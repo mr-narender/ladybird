@@ -13,6 +13,9 @@
 #include <LibWeb/WebAudio/AudioListener.h>
 #include <LibWeb/WebAudio/BiquadFilterNode.h>
 #include <LibWeb/WebAudio/ChannelMergerNode.h>
+#include <LibWeb/WebAudio/ChannelSplitterNode.h>
+#include <LibWeb/WebAudio/ConstantSourceNode.h>
+#include <LibWeb/WebAudio/PeriodicWave.h>
 #include <LibWeb/WebIDL/Types.h>
 
 namespace Web::WebAudio {
@@ -59,10 +62,13 @@ public:
     WebIDL::ExceptionOr<GC::Ref<AudioBuffer>> create_buffer(WebIDL::UnsignedLong number_of_channels, WebIDL::UnsignedLong length, float sample_rate);
     WebIDL::ExceptionOr<GC::Ref<AudioBufferSourceNode>> create_buffer_source();
     WebIDL::ExceptionOr<GC::Ref<ChannelMergerNode>> create_channel_merger(WebIDL::UnsignedLong number_of_inputs);
+    WebIDL::ExceptionOr<GC::Ref<ConstantSourceNode>> create_constant_source();
+    WebIDL::ExceptionOr<GC::Ref<ChannelSplitterNode>> create_channel_splitter(WebIDL::UnsignedLong number_of_outputs);
     WebIDL::ExceptionOr<GC::Ref<OscillatorNode>> create_oscillator();
     WebIDL::ExceptionOr<GC::Ref<DynamicsCompressorNode>> create_dynamics_compressor();
     WebIDL::ExceptionOr<GC::Ref<GainNode>> create_gain();
     WebIDL::ExceptionOr<GC::Ref<PannerNode>> create_panner();
+    WebIDL::ExceptionOr<GC::Ref<PeriodicWave>> create_periodic_wave(Vector<float> const& real, Vector<float> const& imag, Optional<PeriodicWaveConstraints> const& constraints = {});
 
     GC::Ref<WebIDL::Promise> decode_audio_data(GC::Root<WebIDL::BufferSource>, GC::Ptr<WebIDL::CallbackType>, GC::Ptr<WebIDL::CallbackType>);
 

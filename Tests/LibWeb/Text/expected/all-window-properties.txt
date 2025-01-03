@@ -57,6 +57,7 @@ CanvasGradient
 CanvasPattern
 CanvasRenderingContext2D
 ChannelMergerNode
+ChannelSplitterNode
 CharacterData
 Clipboard
 ClipboardEvent
@@ -66,6 +67,7 @@ CloseWatcher
 Comment
 CompositionEvent
 CompressionStream
+ConstantSourceNode
 CountQueuingStrategy
 Crypto
 CryptoKey

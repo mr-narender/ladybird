@@ -173,7 +173,7 @@ static DOM::Element const* element_to_inherit_style_from(DOM::Element const*, Op
 
 StyleComputer::StyleComputer(DOM::Document& document)
     : m_document(document)
-    , m_default_font_metrics(16, Platform::FontPlugin::the().default_font().pixel_metrics())
+    , m_default_font_metrics(16, Platform::FontPlugin::the().default_font(16)->pixel_metrics())
     , m_root_element_font_metrics(m_default_font_metrics)
 {
     m_qualified_layer_names_in_order.append({});
@@ -1775,9 +1775,7 @@ RefPtr<Gfx::FontCascadeList const> StyleComputer::compute_font_for_style_values(
     auto* parent_element = element_to_inherit_style_from(element, pseudo_element);
 
     auto width = font_stretch.to_font_width();
-
     auto weight = font_weight.to_font_weight();
-    bool bold = weight > Gfx::FontWeight::Regular;
 
     // FIXME: Should be based on "user's default font size"
     CSSPixels font_size_in_px = 16;
@@ -1786,7 +1784,7 @@ RefPtr<Gfx::FontCascadeList const> StyleComputer::compute_font_for_style_values(
     if (parent_element && parent_element->computed_properties())
         font_pixel_metrics = parent_element->computed_properties()->first_available_computed_font().pixel_metrics();
     else
-        font_pixel_metrics = Platform::FontPlugin::the().default_font().pixel_metrics();
+        font_pixel_metrics = Platform::FontPlugin::the().default_font(font_size_in_px.to_float())->pixel_metrics();
     auto parent_font_size = [&]() -> CSSPixels {
         if (!parent_element || !parent_element->computed_properties())
             return font_size_in_px;
@@ -1915,9 +1913,6 @@ RefPtr<Gfx::FontCascadeList const> StyleComputer::compute_font_for_style_values(
 
     // FIXME: Implement the full font-matching algorithm: https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm
 
-    // Note: This is modified by the find_font() lambda
-    bool monospace = false;
-
     float const font_size_in_pt = font_size_in_px * 0.75f;
 
     auto find_font = [&](FlyString const& family) -> RefPtr<Gfx::FontCascadeList const> {
@@ -1954,7 +1949,6 @@ RefPtr<Gfx::FontCascadeList const> StyleComputer::compute_font_for_style_values(
         case Keyword::Monospace:
         case Keyword::UiMonospace:
             generic_font = Platform::GenericFont::Monospace;
-            monospace = true;
             break;
         case Keyword::Serif:
             generic_font = Platform::GenericFont::Serif;
@@ -2009,12 +2003,20 @@ RefPtr<Gfx::FontCascadeList const> StyleComputer::compute_font_for_style_values(
             font_list->extend(*other_font_list);
     }
 
+    auto default_font = Platform::FontPlugin::the().default_font(font_size_in_pt);
+    if (font_list->is_empty()) {
+        // This is needed to make sure we check default font before reaching to emojis.
+        font_list->add(*default_font);
+    }
+
     if (auto emoji_font = Platform::FontPlugin::the().default_emoji_font(font_size_in_pt); emoji_font) {
         font_list->add(*emoji_font);
     }
 
-    auto found_font = ComputedProperties::font_fallback(monospace, bold);
-    font_list->set_last_resort_font(found_font->with_size(font_size_in_pt));
+    // The default font is already included in the font list, but we explicitly set it
+    // as the last-resort font. This ensures that if none of the specified fonts contain
+    // the requested code point, there is still a font available to provide a fallback glyph.
+    font_list->set_last_resort_font(*default_font);
 
     return font_list;
 }
@@ -2069,7 +2071,7 @@ void StyleComputer::compute_font(ComputedProperties& style, DOM::Element const* 
 Gfx::Font const& StyleComputer::initial_font() const
 {
     // FIXME: This is not correct.
-    return ComputedProperties::font_fallback(false, false);
+    return ComputedProperties::font_fallback(false, false, 12);
 }
 
 void StyleComputer::absolutize_values(ComputedProperties& style) const
@@ -3015,20 +3017,28 @@ size_t StyleComputer::number_of_css_font_faces_with_loading_in_progress() const
 
 bool StyleComputer::has_has_selectors() const
 {
+    if (!document().is_active())
+        return false;
+
     build_rule_cache_if_needed();
     return m_selector_insights->has_has_selectors;
 }
 
 bool StyleComputer::has_defined_selectors() const
 {
+    if (!document().is_active())
+        return false;
+
     build_rule_cache_if_needed();
     return m_selector_insights->has_defined_selectors;
 }
 
 bool StyleComputer::has_attribute_selector(FlyString const& attribute_name) const
 {
-    build_rule_cache_if_needed();
+    if (!document().is_active())
+        return false;
 
+    build_rule_cache_if_needed();
     return m_selector_insights->all_names_used_in_attribute_selectors.contains(attribute_name);
 }
 

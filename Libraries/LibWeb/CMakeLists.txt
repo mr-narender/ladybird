@@ -690,8 +690,12 @@ set(SOURCES
     ServiceWorker/ServiceWorkerRegistration.cpp
     SRI/SRI.cpp
     StorageAPI/NavigatorStorage.cpp
+    StorageAPI/StorageBottle.cpp
+    StorageAPI/StorageEndpoint.cpp
     StorageAPI/StorageKey.cpp
     StorageAPI/StorageManager.cpp
+    StorageAPI/StorageShed.cpp
+    StorageAPI/StorageShelf.cpp
     Streams/AbstractOperations.cpp
     Streams/ByteLengthQueuingStrategy.cpp
     Streams/CountQueuingStrategy.cpp
@@ -789,6 +793,8 @@ set(SOURCES
     WebAudio/BaseAudioContext.cpp
     WebAudio/BiquadFilterNode.cpp
     WebAudio/ChannelMergerNode.cpp
+    WebAudio/ChannelSplitterNode.cpp
+    WebAudio/ConstantSourceNode.cpp
     WebAudio/DynamicsCompressorNode.cpp
     WebAudio/GainNode.cpp
     WebAudio/OfflineAudioContext.cpp
