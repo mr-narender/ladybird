@@ -775,7 +775,7 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_inherited_style()
 
 GC::Ref<CSS::ComputedProperties> Element::resolved_css_values(Optional<CSS::PseudoElement> type)
 {
-    auto element_computed_style = CSS::CSSStyleProperties::create_resolved_style({ *this, type });
+    auto element_computed_style = CSS::CSSStyleProperties::create_resolved_style(realm(), ElementReference { *this, type });
     auto properties = heap().allocate<CSS::ComputedProperties>();
 
     for (auto i = to_underlying(CSS::first_property_id); i <= to_underlying(CSS::last_property_id); ++i) {
@@ -3637,20 +3637,13 @@ void Element::attribute_changed(FlyString const& local_name, Optional<String> co
         if (m_class_list)
             m_class_list->associated_attribute_changed(value_or_empty);
     } else if (local_name == HTML::AttributeNames::style) {
-        if (!value.has_value()) {
-            if (m_inline_style) {
-                m_inline_style = nullptr;
-                set_needs_style_update(true);
-            }
-        } else {
-            // https://drafts.csswg.org/cssom/#ref-for-cssstyledeclaration-updating-flag
-            if (m_inline_style && m_inline_style->is_updating())
-                return;
-            if (!m_inline_style)
-                m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this }, {}, {});
-            m_inline_style->set_declarations_from_text(*value);
-            set_needs_style_update(true);
-        }
+        // https://drafts.csswg.org/cssom/#ref-for-cssstyledeclaration-updating-flag
+        if (m_inline_style && m_inline_style->is_updating())
+            return;
+        if (!m_inline_style)
+            m_inline_style = CSS::CSSStyleProperties::create_element_inline_style({ *this }, {}, {});
+        m_inline_style->set_declarations_from_text(value.value_or(""_string));
+        set_needs_style_update(true);
     } else if (local_name == HTML::AttributeNames::dir) {
         // https://html.spec.whatwg.org/multipage/dom.html#attr-dir
         if (value_or_empty.equals_ignoring_ascii_case("ltr"sv))
@@ -3972,6 +3965,43 @@ void Element::play_or_cancel_animations_after_display_property_change()
         if (auto animation = cached_animation_name_animation(pseudo_element))
             play_or_cancel_depending_on_display(*animation);
     }
+}
+
+// https://drafts.csswg.org/selectors/#indicate-focus
+bool Element::should_indicate_focus() const
+{
+    // User agents can choose their own heuristics for when to indicate focus; however, the following (non-normative)
+    // suggestions can be used as a starting point for when to indicate focus on the currently focused element:
+
+    // FIXME: * If the user has expressed a preference (such as via a system preference or a browser setting) to always see a
+    //   visible focus indicator, indicate focus regardless of any other factors. (Another option may be for the user
+    //   agent to show its own focus indicator regardless of author styles.)
+
+    // * If the element which supports keyboard input (such as an input element, or any other element that would
+    //   triggers a virtual keyboard to be shown on focus if a physical keyboard were not present), indicate focus.
+    if (is<HTML::FormAssociatedElement>(this))
+        return true;
+
+    // * If the user interacts with the page via keyboard or some other non-pointing device, indicate focus. (This means
+    //   keyboard usage may change whether this pseudo-class matches even if it doesn’t affect :focus).
+    if (document().last_focus_trigger() == HTML::FocusTrigger::Key)
+        return true;
+
+    // FIXME: * If the user interacts with the page via a pointing device (mouse, touchscreen, etc.) and the focused element
+    //   does not support keyboard input, don’t indicate focus.
+
+    // * If the previously-focused element indicated focus, and a script causes focus to move elsewhere, indicate focus
+    //   on the newly focused element.
+    //   Conversely, if the previously-focused element did not indicate focus, and a script causes focus to move
+    //   elsewhere, don’t indicate focus on the newly focused element.
+    // AD-HOC: Other browsers seem to always indicate focus on programmatically focused elements.
+    if (document().last_focus_trigger() == HTML::FocusTrigger::Script)
+        return true;
+
+    // FIXME: * If a newly-displayed element automatically gains focus (such as an action button in a freshly opened dialog),
+    //   that element should indicate focus.
+
+    return false;
 }
 
 }
