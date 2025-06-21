@@ -96,7 +96,7 @@ public:
         ContentData content_data;
         u32 final_quote_nesting_level { 0 };
     };
-    ContentDataAndQuoteNestingLevel content(DOM::Element&, u32 initial_quote_nesting_level) const;
+    ContentDataAndQuoteNestingLevel content(DOM::AbstractElement&, u32 initial_quote_nesting_level) const;
     ContentVisibility content_visibility() const;
     Vector<CursorData> cursor() const;
     Variant<LengthOrCalculated, NumberOrCalculated> tab_size() const;
@@ -159,6 +159,7 @@ public:
     GridTrackPlacement grid_row_end() const;
     GridTrackPlacement grid_row_start() const;
     BorderCollapse border_collapse() const;
+    CSS::EmptyCells empty_cells() const;
     Vector<Vector<String>> grid_template_areas() const;
     ObjectFit object_fit() const;
     ObjectPosition object_position() const;

@@ -116,7 +116,7 @@ static RefPtr<CSSStyleValue const> interpolate_scale(DOM::Element& element, Calc
 
     return TransformationStyleValue::create(
         PropertyID::Scale,
-        TransformFunction::Scale,
+        new_values.size() == 3 ? TransformFunction::Scale3d : TransformFunction::Scale,
         move(new_values));
 }
 
@@ -599,6 +599,10 @@ Color interpolate_color(Color from, Color to, float delta)
 {
     // https://drafts.csswg.org/css-color/#interpolation-space
     // If the host syntax does not define what color space interpolation should take place in, it defaults to Oklab.
+    // However, user agents must handle interpolation between legacy sRGB color formats (hex colors, named colors,
+    // rgb(), hsl() or hwb() and the equivalent alpha-including forms) in gamma-encoded sRGB space.  This provides
+    // Web compatibility; legacy sRGB content interpolates in the sRGB space by default.
+    // FIXME: Use srgb by default for these, once we can distinguish what form a color was specified in.
     auto from_oklab = from.to_oklab();
     auto to_oklab = to.to_oklab();
 

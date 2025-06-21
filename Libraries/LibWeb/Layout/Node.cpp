@@ -76,6 +76,9 @@ bool Node::is_out_of_flow(FormattingContext const& formatting_context) const
 
 bool Node::can_contain_boxes_with_position_absolute() const
 {
+    if (!is<Box>(*this))
+        return false;
+
     if (computed_values().position() != CSS::Positioning::Static)
         return true;
 
@@ -920,6 +923,8 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_row_gap(computed_style.gap_value(CSS::PropertyID::RowGap));
 
     computed_values.set_border_collapse(computed_style.border_collapse());
+
+    computed_values.set_empty_cells(computed_style.empty_cells());
 
     computed_values.set_table_layout(computed_style.table_layout());
 

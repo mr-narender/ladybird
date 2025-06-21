@@ -223,7 +223,7 @@ public:
     ScopePusher const* last_function_scope() const
     {
         for (auto scope_ptr = this; scope_ptr; scope_ptr = scope_ptr->m_parent_scope) {
-            if (scope_ptr->m_function_parameters)
+            if (scope_ptr->m_type == ScopeType::Function || scope_ptr->m_type == ScopeType::ClassStaticInit)
                 return scope_ptr;
         }
         return nullptr;
@@ -328,7 +328,7 @@ public:
             }
 
             if (m_type == ScopeType::Function && m_bound_names.contains(identifier_group_name)) {
-                // NOTE: Currently parser can't determine that named function expression assigment creates scope with binding for funciton name so function names are not considered as candidates to be optmized in global variables access
+                // NOTE: Currently parser can't determine that named function expression assignment creates scope with binding for function name so function names are not considered as candidates to be optimized in global variables access
                 identifier_group.might_be_variable_in_lexical_scope_in_named_function_assignment = true;
             }
 
@@ -1560,8 +1560,6 @@ NonnullRefPtr<ClassExpression const> Parser::parse_class_expression(bool expect_
 
                 {
                     ScopePusher static_init_scope = ScopePusher::static_init_block_scope(*this, *static_init_block);
-                    static_init_scope.set_function_parameters(FunctionParameters::empty());
-
                     parse_statement_list(static_init_block);
                 }
 

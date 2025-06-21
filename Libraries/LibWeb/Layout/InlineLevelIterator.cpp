@@ -452,7 +452,7 @@ Gfx::ShapeFeatures InlineLevelIterator::create_and_merge_font_features() const
     shape_features.ensure_capacity(merged_features.size());
 
     for (auto& it : merged_features) {
-        shape_features.append({ { it.key[0], it.key[1], it.key[2], it.key[3] }, static_cast<u32>(it.value) });
+        shape_features.unchecked_append({ { it.key[0], it.key[1], it.key[2], it.key[3] }, static_cast<u32>(it.value) });
     }
 
     return shape_features;
@@ -620,7 +620,6 @@ Optional<InlineLevelIterator::Item> InlineLevelIterator::next_without_lookahead(
     auto& box_state = m_layout_state.get(box);
     m_inline_formatting_context.dimension_box_on_line(box, m_layout_mode);
 
-    skip_to_next();
     auto item = Item {
         .type = Item::Type::Element,
         .node = &box,
@@ -635,6 +634,7 @@ Optional<InlineLevelIterator::Item> InlineLevelIterator::next_without_lookahead(
         .margin_end = box_state.margin_right,
     };
     add_extra_box_model_metrics_to_item(item, true, true);
+    skip_to_next();
     return item;
 }
 

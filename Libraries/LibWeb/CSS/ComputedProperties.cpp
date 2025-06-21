@@ -377,8 +377,6 @@ float ComputedProperties::resolve_opacity_value(CSSStyleValue const& value)
             else
                 dbgln("Unable to resolve calc() as opacity (number): {}", value.to_string(SerializationMode::Normal));
         }
-    } else if (value.is_percentage()) {
-        unclamped_opacity = value.as_percentage().percentage().as_fraction();
     }
 
     return clamp(unclamped_opacity, 0.0f, 1.0f);
@@ -640,16 +638,32 @@ TransformBox ComputedProperties::transform_box() const
 
 TransformOrigin ComputedProperties::transform_origin() const
 {
+    auto length_percentage_with_keywords_resolved = [](CSSStyleValue const& value) -> Optional<LengthPercentage> {
+        if (value.is_keyword()) {
+            auto keyword = value.to_keyword();
+            if (keyword == Keyword::Left || keyword == Keyword::Top)
+                return Percentage(0);
+            if (keyword == Keyword::Center)
+                return Percentage(50);
+            if (keyword == Keyword::Right || keyword == Keyword::Bottom)
+                return Percentage(100);
+
+            VERIFY_NOT_REACHED();
+        }
+        return length_percentage_for_style_value(value);
+    };
+
     auto const& value = property(PropertyID::TransformOrigin);
-    if (!value.is_value_list() || value.as_value_list().size() != 2)
+    if (!value.is_value_list() || value.as_value_list().size() != 3)
         return {};
     auto const& list = value.as_value_list();
-    auto x_value = length_percentage_for_style_value(list.values()[0]);
-    auto y_value = length_percentage_for_style_value(list.values()[1]);
-    if (!x_value.has_value() || !y_value.has_value()) {
+
+    auto x_value = length_percentage_with_keywords_resolved(list.values()[0]);
+    auto y_value = length_percentage_with_keywords_resolved(list.values()[1]);
+    auto z_value = length_percentage_for_style_value(list.values()[2]);
+    if (!x_value.has_value() || !y_value.has_value() || !z_value.has_value())
         return {};
-    }
-    return { x_value.value(), y_value.value() };
+    return { x_value.value(), y_value.value(), z_value.value() };
 }
 
 Optional<Color> ComputedProperties::accent_color(Layout::NodeWithStyle const& node) const
@@ -921,7 +935,7 @@ ColumnSpan ComputedProperties::column_span() const
     return keyword_to_column_span(value.to_keyword()).release_value();
 }
 
-ComputedProperties::ContentDataAndQuoteNestingLevel ComputedProperties::content(DOM::Element& element, u32 initial_quote_nesting_level) const
+ComputedProperties::ContentDataAndQuoteNestingLevel ComputedProperties::content(DOM::AbstractElement& element_reference, u32 initial_quote_nesting_level) const
 {
     auto const& value = property(PropertyID::Content);
     auto quotes_data = quotes();
@@ -985,7 +999,7 @@ ComputedProperties::ContentDataAndQuoteNestingLevel ComputedProperties::content(
                     break;
                 }
             } else if (item->is_counter()) {
-                builder.append(item->as_counter().resolve(element));
+                builder.append(item->as_counter().resolve(element_reference));
             } else {
                 // TODO: Implement images, and other things.
                 dbgln("`{}` is not supported in `content` (yet?)", item->to_string(SerializationMode::Normal));
@@ -1000,7 +1014,7 @@ ComputedProperties::ContentDataAndQuoteNestingLevel ComputedProperties::content(
                 if (item->is_string()) {
                     alt_text_builder.append(item->as_string().string_value());
                 } else if (item->is_counter()) {
-                    alt_text_builder.append(item->as_counter().resolve(element));
+                    alt_text_builder.append(item->as_counter().resolve(element_reference));
                 } else {
                     dbgln("`{}` is not supported in `content` alt-text (yet?)", item->to_string(SerializationMode::Normal));
                 }
@@ -1559,6 +1573,12 @@ BorderCollapse ComputedProperties::border_collapse() const
 {
     auto const& value = property(PropertyID::BorderCollapse);
     return keyword_to_border_collapse(value.to_keyword()).release_value();
+}
+
+EmptyCells ComputedProperties::empty_cells() const
+{
+    auto const& value = property(PropertyID::EmptyCells);
+    return keyword_to_empty_cells(value.to_keyword()).release_value();
 }
 
 Vector<Vector<String>> ComputedProperties::grid_template_areas() const

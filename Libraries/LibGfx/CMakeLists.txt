@@ -14,6 +14,7 @@ set(SOURCES
     Font/Font.cpp
     Font/FontData.cpp
     Font/FontDatabase.cpp
+    Font/FontSupport.cpp
     Font/PathFontProvider.cpp
     Font/Typeface.cpp
     Font/TypefaceSkia.cpp
@@ -60,6 +61,7 @@ set(SOURCES
 )
 
 set(SWIFT_EXCLUDE_HEADERS
+    FilterImpl.h
     GlobalFontConfig.h
     MetalContext.h
     VulkanContext.h
@@ -80,7 +82,7 @@ endif()
 
 serenity_lib(LibGfx gfx)
 
-target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibRIFF LibTextCodec LibIPC LibUnicode LibURL)
+target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibRIFF LibTextCodec LibIPC LibUnicode)
 
 set(generated_sources TIFFMetadata.h TIFFTagHandler.cpp)
 list(TRANSFORM generated_sources PREPEND "ImageFormats/")
@@ -119,6 +121,10 @@ find_package(harfbuzz REQUIRED)
 
 target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG PNG::PNG avif WebP::webp WebP::webpdecoder
             WebP::webpdemux WebP::libwebpmux skia harfbuzz)
+
+if (HAS_FONTCONFIG)
+    target_link_libraries(LibGfx PRIVATE Fontconfig::Fontconfig)
+endif()
 
 set(CMAKE_REQUIRED_LIBRARIES PNG::PNG)
 check_c_source_compiles([=[

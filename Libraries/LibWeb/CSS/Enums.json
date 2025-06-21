@@ -101,7 +101,9 @@
     "none",
     "left",
     "right",
-    "both"
+    "both",
+    "inline-start",
+    "inline-end"
   ],
   "column-span": [
     "none",
@@ -222,6 +224,10 @@
     "inline",
     "run-in"
   ],
+  "empty-cells": [
+    "show",
+    "hide"
+  ],
   "fill-rule": [
     "nonzero",
     "evenodd"
@@ -257,6 +263,20 @@
     "left",
     "right",
     "oblique"
+  ],
+  "font-tech": [
+    "avar2",
+    "color-cbdt",
+    "color-colrv0",
+    "color-colrv1",
+    "color-sbix",
+    "color-svg",
+    "features-aat",
+    "features-graphite",
+    "features-opentype",
+    "incremental",
+    "palettes",
+    "variations"
   ],
   "font-variant-alternates": [
     "normal",
