@@ -250,8 +250,9 @@ impl<'pass> FlexFormattingContext<'pass> {
     }
 
     // https://www.w3.org/TR/css-flexbox-1/#flex-direction-property
+    /// Whether the inline axis of `node` runs along the horizontal axis of the frame the container lays out in.
     fn inline_axis_is_horizontal(&self, node: Node) -> bool {
-        self.style(node).writing_mode() == writing_mode::HORIZONTAL_TB
+        !geometry::Frame::of(self.style(node).writing_mode()).is_orthogonal_to(self.run.callbacks.frame)
     }
 
     fn is_row_layout(&self) -> bool {
@@ -2539,19 +2540,38 @@ impl<'pass> FlexFormattingContext<'pass> {
     // https://drafts.csswg.org/css-align-3/#synthesize-baseline
     // NB: An item in another writing mode has no baseline in this container's axis, so it synthesizes one.
     fn item_baseline_is_synthesized(&self, index: usize) -> bool {
+        if self.run.callbacks.frame.is_transposed() {
+            // NB: An item has a baseline across its block axis, so only in the cross axis that its block axis runs
+            //     along.
+            return self.item_establishes_orthogonal_flow(index) != self.cross_axis_is_horizontal();
+        }
         self.style(self.flex_items[index].box_).writing_mode() != writing_mode::HORIZONTAL_TB
     }
 
+    fn item_establishes_orthogonal_flow(&self, index: usize) -> bool {
+        self.sizing().establishes_orthogonal_flow(self.flex_items[index].box_)
+    }
+
     fn item_participates_in_baseline_alignment(&self, index: usize) -> bool {
-        // FIXME: box_baseline() only understands horizontal-tb line box geometry, so items can only be baseline-aligned
-        //        in a horizontal-tb container unless they are horizontal-tb themselves.
+        // FIXME: Items in a horizontal-tb container only align by baselines across the vertical axis, where a
+        //        horizontal-tb item is aligned by its own baselines and any other item by synthesized ones.
         self.alignment_for_item(self.flex_items[index].box_) == align_items::BASELINE
-            && (!self.item_baseline_is_synthesized(index)
-                || self.style(self.run.box_).writing_mode() == writing_mode::HORIZONTAL_TB)
+            && (!self.item_baseline_is_synthesized(index) || !self.run.callbacks.frame.is_transposed())
     }
 
     fn item_box_baseline(&self, index: usize) -> CssPixels {
         let item = &self.flex_items[index];
+        if self.run.callbacks.frame.is_transposed() && self.cross_axis_is_horizontal() {
+            // NB: The cross axis is the horizontal axis of the frame, along which an item in an orthogonal flow
+            //     has its baselines.
+            let used = self.item_used(index);
+            let collapsed = used.uses_collapsing_borders_model.get();
+            let margin_box_left = used.margin_left.get() + used.border_box_left(collapsed);
+            return match used.orthogonal_flow_baselines().and_then(|baselines| baselines.first) {
+                Some(baseline) => margin_box_left + baseline,
+                None => margin_box_left + used.content_inline_size.get() + used.border_box_right(collapsed),
+            };
+        }
         if self.item_baseline_is_synthesized(index) {
             let used = self.item_used(index);
             let collapsed = used.uses_collapsing_borders_model.get();
@@ -2754,26 +2774,16 @@ impl<'pass> FlexFormattingContext<'pass> {
         };
         let main_size = self.inner_main_size_used(self.container_used());
         let cross_size = self.inner_cross_size_used(self.container_used());
-        let (logical_inline_size, logical_block_size) = if self.is_row_layout() {
+        let (inline_size, block_size) = if self.is_row_layout() {
             (main_size, cross_size)
         } else {
             (cross_size, main_size)
         };
-        let (inline_size, block_size) = geometry::to_physical(
-            self.style(self.run.box_).writing_mode(),
-            logical_inline_size,
-            logical_block_size,
-        );
-        let (logical_inline_alignment, logical_block_alignment) = if self.is_row_layout() {
+        let (inline_alignment, block_alignment) = if self.is_row_layout() {
             (main_alignment, cross_alignment)
         } else {
             (cross_alignment, main_alignment)
         };
-        let (inline_alignment, block_alignment) = geometry::to_physical(
-            self.style(self.run.box_).writing_mode(),
-            logical_inline_alignment,
-            logical_block_alignment,
-        );
         abspos_inputs::StaticPositionRect {
             rect: geometry::LogicalRect {
                 offset: Default::default(),
@@ -2807,15 +2817,11 @@ impl<'pass> FlexFormattingContext<'pass> {
                 let item = &self.flex_items[index];
                 let main_size = item.main_size.unwrap_or(item.target_main_size);
                 let cross_size = item.cross_size.unwrap_or(item.hypothetical_cross_size);
-                let (logical_inline_offset, logical_block_offset, logical_inline_size, logical_block_size) =
-                    if self.is_row_layout() {
-                        (item.main_offset, item.cross_offset, main_size, cross_size)
-                    } else {
-                        (item.cross_offset, item.main_offset, cross_size, main_size)
-                    };
-                let writing_mode = self.style(self.run.box_).writing_mode();
-                let (x, y) = geometry::to_physical(writing_mode, logical_inline_offset, logical_block_offset);
-                let (width, height) = geometry::to_physical(writing_mode, logical_inline_size, logical_block_size);
+                let (x, y, width, height) = if self.is_row_layout() {
+                    (item.main_offset, item.cross_offset, main_size, cross_size)
+                } else {
+                    (item.cross_offset, item.main_offset, cross_size, main_size)
+                };
                 let rect = CssPixelRect { x, y, width, height };
                 let node = item.box_;
                 let style = self.style(node);

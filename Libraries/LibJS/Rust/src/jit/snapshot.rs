@@ -27,7 +27,7 @@ use super::allocation::{
     allocation_infos, closure_template_snapshots, closure_templates, function_environment_template,
     lexical_environment_templates,
 };
-use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable};
+use super::code::{CapturedBindingAccesses, InlinedFunction, SnapshotExecutable, speculated_cache_size};
 use super::runtime_info::RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS;
 use crate::bytecode::executable::{Executable, PropertyLookupCacheEntryData, PropertyLookupCacheTier};
 use crate::bytecode::feedback::{CallFeedback, CallFeedbackForwarding, call_feedback_flags};
@@ -254,6 +254,30 @@ fn prototype_property_object(entry: &PropertyLookupCacheEntryData) -> Option<Gc<
     value.is_object().then(|| value.as_object())
 }
 
+/// Whether the own property an entry reads or writes is writable in the shape of the object, which makes it a data
+/// property for as long as the object keeps the shape (see `Object::storage_set()`). Loads of the properties of
+/// prototypes always check, as they are guarded by no check of the object they load from.
+fn property_holds_data(entry: &PropertyLookupCacheEntryData) -> bool {
+    if !matches!(
+        entry.entry_type,
+        PropertyLookupCacheEntryType::GetOwnProperty | PropertyLookupCacheEntryType::ChangeOwnProperty
+    ) {
+        return false;
+    }
+    let Some(shape) = entry.shape else {
+        return false;
+    };
+    let mut writable = false;
+    shape.for_each_property_in_insertion_order(|_, metadata| {
+        if metadata.offset != entry.property_offset {
+            return core::ops::ControlFlow::Continue(());
+        }
+        writable = metadata.attributes.is_writable();
+        core::ops::ControlFlow::Break(())
+    });
+    writable
+}
+
 /// The value the prototype of a GetPropertyInPrototypeChain or ChangePropertyInPrototypeChain entry holds in the
 /// property, if the entry still applies.
 fn prototype_property_value(entry: &PropertyLookupCacheEntryData) -> Option<Value> {
@@ -467,7 +491,20 @@ impl SnapshotBuilder<'_> {
                 prototype_property_inline_executable: prototype_property.and_then(|object| {
                     self.inline_executable_index(Some(Value::from_object(object).as_cell()), caller)
                 }),
+                // NB: Watching a slot allocates, which collects no garbage while the snapshot is taken. Slots
+                //     replaced while watched are checked instead, as invalidated code learns nothing, while the
+                //     check learns from its exit.
+                prototype_property_watchpoint: prototype_property
+                    .and(entry.prototype)
+                    .filter(|holder| !holder.shape().was_slot_replaced(entry.property_offset))
+                    .and_then(|holder| {
+                        holder
+                            .shape()
+                            .watch_slot_for_replacements(self.vm, entry.property_offset)
+                    })
+                    .map(|set| self.cell(set)),
                 accessor_function,
+                property_holds_data: property_holds_data(&entry),
                 holds_accessor: entry_holds_accessor(&entry),
             });
         }
@@ -994,7 +1031,7 @@ impl SnapshotBuilder<'_> {
                     handler_offset: handler.handler_offset,
                 })
                 .collect(),
-            exit_sites: executable.jit_exit_sites(),
+            exit_sites: executable.jit_exit_sites_for_recompile(),
             builtin_exit_sites: if entry.function.is_none() {
                 executable
                     .jit_builtin_exit_sites()
@@ -1324,6 +1361,12 @@ pub fn capture_snapshot(
                 function: entry.function,
                 known_exit_sites: entry.executable.jit_exit_site_count(),
                 known_builtin_exit_sites: entry.executable.jit_builtin_exit_site_count(),
+                property_cache_sizes: entry
+                    .executable
+                    .property_lookup_caches()
+                    .iter()
+                    .map(speculated_cache_size)
+                    .collect(),
             })
             .collect(),
     }

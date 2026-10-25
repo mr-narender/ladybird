@@ -137,11 +137,6 @@ StringView Node::class_name() const
     VERIFY_NOT_REACHED();
 }
 
-void Node::reset_cached_intrinsic_sizes_of_self_and_ancestors()
-{
-    RustFFI::render_state_reset_cached_intrinsic_sizes_of_self_and_ancestors(document_host(), slot_id(this));
-}
-
 RustFFI::DocumentHost* Node::document_host() const
 {
     return m_arena->host();
@@ -504,9 +499,8 @@ static bool uses_button_layout(Node const& node)
     return html_element && html_element->uses_button_layout();
 }
 
-void NodeWithStyle::set_style_record_identity(CSS::InstalledStyle const& installed, CSS::InstalledStyle const& held_before)
+void NodeWithStyle::set_style_record_identity(CSS::StyleRecordID style_record_identity)
 {
-    auto style_record_identity = installed.record();
     // A detached or layout-derived record is independent of its DOM target's record. A
     // rendering consequence replaces and re-derives it explicitly through apply_style().
     if (m_has_layout_derived_style)
@@ -517,29 +511,6 @@ void NodeWithStyle::set_style_record_identity(CSS::InstalledStyle const& install
     }
 
     bool should_repin_style_record = m_style_record_pinned_for_cxx_consumers;
-    // Both answers come from the records themselves, so neither side needs a ComputedValues built
-    // for it. Compare the effective payloads, including animations, rather than treating every
-    // animation overlay as layout-affecting. The node's own record is the one its target held
-    // before where the node followed it, which the target still holds.
-    auto const& new_record_view = installed.view();
-    VERIFY(new_record_view.present);
-    CSS::StyleEngine::StyleRecordView old_record_view {};
-    if (!!m_style_record_identity) {
-        old_record_view = held_before.record() == m_style_record_identity
-            ? held_before.view()
-            : document().style_computer().style_engine().style_record_view(held_read(), m_style_record_identity);
-    }
-    // NB: SVG geometry can depend on currentColor strokes and animation composition. Keep its conservative reset.
-    bool svg_style_may_affect_intrinsic_sizes = is_svg_box()
-        && (old_record_view.animation_overlay_identity != 0
-            || new_record_view.animation_overlay_identity != 0
-            || (old_record_view.present
-                && static_cast<CSS::ComputedValues::InheritedTextValues const*>(old_record_view.payloads[to_underlying(CSS::StyleGroupIndex::InheritedTextValues)])->color
-                    != static_cast<CSS::ComputedValues::InheritedTextValues const*>(new_record_view.payloads[to_underlying(CSS::StyleGroupIndex::InheritedTextValues)])->color));
-    bool changes_layout_affecting_style = !old_record_view.present
-        || svg_style_may_affect_intrinsic_sizes
-        || CSS::ComputedValues::layout_affecting_group_payloads_differ(old_record_view.payloads, new_record_view.payloads);
-
     release_pinned_style_record();
     m_background_images.clear();
     m_mask_images.clear();
@@ -550,9 +521,8 @@ void NodeWithStyle::set_style_record_identity(CSS::InstalledStyle const& install
     if (should_repin_style_record)
         pin_style_record_for_cxx_consumers();
 
-    if (changes_layout_affecting_style)
-        reset_cached_intrinsic_sizes_of_self_and_ancestors();
-    if (changes_layout_affecting_style && (kind() == RustFFI::NodeKind::FieldSetBox || uses_button_layout(*this)))
+    // The anonymous content box of a button or a fieldset also takes properties of this style that it does not inherit.
+    if (kind() == RustFFI::NodeKind::FieldSetBox || uses_button_layout(*this))
         RustFFI::render_state_reinherit_anonymous_descendants(document_host(), slot_id(this), false);
 }
 

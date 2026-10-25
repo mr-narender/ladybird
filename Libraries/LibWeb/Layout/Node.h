@@ -73,7 +73,6 @@ public:
     Node const* parent_ptr() const { return linked_node(RustFFI::FfiNodeLink::Parent); }
     Node* first_child_ptr() { return linked_node(RustFFI::FfiNodeLink::FirstChild); }
     Node const* first_child_ptr() const { return linked_node(RustFFI::FfiNodeLink::FirstChild); }
-    Node* last_child_ptr() { return linked_node(RustFFI::FfiNodeLink::LastChild); }
     Node* next_sibling_ptr() { return linked_node(RustFFI::FfiNodeLink::NextSibling); }
     Node const* next_sibling_ptr() const { return linked_node(RustFFI::FfiNodeLink::NextSibling); }
     Node* previous_sibling_ptr() { return linked_node(RustFFI::FfiNodeLink::PreviousSibling); }
@@ -151,48 +150,6 @@ public:
         return const_cast<Node&>(*this).template for_each_child_of_type<U>(move(callback));
     }
 
-    Node* next_in_pre_order()
-    {
-        if (auto* child = first_child_ptr())
-            return child;
-        for (auto* node = this; node; node = node->parent_ptr()) {
-            if (auto* next = node->next_sibling_ptr())
-                return next;
-        }
-        return nullptr;
-    }
-
-    Node const* next_in_pre_order() const
-    {
-        return const_cast<Node*>(this)->next_in_pre_order();
-    }
-
-    Node* previous_in_pre_order()
-    {
-        if (auto* node = previous_sibling_ptr()) {
-            while (auto* last_child = node->last_child_ptr())
-                node = last_child;
-            return node;
-        }
-        return parent_ptr();
-    }
-
-    Node const* previous_in_pre_order() const
-    {
-        return const_cast<Node*>(this)->previous_in_pre_order();
-    }
-
-    bool is_before(Node const& other) const
-    {
-        if (this == &other)
-            return false;
-        for (auto const* node = this; node; node = node->next_in_pre_order()) {
-            if (node == &other)
-                return true;
-        }
-        return false;
-    }
-
     bool is_anonymous() const { return has_identity_flag<RustFFI::NodeFlag::Anonymous>(); }
     bool is_document_element() const { return has_identity_flag<RustFFI::NodeFlag::IsDocumentElement>(); }
     DOM::Node const* dom_node() const;
@@ -213,13 +170,6 @@ public:
     void set_needs_compositor_effects_layer(bool value) { set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::Opacity, value); }
     bool needs_compositor_background_color_frame() const { return has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor); }
     void set_needs_compositor_background_color_frame(bool value) { set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor, value); }
-
-    // Any invalidation below a node must reach every ancestor's epoch: cached runs capture
-    // subtree structure, and unlike intrinsic-size invalidation there is no absolutely-positioned
-    // or SVG boundary — those descendants' fragments live in ancestor run trees. The arena runs
-    // the same walk for every structural change; this serves content changes that never
-    // restructure the tree.
-    void reset_cached_intrinsic_sizes_of_self_and_ancestors();
 
     // Set when a style change altered geometry-determining properties of this node itself, so
     // a partial relayout must re-resolve its own size and position instead of reusing them.
@@ -568,9 +518,9 @@ public:
     bool is_scroll_container() const;
 
     void set_computed_values(Layout::BegunRead const& read, NonnullRefPtr<CSS::ComputedValues const>);
-    // Takes the record its DOM target installed, `installed`, where it followed the target's record. `held_before` is
-    // the record the target held before and still holds, or none.
-    void set_style_record_identity(CSS::InstalledStyle const& installed, CSS::InstalledStyle const& held_before);
+    // Takes the record its DOM target installed, where it followed the target's record. The target still holds the
+    // record it held before until the engine takes the new one in, so the render state compares the two.
+    void set_style_record_identity(CSS::StyleRecordID);
     void refresh_style_from_arena(CSS::StyleRecordID, void const* payloads, bool derived, bool should_attach_resources);
     // The pin lives on the node's arena row and is released with it, so
     // Document::tear_down_layout_tree() must free the layout root before the document's style

@@ -363,7 +363,14 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     // 1. Let browsingContext be the result of obtaining a browsing context to use for a navigation response given navigationParams.
     auto browsing_context = obtain_a_browsing_context_to_use_for_a_navigation_response(navigation_params);
 
-    // FIXME: 2. Let permissionsPolicy be the result of creating a permissions policy from a response given navigationParams's navigable's container, navigationParams's origin, and navigationParams's response.
+    // 2. Let permissionsPolicy be the result of creating a permissions policy from a response given navigationParams's
+    //    navigable's container, navigationParams's origin, and navigationParams's response.
+    // NB: The UI process creates it for navigation params it handled, from the documents and headers it holds. Only a
+    //     document that this process creates alone, such as from a javascript: URL or for inline content, creates it
+    //     here.
+    auto permissions_policy = navigation_params.permissions_policy;
+    if (!permissions_policy.has_value())
+        permissions_policy = navigation_params.navigable->create_a_permissions_policy_from_a_response(navigation_params.origin, navigation_params.response->header_list());
 
     // 3. Let creationURL be navigationParams's response's URL.
     auto creation_url = navigation_params.response->url();
@@ -468,7 +475,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     //    origin: navigationParams's origin
     //    browsing context: browsingContext
     //    policy container: navigationParams's policy container
-    //    FIXME: permissions policy: permissionsPolicy
+    //    permissions policy: permissionsPolicy
     //    active sandboxing flag set: navigationParams's final sandboxing flag set
     //    FIXME: opener policy: navigationParams's opener policy
     //    load timing info: loadTimingInfo
@@ -488,6 +495,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->set_browsing_context(browsing_context);
     document->m_policy_container = navigation_params.policy_container;
     document->set_opener_policy(navigation_params.opener_policy);
+    document->m_permissions_policy = permissions_policy.release_value();
     document->m_active_sandboxing_flag_set = navigation_params.final_sandboxing_flag_set;
     document->m_navigation_id = navigation_params.id;
     document->set_load_timing_info(load_timing_info);
@@ -549,6 +557,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
             || navigation_params.request->text_directive_user_activation();
         navigation_params.request->set_text_directive_user_activation(false);
         document->m_browsing_context_group_has_remote_contexts = navigation_params.request->browsing_context_group_has_multiple_contexts();
+        document->m_navigation_bypassed_cache = navigation_params.request->cache_mode() == HTTP::CacheMode::Reload;
     }
 
     // NOTE: Step 16 is treated as the else branch of step 15. Otherwise, redirectCount is undefined when the fetch
@@ -1203,7 +1212,7 @@ void Document::update_highlight_states_if_needed(Layout::BegunRead const& read)
     }
 }
 
-void Document::set_find_in_page_highlighted_matches(Vector<GC::Ref<Range>> matches)
+void Document::set_find_in_page_highlighted_matches(GC::RootVector<GC::Ref<Range>> matches)
 {
     if (matches.is_empty() && m_find_in_page_highlighted_matches.is_empty())
         return;
@@ -6848,24 +6857,27 @@ void Document::unload(GC::Ptr<Document> new_document)
     did_stop_being_active_document_in_navigable();
 }
 
-// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#allowed-to-use
-// The default allowlist of a policy-controlled feature is "self", which enables it in a document only if every
-// navigable between it and the top level is same origin with it. The origin of a navigable another process hosts is
-// replicated here, so an ancestor is compared wherever it is hosted.
-static bool default_allowlist_enables_feature_in(Document const& document)
+// https://w3c.github.io/webappsec-permissions-policy/#algo-is-feature-enabled
+static PermissionsPolicy::FeatureValue is_feature_enabled_in_document_for_origin(PolicyControlledFeature feature, Document const& document, URL::Origin const& origin)
 {
-    auto navigable = document.navigable();
-    if (!navigable)
-        return false;
+    // 1. Let policy be document's permissions policy.
+    auto const& policy = document.permissions_policy();
 
-    for (auto ancestor = navigable->parent(); ancestor; ancestor = ancestor->parent()) {
-        auto ancestor_origin = ancestor->active_document_origin();
-        if (!ancestor_origin.has_value() || !ancestor_origin->is_same_origin(document.origin()))
-            return false;
-    }
-    return true;
+    // FIXME: 2. Let report-only policy be document's report-only permissions policy.
+
+    // 3. Let result be the result of calling Check permissions policy, given policy, feature, origin, and document's
+    //    origin.
+    auto result = PermissionsPolicy::check_permissions_policy(policy, feature, origin, document.origin());
+
+    // FIXME: 4. Let report-only result be the result of calling Check permissions policy, given report-only policy,
+    //           feature, origin, and document's origin.
+    // FIXME: 5. If report is True, generate a report for a violation of either policy.
+
+    // 6. Return result
+    return result;
 }
 
+// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#allowed-to-use
 bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
 {
     // 1. If document's browsing context is null, then return false.
@@ -6878,39 +6890,8 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
 
     // 3. If the result of running is feature enabled in document for origin on feature, document, and document's origin
     //    is "Enabled", then return true.
-    // FIXME: This is ad-hoc. Implement the Permissions Policy specification.
-    switch (feature) {
-    case PolicyControlledFeature::Autoplay:
-        // FIXME: Implement allowlist for this.
+    if (is_feature_enabled_in_document_for_origin(feature, *this, origin()) == PermissionsPolicy::FeatureValue::Enabled)
         return true;
-    case PolicyControlledFeature::Camera:
-        // FIXME: Implement allowlist for this.
-        return true;
-    case PolicyControlledFeature::CrossOriginIsolated:
-        // FIXME: Implement the allow attribute, which a container uses to delegate the feature to another origin.
-        return default_allowlist_enables_feature_in(*this);
-    case PolicyControlledFeature::FocusWithoutUserActivation:
-        // FIXME: Implement the allow attribute, which a container uses to delegate the feature to another origin.
-        return default_allowlist_enables_feature_in(*this);
-    case PolicyControlledFeature::EncryptedMedia:
-        // FIXME: Implement allowlist for this.
-        return true;
-    case PolicyControlledFeature::Fullscreen:
-        // FIXME: Implement allowlist for this.
-        return true;
-    case PolicyControlledFeature::Gamepad:
-        // FIXME: Implement allowlist for this.
-        return true;
-    case PolicyControlledFeature::Microphone:
-        // FIXME: Implement allowlist for this.
-        return true;
-    case PolicyControlledFeature::PictureInPicture:
-        // FIXME: Implement allowlist for this.
-        return true;
-    case PolicyControlledFeature::WindowManagement:
-        // FIXME: Implement allowlist for this.
-        return true;
-    }
 
     // 4. Return false.
     return false;

@@ -75,6 +75,7 @@
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/HTML/UserNavigationInvolvement.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
+#include <LibWebCommon/PermissionsPolicy/PermissionsPolicy.h>
 
 namespace Web {
 
@@ -266,18 +267,7 @@ struct DocumentUnloadTimingInfo {
     HighResolutionTime::DOMHighResTimeStamp unload_event_end_time { 0 };
 };
 
-enum class PolicyControlledFeature : u8 {
-    Autoplay,
-    Camera,
-    CrossOriginIsolated,
-    EncryptedMedia,
-    FocusWithoutUserActivation,
-    Fullscreen,
-    Gamepad,
-    Microphone,
-    PictureInPicture,
-    WindowManagement,
-};
+using PolicyControlledFeature = PermissionsPolicy::PolicyControlledFeature;
 
 struct PendingFullscreenEvent {
     enum class Type {
@@ -349,7 +339,7 @@ public:
     void set_find_in_page_active_match(GC::Ptr<Range>);
     void collapse_find_in_page_active_match_if_its_text_changed();
     Vector<GC::Ref<Range>> const& find_in_page_highlighted_matches() const { return m_find_in_page_highlighted_matches; }
-    void set_find_in_page_highlighted_matches(Vector<GC::Ref<Range>>);
+    void set_find_in_page_highlighted_matches(GC::RootVector<GC::Ref<Range>>);
     void remove_find_in_page_highlighted_matches_whose_text_changed();
 
     Editing::SpellingMarkers& spelling_markers();
@@ -855,6 +845,11 @@ public:
     bool browsing_context_group_has_remote_contexts() const { return m_browsing_context_group_has_remote_contexts; }
     void set_browsing_context_group_has_remote_contexts(bool value) { m_browsing_context_group_has_remote_contexts = value; }
 
+    // AD-HOC: Whether this document is still loading after a navigation that bypassed the HTTP cache: a reload that
+    //         bypasses it, or a child navigable's navigation while its container document loaded that way. Until it
+    //         has completely loaded, the requests it makes without a cache mode of their own bypass the cache too.
+    bool is_loading_bypassing_cache() const { return m_navigation_bypassed_cache && !is_completely_loaded(); }
+
     GC::Ptr<HTML::HTMLScriptElement> current_script() const { return m_current_script.ptr(); }
     void set_current_script(Badge<HTML::HTMLScriptElement>, GC::Ptr<HTML::HTMLScriptElement> script) { m_current_script = move(script); }
     static constexpr size_t current_script_offset() { return offsetof(Document, m_current_script); }
@@ -1067,6 +1062,10 @@ public:
     // https://html.spec.whatwg.org/multipage/origin.html#active-sandboxing-flag-set
     HTML::SandboxingFlagSet active_sandboxing_flag_set() const;
     void set_active_sandboxing_flag_set(HTML::SandboxingFlagSet);
+
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-permissions-policy
+    PermissionsPolicy::PermissionsPolicy const& permissions_policy() const { return m_permissions_policy; }
+    void set_permissions_policy(PermissionsPolicy::PermissionsPolicy policy) { m_permissions_policy = move(policy); }
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-policy-container
     GC::Ref<HTML::PolicyContainer> policy_container() const;
@@ -1960,6 +1959,7 @@ private:
     // Each Document has a text directive user activation, which is a boolean, initially false.
     bool m_text_directive_user_activation { false };
     bool m_browsing_context_group_has_remote_contexts { false };
+    bool m_navigation_bypassed_cache { false };
     GC::Ptr<HTML::HTMLScriptElement> m_current_script;
 
     u32 m_ignore_destructive_writes_counter { 0 };
@@ -2104,6 +2104,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/origin.html#active-sandboxing-flag-set
     HTML::SandboxingFlagSet m_active_sandboxing_flag_set;
+
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-permissions-policy
+    PermissionsPolicy::PermissionsPolicy m_permissions_policy { PermissionsPolicy::PermissionsPolicy::empty_permissions_policy() };
 
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-policy-container
     mutable GC::Ptr<HTML::PolicyContainer> m_policy_container;

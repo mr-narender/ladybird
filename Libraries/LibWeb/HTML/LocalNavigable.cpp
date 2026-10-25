@@ -2307,6 +2307,14 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
             return;
         }
 
+        // AD-HOC: Main fetch can upgrade request's current URL to a potentially trustworthy URL without a redirect.
+        //         Treat that like a redirect, so currentURL and entry's URL name the URL that was actually fetched,
+        //         which is also response's URL and the document's URL.
+        if (state_holder->request->current_url() != state_holder->current_url) {
+            state_holder->current_url = state_holder->request->current_url();
+            state_holder->redirected_url = state_holder->current_url;
+        }
+
         // 8. If request's body is null, then set entry's document state's resource to null.
         if (state_holder->request->body().has<Empty>()) {
             state_holder->resource_cleared = true;
@@ -2573,11 +2581,23 @@ static void create_navigation_params_by_fetching(
         //         Chromium (FetchCacheMode::kValidateCache) and Firefox (nsIRequest::VALIDATE_ALWAYS); WebKit goes
         //         further, and bypasses the cache entirely (ReloadIgnoringCacheData).
         request->set_cache_mode(HTTP::CacheMode::NoCache);
+
+        // AD-HOC: A reload that bypasses the HTTP cache uses the "reload" cache mode instead, with which "Fetch behaves
+        //         as if there is no HTTP cache on the way to the network. Ergo, it creates a normal request and updates
+        //         the HTTP cache with the response."
+        if (document_state.reload_bypasses_cache)
+            request->set_cache_mode(HTTP::CacheMode::Reload);
     }
 
     // 8. Otherwise, if entry's document state's ever populated is true, then set request's history-navigation flag.
     else if (document_state.ever_populated)
         request->set_history_navigation(true);
+
+    // AD-HOC: While a document loads bypassing the HTTP cache, so do the documents of its child navigables.
+    if (request->cache_mode() == HTTP::CacheMode::Default) {
+        if (auto container_document = navigable->container_document(); container_document && container_document->is_loading_bypassing_cache())
+            request->set_cache_mode(HTTP::CacheMode::Reload);
+    }
 
     // 9. If sourceSnapshotParams's has transient activation is true, then set request's user-activation to true.
     if (source_snapshot_params->has_transient_activation)
@@ -2598,6 +2618,12 @@ static void create_navigation_params_by_fetching(
     //         IsUserTriggeredForSecFetchSite() that its triggering principal is the system's.
     if (document_state.user_agent_initiated == UserAgentInitiated::Yes && navigable && navigable->is_top_level_traversable())
         request->set_user_agent_initiated(true);
+
+    // NB: What step 2.1 of Upgrade Insecure Requests' "upgrade request to a potentially trustworthy URL, if
+    //     appropriate" asks about.
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request
+    if (csp_navigation_type == ContentSecurityPolicy::Directives::Directive::NavigationType::FormSubmission)
+        request->set_form_submission(true);
 
     // 10. If navigable's container is non-null:
     // NB: The container's local name is read through the navigable, which replicates it for a container in another
