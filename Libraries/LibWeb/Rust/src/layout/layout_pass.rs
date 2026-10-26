@@ -98,6 +98,7 @@ impl<'arena> LayoutPass<'arena> {
         self
     }
 
+    #[inline]
     pub(crate) fn arena(&self) -> &'arena LayoutNodeArena {
         self.arena
     }
@@ -117,6 +118,7 @@ impl<'arena> LayoutPass<'arena> {
         self.arena.intrinsic_size_cache_stamp(node)
     }
 
+    #[inline]
     pub(crate) fn node_data(&self, node: Node) -> &'arena NodeData {
         self.arena().data(node)
     }
@@ -127,10 +129,20 @@ impl<'arena> LayoutPass<'arena> {
             .expect("text node content must be synced to the arena before layout")
     }
 
+    #[inline]
     pub(crate) fn style_payloads(&self, node: Node) -> &'arena FfiStylePayloads {
-        self.arena
-            .style_payloads(node)
+        self.style_payloads_if_styled(node)
             .expect("styled node must publish its style container before layout")
+    }
+
+    /// The style of `node`: that of its row, or the position option it is being laid out with.
+    #[inline]
+    pub(crate) fn style_payloads_if_styled(&self, node: Node) -> Option<&'arena FfiStylePayloads> {
+        if let Some(style) = self.scratch.position_option_style(node) {
+            // SAFETY: A position option's style record stays pinned while a box is laid out with it.
+            return unsafe { super::node_data::style_payloads(style) };
+        }
+        self.arena.style_payloads(node)
     }
 
     pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<FfiReplacedContentFacts> {
@@ -138,8 +150,7 @@ impl<'arena> LayoutPass<'arena> {
     }
 
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'arena>> {
-        self.arena
-            .style_payloads(node)
+        self.style_payloads_if_styled(node)
             .map(|payloads| ComputedValuesView::new(&payloads.groups))
     }
 

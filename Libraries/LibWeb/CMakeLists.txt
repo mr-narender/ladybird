@@ -39,36 +39,16 @@ set(SOURCES
     Compositor/NavigablePresenter.cpp
     Compositor/RenderClock.cpp
     ContentSecurityPolicy/BlockingAlgorithms.cpp
-    ContentSecurityPolicy/Directives/BaseUriDirective.cpp
-    ContentSecurityPolicy/Directives/ChildSourceDirective.cpp
-    ContentSecurityPolicy/Directives/ConnectSourceDirective.cpp
-    ContentSecurityPolicy/Directives/DefaultSourceDirective.cpp
     ContentSecurityPolicy/Directives/Directive.cpp
-    ContentSecurityPolicy/Directives/DirectiveFactory.cpp
     ContentSecurityPolicy/Directives/DirectiveOperations.cpp
-    ContentSecurityPolicy/Directives/FontSourceDirective.cpp
-    ContentSecurityPolicy/Directives/FormActionDirective.cpp
-    ContentSecurityPolicy/Directives/FrameAncestorsDirective.cpp
-    ContentSecurityPolicy/Directives/FrameSourceDirective.cpp
-    ContentSecurityPolicy/Directives/ImageSourceDirective.cpp
+    ContentSecurityPolicy/Directives/FetchIntegration.cpp
+    ContentSecurityPolicy/Directives/HTMLIntegration.cpp
     ContentSecurityPolicy/Directives/KeywordSources.cpp
     ContentSecurityPolicy/Directives/KeywordTrustedTypes.cpp
-    ContentSecurityPolicy/Directives/ManifestSourceDirective.cpp
-    ContentSecurityPolicy/Directives/MediaSourceDirective.cpp
     ContentSecurityPolicy/Directives/Names.cpp
-    ContentSecurityPolicy/Directives/ObjectSourceDirective.cpp
-    ContentSecurityPolicy/Directives/ReportToDirective.cpp
-    ContentSecurityPolicy/Directives/ReportUriDirective.cpp
-    ContentSecurityPolicy/Directives/SandboxDirective.cpp
-    ContentSecurityPolicy/Directives/ScriptSourceAttributeDirective.cpp
-    ContentSecurityPolicy/Directives/ScriptSourceDirective.cpp
-    ContentSecurityPolicy/Directives/ScriptSourceElementDirective.cpp
     ContentSecurityPolicy/Directives/SourceExpression.cpp
-    ContentSecurityPolicy/Directives/StyleSourceAttributeDirective.cpp
-    ContentSecurityPolicy/Directives/StyleSourceDirective.cpp
-    ContentSecurityPolicy/Directives/StyleSourceElementDirective.cpp
-    ContentSecurityPolicy/Directives/WebRTCDirective.cpp
-    ContentSecurityPolicy/Directives/WorkerSourceDirective.cpp
+    ContentSecurityPolicy/Directives/WebRTCIntegration.cpp
+    ContentSecurityPolicy/FetchIntegration.cpp
     ContentSecurityPolicy/Policy.cpp
     ContentSecurityPolicy/PolicyList.cpp
     ContentSecurityPolicy/SecurityPolicyViolationEvent.cpp
@@ -173,6 +153,8 @@ set(SOURCES
     CSS/FontFaceSet.cpp
     CSS/FontFaceSetLoadEvent.cpp
     CSS/Frequency.cpp
+    CSS/Highlight.cpp
+    CSS/HighlightRegistry.cpp
     CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
     CSS/Invalidation/AttributeInvalidator.cpp
@@ -349,6 +331,7 @@ set(SOURCES
     Editing/ReplacementRangeCleanup.cpp
     Editing/ReplacementStyleCleanup.cpp
     Editing/SpellCheckController.cpp
+    Editing/WritingSuggestionController.cpp
     Editing/SpellingMarkers.cpp
     Editing/StyledMarkupAccumulator.cpp
     Editing/StyledMarkupSelection.cpp
@@ -358,13 +341,20 @@ set(SOURCES
     EncryptedMediaExtensions/Algorithms.cpp
     EncryptedMediaExtensions/MediaKeySystemAccess.cpp
     EntriesAPI/FileSystemEntry.cpp
+    EventTiming/EventCounts.cpp
+    EventTiming/EventTiming.cpp
     EventTiming/PerformanceEventTiming.cpp
     Fetch/Body.cpp
     Fetch/BodyInit.cpp
+    Fetch/Engine/FetchBodyDeliveryGate.cpp
+    Fetch/Engine/FetchByteChannel.cpp
     Fetch/Engine/FetchExecutor.cpp
     Fetch/Engine/InlineFetchExecutor.cpp
+    Fetch/Engine/WholeBodyTransport.cpp
+    Fetch/Fetching/BodyStreamPullSource.cpp
     Fetch/Fetching/Checks.cpp
     Fetch/Fetching/FetchedDataReceiver.cpp
+    Fetch/Fetching/NetworkBodyPump.cpp
     Fetch/Fetching/Fetching.cpp
     Fetch/Fetching/PendingResponse.cpp
     Fetch/Fetching/RefCountedFlag.cpp
@@ -594,6 +584,7 @@ set(SOURCES
     HTML/NavigationObserver.cpp
     HTML/NavigationParams.cpp
     HTML/NavigationParamsDescriptor.cpp
+    HTML/NavigationPrecommitController.cpp
     HTML/NavigationTransition.cpp
     HTML/Navigator.cpp
     HTML/NavigatorBeacon.cpp
@@ -723,6 +714,7 @@ set(SOURCES
     Internals/XRTest.cpp
     IntersectionObserver/IntersectionObserver.cpp
     IntersectionObserver/IntersectionObserverEntry.cpp
+    LargestContentfulPaint/LargestContentfulPaint.cpp
     Layout/Box.cpp
     Layout/ImageProvider.cpp
     Layout/LayoutRustBridge.cpp
@@ -775,6 +767,8 @@ set(SOURCES
     Page/PageCursor.cpp
     Page/RenderingStats.cpp
     Page/ScreenWakeLockHandle.cpp
+    PaintTiming/PaintTiming.cpp
+    PaintTiming/PerformancePaintTiming.cpp
     Painting/Blending.cpp
     Painting/BoxModelMetrics.cpp
     Painting/BoxViews.cpp
@@ -838,6 +832,7 @@ set(SOURCES
     Speech/SpeechSynthesis.cpp
     Speech/SpeechSynthesisUtterance.cpp
     Speech/SpeechSynthesisVoice.cpp
+    SRI/IntegrityPolicy.cpp
     SRI/SRI.cpp
     StorageAPI/NavigatorStorage.cpp
     StorageAPI/StorageAreaMirror.cpp
@@ -977,6 +972,7 @@ set(SOURCES
     WebLocks/LockManager.cpp
     WebLocks/LockRequest.cpp
     WebLocks/NavigatorLocks.cpp
+    WebAssembly/Builtins.cpp
     WebAssembly/Exception.cpp
     WebAssembly/Global.cpp
     WebAssembly/Instance.cpp
@@ -1012,6 +1008,7 @@ set(SOURCES
     WebAudio/DelayNode.cpp
     WebAudio/DynamicsCompressorNode.cpp
     WebAudio/GainNode.cpp
+    WebAudio/IIRFilterNode.cpp
     WebAudio/MediaElementAudioSourceNode.cpp
     WebAudio/MediaStreamAudioDestinationNode.cpp
     WebAudio/MediaStreamAudioSourceNode.cpp
@@ -1036,7 +1033,12 @@ set(SOURCES
     WebAudio/Rendering/RenderNodes.cpp
     WebAudio/ScriptProcessorNode.cpp
     WebAudio/StereoPannerNode.cpp
+    WebAudio/WaveShaperNode.cpp
     WebDriver/Actions.cpp
+    WebDriver/BiDi/BiDi.cpp
+    WebDriver/BiDi/BrowsingContext.cpp
+    WebDriver/BiDi/RemoteValue.cpp
+    WebDriver/BiDi/Script.cpp
     WebDriver/Contexts.cpp
     WebDriver/ElementLocationStrategies.cpp
     WebDriver/ElementReference.cpp

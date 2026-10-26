@@ -14,6 +14,7 @@ use crate::parser::ForbiddenTokens;
 use crate::parser::PRECEDENCE_COMMA;
 use crate::parser::Parser;
 use crate::parser::Position;
+use crate::parser::collect_binding_names;
 use crate::parser::is_strict_reserved_word;
 use crate::parser::is_unconditional_reserved_word;
 use crate::token::TokenType;
@@ -750,14 +751,14 @@ impl Parser<'_> {
 
         self.scope_collector.open_catch_scope();
 
+        let mut catch_pattern_names: Vec<StringId> = Vec::new();
         let parameter = if self.match_token(TokenType::ParenOpen) {
             self.consume();
             let parameter = if self.match_token(TokenType::CurlyOpen) || self.match_token(TokenType::BracketOpen) {
-                self.pattern_bound_names.clear();
                 let pattern = self.parse_binding_pattern();
+                let pattern_bound_names = std::mem::take(&mut self.pattern_bound_names);
                 // Materialize Utf16Strings for slice-based scope-collector calls.
-                let names_to_check: Vec<Utf16String> = self
-                    .pattern_bound_names
+                let names_to_check: Vec<Utf16String> = pattern_bound_names
                     .iter()
                     .map(|(n, _)| self.arena.strings[*n].clone())
                     .collect();
@@ -780,7 +781,8 @@ impl Parser<'_> {
                 self.scope_collector.add_catch_parameter_pattern(&bound_names);
                 // Register each binding pattern identifier for scope analysis
                 // so they get is_local() annotations (matching variable declarations).
-                let pattern_bound_ids: Vec<IdentifierId> = self.pattern_bound_names.iter().map(|(_, id)| *id).collect();
+                let pattern_bound_ids: Vec<IdentifierId> = pattern_bound_names.iter().map(|(_, id)| *id).collect();
+                catch_pattern_names = pattern_bound_names.iter().map(|(n, _)| *n).collect();
                 let Self {
                     scope_collector, arena, ..
                 } = self;
@@ -814,7 +816,7 @@ impl Parser<'_> {
                     &arena.strings,
                     &mut arena.scopes,
                 );
-                scope_collector.add_catch_parameter_identifier(&value, id);
+                scope_collector.add_catch_parameter_identifier(&value);
                 Some(CatchBinding::Identifier(id))
             } else {
                 self.expected("catch parameter");
@@ -829,7 +831,7 @@ impl Parser<'_> {
         // Collect catch parameter names (as StringIds) for post-body validation.
         let catch_names: Vec<StringId> = match &parameter {
             Some(CatchBinding::Identifier(id)) => vec![self.arena.identifiers[*id].name],
-            Some(CatchBinding::BindingPattern(_)) => self.pattern_bound_names.iter().map(|(n, _)| *n).collect(),
+            Some(CatchBinding::BindingPattern(_)) => catch_pattern_names,
             None => Vec::new(),
         };
 
@@ -841,45 +843,37 @@ impl Parser<'_> {
         if !catch_names.is_empty()
             && let StatementKind::Block(scope_id) = body.inner
         {
-            for child in &self.arena.scopes[scope_id].children.clone() {
+            let mut lexically_declared_names: HashSet<Utf16String> = HashSet::default();
+            for child in &self.arena.scopes[scope_id].children {
                 match &child.inner {
                     StatementKind::VariableDeclaration(vd) if vd.kind != DeclarationKind::Var => {
                         for decl in &vd.declarations {
-                            if let VariableDeclaratorTarget::Identifier(id) = decl.target {
-                                let id_name = self.arena.identifiers[id].name;
-                                for cn in &catch_names {
-                                    if *cn == id_name {
-                                        let n = String::from_utf16_lossy(self.arena.strings[*cn].as_slice());
-                                        self.syntax_error(&format!(
-                                            "Identifier '{n}' already declared as catch parameter"
-                                        ));
-                                    }
-                                }
-                            }
+                            collect_binding_names(&decl.target, &mut lexically_declared_names, &self.arena);
                         }
                     }
-                    StatementKind::FunctionDeclaration(fd) if fd.name.is_some() => {
-                        let id = fd.name.unwrap();
-                        let id_name = self.arena.identifiers[id].name;
-                        for cn in &catch_names {
-                            if *cn == id_name {
-                                let n = String::from_utf16_lossy(self.arena.strings[*cn].as_slice());
-                                self.syntax_error(&format!("Identifier '{n}' already declared as catch parameter"));
-                            }
+                    StatementKind::UsingDeclaration(data) => {
+                        for decl in &data.declarations {
+                            collect_binding_names(&decl.target, &mut lexically_declared_names, &self.arena);
+                        }
+                    }
+                    StatementKind::FunctionDeclaration(fd) => {
+                        if let Some(id) = fd.name {
+                            lexically_declared_names.insert(self.arena.name_of(id).clone());
                         }
                     }
                     StatementKind::ClassDeclaration(data) => {
                         if let Some(id) = data.name {
-                            let id_name = self.arena.identifiers[id].name;
-                            for cn in &catch_names {
-                                if *cn == id_name {
-                                    let n = String::from_utf16_lossy(self.arena.strings[*cn].as_slice());
-                                    self.syntax_error(&format!("Identifier '{n}' already declared as catch parameter"));
-                                }
-                            }
+                            lexically_declared_names.insert(self.arena.name_of(id).clone());
                         }
                     }
                     _ => {}
+                }
+            }
+            for cn in &catch_names {
+                let name = &self.arena.strings[*cn];
+                if lexically_declared_names.contains(name) {
+                    let n = String::from_utf16_lossy(name.as_slice());
+                    self.syntax_error(&format!("Identifier '{n}' already declared as catch parameter"));
                 }
             }
         }

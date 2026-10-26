@@ -34,6 +34,7 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/WebDriver/BiDi/BiDi.h>
 
 namespace Web::HTML {
 
@@ -199,6 +200,12 @@ HTML::WindowProxy* NavigableContainer::content_window()
 {
     if (!m_content_navigable)
         return nullptr;
+
+    // INTEROP: Browsers discard the navigables of a removed navigable container right away, while the spec only
+    //          destroys their documents in a later task. So a navigable in a destroyed subtree has no WindowProxy here.
+    if (m_content_navigable->is_in_a_destroyed_subtree())
+        return nullptr;
+
     return m_content_navigable->active_window_proxy().ptr();
 }
 
@@ -353,6 +360,12 @@ void NavigableContainer::destroy_the_child_navigable()
     //     and the navigable's own document too when another page hosts it. It then continues the destruction here.
     document().page().hold_navigable_being_destroyed({}, *navigable);
     document().page().client().page_did_request_child_navigable_unload(navigable->id());
+
+    // 10. Invoke WebDriver BiDi navigable destroyed with navigable.
+    // NB: The browser process holds the navigable tree, whose navigables are removed once their documents are
+    //     destroyed. It reports navigable's destruction as the tree is now, and ignores the URL given.
+    if (WebDriver::BiDi::is_active())
+        WebDriver::BiDi::navigation_event(*navigable, "browsingContext.contextDestroyed"sv, {}, document().url());
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document-and-its-descendants
@@ -610,6 +623,9 @@ ReplicatedContainerState NavigableContainer::replicated_container_state()
     state.local_name = local_name();
     state.iframe_referrer_policy = determine_iframe_element_referrer_policy(*this);
     state.container_policy = process_permissions_policy_attributes();
+    auto const& document_settings = document().relevant_settings_object();
+    state.document_insecure_requests_policy = document_settings.insecure_requests_policy();
+    state.document_upgrade_insecure_navigations_set = document_settings.upgrade_insecure_navigations_set();
     return state;
 }
 

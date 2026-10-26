@@ -63,6 +63,8 @@ public:
     void webdriver_did_set_current_browsing_context(u64 command_id, Web::HTML::CrossProcessId navigable_id);
     void did_handle_webdriver_mouse_event(u64 request_id);
     void webdriver_command_complete(u64 command_id, Web::WebDriver::Response);
+    void webdriver_bidi_event(Web::HTML::CrossProcessId navigable_id, String const& name, JsonValue params);
+    void webdriver_bidi_navigation_event(Web::HTML::CrossProcessId navigable_id, StringView name, Optional<Utf16String> const& navigation_id, URL::URL const&);
     void set_webdriver_session_config(Web::WebDriver::UserPromptHandler, Web::WebDriver::PageLoadStrategy, bool strict_file_interactability, JsonValue const& timeouts);
     ErrorOr<void> connect_to_web_ui(IPC::TransportHandle);
 
@@ -149,7 +151,7 @@ public:
     void run_navigation_unload_check(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id, Web::HTML::UnloadPromptShown);
     void did_receive_unload_check_result(Web::HTML::CrossProcessId check_id, Web::HTML::CheckIfUnloadingIsCanceledResult);
     void create_navigation_params(Web::HTML::NavigationPopulationRequest);
-    void deliver_posted_message(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor);
+    void deliver_posted_message(Web::HTML::CrossProcessId navigable_id, Web::HTML::MessageDescriptor);
     void cancel_navigation_params_creation(Web::HTML::CrossProcessId navigable_id, Utf16String const& navigation_id);
     void populate_navigation(Web::HTML::NavigationPopulationRequest, Web::HTML::NavigationPopulationResult);
     void cancel_download(u64 download_id);
@@ -355,6 +357,7 @@ private:
     virtual void page_did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem const&, StringView presentation_style) override;
     virtual void page_did_request_clipboard_entries(u64 request_id) override;
     virtual void page_did_request_spell_check(u64 request_id, Utf16String const& text) override;
+    virtual void page_did_request_writing_suggestion(u64 request_id, Utf16String const& text, u32 caret_offset) override;
     virtual void page_did_request_primary_paste() override;
     virtual void page_did_complete_paste_action() override;
     virtual void page_did_update_primary_selection(Utf16String const&) override;

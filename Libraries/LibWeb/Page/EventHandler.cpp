@@ -28,6 +28,7 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Editing/Internal/Algorithms.h>
+#include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/HTML/CloseWatcherManager.h>
 #include <LibWeb/HTML/DataTransfer.h>
 #include <LibWeb/HTML/DragDataStore.h>
@@ -318,11 +319,11 @@ static bool parent_element_for_event_dispatch(Layout::Node& target_layout_node, 
     }
 
     // An event aimed at a disabled form control is not dispatched, and neither is one aimed at
-    // anything under one.
+    // anything under one, including the contents of its shadow tree.
     // NB: The document outlives every live row of its arena.
     VERIFY(arena.document());
     auto& document = *arena.document();
-    for (auto ancestor = identity.resolve(document); ancestor; ancestor = ancestor->parent()) {
+    for (GC::Ptr<DOM::Node> ancestor = identity.resolve(document); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
         if (auto const* form_associated_element = as_if<HTML::FormAssociatedElement>(*ancestor); form_associated_element && !form_associated_element->enabled())
             return false;
     }
@@ -1897,8 +1898,14 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     if (native_editing_binding_resolved)
         native_command_document = m_navigable->active_document();
     auto dispatch_result = fire_keyboard_event(UIEvents::EventNames::keydown, m_navigable, key, modifiers, code_point, repeat);
-    if (dispatch_result != EventResult::Accepted)
+    if (dispatch_result != EventResult::Accepted) {
+        // A page that handles Tab or Escape itself gets the key, and the writing suggestion is dropped.
+        if (first_is_one_of(key, UIEvents::KeyCode::Key_Tab, UIEvents::KeyCode::Key_Escape)) {
+            if (auto document = m_navigable->active_document(); document && document->writing_suggestion_controller_if_exists())
+                document->writing_suggestion_controller_if_exists()->dismiss();
+        }
         return dispatch_result;
+    }
 
     // https://w3c.github.io/uievents/#event-type-keypress
     // If supported by a user agent, this event MUST be dispatched when a key is pressed down, if and only if that key
@@ -1936,7 +1943,23 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
 
     if (!(modifiers & UIEvents::KeyModifier::Mod_Ctrl)) {
         if (key == UIEvents::KeyCode::Key_Tab) {
-            return modifiers & UIEvents::KeyModifier::Mod_Shift ? focus_previous_element() : focus_next_element();
+            // Tab types in the writing suggestion that's showing, rather than moving focus. Shift+Tab never does.
+            if (!(modifiers & UIEvents::KeyModifier::Mod_Shift)) {
+                if (auto* controller = document->writing_suggestion_controller_if_exists()) {
+                    if (auto suggestion = controller->accept(); suggestion.has_value()) {
+                        auto* target = document->active_input_events_target();
+                        if (!target)
+                            return EventResult::Handled;
+                        FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertText, m_navigable, *suggestion));
+                        FIRE(fire_text_input_event(m_navigable, *suggestion));
+                        if (m_navigable->active_document() != document || !document->is_fully_active() || document->active_input_events_target() != target)
+                            return EventResult::Handled;
+                        target->handle_insert(UIEvents::InputTypes::insertText, *suggestion);
+                        return EventResult::Handled;
+                    }
+                }
+            }
+            return focus_sequentially(modifiers & UIEvents::KeyModifier::Mod_Shift ? HTML::SequentialFocusDirection::Backward : HTML::SequentialFocusDirection::Forward);
         }
     }
 
@@ -1946,6 +1969,14 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         // NB: Exit autoscroll if active before handling other close requests.
         if (m_middle_button_scroll_handler) {
             m_middle_button_scroll_handler = nullptr;
+            return EventResult::Handled;
+        }
+
+        // AD-HOC: The spec treats any Escape keydown that the page doesn't cancel as a close request. But while a
+        //         writing suggestion shows, Escape only dismisses it, as it does in native text fields — so dismissing
+        //         a suggestion in a modal dialog doesn't also close the dialog.
+        if (auto* controller = document->writing_suggestion_controller_if_exists(); controller && controller->showing().has_value()) {
+            controller->dismiss();
             return EventResult::Handled;
         }
 
@@ -2047,6 +2078,15 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
                 }
             }
             return EventResult::Handled;
+        }
+
+        // AD-HOC: Like in other engines, the up and down arrow keys step the value of a number input.
+        if ((key == UIEvents::KeyCode::Key_Up || key == UIEvents::KeyCode::Key_Down) && (modifiers & ~UIEvents::Mod_Keypad) == UIEvents::Mod_None) {
+            if (auto* input_element = as_if<HTML::HTMLInputElement>(document->focused_area().ptr()); input_element && input_element->type_state() == HTML::HTMLInputElement::TypeAttributeState::Number) {
+                auto direction = key == UIEvents::KeyCode::Key_Up ? HTML::HTMLInputElement::StepDirection::Up : HTML::HTMLInputElement::StepDirection::Down;
+                input_element->step_for_user_interaction(direction, HTML::HTMLInputElement::CommitChange::Yes);
+                return EventResult::Handled;
+            }
         }
 
         if (key == UIEvents::KeyCode::Key_Up || key == UIEvents::KeyCode::Key_Down) {
@@ -2926,76 +2966,73 @@ EventResult EventHandler::input_event(Utf16FlyString const& event_name, Utf16Fly
     return document->root().dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
 }
 
-EventResult EventHandler::focus_next_element()
+// https://html.spec.whatwg.org/multipage/interaction.html#sequential-focus-navigation
+EventResult EventHandler::focus_sequentially(HTML::SequentialFocusDirection direction)
 {
-    if (!m_navigable->active_document())
-        return EventResult::Dropped;
-    if (!m_navigable->active_document()->is_fully_active())
-        return EventResult::Dropped;
-
-    auto set_focus_to_first_focusable_element = [&] {
-        auto* element = m_navigable->active_document()->first_child_of_type<DOM::Element>();
-
-        for (; element; element = element->next_element_in_pre_order()) {
-            if (element->is_focusable()) {
-                HTML::run_focusing_steps(element, nullptr, HTML::FocusTrigger::Key);
-                return EventResult::Handled;
-            }
-        }
-
-        return EventResult::Dropped;
-    };
-
-    auto node = m_navigable->active_document()->sequential_focus_navigation_starting_point();
-    if (!node)
-        node = m_navigable->active_document()->focused_area();
-    if (!node)
-        return set_focus_to_first_focusable_element();
-
-    for (node = node->next_in_pre_order(); node && !node->is_focusable(); node = node->next_in_pre_order())
-        ;
-
-    if (!node)
-        return set_focus_to_first_focusable_element();
-
-    HTML::run_focusing_steps(node, nullptr, HTML::FocusTrigger::Key);
-    return EventResult::Handled;
-}
-
-EventResult EventHandler::focus_previous_element()
-{
-    if (!m_navigable->active_document())
-        return EventResult::Dropped;
-    if (!m_navigable->active_document()->is_fully_active())
+    auto document = m_navigable->active_document();
+    if (!document || !document->is_fully_active())
         return EventResult::Dropped;
 
-    auto set_focus_to_last_focusable_element = [&] {
-        // FIXME: This often returns the HTML element itself, which has no previous sibling.
-        auto* element = m_navigable->active_document()->last_child_of_type<DOM::Element>();
+    // 1. Let starting point be the currently focused area of a top-level traversable, if the user requested to move
+    //    focus sequentially from there, or else the top-level traversable itself, if the user instead requested to
+    //    move focus from outside the top-level traversable.
+    // NB: Without a focused element, we start from the navigable, which makes us start at the beginning (or end) of
+    //     the sequential focus navigation order.
+    Variant<GC::Ref<HTML::LocalNavigable>, GC::Ref<DOM::Node>> starting_point = GC::Ref<HTML::LocalNavigable> { *m_navigable };
+    if (auto focused_area = document->focused_area(); focused_area && !is<DOM::Document>(*focused_area))
+        starting_point = GC::Ref { *focused_area };
 
-        for (; element; element = element->previous_element_in_pre_order()) {
-            if (element->is_focusable()) {
-                HTML::run_focusing_steps(element, nullptr, HTML::FocusTrigger::Key);
-                return EventResult::Handled;
-            }
-        }
+    // 2. If there is a sequential focus navigation starting point defined and it is inside starting point, then let
+    //    starting point be the sequential focus navigation starting point instead.
+    if (auto sequential_starting_point = document->sequential_focus_navigation_starting_point(); sequential_starting_point && &sequential_starting_point->document() == document.ptr()) {
+        auto is_inside_starting_point = starting_point.visit(
+            [](GC::Ref<HTML::LocalNavigable>) { return true; },
+            [&](GC::Ref<DOM::Node> node) { return node->is_shadow_including_inclusive_ancestor_of(*sequential_starting_point); });
+        if (is_inside_starting_point)
+            starting_point = GC::Ref { *sequential_starting_point };
+    }
 
+    // 3. Let direction be "forward" if the user requested the next control, and "backward" if the user requested the
+    //    previous control.
+
+    // 4. Loop: Let selection mechanism be "sequential" if starting point is a navigable or if starting point is in its
+    //    Document's sequential focus navigation order.
+    //    Otherwise, starting point is not in its Document's sequential focus navigation order; let selection mechanism
+    //    be "DOM".
+    auto selection_mechanism = starting_point.visit(
+        [](GC::Ref<HTML::LocalNavigable>) { return HTML::SelectionMechanism::Sequential; },
+        [](GC::Ref<DOM::Node> node) {
+            auto order = HTML::sequential_focus_navigation_order(node->document());
+            auto is_in_order = order.find_first_index_if([&](auto const& element) { return element.ptr() == node.ptr(); }).has_value();
+            return is_in_order ? HTML::SelectionMechanism::Sequential : HTML::SelectionMechanism::DOM;
+        });
+
+    // 5. Let candidate be the result of running the sequential navigation search algorithm with starting point,
+    //    direction, and selection mechanism.
+    auto candidate = HTML::sequential_navigation_search(starting_point, direction, selection_mechanism);
+
+    // 6. If candidate is not null, then run the focusing steps for candidate and return.
+    if (candidate) {
+        HTML::run_focusing_steps(candidate, nullptr, HTML::FocusTrigger::Key);
+        return EventResult::Handled;
+    }
+
+    // 7. Otherwise, unset the sequential focus navigation starting point.
+    document->move_sequential_focus_navigation_starting_point_to(nullptr);
+
+    // 8. If starting point is a top-level traversable, or a focusable area in the top-level traversable, the user
+    //    agent should transfer focus to its own controls appropriately (if any), honouring direction, and then return.
+    // FIXME: 9. Otherwise, starting point is a focusable area in a child navigable. Set starting point to that child
+    //           navigable's parent and return to the step labeled loop.
+    // NB: We do not move focus to the browser's own controls, and keep focus inside a child navigable. In both cases,
+    //     we restart these steps with the navigable itself as the starting point, which the spec allows a user agent
+    //     without sequentially focusable controls to do.
+    if (starting_point.has<GC::Ref<HTML::LocalNavigable>>())
         return EventResult::Dropped;
-    };
-
-    auto node = m_navigable->active_document()->sequential_focus_navigation_starting_point();
-    if (!node)
-        node = m_navigable->active_document()->focused_area();
-    if (!node)
-        return set_focus_to_last_focusable_element();
-
-    for (node = node->previous_in_pre_order(); node && !node->is_focusable(); node = node->previous_in_pre_order())
-        ;
-
-    if (!node)
-        return set_focus_to_last_focusable_element();
-
-    HTML::run_focusing_steps(node, nullptr, HTML::FocusTrigger::Key);
+    candidate = HTML::sequential_navigation_search(GC::Ref<HTML::LocalNavigable> { *m_navigable }, direction, HTML::SelectionMechanism::Sequential);
+    if (!candidate)
+        return EventResult::Dropped;
+    HTML::run_focusing_steps(candidate, nullptr, HTML::FocusTrigger::Key);
     return EventResult::Handled;
 }
 

@@ -59,6 +59,7 @@
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceSet.h>
+#include <LibWeb/CSS/HighlightRegistry.h>
 #include <LibWeb/CSS/HypotheticalElement.h>
 #include <LibWeb/CSS/Invalidation/AdoptedStyleSheetInvalidator.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
@@ -89,9 +90,10 @@
 #include <LibWeb/CSS/TransitionEvent.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/ComputedValuesRustFFI.h>
-#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/HTMLIntegration.h>
 #include <LibWeb/ContentSecurityPolicy/Policy.h>
 #include <LibWeb/ContentSecurityPolicy/PolicyList.h>
+#include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/AccessibilityTreeNode.h>
 #include <LibWeb/DOM/AdoptedStyleSheets.h>
@@ -113,6 +115,7 @@
 #include <LibWeb/DOM/ElementByIdMap.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
+#include <LibWeb/DOM/EventDispatcher.h>
 #include <LibWeb/DOM/FragmentDirective.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/InputEventsTarget.h>
@@ -133,6 +136,7 @@
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Editing/SpellCheckController.h>
 #include <LibWeb/Editing/SpellingMarkers.h>
+#include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
@@ -260,7 +264,9 @@
 #include <LibWeb/UIEvents/PointerEvent.h>
 #include <LibWeb/UIEvents/PointerTypes.h>
 #include <LibWeb/UIEvents/TextEvent.h>
+#include <LibWeb/UpgradeInsecureRequests/AbstractOperations.h>
 #include <LibWeb/ViewTransition/ViewTransition.h>
+#include <LibWeb/WebDriver/BiDi/BiDi.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -498,6 +504,11 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->m_permissions_policy = permissions_policy.release_value();
     document->m_active_sandboxing_flag_set = navigation_params.final_sandboxing_flag_set;
     document->m_navigation_id = navigation_params.id;
+
+    // INTEROP: A document that a reload or a traversal populates has no navigation ID, and other engines give its load
+    //          one for WebDriver BiDi.
+    if (!document->m_navigation_id.has_value() && WebDriver::BiDi::is_active())
+        document->m_navigation_id = Utf16String::from_utf8(Crypto::generate_random_uuid());
     document->set_load_timing_info(load_timing_info);
     document->m_was_created_via_cross_origin_redirects = navigation_params.response->redirect_taint() != Fetch::Infrastructure::RedirectTaint::SameOrigin;
     document->m_about_base_url = navigation_params.about_base_url;
@@ -526,6 +537,9 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
 
     // 10. Set window's associated Document to document.
     window->set_associated_document(*document);
+
+    // NB: Upgrade Insecure Requests has a new Document inherit its browsing context's insecure requests policy.
+    UpgradeInsecureRequests::inherit_the_insecure_requests_policy_into_a_new_document(document->relevant_settings_object(), browsing_context);
 
     // 11. Set document's internal ancestor origin objects list to the result of running the internal ancestor origin
     //     objects list creation steps given document and navigationParams's iframe element referrer policy.
@@ -938,6 +952,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     m_style_scope.visit_edges(visitor);
+    m_paint_timing_state.visit_edges(visitor);
     m_commit_messages->visit_edges(visitor);
     for (auto const& import : m_pending_css_import_rules)
         import->visit_edges(visitor);
@@ -985,6 +1000,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_scripts);
     visitor.visit(m_all);
     visitor.visit(m_fonts);
+    visitor.visit(m_highlight_registry);
     visitor.visit(m_selection);
     visitor.visit(m_find_in_page_active_match);
     visitor.visit(m_find_in_page_highlighted_matches);
@@ -1035,6 +1051,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
         m_spelling_markers->visit_edges(visitor);
     if (m_spell_check_controller)
         m_spell_check_controller->visit_edges(visitor);
+    if (m_writing_suggestion_controller)
+        m_writing_suggestion_controller->visit_edges(visitor);
 
     for (auto& event : m_pending_animation_event_queue) {
         visitor.visit(event.event);
@@ -1076,7 +1094,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_local_storage_holder);
     visitor.visit(m_session_storage_holder);
     visitor.visit(m_render_blocking_elements);
-    visitor.visit(m_policy_container);
     visitor.visit(m_deferred_parser_start);
     visitor.visit(m_custom_element_registry);
     visitor.visit(m_ancestor_origins_list);
@@ -1188,6 +1205,8 @@ void Document::note_selection_changed()
     request_frame_for_pending_repaint();
     if (m_spell_check_controller)
         m_spell_check_controller->did_change_selection();
+    if (m_writing_suggestion_controller)
+        m_writing_suggestion_controller->did_change_selection();
 }
 
 void Document::update_highlight_states_if_needed(Layout::BegunRead const& read)
@@ -1271,6 +1290,13 @@ Editing::SpellCheckController& Document::spell_check_controller()
     if (!m_spell_check_controller)
         m_spell_check_controller = make<Editing::SpellCheckController>(*this);
     return *m_spell_check_controller;
+}
+
+Editing::WritingSuggestionController& Document::writing_suggestion_controller()
+{
+    if (!m_writing_suggestion_controller)
+        m_writing_suggestion_controller = make<Editing::WritingSuggestionController>(*this);
+    return *m_writing_suggestion_controller;
 }
 
 bool Document::has_spelling_markers() const
@@ -1503,13 +1529,19 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<Utf16String> const&, Opti
     // 17. Set the insertion point to point at just before the end of the input stream (which at this point will be empty).
     m_parser->tokenizer().update_insertion_point();
 
-    // 18. Set the parser's allow declarative shadow roots to true.
+    // FIXME: Preserve the parser's inherited allow declarative shadow roots value; the document open steps do not
+    //        override it.
     m_parser->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
 
-    // 19. Update the current document readiness of document to "loading".
+    // 18. Update the current document readiness of document to "loading".
     update_readiness(HTML::DocumentReadyState::Loading);
 
-    // 20. Return document.
+    // INTEROP: The HTML Standard leaves the during-loading navigation ID for WebDriver BiDi null for the contents that
+    //          document.open() loads. Other engines report the load of the contents as a navigation of its own.
+    if (WebDriver::BiDi::is_active())
+        m_navigation_id = Utf16String::from_utf8(Crypto::generate_random_uuid());
+
+    // 19. Return document.
     return this;
 }
 
@@ -3588,6 +3620,13 @@ GC::Ref<CSS::FontFaceSet> Document::fonts()
     return m_fonts;
 }
 
+GC::Ref<CSS::HighlightRegistry> Document::highlight_registry()
+{
+    if (!m_highlight_registry)
+        m_highlight_registry = CSS::HighlightRegistry::create(*this);
+    return *m_highlight_registry;
+}
+
 // https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-clear
 void Document::clear()
 {
@@ -4126,6 +4165,8 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
 
     if (navigable() && page().spell_checking_available())
         spell_check_controller().did_focus(m_focused_area);
+    if (m_writing_suggestion_controller)
+        m_writing_suggestion_controller->did_focus(m_focused_area);
 }
 
 Element const* Document::active_element() const
@@ -5973,6 +6014,44 @@ void Document::remove_from_script_blocking_style_sheet_set(Element& element)
     schedule_html_parser_end_check();
 }
 
+// https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#printing-steps
+void Document::run_the_printing_steps()
+{
+    // 1. The user agent may display a message to the user or return (or both).
+
+    // 2. If the active sandboxing flag set of document has the sandboxed modals flag set, then return.
+    if (has_flag(active_sandboxing_flag_set(), HTML::SandboxingFlagSet::SandboxedModals))
+        return;
+
+    // NB: The events go to the relevant global object of document, and to the active windows of its child navigables
+    //     that are in this process.
+    auto fire_print_event = [&](Utf16FlyString const& event_name) {
+        auto& window = HTML::relevant_window(*this);
+        window.dispatch_event(Event::create(event_name, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window))));
+        for (auto const& child_navigable : document_tree_child_navigables()) {
+            auto* local_child_navigable = as_if<HTML::LocalNavigable>(*child_navigable);
+            if (!local_child_navigable)
+                continue;
+            if (auto child_window = local_child_navigable->active_window())
+                child_window->dispatch_event(Event::create(event_name, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*child_window))));
+        }
+    };
+
+    // 3. The user agent must fire an event named beforeprint at the relevant global object of document, as well as
+    //    any child navigable in it.
+    fire_print_event(HTML::EventNames::beforeprint);
+
+    // FIXME: 4. The user agent should offer the user the opportunity to obtain a physical form (or the representation of
+    //           a physical form) of document. The user agent may wait for the user to either accept or decline before
+    //           returning; if so, the user agent must pause while the method is waiting. Even if the user agent doesn't
+    //           wait at this point, the user agent must use the state of the relevant documents as they are at this
+    //           point in the algorithm if and when it eventually creates the alternate form.
+
+    // 5. The user agent must fire an event named afterprint at the relevant global object of document, as well as any
+    //    child navigables in it.
+    fire_print_event(HTML::EventNames::afterprint);
+}
+
 void Document::set_ready_for_post_load_tasks(bool ready)
 {
     m_ready_for_post_load_tasks = ready;
@@ -6209,15 +6288,15 @@ void Document::set_active_sandboxing_flag_set(HTML::SandboxingFlagSet sandboxing
     m_active_sandboxing_flag_set = sandboxing_flag_set;
 }
 
-GC::Ref<HTML::PolicyContainer> Document::policy_container() const
+NonnullRefPtr<HTML::PolicyContainer> Document::policy_container() const
 {
     if (!m_policy_container) {
-        m_policy_container = GC::Heap::the().allocate<HTML::PolicyContainer>(GC::Heap::the());
+        m_policy_container = HTML::PolicyContainer::create();
     }
     return *m_policy_container;
 }
 
-void Document::set_policy_container(GC::Ref<HTML::PolicyContainer> policy_container)
+void Document::set_policy_container(NonnullRefPtr<HTML::PolicyContainer> policy_container)
 {
     m_policy_container = policy_container;
 }
@@ -6393,6 +6472,10 @@ void Document::run_unloading_cleanup_steps()
     FileAPI::run_unloading_cleanup_steps(*this);
     fully_exit_fullscreen();
     PictureInPicture::run_unloading_cleanup_steps(*this);
+
+    // https://w3c.github.io/webdriver-bidi/#event-script-realmDestroyed
+    if (WebDriver::BiDi::is_active())
+        WebDriver::BiDi::unloading_document_cleanup_steps(*this);
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
@@ -6612,22 +6695,21 @@ void Document::abort()
     //    or any queued tasks or any network data getting discarded,
     //    then make document unsalvageable given document and "fetch".
     bool canceled_fetch = false;
-    if (m_ongoing_navigation_fetch_controller && m_ongoing_navigation_fetch_controller->state() == Fetch::Infrastructure::FetchController::State::Ongoing) {
-        m_ongoing_navigation_fetch_controller->stop_fetch();
+    auto cancel_fetch = [&](GC::Ptr<Fetch::Infrastructure::FetchController> controller) {
+        if (!controller || controller->state() != Fetch::Infrastructure::FetchController::State::Ongoing)
+            return;
+        controller->stop_fetch();
         canceled_fetch = true;
-    }
+    };
+
+    cancel_fetch(m_ongoing_navigation_fetch_controller);
     m_ongoing_navigation_fetch_controller = nullptr;
 
     // AD-HOC: The fetch group belongs to the document's Window. Once the Window is associated with another document,
     //         as when the initial about:blank document is replaced, its fetches are not in the context of this document.
     if (auto window = this->window(); window && window->associated_document_if_any().ptr() == this) {
-        for (auto& fetch_record : relevant_settings_object().fetch_group()) {
-            auto controller = fetch_record.fetch_controller();
-            if (!controller || controller->state() != Fetch::Infrastructure::FetchController::State::Ongoing)
-                continue;
-            controller->stop_fetch();
-            canceled_fetch = true;
-        }
+        for (auto& fetch_record : relevant_settings_object().fetch_group())
+            cancel_fetch(fetch_record.fetch_controller());
     }
 
     if (canceled_fetch)
@@ -6635,9 +6717,13 @@ void Document::abort()
 
     // 3. If document's during-loading navigation ID for WebDriver BiDi is non-null, then:
     if (m_navigation_id.has_value()) {
-        // FIXME: 1. Invoke WebDriver BiDi navigation aborted with document's node navigable and a new WebDriver BiDi
-        //           navigation status whose id is document's during-loading navigation ID for WebDriver BiDi, status
-        //           is "canceled", and url is document's URL.
+        // 1. Invoke WebDriver BiDi navigation aborted with document's node navigable and a new WebDriver BiDi navigation
+        //    status whose id is document's during-loading navigation ID for WebDriver BiDi, status is "canceled", and
+        //    url is document's URL.
+        if (WebDriver::BiDi::is_active()) {
+            if (auto navigable = this->navigable())
+                WebDriver::BiDi::navigation_event(*navigable, "browsingContext.navigationAborted"sv, m_navigation_id, url());
+        }
 
         // 2. Set document's during-loading navigation ID for WebDriver BiDi to null.
         m_navigation_id = {};
@@ -6804,13 +6890,10 @@ void Document::unload(GC::Ptr<Document> new_document)
     // 12. If oldDocument's salvageable state is false, then fire an event named unload at oldDocument's relevant global
     //     object, with legacy target override flag set.
     if (!m_salvageable) {
-        // then fire an event named unload at document's relevant global object, with legacy target override flag set.
-        // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
-        //        We should reorganize this so that the flag appears explicitly here instead.
         auto event = DOM::Event::create(
             HTML::EventNames::unload,
             HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
-        HTML::relevant_window(*this).dispatch_event(event);
+        EventDispatcher::dispatch(HTML::relevant_window(*this), event, true);
     }
 
     // 13. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event end time to the current high
@@ -7809,6 +7892,7 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
                     old_url.serialize(),
                     entry->url().serialize(),
                     HighResolutionTime::current_high_resolution_time(relevant_global_object));
+                hashchange_event->set_is_trusted(true);
                 HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object, GC::create_function(GC::Heap::the(), [hashchange_event, &window]() {
                     window.dispatch_event(hashchange_event);
                 }));
@@ -7879,8 +7963,18 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
     // 9. If documentIsNew is true, then:
     if (document_is_new) {
         // FIXME: 1. Assert: document's during-loading navigation ID for WebDriver BiDi is not null.
-        // FIXME: 2. Invoke WebDriver BiDi navigation committed with navigable and a new WebDriver BiDi navigation
-        //           status whose id is document's during-loading navigation ID for WebDriver BiDi, status is "committed", and url is document's URL
+        // 2. Invoke WebDriver BiDi navigation committed with navigable and a new WebDriver BiDi navigation status whose
+        //    id is document's during-loading navigation ID for WebDriver BiDi, status is "committed", and url is
+        //    document's URL
+        if (WebDriver::BiDi::is_active()) {
+            if (auto navigable = this->navigable()) {
+                WebDriver::BiDi::navigation_event(*navigable, "browsingContext.navigationCommitted"sv, m_navigation_id, url());
+
+                // AD-HOC: WebDriver BiDi creates the document's realm, and runs its preload scripts, once the document is
+                //         active in its navigable and before scripts may run for it.
+                WebDriver::BiDi::document_is_ready_for_scripts(*this);
+            }
+        }
 
         // 3. If scrollingBlockedInNewDocument is false, try to scroll to the fragment for document.
         if (!scrolling_blocked_in_new_document)
@@ -7918,12 +8012,12 @@ void Document::set_latest_entry(RefPtr<HTML::SessionHistoryEntry> entry)
     m_latest_entry = move(entry);
 }
 
-HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& Document::shared_resource_requests()
+HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>>& Document::shared_resource_requests()
 {
     return m_shared_resource_requests;
 }
 
-HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> const& Document::shared_resource_requests() const
+HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>> const& Document::shared_resource_requests() const
 {
     return m_shared_resource_requests;
 }
@@ -7980,7 +8074,7 @@ void Document::prune_image_resource_caches()
             auto const& request = *it.value;
             if (!request.can_be_pruned_from_memory_cache())
                 continue;
-            if (is_used_by_css_image_resource(it.key, request))
+            if (is_used_by_css_image_resource(it.key.url, request))
                 continue;
             ++count;
             if (auto image_data = request.image_data())
@@ -7993,25 +8087,25 @@ void Document::prune_image_resource_caches()
 
     auto size = cache_size();
     while (size.decoded_image_size > decoded_image_resource_cache_limit || size.decoded_image_count > decoded_image_resource_cache_count_limit) {
-        Optional<URL::URL> least_recently_used_url;
+        Optional<HTML::SharedResourceRequest::Key> least_recently_used_key;
         u64 least_recently_used_serial = NumericLimits<u64>::max();
 
         for (auto const& it : m_shared_resource_requests) {
             auto const& request = *it.value;
             if (!request.can_be_pruned_from_memory_cache())
                 continue;
-            if (is_used_by_css_image_resource(it.key, request))
+            if (is_used_by_css_image_resource(it.key.url, request))
                 continue;
             if (request.cache_touch_serial() >= least_recently_used_serial)
                 continue;
-            least_recently_used_url = it.key;
+            least_recently_used_key = it.key;
             least_recently_used_serial = request.cache_touch_serial();
         }
 
-        if (!least_recently_used_url.has_value())
+        if (!least_recently_used_key.has_value())
             break;
 
-        m_shared_resource_requests.remove(least_recently_used_url.value());
+        m_shared_resource_requests.remove(least_recently_used_key.value());
 
         auto new_size = cache_size();
         if (new_size.decoded_image_size == size.decoded_image_size && new_size.decoded_image_count == size.decoded_image_count)
@@ -9507,17 +9601,6 @@ WebIDL::ExceptionOr<void> Document::set_design_mode(Utf16View design_mode)
     return {};
 }
 
-static Element* retarget_from_ua_internal_shadow_root(Element& element)
-{
-    auto* result = &element;
-    while (auto shadow_root = result->containing_shadow_root()) {
-        if (!shadow_root->is_user_agent_internal())
-            break;
-        result = shadow_root->host();
-    }
-    return result;
-}
-
 // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
 Element const* Document::element_from_point(double x, double y)
 {
@@ -9698,18 +9781,8 @@ Vector<Utf16FlyString> Document::supported_property_names() const
     OrderedHashTable<Utf16FlyString> names;
 
     for (auto const& element : m_potentially_named_elements) {
-        // - the value of the name content attribute for all exposed embed, form, iframe, img, and exposed object elements
-        //   that have a non-empty name content attribute and are in a document tree with document as their root;
-        if ((is<HTML::HTMLEmbedElement>(*element) && is_exposed(element))
-            || is<HTML::HTMLFormElement>(*element)
-            || is<HTML::HTMLIFrameElement>(*element)
-            || is<HTML::HTMLImageElement>(*element)
-            || (is<HTML::HTMLObjectElement>(*element) && is_exposed(element))) {
-            if (auto name = element->name(); name.has_value()) {
-                names.set(name.value());
-            }
-        }
-
+        // NB: Values from id attributes come before values from name attributes when the same element contributes
+        //     both, so the id values are collected first.
         // - the value of the id content attribute for all exposed object elements that have a non-empty id content attribute
         //   and are in a document tree with document as their root; and
         if (is<HTML::HTMLObjectElement>(*element) && is_exposed(element)) {
@@ -9723,6 +9796,18 @@ Vector<Utf16FlyString> Document::supported_property_names() const
         if (is<HTML::HTMLImageElement>(*element)) {
             if (auto id = element->id(); id.has_value() && element->name().has_value()) {
                 names.set(id.value());
+            }
+        }
+
+        // - the value of the name content attribute for all exposed embed, form, iframe, img, and exposed object elements
+        //   that have a non-empty name content attribute and are in a document tree with document as their root;
+        if ((is<HTML::HTMLEmbedElement>(*element) && is_exposed(element))
+            || is<HTML::HTMLFormElement>(*element)
+            || is<HTML::HTMLIFrameElement>(*element)
+            || is<HTML::HTMLImageElement>(*element)
+            || (is<HTML::HTMLObjectElement>(*element) && is_exposed(element))) {
+            if (auto name = element->name(); name.has_value()) {
+                names.set(name.value());
             }
         }
     }
@@ -10067,8 +10152,11 @@ void Document::publish_animation_keyframes_for_style_update()
     // NB: Read before the walk, so that a change the walk itself makes walks again next time.
     m_animation_keyframes_published_generation = m_style_sheet_set_generation;
     auto* host = style_computer().style_engine().host();
-    for (auto const& departed : m_departed_animation_keyframes)
+    for (auto const& departed : m_departed_animation_keyframes) {
         CSS::StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(host, departed.tree_scope.value(), departed.shadow_root_identity, {}, {}, {});
+        if (departed.has_position_try_rules)
+            CSS::StyleEngineFFI::style_engine_set_tree_scope_position_try_rules(host, departed.tree_scope.value(), {}, {}, {});
+    }
     m_departed_animation_keyframes.clear();
     style_scope().build_rule_cache_if_needed();
     for_each_shadow_root([](DOM::ShadowRoot& shadow_root) {
@@ -11419,11 +11507,11 @@ Document::StepsToFireBeforeunloadResult Document::steps_to_fire_beforeunload(boo
 void Document::run_csp_initialization() const
 {
     // 1. For each policy of document’s policy container's CSP list:
-    for (auto policy : policy_container()->csp_list->policies()) {
+    for (auto const& policy : policy_container()->csp_list.policies()) {
         // 1. For each directive of policy:
-        for (auto directive : policy->directives()) {
+        for (auto const& directive : policy->directives()) {
             // 1. Execute directive’s initialization algorithm on document, and assert: its returned value is "Allowed".
-            auto result = directive->initialization(GC::Ref { *this }, policy);
+            auto result = ContentSecurityPolicy::Directives::initialization(directive, GC::Ref { *this }, policy);
             VERIFY(result == ContentSecurityPolicy::Directives::Directive::Result::Allowed);
         }
     }

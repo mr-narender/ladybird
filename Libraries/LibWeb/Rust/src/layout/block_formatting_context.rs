@@ -452,10 +452,12 @@ impl<'pass> BlockFormattingContext<'pass> {
         self.table_box_in_wrapper_border_box_block_size.get()
     }
 
+    #[inline]
     fn facts(&self, node: Node) -> NodeFacts<'_> {
         NodeFacts::new(&self.run.callbacks, node)
     }
 
+    #[inline]
     fn style(&self, node: Node) -> StyleValues<'pass> {
         StyleValues::for_node(&self.run.callbacks, node)
     }
@@ -520,6 +522,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         ancestor == node || self.is_ancestor_of(ancestor, node)
     }
 
+    #[inline]
     pub(crate) fn sizing(&self) -> sizing_context::SizingContext<'pass> {
         sizing_context::SizingContext::new(self.run.purpose, self.run.records, self.run.callbacks)
     }
@@ -3393,14 +3396,22 @@ impl<'pass> BlockFormattingContext<'pass> {
         };
 
         let mut baselines = formatting_context::DerivedBaselines::default();
-        let mut note_baselines = |first: Option<CssPixels>, last: Option<CssPixels>| {
-            if let Some(first) = first {
-                baselines.first = Some(baselines.first.map_or(first, |baseline| baseline.min(first)));
-            }
-            if let Some(last) = last {
-                baselines.last = Some(baselines.last.map_or(last, |baseline| baseline.max(last)));
-            }
-        };
+        let mut note_baselines =
+            |first: Option<CssPixels>, last: Option<CssPixels>, inline_alignment: Option<CssPixels>| {
+                if let Some(first) = first {
+                    baselines.first = Some(baselines.first.map_or(first, |baseline| baseline.min(first)));
+                }
+                if let Some(last) = last {
+                    baselines.last = Some(baselines.last.map_or(last, |baseline| baseline.max(last)));
+                }
+                if let Some(inline_alignment) = inline_alignment {
+                    baselines.inline_alignment = Some(
+                        baselines
+                            .inline_alignment
+                            .map_or(inline_alignment, |baseline| baseline.max(inline_alignment)),
+                    );
+                }
+            };
         let mut root_line_count = 0;
         let mut root_line_data_of_columns = Vec::new();
         let mut rows = Vec::new();
@@ -3460,6 +3471,10 @@ impl<'pass> BlockFormattingContext<'pass> {
                 note_baselines(
                     column_baselines.first.map(|baseline| baseline + row_block_offset),
                     column_baselines.last.map(|baseline| baseline + row_block_offset),
+                    column_baselines
+                        .inline_alignment
+                        .or(column_baselines.last)
+                        .map(|baseline| baseline + row_block_offset),
                 );
                 let Some(outgoing) = outcome.outgoing else {
                     break;
@@ -3514,6 +3529,14 @@ impl<'pass> BlockFormattingContext<'pass> {
                     spanner,
                     formatting_context::BaselineSet::Last,
                     formatting_context::ChildBaselineSource::Own,
+                ),
+                formatting_context::baseline_of_child_for_purpose(
+                    self.run.records,
+                    &self.run.callbacks,
+                    spanner,
+                    formatting_context::BaselineSet::Last,
+                    formatting_context::ChildBaselineSource::Own,
+                    formatting_context::BaselinePurpose::InlineAlignment,
                 ),
             );
             row_block_offset = row_block_offset.max(bottom_of_spanner_margin_box);

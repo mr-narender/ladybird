@@ -12,14 +12,14 @@
 use super::FfiCssPixelRect;
 use super::node_data::NodeSlotId;
 use super::used_values::FfiCssPixelSize;
-use crate::css::css_pixels::CssPixelRect;
+use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::style::tree::StyleNodeID;
 use crate::layout::text_queries::FfiDomTextRange;
 use crate::painting::ffi::{
     FfiBoxModelMetrics, FfiCaretRectResult, FfiEmptyLineCaretRect, FfiOptionalCssPixelRect, FfiRectToViewportTransform,
 };
-use crate::painting::paint_read::{GeometryRead, PaintRead, PaintSource};
+use crate::painting::paint_read::{GeometryRead, PaintRead, PaintRow, PaintSource};
 use crate::render_state::{DocumentHost, ScriptForcedRead};
 use std::ffi::c_void;
 
@@ -302,26 +302,13 @@ pub extern "C" fn layout_script_paintable_empty_line_caret_rect(
         style_source: NodeSlotId::INVALID,
     };
     *out = read_rows(host, |arena| {
-        let paintable_rows = arena;
-        if !paintable_rows.paintable_row_is_populated(block) {
-            return result;
-        }
         let fragments = arena.text_fragments(primary);
-        let node_slots = fragments.as_slice();
-        let side = arena.committed_side_data(block);
-        let Some(first_fragment) = side.fragments().first() else {
-            return result;
-        };
-        if !node_slots.contains(&first_fragment.layout_node) {
-            return result;
-        }
-        for target in crate::painting::visual_lines::empty_line_caret_targets(paintable_rows, block) {
-            if target.offset == offset {
-                result.has_value = true;
-                result.rect = target.rect.into();
-                result.style_source = crate::painting::text_fragment::style_source(paintable_rows, first_fragment);
-                break;
-            }
+        if let Some(caret) =
+            crate::painting::caret::caret_rect_on_empty_line(arena, block, fragments.as_slice(), offset)
+        {
+            result.has_value = true;
+            result.rect = caret.rect.into();
+            result.style_source = caret.style_source;
         }
         result
     });
@@ -350,6 +337,60 @@ pub extern "C" fn layout_script_paintable_absolute_padding_box_rect(
             return FfiCssPixelRect::default();
         }
         crate::painting::paintable_geometry::first_fragment_padding_box_rect(paintable_rows, slot).into()
+    });
+}
+
+/// Whether the box or one of its ancestors is sticky positioned, which moves the box by an offset that depends on the
+/// scroll position.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_has_sticky_positioned_inclusive_ancestor(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+) -> bool {
+    read_rows(host, |arena| {
+        let mut node = slot;
+        while let Some(row) = arena.node(node) {
+            if let Some(style) = row.style()
+                && crate::painting::style_queries::is_sticky_position(style)
+            {
+                return true;
+            }
+            node = row.parent();
+        }
+        false
+    })
+}
+
+/// The offset by which sticky positioning moves the box, as the sum of the offsets of the sticky positioned box and
+/// its sticky positioned ancestors.
+#[unsafe(no_mangle)]
+pub extern "C" fn layout_script_accumulated_sticky_offset(
+    host: &DocumentHost,
+    slot: NodeSlotId,
+    rect_to_viewport_transform: FfiRectToViewportTransform<'_>,
+    out: &mut crate::painting::ffi::FfiOptionalCssPixelPoint,
+) {
+    *out = read_rows(host, |arena| {
+        let mut result = crate::painting::ffi::FfiOptionalCssPixelPoint {
+            has_value: false,
+            x: CssPixels::from_raw(0),
+            y: CssPixels::from_raw(0),
+        };
+        let Some(transform) = rect_to_viewport_transform.transform() else {
+            return result;
+        };
+        if !arena.paintable_row_is_populated(slot) {
+            return result;
+        }
+        let spatial = arena.paintable_data(slot).accumulated_visual_context.spatial;
+        let offset = transform
+            .visual_context_tree
+            .accumulated_sticky_offset(spatial, transform.scroll_offsets);
+        let inverse_pixel_ratio = 1.0 / transform.device_pixels_per_css_pixel;
+        result.has_value = true;
+        result.x = CssPixels::nearest_value_for_f32(offset.x * inverse_pixel_ratio);
+        result.y = CssPixels::nearest_value_for_f32(offset.y * inverse_pixel_ratio);
+        result
     });
 }
 

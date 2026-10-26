@@ -472,6 +472,17 @@ impl<'a> SelectorParser<'a> {
             let Some(SimpleSelector::PseudoElement(pseudo_element)) = compound.simple_selectors.first() else {
                 continue;
             };
+            // https://drafts.csswg.org/css-pseudo-4/#highlight-selectors
+            // INTEROP: Selectors 4 allows logical combination and user action pseudo-classes after any
+            //          pseudo-element, but browsers reject every simple selector after a highlight pseudo-element.
+            //          ::search-text is checked above, as it allows :current.
+            if matches!(
+                pseudo_element.pseudo_element,
+                PseudoElementType::Highlight | PseudoElementType::Selection | PseudoElementType::SpellingError
+            ) && compound.simple_selectors.len() > 1
+            {
+                return Err(());
+            }
             // https://drafts.csswg.org/css-view-transitions-1/#pseudo-root
             // If a descendant pseudo of a pseudo-element root has no other siblings, then :only-child matches that
             // pseudo.
@@ -1001,6 +1012,20 @@ impl<'a> SelectorParser<'a> {
                 Ok(PseudoElementValue::CompoundSelector(CompiledSelector::new(Box::new([
                     compound,
                 ]))))
+            }
+            // https://drafts.csswg.org/css-pseudo-4/#typedef-highlight-name-selector
+            // <highlight-name-selector> = '*' | <custom-ident>
+            // FIXME: Support the '*' argument, which selects every custom highlight.
+            PseudoElementParameterType::HighlightNameSelector => {
+                let name = stream.next().and_then(ComponentValue::ident).ok_or(())?;
+                if is_css_wide_keyword(name) || ascii_eq(name, "default") {
+                    return Err(());
+                }
+                stream.discard_whitespace();
+                if !stream.is_empty() {
+                    return Err(());
+                }
+                Ok(PseudoElementValue::Identifiers(Box::new([name.into()])))
             }
             PseudoElementParameterType::IdentList => {
                 let mut identifiers = Vec::new();

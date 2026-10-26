@@ -626,6 +626,7 @@ fn generate_selector_pseudo_types(manifest_dir: &Path, out_dir: &Path) -> Result
         let parameter_type = match function_syntax {
             None => "None",
             Some("<compound-selector>") => "CompoundSelector",
+            Some("<highlight-name-selector>") => "HighlightNameSelector",
             Some("<ident>+") => "IdentList",
             Some("<pt-name-and-class-selector>") => "PTNameAndClassSelector",
             Some(argument) => return Err(format!("unsupported pseudo-element parameter type {argument}").into()),
@@ -2933,9 +2934,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     layout_config
         .includes
         .push("LibWeb/Layout/TreeBuilderRustFFI.h".to_string());
-    // A compositor animation effect state is opaque to C++, which holds it by pointer, and so is the paint server an
-    // SVG paint resource callback fills.
-    for name in ["CompositorAnimationEffectState", "PublishedSvgPaintServer"] {
+    // A compositor animation effect state is opaque to C++, which holds it by pointer, and so are the paint server an
+    // SVG paint resource callback fills and a parsed SVG path.
+    for name in [
+        "CompositorAnimationEffectState",
+        "PublishedSvgPaintServer",
+        "ParsedPath",
+    ] {
         layout_config.export.rename.insert(name.to_string(), "void".to_string());
         layout_config.export.exclude.push(name.to_string());
     }

@@ -22,11 +22,13 @@
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/EventTiming/EventTiming.h>
 #include <LibWeb/HTML/AnimationFrameCallbackDriver.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/ClockPlan.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventLoop/FrameCompletion.h>
+#include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #include <LibWeb/HTML/ListOfAvailableImages.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
@@ -40,10 +42,12 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/IndexedDB/Internal/Algorithms.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/TreeBuilderRustFFI.h>
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
+#include <LibWeb/PaintTiming/PaintTiming.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -906,6 +910,10 @@ void EventLoop::update_the_rendering()
             navigable->process_main_thread_smooth_scrolls();
             navigable->adopt_pending_async_scroll_offsets();
         }
+        // AD-HOC: A text control that script edited reveals its cursor now, once for all of the edits. See the note
+        //         at FormAssociatedTextControlElement::CursorRevealAfterEdit.
+        if (auto* text_control = as_if<FormAssociatedTextControlElement>(document->focused_area().ptr()))
+            text_control->reveal_cursor_if_pending();
         document->run_the_scroll_steps();
     }
 
@@ -936,6 +944,7 @@ void EventLoop::update_the_rendering()
     for (auto& document : docs) {
         auto now = relative_frame_timestamp_for(*document);
         run_animation_frame_callbacks(*document, now);
+        document->window()->animation_frame_callback_driver().run_after_callbacks(now);
     }
 
     // AD-HOC: Captures in this update's video frame and animation frame callbacks draw the frame that the video frame
@@ -1109,6 +1118,12 @@ static void update_style_and_layout_for_rendering(DOM::Document& document)
             continue;
         }
 
+        // https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
+        // At the time that ResizeObserver events are determined and delivered, the box must record the last
+        // successful position option.
+        if (auto* layout_node_arena = document.layout_node_arena_if_created())
+            Layout::RustFFI::render_state_record_last_successful_position_options(layout_node_arena->host());
+
         // 7. Otherwise, break.
         break;
     }
@@ -1230,7 +1245,22 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
 
     // FIXME: 20. For each doc of docs, record rendering time for doc given unsafeStyleAndLayoutStartTime.
 
-    // FIXME: 21. For each doc of docs, mark paint timing for doc.
+    // 21. For each doc of docs, mark paint timing for doc.
+    for (auto& document : docs) {
+        // AD-HOC: Script that ran earlier in this rendering update may have detached document from its navigable, as
+        //         in step 16. Nothing is rendered for it anymore.
+        if (!document->navigable() || document->navigable()->active_document().ptr() != document.ptr())
+            continue;
+        PaintTiming::mark_paint_timing(*document);
+    }
+
+    // https://w3c.github.io/event-timing/#sec-modifications-HTML
+    // For each fully active Document in docs, invoke the algorithm to dispatch pending Event Timing entries for that
+    // Document.
+    for (auto& document : docs) {
+        if (document->is_fully_active())
+            EventTiming::dispatch_pending_event_timing_entries(*document);
+    }
 
     // AD-HOC: Flush dirty canvas contexts in documents' pages after callbacks
     // have had a chance to update them, and before painting snapshots the frame.

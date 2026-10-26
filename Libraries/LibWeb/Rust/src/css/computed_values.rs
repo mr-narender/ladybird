@@ -2499,6 +2499,10 @@ impl StyleGroupMasks {
         }
         masks[index(DIRECTION)] |= logical_mapping_mask;
         masks[index(WRITING_MODE)] |= logical_mapping_mask;
+        // NB: The inherited UI group holds the used caret color, which `caret-color: auto` resolves against the
+        //     element's own color.
+        masks[index(crate::css::property_metadata::property_id::COLOR)] |=
+            1 << crate::css::table_group_builder::group_index::INHERITED_UI;
         Self { masks, output_masks }
     }
 
@@ -3827,7 +3831,15 @@ fn alignment_position_keyword(data: &RetainedStyleValueData, is_content: bool, u
                     Some(StyleValueData::Keyword { keyword: k::LAST })
                 ) =>
             {
-                Some(unsupported)
+                // https://drafts.csswg.org/css-align-3/#baseline-values
+                // The fallback alignment for last baseline is safe self-end (for self-alignment) or safe end (for
+                // content-distribution).
+                // FIXME: Participate in last-baseline alignment instead of always using the fallback alignment.
+                if is_content {
+                    Some(unsupported)
+                } else {
+                    Some(k::SELF_END)
+                }
             }
             values => match values.last()?.optional_data()? {
                 StyleValueData::Keyword { keyword } => Some(*keyword),
@@ -3851,6 +3863,8 @@ fn alignment_overflow(data: &RetainedStyleValueData) -> u8 {
         Some(StyleValueData::Keyword { keyword: k::UNSAFE }) => {
             crate::css::computed_value_types::OVERFLOW_ALIGNMENT_UNSAFE
         }
+        // NB: Last baseline computes to its fallback alignment, which is safe.
+        Some(StyleValueData::Keyword { keyword: k::LAST }) => crate::css::computed_value_types::OVERFLOW_ALIGNMENT_SAFE,
         _ => crate::css::computed_value_types::OVERFLOW_ALIGNMENT_DEFAULT,
     }
 }
