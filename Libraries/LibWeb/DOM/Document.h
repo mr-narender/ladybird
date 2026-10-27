@@ -1503,7 +1503,7 @@ public:
 
     Vector<GC::Root<Range>> find_matching_text(Utf16View, CaseSensitivity);
 
-    void parse_html_from_a_string(Utf16View);
+    void parse_html_from_a_string(Utf16View, HTML::SanitizerConfiguration const* = nullptr);
 
     void set_console_client(GC::Ptr<JS::ConsoleClient> console_client) { m_console_client = console_client; }
     GC::Ptr<JS::ConsoleClient> console_client() const { return m_console_client; }
@@ -2383,6 +2383,7 @@ private:
     GC::Ptr<Editing::EditingHistory> m_editing_history;
 
     bool m_inside_exec_command { false };
+    bool m_inside_clipboard_exec_command { false };
     bool m_running_editing_command_action { false };
     bool m_preserve_selection_offsets_during_identical_character_data_replacement { false };
 

@@ -19,6 +19,7 @@
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
 #include <LibWebView/WebDriverBiDi.h>
+#include <LibWebView/WebDriverBiDiNetwork.h>
 #include <LibWebView/WebDriverBrowserConnection.h>
 
 // Failures complete the command rather than propagate, so this macro may only be used in functions that take its
@@ -520,6 +521,9 @@ void WebDriverBiDi::top_level_traversable_is_closing(CanonicalNavigable const& t
 
 void WebDriverBiDi::top_level_traversable_did_close(String const& window_handle)
 {
+    if (m_network)
+        m_network->context_destroyed(window_handle);
+
     auto os_window = os_window_of(window_handle);
     m_tab_windows.remove(window_handle);
     m_viewport_defaults.remove(window_handle);
@@ -925,6 +929,20 @@ void WebDriverBiDi::run_command(u64 command_id, String const& method, JsonValue 
     }
     auto const& params = params_value.as_object();
 
+    if (method.starts_with_bytes("network."sv)) {
+        if (!m_network)
+            m_network = make<WebDriverBiDiNetwork>();
+        auto result = m_network->run_command(method, params, [](String const& id) -> ErrorOr<void, Web::WebDriver::Error> {
+            TRY(get_a_top_level_traversable(id));
+            return {};
+        });
+        if (result.is_error())
+            on_complete(result.release_error());
+        else
+            on_complete(result.release_value());
+        return;
+    }
+
     if (method == "browsingContext.activate"sv)
         return browsing_context_activate(params, move(on_complete));
     if (method == "browsingContext.close"sv)
@@ -941,7 +959,7 @@ void WebDriverBiDi::run_command(u64 command_id, String const& method, JsonValue 
         return browsing_context_set_viewport(params, move(on_complete));
     if (method == "browsingContext.traverseHistory"sv)
         return browsing_context_traverse_history(params, move(on_complete));
-    if (method.is_one_of("browsingContext.captureScreenshot"sv, "browsingContext.locateNodes"sv))
+    if (method.is_one_of("browsingContext.captureScreenshot"sv, "browsingContext.locateNodes"sv, "input.performActions"sv, "input.releaseActions"sv))
         return route_to_navigable(method, params, move(on_complete));
 
     if (method == "script.addPreloadScript"sv)

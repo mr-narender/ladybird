@@ -23,6 +23,7 @@ font-feature-settings: normal
 font-kerning: auto
 font-language-override: normal
 font-optical-sizing: auto
+font-palette: normal
 font-size: 16px
 font-size-adjust: none
 font-style: normal
@@ -41,9 +42,11 @@ font-variation-settings: normal
 font-weight: 400
 font-width: 100%
 forced-color-adjust: auto
+hyphenate-character: auto
 image-rendering: auto
 interpolate-size: numeric-only
 letter-spacing: normal
+line-break: auto
 line-height: normal
 list-style-image: none
 list-style-position: outside
@@ -71,6 +74,7 @@ text-align: start
 text-align-last: auto
 text-anchor: start
 text-decoration-skip-ink: auto
+text-emphasis-position: over
 text-indent: 0px
 text-justify: auto
 text-orientation: mixed
@@ -207,6 +211,7 @@ d: none
 display: block
 field-sizing: fixed
 filter: none
+fit-tolerance: normal
 flex-basis: auto
 flex-direction: row
 flex-grow: 0
@@ -379,3 +384,4 @@ will-change: auto
 x: 0px
 y: 0px
 z-index: auto
+zoom: 1

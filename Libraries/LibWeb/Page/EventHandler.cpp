@@ -1894,6 +1894,37 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         return EventResult::Handled;
     };
 
+    // A plain Tab types in a writing suggestion that's showing, rather than moving focus. The suggestion takes the key
+    // ahead of the page, as an input method does — so the page sees the keydown but can't cancel it.
+    if (key == UIEvents::KeyCode::Key_Tab && !(modifiers & (UIEvents::KeyModifier::Mod_Alt | UIEvents::KeyModifier::Mod_Ctrl | UIEvents::KeyModifier::Mod_Shift | UIEvents::KeyModifier::Mod_Super))) {
+        GC::Ref<DOM::Document> document = *m_navigable->active_document();
+        if (auto* controller = document->writing_suggestion_controller_if_exists(); controller && controller->can_accept()) {
+            auto* target = document->active_input_events_target();
+            if (!target)
+                return EventResult::Handled;
+            GC::Root<JS::Cell> rooted_target { target->as_cell() };
+
+            // https://w3c.github.io/uievents/#determine-keydown-keyup-keyCode
+            // If an Input Method Editor is processing key input and the event is keydown, return 229.
+            static constexpr u32 input_method_key_code = 229;
+            fire_keyboard_event(UIEvents::EventNames::keydown, m_navigable, key, modifiers, code_point, repeat, input_method_key_code);
+            if (m_navigable->active_document() != document || !document->is_fully_active() || document->active_input_events_target() != target)
+                return EventResult::Handled;
+
+            // A keydown listener that moved the caret or changed the text leaves nothing to accept.
+            auto suggestion = controller->accept();
+            if (!suggestion.has_value())
+                return EventResult::Handled;
+
+            FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertText, m_navigable, *suggestion));
+            FIRE(fire_text_input_event(m_navigable, *suggestion));
+            if (m_navigable->active_document() != document || !document->is_fully_active() || document->active_input_events_target() != target)
+                return EventResult::Handled;
+            target->handle_insert(UIEvents::InputTypes::insertText, *suggestion);
+            return EventResult::Handled;
+        }
+    }
+
     GC::Root<DOM::Document> native_command_document;
     if (native_editing_binding_resolved)
         native_command_document = m_navigable->active_document();
@@ -1942,25 +1973,8 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     GC::Ref<DOM::Document> document = *m_navigable->active_document();
 
     if (!(modifiers & UIEvents::KeyModifier::Mod_Ctrl)) {
-        if (key == UIEvents::KeyCode::Key_Tab) {
-            // Tab types in the writing suggestion that's showing, rather than moving focus. Shift+Tab never does.
-            if (!(modifiers & UIEvents::KeyModifier::Mod_Shift)) {
-                if (auto* controller = document->writing_suggestion_controller_if_exists()) {
-                    if (auto suggestion = controller->accept(); suggestion.has_value()) {
-                        auto* target = document->active_input_events_target();
-                        if (!target)
-                            return EventResult::Handled;
-                        FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::insertText, m_navigable, *suggestion));
-                        FIRE(fire_text_input_event(m_navigable, *suggestion));
-                        if (m_navigable->active_document() != document || !document->is_fully_active() || document->active_input_events_target() != target)
-                            return EventResult::Handled;
-                        target->handle_insert(UIEvents::InputTypes::insertText, *suggestion);
-                        return EventResult::Handled;
-                    }
-                }
-            }
+        if (key == UIEvents::KeyCode::Key_Tab)
             return focus_sequentially(modifiers & UIEvents::KeyModifier::Mod_Shift ? HTML::SequentialFocusDirection::Backward : HTML::SequentialFocusDirection::Forward);
-        }
     }
 
     // https://html.spec.whatwg.org/multipage/interaction.html#close-requests
@@ -2513,12 +2527,47 @@ static void write_data_transfer_to_clipboard(DOM::Document& document, HTML::Drag
         document.page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
 }
 
-// https://w3c.github.io/clipboard-apis/#the-copy-action
 EventResult EventHandler::perform_copy_action()
 {
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active())
         return EventResult::Dropped;
+    perform_copy_action(ClipboardActionTrigger::User);
+    return EventResult::Handled;
+}
+
+// Whether script may write to the clipboard, which it may do while its window has transient activation.
+static bool script_may_access_clipboard(DOM::Document& document)
+{
+    auto window = document.window();
+    return window && window->has_transient_activation();
+}
+
+static bool has_selected_password_input(DOM::Document& document)
+{
+    auto focused_area = document.focused_area();
+    auto const* input = focused_area ? as_if<HTML::HTMLInputElement>(*focused_area) : nullptr;
+    return input && input->type_state() == HTML::HTMLInputElement::TypeAttributeState::Password
+        && input->selection_start() != input->selection_end();
+}
+
+// https://w3c.github.io/clipboard-apis/#the-copy-action
+bool EventHandler::perform_copy_action(ClipboardActionTrigger trigger)
+{
+    auto document = m_navigable->active_document();
+    if (!document || !document->is_fully_active())
+        return false;
+
+    // 1. If the script-triggered flag is set, then
+    //    1. If the script-may-access-clipboard flag is unset, then
+    //       1. Return false from the copy action, terminate this algorithm
+    // INTEROP: Browsers fire the copy event before they check whether script may access the clipboard, so that web
+    //          apps can implement their own editor. They do not change the clipboard in that case.
+    auto may_access_clipboard = trigger == ClipboardActionTrigger::User || script_may_access_clipboard(*document);
+
+    // INTEROP: With clipboard access, a script clipboard command on a selected password input is a successful no-op.
+    if (trigger == ClipboardActionTrigger::Script && may_access_clipboard && has_selected_password_input(*document))
+        return true;
 
     auto data_store = HTML::DragDataStore::create();
     data_store->set_mode(HTML::DragDataStore::Mode::ReadWrite);
@@ -2528,12 +2577,21 @@ EventResult EventHandler::perform_copy_action()
     bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::copy, data_transfer);
     data_store->set_mode(HTML::DragDataStore::Mode::Protected);
 
+    // NB: The event listeners can make the document inactive, for example by removing its iframe.
+    if (!may_access_clipboard || !document->is_fully_active())
+        return false;
+
     // 3. If the event was not canceled, then:
     if (event_was_not_canceled) {
         // 1. Copy the selected contents, if any, to the clipboard. Implementations should create alternate text/html
         //    and text/plain clipboard formats when content in a web page is selected.
         auto text = m_navigable->selected_text();
         auto html = m_navigable->selected_html_for_clipboard();
+
+        // INTEROP: Browsers return false from a script-triggered copy if nothing is selected.
+        if (trigger == ClipboardActionTrigger::Script && text.is_empty() && html.is_empty())
+            return false;
+
         Vector<Clipboard::SystemClipboardRepresentation> representations;
         if (!html.is_empty())
             representations.empend("text/html"_string, html.to_byte_string());
@@ -2552,15 +2610,35 @@ EventResult EventHandler::perform_copy_action()
     }
 
     // 5. Return true from the copy action.
-    return EventResult::Handled;
+    return true;
 }
 
-// https://w3c.github.io/clipboard-apis/#the-cut-action
 EventResult EventHandler::perform_cut_action()
 {
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active())
         return EventResult::Dropped;
+    perform_cut_action(ClipboardActionTrigger::User);
+    return EventResult::Handled;
+}
+
+// https://w3c.github.io/clipboard-apis/#the-cut-action
+bool EventHandler::perform_cut_action(ClipboardActionTrigger trigger)
+{
+    auto document = m_navigable->active_document();
+    if (!document || !document->is_fully_active())
+        return false;
+
+    // 1. If the script-triggered flag is set, then
+    //    1. If the script-may-access-clipboard flag is unset, then
+    //       1. Return false from the cut action, terminate this algorithm
+    // INTEROP: Browsers fire the cut event before they check whether script may access the clipboard, so that web
+    //          apps can implement their own editor. They do not change the clipboard or the document in that case.
+    auto may_access_clipboard = trigger == ClipboardActionTrigger::User || script_may_access_clipboard(*document);
+
+    // INTEROP: With clipboard access, a script clipboard command on a selected password input is a successful no-op.
+    if (trigger == ClipboardActionTrigger::Script && may_access_clipboard && has_selected_password_input(*document))
+        return true;
 
     auto data_store = HTML::DragDataStore::create();
     data_store->set_mode(HTML::DragDataStore::Mode::ReadWrite);
@@ -2570,31 +2648,61 @@ EventResult EventHandler::perform_cut_action()
     bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::cut, data_transfer);
     data_store->set_mode(HTML::DragDataStore::Mode::Protected);
 
+    // NB: The event listeners can make the document inactive, for example by removing its iframe.
+    if (!may_access_clipboard || !document->is_fully_active())
+        return false;
+
     // 3. If the event was not canceled, then:
     if (event_was_not_canceled) {
         // 1. If there is a selection in an editable context where cutting is enabled, then:
-        if (auto* target = document->active_input_events_target()) {
-            auto text = m_navigable->selected_text();
-            auto html = m_navigable->selected_html_for_clipboard();
-            if (!text.is_empty() || !html.is_empty()) {
-                // 1. Copy the selected contents, if any, to the clipboard. Implementations should create alternate
-                //    text/html and text/plain clipboard formats when content in a web page is selected.
-                Vector<Clipboard::SystemClipboardRepresentation> representations;
-                if (!html.is_empty())
-                    representations.empend("text/html"_string, html.to_byte_string());
-                if (!text.is_empty())
-                    representations.empend("text/plain"_string, text.to_byte_string());
+        auto* target = document->active_input_events_target();
+        if (!target)
+            return false;
+        auto text = m_navigable->selected_text();
+        auto html = m_navigable->selected_html_for_clipboard();
+        if (!text.is_empty() || !html.is_empty()) {
+            if (auto focused_area = document->focused_area()) {
+                if (auto* control = as_if<HTML::FormAssociatedTextControlElement>(*focused_area);
+                    control && !as<HTML::FormAssociatedElement>(control->text_control_to_html_element()).is_mutable())
+                    return true;
+            }
+            auto target_cell = target->as_cell();
+            auto scope = target->mouse_selection_scope();
+            if (trigger == ClipboardActionTrigger::User && (!scope || !scope->is_connected()))
+                return false;
+            // 1. Copy the selected contents, if any, to the clipboard. Implementations should create alternate
+            //    text/html and text/plain clipboard formats when content in a web page is selected.
+            Vector<Clipboard::SystemClipboardRepresentation> representations;
+            if (!html.is_empty())
+                representations.empend("text/html"_string, html.to_byte_string());
+            if (!text.is_empty())
+                representations.empend("text/plain"_string, text.to_byte_string());
+            if (!representations.is_empty())
                 document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
 
-                // 2. Remove the contents of the selection from the document and collapse the selection.
-                // 4. Queue tasks to fire any events that should fire due to the modification.
-                FIRE(input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::deleteByCut, m_navigable, 0));
-                target->handle_delete(UIEvents::InputTypes::deleteByCut);
-
-                // FIXME: 3. Fire a clipboard event named clipboardchange.
+            // 2. Remove the contents of the selection from the document and collapse the selection.
+            // 4. Queue tasks to fire any events that should fire due to the modification.
+            // INTEROP: Browsers do not fire a beforeinput event for a script-triggered cut.
+            if (trigger == ClipboardActionTrigger::User) {
+                if (input_event(UIEvents::EventNames::beforeinput, UIEvents::InputTypes::deleteByCut, m_navigable, 0) == EventResult::Cancelled)
+                    return true;
+                if (m_navigable->active_document() != document || !document->is_fully_active())
+                    return false;
+                auto* current_target = document->active_input_events_target();
+                if (!current_target || current_target->as_cell() != target_cell || !scope->is_connected()
+                    || current_target->mouse_selection_scope() != scope)
+                    return false;
+                target = current_target;
             }
+            target->handle_delete(UIEvents::InputTypes::deleteByCut);
+
+            // FIXME: 3. Fire a clipboard event named clipboardchange.
         }
-        // 2. Else, there is no selection or the context is not editable; do nothing.
+        // 2. Else, if there is no selection or the context is not editable, then:
+        else {
+            // 1. Return false
+            return false;
+        }
     }
     // 4. Else, if the event was canceled, then:
     else {
@@ -2606,7 +2714,7 @@ EventResult EventHandler::perform_cut_action()
     }
 
     // 5. Return true from the cut action.
-    return EventResult::Handled;
+    return true;
 }
 
 // https://w3c.github.io/clipboard-apis/#paste-action
@@ -2849,7 +2957,7 @@ static GC::RootVector<GC::Ref<DOM::StaticRange>> target_ranges_for_input_event(D
     return target_ranges;
 }
 
-EventResult EventHandler::fire_keyboard_event(Utf16FlyString const& event_name, HTML::LocalNavigable& navigable, UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat)
+EventResult EventHandler::fire_keyboard_event(Utf16FlyString const& event_name, HTML::LocalNavigable& navigable, UIEvents::KeyCode key, u32 modifiers, u32 code_point, bool repeat, Optional<u32> key_code)
 {
     GC::Ptr<DOM::Document> document = navigable.active_document();
     if (!document)
@@ -2865,16 +2973,20 @@ EventResult EventHandler::fire_keyboard_event(Utf16FlyString const& event_name, 
                 auto* local_navigable = as_if<HTML::LocalNavigable>(*content_navigable);
                 if (!local_navigable)
                     return EventResult::Dropped;
-                return fire_keyboard_event(event_name, *local_navigable, key, modifiers, code_point, repeat);
+                return fire_keyboard_event(event_name, *local_navigable, key, modifiers, code_point, repeat, key_code);
             }
         }
 
         auto event = UIEvents::KeyboardEvent::create_from_platform_event(HTML::relevant_global_object(*document), event_name, key, modifiers, code_point, repeat);
+        if (key_code.has_value())
+            event->set_key_code(*key_code);
         return focused_area->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
     }
 
     // FIXME: De-duplicate this. This is just to prevent wasting a KeyboardEvent allocation when recursing into an (i)frame.
     auto event = UIEvents::KeyboardEvent::create_from_platform_event(HTML::relevant_global_object(*document), event_name, key, modifiers, code_point, repeat);
+    if (key_code.has_value())
+        event->set_key_code(*key_code);
 
     GC::Ptr target = document->body() ?: &document->root();
     return target->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
