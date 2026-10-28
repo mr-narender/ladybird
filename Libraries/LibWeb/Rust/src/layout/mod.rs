@@ -79,7 +79,6 @@ pub(crate) use crate::layout::layout_node_arena::{
     HostStyle, LayoutNodeArena, LiveRow, PublishedBoundRows, RowsVersion, SLOTS_PER_CHUNK, SampleKind, StyleRelayout,
 };
 use crate::layout::node_data::AncestorFact;
-pub use crate::layout::node_data::FfiReplacedContentFacts;
 pub use crate::layout::node_data::FfiStylePayloads;
 use crate::layout::node_data::NodeData;
 use crate::layout::node_data::NodeFlag;
@@ -112,4 +111,4 @@ pub(crate) use style_values::StyleValues;
 pub(crate) use tree_builder::build_keeps_box;
 pub(crate) use update_layout::MainThreadFfiEntry as UpdateMainThreadFfiEntry;
 pub(crate) use update_layout::{ClockRound, ClockRoundDeclined, FlownRound, SealedRound};
-pub(crate) use used_values::{FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, UsedValues};
+pub(crate) use used_values::{BoxMetricCells, FfiCssPixelPoint, FfiCssPixelRect, FfiCssPixelSize, UsedValues};

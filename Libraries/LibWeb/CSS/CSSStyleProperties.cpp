@@ -101,9 +101,12 @@ CSSStyleProperties::CSSStyleProperties(Computed computed, Readonly readonly, Rus
     set_owner_node(move(owner_node));
 }
 
+CSSStyleProperties::~CSSStyleProperties() = default;
+
 size_t CSSStyleProperties::external_memory_size() const
 {
-    return JS::saturating_add_external_memory_size(Base::external_memory_size(), m_declarations.external_memory_size());
+    auto size = JS::saturating_add_external_memory_size(Base::external_memory_size(), m_declarations.external_memory_size());
+    return JS::saturating_add_external_memory_size(size, m_cached_computed_custom_property_names.capacity() * sizeof(Utf16FlyString));
 }
 
 // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
@@ -122,6 +125,40 @@ static bool element_exposes_computed_style(DOM::Element const& element)
     return true;
 }
 
+Vector<Utf16FlyString> const& CSSStyleProperties::computed_custom_property_names() const
+{
+    auto const& element = *owner_node();
+    auto& document = element.document();
+    document.update_style_for_element(element);
+    auto data = element.custom_property_data();
+    auto registration_generation = document.custom_property_registration_generation();
+    if (m_cached_computed_custom_property_document.ptr().ptr() == &document
+        && m_cached_computed_custom_property_data == data
+        && m_cached_custom_property_registration_generation == registration_generation)
+        return m_cached_computed_custom_property_names;
+
+    HashTable<Utf16FlyString> names;
+    if (data) {
+        data->for_each_property([&](Utf16FlyString const& name, StyleProperty const& property) {
+            if (!property.value->is_guaranteed_invalid())
+                names.set(name);
+        });
+    }
+    document.for_each_registered_custom_property([&](CustomPropertyRegistration const& registration) {
+        if (registration.initial_value && !registration.initial_value->is_guaranteed_invalid())
+            names.set(registration.property_name);
+    });
+    m_cached_computed_custom_property_names.clear_with_capacity();
+    m_cached_computed_custom_property_names.ensure_capacity(names.size());
+    for (auto const& name : names)
+        m_cached_computed_custom_property_names.unchecked_append(name);
+    quick_sort(m_cached_computed_custom_property_names);
+    m_cached_computed_custom_property_document = document;
+    m_cached_computed_custom_property_data = move(data);
+    m_cached_custom_property_registration_generation = registration_generation;
+    return m_cached_computed_custom_property_names;
+}
+
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-length
 size_t CSSStyleProperties::length() const
 {
@@ -131,7 +168,7 @@ size_t CSSStyleProperties::length() const
             return 0;
         if (!element_exposes_computed_style(owner_node()->element()))
             return 0;
-        return number_of_longhand_properties;
+        return number_of_longhand_properties + computed_custom_property_names().size();
     }
 
     return properties().size() + custom_properties().size();
@@ -147,6 +184,8 @@ Utf16String CSSStyleProperties::item(size_t index) const
         return {};
 
     if (is_computed()) {
+        if (index >= number_of_longhand_properties)
+            return computed_custom_property_names()[index - number_of_longhand_properties].to_utf16_string();
         auto property_id = static_cast<PropertyID>(index + to_underlying(first_longhand_property_id));
         return string_from_property_id(property_id).to_utf16_string();
     }
@@ -467,14 +506,9 @@ WebIDL::ExceptionOr<void> CSSStyleProperties::set_property_style_value(PropertyN
     }
 
     if (property.is_custom_property()) {
-        if (auto existing_property = custom_property(property.name()); existing_property.has_value()
-            && existing_property->important == Important::No
-            && *existing_property->value == *style_value) {
-            return {};
-        }
-
         prepare_to_update_style_attribute();
 
+        m_declarations.remove_custom(property.name());
         m_declarations.set_custom(property.name(),
             StyleProperty {
                 Important::No,
@@ -663,6 +697,7 @@ static void ensure_pseudo_element_style_for_cssom(Layout::BegunRead const& read,
 }
 
 static RefPtr<StyleValue const> resolve_color_style_value(StyleValue const&, Color, Optional<ColorResolutionStyle> = {});
+static NonnullRefPtr<StyleValue const> resolve_svg_color_style_value(StyleValue const&, ColorResolutionStyle);
 
 static bool is_min_or_max_size_property(PropertyID property_id)
 {
@@ -904,6 +939,11 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
                 switch (computed_property_id) {
                 case PropertyID::Color:
                     return resolve_color_style_value(*computed_value, computed_values->color(), ColorResolutionStyle::for_computed_values(*computed_values)).release_nonnull();
+                case PropertyID::Fill:
+                case PropertyID::FloodColor:
+                case PropertyID::StopColor:
+                case PropertyID::Stroke:
+                    return resolve_svg_color_style_value(*computed_value, ColorResolutionStyle::for_computed_values(*computed_values));
                 case PropertyID::CaretColor:
                     return resolve_color_style_value(*computed_value, computed_values->caret_color()).release_nonnull();
                 case PropertyID::BackgroundColor:
@@ -1113,6 +1153,26 @@ static RefPtr<StyleValue const> resolve_color_style_value(StyleValue const& styl
     return ColorStyleValue::create_from_color(computed_color, ColorSyntax::Modern);
 }
 
+// https://drafts.csswg.org/css-color-4/#resolving-color-values
+// The resolved value of a <color> is its used value.
+static NonnullRefPtr<StyleValue const> resolve_svg_color_style_value(StyleValue const& style_value, ColorResolutionStyle color_resolution_style)
+{
+    if (!style_value.depends_on_current_color())
+        return style_value;
+
+    if (style_value.is_value_list()) {
+        auto const& list = style_value.as_value_list();
+        auto values = list.values();
+        for (auto& value : values)
+            value = resolve_svg_color_style_value(*value, color_resolution_style);
+        return StyleValueList::create(move(values), list.separator());
+    }
+
+    if (auto color = style_value.to_color(color_resolution_style); color.has_value())
+        return resolve_color_style_value(style_value, *color, color_resolution_style).release_nonnull();
+    return style_value;
+}
+
 // https://svgwg.org/svg2-draft/geometry.html#Sizing
 // The CSS width and height properties are used for sizing some SVG elements. Specifically, they are used to size
 // ‘rect’, ‘svg’, ‘image’ and ‘foreignObject’.
@@ -1273,6 +1333,11 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
         VERIFY(style);
         return resolve_color_style_value(*get_computed_value(property_id), style->color(), ColorResolutionStyle::for_element(*owner_node()));
     }
+    case PropertyID::Fill:
+    case PropertyID::FloodColor:
+    case PropertyID::StopColor:
+    case PropertyID::Stroke:
+        return resolve_svg_color_style_value(*get_computed_value(property_id), color_resolution_style);
     case PropertyID::ColumnRuleColor:
         return resolve_color_style_value(*get_computed_value(property_id), layout_node.column_rule_color(), color_resolution_style);
     case PropertyID::OutlineColor:

@@ -774,10 +774,14 @@ void Element::download_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTM
     //         document's relevant settings object is used as the request client instead.
     auto request = Fetch::Infrastructure::Request::create();
     request->set_url(url);
-    request->set_client(&document().relevant_settings_object());
+    request->set_client(document().relevant_settings_object().address());
     request->set_initiator(Fetch::Infrastructure::Request::Initiator::Download);
     request->set_use_url_credentials(true);
     // NB: The synchronous flag is not set; the response is instead processed asynchronously on the main thread.
+
+    // AD-HOC: The request's referrer policy is subject's hyperlink referrer policy, as when following the hyperlink.
+    //         See https://github.com/whatwg/html/issues/5623
+    request->set_referrer_policy(hyperlink_referrer_policy());
 
     //    3. Let response be the result of fetching request.
     //    4. Handle as a download response with subject's node navigable and null.
@@ -6261,19 +6265,24 @@ void Element::set_last_relative_scroll_direction(u8 direction)
 // That is why the unchecked layout node accessor is the right one here.
 void Element::set_scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type, CSSPixelPoint offset)
 {
+    Web::AsyncScrollNodeStableID stable_node_id { .node_id = unique_id(), .kind = Web::AsyncScrollNodeKind::Element };
     if (pseudo_element_type.has_value()) {
         auto pseudo_element = get_synthetic_pseudo_element(*pseudo_element_type);
         if (!pseudo_element.has_value())
             return;
         pseudo_element->set_scroll_offset(offset);
-        return;
+        stable_node_id.kind = Web::AsyncScrollNodeKind::PseudoElement;
+        stable_node_id.pseudo_element_type = static_cast<u8>(to_underlying(pseudo_element_type.value()));
+    } else {
+        if (!offset.is_zero())
+            ensure_element_rare_data().scroll_offset = offset;
+        else if (auto* rare_data = element_rare_data())
+            rare_data->scroll_offset = {};
+        Layout::publish_element_scroll_offset(*this);
     }
 
-    if (!offset.is_zero())
-        ensure_element_rare_data().scroll_offset = offset;
-    else if (auto* rare_data = element_rare_data())
-        rare_data->scroll_offset = {};
-    Layout::publish_element_scroll_offset(*this);
+    if (auto navigable = document().navigable())
+        navigable->did_change_scroll_offset(stable_node_id);
 }
 
 Optional<Element::Dir> Element::dir() const
@@ -7032,10 +7041,17 @@ Optional<Gfx::DecodedImageFrame> Element::capture_the_image()
 }
 
 // https://w3c.github.io/pointerevents/#dfn-active-pointer
-// A mouse connected to the device is always active, and it is the one pointer there is.
-static bool pointer_id_names_an_active_pointer(WebIDL::Long pointer_id)
+static bool pointer_id_names_an_active_pointer(Element const& element, WebIDL::Long pointer_id)
 {
-    return pointer_id == UIEvents::mouse_pointer_id;
+    if (pointer_id == UIEvents::mouse_pointer_id)
+        return true;
+    if (auto owner = element.document().navigable()) {
+        for (auto const& navigable : owner->page().hosted_navigables()) {
+            if (navigable->event_handler().is_active_pointer(pointer_id))
+                return true;
+        }
+    }
+    return false;
 }
 
 // https://w3c.github.io/pointerevents/#setting-pointer-capture
@@ -7043,7 +7059,7 @@ WebIDL::ExceptionOr<void> Element::set_pointer_capture(WebIDL::Long pointer_id)
 {
     // 1. If the pointerId provided as the method's argument does not match any of the active pointers, then throw a
     //    "NotFoundError" DOMException.
-    if (!pointer_id_names_an_active_pointer(pointer_id))
+    if (!pointer_id_names_an_active_pointer(*this, pointer_id))
         return WebIDL::NotFoundError::create("No active pointer has the given pointerId"_utf16);
 
     // 2. Let the pointer be the active pointer specified by the given pointerId.
@@ -7060,12 +7076,12 @@ WebIDL::ExceptionOr<void> Element::set_pointer_capture(WebIDL::Long pointer_id)
     if (!navigable)
         return {};
     auto& event_handler = navigable->event_handler();
-    if (!event_handler.is_mouse_pointer_in_active_buttons_state())
+    if (!event_handler.is_pointer_in_active_buttons_state(pointer_id))
         return {};
 
     // 6. For the specified pointerId, set the pending pointer capture target override to the Element on which this
     //    method was invoked.
-    event_handler.set_pending_pointer_capture_target_override({}, *this);
+    event_handler.set_pending_pointer_capture_target_override({}, pointer_id, *this);
     return {};
 }
 
@@ -7075,7 +7091,7 @@ WebIDL::ExceptionOr<void> Element::release_pointer_capture(WebIDL::Long pointer_
     // 1. If the pointerId provided as the method's argument does not match any of the active pointers and these steps
     //    are not being invoked as a result of the implicit release of pointer capture, then throw a "NotFoundError"
     //    DOMException.
-    if (!pointer_id_names_an_active_pointer(pointer_id))
+    if (!pointer_id_names_an_active_pointer(*this, pointer_id))
         return WebIDL::NotFoundError::create("No active pointer has the given pointerId"_utf16);
 
     // 2. If hasPointerCapture is false for the Element with the specified pointerId, then terminate these steps.
@@ -7083,7 +7099,7 @@ WebIDL::ExceptionOr<void> Element::release_pointer_capture(WebIDL::Long pointer_
         return {};
 
     // 3. For the specified pointerId, clear the pending pointer capture target override, if set.
-    document().navigable()->event_handler().clear_pending_pointer_capture_target_override({});
+    document().navigable()->event_handler().clear_pending_pointer_capture_target_override({}, pointer_id);
     return {};
 }
 
@@ -7093,12 +7109,10 @@ bool Element::has_pointer_capture(WebIDL::Long pointer_id) const
     // Indicates whether the element on which this method is invoked has pointer capture for the pointer identified by
     // the argument pointerId. In particular, returns true if the pending pointer capture target override for pointerId
     // is set to the element on which this method is invoked, and false otherwise.
-    if (!pointer_id_names_an_active_pointer(pointer_id))
-        return false;
     auto navigable = document().navigable();
     if (!navigable)
         return false;
-    return navigable->event_handler().pending_pointer_capture_target_override().ptr() == this;
+    return navigable->event_handler().pending_pointer_capture_target_override(pointer_id).ptr() == this;
 }
 
 GC::Ptr<NamedNodeMap> Element::attributes()

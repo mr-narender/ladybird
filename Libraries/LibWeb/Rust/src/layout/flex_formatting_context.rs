@@ -44,6 +44,8 @@ enum UsedFlexBasis<'pass> {
 
 struct FlexItem<'pass> {
     box_: Node,
+    /// The item's input cells as this flex container sizes it, which its run takes.
+    cells: used_values::RootInputCells,
     used_flex_basis: UsedFlexBasis<'pass>,
     used_flex_basis_is_definite: bool,
     main_size_was_resolved_from_aspect_ratio: bool,
@@ -77,9 +79,10 @@ struct FlexItem<'pass> {
 }
 
 impl FlexItem<'_> {
-    fn new(box_: Node) -> Self {
+    fn new(box_: Node, cells: used_values::RootInputCells) -> Self {
         Self {
             box_,
+            cells,
             used_flex_basis: UsedFlexBasis::Content,
             used_flex_basis_is_definite: false,
             main_size_was_resolved_from_aspect_ratio: false,
@@ -204,6 +207,15 @@ pub(super) struct FlexFormattingContext<'pass> {
     next_flex_item_lookup_start: Cell<usize>,
 }
 
+impl formatting_context::ChildrenSizedInParentCells for FlexFormattingContext<'_> {
+    fn child_input_cells(&self, node: Node) -> Option<used_values::RootInputCells> {
+        if self.run.callbacks.parent(node) != self.run.box_ {
+            return None;
+        }
+        Some(self.flex_items[self.index_of_flex_item(node)?].cells)
+    }
+}
+
 impl formatting_context::ChildRunShapes for FlexFormattingContext<'_> {
     fn child_run_shape_at(
         &self,
@@ -236,10 +248,7 @@ impl<'pass> FlexFormattingContext<'pass> {
     pub(super) fn new(run: &FormattingContextRun<'pass>) -> Self {
         let flex_direction = StyleValues::for_node(&run.callbacks, run.box_).effective_flex_direction();
         Self {
-            run: FormattingContextRun {
-                previous_line_data: None,
-                ..run.clone()
-            },
+            run: run.clone(),
             flex_lines: Vec::new(),
             flex_items: Vec::new(),
             derived_baselines_of_root_box: DerivedBaselines::default(),
@@ -253,8 +262,13 @@ impl<'pass> FlexFormattingContext<'pass> {
         }
     }
 
-    fn item_used(&self, index: usize) -> &'pass UsedValues {
-        self.run.records.used_values(self.flex_items[index].box_)
+    /// The sizes, size constraints and box sides of `node`, read from the cells this container sizes it in where it is
+    /// an item.
+    fn box_metrics(&self, node: Node) -> run_records::BoxMetrics<'pass> {
+        match formatting_context::ChildrenSizedInParentCells::child_input_cells(self, node) {
+            Some(cells) => run_records::BoxMetrics::BeingSizedByItsParent(cells),
+            None => self.run.records.box_metrics_of(node),
+        }
     }
 
     fn container_used(&self) -> &'pass UsedValues {
@@ -272,14 +286,16 @@ impl<'pass> FlexFormattingContext<'pass> {
 
     #[inline]
     fn sizing(&self) -> sizing_context::SizingContext<'pass, '_> {
-        sizing_context::SizingContext::new(self.run.records, self.run.callbacks).with_child_run_shapes(self)
+        sizing_context::SizingContext::new(self.run.records, self.run.callbacks)
+            .with_child_run_shapes(self)
+            .with_children_sized_in_parent_cells(self)
     }
 
-    fn create_used_values(&self, node: Node) -> &'pass UsedValues {
+    fn keep_item_for_its_run(&self, node: Node) -> used_values::RootInputCells {
         let constraints = self.item_percentage_bases;
         self.run
             .records
-            .create_used_values(&self.run.callbacks, node, constraints)
+            .keep_child_for_its_run(&self.run.callbacks, node, constraints)
     }
 
     fn constraints_for_child_context(
@@ -487,32 +503,32 @@ impl<'pass> FlexFormattingContext<'pass> {
         if style.box_sizing() != box_sizing::BORDER_BOX {
             return value;
         }
-        let used = self.run.records.used_values(node);
+        let metrics = self.box_metrics(node);
         if horizontal {
             formatting_context::subtract_border_box_adjustment(
                 value,
                 style.border_left_width(),
-                used.padding_left.get(),
+                metrics.padding_left(),
                 style.border_right_width(),
-                used.padding_right.get(),
+                metrics.padding_right(),
             )
         } else {
             formatting_context::subtract_border_box_adjustment(
                 value,
                 style.border_top_width(),
-                used.padding_top.get(),
+                metrics.padding_top(),
                 style.border_bottom_width(),
-                used.padding_bottom.get(),
+                metrics.padding_bottom(),
             )
         }
     }
 
-    fn has_definite_main_size_used(&self, used: &UsedValues) -> bool {
-        self.select_main(used.has_definite_inline_size(), used.has_definite_block_size())
+    fn has_definite_main_size_used(&self, metrics: &impl BoxMetricCells) -> bool {
+        self.select_main(metrics.has_definite_inline_size(), metrics.has_definite_block_size())
     }
 
-    fn has_definite_cross_size_used(&self, used: &UsedValues) -> bool {
-        self.select_cross(used.has_definite_inline_size(), used.has_definite_block_size())
+    fn has_definite_cross_size_used(&self, metrics: &impl BoxMetricCells) -> bool {
+        self.select_cross(metrics.has_definite_inline_size(), metrics.has_definite_block_size())
     }
 
     fn container_cross_size_is_known_for_layout(&self) -> bool {
@@ -526,47 +542,65 @@ impl<'pass> FlexFormattingContext<'pass> {
     }
 
     fn has_definite_main_size(&self, index: usize) -> bool {
-        self.has_definite_main_size_used(self.item_used(index))
+        self.has_definite_main_size_used(&self.flex_items[index].cells)
     }
 
     fn has_definite_cross_size(&self, index: usize) -> bool {
-        self.has_definite_cross_size_used(self.item_used(index))
+        self.has_definite_cross_size_used(&self.flex_items[index].cells)
     }
 
-    fn inner_main_size_used(&self, used: &UsedValues) -> CssPixels {
-        self.select_main(used.content_inline_size.get(), used.content_block_size.get())
+    fn inner_main_size_used(&self, metrics: &impl BoxMetricCells) -> CssPixels {
+        self.select_main(metrics.content_inline_size(), metrics.content_block_size())
     }
 
-    fn inner_cross_size_used(&self, used: &UsedValues) -> CssPixels {
-        self.select_cross(used.content_inline_size.get(), used.content_block_size.get())
+    fn inner_cross_size_used(&self, metrics: &impl BoxMetricCells) -> CssPixels {
+        self.select_cross(metrics.content_inline_size(), metrics.content_block_size())
     }
 
     fn inner_main_size(&self, index: usize) -> CssPixels {
-        self.inner_main_size_used(self.item_used(index))
+        self.inner_main_size_used(&self.flex_items[index].cells)
     }
 
     fn inner_cross_size(&self, index: usize) -> CssPixels {
-        self.inner_cross_size_used(self.item_used(index))
+        self.inner_cross_size_used(&self.flex_items[index].cells)
     }
 
     fn set_has_definite_main_size(&mut self, index: usize) {
-        let used = self.item_used(index);
-        self.select_main(&used.has_definite_inline_size, &used.has_definite_block_size)
-            .set(true);
+        let main_axis_is_horizontal = self.main_axis_is_horizontal();
+        let cells = &mut self.flex_items[index].cells;
+        if main_axis_is_horizontal {
+            cells.has_definite_inline_size = true;
+        } else {
+            cells.has_definite_block_size = true;
+        }
     }
 
     fn set_has_definite_cross_size(&mut self, index: usize) {
-        let used = self.item_used(index);
-        self.select_cross(&used.has_definite_inline_size, &used.has_definite_block_size)
-            .set(true);
+        let cross_axis_is_horizontal = self.cross_axis_is_horizontal();
+        let cells = &mut self.flex_items[index].cells;
+        if cross_axis_is_horizontal {
+            cells.has_definite_inline_size = true;
+        } else {
+            cells.has_definite_block_size = true;
+        }
     }
 
     fn set_main_size(&mut self, index: usize, size: CssPixels) {
-        self.set_main_size_used(self.item_used(index), size);
+        let main_axis_is_horizontal = self.main_axis_is_horizontal();
+        Self::set_size_of_item_cells(&mut self.flex_items[index].cells, main_axis_is_horizontal, size);
     }
 
     fn set_cross_size(&mut self, index: usize, size: CssPixels) {
-        self.set_cross_size_used(self.item_used(index), size);
+        let cross_axis_is_horizontal = self.cross_axis_is_horizontal();
+        Self::set_size_of_item_cells(&mut self.flex_items[index].cells, cross_axis_is_horizontal, size);
+    }
+
+    fn set_size_of_item_cells(cells: &mut used_values::RootInputCells, axis_is_horizontal: bool, size: CssPixels) {
+        if axis_is_horizontal {
+            cells.set_content_inline_size(size);
+        } else {
+            cells.set_content_block_size(size);
+        }
     }
 
     fn set_container_main_size(&mut self, size: CssPixels) {
@@ -836,11 +870,11 @@ impl<'pass> FlexFormattingContext<'pass> {
         let padding_top = style.padding_top().to_px(basis);
         let padding_bottom = style.padding_bottom().to_px(basis);
         {
-            let used = self.item_used(index);
-            used.padding_left.set(padding_left);
-            used.padding_right.set(padding_right);
-            used.padding_top.set(padding_top);
-            used.padding_bottom.set(padding_bottom);
+            let cells = &mut self.flex_items[index].cells;
+            cells.padding_left = padding_left;
+            cells.padding_right = padding_right;
+            cells.padding_top = padding_top;
+            cells.padding_bottom = padding_bottom;
         }
 
         let main_axis_is_horizontal = self.main_axis_is_horizontal();
@@ -890,7 +924,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         // calculations that could change that.
         // This is particularly important since we take references to the items stored in flex_items
         // later, whose addresses won't be stable if we added or removed any items.
-        let mut buckets: HashMap<i32, Vec<Node>> = HashMap::default();
+        let mut buckets: HashMap<i32, Vec<(Node, used_values::RootInputCells)>> = HashMap::default();
         for child in self.run.callbacks.children(self.run.box_) {
             let facts = self.facts(child);
             if facts.is_box() {
@@ -902,8 +936,11 @@ impl<'pass> FlexFormattingContext<'pass> {
                         node_facts::has_flag(facts.data(), NodeFlag::IsFlexItem),
                         "the facts of a flex item are derived before layout"
                     );
-                    self.create_used_values(child);
-                    buckets.entry(self.style(child).order()).or_default().push(child);
+                    let cells = self.keep_item_for_its_run(child);
+                    buckets
+                        .entry(self.style(child).order())
+                        .or_default()
+                        .push((child, cells));
                 }
             }
         }
@@ -911,8 +948,13 @@ impl<'pass> FlexFormattingContext<'pass> {
         self.flex_items.reserve_exact(buckets.values().map(Vec::len).sum());
         let keys = order_modified_keys(&buckets, self.is_direction_reverse());
         for key in keys {
-            self.flex_items
-                .extend(buckets.remove(&key).unwrap().into_iter().map(FlexItem::new));
+            self.flex_items.extend(
+                buckets
+                    .remove(&key)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(node, cells)| FlexItem::new(node, cells)),
+            );
         }
         for index in 0..self.flex_items.len() {
             self.populate_specified_margins(index);
@@ -1003,13 +1045,9 @@ impl<'pass> FlexFormattingContext<'pass> {
         let sizing = self.sizing();
         let node = self.flex_items[index].box_;
         let constraints = self.item_containing_block_constraints();
-        let used = self.item_used(index);
-        if used.has_definite_block_size() {
-            sizing.calculate_min_content_inline_size_at_definite_block_size(
-                node,
-                constraints,
-                used.content_block_size.get(),
-            )
+        let cells = &self.flex_items[index].cells;
+        if cells.has_definite_block_size {
+            sizing.calculate_min_content_inline_size_at_definite_block_size(node, constraints, cells.content_block_size)
         } else {
             sizing.calculate_min_content_inline_size(node, constraints)
         }
@@ -1019,13 +1057,9 @@ impl<'pass> FlexFormattingContext<'pass> {
         let sizing = self.sizing();
         let node = self.flex_items[index].box_;
         let constraints = self.item_containing_block_constraints();
-        let used = self.item_used(index);
-        if used.has_definite_block_size() {
-            sizing.calculate_max_content_inline_size_at_definite_block_size(
-                node,
-                constraints,
-                used.content_block_size.get(),
-            )
+        let cells = &self.flex_items[index].cells;
+        if cells.has_definite_block_size {
+            sizing.calculate_max_content_inline_size_at_definite_block_size(node, constraints, cells.content_block_size)
         } else {
             sizing.calculate_max_content_inline_size(node, constraints)
         }
@@ -1101,8 +1135,8 @@ impl<'pass> FlexFormattingContext<'pass> {
     }
 
     fn intrinsic_block_inline_size(&self, index: usize) -> CssPixels {
-        let mut available = self
-            .item_used(index)
+        let mut available = self.flex_items[index]
+            .cells
             .available_inner_space_or_constraints_from(self.available_space_for_items.unwrap().space);
         if available.inline_size == AvailableSize::Indefinite {
             available.inline_size = AvailableSize::definite(self.calculate_inline_size_for_intrinsic_block_size(index));
@@ -1299,10 +1333,10 @@ impl<'pass> FlexFormattingContext<'pass> {
         //           intrinsic size and no cross size to resolve the ratio against.
         //         - in response to cross size min/max constraints.
         let facts = self.facts(node);
-        if facts.has_auto_content_aspect_ratio()
+        if facts.auto_content_size().aspect_ratio.is_some()
             && !basis_is_definite
-            && !facts.has_auto_content_width()
-            && !facts.has_auto_content_height()
+            && !facts.auto_content_size().width.is_some()
+            && !facts.auto_content_size().height.is_some()
             && !self.has_definite_cross_size(index)
             && self.has_definite_main_size_used(self.container_used())
         {
@@ -1517,17 +1551,27 @@ impl<'pass> FlexFormattingContext<'pass> {
 
         // Repeat until all flex items have been collected into flex lines.
 
+        // NB: A column container resolves its automatic block size, including min/max constraints, before wrapping.
+        //     During intrinsic inline sizing that size is not yet known, and calc-size(auto, ...) keeps an
+        //     indefinite available main size even when its calculation changes the used size.
+        let available_main_size = if !self.main_axis_is_horizontal()
+            && crate::layout::sizing_context::is_plain_auto(self.computed_main_size(self.run.box_).0)
+            && self
+                .layout_input
+                .unwrap()
+                .sizing
+                .flex_self_block_size_resolution_space
+                .is_some()
+        {
+            AvailableSize::definite(self.inner_main_size_used(self.container_used()))
+        } else {
+            self.available_space_for_items.unwrap().main
+        };
         let mut line = FlexLine::default();
         let mut line_main_size = CssPixels::default();
         for index in 0..self.flex_items.len() {
             let outer = self.flex_items[index].outer_hypothetical_main_size();
-            if !line.items.is_empty()
-                && self
-                    .available_space_for_items
-                    .unwrap()
-                    .main
-                    .pixels_greater_than(line_main_size + outer)
-            {
+            if !line.items.is_empty() && available_main_size.pixels_greater_than(line_main_size + outer) {
                 if reverse {
                     line.items.reverse();
                 }
@@ -1758,6 +1802,17 @@ impl<'pass> FlexFormattingContext<'pass> {
                         distributed = distributed_including_item;
                     }
                 }
+            } else {
+                // INTEROP: Distributing no free space leaves the unfrozen items at their flex base size, rather than at
+                //          a target main size left over from a previous iteration of this loop. Otherwise, an item
+                //          that was shrunk before another item froze at its max size stays shrunk, even though the
+                //          line now has room for it.
+                for item_position in 0..item_count {
+                    let index = self.flex_lines[line_index].items[item_position];
+                    if !self.flex_items[index].frozen {
+                        self.flex_items[index].target_main_size = self.flex_items[index].flex_base_size;
+                    }
+                }
             }
 
             // d. Fix min/max violations.
@@ -1974,8 +2029,8 @@ impl<'pass> FlexFormattingContext<'pass> {
             // AD-HOC: For a replaced box whose only sizing information is a natural aspect ratio (e.g an SVG with a
             //         viewBox but no natural width or height) and an indefinite flex basis, we stretch-fit the cross size
             //         to the flex container instead of transferring the used main size through the aspect ratio.
-            let replaced_with_only_natural_ratio =
-                facts.is_replaced_box() && !(facts.has_auto_content_width() && facts.has_auto_content_height());
+            let replaced_with_only_natural_ratio = facts.is_replaced_box()
+                && !(facts.auto_content_size().width.is_some() && facts.auto_content_size().height.is_some());
             if replaced_with_only_natural_ratio
                 && !self.flex_items[index].used_flex_basis_is_definite
                 && self.has_definite_cross_size_used(self.container_used())
@@ -2273,15 +2328,25 @@ impl<'pass> FlexFormattingContext<'pass> {
     }
 
     fn set_main_axis_first_margin(&mut self, index: usize, margin: CssPixels) {
-        self.flex_items[index].margins.main_before = margin;
-        let used = self.item_used(index);
-        self.select_main(&used.margin_left, &used.margin_top).set(margin);
+        let main_axis_is_horizontal = self.main_axis_is_horizontal();
+        let item = &mut self.flex_items[index];
+        item.margins.main_before = margin;
+        if main_axis_is_horizontal {
+            item.cells.margin_left = margin;
+        } else {
+            item.cells.margin_top = margin;
+        }
     }
 
     fn set_main_axis_second_margin(&mut self, index: usize, margin: CssPixels) {
-        self.flex_items[index].margins.main_after = margin;
-        let used = self.item_used(index);
-        self.select_main(&used.margin_right, &used.margin_bottom).set(margin);
+        let main_axis_is_horizontal = self.main_axis_is_horizontal();
+        let item = &mut self.flex_items[index];
+        item.margins.main_after = margin;
+        if main_axis_is_horizontal {
+            item.cells.margin_right = margin;
+        } else {
+            item.cells.margin_bottom = margin;
+        }
     }
 
     // https://www.w3.org/TR/css-flexbox-1/#algo-main-align
@@ -2734,23 +2799,28 @@ impl<'pass> FlexFormattingContext<'pass> {
         if self.run.callbacks.frame.is_transposed() && self.cross_axis_is_horizontal() {
             // NB: The cross axis is the horizontal axis of the frame, along which an item in an orthogonal flow
             //     has its baselines.
-            let used = self.item_used(index);
-            let collapsed = used.uses_collapsing_borders_model.get();
-            let margin_box_left = used.margin_left.get() + used.border_box_left(collapsed);
-            return match used.orthogonal_flow_baselines().and_then(|baselines| baselines.first) {
+            let metrics = self.run.records.box_metrics_of(item.box_);
+            let collapsed = metrics.uses_collapsing_borders_model();
+            let margin_box_left = metrics.margin_left() + metrics.border_box_left(collapsed);
+            return match metrics
+                .orthogonal_flow_baselines()
+                .and_then(|baselines| baselines.first)
+            {
                 Some(baseline) => margin_box_left + baseline,
-                None => margin_box_left + used.content_inline_size.get() + used.border_box_right(collapsed),
+                None => margin_box_left + metrics.content_inline_size() + metrics.border_box_right(collapsed),
             };
         }
+        let metrics = self.run.records.box_metrics_of(item.box_);
         if self.item_baseline_is_synthesized(index) {
-            let used = self.item_used(index);
-            let collapsed = used.uses_collapsing_borders_model.get();
-            return used.margin_box_top(collapsed) + used.content_block_size.get() + used.border_box_bottom(collapsed);
+            let collapsed = metrics.uses_collapsing_borders_model();
+            return metrics.margin_box_top(collapsed)
+                + metrics.content_block_size()
+                + metrics.border_box_bottom(collapsed);
         }
         formatting_context::box_baseline_with_content_baselines(
             &self.run.callbacks,
             item.box_,
-            self.item_used(index),
+            &metrics,
             formatting_context::BaselineSet::First,
             item.content_baselines,
         )
@@ -2796,46 +2866,49 @@ impl<'pass> FlexFormattingContext<'pass> {
             } else {
                 self.flex_items[index].cross_size.unwrap()
             };
-            self.prepare_item_record(
-                index,
-                self.item_used(index),
-                self.flex_items[index].main_size,
-                Some(cross_size),
-            );
+            let mut cells = self.flex_items[index].cells;
+            self.size_item_cells_for_its_run(index, &mut cells, self.flex_items[index].main_size, Some(cross_size));
+            self.flex_items[index].cells = cells;
         }
     }
 
-    fn prepare_item_record(
+    /// Gives `cells`, the cells of the item at `index`, the margins and borders its run takes and the main and cross
+    /// sizes it is laid out at.
+    fn size_item_cells_for_its_run(
         &self,
         index: usize,
-        used: &UsedValues,
+        cells: &mut used_values::RootInputCells,
         main_size: Option<CssPixels>,
         cross_size: Option<CssPixels>,
     ) {
         let reference = self.container_used().content_inline_size.get();
         let style = self.style(self.flex_items[index].box_);
-        used.margin_left.set(style.margin_left().to_px(reference));
-        used.margin_right.set(style.margin_right().to_px(reference));
-        used.margin_top.set(style.margin_top().to_px(reference));
-        used.margin_bottom.set(style.margin_bottom().to_px(reference));
-        used.border_left.set(style.border_left_width());
-        used.border_right.set(style.border_right_width());
-        used.border_top.set(style.border_top_width());
-        used.border_bottom.set(style.border_bottom_width());
+        cells.margin_left = style.margin_left().to_px(reference);
+        cells.margin_right = style.margin_right().to_px(reference);
+        cells.margin_top = style.margin_top().to_px(reference);
+        cells.margin_bottom = style.margin_bottom().to_px(reference);
+        cells.border_left = style.border_left_width();
+        cells.border_right = style.border_right_width();
+        cells.border_top = style.border_top_width();
+        cells.border_bottom = style.border_bottom_width();
         if let Some(main_size) = main_size {
-            self.set_main_size_used(used, main_size);
+            Self::set_size_of_item_cells(cells, self.main_axis_is_horizontal(), main_size);
         }
         if let Some(cross_size) = cross_size {
-            self.set_cross_size_used(used, cross_size);
+            Self::set_size_of_item_cells(cells, self.cross_axis_is_horizontal(), cross_size);
         }
     }
 
-    fn item_layout_input(&self, index: usize, used: &UsedValues, space_for_items: AvailableSpace) -> LayoutInput {
+    fn item_layout_input(
+        &self,
+        index: usize,
+        cells: &used_values::RootInputCells,
+        space_for_items: AvailableSpace,
+    ) -> LayoutInput {
         let node = self.flex_items[index].box_;
         let mut input = LayoutInput {
-            available_space: used.available_inner_space_or_constraints_from(space_for_items),
+            available_space: cells.available_inner_space_or_constraints_from(space_for_items),
             containing_block_constraints: self.item_containing_block_constraints(),
-            content_box_position_in_bfc_root: None,
             sizing: RootSizingDirectives::default(),
             participation: ParticipationInParentFormattingContext::Item,
         };
@@ -2930,23 +3003,23 @@ impl<'pass> FlexFormattingContext<'pass> {
         } else {
             (None, Some(measured_inline_size))
         };
-        let record = used_values::RootInputCells::capture(self.item_used(index)).materialize_record();
-        self.prepare_item_record(index, &record, main_size, cross_size);
-        let input = self.item_layout_input(index, &record, space_for_items);
+        let mut cells = self.flex_items[index].cells;
+        self.size_item_cells_for_its_run(index, &mut cells, main_size, cross_size);
+        let input = self.item_layout_input(index, &cells, space_for_items);
         let plan = formatting_context::child_run_plan(&self.run, node, input, false)?;
         debug_assert_eq!(plan.fc_type, formatting_context::FormattingContextType::Block);
         Some(formatting_context::ChildRunShape {
             node,
             fc_type: plan.fc_type,
             input: plan.input,
-            root_cells: used_values::RootInputCells::capture(&record),
+            root_cells: cells,
             root_containing_block: plan.root_containing_block,
         })
     }
 
     fn measure_table_wrapper_block_sizes(&self, index: usize) -> sizing_context::TableWrapperBlockSizes {
-        let mut intrinsic_space = self
-            .item_used(index)
+        let mut intrinsic_space = self.flex_items[index]
+            .cells
             .available_inner_space_or_constraints_from(self.available_space_for_items.unwrap().space);
         intrinsic_space.block_size = AvailableSize::Indefinite;
         self.sizing().measure_table_box_block_size_inside_wrapper(
@@ -2956,26 +3029,33 @@ impl<'pass> FlexFormattingContext<'pass> {
         )
     }
 
-    fn layout_inside_item(&mut self, run: &FormattingContextRun<'pass>, index: usize) {
+    fn layout_inside_item(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        index: usize,
+    ) -> Option<fragment_tree::ChildFragmentArrival> {
         let node = self.flex_items[index].box_;
-        let input = self.item_layout_input(
-            index,
-            self.item_used(index),
-            self.available_space_for_items.unwrap().space,
-        );
-        self.flex_items[index].content_baselines =
-            match formatting_context::layout_inside_child(run, None, None, node, input, false) {
-                ChildLayoutOutcome::Created(result) => result.baselines,
-                ChildLayoutOutcome::ReenterCurrent => {
-                    self.run(run, input);
-                    self.item_used(index).content_baselines_from_cells()
-                }
-                ChildLayoutOutcome::Skipped => self.item_used(index).content_baselines_from_cells(),
-            };
+        let cells = self.flex_items[index].cells;
+        let input = self.item_layout_input(index, &cells, self.available_space_for_items.unwrap().space);
+        let formatting_context::ChildLayout {
+            outcome,
+            fragment_arrival,
+        } = formatting_context::layout_inside_child_with_input_cells(run, None, None, node, input, cells, false);
+        self.flex_items[index].cells = run.records.box_metrics_of(node).input_cells();
+        outcome.report_percentage_block_size_dependency_of(run, node);
+        self.flex_items[index].content_baselines = match outcome {
+            ChildLayoutOutcome::Created(result) => result.baselines,
+            ChildLayoutOutcome::ReenterCurrent => {
+                self.run(run, input);
+                run.records.box_metrics_of(node).content_baselines()
+            }
+            ChildLayoutOutcome::Skipped { .. } => run.records.box_metrics_of(node).content_baselines(),
+        };
 
         let container_inline_size = self.container_used().content_inline_size.get();
         let container_block_size = self.container_used().content_block_size.get();
         abspos_engine::compute_inset_native(run, node, container_inline_size, container_block_size);
+        fragment_arrival
     }
 
     // https://drafts.csswg.org/css-flexbox-1/#abspos-items
@@ -3168,7 +3248,9 @@ impl<'pass> FlexFormattingContext<'pass> {
                 as u8,
             lines,
         };
-        self.container_used().rare_data_mut().flex_layout_data = Some(std::sync::Arc::new(data));
+        self.run.update_fragment_payloads_of(self.run.box_, |payloads| {
+            payloads.flex_layout_data = Some(std::sync::Arc::new(data));
+        });
     }
 
     // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
@@ -3191,7 +3273,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         // NB: A replaced element with a natural inline size contributes that size. Its post-flexing
         //     block size must not replace the natural inline size through the aspect ratio. Explicit
         //     computed heights are handled by the intrinsic inline size calculation instead.
-        if self.facts(node).is_replaced_box() && self.facts(node).has_auto_content_width() {
+        if self.facts(node).is_replaced_box() && self.facts(node).auto_content_size().width.is_some() {
             return None;
         }
         self.facts(node).preferred_aspect_ratio()?;
@@ -3327,19 +3409,6 @@ impl<'pass> FlexFormattingContext<'pass> {
             },
         );
         self.flex_items[index].add_main_margin_box_sizes(css_clamp(size, clamp_min, clamp_max))
-    }
-
-    // https://drafts.csswg.org/css-flexbox-1/#intrinsic-sizes
-    fn determine_intrinsic_size_of_flex_container(&mut self) {
-        let available_space = self.available_space_for_items.unwrap();
-        if available_space.main.is_intrinsic_sizing_constraint() {
-            let size = self.calculate_intrinsic_main_size_of_flex_container();
-            self.set_container_main_size(size);
-        }
-        if available_space.cross.is_intrinsic_sizing_constraint() {
-            let size = self.calculate_intrinsic_cross_size_of_flex_container();
-            self.set_container_cross_size(size);
-        }
     }
 
     fn resolve_own_auto_block_size_from_max_content_main_size(&mut self) {
@@ -3594,7 +3663,7 @@ impl<'pass> FlexFormattingContext<'pass> {
     fn cross_content_contribution_depends_on_used_main_size(&self, index: usize) -> bool {
         let node = self.flex_items[index].box_;
         let facts = self.facts(node);
-        let has_natural_inline_size = facts.is_replaced_box() && facts.has_auto_content_width();
+        let has_natural_inline_size = facts.is_replaced_box() && facts.auto_content_size().width.is_some();
         if has_natural_inline_size && self.style(node).height().is_auto() {
             return false;
         }
@@ -3769,7 +3838,6 @@ impl<'pass> FlexFormattingContext<'pass> {
     }
 
     pub(super) fn run(&mut self, run: &FormattingContextRun<'pass>, layout_input: LayoutInput) {
-        let available_space = layout_input.available_space;
         self.prepare_items(layout_input);
 
         // 5. Collect flex items into flex lines:
@@ -3792,13 +3860,6 @@ impl<'pass> FlexFormattingContext<'pass> {
 
         // 11. Determine the used cross size of each flex item.
         self.determine_used_cross_size_of_each_flex_item();
-        let is_intrinsic_sizing = available_space.inline_size.is_intrinsic_sizing_constraint()
-            || available_space.block_size.is_intrinsic_sizing_constraint();
-        if is_intrinsic_sizing {
-            // Alignment offsets depend on the container's used size, so intrinsic sizing must resolve that size before
-            // the item-placement phases below.
-            self.determine_intrinsic_size_of_flex_container();
-        }
         // 12. Distribute any remaining free space.
         self.distribute_any_remaining_free_space();
         // 13. Resolve cross-axis auto margins.
@@ -3835,16 +3896,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         // 16. Align all flex lines (per align-content)
         self.align_all_flex_lines();
 
-        // https://drafts.csswg.org/css-align-3/#baseline-rules
-        // "... or the first/last in-flow block-level child in the block container that contributes a set of first/last
-        // baselines, whichever comes first/last."
-        // https://drafts.csswg.org/css-flexbox-1/#flex-baselines
-        // NB: Block-level flex containers can therefore contribute baselines through an inline-block ancestor,
-        //     including during intrinsic sizing.
-        // OPTIMIZATION: Avoid laying out items solely for baselines when no inline ancestor needs them.
-        if !is_intrinsic_sizing || self.facts(self.run.box_).has_inline_level_inclusive_ancestor() {
-            self.layout_items_and_derive_baselines(run);
-        }
+        self.layout_items_and_derive_baselines(run);
 
         if self.run.should_collect_devtools_layout_data {
             self.save_flex_layout_data();
@@ -3854,11 +3906,11 @@ impl<'pass> FlexFormattingContext<'pass> {
     // AD-HOC: Layout the inside of all flex items after resolving their dimensions.
     fn layout_items_and_derive_baselines(&mut self, run: &FormattingContextRun<'pass>) {
         self.copy_dimensions_from_flex_items_to_boxes();
-        for index in 0..self.flex_items.len() {
-            self.layout_inside_item(run, index);
-        }
+        let fragment_arrivals_of_items: Vec<_> = (0..self.flex_items.len())
+            .map(|index| self.layout_inside_item(run, index))
+            .collect();
         self.resolve_baseline_aligned_items();
-        for index in 0..self.flex_items.len() {
+        for (index, fragment_arrival) in fragment_arrivals_of_items.into_iter().enumerate() {
             let item = &self.flex_items[index];
             let offset = if self.main_axis_is_horizontal() {
                 FfiCssPixelPoint {
@@ -3871,7 +3923,7 @@ impl<'pass> FlexFormattingContext<'pass> {
                     y: item.main_offset,
                 }
             };
-            formatting_context::place_child(&self.run, item.box_, offset, None);
+            formatting_context::place_laid_out_child(&self.run, item.box_, offset, None, fragment_arrival);
         }
         self.derived_baselines_of_root_box = DerivedBaselines {
             inline_alignment: self.flex_lines.len().checked_sub(1).and_then(|line_index| {
@@ -3976,10 +4028,6 @@ impl<'pass> FlexFormattingContext<'pass> {
 
     pub(super) fn derived_baselines_of_root_box(&self) -> DerivedBaselines {
         self.derived_baselines_of_root_box
-    }
-
-    pub(super) fn automatic_content_inline_size(&self) -> CssPixels {
-        self.container_used().content_inline_size.get()
     }
 
     pub(super) fn automatic_content_block_size(&self) -> CssPixels {

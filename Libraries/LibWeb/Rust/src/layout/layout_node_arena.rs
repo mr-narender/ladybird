@@ -24,12 +24,12 @@ use crate::css::style::{
 };
 use crate::layout::ComputedValuesView;
 use crate::layout::CssPixels;
-use crate::layout::FfiReplacedContentFacts;
 use crate::layout::node_data::{
     AncestorFact, DomPaintFact, FfiStylePayloads, GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE,
     GENERATED_FOR_LAST_SYNTHETIC, GENERATED_FOR_MARKER, MAX_NODE_SLOT_COUNT, NodeData, NodeFlag, NodeKind, NodeSlotId,
     StylePayloadsRef, pseudo_kind_of,
 };
+use crate::layout::node_facts::ReplacedContentFacts;
 use crate::layout::tree_mutation::HostCalls;
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::render_state::DocumentHost;
@@ -651,7 +651,7 @@ impl RowsVersion {
 #[derive(Clone, Default)]
 struct ReplacedContentFactsSlot {
     generation: u8,
-    facts: Option<FfiReplacedContentFacts>,
+    facts: Option<ReplacedContentFacts>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -667,7 +667,7 @@ struct ChunkAddress {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AncestorInvalidation {
+pub(super) enum AncestorInvalidation {
     StructuralChange,
     ContentChange,
 }
@@ -2412,6 +2412,27 @@ impl LayoutNodeArena {
         previous != style_record
     }
 
+    /// Installs `payloads`, the style of `style_record`, in `slot` as the host publishes it. Unless the box keeps its
+    /// layout inputs, this also drops the layout cached for `previous_payloads`, the style the box showed. `None`
+    /// keeps that layout.
+    pub(crate) fn install_style_record(
+        &self,
+        slot: NodeSlotId,
+        style_record: u64,
+        payloads: StylePayloadsRef,
+        previous_payloads: Option<StylePayloadsRef>,
+    ) {
+        if self.set_node_style(slot, style_record, payloads) {
+            self.refresh_style_flags(slot);
+        }
+        self.publish_new_size_container_geometry(slot);
+        self.enroll_node_for_svg_paint_resources_sync(slot);
+        if previous_payloads.is_some_and(|previous| !self.style_move_keeps_layout_inputs(slot, previous, payloads)) {
+            self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
+            self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
+        }
+    }
+
     /// Whether the box `slot` keeps the layout it cached when it shows `new` in place of `previous` (see
     /// [`crate::css::computed_values::style_payloads_layout_inputs_equal`]).
     pub(crate) fn style_move_keeps_layout_inputs(
@@ -2477,16 +2498,8 @@ impl LayoutNodeArena {
                     .map_or(std::ptr::null(), <[_]>::as_ptr)
             });
             let payloads = StylePayloadsRef::new(payloads.cast());
-            if self.set_node_style(slot, row.new_style_record, payloads) {
-                self.refresh_style_flags(slot);
-            }
-            self.publish_new_size_container_geometry(slot);
-            self.enroll_node_for_svg_paint_resources_sync(slot);
+            self.install_style_record(slot, row.new_style_record, payloads, Some(previous_payloads));
             self.set_node_flag(slot, NodeFlag::HasAnimatedOpacityOrTransform, false);
-            if !self.style_move_keeps_layout_inputs(slot, previous_payloads, payloads) {
-                self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
-                self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
-            }
             self.reinherit_anonymous_descendants(HostCalls(host_calls.0), slot);
             if row.relayout {
                 self.mark_row_for_relayout_after_style_change(row.style_node, slot);
@@ -2603,15 +2616,7 @@ impl LayoutNodeArena {
                 .map_or(std::ptr::null(), <[_]>::as_ptr)
         });
         let payloads = StylePayloadsRef::new(payloads.cast());
-        if self.set_node_style(slot, row.new_style_record, payloads) {
-            self.refresh_style_flags(slot);
-        }
-        self.publish_new_size_container_geometry(slot);
-        self.enroll_node_for_svg_paint_resources_sync(slot);
-        if !self.style_move_keeps_layout_inputs(slot, previous_payloads, payloads) {
-            self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
-            self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
-        }
+        self.install_style_record(slot, row.new_style_record, payloads, Some(previous_payloads));
         self.reinherit_anonymous_descendants(HostCalls(host_calls.0), slot);
         let level = row.record_damage & FfiStyleInvalidationField::LevelMask as u32;
         if level >= RELAYOUT_LEVEL
@@ -4753,12 +4758,6 @@ impl LayoutNodeArena {
                     facts |= AncestorFact::InheritsTextOverflowEllipsis as u8;
                 }
             }
-            if super::node_facts::has_ancestor_fact(parent_data, AncestorFact::HasInlineLevelInclusiveAncestor) {
-                facts |= AncestorFact::HasInlineLevelInclusiveAncestor as u8;
-            }
-        }
-        if super::node_facts::node_is_inline_outside(super::node_facts::node_style_view(data)) {
-            facts |= AncestorFact::HasInlineLevelInclusiveAncestor as u8;
         }
         data.ancestor_facts.replace(facts) != facts
     }
@@ -5399,7 +5398,7 @@ impl LayoutNodeArena {
                 .is_some_and(|content| content.rendering_key.is_some())
     }
 
-    pub(crate) fn set_replaced_content_facts(&mut self, id: NodeSlotId, facts: FfiReplacedContentFacts) -> bool {
+    pub(crate) fn set_replaced_content_facts(&mut self, id: NodeSlotId, facts: ReplacedContentFacts) -> bool {
         self.data(id);
         let index = id.slot_index() as usize;
         if self.replaced_content_facts.len() <= index {
@@ -5415,7 +5414,7 @@ impl LayoutNodeArena {
         changed
     }
 
-    pub(crate) fn replaced_content_facts(&self, id: NodeSlotId) -> Option<FfiReplacedContentFacts> {
+    pub(crate) fn replaced_content_facts(&self, id: NodeSlotId) -> Option<ReplacedContentFacts> {
         assert!(!id.is_invalid(), "invalid layout node arena slot ID");
         self.replaced_content_facts
             .get(id.slot_index() as usize)
@@ -5624,18 +5623,20 @@ impl LayoutNodeArena {
     // run's probe and its store is handled by storing the probe-time validity, which turns it
     // into a fail-safe miss.
     fn invalidate_at_and_above(&self, mut node: NodeSlotId, invalidation: AncestorInvalidation) {
-        let paintable_rows = self.paintable_rows();
         while !node.is_invalid() {
-            let data = self.data(node);
-            if invalidation == AncestorInvalidation::StructuralChange {
-                self.fc_run_cache_store.note_inline_layout_damage(node);
-            }
-            self.bump_fragment_cache_epoch(node);
-            let (kind, parent) = (data.kind.get(), data.parent.get());
-            if super::node_facts::kind_is_box(kind) {
-                paintable_rows.clear_cached_overflow_data(node);
-            }
-            node = parent;
+            self.invalidate_one(node, invalidation);
+            node = self.data(node).parent.get();
+        }
+    }
+
+    /// The part of `invalidate_at_and_above` that applies to one node, for walks that also do other work on the way up.
+    pub(super) fn invalidate_one(&self, node: NodeSlotId, invalidation: AncestorInvalidation) {
+        if invalidation == AncestorInvalidation::StructuralChange {
+            self.fc_run_cache_store.note_inline_layout_damage(node);
+        }
+        self.bump_fragment_cache_epoch(node);
+        if super::node_facts::kind_is_box(self.data(node).kind.get()) {
+            self.paintable_rows().clear_cached_overflow_data(node);
         }
     }
 

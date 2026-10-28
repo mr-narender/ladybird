@@ -88,8 +88,6 @@ public:
     void set_zoom_level(double zoom_level);
     void set_maximum_frames_per_second(double maximum_frames_per_second);
     void set_frame_rate_capped(bool capped) { m_frame_rate_capped = capped; }
-    void set_viewport_corner_radius(double radius);
-    virtual double viewport_corner_radius() const override { return m_viewport_corner_radius; }
     virtual double maximum_frames_per_second() const override { return m_maximum_frames_per_second; }
     void set_preferred_color_scheme(Web::CSS::PreferredColorScheme);
     void set_preferred_contrast(Web::CSS::PreferredContrast);
@@ -268,7 +266,7 @@ private:
     virtual void page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&, Optional<Web::HTML::PreparedNavigationDescriptor>) override;
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) override;
     virtual void page_did_finish_loading(Web::HTML::CrossProcessId, Web::HTML::CrossProcessId) override;
-    virtual Optional<u64> page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data) override;
+    virtual Optional<u64> page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response) override;
     virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size) override;
     virtual void page_did_receive_download_data(u64 download_id, ByteBuffer data) override;
     virtual void page_did_finish_download(u64 download_id) override;
@@ -299,7 +297,7 @@ private:
     virtual void page_did_update_cookie(HTTP::Cookie::Cookie const&) override;
     virtual void page_did_expire_cookies_with_time_offset(AK::Duration) override;
     virtual void page_did_delete_all_cookies(URL::URL const&, GC::Ref<Web::WebIDL::Promise>) override;
-    virtual void page_did_lose_request_server_connection() override;
+    virtual void page_did_lose_request_server_connection(Optional<Utf16String> const& top_level_site) override;
     virtual void page_did_simulate_worker_request_server_connection_loss() override;
     virtual void page_did_store_hsts_policy_for_testing(String const&, HTTP::HSTS::ParsedHSTSPolicy const&) override;
     virtual void page_did_request_clear_storage_for_testing(Web::StorageAPI::StorageEndpointType, Web::HTML::EnvironmentSettingsObject const&) override;
@@ -319,6 +317,7 @@ private:
     virtual void page_did_change_focused_navigable(Web::HTML::CrossProcessId) override;
     virtual void page_did_request_key_event_for_testing(Web::KeyEvent) override;
     virtual void page_did_request_webdriver_mouse_event(Web::HTML::CrossProcessId local_root_id, Web::MouseEvent, GC::Ref<GC::Function<void()>> on_handled) override;
+    virtual void page_did_request_pinch_event_for_testing(Web::HTML::CrossProcessId local_root_id, Web::PinchEvent const&) override;
     virtual void page_did_request_set_system_visibility_state(Web::HTML::VisibilityState) override;
     virtual void page_did_request_history_operation(Web::HTML::CrossProcessId operation_id, Web::HistoryOperationParameters) override;
     virtual void page_did_revoke_history_operation(Web::HTML::CrossProcessId operation_id) override;
@@ -381,7 +380,7 @@ private:
     virtual void page_did_change_accessibility_tree() override;
     virtual void page_did_take_screenshot(Gfx::ShareableBitmap const& screenshot) override;
     virtual void received_message_from_web_ui(Utf16String const& name, JS::Value data) override;
-    virtual void page_did_block_resource() override;
+    virtual void page_did_block_resource(URL::URL const&, StringView kind) override;
     virtual void page_did_start_network_request(u64 request_id, URL::URL const&, ByteString const&, Vector<HTTP::Header> const&, ReadonlyBytes, Optional<String>, String const& referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority) override;
     virtual void page_did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String>, Vector<HTTP::Header> const&, Requests::CacheState) override;
     virtual void page_did_receive_network_response_body(u64 request_id, ReadonlyBytes) override;
@@ -407,7 +406,6 @@ private:
     double m_zoom_level { 1.0 };
     double m_maximum_frames_per_second { 60.0 };
     bool m_frame_rate_capped { false };
-    double m_viewport_corner_radius { 0 };
     Web::PageId m_id { 0 };
     u64 m_next_delete_all_cookies_request_id { 1 };
     u64 m_next_text_fragment_generation_id { 1 };

@@ -140,7 +140,7 @@ public:
     Web::CompositorContextId compositor_context_id();
     // Returns whether the event was posted; a page without a compositor sends it to WebContent itself.
     bool handle_and_dispatch_key_event_in_compositor(Web::KeyEvent const&, bool allow_keyboard_scroll);
-    void handle_pinch_event_in_compositor(Web::PinchEvent const&);
+    bool handle_and_dispatch_pinch_event_in_compositor(Web::PinchEvent const&);
     // Returns whether the event was posted; a page without a compositor sends it to WebContent itself.
     bool handle_and_dispatch_mouse_event_in_compositor(Web::MouseEvent const&);
     void did_consume_input_event_in_compositor(u64 event_id);
@@ -159,7 +159,7 @@ public:
     Optional<PresentedBackingStores> take_presented_backing_stores();
     void release_presented_bitmap(i32 bitmap_id);
     void fail_renderer_owned_downloads();
-    void reset_session_history_for_testing();
+    void reset_state_for_testing();
 
 private:
     void relay_finished_input_event(WebContentPage const& reporting_page, u64 event_id, Web::EventResult);
@@ -229,7 +229,7 @@ private:
     virtual void did_cut_selected_text(u64 request_id, ByteString selection) override;
     virtual void did_execute_js_console_input(JsonValue result) override;
     virtual void did_output_js_console_message(ConsoleOutput console_output) override;
-    virtual void did_block_resource() override;
+    virtual void did_block_resource(URL::URL url, String kind) override;
     virtual void did_start_network_request(u64 request_id, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, ByteBuffer request_body, Optional<String> initiator_type, String referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::RequestPriority priority) override;
     virtual void did_receive_network_response_body(u64 request_id, ByteBuffer data) override;
     virtual void did_finish_network_request(u64 request_id, u64 body_size, Requests::RequestTimingInfo timing_info, Optional<Requests::NetworkError> network_error) override;
@@ -321,7 +321,8 @@ private:
     virtual void did_forward_mouse_event_to_child_frame(Web::HTML::CrossProcessId frame_id, Web::MouseEvent) override;
     virtual void did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     Messages::WebContentClient::DidStartDownloadWithoutRequestResponse did_start_download_without_request(URL::URL url, ByteString suggested_filename, Optional<u64> total_size);
-    Messages::WebContentClient::DidStartDownloadResponse did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data);
+    Messages::WebContentClient::DidStartDownloadResponse did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data,
+        JsonValue network_response);
     virtual void did_receive_download_data(u64 download_id, ByteBuffer data) override;
     virtual void did_finish_download(u64 download_id) override;
     virtual void did_fail_download(u64 download_id, String error) override;
@@ -351,6 +352,7 @@ private:
     virtual void did_update_primary_selection(String text) override;
     virtual void did_update_session_history_entry_scroll_restoration_mode(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::ScrollRestorationMode scroll_restoration_mode) override;
     virtual void did_request_webdriver_mouse_event(u64 request_id, Web::HTML::CrossProcessId local_root_id, Web::MouseEvent event) override;
+    virtual void did_request_pinch_event_for_testing(Web::HTML::CrossProcessId local_root_id, Web::PinchEvent event) override;
     virtual void request_unload_check(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId check_id) override;
     Messages::WebContentClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request);
     Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Web::HTML::EnvironmentId environment_id);
@@ -371,7 +373,7 @@ private:
     virtual void did_request_stop_loading_for_testing() override;
     virtual void did_request_reload_for_testing(bool bypass_cache) override;
     virtual void did_request_traverse_history_by_delta_for_testing(i32 delta) override;
-    virtual void did_reset_session_history_for_testing(Web::HTML::SessionHistoryEntryDescriptor) override;
+    virtual void did_reset_state_for_testing(Web::HTML::SessionHistoryEntryDescriptor) override;
     Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) const;
     Messages::WebContentTestClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse did_request_capture_session_history_snapshot_for_testing();
     Messages::WebContentTestClient::DidRequestRestoreSessionHistorySnapshotForTestingResponse did_request_restore_session_history_snapshot_for_testing();

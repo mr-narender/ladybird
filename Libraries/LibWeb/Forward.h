@@ -572,6 +572,7 @@ class FetchParams;
 class FetchRecord;
 class FetchTimingInfo;
 class IncrementalReadLoopReadRequest;
+class KeepaliveQuotaAccountant;
 class Request;
 class Response;
 
@@ -1171,6 +1172,9 @@ class KeyboardEvent;
 class MouseEvent;
 class PointerEvent;
 class TextEvent;
+class Touch;
+class TouchEvent;
+class TouchList;
 class UIEvent;
 
 }

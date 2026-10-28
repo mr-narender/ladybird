@@ -608,6 +608,7 @@ pub extern "C" fn rust_compute_font_width(absolutized_value: &StyleValueData) ->
     compute_font_width(absolutized_value)
 }
 
+/// https://drafts.csswg.org/css-fonts-4/#absolute-size-mapping
 /// An <absolute-size> keyword refers to an entry in a table of font sizes computed and kept by
 /// the user agent. See 2.5.1 Absolute Size Keyword Mapping Table.
 fn absolute_size_font_mapping(keyword: u16, default_font_size: CssPixels) -> Option<CssPixels> {
@@ -617,6 +618,35 @@ fn absolute_size_font_mapping(keyword: u16, default_font_size: CssPixels) -> Opt
                 .div_as_fraction(CssPixels::from_integer(denominator)),
         )
     };
+    // INTEROP: Other browsers share this keyword table for integral default sizes from 9px through 16px, so we use
+    //          it instead of the ratios from the spec's guideline table.
+    let column = match keyword {
+        keyword::XX_SMALL => 0,
+        keyword::X_SMALL => 1,
+        keyword::SMALL => 2,
+        keyword::MEDIUM => 3,
+        keyword::LARGE => 4,
+        keyword::X_LARGE => 5,
+        keyword::XX_LARGE => 6,
+        keyword::XXX_LARGE => 7,
+        _ => return None,
+    };
+    const FONT_SIZE_TABLE: [[i64; 8]; 8] = [
+        [9, 9, 9, 9, 11, 14, 18, 27],
+        [9, 9, 9, 10, 12, 15, 20, 30],
+        [9, 9, 10, 11, 13, 17, 22, 33],
+        [9, 9, 10, 12, 14, 18, 24, 36],
+        [9, 10, 12, 13, 16, 20, 26, 39],
+        [9, 10, 12, 14, 17, 21, 28, 42],
+        [9, 10, 13, 15, 18, 23, 30, 45],
+        [9, 10, 13, 16, 18, 24, 32, 48],
+    ];
+    let default_size = default_font_size.to_int();
+    if (9..=16).contains(&default_size) && default_font_size == CssPixels::from_integer(i64::from(default_size)) {
+        return Some(CssPixels::from_integer(
+            FONT_SIZE_TABLE[(default_size - 9) as usize][column],
+        ));
+    }
     match keyword {
         keyword::XX_SMALL => entry(3, 5),
         keyword::X_SMALL => entry(3, 4),
@@ -640,8 +670,8 @@ fn relative_size_font_mapping(keyword: u16, inherited_font_size: CssPixels) -> O
         )
     };
     match keyword {
-        keyword::SMALLER => entry(4, 5),
-        keyword::LARGER => entry(5, 4),
+        keyword::SMALLER => entry(5, 6),
+        keyword::LARGER => entry(6, 5),
         _ => None,
     }
 }
@@ -657,6 +687,7 @@ fn compute_font_size(
     inherited_font_size: CssPixels,
     inherited_math_depth: i32,
     default_font_size: CssPixels,
+    default_font_size_scale: f64,
 ) -> FfiComputedNumber {
     let computed = |px: f64| FfiComputedNumber {
         handled: true,
@@ -677,7 +708,7 @@ fn compute_font_size(
         StyleValueData::Percentage { value } => computed(inherited_font_size.to_double() * (value / 100.0)),
         StyleValueData::Keyword { keyword } => {
             if let Some(px) = absolute_size_font_mapping(*keyword, default_font_size) {
-                return computed(px.to_double());
+                return computed(px.scaled(default_font_size_scale).to_double());
             }
             if let Some(px) = relative_size_font_mapping(*keyword, inherited_font_size) {
                 return computed(px.to_double());
@@ -756,6 +787,7 @@ pub extern "C" fn rust_compute_font_size(
         CssPixels::from_raw(inherited_font_size_raw),
         inherited_math_depth,
         CssPixels::from_raw(default_font_size_raw),
+        1.0,
     )
 }
 
@@ -875,8 +907,8 @@ pub(crate) fn recascade_font_size_batch<'a>(
                 if *keyword == keyword::INHERIT {
                     continue;
                 }
-                if let Some(px) = absolute_size_font_mapping(*keyword, zoomed_default_size) {
-                    current_size = px;
+                if let Some(px) = absolute_size_font_mapping(*keyword, default_size) {
+                    current_size = px.scaled(length_zoom);
                     depends_on_viewport_metrics = false;
                     continue;
                 }
@@ -1559,6 +1591,14 @@ pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> Ext
             } => {
                 dependencies.needs_document_base_url |= !url.is_empty() && !resource_context.has_base_url;
                 dependencies.may_need_style_sheet_resource_context |= !url.is_empty();
+            }
+            StyleValueData::Url { url, .. } => {
+                if !url.is_empty() && !url.is_fragment() {
+                    let needs_base_url =
+                        liburl_rust::basic_parse(url.url_input(), liburl_rust::BasicParseOptions::new()).is_none();
+                    dependencies.needs_document_base_url |= needs_base_url;
+                    dependencies.may_need_style_sheet_resource_context |= needs_base_url;
+                }
             }
             StyleValueData::Calculated { rust_calculation, .. } => {
                 collect_calculation(rust_calculation.node(), dependencies);
@@ -3061,8 +3101,8 @@ pub(crate) fn value_absolutization_is_identity(value: &StyleValueData) -> bool {
         | StyleValueData::CustomIdent { .. }
         | StyleValueData::Percentage { .. }
         | StyleValueData::Flex { .. }
-        | StyleValueData::UnicodeRange { .. }
-        | StyleValueData::Url { .. } => true,
+        | StyleValueData::UnicodeRange { .. } => true,
+        StyleValueData::Url { url, .. } => url.is_empty() || url.is_fragment(),
         _ => false,
     }
 }
@@ -3151,6 +3191,7 @@ fn compute_animation_name(value: &StyleValueData) -> Option<Arc<StyleValueData>>
             StyleValueData::String {
                 string,
                 is_valid_animation_name_custom_ident,
+                ..
             } => Some(if *is_valid_animation_name_custom_ident {
                 RetainedStyleValueData::from_arc(Arc::new(StyleValueData::CustomIdent {
                     custom_ident: string.clone(),
@@ -4287,7 +4328,8 @@ pub(crate) unsafe fn drive_property_computation(
                                     computed_math_depth,
                                     inherited_font_size,
                                     inherited_math_depth,
-                                    CssPixels::from_raw(default_font_size_raw).scaled(zoom.length_effective_zoom()),
+                                    CssPixels::from_raw(default_font_size_raw),
+                                    zoom.length_effective_zoom(),
                                 );
                                 if result.handled {
                                     if result.unchanged {
@@ -6297,6 +6339,8 @@ pub struct FfiHostAnimationSample {
     /// The identities of the element's custom-property environment and the one it inherits, under
     /// which values substituted against the element hold.
     pub custom_property_environments: [u64; 2],
+    /// The host's current registrations, which the engine may not have consumed yet.
+    pub custom_property_registration_generation: u64,
     pub inheritance_parent_style_record: u64,
     /// The document's side of the environment keyframes compute in. The engine fills in the
     /// element's own: its place among its siblings and its random bases.
@@ -6334,6 +6378,7 @@ pub struct FfiAnimatedCustomPropertyResult {
 #[repr(C)]
 pub struct FfiHostAnimationSampleResult {
     pub outcome: FfiHostAnimationSampleOutcome,
+    pub custom_properties_trigger_restyle: bool,
     /// The non-inherited style groups a keyframe saying `inherit` read from the parent.
     pub keyframes_inherited_non_inherited_style_groups: u32,
     pub depends_on_viewport_metrics: bool,
@@ -6354,6 +6399,7 @@ impl FfiHostAnimationSampleResult {
     fn with_outcome(outcome: FfiHostAnimationSampleOutcome) -> Self {
         Self {
             outcome,
+            custom_properties_trigger_restyle: true,
             keyframes_inherited_non_inherited_style_groups: 0,
             depends_on_viewport_metrics: false,
             font_metrics_depend_on_viewport_metrics: false,
@@ -6438,6 +6484,7 @@ pub(crate) struct AnimationSampleInput<'a> {
     /// The identities of the element's custom-property environment and the one it inherits, under
     /// which values substituted against the element hold.
     pub(crate) custom_property_environments: [u64; 2],
+    pub(crate) custom_property_registration_generation: u64,
     pub(crate) inheritance_parent_style_record: u64,
     /// The document's side of the environment keyframes compute in.
     pub(crate) environment: &'a FfiStyleComputationEnvironment,
@@ -6552,6 +6599,7 @@ impl FfiHostAnimationSample {
                 element_declares_custom_properties: self.element_declares_own_custom_properties,
             },
             custom_property_environments: self.custom_property_environments,
+            custom_property_registration_generation: self.custom_property_registration_generation,
             inheritance_parent_style_record: self.inheritance_parent_style_record,
             environment,
             element_box_slot: self.element_box_slot,
@@ -7030,6 +7078,9 @@ fn finish_animation_sample(
         && resolved.container_relative_length_unit_mask == 0
         && !resolved.needs_document_base_url
         && resolved.unfixed_random_sharings.is_empty();
+
+    let has_non_custom_property_animation = resolved.properties.iter().any(|property| property.custom_name_id == 0);
+
     let custom_results = anim::evaluate_animations(anim::ComputedAnimationBatch {
         context: input.animation_context(Some(&length_contexts.remaining), reference_box),
         device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
@@ -7064,7 +7115,22 @@ fn finish_animation_sample(
             &retained,
             finalization,
         );
-        retained.extend(readers);
+        // Failed resolution keeps the default full restyle. On success, only consumers not
+        // updated by this sample can require one.
+        if let Ok(readers) = readers {
+            retained.extend(readers);
+
+            let uncached_interval_values_may_need_substitution =
+                custom_properties.has_uncached_interval_values && result.substitution_marks != 0;
+
+            result.custom_properties_trigger_restyle = engine.animated_custom_properties_trigger_restyle(
+                node,
+                pseudo,
+                has_non_custom_property_animation,
+                uncached_interval_values_may_need_substitution,
+                input.custom_property_registration_generation,
+            );
+        }
         let rows = retained
             .iter()
             .map(|(name, value)| FfiAnimatedCustomPropertyResult {
@@ -8315,6 +8381,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn url_dependencies_only_read_a_base_for_relative_urls() {
+        for (url, needs_base) in [
+            ("https://example.com/paint.svg#fill", false),
+            ("data:image/svg+xml,paint", false),
+            ("https://example.com/色.svg#fill", false),
+            ("paint.svg#fill", true),
+            ("色.svg#fill", true),
+            ("/paint.svg#fill", true),
+            ("//example.com/paint.svg#fill", true),
+            ("#fill", false),
+            ("", false),
+        ] {
+            let value = StyleValueData::Url {
+                url: crate::css::style_value::RetainedString::from_utf16(&url.encode_utf16().collect::<Vec<_>>())
+                    .unwrap(),
+                url_type: 0,
+                modifiers: crate::css::style_value::RetainedRequestUrlModifierList::from_retained_modifiers(Vec::new()),
+            };
+            let dependencies = collect_external_value_dependencies(&value);
+            assert_eq!(dependencies.needs_document_base_url, needs_base, "{url}");
+            assert_eq!(dependencies.may_need_style_sheet_resource_context, needs_base, "{url}");
+        }
+    }
+
+    #[test]
     fn calculated_random_values_record_their_document_dependency() {
         let number = || {
             Arc::new(crate::css::calc::CalcNode::Numeric(
@@ -8769,6 +8860,7 @@ mod tests {
             sixteen,
             0,
             sixteen,
+            1.0,
         );
         assert_eq!(medium.value, 16.0);
         let large = compute_font_size(
@@ -8779,9 +8871,17 @@ mod tests {
             sixteen,
             0,
             sixteen,
+            1.0,
         );
-        assert_eq!(large.value, 19.1875); // 16 * 6 / 5 in 6-bit fixed point
-        let percent = compute_font_size(&StyleValueData::Percentage { value: 150.0 }, 0, sixteen, 0, sixteen);
+        assert_eq!(large.value, 18.0);
+        let percent = compute_font_size(
+            &StyleValueData::Percentage { value: 150.0 },
+            0,
+            sixteen,
+            0,
+            sixteen,
+            1.0,
+        );
         assert_eq!(percent.value, 24.0);
         let math = compute_font_size(
             &StyleValueData::Keyword { keyword: keyword::MATH },
@@ -8789,6 +8889,7 @@ mod tests {
             sixteen,
             0,
             sixteen,
+            1.0,
         );
         assert_eq!(math.value, CssPixels::from_integer(16).scaled(0.71).to_double());
         let math_two_levels = compute_font_size(
@@ -8797,6 +8898,7 @@ mod tests {
             sixteen,
             0,
             sixteen,
+            1.0,
         );
         assert_eq!(
             math_two_levels.value,
