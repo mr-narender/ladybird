@@ -358,22 +358,18 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         self.context().any_floats_intrude_in_block_range(block_start, block_end)
     }
 
-    pub(crate) fn append_box(
-        &mut self,
-        node: Node,
-        leading_size: CssPixels,
-        trailing_size: CssPixels,
-        leading_margin: CssPixels,
-        trailing_margin: CssPixels,
-        content_baselines: DerivedBaselines,
-    ) {
+    /// Appends the box of `item`, an element item, to the current line.
+    pub(crate) fn append_box(&mut self, item: &inline_level_iterator::Item) {
+        let node = item.node;
+        let leading_size = item.border_start + item.padding_start;
+        let trailing_size = item.padding_end + item.border_end;
+        let box_cells = item.box_cells();
         self.prepare_to_append_inline_content();
-        let atomic_inline = self.context().box_metrics(node);
-        let content_inline = atomic_inline.content_inline_size();
-        let content_block = atomic_inline.content_block_size();
-        let border_start = atomic_inline.border_box_top(false);
-        let border_end = atomic_inline.border_box_bottom(false);
-        let margin_block_size = atomic_inline.margin_box_block_size(false);
+        let content_inline = box_cells.content_inline_size;
+        let content_block = box_cells.content_block_size;
+        let border_start = box_cells.border_box_top(false);
+        let border_end = box_cells.border_box_bottom(false);
+        let margin_block_size = box_cells.margin_box_block_size(false);
         let line_index = self.ensure_last_line_index();
         let fragment_index = self.line(line_index).fragments.len();
         let fragment_facts = self.fragment_facts(node);
@@ -384,8 +380,8 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             0,
             leading_size,
             trailing_size,
-            leading_margin,
-            trailing_margin,
+            item.margin_start,
+            item.margin_end,
             content_inline,
             content_block,
             border_start,
@@ -395,7 +391,12 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             text_align_is_justify,
             line_box_fragment::TrailingWhitespace::default(),
         );
-        self.line_mut(line_index).fragments[fragment_index].content_baselines = Some(content_baselines);
+        {
+            let mut line = self.line_mut(line_index);
+            let fragment = &mut line.fragments[fragment_index];
+            fragment.content_baselines = Some(item.content_baselines);
+            fragment.box_cells = Some(box_cells);
+        }
         self.max_block_size_on_current_line = self.max_block_size_on_current_line.max(margin_block_size);
     }
 
@@ -525,19 +526,13 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         line_index: usize,
         block_end: CssPixels,
         block_end_margin: CssPixels,
+        block_level_box: line_box::BlockLevelBoxOnLine,
     ) {
-        let block = self.context().box_metrics(node);
-        let content_offset = self
-            .context()
-            .run
-            .records
-            .placement_of(node)
-            .expect("a block-level box is placed before its line takes it")
-            .content_offset_in_containing_block;
-        let inline_offset = content_offset.x;
-        let block_offset = content_offset.y;
-        let inline_length = block.content_inline_size();
-        let block_length = block.content_block_size();
+        let block = block_level_box.cells;
+        let inline_offset = block_level_box.content_offset.x;
+        let block_offset = block_level_box.content_offset.y;
+        let inline_length = block.content_inline_size;
+        let block_length = block.content_block_size;
         let border_start = block.border_box_top(false);
         let line_inline_length = block.margin_box_inline_size(false);
         let ensured_line_index = self.ensure_last_line_index();
@@ -567,6 +562,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             line.block_end = block_end;
             line.baseline = CssPixels::default();
             line.has_block_level_box = true;
+            line.block_level_box = Some(block_level_box);
             line.block_level_box_block_end_margin = block_end_margin;
             line.has_break = true;
             line.has_forced_break = true;
@@ -583,8 +579,9 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         self.begin_new_line(false, true, ForcedBreak::No);
     }
 
-    pub(crate) fn ceiling_for_float_to_be_inserted_here(&mut self, node: Node) -> CssPixels {
-        let float_inline_size = self.context().box_metrics(node).margin_box_inline_size(false);
+    /// The block offset a float whose margin box is `float_inline_size` wide is placed at: beside the content of the
+    /// current line where the float fits there, and below that line otherwise.
+    pub(crate) fn ceiling_for_float_to_be_inserted_here(&mut self, float_inline_size: CssPixels) -> CssPixels {
         let mut candidate = self.current_block_offset;
         let line_index = self.ensure_last_line_index();
         let mut line = self.line_mut(line_index);
@@ -748,12 +745,12 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
 
     fn inline_box_alignment_metrics(&self, node: Node) -> VerticalAlignMetrics {
         let style = self.style(node);
-        let used = self.context().used(node);
+        let sides = self.context().sides_of_entered_inline_box(node);
         VerticalAlignMetrics {
             baseline: Self::baseline_for_style(style, style.line_height()),
             block_size: style.line_height(),
-            effective_box_block_start_offset: used.border_box_top(false),
-            effective_box_block_end_offset: used.border_box_bottom(false),
+            effective_box_block_start_offset: sides.border_box_top(false),
+            effective_box_block_end_offset: sides.border_box_bottom(false),
             line_height: style.line_height(),
         }
     }
@@ -791,9 +788,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 .visible_fragments()
                 .map(|fragment| {
                     if fragment.is_atomic_inline {
-                        self.context()
-                            .box_metrics(fragment.layout_node)
-                            .margin_box_block_size(false)
+                        fragment.box_cells().margin_box_block_size(false)
                     } else {
                         fragment.block_length
                     }
@@ -843,12 +838,13 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             if self.line(line_index).fragments[fragment_index].is_fully_truncated {
                 continue;
             }
-            let (node, style_source, content_baselines, is_block_ellipsis) = {
+            let (node, style_source, content_baselines, box_cells, is_block_ellipsis) = {
                 let fragment = &self.line(line_index).fragments[fragment_index];
                 (
                     fragment.layout_node,
                     fragment.style_source,
                     fragment.content_baselines,
+                    fragment.box_cells,
                     fragment.is_block_ellipsis,
                 )
             };
@@ -856,12 +852,13 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             let fragment_baseline = if is_block_ellipsis || self.facts(node).is_text_node() {
                 Self::baseline_for_style(style, style.line_height())
             } else {
-                let metrics = self.context().box_metrics(node);
+                let box_cells = box_cells.expect("the fragment of an element item carries the cells of its box");
                 formatting_context::inline_box_baseline(
                     &self.context().callbacks,
                     node,
-                    &metrics,
-                    content_baselines.unwrap_or_else(|| metrics.content_baselines()),
+                    &box_cells,
+                    content_baselines
+                        .expect("the fragment of an element item carries the content baselines of its box"),
                 )
             };
             self.line_mut(line_index).fragments[fragment_index].baseline = fragment_baseline;
@@ -930,11 +927,11 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 line_height: style.line_height(),
             };
             if snapshot.is_atomic_inline {
-                let atomic_inline = self.context().box_metrics(snapshot.layout_node);
+                let atomic_inline = self.line(line_index).fragments[fragment_index].box_cells();
                 metrics.effective_box_block_start_offset =
-                    atomic_inline.margin_top() + atomic_inline.border_box_top(false);
+                    atomic_inline.margin_top + atomic_inline.border_box_top(false);
                 metrics.effective_box_block_end_offset =
-                    atomic_inline.margin_bottom() + atomic_inline.border_box_bottom(false);
+                    atomic_inline.margin_bottom + atomic_inline.border_box_bottom(false);
             }
             let containing_block = self.context().containing_block;
             let new_inline_offset = inline_offset + snapshot.inline_offset;
@@ -1026,12 +1023,12 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             }
 
             let (inline_box_start, mut inline_box_end) = if snapshot.is_atomic_inline {
-                let atomic_inline = self.context().box_metrics(snapshot.layout_node);
+                let atomic_inline = self.line(line_index).fragments[fragment_index].box_cells();
                 (
-                    snapshot.block_offset - (atomic_inline.margin_top() + atomic_inline.border_box_top(false)),
+                    snapshot.block_offset - (atomic_inline.margin_top + atomic_inline.border_box_top(false)),
                     snapshot.block_offset
-                        + atomic_inline.content_block_size()
-                        + atomic_inline.margin_bottom()
+                        + atomic_inline.content_block_size
+                        + atomic_inline.margin_bottom
                         + atomic_inline.border_box_bottom(false),
                 )
             } else {

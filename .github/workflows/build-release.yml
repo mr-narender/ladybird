@@ -17,6 +17,9 @@ jobs:
     name: Source
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+
     permissions:
       contents: read
       id-token: write
@@ -42,16 +45,17 @@ jobs:
           subject-path: '*-source.tar.xz'
 
       - name: Upload
+        id: upload
         uses: actions/upload-artifact@v7
         with:
-          name: ladybird-source
           path: '*-source.tar.xz'
-          compression-level: 0
+          archive: false
           if-no-files-found: error
 
   Build:
     if: github.repository == 'LadybirdBrowser/ladybird'
     name: ${{ matrix.os_name }}, ${{ matrix.arch }}, Distribution, Clang
+    needs: Source
     runs-on: ${{ fromJSON(!inputs.version && matrix.snapshot_runner_labels || matrix.runner_labels) }}
     container: ${{ fromJSON(matrix.container) }}
 
@@ -80,7 +84,15 @@ jobs:
       artifact-metadata: write
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - name: Download the source
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.Source.outputs.artifact-id }}
+
+      - name: Unpack the source
+        run: |
+          tar -xf ./*-source.tar.xz --strip-components=1
+          rm ./*-source.tar.xz
 
       - name: Build
         uses: ./.github/actions/build
@@ -102,9 +114,7 @@ jobs:
 
       - name: Test
         working-directory: ${{ github.workspace }}
-        run: ctest --output-on-failure -E 'LibWebAccessibilityBridge|AccessibilityBridgeMac' --test-dir Build --timeout 1800
-        env:
-          TESTS_ONLY: 1
+        run: ctest --output-on-failure --test-dir Build --timeout 1800
 
       - name: Package
         working-directory: ${{ github.workspace }}/Build
@@ -137,17 +147,57 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
-          name: ladybird-${{ matrix.os_name }}-${{ matrix.arch }}
           path: |
-            Build/packages/*.tar.xz
-            Build/packages/*.deb
-            Build/packages/*.rpm
-          compression-level: 0
+            Build/packages/ladybird-*.tar.xz
+            !Build/packages/ladybird-symbols-*.tar.xz
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v7
+        with:
+          path: Build/packages/ladybird-symbols-*.tar.xz
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload the Debian package
+        if: ${{ matrix.os_name == 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: Build/packages/ladybird_*.deb
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload the Debian debug symbols
+        if: ${{ matrix.os_name == 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: Build/packages/ladybird-dbgsym_*.deb
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload the RPM package
+        if: ${{ matrix.os_name == 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: |
+            Build/packages/ladybird-*.rpm
+            !Build/packages/ladybird-debuginfo-*.rpm
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload the RPM debug symbols
+        if: ${{ matrix.os_name == 'Linux' }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: Build/packages/ladybird-debuginfo-*.rpm
+          archive: false
           if-no-files-found: error
 
   Flatpak:
     if: github.repository == 'LadybirdBrowser/ladybird'
     name: Flatpak, ${{ matrix.arch }}
+    needs: Source
     runs-on: ${{ fromJSON(matrix.runner_labels) }}
 
     strategy:
@@ -174,7 +224,15 @@ jobs:
       DEBUG_BUNDLE: ladybird-${{ inputs.version && format('{0}-', inputs.version) }}Linux-${{ matrix.arch }}-debug.flatpak
 
     steps:
-      - uses: actions/checkout@v7.0.1
+      - name: Download the source
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.Source.outputs.artifact-id }}
+
+      - name: Unpack the source
+        run: |
+          tar -xf ./*-source.tar.xz --strip-components=1
+          rm ./*-source.tar.xz
 
       # The image bakes the SDK into a read-only layer, and the action always has flatpak-builder update it from
       # Flathub. An update renames the old deployment into /var/lib/flatpak/.removed, and overlayfs can't rename a
@@ -226,9 +284,13 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
-          name: ladybird-Flatpak-${{ matrix.arch }}
-          path: |
-            ${{ env.BUNDLE }}
-            ${{ env.DEBUG_BUNDLE }}
-          compression-level: 0
+          path: ${{ env.BUNDLE }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.DEBUG_BUNDLE }}
+          archive: false
           if-no-files-found: error

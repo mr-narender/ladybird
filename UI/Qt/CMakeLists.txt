@@ -20,6 +20,8 @@ if (LINUX AND NOT ANDROID)
     pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
     # NB: Without the Wayland client library, a tab dragged out of a window does not take a window along with it.
     pkg_check_modules(WAYLAND_CLIENT IMPORTED_TARGET wayland-client)
+    # NB: Without the Wayland scanner, the browser cannot ask the Wayland compositor which GPU it presents on.
+    pkg_check_modules(WAYLAND_SCANNER wayland-scanner)
     pkg_check_modules(XCB_ICCCM REQUIRED IMPORTED_TARGET xcb-icccm)
 endif()
 
@@ -91,6 +93,37 @@ if (LINUX AND NOT ANDROID)
         target_sources(ladybird PRIVATE WaylandWindow.cpp WaylandWindow.h)
         target_link_libraries(ladybird PRIVATE PkgConfig::WAYLAND_CLIENT)
         target_compile_definitions(ladybird PRIVATE LADYBIRD_HAS_WAYLAND_CLIENT)
+    endif()
+    if (WAYLAND_CLIENT_FOUND AND WAYLAND_SCANNER_FOUND AND USE_VULKAN_DMABUF_IMAGES)
+        pkg_get_variable(WAYLAND_SCANNER_EXECUTABLE wayland-scanner wayland_scanner)
+        foreach(protocol linux-dmabuf-v1 viewporter)
+            set(protocol_xml "${CMAKE_CURRENT_SOURCE_DIR}/Protocols/${protocol}.xml")
+            set(protocol_header "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-client-protocol.h")
+            set(protocol_code "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-protocol.c")
+            add_custom_command(
+                OUTPUT "${protocol_header}"
+                COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" client-header "${protocol_xml}" "${protocol_header}"
+                DEPENDS "${protocol_xml}"
+                VERBATIM
+            )
+            add_custom_command(
+                OUTPUT "${protocol_code}"
+                COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" private-code "${protocol_xml}" "${protocol_code}"
+                DEPENDS "${protocol_xml}"
+                VERBATIM
+            )
+            target_sources(ladybird PRIVATE "${protocol_header}" "${protocol_code}")
+        endforeach()
+        target_sources(ladybird PRIVATE
+            WaylandGpu.cpp
+            WaylandGpu.h
+            WaylandPageSurface.cpp
+            WaylandPageSurface.h
+            WaylandRegistry.cpp
+            WaylandRegistry.h
+        )
+        target_include_directories(ladybird PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_definitions(ladybird PRIVATE LADYBIRD_HAS_WAYLAND_GPU_QUERY)
     endif()
 endif()
 
@@ -197,7 +230,7 @@ qt_deploy_runtime_dependencies(
     )
 endif()
 
-if (BUILD_TESTING)
+if (BUILD_TESTING AND NOT BUILD_BROWSER_TESTS_ONLY)
     if (APPLE)
         add_library(NativeTextEditingTestMain OBJECT
             ${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/NativeTextEditingTestMain.mm

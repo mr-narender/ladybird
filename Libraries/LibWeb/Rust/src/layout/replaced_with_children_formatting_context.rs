@@ -38,15 +38,15 @@ pub(super) fn layout_replaced_with_children(
         return formatting_context::ChildLayoutResult::default();
     };
 
-    let wrapper_constraints = run
-        .sizing()
-        .constraints_for_child_context(run.box_, layout_input.containing_block_constraints);
-    let mut wrapper_cells = run
-        .records
-        .keep_child_for_its_run(&run.callbacks, wrapper, wrapper_constraints);
+    let wrapper_constraints = run.sizing().constraints_for_child_context(
+        run.box_,
+        &run.root_record(),
+        layout_input.containing_block_constraints,
+    );
+    let mut wrapper_cells = used_values::cells_before_sizing(&run.callbacks, wrapper, wrapper_constraints);
     wrapper_cells.set_content_inline_size(content_inline_size);
 
-    let (wrapper_result, fragment_arrival) = formatting_context::run_formatting_context(
+    let wrapper_outcome = formatting_context::run_formatting_context(
         run.fragments.as_deref(),
         wrapper_cells,
         wrapper,
@@ -65,20 +65,21 @@ pub(super) fn layout_replaced_with_children(
             participation: geometry::ParticipationInParentFormattingContext::Item,
         },
         None,
-    )
-    .hand_box_back_to(run, wrapper);
+    );
+    let wrapper_result = wrapper_outcome.result;
     formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
         run.records,
         &run.callbacks,
         wrapper,
         wrapper_result.depends_on_percentage_block_size,
     );
-    formatting_context::place_laid_out_child(
+    formatting_context::place_child(
         run,
         wrapper,
+        wrapper_outcome.placed_child(),
         used_values::FfiCssPixelPoint::default(),
         None,
-        fragment_arrival,
+        wrapper_outcome.fragment_arrival,
     );
 
     formatting_context::ChildLayoutResult {

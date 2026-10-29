@@ -7,7 +7,7 @@
 #include <LibGC/Heap.h>
 #include <LibGC/Weak.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibRequests/Request.h>
+#include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Fetching/PendingResponse.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -41,21 +41,30 @@ void FetchController::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_report_timing_steps);
+    if (m_awaited_network_completion.has_value())
+        visitor.visit(m_awaited_network_completion->steps);
     visitor.visit(m_next_manual_redirect_steps);
     visitor.visit(m_fetch_params);
+    visitor.visit(m_algorithms);
     visitor.visit(m_pending_preloaded_response);
     visitor.visit(m_stop_steps);
     visitor.visit(m_pending_responses);
 }
 
-void FetchController::set_pending_request(RefPtr<Requests::Request> const& request)
+GC::Ref<FetchAlgorithms const> FetchController::algorithms() const
 {
-    m_pending_request = request;
-    m_has_started_request |= !!request;
-    if (request && m_fetch_params && m_fetch_params->request()->destination() == Request::Destination::Font) {
-        request->on_requires_network = GC::weak_callback(*this, [](auto& controller) {
+    VERIFY(m_algorithms);
+    return *m_algorithms;
+}
+
+void FetchController::set_network_transport(Engine::NetworkTransportHandle& network_transport)
+{
+    set_body_transport(network_transport);
+    m_has_started_request = true;
+    if (m_fetch_params && m_fetch_params->request()->destination() == Request::Destination::Font) {
+        network_transport.set_on_requires_network(GC::weak_callback(*this, [](auto& controller) {
             controller.m_requires_network = true;
-        });
+        }));
     }
 }
 
@@ -92,6 +101,19 @@ void FetchController::process_next_manual_redirect() const
 
     // 2. Call controller’s next manual redirect steps.
     m_next_manual_redirect_steps->function()();
+}
+
+void FetchController::when_network_completes_body(Engine::FetchByteChannel const& body, GC::Ref<GC::Function<void()>> steps)
+{
+    m_awaited_network_completion = AwaitedNetworkCompletion { body, steps };
+}
+
+void FetchController::did_complete_network_body(Engine::FetchByteChannel const& body)
+{
+    if (!m_awaited_network_completion.has_value() || m_awaited_network_completion->body.ptr() != &body)
+        return;
+    auto steps = m_awaited_network_completion.release_value().steps;
+    steps->function()();
 }
 
 // https://fetch.spec.whatwg.org/#extract-full-timing-info
@@ -176,11 +198,11 @@ void FetchController::stop_fetch()
         });
     });
 
-    if (m_fetch_params) {
-        // NB: Nobody reads a stopped fetch's body.
-        auto fetch_algorithms = FetchAlgorithms::create(FetchAlgorithms::Input { Engine::BodyIntent::DrainAndDiscard });
-        m_fetch_params->set_algorithms(fetch_algorithms);
-    }
+    // NB: Nobody reads a stopped fetch's body.
+    if (m_fetch_params)
+        m_fetch_params->set_body_intent(Engine::BodyIntent::DrainAndDiscard);
+    if (m_algorithms)
+        m_algorithms = FetchAlgorithms::create(FetchAlgorithms::Input { Engine::BodyIntent::DrainAndDiscard });
 
     stop_request();
 
@@ -200,15 +222,12 @@ void FetchController::stop_request()
 {
     end_rendering_pending_operation(this);
     VERIFY(m_state != State::Ongoing);
+    m_awaited_network_completion.clear();
     stop_body_transport();
 }
 
 void FetchController::stop_body_transport()
 {
-    if (m_pending_request) {
-        m_pending_request->stop();
-        m_pending_request = nullptr;
-    }
     if (auto body_transport = m_body_transport.strong_ref()) {
         m_body_transport = nullptr;
         body_transport->stop();

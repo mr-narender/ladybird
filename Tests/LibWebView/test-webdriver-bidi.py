@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 
 helpers = importlib.import_module("test-webdriver-error-keep-alive")
@@ -133,6 +134,11 @@ class ReloadServer(http.server.ThreadingHTTPServer):
         self.release_interception = threading.Event()
         self.detached_final_received = threading.Event()
         self.interception_transport_closed = threading.Event()
+        self.document_headers_sent: threading.Event = threading.Event()
+        self.release_document: threading.Event = threading.Event()
+        self.document_body: bytes = (
+            b"<!doctype html><title>Adopted document</title><p>" + b"BiDi adopted document\n" * 128
+        )
 
 
 class ReloadHandler(http.server.BaseHTTPRequestHandler):
@@ -271,6 +277,30 @@ class ReloadHandler(http.server.BaseHTTPRequestHandler):
                     raise TimeoutError("The test did not release the download response")
                 if not truncated:
                     self.wfile.write(server.download_body[1024:])
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if self.path.startswith("/network-document/"):
+            truncated = self.path.rsplit("/", 1)[-1] == "truncated"
+            body = server.document_body
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body) + (16 if truncated else 0)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            # A navigation reads 1445 bytes before it commits its document, so the held part starts after them.
+            held_from = 2048
+            try:
+                self.wfile.write(body[:held_from])
+                self.wfile.flush()
+                server.document_headers_sent.set()
+                if not server.release_document.wait(30):
+                    raise TimeoutError("The test did not release the document response")
+                if not truncated:
+                    self.wfile.write(body[held_from:])
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
@@ -902,6 +932,50 @@ def check_network_failed_response_transport(bidi, context, server):
             bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
 
 
+def check_network_provided_body_at_response_started(bidi, context, server):
+    url = f"http://127.0.0.1:{server.server_port}/network-interception/fail-body"
+    provided = "provided body"
+    server.interception_transport_closed.clear()
+    subscription = bidi.command(
+        "session.subscribe", {"events": ["network.responseStarted", "network.responseCompleted"]}
+    )["subscription"]
+    intercept = bidi.command(
+        "network.addIntercept",
+        {
+            "phases": ["responseStarted"],
+            "urlPatterns": [{"type": "string", "pattern": url}],
+        },
+    )["intercept"]
+    try:
+        pending = bidi.send(
+            "script.evaluate",
+            {
+                "target": {"context": context},
+                "awaitPromise": True,
+                "expression": f"fetch({json.dumps(url)}).then(response => response.text())",
+            },
+        )
+        # The original body is still arriving when the provided one replaces it.
+        event = intercepted_event(bidi, "network.responseStarted", url)
+        bidi.command(
+            "network.provideResponse",
+            {"request": event["request"]["request"], "body": {"type": "string", "value": provided}},
+        )
+        result = bidi.response(pending)
+        assert result["type"] == "success" and result["result"]["result"]["value"] == provided, result
+        assert server.interception_transport_closed.wait(30), "The provided body left the original transport open"
+        completed = bidi.event("network.responseCompleted")
+        while completed["request"]["url"] != url:
+            completed = bidi.event("network.responseCompleted")
+        response = completed["response"]
+        assert response["bodySize"] == len(provided), response
+        assert response["content"]["size"] == len(provided), response
+    finally:
+        if sys.exc_info()[0] is None:
+            bidi.command("network.removeIntercept", {"intercept": intercept})
+            bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+
+
 def check_network_scoped_headers(bidi, context, server):
     other = bidi.command("browsingContext.create", {"type": "tab"})["context"]
 
@@ -1034,6 +1108,8 @@ def check_network_interception(bidi, context, server, case="all"):
         check_network_scoped_headers(bidi, context, server)
     if case in ["all", "fail-transport"]:
         check_network_failed_response_transport(bidi, context, server)
+    if case in ["all", "provided-body-at-response-started"]:
+        check_network_provided_body_at_response_started(bidi, context, server)
     for action in ["cancel", "default"]:
         if case in ["all", "auth-response-matrix", "auth-action-extras", f"auth-{action}-extra"]:
             for credentials in [{"type": "password", "username": "user", "password": "pass"}, {}]:
@@ -1152,6 +1228,95 @@ def check_network_download_events(bidi, context, server, downloads):
     finally:
         if sys.exc_info()[0] is None:
             bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+
+
+def check_network_adopted_navigation_events(bidi, context, server):
+    # A cross-site navigation commits its document in another process, which adopts the body from RequestServer.
+    terminal_methods = {"network.responseCompleted", "network.fetchError"}
+    bidi.command(
+        "browsingContext.navigate",
+        {"context": context, "url": f"http://127.0.0.1:{server.server_port}/reload", "wait": "complete"},
+    )
+    subscription = bidi.command(
+        "session.subscribe",
+        {
+            "events": ["network.beforeRequestSent", "network.responseStarted", *sorted(terminal_methods)],
+            "contexts": [context],
+        },
+    )["subscription"]
+    try:
+        for kind in ["success", "truncated", "stopped"]:
+            url = f"http://localhost:{server.server_port}/network-document/{kind}"
+            server.document_headers_sent.clear()
+            server.release_document.clear()
+
+            def is_our_event(event, expected_url=url):
+                return event["params"].get("request", {}).get("url") == expected_url
+
+            def next_event(methods):
+                while True:
+                    for index, event in enumerate(bidi.events):
+                        if event["method"] in methods and is_our_event(event):
+                            return bidi.events.pop(index)
+                    bidi.read_message()
+
+            try:
+                bidi.send("browsingContext.navigate", {"context": context, "url": url, "wait": "none"})
+                before = next_event({"network.beforeRequestSent"})["params"]
+                started = next_event({"network.responseStarted", *terminal_methods})
+                assert started["method"] == "network.responseStarted", started
+                started = started["params"]
+                assert server.document_headers_sent.wait(10)
+                request_id = started["request"]["request"]
+                assert before["request"]["request"] == request_id, (before, started)
+
+                # The document commits while the rest of its body is held.
+                deadline = time.monotonic() + 10
+                while True:
+                    result = bidi.response(
+                        bidi.send(
+                            "script.evaluate",
+                            {"target": {"context": context}, "expression": "document.URL", "awaitPromise": False},
+                        )
+                    )
+                    if result["type"] == "success" and result["result"]["result"].get("value") == url:
+                        break
+                    assert time.monotonic() < deadline, "The navigation did not commit its document"
+                assert not any(event["method"] in terminal_methods and is_our_event(event) for event in bidi.events), (
+                    bidi.events
+                )
+
+                if kind == "stopped":
+                    # A stop in the document's process ends the adopted body with a fetch error.
+                    bidi.evaluate(context, "window.stop()")
+                else:
+                    server.release_document.set()
+                terminal = next_event(terminal_methods)
+                expected_method = "network.responseCompleted" if kind == "success" else "network.fetchError"
+                assert terminal["method"] == expected_method, terminal
+                params = terminal["params"]
+                assert params["context"] == context, params
+                assert params["request"]["request"] == request_id, params
+                assert params["navigation"] == started["navigation"], params
+                if kind == "success":
+                    response = params["response"]
+                    assert response["bodySize"] == len(server.document_body), response
+                    assert response["content"]["size"] == len(server.document_body), response
+                    assert response["bytesReceived"] == response["headersSize"] + len(server.document_body), response
+                else:
+                    assert isinstance(params["errorText"], str) and params["errorText"], params
+
+                # Only the document's process reports the end of its body, and only once.
+                bidi.evaluate(context, "0")
+                assert not any(event["method"] in terminal_methods and is_our_event(event) for event in bidi.events), (
+                    bidi.events
+                )
+            finally:
+                server.release_document.set()
+    finally:
+        if sys.exc_info()[0] is None:
+            bidi.command("session.unsubscribe", {"subscriptions": [subscription]})
+            bidi.command("browsingContext.navigate", {"context": context, "url": "about:blank", "wait": "complete"})
 
 
 def check_screenshot_handles(bidi, context):
@@ -1831,6 +1996,7 @@ def run_test(
                 return
             check_network_interception(bidi, context, server, network_interception_case)
             check_network_download_events(bidi, context, server, downloads)
+            check_network_adopted_navigation_events(bidi, context, server)
             check_screenshot_handles(bidi, context)
             check_input_handles(bidi, context)
             check_input_queue(bidi, context)
@@ -2035,6 +2201,7 @@ if __name__ == "__main__":
             "navigation",
             "scoped-headers",
             "fail-transport",
+            "provided-body-at-response-started",
             "auth-gates",
             "auth-omit",
             "auth-cors",

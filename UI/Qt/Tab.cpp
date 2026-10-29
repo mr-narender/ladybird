@@ -70,8 +70,15 @@
 
 namespace Ladybird {
 
+static constexpr int HOVER_TEXT_CORNER_RADIUS = 4;
+
 static constexpr auto WINDOW_DRAG_REGION_PROPERTY = "LadybirdWindowDragRegion";
 static constexpr int BOOKMARKS_BAR_HOVER_COLLAPSE_POLL_INTERVAL_MS = 250;
+
+static Web::HTML::ActivateTab activate_tab_for_modifiers(Qt::KeyboardModifiers modifiers)
+{
+    return modifiers.testFlag(Qt::ShiftModifier) ? Web::HTML::ActivateTab::Yes : Web::HTML::ActivateTab::No;
+}
 
 class ToolbarButton : public QToolButton {
 public:
@@ -84,7 +91,12 @@ public:
         QObject::connect(&m_icon_motion_animation, &QVariantAnimation::finished, this, [this] { update(); });
     }
 
-    Function<void()> on_middle_click;
+    Function<void(Web::HTML::ActivateTab)> on_open_in_new_tab;
+
+    bool click_opens_in_new_tab() const
+    {
+        return can_open_in_new_tab() && QApplication::keyboardModifiers().testFlag(Qt::ControlModifier);
+    }
 
     // A click or a change of state moves the icon a little: back and forward nudge their way, and the downloads arrow
     // drops into place as the button appears and bobs once as a download finishes.
@@ -122,6 +134,8 @@ public:
     }
 
 protected:
+    virtual bool can_open_in_new_tab() const { return static_cast<bool>(on_open_in_new_tab); }
+
     QRect icon_rect() const
     {
         return QRect(QPoint((width() - iconSize().width()) / 2, (height() - iconSize().height()) / 2), iconSize());
@@ -179,7 +193,7 @@ protected:
 
     virtual void mousePressEvent(QMouseEvent* event) override
     {
-        if (event->button() == Qt::MiddleButton && on_middle_click)
+        if (event->button() == Qt::MiddleButton && can_open_in_new_tab())
             event->accept();
         else
             QToolButton::mousePressEvent(event);
@@ -187,13 +201,23 @@ protected:
 
     virtual void mouseReleaseEvent(QMouseEvent* event) override
     {
-        if (event->button() == Qt::MiddleButton && on_middle_click) {
+        if (event->button() == Qt::MiddleButton && can_open_in_new_tab()) {
             if (rect().contains(event->position().toPoint()))
-                on_middle_click();
+                on_open_in_new_tab(activate_tab_for_modifiers(event->modifiers()));
             event->accept();
         } else {
             QToolButton::mouseReleaseEvent(event);
         }
+    }
+
+    // QToolButton triggers its default action from here, once a click has completed.
+    virtual void nextCheckState() override
+    {
+        if (click_opens_in_new_tab()) {
+            on_open_in_new_tab(activate_tab_for_modifiers(QApplication::keyboardModifiers()));
+            return;
+        }
+        QToolButton::nextCheckState();
     }
 
 private:
@@ -260,6 +284,11 @@ public:
     }
 
 protected:
+    virtual bool can_open_in_new_tab() const override
+    {
+        return m_visible_mode == Mode::Reload && ToolbarButton::can_open_in_new_tab();
+    }
+
     virtual void leaveEvent(QEvent* event) override
     {
         ToolbarButton::leaveEvent(event);
@@ -267,12 +296,12 @@ protected:
     }
 
     // A Shift-click on the reload button reloads bypassing the HTTP cache, and one on the stop button stops the load as
-    // any other click there does. QToolButton triggers its default action from here, once a click has completed.
+    // any other click there does.
     virtual void nextCheckState() override
     {
         if (m_visible_mode == Mode::Stop && m_double_click_timer.isActive())
             return;
-        if (m_visible_mode == Mode::Reload && QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier)) {
+        if (m_visible_mode == Mode::Reload && !click_opens_in_new_tab() && QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier)) {
             m_reload_bypassing_cache_action->trigger();
             return;
         }
@@ -473,7 +502,7 @@ private:
             if (progress.has_value())
                 ChromeStyle::paint_progress_ring(painter, palette, center, *progress);
             else
-                ChromeStyle::paint_loading_ring(painter, palette, center);
+                ChromeStyle::paint_loading_ring(painter, palette, center, ChromeStyle::LoadingRingSize::ToolbarButton);
             painter.restore();
         }
         if (m_needs_attention) {
@@ -522,17 +551,25 @@ QToolButton* Tab::create_navigation_history_toolbar_button(QWidget& parent, QAct
 {
     auto& view = this->view();
     auto* button = create_toolbar_button(parent, action);
-    button->on_middle_click = [this, direction] {
-        m_window->open_history_entry_in_new_tab(*this, direction);
+    button->on_open_in_new_tab = [this, direction](auto activate_tab) {
+        m_window->open_history_entry_in_new_tab(*this, direction, activate_tab);
     };
     auto* menu = new QMenu(button);
     QObject::connect(menu, &QMenu::aboutToShow, button, [menu, &view, direction] {
         populate_session_history_traversal_menu(*menu, view, direction);
     });
+    QObject::connect(menu, &QMenu::triggered, button, [this, &view](QAction* action) {
+        auto step = action->data().toInt();
+        if (auto modifiers = QApplication::keyboardModifiers(); modifiers.testFlag(Qt::ControlModifier))
+            m_window->duplicate_tab(*this, activate_tab_for_modifiers(modifiers), step);
+        else
+            view.traverse_the_history_to_step(step);
+    });
     button->setMenu(menu);
     button->setPopupMode(QToolButton::DelayedPopup);
     QObject::connect(button, &QToolButton::clicked, button, [button, direction] {
-        button->play_icon_motion(direction < 0 ? ToolbarButton::IconMotion::NudgeLeft : ToolbarButton::IconMotion::NudgeRight);
+        if (!button->click_opens_in_new_tab())
+            button->play_icon_motion(direction < 0 ? ToolbarButton::IconMotion::NudgeLeft : ToolbarButton::IconMotion::NudgeRight);
     });
     button->setContextMenuPolicy(Qt::CustomContextMenu);
     QObject::connect(button, &QToolButton::customContextMenuRequested, button, [button, menu, &view, direction](QPoint const&) {
@@ -1146,7 +1183,7 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     m_bookmarks_bar_hover_collapse_timer->setInterval(BOOKMARKS_BAR_HOVER_COLLAPSE_POLL_INTERVAL_MS);
     connect(m_bookmarks_bar_hover_collapse_timer, &QTimer::timeout, this, &Tab::update_bookmarks_bar_hover);
 
-    m_toolbar->installEventFilter(this);
+    m_toolbar_container->installEventFilter(this);
     m_bookmarks_bar_container->installEventFilter(this);
     m_bookmarks_bar->installEventFilter(this);
     m_view->installEventFilter(this);
@@ -1242,6 +1279,9 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_forward_action, 1));
     m_reload_button = create_toolbar_button<ReloadButton>(*navigation_button_cluster, *m_reload_action);
     m_reload_button->set_actions(*m_reload_action, *m_reload_bypassing_cache_action, *m_stop_action);
+    m_reload_button->on_open_in_new_tab = [this](auto activate_tab) {
+        m_window->duplicate_tab(*this, activate_tab);
+    };
     navigation_button_layout->addWidget(m_reload_button);
 
     auto* location_edit_container = new QWidget(m_toolbar);
@@ -1350,15 +1390,16 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         });
     };
 
+    QObject::connect(m_view, &WebContentView::image_overlay_unavailable, this, &Tab::update_hover_label);
+
     view().on_link_hover = [this](auto const& url) {
-        m_hover_label->setText(qstring_from_ak_string(url.to_byte_string()));
+        m_hover_text = qstring_from_ak_string(url.to_byte_string());
+        m_hover_text_is_on_right = false;
         update_hover_label();
-        m_hover_label->setCursor(view().cursor());
-        m_hover_label->show();
     };
 
     view().on_link_unhover = [this]() {
-        m_hover_label->hide();
+        hide_hover_label();
     };
 
     view().on_loading_state_change = [this](bool is_loading) {
@@ -1754,8 +1795,8 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         m_window->fullscreen_mode().exit(FullscreenMode::ExitInitiatedBy::WebContent);
     };
 
-    view().on_audio_play_state_changed = [this](auto play_state) {
-        emit audio_play_state_changed(tab_index(), play_state);
+    view().on_audibility_changed = [this](auto audibility) {
+        emit audibility_changed(tab_index(), audibility);
     };
 
     view().on_screen_wake_lock_state_changed = [this](auto wake_lock_state) {
@@ -1787,8 +1828,10 @@ void Tab::create_tab_context_menu()
 
     auto* mute_tab_action = new QAction("&Mute Tab", this);
     QObject::connect(mute_tab_action, &QAction::triggered, this, [this]() {
-        if (is_loaded())
+        if (is_loaded()) {
             view().toggle_page_mute_state();
+            m_window->update_tab_audio_button(*this);
+        }
     });
 
     auto* move_to_new_window_action = new QAction("Move to New &Window", this);
@@ -1969,6 +2012,13 @@ void Tab::set_pinned(bool pinned)
 void Tab::set_vertical_tabs_enabled(bool enabled)
 {
     m_vertical_tabs_enabled = enabled;
+
+    // The page's separator supplies the bottom border, leaving the toolbar open above the sidebar.
+    m_toolbar_container->setProperty("verticalTabs", enabled);
+    m_toolbar_container->style()->unpolish(m_toolbar_container);
+    m_toolbar_container->style()->polish(m_toolbar_container);
+    m_toolbar_container->update();
+
     if (!is_loaded())
         return;
 
@@ -2153,14 +2203,13 @@ void Tab::update_tab_title()
 
 void Tab::tab_settings_changed()
 {
+    auto const& tab_settings = WebView::Application::settings().tab_settings();
+    set_vertical_tabs_enabled(tab_settings.vertical_tabs_enabled);
+
     if (!is_loaded())
         return;
 
-    auto const& tab_settings = WebView::Application::settings().tab_settings();
-    m_vertical_tabs_enabled = tab_settings.vertical_tabs_enabled;
     recreate_toolbar_icons();
-    update_bookmarks_bar_visibility();
-    m_toolbar->layout()->invalidate();
 }
 
 void Tab::config_variable_changed(WebView::ConfigVariableID variable)
@@ -2252,7 +2301,7 @@ void Tab::resizeEvent(QResizeEvent* event)
     if (!is_loaded())
         return;
 
-    if (m_hover_label->isVisible())
+    if (!m_hover_text.isEmpty())
         update_hover_label();
 }
 
@@ -2263,12 +2312,32 @@ void Tab::hideEvent(QHideEvent* event)
         return;
 
     set_bookmarks_bar_hover_expanded(false);
-    m_hover_label->hide();
+    hide_hover_label();
 }
 
 void Tab::update_hover_label()
 {
-    m_hover_label->setText(QFontMetrics(m_hover_label->font()).elidedText(m_hover_label->text(), Qt::ElideRight, width() / 2 - 10));
+    if (m_hover_text.isEmpty())
+        return;
+    auto text = QFontMetrics(m_hover_label->font()).elidedText(m_hover_text, Qt::ElideRight, width() / 2 - 10);
+
+    // NB: Where the view can stack the text above the page itself, it stays inside the window and costs the page
+    //     nothing. A tooltip is a window of its own instead, which can stick out of the browser window.
+    auto image = render_hover_text(text);
+    auto size = image.deviceIndependentSize().toSize();
+    QPoint position { m_hover_text_is_on_right ? m_view->width() - size.width() : 0, m_view->height() - size.height() };
+    if (m_view->show_image_over_page(image, position)) {
+        m_hover_text_rect_over_page = { position, size };
+        m_hover_label->hide();
+        return;
+    }
+    if (!m_hover_text_rect_over_page.isEmpty()) {
+        m_view->hide_image_over_page();
+        m_hover_text_rect_over_page = {};
+    }
+
+    m_hover_label->setText(text);
+    m_hover_label->setCursor(view().cursor());
     m_hover_label->resize(m_hover_label->sizeHint());
 
     auto hover_label_height = height() - m_hover_label->height();
@@ -2281,11 +2350,57 @@ void Tab::update_hover_label()
         m_hover_label->move(left_position);
 
     m_hover_label->raise();
+    m_hover_label->show();
 }
 
 void Tab::hide_hover_label()
 {
+    m_hover_text = {};
+    if (!m_hover_text_rect_over_page.isEmpty()) {
+        m_view->hide_image_over_page();
+        m_hover_text_rect_over_page = {};
+    }
     m_hover_label->hide();
+}
+
+// Paints the hover text the way the hover label's style sheet does. It sits in a bottom corner of the page, and only
+// its corner toward the page is rounded.
+QImage Tab::render_hover_text(QString const& text) const
+{
+    static constexpr int horizontal_padding = 4 + 1;
+    static constexpr int vertical_padding = 2 + 1;
+
+    QFontMetrics metrics { m_hover_label->font() };
+    QSize size { metrics.horizontalAdvance(text) + 2 * horizontal_padding, metrics.height() + 2 * vertical_padding };
+    auto device_pixel_ratio = devicePixelRatioF();
+    QImage image { size * device_pixel_ratio, QImage::Format_ARGB32_Premultiplied };
+    image.setDevicePixelRatio(device_pixel_ratio);
+    image.fill(Qt::transparent);
+
+    auto palette = Theme::chrome_palette(*this);
+    QPainter painter { &image };
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(ChromeStyle::chrome_border(palette));
+    painter.setBrush(ChromeStyle::chrome_surface(palette));
+    auto rect = QRectF { QPointF {}, size }.adjusted(0.5, 0.5, -0.5, -0.5);
+    QPainterPath path;
+    path.moveTo(rect.bottomLeft());
+    if (m_hover_text_is_on_right) {
+        path.lineTo(rect.left(), rect.top() + HOVER_TEXT_CORNER_RADIUS);
+        path.arcTo(rect.left(), rect.top(), 2 * HOVER_TEXT_CORNER_RADIUS, 2 * HOVER_TEXT_CORNER_RADIUS, 180, -90);
+        path.lineTo(rect.topRight());
+    } else {
+        path.lineTo(rect.topLeft());
+        path.lineTo(rect.right() - HOVER_TEXT_CORNER_RADIUS, rect.top());
+        path.arcTo(rect.right() - 2 * HOVER_TEXT_CORNER_RADIUS, rect.top(), 2 * HOVER_TEXT_CORNER_RADIUS, 2 * HOVER_TEXT_CORNER_RADIUS, 90, -90);
+    }
+    path.lineTo(rect.bottomRight());
+    path.closeSubpath();
+    painter.drawPath(path);
+    painter.setFont(m_hover_label->font());
+    painter.setPen(ChromeStyle::chrome_text(palette));
+    painter.drawText(QRect { QPoint {}, size }, Qt::AlignCenter, text);
+    return image;
 }
 
 bool Tab::event(QEvent* event)
@@ -2311,6 +2426,11 @@ bool Tab::eventFilter(QObject* watched, QEvent* event)
         if (static_cast<QDynamicPropertyChangeEvent*>(event)->propertyName() == "autocompleteOpen")
             update_bookmarks_bar_hover();
     }
+    // NB: The hover text over the page lets the pointer through, so it moves aside when the pointer comes over it.
+    if (watched == m_view && event->type() == QEvent::MouseMove && m_hover_text_rect_over_page.contains(static_cast<QMouseEvent*>(event)->position().toPoint())) {
+        m_hover_text_is_on_right = !m_hover_text_is_on_right;
+        update_hover_label();
+    }
     if (watched == m_view && (event->type() == QEvent::Resize || event->type() == QEvent::Move)) {
         update_bookmarks_bar_geometry();
         if (m_find_in_page->isVisible())
@@ -2323,12 +2443,12 @@ bool Tab::eventFilter(QObject* watched, QEvent* event)
     if (watched == m_bookmarks_bar && event->type() == QEvent::LayoutRequest)
         update_bookmarks_bar_geometry();
 
-    if (watched == m_toolbar || watched == m_bookmarks_bar_container) {
+    if (watched == m_toolbar_container || watched == m_bookmarks_bar_container) {
         if (event->type() == QEvent::Enter || event->type() == QEvent::Show) {
             update_bookmarks_bar_hover();
         } else if (event->type() == QEvent::Leave) {
             QTimer::singleShot(0, this, &Tab::update_bookmarks_bar_hover);
-        } else if (event->type() == QEvent::Hide && watched == m_toolbar) {
+        } else if (event->type() == QEvent::Hide && watched == m_toolbar_container) {
             set_bookmarks_bar_hover_expanded(false);
         }
     }
@@ -2346,8 +2466,8 @@ void Tab::update_chrome_style()
     auto hover_surface = ChromeStyle::style_sheet_color(ChromeStyle::chrome_surface(Theme::chrome_palette(*this)));
     auto hover_border = ChromeStyle::style_sheet_color(ChromeStyle::chrome_border(Theme::chrome_palette(*this)));
     auto hover_text = ChromeStyle::style_sheet_color(ChromeStyle::chrome_text(Theme::chrome_palette(*this)));
-    m_hover_label->setStyleSheet(qformatted("background: {}; color: {}; border: 1px solid {}; border-radius: 6px;",
-        hover_surface, hover_text, hover_border));
+    m_hover_label->setStyleSheet(qformatted("background: {}; color: {}; border: 1px solid {}; border-top-right-radius: {}px;",
+        hover_surface, hover_text, hover_border, HOVER_TEXT_CORNER_RADIUS));
     if (m_downloads_popover)
         m_downloads_popover->update_chrome_style(palette());
     m_is_updating_chrome_style = false;
@@ -2729,7 +2849,7 @@ bool Tab::cursor_is_over_bookmarks_bar_hover_region() const
     auto contains_cursor = [&](QWidget const& widget) {
         return widget.isVisible() && QRect { widget.mapToGlobal(QPoint {}), widget.size() }.contains(cursor_position);
     };
-    return contains_cursor(*m_toolbar) || contains_cursor(*m_bookmarks_bar_container);
+    return contains_cursor(*m_toolbar_container) || contains_cursor(*m_bookmarks_bar_container);
 }
 
 void Tab::update_bookmarks_bar_hover()

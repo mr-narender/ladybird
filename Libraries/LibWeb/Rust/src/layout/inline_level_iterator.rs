@@ -36,6 +36,8 @@ pub(crate) struct Item {
     pub(crate) preceded_by_unattached_inline_start_edges: bool,
     pub(crate) content_baselines: DerivedBaselines,
     pub(crate) trailing_whitespace: line_box_fragment::TrailingWhitespace,
+    /// For an element item laid out on a line, the sizes and box sides of its box, as its layout left them.
+    pub(crate) box_cells: Option<Box<used_values::RootInputCells>>,
 }
 
 fn shape_glyph_data(
@@ -134,7 +136,17 @@ impl Item {
             preceded_by_unattached_inline_start_edges: false,
             content_baselines: DerivedBaselines::default(),
             trailing_whitespace: line_box_fragment::TrailingWhitespace::default(),
+            box_cells: None,
         }
+    }
+
+    /// The sizes and box sides of the box of an element item laid out on a line.
+    #[track_caller]
+    pub(crate) fn box_cells(&self) -> used_values::RootInputCells {
+        *self
+            .box_cells
+            .as_deref()
+            .expect("an element item laid out on a line carries the cells of its box")
     }
 
     pub(crate) fn border_box_inline_size(&self) -> CssPixels {
@@ -552,20 +564,20 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
 
     fn enter_node_with_box_model_metrics(&mut self, node: Node) {
         self.entered_box_model_nodes.push(node);
-        let used = record_entered_inline_box(self.context, node);
+        let sides = record_entered_inline_box(self.context, node);
         let leading = self.extra_leading_metrics.get_or_insert_default();
-        leading.margin += used.margin_left.get();
-        leading.border += used.border_left.get();
-        leading.padding += used.padding_left.get();
+        leading.margin += sides.margin_left;
+        leading.border += sides.border_left;
+        leading.padding += sides.padding_left;
         self.box_model_node_stack.push(node);
     }
 
     fn exit_node_with_box_model_metrics(&mut self) {
         let node = self.box_model_node_stack.pop().unwrap();
-        let used = self.context().used(node);
-        let margin = used.margin_right.get();
-        let border = used.border_right.get();
-        let padding = used.padding_right.get();
+        let sides = self.context().sides_of_entered_inline_box(node);
+        let margin = sides.margin_right;
+        let border = sides.border_right;
+        let padding = sides.padding_right;
         let trailing = self.extra_trailing_metrics.get_or_insert_default();
         trailing.margin += margin;
         trailing.border += border;
@@ -971,18 +983,17 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
         if self.atomic_sizing == AtomicInlineSizing::Contributions {
             self.size_item_by_outer_inline_contributions(&mut item);
         } else {
-            if self.box_model_node_stack.last().copied() != Some(node) {
-                self.context().hold_atomic_inline(node);
-            }
-            item.content_baselines = self.context_mut().dimension_box_on_line(node);
-            let atomic_inline = self.context().box_metrics(node);
-            item.inline_size = atomic_inline.content_inline_size();
-            item.padding_start = atomic_inline.padding_left();
-            item.padding_end = atomic_inline.padding_right();
-            item.border_start = atomic_inline.border_left();
-            item.border_end = atomic_inline.border_right();
-            item.margin_start = atomic_inline.margin_left();
-            item.margin_end = atomic_inline.margin_right();
+            let cells = self.context().hold_atomic_inline(node);
+            let (content_baselines, box_cells) = self.context_mut().dimension_box_on_line(node, cells);
+            item.content_baselines = content_baselines;
+            item.inline_size = box_cells.content_inline_size;
+            item.padding_start = box_cells.padding_left;
+            item.padding_end = box_cells.padding_right;
+            item.border_start = box_cells.border_left;
+            item.border_end = box_cells.border_right;
+            item.margin_start = box_cells.margin_left;
+            item.margin_end = box_cells.margin_right;
+            item.box_cells = Some(Box::new(box_cells));
         }
         self.add_extra_box_model_metrics_to_item(&mut item, true, true);
         self.skip_to_next();
@@ -990,20 +1001,32 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
     }
 }
 
-fn record_entered_inline_box<'context>(
-    context: &inline_formatting_context::InlineFormattingContext<'context>,
+/// Lays out `node`, a fragmented inline the context enters, in a record of this call, resolves its box sides and
+/// returns them.
+fn record_entered_inline_box(
+    context: &inline_formatting_context::InlineFormattingContext<'_>,
     node: Node,
-) -> &'context UsedValues {
+) -> used_values::RootInputCells {
     let constraints = context.input.containing_block_constraints;
-    let used = context.create_used_values(node, constraints);
+    let record_of_this_call = used_values::create_used_values(&context.callbacks, node, constraints);
+    let used = &record_of_this_call;
     let style = context.style(node);
     let basis = constraints.inline_basis();
     used.resolve_box_model(&style, basis);
-    context.compute_inset(node);
+    let insets = context.compute_inset(node);
+    let sides = used_values::RootInputCells::capture(used);
+    context.keep_entered_inline_box(node, sides, insets);
     if context.run.fragments.is_some() && context.run.fragmentainer.is_none() {
-        formatting_context::place_child(context.run, node, FfiCssPixelPoint::default(), None);
+        formatting_context::place_child(
+            context.run,
+            node,
+            formatting_context::PlacedChild::of_record(used, context.run).with_in_flow_box_insets(insets),
+            FfiCssPixelPoint::default(),
+            None,
+            None,
+        );
     }
-    used
+    sides
 }
 
 /// The inline items a block container generated, kept for the later runs of the container in the same pass. Their

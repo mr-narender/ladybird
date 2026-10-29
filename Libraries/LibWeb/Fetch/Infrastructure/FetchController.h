@@ -14,9 +14,9 @@
 #include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibRequests/Forward.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
+#include <LibWeb/Fetch/Engine/FetchByteChannel.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
@@ -54,6 +54,11 @@ public:
 
     void report_timing(JS::Object&) const;
     void process_next_manual_redirect() const;
+
+    // Runs the steps once the network has delivered all of the body whose bytes arrive through the channel, in place of
+    // any steps set before.
+    void when_network_completes_body(Engine::FetchByteChannel const&, GC::Ref<GC::Function<void()>> steps);
+    void did_complete_network_body(Engine::FetchByteChannel const&);
     [[nodiscard]] NonnullRefPtr<FetchTimingInfo> extract_full_timing_info() const;
     void abort(JS::Realm&, Optional<JS::Value>);
     Optional<HTML::IPCSerializationRecord> const& serialized_abort_reason() const { return m_serialized_abort_reason; }
@@ -61,6 +66,9 @@ public:
 
     void set_fetch_params(Badge<FetchParams>, GC::Ref<FetchParams> fetch_params) { m_fetch_params = fetch_params; }
     [[nodiscard]] GC::Ptr<FetchParams> fetch_params() const { return m_fetch_params; }
+
+    void set_algorithms(Badge<FetchParams>, GC::Ref<FetchAlgorithms const> algorithms) { m_algorithms = algorithms; }
+    [[nodiscard]] GC::Ref<FetchAlgorithms const> algorithms() const;
 
     // AD-HOC: Whether this fetch's response has arrived: as headers from the network, or at main fetch. From then on,
     //         its body delivery is queued as event-loop tasks, and its response processing captures its task
@@ -71,7 +79,7 @@ public:
     [[nodiscard]] GC::Ptr<Fetching::PendingResponse> pending_preloaded_response() const { return m_pending_preloaded_response; }
     void set_pending_preloaded_response(GC::Ptr<Fetching::PendingResponse> pending_preloaded_response) { m_pending_preloaded_response = pending_preloaded_response; }
 
-    void set_pending_request(RefPtr<Requests::Request> const&);
+    void set_network_transport(Engine::NetworkTransportHandle&);
     void set_body_transport(Engine::FetchBodyDeliveryGate::Transport&);
     bool requires_network() const { return m_requires_network; }
     bool has_started_request() const { return m_has_started_request; }
@@ -111,6 +119,12 @@ private:
     //    Null or an algorithm accepting a global object.
     GC::Ptr<GC::Function<void(JS::Object&)>> m_report_timing_steps;
 
+    struct AwaitedNetworkCompletion {
+        NonnullRefPtr<Engine::FetchByteChannel const> body;
+        GC::Ref<GC::Function<void()>> steps;
+    };
+    Optional<AwaitedNetworkCompletion> m_awaited_network_completion;
+
     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
     // serialized abort reason (default null)
     //     Null or a Record (result of StructuredSerialize).
@@ -122,12 +136,28 @@ private:
     GC::Ptr<GC::Function<void()>> m_next_manual_redirect_steps;
 
     GC::Ptr<FetchParams> m_fetch_params;
+
+    // AD-HOC: The fetch params' algorithms are kept on their controller, which every copy of the fetch params shares.
+    // https://fetch.spec.whatwg.org/#fetch-params-process-request-body
+    // process request body chunk length (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-request-end-of-body
+    // process request end-of-body (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-early-hints-response
+    // process early hints response (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-response
+    // process response (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-response-end-of-body
+    // process response end-of-body (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-response-consume-body
+    // process response consume body (default null)
+    //     Null or an algorithm.
+    GC::Ptr<FetchAlgorithms const> m_algorithms;
+
     bool m_response_arrived { false };
     // NB: Assumes one waiting consumer for a pending preloaded response.
     // Widen this if preload handoff ever supports multiple consumers.
     GC::Ptr<Fetching::PendingResponse> m_pending_preloaded_response;
 
-    WeakPtr<Requests::Request> m_pending_request;
     WeakPtr<Engine::FetchBodyDeliveryGate::Transport> m_body_transport;
     bool m_requires_network { false };
     bool m_has_started_request { false };

@@ -146,6 +146,11 @@ public:
     void platform_scrollbar_track_press_behavior_changed();
     // The languages the user prefers, as the platform lists them (BCP 47 tags, most preferred first).
     virtual Vector<String> platform_preferred_languages() const { return {}; }
+    // The GPU the platform presents on, which the compositor paints on too, so that it can share its frames without a copy.
+    virtual Optional<Gfx::GpuDeviceIdentity> platform_presentation_gpu_device() const { return {}; }
+    // The DRM format modifiers the platform can present frames in that are shared from that GPU, or empty if it does
+    // not say.
+    virtual Vector<u64> platform_presentation_drm_format_modifiers() const { return {}; }
 
     virtual OwnPtr<PictureInPictureWindow> create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable&, Gfx::IntSize video_size);
 
@@ -264,6 +269,7 @@ public:
     void update_compositor_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays const&);
     void update_compositor_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void update_compositor_context_visibility(Web::CompositorContextId, Web::HTML::VisibilityState);
+    void update_compositor_context_presents_from_cpu_memory(Web::CompositorContextId, bool);
     bool handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&, bool allow_keyboard_scroll);
     bool handle_and_dispatch_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
     bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
@@ -381,6 +387,8 @@ public:
 
     Menu& bookmarks_menu() { return *m_bookmarks_menu; }
     virtual void toggle_bookmark_for_view(ViewImplementation&);
+
+    Menu& show_bookmarks_bar_menu() { return *m_show_bookmarks_bar_menu; }
     Action& toggle_bookmark_bar_action() { return *m_toggle_bookmark_bar_action; }
 
     Menu& history_menu() { return *m_history_menu; }
@@ -707,11 +715,11 @@ private:
 
     RefPtr<Menu> m_bookmarks_menu;
     RefPtr<Action> m_toggle_bookmark_action;
-    RefPtr<Action> m_toggle_bookmark_bar_action;
     RefPtr<Menu> m_show_bookmarks_bar_menu;
     RefPtr<Action> m_show_bookmarks_bar_always_action;
     RefPtr<Action> m_show_bookmarks_bar_never_action;
     RefPtr<Action> m_show_bookmarks_bar_on_hover_action;
+    RefPtr<Action> m_toggle_bookmark_bar_action;
     size_t m_bookmarks_menu_static_size { 0 };
 
     RefPtr<Menu> m_history_menu;

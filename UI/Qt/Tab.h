@@ -13,8 +13,8 @@
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
+#include <LibAudio/Audibility.h>
 #include <LibWakeLock/DisplaySleepInhibitor.h>
-#include <LibWebCommon/HTML/AudioPlayState.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/Page/ScreenWakeLockState.h>
 #include <LibWebView/FileDownloader.h>
@@ -205,7 +205,7 @@ public slots:
 signals:
     void title_changed(int id, QString const&);
     void favicon_changed(int id, QIcon const&);
-    void audio_play_state_changed(int id, Web::HTML::AudioPlayState);
+    void audibility_changed(int id, Audio::Audibility);
     void loading_changed();
     void loaded();
 
@@ -232,6 +232,7 @@ private:
     void position_downloads_popover();
     void position_private_session_popover();
     void hide_hover_label();
+    QImage render_hover_text(QString const&) const;
     void set_loading(bool);
     void update_tab_icon();
     int tab_index();
@@ -283,6 +284,11 @@ private:
     Optional<u64> m_report_review_navigation_listener;
     bool m_has_loaded_report_review_page { false };
     HyperlinkLabel* m_hover_label { nullptr };
+    // The address of the hovered link, which shows over the bottom corner of the page that the pointer is not over.
+    QString m_hover_text;
+    bool m_hover_text_is_on_right { false };
+    // Where the hover text shows over the page, in the view, when the view can stack it above the page itself.
+    QRect m_hover_text_rect_over_page;
     QIcon m_favicon;
     bool m_is_loading { false };
     bool m_needs_attention { false };

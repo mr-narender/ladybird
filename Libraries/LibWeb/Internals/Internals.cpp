@@ -12,6 +12,7 @@
 #include <AK/NumericLimits.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16StringBuilder.h>
+#include <LibAudio/ClientConnection.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
@@ -68,6 +69,7 @@
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/HTML/AnimatedBitmapDecodedImageData.h>
 #include <LibWeb/HTML/AutoplaySettings.h>
+#include <LibWeb/HTML/BitmapDecodedImageData.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventLoop/TaskQueue.h>
@@ -415,6 +417,11 @@ void Internals::gc_async(GC::Ref<WebIDL::Promise> promise)
         realm.vm().heap().collect_garbage();
         WebIDL::resolve_promise(*promise);
     });
+}
+
+WebIDL::UnsignedLongLong Internals::discard_decoded_image_frames()
+{
+    return HTML::BitmapDecodedImageData::discard_all_discardable_frames();
 }
 
 WebIDL::ExceptionOr<void> Internals::mark_as_garbage(Utf16String const& variable_name)
@@ -2117,6 +2124,21 @@ bool Internals::media_element_is_playing_audio(HTML::HTMLMediaElement& element)
     return element.is_playing_audio();
 }
 
+bool Internals::document_is_playing_audio(DOM::Document& document)
+{
+    return document.is_playing_audio();
+}
+
+bool Internals::tab_is_playing_audio()
+{
+    return window().associated_document().page().client().page_did_request_tab_is_playing_audio_for_testing();
+}
+
+WebIDL::UnsignedLongLong Internals::tab_audibility_change_count()
+{
+    return window().associated_document().page().client().page_did_request_tab_audibility_change_count_for_testing();
+}
+
 bool Internals::media_element_video_sink_is_ticking(HTML::HTMLMediaElement& element)
 {
     return element.m_video_sink_is_ticking;
@@ -2145,9 +2167,10 @@ void Internals::disconnect_media_server()
         client.value()->shutdown();
 }
 
-void Internals::set_page_muted(bool muted)
+void Internals::disconnect_audio_server()
 {
-    window().associated_document().page().set_page_mute_state(muted ? HTML::MuteState::Muted : HTML::MuteState::Unmuted);
+    if (auto connection = Audio::ClientConnection::acquire(); !connection.is_error())
+        connection.value()->shutdown();
 }
 
 DOM::Document::StyleInvalidationCounters const& Internals::style_invalidation_counters() const

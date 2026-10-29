@@ -921,10 +921,19 @@ impl RetainedState {
 
     /// The language tag a text node's transform reads: the one its DOM parent element resolves to.
     /// A text node under a shadow root or the document has no element above it and reads none.
-    fn text_language_tag(&self, node: StyleNodeID) -> &[u16] {
+    pub(crate) fn text_language_tag(&self, node: StyleNodeID) -> &[u16] {
         self.tree
             .text_parent(node)
             .filter(|&parent| self.tree.host_of(parent).is_none() && !self.tree.is_relation_only(parent))
+            .map_or(&[], |parent| self.facts.language_tag_of(parent))
+    }
+
+    /// Text directly under a shadow root uses its host's language for line breaking.
+    pub(crate) fn text_line_break_language_tag(&self, node: StyleNodeID) -> &[u16] {
+        self.tree
+            .text_parent(node)
+            .map(|parent| self.tree.host_of(parent).unwrap_or(parent))
+            .filter(|&parent| !self.tree.is_relation_only(parent))
             .map_or(&[], |parent| self.facts.language_tag_of(parent))
     }
 
@@ -1993,6 +2002,7 @@ impl StyleEngine {
                 specified_values: crate::fork::ForkShared::new(SpecifiedValues::new()),
                 winner_groups: crate::fork::ForkShared::new(WinnerGroups::new()),
                 computed_group_sets: Default::default(),
+                style_record_view_epoch_depth: 0,
                 custom_property_environments: Default::default(),
                 nodes_with_substituted_records: HashSet::default(),
                 custom_declaration_reads: HashMap::default(),
@@ -3367,6 +3377,7 @@ impl RetainedState {
             specified_values: _,
             winner_groups,
             computed_group_sets,
+            style_record_view_epoch_depth: _,
             custom_property_environments: _,
             nodes_with_substituted_records,
             custom_declaration_reads,

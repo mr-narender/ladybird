@@ -15,6 +15,7 @@
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWebCommon/Loader/LoaderConfigSnapshot.h>
@@ -28,7 +29,7 @@ class WEB_API FetchParams : public JS::Cell {
 
 public:
     struct PreloadedResponseCandidatePendingTag { };
-    using PreloadedResponseCandidate = Variant<Empty, PreloadedResponseCandidatePendingTag, GC::Ref<Response>>;
+    using PreloadedResponseCandidate = Variant<Empty, PreloadedResponseCandidatePendingTag, NonnullRefPtr<Response>>;
 
     [[nodiscard]] static GC::Ref<FetchParams> create(NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
     [[nodiscard]] static GC::Ref<FetchParams> copy(FetchParams const&);
@@ -40,8 +41,8 @@ public:
     [[nodiscard]] LoaderConfig const& loader_config() const { return m_loader_config->config; }
     [[nodiscard]] NonnullRefPtr<LoaderConfigSnapshot const> const& loader_config_snapshot() const { return m_loader_config; }
 
-    [[nodiscard]] GC::Ref<FetchAlgorithms const> algorithms() const { return m_algorithms; }
-    void set_algorithms(GC::Ref<FetchAlgorithms const> algorithms) { m_algorithms = algorithms; }
+    [[nodiscard]] Engine::BodyIntent body_intent() const { return m_body_intent; }
+    void set_body_intent(Engine::BodyIntent body_intent) { m_body_intent = body_intent; }
 
     [[nodiscard]] TaskDestination& task_destination() { return m_task_destination; }
     [[nodiscard]] TaskDestination const& task_destination() const { return m_task_destination; }
@@ -77,20 +78,7 @@ private:
     //     A request.
     NonnullRefPtr<Request> m_request;
 
-    // https://fetch.spec.whatwg.org/#fetch-params-process-request-body
-    // process request body chunk length (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-request-end-of-body
-    // process request end-of-body (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-early-hints-response
-    // process early hints response (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-response
-    // process response (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-response-end-of-body
-    // process response end-of-body (default null)
-    // https://fetch.spec.whatwg.org/#fetch-params-process-response-consume-body
-    // process response consume body (default null)
-    //     Null or an algorithm.
-    GC::Ref<FetchAlgorithms const> m_algorithms;
+    Engine::BodyIntent m_body_intent;
 
     // https://fetch.spec.whatwg.org/#fetch-params-task-destination
     // task destination (default null)

@@ -289,6 +289,20 @@ static ReferrerPolicy::ReferrerPolicy referrer_policy_attribute_state(Optional<U
 
 void HTMLImageElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
+    // https://html.spec.whatwg.org/multipage/embedded-content.html#attr-img-loading
+    // When the loading attribute's state is changed to the Eager state, the user agent must run these steps:
+    if (!namespace_.has_value() && name == HTML::AttributeNames::loading && lazy_loading_state(old_value) == LazyLoading::Lazy && lazy_loading_state(value) == LazyLoading::Eager) {
+        // 1. Let resumptionSteps be the img element's lazy load resumption steps.
+        // 3. Set the img's lazy load resumption steps to null.
+        auto resumption_steps = take_lazy_load_resumption_steps_internal();
+
+        // 2. If resumptionSteps is null, then return.
+        if (resumption_steps) {
+            // 4. Invoke resumptionSteps.
+            resumption_steps->function()();
+        }
+    }
+
     // https://html.spec.whatwg.org/multipage/images.html#relevant-mutations
     // The element's crossorigin attribute's state is changed.
     if (!namespace_.has_value() && name == HTML::AttributeNames::crossorigin) {
@@ -1139,8 +1153,13 @@ after_step_7:
         }
 
         // 14. If the pending request is not null and urlString is the same as the pending request's current URL, then return.
-        if (m_pending_request && *url_string == m_pending_request->current_url())
-            return;
+        if (m_pending_request && *url_string == m_pending_request->current_url()) {
+            auto resumption_steps = take_lazy_load_resumption_steps_internal();
+            if (!resumption_steps)
+                return;
+            // NB: Retire the superseded lazy continuation and recreate it below for this update.
+            resumption_steps->function()();
+        }
 
         // 15. If urlString is the same as the current request's current URL and the current request's state is
         //     partially available:
@@ -1230,7 +1249,11 @@ after_step_7:
         //          Subsequent source changes must not wait for another intersection observation.
         if (!m_has_resumed_lazy_loading && will_lazy_load_element()) {
             // 1. Set the img's lazy load resumption steps to the rest of this algorithm starting with the step labeled fetch the image.
-            set_lazy_load_resumption_steps([this, request, image_request]() {
+            set_lazy_load_resumption_steps([this, request, image_request, update_the_image_data_count, observing_document = GC::Ref { document() }]() {
+                // NB: Unobserve in the document which registered the image, including after adoption.
+                observing_document->stop_intersection_observing_a_lazy_loading_element(*this);
+                if (update_the_image_data_count != m_update_the_image_data_count)
+                    return;
                 m_has_resumed_lazy_loading = true;
                 image_request->fetch_image(request);
             });
@@ -1680,7 +1703,15 @@ void update_the_source_set(DOM::Element& element)
         }
 
         // 7. Parse child's sizes attribute with img, and let source set's source size be the returned value.
-        source_set.m_source_size = parse_a_sizes_attribute(element.document(), child->attribute(HTML::AttributeNames::sizes).value_or({}), img);
+        auto sizes = child->attribute(HTML::AttributeNames::sizes);
+        // AD-HOC: Parsing a sizes attribute treats an absent attribute as the empty string, but the source element's
+        //         sizes attribute definition says:
+        //         https://html.spec.whatwg.org/multipage/embedded-content.html#attr-source-sizes
+        //         "If the img element allows auto-sizes, then the sizes attribute can be omitted on previous sibling
+        //         source elements. In such cases, it is equivalent to specifying auto."
+        if (!sizes.has_value() && img && img->allows_auto_sizes())
+            sizes = "auto"_utf16;
+        source_set.m_source_size = parse_a_sizes_attribute(element.document(), sizes.value_or({}), img);
 
         // 8. If child has a type attribute, and its value is an unknown or unsupported MIME type, continue to the next child.
         if (child->has_attribute(HTML::AttributeNames::type)) {

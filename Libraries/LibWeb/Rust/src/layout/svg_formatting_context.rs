@@ -325,6 +325,14 @@ fn kind_is_svg_container_element(kind: NodeKind) -> bool {
     )
 }
 
+/// What the layout of an SVG element hands its parent: the element's sizes and box sides, and the offset of its content
+/// box.
+#[derive(Clone, Copy)]
+struct LaidOutSvgElement {
+    cells: used_values::RootInputCells,
+    content_offset: FfiCssPixelPoint,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SvgCssPixelRect {
     x: CssPixels,
@@ -1829,13 +1837,12 @@ impl<'pass> SvgFormattingContext<'pass> {
         self.run.records.used_values(node)
     }
 
-    fn create_used_values(&self, node: Node) -> &'pass UsedValues {
+    /// A record for `node`, a box this context lays out in it.
+    fn create_used_values(&self, node: Node) -> UsedValues {
         // SVG descendants deliberately carry no percentage basis.
         // SVG layout resolves percentages against the SVG viewport, not a CSS containing
         // block, so boxes inside the SVG subtree carry no percentage basis.
-        self.run
-            .records
-            .create_used_values(&self.run.callbacks, node, ContainingBlockConstraints::default())
+        used_values::create_used_values(&self.run.callbacks, node, ContainingBlockConstraints::default())
     }
 
     fn set_svg_viewport_transform(&self, node: Node, transform: FfiAffineTransform) {
@@ -1869,31 +1876,46 @@ impl<'pass> SvgFormattingContext<'pass> {
         });
     }
 
-    fn place_child(&self, node: Node, x: CssPixels, y: CssPixels) {
-        self.place_laid_out_child(node, x, y, None);
+    /// Places `node`, a box this context lays out in `record`, whose metrics are final once the box is placed, and
+    /// returns what the parent of the box reads of it.
+    fn place_child(&self, node: Node, record: &UsedValues, x: CssPixels, y: CssPixels) -> LaidOutSvgElement {
+        let placed_child = formatting_context::PlacedChild::of_record(record, &self.run);
+        self.place_laid_out_child(node, placed_child, x, y, None);
+        record.seal_own_metrics();
+        LaidOutSvgElement {
+            cells: used_values::RootInputCells::capture(record),
+            content_offset: FfiCssPixelPoint { x, y },
+        }
     }
 
     fn place_laid_out_child(
         &self,
         node: Node,
+        placed_child: formatting_context::PlacedChild,
         x: CssPixels,
         y: CssPixels,
         fragment_arrival: Option<fragment_tree::ChildFragmentArrival>,
     ) {
-        formatting_context::place_laid_out_child(&self.run, node, FfiCssPixelPoint { x, y }, None, fragment_arrival);
+        formatting_context::place_child(
+            &self.run,
+            node,
+            placed_child,
+            FfiCssPixelPoint { x, y },
+            None,
+            fragment_arrival,
+        );
     }
 
-    /// Gives `node` a content size that is definite in both axes.
-    fn set_definite_content_size(&self, node: Node, width: CssPixels, height: CssPixels) {
-        let used = self.used_values(node);
+    /// Gives the box laid out in `used` a content size that is definite in both axes.
+    fn set_definite_content_size(used: &UsedValues, width: CssPixels, height: CssPixels) {
         used.set_content_inline_size(width);
         used.set_content_block_size(height);
         used.has_definite_block_size.set(true);
     }
 
-    fn set_content_rect(&self, node: Node, rect: SvgCssPixelRect) {
-        self.set_definite_content_size(node, rect.width, rect.height);
-        self.place_child(node, rect.x, rect.y);
+    fn set_content_rect(&self, node: Node, used: &UsedValues, rect: SvgCssPixelRect) -> LaidOutSvgElement {
+        Self::set_definite_content_size(used, rect.width, rect.height);
+        self.place_child(node, used, rect.x, rect.y)
     }
 
     fn first_child_of_kind(&self, node: Node, kind: NodeKind) -> Option<Node> {
@@ -1904,13 +1926,17 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     pub(super) fn run(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput) {
+        let used = self.used_values(self.run.box_);
+        self.lay_out_contents(run, input, used);
+    }
+
+    /// Lays out the contents of this context's box, which is laid out in `used`.
+    fn lay_out_contents(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput, used: &UsedValues) {
         // NOTE: SVG doesn't have a "formatting context" in the spec, but this is the most
         //       obvious way to drive SVG layout in our engine at the moment.
         let kind = self.node_kind(self.run.box_);
         let facts = self.svg_facts(self.run.box_);
         let attributes = self.svg_attributes(self.run.box_);
-        let used_pointer = self.used_values(self.run.box_);
-        let used = &used_pointer;
         self.commit_svg_element_facts(self.run.box_, facts, attributes);
 
         if facts.is_document_element
@@ -2025,17 +2051,15 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
-    fn layout_svg_element(&mut self, run: &FormattingContextRun<'pass>, child: Node) {
+    /// Lays out and places `child`, and returns what its parent reads of it, if it laid it out.
+    fn layout_svg_element(&mut self, run: &FormattingContextRun<'pass>, child: Node) -> Option<LaidOutSvgElement> {
         let kind = self.node_kind(child);
         if self.svg_attributes(child).is_fit_to_view_box {
-            self.layout_nested_viewport(run, child);
+            return Some(self.layout_nested_viewport(run, child));
         } else if kind == NodeKind::SVGForeignObjectBox {
             // SVG descendants carry no percentage basis, as `create_used_values` explains.
-            let mut child_cells = self.run.records.keep_child_for_its_run(
-                &self.run.callbacks,
-                child,
-                ContainingBlockConstraints::default(),
-            );
+            let mut child_cells =
+                used_values::cells_before_sizing(&self.run.callbacks, child, ContainingBlockConstraints::default());
             let style = self.style(child);
             let rect = SvgCssPixelRect {
                 x: style.x().to_px(self.viewport_width),
@@ -2056,6 +2080,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             let formatting_context::ChildLayout {
                 outcome,
                 fragment_arrival,
+                laid_out_box,
             } = formatting_context::layout_inside_child_with_input_cells(
                 run,
                 None,
@@ -2063,33 +2088,43 @@ impl<'pass> SvgFormattingContext<'pass> {
                 child,
                 child_input,
                 child_cells,
+                None,
                 true,
+                run.percentage_block_insets_of_root_children_have_definite_basis(),
             );
             outcome.report_percentage_block_size_dependency_of(run, child);
-            match outcome {
-                ChildLayoutOutcome::Created(_) => {}
-                ChildLayoutOutcome::Skipped { .. } | ChildLayoutOutcome::ReenterCurrent => {
-                    panic!("SVG foreign object did not create an independent formatting context")
-                }
-            };
-
+            assert!(
+                matches!(outcome, ChildLayoutOutcome::Created(_)),
+                "SVG foreign object did not create an independent formatting context"
+            );
             // Masks and clips may use this offset for objectBoundingBox units.
-            self.place_laid_out_child(child, rect.x, rect.y, fragment_arrival);
+            self.place_laid_out_child(
+                child,
+                formatting_context::PlacedChild::of_laid_out_box(&laid_out_box),
+                rect.x,
+                rect.y,
+                fragment_arrival,
+            );
             if let Some(mask) = self.first_child_of_kind(child, NodeKind::SVGMaskBox) {
-                self.layout_mask_or_clip(run, mask);
+                self.layout_mask_or_clip(run, mask, &laid_out_box.cells);
             }
             if let Some(clip) = self.first_child_of_kind(child, NodeKind::SVGClipBox) {
-                self.layout_mask_or_clip(run, clip);
+                self.layout_mask_or_clip(run, clip, &laid_out_box.cells);
             }
+            return Some(LaidOutSvgElement {
+                cells: laid_out_box.cells,
+                content_offset: FfiCssPixelPoint { x: rect.x, y: rect.y },
+            });
         } else if kind_is_svg_graphics_box(kind) {
-            self.layout_graphics_element(run, child);
+            return Some(self.layout_graphics_element(run, child));
         }
+        None
     }
 
-    fn layout_nested_viewport(&mut self, run: &FormattingContextRun<'pass>, viewport: Node) {
+    fn layout_nested_viewport(&mut self, run: &FormattingContextRun<'pass>, viewport: Node) -> LaidOutSvgElement {
         // Layout for a nested SVG viewport.
         // https://svgwg.org/svg2-draft/coords.html#EstablishingANewSVGViewport.
-        self.create_used_values(viewport);
+        let used = self.create_used_values(viewport);
         let style = self.style(viewport);
         let nested_viewport_x = style.x().to_px(self.viewport_width);
         let nested_viewport_y = style.y().to_px(self.viewport_height);
@@ -2106,10 +2141,10 @@ impl<'pass> SvgFormattingContext<'pass> {
             style.height().to_px(self.viewport_height)
         };
 
-        self.set_definite_content_size(viewport, nested_viewport_width, nested_viewport_height);
+        Self::set_definite_content_size(&used, nested_viewport_width, nested_viewport_height);
 
         let mut nested_context = Self::new_nested(run, viewport);
-        nested_context.run(run, self.nested_layout_input());
+        nested_context.lay_out_contents(run, self.nested_layout_input(), &used);
         self.set_svg_viewport_size(
             viewport,
             FfiCssPixelSize {
@@ -2117,14 +2152,14 @@ impl<'pass> SvgFormattingContext<'pass> {
                 height: nested_viewport_height,
             },
         );
-        self.place_child(viewport, nested_viewport_x, nested_viewport_y);
+        self.place_child(viewport, &used, nested_viewport_x, nested_viewport_y)
     }
 
-    fn layout_graphics_element(&mut self, run: &FormattingContextRun<'pass>, graphics_box: Node) {
-        self.create_used_values(graphics_box);
+    fn layout_graphics_element(&mut self, run: &FormattingContextRun<'pass>, graphics_box: Node) -> LaidOutSvgElement {
+        let used = self.create_used_values(graphics_box);
         let facts = self.svg_facts(graphics_box);
-        if self.place_unchanged_committed_shape(graphics_box, facts) {
-            return;
+        if let Some(laid_out) = self.place_unchanged_committed_shape(graphics_box, &used, facts) {
+            return laid_out;
         }
         self.commit_svg_element_facts(graphics_box, facts, self.svg_attributes(graphics_box));
         let kind = self.node_kind(graphics_box);
@@ -2133,73 +2168,70 @@ impl<'pass> SvgFormattingContext<'pass> {
         // container element
         // An element which can have graphics elements and other container elements as child elements.
         // Specifically: ‘a’, ‘clipPath’, ‘defs’, ‘g’, ‘marker’, ‘mask’, ‘pattern’, ‘svg’, ‘switch’ and ‘symbol’.
-        if kind_is_svg_container_element(kind) {
+        let laid_out = if kind_is_svg_container_element(kind) {
             // https://svgwg.org/svg2-draft/struct.html#Groups
             // 5.2. Grouping: the ‘g’ element
             // The ‘g’ element is a container element for grouping together related graphics elements.
-            self.layout_container_element(run, graphics_box);
+            self.layout_container_element(run, graphics_box, &used)
         } else if kind == NodeKind::SVGImageBox {
-            self.layout_image_element(graphics_box);
+            self.layout_image_element(graphics_box, &used)
         } else {
             // Assume this is a path-like element.
-            self.layout_path_like_element(run, graphics_box, facts);
-        }
+            self.layout_path_like_element(run, graphics_box, &used, facts)
+        };
 
         if let Some(mask) = self.first_child_of_kind(graphics_box, NodeKind::SVGMaskBox) {
-            self.layout_mask_or_clip(run, mask);
+            self.layout_mask_or_clip(run, mask, &laid_out.cells);
         }
         if let Some(clip) = self.first_child_of_kind(graphics_box, NodeKind::SVGClipBox) {
-            self.layout_mask_or_clip(run, clip);
+            self.layout_mask_or_clip(run, clip, &laid_out.cells);
         }
         for child in self.run.callbacks.children(graphics_box) {
             if self.node_kind(child) == NodeKind::SVGPatternBox {
-                self.layout_mask_or_clip(run, child);
+                self.layout_mask_or_clip(run, child, &laid_out.cells);
             }
         }
+        laid_out
     }
 
     /// Places a shape with the fragment it last committed, where laying it out again would produce that fragment: the
     /// shape has no boxes below it, nothing marked it for layout since that commit, and it resolves against the viewport
     /// it was committed in. Then neither this pass nor the commit redoes a shape that a change to a sibling did not
-    /// touch. Answers whether it placed the shape.
-    fn place_unchanged_committed_shape(&self, shape: Node, facts: SvgElementFacts) -> bool {
+    /// touch. Returns what the parent of the shape reads of it, if it placed the shape, which is laid out in `used`.
+    fn place_unchanged_committed_shape(
+        &self,
+        shape: Node,
+        used: &UsedValues,
+        facts: SvgElementFacts,
+    ) -> Option<LaidOutSvgElement> {
         if !self.viewport_is_committed_viewport
             || self.node_kind(shape) != NodeKind::SVGGeometryBox
             || !self.first_child(shape).is_invalid()
         {
-            return false;
+            return None;
         }
         // An anchor registers itself only when its box is placed with a fragment of its own.
         if NodeFacts::new(&self.run.callbacks, shape).has_anchor_names() {
-            return false;
+            return None;
         }
         // A line's coordinates are attribute lengths resolved here against the initial containing block, the root font
         // and size query containers, and a change to any of those does not mark the line for layout.
         if self.svg_attributes(shape).geometry_kind == SVG_GEOMETRY_KIND_LINE {
-            return false;
+            return None;
         }
-        if self.run.fragments.is_none() {
-            return false;
-        }
+        self.run.fragments.as_ref()?;
         // A committed fragment stops being current when something marks its box for layout.
-        let Some(fragment) = self
+        let fragment = self
             .run
             .callbacks
             .arena()
-            .with_current_committed_fragment(shape, |fragment| fragment.clone())
-        else {
-            return false;
-        };
-        if fragment.computed_svg_path.is_none() {
-            return false;
-        }
-        let Some(committed_offset) = crate::painting::paint_read::GeometryRead::with_committed_fragment_link(
+            .with_current_committed_fragment(shape, |fragment| fragment.clone())?;
+        fragment.computed_svg_path.as_ref()?;
+        let committed_offset = crate::painting::paint_read::GeometryRead::with_committed_fragment_link(
             self.run.callbacks.arena(),
             shape,
             |link| link.map(|link| link.committed_offset),
-        ) else {
-            return false;
-        };
+        )?;
         // The transforms and the stroke's percentage basis are what the shape's facts take from outside its own
         // geometry.
         let committed = fragment.svg.as_deref().copied().unwrap_or_default();
@@ -2208,13 +2240,13 @@ impl<'pass> SvgFormattingContext<'pass> {
                 != (!facts.additional_element_transform.is_identity()).then_some(facts.additional_element_transform)
             || committed.viewport_percentage_basis != facts.viewport_percentage_basis
         {
-            return false;
+            return None;
         }
-        let used = self.used_values(shape);
         used.set_box_metrics_from_fragment(&fragment);
         used.has_definite_block_size.set(true);
         self.place_laid_out_child(
             shape,
+            formatting_context::PlacedChild::of_record(used, &self.run),
             committed_offset.x,
             committed_offset.y,
             Some(fragment_tree::ChildFragmentArrival::CommittedFragment {
@@ -2222,15 +2254,20 @@ impl<'pass> SvgFormattingContext<'pass> {
                 reuses_subtree: false,
             }),
         );
-        true
+        used.seal_own_metrics();
+        Some(LaidOutSvgElement {
+            cells: used_values::RootInputCells::capture(used),
+            content_offset: committed_offset,
+        })
     }
 
     fn layout_path_like_element(
         &mut self,
         run: &FormattingContextRun<'pass>,
         graphics_box: Node,
+        used: &UsedValues,
         facts: SvgElementFacts,
-    ) {
+    ) -> LaidOutSvgElement {
         // A shape's geometry is its own attributes and computed style against the viewport, and
         // text is its own character data shaped with its own font cascade, so the pass draws both.
         let kind = self.node_kind(graphics_box);
@@ -2270,14 +2307,13 @@ impl<'pass> SvgFormattingContext<'pass> {
             // <text> and <tspan> elements can contain more text elements, whose glyph cells count toward this box too.
             for child in self.run.callbacks.children(graphics_box) {
                 if matches!(self.node_kind(child), NodeKind::SVGTextBox | NodeKind::SVGTextPathBox) {
-                    self.layout_graphics_element(run, child);
-                    let child_used = self.used_values(child);
-                    let offset = self.run.records.content_offset_or_origin(child);
+                    let laid_out_child = self.layout_graphics_element(run, child);
+                    let offset = laid_out_child.content_offset;
                     bounding_box.unite(SvgCssPixelRect {
                         x: offset.x,
                         y: offset.y,
-                        width: child_used.content_inline_size.get(),
-                        height: child_used.content_block_size.get(),
+                        width: laid_out_child.cells.content_inline_size,
+                        height: laid_out_child.cells.content_block_size,
                     });
                 }
             }
@@ -2287,7 +2323,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             payloads.computed_svg_path = Some(std::sync::Arc::new(path));
             payloads.svg_text_character_cells = character_cells.map(std::sync::Arc::new);
         });
-        self.set_content_rect(graphics_box, bounding_box);
+        self.set_content_rect(graphics_box, used, bounding_box)
     }
 
     // https://w3c.github.io/svgwg/svg2-draft/embedded.html#Placement
@@ -2334,17 +2370,23 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
-    fn layout_image_element(&self, image_box: Node) {
-        self.set_content_rect(image_box, self.svg_image_bounding_box(image_box));
+    fn layout_image_element(&self, image_box: Node, used: &UsedValues) -> LaidOutSvgElement {
+        self.set_content_rect(image_box, used, self.svg_image_bounding_box(image_box))
     }
 
-    fn layout_mask_or_clip(&mut self, run: &FormattingContextRun<'pass>, resource: Node) {
+    /// Lays out `resource`, a mask, clip or pattern of a box whose sizes and box sides are `parent_metrics`.
+    fn layout_mask_or_clip(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        resource: Node,
+        parent_metrics: &used_values::RootInputCells,
+    ) {
         let kind = self.node_kind(resource);
         let facts = self.svg_facts(resource);
         let attributes = self.svg_attributes(resource);
         assert!(node_facts::kind_is_svg_resource_box(kind));
         // FIXME: Somehow limit <clipPath> contents to: shape elements, <text>, and <use>.
-        self.create_used_values(resource);
+        let used = self.create_used_values(resource);
         self.commit_svg_element_facts(resource, facts, attributes);
 
         let (width, height) = if kind == NodeKind::SVGPatternBox && attributes.has_active_view_box {
@@ -2364,7 +2406,6 @@ impl<'pass> SvgFormattingContext<'pass> {
             } else {
                 let parent = self.parent(resource);
                 assert!(!parent.is_invalid());
-                let parent_metrics = run.records.box_metrics_of(parent);
                 (
                     CssPixels::nearest_value_for(
                         attributes.pattern_width.value as f64 * parent_metrics.content_inline_size().to_double(),
@@ -2377,7 +2418,6 @@ impl<'pass> SvgFormattingContext<'pass> {
         } else if attributes.content_units == SVG_UNITS_OBJECT_BOUNDING_BOX {
             let parent = self.parent(resource);
             assert!(!parent.is_invalid());
-            let parent_metrics = run.records.box_metrics_of(parent);
             (
                 parent_metrics.content_inline_size(),
                 parent_metrics.content_block_size(),
@@ -2385,15 +2425,20 @@ impl<'pass> SvgFormattingContext<'pass> {
         } else {
             (self.viewport_width, self.viewport_height)
         };
-        self.set_definite_content_size(resource, width, height);
+        Self::set_definite_content_size(&used, width, height);
         // Resource content lays out in its own user space; objectBoundingBox content scaling is a
         // paint-time transform in the resource's nested visual context tree.
         let mut nested_context = Self::new_nested(run, resource);
-        nested_context.run(run, self.nested_layout_input());
-        self.place_child(resource, CssPixels::default(), CssPixels::default());
+        nested_context.lay_out_contents(run, self.nested_layout_input(), &used);
+        self.place_child(resource, &used, CssPixels::default(), CssPixels::default());
     }
 
-    fn layout_container_element(&mut self, run: &FormattingContextRun<'pass>, container: Node) {
+    fn layout_container_element(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        container: Node,
+        used: &UsedValues,
+    ) -> LaidOutSvgElement {
         let mut has_points = false;
         let mut min_x = CssPixels::default();
         let mut min_y = CssPixels::default();
@@ -2404,11 +2449,13 @@ impl<'pass> SvgFormattingContext<'pass> {
             if NodeFacts::new(&self.run.callbacks, child).is_box()
                 && !node_facts::kind_is_svg_resource_box(self.node_kind(child))
             {
-                self.layout_svg_element(run, child);
-                let child_metrics = self.run.records.box_metrics_of(child);
+                let laid_out_child = self
+                    .layout_svg_element(run, child)
+                    .expect("a box below an SVG container element is laid out");
+                let child_metrics = laid_out_child.cells;
                 // The container's bounding box includes descendants' transforms; children lay out
                 // untransformed, so each child rect maps through the child's own transform here.
-                let child_content_offset = self.run.records.content_offset_or_origin(child);
+                let child_content_offset = laid_out_child.content_offset;
                 let mapped_child_rect = self.svg_element_transform(child).map_rect(FfiFloatRect {
                     x: child_content_offset.x.raw_value() as f32 / 64.0,
                     y: child_content_offset.y.raw_value() as f32 / 64.0,
@@ -2436,13 +2483,14 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         self.set_content_rect(
             container,
+            used,
             SvgCssPixelRect {
                 x: min_x,
                 y: min_y,
                 width: max_x - min_x,
                 height: max_y - min_y,
             },
-        );
+        )
     }
 }
 

@@ -11,6 +11,8 @@ use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
 
+use crate::css::serialize::trim_ascii_whitespace_start;
+
 const REPLACEMENT_CHARACTER: u32 = 0xFFFD;
 const TOKENIZER_EOF: u32 = u32::MAX;
 
@@ -272,9 +274,10 @@ fn filter_code_points(input: TokenizerInput<'_>) -> FilteredTokenizerInput<'_> {
         last_was_carriage_return = false;
     }
 
-    // NB: The former C++ RustTokenizer::normalize_input() did not flush a
-    // trailing carriage return. Keep that observable behavior while moving
-    // filtering across the FFI boundary.
+    if last_was_carriage_return {
+        output.push(u16::from(b'\n'));
+    }
+
     FilteredTokenizerInput::Owned(output)
 }
 
@@ -908,6 +911,63 @@ where
 {
     let filtered_input = filter_code_points(input);
     Tokenizer::new(filtered_input.as_input()).tokenize(callback);
+}
+
+pub(crate) fn trim_component_value_boundary_whitespace(source: &[u16]) -> &[u16] {
+    let source = trim_ascii_whitespace_start(source);
+    let is_ascii_whitespace = |unit: &u16| matches!(*unit, 0x09 | 0x0a | 0x0c | 0x0d | 0x20);
+    if !source.last().is_some_and(is_ascii_whitespace) {
+        return source;
+    }
+
+    let mut source_end = source.len();
+    let code_points = filter_code_points(source.into());
+    let input = code_points.as_input();
+    let mut tokenizer = Tokenizer::new(input);
+    let mut expected_closings = SmallVec::<[CssTokenType; 8]>::new();
+    let mut trailing_whitespace_length = 0;
+    let mut follows_backslash = false;
+
+    loop {
+        let token = tokenizer.next_token();
+        let token_type = token.as_syntax_ffi().token_type;
+        match token_type {
+            CssTokenType::EndOfFile => break,
+            CssTokenType::Function | CssTokenType::OpenParen => expected_closings.push(CssTokenType::CloseParen),
+            CssTokenType::OpenSquare => expected_closings.push(CssTokenType::CloseSquare),
+            CssTokenType::OpenCurly => expected_closings.push(CssTokenType::CloseCurly),
+            token_type if expected_closings.last() == Some(&token_type) => {
+                expected_closings.pop();
+            }
+            _ => {}
+        }
+        // Comments are emitted as whitespace tokens whose source starts with '/'.
+        if token_type == CssTokenType::Whitespace
+            && is_whitespace(u32::from(input.code_unit_at(token.original_source_range.start)))
+        {
+            trailing_whitespace_length += token.original_source_range.len();
+        } else {
+            trailing_whitespace_length = 0;
+            follows_backslash = matches!(token.token_type, TokenType::Delim { value } if value == u32::from(b'\\'));
+        }
+    }
+
+    // Whitespace inside an unclosed function or block belongs to that component value.
+    if !expected_closings.is_empty() {
+        return &source[..source_end];
+    }
+
+    // Token source lengths count CRLF as a single code point after input preprocessing.
+    for _ in 0..trailing_whitespace_length {
+        let is_crlf = source[..source_end].ends_with(&[0x0d, 0x0a]);
+        source_end -= if is_crlf { 2 } else { 1 };
+    }
+
+    if follows_backslash {
+        // Preserve the newline required to serialize a U+005C delimiter.
+        source_end += 1;
+    }
+    &source[..source_end]
 }
 
 struct Tokenizer<'a> {
@@ -2334,13 +2394,13 @@ mod tests {
     }
 
     #[test]
-    fn filtering_preserves_trailing_carriage_return_oracle_behavior() {
+    fn filtering_converts_a_trailing_carriage_return_to_a_newline() {
         let FilteredTokenizerInput::Owned(filtered) =
             filter_code_points(TokenizerInput::Utf16(&[b'a' as u16, b'\r' as u16]))
         else {
             panic!("a carriage return should require filtering");
         };
-        assert_eq!(filtered, vec![b'a' as u16]);
+        assert_eq!(filtered, vec![b'a' as u16, b'\n' as u16]);
     }
 
     #[test]

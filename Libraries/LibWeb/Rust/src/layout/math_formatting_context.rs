@@ -613,6 +613,8 @@ fn intrinsic_stretch_axis(code_point: u32) -> StretchAxis {
 #[derive(Clone, Copy)]
 struct Child {
     node: Node,
+    /// The sizes and box sides of the child, as its layout left them.
+    cells: used_values::RootInputCells,
     inline_size: CssPixels,
     ascent: CssPixels,
     descent: CssPixels,
@@ -1458,9 +1460,20 @@ pub(super) struct MathFormattingContext<'pass> {
     derived_baselines_of_root_box: DerivedBaselines,
     /// What the layout of each child hands its placement, which places the children once their positions are known.
     fragment_arrivals_of_children: RefCell<Vec<fragment_tree::ChildFragmentArrival>>,
+    /// What placing each child takes of the box its latest layout handed back.
+    placed_children: RefCell<HashMap<Node, formatting_context::PlacedChild>>,
 }
 
 impl<'pass> MathFormattingContext<'pass> {
+    #[track_caller]
+    fn placed_child(&self, child: Node) -> formatting_context::PlacedChild {
+        self.placed_children
+            .borrow()
+            .get(&child)
+            .cloned()
+            .expect("a math child is laid out before it is placed")
+    }
+
     fn take_fragment_arrival_of_child(&self, child: Node) -> Option<fragment_tree::ChildFragmentArrival> {
         let mut arrivals = self.fragment_arrivals_of_children.borrow_mut();
         let index = arrivals.iter().position(|arrival| arrival.node() == child)?;
@@ -1473,6 +1486,7 @@ impl<'pass> MathFormattingContext<'pass> {
             content: MathContent::default(),
             derived_baselines_of_root_box: DerivedBaselines::default(),
             fragment_arrivals_of_children: RefCell::new(Vec::new()),
+            placed_children: RefCell::new(HashMap::default()),
         }
     }
 
@@ -2131,7 +2145,7 @@ impl<'pass> MathFormattingContext<'pass> {
         stretch_size_constraint: Option<MathStretchSizeConstraint>,
     ) -> Child {
         let run = &self.run;
-        let child_cells = run.records.keep_child_for_its_run(&run.callbacks, child, constraints);
+        let child_cells = used_values::cells_before_sizing(&run.callbacks, child, constraints);
         // NB: MathML layout does not break lines, so each child is laid out at its max-content inline size, as an
         //     atomic box whose block size follows from its content.
         let mut input = LayoutInput::new(
@@ -2146,16 +2160,27 @@ impl<'pass> MathFormattingContext<'pass> {
         let formatting_context::ChildLayout {
             outcome,
             fragment_arrival,
-        } = formatting_context::layout_inside_child_with_input_cells(run, None, None, child, input, child_cells, true);
+            laid_out_box,
+        } = formatting_context::layout_inside_child_with_input_cells(
+            run,
+            None,
+            None,
+            child,
+            input,
+            child_cells,
+            None,
+            true,
+            run.percentage_block_insets_of_root_children_have_definite_basis(),
+        );
         if let Some(fragment_arrival) = fragment_arrival {
             self.fragment_arrivals_of_children.borrow_mut().push(fragment_arrival);
         }
+        self.placed_children
+            .borrow_mut()
+            .insert(child, formatting_context::PlacedChild::of_laid_out_box(&laid_out_box));
         outcome.report_percentage_block_size_dependency_of(run, child);
-        let metrics = run.records.box_metrics_of(child);
-        let baselines = match outcome {
-            ChildLayoutOutcome::Created(result) => result.baselines,
-            ChildLayoutOutcome::ReenterCurrent | ChildLayoutOutcome::Skipped { .. } => metrics.content_baselines(),
-        };
+        let metrics = laid_out_box.cells;
+        let baselines = laid_out_box.baselines;
         let collapsed = metrics.uses_collapsing_borders_model();
         let block_size = metrics.margin_box_block_size(collapsed);
         // NB: A box without a baseline is aligned by its line-under margin edge.
@@ -2164,6 +2189,7 @@ impl<'pass> MathFormattingContext<'pass> {
             .map_or(block_size, |baseline| metrics.margin_box_top(collapsed) + baseline);
         Child {
             node: child,
+            cells: metrics,
             inline_size: metrics.margin_box_inline_size(collapsed),
             ascent,
             descent: block_size - ascent,
@@ -2173,9 +2199,11 @@ impl<'pass> MathFormattingContext<'pass> {
     pub(super) fn run(&mut self, run: &FormattingContextRun<'pass>, layout_input: LayoutInput) {
         let root = run.box_;
         let kind = self.kind(root);
-        let constraints = run
-            .sizing()
-            .constraints_for_child_context(root, layout_input.containing_block_constraints);
+        let constraints = run.sizing().constraints_for_child_context(
+            root,
+            &run.root_record(),
+            layout_input.containing_block_constraints,
+        );
         let nodes = self.in_flow_children();
         let children = self.layout_children(
             &nodes,
@@ -2275,7 +2303,7 @@ impl<'pass> MathFormattingContext<'pass> {
         }
 
         for (child, position) in children.iter().zip(content.positions.iter()) {
-            let metrics = run.records.box_metrics_of(child.node);
+            let metrics = child.cells;
             let collapsed = metrics.uses_collapsing_borders_model();
             let line_left_offset = if is_rtl {
                 content.inline_size - position.line_left_offset - child.inline_size
@@ -2291,10 +2319,15 @@ impl<'pass> MathFormattingContext<'pass> {
                 y: margin_box_top + metrics.margin_box_top(collapsed),
             };
             let fragment_arrival = self.take_fragment_arrival_of_child(child.node);
-            formatting_context::place_laid_out_child(run, child.node, offset, None, fragment_arrival);
+            let placed_child = self.placed_child(child.node);
+            formatting_context::place_child(run, child.node, placed_child, offset, None, fragment_arrival);
         }
         for fragment_arrival in self.fragment_arrivals_of_children.take() {
-            formatting_context::leave_child_unplaced(run, Some(fragment_arrival));
+            formatting_context::leave_child_unplaced(
+                run,
+                self.placed_child(fragment_arrival.node()),
+                Some(fragment_arrival),
+            );
         }
 
         if run.fragments.is_some() && (!content.rules.is_empty() || !content.glyph_runs.is_empty()) {
