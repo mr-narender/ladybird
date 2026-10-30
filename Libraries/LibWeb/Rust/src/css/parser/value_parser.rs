@@ -5013,6 +5013,62 @@ fn parse_border_image_shorthand(context: &ParseContext, values: &[ComponentValue
     ParseOutcome::Invalid
 }
 
+// https://drafts.csswg.org/css-fonts-4/#font-synthesis
+fn parse_font_synthesis_shorthand(values: &[ComponentValue]) -> ParseOutcome {
+    // https://drafts.csswg.org/css-fonts-4/#font-synthesis
+    let Some(keywords) = values
+        .iter()
+        .filter(|value| !value.is_whitespace())
+        .map(|value| value.ident())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return ParseOutcome::Invalid;
+    };
+    if keywords.is_empty() || keywords.len() > 4 {
+        return ParseOutcome::Invalid;
+    }
+    let mut enabled = [false; 4];
+    if keywords.len() != 1 || !equals_ascii_case_insensitive(keywords[0], b"none") {
+        for ident in keywords {
+            let index = if equals_ascii_case_insensitive(ident, b"position") {
+                3
+            } else {
+                match keyword_from_ascii_case_insensitive(ident) {
+                    Some(keyword::WEIGHT) => 0,
+                    Some(keyword::STYLE) => 1,
+                    Some(keyword::SMALL_CAPS) => 2,
+                    _ => return ParseOutcome::Invalid,
+                }
+            };
+            if enabled[index] {
+                return ParseOutcome::Invalid;
+            }
+            enabled[index] = true;
+        }
+    }
+    let properties = longhands_for_shorthand(property_id::FONT_SYNTHESIS);
+    let values = properties
+        .iter()
+        .map(|property| {
+            let index = match *property {
+                property_id::FONT_SYNTHESIS_WEIGHT => 0,
+                property_id::FONT_SYNTHESIS_STYLE => 1,
+                property_id::FONT_SYNTHESIS_SMALL_CAPS => 2,
+                property_id::FONT_SYNTHESIS_POSITION => 3,
+                _ => unreachable!(),
+            };
+            StyleValueData::Keyword {
+                keyword: if enabled[index] { keyword::AUTO } else { keyword::NONE },
+            }
+        })
+        .collect();
+    ParseOutcome::Parsed(shared_style_value(shorthand_value(
+        property_id::FONT_SYNTHESIS,
+        properties.to_vec(),
+        values,
+    )))
+}
+
 fn parse_font_variant_shorthand(context: &ParseContext, values: &[ComponentValue]) -> ParseOutcome {
     let components = values
         .iter()
@@ -6007,6 +6063,9 @@ fn parse_css_value_after_substitution_scan(
         }
         if property_id == property_id::BORDER_IMAGE {
             return parse_border_image_shorthand(context, values);
+        }
+        if property_id == property_id::FONT_SYNTHESIS {
+            return parse_font_synthesis_shorthand(values);
         }
         if property_id == property_id::FONT_VARIANT {
             return parse_font_variant_shorthand(context, values);

@@ -50,7 +50,14 @@ SUPPORTED_TYPE_EXTENDED_ATTRIBUTES = {
 }
 
 # The integer types, with the Rust type of their values.
-INTEGER_TYPES = {"short": "i16", "long": "i32", "unsigned long": "u32", "long long": "i64", "unsigned long long": "u64"}
+INTEGER_TYPES = {
+    "short": "i16",
+    "unsigned short": "u16",
+    "long": "i32",
+    "unsigned long": "u32",
+    "long long": "i64",
+    "unsigned long long": "u64",
+}
 
 # The floating point types, with the Rust type of their values.
 FLOATING_POINT_TYPES = {"float": "f32", "unrestricted float": "f32", "double": "f64", "unrestricted double": "f64"}
@@ -451,7 +458,7 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return f"Option<{rust_type(optional_member, context, what)}>"
     if isinstance(idl_type, IDLUnionType):
         for member_type in union_member_types(idl_type, context):
-            rust_type(member_type, context, what)
+            rust_type(member_type, context, what, is_result)
         return rust_union_path(idl_type, context, what)
     raise UnsupportedByRustBindings(f"{what} has the type {idl_type}, which the Rust bindings do not convert yet")
 

@@ -7,46 +7,39 @@
 #pragma once
 
 #include <AK/Forward.h>
+#include <AK/RefCounted.h>
+#include <AK/WeakPtr.h>
+#include <AK/Weakable.h>
 #include <LibGC/Ptr.h>
-#include <LibJS/Forward.h>
-#include <LibJS/Heap/Cell.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
-#include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWebCommon/Loader/LoaderConfigSnapshot.h>
 
 namespace Web::Fetch::Infrastructure {
 
 // https://fetch.spec.whatwg.org/#fetch-params
-class WEB_API FetchParams : public JS::Cell {
-    GC_CELL(FetchParams, JS::Cell);
-    GC_DECLARE_ALLOCATOR(FetchParams);
-
+class WEB_API FetchParams
+    : public RefCounted<FetchParams>
+    , public Weakable<FetchParams> {
 public:
     struct PreloadedResponseCandidatePendingTag { };
     using PreloadedResponseCandidate = Variant<Empty, PreloadedResponseCandidatePendingTag, NonnullRefPtr<Response>>;
 
-    [[nodiscard]] static GC::Ref<FetchParams> create(NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
-    [[nodiscard]] static GC::Ref<FetchParams> copy(FetchParams const&);
+    [[nodiscard]] static NonnullRefPtr<FetchParams> create(FetchController&, NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
+    [[nodiscard]] static NonnullRefPtr<FetchParams> copy(FetchParams const&);
 
     [[nodiscard]] NonnullRefPtr<Request> request() const { return m_request; }
     void set_request(NonnullRefPtr<Request> request) { m_request = move(request); }
-    [[nodiscard]] GC::Ref<FetchController> controller() const { return m_controller; }
+    [[nodiscard]] GC::Ref<FetchController> controller() const;
+    [[nodiscard]] FetchControlBlock& control_block() const { return *m_control_block; }
     [[nodiscard]] NonnullRefPtr<FetchTimingInfo> timing_info() const { return m_timing_info; }
     [[nodiscard]] LoaderConfig const& loader_config() const { return m_loader_config->config; }
     [[nodiscard]] NonnullRefPtr<LoaderConfigSnapshot const> const& loader_config_snapshot() const { return m_loader_config; }
-
-    [[nodiscard]] Engine::BodyIntent body_intent() const { return m_body_intent; }
-    void set_body_intent(Engine::BodyIntent body_intent) { m_body_intent = body_intent; }
-
-    [[nodiscard]] TaskDestination& task_destination() { return m_task_destination; }
-    [[nodiscard]] TaskDestination const& task_destination() const { return m_task_destination; }
-    void set_task_destination(TaskDestination task_destination) { m_task_destination = move(task_destination); }
 
     [[nodiscard]] HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability() const { return m_cross_origin_isolated_capability; }
     void set_cross_origin_isolated_capability(HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability) { m_cross_origin_isolated_capability = cross_origin_isolated_capability; }
@@ -68,22 +61,13 @@ public:
     void set_blob_url_entry(Optional<FileAPI::SerializedBlobURLEntry> blob_url_entry) { m_blob_url_entry = move(blob_url_entry); }
 
 private:
-    FetchParams(NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, GC::Ref<FetchController>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
+    FetchParams(NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, FetchController&, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
     FetchParams(FetchParams const&);
-
-    virtual void visit_edges(JS::Cell::Visitor&) override;
 
     // https://fetch.spec.whatwg.org/#fetch-params-request
     // request
     //     A request.
     NonnullRefPtr<Request> m_request;
-
-    Engine::BodyIntent m_body_intent;
-
-    // https://fetch.spec.whatwg.org/#fetch-params-task-destination
-    // task destination (default null)
-    //     Null, a global object, or a parallel queue.
-    TaskDestination m_task_destination;
 
     // https://fetch.spec.whatwg.org/#fetch-params-cross-origin-isolated-capability
     // cross-origin isolated capability (default false)
@@ -93,7 +77,9 @@ private:
     // https://fetch.spec.whatwg.org/#fetch-params-controller
     // controller (default a new fetch controller)
     //     A fetch controller.
-    GC::Ref<FetchController> m_controller;
+    FetchControllerToken m_controller_token;
+    WeakPtr<FetchControllerRegistry> m_controller_registry;
+    NonnullRefPtr<FetchControlBlock> m_control_block;
 
     // https://fetch.spec.whatwg.org/#fetch-params-timing-info
     // timing info

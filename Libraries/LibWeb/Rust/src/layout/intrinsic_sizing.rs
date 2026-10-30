@@ -55,14 +55,13 @@ impl ContentSizingScope {
     }
 
     fn enter<R>(&self, callbacks: LayoutPass<'_>, size_content: impl FnOnce(&FormattingContextRun<'_>) -> R) -> R {
-        RunRecords::with_content_inline_sizes_root(
+        RunState::with_content_inline_sizes_root(
             callbacks,
             self.node,
             callbacks.in_flow_containing_block(self.node),
-            self.root_cells,
-            |records, callbacks| {
+            |state, callbacks| {
                 size_content(&FormattingContextRun {
-                    records,
+                    state,
                     box_: self.node,
                     callbacks,
                     should_collect_devtools_layout_data: false,
@@ -105,7 +104,7 @@ pub(super) fn content_sizes_of_inline_content(
     scope.enter(callbacks, |run| {
         let child_constraints = run
             .sizing()
-            .constraints_for_child_context(node, &run.root_record(), constraints);
+            .constraints_for_child_context(node, &scope.root_cells(), constraints);
         let sizes = if inline_content_has_no_in_flow_content(&callbacks, node) {
             let sizing = run.sizing();
             let mut contributions_of_floats = BlockLevelContributions::default();
@@ -131,10 +130,10 @@ pub(super) fn content_sizes_of_inline_content(
                 child_constraints,
                 ParticipationInParentFormattingContext::BlockLevel,
             );
-            let parent = block_formatting_context::BlockFormattingContext::new(run, None);
+            let parent = block_formatting_context::BlockFormattingContext::new(run, scope.root_cells(), None);
             let mut context = inline_formatting_context::InlineFormattingContext::new_with_rust_parent(
                 run,
-                block_formatting_context::BlockContainer::root_of(run),
+                block_formatting_context::BlockContainer::root_of(run, scope.root_cells()),
                 input,
                 FfiCssPixelPoint::default(),
                 run.callbacks,
@@ -337,7 +336,7 @@ pub(super) fn content_sizes_of_block_container(
     let style = StyleValues::for_node(&callbacks, node);
     scope.measure(callbacks, depends_on_block_size, |run| {
         let sizing = run.sizing();
-        let child_constraints = sizing.constraints_for_child_context(node, &run.root_record(), constraints);
+        let child_constraints = sizing.constraints_for_child_context(node, &scope.root_cells(), constraints);
         let collects_column_spanners = facts.lays_out_in_columns();
         let legend_sized_to_fit_its_content = rendered_legend_with_automatic_inline_size(&callbacks, node);
         let mut contributions_of_children = BlockLevelContributions::default();
@@ -434,6 +433,7 @@ pub(super) fn content_sizes_of_table(
         if is_table_box {
             table_formatting_context::TableFormattingContext::new(
                 run,
+                scope.root_cells(),
                 table_formatting_context::AutoTableInlineSize::FillsAvailableInlineSize,
             )
             .content_inline_sizes(LayoutInput::new(
@@ -465,7 +465,9 @@ pub(super) fn content_sizes_of_flex_container(
         block_size,
         depends_on_block_size,
         None,
-        |run, input| flex_formatting_context::FlexFormattingContext::new(run).content_inline_size(input),
+        |run, root_cells, input| {
+            flex_formatting_context::FlexFormattingContext::new(run, root_cells).content_inline_size(input)
+        },
     )
 }
 
@@ -483,7 +485,9 @@ pub(super) fn content_sizes_of_grid_container(
         block_size,
         depends_on_block_size,
         content_size_named_by_maximum_inline_size(&callbacks, node),
-        |run, input| grid_formatting_context::GridFormattingContext::new(run, None).content_inline_size(input),
+        |run, root_cells, input| {
+            grid_formatting_context::GridFormattingContext::new(run, root_cells, None).content_inline_size(input)
+        },
     )
 }
 
@@ -534,7 +538,7 @@ fn content_sizes_of_container_under_each_inline_size_constraint(
     block_size: Option<CssPixels>,
     depends_on_block_size: bool,
     content_size_named_by_maximum_inline_size: Option<ContentSizeNamedByMaximum>,
-    content_inline_size: impl Fn(&FormattingContextRun<'_>, LayoutInput) -> CssPixels,
+    content_inline_size: impl Fn(&FormattingContextRun<'_>, used_values::RootInputCells, LayoutInput) -> CssPixels,
 ) -> sizing_context::ContentInlineSizes {
     let content_inline_size_under =
         |available_inline_size: AvailableSize, content_size_named_by_maximum: Option<CssPixels>| {
@@ -552,7 +556,7 @@ fn content_sizes_of_container_under_each_inline_size_constraint(
                 input.sizing.maximum_inline_size_resolved_by_caller =
                     content_size_named_by_maximum.map(|content_size| {
                         sizing.apply_transferred_limits_to_intrinsic_inline_size(
-                            sizing_context::SizedBox::new(node, &run.root_record()),
+                            sizing_context::SizedBox::of_own_metrics(node, &scope.root_cells(), run.callbacks.frame),
                             clamp_to_max_dimension_value(content_size),
                             available_inline_size_under_content_size_named_by_maximum(
                                 content_size_named_by_maximum_inline_size,
@@ -560,7 +564,7 @@ fn content_sizes_of_container_under_each_inline_size_constraint(
                             constraints,
                         )
                     });
-                let size = content_inline_size(run, input);
+                let size = content_inline_size(run, scope.root_cells(), input);
                 let dependencies = IntrinsicMeasurementDependencies {
                     percentage_block_size: sizing.resolve_percentage_block_size_dependency(node),
                     percentage_inline_basis: sizing.measurement_root_observes_percentage_inline_basis(node),
@@ -648,7 +652,7 @@ pub(super) fn content_sizes_of_orthogonal_flow(
         let scope_in_own_frame = ContentSizingScope { node, root_cells };
         scope_in_own_frame.enter(callbacks_in_own_frame, |run| {
             run.sizing().orthogonal_flow_inline_size(
-                sizing_context::SizedBox::new(node, &run.root_record()),
+                sizing_context::SizedBox::of_own_metrics(node, &scope_in_own_frame.root_cells(), run.callbacks.frame),
                 AvailableSpace {
                     inline_size: available_inline_size_in_own_frame,
                     block_size: AvailableSize::Indefinite,

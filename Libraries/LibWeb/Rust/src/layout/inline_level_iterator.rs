@@ -16,6 +16,17 @@ pub(crate) enum ItemType {
     FloatingElement,
 }
 
+impl ItemType {
+    /// Whether an item of this type takes its place on the lines alone, unlike floats and block-level boxes, which lay
+    /// out beside or between the lines.
+    pub(crate) fn stays_on_lines(self) -> bool {
+        matches!(
+            self,
+            Self::Text | Self::Element | Self::ForcedBreak | Self::AbsolutelyPositionedElement
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Item {
     pub(crate) type_: ItemType,
@@ -96,14 +107,15 @@ pub(crate) fn text_is_set_upright(writing_mode: u8, text_orientation: u8, code_p
 }
 
 /// Sets shaped glyphs upright: each of them takes one em along the inline axis, which runs downwards in the frame of
-/// a vertical writing mode, while keeping its own horizontal width, which painting centers it within.
+/// a vertical writing mode, while keeping its own horizontal width, which painting centers it within. Invisible
+/// characters such as soft hyphens take no space.
 // FIXME: Use the vertical metrics of the font, where it has them.
 fn set_glyphs_upright(glyph_data: &mut line_box_fragment::GlyphData, inline_offset: f32, advance: f32) {
     let glyphs = glyph_data.glyphs.to_mut();
     let mut pen = inline_offset;
     let mut count = 0usize;
     for glyph in glyphs.iter_mut() {
-        if glyph.length_in_code_units != 0 {
+        if glyph.length_in_code_units != 0 && glyph.should_paint {
             if count > 0 {
                 pen += advance;
             }
@@ -471,6 +483,17 @@ struct InlineLevelIteratorGenerator<'iterator, 'context> {
     items: Vec<Item>,
     accumulated_inline_size_for_tabs: CssPixels,
     previous_chunk_can_break_after: bool,
+    /// The text of the text node before the current one, when nothing but inline box boundaries and out-of-flow
+    /// boxes lies between them.
+    previous_text: Option<&'context [u16]>,
+    /// The number of regional indicators that end the previous text, including any in the text nodes before it.
+    previous_text_regional_indicators: usize,
+    /// The number of regional indicators that end the text before the current text node.
+    regional_indicators_before_text: usize,
+    /// The last code unit of the text before the previous text.
+    code_unit_before_previous_text: Option<u16>,
+    /// The last code unit of the text before the current text node.
+    code_unit_before_text: Option<u16>,
 }
 
 impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
@@ -494,6 +517,11 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
             items: Vec::new(),
             accumulated_inline_size_for_tabs: CssPixels::default(),
             previous_chunk_can_break_after: false,
+            previous_text: None,
+            previous_text_regional_indicators: 0,
+            regional_indicators_before_text: 0,
+            code_unit_before_previous_text: None,
+            code_unit_before_text: None,
         };
         iterator.is_unidirectional_left_to_right = iterator.compute_is_unidirectional_left_to_right();
         iterator.skip_to_next();
@@ -501,6 +529,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
         InlineLevelIterator {
             entered_box_model_nodes: iterator.entered_box_model_nodes,
             items: ItemQueue::Owned(iterator.items.into_iter()),
+            items_kept_for_looking_ahead: 0,
         }
     }
 
@@ -564,7 +593,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
 
     fn enter_node_with_box_model_metrics(&mut self, node: Node) {
         self.entered_box_model_nodes.push(node);
-        let sides = record_entered_inline_box(self.context, node);
+        let sides = lay_out_entered_inline_box(self.context, node);
         let leading = self.extra_leading_metrics.get_or_insert_default();
         leading.margin += sides.margin_left;
         leading.border += sides.border_left;
@@ -780,6 +809,17 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
                 text_type: line_box_fragment::GLYPH_TEXT_TYPE_COMMON,
             }
         } else {
+            if !text_context.text.is_empty() {
+                let regional_indicators = text_chunker::trailing_regional_indicator_count(text_context.text);
+                // NB: Each regional indicator is a surrogate pair.
+                self.previous_text_regional_indicators = if regional_indicators * 2 == text_context.text.len() {
+                    self.regional_indicators_before_text + regional_indicators
+                } else {
+                    regional_indicators
+                };
+                self.code_unit_before_previous_text = self.code_unit_before_text;
+                self.previous_text = Some(text_context.text);
+            }
             self.text_node_context = None;
             self.previous_chunk_can_break_after = false;
             self.skip_to_next();
@@ -885,6 +925,37 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
         item.is_collapsible_whitespace =
             text_context.should_collapse_whitespace && chunk.is_all_whitespace && !generated_empty;
         item.can_break_before = self.previous_chunk_can_break_after;
+        // NB: Look for a soft wrap opportunity between the texts of two text nodes, which the chunker of either text
+        //     cannot see. This uses the line breaking properties of the text after it.
+        if is_first_chunk {
+            self.regional_indicators_before_text = if self.previous_text.is_some() {
+                self.previous_text_regional_indicators
+            } else {
+                0
+            };
+            self.code_unit_before_text = self.previous_text.and_then(|text| text.last().copied());
+        }
+        if is_first_chunk
+            && !item.can_break_before
+            && let Some(previous_text) = self.previous_text.take()
+            && style.text_wrap_mode() == text_wrap_mode::WRAP
+        {
+            let line_break_language = if style.line_break() == line_break::LOOSE {
+                self.context().callbacks.arena().text_line_break_language(text_node)
+            } else {
+                text_chunker::LineBreakLanguage::Other
+            };
+            item.can_break_before = text_chunker::soft_wrap_opportunity_between(
+                previous_text,
+                &full_text[chunk.start..],
+                self.code_unit_before_previous_text,
+                self.regional_indicators_before_text,
+                style.word_break(),
+                style.line_break(),
+                line_break_language,
+            );
+        }
+        self.previous_text = None;
         self.previous_chunk_can_break_after = chunk.can_break_after;
         self.add_extra_box_model_metrics_to_item(&mut item, is_first_chunk, is_last_chunk);
         self.text_node_context = Some(text_context);
@@ -928,6 +999,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
                 return Some(item);
             }
             if facts.is_break_node() {
+                self.previous_text = None;
                 self.skip_to_next();
                 return Some(Item::new(ItemType::ForcedBreak, node));
             }
@@ -950,6 +1022,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
                 continue;
             }
             if facts.is_inline_flow_interrupting_block() {
+                self.previous_text = None;
                 self.skip_to_next();
                 let mut item = Item::new(ItemType::BlockLevelBox, node);
                 if self.atomic_sizing == AtomicInlineSizing::Contributions {
@@ -957,6 +1030,7 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
                 }
                 return Some(item);
             }
+            self.previous_text = None;
             return Some(self.generate_element_item(node));
         }
     }
@@ -1001,26 +1075,27 @@ impl<'iterator, 'context> InlineLevelIteratorGenerator<'iterator, 'context> {
     }
 }
 
-/// Lays out `node`, a fragmented inline the context enters, in a record of this call, resolves its box sides and
-/// returns them.
-fn record_entered_inline_box(
+/// Lays out `node`, a fragmented inline the context enters, resolves its box sides and returns them.
+fn lay_out_entered_inline_box(
     context: &inline_formatting_context::InlineFormattingContext<'_>,
     node: Node,
 ) -> used_values::RootInputCells {
     let constraints = context.input.containing_block_constraints;
-    let record_of_this_call = used_values::create_used_values(&context.callbacks, node, constraints);
-    let used = &record_of_this_call;
+    let mut sides = used_values::cells_before_sizing(&context.callbacks, node, constraints);
     let style = context.style(node);
     let basis = constraints.inline_basis();
-    used.resolve_box_model(&style, basis);
+    sides.resolve_box_model(&style, basis);
     let insets = context.compute_inset(node);
-    let sides = used_values::RootInputCells::capture(used);
     context.keep_entered_inline_box(node, sides, insets);
     if context.run.fragments.is_some() && context.run.fragmentainer.is_none() {
         formatting_context::place_child(
             context.run,
             node,
-            formatting_context::PlacedChild::of_record(used, context.run).with_in_flow_box_insets(insets),
+            formatting_context::PlacedChild::new(fragment_tree::FragmentGeometry {
+                cells: sides.in_frame(context.callbacks.frame, context.run.callbacks.frame),
+                line_data: None,
+            })
+            .with_in_flow_box_insets(insets),
             FfiCssPixelPoint::default(),
             None,
             None,
@@ -1090,6 +1165,8 @@ impl ItemQueue {
 pub(crate) struct InlineLevelIterator {
     entered_box_model_nodes: Vec<Node>,
     items: ItemQueue,
+    /// The number of items at the end that this iterator only shows to look ahead, and does not hand out.
+    items_kept_for_looking_ahead: usize,
 }
 
 impl InlineLevelIterator {
@@ -1109,20 +1186,16 @@ impl InlineLevelIterator {
             .map(|shared| (shared.items.clone(), shared.entered_box_model_nodes.clone()));
         if let Some((items, entered_box_model_nodes)) = shared {
             for node in entered_box_model_nodes.iter() {
-                record_entered_inline_box(context, *node);
+                lay_out_entered_inline_box(context, *node);
             }
             return Self {
                 entered_box_model_nodes: entered_box_model_nodes.to_vec(),
                 items: ItemQueue::Shared { items, next: 0 },
+                items_kept_for_looking_ahead: 0,
             };
         }
         let iterator = Self::new(context);
-        if !iterator.items.as_slice().iter().all(|item| {
-            matches!(
-                item.type_,
-                ItemType::Text | ItemType::ForcedBreak | ItemType::Element | ItemType::AbsolutelyPositionedElement
-            )
-        }) {
+        if !iterator.items.as_slice().iter().all(|item| item.type_.stays_on_lines()) {
             return iterator;
         }
         let items = iterator.items.into_vec();
@@ -1145,6 +1218,7 @@ impl InlineLevelIterator {
                     next: 0,
                 }
             },
+            items_kept_for_looking_ahead: 0,
         }
     }
 
@@ -1159,7 +1233,7 @@ impl InlineLevelIterator {
         atomic_sizing: AtomicInlineSizing,
     ) -> Self {
         let callbacks = context.callbacks;
-        match callbacks.scratch().inline_item_stash(context.containing_block) {
+        match callbacks.inline_item_stash(context.containing_block) {
             Some(stash) => Self::from_stash(context, stash),
             None => InlineLevelIteratorGenerator::generate(context, atomic_sizing),
         }
@@ -1167,11 +1241,12 @@ impl InlineLevelIterator {
 
     fn from_stash(context: &inline_formatting_context::InlineFormattingContext<'_>, stash: StashedInlineItems) -> Self {
         for node in &stash.entered_box_model_nodes {
-            record_entered_inline_box(context, *node);
+            lay_out_entered_inline_box(context, *node);
         }
         Self {
             entered_box_model_nodes: stash.entered_box_model_nodes,
             items: ItemQueue::Owned(stash.items.into_iter()),
+            items_kept_for_looking_ahead: 0,
         }
     }
 
@@ -1203,7 +1278,7 @@ impl InlineLevelIterator {
                 glyphs.glyphs = libgfx_rust::text_layout::GlyphBuffer::Shared(std::mem::take(owned).into());
             }
         }
-        context.callbacks.scratch().store_inline_item_stash(
+        context.callbacks.store_inline_item_stash(
             context.containing_block,
             StashedInlineItems {
                 items,
@@ -1213,6 +1288,9 @@ impl InlineLevelIterator {
     }
 
     pub(crate) fn next(&mut self) -> Option<Item> {
+        if self.items.as_slice().len() <= self.items_kept_for_looking_ahead {
+            return None;
+        }
         self.items.next()
     }
 
@@ -1230,6 +1308,17 @@ impl InlineLevelIterator {
 
     pub(crate) fn skip_items(&mut self, count: usize) {
         self.items.skip(count);
+    }
+
+    /// An iterator over a copy of the items left in `range`, which leaves the items of this one in place. It looks
+    /// ahead at the items after `range` up to `look_ahead_end`, without handing them out.
+    pub(crate) fn duplicate(&self, range: std::ops::Range<usize>, look_ahead_end: usize) -> Self {
+        let items: Vec<Item> = self.items()[range.start..look_ahead_end].to_vec();
+        Self {
+            entered_box_model_nodes: self.entered_box_model_nodes.clone(),
+            items: ItemQueue::Owned(items.into_iter()),
+            items_kept_for_looking_ahead: look_ahead_end - range.end,
+        }
     }
 
     pub(crate) fn next_inline_run_size(
@@ -1274,7 +1363,7 @@ pub(crate) fn sequence_inline_size(
     stop_at_overflow_breakable_text: bool,
 ) -> Option<CssPixels> {
     let mut size = CssPixels::default();
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         match item.type_ {
             ItemType::ForcedBreak => return Some(CssPixels::default()),
             ItemType::BlockLevelBox => break,
@@ -1283,6 +1372,10 @@ pub(crate) fn sequence_inline_size(
         let style = context.style(context.style_source(item.node));
         if style.text_wrap_mode() == text_wrap_mode::WRAP {
             if item.type_ != ItemType::Text || item.is_collapsible_whitespace {
+                break;
+            }
+            // NB: The sequence ends at its next soft wrap opportunity, such as the one after a hyphen.
+            if index > 0 && item.can_break_before {
                 break;
             }
             if item.is_ascii_whitespace(context) {

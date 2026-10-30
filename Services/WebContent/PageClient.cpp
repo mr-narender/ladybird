@@ -31,6 +31,7 @@
 #include <LibWeb/CSS/StyleSheetImport.h>
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -49,6 +50,8 @@
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/RemoteEnvironmentSettings.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/TextDirectiveGenerator.h>
@@ -316,6 +319,14 @@ void PageClient::deliver_posted_message(Web::HTML::CrossProcessId navigable_id, 
         navigable->deliver_posted_message_from_another_process(move(message));
 }
 
+void PageClient::report_violation_of_environment(Web::HTML::EnvironmentId const& environment_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, URL::URL resource)
+{
+    auto settings = Web::HTML::environment_settings_object_with_id(environment_id);
+    if (!settings)
+        return;
+    Web::ContentSecurityPolicy::report_a_violation_found_in_another_process(*settings, policy_index, directive, move(resource));
+}
+
 void PageClient::navigation_params_creation_finished(Web::HTML::LocalNavigable& navigable, Web::HTML::NavigationPopulationRequest request, Web::HTML::NavigationPopulationResult result)
 {
     client().async_did_finish_navigation_params_creation(m_id, navigable.id(), request.navigation_id, move(result));
@@ -562,6 +573,11 @@ void PageClient::report_finished_handling_input_event(Web::PageId page_id, u64 e
 void PageClient::forward_mouse_event_to_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::MouseEvent event)
 {
     client().async_did_forward_mouse_event_to_child_frame(page_id, navigable_id, move(event));
+}
+
+void PageClient::forward_pinch_event_to_remote_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::PinchEvent event)
+{
+    client().async_did_forward_pinch_event_to_child_frame(page_id, navigable_id, event);
 }
 
 Web::CompositorContextId PageClient::allocate_compositor_context_id(Web::PagePresentationRegistration page_presentation_registration)
@@ -1285,19 +1301,61 @@ void PageClient::geolocation_position_response(u64 request_id, WebView::Geolocat
         page().receive_geolocation_position(request_id, Web::Geolocation::GeolocationPositionError::ErrorCode::PositionUnavailable);
 }
 
-void PageClient::page_did_request_geolocation_position(u64 request_id)
+void PageClient::page_did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId requesting_document_id)
 {
-    client().async_did_request_geolocation_position(m_id, request_id);
+    client().async_did_request_geolocation_position(m_id, request_id, requesting_document_id);
 }
 
-void PageClient::page_did_request_permission(u64 request_id, Utf16String const& name)
+void PageClient::page_did_request_permission(u64 request_id, Web::HTML::CrossProcessId requesting_document_id, Utf16String const& name)
 {
-    client().async_did_request_permission(m_id, request_id, name);
+    client().async_did_request_permission(m_id, request_id, requesting_document_id, name);
 }
 
-void PageClient::permission_request_completed(u64 request_id, bool granted)
+Optional<Web::Permissions::PermissionSnapshot> PageClient::page_did_request_permission_snapshot(URL::Origin const& top_level_origin)
 {
-    page().permission_request_completed(request_id, granted);
+    auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestPermissionSnapshot>(m_id, top_level_origin);
+    if (!response)
+        return {};
+    return response->take_snapshot();
+}
+
+Optional<Web::Permissions::PermissionSnapshot> PageClient::page_did_set_permission_for_testing(Web::HTML::CrossProcessId document_id, String const& name, String const& state)
+{
+    auto* test_connection = client().test_connection();
+    if (!test_connection)
+        return {};
+    auto response = test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::SetPermissionForTesting>(m_id, document_id, name, state);
+    if (!response)
+        return {};
+    return response->take_snapshot();
+}
+
+void PageClient::page_did_set_next_permission_prompt_outcome_for_testing(String const& name, String const& outcome, bool held)
+{
+    if (auto* test_connection = client().test_connection())
+        (void)test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::SetNextPermissionPromptOutcomeForTesting>(m_id, name, outcome, held);
+}
+
+void PageClient::page_did_release_held_permission_prompt_for_testing(u32 waiters)
+{
+    if (auto* test_connection = client().test_connection())
+        (void)test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::ReleaseHeldPermissionPromptForTesting>(m_id, waiters);
+}
+
+Optional<Web::Permissions::PermissionSnapshot> PageClient::page_did_advance_permission_clock_for_testing(u64 milliseconds)
+{
+    auto* test_connection = client().test_connection();
+    if (!test_connection)
+        return {};
+    auto response = test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::AdvancePermissionClockForTesting>(m_id, milliseconds);
+    if (!response)
+        return {};
+    return response->take_snapshot();
+}
+
+void PageClient::permission_request_completed(u64 request_id, Web::Permissions::EffectiveState state)
+{
+    page().permission_request_completed(request_id, state);
 }
 
 void PageClient::page_did_cancel_geolocation_position_request(u64 request_id)
@@ -1305,9 +1363,9 @@ void PageClient::page_did_cancel_geolocation_position_request(u64 request_id)
     client().async_did_cancel_geolocation_position_request(m_id, request_id);
 }
 
-void PageClient::page_did_start_geolocation_position_watch(u64 request_id)
+void PageClient::page_did_start_geolocation_position_watch(u64 request_id, Web::HTML::CrossProcessId requesting_document_id)
 {
-    client().async_did_start_geolocation_position_watch(m_id, request_id);
+    client().async_did_start_geolocation_position_watch(m_id, request_id, requesting_document_id);
 }
 
 void PageClient::page_did_stop_geolocation_position_watch(u64 request_id)
@@ -1591,6 +1649,12 @@ void PageClient::page_did_update_indexed_database(String const& url, Web::Indexe
 void PageClient::page_did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage const& message)
 {
     client().async_did_post_broadcast_channel_message(m_id, message);
+}
+
+// The UI process passes the violation on to the process hosting the navigation's source, while it still hosts it.
+void PageClient::page_did_report_navigation_violation_of_remote_client(Web::HTML::RemoteClientNavigation const& navigation, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https)
+{
+    client().async_did_report_navigation_violation(m_id, navigation.navigable_id, navigation.navigation_id, policy_index, directive, url_is_https);
 }
 
 void PageClient::page_did_update_resource_count(i32 count_waiting)
@@ -2313,15 +2377,29 @@ void PageClient::initialize_js_console(Web::DOM::Document& document)
     document.set_console_client(console_client);
 }
 
-void PageClient::did_execute_js_console_input(JsonValue const& result)
+void PageClient::did_execute_js_console_input(WebView::DebuggerValue const& result)
 {
     client().async_did_execute_js_console_input(m_id, result);
+}
+
+ErrorOr<WebView::DebuggerObjectProperties> PageClient::console_object_properties(u64 object_id)
+{
+    if (!m_top_level_document_console_client)
+        return Error::from_string_literal("Unable to locate console object");
+    return as<DevToolsConsoleClient>(*m_top_level_document_console_client).properties_for_object(object_id);
 }
 
 void PageClient::js_console_input(StringView js_source)
 {
     if (m_top_level_document_console_client)
         m_top_level_document_console_client->handle_input(js_source);
+}
+
+Optional<Web::HTML::ConsoleInputCompletion> PageClient::complete_js_console_input(StringView input)
+{
+    if (!m_top_level_document_console_client)
+        return {};
+    return m_top_level_document_console_client->complete_input(input);
 }
 
 void PageClient::run_javascript(StringView js_source)

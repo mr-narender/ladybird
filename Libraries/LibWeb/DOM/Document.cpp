@@ -404,12 +404,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     }
     // 7. Otherwise:
     else {
-        // FIXME: 1. Let oacHeader be the result of getting a structured field value given `Origin-Agent-Cluster` and "item" from response's header list.
-
-        // FIXME: 2. Let requestsOAC be true if oacHeader is not null and oacHeader[0] is the boolean true; otherwise false.
-        [[maybe_unused]] auto requests_oac = false;
-
-        // FIXME: 3. If navigationParams's reserved environment is a non-secure context, then set requestsOAC to false.
+        // NB: The UI process performs steps 1 through 4 and passes the selected agent cluster's properties.
 
         // 4. Let agent be the result of obtaining a similar-origin window agent given navigationParams's origin, browsingContext's group, and requestsOAC.
         // NB: The UI process obtains the agent, and names its agent cluster.
@@ -457,11 +452,14 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
             agent_cluster_cross_origin_isolation_mode);
     }
 
+    // NB: The UI process selects the window's agent even when an initial about:blank Window is reused.
+    as<HTML::WindowEnvironmentSettingsObject>(HTML::relevant_settings_object(*window)).set_agent_cluster_is_origin_keyed(navigation_params.agent_cluster_is_origin_keyed || navigation_params.origin.is_opaque() || navigation_params.agent_cluster_cross_origin_isolation_mode != HTML::CrossOriginIsolationMode::None);
+
     // AD-HOC: The fetch controller is only available in the process that ran the navigation fetch. Navigation params
     //         rebuilt from a descriptor carry the fetch's timing info directly.
     RefPtr<Fetch::Infrastructure::FetchTimingInfo> navigation_fetch_timing_info = navigation_params.fetch_timing_info;
     if (navigation_params.fetch_controller)
-        navigation_fetch_timing_info = navigation_params.fetch_controller->timing_info();
+        navigation_fetch_timing_info = navigation_params.fetch_controller->full_timing_info();
 
     // 8. Let loadTimingInfo be a new document load timing info with its navigation start time set to navigationParams's response's timing info's start time.
     DOM::DocumentLoadTimingInfo load_timing_info;
@@ -1502,7 +1500,14 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<Utf16String> const&, Opti
     // INTEROP: The HTML Standard says the document open steps do not affect whether a Document is ready for post-load
     //          tasks. Blink and WebKit reset their corresponding frame load-completion state, while Gecko marks the
     //          document loader as opened but not loaded. Reset our load gating flag for the replacement contents too.
-    set_ready_for_post_load_tasks(false);
+    //          Blink only treats document.open() as part of a load when the parent document still has to fire
+    //          its load event, so keep the flag when the container's document has already fired its load event:
+    //          nothing waits on the replacement contents then, and a later load of an ancestor must not wait on
+    //          them either. The replacement contents still fire a load event of their own, so a document that is
+    //          reopened in turn below them is part of their load.
+    if (auto container_document = this->container_document(); !container_document || container_document->load_event_still_needed())
+        set_ready_for_post_load_tasks(false);
+    m_opened_contents_still_loading = true;
 
     // INTEROP: The HTML Standard does not reset the page showing flag in the document open steps. Browsers allow a
     //          completed Document to be reopened and complete loading again, so mark the replaced contents as no longer
@@ -4158,6 +4163,8 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
         return;
 
     page().invalidate_compositor_keyboard_scroll_state_for_document(*this);
+    if (auto navigable = this->navigable())
+        navigable->event_handler().cancel_keyboard_activation();
     if (node)
         m_sequential_focus_navigation_starting_point = nullptr;
 
@@ -6083,6 +6090,7 @@ void Document::set_ready_for_post_load_tasks(bool ready)
 {
     m_ready_for_post_load_tasks = ready;
     if (ready) {
+        m_opened_contents_still_loading = false;
         if (auto navigable = this->navigable()) {
             if (auto container = navigable->container())
                 container->document().schedule_html_parser_end_check();
@@ -6570,10 +6578,12 @@ void Document::destroy()
             auto& child_navigable = *navigable_container->content_navigable();
             page().client().page_did_destroy_child_frame(child_navigable.id());
             child_navigable.set_has_been_destroyed();
-            if (auto* local_child_navigable = as_if<HTML::LocalNavigable>(child_navigable))
+            if (auto* local_child_navigable = as_if<HTML::LocalNavigable>(child_navigable)) {
                 local_child_navigable->remove_from_all_local_navigables();
-            else
+            } else {
+                page().discard_provisional_navigable(child_navigable.id());
                 as<HTML::RemoteNavigable>(child_navigable).remove_from_all_remote_navigables();
+            }
         }
     }
 
@@ -6736,6 +6746,16 @@ void Document::abort()
     if (auto window = this->window(); window && window->associated_document_if_any().ptr() == this) {
         for (auto& fetch_record : relevant_settings_object().fetch_group())
             cancel_fetch(fetch_record.fetch_controller());
+
+        for (auto& controller : HTML::relevant_agent(*this).fetch_controller_registry.controllers()) {
+            if (!controller->task_destination().is_for_document(*this))
+                continue;
+            // AD-HOC: A keepalive fetch without a fetch record, such as a violation report, outlives the document, as
+            //         terminating a fetch group leaves its keepalive fetches running.
+            if (controller->is_keepalive())
+                continue;
+            cancel_fetch(controller.ptr());
+        }
     }
 
     if (canceled_fetch)
@@ -6765,6 +6785,12 @@ void Document::abort()
 
         // 3. Make document unsalvageable given document and "parser-aborted".
         make_unsalvageable("parser-aborted"_utf16);
+    }
+
+    // NB: Stopped fetches discard their completion tasks, so their elements cannot release rendering themselves.
+    while (!m_render_blocking_elements.is_empty()) {
+        auto element = *m_render_blocking_elements.begin();
+        element->unblock_rendering();
     }
 }
 
@@ -7751,14 +7777,19 @@ void Document::shared_declarative_refresh_steps(Utf16View input, GC::Ptr<HTML::H
     //   flag set, then navigate document's node navigable to urlRecord using document, with historyHandling set to
     //   "replace".
     m_active_refresh_timer = Core::Timer::create_single_shot(AK::Duration::from_seconds(time), [this, has_meta_element = !!meta_element, url_record = move(url_record)]() {
-        if (has_meta_element && has_flag(active_sandboxing_flag_set(), HTML::SandboxingFlagSet::SandboxedAutomaticFeatures))
-            return;
+        // AD-HOC: Navigate from a task, so that the refresh comes after the tasks that "completely finish loading"
+        //         queued, such as the one that fires the load event at the container, as the refresh is due only
+        //         after the document has completely loaded.
+        HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(*this), GC::create_function(heap(), [document = GC::Ref { *this }, has_meta_element, url_record] {
+            if (has_meta_element && has_flag(document->active_sandboxing_flag_set(), HTML::SandboxingFlagSet::SandboxedAutomaticFeatures))
+                return;
 
-        auto navigable = this->navigable();
-        if (!navigable || navigable->has_been_destroyed())
-            return;
+            auto navigable = document->navigable();
+            if (!navigable || navigable->has_been_destroyed())
+                return;
 
-        MUST(navigable->navigate({ .url = url_record, .source_document = *this, .history_handling = HTML::NavigationHistoryBehavior::Replace }));
+            MUST(navigable->navigate({ .url = url_record, .source_document = document, .history_handling = HTML::NavigationHistoryBehavior::Replace }));
+        }));
     });
 
     // For the purposes of the previous paragraph, a refresh is said to have come due as soon as the later of the
@@ -9933,7 +9964,7 @@ static size_t calculate_depth_for_node(Node const& node)
 }
 
 // https://drafts.csswg.org/resize-observer-1/#gather-active-observations-h
-void Document::gather_active_observations_at_depth(size_t depth)
+void Document::gather_active_observations_at_depth(size_t depth, u64 rendering_update_serial)
 {
     // 1. Let depth be the depth passed in.
 
@@ -9953,6 +9984,10 @@ void Document::gather_active_observations_at_depth(size_t depth)
 
         // 2. For each observation in observer.[[observationTargets]] run this step:
         for (auto& observation : observer->observation_targets()) {
+            // NB: An observation made beside a rendering update in flight is gathered by the rendering updates after it.
+            if (observation->first_rendering_update_to_gather() > rendering_update_serial)
+                continue;
+
             // 1. If observation.isActive() is true
             if (observation->is_active()) {
                 auto target = observation->target();
@@ -10452,10 +10487,6 @@ bool Document::is_render_blocked() const
     auto now = HighResolutionTime::current_high_resolution_time(relevant_global_object(*this));
     if (now > max_time_to_block_rendering_in_ms)
         return false;
-
-    // AD-HOC: Consider pending CSS @import rules as render-blocking
-    if (!m_pending_css_import_rules.is_empty())
-        return true;
 
     if (!m_render_blocking_elements.is_empty())
         return true;
@@ -12447,7 +12478,7 @@ static WebIDL::ExceptionOr<Utf16String> document_write_compliant_string(DOM::Doc
             HTML::relevant_global_object(document),
             string.to_string(),
             sink,
-            "script"_utf16));
+            TrustedTypes::Script.view()));
         string.clear();
         string.append(new_string);
     }

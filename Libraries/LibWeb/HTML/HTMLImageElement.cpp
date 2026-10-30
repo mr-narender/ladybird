@@ -159,6 +159,35 @@ void HTMLImageElement::initialize_element()
     });
 }
 
+// https://html.spec.whatwg.org/multipage/images.html#update-the-source-set
+static void update_dimension_attribute_source(HTMLImageElement& image)
+{
+    // INTEROP: Chrome, Firefox and Safari expose dimension hints to synchronous style queries before the deferred
+    //          image update. Select only the source element here; resolving sizes could depend on layout, and
+    //          currentSrc must remain deferred.
+    if (is<HTMLPictureElement>(image.parent())) {
+        for (auto* child = image.parent()->first_child(); child != &image; child = child->next_sibling()) {
+            auto* source = as_if<HTMLSourceElement>(child);
+            if (!source)
+                continue;
+            auto srcset = source->attribute(HTML::AttributeNames::srcset);
+            if (!srcset.has_value() || parse_a_srcset_attribute(*srcset).is_empty())
+                continue;
+            if (auto media = source->attribute(HTML::AttributeNames::media); media.has_value()
+                && !CSS::RustMediaList::parse(*media).evaluate(image.document()))
+                continue;
+            if (auto type = source->attribute(HTML::AttributeNames::type); type.has_value() && !is_supported_image_type(*type))
+                continue;
+
+            // 5.9. If child has width or height attributes, set el's dimension attribute source to child.
+            //      Otherwise, set el's dimension attribute source to el.
+            image.set_dimension_attribute_source(source->has_attribute(HTML::AttributeNames::width) || source->has_attribute(HTML::AttributeNames::height) ? source : nullptr);
+            return;
+        }
+    }
+    image.set_dimension_attribute_source(nullptr);
+}
+
 void HTMLImageElement::adopted_from(DOM::Document& old_document)
 {
     old_document.unregister_viewport_client(*this);
@@ -185,6 +214,8 @@ void HTMLImageElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<DOM::No
     //    movedNode.
     if (is_subtree_root == IsSubtreeRoot::Yes && is<HTMLPictureElement>(old_ancestor.ptr()))
         update_the_image_data();
+    else
+        update_dimension_attribute_source(*this);
 }
 
 // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:html-element-removing-steps
@@ -228,6 +259,12 @@ void HTMLImageElement::set_dimension_attribute_source(DOM::Element const* source
         m_dimension_attribute_source = source;
         CSS::republish_presentational_hints(*this);
     }
+}
+
+void HTMLImageElement::inserted()
+{
+    Base::inserted();
+    update_dimension_attribute_source(*this);
 }
 
 bool HTMLImageElement::is_presentational_hint(Utf16FlyString const& name) const
@@ -704,7 +741,7 @@ void HTMLImageElement::decode(GC::Ref<WebIDL::Promise> promise) const
             return;
         }
 
-        current_request.add_callbacks(
+        current_request.add_callbacks_without_delaying_the_load_event(
             // AD-HOC: Enqueue on the batching dispatcher to preserve ordering relative to update_the_image_data's step
             //         16, which also goes through the batching dispatcher. Otherwise decode() can resolve before the
             //         current request transitions to CompletelyAvailable, leaving the image dimensions at zero when
@@ -843,6 +880,8 @@ bool HTMLImageElement::uses_srcset_or_picture() const
 // https://html.spec.whatwg.org/multipage/images.html#update-the-image-data
 void HTMLImageElement::update_the_image_data(bool restart_animations, bool maybe_omit_events)
 {
+    update_dimension_attribute_source(*this);
+
     auto update_the_image_data_count = ++m_update_the_image_data_count;
 
     // 1. If the element's node document is not fully active, then:
@@ -1035,6 +1074,7 @@ after_step_7:
             unregister_with_decoded_image_data_if_needed();
             abort_the_image_request(m_current_request);
             abort_the_image_request(m_pending_request);
+            stop_delaying_the_load_event_for_aborted_requests();
             m_pending_request = nullptr;
 
             // AD-HOC: The element may have been rendering as blank space while a load was pending;
@@ -1076,6 +1116,7 @@ after_step_7:
             unregister_with_decoded_image_data_if_needed();
             abort_the_image_request(m_current_request);
             abort_the_image_request(m_pending_request);
+            stop_delaying_the_load_event_for_aborted_requests();
 
             // 2. Set the current request's state to broken.
             m_current_request->set_state(ImageRequest::State::Broken);
@@ -1384,11 +1425,22 @@ void HTMLImageElement::add_callbacks_to_image_request(GC::Ref<ImageRequest> imag
         });
 }
 
+// NB: Aborting the image requests aborts their fetches, so nothing that the img element is fetching delays the load
+//     event of its node document anymore. Our fetches are shared and keep going, so stop waiting for them here.
+void HTMLImageElement::stop_delaying_the_load_event_for_aborted_requests()
+{
+    m_current_request->stop_waiting_for_fetch();
+    if (m_pending_request)
+        m_pending_request->stop_waiting_for_fetch();
+    m_load_event_delayer.clear();
+}
+
 void HTMLImageElement::did_set_viewport_rect(CSSPixelRect const& viewport_rect)
 {
     if (viewport_rect.size() == m_last_seen_viewport_size)
         return;
     m_last_seen_viewport_size = viewport_rect.size();
+    update_dimension_attribute_source(*this);
     batching_dispatcher().enqueue(document(), GC::create_function(GC::Heap::the(), [this] {
         react_to_changes_in_the_environment();
     }));

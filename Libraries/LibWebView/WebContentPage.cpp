@@ -14,6 +14,7 @@
 #include <LibWebCommon/Geolocation/GeolocationPositionErrorCode.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
 #include <LibWebCommon/Page/InputEvent.h>
+#include <LibWebCommon/SecureContexts/AbstractOperations.h>
 #include <LibWebCommon/WebDriver/Error.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
@@ -28,6 +29,7 @@
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
+#include <LibWebView/PermissionManager.h>
 #include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/StorageAreaRegistry.h>
@@ -705,11 +707,13 @@ void WebContentPage::did_request_navigation_of_navigable(Web::HTML::CrossProcess
     //     again, with the sourceDocument and sandboxing flags it holds. sourceDocument can be in another tab, in this
     //     process's page for it.
     Optional<CanonicalNavigable&> source;
+    RefPtr<WebContentPage> source_page;
     client().for_each_page([&](WebContentPage& page) {
         auto navigable = page.traversable().find(source_navigable_id);
         if (!navigable.has_value() || navigable->active_document().id() != source_document_id || navigable->active_document().host() != &page)
             return IterationDecision::Continue;
         source = *navigable;
+        source_page = page;
         return IterationDecision::Break;
     });
     if (!source.has_value())
@@ -735,7 +739,54 @@ void WebContentPage::did_request_navigation_of_navigable(Web::HTML::CrossProcess
     //    3. Set initiatorOriginSnapshot to sourceDocument's origin.
     navigation.initiator_origin_snapshot = source_document.origin();
 
-    target->begin_navigation(move(navigation));
+    target->begin_navigation(move(navigation), move(source_page));
+}
+
+static bool navigation_can_violate(Web::ContentSecurityPolicy::RemoteViolationDirective directive, CanonicalNavigable const& navigable, Web::HTML::NavigationPopulationRequest const& request)
+{
+    switch (directive) {
+    case Web::ContentSecurityPolicy::RemoteViolationDirective::FrameSrc:
+    case Web::ContentSecurityPolicy::RemoteViolationDirective::ObjectSrc:
+        return !navigable.is_top_level_traversable();
+    case Web::ContentSecurityPolicy::RemoteViolationDirective::FormAction:
+        return request.csp_navigation_type == Web::ContentSecurityPolicy::Directives::NavigationType::FormSubmission;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+// The process populating a navigation reports a violation of a policy of its source, which goes to the page found
+// hosting the source when the navigation was requested, while that page still hosts it.
+void WebContentPage::did_report_navigation_violation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https)
+{
+    auto navigable = population_worker_navigable(navigable_id);
+    if (!navigable.has_value())
+        return;
+    auto navigation = navigable->navigation_with_id(navigation_id);
+    auto* creating = navigation ? navigation->state.get_pointer<CanonicalNavigation::CreatingNavigationParams>() : nullptr;
+    if (!creating || navigation->worker() != this)
+        return;
+
+    auto const& request = creating->loader->request();
+    auto const& fetch_client = request.source_snapshot_params.fetch_client;
+    if (!fetch_client.has_value() || !navigation_can_violate(directive, *navigable, request)) {
+        client().did_misbehave("did_report_navigation_violation"sv, "violation the navigation cannot have"sv);
+        return;
+    }
+
+    auto const& source_page = navigation->source_page;
+    if (!source_page || !source_page->is_open() || !source_page->hosted_environment(fetch_client->id).has_value())
+        return;
+
+    // The request's URL can be upgraded from http to https before the check, by upgrade-insecure-requests or HSTS, so
+    // the report then names the upgraded URL.
+    auto url = request.history_entry.url;
+    if (url_is_https && url.scheme() == "http"sv) {
+        url.set_scheme("https"_string);
+        // NB: Unlike the URL parser, setting the scheme does not remove a port that is the new scheme's default port.
+        if (url.port() == 443)
+            url.set_port({});
+    }
+    source_page->async_report_violation_of_environment(fetch_client->id, policy_index, directive, move(url));
 }
 
 void WebContentPage::did_post_message_to_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor posted_message)
@@ -1118,7 +1169,7 @@ void WebContentPage::did_get_hovered_node_id(Web::UniqueNodeID node_id)
 void WebContentPage::did_get_node_id_at_position(u64 request_id, Web::UniqueNodeID node_id)
 {
     if (displays_tab()) {
-        view().did_receive_node_picker_hit_test(request_id, node_id);
+        view().did_receive_node_hit_test(request_id, node_id);
     }
 }
 
@@ -1221,7 +1272,7 @@ void WebContentPage::did_cut_selected_text(u64 request_id, ByteString selection)
     view().did_cut_selected_text({}, request_id, move(selection));
 }
 
-void WebContentPage::did_execute_js_console_input(JsonValue result)
+void WebContentPage::did_execute_js_console_input(DebuggerValue result)
 {
     if (displays_tab()) {
         if (view().on_received_js_console_result)
@@ -1548,6 +1599,26 @@ void WebContentPage::did_request_color_picker(Color current_color)
     view().did_request_color_picker({}, *this, current_color);
 }
 
+static Optional<Web::Permissions::PermissionName> permission_name_from(Utf16String const& name)
+{
+    if (name == "geolocation"_utf16)
+        return Web::Permissions::PermissionName::Geolocation;
+    if (name == "microphone"_utf16)
+        return Web::Permissions::PermissionName::Microphone;
+    return {};
+}
+
+static Web::PermissionsPolicy::PolicyControlledFeature policy_controlled_feature_for(Web::Permissions::PermissionName name)
+{
+    switch (name) {
+    case Web::Permissions::PermissionName::Geolocation:
+        return Web::PermissionsPolicy::PolicyControlledFeature::Geolocation;
+    case Web::Permissions::PermissionName::Microphone:
+        return Web::PermissionsPolicy::PolicyControlledFeature::Microphone;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 bool WebContentPage::hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature feature) const
 {
     auto is_allowed = false;
@@ -1562,41 +1633,202 @@ bool WebContentPage::hosts_a_document_allowed_to_use(Web::PermissionsPolicy::Pol
     return is_allowed;
 }
 
-void WebContentPage::did_request_geolocation_position(u64 request_id)
+bool WebContentPage::document_may_use(Web::HTML::CrossProcessId document_id, Web::Permissions::PermissionName name) const
 {
-    if (!hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature::Geolocation)) {
+    auto document = hosted_document_with_id(document_id);
+    if (!document)
+        return false;
+    auto top_level_origin = document->top_level_origin();
+    if (!top_level_origin.has_value())
+        return false;
+    if (Web::PermissionsPolicy::check_permissions_policy(document->permissions_policy(), policy_controlled_feature_for(name), document->origin(), document->origin()) != Web::PermissionsPolicy::FeatureValue::Enabled)
+        return false;
+    if (top_level_origin->is_opaque())
+        return m_file_permission_grants.find_first_index_if([&](auto const& grant) { return grant.document_id == document_id && grant.name == name; }).has_value();
+    return view().session().permission_manager->effective_state(name, *top_level_origin) == Web::Permissions::EffectiveState::Granted;
+}
+
+void WebContentPage::did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId document_id)
+{
+    // The UI process hands out a position only to a document it knows the user let have one.
+    if (!document_may_use(document_id, Web::Permissions::PermissionName::Geolocation)) {
         async_geolocation_position_response(request_id, {}, to_underlying(Web::Geolocation::GeolocationPositionErrorCode::PermissionDenied));
         return;
     }
     if (view().on_request_geolocation_position)
-        view().on_request_geolocation_position(*this, request_id);
+        view().on_request_geolocation_position(*this, request_id, document_id);
 }
 
-void WebContentPage::did_request_permission(u64 request_id, Utf16String name)
+bool WebContentPage::hosts_a_document_with_top_level_origin(URL::Origin const& origin) const
 {
-    if (name != "microphone"_utf16) {
+    auto hosts = false;
+    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+        auto const& document = navigable.active_document();
+        if (document.host() != this)
+            return IterationDecision::Continue;
+        auto top_level_origin = document.top_level_origin();
+        hosts = top_level_origin.has_value() && top_level_origin->is_same_origin(origin);
+        return hosts ? IterationDecision::Break : IterationDecision::Continue;
+    });
+    return hosts;
+}
+
+RefPtr<CanonicalDocument> WebContentPage::hosted_document_with_id(Web::HTML::CrossProcessId document_id) const
+{
+    RefPtr<CanonicalDocument> found;
+    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+        auto document = navigable.document_with_id(document_id);
+        if (!document || document->host() != this)
+            return IterationDecision::Continue;
+        found = move(document);
+        return IterationDecision::Break;
+    });
+    return found;
+}
+
+void WebContentPage::did_request_permission(u64 request_id, Web::HTML::CrossProcessId document_id, Utf16String name)
+{
+    auto permission_name = permission_name_from(name);
+    if (!permission_name.has_value()) {
         client().did_misbehave("did_request_permission"sv, "unknown permission name"sv);
         return;
     }
 
-    if (!view().on_request_permission) {
-        async_permission_request_completed(request_id, false);
+    auto deny = [&] { async_permission_request_completed(request_id, Web::Permissions::EffectiveState::Denied); };
+
+    view().did_request_permission({}, *permission_name);
+
+    // The UI process decides from what it knows of the requesting document, never from what the renderer says of it.
+    auto document = hosted_document_with_id(document_id);
+    if (!document) {
+        deny();
+        return;
+    }
+    auto top_level_origin = document->top_level_origin();
+    if (!top_level_origin.has_value()) {
+        deny();
         return;
     }
 
-    auto url = view().url();
-    view().on_request_permission(name, url.origin(), [page = NonnullRefPtr(*this), request_id, name, url](bool granted) {
+    auto policy = Web::PermissionsPolicy::check_permissions_policy(document->permissions_policy(), policy_controlled_feature_for(*permission_name), document->origin(), document->origin());
+    if (policy != Web::PermissionsPolicy::FeatureValue::Enabled) {
+        deny();
+        return;
+    }
+
+    // A file: page has an opaque origin, and it's the only one that gets to ask. Its answer lasts as long as the page.
+    auto is_file = top_level_origin->is_opaque() && view().url().scheme() == "file"sv;
+    if (!is_file) {
+        auto is_trustworthy = [](URL::Origin const& origin) {
+            return Web::SecureContexts::is_origin_potentially_trustworthy(origin) == Web::SecureContexts::Trustworthiness::PotentiallyTrustworthy;
+        };
+        if (!is_trustworthy(*top_level_origin) || !is_trustworthy(document->origin())) {
+            deny();
+            return;
+        }
+    }
+
+    auto& manager = *view().session().permission_manager;
+    if (!is_file) {
+        if (auto state = manager.effective_state(*permission_name, *top_level_origin); state != Web::Permissions::EffectiveState::Prompt) {
+            async_permission_request_completed(request_id, state);
+            return;
+        }
+    }
+
+    auto generation_when_asked = manager.decision_generation(*permission_name, *top_level_origin);
+    // When the system hasn't yet let the browser find the user's location either, the prompt says the system will ask next.
+    auto show_os_hint = *permission_name == Web::Permissions::PermissionName::Geolocation && Application::the().geolocation_authorization() == Core::GeolocationAuthorization::NotDetermined;
+    PermissionPromptRequest request { *permission_name, *top_level_origin, is_file, show_os_hint };
+
+    view().request_permission_prompt(move(request), [page = NonnullRefPtr(*this), request_id, document_id, permission_name = *permission_name, top_level_origin = *top_level_origin, is_file, generation_when_asked](Web::Permissions::PromptOutcome outcome) {
         if (!page->is_open())
             return;
-        // The AudioServer hears of the permission before the page does, so the page's first request finds it in place.
-        if (granted && name == "microphone"_utf16) {
-            if (auto result = page->client().grant_audio_capture(url); result.is_error()) {
-                warnln("Unable to grant audio capture: {}", result.error());
-                granted = false;
+
+        auto state = Web::Permissions::EffectiveState::Prompt;
+        if (is_file) {
+            if (outcome == Web::Permissions::PromptOutcome::AllowAlways || outcome == Web::Permissions::PromptOutcome::AllowOnce)
+                state = Web::Permissions::EffectiveState::Granted;
+            else if (outcome == Web::Permissions::PromptOutcome::Block)
+                state = Web::Permissions::EffectiveState::Denied;
+            if (state == Web::Permissions::EffectiveState::Granted)
+                page->m_file_permission_grants.append({ document_id, permission_name });
+            if (state == Web::Permissions::EffectiveState::Granted && permission_name == Web::Permissions::PermissionName::Microphone) {
+                if (auto result = page->client().grant_audio_capture_to_file(page->view().url()); result.is_error())
+                    warnln("Unable to grant audio capture: {}", result.error());
             }
+        } else {
+            auto& manager = *page->view().session().permission_manager;
+
+            // The answer counts only if nothing was decided for the site while the prompt was up: A decision made
+            // elsewhere (in the site-info panel, e.g.) wins, and a document that's gone takes its prompt with it. And
+            // requests that shared one prompt record its answer once, as the first of them records it.
+            auto still_relevant = page->hosted_document_with_id(document_id) && manager.decision_generation(permission_name, top_level_origin) == generation_when_asked;
+            if (still_relevant)
+                manager.record_prompt_outcome(permission_name, top_level_origin, outcome);
+            state = manager.effective_state(permission_name, top_level_origin);
         }
-        page->async_permission_request_completed(request_id, granted);
+
+        // The AudioServer hears of the permission before the page does, so the page's first request finds it in place.
+        if (permission_name == Web::Permissions::PermissionName::Microphone)
+            page->client().update_audio_capture_permission();
+
+        page->async_permission_request_completed(request_id, state);
     });
+}
+
+Web::Permissions::PermissionSnapshot WebContentPage::set_permission_for_testing(Web::HTML::CrossProcessId document_id, String const& name, String const& state)
+{
+    auto& manager = *view().session().permission_manager;
+    auto permission_name = Web::Permissions::permission_name_from_string(name);
+    auto document = hosted_document_with_id(document_id);
+    auto top_level_origin = document ? document->top_level_origin() : Optional<URL::Origin> {};
+
+    if (permission_name.has_value() && top_level_origin.has_value()) {
+        if (state == "granted"sv)
+            manager.set_decision(*permission_name, *top_level_origin, PermissionDecision::Allow);
+        else if (state == "denied"sv)
+            manager.set_decision(*permission_name, *top_level_origin, PermissionDecision::Block);
+        else if (state == "prompt"sv)
+            manager.set_decision(*permission_name, *top_level_origin, {});
+        if (*permission_name == Web::Permissions::PermissionName::Microphone)
+            client().update_audio_capture_permission();
+        client().add_permission_origin(*top_level_origin);
+    }
+    return manager.snapshot_for(client().permission_origins());
+}
+
+void WebContentPage::set_next_permission_prompt_outcome_for_testing(String const& name, String const& outcome, bool held)
+{
+    auto permission_name = Web::Permissions::permission_name_from_string(name);
+    if (!permission_name.has_value())
+        return;
+
+    Optional<Web::Permissions::PromptOutcome> prompt_outcome;
+    if (outcome == "allow"sv)
+        prompt_outcome = Web::Permissions::PromptOutcome::AllowAlways;
+    else if (outcome == "allow-once"sv)
+        prompt_outcome = Web::Permissions::PromptOutcome::AllowOnce;
+    else if (outcome == "block"sv)
+        prompt_outcome = Web::Permissions::PromptOutcome::Block;
+    else if (outcome == "dismiss"sv)
+        prompt_outcome = Web::Permissions::PromptOutcome::Dismissed;
+    else if (outcome == "ignore"sv)
+        prompt_outcome = Web::Permissions::PromptOutcome::Ignored;
+    if (prompt_outcome.has_value())
+        view().set_next_permission_prompt_outcome_for_testing(*permission_name, *prompt_outcome, held);
+}
+
+void WebContentPage::release_held_permission_prompt_for_testing(u32 waiters)
+{
+    view().release_held_permission_prompt_for_testing(waiters);
+}
+
+Web::Permissions::PermissionSnapshot WebContentPage::advance_permission_clock_for_testing(u64 milliseconds)
+{
+    auto& manager = *view().session().permission_manager;
+    manager.age_origin_for_testing(view().url().origin(), AK::Duration::from_milliseconds(static_cast<i64>(milliseconds)));
+    return manager.snapshot_for(client().permission_origins());
 }
 
 void WebContentPage::did_cancel_geolocation_position_request(u64 request_id)
@@ -1605,10 +1837,14 @@ void WebContentPage::did_cancel_geolocation_position_request(u64 request_id)
         view().on_cancel_geolocation_position_request(*this, request_id);
 }
 
-void WebContentPage::did_start_geolocation_position_watch(u64 request_id)
+void WebContentPage::did_start_geolocation_position_watch(u64 request_id, Web::HTML::CrossProcessId document_id)
 {
+    if (!document_may_use(document_id, Web::Permissions::PermissionName::Geolocation)) {
+        async_geolocation_position_response(request_id, {}, to_underlying(Web::Geolocation::GeolocationPositionErrorCode::PermissionDenied));
+        return;
+    }
     if (view().on_start_geolocation_position_watch)
-        view().on_start_geolocation_position_watch(*this, request_id);
+        view().on_start_geolocation_position_watch(*this, request_id, document_id);
 }
 
 void WebContentPage::did_stop_geolocation_position_watch(u64 request_id)
@@ -1959,6 +2195,15 @@ void WebContentPage::did_resolve_dom_node_url(u64 request_id, String resolved_ur
     }
 }
 
+void WebContentPage::did_complete_js_console_input(u64 request_id, Optional<Vector<String>> matches, String match_prop)
+{
+    if (displays_tab()) {
+        auto handler = view().on_completed_js_console_input.take(request_id);
+        if (handler.has_value())
+            (*handler)(DevTools::DevToolsDelegate::ConsoleInputCompletion { move(matches), move(match_prop) });
+    }
+}
+
 void WebContentPage::did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CacheState cache_state)
 {
     if (displays_tab()) {
@@ -2274,6 +2519,22 @@ void WebContentPage::did_forward_mouse_event_to_child_frame(Web::HTML::CrossProc
     auto& host = child_frame->remote_host();
     view().did_forward_input_event({}, *this, event.id, host);
     host.async_mouse_event_in_hosted_root(frame_id, move(event));
+}
+
+// The page found a pinch over a child frame another process hosts, whose document gets the pinch's ctrl+wheel event.
+void WebContentPage::did_forward_pinch_event_to_child_frame(Web::HTML::CrossProcessId frame_id, Web::PinchEvent event)
+{
+    auto child_frame = traversable().find(frame_id);
+    if (!child_frame.has_value() || !holds_container_of(*child_frame, "did_forward_pinch_event_to_child_frame"sv) || !child_frame->has_remote_host()) {
+        did_finish_handling_input_event(event.id, Web::EventResult::Dropped);
+        return;
+    }
+
+    auto& host = child_frame->remote_host();
+    view().did_forward_pinch_event({}, *this, event, host);
+    // NB: The frame has yet to dispatch the event, whatever the page that forwards it claims.
+    event.wheel_event_was_dispatched = false;
+    host.async_pinch_event_in_hosted_root(frame_id, event);
 }
 
 void WebContentPage::did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)

@@ -369,6 +369,7 @@ set(SOURCES
     Fetch/HeadersIterator.cpp
     Fetch/Infrastructure/FetchAlgorithms.cpp
     Fetch/Infrastructure/FetchController.cpp
+    Fetch/Infrastructure/FetchControllerRegistry.cpp
     Fetch/Infrastructure/FetchParams.cpp
     Fetch/Infrastructure/FetchRecord.cpp
     Fetch/Infrastructure/FetchTimingInfo.cpp
@@ -393,8 +394,6 @@ set(SOURCES
     FileAPI/BlobURLStore.cpp
     FileAPI/File.cpp
     FileAPI/FileList.cpp
-    FileAPI/FileReader.cpp
-    FileAPI/FileReaderSync.cpp
     Gamepad/EventNames.cpp
     Gamepad/Gamepad.cpp
     Gamepad/GamepadButton.cpp
@@ -629,6 +628,8 @@ set(SOURCES
     HTML/SanitizerConfiguration.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
+    HTML/Scripting/ConsoleInputCompletion.cpp
+    HTML/Scripting/DevToolsObjectTable.cpp
     HTML/Scripting/Environments.cpp
     HTML/Scripting/ExceptionReporter.cpp
     HTML/Scripting/FetchClient.cpp

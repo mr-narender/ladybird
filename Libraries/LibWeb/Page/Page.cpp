@@ -525,7 +525,11 @@ bool Page::select_word_for_dictionary_lookup(DevicePixelPoint position)
 
 UniqueNodeID Page::node_id_at_position(DevicePixelPoint position)
 {
-    auto node = local_traversable()->event_handler().target_node_for_mouse_position(device_to_css_point(position));
+    // DevTools selects only elements, and its DOM tree leaves out whitespace-only text, so a hit on text resolves to
+    // the element around it here.
+    GC::Ptr<DOM::Node> node = local_traversable()->event_handler().target_node_for_mouse_position(device_to_css_point(position));
+    while (node && !is<DOM::Element>(*node))
+        node = node->parent_or_shadow_host();
     if (!node)
         return 0;
 
@@ -552,16 +556,21 @@ EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPo
     return handle_drag_and_drop_event(local_traversable(), type, position, screen_position, button, buttons, modifiers, move(files));
 }
 
-EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint position, unsigned modifiers, double scale, bool async_zoom_performed_default_action)
+EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, PinchEvent const& event, Optional<RemoteInputEventTarget>* remote_target)
 {
-    if (async_zoom_performed_default_action)
+    if (event.async_zoom_performed_default_action && root.is_top_level_traversable())
         root.adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
-    return root.event_handler().handle_pinch_event(device_to_css_point(position), modifiers, scale, async_zoom_performed_default_action);
+    return root.event_handler().handle_pinch_event(device_to_css_point(event.position), event, remote_target);
 }
 
 EventResult Page::handle_pinch_event(DevicePixelPoint position, unsigned modifiers, double scale)
 {
-    return handle_pinch_event(local_traversable(), position, modifiers, scale, false);
+    PinchEvent event {
+        .position = position,
+        .modifiers = static_cast<UIEvents::KeyModifier>(modifiers),
+        .scale_delta = scale,
+    };
+    return handle_pinch_event(local_traversable(), event, nullptr);
 }
 
 EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved)
@@ -1502,33 +1511,33 @@ void Page::unregister_emulated_position_data_observer(u64 observer_id)
     m_emulated_position_data_observers.remove(observer_id);
 }
 
-void Page::request_permission(Utf16String const& name, PermissionPromptCallback callback)
+void Page::request_permission(HTML::CrossProcessId requesting_document_id, Utf16String const& name, PermissionPromptCallback callback)
 {
     auto request_id = m_next_permission_request_id++;
     m_pending_permission_requests.set(request_id, callback);
-    client().page_did_request_permission(request_id, name);
+    client().page_did_request_permission(request_id, requesting_document_id, name);
 }
 
-void Page::permission_request_completed(u64 request_id, bool granted)
+void Page::permission_request_completed(u64 request_id, Web::Permissions::EffectiveState state)
 {
     if (auto callback = m_pending_permission_requests.take(request_id); callback.has_value())
-        callback.value()->function()(granted);
+        callback.value()->function()(state);
 }
 
-u64 Page::request_geolocation_position(GeolocationPositionCallback callback, GeolocationRequestType type)
+u64 Page::request_geolocation_position(HTML::CrossProcessId requesting_document_id, GeolocationPositionCallback callback, GeolocationRequestType type)
 {
     // This is the browser-process bridge for the Geolocation spec's "try to acquire position data from the underlying system" step.
     auto request_id = m_next_geolocation_request_id++;
-    m_pending_geolocation_requests.set(request_id, { callback, type });
+    m_pending_geolocation_requests.set(request_id, { callback, type, requesting_document_id });
 
     if (type == GeolocationRequestType::Watch) {
-        client().page_did_start_geolocation_position_watch(request_id);
+        client().page_did_start_geolocation_position_watch(request_id, requesting_document_id);
         return request_id;
     }
 
     if (!m_active_geolocation_request_id.has_value()) {
         m_active_geolocation_request_id = request_id;
-        client().page_did_request_geolocation_position(request_id);
+        client().page_did_request_geolocation_position(request_id, requesting_document_id);
     }
 
     return request_id;
@@ -1550,10 +1559,15 @@ void Page::cancel_geolocation_position_request(u64 request_id)
 
     client().page_did_cancel_geolocation_position_request(request_id);
     m_active_geolocation_request_id = {};
+    start_next_geolocation_position_request();
+}
+
+void Page::start_next_geolocation_position_request()
+{
     for (auto const& entry : m_pending_geolocation_requests) {
         if (entry.value.type == GeolocationRequestType::OneShot) {
             m_active_geolocation_request_id = entry.key;
-            client().page_did_request_geolocation_position(entry.key);
+            client().page_did_request_geolocation_position(entry.key, entry.value.requesting_document_id);
             return;
         }
     }
@@ -1579,10 +1593,18 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
 
     m_active_geolocation_request_id = {};
 
+    // A position, or a failure to get one, is the same answer for every document on the page, so the queued requests
+    // complete with it too. A denial is the answer for the requesting document alone, so the others stay queued, and
+    // the next of them is sent.
+    auto denied = result.has<Geolocation::GeolocationPositionError::ErrorCode>()
+        && result.get<Geolocation::GeolocationPositionError::ErrorCode>() == Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied;
+
     GC::RootVector<GeolocationPositionCallback> callbacks;
     Vector<u64> completed_request_ids;
     for (auto const& entry : m_pending_geolocation_requests) {
         if (entry.value.type != GeolocationRequestType::OneShot)
+            continue;
+        if (denied && entry.value.requesting_document_id != request->requesting_document_id)
             continue;
         callbacks.append(entry.value.callback);
         completed_request_ids.append(entry.key);
@@ -1590,6 +1612,9 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
 
     for (auto completed_request_id : completed_request_ids)
         m_pending_geolocation_requests.remove(completed_request_id);
+
+    if (denied)
+        start_next_geolocation_position_request();
 
     for (auto const& callback : callbacks)
         callback->function()(result);

@@ -13,6 +13,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/Scripting/DevToolsObjectTable.h>
 #include <LibWeb/Internals/InternalAnimationTimeline.h>
 #include <LibWeb/Internals/InternalsBase.h>
 #include <LibWeb/Painting/Forward.h>
@@ -134,6 +135,9 @@ public:
 
     Utf16String selected_text_for_clipboard();
     Optional<Utf16String> generate_text_fragment_url(DOM::Range&, Utf16String const& current_url);
+    Utf16String devtools_grip(JS::Value);
+    Utf16String devtools_properties(JS::Value);
+    Optional<Vector<String>> complete_console_input(Utf16String const& input);
 
     void find_in_page(Utf16String const& query, bool highlight_all);
     void find_in_page_next_match();
@@ -254,7 +258,15 @@ public:
 
     void clear_element(HTML::HTMLElement&);
     void set_environments_top_level_url(Utf16String const& url);
-    void set_geolocation_emulated_position(double latitude, double longitude, double accuracy);
+    void set_geolocation_emulated_position(double latitude, double longitude, double accuracy, Optional<double> altitude, Optional<double> altitude_accuracy, Optional<double> heading, Optional<double> speed);
+    void set_geolocation_emulated_position_unavailable();
+
+    GC::Ref<WebIDL::Promise> request_permission(Utf16String const& name);
+    GC::Ref<WebIDL::Promise> set_permission(Utf16String const& name, Utf16String const& state);
+    void set_next_permission_prompt_outcome(Utf16String const& name, Utf16String const& outcome, bool held);
+    void release_held_permission_prompt(WebIDL::UnsignedLong waiters);
+    GC::Ref<WebIDL::Promise> advance_permission_clock(WebIDL::UnsignedLongLong milliseconds);
+    Vector<String> permission_cache_origins();
 
     u64 parser_non_append_insertions();
     DOM::Document::StyleInvalidationCounters const& style_invalidation_counters() const;
@@ -347,6 +359,7 @@ private:
     bool m_actions_running { false };
     Optional<Utf16String> m_pending_action_test_result;
     Vector<GC::Ref<InternalGamepad>> m_gamepads;
+    Optional<HTML::DevToolsObjectTable> m_devtools_object_table;
 };
 
 }

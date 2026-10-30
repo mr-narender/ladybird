@@ -14,6 +14,7 @@
 #include <LibWebCommon/HTML/HistoryOperation.h>
 #include <LibWebCommon/HTML/SerializationRecords.h>
 #include <LibWebCommon/Page/ViewportIsFullscreen.h>
+#include <LibWebCommon/SecureContexts/AbstractOperations.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowsingSession.h>
@@ -183,7 +184,7 @@ Web::HTML::PreparedNavigationDescriptor CanonicalNavigable::prepare_navigation(U
 }
 
 // Continue the navigate algorithm at step 9 with the values prepared by steps 1-7.
-void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescriptor navigation)
+void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescriptor navigation, RefPtr<WebContentPage> source_page)
 {
     auto& traversable = top_level_traversable();
     auto const& url = navigation.url;
@@ -338,6 +339,7 @@ void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescripto
         .sequence_number = traversable.next_sequence_number(),
         .state = CanonicalNavigation::CheckingIfUnloadingIsCanceled { move(start_request) },
         .page = worker,
+        .source_page = move(source_page),
     });
     worker->async_set_ongoing_navigation(id(), navigation_id);
     worker->begin_navigation_unload_check(*this, navigation_id);
@@ -426,11 +428,15 @@ NonnullRefPtr<CanonicalDocument> CanonicalNavigable::create_and_initialize_a_doc
     }
     // 7. Otherwise:
     else {
-        // FIXME: 1. Let oacHeader be the result of getting a structured field value given `Origin-Agent-Cluster` and "item"
-        //           from navigationParams's response's header list.
-        // FIXME: 2. Let requestsOAC be true if oacHeader is not null and oacHeader[0] is the boolean true; otherwise false.
-        // FIXME: 3. If navigationParams's reserved environment is a non-secure context, then set requestsOAC to false.
-        auto requests_oac = false;
+        // NB: NavigationLoader parsed the response's Origin-Agent-Cluster field for steps 1 and 2.
+        auto requests_oac = navigation_params.requests_oac;
+
+        // 3. If navigationParams's reserved environment is a non-secure context, then set requestsOAC to false.
+        // NB: Derive this from canonical navigation state, since WebContent supplies the reserved environment.
+        auto reserved_top_level_creation_url = m_parent ? m_parent->active_document().relevant_global_object().relevant_settings_object().top_level_creation_url().value() : creation_url;
+        if (reserved_top_level_creation_url.scheme() == "data"sv
+            || Web::SecureContexts::is_url_potentially_trustworthy(reserved_top_level_creation_url) == Web::SecureContexts::Trustworthiness::NotTrustworthy)
+            requests_oac = false;
 
         // 4. Let agent be the result of obtaining a similar-origin window agent given navigationParams's origin,
         //    browsingContext's group, and requestsOAC.
@@ -1092,6 +1098,9 @@ void CanonicalNavigable::abandon_populated_document(NonnullRefPtr<CanonicalDocum
 void CanonicalNavigable::place_populated_document(CanonicalDocument& document, WebContentPage& page)
 {
     document.set_host(page);
+    // A provisional host snapshots its container before population. Refresh it before giving that host a viewport.
+    if (parent() && m_hosted_state.has_value())
+        page.async_update_local_root_container_state(id(), m_hosted_state->container);
     if (auto* bidi = WebDriverBiDi::the())
         bidi->push_session_state_for_client(page.client());
     send_viewport_to_host();
@@ -1212,8 +1221,14 @@ void CanonicalNavigable::update_container_state(Web::HTML::ReplicatedContainerSt
         state.document_permissions_policy = m_container_document->permissions_policy();
     }
     m_hosted_state->container = state;
-    if (has_remote_host())
-        remote_host().async_update_local_root_container_state(id(), move(state));
+    RefPtr<WebContentPage> active_host = has_remote_host() ? &remote_host() : nullptr;
+    if (active_host)
+        active_host->async_update_local_root_container_state(id(), state);
+    // Viewport updates also reach provisional hosts. Keep their container snapshot current before they activate.
+    for_each_pending_host([&](WebContentPage& host) {
+        if (&host != active_host.ptr())
+            host.async_update_local_root_container_state(id(), state);
+    });
     send_replicated_state();
 }
 

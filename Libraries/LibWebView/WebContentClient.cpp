@@ -38,6 +38,7 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
+#include <LibWebView/PermissionManager.h>
 #include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/ViewImplementation.h>
@@ -941,7 +942,7 @@ String WebContentClient::audio_capture_permission_key(URL::URL const& url)
     return url.serialize(URL::ExcludeFragment::Yes);
 }
 
-ErrorOr<void> WebContentClient::grant_audio_capture(URL::URL const& url)
+ErrorOr<void> WebContentClient::grant_audio_capture_to_file(URL::URL const& url)
 {
     m_audio_capture_grants.set(audio_capture_permission_key(url));
     m_audio_capture_permitted = audio_capture_permitted();
@@ -963,13 +964,46 @@ void WebContentClient::update_audio_capture_permission()
         warnln("Unable to update the AudioServer's capture permission: {}", result.error());
 }
 
+void WebContentClient::add_permission_origin(URL::Origin const& origin)
+{
+    if (!origin.is_opaque() && !m_permission_origins.contains_slow(origin))
+        m_permission_origins.append(origin);
+}
+
+// A process may learn the permissions only of a site it shows; asking about any other is refused, and gets just the
+// defaults.
+Messages::WebContentClient::DidRequestPermissionSnapshotResponse WebContentClient::did_request_permission_snapshot(Web::PageId, URL::Origin top_level_origin)
+{
+    auto& manager = *session().permission_manager;
+    auto shows_site = false;
+    for (auto const& it : m_pages) {
+        if (it.value->is_open() && it.value->hosts_a_document_with_top_level_origin(top_level_origin)) {
+            shows_site = true;
+            break;
+        }
+    }
+    if (shows_site)
+        add_permission_origin(top_level_origin);
+    return manager.snapshot_for(m_permission_origins);
+}
+
+bool WebContentClient::page_may_capture_audio(WebContentPage const& page) const
+{
+    // The top-level document's origin, which a popup on about:blank has from its opener; only a file page is left with
+    // an opaque one, and reads its own grant by URL.
+    auto origin = page.view().permission_origin();
+    if (origin.is_opaque())
+        return m_audio_capture_grants.contains(audio_capture_permission_key(page.view().url()));
+    return session().permission_manager->effective_state(Web::Permissions::PermissionName::Microphone, origin) == Web::Permissions::EffectiveState::Granted;
+}
+
 bool WebContentClient::audio_capture_permitted() const
 {
     // A tab's grant reaches only the documents whose permissions policy allows them the microphone. The process may
     // capture if it hosts one, as it can act for any document it hosts.
     for (auto const& it : m_pages) {
         auto const& page = it.value;
-        if (!page->is_open() || !m_audio_capture_grants.contains(audio_capture_permission_key(page->view().url())))
+        if (!page->is_open() || !page_may_capture_audio(*page))
             continue;
         if (page->hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature::Microphone))
             return true;

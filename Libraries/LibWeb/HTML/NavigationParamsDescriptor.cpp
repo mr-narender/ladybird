@@ -136,8 +136,8 @@ static NavigationParamsDescriptor create_navigation_params_descriptor(Navigation
         request = create_navigation_request_descriptor(*params.request);
 
     Optional<NavigationFetchTimingInfoDescriptor> fetch_timing_info;
-    if (params.fetch_controller && params.fetch_controller->timing_info())
-        fetch_timing_info = create_navigation_fetch_timing_info_descriptor(*params.fetch_controller->timing_info());
+    if (params.fetch_controller && params.fetch_controller->full_timing_info())
+        fetch_timing_info = create_navigation_fetch_timing_info_descriptor(*params.fetch_controller->full_timing_info());
     else if (params.fetch_timing_info)
         fetch_timing_info = create_navigation_fetch_timing_info_descriptor(*params.fetch_timing_info);
 
@@ -158,7 +158,7 @@ static NavigationParamsDescriptor create_navigation_params_descriptor(Navigation
         .id = params.id,
         .navigable_id = params.navigable->id(),
         .request = move(request),
-        .response = create_navigation_response_descriptor(*params.response, params.request.ptr(), params.fetch_controller ? params.fetch_controller->timing_info().ptr() : params.fetch_timing_info.ptr()),
+        .response = create_navigation_response_descriptor(*params.response, params.request.ptr(), params.fetch_controller ? params.fetch_controller->full_timing_info().ptr() : params.fetch_timing_info.ptr()),
         .fetch_timing_info = move(fetch_timing_info),
         .coop_enforcement_result = params.coop_enforcement_result,
         .reserved_environment = move(reserved_environment),
@@ -171,6 +171,7 @@ static NavigationParamsDescriptor create_navigation_params_descriptor(Navigation
         .about_base_url = params.about_base_url,
         .user_involvement = params.user_involvement,
         .agent_cluster_id = params.agent_cluster_id,
+        .agent_cluster_is_origin_keyed = params.agent_cluster_is_origin_keyed,
         .agent_cluster_cross_origin_isolation_mode = params.agent_cluster_cross_origin_isolation_mode,
         .new_browsing_context_group_id = params.new_browsing_context_group_id,
         .permissions_policy = params.permissions_policy,
@@ -356,6 +357,7 @@ ErrorOr<NavigationParamsVariant> create_navigation_params_from_descriptor(JS::Re
     navigation_params->webdriver_bidi_network_response = move(network_response);
     navigation_params->webdriver_bidi_network_response_state = move(network_response_state);
     navigation_params->agent_cluster_id = params.agent_cluster_id;
+    navigation_params->agent_cluster_is_origin_keyed = params.agent_cluster_is_origin_keyed;
     navigation_params->agent_cluster_cross_origin_isolation_mode = params.agent_cluster_cross_origin_isolation_mode;
     navigation_params->new_browsing_context_group_id = params.new_browsing_context_group_id;
     navigation_params->permissions_policy = move(params.permissions_policy);

@@ -30,6 +30,7 @@
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Page/Page.h>
@@ -124,8 +125,11 @@ void run_focus_update_steps(Vector<GC::Root<DOM::Node>> old_chain, Vector<GC::Ro
     auto build_focus_within_chain = [](GC::Ptr<DOM::Node> source) {
         Vector<GC::Root<DOM::Element>> chain;
         for (auto* node = source.ptr(); node; node = node->flat_tree_parent()) {
-            if (auto* element = as_if<DOM::Element>(*node))
+            if (auto* element = as_if<DOM::Element>(*node)) {
                 chain.append(*element);
+                if (element->rendered_in_top_layer())
+                    break;
+            }
         }
         return chain;
     };
@@ -398,6 +402,35 @@ static bool is_focusable_area(DOM::Node& node)
         return false;
 
     return node.is_focusable();
+}
+
+// NB: Whether the document has a focused area that the focus fixup rule may find not focusable. The viewport is
+//     focusable, and a container stands for its child navigable's viewport in the parent's focus chain. The child
+//     document handles its own focused area; an inert container does not make that document inert.
+bool focus_fixup_rule_may_apply(DOM::Document const& document)
+{
+    auto focused_area = document.focused_area();
+    if (!focused_area)
+        return false;
+    auto const* container = as_if<NavigableContainer>(focused_area.ptr());
+    return !container || !container->content_navigable();
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#focus-fixup-rule
+bool focus_fixup_rule_applies(DOM::Document& document)
+{
+    return focus_fixup_rule_may_apply(document) && !is_focusable_area(*document.focused_area());
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#focus-fixup-rule
+void run_focus_fixup_rule(DOM::Document& document)
+{
+    if (!focus_fixup_rule_applies(document))
+        return;
+
+    TemporaryExecutionContext execution_context { document.relevant_settings_object() };
+    run_focusing_steps(&document);
+    relevant_window(document).navigation()->set_focus_changed_during_ongoing_navigation(false);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#get-the-focusable-area

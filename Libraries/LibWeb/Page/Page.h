@@ -63,6 +63,7 @@
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/CSS/PreferredContrast.h>
 #include <LibWebCommon/CSS/PreferredMotion.h>
+#include <LibWebCommon/ContentSecurityPolicy/RemoteViolationDirective.h>
 #include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWebCommon/Fullscreen/FullscreenRequestType.h>
 #include <LibWebCommon/Gamepad/GamepadSnapshot.h>
@@ -96,6 +97,7 @@
 #include <LibWebCommon/Page/TextEditingCommand.h>
 #include <LibWebCommon/Page/ViewportIsFullscreen.h>
 #include <LibWebCommon/Page/WritingSuggestion.h>
+#include <LibWebCommon/Permissions/Permissions.h>
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/StorageAPI/StorageEndpoint.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
@@ -199,7 +201,7 @@ public:
     EventResult handle_mousecancel(HTML::LocalNavigable& root);
     EventResult handle_mousewheel(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, bool async_scroll_performed_default_action, Optional<AsyncScrollOperation>* async_scroll_operation, Optional<RemoteInputEventTarget>* remote_target, Optional<Web::WheelGestureMark>);
     EventResult handle_drag_and_drop_event(HTML::LocalNavigable& root, DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
-    EventResult handle_pinch_event(HTML::LocalNavigable& root, DevicePixelPoint point, unsigned modifiers, double scale, bool async_zoom_performed_default_action);
+    EventResult handle_pinch_event(HTML::LocalNavigable& root, PinchEvent const&, Optional<RemoteInputEventTarget>* remote_target);
 
     EventResult handle_mouseup(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers);
     EventResult handle_mousedown(DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, int click_count);
@@ -342,14 +344,15 @@ public:
         OneShot,
         Watch,
     };
-    u64 request_geolocation_position(GeolocationPositionCallback, GeolocationRequestType = GeolocationRequestType::OneShot);
+    u64 request_geolocation_position(HTML::CrossProcessId requesting_document_id, GeolocationPositionCallback, GeolocationRequestType = GeolocationRequestType::OneShot);
     void cancel_geolocation_position_request(u64 request_id);
+    void start_next_geolocation_position_request();
     void receive_geolocation_position(u64 request_id, GeolocationPositionResult);
 
     // The browser-process bridge for the Permissions spec's "ask the user for express permission" step.
-    using PermissionPromptCallback = GC::Ref<GC::Function<void(bool granted)>>;
-    void request_permission(Utf16String const& name, PermissionPromptCallback);
-    void permission_request_completed(u64 request_id, bool granted);
+    using PermissionPromptCallback = GC::Ref<GC::Function<void(Web::Permissions::EffectiveState)>>;
+    void request_permission(HTML::CrossProcessId requesting_document_id, Utf16String const& name, PermissionPromptCallback);
+    void permission_request_completed(u64 request_id, Web::Permissions::EffectiveState);
 
     // https://w3c.github.io/geolocation/#dfn-emulated-position-data
     // NB: The top-level traversable's, which the UI process tells every page representing it.
@@ -575,6 +578,7 @@ private:
     struct PendingGeolocationRequest {
         GeolocationPositionCallback callback;
         GeolocationRequestType type;
+        HTML::CrossProcessId requesting_document_id;
     };
     HashMap<u64, PendingGeolocationRequest> m_pending_geolocation_requests;
     u64 m_next_geolocation_request_id { 0 };
@@ -712,6 +716,7 @@ public:
     virtual void report_finished_handling_input_event(Web::PageId page_id, u64 event_id, EventResult event_was_handled) = 0;
     // The event lands on content another process hosts, which handles it and finishes it.
     virtual void forward_mouse_event_to_remote_navigable([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Web::MouseEvent) { }
+    virtual void forward_pinch_event_to_remote_navigable([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] HTML::CrossProcessId navigable_id, [[maybe_unused]] Web::PinchEvent) { }
     virtual Web::CompositorContextId allocate_compositor_context_id(Web::PagePresentationRegistration page_presentation_registration)
     {
         if (page_presentation_registration == Web::PagePresentationRegistration::Yes)
@@ -871,11 +876,16 @@ public:
     virtual void page_did_request_color_picker([[maybe_unused]] Color current_color) { }
     virtual void page_did_request_file_picker([[maybe_unused]] HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles) { }
     virtual void page_did_request_select_dropdown([[maybe_unused]] HTML::CrossProcessId local_root_id, [[maybe_unused]] Web::CSSPixelPoint content_position, [[maybe_unused]] Web::CSSPixels minimum_width, [[maybe_unused]] Vector<Web::HTML::SelectItem> items) { }
-    virtual void page_did_request_geolocation_position([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_request_geolocation_position([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId requesting_document_id) { }
     virtual void page_did_cancel_geolocation_position_request([[maybe_unused]] u64 request_id) { }
-    virtual void page_did_start_geolocation_position_watch([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_start_geolocation_position_watch([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId requesting_document_id) { }
     virtual void page_did_stop_geolocation_position_watch([[maybe_unused]] u64 request_id) { }
-    virtual void page_did_request_permission([[maybe_unused]] u64 request_id, [[maybe_unused]] Utf16String const& name) { }
+    virtual void page_did_request_permission([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId requesting_document_id, [[maybe_unused]] Utf16String const& name) { }
+    virtual Optional<Web::Permissions::PermissionSnapshot> page_did_request_permission_snapshot([[maybe_unused]] URL::Origin const& top_level_origin) { return {}; }
+    virtual Optional<Web::Permissions::PermissionSnapshot> page_did_set_permission_for_testing([[maybe_unused]] HTML::CrossProcessId document_id, [[maybe_unused]] String const& name, [[maybe_unused]] String const& state) { return {}; }
+    virtual void page_did_set_next_permission_prompt_outcome_for_testing([[maybe_unused]] String const& name, [[maybe_unused]] String const& outcome, [[maybe_unused]] bool held) { }
+    virtual void page_did_release_held_permission_prompt_for_testing([[maybe_unused]] u32 waiters) { }
+    virtual Optional<Web::Permissions::PermissionSnapshot> page_did_advance_permission_clock_for_testing([[maybe_unused]] u64 milliseconds) { return {}; }
 
     virtual void page_did_finish_test([[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_set_test_timeout([[maybe_unused]] double milliseconds) { }
@@ -921,6 +931,8 @@ public:
     virtual void page_did_report_worker_exception([[maybe_unused]] Utf16String const& message, [[maybe_unused]] Utf16String const& filename, [[maybe_unused]] u32 lineno, [[maybe_unused]] u32 colno) { }
     // A fetch whose client another process hosts violated the policy at policy_index in that client's CSP list.
     virtual void page_did_report_violation_of_remote_client([[maybe_unused]] u64 policy_index, [[maybe_unused]] String effective_directive, [[maybe_unused]] URL::URL resource) { }
+    // A navigation whose source another process hosts violated the policy at policy_index in the source's CSP list.
+    virtual void page_did_report_navigation_violation_of_remote_client([[maybe_unused]] HTML::RemoteClientNavigation const& navigation, [[maybe_unused]] u64 policy_index, [[maybe_unused]] ContentSecurityPolicy::RemoteViolationDirective directive, [[maybe_unused]] bool url_is_https) { }
     virtual void page_did_register_javascript_source([[maybe_unused]] DOM::Document&, [[maybe_unused]] HTML::ScriptRegistry::Description const&) { }
     virtual void page_did_post_broadcast_channel_message([[maybe_unused]] HTML::PostedBroadcastChannelMessage const& message) { }
 

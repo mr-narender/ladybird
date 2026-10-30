@@ -21,6 +21,7 @@
 #include <LibCore/EventLoop.h>
 #include <LibCore/Forward.h>
 #include <LibCore/GeolocationProvider.h>
+#include <LibCore/Timer.h>
 #include <LibDatabase/Forward.h>
 #include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/Forward.h>
@@ -76,6 +77,7 @@ struct PinchEvent;
 namespace WebView {
 
 struct ApplicationSettingsObserver;
+struct ApplicationPermissionManagerObserver;
 struct ApplicationBookmarkStoreObserver;
 
 class WEBVIEW_API Application : public DevTools::DevToolsDelegate {
@@ -168,6 +170,12 @@ public:
     void bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>);
 
     void background_networking_settings_changed(Badge<ApplicationSettingsObserver>);
+
+    // True unless the user has turned location off, or there's no way to find it.
+    bool sites_can_ask_for_location() const;
+    Core::GeolocationAuthorization geolocation_authorization();
+    void location_policy_changed(Badge<ApplicationSettingsObserver>);
+    void permissions_changed(Badge<ApplicationPermissionManagerObserver>, PermissionManager const&);
 
     bool content_blocking_enabled() const;
     bool has_content_blocking_rules() const;
@@ -434,6 +442,7 @@ protected:
     virtual Core::EventLoop& create_platform_event_loop();
 
     virtual bool should_coordinate_browser_process() const { return true; }
+    virtual bool should_use_os_geolocation() const { return true; }
     virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::IFrame; }
 
     virtual Optional<ByteString> ask_user_for_download_path([[maybe_unused]] ByteString const& file) const { return {}; }
@@ -485,6 +494,9 @@ private:
     void stop_current_content_blocker_list_update_and_continue();
     void finish_current_content_blocker_list_update();
     ErrorOr<NonnullRawPtr<Core::GeolocationProvider>> ensure_geolocation_provider();
+    void update_permission_defaults();
+    void update_os_location_authorization();
+    void schedule_permission_expiry();
 
     void initialize_actions();
     void update_vertical_tabs_action();
@@ -572,8 +584,9 @@ private:
     virtual void remove_debugger_breakpoint(DevTools::TabDescription const&, DebuggerBreakpointLocation, OnDebuggerBreakpointOperationComplete) const override;
     virtual void retrieve_debugger_environments(DevTools::TabDescription const&, u64 frame_id, OnDebuggerEnvironmentsReceived) const override;
     virtual void evaluate_javascript_in_debugger_frame(DevTools::TabDescription const&, u64 frame_id, String const&, OnDebuggerEvaluationComplete) const override;
-    virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, OnDebuggerObjectPropertiesReceived) const override;
+    virtual void retrieve_debugger_object_properties(DevTools::TabDescription const&, u64 object_id, DebuggerObjectScope, OnDebuggerObjectPropertiesReceived) const override;
     virtual void retrieve_debugger_source_positions(DevTools::TabDescription const&, Web::HTML::ScriptRegistryIdentifier, OnDebuggerSourcePositionsReceived) const override;
+    virtual void complete_console_input(DevTools::TabDescription const&, String const&, OnConsoleInputCompleted) const override;
     virtual void resolve_dom_node_url(DevTools::TabDescription const&, Optional<Web::UniqueNodeID>, String const&, OnResolvedURLReceived) const override;
     virtual void evaluate_javascript(DevTools::TabDescription const&, String const&, OnScriptEvaluationComplete) const override;
     virtual void listen_for_console_messages(DevTools::TabDescription const&, OnConsoleMessage) const override;
@@ -582,6 +595,8 @@ private:
     virtual void stop_listening_for_network_events(DevTools::TabDescription const&) const override;
     virtual void listen_for_navigation_events(DevTools::TabDescription const&, OnNavigationStarted, OnNavigationFinished) const override;
     virtual void stop_listening_for_navigation_events(DevTools::TabDescription const&) const override;
+    virtual void listen_for_inspect_element_requests(DevTools::TabDescription const&, OnInspectElementRequest) const override;
+    virtual void stop_listening_for_inspect_element_requests(DevTools::TabDescription const&) const override;
     virtual void did_connect_devtools_client(DevTools::TabDescription const&) const override;
     virtual void did_disconnect_devtools_client(DevTools::TabDescription const&) const override;
     virtual void did_close_devtools_connection() override;
@@ -593,6 +608,8 @@ private:
     OwnPtr<BrowserProcess> m_browser_process;
     bool m_should_exit_after_profile_coordination { false };
     OwnPtr<ApplicationSettingsObserver> m_settings_observer;
+    OwnPtr<ApplicationPermissionManagerObserver> m_permission_manager_observer;
+    RefPtr<Core::Timer> m_permission_expiry_timer;
 
     OwnPtr<BookmarkStore> m_bookmark_store;
     OwnPtr<ApplicationBookmarkStoreObserver> m_bookmark_store_observer;

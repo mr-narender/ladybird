@@ -75,6 +75,7 @@
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
@@ -561,7 +562,7 @@ static bool handle_navigation_response_as_download(GC::Ref<NavigationParams> nav
     if (WebDriver::BiDi::g_network_events_enabled && response->network_transport().has_value() && !network_response.is_object() && navigation_params->request) {
         RefPtr<Fetch::Infrastructure::FetchTimingInfo> timing_info = navigation_params->fetch_timing_info;
         if (navigation_params->fetch_controller)
-            timing_info = navigation_params->fetch_controller->timing_info();
+            timing_info = navigation_params->fetch_controller->full_timing_info();
         if (timing_info) {
             auto metadata = WebDriver::BiDi::network_response_for_navigation(
                 *navigation_params->request, *timing_info, *response->record());
@@ -1567,7 +1568,14 @@ ReplicatedContainerState LocalNavigable::container_state() const
 void LocalNavigable::set_root_container_state(ReplicatedContainerState state)
 {
     VERIFY(is_local_root() && parent());
+    auto used_color_scheme_changed = m_root_container_state.used_color_scheme != state.used_color_scheme;
     m_root_container_state = move(state);
+
+    // The container's used color scheme decides whether the canvas is opaque.
+    if (used_color_scheme_changed && m_active_document) {
+        m_needs_to_record_display_list = true;
+        m_active_document->set_needs_repaint(Badge<HTML::LocalNavigable> {}, InvalidateDisplayList::No);
+    }
 }
 
 void LocalNavigable::set_closing(bool value)
@@ -2284,7 +2292,7 @@ static void perform_navigation_params_fetch(JS::Realm& realm, GC::Ref<Navigation
     }
 
     // 3. If the result of should navigation request of type be blocked by Content Security Policy? given request and cspNavigationType is "Blocked", then set response to a network error and break. [CSP]
-    if (ContentSecurityPolicy::should_navigation_request_of_type_be_blocked_by_content_security_policy(state_holder->request, state_holder->csp_navigation_type) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
+    if (ContentSecurityPolicy::should_navigation_request_of_type_be_blocked_by_content_security_policy(state_holder->request, state_holder->csp_navigation_type, state_holder->navigable->page()) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
         state_holder->response = Fetch::Infrastructure::ResponseView::network_error("Blocked by Content Security Policy"_string);
         fetch_completion_steps->function()();
         return;
@@ -2536,8 +2544,12 @@ static void create_navigation_params_by_fetching(
     //    traversable for user prompts: navigable's top-level traversable
     auto request = Fetch::Infrastructure::Request::create();
     request->set_url(entry.url);
-    if (source_snapshot_params->fetch_client.has_value())
-        request->set_client(Fetch::Fetching::request_client(*source_snapshot_params->fetch_client));
+    if (source_snapshot_params->fetch_client.has_value()) {
+        auto const& fetch_client = *source_snapshot_params->fetch_client;
+        request->set_client(Fetch::Fetching::request_client(fetch_client));
+        if (fetch_client.has<NonnullRefPtr<RemoteEnvironmentSettings const>>() && navigation_id.has_value())
+            request->set_remote_client_navigation(RemoteClientNavigation { navigable->id(), *navigation_id });
+    }
     request->set_destination(Fetch::Infrastructure::Request::Destination::Document);
     request->set_credentials_mode(Fetch::Infrastructure::Request::CredentialsMode::Include);
     request->set_use_url_credentials(true);
@@ -4118,6 +4130,7 @@ GC::Ptr<DOM::Document> LocalNavigable::evaluate_javascript_url(URL::URL const& u
     //     obtains for it is the active document's: the origins are the same, or share the site that keys the agent
     //     cluster, since an origin-keyed window cannot set document.domain.
     navigation_params->agent_cluster_id = active_document()->relevant_settings_object().agent_cluster_id();
+    navigation_params->agent_cluster_is_origin_keyed = as<WindowEnvironmentSettingsObject>(active_document()->relevant_settings_object()).agent_cluster_is_origin_keyed();
     navigation_params->agent_cluster_cross_origin_isolation_mode = active_document()->relevant_settings_object().agent_cluster_cross_origin_isolation_mode();
 
     // 17. Return the result of loading an HTML document given navigationParams.
@@ -4158,7 +4171,7 @@ void LocalNavigable::navigate_to_a_javascript_url(NonnullRefPtr<Fetch::Infrastru
     // 5. If the result of should navigation request of type be blocked by Content Security Policy? given request and cspNavigationType is "Blocked", then return.
     // NB: This can change request's URL, as the require-trusted-types-for pre-navigation check passes the script source
     //     through the default policy.
-    if (ContentSecurityPolicy::should_navigation_request_of_type_be_blocked_by_content_security_policy(request, csp_navigation_type) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
+    if (ContentSecurityPolicy::should_navigation_request_of_type_be_blocked_by_content_security_policy(request, csp_navigation_type, page()) == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
         finish_loading_without_navigation();
         return;
     }
@@ -6831,7 +6844,9 @@ bool LocalNavigable::commit_frame(PaintConfig paint_config)
 
     // Hit testing can publish a display list before the next frame. Give both paths the same canvas fill so that
     // switching between them does not force another recording. Screenshots can supply their own fill rectangle.
-    if (is_local_root() && !paint_config.canvas_fill_rect.has_value())
+    // NB: Only the top-level traversable fills its canvas. A local root under a remote parent is an iframe in another
+    //     process, and its canvas stays transparent like that of a same-process iframe.
+    if (is_top_level_traversable() && !paint_config.canvas_fill_rect.has_value())
         paint_config.canvas_fill_rect = Gfx::IntRect { {}, page().css_to_device_rect(viewport_rect()).size().to_type<int>() };
 
     // A frame is left to the next rendering update while the compositor cannot be reached.

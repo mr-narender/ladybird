@@ -160,7 +160,13 @@ public:
     ErrorOr<void> recreate_compositor_contexts(Badge<Application>);
     // The user let the page at the URL capture audio. The process's AudioServer hears of the permission before this
     // returns, so a page told afterwards finds it in place.
-    ErrorOr<void> grant_audio_capture(URL::URL const&);
+    // A file: page's microphone grant, which has no origin to be kept for; every other site's is the PermissionManager's.
+    ErrorOr<void> grant_audio_capture_to_file(URL::URL const&);
+
+    // The sites this process asked for the permissions of, which the UI process keeps it up to date on.
+    Vector<URL::Origin> const& permission_origins() const { return m_permission_origins; }
+    // Keeps the process up to date on a site's permissions from now on.
+    void add_permission_origin(URL::Origin const&);
     // The permission follows the origins the process's open pages show, so it goes with a navigation away.
     void update_audio_capture_permission();
     // The process's AudioServer plays the page's sound while the page is authorized. It hears of an authorization
@@ -195,6 +201,7 @@ private:
     virtual void did_destroy_compositor_context(Web::CompositorContextId) override;
     virtual Messages::WebContentClient::DidRequestAllCookiesWebdriverResponse did_request_all_cookies_webdriver(URL::URL, Optional<HTTP::Cookie::PartitionContext>) override;
     virtual Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse did_request_all_cookies_cookiestore(Web::PageId page_id, Web::HTML::EnvironmentId, URL::URL) override;
+    virtual Messages::WebContentClient::DidRequestPermissionSnapshotResponse did_request_permission_snapshot(Web::PageId, URL::Origin top_level_origin) override;
     virtual Messages::WebContentClient::DidRequestNamedCookieResponse did_request_named_cookie(URL::URL, String) override;
     virtual Messages::WebContentClient::DidRequestCookieResponse did_request_cookie(Web::PageId page_id, Optional<Web::HTML::EnvironmentId>, URL::URL, HTTP::Cookie::Source) override;
     virtual void did_close_browsing_context(Web::PageId page_id) override;
@@ -261,6 +268,7 @@ private:
     void did_change_audio_playback_audibility(Audio::PlaybackGroupId, Audio::Audibility);
     static String audio_capture_permission_key(URL::URL const&);
     bool audio_capture_permitted() const;
+    bool page_may_capture_audio(WebContentPage const&) const;
     void decide_audio_capture_request(u64 request_id);
 
     // The controller connections to the MediaServer and AudioServer spawned for this process, from its first media use
@@ -272,6 +280,7 @@ private:
     // The pages the user let capture audio, and whether an open page is one of them; the AudioServer is told of the latter,
     // again whenever it relaunches, and rules on nothing itself.
     HashTable<String> m_audio_capture_grants;
+    Vector<URL::Origin> m_permission_origins;
     bool m_audio_capture_permitted { false };
     // Likewise, the AudioServer is told again of the groups it may play, and of those the user has muted.
     HashTable<Audio::PlaybackGroupId> m_authorized_audio_playback_groups;

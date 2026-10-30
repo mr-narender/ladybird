@@ -166,22 +166,6 @@ pub struct FfiSvgLengthValue {
     pub unit: u8,
 }
 
-/// The sizes a container-relative length on an element resolves against, as style answers them
-/// for that element: per axis, the committed content box of its nearest size query container, or
-/// the small viewport size. Style writes nothing while it answers: it says which containers the
-/// lengths depend on, by style node or 0 for the viewport, and whether a container has no committed
-/// box yet, so the document must evaluate its container queries after layout.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiContainerLengthBases {
-    pub width: f64,
-    pub height: f64,
-    pub width_query_container: u32,
-    pub height_query_container: u32,
-    pub width_query_container_awaits_layout: bool,
-    pub height_query_container_awaits_layout: bool,
-}
-
 pub const SVG_LENGTH_KIND_NONE: u8 = 0;
 pub const SVG_LENGTH_KIND_NUMBER: u8 = 1;
 pub const SVG_LENGTH_KIND_LENGTH: u8 = 2;
@@ -602,15 +586,22 @@ pub(super) struct SvgFormattingContext<'pass> {
     /// Whether this context's box is an <svg> viewport whose view box and size are the ones it was
     /// last committed with, so that a shape below it resolves against the viewport it did then.
     viewport_is_committed_viewport: bool,
+    /// Whether percentage block insets of the children of the run's root have a definite basis. The context of the root
+    /// sets it once the root is definite. A nested context takes it from the context that creates it.
+    percentage_block_insets_of_run_root_children_have_definite_basis: bool,
     current_text_position: FfiFloatPoint,
 }
 
 impl<'pass> SvgFormattingContext<'pass> {
     pub(super) fn new(run: &FormattingContextRun<'pass>) -> Self {
-        Self::new_nested(run, run.box_)
+        Self::new_nested(run, run.box_, false)
     }
 
-    fn new_nested(run: &FormattingContextRun<'pass>, box_: Node) -> Self {
+    fn new_nested(
+        run: &FormattingContextRun<'pass>,
+        box_: Node,
+        percentage_block_insets_of_run_root_children_have_definite_basis: bool,
+    ) -> Self {
         Self {
             run: FormattingContextRun { box_, ..run.clone() },
             available_space: None,
@@ -618,6 +609,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             viewport_width: CssPixels::default(),
             viewport_height: CssPixels::default(),
             viewport_is_committed_viewport: false,
+            percentage_block_insets_of_run_root_children_have_definite_basis,
             current_text_position: FfiFloatPoint::default(),
         }
     }
@@ -1832,17 +1824,16 @@ impl<'pass> SvgFormattingContext<'pass> {
         StyleValues::for_node(&self.run.callbacks, node)
     }
 
-    #[track_caller]
-    fn used_values(&self, node: Node) -> &'pass UsedValues {
-        self.run.records.used_values(node)
-    }
-
-    /// A record for `node`, a box this context lays out in it.
-    fn create_used_values(&self, node: Node) -> UsedValues {
+    /// Cells for `node`, a box this context lays out in them.
+    fn cells_of_svg_box(&self, node: Node) -> Cell<used_values::RootInputCells> {
         // SVG descendants deliberately carry no percentage basis.
         // SVG layout resolves percentages against the SVG viewport, not a CSS containing
         // block, so boxes inside the SVG subtree carry no percentage basis.
-        used_values::create_used_values(&self.run.callbacks, node, ContainingBlockConstraints::default())
+        Cell::new(used_values::cells_before_sizing(
+            &self.run.callbacks,
+            node,
+            ContainingBlockConstraints::default(),
+        ))
     }
 
     fn set_svg_viewport_transform(&self, node: Node, transform: FfiAffineTransform) {
@@ -1876,14 +1867,19 @@ impl<'pass> SvgFormattingContext<'pass> {
         });
     }
 
-    /// Places `node`, a box this context lays out in `record`, whose metrics are final once the box is placed, and
+    /// Places `node`, a box this context lays out in `cells`, whose metrics are final once the box is placed, and
     /// returns what the parent of the box reads of it.
-    fn place_child(&self, node: Node, record: &UsedValues, x: CssPixels, y: CssPixels) -> LaidOutSvgElement {
-        let placed_child = formatting_context::PlacedChild::of_record(record, &self.run);
+    fn place_child(
+        &self,
+        node: Node,
+        cells: &Cell<used_values::RootInputCells>,
+        x: CssPixels,
+        y: CssPixels,
+    ) -> LaidOutSvgElement {
+        let placed_child = formatting_context::PlacedChild::laid_out_here(cells.get(), None, &self.run);
         self.place_laid_out_child(node, placed_child, x, y, None);
-        record.seal_own_metrics();
         LaidOutSvgElement {
-            cells: used_values::RootInputCells::capture(record),
+            cells: cells.get(),
             content_offset: FfiCssPixelPoint { x, y },
         }
     }
@@ -1906,16 +1902,21 @@ impl<'pass> SvgFormattingContext<'pass> {
         );
     }
 
-    /// Gives the box laid out in `used` a content size that is definite in both axes.
-    fn set_definite_content_size(used: &UsedValues, width: CssPixels, height: CssPixels) {
-        used.set_content_inline_size(width);
-        used.set_content_block_size(height);
-        used.has_definite_block_size.set(true);
+    /// Gives the box laid out in `cells` a content size that is definite in both axes.
+    fn set_definite_content_size(cells: &Cell<used_values::RootInputCells>, width: CssPixels, height: CssPixels) {
+        cells.set_content_inline_size(width);
+        cells.set_content_block_size(height);
+        cells.update_cells(|cells| cells.has_definite_block_size = true);
     }
 
-    fn set_content_rect(&self, node: Node, used: &UsedValues, rect: SvgCssPixelRect) -> LaidOutSvgElement {
-        Self::set_definite_content_size(used, rect.width, rect.height);
-        self.place_child(node, used, rect.x, rect.y)
+    fn set_content_rect(
+        &self,
+        node: Node,
+        cells: &Cell<used_values::RootInputCells>,
+        rect: SvgCssPixelRect,
+    ) -> LaidOutSvgElement {
+        Self::set_definite_content_size(cells, rect.width, rect.height);
+        self.place_child(node, cells, rect.x, rect.y)
     }
 
     fn first_child_of_kind(&self, node: Node, kind: NodeKind) -> Option<Node> {
@@ -1925,13 +1926,26 @@ impl<'pass> SvgFormattingContext<'pass> {
             .find(|&child| self.node_kind(child) == kind)
     }
 
-    pub(super) fn run(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput) {
-        let used = self.used_values(self.run.box_);
-        self.lay_out_contents(run, input, used);
+    /// Lays out the run's root from `root_cells`, which hold it in the frame it lays its contents out in, and returns
+    /// the root's cells after the layout.
+    pub(super) fn run(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        input: LayoutInput,
+        root_cells: used_values::RootInputCells,
+    ) -> used_values::RootInputCells {
+        let root = Cell::new(root_cells);
+        self.lay_out_contents(run, input, &root);
+        root.get()
     }
 
-    /// Lays out the contents of this context's box, which is laid out in `used`.
-    fn lay_out_contents(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput, used: &UsedValues) {
+    /// Lays out the contents of this context's box, which is laid out in `cells`.
+    fn lay_out_contents(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        input: LayoutInput,
+        cells: &Cell<used_values::RootInputCells>,
+    ) {
         // NOTE: SVG doesn't have a "formatting context" in the spec, but this is the most
         //       obvious way to drive SVG layout in our engine at the moment.
         let kind = self.node_kind(self.run.box_);
@@ -1948,18 +1962,24 @@ impl<'pass> SvgFormattingContext<'pass> {
             // NOTE: If a height had not been provided by the svg element, it was set to the height of the container
             let style = self.style(self.run.box_);
             if style.width().is_length() {
-                used.set_content_inline_size(style.width().to_px(CssPixels::default()));
+                cells.set_content_inline_size(style.width().to_px(CssPixels::default()));
             }
             if style.height().is_length() {
-                used.set_content_block_size(style.height().to_px(CssPixels::default()));
+                cells.set_content_block_size(style.height().to_px(CssPixels::default()));
             }
             // FIXME: In SVG 2, length can also be a percentage. We'll need to support that.
         }
 
         // NOTE: We consider all SVG root elements to have definite size in both axes.
         //       I'm not sure if this is good or bad, but our viewport transform logic depends on it.
-        used.has_definite_inline_size.set(true);
-        used.has_definite_block_size.set(true);
+        cells.update_cells(|cells| {
+            cells.has_definite_inline_size = true;
+            cells.has_definite_block_size = true;
+        });
+        if self.run.box_ == run.box_ {
+            self.percentage_block_insets_of_run_root_children_have_definite_basis =
+                run.percentage_block_insets_of_root_children_have_definite_basis(cells);
+        }
 
         // An embedded SVG viewport's outer size does not depend on its descendants. Measuring it
         // only needs the root sizing above; shapes, text, and foreignObject content wait for layout.
@@ -1971,8 +1991,8 @@ impl<'pass> SvgFormattingContext<'pass> {
             self.set_svg_viewport_size(
                 self.run.box_,
                 FfiCssPixelSize {
-                    width: used.content_inline_size.get(),
-                    height: used.content_block_size.get(),
+                    width: cells.content_inline_size(),
+                    height: cells.content_block_size(),
                 },
             );
         }
@@ -2010,16 +2030,16 @@ impl<'pass> SvgFormattingContext<'pass> {
                     attributes.preserve_aspect_ratio_align,
                     attributes.preserve_aspect_ratio_meet_or_slice,
                     view_box,
-                    (used.content_inline_size.get(), used.content_block_size.get()),
+                    (cells.content_inline_size(), cells.content_block_size()),
                 )
             });
             self.set_svg_viewport_transform(self.run.box_, viewport_transform);
         }
 
-        self.viewport_width = active_view_box.map_or(used.content_inline_size.get(), |view_box| {
+        self.viewport_width = active_view_box.map_or(cells.content_inline_size(), |view_box| {
             CssPixels::nearest_value_for(view_box.width)
         });
-        self.viewport_height = active_view_box.map_or(used.content_block_size.get(), |view_box| {
+        self.viewport_height = active_view_box.map_or(cells.content_block_size(), |view_box| {
             CssPixels::nearest_value_for(view_box.height)
         });
         self.viewport_is_committed_viewport = kind == NodeKind::SVGSVGBox
@@ -2033,8 +2053,8 @@ impl<'pass> SvgFormattingContext<'pass> {
                         committed.view_box == attributes.has_active_view_box.then_some(attributes.active_view_box)
                             && committed.viewport_size
                                 == Some(FfiCssPixelSize {
-                                    width: used.content_inline_size.get(),
-                                    height: used.content_block_size.get(),
+                                    width: cells.content_inline_size(),
+                                    height: cells.content_block_size(),
                                 })
                     })
                 },
@@ -2057,7 +2077,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         if self.svg_attributes(child).is_fit_to_view_box {
             return Some(self.layout_nested_viewport(run, child));
         } else if kind == NodeKind::SVGForeignObjectBox {
-            // SVG descendants carry no percentage basis, as `create_used_values` explains.
+            // SVG descendants carry no percentage basis, as `cells_of_svg_box` explains.
             let mut child_cells =
                 used_values::cells_before_sizing(&self.run.callbacks, child, ContainingBlockConstraints::default());
             let style = self.style(child);
@@ -2088,9 +2108,8 @@ impl<'pass> SvgFormattingContext<'pass> {
                 child,
                 child_input,
                 child_cells,
-                None,
                 true,
-                run.percentage_block_insets_of_root_children_have_definite_basis(),
+                self.percentage_block_insets_of_run_root_children_have_definite_basis,
             );
             outcome.report_percentage_block_size_dependency_of(run, child);
             assert!(
@@ -2124,7 +2143,7 @@ impl<'pass> SvgFormattingContext<'pass> {
     fn layout_nested_viewport(&mut self, run: &FormattingContextRun<'pass>, viewport: Node) -> LaidOutSvgElement {
         // Layout for a nested SVG viewport.
         // https://svgwg.org/svg2-draft/coords.html#EstablishingANewSVGViewport.
-        let used = self.create_used_values(viewport);
+        let viewport_cells = self.cells_of_svg_box(viewport);
         let style = self.style(viewport);
         let nested_viewport_x = style.x().to_px(self.viewport_width);
         let nested_viewport_y = style.y().to_px(self.viewport_height);
@@ -2141,10 +2160,14 @@ impl<'pass> SvgFormattingContext<'pass> {
             style.height().to_px(self.viewport_height)
         };
 
-        Self::set_definite_content_size(&used, nested_viewport_width, nested_viewport_height);
+        Self::set_definite_content_size(&viewport_cells, nested_viewport_width, nested_viewport_height);
 
-        let mut nested_context = Self::new_nested(run, viewport);
-        nested_context.lay_out_contents(run, self.nested_layout_input(), &used);
+        let mut nested_context = Self::new_nested(
+            run,
+            viewport,
+            self.percentage_block_insets_of_run_root_children_have_definite_basis,
+        );
+        nested_context.lay_out_contents(run, self.nested_layout_input(), &viewport_cells);
         self.set_svg_viewport_size(
             viewport,
             FfiCssPixelSize {
@@ -2152,13 +2175,13 @@ impl<'pass> SvgFormattingContext<'pass> {
                 height: nested_viewport_height,
             },
         );
-        self.place_child(viewport, &used, nested_viewport_x, nested_viewport_y)
+        self.place_child(viewport, &viewport_cells, nested_viewport_x, nested_viewport_y)
     }
 
     fn layout_graphics_element(&mut self, run: &FormattingContextRun<'pass>, graphics_box: Node) -> LaidOutSvgElement {
-        let used = self.create_used_values(graphics_box);
+        let graphics_box_cells = self.cells_of_svg_box(graphics_box);
         let facts = self.svg_facts(graphics_box);
-        if let Some(laid_out) = self.place_unchanged_committed_shape(graphics_box, &used, facts) {
+        if let Some(laid_out) = self.place_unchanged_committed_shape(graphics_box, &graphics_box_cells, facts) {
             return laid_out;
         }
         self.commit_svg_element_facts(graphics_box, facts, self.svg_attributes(graphics_box));
@@ -2172,12 +2195,12 @@ impl<'pass> SvgFormattingContext<'pass> {
             // https://svgwg.org/svg2-draft/struct.html#Groups
             // 5.2. Grouping: the ‘g’ element
             // The ‘g’ element is a container element for grouping together related graphics elements.
-            self.layout_container_element(run, graphics_box, &used)
+            self.layout_container_element(run, graphics_box, &graphics_box_cells)
         } else if kind == NodeKind::SVGImageBox {
-            self.layout_image_element(graphics_box, &used)
+            self.layout_image_element(graphics_box, &graphics_box_cells)
         } else {
             // Assume this is a path-like element.
-            self.layout_path_like_element(run, graphics_box, &used, facts)
+            self.layout_path_like_element(run, graphics_box, &graphics_box_cells, facts)
         };
 
         if let Some(mask) = self.first_child_of_kind(graphics_box, NodeKind::SVGMaskBox) {
@@ -2197,11 +2220,11 @@ impl<'pass> SvgFormattingContext<'pass> {
     /// Places a shape with the fragment it last committed, where laying it out again would produce that fragment: the
     /// shape has no boxes below it, nothing marked it for layout since that commit, and it resolves against the viewport
     /// it was committed in. Then neither this pass nor the commit redoes a shape that a change to a sibling did not
-    /// touch. Returns what the parent of the shape reads of it, if it placed the shape, which is laid out in `used`.
+    /// touch. Returns what the parent of the shape reads of it, if it placed the shape, which is laid out in `cells`.
     fn place_unchanged_committed_shape(
         &self,
         shape: Node,
-        used: &UsedValues,
+        cells: &Cell<used_values::RootInputCells>,
         facts: SvgElementFacts,
     ) -> Option<LaidOutSvgElement> {
         if !self.viewport_is_committed_viewport
@@ -2242,11 +2265,13 @@ impl<'pass> SvgFormattingContext<'pass> {
         {
             return None;
         }
-        used.set_box_metrics_from_fragment(&fragment);
-        used.has_definite_block_size.set(true);
+        cells.update_cells(|cells| {
+            cells.take_box_metrics_of_fragment(&fragment);
+            cells.has_definite_block_size = true;
+        });
         self.place_laid_out_child(
             shape,
-            formatting_context::PlacedChild::of_record(used, &self.run),
+            formatting_context::PlacedChild::laid_out_here(cells.get(), None, &self.run),
             committed_offset.x,
             committed_offset.y,
             Some(fragment_tree::ChildFragmentArrival::CommittedFragment {
@@ -2254,9 +2279,8 @@ impl<'pass> SvgFormattingContext<'pass> {
                 reuses_subtree: false,
             }),
         );
-        used.seal_own_metrics();
         Some(LaidOutSvgElement {
-            cells: used_values::RootInputCells::capture(used),
+            cells: cells.get(),
             content_offset: committed_offset,
         })
     }
@@ -2265,7 +2289,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         &mut self,
         run: &FormattingContextRun<'pass>,
         graphics_box: Node,
-        used: &UsedValues,
+        cells: &Cell<used_values::RootInputCells>,
         facts: SvgElementFacts,
     ) -> LaidOutSvgElement {
         // A shape's geometry is its own attributes and computed style against the viewport, and
@@ -2323,7 +2347,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             payloads.computed_svg_path = Some(std::sync::Arc::new(path));
             payloads.svg_text_character_cells = character_cells.map(std::sync::Arc::new);
         });
-        self.set_content_rect(graphics_box, used, bounding_box)
+        self.set_content_rect(graphics_box, cells, bounding_box)
     }
 
     // https://w3c.github.io/svgwg/svg2-draft/embedded.html#Placement
@@ -2370,8 +2394,8 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
-    fn layout_image_element(&self, image_box: Node, used: &UsedValues) -> LaidOutSvgElement {
-        self.set_content_rect(image_box, used, self.svg_image_bounding_box(image_box))
+    fn layout_image_element(&self, image_box: Node, cells: &Cell<used_values::RootInputCells>) -> LaidOutSvgElement {
+        self.set_content_rect(image_box, cells, self.svg_image_bounding_box(image_box))
     }
 
     /// Lays out `resource`, a mask, clip or pattern of a box whose sizes and box sides are `parent_metrics`.
@@ -2386,7 +2410,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         let attributes = self.svg_attributes(resource);
         assert!(node_facts::kind_is_svg_resource_box(kind));
         // FIXME: Somehow limit <clipPath> contents to: shape elements, <text>, and <use>.
-        let used = self.create_used_values(resource);
+        let resource_cells = self.cells_of_svg_box(resource);
         self.commit_svg_element_facts(resource, facts, attributes);
 
         let (width, height) = if kind == NodeKind::SVGPatternBox && attributes.has_active_view_box {
@@ -2425,19 +2449,23 @@ impl<'pass> SvgFormattingContext<'pass> {
         } else {
             (self.viewport_width, self.viewport_height)
         };
-        Self::set_definite_content_size(&used, width, height);
+        Self::set_definite_content_size(&resource_cells, width, height);
         // Resource content lays out in its own user space; objectBoundingBox content scaling is a
         // paint-time transform in the resource's nested visual context tree.
-        let mut nested_context = Self::new_nested(run, resource);
-        nested_context.lay_out_contents(run, self.nested_layout_input(), &used);
-        self.place_child(resource, &used, CssPixels::default(), CssPixels::default());
+        let mut nested_context = Self::new_nested(
+            run,
+            resource,
+            self.percentage_block_insets_of_run_root_children_have_definite_basis,
+        );
+        nested_context.lay_out_contents(run, self.nested_layout_input(), &resource_cells);
+        self.place_child(resource, &resource_cells, CssPixels::default(), CssPixels::default());
     }
 
     fn layout_container_element(
         &mut self,
         run: &FormattingContextRun<'pass>,
         container: Node,
-        used: &UsedValues,
+        cells: &Cell<used_values::RootInputCells>,
     ) -> LaidOutSvgElement {
         let mut has_points = false;
         let mut min_x = CssPixels::default();
@@ -2483,7 +2511,7 @@ impl<'pass> SvgFormattingContext<'pass> {
 
         self.set_content_rect(
             container,
-            used,
+            cells,
             SvgCssPixelRect {
                 x: min_x,
                 y: min_y,
@@ -2517,24 +2545,21 @@ fn length_resolution_context(
     let root_style = document_element_style(callbacks, node).unwrap_or(style);
     let viewport_width = callbacks.initial_containing_block_inline_size.to_double();
     let viewport_height = callbacks.initial_containing_block_block_size.to_double();
-    // A container unit resolves against the nearest size query container on its axis, or the small viewport size
-    // without one. Finding that container is style's business, so it is asked only for a length that needs it. A pass
-    // that cannot ask resolves it to zero, and leaves the node for the host to lay out again.
-    let container_bases = if crate::css::style_compute::length_unit_is_container_relative(unit) {
+    // A container unit resolves against the committed content box of the nearest size query container on its axis, or
+    // the viewport without one. Finding that container is style's business, so it is asked only for a length that
+    // needs it, and the host hears which containers the lengths depend on once the layout is committed.
+    let container_bases = crate::css::style_compute::length_unit_is_container_relative(unit).then(|| {
         let element = callbacks
             .arena()
             .dom_node_style_node(node)
             .expect("an SVG element's attribute length is resolved for the element's own box");
-        let bases = callbacks.container_length_bases.bases(element);
-        callbacks.scratch().note_host_findings(|findings| match &bases {
-            Some(bases) => findings.note_container_length_dependencies(element, bases),
-            None => findings.note_unresolved_container_lengths(node),
-        });
+        let bases = callbacks
+            .arena()
+            .with_style_store(|engine| engine.container_unit_bases(element, false));
+        callbacks.note_host_findings(|findings| findings.note_container_length_dependencies(element, &bases));
         bases
-    } else {
-        None
-    };
-    crate::css::style_compute::FfiLengthResolutionContext {
+    });
+    let mut context = crate::css::style_compute::FfiLengthResolutionContext {
         viewport_width,
         viewport_height,
         font_metrics: font_metrics_for_length_resolution(style),
@@ -2542,16 +2567,20 @@ fn length_resolution_context(
         // Only the out-flag below consumes these, and this resolution reports no dependency.
         font_metrics_depend_on_viewport_metrics: false,
         root_font_metrics_depend_on_viewport_metrics: false,
-        has_container_width_basis: container_bases.is_some(),
-        has_container_height_basis: container_bases.is_some(),
-        container_width_basis: container_bases.map_or(0.0, |bases| bases.width),
-        container_height_basis: container_bases.map_or(0.0, |bases| bases.height),
+        has_container_width_basis: false,
+        has_container_height_basis: false,
+        container_width_basis: 0.0,
+        container_height_basis: 0.0,
         container_width_basis_depends_on_viewport_metrics: false,
         container_height_basis_depends_on_viewport_metrics: false,
         subject_inline_axis_is_horizontal: style.writing_mode() == writing_mode::HORIZONTAL_TB,
         resolved_viewport_relative_length: std::ptr::null_mut(),
         zoom: 1.0,
+    };
+    if let Some(bases) = container_bases {
+        bases.apply_to(&mut context);
     }
+    context
 }
 
 /// The style of the document element, which a root-relative length resolves against.

@@ -5,6 +5,8 @@
  */
 
 use super::*;
+use crate::css::style::layout_style::LayoutStyle;
+use crate::css::style::position_try::PositionOptionStyle;
 use crate::css::style::tree::StyleNodeID;
 use crate::painting::paint_read::{GeometryRead, PaintRead};
 
@@ -130,8 +132,43 @@ impl ContainingBlockGeometry {
     }
 }
 
+/// An absolutely positioned box this engine sizes: its cells, held in `frame`, the used insets the engine resolves for
+/// it, and the anchor-size() resolutions its style reads.
+#[derive(Clone, Copy)]
+pub(crate) struct OutOfFlowBox<'a> {
+    pub(crate) node: Node,
+    pub(crate) cells: &'a Cell<used_values::RootInputCells>,
+    pub(crate) frame: geometry::Frame,
+    used_insets: &'a Cell<run_state::UsedInsets>,
+    anchor_resolved_values: Option<&'a style_values::AnchorResolvedValues>,
+}
+
+impl<'a> OutOfFlowBox<'a> {
+    pub(crate) fn new(
+        sized: sizing_context::SizedCells<'a>,
+        used_insets: &'a Cell<run_state::UsedInsets>,
+        anchor_resolved_values: Option<&'a style_values::AnchorResolvedValues>,
+    ) -> Self {
+        Self {
+            node: sized.node,
+            cells: sized.cells,
+            frame: sized.frame,
+            used_insets,
+            anchor_resolved_values,
+        }
+    }
+
+    fn sized_cells(&self) -> sizing_context::SizedCells<'a> {
+        sizing_context::SizedCells::new(self.node, self.cells, self.frame)
+    }
+
+    fn sized_box(&self) -> sizing_context::SizedBox<'a> {
+        sizing_context::SizedBox::of_own_metrics(self.node, self.cells, self.frame)
+    }
+}
+
 pub(crate) struct AbsposEngine<'pass> {
-    records: &'pass RunRecords<'pass>,
+    state: &'pass RunState,
     callbacks: LayoutPass<'pass>,
     fragments: Option<std::rc::Rc<fragment_tree::RunFragmentBuilder>>,
 }
@@ -139,7 +176,7 @@ pub(crate) struct AbsposEngine<'pass> {
 impl<'pass> AbsposEngine<'pass> {
     pub(crate) fn for_run(run: &FormattingContextRun<'pass>) -> Self {
         Self {
-            records: run.records,
+            state: run.state,
             callbacks: run.callbacks,
             fragments: run.fragments.clone(),
         }
@@ -194,7 +231,7 @@ impl<'pass> AbsposEngine<'pass> {
             }
             let placement = self.placement_of(space_box).unwrap_or_else(|| {
                 panic!(
-                    "an entry's space chain crossed an unplaced or foreign record before meeting its containing block's chain (slot {})",
+                    "an entry's space chain crossed a box the run did not place before meeting its containing block's chain (slot {})",
                     space_box.slot_index()
                 )
             });
@@ -212,7 +249,7 @@ impl<'pass> AbsposEngine<'pass> {
             return FfiCssPixelPoint::default();
         }
         let mut merge_point = from_space;
-        while merge_point != to_space && !self.callbacks.is_ancestor(merge_point, to_space, self.records.root()) {
+        while merge_point != to_space && !self.callbacks.is_ancestor(merge_point, to_space, self.state.root()) {
             merge_point = self.placement_containing_block(merge_point);
             assert!(!merge_point.is_invalid());
         }
@@ -245,7 +282,7 @@ impl<'pass> AbsposEngine<'pass> {
     }
 
     /// Where the run placed `node`, if it placed the box.
-    fn placement_of(&self, node: Node) -> Option<run_records::BoxPlacement> {
+    fn placement_of(&self, node: Node) -> Option<run_state::BoxPlacement> {
         self.placed_box_fragments().placement_of(node)
     }
 
@@ -256,7 +293,7 @@ impl<'pass> AbsposEngine<'pass> {
 
     #[inline]
     fn sizing(&self) -> sizing_context::SizingContext<'pass, 'static> {
-        sizing_context::SizingContext::new(self.records, self.callbacks)
+        sizing_context::SizingContext::new(self.state, self.callbacks)
     }
 
     #[inline]
@@ -264,19 +301,12 @@ impl<'pass> AbsposEngine<'pass> {
         StyleValues::for_node(&self.callbacks, node)
     }
 
-    /// The style of `sized`, an absolutely positioned box this engine sizes, with the anchor-size() resolutions its
-    /// record holds.
-    fn style_of<'sized>(&self, sized: sizing_context::SizedRecord<'sized>) -> StyleValues<'sized>
+    /// The style of `sized`, an absolutely positioned box this engine sizes, with its anchor-size() resolutions.
+    fn style_of<'sized>(&self, sized: OutOfFlowBox<'sized>) -> StyleValues<'sized>
     where
         'pass: 'sized,
     {
-        let anchor_resolved_values = sized
-            .record
-            .record()
-            .anchor_resolved_values
-            .get()
-            .map(|resolved| &**resolved);
-        StyleValues::for_node(&self.callbacks, sized.node).with_anchor_resolved_values(anchor_resolved_values)
+        StyleValues::for_node(&self.callbacks, sized.node).with_anchor_resolved_values(sized.anchor_resolved_values)
     }
 
     #[inline]
@@ -514,7 +544,7 @@ impl AbsposEngine<'_> {
             if self.facts(ancestor).is_scroll_container() {
                 return ancestor;
             }
-            if ancestor == self.records.root() {
+            if ancestor == self.state.root() {
                 break;
             }
             ancestor = self.placement_containing_block(ancestor);
@@ -965,26 +995,6 @@ impl AbsposEngine<'_> {
         if aligns_block {
             zero_if_auto(style.margin_top(), &mut resolved.margin_top);
             zero_if_auto(style.margin_bottom(), &mut resolved.margin_bottom);
-        }
-    }
-
-    /// Makes the resolved anchor sizes of `inputs` visible to the style reads of `node` in this run's records.
-    fn install_resolved_anchor_sizes(
-        &self,
-        sized: sizing_context::SizedRecord<'_>,
-        inputs: &abspos_inputs::AbsposLayoutInputs,
-    ) {
-        if inputs.resolved_anchor_sizes.is_empty() {
-            return;
-        }
-        let used = sized.record.record();
-        if used.anchor_resolved_values.get().is_none() {
-            let _ = used
-                .anchor_resolved_values
-                .set(Box::new(style_values::AnchorResolvedValues::new(
-                    &inputs.resolved_anchor_sizes,
-                    self.callbacks.frame,
-                )));
         }
     }
 
@@ -1827,10 +1837,10 @@ impl AbsposEngine<'_> {
 
     fn static_offset(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         rect: abspos_inputs::StaticPositionRect,
     ) -> geometry::LogicalOffset {
-        let metrics = sized.record;
+        let metrics = sized.cells;
         let collapsed = metrics.uses_collapsing_borders_model();
         aligned_static_offset(
             rect,
@@ -1845,7 +1855,7 @@ impl AbsposEngine<'_> {
     #[expect(clippy::too_many_arguments)]
     fn calculate_inner_size(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         axis: SizingAxis,
         size: &ComputedSize,
         available_space: AvailableSpace,
@@ -1937,7 +1947,7 @@ impl AbsposEngine<'_> {
     #[expect(clippy::too_many_arguments)]
     fn solve_non_replaced_inline_once(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         containing_block_inline_size: CssPixels,
         _available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
@@ -1947,7 +1957,7 @@ impl AbsposEngine<'_> {
         auto_margin_overflow: AutoMarginOverflow,
     ) -> (AutoPx, CssPixels, CssPixels, AutoPx, AutoPx) {
         let style = self.style_of(sized).with_resolved_insets(resolved_anchor_insets);
-        let used = sized.record;
+        let used = sized.cells;
         let border_left = style.border_left_width();
         let border_right = style.border_right_width();
         let padding_left = used.padding_left();
@@ -2015,7 +2025,7 @@ impl AbsposEngine<'_> {
             }
             let content_inline_size = shrink_to_fit(left, margin_left, margin_right, right);
             inline_size = Some(content_inline_size);
-            sized.record.set_content_inline_size(content_inline_size);
+            sized.cells.set_content_inline_size(content_inline_size);
             left = self.static_offset(sized, static_position_rect).inline_offset;
             right = solve_for_right(left, inline_size, margin_left, margin_right);
         }
@@ -2086,7 +2096,7 @@ impl AbsposEngine<'_> {
 
     fn compute_inline_size_for_non_replaced(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         static_position_rect: abspos_inputs::StaticPositionRect,
@@ -2218,10 +2228,10 @@ impl AbsposEngine<'_> {
             }
         }
 
-        let used = sized.record;
+        let used = sized.cells;
         used.set_content_inline_size(auto_px_value(used_inline_size));
         Self::set_used_inline_insets(sized, left, right);
-        used.update(|cells| {
+        used.update_cells(|cells| {
             cells.margin_left = auto_px_value(margin_left);
             cells.margin_right = auto_px_value(margin_right);
         });
@@ -2229,7 +2239,7 @@ impl AbsposEngine<'_> {
 
     fn compute_inline_size_for_replaced(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         static_position_rect: abspos_inputs::StaticPositionRect,
@@ -2254,7 +2264,7 @@ impl AbsposEngine<'_> {
         };
         let containing_block_inline_size = available_space.inline_size.to_px_or_zero();
         let style = self.style_of(sized).with_resolved_insets(resolved_anchor_insets);
-        let used = sized.record;
+        let used = sized.cells;
         let available = containing_block_inline_size
             - inline_size
             - style.border_left_width()
@@ -2271,27 +2281,27 @@ impl AbsposEngine<'_> {
             ReplacedAxisBehavior { auto_margin_overflow },
         );
 
-        let used = sized.record;
+        let used = sized.cells;
         Self::set_used_inline_insets(sized, solution.start, solution.end);
-        used.update(|cells| {
+        used.update_cells(|cells| {
             cells.margin_left = solution.margin_start;
             cells.margin_right = solution.margin_end;
         });
         used.set_content_inline_size(inline_size);
     }
 
-    fn set_used_inline_insets(sized: sizing_context::SizedRecord<'_>, left: CssPixels, right: CssPixels) {
-        let insets = &sized.record.record().used_insets;
-        insets.set(run_records::UsedInsets {
+    fn set_used_inline_insets(sized: OutOfFlowBox<'_>, left: CssPixels, right: CssPixels) {
+        let insets = sized.used_insets;
+        insets.set(run_state::UsedInsets {
             left,
             right,
             ..insets.get()
         });
     }
 
-    fn set_used_block_insets(sized: sizing_context::SizedRecord<'_>, top: CssPixels, bottom: CssPixels) {
-        let insets = &sized.record.record().used_insets;
-        insets.set(run_records::UsedInsets {
+    fn set_used_block_insets(sized: OutOfFlowBox<'_>, top: CssPixels, bottom: CssPixels) {
+        let insets = sized.used_insets;
+        insets.set(run_state::UsedInsets {
             top,
             bottom,
             ..insets.get()
@@ -2300,7 +2310,7 @@ impl AbsposEngine<'_> {
 
     fn compute_inline_size(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         static_position_rect: abspos_inputs::StaticPositionRect,
@@ -2351,7 +2361,7 @@ enum BlockSizePass {
 impl AbsposEngine<'_> {
     fn apply_min_max_block_size_constraints(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         static_position_rect: abspos_inputs::StaticPositionRect,
@@ -2388,7 +2398,7 @@ impl AbsposEngine<'_> {
 
     fn automatic_block_size(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         pass: BlockSizePass,
@@ -2404,9 +2414,9 @@ impl AbsposEngine<'_> {
             // NB: That makes the automatic block size the shrink-to-fit size of the box's own inline axis, within the
             //     inset-modified containing block, as it is in the inline axis of a box in the frame's writing mode.
             if let BlockSizePass::AfterInsideLayout { .. } = pass {
-                return Some(sized.record.content_block_size());
+                return Some(sized.cells.content_block_size());
             }
-            let inline_size = sized.record.content_inline_size();
+            let inline_size = sized.cells.content_inline_size();
             let preferred = sizing.calculate_max_content_block_size(sized.sized_box(), inline_size, constraints);
             let size = if preferred <= stretch_fit_block_size {
                 preferred
@@ -2430,14 +2440,14 @@ impl AbsposEngine<'_> {
                 BlockSizePass::AfterInsideLayout { .. } => Some(CssPixels::default()),
             };
         }
-        let inner = sized.record.available_inner_space_or_constraints_from(available_space);
+        let inner = sized.cells.available_inner_space_or_constraints_from(available_space);
         Some(sizing.calculate_fit_content_size(sized.sized_box(), SizingAxis::Block, inner, constraints))
     }
 
     #[expect(clippy::too_many_arguments)]
     fn solve_non_replaced_block_once(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         static_position_rect: abspos_inputs::StaticPositionRect,
@@ -2449,7 +2459,7 @@ impl AbsposEngine<'_> {
         let style = self.style_of(sized).with_resolved_insets(resolved_anchor_insets);
         let containing_block_inline_size = available_space.inline_size.to_px_or_zero();
         let containing_block_block_size = available_space.block_size.to_px_or_zero();
-        let used = sized.record;
+        let used = sized.cells;
         let padding_top = used.padding_top();
         let padding_bottom = used.padding_bottom();
         let mut solution = BlockAxisSolution {
@@ -2518,7 +2528,7 @@ impl AbsposEngine<'_> {
                 resolved_anchor_insets,
                 solution.block_size,
             );
-            sized.record.set_content_block_size(auto_px_value(constrained));
+            sized.cells.set_content_block_size(auto_px_value(constrained));
             solution.top = Some(self.static_offset(sized, static_position_rect).block_offset);
             solution.bottom = Some(solve_for(solution.bottom, false, solution));
         } else if solution.top.is_some() && solution.block_size.is_some() && solution.bottom.is_some() {
@@ -2579,7 +2589,7 @@ impl AbsposEngine<'_> {
     #[expect(clippy::too_many_arguments)]
     fn compute_block_size_for_non_replaced(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         static_position_rect: abspos_inputs::StaticPositionRect,
@@ -2590,7 +2600,7 @@ impl AbsposEngine<'_> {
         let node = sized.node;
         let style = self.style_of(sized);
         let mut intrinsic_available_space = available_space;
-        intrinsic_available_space.inline_size = AvailableSize::definite(sized.record.content_inline_size());
+        intrinsic_available_space.inline_size = AvailableSize::definite(sized.cells.content_inline_size());
         let initial = if self.facts(node).is_table_wrapper() {
             Some(self.sizing().compute_table_box_block_size_inside_wrapper(
                 sized.sized_box(),
@@ -2706,23 +2716,23 @@ impl AbsposEngine<'_> {
             );
         }
 
-        let used = sized.record;
+        let used = sized.cells;
         used.set_content_block_size(auto_px_value(solution.block_size));
         if style.height().is_auto() && pass == BlockSizePass::BeforeInsideLayout {
             // NB: A box that establishes an orthogonal flow is sized in this axis before its contents are laid out,
             //     which they are at that size.
             if solution.block_size.is_some() && self.sizing().establishes_orthogonal_flow(node) {
-                used.update(|cells| cells.has_definite_block_size = true);
+                used.update_cells(|cells| cells.has_definite_block_size = true);
             }
             return;
         }
         if !style.height().is_intrinsic_sizing_constraint() {
-            used.update(|cells| cells.has_definite_block_size = true);
+            used.update_cells(|cells| cells.has_definite_block_size = true);
         }
         Self::set_used_block_insets(sized, auto_px_value(solution.top), auto_px_value(solution.bottom));
         // NOTE: solve_non_replaced_block_once() already resolved these against the bases the C++ layout code used:
         //       the insets against the containing block's block size, but the margins against its inline size.
-        used.update(|cells| {
+        used.update_cells(|cells| {
             cells.margin_top = auto_px_value(solution.margin_top);
             cells.margin_bottom = auto_px_value(solution.margin_bottom);
         });
@@ -2731,7 +2741,7 @@ impl AbsposEngine<'_> {
     #[expect(clippy::too_many_arguments)]
     fn compute_block_size_for_replaced(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         static_position_rect: abspos_inputs::StaticPositionRect,
@@ -2768,7 +2778,7 @@ impl AbsposEngine<'_> {
             if let Some(minimum) = self.sizing().automatic_minimum_size_from_aspect_ratio(
                 sized.sized_box(),
                 SizingAxis::Block,
-                sized.record.content_inline_size(),
+                sized.cells.content_inline_size(),
                 block_size,
                 available_space,
                 constraints,
@@ -2779,7 +2789,7 @@ impl AbsposEngine<'_> {
         }
         let containing_block_block_size = available_space.block_size.to_px_or_zero();
         let style = self.style_of(sized).with_resolved_insets(resolved_anchor_insets);
-        let used = sized.record;
+        let used = sized.cells;
         let available = containing_block_block_size
             - block_size
             - style.border_top_width()
@@ -2796,7 +2806,7 @@ impl AbsposEngine<'_> {
             ReplacedAxisBehavior { auto_margin_overflow },
         );
 
-        let used = sized.record;
+        let used = sized.cells;
         used.set_content_block_size(block_size);
         if style.height().is_auto() && pass == BlockSizePass::BeforeInsideLayout {
             // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
@@ -2806,15 +2816,15 @@ impl AbsposEngine<'_> {
                 .sizing()
                 .should_treat_block_size_as_auto(sized.sized_box(), available_space, constraints)
             {
-                used.update(|cells| cells.has_definite_block_size = true);
+                used.update_cells(|cells| cells.has_definite_block_size = true);
             }
             return;
         }
         if !style.height().is_intrinsic_sizing_constraint() {
-            used.update(|cells| cells.has_definite_block_size = true);
+            used.update_cells(|cells| cells.has_definite_block_size = true);
         }
         Self::set_used_block_insets(sized, solution.start, solution.end);
-        used.update(|cells| {
+        used.update_cells(|cells| {
             cells.margin_top = solution.margin_start;
             cells.margin_bottom = solution.margin_end;
         });
@@ -2823,7 +2833,7 @@ impl AbsposEngine<'_> {
     #[expect(clippy::too_many_arguments)]
     fn compute_block_size(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         static_position_rect: abspos_inputs::StaticPositionRect,
@@ -2864,11 +2874,10 @@ impl<'pass> AbsposEngine<'pass> {
     // pass, and the definiteness overrides insets and aspect ratios provide.
     pub(crate) fn dimension_out_of_flow_root(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         inputs: abspos_inputs::AbsposLayoutInputs,
     ) {
         let node = sized.node;
-        self.install_resolved_anchor_sizes(sized, &inputs);
         let (available_space, constraints) = out_of_flow_root_space(inputs);
         let containing_block_inline_size = available_space.inline_size.to_px_or_zero();
         let resolved = inputs.resolved_anchor_insets.as_ref();
@@ -2881,7 +2890,7 @@ impl<'pass> AbsposEngine<'pass> {
             "an out-of-flow root with anchor() insets must arrive with their resolutions"
         );
         let style = self.style_of(sized).with_resolved_insets(resolved);
-        sized.record.update(|cells| {
+        sized.cells.update_cells(|cells| {
             cells.border_left = style.border_left_width();
             cells.border_right = style.border_right_width();
             cells.border_top = style.border_top_width();
@@ -2911,41 +2920,40 @@ impl<'pass> AbsposEngine<'pass> {
         );
 
         {
-            let used = sized.record;
+            let used = sized.cells;
             if !style.inset_left().is_auto() && !style.inset_right().is_auto() {
-                used.update(|cells| cells.has_definite_inline_size = true);
+                used.update_cells(|cells| cells.has_definite_inline_size = true);
             }
             if !style.inset_top().is_auto()
                 && !style.inset_bottom().is_auto()
                 && (style.height().is_auto() || !style.height().is_intrinsic_sizing_constraint())
             {
-                used.update(|cells| cells.has_definite_block_size = true);
+                used.update_cells(|cells| cells.has_definite_block_size = true);
             }
         }
         if !self.facts(node).creates_block_formatting_context() {
             let block_size_resolved_from_aspect_ratio = style.height().is_auto()
                 && self.facts(node).has_preferred_aspect_ratio()
-                && sized.record.has_definite_inline_size();
-            let used = sized.record;
-            used.update(|cells| cells.has_definite_inline_size = true);
+                && sized.cells.has_definite_inline_size();
+            let used = sized.cells;
+            used.update_cells(|cells| cells.has_definite_inline_size = true);
             if (!style.height().is_auto() && !style.height().is_intrinsic_sizing_constraint())
                 || block_size_resolved_from_aspect_ratio
             {
-                used.update(|cells| cells.has_definite_block_size = true);
+                used.update_cells(|cells| cells.has_definite_block_size = true);
             }
         }
 
         self.sizing()
-            .make_form_control_content_box_definite(sized, available_space, constraints, None);
+            .make_form_control_content_box_definite(sized.sized_cells(), available_space, constraints, None);
     }
 
     pub(crate) fn finalize_out_of_flow_root_after_inside_layout(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         inputs: abspos_inputs::AbsposLayoutInputs,
         inside_layout: Option<InsideLayoutBlockSizes>,
     ) {
-        self.install_resolved_anchor_sizes(sized, &inputs);
         let (available_space, constraints) = out_of_flow_root_space(inputs);
         let containing_block_size = geometry::LogicalSize {
             inline_size: available_space.inline_size.to_px_or_zero(),
@@ -2966,7 +2974,7 @@ impl<'pass> AbsposEngine<'pass> {
         }
 
         {
-            let used = sized.record;
+            let used = sized.cells;
             let collapsed = used.uses_collapsing_borders_model();
             // https://drafts.csswg.org/css-anchor-position-1/#position-area-alignment
             // NB: A position area aligns the box within its inset-modified containing block even when both insets
@@ -3140,7 +3148,7 @@ impl<'pass> AbsposEngine<'pass> {
     /// https://drafts.csswg.org/css-align-3/#align-abspos
     fn self_alignment(
         &self,
-        sized: sizing_context::SizedRecord<'_>,
+        sized: OutOfFlowBox<'_>,
         containing_block: Node,
         inline_axis: bool,
     ) -> Option<AbsposAlignment> {
@@ -3185,7 +3193,7 @@ impl<'pass> AbsposEngine<'pass> {
 
     /// Whether the box's self-alignment in an axis of its containing block's frame makes it take its fit-content size
     /// within its inset-modified containing block, rather than fill it.
-    fn self_alignment_sizes_to_fit_content(&self, sized: sizing_context::SizedRecord<'_>, inline_axis: bool) -> bool {
+    fn self_alignment_sizes_to_fit_content(&self, sized: OutOfFlowBox<'_>, inline_axis: bool) -> bool {
         let style = self.style_of(sized);
         let value = if inline_axis {
             style.justify_self()
@@ -3227,7 +3235,6 @@ impl<'pass> AbsposEngine<'pass> {
                 ParticipationInParentFormattingContext::AbsolutelyPositioned(inputs),
             ),
             cells,
-            None,
             false,
             // https://drafts.csswg.org/css-sizing-3/#definite
             // "Additionally, the size of the containing block of an absolutely positioned element is always definite
@@ -3318,28 +3325,25 @@ impl<'pass> AbsposEngine<'pass> {
     ) -> CssPixels {
         let child_box = child.child_box;
         let position_option = self.determine_position_fallback_styles(&child);
-        let cells = used_values::cells_before_sizing(&self.callbacks, child_box, ContainingBlockConstraints::default());
-        let (mut inputs, default_scroll_shift) = self.pending_child_layout_inputs(&mut child);
-        inputs.position_option = position_option.choice();
-        let border_box_block_end = self.layout_element(run, child_box, cells, inputs, Some(default_scroll_shift));
-        drop(position_option);
-        border_box_block_end
+        self.with_position_option_style(child_box, position_option.style, |engine| {
+            let run = run.with_callbacks(engine.callbacks);
+            let cells =
+                used_values::cells_before_sizing(&engine.callbacks, child_box, ContainingBlockConstraints::default());
+            let (mut inputs, default_scroll_shift) = engine.pending_child_layout_inputs(&mut child);
+            inputs.position_option = position_option.choice;
+            engine.layout_element(&run, child_box, cells, inputs, Some(default_scroll_shift))
+        })
     }
 
     /// https://drafts.csswg.org/css-anchor-position-1/#determine-position-fallback-styles
-    /// Chooses the position option the pending child `child` is laid out with, and makes its style reads see the
-    /// styles of that option until the answer is dropped.
-    fn determine_position_fallback_styles(
-        &self,
-        child: &abspos_inputs::PendingAbsposChild,
-    ) -> PositionOptionStyles<'pass> {
+    /// Chooses the position option the pending child `child` is laid out with, whose styles live until the answer is
+    /// dropped.
+    fn determine_position_fallback_styles(&self, child: &abspos_inputs::PendingAbsposChild) -> PositionOptionStyles {
         let node = child.child_box;
         let mut styles = PositionOptionStyles {
-            callbacks: self.callbacks,
-            node,
             choice: None,
-            records: Vec::new(),
-            installed: false,
+            style: None,
+            option_styles: Vec::new(),
         };
         let style = StyleValues::for_node(&self.callbacks, node);
         let anchor = style.anchor();
@@ -3367,7 +3371,7 @@ impl<'pass> AbsposEngine<'pass> {
         // lists, to limit the amount of excess layout work that may be required. This limit must be at least five.
         const POSITION_OPTIONS_LIST_LIMIT: usize = 32;
         // NB: Each option is an entry of the position options list, the base styles first.
-        let entries = arena.with_style_engine(|engine| {
+        let entries = arena.with_style_store(|engine| {
             engine.position_option_entries(style_node, base_style_record, POSITION_OPTIONS_LIST_LIMIT - 1)
         });
         if entries.is_empty() {
@@ -3383,10 +3387,11 @@ impl<'pass> AbsposEngine<'pass> {
 
         // OPTIMIZATION: The styles of an option are made the first time it is tried, so that a box that fits with
         //               its current styles makes no other.
-        let made_styles: std::cell::RefCell<Vec<(u32, Option<node_data::StylePayloadsRef>)>> =
+        let made_styles: std::cell::RefCell<Vec<(u32, Option<Option<node_data::StylePayloadsRef>>)>> =
             std::cell::RefCell::new(Vec::new());
-        let records = std::cell::RefCell::new(Vec::new());
-        // The styles the option applies, which are none for the base styles, or none where it makes no styles.
+        let option_styles = std::cell::RefCell::new(Vec::new());
+        // The styles the option applies: none where the entry makes no option, and no styles of its own for the base
+        // styles or an option that changes none of them.
         let option_style = |option: u32| -> Option<Option<node_data::StylePayloadsRef>> {
             let Some((index, _)) = entry_of(option) else {
                 return Some(None);
@@ -3397,15 +3402,22 @@ impl<'pass> AbsposEngine<'pass> {
                 .find(|&&(made_option, _)| made_option == option)
                 .map(|&(_, style)| style);
             if let Some(style) = made {
-                return style.map(Some);
+                return style;
             }
-            let record = arena.with_style_engine(|engine| {
-                engine.position_option_record(style_node, base_style_record, index, writing_mode, direction)
-            });
-            let style = record.as_ref().map(|record| record.payloads);
-            records.borrow_mut().extend(record);
+            let style = arena
+                .with_style_store(|engine| {
+                    engine.position_option_style(style_node, base_style_record, index, writing_mode, direction)
+                })
+                .map(|style| match style {
+                    PositionOptionStyle::SameAsBase => None,
+                    PositionOptionStyle::Applied(style) => {
+                        let payloads = style.payloads_for_style_reads();
+                        option_styles.borrow_mut().push(style);
+                        Some(payloads)
+                    }
+                });
             made_styles.borrow_mut().push((option, style));
-            style.map(Some)
+            style
         };
 
         // https://drafts.csswg.org/css-anchor-position-1/#position-try-order-property
@@ -3418,11 +3430,11 @@ impl<'pass> AbsposEngine<'pass> {
                 .iter()
                 .filter_map(|&option| {
                     let style = option_style(option)?;
-                    let size = self.with_position_option_style(node, style, || {
+                    let size = self.with_position_option_style(node, style, |engine| {
                         let mut child = *child;
-                        let (inputs, _) = self.pending_child_layout_inputs(&mut child);
-                        let size = self.inset_modified_containing_block_size(node, &inputs);
-                        let horizontal_is_frame_inline = !self.callbacks.frame.is_transposed();
+                        let (inputs, _) = engine.pending_child_layout_inputs(&mut child);
+                        let size = engine.inset_modified_containing_block_size(node, &inputs);
+                        let horizontal_is_frame_inline = !engine.callbacks.frame.is_transposed();
                         let inline_axis_is_horizontal = writing_mode == writing_mode::HORIZONTAL_TB;
                         let (horizontal, vertical) = if horizontal_is_frame_inline {
                             (size.inline_size, size.block_size)
@@ -3474,7 +3486,9 @@ impl<'pass> AbsposEngine<'pass> {
             let Some(style) = option_style(option) else {
                 return false;
             };
-            self.with_position_option_style(node, style, || self.position_option_fits(child, choice_of(option)))
+            self.with_position_option_style(node, style, |engine| {
+                engine.position_option_fits(child, choice_of(option))
+            })
         };
         // NB: The box determines its position fallback styles only where it overflows with its current styles.
         // INTEROP: Other browsers take the first option of a list that position-try-order sorted that fits, even
@@ -3495,30 +3509,30 @@ impl<'pass> AbsposEngine<'pass> {
                 .unwrap_or(current)
         };
         let option = options[chosen];
-        let style = option_style(option).flatten();
         styles.choice = Some(choice_of(option));
-        styles.records = records.into_inner();
-        if let Some(style) = style {
-            self.callbacks.scratch().push_position_option_style(node, style);
-            styles.installed = true;
-        }
+        styles.style = option_style(option).flatten();
+        styles.option_styles = option_styles.into_inner();
         styles
     }
 
-    /// Runs `callback` with the style reads of `node` seeing `style`, or the style of its row for none.
+    /// Runs `callback` with this engine as it lays out `node` with `style`, which its style reads see, or with the
+    /// style of its row for none.
     fn with_position_option_style<T>(
         &self,
         node: Node,
         style: Option<node_data::StylePayloadsRef>,
-        callback: impl FnOnce() -> T,
+        callback: impl for<'option> FnOnce(&AbsposEngine<'option>) -> T,
     ) -> T {
         let Some(style) = style else {
-            return callback();
+            return callback(self);
         };
-        self.callbacks.scratch().push_position_option_style(node, style);
-        let result = callback();
-        self.callbacks.scratch().pop_position_option_style(node);
-        result
+        self.callbacks.with_position_option_style(node, style, |callbacks| {
+            callback(&AbsposEngine {
+                state: self.state,
+                callbacks,
+                fragments: self.fragments.clone(),
+            })
+        })
     }
 
     /// The size of the inset-modified containing block that `inputs` give the box `node`, treating auto inset values
@@ -3574,7 +3588,7 @@ impl<'pass> AbsposEngine<'pass> {
                 ParticipationInParentFormattingContext::AbsolutelyPositioned(inputs),
             ),
         );
-        let used = laid_out.root_cells_left_by_run.materialize_record(self.callbacks.frame);
+        let used = laid_out.root_cells_left_by_run;
         let used_insets = laid_out
             .result
             .out_of_flow_root_used_insets
@@ -3857,7 +3871,7 @@ impl<'pass> AbsposEngine<'pass> {
             return insets;
         }
         formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
-            self.records,
+            self.state,
             &self.callbacks,
             node,
             false,
@@ -3894,7 +3908,7 @@ impl<'pass> AbsposEngine<'pass> {
             block_axis_inset_value(style.inset_bottom(), treat_block_axis_percentage_insets_as_auto),
             percentage_basis.block_size,
         );
-        insets.used_insets = Some(run_records::UsedInsets {
+        insets.used_insets = Some(run_state::UsedInsets {
             left,
             right,
             top,
@@ -3905,14 +3919,14 @@ impl<'pass> AbsposEngine<'pass> {
 }
 
 pub(crate) fn drain_abspos_with_placed_containing_blocks(
-    records: &RunRecords<'_>,
+    state: &RunState,
     callbacks: LayoutPass<'_>,
     should_collect_devtools_layout_data: bool,
     entry_fragments: &std::rc::Rc<fragment_tree::RunFragmentBuilder>,
 ) {
     let accumulator_root = entry_fragments.root_node();
     let run = FormattingContextRun {
-        records,
+        state,
         box_: accumulator_root,
         callbacks,
         should_collect_devtools_layout_data,
@@ -3933,7 +3947,7 @@ pub(crate) fn drain_abspos_with_placed_containing_blocks(
 /// its anchor() insets compensate for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InFlowBoxInsets {
-    pub(crate) used_insets: Option<run_records::UsedInsets>,
+    pub(crate) used_insets: Option<run_state::UsedInsets>,
     pub(crate) default_scroll_shift: Option<abspos_inputs::DefaultScrollShift>,
 }
 
@@ -3955,36 +3969,14 @@ pub(crate) fn compute_inset_native(
     )
 }
 
-/// The position option a box is laid out with, whose styles its style reads see while this lives, and the style records
-/// of its position options, which stay pinned until then.
-struct PositionOptionStyles<'pass> {
-    callbacks: LayoutPass<'pass>,
-    node: Node,
+/// The position option a box is laid out with and the styles it makes, if any, and the styles of the box's position
+/// options, which the style reads of the box address while this lives.
+struct PositionOptionStyles {
     choice: Option<abspos_inputs::PositionOptionChoice>,
-    records: Vec<crate::css::style::layout_style::DerivedStyleRecord>,
-    installed: bool,
-}
-
-impl PositionOptionStyles<'_> {
-    fn choice(&self) -> Option<abspos_inputs::PositionOptionChoice> {
-        self.choice
-    }
-}
-
-impl Drop for PositionOptionStyles<'_> {
-    fn drop(&mut self) {
-        if self.installed {
-            self.callbacks.scratch().pop_position_option_style(self.node);
-        }
-        if self.records.is_empty() {
-            return;
-        }
-        self.callbacks.arena().with_style_engine(|engine| {
-            for record in &self.records {
-                engine.unpin_layout_style_record(record.record);
-            }
-        });
-    }
+    style: Option<node_data::StylePayloadsRef>,
+    /// Boxed so that the payloads the style reads address stay in place as the list grows.
+    #[expect(clippy::vec_box)]
+    option_styles: Vec<Box<LayoutStyle>>,
 }
 
 #[cfg(test)]

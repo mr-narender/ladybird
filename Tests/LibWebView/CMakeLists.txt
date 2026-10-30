@@ -85,6 +85,24 @@ if (BUILD_TESTING AND NOT WIN32)
     set_tests_properties(TestWebDriverContentBlockers PROPERTIES TIMEOUT 180)
 
     add_test(
+        NAME TestWebDriverLocationPolicy
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-location-policy.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverLocationPolicy PROPERTIES TIMEOUT 120)
+
+    add_test(
+        NAME TestWebDriverPermissionsSettings
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-permissions-settings.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverPermissionsSettings PROPERTIES TIMEOUT 120)
+
+    add_test(
+        NAME TestWebDriverSetPermission
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-set-permission.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverSetPermission PROPERTIES TIMEOUT 120)
+
+    add_test(
         NAME TestWebDriverSearchEngineSettings
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-search-engine-settings.py $<TARGET_FILE:WebDriver>
     )
@@ -156,6 +174,7 @@ set(TEST_SOURCES
     TestHSTSStore.cpp
     TestNavigationLoader.cpp
     TestOmnibox.cpp
+    TestPermissionManager.cpp
     TestPictureInPictureWindow.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
@@ -203,6 +222,9 @@ foreach(source IN LISTS TEST_SOURCES)
     endif()
     if (source STREQUAL "TestAudioServerAudibility.cpp")
         list(APPEND test_libraries LibAudio LibIPC)
+    endif()
+    if (source STREQUAL "TestPermissionManager.cpp")
+        list(APPEND test_libraries LibFileSystem LibWebCommon)
     endif()
     if (source STREQUAL "TestFontService.cpp")
         list(APPEND test_libraries LibFileSystem LibIPC LibGfx)
@@ -399,6 +421,13 @@ if (NOT WIN32)
         target_compile_definitions(TestRendererOriginClaims PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
     endif()
 
+    add_executable(TestRendererViolationReports TestRendererViolationReports.cpp)
+    add_dependencies(TestRendererViolationReports ladybird_build_resource_files ${ladybird_helper_processes})
+    target_link_libraries(TestRendererViolationReports PRIVATE AK LibCore LibFileSystem LibGfx LibIPC LibMain LibThreading LibURL LibWeb LibWebView)
+    if (APPLE)
+        target_compile_definitions(TestRendererViolationReports PRIVATE LADYBIRD_BINARY_PATH="$<TARGET_FILE_DIR:ladybird>")
+    endif()
+
     add_executable(TestImageDecoderIsolation TestImageDecoderIsolation.cpp)
     add_dependencies(TestImageDecoderIsolation ladybird_build_resource_files ${ladybird_helper_processes})
     target_link_libraries(TestImageDecoderIsolation PRIVATE AK LibCore LibFileSystem LibGfx LibIPC LibMain LibWebView)
@@ -493,6 +522,8 @@ if (BUILD_TESTING AND NOT WIN32)
     set_tests_properties(TestRendererCookieAccess PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestRendererOriginClaims COMMAND $<TARGET_FILE:TestRendererOriginClaims>)
     set_tests_properties(TestRendererOriginClaims PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
+    add_test(NAME TestRendererViolationReports COMMAND $<TARGET_FILE:TestRendererViolationReports>)
+    set_tests_properties(TestRendererViolationReports PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestImageDecoderIsolation COMMAND $<TARGET_FILE:TestImageDecoderIsolation>)
     set_tests_properties(TestImageDecoderIsolation PROPERTIES TIMEOUT 60 ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})
     add_test(NAME TestCrashReportSubmission COMMAND $<TARGET_FILE:TestCrashReportSubmission>)

@@ -48,7 +48,10 @@ pub(crate) fn inline_item_alignment(justify_self_value: u8, container_justify_it
             _ => unreachable!("invalid justify-items value"),
         },
         justify_self::BASELINE => Alignment::Baseline,
-        justify_self::CENTER => Alignment::Center,
+        // https://drafts.csswg.org/css-anchor-position-1/#valdef-justify-self-anchor-center
+        // If the box is not absolutely positioned, or does not have a default anchor box, this value behaves as
+        // center and has no additional effect on how inset properties resolve.
+        justify_self::CENTER | justify_self::ANCHOR_CENTER => Alignment::Center,
         justify_self::END | justify_self::FLEX_END => Alignment::End,
         justify_self::FLEX_START | justify_self::START => Alignment::Start,
         justify_self::LEFT => Alignment::Left,
@@ -79,7 +82,10 @@ pub(crate) fn block_item_alignment(align_self_value: u8, container_align_items: 
             _ => unreachable!("invalid align-items value"),
         },
         align_self::BASELINE => Alignment::Baseline,
-        align_self::CENTER => Alignment::Center,
+        // https://drafts.csswg.org/css-anchor-position-1/#valdef-justify-self-anchor-center
+        // If the box is not absolutely positioned, or does not have a default anchor box, this value behaves as
+        // center and has no additional effect on how inset properties resolve.
+        align_self::CENTER | align_self::ANCHOR_CENTER => Alignment::Center,
         align_self::END | align_self::FLEX_END => Alignment::End,
         align_self::FLEX_START | align_self::START => Alignment::Start,
         align_self::NORMAL => Alignment::Normal,
@@ -665,9 +671,42 @@ pub(crate) struct PlacementResult {
     pub(crate) explicit_row_start: usize,
 }
 
+/// The occupied cells of one row of an OccupationGrid.
 #[derive(Default)]
+struct OccupationGridRow {
+    /// The occupied columns, as sorted half-open ranges that neither overlap nor touch.
+    occupied_columns: smallvec::SmallVec<[Range<i32>; 2]>,
+    /// The column past the grid items that step 2 of the placement algorithm placed in this row, where sparse packing
+    /// places the next item locked to this row.
+    column_past_items_locked_to_this_row: i32,
+}
+
+impl OccupationGridRow {
+    fn occupy(&mut self, columns: Range<i32>) {
+        let ranges = &mut self.occupied_columns;
+        let first_touching = ranges.partition_point(|range| range.end < columns.start);
+        let end_touching = ranges.partition_point(|range| range.start <= columns.end);
+        if first_touching == end_touching {
+            ranges.insert(first_touching, columns);
+            return;
+        }
+        ranges[first_touching] =
+            ranges[first_touching].start.min(columns.start)..ranges[end_touching - 1].end.max(columns.end);
+        ranges.drain(first_touching + 1..end_touching);
+    }
+
+    /// The end of the occupied range that overlaps `columns`, which is the first column past it that's unoccupied.
+    fn end_of_occupied_columns_overlapping(&self, columns: &Range<i32>) -> Option<i32> {
+        let ranges = &self.occupied_columns;
+        let range = ranges.get(ranges.partition_point(|range| range.end <= columns.start))?;
+        (range.start < columns.end).then_some(range.end)
+    }
+}
+
 pub(crate) struct OccupationGrid {
-    occupied: HashSet<(i32, i32)>,
+    /// The rows from `first_row` on, which grow at the end as items occupy cells further down.
+    rows: Vec<OccupationGridRow>,
+    first_row: i32,
     min_column_index: i32,
     // NB: max < min means the axis has no tracks at all; an axis with no explicit tracks starts
     //     out as max = -1 and only grows when items actually occupy it.
@@ -677,9 +716,11 @@ pub(crate) struct OccupationGrid {
 }
 
 impl OccupationGrid {
-    pub(crate) fn new(column_count: usize, row_count: usize) -> Self {
+    /// An occupation grid whose rows are stored from `first_row` on, which should be the first row an item occupies.
+    pub(crate) fn new(column_count: usize, row_count: usize, first_row: i32) -> Self {
         Self {
-            occupied: HashSet::default(),
+            rows: Vec::new(),
+            first_row,
             min_column_index: 0,
             max_column_index: column_count as i32 - 1,
             min_row_index: 0,
@@ -687,20 +728,55 @@ impl OccupationGrid {
         }
     }
 
+    fn row(&self, row: i32) -> Option<&OccupationGridRow> {
+        self.rows.get(usize::try_from(row.checked_sub(self.first_row)?).ok()?)
+    }
+
+    fn rows_mut(&mut self, rows: Range<i32>) -> &mut [OccupationGridRow] {
+        if rows.start < self.first_row {
+            let missing_row_count = (self.first_row - rows.start) as usize;
+            self.rows.splice(
+                0..0,
+                std::iter::repeat_with(OccupationGridRow::default).take(missing_row_count),
+            );
+            self.first_row = rows.start;
+        }
+        let start = (rows.start - self.first_row) as usize;
+        let end = (rows.end - self.first_row) as usize;
+        if self.rows.len() < end {
+            self.rows.resize_with(end, OccupationGridRow::default);
+        }
+        &mut self.rows[start..end]
+    }
+
     pub(crate) fn set_occupied(&mut self, column_start: i32, column_end: i32, row_start: i32, row_end: i32) {
-        for row in row_start..row_end {
-            for column in column_start..column_end {
-                self.min_column_index = self.min_column_index.min(column);
-                self.max_column_index = self.max_column_index.max(column);
-                self.min_row_index = self.min_row_index.min(row);
-                self.max_row_index = self.max_row_index.max(row);
-                self.occupied.insert((column, row));
-            }
+        if column_start >= column_end || row_start >= row_end {
+            return;
+        }
+        self.min_column_index = self.min_column_index.min(column_start);
+        self.max_column_index = self.max_column_index.max(column_end - 1);
+        self.min_row_index = self.min_row_index.min(row_start);
+        self.max_row_index = self.max_row_index.max(row_end - 1);
+        for row in self.rows_mut(row_start..row_end) {
+            row.occupy(column_start..column_end);
         }
     }
 
-    pub(crate) fn is_occupied(&self, column: i32, row: i32) -> bool {
-        self.occupied.contains(&(column, row))
+    /// The end of an occupied range of columns that overlaps the area, if any does. Starting the area at any later
+    /// column before that end overlaps the range too.
+    fn end_of_occupied_columns_overlapping_area(
+        &self,
+        column_start: i32,
+        row_start: i32,
+        column_span: usize,
+        row_span: usize,
+    ) -> Option<i32> {
+        if column_span == 0 {
+            return None;
+        }
+        let columns = column_start..column_start + column_span as i32;
+        (row_start..row_start + row_span as i32)
+            .find_map(|row| self.row(row)?.end_of_occupied_columns_overlapping(&columns))
     }
 
     pub(crate) fn is_area_occupied(
@@ -710,14 +786,8 @@ impl OccupationGrid {
         column_span: usize,
         row_span: usize,
     ) -> bool {
-        for row in row_start..row_start + row_span as i32 {
-            for column in column_start..column_start + column_span as i32 {
-                if self.is_occupied(column, row) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.end_of_occupied_columns_overlapping_area(column_start, row_start, column_span, row_span)
+            .is_some()
     }
 
     fn find_unoccupied_grid_area(&self, column: &mut i32, row: &mut i32, column_span: usize, row_span: usize) {
@@ -725,14 +795,25 @@ impl OccupationGrid {
         while *row <= self.max_row_index {
             while *column <= self.max_column_index {
                 let minor_axis_fits = *column + column_span as i32 - 1 <= self.max_column_index;
-                if minor_axis_fits && !self.is_area_occupied(*column, *row, column_span, row_span) {
-                    return;
+                if !minor_axis_fits {
+                    break;
                 }
-                *column += 1;
+                match self.end_of_occupied_columns_overlapping_area(*column, *row, column_span, row_span) {
+                    Some(end_of_occupied_columns) => *column = end_of_occupied_columns,
+                    None => return,
+                }
             }
             *row += 1;
             *column = self.min_column_index;
         }
+    }
+
+    fn column_past_items_locked_to_row(&self, row: i32) -> i32 {
+        self.row(row).map_or(0, |row| row.column_past_items_locked_to_this_row)
+    }
+
+    fn set_column_past_items_locked_to_row(&mut self, row: i32, column: i32) {
+        self.rows_mut(row..row + 1)[0].column_past_items_locked_to_this_row = column;
     }
 }
 
@@ -811,7 +892,8 @@ fn place_items_in_row_flow(
     ordered_indices.sort_by_key(|index| (items[*index].order, *index));
 
     let mut remaining = vec![true; items.len()];
-    let mut grid = OccupationGrid::new(explicit_column_count, explicit_row_count);
+    let first_occupied_row = items.iter().filter_map(|item| item.row.start).min().unwrap_or(0).min(0);
+    let mut grid = OccupationGrid::new(explicit_column_count, explicit_row_count, first_occupied_row);
     let mut output = Vec::with_capacity(items.len());
 
     // FIXME: 0. Generate anonymous grid items
@@ -836,7 +918,6 @@ fn place_items_in_row_flow(
     //    "dense" packing (dense specified)
     //        Set the column-start line of its placement to the earliest (smallest positive index) line index that
     //        ensures this item’s grid area will not overlap any occupied grid cells.
-    let mut row_cursors = HashMap::<i32, i32>::default();
     for &index in &ordered_indices {
         if !remaining[index] {
             continue;
@@ -852,20 +933,22 @@ fn place_items_in_row_flow(
         let mut column = if dense {
             0
         } else {
-            row_cursors.get(&row).copied().unwrap_or(0)
+            grid.column_past_items_locked_to_row(row)
         };
         let mut found = false;
         while column <= grid.max_column_index {
-            if !grid.is_area_occupied(column, row, item.column.span, item.row.span) {
-                found = true;
-                break;
+            match grid.end_of_occupied_columns_overlapping_area(column, row, item.column.span, item.row.span) {
+                Some(end_of_occupied_columns) => column = end_of_occupied_columns,
+                None => {
+                    found = true;
+                    break;
+                }
             }
-            column += 1;
         }
         if !found {
             column = grid.max_column_index + 1;
         }
-        row_cursors.insert(row, column + item.column.span as i32);
+        grid.set_column_past_items_locked_to_row(row, column + item.column.span as i32);
         record(&mut grid, &mut output, item, row, column);
         remaining[index] = false;
     }
@@ -1018,15 +1101,26 @@ struct LaidOutGridItem {
     content_offset: Option<FfiCssPixelPoint>,
 }
 
+/// What a grid keeps for each grid item it collected, at the item's collected index.
+struct CollectedGridItem {
+    box_: Node,
+    /// The input cells of the item as this grid sizes it, which the item's run takes.
+    cells: Cell<used_values::RootInputCells>,
+    /// What this grid keeps of the item once it laid the item out.
+    laid_out: Cell<Option<LaidOutGridItem>>,
+}
+
 #[derive(Clone, Copy)]
 struct GridItem {
     box_: Node,
+    /// The index of the item in the grid's collected items.
+    collected_index: u32,
     row: i32,
     row_span: usize,
     column: i32,
     column_span: usize,
     // Accumulated while projecting a nested subgrid item into an ancestor's track
-    // sizing without modifying the UsedValues owned by the nested grid context.
+    // sizing without modifying the cells the nested grid context holds for the item.
     extra_margin_top: CssPixels,
     extra_margin_right: CssPixels,
     extra_margin_bottom: CssPixels,
@@ -1091,10 +1185,13 @@ struct SubgridBlockSizeKey {
 /// Block sizes measured for column subgrids during one run of an independent grid, shared by every subgrid context
 /// nested under it — so a nest of subgrids measures each one once per key, rather than once per request at
 /// every level of the nest, which grows exponentially with its depth.
-type SubgridBlockSizeMemo = std::rc::Rc<std::cell::RefCell<std::collections::HashMap<SubgridBlockSizeKey, CssPixels>>>;
+type SubgridBlockSizeMemo = std::rc::Rc<std::cell::RefCell<HashMap<SubgridBlockSizeKey, CssPixels>>>;
 
 pub(crate) struct GridFormattingContext<'pass> {
     run: FormattingContextRun<'pass>,
+    /// The cells of the grid container, in the frame its items are laid out in. The grid does not resize its container,
+    /// but takes it again after the run sizes the container's own box.
+    container_cells: Cell<used_values::RootInputCells>,
     /// The inline layout of the table box inside a table wrapper item, as resolving the wrapper's inline size last
     /// found it, which the item's run can reuse.
     table_inline_layout_of_item: Cell<Option<(Node, table_formatting_context::TableInlineLayout)>>,
@@ -1109,10 +1206,10 @@ pub(crate) struct GridFormattingContext<'pass> {
     column_gaps: Vec<Track<'pass>>,
     row_gaps: Vec<Track<'pass>>,
     items: Vec<GridItem>,
-    /// The input cells of each item as this grid sizes it, which the item's run takes.
-    cells_of_items: HashMap<Node, Cell<used_values::RootInputCells>>,
-    /// What this grid keeps of each item it laid out.
-    laid_out_items: RefCell<HashMap<Node, LaidOutGridItem>>,
+    /// Every grid item in document order, which a GridItem indexes with its collected index.
+    collected_items: Vec<CollectedGridItem>,
+    /// Whether the container has an in-flow child box that is not a grid item, as a skipped anonymous text run.
+    has_in_flow_child_box_that_is_not_an_item: bool,
     in_flow_items_margin_box_block_extent: Option<CssPixels>,
     explicit_column_line_count: usize,
     explicit_row_line_count: usize,
@@ -1248,12 +1345,17 @@ pub(super) fn grid_template_declares_a_subgrid_axis(callbacks: &LayoutPass<'_>, 
 }
 
 impl<'pass> GridFormattingContext<'pass> {
-    pub(crate) fn new(run: &FormattingContextRun<'pass>, parent_grid: Option<&GridFormattingContext<'pass>>) -> Self {
+    pub(crate) fn new(
+        run: &FormattingContextRun<'pass>,
+        container_cells: used_values::RootInputCells,
+        parent_grid: Option<&GridFormattingContext<'pass>>,
+    ) -> Self {
         let grid_container = run.box_;
         let parent_grid = parent_grid.filter(|_| grid_template_declares_a_subgrid_axis(&run.callbacks, grid_container));
         let container_style = StyleValues::for_node(&run.callbacks, grid_container);
         Self {
             run: run.clone(),
+            container_cells: Cell::new(container_cells),
             derived_baselines_of_root_box: DerivedBaselines::default(),
             parent_grid: parent_grid.map(|parent| ParentGridData::for_child_container(parent, grid_container)),
             available_space: None,
@@ -1298,8 +1400,8 @@ impl<'pass> GridFormattingContext<'pass> {
             maximum_inline_size_resolved_by_caller: None,
             item_runs_offered_to_row_measurements: None,
             next_item_lookup_start: Cell::new(0),
-            cells_of_items: HashMap::default(),
-            laid_out_items: RefCell::new(HashMap::default()),
+            collected_items: Vec::new(),
+            has_in_flow_child_box_that_is_not_an_item: false,
             table_inline_layout_of_item: Cell::new(None),
             in_flow_items_margin_box_block_extent: None,
             lanes: None,
@@ -1339,22 +1441,20 @@ impl<'pass> GridFormattingContext<'pass> {
         self.subgrid_block_size_memo.get_or_init(SubgridBlockSizeMemo::default)
     }
 
-    fn container_used(&self) -> &'pass UsedValues {
-        self.run.records.used_values(self.run.box_)
+    #[inline]
+    #[track_caller]
+    fn collected_item(&self, item: GridItem) -> &CollectedGridItem {
+        let collected = &self.collected_items[item.collected_index as usize];
+        debug_assert!(collected.box_ == item.box_, "a grid item is one this grid collected");
+        collected
     }
 
     fn cells_of(&self, item: GridItem) -> used_values::RootInputCells {
-        self.cells_of_items
-            .get(&item.box_)
-            .expect("a grid item has the cells its grid sizes it in")
-            .get()
+        self.collected_item(item).cells.get()
     }
 
     fn update_cells_of(&self, item: GridItem, update: impl FnOnce(&mut used_values::RootInputCells)) {
-        let cells = self
-            .cells_of_items
-            .get(&item.box_)
-            .expect("a grid item has the cells its grid sizes it in");
+        let cells = &self.collected_item(item).cells;
         let mut updated = cells.get();
         update(&mut updated);
         cells.set(updated);
@@ -1403,7 +1503,7 @@ impl<'pass> GridFormattingContext<'pass> {
 
     #[inline]
     fn sizing(&self) -> sizing_context::SizingContext<'pass, '_> {
-        sizing_context::SizingContext::new(self.run.records, self.run.callbacks).with_child_run_shapes(self)
+        sizing_context::SizingContext::new(self.run.state, self.run.callbacks).with_child_run_shapes(self)
     }
 
     fn parent_grid(&self) -> Option<&ParentGridData<'pass>> {
@@ -1657,7 +1757,11 @@ impl<'pass> GridFormattingContext<'pass> {
                 return None;
             }
             Some(self.sizing().calculate_inner_size_for_property(
-                sizing_context::SizedBox::new(self.run.box_, &self.run.root_record()),
+                sizing_context::SizedBox::of_own_metrics(
+                    self.run.box_,
+                    &self.container_cells,
+                    self.run.callbacks.frame,
+                ),
                 axis.sizing_axis(),
                 axis.select(SizingProperty::MinWidth, SizingProperty::MinHeight),
                 self.container_available_space(),
@@ -1867,18 +1971,19 @@ impl<'pass> GridFormattingContext<'pass> {
         *span = (end - *start) as usize;
     }
 
-    /// The grid items of the grid container, and the grid-placement properties of each resolved against the explicit
-    /// grid.
-    fn collect_grid_items(&mut self) -> (Vec<Node>, Vec<PlacementInput>) {
-        self.cells_of_items.clear();
-        self.laid_out_items.get_mut().clear();
-        let mut nodes = Vec::new();
+    /// Collects the grid items of the grid container, and returns the grid-placement properties of each resolved
+    /// against the explicit grid, whose ids are the items' collected indices.
+    fn collect_grid_items(&mut self) -> Vec<PlacementInput> {
+        self.collected_items.clear();
+        self.has_in_flow_child_box_that_is_not_an_item = false;
         let mut inputs = Vec::new();
         for child in self.run.callbacks.children(self.run.box_) {
             let box_facts = self.facts(child);
             if box_facts.is_box() && !box_facts.is_absolutely_positioned() {
                 let skip = self.run.callbacks.can_skip_is_anonymous_text_run(child);
-                if !skip {
+                if skip {
+                    self.has_in_flow_child_box_that_is_not_an_item = true;
+                } else {
                     debug_assert!(
                         node_facts::has_flag(box_facts.data(), NodeFlag::IsGridItem),
                         "the facts of a grid item are derived before layout"
@@ -1914,7 +2019,7 @@ impl<'pass> GridFormattingContext<'pass> {
                         (child_grid_style.row_start, child_grid_style.row_end),
                     );
                     inputs.push(PlacementInput {
-                        id: nodes.len(),
+                        id: self.collected_items.len(),
                         order: self.style(child).order(),
                         row: self.axis_placements(
                             row_start,
@@ -1936,15 +2041,19 @@ impl<'pass> GridFormattingContext<'pass> {
                         child,
                         ContainingBlockConstraints::default(),
                     );
-                    self.cells_of_items.insert(child, Cell::new(cells));
-                    nodes.push(child);
+                    self.collected_items.push(CollectedGridItem {
+                        box_: child,
+                        cells: Cell::new(cells),
+                        laid_out: Cell::new(None),
+                    });
                 }
             }
         }
-        (nodes, inputs)
+        inputs
     }
 
-    fn new_grid_item(&self, box_: Node) -> GridItem {
+    fn new_grid_item(&self, collected_index: usize) -> GridItem {
+        let box_ = self.collected_items[collected_index].box_;
         let is_column_only_subgrid = self.facts(box_).display().is_grid_inside() && {
             let grid_style = self.grid_style(box_);
             self.select_item_grid_axis(
@@ -1960,6 +2069,7 @@ impl<'pass> GridFormattingContext<'pass> {
         };
         GridItem {
             box_,
+            collected_index: collected_index as u32,
             row: 0,
             row_span: 1,
             column: 0,
@@ -1980,7 +2090,7 @@ impl<'pass> GridFormattingContext<'pass> {
             self.place_grid_lanes_items(lanes);
             return;
         }
-        let (nodes, inputs) = self.collect_grid_items();
+        let inputs = self.collect_grid_items();
         let subgridded_columns = self.container_is_subgridded(Axis::Column);
         let subgridded_rows = self.container_is_subgridded(Axis::Row);
         let style = self.style(self.run.box_);
@@ -2024,7 +2134,7 @@ impl<'pass> GridFormattingContext<'pass> {
             self.row_lines = lines;
         }
         for placed in result.items {
-            let mut item = self.new_grid_item(nodes[placed.id]);
+            let mut item = self.new_grid_item(placed.id);
             item.set_position(Axis::Row, placed.row, placed.row_span);
             item.set_position(Axis::Column, placed.column, placed.column_span);
             self.items.push(item);
@@ -2240,10 +2350,10 @@ impl<'pass> GridFormattingContext<'pass> {
     }
 
     fn container_padding_start(&self, axis: Axis) -> CssPixels {
-        let used = self.container_used();
+        let used = &self.container_cells;
         let (left_or_top, right_or_bottom) = axis.select(
-            (used.padding_left.get(), used.padding_right.get()),
-            (used.padding_top.get(), used.padding_bottom.get()),
+            (used.padding_left(), used.padding_right()),
+            (used.padding_top(), used.padding_bottom()),
         );
         if self.tracks_are_reversed(axis) {
             right_or_bottom
@@ -2253,10 +2363,10 @@ impl<'pass> GridFormattingContext<'pass> {
     }
 
     fn container_padding_end(&self, axis: Axis) -> CssPixels {
-        let used = self.container_used();
+        let used = &self.container_cells;
         let (left_or_top, right_or_bottom) = axis.select(
-            (used.padding_left.get(), used.padding_right.get()),
-            (used.padding_top.get(), used.padding_bottom.get()),
+            (used.padding_left(), used.padding_right()),
+            (used.padding_top(), used.padding_bottom()),
         );
         if self.tracks_are_reversed(axis) {
             left_or_top
@@ -2367,7 +2477,7 @@ impl<'pass> GridFormattingContext<'pass> {
     fn container_constraints(&self) -> ContainingBlockConstraints {
         self.sizing().constraints_for_child_context(
             self.run.box_,
-            &self.run.root_record(),
+            &self.container_cells,
             self.layout_input.unwrap().containing_block_constraints,
         )
     }
@@ -2903,7 +3013,7 @@ impl<'pass> GridFormattingContext<'pass> {
         let available = self.container_available_space();
         let constraints = self.layout_input.unwrap().containing_block_constraints;
         self.sizing().calculate_inner_size_for_property(
-            sizing_context::SizedBox::new(self.run.box_, &self.run.root_record()),
+            sizing_context::SizedBox::of_own_metrics(self.run.box_, &self.container_cells, self.run.callbacks.frame),
             axis.sizing_axis(),
             axis.select(SizingProperty::MaxWidth, SizingProperty::MaxHeight),
             available,
@@ -3080,20 +3190,20 @@ impl<'pass> GridFormattingContext<'pass> {
         // This extra layer of "margin" accumulates through multiple levels of
         // subgrids.
         //
-        // NB: Scrollbar gutters are not represented in UsedValues yet.
+        // NB: The cells of a box do not hold its scrollbar gutters yet.
         let position = item.position(axis);
         let span = item.span(axis);
         let track_count = self.axis_tracks(axis).len() as i32;
-        let used = self.container_used();
+        let used = &self.container_cells;
         let (left_or_top, right_or_bottom) = if axis.is_column() {
             (
-                used.margin_left.get() + used.border_left.get() + used.padding_left.get(),
-                used.padding_right.get() + used.border_right.get() + used.margin_right.get(),
+                used.margin_left() + used.border_left() + used.padding_left(),
+                used.padding_right() + used.border_right() + used.margin_right(),
             )
         } else {
             (
-                used.margin_top.get() + used.border_top.get() + used.padding_top.get(),
-                used.padding_bottom.get() + used.border_bottom.get() + used.margin_bottom.get(),
+                used.margin_top() + used.border_top() + used.padding_top(),
+                used.padding_bottom() + used.border_bottom() + used.margin_bottom(),
             )
         };
         let parent = container_as_parent_grid_item;
@@ -3155,15 +3265,14 @@ impl<'pass> GridFormattingContext<'pass> {
             ..live
         };
         let containing_block = self.run.callbacks.in_flow_containing_block(subgrid.box_);
-        RunRecords::with_root(
+        RunState::with_root(
             self.run.callbacks,
             subgrid.box_,
             containing_block,
-            scratch_root,
-            self.run.callbacks.frame,
-            |records, callbacks| {
+            None,
+            |state, callbacks| {
                 let scratch_run = FormattingContextRun {
-                    records,
+                    state,
                     box_: subgrid.box_,
                     callbacks,
                     should_collect_devtools_layout_data: false,
@@ -3171,7 +3280,7 @@ impl<'pass> GridFormattingContext<'pass> {
                     fragments: None,
                     fragmentainer: None,
                 };
-                let mut context = GridFormattingContext::new(&scratch_run, Some(self));
+                let mut context = GridFormattingContext::new(&scratch_run, scratch_root, Some(self));
                 context.subgrid_tracks_act_empty = true;
                 measure(&mut context, &scratch_run)
             },
@@ -4107,19 +4216,19 @@ impl<'pass> GridFormattingContext<'pass> {
 
     fn grid_container_alignment_size(&self, axis: Axis) -> CssPixels {
         if axis.is_column() {
-            return self.container_used().content_inline_size.get();
+            return self.container_cells.content_inline_size();
         }
         if self.use_row_alignment_container_size {
             let style = self.style(self.run.box_);
             if !crate::layout::sizing_context::is_plain_auto(style.min_height()) {
                 return self
                     .row_alignment_container_size
-                    .max(self.container_used().content_block_size.get());
+                    .max(self.container_cells.content_block_size());
             }
             return self.row_alignment_container_size;
         }
-        if self.container_used().has_definite_block_size() {
-            self.container_used().content_block_size.get()
+        if self.container_cells.has_definite_block_size() {
+            self.container_cells.content_block_size()
         } else {
             self.row_alignment_container_size
         }
@@ -4155,7 +4264,11 @@ impl<'pass> GridFormattingContext<'pass> {
             && !sizing.should_treat_max_block_size_as_none(self.run.box_, available.block_size, constraints)
         {
             block_size = block_size.min(sizing.calculate_inner_size_for_property(
-                sizing_context::SizedBox::new(self.run.box_, &self.run.root_record()),
+                sizing_context::SizedBox::of_own_metrics(
+                    self.run.box_,
+                    &self.container_cells,
+                    self.run.callbacks.frame,
+                ),
                 SizingAxis::Block,
                 SizingProperty::MaxHeight,
                 available,
@@ -4166,7 +4279,11 @@ impl<'pass> GridFormattingContext<'pass> {
             && !(self.own_block_size_is_being_measured() && style.min_height().is_intrinsic_sizing_constraint())
         {
             block_size = block_size.max(sizing.calculate_inner_size_for_property(
-                sizing_context::SizedBox::new(self.run.box_, &self.run.root_record()),
+                sizing_context::SizedBox::of_own_metrics(
+                    self.run.box_,
+                    &self.container_cells,
+                    self.run.callbacks.frame,
+                ),
                 SizingAxis::Block,
                 SizingProperty::MinHeight,
                 available,
@@ -4409,7 +4526,8 @@ impl<'pass> GridFormattingContext<'pass> {
             item.box_,
             input,
             false,
-            self.run.percentage_block_insets_of_root_children_have_definite_basis(),
+            self.run
+                .percentage_block_insets_of_root_children_have_definite_basis(&self.container_cells),
         );
         formatting_context::ChildRunShape {
             node: item.box_,
@@ -4481,33 +4599,27 @@ impl<'pass> GridFormattingContext<'pass> {
                 item.box_,
                 input,
                 cells,
-                None,
                 false,
-                run.percentage_block_insets_of_root_children_have_definite_basis(),
+                run.percentage_block_insets_of_root_children_have_definite_basis(&self.container_cells),
             );
             self.update_cells_of(item, |item_cells| *item_cells = laid_out_box.cells);
             outcome.report_percentage_block_size_dependency_of(run, item.box_);
-            self.laid_out_items.borrow_mut().insert(
-                item.box_,
-                LaidOutGridItem {
-                    content_baselines: laid_out_box.baselines,
-                    orthogonal_flow_baselines: laid_out_box.orthogonal_flow_baselines,
-                    content_offset: None,
-                },
-            );
+            self.collected_item(item).laid_out.set(Some(LaidOutGridItem {
+                content_baselines: laid_out_box.baselines,
+                orthogonal_flow_baselines: laid_out_box.orthogonal_flow_baselines,
+                content_offset: None,
+            }));
             let placed_item = formatting_context::PlacedChild::of_laid_out_box(&laid_out_box);
             let offset = FfiCssPixelPoint {
                 x: area.offset.inline_offset + self.item_margin_box_start(item, Axis::Column),
                 y: area.offset.block_offset + self.item_margin_box_start(item, Axis::Row),
             };
-            // Resolve relative-position insets before placement seals the
-            // item's committed metrics.
             let insets = abspos_engine::compute_inset_native(
                 run,
                 item.box_,
-                self.container_used(),
+                &self.container_cells,
                 area.size,
-                run.percentage_block_insets_of_root_children_have_definite_basis(),
+                run.percentage_block_insets_of_root_children_have_definite_basis(&self.container_cells),
             );
             let placed_item = placed_item.with_in_flow_box_insets(insets);
             if self.item_participates_in_row_baseline_alignment(item)
@@ -4657,32 +4769,43 @@ impl<'pass> GridFormattingContext<'pass> {
         // therefore participate with other items in their row.)
         // [...] a table cell spanning three rows participates in first-baseline alignment with the table cells in the
         // first row that it spans [...]
-        let mut shared_baselines = HashMap::<i32, CssPixels>::default();
-        let mut shared_column_baselines = HashMap::<i32, CssPixels>::default();
+        // The shared baseline of the items that start in each row and column, by the index of its track.
+        let mut shared_baselines = Vec::<Option<CssPixels>>::new();
+        let mut shared_column_baselines = Vec::<Option<CssPixels>>::new();
+        let track_index =
+            |position: i32| usize::try_from(position).expect("a placed grid item starts at a track of its grid");
+        let share_baseline = |shared_baselines: &mut Vec<Option<CssPixels>>, track: usize, baseline: CssPixels| {
+            if shared_baselines.len() <= track {
+                shared_baselines.resize(track + 1, None);
+            }
+            let shared = &mut shared_baselines[track];
+            *shared = Some(shared.map_or(baseline, |shared| shared.max(baseline)));
+        };
         for &(item_index, _, _, _) in &items {
             let item = self.items[item_index];
             if self.item_participates_in_row_baseline_alignment(item) {
-                let baseline = self.item_row_baseline(item);
-                shared_baselines
-                    .entry(item.row)
-                    .and_modify(|shared| *shared = (*shared).max(baseline))
-                    .or_insert(baseline);
+                share_baseline(
+                    &mut shared_baselines,
+                    track_index(item.row),
+                    self.item_row_baseline(item),
+                );
             }
             if self.item_participates_in_column_baseline_alignment(item) {
-                let baseline = self.item_column_baseline(item);
-                shared_column_baselines
-                    .entry(item.column)
-                    .and_modify(|shared| *shared = (*shared).max(baseline))
-                    .or_insert(baseline);
+                share_baseline(
+                    &mut shared_column_baselines,
+                    track_index(item.column),
+                    self.item_column_baseline(item),
+                );
             }
         }
         for (item_index, placed_item, mut offset, fragment_arrival) in items {
             let item = self.items[item_index];
             if self.item_participates_in_row_baseline_alignment(item) {
-                offset.y += shared_baselines[&item.row] - self.item_row_baseline(item);
+                offset.y += shared_baselines[track_index(item.row)].unwrap() - self.item_row_baseline(item);
             }
             if self.item_participates_in_column_baseline_alignment(item) {
-                offset.x += shared_column_baselines[&item.column] - self.item_column_baseline(item);
+                offset.x +=
+                    shared_column_baselines[track_index(item.column)].unwrap() - self.item_column_baseline(item);
             }
             self.place_item(item, placed_item, offset, fragment_arrival);
         }
@@ -4696,19 +4819,17 @@ impl<'pass> GridFormattingContext<'pass> {
         fragment_arrival: Option<fragment_tree::ChildFragmentArrival>,
     ) {
         formatting_context::place_child(&self.run, item.box_, placed_item, offset, None, fragment_arrival);
-        self.laid_out_items
-            .borrow_mut()
-            .get_mut(&item.box_)
-            .expect("a grid item is laid out before it is placed")
-            .content_offset = Some(offset);
+        let laid_out = &self.collected_item(item).laid_out;
+        let mut laid_out_item = laid_out.get().expect("a grid item is laid out before it is placed");
+        laid_out_item.content_offset = Some(offset);
+        laid_out.set(Some(laid_out_item));
     }
 
     #[track_caller]
     fn laid_out_item(&self, item: GridItem) -> LaidOutGridItem {
-        *self
-            .laid_out_items
-            .borrow()
-            .get(&item.box_)
+        self.collected_item(item)
+            .laid_out
+            .get()
             .expect("a grid item is laid out before its baselines are read")
     }
 
@@ -4737,18 +4858,18 @@ impl<'pass> GridFormattingContext<'pass> {
     /// The block size of the margin boxes of the container's in-flow children, once its items are placed, unless a box
     /// among them is not an item.
     fn margin_box_block_extent_of_placed_in_flow_items(&self) -> Option<CssPixels> {
+        if self.has_in_flow_child_box_that_is_not_an_item {
+            return None;
+        }
         let mut block_start = CssPixels::default();
         let mut block_end = CssPixels::default();
-        for child in self.run.callbacks.children(self.run.box_) {
-            let facts = self.facts(child);
-            if facts.is_box() && !facts.is_absolutely_positioned() {
-                let metrics = self.cells_of_items.get(&child)?.get();
-                let content_block_offset = self.laid_out_items.borrow().get(&child)?.content_offset?.y;
-                let collapsed = metrics.uses_collapsing_borders_model();
-                block_start = block_start.min(content_block_offset - metrics.margin_box_top(collapsed));
-                block_end = block_end
-                    .max(content_block_offset + metrics.content_block_size() + metrics.margin_box_bottom(collapsed));
-            }
+        for collected in &self.collected_items {
+            let metrics = collected.cells.get();
+            let content_block_offset = collected.laid_out.get()?.content_offset?.y;
+            let collapsed = metrics.uses_collapsing_borders_model();
+            block_start = block_start.min(content_block_offset - metrics.margin_box_top(collapsed));
+            block_end = block_end
+                .max(content_block_offset + metrics.content_block_size() + metrics.margin_box_bottom(collapsed));
         }
         Some(block_end - block_start)
     }
@@ -5075,7 +5196,11 @@ impl<'pass> GridFormattingContext<'pass> {
             self.automatic_content_block_size = intrinsic_block_size;
         } else if let AvailableSize::Definite(block_size) = available.block_size
             && self.sizing().should_treat_block_size_as_auto(
-                sizing_context::SizedBox::new(self.run.box_, &self.run.root_record()),
+                sizing_context::SizedBox::of_own_metrics(
+                    self.run.box_,
+                    &self.container_cells,
+                    self.run.callbacks.frame,
+                ),
                 available,
                 self.layout_input.unwrap().containing_block_constraints,
             )
@@ -5116,7 +5241,9 @@ impl<'pass> GridFormattingContext<'pass> {
         self.automatic_content_block_size
     }
 
-    pub(crate) fn parent_did_dimension(&self) {
+    pub(crate) fn parent_did_dimension(&self, root_after_epilogue: used_values::RootInputCells) {
+        // NB: The static positions and containing blocks of the abspos children use the container as the run sized it.
+        self.container_cells.set(root_after_epilogue);
         // https://drafts.csswg.org/css-grid-2/#static-position
         // The static position of an absolutely-positioned child of a grid container is determined as if it were the
         // sole grid item in a grid area whose edges coincide with the content edges of the grid container.
@@ -5144,8 +5271,8 @@ impl<'pass> GridFormattingContext<'pass> {
                     rect: geometry::LogicalRect {
                         offset: Default::default(),
                         size: geometry::LogicalSize {
-                            inline_size: self.container_used().content_inline_size.get(),
-                            block_size: self.container_used().content_block_size.get(),
+                            inline_size: self.container_cells.content_inline_size(),
+                            block_size: self.container_cells.content_block_size(),
                         },
                     },
                     inline_alignment: static_position_alignment(child, horizontal_axis),

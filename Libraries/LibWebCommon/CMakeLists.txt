@@ -57,6 +57,7 @@ set(SOURCES
     Page/MediaContextMenu.cpp
     Page/SpellingError.cpp
     Page/WritingSuggestion.cpp
+    Permissions/Permissions.cpp
     PermissionsPolicy/PermissionsPolicy.cpp
     PixelUnits.cpp
     ReferrerPolicy/ReferrerPolicy.cpp
@@ -110,6 +111,7 @@ invoke_py_generator(
                  "${LADYBIRD_SOURCE_DIR}/Meta/Utils/utils.py"
 )
 
+compile_ipc(ContentSecurityPolicy/RemoteViolationDirective.ipc ContentSecurityPolicy/RemoteViolationDirectiveCodecs.h)
 compile_ipc(HTML/NavigationResponse.ipc HTML/NavigationResponseCodecs.h)
 compile_ipc(Page/InputEvent.ipc Page/InputEventCodecs.h)
 compile_ipc(Page/TextEditingCommand.ipc Page/TextEditingCommandCodecs.h)

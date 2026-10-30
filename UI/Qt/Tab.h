@@ -23,6 +23,7 @@
 #include <UI/Qt/BookmarksBar.h>
 #include <UI/Qt/FindInPageWidget.h>
 #include <UI/Qt/LocationEdit.h>
+#include <UI/Qt/PermissionPromptPopover.h>
 #include <UI/Qt/WebContentView.h>
 
 #include <QBoxLayout>
@@ -193,6 +194,7 @@ public:
     void update_downloads_button();
     void show_private_session_popover();
     void show_site_settings_popover();
+    void refresh_site_settings_popover();
     void show_zoom_popover();
     void show_bookmark_popover();
     void close_popovers();
@@ -217,6 +219,7 @@ private:
     void location_edit_return_pressed(String, Optional<URL::URL>, WebView::OmniboxDestinationKind);
     virtual void resizeEvent(QResizeEvent*) override;
     virtual void hideEvent(QHideEvent*) override;
+    virtual void showEvent(QShowEvent*) override;
     virtual bool event(QEvent*) override;
     virtual bool eventFilter(QObject*, QEvent*) override;
 
@@ -269,6 +272,8 @@ private:
     QPointer<DownloadsPopover> m_downloads_popover;
     QPointer<MessagePopover> m_private_session_popover;
     QPointer<SiteSettingsPopover> m_site_settings_popover;
+    // The site the open popover shows, which its changes apply to whatever the tab shows by then.
+    Optional<URL::Origin> m_site_settings_popover_origin;
     QTimer* m_content_blocking_update_timer { nullptr };
     QPointer<Popover> m_zoom_popover;
     QPointer<BookmarkPopover> m_bookmark_popover;
@@ -323,12 +328,7 @@ private:
     QPointer<QColorDialog> m_color_picker_dialog;
     QPointer<QFileDialog> m_file_picker_dialog;
     QPointer<QMessageBox> m_external_url_confirmation_dialog;
-    // Requests the same dialog would answer wait on the one open, so a page cannot stack dialogs by asking again.
-    struct PendingPermissionRequests {
-        QPointer<MessagePopover> popover;
-        Vector<Function<void(bool granted)>> on_decided;
-    };
-    HashMap<String, PendingPermissionRequests> m_pending_permission_requests;
+    PermissionPromptQueue m_permission_prompts;
 
     bool m_suppress_javascript_dialogs_until_navigation { false };
     // The dialogs the current document has shown, and whether the user stopped it from showing more.

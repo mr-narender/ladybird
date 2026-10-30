@@ -45,6 +45,7 @@
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
 #include <LibWeb/CSS/Invalidation/PartInvalidator.h>
+#include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/SelectorMatching.h>
@@ -3437,6 +3438,12 @@ void Element::children_changed(ChildrenChangedMetadata const& metadata)
         document().style_computer().style_engine().note_children_changed_beside_flown_transaction(style_node_id());
     if (child_style_uses_tree_counting_function())
         document().style_computer().style_engine().restyle_children_reading_sibling_position(*this);
+
+    // NB: Option labels include descendant text, so mutations below a wrapper must update their cached labels too.
+    for (auto* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
+        if (auto* option = as_if<HTML::HTMLOptionElement>(ancestor))
+            option->descendant_text_content_changed({});
+    }
 }
 
 void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
@@ -3487,6 +3494,17 @@ void Element::set_rendered_in_top_layer(bool rendered_in_top_layer)
         return;
     m_rendered_in_top_layer = rendered_in_top_layer;
     CSS::record_element_adjustment_facts(*this);
+    // NB: Changing the top layer boundary moves ancestor state even when focus and the pointer stay put.
+    CSS::Invalidation::invalidate_style_after_subtree_place_changed(*this, flat_tree_parent());
+    if (is_being_activated()) {
+        for (auto* node = flat_tree_parent(); node; node = node->flat_tree_parent()) {
+            if (auto* element = as_if<Element>(*node)) {
+                element->set_being_activated(!rendered_in_top_layer);
+                if (element->rendered_in_top_layer())
+                    break;
+            }
+        }
+    }
 }
 
 Layout::NodeWithStyle* Element::pseudo_element_layout_node(Layout::BegunRead const& read, CSS::PseudoElement pseudo_element) const
@@ -3650,9 +3668,14 @@ bool Element::matches_focus_within_pseudo_class() const
     if (!focused_area)
         return false;
 
+    // https://drafts.csswg.org/selectors-4/#useraction-pseudos
+    // Specifically, if these match on a given element, they also match on the element's flat tree ancestors, up to and
+    // including the first top layer element or the root element, whichever is encountered first.
     for (auto const* node = focused_area.ptr(); node; node = node->flat_tree_parent()) {
         if (node == this)
             return true;
+        if (auto const* element = as_if<Element>(*node); element && element->rendered_in_top_layer())
+            break;
     }
     return false;
 }
@@ -4978,13 +5001,27 @@ ENUMERATE_ARIA_ATTRIBUTES
 
 bool Element::is_hidden(Layout::BegunRead const& read) const
 {
-    if (layout_node(read) == nullptr)
+    // https://drafts.csswg.org/css-display-3/#valdef-display-contents
+    // The element itself does not generate any boxes, but its children and pseudo-elements still generate boxes and text sequences as normal.
+    if (!layout_node(read) && !has_display_contents())
         return true;
-    if (layout_node(read)->visibility() == CSS::Visibility::Hidden || layout_node(read)->visibility() == CSS::Visibility::Collapse || layout_node(read)->content_visibility() == CSS::ContentVisibility::Hidden)
+    auto const* inherited_box_values = style_group<CSS::ComputedValues::InheritedBoxValues>();
+    if (inherited_box_values
+        && (static_cast<CSS::Visibility>(inherited_box_values->visibility) != CSS::Visibility::Visible
+            || static_cast<CSS::ContentVisibility>(inherited_box_values->content_visibility) == CSS::ContentVisibility::Hidden))
         return true;
     for (ParentNode const* self_or_ancestor = this; self_or_ancestor; self_or_ancestor = self_or_ancestor->parent_or_shadow_host()) {
         if (self_or_ancestor->is_element()) {
-            auto aria_hidden = static_cast<DOM::Element const*>(self_or_ancestor)->aria_hidden();
+            auto const& element = static_cast<DOM::Element const&>(*self_or_ancestor);
+            // NB: A boxless display:contents element can also be inside an undisplayed subtree.
+            auto const* box_values = element.style_group<CSS::ComputedValues::BoxValues>();
+            if (box_values && CSS::display_from_ffi_display(box_values->display).is_none())
+                return true;
+            auto const* ancestor_inherited_box_values = element.style_group<CSS::ComputedValues::InheritedBoxValues>();
+            if (ancestor_inherited_box_values
+                && static_cast<CSS::ContentVisibility>(ancestor_inherited_box_values->content_visibility) == CSS::ContentVisibility::Hidden)
+                return true;
+            auto aria_hidden = element.aria_hidden();
             if (aria_hidden.has_value() && aria_hidden->utf16_view() == u"true"sv)
                 return true;
         }
@@ -6575,6 +6612,12 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         return;
     }
 
+    // https://html.spec.whatwg.org/multipage/dom.html#render-blocking-mechanism
+    // Whenever a render-blocking element el becomes browsing-context disconnected, or el's blocking attribute's
+    // value is changed so that el is no longer potentially render-blocking, then unblock rendering on el.
+    if (local_name == HTML::AttributeNames::blocking && document().is_render_blocking_element(*this) && !is_potentially_render_blocking())
+        unblock_rendering();
+
     // https://dom.spec.whatwg.org/#ref-for-concept-element-attributes-change-ext①
     // 1. If localName is slot and namespace is null, then:
     if (local_name == HTML::AttributeNames::slot) {
@@ -7014,7 +7057,12 @@ bool Element::meets_focusable_area_rendering_requirements() const
     if (!is_connected())
         return false;
 
-    return const_cast<Element&>(*this).document().update_style_for_element(AbstractElement { *this }, Document::StyleUpdateMode::StopAtDisplayNone);
+    if (!const_cast<Element&>(*this).document().update_style_for_element(AbstractElement { *this }, Document::StyleUpdateMode::StopAtDisplayNone))
+        return false;
+
+    // NB: Elements whose boxes are not visible cannot be focused.
+    auto const* values = style_group<CSS::ComputedValues::InheritedBoxValues>();
+    return values && values->visibility_value() == CSS::Visibility::Visible;
 }
 
 // https://drafts.csswg.org/css-view-transitions-1/#document-scoped-view-transition-name
@@ -7210,7 +7258,9 @@ bool Element::should_indicate_focus() const
 
     // * If the element which supports keyboard input (such as an input element, or any other element that would
     //   triggers a virtual keyboard to be shown on focus if a physical keyboard were not present), indicate focus.
-    if (is<HTML::FormAssociatedTextControlElement>(this) || is_editable_or_editing_host())
+    if (is<HTML::HTMLTextAreaElement>(this) || is_editable_or_editing_host())
+        return true;
+    if (auto const* input = as_if<HTML::HTMLInputElement>(this); input && input->has_selectable_text())
         return true;
 
     // * If the user interacts with the page via keyboard or some other non-pointing device, indicate focus. (This means
@@ -7369,10 +7419,25 @@ void Element::unblock_rendering()
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#potentially-render-blocking
 bool Element::is_potentially_render_blocking()
 {
-    // An element is potentially render-blocking if
-    // FIXME: its blocking tokens set contains "render",
-    // or if it is implicitly potentially render-blocking, which will be defined at the individual elements.
-    return is_implicitly_potentially_render_blocking();
+    // An element is potentially render-blocking if its blocking tokens set contains "render", or if it is
+    // implicitly potentially render-blocking, which will be defined at the individual elements.
+    if (is_implicitly_potentially_render_blocking())
+        return true;
+    if (namespace_uri() != Namespace::HTML || !local_name().is_one_of(HTML::TagNames::link, HTML::TagNames::script, HTML::TagNames::style))
+        return false;
+    auto value = attribute(HTML::AttributeNames::blocking);
+    if (!value.has_value())
+        return false;
+    auto tokens = value->utf16_view();
+    size_t start = 0;
+    for (size_t i = 0; i <= tokens.length_in_code_units(); ++i) {
+        if (i != tokens.length_in_code_units() && !Infra::is_ascii_whitespace(tokens.code_unit_at(i)))
+            continue;
+        if (i > start && tokens.substring_view(start, i - start).equals_ignoring_ascii_case(u"render"sv))
+            return true;
+        start = i + 1;
+    }
+    return false;
 }
 
 }

@@ -31,6 +31,7 @@
 #endif
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/Motion.h>
+#include <UI/Qt/PermissionPromptPopover.h>
 #include <UI/Qt/Popover.h>
 #include <UI/Qt/RestoreSessionCard.h>
 #include <UI/Qt/SiteSettingsPopover.h>
@@ -602,7 +603,6 @@ static constexpr int toolbar_right_margin(bool has_custom_window_controls)
 static constexpr int DOWNLOADS_POPOVER_WIDTH = 380;
 static constexpr int DOWNLOADS_POPOVER_MAX_HEIGHT = 360;
 static constexpr int PRIVATE_SESSION_POPOVER_WIDTH = 320;
-static constexpr int PERMISSION_POPOVER_WIDTH = 352;
 
 class ElidedLabel final : public QLabel {
 public:
@@ -1574,11 +1574,7 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         }
         if (m_external_url_confirmation_dialog)
             m_external_url_confirmation_dialog->close();
-        auto pending_permission_requests = AK::move(m_pending_permission_requests);
-        for (auto& it : pending_permission_requests) {
-            if (it.value.popover)
-                it.value.popover->close();
-        }
+        m_permission_prompts.ignore_all();
     };
 
     view().on_request_external_url_confirmation = [this](auto const& url, auto const& initiator_origin, auto const& handler, auto on_complete) {
@@ -1618,41 +1614,35 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         dialog->open();
     };
 
-    // A site's request for a permission hangs from the site settings button, and is denied unless it is allowed.
-    view().on_request_permission = [this](auto const& name, auto const& origin, auto on_decided) {
-        auto requester = origin.is_opaque() ? "This page"_string : origin.host().serialize();
-        auto question = MUST(String::formatted("{} wants to use your {}", requester, name));
-        if (auto pending = m_pending_permission_requests.get(question); pending.has_value()) {
-            pending.value().on_decided.append(AK::move(on_decided));
-            return;
-        }
-
-        // NB: The microphone is the only feature a site asks for permission to use.
-        auto icon = name == "microphone"sv ? create_chrome_icon(ChromeIcon::Microphone, Theme::panel().link) : QIcon {};
-        auto* popover = new MessagePopover(this, PERMISSION_POPOVER_WIDTH, qstring_from_ak_string(question), {}, "Block", "Allow", icon);
-        popover->setAttribute(Qt::WA_DeleteOnClose);
+    // A site's request for a permission hangs from the site settings button, or from the field when the page has no
+    // such button.
+    m_permission_prompts.create_popover = [this](WebView::PermissionPromptRequest const& request) {
+        auto* popover = new PermissionPromptPopover(this, request);
         popover->update_chrome_style(palette());
-
-        PendingPermissionRequests pending { .popover = popover, .on_decided = {} };
-        pending.on_decided.append(AK::move(on_decided));
-        m_pending_permission_requests.set(question, AK::move(pending));
-
-        auto decide = [this, question](bool granted) {
-            auto pending = m_pending_permission_requests.take(question);
-            if (!pending.has_value())
-                return;
-            for (auto& on_decided : pending.value().on_decided)
-                on_decided(granted);
+        auto position = [this, popover] {
+            auto& anchor = m_location_edit->site_settings_button();
+            QWidget& anchor_or_field = anchor.isVisible() ? anchor : static_cast<QWidget&>(*m_location_edit);
+            move_popover_below(*popover, anchor_or_field, PopoverAlignment::Leading);
         };
-        popover->on_accept = [decide] { decide(true); };
-        popover->on_dismiss = [decide] { decide(false); };
-
-        auto& anchor = m_location_edit->site_settings_button();
-        QWidget& anchor_or_field = anchor.isVisible() ? anchor : static_cast<QWidget&>(*m_location_edit);
         popover->adjustSize();
-        move_popover_below(*popover, anchor_or_field, PopoverAlignment::Leading);
-        popover->show();
-        move_popover_below(*popover, anchor_or_field, PopoverAlignment::Leading);
+        position();
+        popover->on_shown = AK::move(position);
+        return popover;
+    };
+
+    view().on_request_permission = [this](WebView::PermissionPromptRequest const& request, WebView::PermissionPromptCallback on_outcome) {
+        // A tab opened in the background has never been shown, so no hideEvent has suspended its prompts yet.
+        if (!isVisible())
+            m_permission_prompts.suspend();
+        m_permission_prompts.enqueue(request, AK::move(on_outcome));
+    };
+
+    view().on_cancel_permission_prompt = [this](WebView::PermissionPromptRequest const& request) {
+        m_permission_prompts.cancel(request);
+    };
+
+    view().on_location_in_use_change = [this](bool in_use) {
+        m_location_edit->set_location_in_use(in_use);
     };
 
     view().on_request_accept_dialog = [this]() {
@@ -2313,6 +2303,15 @@ void Tab::hideEvent(QHideEvent* event)
 
     set_bookmarks_bar_hover_expanded(false);
     hide_hover_label();
+
+    // A tab's permission prompt waits, unanswered, while another tab is shown.
+    m_permission_prompts.suspend();
+}
+
+void Tab::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    m_permission_prompts.resume();
 }
 
 void Tab::update_hover_label()
@@ -2699,7 +2698,9 @@ void Tab::close_popovers()
 void Tab::show_site_settings_popover()
 {
     auto url = view().url();
-    if (!url.host().has_value())
+    // A page on an inherited about:blank has its opener's origin and no host of its own; the panel is for it too.
+    auto origin = view().permission_origin();
+    if (!url.host().has_value() && origin.is_opaque())
         return;
 
     if (!m_site_settings_popover) {
@@ -2722,20 +2723,47 @@ void Tab::show_site_settings_popover()
         m_site_settings_popover->on_open_filter_lists = [this] {
             m_window->new_tab_from_url(URL::Parser::basic_parse("about:settings#blocking"sv).release_value(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
         };
+        // A change reaches every page of the site at once, and the panel shows it right away. It applies to the site
+        // the panel was opened for: its menu runs a nested event loop, during which the tab may move on to another.
+        m_site_settings_popover->on_permission_change = [this](Web::Permissions::PermissionName name, Optional<WebView::PermissionDecision> decision) {
+            view().set_site_permission(*m_site_settings_popover_origin, name, decision);
+            refresh_site_settings_popover();
+        };
+        m_site_settings_popover->on_reset_permissions = [this] {
+            view().reset_site_permissions(*m_site_settings_popover_origin);
+            refresh_site_settings_popover();
+        };
     }
 
+    m_site_settings_popover_origin = origin;
     m_site_settings_popover->update_chrome_style(palette());
     m_site_settings_popover->set_site({
-        .host = MUST(String::from_utf8(url.serialized_host())),
-        .is_secure = url.scheme() == "https"sv,
+        .host = url.host().has_value() ? MUST(String::from_utf8(url.serialized_host())) : origin.host().serialize(),
+        .is_secure = (url.host().has_value() ? url.scheme() : origin.scheme().value_or({})) == "https"sv,
         .favicon = m_favicon,
         .content_blocking = view().content_blocking_snapshot(),
+        .permissions = view().site_permission_rows(),
     });
+    // The site settings button is hidden for a page with no host, so the popover hangs from the field then.
     auto& anchor = m_location_edit->site_settings_button();
-    move_popover_below(*m_site_settings_popover, anchor, PopoverAlignment::Leading);
+    QWidget& anchor_or_field = anchor.isVisible() ? anchor : static_cast<QWidget&>(*m_location_edit);
+    move_popover_below(*m_site_settings_popover, anchor_or_field, PopoverAlignment::Leading);
     m_site_settings_popover->show();
-    move_popover_below(*m_site_settings_popover, anchor, PopoverAlignment::Leading);
+    move_popover_below(*m_site_settings_popover, anchor_or_field, PopoverAlignment::Leading);
     m_site_settings_popover->raise();
+}
+
+// The rows are read again for the site the panel was opened for; a panel whose tab has moved on to another site closes
+// instead, since its rows would be the new site's.
+void Tab::refresh_site_settings_popover()
+{
+    if (!m_site_settings_popover)
+        return;
+    if (!view().permission_origin().is_same_origin(*m_site_settings_popover_origin)) {
+        m_site_settings_popover->close();
+        return;
+    }
+    m_site_settings_popover->set_permissions(view().site_permission_rows());
 }
 
 void Tab::show_private_session_popover()

@@ -20,10 +20,6 @@ pub(crate) struct ResolvedBlockSize {
 }
 
 impl ResolvedBlockSize {
-    pub(crate) fn apply_to_record(self, used: used_values::RecordInFrame<'_>) {
-        used.update(|cells| self.apply_to_cells(cells));
-    }
-
     pub(crate) fn apply_to_cells(self, cells: &mut used_values::RootInputCells) {
         cells.set_content_block_size(self.content_block_size);
         if self.makes_block_size_definite {
@@ -130,13 +126,17 @@ pub(crate) struct TableWrapperBlockSizes {
     pub(crate) wrapper_content_block_size: CssPixels,
 }
 
-/// A box a sizing step sizes, with the sizes, size constraints and box sides the step reads of it: held in its record
-/// or in cells of the parent that sizes it.
+/// A box a sizing step sizes, with the sizes, size constraints and box sides the step reads of it: held in cells of its
+/// own or in cells of the parent that sizes it.
 #[derive(Clone, Copy)]
 pub(crate) struct SizedBox<'metrics> {
     pub(crate) node: Node,
     /// What the caller holds of the box, which is nothing for a box its run does not hold yet.
     metrics: Option<&'metrics dyn BoxMetricCells>,
+    /// Where the metrics are the box's own (held by the run or call that sizes the box, not by a parent sizing it ahead
+    /// of its run), the frame they are held in. content_block_size_of_orthogonal_flow() reads such metrics in the box's
+    /// own frame.
+    own_metrics_frame: Option<geometry::Frame>,
 }
 
 impl<'metrics> SizedBox<'metrics> {
@@ -144,19 +144,25 @@ impl<'metrics> SizedBox<'metrics> {
         Self {
             node,
             metrics: Some(metrics),
+            own_metrics_frame: None,
+        }
+    }
+
+    /// `node`, with metrics of its own that are held in frame `held_in`.
+    pub(crate) fn of_own_metrics(node: Node, metrics: &'metrics dyn BoxMetricCells, held_in: geometry::Frame) -> Self {
+        Self {
+            node,
+            metrics: Some(metrics),
+            own_metrics_frame: Some(held_in),
         }
     }
 
     /// `node`, of which its caller holds no metrics.
     pub(crate) fn unheld(node: Node) -> Self {
-        Self { node, metrics: None }
-    }
-
-    /// `node`, with the metrics its caller holds of it, if any.
-    pub(crate) fn held_if_any(node: Node, metrics: Option<&'metrics impl BoxMetricCells>) -> Self {
         Self {
             node,
-            metrics: metrics.map(|metrics| metrics as &dyn BoxMetricCells),
+            metrics: None,
+            own_metrics_frame: None,
         }
     }
 
@@ -174,25 +180,27 @@ impl<'metrics> SizedBox<'metrics> {
     }
 }
 
-/// A box a sizing step sizes in its record, which the step writes what it resolves to.
+/// A box a sizing step sizes in its own cells, held in `frame`. The step reads the cells in that frame and writes to
+/// them what it resolves.
 #[derive(Clone, Copy)]
-pub(crate) struct SizedRecord<'record> {
+pub(crate) struct SizedCells<'cells> {
     pub(crate) node: Node,
-    pub(crate) record: used_values::RecordInFrame<'record>,
+    pub(crate) cells: &'cells Cell<used_values::RootInputCells>,
+    pub(crate) frame: geometry::Frame,
 }
 
-impl<'record> SizedRecord<'record> {
-    pub(crate) fn new(node: Node, record: used_values::RecordInFrame<'record>) -> Self {
-        Self { node, record }
+impl<'cells> SizedCells<'cells> {
+    pub(crate) fn new(node: Node, cells: &'cells Cell<used_values::RootInputCells>, frame: geometry::Frame) -> Self {
+        Self { node, cells, frame }
     }
 
-    pub(crate) fn sized_box(&self) -> SizedBox<'_> {
-        SizedBox::new(self.node, &self.record)
+    pub(crate) fn sized_box(&self) -> SizedBox<'cells> {
+        SizedBox::of_own_metrics(self.node, self.cells, self.frame)
     }
 }
 
 pub(crate) struct SizingContext<'pass, 'container> {
-    records: &'pass RunRecords<'pass>,
+    state: &'pass RunState,
     callbacks: LayoutPass<'pass>,
     style_cache: Cell<Option<(Node, &'pass FfiStylePayloads)>>,
     child_run_shapes: Option<&'container dyn formatting_context::ChildRunShapes>,
@@ -246,9 +254,9 @@ pub(crate) fn stretch_fit_block_margins(
 
 impl<'pass, 'container> SizingContext<'pass, 'container> {
     #[inline]
-    pub(crate) fn new(records: &'pass RunRecords<'pass>, callbacks: LayoutPass<'pass>) -> Self {
+    pub(crate) fn new(state: &'pass RunState, callbacks: LayoutPass<'pass>) -> Self {
         Self {
-            records,
+            state,
             callbacks,
             style_cache: Cell::new(None),
             child_run_shapes: None,
@@ -288,12 +296,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         if !style.is_absolutely_positioned() {
             return style;
         }
-        let anchor_resolved_values = self
-            .records
-            .used_values_if_owned(node)
-            .and_then(|used| used.anchor_resolved_values.get())
-            .map(|resolved| &**resolved);
-        style.with_anchor_resolved_values(anchor_resolved_values)
+        style.with_anchor_resolved_values(self.state.anchor_resolved_values_of(node))
     }
 
     fn first_child(&self, node: Node) -> Node {
@@ -1156,7 +1159,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             && facts.is_anonymous()
             && !facts.is_table_cell()
             && !facts.has_auto_content_box_size()
-            && (!self.records.measures_content_inline_sizes_of(node) || self.is_anonymous_block_box_in_block_flow(node))
+            && (!self.state.measures_content_inline_sizes_of(node) || self.is_anonymous_block_box_in_block_flow(node))
     }
 
     fn is_anonymous_block_box_in_block_flow(&self, node: Node) -> bool {
@@ -1356,13 +1359,13 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
     }
 
     pub(crate) fn resolve_percentage_block_size_dependency(&self, node: Node) -> bool {
-        let found = self.records.percentage_block_size_dependency_of(node);
+        let found = self.state.percentage_block_size_dependency_of(node);
         let depends_on_percentage_block_size = found.depends_on_percentage_block_size
             || self.own_style_depends_on_percentage_block_size(node)
             || (found.has_descendant_that_depends_on_percentage_block_size
                 && self.passes_percentage_block_size_through_to_children(node));
         if depends_on_percentage_block_size {
-            self.records.note_box_depends_on_percentage_block_size(node);
+            self.state.note_box_depends_on_percentage_block_size(node);
         }
         depends_on_percentage_block_size
     }
@@ -1426,9 +1429,9 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         if !depends_on_percentage_block_size {
             return;
         }
-        self.records.note_box_depends_on_percentage_block_size(node);
+        self.state.note_box_depends_on_percentage_block_size(node);
         formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
-            self.records,
+            self.state,
             &self.callbacks,
             node,
             true,
@@ -1878,13 +1881,9 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             content_constraints.percentage_basis_inline_size = Some(other_axis_size);
             content_constraints.percentage_basis_block_size = Some(transferred_size);
             if self.establishes_orthogonal_flow(content_box) {
-                // NB: The run measuring the button may not hold its content box, whose sizing reads no metrics of it.
-                let content_box_record = self
-                    .records
-                    .used_values_if_owned(content_box)
-                    .map(|record| used_values::RecordInFrame::new(record, self.callbacks.frame));
+                // NB: A run that sizes the button never holds its content box, whose sizing reads no metrics of it.
                 return self.content_block_size_of_orthogonal_flow(
-                    SizedBox::held_if_any(content_box, content_box_record.as_ref()),
+                    SizedBox::unheld(content_box),
                     other_axis_size,
                     content_constraints,
                     IntrinsicSizeCacheKind::MaxContentInline,
@@ -1931,27 +1930,27 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
     /// box's content block size is known. Without a known content block size, the content is measured.
     pub(crate) fn apply_automatic_minimum_block_size_from_aspect_ratio(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         content_block_size: Option<CssPixels>,
     ) {
-        let sized = sized_record.sized_box();
+        let sized = sized_cells.sized_box();
         if !self.block_size_is_ratio_dependent(sized, available_space, constraints) {
             return;
         }
         let Some(minimum) = self.automatic_minimum_size_from_aspect_ratio(
             sized,
             SizingAxis::Block,
-            sized_record.record.content_inline_size(),
-            sized_record.record.content_block_size(),
+            sized_cells.cells.content_inline_size(),
+            sized_cells.cells.content_block_size(),
             available_space,
             constraints,
             content_block_size,
         ) else {
             return;
         };
-        let used = sized_record.record;
+        let used = sized_cells.cells;
         if used.content_block_size() < minimum {
             used.set_content_block_size(minimum);
         }
@@ -1959,13 +1958,13 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
 
     pub(crate) fn resolve_used_block_size_if_not_treated_as_auto(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
     ) {
-        let sized = sized_record.sized_box();
+        let sized = sized_cells.sized_box();
         if let Some(resolved) = self.used_block_size_if_not_treated_as_auto(sized, available_space, constraints) {
-            resolved.apply_to_record(sized_record.record);
+            sized_cells.cells.update_cells(|cells| resolved.apply_to_cells(cells));
         }
     }
 
@@ -1995,13 +1994,13 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
 
     pub(crate) fn resolve_used_block_size_if_treated_as_auto(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         child_automatic_block_size: Option<CssPixels>,
         automatic_block_size_fallback: impl FnOnce() -> CssPixels,
     ) {
-        let sized = sized_record.sized_box();
+        let sized = sized_cells.sized_box();
         if let Some(resolved) = self.used_block_size_if_treated_as_auto(
             sized,
             available_space,
@@ -2009,7 +2008,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             child_automatic_block_size,
             automatic_block_size_fallback,
         ) {
-            resolved.apply_to_record(sized_record.record);
+            sized_cells.cells.update_cells(|cells| resolved.apply_to_cells(cells));
         }
     }
 
@@ -2101,36 +2100,36 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
 
     pub(crate) fn resolve_box_model_metrics_against_inline_basis(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
         containing_inline_size: CssPixels,
     ) {
-        let node = sized_record.node;
+        let node = sized_cells.node;
         let style = self.style(node);
-        let used = sized_record.record;
-        used.resolve_box_model(&style, containing_inline_size);
+        let used = sized_cells.cells;
+        used.update_cells(|cells| cells.resolve_box_model(&style, containing_inline_size));
     }
 
     /// Sizes an empty atomic block. Where a committing layout takes its metrics from its committed fragment as they
     /// are, returns that fragment.
     pub(crate) fn dimension_empty_atomic_root(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         layout_builds_fragments: bool,
     ) -> Option<std::sync::Arc<fragment_tree::Fragment>> {
-        if layout_builds_fragments && let Some(fragment) = self.try_reuse_empty_atomic_root_metrics(sized_record) {
+        if layout_builds_fragments && let Some(fragment) = self.try_reuse_empty_atomic_root_metrics(sized_cells) {
             return Some(fragment);
         }
-        self.dimension_empty_atomic_root_fresh(sized_record, available_space, constraints);
+        self.dimension_empty_atomic_root_fresh(sized_cells, available_space, constraints);
         None
     }
 
     fn try_reuse_empty_atomic_root_metrics(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
     ) -> Option<std::sync::Arc<fragment_tree::Fragment>> {
-        let node = sized_record.node;
+        let node = sized_cells.node;
         let facts = self.facts(node);
         debug_assert!(
             formatting_context::formatting_context_type_created_by_box(facts)
@@ -2157,55 +2156,55 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         {
             return None;
         }
-        let used = sized_record.record;
+        let used = sized_cells.cells;
         self.callbacks
             .arena()
             .with_current_committed_fragment(node, |fragment| {
-                used.set_box_metrics_from_fragment(fragment);
+                used.update_cells(|cells| cells.take_box_metrics_of_fragment(fragment));
                 fragment.clone()
             })
     }
 
     fn dimension_empty_atomic_root_fresh(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
     ) {
-        let sized = sized_record.sized_box();
-        self.dimension_atomic_root(sized_record, available_space, constraints, false);
+        let sized = sized_cells.sized_box();
+        self.dimension_atomic_root(sized_cells, available_space, constraints, false);
         self.resolve_used_block_size_if_treated_as_auto(
-            sized_record,
+            sized_cells,
             available_space,
             constraints,
             Some(CssPixels::default()),
             || unreachable!("an empty atomic block has a zero automatic content block size"),
         );
         if !self.box_is_sized_as_replaced_element(sized, available_space, constraints) {
-            self.resolve_used_block_size_if_not_treated_as_auto(sized_record, available_space, constraints);
+            self.resolve_used_block_size_if_not_treated_as_auto(sized_cells, available_space, constraints);
         }
     }
 
     pub(crate) fn dimension_atomic_root(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         report_for_run_cache_the_available_inline_sizes_this_sizing_repeats_for: bool,
     ) -> Option<CssPixels> {
-        let sized = sized_record.sized_box();
+        let sized = sized_cells.sized_box();
         let node = sized.node;
         let containing_inline_size = available_space.inline_size.to_px_or_zero();
         let style = self.style(node);
-        self.resolve_box_model_metrics_against_inline_basis(sized_record, containing_inline_size);
+        self.resolve_box_model_metrics_against_inline_basis(sized_cells, containing_inline_size);
 
         let facts = self.facts(node);
         if self.box_is_sized_as_replaced_element(sized, available_space, constraints) {
             let inline_size = self.compute_inline_size_for_replaced_element(sized, available_space, constraints);
-            sized_record.record.set_content_inline_size(inline_size);
+            sized_cells.cells.set_content_inline_size(inline_size);
 
             let block_size = self.compute_block_size_for_replaced_element(sized, available_space, constraints);
-            sized_record.record.set_content_block_size(block_size);
+            sized_cells.cells.set_content_block_size(block_size);
 
             // Native form controls lay out their internal shadow contents against the concrete size produced by
             // replaced sizing. That size remains definite when a min/max constraint clamps the automatic preferred
@@ -2221,19 +2220,21 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
 
             let block_size_is_automatic = self.preferred_block_size(node, constraints).is_auto()
                 || self.should_treat_block_size_as_auto(sized, available_space, constraints);
-            let block_size_is_definite_from_aspect_ratio = sized_record.record.has_definite_inline_size()
+            let block_size_is_definite_from_aspect_ratio = sized_cells.cells.has_definite_inline_size()
                 && facts.has_preferred_aspect_ratio()
                 && block_size_is_automatic;
 
             if native_control_block_size_constraint_is_active || block_size_is_definite_from_aspect_ratio {
-                sized_record.record.update(|cells| cells.has_definite_block_size = true);
+                sized_cells
+                    .cells
+                    .update_cells(|cells| cells.has_definite_block_size = true);
             }
             return None;
         }
 
         let resolution = self.calculate_atomic_root_content_inline_size(sized, available_space, constraints);
-        sized_record
-            .record
+        sized_cells
+            .cells
             .set_content_inline_size(resolution.content_inline_size);
         let sizing_repeats_for_available_inline_sizes_at_or_above =
             report_for_run_cache_the_available_inline_sizes_this_sizing_repeats_for
@@ -2250,8 +2251,8 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             inline_size: AvailableSize::definite(resolution.content_inline_size),
             block_size: AvailableSize::Indefinite,
         };
-        self.resolve_used_block_size_if_not_treated_as_auto(sized_record, inline_definite_space, constraints);
-        self.make_form_control_content_box_definite(sized_record, available_space, constraints, None);
+        self.resolve_used_block_size_if_not_treated_as_auto(sized_cells, inline_definite_space, constraints);
+        self.make_form_control_content_box_definite(sized_cells, available_space, constraints, None);
         sizing_repeats_for_available_inline_sizes_at_or_above
     }
 
@@ -2406,17 +2407,15 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         let indefinite_inline_basis = CssPixels::default();
         root.resolve_box_model(&self.style(node), indefinite_inline_basis);
         let (contributions, percentage_block_size_dependency_its_layout_would_report) =
-            RunRecords::with_content_sizing_root(
+            RunState::with_content_sizing_root(
                 self.callbacks,
                 node,
                 self.callbacks.in_flow_containing_block(node),
-                root,
-                |records, callbacks| {
-                    let sizing = SizingContext::new(records, callbacks);
-                    let root_record = used_values::RecordInFrame::new(records.used_values(node), callbacks.frame);
+                |state, callbacks| {
+                    let sizing = SizingContext::new(state, callbacks);
                     let inline_size_under = |inline_size| {
                         sizing.atomic_root_content_inline_size(
-                            SizedBox::new(node, &root_record),
+                            SizedBox::of_own_metrics(node, &root, callbacks.frame),
                             AvailableSpace {
                                 inline_size,
                                 block_size: available_block_size,
@@ -2426,19 +2425,18 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                     };
                     let max_content_inline_size = inline_size_under(AvailableSize::MaxContent);
                     let min_content_inline_size = inline_size_under(AvailableSize::MinContent);
-                    let root_used = records.used_values(node);
                     (
                         OuterInlineContributions {
                             min_content_inline_size,
                             max_content_inline_size,
-                            margin_start: root_used.margin_left(),
-                            border_start: root_used.border_left(),
-                            padding_start: root_used.padding_left(),
-                            padding_end: root_used.padding_right(),
-                            border_end: root_used.border_right(),
-                            margin_end: root_used.margin_right(),
+                            margin_start: root.margin_left,
+                            border_start: root.border_left,
+                            padding_start: root.padding_left,
+                            padding_end: root.padding_right,
+                            border_end: root.border_right,
+                            margin_end: root.margin_right,
                         },
-                        records
+                        state
                             .percentage_block_size_dependency_of(node)
                             .depends_on_percentage_block_size
                             || sizing.skipped_child_depends_on_percentage_block_size(node),
@@ -2446,7 +2444,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 },
             );
         formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
-            self.records,
+            self.state,
             &self.callbacks,
             node,
             percentage_block_size_dependency_its_layout_would_report,
@@ -2720,7 +2718,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         self.single_content_inline_size(
             sized,
             constraints,
-            self.definite_block_size_of_replaced_box_in_record(sized),
+            self.definite_block_size_of_replaced_box_in_held_metrics(sized),
             IntrinsicSizeCacheKind::MaxContentInline,
         )
     }
@@ -2739,7 +2737,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         )
     }
 
-    fn definite_block_size_of_replaced_box_in_record(&self, sized: SizedBox<'_>) -> Option<CssPixels> {
+    fn definite_block_size_of_replaced_box_in_held_metrics(&self, sized: SizedBox<'_>) -> Option<CssPixels> {
         let node = sized.node;
         if !self.facts(node).is_replaced_box() {
             return None;
@@ -2762,7 +2760,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
     }
 
     fn charge_content_sizing_scope_with(&self, node: Node, dependencies: IntrinsicMeasurementDependencies) {
-        if self.records.is_content_sizing() {
+        if self.state.is_content_sizing() {
             self.charge_measurement_dependency_to_measured_box_and_containing_block(
                 node,
                 dependencies.percentage_block_size,
@@ -3101,11 +3099,11 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         }
         let key = formatting_context::cache_key(None, block_size, constraints);
         if let Some(cached) = self.intrinsic_inline_measurement_cache_get(node, key) {
-            self.callbacks.arena().layout_trace.intrinsic_size_hit(node, kind);
+            self.callbacks.layout_trace().intrinsic_size_hit(node, kind);
             return ContentInlineSizeAnswer::from_cache(cached, kind);
         }
 
-        let trace = self.callbacks.arena().layout_trace.intrinsic_size_miss(node, kind);
+        let trace = self.callbacks.layout_trace().intrinsic_size_miss(node, kind);
         let depends_on_block_size = self.intrinsic_inline_measurement_may_depend_on_block_size(node, block_size);
         let scope = || intrinsic_sizing::ContentSizingScope::new(&self.callbacks, node, constraints, block_size);
         let facts = self.facts(node);
@@ -3236,7 +3234,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         let kind = IntrinsicSizeCacheKind::MaxContentBlock;
         let key = formatting_context::cache_key(Some(inline_size), None, constraints);
         if let Some(cached) = self.intrinsic_block_cache_get(node, kind, key) {
-            self.callbacks.arena().layout_trace.intrinsic_size_hit(node, kind);
+            self.callbacks.layout_trace().intrinsic_size_hit(node, kind);
             return cached.size;
         }
 
@@ -3245,7 +3243,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         {
             formatting_context::lay_out_shape_for_its_result(self.callbacks, shape)
         } else {
-            let _trace = self.callbacks.arena().layout_trace.intrinsic_size_miss(node, kind);
+            let _trace = self.callbacks.layout_trace().intrinsic_size_miss(node, kind);
             self.measure_block_size_with_normal_layout(node, inline_size, constraints)
         };
         let value = clamp_to_max_dimension_value(result.automatic_content_block_size);
@@ -3302,19 +3300,18 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
     ) -> CssPixels {
         let node = sized.node;
         let own_frame = formatting_context::frame_established_by(&self.callbacks, node);
-        let sizing = SizingContext::new(self.records, self.callbacks.in_frame_of(own_frame.writing_mode()));
+        let sizing = SizingContext::new(self.state, self.callbacks.in_frame_of(own_frame.writing_mode()));
         let constraints_in_own_frame = ContainingBlockConstraints {
             percentage_basis_inline_size: constraints.percentage_basis_block_size,
             percentage_basis_block_size: constraints.percentage_basis_inline_size,
             quirks_mode_percentage_basis_block_size: None,
         };
-        // NB: A record of the box is read in the box's own frame. Cells its parent sizes it in are read as they are.
-        let record_in_own_frame = sized
-            .metrics_if_held()
-            .and_then(|metrics| metrics.record_viewed())
-            .map(|record| used_values::RecordInFrame::new(record, sizing.callbacks.frame));
-        let sized_in_own_frame = match &record_in_own_frame {
-            Some(record) => SizedBox::new(node, record),
+        // NB: The box's own metrics are read in the box's own frame. Cells its parent sizes it in are read as they are.
+        let own_metrics_in_own_frame = sized
+            .own_metrics_frame
+            .map(|held_in| sized.metrics().cells().in_frame(held_in, sizing.callbacks.frame));
+        let sized_in_own_frame = match &own_metrics_in_own_frame {
+            Some(cells) => SizedBox::of_own_metrics(node, cells, sizing.callbacks.frame),
             None => sized,
         };
         let answer = sizing.content_inline_size(sized_in_own_frame, constraints_in_own_frame, Some(inline_size), kind);
@@ -3462,12 +3459,12 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
     /// before the content is laid out, also where a min or max block size decides an automatic block size.
     pub(crate) fn make_form_control_content_box_definite(
         &self,
-        sized_record: SizedRecord<'_>,
+        sized_cells: SizedCells<'_>,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
         measured_content_block_size: Option<CssPixels>,
     ) {
-        let sized = sized_record.sized_box();
+        let sized = sized_cells.sized_box();
         let node = sized.node;
         let facts = self.facts(node);
         // https://drafts.csswg.org/css-ui-4/#input-rules
@@ -3545,7 +3542,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         if !content_box_needs_to_be_definite {
             return;
         }
-        sized_record.record.update(|cells| {
+        sized_cells.cells.update_cells(|cells| {
             cells.set_content_block_size(used_block_size);
             cells.has_definite_block_size = true;
             cells.has_definite_block_size_only_for_button_content_alignment =
@@ -3572,7 +3569,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         wrapper: Node,
         containing_block_inline_size: CssPixels,
         table_constraints: ContainingBlockConstraints,
-        size_table: impl FnOnce(&FormattingContextRun<'_>) -> R,
+        size_table: impl FnOnce(&FormattingContextRun<'_>, used_values::RootInputCells) -> R,
     ) -> R {
         let table_box = self.table_box_inside_wrapper(wrapper);
         let mut table_cells = used_values::cells_before_sizing(&self.callbacks, table_box, table_constraints);
@@ -3582,14 +3579,13 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         table_cells.padding_left = table_style.padding_left().to_px(containing_block_inline_size);
         table_cells.padding_right = table_style.padding_right().to_px(containing_block_inline_size);
 
-        RunRecords::with_content_sizing_root(
+        RunState::with_content_sizing_root(
             self.callbacks,
             table_box,
             self.callbacks.in_flow_containing_block(table_box),
-            table_cells,
-            |records, callbacks| {
+            |state, callbacks| {
                 let table_run = FormattingContextRun {
-                    records,
+                    state,
                     box_: table_box,
                     callbacks,
                     should_collect_devtools_layout_data: false,
@@ -3597,7 +3593,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                     fragments: None,
                     fragmentainer: None,
                 };
-                size_table(&table_run)
+                size_table(&table_run, table_cells)
             },
         )
     }
@@ -3631,35 +3627,42 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         // wrapper's constraints unchanged. Callers measuring a table wrapper for grid alignment
         // pass the grid-area inline size as the wrapper's percentage basis.
         let table_constraints = table_wrapper_constraints;
-        self.size_table_box_inside_wrapper(wrapper, containing_block_inline_size, table_constraints, |table_run| {
-            let table_used = table_run.records.used_values(table_run.box_);
-            let mut table = table_formatting_context::TableFormattingContext::new(
-                table_run,
-                table_formatting_context::AutoTableInlineSize::ShrinksToFitAvailableInlineSize,
-            );
-            let table_available = table_used.available_inner_space_or_constraints_from(available_space);
-            table.run_until_inline_size_calculation(
-                LayoutInput::new(
-                    table_available,
-                    table_constraints,
-                    ParticipationInParentFormattingContext::Root,
-                ),
-                true,
-            );
+        self.size_table_box_inside_wrapper(
+            wrapper,
+            containing_block_inline_size,
+            table_constraints,
+            |table_run, table_cells| {
+                let mut table = table_formatting_context::TableFormattingContext::new(
+                    table_run,
+                    table_cells,
+                    table_formatting_context::AutoTableInlineSize::ShrinksToFitAvailableInlineSize,
+                );
+                let table_available = table_cells.available_inner_space_or_constraints_from(available_space);
+                table.run_until_inline_size_calculation(
+                    LayoutInput::new(
+                        table_available,
+                        table_constraints,
+                        ParticipationInParentFormattingContext::Root,
+                    ),
+                    true,
+                );
 
-            let table_used_inline_size = table_used.border_box_inline_size(table_used.uses_collapsing_borders_model());
-            let inline_size = if table_wrapper_inline_size_mode
-                == formatting_context::TableWrapperInlineSizeMode::UseTableUsedInlineSizeIfNotAuto
-                && !self.style(table_run.box_).width().is_auto()
-            {
-                table_used_inline_size
-            } else if matches!(available_space.inline_size, AvailableSize::Definite(_)) {
-                table_used_inline_size.min(available_inline_size)
-            } else {
-                table_used_inline_size
-            };
-            (inline_size, table.take_inline_layout())
-        })
+                let table_used = table.table_box_cells();
+                let table_used_inline_size =
+                    table_used.border_box_inline_size(table_used.uses_collapsing_borders_model());
+                let inline_size = if table_wrapper_inline_size_mode
+                    == formatting_context::TableWrapperInlineSizeMode::UseTableUsedInlineSizeIfNotAuto
+                    && !self.style(table_run.box_).width().is_auto()
+                {
+                    table_used_inline_size
+                } else if matches!(available_space.inline_size, AvailableSize::Definite(_)) {
+                    table_used_inline_size.min(available_inline_size)
+                } else {
+                    table_used_inline_size
+                };
+                (inline_size, table.take_inline_layout())
+            },
+        )
     }
 
     pub(crate) fn table_wrapper_content_inline_sizes(
@@ -3674,9 +3677,10 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 wrapper,
                 indefinite_containing_block_inline_size,
                 table_wrapper_constraints,
-                |table_run| {
+                |table_run, table_cells| {
                     let sizes = table_formatting_context::TableFormattingContext::new(
                         table_run,
+                        table_cells,
                         table_formatting_context::AutoTableInlineSize::ShrinksToFitAvailableInlineSize,
                     )
                     .border_box_inline_sizes(LayoutInput::new(
@@ -3697,7 +3701,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 },
             );
         formatting_context::propagate_percentage_block_size_dependency_to_containing_block(
-            self.records,
+            self.state,
             &self.callbacks,
             table_box,
             table_depends_on_percentage_block_size,
@@ -4289,14 +4293,7 @@ mod replaced_ratio_tests {
     use crate::layout::formatting_context::LayoutStageFacts;
     use crate::layout::layout_node_arena::LayoutNodeArena;
     use crate::layout::node_data::{NodeConstructionFacts, NodeKind, StylePayloadsRef};
-    use crate::layout::run_records::LayoutScratch;
-
-    unsafe extern "C" fn unused_container_bases(
-        _: *mut c_void,
-        _: u32,
-    ) -> svg_formatting_context::FfiContainerLengthBases {
-        unreachable!("replaced ratio tests use absolute lengths")
-    }
+    use crate::layout::run_state::LayoutScratch;
 
     fn size(
         width: Option<i64>,
@@ -4361,45 +4358,27 @@ mod replaced_ratio_tests {
             &arena,
             &scratch,
             LayoutStageFacts {
-                container_length_bases: layout_pass::ContainerLengthBasesQuery::new(
-                    std::ptr::null_mut(),
-                    unused_container_bases,
-                )
-                .sealed(),
                 viewport_inline_size: CssPixels::from_integer(800),
                 viewport_block_size: CssPixels::from_integer(600),
                 document_in_quirks_mode: false,
             },
         );
-        let result = RunRecords::with_root(
-            callbacks,
-            node,
-            Node::INVALID,
-            used_values::RootInputCells::capture(&UsedValues::default()),
-            callbacks.frame,
-            |records, callbacks| {
-                let context = SizingContext::new(records, callbacks);
-                let mut metrics = used_values::RootInputCells::capture(&UsedValues::default());
-                let available = AvailableSpace {
-                    inline_size: AvailableSize::Definite(CssPixels::from_integer(800)),
-                    block_size: AvailableSize::Indefinite,
-                };
-                let constraints = ContainingBlockConstraints::default();
-                let inline = context.compute_inline_size_for_replaced_element(
-                    SizedBox::new(node, &metrics),
-                    available,
-                    constraints,
-                );
-                // NB: Match dimension_atomic_root: publish the used inline size before resolving the block size.
-                metrics.set_content_inline_size(inline);
-                let block = context.compute_block_size_for_replaced_element(
-                    SizedBox::new(node, &metrics),
-                    available,
-                    constraints,
-                );
-                (inline.to_int(), block.to_int())
-            },
-        );
+        let result = RunState::with_root(callbacks, node, Node::INVALID, None, |state, callbacks| {
+            let context = SizingContext::new(state, callbacks);
+            let mut metrics = used_values::RootInputCells::default();
+            let available = AvailableSpace {
+                inline_size: AvailableSize::Definite(CssPixels::from_integer(800)),
+                block_size: AvailableSize::Indefinite,
+            };
+            let constraints = ContainingBlockConstraints::default();
+            let inline =
+                context.compute_inline_size_for_replaced_element(SizedBox::new(node, &metrics), available, constraints);
+            // NB: Match dimension_atomic_root: publish the used inline size before resolving the block size.
+            metrics.set_content_inline_size(inline);
+            let block =
+                context.compute_block_size_for_replaced_element(SizedBox::new(node, &metrics), available, constraints);
+            (inline.to_int(), block.to_int())
+        });
         arena
             .free_subtree(node)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());

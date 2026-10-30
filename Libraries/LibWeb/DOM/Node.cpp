@@ -84,6 +84,7 @@
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
@@ -1116,12 +1117,16 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
                 return TraversalDecision::Continue;
 
             // 3. If inclusiveDescendant is an element and inclusiveDescendant’s custom element registry is non-null:
-            if (auto* element = as_if<Element>(inclusive_descendant); element && element->custom_element_registry()) {
+            // INTEROP: Already-custom elements still receive connectedCallback after adoption into a document with
+            //          no registry, as in Chromium and Firefox. Their definition supplies the callback independently of
+            //          the registry available to upgrade new elements.
+            if (auto* element = as_if<Element>(inclusive_descendant)) {
+                auto registry = element->custom_element_registry();
                 // 1. If inclusiveDescendant’s custom element registry’s is scoped is true, then append
                 //    inclusiveDescendant’s node document to inclusiveDescendant’s custom element registry’s scoped
                 //    document set.
-                if (element->custom_element_registry()->is_scoped())
-                    element->custom_element_registry()->append_scoped_document(element->document());
+                if (registry && registry->is_scoped())
+                    registry->append_scoped_document(element->document());
 
                 // 2. If inclusiveDescendant is custom, then enqueue a custom element callback reaction with
                 //    inclusiveDescendant, callback name "connectedCallback", and « ».
@@ -1129,7 +1134,7 @@ void Node::insert_nodes_before(ReadonlySpan<GC::Ref<Node>> nodes, GC::Ptr<Node> 
                     element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::connectedCallback);
 
                 // 3. Otherwise, try to upgrade inclusiveDescendant.
-                else {
+                else if (registry) {
                     element->try_to_upgrade();
                 }
             }
@@ -1764,6 +1769,10 @@ void Node::remove(bool suppress_observers)
 
     removal_style_record_pins.pin_style_records_after_removal(*this, was_connected);
 
+    // NB: A subtree holding the focused or hovered node takes :focus-within and :hover out of its old ancestor
+    //     chain. Republish that chain before the removing steps clear the focused area.
+    CSS::Invalidation::invalidate_style_after_subtree_place_changed(*this, parent);
+
     // 11. Run the removing steps with node, true, and parent.
     // 12. Let isParentConnected be parent’s connected.
     // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with node,
@@ -1772,10 +1781,6 @@ void Node::remove(bool suppress_observers)
     run_removing_steps(*parent, parent_root, was_tracked_by_style_engine);
 
     removal_style_record_pins.release_dom_style_records();
-
-    // A subtree holding the focused or hovered node takes `:focus-within` and `:hover` out of the
-    // chain it hung off. Nothing about any element in that chain moved, so it has to be told.
-    CSS::Invalidation::invalidate_style_after_subtree_place_changed(*this, parent);
 
     // 15. Add transient registered observers given node and parent.
     add_transient_registered_observers(*parent);
@@ -2877,6 +2882,17 @@ void Node::removed_from(IsSubtreeRoot, Node* old_parent, Node&)
 
     m_is_connected = false;
     m_in_editable_subtree = false;
+
+    // https://html.spec.whatwg.org/multipage/infrastructure.html#dom-trees:concept-node-remove-ext
+    // 1. Let document be removedNode's node document.
+    auto& document = this->document();
+
+    // 2. If document's focused area is removedNode, then set document's focused area to document's viewport, and set
+    //    document's relevant global object's navigation API's focus changed during ongoing navigation to false.
+    if (document.focused_area().ptr() == this) {
+        document.set_focused_area(nullptr);
+        HTML::relevant_window(document).navigation()->set_focus_changed_during_ongoing_navigation(false);
+    }
 }
 
 // https://dom.spec.whatwg.org/#concept-node-move-ext
@@ -3162,6 +3178,10 @@ void Node::remove_all_children(bool suppress_observers)
 
         removal_style_record_pins.pin_style_records_after_removal(*child, was_connected);
 
+        // NB: Republish the old chain before the removing steps clear the focused area.
+        if (a_child_holds_a_propagating_state_source)
+            CSS::Invalidation::invalidate_style_after_subtree_place_changed(*child, this);
+
         // 11. Run the removing steps with node, true, and parent.
         // 12. Let isParentConnected be parent’s connected.
         // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with
@@ -3170,9 +3190,6 @@ void Node::remove_all_children(bool suppress_observers)
         child->run_removing_steps(*this, parent_root, was_tracked_by_style_engine);
 
         removal_style_record_pins.release_dom_style_records();
-
-        if (a_child_holds_a_propagating_state_source)
-            CSS::Invalidation::invalidate_style_after_subtree_place_changed(*child, this);
 
         // 15. Add transient registered observers given node and parent.
         child->add_transient_registered_observers(*this);
@@ -3296,11 +3313,8 @@ bool Node::is_host_including_inclusive_ancestor_of(Node const& other) const
         return true;
 
     // or if B’s root has a non-null host and A is a host-including inclusive ancestor of B’s root’s host
-    if (is<DocumentFragment>(other.root())
-        && static_cast<DocumentFragment const&>(other.root()).host()
-        && is_inclusive_ancestor_of(*static_cast<DocumentFragment const&>(other.root()).host())) {
-        return true;
-    }
+    if (auto const* fragment = as_if<DocumentFragment>(other.root()); fragment && fragment->host())
+        return is_host_including_inclusive_ancestor_of(*fragment->host());
     return false;
 }
 
@@ -3346,6 +3360,7 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& obje
     Layout::ForcedReadScope read { document() };
     MUST(object.add("name"sv, node_name().view()));
     MUST(object.add("id"sv, unique_id().value()));
+    bool serialized_content_document = false;
     if (is_document()) {
         MUST(object.add("type"sv, "document"));
     } else if (is_element()) {
@@ -3364,14 +3379,17 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& obje
             MUST(attributes.finish());
         }
 
+        // DevTools shows the document of a nested navigable in this process whatever its origin, as the only child of its
+        // container: The container's own child nodes are fallback content that isn't rendered.
         if (element->is_navigable_container()) {
             auto const* container = static_cast<HTML::NavigableContainer const*>(element);
-            if (auto const* content_document = container->content_document()) {
+            if (auto const* content_document = container->content_document_without_origin_check()) {
                 auto children = MUST(object.add_array("children"sv));
                 JsonObjectSerializer<Utf16StringBuilder> content_document_object = MUST(children.add_object());
                 content_document->serialize_tree_as_json(content_document_object);
                 MUST(content_document_object.finish());
                 MUST(children.finish());
+                serialized_content_document = true;
             }
         }
 
@@ -3404,7 +3422,8 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& obje
     MUST((object.add("visible"sv, !!layout_node(read))));
 
     if (auto const* element = as_if<Element>(this)) {
-        element->serialize_children_as_json(read, object);
+        if (!serialized_content_document)
+            element->serialize_children_as_json(read, object);
     } else if (has_child_nodes()) {
         auto children = MUST(object.add_array("children"sv));
         auto add_child = [this, &children](Node const& child) {

@@ -576,7 +576,9 @@ namespace Web::Fetch::Infrastructure {
 
 class Body;
 class FetchAlgorithms;
+class FetchControlBlock;
 class FetchController;
+class FetchControllerRegistry;
 class FetchParams;
 class FetchRecord;
 class FetchTimingInfo;
@@ -854,6 +856,7 @@ struct NavigationParams;
 struct PreparedNavigation;
 struct PaintConfig;
 struct PolicyContainer;
+struct RemoteClientNavigation;
 struct SerializedFormData;
 struct SourceSnapshotParams;
 struct ToggleTaskTracker;
