@@ -247,6 +247,7 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
+#include <LibWeb/SVG/SMILAnimation.h>
 #include <LibWeb/SVG/SMILTimeContainer.h>
 #include <LibWeb/SVG/SVGAnimateMotionElement.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
@@ -823,9 +824,8 @@ Layout::NodeArena& Document::layout_node_arena()
         Layout::RustFFI::document_host_set_layout_update_host_callbacks(m_layout_node_arena->host(), layout_update_host_callbacks());
         Layout::RustFFI::FfiStyleRecordHostCallbacks style_record_host_callbacks {
             .context = this,
-            .shell_style_changed = [](void*, void* shell, u64 record, void const* payloads, bool derived, bool attach_resources) {
-                as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(CSS::StyleRecordID { record }, payloads, derived, attach_resources);
-            },
+            .shell_style_changed = [](void*, void* shell, u64 record, void const* payloads, bool derived, bool attach_resources) { as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(CSS::StyleRecordID { record }, payloads, derived, attach_resources); },
+            .shell_style_damaged = [](void*, void* shell, u32 damage) { Painting::repaint_after_style_change(*static_cast<Layout::Node*>(shell), CSS::decode_style_invalidation(damage)); },
         };
         Layout::RustFFI::document_host_set_style_record_host_callbacks(m_layout_node_arena->host(), style_record_host_callbacks);
         m_layout_node_arena->start_reporting_box_presence({});
@@ -979,6 +979,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_focused_area);
     visitor.visit(m_sequential_focus_navigation_starting_point);
     visitor.visit(m_active_element);
+    visitor.visit(m_focus_visibility_request_target);
     visitor.visit(m_target_element);
     visitor.visit(m_autofocus_candidates);
     visitor.visit(m_accessibility_focus_target);
@@ -4200,6 +4201,37 @@ void Document::set_focused_area(GC::Ptr<Node> node, InvalidateFocusPseudoClasses
         m_writing_suggestion_controller->did_focus(m_focused_area);
 }
 
+void Document::note_keyboard_interaction()
+{
+    if (!m_last_user_focus_was_by_pointer)
+        return;
+    auto indicated_focus = focused_element_indicates_focus();
+    m_last_user_focus_was_by_pointer = false;
+    publish_focus_visibility_change(indicated_focus);
+}
+
+void Document::request_focus_visibility_for_focused_element(bool focus_visible)
+{
+    auto indicated_focus = focused_element_indicates_focus();
+    set_requested_focus_visibility(m_focused_area, focus_visible);
+    publish_focus_visibility_change(indicated_focus);
+}
+
+bool Document::focused_element_indicates_focus() const
+{
+    auto const* focused_element = as_if<Element>(m_focused_area.ptr());
+    return focused_element && focused_element->should_indicate_focus();
+}
+
+// The focused element's :focus-visible can change without focus moving, so the style engine has to hear the new state
+// from the element rather than from a focus move.
+void Document::publish_focus_visibility_change(bool indicated_focus_before)
+{
+    auto* focused_element = as_if<Element>(m_focused_area.ptr());
+    if (focused_element && focused_element->should_indicate_focus() != indicated_focus_before)
+        CSS::record_element_state_changed(*focused_element, CSS::PseudoClass::FocusVisible, !indicated_focus_before);
+}
+
 Element const* Document::active_element() const
 {
     return m_active_element ? m_active_element.ptr() : body();
@@ -4664,6 +4696,11 @@ void Document::dispatch_events_for_transition(GC::Ref<CSS::CSSTransition> transi
 // https://www.w3.org/TR/css-animations-2/#event-dispatch
 void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::Animation> animation)
 {
+    if (animation->is_smil_animation()) {
+        as<SVG::SMILAnimation>(*animation).animation_element().queue_time_events_if_necessary();
+        return;
+    }
+
     if (animation->is_css_transition()) {
         dispatch_events_for_transition(as<CSS::CSSTransition>(*animation));
         return;
@@ -5834,6 +5871,14 @@ bool Document::has_focus() const
     }
 
     return false;
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#fully-active-descendant-of-a-top-level-traversable-with-user-attention
+bool Document::is_fully_active_descendant_of_a_top_level_traversable_with_user_attention() const
+{
+    // A Document d is a fully active descendant of a top-level traversable with user attention when d is fully active
+    // and d's node navigable's top-level traversable has user attention.
+    return is_fully_active() && page().top_level_traversable_has_user_attention();
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#allow-focus-steps
@@ -7424,6 +7469,8 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
     };
 
     for (auto& observer : intersection_observers) {
+        observer->remove_dead_observation_targets();
+
         auto intersection_root_node = observer->intersection_root_node();
         // NB: The root and the targets may each be in another document than this one, and their boxes are reads of
         //     the render state of their own documents.
@@ -7451,7 +7498,11 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
         // 2. For each target in observer’s internal [[ObservationTargets]] slot, processed in the same order that
         //    observe() was called on each target:
         for (auto& observed_target : observer->observation_targets()) {
-            auto& target = observed_target.target;
+            // NB: A collection during this loop can clear a target that the pruning above kept.
+            auto maybe_target = observed_target.target.ptr();
+            if (!maybe_target)
+                continue;
+            GC::Ref<Element> target = *maybe_target;
             // 1. Let:
             // thresholdIndex be 0.
             size_t threshold_index = 0;
@@ -8551,9 +8602,12 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         if (root->is_element())
             index_shadow_including_element_ancestors(*root, elements_with_intersection_observation_descendants);
         for (auto const& observation : observer.observation_targets()) {
-            index_shadow_including_element_ancestors(observation.target, elements_with_intersection_observation_descendants);
+            auto target = observation.target.ptr();
+            if (!target)
+                continue;
+            index_shadow_including_element_ancestors(*target, elements_with_intersection_observation_descendants);
             if (observer.track_visibility())
-                index_shadow_including_element_ancestors(observation.target, elements_with_visibility_observation_descendants);
+                index_shadow_including_element_ancestors(*target, elements_with_visibility_observation_descendants);
         }
     }
 
@@ -8789,15 +8843,18 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
                 return true;
             bool subtree_is_clipped_outside_root = transform_subtree_is_clipped_outside(animated_target, observer.root_intersection_rectangle(read));
             for (auto const& observation : observer.observation_targets()) {
-                if (!animated_target.is_shadow_including_inclusive_ancestor_of(*observation.target) || subtree_is_clipped_outside_root)
+                auto target = observation.target.ptr();
+                if (!target)
+                    continue;
+                if (!animated_target.is_shadow_including_inclusive_ancestor_of(*target) || subtree_is_clipped_outside_root)
                     continue;
                 if (only_translates_horizontally && ancestor_transform_can_map_horizontal_motion_to_vertical(animated_target, *root)) {
                     requires_main_thread_sampling = true;
                     return true;
                 }
-                if (only_translates_horizontally && !observation_has_another_transform_animation(animated_target, *observation.target, effect)) {
-                    auto const& target_rect = observation_target_rect_cache.ensure(observation.target, [&] {
-                        return observation.target->bounding_client_rect_assuming_layout_clean();
+                if (only_translates_horizontally && !observation_has_another_transform_animation(animated_target, *target, effect)) {
+                    auto const& target_rect = observation_target_rect_cache.ensure(target, [&] {
+                        return target->bounding_client_rect_assuming_layout_clean();
                     });
                     auto root_rect = observer.root_intersection_rectangle(read);
                     bool vertical_bands_are_disjoint = target_rect.bottom() < root_rect.top() || target_rect.top() > root_rect.bottom();
@@ -11428,7 +11485,7 @@ Optional<Painting::HitTestResult> Document::hit_test(Layout::BegunRead const& re
     //    the transforms that apply to the descendants of the viewport, return the associated element and terminate
     //    these steps.
     auto result = query->list().hit_test(read, position, *query);
-    if (result.has_value() && (result->chrome_widget || result->dom_node()))
+    if (result.has_value() && (result->chrome_widget || result->is_scrollbar || result->dom_node()))
         return result;
 
     // 3. If the document has a root element, return the root element and terminate these steps.
@@ -12122,7 +12179,7 @@ Vector<URL::Origin> Document::internal_ancestor_origin_objects_list_creation_ste
         masked = true;
 
     // 9. Otherwise, if referrerPolicy is "same-origin" and parentDoc's origin is not same origin with document's origin, then set masked to true.
-    else if (referrer_policy == ReferrerPolicy::ReferrerPolicy::SameOrigin && parent_doc->origin().is_same_origin(origin()))
+    else if (referrer_policy == ReferrerPolicy::ReferrerPolicy::SameOrigin && !parent_doc->origin().is_same_origin(origin()))
         masked = true;
 
     // 10. If masked is true, then append a new opaque origin to output.

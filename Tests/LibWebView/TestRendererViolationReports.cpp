@@ -4,25 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/Array.h>
 #include <AK/Atomic.h>
 #include <AK/HashMap.h>
 #include <AK/LexicalPath.h>
-#include <AK/Random.h>
-#include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
-#include <LibCore/Directory.h>
-#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibCore/Timer.h>
-#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/SystemTheme.h>
-#include <LibMain/Main.h>
+#include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 #include <LibURL/Parser.h>
-#include <LibWebView/Application.h>
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalNavigable.h>
 #include <LibWebView/CanonicalNavigation.h>
@@ -37,25 +31,6 @@
 #include <sys/socket.h>
 
 namespace {
-
-class TestApplication : public WebView::Application {
-    WEB_VIEW_APPLICATION(TestApplication)
-
-public:
-    explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
-    {
-    }
-
-    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options) override
-    {
-        browser_options.headless_mode = WebView::HeadlessMode::Test;
-        browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
-        web_content_options.is_test_mode = WebView::IsTestMode::Yes;
-    }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
-};
 
 struct Page {
     ByteString headers;
@@ -229,25 +204,16 @@ void claim_environment(WebView::HeadlessWebView& liar, Web::HTML::EnvironmentId 
 // population worker is terminated for a report of a directive its kind of navigation rules out, such as form-action
 // outside a form submission; a report from another page, or for a navigation the worker is not running, is dropped.
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(renderer_violation_reports)
 {
-    auto test_config_directory = ByteString::formatted("{}/Ladybird-TestRendererViolationReports-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_config_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_config_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_config_directory, FileSystem::RecursionMode::Allowed));
-    });
-    MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, test_config_directory, Core::Environment::Overwrite::Yes));
+    Test::HeadlessTestEnvironment environment { "TestRendererViolationReports"sv };
 
     signal(SIGPIPE, SIG_IGN);
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application());
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
-    auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
+    auto theme = TRY_OR_FAIL(Gfx::load_system_theme(theme_path.string()));
 
     // The source's policy allows its frame's own site only. Each load of the frame and each violation retitles it.
     HashMap<ByteString, Page> pages;
@@ -361,10 +327,10 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     };
 
     report(*worker, target, "not-the-navigation"_utf16, Web::ContentSecurityPolicy::RemoteViolationDirective::FrameSrc);
-    expect(worker->client().is_open(), "a report for another navigation is dropped"sv);
+    expect(worker->client().is_open(), "a report for another navigation does not terminate the worker"sv);
 
     report(source_page, target, held_navigation->navigation_id, Web::ContentSecurityPolicy::RemoteViolationDirective::FrameSrc);
-    expect(source_page.client().is_open(), "a report from a page that is not the navigation's worker is dropped"sv);
+    expect(source_page.client().is_open(), "a report from a page that is not the navigation's worker does not terminate that page"sv);
 
     // The source reports only for its policy at the given index, and only one governing the directive. Both channels
     // keep their order, so the last report's violation comes after every earlier report's.
@@ -375,6 +341,11 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     expect(spin_until_or_timeout([&] { return saw_title("violation 3: frame-src"sv); }, 10'000), "the source reports the reports for its governing policy"sv);
     expect(!any_of(titles, [](auto const& title) { return title.contains("object-src"sv); }), "the source drops a report its policy does not govern"sv);
     expect(saw_title("violation 2: frame-src"sv), "the source drops a report for a policy it does not have"sv);
+
+    // A title the source sets two tasks after a later script comes after every violation the reports above add.
+    source_view->run_javascript("setTimeout(() => setTimeout(() => (document.title = 'reports handled')))"_string);
+    expect(spin_until_or_timeout([&] { return saw_title("reports handled"sv); }, 10'000), "the source handles every report it was sent"sv);
+    expect(!any_of(titles, [](auto const& title) { return title.starts_with("violation 4"sv); }), "neither a report for another navigation nor one from a page that is not the navigation's worker adds a violation"sv);
 
     report(*worker, target, held_navigation->navigation_id, Web::ContentSecurityPolicy::RemoteViolationDirective::FormAction);
     expect(!worker->client().is_open(), "the worker is terminated for a directive the navigation cannot violate"sv);
@@ -422,5 +393,4 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     expect(sibling_worker->client().is_open(), "a report for a replaced source is no fault of its worker"sv);
 
     outln("PASS: violation reports reach the source's page, and a report of a directive the navigation rules out terminates its renderer");
-    return 0;
 }

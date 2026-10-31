@@ -61,7 +61,6 @@
 #include <LibWeb/InvalidateDisplayList.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Streams/ReadableStreamDefaultReader.h>
 #include <LibWeb/WebDriver/BiDi/BiDi.h>
@@ -211,8 +210,8 @@ void PageClient::set_has_focus(bool has_focus)
     page().invalidate_compositor_keyboard_scroll_state();
     m_has_focus = has_focus;
 
-    // The focus ring, the text caret, and selection highlight colors all depend on the window focus state, so
-    // nothing painted before the change can be reused; repaint every document the page hosts.
+    // The focus ring, the text caret, and selection highlight colors all depend on the window focus state, so every
+    // document the page hosts records again, which records the output that read the focus state again.
     for (auto const& navigable : page().hosted_navigables()) {
         if (!has_focus)
             navigable->event_handler().release_held_scroll_key();
@@ -224,10 +223,7 @@ void PageClient::set_has_focus(bool has_focus)
         // A writing suggestion is for the user typing in the window, so leaving the window drops it.
         if (auto* controller = document->writing_suggestion_controller_if_exists(); controller && !has_focus)
             controller->dismiss();
-        // Focus changes can arrive while layout is invalidated. We only need to invalidate cached paint
-        // on the current paintable tree here, without requiring layout to be up to date first.
-        if (document->has_committed_viewport_box())
-            document->paint_state().invalidate_all_cached_paint(*document);
+        Web::Painting::request_document_repaint(*document, Web::InvalidateDisplayList::PaintCommands);
     }
 }
 
@@ -1741,7 +1737,8 @@ void PageClient::page_did_set_session_history_entry_document_state_reload_pendin
 
 void PageClient::page_did_request_set_system_focus(bool has_system_focus)
 {
-    client().async_did_request_set_system_focus(m_id, has_system_focus);
+    // Synchronous, so that the UI process has the new focus before input the test sends next over the test connection.
+    client().did_request_set_system_focus(m_id, has_system_focus);
 }
 
 void PageClient::page_did_change_focused_navigable(Web::HTML::CrossProcessId navigable_id)
@@ -2072,7 +2069,10 @@ void PageClient::page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState
 
 void PageClient::page_did_start_using_gamepads()
 {
-    client().notify_started_using_gamepads();
+    if (m_did_start_using_gamepads)
+        return;
+    m_did_start_using_gamepads = true;
+    client().async_did_start_using_gamepads(m_id);
 }
 
 void PageClient::page_did_play_gamepad_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect const& effect)
@@ -2132,6 +2132,13 @@ Web::Gamepad::ReceivedRumbleEffects PageClient::virtual_gamepad_received_rumble_
 void PageClient::pump_gamepad_events()
 {
     client().pump_and_dispatch_gamepad_events();
+}
+
+void PageClient::reset_gamepad_access_for_testing()
+{
+    m_did_start_using_gamepads = false;
+    if (auto* test_connection = client().test_connection(); test_connection && test_connection->is_open())
+        test_connection->async_reset_gamepad_access_for_testing(m_id);
 }
 
 Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)

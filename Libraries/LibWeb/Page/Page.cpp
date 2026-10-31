@@ -170,6 +170,34 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
     });
 }
 
+// https://html.spec.whatwg.org/multipage/interaction.html#user-attention
+bool Page::top_level_traversable_has_user_attention() const
+{
+    // A top-level traversable has user attention when its system visibility state is "visible", and it either has
+    // system focus or user agent widgets directly related to it can receive keyboard input channeled from the
+    // operating system.
+    // FIXME: Also give the top-level traversable user attention while a user agent widget related to it, such as the
+    //        location bar, can receive keyboard input.
+    return m_system_visibility_state == HTML::VisibilityState::Visible && client().has_focus();
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#activation-notification
+// NB: The UI process gathers the windows of steps 2 to 4, which documents in other processes can hold, and names each
+//     one this page hosts.
+void Page::notify_document_about_user_activation(HTML::CrossProcessId document_id)
+{
+    for (auto const& navigable : hosted_navigables()) {
+        auto document = navigable->active_document();
+        if (!document || !document->is_fully_active() || document->id() != document_id)
+            continue;
+
+        // 5.1. Set window's last activation timestamp to the current high resolution time.
+        // 5.2. Notify the close watcher manager about user activation given window.
+        document->window()->notify_about_user_activation();
+        return;
+    }
+}
+
 // The navigable keyboard input goes to in the tab, which is the top-level traversable until focus moves into another.
 GC::Ptr<HTML::Navigable> Page::focused_navigable() const
 {
@@ -211,9 +239,18 @@ void Page::focused_navigable_changed_in_another_page(HTML::CrossProcessId id)
 void Page::update_focused_navigable(GC::Ptr<HTML::Navigable> navigable)
 {
     invalidate_compositor_keyboard_scroll_state();
+    GC::Ptr<HTML::Navigable> previously_focused_navigable = m_focused_navigable.ptr();
     m_focused_navigable = navigable;
     for (auto const& root : local_roots())
         root->set_needs_repaint();
+
+    // A navigable below the top-level traversable paints its focus ring, caret and selection as focused only while it
+    // is the focused navigable, so the two navigables focus moved between record again.
+    for (auto navigable_whose_focus_changed : { previously_focused_navigable, navigable }) {
+        auto* local_navigable = navigable_whose_focus_changed ? as_if<HTML::LocalNavigable>(*navigable_whose_focus_changed) : nullptr;
+        if (auto document = local_navigable ? local_navigable->active_document() : nullptr)
+            Painting::request_document_repaint(*document, InvalidateDisplayList::PaintCommands);
+    }
 }
 
 void Page::navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable& navigable)

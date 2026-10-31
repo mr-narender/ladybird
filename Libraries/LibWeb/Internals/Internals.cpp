@@ -1657,8 +1657,9 @@ void Internals::record_display_list_for_testing(bool paint_overlay, bool cold)
     document.update_layout(DOM::UpdateLayoutReason::InternalsHitTest);
     if (!document.navigable() || !document.has_committed_viewport_box())
         return;
+    // A recording against a visual context tree built fresh copies nothing from the published one.
     if (cold)
-        document.paint_state().invalidate_all_cached_paint(document);
+        document.schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
     (void)document.record_display_list(read, HTML::PaintConfig { .paint_overlay = paint_overlay }, document.navigable()->display_list_resource_storage(), Painting::PaintCommandCacheMode::ReadWrite);
 }
 
@@ -2107,6 +2108,9 @@ void Internals::perform_per_test_cleanup()
     for (auto gamepad : m_gamepads)
         gamepad->disconnect();
     m_gamepads.clear();
+
+    // Reset gamepad access, so that no test relies on the gamepad use and gestures of an earlier one
+    page().client().reset_gamepad_access_for_testing();
 
     // Clear any input state
     if (auto local_root = local_root_of(window())) {

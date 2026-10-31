@@ -10,6 +10,7 @@ set(SOURCES
     Fetch/Infrastructure/URL.cpp
     FileAPI/BlobURLStore.cpp
     FileAPI/SerializedBlobURLEntry.cpp
+    Gamepad/GamepadInput.cpp
     Gamepad/GamepadSharedState.cpp
     Gamepad/GamepadSnapshot.cpp
     Gamepad/GamepadStateBuffer.cpp
@@ -113,6 +114,7 @@ invoke_py_generator(
 
 compile_ipc(ContentSecurityPolicy/RemoteViolationDirective.ipc ContentSecurityPolicy/RemoteViolationDirectiveCodecs.h)
 compile_ipc(HTML/NavigationResponse.ipc HTML/NavigationResponseCodecs.h)
+compile_ipc(MixedContent/ProhibitsMixedSecurityContexts.ipc MixedContent/ProhibitsMixedSecurityContextsCodecs.h)
 compile_ipc(Page/InputEvent.ipc Page/InputEventCodecs.h)
 compile_ipc(Page/TextEditingCommand.ipc Page/TextEditingCommandCodecs.h)
 compile_ipc(PixelUnits.ipc PixelUnitsCodecs.h)

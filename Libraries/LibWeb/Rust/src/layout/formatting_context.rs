@@ -178,21 +178,6 @@ pub(crate) fn run_fragmentainer(
     )
 }
 
-pub(super) fn cache_key(
-    measured_at_inline_size: Option<CssPixels>,
-    measured_at_block_size: Option<CssPixels>,
-    constraints: ContainingBlockConstraints,
-) -> IntrinsicSizeCacheKey {
-    IntrinsicSizeCacheKey {
-        measured_at_inline_size,
-        measured_at_block_size,
-        percentage_basis_inline_size: constraints.percentage_basis_inline_size,
-        percentage_basis_block_size: constraints.percentage_basis_block_size,
-        quirks_mode_percentage_basis_block_size: constraints.quirks_mode_percentage_basis_block_size,
-        measured_in_transposed_frame: false,
-    }
-}
-
 impl PixelFraction {
     pub(crate) fn new(numerator: CssPixels, denominator: CssPixels) -> Self {
         assert_ne!(denominator, CssPixels::default());
@@ -2035,7 +2020,16 @@ pub(super) fn run_formatting_context(
             table_inline_layout,
             None,
         );
-        return child_run_outcome_from_outputs(&callbacks, parent_fragments, box_, &input, root_cells, outputs, false);
+        return child_run_outcome_from_outputs(
+            &callbacks,
+            parent_fragments,
+            box_,
+            &input,
+            root_cells,
+            outputs,
+            false,
+            false,
+        );
     }
     let cache_key = fc_run_cache::FcRunCacheKey::new(fc_type, input, root_cells);
     let cache_attempt = match fc_run_cache::FcRunCacheAttempt::probe(
@@ -2082,6 +2076,7 @@ pub(super) fn run_formatting_context(
                 root_cells,
                 outputs,
                 reuses_committed_subtree,
+                true,
             );
         }
     };
@@ -2148,7 +2143,16 @@ pub(super) fn run_formatting_context(
         );
     }
     cache_attempt.conclude(&callbacks, box_, cache_key, &input, &outputs);
-    child_run_outcome_from_outputs(&callbacks, parent_fragments, box_, &input, root_cells, outputs, false)
+    child_run_outcome_from_outputs(
+        &callbacks,
+        parent_fragments,
+        box_,
+        &input,
+        root_cells,
+        outputs,
+        false,
+        false,
+    )
 }
 
 /// Takes a committing run of `box_` from the cache hit `hit` with nothing replayed: the box gets what the stored run
@@ -2182,10 +2186,15 @@ fn reuse_committed_subtree_as_it_is(
         .flatten()?;
     let content_block_size_adopted_after_run =
         content_block_size_adopted_after_run(input, entry.outputs.result.automatic_content_block_size);
-    let laid_out_box = entry.outputs.root_outcome.laid_out_child_box(
+    let mut laid_out_box = entry.outputs.root_outcome.laid_out_child_box(
         root_cells,
         &entry.outputs.result,
         content_block_size_adopted_after_run,
+    );
+    keep_inline_margins_resolved_now_where_unobserved(
+        &mut laid_out_box,
+        root_cells,
+        entry.outputs.inputs_never_observed,
     );
     let geometry = fragment_tree::FragmentGeometry {
         cells: laid_out_box.cells,
@@ -2206,6 +2215,17 @@ fn reuse_committed_subtree_as_it_is(
             reuses_subtree: true,
         }),
     })
+}
+
+fn keep_inline_margins_resolved_now_where_unobserved(
+    laid_out_box: &mut run_state::LaidOutChildBox,
+    root_cells: used_values::RootInputCells,
+    inputs_never_observed: fc_run_cache::RunInputsTheStoredRunNeverObserved,
+) {
+    if inputs_never_observed.inline_space_around_root {
+        laid_out_box.cells.margin_left = root_cells.margin_left;
+        laid_out_box.cells.margin_right = root_cells.margin_right;
+    }
 }
 
 pub(crate) fn explicit_intrinsic_inner_inline_size(facts: &NodeFacts<'_>) -> CssPixels {
@@ -2601,17 +2621,21 @@ fn lay_out_run_root_and_contents<'pass>(
     );
     result.depends_on_percentage_block_size = run.sizing().resolve_percentage_block_size_dependency(run.box_);
     let item_run_observations_are_known = !run_is_handed_table_inline_layout_outside_its_key;
+    let table_wrapper_sized_by_its_parent = is_run_of_table_wrapper_sized_by_its_parent(run, fc_type, &input);
     let inputs_never_observed = fc_run_cache::RunInputsTheStoredRunNeverObserved {
         percentage_block_basis_and_block_size_definiteness: !result.depends_on_percentage_block_size,
         definite_available_inline_sizes_at_or_above: atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above,
         percentage_inline_basis: atomic_root_sizing_repeats_for_available_inline_sizes_at_or_above.is_some()
             || (item_run_observations_are_known
-                && item_run_never_observes_percentage_inline_basis(run, fc_type, &input)),
+                && item_run_never_observes_percentage_inline_basis(run, fc_type, &input))
+            || (table_wrapper_sized_by_its_parent
+                && table_in_wrapper_never_observes_percentage_inline_basis(run, run.box_)),
         own_block_size: if item_run_observations_are_known {
             own_block_size_observation_of_item_run(run, fc_type, &input, &result)
         } else {
             OwnBlockSizeObservation::Observed
         },
+        inline_space_around_root: table_wrapper_sized_by_its_parent,
     };
 
     // NB: The root's descendants are laid out in the frame the root establishes.
@@ -2731,6 +2755,9 @@ fn body_input_in_own_frame(
         {
             used.content_inline_size()
         } else {
+            // NB: The root's own inline size comes from its parent's block size here, which its run observes like a
+            //     percentage block size.
+            run.state.note_box_depends_on_percentage_block_size(node);
             body_run.sizing().orthogonal_flow_inline_size(
                 sized_root_in_own_frame.sized_box(),
                 available_space,
@@ -3306,6 +3333,49 @@ fn root_content_includes_an_orthogonal_flow_sized_by_the_root_block_size(
     false
 }
 
+fn is_run_of_table_wrapper_sized_by_its_parent(
+    run: &FormattingContextRun,
+    fc_type: FormattingContextType,
+    input: &LayoutInput,
+) -> bool {
+    fc_type == FormattingContextType::Block
+        && input.participation == ParticipationInParentFormattingContext::BlockLevel
+        && input.sizing.block_parent_resolved_content_inline_size.is_some()
+        && NodeFacts::new(&run.callbacks, run.box_).is_table_wrapper()
+}
+
+fn table_in_wrapper_never_observes_percentage_inline_basis(run: &FormattingContextRun, wrapper: Node) -> bool {
+    let mut children_of_wrapper = run.callbacks.children(wrapper);
+    let (Some(table_box), None) = (children_of_wrapper.next(), children_of_wrapper.next()) else {
+        return false;
+    };
+    let resolves_percentage_against_inline_basis = |node| {
+        sizing_context::SizingContext::own_box_resolves_percentage_against_inline_basis(StyleValues::for_node(
+            &run.callbacks,
+            node,
+        ))
+    };
+    if resolves_percentage_against_inline_basis(table_box) {
+        return false;
+    }
+    let mut boxes_whose_children_are_internal_table_boxes = vec![table_box];
+    while let Some(parent) = boxes_whose_children_are_internal_table_boxes.pop() {
+        for child in run.callbacks.children(parent) {
+            let facts = NodeFacts::new(&run.callbacks, child);
+            if facts.is_text_node() {
+                continue;
+            }
+            if resolves_percentage_against_inline_basis(child) {
+                return false;
+            }
+            if facts.is_table_row_group_kind() || facts.is_table_row() || facts.is_table_column_group() {
+                boxes_whose_children_are_internal_table_boxes.push(child);
+            }
+        }
+    }
+    true
+}
+
 /// Whether the run is of an item block container whose content resolves percentages against the container itself.
 fn item_run_never_observes_percentage_inline_basis(
     run: &FormattingContextRun,
@@ -3338,6 +3408,7 @@ pub(super) fn run_reads_content_block_size_adopted_after_it(
         && fc_type.registers_abspos_children_against_its_final_block_size()
 }
 
+#[expect(clippy::too_many_arguments)]
 fn child_run_outcome_from_outputs(
     callbacks: &LayoutPass<'_>,
     parent_fragments: Option<&fragment_tree::RunFragmentBuilder>,
@@ -3346,18 +3417,22 @@ fn child_run_outcome_from_outputs(
     root_cells: used_values::RootInputCells,
     outputs: RunOutputs,
     reuses_committed_subtree: bool,
+    outputs_are_stored_ones: bool,
 ) -> ChildRunOutcome {
     let RunOutputs {
         result,
         root,
         root_outcome,
-        inputs_never_observed: _,
+        inputs_never_observed,
         host_findings,
     } = outputs;
     callbacks.receive_host_findings(host_findings);
     let content_block_size_adopted_after_run =
         content_block_size_adopted_after_run(input, result.automatic_content_block_size);
-    let laid_out_box = root_outcome.laid_out_child_box(root_cells, &result, content_block_size_adopted_after_run);
+    let mut laid_out_box = root_outcome.laid_out_child_box(root_cells, &result, content_block_size_adopted_after_run);
+    if outputs_are_stored_ones {
+        keep_inline_margins_resolved_now_where_unobserved(&mut laid_out_box, root_cells, inputs_never_observed);
+    }
     let fragment_arrival = parent_fragments.and(root).map(|root| {
         debug_assert!(root.node == child, "a child run returned a root for a different box");
         fragment_tree::ChildFragmentArrival::RunRoot {
@@ -3633,7 +3708,8 @@ fn compute_root_layout(input: LayoutStageInput<'_>, should_collect_devtools_layo
 }
 
 /// Brings the arena up to date for a stage before the stage borrows it: derives the facts its runs read, marks the
-/// flex and grid items of the nodes marked for layout, and drops the cached intrinsic sizes of released slots.
+/// flex and grid items of the nodes marked for layout, and applies the arena's memo invalidations to the stage's
+/// memos.
 fn prepare_layout_stage(state: &mut super::ArenaHandle, kind: LayoutStageKind, root: NodeSlotId) {
     let (arena, scratch) = state.arena_mut_and_layout_scratch();
     match kind {
@@ -3657,22 +3733,9 @@ fn prepare_layout_stage(state: &mut super::ArenaHandle, kind: LayoutStageKind, r
             arena.derive_facts_in_subtree(root);
         }
     }
-    drop_intrinsic_size_cache_entries_of_released_slots(arena, scratch);
     scratch.apply_memo_invalidations(arena);
     scratch.layout_trace.take_over_from(&mut arena.layout_trace);
     arena.begin_active_layout_pass();
-}
-
-/// Drops the intrinsic size cache entries of the slots the arena let go of, or whose cache epoch wrapped, since the
-/// last stage, before any run of this one reads a cache.
-fn drop_intrinsic_size_cache_entries_of_released_slots(
-    arena: &mut LayoutNodeArena,
-    scratch: &super::run_state::LayoutScratch,
-) {
-    let drops = arena.take_intrinsic_size_cache_drops();
-    if !drops.is_empty() {
-        scratch.intrinsic_size_caches.drop_slots(drops);
-    }
 }
 
 fn finish_entry_pass(

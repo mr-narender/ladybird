@@ -659,6 +659,7 @@ set(SOURCES
     HTML/Storage.cpp
     HTML/StorageEvent.cpp
     HTML/StructuredSerialize.cpp
+    HTML/StructuredSerializeRustIntegration.cpp
     HTML/SubmitEvent.cpp
     HTML/SupportedImageTypes.cpp
     HTML/SyntaxHighlighter/SyntaxHighlighter.cpp
@@ -777,7 +778,6 @@ set(SOURCES
     Painting/CompositorAnimationEffectState.cpp
     Painting/PaintingRustBridge.cpp
     Painting/ResizeHandle.cpp
-    Painting/Scrollbar.cpp
     Painting/Scrolling.cpp
     Painting/ScrollSnap.cpp
     Painting/SvgPaintResources.cpp
@@ -858,6 +858,7 @@ set(SOURCES
     SVG/SVGAnimatedRect.cpp
     SVG/SVGAnimatedString.cpp
     SVG/SVGAnimatedTransformList.cpp
+    SVG/SVGAnimateElement.cpp
     SVG/SVGAnimateMotionElement.cpp
     SVG/SVGAnimationElement.cpp
     SVG/SVGCircleElement.cpp
@@ -940,6 +941,7 @@ set(SOURCES
     SVG/SVGUseElement.cpp
     SVG/SVGViewElement.cpp
     SVG/TagNames.cpp
+    SVG/TimeEvent.cpp
     TrustedTypes/InjectionSink.cpp
     TrustedTypes/RequireTrustedTypesForDirective.cpp
     TrustedTypes/TrustedHTML.cpp

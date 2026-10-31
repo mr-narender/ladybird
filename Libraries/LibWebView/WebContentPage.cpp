@@ -27,6 +27,7 @@
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CanonicalWindow.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/GamepadManager.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/NavigationLoader.h>
 #include <LibWebView/PermissionManager.h>
@@ -235,6 +236,12 @@ Optional<CanonicalNavigable&> WebContentPage::hosted_navigable(Web::HTML::CrossP
     if (!navigable.has_value() || !traversable().hosts(*navigable, *this))
         return {};
     return *navigable;
+}
+
+// A page standing in for a lost document hosts its navigable, but not the document.
+bool WebContentPage::hosts_active_document_of(CanonicalNavigable const& navigable) const
+{
+    return navigable.active_document().host() == this;
 }
 
 // The environments a page names are the window environments of the documents it hosts, and of those populated for it
@@ -650,6 +657,7 @@ void WebContentPage::close()
         if (auto* bidi = WebDriverBiDi::the())
             bidi->push_session_state_for_client(*m_client);
         m_client->forget_audio_playback(m_id);
+        GamepadManager::the().page_closed(*this);
     }
     if (m_traversable) {
         if (auto view = m_traversable->view(); view.has_value())
@@ -710,7 +718,7 @@ void WebContentPage::did_request_navigation_of_navigable(Web::HTML::CrossProcess
     RefPtr<WebContentPage> source_page;
     client().for_each_page([&](WebContentPage& page) {
         auto navigable = page.traversable().find(source_navigable_id);
-        if (!navigable.has_value() || navigable->active_document().id() != source_document_id || navigable->active_document().host() != &page)
+        if (!navigable.has_value() || navigable->active_document().id() != source_document_id || !page.hosts_active_document_of(*navigable))
             return IterationDecision::Continue;
         source = *navigable;
         source_page = page;
@@ -1390,6 +1398,12 @@ void WebContentPage::give_user_activation()
     m_last_user_activation = MonotonicTime::now();
 }
 
+void WebContentPage::notify_about_user_activation(Web::HTML::CrossProcessId document_id)
+{
+    give_user_activation();
+    async_notify_about_user_activation(document_id);
+}
+
 bool WebContentPage::has_transient_user_activation() const
 {
     // NB: Automation lets a renderer synthesize the input that gives it activation.
@@ -1622,15 +1636,21 @@ static Web::PermissionsPolicy::PolicyControlledFeature policy_controlled_feature
 bool WebContentPage::hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature feature) const
 {
     auto is_allowed = false;
-    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
-        auto const& document = navigable.active_document();
-        if (document.host() != this)
-            return IterationDecision::Continue;
-        auto value = Web::PermissionsPolicy::check_permissions_policy(document.permissions_policy(), feature, document.origin(), document.origin());
-        is_allowed = value == Web::PermissionsPolicy::FeatureValue::Enabled;
+    for_each_navigable_with_a_hosted_active_document([&](CanonicalNavigable const& navigable) {
+        is_allowed = navigable.active_document().is_allowed_to_use(feature);
         return is_allowed ? IterationDecision::Break : IterationDecision::Continue;
     });
     return is_allowed;
+}
+
+// Unlike for_each_hosted_document(), this skips the documents populated for navigations, which are not active yet.
+void WebContentPage::for_each_navigable_with_a_hosted_active_document(Function<IterationDecision(CanonicalNavigable const&)> const& callback) const
+{
+    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+        if (!hosts_active_document_of(navigable))
+            return IterationDecision::Continue;
+        return callback(navigable);
+    });
 }
 
 bool WebContentPage::document_may_use(Web::HTML::CrossProcessId document_id, Web::Permissions::PermissionName name) const
@@ -1662,11 +1682,8 @@ void WebContentPage::did_request_geolocation_position(u64 request_id, Web::HTML:
 bool WebContentPage::hosts_a_document_with_top_level_origin(URL::Origin const& origin) const
 {
     auto hosts = false;
-    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
-        auto const& document = navigable.active_document();
-        if (document.host() != this)
-            return IterationDecision::Continue;
-        auto top_level_origin = document.top_level_origin();
+    for_each_navigable_with_a_hosted_active_document([&](CanonicalNavigable const& navigable) {
+        auto top_level_origin = navigable.active_document().top_level_origin();
         hosts = top_level_origin.has_value() && top_level_origin->is_same_origin(origin);
         return hosts ? IterationDecision::Break : IterationDecision::Continue;
     });
@@ -1928,6 +1945,11 @@ void WebContentPage::did_change_screen_wake_lock_state(Web::ScreenWakeLockState 
 {
     if (displays_tab())
         view().did_change_screen_wake_lock_state({}, wake_lock_state);
+}
+
+void WebContentPage::did_start_using_gamepads()
+{
+    GamepadManager::the().page_did_start_using_gamepads(*this);
 }
 
 void WebContentPage::did_update_session_history_entry_navigation_api_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::StorageSerializationRecord navigation_api_state)
@@ -2243,11 +2265,15 @@ void WebContentPage::did_request_writing_suggestion(u64 request_id, Utf16String 
 
 void WebContentPage::did_request_set_system_focus(bool has_system_focus)
 {
+    if (!may_change_window(*this, "did_request_set_system_focus"sv))
+        return;
     traversable().set_has_system_focus(has_system_focus, *this);
 }
 
 void WebContentPage::did_request_set_system_visibility_state(Web::HTML::VisibilityState visibility_state)
 {
+    if (!may_change_window(*this, "did_request_set_system_visibility_state"sv))
+        return;
     view().set_system_visibility_state(visibility_state);
 }
 
@@ -2465,7 +2491,7 @@ void WebContentPage::did_change_hosted_navigable_state(Web::HTML::CrossProcessId
 
     // A page standing in for a document the navigable lost, as the page displaying the tab after its process crashed
     // does, does not speak for that document.
-    if (navigable->active_document().host() != this)
+    if (!hosts_active_document_of(*navigable))
         return;
 
     navigable->update_hosted_state(move(state));
@@ -2475,7 +2501,7 @@ void WebContentPage::did_set_opener_browsing_context(Web::HTML::CrossProcessId n
 {
     // Only the process hosting a navigable's active document speaks for its browsing context.
     auto navigable = hosted_navigable(navigable_id);
-    if (!navigable.has_value() || navigable->active_document().host() != this)
+    if (!navigable.has_value() || !hosts_active_document_of(*navigable))
         return;
     navigable->did_set_opener_browsing_context(opener_navigable_id);
 }
@@ -2655,7 +2681,7 @@ void WebContentPage::did_finish_loading(Web::HTML::CrossProcessId navigable_id, 
     //     navigable lost, as the page displaying the tab after its process crashed does, finishes loading the stand-in;
     //     that must not surface in the view.
     auto navigable = traversable().find(navigable_id);
-    if (!navigable.has_value() || navigable->active_document().host() != this)
+    if (!navigable.has_value() || !hosts_active_document_of(*navigable))
         return;
 
     if (navigable->active_document().id() != document_id)
@@ -3221,6 +3247,11 @@ void WebContentPage::did_reset_state_for_testing(Web::HTML::SessionHistoryEntryD
 {
     if (displays_tab())
         view().did_reset_state_for_testing({}, move(active_entry));
+}
+
+void WebContentPage::reset_gamepad_access_for_testing()
+{
+    GamepadManager::the().reset_access_for_testing(*this);
 }
 
 Messages::WebContentTestClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse WebContentPage::did_request_capture_session_history_snapshot_for_testing()

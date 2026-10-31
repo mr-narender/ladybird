@@ -72,7 +72,6 @@
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/HitTestDisplayList.h>
 #include <LibWeb/Painting/ScrollSnap.h>
-#include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/InputEvent.h>
@@ -389,15 +388,25 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     if (!node)
         return EventResult::Dropped;
 
-    // The compositor already scrolls for this press, so its scrollbar takes it whatever is hit here by now.
-    if (scrollbar_dragged_by_compositor.has_value()) {
-        auto scrollbar = m_navigable->scrollbar_dragged_by_compositor(read, *scrollbar_dragged_by_compositor);
-        if (!scrollbar)
+    // The compositor already scrolls for this press, so its scrollbar takes it whatever is hit here by now. A scrollbar
+    // of a document nested in this one takes it there, and only the process that owns that document's context can tell
+    // which scroller the compositor names.
+    auto scrollbar_is_in_this_document = scrollbar_dragged_by_compositor.has_value()
+        && m_navigable->has_compositor_context()
+        && m_navigable->compositor_context().id() == scrollbar_dragged_by_compositor->context_id;
+    if (scrollbar_is_in_this_document) {
+        auto* scroller = m_navigable->element_whose_scrollbar_is_dragged_by_compositor(read, *scrollbar_dragged_by_compositor);
+        if (!scroller)
             return EventResult::Dropped;
-        scrollbar->begin_drag_driven_by_compositor();
         record_input_routing(InputRoutingDecision::ScrollbarDragDrivenByCompositor, scrollbar_dragged_by_compositor->scroller_stable_node_id);
-        chrome_widget = scrollbar;
+        // The scrollbar the compositor presents grows wider than the one hit tested here, so the press goes to the
+        // scroller whatever is under the pointer.
+        if (auto* scroller_layout_node = scroller->layout_node(read)) {
+            node = scroller;
+            target_layout_node = scroller_layout_node;
+        }
     }
+    auto pressed_on_chrome = chrome_widget || target->is_scrollbar || scrollbar_is_in_this_document;
 
     if (button == UIEvents::MouseButton::Primary) {
         clear_mousedown_tracking();
@@ -406,12 +415,14 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
 
     m_mousedown_click_count = click_count;
 
-    if (!scrollbar_dragged_by_compositor.has_value() && !next_pointer_event_is_captured()) {
+    if (!scrollbar_is_in_this_document && (scrollbar_dragged_by_compositor.has_value() || !next_pointer_event_is_captured())) {
         auto dispath_result = dispatch_event_to_nested_navigable(*this, *target_layout_node, node, visual_viewport_position, remote_target, [=](EventHandler& event_handler, CSSPixelPoint position) -> EventResult {
-            return event_handler.handle_mousedown(position, screen_position, button, buttons, modifiers, click_count, {}, remote_target);
+            return event_handler.handle_mousedown(position, screen_position, button, buttons, modifiers, click_count, scrollbar_dragged_by_compositor, remote_target);
         });
         if (dispath_result.has_value())
             return *dispath_result;
+        if (scrollbar_dragged_by_compositor.has_value())
+            return EventResult::Dropped;
     }
 
     m_navigable->page().set_focused_navigable(m_navigable);
@@ -447,7 +458,7 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     // NB: The contextmenu event is dispatched even if the page cancelled the pointerdown or mousedown event,
     //     matching other engines. The page can still suppress the native context menu by cancelling the
     //     contextmenu event itself.
-    if (is_context_menu_trigger && dispatch_result != PointerEventDispatchResult::SwallowedByChromeWidget)
+    if (is_context_menu_trigger)
         maybe_show_context_menu(*node, coordinates, screen_position, viewport_position, buttons, modifiers);
 
     if (dispatch_result != PointerEventDispatchResult::RunDefaultActions)
@@ -463,7 +474,7 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     if (!has_committed_root_box())
         return EventResult::Accepted;
 
-    if (!chrome_widget)
+    if (!pressed_on_chrome)
         run_mousedown_default_actions(read, *document, visual_viewport_position, button, modifiers, click_count);
 
     return EventResult::Handled;
@@ -833,7 +844,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
         // https://www.w3.org/TR/pointerevents3/#event-dispatch
         // Dispatch event to target following the [UIEVENTS] spec.
         if (fire_click_events(*click_target, coordinates, screen_position, button, buttons, modifiers, click_count)
-            && !chrome_widget) {
+            && !chrome_widget && !target->is_scrollbar) {
             // NB: Event dispatches above may have run JS that invalidated layout.
             document->update_layout(DOM::UpdateLayoutReason::EventHandlerRunActivationBehavior);
 
@@ -1394,7 +1405,6 @@ EventResult EventHandler::handle_mouseleave()
     if (!has_committed_root_box())
         return EventResult::Dropped;
 
-    update_hovered_chrome_widget(nullptr);
     update_cursor(read, nullptr, nullptr, nullptr);
     m_last_known_mouse_visual_viewport_position.clear();
     update_nested_navigable_under_pointer(nullptr);
@@ -1457,7 +1467,7 @@ EventResult EventHandler::handle_mousecancel()
 
     // 4. Implicitly release the pointer capture if the pointer is currently captured.
     // NB: Firing the pointercancel event released the capture, and the press is released as this returns.
-    // FIXME: Also end a drag that a chrome widget, such as a scrollbar, has captured.
+    // FIXME: Also end a drag that a chrome widget, such as a resize handle, has captured.
 
     return EventResult::Handled;
 }
@@ -1582,7 +1592,6 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
     }
 
     ArmedScopeGuard clear_hover = [&] {
-        update_hovered_chrome_widget(nullptr);
         update_cursor(read, nullptr, nullptr, nullptr);
         track_the_effective_position_of_the_legacy_mouse_pointer(nullptr);
     };
@@ -1624,7 +1633,6 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
     if (!parent_element_for_event_dispatch(*target_layout_node, node, layout_node))
         return;
 
-    update_hovered_chrome_widget(chrome_widget);
     update_cursor(read, target_layout_node, *node, chrome_widget, hit_text_fragment);
     m_cursor_resolved_before_hover = true;
 
@@ -1900,6 +1908,11 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         return EventResult::Dropped;
     if (!m_navigable->active_document()->is_fully_active())
         return EventResult::Dropped;
+
+    // Using the keyboard means focus is indicated again, even if a click moved it last. A shortcut, with Ctrl, Alt, or
+    // Super held, doesn't count.
+    if (!(modifiers & (UIEvents::KeyModifier::Mod_Alt | UIEvents::KeyModifier::Mod_Ctrl | UIEvents::KeyModifier::Mod_Super)))
+        m_navigable->active_document()->note_keyboard_interaction();
 
     if (should_ignore_device_input_event() && m_mousedown_target_is_drag_candidate && key == UIEvents::KeyCode::Key_Escape)
         return cancel_drag_and_drop_event(m_last_known_mouse_visual_viewport_position.value_or({}), m_last_known_mouse_screen_position, UIEvents::MouseButton::Primary, m_last_known_mouse_buttons, modifiers);
@@ -3410,6 +3423,7 @@ Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelP
             .hit_node = result->hit_node,
             .arena = result->arena,
             .chrome_widget = result->chrome_widget,
+            .is_scrollbar = result->is_scrollbar,
             .node = result->node,
             .index_in_node = result->index_in_node,
             .is_text_fragment = result->is_text_fragment,
@@ -5348,7 +5362,7 @@ EventHandler::DispatchedPointerEvent EventHandler::dispatch_a_pointer_event_for_
     auto hit_test_coordinates = coordinates;
     if (pointer_capture_target) {
         node = pointer_capture_target;
-        // NB: A chrome widget under the pointer, such as a scrollbar, is a hit test result as well.
+        // NB: A chrome widget under the pointer, such as a resize handle, is a hit test result as well.
         chrome_widget = nullptr;
         if (auto* pointer_capture_target_layout_node = node->layout_node(read))
             coordinates = compute_mouse_event_coordinates(coordinates.visual_viewport_position, coordinates.viewport_position, *pointer_capture_target_layout_node);
@@ -5403,13 +5417,10 @@ EventHandler::DispatchedPointerEvent EventHandler::dispatch_a_pointer_event_for_
             set_node_and_ancestors_being_activated(m_mousedown_target.ptr(), false);
     }
 
-    update_hovered_chrome_widget(chrome_widget);
-
     // The events above may have changed layout, and chrome widgets are very likely to touch committed boxes.
     if (chrome_widget || m_captured_chrome_widget)
         document.update_layout(DOM::UpdateLayoutReason::EventHandlerDispatchChromeWidgetEvent);
-    if (!dispatch_chrome_widget_pointer_event(chrome_widget, pointer_event_name, button, coordinates.visual_viewport_position))
-        return { PointerEventDispatchResult::SwallowedByChromeWidget, pointer_capture_target };
+    dispatch_chrome_widget_pointer_event(chrome_widget, pointer_event_name, button, coordinates.visual_viewport_position);
 
     // FIXME: This will be moved to the click event and need to track the targets of the pointerdown and pointerup events.
     //        https://github.com/w3c/pointerevents/pull/460
@@ -5600,39 +5611,16 @@ void EventHandler::record_last_known_mouse_position(CSSPixelPoint visual_viewpor
     m_last_known_mouse_screen_position = screen_position;
 }
 
-bool EventHandler::dispatch_chrome_widget_pointer_event(RefPtr<Painting::ChromeWidget> target, Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position)
+void EventHandler::dispatch_chrome_widget_pointer_event(RefPtr<Painting::ChromeWidget> target, Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position)
 {
-    bool allow_default_behavior = true;
-
     if (m_captured_chrome_widget) {
-        auto action = m_captured_chrome_widget->handle_pointer_event(type, button, visual_viewport_position);
-        if (has_flag(action, Painting::MouseAction::SwallowEvent))
-            allow_default_behavior = false;
-        if (has_flag(action, Painting::MouseAction::CaptureInput))
-            return allow_default_behavior;
+        if (m_captured_chrome_widget->handle_pointer_event(type, button, visual_viewport_position) == Painting::MouseAction::CaptureInput)
+            return;
         m_captured_chrome_widget = nullptr;
     }
 
-    if (target) {
-        auto action = target->handle_pointer_event(type, button, visual_viewport_position);
-        if (has_flag(action, Painting::MouseAction::SwallowEvent))
-            allow_default_behavior = false;
-        if (has_flag(action, Painting::MouseAction::CaptureInput))
-            m_captured_chrome_widget = target;
-    }
-
-    return allow_default_behavior;
-}
-
-void EventHandler::update_hovered_chrome_widget(RefPtr<Painting::ChromeWidget> widget)
-{
-    if (m_hovered_chrome_widget == widget)
-        return;
-    if (m_hovered_chrome_widget)
-        m_hovered_chrome_widget->mouse_leave();
-    m_hovered_chrome_widget = move(widget);
-    if (m_hovered_chrome_widget)
-        m_hovered_chrome_widget->mouse_enter();
+    if (target && target->handle_pointer_event(type, button, visual_viewport_position) == Painting::MouseAction::CaptureInput)
+        m_captured_chrome_widget = target;
 }
 
 static Gfx::Cursor resolve_cursor(Layout::NodeWithStyle const& layout_node, Layout::NodeWithStyle const* cursor_values_owner, ReadonlySpan<CSS::ComputedValuesFFI::ComputedCursor> cursor_data, Gfx::StandardCursor auto_cursor)
@@ -5728,7 +5716,6 @@ void EventHandler::clear_per_test_input_state(Badge<Internals::Internals>)
     m_middle_button_scroll_handler = nullptr;
     m_mouse_pointer.prevent_mouse_event = false;
     m_additional_pointers.clear();
-    m_hovered_chrome_widget = nullptr;
     m_captured_chrome_widget = nullptr;
     m_effective_legacy_mouse_pointer_position = nullptr;
     m_effective_legacy_mouse_pointer_type = PointerType::Mouse;

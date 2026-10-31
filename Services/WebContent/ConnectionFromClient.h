@@ -84,7 +84,6 @@ public:
     Queue<Web::QueuedInputEvent>& input_event_queue() { return m_input_event_queue; }
     void update_input_method_state(Web::PageId page_id);
 
-    void notify_started_using_gamepads();
     void pump_and_dispatch_gamepad_events();
 
 private:
@@ -262,6 +261,7 @@ private:
     virtual void set_has_focus(Web::PageId page_id, bool) override;
     virtual void set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption) override;
+    virtual void notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id) override;
     virtual void set_is_scripting_enabled(Web::PageId page_id, bool) override;
     virtual void set_zoom_level(Web::PageId page_id, double zoom_level) override;
     virtual void set_maximum_frames_per_second(Web::PageId page_id, double) override;
@@ -366,8 +366,6 @@ private:
     RefPtr<Web::Compositor::CompositorConnection> m_compositor_connection;
     NonnullOwnPtr<PageHost> m_page_host;
     OwnPtr<DevToolsDebugger> m_devtools_debugger;
-
-    bool m_did_notify_started_using_gamepads { false };
 
     HashMap<int, Web::FileRequest> m_requested_files {};
     int last_id { 0 };

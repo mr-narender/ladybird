@@ -94,7 +94,6 @@
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/ScrollSnap.h>
-#include <LibWeb/Painting/Scrollbar.h>
 #include <LibWeb/Platform/Timer.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/CompositionEvent.h>
@@ -611,7 +610,7 @@ static bool handle_navigation_response_as_download(GC::Ref<NavigationParams> nav
         }
         auto suggested_filename = suggested_download_filename(download_url, *response->header_list(), {}, interface_origin);
 
-        // The UI process downloads the bytes this process received from the body first, then the rest of the request.
+        // A download the UI process starts reads the bytes released here before the rest of the request.
         ByteBuffer initial_data;
         for (auto const& received : response->release_body_for_transfer())
             initial_data.append(received.bytes());
@@ -5059,7 +5058,7 @@ bool LocalNavigable::set_scroll_offset_for(Web::AsyncScrollNodeStableID stable_n
     return Painting::set_scroll_offset(*layout_node, scroll_offset) == Painting::ScrollHandled::Yes;
 }
 
-RefPtr<Painting::Scrollbar> LocalNavigable::scrollbar_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const& scrollbar)
+DOM::Element* LocalNavigable::element_whose_scrollbar_is_dragged_by_compositor(Layout::BegunRead const& read, Web::ScrollbarDraggedByCompositor const& scrollbar)
 {
     auto document = active_document();
     if (!document)
@@ -5067,8 +5066,7 @@ RefPtr<Painting::Scrollbar> LocalNavigable::scrollbar_dragged_by_compositor(Layo
     auto* scrolling_box = layout_node_for_async_scroll_node(read, *document, scrollbar.scroller_stable_node_id);
     if (!scrolling_box || !Painting::has_committed_box(*scrolling_box))
         return nullptr;
-    auto direction = scrollbar.vertical ? Painting::ScrollDirection::Vertical : Painting::ScrollDirection::Horizontal;
-    return document->chrome_widget_registry().get_or_create_scrollbar(document->layout_node_arena(), Painting::committed_row_slot(*scrolling_box), direction);
+    return element_for_async_scroll_node_stable_id(*document, scrollbar.scroller_stable_node_id);
 }
 
 // NB: A scroll the compositor reports can arrive while layout is out of date, so this reads the committed layout.
@@ -7985,12 +7983,10 @@ bool LocalNavigable::has_inclusive_ancestor_with_visibility_hidden() const
     return false;
 }
 
-UserScrollGestureHold::UserScrollGestureHold(LocalNavigable& navigable, TakesOverMomentum takes_over_momentum, Optional<Web::AsyncScrollNodeStableID> held_box)
+UserScrollGestureHold::UserScrollGestureHold(LocalNavigable& navigable, TakesOverMomentum takes_over_momentum)
     : m_navigable(navigable)
     , m_takes_over_momentum(takes_over_momentum)
 {
-    if (held_box.has_value())
-        hold(held_box.value());
 }
 
 UserScrollGestureHold::~UserScrollGestureHold()

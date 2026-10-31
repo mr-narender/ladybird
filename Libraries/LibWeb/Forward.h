@@ -61,7 +61,6 @@ class ChromeWidgetRegistry;
 enum class PaintCommandCacheMode : u8;
 struct GradientPaintStyle;
 struct PatternPaintStyle;
-class Scrollbar;
 
 }
 
@@ -1104,6 +1103,7 @@ class SVGAnimatedLengthList;
 class SVGAnimatedNumber;
 class SVGAnimatedNumberList;
 class SVGAnimatedRect;
+class SVGAnimateElement;
 class SVGAnimateMotionElement;
 class SVGAnimationElement;
 class SVGCircleElement;
@@ -1156,6 +1156,7 @@ class SVGSymbolElement;
 class SVGTitleElement;
 class SVGTransformList;
 class SVGViewElement;
+class TimeEvent;
 
 }
 

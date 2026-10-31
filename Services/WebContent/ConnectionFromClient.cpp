@@ -3242,6 +3242,12 @@ void ConnectionFromClient::consume_user_activation(Web::PageId page_id, Web::HTM
         Web::HTML::Window::consume_user_activation_of_windows_hosted_by(page->page(), consumption);
 }
 
+void ConnectionFromClient::notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notify_document_about_user_activation(document_id);
+}
+
 void ConnectionFromClient::set_enable_global_privacy_control(Web::PageId, bool enable)
 {
     Web::update_loader_config([&](auto& config) { config.enable_global_privacy_control = enable; });
@@ -3613,14 +3619,6 @@ void ConnectionFromClient::dispatch_changed_gamepad_states()
             page.page().handle_gamepad_updated(state);
         });
     }
-}
-
-void ConnectionFromClient::notify_started_using_gamepads()
-{
-    if (m_did_notify_started_using_gamepads)
-        return;
-    m_did_notify_started_using_gamepads = true;
-    async_did_start_using_gamepads();
 }
 
 void ConnectionFromClient::pump_and_dispatch_gamepad_events()

@@ -410,6 +410,7 @@ ResizeObserverSize
 Response
 SVGAElement
 SVGAngle
+SVGAnimateElement
 SVGAnimateMotionElement
 SVGAnimatedAngle
 SVGAnimatedBoolean
@@ -556,6 +557,7 @@ TextTrack
 TextTrackCue
 TextTrackCueList
 TextTrackList
+TimeEvent
 TimeRanges
 ToggleEvent
 Touch

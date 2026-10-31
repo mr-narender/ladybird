@@ -26,8 +26,8 @@ use crate::layout::ComputedValuesView;
 use crate::layout::CssPixels;
 use crate::layout::node_data::{
     AncestorFact, DomPaintFact, FfiStylePayloads, GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE,
-    GENERATED_FOR_LAST_SYNTHETIC, GENERATED_FOR_MARKER, MAX_NODE_SLOT_COUNT, NodeData, NodeFlag, NodeKind, NodeSlotId,
-    StylePayloadsRef, pseudo_kind_of,
+    GENERATED_FOR_FIRST_LETTER, GENERATED_FOR_LAST_SYNTHETIC, GENERATED_FOR_MARKER, MAX_NODE_SLOT_COUNT, NodeData,
+    NodeFlag, NodeKind, NodeSlotId, StylePayloadsRef, pseudo_kind_of,
 };
 use crate::layout::node_facts::ReplacedContentFacts;
 use crate::layout::tree_mutation::HostCalls;
@@ -50,8 +50,8 @@ pub(crate) const SLOTS_PER_CHUNK: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IntrinsicSizeCacheKey {
-    pub(crate) measured_at_inline_size: Option<CssPixels>,
-    pub(crate) measured_at_block_size: Option<CssPixels>,
+    /// The block size inline sizes were measured at, or the inline size a block size was measured at.
+    pub(crate) measured_at_other_axis_size: Option<CssPixels>,
     pub(crate) percentage_basis_inline_size: Option<CssPixels>,
     pub(crate) percentage_basis_block_size: Option<CssPixels>,
     pub(crate) quirks_mode_percentage_basis_block_size: Option<CssPixels>,
@@ -60,53 +60,30 @@ pub(crate) struct IntrinsicSizeCacheKey {
 }
 
 impl IntrinsicSizeCacheKey {
-    fn with_percentage_block_bases_masked(self) -> Self {
-        Self {
-            percentage_basis_block_size: None,
-            quirks_mode_percentage_basis_block_size: None,
-            ..self
-        }
+    /// Whether a measurement made under this key answers `probe`: the keys agree on every part the measurement observed.
+    fn answers(&self, probe: &Self, observed: ObservedKeyParts) -> bool {
+        let Self {
+            measured_at_other_axis_size,
+            percentage_basis_inline_size,
+            percentage_basis_block_size,
+            quirks_mode_percentage_basis_block_size,
+            measured_in_transposed_frame,
+        } = *self;
+        measured_in_transposed_frame == probe.measured_in_transposed_frame
+            && (!observed.other_axis_size || measured_at_other_axis_size == probe.measured_at_other_axis_size)
+            && (!observed.percentage_inline_basis || percentage_basis_inline_size == probe.percentage_basis_inline_size)
+            && (!observed.percentage_block_bases
+                || (percentage_basis_block_size == probe.percentage_basis_block_size
+                    && quirks_mode_percentage_basis_block_size == probe.quirks_mode_percentage_basis_block_size))
     }
+}
 
-    fn with_percentage_inline_basis_masked(self) -> Self {
-        Self {
-            percentage_basis_inline_size: None,
-            ..self
-        }
-    }
-
-    pub(crate) fn with_measured_at_block_size_masked(self) -> Self {
-        Self {
-            measured_at_block_size: None,
-            ..self
-        }
-    }
-
-    fn with_parts_masked(self, parts: IntrinsicMeasurementDependencies) -> Self {
-        let mut key = self;
-        if parts.percentage_block_size {
-            key = key.with_percentage_block_bases_masked();
-        }
-        if parts.percentage_inline_basis {
-            key = key.with_percentage_inline_basis_masked();
-        }
-        if parts.block_size {
-            key = key.with_measured_at_block_size_masked();
-        }
-        key
-    }
-
-    fn masked_for(self, dependencies: IntrinsicMeasurementDependencies) -> Self {
-        self.with_parts_masked(dependencies.unobserved_parts())
-    }
-
-    fn parts_that_masking_changes(self) -> IntrinsicMeasurementDependencies {
-        IntrinsicMeasurementDependencies {
-            percentage_block_size: self.with_percentage_block_bases_masked() != self,
-            percentage_inline_basis: self.with_percentage_inline_basis_masked() != self,
-            block_size: self.with_measured_at_block_size_masked() != self,
-        }
-    }
+/// The parts of its key an intrinsic size measurement read.
+#[derive(Clone, Copy)]
+struct ObservedKeyParts {
+    other_axis_size: bool,
+    percentage_inline_basis: bool,
+    percentage_block_bases: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,43 +101,16 @@ impl IntrinsicMeasurementDependencies {
             block_size: self.block_size || other.block_size,
         }
     }
-
-    fn non_empty_subsets_of_all_parts() -> impl Iterator<Item = Self> {
-        (1u8..8).map(|bits| Self {
-            percentage_block_size: bits & 1 != 0,
-            percentage_inline_basis: bits & 2 != 0,
-            block_size: bits & 4 != 0,
-        })
-    }
-
-    fn unobserved_parts(self) -> Self {
-        Self {
-            percentage_block_size: !self.percentage_block_size,
-            percentage_inline_basis: !self.percentage_inline_basis,
-            block_size: !self.block_size,
-        }
-    }
-
-    fn is_subset_of(self, other: Self) -> bool {
-        (!self.percentage_block_size || other.percentage_block_size)
-            && (!self.percentage_inline_basis || other.percentage_inline_basis)
-            && (!self.block_size || other.block_size)
-    }
-
-    fn shares_a_part_with(self, other: Self) -> bool {
-        (self.percentage_block_size && other.percentage_block_size)
-            || (self.percentage_inline_basis && other.percentage_inline_basis)
-            || (self.block_size && other.block_size)
-    }
 }
 
-pub(crate) trait IntrinsicMeasurement: Copy {
-    fn dependencies(&self) -> IntrinsicMeasurementDependencies;
+trait IntrinsicMeasurement: Copy {
+    fn observed_key_parts(&self) -> ObservedKeyParts;
 }
 
-/// The intrinsic size measurements of one box, one entry per key. A box is usually measured under one key, so they are
-/// kept inline and searched in order, which reads one cache line where a hash map reads several. As a cache it may
-/// forget: past a few keys, the oldest goes.
+/// The intrinsic size measurements of one box, each under the key it was measured for, answering every key that agrees
+/// with it on the parts it observed. A box is usually measured under one key, so they are kept inline and searched in
+/// order, which reads one cache line where a hash map reads several. As a cache it may forget: past a few keys, the
+/// oldest goes.
 struct IntrinsicMeasurements<V> {
     entries: smallvec::SmallVec<[(IntrinsicSizeCacheKey, V); 1]>,
 }
@@ -176,10 +126,14 @@ impl<V> Default for IntrinsicMeasurements<V> {
 impl<V> IntrinsicMeasurements<V> {
     const MAXIMUM_ENTRIES: usize = 8;
 
-    fn get(&self, key: &IntrinsicSizeCacheKey) -> Option<&V> {
-        self.entries
-            .iter()
-            .find_map(|(entry_key, value)| (entry_key == key).then_some(value))
+    fn answer(&self, probe: &IntrinsicSizeCacheKey) -> Option<V>
+    where
+        V: IntrinsicMeasurement,
+    {
+        self.entries.iter().find_map(|(key, measurement)| {
+            key.answers(probe, measurement.observed_key_parts())
+                .then_some(*measurement)
+        })
     }
 
     fn insert(&mut self, key: IntrinsicSizeCacheKey, value: V) {
@@ -192,33 +146,6 @@ impl<V> IntrinsicMeasurements<V> {
         }
         self.entries.push((key, value));
     }
-}
-
-// Measurements are stored under their key with every part they never observed masked out. A
-// probe that had to mask a part must skip entries that observed it: a measurement made without
-// that part shares the masked key's shape.
-fn intrinsic_cache_lookup<V: IntrinsicMeasurement>(
-    map: &IntrinsicMeasurements<V>,
-    key: IntrinsicSizeCacheKey,
-) -> Option<V> {
-    if let Some(measurement) = map.get(&key) {
-        return Some(*measurement);
-    }
-    let parts_that_masking_changes = key.parts_that_masking_changes();
-    IntrinsicMeasurementDependencies::non_empty_subsets_of_all_parts()
-        .filter(|masked_parts| masked_parts.is_subset_of(parts_that_masking_changes))
-        .find_map(|masked_parts| {
-            let measurement = *map.get(&key.with_parts_masked(masked_parts))?;
-            (!measurement.dependencies().shares_a_part_with(masked_parts)).then_some(measurement)
-        })
-}
-
-fn intrinsic_cache_store<V: IntrinsicMeasurement>(
-    map: &mut IntrinsicMeasurements<V>,
-    key: IntrinsicSizeCacheKey,
-    value: V,
-) {
-    map.insert(key.masked_for(value.dependencies()), value);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,12 +181,22 @@ pub(crate) struct IntrinsicInlineSizeMeasurement {
     pub(crate) depends_on_block_size: bool,
 }
 
-impl IntrinsicMeasurement for IntrinsicInlineSizeMeasurement {
-    fn dependencies(&self) -> IntrinsicMeasurementDependencies {
+impl IntrinsicInlineSizeMeasurement {
+    pub(crate) fn dependencies(&self) -> IntrinsicMeasurementDependencies {
         IntrinsicMeasurementDependencies {
             percentage_block_size: self.depends_on_percentage_block_size,
             percentage_inline_basis: self.depends_on_percentage_inline_basis,
             block_size: self.depends_on_block_size,
+        }
+    }
+}
+
+impl IntrinsicMeasurement for IntrinsicInlineSizeMeasurement {
+    fn observed_key_parts(&self) -> ObservedKeyParts {
+        ObservedKeyParts {
+            other_axis_size: self.depends_on_block_size,
+            percentage_inline_basis: self.depends_on_percentage_inline_basis,
+            percentage_block_bases: self.depends_on_percentage_block_size,
         }
     }
 }
@@ -272,175 +209,101 @@ pub(crate) struct IntrinsicBlockSizeMeasurement {
 }
 
 impl IntrinsicMeasurement for IntrinsicBlockSizeMeasurement {
-    fn dependencies(&self) -> IntrinsicMeasurementDependencies {
-        IntrinsicMeasurementDependencies {
-            percentage_block_size: self.depends_on_percentage_block_size,
+    fn observed_key_parts(&self) -> ObservedKeyParts {
+        ObservedKeyParts {
+            other_axis_size: true,
             percentage_inline_basis: self.depends_on_percentage_inline_basis,
-            block_size: false,
+            percentage_block_bases: self.depends_on_percentage_block_size,
         }
     }
 }
 
 #[derive(Default)]
 struct IntrinsicSizeMaps {
-    // This is a subtree fact and shares the intrinsic cache's epoch so descendant changes invalidate it.
-    inline_size_depends_on_block_size: Option<bool>,
     content_inline_sizes: IntrinsicMeasurements<IntrinsicInlineSizeMeasurement>,
     max_content_block_size: IntrinsicMeasurements<IntrinsicBlockSizeMeasurement>,
-}
-
-impl IntrinsicSizeMaps {
-    fn block_sizes(
-        &self,
-        kind: IntrinsicSizeCacheKind,
-    ) -> Option<&IntrinsicMeasurements<IntrinsicBlockSizeMeasurement>> {
-        match kind {
-            IntrinsicSizeCacheKind::MinContentInline | IntrinsicSizeCacheKind::MaxContentInline => None,
-            IntrinsicSizeCacheKind::MaxContentBlock => Some(&self.max_content_block_size),
-        }
-    }
-
-    fn block_sizes_mut(
-        &mut self,
-        kind: IntrinsicSizeCacheKind,
-    ) -> Option<&mut IntrinsicMeasurements<IntrinsicBlockSizeMeasurement>> {
-        match kind {
-            IntrinsicSizeCacheKind::MinContentInline | IntrinsicSizeCacheKind::MaxContentInline => None,
-            IntrinsicSizeCacheKind::MaxContentBlock => Some(&mut self.max_content_block_size),
-        }
-    }
 }
 
 #[derive(Default)]
 struct IntrinsicSizeCacheSlot {
     generation: u8,
-    epoch: u16,
     sizes: Option<Box<IntrinsicSizeMaps>>,
 }
 
-/// What an intrinsic size cache entry was measured for: the row in a slot, and the row's
-/// intrinsic cache epoch, which every change that can move the row's intrinsic sizes bumps.
-#[derive(Clone, Copy)]
-pub(crate) struct IntrinsicSizeCacheStamp {
-    index: u32,
-    generation: u8,
-    epoch: u16,
-}
-
 /// The intrinsic sizes layout measured, kept from one pass to the next. Only layout reads or
-/// writes them, so they are the layout stage's scratch; the arena only notes the slots whose
-/// entries must go, which the stage drops before its next run reads anything.
+/// writes them, so they are the layout stage's scratch; the arena notes the boxes whose sizes
+/// went stale in its memo invalidations, which the stage applies before its next run reads any.
 #[derive(Default)]
 pub(crate) struct IntrinsicSizeCaches {
     slots: RefCell<Vec<IntrinsicSizeCacheSlot>>,
 }
 
 impl IntrinsicSizeCaches {
-    /// Drops the entries of `slots`, which were freed or whose rows' cache epoch wrapped.
-    pub(crate) fn drop_slots(&self, slots: Vec<u32>) {
-        let mut caches = self.slots.borrow_mut();
-        for index in slots {
-            if let Some(slot) = caches.get_mut(index as usize) {
-                *slot = IntrinsicSizeCacheSlot::default();
-            }
+    pub(crate) fn drop_entries_of_slot(&self, slot: u32) {
+        if let Some(slot) = self.slots.borrow_mut().get_mut(slot as usize) {
+            *slot = IntrinsicSizeCacheSlot::default();
         }
     }
 
-    /// Answers `answer` from the maps of the row `stamp` names, where they hold what was measured for it.
-    fn with_maps<R>(
-        &self,
-        stamp: IntrinsicSizeCacheStamp,
-        answer: impl FnOnce(&IntrinsicSizeMaps) -> Option<R>,
-    ) -> Option<R> {
+    /// Answers `answer` from the maps of `node`, where they hold what was measured for it.
+    fn with_maps<R>(&self, node: NodeSlotId, answer: impl FnOnce(&IntrinsicSizeMaps) -> Option<R>) -> Option<R> {
         let caches = self.slots.borrow();
-        let slot = caches.get(stamp.index as usize)?;
-        if slot.generation != stamp.generation || slot.epoch != stamp.epoch {
+        let slot = caches.get(node.slot_index() as usize)?;
+        if slot.generation != node.generation() {
             return None;
         }
         answer(slot.sizes.as_ref()?)
     }
 
-    pub(crate) fn intrinsic_block_size_cache_get(
+    pub(crate) fn max_content_block_size_cache_get(
         &self,
-        stamp: IntrinsicSizeCacheStamp,
-        kind: IntrinsicSizeCacheKind,
+        node: NodeSlotId,
         key: IntrinsicSizeCacheKey,
     ) -> Option<IntrinsicBlockSizeMeasurement> {
-        self.with_maps(stamp, |maps| {
-            let map = maps
-                .block_sizes(kind)
-                .expect("block size cache kind must use the block axis");
-            intrinsic_cache_lookup(map, key)
-        })
+        self.with_maps(node, |maps| maps.max_content_block_size.answer(&key))
     }
 
-    fn with_maps_mut(&self, stamp: IntrinsicSizeCacheStamp, callback: impl FnOnce(&mut IntrinsicSizeMaps)) {
-        let IntrinsicSizeCacheStamp {
-            index,
-            generation,
-            epoch,
-        } = stamp;
+    fn with_maps_mut(&self, node: NodeSlotId, callback: impl FnOnce(&mut IntrinsicSizeMaps)) {
+        let index = node.slot_index() as usize;
         let mut caches = self.slots.borrow_mut();
-        if caches.len() <= index as usize {
-            caches.resize_with(index as usize + 1, IntrinsicSizeCacheSlot::default);
+        if caches.len() <= index {
+            caches.resize_with(index + 1, IntrinsicSizeCacheSlot::default);
         }
-        let slot = &mut caches[index as usize];
-        if slot.generation != generation || slot.epoch != epoch {
+        let slot = &mut caches[index];
+        if slot.generation != node.generation() {
             *slot = IntrinsicSizeCacheSlot {
-                generation,
-                epoch,
-                sizes: Some(Box::default()),
+                generation: node.generation(),
+                sizes: None,
             };
         }
         callback(slot.sizes.get_or_insert_with(Box::default));
     }
 
-    pub(crate) fn intrinsic_block_size_cache_put(
+    pub(crate) fn max_content_block_size_cache_put(
         &self,
-        stamp: IntrinsicSizeCacheStamp,
-        kind: IntrinsicSizeCacheKind,
+        node: NodeSlotId,
         key: IntrinsicSizeCacheKey,
         value: IntrinsicBlockSizeMeasurement,
     ) {
-        self.with_maps_mut(stamp, |maps| {
-            let map = maps
-                .block_sizes_mut(kind)
-                .expect("block size cache kind must use the block axis");
-            intrinsic_cache_store(map, key, value);
-        });
+        self.with_maps_mut(node, |maps| maps.max_content_block_size.insert(key, value));
     }
 
     pub(crate) fn intrinsic_inline_size_measurement_cache_get(
         &self,
-        stamp: IntrinsicSizeCacheStamp,
+        node: NodeSlotId,
         key: IntrinsicSizeCacheKey,
     ) -> Option<IntrinsicInlineSizeMeasurement> {
-        self.with_maps(stamp, |maps| intrinsic_cache_lookup(&maps.content_inline_sizes, key))
-    }
-
-    pub(crate) fn intrinsic_inline_size_depends_on_block_size(
-        &self,
-        stamp: IntrinsicSizeCacheStamp,
-        compute: impl FnOnce() -> bool,
-    ) -> bool {
-        if let Some(value) = self.with_maps(stamp, |maps| maps.inline_size_depends_on_block_size) {
-            return value;
-        }
-        let value = compute();
-        self.with_maps_mut(stamp, |maps| {
-            maps.inline_size_depends_on_block_size = Some(value);
-        });
-        value
+        self.with_maps(node, |maps| maps.content_inline_sizes.answer(&key))
     }
 
     pub(crate) fn intrinsic_inline_size_measurement_cache_put(
         &self,
-        stamp: IntrinsicSizeCacheStamp,
+        node: NodeSlotId,
         key: IntrinsicSizeCacheKey,
         value: IntrinsicInlineSizeMeasurement,
     ) {
-        self.with_maps_mut(stamp, |maps| {
-            intrinsic_cache_store(&mut maps.content_inline_sizes, key, value);
+        self.with_maps_mut(node, |maps| {
+            maps.content_inline_sizes.insert(key, value);
         });
     }
 }
@@ -663,6 +526,13 @@ pub(super) enum AncestorInvalidation {
     ContentChange,
 }
 
+/// Whether a walk up from a change resets the cached intrinsic sizes of the boxes it reaches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AncestorIntrinsicSizes {
+    Reset,
+    Kept,
+}
+
 pub(crate) type ShellFactory = (*mut c_void, unsafe extern "C" fn(*mut c_void, NodeSlotId, NodeKind));
 
 /// How the host learns what boxes a DOM node has. The identity is 0 for the document, which has
@@ -725,14 +595,8 @@ pub const BOX_PRESENCE_HAS_COMMITTED_BOX: u8 = 1 << 1;
 pub struct FfiStyleRecordHostCallbacks {
     pub context: *mut c_void,
     pub shell_style_changed: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *const c_void, bool, bool),
+    pub shell_style_damaged: unsafe extern "C" fn(*mut c_void, *mut c_void, u32),
 }
-
-/// How the host learns that a shell's row took a new style: the shell, its new record and
-/// payloads, whether the arena derived the record, and whether the shell should attach the style's resources.
-pub(crate) type ShellStyleChangedHost = (
-    *mut c_void,
-    unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *const c_void, bool, bool),
-);
 
 /// Whether `a` and `b` hold equal payloads in the inherited groups, which are all an anonymous box inherits.
 fn style_payloads_equal_in_inherited_groups(a: StylePayloadsRef, b: StylePayloadsRef) -> bool {
@@ -1245,8 +1109,6 @@ pub(crate) struct LayoutNodeArena {
     free_list: Vec<u32>,
     next_index: u32,
     live_count: u32,
-    /// The slots whose intrinsic size cache entries the layout stage drops before its next run.
-    intrinsic_size_cache_drops: Vec<u32>,
     default_scroll_shift_anchors: Vec<DefaultScrollShiftAnchorSlot>,
     any_default_scroll_shift_anchor_ever_stored: bool,
     text_slots: TextSlots,
@@ -1284,6 +1146,10 @@ pub(crate) struct LayoutNodeArena {
     position_options_in_use: HashMap<NodeSlotId, super::abspos_inputs::PositionOptionChoice>,
     /// https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
     last_successful_position_options: HashMap<NodeSlotId, super::abspos_inputs::PositionOptionChoice>,
+    /// The style record and custom property environment of the element containing the letter, as each
+    /// `::first-letter` box's style was last derived from them.
+    first_letter_parent_styles: HashMap<NodeSlotId, (u64, u64)>,
+    first_letter_styles_derived: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) inline_boxes_lifted_out_of: HashMap<NodeSlotId, NodeSlotId>,
     pub(crate) out_of_flow_positioning_contained: HashMap<NodeSlotId, u32>,
     /// Attribution of pending updates for partial relayout. Invariant: every update recorded
@@ -1302,6 +1168,8 @@ pub(crate) struct LayoutNodeArena {
     image_resources_owed_to_host: Vec<(NodeSlotId, OwedImageResources)>,
     /// The image boxes among the rows that own the provider of the image they show.
     owned_image_providers: HashMap<NodeSlotId, OwnedImageProvider>,
+    /// The text node that each `display: contents` text wrapper box wraps.
+    display_contents_text_wrappers: HashMap<NodeSlotId, StyleNodeID>,
     /// Whether a row has ever been given a style with `content-visibility: auto`.
     may_have_auto_content_visibility: bool,
     /// Whether a row has ever been given a style with a scroll snap type.
@@ -1366,7 +1234,6 @@ impl LayoutNodeArena {
             free_list: Vec::new(),
             next_index: 0,
             live_count: 0,
-            intrinsic_size_cache_drops: Vec::new(),
             default_scroll_shift_anchors: Vec::new(),
             any_default_scroll_shift_anchor_ever_stored: false,
             text_slots: TextSlots::default(),
@@ -1390,6 +1257,8 @@ impl LayoutNodeArena {
             confined_abspos_layout_inputs: HashMap::default(),
             position_options_in_use: (HashMap::default()),
             last_successful_position_options: (HashMap::default()),
+            first_letter_parent_styles: HashMap::default(),
+            first_letter_styles_derived: std::sync::Arc::default(),
             inline_boxes_lifted_out_of: HashMap::default(),
             out_of_flow_positioning_contained: HashMap::default(),
             pending_updates_escape_partial_relayout: false,
@@ -1399,6 +1268,7 @@ impl LayoutNodeArena {
             built_scroll_containers: Default::default(),
             image_resources_owed_to_host: Default::default(),
             owned_image_providers: Default::default(),
+            display_contents_text_wrappers: Default::default(),
             may_have_auto_content_visibility: false,
             may_have_scroll_snap_areas: false,
             nodes_enrolled_for_replaced_content_facts_sync: Vec::new(),
@@ -1412,19 +1282,6 @@ impl LayoutNodeArena {
         }
     }
 
-    /// Drops one node's cached intrinsic sizes outright, for the wrap of its epoch:
-    /// entries are stamped with the epoch they were measured under, so a stamp reused
-    /// after a full lap would match a pre-wrap entry.
-    fn drop_intrinsic_size_cache(&mut self, node: NodeSlotId) {
-        self.intrinsic_size_cache_drops.push(node.slot_index());
-    }
-
-    /// The slots whose intrinsic size cache entries must go, for the layout stage to drop before
-    /// its next run reads any.
-    pub(crate) fn take_intrinsic_size_cache_drops(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.intrinsic_size_cache_drops)
-    }
-
     pub(crate) fn layout_commit_count(&self) -> u64 {
         self.layout_commit_count
     }
@@ -1433,26 +1290,12 @@ impl LayoutNodeArena {
         self.layout_commit_count += 1;
     }
 
-    pub(crate) fn has_intrinsic_size_cache_drops(&self) -> bool {
-        !self.intrinsic_size_cache_drops.is_empty()
-    }
-
-    /// What an intrinsic size cache entry measured for the row `id` now is valid for.
-    pub(crate) fn intrinsic_size_cache_stamp(&self, id: NodeSlotId) -> IntrinsicSizeCacheStamp {
-        IntrinsicSizeCacheStamp {
-            index: id.slot_index(),
-            generation: id.generation(),
-            epoch: self.data(id).intrinsic_cache_epoch,
-        }
-    }
-
     pub(crate) fn reset_cached_intrinsic_sizes(&mut self, node: NodeSlotId) {
-        let epoch = self.unpublished_facts_mut(node).intrinsic_cache_epoch;
-        *epoch = epoch.wrapping_add(1);
-        let bumped_epoch = *epoch;
-        if bumped_epoch == 0 {
-            self.drop_intrinsic_size_cache(node);
-        }
+        debug_assert!(
+            !self.layout_pass_is_running(),
+            "a node's intrinsic sizes became stale while a layout pass ran"
+        );
+        self.memo_invalidations.note_intrinsic_sizes_dropped(node.slot_index());
     }
 
     /// What writes did to the boxes the layout stage's run memos hold entries of since the stage last took it.
@@ -1578,10 +1421,10 @@ impl LayoutNodeArena {
                 continue;
             };
             let facts = super::node_facts::derived_replaced_content_facts(self.data(node), input);
-            // Changed facts invalidate cached formatting-context runs regardless of which channel
-            // produced the change, including sources with no invalidation of their own.
+            // Changed facts invalidate cached formatting-context runs and intrinsic sizes regardless of
+            // which channel produced the change, including sources with no invalidation of their own.
             if self.set_replaced_content_facts(node, facts) {
-                self.bump_fragment_cache_epoch_of_self_and_ancestors(node);
+                self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(node);
             }
         }
         self.nodes_enrolled_for_replaced_content_facts_sync = enrolled_nodes;
@@ -1750,7 +1593,6 @@ impl LayoutNodeArena {
         self.style_record_pins[index as usize] = ArenaStylePin::None;
         self.style_records_pinned_by_host[index as usize] = 0;
 
-        self.intrinsic_size_cache_drops.push(index);
         if let Some(slot) = self.default_scroll_shift_anchors.get_mut(index as usize) {
             *slot = DefaultScrollShiftAnchorSlot::default();
         }
@@ -1762,6 +1604,7 @@ impl LayoutNodeArena {
         }
         self.owned_image_natural_sizes.remove(&id);
         self.owned_image_providers.remove(&id);
+        self.display_contents_text_wrappers.remove(&id);
         self.memo_invalidations.note_slot_freed(index);
         self.remove_layout_update_flag_node(id);
         self.math_layout_kinds.remove(&id);
@@ -2419,8 +2262,7 @@ impl LayoutNodeArena {
         self.publish_new_size_container_geometry(slot);
         self.enroll_node_for_svg_paint_resources_sync(slot);
         if previous_payloads.is_some_and(|previous| !self.style_move_keeps_layout_inputs(slot, previous, payloads)) {
-            self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
-            self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
+            self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(slot);
         }
     }
 
@@ -2867,13 +2709,13 @@ impl LayoutNodeArena {
         if self.style_move_keeps_layout_inputs(row, previous_payloads, style.payloads) {
             return;
         }
-        self.bump_fragment_cache_epoch_of_self_and_ancestors(row);
         if let StyleRelayout::ByDamage(damage) = relayout
             && (damage & crate::css::style::bridge::FfiStyleInvalidationField::LevelMask as u32) < RELAYOUT_LEVEL
         {
+            self.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(row);
             return;
         }
-        self.reset_cached_intrinsic_sizes_of_self_and_ancestors(row);
+        self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(row);
         if let Some(style_node) = style_node {
             self.mark_row_for_relayout_after_style_change(style_node, row);
         }
@@ -2953,12 +2795,20 @@ impl LayoutNodeArena {
         fork.chunks_by_address.sort_unstable_by_key(|address| address.start);
         fork.style_engine = ArenaStyleEngine(engine);
         fork.svg_paint_resources.detach_enrolled_flag_for_fork();
+        fork.first_letter_styles_derived = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            self.first_letter_styles_derived
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ));
         fork
     }
 
     /// See [`crate::painting::svg_paint_resources::SvgPaintResources::share_enrolled_flag`].
     pub(crate) fn share_svg_paint_resources_enrolled(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.svg_paint_resources.share_enrolled_flag(flag);
+    }
+
+    pub(crate) fn share_first_letter_styles_derived(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.first_letter_styles_derived = flag;
     }
 
     /// Gives the row at `index` the style record `record`, answering the one it held. A row whose record changes no
@@ -3609,6 +3459,105 @@ impl LayoutNodeArena {
         self.with_style_engine(|engine| LayoutStyle::anonymous(engine, parent, kind, overrides).intern(engine))
     }
 
+    pub(crate) fn derive_first_letter_style_record(
+        &mut self,
+        originating: StyleNodeID,
+        text: StyleNodeID,
+    ) -> Option<DerivedStyleRecord> {
+        self.with_style_engine(|engine| {
+            let record = engine.first_letter_record_inheriting_from_text_parent(originating, text)?;
+            Some(DerivedStyleRecord::pin(engine, record))
+        })
+    }
+
+    pub(crate) fn note_first_letter_parent_style(
+        &mut self,
+        slot: NodeSlotId,
+        originating: StyleNodeID,
+        text: StyleNodeID,
+    ) {
+        let parent_style =
+            self.with_style_store(|engine| engine.first_letter_inheritance_parent_style(originating, text));
+        let Some(parent_style) = parent_style else {
+            self.first_letter_parent_styles.remove(&slot);
+            return;
+        };
+        self.first_letter_parent_styles.insert(slot, parent_style);
+        self.first_letter_styles_derived
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn refresh_first_letter_styles(&mut self, host_calls: HostCalls<'_>) {
+        let noted: smallvec::SmallVec<[(NodeSlotId, (u64, u64)); 4]> = self
+            .first_letter_parent_styles
+            .iter()
+            .map(|(&slot, &parent_style)| (slot, parent_style))
+            .collect();
+        for (slot, noted_parent_style) in noted {
+            if !self.slot_is_live(slot) {
+                self.first_letter_parent_styles.remove(&slot);
+                continue;
+            }
+            let parent_style = self
+                .node_style_node(slot)
+                .zip(self.node_style_node(self.data(slot).first_child.get()))
+                .and_then(|(originating, text)| {
+                    self.with_style_store(|engine| engine.first_letter_inheritance_parent_style(originating, text))
+                });
+            if parent_style != Some(noted_parent_style) {
+                self.reinherit_first_letter_box(host_calls, slot);
+            }
+        }
+    }
+
+    fn reinherit_first_letter_box(&mut self, host_calls: HostCalls<'_>, slot: NodeSlotId) {
+        let data = self.data(slot);
+        if data.generated_for.get() != GENERATED_FOR_FIRST_LETTER
+            || !super::node_facts::has_flag(data, NodeFlag::IsPseudoElementPrincipalBox)
+        {
+            return;
+        }
+        let kind = data.kind.get();
+        let Some(originating) = self.node_style_node(slot) else {
+            return;
+        };
+        let Some(text) = self.node_style_node(data.first_child.get()) else {
+            return;
+        };
+        let derived = self.derive_first_letter_style_record(originating, text);
+        self.note_first_letter_parent_style(slot, originating, text);
+        let Some(derived) = derived else {
+            return;
+        };
+        if derived.record == self.node_style_record(slot) {
+            self.with_style_engine(|engine| engine.unpin_layout_style_record(derived.record));
+            return;
+        }
+        let derived_kind = self
+            .with_style_store(|engine| engine.published_record_view(derived.record).map(|view| view.display()))
+            .and_then(super::tree_builder::node_kind_for_display);
+        if derived_kind != Some(kind) {
+            self.with_style_engine(|engine| engine.unpin_layout_style_record(derived.record));
+            self.mark_layout_tree_update(
+                Some(originating),
+                super::tree_update_marks::FfiLayoutTreeUpdateMark::style_change(0),
+            );
+            return;
+        }
+        let shown_record = self.node_style_record(slot);
+        let damage = self
+            .with_style_engine(|engine| engine.element_record_damage(originating, true, shown_record, derived.record));
+        if self.apply_reinherited_style_record(host_calls, slot, derived) {
+            self.set_needs_layout_update(slot, true);
+        }
+        if self.owe_style_image_resources_once(slot) {
+            self.notify_shell_of_style_change(host_calls, slot, true);
+        }
+        if damage & crate::css::style::bridge::FfiStyleInvalidationField::LevelMask as u32 != 0 {
+            host_calls.shell_style_damaged(slot, damage);
+        }
+    }
+
     /// `record` with its display replaced by `display`, pinned for a row of the arena.
     pub(crate) fn derive_style_record_with_display(
         &mut self,
@@ -3712,6 +3661,7 @@ impl LayoutNodeArena {
         if self.node_style_record(node) == 0 {
             return;
         }
+        self.reinherit_first_letter_box(host_calls, node);
         if self.is_display_contents_pseudo_element_box_holding_its_published_display(node) {
             self.make_display_contents_pseudo_element_box_inline(host_calls, node);
         }
@@ -3771,6 +3721,12 @@ impl LayoutNodeArena {
                             AnonymousStyleKind::WritingSuggestion,
                             AnonymousStyleOverrides::default(),
                         )
+                    } else if let Some(style_record) = self.display_contents_text_style_record(child) {
+                        self.derive_anonymous_style_record(
+                            style_record,
+                            AnonymousStyleKind::InlineStyleWrapper,
+                            AnonymousStyleOverrides::default(),
+                        )
                     } else {
                         let column_source = self
                             .anonymous_box_column_source(child)
@@ -3784,6 +3740,8 @@ impl LayoutNodeArena {
                     self.apply_reinherited_style_record(host_calls, child, derived);
                     self.reinherit_anonymous_children(host_calls, child, derived.record);
                 }
+            } else {
+                self.reinherit_first_letter_box(host_calls, child);
             }
             child = next_sibling;
         }
@@ -3794,16 +3752,16 @@ impl LayoutNodeArena {
         host_calls: HostCalls<'_>,
         slot: NodeSlotId,
         derived: DerivedStyleRecord,
-    ) {
+    ) -> bool {
         let previous_payloads = self.data(slot).style.get();
         let changes_layout_affecting_style =
             !self.style_move_keeps_layout_inputs(slot, previous_payloads, derived.payloads);
         self.replace_arena_pinned_style_record(slot, derived);
         if changes_layout_affecting_style {
-            self.bump_fragment_cache_epoch_of_self_and_ancestors(slot);
-            self.reset_cached_intrinsic_sizes_of_self_and_ancestors(slot);
+            self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(slot);
         }
         self.notify_shell_of_style_change(host_calls, slot, false);
+        changes_layout_affecting_style
     }
 
     fn notify_shell_of_style_change(&self, host_calls: HostCalls<'_>, slot: NodeSlotId, attach_resources: bool) {
@@ -4036,7 +3994,7 @@ impl LayoutNodeArena {
             let mut child = first_styled_child;
             while !child.is_invalid() {
                 if self.derive_ancestor_facts_for_node(child) {
-                    self.bump_fragment_cache_epoch_of_self_and_ancestors(child);
+                    self.invalidate_fragments_of_self_and_ancestors_leaving_intrinsic_sizes_to_its_cause(child);
                 }
                 child = self.data(child).next_sibling.get();
             }
@@ -4787,7 +4745,7 @@ impl LayoutNodeArena {
             if super::node_facts::has_flag(self.data(child), NodeFlag::Anonymous)
                 && self.derive_ancestor_facts_for_node(child)
             {
-                self.bump_fragment_cache_epoch_of_self_and_ancestors(child);
+                self.invalidate_fragments_of_self_and_ancestors_leaving_intrinsic_sizes_to_its_cause(child);
                 self.refresh_ancestor_facts_of_anonymous_children(child);
             }
             child = self.data(child).next_sibling.get();
@@ -5388,7 +5346,7 @@ impl LayoutNodeArena {
         // Publication can happen through a C++ text read before the enrolled
         // sync runs. Invalidate here so every publication invalidates layout,
         // including mapping-only changes with identical rendered code units.
-        self.bump_fragment_cache_epoch_of_self_and_ancestors(id);
+        self.invalidate_fragments_of_self_and_ancestors_leaving_intrinsic_sizes_to_its_cause(id);
     }
 
     pub(crate) fn invalidate_text_content(&mut self, id: NodeSlotId) {
@@ -5528,6 +5486,55 @@ impl LayoutNodeArena {
             .is_some_and(|state| state.precedes_writing_suggestion)
     }
 
+    pub(crate) fn note_display_contents_text_wrapper(&mut self, wrapper: NodeSlotId, text: StyleNodeID) {
+        self.display_contents_text_wrappers.insert(wrapper, text);
+    }
+
+    pub(crate) fn reinherit_display_contents_text(&mut self, host_calls: HostCalls<'_>, element: StyleNodeID) {
+        let assigned_node_count = self.assigned_node_count(Some(element));
+        let children: smallvec::SmallVec<[StyleNodeID; 4]> = if assigned_node_count != 0 {
+            (0..assigned_node_count)
+                .map(|index| self.assigned_node_at(element, index))
+                .collect()
+        } else {
+            self.with_style_store(|engine| engine.tree().dom_children(element).collect())
+        };
+        for child in children {
+            let row = self.bound_row(child);
+            if row.is_invalid() {
+                continue;
+            }
+            let wrapper = self.data(row).parent.get();
+            if wrapper.is_invalid() {
+                continue;
+            }
+            let Some(style_record) = self.display_contents_text_style_record(wrapper) else {
+                continue;
+            };
+            let derived = self.derive_anonymous_style_record(
+                style_record,
+                AnonymousStyleKind::InlineStyleWrapper,
+                AnonymousStyleOverrides::default(),
+            );
+            let shown_record = self.node_style_record(wrapper);
+            let damage = self
+                .with_style_engine(|engine| engine.element_record_damage(element, true, shown_record, derived.record));
+            if self.apply_reinherited_style_record(host_calls, wrapper, derived) {
+                self.set_needs_layout_update(wrapper, true);
+            }
+            self.reinherit_anonymous_children(host_calls, wrapper, derived.record);
+            if damage & crate::css::style::bridge::FfiStyleInvalidationField::LevelMask as u32 != 0 {
+                host_calls.shell_style_damaged(wrapper, damage);
+            }
+        }
+    }
+
+    fn display_contents_text_style_record(&self, wrapper: NodeSlotId) -> Option<u64> {
+        let text = self.display_contents_text_wrappers.get(&wrapper).copied()?;
+        let style_record = self.text_style_parent_facts(Some(text)).style_record;
+        (style_record != 0).then_some(style_record)
+    }
+
     /// Whether a box is the inline box that renders a writing suggestion, i.e. the one right after the text slice in
     /// front of the suggestion.
     fn is_writing_suggestion_box(&self, id: NodeSlotId) -> bool {
@@ -5644,14 +5651,65 @@ impl LayoutNodeArena {
     // parent pass sizing a child navigable's viewport invalidates the child document), so only
     // this arena's own pass may not see one. A bump landing between a run's probe and its store
     // is handled by storing the probe-time validity, which turns it into a fail-safe miss.
-    fn invalidate_at_and_above(&mut self, mut node: NodeSlotId, invalidation: AncestorInvalidation) {
-        while !node.is_invalid() {
-            self.invalidate_one(node, invalidation);
-            node = self.data(node).parent.get();
+    fn invalidate_self_and_ancestors(
+        &mut self,
+        node: NodeSlotId,
+        invalidation: AncestorInvalidation,
+        intrinsic_sizes: AncestorIntrinsicSizes,
+    ) {
+        self.invalidate_one(node, invalidation);
+        if intrinsic_sizes == AncestorIntrinsicSizes::Reset
+            && super::node_facts::kind_is_box(self.data(node).kind.get())
+        {
+            self.reset_cached_intrinsic_sizes(node);
+        }
+        self.invalidate_ancestors_for_change_below(node, invalidation, intrinsic_sizes);
+    }
+
+    pub(super) fn invalidate_ancestors_for_change_below(
+        &mut self,
+        node: NodeSlotId,
+        invalidation: AncestorInvalidation,
+        mut intrinsic_sizes: AncestorIntrinsicSizes,
+    ) {
+        let mut ancestor = self.data(node).parent.get();
+        while !ancestor.is_invalid() {
+            intrinsic_sizes = self.invalidate_ancestor_for_change_below(ancestor, invalidation, intrinsic_sizes);
+            ancestor = self.data(ancestor).parent.get();
         }
     }
 
-    /// The part of `invalidate_at_and_above` that applies to one node, for walks that also do other work on the way up.
+    /// The step of a walk up from a change that invalidates `ancestor`, for walks that also do other work on the way up.
+    /// Answers what the walk does to the intrinsic sizes of the ancestors above it.
+    pub(super) fn invalidate_ancestor_for_change_below(
+        &mut self,
+        ancestor: NodeSlotId,
+        invalidation: AncestorInvalidation,
+        intrinsic_sizes: AncestorIntrinsicSizes,
+    ) -> AncestorIntrinsicSizes {
+        self.invalidate_one(ancestor, invalidation);
+        if intrinsic_sizes == AncestorIntrinsicSizes::Reset
+            && super::node_facts::kind_is_box(self.data(ancestor).kind.get())
+        {
+            self.reset_cached_intrinsic_sizes(ancestor);
+            if self.content_does_not_size_box(ancestor) {
+                return AncestorIntrinsicSizes::Kept;
+            }
+        }
+        intrinsic_sizes
+    }
+
+    /// Whether a change inside the box leaves the intrinsic sizes of its ancestors as they are.
+    /// Absolutely positioned elements don't contribute to ancestor intrinsic sizes. SVG root
+    /// elements have intrinsic sizes determined solely by their own attributes (width, height,
+    /// viewBox), not by their children.
+    fn content_does_not_size_box(&self, node: NodeSlotId) -> bool {
+        self.data(node).kind.get() == NodeKind::SVGSVGBox
+            || self
+                .node_style_if_live(node)
+                .is_some_and(|style| style.is_absolutely_positioned())
+    }
+
     pub(super) fn invalidate_one(&mut self, node: NodeSlotId, invalidation: AncestorInvalidation) {
         if invalidation == AncestorInvalidation::StructuralChange {
             self.memo_invalidations.note_structural_inline_change(node);
@@ -5676,12 +5734,21 @@ impl LayoutNodeArena {
         self.memo_invalidations.note_fragment_cache_epoch_bumped(node);
     }
 
-    pub(crate) fn note_structural_change_at_and_above(&mut self, node: NodeSlotId) {
-        self.invalidate_at_and_above(node, AncestorInvalidation::StructuralChange);
+    pub(crate) fn invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(&mut self, node: NodeSlotId) {
+        self.invalidate_self_and_ancestors(node, AncestorInvalidation::ContentChange, AncestorIntrinsicSizes::Reset);
     }
 
-    pub(crate) fn bump_fragment_cache_epoch_of_self_and_ancestors(&mut self, node: NodeSlotId) {
-        self.invalidate_at_and_above(node, AncestorInvalidation::ContentChange);
+    pub(crate) fn invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(&mut self, node: NodeSlotId) {
+        self.invalidate_self_and_ancestors(node, AncestorInvalidation::ContentChange, AncestorIntrinsicSizes::Kept);
+    }
+
+    /// For a change whose cause resets the intrinsic sizes it moves itself, such as the layout mark that follows a text
+    /// change or the style change that refreshes ancestor facts.
+    pub(crate) fn invalidate_fragments_of_self_and_ancestors_leaving_intrinsic_sizes_to_its_cause(
+        &mut self,
+        node: NodeSlotId,
+    ) {
+        self.invalidate_self_and_ancestors(node, AncestorInvalidation::ContentChange, AncestorIntrinsicSizes::Kept);
     }
 
     pub(crate) fn insert_child(&mut self, parent: NodeSlotId, child: NodeSlotId, before: NodeSlotId) {
@@ -5751,7 +5818,12 @@ impl LayoutNodeArena {
         self.note_layout_subtree_attached(child);
         self.pending_attached_subtree_roots.push(child);
         self.note_overflow_contained_boxes_may_move_with_subtree(child);
-        self.note_structural_change_at_and_above(parent);
+        // NB: Resolving the deferred insertion marks the parent for layout, which resets its intrinsic sizes.
+        self.invalidate_self_and_ancestors(
+            parent,
+            AncestorInvalidation::StructuralChange,
+            AncestorIntrinsicSizes::Kept,
+        );
     }
 
     pub(crate) fn remove_child(&mut self, parent: NodeSlotId, child: NodeSlotId) {
@@ -5760,8 +5832,11 @@ impl LayoutNodeArena {
         }
         self.note_overflow_contained_boxes_may_move_with_subtree(child);
         self.unlink_child(parent, child);
-        self.note_structural_change_at_and_above(parent);
-        self.reset_cached_intrinsic_sizes_of_self_and_ancestors(parent);
+        self.invalidate_self_and_ancestors(
+            parent,
+            AncestorInvalidation::StructuralChange,
+            AncestorIntrinsicSizes::Reset,
+        );
     }
 
     fn unlink_child(&mut self, parent: NodeSlotId, child: NodeSlotId) {
@@ -6257,9 +6332,7 @@ pub unsafe extern "C" fn document_host_set_style_record_host_callbacks(
     host: &DocumentHost,
     callbacks: FfiStyleRecordHostCallbacks,
 ) {
-    host.host_tables()
-        .shell_style_changed_host
-        .set(Some((callbacks.context, callbacks.shell_style_changed)));
+    host.host_tables().style_record_host.set(Some(callbacks));
 }
 
 #[unsafe(no_mangle)]
@@ -6350,15 +6423,13 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
 
     use crate::layout::abspos_inputs::{
         AbsposAxisMode, AbsposContainingBlockInfo, AbsposLayoutInputs, StaticPositionAlignment, StaticPositionRect,
     };
     use crate::layout::layout_node_arena::{
         Chunk, DerivedStyleRecord, IntrinsicBlockSizeMeasurement, IntrinsicInlineSizeMeasurement,
-        IntrinsicMeasurementDependencies, IntrinsicSizeCacheKey, IntrinsicSizeCacheKind, LayoutNodeArena,
-        SLOTS_PER_CHUNK,
+        IntrinsicMeasurementDependencies, IntrinsicSizeCacheKey, LayoutNodeArena, SLOTS_PER_CHUNK,
     };
     use crate::layout::node_data::{NodeConstructionFacts, NodeFlag, NodeKind, NodeSlotId};
     use crate::layout::{CssPixels, fragment_tree};
@@ -7074,7 +7145,7 @@ mod tests {
         commit_from_layout(&mut arena);
         assert_eq!(current(&arena), Some(node));
 
-        arena.bump_fragment_cache_epoch_of_self_and_ancestors(node);
+        arena.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(node);
         assert_eq!(current(&arena), None);
         commit_from_layout(&mut arena);
         assert_eq!(current(&arena), Some(node));
@@ -7091,7 +7162,7 @@ mod tests {
         *arena.unpublished_facts_mut(node).fragment_cache_epoch = 0;
         commit_from_layout(&mut arena);
         *arena.unpublished_facts_mut(node).fragment_cache_epoch = u32::MAX;
-        arena.bump_fragment_cache_epoch_of_self_and_ancestors(node);
+        arena.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(node);
         assert_eq!(arena.data(node).fragment_cache_epoch, 0);
         assert_eq!(current(&arena), None);
     }
@@ -7102,7 +7173,7 @@ mod tests {
         let mut arena = LayoutNodeArena::new();
         let node = arena.allocate_for_test().slot;
         arena.begin_active_layout_pass();
-        arena.bump_fragment_cache_epoch_of_self_and_ancestors(node);
+        arena.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(node);
     }
 
     #[test]
@@ -7482,12 +7553,14 @@ mod tests {
     }
 
     #[test]
-    fn intrinsic_size_cache_validates_epoch_and_generation() {
+    fn intrinsic_size_cache_entries_go_with_noted_resets_and_slot_reuse() {
         let mut arena = LayoutNodeArena::new();
-        let caches = super::IntrinsicSizeCaches::default();
+        let scratch = crate::layout::run_state::LayoutScratch::default();
+        let caches = &scratch.intrinsic_size_caches;
         let first = arena.allocate_for_test();
+        scratch.apply_memo_invalidations(&mut arena);
         let key = IntrinsicSizeCacheKey {
-            measured_at_inline_size: Some(CssPixels::from_raw(64)),
+            measured_at_other_axis_size: Some(CssPixels::from_raw(64)),
             ..Default::default()
         };
         let value = IntrinsicBlockSizeMeasurement {
@@ -7503,81 +7576,42 @@ mod tests {
             depends_on_percentage_inline_basis: false,
             depends_on_block_size: false,
         };
-        let dependency_computations = Cell::new(0);
-
-        caches.intrinsic_block_size_cache_put(
-            arena.intrinsic_size_cache_stamp(first.slot),
-            IntrinsicSizeCacheKind::MaxContentBlock,
-            key,
-            value,
-        );
-        caches.intrinsic_inline_size_measurement_cache_put(
-            arena.intrinsic_size_cache_stamp(first.slot),
-            key,
-            inline_measurement,
-        );
+        caches.max_content_block_size_cache_put(first.slot, key, value);
+        caches.intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
+        assert_eq!(caches.max_content_block_size_cache_get(first.slot, key), Some(value));
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(first.slot),
-                IntrinsicSizeCacheKind::MaxContentBlock,
-                key
-            ),
-            Some(value)
-        );
-        assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(arena.intrinsic_size_cache_stamp(first.slot), key),
+            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
             Some(inline_measurement)
         );
-        assert!(caches.intrinsic_inline_size_depends_on_block_size(
-            arena.intrinsic_size_cache_stamp(first.slot),
-            || {
-                dependency_computations.set(dependency_computations.get() + 1);
-                true
-            }
-        ));
-        assert!(
-            caches.intrinsic_inline_size_depends_on_block_size(arena.intrinsic_size_cache_stamp(first.slot), || false)
-        );
-        assert_eq!(dependency_computations.get(), 1);
 
-        *arena.unpublished_facts_mut(first.slot).intrinsic_cache_epoch += 1;
+        arena.reset_cached_intrinsic_sizes(first.slot);
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(first.slot),
-                IntrinsicSizeCacheKind::MaxContentBlock,
-                key
-            ),
+            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
+            Some(inline_measurement),
+            "a reset reaches the cache when the stage applies the arena's notes"
+        );
+        scratch.apply_memo_invalidations(&mut arena);
+        assert_eq!(caches.max_content_block_size_cache_get(first.slot, key), None);
+        assert_eq!(
+            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
             None
         );
-        assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(arena.intrinsic_size_cache_stamp(first.slot), key),
-            None
-        );
-        assert!(!caches.intrinsic_inline_size_depends_on_block_size(
-            arena.intrinsic_size_cache_stamp(first.slot),
-            || {
-                dependency_computations.set(dependency_computations.get() + 1);
-                false
-            }
-        ));
-        assert_eq!(dependency_computations.get(), 2);
+
+        caches.intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
         arena
             .free_subtree(first.slot)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
-
         let second = arena.allocate_for_test();
         assert_eq!(second.slot.slot_index(), first.slot.slot_index());
         assert_ne!(second.slot, first.slot);
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(second.slot),
-                IntrinsicSizeCacheKind::MaxContentBlock,
-                key
-            ),
-            None
+            caches.intrinsic_inline_size_measurement_cache_get(second.slot, key),
+            None,
+            "a reused slot misses by its generation before the stage applies the freeing note"
         );
+        scratch.apply_memo_invalidations(&mut arena);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(arena.intrinsic_size_cache_stamp(second.slot), key),
+            caches.intrinsic_inline_size_measurement_cache_get(second.slot, key),
             None
         );
         arena
@@ -7592,50 +7626,32 @@ mod tests {
         let allocation = arena.allocate_for_test();
         let dependent_allocation = arena.allocate_for_test();
         let key_with_basis = |basis: i32| IntrinsicSizeCacheKey {
-            measured_at_inline_size: Some(CssPixels::from_raw(64)),
+            measured_at_other_axis_size: Some(CssPixels::from_raw(64)),
             percentage_basis_block_size: Some(CssPixels::from_raw(basis)),
             quirks_mode_percentage_basis_block_size: Some(CssPixels::from_raw(basis)),
             ..Default::default()
         };
         let key_without_basis = IntrinsicSizeCacheKey {
-            measured_at_inline_size: Some(CssPixels::from_raw(64)),
+            measured_at_other_axis_size: Some(CssPixels::from_raw(64)),
             ..Default::default()
         };
-        let max_content = IntrinsicSizeCacheKind::MaxContentBlock;
 
         let independent = IntrinsicBlockSizeMeasurement {
             size: CssPixels::from_raw(128),
             depends_on_percentage_block_size: false,
             depends_on_percentage_inline_basis: false,
         };
-        caches.intrinsic_block_size_cache_put(
-            arena.intrinsic_size_cache_stamp(allocation.slot),
-            max_content,
-            key_with_basis(100),
-            independent,
-        );
+        caches.max_content_block_size_cache_put(allocation.slot, key_with_basis(100), independent);
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(allocation.slot),
-                max_content,
-                key_with_basis(100)
-            ),
+            caches.max_content_block_size_cache_get(allocation.slot, key_with_basis(100)),
             Some(independent)
         );
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(allocation.slot),
-                max_content,
-                key_with_basis(200)
-            ),
+            caches.max_content_block_size_cache_get(allocation.slot, key_with_basis(200)),
             Some(independent)
         );
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(allocation.slot),
-                max_content,
-                key_without_basis
-            ),
+            caches.max_content_block_size_cache_get(allocation.slot, key_without_basis),
             Some(independent)
         );
 
@@ -7644,53 +7660,27 @@ mod tests {
             depends_on_percentage_block_size: true,
             depends_on_percentage_inline_basis: false,
         };
-        caches.intrinsic_block_size_cache_put(
-            arena.intrinsic_size_cache_stamp(dependent_allocation.slot),
-            max_content,
-            key_without_basis,
-            dependent,
-        );
+        caches.max_content_block_size_cache_put(dependent_allocation.slot, key_without_basis, dependent);
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(dependent_allocation.slot),
-                max_content,
-                key_without_basis
-            ),
+            caches.max_content_block_size_cache_get(dependent_allocation.slot, key_without_basis),
             Some(dependent)
         );
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(dependent_allocation.slot),
-                max_content,
-                key_with_basis(100)
-            ),
+            caches.max_content_block_size_cache_get(dependent_allocation.slot, key_with_basis(100)),
             None
         );
-        caches.intrinsic_block_size_cache_put(
-            arena.intrinsic_size_cache_stamp(dependent_allocation.slot),
-            max_content,
-            key_with_basis(100),
-            dependent,
-        );
+        caches.max_content_block_size_cache_put(dependent_allocation.slot, key_with_basis(100), dependent);
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(dependent_allocation.slot),
-                max_content,
-                key_with_basis(100)
-            ),
+            caches.max_content_block_size_cache_get(dependent_allocation.slot, key_with_basis(100)),
             Some(dependent)
         );
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(dependent_allocation.slot),
-                max_content,
-                key_with_basis(200)
-            ),
+            caches.max_content_block_size_cache_get(dependent_allocation.slot, key_with_basis(200)),
             None
         );
 
         let key_at_another_inline_size_with_inline_basis = |basis: i32| IntrinsicSizeCacheKey {
-            measured_at_inline_size: Some(CssPixels::from_raw(96)),
+            measured_at_other_axis_size: Some(CssPixels::from_raw(96)),
             percentage_basis_inline_size: Some(CssPixels::from_raw(basis)),
             ..key_with_basis(100)
         };
@@ -7699,24 +7689,18 @@ mod tests {
             depends_on_percentage_block_size: false,
             depends_on_percentage_inline_basis: true,
         };
-        caches.intrinsic_block_size_cache_put(
-            arena.intrinsic_size_cache_stamp(allocation.slot),
-            max_content,
+        caches.max_content_block_size_cache_put(
+            allocation.slot,
             key_at_another_inline_size_with_inline_basis(300),
             observes_inline_basis,
         );
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(allocation.slot),
-                max_content,
-                key_at_another_inline_size_with_inline_basis(300)
-            ),
+            caches.max_content_block_size_cache_get(allocation.slot, key_at_another_inline_size_with_inline_basis(300)),
             Some(observes_inline_basis)
         );
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(allocation.slot),
-                max_content,
+            caches.max_content_block_size_cache_get(
+                allocation.slot,
                 IntrinsicSizeCacheKey {
                     percentage_basis_block_size: Some(CssPixels::from_raw(200)),
                     ..key_at_another_inline_size_with_inline_basis(300)
@@ -7725,11 +7709,7 @@ mod tests {
             Some(observes_inline_basis)
         );
         assert_eq!(
-            caches.intrinsic_block_size_cache_get(
-                arena.intrinsic_size_cache_stamp(allocation.slot),
-                max_content,
-                key_at_another_inline_size_with_inline_basis(400)
-            ),
+            caches.max_content_block_size_cache_get(allocation.slot, key_at_another_inline_size_with_inline_basis(400)),
             None
         );
         arena
@@ -7746,8 +7726,7 @@ mod tests {
         measured_at_block_size: Option<i32>,
     ) -> IntrinsicSizeCacheKey {
         IntrinsicSizeCacheKey {
-            measured_at_inline_size: None,
-            measured_at_block_size: measured_at_block_size.map(CssPixels::from_raw),
+            measured_at_other_axis_size: measured_at_block_size.map(CssPixels::from_raw),
             percentage_basis_inline_size: percentage_basis_inline_size.map(CssPixels::from_raw),
             percentage_basis_block_size: percentage_basis_block_size.map(CssPixels::from_raw),
             quirks_mode_percentage_basis_block_size: percentage_basis_block_size.map(CssPixels::from_raw),
@@ -7784,9 +7763,8 @@ mod tests {
         let measured_key = inline_size_cache_key(Some(100), Some(300), Some(50));
         for observed_parts in every_combination_of_key_parts() {
             let allocation = arena.allocate_for_test();
-            let stamp = || arena.intrinsic_size_cache_stamp(allocation.slot);
             let measurement = inline_size_measurement(128, observed_parts);
-            caches.intrinsic_inline_size_measurement_cache_put(stamp(), measured_key, measurement);
+            caches.intrinsic_inline_size_measurement_cache_put(allocation.slot, measured_key, measurement);
             for changed_parts in every_combination_of_key_parts() {
                 let measured_or_changed =
                     |changed: bool, measured: i32| Some(if changed { measured * 2 } else { measured });
@@ -7800,7 +7778,7 @@ mod tests {
                     || (changed_parts.percentage_inline_basis && observed_parts.percentage_inline_basis)
                     || (changed_parts.block_size && observed_parts.block_size);
                 assert_eq!(
-                    caches.intrinsic_inline_size_measurement_cache_get(stamp(), probe),
+                    caches.intrinsic_inline_size_measurement_cache_get(allocation.slot, probe),
                     (!probe_changes_an_observed_part).then_some(measurement),
                     "observed {observed_parts:?}, changed {changed_parts:?}"
                 );
@@ -7822,17 +7800,16 @@ mod tests {
         let key_at_block_size = |block_size: Option<i32>| inline_size_cache_key(None, None, block_size);
 
         let independent = arena.allocate_for_test();
-        let independent_stamp = || arena.intrinsic_size_cache_stamp(independent.slot);
         let measured_at_definite_block_size = inline_size_measurement(128, IntrinsicMeasurementDependencies::default());
         caches.intrinsic_inline_size_measurement_cache_put(
-            independent_stamp(),
+            independent.slot,
             key_at_block_size(Some(50)),
             measured_at_definite_block_size,
         );
         for probed_block_size in [Some(50), Some(80), None] {
             assert_eq!(
                 caches.intrinsic_inline_size_measurement_cache_get(
-                    independent_stamp(),
+                    independent.slot,
                     key_at_block_size(probed_block_size)
                 ),
                 Some(measured_at_definite_block_size)
@@ -7840,43 +7817,40 @@ mod tests {
         }
 
         let dependent = arena.allocate_for_test();
-        let dependent_stamp = || arena.intrinsic_size_cache_stamp(dependent.slot);
         let dependent_measurement = inline_size_measurement(256, observes_block_size);
         caches.intrinsic_inline_size_measurement_cache_put(
-            dependent_stamp(),
+            dependent.slot,
             key_at_block_size(Some(50)),
             dependent_measurement,
         );
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(dependent_stamp(), key_at_block_size(Some(50))),
+            caches.intrinsic_inline_size_measurement_cache_get(dependent.slot, key_at_block_size(Some(50))),
             Some(dependent_measurement)
         );
         for probed_block_size in [Some(80), None] {
             assert_eq!(
-                caches.intrinsic_inline_size_measurement_cache_get(
-                    dependent_stamp(),
-                    key_at_block_size(probed_block_size)
-                ),
+                caches
+                    .intrinsic_inline_size_measurement_cache_get(dependent.slot, key_at_block_size(probed_block_size)),
                 None
             );
         }
 
         let measured_without_block_size = inline_size_measurement(512, observes_block_size);
         caches.intrinsic_inline_size_measurement_cache_put(
-            dependent_stamp(),
+            dependent.slot,
             key_at_block_size(None),
             measured_without_block_size,
         );
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(dependent_stamp(), key_at_block_size(None)),
+            caches.intrinsic_inline_size_measurement_cache_get(dependent.slot, key_at_block_size(None)),
             Some(measured_without_block_size)
         );
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(dependent_stamp(), key_at_block_size(Some(80))),
+            caches.intrinsic_inline_size_measurement_cache_get(dependent.slot, key_at_block_size(Some(80))),
             None
         );
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(dependent_stamp(), key_at_block_size(Some(50))),
+            caches.intrinsic_inline_size_measurement_cache_get(dependent.slot, key_at_block_size(Some(50))),
             Some(dependent_measurement)
         );
 

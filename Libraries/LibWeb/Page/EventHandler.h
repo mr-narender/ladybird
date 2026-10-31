@@ -231,6 +231,7 @@ private:
         Compositing::RustFFI::NodeSlotId hit_node;
         NonnullRefPtr<Layout::NodeArena> arena;
         RefPtr<Painting::ChromeWidget> chrome_widget;
+        bool is_scrollbar { false };
         DOM::NodeIdentity node;
         Optional<int> index_in_node;
         bool is_text_fragment { false };
@@ -283,7 +284,6 @@ private:
         RunDefaultActions,
         CancelledByPage,
         MouseEventPrevented,
-        SwallowedByChromeWidget,
     };
     struct DispatchedPointerEvent {
         PointerEventDispatchResult result;
@@ -304,8 +304,7 @@ private:
     void track_the_effective_position_of_the_legacy_mouse_pointer(GC::Ptr<DOM::Node>, Optional<DOM::HoverEventData> = {});
     void report_hovered_node_to_client(GC::Ptr<DOM::Node>);
 
-    bool dispatch_chrome_widget_pointer_event(RefPtr<Painting::ChromeWidget>, Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position);
-    void update_hovered_chrome_widget(RefPtr<Painting::ChromeWidget>);
+    void dispatch_chrome_widget_pointer_event(RefPtr<Painting::ChromeWidget>, Utf16FlyString const& type, unsigned button, CSSPixelPoint visual_viewport_position);
     void update_nested_navigable_under_pointer(GC::Ptr<HTML::LocalNavigable>);
 
     void update_cursor(Layout::BegunRead const& read, Layout::Node const*, GC::Ptr<DOM::Node> host_element, RefPtr<Painting::ChromeWidget>, bool hit_text_fragment = false);
@@ -320,7 +319,6 @@ private:
     InputEventsTarget* m_mouse_selection_target { nullptr };
     GC::Ptr<DOM::Range> m_selection_origin;
 
-    RefPtr<Painting::ChromeWidget> m_hovered_chrome_widget;
     RefPtr<Painting::ChromeWidget> m_captured_chrome_widget;
 
     GC::Weak<DOM::Node> m_effective_legacy_mouse_pointer_position;

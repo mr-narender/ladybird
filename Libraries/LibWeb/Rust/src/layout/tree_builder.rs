@@ -164,7 +164,7 @@ fn apply_replaced_display_adjustment(
 }
 
 /// The kind of box a computed display asks for, or none for a display that generates no box.
-fn node_kind_for_display(display: FfiDisplay) -> Option<NodeKind> {
+pub(crate) fn node_kind_for_display(display: FfiDisplay) -> Option<NodeKind> {
     if display.is_none() || display.is_contents() {
         return None;
     }
@@ -528,11 +528,15 @@ struct ChildListInsertionReuse<'a, 'host> {
 pub(crate) struct LayoutNodeReuse {
     pub insert_children: bool,
     pub update_pseudo_elements: bool,
+    /// The box stays, and its child list is built again around the boxes its clean children keep.
+    pub rebuild_child_list: bool,
 }
 
 /// Settles which of the narrower rebuilds the node's marks asked for the build can actually take.
 /// Neither is available unless every mark the node collected permits it, because a rebuild that
-/// only updates the pseudo-elements leaves the child list alone, and the other way round.
+/// only updates the pseudo-elements leaves the child list alone, and the other way round. When
+/// children were inserted and neither is available, the build can still keep the box and build
+/// its child list again, which also regenerates its pseudo-elements.
 fn resolve_layout_node_reuse(
     host: &TreeBuilderHost<'_>,
     kind: PrincipalNodeKind,
@@ -553,9 +557,21 @@ fn resolve_layout_node_reuse(
     });
     let may_reuse = (reasons & layout_tree_update_reuse_reason::PSEUDO_ELEMENT_CHANGE == 0 || update_pseudo_elements)
         && (reasons & layout_tree_update_reuse_reason::CHILD_LIST_INSERTION == 0 || insert_children);
+    if may_reuse {
+        return LayoutNodeReuse {
+            insert_children,
+            update_pseudo_elements,
+            rebuild_child_list: false,
+        };
+    }
+    let rebuild_child_list = reasons & layout_tree_update_reuse_reason::CHILD_LIST_INSERTION != 0
+        && host
+            .arena()
+            .with_style_store(|engine| may_rebuild_child_list(host, engine, kind, element));
     LayoutNodeReuse {
-        insert_children: may_reuse && insert_children,
-        update_pseudo_elements: may_reuse && update_pseudo_elements,
+        insert_children: false,
+        update_pseudo_elements: false,
+        rebuild_child_list,
     }
 }
 
@@ -734,6 +750,57 @@ fn may_reuse_layout_node_for_child_list_insertion(
     test.run()
 }
 
+/// Whether `node` is an anonymous block that only wraps a run of inline-level children, which a build makes again
+/// whenever it places such a run.
+fn is_anonymous_inline_run_wrapper(host: &TreeBuilderHost<'_>, node: LayoutNode) -> bool {
+    let data = host.data(node);
+    data.kind.get() == NodeKind::BlockContainer
+        && node_facts::has_flag(data, NodeFlag::Anonymous)
+        && node_facts::has_flag(data, NodeFlag::ChildrenAreInline)
+        && !node_is_generated_for_pseudo_element(data)
+}
+
+/// Whether the build can keep the element's box and build its child list again: free its anonymous wrappers and
+/// generated boxes, place the boxes of its clean children again in DOM order, and build boxes for the others. The
+/// box has to be a block, list item, flex or grid container whose child list holds nothing but those three kinds of
+/// boxes, and no generated content may depend on what the rebuild leaves alone.
+fn may_rebuild_child_list(
+    layout: &TreeBuilderHost<'_>,
+    engine: &RetainedState,
+    kind: PrincipalNodeKind,
+    element: StyleNodeID,
+) -> bool {
+    let arena = layout.arena();
+    let layout_node = arena.bound_row(element);
+    if !kind.is_element()
+        || layout_node.is_invalid()
+        || layout.parent(layout_node).is_invalid()
+        || engine.tree().shadow_root_of(element).is_some()
+        || engine.element_is_slot(element)
+        || engine.element_counter_reset_has_reversed_counter(element)
+        || engine.element_box_kind(element) != ElementBoxKind::FromDisplay
+        || engine.element_adjustment_facts(element)
+            & (element_adjustment_fact::RENDERED_IN_TOP_LAYER
+                | element_adjustment_fact::IS_SVG_ELEMENT
+                | element_adjustment_fact::IS_SVG_CONTAINER
+                | element_adjustment_fact::REQUIRES_SVG_CONTAINER
+                | element_adjustment_fact::IS_SVG_FOREIGN_OBJECT_ELEMENT)
+            != 0
+        || first_letter_owner_covers_subtree(layout, engine, element, layout_node)
+    {
+        return false;
+    }
+    let test = ChildListInsertionReuse {
+        layout,
+        engine,
+        element,
+        layout_node,
+        has_first_letter_owner: false,
+        trailing_inline_wrapper: NodeSlotId::INVALID,
+    };
+    test.child_list_can_be_rebuilt()
+}
+
 impl ChildListInsertionReuse<'_, '_> {
     fn arena(&self) -> &LayoutNodeArena {
         self.layout.arena()
@@ -893,8 +960,12 @@ impl ChildListInsertionReuse<'_, '_> {
     fn pending_children_can_preserve_parent(&self) -> bool {
         let collapses_whitespace = self.parent_collapses_whitespace();
         let mut has_pending_collapsing_whitespace = false;
+        let mut inserted_whitespace_run_must_stay_last = false;
         for child in self.dom_children() {
             if !self.box_of(child).is_invalid() {
+                if inserted_whitespace_run_must_stay_last {
+                    return false;
+                }
                 has_pending_collapsing_whitespace = false;
                 if self.needs_layout_tree_update(child) || self.arena().child_needs_layout_tree_update(Some(child)) {
                     return false;
@@ -910,9 +981,7 @@ impl ChildListInsertionReuse<'_, '_> {
                 && !self.has_first_letter_owner
                 && self.collapsing_whitespace_can_be_inserted(child)
             {
-                if has_pending_collapsing_whitespace {
-                    return false;
-                }
+                inserted_whitespace_run_must_stay_last |= has_pending_collapsing_whitespace;
                 has_pending_collapsing_whitespace = true;
                 continue;
             }
@@ -954,6 +1023,182 @@ impl ChildListInsertionReuse<'_, '_> {
             };
         }
         false
+    }
+
+    /// Whether a child before `inserted_child` resets a counter that counts down from its last item. The start value
+    /// of such a counter counts every increment in its scope, which includes the inserted child.
+    fn earlier_child_counts_a_counter_down(&self, inserted_child: StyleNodeID) -> bool {
+        self.dom_children()
+            .take_while(|&child| child != inserted_child)
+            .any(|child| {
+                child.element_index().is_some() && self.engine.element_counter_reset_has_reversed_counter(child)
+            })
+    }
+
+    /// Whether `node`, a box in the parent's child list, is one that a rebuild of that list keeps: the box of a DOM
+    /// node, or the table wrapper around one, which it places again; or one of the parent's own generated boxes,
+    /// which it regenerates.
+    fn is_box_a_child_list_rebuild_keeps(&self, node: LayoutNode) -> bool {
+        let data = self.layout.data(node);
+        if node_is_generated_for_pseudo_element(data) {
+            let generated_for = data.generated_for.get();
+            return matches!(
+                generated_for,
+                GENERATED_FOR_BEFORE | GENERATED_FOR_AFTER | GENERATED_FOR_MARKER
+            ) && self.arena().bound_pseudo_element_row(self.element, generated_for) == node;
+        }
+        if data.kind.get() == NodeKind::TableWrapper {
+            let mut wrapped = self.layout.first_child(node);
+            while !wrapped.is_invalid() {
+                if self.is_bound_box_of_dom_node(wrapped) {
+                    return true;
+                }
+                wrapped = self.layout.next_sibling(wrapped);
+            }
+            return false;
+        }
+        self.is_bound_box_of_dom_node(node)
+    }
+
+    /// Whether `node` is the one box its DOM node is bound to. A `::first-letter` or a writing suggestion splits a
+    /// text node's box, and the other slices are not bound.
+    fn is_bound_box_of_dom_node(&self, node: LayoutNode) -> bool {
+        let arena = self.arena();
+        arena
+            .dom_node_style_node(node)
+            .is_some_and(|dom_node| arena.bound_row(dom_node) == node)
+            && !(self.layout.data(node).kind.get() == NodeKind::TextNode && arena.text_has_source_range(node))
+    }
+
+    /// See [`may_rebuild_child_list`].
+    fn child_list_can_be_rebuilt(&self) -> bool {
+        let data = self.layout.data(self.layout_node);
+        let display = self.layout.display(self.layout_node);
+        let lays_out_flow = display.is_flow_inside() || display.is_flow_root_inside();
+        let lays_out_flex_or_grid = display.is_flex_inside() || display.is_grid_inside();
+        let is_ordinary_container = match data.kind.get() {
+            NodeKind::BlockContainer | NodeKind::ListItemBox => lays_out_flow || lays_out_flex_or_grid,
+            NodeKind::Box => lays_out_flex_or_grid,
+            _ => false,
+        };
+        if !is_ordinary_container
+            || node_facts::has_flag(data, NodeFlag::IsReplacedElement)
+            || node_facts::has_flag(data, NodeFlag::UsesButtonLayout)
+        {
+            return false;
+        }
+        // An inline box keeps its in-flow block children in its own child list, and table fixup wraps the boxes of a
+        // table-internal display in anonymous table boxes.
+        let display_before_box_type_transformation =
+            self.layout.display_before_box_type_transformation(self.layout_node);
+        let parent_of_layout_node = self.layout.parent(self.layout_node);
+        if (display.is_inline_outside() && display.is_flow_inside())
+            || display_before_box_type_transformation.is_internal_table()
+            || display_before_box_type_transformation.is_table_inside()
+            || display_before_box_type_transformation.is_table_caption()
+            || (node_facts::has_flag(self.layout.data(parent_of_layout_node), NodeFlag::Anonymous)
+                && !is_anonymous_inline_run_wrapper(self.layout, parent_of_layout_node))
+        {
+            return false;
+        }
+        if self
+            .engine
+            .element_published_box_facts(self.element)
+            .is_none_or(|facts| facts.content_visibility != content_visibility::VISIBLE)
+            || self
+                .arena()
+                .writing_suggestion()
+                .is_some_and(|suggestion| self.engine.tree().text_parent(suggestion.text) == Some(self.element))
+        {
+            return false;
+        }
+        // The rebuild regenerates these after the walk, which leaves the quote depth of the boxes it keeps out.
+        for generated_for in [GENERATED_FOR_BEFORE, GENERATED_FOR_AFTER, GENERATED_FOR_MARKER] {
+            if self
+                .engine
+                .pseudo_published_content_facts(self.element, pseudo_kind_of(generated_for))
+                .is_some_and(|content| content.opens_or_closes_quotes)
+            {
+                return false;
+            }
+        }
+
+        let mut kept_dom_node_box_count = 0usize;
+        let mut child = self.layout.first_child(self.layout_node);
+        while !child.is_invalid() {
+            let mut kept_box = child;
+            let mut end_of_run = NodeSlotId::INVALID;
+            if is_anonymous_inline_run_wrapper(self.layout, child) {
+                kept_box = self.layout.first_child(child);
+            } else {
+                end_of_run = self.layout.next_sibling(child);
+            }
+            while kept_box != end_of_run {
+                if !self.is_box_a_child_list_rebuild_keeps(kept_box) {
+                    return false;
+                }
+                if !node_is_generated_for_pseudo_element(self.layout.data(kept_box)) {
+                    kept_dom_node_box_count += 1;
+                }
+                kept_box = self.layout.next_sibling(kept_box);
+            }
+            child = self.layout.next_sibling(child);
+        }
+
+        // Every DOM child with a box has to own one of the boxes counted above.
+        let mut boxed_dom_child_count = 0usize;
+        let mut first_inserted_child_touching_counters = None;
+        let mut inserted_subtree_increments_or_sets_counters = false;
+        for child in self.dom_children() {
+            let is_element = child.element_index().is_some();
+            if is_element {
+                if self
+                    .published_display(child)
+                    .is_some_and(|display| display.is_contents())
+                {
+                    return false;
+                }
+                // A top-layer box is a child of the viewport.
+                if self.engine.element_adjustment_facts(child) & element_adjustment_fact::RENDERED_IN_TOP_LAYER != 0 {
+                    continue;
+                }
+            }
+            if !self.box_of(child).is_invalid() {
+                // A counter that an inserted subtree touches is read by the boxes after it, which the rebuild keeps.
+                if first_inserted_child_touching_counters.is_some() {
+                    return false;
+                }
+                boxed_dom_child_count += 1;
+                continue;
+            }
+            if !self.needs_layout_tree_update(child) {
+                // A full build may give such a text node a box again.
+                if !is_element {
+                    return false;
+                }
+                continue;
+            }
+            if !is_element || self.published_display(child).is_none_or(|display| display.is_none()) {
+                continue;
+            }
+            let generated_content_effects = self.engine.subtree_generated_content_effects(child);
+            if generated_content_effects.opens_or_closes_quotes {
+                return false;
+            }
+            if (generated_content_effects.resets_counters || generated_content_effects.increments_or_sets_counters)
+                && first_inserted_child_touching_counters.is_none()
+            {
+                first_inserted_child_touching_counters = Some(child);
+            }
+            inserted_subtree_increments_or_sets_counters |= generated_content_effects.increments_or_sets_counters;
+        }
+        if let Some(first_inserted_child_touching_counters) = first_inserted_child_touching_counters
+            && inserted_subtree_increments_or_sets_counters
+            && self.earlier_child_counts_a_counter_down(first_inserted_child_touching_counters)
+        {
+            return false;
+        }
+        boxed_dom_child_count == kept_dom_node_box_count
     }
 
     fn run(&self) -> bool {
@@ -1024,9 +1269,20 @@ impl ChildListInsertionReuse<'_, '_> {
         let mut all_indirect_existing_children_are_in_text_run_wrappers =
             self.layout.data(self.layout_node).kind.get() != NodeKind::FieldSetBox;
         let mut has_pending_collapsing_whitespace = false;
+        // In a full build, an out-of-flow block or more whitespace after inserted whitespace joins the anonymous wrapper
+        // that whitespace starts. The incremental insertion finds that wrapper only while it stays the parent's last
+        // child.
+        let mut inserted_whitespace_run_must_stay_last = false;
+        // Counters are resolved from the boxes before a box, so an inserted subtree that touches one changes only what
+        // comes after it.
+        let mut first_inserted_child_touching_counters = None;
+        let mut inserted_subtree_increments_or_sets_counters = false;
         for child in self.dom_children() {
             let child_layout_node = self.box_of(child);
             if !child_layout_node.is_invalid() {
+                if inserted_whitespace_run_must_stay_last || first_inserted_child_touching_counters.is_some() {
+                    return false;
+                }
                 has_pending_collapsing_whitespace = false;
                 has_existing_child_after_insertion |= has_inserted_child;
                 if self.layout.parent(child_layout_node) != self.layout_node {
@@ -1052,13 +1308,19 @@ impl ChildListInsertionReuse<'_, '_> {
                     has_unboxed_existing_text = true;
                     continue;
                 }
-                let collapsed_whitespace_can_be_inserted = self.engine.tree().text_is_ascii_whitespace(child)
-                    && collapses_whitespace
-                    && !self.has_first_letter_owner
-                    && self.collapsing_whitespace_can_be_inserted(child);
-                if !collapsed_whitespace_can_be_inserted || has_pending_collapsing_whitespace {
+                if !self.engine.tree().text_is_ascii_whitespace(child) || !collapses_whitespace {
+                    // Text that renders is inline-level content, which is appended as an inline element is.
+                    if !parent_lays_out_block_children || will_insert_block_child {
+                        return false;
+                    }
+                    will_insert_inline_child = true;
+                    has_inserted_child = true;
+                    continue;
+                }
+                if self.has_first_letter_owner || !self.collapsing_whitespace_can_be_inserted(child) {
                     return false;
                 }
+                inserted_whitespace_run_must_stay_last |= has_pending_collapsing_whitespace;
                 has_pending_collapsing_whitespace = true;
                 continue;
             }
@@ -1073,9 +1335,16 @@ impl ChildListInsertionReuse<'_, '_> {
             if !self.needs_layout_tree_update(child) || child_display.is_none() {
                 continue;
             }
-            if self.engine.subtree_affects_generated_content_state(child) {
+            let generated_content_effects = self.engine.subtree_generated_content_effects(child);
+            if generated_content_effects.opens_or_closes_quotes {
                 return false;
             }
+            if (generated_content_effects.resets_counters || generated_content_effects.increments_or_sets_counters)
+                && first_inserted_child_touching_counters.is_none()
+            {
+                first_inserted_child_touching_counters = Some(child);
+            }
+            inserted_subtree_increments_or_sets_counters |= generated_content_effects.increments_or_sets_counters;
             if self.layout.data(self.layout_node).kind.get() == NodeKind::FieldSetBox
                 && self.engine.element_box_kind(child) == ElementBoxKind::Legend
             {
@@ -1094,9 +1363,7 @@ impl ChildListInsertionReuse<'_, '_> {
                 && child_facts.position != positioning::FIXED
                 && child_facts.float_ == float::NONE;
             if parent_lays_out_flex_or_grid_children {
-                if has_pending_collapsing_whitespace
-                    && (child_facts.position != positioning::STATIC || child_facts.float_ != float::NONE)
-                {
+                if has_pending_collapsing_whitespace && !child_is_in_flow {
                     return false;
                 }
                 has_pending_collapsing_whitespace = false;
@@ -1107,10 +1374,8 @@ impl ChildListInsertionReuse<'_, '_> {
                 continue;
             }
             if parent_lays_out_block_children && child_display.is_block_outside() {
-                if has_pending_collapsing_whitespace
-                    && (child_facts.position != positioning::STATIC || child_facts.float_ != float::NONE)
-                {
-                    return false;
+                if has_pending_collapsing_whitespace && !child_is_in_flow {
+                    inserted_whitespace_run_must_stay_last = true;
                 }
                 has_pending_collapsing_whitespace = false;
                 has_inserted_child = true;
@@ -1161,6 +1426,13 @@ impl ChildListInsertionReuse<'_, '_> {
             return false;
         }
         let after = self.arena().bound_pseudo_element_row(self.element, GENERATED_FOR_AFTER);
+        if let Some(first_inserted_child_touching_counters) = first_inserted_child_touching_counters
+            && (!after.is_invalid()
+                || (inserted_subtree_increments_or_sets_counters
+                    && self.earlier_child_counts_a_counter_down(first_inserted_child_touching_counters)))
+        {
+            return false;
+        }
         let after_is_in_inline_run = !after.is_invalid() && self.layout.parent(after) != self.layout_node;
         // OPTIMIZATION: Appended inline and out-of-flow children can join the trailing inline run. Do not
         //               reuse a run across generated content or text that a rebuild may need to make visible.
@@ -1198,7 +1470,10 @@ pub(crate) fn principal_node_entry_decision(
     context: &TreeBuilderContext,
 ) -> PrincipalNodeEntryDecision {
     let should_create_layout_node = facts.must_create_subtree
-        || (facts.needs_layout_tree_update && !reuse.insert_children && !reuse.update_pseudo_elements)
+        || (facts.needs_layout_tree_update
+            && !reuse.insert_children
+            && !reuse.update_pseudo_elements
+            && !reuse.rebuild_child_list)
         || context.document_needs_full_layout_tree_update
         || (kind.is_document() && !facts.has_layout_node);
 
@@ -2023,6 +2298,7 @@ struct PrincipalDescendantUpdate {
     element_type_facts: u32,
     should_create_layout_node: bool,
     update_pseudo_elements_in_place: bool,
+    rebuild_child_list: bool,
     must_create_subtree: bool,
     insertion_mode: FfiInsertionMode,
 }
@@ -2057,8 +2333,11 @@ fn update_principal_node_descendants(
         )
     };
     let prior_quote_nesting_level = state.quote_nesting_level;
+    let kept_child_boxes = update
+        .rebuild_child_list
+        .then(|| detach_child_list_for_rebuild(host, update.mirror_identity, layout_node));
 
-    if should_create_layout_node || update.update_pseudo_elements_in_place {
+    if should_create_layout_node || update.update_pseudo_elements_in_place || update.rebuild_child_list {
         // Resolve counters now that we exist in the layout tree.
         if should_create_layout_node && update.kind.is_element() {
             resolve_counters(host, update.mirror_identity, FfiPseudoElement::None);
@@ -2092,6 +2371,7 @@ fn update_principal_node_descendants(
     }
 
     if (should_create_layout_node
+        || update.rebuild_child_list
         || host
             .arena()
             .child_needs_layout_tree_update(Some(update.mirror_identity)))
@@ -2127,6 +2407,8 @@ fn update_principal_node_descendants(
                     context,
                     should_create_layout_node,
                 );
+            } else if let Some(kept_child_boxes) = &kept_child_boxes {
+                rebuild_child_list_from_dom_children(host, state, update.mirror_identity, context, kept_child_boxes);
             } else {
                 update_layout_tree_for_dom_children(
                     host,
@@ -2247,26 +2529,7 @@ fn update_principal_node_descendants(
             && !content_visibility_hidden
             && !context.has_svg_root
         {
-            state.ancestor_stack.push(layout_node);
-            if host.data(layout_node).kind.get() == NodeKind::ListItemBox {
-                let placed = create_pseudo_element(
-                    host,
-                    state,
-                    update.mirror_identity,
-                    FfiPseudoElement::Marker,
-                    Some(FfiInsertionMode::Prepend),
-                );
-                assert!(placed.is_none());
-            }
-            let placed = create_pseudo_element(
-                host,
-                state,
-                update.mirror_identity,
-                FfiPseudoElement::After,
-                Some(FfiInsertionMode::Append),
-            );
-            assert!(placed.is_none());
-            assert!(state.ancestor_stack.pop().is_some());
+            create_marker_and_after_boxes(host, state, update.mirror_identity, layout_node);
 
             if node_facts::kind_is_block_container(host.data(layout_node).kind.get())
                 && host.has_first_letter_style(layout_node)
@@ -2280,6 +2543,18 @@ fn update_principal_node_descendants(
 
         wrap_fieldset_contents_if_needed(host, layout_node);
         wrap_button_contents_if_needed(host, layout_node);
+    }
+
+    if let Some(kept_child_boxes) = kept_child_boxes {
+        create_marker_and_after_boxes(host, state, update.mirror_identity, layout_node);
+        // A kept box that the walk did not place again belongs to no DOM child any more.
+        for kept_box in kept_child_boxes {
+            if host.arena().slot_is_live(kept_box) && host.parent(kept_box).is_invalid() {
+                let host_calls = host.host_calls();
+                super::layout_node_arena::prepare_subtree_for_detach(host_calls, host.arena_mut(), kept_box);
+                host.free_subtree(kept_box);
+            }
+        }
     }
 
     if update.update_pseudo_elements_in_place && !should_create_layout_node {
@@ -2307,6 +2582,124 @@ fn update_principal_node_descendants(
 
     host.arena_mut()
         .clear_layout_tree_update_marks(Some(update.mirror_identity));
+}
+
+/// Adds the `::marker` of a list item box and the `::after` of an element's box, once its children are in place.
+fn create_marker_and_after_boxes(
+    host: &mut TreeBuilderHost<'_>,
+    state: &mut TreeBuilderState,
+    element: StyleNodeID,
+    layout_node: LayoutNode,
+) {
+    state.ancestor_stack.push(layout_node);
+    if host.data(layout_node).kind.get() == NodeKind::ListItemBox {
+        let placed = create_pseudo_element(
+            host,
+            state,
+            element,
+            FfiPseudoElement::Marker,
+            Some(FfiInsertionMode::Prepend),
+        );
+        assert!(placed.is_none());
+    }
+    let placed = create_pseudo_element(
+        host,
+        state,
+        element,
+        FfiPseudoElement::After,
+        Some(FfiInsertionMode::Append),
+    );
+    assert!(placed.is_none());
+    assert!(state.ancestor_stack.pop().is_some());
+}
+
+/// Empties the child list of a box that keeps its place while its children are placed again: frees the element's
+/// `::before`, `::after` and `::marker` boxes and the anonymous wrappers around inline runs, and detaches every other
+/// box, which [`may_rebuild_child_list`] made sure belongs to a DOM child. Those boxes keep their subtrees, and
+/// detaching a box leaves its own subtree's layout state alone. Answers the boxes it detached.
+fn detach_child_list_for_rebuild(
+    host: &mut TreeBuilderHost<'_>,
+    element: StyleNodeID,
+    layout_node: LayoutNode,
+) -> HashSet<LayoutNode> {
+    let host_calls = host.host_calls();
+    for generated_for in [GENERATED_FOR_BEFORE, GENERATED_FOR_AFTER, GENERATED_FOR_MARKER] {
+        free_pseudo_element_box(host_calls, host.arena_mut(), element, generated_for);
+    }
+    let mut kept_child_boxes = HashSet::default();
+    loop {
+        let child = host.first_child(layout_node);
+        if child.is_invalid() {
+            break;
+        }
+        host.arena_mut().detach_child(layout_node, child);
+        if !is_anonymous_inline_run_wrapper(host, child) {
+            kept_child_boxes.insert(child);
+            continue;
+        }
+        loop {
+            let wrapped = host.first_child(child);
+            if wrapped.is_invalid() {
+                break;
+            }
+            host.arena_mut().detach_child(child, wrapped);
+            kept_child_boxes.insert(wrapped);
+        }
+        super::layout_node_arena::prepare_subtree_for_detach(host_calls, host.arena_mut(), child);
+        host.free_subtree(child);
+    }
+    host.set_children_are_inline(layout_node, false);
+    kept_child_boxes
+}
+
+/// Places the children of a box whose child list [`detach_child_list_for_rebuild`] emptied again, in DOM order, as a
+/// full build would. A child that keeps its box is placed again as a whole, so the anonymous wrappers it needs are
+/// made again around it; a child whose box goes is built again, as are the children that had none.
+fn rebuild_child_list_from_dom_children(
+    host: &mut TreeBuilderHost<'_>,
+    state: &mut TreeBuilderState,
+    parent: StyleNodeID,
+    context: &mut TreeBuilderContext,
+    kept_child_boxes: &HashSet<LayoutNode>,
+) {
+    let mut node = host.first_dom_child(parent);
+    while let Some(child) = node {
+        // A table's box is kept inside its table wrapper.
+        let mut kept_box = host.arena().bound_row(child);
+        while !kept_box.is_invalid() && !kept_child_boxes.contains(&kept_box) {
+            kept_box = host.parent(kept_box);
+        }
+        if kept_box.is_invalid() {
+            update_layout_tree(host, state, child, context, false, FfiInsertionMode::Append);
+        } else if host.arena().needs_layout_tree_update(child)
+            && (host.arena().layout_tree_update_reuse_reasons(child) == 0
+                || host.data(kept_box).kind.get() == NodeKind::TableWrapper)
+        {
+            // The child's box is built again from its new style, so the box it had goes. A table's box may be built
+            // again too, and table fixup moves its outer properties to the wrapper only when it makes the wrapper.
+            let host_calls = host.host_calls();
+            super::layout_node_arena::prepare_subtree_for_detach(host_calls, host.arena_mut(), kept_box);
+            host.free_subtree(kept_box);
+            update_layout_tree(host, state, child, context, true, FfiInsertionMode::Append);
+        } else {
+            let is_inline_outside = node_is_inline_outside(host, kept_box);
+            let kept_box = host.created(kept_box);
+            let parent_layout_node = state.current_parent();
+            insert_node_into_inline_or_block_ancestor(
+                host,
+                state,
+                parent_layout_node,
+                kept_box,
+                is_inline_outside,
+                FfiInsertionMode::Append,
+                Some(child),
+            );
+            if !keeps_its_box_as_it_is(host, child, context, false) {
+                update_layout_tree(host, state, child, context, false, FfiInsertionMode::Append);
+            }
+        }
+        node = host.next_dom_sibling(child);
+    }
 }
 
 struct PrincipalNodeUpdate<'host, 'callbacks, 'state, 'context> {
@@ -2398,9 +2791,10 @@ fn construct_principal_layout_node(
         if should_create_layout_node {
             // The box is built again from scratch, so every pseudo-element box it holds goes.
             clear_synthetic_pseudo_element_boxes(host.host_calls(), host.arena, element);
-        } else if host.arena().layout_tree_update_reuse_reasons(element)
-            & layout_tree_update_reuse_reason::PSEUDO_ELEMENT_CHANGE
-            != 0
+        } else if !update.reuse.rebuild_child_list
+            && host.arena().layout_tree_update_reuse_reasons(element)
+                & layout_tree_update_reuse_reason::PSEUDO_ELEMENT_CHANGE
+                != 0
         {
             // The box stays and only its generated content is regenerated, which is the ::before
             // and ::after boxes and nothing else.
@@ -2535,6 +2929,9 @@ fn construct_principal_layout_node(
                     NodeKind::InlineNode,
                 );
                 let wrapper_slot = wrapper.slot();
+                if let Some(text) = update.style_node {
+                    host.arena_mut().note_display_contents_text_wrapper(wrapper_slot, text);
+                }
                 host.set_children_are_inline(wrapper_slot, true);
                 host.attach_child(wrapper_slot, host.created(text_layout_node), NodeSlotId::INVALID);
                 layout_node = wrapper_slot;
@@ -2642,8 +3039,15 @@ fn update_principal_node_after_entry(
         let placement =
             principal_box_placement_decision(placement_facts, layout_node_is_svg_box, prior_layout_top_layer);
 
+        // A box whose child list is built again is a rebuild root as a replaced box is: every box the rebuild places
+        // is inside it.
+        let rebuilds_child_list = entry_facts.needs_layout_tree_update
+            && update.reuse.rebuild_child_list
+            && !entry_decision.should_create_layout_node;
+        let starts_rebuild_root =
+            placement.start_rebuild_root || (rebuilds_child_list && update.state.current_rebuild_root.is_invalid());
         let mut prior_rebuild_root = NodeSlotId::INVALID;
-        if placement.start_rebuild_root {
+        if starts_rebuild_root {
             prior_rebuild_root = update.state.current_rebuild_root;
             update.state.current_rebuild_root = layout_node;
             update.state.rebuilt_subtree_roots.push(layout_node);
@@ -2756,6 +3160,7 @@ fn update_principal_node_after_entry(
                 should_create_layout_node: entry_decision.should_create_layout_node,
                 update_pseudo_elements_in_place: update.reuse.update_pseudo_elements
                     && !entry_decision.should_create_layout_node,
+                rebuild_child_list: rebuilds_child_list,
                 must_create_subtree: update.must_create_subtree,
                 insertion_mode: if update.reuse.insert_children {
                     FfiInsertionMode::InDomOrder
@@ -2768,7 +3173,7 @@ fn update_principal_node_after_entry(
         if placement.clear_layout_top_layer_for_descendants {
             context.layout_top_layer = prior_layout_top_layer;
         }
-        if placement.start_rebuild_root {
+        if starts_rebuild_root {
             update.state.current_rebuild_root = prior_rebuild_root;
         }
         if starts_new_subtree {
@@ -4579,7 +4984,8 @@ fn create_first_letter_boxes(host: &mut TreeBuilderHost<'_>, element: StyleNodeI
             host.stamp_generated_text_box(&source[letter_end..]),
         )
     };
-    if let Some(text) = host.arena().node_style_node(first_letter_slice) {
+    let text = host.arena().node_style_node(first_letter_slice);
+    if let Some(text) = text {
         for slice in [first_letter_slice, remainder_slice] {
             host.stamp_text_row_facts(slice, text);
         }
@@ -4589,15 +4995,22 @@ fn create_first_letter_boxes(host: &mut TreeBuilderHost<'_>, element: StyleNodeI
     let first_letter_slice = host.created(first_letter_slice);
     let remainder_slice = host.created(remainder_slice);
 
+    let derived = text.and_then(|text| host.arena_mut().derive_first_letter_style_record(element, text));
     let wrapper_kind = host
         .arena()
         .with_style_store(|engine| {
-            engine
-                .pseudo_published_style_view(element, pseudo_kind_of(GENERATED_FOR_FIRST_LETTER))
-                .map(|view| view.display())
+            match derived {
+                Some(derived) => engine.published_record_view(derived.record),
+                None => engine.pseudo_published_style_view(element, pseudo_kind_of(GENERATED_FOR_FIRST_LETTER)),
+            }
+            .map(|view| view.display())
         })
         .and_then(node_kind_for_display);
     let Some(wrapper_kind) = wrapper_kind else {
+        if let Some(derived) = derived {
+            host.arena_mut()
+                .with_style_engine(|engine| engine.unpin_layout_style_record(derived.record));
+        }
         // A `::first-letter` whose display generates no box leaves the text it matched alone.
         host.free_unplaced(first_letter_slice);
         host.free_unplaced(remainder_slice);
@@ -4616,6 +5029,14 @@ fn create_first_letter_boxes(host: &mut TreeBuilderHost<'_>, element: StyleNodeI
     let wrapper_slot = host.arena.allocate_unbound();
     host.arena_mut()
         .stamp_pseudo_element_row(wrapper_slot, wrapper_kind, element, GENERATED_FOR_FIRST_LETTER);
+    if let Some(derived) = derived {
+        host.arena_mut()
+            .replace_arena_pinned_style_record(wrapper_slot, derived);
+    }
+    if let Some(text) = text {
+        host.arena_mut()
+            .note_first_letter_parent_style(wrapper_slot, element, text);
+    }
     host.note_style_of_built_row(wrapper_slot, None);
     host.arena_mut().owe_image_resources(
         wrapper_slot,
@@ -4926,10 +5347,12 @@ fn display_for_table_fixup(host: &TreeBuilderHost<'_>, node: LayoutNode) -> FfiD
     // For the purposes of these rules, out-of-flow elements are represented as inline elements of zero width and
     // height. Their containing blocks are chosen accordingly.
     //
-    // AD-HOC: Table-internal boxes can be blockified before fixup. Use the pre-transformation display for ordinary
+    // AD-HOC: Table-internal boxes can be blockified before fixup. Use the pre-transformation display for out-of-flow
     // authored boxes so an out-of-flow table-header-group is still recognized as a proper table child during fixup.
+    // An in-flow box blockified as a flex or grid item is a block, though, and not a proper table child.
     // Element-specific display adjustments for replaced elements and buttons take precedence over that display.
-    if node_has_replaced_element_table_display_adjustment(host, node)
+    if !node_is_out_of_flow(host, node)
+        || node_has_replaced_element_table_display_adjustment(host, node)
         || node_facts::has_flag(host.data(node), NodeFlag::Anonymous)
         || node_facts::has_flag(host.data(node), NodeFlag::UsesButtonLayout)
     {
@@ -5968,6 +6391,28 @@ mod tests {
         assert!(!decision.should_create_layout_node);
         assert_eq!(decision.top_layer, TopLayerEntryDecision::Continue);
         assert_eq!(decision.svg, SvgEntryDecision::Continue);
+
+        facts.needs_layout_tree_update = true;
+        let decision = principal_node_entry_decision(
+            facts,
+            LayoutNodeReuse::default(),
+            PrincipalNodeKind::Element,
+            element_type_facts,
+            &context,
+        );
+        assert!(decision.should_create_layout_node);
+        let decision = principal_node_entry_decision(
+            facts,
+            LayoutNodeReuse {
+                rebuild_child_list: true,
+                ..LayoutNodeReuse::default()
+            },
+            PrincipalNodeKind::Element,
+            element_type_facts,
+            &context,
+        );
+        assert!(!decision.should_create_layout_node);
+        facts.needs_layout_tree_update = false;
 
         facts.layout_node_is_attached = false;
         element_type_facts = element_adjustment_fact::RENDERED_IN_TOP_LAYER;
