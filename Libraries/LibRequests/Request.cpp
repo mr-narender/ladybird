@@ -77,11 +77,14 @@ bool Request::stop()
     if (!had_active_request)
         release_transfer_lease();
     auto on_stop = move(m_on_stop);
+    auto teardown = move(on_teardown);
 
     defer_teardown();
 
     if (had_active_request && on_stop)
         on_stop();
+    if (teardown)
+        teardown(TeardownReason::Stopped);
 
     return had_active_request;
 }
@@ -91,6 +94,21 @@ void Request::set_body_delivery_paused(bool paused)
     m_body_delivery_paused = paused;
     if (m_internal_stream_data && m_internal_stream_data->read_notifier)
         m_internal_stream_data->read_notifier->set_enabled(!m_body_delivery_paused);
+    if (!m_body_delivery_paused)
+        schedule_file_backed_delivery();
+}
+
+void Request::account_body_delivery(size_t byte_count)
+{
+    auto& remaining_byte_count = m_internal_stream_data->body_delivery_remaining_byte_count;
+    if (!remaining_byte_count.has_value())
+        return;
+    if (byte_count >= *remaining_byte_count) {
+        *remaining_byte_count = 0;
+        set_body_delivery_paused(true);
+        return;
+    }
+    *remaining_byte_count -= byte_count;
 }
 
 void Request::resume_body_delivery()
@@ -123,6 +141,59 @@ void Request::release_transfer_lease()
 bool Request::has_file_backed_response_body() const
 {
     return m_internal_stream_data && m_internal_stream_data->file_backed_payload.has_value();
+}
+
+bool Request::has_undelivered_file_backed_bytes() const
+{
+    return has_file_backed_response_body() && m_internal_stream_data->file_backed_delivery_offset < m_internal_stream_data->file_backed_payload->size();
+}
+
+// Delivers under the same pause and byte allowance as the read stream.
+void Request::deliver_file_backed_payload()
+{
+    if (m_mode != Mode::Unbuffered || !has_file_backed_response_body())
+        return;
+
+    NonnullRefPtr protector { *this };
+    auto payload = *m_internal_stream_data->file_backed_payload;
+
+    while (!m_body_delivery_paused) {
+        auto offset = m_internal_stream_data->file_backed_delivery_offset;
+        auto length = payload.size() - offset;
+        if (length == 0)
+            break;
+        if (auto const& remaining_byte_count = m_internal_stream_data->body_delivery_remaining_byte_count; remaining_byte_count.has_value()) {
+            if (*remaining_byte_count == 0) {
+                set_body_delivery_paused(true);
+                break;
+            }
+            length = min(length, *remaining_byte_count);
+        }
+
+        m_internal_stream_data->file_backed_delivery_offset += length;
+        m_internal_stream_data->delivered_size += length;
+        m_internal_stream_data->on_data_available(ResponseData::from_file_backed_payload(payload, offset, length));
+        if (m_mode != Mode::Unbuffered)
+            return;
+        account_body_delivery(length);
+    }
+
+    if (m_internal_stream_data->request_done)
+        m_internal_stream_data->on_finish();
+}
+
+void Request::schedule_file_backed_delivery()
+{
+    if (!has_undelivered_file_backed_bytes() || m_internal_stream_data->file_backed_delivery_scheduled)
+        return;
+
+    m_internal_stream_data->file_backed_delivery_scheduled = true;
+    Core::deferred_invoke([self = NonnullRefPtr(*this)] {
+        if (!self->m_internal_stream_data)
+            return;
+        self->m_internal_stream_data->file_backed_delivery_scheduled = false;
+        self->deliver_file_backed_payload();
+    });
 }
 
 void Request::set_request_fd(Badge<Requests::RequestClient>, int fd)
@@ -168,10 +239,8 @@ void Request::set_request_body_file(Badge<Requests::RequestClient>, int fd, u64 
     }
 
     m_internal_stream_data->file_backed_payload = payload.release_value();
-    if (m_internal_stream_data->on_data_available) {
-        m_internal_stream_data->delivered_size += m_internal_stream_data->file_backed_payload->size();
-        m_internal_stream_data->on_data_available(ResponseData::from_immutable_bytes(*m_internal_stream_data->file_backed_payload));
-    }
+    m_internal_stream_data->file_backed_delivery_offset = 0;
+    deliver_file_backed_payload();
 }
 
 void Request::set_request_cached_body_file(Badge<Requests::RequestClient>, int fd, u64 offset, u64 size)
@@ -201,13 +270,13 @@ void Request::set_buffered_request_finished_callback(BufferedRequestFinished on_
 
     m_internal_buffered_data = make<InternalBufferedData>();
 
-    on_headers_received = [this](auto headers, auto response_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto came_from_cache) {
+    on_headers_received = [this](auto headers, auto response_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto cache_state) {
         m_internal_buffered_data->response_headers = move(headers);
         m_internal_buffered_data->response_code = move(response_code);
         m_internal_buffered_data->reason_phrase = reason_phrase;
         m_internal_buffered_data->javascript_bytecode = move(javascript_bytecode);
         m_internal_buffered_data->javascript_bytecode_cache_vary_key = javascript_bytecode_cache_vary_key;
-        m_internal_buffered_data->came_from_cache = came_from_cache;
+        m_internal_buffered_data->cache_state = cache_state;
     };
 
     on_finish = [this, on_buffered_request_finished = move(on_buffered_request_finished)](auto total_size, auto& timing_info, auto network_error) {
@@ -229,7 +298,7 @@ void Request::set_buffered_request_finished_callback(BufferedRequestFinished on_
             m_internal_buffered_data->reason_phrase,
             move(m_internal_buffered_data->javascript_bytecode),
             m_internal_buffered_data->javascript_bytecode_cache_vary_key,
-            m_internal_buffered_data->came_from_cache,
+            m_internal_buffered_data->cache_state,
             move(payload));
     };
 
@@ -265,31 +334,25 @@ void Request::did_finish(Badge<RequestClient>, u64 total_size, RequestTimingInfo
         on_finish(total_size, timing_info, effective_network_error);
 }
 
-void Request::did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CameFromCache came_from_cache)
+void Request::did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CacheState cache_state, ByteString http_version)
 {
+    m_http_version = move(http_version);
     if (on_headers_received)
-        on_headers_received(move(response_headers), response_code, reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, came_from_cache);
-}
-
-void Request::did_request_certificates(Badge<RequestClient>)
-{
-    if (on_certificate_requested) {
-        auto result = on_certificate_requested();
-        if (!m_client->set_certificate({}, *this, result.certificate, result.key)) {
-            dbgln("Request: set_certificate failed");
-        }
-    }
+        on_headers_received(move(response_headers), response_code, reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
 }
 
 void Request::did_transfer(Badge<RequestClient>)
 {
     m_transfer_lease.clear();
     auto on_stop = move(m_on_stop);
+    auto teardown = move(on_teardown);
 
     defer_teardown();
 
     if (on_stop)
         on_stop();
+    if (teardown)
+        teardown(TeardownReason::Transferred);
 }
 
 void Request::defer_teardown()
@@ -300,7 +363,6 @@ void Request::defer_teardown()
     Core::deferred_invoke([self = NonnullRefPtr(*this)] {
         self->on_headers_received = nullptr;
         self->on_finish = nullptr;
-        self->on_certificate_requested = nullptr;
         self->m_internal_buffered_data = nullptr;
         self->m_internal_stream_data = nullptr;
     });
@@ -339,13 +401,14 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
         NonnullRefPtr protector { *this };
 
         auto has_received_all_reported_bytes = m_internal_stream_data->request_done && m_internal_stream_data->delivered_size >= m_internal_stream_data->total_size;
-        if (!m_internal_stream_data->user_finish_called && (!m_internal_stream_data->read_stream || m_internal_stream_data->read_stream->is_eof() || has_received_all_reported_bytes)) {
+        if (!m_internal_stream_data->user_finish_called && !has_undelivered_file_backed_bytes() && (!m_internal_stream_data->read_stream || m_internal_stream_data->read_stream->is_eof() || has_received_all_reported_bytes)) {
             m_internal_stream_data->user_finish_called = true;
             m_internal_stream_data->read_notifier->close();
             m_internal_stream_data->read_notifier = nullptr;
             m_internal_stream_data->read_stream = nullptr;
             // The request has finished for its owner, so a stop or transfer that follows has nothing left to report.
             m_on_stop = nullptr;
+            on_teardown = nullptr;
             user_on_finish(m_internal_stream_data->total_size, m_internal_stream_data->timing_info, m_internal_stream_data->network_error);
             defer_teardown();
         }
@@ -353,13 +416,19 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
 
     m_internal_stream_data->read_notifier->on_activation = [this]() {
         static constexpr size_t buffer_size = 256 * KiB;
-        static thread_local char buffer[buffer_size];
+        // NB: The buffer lives on the heap, as a thread_local array this large would be static TLS that every thread
+        //     of the process zeroes as it starts, reading requests or not. It is allocated the first time a thread
+        //     reads a response and kept for the life of that thread's event loop.
+        static thread_local u8* buffer = nullptr;
 
         // If the request was stopped while this IPC was in-flight, just bail.
         if (!m_internal_stream_data || !m_internal_stream_data->read_stream)
             return;
 
         NonnullRefPtr protector { *this };
+
+        if (!buffer)
+            buffer = new u8[buffer_size];
 
         do {
             auto bytes_to_read = buffer_size;
@@ -385,17 +454,9 @@ void Request::set_up_internal_stream_data(DataReceived on_data_available)
             m_internal_stream_data->on_data_available(ResponseData::from_bytes(read_bytes));
             if (!m_internal_stream_data || !m_internal_stream_data->read_stream)
                 return;
+            account_body_delivery(read_bytes.size());
             if (m_body_delivery_paused)
                 break;
-
-            if (m_internal_stream_data->body_delivery_remaining_byte_count.has_value()) {
-                if (read_bytes.size() >= *m_internal_stream_data->body_delivery_remaining_byte_count) {
-                    m_internal_stream_data->body_delivery_remaining_byte_count = 0;
-                    set_body_delivery_paused(true);
-                    break;
-                }
-                *m_internal_stream_data->body_delivery_remaining_byte_count -= read_bytes.size();
-            }
         } while (true);
 
         if (m_internal_stream_data->read_stream->is_eof())

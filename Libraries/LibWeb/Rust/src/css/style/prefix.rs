@@ -18,7 +18,6 @@
 //! sequence exactly as a descendant step persists down the tree, so the state representation, the
 //! interner, and the retained form serve both axes unchanged.
 
-use super::capacity::capacity_bytes;
 use super::fast_hash::FastMap as HashMap;
 use super::fast_hash::fast_hasher;
 use super::selector::SelectorPrefixPredicate;
@@ -41,9 +40,6 @@ use super::index::StyleAtomID;
 use super::index::StyleNodeFacts;
 use super::instrumentation::Counter;
 use super::instrumentation::Counters;
-use super::memory::MemoryCategory;
-use super::memory::MemoryController;
-use super::memory::MemoryLease;
 use super::partial_view::Lookup;
 use super::program::EntryID;
 use super::program::SelectorProgramID;
@@ -278,13 +274,6 @@ impl PrefixRootSteps {
             Self::Many(steps) => steps.as_mut_slice(),
         }
     }
-
-    fn capacity_bytes(&self) -> usize {
-        match self {
-            Self::Empty | Self::One(_) => 0,
-            Self::Many(steps) => size_of::<Vec<PrefixStepID>>() + steps.capacity() * size_of::<PrefixStepID>(),
-        }
-    }
 }
 
 #[derive(Clone, Default)]
@@ -294,11 +283,11 @@ struct PrefixDispatchBucket {
     end_step: u32,
 }
 
-thread_local! {
-    static SHARED_PREFIX_COMPOUNDS: std::cell::RefCell<SharedVectorPool<PrefixCompound>> =
-        std::cell::RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
-    static SHARED_PREFIX_FEATURES: std::cell::RefCell<SharedVectorPool<PrefixFeature>> =
-        std::cell::RefCell::new(SharedVectorPool::new(MemoryCategory::RuleProgram));
+/// The pools for finished prefix automata.
+#[derive(Default)]
+pub(super) struct PrefixPools {
+    compounds: SharedVectorPool<PrefixCompound>,
+    features: SharedVectorPool<PrefixFeature>,
 }
 
 /// Immutable prefix program attached to one selector dispatch.
@@ -604,7 +593,7 @@ impl PrefixAutomaton {
         true
     }
 
-    pub(super) fn finish(&mut self) {
+    pub(super) fn finish(&mut self, pools: &mut PrefixPools) {
         assert!(!self.entry_paths_finished, "cannot finish a prefix automaton twice");
         if !self.entry_paths.is_sorted_by_key(|path| path.terminal) {
             self.entry_paths.sort_unstable_by_key(|path| path.terminal);
@@ -738,8 +727,8 @@ impl PrefixAutomaton {
         // have exact capacity. Spare builder capacity in the retained template is unused.
         self.compounds.shrink_to_fit();
         self.features.shrink_to_fit();
-        self.compounds.share(&SHARED_PREFIX_COMPOUNDS);
-        self.features.share(&SHARED_PREFIX_FEATURES);
+        self.compounds.share(&mut pools.compounds);
+        self.features.share(&mut pools.features);
         self.tag_tests.shrink_to_fit();
         self.attribute_tests.shrink_to_fit();
         self.outputs.shrink_to_fit();
@@ -836,66 +825,6 @@ impl PrefixAutomaton {
             step: *path.get(index)?,
         })
     }
-
-    #[must_use]
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [
-                self.local_fact_dependencies.ids,
-                self.local_fact_dependencies.classes,
-                self.local_fact_dependencies.attribute_names,
-                self.local_fact_dependencies.attribute_values,
-                self.local_fact_dependencies.attribute_text_names,
-                self.compounds,
-                self.compound_ids,
-                self.features,
-                self.tag_tests,
-                self.attribute_tests,
-                self.steps,
-                self.step_output_builders,
-                self.outputs,
-                self.step_ids,
-                self.buckets,
-                self.entry_paths,
-                self.entry_path_steps,
-                self.entry_path_keys,
-                self.step_predecessors,
-            ];
-            cached [];
-            nested [
-                self.compounds.iter().map(|compound| match &compound.predicate {
-                    PrefixPredicate::Program { identity, .. } => size_of::<SelectorPrefixPredicate>() + 2 * size_of::<usize>() + identity.capacity_bytes(),
-                    _ => 0,
-                }).sum::<usize>(),
-                self
-                .compound_ids
-                .keys()
-                .map(|predicate| match predicate {
-                    PrefixPredicateKey::Features { features, .. } => features.len() * size_of::<FeatureTest>(),
-                    PrefixPredicateKey::Program(_) => 0,
-                })
-                .sum::<usize>(),
-                self
-                .step_output_builders
-                .iter()
-                .map(|builder| {
-                    (builder.child_successors.capacity()
-                        + builder.descendant_successors.capacity()
-                        + builder.adjacent_successors.capacity()
-                        + builder.following_successors.capacity())
-                        * size_of::<PrefixStepID>()
-                        + builder.terminals.capacity() * size_of::<EntryID>()
-                })
-                .sum::<usize>(),
-                self
-                .buckets
-                .values()
-                .map(|bucket| bucket.root_steps.capacity_bytes())
-                .sum::<usize>(),
-            ];
-            skip [self.entry_paths_finished, self.relation_program];
-        }
-    }
 }
 
 impl PrefixSelection {
@@ -905,15 +834,6 @@ impl PrefixSelection {
 
     fn contains_terminal(&self, terminal: EntryID) -> bool {
         self.terminals[terminal.0 as usize]
-    }
-
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [];
-            cached [];
-            nested [self.steps.len(), self.terminals.len()];
-            skip [];
-        }
     }
 }
 
@@ -1147,7 +1067,7 @@ impl LocalFactInterner {
         facts: &StyleNodeFacts,
         row: u32,
         dependencies: &PrefixFactDependencies,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> u32 {
         let hash = hash_local_facts(facts, row, dependencies);
         if let Some(slot) = identities.find(hash, |_slot, &(_identity, representative)| {
@@ -1236,7 +1156,7 @@ pub(super) struct PrefixStates {
 }
 
 /// Private memo and row domain for one prefix evaluation context.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct PrefixTransitionScratch {
     facts_generation: u64,
     /// The `PrefixStates` every answer below names by index; see `PrefixStates::identity`.
@@ -1252,10 +1172,12 @@ pub(super) struct PrefixTransitionScratch {
     ancestor_chain: Vec<StyleNodeID>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct PrefixEffects {
     writes: Vec<PrefixNodeWrite>,
 }
+
+#[derive(Clone)]
 
 struct PrefixNodeWrite {
     node: StyleNodeID,
@@ -1265,7 +1187,7 @@ struct PrefixNodeWrite {
     local_facts: Option<u32>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct PrefixTransitionContext {
     pub(super) scratch: PrefixTransitionScratch,
     pub(super) effects: PrefixEffects,
@@ -1297,31 +1219,14 @@ impl PrefixTransitionContext {
         context.scratch.composite_local_fact_changes = Some(changed.to_vec());
         context
     }
-
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        self.scratch.capacity_bytes() + self.effects.capacity_bytes()
-    }
 }
 
+#[derive(Clone, Default)]
 pub(super) struct PrefixTransitionContexts {
     by_program: Column<Option<PrefixTransitionContext>>,
-    memory: MemoryLease,
-}
-
-impl Default for PrefixTransitionContexts {
-    fn default() -> Self {
-        Self {
-            by_program: Column::default(),
-            memory: MemoryLease::new(MemoryCategory::BatchScratch),
-        }
-    }
 }
 
 impl PrefixTransitionContexts {
-    pub(super) fn settle_memory(&mut self, memory: &mut MemoryController) {
-        self.memory.resize_required_to(memory, self.capacity_bytes());
-    }
-
     pub(super) fn prepare(&mut self, program: ScopeProgramID, states: &mut PrefixStates, facts: &StyleNodeFacts) {
         self.by_program
             .entry(program.0 as usize)
@@ -1332,7 +1237,7 @@ impl PrefixTransitionContexts {
     /// Prepare one program's context again when the arena it was prepared against was replaced.
     ///
     /// A traversal owns its contexts for as long as it runs, while the states they name can be
-    /// released and rebuilt under it whenever the cache loses its residency. Every pairing of a
+    /// released and rebuilt under it whenever the cache is released. Every pairing of a
     /// context with an arena therefore revalidates before reading memoized answers.
     pub(super) fn rebind(&mut self, program: ScopeProgramID, states: &mut PrefixStates, facts: &StyleNodeFacts) {
         let context = self
@@ -1352,8 +1257,7 @@ impl PrefixTransitionContexts {
             .expect("prefix context prepared")
     }
 
-    pub(super) fn install(&mut self, states: &mut PrefixStateCache, memory: &mut MemoryController) {
-        let mut installed = false;
+    pub(super) fn install(&mut self, states: &mut PrefixStateCache) {
         for (program, context) in self.by_program.iter_mut().enumerate() {
             if let Some(context) = context
                 && !context.effects.writes.is_empty()
@@ -1362,22 +1266,8 @@ impl PrefixTransitionContexts {
                 ))
             {
                 states.install_prefix_effects(&mut context.effects);
-                installed = true;
             }
         }
-        if installed {
-            states.settle_memory(memory);
-        }
-    }
-
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        (self.by_program.capacity() * size_of::<Option<PrefixTransitionContext>>()) as u64
-            + self
-                .by_program
-                .iter()
-                .flatten()
-                .map(PrefixTransitionContext::capacity_bytes)
-                .sum::<u64>()
     }
 }
 
@@ -1716,31 +1606,14 @@ impl PrefixDeltaArena {
         }
         self.append_scratch_delta(0)
     }
-
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.steps, self.deltas, self.matches, self.signed_scratch, self.key_tables];
-            cached [];
-            nested [
-                self.scratch.iter().map(Vec::capacity).sum::<usize>() * size_of::<PrefixStepID>(),
-                self.match_scratch.iter().map(Vec::capacity).sum::<usize>() * size_of::<EntryID>(),
-                self.key_table_bytes,
-            ];
-            skip [];
-        }
-    }
 }
 
 impl<'a, 'b> PrefixEvaluation<'a, 'b> {
-    pub(super) fn match_scratch_capacity_bytes(&self) -> u64 {
-        self.evaluator.match_scratch_capacity_bytes()
-    }
-
     fn positional_test_matches(
         &mut self,
         node: StyleNodeID,
         index: usize,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let (program, test) = self.automaton.positional_tests()[index];
         match test {
@@ -1759,7 +1632,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
         &mut self,
         node: StyleNodeID,
         step: PrefixStepID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let row = self.row_of(node)?;
         let compound = &self.automaton.compounds[self.automaton.steps[step.0 as usize].compound.0 as usize];
@@ -1780,7 +1653,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
                 Ok(self
                     .automaton
                     .features_for(*feature_start, *feature_len)
-                    .all(|feature| matches_feature(row.facts, row.row, feature)))
+                    .all(|feature| matches_feature(row, feature)))
             }
             PrefixPredicate::Program { program, local, .. } => {
                 self.evaluator
@@ -1794,7 +1667,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
         node: StyleNodeID,
         positional_bits: u32,
         step: PrefixStepID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<bool, Incomplete> {
         let row = self.row_of(node)?;
         let compound = &self.automaton.compounds[self.automaton.steps[step.0 as usize].compound.0 as usize];
@@ -1808,7 +1681,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
                     && self
                         .automaton
                         .features_for(*feature_start, *feature_len)
-                        .all(|feature| matches_feature(row.facts, row.row, feature)),
+                        .all(|feature| matches_feature(row, feature)),
             ),
             PrefixPredicate::Program { program, local, .. } => {
                 self.evaluator
@@ -1819,7 +1692,7 @@ impl<'a, 'b> PrefixEvaluation<'a, 'b> {
 
     /// The per-node answers of the automaton's positional tests, one bit per test. Zero for
     /// automata without positional steps, so fact-cohort sharing is unchanged there.
-    pub(super) fn positional_bits(&mut self, node: StyleNodeID, counters: &mut Counters) -> Result<u32, Incomplete> {
+    pub(super) fn positional_bits(&mut self, node: StyleNodeID, counters: &Counters) -> Result<u32, Incomplete> {
         let tests = self.automaton.positional_tests();
         let mut bits = 0_u32;
         for index in 0..tests.len() {
@@ -1923,7 +1796,7 @@ impl PrefixStates {
         effects: &mut PrefixEffects,
         evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> PrefixTransitionLookup<PrefixMatchSetID> {
         if let Some(matches) = self.relation_answer(node) {
             return PrefixTransitionLookup::Known(matches);
@@ -1996,7 +1869,7 @@ impl PrefixStates {
         // SAFETY: Every referenced state range is initialized. Sparse rebases can leave
         // unreferenced holes in the arena, but never point a state at one.
         unsafe {
-            std::slice::from_raw_parts(
+            ak::slice_from_raw_parts(
                 self.delta_steps.as_ptr().add(start).cast::<PrefixStepID>(),
                 state.additions_len as usize,
             )
@@ -2008,7 +1881,7 @@ impl PrefixStates {
         let start = state.payload_start as usize + state.additions_len as usize;
         // SAFETY: See `additions_in`; this is the initialized suffix of the same payload.
         unsafe {
-            std::slice::from_raw_parts(
+            ak::slice_from_raw_parts(
                 self.delta_steps.as_ptr().add(start).cast::<PrefixStepID>(),
                 state.expiring_len as usize,
             )
@@ -2373,7 +2246,7 @@ impl PrefixStates {
         local_producers: Option<&[PrefixProducer]>,
         use_admitted_new_truth: bool,
         arena: &mut PrefixDeltaArena,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<PrefixLocalOutputDeltas, Incomplete> {
         for scratch in &mut arena.scratch {
             scratch.clear();
@@ -2556,7 +2429,7 @@ impl PrefixStates {
         delta: PrefixStateDeltaID,
         arena: &PrefixDeltaArena,
         downward: bool,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Option<u32> {
         let mut additions = match downward {
             true => std::mem::take(&mut self.new_descendant),
@@ -2666,7 +2539,7 @@ impl PrefixStates {
         positional_bits: u32,
         local_output_deltas: PrefixLocalOutputDeltas,
         delta_arena: &PrefixDeltaArena,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Option<PrefixTransition> {
         let old_entering = self.entering_of(node)?;
         if entering_deltas.parent.is_none() && entering_deltas.previous.is_none() {
@@ -2757,7 +2630,7 @@ impl PrefixStates {
         entering_deltas: PrefixEnteringDeltas,
         positional_truth_stable: bool,
         delta_arena: &mut PrefixDeltaArena,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> PrefixTransitionLookup<PrefixDifference> {
         let row = match evaluation.row_of(node) {
             Ok(row) => row,
@@ -3168,7 +3041,7 @@ impl PrefixStates {
         new_parent: u32,
         delta: PrefixStateDeltaID,
         arena: &mut PrefixDeltaArena,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Option<PrefixDifference> {
         let automaton = evaluation.automaton;
         let is_document_root = evaluation.tree.parent(node).is_none();
@@ -3325,7 +3198,7 @@ impl PrefixStates {
 
     /// The state a node that admits nothing hands its children under `state`: the state itself
     /// when it carries no expiring steps, its persisting-only form otherwise.
-    fn state_without_expiring(&mut self, state: u32, counters: &mut Counters) -> u32 {
+    fn state_without_expiring(&mut self, state: u32, counters: &Counters) -> u32 {
         match self.states[state as usize].expiring_len == 0 {
             true => state,
             false => self.descendant_only_state(state, counters),
@@ -3339,7 +3212,7 @@ impl PrefixStates {
         evaluation: &mut PrefixEvaluation<'_, '_>,
         nodes: impl Iterator<Item = StyleNodeID>,
         completion_budget: usize,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> bool {
         let mut completions = 0;
         for node in nodes {
@@ -3400,7 +3273,7 @@ impl PrefixStates {
         effects: &mut PrefixEffects,
         evaluation: &mut PrefixEvaluation<'_, '_>,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> PrefixTransitionLookup<PrefixTransition> {
         transition_for(
             &mut PrefixTransitionSurface {
@@ -3423,7 +3296,7 @@ impl PrefixStates {
         node: StyleNodeID,
         is_document_root: bool,
         positional_bits: u32,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> PrefixTransitionLookup<PrefixTransition> {
         let automaton = evaluation.automaton;
         if !self.automaton_statistics_recorded {
@@ -3455,7 +3328,7 @@ impl PrefixStates {
                             (positional_bits & required_positional_bits) == *required_positional_bits
                                 && automaton
                                     .features_for(*feature_start, *feature_len)
-                                    .all(|feature| matches_feature(row.facts, row.row, feature))
+                                    .all(|feature| matches_feature(row, feature))
                         }
                         PrefixPredicate::Program { program, local, .. } => match evaluation
                             .evaluator
@@ -3653,7 +3526,7 @@ impl PrefixStates {
     ) {
         // SAFETY: Callers pass a range from an interned state's initialized payload.
         let steps = unsafe {
-            std::slice::from_raw_parts(
+            ak::slice_from_raw_parts(
                 self.delta_steps.as_ptr().add(payload_start).cast::<PrefixStepID>(),
                 len as usize,
             )
@@ -3709,12 +3582,7 @@ impl PrefixStates {
 
     /// Intern the transition's downward output state from the parent state and the new
     /// down-axis admissions.
-    fn intern_transition_state(
-        &mut self,
-        automaton: &PrefixAutomaton,
-        parent_state: u32,
-        counters: &mut Counters,
-    ) -> u32 {
+    fn intern_transition_state(&mut self, automaton: &PrefixAutomaton, parent_state: u32, counters: &Counters) -> u32 {
         let mut additions = std::mem::take(&mut self.new_descendant);
         let mut additions_hash = self.new_descendant_hash;
         additions.retain(|step| {
@@ -3747,7 +3615,7 @@ impl PrefixStates {
         &mut self,
         automaton: &PrefixAutomaton,
         previous_state: u32,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> u32 {
         let mut additions = std::mem::take(&mut self.new_following);
         let mut additions_hash = self.new_following_hash;
@@ -3790,7 +3658,7 @@ impl PrefixStates {
         additions_hash: u64,
         expiring: &[PrefixStepID],
         expiring_hash: u32,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> u32 {
         if additions.is_empty() && expiring.is_empty() {
             if self.states[base_state as usize].expiring_len == 0 {
@@ -3855,7 +3723,7 @@ impl PrefixStates {
         source_state: u32,
         old_base_state: u32,
         new_base_state: u32,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Option<u32> {
         if old_base_state == new_base_state {
             return Some(source_state);
@@ -3911,7 +3779,7 @@ impl PrefixStates {
     }
 
     /// The interned state holding exactly `state`'s persisting part, memoized per state.
-    fn descendant_only_state(&mut self, state: u32, counters: &mut Counters) -> u32 {
+    fn descendant_only_state(&mut self, state: u32, counters: &Counters) -> u32 {
         let known = self.descendant_only[state as usize];
         if known != UNKNOWN_STATE {
             return known;
@@ -4099,7 +3967,7 @@ impl PrefixStates {
     }
 
     /// Shed unreachable interned identities and allocation slack before the working form is
-    /// offered for residency. Only per-element transitions cross this boundary; traversal memos
+    /// retained. Only per-element transitions cross this boundary; traversal memos
     /// and completed-answer keys are batch-local, so every remapped identity stays internal.
     fn trim_for_retention(&mut self) {
         let working_bytes = self.interned_working_bytes();
@@ -4131,81 +3999,6 @@ impl PrefixStates {
         self.new_following = Vec::new();
         self.new_adjacent = Vec::new();
     }
-
-    fn top_level_capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [
-                self.states,
-                self.relation_answers,
-                self.delta_steps,
-                self.states_by_hash,
-                self.match_offsets,
-                self.match_entries,
-                self.truth_offsets,
-                self.truth_steps,
-                self.truth_sets_by_hash,
-                self.results,
-                self.result_ids,
-                self.match_sets_by_hash,
-                self.transition_by_element,
-                self.entering_by_element,
-                self.local_facts_by_element,
-                self.positional_bits_by_element,
-                self.candidate_epoch,
-                self.comparison_marks,
-                self.compound_epoch,
-                self.output_epoch,
-                self.match_epoch,
-                self.parent_persisting_epoch,
-                self.previous_persisting_epoch,
-                self.compound_answer,
-                self.candidates,
-                self.compare_left,
-                self.compare_right,
-                self.new_descendant,
-                self.new_child,
-                self.new_following,
-                self.new_adjacent,
-                self.descendant_only,
-                self.output_matches,
-                self.output_matched_steps,
-            ];
-            cached [];
-            nested [self.states_by_hash_collision_bytes];
-            skip [
-                self.local_fact_interner,
-                self.relation,
-                self.comparison_epoch,
-                self.states_by_hash_collision_bytes,
-                self.new_descendant_hash,
-                self.new_child_hash,
-                self.new_following_hash,
-                self.new_adjacent_hash,
-                self.epoch,
-                self.complete,
-                self.automaton_step_count,
-                self.automaton_statistics_recorded,
-                self.last_compacted_working_bytes,
-            ];
-        }
-    }
-
-    #[must_use]
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [];
-            cached [];
-            nested [self.top_level_capacity_bytes()];
-            skip [];
-        }
-    }
-
-    #[must_use]
-    pub(super) fn relation_capacity_bytes(&self) -> u64 {
-        self.relation.as_ref().map_or(0, |relation| {
-            size_of::<PrefixRelation>() as u64 + relation.capacity_bytes()
-        })
-    }
 }
 
 impl PrefixTransitionScratch {
@@ -4215,7 +4008,7 @@ impl PrefixTransitionScratch {
         automaton: &PrefixAutomaton,
         facts: &StyleNodeFacts,
         node: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> u32 {
         let row = facts.row_of(node).expect("prepared fact row");
         if let Some(&cached) = self.local_facts_by_row.get(&row) {
@@ -4257,22 +4050,9 @@ impl PrefixTransitionScratch {
             self.local_fact_representatives = Default::default();
         }
     }
-
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.memo, self.by_node, self.local_facts_by_row, self.ancestor_chain, self.local_fact_representatives];
-            cached [];
-            nested [self.composite_local_fact_changes.as_ref().map_or(0, |changes| (changes.capacity() * size_of::<StyleNodeID>()) as u64)];
-            skip [self.facts_generation, self.states_identity, self.composite_local_fact_changes];
-        }
-    }
 }
 
-impl PrefixEffects {
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        (self.writes.capacity() * size_of::<PrefixNodeWrite>()) as u64
-    }
-}
+impl PrefixEffects {}
 
 impl PrefixStates {
     pub(super) fn install_prefix_effects(&mut self, effects: &mut PrefixEffects) {
@@ -4349,7 +4129,7 @@ impl PrefixTransitionSurface<'_> {
         node: StyleNodeID,
         row: MatchFactRow<'_>,
         inputs: TransitionInputs,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> PrefixTransitionLookup<(PrefixTransition, PrefixTransitionOrigin)> {
         let key = PrefixTransitionKey {
             parent: inputs.entering.parent,
@@ -4389,7 +4169,7 @@ fn transition_for(
     surface: &mut PrefixTransitionSurface<'_>,
     evaluation: &mut PrefixEvaluation<'_, '_>,
     node: StyleNodeID,
-    counters: &mut Counters,
+    counters: &Counters,
 ) -> PrefixTransitionLookup<PrefixTransition> {
     let has_sibling_steps = evaluation.automaton.has_sibling_steps();
     surface.clear_ancestor_chain();
@@ -4500,12 +4280,9 @@ fn selected_matches_equal(left: &[EntryID], right: &[EntryID], selection: &Prefi
 /// Prefix states shared by every element ask in one synchronous matching traversal.
 ///
 /// The delta representation keeps the working form small enough to retain outright, so there is
-/// no compact retained encoding. Retention moves the same working bytes from scratch into Tier 3.
+/// no compact retained encoding. Retention keeps the same working form.
 pub(super) struct PrefixStateCache {
     by_program: Column<Option<Box<PrefixStates>>>,
-    scratch_memory: MemoryLease,
-    residency: MemoryLease,
-    relation_residency: MemoryLease,
     lifecycle: PrefixStateCacheLifecycle,
 }
 
@@ -4546,9 +4323,7 @@ impl Default for PrefixStateCache {
     fn default() -> Self {
         Self {
             by_program: Column::default(),
-            scratch_memory: MemoryLease::new(MemoryCategory::BatchScratch),
-            residency: MemoryLease::new(MemoryCategory::PrefixTransitionCache),
-            relation_residency: MemoryLease::new(MemoryCategory::PrefixRelation),
+
             lifecycle: PrefixStateCacheLifecycle::Scratch(PrefixStateCacheCoverage::Full),
         }
     }
@@ -4593,40 +4368,7 @@ impl PrefixStateCache {
         }
     }
 
-    pub(super) fn settle_memory(&mut self, memory: &mut MemoryController) {
-        let (transition_bytes, relation_bytes) =
-            self.by_program
-                .iter()
-                .flatten()
-                .fold((0, 0), |(transitions, relations), states| {
-                    (
-                        transitions + size_of::<PrefixStates>() as u64 + states.capacity_bytes(),
-                        relations + states.relation_capacity_bytes(),
-                    )
-                });
-        let bytes = capacity_bytes! {
-            shallow [self.by_program];
-            cached [];
-            nested [transition_bytes];
-            skip [self.scratch_memory, self.residency, self.relation_residency, self.lifecycle];
-        };
-        if relation_bytes != 0 || self.relation_residency.bytes() != 0 {
-            self.relation_residency.reconcile_committed(memory, relation_bytes);
-        }
-        if self.lifecycle.is_retained() {
-            self.residency.reconcile_committed(memory, bytes);
-        } else {
-            self.scratch_memory.resize_required_to(memory, bytes);
-        }
-    }
-
     pub(super) fn release(&mut self) {
-        if self.lifecycle.is_retained() {
-            self.residency.release();
-        } else {
-            self.scratch_memory.release();
-        }
-        self.relation_residency.release();
         self.by_program = Column::default();
         self.lifecycle = PrefixStateCacheLifecycle::Scratch(self.lifecycle.coverage());
     }
@@ -4644,11 +4386,6 @@ impl PrefixStateCache {
                 Box::new(states)
             });
         }
-        if self.lifecycle.is_retained() {
-            self.residency.release();
-        } else {
-            self.scratch_memory.release();
-        }
         let coverage = self.lifecycle.coverage();
         self.lifecycle = if self.lifecycle.is_current() {
             PrefixStateCacheLifecycle::CurrentScratch(coverage)
@@ -4657,28 +4394,19 @@ impl PrefixStateCache {
         };
     }
 
-    pub(super) fn retain(&mut self, memory: &mut MemoryController) -> bool {
+    pub(super) fn retain(&mut self) {
         if self.lifecycle.is_retained() {
-            return true;
+            return;
         }
         for states in self.by_program.iter_mut().flatten() {
-            let before = states.capacity_bytes();
             states.trim_for_retention();
-            let after = states.capacity_bytes();
-            self.scratch_memory.shrink_committed(before - after);
         }
-        let working_bytes = self.scratch_memory.bytes();
-        if !memory.is_tier3_admitting(MemoryCategory::PrefixTransitionCache) {
-            return false;
-        }
-        self.residency.reconcile_committed(memory, working_bytes);
-        self.scratch_memory.release();
+
         self.lifecycle = match self.lifecycle {
             PrefixStateCacheLifecycle::Scratch(coverage) => PrefixStateCacheLifecycle::Retained(coverage),
             PrefixStateCacheLifecycle::CurrentScratch(coverage) => PrefixStateCacheLifecycle::CurrentRetained(coverage),
             PrefixStateCacheLifecycle::Retained(_) | PrefixStateCacheLifecycle::CurrentRetained(_) => unreachable!(),
         };
-        true
     }
 
     /// Forget one element's transition. This is the whole maintenance a pure tree flush needs,
@@ -4748,12 +4476,11 @@ impl PrefixStateCache {
         }
     }
 
-    pub(super) fn make_scratch(&mut self, memory: &mut MemoryController) {
+    pub(super) fn make_scratch(&mut self) {
         if !self.lifecycle.is_retained() {
             return;
         }
-        self.scratch_memory.resize_required_to(memory, self.residency.bytes());
-        self.residency.release();
+
         self.lifecycle = match self.lifecycle {
             PrefixStateCacheLifecycle::Retained(coverage) => PrefixStateCacheLifecycle::Scratch(coverage),
             PrefixStateCacheLifecycle::CurrentRetained(coverage) => PrefixStateCacheLifecycle::CurrentScratch(coverage),
@@ -4761,39 +4488,17 @@ impl PrefixStateCache {
         };
     }
 
-    pub(super) fn prepare_to_mutate(&mut self, memory: &mut MemoryController) {
+    pub(super) fn prepare_to_mutate(&mut self) {
         debug_assert!(!self.lifecycle.is_retained());
         for states in self.by_program.iter_mut().flatten() {
-            let before = states.capacity_bytes();
             states.rebuild_interners();
-            let after = states.capacity_bytes();
-            if after > before {
-                self.scratch_memory.grow_required(memory, after - before);
-            }
         }
     }
 
     pub(super) fn remove(&mut self, program: ScopeProgramID) {
         let index = program.0 as usize;
-        if self.by_program.get(index).is_none_or(Option::is_none) {
-            return;
-        }
-        let states = self.by_program[index].as_ref().expect("program entry is live");
-        let relation_released = states.relation_capacity_bytes();
-        let released = size_of::<PrefixStates>() as u64 + states.capacity_bytes();
-        self.by_program[index] = None;
-        self.relation_residency
-            .shrink_committed(relation_released.min(self.relation_residency.bytes()));
-        let held = if self.lifecycle.is_retained() {
-            self.residency.bytes()
-        } else {
-            self.scratch_memory.bytes()
-        };
-        let released = released.min(held);
-        if self.lifecycle.is_retained() {
-            self.residency.shrink_to(held - released);
-        } else {
-            self.scratch_memory.shrink_to(held - released);
+        if let Some(entry) = self.by_program.get_mut(index) {
+            *entry = None;
         }
     }
 }
@@ -4881,35 +4586,13 @@ fn rows_have_equal_local_facts_between(
     }
 }
 
-fn matches_feature(facts: &StyleNodeFacts, row: u32, feature: FeatureTest) -> bool {
-    match feature {
-        FeatureTest::AnyElement => true,
-        FeatureTest::Namespace(NamespaceTest::None) => facts.namespace_of(row).is_none(),
-        FeatureTest::Namespace(NamespaceTest::Named(namespace)) => facts.namespace_of(row) == namespace,
-        FeatureTest::TagName(tag) => tag.matches(facts.tag_of(row), facts.namespace_of(row)),
-        FeatureTest::Id(id) => facts.id_of(row) == id,
-        FeatureTest::Class(class) => facts.classes_of(row).contains(&class),
-        FeatureTest::Attribute(test) => {
-            let folds = !test.fold_in_namespace.is_none() && facts.namespace_of(row) == test.fold_in_namespace;
-            facts.attributes_of(row).iter().any(|attribute| {
-                let value_matches = match test.operator {
-                    AttributeOperator::Presence => true,
-                    AttributeOperator::Exact => attribute.value == test.value_atom,
-                    _ => unreachable!("only atom-answerable features are canonicalized"),
-                };
-                if !value_matches {
-                    return false;
-                }
-                let name = if folds { test.folded } else { test.name };
-                let written = if test.any_namespace {
-                    facts.attribute_name_forms(attribute.name).local
-                } else {
-                    attribute.name
-                };
-                written == name
-            })
-        }
-    }
+/// Whether a canonical feature holds. Canonical attribute features are answerable by their value atom alone.
+fn matches_feature(row: MatchFactRow<'_>, feature: FeatureTest) -> bool {
+    super::selector_evaluation::matches_feature(&row, feature, |test, (_, attribute), _| match test.operator {
+        AttributeOperator::Presence => true,
+        AttributeOperator::Exact => attribute.value == test.value_atom,
+        _ => unreachable!("only atom-answerable features are canonicalized"),
+    })
 }
 
 #[cfg(test)]
@@ -4934,8 +4617,6 @@ mod tests {
                 &[AttributeFact {
                     name,
                     value: StyleAtomID(30 + index),
-                    text_offset: 0,
-                    text_length: 0,
                 }],
             );
         }
@@ -4959,15 +4640,7 @@ mod tests {
             let mut interner = LocalFactInterner::new();
             let mut representatives = Default::default();
             let identities: Vec<_> = (0..3)
-                .map(|row| {
-                    interner.intern(
-                        &mut representatives,
-                        &facts,
-                        row,
-                        &dependencies,
-                        &mut Counters::default(),
-                    )
-                })
+                .map(|row| interner.intern(&mut representatives, &facts, row, &dependencies, &Counters::default()))
                 .collect();
             match operator {
                 AttributeOperator::Presence => assert_eq!(identities, [1, 1, 1]),
@@ -4995,7 +4668,7 @@ mod tests {
         }
         let mut states = PrefixStates::new();
         let automaton = PrefixAutomaton::default();
-        let mut counters = Counters::default();
+        let counters = Counters::default();
         let mut context = PrefixTransitionContext::new(&mut states, &facts);
         assert_eq!(counters.get(Counter::PrefixLocalFactIdentityHits), 0);
         assert_eq!(counters.get(Counter::PrefixLocalFactIdentityMisses), 0);
@@ -5005,14 +4678,14 @@ mod tests {
             &automaton,
             &facts,
             StyleNodeID::element(999),
-            &mut counters,
+            &counters,
         );
         let second = context.scratch.ensure_local_fact_identity(
             &mut states,
             &automaton,
             &facts,
             StyleNodeID::element(1000),
-            &mut counters,
+            &counters,
         );
         assert_eq!(first, second);
         assert_eq!(counters.get(Counter::PrefixLocalFactIdentityHits), 1);
@@ -5024,12 +4697,11 @@ mod tests {
                 &automaton,
                 &facts,
                 StyleNodeID::element(999),
-                &mut counters,
+                &counters,
             ),
         );
         assert_eq!(counters.get(Counter::PrefixLocalFactIdentityHits), 1);
         assert_eq!(counters.get(Counter::PrefixLocalFactIdentityMisses), 1);
-        assert!(context.capacity_bytes() < 4096);
     }
 
     #[test]
@@ -5051,7 +4723,7 @@ mod tests {
         let retained = states.local_fact_interner.mint_identity();
         states.set_local_facts(StyleNodeID::element(1), retained);
         states.set_local_facts(StyleNodeID::element(2), retained);
-        let mut counters = Counters::default();
+        let counters = Counters::default();
         let mut context = PrefixTransitionContext::new_composite(&mut states, &facts, &[StyleNodeID::element(1)]);
         assert_eq!(counters.get(Counter::PrefixLocalFactIdentityMisses), 0);
         let mut identity = |node| {
@@ -5060,7 +4732,7 @@ mod tests {
                 &PrefixAutomaton::default(),
                 &facts,
                 StyleNodeID::element(node),
-                &mut counters,
+                &counters,
             )
         };
         let changed = identity(1);
@@ -5111,7 +4783,7 @@ mod tests {
             });
         }
 
-        // Losing residency rebuilds the arena every answer above names by index.
+        // Releasing the cache rebuilds the arena every answer above names by index.
         let mut rebuilt = PrefixStates::new();
         contexts.rebind(program, &mut rebuilt, &facts);
         let context = contexts.get_mut(program);
@@ -5150,7 +4822,7 @@ mod tests {
                     &automaton,
                     facts,
                     StyleNodeID::element(node),
-                    &mut Counters::default(),
+                    &Counters::default(),
                 )
             };
         let mut context = PrefixTransitionContext::new(&mut states, &facts);
@@ -5277,27 +4949,25 @@ mod tests {
     #[test]
     fn sparse_rebase_shares_unchanged_local_payload() {
         let mut states = PrefixStates::new();
-        let mut counters = Counters::new();
+        let counters = Counters::new();
         let old_base_step = PrefixStepID(1);
         let local_step = PrefixStepID(2);
         let expiring_step = PrefixStepID(3);
         let new_base_step = PrefixStepID(4);
-        let old_base =
-            states.intern_extended_state(0, &[old_base_step], step_hash(old_base_step), &[], 0, &mut counters);
+        let old_base = states.intern_extended_state(0, &[old_base_step], step_hash(old_base_step), &[], 0, &counters);
         let source = states.intern_extended_state(
             old_base,
             &[local_step],
             step_hash(local_step),
             &[expiring_step],
             step_hash(expiring_step) as u32,
-            &mut counters,
+            &counters,
         );
-        let new_base =
-            states.intern_extended_state(0, &[new_base_step], step_hash(new_base_step), &[], 0, &mut counters);
+        let new_base = states.intern_extended_state(0, &[new_base_step], step_hash(new_base_step), &[], 0, &counters);
         let source_payload = states.states[source as usize].payload_start;
 
         let rebased = states
-            .rebase_unchanged_local_payload(source, old_base, new_base, &mut counters)
+            .rebase_unchanged_local_payload(source, old_base, new_base, &counters)
             .expect("a one-level local payload can be rebased");
 
         assert_eq!(states.states[rebased as usize].base, new_base);
@@ -5312,14 +4982,14 @@ mod tests {
         let second = PrefixStepID(2);
         let mut states = PrefixStates::new();
         states.automaton_step_count = 3;
-        let mut counters = Counters::new();
-        let first_base = states.intern_extended_state(0, &[first], step_hash(first), &[], 0, &mut counters);
-        let second_base = states.intern_extended_state(0, &[second], step_hash(second), &[], 0, &mut counters);
+        let counters = Counters::new();
+        let first_base = states.intern_extended_state(0, &[first], step_hash(first), &[], 0, &counters);
+        let second_base = states.intern_extended_state(0, &[second], step_hash(second), &[], 0, &counters);
 
         let first_then_second =
-            states.intern_extended_state(first_base, &[second], step_hash(second), &[], 0, &mut counters);
+            states.intern_extended_state(first_base, &[second], step_hash(second), &[], 0, &counters);
         let second_then_first =
-            states.intern_extended_state(second_base, &[first], step_hash(first), &[], 0, &mut counters);
+            states.intern_extended_state(second_base, &[first], step_hash(first), &[], 0, &counters);
 
         assert_eq!(first_then_second, second_then_first);
     }
@@ -5332,13 +5002,13 @@ mod tests {
         let fourth = PrefixStepID(4);
         let mut states = PrefixStates::new();
         states.automaton_step_count = 5;
-        let mut counters = Counters::new();
-        let first_base = states.intern_extended_state(0, &[first], step_hash(first), &[], 0, &mut counters);
-        let second_base = states.intern_extended_state(0, &[second], step_hash(second), &[], 0, &mut counters);
+        let counters = Counters::new();
+        let first_base = states.intern_extended_state(0, &[first], step_hash(first), &[], 0, &counters);
+        let second_base = states.intern_extended_state(0, &[second], step_hash(second), &[], 0, &counters);
         let collision_hash = step_hash(first).wrapping_add(step_hash(second));
-        let collision = states.intern_extended_state(0, &[third, fourth], collision_hash, &[], 0, &mut counters);
+        let collision = states.intern_extended_state(0, &[third, fourth], collision_hash, &[], 0, &counters);
         let first_then_second =
-            states.intern_extended_state(first_base, &[second], step_hash(second), &[], 0, &mut counters);
+            states.intern_extended_state(first_base, &[second], step_hash(second), &[], 0, &counters);
 
         assert_ne!(collision, first_then_second);
         let key = state_content_key(2, collision_hash, 0, 0);
@@ -5349,7 +5019,7 @@ mod tests {
         );
 
         let second_then_first =
-            states.intern_extended_state(second_base, &[first], step_hash(first), &[], 0, &mut counters);
+            states.intern_extended_state(second_base, &[first], step_hash(first), &[], 0, &counters);
         assert_eq!(second_then_first, first_then_second);
     }
 
@@ -5437,7 +5107,7 @@ mod tests {
     #[test]
     fn sparse_rebase_applies_signed_local_output_edits() {
         let mut states = PrefixStates::new();
-        let mut counters = Counters::new();
+        let counters = Counters::new();
         let old_base_step = PrefixStepID(0);
         let retained_step = PrefixStepID(1);
         let removed_step = PrefixStepID(2);
@@ -5445,18 +5115,16 @@ mod tests {
         let removed_expiring_step = PrefixStepID(4);
         let added_step = PrefixStepID(5);
         let added_expiring_step = PrefixStepID(6);
-        let old_base =
-            states.intern_extended_state(0, &[old_base_step], step_hash(old_base_step), &[], 0, &mut counters);
+        let old_base = states.intern_extended_state(0, &[old_base_step], step_hash(old_base_step), &[], 0, &counters);
         let source = states.intern_extended_state(
             old_base,
             &[retained_step, removed_step],
             step_hash(retained_step).wrapping_add(step_hash(removed_step)),
             &[removed_expiring_step],
             step_hash(removed_expiring_step) as u32,
-            &mut counters,
+            &counters,
         );
-        let new_base =
-            states.intern_extended_state(0, &[new_base_step], step_hash(new_base_step), &[], 0, &mut counters);
+        let new_base = states.intern_extended_state(0, &[new_base_step], step_hash(new_base_step), &[], 0, &counters);
         let mut arena = PrefixDeltaArena::default();
         arena.scratch[0].extend([new_base_step, added_step]);
         arena.scratch[1].push(removed_step);
@@ -5465,7 +5133,7 @@ mod tests {
         let delta = arena.append_scratch_delta(0);
 
         let rebased = states
-            .rebase_payload_with_local_delta(source, old_base, new_base, delta, &arena, true, &mut counters)
+            .rebase_payload_with_local_delta(source, old_base, new_base, delta, &arena, true, &counters)
             .expect("a one-level local payload can apply signed edits");
 
         assert_eq!(states.states[rebased as usize].base, new_base);
@@ -5503,7 +5171,7 @@ mod tests {
             .extend([unique, unique, shared]);
         automaton.step_output_builders[1].terminals.push(shared);
 
-        automaton.finish();
+        automaton.finish(&mut PrefixPools::default());
 
         let first_outputs = automaton.outputs_for(&automaton.steps[0]);
         assert!(matches!(first_outputs[0].kind, PrefixOutputKind::UniqueTerminal));
@@ -5567,7 +5235,7 @@ mod tests {
             steps: 0..2,
         });
 
-        automaton.finish();
+        automaton.finish(&mut PrefixPools::default());
 
         assert_eq!(
             automaton.compounds[automaton.steps[0].compound.0 as usize].dispatch_key,
@@ -5748,33 +5416,5 @@ mod tests {
                 states.transition_by_element.capacity(),
             ]
         );
-    }
-
-    #[test]
-    fn retained_cache_entry_maintenance_charges_the_residency_lease() {
-        use super::super::index::StateSet;
-        use super::super::memory::DeviceClass;
-
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-        let mut cache = PrefixStateCache::default();
-        let mut facts = StyleNodeFacts::new();
-        facts.push_row(
-            super::super::tree::StyleNodeID::element(1),
-            StyleAtomID(1),
-            StyleAtomID::NONE,
-            StateSet(0),
-            &[],
-            &[],
-        );
-        let mut context = PrefixTransitionContext::new(cache.prepare_program(ScopeProgramID(0)), &facts);
-        cache.settle_memory(&mut memory);
-        assert!(cache.retain(&mut memory));
-        assert!(memory.bytes_in_category(MemoryCategory::PrefixTransitionCache) > 0);
-
-        // Preparing a fresh private row domain does not change retained cache accounting.
-        context.scratch.prepare_rows(facts.generation() + 1);
-        let _ = cache.prepare_program(ScopeProgramID(0));
-        cache.settle_memory(&mut memory);
-        assert_eq!(memory.bytes_in_category(MemoryCategory::BatchScratch), 0);
     }
 }

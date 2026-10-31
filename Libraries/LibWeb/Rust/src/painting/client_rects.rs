@@ -6,30 +6,31 @@
 
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
-use crate::layout::node_facts;
+use crate::layout::node_facts::{self, NodeShape};
 use crate::painting::node_painting;
+use crate::painting::paint_read::{PaintRead, PaintRow};
 use crate::painting::paintable_geometry;
-use crate::painting::paintable_rows::{PaintableRowsRead, with_inline_pieces};
+use crate::painting::paintable_rows::with_inline_pieces;
 use crate::painting::rect_to_viewport_transform::{RectToViewportTransform, transform_rect_to_viewport_or_identity};
 use crate::painting::style_queries;
 
 pub(crate) fn can_compute_client_rects_without_visual_context_update(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     layout_node: NodeSlotId,
     viewport_scroll_offset_is_zero: bool,
 ) -> bool {
     let mut node = layout_node;
-    while let Some(data) = arena.node_data_if_live(node) {
-        let kind = data.kind.get();
+    while let Some(row) = arena.node(node) {
+        let (kind, flags, parent) = (row.kind(), row.flags(), row.parent());
         if node_facts::kind_is_svg_box(kind) || kind == NodeKind::SVGSVGBox || kind == NodeKind::SVGForeignObjectBox {
             return false;
         }
 
-        if !node_facts::has_flag(data, NodeFlag::HasStyle) {
-            node = data.parent.get();
+        if flags & NodeFlag::HasStyle as u32 == 0 {
+            node = parent;
             continue;
         }
-        if let Some(style) = arena.node_style_if_live(node)
+        if let Some(style) = row.style()
             && (style_queries::has_css_transform(arena, node, style)
                 || style.transform().has_perspective
                 || style_queries::is_sticky_position(style))
@@ -38,7 +39,7 @@ pub(crate) fn can_compute_client_rects_without_visual_context_update(
         }
         let compensates_for_scroll =
             NodeFlag::CompensatesForHorizontalScroll as u32 | NodeFlag::CompensatesForVerticalScroll as u32;
-        if data.flags.get() & compensates_for_scroll != 0 {
+        if flags & compensates_for_scroll != 0 {
             return false;
         }
         // A scroll container's contents move, but its own border box does not.
@@ -46,30 +47,32 @@ pub(crate) fn can_compute_client_rects_without_visual_context_update(
             let scroll_offset_is_zero = if kind == NodeKind::Viewport {
                 viewport_scroll_offset_is_zero
             } else {
-                !node_facts::has_flag(data, NodeFlag::HasScrollOffset)
+                flags & NodeFlag::HasScrollOffset as u32 == 0
             };
             if !scroll_offset_is_zero && arena.paintable_row_is_populated(node) {
                 return false;
             }
         }
-        node = data.parent.get();
+        node = parent;
     }
     true
 }
 
 fn for_each_inline_piece_border_box_rect(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     inline_paintable: NodeSlotId,
     mut push_rect: impl FnMut(CssPixelRect),
 ) {
     let Some(root) = arena.inline_pieces_root(inline_paintable) else {
         return;
     };
-    let root_position = paintable_geometry::absolute_position(arena, root);
+    let root_positions = paintable_geometry::LineRootPositions::new(arena, root);
+    let root_side = arena.committed_side_data(root);
     with_inline_pieces(arena, inline_paintable, |piece, _| {
         if piece.is_geometry_only_placeholder {
             return true;
         }
+        let root_position = root_positions.of_line(root_side.lines(), piece.line_index as usize);
         push_rect(CssPixelRect::from(piece.border_box_rect).translated_by(root_position));
         true
     });
@@ -77,7 +80,7 @@ fn for_each_inline_piece_border_box_rect(
 
 // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
 pub(crate) fn for_each_client_rect(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     layout_node: NodeSlotId,
     rect_to_viewport_transform: Option<&RectToViewportTransform<'_>>,
     mut push_rect: impl FnMut(CssPixelRect),
@@ -90,6 +93,20 @@ pub(crate) fn for_each_client_rect(
             rect,
         ));
     };
+    // INTEROP: A line break has no box fragments of its own, but browsers report a zero-width rect where it ends its
+    //          line.
+    if arena.node_kind_if_live(layout_node) == Some(NodeKind::BreakNode) {
+        if let Some((line_root, rect)) = line_break_rect(arena, layout_node) {
+            push_rect(transform_rect_to_viewport_or_identity(
+                rect_to_viewport_transform,
+                arena,
+                line_root,
+                rect,
+            ));
+        }
+        return;
+    }
+
     let row_is_populated = arena.paintable_row_is_populated(layout_node);
 
     // FIXME: 2. If the element has an associated SVG layout box return a DOMRectList object containing a single
@@ -118,13 +135,63 @@ pub(crate) fn for_each_client_rect(
     }
 
     if row_is_populated {
-        push_rect_in_viewport_space(paintable_geometry::absolute_border_box_rect(arena, layout_node));
+        for index in 0..paintable_geometry::fragment_count(arena, layout_node) {
+            push_rect_in_viewport_space(paintable_geometry::absolute_fragment_border_box_rect(
+                arena,
+                layout_node,
+                index,
+            ));
+        }
     }
+}
+
+/// The line root whose line the forced line break ends, and the zero-width rect of the break at the inline end of
+/// that line's content, or at the inline start of the line where it is empty.
+fn line_break_rect(arena: &impl PaintRead, break_node: NodeSlotId) -> Option<(NodeSlotId, CssPixelRect)> {
+    let mut ancestor = arena.node(break_node)?.parent();
+    while let Some(row) = arena.node(ancestor) {
+        if arena.paintable_row_is_populated(ancestor) {
+            let side = arena.committed_side_data(ancestor);
+            if let Some(line) = side.lines().iter().find(|line| line.forced_break_node == break_node) {
+                let style = arena.node_style_if_live(ancestor)?;
+                let root_position =
+                    paintable_geometry::LineRootPositions::new(arena, ancestor).of_fragment(line.box_fragment);
+                let line_rect = CssPixelRect::from(line.rect).translated_by(root_position);
+                let inline_axis_is_horizontal =
+                    style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB;
+                let at_high_side = (line.fragment_count == 0) == style.inline_axis_is_reverse();
+                let zero = CssPixels::default();
+                let rect = match (inline_axis_is_horizontal, at_high_side) {
+                    (true, false) => CssPixelRect {
+                        width: zero,
+                        ..line_rect
+                    },
+                    (true, true) => CssPixelRect {
+                        x: line_rect.x + line_rect.width,
+                        width: zero,
+                        ..line_rect
+                    },
+                    (false, false) => CssPixelRect {
+                        height: zero,
+                        ..line_rect
+                    },
+                    (false, true) => CssPixelRect {
+                        y: line_rect.y + line_rect.height,
+                        height: zero,
+                        ..line_rect
+                    },
+                };
+                return Some((ancestor, rect));
+            }
+        }
+        ancestor = row.parent();
+    }
+    None
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
 pub(crate) fn bounding_client_rect(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     layout_node: NodeSlotId,
     rect_to_viewport_transform: Option<&RectToViewportTransform<'_>>,
 ) -> CssPixelRect {

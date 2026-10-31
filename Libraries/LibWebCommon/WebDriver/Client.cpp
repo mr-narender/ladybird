@@ -115,6 +115,7 @@ static constexpr auto s_webdriver_endpoints = Array {
     ROUTE(GET, "/session/:session_id/screenshot"sv, take_screenshot),
     ROUTE(GET, "/session/:session_id/element/:element_id/screenshot"sv, take_element_screenshot),
     ROUTE(POST, "/session/:session_id/print"sv, print_page),
+    ROUTE(POST, "/session/:session_id/permissions"sv, set_permission),
 };
 
 // https://w3c.github.io/webdriver/#dfn-match-a-request
@@ -441,6 +442,9 @@ ErrorOr<void, Client::WrappedError> Client::send_error_response(HTTP::HttpReques
 
 void Client::log_response(HTTP::HttpRequest const& request, unsigned code)
 {
+    // A test harness sends a dozen commands per test and captures everything this process prints.
+    if (code == 200 && !WEBDRIVER_DEBUG)
+        return;
     outln("{} :: {:03d} :: {} {}", AK::UnixDateTime::now().to_byte_string(), code, request.method_name(), request.resource());
 }
 

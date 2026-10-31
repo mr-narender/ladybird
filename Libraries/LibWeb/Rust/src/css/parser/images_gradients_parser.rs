@@ -40,26 +40,19 @@ fn value_list(values: Vec<StyleValueData>) -> StyleValueData {
     }
 }
 
-fn context_bytes(pointer: *const u8, length: usize) -> Option<&'static [u8]> {
-    if pointer.is_null() {
-        return (length == 0).then_some(&[]);
-    }
-    Some(unsafe { std::slice::from_raw_parts(pointer, length) })
-}
-
-fn image_resource_context(context: &ParseContext) -> Option<ImageResourceContext> {
-    super::stylesheet_cache::record_base_url_dependency();
-    let base_url = context_bytes(context.document_base_url, context.document_base_url_length)?;
-    Some(ImageResourceContext {
-        base_url: RetainedString::from_ascii(std::str::from_utf8(base_url).ok()?.to_owned()),
-        has_base_url: !base_url.is_empty(),
+fn image_resource_context() -> ImageResourceContext {
+    // The stylesheet supplies its resource context when the value is computed. Inline images
+    // follow their element's document, which can change after parsing in a template document.
+    ImageResourceContext {
+        base_url: RetainedString::from_ascii(String::new()),
+        has_base_url: false,
         has_parent_style_sheet_origin_clean: false,
         parent_style_sheet_origin_clean: false,
         should_absolutize_url_for_computed_value: false,
-    })
+    }
 }
 
-fn image_from_url(context: &ParseContext, url: StyleValueData) -> Option<StyleValueData> {
+fn image_from_url(url: StyleValueData) -> Option<StyleValueData> {
     let StyleValueData::Url {
         url,
         url_type,
@@ -72,16 +65,16 @@ fn image_from_url(context: &ParseContext, url: StyleValueData) -> Option<StyleVa
         url,
         url_type,
         url_modifiers: modifiers,
-        resource_context: image_resource_context(context)?,
+        resource_context: image_resource_context(),
     })
 }
 
-fn image_from_string(context: &ParseContext, string: &[u16]) -> Option<StyleValueData> {
+fn image_from_string(string: &[u16]) -> Option<StyleValueData> {
     Some(StyleValueData::Image {
         url: RetainedString::from_utf16(string)?,
         url_type: 0,
         url_modifiers: RetainedRequestUrlModifierList::from_retained_modifiers(Vec::new()),
-        resource_context: image_resource_context(context)?,
+        resource_context: image_resource_context(),
     })
 }
 
@@ -107,7 +100,7 @@ fn parse_image_set(context: &ParseContext, property: u16, arguments: &[Component
         let mut tokens = TokenStream::new(option);
         tokens.discard_whitespace();
         let image = if let Some(string) = tokens.next_token().string() {
-            let image = image_from_string(context, string)?;
+            let image = image_from_string(string)?;
             tokens.discard_a_token();
             image
         } else {
@@ -633,11 +626,8 @@ pub(crate) fn parse_image_value(
 ) -> Option<StyleValueData> {
     tokens.discard_whitespace();
     if let Some(url) = parse_url_value(context, tokens.next_token()) {
-        let is_fragment = matches!(&url, StyleValueData::Url { url, .. } if url.is_fragment());
-        if !is_fragment {
-            tokens.discard_a_token();
-            return image_from_url(context, url);
-        }
+        tokens.discard_a_token();
+        return image_from_url(url);
     }
     if allow_image_set
         && let Some((name, arguments)) = tokens.next_token().function()
@@ -654,7 +644,46 @@ pub(crate) fn parse_image_value(
         tokens.discard_a_token();
         return Some(parsed);
     }
+    if let Some((name, arguments)) = tokens.next_token().function()
+        && equals_ascii_case_insensitive(name, b"light-dark")
+        && let Some(parsed) = parse_light_dark_image(context, property, arguments, allow_image_set)
+    {
+        tokens.discard_a_token();
+        return Some(parsed);
+    }
     None
+}
+
+// https://drafts.csswg.org/css-color-5/#light-dark
+fn parse_light_dark_image(
+    context: &ParseContext,
+    property: u16,
+    arguments: &[ComponentValue],
+    allow_image_set: bool,
+) -> Option<StyleValueData> {
+    // <light-dark-image> = light-dark( [ <image> | none ] , [ <image> | none ] )
+    // FIXME: Support none, which computes to image(transparent).
+    let mut tokens = TokenStream::new(arguments);
+    let light = parse_image_value(context, property, &mut tokens, allow_image_set)?;
+    tokens.discard_whitespace();
+    if !tokens.next_token().is_comma() {
+        return None;
+    }
+    tokens.discard_a_token();
+    let dark = parse_image_value(context, property, &mut tokens, allow_image_set)?;
+    tokens.discard_whitespace();
+    if tokens.has_next_token() {
+        return None;
+    }
+    Some(StyleValueData::LightDark {
+        color_base: crate::css::style_value::ColorBase {
+            has_color_type: false,
+            color_type: 0,
+            color_syntax: crate::css::value_codes::COLOR_SYNTAX_MODERN,
+        },
+        light: retained(light),
+        dark: retained(dark),
+    })
 }
 
 pub(crate) fn is_image_function_name(name: &[u16]) -> bool {
@@ -686,14 +715,18 @@ fn parse_image_or_none(context: &ParseContext, property: u16, values: &[Componen
         StyleValueData::Keyword {
             keyword: crate::css::css_enums::keyword::NONE,
         }
-    } else if let Some(image) = parse_image_value(context, property, &mut tokens, true) {
-        image
-    } else if property == property_id::MASK_IMAGE {
-        let url = parse_url_value(context, tokens.next_token())?;
+    } else if property == property_id::MASK_IMAGE
+        && let Some(url) = parse_url_value(context, tokens.next_token())
+    {
         tokens.discard_a_token();
-        url
+        if matches!(&url, StyleValueData::Url { url, .. } if url.is_fragment()) {
+            // NB: Preserve the SVG resource path for local mask references.
+            url
+        } else {
+            image_from_url(url)?
+        }
     } else {
-        return None;
+        parse_image_value(context, property, &mut tokens, true)?
     };
     tokens.discard_whitespace();
     (!tokens.has_next_token()).then_some(parsed)
@@ -729,23 +762,8 @@ mod tests {
     use crate::css::css_tokenizer::tokenize_for_parser;
     use crate::css::parser::component_value::consume_a_list_of_component_values;
 
-    fn context() -> ParseContext {
-        ParseContext {
-            in_quirks_mode: false,
-            is_svg_presentation_attribute: false,
-            is_substituted_value: false,
-            contains_attr_tainted_values: false,
-            is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index: std::ptr::null_mut(),
-        }
+    fn context() -> ParseContext<'static> {
+        ParseContext::default()
     }
 
     fn parse(property: u16, source: &str) -> ParseOutcome {
@@ -777,7 +795,15 @@ mod tests {
             parse(property_id::BACKGROUND_IMAGE, "none, url(image.png)"),
             ParseOutcome::Parsed(_)
         ));
-        for source in ["image-set()", "image-set(url(one.png) 1x 2x)", "url(#mask)"] {
+        let ParseOutcome::Parsed(value) = parse(property_id::BACKGROUND_IMAGE, "url(#mask)") else {
+            panic!("fragment background image should parse");
+        };
+        let StyleValueData::ValueList { values, .. } = &*value else {
+            panic!("background-image should be a list");
+        };
+        assert_eq!(values.as_slice().len(), 1);
+        assert!(matches!(values.as_slice()[0].data(), StyleValueData::Image { .. }));
+        for source in ["image-set()", "image-set(url(one.png) 1x 2x)"] {
             assert!(matches!(
                 parse(property_id::BACKGROUND_IMAGE, source),
                 ParseOutcome::NotHandled

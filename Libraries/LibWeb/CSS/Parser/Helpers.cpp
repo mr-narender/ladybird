@@ -91,9 +91,9 @@ Optional<CSS::SelectorList> parse_selector(CSS::Parser::ParsingParams const& con
     return CSS::Parser::Parser { context }.parse_as_selector(selector_text);
 }
 
-Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const& context, Utf16View selector_text)
+Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const& context, Utf16View selector_text, CSS::Parser::PseudoElementParsingMode mode)
 {
-    return CSS::Parser::Parser { context }.parse_as_pseudo_element_selector(selector_text);
+    return CSS::Parser::Parser { context }.parse_as_pseudo_element_selector(selector_text, mode);
 }
 
 Optional<CSS::RustQueryHandle> parse_css_supports(CSS::Parser::ParsingParams const& context, Utf16View string)
@@ -171,7 +171,7 @@ ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_en
         return Error::from_string_literal("No Decoder found");
     }
     // 2. Decode stylesheet’s stream of bytes with fallback encoding fallback, and return the result.
-    return TextCodec::convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, encoded_string);
+    return TextCodec::decode_to_utf16(encoded_string, *decoder);
 }
 
 bool is_valid_animation_name_custom_ident(Utf16View ident)

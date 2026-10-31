@@ -6,7 +6,7 @@
 
 use crate::font::FontHandle;
 use std::ffi::c_void;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -41,7 +41,9 @@ pub struct DrawGlyph {
     pub length_in_code_units: usize,
     pub glyph_width: f32,
     pub glyph_id: u32,
+    pub cluster_start: u32,
     pub should_paint: bool,
+    pub is_rtl: bool,
 }
 
 unsafe extern "C" {
@@ -57,6 +59,14 @@ unsafe extern "C" {
     );
 
     fn ladybird_gfx_glyph_run_bounding_box(
+        font: *const c_void,
+        glyphs: *const DrawGlyph,
+        glyph_count: usize,
+        scale: f32,
+        out_rect: *mut f32,
+    );
+
+    fn ladybird_gfx_glyph_run_ink_bounding_box(
         font: *const c_void,
         glyphs: *const DrawGlyph,
         glyph_count: usize,
@@ -83,6 +93,25 @@ pub fn glyph_run_bounding_box(font: &FontHandle, glyphs: &[DrawGlyph], scale: f3
     // for the synchronous call, which fills the four floats out_rect points at.
     unsafe {
         ladybird_gfx_glyph_run_bounding_box(
+            font.as_raw(),
+            glyphs.as_ptr(),
+            glyphs.len(),
+            scale,
+            out_rect.as_mut_ptr(),
+        );
+    }
+    out_rect
+}
+
+/// Tight bounds of the ink of the painted glyphs, from their own extents, in the coordinates of
+/// `glyph_run_bounding_box()`, as x, y, width and height. Empty if no painted glyph has ink.
+#[must_use]
+pub fn glyph_run_ink_bounding_box(font: &FontHandle, glyphs: &[DrawGlyph], scale: f32) -> [f32; 4] {
+    let mut out_rect = [0.0f32; 4];
+    // SAFETY: The handle keeps the font live and the glyph slice stays valid
+    // for the synchronous call, which fills the four floats out_rect points at.
+    unsafe {
+        ladybird_gfx_glyph_run_ink_bounding_box(
             font.as_raw(),
             glyphs.as_ptr(),
             glyphs.len(),
@@ -125,7 +154,7 @@ pub fn glyph_run_glyph_intercepts(
 
 #[derive(Clone, Debug)]
 pub enum GlyphBuffer {
-    Shared(Rc<[DrawGlyph]>),
+    Shared(Arc<[DrawGlyph]>),
     Owned(Vec<DrawGlyph>),
 }
 
@@ -227,7 +256,7 @@ impl ShapeParams {
 }
 
 struct CachedShape {
-    glyphs: Rc<[DrawGlyph]>,
+    glyphs: Arc<[DrawGlyph]>,
     width: f32,
     trailing_whitespace_length_in_code_units: usize,
     trailing_whitespace_advance: f32,
@@ -378,11 +407,11 @@ fn shape_text_uncached(
         let shape = unsafe { &mut *sink.cast::<Option<CachedShape>>() };
         assert!(glyph_count == 0 || !glyphs.is_null());
         let glyphs = if glyph_count == 0 {
-            Rc::from([])
+            Arc::from([])
         } else {
             // SAFETY: The C++ side hands a pointer to glyph_count glyphs that
             // outlive the callback.
-            Rc::from(unsafe { std::slice::from_raw_parts(glyphs, glyph_count) })
+            Arc::from(unsafe { ak::slice_from_raw_parts(glyphs, glyph_count) })
         };
         *shape = Some(CachedShape {
             glyphs,
@@ -496,7 +525,7 @@ pub unsafe extern "C" fn ladybird_gfx_shape_text_cached(
     let text = if length == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(text, length) }
+        unsafe { ak::slice_from_raw_parts(text, length) }
     };
     let params = ShapeParams {
         text_type,
@@ -527,7 +556,7 @@ mod shaping_cache_tests {
 
     fn shape_with_glyph_count(glyph_count: usize) -> CachedShape {
         CachedShape {
-            glyphs: Rc::from(vec![DrawGlyph::default(); glyph_count]),
+            glyphs: Arc::from(vec![DrawGlyph::default(); glyph_count]),
             width: glyph_count as f32,
             trailing_whitespace_length_in_code_units: 0,
             trailing_whitespace_advance: 0.0,

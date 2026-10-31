@@ -208,7 +208,13 @@ impl<'a> Lexer<'a> {
                         .trim_start_matches("0x")
                         .trim_start_matches("0X")
                         .replace('_', "");
-                    let value = i64::from_str_radix(&digits, radix).map_err(|_| {
+                    // Hexadecimal literals spell bit patterns, so they may set the sign bit.
+                    let value = if radix == 16 {
+                        u64::from_str_radix(&digits, radix).map(|value| value as i64)
+                    } else {
+                        i64::from_str_radix(&digits, radix)
+                    };
+                    let value = value.map_err(|_| {
                         Diagnostic::new(
                             self.filename,
                             SourceSpan {
@@ -376,6 +382,26 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let mut profiling = false;
+        while self.current().kind == TokenKind::At {
+            self.advance();
+            let (annotation, span) = self.consume_identifier("inline function annotation")?;
+            if annotation != "profiling" {
+                return Err(Diagnostic::new(
+                    self.filename,
+                    span,
+                    format!("unknown inline function annotation '@{annotation}'"),
+                ));
+            }
+            if return_type.is_some() {
+                return Err(Diagnostic::new(
+                    self.filename,
+                    span,
+                    "a @profiling inline function cannot return a value",
+                ));
+            }
+            profiling = true;
+        }
         let body = if return_type.is_some() {
             self.parse_value_block()?
         } else {
@@ -385,6 +411,7 @@ impl<'a> Parser<'a> {
             name,
             parameters,
             return_type,
+            profiling,
             span: SourceSpan {
                 start,
                 end: body.span.end,
@@ -406,7 +433,16 @@ impl<'a> Parser<'a> {
             let (annotation, span) = self.consume_identifier("handler annotation")?;
             match annotation.as_str() {
                 "cold" => temperature = BlockTemperature::Cold,
-                "terminator" => {}
+                "terminator" | "fallthrough" | "fallback" => {}
+                // The bytecode metadata reads the opcode a raw-bytes handler
+                // dispatches on; the handler body does not depend on it.
+                "opcode" => {
+                    self.consume(TokenKind::LeftParen, "'('")?;
+                    while self.current().kind != TokenKind::RightParen {
+                        self.advance();
+                    }
+                    self.consume(TokenKind::RightParen, "')'")?;
+                }
                 _ => {
                     return Err(Diagnostic::new(
                         self.filename,
@@ -551,7 +587,6 @@ impl<'a> Parser<'a> {
                 | "ObjectPropertyIteratorCacheIndex"
                 | "ObjectShapeCacheIndex"
                 | "PropertyKeyTableIndex"
-                | "RegexTableIndex"
                 | "StringTableIndex"
                 | "TemplateObjectCacheIndex"
         ) {

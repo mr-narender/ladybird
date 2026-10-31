@@ -19,9 +19,12 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/SelectionchangeEventDispatching.h>
+#include <LibWeb/DOM/StaticRange.h>
 #include <LibWeb/DOM/SubtreeInsertionScope.h>
 #include <LibWeb/Editing/EditCommand.h>
 #include <LibWeb/Editing/EditingHistory.h>
+#include <LibWeb/Editing/SpellCheckController.h>
+#include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
@@ -37,9 +40,12 @@
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/ValidityState.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Page/EventHandler.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/HitTestDisplayList.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWeb/VisualLines.h>
 #include <LibWebCommon/Infra/Strings.h>
@@ -96,11 +102,6 @@ Utf16String const& FormAssociatedElement::face_validation_message() const
 FormAssociatedElement::FACESubmissionValue const& FormAssociatedElement::face_submission_value() const
 {
     return face_rare_data().submission_value;
-}
-
-FormAssociatedElement::FACESubmissionValue const& FormAssociatedElement::face_state() const
-{
-    return face_rare_data().state;
 }
 
 static SelectionDirection string_to_selection_direction(Utf16View value)
@@ -291,7 +292,7 @@ void FormAssociatedElement::form_node_was_moved()
 
 void FormAssociatedElement::reposition_associated_elements_after_move(Badge<DOM::Element>, DOM::Node& moved_subtree_root)
 {
-    HashMap<GC::Ref<HTMLFormElement>, Vector<GC::Ref<HTMLElement>>> moved_elements_by_form;
+    GC::RootHashMap<GC::Ref<HTMLFormElement>, GC::RootVector<GC::Ref<HTMLElement>>> moved_elements_by_form;
     moved_subtree_root.for_each_in_inclusive_subtree_of_type<HTMLElement>([&](HTMLElement& element) {
         if (!element.is_form_associated_element())
             return TraversalDecision::Continue;
@@ -809,13 +810,13 @@ void FormAssociatedElement::RareData::visit_edges(JS::Cell::Visitor& visitor)
         [&visitor](GC::Ref<FileAPI::File> file) {
             visitor.visit(file);
         },
-        [](auto&) {});
+        [](auto&) { });
 
     face_rare_data->state.visit(
         [&visitor](GC::Ref<FileAPI::File> file) {
             visitor.visit(file);
         },
-        [](auto&) {});
+        [](auto&) { });
 }
 
 // A user-agent shadow tree's inner elements share their default declarations, parsed once, but each
@@ -844,7 +845,8 @@ void FormAssociatedTextControlElement::relevant_value_was_changed()
     auto relevant_value_length = the_relevant_value.length_in_code_units();
 
     // 1. If the element has a selection:
-    if (m_selection_start < m_selection_end) {
+    // NB: A selection the user extended backward has its start past its end.
+    if (m_selection_start != m_selection_end) {
         // 1. If the start of the selection is now past the end of the relevant value, set it to
         //    the end of the relevant value.
         if (m_selection_start > relevant_value_length)
@@ -865,8 +867,11 @@ void FormAssociatedTextControlElement::relevant_value_was_changed()
 
     // 2. Otherwise, the element must have a text entry cursor position position. If it is now past
     //    the end of the relevant value, set it to the end of the relevant value.
-    if (m_selection_start > relevant_value_length)
+    // NB: With no selection, m_selection_start and m_selection_end both hold the text entry cursor position.
+    if (m_selection_start > relevant_value_length) {
         m_selection_start = relevant_value_length;
+        m_selection_end = relevant_value_length;
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-select
@@ -875,11 +880,20 @@ WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::select()
     // 1. If this element is an input element, and either select() does not apply to this element
     //    or the corresponding control has no selectable text, return.
     auto& html_element = text_control_to_html_element();
-    if (is<HTMLInputElement>(html_element)) {
-        auto& input_element = static_cast<HTMLInputElement&>(html_element);
-        if (!input_element.select_applies() || !input_element.has_selectable_text())
-            return {};
-    }
+    auto select_does_not_apply = [&] {
+        auto* input_element = as_if<HTMLInputElement>(html_element);
+        return input_element && (!input_element->select_applies() || !input_element->has_selectable_text());
+    };
+    if (select_does_not_apply())
+        return {};
+
+    // INTEROP: select() also focuses the control, without scrolling it into view. Sites rely on this to focus an
+    //          input, e.g. Instagram's search box.
+    html_element.focus({ .prevent_scroll = true });
+
+    // AD-HOC: Focus event handlers may have changed the control's type, so check step 1 again.
+    if (select_does_not_apply())
+        return {};
 
     // 2. Set the selection range with 0 and infinity.
     set_the_selection_range(0, NumericLimits<WebIDL::UnsignedLong>::max());
@@ -926,7 +940,7 @@ WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_selection_start_
     }
 
     // 2. Let end be the value of this element's selectionEnd attribute.
-    auto end = m_selection_end;
+    auto end = selection_end();
 
     // 3. If end is less than the given value, set end to the given value.
     if (value.has_value() && end < value.value())
@@ -980,7 +994,7 @@ WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_selection_end_bi
 
     // 2. Set the selection range with the value of this element's selectionStart attribute, the
     //    given value, and the value of this element's selectionDirection attribute.
-    set_the_selection_range(m_selection_start, value, selection_direction_state());
+    set_the_selection_range(selection_start(), value, selection_direction_state());
     return {};
 }
 
@@ -1026,7 +1040,9 @@ WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_selection_direct
     //    throw an "InvalidStateError" DOMException.
     TRY(validate_selection_direction_applies(*this));
 
-    set_the_selection_range(m_selection_start, m_selection_end, string_to_selection_direction(optional_utf16_view(direction)));
+    // 2. Set the selection range with the value of this element's selectionStart attribute, the value of this
+    //    element's selectionEnd attribute, and the given value.
+    set_the_selection_range(selection_start(), selection_end(), string_to_selection_direction(optional_utf16_view(direction)));
     return {};
 }
 
@@ -1034,19 +1050,22 @@ WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_selection_direct
 {
     TRY(validate_selection_direction_applies(*this));
 
-    set_the_selection_range(m_selection_start, m_selection_end, string_to_selection_direction(direction));
+    set_the_selection_range(selection_start(), selection_end(), string_to_selection_direction(direction));
     return {};
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setrangetext
 WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_range_text_binding(Utf16View replacement)
 {
-    return set_range_text(replacement, m_selection_start, m_selection_end);
+    return set_range_text(replacement, selection_start(), selection_end());
 }
 
+// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setrangetext
 WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_range_text(Utf16String const& replacement)
 {
-    return set_range_text(replacement.utf16_view(), 0, replacement.length_in_code_units());
+    // 3. If the method has only one argument, then let start and end have the values of the selectionStart attribute
+    //    and the selectionEnd attribute respectively.
+    return set_range_text(replacement.utf16_view(), selection_start(), selection_end());
 }
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setrangetext
@@ -1087,10 +1106,10 @@ WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_range_text(Utf16
         end = relevant_value_length;
 
     // 7. Let selection start be the current value of the selectionStart attribute.
-    auto selection_start = m_selection_start;
+    auto selection_start = this->selection_start();
 
     // 8. Let selection end be the current value of the selectionEnd attribute.
-    auto selection_end = m_selection_end;
+    auto selection_end = this->selection_end();
 
     // 9. If start is less than end, delete the sequence of code units within the element's relevant value starting with
     //    the code unit at the startth position and ending with the code unit at the (end-1)th position.
@@ -1191,6 +1210,12 @@ WebIDL::ExceptionOr<void> FormAssociatedTextControlElement::set_selection_range(
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#set-the-selection-range
 void FormAssociatedTextControlElement::set_the_selection_range(Optional<WebIDL::UnsignedLong> start, Optional<WebIDL::UnsignedLong> end, SelectionDirection direction, SelectionSource source)
 {
+    // NB: A cursor reveal that an earlier execCommand() edit left pending is for the cursor that edit placed, so reveal
+    //     it before the selection moves. Edits that execCommand() is making right now set the selection here too, and
+    //     they keep their reveal pending.
+    if (m_cursor_reveal_after_edit == CursorRevealAfterEdit::Immediately)
+        reveal_cursor_if_pending();
+
     // 1. If start is null, let start be 0.
     start = start.value_or(0);
 
@@ -1213,6 +1238,11 @@ void FormAssociatedTextControlElement::set_the_selection_range(Optional<WebIDL::
     //    where there is no concept of an empty selection, this must set the cursor to be just
     //    before the character with offset end.
     new_selection_start = AK::min(new_selection_start, new_selection_end);
+
+    // NB: m_selection_start and m_selection_end hold the anchor and the focus of the selection. The focus of a
+    //     backward selection is its start, so that the user extends it from there.
+    if (direction == SelectionDirection::Backward)
+        swap(new_selection_start, new_selection_end);
 
     bool was_modified = m_selection_start != new_selection_start || m_selection_end != new_selection_end;
     m_selection_start = new_selection_start;
@@ -1278,7 +1308,7 @@ void FormAssociatedTextControlElement::handle_insert(Utf16FlyString const& input
     // Record the edit on the document's editing history so the user can undo it. Pastes never
     // coalesce with typing, like in the editing host path.
     auto& html_element = text_control_to_html_element();
-    auto category = input_type == UIEvents::InputTypes::insertFromPaste
+    auto category = first_is_one_of(input_type, UIEvents::InputTypes::insertFromPaste, UIEvents::InputTypes::insertReplacementText)
         ? Editing::UndoStep::Category::Other
         : Editing::UndoStep::Category::Insertion;
     auto history = html_element.document().editing_history();
@@ -1306,11 +1336,58 @@ void FormAssociatedTextControlElement::handle_insert(Utf16FlyString const& input
     // The input event's data attribute is only set for certain input types according to:
     // https://w3c.github.io/input-events/#overview
     Optional<Utf16String> data_for_input_event;
-    if (first_is_one_of(input_type, UIEvents::InputTypes::insertText, UIEvents::InputTypes::insertCompositionText, UIEvents::InputTypes::insertFromPaste))
+    if (first_is_one_of(input_type, UIEvents::InputTypes::insertText, UIEvents::InputTypes::insertCompositionText, UIEvents::InputTypes::insertFromPaste, UIEvents::InputTypes::insertReplacementText))
         data_for_input_event = Utf16String::from_utf16(data_for_insertion);
 
-    did_edit_text_node(input_type, data_for_input_event);
-    scroll_cursor_into_view();
+    did_edit_text_node(input_type, data_for_input_event, old_value);
+    html_element.document().spell_check_controller().did_user_edit(html_element);
+    html_element.document().writing_suggestion_controller().did_user_edit(html_element);
+    reveal_cursor_after_edit();
+}
+
+GC::Ptr<DOM::StaticRange> FormAssociatedTextControlElement::deletion_target_range(Utf16FlyString const& input_type)
+{
+    auto text = form_associated_element_to_text_node();
+    if (!text || !static_cast<FormAssociatedElement&>(text_control_to_html_element()).is_mutable())
+        return nullptr;
+    auto start = min(selection_start(), text->length());
+    auto end = min(selection_end(), text->length());
+    if (start == end) {
+        if (input_type == UIEvents::InputTypes::deleteContentBackward) {
+            start = text->grapheme_segmenter().previous_boundary(start).value_or(start);
+        } else if (input_type == UIEvents::InputTypes::deleteContentForward) {
+            end = text->grapheme_segmenter().next_boundary(end).value_or(end);
+        } else if (input_type == UIEvents::InputTypes::deleteWordBackward) {
+            while (true) {
+                auto boundary = text->word_segmenter().previous_boundary(start);
+                if (!boundary.has_value())
+                    break;
+                auto word = text->data().substring_view(*boundary, start - *boundary);
+                start = *boundary;
+                if (!Unicode::Segmenter::should_continue_beyond_word(word))
+                    break;
+            }
+        } else if (input_type == UIEvents::InputTypes::deleteWordForward) {
+            while (true) {
+                auto boundary = text->word_segmenter().next_boundary(end);
+                if (!boundary.has_value())
+                    break;
+                auto word = text->data().substring_view(end, *boundary - end);
+                end = *boundary;
+                if (!Unicode::Segmenter::should_continue_beyond_word(word))
+                    break;
+            }
+        } else if (input_type == UIEvents::InputTypes::deleteHardLineForward) {
+            auto value = text->data().utf16_view();
+            while (end < text->length() && value.code_unit_at(end) != '\n')
+                ++end;
+            if (start == end && end < text->length())
+                ++end;
+        }
+    }
+    if (start == end)
+        return nullptr;
+    return text->heap().allocate<DOM::StaticRange>(*text, start, *text, end);
 }
 
 void FormAssociatedTextControlElement::handle_delete(Utf16FlyString const& input_type, [[maybe_unused]] DispatchInputEvent dispatch_input_event)
@@ -1319,18 +1396,11 @@ void FormAssociatedTextControlElement::handle_delete(Utf16FlyString const& input
     if (!text_node || !static_cast<FormAssociatedElement&>(text_control_to_html_element()).is_mutable())
         return;
 
-    auto selection_start = this->selection_start();
-    auto selection_end = this->selection_end();
-
-    if (selection_start == selection_end) {
-        if (input_type == UIEvents::InputTypes::deleteContentBackward) {
-            if (auto offset = text_node->grapheme_segmenter().previous_boundary(m_selection_end); offset.has_value())
-                selection_start = *offset;
-        } else {
-            if (auto offset = text_node->grapheme_segmenter().next_boundary(m_selection_end); offset.has_value())
-                selection_end = *offset;
-        }
-    }
+    auto range = deletion_target_range(input_type);
+    if (!range)
+        return;
+    auto selection_start = range->start_offset();
+    auto selection_end = range->end_offset();
 
     // Record the edit on the document's editing history so the user can undo it. Backward and
     // forward deletion runs coalesce separately, and cuts never coalesce, like in the editing
@@ -1359,8 +1429,10 @@ void FormAssociatedTextControlElement::handle_delete(Utf16FlyString const& input
     }
     history->end_recording();
 
-    did_edit_text_node(input_type, {});
-    scroll_cursor_into_view();
+    did_edit_text_node(input_type, {}, old_value);
+    html_element.document().spell_check_controller().did_user_edit(html_element);
+    html_element.document().writing_suggestion_controller().did_user_edit(html_element);
+    reveal_cursor_after_edit();
 }
 
 Optional<Utf16String> FormAssociatedTextControlElement::selected_text_for_stringifier() const
@@ -1386,15 +1458,39 @@ void FormAssociatedTextControlElement::move_selection_end_to(size_t offset, Text
         m_selection_start = offset;
     m_selection_end = offset;
     m_selection_end_affinity = affinity;
+    if (collapse == CollapseSelection::Yes || m_selection_start == m_selection_end)
+        m_selection_direction = SelectionDirection::None;
+    else
+        m_selection_direction = m_selection_end < m_selection_start ? SelectionDirection::Backward : SelectionDirection::Forward;
 
     // NB: Caret movement ends typing coalescence in the editing history.
     if (auto history = text_control_to_html_element().document().editing_history_if_exists())
         history->selection_changed();
 }
 
+void FormAssociatedTextControlElement::reveal_cursor_after_edit()
+{
+    // NB: Only the focused text control reveals its cursor in the rendering update, so a control that lost focus during
+    //     the edit reveals it right away.
+    if (m_cursor_reveal_after_edit == CursorRevealAfterEdit::InNextRenderingUpdate && text_control_to_html_element().is_focused()) {
+        m_has_pending_cursor_reveal = true;
+        return;
+    }
+    scroll_cursor_into_view();
+}
+
+void FormAssociatedTextControlElement::reveal_cursor_if_pending()
+{
+    if (m_has_pending_cursor_reveal)
+        scroll_cursor_into_view();
+}
+
 void FormAssociatedTextControlElement::scroll_cursor_into_view()
 {
+    m_has_pending_cursor_reveal = false;
+
     auto& element = text_control_to_html_element();
+    Layout::ForcedReadScope read { element.document() };
     element.document().update_layout(DOM::UpdateLayoutReason::ScrollCursorIntoView);
 
     auto text_node = form_associated_element_to_text_node();
@@ -1406,7 +1502,7 @@ void FormAssociatedTextControlElement::scroll_cursor_into_view()
     auto scroll_block_direction = is<HTMLInputElement>(element)
         ? Painting::ScrollBlockDirection::No
         : Painting::ScrollBlockDirection::Yes;
-    Painting::scroll_text_offset_into_view(*text_node, m_selection_end, m_selection_end_affinity, scroll_block_direction);
+    Painting::scroll_text_offset_into_view(read, *text_node, m_selection_end, m_selection_end_affinity, scroll_block_direction);
 }
 
 void FormAssociatedTextControlElement::selection_was_changed(SelectionSource source)
@@ -1420,17 +1516,20 @@ void FormAssociatedTextControlElement::selection_was_changed(SelectionSource sou
         VERIFY_NOT_REACHED();
     }
 
+    if (auto* controller = element.document().spell_check_controller_if_exists())
+        controller->did_change_selection();
+    if (auto* controller = element.document().writing_suggestion_controller_if_exists())
+        controller->did_change_selection();
+
+    // NB: Called during selection change handling, layout may be stale. The render state finds the text's box as it
+    //     applies the repaint, so the change reads nothing of it.
     auto text_node = form_associated_element_to_text_node();
-    if (!text_node)
-        return;
-    // NB: Called during selection change handling, layout may be stale.
-    auto* layout_text_node = as_if<Layout::TextNode>(text_node->unsafe_layout_node());
-    if (!layout_text_node)
+    if (!text_node || !text_node->has_layout_box())
         return;
 
     if (m_selection_start == m_selection_end)
         text_node->document().reset_cursor_blink_cycle();
-    layout_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
+    text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     // AD-HOC: Only scroll the cursor into view for UI-driven selection changes (like keyboard input). Programmatic
     //         changes (input.value, setSelectionRange) do not cause the cursor to scroll into view. This matches the
@@ -1513,6 +1612,77 @@ void FormAssociatedTextControlElement::move_cursor_to_end_of_current_line(Collap
         return;
     auto new_position = find_visual_line_end(*text_node, m_selection_end, m_selection_end_affinity);
     move_selection_end_to(new_position.offset, new_position.affinity, collapse);
+    selection_was_changed(SelectionSource::UI);
+}
+
+void FormAssociatedTextControlElement::move_cursor_to_start_of_paragraph(CollapseSelection collapse)
+{
+    auto text = form_associated_element_to_text_node();
+    if (!text)
+        return;
+    auto value = text->data().utf16_view();
+    auto offset = min(static_cast<size_t>(m_selection_end), value.length_in_code_units());
+    while (offset > 0 && value.code_unit_at(offset - 1) != '\n')
+        --offset;
+    move_selection_end_to(offset, TextAffinity::Downstream, collapse);
+    selection_was_changed(SelectionSource::UI);
+}
+
+void FormAssociatedTextControlElement::move_cursor_to_end_of_paragraph(CollapseSelection collapse)
+{
+    auto text = form_associated_element_to_text_node();
+    if (!text)
+        return;
+    auto value = text->data().utf16_view();
+    auto offset = min(static_cast<size_t>(m_selection_end), value.length_in_code_units());
+    while (offset < value.length_in_code_units() && value.code_unit_at(offset) != '\n')
+        ++offset;
+    move_selection_end_to(offset, TextAffinity::Downstream, collapse);
+    selection_was_changed(SelectionSource::UI);
+}
+
+void FormAssociatedTextControlElement::move_cursor_by_page(bool forward, CollapseSelection collapse)
+{
+    auto text = form_associated_element_to_text_node();
+    auto& element = text_control_to_html_element();
+    if (!text)
+        return;
+    Layout::ForcedReadScope read { element.document() };
+    element.document().update_layout_if_needed_for_node(element, DOM::UpdateLayoutReason::CursorLineNavigation);
+    auto* layout = element.layout_node(read);
+    auto window = element.document().window();
+    if (!layout || !window)
+        return;
+    auto page_height = min(Painting::absolute_padding_box_rect(*layout).height().to_int(), window->inner_height());
+    if (page_height <= 0)
+        return;
+    auto distance = static_cast<i32>(page_height * 0.875);
+#ifdef AK_OS_MACOS
+    distance = max(distance, page_height - 40);
+#endif
+    auto position = compute_cursor_position_by_page(*text, m_selection_end, m_selection_end_affinity, forward, max(distance, 1));
+    if (!position.has_value())
+        return;
+    move_selection_end_to(position->offset, position->affinity, collapse);
+    selection_was_changed(SelectionSource::UI);
+}
+
+void FormAssociatedTextControlElement::move_cursor_to_physical_line_boundary(bool left, CollapseSelection collapse)
+{
+    auto text = form_associated_element_to_text_node();
+    if (!text)
+        return;
+    auto& document = text_control_to_html_element().document();
+    Layout::ForcedReadScope read { document };
+    document.update_layout_if_needed_for_node(*text, DOM::UpdateLayoutReason::CursorLineNavigation);
+    auto position = document.caret_position_at_line_edge(read, *text, m_selection_end, m_selection_end_affinity,
+        left ? Painting::CaretLineEdge::Left : Painting::CaretLineEdge::Right);
+    if (!position.has_value())
+        return;
+    auto boundary = position->boundary_point();
+    if (!boundary.has_value() || boundary->node != text)
+        return;
+    move_selection_end_to(boundary->offset, position->affinity, collapse);
     selection_was_changed(SelectionSource::UI);
 }
 
@@ -1621,7 +1791,7 @@ GC::Ptr<DOM::Position> FormAssociatedTextControlElement::cursor_position() const
         return nullptr;
     if (m_selection_start != m_selection_end)
         return nullptr;
-    return DOM::Position::create(const_cast<DOM::Text&>(*node), m_selection_start);
+    return DOM::Position::create(const_cast<DOM::Text&>(*node), m_selection_start, m_selection_end_affinity);
 }
 
 GC::Ref<JS::Cell> FormAssociatedTextControlElement::as_cell()

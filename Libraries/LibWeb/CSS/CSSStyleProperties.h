@@ -10,6 +10,7 @@
 #include <AK/OwnPtr.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <LibGC/Weak.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
 #include <LibWeb/CSS/GeneratedCSSStyleProperties.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
@@ -29,8 +30,9 @@ public:
 
     [[nodiscard]] static GC::Ref<CSSStyleProperties> create_resolved_style(Optional<DOM::AbstractElement>);
     [[nodiscard]] static GC::Ref<CSSStyleProperties> create_element_inline_style(DOM::AbstractElement);
+    [[nodiscard]] static GC::Ref<CSSStyleProperties> create_element_inline_style(DOM::AbstractElement, RustDeclarationBlock);
 
-    virtual ~CSSStyleProperties() override = default;
+    virtual ~CSSStyleProperties() override;
 
     virtual size_t length() const override;
     virtual Utf16String item(size_t index) const override;
@@ -55,17 +57,6 @@ public:
     u64 identity() const { return m_declarations.identity(); }
     u64 revision() const { return m_declarations.revision(); }
 
-    // Every custom property a var() in this block's values refers to, and whether each reference
-    // names its property with a plain identifier. A reference that substitutes its name can read
-    // anything, so no list of names stands for it.
-    struct CustomPropertyReferences {
-        AK_ALLOC_WITH_KMALLOC;
-
-        Vector<Utf16FlyString> names;
-        bool all_references_visible { true };
-    };
-    CustomPropertyReferences const& custom_property_references() const;
-
     virtual bool has_property(PropertyNameAndID const&) const override;
     bool has_property(PropertyID) const;
 
@@ -85,9 +76,10 @@ public:
     // Takes `source`'s declarations as they are, sharing them until either side changes.
     void set_declarations_from(CSSStyleProperties const& source);
 
-private:
+protected:
     CSSStyleProperties(Computed, Readonly, RustDeclarationBlock, Optional<DOM::AbstractElement>);
 
+private:
     virtual size_t external_memory_size() const override;
 
     RefPtr<StyleValue const> style_value_for_computed_property(Layout::NodeWithStyle const&, PropertyID) const;
@@ -100,9 +92,13 @@ private:
 
     void invalidate_owners();
 
+    Vector<Utf16FlyString> const& computed_custom_property_names() const;
+
     RustDeclarationBlock m_declarations;
-    mutable OwnPtr<CustomPropertyReferences> m_custom_property_references;
-    mutable u64 m_custom_property_references_revision { 0 };
+    mutable Vector<Utf16FlyString> m_cached_computed_custom_property_names;
+    mutable GC::Weak<DOM::Document> m_cached_computed_custom_property_document;
+    mutable RefPtr<CustomPropertyData const> m_cached_computed_custom_property_data;
+    mutable u64 m_cached_custom_property_registration_generation { 0 };
 };
 
 #undef ENUMERATE_GENERATED_CSS_STYLE_PROPERTIES

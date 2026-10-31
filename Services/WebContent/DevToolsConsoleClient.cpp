@@ -16,6 +16,7 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/WebDriver/BiDi/BiDi.h>
 #include <WebContent/ConsoleGlobalEnvironmentExtensions.h>
 #include <WebContent/DevToolsConsoleClient.h>
 #include <WebContent/PageClient.h>
@@ -27,7 +28,7 @@ GC_DEFINE_ALLOCATOR(DevToolsConsoleClient);
 GC::Ref<DevToolsConsoleClient> DevToolsConsoleClient::create(JS::Realm& realm, JS::Console& console, PageClient& client)
 {
     auto& window = Web::HTML::relevant_window(realm.global_object());
-    auto console_global_environment_extensions = realm.create<ConsoleGlobalEnvironmentExtensions>(realm, window);
+    auto console_global_environment_extensions = ConsoleGlobalEnvironmentExtensions::create(realm, window);
 
     return GC::Heap::the().allocate<DevToolsConsoleClient>(console, client, console_global_environment_extensions);
 }
@@ -97,10 +98,24 @@ JsonValue DevToolsConsoleClient::serialize_value(JS::Realm& realm, JS::Value val
     return {};
 }
 
+void DevToolsConsoleClient::visit_edges(JS::Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    m_object_table.visit_edges(visitor);
+}
+
 void DevToolsConsoleClient::handle_result(JS::Value result)
 {
-    auto& settings = Web::HTML::relevant_settings_object(*m_console_global_environment_extensions);
-    m_client->did_execute_js_console_input(serialize_value(settings.realm(), result));
+    auto& settings = Web::HTML::relevant_settings_object(m_console_global_environment_extensions->binding_object());
+    Web::HTML::TemporaryExecutionContext execution_context { settings.realm() };
+    m_client->did_execute_js_console_input(m_object_table.serialize_value(result));
+}
+
+ErrorOr<WebView::DebuggerObjectProperties> DevToolsConsoleClient::properties_for_object(u64 object_id)
+{
+    auto& settings = Web::HTML::relevant_settings_object(m_console_global_environment_extensions->binding_object());
+    Web::HTML::TemporaryExecutionContext execution_context { settings.realm() };
+    return m_object_table.properties_for_object(object_id);
 }
 
 void DevToolsConsoleClient::report_exception(Utf16View name, Utf16View message, JS::ErrorData const& error_data, bool in_promise)
@@ -144,6 +159,10 @@ void DevToolsConsoleClient::send_console_output(WebView::ConsoleOutput console_o
 // 2.3. Printer(logLevel, args[, options]), https://console.spec.whatwg.org/#printer
 JS::ThrowCompletionOr<JS::Value> DevToolsConsoleClient::printer(JS::Console::LogLevel log_level, PrinterArguments arguments)
 {
+    // https://w3c.github.io/webdriver-bidi/#event-log-entryAdded
+    if (Web::WebDriver::BiDi::is_active())
+        Web::WebDriver::BiDi::console_steps(Web::HTML::principal_realm_settings_object(m_console->realm()), log_level, arguments);
+
     if (log_level == JS::Console::LogLevel::Trace) {
         auto const& trace = arguments.get<JS::Console::Trace>();
 

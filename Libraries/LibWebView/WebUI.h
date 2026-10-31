@@ -16,6 +16,7 @@
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Types.h>
+#include <AK/WeakPtr.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibIPC/Transport.h>
 #include <LibWebCommon/Page/PageId.h>
@@ -46,11 +47,15 @@ public:
     virtual ~WebUI();
 
     String const& host() const { return m_host; }
+    Web::PageId page_id() const { return m_page_id; }
 
 protected:
-    WebUI(WebContentClient&, NonnullOwnPtr<IPC::Transport>, String host);
+    WebUI(WebContentClient&, Web::PageId, NonnullOwnPtr<IPC::Transport>, String host);
 
-    WebContentClient& client() const { return m_client; }
+    // NB: The client of a WebUI is destroyed when its process exits, which can happen before the WebUI's own
+    //     connection closes. Code that can run after that checks has_client() first.
+    WebContentClient& client() const { return *m_client; }
+    bool has_client() const { return !m_client.is_null(); }
 
     using Interface = Function<void(JsonValue)>;
 
@@ -61,23 +66,24 @@ private:
     virtual void die() override;
     virtual void received_message(String name, JsonValue data) override;
 
-    WebContentClient& m_client;
+    WeakPtr<WebContentClient> m_client;
+    Web::PageId m_page_id;
     String m_host;
 
     HashMap<StringView, Interface> m_interfaces;
 };
 
-#define WEB_UI(WebUIType)                                                                                                  \
-public:                                                                                                                    \
-    static NonnullRefPtr<WebUIType> create(WebContentClient& client, NonnullOwnPtr<IPC::Transport> transport, String host) \
-    {                                                                                                                      \
-        return adopt_ref(*new WebUIType(client, move(transport), move(host)));                                             \
-    }                                                                                                                      \
-                                                                                                                           \
-private:                                                                                                                   \
-    WebUIType(WebContentClient& client, NonnullOwnPtr<IPC::Transport> transport, String host)                              \
-        : WebView::WebUI(client, move(transport), move(host))                                                              \
-    {                                                                                                                      \
+#define WEB_UI(WebUIType)                                                                                                                       \
+public:                                                                                                                                         \
+    static NonnullRefPtr<WebUIType> create(WebContentClient& client, Web::PageId page_id, NonnullOwnPtr<IPC::Transport> transport, String host) \
+    {                                                                                                                                           \
+        return adopt_ref(*new WebUIType(client, page_id, move(transport), move(host)));                                                         \
+    }                                                                                                                                           \
+                                                                                                                                                \
+private:                                                                                                                                        \
+    WebUIType(WebContentClient& client, Web::PageId page_id, NonnullOwnPtr<IPC::Transport> transport, String host)                              \
+        : WebView::WebUI(client, page_id, move(transport), move(host))                                                                          \
+    {                                                                                                                                           \
     }
 
 }

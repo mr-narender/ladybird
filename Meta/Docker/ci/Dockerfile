@@ -1,7 +1,7 @@
 FROM ubuntu:26.04
 
-ARG GCC_VERSION=14
-ARG LLVM_VERSION=21
+ARG GCC_VERSION=16
+ARG LLVM_VERSION=22
 ARG WASM_TOOLS_VERSION=1.243.0
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -52,6 +52,7 @@ RUN apt-get update -o APT::Update::Error-Mode=any \
         libssl-dev \
         libstdc++-${GCC_VERSION}-dev \
         libtool \
+        libxcb-icccm4-dev \
         libclang-${LLVM_VERSION}-dev \
         libclang-rt-${LLVM_VERSION}-dev \
         lld-${LLVM_VERSION} \
@@ -75,6 +76,7 @@ RUN apt-get update -o APT::Update::Error-Mode=any \
         qt6-positioning-dev \
         qt6-tools-dev-tools \
         rsync \
+        sccache \
         shellcheck \
         tar \
         unzip \

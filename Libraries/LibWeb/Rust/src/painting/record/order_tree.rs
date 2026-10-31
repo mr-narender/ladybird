@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! The paint-order tree retained from the published frame. Every scope the planner produced is
+//! The paint-order tree retained from the published recording. Every scope the planner produced is
 //! a node with a stable id. A node's child entries name producers of the node's owner and child
 //! scopes, each with the size of the output it contributed, so a child's position in the
 //! published tape is the sum of the sizes before it and a change inside one scope never touches
@@ -146,7 +146,7 @@ impl ProducerKind {
     }
 }
 
-/// The output one child contributed to the published frame.
+/// The output one child contributed to the published recording.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OutputSize {
     pub bytes: u32,
@@ -155,6 +155,9 @@ pub(crate) struct OutputSize {
     // Recorded again every frame: scroll-offset-dependent content and resources without
     // retained output. A scope is live when any child is.
     pub live: bool,
+    // Recorded again when the window gains or loses focus. A scope reads the window focus when
+    // any child does.
+    pub reads_window_focus: bool,
 }
 
 impl OutputSize {
@@ -163,6 +166,7 @@ impl OutputSize {
         self.hits += other.hits;
         self.blocking_wheel_event_regions += other.blocking_wheel_event_regions;
         self.live |= other.live;
+        self.reads_window_focus |= other.reads_window_focus;
     }
 }
 
@@ -185,6 +189,7 @@ const _: () = assert!(std::mem::size_of::<ChildEntry>() == 16);
 
 const SCOPE_KEY_BIT: u32 = 1 << 31;
 const META_LIVE: u32 = 1;
+const META_READS_WINDOW_FOCUS: u32 = 2;
 const META_BLOCKING_REGIONS_SHIFT: u32 = 8;
 
 impl ChildEntry {
@@ -199,7 +204,12 @@ impl ChildEntry {
 
     fn with_key(key: u32, output: OutputSize) -> Self {
         let meta = (output.blocking_wheel_event_regions << META_BLOCKING_REGIONS_SHIFT)
-            | if output.live { META_LIVE } else { 0 };
+            | if output.live { META_LIVE } else { 0 }
+            | if output.reads_window_focus {
+                META_READS_WINDOW_FOCUS
+            } else {
+                0
+            };
         Self {
             key,
             bytes: output.bytes,
@@ -222,11 +232,16 @@ impl ChildEntry {
             hits: self.hits,
             blocking_wheel_event_regions: self.meta >> META_BLOCKING_REGIONS_SHIFT,
             live: self.meta & META_LIVE != 0,
+            reads_window_focus: self.reads_window_focus(),
         }
     }
 
     pub(crate) fn is_live(&self) -> bool {
         self.meta & META_LIVE != 0
+    }
+
+    pub(crate) fn reads_window_focus(&self) -> bool {
+        self.meta & META_READS_WINDOW_FOCUS != 0
     }
 }
 
@@ -276,7 +291,7 @@ fn scope_kind_from_code(code: u8) -> PaintScopeKind {
 
 pub(crate) const SCOPE_KIND_COUNT: u8 = 1 + StackingContextPaintPhase::COUNT as u8;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct PaintOrderTree {
     nodes: Vec<ScopeNode>,
     free_nodes: Vec<u32>,
@@ -309,6 +324,26 @@ impl PaintOrderTree {
     #[cfg(test)]
     pub(crate) fn child_entry_capacity(&self) -> usize {
         self.children.len()
+    }
+
+    /// Every scope reachable from the root, in tree order, with its child list.
+    #[cfg(test)]
+    pub(crate) fn structure(&self) -> Vec<(ScopeId, PaintScope, Vec<ChildEntry>)> {
+        let mut structure = Vec::new();
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            if id.is_none() {
+                continue;
+            }
+            let children = self.children(id).to_vec();
+            for entry in children.iter().rev() {
+                if let ChildKey::Scope(child) = entry.key() {
+                    stack.push(child);
+                }
+            }
+            structure.push((id, self.scope_of(id), children));
+        }
+        structure
     }
 
     fn node(&self, id: ScopeId) -> &ScopeNode {
@@ -354,7 +389,7 @@ impl PaintOrderTree {
     }
 
     /// The scope for a plan item under `parent`, if the tree has one. A scope allocated by the
-    /// current recording qualifies too; a caller copying from the published frame tells the
+    /// current recording qualifies too; a caller copying from the published recording tells the
     /// two apart by the parent's published child list.
     pub(crate) fn published_scope(&self, scope: PaintScope, parent: ScopeId) -> Option<ScopeId> {
         let kind_code = scope_kind_code(scope.kind);

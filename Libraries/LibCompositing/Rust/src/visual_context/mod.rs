@@ -11,8 +11,6 @@ pub mod serialize;
 pub mod visual_animations;
 
 use std::collections::HashMap;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::node_slot_id::NodeSlotId;
 use crate::visual_animation::VisualAnimation;
@@ -74,7 +72,7 @@ pub struct ClipData {
 
 #[derive(Clone)]
 pub struct ClipPathData {
-    pub path: std::rc::Rc<libgfx_rust::path::OwnedPath>,
+    pub path: std::sync::Arc<libgfx_rust::path::Path>,
     pub bounding_rect: IntRect,
     pub fill_rule: WindingRule,
 }
@@ -83,22 +81,24 @@ pub struct ClipPathData {
 // layer, so the layer's opacity, blend mode and filter apply to it along with the box's content.
 #[derive(Clone, PartialEq)]
 pub struct BackdropFilterData {
-    pub filter: Rc<Vec<u8>>,
+    pub filter: std::sync::Arc<Vec<u8>>,
     pub region: IntRect,
     pub corner_radii: CornerRadii,
 }
 
 #[derive(Clone)]
 pub struct EffectsData {
+    pub isolation: bool,
     pub opacity: f32,
     pub blend_mode: CompositingAndBlendingOperator,
-    pub filter: Option<std::rc::Rc<Vec<u8>>>,
+    pub filter: Option<std::sync::Arc<Vec<u8>>>,
     pub backdrop_filter: Option<BackdropFilterData>,
 }
 
 impl EffectNodeData {
     pub fn layer_blending_with(blend_mode: CompositingAndBlendingOperator) -> Self {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode,
             filter: None,
@@ -119,7 +119,8 @@ impl ClipNodeData {
 
 impl EffectsData {
     pub fn needs_layer(&self) -> bool {
-        self.opacity < 1.0
+        self.isolation
+            || self.opacity < 1.0
             || self.blend_mode != CompositingAndBlendingOperator::Normal
             || self.filter.is_some()
             || self.backdrop_filter.is_some()
@@ -139,6 +140,9 @@ pub struct MaskData {
     pub rect: IntRect,
     pub kind: MaskKind,
     pub origin: MaskLayerOrigin,
+    /// Whether the mask belongs to a box with a backdrop filter, whose effects node then sits
+    /// under the box's masks so that they mask the filtered backdrop along with the content.
+    pub masks_backdrop: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +165,9 @@ pub struct StickyData {
     pub scrollport_size: FloatSize,
     pub containing_block_region: FloatRect,
     pub needs_parent_offset_adjustment: bool,
+    // The nearest scroll container of the box when it has no scrollable overflow, and so no scroll node. Its
+    // scrollport never moves, and the geometry above is relative to it rather than to the scroller.
+    pub non_scrolling_scroll_container: NodeSlotId,
     pub inset_top: Option<f32>,
     pub inset_right: Option<f32>,
     pub inset_bottom: Option<f32>,
@@ -186,6 +193,7 @@ impl StickyData {
             scrollport_size: FloatSize::default(),
             containing_block_region: FloatRect::default(),
             needs_parent_offset_adjustment: false,
+            non_scrolling_scroll_container: NodeSlotId::INVALID,
             inset_top: None,
             inset_right: None,
             inset_bottom: None,
@@ -597,10 +605,16 @@ pub fn resolve_sorting_contexts_over_nodes(
     contexts
 }
 
-static NEXT_STRUCTURAL_EPOCH: AtomicU64 = AtomicU64::new(1);
+unsafe extern "C" {
+    fn ladybird_gfx_process_next_structural_epoch() -> u64;
+}
 
 pub fn allocate_structural_epoch() -> u64 {
-    NEXT_STRUCTURAL_EPOCH.fetch_add(1, Ordering::Relaxed)
+    // The counter is LibGfx's: this crate is compiled into more than one library, and a counter
+    // here would let a tree one copy built and a plan the other prepared agree on an epoch they do
+    // not share. See `LibGfx/RustProcessState.cpp`.
+    // SAFETY: The counter is an atomic on the other side of the boundary.
+    unsafe { ladybird_gfx_process_next_structural_epoch() }
 }
 
 pub fn resolve_leaf_to_context_matrices(
@@ -656,8 +670,14 @@ pub struct VisualContextTree {
     // Keyed by effect node index.
     sampled_background_colors: HashMap<u32, libgfx_rust::Color>,
     // The compositor animations the main thread published with this tree, which name its nodes.
-    visual_animations: Rc<[VisualAnimation]>,
+    visual_animations: std::sync::Arc<[VisualAnimation]>,
 }
+
+// A tree is shared by the arena and by the handles C++ retains; any thread may come to hold it.
+const _: () = {
+    const fn assert_send_and_sync<T: Send + Sync>() {}
+    assert_send_and_sync::<VisualContextTree>();
+};
 
 const COMPACTION_DEAD_NODE_THRESHOLD: usize = 512;
 
@@ -808,7 +828,7 @@ impl VisualContextTree {
             clip_slots: SlotAccounting::default(),
             effect_slots: SlotAccounting::default(),
             sampled_background_colors: HashMap::new(),
-            visual_animations: Rc::from(Vec::new()),
+            visual_animations: std::sync::Arc::from(Vec::new()),
         }
     }
 
@@ -836,7 +856,7 @@ impl VisualContextTree {
             root_isolation_effect,
             structural_epoch,
             sampled_background_colors: HashMap::new(),
-            visual_animations: Rc::from(Vec::new()),
+            visual_animations: std::sync::Arc::from(Vec::new()),
         }
     }
 
@@ -1442,6 +1462,7 @@ mod tests {
 
     fn effects() -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode: CompositingAndBlendingOperator::Normal,
             filter: None,

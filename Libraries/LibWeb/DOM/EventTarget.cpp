@@ -11,7 +11,6 @@
 #include <AK/StringBuilder.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/AbstractOperations.h>
-#include <LibJS/Runtime/ECMAScriptFunctionObject.h>
 #include <LibJS/Runtime/ExternalMemory.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/NativeFunction.h>
@@ -19,7 +18,7 @@
 #include <LibJS/Runtime/PrimitiveString.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibJS/Runtime/Value.h>
-#include <LibJS/RustIntegration.h>
+#include <LibJS/ScriptCompilation.h>
 #include <LibWeb/Bindings/EventTarget.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/Wrappable.h>
@@ -50,10 +49,13 @@
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
+#include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/UIEvents/EventNames.h>
 #include <LibWeb/UIEvents/KeyboardEvent.h>
 #include <LibWeb/UIEvents/PointerEvent.h>
@@ -147,14 +149,26 @@ HTML::Window* window_from_callback(WebIDL::CallbackType& callback)
     return HTML::window_from_global_object(realm.global_object());
 }
 
+// targetGlobal in https://dom.spec.whatwg.org/#concept-event-listener-inner-invoke for an event whose currentTarget isn't
+// a node, if it's a Window: event's currentTarget's relevant global object.
+DOM::EventTarget* current_target_global(WebIDL::CallbackType& callback, DOM::Event const& event)
+{
+    auto current_target = event.current_target();
+    if (auto* window = as_if<HTML::Window>(current_target.ptr()))
+        return window;
+
+    // Any other target's relevant realm is its wrapper's: the realm it was created in.
+    auto& callback_realm = callback.callback->shape().realm();
+    auto wrapper = current_target_wrapper(callback_realm, event);
+    if (!wrapper)
+        return nullptr;
+    return HTML::window_from_global_object(this_value_realm(callback_realm, wrapper).global_object());
+}
+
 void report_exception_for_callback(WebIDL::CallbackType& callback, JS::Value exception)
 {
     auto& realm = callback.callback->shape().realm();
-    auto& global = realm.global_object();
-
-    auto* window_or_worker = HTML::window_or_worker_global_scope_from_global_object(global);
-    VERIFY(window_or_worker);
-    window_or_worker->report_an_exception(exception);
+    HTML::report_an_exception(realm.global_object(), exception);
 }
 
 JS::Completion invoke_event_listener(WebIDL::CallbackType& callback, DOM::Event& event)
@@ -165,7 +179,8 @@ JS::Completion invoke_event_listener(WebIDL::CallbackType& callback, DOM::Event&
     auto wrapped_event = Bindings::event(event_realm, GC::Ref { event });
 
     static Utf16FlyString const& handle_event = *new Utf16FlyString("handleEvent"_utf16_fly_string);
-    return WebIDL::call_user_object_operation(callback, handle_event, this_value.ptr(), { { wrapped_event } });
+    // Inner invoke has just skipped the listener if its callback's Window has a document that isn't fully active.
+    return WebIDL::call_user_object_operation(callback, handle_event, this_value.ptr(), { { wrapped_event } }, WebIDL::RefuseCallbackFromInactiveWindow::No);
 }
 
 JS::Completion invoke_event_handler(WebIDL::CallbackType& callback, DOM::Event& event, bool special_error_event_handling)
@@ -288,14 +303,17 @@ static void invalidate_compositor_wheel_event_listener_state(EventTarget& event_
     if (auto* window = as_if<HTML::Window>(event_target)) {
         auto& document = window->associated_document();
         document.set_needs_to_record_display_list();
-        document.page().invalidate_compositor_wheel_event_listener_state();
+        document.page().invalidate_compositor_wheel_event_listener_state(document);
         return;
     }
 
     if (auto* node = as_if<Node>(event_target)) {
+        // The document remembers that a blocking listener lives in it, so that a node arriving
+        // under this one later derives the state it inherits.
+        node->document().set_may_have_blocking_wheel_event_listener();
         node->update_inside_blocking_wheel_event_handler_state_for_subtree();
         node->set_needs_repaint();
-        node->document().page().invalidate_compositor_wheel_event_listener_state();
+        node->document().page().invalidate_compositor_wheel_event_listener_state(node->document());
     }
 }
 
@@ -317,12 +335,16 @@ static void wake_animation_frame_pump_for_animation_event_listener(EventTarget& 
         return;
 
     if (auto* window = as_if<HTML::Window>(event_target)) {
+        if (Core::StatsLog::the())
+            set_rendering_pending(window->associated_document(), RenderingPendingReason::NeedsRenderingUpdate, 1);
         window->associated_document().page().client().request_frame();
         return;
     }
 
-    if (auto* node = as_if<Node>(event_target))
+    if (auto* node = as_if<Node>(event_target)) {
+        set_rendering_pending(node->document(), RenderingPendingReason::NeedsRenderingUpdate, 1);
         node->document().page().client().request_frame();
+    }
 }
 
 static void prepare_to_observe_css_animation_events(EventTarget& event_target, DOMEventListener const& listener)
@@ -353,6 +375,46 @@ static void update_needs_beforeunload_check(EventTarget& event_target, DOMEventL
         return;
 
     navigable->page().update_needs_beforeunload_check();
+}
+
+// A storage event made in another process reaches this one only through the mirror of the map it changed, and a
+// window that has never touched its storage has no mirror. So the moment a window starts listening for storage
+// events, its Storage objects are created, which connects the mirrors and brings the events.
+static void connect_storage_for_storage_event_listener(EventTarget& event_target, DOMEventListener const& listener)
+{
+    if (listener.type != HTML::EventNames::storage)
+        return;
+
+    auto* window = as_if<HTML::Window>(event_target);
+    if (!window)
+        return;
+    auto document = window->associated_document_if_any();
+    if (!document || !document->is_fully_active())
+        return;
+
+    if (auto local_storage = window->local_storage(); !local_storage.is_error())
+        local_storage.value()->connect();
+    if (auto session_storage = window->session_storage(); !session_storage.is_error())
+        session_storage.value()->connect();
+}
+
+static void notify_page_that_window_listens_for_gamepad_events(EventTarget& event_target, DOMEventListener const& listener)
+{
+    if (!first_is_one_of(listener.type, Gamepad::EventNames::gamepadconnected, Gamepad::EventNames::gamepaddisconnected))
+        return;
+
+    auto* window = as_if<HTML::Window>(event_target);
+    if (!window)
+        return;
+
+    auto& document = window->associated_document();
+    if (!document.navigable())
+        return;
+
+    if (!document.is_allowed_to_use_feature(PolicyControlledFeature::Gamepad))
+        return;
+
+    window->page().client().page_did_start_using_gamepads();
 }
 
 // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
@@ -428,6 +490,8 @@ void EventTarget::add_an_event_listener(DOMEventListener& listener)
         wake_animation_frame_pump_for_animation_event_listener(*this, listener);
         update_needs_beforeunload_check(*this, listener);
         event_listener_list_changed();
+        notify_page_that_window_listens_for_gamepad_events(*this, listener);
+        connect_storage_for_storage_event_listener(*this, listener);
     }
 
     // 6. If listener’s signal is not null, then add the following abort steps to it:
@@ -675,17 +739,22 @@ WebIDL::CallbackType* EventTarget::get_current_value_of_event_handler(Utf16FlySt
 
         auto& vm = Bindings::main_thread_vm();
 
-        auto rust_compilation = JS::RustIntegration::compile_dynamic_function(
-            vm, source_text, parameters_string, body, JS::FunctionKind::Normal);
+        auto compiled_function = JS::CompiledDynamicFunction::compile(vm, source_text, parameters_string, body, JS::FunctionKind::Normal);
 
         // 7. If body is not parsable as FunctionBody or if parsing detects an early error, then follow these substeps:
-        if (!rust_compilation.has_value() || rust_compilation->is_error()) {
+        if (compiled_function.is_error()) {
             // 1. Set eventHandler's value to null.
             event_handler->value = GC::Ptr<WebIDL::CallbackType> {};
 
-            // FIXME: 2. Report the error for the appropriate script and with the appropriate position (line number and column number) given by location, using settings object's global object.
+            // 2. Let syntaxError be a new SyntaxError exception associated with settings object's realm which describes
+            //    the error while parsing. It should be based on location, where the script body originated.
+            // FIXME: Base the error on location.
+            auto syntax_error = JS::SyntaxError::create(settings_object.realm(), compiled_function.release_error());
 
-            // 3. Return null.
+            // 3. Report an exception with syntaxError for settings object's global object.
+            HTML::report_an_exception(settings_object.global_object(), syntax_error);
+
+            // 4. Return null.
             return nullptr;
         }
 
@@ -713,18 +782,14 @@ WebIDL::CallbackType* EventTarget::get_current_value_of_event_handler(Utf16FlySt
             scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *element }, scope);
 
         // 9. Let function be the result of calling OrdinaryFunctionCreate.
-        auto function = JS::ECMAScriptFunctionObject::create_from_function_data(
-            realm,
-            rust_compilation->value(),
-            scope,
-            nullptr);
+        auto function = compiled_function.value().instantiate(realm, *scope, nullptr, JS::ScriptOrModule {});
 
         // 10. Remove settings object's realm execution context from the JavaScript execution context stack.
         auto* popped_execution_context = vm.pop_execution_context();
         VERIFY(popped_execution_context == &settings_object.realm_execution_context());
 
         // 11. Set function.[[ScriptOrModule]] to null.
-        function->set_script_or_module({});
+        // NB: Step 9 already did this by instantiating the function with an empty script or module.
 
         // 12. Set eventHandler's value to the result of creating a Web IDL EventHandler callback function object whose object reference is function and whose callback context is settings object.
         // FIXME: Update this comment once the ShadowRealm proposal is merged to pass realm.
@@ -909,18 +974,26 @@ void EventTarget::erase_all_event_listeners_and_handlers()
 // https://html.spec.whatwg.org/multipage/webappapis.html#the-event-handler-processing-algorithm
 JS::ThrowCompletionOr<void> EventTarget::process_event_handler_for_event(Utf16FlyString const& name, Event& event)
 {
-    // 1. Let callback be the result of getting the current value of the event handler given eventTarget and name.
+    // FIXME: 1. If the result of WebDriver BiDi scripting is enabled with eventTarget's relevant settings object is false,
+    //           then return.
+
+    // 2. Let callback be the result of getting the current value of the event handler given eventTarget and name.
     auto* callback = get_current_value_of_event_handler(name);
 
-    // 2. If callback is null, then return.
+    // 3. If callback is null, then return.
     if (!callback)
         return {};
 
-    // 3. Let special error event handling be true if event is an ErrorEvent object, event's type is error, and event's currentTarget implements the WindowOrWorkerGlobalScope mixin.
+    // 4. If callback's associated realm's global object is a Window object whose associated Document is not fully
+    //    active, then return.
+    if (auto* window = Bindings::window_from_callback(*callback); window && !window->associated_document().is_fully_active())
+        return {};
+
+    // 5. Let special error event handling be true if event is an ErrorEvent object, event's type is error, and event's currentTarget implements the WindowOrWorkerGlobalScope mixin.
     //    Otherwise, let special error event handling be false.
     bool special_error_event_handling = is<HTML::ErrorEvent>(event) && event.type() == HTML::EventNames::error && is<HTML::WindowOrWorkerGlobalScopeMixin>(event.current_target().ptr());
 
-    // 4. Process the Event object event as follows:
+    // 6. Process the Event object event as follows:
     JS::Completion return_value_or_error;
 
     return_value_or_error = Bindings::invoke_event_handler(*callback, event, special_error_event_handling);
@@ -934,7 +1007,7 @@ JS::ThrowCompletionOr<void> EventTarget::process_event_handler_for_event(Utf16Fl
 
     auto is_beforeunload = event.type() == HTML::EventNames::beforeunload;
 
-    // 5. Process return value as follows:
+    // 7. Process return value as follows:
     if (is<HTML::BeforeUnloadEvent>(event) && is_beforeunload) {
         // ->  If event is a BeforeUnloadEvent object and event's type is "beforeunload"
         //         If return value is not null, then:
@@ -1064,7 +1137,9 @@ bool EventTarget::dispatch_event(Event& event)
                 return pointer_event->pointer_type() != u"mouse"sv;
         }
 
-        // FIXME: touchend
+        // touchend.
+        if (event.type() == UIEvents::EventNames::touchend)
+            return true;
 
         return false;
     };

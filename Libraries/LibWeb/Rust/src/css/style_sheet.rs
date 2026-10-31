@@ -5,7 +5,7 @@
  */
 
 use crate::css::container_conditions::ContainerConditionsData;
-use crate::css::ffi_support::FfiUtf16View;
+use crate::css::ffi_support::{FfiUtf16View, OwnedBox, OwnedRc};
 use crate::css::media_list::MediaList;
 use crate::css::parser::query_parser::{FfiMediaEnvironment, MediaEnvironment};
 use crate::css::rule::read::{NativeRuleView, RuleRef};
@@ -60,11 +60,9 @@ pub extern "C" fn rust_media_evaluation_state_create() -> *mut NativeMediaEvalua
     Box::into_raw(Box::default())
 }
 
-/// # Safety
-/// The state must be an owned pointer returned by rust_media_evaluation_state_create.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_evaluation_state_free(state: *mut NativeMediaEvaluationState) {
-    drop(unsafe { Box::from_raw(state) });
+pub extern "C" fn rust_media_evaluation_state_free(state: OwnedBox<NativeMediaEvaluationState>) {
+    drop(state);
 }
 
 // Document-local state. The rule and media owners retain their immutable parsed data separately,
@@ -79,11 +77,29 @@ pub struct NativeStyleSheet {
 }
 
 impl NativeStyleSheet {
+    /// Attach a loaded sheet to the import rule `rule_identity` names, or remove the edge when
+    /// the rule is detached. The imported sheet must not transitively import this one.
+    pub(crate) fn set_import(&self, rule_identity: u64, imported: Option<Rc<NativeStyleSheet>>) {
+        match imported {
+            None => {
+                self.imports.borrow_mut().remove(&rule_identity);
+            }
+            Some(imported) => {
+                self.imports.borrow_mut().insert(rule_identity, imported);
+            }
+        }
+    }
+
     pub(crate) fn identity(&self) -> u64 {
         self.identity
     }
 
     pub(super) fn rules(&self) -> &NativeRuleList {
+        &self.rules
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_rules(&self) -> &Rc<NativeRuleList> {
         &self.rules
     }
 
@@ -237,18 +253,6 @@ impl NativeStyleSheet {
         evaluation.sheet(self, true, false);
         evaluation.result.sheet_changed = previous_sheet.is_some_and(|previous| previous != self.media.matches());
         evaluation.result
-    }
-
-    pub(crate) fn publish_conditions(
-        &self,
-        engine: &mut crate::css::style::StyleEngine,
-        environment: MediaEnvironment<'_>,
-    ) {
-        self.visit_conditions(environment, true, &mut |identity, holds| {
-            if let Some(rule) = engine.native_rule_id(identity) {
-                crate::css::style::bridge::operations::set_rule_conditions_hold(engine, rule.0 + 1, holds);
-            }
-        });
     }
 
     pub(crate) fn visit_conditions(
@@ -428,11 +432,7 @@ pub unsafe extern "C" fn rust_style_sheet_visit_effective_rule_data(
         visit(
             context,
             &NativeRuleView { rule, containers },
-            FfiUtf16View {
-                ascii: std::ptr::null(),
-                utf16: prefix.as_ptr(),
-                length: prefix.len(),
-            },
+            FfiUtf16View::from_utf16(prefix),
         );
     });
 }
@@ -456,19 +456,16 @@ impl Drop for NativeStyleSheet {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_sheet_create(
-    rules: *const NativeRuleList,
+pub extern "C" fn rust_style_sheet_create(
+    rules: crate::css::ffi_support::RcRef<'_, NativeRuleList>,
     media: &MediaList,
 ) -> *const NativeStyleSheet {
-    unsafe { Rc::increment_strong_count(rules) };
-    Rc::into_raw(NativeStyleSheet::new(unsafe { Rc::from_raw(rules) }, media.clone()))
+    Rc::into_raw(NativeStyleSheet::new(rules.to_rc(), media.clone()))
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_sheet_release(sheet: *const NativeStyleSheet) {
-    if !sheet.is_null() {
-        drop(unsafe { Rc::from_raw(sheet) });
-    }
+pub extern "C" fn rust_style_sheet_release(sheet: OwnedRc<NativeStyleSheet>) {
+    drop(sheet);
 }
 
 #[unsafe(no_mangle)]
@@ -491,19 +488,18 @@ pub unsafe extern "C" fn rust_style_sheet_set_import(
     rule_identity: u64,
     imported: *const NativeStyleSheet,
 ) {
-    if imported.is_null() {
-        sheet.imports.borrow_mut().remove(&rule_identity);
-    } else {
-        unsafe { Rc::increment_strong_count(imported) };
-        sheet
-            .imports
-            .borrow_mut()
-            .insert(rule_identity, unsafe { Rc::from_raw(imported) });
-    }
+    let imported = (!imported.is_null()).then(|| {
+        // SAFETY: Guaranteed by the caller.
+        unsafe {
+            Rc::increment_strong_count(imported);
+            Rc::from_raw(imported)
+        }
+    });
+    sheet.set_import(rule_identity, imported);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_sheet_import(sheet: &NativeStyleSheet, rule_identity: u64) -> *const NativeStyleSheet {
+#[cfg(test)]
+pub(crate) fn style_sheet_import(sheet: &NativeStyleSheet, rule_identity: u64) -> *const NativeStyleSheet {
     sheet
         .imports
         .borrow()
@@ -521,36 +517,45 @@ pub extern "C" fn rust_style_sheet_reset_media_state(sheet: &NativeStyleSheet) {
     sheet.media_state.set(NativeStyleSheetMediaState::Unevaluated);
 }
 
-/// Evaluate media queries throughout the sheet graph from one document environment snapshot.
-///
-/// # Safety
-/// Engine must be exclusively available and the environment must contain valid media feature data.
+/// Evaluate media queries throughout the sheet graph from one document environment snapshot, and queue whether the
+/// conditions of the rules whose conditions changed hold.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_sheet_evaluate_media_queries(
+pub extern "C" fn rust_style_sheet_evaluate_media_queries(
     sheet: &NativeStyleSheet,
-    environment: FfiMediaEnvironment,
+    environment: FfiMediaEnvironment<'_>,
     state: &mut NativeMediaEvaluationState,
-    engine: *mut c_void,
+    host: &crate::render_state::DocumentHost,
 ) -> NativeStyleSheetMediaEvaluation {
-    let engine: &mut crate::css::style::StyleEngine = unsafe { &mut *engine.cast() };
-    sheet.evaluate_media_queries(unsafe { environment.borrow() }, state, &mut |identity, holds| {
-        if let Some(rule) = engine.native_rule_id(identity) {
-            crate::css::style::bridge::operations::set_rule_conditions_hold(engine, rule.0 + 1, holds);
-        }
-    })
+    let mut conditions = Vec::new();
+    let result = sheet.evaluate_media_queries(environment.borrow(), state, &mut |identity, holds| {
+        conditions.push((identity, holds));
+    });
+    write_rule_conditions(host, conditions);
+    result
 }
 
-/// Publish inherited condition gates directly into the document engine.
-///
-/// # Safety
-/// Engine and environment must be live and exclusively available for this call.
+/// Queue inherited condition gates for the document engine.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_sheet_publish_conditions(
+pub extern "C" fn rust_style_sheet_publish_conditions(
     sheet: &NativeStyleSheet,
-    engine: *mut c_void,
-    environment: FfiMediaEnvironment,
+    host: &crate::render_state::DocumentHost,
+    environment: FfiMediaEnvironment<'_>,
 ) {
-    sheet.publish_conditions(unsafe { &mut *engine.cast() }, unsafe { environment.borrow() });
+    let mut conditions = Vec::new();
+    sheet.visit_conditions(environment.borrow(), true, &mut |identity, holds| {
+        conditions.push((identity, holds));
+    });
+    write_rule_conditions(host, conditions);
+}
+
+/// Writes whether the conditions of each rule hold, for the rules the engine has.
+fn write_rule_conditions(host: &crate::render_state::DocumentHost, conditions: Vec<(u64, bool)>) {
+    if conditions.is_empty() {
+        return;
+    }
+    host.write_rules(crate::css::style::rule_writes::RuleWrite::RuleConditions(
+        conditions.into(),
+    ));
 }
 
 // Keep first-seen sibling order and emit descendants before their parent, including the
@@ -602,13 +607,13 @@ fn cascade_layer_order<'a>(sheets: impl IntoIterator<Item = &'a NativeStyleSheet
 /// Publish the layer order of the host's ordered, active author sheets.
 ///
 /// # Safety
-/// Sheets and engine must be live. prepare must flush host changes without destroying them.
-/// The engine is not borrowed during prepare.
+/// Sheets must be live, and `host` a live document host, on its document's thread. prepare must
+/// flush host changes without destroying them. The engine is not borrowed during prepare.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_sheet_publish_layer_order(
     sheets: *const *const NativeStyleSheet,
     count: usize,
-    engine: *mut c_void,
+    host: &crate::render_state::DocumentHost,
     tree_scope: u32,
     previously_had_layers: bool,
     context: *mut c_void,
@@ -617,7 +622,7 @@ pub unsafe extern "C" fn rust_style_sheet_publish_layer_order(
     let sheets = if count == 0 {
         &[][..]
     } else {
-        unsafe { std::slice::from_raw_parts(sheets, count) }
+        unsafe { ak::slice_from_raw_parts(sheets, count) }
     };
     let names = cascade_layer_order(sheets.iter().map(|&sheet| unsafe { &*sheet }));
     let has_layers = names.len() > 1;
@@ -625,18 +630,7 @@ pub unsafe extern "C" fn rust_style_sheet_publish_layer_order(
     // must clear the engine's old ranks.
     if has_layers || previously_had_layers {
         unsafe { prepare(context) };
-        let engine = unsafe { &mut *engine.cast::<crate::css::style::StyleEngine>() };
-        let layers: Vec<_> = names
-            .iter()
-            .map(|name| {
-                if name.is_empty() {
-                    0
-                } else {
-                    crate::css::style::bridge::intern_native_text(engine, name).0
-                }
-            })
-            .collect();
-        crate::css::style::bridge::operations::set_layer_order(engine, tree_scope, &layers);
+        host.write_rules(crate::css::style::rule_writes::RuleWrite::LayerOrder { tree_scope, names });
     }
     has_layers
 }
@@ -662,13 +656,13 @@ mod tests {
     use crate::css::media_list::rust_media_list_length;
     use crate::css::parser::syntax_parser::{ParsedStyleSheet, parse_shared_stylesheet};
     use crate::css::parser::value_parser::ParseContext;
-    use crate::css::rule::{rust_rule_list_at, rust_rule_list_count, rust_rule_list_remove};
+    use crate::css::rule::{rust_rule_list_count, rust_rule_list_remove};
 
     fn parse(source: &str) -> std::sync::Arc<ParsedStyleSheet> {
         let units: Vec<_> = source.encode_utf16().collect();
         // All fields are booleans, integers, or nullable pointers; zero is an empty parser context.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
-        unsafe { parse_shared_stylesheet(crate::css::css_tokenizer::TokenizerInput::Utf16(&units), &context) }
+        let context = ParseContext::default();
+        parse_shared_stylesheet(crate::css::css_tokenizer::TokenizerInput::Utf16(&units), Some(&context))
     }
 
     fn sheet(parsed: &std::sync::Arc<ParsedStyleSheet>) -> Rc<NativeStyleSheet> {
@@ -687,11 +681,7 @@ mod tests {
 
     #[test]
     fn media_cache_invalidation_reads_shared_rules_without_owners() {
-        let environment = FfiMediaEnvironment {
-            values: std::ptr::null(),
-            value_count: 0,
-            length_resolution_context: std::ptr::null(),
-        };
+        let environment = FfiMediaEnvironment::new(&[], None);
         for (text, reaches_cache) in [
             ("@media all { .target { color: red; } }", false),
             ("@media all { @keyframes motion { from { opacity: 0; } } }", true),
@@ -700,11 +690,11 @@ mod tests {
             let sheet = sheet(&parse(text));
             let owners = crate::css::rule::RULE_OWNER_ALLOCATIONS.get();
             let mut state = NativeMediaEvaluationState::default();
-            let initial = sheet.evaluate_media_queries(unsafe { environment.borrow() }, &mut state, &mut |_, _| {});
+            let initial = sheet.evaluate_media_queries(environment.borrow(), &mut state, &mut |_, _| {});
             assert!(!initial.any_changed);
             assert!(!initial.style_cache_inputs_changed);
             set_media(&sheet, "not all");
-            let changed = sheet.evaluate_media_queries(unsafe { environment.borrow() }, &mut state, &mut |_, _| {});
+            let changed = sheet.evaluate_media_queries(environment.borrow(), &mut state, &mut |_, _| {});
             assert!(changed.sheet_changed);
             assert_eq!(changed.style_cache_inputs_changed, reaches_cache);
             assert_eq!(crate::css::rule::RULE_OWNER_ALLOCATIONS.get(), owners);
@@ -771,7 +761,7 @@ mod tests {
         rust_rule_list_remove(&first.rules, 0);
         set_media(&first, "print, screen");
         assert_eq!(rust_rule_list_count(&second.rules), 2);
-        assert_eq!(unsafe { rust_media_list_length(&second.media) }, 1);
+        assert_eq!(rust_media_list_length(&second.media), 1);
         assert_eq!(rust_rule_list_count(&sheet(&parsed).rules), 2);
         drop(parsed);
 
@@ -781,7 +771,7 @@ mod tests {
         let media = retained.media.clone();
         drop(retained);
         assert_eq!(rust_rule_list_count(&rules), 1);
-        assert_eq!(unsafe { rust_media_list_length(&media) }, 2);
+        assert_eq!(rust_media_list_length(&media), 2);
     }
 
     fn layer_names(sheet: &NativeStyleSheet) -> Vec<Vec<u16>> {
@@ -924,10 +914,8 @@ mod tests {
         let leaf_rule = identity(&leaf, 0);
         let middle_rule = identity(&middle, 1);
         let root_rule = identity(&root, 1);
-        unsafe {
-            rust_style_sheet_set_import(&root, root_import, Rc::as_ptr(&middle));
-            rust_style_sheet_set_import(&middle, middle_import, Rc::as_ptr(&leaf));
-        }
+        root.set_import(root_import, Some(middle.clone()));
+        middle.set_import(middle_import, Some(leaf.clone()));
         let owners = crate::css::rule::RULE_OWNER_ALLOCATIONS.get();
         let mut prefix = Vec::with_capacity(32);
         prefix.extend("根".encode_utf16());
@@ -980,7 +968,7 @@ mod tests {
             vec![entry(root_import, "根"), entry(root_rule, "根")]
         );
         set_media(&middle, "");
-        unsafe { rust_style_sheet_set_import(&middle, middle_import, std::ptr::null()) };
+        middle.set_import(middle_import, None);
         assert_eq!(
             collect(FfiRuleTraversalOrder::Preorder),
             vec![
@@ -999,14 +987,12 @@ mod tests {
         let root = sheet(&parse("@import 'middle.css' layer(外); @layer 末;"));
         let middle = sheet(&parse("@import 'leaf.css' layer(中); @layer 隣;"));
         let leaf = sheet(&parse("@layer 内;"));
-        let root_import = unsafe { &*rust_rule_list_at(&root.rules, 0) };
-        let middle_import = unsafe { &*rust_rule_list_at(&middle.rules, 0) };
+        let root_import = &root.rules.rule_at(0);
+        let middle_import = &middle.rules.rule_at(0);
         let root_id = crate::css::rule::rust_rule_identity(root_import);
         let middle_id = crate::css::rule::rust_rule_identity(middle_import);
-        unsafe {
-            rust_style_sheet_set_import(&middle, middle_id, Rc::as_ptr(&leaf));
-            rust_style_sheet_set_import(&root, root_id, Rc::as_ptr(&middle));
-        }
+        middle.set_import(middle_id, Some(leaf.clone()));
+        root.set_import(root_id, Some(middle.clone()));
         let weak_middle = Rc::downgrade(&middle);
         let weak_leaf = Rc::downgrade(&leaf);
         drop(middle);
@@ -1015,11 +1001,11 @@ mod tests {
         let middle = weak_middle.upgrade().unwrap();
         let leaf = weak_leaf.upgrade().unwrap();
         let replacement = sheet(&parse("@layer 替;"));
-        unsafe { rust_style_sheet_set_import(&root, root_id, Rc::as_ptr(&replacement)) };
+        root.set_import(root_id, Some(replacement.clone()));
         drop(replacement);
         assert_layers(&root, &["根.外.替", "根.外", "根.末"]);
-        unsafe { rust_style_sheet_set_import(&root, root_id, std::ptr::null()) };
-        assert!(rust_style_sheet_import(&root, root_id).is_null());
+        root.set_import(root_id, None);
+        assert!(style_sheet_import(&root, root_id).is_null());
         assert_layers(&root, &["根.外", "根.末"]);
         assert_layers(&middle, &["根.中.内", "根.中", "根.隣"]);
         set_media(&leaf, "not all");
@@ -1039,7 +1025,7 @@ mod tests {
         let leaf = Rc::downgrade(&child);
         for _ in 0..20_000 {
             let parent = sheet(&parsed);
-            let rule = unsafe { &*rust_rule_list_at(&parent.rules, 0) };
+            let rule = &parent.rules.rule_at(0);
             parent
                 .imports
                 .borrow_mut()

@@ -97,6 +97,40 @@ unsafe extern "C" {
     fn unicode_text_may_require_bidi_processing(text: *const u16, length: usize) -> bool;
 }
 
+// Stand-ins for the Unicode library's mappings, which a unit test links through a document's render state but never
+// reaches.
+#[cfg(test)]
+mod unicode_test_stubs {
+    use super::UnicodeTextMappingOutput;
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_apply_case_mapping(
+        _text: *const u16,
+        _length: usize,
+        _mapping: u8,
+        _locale: *const u16,
+        _locale_length: usize,
+        _preserve_existing: bool,
+        _output: UnicodeTextMappingOutput,
+    ) {
+        unreachable!("no unit test transforms text");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_apply_fullwidth_mapping(
+        _text: *const u16,
+        _length: usize,
+        _output: UnicodeTextMappingOutput,
+    ) {
+        unreachable!("no unit test transforms text");
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn unicode_text_may_require_bidi_processing(_text: *const u16, _length: usize) -> bool {
+        unreachable!("no unit test transforms text");
+    }
+}
+
 unsafe extern "C" fn allocate_text(context: *mut c_void, length: usize) -> *mut u16 {
     // SAFETY: unicode_mapping lends this result exclusively to its synchronous callbacks.
     let result = unsafe { &mut *context.cast::<TransformedText>() };
@@ -215,7 +249,7 @@ pub(super) fn render_text(
     assert!(options.dom_start_offset <= source_length);
     assert!(options.dom_length_in_code_units <= source_length - options.dom_start_offset);
     let mut result = if options.is_password_input {
-        map_code_points(&source, |_| 0x25cf)
+        map_code_points(&source, |_| 0x2022)
     } else {
         match options.text_transform {
             text_transform::NONE | text_transform::FULL_SIZE_KANA => {
@@ -384,8 +418,8 @@ mod tests {
     #[test]
     fn password_masking_counts_code_points_and_preserves_dom_spans() {
         let source = [0x61, 0xd83d, 0xde00, 0xd800, 0x62];
-        let masked = map_code_points(&source, |_| 0x25cf);
-        assert_eq!(masked.text, [0x25cf; 4]);
+        let masked = map_code_points(&source, |_| 0x2022);
+        assert_eq!(masked.text, [0x2022; 4]);
         assert_eq!(
             masked.edits,
             [RenderedTextEdit {

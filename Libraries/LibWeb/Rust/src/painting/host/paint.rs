@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::CssPixels;
 use crate::layout::svg_formatting_context::FfiSvgNumberPercentage;
 use crate::layout::used_values;
 use crate::painting::display_list::commands::{OptionalAffineTransform, OptionalColor};
+use crate::stage::MainThread;
 use libgfx_rust::{Color, IntRect, InterpolationColorSpace};
 use std::ffi::c_void;
 
@@ -21,9 +21,9 @@ pub struct FfiRecordingInputs {
     pub force_dark_foreground_threshold: i32,
     pub force_dark_background_threshold: i32,
     pub should_paint_overlay: bool,
-    pub is_recording_async_scrolling_metadata: bool,
     pub document_id: i64,
     pub has_blocking_wheel_event_region_covering_viewport: bool,
+    pub has_navigable_container_with_composited_context: bool,
     pub wheel_event_listener_state_generation: u64,
     pub chrome_metrics: crate::painting::ffi::FfiChromeMetrics,
     pub paint_viewport_scrollbars: bool,
@@ -40,8 +40,14 @@ pub struct FfiRecordingInputs {
     pub selection_background_from_palette: Color,
     pub selection_background_light: Color,
     pub selection_background_dark: Color,
+    pub inactive_selection_background_from_palette: Color,
+    pub inactive_selection_background_light: Color,
+    pub inactive_selection_background_dark: Color,
     pub palette_is_dark: bool,
     pub document_has_supported_color_schemes: bool,
+    pub document_supports_light_or_dark: bool,
+    pub image_fallback_color_scheme: u8,
+    pub accessibility_focus_target: crate::layout::node_data::NodeSlotId,
     pub has_inspector_highlight: bool,
     pub inspector_highlight_paintable: crate::layout::node_data::NodeSlotId,
     pub tooltip_color: Color,
@@ -58,35 +64,42 @@ pub struct FfiRecordingInputs {
     pub focused_area_outline: FfiFocusedAreaOutline,
     pub inspector_highlight_label: FfiInspectorHighlightLabel,
     pub grid_label_fonts: FfiOverlayLabelFonts,
+    pub text_fragment_indications: *const FfiTextFragmentIndicationRange,
+    pub text_fragment_indication_count: usize,
+    pub mark_color: Color,
+    pub mark_text_color: Color,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FfiTextFragmentIndicationRange {
+    pub text_node: crate::layout::node_data::NodeSlotId,
+    pub start: usize,
+    pub end: usize,
 }
 
 impl FfiRecordingInputs {
+    /// The inputs of a recording, but for what the frame it records decides, which copy what they read of the arrays
+    /// and byte buffers.
+    ///
     /// # Safety
     ///
-    /// Nonempty arrays and byte buffers must be aligned, valid and immutable for the
-    /// returned inputs' lifetime. Fonts for enabled overlays must point to live `Gfx::Font`s.
-    pub(crate) unsafe fn borrow_recording_inputs(
-        &self,
-        tree_inputs: super::FfiVisualContextTreeInputs,
-        root_background_source: super::FfiRootBackgroundSource,
-    ) -> crate::painting::record::inputs::RecordingInputs<'_> {
+    /// Nonempty arrays and byte buffers must be aligned, valid and immutable for this call. Fonts
+    /// for enabled overlays must point to live `Gfx::Font`s.
+    pub(crate) unsafe fn recording_inputs(&self) -> crate::painting::record::inputs::UnframedRecordingInputs {
         use crate::painting::display_list::commands::UniqueNodeId;
         use crate::painting::force_dark::ForceDarkSettings;
         use crate::painting::record::inputs::{
             CaretPaint, CaretTarget, FocusedAreaOutline, FocusedTextControlSelection, GridOverlays, InspectorHighlight,
-            RecordingInputs,
+            RecordingInputs, UnframedRecordingInputs,
         };
-        use libcompositing_rust::ffi::ffi_slice;
 
-        // SAFETY: The caller lends these arrays and buffers for the returned inputs' lifetime.
-        let (grid_overlays, flex_overlays, outline_path) = unsafe {
+        // SAFETY: The caller lends these arrays and buffers for this call.
+        let (grid_overlays, flex_overlays, text_fragment_indications) = unsafe {
             (
-                ffi_slice(self.grid_overlays, self.grid_overlay_count),
-                ffi_slice(self.flex_overlays, self.flex_overlay_count),
-                ffi_slice(
-                    self.focused_area_outline.path_bytes,
-                    self.focused_area_outline.path_byte_count,
-                ),
+                ak::slice_from_raw_parts(self.grid_overlays, self.grid_overlay_count),
+                ak::slice_from_raw_parts(self.flex_overlays, self.flex_overlay_count),
+                ak::slice_from_raw_parts(self.text_fragment_indications, self.text_fragment_indication_count),
             )
         };
         let caret = self.caret;
@@ -99,20 +112,18 @@ impl FfiRecordingInputs {
             FfiCaretPaintKind::EmptyInline => Some(CaretTarget::EmptyInline(caret.block)),
         };
         let control = self.focused_text_control;
-        RecordingInputs {
-            device_pixels_per_css_pixel: tree_inputs.device_pixels_per_css_pixel,
+        UnframedRecordingInputs(RecordingInputs {
+            device_pixels_per_css_pixel: 0.0,
             uncaptured: crate::painting::record::inputs::UncapturedContentInputs {
-                viewport_wheel_overflow_x: tree_inputs.viewport_wheel_overflow_x,
-                viewport_wheel_overflow_y: tree_inputs.viewport_wheel_overflow_y,
-                root_background_source,
+                root_background_source: Default::default(),
                 device_viewport_size: libgfx_rust::IntSize {
                     width: self.device_viewport_rect.width,
                     height: self.device_viewport_rect.height,
                 },
-                is_recording_async_scrolling_metadata: self.is_recording_async_scrolling_metadata,
                 document_id: UniqueNodeId(self.document_id),
                 has_blocking_wheel_event_region_covering_viewport: self
                     .has_blocking_wheel_event_region_covering_viewport,
+                has_navigable_container_with_composited_context: self.has_navigable_container_with_composited_context,
                 chrome_metrics: self.chrome_metrics,
                 paint_viewport_scrollbars: self.paint_viewport_scrollbars,
                 middle_button_scroll_origin: self
@@ -139,13 +150,20 @@ impl FfiRecordingInputs {
             selection_background_from_palette: self.selection_background_from_palette,
             selection_background_light: self.selection_background_light,
             selection_background_dark: self.selection_background_dark,
+            inactive_selection_background_from_palette: self.inactive_selection_background_from_palette,
+            inactive_selection_background_light: self.inactive_selection_background_light,
+            inactive_selection_background_dark: self.inactive_selection_background_dark,
             palette_is_dark: self.palette_is_dark,
             document_has_supported_color_schemes: self.document_has_supported_color_schemes,
+            document_supports_light_or_dark: self.document_supports_light_or_dark,
+            image_fallback_color_scheme: self.image_fallback_color_scheme,
+            accessibility_focus_target: (!self.accessibility_focus_target.is_invalid())
+                .then_some(self.accessibility_focus_target),
             inspector_highlight: self.has_inspector_highlight.then(|| {
                 // SAFETY: The caller lends the label bytes and supplies live fonts for this overlay.
                 let (text, fonts) = unsafe {
                     (
-                        ffi_slice(
+                        ak::slice_from_raw_parts(
                             self.inspector_highlight_label.text,
                             self.inspector_highlight_label.text_byte_count,
                         ),
@@ -154,7 +172,7 @@ impl FfiRecordingInputs {
                 };
                 InspectorHighlight {
                     paintable: self.inspector_highlight_paintable,
-                    label: String::from_utf8_lossy(text),
+                    label: String::from_utf8_lossy(text).into_owned(),
                     fonts,
                 }
             }),
@@ -162,11 +180,11 @@ impl FfiRecordingInputs {
             tooltip_text_color: self.tooltip_text_color,
             tooltip_border_color: self.tooltip_border_color,
             grid_overlays: (!grid_overlays.is_empty()).then(|| GridOverlays {
-                inputs: grid_overlays,
+                inputs: grid_overlays.into(),
                 // SAFETY: The caller supplies live label fonts when grid overlays are enabled.
                 fonts: unsafe { self.grid_label_fonts.retain() },
             }),
-            flex_overlays,
+            flex_overlays: flex_overlays.into(),
             caret_debug_rect: self
                 .caret_debug_rect
                 .has_value
@@ -183,18 +201,20 @@ impl FfiRecordingInputs {
                 start: control.start,
                 end: control.end,
             }),
-            focused_area_outline: (!outline_path.is_empty()).then_some(FocusedAreaOutline {
+            focused_area_outline: (self.focused_area_outline.area != 0).then_some(FocusedAreaOutline {
                 image: self.focused_area_outline.image,
-                path_bytes: outline_path,
-                color: self.focused_area_outline.color,
-                width: self.focused_area_outline.width,
+                area: self.focused_area_outline.area,
             }),
-        }
+            text_fragment_indications: text_fragment_indications.to_vec().into(),
+            mark_color: self.mark_color,
+            mark_text_color: self.mark_text_color,
+        })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiCaretPaintKind {
     None,
     /// `block` paints the caret, in the fragment run owned by the self-painting inline `owner`
@@ -228,16 +248,13 @@ pub struct FfiFocusedTextControlSelection {
 }
 
 /// The focus ring of a focused image-map area, painted by the image whose rendering makes the
-/// area's shape focusable. No path bytes means no focus ring.
+/// area's shape focusable, along the shape the image's map gives the area its style-tree identity
+/// names. An identity of zero means no focus ring.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiFocusedAreaOutline {
     pub image: crate::layout::node_data::NodeSlotId,
-    /// A serialised `Gfx::Path` in the image's own coordinate space, live for the recording call.
-    pub path_bytes: *const u8,
-    pub path_byte_count: usize,
-    pub color: Color,
-    pub width: crate::css::css_pixels::CssPixels,
+    pub area: u32,
 }
 
 /// The platform default font at an overlay label's CSS size and at that size in device pixels.
@@ -295,6 +312,7 @@ pub struct FfiFlexOverlayInput {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiImageContentKind {
     #[default]
     None,
@@ -342,6 +360,7 @@ pub struct FfiLayerImagePaintFactsEntry {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiVideoRepresentation {
     #[default]
     VideoFrame,
@@ -370,6 +389,7 @@ pub struct FfiVideoPaintFacts {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiSvgGradientSpreadMethod {
     #[default]
     Pad,
@@ -379,6 +399,7 @@ pub enum FfiSvgGradientSpreadMethod {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiSvgGradientKind {
     #[default]
     Linear,
@@ -421,18 +442,10 @@ pub struct FfiSvgPatternDescription {
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-pub struct FfiSelectionShadowLayer {
-    pub color: Color,
-    pub offset_x: CssPixels,
-    pub offset_y: CssPixels,
-    pub blur_radius: CssPixels,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
 pub struct FfiSelectionStyleFacts {
     pub colors_authored: bool,
     pub background_color: Color,
+    pub background_color_is_current_color: bool,
     pub text_color: OptionalColor,
     pub wash_color: Color,
     pub has_text_shadow: bool,
@@ -441,6 +454,7 @@ pub struct FfiSelectionStyleFacts {
     pub text_decoration_line_count: u32,
     pub text_decoration_style: u8,
     pub text_decoration_color: Color,
+    pub text_decoration_color_is_current_color: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -461,9 +475,8 @@ pub struct FfiVectorImageRenderRequest {
     pub css_width: crate::css::css_pixels::CssPixels,
     pub css_height: crate::css::css_pixels::CssPixels,
     pub raster_scale: f32,
+    pub color_scheme: u8,
 }
-
-pub use crate::painting::display_list::storage::FfiRecordedDisplayList;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
@@ -526,35 +539,44 @@ pub struct FfiSnapAreaGeometry {
     pub always_stop: bool,
 }
 
+/// Where a recording's resources go once it is published. The fields are private: the callbacks
+/// are reached only through the methods below, which take the main thread token.
+///
+/// NB: The callbacks are typed as safe functions because the table only comes from the host through an export
+///     whose safety contract keeps them callable, and the private fields let nothing else call them.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiRecordingPublishCallbacks {
-    pub context: *mut c_void,
-    pub add_font: unsafe extern "C" fn(*mut c_void, *const c_void),
-    pub add_image_frame: unsafe extern "C" fn(*mut c_void, *const c_void),
-    pub resolve_vector_image_display_list: unsafe extern "C" fn(*mut c_void, *const FfiVectorImageRenderRequest) -> u64,
-    pub add_video_sink: unsafe extern "C" fn(*mut c_void, u64, u64),
+    context: *mut c_void,
+    add_font: extern "C" fn(*mut c_void, *const c_void),
+    add_image_frame: extern "C" fn(*mut c_void, *const c_void),
+    resolve_vector_image_display_list: extern "C" fn(*mut c_void, *const FfiVectorImageRenderRequest) -> u64,
+    add_video_sink: extern "C" fn(*mut c_void, u64, u64),
 }
 
 impl FfiRecordingPublishCallbacks {
-    pub(crate) fn add_font(&self, font: &libgfx_rust::font::FontHandle) {
-        // SAFETY: The C++ host registers the live font synchronously.
-        unsafe { (self.add_font)(self.context, font.as_raw()) };
+    pub(crate) fn add_font(&self, _: &MainThread, font: &libgfx_rust::font::FontHandle) {
+        // The C++ host registers the live font synchronously.
+        (self.add_font)(self.context, font.as_raw());
     }
 
-    pub(crate) fn add_image_frame(&self, frame: &libgfx_rust::image_frame::ImageFrameHandle) {
-        // SAFETY: The C++ host copies the live frame synchronously.
-        unsafe { (self.add_image_frame)(self.context, frame.as_raw()) };
+    pub(crate) fn add_image_frame(&self, _: &MainThread, frame: &libgfx_rust::image_frame::ImageFrameHandle) {
+        // The C++ host copies the live frame synchronously.
+        (self.add_image_frame)(self.context, frame.as_raw());
     }
 
-    pub(crate) fn resolve_vector_image_display_list(&self, request: &FfiVectorImageRenderRequest) -> u64 {
-        // SAFETY: The C++ host records the image's display list synchronously and reads the
+    pub(crate) fn resolve_vector_image_display_list(
+        &self,
+        _: &MainThread,
+        request: &FfiVectorImageRenderRequest,
+    ) -> u64 {
+        // The C++ host records the image's display list synchronously and reads the
         // request only for the duration of the call.
-        unsafe { (self.resolve_vector_image_display_list)(self.context, request) }
+        (self.resolve_vector_image_display_list)(self.context, request)
     }
 
-    pub(crate) fn add_video_sink(&self, resource_id: u64, sink_handle: u64) {
-        // SAFETY: The C++ host registers the sink synchronously.
-        unsafe { (self.add_video_sink)(self.context, resource_id, sink_handle) };
+    pub(crate) fn add_video_sink(&self, _: &MainThread, resource_id: u64, sink_handle: u64) {
+        // The C++ host registers the sink synchronously.
+        (self.add_video_sink)(self.context, resource_id, sink_handle);
     }
 }

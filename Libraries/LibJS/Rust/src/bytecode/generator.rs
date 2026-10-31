@@ -16,8 +16,9 @@ use std::rc::Rc;
 
 use super::basic_block::BasicBlock;
 use super::basic_block::SourceMapEntry;
-use super::ffi::AbstractOperationKind;
-use super::ffi::WellKnownSymbolKind;
+use super::constant::AbstractOperationKind;
+use super::constant::WellKnownSymbolKind;
+use super::executable_data::ExecutableData;
 use super::instruction::{Instruction, specialize_instruction_sequence};
 use super::operand::*;
 use crate::ast::AstArena;
@@ -74,8 +75,7 @@ pub struct FunctionSfdMetadata {
 
 /// GC-free compiled bytecode for a function that top-level code will immediately invoke.
 pub struct PrecompiledFunction {
-    pub generator: Box<Generator>,
-    pub assembled: AssembledBytecode,
+    pub executable: ExecutableData,
     pub metadata: FunctionSfdMetadata,
 }
 
@@ -194,8 +194,8 @@ enum EnvironmentCoordinateScopeKind {
     Dynamic,
 }
 
-const ENVIRONMENT_MODE_LEXICAL: u32 = 0;
-const ENVIRONMENT_MODE_VAR: u32 = 1;
+const ENVIRONMENT_MODE_LEXICAL: u32 = libjs_abi::EnvironmentMode::Lexical as u32;
+const ENVIRONMENT_MODE_VAR: u32 = libjs_abi::EnvironmentMode::Var as u32;
 
 fn should_verify_environment_coordinates() -> bool {
     static SHOULD_VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -292,6 +292,14 @@ impl FinallyContext {
     pub const FIRST_JUMP_INDEX: i32 = 3;
 }
 
+/// The kind of a disposable resource, as the hint operand of AddDisposableResource encodes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DisposableResourceKind {
+    SyncDispose = 0,
+    AsyncDispose = 1,
+}
+
 /// A break/continue target registered with a FinallyContext.
 pub struct FinallyJump {
     pub index: i32,
@@ -339,7 +347,6 @@ pub struct Generator {
     identifier_table_index: HashMap<ak::Utf16FlyString, IdentifierTableIndex>,
     pub property_key_table: Vec<ak::Utf16FlyString>,
     property_key_table_index: HashMap<ak::Utf16FlyString, PropertyKeyTableIndex>,
-    pub compiled_regexes: Vec<*mut std::ffi::c_void>,
 
     // --- Scope/unwind state ---
     pub boundaries: Vec<BlockBoundaryType>,
@@ -368,6 +375,8 @@ pub struct Generator {
     // This avoids the deep-clone issues of an owned Box parent chain.
     pub finally_contexts: Vec<FinallyContext>,
     pub current_finally_context: Option<usize>,
+    /// The [[DisposableResourceStack]] of the innermost scope that has `using` or `await using` declarations.
+    pub current_disposable_resource_stack: Option<ScopedOperand>,
 
     // --- Various counters ---
     pub next_property_lookup_cache: u32,
@@ -377,6 +386,10 @@ pub struct Generator {
     pub next_object_shape_cache: u32,
     pub next_object_property_iterator_cache: u32,
     pub next_environment_shape_cache: u32,
+    pub next_arith_feedback: u32,
+    pub next_value_feedback: u32,
+    pub next_call_feedback: u32,
+    pub next_keyed_feedback: u32,
 
     // --- Codegen state ---
     pub strict: bool,
@@ -405,7 +418,7 @@ pub struct Generator {
 
     // --- Shared function data ---
     // Pending descriptors for SharedFunctionInstanceData objects. These are
-    // materialized at the C++ boundary so bytecode generation can run without
+    // materialized by the runtime so bytecode generation can run without
     // allocating GC cells.
     pub shared_function_data: Vec<PendingSharedFunctionData>,
     pub eager_compile_function_ids: HashSet<FunctionId>,
@@ -435,11 +448,7 @@ pub struct Generator {
     // Used for builtin JS files.
     pub builtin_abstract_operations_enabled: bool,
 
-    // --- FFI context ---
-    // These are set by the top-level compiler and passed through for
-    // creating SharedFunctionInstanceData via FFI callbacks.
-    pub vm_ptr: *mut std::ffi::c_void,
-    pub source_code_ptr: *const std::ffi::c_void,
+    // --- Source ---
     pub source_len: usize,
 
     // --- Function table ---
@@ -478,6 +487,20 @@ macro_rules! next_cache_method {
         pub fn $method(&mut self) -> u32 {
             let index = self.$field;
             self.$field += 1;
+            index
+        }
+    };
+}
+
+/// Feedback slot indices are encoded as u16. Sites beyond the last index share
+/// it, which only merges their feedback.
+pub const MAX_FEEDBACK_SLOT_COUNT: u32 = u16::MAX as u32 + 1;
+
+macro_rules! next_feedback_slot_method {
+    ($method:ident, $field:ident) => {
+        pub fn $method(&mut self) -> u16 {
+            let index = u16::try_from(self.$field).unwrap_or(u16::MAX);
+            self.$field = (self.$field + 1).min(MAX_FEEDBACK_SLOT_COUNT);
             index
         }
     };
@@ -528,7 +551,6 @@ impl Generator {
             identifier_table_index: HashMap::new(),
             property_key_table: Vec::new(),
             property_key_table_index: HashMap::new(),
-            compiled_regexes: Vec::new(),
             boundaries: Vec::new(),
             continuable_scopes: Vec::new(),
             breakable_scopes: Vec::new(),
@@ -542,6 +564,7 @@ impl Generator {
             home_objects: Vec::new(),
             finally_contexts: Vec::new(),
             current_finally_context: None,
+            current_disposable_resource_stack: None,
             next_property_lookup_cache: 0,
             next_global_variable_cache: 0,
             next_environment_coordinate_cache: 0,
@@ -549,6 +572,10 @@ impl Generator {
             next_object_shape_cache: 0,
             next_object_property_iterator_cache: 0,
             next_environment_shape_cache: 0,
+            next_arith_feedback: 0,
+            next_value_feedback: 0,
+            next_call_feedback: 0,
+            next_keyed_feedback: 0,
             strict: false,
             this_value_needs_environment_resolution: true,
             enclosing_function_kind: FunctionKind::Normal,
@@ -590,8 +617,6 @@ impl Generator {
             catch_handler_labels: HashSet::new(),
             annexb_function_names: HashSet::new(),
             builtin_abstract_operations_enabled: false,
-            vm_ptr: std::ptr::null_mut(),
-            source_code_ptr: std::ptr::null(),
             source_len: 0,
             function_table: crate::ast::FunctionTable::new(),
             arena: Arc::new(AstArena::new()),
@@ -862,12 +887,6 @@ impl Generator {
         index
     }
 
-    pub fn intern_regex(&mut self, compiled: *mut std::ffi::c_void) -> RegexTableIndex {
-        let index = u32_from_usize(self.compiled_regexes.len());
-        self.compiled_regexes.push(compiled);
-        RegexTableIndex(index)
-    }
-
     // --- Basic block management ---
 
     /// Create a new basic block and return its label.
@@ -1013,70 +1032,102 @@ impl Generator {
             let block = &mut self.basic_blocks[self.current_block_index.basic_block_index()];
             if let Some((last_instruction, _, _)) = block.instructions.last() {
                 let fused = match last_instruction {
-                    Instruction::LessThan { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpLessThan {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::LessThanEquals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpLessThanEquals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::GreaterThan { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpGreaterThan {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::GreaterThanEquals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpGreaterThanEquals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::LooselyEquals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpLooselyEquals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::LooselyInequals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpLooselyInequals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::StrictlyEquals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpStrictlyEquals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
-                    Instruction::StrictlyInequals { dst, lhs, rhs } if *dst == condition.operand() => {
-                        Some(Instruction::JumpStrictlyInequals {
-                            lhs: *lhs,
-                            rhs: *rhs,
-                            true_target,
-                            false_target,
-                        })
-                    }
+                    Instruction::LessThan {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpLessThan {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::LessThanEquals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpLessThanEquals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::GreaterThan {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpGreaterThan {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::GreaterThanEquals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpGreaterThanEquals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::LooselyEquals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpLooselyEquals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::LooselyInequals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpLooselyInequals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::StrictlyEquals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpStrictlyEquals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
+                    Instruction::StrictlyInequals {
+                        arith_feedback,
+                        dst,
+                        lhs,
+                        rhs,
+                    } if *dst == condition.operand() => Some(Instruction::JumpStrictlyInequals {
+                        arith_feedback: *arith_feedback,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        true_target,
+                        false_target,
+                    }),
                     _ => None,
                 };
                 if let Some(fused_instruction) = fused {
@@ -1104,6 +1155,10 @@ impl Generator {
     next_cache_method!(next_object_shape_cache, next_object_shape_cache);
     next_cache_method!(next_object_property_iterator_cache, next_object_property_iterator_cache);
     next_cache_method!(next_environment_shape_cache, next_environment_shape_cache);
+    next_feedback_slot_method!(next_arith_feedback, next_arith_feedback);
+    next_feedback_slot_method!(next_value_feedback, next_value_feedback);
+    next_feedback_slot_method!(next_call_feedback, next_call_feedback);
+    next_feedback_slot_method!(next_keyed_feedback, next_keyed_feedback);
 
     // --- Lexical environment helpers ---
 
@@ -1238,6 +1293,12 @@ impl Generator {
 
     fn pop_environment_coordinate_scope(&mut self) {
         self.environment_coordinate_scope_stack.pop();
+    }
+
+    /// Records a binding of the innermost environment that an instruction other than CreateVariable creates.
+    pub fn record_environment_binding_created_elsewhere(&mut self, identifier: IdentifierTableIndex) {
+        let name = self.identifier_table[identifier.0 as usize].clone();
+        self.record_environment_binding(name);
     }
 
     fn record_environment_binding(&mut self, name: ak::Utf16FlyString) {
@@ -1770,6 +1831,11 @@ impl Generator {
                     });
                 }
                 BlockBoundaryType::ReturnToFinally => {
+                    debug_assert_eq!(
+                        self.current_finally_context
+                            .and_then(|index| self.finally_contexts[index].lexical_environment_at_entry.as_ref()),
+                        Some(&self.lexical_environment_register_stack[env_stack_offset - 1])
+                    );
                     return;
                 }
                 _ => {}
@@ -1797,6 +1863,29 @@ impl Generator {
         } else {
             self.emit(Instruction::Return { value: value.operand() });
         }
+    }
+
+    pub fn forward_completion_to_outer_finally(
+        &mut self,
+        outer_index: usize,
+        completion_type: &ScopedOperand,
+        completion_value: &ScopedOperand,
+    ) {
+        let outer = &self.finally_contexts[outer_index];
+        let outer_completion_type = outer.completion_type.clone();
+        let outer_completion_value = outer.completion_value.clone();
+        let outer_finally_body = outer.finally_body;
+        let outer_environment = outer.lexical_environment_at_entry.clone();
+        self.emit_mov(&outer_completion_type, completion_type);
+        self.emit_mov(&outer_completion_value, completion_value);
+        if let Some(environment) = outer_environment {
+            self.emit(Instruction::SetLexicalEnvironment {
+                environment: environment.operand(),
+            });
+        }
+        self.emit(Instruction::Jump {
+            target: outer_finally_body,
+        });
     }
 
     pub fn add_constant_i32(&mut self, val: i32) -> ScopedOperand {
@@ -1860,30 +1949,55 @@ impl Generator {
         });
 
         if let Some((load_block_index, load_instruction_index)) = synthetic_load {
-            let saved_environment_is_used = self.basic_blocks.iter().enumerate().any(|(block_index, block)| {
-                block
-                    .instructions
-                    .iter()
-                    .enumerate()
-                    .any(|(instruction_index, (instruction, _, _))| {
-                        if block_index == load_block_index && instruction_index == load_instruction_index {
-                            return false;
+            let is_restore_of_saved_environment = |instruction: &Instruction| {
+                matches!(
+                    instruction,
+                    Instruction::SetLexicalEnvironment { environment } if *environment == saved_environment
+                )
+            };
+            let mut saved_environment_is_only_restored = true;
+            let mut has_restores_of_saved_environment = false;
+            let mut changes_running_lexical_environment = false;
+            for (block_index, block) in self.basic_blocks.iter().enumerate() {
+                for (instruction_index, (instruction, _, _)) in block.instructions.iter().enumerate() {
+                    if block_index == load_block_index && instruction_index == load_instruction_index {
+                        continue;
+                    }
+                    if is_restore_of_saved_environment(instruction) {
+                        has_restores_of_saved_environment = true;
+                        continue;
+                    }
+                    // NB: These are the instructions whose interpreter handlers change the running lexical environment:
+                    //     SetLexicalEnvironment in interpreter.flap, and the slow paths in slow_paths/bindings.rs.
+                    //     Exception unwinding and generator resumption do not change it.
+                    changes_running_lexical_environment |= matches!(
+                        instruction,
+                        Instruction::SetLexicalEnvironment { .. }
+                            | Instruction::CreateLexicalEnvironment { .. }
+                            | Instruction::CreateVariableEnvironment { .. }
+                            | Instruction::EnterObjectEnvironment { .. }
+                    );
+                    let mut instruction = instruction.clone();
+                    instruction.visit_operands(&mut |operand: &mut Operand| {
+                        if *operand == saved_environment {
+                            saved_environment_is_only_restored = false;
                         }
-                        let mut instruction = instruction.clone();
-                        let mut mentions_saved_environment = false;
-                        instruction.visit_operands(&mut |operand: &mut Operand| {
-                            if *operand == saved_environment {
-                                mentions_saved_environment = true;
-                            }
-                        });
-                        mentions_saved_environment
-                    })
-            });
+                    });
+                }
+            }
 
-            if !saved_environment_is_used {
+            // NB: Restoring an environment that no instruction changes does nothing.
+            if saved_environment_is_only_restored
+                && (!has_restores_of_saved_environment || !changes_running_lexical_environment)
+            {
                 self.basic_blocks[load_block_index]
                     .instructions
                     .remove(load_instruction_index);
+                for block in &mut self.basic_blocks {
+                    block
+                        .instructions
+                        .retain(|(instruction, _, _)| !is_restore_of_saved_environment(instruction));
+                }
             }
         }
 
@@ -1901,8 +2015,10 @@ impl Generator {
         // Select declarative single-instruction specializations and fused
         // sequences before operand indices are rewritten away from the
         // generator's constant table.
-        for block in &mut self.basic_blocks {
+        for (block_index, block) in self.basic_blocks.iter_mut().enumerate() {
             remove_redundant_movs(&mut block.instructions);
+
+            mark_loop_back_edge(block_index, &mut block.instructions);
 
             specialize_instructions(&mut block.instructions, &self.constants);
         }
@@ -1946,8 +2062,16 @@ impl Generator {
             Skip,
             JumpToReturn(Operand),
             JumpToEnd(Operand),
-            EmitJumpTrue { condition: Operand, target: Label },
-            EmitJumpFalse { condition: Operand, target: Label },
+            EmitJumpTrue {
+                condition: Operand,
+                target: Label,
+                loop_back_edge: bool,
+            },
+            EmitJumpFalse {
+                condition: Operand,
+                target: Label,
+                loop_back_edge: bool,
+            },
         }
         let mut actions: Vec<Vec<InstAction>> = Vec::with_capacity(num_blocks);
         let mut offset: usize = 0;
@@ -1958,7 +2082,7 @@ impl Generator {
             let mut block_actions = Vec::with_capacity(block.instructions.len());
             for (instruction, _, _) in &block.instructions {
                 match instruction {
-                    Instruction::Jump { target } => {
+                    Instruction::Jump { target } | Instruction::JumpLoop { target } => {
                         let target_block = target.0 as usize;
                         // OPTIMIZATION: Don't emit jumps that just jump to the next block.
                         if target_block == block_index + 1 {
@@ -1994,15 +2118,22 @@ impl Generator {
                         condition,
                         true_target,
                         false_target,
+                    }
+                    | Instruction::JumpIfLoop {
+                        condition,
+                        true_target,
+                        false_target,
                     } => {
                         let true_block = true_target.0 as usize;
                         let false_block = false_target.0 as usize;
+                        let loop_back_edge = matches!(instruction, Instruction::JumpIfLoop { .. });
                         // OPTIMIZATION: Replace JumpIf where one target is next block
                         // with JumpTrue or JumpFalse.
                         if true_block == block_index + 1 {
                             block_actions.push(InstAction::EmitJumpFalse {
                                 condition: *condition,
                                 target: *false_target,
+                                loop_back_edge,
                             });
                             let replacement = Instruction::JumpFalse {
                                 condition: *condition,
@@ -2015,6 +2146,7 @@ impl Generator {
                             block_actions.push(InstAction::EmitJumpTrue {
                                 condition: *condition,
                                 target: *true_target,
+                                loop_back_edge,
                             });
                             let replacement = Instruction::JumpTrue {
                                 condition: *condition,
@@ -2125,7 +2257,11 @@ impl Generator {
                         let replacement = Instruction::End { value };
                         replacement.encode(*strict, &mut bytecode);
                     }
-                    InstAction::EmitJumpFalse { condition, mut target } => {
+                    InstAction::EmitJumpFalse {
+                        condition,
+                        mut target,
+                        loop_back_edge,
+                    } => {
                         // Patch label for the target
                         let target_block = target.0 as usize;
                         target.0 = u32_from_usize(block_offsets[target_block]);
@@ -2138,10 +2274,18 @@ impl Generator {
                                 column: sm.column,
                             },
                         );
-                        let replacement = Instruction::JumpFalse { condition, target };
+                        let replacement = if loop_back_edge {
+                            Instruction::JumpFalseLoop { condition, target }
+                        } else {
+                            Instruction::JumpFalse { condition, target }
+                        };
                         replacement.encode(*strict, &mut bytecode);
                     }
-                    InstAction::EmitJumpTrue { condition, mut target } => {
+                    InstAction::EmitJumpTrue {
+                        condition,
+                        mut target,
+                        loop_back_edge,
+                    } => {
                         let target_block = target.0 as usize;
                         target.0 = u32_from_usize(block_offsets[target_block]);
                         let instruction_offset = bytecode.len();
@@ -2153,7 +2297,11 @@ impl Generator {
                                 column: sm.column,
                             },
                         );
-                        let replacement = Instruction::JumpTrue { condition, target };
+                        let replacement = if loop_back_edge {
+                            Instruction::JumpTrueLoop { condition, target }
+                        } else {
+                            Instruction::JumpTrue { condition, target }
+                        };
                         replacement.encode(*strict, &mut bytecode);
                     }
                 }
@@ -2316,6 +2464,89 @@ fn specialize_instructions(instructions: &mut Vec<(Instruction, SourceMapEntry, 
         read_index += consumed;
     }
     instructions.truncate(write_index);
+}
+
+/// A jump to the same or an earlier block is a loop back edge. Back edges use
+/// the loop variants of the jump instructions, which count loop iterations
+/// towards the executable's tier-up budget, so that ordinary jumps do not
+/// have to check their direction.
+fn mark_loop_back_edge(block_index: usize, instructions: &mut [(Instruction, SourceMapEntry, bool)]) {
+    let Some((instruction, _, _)) = instructions.last_mut() else {
+        return;
+    };
+    let mut is_back_edge = false;
+    instruction.visit_labels(&mut |label: &mut Label| {
+        if label.0 as usize <= block_index {
+            is_back_edge = true;
+        }
+    });
+    if !is_back_edge {
+        return;
+    }
+
+    macro_rules! compare_jump_loop {
+        ($from:ident, $to:ident, $instruction:expr) => {
+            if let Instruction::$from {
+                arith_feedback,
+                lhs,
+                rhs,
+                true_target,
+                false_target,
+            } = $instruction
+            {
+                return Some(Instruction::$to {
+                    arith_feedback: *arith_feedback,
+                    lhs: *lhs,
+                    rhs: *rhs,
+                    true_target: *true_target,
+                    false_target: *false_target,
+                });
+            }
+        };
+    }
+
+    let loop_variant = |instruction: &Instruction| -> Option<Instruction> {
+        match instruction {
+            Instruction::Jump { target } => return Some(Instruction::JumpLoop { target: *target }),
+            Instruction::JumpIf {
+                condition,
+                true_target,
+                false_target,
+            } => {
+                return Some(Instruction::JumpIfLoop {
+                    condition: *condition,
+                    true_target: *true_target,
+                    false_target: *false_target,
+                });
+            }
+            Instruction::JumpTrue { condition, target } => {
+                return Some(Instruction::JumpTrueLoop {
+                    condition: *condition,
+                    target: *target,
+                });
+            }
+            Instruction::JumpFalse { condition, target } => {
+                return Some(Instruction::JumpFalseLoop {
+                    condition: *condition,
+                    target: *target,
+                });
+            }
+            _ => {}
+        }
+        compare_jump_loop!(JumpLessThan, JumpLessThanLoop, instruction);
+        compare_jump_loop!(JumpGreaterThan, JumpGreaterThanLoop, instruction);
+        compare_jump_loop!(JumpLessThanEquals, JumpLessThanEqualsLoop, instruction);
+        compare_jump_loop!(JumpGreaterThanEquals, JumpGreaterThanEqualsLoop, instruction);
+        compare_jump_loop!(JumpLooselyEquals, JumpLooselyEqualsLoop, instruction);
+        compare_jump_loop!(JumpLooselyInequals, JumpLooselyInequalsLoop, instruction);
+        compare_jump_loop!(JumpStrictlyEquals, JumpStrictlyEqualsLoop, instruction);
+        compare_jump_loop!(JumpStrictlyInequals, JumpStrictlyInequalsLoop, instruction);
+        None
+    };
+
+    if let Some(replacement) = loop_variant(instruction) {
+        *instruction = replacement;
+    }
 }
 
 fn remove_redundant_movs(instructions: &mut Vec<(Instruction, SourceMapEntry, bool)>) {

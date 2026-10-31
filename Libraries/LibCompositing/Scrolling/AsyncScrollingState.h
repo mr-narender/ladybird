@@ -23,6 +23,8 @@
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 #include <LibWebCommon/Page/AsyncScrollNodeStableID.h>
+#include <LibWebCommon/Page/CompositorContextId.h>
+#include <LibWebCommon/Page/InputRoutingDecision.h>
 
 namespace Compositing {
 
@@ -45,10 +47,20 @@ struct AsyncScrollOffset {
     // The most recent nonzero delta of a relative scroll in each axis, such as a wheel or panning scroll. Absolute
     // scrolls, such as dragging a scrollbar thumb, leave it as it is.
     Gfx::FloatPoint last_relative_scroll_delta;
+    // The scale the visual viewport was zoomed to, which only its scroll node reports.
+    Optional<float> visual_viewport_scale;
+    // The last of the main thread's scroll requests for the box that the compositor applied before it reported this.
+    u64 applied_scroll_request_id { 0 };
+    // How many times the compositor had scrolled the box for user input of its own when it reported this.
+    u64 user_input_scroll_count { 0 };
 
     void merge_later_scroll(AsyncScrollOffset const& later)
     {
         compositor_scroll_offset = later.compositor_scroll_offset;
+        applied_scroll_request_id = later.applied_scroll_request_id;
+        user_input_scroll_count = later.user_input_scroll_count;
+        if (later.visual_viewport_scale.has_value())
+            visual_viewport_scale = later.visual_viewport_scale;
         unadopted_scroll_delta.translate_by(later.unadopted_scroll_delta);
         if (later.last_relative_scroll_delta.x() != 0)
             last_relative_scroll_delta.set_x(later.last_relative_scroll_delta.x());
@@ -68,6 +80,12 @@ struct AsyncScrollNode {
     bool is_viewport { false };
     bool can_be_wheel_scrolled_horizontally { false };
     bool can_be_wheel_scrolled_vertically { false };
+    // Whether a scroll the scroller cannot scroll by is passed on to the scrollers around it.
+    bool chains_scroll_to_ancestors_horizontally { true };
+    bool chains_scroll_to_ancestors_vertically { true };
+    // Whether a touchpad may pull the scroller past the edges of its scroll range.
+    bool shows_overscroll_effect_horizontally { true };
+    bool shows_overscroll_effect_vertically { true };
 };
 
 // A region with a non-passive wheel listener. Wheels inside it must stay on the main thread because script may cancel.
@@ -91,6 +109,26 @@ struct MainThreadWheelEventRegion {
     Gfx::FloatRect rect;
 };
 
+// Where a nested context's content is painted. A wheel inside it that no wheel hit test target painted later covers
+// can be handed to the nested context.
+struct NestedContextWheelRegion {
+    Compositing::ContextRef context;
+    Gfx::FloatRect rect;
+    Gfx::CornerRadii corner_radii;
+    Web::CompositorContextId child_context_id;
+    u32 paint_order_index { 0 };
+};
+
+// A scroll container without a scroll node of its own that keeps the scrolls along an axis to itself. A wheel inside
+// its rect is not passed on along that axis to the scroll node above it.
+struct ScrollChainingBarrier {
+    Compositing::ContextRef context;
+    Gfx::FloatRect rect;
+    AsyncScrollNodeID scroll_node_id_above_barrier;
+    bool keeps_horizontal_scrolls { false };
+    bool keeps_vertical_scrolls { false };
+};
+
 struct AsyncScrollbar {
     AsyncScrollNodeID scroll_node_id;
     Optional<Web::AsyncScrollNodeStableID> scroller_stable_node_id;
@@ -110,10 +148,9 @@ struct AsyncScrollbar {
     Color thumb_color;
     Color track_color;
     bool vertical { false };
-    // The compositor paints the viewport's scrollbars itself and owns their hover expansion. The display list paints
-    // every other scrollbar, in whichever of the two geometries the main thread currently gives it.
+    // The compositor paints the viewport's scrollbars itself. The display list paints every other scrollbar thin, which
+    // the compositor presents growing as it is hovered, as it does its own.
     bool is_painted_by_compositor { false };
-    bool display_list_paints_enlarged_scrollbar { false };
 };
 
 // A scroll node that is a snap container, with the geometry snap positions are selected from.
@@ -124,10 +161,13 @@ struct AsyncSnapContainer {
 };
 
 struct AsyncScrollingState {
+    Optional<Web::UniqueNodeID> document_id;
     Vector<AsyncScrollNode> scroll_nodes;
     Vector<AsyncSnapContainer> snap_containers;
     Vector<WheelHitTestTarget> wheel_hit_test_targets;
     Vector<MainThreadWheelEventRegion> main_thread_wheel_event_regions;
+    Vector<NestedContextWheelRegion> nested_context_wheel_regions;
+    Vector<ScrollChainingBarrier> scroll_chaining_barriers;
     Vector<AsyncScrollbar> scrollbars;
 
     // Non-passive wheel listeners can cancel scrolling, so async scrolling must treat them as hard barriers.
@@ -142,6 +182,8 @@ struct AsyncScrollingState {
     u64 wheel_event_listener_state_generation { 0 };
     bool has_blocking_wheel_event_listeners { false };
     bool has_blocking_wheel_event_region_covering_viewport { false };
+    bool viewport_keeps_horizontal_scrolls { false };
+    bool viewport_keeps_vertical_scrolls { false };
     double device_pixels_per_css_pixel { 1.0 };
 };
 
@@ -153,18 +195,14 @@ enum class WheelRoutingAdmission {
     StaleWheelEventListeners,
 };
 
-enum class WheelScrollAdmission {
-    Accepted,
-    NoScrollableTarget,
-    BlockedByMainThreadRegion,
-    StaleBlockingWheelEventRegions,
-    BlockedByWheelEventRegion,
-};
-
 COMPOSITING_API AsyncScrollingState async_scrolling_state_from_display_list(Compositing::DisplayList const&);
+// The scrolling state as tests read it, from WebContent and from the compositor alike.
+COMPOSITING_API JsonObject async_scrolling_state_to_json(AsyncScrollingState const&);
 COMPOSITING_API WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const&);
-COMPOSITING_API Utf16View wheel_routing_admission_to_utf16_view(WheelRoutingAdmission);
-COMPOSITING_API bool blocks_wheel_event_at_position(AsyncScrollingState const&, RefPtr<Compositing::DisplayList const> const&, Compositing::AccumulatedVisualContextTree const*, Compositing::ScrollStateSnapshot const&, Gfx::FloatPoint position);
-COMPOSITING_API WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const&, RefPtr<Compositing::DisplayList const> const&, Compositing::AccumulatedVisualContextTree const*, Compositing::ScrollStateSnapshot const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool blocking_wheel_event_regions_are_current);
+// The admission of a scrolling state recorded before the newest change to the page's blocking wheel event listeners is
+// stale, as the state may not have the regions that change made.
+COMPOSITING_API WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const&, u64 newest_wheel_event_listener_state_generation);
+// Why a wheel step that the admission does not let the compositor scroll is left to the main thread.
+COMPOSITING_API Web::InputRoutingDecision input_routing_decision_for_wheel_step_not_admitted_by(WheelRoutingAdmission);
 
 }

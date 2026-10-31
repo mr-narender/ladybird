@@ -9,12 +9,13 @@
 
 #include <LibGfx/AffineTransform.h>
 #include <LibWeb/DOM/EventTarget.h>
+#include <LibWeb/Export.h>
 #include <LibWebCommon/PixelUnits.h>
 
 namespace Web::CSS {
 
 // https://drafts.csswg.org/cssom-view/#visualviewport
-class VisualViewport final : public DOM::EventTarget {
+class WEB_API VisualViewport final : public DOM::EventTarget {
     WEB_WRAPPABLE(VisualViewport, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(VisualViewport);
 
@@ -50,7 +51,10 @@ public:
 
     [[nodiscard]] Gfx::AffineTransform transform() const;
     void zoom(CSSPixelPoint position, double scale_delta);
+    void set_scale_zoomed_by_compositor(double scale);
     CSSPixelPoint map_to_layout_viewport(CSSPixelPoint) const;
+    CSSPixelPoint map_from_layout_viewport(CSSPixelPoint) const;
+    CSSPixelRect map_from_layout_viewport(CSSPixelRect const&) const;
     void reset();
 
 private:
@@ -59,6 +63,7 @@ private:
     virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
     void did_scroll();
+    void did_change_offset_or_scale();
     void update_accumulated_visual_context();
 
     GC::Ref<DOM::Document> m_document;

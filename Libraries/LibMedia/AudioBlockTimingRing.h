@@ -11,7 +11,7 @@
 #include <AK/Noncopyable.h>
 #include <AK/Optional.h>
 #include <AK/TearableAtomic.h>
-#include <LibMedia/AudioBlockTiming.h>
+#include <LibMediaCodecs/AudioBlockTiming.h>
 
 namespace Media {
 
@@ -114,6 +114,8 @@ private:
         if (version_before != version_after || version_after % 2 != 0)
             return {};
         if (record.sequence != expected_sequence)
+            return {};
+        if (record.timing.frame_count() <= 0 || record.timing.media_time_duration().is_negative())
             return {};
         return record;
     }

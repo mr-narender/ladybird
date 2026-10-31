@@ -11,19 +11,19 @@
 
 use super::assemble::{AssemblyEvent, AssemblyHost, OutputPosition, ProducerOutcome, ScopeAction, ScopePlan};
 use super::order_tree::ProducerKind;
-use super::trace::{Action, Observer, Operation, producer_name};
-use super::verify::LoggedCapture;
+use super::trace::{Action, Observer, Operation};
 use super::{PaintPhase, PaintRecorder};
 use crate::css::css_pixels::CssPixelRect;
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
-use crate::painting::display_list::builder::CommandRange;
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::paint_order_plan::{PaintScope, PaintScopePlan};
+use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::paintable_data::PaintableFlag;
 use crate::painting::record::damage::PaintDamage;
 use crate::painting::record::svg_resources::MaskLayerSet;
 use crate::painting::scroll_snap;
+use libgfx_rust::Color;
 use smallvec::SmallVec;
 use std::ops::Range;
 
@@ -60,12 +60,17 @@ fn hit_phase(kind: ProducerKind) -> Option<PaintPhase> {
 }
 
 impl<O: Observer> PaintRecorder<'_, O> {
-    pub(crate) fn record_canvas(&mut self) {
+    pub(crate) fn record_canvas(&mut self) -> Color {
+        let mut root_group_color = Color::TRANSPARENT;
         self.trace_paint(Operation::Named(None, "canvas"), |this| {
             let inputs = this.inputs;
+            let canvas_color = this
+                .recorder
+                .resolve_color(inputs.uncaptured.canvas_color, ForceDarkRole::Background);
             if let Some(rect) = inputs.canvas_fill_rect {
                 this.recorder
                     .fill_rect(rect, inputs.uncaptured.canvas_color, ForceDarkRole::Background);
+                root_group_color = canvas_color;
             }
             // .. in the case of embedded documents typically rendered over a transparent canvas
             // (such as provided via an HTML iframe element), if the used color scheme of the element
@@ -78,13 +83,19 @@ impl<O: Observer> PaintRecorder<'_, O> {
                     inputs.uncaptured.canvas_color,
                     ForceDarkRole::Background,
                 );
+                root_group_color = canvas_color;
             }
             this.recorder.fill_rect(
                 inputs.bitmap_rect,
                 inputs.uncaptured.background_color,
                 ForceDarkRole::Background,
             );
+            root_group_color = root_group_color.blend(
+                this.recorder
+                    .resolve_color(inputs.uncaptured.background_color, ForceDarkRole::Background),
+            );
         });
+        root_group_color
     }
 
     // https://drafts.csswg.org/css-transforms-1/#transform-function-lists
@@ -93,7 +104,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
     // is animated is retained so the compositor can reveal it without a main-thread repaint.
     fn stacking_context_paints(&self, owner: NodeSlotId) -> bool {
         !(self.data(owner).has_flag(PaintableFlag::HasNonInvertibleCssTransform)
-            && self.layout_arena.node_flags_if_live(owner) & NodeFlag::HasAnimatedOpacityOrTransform as u32 == 0)
+            && self.source.node_flags_if_live(owner) & NodeFlag::HasAnimatedOpacityOrTransform as u32 == 0)
     }
 
     // The transparent fill that triggers a content-generating SVG filter, and the mask
@@ -101,7 +112,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
     fn record_scope_preamble(&mut self, owner: NodeSlotId) {
         let context = self.own_context(owner);
         self.recorder.set_accumulated_visual_context(context);
-        if let Some(svg_filter_bounds) = self.layout_arena.paintable_side_data(owner).svg_filter_bounds.get() {
+        if let Some(svg_filter_bounds) = self.source.committed_side_data(owner).svg_filter_bounds {
             let device_rect = self
                 .converter
                 .enclosing_device_rect(CssPixelRect::from(svg_filter_bounds));
@@ -141,7 +152,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
     }
 
     fn record_svg_box_foreground(&mut self, owner: NodeSlotId) {
-        self.paint_svg_box_impl(owner, PaintPhase::Foreground);
+        self.paint_svg_box_impl(owner);
         self.recorder.set_accumulated_visual_context(ContextRef::default());
     }
 
@@ -167,21 +178,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
 impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
     fn plan_scope(&mut self, scope: PaintScope) -> ScopePlan {
-        let use_prepared_inputs = self.plan_from_prepared_inputs;
-        let plan = PaintScopePlan::build(
-            self.layout_arena,
-            scope,
-            self.inputs.should_paint_overlay,
-            use_prepared_inputs,
-        );
-        if use_prepared_inputs && crate::painting::record::verify::enabled_by_environment() {
-            let canonical = PaintScopePlan::build(self.layout_arena, scope, self.inputs.should_paint_overlay, false);
-            assert!(
-                plan.items == canonical.items
-                    && plan.establishes_stacking_context == canonical.establishes_stacking_context,
-                "prepared paint-order inputs of {scope:?} are stale"
-            );
-        }
+        let plan = PaintScopePlan::build(self.source, scope, self.inputs.should_paint_overlay);
         let active = !plan.establishes_stacking_context || self.stacking_context_paints(scope.owner);
         ScopePlan {
             active,
@@ -197,9 +194,10 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
         if self.producer_is_skipped(owner, kind) {
             self.observer
                 .observe(|log| log.leaf(Operation::Producer(owner, kind), Action::Skip, true));
-            return ProducerOutcome { live: false };
+            return ProducerOutcome::default();
         }
         self.live_producer = false;
+        self.producer_reads_window_focus.set(false);
         let start = self.output_position();
         self.observer
             .observe(|log| log.begin(Operation::Producer(owner, kind), Action::Record));
@@ -208,7 +206,7 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
             ProducerKind::ScrollMetadata => self.record_scroll_metadata(owner),
             ProducerKind::Svg => self.record_svg_box_foreground(owner),
             ProducerKind::InlinePiece(index) | ProducerKind::TextFragment(index) => {
-                let root = if crate::painting::node_painting::has_lines(self.layout_arena, owner) {
+                let root = if crate::painting::node_painting::has_lines(self.source, owner) {
                     owner
                 } else {
                     self.data(owner).containing_block
@@ -231,29 +229,15 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
             }
         }
         let end = self.output_position();
-        self.observer.observe(|log| {
-            log.end(end.bytes == start.bytes && end.hits == start.hits);
-            log.command_byte_captures.push(LoggedCapture {
-                start: start.bytes,
-                length: end.bytes - start.bytes,
-                owner,
-                label: producer_name(kind),
-                copied: false,
-            });
-            log.hit_test_item_captures.push(LoggedCapture {
-                start: start.hits,
-                length: end.hits - start.hits,
-                owner,
-                label: producer_name(kind),
-                copied: false,
-            });
-        });
+        self.observer
+            .observe(|log| log.end(end.bytes == start.bytes && end.hits == start.hits));
         debug_assert!(
             self.recorder.is_producer_boundary(),
             "a producer ends at a closed group boundary without ambient state"
         );
         ProducerOutcome {
             live: self.live_producer,
+            reads_window_focus: self.producer_reads_window_focus.get(),
         }
     }
 
@@ -267,66 +251,41 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
 
     fn copy_published(&mut self, bytes: Range<u32>, hits: Range<u32>, blocking_wheel_event_regions: u32) {
         let frame = self
-            .source_frame
+            .source_recording
             .as_ref()
-            .expect("clean output is copied from a published frame");
+            .expect("clean output is copied from a published recording");
         let items = self
             .source_items
             .as_ref()
-            .expect("clean output is copied from a published frame");
-        let destination = self.output_position();
-        if !bytes.is_empty() {
-            self.recorder.append_cached_command_range_verbatim(
-                &frame.display_list,
-                CommandRange {
-                    offset: bytes.start,
-                    size: bytes.end - bytes.start,
-                },
-            );
-        }
+            .expect("clean output is copied from a published recording");
+        self.recorder.append_cached_commands(&frame.display_list, bytes);
         if !hits.is_empty() {
             self.list
                 .append_copies_of(&items.items[hits.start as usize..hits.end as usize]);
         }
         self.blocking_wheel_event_region_count += blocking_wheel_event_regions;
-        self.observer.observe(|log| {
-            log.command_byte_captures.push(LoggedCapture {
-                start: destination.bytes,
-                length: bytes.end - bytes.start,
-                owner: NodeSlotId::INVALID,
-                label: "copied output",
-                copied: true,
-            });
-            log.hit_test_item_captures.push(LoggedCapture {
-                start: destination.hits,
-                length: hits.end - hits.start,
-                owner: NodeSlotId::INVALID,
-                label: "copied output",
-                copied: true,
-            });
-        });
     }
 
     fn damaged_rows(&mut self) -> Vec<NodeSlotId> {
-        let mut rows = self.layout_arena.damaged_paint_rows();
+        let mut rows: Vec<NodeSlotId> = self.source.damaged_paint_rows().collect();
         // A moved row moves its whole layout subtree, whose rows were not pushed themselves. A
         // moved row inside that subtree is listed already and expands its own subtree, so the
         // walk stops there, and a row expanded from another moved ancestor stops it as well.
         let mut expanded = Vec::new();
         for row in &rows {
-            if !self.layout_arena.paint_damage_of_row(*row).contains(PaintDamage::MOVED) {
+            if !self.source.paint_damage_of_row(*row).contains(PaintDamage::MOVED) {
                 continue;
             }
             let root = *row;
-            self.layout_arena
+            self.source
                 .for_each_node_in_layout_subtree_in_pre_order_with_pruning(root, |node| {
                     if node == root {
                         return true;
                     }
-                    if self.layout_arena.paint_damage_of_row(node).contains(PaintDamage::MOVED) {
+                    if self.source.paint_damage_of_row(node).contains(PaintDamage::MOVED) {
                         return false;
                     }
-                    if !self.layout_arena.paintable_row_is_populated(node) {
+                    if !self.source.paintable_row_is_populated(node) {
                         return true;
                     }
                     let newly_expanded = self.moved_expansion.insert(node);
@@ -341,7 +300,7 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
     }
 
     fn effective_damage(&mut self, row: NodeSlotId) -> PaintDamage {
-        let mut damage = self.layout_arena.paint_damage_of_row(row);
+        let mut damage = self.source.paint_damage_of_row(row);
         if self.moved_expansion.contains(&row) {
             damage |= PaintDamage::ALL_PRODUCERS | PaintDamage::MOVED;
         }
@@ -354,7 +313,7 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
         match kind {
             ProducerKind::Svg => true,
             ProducerKind::ScopePreamble => self.paints_svg_mask_or_clip_resource_subtree(owner),
-            ProducerKind::ScrollMetadata => scroll_snap::snap_container_geometry(self.layout_arena, owner).is_some(),
+            ProducerKind::ScrollMetadata => scroll_snap::snap_container_geometry(self.source, owner).is_some(),
             ProducerKind::InlinePiece(_) | ProducerKind::TextFragment(_) => true,
             _ => false,
         }

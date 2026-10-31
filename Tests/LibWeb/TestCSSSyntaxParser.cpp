@@ -15,6 +15,7 @@
 #include <LibWeb/CSS/RustRule.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
 #include <LibWeb/CSS/StyleSheetImport.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/SelectorRustFFI.h>
 #include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/ValueParserRustFFI.h>
@@ -243,7 +244,7 @@ TEST_CASE(native_function_fragments_preserve_declaration_context)
 {
     ValueParserFFI::ParseContext context {};
     u8 rule_context = to_underlying(RuleContext::AtFunction);
-    auto* parse = ValueParserFFI::rust_parse_css_rule_syntax(ffi_utf16_view(u"@supports (display: block) { result: 50px; }"sv), &rule_context, 1, true, &context);
+    auto* parse = ValueParserFFI::rust_parse_css_rule_syntax(ffi_utf16_view(u"@supports (display: block) { result: 50px; }"sv), ReadonlyBytes { &rule_context, 1 }, true, &context);
     RustRuleList rules { ValueParserFFI::rust_css_syntax_native_rules(parse) };
     ValueParserFFI::rust_css_syntax_parse_free(parse);
     EXPECT_EQ(rules.size(), 1u);
@@ -251,7 +252,7 @@ TEST_CASE(native_function_fragments_preserve_declaration_context)
     EXPECT_EQ(ValueParserFFI::rust_rule_list_count(children), 1u);
     RustRule declarations { ValueParserFFI::rust_rule_list_at(children, 0) };
     EXPECT_EQ(declarations.type(), RustRule::Type::FunctionDeclarations);
-    parse = ValueParserFFI::rust_parse_css_block_syntax(ffi_utf16_view(u"result: 60px;"sv), &rule_context, 1, &context, false);
+    parse = ValueParserFFI::rust_parse_css_block_syntax(ffi_utf16_view(u"result: 60px;"sv), ReadonlyBytes { &rule_context, 1 }, &context, false);
     RustRuleList block { ValueParserFFI::rust_css_syntax_native_rules(parse) };
     ValueParserFFI::rust_css_syntax_parse_free(parse);
     EXPECT_EQ(block.size(), 1u);
@@ -353,7 +354,7 @@ static RustDeclarationBlock parse_native_declaration_block(Utf16View source)
     ValueParserFFI::ParseContext context {};
     u8 rule_context = to_underlying(RuleContext::Style);
     auto* parse = ValueParserFFI::rust_parse_css_block_syntax(
-        { nullptr, reinterpret_cast<u16 const*>(source.utf16_span().data()), source.length_in_code_units() }, &rule_context, 1, &context, false);
+        { nullptr, reinterpret_cast<u16 const*>(source.utf16_span().data()), source.length_in_code_units() }, ReadonlyBytes { &rule_context, 1 }, &context, false);
     auto* block = ValueParserFFI::rust_css_syntax_parse_declaration_block(parse);
     ValueParserFFI::rust_css_syntax_parse_free(parse);
     return RustDeclarationBlock { block };
@@ -361,19 +362,19 @@ static RustDeclarationBlock parse_native_declaration_block(Utf16View source)
 
 TEST_CASE(style_engine_consumes_native_inline_declaration_blocks)
 {
-    StyleEngine engine(StyleEngine::DeviceClass::ForegroundDesktop);
-    auto node = engine.allocate_style_node();
+    StyleEngine engine;
+    auto node = engine.mint_style_node();
     auto declarations = parse_native_declaration_block(u"color: rgb(20, 24, 28); margin: var(--gap); --gap: 13px"sv);
     auto shared = declarations.share();
     auto transitions = parse_native_declaration_block(u"transition-duration: 1s"sv);
     auto retained = declarations.retain();
     StyleValueFFI::rust_style_ffi_counters_reset();
-    engine.set_element_inline_style_properties(node, &declarations);
+    engine.set_element_inline_style_properties(node, declarations.handle());
     EXPECT(!engine.css_transitions_may_observe_style_changes());
-    engine.set_element_inline_style_properties(node, &shared);
+    engine.set_element_inline_style_properties(node, shared.handle());
     engine.set_element_inline_style_properties(node, nullptr);
     declarations.replace(transitions);
-    engine.set_element_inline_style_properties(node, &retained);
+    engine.set_element_inline_style_properties(node, retained.handle());
     EXPECT(engine.css_transitions_may_observe_style_changes());
     for (size_t index = 0; index < StyleValueFFI::rust_style_ffi_counter_count(); ++index) {
         auto const* name_data = reinterpret_cast<char const*>(StyleValueFFI::rust_style_ffi_counter_name(index));
@@ -385,8 +386,8 @@ TEST_CASE(style_engine_consumes_native_inline_declaration_blocks)
 
 TEST_CASE(style_engine_expands_presentation_hint_shorthands_in_rust)
 {
-    StyleEngine engine(StyleEngine::DeviceClass::ForegroundDesktop);
-    auto node = engine.allocate_style_node();
+    StyleEngine engine;
+    auto node = engine.mint_style_node();
     auto inherited = parse_native_declaration_block(u"color: inherit"sv);
     Vector<StyleProperty> hints { StyleProperty { Important::No, PropertyID::Border, inherited.properties()[0].value } };
     engine.set_element_presentational_hint_properties(node, StyleEngineFFI::FfiElementDeclarationKind::PresentationalHint, hints);
@@ -394,10 +395,11 @@ TEST_CASE(style_engine_expands_presentation_hint_shorthands_in_rust)
     // Border expands through intermediate shorthands such as border-width. Each resulting
     // longhand after the first must reuse the same immutable keyword value. The 17 longhands
     // comprise four widths, four styles, four colors, and five border-image properties.
+    Layout::ForcedReadScope read { engine.render_document() };
     for (size_t index = 0;; ++index) {
         StringView name;
         u64 value = 0;
-        VERIFY(engine.counter(index, name, value));
+        VERIFY(engine.counter(read, index, name, value));
         if (name == "specifiedValuesReused"sv) {
             EXPECT_EQ(value, 16ull);
             break;

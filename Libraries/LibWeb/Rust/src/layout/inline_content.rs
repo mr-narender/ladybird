@@ -5,11 +5,11 @@
  */
 
 use super::CssPixels;
-use super::geometry::AvailableSize;
+use super::geometry::{AvailableSize, Side};
 use super::layout_node_arena::LayoutNodeArena;
 use super::node_data::NodeSlotId;
 use super::{formatting_context, inline_formatting_context, used_values};
-use std::rc::Rc;
+use crate::css::style::fast_hash::FastSet as HashSet;
 
 // Finalized inline output shared by committed fragments, formatting-context caches and painting.
 // Glyph buffers move here from the line builder and own their fonts. No borrowed text or mutable
@@ -22,6 +22,11 @@ pub struct InlineContent {
     /// Boxes and text in line order, then tree order within each line. Empty when
     /// there are no boxes to interleave, so text can be painted together.
     pub items: Vec<InlineItem>,
+    pub lines_after_clamp_point_rect: Option<Box<used_values::FfiCssPixelRect>>,
+    /// Where the content that text-overflow elided from the end of a line would be, by line index.
+    pub elided_content_rects: Vec<(u32, used_values::FfiCssPixelRect)>,
+    /// The writing mode whose frame the lines were laid out in.
+    pub writing_mode: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +38,7 @@ pub enum InlineItem {
 
 impl PartialEq for GlyphRunRecord {
     fn eq(&self, other: &Self) -> bool {
-        self.font == other.font && self.glyphs == other.glyphs
+        self.font == other.font && self.glyphs == other.glyphs && self.is_upright == other.is_upright
     }
 }
 
@@ -41,8 +46,6 @@ impl PartialEq for GlyphRunRecord {
 pub struct LineRecord {
     pub rect: used_values::FfiCssPixelRect,
     pub fragment_count: u32,
-    pub(crate) layout_fragment_count: usize,
-    pub(crate) first_fragment_node: Option<NodeSlotId>,
     pub(crate) is_empty: bool,
     pub(crate) horizontal_extent: CssPixels,
     pub(crate) reusable_atomic_prefix: bool,
@@ -61,6 +64,7 @@ pub struct LineRecord {
     pub has_forced_break: bool,
     pub forced_break_node: NodeSlotId,
     pub has_block_level_box: bool,
+    pub box_fragment: u32,
 }
 
 impl LineRecord {
@@ -80,6 +84,8 @@ impl LineRecord {
 pub struct GlyphRunRecord {
     pub glyphs: libgfx_rust::text_layout::GlyphBuffer,
     pub font: libgfx_rust::font::FontHandle,
+    /// Whether the glyphs are set upright in vertical text.
+    pub is_upright: bool,
     // Conservative painted bounds in CSS pixels, relative to the run's baseline origin.
     pub bounding_box: libgfx_rust::FloatRect,
 }
@@ -115,7 +121,7 @@ pub struct FragmentRecord {
     pub dom_end_offset_in_node: usize,
     pub dom_end_offset_with_trailing_whitespace: usize,
     pub trailing_whitespace_length_in_code_units: usize,
-    pub glyph_run: Option<Rc<GlyphRunRecord>>,
+    pub glyph_run: Option<std::sync::Arc<GlyphRunRecord>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -133,10 +139,19 @@ pub struct InlineBoxPieceRecord {
 }
 
 impl InlineContent {
-    pub(crate) fn finish(data: used_values::LineData, arena: &LayoutNodeArena, content_inline_size: CssPixels) -> Self {
+    pub(crate) fn finish(
+        data: used_values::LineData,
+        arena: &LayoutNodeArena,
+        content_inline_size: CssPixels,
+        writing_mode: u8,
+    ) -> Self {
         let mut lines = Vec::with_capacity(data.line_boxes.len());
         let mut fragment_count = 0usize;
-        for line in &data.line_boxes {
+        let mut elided_content_rects = Vec::new();
+        for (line_index, line) in data.line_boxes.iter().enumerate() {
+            if let Some(rect) = inline_formatting_context::elided_content_rect(line) {
+                elided_content_rects.push((line_index as u32, rect));
+            }
             let visible_fragment_count = line.visible_fragments().count();
             fragment_count = fragment_count
                 .checked_add(visible_fragment_count)
@@ -165,9 +180,10 @@ impl InlineContent {
                     let bounding_box = libgfx_rust::FloatRect::from_array(
                         libgfx_rust::text_layout::glyph_run_bounding_box(&glyph_data.font, &glyph_data.glyphs, 1.0),
                     );
-                    Rc::new(GlyphRunRecord {
+                    std::sync::Arc::new(GlyphRunRecord {
                         glyphs: glyph_data.glyphs,
                         font: glyph_data.font,
+                        is_upright: glyph_data.is_upright,
                         bounding_box,
                     })
                 });
@@ -191,6 +207,9 @@ impl InlineContent {
             fragments,
             inline_box_pieces: pieces,
             items: Vec::new(),
+            lines_after_clamp_point_rect: data.lines_after_clamp_point_rect,
+            elided_content_rects,
+            writing_mode,
         };
         // Plain text needs no interleaving and keeps its single foreground producer.
         if content.inline_box_pieces.is_empty() && !content.fragments.iter().any(|fragment| fragment.is_atomic_inline) {
@@ -218,6 +237,249 @@ impl InlineContent {
             (line, arena.node_pre_order_label(node))
         });
         content.items = items;
+        content
+    }
+
+    pub(crate) fn merge_box_fragments<'content>(
+        contents: impl Iterator<Item = Option<&'content InlineContent>>,
+    ) -> Option<std::sync::Arc<InlineContent>> {
+        let contents: Vec<(&InlineContent, u32, used_values::FfiCssPixelPoint)> = contents
+            .enumerate()
+            .filter_map(|(index, content)| {
+                content.map(|content| (content, index as u32, used_values::FfiCssPixelPoint::default()))
+            })
+            .collect();
+        if contents.is_empty() {
+            return None;
+        }
+        Some(Self::combine(&contents))
+    }
+
+    pub(crate) fn concatenate_translated(
+        contents: &[(std::sync::Arc<InlineContent>, used_values::FfiCssPixelPoint)],
+    ) -> std::sync::Arc<InlineContent> {
+        let contents: Vec<(&InlineContent, u32, used_values::FfiCssPixelPoint)> = contents
+            .iter()
+            .map(|(content, offset)| (&**content, 0, *offset))
+            .collect();
+        Self::combine(&contents)
+    }
+
+    fn combine(contents: &[(&InlineContent, u32, used_values::FfiCssPixelPoint)]) -> std::sync::Arc<InlineContent> {
+        let interleaves = contents.iter().any(|(content, ..)| !content.items.is_empty());
+        let mut combined = InlineContent {
+            writing_mode: contents.first().map_or(0, |(content, ..)| content.writing_mode),
+            ..InlineContent::default()
+        };
+        for (content, box_fragment, offset) in contents {
+            combined.append_translated(content, interleaves, *box_fragment, *offset);
+        }
+        combined.drop_repeated_placeholder_pieces();
+        std::sync::Arc::new(combined)
+    }
+
+    fn drop_repeated_placeholder_pieces(&mut self) {
+        let is_placeholder =
+            |piece: &InlineBoxPieceRecord| piece.is_geometry_only_placeholder && piece.fragment_count == 0;
+        if !self.inline_box_pieces.iter().any(is_placeholder) {
+            return;
+        }
+        let mut nodes_with_pieces: HashSet<NodeSlotId> = self
+            .inline_box_pieces
+            .iter()
+            .filter(|piece| !is_placeholder(piece))
+            .map(|piece| piece.node)
+            .collect();
+        let mut new_indices = Vec::with_capacity(self.inline_box_pieces.len());
+        let mut kept_count = 0u32;
+        self.inline_box_pieces.retain(|piece| {
+            let keep = !is_placeholder(piece) || nodes_with_pieces.insert(piece.node);
+            new_indices.push(kept_count);
+            kept_count += u32::from(keep);
+            keep
+        });
+        for item in &mut self.items {
+            if let InlineItem::BoxPiece(index) = item {
+                *index = new_indices[*index as usize];
+            }
+        }
+    }
+
+    fn append_translated(
+        &mut self,
+        content: &InlineContent,
+        interleaves: bool,
+        box_fragment: u32,
+        offset: used_values::FfiCssPixelPoint,
+    ) {
+        let line_offset = self.lines.len() as u32;
+        let fragment_offset = self.fragments.len() as u32;
+        let piece_offset = self.inline_box_pieces.len() as u32;
+        self.lines.extend(content.lines.iter().map(|line| {
+            let mut line = LineRecord { box_fragment, ..*line };
+            line.rect.x += offset.x;
+            line.rect.y += offset.y;
+            line.block_start += offset.y;
+            line.block_end += offset.y;
+            line.next_line_block_offset += offset.y;
+            line
+        }));
+        self.elided_content_rects
+            .extend(content.elided_content_rects.iter().map(|&(line_index, mut rect)| {
+                rect.x += offset.x;
+                rect.y += offset.y;
+                (line_index + line_offset, rect)
+            }));
+        self.fragments
+            .extend(content.fragments.iter().cloned().map(|mut fragment| {
+                fragment.line_index += line_offset;
+                let (inline_delta, block_delta) =
+                    super::geometry::to_physical(fragment.writing_mode, offset.x, offset.y);
+                fragment.inline_offset += inline_delta;
+                fragment.block_offset += block_delta;
+                fragment
+            }));
+        self.inline_box_pieces
+            .extend(content.inline_box_pieces.iter().map(|piece| {
+                let mut piece = *piece;
+                piece.line_index += line_offset;
+                piece.first_fragment_index += fragment_offset;
+                piece.border_box_rect.x += offset.x;
+                piece.border_box_rect.y += offset.y;
+                piece.baseline += offset.y;
+                piece
+            }));
+        if !interleaves {
+            return;
+        }
+        if content.items.is_empty() {
+            self.items.extend(
+                content
+                    .fragments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, fragment)| fragment.glyph_run.is_some())
+                    .map(|(index, _)| InlineItem::TextFragment(index as u32 + fragment_offset)),
+            );
+        } else {
+            self.items.extend(content.items.iter().map(|item| match *item {
+                InlineItem::BoxPiece(index) => InlineItem::BoxPiece(index + piece_offset),
+                InlineItem::TextFragment(index) => InlineItem::TextFragment(index + fragment_offset),
+                InlineItem::AtomicInline(index) => InlineItem::AtomicInline(index + fragment_offset),
+            }));
+        }
+    }
+
+    /// The content as painting sees it: laid out in the frame of `writing_mode` within a line root whose content box
+    /// has the physical size `content_size`, mapped onto the physical plane.
+    pub(crate) fn in_physical_plane(&self, writing_mode: u8, content_size: used_values::FfiCssPixelSize) -> Self {
+        use crate::css::css_pixels::CssPixelRect;
+        let frame = super::geometry::Frame::of(writing_mode);
+        let mut content = self.clone();
+        if frame.is_physical() {
+            return content;
+        }
+        let to_physical = |rect: used_values::FfiCssPixelRect| -> used_values::FfiCssPixelRect {
+            frame.rect_to_physical(CssPixelRect::from(rect), content_size).into()
+        };
+        let delta_to_physical = |delta: used_values::FfiCssPixelPoint| -> used_values::FfiCssPixelPoint {
+            let origin = frame.rect_to_physical(CssPixelRect::default(), content_size);
+            let moved = frame.rect_to_physical(
+                CssPixelRect::new(delta.x, delta.y, CssPixels::default(), CssPixels::default()),
+                content_size,
+            );
+            used_values::FfiCssPixelPoint {
+                x: moved.x - origin.x,
+                y: moved.y - origin.y,
+            }
+        };
+        // NB: Glyphs that run along a vertical line are turned a quarter turn clockwise, so their line-over side
+        //     faces the physical right side. That is the block-start side of the frame of vertical-rl, but the
+        //     block-end side of the frame of vertical-lr, where each line is laid out mirrored in the block axis.
+        //     https://drafts.csswg.org/css-writing-modes-4/#line-orientation
+        // FIXME: Turn the glyphs of sideways-lr a quarter turn counterclockwise instead, so that they face its
+        //        line-over side on the left and run upwards like its inline axis.
+        let lines_are_mirrored = writing_mode == crate::css::css_enums::writing_mode::VERTICAL_LR;
+        let mirror_in_line = |line_index: u32, block_offset: CssPixels, block_length: CssPixels| -> CssPixels {
+            if !lines_are_mirrored {
+                return block_offset;
+            }
+            let Some(line) = self.lines.get(line_index as usize) else {
+                return block_offset;
+            };
+            let line_block_start = line.block_end - line.block_length;
+            line_block_start + line.block_end - block_offset - block_length
+        };
+        for line in &mut content.lines {
+            line.rect = to_physical(line.rect);
+            line.writing_mode = writing_mode;
+        }
+        for (_, rect) in &mut content.elided_content_rects {
+            *rect = to_physical(*rect);
+        }
+        if let Some(rect) = content.lines_after_clamp_point_rect.as_deref_mut() {
+            *rect = to_physical(*rect);
+        }
+        for fragment in &mut content.fragments {
+            let block_offset = mirror_in_line(fragment.line_index, fragment.block_offset, fragment.block_length);
+            let rect = frame.rect_to_physical(
+                CssPixelRect::new(
+                    fragment.inline_offset,
+                    block_offset,
+                    fragment.inline_length,
+                    fragment.block_length,
+                ),
+                content_size,
+            );
+            fragment.relpos_delta = delta_to_physical(fragment.relpos_delta);
+            if fragment.glyph_run.as_ref().is_some_and(|run| run.is_upright) {
+                // NB: Upright glyphs are painted unturned, stacked downwards one em apart and centered within the
+                //     line, so the fragment is painted as horizontal text whose glyphs sit at those positions.
+                let run = fragment.glyph_run.as_ref().unwrap();
+                let ascent = fragment.baseline.to_double() as f32;
+                let line_width = rect.width.to_double() as f32;
+                let mut glyphs = run.glyphs.clone();
+                for glyph in glyphs.to_mut().iter_mut() {
+                    let inline_position = glyph.x;
+                    glyph.x = (line_width - glyph.glyph_width) / 2.0;
+                    glyph.y += inline_position;
+                }
+                let bounding_box = libgfx_rust::FloatRect::from_array(
+                    libgfx_rust::text_layout::glyph_run_bounding_box(&run.font, &glyphs, 1.0),
+                );
+                fragment.glyph_run = Some(std::sync::Arc::new(GlyphRunRecord {
+                    glyphs,
+                    font: run.font.clone(),
+                    is_upright: true,
+                    bounding_box,
+                }));
+                fragment.baseline = CssPixels::nearest_value_for_f32(ascent);
+                fragment.writing_mode = crate::css::css_enums::writing_mode::HORIZONTAL_TB;
+                fragment.inline_offset = rect.x;
+                fragment.block_offset = rect.y;
+                fragment.inline_length = rect.width;
+                fragment.block_length = rect.height;
+                continue;
+            }
+            // NB: A vertical fragment keeps its inline offset and length along the physical vertical axis.
+            fragment.writing_mode = writing_mode;
+            fragment.inline_offset = rect.y;
+            fragment.block_offset = rect.x;
+            fragment.inline_length = rect.height;
+            fragment.block_length = rect.width;
+        }
+        for piece in &mut content.inline_box_pieces {
+            let mut rect = piece.border_box_rect;
+            rect.y = mirror_in_line(piece.line_index, rect.y, rect.height);
+            piece.border_box_rect = to_physical(rect);
+            piece.relpos_delta = delta_to_physical(piece.relpos_delta);
+            // https://drafts.csswg.org/css-break-3/#break-decoration
+            // NB: Painting reads physical edge bits, just as it reads the physical piece rectangle.
+            piece.present_edges = [Side::Top, Side::Right, Side::Bottom, Side::Left]
+                .into_iter()
+                .filter(|side| piece.present_edges & (1 << *side as u8) != 0)
+                .fold(0, |edges, side| edges | (1 << frame.physical_side(side) as u8));
+        }
         content
     }
 
@@ -282,10 +544,6 @@ impl FragmentRecord {
 
     pub(crate) fn size(&self) -> (CssPixels, CssPixels) {
         super::geometry::to_physical(self.writing_mode, self.inline_length, self.block_length)
-    }
-
-    pub(crate) fn physical_horizontal_extent(&self) -> CssPixels {
-        super::geometry::to_physical(self.writing_mode, self.inline_length, self.block_length).0
     }
 
     pub(crate) fn physical_vertical_extent(&self) -> CssPixels {

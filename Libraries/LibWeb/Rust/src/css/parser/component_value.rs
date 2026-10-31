@@ -4,24 +4,104 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::fmt::Write;
+
 use crate::css::css_tokenizer::{
-    ParserSource, ParserString, ParserToken, ParserTokenKind, SmallParserTokenList, SourcePosition,
+    ParserSource, ParserString, ParserToken, ParserTokenKind, SmallParserTokenList, SourcePosition, TextDetacher,
 };
 use crate::css::serialize::{StringUnits, TextSink, serialize_a_string, serialize_an_identifier};
 use smallvec::SmallVec;
 
 const MAXIMUM_COMPONENT_VALUE_NESTING_DEPTH: usize = 256;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ComponentValueList<T = Vec<ComponentValue>> {
+    values: T,
+    pub(crate) token_count: usize,
+}
+
+pub(crate) type ComponentValueSlice<'a> = ComponentValueList<&'a [ComponentValue]>;
+
+impl<T: AsRef<[ComponentValue]>> ComponentValueList<T> {
+    pub(crate) fn new(values: T) -> Self {
+        let token_count = values.as_ref().iter().map(ComponentValue::token_count).sum();
+        Self { values, token_count }
+    }
+
+    pub(crate) fn with_token_count(values: T, token_count: usize) -> Self {
+        Self { values, token_count }
+    }
+
+    pub(crate) fn as_slice(&self) -> ComponentValueSlice<'_> {
+        ComponentValueSlice::with_token_count(self.values.as_ref(), self.token_count)
+    }
+}
+
+impl ComponentValueList {
+    pub(crate) fn into_vec(self) -> Vec<ComponentValue> {
+        self.values
+    }
+
+    pub(crate) fn into_boxed(self) -> ComponentValueList<Box<[ComponentValue]>> {
+        ComponentValueList {
+            values: self.values.into_boxed_slice(),
+            token_count: self.token_count,
+        }
+    }
+}
+
+impl<T: AsRef<[ComponentValue]>> std::ops::Deref for ComponentValueList<T> {
+    type Target = [ComponentValue];
+
+    fn deref(&self) -> &Self::Target {
+        self.values.as_ref()
+    }
+}
+
+impl<T: AsRef<[ComponentValue]>> From<T> for ComponentValueList<T> {
+    fn from(values: T) -> Self {
+        Self::new(values)
+    }
+}
+
+impl<'a, T: AsRef<[ComponentValue]>> From<&'a ComponentValueList<T>> for ComponentValueSlice<'a> {
+    fn from(values: &'a ComponentValueList<T>) -> Self {
+        values.as_slice()
+    }
+}
+
+impl ComponentValueSlice<'_> {
+    pub(crate) fn trim_whitespace(self) -> Self {
+        let values = trim_whitespace(self.values);
+        Self {
+            values,
+            token_count: self.token_count - (self.values.len() - values.len()),
+        }
+    }
+
+    pub(crate) fn trim_end_whitespace(mut self) -> Self {
+        while self.values.last().is_some_and(ComponentValue::is_whitespace) {
+            self.values = &self.values[..self.values.len() - 1];
+            self.token_count -= 1;
+        }
+        self
+    }
+
+    pub(crate) fn to_owned(self) -> ComponentValueList {
+        ComponentValueList::with_token_count(self.values.to_vec(), self.token_count)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ComponentKind {
     Token(ParserTokenKind),
     Function {
         name: ParserString,
-        values: Box<[ComponentValue]>,
+        values: ComponentValueList<Box<[ComponentValue]>>,
     },
     SimpleBlock {
         opening: ParserTokenKind,
-        values: Box<[ComponentValue]>,
+        values: ComponentValueList<Box<[ComponentValue]>>,
     },
 }
 
@@ -36,6 +116,33 @@ pub(crate) struct ComponentValue {
 }
 
 impl ComponentValue {
+    /// Copies the value's text out of the sheet's source and token storage, for a value that outlives its parse.
+    /// Otherwise the value keeps the text of the whole sheet alive.
+    pub(crate) fn detach(&mut self, detacher: &mut TextDetacher) {
+        self.original_source_text.detach(detacher);
+        match &mut self.kind {
+            ComponentKind::Token(token) => token.detach(detacher),
+            ComponentKind::Function { name, values } => {
+                name.detach(detacher);
+                values.values.iter_mut().for_each(|value| value.detach(detacher));
+            }
+            ComponentKind::SimpleBlock { opening, values } => {
+                opening.detach(detacher);
+                values.values.iter_mut().for_each(|value| value.detach(detacher));
+            }
+        }
+    }
+
+    pub(crate) fn token_count(&self) -> usize {
+        match &self.kind {
+            ComponentKind::Token(_) => 1,
+            // Include closing delimiters even when the component is closed at EOF.
+            ComponentKind::Function { values, .. } | ComponentKind::SimpleBlock { values, .. } => {
+                2 + values.token_count
+            }
+        }
+    }
+
     pub(crate) fn end_of_file() -> Self {
         Self {
             kind: ComponentKind::Token(ParserTokenKind::EndOfFile),
@@ -68,8 +175,12 @@ impl ComponentValue {
     }
 
     pub(crate) fn ident(&self) -> Option<&[u16]> {
+        self.ident_string().map(AsRef::as_ref)
+    }
+
+    pub(crate) fn ident_string(&self) -> Option<&ParserString> {
         match &self.kind {
-            ComponentKind::Token(ParserTokenKind::Ident(value)) => Some(value.as_ref()),
+            ComponentKind::Token(ParserTokenKind::Ident(value)) => Some(value),
             _ => None,
         }
     }
@@ -231,13 +342,10 @@ fn serialize_token(sink: &mut TextSink, kind: &ParserTokenKind) {
         }
         ParserTokenKind::BadUrl => sink.push_ascii("url()"),
         ParserTokenKind::Delim(value) => sink.push_code_point(*value),
-        ParserTokenKind::Number { value, .. } => sink.push_ascii(&value.to_string()),
-        ParserTokenKind::Percentage { value, .. } => {
-            sink.push_ascii(&value.to_string());
-            sink.push_ascii("%");
-        }
+        ParserTokenKind::Number { value, .. } => write!(sink, "{value}").unwrap(),
+        ParserTokenKind::Percentage { value, .. } => write!(sink, "{value}%").unwrap(),
         ParserTokenKind::Dimension { value, unit, .. } => {
-            sink.push_ascii(&value.to_string());
+            write!(sink, "{value}").unwrap();
             unit.iter().for_each(|&code_unit| sink.push_code_unit(code_unit));
         }
         ParserTokenKind::Whitespace => sink.push_ascii(" "),
@@ -382,30 +490,49 @@ fn is_same_token_kind(left: &ParserTokenKind, right: &ParserTokenKind) -> bool {
     std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
-fn consume_component_values(
-    tokens: &mut [ParserToken],
+/// The tokens that component values are consumed from, which a source may produce only as they're asked for.
+pub(crate) trait ParserTokens {
+    fn token(&mut self, index: usize) -> Option<&ParserToken>;
+    fn token_mut(&mut self, index: usize) -> Option<&mut ParserToken>;
+}
+
+impl ParserTokens for [ParserToken] {
+    fn token(&mut self, index: usize) -> Option<&ParserToken> {
+        self.get(index)
+    }
+
+    fn token_mut(&mut self, index: usize) -> Option<&mut ParserToken> {
+        self.get_mut(index)
+    }
+}
+
+fn consume_component_values<T: ParserTokens + ?Sized>(
+    tokens: &mut T,
     position: &mut usize,
     ending: Option<&ParserTokenKind>,
     depth: usize,
     take_tokens: bool,
-) -> Result<Vec<ComponentValue>, ()> {
+) -> Result<ComponentValueList, ()> {
     if depth > MAXIMUM_COMPONENT_VALUE_NESTING_DEPTH {
         return Err(());
     }
 
     let mut values = Vec::with_capacity(4);
-    while let Some(token) = tokens.get(*position) {
+    let mut token_count = 0;
+    while let Some(token) = tokens.token(*position) {
         if ending.is_some_and(|ending| is_same_token_kind(&token.kind, ending)) {
             break;
         }
 
-        values.push(consume_a_component_value(tokens, position, depth, take_tokens)?);
+        let value = consume_a_component_value(tokens, position, depth, take_tokens)?;
+        token_count += value.token_count();
+        values.push(value);
     }
-    Ok(values)
+    Ok(ComponentValueList::with_token_count(values, token_count))
 }
 
-pub(crate) fn consume_a_component_value(
-    tokens: &mut [ParserToken],
+pub(crate) fn consume_a_component_value<T: ParserTokens + ?Sized>(
+    tokens: &mut T,
     position: &mut usize,
     depth: usize,
     take_tokens: bool,
@@ -414,7 +541,7 @@ pub(crate) fn consume_a_component_value(
         return Err(());
     }
     let token = if take_tokens {
-        let token = tokens.get_mut(*position).ok_or(())?;
+        let token = tokens.token_mut(*position).ok_or(())?;
         std::mem::replace(
             token,
             ParserToken {
@@ -425,7 +552,7 @@ pub(crate) fn consume_a_component_value(
             },
         )
     } else {
-        tokens.get(*position).ok_or(())?.clone()
+        tokens.token(*position).ok_or(())?.clone()
     };
     *position += 1;
     let opening_source_length = token.source.len();
@@ -444,10 +571,9 @@ pub(crate) fn consume_a_component_value(
             )?;
             let last_child_source = function_values.last().map(|value| &value.original_source_text);
             let mut closing_source = None;
-            if let Some(closing) = tokens.get(*position)
+            if let Some(closing) = tokens.token(*position)
                 && matches!(closing.kind, ParserTokenKind::CloseParen)
             {
-                let closing = &tokens[*position];
                 *position += 1;
                 closing_source = Some(&closing.source);
                 closing_source_length = closing.source.len();
@@ -467,7 +593,7 @@ pub(crate) fn consume_a_component_value(
             });
             ComponentKind::Function {
                 name,
-                values: function_values.into_boxed_slice(),
+                values: function_values.into_boxed(),
             }
         }
         opening @ (ParserTokenKind::OpenSquare | ParserTokenKind::OpenParen | ParserTokenKind::OpenCurly) => {
@@ -480,10 +606,9 @@ pub(crate) fn consume_a_component_value(
             let block_values = consume_component_values(tokens, position, Some(&ending), depth + 1, take_tokens)?;
             let last_child_source = block_values.last().map(|value| &value.original_source_text);
             let mut closing_source = None;
-            if let Some(closing) = tokens.get(*position)
+            if let Some(closing) = tokens.token(*position)
                 && is_same_token_kind(&closing.kind, &ending)
             {
-                let closing = &tokens[*position];
                 *position += 1;
                 closing_source = Some(&closing.source);
                 closing_source_length = closing.source.len();
@@ -503,7 +628,7 @@ pub(crate) fn consume_a_component_value(
             });
             ComponentKind::SimpleBlock {
                 opening,
-                values: block_values.into_boxed_slice(),
+                values: block_values.into_boxed(),
             }
         }
         kind => {
@@ -539,9 +664,15 @@ impl ComponentValueTokens for &[ParserToken] {
 }
 
 pub(crate) fn consume_a_list_of_component_values(tokens: impl ComponentValueTokens) -> Result<Vec<ComponentValue>, ()> {
+    consume_a_counted_list_of_component_values(tokens).map(ComponentValueList::into_vec)
+}
+
+pub(crate) fn consume_a_counted_list_of_component_values(
+    tokens: impl ComponentValueTokens,
+) -> Result<ComponentValueList, ()> {
     let mut tokens = tokens.into_owned_tokens();
     let mut position = 0;
-    consume_component_values(&mut tokens, &mut position, None, 0, true)
+    consume_component_values(tokens.as_mut_slice(), &mut position, None, 0, true)
 }
 
 pub(crate) fn consume_a_small_list_of_component_values(
@@ -550,7 +681,12 @@ pub(crate) fn consume_a_small_list_of_component_values(
     let mut values = SmallVec::new();
     let mut position = 0;
     while position < tokens.len() {
-        values.push(consume_a_component_value(&mut tokens, &mut position, 0, true)?);
+        values.push(consume_a_component_value(
+            tokens.as_mut_slice(),
+            &mut position,
+            0,
+            true,
+        )?);
     }
     Ok(values)
 }
@@ -558,7 +694,8 @@ pub(crate) fn consume_a_small_list_of_component_values(
 #[cfg(test)]
 mod tests {
     use super::{
-        ComponentKind, ComponentSerializationMode, consume_a_list_of_component_values, serialize_component_values_into,
+        ComponentKind, ComponentSerializationMode, ComponentValueSlice, consume_a_counted_list_of_component_values,
+        consume_a_list_of_component_values, serialize_component_values_into,
     };
     use crate::css::css_tokenizer::{ParserTokenKind, tokenize_for_parser};
     use crate::css::serialize::TextSink;
@@ -575,6 +712,27 @@ mod tests {
         let mut sink = TextSink::new();
         serialize_component_values_into(&mut sink, values, mode)
             .then(|| String::from_utf16(&sink.into_utf16()).unwrap())
+    }
+
+    #[test]
+    fn retains_underlying_token_counts() {
+        for (source, expected) in [
+            ("", 0),
+            ("a 1", 3),
+            ("f([a])", 5),
+            ("f([a", 5),
+            ("[{}]", 4),
+            (" f([a]) ", 7),
+        ] {
+            let values = consume_a_counted_list_of_component_values(tokenize_for_parser(source.as_bytes())).unwrap();
+            assert_eq!(values.token_count, expected, "{source}");
+            let trimmed = values.as_slice().trim_whitespace().to_owned();
+            assert_eq!(
+                trimmed.token_count,
+                ComponentValueSlice::new(&trimmed[..]).token_count,
+                "{source}"
+            );
+        }
     }
 
     #[test]

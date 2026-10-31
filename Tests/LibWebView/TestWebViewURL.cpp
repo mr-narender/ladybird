@@ -268,6 +268,11 @@ TEST_CASE(location_to_search_or_url)
     expect_url_equals_sanitized_url("http://[::1]:8000/"sv, "[::1]:8000"sv);
     expect_url_equals_sanitized_url("http://0.0.0.0:8000/"sv, "0.0.0.0:8000"sv); // The unspecified address reaches loopback in practice.
 
+    // Numbers that the URL parser would read as abbreviated IPv4 addresses are searched for instead.
+    expect_search_url_equals_sanitized_url("127"sv);
+    expect_search_url_equals_sanitized_url("2026"sv);
+    expect_search_url_equals_sanitized_url("1.5"sv);
+
     // Private-use and link-local addresses also get the http guess. Like loopback hosts, they can't obtain publicly-
     // trusted TLS certs.
     expect_url_equals_sanitized_url("http://192.168.0.42:8000/"sv, "192.168.0.42:8000"sv);
@@ -317,6 +322,25 @@ TEST_CASE(location_to_search_or_url)
     expect_search_url_equals_sanitized_url("javascript:alert(1)"sv);
 }
 
+TEST_CASE(abbreviated_ipv4_user_input)
+{
+    for (auto input : { "127\\notes"sv, "127\\notes:8000"sv, "0x7f"sv, "0X7F"sv, "0x7f.1"sv, "127.0x1/path"sv, "0177"sv, "%31%32%37"sv, "127.0.0.1."sv }) {
+        expect_search_url_equals_sanitized_url(input);
+        expect_user_input_classification(input, WebView::UserInputClassification::Search);
+        expect_location_does_not_look_like_url(input);
+        expect_context_menu_text_not_url(input);
+    }
+
+    // A complete address, an explicit scheme or a port still requests navigation.
+    expect_url_equals_sanitized_url("http://127.0.0.1/notes"sv, "127.0.0.1\\notes"sv);
+    expect_url_equals_sanitized_url("http://127.0.0.1/"sv, "0x7f.0.0.1"sv);
+    expect_url_equals_sanitized_url("https://0.0.0.127/"sv, "https://0x7f"sv);
+    expect_url_equals_sanitized_url("http://0.0.0.127:8000/"sv, "0x7f:8000"sv);
+    expect_url_equals_sanitized_url("http://0.0.0.127:8000/notes"sv, "0x7f:8000\\notes"sv);
+    expect_context_menu_text_url("0x7f.0.0.1"sv, "http://127.0.0.1/"sv);
+    expect_url_equals_sanitized_url("https://0x7f.example/"sv, "0x7f.example"sv);
+}
+
 TEST_CASE(classify_user_input)
 {
     using enum WebView::UserInputClassification;
@@ -360,6 +384,8 @@ TEST_CASE(location_looks_like_url)
     expect_location_does_not_look_like_url("example.org hello"sv);
     expect_location_does_not_look_like_url("example.def"sv);
     expect_location_does_not_look_like_url("javascript://alert"sv);
+    expect_location_does_not_look_like_url("f"sv);
+    expect_location_does_not_look_like_url("cafe"sv);
 
     expect_location_looks_like_url("example"sv, WebView::AppendTLD::Yes);
 }
@@ -379,14 +405,21 @@ TEST_CASE(context_menu_url_text)
     expect_context_menu_text_not_url("192.168"sv);
     expect_context_menu_text_not_url("192.168.0"sv);
     expect_context_menu_text_not_url("192.168.0.999"sv);
+    expect_context_menu_text_not_url("12:30"sv);
     expect_context_menu_text_not_url("./Meta/ladybird.py"sv);
     expect_context_menu_text_not_url("../ladybird.org"sv);
     expect_context_menu_text_not_url("/tmp/ladybird.org"sv);
+    expect_context_menu_text_not_url("\\example.com"sv);
+    expect_context_menu_text_not_url("\\127.0.0.1"sv);
+    expect_context_menu_text_not_url(":8080/foo"sv);
+    expect_context_menu_text_not_url("?x"sv);
+    expect_context_menu_text_not_url("#top"sv);
 }
 
 TEST_CASE(autocomplete_url_matching)
 {
-    expect_autocomplete_urls_match("example.com/path?q=1"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_match("example.com/path?q=1#fragment"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_match("https://example.com/page#:~:text=target"sv, "https://example.com/page#:~:text=target"sv);
 
     expect_autocomplete_urls_do_not_match("google.com"sv, "https://www.google.com/"sv);
     expect_autocomplete_urls_do_not_match("http://example.com"sv, "https://example.com/"sv);
@@ -394,6 +427,9 @@ TEST_CASE(autocomplete_url_matching)
     expect_autocomplete_urls_do_not_match("https://example.com"sv, "https://example.com:8443"sv);
     expect_autocomplete_urls_do_not_match("hello"sv, "https://hello.example/"sv);
     expect_autocomplete_urls_do_not_match("steam://launch/1536610"sv, "https://steam://launch/1536610"sv);
+    expect_autocomplete_urls_do_not_match("example.com/path?q=1"sv, "https://example.com/path?q=1#fragment"sv);
+    expect_autocomplete_urls_do_not_match("https://example.com/page"sv, "https://example.com/page#:~:text=target"sv);
+    expect_autocomplete_urls_do_not_match("https://example.com/page#section"sv, "https://example.com/page#section:~:text=target"sv);
 }
 
 TEST_CASE(autocomplete_url_completion)
@@ -402,6 +438,7 @@ TEST_CASE(autocomplete_url_completion)
     expect_autocomplete_url_can_complete("reddit.co"sv, "https://reddit.com/"sv);
     expect_autocomplete_url_can_complete("https://reddit.co"sv, "https://www.reddit.com/"sv);
     expect_autocomplete_url_can_complete("www.reddit.co"sv, "https://www.reddit.com/"sv);
+    expect_autocomplete_url_can_complete("example.com/page#sec"sv, "https://example.com/page#section"sv);
 
     expect_autocomplete_url_cannot_complete("reddit.com"sv, "https://reddit.com/"sv);
     expect_autocomplete_url_cannot_complete("reddit.co"sv, "https://reddit.co/"sv);
@@ -425,4 +462,12 @@ TEST_CASE(autocomplete_suggestion_display_text)
     search_suggestion.source = WebView::AutocompleteSuggestionSource::Search;
     search_suggestion.text = "https://example.com/"_string;
     EXPECT_EQ(WebView::autocomplete_suggestion_display_text(search_suggestion), "https://example.com/"sv);
+}
+
+TEST_CASE(search_query_display_truncation)
+{
+    EXPECT_EQ(s_test_engine.format_search_query_for_display("short"sv), "Search Test for “short”"sv);
+
+    // The 32nd byte falls in the middle of the first "é".
+    EXPECT_EQ(s_test_engine.format_search_query_for_display("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaéé"sv), "Search Test for “aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé…”"sv);
 }

@@ -1,416 +1,162 @@
-include(libjs_generators)
+# LibJS's C++ API, which LibJS's users build against, is implemented over the embedding ABI of the Rust runtime. When
+# LibWeb is built, the API's objects and the runtime go into LibWeb's library, whose Rust crate builds the runtime, so
+# that a process has one copy of the runtime and LibWeb's Rust code depends on it directly. Without LibWeb, LibJS is a
+# library of its own, which exports only its own JS_API functions and keeps the runtime's symbols hidden.
 
-build_rust_binary(
-    MANIFEST_PATH Flap/Cargo.toml
-    CRATE_NAME flapc
-    BINARY_NAME generate-libjs-bytecode
-    OUTPUT_PATH_VAR BYTECODE_GENERATOR_BIN
-)
+# The features the runtime is built with, by LibJS's own crate build or by LibWeb's crate.
+set(LIBJS_RUST_FEATURES allocator)
+if (ENABLE_ADDRESS_SANITIZER)
+    list(APPEND LIBJS_RUST_FEATURES address-sanitizer)
+endif()
+if (ENABLE_THREAD_SANITIZER)
+    list(APPEND LIBJS_RUST_FEATURES thread-sanitizer)
+endif()
+# The JIT is a default feature of the crate, so that cargo builds and lints it unless told otherwise.
+if (ENABLE_JS_JIT)
+    list(APPEND LIBJS_RUST_FEATURES jit)
+endif()
+set(LIBJS_RUST_FEATURES ${LIBJS_RUST_FEATURES} PARENT_SCOPE)
+
+add_subdirectory(Rust)
+
+# The optimizing JIT's compiler, a pure Rust crate that only works on plain data. Its unit tests run without the rest of
+# LibJS.
+if (ENABLE_JS_JIT)
+    test_rust_crate(MANIFEST_PATH JIT/Rust/Cargo.toml CRATE_NAME libjs_jit)
+endif()
 
 set(SOURCES
-    Interpreter/SlowPaths.cpp
-    Bytecode/Executable.cpp
-    Bytecode/IdentifierTable.cpp
-    Bytecode/Instruction.cpp
-    Interpreter/Interpreter.cpp
-    Bytecode/PropertyKeyTable.cpp
-    Bytecode/RegexTable.cpp
-    Bytecode/StringTable.cpp
-    Bytecode/Validator.cpp
     Console.cpp
-    Contrib/Test262/262Object.cpp
-    Contrib/Test262/AgentObject.cpp
-    Contrib/Test262/GlobalObject.cpp
-    Contrib/Test262/IsHTMLDDA.cpp
     CyclicModule.cpp
     Debugger.cpp
+    DecodedBytecodeCache.cpp
     Heap/Cell.cpp
     Module.cpp
     ParserError.cpp
     Print.cpp
-    RustIntegration.cpp
     Runtime/AbstractOperations.cpp
-    Runtime/Accessor.cpp
     Runtime/Agent.cpp
-    Runtime/AggregateError.cpp
-    Runtime/AggregateErrorConstructor.cpp
-    Runtime/AggregateErrorPrototype.cpp
-    Runtime/ArgumentsObject.cpp
     Runtime/Array.cpp
     Runtime/ArrayBuffer.cpp
-    Runtime/ArrayBufferConstructor.cpp
-    Runtime/ArrayBufferPrototype.cpp
-    Runtime/ArrayConstructor.cpp
-    Runtime/ArrayIterator.cpp
-    Runtime/ArrayIteratorPrototype.cpp
-    Runtime/ArrayPrototype.cpp
-    Runtime/AsyncDisposableStack.cpp
-    Runtime/AsyncDisposableStackConstructor.cpp
-    Runtime/AsyncDisposableStackPrototype.cpp
-    Runtime/AsyncFromSyncIterator.cpp
-    Runtime/AsyncFromSyncIteratorPrototype.cpp
-    Runtime/AsyncFunctionConstructor.cpp
-    Runtime/AsyncFunctionDriverWrapper.cpp
-    Runtime/AsyncFunctionPrototype.cpp
-    Runtime/AsyncGenerator.cpp
-    Runtime/AsyncGeneratorFunctionConstructor.cpp
-    Runtime/AsyncGeneratorFunctionPrototype.cpp
-    Runtime/AsyncGeneratorPrototype.cpp
-    Runtime/AsyncIteratorPrototype.cpp
-    Runtime/AtomicsObject.cpp
     Runtime/BigInt.cpp
-    Runtime/BigIntConstructor.cpp
     Runtime/BigIntObject.cpp
-    Runtime/BigIntPrototype.cpp
-    Runtime/BooleanConstructor.cpp
     Runtime/BooleanObject.cpp
-    Runtime/BooleanPrototype.cpp
-    Runtime/BoundFunction.cpp
-    Runtime/ClassConstruction.cpp
-    Runtime/ClassFieldDefinition.cpp
     Runtime/Completion.cpp
-    Runtime/ConsoleObjectPrototype.cpp
     Runtime/ConsoleObject.cpp
     Runtime/DataView.cpp
-    Runtime/DataViewConstructor.cpp
-    Runtime/DataViewPrototype.cpp
-    Runtime/DescriptorArray.cpp
     Runtime/Date.cpp
-    Runtime/DateConstructor.cpp
-    Runtime/DatePrototype.cpp
     Runtime/DeclarativeEnvironment.cpp
-    Runtime/DisposableStack.cpp
-    Runtime/DisposableStackConstructor.cpp
-    Runtime/DisposableStackPrototype.cpp
-    Runtime/ECMAScriptFunctionObject.cpp
     Runtime/Environment.cpp
-    Runtime/EnvironmentShape.cpp
     Runtime/Error.cpp
-    Runtime/ErrorConstructor.cpp
     Runtime/ErrorData.cpp
-    Runtime/ErrorPrototype.cpp
     Runtime/ErrorTypes.cpp
     Runtime/ExecutionContext.cpp
-    Runtime/InterpreterStack.cpp
     Runtime/FinalizationRegistry.cpp
-    Runtime/FinalizationRegistryConstructor.cpp
-    Runtime/FinalizationRegistryPrototype.cpp
-    Runtime/FunctionConstructor.cpp
     Runtime/FunctionEnvironment.cpp
     Runtime/FunctionObject.cpp
-    Runtime/FunctionPrototype.cpp
-    Runtime/GeneratorFunctionConstructor.cpp
-    Runtime/GeneratorFunctionPrototype.cpp
-    Runtime/GeneratorObject.cpp
-    Runtime/GeneratorPrototype.cpp
     Runtime/GlobalEnvironment.cpp
-    Runtime/GlobalObject.cpp
-    Runtime/IndexedProperties.cpp
-    Runtime/Intl/AbstractOperations.cpp
-    Runtime/Intl/Collator.cpp
-    Runtime/Intl/CollatorCompareFunction.cpp
-    Runtime/Intl/CollatorConstructor.cpp
-    Runtime/Intl/CollatorPrototype.cpp
-    Runtime/Intl/DateTimeFormat.cpp
-    Runtime/Intl/DateTimeFormatConstructor.cpp
-    Runtime/Intl/DateTimeFormatFunction.cpp
-    Runtime/Intl/DateTimeFormatPrototype.cpp
-    Runtime/Intl/DisplayNames.cpp
-    Runtime/Intl/DisplayNamesConstructor.cpp
-    Runtime/Intl/DisplayNamesPrototype.cpp
-    Runtime/Intl/DurationFormat.cpp
-    Runtime/Intl/DurationFormatConstructor.cpp
-    Runtime/Intl/DurationFormatPrototype.cpp
-    Runtime/Intl/Intl.cpp
-    Runtime/Intl/ListFormat.cpp
-    Runtime/Intl/ListFormatConstructor.cpp
-    Runtime/Intl/ListFormatPrototype.cpp
-    Runtime/Intl/Locale.cpp
-    Runtime/Intl/LocaleConstructor.cpp
-    Runtime/Intl/LocalePrototype.cpp
-    Runtime/Intl/MathematicalValue.cpp
-    Runtime/Intl/NumberFormat.cpp
-    Runtime/Intl/NumberFormatConstructor.cpp
-    Runtime/Intl/NumberFormatFunction.cpp
-    Runtime/Intl/NumberFormatPrototype.cpp
-    Runtime/Intl/PluralRules.cpp
-    Runtime/Intl/PluralRulesConstructor.cpp
-    Runtime/Intl/PluralRulesPrototype.cpp
-    Runtime/Intl/RelativeTimeFormat.cpp
-    Runtime/Intl/RelativeTimeFormatConstructor.cpp
-    Runtime/Intl/RelativeTimeFormatPrototype.cpp
-    Runtime/Intl/Segmenter.cpp
-    Runtime/Intl/SegmenterConstructor.cpp
-    Runtime/Intl/SegmenterPrototype.cpp
-    Runtime/Intl/Segments.cpp
-    Runtime/Intl/SegmentIterator.cpp
-    Runtime/Intl/SegmentIteratorPrototype.cpp
-    Runtime/Intl/SegmentsPrototype.cpp
+    Runtime/HostArray.cpp
+    Runtime/HostFunction.cpp
+    Runtime/HostModule.cpp
+    Runtime/HostObject.cpp
     Runtime/Intrinsics.cpp
     Runtime/Iterator.cpp
-    Runtime/IteratorConstructor.cpp
-    Runtime/IteratorHelper.cpp
-    Runtime/IteratorHelperPrototype.cpp
-    Runtime/IteratorPrototype.cpp
-    Runtime/JSONObject.cpp
     Runtime/JobCallback.cpp
-    Runtime/KeyedCollections.cpp
+    Runtime/JSONObject.cpp
     Runtime/Map.cpp
-    Runtime/MapConstructor.cpp
     Runtime/MapIterator.cpp
-    Runtime/MapIteratorPrototype.cpp
-    Runtime/MapPrototype.cpp
-    Runtime/MathObject.cpp
     Runtime/ModuleEnvironment.cpp
-    Runtime/ModuleNamespaceObject.cpp
     Runtime/NativeFunction.cpp
-    Runtime/NativeJavaScriptBackedFunction.cpp
-    Runtime/NumberConstructor.cpp
     Runtime/NumberObject.cpp
-    Runtime/NumberPrototype.cpp
     Runtime/Object.cpp
-    Runtime/ObjectConstructor.cpp
     Runtime/ObjectEnvironment.cpp
-    Runtime/ObjectPrototype.cpp
     Runtime/PrimitiveString.cpp
-    Runtime/PrivateEnvironment.cpp
     Runtime/Promise.cpp
     Runtime/PromiseCapability.cpp
-    Runtime/PromiseConstructor.cpp
-    Runtime/PromiseJobs.cpp
-    Runtime/PromisePrototype.cpp
-    Runtime/PromiseReaction.cpp
-    Runtime/PromiseResolvingElementFunctions.cpp
-    Runtime/PromiseResolvingFunction.cpp
+    Runtime/PromiseJob.cpp
     Runtime/PropertyDescriptor.cpp
-    Runtime/ProxyConstructor.cpp
-    Runtime/ProxyObject.cpp
-    Runtime/RawJSONObject.cpp
     Runtime/Realm.cpp
-    Runtime/Reference.cpp
-    Runtime/ReflectObject.cpp
-    Runtime/RegExpConstructor.cpp
-    Runtime/RegExpLegacyStaticProperties.cpp
     Runtime/RegExpObject.cpp
-    Runtime/RegExpPrototype.cpp
-    Runtime/RegExpStringIterator.cpp
-    Runtime/RegExpStringIteratorPrototype.cpp
     Runtime/Set.cpp
-    Runtime/SetConstructor.cpp
     Runtime/SetIterator.cpp
-    Runtime/SetIteratorPrototype.cpp
-    Runtime/SetPrototype.cpp
-    Runtime/Shape.cpp
-    Runtime/SharedArrayBufferConstructor.cpp
-    Runtime/SharedArrayBufferPrototype.cpp
-    Runtime/SharedFunctionInstanceData.cpp
-    Runtime/StringConstructor.cpp
-    Runtime/StringIterator.cpp
-    Runtime/StringIteratorPrototype.cpp
     Runtime/StringObject.cpp
-    Runtime/StringPrototype.cpp
-    Runtime/SuppressedError.cpp
-    Runtime/SuppressedErrorConstructor.cpp
-    Runtime/SuppressedErrorPrototype.cpp
     Runtime/Symbol.cpp
-    Runtime/SymbolConstructor.cpp
-    Runtime/SymbolObject.cpp
-    Runtime/SymbolPrototype.cpp
-    Runtime/Temporal/AbstractOperations.cpp
-    Runtime/Temporal/Calendar.cpp
-    Runtime/Temporal/DateEquations.cpp
-    Runtime/Temporal/Duration.cpp
-    Runtime/Temporal/DurationConstructor.cpp
-    Runtime/Temporal/DurationPrototype.cpp
-    Runtime/Temporal/Instant.cpp
-    Runtime/Temporal/InstantConstructor.cpp
-    Runtime/Temporal/InstantPrototype.cpp
-    Runtime/Temporal/ISO8601.cpp
-    Runtime/Temporal/Now.cpp
-    Runtime/Temporal/PlainDate.cpp
-    Runtime/Temporal/PlainDateConstructor.cpp
-    Runtime/Temporal/PlainDatePrototype.cpp
-    Runtime/Temporal/PlainDateTime.cpp
-    Runtime/Temporal/PlainDateTimeConstructor.cpp
-    Runtime/Temporal/PlainDateTimePrototype.cpp
-    Runtime/Temporal/PlainMonthDay.cpp
-    Runtime/Temporal/PlainMonthDayConstructor.cpp
-    Runtime/Temporal/PlainMonthDayPrototype.cpp
-    Runtime/Temporal/PlainTime.cpp
-    Runtime/Temporal/PlainTimeConstructor.cpp
-    Runtime/Temporal/PlainTimePrototype.cpp
-    Runtime/Temporal/PlainYearMonth.cpp
-    Runtime/Temporal/PlainYearMonthConstructor.cpp
-    Runtime/Temporal/PlainYearMonthPrototype.cpp
-    Runtime/Temporal/Temporal.cpp
-    Runtime/Temporal/TimeZone.cpp
-    Runtime/Temporal/ZonedDateTime.cpp
-    Runtime/Temporal/ZonedDateTimeConstructor.cpp
-    Runtime/Temporal/ZonedDateTimePrototype.cpp
     Runtime/TypedArray.cpp
-    Runtime/TypedArrayConstructor.cpp
-    Runtime/TypedArrayPrototype.cpp
-    Runtime/Uint8Array.cpp
     Runtime/Value.cpp
     Runtime/VM.cpp
-    Runtime/WeakMap.cpp
-    Runtime/WeakMapConstructor.cpp
-    Runtime/WeakMapPrototype.cpp
-    Runtime/WeakRef.cpp
-    Runtime/WeakRefConstructor.cpp
-    Runtime/WeakRefPrototype.cpp
-    Runtime/WeakSet.cpp
-    Runtime/WeakSetConstructor.cpp
-    Runtime/WeakSetPrototype.cpp
-    Runtime/WrapForValidIteratorPrototype.cpp
     Script.cpp
+    ScriptCompilation.cpp
     SourceCode.cpp
     SourceTextModule.cpp
     SyntaxHighlighter.cpp
     SyntheticModule.cpp
+    ToolEntryPoints.cpp
 )
 
-generate_libjs_bytecode()
-
-set(GENERATED_SOURCES Bytecode/Op.h)
-
-ladybird_lib(LibJS js EXPLICIT_SYMBOL_EXPORT)
-
-target_link_libraries(LibJS PRIVATE LibCore LibCrypto LibFileSystem LibRegex LibSyntax LibTextCodec LibGC simdjson::simdjson)
-
-# Link LibUnicode publicly to ensure ICU data (which is in libicudata.a) is available in any process using LibJS.
-target_link_libraries(LibJS PUBLIC LibUnicode)
-
-# TODO: This is probably also needed on RISC-V.
-if("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "i.86.*")
-    target_link_libraries(LibJS PRIVATE atomic)
+# What every target that includes LibJS's headers needs: the clang plugin that checks the code, LibUnicode, so that
+# ICU's data is in every process that runs JavaScript, and the generated headers of the embedding ABI, which the public
+# headers include, before anything compiles against them.
+add_library(LibJSHeaders INTERFACE)
+target_link_libraries(LibJSHeaders INTERFACE JSClangPlugin LibUnicode)
+add_dependencies(LibJSHeaders libjs_embedding_headers-ffi-headers)
+if (NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(LibJSHeaders INTERFACE LIBJS_STATIC_DEFINE)
 endif()
+add_lagom_library_install_rules(LibJSHeaders ALIAS_NAME JSHeaders)
 
-if (WIN32)
-    # FIXME: Windows on ARM
-    target_link_libraries(LibJS PRIVATE clang_rt.builtins-x86_64.lib kernel32 ntdll Ws2_32 userenv)
+# The objects of the C++ API, compiled once for whichever library they go into. Their export header is generated under
+# LibJS's name, so that JS_API means the same wherever they are, and its guard is the define the objects are compiled
+# with, as it would be for a shared LibJS.
+add_library(LibJSObjects OBJECT ${SOURCES})
+ladybird_library_setup(LibJSObjects)
+target_link_libraries(LibJSObjects PUBLIC LibJSHeaders)
+target_link_libraries(LibJSObjects PRIVATE LibCore LibCrypto LibGC LibSyntax LibTextCodec)
+target_compile_definitions(LibJSObjects PRIVATE LibJS_EXPORTS)
+set_target_properties(LibJSObjects PROPERTIES DEFINE_SYMBOL LibJS_EXPORTS)
+ladybird_generate_export_header(LibJSObjects js BASE_NAME LibJS)
+
+if (LIBJS_FOLDED_INTO_LIBWEB)
+    # LibJS is what a target that also uses LibWeb links: LibWeb's library holds the objects and the runtime.
+    add_library(LibJS INTERFACE)
+    target_link_libraries(LibJS INTERFACE LibWeb LibJSHeaders)
+    set_target_properties(LibJS PROPERTIES EXPORT_NAME JS)
+    ladybird_install_library_headers(LibJS JS)
+    add_lagom_library_install_rules(LibJS ALIAS_NAME JS)
+
+    # Standalone JavaScript tools link the objects and an independent runtime archive, so building them does not
+    # build LibWeb's Rust code or generate its bindings.
+    add_library(LibJSStandalone INTERFACE)
+    target_link_libraries(LibJSStandalone INTERFACE
+        $<TARGET_OBJECTS:LibJSObjects>
+        LibJSHeaders libjs_rust AK LibCore LibCrypto LibGC LibSyntax LibTextCodec
+    )
+    if ((LINUX OR BSD) AND BUILD_SHARED_LIBS)
+        # The tool's copy of the runtime, with its Rust standard library, stays out of its dynamic symbol table, as the
+        # copy in LibJS's own library does.
+        target_link_options(LibJSStandalone INTERFACE
+            "LINKER:--exclude-libs,$<TARGET_FILE_NAME:libjs_rust>"
+        )
+    endif()
 else()
-    # This flag has no effect on Windows
-    target_compile_options(LibJS PRIVATE -fno-omit-frame-pointer)
-endif()
+    set(SOURCES $<TARGET_OBJECTS:LibJSObjects>)
+    ladybird_lib(LibJS js)
+    set_target_properties(LibJS PROPERTIES LINKER_LANGUAGE CXX WINDOWS_EXPORT_ALL_SYMBOLS OFF)
+    target_link_libraries(LibJS PUBLIC LibJSHeaders)
+    target_link_libraries(LibJS PRIVATE LibCore LibCrypto LibGC LibSyntax LibTextCodec)
 
-target_link_libraries(LibJS PUBLIC JSClangPlugin)
-
-import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libjs_rust FFI_HEADER RustFFI.h)
-target_link_libraries(LibJS PRIVATE libjs_rust)
-if ((LINUX OR BSD) AND NOT BUILD_SHARED_LIBS)
-    # Rust staticlibs each carry the same allocator shim symbols. LibJS can
-    # pull in multiple crates' copies in static ELF links, but they all
-    # forward to the same ladybird_rust_* entry points in AK/kmalloc.cpp.
-    target_link_options(LibJS INTERFACE LINKER:--allow-multiple-definition)
-endif()
-
-# The Rust library and LibJS have a circular dependency (C++ calls Rust
-# entry points, Rust calls C++ callbacks). For static builds, merge the
-# Rust archive into the LibJS archive so all symbols are in one place.
-if(NOT BUILD_SHARED_LIBS)
-    add_custom_command(TARGET LibJS POST_BUILD
-        COMMAND ${CMAKE_AR} -x $<TARGET_FILE:libjs_rust>
-        COMMAND ${CMAKE_AR} -qS $<TARGET_FILE:LibJS> *.o
-        COMMAND ${CMAKE_RANLIB} $<TARGET_FILE:LibJS>
-        COMMAND ${CMAKE_COMMAND} -E remove -f *.o
-        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/rust_merge_tmp
-        COMMENT "Merging Rust archive into LibJS"
-    )
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/rust_merge_tmp)
-
-    # POST_BUILD steps don't track inputs, so when libjs_rust.a changes ninja
-    # leaves liblagom-js.a alone and the merged archive ends up with stale
-    # Rust objects. Force the C++ FFI bridge file to depend on the Rust
-    # archive: when it changes, RustIntegration.cpp recompiles, LibJS gets
-    # re-archived, and POST_BUILD re-merges the fresh Rust objects.
-    get_target_property(_libjs_rust_lib libjs_rust IMPORTED_LOCATION)
-    set_property(SOURCE RustIntegration.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libjs_rust_lib})
-endif()
-
-# Generate the JS interpreter's platform-specific assembly.
-if ("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(x86_64|amd64|AMD64)$")
-    set(FLAP_ARCH "x86_64")
-elseif ("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(aarch64|arm64|ARM64)$")
-    set(FLAP_ARCH "aarch64")
-else()
-    message(FATAL_ERROR "LibJS requires JS interpreter support for ${CMAKE_SYSTEM_PROCESSOR}")
-endif()
-
-if (DEFINED FLAP_ARCH)
-    enable_language(ASM)
-    if (WIN32 AND CMAKE_ASM_COMPILER_ID MATCHES "Clang")
-        set(CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_ProgramDatabase "")
-        set(CMAKE_ASM_COMPILE_OPTIONS_MSVC_DEBUG_INFORMATION_FORMAT_EditAndContinue "")
-    endif()
-    set(FLAP_DSL
-        "${CMAKE_CURRENT_SOURCE_DIR}/Interpreter/interpreter.flap")
-    set(FLAP_GENERATED_S "${CMAKE_CURRENT_BINARY_DIR}/Interpreter/interpreter_${FLAP_ARCH}.S")
-    set(INTERPRETER_LAYOUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/Interpreter/layout.conf")
-
-    # Build-time offset generator: compiles a small C++ program that uses
-    # offsetof() to emit struct field offsets as DSL constants.
-    add_executable(generate_interpreter_layout "${CMAKE_CURRENT_SOURCE_DIR}/Interpreter/GenerateLayout.cpp")
-    target_link_libraries(generate_interpreter_layout PRIVATE AK)
-    if (MSVC)
-        target_compile_definitions(generate_interpreter_layout PRIVATE _ALLOW_KEYWORD_MACROS)
-    endif()
-    target_compile_definitions(generate_interpreter_layout PRIVATE private=public protected=public)
-    # NB: Strip fuzzer sanitizer flags so generate_interpreter_layout can define its own main().
-    if (ENABLE_FUZZERS_LIBFUZZER)
-        target_compile_options(generate_interpreter_layout PRIVATE -fno-sanitize=fuzzer)
-        target_link_options(generate_interpreter_layout PRIVATE -fno-sanitize=fuzzer)
-    endif()
-    # NB: GenerateLayout.cpp does not depend on Op.h since opcode field
-    # offsets are computed from interpreter.flap by flapc directly.
-
-    add_custom_command(
-        OUTPUT "${INTERPRETER_LAYOUT_FILE}"
-        COMMAND "$<TARGET_FILE:generate_interpreter_layout>" > "${INTERPRETER_LAYOUT_FILE}"
-        DEPENDS generate_interpreter_layout
-        COMMENT "Generating JS interpreter layout"
-    )
-
-    build_rust_binary(
-        MANIFEST_PATH Flap/Cargo.toml
-        CRATE_NAME flapc
-        BINARY_NAME flapc
-        OUTPUT_PATH_VAR FLAPC_BIN
-    )
-
-    if (WIN32)
-        set(FLAP_OBJECT_FORMAT "coff")
+    if (NOT BUILD_SHARED_LIBS OR WIN32)
+        target_link_libraries(LibJS PRIVATE libjs_rust)
     elseif (APPLE)
-        set(FLAP_OBJECT_FORMAT "macho")
+        set(CMAKE_LINK_LIBRARY_USING_load_hidden "LINKER:-load_hidden,<LIBRARY>")
+        set(CMAKE_LINK_LIBRARY_USING_load_hidden_SUPPORTED TRUE)
+        target_link_libraries(LibJS PRIVATE "$<LINK_LIBRARY:load_hidden,libjs_rust>")
     else()
-        set(FLAP_OBJECT_FORMAT "elf")
+        target_link_libraries(LibJS PRIVATE libjs_rust)
+        get_target_property(libjs_rust_archive libjs_rust IMPORTED_LOCATION)
+        cmake_path(GET libjs_rust_archive FILENAME libjs_rust_archive_name)
+        target_link_options(LibJS PRIVATE "LINKER:--exclude-libs,${libjs_rust_archive_name}")
     endif()
 
-    # Interpreter assertions guard memory safety invariants, so keep them in every build type.
-    set(FLAP_EXTRA_FLAGS "--enable-assertions")
-    # All Apple Silicon chips are ARMv8.5+ which includes FEAT_JSCVT.
-    if ("${FLAP_ARCH}" STREQUAL "aarch64" AND APPLE)
-        list(APPEND FLAP_EXTRA_FLAGS "--has-jscvt")
-    endif()
-
-    add_custom_command(
-        OUTPUT "${FLAP_GENERATED_S}"
-        COMMAND "${FLAPC_BIN}" --arch ${FLAP_ARCH}
-            --object-format ${FLAP_OBJECT_FORMAT}
-            --constants "${INTERPRETER_LAYOUT_FILE}"
-            --input "${FLAP_DSL}"
-            --output "${FLAP_GENERATED_S}"
-            ${FLAP_EXTRA_FLAGS}
-        DEPENDS "${FLAPC_BIN}" "${FLAP_DSL}"
-            "${INTERPRETER_LAYOUT_FILE}"
-        COMMENT "Generating interpreter_${FLAP_ARCH}.S from Flap"
-    )
-
-    target_sources(LibJS PRIVATE "${FLAP_GENERATED_S}")
-    if ("${FLAP_ARCH}" STREQUAL "x86_64" AND CMAKE_ASM_COMPILER_ID MATCHES "Clang")
-        # Keep conditional branches within 32-byte boundaries so Intel's
-        # microcode mitigation does not prevent their blocks from using the DSB.
-        set_property(SOURCE "${FLAP_GENERATED_S}" APPEND PROPERTY COMPILE_OPTIONS
-            "-malign-branch-boundary=32;-malign-branch=fused,jcc")
-    endif()
+    add_library(LibJSStandalone INTERFACE)
+    target_link_libraries(LibJSStandalone INTERFACE LibJS)
 endif()

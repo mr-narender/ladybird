@@ -30,7 +30,6 @@ set(INTERNAL_RESOURCES
 list(TRANSFORM INTERNAL_RESOURCES PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/ladybird/")
 
 set(SITE_COMPATIBILITY_RESOURCES
-    aljazeera.com.json
     cnn.com.json
     nytimes.com.json
 )
@@ -47,6 +46,9 @@ set(ABOUT_PAGES
     services.html
     version.html
     webui.css
+    welcome.css
+    welcome.html
+    welcome.js
 )
 list(TRANSFORM ABOUT_PAGES PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/ladybird/about-pages/")
 
@@ -60,11 +62,12 @@ set(ABOUT_SETTINGS_RESOURCES
     geolocation.js
     languages.js
     network.js
-    new-tab-page.js
     permissions.js
     privacy.js
     search.js
     services.js
+    site-permissions.js
+    startup.js
     tabs.js
 )
 list(TRANSFORM ABOUT_SETTINGS_RESOURCES PREPEND "${LADYBIRD_SOURCE_DIR}/Base/res/ladybird/about-pages/settings/")

@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/HTML/PreparedNavigationDescriptor.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
@@ -53,6 +53,19 @@ GC::Ptr<DOM::Document> Navigable::container_document() const
     return container->document();
 }
 
+PermissionsPolicy::PermissionsPolicy Navigable::create_a_permissions_policy_from_a_response(URL::Origin const& origin, HTTP::HeaderList const& response_header_list) const
+{
+    if (!parent())
+        return PermissionsPolicy::create_a_permissions_policy_for_a_navigable_from_response({}, origin, response_header_list);
+
+    // NB: The container's node document is the parent's active document. An origin not yet replicated is same origin
+    //     with nothing, which withholds features whose default allowlist is 'self'.
+    auto container_document_origin = parent()->active_document_origin().value_or_lazy_evaluated([] { return URL::Origin::create_opaque(); });
+    auto container_state = this->container_state();
+    PermissionsPolicy::NavigableContainerPolicyInputs container { container_state.document_permissions_policy, container_document_origin, container_state.container_policy };
+    return PermissionsPolicy::create_a_permissions_policy_for_a_navigable_from_response(container, origin, response_header_list);
+}
+
 bool Navigable::is_ancestor_of(Navigable const& other) const
 {
     for (auto ancestor = other.parent(); ancestor; ancestor = ancestor->parent()) {
@@ -83,6 +96,12 @@ GC::Ptr<DOM::Node> Navigable::currently_focused_area_shown_by_focused_navigable(
             return container;
     }
     return nullptr;
+}
+
+void Navigable::set_parent(GC::Ptr<Navigable> parent)
+{
+    m_parent = parent;
+    DOM::Document::invalidate_full_activity();
 }
 
 // AD-HOC: Destroying a child navigable detaches its subtree from the traversable, although the documents in that
@@ -156,14 +175,8 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
         ? ContentSecurityPolicy::Directives::Directive::NavigationType::FormSubmission
         : ContentSecurityPolicy::Directives::Directive::NavigationType::Other;
 
-    // 2. Let sourceSnapshotParams be the result of snapshotting source snapshot params given sourceDocument.
-    auto source_snapshot_params = snapshot_source_snapshot_params(source_document);
-
-    // 3. Let initiatorOriginSnapshot be a new opaque origin.
-    auto initiator_origin_snapshot = URL::Origin::create_opaque();
-
-    // 4. Let initiatorBaseURLSnapshot be about:blank.
-    auto initiator_base_url_snapshot = URL::about_blank();
+    // Steps 2 to 4, 6.3, 6.4, and 7.
+    auto snapshots = snapshot_navigation_source(source_document);
 
     // 5. If sourceDocument is null:
     if (!source_document) {
@@ -175,7 +188,7 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
             auto origin = active_document_origin();
             if (!origin.has_value())
                 return {};
-            initiator_origin_snapshot = origin.release_value();
+            snapshots.initiator_origin_snapshot = origin.release_value();
         }
     }
     // 6. Otherwise:
@@ -183,9 +196,15 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
         // 1. Assert: userInvolvement is not "browser UI".
         VERIFY(params.user_involvement != UserNavigationInvolvement::BrowserUI);
 
+        // AD-HOC: sourceDocument can have no node navigable, e.g. a document without a browsing context that a form
+        //         moved into after it planned a navigation. There is nothing to navigate from.
+        auto source_navigable = source_document->navigable();
+        if (!source_navigable)
+            return {};
+
         // 2. If sourceDocument's node navigable is not allowed by sandboxing to navigate navigable given
         //    sourceSnapshotParams:
-        if (!source_document->navigable()->allowed_by_sandboxing_to_navigate(*this, source_snapshot_params)) {
+        if (!source_navigable->allowed_by_sandboxing_to_navigate(*this, snapshots.source_snapshot_params)) {
             // 1. If exceptionsEnabled is true, then throw a "SecurityError" DOMException.
             if (params.exceptions_enabled)
                 return WebIDL::SecurityError::create("Source document's node navigable is not allowed to navigate"_utf16);
@@ -193,12 +212,6 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
             // 2. Return.
             return {};
         }
-
-        // 3. Set initiatorOriginSnapshot to sourceDocument's origin.
-        initiator_origin_snapshot = source_document->origin();
-
-        // 4. Set initiatorBaseURLSnapshot to sourceDocument's document base URL.
-        initiator_base_url_snapshot = source_document->base_url();
     }
 
     // AD-HOC: Nothing the browser process can see names this URL's blob URL entry until the navigation commits, so
@@ -207,10 +220,6 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
         if (auto const* blob = blob_url_entry->object.get_pointer<URL::BlobURLEntry::Blob>())
             source_document->page().client().page_did_retain_blob_url_token(id(), blob->token);
     }
-
-    // 7. Let navigationId be the result of generating a random UUID.
-    auto uuid = Crypto::generate_random_uuid();
-    auto navigation_id = Utf16String::from_ascii_without_validation(uuid.bytes());
 
     // 8. If the surrounding agent is equal to navigable's active document's relevant agent, then continue these
     //    steps. Otherwise, queue a global task on the navigation and traversal task source given navigable's active
@@ -225,14 +234,14 @@ WebIDL::ExceptionOr<void> Navigable::navigate(NavigateParams params)
         .form_data_entry_list = move(params.form_data_entry_list),
         .referrer_policy = params.referrer_policy,
         .user_involvement = params.user_involvement,
-        .navigation_id = move(navigation_id),
+        .navigation_id = move(snapshots.navigation_id),
         .source_element = params.source_element,
         .initial_insertion = params.initial_insertion,
         .api_method_tracker = params.api_method_tracker,
         .csp_navigation_type = csp_navigation_type,
-        .source_snapshot_params = source_snapshot_params,
-        .initiator_origin_snapshot = move(initiator_origin_snapshot),
-        .initiator_base_url_snapshot = move(initiator_base_url_snapshot),
+        .source_snapshot_params = snapshots.source_snapshot_params,
+        .initiator_origin_snapshot = move(snapshots.initiator_origin_snapshot),
+        .initiator_base_url_snapshot = move(snapshots.initiator_base_url_snapshot),
     });
 }
 
@@ -252,13 +261,10 @@ bool Navigable::allowed_by_sandboxing_to_navigate(Navigable const& target, Sourc
     if (source.is_ancestor_of(target))
         return true;
 
-    // 3. If target is an ancestor of source, then:
-    if (target.is_ancestor_of(source)) {
-
-        // 1. If target is not a top-level traversable, then return true.
-        if (!target.is_top_level_traversable())
-            return true;
-
+    // 3. If target is an ancestor of source:
+    // AD-HOC: Only for a top-level target, which drops step 1, so that other ancestors reach step 5.
+    //         See https://github.com/whatwg/html/pull/13150
+    if (target.is_top_level_traversable() && target.is_ancestor_of(source)) {
         // 2. If sourceSnapshotParams's has transient activation is true, and sourceSnapshotParams's sandboxing flags's
         //    sandboxed top-level navigation with user activation browsing context flag is set, then return false.
         if (source_snapshot_params.has_transient_activation && has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedTopLevelNavigationWithUserActivation))
@@ -275,7 +281,9 @@ bool Navigable::allowed_by_sandboxing_to_navigate(Navigable const& target, Sourc
 
     // 4. If target is a top-level traversable:
     if (target.is_top_level_traversable()) {
-        // FIXME: 1. If source is the one permitted sandboxed navigator of target, then return true.
+        // 1. If source is the one permitted sandboxed navigator of target, then return true.
+        if (target.active_browsing_context_one_permitted_sandboxed_navigator().ptr() == &source)
+            return true;
 
         // 2. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
         if (has_flag(source_snapshot_params.sandboxing_flags, SandboxingFlagSet::SandboxedNavigation))
@@ -320,6 +328,7 @@ GC::Ptr<Navigable> navigable_with_id_in_any_page(Page const& preferred_page, Cro
 
 // The top-level browsing contexts of a group, as the navigables they are active in: the traversables this process
 // hosts, and its stand-ins for those other processes host. A traversable hosted here stands ahead of any stand-in.
+// A provisional traversable is not active yet: the stand-in for the traversable another process hosts represents it.
 Vector<GC::Root<Navigable>> top_level_navigables_in_browsing_context_group(Optional<u64> browsing_context_group_id)
 {
     Vector<GC::Root<Navigable>> navigables;
@@ -327,6 +336,8 @@ Vector<GC::Root<Navigable>> top_level_navigables_in_browsing_context_group(Optio
         return navigables;
     auto consider = [&](Navigable& navigable) {
         if (!navigable.is_top_level_traversable() || navigable.has_been_destroyed() || navigable.browsing_context_group_id() != browsing_context_group_id)
+            return;
+        if (auto* local_navigable = as_if<LocalNavigable>(navigable); local_navigable && local_navigable->is_provisional())
             return;
         if (any_of(navigables, [&](auto const& seen) { return seen->id() == navigable.id(); }))
             return;

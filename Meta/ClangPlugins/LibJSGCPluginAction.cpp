@@ -6,6 +6,8 @@
  */
 
 #include "LibJSGCPluginAction.h"
+#include <array>
+#include <clang/AST/IgnoreExpr.h>
 #include <clang/ASTMatchers/ASTMatchFinder.h>
 #include <clang/ASTMatchers/ASTMatchers.h>
 #include <clang/Basic/SourceManager.h>
@@ -38,20 +40,43 @@ private:
     std::vector<T const*> m_matches;
 };
 
-static bool record_inherits_from_cell(clang::CXXRecordDecl const& record)
+// GC::ForeignCell's subclasses name cells that a foreign implementation, such as the Rust LibJS runtime, lays out,
+// creates and visits. C++ code holds and visits them like GC::Cell's subclasses, so the checks of how cells are held
+// apply to both kinds, while the checks of how a C++ cell class is written apply only to GC::Cell's subclasses.
+enum class CellBaseOfRecord {
+    NotACell,
+    Cell,
+    ForeignCell,
+};
+
+static CellBaseOfRecord cell_base_named_by_record(clang::CXXRecordDecl const& record)
+{
+    auto qualified_name = record.getQualifiedNameAsString();
+    if (qualified_name == "GC::Cell")
+        return CellBaseOfRecord::Cell;
+    if (qualified_name == "GC::ForeignCell")
+        return CellBaseOfRecord::ForeignCell;
+    return CellBaseOfRecord::NotACell;
+}
+
+static CellBaseOfRecord cell_base_of_record(clang::CXXRecordDecl const& record)
 {
     if (!record.isCompleteDefinition())
-        return false;
+        return CellBaseOfRecord::NotACell;
 
-    bool inherits_from_cell = record.getQualifiedNameAsString() == "GC::Cell";
+    auto cell_base = cell_base_named_by_record(record);
+    if (cell_base != CellBaseOfRecord::NotACell)
+        return cell_base;
     record.forallBases([&](clang::CXXRecordDecl const* base) -> bool {
-        if (base->getQualifiedNameAsString() == "GC::Cell") {
-            inherits_from_cell = true;
-            return false;
-        }
-        return true;
+        cell_base = cell_base_named_by_record(*base);
+        return cell_base == CellBaseOfRecord::NotACell;
     });
-    return inherits_from_cell;
+    return cell_base;
+}
+
+static bool record_inherits_from_cell(clang::CXXRecordDecl const& record)
+{
+    return cell_base_of_record(record) != CellBaseOfRecord::NotACell;
 }
 
 // Check if a type has a visit_edges method that takes GC::Cell::Visitor&
@@ -155,19 +180,14 @@ static ContainsGCPtrResult record_contains_gc_ptr(clang::CXXRecordDecl const* re
 
 static ContainsGCPtrResult type_contains_gc_ptr(clang::QualType const& type, std::set<clang::CXXRecordDecl const*>& visited)
 {
-    // Handle elaborated types
-    clang::QualType actual_type = type;
-    if (auto const* elaborated = llvm::dyn_cast<clang::ElaboratedType>(type.getTypePtr()))
-        actual_type = elaborated->desugar();
-
     // Check for JS::Value directly
-    if (auto const* record = actual_type->getAsCXXRecordDecl()) {
+    if (auto const* record = type->getAsCXXRecordDecl()) {
         if (record->getQualifiedNameAsString() == "JS::Value")
             return ContainsGCPtrResult::Yes;
     }
 
     // Check for raw pointers to Cell types (these should use GC::Ptr instead)
-    if (auto const* pointer_type = actual_type->getAs<clang::PointerType>()) {
+    if (auto const* pointer_type = type->getAs<clang::PointerType>()) {
         if (auto const* pointee = pointer_type->getPointeeCXXRecordDecl()) {
             if (pointee->hasDefinition() && record_inherits_from_cell(*pointee))
                 return ContainsGCPtrResult::Yes;
@@ -175,7 +195,7 @@ static ContainsGCPtrResult type_contains_gc_ptr(clang::QualType const& type, std
     }
 
     // Check for raw references to Cell types (these should use GC::Ref instead)
-    if (auto const* reference_type = actual_type->getAs<clang::ReferenceType>()) {
+    if (auto const* reference_type = type->getAs<clang::ReferenceType>()) {
         if (auto const* pointee = reference_type->getPointeeCXXRecordDecl()) {
             if (pointee->hasDefinition() && record_inherits_from_cell(*pointee))
                 return ContainsGCPtrResult::Yes;
@@ -183,7 +203,7 @@ static ContainsGCPtrResult type_contains_gc_ptr(clang::QualType const& type, std
     }
 
     // Check for template specializations (GC::Ptr, GC::Ref, Vector, HashMap, etc.)
-    if (auto const* specialization = actual_type->getAs<clang::TemplateSpecializationType>()) {
+    if (auto const* specialization = type->getAs<clang::TemplateSpecializationType>()) {
         auto template_name = specialization->getTemplateName().getAsTemplateDecl()->getQualifiedNameAsString();
 
         // Direct GC pointer types
@@ -209,7 +229,7 @@ static ContainsGCPtrResult type_contains_gc_ptr(clang::QualType const& type, std
     }
 
     // Check for record types (structs/classes) that might contain GC pointers
-    if (auto const* record = actual_type->getAsCXXRecordDecl()) {
+    if (auto const* record = type->getAsCXXRecordDecl()) {
         return record_contains_gc_ptr(record, visited);
     }
 
@@ -324,11 +344,7 @@ static std::optional<QualTypeGCInfo> validate_qualified_type(clang::QualType con
 
 static std::optional<QualTypeGCInfo> validate_field_qualified_type(clang::FieldDecl const* field_decl)
 {
-    auto type = field_decl->getType();
-    if (auto const* elaborated_type = llvm::dyn_cast<clang::ElaboratedType>(type.getTypePtr()))
-        type = elaborated_type->desugar();
-
-    for (auto const& qualified_type : get_all_qualified_types(type)) {
+    for (auto const& qualified_type : get_all_qualified_types(field_decl->getType())) {
         if (auto error = validate_qualified_type(qualified_type))
             return error;
     }
@@ -360,10 +376,15 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
     if (qualified_name == "GC::Cell")
         return true;
 
+    validate_engine_subclass_is_in_libjs(*record);
+
+    remember_polymorphic_subclass(*record);
+
     auto& diag_engine = m_context.getDiagnostics();
     std::vector<clang::FieldDecl const*> fields_that_need_visiting;
     std::vector<clang::FieldDecl const*> substruct_fields_that_need_visiting;
-    auto record_is_cell = record_inherits_from_cell(*record);
+    auto record_cell_base = cell_base_of_record(*record);
+    auto record_is_cell = record_cell_base != CellBaseOfRecord::NotACell;
 
     for (clang::FieldDecl const* field : record->fields()) {
         // Skip anonymous structs/unions - their members are accessed indirectly
@@ -371,8 +392,12 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
         if (field->isAnonymousStructOrUnion())
             continue;
 
-        if (auto const* field_record = m_context.getBaseElementType(field->getType())->getAsCXXRecordDecl(); field_record && record_inherits_from_cell(*field_record)) {
-            auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "GC::Cell type %0 must be allocated with GC::Heap::allocate(), not stored by value");
+        auto const* field_record = m_context.getBaseElementType(field->getType())->getAsCXXRecordDecl();
+        auto field_cell_base = field_record ? cell_base_of_record(*field_record) : CellBaseOfRecord::NotACell;
+        if (field_cell_base != CellBaseOfRecord::NotACell) {
+            auto diag_id = field_cell_base == CellBaseOfRecord::ForeignCell
+                ? diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "GC::ForeignCell type %0 is allocated by its foreign implementation, not stored by value")
+                : diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "GC::Cell type %0 must be allocated with GC::Heap::allocate(), not stored by value");
             auto builder = diag_engine.Report(field->getLocation(), diag_id);
             builder << field_record->getName();
             continue;
@@ -425,10 +450,14 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
     // when used as a member of a Cell (checked below for Cell types).
     // However, if they DO have visit_edges, verify it visits all GC members.
     if (!record_is_cell) {
+        validate_gc_members_of_polymorphic_record(*record);
+
         // Check if this non-Cell type has a visit_edges method
         clang::DeclarationName name = &m_context.Idents.get("visit_edges");
         auto const* visit_edges_method = record->lookup(name).find_first<clang::CXXMethodDecl>();
-        if (visit_edges_method && visit_edges_method->getBody()) {
+        // A struct that a foreign implementation lays out, such as an execution context of the Rust LibJS runtime, can
+        // hand its visit to that implementation, which visits every member.
+        if (visit_edges_method && visit_edges_method->getBody() && !decl_has_annotation(visit_edges_method, "ladybird::visits_through_foreign_implementation")) {
             // Verify that all GC pointer fields are visited
             if (!fields_that_need_visiting.empty() || !substruct_fields_that_need_visiting.empty()) {
                 MatchFinder field_access_finder;
@@ -470,7 +499,14 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
         return true;
     }
 
-    validate_record_macros(*record);
+    // The checks below are about how a C++ cell class is written. A foreign cell has no vtable for the GC_CELL macros
+    // to override, and its foreign implementation visits its edges and destroys it.
+    if (record_cell_base == CellBaseOfRecord::ForeignCell)
+        return true;
+
+    // The macros are written in the class template, not in an explicit instantiation of it.
+    if (!record->getTemplateInstantiationPattern())
+        validate_record_macros(*record);
 
     // Check that Cell subclasses (and all their base classes) don't have non-trivial destructors.
     // They should override Cell::finalize() instead.
@@ -572,8 +608,6 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
         if (!fields_that_are_visited.contains(field->getNameAsString())) {
             // Check if the substruct type has a visit_edges method
             auto field_type = field->getType();
-            if (auto const* elaborated = llvm::dyn_cast<clang::ElaboratedType>(field_type.getTypePtr()))
-                field_type = elaborated->desugar();
 
             // For smart pointer types (OwnPtr, RefPtr, etc.), check the pointed-to type
             clang::CXXRecordDecl const* type_to_check = nullptr;
@@ -684,15 +718,7 @@ bool LibJSGCVisitor::VisitCXXMethodDecl(clang::CXXMethodDecl* method)
             continue;
 
         // Get the record decl that the qualifier refers to
-        auto const* qualifier = member_expr->getQualifier();
-        if (!qualifier)
-            continue;
-
-        auto const* qualifier_type = qualifier->getAsType();
-        if (!qualifier_type)
-            continue;
-
-        auto const* qualifier_record = qualifier_type->getAsCXXRecordDecl();
+        auto const* qualifier_record = member_expr->getQualifier().getAsRecordDecl();
         if (!qualifier_record)
             continue;
 
@@ -757,9 +783,6 @@ static std::optional<CellTypeWithOrigin> find_cell_type_with_origin(clang::CXXRe
 
             if (base_name == "JS::PrototypeObject")
                 return CellTypeWithOrigin { *base_record, LibJSCellMacro::Type::JSPrototypeObject };
-
-            if (base_name == "Web::Bindings::PlatformObject")
-                return CellTypeWithOrigin { *base_record, LibJSCellMacro::Type::WebPlatformObject };
 
             if (base_name == "Web::Bindings::Wrappable")
                 return CellTypeWithOrigin { *base_record, LibJSCellMacro::Type::WebWrappable };
@@ -891,6 +914,640 @@ void LibJSGCVisitor::validate_record_macros(clang::CXXRecordDecl const& record)
         report_missing_macro();
 }
 
+// A dependent base such as JS::TypedArray<T> has no record of its own, so it stands for the class template it names: if
+// that template is an engine object type, so is every instantiation. A base that is a template parameter stays unknown
+// until the template is instantiated.
+static clang::CXXRecordDecl const* record_named_by_base_type(clang::QualType base_type)
+{
+    if (auto const* record = base_type->getAsCXXRecordDecl())
+        return record->getDefinition();
+
+    auto const* specialization_type = base_type->getAs<clang::TemplateSpecializationType>();
+    if (!specialization_type)
+        return nullptr;
+    if (specialization_type->isTypeAlias())
+        return record_named_by_base_type(specialization_type->getAliasedType());
+    auto const* class_template = llvm::dyn_cast_or_null<clang::ClassTemplateDecl>(specialization_type->getTemplateName().getAsTemplateDecl());
+    if (!class_template)
+        return nullptr;
+    return class_template->getTemplatedDecl()->getDefinition();
+}
+
+// Every other engine object type, such as JS::NativeFunction, JS::Array, JS::Error, JS::CyclicModule or
+// JS::PrototypeObject, derives from one of these.
+static bool is_engine_object_type(clang::CXXRecordDecl const& record, std::unordered_set<clang::CXXRecordDecl const*>& records_seen)
+{
+    static std::unordered_set<std::string> const engine_object_root_types {
+        "JS::Environment",
+        "JS::Module",
+        "JS::Object",
+    };
+
+    if (engine_object_root_types.contains(record.getQualifiedNameAsString()))
+        return true;
+    if (!records_seen.insert(&record).second)
+        return false;
+
+    for (auto const& base : record.bases()) {
+        auto const* base_record = record_named_by_base_type(base.getType());
+        if (base_record && is_engine_object_type(*base_record, records_seen))
+            return true;
+    }
+    return false;
+}
+
+static bool is_engine_object_type(clang::CXXRecordDecl const& record)
+{
+    std::unordered_set<clang::CXXRecordDecl const*> records_seen;
+    return is_engine_object_type(record, records_seen);
+}
+
+static clang::CXXRecordDecl const& class_definition_written_in_source(clang::CXXRecordDecl const& record)
+{
+    if (auto const* template_pattern = record.getTemplateInstantiationPattern())
+        return *template_pattern;
+    return record;
+}
+
+static std::string file_path_of_declaration(clang::SourceManager const& source_manager, clang::Decl const& declaration)
+{
+    auto path = source_manager.getFilename(source_manager.getFileLoc(declaration.getLocation())).str();
+    if (!path.starts_with('/'))
+        path.insert(0, "/");
+    return path;
+}
+
+static bool is_libjs_path(std::string const& path)
+{
+    return path.find("/Libraries/LibJS/") != std::string::npos;
+}
+
+// These files still define their global objects and test objects as C++ subclasses of engine objects. They move to
+// host objects together with the rest of the code that embeds the engine, and each entry goes away with its port.
+static bool is_path_allowed_to_subclass_engine_objects(std::string const& path)
+{
+    static constexpr std::array legacy_engine_subclass_paths {
+        "/Utilities/js.cpp",
+    };
+    for (auto const* legacy_path : legacy_engine_subclass_paths) {
+        if (path.ends_with(legacy_path))
+            return true;
+    }
+    return false;
+}
+
+static bool may_subclass_engine_objects(clang::SourceManager const& source_manager, clang::CXXRecordDecl const& record)
+{
+    auto path = file_path_of_declaration(source_manager, class_definition_written_in_source(record));
+    return is_libjs_path(path) || is_path_allowed_to_subclass_engine_objects(path);
+}
+
+// The visitor checks every class written in the source and every instantiation of a class template written in the
+// source, but not the classes and class templates that an instantiation declares as its members.
+static bool is_checked_for_engine_subclassing(clang::CXXRecordDecl const& record)
+{
+    if (auto const* specialization = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record))
+        return !specialization->getSpecializedTemplate()->getInstantiatedFromMemberTemplate();
+    return !record.getInstantiatedFromMemberClass();
+}
+
+static clang::CXXRecordDecl const& engine_object_type_that_may_be_subclassed(clang::SourceManager const& source_manager, clang::CXXRecordDecl const& engine_object_type)
+{
+    if (may_subclass_engine_objects(source_manager, engine_object_type))
+        return engine_object_type;
+    for (auto const& base : engine_object_type.bases()) {
+        auto const* base_record = record_named_by_base_type(base.getType());
+        if (base_record && is_engine_object_type(*base_record))
+            return engine_object_type_that_may_be_subclassed(source_manager, *base_record);
+    }
+    return engine_object_type;
+}
+
+static std::string name_for_diagnostic(clang::ASTContext const& context, clang::NamedDecl const& declaration)
+{
+    std::string name;
+    llvm::raw_string_ostream stream(name);
+    declaration.getNameForDiagnostic(stream, context.getPrintingPolicy(), false);
+    return name;
+}
+
+void LibJSGCVisitor::validate_engine_subclass_is_in_libjs(clang::CXXRecordDecl const& record)
+{
+    auto& source_manager = m_context.getSourceManager();
+    if (may_subclass_engine_objects(source_manager, record))
+        return;
+
+    // A class template that is an engine object type whatever its arguments are gets the diagnostic in place of its
+    // instantiations.
+    auto const& class_definition = class_definition_written_in_source(record);
+    if (&class_definition != &record && is_engine_object_type(class_definition))
+        return;
+
+    for (auto const& base : record.bases()) {
+        auto const* base_record = record_named_by_base_type(base.getType());
+        if (!base_record || !is_engine_object_type(*base_record))
+            continue;
+
+        // A checked base outside LibJS gets the diagnostic in place of the classes derived from it.
+        if (!may_subclass_engine_objects(source_manager, *base_record) && is_checked_for_engine_subclassing(*base_record))
+            continue;
+
+        auto& diag_engine = m_context.getDiagnostics();
+        auto record_name = name_for_diagnostic(m_context, record);
+        auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "%0 derives from the engine type %1, which only LibJS may subclass; use a host class instead");
+        auto const& engine_object_type = engine_object_type_that_may_be_subclassed(source_manager, *base_record);
+        diag_engine.Report(record.getLocation(), diag_id) << record_name << engine_object_type.getQualifiedNameAsString();
+
+        auto const* specialization = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(&record);
+        if (specialization && specialization->getSpecializationKind() == clang::TSK_ImplicitInstantiation) {
+            auto note_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Note, "%0 is instantiated here");
+            diag_engine.Report(specialization->getPointOfInstantiation(), note_id) << record_name;
+        }
+    }
+}
+
+// The visitor sees only the classes written in the source. An instantiation of a class template can still be an engine
+// object type when the template derives from one of its arguments, so the implicit instantiations are checked here.
+bool LibJSGCVisitor::VisitClassTemplateDecl(clang::ClassTemplateDecl* class_template)
+{
+    if (!class_template->isThisDeclarationADefinition())
+        return true;
+
+    for (auto const* specialization : class_template->specializations()) {
+        if (specialization->getSpecializationKind() != clang::TSK_ImplicitInstantiation || !specialization->isCompleteDefinition())
+            continue;
+        validate_engine_subclass_is_in_libjs(*specialization);
+        remember_polymorphic_subclass(*specialization);
+        if (!record_inherits_from_cell(*specialization))
+            validate_gc_members_of_polymorphic_record(*specialization);
+    }
+    return true;
+}
+
+struct TemplateInstance {
+    std::string name;
+    std::vector<clang::QualType> type_arguments;
+};
+
+static void append_type_arguments(llvm::ArrayRef<clang::TemplateArgument> arguments, std::vector<clang::QualType>& type_arguments)
+{
+    for (auto const& argument : arguments) {
+        if (argument.getKind() == clang::TemplateArgument::Type)
+            type_arguments.push_back(argument.getAsType());
+        else if (argument.getKind() == clang::TemplateArgument::Pack)
+            append_type_arguments(argument.pack_elements(), type_arguments);
+    }
+}
+
+// These hold their values outside the object they are stored in, or are visible to the GC already.
+static bool is_type_that_does_not_store_gc_pointers_by_value(std::string const& template_name)
+{
+    static std::unordered_set<std::string> const template_names {
+        "AK::NonnullOwnPtr",
+        "AK::NonnullRefPtr",
+        "AK::OwnPtr",
+        "AK::RefPtr",
+        "AK::Span",
+        "AK::WeakPtr",
+        "GC::ConservativeHashMap",
+        "GC::ConservativeHashTable",
+        "GC::ConservativeVector",
+        "GC::RawPtr",
+        "GC::RawRef",
+        "GC::Root",
+        "GC::RootHashMap",
+        "GC::RootHashTable",
+        "GC::RootVector",
+        "GC::Weak",
+        "GC::WeakHashMap",
+        "GC::WeakHashSet",
+    };
+    return template_names.contains(template_name);
+}
+
+// The template arguments as written keep alias templates such as GC::RawPtr, which the canonical arguments of a
+// specialization resolve to the template they alias. A dependent type such as Vector<GC::Ref<T>> only has those.
+static std::optional<TemplateInstance> template_instance_of_type(clang::QualType type)
+{
+    if (auto const* specialization_type = type->getAs<clang::TemplateSpecializationType>()) {
+        auto const* template_decl = specialization_type->getTemplateName().getAsTemplateDecl();
+        if (!template_decl)
+            return {};
+        auto template_name = template_decl->getQualifiedNameAsString();
+        if (specialization_type->isTypeAlias() && !is_type_that_does_not_store_gc_pointers_by_value(template_name))
+            return template_instance_of_type(specialization_type->getAliasedType());
+
+        TemplateInstance instance { std::move(template_name), {} };
+        append_type_arguments(specialization_type->template_arguments(), instance.type_arguments);
+        return instance;
+    }
+
+    if (auto const* specialization = llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(type->getAsCXXRecordDecl())) {
+        TemplateInstance instance { specialization->getSpecializedTemplate()->getQualifiedNameAsString(), {} };
+        append_type_arguments(specialization->getTemplateArgs().asArray(), instance.type_arguments);
+        return instance;
+    }
+    return {};
+}
+
+static bool record_is_nan_boxed_value(clang::CXXRecordDecl const& record)
+{
+    if (record.getQualifiedNameAsString() == "GC::NanBoxedValue")
+        return true;
+    return !record.forallBases([](clang::CXXRecordDecl const* base) {
+        return base->getQualifiedNameAsString() != "GC::NanBoxedValue";
+    });
+}
+
+static bool record_is_in_ak_or_gc(clang::CXXRecordDecl const& record)
+{
+    auto qualified_name = record.getQualifiedNameAsString();
+    return qualified_name.starts_with("AK::") || qualified_name.starts_with("GC::");
+}
+
+// Whether a value of this type holds a pointer that a GC root container could keep alive, or a struct that holds one.
+static bool type_holds_gc_pointer(clang::QualType type, std::set<clang::CXXRecordDecl const*>& visited)
+{
+    if (auto const* array = type->getAsArrayTypeUnsafe())
+        return type_holds_gc_pointer(array->getElementType(), visited);
+
+    if (type->isPointerType() || type->isReferenceType()) {
+        auto const* pointee = type->getPointeeCXXRecordDecl();
+        auto const* definition = pointee ? pointee->getDefinition() : nullptr;
+        return definition && record_inherits_from_cell(*definition);
+    }
+
+    if (auto instance = template_instance_of_type(type)) {
+        if (instance->name == "GC::Ptr" || instance->name == "GC::Ref")
+            return true;
+        if (is_type_that_does_not_store_gc_pointers_by_value(instance->name))
+            return false;
+        for (auto const& type_argument : instance->type_arguments) {
+            if (type_holds_gc_pointer(type_argument, visited))
+                return true;
+        }
+    }
+
+    auto const* record = type->getAsCXXRecordDecl();
+    if (!record || !record->isCompleteDefinition() || !visited.insert(record).second)
+        return false;
+    if (record_is_nan_boxed_value(*record))
+        return true;
+    if (record_is_in_ak_or_gc(*record) || record_inherits_from_cell(*record))
+        return false;
+    for (auto const& base : record->bases()) {
+        if (type_holds_gc_pointer(base.getType(), visited))
+            return true;
+    }
+    for (auto const* field : record->fields()) {
+        if (type_holds_gc_pointer(field->getType(), visited))
+            return true;
+    }
+    return false;
+}
+
+void LibJSGCVisitor::validate_gc_members_of_polymorphic_record(clang::CXXRecordDecl const& record)
+{
+    if (record.isDependentContext() || !record.isPolymorphic() || type_has_visit_edges_method(&record))
+        return;
+
+    bool has_polymorphic_base = false;
+    record.forallBases([&](clang::CXXRecordDecl const* base) {
+        has_polymorphic_base |= base->isPolymorphic();
+        return !has_polymorphic_base;
+    });
+    if (!has_polymorphic_base)
+        return;
+
+    auto& diag_engine = m_context.getDiagnostics();
+    auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "Member %0 of polymorphic class %1 contains GC pointers but %1 has no visit_edges method");
+    auto record_name = name_for_diagnostic(m_context, record);
+    for (auto const* field : record.fields()) {
+        std::set<clang::CXXRecordDecl const*> visited;
+        if (type_holds_gc_pointer(field->getType(), visited))
+            diag_engine.Report(field->getLocation(), diag_id) << field->getName() << record_name;
+    }
+}
+
+void LibJSGCVisitor::remember_polymorphic_subclass(clang::CXXRecordDecl const& record)
+{
+    if (record.isDependentContext() || !record.isPolymorphic())
+        return;
+    record.forallBases([&](clang::CXXRecordDecl const* base) {
+        if (base->isPolymorphic())
+            m_polymorphic_subclasses[base->getCanonicalDecl()].push_back(&record);
+        return true;
+    });
+}
+
+static bool is_container_with_heap_storage(std::string const& template_name)
+{
+    static std::unordered_set<std::string> const template_names {
+        "AK::DoublyLinkedList",
+        "AK::FixedArray",
+        "AK::HashMap",
+        "AK::HashTable",
+        "AK::Queue",
+        "AK::SinglyLinkedList",
+        "AK::Vector",
+    };
+    return template_names.contains(template_name);
+}
+
+// The GC sees the values these store, but not the heap storage of a container stored in one of them.
+static bool is_container_scanned_by_gc(std::string const& template_name)
+{
+    static std::unordered_set<std::string> const template_names {
+        "GC::ConservativeHashMap",
+        "GC::ConservativeHashTable",
+        "GC::ConservativeVector",
+        "GC::RootHashMap",
+        "GC::RootHashTable",
+        "GC::RootVector",
+    };
+    return template_names.contains(template_name);
+}
+
+static bool is_value_wrapper(std::string const& template_name)
+{
+    static std::unordered_set<std::string> const template_names {
+        "AK::Array",
+        "AK::ErrorOr",
+        "AK::Optional",
+        "AK::Tuple",
+        "AK::Variant",
+    };
+    return template_names.contains(template_name);
+}
+
+static bool is_owning_pointer(std::string const& template_name)
+{
+    return template_name == "AK::NonnullOwnPtr" || template_name == "AK::NonnullRefPtr" || template_name == "AK::OwnPtr" || template_name == "AK::RefPtr";
+}
+
+static std::optional<clang::QualType> find_container_with_unscanned_gc_pointers(clang::QualType, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const* subclasses_of_owned_types = nullptr);
+
+static clang::FieldDecl const* find_owned_member_with_gc_pointers(clang::QualType owned_type, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const& subclasses_of_owned_types)
+{
+    auto const* record = owned_type->getAsCXXRecordDecl();
+    if (!record || !record->getDefinition())
+        return nullptr;
+    record = record->getDefinition();
+    if (record_is_in_ak_or_gc(*record) || record_inherits_from_cell(*record) || !visited.insert(record).second)
+        return nullptr;
+
+    std::vector<clang::CXXRecordDecl const*> records { record };
+    record->forallBases([&](clang::CXXRecordDecl const* base) {
+        records.push_back(base);
+        return true;
+    });
+    if (auto subclasses = subclasses_of_owned_types.find(record->getCanonicalDecl()); subclasses != subclasses_of_owned_types.end())
+        records.insert(records.end(), subclasses->second.begin(), subclasses->second.end());
+
+    for (auto const* candidate : records) {
+        for (auto const* field : candidate->fields()) {
+            std::set<clang::CXXRecordDecl const*> visited_by_field;
+            if (type_holds_gc_pointer(field->getType(), visited_by_field) || find_container_with_unscanned_gc_pointers(field->getType(), visited, &subclasses_of_owned_types))
+                return field;
+        }
+    }
+    return nullptr;
+}
+
+// Conservative stack scanning sees the values stored in a stack object, but not the heap storage of a container in it.
+static std::optional<clang::QualType> find_container_with_unscanned_gc_pointers(clang::QualType type, std::set<clang::CXXRecordDecl const*>& visited, PolymorphicSubclasses const* subclasses_of_owned_types)
+{
+    if (auto const* array = type->getAsArrayTypeUnsafe())
+        return find_container_with_unscanned_gc_pointers(array->getElementType(), visited, subclasses_of_owned_types);
+
+    if (type->isPointerType() || type->isReferenceType())
+        return {};
+
+    if (auto instance = template_instance_of_type(type)) {
+        if (is_container_with_heap_storage(instance->name)) {
+            for (auto const& type_argument : instance->type_arguments) {
+                std::set<clang::CXXRecordDecl const*> visited_by_element;
+                if (type_holds_gc_pointer(type_argument, visited_by_element))
+                    return type;
+                if (subclasses_of_owned_types && find_container_with_unscanned_gc_pointers(type_argument, visited, subclasses_of_owned_types))
+                    return type;
+            }
+            return {};
+        }
+        if (subclasses_of_owned_types && is_owning_pointer(instance->name)) {
+            for (auto const& type_argument : instance->type_arguments) {
+                std::set<clang::CXXRecordDecl const*> visited_by_object;
+                if (type_holds_gc_pointer(type_argument, visited_by_object) || find_owned_member_with_gc_pointers(type_argument, visited, *subclasses_of_owned_types))
+                    return type;
+                if (find_container_with_unscanned_gc_pointers(type_argument, visited, subclasses_of_owned_types))
+                    return type;
+            }
+            return {};
+        }
+        if (is_value_wrapper(instance->name) || is_container_scanned_by_gc(instance->name)) {
+            for (auto const& type_argument : instance->type_arguments) {
+                if (auto container = find_container_with_unscanned_gc_pointers(type_argument, visited, subclasses_of_owned_types))
+                    return container;
+            }
+            return {};
+        }
+        if (is_type_that_does_not_store_gc_pointers_by_value(instance->name))
+            return {};
+    }
+
+    auto const* record = type->getAsCXXRecordDecl();
+    if (!record || !record->isCompleteDefinition() || !visited.insert(record).second)
+        return {};
+    if (record_is_in_ak_or_gc(*record) || record_inherits_from_cell(*record))
+        return {};
+    for (auto const& base : record->bases()) {
+        if (auto container = find_container_with_unscanned_gc_pointers(base.getType(), visited, subclasses_of_owned_types))
+            return container;
+    }
+    for (auto const* field : record->fields()) {
+        if (auto container = find_container_with_unscanned_gc_pointers(field->getType(), visited, subclasses_of_owned_types))
+            return container;
+    }
+    return {};
+}
+
+static clang::QualType type_of_object_on_stack(clang::VarDecl const& variable)
+{
+    if (!variable.getType()->isReferenceType())
+        return variable.getType();
+
+    // A reference that extends the lifetime of a temporary keeps that temporary on the stack.
+    auto const* initializer = variable.getInit();
+    if (auto const* expression_with_cleanups = llvm::dyn_cast_or_null<clang::ExprWithCleanups>(initializer))
+        initializer = expression_with_cleanups->getSubExpr();
+    auto const* temporary = llvm::dyn_cast_or_null<clang::MaterializeTemporaryExpr>(initializer);
+    if (!temporary || temporary->getExtendingDecl() != &variable)
+        return {};
+    return temporary->getType();
+}
+
+void LibJSGCVisitor::validate_object_on_stack(clang::VarDecl const& variable, clang::SourceLocation location)
+{
+    auto type = type_of_object_on_stack(variable);
+    if (type.isNull())
+        return;
+
+    validate_type_on_stack(type, location);
+}
+
+void LibJSGCVisitor::validate_type_on_stack(clang::QualType type, clang::SourceLocation location)
+{
+    std::set<clang::CXXRecordDecl const*> visited;
+    auto container = find_container_with_unscanned_gc_pointers(type, visited);
+    if (!container)
+        return;
+
+    auto& diag_engine = m_context.getDiagnostics();
+    auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "%0 keeps GC pointers in heap memory that is not scanned for roots; use GC::RootVector, GC::RootHashMap, GC::RootHashTable or a GC::Conservative container instead");
+    diag_engine.Report(location, diag_id) << *container;
+}
+
+bool LibJSGCVisitor::VisitVarDecl(clang::VarDecl* variable)
+{
+    if (!variable->hasLocalStorage() || variable->isImplicit())
+        return true;
+
+    // A parameter passed by value is an object on the stack of the definition, like a local. A container that is moved
+    // into a field is taken by rvalue reference instead, so that the caller keeps it until then.
+    if (llvm::isa<clang::ParmVarDecl>(variable)) {
+        auto const* function = llvm::dyn_cast<clang::FunctionDecl>(variable->getDeclContext());
+        if (!function || !function->doesThisDeclarationHaveABody() || function->isImplicit())
+            return true;
+    }
+
+    validate_object_on_stack(*variable, variable->getLocation());
+    return true;
+}
+
+// The hidden range variable of a range-based for loop keeps a temporary range alive for the whole loop.
+bool LibJSGCVisitor::VisitCXXForRangeStmt(clang::CXXForRangeStmt* for_range)
+{
+    auto const* range_statement = for_range->getRangeStmt();
+    if (!range_statement || !range_statement->isSingleDecl())
+        return true;
+    if (auto const* range_variable = llvm::dyn_cast<clang::VarDecl>(range_statement->getSingleDecl()))
+        validate_object_on_stack(*range_variable, for_range->getRangeInit()->getBeginLoc());
+    return true;
+}
+
+// A container returned by value becomes a temporary or a local of the caller.
+bool LibJSGCVisitor::VisitFunctionDecl(clang::FunctionDecl* function)
+{
+    if (function->doesThisDeclarationHaveABody() && !function->isImplicit() && !function->getReturnType()->isReferenceType())
+        validate_type_on_stack(function->getReturnType(), function->getLocation());
+    return true;
+}
+
+// The call operator of a lambda is only visited through its body.
+bool LibJSGCVisitor::VisitLambdaExpr(clang::LambdaExpr* lambda)
+{
+    auto return_type = lambda->getCallOperator()->getReturnType();
+    if (!return_type->isReferenceType())
+        validate_type_on_stack(return_type, lambda->getBeginLoc());
+    return true;
+}
+
+static bool creates_gc_function(clang::FunctionDecl const& function)
+{
+    if (function.getQualifiedNameAsString() == "GC::create_function")
+        return true;
+    auto const* method = llvm::dyn_cast<clang::CXXMethodDecl>(&function);
+    if (!method || !method->getDeclName().isIdentifier() || method->getName() != "create")
+        return false;
+    auto const* specialization = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(method->getParent());
+    return specialization && specialization->getSpecializedTemplate()->getQualifiedNameAsString() == "GC::Function";
+}
+
+static bool is_call_to_move(clang::CallExpr const& call)
+{
+    auto const* callee = call.getDirectCallee();
+    return callee && call.getNumArgs() == 1 && callee->getDeclName().isIdentifier() && callee->getName() == "move";
+}
+
+static clang::LambdaExpr const* lambda_passed_by(clang::Expr const* argument)
+{
+    while (argument) {
+        argument = clang::IgnoreExprNodes(argument, clang::IgnoreImplicitSingleStep, clang::IgnoreParensSingleStep);
+        if (auto const* lambda = llvm::dyn_cast<clang::LambdaExpr>(argument))
+            return lambda;
+        if (auto const* cast = llvm::dyn_cast<clang::CXXFunctionalCastExpr>(argument)) {
+            argument = cast->getSubExpr();
+        } else if (auto const* construct = llvm::dyn_cast<clang::CXXConstructExpr>(argument); construct && construct->getNumArgs() == 1) {
+            argument = construct->getArg(0);
+        } else if (auto const* call = llvm::dyn_cast<clang::CallExpr>(argument); call && is_call_to_move(*call)) {
+            argument = call->getArg(0);
+        } else if (auto const* reference = llvm::dyn_cast<clang::DeclRefExpr>(argument)) {
+            auto const* variable = llvm::dyn_cast<clang::VarDecl>(reference->getDecl());
+            if (!variable || !variable->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(variable))
+                return nullptr;
+            argument = variable->getInit();
+        } else {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+bool LibJSGCVisitor::VisitCallExpr(clang::CallExpr* call)
+{
+    auto const* callee = call->getDirectCallee();
+    if (!callee || !creates_gc_function(*callee))
+        return true;
+    for (auto const* argument : call->arguments()) {
+        if (auto const* lambda = lambda_passed_by(argument))
+            m_lambdas_in_gc_functions.push_back(lambda);
+    }
+    return true;
+}
+
+void LibJSGCVisitor::validate_gc_function_captures()
+{
+    auto& diag_engine = m_context.getDiagnostics();
+    auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "Captured %0 keeps GC pointers in heap memory that GC::Function does not scan; hold them in a GC::Root, a GC::RootVector or a GC::Conservative container instead");
+    auto note_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Note, "Member %0 contains GC pointers");
+
+    for (auto const* lambda : m_lambdas_in_gc_functions) {
+        for (auto const& capture : lambda->captures()) {
+            if (!capture.capturesVariable() || capture.getCaptureKind() != clang::LCK_ByCopy)
+                continue;
+            auto const* variable = capture.getCapturedVar();
+            auto type = variable->getType().getNonReferenceType().getUnqualifiedType();
+            // An init-capture of move(x) has the type typename std::remove_reference<T&>::type.
+            while (!llvm::isa<clang::TemplateSpecializationType>(type.getTypePtr())) {
+                auto desugared_type = type.getSingleStepDesugaredType(m_context);
+                if (desugared_type == type)
+                    break;
+                type = desugared_type;
+            }
+
+            // An init-capture is a variable of its own, whose containers the check of objects on the stack reports.
+            if (auto const* init_capture = llvm::dyn_cast<clang::VarDecl>(variable); init_capture && init_capture->isInitCapture()) {
+                std::set<clang::CXXRecordDecl const*> visited_on_stack;
+                if (find_container_with_unscanned_gc_pointers(type, visited_on_stack))
+                    continue;
+            }
+
+            std::set<clang::CXXRecordDecl const*> visited;
+            auto storage = find_container_with_unscanned_gc_pointers(type, visited, &m_polymorphic_subclasses);
+            if (!storage)
+                continue;
+            diag_engine.Report(capture.getLocation(), diag_id) << *storage;
+
+            auto instance = template_instance_of_type(*storage);
+            if (!instance || !is_owning_pointer(instance->name) || instance->type_arguments.empty())
+                continue;
+            std::set<clang::CXXRecordDecl const*> visited_by_object;
+            if (auto const* member = find_owned_member_with_gc_pointers(instance->type_arguments[0], visited_by_object, m_polymorphic_subclasses))
+                diag_engine.Report(member->getLocation(), note_id) << member->getName();
+        }
+    }
+}
+
 LibJSGCASTConsumer::LibJSGCASTConsumer(clang::CompilerInstance& compiler, bool detect_invalid_function_members)
     : m_compiler(compiler)
     , m_detect_invalid_function_members(detect_invalid_function_members)
@@ -903,6 +1560,7 @@ void LibJSGCASTConsumer::HandleTranslationUnit(clang::ASTContext& context)
 {
     LibJSGCVisitor visitor { context, m_macro_map, m_detect_invalid_function_members };
     visitor.TraverseDecl(context.getTranslationUnitDecl());
+    visitor.validate_gc_function_captures();
 }
 
 char const* LibJSCellMacro::type_name(Type type)
@@ -916,8 +1574,6 @@ char const* LibJSCellMacro::type_name(Type type)
         return "JS_ENVIRONMENT";
     case Type::JSPrototypeObject:
         return "JS_PROTOTYPE_OBJECT";
-    case Type::WebPlatformObject:
-        return "WEB_PLATFORM_OBJECT";
     case Type::WebWrappable:
         return "WEB_WRAPPABLE";
     default:
@@ -940,12 +1596,11 @@ void LibJSPPCallbacks::MacroExpands(clang::Token const& name_token, clang::Macro
     if (auto* ident_info = name_token.getIdentifierInfo()) {
         static llvm::StringMap<LibJSCellMacro::Type> libjs_macro_types {
             { "GC_CELL", LibJSCellMacro::Type::GCCell },
+            { "GC_CELL_WITH_CUSTOM_CLASS_NAME", LibJSCellMacro::Type::GCCell },
             { "JS_OBJECT", LibJSCellMacro::Type::JSObject },
             { "JS_OBJECT_WITH_CUSTOM_CLASS_NAME", LibJSCellMacro::Type::JSObject },
             { "JS_ENVIRONMENT", LibJSCellMacro::Type::JSEnvironment },
             { "JS_PROTOTYPE_OBJECT", LibJSCellMacro::Type::JSPrototypeObject },
-            { "WEB_PLATFORM_OBJECT", LibJSCellMacro::Type::WebPlatformObject },
-            { "WEB_NON_IDL_PLATFORM_OBJECT", LibJSCellMacro::Type::WebPlatformObject },
             { "WEB_WRAPPABLE", LibJSCellMacro::Type::WebWrappable },
             { "WEB_NON_IDL_WRAPPABLE", LibJSCellMacro::Type::WebWrappable },
         };

@@ -11,6 +11,9 @@
 #include <AK/CharacterTypes.h>
 #include <AK/Debug.h>
 #include <AK/FFIHelpers.h>
+#include <AK/NeverDestroyed.h>
+#include <AK/UnicodeUtils.h>
+#include <LibCore/StatsLog.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
 #include <LibTextCodec/Decoder.h>
@@ -22,10 +25,12 @@
 #include <LibWeb/DOM/Comment.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
+#include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/DocumentType.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
+#include <LibWeb/DOM/EventDispatcher.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
 #include <LibWeb/DOM/ProcessingInstruction.h>
 #include <LibWeb/DOM/QualifiedName.h>
@@ -44,11 +49,16 @@
 #include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/HTMLToken.h>
 #include <LibWeb/HTML/Parser/ParserScriptingMode.h>
 #include <LibWeb/HTML/Parser/SpeculativeHTMLParser.h>
+#include <LibWeb/HTML/PolicyContainers.h>
+#include <LibWeb/HTML/PreloadEntry.h>
+#include <LibWeb/HTML/SanitizerConfiguration.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
@@ -56,8 +66,12 @@
 #include <LibWeb/HTMLTokenizerRustFFI.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
+#include <LibWeb/WebDriver/BiDi/BiDi.h>
+#include <LibWebCommon/HTML/BrowsingContext.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
 #include <LibWebCommon/Infra/Strings.h>
 
@@ -90,18 +104,59 @@ static Utf16FlyString utf16_fly_string_from_ffi(u16 const* ptr, size_t len)
     return Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(ptr), len });
 }
 
+static Utf16String utf16_string_from_span(ReadonlySpan<char> utf8)
+{
+    if (utf8.is_empty())
+        return {};
+    return Utf16String::from_utf8_without_validation({ utf8.data(), utf8.size() });
+}
+
+static Utf16String utf16_string_from_span(ReadonlySpan<char16_t> utf16)
+{
+    if (utf16.is_empty())
+        return {};
+    return Utf16String::from_utf16(Utf16View { utf16.data(), utf16.size() });
+}
+
 static Utf16String utf16_string_from_ffi(u16 const* ptr, size_t len)
 {
-    if (!ptr || len == 0)
+    if (!ptr)
         return {};
-    return Utf16String::from_utf16({ reinterpret_cast<char16_t const*>(ptr), len });
+    return utf16_string_from_span(ReadonlySpan<char16_t> { reinterpret_cast<char16_t const*>(ptr), len });
 }
 
 static Utf16String utf8_string_from_ffi(u8 const* ptr, size_t len)
 {
-    if (len == 0)
+    if (!ptr)
         return {};
-    return Utf16String::from_utf8_without_validation({ reinterpret_cast<char const*>(ptr), len });
+    return utf16_string_from_span(ReadonlySpan<char> { reinterpret_cast<char const*>(ptr), len });
+}
+
+static constexpr size_t newline_then_spaces_table_size = 64;
+
+static Utf16String const& newline_then_spaces_string(size_t length)
+{
+    VERIFY(length > 1 && length < newline_then_spaces_table_size);
+    static thread_local NeverDestroyed<Array<Optional<Utf16String>, newline_then_spaces_table_size>> newline_then_spaces_strings;
+    auto& string = (*newline_then_spaces_strings)[length];
+    if (!string.has_value()) {
+        Array<char, newline_then_spaces_table_size> characters;
+        characters[0] = '\n';
+        characters.span().slice(1, length - 1).fill(' ');
+        string = Utf16String::from_utf8_without_validation({ characters.data(), length });
+    }
+    return *string;
+}
+
+// OPTIMIZATION: Markup indents tags with a newline followed by spaces, so many Text nodes hold such a run. Like Blink,
+//               share one string for each length of these runs instead of allocating one for every Text node.
+template<typename CharT>
+static Utf16String text_node_data_from_span(ReadonlySpan<CharT> text)
+{
+    if (text.size() > 1 && text.size() < newline_then_spaces_table_size && text[0] == '\n'
+        && all_of(text.slice(1), [](CharT ch) { return ch == ' '; }))
+        return newline_then_spaces_string(text.size());
+    return utf16_string_from_span(text);
 }
 
 static Optional<Utf16FlyString> attribute_namespace_from_html_parser_ffi(RustFfiHtmlAttributeNamespace);
@@ -115,7 +170,7 @@ static Utf16String decode_html_parser_input(StringView input, StringView encodin
 {
     auto decoder = TextCodec::decoder_for(encoding);
     VERIFY(decoder.has_value());
-    return MUST(TextCodec::convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, input));
+    return MUST(TextCodec::decode_to_utf16(input.bytes(), *decoder));
 }
 
 extern "C" void ladybird_html_parser_log_parse_error(void*, u8 const*, size_t);
@@ -125,10 +180,14 @@ extern "C" void ladybird_html_parser_visit_node(void*, size_t);
 extern "C" size_t ladybird_html_parser_document_node(void*);
 extern "C" size_t ladybird_html_parser_document_html_element(void*);
 extern "C" void ladybird_html_parser_set_document_quirks_mode(void*, RustFfiHtmlQuirksMode);
+extern "C" bool ladybird_html_parser_document_is_iframe_srcdoc_document(void*);
 extern "C" size_t ladybird_html_parser_create_document_type(void*, u16 const*, size_t, u16 const*, size_t, u16 const*, size_t);
 extern "C" size_t ladybird_html_parser_create_comment(void*, u16 const*, size_t);
 extern "C" void ladybird_html_parser_insert_text(size_t, size_t, u8 const*, size_t);
-extern "C" void ladybird_html_parser_add_missing_attribute(size_t, size_t, u16 const*, size_t);
+extern "C" void ladybird_html_parser_add_missing_attribute(void*, size_t, size_t, u16 const*, size_t);
+extern "C" u8 ladybird_html_parser_sanitizer_action(void*, size_t);
+extern "C" size_t ladybird_html_parser_child_at_index(size_t, size_t);
+extern "C" u32 ladybird_html_parser_declarative_shadow_root_attributes(size_t);
 extern "C" void ladybird_html_parser_remove_node(size_t);
 extern "C" void ladybird_html_parser_handle_element_popped(size_t);
 extern "C" void ladybird_html_parser_prepare_svg_script(void*, size_t, size_t);
@@ -136,6 +195,7 @@ extern "C" void ladybird_html_parser_set_script_source_line(void*, size_t, size_
 extern "C" void ladybird_html_parser_mark_script_already_started(void*, size_t);
 extern "C" void ladybird_html_parser_process_meta_element(void*, size_t);
 extern "C" size_t ladybird_html_parser_parent_node(size_t);
+extern "C" bool ladybird_html_parser_element_cannot_be_inserted(size_t, size_t);
 extern "C" size_t ladybird_html_parser_node_index(size_t);
 extern "C" size_t ladybird_html_parser_create_element(void*, size_t, RustFfiHtmlNamespace, u16 const*, size_t, size_t, RustFfiHtmlParserAttribute const*, size_t, bool, size_t, bool);
 extern "C" void ladybird_html_parser_append_child(size_t, size_t);
@@ -146,6 +206,7 @@ extern "C" size_t ladybird_html_parser_template_content(size_t);
 extern "C" size_t ladybird_html_parser_attach_declarative_shadow_root(size_t, RustFfiHtmlShadowRootMode, RustFfiHtmlSlotAssignmentMode, bool, bool, bool, bool);
 extern "C" void ladybird_html_parser_set_template_content(size_t, size_t);
 extern "C" bool ladybird_html_parser_is_shadow_host(size_t);
+extern "C" void ladybird_html_parser_set_script_text_from_parser(size_t);
 
 HTMLParser::HTMLParser(DOM::Document& document, ParserScriptingMode scripting_mode, StringView input, StringView encoding, EncodingConfidence encoding_confidence)
     : m_tokenizer(decode_html_parser_input(input, encoding))
@@ -257,6 +318,9 @@ void HTMLParser::run(HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point
     }
 
     m_tokenizer.parser_did_run({});
+
+    if (m_document->parser().ptr() == this)
+        m_document->schedule_text_fragment_search_after_parser_progress({});
 }
 
 void HTMLParser::run(URL::URL const& url, HTMLTokenizer::StopAtInsertionPoint stop_at_insertion_point)
@@ -269,6 +333,12 @@ void HTMLParser::run(URL::URL const& url, HTMLTokenizer::StopAtInsertionPoint st
 void HTMLParser::pop_all_open_elements()
 {
     rust_html_parser_pop_all_open_elements(m_rust_parser);
+}
+
+void HTMLParser::set_sanitizer_configuration(SanitizerConfiguration const& configuration)
+{
+    m_sanitizer_configuration = configuration;
+    rust_html_parser_set_sanitizer(m_rust_parser, true, sanitizer_config_allows_comments(configuration));
 }
 
 void HTMLParser::configure_element_created_by_rust_parser(DOM::Element& element)
@@ -293,6 +363,15 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for_rust_parser(Utf16FlyString 
     if (had_duplicate_attribute)
         element->set_had_duplicate_attribute_during_tokenization({});
 
+    // 21. If element is a form-associated element and not a form-associated custom element, the form element pointer
+    //     is not null, the parser is not parsing template contents, the parser's fragment context element is null,
+    //     element is either not listed or doesn't have a form attribute, the intendedParent is in the same tree as
+    //     the element pointed to by the form element pointer, and the parser's insertion target redirection map[the
+    //     element pointed to by the form element pointer] does not exist, then associate element with the form
+    //     element pointed to by the form element pointer and set element's parser inserted flag.
+    // FIXME: Check the fragment context element and the full parsing-template-contents predicate.
+    // NB: The Rust tree builder passes a null form element if the insertion target redirection map has an entry for
+    //     the element pointed to by the form element pointer.
     if (form_element && !has_template_element_on_stack) {
         auto* html_element = as_if<HTML::HTMLElement>(*element);
         if (html_element && html_element->is_form_associated_element() && !html_element->is_form_associated_custom_element()) {
@@ -608,6 +687,9 @@ void HTMLParser::the_end(GC::Ref<DOM::Document> document, GC::Ptr<HTMLParser> pa
     if (parser)
         parser->m_tokenizer.undefine_insertion_point();
 
+    // NB: The normal parser fetches nothing more.
+    discard_speculative_preloads(*document);
+
     // 3. Update the current document readiness to "interactive".
     document->update_readiness(HTML::DocumentReadyState::Interactive);
 
@@ -661,7 +743,7 @@ HTMLParserEndState::HTMLParserEndState(GC::Ref<DOM::Document> document, GC::Ptr<
     : m_document(document)
     , m_parser(parser)
     , m_parser_generation(parser_generation)
-    , m_timeout(Platform::Timer::create_single_shot(GC::Heap::the(), THE_END_TIMEOUT_MS, GC::create_function(GC::Heap::the(), [this] {
+    , m_timeout(Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(THE_END_TIMEOUT_MS), GC::create_function(GC::Heap::the(), [this] {
         if (m_phase != Phase::Completed && m_phase != Phase::Cancelled)
             dbgln("HTMLParserEndState: timed out in phase {}", to_underlying(m_phase));
     })))
@@ -691,10 +773,20 @@ void HTMLParserEndState::schedule_progress_check()
         return;
     m_check_pending = true;
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this] {
+        auto scope_guard = SVG::ScopedSVGImageDocument::create_if_needed(m_document, SVG::ScopedSVGImageDocument::FrameRequests::Suppress);
         perform_pre_progress_microtask_checkpoint();
         check_progress();
         m_check_pending = false;
     }));
+}
+
+static bool navigable_container_is_rendered(DOM::Document& document)
+{
+    auto navigable = document.navigable();
+    if (!navigable || !navigable->container())
+        return true;
+    auto& container = *navigable->container();
+    return container.document().update_style_for_element(DOM::AbstractElement { container }, DOM::Document::StyleUpdateMode::StopAtDisplayNone);
 }
 
 void HTMLParserEndState::check_progress()
@@ -752,7 +844,8 @@ void HTMLParserEndState::check_progress()
         // 8. Spin the event loop until there is nothing that delays the load event in the Document.
         // AD-HOC: Update layout first so font loads selected by text shaping can delay the load event.
         // INTEROP: Gecko also flushes layout before firing the load event — so lazily-started font loads hold it back.
-        m_document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
+        if (navigable_container_is_rendered(*m_document))
+            m_document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
         if (m_document->anything_is_delaying_the_load_event())
             return;
 
@@ -767,15 +860,38 @@ void HTMLParserEndState::check_progress()
     }
 }
 
+static void log_document_stats_event(DOM::Document const& document, StringView name)
+{
+    auto* log = Core::StatsLog::the();
+    if (!log || document.is_decoded_svg() || !document.is_active())
+        return;
+    auto navigable = document.navigable();
+    if (!navigable || !navigable->is_top_level_traversable())
+        return;
+    JsonObject data;
+    data.set("page_id"sv, document.page().client().id().value());
+    data.set("navigable_id"sv, MUST(String::formatted("{}", navigable->id())));
+    data.set("document_id"sv, MUST(String::formatted("{}", document.id())));
+    data.set("url"sv, document.url().serialize());
+    log->event(name, move(data));
+}
+
 void HTMLParserEndState::advance_to_dom_content_loaded_phase()
 {
     // AD-HOC: We need to scroll to the fragment on page load somewhere.
     // But a script that ran in step 5 above may have scrolled the page already,
     // so only do this if there is an actual fragment to avoid resetting the scroll position unexpectedly.
     // Spec bug: https://github.com/whatwg/html/issues/10914
-    auto indicated_part = m_document->determine_the_indicated_part();
-    if (indicated_part.has<DOM::Element*>() && indicated_part.get<DOM::Element*>() != nullptr) {
-        m_document->scroll_to_the_fragment();
+    // https://wicg.github.io/scroll-to-text-fragment/#restricting-scroll-on-load
+    // https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+    if (!m_document->policy_container()->force_load_at_top) {
+        if (m_document->pending_text_directives().has_value() && !m_document->pending_text_directives()->is_empty()) {
+            m_document->scroll_to_the_fragment(m_document->pending_text_directive_scroll_allowed());
+        } else {
+            auto indicated_part = m_document->determine_the_indicated_part();
+            if (indicated_part.has<DOM::Element*>() && indicated_part.get<DOM::Element*>() != nullptr)
+                m_document->scroll_to_the_fragment();
+        }
     }
 
     m_phase = Phase::WaitingForDOMContentLoaded;
@@ -787,6 +903,9 @@ void HTMLParserEndState::advance_to_dom_content_loaded_phase()
         // 1. Set the Document's load timing info's DOM content loaded event start time to the current high resolution time given the Document's relevant global object.
         document->load_timing_info().dom_content_loaded_event_start_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(*document));
 
+        if (Core::StatsLog::the())
+            log_document_stats_event(*document, "DOMContentLoaded"sv);
+
         // 2. Fire an event named DOMContentLoaded at the Document object, with its bubbles attribute initialized to true.
         auto content_loaded_event = DOM::Event::create(
             HTML::EventNames::DOMContentLoaded,
@@ -794,12 +913,30 @@ void HTMLParserEndState::advance_to_dom_content_loaded_phase()
         content_loaded_event->set_bubbles(true);
         document->dispatch_event(content_loaded_event);
 
+        // https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+        // If the document has no parser, or its parser has stopped parsing, then:
+        if (document->pending_text_directives().has_value() && !document->pending_text_directives()->is_empty()) {
+            auto const scrolling_blocked_in_new_document = document->policy_container()->force_load_at_top;
+            if (!scrolling_blocked_in_new_document)
+                document->scroll_to_the_fragment(document->pending_text_directive_scroll_allowed());
+
+            // AD-HOC: Retain unmatched directives through the rest of the loading lifecycle. A
+            //         load handler or load-delaying resource can make additional searchable content
+            //         available, and the load-completion pass below performs the final search.
+        }
+
         // 3. Set the Document's load timing info's DOM content loaded event end time to the current high resolution time given the Document's relevant global object.
         document->load_timing_info().dom_content_loaded_event_end_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(*document));
 
         // FIXME: 4. Enable the client message queue of the ServiceWorkerContainer object whose associated service worker client is the Document object's relevant settings object.
 
-        // FIXME: 5. Invoke WebDriver BiDi DOM content loaded with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "pending", and url is the Document object's URL.
+        // 5. Invoke WebDriver BiDi DOM content loaded with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's during-loading navigation ID for WebDriver BiDi, status is "pending", and url is the Document object's URL.
+        // NB: The browsing context's active document's node navigable is the navigable the steps report on.
+        // NB: The initial about:blank document of a navigable is not loaded by a navigation.
+        if (WebDriver::BiDi::is_active() && !document->is_initial_about_blank()) {
+            if (auto navigable = document->navigable())
+                WebDriver::BiDi::navigation_event(*navigable, "browsingContext.domContentLoaded"sv, document->during_loading_navigation_id_for_webdriver_bidi(), document->url());
+        }
 
         // NB: Only advance the state machine after this task has run, so that anything the DOMContentLoaded event
         //     handlers did (e.g. starting loads that delay the load event) is visible to the remaining phases. This
@@ -825,9 +962,31 @@ void HTMLParserEndState::complete()
         // parser mark the replacement document ready for post-load tasks.
         if (parser_was_replaced(document, parser, parser_generation))
             return;
+        // NB: Step 8 can stop spinning and queue this task before an already-queued task reopens a descendant document.
+        //     Recheck its condition here and resume waiting using the same parser end state.
+        // INTEROP: Blink and WebKit recheck descendant completeness at their final load-completion gate. Gecko's
+        //          document loader likewise remains busy while a child loader is waiting to complete.
+        if (document->is_fully_active() && document->anything_is_delaying_the_load_event()) {
+            state->m_phase = Phase::WaitingForLoadEventDelay;
+            state->schedule_progress_check();
+            return;
+        }
 
         state->m_timeout->stop();
         document->set_html_parser_end_state(nullptr);
+
+        // Becoming ready reports this document's state to a container in another process, so delay the load event
+        // first, until the load event handlers below have started any resources of their own.
+        DOM::DocumentLoadEventDelayer load_event_delayer(*document);
+
+        // 11. The Document is now ready for post-load tasks.
+        // NB: The spec sets this synchronously after queueing this task, and relies on "spin the event loop"
+        //     continuations being queued tasks to keep an ancestor document's load event behind this document's own
+        //     load event and its container's load event. Our parser end state machine checks its progress from
+        //     deferred invocations, which run ahead of queued tasks, so flip readiness inside this task instead;
+        //     an ancestor then cannot complete until this task (and everything it queues) is already in the queue.
+        //     WebKit and Blink time their equivalent flag the same way.
+        document->set_ready_for_post_load_tasks(true);
 
         // 1. Update the current document readiness to "complete".
         document->update_readiness(HTML::DocumentReadyState::Complete);
@@ -848,7 +1007,8 @@ void HTMLParserEndState::complete()
         //         layout otherwise wait for the next rendering update, and a load handler that
         //         changes style would fold its change into the document's very first style pass,
         //         where a transition it expects to start has no before-change style to start from.
-        document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
+        if (navigable_container_is_rendered(*document))
+            document->update_layout(DOM::UpdateLayoutReason::DocumentReadinessComplete);
 
         // 3. Let window be the Document's relevant global object.
         auto& window = relevant_window(*document);
@@ -856,21 +1016,52 @@ void HTMLParserEndState::complete()
         // 4. Set the Document's load timing info's load event start time to the current high resolution time given window.
         document->load_timing_info().load_event_start_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(window));
 
+        if (Core::StatsLog::the())
+            log_document_stats_event(*document, "load"sv);
+
         // 5. Fire an event named load at window, with legacy target override flag set.
-        // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
-        //        We should reorganize this so that the flag appears explicitly here instead.
-        window.dispatch_event(DOM::Event::create(
-            HTML::EventNames::load,
-            HighResolutionTime::current_high_resolution_time(relevant_global_object(window))));
+        DOM::EventDispatcher::dispatch(window, DOM::Event::create(HTML::EventNames::load, HighResolutionTime::current_high_resolution_time(relevant_global_object(window))), true);
 
         // INTEROP: A load event handler can call document.open(), which associates a replacement parser after the old
         //          parser was detached above. Do not let this completion continue into the replacement document.
         if (document->parser_generation() != parser_generation)
             return;
 
-        // FIXME: 6. Invoke WebDriver BiDi load complete with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "complete", and url is the Document object's URL.
+        // AD-HOC: Perform the final lifecycle-driven text-fragment search after all
+        //         load-event-delaying resources have settled and the load event has run. This also
+        //         observes content added by a load handler and corrects layout shifts in the absence of
+        //         CSS scroll anchoring.
+        // https://drafts.csswg.org/css-scroll-anchoring/
+        if (document->pending_text_directives().has_value() && !document->pending_text_directives()->is_empty()) {
+            auto const scrolling_blocked_in_new_document = document->policy_container()->force_load_at_top;
+            if (!scrolling_blocked_in_new_document)
+                document->scroll_to_the_fragment(document->pending_text_directive_scroll_allowed());
 
-        // FIXME: 7. Set the Document object's navigation id to null.
+            auto const text_fragment_was_found = !document->text_fragment_ranges().is_empty();
+
+            // https://wicg.github.io/scroll-to-text-fragment/#invoking-text-directives
+            // 1. If pending text directives is not null, then:
+            // 1. Set pending text directives to null.
+            document->clear_pending_text_directives();
+
+            if (!scrolling_blocked_in_new_document
+                && (!text_fragment_was_found || !document->pending_text_directive_scroll_allowed())) {
+                // https://wicg.github.io/scroll-to-text-fragment/#scroll-on-navigation
+                // If a UA chooses not to scroll automatically, it must scroll a fallback element-id
+                // into view, if provided, regardless of whether a text fragment was matched.
+                document->scroll_to_the_fragment();
+            }
+        }
+
+        // 6. Invoke WebDriver BiDi load complete with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's during-loading navigation ID for WebDriver BiDi, status is "complete", and url is the Document object's URL.
+        // NB: The initial about:blank document of a navigable is not loaded by a navigation.
+        if (WebDriver::BiDi::is_active() && !document->is_initial_about_blank()) {
+            if (auto navigable = document->navigable())
+                WebDriver::BiDi::navigation_event(*navigable, "browsingContext.load"sv, document->during_loading_navigation_id_for_webdriver_bidi(), document->url());
+        }
+
+        // 7. Set the Document object's during-loading navigation ID for WebDriver BiDi to null.
+        document->set_during_loading_navigation_id_for_webdriver_bidi({});
 
         // 8. Set the Document's load timing info's load event end time to the current high resolution time given window.
         document->load_timing_info().load_event_end_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(window));
@@ -889,17 +1080,17 @@ void HTMLParserEndState::complete()
         if (document->parser_generation() != parser_generation)
             return;
 
-        // 11. The Document is now ready for post-load tasks.
-        document->set_ready_for_post_load_tasks(true);
-
         // 12. Completely finish loading the Document.
         document->completely_finish_loading();
 
         // 13. Queue the navigation timing entry for the Document.
         document->queue_navigation_timing_entry();
-    }));
 
-    // FIXME: 10. If the Document's print when loaded flag is set, then run the printing steps.
+        // 10. If the Document's print when loaded flag is set, then run the printing steps.
+        // NB: This runs inside the task queued above, like step 11; see there.
+        if (document->print_when_loaded())
+            document->run_the_printing_steps();
+    }));
 
     // NB: Step 11 (the Document is now ready for post-load tasks) runs inside the task queued above; see there.
 }
@@ -911,7 +1102,8 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(Utf16FlyString const& local
     // The active speculative HTML parser runs synchronously to completion, so it is null whenever the real parser
     // invokes this algorithm. It emits speculative fetch candidates directly instead of producing mock elements.
 
-    // 2. Otherwise, optionally create a speculative mock element given namespace, token's tag name, and token's attributes.
+    // 2. Otherwise, if the parser's parser sanitizer configuration is null, optionally create a speculative mock
+    //    element given namespace, token's tag name, and token's attributes.
     // We deliberately skip step 2, the active speculative parser already issues these fetches, so doing it again here
     // would be redundant.
 
@@ -928,23 +1120,52 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(Utf16FlyString const& local
         return {};
     };
 
-    // 5. Let is be the value of the "is" attribute in token, if such an attribute exists; otherwise null.
+    // 5. Let sanitizerConfig be the parser's parser sanitizer configuration.
+    auto const* sanitizer_config = sanitizer_configuration();
+
+    // 6. Let sanitizerAction be "Keep".
+    auto sanitizer_action = SanitizerAction::Keep;
+
+    // 7. If sanitizerConfig is not null, then set sanitizerAction to the result of getting the sanitizer action for an
+    //    element name given localName, namespace, and sanitizerConfig.
+    if (sanitizer_config)
+        sanitizer_action = sanitizer_action_for_element_name(local_name, namespace_, *sanitizer_config);
+
+    // 8. Let is be the value of the "is" attribute in token, if such an attribute exists; otherwise null.
     Optional<Utf16FlyString> is_value;
     if (auto is_attribute = attribute_value(AttributeNames::is); is_attribute.has_value())
         is_value = Utf16FlyString::from_utf8_without_validation(*is_attribute);
 
-    // 6. Let registry be the result of looking up a custom element registry given intendedParent.
+    // 9. If is is non-null, sanitizerConfig is non-null, and the result of checking if a sanitizer config allows an
+    //    attribute given "is", null, is, localName, namespace, and sanitizerConfig is false, then set is to null.
+    if (is_value.has_value() && sanitizer_config
+        && !sanitizer_config_allows_attribute(AttributeNames::is, {}, is_value->view(), local_name, namespace_, *sanitizer_config)) {
+        is_value = {};
+    }
+
+    // 10. Let registry be the result of looking up a custom element registry given intendedParent.
     auto registry = look_up_a_custom_element_registry(intended_parent);
 
-    // 7. Let definition be the result of looking up a custom element definition given registry, namespace, localName,
-    //    and is.
-    auto definition = look_up_a_custom_element_definition(registry, namespace_, local_name, is_value);
+    // 11. Let creationRegistry be registry if sanitizerAction is "Keep"; otherwise null.
+    // NOTE: Elements that the sanitizer will remove or replace with their children are created with a null custom
+    //       element registry, so creating an element finds no custom element definition and no custom element
+    //       constructor runs for them. Removed elements keep the null registry, so their descendants, which look up
+    //       their registry from them, don't run constructors either. Replaced elements have their registry set to
+    //       registry after creation so that their children inherit it. Likewise, an is attribute that the sanitizer
+    //       will remove does not create a customized built-in element.
+    GC::Ptr<CustomElementRegistry> creation_registry = sanitizer_action == SanitizerAction::Keep ? registry : nullptr;
 
-    // 8. Let willExecuteScript be true if definition is non-null and the parser was not created as part of the HTML
-    //    fragment parsing algorithm; otherwise false.
+    // 12. Let definition be null if sanitizerAction is not "Keep"; otherwise the result of looking up a custom element
+    //     definition given registry, namespace, localName, and is.
+    GC::Ptr<CustomElementDefinition> definition;
+    if (sanitizer_action == SanitizerAction::Keep)
+        definition = look_up_a_custom_element_definition(registry, namespace_, local_name, is_value);
+
+    // 13. Let willExecuteScript be true if definition is non-null and the parser's fragment context element is null;
+    //     otherwise false.
     bool will_execute_script = definition && !m_parsing_fragment;
 
-    // 9. If willExecuteScript is true:
+    // 14. If willExecuteScript is true:
     if (will_execute_script) {
         // 1. Increment document's throw-on-dynamic-markup-insertion counter.
         document->increment_throw_on_dynamic_markup_insertion_counter({});
@@ -958,16 +1179,17 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(Utf16FlyString const& local
         relevant_similar_origin_window_agent(document).custom_element_reactions_stack.element_queue_stack.append({});
     }
 
-    // 10. Let element be the result of creating an element given document, localName, namespace, null, is,
-    //     willExecuteScript, and registry.
-    auto element = DOM::create_element(*document, local_name, namespace_, {}, is_value, will_execute_script, registry).release_value_but_fixme_should_propagate_errors();
+    // 15. Let element be the result of creating an element given document, localName, namespace, prefix, is,
+    //     willExecuteScript, and creationRegistry.
+    // NB: This helper currently implements only the default null prefix.
+    auto element = DOM::create_element(*document, local_name, namespace_, {}, is_value, will_execute_script, creation_registry).release_value_but_fixme_should_propagate_errors();
 
     // AD-HOC: Let <link> elements know which document they were originally parsed for.
     //         This is used for the render-blocking logic.
     if (!m_parsing_fragment && local_name == HTML::TagNames::link && namespace_ == Namespace::HTML) {
         auto& link_element = as<HTMLLinkElement>(*element);
-        link_element.set_parser_document({}, document);
-        link_element.set_was_enabled_when_created_by_parser({}, !attribute_value(HTML::AttributeNames::disabled).has_value());
+        link_element.set_parser_document(Badge<HTMLParser> {}, document);
+        link_element.set_was_enabled_when_created_by_parser(Badge<HTMLParser> {}, !attribute_value(HTML::AttributeNames::disabled).has_value());
     }
 
     // AD-HOC: Let style elements know which document they were originally parsed for.
@@ -975,14 +1197,34 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(Utf16FlyString const& local
     if (auto* style_element = as_if<DOM::StyleElementBase>(*element))
         style_element->set_parser_document({}, document);
 
-    // 11. Append each attribute in the given token to element.
+    // 16. If sanitizerAction is "Replace with children", then set element's custom element registry to registry.
+    if (sanitizer_action == SanitizerAction::ReplaceWithChildren)
+        element->set_custom_element_registry(registry);
+
+    // 17. For each attribute of token's attributes:
     element->ensure_attribute_capacity(attributes.size());
     for (auto const& attribute : attributes) {
+        auto attribute_local_name = Utf16FlyString::from_raw(attribute.local_name);
+        auto attribute_namespace = attribute_namespace_from_html_parser_ffi(attribute.namespace_);
+        auto value = utf8_string_from_ffi(attribute.value_ptr, attribute.value_len);
+
+        // 1. If sanitizerConfig is not null:
+        if (sanitizer_config) {
+            // 1. Let attrLocalName be attribute's local name if attribute is a namespaced attribute; otherwise
+            //    attribute's name.
+            // 2. Let attrNamespace be attribute's namespace if attribute is a namespaced attribute; otherwise null.
+            // 3. If the result of checking if a sanitizer config allows an attribute given attrLocalName,
+            //    attrNamespace, attribute's value, localName, namespace, and sanitizerConfig is false, then continue.
+            if (!sanitizer_config_allows_attribute(attribute_local_name, attribute_namespace, value.utf16_view(), local_name, namespace_, *sanitizer_config))
+                continue;
+        }
+
         Optional<Utf16FlyString> prefix;
         if (attribute.prefix_len != 0)
             prefix = Utf16FlyString::from_utf8_without_validation({ reinterpret_cast<char const*>(attribute.prefix_ptr), attribute.prefix_len });
-        DOM::QualifiedName qualified_name { Utf16FlyString::from_raw(attribute.local_name), move(prefix), attribute_namespace_from_html_parser_ffi(attribute.namespace_) };
-        element->append_attribute(move(qualified_name), utf8_string_from_ffi(attribute.value_ptr, attribute.value_len));
+        DOM::QualifiedName qualified_name { move(attribute_local_name), move(prefix), move(attribute_namespace) };
+        // 2. Append attribute to element.
+        element->append_attribute(move(qualified_name), move(value));
     }
 
     // AD-HOC: The muted attribute on media elements is only set if the muted content attribute is present when the element is first created.
@@ -996,7 +1238,7 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(Utf16FlyString const& local
         }
     }
 
-    // 12. If willExecuteScript is true:
+    // 18. If willExecuteScript is true:
     if (will_execute_script) {
         // 1. Let queue be the result of popping from document's relevant agent's custom element reactions stack.
         //    (This will be the same element queue as was pushed above.)
@@ -1009,19 +1251,21 @@ GC::Ref<DOM::Element> HTMLParser::create_element_for(Utf16FlyString const& local
         document->decrement_throw_on_dynamic_markup_insertion_counter({});
     }
 
-    // FIXME: 13. If element has an xmlns attribute in the XMLNS namespace whose value is not exactly the same as the element's namespace, that is a parse error.
+    // FIXME: 19. If element has an xmlns attribute in the XMLNS namespace whose value is not exactly the same as the element's namespace, that is a parse error.
     //            Similarly, if element has an xmlns:xlink attribute in the XMLNS namespace whose value is not the XLink Namespace, that is a parse error.
 
     if (auto* html_element = as_if<HTML::HTMLElement>(*element)) {
         if (html_element->is_form_associated_element() && !html_element->is_form_associated_custom_element()) {
-            // 14. If element is a resettable element and not a form-associated custom element, then invoke its reset algorithm.
+            // 20. If element is a resettable element and not a form-associated custom element, then invoke its reset algorithm.
             //     (This initializes the element's value and checkedness based on the element's attributes.)
             if (html_element->is_resettable())
                 html_element->reset_algorithm();
         }
     }
 
-    // 16. Return element.
+    // NB: Step 21 (parser form association) is performed by create_element_for_rust_parser().
+
+    // 22. Return element.
     return element;
 }
 
@@ -1193,15 +1437,30 @@ DOM::Document& HTMLParser::document()
 
 namespace {
 
+// Attribute names are ASCII, since the scanner only accepts lowercase ASCII letters, digits and hyphens in names.
+template<typename CharT>
 struct FragmentAttribute {
-    StringView name;
-    StringView value;
+    ReadonlySpan<CharT> name;
+    ReadonlySpan<CharT> value;
 };
+
+template<typename CharT>
+bool fragment_span_equals(ReadonlySpan<CharT> span, StringView ascii)
+{
+    if (span.size() != ascii.length())
+        return false;
+    for (size_t i = 0; i < span.size(); ++i) {
+        if (span[i] != static_cast<CharT>(ascii[i]))
+            return false;
+    }
+    return true;
+}
 
 Utf16FlyString const* supported_fragment_tag(StringView name)
 {
     // Keep this subset deliberately small. Adding a tag requires checking its in-body tree-builder rules,
-    // its insertion steps, and interactions with every other supported tag.
+    // its insertion steps, and interactions with every other supported tag. A supported tag must not have children
+    // changed steps, since the fast path links children below a new element without running them.
     if (name == "a"sv)
         return &TagNames::a;
     if (name == "b"sv)
@@ -1261,9 +1520,35 @@ Utf16FlyString const* supported_fragment_tag(StringView name)
     return nullptr;
 }
 
+template<typename CharT>
+Utf16FlyString const* supported_fragment_tag(ReadonlySpan<CharT> name)
+{
+    if constexpr (IsSame<CharT, char>) {
+        return supported_fragment_tag(StringView { name.data(), name.size() });
+    } else {
+        // Supported tag names are ASCII and short.
+        Array<char, 8> ascii_name;
+        if (name.size() > ascii_name.size())
+            return nullptr;
+        for (size_t i = 0; i < name.size(); ++i) {
+            if (!is_ascii(name[i]))
+                return nullptr;
+            ascii_name[i] = static_cast<char>(name[i]);
+        }
+        return supported_fragment_tag(StringView { ascii_name.data(), name.size() });
+    }
+}
+
+// The whitespace the scanner skips between attributes and the tree builder drops before the html element.
+constexpr bool is_fragment_whitespace(u32 code_unit)
+{
+    return code_unit == ' ' || code_unit == '\t' || code_unit == '\n' || code_unit == '\f';
+}
+
+template<typename CharT>
 class FragmentScanner {
 public:
-    explicit FragmentScanner(StringView input)
+    explicit FragmentScanner(ReadonlySpan<CharT> input)
         : m_input(input)
     {
     }
@@ -1272,16 +1557,15 @@ public:
     bool parse(Open&& open, Close&& close, Text&& text)
     {
         Vector<Utf16FlyString const*, 32> stack;
-        Vector<FragmentAttribute, 16> attributes;
-        while (m_offset < m_input.length()) {
+        Vector<FragmentAttribute<CharT>, 16> attributes;
+        while (m_offset < m_input.size()) {
             if (peek() != '<') {
                 auto start = m_offset;
-                while (m_offset < m_input.length() && peek() != '<') {
-                    if (peek() == '&' || peek() == '\r' || peek() == '\0')
+                while (m_offset < m_input.size() && peek() != '<') {
+                    if (!consume_data_code_point())
                         return false;
-                    ++m_offset;
                 }
-                text(m_input.substring_view(start, m_offset - start));
+                text(m_input.slice(start, m_offset - start));
                 continue;
             }
             ++m_offset;
@@ -1320,31 +1604,30 @@ public:
                 if (peek() == '>' || peek() == '/')
                     break;
                 auto attribute_name = scan_name();
-                if (attribute_name.is_empty() || attribute_name == "is"sv || attributes.size() >= 64)
+                if (attribute_name.is_empty() || fragment_span_equals(attribute_name, "is"sv) || attributes.size() >= 64)
                     return false;
                 for (auto const& attribute : attributes) {
                     if (attribute.name == attribute_name)
                         return false;
                 }
                 skip_whitespace();
-                StringView value = ""sv;
+                ReadonlySpan<CharT> value;
                 if (consume('=')) {
                     skip_whitespace();
-                    char quote = peek();
+                    CharT quote = peek();
                     if (quote != '\'' && quote != '"')
                         return false;
                     ++m_offset;
                     auto start = m_offset;
-                    while (m_offset < m_input.length() && peek() != quote) {
-                        if (peek() == '&' || peek() == '\r' || peek() == '\0')
+                    while (m_offset < m_input.size() && peek() != quote) {
+                        if (!consume_data_code_point())
                             return false;
-                        ++m_offset;
                     }
-                    value = m_input.substring_view(start, m_offset - start);
+                    value = m_input.slice(start, m_offset - start);
                     if (!consume(quote))
                         return false;
                 }
-                if (tag == &TagNames::input && attribute_name == "type"sv && !value.is_one_of("text"sv, "checkbox"sv))
+                if (tag == &TagNames::input && fragment_span_equals(attribute_name, "type"sv) && !fragment_span_equals(value, "text"sv) && !fragment_span_equals(value, "checkbox"sv))
                     return false;
                 attributes.append({ attribute_name, value });
             }
@@ -1361,11 +1644,32 @@ public:
     }
 
 private:
-    char peek() const { return m_offset < m_input.length() ? m_input[m_offset] : '\0'; }
+    CharT peek() const { return m_offset < m_input.size() ? m_input[m_offset] : '\0'; }
 
-    bool consume(char ch)
+    // Consumes one code point of text or of an attribute value, unless it needs the general parser.
+    bool consume_data_code_point()
     {
-        if (m_offset == m_input.length() || peek() != ch)
+        auto ch = peek();
+        // Character references and input preprocessing use the general parser.
+        if (ch == '&' || ch == '\r' || ch == '\0')
+            return false;
+        if constexpr (IsSame<CharT, char16_t>) {
+            // The general parser replaces a lone surrogate with U+FFFD.
+            if (AK::UnicodeUtils::is_utf16_low_surrogate(ch))
+                return false;
+            if (AK::UnicodeUtils::is_utf16_high_surrogate(ch)) {
+                if (m_offset + 1 == m_input.size() || !AK::UnicodeUtils::is_utf16_low_surrogate(m_input[m_offset + 1]))
+                    return false;
+                ++m_offset;
+            }
+        }
+        ++m_offset;
+        return true;
+    }
+
+    bool consume(CharT ch)
+    {
+        if (m_offset == m_input.size() || peek() != ch)
             return false;
         ++m_offset;
         return true;
@@ -1373,72 +1677,171 @@ private:
 
     void skip_whitespace()
     {
-        while (peek() == ' ' || peek() == '\t' || peek() == '\n' || peek() == '\f')
+        while (is_fragment_whitespace(peek()))
             ++m_offset;
     }
 
-    StringView scan_name()
+    ReadonlySpan<CharT> scan_name()
     {
         auto start = m_offset;
         while (is_ascii_lower_alpha(peek()) || is_ascii_digit(peek()) || peek() == '-')
             ++m_offset;
-        return m_input.substring_view(start, m_offset - start);
+        return m_input.slice(start, m_offset - start);
     }
 
-    StringView m_input;
+    ReadonlySpan<CharT> m_input;
     size_t m_offset { 0 };
 };
 
 }
 
-GC::Ptr<DOM::DocumentFragment> HTMLParser::try_parse_html_fragment_fast(DOM::Element& context, Utf16View input)
+static void insert_node_for_parser(DOM::Node& parent, DOM::Node& node, DOM::Node* child);
+
+template<typename CharT>
+static bool can_parse_fragment_fast(ReadonlySpan<CharT> source)
 {
-    // OPTIMIZATION: Validate a restricted in-body grammar before allocating or exposing any DOM nodes. The second
-    //               pass borrows input spans and constructs elements directly, bypassing tokenization and tree building.
-    //               All unsupported syntax falls back without side effects, including custom elements and foreign content.
-    if (context.namespace_uri() != Namespace::HTML || !input.has_ascii_storage())
-        return nullptr;
-    if (!context.local_name().is_one_of(TagNames::body, TagNames::div, TagNames::span, TagNames::ul, TagNames::ol,
-            TagNames::li, TagNames::footer, TagNames::button, TagNames::label, TagNames::p))
-        return nullptr;
-    if (context.first_ancestor_of_type<HTMLFormElement>())
-        return nullptr;
+    return FragmentScanner<CharT> { source }.parse([](auto const&, auto, bool) { }, [] { }, [](auto) { });
+}
 
-    StringView source { input.ascii_span().data(), input.length_in_code_units() };
-    // Character references and input preprocessing use the general parser.
-    if (!FragmentScanner { source }.parse([](auto const&, auto, bool) { }, [] { }, [](auto) { }))
-        return nullptr;
-
-    auto fragment = DOM::DocumentFragment::create(context.document());
+// Builds the nodes of source, which can_parse_fragment_fast() has accepted, for parsing in context.
+template<typename CharT>
+static void build_fast_fragment_into_detached_nodes(DOM::Element& context, ReadonlySpan<CharT> source, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes)
+{
+    auto& document = context.document();
     auto registry = look_up_a_custom_element_registry(context);
     GC::RootVector<GC::Ref<DOM::Node>, 32> parents;
-    parents.append(fragment);
-    auto success = FragmentScanner { source }.parse(
-        [&](Utf16FlyString const& tag, ReadonlySpan<FragmentAttribute> attributes, bool is_void) {
-            auto& parent = *parents.last();
-            auto element = MUST(DOM::create_element(context.document(), tag, Namespace::HTML, {}, {}, false, registry));
+    auto append = [&](GC::Ref<DOM::Node> node) {
+        if (parents.is_empty())
+            top_level_nodes.append(node);
+        else
+            parents.last()->parser_append_child_without_insertion_steps(node);
+    };
+    auto success = FragmentScanner<CharT> { source }.parse(
+        [&](Utf16FlyString const& tag, ReadonlySpan<FragmentAttribute<CharT>> attributes, bool is_void) {
+            auto element = MUST(DOM::create_element(document, tag, Namespace::HTML, {}, {}, false, registry));
             element->ensure_attribute_capacity(attributes.size());
             for (auto const& attribute : attributes) {
-                DOM::QualifiedName name { Utf16FlyString::from_utf8_without_validation(attribute.name), {}, {} };
-                element->append_attribute(move(name), Utf16String::from_utf8_without_validation(attribute.value));
+                Utf16FlyString local_name;
+                if constexpr (IsSame<CharT, char>)
+                    local_name = Utf16FlyString::from_utf8_without_validation({ attribute.name.data(), attribute.name.size() });
+                else
+                    local_name = Utf16FlyString::from_utf16({ attribute.name.data(), attribute.name.size() });
+                element->append_attribute(DOM::QualifiedName { move(local_name), {}, {} }, utf16_string_from_span(attribute.value));
             }
             auto& html_element = as<HTMLElement>(*element);
             if (html_element.is_form_associated_element() && html_element.is_resettable())
                 html_element.reset_algorithm();
-            parent.parser_append_child(element);
+            append(element);
             if (!is_void)
                 parents.append(element);
         },
         [&] { parents.take_last(); },
-        [&](StringView text) {
-            parents.last()->parser_append_child(DOM::Text::create(context.document(), Utf16String::from_utf8_without_validation(text)));
+        [&](ReadonlySpan<CharT> text) {
+            append(DOM::Text::create(document, text_node_data_from_span(text)));
         });
     VERIFY(success);
+}
+
+template<typename Callback>
+static decltype(auto) with_code_unit_span(Utf16View input, Callback&& callback)
+{
+    if (input.has_ascii_storage())
+        return callback(ReadonlySpan<char> { input.ascii_span().data(), input.length_in_code_units() });
+    return callback(input.utf16_span());
+}
+
+static bool can_parse_fragment_fast_in_context(DOM::Element const& context)
+{
+    if (context.namespace_uri() != Namespace::HTML || context.document().is_xml_document())
+        return false;
+    if (!context.local_name().is_one_of(TagNames::body, TagNames::div, TagNames::span, TagNames::ul, TagNames::ol,
+            TagNames::li, TagNames::footer, TagNames::button, TagNames::label, TagNames::p))
+        return false;
+    return !context.first_ancestor_of_type<HTMLFormElement>();
+}
+
+bool HTMLParser::try_parse_html_fragment_fast_into_detached_nodes(DOM::Element& context, Utf16View input, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes)
+{
+    // OPTIMIZATION: Validate a restricted in-body grammar before allocating or exposing any DOM nodes. The second
+    //               pass borrows input spans and constructs elements directly, bypassing tokenization and tree building.
+    //               All unsupported syntax falls back without side effects, including custom elements and foreign content.
+    //               Like Blink and WebKit, only link the nodes below each top-level node without running the insertion
+    //               steps. The caller inserts the top-level nodes, which runs the insertion steps for every node once.
+    //               Nothing can observe the skipped steps: the nodes are new, so no script, observer, live range or
+    //               collection can reach them, and the children changed steps of a new element have nothing to update.
+    VERIFY(top_level_nodes.is_empty());
+    if (!can_parse_fragment_fast_in_context(context))
+        return false;
+    return with_code_unit_span(input, [&](auto source) {
+        if (!can_parse_fragment_fast(source))
+            return false;
+        build_fast_fragment_into_detached_nodes(context, source, top_level_nodes);
+        return true;
+    });
+}
+
+bool HTMLParser::try_parse_document_fast(DOM::Document& document, Utf16View input)
+{
+    // OPTIMIZATION: Markup without a doctype whose content is in the fragment fast path's subset of in-body markup,
+    //               such as a template given to DOMParser, gets the same document as from the tree builder: the
+    //               document is in quirks mode, leading whitespace is dropped, and an html element holds an empty head
+    //               and a body with the content. Like innerHTML's fast path, the nodes below each top-level node of the
+    //               content are linked without the insertion steps, which inserting that node into the body then runs
+    //               for its whole subtree. No parser is created, so the input is not copied into a tokenizer that
+    //               would keep it for as long as the document keeps its parser.
+    //               Nothing can observe the difference, since no script runs while the document is parsed.
+    if (document.has_children() || document.parser_cannot_change_the_mode() || document.is_xml_document())
+        return false;
+
+    // NB: The tree builder drops whitespace before the html element, and leaves carriage returns to the scanner,
+    //     which rejects them.
+    size_t content_start = 0;
+    while (content_start < input.length_in_code_units() && is_fragment_whitespace(input.code_unit_at(content_start)))
+        ++content_start;
+    auto content = input.substring_view(content_start);
+
+    auto can_parse_content = with_code_unit_span(content, [](auto source) { return can_parse_fragment_fast(source); });
+    if (!can_parse_content)
+        return false;
+
+    // NB: These are what creating the parser for a decoded string and running it would have set.
+    document.set_encoding("UTF-8"_utf16);
+    document.set_source(Utf16String::from_utf16(input));
+    document.set_quirks_mode(DOM::QuirksMode::Yes);
+
+    auto registry = look_up_a_custom_element_registry(document);
+    auto create_html_element = [&](Utf16FlyString const& local_name) {
+        return MUST(DOM::create_element(document, local_name, Namespace::HTML, {}, {}, false, registry));
+    };
+    auto html = create_html_element(TagNames::html);
+    insert_node_for_parser(document, html, nullptr);
+    insert_node_for_parser(html, create_html_element(TagNames::head), nullptr);
+    auto body = create_html_element(TagNames::body);
+    insert_node_for_parser(html, body, nullptr);
+    VERIFY(can_parse_fragment_fast_in_context(body));
+
+    GC::RootVector<GC::Ref<DOM::Node>> body_children;
+    with_code_unit_span(content, [&](auto source) { build_fast_fragment_into_detached_nodes(*body, source, body_children); });
+    for (auto child : body_children)
+        insert_node_for_parser(body, child, nullptr);
+
+    the_end(document, parserless_completion_token(document));
+    return true;
+}
+
+GC::Ptr<DOM::DocumentFragment> HTMLParser::try_parse_html_fragment_fast(DOM::Element& context, Utf16View input)
+{
+    GC::RootVector<GC::Ref<DOM::Node>> top_level_nodes;
+    if (!try_parse_html_fragment_fast_into_detached_nodes(context, input, top_level_nodes))
+        return nullptr;
+    auto fragment = DOM::DocumentFragment::create(context.document());
+    for (auto node : top_level_nodes)
+        fragment->parser_append_child(node);
     return fragment;
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#parsing-html-fragments
-WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragment(Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::DocumentFragment>> target, Utf16View input, AllowDeclarativeShadowRoots allow_declarative_shadow_roots, ParserScriptingMode scripting_mode)
+WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragment(Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::DocumentFragment>> target, Utf16View input, AllowDeclarativeShadowRoots allow_declarative_shadow_roots, ParserScriptingMode scripting_mode, FragmentFastPath fast_path, SanitizerConfiguration const* configuration)
 {
     // 1. Assert: scriptingMode is either Inert or Fragment.
     VERIFY(scripting_mode == HTML::ParserScriptingMode::Inert || scripting_mode == HTML::ParserScriptingMode::Fragment);
@@ -1452,34 +1855,48 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
     VERIFY(context);
 
     // OPTIMIZATION: A validated subset of in-body fragments can be constructed directly from input spans.
-    if (target.has<GC::Ref<DOM::Element>>()) {
+    // NB: The fast path does not sanitize, so it is never used with a sanitizer configuration.
+    if (fast_path == FragmentFastPath::Allow && !configuration && target.has<GC::Ref<DOM::Element>>()) {
         if (auto fragment = try_parse_html_fragment_fast(*context, input))
             return GC::Ref { *fragment };
     }
 
     // 4. Let document be a Document node whose type is "html".
-
     // 5. Let contextDocument be context's node document.
     auto& context_document = context->document();
 
-    // 6. If contextDocument is in quirks mode, then set document's mode to "quirks".
-    // 7. Otherwise, if contextDocument is in limited-quirks mode, then set document's mode to "limited-quirks".
+    // OPTIMIZATION: Without a sanitizer configuration, the parser uses the context document directly, see below.
+    //               When sanitizing, the nodes are created in a new document instead, so that elements that the
+    //               sanitizer removes are never created in the context document, where their creation could have
+    //               side effects.
+    GC::Ref<DOM::Document> document = context_document;
+    if (configuration) {
+        document = DOM::Document::create_for_fragment_parsing(context_document.page(), context_document.relevant_global_event_target());
+        document->set_document_type(DOM::Document::Type::HTML);
 
-    // 8. Create a new HTML parser whose allow declarative shadow roots is allowDeclarativeShadowRoots, and associate it with document.
-    // 9. If contextDocument's scripting is disabled, then set scriptingMode to Disabled.
-    // 10. Set the parser's scripting mode to scriptingMode.
+        // 6. If contextDocument is in quirks mode, then set document's mode to "quirks".
+        // 7. Otherwise, if contextDocument is in limited-quirks mode, then set document's mode to "limited-quirks".
+        document->set_quirks_mode(context_document.mode());
+    }
+
+    // 8. If contextDocument's scripting is disabled, then set scriptingMode to Disabled.
     if (context_document.is_scripting_disabled())
         scripting_mode = HTML::ParserScriptingMode::Disabled;
 
-    // OPTIMIZATION: Use the context document directly while keeping the parser detached from its document parser state.
-    //               The detached root below supplies the temporary tree-builder state, while all output nodes are
-    //               created for their final document. This avoids initializing a complete Document for every fragment.
-    auto parser = GC::Heap::the().allocate<HTMLParser>(context_document, scripting_mode, input, FragmentParser::Yes);
+    // 9. Create a new HTML parser whose parser sanitizer configuration is configuration, allow declarative shadow
+    //    roots is allowDeclarativeShadowRoots, scripting mode is scriptingMode, and fragment context element is
+    //    context, and associate it with document.
+    // NB: The parser sanitizer configuration is set below, once the Rust parser state has been initialized.
+    // OPTIMIZATION: Without a sanitizer configuration, use the context document directly while keeping the parser
+    //               detached from its document parser state. The detached root below supplies the temporary
+    //               tree-builder state, while all output nodes are created for their final document. This avoids
+    //               initializing a complete Document for every fragment.
+    auto parser = GC::Heap::the().allocate<HTMLParser>(*document, scripting_mode, input, FragmentParser::Yes);
     parser->initialize(context_document.relevant_settings_object().realm());
     parser->set_allow_declarative_shadow_roots(allow_declarative_shadow_roots);
     parser->m_context_element = context; // FIXME: Is this needed?
 
-    // 11. Set the state of the HTML parser's tokenization stage as follows, switching on context:
+    // 10. Set the state of the HTML parser's tokenization stage as follows, switching on context:
     bool const context_element_is_html = context->namespace_uri() == Namespace::HTML;
     // - title
     // - textarea
@@ -1521,31 +1938,33 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
 
     auto target_node = target.visit([](auto node) -> GC::Ref<DOM::Node> { return node; });
 
-    // 12. Let root be the result of creating an element given document, "html", the HTML namespace, null, null, false,
+    // 11. Let root be the result of creating an element given document, "html", the HTML namespace, null, null, false,
     //     and the result of looking up a custom element registry given target.
     auto root_registry = look_up_a_custom_element_registry(target_node);
-    auto root = MUST(DOM::create_element(context_document, HTML::TagNames::html, Namespace::HTML, {}, {}, false, root_registry));
+    auto root = MUST(DOM::create_element(*document, HTML::TagNames::html, Namespace::HTML, {}, {}, false, root_registry));
 
-    // 13. Append root to document.
+    // 12. Append root to document.
     // OPTIMIZATION: Keep the root detached. It is only a sentinel for the tree builder, whose root insertions are
     //               redirected to the output fragment.
 
-    // 14. Set up the HTML parser's stack of open elements so that it contains just the single element root.
-    // 15. Let fragment be a new DocumentFragment whose node document is target's node document.
-    auto fragment = DOM::DocumentFragment::create(target_node->document());
+    // 13. Set up the HTML parser's stack of open elements so that it contains just the single element root.
+    // 14. Let fragment be the result of creating a document fragment given document if configuration is non-null;
+    //     otherwise target's node document.
+    auto fragment = DOM::DocumentFragment::create(configuration ? *document : target_node->document());
 
-    // 16. Set the parser's root insertion target to fragment.
+    // 15. Set the parser's insertion target redirection map[root] to (fragment, null).
+    // NB: m_root_insertion_target represents the root entry of the insertion target redirection map.
     parser->m_root_insertion_target = fragment;
 
-    // 17. If context is a template element, then push "in template" onto the stack of template insertion modes so that
+    // 16. If context is a template element, then push "in template" onto the stack of template insertion modes so that
     //     it is the new current template insertion mode.
-    // 18. Create a start tag token whose name is the local name of context and whose attributes are the attributes of context.
+    // 17. Create a start tag token whose name is the local name of context and whose attributes are the attributes of context.
     //     Let this start tag token be the start tag token of context; e.g. for the purposes of determining if it is an
     //     HTML integration point.
-    // 19. Reset the parser's insertion mode appropriately.
+    // 18. Reset the parser's insertion mode appropriately.
     // NB: The parser will reference the context element as part of that algorithm.
 
-    // 20. Set the HTML parser's form element pointer to the nearest node to context that is a form element
+    // 19. Set the HTML parser's form element pointer to the nearest node to context that is a form element
     //     (going straight up the ancestor chain, and including the element itself, if it is a form element), if any.
     //     (If there is no such form element, the form element pointer keeps its initial value, null.)
     parser->m_form_element = as_if<HTMLFormElement>(context);
@@ -1600,10 +2019,21 @@ WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> HTMLParser::parse_html_fragm
         allow_declarative_shadow_roots == AllowDeclarativeShadowRoots::Yes,
         parser->m_form_element ? reinterpret_cast<size_t>(parser->m_form_element.ptr()) : 0);
 
-    // 22. Place the input into the input stream for the HTML parser just created. The encoding confidence is irrelevant.
-    // 23. Start the HTML parser and let it run until it has consumed all the characters just inserted into the input stream.
+    // NB: The parser sanitizer configuration is set after the Rust parser state has been initialized for the fragment.
+    if (configuration)
+        parser->set_sanitizer_configuration(*configuration);
+
+    // 20. Place the input into the input stream for the HTML parser just created. The encoding confidence is irrelevant.
+    // NB: The input was supplied when constructing the parser above.
+    // 21. Start the HTML parser and let it run until it has consumed all the characters just inserted into the input stream.
     parser->run_until_completion();
 
+    // 22. Adopt fragment into target's node document.
+    // NB: Without a sanitizer configuration, the fragment is already in the target's node document.
+    if (configuration)
+        target_node->document().adopt_node_steps(fragment);
+
+    // 23. Return fragment.
     return fragment;
 }
 
@@ -1619,7 +2049,7 @@ GC::Ref<HTMLParser> HTMLParser::create_with_open_input_stream(DOM::Document& doc
     return document.relevant_settings_object().realm().create<HTMLParser>(document, scripting_mode, ScriptCreatedParser::No, encoding_confidence);
 }
 
-GC::Ref<HTMLParser> HTMLParser::create_with_uncertain_encoding(DOM::Document& document, ByteBuffer const& input, Optional<MimeSniff::MimeType> maybe_mime_type)
+GC::Ref<HTMLParser> HTMLParser::create_with_uncertain_encoding(DOM::Document& document, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type)
 {
     auto scripting_mode = document.is_scripting_enabled() ? ParserScriptingMode::Normal : ParserScriptingMode::Disabled;
 
@@ -1925,8 +2355,9 @@ Utf16String HTMLParser::serialize_html_fragment(DOM::Node const& node, Serializa
             // -> If current node is a ProcessingInstruction
             auto& processing_instruction_node = as<DOM::ProcessingInstruction>(current_node);
 
-            // Append the literal string "<?" (U+003C LESS-THAN SIGN, U+003F QUESTION MARK), followed by the value of current node's target IDL attribute,
-            // followed by a single U+0020 SPACE character, followed by the value of current node's data IDL attribute, followed by a single U+003E GREATER-THAN SIGN character (>).
+            // Append "<?", followed by the value of current node's target, U+0020 SPACE, the value of
+            // current node's data, and "?>".
+            // FIXME: Use "?>" as the processing instruction terminator.
             builder.append_ascii("<?"sv);
             builder.append(processing_instruction_node.target().view());
             builder.append_ascii(' ');
@@ -1972,22 +2403,28 @@ static bool is_eof(StringType string, size_t position)
     return position >= code_unit_length(string);
 }
 
-static RefPtr<CSS::StyleValue const> parse_current_dimension_value(float value, Utf16View input, size_t position)
+static RefPtr<CSS::StyleValue const> parse_current_dimension_value(double value, Utf16View input, size_t position)
 {
     // 1. If position is past the end of input, then return value as a length.
     if (is_eof(input, position))
-        return CSS::LengthStyleValue::create(CSS::Length::make_px(CSSPixels::nearest_value_for(value)));
+        return CSS::LengthStyleValue::create(CSS::Length::make_px(value));
 
     // 2. If the code point at position within input is U+0025 (%), then return value as a percentage.
     if (code_unit_at(input, position) == '%')
         return CSS::PercentageStyleValue::create(CSS::Percentage(value));
 
     // 3. Return value as a length.
-    return CSS::LengthStyleValue::create(CSS::Length::make_px(CSSPixels::nearest_value_for(value)));
+    return CSS::LengthStyleValue::create(CSS::Length::make_px(value));
 }
 
 // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#rules-for-parsing-dimension-values
 RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View input)
+{
+    double unclamped_value;
+    return parse_dimension_value(input, unclamped_value);
+}
+
+RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View input, double& unclamped_value)
 {
     // 1. Let input be the string being parsed.
     // 2. Let position be a position variable for input, initially pointing at the start of input.
@@ -2010,11 +2447,12 @@ RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View input)
         ++position;
     }
 
-    float value = min(integer_value, CSSPixels::max_dimension_value);
+    unclamped_value = integer_value;
+    double value = min(integer_value, CSSPixels::max_dimension_value);
 
     // 6. If position is past the end of input, then return value as a length.
     if (is_eof(input, position))
-        return CSS::LengthStyleValue::create(CSS::Length::make_px(CSSPixels(value)));
+        return CSS::LengthStyleValue::create(CSS::Length::make_px(value));
 
     // 7. If the code point at position within input is U+002E (.), then:
     if (code_unit_at(input, position) == '.') {
@@ -2027,7 +2465,7 @@ RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View input)
             return parse_current_dimension_value(value, input, position);
 
         // 3. Let divisor have the value 1.
-        float divisor = 1;
+        double divisor = 1;
 
         // 4. While true:
         while (true) {
@@ -2036,14 +2474,16 @@ RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View input)
 
             // 2. Add the value of the code point at position within input,
             //    interpreted as a base-ten digit (0..9) and divided by divisor, to value.
-            value += (code_unit_at(input, position) - '0') / divisor;
+            auto fraction = (code_unit_at(input, position) - '0') / divisor;
+            value += fraction;
+            unclamped_value += fraction;
 
             // 3. Advance position by 1.
             ++position;
 
             // 4. If position is past the end of input, then return value as a length.
             if (is_eof(input, position))
-                return CSS::LengthStyleValue::create(CSS::Length::make_px(CSSPixels::nearest_value_for(value)));
+                return CSS::LengthStyleValue::create(CSS::Length::make_px(value));
 
             // 5. If the code point at position within input is not an ASCII digit, then break.
             if (!is_ascii_digit(code_unit_at(input, position)))
@@ -2306,6 +2746,7 @@ void HTMLParser::abort()
 
     // 2. Stop the speculative HTML parser for this HTML parser.
     stop_the_speculative_html_parser();
+    discard_speculative_preloads(*m_document);
 
     // 3. Update the current document readiness to "interactive".
     m_document->update_readiness(DocumentReadyState::Interactive);
@@ -2521,6 +2962,15 @@ extern "C" void ladybird_html_parser_set_document_quirks_mode(void* parser, Rust
         document.set_quirks_mode(quirks_mode_from_html_parser_ffi(mode));
 }
 
+extern "C" bool ladybird_html_parser_document_is_iframe_srcdoc_document(void* parser)
+{
+    // NB: Only an iframe's srcdoc resource is loaded from about:srcdoc, so a document with that URL is the iframe
+    //     srcdoc document made from it.
+    // FIXME: The document stays an iframe srcdoc document for good, but document.open() gives it the URL of the
+    //        document that opened it, after which it is no longer recognized here.
+    return url_matches_about_srcdoc(parser_from_html_parser_ffi(parser).document().url());
+}
+
 extern "C" size_t ladybird_html_parser_create_document_type(void* parser, u16 const* name_ptr, size_t name_len, u16 const* public_id_ptr, size_t public_id_len, u16 const* system_id_ptr, size_t system_id_len)
 {
     auto& html_parser = parser_from_html_parser_ffi(parser);
@@ -2546,12 +2996,12 @@ extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u
     auto insertion_location = node_and_offset_from_html_parser_ffi(parent, offset);
     auto& parent_node = *insertion_location.node;
 
-    // 3. If insertionLocation is in a Document node, then return.
+    // 3. If targetParent is a Document node, then return.
     // NOTE: The DOM will not let Document nodes have Text node children, so they are dropped on the floor.
     if (parent_node.is_document())
         return;
 
-    auto data = utf8_string_from_ffi(data_ptr, data_len);
+    auto data = text_node_data_from_span(ReadonlySpan<char> { reinterpret_cast<char const*>(data_ptr), data_len });
     if (auto* previous_text = as_if<DOM::Text>(insertion_location.previous_child())) {
         (void)previous_text->append_data(data);
         return;
@@ -2561,14 +3011,71 @@ extern "C" void ladybird_html_parser_insert_text(size_t parent, size_t offset, u
     insert_node_for_parser(parent_node, *text, insertion_location.child_at_offset());
 }
 
-extern "C" void ladybird_html_parser_add_missing_attribute(size_t element, size_t local_name_raw, u16 const* value_ptr, size_t value_len)
+// https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inbody
+// NB: The steps for each attribute of an "html" or "body" start tag token in the "in body" insertion mode.
+extern "C" void ladybird_html_parser_add_missing_attribute(void* parser, size_t element, size_t local_name_raw, u16 const* value_ptr, size_t value_len)
 {
     auto& dom_element = as<DOM::Element>(node_from_html_parser_ffi(element));
     auto local_name = Utf16FlyString::from_raw(local_name_raw);
+    auto value = utf16_string_from_ffi(value_ptr, value_len);
+
+    // 1. If the parser's parser sanitizer configuration is not null and the result of checking if a sanitizer config
+    //    allows an attribute given attribute's name, null, attribute's value, element's local name, element's
+    //    namespace, and the parser's parser sanitizer configuration is false, then continue.
+    if (auto const* sanitizer_config = parser_from_html_parser_ffi(parser).sanitizer_configuration();
+        sanitizer_config && !sanitizer_config_allows_attribute(local_name, {}, value.utf16_view(), dom_element.local_name(), dom_element.namespace_uri(), *sanitizer_config)) {
+        return;
+    }
+
+    // 2. If element does not have an attribute whose name is attribute's name, then add attribute's name and its
+    //    corresponding value to element.
     if (dom_element.has_attribute(local_name))
         return;
-    auto value = utf16_string_from_ffi(value_ptr, value_len);
     dom_element.append_attribute(DOM::QualifiedName { move(local_name), {}, {} }, move(value));
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#get-the-sanitizer-action-for-an-element-name
+// NB: Returns the sanitizer action for element's local name and namespace, given the parser's parser sanitizer
+//     configuration, which must not be null.
+extern "C" u8 ladybird_html_parser_sanitizer_action(void* parser, size_t element)
+{
+    auto const* sanitizer_config = parser_from_html_parser_ffi(parser).sanitizer_configuration();
+    VERIFY(sanitizer_config);
+    auto& dom_element = as<DOM::Element>(node_from_html_parser_ffi(element));
+    return to_underlying(sanitizer_action_for_element_name(dom_element.local_name(), dom_element.namespace_uri(), *sanitizer_config));
+}
+
+extern "C" size_t ladybird_html_parser_child_at_index(size_t parent, size_t index)
+{
+    auto& parent_node = node_from_html_parser_ffi(parent);
+    if (index >= parent_node.child_count())
+        return 0;
+    return reinterpret_cast<size_t>(parent_node.child_at_index(index));
+}
+
+// NB: Returns the shadowroot* attribute states of a template element, encoded as bit flags for the Rust tree builder.
+extern "C" u32 ladybird_html_parser_declarative_shadow_root_attributes(size_t element)
+{
+    auto& template_element = as<HTMLTemplateElement>(node_from_html_parser_ffi(element));
+    u32 result = 0;
+    auto mode = template_element.get_attribute(HTML::AttributeNames::shadowrootmode);
+    if (mode.has_value()) {
+        if (mode->equals_ignoring_ascii_case("open"sv))
+            result |= 1;
+        else if (mode->equals_ignoring_ascii_case("closed"sv))
+            result |= 2;
+    }
+    if (template_element.has_attribute(HTML::AttributeNames::shadowrootdelegatesfocus))
+        result |= 1 << 2;
+    if (template_element.has_attribute(HTML::AttributeNames::shadowrootserializable))
+        result |= 1 << 3;
+    if (auto slot_assignment = template_element.get_attribute(HTML::AttributeNames::shadowrootslotassignment); slot_assignment.has_value() && slot_assignment->equals_ignoring_ascii_case("manual"sv))
+        result |= 1 << 4;
+    if (template_element.has_attribute(HTML::AttributeNames::shadowrootclonable))
+        result |= 1 << 5;
+    if (template_element.has_attribute(HTML::AttributeNames::shadowrootcustomelementregistry))
+        result |= 1 << 6;
+    return result;
 }
 
 extern "C" void ladybird_html_parser_remove_node(size_t node)
@@ -2620,6 +3127,28 @@ extern "C" size_t ladybird_html_parser_parent_node(size_t node)
     return reinterpret_cast<size_t>(parent);
 }
 
+// https://html.spec.whatwg.org/multipage/parsing.html#insert-an-element-at-the-adjusted-insertion-location
+// NB: The conditions of step 2.
+extern "C" bool ladybird_html_parser_element_cannot_be_inserted(size_t target_parent, size_t element)
+{
+    auto& target_parent_node = node_from_html_parser_ffi(target_parent);
+    auto& element_node = node_from_html_parser_ffi(element);
+
+    // - element's parent is non-null;
+    if (element_node.parent())
+        return true;
+
+    // - element is a host-including inclusive ancestor of targetParent; or
+    if (element_node.is_host_including_inclusive_ancestor_of(target_parent_node))
+        return true;
+
+    // - targetParent is a Document node that already has an element child,
+    if (is<DOM::Document>(target_parent_node) && target_parent_node.has_child_of_type<DOM::Element>())
+        return true;
+
+    return false;
+}
+
 extern "C" size_t ladybird_html_parser_node_index(size_t node)
 {
     return node_from_html_parser_ffi(node).index();
@@ -2661,7 +3190,8 @@ extern "C" void ladybird_html_parser_insert_node(size_t parent, size_t offset, s
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#adoptionAgency
-// NB: Steps 15 and 16, given the (target, refNode) pair computed by step 14.
+// NB: Steps 20 and 21 of the outer loop, given the (target, refNode) pair computed by step 18.
+//     This callback implements the unsanitized case, in which lastNode is non-null.
 extern "C" void ladybird_html_parser_reinsert_last_node(size_t parent, size_t offset, size_t last_node)
 {
     auto insertion_location = node_and_offset_from_html_parser_ffi(parent, offset);
@@ -2669,11 +3199,12 @@ extern "C" void ladybird_html_parser_reinsert_last_node(size_t parent, size_t of
     GC::Ptr<DOM::Node> ref_node = insertion_location.child_at_offset();
     auto& last_node_to_insert = node_from_html_parser_ffi(last_node);
 
-    // 15. If lastNode's parent is non-null, then remove lastNode.
+    // 20. If lastNode is non-null and lastNode's parent is non-null, then remove lastNode.
     if (last_node_to_insert.parent())
         last_node_to_insert.remove();
 
-    // 16. If all of the following are true:
+    // 21. If all of the following are true:
+    //     - lastNode is non-null;
     //     - lastNode's parent is null;
     //     - lastNode is not a host-including inclusive ancestor of target;
     //     - target is not a Document node, or it does not have an element child; and
@@ -2743,6 +3274,14 @@ extern "C" bool ladybird_html_parser_is_shadow_host(size_t node)
 {
     auto* element = as_if<DOM::Element>(&node_from_html_parser_ffi(node));
     return element && element->is_shadow_host();
+}
+
+// https://w3c.github.io/trusted-types/dist/spec/#setting-slot-values-from-parser
+extern "C" void ladybird_html_parser_set_script_text_from_parser(size_t element)
+{
+    // Set script's script text value to its child text content.
+    auto& script = as<HTMLScriptElement>(node_from_html_parser_ffi(element));
+    script.set_string_text(script.child_text_content());
 }
 
 }

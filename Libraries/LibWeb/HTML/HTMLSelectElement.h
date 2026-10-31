@@ -15,6 +15,7 @@
 #include <LibWeb/HTML/HTMLElement.h>
 #include <LibWeb/HTML/HTMLOptionsCollection.h>
 #include <LibWebCommon/HTML/SelectItem.h>
+#include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
@@ -88,6 +89,11 @@ public:
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
 
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+    // When the element renders as a list box, it is a devolvable widget [...]
+    // When the element renders as a drop-down box, it is a devolvable widget [...]
+    virtual bool is_devolvable_widget() const override { return true; }
+
     virtual void reset_algorithm() override;
 
     Utf16FlyString type() const;
@@ -98,13 +104,30 @@ public:
     virtual void activation_behavior(DOM::Event const&) override;
 
     virtual void form_associated_element_was_inserted() override;
+
+    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
+    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
     virtual void form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
     void did_select_item(Optional<u32> const& id);
 
-    void update_selectedness();
+    // NB: Returns whether the selectedness changed, in which case the select's selectedcontent was also updated.
+    bool update_selectedness();
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#reset-a-select%27s-selectedness
+    enum class HasChanged : u8 {
+        No,
+        Yes,
+    };
+    void reset_selectedness(HasChanged);
 
     void clone_selected_option_into_select_button();
+
+    // https://html.spec.whatwg.org/multipage/rendering.html#the-select-element-2
+    bool renders_as_list_box() const;
+    void list_box_options_did_change();
+    void list_box_option_selectedness_did_change(HTMLOptionElement const&);
+    bool handle_list_box_key(UIEvents::KeyCode, u32 modifiers);
 
     bool can_skip_selectedness_update_for_inserted_option(HTMLOptionElement const&) const;
 
@@ -129,6 +152,8 @@ public:
     virtual bool is_mutable() const override;
 
 private:
+    friend class HTMLOptionElement;
+
     HTMLSelectElement(DOM::Document&, DOM::QualifiedName);
     virtual void visit_edges(Cell::Visitor&) override;
 
@@ -150,14 +175,37 @@ private:
     u32 display_size() const;
 
     mutable Vector<GC::Ref<HTMLOptionElement>> m_cached_list_of_options;
-    mutable size_t m_cached_number_of_selected_options { 0 };
+    size_t m_number_of_selected_options { 0 };
 
     mutable GC::Ptr<HTMLOptionsCollection> m_options;
     GC::Ptr<DOM::HTMLCollection> m_selected_options;
     bool m_is_open { false };
     Vector<GC::Ref<HTMLOptionElement>> m_select_item_option_elements;
     GC::Ptr<DOM::Element> m_inner_text_element;
+    GC::Ptr<DOM::Element> m_selected_label_element;
+    GC::Ptr<DOM::Element> m_label_sizer_element;
     GC::Ptr<DOM::Element> m_chevron_icon_element;
+    bool m_chevron_icon_hidden { false };
+
+    void create_list_box_shadow_tree(DOM::ShadowRoot&);
+    void update_list_box();
+    void update_list_box_row_style(DOM::Element& row, HTMLOptionElement const&) const;
+    void update_list_box_row_styles();
+    virtual void did_receive_focus() override;
+    virtual void did_lose_focus() override;
+    bool m_list_box_is_focused { false };
+    void handle_list_box_mousedown(UIEvents::MouseEvent&);
+    void choose_list_box_row(size_t index, bool extend);
+
+    GC::Ptr<DOM::Element> m_list_box_element;
+    struct ListBoxRow {
+        GC::Ref<DOM::Element> element;
+        GC::Ref<HTMLOptionElement> option;
+    };
+    Vector<ListBoxRow> m_list_box_rows;
+    Optional<size_t> m_list_box_anchor_index;
+    Optional<size_t> m_list_box_focus_index;
+    bool m_list_box_update_queued { false };
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
     bool m_user_validity { false };

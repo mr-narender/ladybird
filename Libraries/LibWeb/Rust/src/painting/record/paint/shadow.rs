@@ -4,16 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::painting::paint_read::PaintRead;
 use crate::painting::record::trace::Observer;
 
 use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::border_radii::BorderRadii;
+use crate::painting::corner_shape::{CornerShapes, Insets, border_contour_path};
 use crate::painting::display_list::commands::{PaintInnerBoxShadow, PaintOuterBoxShadow};
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::record::PaintRecorder;
-use libgfx_rust::{Color, CornerRadii, IntRect};
+use libgfx_rust::path::Path;
+use libgfx_rust::{Color, CornerRadii, FloatPoint, IntRect};
 
 fn add_spread_distance_to_border_radius(border_radius: &mut i32, spread_distance: i32) {
     if *border_radius == 0 || spread_distance == 0 {
@@ -47,7 +50,7 @@ pub(crate) fn paint_box_shadow<O: Observer>(
     borderless_content_rect: CssPixelRect,
     border_radii: BorderRadii,
 ) {
-    let layout_arena = recorder.layout_arena;
+    let layout_arena = recorder.source;
     let Some(style) = layout_arena.node_style_if_live(paintable) else {
         return;
     };
@@ -57,6 +60,7 @@ pub(crate) fn paint_box_shadow<O: Observer>(
     }
     paint_box_shadow_layers(
         recorder,
+        paintable,
         bordered_content_rect,
         borderless_content_rect,
         border_radii,
@@ -66,6 +70,7 @@ pub(crate) fn paint_box_shadow<O: Observer>(
 
 fn paint_box_shadow_layers<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
     bordered_content_rect: CssPixelRect,
     borderless_content_rect: CssPixelRect,
     border_radii: BorderRadii,
@@ -73,7 +78,10 @@ fn paint_box_shadow_layers<O: Observer>(
 ) {
     let converter = recorder.converter;
     let corner_radii = border_radii.as_corners(&converter);
+    let shadow_shapes = ShadowShapes::of(recorder, paintable, bordered_content_rect, corner_radii);
 
+    // Force-dark judges a box shadow as a background, so a dark drop shadow stays dark rather than turning into a
+    // light glow — as Blink's ResolveShadowColor does, passing DarkModeFilter::ElementRole::kBackground.
     // Box-shadow layers are ordered front-to-back, so we paint them in reverse.
     for layer in layers.iter().rev() {
         let offset_x = converter.rounded_device_pixels(CssPixels::from_raw(layer.offset_x));
@@ -88,7 +96,24 @@ fn paint_box_shadow_layers<O: Observer>(
             converter.rounded_device_rect(bordered_content_rect)
         };
 
-        if inner {
+        if let Some(shadow_shapes) = &shadow_shapes {
+            recorder.recorder.paint_path_box_shadow(
+                Color(layer.color),
+                blur_radius,
+                spread_distance as f32,
+                FloatPoint {
+                    x: offset_x as f32,
+                    y: offset_y as f32,
+                },
+                if inner {
+                    &shadow_shapes.inner
+                } else {
+                    &shadow_shapes.outer
+                },
+                inner,
+                ForceDarkRole::Background,
+            );
+        } else if inner {
             let mut outer_shadow_rect = IntRect::new(
                 device_content_rect.x + offset_x,
                 device_content_rect.y + offset_y,
@@ -130,7 +155,7 @@ fn paint_box_shadow_layers<O: Observer>(
                     inner_shadow_rect,
                     inner_shadow_corner_radii,
                 },
-                ForceDarkRole::Foreground,
+                ForceDarkRole::Background,
             );
         } else {
             let mut shadow_rect =
@@ -150,8 +175,53 @@ fn paint_box_shadow_layers<O: Observer>(
                     shadow_rect,
                     shadow_corner_radii,
                 },
-                ForceDarkRole::Foreground,
+                ForceDarkRole::Background,
             );
         }
+    }
+}
+
+/// The shapes a box's shadows are cast from when they are not its rounded border and padding boxes: the shape outer
+/// shadows are cast from, and the shape whose outside casts inner shadows.
+struct ShadowShapes {
+    outer: Path,
+    inner: Path,
+}
+
+impl ShadowShapes {
+    fn of<O: Observer>(
+        recorder: &PaintRecorder<'_, O>,
+        paintable: NodeSlotId,
+        border_box_rect: CssPixelRect,
+        corner_radii: CornerRadii,
+    ) -> Option<Self> {
+        let converter = recorder.converter;
+        // https://drafts.csswg.org/css-borders-4/#border-shape-shadow-interaction
+        if let Some(border_shape) =
+            crate::painting::border_shape::BorderShape::for_paintable(recorder.source, paintable, &converter)
+        {
+            let (outer, inner) = border_shape.into_shadow_paths();
+            return Some(Self { outer, inner });
+        }
+        // https://drafts.csswg.org/css-borders-4/#corner-shape-rendering
+        // Each shadow of an element's box-shadow is shaped by the border contour path given the element and the inset
+        // between its border edge and the shadow's edge.
+        let style = recorder.source.node_style_if_live(paintable)?;
+        let shapes = CornerShapes::of(style);
+        if !shapes.needs_contour(corner_radii) {
+            return None;
+        }
+        let border_rect = converter.rounded_device_rect(border_box_rect).to_float();
+        let width = |width: CssPixels| f64::from(converter.rounded_device_pixels(width));
+        let border_widths = Insets {
+            top: width(style.border_top_width()),
+            right: width(style.border_right_width()),
+            bottom: width(style.border_bottom_width()),
+            left: width(style.border_left_width()),
+        };
+        Some(Self {
+            outer: border_contour_path(border_rect, corner_radii, shapes, Insets::default()),
+            inner: border_contour_path(border_rect, corner_radii, shapes, border_widths),
+        })
     }
 }

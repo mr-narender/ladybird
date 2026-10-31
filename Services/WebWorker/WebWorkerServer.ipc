@@ -8,17 +8,21 @@
 #include <LibWebCommon/HTML/WorkerAgentForward.h>
 #include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <LibWebCommon/HTML/WorkerTypes.h>
+#include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
+#include <LibWebCommon/Permissions/Permissions.h>
 
 endpoint WebWorkerServer {
-    init_transport(int peer_pid) => (int peer_pid)
-    set_font_catalog(IPC::File file, u64 size, u64 generation) =|
+    set_font_service(IPC::TransportHandle handle, IPC::File catalog, u64 catalog_size, u64 generation) =|
 
-    connect_to_request_server(IPC::TransportHandle handle) =|
-    simulate_request_server_connection_loss_and_reconnect_for_testing(IPC::TransportHandle replacement_handle) => ()
+    connect_to_request_server(IPC::TransportHandle handle, int client_id, Optional<Utf16String> top_level_site) =|
+    simulate_request_server_connection_loss_and_reconnect_for_testing(IPC::TransportHandle replacement_handle, int client_id, Optional<Utf16String> top_level_site) => ()
     connect_to_image_decoder(IPC::TransportHandle handle) =|
-    connect_to_wasm_compiler(IPC::TransportHandle handle) =|
     connect_to_compositor(IPC::TransportHandle handle) =|
     set_site_compatibility_data(JsonValue data) =|
+    set_permission_snapshot(Web::Permissions::PermissionSnapshot snapshot) =|
+    set_user_agent(String user_agent) =|
+    set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode mode) =|
+    set_preferred_languages(Vector<String> preferred_languages) =|
 
     set_system_font_family(String family) =|
 
@@ -39,6 +43,7 @@ endpoint WebWorkerServer {
 
     did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) =|
     did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno) =|
+    did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) =|
     did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) =|
     did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) =|
 

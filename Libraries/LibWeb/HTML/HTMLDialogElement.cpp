@@ -394,6 +394,41 @@ void HTMLDialogElement::close_the_dialog(Optional<Utf16String> result, GC::Ptr<D
     });
 }
 
+enum class ClosedByState : u8 {
+    Any,
+    CloseRequest,
+    None,
+};
+
+// https://html.spec.whatwg.org/multipage/interactive-elements.html#computed-closed-by-state
+static ClosedByState computed_closed_by_state(HTMLDialogElement const& dialog)
+{
+    auto closedby = dialog.attribute(AttributeNames::closedby);
+    Optional<ClosedByState> state;
+    if (closedby.has_value()) {
+        if (closedby->equals_ignoring_ascii_case(u"any"sv))
+            state = ClosedByState::Any;
+        else if (closedby->equals_ignoring_ascii_case(u"closerequest"sv))
+            state = ClosedByState::CloseRequest;
+        else if (closedby->equals_ignoring_ascii_case(u"none"sv))
+            state = ClosedByState::None;
+    }
+
+    // 1. If the state of dialog's closedby attribute is Auto:
+    // NB: The missing value default and the invalid value default are both the Auto state.
+    if (!state.has_value()) {
+        // 1. If dialog's is modal is true, then return Close Request.
+        if (dialog.is_modal())
+            return ClosedByState::CloseRequest;
+
+        // 2. Return None.
+        return ClosedByState::None;
+    }
+
+    // 2. Return the state of dialog's closedby attribute.
+    return *state;
+}
+
 // https://html.spec.whatwg.org/multipage/interactive-elements.html#set-the-dialog-close-watcher
 void HTMLDialogElement::set_close_watcher()
 {
@@ -434,8 +469,7 @@ void HTMLDialogElement::set_close_watcher()
     auto get_enabled_state = GC::create_function(GC::Heap::the(), [dialog = this] {
         if (dialog->m_enable_close_watcher_for_request_close)
             return true;
-        // FIXME: dialog's computed closed-by state is not None
-        return false;
+        return computed_closed_by_state(*dialog) != ClosedByState::None;
     });
 
     m_close_watcher = CloseWatcher::establish(*document().window(), move(get_enabled_state));
@@ -486,10 +520,15 @@ void HTMLDialogElement::run_dialog_focusing_steps()
         return;
 
     // 2. Let control be null
-    GC::Ptr<Element> control = nullptr;
+    GC::Ptr<DOM::Node> control = nullptr;
 
-    // FIXME: 3. If subject has the autofocus attribute, then set control to subject.
-    // FIXME: 4. If control is null, then set control to the focus delegate of subject.
+    // 3. If subject has the autofocus attribute, then set control to subject.
+    if (has_attribute(AttributeNames::autofocus))
+        control = this;
+
+    // 4. If control is null, then set control to the focus delegate of subject.
+    if (!control)
+        control = focus_delegate(*this);
 
     // 5. If control is null, then set control to subject.
     if (!control)
@@ -499,12 +538,24 @@ void HTMLDialogElement::run_dialog_focusing_steps()
     run_focusing_steps(control);
 
     // 7. Let topDocument be control's node navigable's top-level traversable's active document.
+    // NB: A focus event handler can move control into a document without a navigable.
+    auto navigable = control->navigable();
+    if (!navigable)
+        return;
+    auto* top_level_traversable = as_if<LocalNavigable>(*navigable->top_level_traversable());
+    if (!top_level_traversable)
+        return;
+    auto top_document = top_level_traversable->active_document();
+
     // 8. If control's node document's origin is not the same as the origin of topDocument, then return.
-    if (!control->document().origin().is_same_origin(*control->navigable()->top_level_traversable()->active_document_origin()))
+    if (!top_document || !control->document().origin().is_same_origin(top_document->origin()))
         return;
 
-    // FIXME: 9. Empty topDocument's autofocus candidates.
-    // FIXME: 10. Set topDocument's autofocus processed flag to true.
+    // 9. Empty topDocument's autofocus candidates.
+    top_document->autofocus_candidates().clear();
+
+    // 10. Set topDocument's autofocus processed flag to true.
+    top_document->set_autofocus_processed_flag(true);
 }
 
 void HTMLDialogElement::set_is_modal(bool is_modal)
@@ -631,9 +682,7 @@ void HTMLDialogElement::light_dismiss_open_dialogs(UIEvents::PointerEvent const&
             return;
 
         // 6. If topmostDialog's computed closed-by state is not Any, then return.
-        // FIXME: This should use the "computed closed-by state" algorithm.
-        auto closedby = topmost_dialog->attribute(AttributeNames::closedby);
-        if (!closedby.has_value() || !closedby.value().equals_ignoring_ascii_case(u"any"sv))
+        if (computed_closed_by_state(*topmost_dialog) != ClosedByState::Any)
             return;
 
         // 7. Assert: topmostDialog's close watcher is not null.

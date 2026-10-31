@@ -57,6 +57,9 @@ inline fn load_direct_getter_value(
     else failure: Label
 ) -> Value {
     let direct_getter: DirectGetterFunction = alias(function);
+    # The validated cache entry only pins the receiver's shape, and an ordinary object created from a wrapper's
+    # prototype shares that shape while being too small to have an implementation slot.
+    guard receiver_object.flags has OBJECT_FLAG_IS_PLATFORM_OBJECT else failure;
     let wrapper_words: Sequence<u64> = alias(receiver_object);
     let implementation = wrapper_words[direct_getter.wrapper_implementation_word_offset];
     guard implementation != 0 else failure;
@@ -143,6 +146,22 @@ inline fn load_property_lookup_cache(
     guard property_cache != 0 else fail;
     and(property_cache, PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK);
     assert(property_cache != 0);
+    property_cache
+}
+
+# The data of the property lookup cache of a keyed access: `empty` if it has none yet, `generic` if the
+# access saw too many keys to cache (see PropertyLookupCache::is_keyed_generic()).
+inline fn load_keyed_property_lookup_cache(
+    cache: PropertyLookupCacheIndex,
+    generic: Label,
+    else empty: Label
+) -> PropertyLookupCache {
+    let executable = exec_ctx.executable;
+    assert(executable != 0);
+    let mut property_cache = executable.property_lookup_caches[load(cache)];
+    guard property_cache != 0 else empty;
+    branch_eq(property_cache, PROPERTY_LOOKUP_CACHE_KEYED_GENERIC, generic);
+    and(property_cache, PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK);
     property_cache
 }
 
@@ -359,6 +378,18 @@ inline fn normalize_completion_value(initial_value: Value) -> (Value, Value) {
     (value, empty_tag)
 }
 
+# Switches to the dispatch table of the executable whose frame the interpreter
+# continues in. Only the profiling build switches: the plain build's handlers
+# run every frame while the JIT is off, and while it is on, the plain
+# handlers' frames keep the table they run with until the next profiling
+# handler switches frames (see the executable's interpreter tier).
+inline fn switch_dispatch_table(executable: Executable) @profiling {
+    let dispatch_table_index: u32 = alias(executable.dispatch_table_index);
+    let vm = current_vm();
+    let dispatch_table = vm.dispatch_tables[dispatch_table_index & DISPATCH_TABLE_INDEX_MASK];
+    dispatch = dispatch_table;
+}
+
 inline fn return_to_caller(
     return_value: Value,
     else top_level: Label
@@ -373,16 +404,22 @@ inline fn return_to_caller(
     }
     let return_pc = exec_ctx.caller_return_pc;
     let destination_index = exec_ctx.caller_dst_raw;
+    let returns_to_native_caller = exec_ctx.returns_to_native_caller;
     caller_frame.program_counter = return_pc;
     caller_frame.slots[destination_index] = result;
     let vm = current_vm();
     vm.running_execution_context = caller_frame;
     vm.interpreter_stack_top = alias(exec_ctx);
     inc32_mem([vm, VM_EXECUTION_GENERATION]);
+    # A caller waiting in native code (JIT code) continues there.
+    if returns_to_native_caller {
+        exit;
+    }
     exec_ctx = caller_frame;
     let executable = exec_ctx.executable;
     assert(executable != 0);
     pb = executable.bytecode_data;
+    switch_dispatch_table(executable);
     assert(pb != 0);
     values = exec_ctx.slots;
     pc = return_pc;
@@ -402,15 +439,18 @@ inline fn update_operand(
     operand: inout Operand,
     integer_operation: CheckedBinaryOperation<i32>,
     float_operation: BinaryOperation<f64>,
-    slow_path: SlowPath
+    slow_path: SlowPath,
+    feedback: ArithFeedbackIndex
 ) {
     let value = load(operand);
     guard let mut Value<i32>(integer) = value else slow;
     integer_operation(integer, 1) else overflow;
+    record_arith_feedback(feedback, ARITH_FEEDBACK_INT32);
     store(operand, box_i32(integer));
     dispatch_next;
 
     let overflow = || @cold {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
         let overflowed_integer = unbox_i32(load(operand));
         let mut result = to_f64(overflowed_integer);
         let one = unbox_f64(DOUBLE_ONE);
@@ -419,6 +459,7 @@ inline fn update_operand(
         dispatch_next;
     };
     let slow = || @cold {
+        record_arith_operand_feedback(feedback, value);
         call_slow_path(slow_path);
     };
 }
@@ -428,16 +469,19 @@ inline fn post_update_operand(
     operand: inout Operand,
     integer_operation: CheckedBinaryOperation<i32>,
     float_operation: BinaryOperation<f64>,
-    slow_path: SlowPath
+    slow_path: SlowPath,
+    feedback: ArithFeedbackIndex
 ) {
     let old = load(operand);
     guard let mut Value<i32>(integer) = old else slow;
     store(dst, old);
     integer_operation(integer, 1) else overflow;
+    record_arith_feedback(feedback, ARITH_FEEDBACK_INT32);
     store(operand, box_i32(integer));
     dispatch_next;
 
     let overflow = || @cold {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
         let overflowed_integer = unbox_i32(load(operand));
         let mut result = to_f64(overflowed_integer);
         let one = unbox_f64(DOUBLE_ONE);
@@ -446,6 +490,7 @@ inline fn post_update_operand(
         dispatch_next;
     };
     let slow = || @cold {
+        record_arith_operand_feedback(feedback, old);
         call_slow_path(slow_path);
     };
 }
@@ -474,13 +519,15 @@ inline fn bitwise_binary(
     lhs: Value,
     rhs: Value,
     operation: BinaryOperation<i32>,
-    slow_path: SlowPath
+    slow_path: SlowPath,
+    feedback: ArithFeedbackIndex
 ) {
     let slow = || @cold {
         call_binary_slow_path(slow_path, dst, lhs, rhs);
     };
 
     let non_int32 = || @cold {
+        record_arith_operands_feedback(feedback, lhs, rhs);
         guard let mut lhs_integer = numeric_value_to_i32(lhs) else slow;
         guard let rhs_integer = numeric_value_to_i32(rhs) else slow;
         operation(lhs_integer, rhs_integer);
@@ -490,6 +537,7 @@ inline fn bitwise_binary(
     guard let mut Value<i32>(lhs_integer) = lhs else non_int32;
     guard let Value<i32>(rhs_integer) = rhs else non_int32;
 
+    record_arith_feedback(feedback, ARITH_FEEDBACK_INT32);
     operation(lhs_integer, rhs_integer);
     store(dst, box_i32(lhs_integer));
     dispatch_next;
@@ -500,14 +548,17 @@ inline fn signed_shift(
     lhs: Value,
     rhs: Value,
     operation: BinaryOperation<i32>,
-    slow_path: SlowPath
+    slow_path: SlowPath,
+    feedback: ArithFeedbackIndex
 ) {
     let slow = || @cold {
+        record_arith_operands_feedback(feedback, lhs, rhs);
         call_binary_slow_path(slow_path, dst, lhs, rhs);
     };
 
     guard let mut Value<i32>(integer) = lhs else slow;
     guard let mut Value<i32>(count) = rhs else slow;
+    record_arith_feedback(feedback, ARITH_FEEDBACK_INT32);
     count = count & 31;
     operation(integer, count);
     store(dst, box_i32(integer));
@@ -520,7 +571,8 @@ inline fn store_relational_result(
     rhs: Value,
     integer_condition: IntegerCondition,
     float_condition: FloatCondition,
-    slow_path: SlowPath
+    slow_path: SlowPath,
+    feedback: ArithFeedbackIndex
 ) {
     let store_true = || {
         store(dst, Value<True>);
@@ -540,7 +592,8 @@ inline fn store_relational_result(
         integer_condition,
         float_condition,
         store_true,
-        store_false
+        store_false,
+        feedback
     ) else slow;
 }
 
@@ -551,28 +604,45 @@ inline fn equality_same_tag(
     equal: Label,
     not_equal: Label,
     compare_f64: Label,
+    feedback: ArithFeedbackIndex,
     else slow: Label
 ) {
     match lhs_tag {
-        INT32_TAG | BOOLEAN_TAG => fast_compare,
-        OBJECT_TAG | SYMBOL_TAG => fast_compare,
+        INT32_TAG | BOOLEAN_TAG => other_compare,
+        OBJECT_TAG | SYMBOL_TAG => other_compare,
         STRING_TAG => string_compare,
-        BIGINT_TAG => slow,
+        BIGINT_TAG => bigint_compare,
         _ => check_nullish,
     }
 
     let check_nullish = || {
         lhs_tag = lhs_tag & 0xfffe;
-        branch_eq(lhs_tag, UNDEFINED_TAG, fast_compare);
+        branch_eq(lhs_tag, UNDEFINED_TAG, other_compare);
         goto compare_f64;
     };
 
     let string_compare = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_STRING);
         guard lhs is not rhs else equal;
+        goto different_strings;
+    };
+
+    let different_strings = || @cold {
+        # Two different interned strings never have the same contents.
+        guard let Value<PrimitiveString>(lhs_string) = lhs else slow;
+        guard let Value<PrimitiveString>(rhs_string) = rhs else slow;
+        guard lhs_string.deferred_kind_and_flags has PRIMITIVE_STRING_INTERNED_FLAG else slow;
+        guard rhs_string.deferred_kind_and_flags has PRIMITIVE_STRING_INTERNED_FLAG else slow;
+        goto not_equal;
+    };
+
+    let bigint_compare = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_BIGINT);
         goto slow;
     };
 
-    let fast_compare = || {
+    let other_compare = || {
+        record_identity_equality_feedback(feedback, lhs_tag);
         guard lhs is not rhs else equal;
         goto not_equal;
     };
@@ -594,29 +664,42 @@ inline fn strict_equality(
     rhs: Value,
     equal: Label,
     not_equal: Label,
+    feedback: ArithFeedbackIndex,
     else slow: Label
 ) {
     let mut rhs_tag = extract_tag(rhs);
     branch_eq(rhs_tag, INT32_TAG, rhs_i32);
     let mut lhs_tag = extract_tag(lhs);
     guard lhs_tag == rhs_tag else different_tags;
-    equality_same_tag(lhs, rhs, lhs_tag, equal, not_equal, compare_f64) else slow;
+    equality_same_tag(lhs, rhs, lhs_tag, equal, not_equal, compare_f64, feedback) else slow;
 
     let compare_f64 = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_DOUBLE);
         let lhs_number = unbox_f64(lhs);
         let rhs_number = unbox_f64(rhs);
         compare_f64_equality(lhs_number, rhs_number, equal, not_equal);
     };
 
+    let other_not_equal = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_OTHER);
+        goto not_equal;
+    };
+
     let different_tags = || {
         branch_eq(lhs_tag, INT32_TAG, lhs_i32);
-        check_tag_is_double(lhs_tag) else not_equal;
-        check_tag_is_double(rhs_tag) else not_equal;
+        check_tag_is_double(lhs_tag) else other_not_equal;
+        check_tag_is_double(rhs_tag) else other_not_equal;
         goto compare_f64;
     };
 
+    let int32_and_other_not_equal = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_AND_OTHER);
+        goto not_equal;
+    };
+
     let lhs_i32 = || {
-        check_tag_is_double(rhs_tag) else not_equal;
+        check_tag_is_double(rhs_tag) else int32_and_other_not_equal;
+        record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
         let integer = unbox_i32(lhs);
         let lhs_number = to_f64(integer);
         let rhs_number = unbox_f64(rhs);
@@ -628,13 +711,15 @@ inline fn strict_equality(
         let rhs_integer = unbox_i32(rhs);
         match lhs {
             Value<i32>(lhs_integer) => {
+                record_arith_feedback(feedback, ARITH_FEEDBACK_INT32);
                 branch_eq(lhs_integer, rhs_integer, equal);
                 goto not_equal;
             },
             Value<f64>(lhs_double) => @cold {
+                record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                 compare_f64_equality(lhs_double, to_f64(rhs_integer), equal, not_equal);
             },
-            _ => not_equal,
+            _ => int32_and_other_not_equal,
         }
     };
 }
@@ -644,45 +729,60 @@ inline fn loose_equality(
     rhs: Value,
     equal: Label,
     not_equal: Label,
+    feedback: ArithFeedbackIndex,
     else slow: Label
 ) {
     let mut rhs_tag = extract_tag(rhs);
     branch_eq(rhs_tag, INT32_TAG, rhs_i32);
     let mut lhs_tag = extract_tag(lhs);
     guard lhs_tag == rhs_tag else different_tags;
-    equality_same_tag(lhs, rhs, lhs_tag, equal, not_equal, compare_f64) else slow;
+    equality_same_tag(lhs, rhs, lhs_tag, equal, not_equal, compare_f64, feedback) else slow;
 
     let compare_f64 = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_DOUBLE);
         let lhs_number = unbox_f64(lhs);
         let rhs_number = unbox_f64(rhs);
         compare_f64_equality(lhs_number, rhs_number, equal, not_equal);
     };
 
+    let other_slow = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_OTHER);
+        goto slow;
+    };
+
     let different_tags = || {
         lhs_tag = lhs_tag & 0xfffe;
         guard lhs_tag == UNDEFINED_TAG else try_f64;
+        record_arith_feedback(feedback, ARITH_FEEDBACK_OTHER);
         rhs_tag = rhs_tag & 0xfffe;
         guard rhs_tag != UNDEFINED_TAG else equal;
         goto slow;
     };
 
     let try_f64 = || {
-        guard lhs is Value<f64> else slow;
-        guard rhs is Value<f64> else slow;
+        guard lhs is Value<f64> else other_slow;
+        guard rhs is Value<f64> else other_slow;
         goto compare_f64;
+    };
+
+    let int32_and_other_slow = || {
+        record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_AND_OTHER);
+        goto slow;
     };
 
     let rhs_i32 = || {
         let rhs_integer = unbox_i32(rhs);
         match lhs {
             Value<i32>(lhs_integer) => {
+                record_arith_feedback(feedback, ARITH_FEEDBACK_INT32);
                 branch_eq(lhs_integer, rhs_integer, equal);
                 goto not_equal;
             },
             Value<f64>(lhs_double) => @cold {
+                record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                 compare_f64_equality(lhs_double, to_f64(rhs_integer), equal, not_equal);
             },
-            _ => slow,
+            _ => int32_and_other_slow,
         }
     };
 }
@@ -692,9 +792,10 @@ inline fn strict_inequality(
     rhs: Value,
     not_equal: Label,
     equal: Label,
+    feedback: ArithFeedbackIndex,
     else slow: Label
 ) {
-    strict_equality(lhs, rhs, equal, not_equal) else slow;
+    strict_equality(lhs, rhs, equal, not_equal, feedback) else slow;
 }
 
 inline fn loose_inequality(
@@ -702,9 +803,10 @@ inline fn loose_inequality(
     rhs: Value,
     not_equal: Label,
     equal: Label,
+    feedback: ArithFeedbackIndex,
     else slow: Label
 ) {
-    loose_equality(lhs, rhs, equal, not_equal) else slow;
+    loose_equality(lhs, rhs, equal, not_equal, feedback) else slow;
 }
 
 inline fn store_equality_result(
@@ -712,7 +814,8 @@ inline fn store_equality_result(
     lhs: Value,
     rhs: Value,
     operation: EqualityOperation,
-    slow: SlowPath
+    slow: SlowPath,
+    feedback: ArithFeedbackIndex
 ) {
     let failure = || @cold {
         call_binary_slow_path(slow, dst, lhs, rhs);
@@ -726,7 +829,7 @@ inline fn store_equality_result(
         dispatch_next;
     };
 
-    operation(lhs, rhs, store_true, store_false) else failure;
+    operation(lhs, rhs, store_true, store_false, feedback) else failure;
 }
 
 inline fn jump_equality(
@@ -735,7 +838,8 @@ inline fn jump_equality(
     true_target: BytecodeOffset,
     false_target: BytecodeOffset,
     operation: EqualityOperation,
-    slow: SlowPath
+    slow: SlowPath,
+    feedback: ArithFeedbackIndex
 ) {
     let failure = || @cold {
         call_jump_slow_path(slow, lhs, rhs, true_target, false_target);
@@ -747,7 +851,7 @@ inline fn jump_equality(
         jump(false_target);
     };
 
-    operation(lhs, rhs, take_true, take_false) else failure;
+    operation(lhs, rhs, take_true, take_false, feedback) else failure;
 }
 
 inline fn compare_numeric_values(
@@ -757,6 +861,7 @@ inline fn compare_numeric_values(
     float_condition: FloatCondition,
     true_result: Label,
     false_result: Label,
+    feedback: ArithFeedbackIndex,
     else slow: Label
 ) {
     let compare_double = |lhs: f64, rhs: f64| @cold {
@@ -769,27 +874,40 @@ inline fn compare_numeric_values(
         Value<i32>(lhs_integer) => {
             match rhs {
                 Value<i32>(rhs_integer) => {
+                    record_arith_feedback(feedback, ARITH_FEEDBACK_INT32);
                     integer_condition(lhs_integer, rhs_integer, true_result);
                     goto false_result;
                 },
                 Value<f64>(rhs_double) => @cold {
+                    record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                     goto compare_double(to_f64(lhs_integer), rhs_double);
                 },
-                _ => slow,
+                _ => @cold {
+                    record_arith_operands_feedback(feedback, lhs, rhs);
+                    goto slow;
+                },
             }
         },
         Value<f64>(lhs_double) => @cold {
             match rhs {
                 Value<i32>(rhs_integer) => {
+                    record_arith_feedback(feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                     goto compare_double(lhs_double, to_f64(rhs_integer));
                 },
                 Value<f64>(rhs_double) => {
+                    record_arith_feedback(feedback, ARITH_FEEDBACK_DOUBLE);
                     goto compare_double(lhs_double, rhs_double);
                 },
-                _ => slow,
+                _ => @cold {
+                    record_arith_operands_feedback(feedback, lhs, rhs);
+                    goto slow;
+                },
             }
         },
-        _ => slow,
+        _ => @cold {
+            record_arith_operands_feedback(feedback, lhs, rhs);
+            goto slow;
+        },
     }
 }
 
@@ -800,7 +918,8 @@ inline fn jump_relational(
     false_target: BytecodeOffset,
     integer_condition: IntegerCondition,
     float_condition: FloatCondition,
-    slow: SlowPath
+    slow: SlowPath,
+    feedback: ArithFeedbackIndex
 ) {
     let failure = || @cold {
         call_jump_slow_path(slow, lhs, rhs, true_target, false_target);
@@ -818,7 +937,8 @@ inline fn jump_relational(
         integer_condition,
         float_condition,
         take_true,
-        take_false
+        take_false,
+        feedback
     ) else failure;
 }
 
@@ -833,67 +953,271 @@ inline fn box_boolean(value: u64) -> Value {
     reinterpret_u64_as_value(bits)
 }
 
-inline fn validate_builtin(
-    callee_operand: in Operand,
-    expected_builtin: u8,
-    else failure: Label
-) {
-    guard let Value<Object>(object) = load(callee_operand) else failure;
-    guard object.flags has OBJECT_FLAG_IS_FUNCTION else failure;
-    let function: FunctionObject = alias(object);
-    guard function.has_builtin else failure;
-    guard function.builtin == expected_builtin else failure;
-}
-
-inline fn load_builtin_f64(
-    callee: in Operand,
-    argument_operand: in Operand,
-    expected_builtin: u8,
-    else failure: Label
-) -> (Value, f64) {
-    validate_builtin(callee, expected_builtin) else failure;
-    let argument = load(argument_operand);
-    guard let Value<f64>(argument_f64) = argument else failure;
-    (argument, argument_f64)
-}
-
 inline fn load_primitive_string_utf16_code_unit(
     string: PrimitiveString,
     index: u32,
     out_of_bounds: Label,
     else failure: Label
 ) -> u32 {
-    guard string.deferred_kind == PRIMITIVE_STRING_DEFERRED_KIND_NONE else failure;
-    let utf16_data = string.utf16_data;
-    guard utf16_data != 0 else failure;
-    assert(utf16_data != 0);
-
-    let short_string_info = string.utf16_short_string_byte_count_and_flag;
-    if short_string_info lacks UTF16_SHORT_STRING_FLAG {
-        let length = utf16_data.length_in_code_units;
+    let deferred_kind_and_flags: u32 = alias(string.deferred_kind_and_flags);
+    let deferred_kind = deferred_kind_and_flags & PRIMITIVE_STRING_DEFERRED_KIND_MASK;
+    if deferred_kind == PRIMITIVE_STRING_DEFERRED_KIND_INLINE {
+        let length = string.length_in_utf16_code_units;
         guard length > index else out_of_bounds;
-        if utf16_data.flags has UTF16_STRING_DATA_HAS_UTF16_STORAGE {
-            let utf16_storage: Sequence<u16> = alias(utf16_data.string_storage);
-            let code_unit: u32 = alias(utf16_storage[index]);
-            code_unit
+        let code_unit: u32 = alias(string.inline_string_storage[index]);
+        code_unit
+    } else {
+        guard deferred_kind == PRIMITIVE_STRING_DEFERRED_KIND_NONE else failure;
+        let utf16_data = string.utf16_data;
+        guard utf16_data != 0 else failure;
+        assert(utf16_data != 0);
+
+        let short_string_info = string.utf16_short_string_byte_count_and_flag;
+        if short_string_info lacks UTF16_SHORT_STRING_FLAG {
+            let length = utf16_data.length_in_code_units;
+            guard length > index else out_of_bounds;
+            if utf16_data.flags has UTF16_STRING_DATA_HAS_UTF16_STORAGE {
+                let utf16_storage: Sequence<u16> = alias(utf16_data.string_storage);
+                let code_unit: u32 = alias(utf16_storage[index]);
+                code_unit
+            } else {
+                let code_unit: u32 = alias(utf16_data.string_storage[index]);
+                code_unit
+            }
         } else {
-            let code_unit: u32 = alias(utf16_data.string_storage[index]);
+            let wide_short_string_info: u32 = alias(short_string_info);
+            let byte_count = wide_short_string_info >> UTF16_SHORT_STRING_BYTE_COUNT_SHIFT_COUNT;
+            guard index < byte_count else out_of_bounds;
+            let code_unit: u32 = alias(string.utf16_short_string_storage[index]);
             code_unit
         }
-    } else {
-        let wide_short_string_info: u32 = alias(short_string_info);
-        let byte_count = wide_short_string_info >> UTF16_SHORT_STRING_BYTE_COUNT_SHIFT_COUNT;
-        guard index < byte_count else out_of_bounds;
-        let code_unit: u32 = alias(string.utf16_short_string_storage[index]);
-        code_unit
     }
 }
 
-# Handlers whose complete semantics live in their C++ slow path.
+# All feedback recording goes through this helper, so the feedback base can
+# later move into the frame without touching every handler.
+inline fn feedback_base() -> ExecutableFeedback {
+    let executable = exec_ctx.executable;
+    executable.feedback
+}
+
+# The address of the element `index` of `size` bytes of the feedback array at
+# `array` (an offset into the primitive storage cage), masked into the cage.
+# Shifting the bits outside PRIMITIVE_STORAGE_CAGE_OFFSET_MASK out masks them
+# without a 64-bit immediate, which takes another register on x86-64.
+inline fn feedback_address(cage_base: u64, array: u64, index: u32, size: u8) -> u64 {
+    let unmasked: u64 = array + alias(index) * alias(size);
+    cage_base + ((unmasked << PRIMITIVE_STORAGE_CAGE_OFFSET_SHIFT) >> PRIMITIVE_STORAGE_CAGE_OFFSET_SHIFT)
+}
+
+inline fn record_arith_feedback(slot: ArithFeedbackIndex, bits: i32) @profiling {
+    let feedback = feedback_base();
+    let arith = feedback_address(primitive_storage_cage_base(), feedback.arith, load(slot), 1);
+    or8_mem([arith, 0], bits);
+}
+
+inline fn record_identity_equality_feedback(slot: ArithFeedbackIndex, tag: ValueTag) @profiling {
+    let mut bits: i32 = ARITH_FEEDBACK_OTHER;
+    if tag == OBJECT_TAG {
+        bits = ARITH_FEEDBACK_OBJECT_PAIR;
+    }
+    record_arith_feedback(slot, bits);
+}
+
+inline fn arith_feedback_bits(value: Value) -> i32 {
+    let tag = extract_tag(value);
+    let mut bits: i32 = ARITH_FEEDBACK_OTHER;
+    if tag == INT32_TAG {
+        bits = ARITH_FEEDBACK_INT32;
+    } else if value is Value<f64> {
+        bits = ARITH_FEEDBACK_DOUBLE;
+    } else if tag == STRING_TAG {
+        bits = ARITH_FEEDBACK_STRING;
+    } else if tag == BIGINT_TAG {
+        bits = ARITH_FEEDBACK_BIGINT;
+    } else if tag == BOOLEAN_TAG {
+        bits = ARITH_FEEDBACK_BOOLEAN;
+    }
+    bits
+}
+
+inline fn record_arith_operand_feedback(slot: ArithFeedbackIndex, value: Value) @profiling {
+    record_arith_feedback(slot, arith_feedback_bits(value));
+}
+
+inline fn record_arith_operands_feedback(slot: ArithFeedbackIndex, lhs: Value, rhs: Value) @profiling {
+    let lhs_bits = arith_feedback_bits(lhs);
+    let rhs_bits = arith_feedback_bits(rhs);
+    let bits = lhs_bits | rhs_bits;
+    record_arith_feedback(slot, bits);
+}
+
+# Value feedback stores the bits of the produced value in the instruction's
+# bucket. The runtime classifies buckets into ValueFeedback bits later.
+inline fn record_value_feedback(slot: ValueFeedbackIndex, value: Value) @profiling {
+    let feedback = feedback_base();
+    let buckets: Sequence<Value> = alias(
+        feedback_address(primitive_storage_cage_base(), feedback.value_buckets, load(slot), 8)
+    );
+    buckets[0] = value;
+}
+
+# Call feedback only does work when the callee differs from the first one
+# recorded at the site.
+inline fn record_call_target(slot: CallFeedbackIndex, function: Object) @profiling {
+    let feedback = feedback_base();
+    let call_feedback: CallFeedback = alias(
+        feedback_address(primitive_storage_cage_base(), feedback.call, load(slot), CALL_FEEDBACK_SIZE)
+    );
+    let function_pointer: u64 = alias(function);
+    if call_feedback.target != function_pointer {
+        let mut flags: i32 = alias(call_feedback.flags);
+        if call_feedback.target == 0 {
+            call_feedback.target = function_pointer;
+        } else {
+            flags = flags | CALL_FEEDBACK_POLYMORPHIC;
+            # A closure of the first callee's function has its shared data.
+            # Without native callees, the first callee is an ECMAScript
+            # function too.
+            if function.flags lacks OBJECT_FLAG_IS_ECMASCRIPT_FUNCTION_OBJECT {
+                flags = flags | CALL_FEEDBACK_OTHER_FUNCTIONS;
+            } else if flags lacks CALL_FEEDBACK_SAW_NATIVE {
+                # The first callee is a weak reference in the feedback, which is
+                # decoded into the heap region like a cell value.
+                let first_bits = call_feedback.target;
+                let mut first_value: Value;
+                mov(first_value, first_bits);
+                let first_object: Object = unbox_object(first_value);
+                let first: ECMAScriptFunctionObject = alias(first_object);
+                let closure: ECMAScriptFunctionObject = alias(function);
+                if first.shared_data != closure.shared_data {
+                    flags = flags | CALL_FEEDBACK_OTHER_FUNCTIONS;
+                }
+            }
+        }
+        if function.flags lacks OBJECT_FLAG_IS_ECMASCRIPT_FUNCTION_OBJECT {
+            flags = flags | CALL_FEEDBACK_SAW_NATIVE;
+        }
+        call_feedback.flags = truncate_u8(flags);
+    }
+}
+
+inline fn record_keyed_feedback(slot: KeyedFeedbackIndex, bits: u32) @profiling {
+    record_keyed_feedback_with_cage_base(primitive_storage_cage_base(), slot, bits);
+}
+
+# For handlers that have the primitive storage cage base at hand already.
+inline fn record_keyed_feedback_with_cage_base(cage_base: u64, slot: KeyedFeedbackIndex, bits: u32) @profiling {
+    let feedback = feedback_base();
+    let keyed_feedback = feedback_address(cage_base, feedback.keyed, load(slot), KEYED_FEEDBACK_SIZE);
+    or32_mem([keyed_feedback, KEYED_FEEDBACK_BITS], bits);
+}
+
+inline fn record_typed_array_keyed_feedback(cage_base: u64, slot: KeyedFeedbackIndex, kind: u8) @profiling {
+    let mut bits: u32 = 1;
+    let shift: u32 = alias(kind);
+    let mut count = shift + KEYED_FEEDBACK_TYPED_ARRAY_SHIFT;
+    shl(bits, count);
+    bits = bits | KEYED_FEEDBACK_INT32_INDEX;
+    record_keyed_feedback_with_cage_base(cage_base, slot, bits);
+}
+
+# Runs the frame that just became the running execution context in its
+# executable's JIT code, if it has some. Only the profiling build checks:
+# JIT code exists only while the JIT is enabled, which selects that build.
+inline fn enter_jit_code_if_any(executable: Executable) @profiling {
+    if executable.jit_compile_state == JIT_COMPILE_STATE_INSTALLED {
+        let control: i32 = call_helper(asm_helper_enter_jit_code, current_vm());
+        guard control >= 0 else @cold {
+            exit;
+        };
+        if control > 0 {
+            # The code returned: its frame is still the running execution context, and the return value is in the
+            # frame's return value register.
+            let returned_vm = current_vm();
+            exec_ctx = returned_vm.running_execution_context;
+            values = exec_ctx.slots;
+            return_value(values[3]);
+        }
+        continue_running_execution_context();
+    }
+}
+
+# Continues interpreting the running execution context at its program
+# counter, after JIT code ran.
+inline fn continue_running_execution_context() @profiling {
+    let resumed_vm = current_vm();
+    exec_ctx = resumed_vm.running_execution_context;
+    assert(exec_ctx != 0);
+    values = exec_ctx.slots;
+    let resumed_executable = exec_ctx.executable;
+    assert(resumed_executable != 0);
+    pb = resumed_executable.bytecode_data;
+    switch_dispatch_table(resumed_executable);
+    pc = exec_ctx.program_counter;
+    goto_handler(pc);
+}
+
+# Continues the running frame in its executable's JIT code after the Catch
+# that just ran, if the code has an entry there. Like at loop back edges, an
+# exit from that code resumes after the Catch, so the frame always makes
+# progress.
+inline fn enter_jit_code_after_catch() @profiling {
+    let executable = exec_ctx.executable;
+    if executable.jit_compile_state == JIT_COMPILE_STATE_INSTALLED {
+        let control: i32 = call_helper_with_two_arguments(asm_helper_enter_jit_code_after_catch, current_vm(), pc);
+        if control != 0 {
+            guard control > 0 else @cold {
+                exit;
+            };
+            continue_running_execution_context();
+        }
+    }
+}
+
+# Starts running the frame that just became the running execution context,
+# at its entry: in its executable's JIT code if it has some, and in the
+# interpreter otherwise.
+inline fn enter_new_frame(executable: Executable) {
+    enter_jit_code_if_any(executable);
+    pc = 0;
+    goto_handler(pc);
+}
+
+# Counts the executable's tier-up budget down by cost and runs the tier-up
+# policy once it is used up.
+inline fn consume_tier_up_budget(cost: i32, target_pc: u32, is_loop: u32) @profiling {
+    let executable = exec_ctx.executable;
+    sub32_mem([executable, EXECUTABLE_TIER_UP_BUDGET], cost);
+    if executable.tier_up_budget <= 0 {
+        let shifted_pc = target_pc << 1;
+        let encoded_pc = shifted_pc | is_loop;
+        # NB: When the policy moves the executable to other handlers at a
+        #     function entry, the running frame keeps its handlers until the
+        #     interpreter enters another frame. At a loop back edge, the frame
+        #     switches to them, or continues in JIT code (on-stack
+        #     replacement).
+        let control: i32 = call_helper_with_two_arguments(asm_helper_tier_up_check, current_vm(), encoded_pc);
+        if control != 0 {
+            guard control > 0 else @cold {
+                exit;
+            };
+            continue_running_execution_context();
+        }
+    }
+}
+
+# Loop back edges consume tier-up budget each time they run.
+inline fn count_loop_iteration() {
+    consume_tier_up_budget(TIER_UP_LOOP_ITERATION_COST, pc, 1);
+}
+
+# Handlers whose complete semantics live in their slow path.
 
 # Bytecode handlers are kept in native layout order.
 
 handler Enter() {
+    consume_tier_up_budget(TIER_UP_FUNCTION_ENTRY_COST, pc, 0);
     let executable = exec_ctx.executable;
     assert(executable != 0);
     let registers_and_locals_count = executable.registers_and_locals_count;
@@ -965,8 +1289,17 @@ specialize JumpStrictlyEquals(rhs: Int32);
 specialize JumpStrictlyInequals(rhs: Int32);
 specialize JumpLooselyEquals(rhs: Int32);
 specialize JumpLooselyInequals(rhs: Int32);
+specialize JumpLessThanLoop(rhs: Int32);
+specialize JumpLessThanEqualsLoop(rhs: Int32);
+specialize JumpGreaterThanLoop(rhs: Int32);
+specialize JumpGreaterThanEqualsLoop(rhs: Int32);
+specialize JumpStrictlyEqualsLoop(rhs: Int32);
+specialize JumpStrictlyInequalsLoop(rhs: Int32);
+specialize JumpLooselyEqualsLoop(rhs: Int32);
+specialize JumpLooselyInequalsLoop(rhs: Int32);
 
 handler Add(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -974,6 +1307,7 @@ handler Add(
     let lhs_value = load(lhs);
     let rhs_value = load(rhs);
     let slow = || @cold {
+        record_arith_operands_feedback(arith_feedback, lhs_value, rhs_value);
         call_binary_slow_path(add_values, dst, lhs_value, rhs_value);
     };
     let add_double = |lhs: f64, rhs: f64| @cold {
@@ -985,13 +1319,16 @@ handler Add(
             match rhs_value {
                 Value<i32>(rhs_integer) => {
                     guard let sum = checked_add(lhs_integer, rhs_integer) else @cold {
+                        record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
                         store(dst, box_f64(to_f64(lhs_integer) + to_f64(rhs_integer)));
                         dispatch_next;
                     };
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
                     store(dst, box_i32(sum));
                     dispatch_next;
                 },
                 Value<f64>(rhs_double) => @cold {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                     goto add_double(to_f64(lhs_integer), rhs_double);
                 },
                 _ => slow,
@@ -1000,9 +1337,11 @@ handler Add(
         Value<f64>(lhs_double) => @cold {
             match rhs_value {
                 Value<i32>(rhs_integer) => {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                     goto add_double(lhs_double, to_f64(rhs_integer));
                 },
                 Value<f64>(rhs_double) => {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_DOUBLE);
                     goto add_double(lhs_double, rhs_double);
                 },
                 _ => slow,
@@ -1013,6 +1352,7 @@ handler Add(
 }
 
 handler Sub(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -1020,6 +1360,7 @@ handler Sub(
     let lhs_value = load(lhs);
     let rhs_value = load(rhs);
     let slow = || @cold {
+        record_arith_operands_feedback(arith_feedback, lhs_value, rhs_value);
         call_binary_slow_path(sub_values, dst, lhs_value, rhs_value);
     };
     let subtract_double = |lhs: f64, rhs: f64| @cold {
@@ -1031,13 +1372,16 @@ handler Sub(
             match rhs_value {
                 Value<i32>(rhs_integer) => {
                     guard let difference = checked_sub(lhs_integer, rhs_integer) else @cold {
+                        record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
                         store(dst, box_f64(to_f64(lhs_integer) - to_f64(rhs_integer)));
                         dispatch_next;
                     };
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
                     store(dst, box_i32(difference));
                     dispatch_next;
                 },
                 Value<f64>(rhs_double) => @cold {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                     goto subtract_double(to_f64(lhs_integer), rhs_double);
                 },
                 _ => slow,
@@ -1046,9 +1390,11 @@ handler Sub(
         Value<f64>(lhs_double) => @cold {
             match rhs_value {
                 Value<i32>(rhs_integer) => {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                     goto subtract_double(lhs_double, to_f64(rhs_integer));
                 },
                 Value<f64>(rhs_double) => {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_DOUBLE);
                     goto subtract_double(lhs_double, rhs_double);
                 },
                 _ => slow,
@@ -1059,6 +1405,7 @@ handler Sub(
 }
 
 handler Mul(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -1066,6 +1413,7 @@ handler Mul(
     let lhs_value = load(lhs);
     let rhs_value = load(rhs);
     let slow = || @cold {
+        record_arith_operands_feedback(arith_feedback, lhs_value, rhs_value);
         call_binary_slow_path(mul_values, dst, lhs_value, rhs_value);
     };
     let multiply_double = |lhs: f64, rhs: f64| @cold {
@@ -1077,10 +1425,12 @@ handler Mul(
             match rhs_value {
                 Value<i32>(rhs_integer) => {
                     let negative_zero = || @cold {
+                        record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
                         store(dst, Value<NegativeZero>);
                         dispatch_next;
                     };
                     guard let product = checked_mul(lhs_integer, rhs_integer) else @cold {
+                        record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
                         store(dst, box_f64(to_f64(lhs_integer) * to_f64(rhs_integer)));
                         dispatch_next;
                     };
@@ -1089,10 +1439,12 @@ handler Mul(
                         guard sign_check >= 0 else negative_zero;
                     }
 
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
                     store(dst, box_i32(product));
                     dispatch_next;
                 },
                 Value<f64>(rhs_double) => @cold {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                     goto multiply_double(to_f64(lhs_integer), rhs_double);
                 },
                 _ => slow,
@@ -1101,9 +1453,11 @@ handler Mul(
         Value<f64>(lhs_double) => @cold {
             match rhs_value {
                 Value<i32>(rhs_integer) => {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_AND_DOUBLE);
                     goto multiply_double(lhs_double, to_f64(rhs_integer));
                 },
                 Value<f64>(rhs_double) => {
+                    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_DOUBLE);
                     goto multiply_double(lhs_double, rhs_double);
                 },
                 _ => slow,
@@ -1114,11 +1468,15 @@ handler Mul(
 }
 
 handler Exp(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
 ) @cold {
-    call_binary_slow_path(exp_values, dst, load(lhs), load(rhs));
+    let lhs_value = load(lhs);
+    let rhs_value = load(rhs);
+    record_arith_operands_feedback(arith_feedback, lhs_value, rhs_value);
+    call_binary_slow_path(exp_values, dst, lhs_value, rhs_value);
 }
 
 handler ConcatString(
@@ -1155,11 +1513,11 @@ handler Jump(
     target: BytecodeOffset
 ) @terminator = jump(target);
 
-handler JumpIf(
+inline fn jump_if(
     condition: in Operand,
     true_target: BytecodeOffset,
     false_target: BytecodeOffset
-) @terminator {
+) {
     let value = load(condition);
     let take_false = || {
         jump(false_target);
@@ -1191,10 +1549,16 @@ handler JumpIf(
     }
 }
 
-handler JumpTrue(
+handler JumpIf(
+    condition: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator = jump_if(condition, true_target, false_target);
+
+inline fn jump_true(
     condition: in Operand,
     target: BytecodeOffset
-) @terminator {
+) {
     let value = load(condition);
     let take = || {
         jump(target);
@@ -1223,10 +1587,15 @@ handler JumpTrue(
     }
 }
 
-handler JumpFalse(
+handler JumpTrue(
     condition: in Operand,
     target: BytecodeOffset
-) @terminator {
+) @terminator @fallthrough = jump_true(condition, target);
+
+inline fn jump_false(
+    condition: in Operand,
+    target: BytecodeOffset
+) {
     let value = load(condition);
     let take = || {
         jump(target);
@@ -1255,6 +1624,11 @@ handler JumpFalse(
     }
 }
 
+handler JumpFalse(
+    condition: in Operand,
+    target: BytecodeOffset
+) @terminator @fallthrough = jump_false(condition, target);
+
 handler JumpNullish(
     condition: in Operand,
     true_target: BytecodeOffset,
@@ -1278,6 +1652,7 @@ handler JumpUndefined(
 }
 
 handler JumpLessThan(
+    arith_feedback: ArithFeedbackIndex,
     lhs: in Operand,
     rhs: in Operand,
     true_target: BytecodeOffset,
@@ -1289,10 +1664,12 @@ handler JumpLessThan(
     false_target,
     branch_lt_signed,
     branch_fp_less,
-    jump_less_than_values
+    jump_less_than_values,
+    arith_feedback
 );
 
 handler JumpGreaterThan(
+    arith_feedback: ArithFeedbackIndex,
     lhs: in Operand,
     rhs: in Operand,
     true_target: BytecodeOffset,
@@ -1304,10 +1681,12 @@ handler JumpGreaterThan(
     false_target,
     branch_gt_signed,
     branch_fp_greater,
-    jump_greater_than_values
+    jump_greater_than_values,
+    arith_feedback
 );
 
 handler JumpLessThanEquals(
+    arith_feedback: ArithFeedbackIndex,
     lhs: in Operand,
     rhs: in Operand,
     true_target: BytecodeOffset,
@@ -1319,10 +1698,12 @@ handler JumpLessThanEquals(
     false_target,
     branch_le_signed,
     branch_fp_less_or_equal,
-    jump_less_than_equals_values
+    jump_less_than_equals_values,
+    arith_feedback
 );
 
 handler JumpGreaterThanEquals(
+    arith_feedback: ArithFeedbackIndex,
     lhs: in Operand,
     rhs: in Operand,
     true_target: BytecodeOffset,
@@ -1334,10 +1715,12 @@ handler JumpGreaterThanEquals(
     false_target,
     branch_ge_signed,
     branch_fp_greater_or_equal,
-    jump_greater_than_equals_values
+    jump_greater_than_equals_values,
+    arith_feedback
 );
 
 handler JumpLooselyEquals(
+    arith_feedback: ArithFeedbackIndex,
     lhs: in Operand,
     rhs: in Operand,
     true_target: BytecodeOffset,
@@ -1348,10 +1731,12 @@ handler JumpLooselyEquals(
     true_target,
     false_target,
     loose_equality,
-    jump_loosely_equals_values
+    jump_loosely_equals_values,
+    arith_feedback
 );
 
 handler JumpLooselyInequals(
+    arith_feedback: ArithFeedbackIndex,
     lhs: in Operand,
     rhs: in Operand,
     true_target: BytecodeOffset,
@@ -1362,10 +1747,12 @@ handler JumpLooselyInequals(
     true_target,
     false_target,
     loose_inequality,
-    jump_loosely_inequals_values
+    jump_loosely_inequals_values,
+    arith_feedback
 );
 
 handler JumpStrictlyEquals(
+    arith_feedback: ArithFeedbackIndex,
     lhs: in Operand,
     rhs: in Operand,
     true_target: BytecodeOffset,
@@ -1376,10 +1763,12 @@ handler JumpStrictlyEquals(
     true_target,
     false_target,
     strict_equality,
-    jump_strictly_equals_values
+    jump_strictly_equals_values,
+    arith_feedback
 );
 
 handler JumpStrictlyInequals(
+    arith_feedback: ArithFeedbackIndex,
     lhs: in Operand,
     rhs: in Operand,
     true_target: BytecodeOffset,
@@ -1390,16 +1779,210 @@ handler JumpStrictlyInequals(
     true_target,
     false_target,
     strict_inequality,
-    jump_strictly_inequals_values
+    jump_strictly_inequals_values,
+    arith_feedback
 );
 
+# Loop back edges. The bytecode generator emits these variants for jumps to
+# an earlier block, and they consume tier-up budget each time they run.
+
+handler JumpLoop(
+    target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump(target);
+}
+
+handler JumpIfLoop(
+    condition: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_if(condition, true_target, false_target);
+}
+
+handler JumpTrueLoop(
+    condition: in Operand,
+    target: BytecodeOffset
+) @terminator @fallthrough {
+    count_loop_iteration();
+    jump_true(condition, target);
+}
+
+handler JumpFalseLoop(
+    condition: in Operand,
+    target: BytecodeOffset
+) @terminator @fallthrough {
+    count_loop_iteration();
+    jump_false(condition, target);
+}
+
+handler JumpLessThanLoop(
+    arith_feedback: ArithFeedbackIndex,
+    lhs: in Operand,
+    rhs: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_relational(
+        load(lhs),
+        load(rhs),
+        true_target,
+        false_target,
+        branch_lt_signed,
+        branch_fp_less,
+        jump_less_than_values,
+        arith_feedback
+    );
+}
+
+handler JumpGreaterThanLoop(
+    arith_feedback: ArithFeedbackIndex,
+    lhs: in Operand,
+    rhs: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_relational(
+        load(lhs),
+        load(rhs),
+        true_target,
+        false_target,
+        branch_gt_signed,
+        branch_fp_greater,
+        jump_greater_than_values,
+        arith_feedback
+    );
+}
+
+handler JumpLessThanEqualsLoop(
+    arith_feedback: ArithFeedbackIndex,
+    lhs: in Operand,
+    rhs: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_relational(
+        load(lhs),
+        load(rhs),
+        true_target,
+        false_target,
+        branch_le_signed,
+        branch_fp_less_or_equal,
+        jump_less_than_equals_values,
+        arith_feedback
+    );
+}
+
+handler JumpGreaterThanEqualsLoop(
+    arith_feedback: ArithFeedbackIndex,
+    lhs: in Operand,
+    rhs: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_relational(
+        load(lhs),
+        load(rhs),
+        true_target,
+        false_target,
+        branch_ge_signed,
+        branch_fp_greater_or_equal,
+        jump_greater_than_equals_values,
+        arith_feedback
+    );
+}
+
+handler JumpLooselyEqualsLoop(
+    arith_feedback: ArithFeedbackIndex,
+    lhs: in Operand,
+    rhs: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_equality(
+        load(lhs),
+        load(rhs),
+        true_target,
+        false_target,
+        loose_equality,
+        jump_loosely_equals_values,
+        arith_feedback
+    );
+}
+
+handler JumpLooselyInequalsLoop(
+    arith_feedback: ArithFeedbackIndex,
+    lhs: in Operand,
+    rhs: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_equality(
+        load(lhs),
+        load(rhs),
+        true_target,
+        false_target,
+        loose_inequality,
+        jump_loosely_inequals_values,
+        arith_feedback
+    );
+}
+
+handler JumpStrictlyEqualsLoop(
+    arith_feedback: ArithFeedbackIndex,
+    lhs: in Operand,
+    rhs: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_equality(
+        load(lhs),
+        load(rhs),
+        true_target,
+        false_target,
+        strict_equality,
+        jump_strictly_equals_values,
+        arith_feedback
+    );
+}
+
+handler JumpStrictlyInequalsLoop(
+    arith_feedback: ArithFeedbackIndex,
+    lhs: in Operand,
+    rhs: in Operand,
+    true_target: BytecodeOffset,
+    false_target: BytecodeOffset
+) @terminator {
+    count_loop_iteration();
+    jump_equality(
+        load(lhs),
+        load(rhs),
+        true_target,
+        false_target,
+        strict_inequality,
+        jump_strictly_inequals_values,
+        arith_feedback
+    );
+}
+
 handler Increment(
+    arith_feedback: ArithFeedbackIndex,
     dst: inout Operand
-) = update_operand(dst, checked_add, add_f64, increment);
+) = update_operand(dst, checked_add, add_f64, increment, arith_feedback);
 
 handler Decrement(
+    arith_feedback: ArithFeedbackIndex,
     dst: inout Operand
-) = update_operand(dst, checked_sub, sub_f64, decrement);
+) = update_operand(dst, checked_sub, sub_f64, decrement, arith_feedback);
 
 handler Not(
     dst: out Operand,
@@ -1455,10 +2038,14 @@ handler ToBoolean(
 }
 
 handler Catch(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand
 ) {
-    store(dst, exec_ctx.exception);
+    let exception = exec_ctx.exception;
+    record_value_feedback(value_feedback, exception);
+    store(dst, exception);
     exec_ctx.exception = Value<Empty>;
+    enter_jit_code_after_catch();
     dispatch_next;
 }
 
@@ -1515,6 +2102,7 @@ handler SetLexicalEnvironment(
 }
 
 handler GetBinding(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     identifier: IdentifierTableIndex,
     cache: EnvironmentCoordinate
@@ -1524,11 +2112,13 @@ handler GetBinding(
     guard let value = load_initialized_binding(environment.binding_values, binding_index) else @cold {
         call_slow_path(get_binding);
     };
+    record_value_feedback(value_feedback, value);
     store(dst, value);
     dispatch_next;
 }
 
 handler DynamicGetBinding(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     identifier: IdentifierTableIndex,
     cache: EnvironmentCoordinateCacheIndex
@@ -1543,22 +2133,27 @@ handler DynamicGetBinding(
         hops
     ) else slow;
     guard let value = load_initialized_binding(environment.binding_values, binding_index) else slow;
+    record_value_feedback(value_feedback, value);
     store(dst, value);
     dispatch_next;
 }
 
 handler GetInitializedBinding(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     identifier: IdentifierTableIndex,
     cache: EnvironmentCoordinate
 ) {
     let [environment, binding_index] =
         walk_environment_chain(exec_ctx.lexical_environment, cache);
-    store(dst, environment.binding_values[binding_index]);
+    let value = environment.binding_values[binding_index];
+    record_value_feedback(value_feedback, value);
+    store(dst, value);
     dispatch_next;
 }
 
 handler DynamicGetInitializedBinding(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     identifier: IdentifierTableIndex,
     cache: EnvironmentCoordinateCacheIndex
@@ -1572,7 +2167,9 @@ handler DynamicGetInitializedBinding(
         exec_ctx.lexical_environment,
         hops
     ) else slow;
-    store(dst, environment.binding_values[binding_index]);
+    let value = environment.binding_values[binding_index];
+    record_value_feedback(value_feedback, value);
+    store(dst, value);
     dispatch_next;
 }
 
@@ -1687,6 +2284,12 @@ handler ResolveSuperBase(
     dst: out Operand
 ) @cold = call_slow_path(resolve_super_base);
 
+handler GetResolvedBinding(
+    dst: out Operand,
+    environment: Operand,
+    identifier: IdentifierTableIndex
+) @cold = call_slow_path(get_resolved_binding);
+
 handler SetResolvedBinding(
     environment: Operand,
     identifier: IdentifierTableIndex,
@@ -1704,6 +2307,14 @@ handler DynamicTypeofBinding(
     identifier: IdentifierTableIndex,
     cache: EnvironmentCoordinateCacheIndex
 ) @cold = call_slow_path(dynamic_typeof_binding);
+
+# `typeof` of a global variable, which finds it through the global variable
+# cache of GetGlobal, and is "undefined" for unresolvable ones.
+handler TypeofGlobal(
+    dst: out Operand,
+    identifier: IdentifierTableIndex,
+    cache: GlobalVariableCacheIndex
+) @cold = call_slow_path(typeof_global);
 
 handler VerifyEnvironmentCoordinate(
     identifier: IdentifierTableIndex,
@@ -1748,17 +2359,20 @@ handler EnterObjectEnvironment(
 ) @cold = call_slow_path(enter_object_environment);
 
 handler PostfixIncrement(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     src: inout Operand
-) = post_update_operand(dst, src, checked_add, add_f64, postfix_increment);
+) = post_update_operand(dst, src, checked_add, add_f64, postfix_increment, arith_feedback);
 
 handler Div(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
 ) {
     let lhs = load(lhs);
     let rhs = load(rhs);
+    record_arith_operands_feedback(arith_feedback, lhs, rhs);
 
     guard let [lhs_number, rhs_number] = numeric_pair_to_f64(lhs, rhs) else @cold {
         call_binary_slow_path(div_values, dst, lhs, rhs);
@@ -1781,12 +2395,14 @@ handler Div(
     };
 
     let store_f64 = || {
+        record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
         store(dst, canonicalize_nan(quotient));
         dispatch_next;
     };
 }
 
 handler LessThan(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -1796,10 +2412,12 @@ handler LessThan(
     load(rhs),
     branch_lt_signed,
     branch_fp_less,
-    less_than_values
+    less_than_values,
+    arith_feedback
 );
 
 handler LessThanEquals(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -1809,10 +2427,12 @@ handler LessThanEquals(
     load(rhs),
     branch_le_signed,
     branch_fp_less_or_equal,
-    less_than_equals_values
+    less_than_equals_values,
+    arith_feedback
 );
 
 handler GreaterThan(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -1822,10 +2442,12 @@ handler GreaterThan(
     load(rhs),
     branch_gt_signed,
     branch_fp_greater,
-    greater_than_values
+    greater_than_values,
+    arith_feedback
 );
 
 handler GreaterThanEquals(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -1835,32 +2457,38 @@ handler GreaterThanEquals(
     load(rhs),
     branch_ge_signed,
     branch_fp_greater_or_equal,
-    greater_than_equals_values
+    greater_than_equals_values,
+    arith_feedback
 );
 
 handler BitwiseXor(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
-) = bitwise_binary(dst, load(lhs), load(rhs), xor, bitwise_xor_values);
+) = bitwise_binary(dst, load(lhs), load(rhs), xor, bitwise_xor_values, arith_feedback);
 
 handler UnaryPlus(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     src: in Operand
 ) {
     let value = load(src);
     match value {
         Value<i32> => {
+            record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
             store(dst, value);
             dispatch_next;
         },
 
         Value<f64> => @cold {
+            record_arith_feedback(arith_feedback, ARITH_FEEDBACK_DOUBLE);
             store(dst, value);
             dispatch_next;
         },
 
         _ => @cold {
+            record_arith_operand_feedback(arith_feedback, value);
             call_slow_path(unary_plus);
         },
     }
@@ -1895,6 +2523,14 @@ handler ThrowIfNullish(
 
 handler ThrowConstAssignment() @cold = call_slow_path(throw_const_assignment);
 
+handler ThrowNotAFunction(
+    src: Operand
+) @cold = call_slow_path(throw_not_a_function);
+
+handler GetArgumentCount(
+    dst: out Operand
+) @cold = call_slow_path(get_argument_count);
+
 handler Throw(
     src: Operand
 ) @terminator @cold = call_slow_path(throw);
@@ -1923,8 +2559,15 @@ handler ToString(
 
 handler ToPrimitiveWithStringHint(
     dst: out Operand,
-    value: Operand
-) @cold = call_slow_path(to_primitive_with_string_hint);
+    value: in Operand
+) {
+    let primitive = load(value);
+    guard primitive is not Value<Object> else @cold {
+        call_slow_path(to_primitive_with_string_hint);
+    };
+    store(dst, primitive);
+    dispatch_next;
+}
 
 handler ToObject(
     dst: out Operand,
@@ -1937,47 +2580,56 @@ handler ToLength(
 ) @cold = call_slow_path(to_length);
 
 handler BitwiseNot(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     src: in Operand
 ) {
-    match load(src) {
+    let value = load(src);
+    match value {
         Value<i32>(integer) => {
+            record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
             let result = ~integer;
             store(dst, box_i32(result));
             dispatch_next;
         },
 
         _ => @cold {
+            record_arith_operand_feedback(arith_feedback, value);
             call_slow_path(bitwise_not);
         },
     }
 }
 
 handler BitwiseAnd(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
-) = bitwise_binary(dst, load(lhs), load(rhs), and, bitwise_and_values);
+) = bitwise_binary(dst, load(lhs), load(rhs), and, bitwise_and_values, arith_feedback);
 
 handler BitwiseOr(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
-) = bitwise_binary(dst, load(lhs), load(rhs), or, bitwise_or_values);
+) = bitwise_binary(dst, load(lhs), load(rhs), or, bitwise_or_values, arith_feedback);
 
 handler LeftShift(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
-) = signed_shift(dst, load(lhs), load(rhs), shl, left_shift_values);
+) = signed_shift(dst, load(lhs), load(rhs), shl, left_shift_values, arith_feedback);
 
 handler RightShift(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
-) = signed_shift(dst, load(lhs), load(rhs), sar, right_shift_values);
+) = signed_shift(dst, load(lhs), load(rhs), sar, right_shift_values, arith_feedback);
 
 handler UnsignedRightShift(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -1986,6 +2638,7 @@ handler UnsignedRightShift(
     let rhs = load(rhs);
 
     let slow = || @cold {
+        record_arith_operands_feedback(arith_feedback, lhs, rhs);
         call_binary_slow_path(unsigned_right_shift_values, dst, lhs, rhs);
     };
 
@@ -1993,18 +2646,21 @@ handler UnsignedRightShift(
     guard let mut Value<i32>(count) = rhs else slow;
     let mut value = u32(integer);
     let as_double = || @cold {
+        record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
         store(dst, box_f64(u32_to_f64(value)));
         dispatch_next;
     };
     count = count & 31;
     value = value >> u32(count);
     branch_bit_set(value, 31, as_double);
+    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
     store(dst, box_i32(assume_i32(value)));
     dispatch_next;
 
 }
 
 handler Mod(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -2013,16 +2669,20 @@ handler Mod(
 
     let slow = || @cold {
         let rhs_value = load(rhs);
+        record_arith_operands_feedback(arith_feedback, lhs, rhs_value);
         call_binary_slow_path(mod_values, dst, lhs, rhs_value);
     };
 
     let try_int64 = || @cold {
+        let rhs_value = load(rhs);
+        record_arith_operands_feedback(arith_feedback, lhs, rhs_value);
         guard let lhs_integer = integer_value_to_i64(lhs) else slow;
         guard let rhs_integer = integer_value_to_i64(load(rhs)) else slow;
         guard rhs_integer != 0 else slow;
 
         let zero = || @cold {
             let negative_zero = || @cold {
+                record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
                 store(dst, Value<NegativeZero>);
                 dispatch_next;
             };
@@ -2053,12 +2713,14 @@ handler Mod(
     guard let Value<i32>(rhs_int) = load(rhs) else try_int64;
     guard rhs_int != 0 else slow;
     guard lhs_int >= 0 else try_int64;
+    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
     let [_, remainder] = divmod(lhs_int, rhs_int);
     store(dst, box_i32(remainder));
     dispatch_next;
 }
 
 handler StrictlyEquals(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -2067,10 +2729,12 @@ handler StrictlyEquals(
     load(lhs),
     load(rhs),
     strict_equality,
-    strictly_equals_values
+    strictly_equals_values,
+    arith_feedback
 );
 
 handler StrictlyInequals(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -2079,10 +2743,12 @@ handler StrictlyInequals(
     load(lhs),
     load(rhs),
     strict_inequality,
-    strictly_inequals_values
+    strictly_inequals_values,
+    arith_feedback
 );
 
 handler GetCalleeAndThisFromEnvironment(
+    value_feedback: ValueFeedbackIndex,
     callee: out Operand,
     this_value: out Operand,
     identifier: IdentifierTableIndex,
@@ -2093,12 +2759,14 @@ handler GetCalleeAndThisFromEnvironment(
     guard let value = load_initialized_binding(environment.binding_values, binding_index) else @cold {
         call_slow_path(get_callee_and_this);
     };
+    record_value_feedback(value_feedback, value);
     store(callee, value);
     store(this_value, Value<Undefined>);
     dispatch_next;
 }
 
 handler DynamicGetCalleeAndThisFromEnvironment(
+    value_feedback: ValueFeedbackIndex,
     callee: out Operand,
     this_value: out Operand,
     identifier: IdentifierTableIndex,
@@ -2114,12 +2782,14 @@ handler DynamicGetCalleeAndThisFromEnvironment(
         hops
     ) else slow;
     guard let value = load_initialized_binding(environment.binding_values, binding_index) else slow;
+    record_value_feedback(value_feedback, value);
     store(callee, value);
     store(this_value, Value<Undefined>);
     dispatch_next;
 }
 
 handler LooselyEquals(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -2128,10 +2798,12 @@ handler LooselyEquals(
     load(lhs),
     load(rhs),
     loose_equality,
-    loosely_equals_values
+    loosely_equals_values,
+    arith_feedback
 );
 
 handler LooselyInequals(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     lhs: in Operand,
     rhs: in Operand
@@ -2140,10 +2812,12 @@ handler LooselyInequals(
     load(lhs),
     load(rhs),
     loose_inequality,
-    loosely_inequals_values
+    loosely_inequals_values,
+    arith_feedback
 );
 
 handler UnaryMinus(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     src: in Operand
 ) {
@@ -2152,11 +2826,13 @@ handler UnaryMinus(
     match value {
         Value<i32>(mut integer) => {
             let negative_zero = || @cold {
+                record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
                 store(dst, Value<NegativeZero>);
                 dispatch_next;
             };
 
             let overflow = || @cold {
+                record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32_OVERFLOW);
                 neg(integer);
                 let unsigned_integer: u32 = alias(integer);
                 store(dst, box_f64(u32_to_f64(unsigned_integer)));
@@ -2165,28 +2841,33 @@ handler UnaryMinus(
 
             guard integer != 0 else negative_zero;
             neg32_overflow(integer) else overflow;
+            record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
             store(dst, box_i32(integer));
             dispatch_next;
         },
 
         Value<f64> => @cold {
+            record_arith_feedback(arith_feedback, ARITH_FEEDBACK_DOUBLE);
             toggle_bit(value, 63);
             store(dst, value);
             dispatch_next;
         },
 
         _ => @cold {
+            record_arith_operand_feedback(arith_feedback, value);
             call_slow_path(unary_minus);
         },
     }
 }
 
 handler PostfixDecrement(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     src: inout Operand
-) = post_update_operand(dst, src, checked_sub, sub_f64, postfix_decrement);
+) = post_update_operand(dst, src, checked_sub, sub_f64, postfix_decrement, arith_feedback);
 
 handler ToInt32(
+    arith_feedback: ArithFeedbackIndex,
     dst: out Operand,
     value: in Operand
 ) {
@@ -2197,29 +2878,59 @@ handler ToInt32(
 
     let tag = extract_tag(loaded_value);
     guard tag == INT32_TAG else @cold {
+        record_arith_operand_feedback(arith_feedback, loaded_value);
         guard let integer = numeric_value_to_i32(load(value)) else slow;
         store(dst, box_i32(integer));
         dispatch_next;
     };
 
+    record_arith_feedback(arith_feedback, ARITH_FEEDBACK_INT32);
     store(dst, loaded_value);
     dispatch_next;
 }
 
 handler PutByValue(
+    keyed_feedback: KeyedFeedbackIndex,
     base: in Operand,
     property: in Operand,
     src: in Operand,
     kind: PutKind,
-    base_identifier: Optional<IdentifierTableIndex>
+    base_identifier: Optional<IdentifierTableIndex>,
+    cache: PropertyLookupCacheIndex
 ) {
     let slow = || @cold {
         call_slow_path(put_by_value);
     };
 
+    let slow_without_cache = || @cold {
+        call_slow_path(put_by_value_uncached);
+    };
+
+    let try_cache = || @cold {
+        guard call_interp(asm_try_put_by_value_cache) == 0 else slow;
+        dispatch_next;
+    };
+
     guard load(kind) == PUT_KIND_NORMAL else slow;
+    let key = load(property);
+    guard extract_tag(key) == INT32_TAG else {
+        # Keys that are not array indices: the property lookup cache remembers the shapes and keys it has
+        # seen, and matches string and symbol keys by identity.
+        guard let property_cache = load_keyed_property_lookup_cache(cache, slow_without_cache) else slow;
+        guard let Value<Object>(object) = load(base) else slow;
+        guard property_cache.key is key else try_cache;
+        let shape = object.shape;
+        guard property_cache.shape == shape else try_cache;
+        guard property_cache.prototype == 0 else try_cache;
+        guard property_cache.shape_dictionary_generation == shape.dictionary_generation else try_cache;
+        # NB: Addition entries have no slot at their offset.
+        guard property_cache.writes_data_property != 0 else try_cache;
+        guard object.named_properties[property_cache.property_offset] is not Value<Accessor> else try_cache;
+        object.named_properties[property_cache.property_offset] = load(src);
+        dispatch_next;
+    };
     guard let Value<Object>(object) = load(base) else slow;
-    guard let index = array_index(load(property)) else slow;
+    let index = u32(unbox_i32(key));
     let flags = object.flags;
     if flags lacks OBJECT_FLAG_IS_TYPED_ARRAY {
         let try_holey_array_slow = || @cold {
@@ -2236,6 +2947,7 @@ handler PutByValue(
                 # The size above lives on the object while the capacity lives with the buffer, so
                 # bound the access by the buffer that is really being addressed.
                 guard index < indexed_elements.capacity else slow;
+                record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_INT32_INDEX_PACKED);
                 indexed_elements[index] = load(src);
                 dispatch_next;
             },
@@ -2246,6 +2958,7 @@ handler PutByValue(
                 guard indexed_elements != 0 else try_holey_array_slow;
                 guard index < indexed_elements.capacity else try_holey_array_slow;
                 guard indexed_elements[index] is not Value<Empty> else try_holey_array_slow;
+                record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_INT32_INDEX_HOLEY);
                 indexed_elements[index] = load(src);
                 dispatch_next;
             },
@@ -2264,6 +2977,7 @@ handler PutByValue(
     let elements = primitive_storage_cage_base();
     guard index < object.typed_array_array_length else slow;
     let typed_array_kind = object.typed_array_kind;
+    record_typed_array_keyed_feedback(elements, keyed_feedback, typed_array_kind);
     let source = load(src);
     let store_non_integer = || {
         match typed_array_kind {
@@ -2387,6 +3101,7 @@ handler PutByValue(
 }
 
 handler GetById(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     base: in Operand,
     property: PropertyKeyTableIndex,
@@ -2401,6 +3116,7 @@ handler GetById(
         let result: Value = call_helper_with_two_arguments(asm_try_get_by_id_cache, load(base), cache_pointer);
         guard result is not Value<Empty> else slow;
         store(dst, result);
+        record_value_feedback(value_feedback, result);
         dispatch_next;
     };
 
@@ -2419,6 +3135,7 @@ handler GetById(
         let inline_executable = exec_ctx.executable;
         assert(inline_executable != 0);
         pb = inline_executable.bytecode_data;
+        switch_dispatch_table(inline_executable);
         pc = 0;
         goto_handler(pc);
     };
@@ -2427,7 +3144,9 @@ handler GetById(
         let accessor: Accessor = unbox_object(accessor_value);
         let getter = accessor.getter;
         guard getter != 0 else {
-            store(dst, Value<Undefined>);
+            let produced: Value = Value<Undefined>;
+            record_value_feedback(value_feedback, produced);
+            store(dst, produced);
             dispatch_next;
         };
         let function: Object = alias(getter);
@@ -2435,8 +3154,9 @@ handler GetById(
         guard flags has OBJECT_FLAG_IS_RAW_NATIVE_FUNCTION else invoke_accessor_slow;
 
         if flags has OBJECT_FLAG_IS_DIRECT_GETTER_FUNCTION {
-            if property_cache.direct_getter_validated != 0 {
+            if property_cache.getter == getter {
                 guard let result = load_direct_getter_value(function, receiver_object) else invoke_accessor_slow;
+                record_value_feedback(value_feedback, result);
                 store(dst, result);
                 dispatch_next;
             }
@@ -2446,7 +3166,7 @@ handler GetById(
         let raw_native_function: RawNativeFunction = alias(function);
         let native_function_index = raw_native_function.native_function_index;
         let native_table_vm = current_vm();
-        let native_function_entry = &native_table_vm.native_function_table[native_function_index];
+        let native_function_entry = &native_table_vm.native_function_table[native_function_index & NATIVE_FUNCTION_TABLE_INDEX_MASK];
         let native_function_type = native_function_entry.type;
         assert(native_function_type < NATIVE_FUNCTION_TYPE_COUNT);
 
@@ -2489,6 +3209,8 @@ handler GetById(
         native_frame.yield_value_is_iterator_result = false;
         native_frame.caller_is_construct = false;
         native_frame.frame_initialized = false;
+        native_frame.returns_to_native_caller = false;
+        native_frame.runs_jit_code = false;
         let native_pc: u32 = pc;
         let [destination_offset, _] = load_pair32(
             [pb, pc, dst],
@@ -2510,8 +3232,9 @@ handler GetById(
         assert(variant < 2);
         guard variant == 0 else @cold {
             let helper_argument = native_payload;
-            let exception_pc: i32 = call_helper(
+            let exception_pc: i32 = call_helper_with_two_arguments(
                 asm_helper_handle_raw_native_exception,
+                current_vm(),
                 helper_argument
             );
             guard exception_pc >= 0 else @cold {
@@ -2524,6 +3247,7 @@ handler GetById(
             let exception_executable = exec_ctx.executable;
             assert(exception_executable != 0);
             pb = exception_executable.bytecode_data;
+            switch_dispatch_table(exception_executable);
             pc = exec_ctx.program_counter;
             goto_handler(pc);
         };
@@ -2534,19 +3258,68 @@ handler GetById(
         return_vm.interpreter_stack_top = alias(exec_ctx);
         exec_ctx = caller_frame;
         values = exec_ctx.slots;
+        record_value_feedback(value_feedback, native_payload);
         store(dst, native_payload);
         dispatch_next;
     };
 
-    guard let Value<Object>(object) = load(base) else try_cache;
+    # The other entries of a polymorphic cache (the first one did not match). Accessors and missing
+    # properties are left to the runtime's probe.
+    let try_polymorphic_entries = |object: Object, shape: Shape| {
+        let polymorphic_executable = exec_ctx.executable;
+        let tagged_cache: u64 = alias(polymorphic_executable.property_lookup_caches[load(cache)]);
+        let cache_tag = tagged_cache & PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK;
+        guard cache_tag == PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG else try_cache;
+        let first_entry: u64 = tagged_cache & PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK;
+        let second_entry_address: u64 = first_entry + PROPERTY_LOOKUP_CACHE_ENTRY_SIZE;
+        let second_entry: PropertyLookupCache = alias(second_entry_address);
+        guard second_entry.shape != shape else use_polymorphic_entry(object, second_entry, shape);
+        let third_entry_address: u64 = second_entry_address + PROPERTY_LOOKUP_CACHE_ENTRY_SIZE;
+        let third_entry: PropertyLookupCache = alias(third_entry_address);
+        guard third_entry.shape != shape else use_polymorphic_entry(object, third_entry, shape);
+        let fourth_entry_address: u64 = third_entry_address + PROPERTY_LOOKUP_CACHE_ENTRY_SIZE;
+        let fourth_entry: PropertyLookupCache = alias(fourth_entry_address);
+        guard fourth_entry.shape != shape else use_polymorphic_entry(object, fourth_entry, shape);
+        goto try_cache;
+    };
+
+    let use_polymorphic_entry = |object: Object, entry: PropertyLookupCache, shape: Shape| {
+        guard entry.entry_type != PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_MISSING_PROPERTY else try_cache;
+        guard entry.shape_dictionary_generation == shape.dictionary_generation else try_cache;
+        let entry_prototype = entry.prototype;
+        guard entry_prototype == 0 else @cold {
+            let entry_prototype_chain_validity = entry.prototype_chain_validity;
+            guard entry_prototype_chain_validity != 0 else try_cache;
+            guard entry_prototype_chain_validity.valid != 0 else try_cache;
+            goto load_polymorphic_value(entry_prototype, entry);
+        };
+        goto load_polymorphic_value(object, entry);
+    };
+
+    let load_polymorphic_value = |holder: Object, entry: PropertyLookupCache| {
+        let polymorphic_value = holder.named_properties[entry.property_offset];
+        guard polymorphic_value is not Value<Accessor> else try_cache;
+        record_value_feedback(value_feedback, polymorphic_value);
+        store(dst, polymorphic_value);
+        dispatch_next;
+    };
+
+    # Primitive bases find their properties through the prototype of their kind, which the cache remembers.
+    let try_primitive = || @cold {
+        guard call_interp(asm_try_get_by_id_cache_on_primitive) == 0 else slow;
+        dispatch_next;
+    };
+
+    guard let Value<Object>(object) = load(base) else try_primitive;
     let shape = object.shape;
     guard let property_cache = load_property_lookup_cache(cache) else try_cache;
-    guard property_cache.shape == shape else try_cache;
+    guard property_cache.shape == shape else try_polymorphic_entries(object, shape);
     guard property_cache.entry_type != PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_MISSING_PROPERTY else try_cache;
     let load_cached_value = |holder: Object, object: Object, property_cache: PropertyLookupCache, shape: Shape| {
         guard property_cache.shape_dictionary_generation == shape.dictionary_generation else try_cache;
         let value = holder.named_properties[property_cache.property_offset];
         guard value is not Value<Accessor> else invoke_accessor(value, object, property_cache);
+        record_value_feedback(value_feedback, value);
         store(dst, value);
         dispatch_next;
     };
@@ -2562,6 +3335,7 @@ handler GetById(
 }
 
 handler GetByIdWithThis(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     base: Operand,
     property: PropertyKeyTableIndex,
@@ -2592,8 +3366,9 @@ handler PutById(
     guard property_cache.shape == shape else try_cache;
     guard property_cache.prototype == 0 else try_cache;
     guard property_cache.shape_dictionary_generation == shape.dictionary_generation else try_cache;
-    guard object.named_properties[property_cache.property_offset] is not Value<Accessor> else try_cache;
+    # NB: Addition entries have no slot at their offset.
     guard property_cache.writes_data_property != 0 else try_cache;
+    guard object.named_properties[property_cache.property_offset] is not Value<Accessor> else try_cache;
     object.named_properties[property_cache.property_offset] = load(src);
     dispatch_next;
 }
@@ -2608,13 +3383,52 @@ handler PutByIdWithThis(
 ) @cold = call_slow_path(put_by_id_with_this);
 
 handler GetByValue(
+    value_feedback: ValueFeedbackIndex,
+    keyed_feedback: KeyedFeedbackIndex,
     dst: out Operand,
     base: in Operand,
     property: in Operand,
-    base_identifier: Optional<IdentifierTableIndex>
+    base_identifier: Optional<IdentifierTableIndex>,
+    cache: PropertyLookupCacheIndex
 ) {
     let slow = || @cold {
         call_slow_path(get_by_value);
+    };
+
+    let slow_without_cache = || @cold {
+        call_slow_path(get_by_value_uncached);
+    };
+
+    # Accesses that saw too many keys for their own cache look up own data properties in the VM's keyed property
+    # lookup cache, like the runtime does: the entry is at the top bits of the Fibonacci hash of the shape and the
+    # identity of the name, the word of the storage of a fly string.
+    let try_vm_keyed_property_lookup_cache = |keyed_object: Object| @cold {
+        guard let Value<PrimitiveString>(name_string) = load(property) else slow_without_cache;
+        let keyed_name: u64 = alias(name_string.utf16_data);
+        let keyed_shape = keyed_object.shape;
+        let keyed_shape_bits: u64 = alias(keyed_shape);
+        let keyed_mixed = u32(keyed_shape_bits ^ keyed_name);
+        let keyed_hash: u32 = keyed_mixed * KEYED_PROPERTY_LOOKUP_CACHE_HASH_MULTIPLIER;
+        let keyed_index: u64 = alias(keyed_hash >> KEYED_PROPERTY_LOOKUP_CACHE_INDEX_SHIFT);
+        let keyed_vm = current_vm();
+        let keyed_entry_address: u64 = keyed_vm.keyed_property_lookup_cache_entries + (keyed_index << KEYED_PROPERTY_LOOKUP_CACHE_ENTRY_SIZE_SHIFT);
+        let keyed_entry: KeyedPropertyLookupCacheEntry = alias(keyed_entry_address);
+        guard keyed_entry.property_name == keyed_name else slow_without_cache;
+        guard keyed_entry.shape == keyed_shape else slow_without_cache;
+        guard keyed_entry.entry_type == PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_OWN_PROPERTY else slow_without_cache;
+        guard keyed_entry.shape_dictionary_generation == keyed_shape.dictionary_generation else slow_without_cache;
+        let keyed_value = keyed_object.named_properties[keyed_entry.property_offset];
+        guard keyed_value is not Value<Accessor> else slow_without_cache;
+        # NB: The runtime recorded multiple keys before the access gave up on its own cache.
+        record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_MULTIPLE_STRING_KEYS);
+        record_value_feedback(value_feedback, keyed_value);
+        store(dst, keyed_value);
+        dispatch_next;
+    };
+
+    let try_cache = || @cold {
+        guard call_interp(asm_try_get_by_value_cache) == 0 else slow;
+        dispatch_next;
     };
 
     let try_typed_array_slow = || @cold {
@@ -2622,8 +3436,50 @@ handler GetByValue(
         dispatch_next;
     };
 
-    guard let Value<Object>(object) = load(base) else slow;
-    guard let index = array_index(load(property)) else slow;
+    let key = load(property);
+    guard extract_tag(key) == INT32_TAG else {
+        # Keys that are not array indices: the property lookup cache remembers the shapes and keys it has
+        # seen, and matches string and symbol keys by identity.
+        guard let Value<Object>(object) = load(base) else slow;
+        let keyed_executable = exec_ctx.executable;
+        let tagged_cache: u64 = alias(keyed_executable.property_lookup_caches[load(cache)]);
+        guard tagged_cache != PROPERTY_LOOKUP_CACHE_KEYED_GENERIC else try_vm_keyed_property_lookup_cache(object);
+        guard let property_cache = load_keyed_property_lookup_cache(cache, slow_without_cache) else slow;
+        guard property_cache.key is key else try_cache;
+        let shape = object.shape;
+        guard property_cache.shape == shape else try_cache;
+        guard property_cache.entry_type != PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_MISSING_PROPERTY else try_cache;
+        guard property_cache.shape_dictionary_generation == shape.dictionary_generation else try_cache;
+        # Values found in the prototype chain go through try_cache, which checks the chain's validity.
+        guard property_cache.prototype == 0 else try_cache;
+        let value = object.named_properties[property_cache.property_offset];
+        guard value is not Value<Accessor> else slow;
+        record_value_feedback(value_feedback, value);
+        store(dst, value);
+        dispatch_next;
+    };
+    # The code unit of a string at an index, as a string. Only ASCII code units have a string ready.
+    let string_index_slow = || @cold {
+        call_slow_path(get_by_value);
+    };
+    let string_index = || {
+        guard let Value<PrimitiveString>(string) = load(base) else slow;
+        let signed_index = unbox_i32(key);
+        guard signed_index >= 0 else slow;
+        let unsigned_index = assume_u32(signed_index);
+        guard let code_unit = load_primitive_string_utf16_code_unit(string, unsigned_index, string_index_slow) else slow;
+        guard code_unit < 0x80 else slow;
+        let signed_code_unit: i32 = alias(code_unit);
+        let result: Value = call_helper_with_two_arguments(asm_helper_single_ascii_character_string, current_vm(), signed_code_unit);
+        assert(extract_tag(result) == STRING_TAG);
+        record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_PRIMITIVE_BASE);
+        record_value_feedback(value_feedback, result);
+        store(dst, result);
+        dispatch_next;
+    };
+
+    guard let Value<Object>(object) = load(base) else string_index;
+    let index = u32(unbox_i32(key));
     let flags = object.flags;
     if flags lacks OBJECT_FLAG_IS_TYPED_ARRAY {
         branch_bits_set(flags, OBJECT_FLAG_MAY_INTERFERE, slow);
@@ -2635,7 +3491,10 @@ handler GetByValue(
                 # The size above lives on the object while the capacity lives with the buffer, so
                 # bound the access by the buffer that is really being addressed.
                 guard index < indexed_elements.capacity else slow;
-                store(dst, indexed_elements[index]);
+                let value = indexed_elements[index];
+                record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_INT32_INDEX_PACKED);
+                record_value_feedback(value_feedback, value);
+                store(dst, value);
                 dispatch_next;
             },
 
@@ -2646,6 +3505,8 @@ handler GetByValue(
                 guard index < indexed_elements.capacity else slow;
                 let value = indexed_elements[index];
                 guard value is not Value<Empty> else slow;
+                record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_INT32_INDEX_HOLEY);
+                record_value_feedback(value_feedback, value);
                 store(dst, value);
                 dispatch_next;
             },
@@ -2661,14 +3522,18 @@ handler GetByValue(
     let elements = primitive_storage_cage_base();
     guard index < object.typed_array_array_length else try_typed_array_slow;
     let kind = object.typed_array_kind;
+    record_typed_array_keyed_feedback(elements, keyed_feedback, kind);
 
     let typed_array_f64_as_int = |raw: i32| {
-        store(dst, box_i32(raw));
+        let produced: Value = box_i32(raw);
+        record_value_feedback(value_feedback, produced);
+        store(dst, produced);
         dispatch_next;
     };
 
     let typed_array_f64_as_double = |slot_f64: f64| {
         let result = canonicalize_nan(slot_f64);
+        record_value_feedback(value_feedback, result);
         store(dst, result);
         dispatch_next;
     };
@@ -2677,7 +3542,9 @@ handler GetByValue(
     #        one taken branch per load but duplicates about 30 instructions
     #        in this hot handler. Revisit with profile data or cost-aware layout.
     let typed_array_box_int32 = |raw: i32| {
-        store(dst, box_i32(raw));
+        let produced: Value = box_i32(raw);
+        record_value_feedback(value_feedback, produced);
+        store(dst, produced);
         dispatch_next;
     };
 
@@ -2685,7 +3552,9 @@ handler GetByValue(
         TYPED_ARRAY_KIND_UINT8 | TYPED_ARRAY_KIND_UINT8_CLAMPED => @hot {
             let value = load_caged_u8(elements, cached_offset, index);
             let widened: i32 = alias(value);
-            store(dst, box_i32(widened));
+            let produced: Value = box_i32(widened);
+            record_value_feedback(value_feedback, produced);
+            store(dst, produced);
             dispatch_next;
         },
 
@@ -2710,6 +3579,7 @@ handler GetByValue(
             let uint32_to_double = || @cold {
                 let slot_f64 = u32_to_f64(raw_u32);
                 let result = box_f64(slot_f64);
+                record_value_feedback(value_feedback, result);
                 store(dst, result);
                 dispatch_next;
             };
@@ -2742,6 +3612,7 @@ handler GetByValue(
 }
 
 handler GetByValueWithThis(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     base: Operand,
     property: Operand,
@@ -2762,6 +3633,8 @@ handler PutBySpread(
 ) @cold = call_slow_path(put_by_spread);
 
 handler GetLength(
+    value_feedback: ValueFeedbackIndex,
+    keyed_feedback: KeyedFeedbackIndex,
     dst: out Operand,
     base: in Operand,
     base_identifier: Optional<IdentifierTableIndex>,
@@ -2772,38 +3645,50 @@ handler GetLength(
     };
 
     let not_object = || {
+        record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_OTHER_ELEMENTS);
         guard let Value<PrimitiveString>(string) = load(base) else slow;
         let length = string.length_in_utf16_code_units;
         guard length <= INT32_MAX else slow;
-        store(dst, box_i32(assume_i32(length)));
+        let produced: Value = box_i32(assume_i32(length));
+        record_value_feedback(value_feedback, produced);
+        store(dst, produced);
         dispatch_next;
     };
 
     guard let Value<Object>(object) = load(base) else not_object;
     if object.flags has OBJECT_FLAG_HAS_MAGICAL_LENGTH {
+        record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_MAGICAL_LENGTH);
         let length = object.indexed_array_like_size;
         let length_double = || @cold {
-            store(dst, box_f64(u32_to_f64(length)));
+            let produced: Value = box_f64(u32_to_f64(length));
+            record_value_feedback(value_feedback, produced);
+            store(dst, produced);
             dispatch_next;
         };
 
         guard length <= INT32_MAX else length_double;
-        store(dst, box_i32(assume_i32(length)));
+        let produced: Value = box_i32(assume_i32(length));
+        record_value_feedback(value_feedback, produced);
+        store(dst, produced);
         dispatch_next;
     }
 
+    record_keyed_feedback(keyed_feedback, KEYED_FEEDBACK_OTHER_ELEMENTS);
     let shape = object.shape;
     guard let property_cache = load_property_lookup_cache(cache) else slow;
     guard property_cache.shape == shape else slow;
+    guard property_cache.entry_type != PROPERTY_LOOKUP_CACHE_ENTRY_TYPE_GET_MISSING_PROPERTY else slow;
     guard property_cache.prototype == 0 else slow;
     guard property_cache.shape_dictionary_generation == shape.dictionary_generation else slow;
     let value = object.named_properties[property_cache.property_offset];
     guard value is not Value<Accessor> else slow;
+    record_value_feedback(value_feedback, value);
     store(dst, value);
     dispatch_next;
 }
 
 handler GetLengthWithThis(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     base: Operand,
     this_value: Operand,
@@ -2813,7 +3698,8 @@ handler GetLengthWithThis(
 handler GetMethod(
     dst: out Operand,
     object: Operand,
-    property: PropertyKeyTableIndex
+    property: PropertyKeyTableIndex,
+    cache: PropertyLookupCacheIndex
 ) @cold = call_slow_path(get_method);
 
 handler GetIterator(
@@ -2821,10 +3707,13 @@ handler GetIterator(
     dst_iterator_next: out Operand,
     dst_iterator_done: out Operand,
     iterable: Operand,
-    hint: IteratorHint
+    hint: IteratorHint,
+    fast_array_mode_allowed: bool,
+    cache: PropertyLookupCacheIndex
 ) @cold = call_slow_path(get_iterator);
 
 handler GetGlobal(
+    value_feedback: ValueFeedbackIndex,
     dst: out Operand,
     identifier: IdentifierTableIndex,
     cache: GlobalVariableCacheIndex
@@ -2845,6 +3734,7 @@ handler GetGlobal(
             environment.binding_values,
             global_cache.environment_binding_index
         ) else slow;
+        record_value_feedback(value_feedback, value);
         store(dst, value);
         dispatch_next;
     };
@@ -2854,7 +3744,37 @@ handler GetGlobal(
     guard global_cache.shape_dictionary_generation == shape.dictionary_generation else try_environment;
     let value = global_object.named_properties[global_cache.property_offset];
     guard value is not Value<Accessor> else slow;
+    record_value_feedback(value_feedback, value);
     store(dst, value);
+    dispatch_next;
+}
+
+handler ResolveGlobalBinding(
+    dst: out Operand,
+    identifier: IdentifierTableIndex,
+    cache: GlobalVariableCacheIndex
+) {
+    let slow = || @cold {
+        call_slow_path(resolve_global_binding);
+    };
+
+    # A binding the cache of the SetGlobal or GetGlobal of the identifier still finds exists.
+    let realm = exec_ctx.realm;
+    let global_object = realm.global_object;
+    let environment = realm.global_declarative_environment;
+    let global_cache = load_global_variable_cache(cache);
+    guard global_cache.environment_serial_number == environment.serial_number else slow;
+
+    let try_environment = || {
+        guard global_cache.has_environment_binding_index != 0 else slow;
+        store(dst, Value<True>);
+        dispatch_next;
+    };
+
+    let shape = global_object.shape;
+    guard global_cache.shape == shape else try_environment;
+    guard global_cache.shape_dictionary_generation == shape.dictionary_generation else try_environment;
+    store(dst, Value<True>);
     dispatch_next;
 }
 
@@ -2893,6 +3813,8 @@ handler SetGlobal(
 }
 
 handler Call(
+    value_feedback: ValueFeedbackIndex,
+    call_feedback: CallFeedbackIndex,
     length: u32,
     dst: out Operand,
     callee: in Operand,
@@ -2908,6 +3830,7 @@ handler Call(
     guard let Value<Object>(function) = load(callee) else slow;
     let flags = function.flags;
     guard flags has OBJECT_FLAG_IS_FUNCTION else slow;
+    record_call_target(call_feedback, function);
     guard flags has OBJECT_FLAG_IS_ECMASCRIPT_FUNCTION_OBJECT else invoke_try_native;
     let ecmascript_function: ECMAScriptFunctionObject = alias(function);
     let shared_data = ecmascript_function.shared_data;
@@ -2981,8 +3904,12 @@ handler Call(
     frame.yield_value_is_iterator_result = false;
     frame.caller_is_construct = false;
     frame.frame_initialized = false;
+    frame.returns_to_native_caller = false;
+    frame.runs_jit_code = false;
     frame.caller_frame = exec_ctx;
-    let [_, return_pc, return_destination] = call_site_info(length, dst);
+    let [current_pc, return_pc, return_destination] = call_site_info(length, dst);
+    # NB: Stack traces show the caller at its program counter.
+    exec_ctx.program_counter = current_pc;
     frame.caller_return_pc = return_pc;
     frame.caller_dst_raw = return_destination;
     let actual_argument_count = load(argument_count);
@@ -3009,12 +3936,12 @@ handler Call(
     let direct_executable = frame.executable;
     assert(direct_executable != 0);
     pb = direct_executable.bytecode_data;
+    switch_dispatch_table(direct_executable);
     let direct_vm = current_vm();
     direct_vm.running_execution_context = frame;
     exec_ctx = frame;
     values = exec_ctx.slots;
-    pc = 0;
-    goto_handler(pc);
+    enter_new_frame(direct_executable);
     let invoke_interp_inline = || {
         # Let the interpreter resolve the cases that cannot use the direct
         # frame construction above, then enter the resolved callee.
@@ -3026,8 +3953,8 @@ handler Call(
         let inline_executable = exec_ctx.executable;
         assert(inline_executable != 0);
         pb = inline_executable.bytecode_data;
-        pc = 0;
-        goto_handler(pc);
+        switch_dispatch_table(inline_executable);
+        enter_new_frame(inline_executable);
     };
     let invoke_try_native = || {
         # Construct the lightweight frame used by raw native functions.
@@ -3078,6 +4005,8 @@ handler Call(
         native_frame.yield_value_is_iterator_result = false;
         native_frame.caller_is_construct = false;
         native_frame.frame_initialized = false;
+        native_frame.returns_to_native_caller = false;
+        native_frame.runs_jit_code = false;
         let [native_pc, after_pc, destination_offset] = call_site_info(length, dst);
         exec_ctx.program_counter = native_pc;
         native_frame.caller_frame = exec_ctx;
@@ -3097,7 +4026,7 @@ handler Call(
         values = exec_ctx.slots;
         let raw_native_function: RawNativeFunction = alias(function);
         let native_function_index = raw_native_function.native_function_index;
-        let native_function_entry = &native_running_vm.native_function_table[native_function_index];
+        let native_function_entry = &native_running_vm.native_function_table[native_function_index & NATIVE_FUNCTION_TABLE_INDEX_MASK];
         assert(native_function_entry.type < NATIVE_FUNCTION_TYPE_COUNT);
         let native_function = native_function_entry.function;
         # FIXME: Bind native_payload directly once the allocator can keep the
@@ -3110,8 +4039,9 @@ handler Call(
             # FIXME: Pass native_payload directly once the allocator can
             #        satisfy the helper ABI without conflicting with variant.
             let helper_argument = native_payload;
-            let exception_pc: i32 = call_helper(
+            let exception_pc: i32 = call_helper_with_two_arguments(
                 asm_helper_handle_raw_native_exception,
+                current_vm(),
                 helper_argument
             );
             guard exception_pc >= 0 else @cold {
@@ -3124,6 +4054,7 @@ handler Call(
             let exception_executable = exec_ctx.executable;
             assert(exception_executable != 0);
             pb = exception_executable.bytecode_data;
+            switch_dispatch_table(exception_executable);
             pc = exec_ctx.program_counter;
             goto_handler(pc);
         };
@@ -3135,343 +4066,9 @@ handler Call(
         exec_ctx = caller_frame;
         values = exec_ctx.slots;
         store(dst, native_payload);
+        record_value_feedback(value_feedback, native_payload);
         dispatch_variable(load(length));
     };
-}
-
-handler CallBuiltinMathAbs(
-    dst: out Operand,
-    callee: in Operand,
-    this_value: Operand,
-    argument: in Operand,
-    expression_string: Optional<StringTableIndex>
-) {
-    let slow = || @cold {
-        call_slow_path(call_builtin_math_abs);
-    };
-
-    validate_builtin(callee, BUILTIN_MATH_ABS) else slow;
-    let mut argument_value = load(argument);
-    match argument_value {
-        Value<f64> => {
-            clear_bit(argument_value, 63);
-            store(dst, argument_value);
-            dispatch_next;
-        },
-
-        Value<i32>(mut integer_value) => {
-            let overflow = || @cold {
-                let mut overflowed_integer = unbox_i32(argument_value);
-                neg(overflowed_integer);
-                let unsigned_integer: u32 = alias(overflowed_integer);
-                store(dst, box_f64(u32_to_f64(unsigned_integer)));
-                dispatch_next;
-            };
-            if integer_value < 0 {
-                neg32_overflow(integer_value) else overflow;
-            }
-            store(dst, box_i32(integer_value));
-            dispatch_next;
-        },
-
-        _ => slow,
-    }
-}
-
-handler CallBuiltinMathFloor(
-    dst: out Operand,
-    callee: in Operand,
-    this_value: Operand,
-    argument: in Operand,
-    expression_string: Optional<StringTableIndex>
-) {
-    guard let [_, argument_f64] = load_builtin_f64(
-        callee,
-        argument,
-        BUILTIN_MATH_FLOOR
-    ) else @cold {
-        call_slow_path(call_builtin_math_floor);
-    };
-    store(dst, box_number(fp_floor(argument_f64)));
-    dispatch_next;
-}
-
-handler CallBuiltinMathCeil(
-    dst: out Operand,
-    callee: in Operand,
-    this_value: Operand,
-    argument: in Operand,
-    expression_string: Optional<StringTableIndex>
-) {
-    guard let [_, argument_f64] = load_builtin_f64(
-        callee,
-        argument,
-        BUILTIN_MATH_CEIL
-    ) else @cold {
-        call_slow_path(call_builtin_math_ceil);
-    };
-    store(dst, box_number(fp_ceil(argument_f64)));
-    dispatch_next;
-}
-
-handler CallBuiltinMathSqrt(
-    dst: out Operand,
-    callee: in Operand,
-    this_value: Operand,
-    argument: in Operand,
-    expression_string: Optional<StringTableIndex>
-) {
-    guard let [_, argument_f64] = load_builtin_f64(
-        callee,
-        argument,
-        BUILTIN_MATH_SQRT
-    ) else @cold {
-        call_slow_path(call_builtin_math_sqrt);
-    };
-    store(dst, box_number(fp_sqrt(argument_f64)));
-    dispatch_next;
-}
-
-handler CallBuiltinMathExp(
-    dst: out Operand,
-    callee: in Operand,
-    this_value: Operand,
-    argument: in Operand,
-    expression_string: Optional<StringTableIndex>
-) {
-    guard let [argument_value, _] = load_builtin_f64(
-        callee,
-        argument,
-        BUILTIN_MATH_EXP
-    ) else @cold {
-        call_slow_path(call_builtin_math_exp);
-    };
-    # FIXME: The helper still consumes the boxed argument even though the
-    #        f64 conversion above is otherwise unused. Preserve this odd
-    #        sequence until removing it improves both native backends.
-    let result: Value = call_helper(asm_helper_math_exp, argument_value);
-    store(dst, result);
-    dispatch_next;
-}
-
-handler CallBuiltinMathLog(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_math_log);
-
-handler CallBuiltinMathPow(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument0: Operand,
-    argument1: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_math_pow);
-
-handler CallBuiltinMathImul(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument0: Operand,
-    argument1: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_math_imul);
-
-handler CallBuiltinMathRandom(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_math_random);
-
-handler CallBuiltinMathRound(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_math_round);
-
-handler CallBuiltinMathSin(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_math_sin);
-
-handler CallBuiltinMathCos(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_math_cos);
-
-handler CallBuiltinMathTan(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_math_tan);
-
-handler CallBuiltinRegExpPrototypeExec(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_regexp_prototype_exec);
-
-handler CallBuiltinRegExpPrototypeReplace(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument0: Operand,
-    argument1: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_regexp_prototype_replace);
-
-handler CallBuiltinRegExpPrototypeSplit(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument0: Operand,
-    argument1: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_regexp_prototype_split);
-
-handler CallBuiltinOrdinaryHasInstance(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    argument: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_ordinary_has_instance);
-
-handler CallBuiltinArrayIteratorPrototypeNext(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_array_iterator_prototype_next);
-
-handler CallBuiltinMapIteratorPrototypeNext(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_map_iterator_prototype_next);
-
-handler CallBuiltinSetIteratorPrototypeNext(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_set_iterator_prototype_next);
-
-handler CallBuiltinStringIteratorPrototypeNext(
-    dst: out Operand,
-    callee: Operand,
-    this_value: Operand,
-    expression_string: Optional<StringTableIndex>
-) @cold = call_slow_path(call_builtin_string_iterator_prototype_next);
-
-handler CallBuiltinStringFromCharCode(
-    dst: out Operand,
-    callee: in Operand,
-    this_value: Operand,
-    argument: in Operand,
-    expression_string: Optional<StringTableIndex>
-) {
-    let slow = || @cold {
-        call_slow_path(call_builtin_string_from_char_code);
-    };
-
-    validate_builtin(callee, BUILTIN_STRING_FROM_CHAR_CODE) else slow;
-    guard let mut Value<i32>(code_unit) = load(argument) else slow;
-    let single_utf16_code_unit = || {
-        assert(u32(code_unit) < 0x10000);
-        let result: Value = call_helper(asm_helper_single_utf16_code_unit_string, code_unit);
-        assert(extract_tag(result) == STRING_TAG);
-        store(dst, result);
-        dispatch_next;
-    };
-    code_unit = code_unit & 0xffff;
-    # FIXME: Use a guard once the nonnegative refinement retains an unsigned
-    #        branch condition for this comparison.
-    branch_ge_unsigned(code_unit, 0x80, single_utf16_code_unit);
-
-    let result: Value = call_helper(asm_helper_single_ascii_character_string, code_unit);
-    assert(extract_tag(result) == STRING_TAG);
-    store(dst, result);
-    dispatch_next;
-}
-
-handler CallBuiltinStringPrototypeCharCodeAt(
-    dst: out Operand,
-    callee: in Operand,
-    this_value: in Operand,
-    argument: in Operand,
-    expression_string: Optional<StringTableIndex>
-) {
-    let out_of_bounds = || @cold {
-        let result: Value = CANON_NAN_BITS;
-        store(dst, result);
-        dispatch_next;
-    };
-    let slow = || @cold {
-        call_slow_path(call_builtin_string_prototype_char_code_at);
-    };
-
-    validate_builtin(callee, BUILTIN_STRING_PROTOTYPE_CHAR_CODE_AT) else slow;
-    guard let Value<PrimitiveString>(string) = load(this_value) else slow;
-    guard let Value<i32>(index) = load(argument) else slow;
-    guard index >= 0 else out_of_bounds;
-    let unsigned_index = assume_u32(index);
-    guard let code_unit =
-        load_primitive_string_utf16_code_unit(string, unsigned_index, out_of_bounds) else slow;
-    let signed_code_unit: i32 = alias(code_unit);
-    store(dst, box_i32(signed_code_unit));
-    dispatch_next;
-}
-
-handler CallBuiltinStringPrototypeCharAt(
-    dst: out Operand,
-    callee: in Operand,
-    this_value: in Operand,
-    argument: in Operand,
-    expression_string: Optional<StringTableIndex>
-) {
-    let slow = || @cold {
-        call_slow_path(call_builtin_string_prototype_char_at);
-    };
-    let empty = || @cold {
-        let zero: u64 = 0;
-        let result: Value = call_helper(asm_helper_empty_string, zero);
-        assert(extract_tag(result) == STRING_TAG);
-        store(dst, result);
-        dispatch_next;
-    };
-
-    validate_builtin(callee, BUILTIN_STRING_PROTOTYPE_CHAR_AT) else slow;
-    guard let Value<PrimitiveString>(string) = load(this_value) else slow;
-    guard let Value<i32>(index) = load(argument) else slow;
-    guard index >= 0 else empty;
-    let unsigned_index = assume_u32(index);
-    guard let code_unit =
-        load_primitive_string_utf16_code_unit(string, unsigned_index, empty) else slow;
-    guard code_unit < 0x80 else slow;
-    assert(code_unit < 0x80);
-    let signed_code_unit: i32 = alias(code_unit);
-    let result: Value = call_helper(asm_helper_single_ascii_character_string, signed_code_unit);
-    assert(extract_tag(result) == STRING_TAG);
-    store(dst, result);
-    dispatch_next;
 }
 
 handler GetObjectPropertyIterator(
@@ -3551,8 +4148,34 @@ handler IteratorClose(
     iterator_next: Operand,
     iterator_done: Operand,
     completion_type: Completion::Type,
-    completion_value: Operand
-) @cold = call_slow_path(iterator_close);
+    completion_value: Operand,
+    cache: PropertyLookupCacheIndex
+) {
+    let slow = || @cold {
+        call_slow_path(iterator_close);
+    };
+
+    # An iterator without a return method closes without doing anything, for every completion type: the
+    # instruction that follows a close for a throw completion throws it again.
+
+    # In fast array mode, the iterator register holds a number. A watchpoint set of the realm tells if array
+    # iterators have a return method.
+    if extract_tag(load(iterator_object)) == INT32_TAG {
+        let return_watchpoint_set = exec_ctx.realm.array_iterator_return_watchpoint_set;
+        guard return_watchpoint_set != 0 else slow;
+        guard return_watchpoint_set.valid else slow;
+        dispatch_next;
+    }
+
+    # Other iterators: the cache of the site tells if the method is missing.
+    let executable = exec_ctx.executable;
+    let caches: u64 = alias(executable.property_lookup_caches);
+    let cache_index: u64 = alias(load(cache));
+    let cache_pointer = caches + cache_index * PROPERTY_LOOKUP_CACHE_SIZE;
+    let return_method: Value = call_helper_with_two_arguments(asm_try_get_by_id_cache, load(iterator_object), cache_pointer);
+    guard return_method is Value<Nullish> else slow;
+    dispatch_next;
+}
 
 handler IteratorNext(
     dst: out Operand,
@@ -3564,10 +4187,56 @@ handler IteratorNext(
 handler IteratorNextUnpack(
     dst_value: out Operand,
     dst_done: out Operand,
-    iterator_object: Operand,
+    iterator_object: inout Operand,
     iterator_next: Operand,
     iterator_done: inout Operand
-) @cold = call_slow_path(iterator_next_unpack);
+) {
+    let slow = || @cold {
+        call_slow_path(iterator_next_unpack);
+    };
+
+    # In fast array mode, the iterator register holds the index of the next element as a number, and the next
+    # register holds the array (see get_iterator() in the runtime). Holes, iterations that are done and all other
+    # iterators take the slow path.
+    guard let Value<i32>(index) = load(iterator_object) else slow;
+    guard index >= 0 else slow;
+    # NB: The done register holds a boolean.
+    let iteration_done = load(iterator_done);
+    branch_bits_set(iteration_done, 1, slow);
+    guard let Value<Object>(array) = load(iterator_next) else slow;
+    let flags = array.flags;
+    guard flags has OBJECT_FLAG_HAS_MAGICAL_LENGTH else slow;
+    guard flags lacks OBJECT_FLAG_MAY_INTERFERE else slow;
+    let unsigned_index = assume_u32(index);
+
+    # The array iterator reads the length of the array at each step. After the last element, the done register
+    # keeps the iteration done, also if the array grows.
+    if unsigned_index >= array.indexed_array_like_size {
+        store(dst_value, Value<Undefined>);
+        store(dst_done, Value<True>);
+        store(iterator_done, Value<True>);
+        dispatch_next;
+    }
+
+    let next_element = || {
+        let indexed_elements = array.indexed_elements;
+        guard indexed_elements != 0 else slow;
+        guard unsigned_index < indexed_elements.capacity else slow;
+        let value = indexed_elements[unsigned_index];
+        guard value is not Value<Empty> else slow;
+        guard let next_index = checked_add(index, 1) else slow;
+        store(dst_value, value);
+        store(dst_done, Value<False>);
+        store(iterator_object, box_i32(next_index));
+        dispatch_next;
+    };
+
+    match array.indexed_storage_kind {
+        INDEXED_STORAGE_KIND_PACKED => next_element,
+        INDEXED_STORAGE_KIND_HOLEY => next_element,
+        _ => slow,
+    }
+}
 
 handler IteratorToArray(
     dst: out Operand,
@@ -3577,6 +4246,8 @@ handler IteratorToArray(
 ) @cold = call_slow_path(iterator_to_array);
 
 handler CallConstruct(
+    value_feedback: ValueFeedbackIndex,
+    call_feedback: CallFeedbackIndex,
     length: u32,
     dst: out Operand,
     callee: Operand,
@@ -3586,6 +4257,8 @@ handler CallConstruct(
 ) @cold = call_slow_path(call_construct);
 
 handler CallDirectEval(
+    value_feedback: ValueFeedbackIndex,
+    call_feedback: CallFeedbackIndex,
     length: u32,
     dst: out Operand,
     callee: Operand,
@@ -3596,6 +4269,8 @@ handler CallDirectEval(
 ) @cold = call_slow_path(call_direct_eval);
 
 handler CallWithArgumentArray(
+    value_feedback: ValueFeedbackIndex,
+    call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
@@ -3604,6 +4279,8 @@ handler CallWithArgumentArray(
 ) @cold = call_slow_path(call_with_argument_array);
 
 handler CallDirectEvalWithArgumentArray(
+    value_feedback: ValueFeedbackIndex,
+    call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
@@ -3612,6 +4289,8 @@ handler CallDirectEvalWithArgumentArray(
 ) @cold = call_slow_path(call_direct_eval_with_argument_array);
 
 handler CallConstructWithArgumentArray(
+    value_feedback: ValueFeedbackIndex,
+    call_feedback: CallFeedbackIndex,
     dst: out Operand,
     callee: Operand,
     this_value: Operand,
@@ -3620,6 +4299,8 @@ handler CallConstructWithArgumentArray(
 ) @cold = call_slow_path(call_construct_with_argument_array);
 
 handler SuperCallWithArgumentArray(
+    value_feedback: ValueFeedbackIndex,
+    call_feedback: CallFeedbackIndex,
     dst: out Operand,
     super_constructor: Operand,
     arguments: Operand,
@@ -3665,8 +4346,7 @@ handler NewPrimitiveArray(
 handler NewRegExp(
     dst: out Operand,
     source_index: StringTableIndex,
-    flags_index: StringTableIndex,
-    regex_index: RegexTableIndex
+    flags_index: StringTableIndex
 ) @cold = call_slow_path(new_regexp);
 
 handler NewReferenceError(
@@ -3748,7 +4428,8 @@ handler CreateRestParams(
 handler CreateArguments(
     dst: out Optional<Operand>,
     kind: ArgumentsKind,
-    is_immutable: bool
+    is_immutable: bool,
+    creates_parameter_bindings: bool
 ) @cold = call_slow_path(create_arguments);
 
 handler CreateLexicalEnvironment(
@@ -3781,6 +4462,32 @@ handler DeleteVariable(
     dst: out Operand,
     identifier: IdentifierTableIndex
 ) @cold = call_slow_path(delete_variable);
+
+handler NewDisposableResourceStack(
+    dst: out Operand
+) @cold = call_slow_path(new_disposable_resource_stack);
+
+handler AddDisposableResource(
+    stack: Operand,
+    value: Operand,
+    hint: u32
+) @cold = call_slow_path(add_disposable_resource);
+
+handler DisposeResources(
+    stack: Operand,
+    completion_type: Operand,
+    completion_value: Operand
+) @cold = call_slow_path(dispose_resources);
+
+handler AsyncDisposeResourcesStep(
+    done: out Operand,
+    awaited_value: out Operand,
+    stack: Operand,
+    completion_type: Operand,
+    completion_value: Operand,
+    await_completion_type: Operand,
+    await_completion_value: Operand
+) @cold = call_slow_path(async_dispose_resources_step);
 
 handler GetCompletionFields(
     type_dst: out Operand,

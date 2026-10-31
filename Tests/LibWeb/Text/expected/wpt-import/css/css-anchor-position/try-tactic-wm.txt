@@ -1,0 +1,16 @@
+Harness status: OK
+
+Found 11 tests
+
+11 Pass
+Pass	 horizontal-tb ltr
+Pass	flip-inline horizontal-tb ltr
+Pass	flip-x horizontal-tb ltr
+Pass	flip-inline vertical-lr ltr
+Pass	flip-inline sideways-lr ltr
+Pass	flip-y vertical-lr ltr
+Pass	flip-y sideways-lr ltr
+Pass	flip-block sideways-rl ltr
+Pass	flip-x sideways-rl ltr
+Pass	flip-start horizontal-tb ltr
+Pass	flip-start horizontal-tb rtl

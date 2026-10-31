@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Utf16View.h>
+#include <AK/JsonArray.h>
+#include <AK/JsonObject.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
-#include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
 
@@ -45,14 +45,17 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
     u32 next_paint_order_index = 0;
 
     if (auto const& metadata = display_list.async_scrolling_metadata(); metadata.has_value()) {
+        async_scrolling_state.document_id = metadata->document_id;
         async_scrolling_state.viewport_rect = metadata->viewport_rect;
         async_scrolling_state.wheel_event_listener_state_generation = metadata->wheel_event_listener_state_generation;
         async_scrolling_state.has_blocking_wheel_event_listeners = metadata->has_blocking_wheel_event_listeners;
         async_scrolling_state.has_blocking_wheel_event_region_covering_viewport = metadata->has_blocking_wheel_event_region_covering_viewport;
+        async_scrolling_state.viewport_keeps_horizontal_scrolls = metadata->viewport_keeps_horizontal_scrolls;
+        async_scrolling_state.viewport_keeps_vertical_scrolls = metadata->viewport_keeps_vertical_scrolls;
         async_scrolling_state.device_pixels_per_css_pixel = metadata->device_pixels_per_css_pixel;
     }
 
-    auto read_compositor_metadata = [&](Compositing::ContextRef context, Compositing::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
+    display_list.for_each_compositor_metadata([&](Compositing::ContextRef context, Compositing::DisplayListCommandType command_type, ReadonlyBytes payload) {
         auto append_wheel_hit_test_target = [&](auto const& command, Gfx::CornerRadii corner_radii) {
             Optional<AsyncScrollNodeID> target_node_id;
             if (command.target_scroll_node_index.value())
@@ -66,9 +69,9 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
             });
         };
 
-        switch (header.command_type) {
+        switch (command_type) {
         case Compositing::DisplayListCommandType::CompositorBlockingWheelEventRegion: {
-            auto command = Compositing::read_display_list_command_payload<Compositing::CompositorBlockingWheelEventRegion>(payload);
+            auto command = Compositing::read_display_list_object<Compositing::CompositorBlockingWheelEventRegion>(payload);
             async_scrolling_state.has_blocking_wheel_event_listeners = true;
             async_scrolling_state.blocking_wheel_event_regions.append({
                 .context = context,
@@ -77,7 +80,7 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
             break;
         }
         case Compositing::DisplayListCommandType::CompositorScrollNode: {
-            auto command = Compositing::read_display_list_command_payload<Compositing::CompositorScrollNode>(payload);
+            auto command = Compositing::read_display_list_object<Compositing::CompositorScrollNode>(payload);
             Optional<AsyncScrollNodeID> parent_node_id;
             if (command.parent_scroll_node_index.value())
                 parent_node_id = scroll_node_id_for(command.document_id, command.parent_scroll_node_index);
@@ -91,29 +94,55 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
                 .is_viewport = command.is_viewport,
                 .can_be_wheel_scrolled_horizontally = command.can_be_wheel_scrolled_horizontally,
                 .can_be_wheel_scrolled_vertically = command.can_be_wheel_scrolled_vertically,
+                .chains_scroll_to_ancestors_horizontally = command.chains_scroll_to_ancestors_horizontally,
+                .chains_scroll_to_ancestors_vertically = command.chains_scroll_to_ancestors_vertically,
+                .shows_overscroll_effect_horizontally = command.shows_overscroll_effect_horizontally,
+                .shows_overscroll_effect_vertically = command.shows_overscroll_effect_vertically,
             });
             break;
         }
         case Compositing::DisplayListCommandType::CompositorWheelHitTestTarget: {
-            auto command = Compositing::read_display_list_command_payload<Compositing::CompositorWheelHitTestTarget>(payload);
+            auto command = Compositing::read_display_list_object<Compositing::CompositorWheelHitTestTarget>(payload);
             append_wheel_hit_test_target(command, {});
             break;
         }
         case Compositing::DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii: {
-            auto command = Compositing::read_display_list_command_payload<Compositing::CompositorWheelHitTestTargetWithCornerRadii>(payload);
+            auto command = Compositing::read_display_list_object<Compositing::CompositorWheelHitTestTargetWithCornerRadii>(payload);
             append_wheel_hit_test_target(command, command.corner_radii);
             break;
         }
         case Compositing::DisplayListCommandType::CompositorMainThreadWheelEventRegion: {
-            auto command = Compositing::read_display_list_command_payload<Compositing::CompositorMainThreadWheelEventRegion>(payload);
+            auto command = Compositing::read_display_list_object<Compositing::CompositorMainThreadWheelEventRegion>(payload);
             async_scrolling_state.main_thread_wheel_event_regions.append({
                 .context = context,
                 .rect = command.rect,
             });
             break;
         }
+        case Compositing::DisplayListCommandType::CompositorNestedContextWheelRegion: {
+            auto command = Compositing::read_display_list_object<Compositing::CompositorNestedContextWheelRegion>(payload);
+            async_scrolling_state.nested_context_wheel_regions.append({
+                .context = context,
+                .rect = command.rect,
+                .corner_radii = command.corner_radii,
+                .child_context_id = command.child_context_id,
+                .paint_order_index = next_paint_order_index++,
+            });
+            break;
+        }
+        case Compositing::DisplayListCommandType::CompositorScrollChainingBarrier: {
+            auto command = Compositing::read_display_list_object<Compositing::CompositorScrollChainingBarrier>(payload);
+            async_scrolling_state.scroll_chaining_barriers.append({
+                .context = context,
+                .rect = command.rect,
+                .scroll_node_id_above_barrier = scroll_node_id_for(command.document_id, command.scroll_node_index_above_barrier),
+                .keeps_horizontal_scrolls = command.keeps_horizontal_scrolls,
+                .keeps_vertical_scrolls = command.keeps_vertical_scrolls,
+            });
+            break;
+        }
         case Compositing::DisplayListCommandType::CompositorScrollbar: {
-            auto command = Compositing::read_display_list_command_payload<Compositing::CompositorScrollbar>(payload);
+            auto command = Compositing::read_display_list_object<Compositing::CompositorScrollbar>(payload);
             async_scrolling_state.scrollbars.append({
                 .scroll_node_id = scroll_node_id_for(command.document_id, command.scroll_node_index),
                 .scroller_stable_node_id = {},
@@ -133,12 +162,11 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
                 .track_color = command.track_color,
                 .vertical = command.vertical,
                 .is_painted_by_compositor = command.is_painted_by_compositor,
-                .display_list_paints_enlarged_scrollbar = command.display_list_paints_enlarged_scrollbar,
             });
             break;
         }
         case Compositing::DisplayListCommandType::CompositorSnapContainer: {
-            auto command = Compositing::read_display_list_command_payload<Compositing::CompositorSnapContainer>(payload);
+            auto command = Compositing::read_display_list_object<Compositing::CompositorSnapContainer>(payload);
             async_scrolling_state.snap_containers.append({
                 .node_id = scroll_node_id_for(command.document_id, command.scroll_node_index),
                 .geometry = {
@@ -154,7 +182,7 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
             break;
         }
         case Compositing::DisplayListCommandType::CompositorSnapArea: {
-            auto command = Compositing::read_display_list_command_payload<Compositing::CompositorSnapArea>(payload);
+            auto command = Compositing::read_display_list_object<Compositing::CompositorSnapArea>(payload);
             auto& snap_containers = async_scrolling_state.snap_containers;
             // A snap container's areas are recorded right after it.
             if (snap_containers.is_empty() || snap_containers.last().node_id != scroll_node_id_for(command.document_id, command.scroll_node_index)) {
@@ -173,14 +201,7 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
         default:
             break;
         }
-    };
-    for (auto const& run : display_list.command_runs()) {
-        if (!run.has_compositor_metadata)
-            continue;
-        Compositing::DisplayList::for_each_command_header(display_list.command_bytes_of_run(run), [&](auto const& header, auto payload) {
-            read_compositor_metadata(run.context, header, payload);
-        });
-    }
+    });
 
     for (auto& scrollbar : async_scrolling_state.scrollbars) {
         for (auto const& scroll_node : async_scrolling_state.scroll_nodes) {
@@ -194,6 +215,107 @@ AsyncScrollingState async_scrolling_state_from_display_list(Compositing::Display
     return async_scrolling_state;
 }
 
+static StringView snap_strictness_name(SnapStrictness strictness)
+{
+    switch (strictness) {
+    case SnapStrictness::None:
+        return "none"sv;
+    case SnapStrictness::Proximity:
+        return "proximity"sv;
+    case SnapStrictness::Mandatory:
+        return "mandatory"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static StringView snap_align_name(SnapAlign align)
+{
+    switch (align) {
+    case SnapAlign::None:
+        return "none"sv;
+    case SnapAlign::Start:
+        return "start"sv;
+    case SnapAlign::End:
+        return "end"sv;
+    case SnapAlign::Center:
+        return "center"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static JsonObject rect_to_json(Web::CSSPixelRect const& rect)
+{
+    JsonObject object;
+    object.set("x"sv, rect.x().to_double());
+    object.set("y"sv, rect.y().to_double());
+    object.set("width"sv, rect.width().to_double());
+    object.set("height"sv, rect.height().to_double());
+    return object;
+}
+
+static JsonObject point_to_json(Web::CSSPixelPoint const& point)
+{
+    JsonObject object;
+    object.set("x"sv, point.x().to_double());
+    object.set("y"sv, point.y().to_double());
+    return object;
+}
+
+JsonObject async_scrolling_state_to_json(AsyncScrollingState const& state)
+{
+    JsonArray scroll_nodes;
+    for (auto const& scroll_node : state.scroll_nodes) {
+        JsonObject node;
+        node.set("documentID"sv, scroll_node.node_id.document_id.value());
+        node.set("scrollNodeIndex"sv, scroll_node.node_id.scroll_node_index.value());
+        node.set("parentDocumentID"sv, scroll_node.parent_node_id.has_value() ? scroll_node.parent_node_id->document_id.value() : 0);
+        node.set("parentScrollNodeIndex"sv, scroll_node.parent_node_id.has_value() ? scroll_node.parent_node_id->scroll_node_index.value() : 0);
+        node.set("isViewport"sv, scroll_node.is_viewport);
+        scroll_nodes.must_append(move(node));
+    }
+
+    JsonArray snap_containers;
+    for (auto const& snap_container : state.snap_containers) {
+        JsonObject container;
+        container.set("documentID"sv, snap_container.node_id.document_id.value());
+        container.set("scrollNodeIndex"sv, snap_container.node_id.scroll_node_index.value());
+        container.set("snapport"sv, rect_to_json(snap_container.geometry.snapport));
+        container.set("minScrollOffset"sv, point_to_json(snap_container.geometry.min_scroll_offset));
+        container.set("maxScrollOffset"sv, point_to_json(snap_container.geometry.max_scroll_offset));
+        container.set("strictness"sv, snap_strictness_name(snap_container.geometry.strictness));
+        container.set("snapsX"sv, snap_container.geometry.axes.x);
+        container.set("snapsY"sv, snap_container.geometry.axes.y);
+        container.set("horizontalWritingMode"sv, snap_container.geometry.horizontal_writing_mode);
+        JsonArray areas;
+        for (auto const& snap_area : snap_container.areas) {
+            JsonObject area;
+            area.set("nodeID"sv, snap_area.identity.node_id.value());
+            area.set("pseudoElementType"sv, snap_area.identity.pseudo_element_type);
+            area.set("rect"sv, rect_to_json(snap_area.rect));
+            area.set("alignX"sv, snap_align_name(snap_area.align_x));
+            area.set("alignY"sv, snap_align_name(snap_area.align_y));
+            area.set("alwaysStop"sv, snap_area.always_stop);
+            areas.must_append(move(area));
+        }
+        container.set("areas"sv, move(areas));
+        snap_containers.must_append(move(container));
+    }
+
+    JsonObject object;
+    object.set("documentID"sv, state.document_id.has_value() ? JsonValue { state.document_id->value() } : JsonValue {});
+    object.set("scrollNodeCount"sv, state.scroll_nodes.size());
+    object.set("scrollNodes"sv, move(scroll_nodes));
+    object.set("snapContainers"sv, move(snap_containers));
+    object.set("devicePixelsPerCssPixel"sv, state.device_pixels_per_css_pixel);
+    object.set("hasBlockingWheelEventListeners"sv, state.has_blocking_wheel_event_listeners);
+    object.set("blockingWheelEventRegionCount"sv, state.blocking_wheel_event_regions.size());
+    object.set("mainThreadWheelEventRegionCount"sv, state.main_thread_wheel_event_regions.size());
+    object.set("nestedContextWheelRegionCount"sv, state.nested_context_wheel_regions.size());
+    object.set("wheelEventListenerStateGeneration"sv, state.wheel_event_listener_state_generation);
+    object.set("hasBlockingWheelEventRegionCoveringViewport"sv, state.has_blocking_wheel_event_region_covering_viewport);
+    return object;
+}
+
 WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const& state)
 {
     if (state.has_blocking_wheel_event_region_covering_viewport)
@@ -204,70 +326,28 @@ WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const& sta
     return WheelRoutingAdmission::Accepted;
 }
 
-Utf16View wheel_routing_admission_to_utf16_view(WheelRoutingAdmission admission)
+Web::InputRoutingDecision input_routing_decision_for_wheel_step_not_admitted_by(WheelRoutingAdmission admission)
 {
     switch (admission) {
     case WheelRoutingAdmission::Accepted:
-        return u"accepted"sv;
+        VERIFY_NOT_REACHED();
     case WheelRoutingAdmission::NoAsyncScrollingState:
-        return u"no async scrolling state"sv;
+        return Web::InputRoutingDecision::NoAsyncScrollingState;
     case WheelRoutingAdmission::BlockingWheelEventListeners:
-        return u"blocking wheel event listeners"sv;
+        return Web::InputRoutingDecision::BlockingWheelEventListeners;
     case WheelRoutingAdmission::NoScrollNode:
-        return u"no scroll node"sv;
+        return Web::InputRoutingDecision::NoScrollNode;
     case WheelRoutingAdmission::StaleWheelEventListeners:
-        return u"stale wheel event listeners"sv;
+        return Web::InputRoutingDecision::StaleWheelEventListeners;
     }
     VERIFY_NOT_REACHED();
 }
 
-static AsyncScrollTree scroll_tree_for_hit_testing(AsyncScrollingState async_scrolling_state, RefPtr<Compositing::DisplayList const> const& display_list, Compositing::AccumulatedVisualContextTree const* visual_context_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot)
+WheelRoutingAdmission wheel_routing_admission_for(AsyncScrollingState const& state, u64 newest_wheel_event_listener_state_generation)
 {
-    AsyncScrollTree scroll_tree;
-    scroll_tree.set_state(move(async_scrolling_state));
-    scroll_tree.rebuild_wheel_hit_test_targets(display_list, visual_context_tree, scroll_state_snapshot);
-    return scroll_tree;
-}
-
-bool blocks_wheel_event_at_position(AsyncScrollingState const& async_scrolling_state, RefPtr<Compositing::DisplayList const> const& display_list, Compositing::AccumulatedVisualContextTree const* visual_context_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position)
-{
-    if (async_scrolling_state.has_blocking_wheel_event_region_covering_viewport)
-        return true;
-
-    // If a caller knows blocking wheel listeners exist but cannot provide a display list for visual-context hit
-    // testing, async scrolling must fail closed. Sending the input to the main thread is slower, but it preserves
-    // cancelability.
-    if (!display_list || !visual_context_tree)
-        return async_scrolling_state.has_blocking_wheel_event_listeners;
-
-    auto scroll_tree = scroll_tree_for_hit_testing(async_scrolling_state, display_list, visual_context_tree, scroll_state_snapshot);
-    return scroll_tree.blocks_wheel_event_at_position(*visual_context_tree, position);
-}
-
-WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const& async_scrolling_state, RefPtr<Compositing::DisplayList const> const& display_list, Compositing::AccumulatedVisualContextTree const* visual_context_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position, Gfx::FloatPoint delta, bool blocking_wheel_event_regions_are_current)
-{
-    WheelHitTestResult hit_test_result;
-    if (display_list && visual_context_tree) {
-        auto scroll_tree = scroll_tree_for_hit_testing(async_scrolling_state, display_list, visual_context_tree, scroll_state_snapshot);
-        hit_test_result = scroll_tree.hit_test_scroll_node_for_wheel(*visual_context_tree, position, delta);
-    } else {
-        hit_test_result.blocked_by_wheel_event_region = async_scrolling_state.has_blocking_wheel_event_listeners;
-    }
-    if (hit_test_result.blocked_by_main_thread_region)
-        return WheelScrollAdmission::BlockedByMainThreadRegion;
-
-    // Async scrolling may only start when the snapshot can prove that the wheel event cannot be canceled by script
-    // at this position. Stale or missing blocker information sends the event back to the main thread.
-    if (async_scrolling_state.has_blocking_wheel_event_listeners) {
-        if (!blocking_wheel_event_regions_are_current)
-            return WheelScrollAdmission::StaleBlockingWheelEventRegions;
-        if (hit_test_result.blocked_by_wheel_event_region)
-            return WheelScrollAdmission::BlockedByWheelEventRegion;
-    }
-
-    if (!hit_test_result.node_id.has_value())
-        return WheelScrollAdmission::NoScrollableTarget;
-    return WheelScrollAdmission::Accepted;
+    if (state.wheel_event_listener_state_generation < newest_wheel_event_listener_state_generation)
+        return WheelRoutingAdmission::StaleWheelEventListeners;
+    return wheel_routing_admission_for(state);
 }
 
 }

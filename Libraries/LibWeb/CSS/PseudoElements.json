@@ -76,6 +76,7 @@
       "float",
       "#custom-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
   },
   "first-line": {
@@ -91,7 +92,14 @@
       "FIXME: ruby-position",
       "#inline-layout-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
+  },
+  "highlight": {
+    "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-highlight",
+    "type": "function",
+    "function-syntax": "<highlight-name-selector>",
+    "accepts-animations": false
   },
   "marker": {
     "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-marker",
@@ -119,6 +127,37 @@
     ],
     "implementation": "element-reference"
   },
+  "search-text": {
+    "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-search-text",
+    "is-highlight": true,
+    "property-whitelist": [
+      "color",
+      "background-color",
+      "#text-decoration-properties",
+      "FIXME: stroke-color",
+      "FIXME: fill-color",
+      "stroke-width",
+      "#custom-properties"
+    ],
+    "accepts-animations": false,
+    "implementation": "synthetic"
+  },
+  "search-text-current": {
+    "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-search-text",
+    "is-highlight": true,
+    "is-internal": true,
+    "property-whitelist": [
+      "color",
+      "background-color",
+      "#text-decoration-properties",
+      "FIXME: stroke-color",
+      "FIXME: fill-color",
+      "stroke-width",
+      "#custom-properties"
+    ],
+    "accepts-animations": false,
+    "implementation": "synthetic"
+  },
   "selection": {
     "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-selection",
     "is-highlight": true,
@@ -131,6 +170,7 @@
       "stroke-width",
       "#custom-properties"
     ],
+    "accepts-animations": false,
     "implementation": "synthetic"
   },
   "slider-fill": {
@@ -152,6 +192,21 @@
     "is-element-backed": true,
     "implementation": "element-reference"
   },
+  "spelling-error": {
+    "spec": "https://drafts.csswg.org/css-pseudo-4/#selectordef-spelling-error",
+    "is-highlight": true,
+    "property-whitelist": [
+      "color",
+      "background-color",
+      "#text-decoration-properties",
+      "FIXME: stroke-color",
+      "FIXME: fill-color",
+      "stroke-width",
+      "#custom-properties"
+    ],
+    "accepts-animations": false,
+    "implementation": "synthetic"
+  },
   "view-transition": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition",
     "is-pseudo-root": true,
@@ -160,21 +215,21 @@
   "view-transition-group": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition-group",
     "type": "function",
-    "function-syntax": "<pt-name-selector>"
+    "function-syntax": "<pt-name-and-class-selector>"
   },
   "view-transition-image-pair": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition-image-pair",
     "type": "function",
-    "function-syntax": "<pt-name-selector>"
+    "function-syntax": "<pt-name-and-class-selector>"
   },
   "view-transition-new": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition-new",
     "type": "function",
-    "function-syntax": "<pt-name-selector>"
+    "function-syntax": "<pt-name-and-class-selector>"
   },
   "view-transition-old": {
     "spec": "https://drafts.csswg.org/css-view-transitions-1/#selectordef-view-transition-old",
     "type": "function",
-    "function-syntax": "<pt-name-selector>"
+    "function-syntax": "<pt-name-and-class-selector>"
   }
 }

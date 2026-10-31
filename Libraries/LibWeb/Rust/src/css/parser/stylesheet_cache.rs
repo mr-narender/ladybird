@@ -5,14 +5,14 @@
  */
 
 use super::syntax_parser::ParsedStyleSheet;
-use super::value_parser::{FfiValueParsingContext, ParseContext};
+use super::value_parser::{FfiValueParsingContext, ParseContext, RandomFunctionIndex};
 use crate::css::css_tokenizer::TokenizerInput;
 use crate::css::ffi_support::FfiUtf16View;
 use crate::css::style_compute::{FfiFontMetrics, FfiLengthResolutionContext};
 use std::cell::Cell;
-use std::collections::{HashMap, hash_map::RandomState};
+use std::collections::{HashMap, HashSet, hash_map::RandomState};
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 
 #[derive(PartialEq, Eq, Hash)]
 struct LengthResolutionKey {
@@ -20,6 +20,7 @@ struct LengthResolutionKey {
     font: [u64; 5],
     root_font: [u64; 5],
     container: [u64; 2],
+    zoom: u64,
     flags: [bool; 7],
 }
 
@@ -40,6 +41,7 @@ impl LengthResolutionKey {
             container_height_basis_depends_on_viewport_metrics,
             subject_inline_axis_is_horizontal,
             resolved_viewport_relative_length,
+            zoom,
         } = *context;
         // A cache hit cannot reproduce writes to an external dependency-tracking flag.
         if !resolved_viewport_relative_length.is_null() {
@@ -66,6 +68,7 @@ impl LengthResolutionKey {
             font: font_key(&font_metrics),
             root_font: font_key(&root_font_metrics),
             container: [container_width_basis.to_bits(), container_height_basis.to_bits()],
+            zoom: zoom.to_bits(),
             flags: [
                 font_metrics_depend_on_viewport_metrics,
                 root_font_metrics_depend_on_viewport_metrics,
@@ -128,14 +131,6 @@ thread_local! {
     }) };
 }
 
-pub(super) fn record_base_url_dependency() {
-    ParseDependencies {
-        base_url: true,
-        ..Default::default()
-    }
-    .record();
-}
-
 pub(super) fn record_length_resolution_dependency() {
     ParseDependencies {
         length_resolution: true,
@@ -173,21 +168,20 @@ fn own_text(source: TokenizerInput<'_>) -> Box<[u16]> {
     text.into_boxed_slice()
 }
 
-unsafe fn own_view(view: FfiUtf16View) -> Option<Box<[u16]>> {
-    Some(own_text(unsafe { view.units() }?))
+fn own_view(view: FfiUtf16View) -> Option<Box<[u16]>> {
+    Some(own_text(view.units()?))
 }
 
-unsafe fn own_url(pointer: *const u8, length: usize) -> Option<Box<[u16]>> {
-    if length == 0 {
+fn own_url(bytes: &[u8]) -> Option<Box<[u16]>> {
+    if bytes.is_empty() {
         return Some(Box::default());
     }
     // The legacy URL context is UTF-8. Keep the cache's owned strings in native UTF-16.
-    let bytes = unsafe { std::slice::from_raw_parts(pointer, length) };
     Some(std::str::from_utf8(bytes).ok()?.encode_utf16().collect())
 }
 
 impl ContextKey {
-    unsafe fn new(context: &ParseContext) -> Option<Self> {
+    fn new(context: &ParseContext) -> Option<Self> {
         // Keep this exhaustive so new parsing inputs cannot silently bypass the cache key.
         let ParseContext {
             in_quirks_mode,
@@ -196,38 +190,34 @@ impl ContextKey {
             contains_attr_tainted_values,
             is_ua_style_sheet,
             value_contexts: borrowed_value_contexts,
-            value_context_count,
-            declared_namespaces: borrowed_declared_namespaces,
+            declared_namespaces,
             // Parsed values do not use the document URL. Image values capture the base URL.
             document_url: _,
-            document_url_length: _,
             document_base_url,
-            document_base_url_length,
             length_resolution_context,
             random_function_index,
         } = *context;
-        let mut value_contexts = Vec::with_capacity(value_context_count);
-        for index in 0..value_context_count {
-            let FfiValueParsingContext {
-                kind,
-                value,
-                secondary_value,
-                name,
-            } = unsafe { *borrowed_value_contexts.add(index) };
+        let mut value_contexts = Vec::with_capacity(borrowed_value_contexts.as_slice().len());
+        for &FfiValueParsingContext {
+            kind,
+            value,
+            secondary_value,
+            name,
+        } in borrowed_value_contexts.as_slice()
+        {
             value_contexts.push(ValueContextKey {
                 kind: kind as u8,
                 value,
                 secondary_value,
-                name: unsafe { own_view(name) }?,
+                name: own_view(name)?,
             });
         }
-        let declared_namespaces = unsafe { borrowed_declared_namespaces.as_ref() }
+        let declared_namespaces = declared_namespaces
             .into_iter()
             .flat_map(|namespaces| namespaces.prefixes.iter())
             .map(|namespace| namespace.units().into())
             .collect();
-        let length_resolution = match unsafe { length_resolution_context.cast::<FfiLengthResolutionContext>().as_ref() }
-        {
+        let length_resolution = match length_resolution_context {
             Some(context) => Some(LengthResolutionKey::new(context)?),
             None => None,
         };
@@ -242,16 +232,67 @@ impl ContextKey {
                 ],
                 value_contexts,
                 declared_namespaces,
-                random_function_index: unsafe { random_function_index.as_ref() }.copied(),
+                random_function_index: random_function_index.map(RandomFunctionIndex::get),
             },
-            document_base_url: unsafe { own_url(document_base_url, document_base_url_length) }?,
+            document_base_url: own_url(document_base_url.as_slice())?,
             length_resolution,
         })
     }
 }
 
+/// Identifies a sheet's text without keeping a copy of it: its length and two keyed hashes of its code units. The
+/// keys are random for each process, so a page cannot make two different texts collide.
+#[derive(PartialEq, Eq, Hash)]
+struct TextDigest {
+    length: usize,
+    hashes: [u64; 2],
+}
+
+impl TextDigest {
+    fn new(source: TokenizerInput<'_>) -> Self {
+        const CHUNK_BYTES: usize = 4096;
+        static KEYS: OnceLock<[RandomState; 2]> = OnceLock::new();
+        let mut hashers = KEYS
+            .get_or_init(|| [RandomState::new(), RandomState::new()])
+            .each_ref()
+            .map(RandomState::build_hasher);
+        let mut write = |bytes: &[u8]| hashers.iter_mut().for_each(|hasher| hasher.write(bytes));
+        // NB: Equal texts hash equally whether they arrive as ASCII or as UTF-16, so UTF-16 text that is all ASCII is
+        //     hashed as ASCII. The first byte keeps the two forms apart otherwise.
+        let mut chunk = [0u8; CHUNK_BYTES];
+        match source {
+            TokenizerInput::Ascii(units) => {
+                write(&[0]);
+                write(units);
+            }
+            TokenizerInput::Utf16(units) if units.iter().all(|&unit| unit < 0x80) => {
+                write(&[0]);
+                for part in units.chunks(CHUNK_BYTES) {
+                    for (byte, &unit) in chunk.iter_mut().zip(part) {
+                        *byte = unit as u8;
+                    }
+                    write(&chunk[..part.len()]);
+                }
+            }
+            TokenizerInput::Utf16(units) => {
+                write(&[1]);
+                for part in units.chunks(CHUNK_BYTES / 2) {
+                    for (bytes, &unit) in chunk.as_chunks_mut::<2>().0.iter_mut().zip(part) {
+                        bytes.copy_from_slice(&unit.to_ne_bytes());
+                    }
+                    write(&chunk[..part.len() * 2]);
+                }
+            }
+        }
+        Self {
+            length: source.len(),
+            hashes: hashers.map(|hasher| hasher.finish()),
+        }
+    }
+}
+
 struct StyleSheetKey {
-    text: Box<[u16]>,
+    text: TextDigest,
     context: Option<ContextKey>,
 }
 
@@ -285,6 +326,48 @@ pub(super) struct CachedParseMetadata {
 
 type Entries = HashMap<u64, Vec<Weak<ParsedStyleSheet>>>;
 
+#[derive(Default)]
+struct Cache {
+    entries: Entries,
+    /// The common hashes of the sheets a worker is parsing right now. A worker whose sheet is among them waits for
+    /// that parse to publish rather than parsing the same sheet again: documents that load one sheet at the same
+    /// time (a page's frames, e.g.) would otherwise each parse it in full, and all but one throw the result away.
+    in_flight: HashSet<u64>,
+}
+
+struct SharedCache {
+    cache: Mutex<Cache>,
+    /// Signaled whenever a parse leaves `in_flight`, published or not.
+    parse_finished: Condvar,
+}
+
+impl SharedCache {
+    fn the() -> &'static Self {
+        static CACHE: OnceLock<SharedCache> = OnceLock::new();
+        CACHE.get_or_init(|| SharedCache {
+            cache: Mutex::default(),
+            parse_finished: Condvar::new(),
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap()
+    }
+}
+
+/// Marks a sheet's parse as in flight for as long as it lives, so that the mark comes off however the parse ends.
+struct InFlightParse {
+    hash: u64,
+}
+
+impl Drop for InFlightParse {
+    fn drop(&mut self) {
+        let shared = SharedCache::the();
+        shared.lock().in_flight.remove(&self.hash);
+        shared.parse_finished.notify_all();
+    }
+}
+
 fn find(entries: &Entries, hash: u64, key: &StyleSheetKey) -> Option<Arc<ParsedStyleSheet>> {
     entries.get(&hash)?.iter().filter_map(Weak::upgrade).find(|sheet| {
         sheet
@@ -294,27 +377,23 @@ fn find(entries: &Entries, hash: u64, key: &StyleSheetKey) -> Option<Arc<ParsedS
     })
 }
 
-/// # Safety
-/// All pointers in `context` must remain valid for this call, just as for parsing.
-pub(super) unsafe fn parse_with_cache(
+pub(super) fn parse_with_cache(
     source: TokenizerInput<'_>,
-    context: *const ParseContext,
+    context: Option<&ParseContext>,
     parse: impl FnOnce() -> ParsedStyleSheet,
 ) -> Arc<ParsedStyleSheet> {
-    let context = unsafe { context.as_ref() };
     let context_key = match context {
-        Some(context) => match unsafe { ContextKey::new(context) } {
+        Some(context) => match ContextKey::new(context) {
             Some(key) => Some(key),
             None => return Arc::new(parse()),
         },
         None => None,
     };
     let key = StyleSheetKey {
-        text: own_text(source),
+        text: TextDigest::new(source),
         context: context_key,
     };
     static HASHER: OnceLock<RandomState> = OnceLock::new();
-    static CACHE: OnceLock<Mutex<Entries>> = OnceLock::new();
     let hash = HASHER.get_or_init(RandomState::new).hash_one(&key);
     // Keep context-dependent variants in separate buckets so many documents using one
     // contextual sheet do not create a linear scan. Independent sheets use the common key.
@@ -327,33 +406,49 @@ pub(super) unsafe fn parse_with_cache(
         hasher.hash_one((hash, 2_u8, lengths)),
         hasher.hash_one((hash, 3_u8, base_url, lengths)),
     ];
-    let cache = CACHE.get_or_init(Mutex::default);
+    let shared = SharedCache::the();
     let cached = {
-        let entries = cache.lock().unwrap();
-        hashes.iter().find_map(|&hash| find(&entries, hash, &key))
+        let mut cache = shared.lock();
+        loop {
+            if let Some(sheet) = hashes.iter().find_map(|&hash| find(&cache.entries, hash, &key)) {
+                break Some(sheet);
+            }
+            // The parse in flight may publish under a context-dependent hash that this key doesn't match; the
+            // lookup above misses again then, and this worker parses for itself.
+            if cache.in_flight.insert(hash) {
+                break None;
+            }
+            cache = shared.parse_finished.wait(cache).unwrap();
+        }
     };
     if let Some(sheet) = cached {
         sheet.cache_metadata.as_ref().unwrap().dependencies.record();
-        if let Some(counter) = context.and_then(|context| unsafe { context.random_function_index.as_mut() }) {
-            *counter = sheet
-                .cache_metadata
-                .as_ref()
-                .unwrap()
-                .final_random_function_index
-                .unwrap();
+        if let Some(counter) = context.and_then(|context| context.random_function_index) {
+            counter.set(
+                sheet
+                    .cache_metadata
+                    .as_ref()
+                    .unwrap()
+                    .final_random_function_index
+                    .unwrap(),
+            );
         }
         return sheet;
     }
 
     // Never hold the cache lock while parsing. Workers parsing different sheets run independently.
+    let in_flight = InFlightParse { hash };
     let dependency_scope = ParseDependencyScope::new();
     let mut sheet = parse();
     let dependencies = dependency_scope.dependencies();
     drop(dependency_scope);
     let hash = hashes[dependencies.index()];
-    let mut entries = cache.lock().unwrap();
-    // Another worker may have published the same sheet while this worker was parsing.
-    if let Some(sheet) = find(&entries, hash, &key) {
+    let mut cache = shared.lock();
+    let entries = &mut cache.entries;
+    // A worker whose context matched this key under another dependency may have published while this one parsed.
+    if let Some(sheet) = find(entries, hash, &key) {
+        drop(cache);
+        drop(in_flight);
         return sheet;
     }
     entries.retain(|_, bucket| {
@@ -364,10 +459,32 @@ pub(super) unsafe fn parse_with_cache(
         key,
         dependencies,
         final_random_function_index: context
-            .and_then(|context| unsafe { context.random_function_index.as_ref() })
-            .copied(),
+            .and_then(|context| context.random_function_index)
+            .map(RandomFunctionIndex::get),
     });
     let sheet = Arc::new(sheet);
     entries.entry(hash).or_default().push(Arc::downgrade(&sheet));
+    drop(cache);
+    drop(in_flight);
     sheet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_digests_agree_for_ascii_and_utf16_forms_of_one_text() {
+        let utf16 = |text: &str| text.encode_utf16().collect::<Vec<_>>();
+        let long = "a { color: red }\n".repeat(1000);
+        for text in ["", "a{}", long.as_str()] {
+            let ascii = TextDigest::new(TokenizerInput::Ascii(text.as_bytes()));
+            assert!(ascii == TextDigest::new(TokenizerInput::Utf16(&utf16(text))));
+        }
+        let ascii = TextDigest::new(TokenizerInput::Ascii(b"a{}"));
+        assert!(ascii != TextDigest::new(TokenizerInput::Ascii(b"b{}")));
+        let wide = TextDigest::new(TokenizerInput::Utf16(&utf16("\u{e9}{}")));
+        assert!(wide == TextDigest::new(TokenizerInput::Utf16(&utf16("\u{e9}{}"))));
+        assert!(wide != TextDigest::new(TokenizerInput::Utf16(&utf16("\u{e8}{}"))));
+    }
 }

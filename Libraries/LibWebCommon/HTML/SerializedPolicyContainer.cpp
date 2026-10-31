@@ -16,6 +16,9 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::SerializedPolicyContainer cons
     TRY(encoder.encode(serialized_policy_container.csp_list));
     TRY(encoder.encode(serialized_policy_container.embedder_policy));
     TRY(encoder.encode(serialized_policy_container.referrer_policy));
+    TRY(encoder.encode(serialized_policy_container.force_load_at_top));
+    TRY(encoder.encode(serialized_policy_container.insecure_requests_policy));
+    TRY(encoder.encode(serialized_policy_container.upgrade_insecure_navigations_set));
 
     return {};
 }
@@ -28,6 +31,9 @@ ErrorOr<Web::HTML::SerializedPolicyContainer> decode(Decoder& decoder)
     serialized_policy_container.csp_list = TRY(decoder.decode<Vector<Web::ContentSecurityPolicy::SerializedPolicy>>());
     serialized_policy_container.embedder_policy = TRY(decoder.decode<Web::HTML::EmbedderPolicy>());
     serialized_policy_container.referrer_policy = TRY(decoder.decode<Web::ReferrerPolicy::ReferrerPolicy>());
+    serialized_policy_container.force_load_at_top = TRY(decoder.decode<bool>());
+    serialized_policy_container.insecure_requests_policy = TRY(decoder.decode<Web::UpgradeInsecureRequests::InsecureRequestsPolicy>());
+    serialized_policy_container.upgrade_insecure_navigations_set = TRY(decoder.decode<Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet>());
 
     return serialized_policy_container;
 }

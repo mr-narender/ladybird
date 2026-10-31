@@ -28,8 +28,8 @@ public:
 
     PermissionDescriptor const& query() const { return m_query; }
 
-    // https://w3c.github.io/permissions/#dfn-permissionstatus-update-steps
-    void update_steps();
+    // Reads the state again from the permission store, and fires change at this status if it moved.
+    void update_from_store();
 
     // https://w3c.github.io/permissions/#dom-permissionstatus-onchange
     void set_onchange(GC::Ptr<WebIDL::CallbackType> event_handler);

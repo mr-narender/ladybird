@@ -273,7 +273,7 @@ value:
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#concept-get-xml-encoding-when-sniffing
-static Optional<ByteString> get_an_xml_encoding(ReadonlyBytes input)
+Optional<ByteString> get_an_xml_encoding(ReadonlyBytes input)
 {
     // 1. Let encodingPosition be a pointer to the start of the stream.
     size_t encoding_position = 0;
@@ -596,7 +596,7 @@ ByteString extract_tld_hint(URL::URL const& url)
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
-EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type)
+EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type, GC::Ptr<DOM::Document> loading_container_document)
 {
     // 1. If the result of BOM sniffing is an encoding, return that encoding with confidence certain.
     auto bom = run_bom_sniff(input);
@@ -626,10 +626,18 @@ EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, 
     if (prescan.has_value())
         return { prescan.release_value(), EncodingConfidence::Tentative };
 
-    // 6. FIXME: If the HTML parser for which this algorithm is being run is associated with a Document d whose container document is non-null, then:
-    // 1. Let parentDocument be d's container document.
-    // 2. If parentDocument's origin is same origin with d's origin and parentDocument's character encoding is not UTF-16BE/LE, then return parentDocument's character
-    //    encoding, with the confidence tentative.
+    // 6. If the HTML parser for which this algorithm is being run is associated with a Document d whose container document is non-null, then:
+    auto parent_document = loading_container_document ? loading_container_document : document.container_document();
+    if (parent_document) {
+        // 1. Let parentDocument be d's container document.
+        // 2. If parentDocument's origin is same origin with d's origin and parentDocument's character encoding is not UTF-16BE/LE, then return parentDocument's character
+        //    encoding, with the confidence tentative.
+        if (parent_document->origin().is_same_origin(document.origin())) {
+            auto parent_encoding = parent_document->character_set().to_byte_string();
+            if (!parent_encoding.is_one_of_ignoring_ascii_case("UTF-16BE"sv, "UTF-16LE"sv))
+                return { move(parent_encoding), EncodingConfidence::Tentative };
+        }
+    }
 
     // 7. Otherwise, if the user agent has information on the likely encoding for this page, e.g. based on the encoding of the page when it was last visited, then return
     //    that encoding, with the confidence tentative.
@@ -641,24 +649,17 @@ EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, 
     //    then return that encoding, with the confidence tentative. [UNIVCHARDET]
 
     auto tld_hint = extract_tld_hint(document.url());
-    u8 const* tld_data = tld_hint.is_empty() ? nullptr : reinterpret_cast<u8 const*>(tld_hint.characters());
-    size_t tld_size = tld_hint.length();
 
     u8 const* encoding_name_ptr = nullptr;
     size_t encoding_name_len = 0;
 
     bool allow_utf8_detection = document.url().scheme() == "file"sv;
 
-    if (Parser::rust_detect_encoding(
-            input.data(), input.size(),
-            tld_data, tld_size,
-            allow_utf8_detection,
-            &encoding_name_ptr, &encoding_name_len)) {
-        auto detected = StringView { reinterpret_cast<char const*>(encoding_name_ptr), encoding_name_len };
-        auto standardized = TextCodec::get_standardized_encoding(detected);
-        if (standardized.has_value())
-            return { ByteString { standardized.value() }, EncodingConfidence::Tentative };
-    }
+    Parser::rust_detect_encoding(input, tld_hint.bytes(), allow_utf8_detection, &encoding_name_ptr, &encoding_name_len);
+    auto detected = StringView { reinterpret_cast<char const*>(encoding_name_ptr), encoding_name_len };
+    auto standardized = TextCodec::get_standardized_encoding(detected);
+    if (standardized.has_value())
+        return { ByteString { standardized.value() }, EncodingConfidence::Tentative };
 
     // 9. Otherwise, return an implementation-defined or user-specified default character encoding, with the confidence tentative.
     //    In controlled environments or in environments where the encoding of documents can be prescribed (for example, for user agents intended for dedicated use in new

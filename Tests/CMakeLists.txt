@@ -1,3 +1,11 @@
+if (BUILD_BROWSER_TESTS_ONLY)
+    if (ENABLE_GUI_TARGETS)
+        add_subdirectory(LibWeb)
+        add_subdirectory(LibWebView)
+    endif()
+    return()
+endif()
+
 add_subdirectory(AK)
 add_subdirectory(LibCompress)
 add_subdirectory(LibCore)
@@ -27,15 +35,22 @@ add_subdirectory(Meta)
 
 # FIXME: Provide standalone implementations of the C++ FFI callbacks required by Rust test binaries on Windows.
 if (NOT WIN32)
+    string(TOUPPER "${RUST_TARGET_TRIPLE}" rust_target_upper)
+    string(REPLACE "-" "_" rust_target_upper "${rust_target_upper}")
+    set(rust_test_env "CARGO_TARGET_${rust_target_upper}_RUSTFLAGS=${RUSTC_TARGET_FLAGS}")
+
     set(rust_workspace_test_command
         "${CMAKE_COMMAND}" -E env
+            ${rust_test_env}
             "CARGO_TARGET_DIR=${CMAKE_BINARY_DIR}/cargo/build"
+            "RUST_ECHO_SERVER_ENDPOINT=${CMAKE_CURRENT_BINARY_DIR}/LibIPC/RustEchoServerEndpoint.rs"
             "${RUST_CARGO}" test --workspace
                 --manifest-path "${LADYBIRD_SOURCE_DIR}/Cargo.toml"
                 --target "${RUST_TARGET_TRIPLE}"
     )
     set(flap_test_command
         "${CMAKE_COMMAND}" -E env
+            ${rust_test_env}
             "CARGO_TARGET_DIR=${CMAKE_BINARY_DIR}/cargo/flap-tests"
             "${RUST_CARGO}" test
                 --manifest-path "${LADYBIRD_SOURCE_DIR}/Libraries/LibJS/Flap/Cargo.toml"
@@ -72,16 +87,20 @@ if (NOT WIN32)
         COMMAND_EXPAND_LISTS
     )
     add_custom_target(rust-tests ALL DEPENDS "${rust_tests_stamp}")
+    add_dependencies(rust-tests generate_RustEchoServerEndpoint.h)
 
     add_test(NAME RustWorkspace COMMAND ${rust_workspace_test_command})
     add_test(NAME Flap COMMAND ${flap_test_command})
 endif()
 
 if (ENABLE_GUI_TARGETS)
+    add_subdirectory(AudioServer)
     add_subdirectory(Compositor)
+    add_subdirectory(LibAudio)
     add_subdirectory(LibCompositing)
     add_subdirectory(LibDevTools)
     add_subdirectory(LibGfx)
+    add_subdirectory(LibImageDecoderClient)
     add_subdirectory(LibMedia)
     add_subdirectory(LibWeb)
     add_subdirectory(LibWebCommon)

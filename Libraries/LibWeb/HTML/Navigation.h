@@ -87,7 +87,7 @@ public:
     [[nodiscard]] static GC::Ref<Navigation> create(Window&);
 
     // IDL properties and methods
-    Vector<GC::Ref<NavigationHistoryEntry>> entries() const;
+    ReadonlySpan<GC::Ref<NavigationHistoryEntry>> entries() const;
     GC::Ptr<NavigationHistoryEntry> current_entry() const;
     WebIDL::ExceptionOr<void> update_current_entry(NavigationUpdateCurrentEntryOptions);
 
@@ -153,6 +153,7 @@ public:
     // Internal Getters/Setters
     GC::Ptr<NavigateEvent> ongoing_navigate_event() const { return m_ongoing_navigate_event; }
     void set_ongoing_navigate_event(GC::Ptr<NavigateEvent> event) { m_ongoing_navigate_event = event; }
+    GC::Ptr<NavigationAPIMethodTracker> ongoing_api_method_tracker() const { return m_ongoing_api_method_tracker; }
     void set_ongoing_api_method_tracker(GC::Ptr<NavigationAPIMethodTracker> tracker) { m_ongoing_api_method_tracker = tracker; }
 
     bool focus_changed_during_ongoing_navigation() const { return m_focus_changed_during_ongoing_navigation; }
@@ -237,6 +238,5 @@ private:
 };
 
 HistoryHandlingBehavior to_history_handling_behavior(NavigationHistoryBehavior);
-NavigationHistoryBehavior to_navigation_history_behavior(HistoryHandlingBehavior);
 
 }

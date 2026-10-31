@@ -5,6 +5,7 @@
  */
 
 #include <AK/ByteBuffer.h>
+#include <AK/NumericLimits.h>
 #include <AK/Platform.h>
 #include <AK/Vector.h>
 #include <LibCore/AnonymousBuffer.h>
@@ -18,6 +19,7 @@
 #else
 #    include <errno.h>
 #    include <fcntl.h>
+#    include <sys/mman.h>
 #    include <unistd.h>
 #endif
 
@@ -126,15 +128,47 @@ TEST_CASE(snapshot_has_independent_contents)
     EXPECT_EQ(StringView(snapshot.data<char const>(), payload.length()), payload);
 }
 
+TEST_CASE(snapshot_copies_only_the_requested_range)
+{
+    auto original = MUST(Core::AnonymousBuffer::create_with_size(16));
+    for (u8 i = 0; i < 16; ++i)
+        original.data<u8>()[i] = i;
+    auto snapshot = MUST(original.snapshot(4, 8));
+    EXPECT_EQ(snapshot.size(), 8u);
+    for (u8 i = 0; i < 8; ++i)
+        EXPECT_EQ(snapshot.data<u8>()[i], i + 4);
+    original.data<u8>()[4] = 0;
+    EXPECT_EQ(snapshot.data<u8>()[0], 4);
+    EXPECT(original.snapshot(17, 0).is_error());
+    EXPECT(original.snapshot(4, 13).is_error());
+    EXPECT(original.snapshot(4, NumericLimits<size_t>::max()).is_error());
+    EXPECT_EQ(MUST(original.snapshot(16, 0)).size(), 0u);
+}
+
 TEST_CASE(snapshot_rejects_an_invalid_buffer)
 {
     EXPECT(Core::AnonymousBuffer {}.snapshot().is_error());
 }
 
+TEST_CASE(validate_backing_size_accepts_a_fully_backed_buffer)
+{
+    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(2 * static_cast<size_t>(PAGE_SIZE)));
+    EXPECT(!buffer.validate_backing_size().is_error());
+
+    auto fd = MUST(Core::System::dup(buffer.fd()));
+    auto mirror = MUST(Core::AnonymousBuffer::create_from_anon_fd(fd, buffer.size()));
+    EXPECT(!mirror.validate_backing_size().is_error());
+}
+
+TEST_CASE(validate_backing_size_rejects_an_invalid_buffer)
+{
+    EXPECT(Core::AnonymousBuffer {}.validate_backing_size().is_error());
+}
+
 #if (defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)) && defined(F_ADD_SEALS) && defined(F_GET_SEALS) && defined(F_SEAL_GROW) && defined(F_SEAL_SHRINK)
 TEST_CASE(create_sealable_buffer)
 {
-    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(128, Core::AnonymousBuffer::Sealability::Sealable));
+    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(128));
     MUST(Core::System::fcntl(buffer.fd(), F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK));
     auto seals = MUST(Core::System::fcntl(buffer.fd(), F_GET_SEALS, static_cast<uintptr_t>(0)));
     EXPECT_EQ(seals & (F_SEAL_GROW | F_SEAL_SHRINK), F_SEAL_GROW | F_SEAL_SHRINK);
@@ -142,7 +176,7 @@ TEST_CASE(create_sealable_buffer)
 
 TEST_CASE(snapshot_rejects_a_buffer_larger_than_its_backing_store)
 {
-    auto original = MUST(Core::AnonymousBuffer::create_with_size(64, Core::AnonymousBuffer::Sealability::Sealable));
+    auto original = MUST(Core::AnonymousBuffer::create_with_size(64));
     auto fd = MUST(Core::System::dup(original.fd()));
     auto oversized = MUST(Core::AnonymousBuffer::create_from_anon_fd(fd, 128));
     EXPECT(oversized.snapshot().is_error());
@@ -180,7 +214,7 @@ TEST_CASE(failed_creation_from_a_handle_closes_the_handle)
 #ifdef AK_OS_LINUX
 TEST_CASE(create_with_size_seals_immutable_size)
 {
-    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(8192, Core::AnonymousBuffer::Sealability::Sealable));
+    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(8192));
     EXPECT(buffer.is_valid());
 
     int seals = fcntl(buffer.fd(), F_GET_SEALS);
@@ -199,10 +233,56 @@ TEST_CASE(create_with_size_seals_immutable_size)
     EXPECT_EQ(data[0], static_cast<u8>(0x5a));
 }
 
-TEST_CASE(create_with_size_unsealed_by_default)
+static int create_unsealed_memfd(size_t size, unsigned flags)
 {
-    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(8192));
-    // Without the seal, the fd can still be resized.
-    EXPECT(ftruncate(buffer.fd(), 4096) == 0);
+    auto fd = memfd_create("", MFD_CLOEXEC | flags);
+    VERIFY(fd >= 0);
+    VERIFY(ftruncate(fd, static_cast<off_t>(size)) == 0);
+    return fd;
+}
+
+TEST_CASE(validate_backing_size_seals_a_received_buffer)
+{
+    auto const page_size = static_cast<size_t>(PAGE_SIZE);
+    auto buffer = MUST(Core::AnonymousBuffer::create_from_anon_fd(create_unsealed_memfd(2 * page_size, MFD_ALLOW_SEALING), 2 * page_size));
+    EXPECT(!buffer.validate_backing_size().is_error());
+
+    // The sender still holds the fd, but can no longer pull the pages out from under the mapping.
+    errno = 0;
+    EXPECT(ftruncate(buffer.fd(), static_cast<off_t>(page_size)) < 0);
+    EXPECT_EQ(errno, EPERM);
+}
+
+TEST_CASE(validate_backing_size_rejects_a_buffer_that_cannot_be_sealed)
+{
+    auto buffer = MUST(Core::AnonymousBuffer::create_from_anon_fd(create_unsealed_memfd(4096, 0), 4096));
+    EXPECT(buffer.validate_backing_size().is_error());
+}
+
+// These truncation tests are Linux-only: macOS refuses to resize a shared memory object once its
+// size is set, so a truncated backing file cannot be produced there.
+TEST_CASE(validate_backing_size_rejects_a_truncated_backing_file)
+{
+    auto const page_size = static_cast<size_t>(PAGE_SIZE);
+    auto buffer = MUST(Core::AnonymousBuffer::create_from_anon_fd(create_unsealed_memfd(2 * page_size, MFD_ALLOW_SEALING), 2 * page_size));
+    EXPECT_EQ(ftruncate(buffer.fd(), static_cast<off_t>(page_size)), 0);
+    // The mapping is deliberately never touched from here on: its second page no longer has backing.
+    EXPECT(buffer.validate_backing_size().is_error());
+}
+
+TEST_CASE(validate_backing_size_rejects_a_claim_larger_than_the_backing_file)
+{
+    auto original = MUST(Core::AnonymousBuffer::create_with_size(64));
+    auto fd = MUST(Core::System::dup(original.fd()));
+    auto oversized = MUST(Core::AnonymousBuffer::create_from_anon_fd(fd, 128));
+    EXPECT(oversized.validate_backing_size().is_error());
+}
+
+TEST_CASE(a_sealed_buffer_cannot_be_truncated)
+{
+    auto const page_size = static_cast<size_t>(PAGE_SIZE);
+    auto buffer = MUST(Core::AnonymousBuffer::create_with_size(2 * page_size));
+    EXPECT(ftruncate(buffer.fd(), static_cast<off_t>(page_size)) < 0);
+    EXPECT(!buffer.validate_backing_size().is_error());
 }
 #endif

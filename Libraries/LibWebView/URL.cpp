@@ -14,6 +14,7 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibURL/Parser.h>
 #include <LibURL/PublicSuffixData.h>
+#include <LibWebCommon/Fetch/Infrastructure/URL.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Autocomplete.h>
 #include <LibWebView/ExternalURLHandler.h>
@@ -23,12 +24,12 @@ namespace WebView {
 
 bool is_url_handled_internally(URL::URL const& url)
 {
-    return url.scheme().is_one_of("about"sv, "blob"sv, "data"sv, "file"sv, "http"sv, "https"sv, "resource"sv);
+    return Web::Fetch::Infrastructure::is_fetch_scheme(url.scheme());
 }
 
 static bool has_valid_explicit_port(StringView input)
 {
-    auto authority_end = input.find_any_of("/?#"sv).value_or(input.length());
+    auto authority_end = input.find_any_of("/\\?#"sv).value_or(input.length());
     auto authority = input.substring_view(0, authority_end);
 
     Optional<size_t> port_separator;
@@ -86,6 +87,19 @@ static bool should_guess_http_scheme_for_host(URL::Host const& host)
     return false;
 }
 
+// The URL parser accepts abbreviated IPv4 addresses, so numeric text such as "88" parses as 0.0.0.88. Text without a
+// scheme or a port is only taken for an IPv4 address when all four parts are there.
+static bool is_abbreviated_ipv4_hostname(StringView text)
+{
+    auto hostname_end = text.find_any_of(":/\\?#"sv).value_or(text.length());
+    auto hostname = text.substring_view(0, hostname_end);
+    auto host = URL::Parser::parse_host(hostname);
+    if (!host.has_value() || !host->has<IPv4Address>())
+        return false;
+    auto parts = hostname.split_view('.', SplitBehavior::KeepEmpty);
+    return parts.size() != 4 || any_of(parts, [](auto part) { return part.is_empty(); });
+}
+
 ClassifiedUserInput classify_user_input(StringView location, AppendTLD append_tld)
 {
     location = location.trim_whitespace();
@@ -122,6 +136,9 @@ ClassifiedUserInput classify_user_input(StringView location, AppendTLD append_tl
         input_has_explicit_port = true;
     } else if (url.has_value()) {
         return { UserInputClassification::ExternalURL, move(url) };
+    } else if (is_abbreviated_ipv4_hostname(location)) {
+        // NB: With a port, the text is taken for an address all the same.
+        return {};
     } else {
         schemeless_location = location;
 
@@ -204,19 +221,13 @@ Optional<URL::URL> url_from_text(StringView text)
     if (trimmed_text.is_empty() || trimmed_text.is_whitespace())
         return {};
 
-    if (trimmed_text.starts_with('.') || trimmed_text.starts_with('/'))
+    // NB: Text that starts with a port, path, query or fragment has no host to go to.
+    if (trimmed_text.starts_with('.') || trimmed_text.starts_with('/') || trimmed_text.starts_with('\\') || trimmed_text.starts_with(':') || trimmed_text.starts_with('?') || trimmed_text.starts_with('#'))
         return {};
 
-    // The URL parser accepts abbreviated IPv4 addresses, causing numeric text such as "88" to be parsed as
-    // 0.0.0.88. For selected text, only recognize an IPv4 address when all four parts are present.
-    auto hostname_end = trimmed_text.find_any_of(":/?#"sv).value_or(trimmed_text.length());
-    auto hostname = trimmed_text.substring_view(0, hostname_end);
-    auto is_numeric_hostname = all_of(hostname.bytes(), [](auto byte) { return is_ascii_digit(byte) || byte == '.'; });
-    if (is_numeric_hostname) {
-        auto parts = hostname.split_view('.', SplitBehavior::KeepEmpty);
-        if (parts.size() != 4 || any_of(parts, [](auto part) { return part.is_empty(); }))
-            return {};
-    }
+    // NB: Selected numbers such as "12:30" aren't addresses either, even though they look like a host and a port.
+    if (is_abbreviated_ipv4_hostname(trimmed_text))
+        return {};
 
     return sanitize_url(trimmed_text);
 }
@@ -235,7 +246,7 @@ bool autocomplete_urls_match(StringView left, StringView right)
     if (!left_url.has_value() || !right_url.has_value())
         return false;
 
-    return left_url->equals(*right_url, URL::ExcludeFragment::Yes);
+    return left_url->equals(*right_url);
 }
 
 bool autocomplete_url_can_complete(StringView query, StringView suggestion)
@@ -251,7 +262,7 @@ bool autocomplete_url_can_complete(StringView query, StringView suggestion)
             && form.starts_with(query, CaseSensitivity::CaseInsensitive);
     };
 
-    auto serialized_suggestion = suggestion_url->serialize(URL::ExcludeFragment::Yes);
+    auto serialized_suggestion = suggestion_url->serialize();
     if (can_complete_form(serialized_suggestion))
         return true;
 

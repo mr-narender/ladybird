@@ -6,7 +6,6 @@
 
 use crate::css::easing::FfiEasingDescriptor;
 use crate::css::ffi_support::FfiUtf16View;
-use crate::layout::used_values;
 use crate::layout::used_values::OptionalCssPixelRect;
 use libgfx_rust::filter::Filter;
 use libgfx_rust::{Color, CompositingAndBlendingOperator, IntRect, InterpolationColorSpace};
@@ -14,26 +13,27 @@ use std::ffi::c_void;
 
 pub use crate::painting::visual_context::ffi_types::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How much of the visual context tree an update walks, in increasing order: the dirty boxes, every
+/// box into the kept tree, or every box into a fresh tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
-pub enum FfiVisualContextBoxDirtyKind {
-    StyleValueChange,
-    StyleStructuralChange,
-    ScrollableOverflowFlipped,
+pub enum VisualContextUpdateScope {
+    #[default]
+    DirtyPath,
+    EveryBox,
+    FreshTree,
+}
+
+impl VisualContextUpdateScope {
+    pub fn rebuilds_every_box(self) -> bool {
+        self != Self::DirtyPath
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum FfiVisualContextGlobalRebuildReason {
-    FirstBuild,
-    DocumentWideStructuralChange,
-    FilterResourcesChanged,
-    ForcedForTesting,
-    CanonicalDumpRequested,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
+#[expect(clippy::enum_variant_names, reason = "C++ names the variants")]
 pub enum FfiVisualContextBoxNodeList {
     SpatialNodes,
     ClipNodes,
@@ -51,6 +51,7 @@ pub struct FfiVisualContextUpdateOutcome {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
+#[expect(dead_code, reason = "C++ constructs the variants")]
 pub enum FfiSvgFilterPrimitiveKind {
     #[default]
     Blend,
@@ -120,13 +121,13 @@ pub struct SvgFilterPrimitiveValues {
 /// and tables it borrows from the element for the duration of one push.
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct FfiSvgFilterPrimitive {
+pub struct FfiSvgFilterPrimitive<'a> {
     pub values: SvgFilterPrimitiveValues,
-    pub in1: FfiUtf16View,
-    pub in2: FfiUtf16View,
-    pub result: FfiUtf16View,
+    pub in1: FfiUtf16View<'a>,
+    pub in2: FfiUtf16View<'a>,
+    pub result: FfiUtf16View<'a>,
     /// feMerge: the `in` of each feMergeNode child.
-    pub merge_inputs: *const FfiUtf16View,
+    pub merge_inputs: *const FfiUtf16View<'a>,
     pub merge_input_count: usize,
     /// feColorMatrix: the parsed `values` list.
     pub color_matrix_values: *const f32,
@@ -144,30 +145,6 @@ pub(crate) struct ResolvedSvgFilter {
     /// primitives.
     pub filter: Option<Filter>,
     pub svg_filter_bounds: OptionalCssPixelRect,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiVisualContextHostCallbacks {
-    pub context: *mut c_void,
-    pub tree_inputs: unsafe extern "C" fn(*mut c_void) -> FfiVisualContextTreeInputs,
-    pub scroll_offset: unsafe extern "C" fn(*mut c_void, *mut c_void) -> used_values::FfiCssPixelPoint,
-    pub node_identity: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64,
-}
-
-impl FfiVisualContextHostCallbacks {
-    pub(crate) fn tree_inputs(&self) -> FfiVisualContextTreeInputs {
-        // SAFETY: The C++ host answers synchronously.
-        unsafe { (self.tree_inputs)(self.context) }
-    }
-    pub(crate) fn node_identity(&self, layout_node_shell: *mut c_void) -> i64 {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.node_identity)(self.context, layout_node_shell) }
-    }
-    pub(crate) fn scroll_offset(&self, layout_node_shell: *mut c_void) -> used_values::FfiCssPixelPoint {
-        // SAFETY: The C++ host answers synchronously from a live layout node shell.
-        unsafe { (self.scroll_offset)(self.context, layout_node_shell) }
-    }
 }
 
 /// Whether a keyframe gives a property a value of its own, takes the target's underlying style
@@ -228,6 +205,10 @@ pub struct FfiCompositorAnimationRequest {
     pub target_kind: FfiVisualAnimationTargetKind,
     /// The target's box, whose visual context nodes the animation drives.
     pub layout_node: crate::layout::node_data::NodeSlotId,
+    /// The target's InheritedUIValues and InheritedTextValues group payloads, whose used color-scheme and color
+    /// the keyframes' colors resolve against.
+    pub target_inherited_ui_values: *const std::ffi::c_void,
+    pub target_inherited_text_values: *const std::ffi::c_void,
     pub timing: FfiCompositorAnimationTiming,
     pub keyframes: *const FfiCompositorAnimationKeyframe,
     pub keyframe_count: usize,
@@ -260,12 +241,6 @@ pub struct FfiCompositorAnimationHost {
         property_id: u16,
         uses_underlying_style: bool,
     ) -> *const std::ffi::c_void,
-    /// The color a resolved color value names for the target; false when it names none.
-    pub resolve_color: unsafe extern "C" fn(
-        context: *mut std::ffi::c_void,
-        value: *const std::ffi::c_void,
-        color: *mut libgfx_rust::Color,
-    ) -> bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

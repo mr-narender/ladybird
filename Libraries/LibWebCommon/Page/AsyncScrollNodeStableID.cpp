@@ -30,10 +30,27 @@ ErrorOr<Web::AsyncScrollNodeStableID> decode(Decoder& decoder)
 }
 
 template<>
+ErrorOr<void> encode(Encoder& encoder, Web::CompositorScrollOffset const& scroll_offset)
+{
+    TRY(encoder.encode(scroll_offset.scroll_node));
+    TRY(encoder.encode(scroll_offset.offset));
+    return {};
+}
+
+template<>
+ErrorOr<Web::CompositorScrollOffset> decode(Decoder& decoder)
+{
+    return Web::CompositorScrollOffset {
+        .scroll_node = TRY(decoder.decode<Web::AsyncScrollNodeStableID>()),
+        .offset = TRY(decoder.decode<Web::CSSPixelPoint>()),
+    };
+}
+
+template<>
 ErrorOr<void> encode(Encoder& encoder, Web::ScrollbarDraggedByCompositor const& scrollbar)
 {
+    TRY(encoder.encode(scrollbar.context_id));
     TRY(encoder.encode(scrollbar.scroller_stable_node_id));
-    TRY(encoder.encode(scrollbar.vertical));
     return {};
 }
 
@@ -41,8 +58,27 @@ template<>
 ErrorOr<Web::ScrollbarDraggedByCompositor> decode(Decoder& decoder)
 {
     return Web::ScrollbarDraggedByCompositor {
+        .context_id = TRY(decoder.decode<Web::CompositorContextId>()),
+        .scroller_stable_node_id = TRY(decoder.decode<Web::AsyncScrollNodeStableID>()),
+    };
+}
+
+template<>
+ErrorOr<void> encode(Encoder& encoder, Web::OverlayScrollbarVisibility const& visibility)
+{
+    TRY(encoder.encode(visibility.scroller_stable_node_id));
+    TRY(encoder.encode(visibility.vertical));
+    TRY(encoder.encode(visibility.hidden));
+    return {};
+}
+
+template<>
+ErrorOr<Web::OverlayScrollbarVisibility> decode(Decoder& decoder)
+{
+    return Web::OverlayScrollbarVisibility {
         .scroller_stable_node_id = TRY(decoder.decode<Web::AsyncScrollNodeStableID>()),
         .vertical = TRY(decoder.decode<bool>()),
+        .hidden = TRY(decoder.decode<bool>()),
     };
 }
 

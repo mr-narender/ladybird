@@ -21,6 +21,11 @@ describe("normal behavior", () => {
         testHourCycles(new Intl.Locale("ha"), ["h23"]);
     });
 
+    test("subdivision region is used without a region subtag", () => {
+        expect(new Intl.Locale("en-u-sd-gbeng").getHourCycles()).toEqual(new Intl.Locale("en-GB").getHourCycles());
+        expect(new Intl.Locale("en-US-u-sd-gbeng").getHourCycles()).toEqual(new Intl.Locale("en-US").getHourCycles());
+    });
+
     test("extension keyword overrides default data", () => {
         testHourCycles(new Intl.Locale("en-u-hc-h24"), ["h24"]);
         testHourCycles(new Intl.Locale("en", { collation: "h24" }), ["h24"]);
@@ -31,5 +36,11 @@ describe("normal behavior", () => {
         // Invalid hourCycles also take precedence when specified in the locale string. Unlike other
         // properties, Locale("en", { hourCycle: "ladybird" }) will explicitly throw.
         testHourCycles(new Intl.Locale("en-u-hc-ladybird"), ["ladybird"]);
+    });
+
+    test("numbering system without locale data", () => {
+        expect(new Intl.Locale("en", { numberingSystem: "abc" }).getHourCycles()).toEqual(["h12", "h11", "h23", "h24"]);
+        expect(new Intl.Locale("en-u-nu-abc").getHourCycles()).toEqual(["h12", "h11", "h23", "h24"]);
+        expect(new Intl.Locale("de-u-nu-abc").getHourCycles()).toEqual(["h23", "h11", "h12", "h24"]);
     });
 });

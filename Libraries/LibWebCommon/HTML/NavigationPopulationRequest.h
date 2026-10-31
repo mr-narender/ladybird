@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Bindings/Navigation.h>
@@ -41,6 +42,8 @@ struct NavigationStartRequest {
     StorageSerializationRecord navigation_api_state;
     Utf16String navigation_api_key;
     Utf16String navigation_api_id;
+    CrossProcessId directive_state_id;
+    Optional<String> directive_state_value;
 };
 
 // The serializable inputs needed to continue the navigate algorithm in the process selected to
@@ -61,11 +64,13 @@ struct NavigationPopulationRequest {
 struct NavigationPopulationResult {
     NavigationParamsVariantDescriptor navigation_params;
     Optional<URL::URL> redirected_url;
+    bool redirect_replaced_fragment { false };
     Optional<StorageSerializationRecord> classic_history_api_state;
     Optional<SessionHistoryDocumentStateDescriptor> replacement_document_state;
     bool resource_cleared { false };
     // The origin the UI process gives a document created for inline content in place of the response.
     Optional<URL::Origin> inline_content_origin {};
+    Optional<CrossProcessId> document_id {};
 };
 
 struct HistoryNavigationPopulation {

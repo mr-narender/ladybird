@@ -11,17 +11,17 @@
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGfx/Font/PathFontProvider.h>
+#include <LibGfx/Font/SystemFallbackFonts.h>
 #include <LibGfx/Font/Typeface.h>
-#include <LibGfx/Font/TypefaceSkia.h>
+#ifdef AK_OS_MACOS
+#    include <LibGfx/Font/TypefaceCoreText.h>
+#endif
 #include <LibGfx/FontCascadeList.h>
 #include <LibGfx/TextLayout.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
-#include <core/SkFont.h>
-#include <core/SkStream.h>
-#include <core/SkTypeface.h>
 #include <harfbuzz/hb.h>
 
 #define TEST_INPUT(x) ("test-inputs/" x)
@@ -33,7 +33,12 @@ struct Global {
     {
         Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>());
     }
-} global;
+};
+
+TEST_SETUP
+{
+    static Global global;
+}
 
 }
 
@@ -57,12 +62,8 @@ private:
 
 static bool font_is_emoji(StringView path)
 {
-    auto file = MUST(Core::MappedFile::map(path));
-    auto typeface = MUST(Gfx::Typeface::try_load_from_externally_owned_memory(file->bytes()));
-    // Construct the Font directly rather than via Typeface::font() — which would cache it on the
-    // Typeface and form a Typeface<->Font reference cycle that leaks once both leave this scope.
-    auto font = adopt_ref(*new Gfx::Font(typeface, 12, 12, {}, {}));
-    return font->is_emoji_font();
+    auto typeface = MUST(Gfx::Typeface::try_load_from_mapped_file(MUST(Core::MappedFile::map(path)), 0));
+    return typeface->font(12)->is_emoji_font();
 }
 
 // A COLRv1 color font is recognized.
@@ -81,56 +82,6 @@ TEST_CASE(monochrome_emoji_font_is_not_emoji_font)
 TEST_CASE(text_font_is_not_emoji_font)
 {
     EXPECT(!font_is_emoji(TEST_INPUT("fonts/text.ttf"sv)));
-}
-
-static void check_skia_font_data_lifetime(Function<NonnullRefPtr<Gfx::Typeface>()> load_typeface)
-{
-    sk_sp<SkTypeface const> skia_typeface;
-    ByteBuffer expected_table;
-    ByteBuffer expected_font_data;
-    constexpr auto cmap_tag = SkSetFourByteTag('c', 'm', 'a', 'p');
-    {
-        auto typeface = load_typeface();
-        skia_typeface = sk_ref_sp(static_cast<Gfx::TypefaceSkia const&>(*typeface).sk_typeface());
-        int collection_index = 0;
-        auto stream = skia_typeface->openStream(&collection_index);
-        EXPECT(stream);
-        if (stream) {
-            EXPECT_EQ(stream->getMemoryBase(), typeface->font_data().data());
-            EXPECT_EQ(stream->getLength(), typeface->font_data().size());
-        }
-        expected_font_data = MUST(ByteBuffer::copy(typeface->font_data()));
-        expected_table = MUST(ByteBuffer::create_uninitialized(skia_typeface->getTableSize(cmap_tag)));
-        EXPECT(!expected_table.is_empty());
-        EXPECT_EQ(skia_typeface->getTableData(cmap_tag, 0, expected_table.size(), expected_table.data()), expected_table.size());
-    }
-    auto actual_table = MUST(ByteBuffer::create_uninitialized(expected_table.size()));
-    EXPECT_EQ(skia_typeface->getTableData(cmap_tag, 0, actual_table.size(), actual_table.data()), actual_table.size());
-    EXPECT_EQ(actual_table, expected_table);
-    int collection_index = 0;
-    auto stream = skia_typeface->openStream(&collection_index);
-    EXPECT(stream);
-    if (stream) {
-        auto actual_font_data = MUST(ByteBuffer::create_uninitialized(expected_font_data.size()));
-        EXPECT_EQ(stream->read(actual_font_data.data(), actual_font_data.size()), actual_font_data.size());
-        EXPECT_EQ(actual_font_data, expected_font_data);
-    }
-}
-
-TEST_CASE(skia_typeface_retains_font_data_after_ladybird_typeface_is_destroyed)
-{
-    check_skia_font_data_lifetime([] {
-        auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/text.ttf"sv)));
-        return MUST(Gfx::Typeface::try_load_from_temporary_memory(file->bytes()));
-    });
-}
-
-TEST_CASE(skia_typeface_retains_mapped_font_data_after_ladybird_typeface_is_destroyed)
-{
-    check_skia_font_data_lifetime([] {
-        auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/text.ttf"sv)));
-        return MUST(Gfx::Typeface::try_load_from_mapped_file(move(file)));
-    });
 }
 
 static NonnullRefPtr<Gfx::Font> load_text_font(float point_size)
@@ -381,12 +332,12 @@ static NonnullRefPtr<Gfx::Typeface const> round_trip_typeface_through_ipc(Gfx::T
     return MUST(IPC::decode<NonnullRefPtr<Gfx::Typeface const>>(decoder));
 }
 
-TEST_CASE(system_ui_italic_keeps_its_slope_when_the_variation_clone_collapses)
+TEST_CASE(system_ui_italic_keeps_its_slope_with_variations)
 {
-    // At 28px the system font's opsz axis sits at its maximum, so applying the default variation hands back the base
-    // CoreText UI font, which Skia reads as upright.
+    // A system UI font is one variable face for every style, so its typeface and its fonts answer with the style
+    // that they were asked for, also after the typeface crosses IPC.
     float const font_size = 28;
-    auto typeface = MUST(Gfx::TypefaceSkia::match_system_ui(Gfx::SystemUIFontKind::System, font_size, 400, Gfx::FontWidth::Normal, 1));
+    auto typeface = Gfx::TypefaceCoreText::system_ui({ Gfx::SystemUIFontKind::System, 400, Gfx::FontWidth::Normal, 1 });
     EXPECT(typeface);
 
     Gfx::FontVariationSettings variations;
@@ -394,11 +345,12 @@ TEST_CASE(system_ui_italic_keeps_its_slope_when_the_variation_clone_collapses)
     variations.set_width(100);
     variations.set_optical_sizing(font_size);
     auto font = typeface->font(font_size * 0.75f, variations);
+    EXPECT_EQ(font->slope(), 1u);
     EXPECT_EQ(font->typeface().slope(), 1u);
 
     auto decoded = round_trip_typeface_through_ipc(font->typeface());
     EXPECT_EQ(decoded->slope(), 1u);
-    EXPECT_EQ(decoded->glyph_id_for_code_point('m'), font->typeface().glyph_id_for_code_point('m'));
+    EXPECT_EQ(decoded.ptr(), &font->typeface());
 }
 #endif
 
@@ -431,8 +383,7 @@ TEST_CASE(shaping_cache_preserves_positions_spacing_and_trailing_whitespace)
 // Only ThreadSanitizer can catch a memo race here, since every thread reaches the same verdict.
 TEST_CASE(emoji_classification_can_run_on_several_threads)
 {
-    auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/colrv1-noname.ttf"sv)));
-    auto typeface = MUST(Gfx::Typeface::try_load_from_externally_owned_memory(file->bytes()));
+    auto typeface = MUST(Gfx::Typeface::try_load_from_mapped_file(MUST(Core::MappedFile::map(TEST_INPUT("fonts/colrv1-noname.ttf"sv))), 0));
     IGNORE_USE_IN_ESCAPING_LAMBDA auto font = adopt_ref(*new Gfx::Font(typeface, 12, 12, {}, {}));
 
     IGNORE_USE_IN_ESCAPING_LAMBDA Array<bool, 8> verdicts {};
@@ -487,42 +438,6 @@ TEST_CASE(typeface_bounding_box_can_be_read_on_several_threads)
     }
 }
 
-// Only ThreadSanitizer can catch a memo race here, since fontconfig answers each scale the same way.
-TEST_CASE(hinting_options_can_be_memoized_on_several_threads)
-{
-    IGNORE_USE_IN_ESCAPING_LAMBDA auto font = load_text_font(16);
-    IGNORE_USE_IN_ESCAPING_LAMBDA Array<float, 4> scales { 1, 1.5f, 2, 3 };
-
-    // The memo answers the way a fresh query does: ask, displace it with another scale, ask again.
-    auto fresh = font->skia_font(1);
-    (void)font->skia_font(2);
-    auto memoized = font->skia_font(1);
-    EXPECT_EQ(memoized.getHinting(), fresh.getHinting());
-    EXPECT_EQ(memoized.isForceAutoHinting(), fresh.isForceAutoHinting());
-
-    IGNORE_USE_IN_ESCAPING_LAMBDA Array<Array<SkFont, 4>, 8> fonts;
-    Vector<NonnullRefPtr<Threading::Thread>> threads;
-    for (size_t thread_index = 0; thread_index < fonts.size(); ++thread_index) {
-        auto thread = Threading::Thread::construct("HintingMemo"sv, [&font, &scales, &fonts, thread_index]() {
-            for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index)
-                fonts[thread_index][scale_index] = font->skia_font(scales[scale_index]);
-            return 0;
-        });
-        thread->start();
-        threads.append(move(thread));
-    }
-    for (auto& thread : threads)
-        (void)thread->join();
-
-    for (auto const& thread_fonts : fonts) {
-        for (size_t scale_index = 0; scale_index < scales.size(); ++scale_index) {
-            EXPECT_EQ(thread_fonts[scale_index].getHinting(), fonts[0][scale_index].getHinting());
-            EXPECT_EQ(thread_fonts[scale_index].isForceAutoHinting(), fonts[0][scale_index].isForceAutoHinting());
-            EXPECT_EQ(thread_fonts[scale_index].getSize(), font->pixel_size() * scales[scale_index]);
-        }
-    }
-}
-
 // Only ThreadSanitizer can catch a cache race here, since every thread computes the same glyph IDs.
 TEST_CASE(glyph_pages_can_be_populated_on_several_threads)
 {
@@ -567,15 +482,274 @@ TEST_CASE(glyph_page_caches_keep_the_typefaces_in_use_once_full)
     auto thread = Threading::Thread::construct("GlyphPageCache"sv, [&typefaces, &pages_populated_in_turns]() {
         for (auto const& typeface : typefaces)
             (void)typeface->glyph_id_for_code_point('A');
-        auto populated_before_turns = Gfx::TypefaceSkia::glyph_pages_populated_on_this_thread();
+        auto populated_before_turns = Gfx::Typeface::glyph_pages_populated_on_this_thread();
         for (size_t turn = 0; turn < 50; ++turn) {
             for (size_t i = 0; i < 8; ++i)
                 (void)typefaces[i * 20]->glyph_id_for_code_point('A');
         }
-        pages_populated_in_turns = Gfx::TypefaceSkia::glyph_pages_populated_on_this_thread() - populated_before_turns;
+        pages_populated_in_turns = Gfx::Typeface::glyph_pages_populated_on_this_thread() - populated_before_turns;
         return 0;
     });
     thread->start();
     (void)thread->join();
     EXPECT(pages_populated_in_turns <= 8);
+}
+
+TEST_CASE(font_collection_preserves_each_face_style)
+{
+    auto file = MUST(Core::MappedFile::map(TEST_INPUT("fonts/styles.ttc"sv)));
+    for (u32 index = 0; index < 3; ++index) {
+        auto result = Gfx::Typeface::try_load_from_temporary_memory(file->bytes(), index);
+        EXPECT(!result.is_error());
+        if (result.is_error())
+            continue;
+        auto typeface = result.release_value();
+        auto expected_weight = index == 1 ? 700u : 400u;
+        auto expected_slope = index == 2 ? 1u : 0u;
+        EXPECT_EQ(typeface->weight(), expected_weight);
+        EXPECT_EQ(typeface->slope(), expected_slope);
+        EXPECT_EQ(typeface->collection_index(), index);
+        Gfx::FontVariationSettings variations;
+        variations.set_weight(expected_weight);
+        variations.set_width(100);
+        variations.set_optical_sizing(16);
+        auto font = typeface->font(12, variations);
+        EXPECT_EQ(font->weight(), expected_weight);
+        EXPECT_EQ(font->slope(), expected_slope);
+        EXPECT_NE(font->glyph_id_for_code_point('a'), 0u);
+    }
+    EXPECT(Gfx::Typeface::try_load_from_temporary_memory(file->bytes(), 3).is_error());
+}
+
+// The answer depends on the installed font set alone, so every thread must reach the same one and
+// the memo must match a code point once however many threads ask at the same moment.
+TEST_CASE(system_fallback_fonts_can_be_matched_on_several_threads)
+{
+    Gfx::clear_system_fallback_font_cache();
+    IGNORE_USE_IN_ESCAPING_LAMBDA Gfx::SystemFallbackFontKey key {
+        .code_point = 0x4e2d,
+        .weight = 400,
+        .width = Gfx::FontWidth::Normal,
+        .slope = 0,
+        .prefer_color_emoji = false,
+    };
+    // NB: A machine without a font covering this code point answers null, and null is an answer the
+    //     memo keeps like any other, so this test does not depend on what is installed.
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<RefPtr<Gfx::Font const>, 8> matched {};
+    Vector<NonnullRefPtr<Threading::Thread>> threads;
+    for (size_t thread_index = 0; thread_index < matched.size(); ++thread_index) {
+        auto thread = Threading::Thread::construct("SystemFallbackFont"sv, [&key, &matched, thread_index]() {
+            matched[thread_index] = Gfx::system_fallback_font(key, 12);
+            return 0;
+        });
+        thread->start();
+        threads.append(move(thread));
+    }
+    for (auto& thread : threads)
+        (void)thread->join();
+
+    // One key is matched once, so every thread names the same font object, not eight equivalent ones.
+    for (auto const& font : matched)
+        EXPECT_EQ(font.ptr(), matched[0].ptr());
+    EXPECT_EQ(Gfx::system_fallback_font_cache_size(), 1u);
+    EXPECT_EQ(Gfx::system_fallback_font(key, 12).ptr(), matched[0].ptr());
+
+    // Another size picks another font from the same typeface, so it does not grow the memo.
+    (void)Gfx::system_fallback_font(key, 13);
+    EXPECT_EQ(Gfx::system_fallback_font_cache_size(), 1u);
+
+    // A different style is a different question, not another answer to the same one.
+    auto bold_key = key;
+    bold_key.weight = 700;
+    (void)Gfx::system_fallback_font(bold_key, 12);
+    EXPECT_EQ(Gfx::system_fallback_font_cache_size(), 2u);
+}
+
+// A frozen cascade answers the same question as the live one, without entering the document.
+TEST_CASE(frozen_cascade_matches_the_live_lookup)
+{
+    auto local_font = load_text_font(24);
+    auto fallback_font = load_text_font(16);
+    auto cascade = Gfx::FontCascadeList::create();
+    cascade->add(local_font, { { 'a', 'a' } });
+    cascade->add(fallback_font);
+    cascade->set_last_resort_font(fallback_font);
+
+    cascade->freeze();
+    EXPECT(cascade->frozen_list());
+    for (u32 code_point : { 'a', 'b', 'z' })
+        EXPECT_EQ(&cascade->frozen_font_for_code_point(code_point), &cascade->font_for_code_point(code_point));
+}
+
+TEST_CASE(system_fallback_does_not_depend_on_earlier_lookups)
+{
+    auto first_font = load_text_font(16);
+    auto second_font = load_text_font(24);
+    auto cascade = Gfx::FontCascadeList::create();
+    cascade->set_last_resort_font(first_font);
+    cascade->set_system_font_fallback_callback([first_font, second_font](u32 code_point, Gfx::EmojiPresentation, Gfx::Font const&) -> RefPtr<Gfx::Font const> {
+        return code_point == 'a' ? first_font : second_font;
+    });
+
+    EXPECT_EQ(&cascade->font_for_code_point('a'), first_font.ptr());
+    EXPECT_EQ(&cascade->font_for_code_point('b'), second_font.ptr());
+}
+
+// https://drafts.csswg.org/css-fonts-4/#font-display-timeline
+// A face in its block period renders invisibly and one in its swap period renders with the
+// fallback, and the frozen cascade decides that from the period it recorded, not by resolving.
+TEST_CASE(frozen_cascade_renders_a_pending_face_without_resolving_it)
+{
+    auto font = load_text_font(16);
+    u32 resolves = 0;
+    auto build = [&](Gfx::PendingFontState state) {
+        auto cascade = Gfx::FontCascadeList::create();
+        cascade->add_pending_face(
+            { { 'a', 'a' } }, [&resolves, state] { ++resolves; return state; }, {}, [state] { return state; });
+        cascade->add(font);
+        cascade->set_last_resort_font(font);
+        cascade->freeze();
+        return cascade;
+    };
+
+    // Drop anything an earlier case left waiting, so the count below is only this case's.
+    (void)Gfx::request_wanted_pending_faces();
+
+    auto blocking = build(Gfx::PendingFontState::Invisible);
+    EXPECT(blocking->frozen_font_for_code_point('a').is_invisible());
+    EXPECT(!blocking->frozen_font_for_code_point('b').is_invisible());
+
+    auto swapping = build(Gfx::PendingFontState::Visible);
+    EXPECT_EQ(&swapping->frozen_font_for_code_point('a'), font.ptr());
+
+    // Not one of those lookups resolved a face: the periods came from the snapshot.
+    EXPECT_EQ(resolves, 0u);
+
+    // Both faces are waiting for the document to request their loads, which is what starts them.
+    EXPECT_EQ(Gfx::request_wanted_pending_faces(), 2u);
+    EXPECT_EQ(resolves, 2u);
+}
+
+// A face whose display period has already failed contributes nothing and does not block the
+// faces after it, so the frozen cascade does not carry it at all.
+TEST_CASE(frozen_cascade_leaves_out_a_failed_pending_face)
+{
+    auto local_font = load_text_font(24);
+    auto fallback_font = load_text_font(16);
+    auto cascade = Gfx::FontCascadeList::create();
+    cascade->add_pending_face(
+        { { 'a', 'a' } }, [] { return Gfx::PendingFontState::Failed; }, {}, [] { return Gfx::PendingFontState::Failed; });
+    cascade->add_pending_face(
+        { { 'a', 'a' } }, [] { return Gfx::PendingFontState::Visible; }, [local_font] { return local_font; }, [] { return Gfx::PendingFontState::Visible; });
+    cascade->add(fallback_font);
+    cascade->set_last_resort_font(fallback_font);
+    cascade->freeze();
+
+    EXPECT_EQ(&cascade->frozen_font_for_code_point('a'), local_font.ptr());
+}
+
+TEST_CASE(frozen_cascade_compares_pending_selection_snapshots)
+{
+    auto fallback = load_text_font(16);
+    auto resident = load_text_font(24);
+    u32 resolves = 0;
+    auto build = [&](u64 source_face_id, Gfx::PendingFontState state, Vector<Gfx::UnicodeRange> ranges, RefPtr<Gfx::Font const> font = {}) {
+        auto cascade = Gfx::FontCascadeList::create();
+        cascade->add_pending_face(move(ranges), [&resolves, state] { ++resolves; return state; }, [font] { return font; }, [state] { return state; }, source_face_id);
+        cascade->add(fallback);
+        cascade->set_last_resort_font(fallback);
+        cascade->freeze();
+        return cascade;
+    };
+    auto first = build(1, Gfx::PendingFontState::Visible, { { 'a', 'a' } });
+    auto same = build(1, Gfx::PendingFontState::Visible, { { 'a', 'a' } });
+    EXPECT(first->equals(*first));
+    EXPECT(first->equals(*same));
+    EXPECT(!first->equals(*build(2, Gfx::PendingFontState::Visible, { { 'a', 'a' } })));
+    EXPECT(!first->equals(*build(1, Gfx::PendingFontState::Invisible, { { 'a', 'a' } })));
+    EXPECT(!first->equals(*build(1, Gfx::PendingFontState::Visible, { { 'b', 'b' } })));
+    EXPECT(!first->equals(*build(1, Gfx::PendingFontState::Visible, { { 'a', 'a' } }, resident)));
+    EXPECT(!build(0, Gfx::PendingFontState::Visible, { { 'a', 'a' } })->equals(*build(0, Gfx::PendingFontState::Visible, { { 'a', 'a' } })));
+
+    auto loaded = Gfx::FontCascadeList::create();
+    loaded->add(resident, { { 'a', 'a' } });
+    loaded->add(fallback);
+    loaded->set_last_resort_font(fallback);
+    loaded->freeze();
+    EXPECT(loaded->equals(*build(1, Gfx::PendingFontState::Visible, { { 'a', 'a' } }, resident)));
+    EXPECT_EQ(resolves, 0u);
+}
+
+TEST_CASE(frozen_cascade_comparison_distinguishes_resident_faces_during_fallback)
+{
+    auto fallback = load_text_font(16);
+    auto resident = load_text_font(24);
+    for (auto state : { Gfx::PendingFontState::Visible, Gfx::PendingFontState::Invisible }) {
+        auto build = [&](bool completed) {
+            auto cascade = Gfx::FontCascadeList::create();
+            cascade->add_pending_face({ { 'a', 'a' } }, [state] { return state; }, {}, [state] { return state; }, 1);
+            if (completed)
+                cascade->add(resident, { { 'a', 'a' } });
+            else
+                cascade->add_pending_face({ { 'a', 'a' } }, [] { return Gfx::PendingFontState::Visible; }, [resident] { return resident; }, [] { return Gfx::PendingFontState::Visible; }, 2);
+            cascade->add(fallback);
+            cascade->set_last_resort_font(fallback);
+            cascade->freeze();
+            return cascade;
+        };
+        auto before = build(false);
+        auto after = build(true);
+        EXPECT(before->equals(*build(false)));
+        EXPECT(after->equals(*build(true)));
+        EXPECT(!before->equals(*after));
+        EXPECT(!after->equals(*before));
+        EXPECT_EQ(before->frozen_font_for_code_point('a').point_size(), fallback->point_size());
+        EXPECT_EQ(after->frozen_font_for_code_point('a').point_size(), resident->point_size());
+        EXPECT_EQ(before->frozen_font_for_code_point('a').is_invisible(), state == Gfx::PendingFontState::Invisible);
+        EXPECT_EQ(after->frozen_font_for_code_point('a').is_invisible(), state == Gfx::PendingFontState::Invisible);
+    }
+}
+
+TEST_CASE(frozen_cascade_comparison_retains_font_display_state)
+{
+    auto fallback = load_text_font(16);
+    auto state = Gfx::PendingFontState::Invisible;
+    auto before = Gfx::FontCascadeList::create();
+    before->add_pending_face({ { 'a', 'a' } }, [&state] { return state; }, {}, [&state] { return state; }, 1);
+    before->add(fallback);
+    before->set_last_resort_font(fallback);
+    before->freeze();
+    state = Gfx::PendingFontState::Visible;
+    auto after = Gfx::FontCascadeList::create();
+    after->extend(*before);
+    after->set_last_resort_font(fallback);
+    after->freeze();
+    EXPECT(!before->equals(*after));
+    EXPECT(before->frozen_font_for_code_point('a').is_invisible());
+    EXPECT(!after->frozen_font_for_code_point('a').is_invisible());
+}
+
+TEST_CASE(frozen_cascade_comparison_includes_fallback_fonts)
+{
+    auto first_font = load_text_font(16);
+    auto second_font = load_text_font(24);
+    auto first = Gfx::FontCascadeList::create();
+    first->set_last_resort_font(first_font);
+    first->freeze();
+    auto second = Gfx::FontCascadeList::create();
+    second->set_last_resort_font(second_font);
+    second->freeze();
+    EXPECT(!first->equals(*second));
+
+    auto build = [&](NonnullRefPtr<Gfx::Font> font) {
+        auto cascade = Gfx::FontCascadeList::create();
+        cascade->set_last_resort_font(first_font);
+        auto fallback = Gfx::FontCascadeList::create();
+        fallback->add(font);
+        cascade->extend_fallback(*fallback);
+        cascade->freeze();
+        return cascade;
+    };
+    EXPECT(!build(first_font)->equals(*build(second_font)));
+    EXPECT(build(first_font)->equals(*build(first_font)));
 }

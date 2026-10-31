@@ -4,15 +4,14 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
+use crate::css::css_pixels::{CssPixelPoint, CssPixelRect};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::UniqueNodeId;
 use crate::painting::ffi::FfiChromeMetrics;
 use crate::painting::force_dark::ForceDarkSettings;
-use crate::painting::host::{FfiFlexOverlayInput, FfiGridOverlayInput, FfiRootBackgroundSource};
+use crate::painting::host::{FfiFlexOverlayInput, FfiGridOverlayInput, RootBackgroundSource};
 use libgfx_rust::font::FontHandle;
 use libgfx_rust::{Color, IntRect, IntSize};
-use std::borrow::Cow;
 
 /// The inputs read by content that is recorded outside per-box captures: scroll metadata,
 /// viewport scrollbars, the wheel-target facts of hit-test items. Reusing a subtree capture from
@@ -20,14 +19,14 @@ use std::borrow::Cow;
 /// values from here and a new one is part of that check automatically.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct UncapturedContentInputs {
-    pub viewport_wheel_overflow_x: u8,
-    pub viewport_wheel_overflow_y: u8,
-    pub root_background_source: FfiRootBackgroundSource,
+    pub root_background_source: RootBackgroundSource,
     // Scroll commands use a scrollport at the origin. Its position is compositor state.
     pub device_viewport_size: IntSize,
-    pub is_recording_async_scrolling_metadata: bool,
     pub document_id: UniqueNodeId,
     pub has_blocking_wheel_event_region_covering_viewport: bool,
+    // The compositor hands a wheel over a nested context to it only where no box painted later covers it, which it can
+    // tell only from the wheel hit test targets of every box.
+    pub has_navigable_container_with_composited_context: bool,
     pub chrome_metrics: FfiChromeMetrics,
     pub paint_viewport_scrollbars: bool,
     pub middle_button_scroll_origin: Option<CssPixelPoint>,
@@ -35,10 +34,29 @@ pub(crate) struct UncapturedContentInputs {
     pub background_color: Color,
 }
 
-/// Inputs borrowed for one synchronous recording call. Recording results retain their own
-/// resources and never borrow these inputs or the host's arrays and byte buffers.
+/// The inputs of one recording but for what the frame it records decides, which only the frame frozen for the recording
+/// fills in: the host makes them before the render owner freezes the frame.
+pub(crate) struct UnframedRecordingInputs(pub(in crate::painting) RecordingInputs);
+
+impl UnframedRecordingInputs {
+    /// The inputs of the recording of a frame frozen with `tree_inputs`, whose canvas background `root_background_source`
+    /// paints.
+    pub(crate) fn for_frame(
+        self,
+        tree_inputs: crate::painting::host::FfiVisualContextTreeInputs,
+        root_background_source: RootBackgroundSource,
+    ) -> RecordingInputs {
+        let Self(mut inputs) = self;
+        inputs.device_pixels_per_css_pixel = tree_inputs.device_pixels_per_css_pixel;
+        inputs.uncaptured.root_background_source = root_background_source;
+        inputs
+    }
+}
+
+/// The inputs of one recording, which own what they read, so that the recording may outlive the
+/// call that started it. Recording results retain their own resources and never borrow these inputs.
 #[derive(Clone)]
-pub(crate) struct RecordingInputs<'a> {
+pub(crate) struct RecordingInputs {
     pub device_pixels_per_css_pixel: f64,
     pub uncaptured: UncapturedContentInputs,
     // Carried on the recording so the compositor can tell which listener state it saw; no
@@ -58,19 +76,31 @@ pub(crate) struct RecordingInputs<'a> {
     pub selection_background_from_palette: Color,
     pub selection_background_light: Color,
     pub selection_background_dark: Color,
+    pub inactive_selection_background_from_palette: Color,
+    pub inactive_selection_background_light: Color,
+    pub inactive_selection_background_dark: Color,
     pub palette_is_dark: bool,
     pub document_has_supported_color_schemes: bool,
-    pub inspector_highlight: Option<InspectorHighlight<'a>>,
+    // Whether the document's supported color schemes name `light` or `dark`.
+    pub document_supports_light_or_dark: bool,
+    // The color scheme an SVG image renders in where neither the box that draws it nor its document opts into one.
+    pub image_fallback_color_scheme: u8,
+    // The paintable the assistive technology's browse-mode focus is on, which paints the AT focus ring.
+    pub accessibility_focus_target: Option<NodeSlotId>,
+    pub inspector_highlight: Option<InspectorHighlight>,
     pub tooltip_color: Color,
     pub tooltip_text_color: Color,
     pub tooltip_border_color: Color,
-    pub grid_overlays: Option<GridOverlays<'a>>,
+    pub grid_overlays: Option<GridOverlays>,
     // These array elements are already plain values without pointers or optional-value tags.
-    pub flex_overlays: &'a [FfiFlexOverlayInput],
+    pub flex_overlays: Box<[FfiFlexOverlayInput]>,
     pub caret_debug_rect: Option<CssPixelRect>,
     pub caret: Option<CaretPaint>,
     pub focused_text_control: Option<FocusedTextControlSelection>,
-    pub focused_area_outline: Option<FocusedAreaOutline<'a>>,
+    pub focused_area_outline: Option<FocusedAreaOutline>,
+    pub text_fragment_indications: Box<[crate::painting::host::FfiTextFragmentIndicationRange]>,
+    pub mark_color: Color,
+    pub mark_text_color: Color,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,12 +128,11 @@ pub(crate) struct FocusedTextControlSelection {
     pub end: usize,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct FocusedAreaOutline<'a> {
+#[derive(Clone)]
+pub(crate) struct FocusedAreaOutline {
     pub image: NodeSlotId,
-    pub path_bytes: &'a [u8],
-    pub color: Color,
-    pub width: CssPixels,
+    /// The style-tree identity of the area.
+    pub area: u32,
 }
 
 #[derive(Clone)]
@@ -113,14 +142,14 @@ pub(crate) struct OverlayLabelFonts {
 }
 
 #[derive(Clone)]
-pub(crate) struct InspectorHighlight<'a> {
+pub(crate) struct InspectorHighlight {
     pub paintable: NodeSlotId,
-    pub label: Cow<'a, str>,
+    pub label: String,
     pub fonts: OverlayLabelFonts,
 }
 
 #[derive(Clone)]
-pub(crate) struct GridOverlays<'a> {
-    pub inputs: &'a [FfiGridOverlayInput],
+pub(crate) struct GridOverlays {
+    pub inputs: Box<[FfiGridOverlayInput]>,
     pub fonts: OverlayLabelFonts,
 }

@@ -5,12 +5,13 @@
  */
 
 #include <AK/Checked.h>
+#include <LibCompositing/CanvasSize.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/CanvasCommandList.h>
 #include <LibGfx/Rect.h>
 #include <LibWeb/HTML/Canvas/Canvas2DContextBase.h>
 #include <LibWeb/HTML/Canvas/CanvasHost.h>
-#include <LibWeb/WebGL/WebGLContextProxy.h>
+#include <LibWeb/HTML/Canvas/PredefinedColorSpace.h>
+#include <LibWeb/HTML/Canvas/SerializeBitmap.h>
 #include <LibWeb/WebGL/WebGLRenderingContextBase.h>
 
 namespace Web::HTML {
@@ -29,7 +30,7 @@ Gfx::IntSize CanvasHost::bitmap_size_for_dimensions(u64 width, u64 height)
         dbgln("Refusing to create {}x{} canvas (overflow)", width, height);
         return {};
     }
-    if (area.value() > static_cast<u64>(Gfx::max_canvas_area)) {
+    if (area.value() > static_cast<u64>(Compositing::max_canvas_area)) {
         dbgln("Refusing to create {}x{} canvas (exceeds maximum size)", width, height);
         return {};
     }
@@ -51,7 +52,7 @@ RefPtr<Gfx::Bitmap> CanvasHost::get_bitmap_from_surface()
         return nullptr;
 
     if (auto* webgl_context = canvas_webgl_context())
-        return webgl_context->context().read_back_drawing_buffer({ {}, size });
+        return webgl_context->read_back_drawing_buffer({ {}, size });
 
     if (auto* context = canvas_2d_context()) {
         context->ensure_backing_storage();
@@ -63,12 +64,43 @@ RefPtr<Gfx::Bitmap> CanvasHost::get_bitmap_from_surface()
     return create_transparent_canvas_bitmap(size);
 }
 
+Optional<Gfx::DecodedImageFrame> CanvasHost::get_frame_from_surface()
+{
+    if (auto* context = canvas_2d_context(); context && context->color_space() != Bindings::PredefinedColorSpace::Srgb) {
+        auto const size = bitmap_size_for_canvas();
+        if (size.is_empty())
+            return {};
+        context->ensure_backing_storage();
+        auto color_space = context->color_space();
+        if (auto pixels = context->read_pixels({ {}, size }, Gfx::AlphaType::Premultiplied, color_space); pixels && pixels->size() == size)
+            return Gfx::DecodedImageFrame { *pixels, gfx_color_space_for(color_space) };
+        return {};
+    }
+
+    auto bitmap = get_bitmap_from_surface();
+    if (!bitmap)
+        return {};
+    return Gfx::DecodedImageFrame { *bitmap };
+}
+
+Optional<Gfx::DecodedImageFrame> CanvasHost::get_frame_for_serialization(Utf16View type)
+{
+    if (serialization_of_the_bitmap_supports_color_profiles(type))
+        return get_frame_from_surface();
+    auto bitmap = get_bitmap_from_surface();
+    if (!bitmap)
+        return {};
+    return Gfx::DecodedImageFrame { *bitmap };
+}
+
 // https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean
 bool CanvasHost::is_origin_clean() const
 {
     if (auto* context = canvas_2d_context())
         return context->origin_clean();
-    // FIXME: WebGL and WebGL2 contexts do not track the origin-clean flag yet.
+    // NB: The texture uploads of a WebGL context throw a "SecurityError" DOMException for a source that is not
+    //     origin-clean, so its bitmap stays origin-clean. A video is the exception, as long as its media data is
+    //     never CORS-cross-origin (see image_is_not_origin_clean()).
     return true;
 }
 

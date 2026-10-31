@@ -7,52 +7,34 @@
 use super::NativeRuleTarget;
 use crate::css::container_conditions::ContainerConditionsData;
 use crate::css::declaration_block::DeclarationBlockData;
-use crate::css::style::capacity::ShallowCapacityBytes;
-use crate::css::style::fast_hash::{FastMap as HashMap, fast_hasher};
-use crate::css::style::memory::{DeviceClass, MemoryCategory, MemoryController, MemoryLease};
+use crate::css::style::fast_hash::fast_hasher;
 use crate::css::style::program::RuleID;
-use std::cell::RefCell;
+use crate::css::style::weak_pool::WeakPool;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU64;
-use std::sync::Arc;
-use std::sync::Weak;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const TARGETS_PER_PAGE: usize = 128;
+
+#[derive(Clone)]
 
 struct TargetPage {
     values: [Option<NativeRuleTarget>; TARGETS_PER_PAGE],
     live_count: u16,
     shared_hash: Option<u64>,
-    memory: MemoryLease,
 }
 
 impl TargetPage {
     fn new(values: [Option<NativeRuleTarget>; TARGETS_PER_PAGE]) -> Self {
-        let mut memory = MemoryLease::new(MemoryCategory::RuleProgram);
-        let nested_bytes: u64 = values.iter().flatten().map(NativeRuleTarget::owned_bytes).sum();
-        SHARED_TARGET_PAGES.with_borrow_mut(|pool| {
-            memory.resize_required_to(&mut pool.memory, size_of::<Self>() as u64 + nested_bytes);
-        });
         Self {
             live_count: u16::try_from(values.iter().flatten().count()).unwrap(),
             values,
             shared_hash: None,
-            memory,
         }
     }
 }
 
-impl Clone for TargetPage {
-    fn clone(&self) -> Self {
-        Self::new(self.values.clone())
-    }
-}
-
-impl Drop for TargetPage {
-    fn drop(&mut self) {
-        forget_dead_pages(self.shared_hash);
-    }
-}
+#[derive(Clone)]
 
 struct BoundTargetPage {
     data: Arc<TargetPage>,
@@ -72,7 +54,7 @@ impl BoundTargetPage {
     fn normalize(&mut self) {
         debug_assert_eq!(self.identity_base, 0);
         debug_assert_eq!(self.source_base, 0);
-        let data = Arc::get_mut(&mut self.data).expect("an unpublished page is private");
+        let data = Arc::make_mut(&mut self.data);
         self.identity_base = data
             .values
             .iter()
@@ -116,35 +98,18 @@ impl<'a> NativeRuleTargetRef<'a> {
     }
 }
 
-struct SharedTargetPages {
-    by_hash: HashMap<u64, Vec<Weak<TargetPage>>>,
-    memory: MemoryController,
-}
-
-thread_local! {
-    static SHARED_TARGET_PAGES: RefCell<SharedTargetPages> = RefCell::new(SharedTargetPages {
-        by_hash: HashMap::default(),
-        memory: MemoryController::new(DeviceClass::ForegroundDesktop),
-    });
-}
-
-fn forget_dead_pages(hash: Option<u64>) {
-    let Some(hash) = hash else { return };
-    let _ = SHARED_TARGET_PAGES.try_with(|pool| {
-        let Ok(mut pool) = pool.try_borrow_mut() else { return };
-        if let std::collections::hash_map::Entry::Occupied(mut entry) = pool.by_hash.entry(hash) {
-            entry.get_mut().retain(|page| page.strong_count() != 0);
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-        }
-    });
+fn target_pages() -> MutexGuard<'static, WeakPool<TargetPage>> {
+    // Every engine interns through the same pool, from whichever thread runs it. Pages never reach
+    // back into the pool when they are dropped, so the lock is only held while interning.
+    static TARGET_PAGES: OnceLock<Mutex<WeakPool<TargetPage>>> = OnceLock::new();
+    TARGET_PAGES.get_or_init(Mutex::default).lock().unwrap()
 }
 
 /// Dense semantic rule identities address immutable pages directly. Store native identities
 /// relative to each page's document-local bases so copies of one parsed stylesheet can share
-/// payloads while retaining distinct native rule and stylesheet identities.
-#[derive(Default)]
+/// payloads, through the process's pool, while retaining distinct native rule and stylesheet
+/// identities.
+#[derive(Clone, Default)]
 pub(in crate::css::style) struct NativeRuleTargets {
     pages: Vec<Option<BoundTargetPage>>,
     needs_sharing: bool,
@@ -154,8 +119,12 @@ impl NativeRuleTargets {
     fn page_mut(&mut self, index: usize) -> &mut TargetPage {
         self.needs_sharing = true;
         let page = self.pages[index / TARGETS_PER_PAGE].as_mut().unwrap();
-        let previous_hash = page.data.shared_hash;
-        let data = Arc::make_mut(&mut page.data);
+        if Arc::get_mut(&mut page.data).is_none() {
+            target_pages().make_private(page.data.shared_hash, &mut page.data, |data| {
+                TargetPage::new(data.values.clone())
+            });
+        }
+        let data = Arc::get_mut(&mut page.data).expect("a private page has one owner");
         if page.identity_base != 0 || page.source_base != 0 {
             for target in data.values.iter_mut().flatten() {
                 target.identity =
@@ -166,7 +135,6 @@ impl NativeRuleTargets {
             page.source_base = 0;
         }
         data.shared_hash = None;
-        forget_dead_pages(previous_hash);
         data
     }
 
@@ -193,12 +161,11 @@ impl NativeRuleTargets {
         if self.pages.len() <= page_index {
             self.pages.resize_with(page_index + 1, || None);
         }
-        self.pages[page_index].get_or_insert_with(BoundTargetPage::new);
+        if self.pages[page_index].is_none() {
+            self.pages[page_index] = Some(BoundTargetPage::new());
+        }
         let page = self.page_mut(index);
-        page.memory.grow_committed(target.owned_bytes());
-        if let Some(previous) = page.values[index % TARGETS_PER_PAGE].replace(target) {
-            page.memory.shrink_committed(previous.owned_bytes());
-        } else {
+        if page.values[index % TARGETS_PER_PAGE].replace(target).is_none() {
             page.live_count += 1;
         }
     }
@@ -208,7 +175,7 @@ impl NativeRuleTargets {
         let index = id.0 as usize;
         let page = self.page_mut(index);
         let target = page.values[index % TARGETS_PER_PAGE].take().unwrap();
-        page.memory.shrink_committed(target.owned_bytes());
+
         page.live_count -= 1;
         if page.live_count == 0 {
             self.pages[index / TARGETS_PER_PAGE] = None;
@@ -229,6 +196,7 @@ impl NativeRuleTargets {
         if !self.needs_sharing {
             return;
         }
+        let mut pool = target_pages();
         for page in self.pages.iter_mut().flatten() {
             if page.data.shared_hash.is_some() {
                 continue;
@@ -237,31 +205,14 @@ impl NativeRuleTargets {
             let mut hasher = fast_hasher();
             page.data.values.hash(&mut hasher);
             let hash = hasher.finish();
-            let shared = SHARED_TARGET_PAGES.with_borrow_mut(|pool| {
-                let bucket = pool.by_hash.entry(hash).or_default();
-                bucket.retain(|page| page.strong_count() != 0);
-                if let Some(found) = bucket
-                    .iter()
-                    .filter_map(Weak::upgrade)
-                    .find(|candidate| candidate.values == page.data.values)
-                {
-                    return found;
-                }
-                Arc::get_mut(&mut page.data)
-                    .expect("an unpublished page is private")
-                    .shared_hash = Some(hash);
-                bucket.push(Arc::downgrade(&page.data));
-                Arc::clone(&page.data)
-            });
-            page.data = shared;
+            if let Some(found) = pool.find(hash, |candidate| candidate.values == page.data.values) {
+                page.data = found;
+                continue;
+            }
+            Arc::make_mut(&mut page.data).shared_hash = Some(hash);
+            pool.insert(hash, &page.data);
         }
         self.needs_sharing = false;
-    }
-}
-
-impl ShallowCapacityBytes for NativeRuleTargets {
-    fn shallow_capacity_bytes(&self) -> u64 {
-        self.pages.shallow_capacity_bytes()
     }
 }
 

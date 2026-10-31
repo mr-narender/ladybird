@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGC/ConservativeHashTable.h>
+#include <LibGC/RootVector.h>
 #include <LibWeb/Bindings/HTMLSlotElement.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ShadowRoot.h>
@@ -40,6 +42,7 @@ Vector<GC::Root<DOM::Node>> HTMLSlotElement::assigned_nodes(AssignedNodesFlatten
 {
     // 1. If options["flatten"] is false, then return this's assigned nodes.
     if (flatten == AssignedNodesFlatten::No) {
+        assign_slottables_if_needed();
         Vector<GC::Root<DOM::Node>> assigned_nodes;
         assigned_nodes.ensure_capacity(assigned_nodes_internal().size());
 
@@ -75,6 +78,7 @@ Vector<GC::Root<DOM::Element>> HTMLSlotElement::assigned_elements(AssignedNodesF
 {
     // 1. If options["flatten"] is false, then return this's assigned nodes, filtered to contain only Element nodes.
     if (flatten == AssignedNodesFlatten::No) {
+        assign_slottables_if_needed();
         Vector<GC::Root<DOM::Element>> assigned_nodes;
 
         for (auto const& node : assigned_nodes_internal()) {
@@ -100,9 +104,18 @@ Vector<GC::Root<DOM::Element>> HTMLSlotElement::assigned_elements(Bindings::Assi
     return assigned_elements(assigned_nodes_flatten(options));
 }
 
+void HTMLSlotElement::assign_slottables_if_needed() const
+{
+    if (auto* shadow_root = as_if<DOM::ShadowRoot>(const_cast<HTMLSlotElement&>(*this).root()))
+        shadow_root->assign_slottables_if_needed();
+}
+
 // https://html.spec.whatwg.org/multipage/scripting.html#dom-slot-assign
 void HTMLSlotElement::assign(GC::ConservativeVector<SlottableHandle> nodes)
 {
+    // AD-HOC: Assigned nodes are recomputed lazily.
+    assign_slottables_if_needed();
+
     // 1. For each node of this's manually assigned nodes, set node's manual slot assignment to null.
     for (auto& node : m_manually_assigned_nodes) {
         node.visit([&](auto& node) {
@@ -111,7 +124,13 @@ void HTMLSlotElement::assign(GC::ConservativeVector<SlottableHandle> nodes)
     }
 
     // 2. Let nodesSet be a new ordered set.
-    Vector<DOM::Slottable> nodes_set;
+    GC::ConservativeVector<DOM::Slottable> nodes_set;
+    GC::ConservativeHashTable<GC::Ref<DOM::Node const>> nodes_in_nodes_set;
+
+    // INTEROP: The spec only assigns slottables for this's root below, so a slot in another tree that loses a node
+    //          to this slot keeps it as an assigned node and fires no slotchange event. Browsers also assign
+    //          slottables for the trees of those slots, and so do we.
+    GC::RootVector<GC::Ref<DOM::Node>> roots_of_previous_slots;
 
     // 3. For each node of nodes:
     for (auto& node_handle : nodes) {
@@ -120,16 +139,23 @@ void HTMLSlotElement::assign(GC::ConservativeVector<SlottableHandle> nodes)
 
         // 1. If node's manual slot assignment refers to a slot, then remove node from that slot's manually assigned nodes.
         if (node.manual_slot_assignment() != nullptr) {
-            m_manually_assigned_nodes.remove_all_matching([&](auto const& manually_assigned_node) {
+            auto& previous_slot = *node.manual_slot_assignment();
+            previous_slot.m_manually_assigned_nodes.remove_all_matching([&](auto const& manually_assigned_node) {
                 return slottable == manually_assigned_node;
             });
+
+            auto& previous_slot_root = previous_slot.root();
+            if (&previous_slot_root != &root() && !roots_of_previous_slots.contains_slow(GC::Ref { previous_slot_root }))
+                roots_of_previous_slots.append(previous_slot_root);
         }
 
         // 2. Set node's manual slot assignment to this.
         node.set_manual_slot_assignment(this);
 
         // 3. Append node to nodesSet.
-        nodes_set.append(slottable);
+        // NB: nodesSet is an ordered set, so a node that is already in it is not appended again.
+        if (nodes_in_nodes_set.set(node_handle.visit([](auto& node) -> GC::Ref<DOM::Node const> { return *node; })) == HashSetResult::InsertedNewEntry)
+            nodes_set.append(slottable);
     }
 
     // 4. Set this's manually assigned nodes to nodesSet.
@@ -137,6 +163,10 @@ void HTMLSlotElement::assign(GC::ConservativeVector<SlottableHandle> nodes)
 
     // 5. Run assign slottables for a tree for this's root.
     assign_slottables_for_a_tree(root());
+
+    // INTEROP: See roots_of_previous_slots above.
+    for (auto const& previous_slot_root : roots_of_previous_slots)
+        assign_slottables_for_a_tree(previous_slot_root);
 }
 
 // https://dom.spec.whatwg.org/#ref-for-concept-element-attributes-change-ext
@@ -157,6 +187,9 @@ void HTMLSlotElement::attribute_changed(Utf16FlyString const& local_name, Option
         // 3. If value is the empty string and oldValue is null, then return.
         if (value == Utf16String {} && !old_value.has_value())
             return;
+
+        // AD-HOC: Assigned nodes are recomputed lazily.
+        assign_slottables_if_needed();
 
         // OPTIMIZATION: Update the slot registry before changing the name.
         auto* shadow_root = as_if<DOM::ShadowRoot>(root());

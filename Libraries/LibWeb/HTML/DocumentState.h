@@ -19,6 +19,7 @@
 #include <LibWebCommon/HTML/DocumentStateClient.h>
 #include <LibWebCommon/HTML/POSTResource.h>
 #include <LibWebCommon/HTML/SerializedPolicyContainer.h>
+#include <LibWebCommon/HTML/UserAgentInitiated.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
@@ -65,8 +66,14 @@ public:
     [[nodiscard]] bool reload_pending() const { return m_reload_pending; }
     void set_reload_pending(bool reload_pending) { m_reload_pending = reload_pending; }
 
+    [[nodiscard]] bool reload_bypasses_cache() const { return m_reload_bypasses_cache; }
+    void set_reload_bypasses_cache(bool reload_bypasses_cache) { m_reload_bypasses_cache = reload_bypasses_cache; }
+
     [[nodiscard]] bool ever_populated() const { return m_ever_populated; }
     void set_ever_populated(bool ever_populated) { m_ever_populated = ever_populated; }
+
+    [[nodiscard]] UserAgentInitiated user_agent_initiated() const { return m_user_agent_initiated; }
+    void set_user_agent_initiated(UserAgentInitiated user_agent_initiated) { m_user_agent_initiated = user_agent_initiated; }
 
     [[nodiscard]] Utf16String const& navigable_target_name() const { return m_navigable_target_name; }
     void set_navigable_target_name(Utf16String navigable_target_name) { m_navigable_target_name = move(navigable_target_name); }
@@ -106,8 +113,20 @@ private:
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-reload-pending
     bool m_reload_pending { false };
 
+    // AD-HOC: Whether the pending reload bypasses the HTTP cache, as the user can ask one to. HTML leaves that to the
+    //         user agent: "When a user requests a reload of a navigable, user agents may provide a mechanism for
+    //         ignoring any caches when reloading."
+    //         https://html.spec.whatwg.org/multipage/speculative-loading.html#nav-traversal-ui
+    bool m_reload_bypasses_cache { false };
+
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-ever-populated
     bool m_ever_populated { false };
+
+    // AD-HOC: Not one of the spec's document state fields. It's whether the navigation that created the entry had no
+    //         source document, recorded so a traversal back to the entry can replay it. Blink and Gecko keep the same
+    //         on their entries: Blink an absent FrameNavigationEntry::initiator_origin(), Gecko a system principal as
+    //         SessionHistoryInfo::GetTriggeringPrincipal().
+    UserAgentInitiated m_user_agent_initiated { UserAgentInitiated::No };
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-nav-target-name
     Utf16String m_navigable_target_name;

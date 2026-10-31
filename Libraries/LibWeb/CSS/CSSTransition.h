@@ -8,6 +8,7 @@
 #pragma once
 
 #include <LibWeb/Animations/Animation.h>
+#include <LibWeb/CSS/EasingFunction.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
 namespace Web::CSS {
@@ -17,12 +18,8 @@ class CSSTransition : public Animations::Animation {
     GC_DECLARE_ALLOCATOR(CSSTransition);
 
 public:
-    enum class Publication {
-        Committed,
-        Provisional,
-    };
-
-    static GC::Ref<CSSTransition> start_a_transition(
+    // A transition is started provisionally, and associated with its target only once committed.
+    static GC::Ref<CSSTransition> start_a_provisional_transition(
         DOM::AbstractElement,
         PropertyID,
         size_t transition_generation,
@@ -33,16 +30,21 @@ public:
         NonnullRefPtr<StyleValue const> end_value,
         NonnullRefPtr<StyleValue const> reversing_adjusted_start_value,
         double reversing_shortening_factor,
-        Publication = Publication::Committed);
+        EasingFunction timing_function);
 
     void commit_provisional_transition();
     void discard_provisional_transition();
+
+    // AD-HOC: Runs the transitions the hover of the document's clock lane left elements running beside a task, which
+    //         the screen showed, in place of those its steps ended, as the rendering update that takes them in begins.
+    static void adopt_lane_transitions(DOM::Document&);
 
     Utf16FlyString const& transition_property() const;
 
     virtual Animations::AnimationClass animation_class() const override;
     virtual int class_specific_composite_order(GC::Ref<Animations::Animation> other) const override;
 
+    double style_change_event_time() const;
     double transition_start_time() const { return m_start_time; }
     double transition_end_time() const { return m_end_time; }
     NonnullRefPtr<StyleValue const> transition_end_value() const { return m_end_value; }
@@ -75,7 +77,7 @@ private:
         NonnullRefPtr<StyleValue const> end_value,
         NonnullRefPtr<StyleValue const> reversing_adjusted_start_value,
         double reversing_shortening_factor,
-        Publication);
+        EasingFunction timing_function);
 
     virtual void visit_edges(Cell::Visitor&) override;
 
@@ -108,7 +110,10 @@ private:
 
     GC::Ptr<CSS::CSSStyleDeclaration const> m_cached_declaration;
 
-    bool m_is_provisional { false };
+    bool m_is_provisional { true };
+
+    // Whether the transition is one the hover of a clock lane started, which the host took in.
+    bool m_adopted_from_lane { false };
 
     Phase m_previous_phase { Phase::Idle };
 };

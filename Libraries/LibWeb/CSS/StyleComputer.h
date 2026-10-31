@@ -14,6 +14,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <AK/WeakPtr.h>
+#include <LibGC/Weak.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/CSS/CSSAnimationProperties.h>
 #include <LibWeb/CSS/CSSFontFaceRule.h>
@@ -22,12 +23,12 @@
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
-#include <LibWeb/CSS/MediaQuery.h>
+#include <LibWeb/CSS/InstalledStyle.h>
 #include <LibWeb/CSS/RustDeclarationBlock.h>
+#include <LibWeb/CSS/RustMediaList.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/SelectorMatching.h>
 #include <LibWeb/CSS/SharedCompiledStyleSheet.h>
-#include <LibWeb/CSS/StyleGroupPayloadPins.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/Export.h>
@@ -36,35 +37,6 @@
 #include <LibWeb/CSS/StyleEngineBridge.h>
 
 namespace Web::CSS {
-
-// Matching an originating element answers both its own cascade and every
-// pseudo-element cascade. A caller that computes those cascades as one batch
-// can keep this result between them.
-struct StyleEngineMatchResult {
-    StyleNodeID node;
-    Optional<Vector<StyleEngine::RuleMatch>> matches;
-    Optional<u32> signature;
-};
-
-struct StyleSharingKey {
-    // The inherited groups of the parent style by address, then everything else the computation
-    // reads: the element's shape and every declaration that applies to it, in order, named by
-    // property and origin but not by value. Two keys that agree here differ in declaration values
-    // alone.
-    Vector<u64> computation_inputs;
-    // Every value the key names by its address rather than by its owner. A presentational hint
-    // is mapped afresh for each element and dies with the cascade that read it, so without this
-    // the next element's hint is free to land on the same address and read as the same value.
-    Vector<NonnullRefPtr<StyleValue const>> pinned_values;
-
-    [[nodiscard]] u64 hash() const;
-    [[nodiscard]] u64 hash_without_values() const;
-    [[nodiscard]] bool equals(StyleSharingKey const&) const;
-    [[nodiscard]] bool equals_without_values(StyleSharingKey const&) const;
-    [[nodiscard]] bool inputs_after_parent_groups_equal(StyleSharingKey const&) const;
-    [[nodiscard]] bool values_equal(StyleSharingKey const&) const;
-    [[nodiscard]] bool parent_groups_equal(StyleSharingKey const&) const;
-};
 
 class WEB_API StyleComputer final : public GC::Cell {
     GC_CELL(StyleComputer, GC::Cell);
@@ -83,24 +55,15 @@ public:
     DOM::Document& document() { return m_document; }
     DOM::Document const& document() const { return m_document; }
 
-    [[nodiscard]] NonnullRefPtr<ComputedValues const> create_document_style() const;
+    // Interns the document's own style, the viewport's, which no element holds.
+    [[nodiscard]] StyleRecordID intern_document_style(Layout::BegunRead const&) const;
 
-    // Materialize the complete computed view for one exact StyleEngine target and publish its
-    // StyleRecord assignment.
-    enum class StyleSharingMode {
-        Enabled,
-        Disabled,
-    };
     // The document element's style installed: the metrics `rem` resolves against are its font's.
     void update_root_element_font_metrics(ComputedValues const&);
-    [[nodiscard]] NonnullRefPtr<ComputedValues const> materialize_style_record(DOM::AbstractElement, Optional<bool&> did_change_custom_properties = {}, StyleEngineMatchResult* = nullptr, Optional<StyleEngine::StyleRecordDelta&> = {}, StyleSharingMode = StyleSharingMode::Enabled) const;
-    [[nodiscard]] StyleRecordID try_share_computed_style_record(DOM::Element&) const;
-    void remember_shared_computed_style_record(DOM::Element&, StyleRecordID) const;
-    // Compute the cascade supplied by rules, presentational hints, and inheritance while excluding the element's
-    // inline declaration. Editing uses this to identify transport-only style without mutating the live element.
-    [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> compute_properties_without_inline_style(DOM::AbstractElement) const;
-    [[nodiscard]] RefPtr<ComputedValues const> compute_pseudo_element_style_if_needed(DOM::AbstractElement, Optional<bool&> did_change_custom_properties, StyleEngineMatchResult* = nullptr, Optional<StyleEngine::StyleRecordDelta&> = {}) const;
-    [[nodiscard]] JsonArray collect_devtools_applied_style_rules(DOM::AbstractElement, bool include_inherited, bool include_user_agent_styles);
+    // The style of a pseudo-element the element holds no style for, as the style engine derives it for one read alone;
+    // null where the engine leaves the read to C++.
+    [[nodiscard]] RefPtr<ComputedValues const> engine_transient_pseudo_element_style(Layout::BegunRead const& read, DOM::Element const&, StyleEngine::DemandedPseudoElement);
+    [[nodiscard]] JsonArray collect_devtools_applied_style_rules(Layout::BegunRead const& read, DOM::AbstractElement, bool include_inherited, bool include_user_agent_styles);
 
     // The way back from a StyleEngine rule identity to what that rule contributes to the cascade.
     // Matching in the engine answers with identities; the cascade needs a declaration and the place
@@ -108,32 +71,21 @@ public:
     // the source's document/loading state.
     // DevTools resolves native identities to CSSOM wrappers only when requested.
     void register_style_engine_sheet_source(StyleSheetState const&);
-    [[nodiscard]] Optional<StyleEngineRuleTarget> style_engine_rule_target(StyleEngineRuleID rule_id) const;
+    [[nodiscard]] Optional<StyleEngineRuleTarget> style_engine_rule_target(Layout::BegunRead const& read, StyleEngineRuleID rule_id) const;
 
     static CSSPixels default_user_font_size();
-    static void ensure_style_metadata_tables_installed();
     static CSSPixels absolute_size_mapping(AbsoluteSize, CSSPixels default_font_size);
-    [[nodiscard]] RefPtr<StyleValue const> recascade_font_size_if_needed(DOM::AbstractElement, bool has_monospace_font_family, bool& depends_on_viewport_metrics) const;
 
     void set_viewport_rect(Badge<DOM::Document>, CSSPixelRect const& viewport_rect) { m_viewport_rect = viewport_rect; }
     [[nodiscard]] CSSPixelRect const& viewport_rect_for_style_environment() const { return m_viewport_rect; }
     [[nodiscard]] Length::FontMetrics const& root_element_font_metrics() const { return m_root_element_font_metrics; }
     [[nodiscard]] bool root_element_font_metrics_depend_on_viewport_metrics() const { return m_root_element_font_metrics_depend_on_viewport_metrics; }
-    // Whether the last materialization answered with the element's own last style because only the
-    // custom-property environment it inherits moved, and nothing its cascades read moved with it. The
-    // element's pseudo-element styles then stand as well.
-    [[nodiscard]] bool last_materialization_kept_pseudo_element_styles() const { return m_last_materialization_kept_pseudo_element_styles; }
-    // Whether the materialization under way answers a reaction the style engine derived from an
-    // ancestor's application rather than from a published match answer. Everything such a reaction
-    // can change is named by the element's style input record, so a record that still holds
-    // answers with the element's own last style.
-    void set_materializing_for_derived_reaction(bool value) const { m_materializing_for_derived_reaction = value; }
-    // Moves with the viewport rect the environment resolves viewport units against. A style input
-    // record names it apart from the environment version, so that a computation that read no
-    // viewport metric survives a resize.
-    [[nodiscard]] u64 viewport_environment_version() const { return m_viewport_environment_version; }
+    // https://drafts.csswg.org/css-viewport/#effective-zoom
+    // NB: The root element font metrics are zoomed by this effective zoom of the root element.
+    [[nodiscard]] double root_element_effective_zoom() const { return m_root_element_effective_zoom; }
+    // Moves with the viewport rect the environment resolves viewport units against.
     void bump_viewport_environment_version() { ++m_viewport_environment_version; }
-    // The environment as the sharing caches name it: the document's version and the viewport's.
+    // The environment as a compositor animation request names it: the document's version and the viewport's.
     [[nodiscard]] u64 style_environment_version_for_sharing() const;
 
     // Drop caches whose keys contain inputs that are stable only within one engine transaction.
@@ -143,206 +95,105 @@ public:
     void begin_style_update() const;
     void end_style_update() const;
 
-    // Forget every style one element computed on another's behalf. See m_style_sharing_cache.
-    void drop_style_sharing_cache() const;
-
     struct ComputedStyleInvalidation {
         RequiredInvalidationAfterStyleChange invalidation;
         bool any_computed_value_changed { false };
     };
 
-    // Publish a computed style built outside the ordinary cascade path, such as an inherited-group
-    // swap, so StyleEngine's final node-to-style relation remains authoritative.
-    [[nodiscard]] StyleEngine::StyleRecordDelta publish_computed_style_inputs(DOM::AbstractElement, ComputedValues const&) const;
-    [[nodiscard]] StyleEngine::StyleRecordDelta publish_animation_overlay(DOM::AbstractElement, ComputedValues const&) const;
+    // Has the engine compose each element's sampled overlay over the record the element installed, which it was sampled
+    // on, compare it with that record and publish it, in one call of the engine, answering each at the same index of
+    // `publications`.
+    struct SampledAnimationOverlay {
+        DOM::AbstractElement element;
+        ComputedStyleWorkingSet const& style;
+    };
+    void publish_sampled_animation_overlays(Layout::BegunRead const& read, ReadonlySpan<SampledAnimationOverlay>, Span<StyleEngineFFI::FfiAnimationOverlayPublication> publications) const;
     // Give a layout-only variant of an element or pseudo-element style an authoritative record
     // without replacing the StyleEngine assignment of its DOM target.
-    [[nodiscard]] StyleRecordID intern_computed_style_inputs(DOM::AbstractElement, ComputedValues const&) const;
+    [[nodiscard]] StyleRecordID intern_computed_style_inputs(Layout::BegunRead const& read, DOM::AbstractElement, ComputedValues const&) const;
     // Anonymous layout boxes have no style target, but their immutable group tuple is still an
     // authoritative shared record rather than layout-owned complete computed values.
-    [[nodiscard]] StyleRecordID intern_anonymous_layout_style(ComputedValues const&) const;
+    [[nodiscard]] StyleRecordID intern_anonymous_layout_style(Layout::BegunRead const& read, ComputedValues const&) const;
 
-    [[nodiscard]] ComputedStyleRecordView computed_style_record_view(StyleRecordID) const;
-    [[nodiscard]] void const* style_record_payloads(StyleRecordID) const;
+    [[nodiscard]] ComputedStyleRecordView computed_style_record_view(Layout::BegunRead const& read, StyleRecordID) const;
+    [[nodiscard]] ComputedStyleRecordView computed_style_record_view(InstalledStyle const&) const;
+    // The style an element or a pseudo-element installs as `style_record`, which a style update answered.
+    [[nodiscard]] InstalledStyle install_style(Layout::BegunRead const& read, StyleRecordID style_record) const;
     void pin_style_record(StyleRecordID) const;
     void unpin_style_record(StyleRecordID) const;
     void begin_style_record_view_epoch() const;
     void end_style_record_view_epoch() const;
     [[nodiscard]] u64 computed_style_record_view_pin_count() const { return m_computed_style_record_view_pin_count; }
 
-    // Two elements whose cascade declares the same custom properties against the same inherited
-    // environment hold the same environment, so they are given one object rather than an object
-    // each. What that buys is not the bytes: an environment resolves once, and a child naming its
-    // parent's environment by identity is told the truth when two parents agree.
-    [[nodiscard]] NonnullRefPtr<CustomPropertyData const> intern_custom_property_data(NonnullRefPtr<CustomPropertyData const>) const;
     void sweep_custom_property_environments() const;
     // The environment the style engine resolved under `identity`, materialized over the data the
     // element inherits, which must be the environment the engine resolved it over. Nothing when
     // the identity is no engine environment or was resolved over another.
-    [[nodiscard]] RefPtr<CustomPropertyData const> engine_custom_property_environment(u64 identity, RefPtr<CustomPropertyData const> const& inherited) const;
+    [[nodiscard]] RefPtr<CustomPropertyData const> engine_custom_property_environment(Layout::BegunRead const& read, u64 identity, RefPtr<CustomPropertyData const> const& inherited) const;
 
-    // Whether the collection refreshes a previously published style outside the drive; a refresh
-    // re-runs the animated element style adjustments and leaves the non-inherited-property
-    // inheritance invalidation mark itself.
-    enum class AnimationRefresh {
-        No,
-        Yes,
+    // Refreshes a previously published style outside the drive: re-runs the animated element style
+    // adjustments and leaves the non-inherited-property inheritance invalidation mark itself.
+    void collect_animations_into(Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&) const;
+    // One element's animations, refreshed over the record it holds as `collect_animations_into()` refreshes them.
+    struct AnimationRefreshRequest {
+        DOM::AbstractElement abstract_element;
+        ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects;
+        ComputedStyleWorkingSet& computed_properties;
     };
-    void collect_animations_into(DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&, AnimationRefresh) const;
+    // Refreshes the animations of elements of this document, sampling them all in one call of the style engine.
+    void refresh_animations_into_each(Layout::BegunRead const& read, ReadonlySpan<AnimationRefreshRequest>) const;
 
-    // `explicitly_inherited_non_inherited_style_groups` reports the style groups whose values the
-    // computation read from the half of the style it inherits from that a child normally cannot
-    // see, which decides whether its answer can be offered to another element.
-    [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> compute_properties(DOM::AbstractElement, CascadedProperties&, u64 matching_pseudo_element_styles, u32* explicitly_inherited_non_inherited_style_groups = nullptr, StyleRecordID previous_style_record = {}, u32 initial_computed_group_mask = ComputedValues::all_style_groups, bool use_retained_style_computation_selection = false, bool stop_after_longhand_drive = false, u32* selected_computed_group_mask = nullptr, bool* computation_reads_unkeyed_context = nullptr, bool* computation_reads_resource_context = nullptr) const;
-
-    void process_animation_definitions(ComputedStyleWorkingSet const& computed_properties, CascadedProperties const&, DOM::AbstractElement& abstract_element, ReadonlySpan<AnimationProperties> animation_definitions) const;
-
-    enum class DeclaredValueSource : u8 {
-        PublishedEnvironment,
-        BeneathAnimationOverlay,
-    };
-    NonnullRefPtr<StyleValue const> compute_value_of_custom_property(ComputedStyleWorkingSet const*, AbstractOrHypotheticalElement const&, Utf16FlyString const& name, DeclaredValueSource = DeclaredValueSource::PublishedEnvironment) const;
-    NonnullRefPtr<StyleValue const> resolve_unresolved_style_value(AbstractOrHypotheticalElement, PropertyNameAndID const&, UnresolvedStyleValue const&) const;
-    ComputationContext fallback_computation_context_for_custom_property(AbstractOrHypotheticalElement const&) const;
+    void apply_animation_definitions(DOM::AbstractElement&, ReadonlySpan<ComputedValuesFFI::FfiComputedAnimation> animation_definitions, bool in_display_none_subtree) const;
+    // Applies the animation plan the record an element or pseudo-element holds decides, for a record the style engine
+    // settled, where applying it would change anything.
+    void apply_settled_animation_plan(Layout::BegunRead const& read, DOM::AbstractElement&) const;
+    // Starts the CSS animations of an element or pseudo-element and composes its animations over the record the style
+    // engine settled for it, once the host has installed it.
+    void compose_installed_engine_record(Layout::BegunRead const& read, DOM::AbstractElement, StyleRecordID before_change_style_record) const;
 
     static NonnullRefPtr<StyleValue const> compute_font_size(NonnullRefPtr<StyleValue const> const& absolutized_value, int computed_math_depth, Optional<DOM::AbstractElement> const& inheritance_parent, CSSPixels initial_font_size = InitialValues::font_size());
     static NonnullRefPtr<StyleValue const> compute_font_style(NonnullRefPtr<StyleValue const> const& absolutized_value);
     static NonnullRefPtr<StyleValue const> compute_font_weight(NonnullRefPtr<StyleValue const> const& absolutized_value, Optional<DOM::AbstractElement> const& inheritance_parent);
     static NonnullRefPtr<StyleValue const> compute_font_width(NonnullRefPtr<StyleValue const> const& absolutized_value);
 
-    [[nodiscard]] NonnullRefPtr<ComputedValues const> build_computed_values(ComputedStyleWorkingSet&, DOM::AbstractElement, StyleScope const&, ComputedValues const* previous_base = nullptr, u32 groups_to_apply = ComputedValues::all_style_groups) const;
-    // The animation-frame variant: keep the previous style's base and rebuild only the groups the
-    // animated properties write, falling back to the full build when a touched group is unknown.
-    [[nodiscard]] NonnullRefPtr<ComputedValues const> build_animated_computed_values(ComputedStyleWorkingSet&, DOM::AbstractElement, StyleScope const&, ComputedValues const& previous_values) const;
     [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> reconstruct_computed_properties(ComputedValues const&) const;
     void apply_animated_properties_to_reconstruction(ComputedStyleWorkingSet&, ComputedValues const&) const;
-    [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> reconstruct_computed_properties_for_animation(StyleRecordID) const;
+    [[nodiscard]] NonnullRefPtr<ComputedStyleWorkingSet> reconstruct_computed_properties_for_animation(Layout::BegunRead const& read, StyleRecordID) const;
 
     void begin_transition_stabilization_epoch();
-    void record_transition_stabilization_baseline(DOM::AbstractElement) const;
+    // https://drafts.csswg.org/css-transitions-2/#defining-before-change-style
+    // Keeps `before_change_style_record` as the style a later pass of the stabilization epoch decides the element's
+    // transitions against, unless a pass already kept one.
+    void record_transition_stabilization_baseline(DOM::AbstractElement, StyleRecordID before_change_style_record) const;
+    // Keeps `before_change_style_record` that way where the element's style scope can run a later pass at all.
+    void record_transition_baseline_for_later_passes(DOM::AbstractElement, StyleRecordID before_change_style_record) const;
+    // Runs the whole transition step for an installed record, against the record the element moved away from, which
+    // the caller keeps alive. Returns what publishing a started transition's values invalidates, which the caller
+    // reacts to like to the rest of the style change.
+    [[nodiscard]] RequiredInvalidationAfterStyleChange run_transition_step_for_installed_record(Layout::BegunRead const& read, DOM::AbstractElement, StyleRecordID before_change_style_record) const;
     void commit_transition_stabilization_epoch();
     void for_each_provisional_transition_effect(DOM::AbstractElement const&, Function<void(Animations::KeyframeEffect&)> const&) const;
 
-private:
-    virtual void finalize() override;
-
-    virtual void visit_edges(Visitor&) override;
-
-    [[nodiscard]] StyleEngine::StyleRecordDelta record_computed_style_inputs(Optional<DOM::AbstractElement>, ComputedValues const&, StyleNodeID style_node_id) const;
-    [[nodiscard]] Parser::ValueParserFFI::FfiMediaEnvironment const* cached_media_environment_for_style_update() const;
+    // The media features of the current style update, which the style engine copies with each transaction.
     [[nodiscard]] Parser::ValueParserFFI::FfiMediaEnvironment const* ensure_media_environment_for_style_update() const;
 
-    enum class ComputeStyleMode {
-        Normal,
-        CreatePseudoElementStyleIfNeeded,
-    };
+private:
+    virtual void visit_edges(Visitor&) override;
 
-    enum class IncludeInlineStyle : u8 {
-        No,
-        Yes,
-    };
-
-public:
-    // One declaration block the cascade applies, and where it sits. This is what a match becomes
-    // once the rule it names has been turned back into what that rule contributes: the cascade never
-    // asks a match anything else, so this is the whole of the boundary between matching and
-    // cascading, and either matcher can produce it.
-    struct CascadeContribution {
-        RustDeclarationBlockSnapshot declaration;
-        RefPtr<StyleSheetState const> source_style_sheet;
-        StyleEngineRuleID style_engine_rule_id;
-        u64 rule_identity;
-        u32 declaration_version;
-        u32 semantic_declaration_id { 0 };
-        // The shadow root the rule decides from, which is not always the one the element is in.
-        GC::Ptr<DOM::ShadowRoot const> source_shadow_root;
-        Optional<Utf16FlyString> layer_name;
-        CascadeOrigin cascade_origin { CascadeOrigin::Author };
-        u32 author_context_index { 0 };
-        u32 layer_index { 0 };
-    };
-
-    // Everything the cascade needs that is not the element's own declarations, in the order it
-    // applies them.
-    struct CascadeInput : public RefCounted<CascadeInput> {
-        Vector<CascadeContribution> contributions;
-        u32 author_context_count { 0 };
-        // The author context the element's own inline style belongs to.
-        Optional<u32> inline_style_context_index;
-        // Which synthetic pseudo-elements some rule decides for, as a bit per pseudo-element. The
-        // element's own style carries it so a consumer knows which pseudo-elements to materialize.
-        u64 matching_pseudo_element_styles { 0 };
-        // A traversal-local exact identity for the complete rule-match input. Present only when
-        // StyleEngine proved the result reusable from the element's ancestry context.
-        Optional<u32> match_signature;
-    };
-
-    // Two elements given the same style input compute the same style, so the second one can take the
-    // first one's answer instead of deriving it again. The key is everything the computation is
-    // allowed to read: every declaration that decides for the element in the order it applies, the
-    // inherited context it computes against, and the shape of the element itself. Anything else the
-    // computation turns out to have read - its container, its attributes, its place among its
-    // siblings - takes the result out of the cache rather than being keyed on, so the key stays a
-    // fixed size and the escape hatches stay honest.
-    struct StyleSharingCandidate {
-        bool may_reuse_or_publish_shared_style { true };
-        // Empty until the cascade has run; unusable when the element is not a sharing candidate.
-        StyleSharingKey key;
-        StyleGroupPayloadPins pinned_parent_groups;
-        // The style the key names the inherited groups of, for the same reason.
-        StyleRecordID parent_style_record_identity;
-        bool is_candidate { false };
-        bool style_input_recorded { false };
-        // Whether the cascade holds anything that reads the inherited custom property environment:
-        // a declaration of a custom property, or a value with a substitution still to make. Only
-        // then does the key name that environment, which is an object the element's own ancestors
-        // mint afresh whenever any of them recomputes.
-        bool cascade_reads_custom_properties { false };
-        bool cascade_inherits_custom_properties_explicitly { false };
-        bool computation_reads_unkeyed_context { true };
-        // Whether a value read the resource context of its declaration, which an input record names
-        // through the declaration's block and a sharing key through the declaration's identity, but a
-        // winner record retained by value does not.
-        bool computation_reads_resource_context { true };
-        RefPtr<CustomPropertyData const> pinned_parent_custom_property_data;
-        // The style groups whose values the computation read from the inherited style's
-        // non-inherited half, which the key does not name.
-        u32 explicitly_inherited_non_inherited_style_groups { 0 };
-        // Set when an entry with this key was found, in which case nothing was computed.
-        RefPtr<ComputedValues const> shared_values;
-        Optional<StyleRecordID> shared_style_record_identity;
-        Optional<u64> new_style_sharing_entry_hash;
-        // Set when nothing this element's last computation read has moved, in which case the style
-        // it produced is still the answer and nothing was computed either.
-        RefPtr<ComputedValues const> reused_values;
-        // The exact cascade winner delta's conservative computed dependency closure. Present only
-        // when a preceding base style is available to supply every group outside the closure.
-        Optional<u32> computed_groups_to_rebuild;
-        // The base style supplying those groups when it is another element's rather than this
-        // element's previous one.
-        RefPtr<ComputedValues const> donor_values;
-    };
+    [[nodiscard]] StyleEngine::StyleRecordDelta record_computed_style_inputs(Layout::BegunRead const& read, Optional<DOM::AbstractElement>, ComputedValues const&, StyleNodeID style_node_id) const;
 
 private:
-    void clear_style_sharing_cache() const;
-    [[nodiscard]] NonnullRefPtr<ComputedValues const> build_and_share_computed_values(NonnullRefPtr<ComputedStyleWorkingSet>, DOM::AbstractElement, StyleScope const&, StyleSharingCandidate&) const;
-    [[nodiscard]] Optional<u32> animated_overlay_style_groups(AnimatedProperties const&, DOM::AbstractElement) const;
-    [[nodiscard]] static Vector<GC::Ptr<DOM::ShadowRoot const>, 4> author_context_shadow_roots(DOM::AbstractElement);
-
-    // The same input, from StyleEngine's own matching. Empty when the engine could not answer for
-    // this element, which is not the same as an element nothing decides for.
-    [[nodiscard]] RefPtr<CascadeInput const> style_engine_cascade_input(DOM::AbstractElement, StyleEngineMatchResult* = nullptr) const;
-
-    [[nodiscard]] RefPtr<ComputedStyleWorkingSet> compute_style_impl(DOM::AbstractElement, ComputeStyleMode, Optional<bool&> did_change_custom_properties, StyleScope const&, IncludeInlineStyle, StyleEngineMatchResult* = nullptr, StyleSharingCandidate* = nullptr) const;
-    [[nodiscard]] NonnullRefPtr<CascadedProperties> compute_cascaded_values(DOM::AbstractElement, CascadeInput const&, IncludeInlineStyle, StyleSharingCandidate* sharing = nullptr, Vector<StyleProperty> const* precomputed_presentational_hints = nullptr) const;
-    void collect_animation_effects_into(DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&) const;
-    NonnullRefPtr<StyleValue const> compute_animated_custom_property_value(Utf16FlyString const& name, NonnullRefPtr<StyleValue const> specified_value, ComputedStyleWorkingSet&, DOM::AbstractElement) const;
-    void publish_animated_custom_properties(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
-    void invalidate_animated_custom_property_readers(DOM::AbstractElement, OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> const& animated_values) const;
-    Vector<GC::Ref<Animations::KeyframeEffect>> start_needed_transitions(ComputedStyleWorkingSet&, DOM::AbstractElement) const;
+    // `sampled_style_record` names the record the working set was reconstructed from, where it was.
+    void collect_animation_effects_into(Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&, StyleRecordID sampled_style_record) const;
+    struct AnimationSample;
+    [[nodiscard]] NonnullOwnPtr<AnimationSample> begin_animation_sample(Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&, StyleRecordID sampled_style_record) const;
+    void finish_animation_sample(AnimationSample&, ComputedValuesFFI::FfiHostAnimationSampleResult const&) const;
+    void finish_animation_refresh(Layout::BegunRead const& read, DOM::AbstractElement, ComputedStyleWorkingSet&) const;
+    void publish_animated_custom_properties(Layout::BegunRead const&, ComputedStyleWorkingSet&, DOM::AbstractElement) const;
+    void invalidate_animated_custom_property_readers(Layout::BegunRead const&, DOM::AbstractElement, OrderedHashMap<Utf16FlyString, NonnullRefPtr<StyleValue const>> const& animated_values, RefPtr<CustomPropertyData const> old_data, bool recompute_style) const;
+    RefPtr<ComputedStyleWorkingSet> start_needed_transitions(Layout::BegunRead const& read, DOM::AbstractElement, StyleRecordID before_change_style_record) const;
     [[nodiscard]] bool has_provisional_transition_states(DOM::AbstractElement) const;
-    [[nodiscard]] RefPtr<ComputedStyleWorkingSet> start_needed_transitions_on_shared_style(DOM::AbstractElement, ComputedValues const& shared_values) const;
-    void finalize_style(ComputedStyleWorkingSet&, DOM::AbstractElement, ComputedValuesFFI::FfiStyleFinalizationMode) const;
+    void finalize_animated_box_type(Layout::BegunRead const& read, ComputedStyleWorkingSet&, DOM::AbstractElement) const;
 
     [[nodiscard]] CSSPixelRect viewport_rect() const { return m_viewport_rect; }
 
@@ -359,132 +210,71 @@ public:
     };
     [[nodiscard]] Vector<NonAuthorStyleSheet>& non_author_style_sheets() { return m_non_author_style_sheets; }
 
-    [[nodiscard]] StyleEngineRuleID style_engine_rule_id_for(RustRule const&) const;
+    [[nodiscard]] StyleEngineRuleID style_engine_rule_id_for(Layout::BegunRead const& read, RustRule const&) const;
     [[nodiscard]] SheetID style_engine_sheet_id_for(StyleSheetState const&) const;
     void set_style_engine_sheet_id_for(StyleSheetState&, SheetID);
 
     [[nodiscard]] HashMap<SharedCompiledStyleSheetKey, RefPtr<SharedCompiledStyleSheet>>& shared_compiled_style_sheets() { return m_shared_compiled_style_sheets; }
+    [[nodiscard]] Vector<SharedCompiledStyleSheetKey>& detached_shared_compiled_style_sheets() { return m_detached_shared_compiled_style_sheets; }
+    // How many shared compiled sheets a document keeps after no tree scope holds them.
+    static constexpr size_t max_detached_shared_compiled_style_sheets = 8;
 
-    // The reverse of an element's style node identity. StyleEngine plans in identities; turning a
-    // plan back into elements needs this, and it is maintained at exactly the two points the
+    // The reverse of a node's style node identity. StyleEngine plans in identities; turning a
+    // plan back into nodes needs this, and it is maintained at exactly the two points the
     // identity itself is.
-    void register_style_node(StyleNodeID style_node_id, DOM::Element&);
+    void register_style_node(StyleNodeID style_node_id, DOM::Node&);
     void ensure_style_node_slot(StyleNodeID);
     void unregister_style_node(StyleNodeID style_node_id);
     [[nodiscard]] GC::Ptr<DOM::Element> element_for_style_node(StyleNodeID style_node_id) const;
+    [[nodiscard]] GC::Ptr<DOM::Node> node_for_style_node(StyleNodeID style_node_id) const;
+    // The node a style node id the render clock's lanes report names, or none where the id left its node since the
+    // rendering update the lanes follow took them in last: the id may name another node by now, which the lanes, on a
+    // fork of the render state from before, never saw.
+    [[nodiscard]] GC::Ptr<DOM::Node> node_for_lane_style_node(StyleNodeID style_node_id) const;
+    [[nodiscard]] GC::Ptr<DOM::Element> element_for_lane_style_node(StyleNodeID style_node_id) const;
+    // Forgets the style node ids that left their nodes, once a rendering update took in what the lanes reported.
+    void forget_style_nodes_retired_beside_lanes() { m_style_nodes_retired_beside_lanes.clear(); }
     void prepare_elements_for_style_computation();
     void for_each_style_node(Function<void(DOM::Element&)>) const;
 
     // Style scopes are numbered per document, with zero naming the document's own scope. A scope is
     // never reused, so a sheet detached with an identity that has been retired detaches nothing
     // rather than something else.
-    [[nodiscard]] TreeScopeID allocate_tree_scope() { return ++m_next_tree_scope; }
+    [[nodiscard]] TreeScopeID allocate_tree_scope(DOM::ShadowRoot&);
+    // The shadow root a scope numbers, while it lives and still belongs to this document.
+    [[nodiscard]] DOM::ShadowRoot* shadow_root_for_tree_scope(TreeScopeID) const;
+    // Each shadow root a scope numbers, while it lives and still belongs to this document.
+    template<typename Callback>
+    void for_each_shadow_root(Callback&& callback) const
+    {
+        for (u32 scope = 1; scope <= m_shadow_roots_by_tree_scope.size(); ++scope) {
+            if (auto* shadow_root = shadow_root_for_tree_scope(TreeScopeID { scope }))
+                callback(*shadow_root);
+        }
+    }
 
 private:
-    [[nodiscard]] Length::FontMetrics calculate_root_element_font_metrics(ComputedStyleWorkingSet const&) const;
-    NonnullRefPtr<StyleValue const> finalize_custom_property_value(ComputedStyleWorkingSet const*, AbstractOrHypotheticalElement const&, Utf16FlyString const&, NonnullRefPtr<StyleValue const>) const;
-
     GC::Ref<DOM::Document> m_document;
 
     Length::FontMetrics m_default_font_metrics;
     mutable Length::FontMetrics m_root_element_font_metrics;
     mutable bool m_root_element_font_metrics_depend_on_viewport_metrics { false };
+    mutable double m_root_element_effective_zoom { 1 };
 
-    mutable Optional<ComputationContext> m_cached_font_computation_context;
-    mutable Optional<ComputationContext> m_cached_line_height_computation_context;
-    mutable Optional<ComputationContext> m_cached_generic_computation_context;
     mutable u64 m_style_update_depth { 0 };
     mutable Optional<MediaEnvironmentSnapshot> m_style_update_media_environment;
     mutable Optional<Parser::ValueParserFFI::FfiMediaEnvironment> m_style_update_ffi_media_environment;
-    // The style most recently built, kept as a payload donor: a run of elements computing the same
-    // style shares group payloads through it, which no parent or previous-style adoption can do.
-    mutable RefPtr<ComputedValues const> m_last_built_computed_values;
-
-    // What one element's computation produced, for the next element with the same key. Only the
-    // effects an element carries away from its own computation are here; everything else the
-    // computation did was to values that are in the shared style.
-    struct StyleSharingEntry {
-        StyleSharingKey key;
-        StyleGroupPayloadPins pinned_parent_groups;
-        StyleNodeID style_node_id;
-        StyleRecordID parent_style_record_identity;
-        // The style groups whose values the computation read from the inherited style's
-        // non-inherited half, which the key does not name. An entry with any such group answers
-        // only for an element inheriting from that same style.
-        u32 explicitly_inherited_non_inherited_style_groups { 0 };
-        NonnullRefPtr<ComputedValues const> values;
-        RefPtr<CustomPropertyData const> custom_property_data;
-        Optional<StyleRecordID> style_record_identity;
-        bool read_beyond_the_record { false };
-        bool style_reads_resource_context { false };
-        bool style_uses_var_css_function { false };
-        bool style_uses_inherit_css_function { false };
-    };
-    // Keyed by the hash of the key, since two keys of different length can share a bucket. Mutable
-    // declaration blocks and the document environment carry revisions in the key, so entries remain
-    // valid across style transactions. Bound the retained set so obsolete revisions cannot grow it
-    // without limit on a page that continuously edits declarations.
-    static constexpr size_t maximum_persistent_style_sharing_entries = 8192;
-    mutable HashMap<u64, Vector<StyleSharingEntry>> m_style_sharing_cache;
-    mutable size_t m_style_sharing_cache_entry_count { 0 };
-    static constexpr size_t maximum_style_sharing_donors_per_key = 4;
-    mutable HashMap<u64, Vector<u64, maximum_style_sharing_donors_per_key>> m_style_sharing_donor_index;
-    mutable u64 m_style_sharing_transaction_generation { 0 };
-    mutable bool m_last_materialization_kept_pseudo_element_styles { false };
-    mutable bool m_materializing_for_derived_reaction { false };
     u64 m_viewport_environment_version { 0 };
-    // The word buffer one element's record gives up, reused by the next element's.
-    mutable OwnPtr<StyleInputRecord> m_style_input_record_scratch;
-    // Interned custom property environments, keyed by a hash of what decides one: the environment it
-    // inherits from, and every name and value it declares.
-    mutable HashMap<u64, Vector<NonnullRefPtr<CustomPropertyData const>>> m_custom_property_environments;
     // The environments the style engine resolved, by the identity it minted, materialized once.
     mutable HashMap<u64, NonnullRefPtr<CustomPropertyData const>> m_engine_custom_property_environments;
 
-    // What one element's cascaded custom property declarations resolved to. A rule that declares
-    // custom properties on every element - which is how utility frameworks carry their theme - hands
-    // the same list to every element it matches, and the environment that list produces depends on
-    // nothing but the list and the environment it inherits.
-    struct CascadedCustomPropertyEnvironment {
-        Vector<u64> key;
-        RefPtr<CustomPropertyData const> parent;
-        RefPtr<CustomPropertyData const> result;
-    };
-    mutable HashMap<u64, Vector<CascadedCustomPropertyEnvironment>> m_cascaded_custom_property_environments;
-
-    mutable Vector<u64> m_cascaded_custom_property_key_scratch;
-
-    // What one final value parses to against one registration's syntax: a pure function of the
-    // value, the syntax, and the registration generation, unlike the computed-value step after it,
-    // which resolves font-relative units against the reading element and runs per read.
-    struct RegisteredCustomPropertyParse {
-        NonnullRefPtr<StyleValue const> value;
-        void const* syntax_identity { nullptr };
-        u64 registration_generation { 0 };
-        NonnullRefPtr<StyleValue const> parsed;
-    };
-    mutable HashMap<void const*, Vector<RegisteredCustomPropertyParse>> m_registered_custom_property_parses;
-
-    // The cascade input a match signature names, expanded once and answered from for every other
-    // element the traversal proves has the same one. Keyed by the signature and what is being
-    // styled, and valid for exactly as long as the sharing cache above is.
-    mutable HashMap<u64, NonnullRefPtr<CascadeInput const>> m_style_engine_cascade_input_cache;
-
-    enum class ProvisionalTransitionAction : u8 {
-        None,
-        Remove,
-        Cancel,
-        Start,
-        RemoveAndStart,
-        CancelRemoveAndStart,
-    };
     struct ProvisionalTransitionState {
         GC::Ptr<DOM::Element> element;
         Optional<PseudoElement> pseudo_element;
         PropertyID property_id;
         GC::Ptr<CSSTransition> committed_transition;
         GC::Ptr<CSSTransition> proposed_transition;
-        ProvisionalTransitionAction action { ProvisionalTransitionAction::None };
+        StyleValueFFI::FfiTransitionActionKind action {};
         bool has_decision { false };
     };
     // Whether the animation collection of the computation in progress resolved a keyframe-borne
@@ -493,38 +283,60 @@ private:
     mutable Vector<ProvisionalTransitionState> m_provisional_transition_states;
     mutable HashMap<u64, size_t> m_provisional_transition_state_indices;
     mutable HashMap<u64, Vector<size_t>> m_provisional_transition_state_indices_by_target;
-    // Style, layout, or animation feedback can introduce a transition for any property in a later
-    // pass. Pin the authoritative before-change record until the stabilization epoch commits.
-    mutable HashMap<u64, StyleRecordID> m_transition_stabilization_baselines;
+    // Whether the engine keeps a before-change style the current stabilization epoch recorded.
+    mutable bool m_transition_baselines_recorded { false };
 
-    ComputationContext make_computation_context_for_property(PropertyID, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
-    ComputationContext const& get_computation_context_for_property(PropertyID, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
-    void clear_computation_context_caches() const
-    {
-        const_cast<StyleComputer*>(this)->m_cached_font_computation_context = {};
-        const_cast<StyleComputer*>(this)->m_cached_line_height_computation_context = {};
-        const_cast<StyleComputer*>(this)->m_cached_generic_computation_context = {};
-    }
-
-    bool computation_context_cache_is_empty() const
-    {
-        return !m_cached_font_computation_context.has_value() && !m_cached_line_height_computation_context.has_value() && !m_cached_generic_computation_context.has_value();
-    }
-
+    ComputationContext make_computation_context_for_property(Layout::BegunRead const& read, PropertyID, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
     CSSPixelRect m_viewport_rect;
 
     mutable StyleEngine m_style_engine;
     mutable u64 m_computed_style_record_view_pin_count { 0 };
     mutable u32 m_style_record_view_epoch_depth { 0 };
-    Vector<GC::Ptr<DOM::Element>> m_style_nodes;
-    TreeScopeID m_next_tree_scope;
+    // Indexed by each kind's dense index; see style_node_is_text(). The element-kind table also
+    // holds shadow roots: a root gets no style, but it has a StyleNodeID of its own.
+    Vector<GC::Ptr<DOM::Node>> m_element_style_nodes;
+    Vector<GC::Ptr<DOM::Text>> m_text_style_nodes;
+    HashTable<StyleNodeID> m_style_nodes_retired_beside_lanes;
+    // The root each scope numbers, by scope minus one.
+    Vector<GC::Weak<DOM::ShadowRoot>> m_shadow_roots_by_tree_scope;
     Vector<NonAuthorStyleSheet> m_non_author_style_sheets;
     HashMap<RefPtr<StyleSheetState const>, SheetID> m_constructed_sheet_ids;
     HashMap<SharedCompiledStyleSheetKey, RefPtr<SharedCompiledStyleSheet>> m_shared_compiled_style_sheets;
+    // The shared compiled sheets that no tree scope holds any longer, least recently detached first.
+    Vector<SharedCompiledStyleSheetKey> m_detached_shared_compiled_style_sheets;
     HashMap<u64, WeakPtr<StyleSheetState const>> m_style_engine_sheet_sources;
 };
 
-// Whether a custom property holds a different value under two inherited environments.
-bool custom_property_value_moved(Utf16FlyString const& name, CustomPropertyData const* old_data, CustomPropertyData const* new_data);
+// Keeps a style record alive for as long as it is held, as a transition step that reads the record an element moved
+// away from needs. A null record pins nothing.
+class StyleRecordPin {
+    AK_MAKE_NONCOPYABLE(StyleRecordPin);
+    AK_MAKE_NONMOVABLE(StyleRecordPin);
+
+public:
+    StyleRecordPin(StyleComputer const& style_computer, StyleRecordID style_record)
+        : m_style_computer(style_computer)
+        , m_style_record(style_record)
+    {
+        if (!!m_style_record)
+            m_style_computer->pin_style_record(m_style_record);
+    }
+
+    ~StyleRecordPin()
+    {
+        if (!!m_style_record)
+            m_style_computer->unpin_style_record(m_style_record);
+    }
+
+    StyleRecordID style_record() const { return m_style_record; }
+
+private:
+    GC::Ref<StyleComputer const> m_style_computer;
+    StyleRecordID m_style_record;
+};
+
+// The custom properties an element's animations sample moved from `old_data`: its descendants take what it hands down
+// now, as they take an environment that a style reaction moved.
+void move_custom_property_environment_below_animated_element(Layout::BegunRead const&, DOM::Element&, RefPtr<CustomPropertyData const> old_data);
 
 }

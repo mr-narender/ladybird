@@ -10,6 +10,10 @@ const languagesSettings = document.querySelector("#languages-settings");
 let LANGUAGES = [];
 
 function loadSettings(settings) {
+    if (!Object.hasOwn(settings, "languages")) {
+        return;
+    }
+
     LANGUAGES = settings.languages;
 
     if (languagesDialog.open) {
@@ -140,14 +144,14 @@ languagesSelect.addEventListener("change", () => {
 });
 
 registerDialogDeepLink({
-    hash: "languages",
-    tab: "general",
+    hash: "editLanguages",
+    tab: "languages",
     dialog: languagesDialog,
     onOpen: showLanguages,
 });
 
 languagesSettings.addEventListener("click", () => {
-    location.hash = "languages";
+    location.hash = "editLanguages";
 });
 
 document.addEventListener("WebUILoaded", () => {

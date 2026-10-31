@@ -4,32 +4,24 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Checked.h>
 #include <AK/NeverDestroyed.h>
-#include <AK/NumericLimits.h>
 #include <AK/ScopeGuard.h>
-#include <LibCompositing/DisplayList/DisplayListPlayerSkia.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibGC/Heap.h>
+#include <LibGC/WeakHashMap.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/DecodedImageFrame.h>
-#include <LibGfx/PaintingSurface.h>
 #include <LibJS/Runtime/ExternalMemory.h>
+#include <LibMedia/Sinks/AudioOutputFactory.h>
+#include <LibMediaClient/RemotePlaybackManager.h>
 #include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
-#include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/DocumentState.h>
+#include <LibWeb/DOM/DocumentObserver.h>
+#include <LibWeb/DOM/XMLDocument.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
-#include <LibWeb/HTML/Navigable.h>
-#include <LibWeb/HTML/NavigationParams.h>
-#include <LibWeb/HTML/Parser/HTMLParser.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
-#include <LibWeb/HTML/WindowProxy.h>
-#include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -43,88 +35,93 @@ namespace Web::SVG {
 GC_DEFINE_ALLOCATOR(SVGDecodedImageData);
 GC_DEFINE_ALLOCATOR(SVGDecodedImageData::SVGPageClient);
 
-class ScopedSVGImageDocument {
-public:
-    enum class FrameRequests {
-        Suppress,
-        RouteToCurrentImage,
-    };
-
-    ScopedSVGImageDocument(SVGDecodedImageData::SVGPageClient& page_client, DOM::Document& document, FrameRequests frame_requests, GC::Ptr<SVGDecodedImageData> current_image_data = nullptr)
-        : m_page_client(page_client)
-        , m_navigable(page_client.page().local_traversable())
-        , m_window(page_client.window())
-        , m_previous_document(*m_navigable->active_document())
-        , m_previous_current_image_data(page_client.current_svg_image_data())
-        , m_should_unsuppress_frame_requests(frame_requests == FrameRequests::Suppress)
-    {
-        if (m_should_unsuppress_frame_requests)
-            m_page_client->suppress_frame_requests();
-        m_page_client->set_current_svg_image_data(current_image_data);
-
-        document.set_browsing_context(m_navigable->active_browsing_context());
-        document.set_window(*m_window);
-        m_window->set_associated_document(document);
-        m_navigable->set_active_document(document);
-    }
-
-    ~ScopedSVGImageDocument()
-    {
-        m_navigable->set_active_document(m_previous_document);
-        m_window->set_associated_document(m_previous_document);
-
-        m_page_client->set_current_svg_image_data(m_previous_current_image_data.ptr());
-        if (m_should_unsuppress_frame_requests)
-            m_page_client->unsuppress_frame_requests();
-    }
-
-private:
-    GC::Ref<SVGDecodedImageData::SVGPageClient> m_page_client;
-    GC::Ref<HTML::LocalNavigable> m_navigable;
-    GC::Ref<HTML::Window> m_window;
-    GC::Ref<DOM::Document> m_previous_document;
-    GC::Weak<SVGDecodedImageData> m_previous_current_image_data;
-    bool m_should_unsuppress_frame_requests { false };
-};
-
-ErrorOr<GC::Ref<SVGDecodedImageData>> SVGDecodedImageData::create(GC::Ref<Page> host_page, URL::URL const& url, ReadonlyBytes data)
+static GC::Ref<SVGDecodedImageData::SVGPageClient> shared_svg_page_client_for_page(GC::Ref<Page> host_page)
 {
-    auto page_client = SVGPageClient::create(*host_page);
+    static NeverDestroyed<GC::WeakHashMap<Page, SVGDecodedImageData::SVGPageClient>> page_clients;
+    if (auto* page_client = page_clients->get(host_page))
+        return *page_client;
+
+    auto page_client = SVGDecodedImageData::SVGPageClient::create(*host_page);
     auto page = Page::create(*page_client);
     page->set_is_scripting_enabled(false);
     page_client->m_svg_page = page.ptr();
     page->set_top_level_traversable(HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(page, nullptr, {}));
-    auto navigable = page->local_traversable();
-    auto response = Fetch::Infrastructure::Response::create();
-    response->url_list().append(url);
-    auto origin = URL::Origin::create_opaque();
-    auto& heap = GC::Heap::the();
-    auto navigation_params = heap.allocate<HTML::NavigationParams>(OptionalNone {},
-        navigable,
-        nullptr,
-        response,
-        nullptr,
-        nullptr,
-        HTML::OpenerPolicyEnforcementResult { .url = url, .origin = origin, .opener_policy = HTML::OpenerPolicy {} },
-        nullptr,
-        origin,
-        heap.allocate<HTML::PolicyContainer>(heap),
-        HTML::SandboxingFlagSet {},
-        ReferrerPolicy::ReferrerPolicy::EmptyString,
-        HTML::OpenerPolicy {},
-        Bindings::NavigationTimingType::Navigate,
-        OptionalNone {},
-        HTML::UserNavigationInvolvement::None);
+    page_clients->set(host_page, page_client);
+    return page_client;
+}
 
-    auto document = MUST(DOM::Document::create_and_initialize(DOM::Document::Type::XML, "image/svg+xml"_utf16_fly_string, navigation_params));
-    navigable->set_ongoing_navigation({});
-    if (auto active_document = navigable->active_document())
-        active_document->destroy();
-    navigable->set_active_document(document);
-    auto& window = HTML::relevant_window(document);
-    document->browsing_context()->window_proxy()->set_window(GC::Ref { window });
+Optional<ScopedSVGImageDocument> ScopedSVGImageDocument::create_if_needed(GC::Ptr<DOM::Document const> document, FrameRequests frame_requests)
+{
+    if (!document || !document->is_decoded_svg())
+        return {};
 
-    ScopedSVGImageDocument scoped_document { *page_client, *document, ScopedSVGImageDocument::FrameRequests::Suppress };
+    return ScopedSVGImageDocument { *const_cast<DOM::Document*>(document.ptr()), frame_requests };
+}
+
+ScopedSVGImageDocument::ScopedSVGImageDocument(DOM::Document& document, FrameRequests frame_requests)
+    : m_page_client(as<SVGDecodedImageData::SVGPageClient>(document.page().client()))
+    , m_navigable(m_page_client->page().local_traversable())
+    , m_window(m_page_client->window())
+    , m_previous_document(m_window->associated_document())
+    , m_previous_current_image_data(m_page_client->current_svg_image_data())
+    , m_should_unsuppress_frame_requests(frame_requests == FrameRequests::Suppress)
+{
+    VERIFY(document.is_decoded_svg());
+
+    if (m_should_unsuppress_frame_requests)
+        m_page_client->suppress_frame_requests();
+
+    GC::Ptr<SVGDecodedImageData> current_image_data;
+
+    for (auto& image : m_page_client->m_svg_image_data) {
+        if (&image.svg_document() == &document) {
+            current_image_data = &image;
+            break;
+        }
+    }
+
+    m_page_client->set_current_svg_image_data(current_image_data);
+
+    document.set_browsing_context(m_navigable->active_browsing_context());
+    document.set_window(*m_window);
+    m_window->set_associated_document(document);
+    m_navigable->set_active_document(document);
+}
+
+ScopedSVGImageDocument::ScopedSVGImageDocument(ScopedSVGImageDocument&& other)
+    : m_page_client(other.m_page_client)
+    , m_navigable(other.m_navigable)
+    , m_window(other.m_window)
+    , m_previous_document(other.m_previous_document)
+    , m_previous_current_image_data(move(other.m_previous_current_image_data))
+    , m_should_unsuppress_frame_requests(other.m_should_unsuppress_frame_requests)
+    , m_is_active(exchange(other.m_is_active, false))
+{
+}
+
+ScopedSVGImageDocument::~ScopedSVGImageDocument()
+{
+    if (!m_is_active)
+        return;
+
+    m_navigable->set_active_document(m_previous_document);
+    m_window->set_associated_document(m_previous_document);
+
+    m_page_client->set_current_svg_image_data(m_previous_current_image_data.ptr());
+    if (m_should_unsuppress_frame_requests)
+        m_page_client->unsuppress_frame_requests();
+}
+
+NonnullRefPtr<SVGDecodedImageData::DecodePromise> SVGDecodedImageData::decode(GC::Ref<Page> host_page, URL::URL const& url, ReadonlyBytes data)
+{
+    auto page_client = shared_svg_page_client_for_page(host_page);
+    auto& page = page_client->page();
+
+    auto document = DOM::XMLDocument::create(page, page_client->window(), url);
+    document->set_content_type("image/svg+xml"_utf16_fly_string);
+    document->set_origin(URL::Origin::create_opaque());
+
+    ScopedSVGImageDocument scoped_document { *document, ScopedSVGImageDocument::FrameRequests::Suppress };
 
     auto parse_failed = [&] {
         document->set_suppresses_attribute_style_invalidation(true);
@@ -150,21 +147,28 @@ ErrorOr<GC::Ref<SVGDecodedImageData>> SVGDecodedImageData::create(GC::Ref<Page> 
     // when no SVG root came out of the parse) — whatever the builder had made of the document before the error isn't
     // shown as if it were the image.
     if (parse_failed)
-        return Error::from_string_literal("SVGDecodedImageData: Failed to parse SVG");
-
-    // Mark the document as completely loaded so that <use> elements
-    // (which defer cloning until the document is complete) resolve
-    // forward references to elements parsed after them.
-    document->completely_finish_loading();
+        return DecodePromise::rejected(Error::from_string_literal("SVGDecodedImageData: Failed to parse SVG"));
 
     auto* svg_root = document->first_child_of_type<SVG::SVGSVGElement>();
     if (!svg_root) {
         dbgln("SVGDecodedImageData: Invalid SVG input (no SVGSVGElement found)");
-        return Error::from_string_literal("SVGDecodedImageData: Invalid SVG input");
+        return DecodePromise::rejected(Error::from_string_literal("SVGDecodedImageData: Invalid SVG input"));
     }
-    auto svg_image_data = GC::Heap::the().allocate<SVGDecodedImageData>(page, page_client, document, *svg_root);
-    page_client->register_svg_image_data(svg_image_data);
-    return svg_image_data;
+    auto promise = DecodePromise::construct();
+    auto observer = DOM::DocumentObserver::create(*document);
+    // Keep the loading state alive until the document finishes loading its internal resources.
+    observer->set_document_completely_loaded([page_client, document, svg_root = GC::Ref { *svg_root }, observer = GC::Root { observer }, promise] {
+        observer->set_document_completely_loaded(nullptr);
+        auto svg_image_data = create(page_client->page(), page_client, document, svg_root);
+        page_client->register_svg_image_data(svg_image_data);
+        promise->resolve(svg_image_data);
+    });
+    return promise;
+}
+
+GC::Ref<SVGDecodedImageData> SVGDecodedImageData::create(GC::Ref<Page> page, GC::Ref<SVGPageClient> page_client, GC::Ref<DOM::Document> document, GC::Ref<SVG::SVGSVGElement> root)
+{
+    return GC::Heap::the().allocate<SVGDecodedImageData>(page, page_client, document, root);
 }
 
 SVGDecodedImageData::SVGDecodedImageData(GC::Ref<Page> page, GC::Ref<SVGPageClient> page_client, GC::Ref<DOM::Document> document, GC::Ref<SVG::SVGSVGElement> root_element)
@@ -199,30 +203,12 @@ void SVGDecodedImageData::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_root_element);
 }
 
-static size_t surface_external_memory_size(Gfx::PaintingSurface const& surface)
-{
-    auto surface_size = surface.size();
-    if (surface_size.is_empty())
-        return 0;
-
-    Checked<size_t> pixel_size = static_cast<size_t>(surface_size.width());
-    pixel_size *= static_cast<size_t>(surface_size.height());
-    pixel_size *= sizeof(u32);
-    if (pixel_size.has_overflow())
-        return NumericLimits<size_t>::max();
-    return pixel_size.value();
-}
-
 size_t SVGDecodedImageData::external_memory_size() const
 {
     size_t size = Base::external_memory_size();
     size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_cached_rendered_frames));
     for (auto const& cached_frame : m_cached_rendered_frames)
         size = JS::saturating_add_external_memory_size(size, cached_frame.value.bitmap().data_size());
-
-    size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_cached_rendered_surfaces));
-    for (auto const& cached_surface : m_cached_rendered_surfaces)
-        size = JS::saturating_add_external_memory_size(size, surface_external_memory_size(*cached_surface.value));
 
     return size;
 }
@@ -261,7 +247,7 @@ Optional<Compositing::DisplayListResource> SVGDecodedImageData::record_display_l
 
 Optional<Compositing::DisplayListResource> SVGDecodedImageData::record_display_list_at_scale(CSSPixelSize css_size, float raster_scale, CSS::PreferredColorScheme color_scheme, Compositing::DisplayListResourceStorage& destination_resource_storage) const
 {
-    ScopedSVGImageDocument scoped_document { *m_page_client, *m_document, ScopedSVGImageDocument::FrameRequests::RouteToCurrentImage, const_cast<SVGDecodedImageData&>(*this) };
+    ScopedSVGImageDocument scoped_document { *m_document, ScopedSVGImageDocument::FrameRequests::RouteToCurrentImage };
     auto& navigable = *m_document->navigable();
     auto& resource_storage = navigable.display_list_resource_storage();
 
@@ -303,7 +289,6 @@ Optional<Compositing::DisplayListResource> SVGDecodedImageData::record_display_l
     if (m_color_scheme != color_scheme) {
         m_color_scheme = color_scheme;
         m_cached_rendered_frames.clear();
-        m_cached_rendered_surfaces.clear();
         m_natural_size.clear();
         m_document->set_svg_image_color_scheme(color_scheme);
         m_document->style_scope().invalidate_style_cache();
@@ -311,8 +296,9 @@ Optional<Compositing::DisplayListResource> SVGDecodedImageData::record_display_l
     }
 
     navigable.set_viewport_size(css_size);
+    Layout::ForcedReadScope read { *m_document };
     m_document->update_layout(DOM::UpdateLayoutReason::SVGDecodedImageDataRender);
-    auto display_list = m_document->record_display_list({}, resource_storage, Painting::PaintCommandCacheMode::ReadWrite);
+    auto display_list = m_document->record_display_list(read, {}, resource_storage, Painting::PaintCommandCacheMode::ReadWrite);
     if (!display_list)
         return {};
 
@@ -329,31 +315,33 @@ Optional<Compositing::DisplayListResource> SVGDecodedImageData::record_display_l
     return display_list_resource;
 }
 
-RefPtr<Gfx::PaintingSurface> SVGDecodedImageData::render_to_surface(Gfx::IntSize size) const
+// An SVG image inside another SVG image has an SVG page as its host. Walk up to the page that shows the outermost one.
+Compositor::CompositorHost* SVGDecodedImageData::host_compositor() const
 {
-    if (size.is_empty())
-        return {};
+    GC::Ref<Page> page = m_page_client->m_host_page;
+    while (page->client().is_svg_page_client())
+        page = static_cast<SVGPageClient&>(page->client()).m_host_page;
+    return page->client().compositor_host();
+}
 
-    if (auto it = m_cached_rendered_surfaces.find(size); it != m_cached_rendered_surfaces.end())
-        return it->value;
+RefPtr<Gfx::Bitmap> SVGDecodedImageData::render_frame(Gfx::IntSize size) const
+{
+    auto* compositor_host = host_compositor();
+    if (!compositor_host)
+        return nullptr;
 
-    // Prevent the cache from growing too big.
-    // FIXME: Evict least used entries.
-    if (m_cached_rendered_surfaces.size() > 10)
-        m_cached_rendered_surfaces.remove(m_cached_rendered_surfaces.begin());
+    auto bitmap = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, size);
+    if (bitmap.is_error())
+        return nullptr;
 
-    auto surface = Gfx::PaintingSurface::create_with_size(size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied);
     Compositing::DisplayListResourceStorage resource_storage;
     auto display_list = record_display_list(size, m_color_scheme, resource_storage);
     if (!display_list.has_value())
         return nullptr;
 
-    Compositing::DisplayListPlayerSkia display_list_player;
-    display_list_player.execute(*display_list->display_list, display_list->visual_context_tree, resource_storage, {}, surface);
-    display_list_player.flush(*surface);
-
-    m_cached_rendered_surfaces.set(size, *surface);
-    return surface;
+    if (!compositor_host->rasterize_display_list(*display_list, resource_storage, bitmap.value()))
+        return nullptr;
+    return bitmap.release_value();
 }
 
 Optional<Gfx::DecodedImageFrame> SVGDecodedImageData::current_frame(Gfx::IntSize size) const
@@ -364,12 +352,16 @@ Optional<Gfx::DecodedImageFrame> SVGDecodedImageData::current_frame(Gfx::IntSize
     if (auto it = m_cached_rendered_frames.find(size); it != m_cached_rendered_frames.end())
         return it->value;
 
+    auto bitmap = render_frame(size);
+    if (!bitmap)
+        return {};
+
     // Prevent the cache from growing too big.
     // FIXME: Evict least used entries.
     if (m_cached_rendered_frames.size() > 10)
         m_cached_rendered_frames.remove(m_cached_rendered_frames.begin());
 
-    auto decoded_frame = Gfx::DecodedImageFrame { *render_to_surface(size)->snapshot_bitmap() };
+    auto decoded_frame = Gfx::DecodedImageFrame { *bitmap };
     m_cached_rendered_frames.set(size, decoded_frame);
     return decoded_frame;
 }
@@ -389,15 +381,15 @@ CSS::SizeWithAspectRatio const& SVGDecodedImageData::natural_size() const
 
     CSS::SizeWithAspectRatio natural_size;
     {
-        ScopedSVGImageDocument scoped_document { *m_page_client, *m_document, ScopedSVGImageDocument::FrameRequests::RouteToCurrentImage, const_cast<SVGDecodedImageData&>(*this) };
+        ScopedSVGImageDocument scoped_document { *m_document, ScopedSVGImageDocument::FrameRequests::RouteToCurrentImage };
         m_document->update_style();
         auto const* sizing_values = m_root_element->style_group<CSS::ComputedValues::SizingValues>();
         VERIFY(sizing_values);
-        auto absolute_length = [](auto const& size_handle) -> Optional<CSSPixels> {
-            auto const& size = CSS::Size::view(size_handle);
-            if (size.is_length() && size.length().is_absolute())
-                return size.length().absolute_length_to_px();
-            return {};
+        auto absolute_length = [](auto const& size) -> Optional<CSSPixels> {
+            double pixels = 0;
+            if (!CSS::ComputedValuesFFI::rust_computed_size_absolute_length_px(&size, &pixels))
+                return {};
+            return CSSPixels::nearest_value_for(pixels);
         };
         natural_size.width = absolute_length(sizing_values->width);
         natural_size.height = absolute_length(sizing_values->height);
@@ -503,6 +495,21 @@ void SVGDecodedImageData::SVGPageClient::request_frame()
         svg_image_data.did_request_frame();
 }
 
+NonnullRefPtr<Media::AudioOutputFactory> SVGDecodedImageData::SVGPageClient::create_audio_output_factory()
+{
+    return m_host_page->client().create_audio_output_factory();
+}
+
+NonnullOwnPtr<MediaClient::RemotePlaybackManager> SVGDecodedImageData::SVGPageClient::create_media_playback_manager()
+{
+    return m_host_page->client().create_media_playback_manager();
+}
+
+void SVGDecodedImageData::SVGPageClient::rebind_media_playback_manager(MediaClient::RemotePlaybackManager& playback_manager)
+{
+    m_host_page->client().rebind_media_playback_manager(playback_manager);
+}
+
 void SVGDecodedImageData::did_request_frame()
 {
     // Recording the SVG image can itself schedule a frame request through the
@@ -532,7 +539,6 @@ void SVGDecodedImageData::invalidate_cached_rendering()
     m_vector_content_identity = next_vector_content_identity();
     m_natural_size.clear();
     m_cached_rendered_frames.clear();
-    m_cached_rendered_surfaces.clear();
     m_cached_display_lists.clear();
     prune_cached_display_list_resources();
 }

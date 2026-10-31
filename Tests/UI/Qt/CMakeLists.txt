@@ -3,6 +3,21 @@ if (NOT Qt6_FOUND)
     return()
 endif()
 
+find_package(Qt6 QUIET COMPONENTS Gui Widgets)
+if (Qt6_FOUND)
+    add_library(QtTestMain OBJECT
+        QtTestMain.cpp
+        "${LADYBIRD_SOURCE_DIR}/Libraries/LibTest/AssertionHandler.cpp"
+    )
+    target_link_libraries(QtTestMain PRIVATE AK LibCore LibTest Qt::Core Qt::Gui Qt::Widgets)
+    ladybird_test_suite(UI/Qt CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>")
+    target_link_libraries(TestUIQt PRIVATE LibCore LibFileSystem LibGfx LibIPC LibURL LibWeb LibWebCommon LibWebView Qt::Core Qt::Gui Qt::Widgets)
+else()
+    ladybird_test_suite(UI/Qt)
+endif()
+
+target_sources(TestUIQt PRIVATE TestBackingStoreRelease.cpp)
+
 add_library(QtEventLoopTestMain OBJECT
     QtEventLoopTestMain.cpp
     "${LADYBIRD_SOURCE_DIR}/Libraries/LibTest/AssertionHandler.cpp"
@@ -29,87 +44,87 @@ target_sources(TestFullscreenDebounce PRIVATE
 )
 set_target_properties(TestFullscreenDebounce PROPERTIES AUTOMOC ON)
 
-find_package(Qt6 QUIET COMPONENTS Gui Widgets)
 if (NOT Qt6_FOUND)
     return()
 endif()
 
-add_library(QtTestMain OBJECT
-    QtTestMain.cpp
-    "${LADYBIRD_SOURCE_DIR}/Libraries/LibTest/AssertionHandler.cpp"
-)
-target_link_libraries(QtTestMain PRIVATE AK LibCore LibTest Qt::Core Qt::Gui Qt::Widgets)
-
-# QtTestMain runs its tests on Qt's offscreen platform plugin, and on Windows nothing deploys that plugin where a test
-# binary can find it: The ladybird target's deploy step copies only the "windows" platform plugin into the bin/platforms
-# directory — and for a binary in a deployed layout, that directory is the whole platform-plugin search path. So a
-# QApplication there finds no platform plugin at all, which is fatal.
-# NB: On Windows, Qt puts up a modal message box before that abort whenever the process has no console window — and a
-# CI test process has none. So the test doesn't fail: It sits in the box until CTest's timeout kills it. Call this for
-# every test that links QtTestMain, so the plugin sits next to the test binary, where Qt looks for it.
-function(deploy_qt_offscreen_platform_plugin target)
-    if (NOT WIN32)
-        return()
-    endif()
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/platforms"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "$<TARGET_FILE:Qt6::QOffscreenIntegrationPlugin>"
-            "$<TARGET_FILE_DIR:${target}>/platforms/"
-        VERBATIM
-    )
-endfunction()
-
-ladybird_test("TestHiddenPageSizing.cpp" UI/Qt
-    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
-    LIBS Qt::Core Qt::Gui Qt::Widgets
-)
-target_sources(TestHiddenPageSizing PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/HiddenPageSizing.cpp")
-deploy_qt_offscreen_platform_plugin(TestHiddenPageSizing)
-
-ladybird_test("TestSelectDropdown.cpp" UI/Qt
-    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
-    LIBS LibWeb LibGfx LibIPC LibURL Qt::Core Qt::Gui Qt::Widgets
-)
-target_sources(TestSelectDropdown PRIVATE
+set(TEST_SOURCES
+    TestChromeIcons.cpp
+    TestHiddenPageSizing.cpp
+    TestNativeTextEditingLineEdit.cpp
+    TestProcessManagerWindow.cpp
+    TestScreenshotSelectionOverlay.cpp
+    TestScreenshotViewer.cpp
+    TestSelectDropdown.cpp
+    TestWebCompatReportReview.cpp
+    TestWebContentViewInputMethod.cpp
+    "${LADYBIRD_SOURCE_DIR}/Libraries/LibWebView/ProcessMonitor.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/HiddenPageSizing.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/Icon.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/InputMethodUtils.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/NativeTextEditingLineEdit.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/Popover.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ProcessManagerWindow.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ReportReview.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ScreenshotSelectionOverlay.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ScreenshotViewer.cpp"
     "${LADYBIRD_SOURCE_DIR}/UI/Qt/SelectDropdown.cpp"
     "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
+    # The chrome's styles take their colors from the theme, which follows the system's appearance.
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/SystemAppearance.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/Theme.cpp"
+    "${LADYBIRD_SOURCE_DIR}/UI/Qt/WebCompatReportReview.cpp"
 )
-deploy_qt_offscreen_platform_plugin(TestSelectDropdown)
 
-ladybird_test("TestProcessManagerWindow.cpp" UI/Qt
-    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
-    LIBS LibWebView LibURL Qt::Core Qt::Gui Qt::Widgets
-)
-target_sources(TestProcessManagerWindow PRIVATE
-    "${LADYBIRD_SOURCE_DIR}/Libraries/LibWebView/ProcessMonitor.cpp"
-    "${LADYBIRD_SOURCE_DIR}/UI/Qt/Icon.cpp"
-    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
-    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ProcessManagerWindow.cpp"
-    "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
-)
-target_compile_definitions(TestProcessManagerWindow PRIVATE TEST_RESOURCE_ROOT="${LADYBIRD_SOURCE_DIR}/Base/res")
-deploy_qt_offscreen_platform_plugin(TestProcessManagerWindow)
-
-if (NOT LINUX)
-    return()
+# Crash reports are only saved on macOS and Linux.
+if (APPLE OR LINUX)
+    list(APPEND TEST_SOURCES
+        TestCrashReportReviewWidget.cpp
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/CrashReportReviewWidget.cpp"
+    )
 endif()
 
-ladybird_test("TestNativeWindowContainerFocus.cpp" UI/Qt LIBS Qt::Core Qt::Gui Qt::Widgets)
-target_sources(TestNativeWindowContainerFocus PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/NativeWindowContainer.cpp")
+if (APPLE)
+    list(APPEND TEST_SOURCES
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/SystemAppearanceMac.mm"
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/NativeTextEditingBindings.mm"
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/MacWindowFocus.mm"
+    )
+    target_link_libraries(TestUIQt PRIVATE "-framework AppKit")
+endif()
 
-ladybird_test("TestJavaScriptDialog.cpp" UI/Qt
-    CUSTOM_MAIN "$<TARGET_OBJECTS:QtTestMain>"
-    LIBS LibURL Qt::Core Qt::Gui Qt::Widgets
-)
-target_sources(TestJavaScriptDialog PRIVATE
-    "${LADYBIRD_SOURCE_DIR}/UI/Qt/ChromeStyle.cpp"
-    "${LADYBIRD_SOURCE_DIR}/UI/Qt/JavaScriptDialog.cpp"
-    "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp"
-)
+if (LINUX)
+    list(APPEND TEST_SOURCES
+        TestJavaScriptDialog.cpp
+        TestNativeWindowContainerFocus.cpp
+        TestPermissionPromptPopover.cpp
+        TestStringUtils.cpp
+        TestWindowCloseCoordinator.cpp
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/NativeWindowContainer.cpp"
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/JavaScriptDialog.cpp"
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/PermissionPromptPopover.cpp"
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/WindowCloseCoordinator.cpp"
+        "${LADYBIRD_SOURCE_DIR}/UI/Qt/X11Window.cpp"
+    )
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(XCB_ICCCM REQUIRED IMPORTED_TARGET xcb-icccm)
+    target_link_libraries(TestUIQt PRIVATE PkgConfig::XCB_ICCCM)
+endif()
 
-ladybird_test("TestStringUtils.cpp" UI/Qt NAME TestQtStringUtils LIBS LibURL Qt::Core)
-target_sources(TestQtStringUtils PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp")
+target_sources(TestUIQt PRIVATE ${TEST_SOURCES})
+set_property(SOURCE TestProcessManagerWindow.cpp APPEND PROPERTY COMPILE_DEFINITIONS TEST_RESOURCE_ROOT="${LADYBIRD_SOURCE_DIR}/Base/res")
+set_target_properties(TestUIQt PROPERTIES AUTOMOC ON)
 
-ladybird_test("TestWebContentViewInputMethod.cpp" UI/Qt LIBS LibWebView LibWeb LibGfx LibIPC LibURL Qt::Core Qt::Gui Qt::Widgets)
-target_sources(TestWebContentViewInputMethod PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/Qt/InputMethodUtils.cpp" "${LADYBIRD_SOURCE_DIR}/UI/Qt/StringUtils.cpp")
+# QtTestMain runs on the offscreen platform plugin. Static Qt needs it imported explicitly, and Windows needs it
+# copied alongside the default platform plugin deployed by the ladybird target.
+qt_import_plugins(TestUIQt INCLUDE Qt6::QOffscreenIntegrationPlugin)
+if (WIN32)
+    add_custom_command(TARGET TestUIQt POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:TestUIQt>/platforms"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:Qt6::QOffscreenIntegrationPlugin>"
+            "$<TARGET_FILE_DIR:TestUIQt>/platforms/"
+        VERBATIM
+    )
+endif()

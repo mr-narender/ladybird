@@ -4,22 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/ByteString.h>
 #include <AK/Mutex.h>
-#include <AK/Random.h>
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
-#include <LibCore/Directory.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibCore/Timer.h>
-#include <LibFileSystem/FileSystem.h>
-#include <LibMain/Main.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
+#include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
 #include <LibURL/Parser.h>
 #include <LibWebView/Application.h>
@@ -29,25 +26,6 @@
 #include <sys/socket.h>
 
 namespace {
-
-class TestApplication : public WebView::Application {
-    WEB_VIEW_APPLICATION(TestApplication)
-
-public:
-    explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
-    {
-    }
-
-    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options) override
-    {
-        browser_options.headless_mode = WebView::HeadlessMode::Test;
-        browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
-        web_content_options.is_test_mode = WebView::IsTestMode::Yes;
-    }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
-};
 
 enum class RangeSupport {
     Yes,
@@ -397,7 +375,7 @@ void expect_request_can_be_released_from_finish_callback(TestHttpServer& server,
     auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
     VERIFY(url.has_value());
 
-    auto request = WebView::Application::request_server_client().start_request("GET"sv, *url);
+    auto request = MUST(WebView::Application::request_server_client())->start_request("GET"sv, *url);
     VERIFY(request);
 
     size_t delivered_size = 0;
@@ -405,7 +383,7 @@ void expect_request_can_be_released_from_finish_callback(TestHttpServer& server,
 
     request->set_body_delivery_paused(true);
     request->set_unbuffered_request_callbacks(
-        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CameFromCache) {
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
         },
         [&](Requests::ResponseData data) {
             delivered_size += data.bytes().size();
@@ -428,9 +406,57 @@ void expect_request_can_be_released_from_finish_callback(TestHttpServer& server,
     VERIFY(delivered_size == expected_body_size);
 }
 
-void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHttpServer& server, size_t expected_body_size)
+void expect_request_can_be_exported_from_headers_callback(TestHttpServer& server, size_t expected_body_size)
 {
-    auto& request_client = WebView::Application::request_server_client();
+    auto& request_client = *MUST(WebView::Application::request_server_client());
+    auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
+    VERIFY(url.has_value());
+
+    auto request = request_client.start_request("GET"sv, *url, {}, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::Yes);
+    VERIFY(request);
+
+    size_t delivered_size = 0;
+    bool finished = false;
+    request->set_body_delivery_paused(true);
+    request->set_unbuffered_request_callbacks(
+        [&](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+            auto exported = MUST(request_client.export_request(*request));
+            request = request_client.import_request(move(exported));
+            VERIFY(request);
+            request->set_unbuffered_request_callbacks(
+                [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+                },
+                [&](Requests::ResponseData data) {
+                    delivered_size += data.bytes().size();
+                },
+                [](Core::ImmutableBytes) {
+                },
+                [&](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> error) {
+                    VERIFY(!error.has_value());
+                    finished = true;
+                });
+        },
+        [](Requests::ResponseData) {
+            VERIFY_NOT_REACHED();
+        },
+        [](Core::ImmutableBytes) {
+            VERIFY_NOT_REACHED();
+        },
+        [](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError>) {
+            VERIFY_NOT_REACHED();
+        });
+
+    bool timed_out = false;
+    auto timeout = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(10'000), [&] { timed_out = true; });
+    timeout->start();
+    Core::EventLoop::current().spin_until([&] { return finished || timed_out; });
+    VERIFY(!timed_out);
+    VERIFY(delivered_size == expected_body_size);
+}
+
+void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHttpServer& server, size_t expected_body_size, bool export_response = false)
+{
+    auto& request_client = *MUST(WebView::Application::request_server_client());
 
     auto url = URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/file", server.port()));
     VERIFY(url.has_value());
@@ -443,7 +469,7 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
 
     request->set_body_delivery_paused(true);
     request->set_unbuffered_request_callbacks(
-        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CameFromCache) {
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
         },
         [](Requests::ResponseData) {
         },
@@ -461,15 +487,22 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
     Core::EventLoop::current().spin_until([&] { return request->is_finished(); });
     VERIFY(!finished);
 
-    // Adopting the finished request transfers it away from its original owner — which has to be told to let go of it.
-    auto adopted_request = request_client.adopt_request(request_client.request_server_client_id(), request->id());
+    // Transferring a finished request must release the original client's reference.
+    auto adopted_request = [&] {
+        if (export_response) {
+            auto exported = MUST(request_client.export_request(*request));
+            VERIFY(request->ref_count() == 1);
+            return request_client.import_request(move(exported));
+        }
+        return request_client.adopt_request(request_client.request_server_client_id(), request->id());
+    }();
     VERIFY(adopted_request);
 
     size_t delivered_size = 0;
     bool adopted_request_finished = false;
 
     adopted_request->set_unbuffered_request_callbacks(
-        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CameFromCache) {
+        [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
         },
         [&](Requests::ResponseData data) {
             delivered_size += data.bytes().size();
@@ -481,13 +514,12 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
         });
 
     bool timed_out = false;
-    auto timeout = Core::Timer::create_single_shot(10'000, [&] {
+    auto timeout = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(10'000), [&] {
         timed_out = true;
     });
     timeout->start();
 
-    // The transfer stops the original request, and drops the client's reference to it — so, this one is the last.
-    Core::EventLoop::current().spin_until([&] { return (stopped && adopted_request_finished && request->ref_count() == 1) || timed_out; });
+    Core::EventLoop::current().spin_until([&] { return ((export_response || stopped) && adopted_request_finished && request->ref_count() == 1) || timed_out; });
     VERIFY(!timed_out);
     VERIFY(!finished);
     VERIFY(delivered_size == expected_body_size);
@@ -495,23 +527,15 @@ void expect_leased_request_is_torn_down_when_transferred_after_finishing(TestHtt
 
 }
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(file_downloader)
 {
-    auto test_directory = ByteString::formatted("{}/Ladybird-TestFileDownloader-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_directory, FileSystem::RecursionMode::Allowed));
-    });
-    VERIFY(setenv("XDG_CONFIG_HOME", test_directory.characters(), 1) == 0);
-    VERIFY(setenv("XDG_DOWNLOAD_DIR", test_directory.characters(), 1) == 0);
+    Test::HeadlessTestEnvironment environment { "TestFileDownloader"sv, 120 };
+    auto const& test_directory = environment.directory();
 
+    VERIFY(setenv("XDG_DOWNLOAD_DIR", test_directory.characters(), 1) == 0);
     signal(SIGPIPE, SIG_IGN);
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application());
 
     {
         auto response_body = make_body(4 * KiB);
@@ -527,6 +551,22 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
         expect_leased_request_is_torn_down_when_transferred_after_finishing(server, response_body.size());
         outln("leased request torn down when transferred after finishing");
+    }
+
+    {
+        auto response_body = make_body(4 * KiB);
+        TestHttpServer server { response_body, RangeSupport::No };
+
+        expect_leased_request_is_torn_down_when_transferred_after_finishing(server, response_body.size(), true);
+        outln("leased request released when exported after finishing");
+    }
+
+    {
+        auto response_body = make_body(4 * KiB);
+        TestHttpServer server { response_body, RangeSupport::No };
+
+        expect_request_can_be_exported_from_headers_callback(server, response_body.size());
+        outln("export request from headers callback");
     }
 
     auto body = make_body(12 * MiB);
@@ -551,6 +591,20 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         outln("single connection: {} requests, {} of them ranged", server.request_count(), server.range_requests().size());
         VERIFY(server.request_count() == 1);
         VERIFY(server.range_requests().is_empty());
+    }
+
+    {
+        TestHttpServer server { body, RangeSupport::No };
+
+        // A file that appears at the destination while the download runs is not the download's to replace.
+        auto late_file_contents = "created while downloading"sv;
+        auto destination = run_download(server, test_directory, "late.bin"sv, [&](u64, DownloadWatcher&) {
+            auto file = MUST(Core::File::open(LexicalPath::join(test_directory, "late.bin"sv).string(), Core::File::OpenMode::Write | Core::File::OpenMode::MustBeNew));
+            MUST(file->write_until_depleted(late_file_contents.bytes()));
+        });
+        expect_file_matches(destination, late_file_contents.bytes());
+        expect_file_matches(LexicalPath::join(test_directory, "late (1).bin"sv).string(), body.bytes());
+        outln("download beside a file created while downloading");
     }
 
     {
@@ -702,5 +756,4 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     }
 
     outln("PASS");
-    return 0;
 }

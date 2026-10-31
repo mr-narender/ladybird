@@ -19,6 +19,8 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/HTMLHeadElement.h>
 #include <LibWeb/HTML/HTMLMetaElement.h>
+#include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Page/Page.h>
@@ -35,6 +37,16 @@ HTMLMetaElement::HTMLMetaElement(DOM::Document& document, DOM::QualifiedName qua
 
 HTMLMetaElement::~HTMLMetaElement() = default;
 
+static void report_container_state_of_child_navigables(DOM::Document& document)
+{
+    // NB: Navigable containers in shadow trees have child navigables too.
+    document.for_each_shadow_including_descendant([&](DOM::Node& node) {
+        if (auto* container = as_if<NavigableContainer>(node); container && container->content_navigable())
+            document.page().client().page_did_change_navigable_container_state(container->content_navigable()->id(), container->replicated_container_state());
+        return TraversalDecision::Continue;
+    });
+}
+
 Optional<HTMLMetaElement::HttpEquivAttributeState> HTMLMetaElement::http_equiv_state() const
 {
     auto value = get_attribute_ns({}, HTML::AttributeNames::http_equiv).value_or({});
@@ -50,9 +62,10 @@ Optional<HTMLMetaElement::HttpEquivAttributeState> HTMLMetaElement::http_equiv_s
 
 void HTMLMetaElement::update_metadata(Optional<Utf16String> const& old_name)
 {
+    Layout::ForcedReadScope read { document() };
     if (auto name = get_attribute_ns({}, AttributeNames::name); name.has_value()) {
         if (name->equals_ignoring_ascii_case(u"theme-color"sv)) {
-            document().obtain_theme_color();
+            document().obtain_theme_color(read);
         } else if (name->equals_ignoring_ascii_case(u"color-scheme"sv)) {
             document().obtain_supported_color_schemes();
         } else if (name->equals_ignoring_ascii_case(u"referrer"sv)) {
@@ -63,7 +76,7 @@ void HTMLMetaElement::update_metadata(Optional<Utf16String> const& old_name)
 
     if (old_name.has_value()) {
         if (old_name->equals_ignoring_ascii_case(u"theme-color"sv)) {
-            document().obtain_theme_color();
+            document().obtain_theme_color(read);
         } else if (old_name->equals_ignoring_ascii_case(u"color-scheme"sv)) {
             document().obtain_supported_color_schemes();
         }
@@ -207,18 +220,23 @@ void HTMLMetaElement::inserted()
             // 3. Let policy be the result of executing Content Security Policy's parse a serialized Content Security
             //    Policy algorithm on the meta element's content attribute's value, with a source of "meta", and a
             //    disposition of "enforce".
-            auto policy = ContentSecurityPolicy::Policy::parse_a_serialized_csp(GC::Heap::the(), input, ContentSecurityPolicy::Policy::Source::Meta, ContentSecurityPolicy::Policy::Disposition::Enforce);
+            auto policy = ContentSecurityPolicy::Policy::parse_a_serialized_csp(input, ContentSecurityPolicy::Policy::Source::Meta, ContentSecurityPolicy::Policy::Disposition::Enforce);
 
             // 4. Remove all occurrences of the report-uri, frame-ancestors, and sandbox directives from policy.
-            policy->remove_directive({}, ContentSecurityPolicy::Directives::Names::ReportUri);
-            policy->remove_directive({}, ContentSecurityPolicy::Directives::Names::FrameAncestors);
-            policy->remove_directive({}, ContentSecurityPolicy::Directives::Names::Sandbox);
+            policy->remove_directive(ContentSecurityPolicy::Directives::Names::ReportUri);
+            policy->remove_directive(ContentSecurityPolicy::Directives::Names::FrameAncestors);
+            policy->remove_directive(ContentSecurityPolicy::Directives::Names::Sandbox);
 
             // FIXME: File spec issue stating the policy's self origin isn't set here.
-            policy->set_self_origin({}, document().origin());
+            policy->set_self_origin(document().origin());
 
             // 5. Enforce the policy policy.
-            document().relevant_settings_object().policy_container()->csp_list->enforce_policy(policy);
+            document().relevant_settings_object().policy_container()->csp_list.enforce_policy(policy);
+
+            // NB: A document created in a child navigable inherits the insecure requests policy of its container's
+            //     node document, which a process hosting the child navigable reads from the container's state.
+            if (policy->contains_directive_with_name(ContentSecurityPolicy::Directives::Names::UpgradeInsecureRequests))
+                report_container_state_of_child_navigables(document());
             break;
         }
         default:

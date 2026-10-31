@@ -7,6 +7,7 @@
 use crate::painting::record::trace::Observer;
 
 use crate::css::computed_value_types::{ComputedSvgPaint, SVG_PAINT_COLOR, SVG_PAINT_NONE, SVG_PAINT_URL};
+use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::css_enums::paint_order;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::display_list::builder::PendingInlineClip;
@@ -17,8 +18,8 @@ use crate::painting::display_list::recorder::{
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::{FfiSvgGradientKind, FfiSvgGradientSpreadMethod};
 use crate::painting::node_painting;
+use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::paintable_geometry::absolute_rect;
-use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::record::{PaintPhase, PaintRecorder};
 use crate::painting::svg_paint_resources::{
     PublishedSvgGradient, PublishedSvgPaintServer, PublishedSvgPattern, SvgPaintResourceKind,
@@ -60,8 +61,8 @@ fn svg_paint_facts<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
 ) -> (SvgPaintFacts, Vec<f32>) {
-    use crate::css::css_enums::{fill_rule, stroke_linecap, stroke_linejoin, vector_effect};
-    let layout_arena = recorder.layout_arena;
+    use crate::css::css_enums::fill_rule;
+    let layout_arena = recorder.source;
     let viewport = layout_arena
         .node_kind_if_live(paintable)
         .is_some_and(node_painting::is_svg_path)
@@ -98,29 +99,50 @@ fn svg_paint_facts<O: Observer>(
     facts.fill_color = svg_paint_color(&svg.fill);
     facts.stroke_color = svg_paint_color(&svg.stroke);
     facts.references_paint_server = svg.fill.kind == SVG_PAINT_URL || svg.stroke.kind == SVG_PAINT_URL;
-    facts.cap_style = match svg.stroke_linecap {
-        stroke_linecap::ROUND => CapStyle::Round,
-        stroke_linecap::SQUARE => CapStyle::Square,
-        _ => CapStyle::Butt,
-    };
-    facts.join_style = match svg.stroke_linejoin {
-        stroke_linejoin::ROUND => JoinStyle::Round,
-        stroke_linejoin::BEVEL => JoinStyle::Bevel,
-        _ => JoinStyle::Miter,
-    };
-    facts.miter_limit = svg.stroke_miterlimit as f32;
-    facts.non_scaling_stroke = style.svg_reset().vector_effect == vector_effect::NON_SCALING_STROKE;
+    let stroke = svg_stroke_style(layout_arena, paintable, &style);
+    facts.cap_style = stroke.cap_style;
+    facts.join_style = stroke.join_style;
+    facts.miter_limit = stroke.miter_limit;
+    facts.non_scaling_stroke = stroke.non_scaling_stroke;
     facts.paint_order = svg.paint_order;
     facts.paint_order_count = 3;
+    facts.stroke_width = stroke.width;
+    facts.stroke_dashoffset = stroke.dash_offset;
+    (facts, stroke.dash_array)
+}
 
+/// The properties that shape the stroke of an SVG shape, in its user units.
+pub(crate) struct SvgStrokeStyle {
+    pub(crate) cap_style: CapStyle,
+    pub(crate) join_style: JoinStyle,
+    pub(crate) miter_limit: f32,
+    pub(crate) width: f32,
+    pub(crate) dash_array: Vec<f32>,
+    pub(crate) dash_offset: f32,
+    pub(crate) non_scaling_stroke: bool,
+}
+
+pub(crate) fn svg_stroke_style(
+    layout_arena: &impl GeometryRead,
+    paintable: NodeSlotId,
+    style: &ComputedValuesView<'_>,
+) -> SvgStrokeStyle {
     let basis = crate::painting::paintable_geometry::committed_svg_viewport_percentage_basis(layout_arena, paintable);
+    svg_stroke_style_for_percentage_basis(style, basis)
+}
+
+/// The stroke properties of an SVG shape, with percentages resolved against the given basis.
+pub(crate) fn svg_stroke_style_for_percentage_basis(
+    style: &ComputedValuesView<'_>,
+    basis: crate::layout::CssPixels,
+) -> SvgStrokeStyle {
+    use crate::css::css_enums::{stroke_linecap, stroke_linejoin, vector_effect};
+    let svg = style.inherited_svg();
     let resolve = |handle: &crate::css::computed_value_types::ComputedStyleValueHandle, default: f32| {
         handle
             .length_percentage()
             .map_or(default, |value| value.to_px(basis).to_double() as f32)
     };
-    facts.stroke_width = resolve(&svg.stroke_width, 1.0);
-    facts.stroke_dashoffset = resolve(&svg.stroke_dashoffset, 0.0);
 
     let mut dash_array: Vec<f32> = svg
         .stroke_dasharray
@@ -140,7 +162,24 @@ fn svg_paint_facts<O: Observer>(
     if dash_array.iter().any(|value| *value < 0.0) || dash_array.iter().all(|value| *value == 0.0) {
         dash_array.clear();
     }
-    (facts, dash_array)
+
+    SvgStrokeStyle {
+        cap_style: match svg.stroke_linecap {
+            stroke_linecap::ROUND => CapStyle::Round,
+            stroke_linecap::SQUARE => CapStyle::Square,
+            _ => CapStyle::Butt,
+        },
+        join_style: match svg.stroke_linejoin {
+            stroke_linejoin::ROUND => JoinStyle::Round,
+            stroke_linejoin::BEVEL => JoinStyle::Bevel,
+            _ => JoinStyle::Miter,
+        },
+        miter_limit: svg.stroke_miterlimit as f32,
+        width: resolve(&svg.stroke_width, 1.0),
+        dash_array,
+        dash_offset: resolve(&svg.stroke_dashoffset, 0.0),
+        non_scaling_stroke: style.svg_reset().vector_effect == vector_effect::NON_SCALING_STROKE,
+    }
 }
 
 fn should_anti_alias(value: bool) -> ShouldAntiAlias {
@@ -273,7 +312,7 @@ fn pattern_paint_style<O: Observer>(
     use libgfx_rust::matrix::{affine_to_matrix, multiply_affine};
     let description = &pattern.description;
     let pattern_box = description.pattern_box;
-    if !recorder.layout_arena.paintable_row_is_populated(pattern_box) {
+    if !recorder.source.paintable_row_is_populated(pattern_box) {
         return None;
     }
     let bounding_box = paint_context.path_bounding_box;
@@ -331,10 +370,10 @@ fn pattern_paint_style<O: Observer>(
             .has_value
             .then_some(description.pattern_transform_attribute.value)
     } else {
-        let pattern_box_style = recorder.layout_arena.node_style_if_live(pattern_box)?;
+        let pattern_box_style = recorder.source.node_style_if_live(pattern_box)?;
         let reference_box = crate::painting::visual_context::node_values::transform_reference_box(
             pattern_box_style,
-            recorder.layout_arena,
+            recorder.source,
             pattern_box,
         );
         Some(
@@ -358,8 +397,15 @@ fn pattern_paint_style<O: Observer>(
             };
         }
     }
+    // The player rasterizes the tile records into a surface of this size.
+    let tile_surface_rect = FloatRect::new(
+        0.0,
+        0.0,
+        (tile_rect.width * content_scale.width).ceil(),
+        (tile_rect.height * content_scale.height).ceil(),
+    );
     Some(PaintStyle::Pattern {
-        tile_records: recorder.pattern_tile_records(pattern_box, tile_content_transform),
+        tile_records: recorder.pattern_tile_records(pattern_box, tile_content_transform, tile_surface_rect),
         tile_rect,
         content_scale,
         pattern_transform,
@@ -377,10 +423,7 @@ fn paint_server_style<O: Observer>(
     } else {
         SvgPaintResourceKind::Fill
     };
-    let published = recorder
-        .layout_arena
-        .svg_paint_resources()
-        .published_paint_server(paintable, kind)?;
+    let published = recorder.source.published_svg_paint_server(paintable, kind)?;
     match &*published {
         PublishedSvgPaintServer::Gradient(gradient) => Some(gradient_paint_style(gradient, paint_context)),
         PublishedSvgPaintServer::Pattern(pattern) => pattern_paint_style(recorder, pattern, paint_context),
@@ -389,18 +432,18 @@ fn paint_server_style<O: Observer>(
 }
 
 fn references_pattern<O: Observer>(recorder: &PaintRecorder<'_, O>, paintable: NodeSlotId) -> bool {
-    let resources = recorder.layout_arena.svg_paint_resources();
     [SvgPaintResourceKind::Fill, SvgPaintResourceKind::Stroke]
         .iter()
         .any(|kind| {
-            resources
-                .published_paint_server(paintable, *kind)
+            recorder
+                .source
+                .published_svg_paint_server(paintable, *kind)
                 .is_some_and(|published| matches!(&*published, PublishedSvgPaintServer::Pattern(_)))
         })
 }
 
 pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId, phase: PaintPhase) {
-    let Some(computed_path) = crate::painting::paintable_geometry::committed_svg_path(recorder.layout_arena, paintable)
+    let Some(computed_path) = crate::painting::paintable_geometry::committed_svg_path(recorder.source, paintable)
     else {
         return;
     };
@@ -410,7 +453,7 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
     // published by the paint resource sync, which pushes damage on the shapes using it.
     let output_is_resolved_through_another_element = (facts.references_paint_server
         && references_pattern(recorder, paintable))
-        || recorder.layout_arena.node_kind_if_live(paintable) == Some(NodeKind::SVGTextPathBox);
+        || recorder.source.node_kind_if_live(paintable) == Some(NodeKind::SVGTextPathBox);
     if output_is_resolved_through_another_element {
         recorder.mark_live_producer();
     }
@@ -541,7 +584,7 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
 }
 
 pub(crate) fn svg_image_unquantized_device_rect(
-    layout_arena: &impl PaintableRowsRead,
+    layout_arena: &impl PaintRead,
     paintable: NodeSlotId,
     pixel_ratio: f64,
 ) -> FloatRect {
@@ -575,7 +618,7 @@ pub(crate) fn paint_image_element<O: Observer>(
     }
 
     let image = recorder
-        .layout_arena
+        .source
         .replaced_paint_facts(paintable)
         .and_then(|facts| facts.image())
         .unwrap_or_default();
@@ -583,11 +626,8 @@ pub(crate) fn paint_image_element<O: Observer>(
         return;
     }
 
-    let image_rect = svg_image_unquantized_device_rect(
-        recorder.layout_arena,
-        paintable,
-        recorder.inputs.device_pixels_per_css_pixel,
-    );
+    let image_rect =
+        svg_image_unquantized_device_rect(recorder.source, paintable, recorder.inputs.device_pixels_per_css_pixel);
     let natural_size = match (image.natural.width, image.natural.height) {
         (Some(width), Some(height)) => (width.to_float(), height.to_float()),
         _ => (image_rect.width, image_rect.height),
@@ -614,7 +654,7 @@ pub(crate) fn paint_image_element<O: Observer>(
     // rectangle defined by the geometry properties.
     let (overflow_is_visible, image_rendering) =
         recorder
-            .layout_arena
+            .source
             .node_style_if_live(paintable)
             .map_or((false, 0), |style| {
                 use crate::css::css_enums::overflow;

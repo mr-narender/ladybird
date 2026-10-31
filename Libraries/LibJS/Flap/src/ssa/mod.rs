@@ -181,6 +181,9 @@ pub(crate) enum ValueDefinition {
 
 struct UseAnalyses<'a> {
     cfg: &'a analysis::ControlFlowGraph,
+    /// Blocks control can reach from the entry, directly or through a block
+    /// reference (see `analysis::reachable_blocks()`).
+    reachable: &'a [bool],
     dominators: &'a analysis::DominatorTree,
     instruction_layout: &'a analysis::InstructionLayout,
     guards: &'a analysis::GuardExits,
@@ -398,6 +401,9 @@ pub(crate) struct Function {
     pub(crate) instructions: Vec<Instruction>,
     pub(crate) values: Vec<Value>,
     pub(crate) entry: BlockId,
+    /// Whether u32 additions, subtractions, and multiplications wrap to 32 bits in their results, as the
+    /// WebAssembly profile requires. Without it, only their low 32 bits are meaningful.
+    pub(crate) exact_u32_arithmetic: bool,
     constant_values: HashMap<(Type, Constant), ValueId>,
 }
 
@@ -431,6 +437,7 @@ impl Function {
             instructions: Vec::new(),
             values,
             entry: BlockId(0),
+            exact_u32_arithmetic: false,
             constant_values: HashMap::default(),
         }
     }
@@ -979,11 +986,16 @@ impl Function {
 
     fn validate_uses(&self) -> Result<(), String> {
         let cfg = analysis::ControlFlowGraph::compute(self);
-        let dominators = analysis::DominatorTree::compute(self, &cfg);
+        // NB: Closure blocks are dominated by the blocks that take references
+        //     to them, which no terminator edge says.
+        let dominators =
+            analysis::DominatorTree::compute(self, &analysis::ControlFlowGraph::compute_with_block_references(self));
         let instruction_layout = analysis::InstructionLayout::compute(self)?;
         let guards = analysis::GuardExits::compute(self, &cfg);
+        let reachable = analysis::reachable_blocks(self, &cfg);
         let analyses = UseAnalyses {
             cfg: &cfg,
+            reachable: &reachable,
             dominators: &dominators,
             instruction_layout: &instruction_layout,
             guards: &guards,
@@ -1018,6 +1030,7 @@ impl Function {
     ) -> Result<(), String> {
         let UseAnalyses {
             cfg,
+            reachable,
             dominators,
             instruction_layout,
             guards,
@@ -1050,6 +1063,13 @@ impl Function {
             {
                 return Err(format!("value {value:?} is used before its definition"));
             }
+            return Ok(());
+        }
+        // Dominance only orders blocks that control can reach. Code that never
+        // runs, like the body of a closure no path jumps to, has no dominator,
+        // so any value may flow into it; passes that split such a block (for
+        // example inlining a call in it) must not make it invalid.
+        if !reachable[use_block.0] {
             return Ok(());
         }
         if !dominators.dominates(definition_block, use_block) {
@@ -1143,6 +1163,20 @@ mod tests {
         function.set_terminator(join, Terminator::Return(vec![value]));
 
         assert!(function.validate().unwrap_err().contains("does not dominate"));
+    }
+
+    #[test]
+    fn accepts_uses_across_blocks_that_no_path_reaches() {
+        // Like the body of a closure that is never jumped to, split in two.
+        let mut function = Function::new("dead", vec![Type::I32], vec![Type::I32]);
+        let dead = function.create_block(None, BlockLayout::Hot, vec![Type::I32]);
+        let dead_continuation = function.create_block(None, BlockLayout::Hot, Vec::new());
+        function.set_terminator(function.entry, Terminator::Return(vec![function.parameter(0)]));
+        function.set_terminator(dead, Terminator::jump(dead_continuation));
+        let parameter = function.blocks[dead.0].parameters[0];
+        function.set_terminator(dead_continuation, Terminator::Return(vec![parameter]));
+
+        function.validate().unwrap();
     }
 
     #[test]

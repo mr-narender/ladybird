@@ -12,6 +12,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/CheckUnloadingCanceledState.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/HistoryExecutor.h>
@@ -27,6 +28,7 @@
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/WebDriver/BiDi/BiDi.h>
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 
 namespace Web::HTML {
@@ -44,7 +46,7 @@ LocalTraversableNavigable::LocalTraversableNavigable(GC::Ref<Page> page)
 LocalTraversableNavigable::~LocalTraversableNavigable() = default;
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-top-level-traversable
-GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_level_traversable(GC::Ref<Page> page, GC::Ptr<HTML::BrowsingContext> opener, Optional<SessionHistoryEntryDescriptor> initial_history_entry_from_owner)
+GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_level_traversable(GC::Ref<Page> page, GC::Ptr<HTML::BrowsingContext> opener, Optional<SessionHistoryEntryDescriptor> initial_history_entry_from_owner, Optional<CrossProcessId> document_id)
 {
     auto& vm = Bindings::main_thread_vm();
     page->ensure_compositor_host();
@@ -61,12 +63,12 @@ GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_l
     // 2. If opener is null, then set document to the second return value of creating a new top-level browsing context and document.
     // NB: The UI process holds the group a top-level browsing context is created in.
     if (!opener) {
-        document = BrowsingContext::create_a_new_browsing_context_and_document(page, nullptr, nullptr, {}, initial_entry.document_state.origin).document;
+        document = BrowsingContext::create_a_new_browsing_context_and_document(page, nullptr, nullptr, {}, initial_entry.document_state.origin, document_id).document;
     }
 
     // 3. Otherwise, set document to the second return value of creating a new auxiliary browsing context and document given opener.
     else {
-        document = BrowsingContext::create_a_new_auxiliary_browsing_context_and_document(page, *opener).document;
+        document = BrowsingContext::create_a_new_auxiliary_browsing_context_and_document(page, *opener, document_id).document;
     }
 
     // 4. Let documentState be a new document state, with
@@ -117,11 +119,29 @@ GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_new_top_l
     return traversable;
 }
 
+// Creates a new top-level traversable in the page that the UI process created for it, adopting the identity the UI
+// process assigned to it.
+GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_for_new_web_view(PageClient::NewWebViewResult&& new_web_view, GC::Ptr<BrowsingContext> opener)
+{
+    auto traversable = create_a_new_top_level_traversable(*new_web_view.page, opener, new_web_view.initial_history_entry.release_value(), new_web_view.initial_document_id.release_value());
+    traversable->active_document()->relevant_settings_object().id = new_web_view.initial_environment_id.release_value();
+    traversable->active_browsing_context()->set_browsing_context_group_id(new_web_view.browsing_context_group_id);
+    new_web_view.page->set_top_level_traversable(traversable);
+    traversable->set_window_handle(Utf16String::from_ascii_without_validation(new_web_view.window_handle.bytes()));
+
+    // AD-HOC: WebDriver BiDi creates the realm of the traversable's first document, and runs its preload scripts, once
+    //         the traversable is named by its window handle.
+    if (WebDriver::BiDi::is_active())
+        WebDriver::BiDi::document_is_ready_for_scripts(*traversable->active_document());
+
+    return traversable;
+}
+
 // https://html.spec.whatwg.org/multipage/document-sequences.html#create-a-fresh-top-level-traversable
-GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_fresh_top_level_traversable(GC::Ref<Page> page, SessionHistoryEntryDescriptor initial_history_entry)
+GC::Ref<LocalTraversableNavigable> LocalTraversableNavigable::create_a_fresh_top_level_traversable(GC::Ref<Page> page, SessionHistoryEntryDescriptor initial_history_entry, CrossProcessId document_id)
 {
     // 1. Let traversable be the result of creating a new top-level traversable given null and the empty string.
-    auto traversable = create_a_new_top_level_traversable(page, nullptr, move(initial_history_entry));
+    auto traversable = create_a_new_top_level_traversable(page, nullptr, move(initial_history_entry), document_id);
     page->set_top_level_traversable(traversable);
 
     // AD-HOC: Mark the about:blank document as finished parsing. This matches the behavior of the window open steps.
@@ -199,11 +219,8 @@ void LocalTraversableNavigable::reset_session_history_for_testing()
     active_window()->navigation()->initialize_the_navigation_api_entries_for_reconstructed_session_history(entries_for_navigation_api, active_entry);
 }
 
-// https://html.spec.whatwg.org/multipage/document-sequences.html#close-a-top-level-traversable
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-close
-// AD-HOC: Step 6 of window.close(), requested through the UI process by a document another process hosts, whose
-//         navigable found itself familiar with this traversable there. source is the incumbent global object's navigable.
-void LocalTraversableNavigable::close_top_level_traversable_from_script(Navigable const& source)
+void LocalTraversableNavigable::close_top_level_traversable_from_script()
 {
     // 1. Let thisTraversable be this's navigable.
     auto& this_traversable = *this;
@@ -216,16 +233,15 @@ void LocalTraversableNavigable::close_top_level_traversable_from_script(Navigabl
     if (this_traversable.is_closing())
         return;
 
-    // 5. Let sourceSnapshotParams be the result of snapshotting source snapshot params given thisTraversable's active document.
-    auto source_snapshot_params = snapshot_source_snapshot_params(this_traversable.active_document());
+    // 5. Let sourceSnapshotParams be the result of snapshotting source snapshot params given the incumbent global object's
+    //    associated Document.
+    // NB: The requesting process snapshotted it.
 
     // 6. If all the following are true:
     //    - thisTraversable is script-closable;
     //    - the incumbent global object's browsing context is familiar with browsingContext; and
     //    - the incumbent global object's navigable is allowed by sandboxing to navigate thisTraversable, given sourceSnapshotParams,
-    if (!this_traversable.is_script_closable() || !source.allowed_by_sandboxing_to_navigate(this_traversable, source_snapshot_params))
-        return;
-
+    // NB: The requesting process found these true, and the UI process checked them again.
     // then:
     // 1. Set thisTraversable's is closing to true.
     this_traversable.set_closing(true);
@@ -261,22 +277,9 @@ void LocalTraversableNavigable::definitely_close_top_level_traversable(PromptToU
         m_close_steps_have_been_appended = true;
 
         // 3. Append the following session history traversal steps to traversable:
-        page().history_executor().request_history_operation(
-            CloseTopLevelTraversableHistoryOperationParameters {},
-            {
-                .on_complete = GC::create_function(heap(), [this](HistoryStepResult result) {
-                    // NB: An abandoned close never reached its queue position; do not destroy the traversable for it.
-                    if (result != HistoryStepResult::Applied) {
-                        m_close_steps_have_been_appended = false;
-                        set_closing(false);
-                        return;
-                    }
-
-                    // NB: The UI process runs the traversal steps' unload recursion and delivers the final
-                    //     unload-and-destroy task through run_ui_traversable_close_unload_task before this
-                    //     completion.
-                }),
-            });
+        // NB: The UI process runs the traversal steps' unload recursion and delivers the final unload-and-destroy task
+        //     through run_ui_traversable_close_unload_task.
+        page().history_executor().request_history_operation(CloseTopLevelTraversableHistoryOperationParameters {});
     };
 
     if (prompt_to_unload == PromptToUnload::No) {
@@ -343,6 +346,12 @@ void LocalTraversableNavigable::destroy_top_level_traversable()
     //        However, without this, we can keep stale destroyed navigables around.
     set_has_been_destroyed();
     remove_from_all_local_navigables();
+}
+
+void LocalTraversableNavigable::visit_edges(Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_active_beforeunload_check);
 }
 
 }

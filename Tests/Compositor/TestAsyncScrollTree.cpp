@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/ByteBuffer.h>
 #include <AK/Tuple.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
@@ -48,7 +47,7 @@ static Compositing::AccumulatedVisualContextTree make_visual_context_tree()
 
 static NonnullRefPtr<Compositing::DisplayList> make_empty_display_list(Compositing::AccumulatedVisualContextTree const& visual_context_tree)
 {
-    return Compositing::DisplayList::create_from_command_bytes(visual_context_tree, ByteBuffer {}, {});
+    return Compositing::DisplayList::create(visual_context_tree);
 }
 
 TEST_CASE(wheel_hit_testing_rejects_a_different_visual_context_tree_structural_epoch)
@@ -65,12 +64,12 @@ TEST_CASE(wheel_hit_testing_rejects_a_different_visual_context_tree_structural_e
     scroll_tree.rebuild_wheel_hit_test_targets(make_empty_display_list(visual_context_tree), &visual_context_tree, {});
     auto current_result = scroll_tree.hit_test_scroll_node_for_wheel(
         visual_context_tree, { 20, 20 }, { 0, 10 });
-    EXPECT(current_result.blocked_by_main_thread_region);
+    EXPECT_EQ(current_result.outcome, Compositing::WheelHitTestOutcome::BlockedByMainThreadRegion);
 
     auto replacement_tree = make_visual_context_tree();
     auto replacement_result = scroll_tree.hit_test_scroll_node_for_wheel(
         replacement_tree, { 20, 20 }, { 0, 10 });
-    EXPECT(!replacement_result.blocked_by_main_thread_region);
+    EXPECT_EQ(replacement_result.outcome, Compositing::WheelHitTestOutcome::HitTestTargetsOfAnotherVisualContextTree);
 }
 
 TEST_CASE(wheel_hit_testing_ignores_invalid_visual_context_indices)
@@ -87,7 +86,7 @@ TEST_CASE(wheel_hit_testing_ignores_invalid_visual_context_indices)
     scroll_tree.rebuild_wheel_hit_test_targets(make_empty_display_list(visual_context_tree), &visual_context_tree, {});
     auto result = scroll_tree.hit_test_scroll_node_for_wheel(
         visual_context_tree, { 20, 20 }, { 0, 10 });
-    EXPECT(!result.blocked_by_main_thread_region);
+    EXPECT_NE(result.outcome, Compositing::WheelHitTestOutcome::BlockedByMainThreadRegion);
 }
 
 TEST_CASE(blocking_wheel_event_hit_testing_fails_closed_for_invalid_visual_context_indices)
@@ -101,19 +100,16 @@ TEST_CASE(blocking_wheel_event_hit_testing_fails_closed_for_invalid_visual_conte
     });
 
     auto display_list = make_empty_display_list(visual_context_tree);
-    EXPECT(Compositing::blocks_wheel_event_at_position(state, display_list, &visual_context_tree, {}, { 200, 200 }));
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, display_list, &visual_context_tree, {}, { 200, 200 }, { 0, 10 }, true),
-        Compositing::WheelScrollAdmission::BlockedByWheelEventRegion);
-
     Compositing::AsyncScrollTree scroll_tree;
     scroll_tree.set_state(move(state));
     scroll_tree.rebuild_wheel_hit_test_targets(display_list, &visual_context_tree, {});
+    EXPECT(scroll_tree.blocks_wheel_event_at_position(visual_context_tree, { 200, 200 }));
     auto result = scroll_tree.hit_test_scroll_node_for_wheel(visual_context_tree, { 200, 200 }, { 0, 10 });
-    EXPECT(result.blocked_by_wheel_event_region);
+    EXPECT_EQ(result.outcome, Compositing::WheelHitTestOutcome::BlockedByWheelEventRegion);
     EXPECT(!result.node_id.has_value());
 }
 
-TEST_CASE(wheel_scroll_admission_preserves_main_thread_region_and_viewport_blocker_precedence)
+TEST_CASE(first_wheel_step_route_puts_main_thread_region_before_blocking_region_and_viewport_blocker_before_both)
 {
     auto visual_context_tree = make_visual_context_tree();
     auto display_list = make_empty_display_list(visual_context_tree);
@@ -127,46 +123,18 @@ TEST_CASE(wheel_scroll_admission_preserves_main_thread_region_and_viewport_block
         .context = { Compositing::VISUAL_VIEWPORT_NODE_INDEX },
         .rect = { 0, 0, 100, 100 },
     });
+    auto route_first_wheel_step_at = [&](Compositing::AsyncScrollingState state) {
+        Compositing::AsyncScrollTree scroll_tree;
+        scroll_tree.set_state(move(state));
+        scroll_tree.rebuild_wheel_hit_test_targets(display_list, &visual_context_tree, {});
+        EXPECT(scroll_tree.blocks_wheel_event_at_position(visual_context_tree, { 20, 20 }));
+        return scroll_tree.route_first_wheel_step(Compositing::WheelRoutingAdmission::Accepted, visual_context_tree, { 20, 20 }, { 0, 10 }).decision;
+    };
 
-    EXPECT(Compositing::blocks_wheel_event_at_position(state, display_list, &visual_context_tree, {}, { 20, 20 }));
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, display_list, &visual_context_tree, {}, { 20, 20 }, { 0, 10 }, true),
-        Compositing::WheelScrollAdmission::BlockedByMainThreadRegion);
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, display_list, &visual_context_tree, {}, { 20, 20 }, { 0, 10 }, false),
-        Compositing::WheelScrollAdmission::BlockedByMainThreadRegion);
+    EXPECT_EQ(route_first_wheel_step_at(state), Web::InputRoutingDecision::BlockedByMainThreadRegion);
 
     state.has_blocking_wheel_event_region_covering_viewport = true;
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, display_list, &visual_context_tree, {}, { 20, 20 }, { 0, 10 }, true),
-        Compositing::WheelScrollAdmission::BlockedByWheelEventRegion);
-}
-
-TEST_CASE(wheel_scroll_admission_fails_closed_for_stale_or_missing_blocker_geometry)
-{
-    Compositing::VisualContextTreeTestBuilder builder;
-    builder.append_scroll(Compositing::VISUAL_VIEWPORT_NODE_INDEX);
-    auto visual_context_tree = builder.finish();
-    auto display_list = make_empty_display_list(visual_context_tree);
-    auto state = make_scrolling_state_with_viewport_scroll_node(2000);
-    state.has_blocking_wheel_event_listeners = true;
-    state.blocking_wheel_event_regions.append({
-        .context = { Compositing::VISUAL_VIEWPORT_NODE_INDEX },
-        .rect = { 0, 0, 100, 100 },
-    });
-
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, display_list, &visual_context_tree, {}, { 200, 200 }, { 0, 10 }, true),
-        Compositing::WheelScrollAdmission::Accepted);
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, display_list, &visual_context_tree, {}, { 200, 200 }, { 0, 10 }, false),
-        Compositing::WheelScrollAdmission::StaleBlockingWheelEventRegions);
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, {}, &visual_context_tree, {}, { 200, 200 }, { 0, 10 }, true),
-        Compositing::WheelScrollAdmission::BlockedByWheelEventRegion);
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, display_list, nullptr, {}, { 200, 200 }, { 0, 10 }, true),
-        Compositing::WheelScrollAdmission::BlockedByWheelEventRegion);
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, {}, nullptr, {}, { 200, 200 }, { 0, 10 }, false),
-        Compositing::WheelScrollAdmission::StaleBlockingWheelEventRegions);
-
-    state.has_blocking_wheel_event_listeners = false;
-    state.blocking_wheel_event_regions.clear();
-    EXPECT_EQ(Compositing::admit_wheel_scroll(state, {}, nullptr, {}, { 200, 200 }, { 0, 10 }, true),
-        Compositing::WheelScrollAdmission::NoScrollableTarget);
+    EXPECT_EQ(route_first_wheel_step_at(state), Web::InputRoutingDecision::BlockedByWheelEventRegion);
 }
 
 TEST_CASE(async_scrolling_resolves_sticky_offsets_from_the_visual_context_tree)
@@ -227,72 +195,41 @@ TEST_CASE(async_scrolling_resolves_sticky_offsets_from_the_visual_context_tree)
     EXPECT_EQ(snapshot.device_offset_for_index(bar_node), (Gfx::FloatPoint { 0, 0 }));
 }
 
-TEST_CASE(a_scroller_at_its_edge_hands_a_delta_to_its_ancestors_only_when_chaining_is_allowed)
+TEST_CASE(a_key_is_not_passed_on_from_a_scroller_that_keeps_its_scrolls)
 {
-    Compositing::VisualContextTreeTestBuilder builder;
-    auto viewport_scroll_node = builder.append_scroll(Compositing::VISUAL_VIEWPORT_NODE_INDEX);
-    VERIFY(viewport_scroll_node == viewport_node_id.scroll_node_index);
-    auto nested_scroll_node = builder.append_scroll(viewport_scroll_node);
-    auto visual_context_tree = builder.finish();
+    Compositing::AsyncScrollNodeID const nested_node_id { .document_id = Web::UniqueNodeID { 1 }, .scroll_node_index = Compositing::SpatialNodeIndex { 2 } };
+    Web::AsyncScrollNodeStableID const nested_stable_node_id { .node_id = Web::UniqueNodeID { 3 }, .kind = Web::AsyncScrollNodeKind::Element, .pseudo_element_type = 0 };
 
-    Compositing::AsyncScrollNodeID const nested_scroll_node_id { .document_id = Web::UniqueNodeID { 1 }, .scroll_node_index = nested_scroll_node };
-    auto make_scroll_tree_with_nested_scroller_that_scrolls_by_10 = [&] {
+    auto scroll_tree_with_nested_scroller = [&](bool nested_scroller_chains_vertically) {
         auto state = make_scrolling_state_with_viewport_scroll_node(2000);
         state.scroll_nodes.append({
-            .node_id = nested_scroll_node_id,
-            .stable_node_id = { .node_id = Web::UniqueNodeID { 3 }, .kind = Web::AsyncScrollNodeKind::Element, .pseudo_element_type = 0 },
+            .node_id = nested_node_id,
+            .stable_node_id = nested_stable_node_id,
             .parent_node_id = viewport_node_id,
             .scrollport_rect = { 0, 0, 100, 100 },
             .min_scroll_offset = { 0, 0 },
-            .max_scroll_offset = { 0, 10 },
+            .max_scroll_offset = { 0, 200 },
             .is_viewport = false,
             .can_be_wheel_scrolled_horizontally = false,
             .can_be_wheel_scrolled_vertically = true,
+            .chains_scroll_to_ancestors_horizontally = true,
+            .chains_scroll_to_ancestors_vertically = nested_scroller_chains_vertically,
         });
         Compositing::AsyncScrollTree scroll_tree;
         scroll_tree.set_state(move(state));
         return scroll_tree;
     };
 
-    auto scroll_nested_scroller_to_its_edge = [&](Compositing::AsyncScrollTree& scroll_tree, Compositing::ScrollStateSnapshot& snapshot) {
-        auto scroll_offset = scroll_tree.apply_scroll_delta(nested_scroll_node_id, { 0, 10 }, visual_context_tree, snapshot, Compositing::ScrollChaining::None);
-        EXPECT(scroll_offset.has_value());
-        EXPECT_EQ(snapshot.device_offset_for_index(nested_scroll_node), (Gfx::FloatPoint { 0, -10 }));
-    };
+    // The viewport is scrolled down and the nested scroller is at its top, so only the viewport can scroll up.
+    Compositing::ScrollStateSnapshot snapshot;
+    snapshot.set_device_offset_for_index(viewport_node_id.scroll_node_index, { 0, -300 });
 
-    {
-        auto scroll_tree = make_scroll_tree_with_nested_scroller_that_scrolls_by_10();
-        Compositing::ScrollStateSnapshot snapshot;
-        scroll_nested_scroller_to_its_edge(scroll_tree, snapshot);
+    auto target_of_key_that_is_passed_on = scroll_tree_with_nested_scroller(true).scroll_node_for_keyboard_scroll(nested_stable_node_id, { 0, -100 }, snapshot);
+    EXPECT(target_of_key_that_is_passed_on.has_value() && *target_of_key_that_is_passed_on == viewport_node_id);
 
-        auto scroll_offset = scroll_tree.apply_scroll_delta(nested_scroll_node_id, { 0, 30 }, visual_context_tree, snapshot, Compositing::ScrollChaining::ToScrollableAncestors);
-        EXPECT(scroll_offset.has_value());
-        EXPECT_EQ(scroll_offset->stable_node_id.node_id, viewport_document_node_id);
-        EXPECT_EQ(snapshot.device_offset_for_index(viewport_scroll_node), (Gfx::FloatPoint { 0, -30 }));
-        EXPECT_EQ(snapshot.device_offset_for_index(nested_scroll_node), (Gfx::FloatPoint { 0, -10 }));
-    }
+    auto target_of_key_that_is_kept = scroll_tree_with_nested_scroller(false).scroll_node_for_keyboard_scroll(nested_stable_node_id, { 0, -100 }, snapshot);
+    EXPECT(!target_of_key_that_is_kept.has_value());
 
-    {
-        auto scroll_tree = make_scroll_tree_with_nested_scroller_that_scrolls_by_10();
-        Compositing::ScrollStateSnapshot snapshot;
-        scroll_nested_scroller_to_its_edge(scroll_tree, snapshot);
-
-        auto scroll_offset = scroll_tree.apply_scroll_delta(nested_scroll_node_id, { 0, 30 }, visual_context_tree, snapshot, Compositing::ScrollChaining::None);
-        EXPECT(!scroll_offset.has_value());
-        EXPECT_EQ(snapshot.device_offset_for_index(viewport_scroll_node), (Gfx::FloatPoint { 0, 0 }));
-        EXPECT_EQ(snapshot.device_offset_for_index(nested_scroll_node), (Gfx::FloatPoint { 0, -10 }));
-    }
-
-    {
-        auto scroll_tree = make_scroll_tree_with_nested_scroller_that_scrolls_by_10();
-        Compositing::ScrollStateSnapshot snapshot;
-
-        // Once the child moves, the remainder of the delta does not scroll its ancestor.
-        auto scroll_offset = scroll_tree.apply_scroll_delta(nested_scroll_node_id, { 0, 30 }, visual_context_tree, snapshot, Compositing::ScrollChaining::ToScrollableAncestors);
-        EXPECT(scroll_offset.has_value());
-        EXPECT_EQ(scroll_offset->stable_node_id.node_id, (Web::UniqueNodeID { 3 }));
-        EXPECT_EQ(scroll_offset->unadopted_scroll_delta, (Gfx::FloatPoint { 0, 10 }));
-        EXPECT_EQ(snapshot.device_offset_for_index(viewport_scroll_node), (Gfx::FloatPoint { 0, 0 }));
-        EXPECT_EQ(snapshot.device_offset_for_index(nested_scroll_node), (Gfx::FloatPoint { 0, -10 }));
-    }
+    auto target_of_key_the_scroller_can_scroll_by = scroll_tree_with_nested_scroller(false).scroll_node_for_keyboard_scroll(nested_stable_node_id, { 0, 100 }, snapshot);
+    EXPECT(target_of_key_the_scroller_can_scroll_by.has_value() && *target_of_key_the_scroller_can_scroll_by == nested_node_id);
 }

@@ -20,15 +20,12 @@ use crate::css::named_colors::named_color_from_name;
 use crate::css::parser::calc_parser::{CalcParseError, CalcParserContext, parse_a_calc_function_node};
 use crate::css::parser::component_value::{ComponentKind, ComponentValue};
 use crate::css::parser::token_stream::TokenStream;
-use crate::css::style_value::{ColorBase, RetainedNumericRangeList, RetainedStyleValueData, StyleValueData};
+use crate::css::style_value::{
+    ColorBase, RetainedNumericRangeList, RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData,
+};
 
 use super::value_parser::{ParseContext, context_allows_random_functions, equals_ascii_case_insensitive};
-
-const COLOR_SYNTAX_LEGACY: u8 = 0;
-const COLOR_SYNTAX_MODERN: u8 = 1;
-const VALUE_TYPE_ANGLE: u8 = 2;
-const VALUE_TYPE_NUMBER: u8 = 27;
-const VALUE_TYPE_PERCENTAGE: u8 = 31;
+use crate::css::value_codes::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NumericKind {
@@ -51,7 +48,8 @@ fn color_base(color_type: Option<u8>, syntax: u8) -> ColorBase {
 }
 
 fn retained(value: StyleValueData) -> RetainedStyleValueData {
-    RetainedStyleValueData::from_owned(value)
+    // NB: Shared, so the channels of colors written with whole numbers allocate nothing of their own.
+    RetainedStyleValueData::from_arc(crate::css::style_value::shared_style_value(value))
 }
 
 fn retained_optional(value: Option<StyleValueData>) -> RetainedStyleValueData {
@@ -375,11 +373,13 @@ fn parse_calculated_numeric(
         values,
         CalcParserContext {
             percentages_resolve_as: None,
+            allow_percentages: accepted.contains(&NumericKind::Percentage),
             property,
             random_function_index: context.random_function_index,
             allowed_color_channels,
+            allow_size_keyword: false,
             allow_random_functions: context_allows_random_functions(context),
-            parse_context: context,
+            parse_context: Some(context),
         },
     ) {
         Ok(root) => root,
@@ -444,6 +444,15 @@ fn parse_numeric(
                 kind: NumericKind::Number,
             });
         }
+    }
+    if accepted.contains(&NumericKind::Number)
+        && let Some(value) = super::value_parser::parse_tree_counting_value(context, value, 0)
+    {
+        stream.discard_a_token();
+        return Some(ParsedNumeric {
+            value,
+            kind: NumericKind::Number,
+        });
     }
     let parsed = match &value.kind {
         ComponentKind::Token(ParserTokenKind::Number { value, .. }) if accepted.contains(&NumericKind::Number) => {
@@ -807,6 +816,28 @@ fn parse_color_function(context: &ParseContext, property: u16, values: &[Compone
     ))
 }
 
+// https://drafts.csswg.org/css-color-5/#relative-alpha
+fn parse_alpha_function(context: &ParseContext, property: u16, values: &[ComponentValue]) -> Option<StyleValueData> {
+    // alpha() = alpha(from <color> / [<alpha-value> | none])
+    let mut stream = TokenStream::new(values);
+    let origin_color = parse_relative_origin(context, property, &mut stream, false).ok()??;
+    let alpha = parse_alpha(context, property, &mut stream, allowed_channels(&[]))?;
+    stream.discard_whitespace();
+    if stream.has_next_token() {
+        return None;
+    }
+    // NB: alpha() keeps the color components of its origin color, so its own channels are unused.
+    let unused_channel = || StyleValueData::Number { value: 0.0 };
+    Some(make_color_function(
+        color_conversion::ALPHA,
+        [unused_channel(), unused_channel(), unused_channel()],
+        Some(alpha),
+        COLOR_SYNTAX_MODERN,
+        None,
+        Some(origin_color),
+    ))
+}
+
 pub(crate) fn parse_color_interpolation_method(stream: &mut TokenStream<'_>) -> Option<StyleValueData> {
     let start = stream.current_index();
     stream.discard_whitespace();
@@ -892,11 +923,9 @@ fn parse_mix_component(context: &ParseContext, property: u16, stream: &mut Token
     Some(MixComponent { color, percentage })
 }
 
-fn is_zero_percentage(value: Option<&StyleValueData>) -> bool {
-    matches!(value, Some(StyleValueData::Percentage { value }) if *value == 0.0)
-}
-
+// https://drafts.csswg.org/css-color-5/#color-mix
 fn parse_color_mix(context: &ParseContext, property: u16, values: &[ComponentValue]) -> Option<StyleValueData> {
+    // color-mix() = color-mix( <color-interpolation-method>? , [ <color> && <percentage [0,100]>? ]#)
     let mut stream = TokenStream::new(values);
     let method_start = stream.current_index();
     let method = parse_color_interpolation_method(&mut stream);
@@ -909,26 +938,25 @@ fn parse_color_mix(context: &ParseContext, property: u16, values: &[ComponentVal
     } else {
         stream.position = method_start;
     }
-    let first = parse_mix_component(context, property, &mut stream)?;
-    if !stream.next_token().is_comma() {
-        return None;
-    }
-    stream.discard_a_token();
-    let second = parse_mix_component(context, property, &mut stream)?;
-    if is_zero_percentage(first.percentage.as_ref()) && is_zero_percentage(second.percentage.as_ref()) {
-        return None;
-    }
-    stream.discard_whitespace();
-    if stream.has_next_token() {
-        return None;
+    let mut colors = Vec::new();
+    let mut percentages = Vec::new();
+    loop {
+        let component = parse_mix_component(context, property, &mut stream)?;
+        colors.push(retained(component.color));
+        percentages.push(retained_optional(component.percentage));
+        if !stream.has_next_token() {
+            break;
+        }
+        if !stream.next_token().is_comma() {
+            return None;
+        }
+        stream.discard_a_token();
     }
     Some(StyleValueData::ColorMix {
         color_base: color_base(None, COLOR_SYNTAX_MODERN),
         color_interpolation_method: retained_optional(method),
-        first_color: retained(first.color),
-        first_percentage: retained_optional(first.percentage),
-        second_color: retained(second.color),
-        second_percentage: retained_optional(second.percentage),
+        colors: RetainedStyleValueDataList::from_retained_values(colors),
+        percentages: RetainedStyleValueDataList::from_retained_values(percentages),
     })
 }
 
@@ -976,6 +1004,8 @@ fn parse_color_function_component(
 ) -> Option<StyleValueData> {
     if equals_ascii_case_insensitive(name, b"color") {
         parse_color_function(context, property, values)
+    } else if equals_ascii_case_insensitive(name, b"alpha") {
+        parse_alpha_function(context, property, values)
     } else if equals_ascii_case_insensitive(name, b"color-mix") {
         parse_color_mix(context, property, values)
     } else if equals_ascii_case_insensitive(name, b"rgb")
@@ -1002,6 +1032,7 @@ fn parse_color_function_component(
 
 pub(crate) fn is_color_function_name(name: &[u16]) -> bool {
     [
+        "alpha",
         "color",
         "color-mix",
         "contrast-color",
@@ -1089,23 +1120,8 @@ mod tests {
     use crate::css::css_tokenizer::tokenize_for_parser;
     use crate::css::parser::component_value::consume_a_list_of_component_values;
 
-    fn context() -> ParseContext {
-        ParseContext {
-            in_quirks_mode: false,
-            is_svg_presentation_attribute: false,
-            is_substituted_value: false,
-            contains_attr_tainted_values: false,
-            is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index: std::ptr::null_mut(),
-        }
+    fn context() -> ParseContext<'static> {
+        ParseContext::default()
     }
 
     fn parse(source: &str) -> Option<StyleValueData> {
@@ -1162,6 +1178,8 @@ mod tests {
             "hsl(from red calc(h + 10) s l)",
             "lab(from red l calc(a * 2) b)",
             "color(from red srgb r g b)",
+            "alpha(from red / 0.5)",
+            "alpha(from currentcolor / calc(alpha * 0.5))",
         ] {
             assert!(parse(source).is_some(), "{source}");
         }
@@ -1175,9 +1193,11 @@ mod tests {
             "rgb(1, 2%, 3)",
             "hsl(0, 1, 2%)",
             "color(unknown 1 2 3)",
-            "color-mix(in srgb, red 0%, blue 0%)",
             "light-dark(red)",
             "contrast-color(red, blue)",
+            "alpha(red / 0.5)",
+            "alpha(from red)",
+            "alpha(from red / r)",
         ] {
             assert!(parse(source).is_none(), "{source}");
         }

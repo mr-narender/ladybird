@@ -15,12 +15,14 @@
 #include <AK/Utf16View.h>
 #include <AK/Weakable.h>
 #include <LibGC/HeapVector.h>
+#include <LibGC/RootVector.h>
 #include <LibGC/Weak.h>
 #include <LibGfx/Font/Typeface.h>
 #include <LibGfx/FontCascadeList.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/FontFace.h>
-#include <LibWeb/CSS/ParsedFontFace.h>
+#include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontFaceSnapshot.h>
 #include <LibWeb/CSS/RustDescriptorBlock.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
 #include <LibWeb/WebIDL/Buffers.h>
@@ -37,7 +39,7 @@ class FontFaceState final : public RefCounted<FontFaceState>
 public:
     using FontFaceSource = FlattenVariant<Variant<Utf16String>, WebIDL::BufferSourceVariant>;
 
-    [[nodiscard]] static NonnullRefPtr<FontFaceState> create_for_constructor(JS::Object&, Utf16String family, FontFaceSource source, Bindings::FontFaceDescriptors const& descriptors);
+    [[nodiscard]] static GC::Ref<FontFace> create_for_constructor(JS::Object&, Utf16String family, FontFaceSource source, Bindings::FontFaceDescriptors const& descriptors);
     [[nodiscard]] static NonnullRefPtr<FontFaceState> create_css_connected(JS::Realm&, u64 rule_identity, StyleSheetState&);
     ~FontFaceState();
     FontFace& cssom_font_face() const;
@@ -45,50 +47,12 @@ public:
     GC::Ref<GC::HeapVector<NonnullRefPtr<FontFaceState>>> keep_alive_during_load();
     void load_for_style();
 
-    Utf16String family() const { return m_family.to_utf16_string(); }
     Utf16FlyString const& family_name() const { return m_family; }
-    WebIDL::ExceptionOr<void> set_family(Utf16View);
-    void set_family_impl(NonnullRefPtr<StyleValue const> const& value);
 
-    Utf16String const& style() const { return m_style; }
-    WebIDL::ExceptionOr<void> set_style(Utf16View);
-    void set_style_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& weight() const { return m_weight; }
-    WebIDL::ExceptionOr<void> set_weight(Utf16View);
-    void set_weight_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& stretch() const { return m_stretch; }
-    WebIDL::ExceptionOr<void> set_stretch(Utf16View);
-    void set_stretch_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& unicode_range() const { return m_unicode_range; }
-    WebIDL::ExceptionOr<void> set_unicode_range(Utf16View);
-    void set_unicode_range_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& feature_settings() const { return m_feature_settings; }
-    WebIDL::ExceptionOr<void> set_feature_settings(Utf16View);
-    void set_feature_settings_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& variation_settings() const { return m_variation_settings; }
-    WebIDL::ExceptionOr<void> set_variation_settings(Utf16View);
-    void set_variation_settings_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& display() const { return m_display; }
-    WebIDL::ExceptionOr<void> set_display(Utf16View);
-    void set_display_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& ascent_override() const { return m_ascent_override; }
-    WebIDL::ExceptionOr<void> set_ascent_override(Utf16View);
-    void set_ascent_override_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& descent_override() const { return m_descent_override; }
-    WebIDL::ExceptionOr<void> set_descent_override(Utf16View);
-    void set_descent_override_impl(NonnullRefPtr<StyleValue const> const& value);
-
-    Utf16String const& line_gap_override() const { return m_line_gap_override; }
-    WebIDL::ExceptionOr<void> set_line_gap_override(Utf16View);
-    void set_line_gap_override_impl(NonnullRefPtr<StyleValue const> const& value);
+    // The serialization of the @font-face descriptor a FontFace attribute reflects.
+    Utf16String const& descriptor_text(DescriptorID) const;
+    WebIDL::ExceptionOr<void> set_descriptor(DescriptorID, Utf16View);
+    static constexpr size_t attribute_count = 11;
 
     bool is_css_connected() const { return m_css_font_face_rule_identity.has_value(); }
     Optional<u64> css_rule_identity() const
@@ -98,23 +62,43 @@ public:
     void disconnect_from_css_rule();
     void reparse_connected_css_font_face_rule_descriptors();
 
-    ParsedFontFace parsed_font_face() const;
-
     RefPtr<Gfx::Typeface const> typeface() const { return m_parsed_font; }
 
-    FontWeightRange declared_weight_range() const { return m_cached_weight_range; }
-    int declared_slope() const { return m_cached_slope; }
-    int declared_width() const { return m_cached_width; }
+    // The number this face is known by in the process. A style update that must not mutate the face names it by this
+    // number and leaves the mutation for the drain below.
+    [[nodiscard]] u64 id() const { return m_id; }
+    [[nodiscard]] static RefPtr<FontFaceState> with_id(u64);
+
+    // The key the font computer files this face under, and matching selects it by.
+    [[nodiscard]] FontFaceKey matching_key() const
+    {
+        return {
+            .family_name = m_family,
+            .weight = m_cached_weight_range,
+            .slope = m_cached_slope,
+            .width = m_cached_width,
+        };
+    }
+
+    // Whether the font-weight descriptor is auto, which takes the weight range of the font file in place of the
+    // range the matching key carries.
+    [[nodiscard]] bool weight_descriptor_is_auto() const { return m_weight_descriptor_is_auto; }
+
     bool should_be_registered_with_font_computer() const;
 
-    RefPtr<Gfx::FontCascadeList const> font_with_point_size(float point_size, Gfx::FontVariationSettings const&, Gfx::ShapeFeatures const&) const;
+    // What the face renders with right now, published for a cascade on any thread: its typeface while its font-display
+    // period has not failed.
+    NonnullRefPtr<FontFaceRenderingTypeface const> rendering_typeface() const { return m_rendering_typeface; }
 
     Vector<Gfx::UnicodeRange> const& unicode_ranges() const { return m_unicode_ranges; }
     bool has_urls() const { return !m_urls.is_empty(); }
+    // Its font-display period failed or its load errored, so it contributes nothing to a cascade.
+    bool is_unusable_for_rendering() const { return m_font_display_failed || m_status == FontFaceLoadStatus::Error; }
     bool is_pending_rendering_from_cache() const;
     bool has_pending_rendering() const;
     void set_font_display_time_for_testing(u32 milliseconds);
     Gfx::PendingFontState resolve_for_rendering();
+    Gfx::PendingFontState rendering_state_without_requesting() const;
 
     bool has_non_default_unicode_range() const
     {
@@ -135,13 +119,15 @@ public:
     void remove_from_set(FontFaceSet&);
 
 private:
-    FontFaceState(GC::Ref<HTML::EnvironmentSettingsObject>, GC::Ptr<WebIDL::Promise> font_status_promise = nullptr);
+    explicit FontFaceState(GC::Ref<HTML::EnvironmentSettingsObject>);
 
     JS::Object& task_global_object() const;
     void reject_status_promise(WebIDL::Exception);
     void did_load(RefPtr<Gfx::Typeface const>);
+    void set_parsed_font(RefPtr<Gfx::Typeface const>);
 
     Optional<FontComputer&> font_computer() const;
+    GC::RootVector<GC::Ref<FontFaceSet>> containing_sets() const;
     void update_font_display_period();
     i64 font_download_elapsed_time() const;
     void invalidate_font_display();
@@ -149,22 +135,16 @@ private:
     RustDescriptorBlock connected_descriptors() const;
 
     [[nodiscard]] Optional<ComputationContext> computation_context() const;
+    void apply_descriptor(DescriptorID, StyleValue const&);
 
-    // FIXME: Should we be storing StyleValues instead?
+    u64 m_id { 0 };
+
     Utf16FlyString m_family;
-    Utf16String m_style;
-    Utf16String m_weight;
-    Utf16String m_stretch;
-    Utf16String m_unicode_range;
+    Array<Utf16String, attribute_count> m_descriptor_texts;
     Vector<Gfx::UnicodeRange> m_unicode_ranges;
-    Utf16String m_feature_settings;
-    Utf16String m_variation_settings;
-    Utf16String m_display;
-    Utf16String m_ascent_override;
-    Utf16String m_descent_override;
-    Utf16String m_line_gap_override;
 
     FontWeightRange m_cached_weight_range { 400, 400 };
+    bool m_weight_descriptor_is_auto { true };
     int m_cached_slope { 0 };
     int m_cached_width { 100 };
     GC::Ptr<FontLoader> m_font_loader;
@@ -188,10 +168,11 @@ private:
     FontFaceLoadStatus m_status;
 
     mutable GC::Ptr<WebIDL::Promise> m_font_status_promise; // [[FontStatusPromise]]
-    Vector<ParsedFontFace::Source> m_urls;                  // [[Urls]]
+    Vector<FontLoader::Source> m_urls;                      // [[Urls]]
     ByteBuffer m_binary_data {};                            // [[Data]]
 
     RefPtr<Gfx::Typeface const> m_parsed_font;
+    NonnullRefPtr<FontFaceRenderingTypeface> m_rendering_typeface { FontFaceRenderingTypeface::create() };
     RefPtr<Core::Promise<NonnullRefPtr<Gfx::Typeface const>>> m_font_load_promise;
 
     Optional<u64> m_css_font_face_rule_identity;
@@ -203,5 +184,17 @@ private:
 };
 
 bool font_format_is_supported(Utf16View name);
+
+// Record that a style update wanted a web face loaded, on any thread. Loading a face changes its status, appends it to
+// every FontFaceSet it is in - under an execution context that runs author callbacks - and starts a fetch, none of
+// which may happen while a style update runs, nor anywhere but the main thread.
+void note_wanted_web_face(u64 face_id);
+
+// Load every face wanted since the last call, unless a style update is running: that one drains them at its end.
+void request_wanted_web_faces();
+
+// A style update defers every load its cascades want to its own end.
+void begin_deferred_web_face_loads();
+void end_deferred_web_face_loads();
 
 }

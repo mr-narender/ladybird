@@ -6,10 +6,10 @@
 
 #include <AK/AnyOf.h>
 #include <Compositor/BackingStoreManager.h>
+#include <Compositor/PaintingSurface.h>
+#include <Compositor/SkiaBackendContext.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/PaintingSurface.h>
 #include <LibGfx/SharedImageBuffer.h>
-#include <LibGfx/SkiaBackendContext.h>
 
 #ifdef USE_VULKAN_DMABUF_IMAGES
 #    include <AK/Array.h>
@@ -59,12 +59,41 @@ struct GpuBackingStore {
 };
 #endif
 
+static Vector<u64>& presentation_drm_format_modifiers()
+{
+    static Vector<u64> modifiers;
+    return modifiers;
+}
+
+void BackingStoreManager::set_presentation_drm_format_modifiers(Vector<u64> modifiers)
+{
+    presentation_drm_format_modifiers() = move(modifiers);
+}
+
 #ifdef USE_VULKAN_DMABUF_IMAGES
+// A presentation on another GPU can only import a linear layout. On ours, the driver picks a layout that suits it among
+// those the presentation can import, which matters to GPUs such as NVIDIA's that cannot render to a linear one at all.
+static Vector<u64> shared_backing_store_drm_format_modifiers(Gfx::VulkanContext const& vulkan_context)
+{
+    if (!vulkan_context.is_preferred_device)
+        return { DRM_FORMAT_MOD_LINEAR };
+
+    auto modifiers = Gfx::renderable_drm_format_modifiers(vulkan_context, VK_FORMAT_B8G8R8A8_UNORM);
+    // NB: The presentation can still show frames that it cannot import, after the view reads them back.
+    auto const& importable_modifiers = presentation_drm_format_modifiers();
+    if (any_of(modifiers, [&](u64 modifier) { return importable_modifiers.contains_slow(modifier); }))
+        modifiers.remove_all_matching([&](u64 modifier) { return !importable_modifiers.contains_slow(modifier); });
+    // NB: A linear layout is the slowest to paint into, so it is only used when there is nothing else.
+    if (any_of(modifiers, [](u64 modifier) { return modifier != DRM_FORMAT_MOD_LINEAR; }))
+        modifiers.remove_all_matching([](u64 modifier) { return modifier == DRM_FORMAT_MOD_LINEAR; });
+    return modifiers;
+}
+
 static ErrorOr<GpuBackingStore> create_shared_gpu_backing_store(Gfx::IntSize size, Gfx::SkiaBackendContext& skia_backend_context)
 {
     auto const& vulkan_context = skia_backend_context.vulkan_context();
-    static constexpr Array<u64, 1> linear_modifiers = { DRM_FORMAT_MOD_LINEAR };
-    auto image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), VK_FORMAT_B8G8R8A8_UNORM, linear_modifiers.span()));
+    auto const modifiers = shared_backing_store_drm_format_modifiers(vulkan_context);
+    auto image = TRY(Gfx::create_shared_vulkan_image(vulkan_context, size.width(), size.height(), VK_FORMAT_B8G8R8A8_UNORM, modifiers.span()));
     auto shared_image = Gfx::duplicate_shared_image(*image);
 
     return GpuBackingStore {
@@ -107,25 +136,26 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
     if (viewport_size.is_empty())
         return {};
 
-    auto minimum_needed_size = viewport_size;
-    bool force_reallocate = false;
+    auto allocation_size = viewport_size;
+    bool needs_allocation = m_allocated_size.is_empty();
     if (window_resize_in_progress == Compositing::WindowResizingInProgress::Yes) {
-        // Pad the minimum needed size so that we don't have to keep reallocating backing stores while the window is being resized.
-        minimum_needed_size = { viewport_size.width() + 256, viewport_size.height() + 256 };
+        // Pad the backing stores we allocate so that we don't have to keep reallocating them while the window is being
+        // resized. Ones that still hold the viewport are kept.
+        allocation_size = { viewport_size.width() + 256, viewport_size.height() + 256 };
+        needs_allocation |= !m_allocated_size.contains(viewport_size);
     } else {
         // If we're not in the middle of a resize, we can shrink the backing store size to match the viewport size.
-        minimum_needed_size = viewport_size;
-        force_reallocate = m_allocated_size != minimum_needed_size;
+        needs_allocation |= m_allocated_size != viewport_size;
     }
 
-    if (force_reallocate || m_allocated_size.is_empty() || !m_allocated_size.contains(minimum_needed_size)) {
-        m_allocated_size = minimum_needed_size;
+    if (needs_allocation) {
+        m_allocated_size = allocation_size;
         auto buffer_count = backing_store_count_for(should_publish);
         Vector<i32> bitmap_ids;
         bitmap_ids.ensure_capacity(buffer_count);
         for (size_t i = 0; i < buffer_count; ++i)
             bitmap_ids.append(m_next_bitmap_id++);
-        return Allocation { .size = minimum_needed_size, .bitmap_ids = move(bitmap_ids) };
+        return Allocation { .size = allocation_size, .bitmap_ids = move(bitmap_ids) };
     }
 
     return {};
@@ -141,6 +171,8 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
         return {};
 
     auto buffer_count = allocation.bitmap_ids.size();
+    m_backing_store_size = allocation.size;
+    m_initial_backing_store_count = buffer_count;
     m_backing_stores.ensure_capacity(buffer_count);
 
     if (!should_publish) {
@@ -170,7 +202,11 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
         for (size_t i = 0; i < buffer_count; ++i) {
             auto backing_store = create_shared_gpu_backing_store(allocation.size, *skia_backend_context);
             if (backing_store.is_error()) {
-                dbgln("Failed to allocate shared GPU backing store ({}), falling back to shareable bitmaps", backing_store.error());
+                static bool reported_failure = false;
+                if (!reported_failure) {
+                    dbgln("Failed to allocate shared GPU backing store ({}), falling back to shareable bitmaps", backing_store.error());
+                    reported_failure = true;
+                }
                 allocation_succeeded = false;
                 break;
             }
@@ -200,22 +236,86 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
     Vector<Gfx::SharedImage> shared_images;
     shared_images.ensure_capacity(buffer_count);
     for (size_t i = 0; i < buffer_count; ++i) {
-        auto shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::create(allocation.size));
-        shared_images.append(shared_image_buffer->export_shared_image());
-        auto surface = create_shareable_bitmap_backing_store(allocation.size, *shared_image_buffer, skia_backend_context);
-        m_backing_stores.append({
-            .surface = move(surface),
-            .published_shared_image_buffer = move(shared_image_buffer),
-            .bitmap_id = allocation.bitmap_ids[i],
-            .state = initial_buffer_state(i),
-            .accumulated_damage = { {}, allocation.size },
-        });
+        m_backing_stores.append(create_published_shareable_backing_store(allocation.size, allocation.bitmap_ids[i], initial_buffer_state(i), skia_backend_context));
+        shared_images.append(m_backing_stores.last().published_shared_image_buffer->export_shared_image());
     }
 
     return Publication {
         .bitmap_ids = allocation.bitmap_ids,
         .shared_images = move(shared_images),
     };
+}
+
+BackingStoreManager::BackingStore BackingStoreManager::create_published_shareable_backing_store(Gfx::IntSize size, i32 bitmap_id, BufferState state, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+{
+    auto shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::create(size));
+    auto surface = create_shareable_bitmap_backing_store(size, *shared_image_buffer, skia_backend_context);
+    return {
+        .surface = move(surface),
+        .published_shared_image_buffer = move(shared_image_buffer),
+        .bitmap_id = bitmap_id,
+        .state = state,
+        .accumulated_damage = { {}, size },
+    };
+}
+
+// The window server lets go of a store some time after the client replaced it on screen, which at high refresh rates
+// can be later than the next frame is due. Rather than hold that frame back, give it a store of its own. While the
+// client has yet to take a frame, or to release a store, there is no telling what the window server holds, and the
+// frame waits as it always did.
+Optional<BackingStoreManager::Publication> BackingStoreManager::add_backing_store_if_window_server_still_reads_every_released_store(RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+{
+    if (is_rendering() || !m_latest_rendered_store_index.has_value())
+        return {};
+    if (m_backing_stores.size() >= maximum_backing_store_count)
+        return {};
+
+    for (size_t i = 0; i < m_backing_stores.size(); ++i) {
+        auto const& store = m_backing_stores[i];
+        if (!store.published_shared_image_buffer)
+            return {};
+        bool client_displays_store = i == *m_latest_rendered_store_index;
+        if (client_displays_store && store.state != BufferState::Presented)
+            return {};
+        if (!client_displays_store && (store.state != BufferState::Available || store_can_be_rendered_into(store)))
+            return {};
+    }
+
+    auto bitmap_id = m_next_bitmap_id++;
+    m_backing_stores.append(create_published_shareable_backing_store(m_backing_store_size, bitmap_id, BufferState::Available, skia_backend_context));
+
+    Vector<Gfx::SharedImage> shared_images;
+    shared_images.append(m_backing_stores.last().published_shared_image_buffer->export_shared_image());
+    return Publication {
+        .bitmap_ids = { bitmap_id },
+        .shared_images = move(shared_images),
+    };
+}
+
+// A store added for a burst of frames is given back once a whole interval between two checks went by without it
+// being rendered into. The stores that stay are the ones first in line for the next frame.
+Vector<i32> BackingStoreManager::retire_idle_surplus_backing_stores()
+{
+    Vector<i32> retired_bitmap_ids;
+    if (is_rendering())
+        return retired_bitmap_ids;
+
+    for (size_t i = m_backing_stores.size(); i-- > 0 && has_surplus_backing_stores();) {
+        auto const& store = m_backing_stores[i];
+        if (m_latest_rendered_store_index == i)
+            continue;
+        if (store.state != BufferState::Available || store.was_rendered_into_since_last_retirement_check || published_surface_is_in_use(store))
+            continue;
+
+        retired_bitmap_ids.append(store.bitmap_id);
+        m_backing_stores.remove(i);
+        if (m_latest_rendered_store_index.has_value() && *m_latest_rendered_store_index > i)
+            m_latest_rendered_store_index = *m_latest_rendered_store_index - 1;
+    }
+
+    for (auto& store : m_backing_stores)
+        store.was_rendered_into_since_last_retirement_check = false;
+    return retired_bitmap_ids;
 }
 
 bool BackingStoreManager::is_valid() const
@@ -237,7 +337,13 @@ bool BackingStoreManager::published_surface_is_in_use(BackingStore const& store)
 
 bool BackingStoreManager::store_can_be_rendered_into(BackingStore const& store)
 {
-    return store.state == BufferState::Available && !published_surface_is_in_use(store);
+    if (store.state != BufferState::Available)
+        return false;
+    // Only the client hands a store to the window server, so whatever uses a store the client was never presented
+    // is the send right still on its way there.
+    if (!store.was_presented_to_client)
+        return true;
+    return !published_surface_is_in_use(store);
 }
 
 bool BackingStoreManager::has_available_buffer() const
@@ -257,6 +363,7 @@ Optional<BackingStoreManager::RenderTarget> BackingStoreManager::acquire_render_
             continue;
 
         store.state = BufferState::Rendering;
+        store.was_rendered_into_since_last_retirement_check = true;
         m_rendering_store_index = i;
         auto damage_rect = store.accumulated_damage;
         store.accumulated_damage = {};
@@ -276,6 +383,8 @@ void BackingStoreManager::complete_rendering(i32 bitmap_id, bool wait_for_releas
         m_backing_stores[*m_latest_rendered_store_index].state = BufferState::Available;
 
     store.state = BufferState::Presented;
+    if (wait_for_release)
+        store.was_presented_to_client = true;
     m_latest_rendered_store_index = m_rendering_store_index;
     m_rendering_store_index.clear();
 }
@@ -289,6 +398,14 @@ bool BackingStoreManager::release_buffer(i32 bitmap_id)
         return true;
     }
     return false;
+}
+
+void BackingStoreManager::release_all_presented_buffers()
+{
+    for (auto& store : m_backing_stores) {
+        if (store.state == BufferState::Presented)
+            store.state = BufferState::Available;
+    }
 }
 
 RefPtr<Gfx::PaintingSurface> BackingStoreManager::latest_rendered_surface() const

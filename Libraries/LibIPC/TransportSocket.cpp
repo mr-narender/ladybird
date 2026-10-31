@@ -18,15 +18,19 @@
 #include <LibIPC/TransportHandle.h>
 #include <LibIPC/TransportSocket.h>
 #include <LibThreading/Thread.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 namespace IPC {
 
 // Maximum size of accumulated unprocessed bytes before we disconnect the peer
 static constexpr size_t MAX_UNPROCESSED_BUFFER_SIZE = 128 * MiB;
 
-// Maximum number of accumulated unprocessed file descriptors before we disconnect the peer
-static constexpr size_t MAX_UNPROCESSED_FDS = 512;
+// Maximum number of accumulated unprocessed file descriptors before we disconnect the peer. Descriptors are parsed
+// after every read, and one read takes the descriptors of at most one sendmsg(). So, the most a well-behaved peer can
+// leave unclaimed is a whole message's, plus those that arrive with the read that completes it.
+static constexpr size_t MAX_UNPROCESSED_FDS = MAX_MESSAGE_FD_COUNT_WITH_SHARED_MEMORY + Core::LocalSocket::MAX_TRANSFER_FDS;
 
 // Size of the buffer for one read from the socket
 static constexpr size_t READ_BUFFER_SIZE = 4096;
@@ -49,6 +53,13 @@ void TransportSocket::set_skip_inloop_read_for_test(bool skip)
 
 ErrorOr<NonnullOwnPtr<TransportSocket>> TransportSocket::from_socket(NonnullOwnPtr<Core::LocalSocket> socket)
 {
+    return make<TransportSocket>(move(socket));
+}
+
+ErrorOr<NonnullOwnPtr<TransportSocket>> TransportSocket::adopt_fd(int fd)
+{
+    auto socket = TRY(Core::LocalSocket::adopt_fd(fd));
+    TRY(socket->set_blocking(false));
     return make<TransportSocket>(move(socket));
 }
 
@@ -75,8 +86,27 @@ ErrorOr<TransportSocket::Paired> TransportSocket::create_paired()
 
 void SendQueue::enqueue_message(SocketMessageHeader header, MessageDataType payload, Vector<NonnullRefPtr<AutoCloseFileDescriptor>>&& fds)
 {
-    VERIFY(fds.size() <= Core::LocalSocket::MAX_TRANSFER_FDS);
     MutexLocker locker(m_mutex);
+
+    // Send the descriptors that do not fit in one sendmsg() with the message ahead of it, in full frames.
+    size_t fds_ahead = 0;
+    if (!fds.is_empty())
+        fds_ahead = fds.size() - ((fds.size() - 1) % Core::LocalSocket::MAX_TRANSFER_FDS + 1);
+    for (size_t offset = 0; offset < fds_ahead; offset += Core::LocalSocket::MAX_TRANSFER_FDS) {
+        SocketMessageHeader attachments_header {
+            .type = SocketMessageHeader::Type::Attachments,
+            .payload_size = 0,
+            .fd_count = static_cast<u32>(Core::LocalSocket::MAX_TRANSFER_FDS),
+        };
+        Vector<NonnullRefPtr<AutoCloseFileDescriptor>> attachment_fds;
+        attachment_fds.ensure_capacity(Core::LocalSocket::MAX_TRANSFER_FDS);
+        for (size_t i = 0; i < Core::LocalSocket::MAX_TRANSFER_FDS; ++i)
+            attachment_fds.unchecked_append(fds[offset + i]);
+        m_queued_byte_count += sizeof(SocketMessageHeader);
+        m_queued_messages.append(QueuedMessage { attachments_header, {}, move(attachment_fds) });
+    }
+    fds.remove(0, fds_ahead);
+
     m_queued_byte_count += sizeof(SocketMessageHeader) + payload.size();
     m_queued_messages.append(QueuedMessage { header, move(payload), move(fds) });
 }
@@ -86,7 +116,6 @@ SendQueue::BytesAndFds SendQueue::peek(size_t max_bytes)
     MutexLocker locker(m_mutex);
     BytesAndFds result;
 
-    static_assert(Core::LocalSocket::MAX_TRANSFER_FDS == MAX_MESSAGE_FD_COUNT, "IPC message attachments must fit in one sendmsg()");
     size_t bytes_to_send = 0;
     size_t fds_to_send = 0;
     for (auto const& queued_message : m_queued_messages) {
@@ -315,7 +344,10 @@ TransportSocket::~TransportSocket()
 void TransportSocket::stop_io_thread(IOThreadState desired_state)
 {
     VERIFY(desired_state == IOThreadState::Stopped || desired_state == IOThreadState::SendPendingMessagesAndStop);
-    m_io_thread_state.store(desired_state, AK::MemoryOrder::memory_order_release);
+    // NB: The IO thread may already have stopped on its own (e.g. the peer hung up). Stopped is terminal, so never
+    //     overwrite it with a new stop request.
+    auto state = m_io_thread_state.load(AK::MemoryOrder::memory_order_acquire);
+    while (state != IOThreadState::Stopped && !m_io_thread_state.compare_exchange_strong(state, desired_state, AK::MemoryOrder::memory_order_acq_rel)) { }
     wake_io_thread();
     if (m_io_thread && m_io_thread->needs_to_be_joined())
         (void)m_io_thread->join();
@@ -405,20 +437,62 @@ void TransportSocket::wait_until_readable()
     }
 }
 
+static ErrorOr<NonnullRefPtr<AutoCloseFileDescriptor>> copy_payload_to_shared_memory(ReadonlyBytes payload)
+{
+    auto shared_memory = adopt_ref(*new AutoCloseFileDescriptor(TRY(Core::System::anon_create(payload.size(), O_CLOEXEC))));
+    while (!payload.is_empty())
+        payload = payload.slice(TRY(Core::System::write(shared_memory->value(), payload)));
+    return shared_memory;
+}
+
+// The peer can still write to the shared memory or truncate it, so we copy the payload out before parsing it. Unlike a
+// read from a mapping, pread() reports a truncation as a short read instead of raising SIGBUS.
+static ErrorOr<Vector<u8>> copy_payload_from_shared_memory(int fd, size_t size)
+{
+    auto stat = TRY(Core::System::fstat(fd));
+    if (static_cast<u64>(stat.st_size) < size)
+        return Error::from_string_literal("Shared memory is smaller than the payload size");
+
+    Vector<u8> payload;
+    TRY(payload.try_resize(size));
+
+    size_t copied_size = 0;
+    while (copied_size < size) {
+        auto bytes_read = ::pread(fd, payload.data() + copied_size, size - copied_size, static_cast<off_t>(copied_size));
+        if (bytes_read < 0) {
+            if (errno == EINTR)
+                continue;
+            return Error::from_errno(errno);
+        }
+        if (bytes_read == 0)
+            return Error::from_string_literal("Shared memory is smaller than the payload size");
+        copied_size += static_cast<size_t>(bytes_read);
+    }
+    return payload;
+}
+
 ErrorOr<void> TransportSocket::post_message(MessageDataType bytes_to_write, Vector<Attachment>& attachments)
 {
-    auto num_fds_to_transfer = attachments.size();
-
     SocketMessageHeader header {
         .type = SocketMessageHeader::Type::Payload,
         .payload_size = static_cast<u32>(bytes_to_write.size()),
-        .fd_count = static_cast<u32>(num_fds_to_transfer),
+        .fd_count = static_cast<u32>(attachments.size()),
     };
 
+    RefPtr<AutoCloseFileDescriptor> shared_memory;
+    if (bytes_to_write.size() > MAX_INLINE_PAYLOAD_SIZE) {
+        shared_memory = TRY(copy_payload_to_shared_memory(bytes_to_write));
+        bytes_to_write.clear();
+        header.type = SocketMessageHeader::Type::SharedMemoryPayload;
+        ++header.fd_count;
+    }
+
     Vector<NonnullRefPtr<AutoCloseFileDescriptor>> fds;
-    fds.ensure_capacity(num_fds_to_transfer);
+    fds.ensure_capacity(header.fd_count);
     for (auto& attachment : attachments)
         fds.unchecked_append(adopt_ref(*new AutoCloseFileDescriptor(attachment.to_fd())));
+    if (shared_memory)
+        fds.unchecked_append(shared_memory.release_nonnull());
 
     m_send_queue->enqueue_message(header, move(bytes_to_write), move(fds));
     wake_io_thread();
@@ -481,28 +555,55 @@ void TransportSocket::parse_unprocessed_messages(Vector<NonnullOwnPtr<Message>>&
     while (index + sizeof(SocketMessageHeader) <= m_unprocessed_bytes.size()) {
         SocketMessageHeader header;
         memcpy(&header, m_unprocessed_bytes.data() + index, sizeof(SocketMessageHeader));
-        if (header.type == SocketMessageHeader::Type::Payload) {
-            if (header.payload_size > MAX_MESSAGE_PAYLOAD_SIZE) {
-                dbgln("TransportSocket: Rejecting message with payload_size {} exceeding limit {}", header.payload_size, MAX_MESSAGE_PAYLOAD_SIZE);
+        size_t frame_payload_size = 0;
+        if (header.type == SocketMessageHeader::Type::Attachments) {
+            // NB: These descriptors were queued as they arrived. The Payload frame that follows claims them.
+            if (header.payload_size != 0 || header.fd_count > Core::LocalSocket::MAX_TRANSFER_FDS) {
+                dbgln("TransportSocket: Rejecting malformed attachments frame");
                 m_peer_eof = true;
                 break;
             }
-            if (header.fd_count > MAX_MESSAGE_FD_COUNT) {
-                dbgln("TransportSocket: Rejecting message with fd_count {} exceeding limit {}", header.fd_count, MAX_MESSAGE_FD_COUNT);
+        } else if (header.type == SocketMessageHeader::Type::Payload || header.type == SocketMessageHeader::Type::SharedMemoryPayload) {
+            bool payload_is_in_shared_memory = header.type == SocketMessageHeader::Type::SharedMemoryPayload;
+            if (!payload_is_in_shared_memory && header.payload_size > MAX_INLINE_PAYLOAD_SIZE) {
+                dbgln("TransportSocket: Rejecting message with payload_size {} exceeding limit {}", header.payload_size, MAX_INLINE_PAYLOAD_SIZE);
                 m_peer_eof = true;
                 break;
             }
-            Checked<size_t> message_size = header.payload_size;
+            auto max_fd_count = payload_is_in_shared_memory ? MAX_MESSAGE_FD_COUNT_WITH_SHARED_MEMORY : MAX_MESSAGE_FD_COUNT;
+            if (header.fd_count > max_fd_count) {
+                dbgln("TransportSocket: Rejecting message with fd_count {} exceeding limit {}", header.fd_count, max_fd_count);
+                m_peer_eof = true;
+                break;
+            }
+            if (payload_is_in_shared_memory && header.fd_count == 0) {
+                dbgln("TransportSocket: Rejecting shared memory message without a descriptor");
+                m_peer_eof = true;
+                break;
+            }
+            if (!payload_is_in_shared_memory)
+                frame_payload_size = header.payload_size;
+            Checked<size_t> message_size = frame_payload_size;
             message_size += sizeof(SocketMessageHeader);
             if (message_size.has_overflow() || message_size.value() > m_unprocessed_bytes.size() - index)
                 break;
             if (header.fd_count > m_unprocessed_attachments.size())
                 break;
             auto message = make<Message>();
-            for (size_t i = 0; i < header.fd_count; ++i)
+            auto attachment_count = payload_is_in_shared_memory ? header.fd_count - 1 : header.fd_count;
+            for (size_t i = 0; i < attachment_count; ++i)
                 message->attachments.enqueue(m_unprocessed_attachments.dequeue());
             Vector<u8> payload_bytes;
-            if (payload_bytes.try_append(m_unprocessed_bytes.data() + index + sizeof(SocketMessageHeader), header.payload_size).is_error()) {
+            if (payload_is_in_shared_memory) {
+                auto shared_memory = m_unprocessed_attachments.dequeue();
+                auto copied_bytes = copy_payload_from_shared_memory(shared_memory.fd(), header.payload_size);
+                if (copied_bytes.is_error()) {
+                    dbgln("TransportSocket: Failed to copy payload_size {} from shared memory: {}", header.payload_size, copied_bytes.error());
+                    m_peer_eof = true;
+                    break;
+                }
+                payload_bytes = copied_bytes.release_value();
+            } else if (payload_bytes.try_append(m_unprocessed_bytes.data() + index + sizeof(SocketMessageHeader), header.payload_size).is_error()) {
                 dbgln("TransportSocket: Failed to allocate message buffer for payload_size {}", header.payload_size);
                 m_peer_eof = true;
                 break;
@@ -515,7 +616,7 @@ void TransportSocket::parse_unprocessed_messages(Vector<NonnullOwnPtr<Message>>&
             break;
         }
         Checked<size_t> new_index = index;
-        new_index += header.payload_size;
+        new_index += frame_payload_size;
         new_index += sizeof(SocketMessageHeader);
         if (new_index.has_overflow()) {
             dbgln("TransportSocket: index would overflow");

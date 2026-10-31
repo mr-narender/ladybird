@@ -10,7 +10,11 @@
 #include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/Geometry/DOMMatrix.h>
 #include <LibWeb/Geometry/DOMPoint.h>
+#include <LibWeb/Geometry/DOMPointReadOnly.h>
+#include <LibWeb/Geometry/DOMRect.h>
+#include <LibWeb/Geometry/DOMRectReadOnly.h>
 #include <LibWeb/SVG/AttributeParsing.h>
+#include <LibWeb/SVG/SVGAngle.h>
 #include <LibWeb/SVG/SVGFitToViewBox.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 #include <LibWeb/SVG/SVGLength.h>
@@ -25,7 +29,7 @@ class SVGSVGElement final : public SVGGraphicsElement
     GC_DECLARE_ALLOCATOR(SVGSVGElement);
 
 public:
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     virtual bool requires_svg_container() const override { return false; }
     virtual bool is_svg_container() const override { return true; }
@@ -33,9 +37,7 @@ public:
     virtual Optional<ViewBox> active_view_box() const override;
     virtual SVGFitToViewBox const* fit_to_view_box() const override { return this; }
 
-    void set_active_view_element(GC::Ptr<SVGViewElement> view_element) { m_active_view_element = view_element; }
-
-    void set_fallback_view_box_for_svg_as_image(Optional<ViewBox>);
+    void set_active_view_element(GC::Ptr<SVGViewElement> view_element);
 
     // AD-HOC: The spec states that the x, y, width and height IDL attributes reflect the respective computed values and their
     //         corresponding presentation attributes but other browsers reflect the attribute values instead - see
@@ -67,10 +69,12 @@ public:
 
     GC::Ref<SVGNumber> create_svg_number() const;
     GC::Ref<SVGLength> create_svg_length() const;
+    GC::Ref<SVGAngle> create_svg_angle() const;
     GC::Ref<Geometry::DOMPoint> create_svg_point() const;
     GC::Ref<Geometry::DOMMatrix> create_svg_matrix() const;
     GC::Ref<Geometry::DOMRect> create_svg_rect() const;
     GC::Ref<SVGTransform> create_svg_transform() const;
+    WebIDL::ExceptionOr<GC::Ref<SVGTransform>> create_svg_transform_from_matrix(Bindings::DOMMatrix2DInit const&) const;
 
     // Deprecated methods that have no effect when called, but which are kept for compatibility reasons.
     WebIDL::UnsignedLong suspend_redraw(WebIDL::UnsignedLong max_wait_milliseconds) const
@@ -86,18 +90,31 @@ public:
     void unsuspend_redraw_all() const { }
     void force_redraw() const { }
 
+    void pause_animations();
+    void unpause_animations();
+    bool animations_paused();
+    float get_current_time();
+    void set_current_time(float seconds);
+
+    GC::Ptr<SMILTimeContainer> time_container() const { return m_time_container; }
+
     // The width/height attributes parsed as the CSS width/height properties, when that yields a
     // plain <length> - the only case the natural size negotiation can use.
     [[nodiscard]] Optional<CSS::Length> width_attribute_length() const;
     [[nodiscard]] Optional<CSS::Length> height_attribute_length() const;
 
-    static CSS::SizeWithAspectRatio negotiate_natural_metrics(SVGSVGElement const&, CSS::Length::ResolutionContext const&);
+    // The natural aspect ratio the active SVG view or the viewBox gives an <svg>, which its natural size negotiation
+    // falls back to where its width and height do not both give it one.
+    static Optional<CSSPixelFraction> view_box_natural_aspect_ratio(SVGSVGElement const&);
 
 private:
     SVGSVGElement(DOM::Document&, DOM::QualifiedName);
 
     virtual void initialize_element() override;
     virtual void visit_edges(Visitor&) override;
+    virtual void inserted() override;
+    virtual void adopted_from(DOM::Document&) override;
+    virtual void moved_from(IsSubtreeRoot, GC::Ptr<Node> old_ancestor) override;
 
     virtual bool is_svg_svg_element() const override { return true; }
 
@@ -107,13 +124,18 @@ private:
     virtual void children_changed(ChildrenChangedMetadata const&) override;
 
     void update_fallback_view_box_for_svg_as_image();
+    void create_time_container_if_outermost();
 
     Optional<ViewBox> m_fallback_view_box_for_svg_as_image;
 
     mutable Optional<Optional<CSS::Length>> m_cached_width_attribute_length;
     mutable Optional<Optional<CSS::Length>> m_cached_height_attribute_length;
 
+    mutable GC::Ptr<Geometry::DOMPointReadOnly> m_current_translate;
+
     GC::Ptr<SVGViewElement> m_active_view_element;
+
+    GC::Ptr<SMILTimeContainer> m_time_container;
 };
 
 }

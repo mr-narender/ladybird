@@ -1,5 +1,6 @@
 const customDnsSettings = document.querySelector("#custom-dns-settings");
 const dnsForciblyEnabled = document.querySelector("#dns-forcibly-enabled");
+const dnsProxyNote = document.querySelector("#dns-proxy-note");
 
 const dnsUpstream = document.querySelector("#dns-upstream");
 const dnsType = document.querySelector("#dns-type");
@@ -10,6 +11,10 @@ const dnssecToggle = document.querySelector("#dnssec-toggle");
 let DNS_SETTINGS = {};
 
 function loadSettings(settings) {
+    if (!Object.hasOwn(settings, "dnsSettings")) {
+        return;
+    }
+
     DNS_SETTINGS = settings.dnsSettings || {};
     loadDnsSettings();
 }
@@ -50,6 +55,22 @@ function loadDnsSettings() {
         dnsPort.disabled = false;
         dnssecToggle.disabled = false;
     }
+
+    const proxy = DNS_SETTINGS.proxy;
+
+    if (proxy) {
+        dnsProxyNote.textContent = proxy.resolvesAllHostnames
+            ? `The proxy at ${proxy.server} resolves hostnames itself, so these settings do not apply to web requests and DNSSEC cannot be validated.`
+            : `The proxy at ${proxy.server} resolves hostnames itself, so these settings do not apply to requests sent through it and DNSSEC cannot be validated for them.`;
+        dnsProxyNote.classList.remove("hidden");
+
+        if (proxy.resolvesAllHostnames) {
+            dnssecToggle.checked = false;
+            dnssecToggle.disabled = true;
+        }
+    } else {
+        dnsProxyNote.classList.add("hidden");
+    }
 }
 
 dnsUpstream.addEventListener("change", () => {
@@ -81,7 +102,8 @@ function updateDnsSettings() {
         type: dnsType.value,
         server: dnsServer.value,
         port: dnsPort.value | 0,
-        dnssec: dnssecToggle.checked,
+        // Keep the saved DNSSEC setting while the proxy makes it inapplicable.
+        dnssec: DNS_SETTINGS.proxy?.resolvesAllHostnames ? !!DNS_SETTINGS.dnssec : dnssecToggle.checked,
     });
 }
 

@@ -4,10 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::painting::paint_read::PaintRead;
 use crate::painting::record::trace::Observer;
 
 use crate::painting::force_dark::ForceDarkRole;
-use libgfx_rust::path::{OwnedPath, PathBuilder};
+use libgfx_rust::path::Path;
 
 use crate::css::css_pixels::CssPixelRect;
 use crate::css::css_pixels::CssPixels;
@@ -15,7 +16,7 @@ use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::recorder::{FillPathParams, PaintStyleOrColor};
 use crate::painting::paintable_geometry::absolute_rect;
 use crate::painting::record::PaintRecorder;
-use libgfx_rust::{Color, IntRect, ShouldAntiAlias, WindingRule};
+use libgfx_rust::{Color, FloatPoint, IntRect, ShouldAntiAlias, WindingRule};
 
 // Note: the color names reflect what the colors would be for a light theme,
 // not necessary the actual colors.
@@ -54,7 +55,7 @@ fn form_control_system_colors<O: Observer>(
 ) -> FormControlSystemColors {
     use crate::css::color_resolution::{PREFERRED_COLOR_SCHEME_DARK, system_color_for_keyword};
     use crate::css::css_enums::keyword;
-    let style = recorder.layout_arena.node_style_if_live(paintable);
+    let style = recorder.source.node_style_if_live(paintable);
     let (dark, accent_color) = style.map_or((false, None), |style| {
         let ui = style.inherited_ui();
         (
@@ -105,16 +106,15 @@ fn centered_square_device_rect<O: Observer>(
     recorder.converter.enclosing_device_rect(rect)
 }
 
-fn check_mark_path(checkbox_rect: IntRect) -> OwnedPath {
-    let mut builder = PathBuilder::new();
-    builder.move_to(72.0, 14.0);
-    builder.line_to(37.0, 64.0);
-    builder.line_to(19.0, 47.0);
-    builder.line_to(8.0, 58.0);
-    builder.line_to(40.0, 89.0);
-    builder.line_to(85.0, 24.0);
-    builder.close();
-    let path = builder.build();
+fn check_mark_path(checkbox_rect: IntRect) -> Path {
+    let mut path = Path::new();
+    path.move_to(FloatPoint { x: 72.0, y: 14.0 });
+    path.line_to(FloatPoint { x: 37.0, y: 64.0 });
+    path.line_to(FloatPoint { x: 19.0, y: 47.0 });
+    path.line_to(FloatPoint { x: 8.0, y: 58.0 });
+    path.line_to(FloatPoint { x: 40.0, y: 89.0 });
+    path.line_to(FloatPoint { x: 85.0, y: 24.0 });
+    path.close();
 
     let checkmark_width = 100.0f32;
     let checkmark_height = 100.0f32;
@@ -125,7 +125,7 @@ fn check_mark_path(checkbox_rect: IntRect) -> OwnedPath {
 
 pub(crate) fn paint_check_box_foreground<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
     let facts = recorder
-        .layout_arena
+        .source
         .replaced_paint_facts(paintable)
         .and_then(|facts| facts.form_control())
         .unwrap_or_default();
@@ -134,7 +134,7 @@ pub(crate) fn paint_check_box_foreground<O: Observer>(recorder: &mut PaintRecord
     let canvas_color = system_colors.canvas;
 
     // Keep checkboxes painted as square, centered within the space they occupy.
-    let outer_rect = absolute_rect(recorder.layout_arena, paintable);
+    let outer_rect = absolute_rect(recorder.source, paintable);
     let checkbox_size = outer_rect.width.min(outer_rect.height);
     let checkbox_rect = centered_square_device_rect(recorder, outer_rect, checkbox_size);
     let checkbox_radius = checkbox_rect.width / 5;
@@ -229,7 +229,7 @@ pub(crate) fn paint_check_box_foreground<O: Observer>(recorder: &mut PaintRecord
 
 pub(crate) fn paint_radio_button_foreground<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
     let facts = recorder
-        .layout_arena
+        .source
         .replaced_paint_facts(paintable)
         .and_then(|facts| facts.form_control())
         .unwrap_or_default();
@@ -262,7 +262,7 @@ pub(crate) fn paint_radio_button_foreground<O: Observer>(recorder: &mut PaintRec
     };
 
     // Keep radio buttons painted as circles, centered within the space they occupy.
-    let outer_rect = absolute_rect(recorder.layout_arena, paintable);
+    let outer_rect = absolute_rect(recorder.source, paintable);
     let radio_button_size = outer_rect.width.min(outer_rect.height);
 
     // This is based on a 1px outer border and 2px inner border when drawn at 13x13.

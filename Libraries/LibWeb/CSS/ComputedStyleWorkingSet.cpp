@@ -11,6 +11,7 @@
 #include <LibGC/WeakInlines.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/FontComputer.h>
+#include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
@@ -24,12 +25,9 @@
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
-#include <LibWeb/CSS/StyleValues/OpenTypeTaggedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ScrollbarColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
-#include <LibWeb/CSS/StyleValues/TupleStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWebCommon/CSS/SystemColor.h>
 
@@ -47,20 +45,11 @@ static_assert(to_underlying(PseudoElement::KnownPseudoElementCount) <= sizeof(u6
 
 ComputedStyleWorkingSet::ComputedStyleWorkingSet()
     : m_computed_longhand_table(ComputedValuesFFI::rust_computed_longhand_table_create())
-    , m_mint_cache(adopt_ref(*new WrapperMintCache))
 {
 }
 
 ComputedStyleWorkingSet::ComputedStyleWorkingSet(ComputedValuesFFI::ComputedLonghandTable* longhand_table)
     : m_computed_longhand_table(longhand_table)
-    , m_mint_cache(adopt_ref(*new WrapperMintCache))
-{
-}
-
-ComputedStyleWorkingSet::ComputedStyleWorkingSet(ShareFrozenTable, ComputedStyleWorkingSet const& other)
-    : m_computed_longhand_table(const_cast<ComputedValuesFFI::ComputedLonghandTable*>(ComputedValuesFFI::rust_computed_longhand_table_retain(other.m_computed_longhand_table)))
-    , m_computed_longhand_table_is_shared(true)
-    , m_mint_cache(other.m_mint_cache)
 {
 }
 
@@ -78,19 +67,6 @@ NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_with_long
 {
     VERIFY(longhand_table);
     return adopt_ref(*new ComputedStyleWorkingSet(longhand_table));
-}
-
-NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_with_base_values_from(ComputedStyleWorkingSet const& style)
-{
-    auto working_set = create();
-    working_set->m_mint_cache->wrappers = style.m_mint_cache->wrappers;
-    working_set->m_mint_cache->style_sheet_source_slots = style.m_mint_cache->style_sheet_source_slots;
-    // The table copy carries the importance, inheritance and evaluation flags and the recorded
-    // inheritance-dependent specified values along with the value slots.
-    ComputedValuesFFI::rust_computed_longhand_table_copy_from(working_set->m_computed_longhand_table, style.m_computed_longhand_table);
-    if (style.m_animated_properties)
-        working_set->m_animated_properties = adopt_ref(*new AnimatedProperties(*style.m_animated_properties));
-    return working_set;
 }
 
 NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_with_base_values_from(ComputedValues const& style)
@@ -114,7 +90,7 @@ NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_with_base
     ComputedValuesFFI::rust_computed_longhand_table_clear_seeded_state(working_set->m_computed_longhand_table);
     auto importance = base.property_importance_bitmap();
     auto inheritance = base.property_inheritance_bitmap();
-    ComputedValuesFFI::rust_computed_longhand_table_load_flag_bitmaps(working_set->m_computed_longhand_table, importance.data(), importance.size(), inheritance.data(), inheritance.size());
+    ComputedValuesFFI::rust_computed_longhand_table_load_flag_bitmaps(working_set->m_computed_longhand_table, importance, inheritance);
     for (auto const& entry : base.inheritance_dependent_specified_values())
         ComputedValuesFFI::rust_computed_longhand_table_add_inheritance_dependent_value(working_set->m_computed_longhand_table, entry.property, entry.value);
     working_set->set_display_before_box_type_transformation(base.display_before_box_type_transformation());
@@ -124,7 +100,7 @@ NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_with_base
     if (base.font_metrics_depend_on_viewport_metrics())
         working_set->set_font_metrics_depend_on_viewport_metrics();
     if (base.in_display_none_subtree())
-        working_set->set_in_display_none_subtree();
+        working_set->metadata().in_display_none_subtree = true;
     return working_set;
 }
 
@@ -139,6 +115,8 @@ NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::create_for_anima
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Position))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::Float))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::LineHeight))
+            || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::OverflowX))
+            || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::OverflowY))
             || ComputedValuesFFI::rust_animated_overlay_contains(overlay, to_underlying(PropertyID::TextAlign));
         auto animated_properties = adopt_ref(*new AnimatedProperties(overlay, AnimatedProperties::InheritedOnly {}));
         working_set->m_animated_properties = move(animated_properties);
@@ -160,11 +138,6 @@ void ComputedStyleWorkingSet::ensure_mutable_computed_longhand_table()
 void ComputedStyleWorkingSet::freeze_computed_longhand_table()
 {
     ComputedValuesFFI::rust_computed_longhand_table_freeze(m_computed_longhand_table);
-}
-
-NonnullRefPtr<ComputedStyleWorkingSet> ComputedStyleWorkingSet::copy_without_animations() const
-{
-    return adopt_ref(*new ComputedStyleWorkingSet(ShareFrozenTable {}, *this));
 }
 
 AnimatedProperties::AnimatedProperties()
@@ -248,7 +221,7 @@ StyleValue const& AnimatedProperties::property(PropertyID property_id) const
 
     if (auto wrapper = m_wrapper_cache.get(property_id); wrapper.has_value())
         return *wrapper.value();
-    auto wrapper = wrap_computed_longhand_slot(animated_entry->value, nullptr);
+    auto wrapper = wrap_computed_longhand_slot(animated_entry->value);
     m_wrapper_cache.set(property_id, wrapper);
     return *wrapper;
 }
@@ -261,21 +234,6 @@ void AnimatedProperties::set_property(PropertyID id, NonnullRefPtr<StyleValue co
         inherited == ComputedStyleWorkingSet::Inherited::Yes,
         animated_property_result_of_transition == AnimatedPropertyResultOfTransition::Yes);
     m_wrapper_cache.set(id, move(value));
-}
-
-bool ComputedStyleWorkingSet::is_property_important(PropertyID property_id) const
-{
-    return ComputedValuesFFI::rust_computed_longhand_table_is_important(m_computed_longhand_table, to_underlying(property_id));
-}
-
-void ComputedStyleWorkingSet::set_property_important(PropertyID property_id, Important important)
-{
-    ComputedValuesFFI::rust_computed_longhand_table_set_important(m_computed_longhand_table, to_underlying(property_id), important == Important::Yes);
-}
-
-bool ComputedStyleWorkingSet::is_property_inherited(PropertyID property_id) const
-{
-    return ComputedValuesFFI::rust_computed_longhand_table_is_inherited(m_computed_longhand_table, to_underlying(property_id));
 }
 
 ReadonlyBytes ComputedStyleWorkingSet::property_importance_bitmap() const
@@ -317,11 +275,6 @@ void ComputedStyleWorkingSet::set_has_pseudo_element_styles(u64 pseudo_element_s
     metadata().pseudo_element_styles |= pseudo_element_styles;
 }
 
-void ComputedStyleWorkingSet::set_property_inherited(PropertyID property_id, Inherited inherited)
-{
-    ComputedValuesFFI::rust_computed_longhand_table_set_inherited(m_computed_longhand_table, to_underlying(property_id), inherited == Inherited::Yes);
-}
-
 void ComputedStyleWorkingSet::set_depends_on_viewport_metrics()
 {
     metadata().dependency_flags |= to_underlying(StyleRecordDependencyFlag::DependsOnViewportMetrics);
@@ -330,52 +283,6 @@ void ComputedStyleWorkingSet::set_depends_on_viewport_metrics()
 void ComputedStyleWorkingSet::set_font_metrics_depend_on_viewport_metrics()
 {
     metadata().dependency_flags |= to_underlying(StyleRecordDependencyFlag::FontMetricsDependOnViewportMetrics);
-}
-
-void ComputedStyleWorkingSet::set_in_display_none_subtree()
-{
-    metadata().in_display_none_subtree = true;
-}
-
-void ComputedStyleWorkingSet::set_property(PropertyID id, NonnullRefPtr<StyleValue const> value, Inherited inherited, Important important)
-{
-    VERIFY(id >= first_longhand_property_id && id <= last_longhand_property_id);
-
-    set_property_without_modifying_flags(id, move(value));
-    set_property_important(id, important);
-    set_property_inherited(id, inherited);
-}
-
-static bool property_affects_computed_font_list(PropertyID id)
-{
-    return first_is_one_of(id, PropertyID::FontFamily, PropertyID::FontSize, PropertyID::FontStyle, PropertyID::FontWeight, PropertyID::FontWidth, PropertyID::FontVariationSettings);
-}
-
-void ComputedStyleWorkingSet::set_property_without_modifying_flags(PropertyID id, NonnullRefPtr<StyleValue const> value, i64 style_sheet_source_slot)
-{
-    VERIFY(id >= first_longhand_property_id && id <= last_longhand_property_id);
-
-    ComputedValuesFFI::rust_computed_longhand_table_set(m_computed_longhand_table, to_underlying(id), value->rust_style_value_data(), style_sheet_source_slot);
-    m_mint_cache->wrappers.set(id, move(value));
-
-    if (property_affects_computed_font_list(id))
-        clear_computed_font_list_cache();
-}
-
-void ComputedStyleWorkingSet::did_store_property_data_from_drive(PropertyID id)
-{
-    VERIFY(id >= first_longhand_property_id && id <= last_longhand_property_id);
-    m_mint_cache->wrappers.remove(id);
-
-    if (property_affects_computed_font_list(id))
-        clear_computed_font_list_cache();
-}
-
-void ComputedStyleWorkingSet::set_style_sheet_for_source_slot(u32 slot, RefPtr<StyleSheetState> style_sheet)
-{
-    if (slot >= m_mint_cache->style_sheet_source_slots.size())
-        m_mint_cache->style_sheet_source_slots.resize(slot + 1);
-    m_mint_cache->style_sheet_source_slots[slot] = style_sheet;
 }
 
 Display ComputedStyleWorkingSet::display_before_box_type_transformation() const
@@ -388,21 +295,6 @@ void ComputedStyleWorkingSet::set_display_before_box_type_transformation(Display
     metadata().display_before_box_type_transformation = bit_cast<u32>(value);
 }
 
-void ComputedStyleWorkingSet::set_animated_property_internal(PropertyID id, NonnullRefPtr<StyleValue const> value, AnimatedPropertyResultOfTransition animated_property_result_of_transition, Inherited inherited)
-{
-    VERIFY(id >= first_longhand_property_id && id <= last_longhand_property_id);
-
-    mutable_animated_properties().set_property(id, move(value), animated_property_result_of_transition, inherited);
-
-    if (property_affects_computed_font_list(id))
-        clear_computed_font_list_cache();
-}
-
-void ComputedStyleWorkingSet::set_animated_property(Badge<StyleComputer>, PropertyID id, NonnullRefPtr<StyleValue const> value, AnimatedPropertyResultOfTransition animated_property_result_of_transition, Inherited inherited)
-{
-    set_animated_property_internal(id, move(value), animated_property_result_of_transition, inherited);
-}
-
 ComputedValuesFFI::AnimatedOverlay* ComputedStyleWorkingSet::prepare_animated_overlay_for_rust_mutation(Badge<StyleComputer>)
 {
     auto& animated_properties = mutable_animated_properties();
@@ -411,10 +303,8 @@ ComputedValuesFFI::AnimatedOverlay* ComputedStyleWorkingSet::prepare_animated_ov
     return const_cast<ComputedValuesFFI::AnimatedOverlay*>(animated_properties.overlay());
 }
 
-ComputedValuesFFI::AnimatedOverlay* ComputedStyleWorkingSet::prepare_animated_overlay_for_rust_finalization(Badge<StyleComputer>, CreateAnimatedOverlay create)
+ComputedValuesFFI::AnimatedOverlay* ComputedStyleWorkingSet::prepare_animated_overlay_for_rust_finalization(Badge<StyleComputer>)
 {
-    if (!m_animated_properties && create == CreateAnimatedOverlay::No)
-        return nullptr;
     auto& animated_properties = mutable_animated_properties();
     animated_properties.clear_wrapper_cache();
     return const_cast<ComputedValuesFFI::AnimatedOverlay*>(animated_properties.overlay());
@@ -438,6 +328,8 @@ bool ComputedStyleWorkingSet::requires_animated_post_compute_adjustments() const
         || has_animated_property(PropertyID::Position)
         || has_animated_property(PropertyID::Float)
         || has_animated_property(PropertyID::LineHeight)
+        || has_animated_property(PropertyID::OverflowX)
+        || has_animated_property(PropertyID::OverflowY)
         || has_animated_property(PropertyID::TextAlign);
 }
 
@@ -446,29 +338,21 @@ void ComputedStyleWorkingSet::prepare_for_animated_post_compute_adjustments(Badg
     ensure_mutable_computed_longhand_table();
 }
 
-void ComputedStyleWorkingSet::did_apply_style_finalization_from_rust(u16 invalidated_longhands)
-{
-    auto invalidate = [&](u16 flag, PropertyID property_id) {
-        if (invalidated_longhands & flag)
-            did_store_property_data_from_drive(property_id);
-    };
-    invalidate(ComputedValuesFFI::FINALIZED_FLOAT, PropertyID::Float);
-    invalidate(ComputedValuesFFI::FINALIZED_DISPLAY, PropertyID::Display);
-    invalidate(ComputedValuesFFI::FINALIZED_LINE_HEIGHT, PropertyID::LineHeight);
-    invalidate(ComputedValuesFFI::FINALIZED_POSITION, PropertyID::Position);
-    invalidate(ComputedValuesFFI::FINALIZED_TEXT_ALIGN, PropertyID::TextAlign);
-    invalidate(ComputedValuesFFI::FINALIZED_OVERFLOW_X, PropertyID::OverflowX);
-    invalidate(ComputedValuesFFI::FINALIZED_OVERFLOW_Y, PropertyID::OverflowY);
-}
-
 void ComputedStyleWorkingSet::set_animated_custom_property(Badge<StyleComputer>, Utf16FlyString name, NonnullRefPtr<StyleValue const> value)
 {
     m_animated_custom_properties.set(move(name), move(value));
 }
 
+void ComputedStyleWorkingSet::install_animated_overlay(Badge<StyleComputer>, ComputedValuesFFI::AnimatedOverlay const* overlay)
+{
+    m_animated_properties = adopt_ref(*new AnimatedProperties(overlay));
+    clear_computed_font_list_cache();
+}
+
 void ComputedStyleWorkingSet::clear_animated_properties(Badge<StyleComputer>)
 {
     m_animated_custom_properties.clear();
+    m_animated_custom_properties_trigger_restyle = true;
     if (!m_animated_properties)
         return;
 
@@ -479,20 +363,17 @@ void ComputedStyleWorkingSet::clear_animated_properties(Badge<StyleComputer>)
     clear_computed_font_list_cache();
 }
 
-NonnullRefPtr<StyleValue const> wrap_computed_longhand_slot(void const* value_data, RefPtr<StyleSheetState> style_sheet)
+NonnullRefPtr<StyleValue const> wrap_computed_longhand_slot(void const* value_data)
 {
-    auto wrapper = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(value_data)));
     ++s_longhand_wrappers_minted;
-    if (style_sheet)
-        const_cast<StyleValue&>(*wrapper).set_style_sheet(style_sheet);
-    return wrapper;
+    return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(value_data)));
 }
 
 StyleValue const& ComputedStyleWorkingSet::property(PropertyID property_id, WithAnimationsApplied return_animated_value) const
 {
     VERIFY(property_id >= first_longhand_property_id && property_id <= last_longhand_property_id);
 
-    auto& cache = m_mint_cache->wrappers;
+    auto& cache = m_minted_wrappers;
     // Without an animated overlay, a cached wrapper is always the effective value: the store
     // funnels replace or invalidate the entry on every table write, and the recorded specified
     // values invalidate it when they change.
@@ -511,28 +392,18 @@ StyleValue const& ComputedStyleWorkingSet::property(PropertyID property_id, With
     VERIFY(effective.value);
     if (auto it = cache.find(property_id); it != cache.end() && it->value->rust_style_value_data() == effective.value)
         return *it->value;
-    // Mints the wrapper on demand, stamping a table-stored value with the sheet the winning
-    // declaration came from when the drive recorded one; image fetches read that context, and
-    // the mint happens before any group fallback consumes the value.
-    RefPtr<StyleSheetState> style_sheet;
-    if (effective.source == ComputedValuesFFI::EFFECTIVE_LONGHAND_SOURCE_TABLE) {
-        auto source_slot = ComputedValuesFFI::rust_computed_longhand_table_source_slot(m_computed_longhand_table, to_underlying(property_id));
-        if (source_slot >= 0 && static_cast<size_t>(source_slot) < m_mint_cache->style_sheet_source_slots.size())
-            style_sheet = m_mint_cache->style_sheet_source_slots[source_slot].ptr();
+    // Mints the wrapper on demand, before any group fallback consumes the value.
+    auto initial_value = property_initial_value(property_id);
+    if (initial_value->rust_style_value_data() == effective.value) {
+        cache.set(property_id, initial_value);
+        return *initial_value;
     }
-    if (!style_sheet) {
-        auto initial_value = property_initial_value(property_id);
-        if (initial_value->rust_style_value_data() == effective.value) {
-            cache.set(property_id, initial_value);
-            return *initial_value;
-        }
-    }
-    auto wrapper = wrap_computed_longhand_slot(effective.value, style_sheet);
+    auto wrapper = wrap_computed_longhand_slot(effective.value);
     cache.set(property_id, wrapper);
     return *wrapper;
 }
 
-void const* ComputedStyleWorkingSet::effective_property_data(PropertyID property_id, WithAnimationsApplied return_animated_value) const
+StyleValueFFI::StyleValueData const* ComputedStyleWorkingSet::effective_property_data(PropertyID property_id, WithAnimationsApplied return_animated_value) const
 {
     VERIFY(property_id >= first_longhand_property_id && property_id <= last_longhand_property_id);
     auto effective = ComputedValuesFFI::rust_computed_longhand_table_effective_value(
@@ -541,16 +412,7 @@ void const* ComputedStyleWorkingSet::effective_property_data(PropertyID property
         to_underlying(property_id),
         return_animated_value == WithAnimationsApplied::Yes);
     VERIFY(effective.value);
-    return effective.value;
-}
-
-Color ComputedStyleWorkingSet::color(PropertyID id, ColorResolutionContext color_resolution_context) const
-{
-    Optional<ComputedValuesFFI::FfiLengthResolutionContext> length_storage;
-    auto input = make_rust_color_resolution_input(color_resolution_context, length_storage);
-    auto resolved = StyleValueFFI::rust_style_value_to_color(effective_property_data(id), &input);
-    VERIFY(resolved.resolved);
-    return Color(resolved.rgba[0], resolved.rgba[1], resolved.rgba[2], resolved.rgba[3]);
+    return static_cast<StyleValueFFI::StyleValueData const*>(effective.value);
 }
 
 // https://drafts.csswg.org/css-color-adjust-1/#determine-the-used-color-scheme
@@ -602,408 +464,79 @@ CSSPixels ComputedStyleWorkingSet::line_height(FontComputer const& font_computer
     VERIFY_NOT_REACHED();
 }
 
-float ComputedStyleWorkingSet::stop_opacity() const
-{
-    return property(PropertyID::StopOpacity).as_opacity_value().resolved();
-}
-
-float ComputedStyleWorkingSet::flood_opacity() const
-{
-    return property(PropertyID::FloodOpacity).as_opacity_value().resolved();
-}
-
-ImageRendering ComputedStyleWorkingSet::image_rendering() const
-{
-    auto const& value = property(PropertyID::ImageRendering);
-    return keyword_to_image_rendering(value.to_keyword()).release_value();
-}
-
-CSSPixels ComputedStyleWorkingSet::border_spacing_horizontal() const
-{
-    auto const& style_value = property(PropertyID::BorderSpacing);
-
-    if (style_value.is_value_list()) {
-        auto const& list = style_value.as_value_list();
-        VERIFY(list.size() > 0);
-        return Length::from_style_value(list.value_at(0, false), {}).absolute_length_to_px();
-    }
-
-    return Length::from_style_value(style_value, {}).absolute_length_to_px();
-}
-
-CSSPixels ComputedStyleWorkingSet::border_spacing_vertical() const
-{
-    auto const& style_value = property(PropertyID::BorderSpacing);
-
-    if (style_value.is_value_list()) {
-        auto const& list = style_value.as_value_list();
-        VERIFY(list.size() > 1);
-        return Length::from_style_value(list.value_at(1, false), {}).absolute_length_to_px();
-    }
-
-    return Length::from_style_value(style_value, {}).absolute_length_to_px();
-}
-
-CaptionSide ComputedStyleWorkingSet::caption_side() const
-{
-    auto const& value = property(PropertyID::CaptionSide);
-    return keyword_to_caption_side(value.to_keyword()).release_value();
-}
-
-Color ComputedStyleWorkingSet::accent_color(ColorResolutionContext const& color_resolution_context) const
-{
-    auto const& value = property(PropertyID::AccentColor);
-
-    if (value.to_keyword() == Keyword::Auto)
-        return CSS::SystemColor::accent_color(color_resolution_context.color_scheme.value());
-
-    return value.to_color(color_resolution_context).value();
-}
-
-TextRendering ComputedStyleWorkingSet::text_rendering() const
-{
-    auto const& value = property(PropertyID::TextRendering);
-    return keyword_to_text_rendering(value.to_keyword()).release_value();
-}
-
-CSSPixels ComputedStyleWorkingSet::text_underline_offset() const
-{
-    auto const& computed_text_underline_offset = property(PropertyID::TextUnderlineOffset);
-
-    // auto
-    if (computed_text_underline_offset.to_keyword() == Keyword::Auto)
-        return InitialValues::text_underline_offset();
-
-    // <length>
-    // <percentage>
-    return Length::from_style_value(computed_text_underline_offset, Length::make_px(font_size())).absolute_length_to_px();
-}
-
-CSSPixels ComputedStyleWorkingSet::word_spacing() const
-{
-    auto const& value = property(PropertyID::WordSpacing);
-    if (value.is_keyword() && value.to_keyword() == Keyword::Normal)
-        return 0;
-
-    return Length::from_style_value(value, Length::make_px(font_size())).absolute_length_to_px();
-}
-
-CSSPixels ComputedStyleWorkingSet::letter_spacing() const
-{
-    auto const& value = property(PropertyID::LetterSpacing);
-    if (value.is_keyword() && value.to_keyword() == Keyword::Normal)
-        return 0;
-
-    return Length::from_style_value(value, Length::make_px(font_size())).absolute_length_to_px();
-}
-
-Color ComputedStyleWorkingSet::caret_color(ColorResolutionContext const& color_resolution_context) const
-{
-    auto const& value = property(PropertyID::CaretColor);
-    if (value.is_keyword() && value.to_keyword() == Keyword::Auto)
-        return color_resolution_context.current_color.value_or(InitialValues::color());
-
-    if (value.has_color())
-        return value.to_color(color_resolution_context).value();
-
-    return InitialValues::caret_color();
-}
-
-ContentVisibility ComputedStyleWorkingSet::content_visibility() const
-{
-    auto const& value = property(PropertyID::ContentVisibility);
-    return keyword_to_content_visibility(value.to_keyword()).release_value();
-}
-
-Visibility ComputedStyleWorkingSet::visibility() const
-{
-    auto const& value = property(PropertyID::Visibility);
-    if (!value.is_keyword())
-        return {};
-    return keyword_to_visibility(value.to_keyword()).release_value();
-}
-
-Display ComputedStyleWorkingSet::display() const
-{
-    auto const* value = static_cast<StyleValueFFI::StyleValueData const*>(effective_property_data(PropertyID::Display));
-    VERIFY(value->tag == StyleValueFFI::StyleValueData::Tag::Display);
-    return bit_cast<Display>(value->display.raw);
-}
-
-ListStyleType ComputedStyleWorkingSet::list_style_type(StyleScope const& style_scope) const
-{
-    auto const& value = property(PropertyID::ListStyleType);
-
-    if (value.to_keyword() == Keyword::None)
-        return Empty {};
-
-    if (value.is_string())
-        return value.as_string().string_value().to_utf16_string();
-
-    auto counter_style = value.as_counter_style().resolve_counter_style(style_scope);
-    if (counter_style)
-        return counter_style;
-
-    VERIFY(value.as_counter_style().value().has<Utf16FlyString>());
-    return UnresolvedCounterStyleName { value.as_counter_style().value().get<Utf16FlyString>() };
-}
-
-FontKerning ComputedStyleWorkingSet::font_kerning() const
-{
-    auto const& value = property(PropertyID::FontKerning);
-    return keyword_to_font_kerning(value.to_keyword()).release_value();
-}
-
-Optional<Utf16FlyString> ComputedStyleWorkingSet::font_language_override() const
-{
-    auto const& value = property(PropertyID::FontLanguageOverride);
-    if (value.is_string())
-        return value.as_string().string_value();
-    return {};
-}
-
-FontFeatureData ComputedStyleWorkingSet::font_feature_data() const
-{
-    return {
-        .font_variant_alternates = font_variant_alternates(),
-        .font_variant_caps = font_variant_caps(),
-        .font_variant_east_asian = font_variant_east_asian(),
-        .font_variant_emoji = font_variant_emoji(),
-        .font_variant_ligatures = font_variant_ligatures(),
-        .font_variant_numeric = font_variant_numeric(),
-        .font_variant_position = font_variant_position(),
-        .font_feature_settings = font_feature_settings(),
-        .font_kerning = font_kerning(),
-        .text_rendering = text_rendering(),
-    };
-}
-
-Optional<FontVariantAlternates> ComputedStyleWorkingSet::font_variant_alternates() const
-{
-    auto const& value = property(PropertyID::FontVariantAlternates);
-
-    // normal
-    if (value.is_keyword()) {
-        VERIFY(value.to_keyword() == Keyword::Normal);
-        return {};
-    }
-
-    FontVariantAlternates alternates;
-
-    for (auto const& value : value.as_value_list().values()) {
-        // historical-forms
-        if (value->is_keyword() && value->to_keyword() == Keyword::HistoricalForms) {
-            alternates.historical_forms = true;
-            continue;
-        }
-
-        if (value->is_function()) {
-            auto function_type = font_feature_value_type_from_string(value->as_function().name()).release_value();
-            auto const& names = value->as_function().value()->as_value_list().values();
-
-            for (auto const& name : names)
-                alternates.font_feature_value_entries.append({ function_type, string_from_style_value(name) });
-
-            continue;
-        }
-
-        VERIFY_NOT_REACHED();
-    }
-
-    return alternates;
-}
-
-FontVariantCaps ComputedStyleWorkingSet::font_variant_caps() const
-{
-    auto const& value = property(PropertyID::FontVariantCaps);
-    return keyword_to_font_variant_caps(value.to_keyword()).release_value();
-}
-
-Optional<FontVariantEastAsian> ComputedStyleWorkingSet::font_variant_east_asian() const
-{
-    auto const& value = property(PropertyID::FontVariantEastAsian);
-
-    if (value.to_keyword() == Keyword::Normal)
-        return {};
-
-    auto const& tuple = value.as_tuple().tuple();
-
-    FontVariantEastAsian east_asian {};
-
-    if (tuple[TupleStyleValue::Indices::FontVariantEastAsian::Variant])
-        east_asian.variant = keyword_to_east_asian_variant(tuple[TupleStyleValue::Indices::FontVariantEastAsian::Variant]->to_keyword()).value();
-
-    if (tuple[TupleStyleValue::Indices::FontVariantEastAsian::Width])
-        east_asian.width = keyword_to_east_asian_width(tuple[TupleStyleValue::Indices::FontVariantEastAsian::Width]->to_keyword()).value();
-
-    if (tuple[TupleStyleValue::Indices::FontVariantEastAsian::Ruby])
-        east_asian.ruby = true;
-
-    return east_asian;
-}
-
 FontVariantEmoji ComputedStyleWorkingSet::font_variant_emoji() const
 {
     auto const& value = property(PropertyID::FontVariantEmoji);
     return keyword_to_font_variant_emoji(value.to_keyword()).release_value();
 }
 
-Optional<FontVariantLigatures> ComputedStyleWorkingSet::font_variant_ligatures() const
+// What a font resolution reads beside the family, as a style engine request names it: the values whose property does
+// not have its initial value.
+FontResolutionFeatureValues ComputedStyleWorkingSet::font_resolution_feature_values() const
 {
-    auto const& value = property(PropertyID::FontVariantLigatures);
-
-    if (value.to_keyword() == Keyword::Normal)
-        return {};
-
-    if (value.to_keyword() == Keyword::None)
-        return FontVariantLigatures { .none = true };
-
-    auto const& tuple = value.as_tuple().tuple();
-
-    FontVariantLigatures ligatures {};
-
-    if (tuple[TupleStyleValue::Indices::FontVariantLigatures::Common])
-        ligatures.common = keyword_to_common_lig_value(tuple[TupleStyleValue::Indices::FontVariantLigatures::Common]->to_keyword()).value();
-
-    if (tuple[TupleStyleValue::Indices::FontVariantLigatures::Discretionary])
-        ligatures.discretionary = keyword_to_discretionary_lig_value(tuple[TupleStyleValue::Indices::FontVariantLigatures::Discretionary]->to_keyword()).value();
-
-    if (tuple[TupleStyleValue::Indices::FontVariantLigatures::Historical])
-        ligatures.historical = keyword_to_historical_lig_value(tuple[TupleStyleValue::Indices::FontVariantLigatures::Historical]->to_keyword()).value();
-
-    if (tuple[TupleStyleValue::Indices::FontVariantLigatures::Contextual])
-        ligatures.contextual = keyword_to_contextual_alt_value(tuple[TupleStyleValue::Indices::FontVariantLigatures::Contextual]->to_keyword()).value();
-
-    return ligatures;
+    FontResolutionFeatureValues values;
+    auto set = [&](FontResolutionFeatureInput input, PropertyID property_id, Keyword initial) {
+        auto const& value = property(property_id);
+        if (!value.is_keyword() || value.to_keyword() != initial)
+            values[to_underlying(input)] = &value;
+    };
+    set(FontResolutionFeatureInput::FontFeatureSettings, PropertyID::FontFeatureSettings, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontVariationSettings, PropertyID::FontVariationSettings, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontVariantCaps, PropertyID::FontVariantCaps, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontVariantEastAsian, PropertyID::FontVariantEastAsian, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontVariantEmoji, PropertyID::FontVariantEmoji, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontVariantLigatures, PropertyID::FontVariantLigatures, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontVariantNumeric, PropertyID::FontVariantNumeric, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontVariantPosition, PropertyID::FontVariantPosition, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontVariantAlternates, PropertyID::FontVariantAlternates, Keyword::Normal);
+    set(FontResolutionFeatureInput::FontKerning, PropertyID::FontKerning, Keyword::Auto);
+    set(FontResolutionFeatureInput::TextRendering, PropertyID::TextRendering, Keyword::Auto);
+    return values;
 }
 
-Optional<FontVariantNumeric> ComputedStyleWorkingSet::font_variant_numeric() const
+ComputedValuesFFI::FfiFontGroupBuildInputs ComputedStyleWorkingSet::font_group_build_inputs(DOM::Document const& document, TreeScopeID tree_scope) const
 {
-    auto const& value = property(PropertyID::FontVariantNumeric);
-
-    if (value.to_keyword() == Keyword::Normal)
-        return {};
-
-    auto const& tuple = value.as_tuple().tuple();
-
-    FontVariantNumeric numeric {};
-
-    if (tuple[TupleStyleValue::Indices::FontVariantNumeric::Figure])
-        numeric.figure = keyword_to_numeric_figure_value(tuple[TupleStyleValue::Indices::FontVariantNumeric::Figure]->to_keyword()).value();
-
-    if (tuple[TupleStyleValue::Indices::FontVariantNumeric::Spacing])
-        numeric.spacing = keyword_to_numeric_spacing_value(tuple[TupleStyleValue::Indices::FontVariantNumeric::Spacing]->to_keyword()).value();
-
-    if (tuple[TupleStyleValue::Indices::FontVariantNumeric::Fraction])
-        numeric.fraction = keyword_to_numeric_fraction_value(tuple[TupleStyleValue::Indices::FontVariantNumeric::Fraction]->to_keyword()).value();
-
-    if (tuple[TupleStyleValue::Indices::FontVariantNumeric::Ordinal])
-        numeric.ordinal = true;
-
-    if (tuple[TupleStyleValue::Indices::FontVariantNumeric::SlashedZero])
-        numeric.slashed_zero = true;
-
-    return numeric;
+    // FIXME: A tree-scoped name is resolved in the tree of the declaration that named it, and inherits with that
+    //        tree (css-scoping). This resolves feature value names in the element's own tree scope instead.
+    auto font_list = computed_font_list(document.font_computer(), tree_scope);
+    auto const& first_available_font = font_list->first_available_font();
+    auto const metrics = first_available_font.pixel_metrics();
+    auto math_shift = keyword_to_math_shift(property(PropertyID::MathShift).to_keyword()).release_value();
+    auto math_style = keyword_to_math_style(property(PropertyID::MathStyle).to_keyword()).release_value();
+    return {
+        .font_size_raw = font_size().raw_value(),
+        .line_height_used_raw = line_height(document.font_computer()).raw_value(),
+        .font_variant_emoji = to_underlying(font_variant_emoji()),
+        .font_ascent = metrics.ascent,
+        .font_descent = metrics.descent,
+        .font_x_height = metrics.x_height,
+        .font_zero_advance = metrics.advance_of_ascii_zero,
+        .first_available_font = &first_available_font,
+        .font_cascade_list = font_list.ptr(),
+        .font_weight = font_weight(),
+        .font_width = font_width().value(),
+        .math_shift = to_underlying(math_shift),
+        .math_style = to_underlying(math_style),
+        .math_depth = math_depth(),
+    };
 }
 
-FontVariantPosition ComputedStyleWorkingSet::font_variant_position() const
+ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer, TreeScopeID tree_scope) const
 {
-    auto const& value = property(PropertyID::FontVariantPosition);
-    return keyword_to_font_variant_position(value.to_keyword()).release_value();
-}
-
-HashMap<Utf16FlyString, u8> ComputedStyleWorkingSet::font_feature_settings() const
-{
-    auto const& value = property(PropertyID::FontFeatureSettings);
-
-    if (value.is_keyword())
-        return {}; // normal
-
-    if (value.is_value_list()) {
-        auto const& feature_tags = value.as_value_list().values();
-        HashMap<Utf16FlyString, u8> result;
-        result.ensure_capacity(feature_tags.size());
-        for (auto const& tag_value : feature_tags) {
-            auto const& feature_tag = tag_value->as_open_type_tagged();
-
-            result.set(feature_tag.tag(), int_from_style_value(feature_tag.value()));
-        }
-        return result;
-    }
-
-    return {};
-}
-
-HashMap<Utf16FlyString, double> ComputedStyleWorkingSet::font_variation_settings() const
-{
-    auto const& value = property(PropertyID::FontVariationSettings);
-
-    if (value.is_keyword())
-        return {}; // normal
-
-    if (value.is_value_list()) {
-        auto const& axis_tags = value.as_value_list().values();
-        HashMap<Utf16FlyString, double> result;
-        result.ensure_capacity(axis_tags.size());
-        for (auto const& tag_value : axis_tags) {
-            auto const& axis_tag = tag_value->as_open_type_tagged();
-
-            result.set(axis_tag.tag(), number_from_style_value(axis_tag.value(), {}));
-        }
-        return result;
-    }
-
-    return {};
-}
-
-BorderCollapse ComputedStyleWorkingSet::border_collapse() const
-{
-    auto const& value = property(PropertyID::BorderCollapse);
-    return keyword_to_border_collapse(value.to_keyword()).release_value();
-}
-
-EmptyCells ComputedStyleWorkingSet::empty_cells() const
-{
-    auto const& value = property(PropertyID::EmptyCells);
-    return keyword_to_empty_cells(value.to_keyword()).release_value();
-}
-
-Direction ComputedStyleWorkingSet::direction() const
-{
-    auto const& value = property(PropertyID::Direction);
-    return keyword_to_direction(value.to_keyword()).release_value();
-}
-
-WritingMode ComputedStyleWorkingSet::writing_mode() const
-{
-    auto const& value = property(PropertyID::WritingMode);
-    return keyword_to_writing_mode(value.to_keyword()).release_value();
-}
-
-ScrollbarColorData ComputedStyleWorkingSet::scrollbar_color(ColorResolutionContext const& color_resolution_context) const
-{
-    auto const& value = property(PropertyID::ScrollbarColor);
-    if (value.is_keyword() && value.as_keyword().keyword() == Keyword::Auto)
-        return InitialValues::scrollbar_color();
-
-    if (value.is_scrollbar_color()) {
-        auto& scrollbar_color_value = value.as_scrollbar_color();
-        auto thumb_color = scrollbar_color_value.thumb_color()->to_color(color_resolution_context).value();
-        auto track_color = scrollbar_color_value.track_color()->to_color(color_resolution_context).value();
-        return {
-            .thumb_color = thumb_color,
-            .track_color = track_color,
-            .is_auto = false,
-        };
-    }
-
-    return {};
-}
-
-ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet::computed_font_list(FontComputer const& font_computer) const
-{
-    if (!m_cached_computed_font_list) {
-        m_cached_computed_font_list = font_computer.compute_font_for_style_values(computed_font_families(), font_size(), font_slope(), font_weight(), font_width(), font_optical_sizing(), font_variation_settings(), font_feature_data());
+    if (!m_cached_computed_font_list || m_cached_computed_font_list_scope != tree_scope) {
+        m_cached_computed_font_list = resolve_font_for_style_values(font_computer,
+            {
+                .font_families = computed_font_families(),
+                .font_optical_sizing = font_optical_sizing(),
+                .font_size = font_size(),
+                .font_size_adjust = font_size_adjust(),
+                .font_slope = font_slope(),
+                .font_weight = font_weight(),
+                .font_width = font_width(),
+                .feature_values = font_resolution_feature_values(),
+                .font_feature_values_scope = tree_scope,
+            });
+        m_cached_computed_font_list_scope = tree_scope;
         VERIFY(!m_cached_computed_font_list->is_empty());
     }
 
@@ -1012,14 +545,25 @@ ValueComparingNonnullRefPtr<Gfx::FontCascadeList const> ComputedStyleWorkingSet:
 
 ValueComparingNonnullRefPtr<Gfx::Font const> ComputedStyleWorkingSet::first_available_computed_font(FontComputer const& font_computer) const
 {
+    // NB: Feature values only change how a font shapes text, not which font is first available, so the list
+    //     resolved for any tree scope answers.
     if (!m_cached_first_available_computed_font)
-        m_cached_first_available_computed_font = computed_font_list(font_computer)->first_available_font();
+        m_cached_first_available_computed_font = computed_font_list(font_computer, m_cached_computed_font_list_scope)->first_available_font();
     return *m_cached_first_available_computed_font;
 }
 
 int ComputedStyleWorkingSet::math_depth() const
 {
     return property(PropertyID::MathDepth).as_integer().integer();
+}
+
+Optional<FontSizeAdjust> ComputedStyleWorkingSet::font_size_adjust() const
+{
+    u8 metric = 0;
+    double value = 0;
+    if (!StyleValueFFI::rust_style_value_computed_font_size_adjust_number(effective_property_data(PropertyID::FontSizeAdjust), &metric, &value))
+        return {};
+    return FontSizeAdjust { static_cast<FontSizeAdjustMetric>(metric), value };
 }
 
 CSSPixels ComputedStyleWorkingSet::font_size() const

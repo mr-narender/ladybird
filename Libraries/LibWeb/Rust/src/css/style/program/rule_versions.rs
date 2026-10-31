@@ -5,14 +5,11 @@
  */
 
 use super::{CascadeLayerID, RuleID, RuleKind, RuleVersion, StyleScopeID};
-use crate::css::style::capacity::ShallowCapacityBytes;
-use crate::css::style::fast_hash::{FastMap as HashMap, fast_hasher};
-use crate::css::style::memory::{DeviceClass, MemoryCategory, MemoryController, MemoryLease};
-use std::cell::RefCell;
+use crate::css::style::fast_hash::fast_hasher;
+use crate::css::style::weak_pool::WeakPool;
 use std::hash::{Hash, Hasher};
 use std::ops::Index;
-use std::sync::Arc;
-use std::sync::Weak;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const RULE_VERSIONS_PER_PAGE: usize = 128;
 const EMPTY_VERSION: RuleVersion = RuleVersion {
@@ -29,63 +26,27 @@ const EMPTY_VERSION: RuleVersion = RuleVersion {
 struct RuleVersionPage {
     values: [RuleVersion; RULE_VERSIONS_PER_PAGE],
     shared_hash: Option<u64>,
-    _memory: MemoryLease,
 }
 
 impl RuleVersionPage {
     fn new(values: [RuleVersion; RULE_VERSIONS_PER_PAGE]) -> Self {
-        let mut memory = MemoryLease::new(MemoryCategory::RuleProgram);
-        SHARED_RULE_VERSION_PAGES.with_borrow_mut(|pool| {
-            memory.resize_required_to(&mut pool.memory, size_of::<Self>() as u64);
-        });
         Self {
             values,
             shared_hash: None,
-            _memory: memory,
         }
     }
 }
 
-impl Clone for RuleVersionPage {
-    fn clone(&self) -> Self {
-        Self::new(self.values)
-    }
+fn rule_version_pages() -> MutexGuard<'static, WeakPool<RuleVersionPage>> {
+    // Every engine interns through the same pool, from whichever thread runs it. Pages never reach
+    // back into the pool when they are dropped, so the lock is only held while interning.
+    static RULE_VERSION_PAGES: OnceLock<Mutex<WeakPool<RuleVersionPage>>> = OnceLock::new();
+    RULE_VERSION_PAGES.get_or_init(Mutex::default).lock().unwrap()
 }
 
-impl Drop for RuleVersionPage {
-    fn drop(&mut self) {
-        forget_dead_pages(self.shared_hash);
-    }
-}
-
-struct SharedRuleVersionPages {
-    by_hash: HashMap<u64, Vec<Weak<RuleVersionPage>>>,
-    memory: MemoryController,
-}
-
-thread_local! {
-    static SHARED_RULE_VERSION_PAGES: RefCell<SharedRuleVersionPages> = RefCell::new(SharedRuleVersionPages {
-        by_hash: HashMap::default(),
-        memory: MemoryController::new(DeviceClass::ForegroundDesktop),
-    });
-}
-
-fn forget_dead_pages(hash: Option<u64>) {
-    let Some(hash) = hash else { return };
-    let _ = SHARED_RULE_VERSION_PAGES.try_with(|pool| {
-        let Ok(mut pool) = pool.try_borrow_mut() else { return };
-        if let std::collections::hash_map::Entry::Occupied(mut entry) = pool.by_hash.entry(hash) {
-            entry.get_mut().retain(|page| page.strong_count() != 0);
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-        }
-    });
-}
-
-/// Rule versions contain only numeric identities. Share equal pages rather than whole tables,
-/// so appending author rules does not duplicate the common non-author prefix in every document.
-#[derive(Default)]
+/// Rule versions contain only numeric identities. Equal pages are interned through the process's
+/// pool rather than copied.
+#[derive(Clone, Default)]
 pub(super) struct RuleVersionTable {
     pages: Vec<Arc<RuleVersionPage>>,
     len: usize,
@@ -114,19 +75,20 @@ impl RuleVersionTable {
             return;
         }
         let page = &mut self.pages[index / RULE_VERSIONS_PER_PAGE];
-        let previous_hash = page.shared_hash;
-        let page = Arc::make_mut(page);
+        if Arc::get_mut(page).is_none() {
+            rule_version_pages().make_private(page.shared_hash, page, |page| RuleVersionPage::new(page.values));
+        }
+        let page = Arc::get_mut(page).expect("a private page has one owner");
         page.shared_hash = None;
         page.values[index % RULE_VERSIONS_PER_PAGE] = value;
         self.needs_sharing = true;
-        // make_mut can detach the pool's weak reference even when this was the only owner.
-        forget_dead_pages(previous_hash);
     }
 
     pub(super) fn share(&mut self) {
         if !self.needs_sharing {
             return;
         }
+        let mut pool = rule_version_pages();
         for page in &mut self.pages {
             if page.shared_hash.is_some() {
                 continue;
@@ -134,21 +96,17 @@ impl RuleVersionTable {
             let mut hasher = fast_hasher();
             page.values.hash(&mut hasher);
             let hash = hasher.finish();
-            let shared = SHARED_RULE_VERSION_PAGES.with_borrow_mut(|pool| {
-                let bucket = pool.by_hash.entry(hash).or_default();
-                bucket.retain(|candidate| candidate.strong_count() != 0);
-                if let Some(found) = bucket
-                    .iter()
-                    .filter_map(Weak::upgrade)
-                    .find(|candidate| candidate.values == page.values)
-                {
-                    return found;
-                }
-                Arc::get_mut(page).expect("an unpublished page is private").shared_hash = Some(hash);
-                bucket.push(Arc::downgrade(page));
-                Arc::clone(page)
-            });
-            *page = shared;
+            if let Some(found) = pool.find(hash, |candidate| candidate.values == page.values) {
+                *page = found;
+                continue;
+            }
+            // A clone of the table, as a fork of the style engine, holds the unpublished page too, and publishes a
+            // copy of its own.
+            if Arc::get_mut(page).is_none() {
+                *page = Arc::new(RuleVersionPage::new(page.values));
+            }
+            Arc::get_mut(page).expect("a private page has one owner").shared_hash = Some(hash);
+            pool.insert(hash, page);
         }
         self.needs_sharing = false;
     }
@@ -160,13 +118,6 @@ impl Index<usize> for RuleVersionTable {
     fn index(&self, index: usize) -> &Self::Output {
         assert!(index < self.len);
         &self.pages[index / RULE_VERSIONS_PER_PAGE].values[index % RULE_VERSIONS_PER_PAGE]
-    }
-}
-
-impl ShallowCapacityBytes for RuleVersionTable {
-    fn shallow_capacity_bytes(&self) -> u64 {
-        // Page allocations are charged once to the process ledger, including private pages.
-        self.pages.shallow_capacity_bytes()
     }
 }
 
@@ -204,6 +155,20 @@ mod tests {
         drop(second);
         let third = make_table();
         for (left, right) in first.pages.iter().zip(&third.pages) {
+            assert!(Arc::ptr_eq(left, right));
+        }
+    }
+
+    #[test]
+    fn a_clone_shares_the_unpublished_pages_it_holds_with_the_original() {
+        let mut table = RuleVersionTable::default();
+        for index in 0..RULE_VERSIONS_PER_PAGE + 1 {
+            table.push(RuleVersion::new(RuleID(0x5ee7_0000 + index as u32), RuleKind::Style));
+        }
+        let mut clone = table.clone();
+        clone.share();
+        table.share();
+        for (left, right) in table.pages.iter().zip(&clone.pages) {
             assert!(Arc::ptr_eq(left, right));
         }
     }

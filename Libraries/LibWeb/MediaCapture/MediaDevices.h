@@ -14,6 +14,7 @@
 #include <AK/Vector.h>
 #include <LibGC/Forward.h>
 #include <LibGC/Root.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/Bindings/MediaStreamConstraints.h>
 #include <LibWeb/DOM/EventTarget.h>
@@ -35,6 +36,10 @@ class MediaDevices final : public DOM::EventTarget {
     GC_DECLARE_ALLOCATOR(MediaDevices);
 
 public:
+    // Ends every live track once the document may no longer use the microphone.
+    void end_tracks_without_permission();
+    void track_was_cloned(Badge<MediaStreamTrack>, MediaStreamTrack& clone);
+
     [[nodiscard]] static GC::Ref<MediaDevices> create(HTML::Window&);
 
     MediaTrackSupportedConstraints get_supported_constraints();
@@ -83,6 +88,10 @@ private:
     void run_device_change_notification_steps(Vector<StoredDevice> const& device_list);
     static Vector<StoredDevice> current_audio_device_snapshot();
     void did_observe_audio_device_cache_update();
+    // Runs the callback once the process has a device list fetched from now on, or at once where no list ever comes.
+    void run_with_fresh_audio_device_list(GC::Ref<GC::Function<void()>>);
+    void end_tracks_of_removed_devices();
+    void end_tracks(GC::RootVector<GC::Ref<MediaStreamTrack>>);
     virtual void visit_edges(Cell::Visitor&) override;
 
     GC::Ref<HTML::Window> m_window;
@@ -100,10 +109,11 @@ private:
     // [[canExposeMicrophoneInfo]]
     bool m_can_expose_microphone_info { false };
     // [[mediaStreamTrackSources]]
-    // FIXME: Replace provider IDs with concrete source objects when MediaCapture source modeling lands.
-    HashTable<u64> m_media_stream_track_sources;
+    // FIXME: Replace the tracks with concrete source objects when MediaCapture source modeling lands.
+    Vector<GC::Weak<MediaStreamTrack>> m_media_stream_track_sources;
     Vector<PendingEnumerateDevicesRequest> m_pending_enumerate_devices_requests;
     Vector<PendingGetUserMediaRequest> m_pending_get_user_media_requests;
+    Vector<GC::Ref<GC::Function<void()>>> m_awaiting_fresh_audio_device_list;
     GC::Ptr<DOM::IDLEventListener> m_pending_request_state_change_listener;
     Optional<u64> m_audio_device_cache_listener_id;
 };

@@ -74,15 +74,14 @@ public:
         case WebView::ActionID::ToggleVerticalTabsExpanded:
             if (auto* parent = as_if<QWidget>(m_action->parent())) {
                 auto const& tab_settings = WebView::Application::settings().tab_settings();
-                auto icon = tab_settings.vertical_tabs_position == WebView::VerticalTabsPosition::Right
-                    ? (action.engaged() ? ChromeIcon::VerticalTabBarCollapseRight : ChromeIcon::VerticalTabBarExpandRight)
-                    : (action.engaged() ? ChromeIcon::VerticalTabBarCollapse : ChromeIcon::VerticalTabBarExpand);
+                auto icon = tab_settings.vertical_tabs_position == WebView::VerticalTabsPosition::Right ? ChromeIcon::SidebarRight : ChromeIcon::Sidebar;
                 m_action->setIcon(create_chrome_icon(icon, parent->palette()));
             }
             break;
 
         case WebView::ActionID::ToggleBookmark:
         case WebView::ActionID::ToggleBookmarkViaToolbar:
+            // A bookmarked page's star is filled in.
             if (auto* parent = as_if<QWidget>(m_action->parent())) {
                 auto icon = action.engaged() ? ChromeIcon::StarFilled : ChromeIcon::Star;
                 m_action->setIcon(create_chrome_icon(icon, parent->palette()));
@@ -111,7 +110,7 @@ private:
                     action->set_checked(checked);
                 action->activate();
 
-                if (action->id() == WebView::ActionID::BookmarkItem) {
+                if (first_is_one_of(action->id(), WebView::ActionID::BookmarkItem, WebView::ActionID::Reload, WebView::ActionID::ReloadBypassingCache)) {
                     if (auto* active_tab = Application::the().active_tab())
                         active_tab->view().setFocus();
                 }
@@ -156,7 +155,7 @@ static void add_properties(QObject& object, T& menu_or_action)
         object.setProperty(key.to_byte_string().characters(), qstring_from_ak_string(value));
 }
 
-static void initialize_native_control(WebView::Action& action, QAction& qaction, QPalette const& palette, IncludeActionIcon include_action_icon, IncludeActionShortcut include_action_shortcut)
+static void initialize_native_control(WebView::Action& action, QAction& qaction, QPalette const& palette, IncludeActionIcon include_action_icon)
 {
     static constexpr int const MENU_ICON_SIZE = 16;
 
@@ -176,10 +175,21 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
             qaction.setIcon(create_chrome_icon(ChromeIcon::Reload, palette));
         qaction.setShortcuts({ QKeySequence(Qt::CTRL | Qt::Key_R), QKeySequence(Qt::Key_F5) });
         break;
+    case WebView::ActionID::ReloadBypassingCache:
+#if defined(AK_OS_MACOS)
+        qaction.setShortcuts({ QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_R), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R) });
+#else
+        qaction.setShortcuts({ QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R), QKeySequence(Qt::CTRL | Qt::Key_F5) });
+#endif
+        break;
     case WebView::ActionID::ViewDownloads:
         if (include_action_icon == IncludeActionIcon::Yes)
             qaction.setIcon(create_chrome_icon(ChromeIcon::Download, palette));
+#if defined(AK_OS_MACOS)
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_L));
+#else
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::Key_J));
+#endif
         break;
 
     case WebView::ActionID::Undo:
@@ -210,15 +220,22 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         if (include_action_icon == IncludeActionIcon::Yes)
             qaction.setIcon(create_chrome_icon(action.engaged() ? ChromeIcon::StarFilled : ChromeIcon::Star, palette));
         break;
-    case WebView::ActionID::AddBookmarkAllTabs:
-        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_D));
-        break;
     case WebView::ActionID::ToggleBookmarksBar:
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_B));
         break;
+    case WebView::ActionID::ToggleVerticalTabsExpanded:
+#if defined(AK_OS_MACOS)
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_S));
+#else
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S));
+#endif
+        break;
+    case WebView::ActionID::AddBookmarkAllTabs:
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_D));
+        break;
     case WebView::ActionID::BookmarkItem:
         if (auto icon = action.png_icon(); icon.has_value())
-            qaction.setIcon(icon_from_png(icon->bytes(), MENU_ICON_SIZE));
+            qaction.setIcon(favicon_with_rounded_corners(icon_from_png(icon->bytes(), MENU_ICON_SIZE), MENU_ICON_SIZE));
         else
             qaction.setIcon(create_chrome_icon(ChromeIcon::Globe, palette));
         break;
@@ -228,6 +245,13 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Y));
 #else
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::Key_H));
+#endif
+        break;
+    case WebView::ActionID::ManageBookmarks:
+#if defined(AK_OS_MACOS)
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_B));
+#else
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O));
 #endif
         break;
     case WebView::ActionID::ClearBrowsingData:
@@ -255,7 +279,11 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         });
         break;
     case WebView::ActionID::ViewSource:
+#if defined(AK_OS_MACOS)
+        qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_U));
+#else
         qaction.setShortcut(QKeySequence(Qt::CTRL | Qt::Key_U));
+#endif
         break;
 
     case WebView::ActionID::ZoomIn: {
@@ -279,7 +307,7 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         break;
     }
 
-    qaction.setShortcutVisibleInContextMenu(include_action_shortcut == IncludeActionShortcut::Yes);
+    qaction.setShortcutVisibleInContextMenu(true);
 
     if (action.is_checkable())
         qaction.setCheckable(true);
@@ -288,7 +316,7 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
     add_properties(qaction, action);
 }
 
-static void add_items_to_menu(QMenu& qmenu, QWidget& parent, WebView::Menu& menu, IncludeActionShortcut include_action_shortcut)
+static void add_items_to_menu(QMenu& qmenu, QWidget& parent, WebView::Menu& menu)
 {
     menu.add_observer(MenuObserver::create(qmenu));
     add_properties(qmenu, menu);
@@ -296,12 +324,12 @@ static void add_items_to_menu(QMenu& qmenu, QWidget& parent, WebView::Menu& menu
     for (auto& menu_item : menu.items()) {
         menu_item.visit(
             [&](NonnullRefPtr<WebView::Action>& action) {
-                auto* qaction = create_application_action(parent, action, IncludeActionIcon::No, include_action_shortcut);
+                auto* qaction = create_application_action(parent, action, IncludeActionIcon::No);
                 qmenu.addAction(qaction);
             },
             [&](NonnullRefPtr<WebView::Menu> const& submenu) {
                 auto* qsubmenu = new QMenu(qstring_from_ak_string(submenu->title()), &qmenu);
-                add_items_to_menu(*qsubmenu, parent, submenu, include_action_shortcut);
+                add_items_to_menu(*qsubmenu, parent, submenu);
 
                 if (submenu->render_group_icon())
                     qsubmenu->setIcon(create_chrome_icon(ChromeIcon::Folder, parent.palette()));
@@ -319,7 +347,7 @@ static void add_items_to_menu(QMenu& qmenu, QWidget& parent, WebView::Menu& menu
 #endif
 }
 
-static QAction* create_session_history_traversal_menu_action(QMenu& menu, WebContentView& view, WebView::ViewImplementation::SessionHistoryTraversalMenuItem const& item)
+static QAction* create_session_history_traversal_menu_action(QMenu& menu, WebView::ViewImplementation::SessionHistoryTraversalMenuItem const& item)
 {
     static constexpr int const MENU_ICON_SIZE = 16;
 
@@ -329,9 +357,7 @@ static QAction* create_session_history_traversal_menu_action(QMenu& menu, WebCon
         action->setIcon(icon_from_png(item.favicon_png->bytes(), MENU_ICON_SIZE));
     else
         action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
-    QObject::connect(action, &QAction::triggered, &view, [&view, step = item.step] {
-        view.traverse_the_history_to_step(step);
-    });
+    action->setData(item.step);
     return action;
 }
 
@@ -342,7 +368,7 @@ static bool append_session_history_traversal_menu_items(QMenu& menu, WebContentV
         return false;
 
     for (auto const& item : items)
-        menu.addAction(create_session_history_traversal_menu_action(menu, view, item));
+        menu.addAction(create_session_history_traversal_menu_action(menu, item));
 
 #if defined(AK_OS_MACOS)
     enable_menu_icons(menu);
@@ -357,17 +383,17 @@ void populate_session_history_traversal_menu(QMenu& menu, WebContentView& view, 
     append_session_history_traversal_menu_items(menu, view, direction);
 }
 
-QMenu* create_application_menu(QWidget& parent, WebView::Menu& menu, IncludeActionShortcut include_action_shortcut)
+QMenu* create_application_menu(QWidget& parent, WebView::Menu& menu)
 {
     auto* application_menu = new QMenu(qstring_from_ak_string(menu.title()), &parent);
-    add_items_to_menu(*application_menu, parent, menu, include_action_shortcut);
+    add_items_to_menu(*application_menu, parent, menu);
     return application_menu;
 }
 
-void repopulate_application_menu(QMenu& menu, QWidget& parent, WebView::Menu& source, IncludeActionShortcut include_action_shortcut)
+void repopulate_application_menu(QMenu& menu, QWidget& parent, WebView::Menu& source)
 {
     menu.clear();
-    add_items_to_menu(menu, parent, source, include_action_shortcut);
+    add_items_to_menu(menu, parent, source);
 }
 
 static void insert_dynamic_history_action(QMenu& menu, QAction* before, QAction& action)
@@ -435,7 +461,7 @@ void update_history_menu(QMenu& menu, WebContentView* view)
     insert_dynamic_history_action(menu, insertion_point, *create_history_navigation_action(menu, *view, view->navigate_forward_action(), QKeySequence::StandardKey::Forward));
     insert_dynamic_history_action(menu, insertion_point, *create_dynamic_history_separator(menu));
 
-    auto entries = view->session().history_store->list_entries({}, 0, RECENT_HISTORY_MENU_ITEM_LIMIT);
+    auto entries = view->recent_history_entries(RECENT_HISTORY_MENU_ITEM_LIMIT);
     for (auto const& entry : entries) {
         auto* action = create_recent_history_menu_action(menu, *view, entry);
         insert_dynamic_history_action(menu, insertion_point, *action);
@@ -451,21 +477,28 @@ void update_history_menu(QMenu& menu, WebContentView* view)
 
 QMenu* create_context_menu(QWidget& parent, WebContentView& view, WebView::Menu& menu)
 {
-    auto* application_menu = create_application_menu(parent, menu, IncludeActionShortcut::No);
+    auto* application_menu = create_application_menu(parent, menu);
 
     menu.on_activation = [view = QPointer { &view }, application_menu = QPointer { application_menu }](Gfx::IntPoint position) {
         if (view && application_menu)
-            application_menu->exec(view->map_point_to_global_position(position));
+            execute_context_menu(*application_menu, view->map_point_to_global_position(position));
     };
 
     return application_menu;
 }
 
-QAction* create_application_action(QWidget& parent, WebView::Action& action, IncludeActionIcon include_action_icon, IncludeActionShortcut include_action_shortcut)
+QAction* create_application_action(QWidget& parent, WebView::Action& action, IncludeActionIcon include_action_icon)
 {
     auto* qaction = new QAction(&parent);
-    initialize_native_control(action, *qaction, parent.palette(), include_action_icon, include_action_shortcut);
+    initialize_native_control(action, *qaction, parent.palette(), include_action_icon);
     return qaction;
 }
+
+#if !defined(AK_OS_MACOS)
+void execute_context_menu(QMenu& menu, QPoint const& global_position)
+{
+    menu.exec(global_position);
+}
+#endif
 
 }

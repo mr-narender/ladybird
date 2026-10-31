@@ -15,10 +15,10 @@
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
 #include <AK/Time.h>
-#include <LibMedia/CodecParameters.h>
-#include <LibMedia/Codecs/AAC.h>
-#include <LibMedia/Color/CodingIndependentCodePoints.h>
 #include <LibMedia/Track.h>
+#include <LibMediaCodecs/CodecParameters.h>
+#include <LibMediaCodecs/Codecs/AAC.h>
+#include <LibMediaCodecs/Color/CodingIndependentCodePoints.h>
 
 namespace Media::Matroska {
 
@@ -64,6 +64,23 @@ public:
         Control = 32,
         Metadata = 33,
     };
+
+    static TrackType track_type_from_element_value(u64 value)
+    {
+        switch (value) {
+        case Video:
+        case Audio:
+        case Complex:
+        case Logo:
+        case Subtitle:
+        case Buttons:
+        case Control:
+        case Metadata:
+            return static_cast<TrackType>(value);
+        default:
+            return Invalid;
+        }
+    }
 
     enum class ColorRange : u8 {
         Unspecified = 0,
@@ -179,17 +196,16 @@ inline TrackType track_type_from_matroska_track_type(TrackEntry::TrackType type)
     case TrackEntry::TrackType::Audio:
         return TrackType::Audio;
     case TrackEntry::TrackType::Subtitle:
+    case TrackEntry::TrackType::Metadata:
         return TrackType::Subtitles;
     case TrackEntry::TrackType::Invalid:
-        return TrackType::Unknown;
     case TrackEntry::TrackType::Complex:
     case TrackEntry::TrackType::Logo:
     case TrackEntry::TrackType::Buttons:
     case TrackEntry::TrackType::Control:
-    case TrackEntry::TrackType::Metadata:
-        break;
+        return TrackType::Unknown;
     }
-    VERIFY_NOT_REACHED();
+    return TrackType::Unknown;
 }
 
 struct AACCodecIdentifier {

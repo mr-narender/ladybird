@@ -28,8 +28,12 @@ namespace Web::UIEvents {
 
 class PointerEvent;
 
+// https://w3c.github.io/pointerevents/#dom-pointerevent-pointerid
+// The mouse is the one pointer there is, and this is its id in every pointer event of it.
+constexpr WebIDL::Long mouse_pointer_id = 0;
+
 struct PointerEventOptions : public MouseEventOptions {
-    WebIDL::Long pointer_id { 0 };
+    WebIDL::Long pointer_id { mouse_pointer_id };
     double width { 1 };
     double height { 1 };
     float pressure { 0 };
@@ -42,8 +46,8 @@ struct PointerEventOptions : public MouseEventOptions {
     Utf16FlyString pointer_type {};
     bool is_primary { false };
     WebIDL::Long persistent_device_id { 0 };
-    Vector<GC::Ref<PointerEvent>> coalesced_events;
-    Vector<GC::Ref<PointerEvent>> predicted_events;
+    GC::RootVector<GC::Ref<PointerEvent>> coalesced_events;
+    GC::RootVector<GC::Ref<PointerEvent>> predicted_events;
 };
 
 // https://w3c.github.io/pointerevents/#pointerevent-interface
@@ -77,6 +81,13 @@ public:
     double client_y() const override;
     double offset_x() const override;
     double offset_y() const override;
+
+    // https://w3c.github.io/pointerevents/#attributes-and-default-actions
+    // Many user agents expose non-standard attributes fromElement and toElement in MouseEvents to support legacy content.
+    // We encourage those user agents to set the values of those (inherited) attributes in PointerEvents to null to
+    // transition authors to the use of standardized alternates (target and relatedTarget).
+    virtual GC::Ptr<DOM::Node> from_element() const override { return nullptr; }
+    virtual GC::Ptr<DOM::Node> to_element() const override { return nullptr; }
 
     WebIDL::Long pointer_id() const { return m_pointer_id; }
     double width() const { return m_width; }

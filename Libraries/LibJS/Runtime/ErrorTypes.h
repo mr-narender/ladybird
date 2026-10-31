@@ -79,6 +79,7 @@
     M(IntlTemporalFormatRangeTypeMismatch, "Cannot format a date-time range with different date-time types")                        \
     M(IntlTemporalInvalidCalendar, "Cannot format {} with calendar '{}' in locale with calendar '{}'")                              \
     M(IntlTemporalZonedDateTime, "Cannot format Temporal.ZonedDateTime, use Temporal.ZonedDateTime.prototype.toLocaleString")       \
+    M(IntlUnsupportedLanguageTag, "{} is not a supported language tag")                                                             \
     M(InvalidAssignToConst, "Invalid assignment to const variable")                                                                 \
     M(InvalidCodePoint, "Invalid code point {}, must be an integer no less than 0 and no greater than 0x10FFFF")                    \
     M(InvalidEnumerationValue, "Invalid value '{}' for enumeration type '{}'")                                                      \
@@ -124,6 +125,7 @@
     M(NotIterable, "{} is not iterable")                                                                                            \
     M(NotObjectCoercible, "{} cannot be converted to an object")                                                                    \
     M(NotUndefined, "{} is not undefined")                                                                                          \
+    M(NumberIsLargerThanMaxSafeNumber, "{} must be less than 2^53")                                                                 \
     M(NumberIsNaN, "{} must not be NaN")                                                                                            \
     M(NumberIsNaNOrInfinity, "Number must not be NaN or Infinity")                                                                  \
     M(NumberIsNegative, "{} must not be negative")                                                                                  \

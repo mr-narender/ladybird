@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/HTMLAreaElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLMapElement.h>
@@ -27,25 +28,25 @@ void HTMLMapElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_areas);
 }
 
-// https://html.spec.whatwg.org/multipage/image-maps.html#image-map-processing-model
-GC::Ptr<HTMLAreaElement> HTMLMapElement::area_for_point(CSSPixelPoint point, CSSPixelSize image_size)
+void HTMLMapElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
-    // 3. Otherwise, the user agent must collect all the area elements that are descendants of the map. Let areas
-    //    be that list.
-    // Pointing device interaction with an image associated with a set of layered shapes per the above algorithm
-    // must result in the relevant user interaction events being first fired to the top-most shape covering the
-    // point that the pointing device indicated, if any, or to the image element itself, if there is no shape
-    // covering that point.
-    // NB: The shapes are layered in reverse tree order, so the top-most shape covering the point belongs to the
-    //     first area element in tree order whose shape contains the point.
-    GC::Ptr<HTMLAreaElement> hit_area;
-    for_each_in_subtree_of_type<HTMLAreaElement>([&](HTMLAreaElement& area) {
-        if (!area.shape_contains_point(point, image_size))
-            return TraversalDecision::Continue;
-        hit_area = area;
-        return TraversalDecision::Break;
-    });
-    return hit_area;
+    Base::attribute_changed(name, old_value, value, namespace_);
+
+    // NB: A map is named by its name or its id, so either can change which images are associated with it.
+    if (name.is_one_of(HTML::AttributeNames::name, HTML::AttributeNames::id))
+        document().set_image_map_areas_need_publication();
+}
+
+void HTMLMapElement::inserted()
+{
+    Base::inserted();
+    document().set_image_map_areas_need_publication();
+}
+
+void HTMLMapElement::removed_from(IsSubtreeRoot is_subtree_root, DOM::Node* old_ancestor, DOM::Node& old_root)
+{
+    Base::removed_from(is_subtree_root, old_ancestor, old_root);
+    document().set_image_map_areas_need_publication();
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#get-the-focusable-area
@@ -61,10 +62,10 @@ GC::Ptr<HTMLImageElement> HTMLMapElement::first_image_with_focusable_shapes() co
     });
 }
 
-GC::Ptr<HTMLImageElement> HTMLMapElement::first_painted_image_with_focusable_shapes() const
+GC::Ptr<HTMLImageElement> HTMLMapElement::first_painted_image_with_focusable_shapes(Layout::BegunRead const& read) const
 {
-    return first_associated_image_matching([](HTMLImageElement& image_element) {
-        auto const* layout_node = image_element.layout_node();
+    return first_associated_image_matching([&read](HTMLImageElement& image_element) {
+        auto const* layout_node = image_element.layout_node(read);
         return layout_node && Painting::has_committed_box(*layout_node) && !image_element.is_inert();
     });
 }

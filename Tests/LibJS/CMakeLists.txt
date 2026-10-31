@@ -1,12 +1,5 @@
-ladybird_test(test-value-js.cpp LibJS LIBS LibJS LibUnicode)
-ladybird_test(test-primitive-string.cpp LibJS LIBS LibJS LibGC)
-ladybird_test(test-bytecode-cache.cpp LibJS LIBS LibCrypto LibFileSystem LibGC LibJS)
-ladybird_test(test-slow-path-result.cpp LibJS LIBS LibJS)
-ladybird_test(test-debugger.cpp LibJS LIBS LibGC LibJS)
-ladybird_test(test-native-function-table.cpp LibJS LIBS LibGC LibJS)
-ladybird_test(test-type-error-realm.cpp LibJS LIBS LibGC LibJS)
+ladybird_utility(test-js-runtime SOURCES test-js-runtime.cpp LIBS LibJSStandalone LibMain)
 
-ladybird_testjs_test(test-js.cpp test-js NAME test-js-runtime NO_TEST LIBS LibGC)
 ladybird_utility(test-js SOURCES test-js-main.cpp LIBS LibMain)
 ladybird_windows_bin(test-js CONSOLE)
 target_compile_definitions(test-js PRIVATE TEST_JS_PYTHON="${Python3_EXECUTABLE}")
@@ -20,3 +13,29 @@ add_custom_command(
 add_dependencies(test-js test-js-runtime test-js-script js)
 add_test(NAME test-js COMMAND test-js)
 set_tests_properties(test-js PROPERTIES ENVIRONMENT "LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR}")
+
+# The JIT's tests: the runtime tests (each run three times, so that the functions they call get compiled with
+# feedback) and the programs in Tests/LibJS/JIT/programs, under the fast tier of JIT stress modes and compared with the
+# interpreter; and the checks of the IR the JIT's passes produce. Tests/LibJS/JIT/matrix.py runs more modes and suites.
+if (ENABLE_JS_JIT)
+    cmake_host_system_information(RESULT logical_core_count QUERY NUMBER_OF_LOGICAL_CORES)
+    add_test(
+        NAME test-js-jit
+        COMMAND "${Python3_EXECUTABLE}" "${ladybird_SOURCE_DIR}/Tests/LibJS/JIT/matrix.py" --build "${CMAKE_BINARY_DIR}"
+            --modes fast --suites test-js,programs --results "${CMAKE_BINARY_DIR}/Testing/jit-matrix"
+            --jobs ${logical_core_count}
+    )
+    add_test(
+        NAME test-jit-ir
+        COMMAND "${Python3_EXECUTABLE}" "${ladybird_SOURCE_DIR}/Tests/LibJS/JIT/irtest.py" --build "${CMAKE_BINARY_DIR}"
+    )
+endif()
+
+add_custom_target(test-js-debugger ALL DEPENDS js "${CMAKE_BINARY_DIR}/bin/test-js-debugger")
+add_custom_command(
+    OUTPUT "${CMAKE_BINARY_DIR}/bin/test-js-debugger"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-debugger.py" "${CMAKE_BINARY_DIR}/bin/test-js-debugger"
+    DEPENDS "${ladybird_SOURCE_DIR}/Tests/LibJS/test-js-debugger.py"
+)
+add_test(NAME test-js-debugger COMMAND "${Python3_EXECUTABLE}" "${CMAKE_BINARY_DIR}/bin/test-js-debugger")
+set_tests_properties(test-js-debugger PROPERTIES ENVIRONMENT LADYBIRD_SOURCE_DIR=${LADYBIRD_SOURCE_DIR})

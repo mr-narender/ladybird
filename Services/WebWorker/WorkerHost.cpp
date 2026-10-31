@@ -12,16 +12,18 @@
 #include <LibWeb/Bindings/MessageEvent.h>
 #include <LibWeb/Bindings/SharedWorkerGlobalScope.h>
 #include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Fetch/Fetching/ClientContextSnapshots.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
+#include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
-#include <LibWeb/HTML/Scripting/EnvironmentSettingsSnapshot.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/Fetching.h>
+#include <LibWeb/HTML/Scripting/RemoteEnvironmentSettings.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Scripting/WorkerEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/SharedWorkerGlobalScope.h>
@@ -67,8 +69,12 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
     auto unsafe_worker_creation_time = Web::HighResolutionTime::unsafe_shared_current_time();
 
     // 5. Let realm execution context be the result of creating a new realm given agent and the following customizations:
+    // NB: A dedicated worker's agent is in its owner's agent cluster. A shared worker's is in a new one, whose
+    //     cross-origin isolation mode is "none" until the worker's response sets it.
+    auto agent_cluster_cross_origin_isolation_mode = is_shared ? Web::HTML::CrossOriginIsolationMode::None : outside_settings_snapshot.agent_cluster_cross_origin_isolation_mode;
     auto realm_execution_context = Web::Bindings::create_a_new_javascript_realm(
         Web::Bindings::main_thread_vm(),
+        agent_cluster_cross_origin_isolation_mode,
         [page, is_shared](JS::Realm& realm) -> GC::Ref<JS::Object> {
             // For the global object, if is shared is true, create a new SharedWorkerGlobalScope object.
             if (is_shared) {
@@ -115,22 +121,13 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
     // 8. Set worker global scope's name to options["name"].
     worker_global_scope->set_name(m_name);
 
-    // IMPLEMENTATION DEFINED: We need an object to represent the fetch response's client
-    auto outside_settings = GC::Heap::the().allocate<Web::HTML::EnvironmentSettingsSnapshot>(inside_settings->realm_execution_context().copy(), outside_settings_snapshot);
-
-    // HACK: The environment settings object used for the worker script fetch should have a Window as its global scope,
-    //       but the EnvironmentSettingsSnapshot used here has a WorkerGlobalScope (we don't have access to a Window).
-    //       This causes the Referrer-Policy spec's "determine request's referrer" algorithm to read the ESO's creation
-    //       URL, whereas it would normally read the document's URL. To hack around this, we overwrite the creation URL
-    //       (which is only used in the initial worker script fetch).
-    if (auto const* window = outside_settings_snapshot.global.get_pointer<Web::HTML::SerializedWindow>())
-        outside_settings->creation_url = window->associated_document.url;
+    auto outside_settings = Web::HTML::RemoteEnvironmentSettings::create(outside_settings_snapshot);
 
     // 10. If is shared is true, then:
     if (is_shared) {
         auto& shared_global_scope = static_cast<Web::HTML::SharedWorkerGlobalScope&>(*worker_global_scope);
         // 1. Set worker global scope's constructor origin to outside settings's origin.
-        shared_global_scope.set_constructor_origin(outside_settings->origin());
+        shared_global_scope.set_constructor_origin(outside_settings->settings.origin);
 
         // 2. Set worker global scope's constructor URL to url.
         shared_global_scope.set_constructor_url(m_url);
@@ -149,10 +146,10 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
                                  : Web::Fetch::Infrastructure::Request::Destination::Worker;
 
     // In both cases, let performFetch be the following perform the fetch hook given request, isTopLevel, and processCustomFetchResponse:
-    auto perform_fetch_function = [inside_settings, worker_global_scope, is_shared](GC::Ref<Web::Fetch::Infrastructure::Request> request, Web::HTML::TopLevelModule is_top_level, Web::Fetch::Infrastructure::FetchAlgorithms::ProcessResponseConsumeBodyFunction process_custom_fetch_response) -> Web::WebIDL::ExceptionOr<void> {
+    auto perform_fetch_function = [inside_settings, outside_settings, worker_global_scope, is_shared](NonnullRefPtr<Web::Fetch::Infrastructure::Request> request, Web::HTML::TopLevelModule is_top_level, Web::Fetch::Infrastructure::FetchAlgorithms::ProcessResponseConsumeBodyFunction process_custom_fetch_response) -> Web::WebIDL::ExceptionOr<void> {
         auto& realm = inside_settings->realm();
 
-        Web::Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+        Web::Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Web::Fetch::Engine::BodyIntent::ConsumeForCallback };
 
         // 1. If isTopLevel is false, fetch request with processResponseConsumeBody set to processCustomFetchResponse,
         //    and abort these steps.
@@ -163,7 +160,7 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
         }
 
         // 2. Set request's reserved client to inside settings.
-        request->set_reserved_client(GC::Ptr<Web::HTML::EnvironmentSettingsObject>(inside_settings));
+        request->set_reserved_client_snapshot(Web::Fetch::Fetching::snapshot_reserved_client_context(*inside_settings));
 
         // NB: We need to store the process custom fetch response function on the heap here, because we're storing it
         //     in another heap function
@@ -171,11 +168,11 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
 
         // 3. Fetch request with processResponseConsumeBody set to the following steps given response response and
         //    null, failure, or a byte sequence bodyBytes:
-        fetch_algorithms_input.process_response_consume_body = [worker_global_scope, process_custom_fetch_response_function, inside_settings, is_shared](auto response, auto body_bytes) {
-            // 1. Set worker global scope's url to response's url.
+        fetch_algorithms_input.process_response_consume_body = [worker_global_scope, process_custom_fetch_response_function, inside_settings, outside_settings, is_shared](auto response, auto body_bytes) {
+            // 1. Set worker global scope's url to response's URL.
             worker_global_scope->set_url(response->url().value_or({}));
 
-            // 2. Set inside settings's creation URL to response's url.
+            // 2. Set inside settings's creation URL to response's URL.
             inside_settings->creation_url = worker_global_scope->url();
 
             // 3. Initialize worker global scope's policy container given worker global scope, response, and inside
@@ -185,23 +182,38 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
             // 4. If the Run CSP initialization for a global object algorithm returns "Blocked" when executed upon
             //    worker global scope, set response to a network error. [CSP]
             if (worker_global_scope->run_csp_initialization() == Web::ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
-                response = Web::Fetch::Infrastructure::Response::network_error("Blocked by Content Security Policy"_string);
+                response = Web::Fetch::Infrastructure::ResponseView::network_error("Blocked by Content Security Policy"_string);
             }
 
-            // FIXME: Use worker global scope's policy container's embedder policy
-            // FIXME: 5. If worker global scope's embedder policy's value is compatible with cross-origin isolation and is shared is true,
-            //    then set agent's agent cluster's cross-origin isolation mode to "logical" or "concrete".
-            //    The one chosen is implementation-defined.
-            // FIXME: 6. If the result of checking a global object's embedder policy with worker global scope, outside settings,
+            // 5. If worker global scope's embedder policy's value is compatible with cross-origin isolation and is
+            //    shared is true, then set agent's agent cluster's cross-origin isolation mode to "logical" or
+            //    "concrete". The one chosen is implementation-defined.
+            // AD-HOC: Nothing sets worker global scope's embedder policy. This reads its policy container's embedder
+            //         policy instead. See https://github.com/whatwg/html/issues/11316.
+            // NB: This chooses "concrete", as the UI process does for a browsing context group.
+            if (Web::HTML::is_compatible_with_cross_origin_isolation(worker_global_scope->policy_container()->embedder_policy.value) && is_shared)
+                inside_settings->set_agent_cluster_cross_origin_isolation_mode(Web::HTML::CrossOriginIsolationMode::Concrete);
+
+            // 6. If the result of checking a global object's embedder policy with worker global scope, outside settings,
             //    and response is false, then set response to a network error.
-            // FIXME: 7. Set worker global scope's cross-origin isolated capability to true if agent's agent cluster's cross-origin
-            //    isolation mode is "concrete".
+            if (!worker_global_scope->check_embedder_policy(outside_settings->settings.policy_container.embedder_policy))
+                response = Web::Fetch::Infrastructure::ResponseView::network_error("Blocked by Cross-Origin-Embedder-Policy"_string);
+
+            // 7. Set worker global scope's cross-origin isolated capability to true if agent's agent cluster's
+            //    cross-origin isolation mode is "concrete".
+            worker_global_scope->set_cross_origin_isolated_capability(inside_settings->agent_cluster_cross_origin_isolation_mode() == Web::HTML::CrossOriginIsolationMode::Concrete);
 
             if (!is_shared) {
-                // FIXME: 8. If is shared is false and owner's cross-origin isolated capability is false, then set worker
-                //     global scope's cross-origin isolated capability to false.
-                // FIXME: 9. If is shared is false and response's url's scheme is "data", then set worker global scope's
-                //     cross-origin isolated capability to false.
+                // 8. If is shared is false and owner's cross-origin isolated capability is false, then set worker
+                //    global scope's cross-origin isolated capability to false.
+                // NB: owner's relevant settings object is outside settings.
+                if (outside_settings->settings.cross_origin_isolated_capability == Web::HTML::CanUseCrossOriginIsolatedAPIs::No)
+                    worker_global_scope->set_cross_origin_isolated_capability(false);
+
+                // 9. If is shared is false and response's URL's scheme is "data", then set worker global scope's
+                //    cross-origin isolated capability to false.
+                if (auto const& response_url = response->url(); response_url.has_value() && response_url->scheme() == "data"sv)
+                    worker_global_scope->set_cross_origin_isolated_capability(false);
             }
 
             // 10. Run processCustomFetchResponse with response and bodyBytes.
@@ -324,8 +336,7 @@ void WorkerHost::run(GC::Ref<Web::Page> page, Web::HTML::TransferDataEncoder mes
         //    Fetch a module worker script graph given url, outside settings, destination, the value of the credentials
         //    member of options, inside settings, and with onComplete and performFetch as defined below.
         VERIFY(m_type == Web::HTML::WorkerType::Module);
-        // FIXME: Pass credentials
-        if (auto err = Web::HTML::fetch_module_worker_script_graph(m_url, outside_settings, destination, inside_settings, perform_fetch, on_complete); err.is_error()) {
+        if (auto err = Web::HTML::fetch_module_worker_script_graph(m_url, outside_settings, destination, inside_settings, perform_fetch, on_complete, static_cast<Web::Fetch::Infrastructure::Request::CredentialsMode>(credentials)); err.is_error()) {
             dbgln("Failed to run worker script");
             // FIXME: Abort the worker properly
             TODO();

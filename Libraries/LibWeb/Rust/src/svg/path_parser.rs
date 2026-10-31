@@ -5,7 +5,10 @@
  */
 
 use super::parser::{Input, Parser as Lexer};
-use libgfx_rust::path::{OwnedPath, PathBuilder};
+use crate::css::css_tokenizer::TokenizerInput;
+use crate::css::ffi_support::{FfiUtf16View, OwnedBox};
+use libgfx_rust::path::Path;
+use libgfx_rust::{FloatPoint, FloatSize};
 use std::ffi::c_void;
 use std::fmt::Write;
 
@@ -123,9 +126,30 @@ enum PathInstruction {
     },
 }
 
+impl PathInstruction {
+    fn is_relative(&self) -> bool {
+        match *self {
+            PathInstruction::ClosePath => false,
+            PathInstruction::MoveTo { absolute, .. }
+            | PathInstruction::LineTo { absolute, .. }
+            | PathInstruction::HorizontalLineTo { absolute, .. }
+            | PathInstruction::VerticalLineTo { absolute, .. }
+            | PathInstruction::CurveTo { absolute, .. }
+            | PathInstruction::SmoothCurveTo { absolute, .. }
+            | PathInstruction::QuadraticBezierCurveTo { absolute, .. }
+            | PathInstruction::SmoothQuadraticBezierCurveTo { absolute, .. }
+            | PathInstruction::EllipticalArc { absolute, .. } => !absolute,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct ParsedPath {
+pub struct ParsedPath {
     instructions: Vec<PathInstruction>,
+}
+
+fn float_point([x, y]: [f32; 2]) -> FloatPoint {
+    FloatPoint { x, y }
 }
 
 impl ParsedPath {
@@ -264,8 +288,8 @@ impl ParsedPath {
         }
     }
 
-    pub(crate) fn to_gfx_path(&self) -> OwnedPath {
-        let mut path = PathBuilder::new();
+    pub(crate) fn to_gfx_path(&self) -> Path {
+        let mut path = Path::new();
         let mut current_point = [0.0, 0.0];
         let mut subpath_start = [0.0, 0.0];
         let mut previous_control_point = None;
@@ -276,7 +300,7 @@ impl ParsedPath {
             let point = match *instruction {
                 PathInstruction::MoveTo { absolute, point } => {
                     let point = if absolute { point } else { relative_to_current(point) };
-                    path.move_to(point[0], point[1]);
+                    path.move_to(float_point(point));
                     subpath_start = point;
                     point
                 }
@@ -286,17 +310,17 @@ impl ParsedPath {
                 }
                 PathInstruction::LineTo { absolute, point } => {
                     let point = if absolute { point } else { relative_to_current(point) };
-                    path.line_to(point[0], point[1]);
+                    path.line_to(float_point(point));
                     point
                 }
                 PathInstruction::HorizontalLineTo { absolute, x } => {
                     let point = [if absolute { x } else { current_point[0] + x }, current_point[1]];
-                    path.line_to(point[0], point[1]);
+                    path.line_to(float_point(point));
                     point
                 }
                 PathInstruction::VerticalLineTo { absolute, y } => {
                     let point = [current_point[0], if absolute { y } else { current_point[1] + y }];
-                    path.line_to(point[0], point[1]);
+                    path.line_to(float_point(point));
                     point
                 }
                 PathInstruction::CurveTo {
@@ -317,12 +341,9 @@ impl ParsedPath {
                     };
                     let point = if absolute { point } else { relative_to_current(point) };
                     path.cubic_bezier_curve_to(
-                        control_point_1[0],
-                        control_point_1[1],
-                        control_point_2[0],
-                        control_point_2[1],
-                        point[0],
-                        point[1],
+                        float_point(control_point_1),
+                        float_point(control_point_2),
+                        float_point(point),
                     );
                     previous_control_point = Some(control_point_2);
                     point
@@ -351,12 +372,9 @@ impl ParsedPath {
                     };
                     let point = if absolute { point } else { relative_to_current(point) };
                     path.cubic_bezier_curve_to(
-                        control_point_1[0],
-                        control_point_1[1],
-                        control_point_2[0],
-                        control_point_2[1],
-                        point[0],
-                        point[1],
+                        float_point(control_point_1),
+                        float_point(control_point_2),
+                        float_point(point),
                     );
                     previous_control_point = Some(control_point_2);
                     point
@@ -372,7 +390,7 @@ impl ParsedPath {
                         relative_to_current(control_point)
                     };
                     let point = if absolute { point } else { relative_to_current(point) };
-                    path.quadratic_bezier_curve_to(control_point[0], control_point[1], point[0], point[1]);
+                    path.quadratic_bezier_curve_to(float_point(control_point), float_point(point));
                     previous_control_point = Some(control_point);
                     point
                 }
@@ -393,7 +411,7 @@ impl ParsedPath {
                         2.0 * current_point[1] - reflected_from[1],
                     ];
                     let point = if absolute { point } else { relative_to_current(point) };
-                    path.quadratic_bezier_curve_to(control_point[0], control_point[1], point[0], point[1]);
+                    path.quadratic_bezier_curve_to(float_point(control_point), float_point(point));
                     previous_control_point = Some(control_point);
                     point
                 }
@@ -407,10 +425,11 @@ impl ParsedPath {
                 } => {
                     let point = if absolute { point } else { relative_to_current(point) };
                     path.elliptical_arc_to(
-                        point[0],
-                        point[1],
-                        radius[0],
-                        radius[1],
+                        float_point(point),
+                        FloatSize {
+                            width: radius[0],
+                            height: radius[1],
+                        },
                         (f64::from(x_axis_rotation).to_radians()) as f32,
                         large_arc,
                         sweep,
@@ -432,7 +451,445 @@ impl ParsedPath {
             last_instruction = Some(*instruction);
         }
 
-        path.build()
+        path
+    }
+
+    /// The same path with each relative command replaced by its absolute equivalent, or `None` when the path has
+    /// no relative commands.
+    pub(crate) fn to_absolute(&self) -> Option<ParsedPath> {
+        if !self.instructions.iter().any(PathInstruction::is_relative) {
+            return None;
+        }
+        let mut current_point = [0.0f32, 0.0];
+        let mut subpath_start = [0.0f32, 0.0];
+        let mut instructions = Vec::with_capacity(self.instructions.len());
+        for instruction in &self.instructions {
+            let resolve = |absolute: bool, point: [f32; 2]| {
+                if absolute {
+                    point
+                } else {
+                    [point[0] + current_point[0], point[1] + current_point[1]]
+                }
+            };
+            let (converted, end_point) = match *instruction {
+                PathInstruction::MoveTo { absolute, point } => {
+                    let point = resolve(absolute, point);
+                    subpath_start = point;
+                    (PathInstruction::MoveTo { absolute: true, point }, point)
+                }
+                PathInstruction::ClosePath => (PathInstruction::ClosePath, subpath_start),
+                PathInstruction::LineTo { absolute, point } => {
+                    let point = resolve(absolute, point);
+                    (PathInstruction::LineTo { absolute: true, point }, point)
+                }
+                PathInstruction::HorizontalLineTo { absolute, x } => {
+                    let x = if absolute { x } else { current_point[0] + x };
+                    (
+                        PathInstruction::HorizontalLineTo { absolute: true, x },
+                        [x, current_point[1]],
+                    )
+                }
+                PathInstruction::VerticalLineTo { absolute, y } => {
+                    let y = if absolute { y } else { current_point[1] + y };
+                    (
+                        PathInstruction::VerticalLineTo { absolute: true, y },
+                        [current_point[0], y],
+                    )
+                }
+                PathInstruction::CurveTo {
+                    absolute,
+                    control_point_1,
+                    control_point_2,
+                    point,
+                } => {
+                    let point = resolve(absolute, point);
+                    (
+                        PathInstruction::CurveTo {
+                            absolute: true,
+                            control_point_1: resolve(absolute, control_point_1),
+                            control_point_2: resolve(absolute, control_point_2),
+                            point,
+                        },
+                        point,
+                    )
+                }
+                PathInstruction::SmoothCurveTo {
+                    absolute,
+                    control_point_2,
+                    point,
+                } => {
+                    let point = resolve(absolute, point);
+                    (
+                        PathInstruction::SmoothCurveTo {
+                            absolute: true,
+                            control_point_2: resolve(absolute, control_point_2),
+                            point,
+                        },
+                        point,
+                    )
+                }
+                PathInstruction::QuadraticBezierCurveTo {
+                    absolute,
+                    control_point,
+                    point,
+                } => {
+                    let point = resolve(absolute, point);
+                    (
+                        PathInstruction::QuadraticBezierCurveTo {
+                            absolute: true,
+                            control_point: resolve(absolute, control_point),
+                            point,
+                        },
+                        point,
+                    )
+                }
+                PathInstruction::SmoothQuadraticBezierCurveTo { absolute, point } => {
+                    let point = resolve(absolute, point);
+                    (
+                        PathInstruction::SmoothQuadraticBezierCurveTo { absolute: true, point },
+                        point,
+                    )
+                }
+                PathInstruction::EllipticalArc {
+                    absolute,
+                    radius,
+                    x_axis_rotation,
+                    large_arc,
+                    sweep,
+                    point,
+                } => {
+                    let point = resolve(absolute, point);
+                    (
+                        PathInstruction::EllipticalArc {
+                            absolute: true,
+                            radius,
+                            x_axis_rotation,
+                            large_arc,
+                            sweep,
+                            point,
+                        },
+                        point,
+                    )
+                }
+            };
+            instructions.push(converted);
+            current_point = end_point;
+        }
+        let mut path = ParsedPath { instructions };
+        path.normalize_for_serialization();
+        Some(path)
+    }
+
+    /// https://svgwg.org/svg2-draft/paths.html#PathElement
+    /// https://drafts.csswg.org/css-shapes-1/#interpolating-shape
+    /// Interpolates two paths with the same commands, in order, component by component. Returns `None` when the
+    /// commands do not match.
+    pub(crate) fn interpolate(&self, to: &ParsedPath, delta: f32) -> Option<ParsedPath> {
+        if self.instructions.len() != to.instructions.len() {
+            return None;
+        }
+        let delta = f64::from(delta);
+        let number = |from: f32, to: f32| (f64::from(from) + (f64::from(to) - f64::from(from)) * delta) as f32;
+        let point = |from: [f32; 2], to: [f32; 2]| [number(from[0], to[0]), number(from[1], to[1])];
+        // NB: Like the arc command of shape(), an arc whose flags differ between the starting and ending list uses the
+        //     set flag for any progress value between 0 and 1.
+        let flag = |from: bool, to: bool| {
+            if from == to || delta <= 0.0 {
+                from
+            } else if delta >= 1.0 {
+                to
+            } else {
+                true
+            }
+        };
+        let mut instructions = Vec::with_capacity(self.instructions.len());
+        for (from, to) in self.instructions.iter().zip(&to.instructions) {
+            instructions.push(match (*from, *to) {
+                (
+                    PathInstruction::MoveTo {
+                        absolute,
+                        point: from_point,
+                    },
+                    PathInstruction::MoveTo {
+                        absolute: to_absolute,
+                        point: to_point,
+                    },
+                ) if absolute == to_absolute => PathInstruction::MoveTo {
+                    absolute,
+                    point: point(from_point, to_point),
+                },
+                (PathInstruction::ClosePath, PathInstruction::ClosePath) => PathInstruction::ClosePath,
+                (
+                    PathInstruction::LineTo {
+                        absolute,
+                        point: from_point,
+                    },
+                    PathInstruction::LineTo {
+                        absolute: to_absolute,
+                        point: to_point,
+                    },
+                ) if absolute == to_absolute => PathInstruction::LineTo {
+                    absolute,
+                    point: point(from_point, to_point),
+                },
+                (
+                    PathInstruction::HorizontalLineTo { absolute, x: from_x },
+                    PathInstruction::HorizontalLineTo {
+                        absolute: to_absolute,
+                        x: to_x,
+                    },
+                ) if absolute == to_absolute => PathInstruction::HorizontalLineTo {
+                    absolute,
+                    x: number(from_x, to_x),
+                },
+                (
+                    PathInstruction::VerticalLineTo { absolute, y: from_y },
+                    PathInstruction::VerticalLineTo {
+                        absolute: to_absolute,
+                        y: to_y,
+                    },
+                ) if absolute == to_absolute => PathInstruction::VerticalLineTo {
+                    absolute,
+                    y: number(from_y, to_y),
+                },
+                (
+                    PathInstruction::CurveTo {
+                        absolute,
+                        control_point_1: from_1,
+                        control_point_2: from_2,
+                        point: from_point,
+                    },
+                    PathInstruction::CurveTo {
+                        absolute: to_absolute,
+                        control_point_1: to_1,
+                        control_point_2: to_2,
+                        point: to_point,
+                    },
+                ) if absolute == to_absolute => PathInstruction::CurveTo {
+                    absolute,
+                    control_point_1: point(from_1, to_1),
+                    control_point_2: point(from_2, to_2),
+                    point: point(from_point, to_point),
+                },
+                (
+                    PathInstruction::SmoothCurveTo {
+                        absolute,
+                        control_point_2: from_2,
+                        point: from_point,
+                    },
+                    PathInstruction::SmoothCurveTo {
+                        absolute: to_absolute,
+                        control_point_2: to_2,
+                        point: to_point,
+                    },
+                ) if absolute == to_absolute => PathInstruction::SmoothCurveTo {
+                    absolute,
+                    control_point_2: point(from_2, to_2),
+                    point: point(from_point, to_point),
+                },
+                (
+                    PathInstruction::QuadraticBezierCurveTo {
+                        absolute,
+                        control_point: from_control,
+                        point: from_point,
+                    },
+                    PathInstruction::QuadraticBezierCurveTo {
+                        absolute: to_absolute,
+                        control_point: to_control,
+                        point: to_point,
+                    },
+                ) if absolute == to_absolute => PathInstruction::QuadraticBezierCurveTo {
+                    absolute,
+                    control_point: point(from_control, to_control),
+                    point: point(from_point, to_point),
+                },
+                (
+                    PathInstruction::SmoothQuadraticBezierCurveTo {
+                        absolute,
+                        point: from_point,
+                    },
+                    PathInstruction::SmoothQuadraticBezierCurveTo {
+                        absolute: to_absolute,
+                        point: to_point,
+                    },
+                ) if absolute == to_absolute => PathInstruction::SmoothQuadraticBezierCurveTo {
+                    absolute,
+                    point: point(from_point, to_point),
+                },
+                (
+                    PathInstruction::EllipticalArc {
+                        absolute,
+                        radius: from_radius,
+                        x_axis_rotation: from_rotation,
+                        large_arc: from_large_arc,
+                        sweep: from_sweep,
+                        point: from_point,
+                    },
+                    PathInstruction::EllipticalArc {
+                        absolute: to_absolute,
+                        radius: to_radius,
+                        x_axis_rotation: to_rotation,
+                        large_arc: to_large_arc,
+                        sweep: to_sweep,
+                        point: to_point,
+                    },
+                ) if absolute == to_absolute => PathInstruction::EllipticalArc {
+                    absolute,
+                    radius: point(from_radius, to_radius),
+                    x_axis_rotation: number(from_rotation, to_rotation),
+                    large_arc: flag(from_large_arc, to_large_arc),
+                    sweep: flag(from_sweep, to_sweep),
+                    point: point(from_point, to_point),
+                },
+                _ => return None,
+            });
+        }
+        let mut path = ParsedPath { instructions };
+        path.normalize_for_serialization();
+        Some(path)
+    }
+
+    /// https://drafts.csswg.org/css-shapes-1/#interpolating-shape
+    /// The commands and points of the shape() equivalent to this path, for interpolating it with a shape(). The first
+    /// command of the path becomes the initial <coordinate-pair> of the shape().
+    /// NB: Commands retain their absolute/relative interpretation, while all coordinates use scalar lengths,
+    ///     matching computed shape() points.
+    pub(crate) fn to_shape_commands(
+        &self,
+    ) -> Option<(
+        Vec<crate::css::style_value::ShapeCommand>,
+        Vec<crate::css::style_value::RetainedShapePoint>,
+    )> {
+        use crate::css::style_value::{
+            RetainedShapePoint, RetainedStyleValueData, ShapeCommand, ShapeCommandKind, ShapeControlPointAnchor,
+            StyleValueData,
+        };
+        let length = |value: f32| StyleValueData::Length {
+            value: f64::from(value),
+            unit: crate::css::style_compute::px_length_unit(),
+        };
+        let value = |value: StyleValueData| RetainedStyleValueData::from_owned(value);
+        let point = |point: [f32; 2]| {
+            RetainedShapePoint::from_retained_values(value(length(point[0])), value(length(point[1])))
+        };
+        let zero = || value(StyleValueData::Percentage { value: 0.0 });
+        let mut commands = Vec::with_capacity(self.instructions.len());
+        let mut points = Vec::with_capacity(self.instructions.len());
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            let (kind, absolute) = match *instruction {
+                PathInstruction::MoveTo {
+                    absolute,
+                    point: end_point,
+                } => {
+                    if index == 0 {
+                        // NB: The current point starts at the origin, so a relative first move is absolute too.
+                        points.push(point(end_point));
+                        commands.push(ShapeCommand::new(ShapeCommandKind::From, false));
+                        continue;
+                    }
+                    points.push(point(end_point));
+                    (ShapeCommandKind::Move, absolute)
+                }
+                _ if index == 0 => return None,
+                PathInstruction::ClosePath => (ShapeCommandKind::Close, true),
+                PathInstruction::LineTo {
+                    absolute,
+                    point: end_point,
+                } => {
+                    points.push(point(end_point));
+                    (ShapeCommandKind::Line, absolute)
+                }
+                PathInstruction::HorizontalLineTo { absolute, x } => {
+                    points.push(RetainedShapePoint::from_retained_values(value(length(x)), zero()));
+                    (ShapeCommandKind::HorizontalLine, absolute)
+                }
+                PathInstruction::VerticalLineTo { absolute, y } => {
+                    points.push(RetainedShapePoint::from_retained_values(zero(), value(length(y))));
+                    (ShapeCommandKind::VerticalLine, absolute)
+                }
+                PathInstruction::CurveTo { .. }
+                | PathInstruction::SmoothCurveTo { .. }
+                | PathInstruction::QuadraticBezierCurveTo { .. }
+                | PathInstruction::SmoothQuadraticBezierCurveTo { .. } => {
+                    let (kind, absolute, end_point, control_points) = match *instruction {
+                        PathInstruction::CurveTo {
+                            absolute,
+                            control_point_1,
+                            control_point_2,
+                            point,
+                        } => (
+                            ShapeCommandKind::Curve,
+                            absolute,
+                            point,
+                            vec![control_point_1, control_point_2],
+                        ),
+                        PathInstruction::QuadraticBezierCurveTo {
+                            absolute,
+                            control_point,
+                            point,
+                        } => (ShapeCommandKind::Curve, absolute, point, vec![control_point]),
+                        PathInstruction::SmoothCurveTo {
+                            absolute,
+                            control_point_2,
+                            point,
+                        } => (ShapeCommandKind::Smooth, absolute, point, vec![control_point_2]),
+                        PathInstruction::SmoothQuadraticBezierCurveTo { absolute, point } => {
+                            (ShapeCommandKind::Smooth, absolute, point, vec![])
+                        }
+                        _ => unreachable!(),
+                    };
+                    let mut command = ShapeCommand::new(kind, !absolute);
+                    points.push(point(end_point));
+                    for (control_index, control_point) in control_points.into_iter().enumerate() {
+                        // Absolute control points are positions in the reference box, and relative ones are relative to
+                        // the start of the segment.
+                        command.control_points[control_index] = if absolute {
+                            ShapeControlPointAnchor::Origin
+                        } else {
+                            ShapeControlPointAnchor::Start
+                        };
+                        command.control_point_count += 1;
+                        points.push(point(control_point));
+                    }
+                    commands.push(command);
+                    continue;
+                }
+                PathInstruction::EllipticalArc {
+                    absolute,
+                    radius,
+                    x_axis_rotation,
+                    large_arc,
+                    sweep,
+                    point: end_point,
+                } => {
+                    let mut command = ShapeCommand::new(ShapeCommandKind::Arc, !absolute);
+                    command.arc_clockwise = sweep;
+                    command.arc_large = large_arc;
+                    command.arc_has_rotation = x_axis_rotation != 0.0;
+                    points.push(point(end_point));
+                    points.push(RetainedShapePoint::from_retained_values(
+                        value(length(radius[0])),
+                        value(length(radius[1])),
+                    ));
+                    let rotation = || {
+                        value(StyleValueData::Angle {
+                            value: f64::from(x_axis_rotation),
+                            unit: 0,
+                        })
+                    };
+                    points.push(RetainedShapePoint::from_retained_values(rotation(), rotation()));
+                    commands.push(command);
+                    continue;
+                }
+            };
+            commands.push(ShapeCommand::new(kind, !absolute));
+        }
+        Some((commands, points))
+    }
+
+    /// Whether the path ends with a closepath command, which makes it a closed loop.
+    pub(crate) fn ends_with_close_path(&self) -> bool {
+        matches!(self.instructions.last(), Some(PathInstruction::ClosePath))
     }
 
     pub(crate) fn serialize(&self) -> String {
@@ -603,8 +1060,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse(mut self, allow_error_recovery: bool) -> Option<Vec<PathInstruction>> {
-        self.parse_whitespace();
-        while !self.done() {
+        self.lexer.parse_whitespace();
+        while !self.lexer.done() {
             if self.parse_draw_to().is_err() {
                 if !allow_error_recovery {
                     return None;
@@ -620,11 +1077,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_draw_to(&mut self) -> Result<(), ()> {
-        match self.current_ascii() {
+        match self.lexer.current_ascii() {
             Some(b'M' | b'm') => self.parse_move_to(),
             Some(b'Z' | b'z') => {
-                self.consume();
-                self.parse_whitespace();
+                self.lexer.consume();
+                self.lexer.parse_whitespace();
                 self.instructions.push(PathInstruction::ClosePath);
                 Ok(())
             }
@@ -642,8 +1099,8 @@ impl<'a> Parser<'a> {
 
     // https://www.w3.org/TR/SVG2/paths.html#PathDataMovetoCommands
     fn parse_move_to(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'M');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'M');
+        self.lexer.parse_whitespace();
 
         let mut first = true;
         self.parse_coordinate_pair_sequence(|parser, point| {
@@ -658,16 +1115,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_line_to(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'L');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'L');
+        self.lexer.parse_whitespace();
         self.parse_coordinate_pair_sequence(|parser, point| {
             parser.instructions.push(PathInstruction::LineTo { absolute, point });
         })
     }
 
     fn parse_horizontal_line_to(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'H');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'H');
+        self.lexer.parse_whitespace();
         self.parse_coordinate_sequence(|parser, x| {
             parser
                 .instructions
@@ -676,8 +1133,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_vertical_line_to(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'V');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'V');
+        self.lexer.parse_whitespace();
         self.parse_coordinate_sequence(|parser, y| {
             parser
                 .instructions
@@ -686,22 +1143,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_curve_to(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'C');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'C');
+        self.lexer.parse_whitespace();
         loop {
-            let control_point_1 = self.parse_coordinate_pair()?;
-            self.parse_optional_comma_whitespace();
-            let control_point_2 = self.parse_coordinate_pair()?;
-            self.parse_optional_comma_whitespace();
-            let point = self.parse_coordinate_pair()?;
+            let control_point_1 = self.lexer.parse_coordinate_pair()?;
+            self.lexer.parse_optional_comma_whitespace();
+            let control_point_2 = self.lexer.parse_coordinate_pair()?;
+            self.lexer.parse_optional_comma_whitespace();
+            let point = self.lexer.parse_coordinate_pair()?;
             self.instructions.push(PathInstruction::CurveTo {
                 absolute,
                 control_point_1,
                 control_point_2,
                 point,
             });
-            self.parse_optional_comma_whitespace();
-            if !self.matches_coordinate() {
+            self.lexer.parse_optional_comma_whitespace();
+            if !self.lexer.matches_coordinate() {
                 break;
             }
         }
@@ -709,19 +1166,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_smooth_curve_to(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'S');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'S');
+        self.lexer.parse_whitespace();
         loop {
-            let control_point_2 = self.parse_coordinate_pair()?;
-            self.parse_optional_comma_whitespace();
-            let point = self.parse_coordinate_pair()?;
+            let control_point_2 = self.lexer.parse_coordinate_pair()?;
+            self.lexer.parse_optional_comma_whitespace();
+            let point = self.lexer.parse_coordinate_pair()?;
             self.instructions.push(PathInstruction::SmoothCurveTo {
                 absolute,
                 control_point_2,
                 point,
             });
-            self.parse_optional_comma_whitespace();
-            if !self.matches_coordinate() {
+            self.lexer.parse_optional_comma_whitespace();
+            if !self.lexer.matches_coordinate() {
                 break;
             }
         }
@@ -729,19 +1186,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_quadratic_bezier_curve_to(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'Q');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'Q');
+        self.lexer.parse_whitespace();
         loop {
-            let control_point = self.parse_coordinate_pair()?;
-            self.parse_optional_comma_whitespace();
-            let point = self.parse_coordinate_pair()?;
+            let control_point = self.lexer.parse_coordinate_pair()?;
+            self.lexer.parse_optional_comma_whitespace();
+            let point = self.lexer.parse_coordinate_pair()?;
             self.instructions.push(PathInstruction::QuadraticBezierCurveTo {
                 absolute,
                 control_point,
                 point,
             });
-            self.parse_optional_comma_whitespace();
-            if !self.matches_coordinate() {
+            self.lexer.parse_optional_comma_whitespace();
+            if !self.lexer.matches_coordinate() {
                 break;
             }
         }
@@ -749,14 +1206,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_smooth_quadratic_bezier_curve_to(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'T');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'T');
+        self.lexer.parse_whitespace();
         loop {
-            let point = self.parse_coordinate_pair()?;
+            let point = self.lexer.parse_coordinate_pair()?;
             self.instructions
                 .push(PathInstruction::SmoothQuadraticBezierCurveTo { absolute, point });
-            self.parse_optional_comma_whitespace();
-            if !self.matches_coordinate() {
+            self.lexer.parse_optional_comma_whitespace();
+            if !self.lexer.matches_coordinate() {
                 break;
             }
         }
@@ -764,20 +1221,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_elliptical_arc(&mut self) -> Result<(), ()> {
-        let absolute = self.consume() == u16::from(b'A');
-        self.parse_whitespace();
+        let absolute = self.lexer.consume() == u16::from(b'A');
+        self.lexer.parse_whitespace();
         loop {
-            let radius_x = self.parse_number()?;
-            self.parse_optional_comma_whitespace();
-            let radius_y = self.parse_number()?;
-            self.parse_optional_comma_whitespace();
-            let x_axis_rotation = self.parse_number()?;
-            self.parse_optional_comma_whitespace();
+            let radius_x = self.lexer.parse_number()?;
+            self.lexer.parse_optional_comma_whitespace();
+            let radius_y = self.lexer.parse_number()?;
+            self.lexer.parse_optional_comma_whitespace();
+            let x_axis_rotation = self.lexer.parse_number()?;
+            self.lexer.parse_optional_comma_whitespace();
             let large_arc = self.parse_flag()?;
-            self.parse_optional_comma_whitespace();
+            self.lexer.parse_optional_comma_whitespace();
             let sweep = self.parse_flag()?;
-            self.parse_optional_comma_whitespace();
-            let point = self.parse_coordinate_pair()?;
+            self.lexer.parse_optional_comma_whitespace();
+            let point = self.lexer.parse_coordinate_pair()?;
             self.instructions.push(PathInstruction::EllipticalArc {
                 absolute,
                 radius: [radius_x, radius_y],
@@ -786,33 +1243,26 @@ impl<'a> Parser<'a> {
                 sweep,
                 point,
             });
-            self.parse_optional_comma_whitespace();
-            if !self.matches_coordinate() {
+            self.lexer.parse_optional_comma_whitespace();
+            if !self.lexer.matches_coordinate() {
                 break;
             }
         }
         Ok(())
     }
 
-    fn parse_coordinate_pair(&mut self) -> Result<[f32; 2], ()> {
-        let x = self.parse_number()?;
-        self.parse_optional_comma_whitespace();
-        let y = self.parse_number()?;
-        Ok([x, y])
-    }
-
     fn parse_coordinate_sequence(&mut self, mut visit: impl FnMut(&mut Self, f32)) -> Result<(), ()> {
         let mut first = true;
         loop {
-            let coordinate = match self.parse_number() {
+            let coordinate = match self.lexer.parse_number() {
                 Ok(coordinate) => coordinate,
                 Err(()) if first => return Err(()),
                 Err(()) => break,
             };
             first = false;
             visit(self, coordinate);
-            self.parse_optional_comma_whitespace();
-            if !self.matches_comma_whitespace() && !self.matches_coordinate() {
+            self.lexer.parse_optional_comma_whitespace();
+            if !self.lexer.matches_comma_whitespace() && !self.lexer.matches_coordinate() {
                 break;
             }
         }
@@ -822,148 +1272,93 @@ impl<'a> Parser<'a> {
     fn parse_coordinate_pair_sequence(&mut self, mut visit: impl FnMut(&mut Self, [f32; 2])) -> Result<(), ()> {
         let mut first = true;
         loop {
-            let pair = match self.parse_coordinate_pair() {
+            let pair = match self.lexer.parse_coordinate_pair() {
                 Ok(pair) => pair,
                 Err(()) if first => return Err(()),
                 Err(()) => break,
             };
             first = false;
             visit(self, pair);
-            self.parse_optional_comma_whitespace();
-            if !self.matches_comma_whitespace() && !self.matches_coordinate() {
+            self.lexer.parse_optional_comma_whitespace();
+            if !self.lexer.matches_comma_whitespace() && !self.lexer.matches_coordinate() {
                 break;
             }
         }
         Ok(())
     }
 
-    fn parse_number(&mut self) -> Result<f32, ()> {
-        self.lexer.parse_number()
-    }
-
     fn parse_flag(&mut self) -> Result<bool, ()> {
-        match self.current_ascii() {
+        match self.lexer.current_ascii() {
             Some(b'0') => {
-                self.consume();
+                self.lexer.consume();
                 Ok(false)
             }
             Some(b'1') => {
-                self.consume();
+                self.lexer.consume();
                 Ok(true)
             }
             _ => Err(()),
         }
     }
-
-    fn parse_optional_comma_whitespace(&mut self) {
-        self.lexer.parse_optional_comma_whitespace();
-    }
-
-    fn parse_whitespace(&mut self) {
-        self.lexer.parse_whitespace();
-    }
-
-    fn matches_coordinate(&self) -> bool {
-        self.lexer.matches_coordinate()
-    }
-
-    fn matches_comma_whitespace(&self) -> bool {
-        self.lexer.matches_comma_whitespace()
-    }
-
-    fn current_ascii(&self) -> Option<u8> {
-        self.lexer.current_ascii()
-    }
-
-    fn consume(&mut self) -> u16 {
-        self.lexer.consume()
-    }
-
-    fn done(&self) -> bool {
-        self.lexer.done()
-    }
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiSvgInput {
-    pub ascii: *const u8,
-    pub utf16: *const u16,
-    pub length: usize,
+/// The units of `view`, or none for a view that names both or neither kind of storage.
+pub(super) fn svg_input(view: FfiUtf16View<'_>) -> Option<Input<'_>> {
+    Some(match view.units()? {
+        TokenizerInput::Ascii(units) => Input::Ascii(units),
+        TokenizerInput::Utf16(units) => Input::Utf16(units),
+    })
 }
 
-impl FfiSvgInput {
-    /// # Safety
-    /// For non-empty input, exactly one pointer must identify `length` readable units.
-    pub(super) unsafe fn input<'a>(self) -> Option<Input<'a>> {
-        if self.length == 0 {
-            return Some(Input::Ascii(&[]));
-        }
-        match (self.ascii.is_null(), self.utf16.is_null()) {
-            (false, true) => Some(Input::Ascii(unsafe {
-                std::slice::from_raw_parts(self.ascii, self.length)
-            })),
-            (true, false) => Some(Input::Utf16(unsafe {
-                std::slice::from_raw_parts(self.utf16, self.length)
-            })),
-            _ => None,
-        }
-    }
+/// The path that the path data describes, as SVG parses it, with its error recovery: what parsing a string of path
+/// data gives Path2D's constructor, which is an empty path where the data describes none.
+pub fn gfx_path_from_path_data(input: ak::Utf16StringUnits<'_>) -> Path {
+    let input = match input {
+        ak::Utf16StringUnits::Ascii(units) => Input::Ascii(units),
+        ak::Utf16StringUnits::Utf16(units) => Input::Utf16(units),
+    };
+    let instructions = Parser::new(input).parse(true).unwrap_or_default();
+    ParsedPath { instructions }.to_gfx_path()
 }
 
-/// # Safety
-/// - `input` must satisfy [`FfiSvgInput::input`]'s requirements.
+/// The path `input` describes, as a new path C++ owns, or null where it describes none.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_svg_path_data(input: FfiSvgInput) -> *mut c_void {
-    let Some(input) = (unsafe { input.input() }) else {
+pub extern "C" fn rust_parse_svg_path_data(input: FfiUtf16View<'_>) -> *mut ParsedPath {
+    let Some(input) = svg_input(input) else {
         return std::ptr::null_mut();
     };
     let Some(instructions) = Parser::new(input).parse(true) else {
         return std::ptr::null_mut();
     };
-    Box::into_raw(Box::new(ParsedPath { instructions })).cast()
+    Box::into_raw(Box::new(ParsedPath { instructions }))
 }
 
-/// # Safety
-/// `path` must point to a live `ParsedPath`.
+/// A copy of `path`, as a new path C++ owns.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_svg_path_clone(path: *const c_void) -> *mut c_void {
-    let path = unsafe { &*path.cast::<ParsedPath>() };
-    Box::into_raw(Box::new(path.clone())).cast()
+pub extern "C" fn rust_svg_path_clone(path: &ParsedPath) -> *mut ParsedPath {
+    Box::into_raw(Box::new(path.clone()))
 }
 
-/// # Safety
-/// `path` must be a `ParsedPath` allocation returned by this module that has not yet been destroyed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_svg_path_destroy(path: *mut c_void) {
-    drop(unsafe { Box::from_raw(path.cast::<ParsedPath>()) });
+pub extern "C" fn rust_svg_path_destroy(path: OwnedBox<ParsedPath>) {
+    drop(path);
 }
 
-/// # Safety
-/// `a` and `b` must point to live `ParsedPath` values.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_svg_path_equals(a: *const c_void, b: *const c_void) -> bool {
-    unsafe { *a.cast::<ParsedPath>() == *b.cast::<ParsedPath>() }
+pub extern "C" fn rust_svg_path_equals(a: &ParsedPath, b: &ParsedPath) -> bool {
+    a == b
 }
 
 /// # Safety
-/// - `path` must point to a live `ParsedPath`.
-/// - `context` must be valid for `append` for the duration of this call.
+/// `context` must be valid for `append` for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_svg_path_serialize(
-    path: *const c_void,
+    path: &ParsedPath,
     context: *mut c_void,
     append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
 ) {
-    let serialized = unsafe { &*path.cast::<ParsedPath>() }.serialize();
+    let serialized = path.serialize();
     unsafe { append(context, serialized.as_ptr(), serialized.len()) };
-}
-
-/// # Safety
-/// `path` must point to a live `ParsedPath`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_svg_path_to_gfx_path(path: *const c_void) -> *mut c_void {
-    unsafe { &*path.cast::<ParsedPath>() }.to_gfx_path().into_raw()
 }
 
 #[cfg(test)]

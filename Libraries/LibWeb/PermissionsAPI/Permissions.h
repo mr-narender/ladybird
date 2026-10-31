@@ -9,6 +9,8 @@
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Types.h>
+#include <LibGC/Function.h>
+#include <LibGC/Ptr.h>
 #include <LibWeb/Bindings/PermissionStatus.h>
 #include <LibWeb/Bindings/Permissions.h>
 #include <LibWeb/Bindings/Wrappable.h>
@@ -24,9 +26,9 @@ bool is_permission_supported(Utf16View);
 
 PermissionState permission_state(PermissionDescriptor descriptor, Optional<HTML::EnvironmentSettingsObject&> settings = {});
 
-PermissionState get_current_permission_state(Utf16String const& name, Optional<HTML::EnvironmentSettingsObject&> settings = {});
-
-PermissionState request_permission(PermissionDescriptor const& descriptor);
+// Asks the user when the state is "prompt"; the callback runs once a state other than "prompt" is known.
+using PermissionDecisionCallback = GC::Ref<GC::Function<void(PermissionState)>>;
+void request_permission_with_user_prompt(PermissionDescriptor const&, HTML::EnvironmentSettingsObject&, PermissionDecisionCallback);
 
 class WEB_API Permissions : public Bindings::GCAllocatedWrappable {
     WEB_WRAPPABLE(Permissions, Bindings::GCAllocatedWrappable);
@@ -41,6 +43,6 @@ private:
     Permissions();
 };
 
-void permission_query_algorithm(PermissionDescriptor const&, PermissionStatus&);
+void permission_query_algorithm(PermissionDescriptor const&, PermissionStatus&, HTML::EnvironmentSettingsObject&);
 
 }

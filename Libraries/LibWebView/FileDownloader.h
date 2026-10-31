@@ -17,8 +17,10 @@
 #include <AK/Span.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <AK/WeakPtr.h>
+#include <AK/Weakable.h>
 #include <LibHTTP/Forward.h>
-#include <LibRequests/CameFromCache.h>
+#include <LibRequests/CacheState.h>
 #include <LibRequests/Forward.h>
 #include <LibRequests/NetworkError.h>
 #include <LibURL/URL.h>
@@ -35,7 +37,7 @@ namespace WebView {
 
 class FileDownloaderObserver;
 
-class WEBVIEW_API FileDownloader {
+class WEBVIEW_API FileDownloader : public Weakable<FileDownloader> {
 public:
     enum class DownloadStatus : u8 {
         InProgress,
@@ -80,33 +82,43 @@ public:
     FileDownloader();
     ~FileDownloader();
 
-    u64 download_file(IsPrivate, URL::URL const&, LexicalPath);
-    u64 adopt_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data = {});
-    u64 start_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size = {});
+    // Whether the user chose to replace a file at the destination. A download never replaces any other file.
+    enum class MayReplaceDestination : u8 {
+        No,
+        Yes,
+    };
+
+    u64 download_file(IsPrivate, URL::URL const&, LexicalPath, MayReplaceDestination = MayReplaceDestination::No);
+    using ResponseFinished = Function<void(u64 decoded_body_size, Requests::RequestTimingInfo const*,
+        Optional<StringView> error)>;
+    u64 adopt_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data = {}, ResponseFinished = {});
+    u64 start_download(IsPrivate, URL::URL const&, LexicalPath, Optional<u64> total_size = {}, MayReplaceDestination = MayReplaceDestination::No);
     bool has_active_downloads() const;
     bool has_unresumable_downloads() const;
     void set_cancel_callback(u64 id, Function<void()>);
     void append_download_data(u64 id, ReadonlyBytes);
     void finish_download(u64 id);
     void cancel_unresumable_downloads();
-    void cancel_private_downloads();
+    void discard_private_downloads();
     void cancel_download(u64 id);
     void pause_download(u64 id);
     void resume_download(u64 id);
     void pause_active_downloads();
     void fail_download(u64 id, String);
-    Vector<u64> prune_inactive_downloads();
-    Vector<u64> remove_inactive_downloads_created_since(UnixDateTime);
+    Vector<u64> prune_inactive_downloads(IsPrivate);
+    Vector<u64> remove_inactive_downloads_created_since(UnixDateTime, Optional<IsPrivate> = {});
 
     ReadonlySpan<Download> downloads() const { return m_downloads.span(); }
+    // The downloads of one browsing session, which that session's UI lists without the other's.
+    Vector<Download> downloads_of_session(IsPrivate) const;
     Optional<Download const&> download(u64 id) const;
 
     Vector<SegmentProgress> segment_progress(u64 id) const;
 
     void adopt_download_store(Badge<Application>, DownloadStore&);
 
-    static void add_observer(Badge<FileDownloaderObserver>, FileDownloaderObserver&);
-    static void remove_observer(Badge<FileDownloaderObserver>, FileDownloaderObserver&);
+    void add_observer(Badge<FileDownloaderObserver>, FileDownloaderObserver&);
+    void remove_observer(Badge<FileDownloaderObserver>, FileDownloaderObserver&);
 
 private:
     struct ActiveDownload;
@@ -116,12 +128,13 @@ private:
     ActiveDownload* active_download(u64 id);
     void start_download_request(u64 id, URL::URL const&);
     void follow_download_redirect(u64 id, HTTP::HeaderList const&);
-    void attach_request_to_download(u64 id, size_t segment_index, NonnullRefPtr<Requests::Request>);
+    void attach_request_to_download(u64 id, size_t segment_index, NonnullRefPtr<Requests::Request>,
+        ResponseFinished = {});
     void maybe_redistribute_segments(u64 id);
     void start_stall_watchdog(u64 id);
     void check_for_stalled_segments(u64 id);
     void restart_stalled_segment(u64 id, size_t segment_index);
-    void handle_segment_headers(u64 id, size_t segment_index, u64 request_generation, HTTP::HeaderList const&, Optional<u32> response_code, Optional<String> const& reason_phrase, Requests::CameFromCache);
+    void handle_segment_headers(u64 id, size_t segment_index, u64 request_generation, HTTP::HeaderList const&, Optional<u32> response_code, Optional<String> const& reason_phrase, Requests::CacheState);
     void handle_segment_finished(u64 id, size_t segment_index, u64 request_generation, u64 delivered_size, Optional<Requests::NetworkError> const&);
     bool validate_range_response(u64 id, size_t segment_index, HTTP::HeaderList const&, Optional<u32> response_code);
     void append_segment_data(u64 id, size_t segment_index, ReadonlyBytes, Optional<u64> request_generation = {});
@@ -153,7 +166,7 @@ private:
 
     void notify_download_added(Download const&);
     void notify_download_updated(Download const&);
-    void notify_download_removed(u64 id);
+    void notify_download_removed(u64 id, IsPrivate);
 
     Vector<Download> m_downloads;
     HashMap<u64, NonnullOwnPtr<ActiveDownload>> m_active_downloads;
@@ -169,7 +182,10 @@ public:
 
     virtual void download_added(FileDownloader::Download const&) { }
     virtual void download_updated(FileDownloader::Download const&) { }
-    virtual void download_removed(u64) { }
+    virtual void download_removed(u64, IsPrivate) { }
+
+private:
+    WeakPtr<FileDownloader> m_file_downloader;
 };
 
 }

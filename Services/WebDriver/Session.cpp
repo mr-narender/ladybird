@@ -92,9 +92,13 @@ ErrorOr<NonnullRefPtr<Session::NewSessionPromise>> Session::create(NonnullRefPtr
                          // Take implementation-defined steps to set the user agent proxy using the extracted proxy configuration. If the
                          // defined proxy cannot be configured return error with error code session not created. Otherwise set the has
                          // proxy configuration flag to true.
-                         session->close();
-                         state->promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "Proxy configuration is not yet supported"sv));
-                         return;
+                         // The browser was already launched with the proxy configuration.
+                         if (!Web::WebDriver::is_supported_proxy_configuration(*proxy)) {
+                             session->close();
+                             state->promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "Proxy configuration is not yet supported"sv));
+                             return;
+                         }
+                         Web::WebDriver::set_has_proxy_configuration(true);
                      }
                      // -> Otherwise
                      else {
@@ -160,7 +164,45 @@ ErrorOr<NonnullRefPtr<Session::NewSessionPromise>> Session::create(NonnullRefPtr
 
                      // FIXME: 10. Process any extension capabilities in capabilities in an implementation-defined manner.
 
-                     // FIXME: 11. Run any WebDriver new session algorithm defined in external specifications, with arguments session, capabilities, and flags.
+                     // 11. Run any WebDriver new session algorithm defined in external specifications, with arguments session, capabilities, and flags.
+                     // https://w3c.github.io/webdriver-bidi/#establishing
+                     [&] {
+                         // 1. If flags contains "bidi", return.
+                         // NB: We do not support BiDi-only sessions, so flags never contains "bidi".
+                         // 2. Let webSocketUrl be the result of getting a property named "webSocketUrl" from capabilities.
+                         auto web_socket_url = capabilities.get("webSocketUrl"sv);
+
+                         // 3. If webSocketUrl is undefined, return.
+                         if (!web_socket_url.has_value())
+                             return;
+
+                         // 4. Assert: webSocketUrl is true.
+                         VERIFY(web_socket_url->is_bool() && web_socket_url->as_bool());
+
+                         // 5. Let listener be the result of start listening for a WebSocket connection given session.
+                         // 6. Set webSocketUrl to the result of construct a WebSocket URL with listener and session.
+                         auto url = BiDiSession::start_listening_for_a_websocket_connection(*session);
+                         if (url.is_error()) {
+                             warnln("Unable to listen for WebSocket connections: {}", url.error());
+                             return;
+                         }
+
+                         // 7. Set a property on capabilities named "webSocketUrl" to webSocketUrl.
+                         capabilities.set("webSocketUrl"sv, url.release_value());
+
+                         // 8. Set session's BiDi flag to true.
+                         session->m_bidi_session = make<BiDiSession>(*session);
+
+                         // 9. Append "bidi" to flags.
+                         // NB: The flags are not used after the session is created, and its BiDi session marks it as a BiDi session.
+                     }();
+
+                     // NB: A session that requested a WebSocket URL but could not listen for one is not created.
+                     if (capabilities.has("webSocketUrl"sv) && !session->m_bidi_session) {
+                         session->close();
+                         state->promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "Unable to listen for WebSocket connections"sv));
+                         return;
+                     }
 
                      // 12. Append session to active sessions.
                      s_sessions.set(session->session_id(), session);
@@ -183,16 +225,36 @@ ErrorOr<NonnullRefPtr<Session::NewSessionPromise>> Session::create(NonnullRefPtr
     return state->promise;
 }
 
+static Optional<ByteString> proxy_autoconfig_url(JsonObject const& capabilities)
+{
+    auto proxy = capabilities.get("proxy"sv);
+    if (!proxy.has_value())
+        return {};
+
+    auto url = Web::WebDriver::proxy_autoconfig_url(*proxy);
+    if (!url.has_value())
+        return {};
+    return url->to_byte_string();
+}
+
 Session::Session(NonnullRefPtr<Client> client, JsonObject const& capabilities, String session_id, Web::WebDriver::SessionFlags flags)
     : m_client(move(client))
     , m_options(capabilities)
+    , m_proxy_autoconfig_url(proxy_autoconfig_url(capabilities))
     , m_session_id(move(session_id))
     , m_session_flags(flags)
     , m_event_loop(Core::EventLoop::current())
 {
 }
 
-Session::~Session() = default;
+Session::~Session()
+{
+    revoke_weak_refs();
+#if defined(AK_OS_MACOS)
+    // NB: Stop bootstrap callbacks before destroying the state they use.
+    m_browser_mach_port_server.clear();
+#endif
+}
 
 ErrorOr<NonnullRefPtr<Session>, Web::WebDriver::Error> Session::find_session(StringView session_id, Web::WebDriver::SessionFlags session_flags, AllowInvalidWindowHandle allow_invalid_window_handle)
 {
@@ -287,7 +349,7 @@ void Session::arm_browser_startup_timeout(NonnullRefPtr<ServerPromise> promise)
 {
     m_start_promise = move(promise);
     static constexpr u32 BROWSER_STARTUP_TIMEOUT_MS = 30'000;
-    m_start_timer = Core::Timer::create_single_shot(BROWSER_STARTUP_TIMEOUT_MS, [this] {
+    m_start_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(BROWSER_STARTUP_TIMEOUT_MS), [this] {
         [[maybe_unused]] auto timer_lifetime_guard = move(m_start_timer);
         reject_start_promise(Error::from_string_literal("Timed out waiting for browser startup"));
         close();
@@ -314,6 +376,7 @@ void Session::close()
     if (m_closing)
         return;
     m_closing = true;
+    revoke_weak_refs();
 
     // NB: Step 2 removes this session from the active-sessions map — usually dropping the last reference to it. So hold
     //     a strong reference across close() — so removal can't destroy the session while the steps below still use it.
@@ -325,6 +388,11 @@ void Session::close()
 
     // 2. Remove session from active sessions.
     s_sessions.remove(m_session_id);
+
+    // https://w3c.github.io/webdriver-bidi/#cleanup-the-session
+    // 1. Close the WebSocket connections with session.
+    if (m_bidi_session)
+        m_bidi_session->close_the_websocket_connections();
 
     // 3. Perform the following substeps based on the remote end's type:
     // -> Remote end is an endpoint node
@@ -361,6 +429,7 @@ void Session::close()
         m_browser_connection->on_did_create_window = nullptr;
         m_browser_connection->on_did_close_window = nullptr;
         m_browser_connection->on_command_complete = nullptr;
+        m_browser_connection->on_bidi_event = nullptr;
         m_browser_connection->async_close_session();
         m_browser_connection = nullptr;
     }
@@ -425,6 +494,11 @@ ErrorOr<void> Session::accept_browser_transport(NonnullOwnPtr<IPC::Transport> tr
             promise.value()->reject(response.release_error());
         else
             promise.value()->resolve(response.release_value());
+    };
+
+    browser_connection->on_bidi_event = [this](String name, JsonValue params, Vector<String> top_level_traversable_ids, Vector<String> user_context_ids) {
+        if (m_bidi_session)
+            m_bidi_session->did_receive_event(name, move(params), top_level_traversable_ids, user_context_ids);
     };
 
     m_browser_connection = move(browser_connection);
@@ -526,6 +600,13 @@ NonnullRefPtr<Session::WebDriverPromise> Session::traverse_history(i32 delta, Ha
     });
 }
 
+NonnullRefPtr<Session::WebDriverPromise> Session::set_permission(JsonValue parameters)
+{
+    return perform_browser_command([this, parameters = move(parameters)](u64 command_id) mutable {
+        m_browser_connection->async_set_permission(command_id, m_current_window_handle, move(parameters));
+    });
+}
+
 NonnullRefPtr<Session::WebDriverPromise> Session::session_history()
 {
     return perform_browser_command([this](u64 command_id) {
@@ -576,6 +657,9 @@ void Session::remove_window(StringView window_handle)
     if (!m_windows.remove(window_handle))
         return;
 
+    if (m_bidi_session)
+        m_bidi_session->did_close_top_level_traversable(MUST(String::from_utf8(window_handle)));
+
     if (m_current_window_handle == window_handle)
         m_current_window_handle = "NoSuchWindowPleaseSelectANewOne"_string;
 
@@ -586,7 +670,7 @@ void Session::remove_window(StringView window_handle)
 ErrorOr<void> Session::create_server()
 {
 #if defined(AK_OS_WINDOWS)
-    static_assert(IsSame<IPC::Transport, IPC::TransportSocketWindows>, "Need to handle other IPC transports here");
+    static_assert(IsSame<IPC::Transport, IPC::TransportWindows>, "Need to handle other IPC transports here");
 #elif defined(AK_OS_MACOS)
     static_assert(IsSame<IPC::Transport, IPC::TransportMachPort>, "Need to handle other IPC transports here");
 #else
@@ -600,11 +684,12 @@ ErrorOr<void> Session::create_server()
     if (!m_browser_mach_port_server->is_initialized())
         return Error::from_string_literal("Failed to initialize Mach port server for WebDriver");
 
-    m_browser_mach_port_server->on_bootstrap_request = [this](auto request) {
+    m_browser_mach_port_server->on_bootstrap_request = [this, weak_session = make_weak_ref()](auto request) {
         auto result = m_transport_bootstrap_server.handle_bootstrap_request(request.pid, move(request.reply_port));
         if (result.is_error()) {
-            m_event_loop.deferred_invoke([this, error = result.release_error()]() mutable {
-                reject_start_promise(move(error));
+            m_event_loop.deferred_invoke([weak_session, error = result.release_error()]() mutable {
+                if (auto session = weak_session.strong_ref())
+                    session->reject_start_promise(move(error));
             });
             return;
         }
@@ -613,10 +698,13 @@ ErrorOr<void> Session::create_server()
             [](IPC::TransportBootstrapMachServer::ChildTransportHandled) {
                 VERIFY_NOT_REACHED();
             },
-            [this](IPC::TransportBootstrapMachServer::OnDemandTransport& transport) {
-                m_event_loop.deferred_invoke([this, transport = move(transport.ports)]() mutable {
-                    if (auto result = accept_browser_transport(make<IPC::Transport>(move(transport.receive_right), move(transport.send_right))); result.is_error())
-                        reject_start_promise(result.release_error());
+            [this, weak_session](IPC::TransportBootstrapMachServer::OnDemandTransport& transport) {
+                m_event_loop.deferred_invoke([weak_session, transport = move(transport.ports)]() mutable {
+                    auto session = weak_session.strong_ref();
+                    if (!session)
+                        return;
+                    if (auto result = session->accept_browser_transport(make<IPC::Transport>(move(transport.receive_right), move(transport.send_right))); result.is_error())
+                        session->reject_start_promise(result.release_error());
                 });
             });
     };
@@ -660,7 +748,7 @@ ErrorOr<NonnullRefPtr<Session::ServerPromise>> Session::start(LaunchBrowserCallb
 #endif
     TRY(create_server());
 
-    m_browser_process = TRY(launch_browser_callback(m_browser_endpoint, m_options.headless));
+    m_browser_process = TRY(launch_browser_callback(m_browser_endpoint, m_options.headless, m_proxy_autoconfig_url));
     arm_browser_startup_timeout(promise);
     return promise;
 }
@@ -802,6 +890,49 @@ void Session::remove_window_handle_became_available_callback(String const& handl
 
     if (callbacks->value.is_empty())
         m_window_handle_became_available_callbacks.remove(callbacks);
+}
+
+bool Session::is_active() const
+{
+    return s_sessions.contains(m_session_id);
+}
+
+Vector<String> Session::top_level_traversable_ids() const
+{
+    // https://w3c.github.io/webdriver-bidi/#type-browsingContext-Browsingcontext
+    // For navigables with an associated WebDriver window handle the navigable id must be the same as the window handle.
+    Vector<String> ids;
+    ids.ensure_capacity(m_windows.size());
+    for (auto const& window_handle : m_windows.keys())
+        ids.unchecked_append(window_handle);
+    return ids;
+}
+
+NonnullRefPtr<Session::WebDriverPromise> Session::perform_bidi_browser_command(StringView method, JsonValue params)
+{
+    return perform_browser_command([this, method = MUST(String::from_utf8(method)), params = move(params)](u64 command_id) mutable {
+        m_browser_connection->async_bidi_command(command_id, move(method), move(params));
+    });
+}
+
+NonnullRefPtr<Session::WebDriverPromise> Session::get_bidi_top_level_traversables(Vector<String> navigable_ids)
+{
+    return perform_browser_command([this, navigable_ids = move(navigable_ids)](u64 command_id) mutable {
+        m_browser_connection->async_bidi_get_top_level_traversables(command_id, move(navigable_ids));
+    });
+}
+
+NonnullRefPtr<Session::WebDriverPromise> Session::run_bidi_subscribe_steps(String const& event_name, Vector<String> top_level_traversable_ids)
+{
+    return perform_browser_command([this, event_name, top_level_traversable_ids = move(top_level_traversable_ids)](u64 command_id) mutable {
+        m_browser_connection->async_bidi_run_subscribe_steps(command_id, event_name, move(top_level_traversable_ids));
+    });
+}
+
+void Session::set_bidi_enabled_events(Vector<String> event_names, HashMap<String, Optional<Vector<String>>> event_contexts)
+{
+    if (m_browser_connection)
+        m_browser_connection->async_set_bidi_enabled_events(move(event_names), move(event_contexts));
 }
 
 ErrorOr<void, Web::WebDriver::Error> Session::ensure_current_window_handle_is_valid() const

@@ -33,6 +33,7 @@
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/Promise.h>
 
@@ -46,6 +47,16 @@ GC::Ref<FontFaceSet> FontFaceSet::create(HTML::EnvironmentSettingsObject& enviro
     HTML::TemporaryExecutionContext temporary_execution_context { realm };
     auto font_face_set = GC::Heap::the().allocate<FontFaceSet>(environment);
     return font_face_set;
+}
+
+void FontFaceSet::record_loading_fonts()
+{
+    if (!Core::StatsLog::the())
+        return;
+    auto* window = HTML::window_from_global_object(relevant_settings_object().global_object());
+    if (!window || window->associated_document().fonts().ptr() != this)
+        return;
+    set_rendering_pending(window->associated_document(), RenderingPendingReason::FontLoads, m_loading_fonts.size());
 }
 
 FontFaceSet::FontFaceSet(HTML::EnvironmentSettingsObject& environment)
@@ -99,9 +110,8 @@ void FontFaceSet::add_css_connected_font(NonnullRefPtr<FontFaceState> face)
     face->add_to_set(*this);
 
     if (face->should_be_registered_with_font_computer()) {
-        auto& global = relevant_settings_object().global_object();
-        if (auto* window = HTML::window_from_global_object(global))
-            window->associated_document().font_computer().register_font_face(face);
+        if (auto font_computer = font_computer_for_font_source(relevant_settings_object().global_object()); font_computer.has_value())
+            font_computer->register_font_face(face);
     }
 
     // 4. If font’s status attribute is "loading"
@@ -113,6 +123,7 @@ void FontFaceSet::add_css_connected_font(NonnullRefPtr<FontFaceState> face)
 
         // 2. Append font to the FontFaceSet’s [[LoadingFonts]] list.
         m_loading_fonts.append(*face);
+        did_change_loading_fonts();
     }
 }
 
@@ -199,9 +210,8 @@ bool FontFaceSet::remove_font_face(NonnullRefPtr<FontFaceState> face, AllowCSSCo
         return false;
 
     if (face->should_be_registered_with_font_computer()) {
-        auto& global = relevant_settings_object().global_object();
-        if (auto* window = HTML::window_from_global_object(global))
-            window->associated_document().font_computer().unregister_font_face(*face);
+        if (auto font_computer = font_computer_for_font_source(relevant_settings_object().global_object()); font_computer.has_value())
+            font_computer->unregister_font_face(*face);
     }
 
     // 2. Let deleted be the result of removing font from the FontFaceSet’s set entries.
@@ -217,6 +227,7 @@ bool FontFaceSet::remove_font_face(NonnullRefPtr<FontFaceState> face, AllowCSSCo
     // 4. If font is present in the FontFaceSet’s [[LoadingFonts]] list, remove it.
     //    If font was the last item in that list (and so the list is now empty), switch the FontFaceSet to loaded.
     bool was_in_loading_fonts = m_loading_fonts.remove_all_matching([face](auto const& entry) { return entry == face; });
+    did_change_loading_fonts();
     if (was_in_loading_fonts && m_loading_fonts.is_empty())
         switch_to_loaded();
 
@@ -228,12 +239,12 @@ void FontFaceSet::clear()
 {
     // 1. Remove all non-CSS-connected items from the FontFaceSet's set entries,
     //    its [[LoadedFonts]] list, and its [[FailedFonts]] list.
-    auto* window = HTML::window_from_global_object(relevant_settings_object().global_object());
+    auto font_computer = font_computer_for_font_source(relevant_settings_object().global_object());
     for (auto& font_face : m_font_faces) {
         if (font_face->is_css_connected())
             continue;
-        if (window && font_face->should_be_registered_with_font_computer())
-            window->associated_document().font_computer().unregister_font_face(font_face);
+        if (font_computer.has_value() && font_face->should_be_registered_with_font_computer())
+            font_computer->unregister_font_face(font_face);
         Bindings::did_remove_font_face(*this, font_face);
         font_face->remove_from_set(*this);
     }
@@ -246,6 +257,7 @@ void FontFaceSet::clear()
     //    then switch the FontFaceSet to loaded.
     if (!m_loading_fonts.is_empty()) {
         m_loading_fonts.clear();
+        did_change_loading_fonts();
         switch_to_loaded();
     }
 }
@@ -322,7 +334,7 @@ static WebIDL::ExceptionOr<GC::Ref<GC::HeapVector<NonnullRefPtr<FontFaceState>>>
         auto font_family_name = string_from_style_value(font_family);
 
         for (auto font_face : font_face_set.font_faces()) {
-            if (font_face->family() != font_family_name)
+            if (font_face->family_name() != font_family_name)
                 continue;
 
             if (!matched_font_faces->elements().contains_slow(font_face))
@@ -524,12 +536,18 @@ void FontFaceSet::switch_to_loaded()
         return;
 
     // 3. Set font face set’s status attribute to "loaded".
+    auto was_loading = m_status == FontFaceSetLoadStatus::Loading;
     m_status = FontFaceSetLoadStatus::Loaded;
 
     // 4. Fulfill font face set’s [[ReadyPromise]] attribute’s value with font face set.
     auto& realm = relevant_settings_object().realm();
     HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
     Bindings::resolve_font_face_set_promise(realm, m_ready_promise, *this);
+
+    // AD-HOC: A set that never switched to loading only fulfills its ready promise. Firing loadingdone for it would
+    //         report a load that never happened.
+    if (!was_loading)
+        return;
 
     // 5. Queue a task to perform the following steps synchronously:
     HTML::queue_a_task(HTML::Task::Source::FontLoading, nullptr, nullptr, GC::create_function(GC::Heap::the(), [this] {

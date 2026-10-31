@@ -5,12 +5,20 @@ set(SOURCES
     CSS/PreferredColorScheme.cpp
     CSS/StyleSheetIdentifier.cpp
     CSS/SystemColor.cpp
+    Fetch/Infrastructure/DataURL.cpp
     Fetch/Infrastructure/HTTP/Statuses.cpp
+    Fetch/Infrastructure/URL.cpp
     FileAPI/BlobURLStore.cpp
     FileAPI/SerializedBlobURLEntry.cpp
+    Gamepad/GamepadInput.cpp
+    Gamepad/GamepadSharedState.cpp
+    Gamepad/GamepadSnapshot.cpp
+    Gamepad/GamepadStateBuffer.cpp
     HTML/AutoplayPolicy.cpp
     HTML/BroadcastChannelMessage.cpp
     HTML/BrowsingContext.cpp
+    HTML/CrossOrigin/OpenerPolicy.cpp
+    HTML/CrossOrigin/OpenerPolicyEnforcement.cpp
     HTML/CrossProcessId.cpp
     HTML/EmbedderPolicy.cpp
     HTML/FileFilter.cpp
@@ -36,20 +44,34 @@ set(SOURCES
     HTML/WebViewHints.cpp
     HTML/WorkerAgentTypes.cpp
     Infra/Strings.cpp
+    Loader/ContentBlocking.cpp
     Loader/DownloadFilename.cpp
+    Loader/LoaderConfigSnapshot.cpp
     Loader/SiteCompatibility.cpp
     MimeSniff/MimeType.cpp
+    MimeSniff/Resource.cpp
     Page/AsyncScrollNodeStableID.cpp
     Page/DragEvent.cpp
     Page/InputEvent.cpp
+    Page/InputRoutingDecision.cpp
+    Page/InputTrace.cpp
     Page/MediaContextMenu.cpp
+    Page/SpellingError.cpp
+    Page/WritingSuggestion.cpp
+    Permissions/Permissions.cpp
+    PermissionsPolicy/PermissionsPolicy.cpp
     PixelUnits.cpp
     ReferrerPolicy/ReferrerPolicy.cpp
+    SecureContexts/AbstractOperations.cpp
     StorageAPI/StorageEndpoint.cpp
     StorageAPI/StorageKey.cpp
+    UpgradeInsecureRequests/InsecureRequestsPolicy.cpp
+    WebDriver/BiDi.cpp
     WebDriver/Capabilities.cpp
     WebDriver/Client.cpp
     WebDriver/Error.cpp
+    WebDriver/Input.cpp
+    WebDriver/Network.cpp
     WebDriver/Proxy.cpp
     WebDriver/Response.cpp
     WebDriver/TimeoutsConfiguration.cpp
@@ -58,11 +80,9 @@ set(SOURCES
     WebView/BrowsingBehavior.cpp
     WebView/ConsoleOutput.cpp
     WebView/Debugger.cpp
-    WebView/DictionaryLookup.cpp
     WebView/DOMNodeProperties.cpp
     WebView/Geolocation.cpp
     WebView/Mutation.cpp
-    WebView/ProcessHandle.cpp
     WebView/SiteIsolation.cpp
     WebView/Utilities.cpp
 )
@@ -91,6 +111,17 @@ invoke_py_generator(
                  "${LADYBIRD_SOURCE_DIR}/Libraries/LibWeb/CSS/LogicalPropertyGroups.json"
                  "${LADYBIRD_SOURCE_DIR}/Meta/Utils/utils.py"
 )
+
+compile_ipc(ContentSecurityPolicy/RemoteViolationDirective.ipc ContentSecurityPolicy/RemoteViolationDirectiveCodecs.h)
+compile_ipc(HTML/NavigationResponse.ipc HTML/NavigationResponseCodecs.h)
+compile_ipc(MixedContent/ProhibitsMixedSecurityContexts.ipc MixedContent/ProhibitsMixedSecurityContextsCodecs.h)
+compile_ipc(Page/InputEvent.ipc Page/InputEventCodecs.h)
+compile_ipc(Page/TextEditingCommand.ipc Page/TextEditingCommandCodecs.h)
+compile_ipc(PixelUnits.ipc PixelUnitsCodecs.h)
+compile_ipc(UpgradeInsecureRequests/InsecureRequestsPolicy.ipc UpgradeInsecureRequests/InsecureRequestsPolicyCodecs.h)
+compile_ipc(WebView/AccessibilityNodeData.ipc WebView/AccessibilityNodeDataCodecs.h)
+compile_ipc(WebView/DictionaryLookup.ipc WebView/DictionaryLookupCodecs.h)
+compile_ipc(WebDriver/BiDi.ipc WebDriver/BiDiCodecs.h)
 
 # NB: The protocols between the UI process and the processes it hosts web content in only use LibWebCommon types, so
 #     both sides generate their endpoints from here.
@@ -130,7 +161,14 @@ endif()
 ladybird_lib(LibWebCommon webcommon EXPLICIT_SYMBOL_EXPORT)
 # NB: The enumerations of LibWeb's IDL modules are generated into LibWebCommon along with LibWeb's bindings.
 add_dependencies(LibWebCommon generate_bindings)
-target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibFileSystem LibGfx LibHTTP LibIPC LibURL)
+target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibFileSystem LibGfx LibHTTP LibIPC LibRequests LibURL)
+
+import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libwebcommon_rust FEATURES allocator FFI_HEADER RustFFI.h)
+target_link_libraries(LibWebCommon PRIVATE libwebcommon_rust)
+target_link_libraries(libwebcommon_rust INTERFACE LibUnicode LibRegex)
+get_target_property(_libwebcommon_rust_lib libwebcommon_rust IMPORTED_LOCATION)
+set_property(SOURCE Fetch/Infrastructure/DataURL.cpp MimeSniff/MimeType.cpp MimeSniff/Resource.cpp APPEND PROPERTY OBJECT_DEPENDS ${_libwebcommon_rust_lib})
+test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libwebcommon_rust)
 
 if (ENABLE_INSTALL_HEADERS)
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/CSS/PropertyList.h" "${CMAKE_CURRENT_BINARY_DIR}/CSS/PseudoElement.h" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibWebCommon/CSS")

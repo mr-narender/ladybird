@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::record::trace::Observer;
 
 use crate::css::css_enums::{
@@ -15,8 +16,8 @@ use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::recorder::{PaintStyleOrColor, StrokePathParams};
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::record::PaintRecorder;
-use libgfx_rust::path::PathBuilder;
-use libgfx_rust::{CapStyle, Color, IntPoint, JoinStyle, LineStyle, ShouldAntiAlias};
+use libgfx_rust::path::Path;
+use libgfx_rust::{CapStyle, Color, FloatPoint, IntPoint, JoinStyle, LineStyle, ShouldAntiAlias};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct TextDecorationSet {
@@ -42,18 +43,18 @@ fn text_decoration_lines(style: crate::css::computed_value_views::ComputedValues
         return &[];
     }
     // SAFETY: The retained list belongs to the style group payload, which outlives the pass.
-    unsafe { std::slice::from_raw_parts(list.pointer, list.length) }
+    unsafe { ak::slice_from_raw_parts(list.pointer, list.length) }
 }
 
 fn first_available_font(
-    arena: &crate::layout::LayoutNodeArena,
+    arena: &impl PaintRead,
     node: crate::layout::node_data::NodeSlotId,
 ) -> Option<libgfx_rust::font::FontHandle> {
     Some(arena.node_style_if_live(node)?.first_available_font())
 }
 
 fn resolve_text_decoration_thickness(
-    arena: &crate::layout::LayoutNodeArena,
+    arena: &impl PaintRead,
     value_node: crate::layout::node_data::NodeSlotId,
     basis_node: crate::layout::node_data::NodeSlotId,
     glyph_height: CssPixels,
@@ -96,7 +97,7 @@ fn anchor_for_decorating_box<O: Observer>(
     if decorating_node == text_parent {
         return (fragment.baseline, true);
     }
-    let side = recorder.layout_arena.paintable_side_data(block);
+    let side = recorder.source.committed_side_data(block);
     for piece in side.inline_box_pieces() {
         if piece.node == decorating_node && piece.line_index == fragment.line_index {
             return (
@@ -122,8 +123,8 @@ pub(crate) fn decoration_sets_for_span<O: Observer>(
     if span.start_code_unit == span.end_code_unit {
         return sets;
     }
-    let arena = recorder.layout_arena;
-    let side = recorder.layout_arena.paintable_side_data(block);
+    let arena = recorder.source;
+    let side = recorder.source.committed_side_data(block);
     let fragment = &side.fragments()[span.fragment_index as usize];
     let text_parent = fragment.style_source;
 
@@ -244,16 +245,20 @@ pub(crate) fn decoration_sets_for_span<O: Observer>(
     // https://drafts.csswg.org/css-pseudo-4/#highlight-text
     // Any text decorations introduced by each highlight pseudo-element are stacked in the same order as their
     // backgrounds over the text's original decorations and are all drawn, each decoration in its own color.
-    if let Some(selection_text_decoration) = &span.selection_text_decoration {
+    for text_decoration in span
+        .highlights
+        .iter()
+        .filter_map(|overlay| overlay.text_decoration.as_ref())
+    {
         let glyph_height = first_available_font(arena, text_parent).map_or(CssPixels::from_raw(0), |font| {
             CssPixels::nearest_value_for_f32(font.facts().pixel_size)
         });
         let thickness = resolve_text_decoration_thickness(arena, text_parent, text_parent, glyph_height);
         push_set(
             text_parent,
-            &selection_text_decoration.lines[..selection_text_decoration.line_count as usize],
-            selection_text_decoration.style,
-            selection_text_decoration.color,
+            &text_decoration.lines[..text_decoration.line_count as usize],
+            text_decoration.style,
+            text_decoration.color,
             thickness,
         );
     }
@@ -278,7 +283,7 @@ fn compute_skip_ink_segments<O: Observer>(
     line_thickness: i32,
     font_size: f32,
 ) -> Vec<DecorationSegment> {
-    let side = recorder.layout_arena.paintable_side_data(block);
+    let side = recorder.source.committed_side_data(block);
     let fragment = &side.fragments()[fragment_index as usize];
     let Some(run) = &fragment.glyph_run else {
         return vec![DecorationSegment {
@@ -289,7 +294,7 @@ fn compute_skip_ink_segments<O: Observer>(
     // The text blob is drawn at baseline_start on the canvas. Compute that same origin so we can convert between
     // device-pixel coordinates and blob-local coordinates.
     let scale = recorder.inputs.device_pixels_per_css_pixel;
-    let fragment_absolute_rect = crate::painting::text_fragment::absolute_rect(recorder.layout_arena, fragment);
+    let fragment_absolute_rect = crate::painting::text_fragment::absolute_rect(recorder.source, fragment);
     let blob_origin_x = fragment_absolute_rect.x.to_float() * scale as f32;
     let blob_origin_y = (fragment_absolute_rect.y.to_float() + fragment.baseline.to_float()) * scale as f32;
 
@@ -340,12 +345,15 @@ fn compute_skip_ink_segments<O: Observer>(
     segments
 }
 
-fn build_triangle_wave_path(from: IntPoint, to: IntPoint, amplitude: f32) -> PathBuilder {
-    let mut path = PathBuilder::new();
+fn build_triangle_wave_path(from: IntPoint, to: IntPoint, amplitude: f32) -> Path {
+    let mut path = Path::new();
     if from.y != to.y {
         return path;
     }
-    path.move_to(from.x as f32, from.y as f32);
+    path.move_to(FloatPoint {
+        x: from.x as f32,
+        y: from.y as f32,
+    });
 
     let wavelength = amplitude * 2.0;
     let half_wavelength = amplitude;
@@ -356,51 +364,63 @@ fn build_triangle_wave_path(from: IntPoint, to: IntPoint, amplitude: f32) -> Pat
     let mut remaining = (to.x as f32 - position_x).abs();
     while remaining > wavelength {
         // Draw a whole wave
-        path.line_to(position_x + quarter_wavelength, position_y - quarter_wavelength);
-        path.line_to(
-            position_x + quarter_wavelength + half_wavelength,
-            position_y + quarter_wavelength,
-        );
-        path.line_to(position_x + wavelength, position_y);
+        path.line_to(FloatPoint {
+            x: position_x + quarter_wavelength,
+            y: position_y - quarter_wavelength,
+        });
+        path.line_to(FloatPoint {
+            x: position_x + quarter_wavelength + half_wavelength,
+            y: position_y + quarter_wavelength,
+        });
+        path.line_to(FloatPoint {
+            x: position_x + wavelength,
+            y: position_y,
+        });
         position_x += wavelength;
         remaining = (to.x as f32 - position_x).abs();
     }
 
     // Up
     if remaining > quarter_wavelength {
-        path.line_to(position_x + quarter_wavelength, position_y - quarter_wavelength);
+        path.line_to(FloatPoint {
+            x: position_x + quarter_wavelength,
+            y: position_y - quarter_wavelength,
+        });
         position_x += quarter_wavelength;
         remaining = (to.x as f32 - position_x).abs();
     } else if remaining >= 1.0 {
         let fraction = remaining / quarter_wavelength;
-        path.line_to(
-            position_x + (fraction * quarter_wavelength),
-            position_y - (fraction * quarter_wavelength),
-        );
+        path.line_to(FloatPoint {
+            x: position_x + (fraction * quarter_wavelength),
+            y: position_y - (fraction * quarter_wavelength),
+        });
         remaining = 0.0;
     }
 
     // Down
     if remaining > half_wavelength {
-        path.line_to(position_x + half_wavelength, position_y + quarter_wavelength);
+        path.line_to(FloatPoint {
+            x: position_x + half_wavelength,
+            y: position_y + quarter_wavelength,
+        });
         position_x += half_wavelength;
         remaining = (to.x as f32 - position_x).abs();
     } else if remaining >= 1.0 {
         let fraction = remaining / half_wavelength;
-        path.line_to(
-            position_x + (fraction * half_wavelength),
-            position_y - quarter_wavelength + (fraction * half_wavelength),
-        );
+        path.line_to(FloatPoint {
+            x: position_x + (fraction * half_wavelength),
+            y: position_y - quarter_wavelength + (fraction * half_wavelength),
+        });
         remaining = 0.0;
     }
 
     // Back to middle
     if remaining >= 1.0 {
         let fraction = remaining / quarter_wavelength;
-        path.line_to(
-            position_x + (fraction * quarter_wavelength),
-            position_y + ((1.0 - fraction) * quarter_wavelength),
-        );
+        path.line_to(FloatPoint {
+            x: position_x + (fraction * quarter_wavelength),
+            y: position_y + ((1.0 - fraction) * quarter_wavelength),
+        });
     }
     path
 }
@@ -593,7 +613,7 @@ pub(crate) fn paint_decoration_lines<O: Observer>(
                         x: segment.end_x,
                         y: wave_y,
                     };
-                    let path = build_triangle_wave_path(from, to, amplitude as f32).build();
+                    let path = build_triangle_wave_path(from, to, amplitude as f32);
                     recorder.recorder.stroke_path(StrokePathParams {
                         force_dark_role: ForceDarkRole::Foreground,
                         cap_style: CapStyle::Round,

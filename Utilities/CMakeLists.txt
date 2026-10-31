@@ -1,23 +1,18 @@
-ladybird_utility(js SOURCES js.cpp LIBS LibCrypto LibJS LibMain LibTextCodec LibGC)
-ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibMain LibJS LibCrypto LibGC)
-
+ladybird_utility(js SOURCES js.cpp LIBS LibJSStandalone LibMain)
 if (NOT WIN32 AND NOT ANDROID)
     target_link_libraries(js PRIVATE PkgConfig::LIBEDIT)
 endif()
+ladybird_utility(wasm SOURCES wasm.cpp LIBS LibFileSystem LibWasm LibMain LibJSStandalone LibCrypto LibGC)
 
 ladybird_utility(xml SOURCES xml.cpp LIBS LibFileSystem LibMain LibXML LibURL)
 ladybird_utility(dns SOURCES dns.cpp LIBS LibDNS LibMain LibTLS LibCrypto)
-
-if (ENABLE_GUI_TARGETS)
-    ladybird_utility(image SOURCES image.cpp LIBS LibGfx LibImageDecoders LibMain)
-endif()
 
 # FIXME: Increase support for building targets on Windows
 if (WIN32)
     return()
 endif()
 
-ladybird_utility(test262-runner SOURCES test262-runner.cpp LIBS LibJS LibFileSystem LibGC LibMain)
+ladybird_utility(test262-runner SOURCES test262-runner.cpp LIBS LibJSStandalone LibMain)
 ladybird_utility(dump-html-tokens SOURCES dump-html-tokens.cpp LIBS LibMain LibWeb)
 ladybird_utility(dump-html-tree SOURCES dump-html-tree.cpp LIBS LibMain LibWeb LibJS LibGC LibGfx LibIPC LibURL)
 
@@ -33,7 +28,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     )
 endif()
 
-if (ASSERT_FAIL_HAS_INT)
+if (ASSERT_FAIL_HAS_INT AND TARGET test262-runner)
     target_compile_definitions(test262-runner PRIVATE ASSERT_FAIL_HAS_INT)
 endif()
 
@@ -54,29 +49,11 @@ set(GIT_COMMIT_FILE "${CMAKE_BINARY_DIR}/COMMIT")
 file(WRITE "${GIT_COMMIT_FILE}" "${GIT_COMMIT_HASH}\n")
 
 if (NOT CMAKE_SKIP_INSTALL_RULES)
-    install(TARGETS js COMPONENT js)
+    if (TARGET js)
+        install(TARGETS js COMPONENT js)
+    endif()
     install(FILES "${GIT_COMMIT_FILE}" COMPONENT js DESTINATION .)
 
     install(TARGETS wasm COMPONENT wasm)
     install(FILES "${GIT_COMMIT_FILE}" COMPONENT wasm DESTINATION .)
-
-    set(CPACK_GENERATOR "TGZ")
-    set(CPACK_STRIP_FILES TRUE)
-    set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
-    set(CPACK_COMPONENTS_ALL js wasm)
-    set(CPACK_COMPONENTS_GROUPING ONE_PER_GROUP)
-    if (APPLE)
-        if("arm64" IN_LIST CMAKE_OSX_ARCHITECTURES AND "x86_64" IN_LIST CMAKE_OSX_ARCHITECTURES)
-            set(CPACK_SYSTEM_NAME "macOS-universal2")
-        else()
-            set(CPACK_SYSTEM_NAME "macOS-${CMAKE_SYSTEM_PROCESSOR}")
-        endif()
-    else()
-        set(CPACK_SYSTEM_NAME "${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
-    endif()
-
-    set(CPACK_ARCHIVE_JS_FILE_NAME "ladybird-js-${CPACK_SYSTEM_NAME}")
-    set(CPACK_ARCHIVE_WASM_FILE_NAME "ladybird-wasm-${CPACK_SYSTEM_NAME}")
-
-    include(CPack)
 endif()

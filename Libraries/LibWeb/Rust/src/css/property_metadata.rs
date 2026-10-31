@@ -103,7 +103,6 @@ pub(crate) fn property_has_hashless_hex_color_quirk(property_id: u16) -> bool {
 /// How much of the computation a property needs, mirroring the C++
 /// requires-computation levels: 0 = never, 1 = with the cascaded value,
 /// 2 = with any non-inherited value, 3 = always.
-pub const REQUIRES_COMPUTATION_NEVER: u8 = 0;
 pub const REQUIRES_COMPUTATION_CASCADED: u8 = 1;
 pub const REQUIRES_COMPUTATION_NON_INHERITED: u8 = 2;
 pub const REQUIRES_COMPUTATION_ALWAYS: u8 = 3;
@@ -140,6 +139,25 @@ pub fn property_may_affect_layout_geometry(property_id: u16) -> bool {
     PROPERTY_MAY_AFFECT_LAYOUT_GEOMETRY[longhand_index(property_id)]
 }
 
+/// Whether changing a property may move where a scroll container snaps, besides the properties
+/// which affect its scrollable overflow.
+pub(crate) fn property_may_resnap_scroll_container(property_id: u16) -> bool {
+    matches!(
+        property_id,
+        property_id::SCROLL_SNAP_TYPE
+            | property_id::SCROLL_SNAP_ALIGN
+            | property_id::SCROLL_SNAP_STOP
+            | property_id::SCROLL_MARGIN_TOP
+            | property_id::SCROLL_MARGIN_RIGHT
+            | property_id::SCROLL_MARGIN_BOTTOM
+            | property_id::SCROLL_MARGIN_LEFT
+            | property_id::SCROLL_PADDING_TOP
+            | property_id::SCROLL_PADDING_RIGHT
+            | property_id::SCROLL_PADDING_BOTTOM
+            | property_id::SCROLL_PADDING_LEFT
+    )
+}
+
 pub(crate) fn property_affects_layout(property_id: u16) -> bool {
     PROPERTY_AFFECTS_LAYOUT[longhand_index(property_id)]
 }
@@ -172,11 +190,11 @@ pub(crate) fn property_initial_value(property_id: u16) -> &'static str {
 }
 
 pub(crate) fn pseudo_element_supports_property(pseudo_element: u8, property_id: u16) -> bool {
-    if PSEUDO_ELEMENT_ALWAYS_ALLOWED_PROPERTIES
+    if PSEUDO_ELEMENT_TRANSITION_AND_ANIMATION_PROPERTIES
         .binary_search(&property_id)
         .is_ok()
     {
-        return true;
+        return PSEUDO_ELEMENT_ACCEPTS_ANIMATIONS[pseudo_element as usize];
     }
     match PSEUDO_ELEMENT_PROPERTY_WHITELISTS[pseudo_element as usize] {
         Some(whitelist) => whitelist.binary_search(&property_id).is_ok(),
@@ -184,16 +202,11 @@ pub(crate) fn pseudo_element_supports_property(pseudo_element: u8, property_id: 
     }
 }
 
-/// Whether a pseudo-element's own whitelist names the property, leaving out the properties every
-/// pseudo-element accepts.
+/// Whether a pseudo-element's own whitelist names the property, leaving out the transition and animation
+/// properties.
 pub(crate) fn pseudo_element_whitelist_names_property(pseudo_element: u8, property_id: u16) -> bool {
     PSEUDO_ELEMENT_PROPERTY_WHITELISTS[pseudo_element as usize]
         .is_some_and(|whitelist| whitelist.binary_search(&property_id).is_ok())
-}
-
-/// https://drafts.csswg.org/css-pseudo-4/#highlight-pseudos
-pub(crate) fn pseudo_element_is_highlight(pseudo_element: u8) -> bool {
-    PSEUDO_ELEMENT_IS_HIGHLIGHT[pseudo_element as usize]
 }
 
 /// An accepted numeric range for one CSS value type.
@@ -215,46 +228,32 @@ pub fn property_computation_order() -> &'static [u16] {
 
 /// FFI accessors for the parity test on the C++ side.
 ///
-/// # Safety
-/// `out_length` must be a valid pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_property_metadata_computation_order(out_length: *mut usize) -> *const u16 {
-    unsafe { *out_length = PROPERTY_COMPUTATION_ORDER.len() };
-    PROPERTY_COMPUTATION_ORDER.as_ptr()
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_property_metadata_is_inherited(property_id: u16) -> bool {
     property_is_inherited(property_id)
 }
 
-/// # Safety
-/// `out_length` must be a valid pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_property_metadata_numeric_ranges(
+pub extern "C" fn rust_property_metadata_numeric_ranges(
     property_id: u16,
-    out_length: *mut usize,
+    out_length: &mut usize,
 ) -> *const FfiPropertyNumericRange {
     let ranges = property_numeric_ranges(property_id);
-    unsafe { *out_length = ranges.len() };
+    *out_length = ranges.len();
     ranges.as_ptr()
 }
 
-/// # Safety
-/// All out-pointers must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_property_metadata_bounds(
-    out_first_longhand: *mut u16,
-    out_last_longhand: *mut u16,
-    out_first_inherited: *mut u16,
-    out_last_inherited: *mut u16,
+pub extern "C" fn rust_property_metadata_bounds(
+    out_first_longhand: &mut u16,
+    out_last_longhand: &mut u16,
+    out_first_inherited: &mut u16,
+    out_last_inherited: &mut u16,
 ) {
-    unsafe {
-        *out_first_longhand = FIRST_LONGHAND_PROPERTY_ID;
-        *out_last_longhand = LAST_LONGHAND_PROPERTY_ID;
-        *out_first_inherited = FIRST_INHERITED_PROPERTY_ID;
-        *out_last_inherited = LAST_INHERITED_PROPERTY_ID;
-    }
+    *out_first_longhand = FIRST_LONGHAND_PROPERTY_ID;
+    *out_last_longhand = LAST_LONGHAND_PROPERTY_ID;
+    *out_first_inherited = FIRST_INHERITED_PROPERTY_ID;
+    *out_last_inherited = LAST_INHERITED_PROPERTY_ID;
 }
 
 pub fn property_is_shorthand(property_id: u16) -> bool {
@@ -271,6 +270,54 @@ pub(crate) fn property_defines_a_css_transition(property_id: u16) -> bool {
             | property_id::TRANSITION_PROPERTY
             | property_id::TRANSITION_TIMING_FUNCTION
     )
+}
+
+/// Each shorthand with its longhands, through any shorthand nested in it (`border-width` in `border`), sorted.
+fn shorthand_leaf_longhands() -> &'static [(u16, Box<[u16]>)] {
+    fn leaf_longhands(property: u16, leaves: &mut Vec<u16>) {
+        for &longhand in longhands_for_shorthand(property) {
+            if longhand < FIRST_LONGHAND_PROPERTY_ID {
+                leaf_longhands(longhand, leaves);
+            } else {
+                leaves.push(longhand);
+            }
+        }
+    }
+    static SHORTHAND_LEAVES: std::sync::OnceLock<Vec<(u16, Box<[u16]>)>> = std::sync::OnceLock::new();
+    SHORTHAND_LEAVES.get_or_init(|| {
+        (FIRST_SHORTHAND_PROPERTY_ID..=LAST_SHORTHAND_PROPERTY_ID)
+            .map(|shorthand| {
+                let mut leaves = Vec::new();
+                leaf_longhands(shorthand, &mut leaves);
+                leaves.sort_unstable();
+                leaves.dedup();
+                (shorthand, leaves.into_boxed_slice())
+            })
+            .collect()
+    })
+}
+
+/// The shorthand whose longhands, through any shorthand nested in it, are exactly `longhands`: the one a value pending
+/// substitution in each of them was written for.
+pub(crate) fn shorthand_with_leaf_longhands(mut longhands: Vec<u16>) -> Option<u16> {
+    longhands.sort_unstable();
+    longhands.dedup();
+    shorthand_leaf_longhands()
+        .iter()
+        .find(|(_, leaves)| **leaves == *longhands)
+        .map(|(shorthand, _)| *shorthand)
+}
+
+/// The shorthands whose longhands, through any shorthand nested in it, include all of `longhands`, with the fewest
+/// longhands first: those a value pending substitution in each of them may have been written for, where a later
+/// declaration may have replaced some of the shorthand's other longhands.
+pub(crate) fn shorthands_with_leaf_longhands(longhands: &[u16]) -> Vec<u16> {
+    let mut shorthands = shorthand_leaf_longhands()
+        .iter()
+        .filter(|(_, leaves)| longhands.iter().all(|longhand| leaves.binary_search(longhand).is_ok()))
+        .collect::<Vec<_>>();
+    shorthands.sort_by_key(|(_, leaves)| leaves.len());
+    shorthands.into_iter().map(|(shorthand, _)| *shorthand).collect()
 }
 
 /// Returns the longhands a shorthand expands to, in Properties.json order.
@@ -307,65 +354,6 @@ pub(crate) fn property_logical_group(property_id: u16) -> Option<u8> {
     match PROPERTY_LOGICAL_GROUPS[property_index(property_id)] {
         0 => None,
         group => Some(group),
-    }
-}
-
-/// `None` for a longhand whose readers no fixed list names, among them `color`, `color-scheme` and
-/// the font properties, whose readers are whichever specified values of the element mention them.
-pub(crate) fn property_computed_dependents(property: u16) -> Option<&'static [u16]> {
-    use property_id as prop;
-
-    match property {
-        // NB: The background properties are coordinated at compute time rather than use time.
-        prop::BACKGROUND_IMAGE => Some(&[
-            prop::BACKGROUND_ATTACHMENT,
-            prop::BACKGROUND_CLIP,
-            prop::BACKGROUND_ORIGIN,
-            prop::BACKGROUND_POSITION_X,
-            prop::BACKGROUND_POSITION_Y,
-            prop::BACKGROUND_REPEAT,
-            prop::BACKGROUND_SIZE,
-        ]),
-        prop::ASPECT_RATIO
-        | prop::BACKDROP_FILTER
-        | prop::BACKGROUND_COLOR
-        | prop::BOX_SHADOW
-        | prop::CLIP_PATH
-        | prop::CX
-        | prop::CY
-        | prop::FILL
-        | prop::FILTER
-        | prop::ISOLATION
-        | prop::MIX_BLEND_MODE
-        | prop::OBJECT_FIT
-        | prop::OBJECT_POSITION
-        | prop::OPACITY
-        | prop::PERSPECTIVE
-        | prop::PERSPECTIVE_ORIGIN
-        | prop::R
-        | prop::ROTATE
-        | prop::RX
-        | prop::RY
-        | prop::SCALE
-        | prop::STROKE
-        | prop::TEXT_DECORATION_COLOR
-        | prop::TEXT_DECORATION_LINE
-        | prop::TEXT_DECORATION_STYLE
-        | prop::TEXT_DECORATION_THICKNESS
-        | prop::TRANSFORM
-        | prop::TRANSFORM_ORIGIN
-        | prop::TRANSITION_BEHAVIOR
-        | prop::TRANSITION_DELAY
-        | prop::TRANSITION_DURATION
-        | prop::TRANSITION_PROPERTY
-        | prop::TRANSITION_TIMING_FUNCTION
-        | prop::TRANSLATE
-        | prop::VISIBILITY
-        | prop::WILL_CHANGE
-        | prop::X
-        | prop::Y
-        | prop::Z_INDEX => Some(&[]),
-        _ => None,
     }
 }
 
@@ -453,6 +441,20 @@ mod tests {
     }
 
     #[test]
+    fn resnapping_properties_affect_layout_geometry() {
+        // A re-snap moves a scroll offset, and with it every box in the scroll container.
+        for property_id in FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID {
+            if property_may_resnap_scroll_container(property_id) {
+                assert!(
+                    property_may_affect_layout_geometry(property_id),
+                    "{}",
+                    property_name(property_id)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn exposes_property_keyword_metadata() {
         assert!(property_accepted_keywords(property_id::APPEARANCE).contains(&keyword::NONE));
         assert!(!property_accepted_keywords(property_id::APPEARANCE).contains(&keyword::INHERIT));
@@ -504,14 +506,12 @@ pub extern "C" fn rust_property_metadata_is_shorthand(property_id: u16) -> bool 
     property_is_shorthand(property_id)
 }
 
-/// # Safety
-/// `out_length` must be a valid pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_property_metadata_longhands_for_shorthand(
+pub extern "C" fn rust_property_metadata_longhands_for_shorthand(
     property_id: u16,
-    out_length: *mut usize,
+    out_length: &mut usize,
 ) -> *const u16 {
     let longhands = longhands_for_shorthand(property_id);
-    unsafe { *out_length = longhands.len() };
+    *out_length = longhands.len();
     longhands.as_ptr()
 }

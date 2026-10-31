@@ -9,11 +9,13 @@
 #include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Error.h>
+#include <AK/JsonValue.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
+#include <LibHTTP/Cache/CacheMode.h>
 #include <LibHTTP/Header.h>
 #include <LibIPC/Forward.h>
 #include <LibURL/Origin.h>
@@ -22,14 +24,17 @@
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/Fetch/Infrastructure/ConnectionTimingInfo.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/RequestReferrer.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/ResponseCacheState.h>
 #include <LibWebCommon/Fetch/Infrastructure/RedirectTaint.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicyEnforcementResult.h>
+#include <LibWebCommon/HTML/CrossOriginIsolationMode.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebCommon/HTML/SerializedPolicyContainer.h>
 #include <LibWebCommon/HTML/UserNavigationInvolvement.h>
+#include <LibWebCommon/PermissionsPolicy/PermissionsPolicy.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::HTML {
@@ -49,6 +54,11 @@ struct NavigationRequestDescriptor {
     ReferrerPolicy::ReferrerPolicy referrer_policy { ReferrerPolicy::DEFAULT_REFERRER_POLICY };
     SerializedPolicyContainer policy_container;
     u8 redirect_count { 0 };
+    bool text_directive_user_activation { false };
+    bool browsing_context_group_has_multiple_contexts { false };
+
+    // Whether the navigation bypassed the HTTP cache, which the new Document's own fetches then do while it loads.
+    HTTP::CacheMode cache_mode { HTTP::CacheMode::Default };
 };
 
 struct NavigationResponseBodyHandle {
@@ -56,6 +66,9 @@ struct NavigationResponseBodyHandle {
     // response moves from the fetch worker through the UI process to the document host.
     int request_server_client_id { -1 };
     u64 request_server_request_id { 0 };
+    // Selects the document host's client for adoption; empty selects the RequestServer with no site.
+    // The UI process sets this when moving the response to the host's RequestServer.
+    Optional<Utf16String> request_server_top_level_site;
 };
 
 using NavigationResponseBody = Variant<Empty, NavigationResponseBodyHandle, ByteBuffer>;
@@ -68,6 +81,9 @@ struct NavigationResponseDescriptor {
     Optional<String> network_error_message;
     bool timing_allow_passed { false };
 
+    // https://fetch.spec.whatwg.org/#concept-response-cache-state
+    Optional<Fetch::Infrastructure::ResponseCacheState> cache_state;
+
     // https://fetch.spec.whatwg.org/#response-navigation-timing-allow-values-list
     // Preserve the redirect chain's TAO values for the navigation TAO check performed after a process swap.
     Vector<Vector<String>> navigation_timing_allow_values_list;
@@ -77,6 +93,8 @@ struct NavigationResponseDescriptor {
     Fetch::Infrastructure::RedirectTaint redirect_taint { Fetch::Infrastructure::RedirectTaint::SameOrigin };
 
     NavigationResponseBody body;
+
+    JsonValue webdriver_bidi_network_response;
 };
 
 struct NavigationFetchTimingInfoDescriptor {
@@ -119,6 +137,11 @@ struct NavigationParamsDescriptor {
     Optional<URL::URL> about_base_url;
     UserNavigationInvolvement user_involvement { UserNavigationInvolvement::None };
     Optional<u64> agent_cluster_id;
+    bool agent_cluster_is_origin_keyed { false };
+    CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode { CrossOriginIsolationMode::None };
+    Optional<u64> new_browsing_context_group_id;
+    // The permissions policy the UI process created for the new Document.
+    Optional<PermissionsPolicy::PermissionsPolicy> permissions_policy {};
 };
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#non-fetch-scheme-navigation-params

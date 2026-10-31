@@ -9,6 +9,7 @@
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <LibGC/RootVector.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/Object.h>
@@ -19,7 +20,6 @@
 #include <LibWeb/Bindings/Location.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -78,20 +78,20 @@ void Location::visit_edges(GC::Cell::Visitor& visitor)
 
 namespace Web::Bindings {
 
-GC::Ref<JS::NativeFunction> LocationWrapper::create_cross_origin_method(JS::Realm& realm, Utf16FlyString const& property)
+GC::Ref<JS::NativeFunction> create_location_cross_origin_method(JS::Realm& realm, Utf16FlyString const& property)
 {
     VERIFY(property == u"replace"sv);
     return JS::NativeFunction::create(realm, LocationPrototype::replace, 1, property);
 }
 
-GC::Ref<JS::NativeFunction> LocationWrapper::create_cross_origin_setter(JS::Realm& realm, Utf16FlyString const& property)
+GC::Ref<JS::NativeFunction> create_location_cross_origin_setter(JS::Realm& realm, Utf16FlyString const& property)
 {
     VERIFY(property == u"href"sv);
     return JS::NativeFunction::create(realm, LocationPrototype::href_setter, 1, property, &realm, "set"sv);
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-location-interface
-void LocationWrapper::initialize_location_object(JS::Realm& realm)
+void initialize_location_object(JS::Realm& realm, JS::HostObject& location_wrapper)
 {
     auto& vm = realm.vm();
 
@@ -111,7 +111,7 @@ void LocationWrapper::initialize_location_object(JS::Realm& realm)
     //     Pass the known-absent current descriptor explicitly because our lazy initialization may otherwise make
     //     OrdinaryDefineOwnProperty ask Location's custom [[GetOwnProperty]], which can take the cross-origin path.
     Optional<JS::PropertyDescriptor> no_current_property;
-    MUST(JS::Object::internal_define_own_property(vm.names.valueOf, value_of_property_descriptor, &no_current_property));
+    MUST(location_wrapper.ordinary_define_own_property(vm.names.valueOf, value_of_property_descriptor, &no_current_property));
 
     // 4. Perform ! location.[[DefineOwnProperty]](%Symbol.toPrimitive%, { [[Value]]: undefined, [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }).
     auto to_primitive_property_descriptor = JS::PropertyDescriptor {
@@ -120,144 +120,157 @@ void LocationWrapper::initialize_location_object(JS::Realm& realm)
         .enumerable = false,
         .configurable = false,
     };
-    MUST(JS::Object::internal_define_own_property(vm.well_known_symbol_to_primitive(), to_primitive_property_descriptor, &no_current_property));
+    MUST(location_wrapper.ordinary_define_own_property(vm.well_known_symbol_to_primitive(), to_primitive_property_descriptor, &no_current_property));
 
     // 5. Set the value of the [[DefaultProperties]] internal slot of location to location.[[OwnPropertyKeys]]().
     // NB: [[DefaultProperties]] is only consulted by [[GetOwnProperty]] and [[DefineOwnProperty]] steps that we don't
     //     implement, see https://github.com/whatwg/html/issues/4157.
 }
 
-// 7.10.5.1 [[GetPrototypeOf]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-getprototypeof
-JS::ThrowCompletionOr<JS::Object*> LocationWrapper::internal_get_prototype_of() const
-{
-    // 1. If IsPlatformObjectSameOrigin(this) is true, then return ! OrdinaryGetPrototypeOf(this).
-    if (HTML::is_platform_object_same_origin(impl()))
-        return MUST(JS::Object::internal_get_prototype_of());
+namespace {
 
-    // 2. Return null.
-    return nullptr;
-}
-
-// 7.10.5.2 [[SetPrototypeOf]] ( V ), https://html.spec.whatwg.org/multipage/history.html#location-setprototypeof
-JS::ThrowCompletionOr<bool> LocationWrapper::internal_set_prototype_of(JS::Object* prototype)
-{
-    // 1. Return ! SetImmutablePrototype(this, V).
-    return MUST(set_immutable_prototype(prototype));
-}
-
-// 7.10.5.3 [[IsExtensible]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-isextensible
-JS::ThrowCompletionOr<bool> LocationWrapper::internal_is_extensible() const
-{
-    // 1. Return true.
-    return true;
-}
-
-// 7.10.5.4 [[PreventExtensions]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-preventextensions
-JS::ThrowCompletionOr<bool> LocationWrapper::internal_prevent_extensions()
-{
-    // 1. Return false.
-    return false;
-}
-
-// 7.10.5.5 [[GetOwnProperty]] ( P ), https://html.spec.whatwg.org/multipage/history.html#location-getownproperty
-JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> LocationWrapper::internal_get_own_property(JS::PropertyKey const& property_key) const
-{
-    auto& vm = this->vm();
-
-    // 1. If IsPlatformObjectSameOrigin(this) is true, then:
-    if (HTML::is_platform_object_same_origin(impl())) {
-        // 1. Let desc be OrdinaryGetOwnProperty(this, P).
-        auto descriptor = MUST(JS::Object::internal_get_own_property(property_key));
-
-        // 2. If the value of the [[DefaultProperties]] internal slot of this contains P, then set desc.[[Configurable]] to true.
-        // NB: We don't do this, matching other engines and WPT, which report these properties as non-configurable.
-        //     As written, this step lets OrdinaryDelete remove a default property, after which desc is undefined.
-        //     Spec issue: https://github.com/whatwg/html/issues/4157
-
-        // 3. Return desc.
-        return descriptor;
+struct LocationWrapperTraits {
+    static HTML::Location const& location_of(JS::HostObject const& wrapper)
+    {
+        return wrapped_implementation_of<HTML::Location>(wrapper);
     }
 
-    // 2. Let property be CrossOriginGetOwnPropertyHelper(this, P).
-    auto property = HTML::cross_origin_get_own_property_helper(
-        const_cast<LocationWrapper&>(*this),
-        impl(),
-        const_cast<LocationWrapper&>(*this).cross_origin_property_descriptor_map(),
-        property_key);
+    // 7.10.5.1 [[GetPrototypeOf]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-getprototypeof
+    static JS::ThrowCompletionOr<JS::Object*> get_prototype_of(JS::HostObject const& wrapper)
+    {
+        // 1. If IsPlatformObjectSameOrigin(this) is true, then return ! OrdinaryGetPrototypeOf(this).
+        if (HTML::is_platform_object_same_origin(location_of(wrapper)))
+            return MUST(wrapper.ordinary_get_prototype_of());
 
-    // 3. If property is not undefined, then return property.
-    if (property.has_value())
-        return property;
-
-    // 4. Return ? CrossOriginPropertyFallback(P).
-    return TRY(HTML::cross_origin_property_fallback(vm, property_key));
-}
-
-// 7.10.5.6 [[DefineOwnProperty]] ( P, Desc ), https://html.spec.whatwg.org/multipage/history.html#location-defineownproperty
-JS::ThrowCompletionOr<bool> LocationWrapper::internal_define_own_property(JS::PropertyKey const& property_key, JS::PropertyDescriptor& descriptor, Optional<JS::PropertyDescriptor>* precomputed_get_own_property)
-{
-    // 1. If IsPlatformObjectSameOrigin(this) is true, then:
-    if (HTML::is_platform_object_same_origin(impl())) {
-        // 1. If the value of the [[DefaultProperties]] internal slot of this contains P, then return false.
-        // NB: This step only exists to compensate for [[GetOwnProperty]] reporting [[DefaultProperties]] as configurable,
-        //     which we don't do. The default properties are non-configurable, so OrdinaryDefineOwnProperty already
-        //     rejects any change to them. Spec issue: https://github.com/whatwg/html/issues/4157
-
-        // 2. Return ? OrdinaryDefineOwnProperty(this, P, Desc).
-        return Bindings::ordinary_define_own_property_and_preserve_wrapper_if_needed(*this, property_key, descriptor, precomputed_get_own_property);
+        // 2. Return null.
+        return nullptr;
     }
 
-    // 2. Throw a "SecurityError" DOMException.
-    return throw_completion(realm(), WebIDL::SecurityError::create(realm(), Utf16String::formatted("Can't define property '{}' on cross-origin object", property_key)));
+    // 7.10.5.2 [[SetPrototypeOf]] ( V ), https://html.spec.whatwg.org/multipage/history.html#location-setprototypeof
+    static JS::ThrowCompletionOr<bool> set_prototype_of(JS::HostObject& wrapper, JS::Object* prototype)
+    {
+        // 1. Return ! SetImmutablePrototype(this, V).
+        return MUST(wrapper.set_immutable_prototype(prototype));
+    }
+
+    // 7.10.5.3 [[IsExtensible]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-isextensible
+    static JS::ThrowCompletionOr<bool> is_extensible(JS::HostObject const&)
+    {
+        // 1. Return true.
+        return true;
+    }
+
+    // 7.10.5.4 [[PreventExtensions]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-preventextensions
+    static JS::ThrowCompletionOr<bool> prevent_extensions(JS::HostObject&)
+    {
+        // 1. Return false.
+        return false;
+    }
+
+    // 7.10.5.5 [[GetOwnProperty]] ( P ), https://html.spec.whatwg.org/multipage/history.html#location-getownproperty
+    static JS::ThrowCompletionOr<Optional<JS::PropertyDescriptor>> get_own_property(JS::HostObject& wrapper, JS::PropertyKey const& property_key)
+    {
+        auto& vm = wrapper.vm();
+        auto const& location = location_of(wrapper);
+
+        // 1. If IsPlatformObjectSameOrigin(this) is true, then:
+        if (HTML::is_platform_object_same_origin(location)) {
+            // 1. Let desc be OrdinaryGetOwnProperty(this, P).
+            auto descriptor = MUST(wrapper.ordinary_get_own_property(property_key));
+
+            // 2. If the value of the [[DefaultProperties]] internal slot of this contains P, then set desc.[[Configurable]] to true.
+            // NB: We don't do this, matching other engines and WPT, which report these properties as non-configurable.
+            //     As written, this step lets OrdinaryDelete remove a default property, after which desc is undefined.
+            //     Spec issue: https://github.com/whatwg/html/issues/4157
+
+            // 3. Return desc.
+            return descriptor;
+        }
+
+        // 2. Let property be CrossOriginGetOwnPropertyHelper(this, P).
+        auto property = HTML::cross_origin_get_own_property_helper(wrapper, location, property_key);
+
+        // 3. If property is not undefined, then return property.
+        if (property.has_value())
+            return property;
+
+        // 4. Return ? CrossOriginPropertyFallback(P).
+        return TRY(HTML::cross_origin_property_fallback(vm, property_key));
+    }
+
+    // 7.10.5.6 [[DefineOwnProperty]] ( P, Desc ), https://html.spec.whatwg.org/multipage/history.html#location-defineownproperty
+    static JS::ThrowCompletionOr<bool> define_own_property(JS::HostObject& wrapper, JS::PropertyKey const& property_key, JS::PropertyDescriptor& descriptor, Optional<JS::PropertyDescriptor>* precomputed_get_own_property)
+    {
+        // 1. If IsPlatformObjectSameOrigin(this) is true, then:
+        if (HTML::is_platform_object_same_origin(location_of(wrapper))) {
+            // 1. If the value of the [[DefaultProperties]] internal slot of this contains P, then return false.
+            // NB: This step only exists to compensate for [[GetOwnProperty]] reporting [[DefaultProperties]] as configurable,
+            //     which we don't do. The default properties are non-configurable, so OrdinaryDefineOwnProperty already
+            //     rejects any change to them. Spec issue: https://github.com/whatwg/html/issues/4157
+
+            // 2. Return ? OrdinaryDefineOwnProperty(this, P, Desc).
+            return ordinary_define_own_property_and_preserve_wrapper_if_needed(wrapper, property_key, descriptor, precomputed_get_own_property);
+        }
+
+        // 2. Throw a "SecurityError" DOMException.
+        return throw_completion(*wrapper.vm().current_realm(), WebIDL::SecurityError::create(Utf16String::formatted("Can't define property '{}' on cross-origin object", property_key)));
+    }
+
+    // 7.10.5.7 [[Get]] ( P, Receiver ), https://html.spec.whatwg.org/multipage/history.html#location-get
+    static JS::ThrowCompletionOr<JS::Value> get(JS::HostObject const& wrapper, JS::PropertyKey const& property_key, JS::Value receiver, JS::CacheableGetPropertyMetadata* cacheable_metadata, JS::Object::PropertyLookupPhase phase)
+    {
+        // 1. If IsPlatformObjectSameOrigin(this) is true, then return ? OrdinaryGet(this, P, Receiver).
+        if (HTML::is_platform_object_same_origin(location_of(wrapper)))
+            return wrapper.ordinary_get(property_key, receiver, cacheable_metadata, phase);
+
+        // 2. Return ? CrossOriginGet(this, P, Receiver).
+        return HTML::cross_origin_get(wrapper.vm(), wrapper, property_key, receiver);
+    }
+
+    // 7.10.5.8 [[Set]] ( P, V, Receiver ), https://html.spec.whatwg.org/multipage/history.html#location-set
+    static JS::ThrowCompletionOr<bool> set(JS::HostObject& wrapper, JS::PropertyKey const& property_key, JS::Value value, JS::Value receiver, JS::CacheableSetPropertyMetadata* cacheable_metadata, JS::Object::PropertyLookupPhase phase)
+    {
+        // 1. If IsPlatformObjectSameOrigin(this) is true, then return ? OrdinarySet(this, P, V, Receiver).
+        if (HTML::is_platform_object_same_origin(location_of(wrapper)))
+            return wrapper.ordinary_set(property_key, value, receiver, cacheable_metadata, phase);
+
+        // 2. Return ? CrossOriginSet(this, P, V, Receiver).
+        return HTML::cross_origin_set(wrapper.vm(), wrapper, property_key, value, receiver);
+    }
+
+    // 7.10.5.9 [[Delete]] ( P ), https://html.spec.whatwg.org/multipage/history.html#location-delete
+    static JS::ThrowCompletionOr<bool> delete_property(JS::HostObject& wrapper, JS::PropertyKey const& property_key)
+    {
+        // 1. If IsPlatformObjectSameOrigin(this) is true, then return ? OrdinaryDelete(this, P).
+        if (HTML::is_platform_object_same_origin(location_of(wrapper)))
+            return wrapper.ordinary_delete(property_key);
+
+        // 2. Throw a "SecurityError" DOMException.
+        return throw_completion(*wrapper.vm().current_realm(), WebIDL::SecurityError::create(Utf16String::formatted("Can't delete property '{}' on cross-origin object", property_key)));
+    }
+
+    // 7.10.5.10 [[OwnPropertyKeys]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-ownpropertykeys
+    static JS::ThrowCompletionOr<GC::RootVector<JS::Value>> own_property_keys(JS::HostObject const& wrapper)
+    {
+        auto const& location = location_of(wrapper);
+
+        // 1. If IsPlatformObjectSameOrigin(this) is true, then return OrdinaryOwnPropertyKeys(this).
+        if (HTML::is_platform_object_same_origin(location))
+            return wrapper.ordinary_own_property_keys();
+
+        // 2. Return CrossOriginOwnPropertyKeys(this).
+        return HTML::cross_origin_own_property_keys(location);
+    }
+
+    static void finalize(JS::HostObject& wrapper)
+    {
+        finalize_platform_object(wrapper);
+    }
+};
+
 }
 
-// 7.10.5.7 [[Get]] ( P, Receiver ), https://html.spec.whatwg.org/multipage/history.html#location-get
-JS::ThrowCompletionOr<JS::Value> LocationWrapper::internal_get(JS::PropertyKey const& property_key, JS::Value receiver, JS::CacheableGetPropertyMetadata* cacheable_metadata, PropertyLookupPhase phase) const
-{
-    auto& vm = this->vm();
-
-    // 1. If IsPlatformObjectSameOrigin(this) is true, then return ? OrdinaryGet(this, P, Receiver).
-    if (HTML::is_platform_object_same_origin(impl()))
-        return JS::Object::internal_get(property_key, receiver, cacheable_metadata, phase);
-
-    // 2. Return ? CrossOriginGet(this, P, Receiver).
-    return HTML::cross_origin_get(vm, static_cast<JS::Object const&>(*this), property_key, receiver);
-}
-
-// 7.10.5.8 [[Set]] ( P, V, Receiver ), https://html.spec.whatwg.org/multipage/history.html#location-set
-JS::ThrowCompletionOr<bool> LocationWrapper::internal_set(JS::PropertyKey const& property_key, JS::Value value, JS::Value receiver, JS::CacheableSetPropertyMetadata* cacheable_metadata, PropertyLookupPhase phase)
-{
-    auto& vm = this->vm();
-
-    // 1. If IsPlatformObjectSameOrigin(this) is true, then return ? OrdinarySet(this, P, V, Receiver).
-    if (HTML::is_platform_object_same_origin(impl()))
-        return JS::Object::internal_set(property_key, value, receiver, cacheable_metadata, phase);
-
-    // 2. Return ? CrossOriginSet(this, P, V, Receiver).
-    return HTML::cross_origin_set(vm, static_cast<JS::Object&>(*this), property_key, value, receiver);
-}
-
-// 7.10.5.9 [[Delete]] ( P ), https://html.spec.whatwg.org/multipage/history.html#location-delete
-JS::ThrowCompletionOr<bool> LocationWrapper::internal_delete(JS::PropertyKey const& property_key)
-{
-    // 1. If IsPlatformObjectSameOrigin(this) is true, then return ? OrdinaryDelete(this, P).
-    if (HTML::is_platform_object_same_origin(impl()))
-        return JS::Object::internal_delete(property_key);
-
-    // 2. Throw a "SecurityError" DOMException.
-    return throw_completion(realm(), WebIDL::SecurityError::create(realm(), Utf16String::formatted("Can't delete property '{}' on cross-origin object", property_key)));
-}
-
-// 7.10.5.10 [[OwnPropertyKeys]] ( ), https://html.spec.whatwg.org/multipage/history.html#location-ownpropertykeys
-JS::ThrowCompletionOr<GC::RootVector<JS::Value>> LocationWrapper::internal_own_property_keys() const
-{
-    // 1. If IsPlatformObjectSameOrigin(this) is true, then return OrdinaryOwnPropertyKeys(this).
-    if (HTML::is_platform_object_same_origin(impl()))
-        return JS::Object::internal_own_property_keys();
-
-    // 2. Return CrossOriginOwnPropertyKeys(this).
-    return HTML::cross_origin_own_property_keys(impl());
-}
+constexpr JSHostObjectHooks location_wrapper_hooks = JS::make_host_object_hooks<LocationWrapperTraits>();
 
 }
 
@@ -286,13 +299,21 @@ bool Location::has_relevant_document() const
 WebIDL::ExceptionOr<void> Location::navigate(URL::URL url, NavigationHistoryBehavior history_handling)
 {
     // 1. Let navigable be location's relevant global object's navigable.
-    auto navigable = m_window.visit([](auto const& window) -> GC::Ptr<Navigable> { return window->navigable(); });
+    // INTEROP: Other browsers keep a window reused from an initial about:blank with the about:blank until the new
+    //          document commits, so its Location navigates the about:blank's navigable. Take the relevant Document's.
+    // FIXME: Associate a reused window with the new document when it is made active, not when it is created, which
+    //        leaves the window without a navigable meanwhile.
+    auto navigable = m_window.visit(
+        [&](GC::Ref<Window> const&) -> GC::Ptr<Navigable> { return relevant_document()->navigable(); },
+        [](GC::Ref<RemoteWindow> const& window) -> GC::Ptr<Navigable> { return window->navigable(); });
+    if (!navigable)
+        return {};
 
     // 2. Let sourceDocument be the incumbent global object's associated Document.
     auto& source_document = incumbent_window().associated_document();
 
     // 3. If location's relevant Document is not yet completely loaded, and the incumbent global object does not have transient activation, then set historyHandling to "replace".
-    // NB: The relevant Document is navigable's active document, which step 1 reached through the relevant global object.
+    // NB: The relevant Document is navigable's active document.
     if (!navigable->active_document_is_completely_loaded() && !incumbent_window().has_transient_activation()) {
         history_handling = NavigationHistoryBehavior::Replace;
     }
@@ -737,12 +758,14 @@ WebIDL::ExceptionOr<void> Location::replace(Utf16String const& url)
     if (!has_relevant_document())
         return {};
 
-    // 2. Parse url relative to the entry settings object. If that failed, throw a "SyntaxError" DOMException.
-    auto replace_url = DOMURL::parse(url.utf16_view(), entry_settings_object().api_base_url());
+    // 2. Let urlRecord be the result of encoding-parsing a URL given url, relative to the entry settings object.
+    auto replace_url = entry_settings_object().encoding_parse_url(url.utf16_view());
+
+    // 3. If urlRecord is failure, then throw a "SyntaxError" DOMException.
     if (!replace_url.has_value())
         return WebIDL::SyntaxError::create(Utf16String::formatted("Invalid URL '{}'", url));
 
-    // 3. Location-object navigate this to the resulting URL record given "replace".
+    // 4. Location-object navigate this to urlRecord given "replace".
     TRY(navigate(replace_url.release_value(), NavigationHistoryBehavior::Replace));
 
     return {};
@@ -760,12 +783,14 @@ WebIDL::ExceptionOr<void> Location::assign(Utf16String const& url)
     if (!relevant_document->origin().is_same_origin_domain(entry_settings_object().origin()))
         return WebIDL::SecurityError::create("Location's relevant document is not same origin-domain with the entry settings object's origin"_utf16);
 
-    // 3. Parse url relative to the entry settings object. If that failed, throw a "SyntaxError" DOMException.
-    auto assign_url = DOMURL::parse(url.utf16_view(), entry_settings_object().api_base_url());
+    // 3. Let urlRecord be the result of encoding-parsing a URL given url, relative to the entry settings object.
+    auto assign_url = entry_settings_object().encoding_parse_url(url.utf16_view());
+
+    // 4. If urlRecord is failure, then throw a "SyntaxError" DOMException.
     if (!assign_url.has_value())
         return WebIDL::SyntaxError::create(Utf16String::formatted("Invalid URL '{}'", url));
 
-    // 4. Location-object navigate this to the resulting URL record.
+    // 5. Location-object navigate this to urlRecord.
     TRY(navigate(assign_url.release_value()));
 
     return {};

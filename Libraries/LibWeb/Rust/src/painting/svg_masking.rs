@@ -7,35 +7,28 @@
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::node_painting;
+use crate::painting::paint_read::PaintRead;
 use crate::painting::paintable_geometry;
-use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::style_queries;
 use libgfx_rust::matrix::multiply_affine;
 use libgfx_rust::{AffineTransform, FloatRect, MaskKind};
 
 pub(crate) fn first_child_paintable_of_kind(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     paintable: NodeSlotId,
     kind: NodeKind,
 ) -> Option<NodeSlotId> {
-    let mut child = arena.node_first_child_if_live(paintable);
-    while let Some(node) = child {
-        if arena.node_kind_if_live(node) == Some(kind) {
-            return arena.paintable_row_is_populated(node).then_some(node);
-        }
-        child = arena.node_next_sibling_if_live(node);
-    }
-    None
+    let node = arena
+        .children(paintable)
+        .find(|&node| arena.node_kind_if_live(node) == Some(kind))?;
+    arena.paintable_row_is_populated(node).then_some(node)
 }
 
 /// The object bounding box covers the target's geometry alone. The paintable's border box is not
 /// that: SVG layout inflates it by the visible stroke width. So, take the bounding box from the
 /// target's geometry path, which carries no stroke. A group or a foreign object has no single
 /// geometry path, and we have no object bounding box for it, so its border box still stands in.
-pub(crate) fn target_user_space_object_bounding_box(
-    arena: &impl PaintableRowsRead,
-    target: NodeSlotId,
-) -> CssPixelRect {
+pub(crate) fn target_user_space_object_bounding_box(arena: &impl PaintRead, target: NodeSlotId) -> CssPixelRect {
     if arena.node_kind_if_live(target).is_some_and(node_painting::is_svg_path)
         && let Some(path) = paintable_geometry::committed_svg_path(arena, target)
     {
@@ -51,7 +44,7 @@ pub(crate) fn target_user_space_object_bounding_box(
 }
 
 pub(crate) fn object_bounding_box_content_units_transform(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     target: NodeSlotId,
 ) -> AffineTransform {
     let bounding_box = target_user_space_object_bounding_box(arena, target);
@@ -80,7 +73,7 @@ fn css_pixel_rect_from_float(rect: FloatRect) -> CssPixelRect {
 /// in a userSpaceOnUse masking area resolve against the SVG viewport. An empty area conveys that
 /// a negative value or a value of zero disables rendering of the element; a mask layer with an
 /// empty area clips the target away entirely.
-pub(crate) fn mask_area(arena: &impl PaintableRowsRead, target: NodeSlotId) -> Option<CssPixelRect> {
+pub(crate) fn mask_area(arena: &impl PaintRead, target: NodeSlotId) -> Option<CssPixelRect> {
     if !arena
         .node_kind_if_live(target)
         .is_some_and(node_painting::supports_svg_masking)
@@ -126,14 +119,14 @@ pub(crate) fn mask_area(arena: &impl PaintableRowsRead, target: NodeSlotId) -> O
     Some(css_pixel_rect_from_float(masking_area))
 }
 
-fn committed_svg_element_transform_or_identity(arena: &impl PaintableRowsRead, slot: NodeSlotId) -> AffineTransform {
+fn committed_svg_element_transform_or_identity(arena: &impl PaintRead, slot: NodeSlotId) -> AffineTransform {
     paintable_geometry::committed_svg_element_transform(arena, slot).map_or_else(AffineTransform::identity, Into::into)
 }
 
 /// https://drafts.csswg.org/css-masking-1/#ClipPathElement
 /// If a child element is made invisible by display or visibility it does not contribute to the
 /// clipping path.
-fn contributes_to_clip_path(arena: &impl PaintableRowsRead, node: NodeSlotId) -> bool {
+fn contributes_to_clip_path(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     arena.node_style_if_live(node).is_some_and(|style| {
         style.visibility() == crate::css::css_enums::visibility::VISIBLE && !style.display().is_none()
     })
@@ -169,7 +162,7 @@ impl ClipPathBoundingBox {
 /// elements are logically OR'd together to create a single silhouette which is then used to
 /// restrict the region onto which paint can be applied.
 fn svg_clip_path_geometry_bounds(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     node: NodeSlotId,
     additional_transform: AffineTransform,
 ) -> Option<CssPixelRect> {
@@ -189,19 +182,14 @@ fn svg_clip_path_geometry_bounds(
         max_y: CssPixels::default(),
         has_points: false,
     };
-    let mut child = arena.node_first_child_if_live(node);
-    while let Some(child_node) = child {
-        child = arena.node_next_sibling_if_live(child_node);
+    for child_node in arena.children(node) {
         let Some(child_kind) = arena.node_kind_if_live(child_node) else {
             continue;
         };
-        if matches!(
-            child_kind,
-            NodeKind::SVGMaskBox | NodeKind::SVGClipBox | NodeKind::SVGPatternBox
-        ) {
+        if crate::layout::node_facts::kind_is_svg_resource_box(child_kind) {
             continue;
         }
-        if !arena.paintable_row_is_populated(child_node) || !node_painting::is_svg_paintable(child_kind) {
+        if !arena.paintable_row_is_populated(child_node) || !node_painting::is_svg(child_kind) {
             continue;
         }
         let child_transform = multiply_affine(
@@ -226,7 +214,7 @@ fn svg_clip_path_geometry_bounds(
 }
 
 // An empty clipping path completely clips away the element that had the clip-path property applied.
-pub(crate) fn clip_area(arena: &impl PaintableRowsRead, target: NodeSlotId) -> Option<CssPixelRect> {
+pub(crate) fn clip_area(arena: &impl PaintRead, target: NodeSlotId) -> Option<CssPixelRect> {
     if !arena
         .node_kind_if_live(target)
         .is_some_and(node_painting::supports_svg_masking)
@@ -244,7 +232,7 @@ pub(crate) fn clip_area(arena: &impl PaintableRowsRead, target: NodeSlotId) -> O
     Some(svg_clip_path_geometry_bounds(arena, clip_box, clip_path_transform).unwrap_or_default())
 }
 
-pub(crate) fn mask_kind(arena: &impl PaintableRowsRead, target: NodeSlotId) -> MaskKind {
+pub(crate) fn mask_kind(arena: &impl PaintRead, target: NodeSlotId) -> MaskKind {
     use crate::css::css_enums::keyword;
     let Some(mask_box) = first_child_paintable_of_kind(arena, target, NodeKind::SVGMaskBox) else {
         return MaskKind::Alpha;

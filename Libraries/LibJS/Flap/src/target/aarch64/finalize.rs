@@ -7,10 +7,13 @@
 //! AArch64 machine instruction finalization.
 
 use super::Opcode;
-use super::{AddSubtractOperation, AddressIndexShift, ConditionFlags, FlagUpdate, MemoryAddressing};
-use crate::CompileError;
+use super::{
+    AddSubtractOperation, AddressIndexShift, ConditionFlags, FlagUpdate, ImmediateShift, LogicalOperation,
+    MemoryAddressing,
+};
 use crate::frontend::layout::KnownLayoutConstant;
 use crate::low_ir::Label;
+use crate::runtime_interface::{RawNativeReturnConvention, raw_native_return_convention};
 use crate::target::backend::{Aarch64Backend, Backend};
 use crate::target::description::ArchitectureOpcode;
 use crate::target::description::{
@@ -32,6 +35,7 @@ use crate::target::registers::{
     PhysicalRegister,
     aarch64::{X21, X22, X23, X24, X25, X26, XZR},
 };
+use crate::{Architecture, CompileError, CompileStage, Target};
 
 fn machine_instruction(opcode: Opcode, operands: Vec<MachineOperand>) -> MachineInstruction {
     MachineInstruction {
@@ -994,7 +998,7 @@ fn call_with_values(
     kind: crate::target::backend::HelperCallKind,
 ) -> Result<(), CompileError> {
     use super::Condition;
-    use crate::metadata::ParameterMode;
+    use crate::metadata::{ParameterMode, SlowPathAbi, SlowPathArray};
     use crate::target::description::ShiftOperation;
     use crate::target::registers::aarch64::{
         SP, X0, X3, X4, X5, X6, X7, X9, X10, X11, X12, X13, X14, X20, X21, X27, X28,
@@ -1005,15 +1009,14 @@ fn call_with_values(
         direct_call(emit, function);
         return Ok(());
     };
-    if kind == crate::target::backend::HelperCallKind::SlowPath
-        && emit.object_format != crate::ObjectFormat::Coff
-        && layout.uses_scalar_arguments()
-    {
+    let abi = match kind {
+        crate::target::backend::HelperCallKind::SlowPath => layout.abi(emit.object_format == crate::ObjectFormat::Coff),
+        crate::target::backend::HelperCallKind::Try => SlowPathAbi::Record,
+    };
+    if abi == SlowPathAbi::Scalar {
         return call_with_scalar_values(emit, function, &layout);
     }
-    let scalar_inputs = kind == crate::target::backend::HelperCallKind::SlowPath
-        && emit.object_format != crate::ObjectFormat::Coff
-        && layout.array.is_none();
+    let scalar_inputs = abi == SlowPathAbi::Mixed;
     let input_registers = [X4, X5, X6, X7];
     let input_count = layout
         .fields
@@ -1029,7 +1032,7 @@ fn call_with_values(
     let fixed_size = values_offset + layout.fields.len() as i64 * 8;
     let empty = emit.constant(KnownLayoutConstant::EmptyValue)?;
     let done = emit.unique_label("values_call_done");
-    if let Some((_, count_offset, _)) = layout.array {
+    if let Some(SlowPathArray { count_offset, .. }) = layout.array {
         call_values_add(emit, X9, SP, 0);
         let allocate = emit.unique_label("values_allocate");
         let probe = emit.unique_label("values_probe");
@@ -1067,7 +1070,7 @@ fn call_with_values(
             direct_call(
                 emit,
                 crate::low_ir::Relocation::function_call(crate::identity::ExternalSymbol::new(
-                    "asm_slow_path_stack_overflow",
+                    crate::runtime_interface::STACK_OVERFLOW_SLOW_PATH,
                 )),
             );
         } else {
@@ -1149,7 +1152,13 @@ fn call_with_values(
         }
         input_index += 1;
     }
-    if let Some((array_offset, count_offset, optional)) = layout.array {
+    if let Some(SlowPathArray {
+        instruction_offset: array_offset,
+        count_offset,
+        optional,
+        ..
+    }) = layout.array
+    {
         let next = emit.unique_label("array_value_next");
         let ready = emit.unique_label("array_value_ready");
         let end = emit.unique_label("array_values_end");
@@ -1352,7 +1361,7 @@ fn finish_slow_path_call(
     dispatch_register: PhysicalRegister,
     dispatch_scratch: PhysicalRegister,
 ) -> Result<(), CompileError> {
-    use crate::target::registers::aarch64::{X0, X20, X26, X27, X28};
+    use crate::target::registers::aarch64::{X0, X19, X20, X26, X27, X28};
 
     let [execution_context, executable, _, bytecode, values_offset] = interpreter_layout(emit.runtime, emit.handler)?;
     emit!(emit.output, Aarch64; Opcode::BranchBitSetToExit(63) => [register X0];);
@@ -1394,6 +1403,33 @@ fn finish_slow_path_call(
         &[dispatch_register, dispatch_scratch],
     )
     .map_err(|error| memory_address_compile_error(emit.handler, error))?;
+    if emit.profiling {
+        let dispatch_table_index = emit.constant(KnownLayoutConstant::ExecutableDispatchTableIndex)?;
+        let vm_dispatch_tables = emit.constant(KnownLayoutConstant::VmDispatchTables)?;
+        let dispatch_table_index_mask = emit.constant(KnownLayoutConstant::DispatchTableIndexMask)?;
+        load(
+            emit,
+            MemoryWidth::Byte,
+            false,
+            dispatch_scratch,
+            MachineMemoryAddress::offset(dispatch_register, dispatch_table_index),
+            &[dispatch_scratch],
+        )
+        .map_err(|error| memory_address_compile_error(emit.handler, error))?;
+        emit!(emit.output, Aarch64;
+            Opcode::LogicalImmediate { operation: super::LogicalOperation::And, width: IntegerWidth::U32 } => [register dispatch_scratch, register dispatch_scratch, immediate dispatch_table_index_mask];
+        );
+        address_offset(emit, dispatch_register, X20, vm_dispatch_tables, dispatch_register);
+        load(
+            emit,
+            MemoryWidth::DoubleWord,
+            false,
+            X19,
+            MachineMemoryAddress::scaled(dispatch_register, dispatch_scratch, 8, 0),
+            &[],
+        )
+        .map_err(|error| memory_address_compile_error(emit.handler, error))?;
+    }
     address_offset(emit, X27, X28, values_offset, dispatch_register);
     emit!(emit.output, Aarch64; Opcode::SetInstructionPointer => [register X0];);
     dispatch_from_instruction_pointer(emit, dispatch_register, dispatch_scratch)
@@ -1669,7 +1705,11 @@ impl Backend for Aarch64Backend {
 
         emit!(emit.output, Aarch64; Opcode::MoveRegister(IntegerWidth::U64) => [register scratch, register function];);
 
-        if emit.object_format == crate::ObjectFormat::Coff {
+        let target = Target {
+            architecture: Architecture::Aarch64,
+            object_format: emit.object_format,
+        };
+        if raw_native_return_convention(target) == RawNativeReturnConvention::OutPointer {
             emit!(emit.output, Aarch64;
                 Opcode::AddSubtractImmediate {
                     operation: AddSubtractOperation::Add,
@@ -1789,7 +1829,10 @@ impl Backend for Aarch64Backend {
         let [opcode_scratch, target_scratch] = scratches.physical_registers();
         use crate::target::registers::aarch64::X25;
 
-        emit!(emit.output, Aarch64; Opcode::SetInstructionPointer => [register X25];);
+        // An absolute instruction pointer is already in x21.
+        if emit.profile.program_counter_addressing() == crate::profile::ProgramCounterAddressing::BaseRelative {
+            emit!(emit.output, Aarch64; Opcode::SetInstructionPointer => [register X25];);
+        }
         dispatch_from_instruction_pointer(emit, opcode_scratch, target_scratch)
             .map_err(|error| memory_address_compile_error(emit.handler, error))
     }
@@ -1801,7 +1844,16 @@ impl Backend for Aarch64Backend {
         scratches: &[AllocatedOperand],
     ) -> Result<(), CompileError> {
         let [opcode_scratch, target_scratch] = scratches.physical_registers();
-        emit!(emit.output, Aarch64; Opcode::AdvanceInstructionPointer => [register size];);
+        if emit.profile.program_counter_addressing() == crate::profile::ProgramCounterAddressing::Absolute {
+            emit!(emit.output, Aarch64;
+                Opcode::AddSubtractRegister {
+                    operation: AddSubtractOperation::Add,
+                    flags: FlagUpdate::Preserve,
+                } => [register X21, register X21, register size];
+            );
+        } else {
+            emit!(emit.output, Aarch64; Opcode::AdvanceInstructionPointer => [register size];);
+        }
         dispatch_from_instruction_pointer(emit, opcode_scratch, target_scratch)
             .map_err(|error| memory_address_compile_error(emit.handler, error))
     }
@@ -2169,7 +2221,13 @@ impl Backend for Aarch64Backend {
 
     fn goto_handler(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) -> Result<(), CompileError> {
         let [target, opcode_scratch, target_scratch] = operands.physical_registers();
-        emit!(emit.output, Aarch64; Opcode::SetInstructionPointer => [register target];);
+        if emit.profile.program_counter_addressing() == crate::profile::ProgramCounterAddressing::Absolute {
+            if target != X21 {
+                emit!(emit.output, Aarch64; Opcode::MoveRegister(IntegerWidth::U64) => [register X21, register target];);
+            }
+        } else {
+            emit!(emit.output, Aarch64; Opcode::SetInstructionPointer => [register target];);
+        }
         dispatch_from_instruction_pointer(emit, opcode_scratch, target_scratch)
             .map_err(|error| memory_address_compile_error(emit.handler, error))
     }
@@ -2275,6 +2333,89 @@ impl Backend for Aarch64Backend {
                 width: MemoryWidth::Word,
                 addressing,
             } => [address address, register value_scratch];
+        );
+        Ok(())
+    }
+
+    fn finalize_memory_update(
+        &self,
+        emit: &mut Emit<'_>,
+        operation: BinaryOperation,
+        width: MemoryWidth,
+        operands: &[AllocatedOperand],
+    ) -> Result<(), CompileError> {
+        let address = machine_address(operands.operand(0));
+        let source = operands.operand(1);
+        let value_scratch = operands.physical_register(2);
+        let address_scratch = operands.physical_register(3);
+        let (addressing, address) = memory_address(emit, width, address, &[value_scratch], &[address_scratch])
+            .map_err(|error| memory_address_compile_error(emit.handler, error))?;
+        emit!(emit.output, Aarch64;
+            Opcode::Load {
+                width,
+                signed: false,
+                addressing,
+            } => [register value_scratch, address address.clone()];
+        );
+        match (operation, source) {
+            (BinaryOperation::Or, AllocatedOperand::Immediate(value)) => {
+                // NB: Every contiguous run of set bits is a logical immediate.
+                let mut remaining = *value as u32;
+                while remaining != 0 {
+                    let low = remaining.trailing_zeros();
+                    let run = (remaining >> low).trailing_ones();
+                    let mask = if run == 32 {
+                        u32::MAX
+                    } else {
+                        ((1u32 << run) - 1) << low
+                    };
+                    emit!(emit.output, Aarch64;
+                        Opcode::LogicalImmediate {
+                            operation: LogicalOperation::Or,
+                            width: IntegerWidth::U32,
+                        } => [register value_scratch, register value_scratch, immediate i64::from(mask)];
+                    );
+                    remaining &= !mask;
+                }
+            }
+            (BinaryOperation::Or, source) => {
+                let source = verified_register(source);
+                emit!(emit.output, Aarch64;
+                    Opcode::LogicalRegister {
+                        operation: LogicalOperation::Or,
+                        width: IntegerWidth::U32,
+                    } => [register value_scratch, register value_scratch, register source];
+                );
+            }
+            (BinaryOperation::Subtract, AllocatedOperand::Immediate(value)) if (0..=4095).contains(value) => {
+                emit!(emit.output, Aarch64;
+                    Opcode::AddSubtractImmediate {
+                        operation: AddSubtractOperation::Subtract,
+                        shift: ImmediateShift::None,
+                        flags: FlagUpdate::Preserve,
+                    } => [register value_scratch, register value_scratch, immediate *value];
+                );
+            }
+            (BinaryOperation::Subtract, AllocatedOperand::Immediate(_)) => {
+                return Err(CompileError::new(
+                    CompileStage::Finalization,
+                    Some(emit.handler),
+                    "memory subtraction immediate does not fit an AArch64 immediate",
+                ));
+            }
+            (BinaryOperation::Subtract, source) => {
+                let source = verified_register(source);
+                emit!(emit.output, Aarch64;
+                    Opcode::AddSubtractRegister {
+                        operation: AddSubtractOperation::Subtract,
+                        flags: FlagUpdate::Preserve,
+                    } => [register value_scratch, register value_scratch, register source];
+                );
+            }
+            _ => unreachable!("memory updates only OR or subtract"),
+        }
+        emit!(emit.output, Aarch64;
+            Opcode::Store { width, addressing } => [address address, register value_scratch];
         );
         Ok(())
     }
@@ -2388,6 +2529,49 @@ impl Backend for Aarch64Backend {
         Ok(())
     }
 
+    fn branch_ordered_float(
+        &self,
+        emit: &mut Emit<'_>,
+        lhs: PhysicalRegister,
+        rhs: PhysicalRegister,
+        comparison: crate::intrinsic::OrderedFloatComparison,
+        target: &Label,
+    ) -> Result<(), CompileError> {
+        super::wasm::branch_ordered_float(emit, lhs, rhs, comparison, target);
+        Ok(())
+    }
+
+    fn dispatch_secondary(&self, emit: &mut Emit<'_>, operands: &[AllocatedOperand]) -> Result<(), CompileError> {
+        super::wasm::dispatch_secondary(emit, operands)
+    }
+
+    fn finalize_numeric(
+        &self,
+        emit: &mut Emit<'_>,
+        operation: crate::intrinsic::NumericOperation,
+        operands: &[AllocatedOperand],
+    ) -> Result<(), CompileError> {
+        super::wasm::finalize_numeric(emit, operation, operands)
+    }
+
+    fn finalize_atomic(
+        &self,
+        emit: &mut Emit<'_>,
+        operation: crate::intrinsic::AtomicOperation,
+        operands: &[AllocatedOperand],
+    ) -> Result<(), CompileError> {
+        super::wasm::finalize_atomic(emit, operation, operands)
+    }
+
+    fn finalize_vector(
+        &self,
+        emit: &mut Emit<'_>,
+        operation: crate::intrinsic::VectorOperation,
+        operands: &[AllocatedOperand],
+    ) -> Result<(), CompileError> {
+        super::wasm::finalize_vector(emit, operation, operands)
+    }
+
     fn finalize_binary_operation(
         &self,
         emit: &mut Emit<'_>,
@@ -2395,6 +2579,15 @@ impl Backend for Aarch64Backend {
         width: IntegerWidth,
         operands: &[AllocatedOperand],
     ) -> Result<(), CompileError> {
+        if width == IntegerWidth::U32
+            && matches!(
+                operation,
+                BinaryOperation::Add | BinaryOperation::Subtract | BinaryOperation::Multiply
+            )
+        {
+            super::wasm::arithmetic32(emit, operation, operands);
+            return Ok(());
+        }
         if operation == BinaryOperation::Multiply {
             multiply(emit, width, operands);
             return Ok(());

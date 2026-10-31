@@ -16,9 +16,6 @@
 #include <AK/ThreadID.h>
 #include <AK/Time.h>
 #include <LibCore/Forward.h>
-#include <LibMedia/CodedFrame.h>
-#include <LibMedia/DecoderError.h>
-#include <LibMedia/DecoderRegistry.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
@@ -28,7 +25,11 @@
 #include <LibMedia/SynchronizedWakeHandler.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
-#include <LibMedia/VideoDecoder.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/DecoderError.h>
+#include <LibMediaCodecs/NonReferenceFrameDetector.h>
+#include <LibMediaCodecs/VideoDecoder.h>
+#include <LibMediaCodecs/VideoDecoderRegistry.h>
 
 namespace Media {
 
@@ -61,7 +62,7 @@ public:
     virtual void set_wake_handler(PipelineWakeHandler) override;
 
     AK::Duration select_fast_seek_target(AK::Duration timestamp, SeekMode);
-    virtual void seek(AK::Duration timestamp) override;
+    virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) override;
 
 private:
     class ThreadData final : public AtomicRefCounted<ThreadData> {
@@ -80,6 +81,8 @@ private:
         DecoderErrorOr<void> create_decoder_for_frame(CodedFrame const&);
         DecoderErrorOr<void> receive_coded_frame(CodedFrame const&, DecodeIntent);
         DecoderErrorOr<bool> replace_drained_decoder();
+        bool check_if_seek_is_needed_or_allow_demuxer_reads(u32 seek_id);
+        void wait_for_another_seek_or_exit(u32 seek_id);
         void release_decoder();
         void exit();
 
@@ -89,7 +92,7 @@ private:
         VideoProducerOutput peek_while_locked();
         void consume();
 
-        void seek(AK::Duration timestamp);
+        void seek(AK::Duration timestamp, InvalidateHeldData);
         AK::Duration select_fast_seek_target(AK::Duration target, SeekMode) const;
 
         void register_decode_thread();
@@ -101,8 +104,11 @@ private:
         void invoke_on_main_thread_while_locked(Invokee);
         void queue_frame(NonnullRefPtr<VideoFrame> const&);
         void dispatch_error(DecoderError&&);
-        bool handle_seek();
+        void handle_seek();
         void resolve_seek(u32 seek_id);
+        bool seek_to_resubmit_if_decoder_lost_its_state(DecoderError const&);
+        bool seek_to_replace_decoder_if_it_cannot_decode_the_stream(DecoderError const&);
+        void seek_to_resubmit_while_locked();
         bool is_within_available_range_while_locked(AK::Duration) const;
         void re_emit_last_frame_if_at_end_of_stream_while_locked();
         void push_data_and_decode_some_frames();
@@ -122,7 +128,11 @@ private:
         };
 
         void note_consumer_activity_while_locked() const;
-        void wait_to_decode_or_auto_suspend_while_locked();
+        enum class WaitResult : u8 {
+            ContinueDecoding,
+            ExitDecodeLoop,
+        };
+        WaitResult wait_for_frame_storage_while_locked();
         void dispatch_read_blocked_change(ReadBlocked blocked);
 
         Core::EventLoop& m_main_thread_event_loop;
@@ -134,6 +144,7 @@ private:
             Mutex mutex;
             ConditionVariable condition { mutex };
             bool frame_storage_was_freed { false };
+            Atomic<bool> output_should_interrupt_demuxer_reads { false };
         };
         NonnullRefPtr<WaitState> m_wait_state { make_ref_counted<WaitState>() };
         RequestedState m_requested_state { RequestedState::None };
@@ -147,8 +158,9 @@ private:
         Optional<CodedFrame> m_frame_awaiting_decoder_replacement;
         DecodeIntent m_intent_awaiting_decoder_replacement { DecodeIntent::Output };
         OwnPtr<VideoDecoder> m_decoder;
+        NonReferenceFrameDetector m_non_reference_frame_detector;
         bool m_decoder_needs_keyframe_next_seek { false };
-        bool m_decoder_needs_codec_configuration_next_seek { true };
+        bool m_decoder_is_draining_before_unavailable_data { false };
 
         FrameQueue m_queue;
         RefPtr<VideoFrame> m_last_queued_frame;
@@ -158,16 +170,22 @@ private:
         ReadBlockedChangeHandler m_read_blocked_change_handler;
         PipelineStatus m_current_halting_status { PipelineStatus::Pending };
 
+        enum class SeekReason : u8 {
+            Normal,
+            DecoderResetNeeded,
+            DataInvalidated,
+        };
+
         Atomic<u32> m_last_processed_seek_id { 0 };
         Atomic<u32> m_seek_id { 0 };
         AK::Duration m_seek_timestamp;
+        Atomic<SeekReason> m_seek_reason { SeekReason::Normal };
 
         SynchronizedWakeHandler m_wake_handler;
         mutable bool m_downstream_needs_wake { true };
 
         AK::Duration const m_auto_suspend_idle_timeout;
         mutable MonotonicTime m_last_consumer_activity { MonotonicTime::now() };
-        bool m_auto_suspended { false };
         mutable bool m_auto_suspend_requested { false };
     };
 

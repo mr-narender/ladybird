@@ -19,7 +19,11 @@ public:
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual Gfx::Path get_path(CSSPixelSize viewport_size, CSS::ComputedValues const&) override;
+    // The parsed endpoint attributes, as the element publishes them to layout.
+    NumberPercentage x1_value() const { return m_x1.value_or({ 0, false }); }
+    NumberPercentage y1_value() const { return m_y1.value_or({ 0, false }); }
+    NumberPercentage x2_value() const { return m_x2.value_or({ 0, false }); }
+    NumberPercentage y2_value() const { return m_y2.value_or({ 0, false }); }
 
     // https://w3c.github.io/svgwg/svg2-draft/shapes.html#__svg__SVGLineElement__x1
     REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x1, Horizontal, SVGLengthValue::number(0));
@@ -34,6 +38,8 @@ public:
     REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y2, Vertical, SVGLengthValue::number(0));
 
 private:
+    virtual bool is_svg_line_element() const final { return true; }
+
     SVGLineElement(DOM::Document&, DOM::QualifiedName);
 
     Optional<NumberPercentage> m_x1;
@@ -41,5 +47,12 @@ private:
     Optional<NumberPercentage> m_x2;
     Optional<NumberPercentage> m_y2;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<SVG::SVGLineElement>() const { return is_svg_line_element(); }
 
 }

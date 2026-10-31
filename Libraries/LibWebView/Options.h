@@ -7,9 +7,11 @@
 #pragma once
 
 #include <AK/ByteString.h>
+#include <AK/NumericLimits.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
+#include <LibHTTP/Proxy.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/ProcessType.h>
@@ -75,6 +77,11 @@ enum class DisableSandbox {
     Yes,
 };
 
+enum class ForceVideoDecoderServer {
+    No,
+    Yes,
+};
+
 enum class ProfileTool {
     Callgrind,
     CPU,
@@ -102,6 +109,7 @@ struct BrowserOptions {
     Optional<u16> devtools_port;
     EnableContentBlocker enable_content_blocker { EnableContentBlocker::Yes };
     DisableSandbox disable_sandbox { DisableSandbox::No };
+    ForceVideoDecoderServer force_video_decoder_server { ForceVideoDecoderServer::No };
     Vector<ByteString> content_blocker_list_paths {};
 };
 
@@ -116,6 +124,10 @@ struct RequestServerOptions {
     ByteString cache_path;
     HTTPDiskCacheMode http_disk_cache_mode { HTTPDiskCacheMode::Disabled };
     Optional<ByteString> resource_substitution_map_path;
+    HTTP::ProxyConfiguration proxy_configuration;
+    // Per-session limit, excluding the RequestServer with no site. Sites beyond the limit share that server;
+    // zero makes every process share it.
+    size_t maximum_site_request_servers { NumericLimits<size_t>::max() };
 };
 
 enum class IsTestMode {
@@ -173,7 +185,7 @@ struct WebContentOptions {
     Optional<StringView> user_agent_preset {};
     IsTestMode is_test_mode { IsTestMode::No };
     LogAllJSExceptions log_all_js_exceptions { LogAllJSExceptions::No };
-    SiteIsolationMode site_isolation_mode { SiteIsolationMode::TopLevel };
+    SiteIsolationMode site_isolation_mode { SiteIsolationMode::IFrame };
     EnableMemoryHTTPCache enable_http_memory_cache { EnableMemoryHTTPCache::No };
     ExposeExperimentalInterfaces expose_experimental_interfaces { ExposeExperimentalInterfaces::No };
     ExposeInternalsObject expose_internals_object { ExposeInternalsObject::No };
@@ -182,9 +194,11 @@ struct WebContentOptions {
     EnableAutoplay enable_autoplay { EnableAutoplay::No };
     CollectGarbageOnEveryAllocation collect_garbage_on_every_allocation { CollectGarbageOnEveryAllocation::No };
     Optional<u16> echo_server_port {};
+    Optional<u16> https_echo_server_port {};
     PaintViewportScrollbars paint_viewport_scrollbars { PaintViewportScrollbars::Yes };
     FileSchemeUrlsHaveTupleOrigins file_scheme_urls_have_tuple_origins { FileSchemeUrlsHaveTupleOrigins::No };
     Optional<StringView> default_time_zone {};
+    Optional<ByteString> proxy_autoconfig_url {};
 };
 
 }

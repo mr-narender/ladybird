@@ -81,8 +81,6 @@ public:
     {
     }
     ~RustCompiledFunction() { Parser::ValueParserFFI::rust_compiled_function_release(m_function); }
-    u64 identity() const { return Parser::ValueParserFFI::rust_compiled_function_identity(m_function); }
-    Parser::ValueParserFFI::FunctionSignature const* signature() const { return Parser::ValueParserFFI::rust_compiled_function_signature(m_function); }
     auto* handle() const { return m_function; }
 
 private:
@@ -105,6 +103,8 @@ public:
     RustMediaList import_media() const { return RustMediaList { Parser::ValueParserFFI::rust_rule_view_import_media(&m_view) }; }
     RustFontFeatureValuesSnapshot font_feature_values() const { return RustFontFeatureValuesSnapshot { Parser::ValueParserFFI::rust_rule_view_font_feature_values(&m_view) }; }
     RustCompiledFunction compile_function() const { return RustCompiledFunction { Parser::ValueParserFFI::rust_rule_view_compile_function(&m_view) }; }
+    // The declarations of a @position-try rule, retained for the caller.
+    Parser::ValueParserFFI::DeclarationBlockData const* position_try_declarations() const { return Parser::ValueParserFFI::rust_rule_view_position_try_declarations(&m_view); }
     Utf16String name() const
     {
         Utf16String name;
@@ -184,6 +184,7 @@ public:
     size_t size() const { return Parser::ValueParserFFI::rust_rule_list_count(m_list); }
     bool has_implicit_scope() const { return Parser::ValueParserFFI::rust_rule_list_has_implicit_scope(m_list); }
     bool has_anonymous_layer() const { return Parser::ValueParserFFI::rust_rule_list_has_anonymous_layer(m_list); }
+    bool has_counter_style_rules() const { return Parser::ValueParserFFI::rust_rule_list_has_counter_style_rules(m_list); }
     FlatPtr shared_contents_identity() const { return Parser::ValueParserFFI::rust_rule_list_shared_contents_identity(m_list); }
     RustRuleList clone_shared_contents() const
     {

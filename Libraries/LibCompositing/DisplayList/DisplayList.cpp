@@ -5,13 +5,10 @@
  */
 
 #include <AK/Atomic.h>
-#include <AK/Debug.h>
-#include <AK/NumericLimits.h>
-#include <AK/TemporaryChange.h>
+#include <AK/Function.h>
+#include <AK/ScopeGuard.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/RustFFI.h>
-#include <LibGfx/PaintingSurface.h>
-#include <LibGfx/Path.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 
@@ -19,280 +16,165 @@ namespace Compositing {
 
 static Atomic<u64> s_next_id { 1 };
 
-DisplayList::DisplayList(u64 compatible_visual_context_tree_structural_epoch)
-    : m_compatible_visual_context_tree_structural_epoch(compatible_visual_context_tree_structural_epoch)
-    , m_id(s_next_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed))
+static u64 next_id()
 {
+    return s_next_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed);
 }
 
-DisplayList::DisplayList(u64 compatible_visual_context_tree_structural_epoch, u64 id, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs, Optional<Gfx::Color> surface_clear_color, Optional<AsyncScrollingMetadata> async_scrolling_metadata)
+DisplayList::DisplayList(u64 compatible_visual_context_tree_structural_epoch, u64 id, void const* storage, Optional<Gfx::Color> surface_clear_color, Gfx::Color root_group_color, Optional<AsyncScrollingMetadata> async_scrolling_metadata)
     : m_compatible_visual_context_tree_structural_epoch(compatible_visual_context_tree_structural_epoch)
     , m_id(id)
-    , m_command_bytes(move(command_bytes))
-    , m_command_runs(move(command_runs))
+    , m_storage(storage)
     , m_surface_clear_color(surface_clear_color)
+    , m_root_group_color(root_group_color)
     , m_async_scrolling_metadata(move(async_scrolling_metadata))
 {
+    VERIFY(m_storage);
 }
 
 DisplayList::~DisplayList()
 {
-    Compositing::RustFFI::display_list_destroy_effect_clip_plan(m_replay_effect_clip_plan.load());
-    Compositing::RustFFI::display_list_release_command_storage(m_rust_command_storage);
+    RustFFI::display_list_storage_release(m_storage);
 }
 
-void const* DisplayList::replay_effect_clip_plan(AccumulatedVisualContextTree const& tree) const
+NonnullRefPtr<DisplayList> DisplayList::create(AccumulatedVisualContextTree const& visual_context_tree)
 {
-    VERIFY(m_compatible_visual_context_tree_structural_epoch == tree.structural_epoch());
-    if (auto const* plan = m_replay_effect_clip_plan.load())
-        return plan;
-    auto runs = command_runs();
-    auto const* plan = Compositing::RustFFI::display_list_create_effect_clip_plan(tree.rust_handle(), runs.data(), runs.size());
-    VERIFY(plan);
-    void const* existing = nullptr;
-    if (!m_replay_effect_clip_plan.compare_exchange_strong(existing, plan)) {
-        Compositing::RustFFI::display_list_destroy_effect_clip_plan(plan);
-        return existing;
+    return adopt_ref(*new DisplayList(visual_context_tree.structural_epoch(), next_id(), RustFFI::display_list_storage_create_empty(), {}, Gfx::Color::Transparent, {}));
+}
+
+NonnullRefPtr<DisplayList> DisplayList::adopt_rust_command_storage(AccumulatedVisualContextTree const& visual_context_tree, void const* recorded)
+{
+    VERIFY(recorded);
+    return adopt_ref(*new DisplayList(visual_context_tree.structural_epoch(), next_id(), RustFFI::display_list_storage_adopt_recorded(recorded), {}, Gfx::Color::Transparent, {}));
+}
+
+NonnullRefPtr<DisplayList> DisplayList::share_rust_command_storage(AccumulatedVisualContextTree const& visual_context_tree, void const* recorded)
+{
+    VERIFY(recorded);
+    return adopt_rust_command_storage(visual_context_tree, RustFFI::display_list_retain_command_storage(recorded));
+}
+
+NonnullRefPtr<DisplayList> DisplayList::adopt_received_storage(Properties properties, void const* storage)
+{
+    return adopt_ref(*new DisplayList(properties.compatible_visual_context_tree_structural_epoch, properties.id, storage, properties.surface_clear_color, properties.root_group_color, move(properties.async_scrolling_metadata)));
+}
+
+// Copies a tape and run table that came from another process into Rust memory through `fill`, then checks them and
+// returns the storage that holds them. Every later read of the tape is then sound.
+static ErrorOr<void const*> receive_display_list_tape(u64 tape_size, u64 run_count, Function<ErrorOr<void>(Bytes tape, Bytes run_bytes)> const& fill)
+{
+    auto pending = RustFFI::display_list_storage_begin(tape_size, run_count);
+    if (!pending.pending)
+        return Error::from_string_literal("Display list is too large to receive");
+    ArmedScopeGuard abandon_pending = [&] { RustFFI::display_list_storage_abandon(pending.pending); };
+    TRY(fill(Bytes { pending.tape, tape_size }, Bytes { pending.run_bytes, pending.run_bytes_size }));
+    abandon_pending.disarm();
+    u8 const* error = nullptr;
+    size_t error_size = 0;
+    auto const* storage = RustFFI::display_list_storage_finish(pending.pending, &error, &error_size);
+    if (!storage)
+        return Error::from_string_view({ error, error_size });
+    return storage;
+}
+
+DisplayList::ReferencedResourceIds DisplayList::referenced_resource_ids() const
+{
+    auto ids = RustFFI::display_list_storage_referenced_resource_ids(m_storage);
+    return {
+        .fonts = { ids.font_ids, ids.font_id_count },
+        .image_frames = { ids.image_frame_ids, ids.image_frame_id_count },
+        .video_sinks = { ids.video_sink_ids, ids.video_sink_id_count },
+        .display_lists = { ids.display_list_ids, ids.display_list_id_count },
+        .canvases = { ids.canvas_ids, ids.canvas_id_count },
+    };
+}
+
+bool DisplayList::requires_direct_replay_without_nested_lists(AccumulatedVisualContextTree const& visual_context_tree) const
+{
+    VERIFY(m_compatible_visual_context_tree_structural_epoch == visual_context_tree.structural_epoch());
+    return RustFFI::display_list_storage_requires_direct_replay_without_nested_lists(m_storage, visual_context_tree.rust_handle());
+}
+
+void DisplayList::for_each_compositor_metadata(Function<void(ContextRef, DisplayListCommandType, ReadonlyBytes)> const& callback) const
+{
+    RustFFI::display_list_storage_for_each_compositor_metadata(m_storage, const_cast<void*>(static_cast<void const*>(&callback)), [](void* context, ContextRef run_context, DisplayListCommandType command_type, u8 const* payload, size_t payload_size) {
+        (*static_cast<Function<void(ContextRef, DisplayListCommandType, ReadonlyBytes)> const*>(context))(run_context, command_type, { payload, payload_size });
+    });
+}
+
+void DisplayList::for_each_caret(Function<void(ContextRef, Gfx::IntRect, PaintCaret const&)> const& callback) const
+{
+    RustFFI::display_list_storage_for_each_caret(m_storage, const_cast<void*>(static_cast<void const*>(&callback)), [](void* context, ContextRef run_context, Gfx::IntRect bounding_rect, u8 const* payload, size_t payload_size) {
+        auto command = read_display_list_object<PaintCaret>({ payload, payload_size });
+        (*static_cast<Function<void(ContextRef, Gfx::IntRect, PaintCaret const&)> const*>(context))(run_context, bounding_rect, command);
+    });
+}
+
+void DisplayList::replay(AccumulatedVisualContextTree const& visual_context_tree, ScrollStateSnapshot const& scroll_state, RustFFI::FfiDisplayListReplayCallbacks const& callbacks) const
+{
+    VERIFY(m_compatible_visual_context_tree_structural_epoch == visual_context_tree.structural_epoch());
+    auto scroll_offsets = scroll_state.device_offsets();
+    RustFFI::display_list_replay(visual_context_tree.rust_handle(), m_storage, m_root_group_color, scroll_offsets.data(), scroll_offsets.size(), &callbacks);
+}
+
+void DisplayList::replay_records(ReadonlyBytes records, ScrollStateSnapshot const& scroll_state, RustFFI::FfiDisplayListReplayCallbacks const& callbacks)
+{
+    auto scroll_offsets = scroll_state.device_offsets();
+    RustFFI::display_list_replay_records(records.data(), records.size(), scroll_offsets.data(), scroll_offsets.size(), &callbacks);
+}
+
+u64 DisplayList::tape_size() const
+{
+    return RustFFI::display_list_storage_tape_size(m_storage);
+}
+
+u64 DisplayList::run_count() const
+{
+    return RustFFI::display_list_storage_run_count(m_storage);
+}
+
+ErrorOr<Core::AnonymousBuffer> DisplayList::copy_to_shared_buffer() const
+{
+    auto size = RustFFI::display_list_storage_packed_size(m_storage);
+    if (size == 0)
+        return Core::AnonymousBuffer {};
+    // Sealed where the platform supports it, so the receiver cannot be faulted by the file shrinking.
+    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(size));
+    RustFFI::display_list_storage_write_packed(m_storage, buffer.data<u8>());
+    return buffer;
+}
+
+ErrorOr<NonnullRefPtr<DisplayList>> DisplayList::create_from_shared_buffer(Properties properties, Core::AnonymousBuffer shared_tape_buffer, u64 tape_size, u64 run_count)
+{
+    ReadonlyBytes packed;
+    if (shared_tape_buffer.is_valid()) {
+        TRY(shared_tape_buffer.validate_backing_size());
+        packed = shared_tape_buffer.bytes();
     }
-    return plan;
+    u8 const* error = nullptr;
+    size_t error_size = 0;
+    auto const* storage = RustFFI::display_list_storage_receive_packed(packed.data(), packed.size(), tape_size, run_count, &error, &error_size);
+    if (!storage)
+        return Error::from_string_view({ error, error_size });
+    return adopt_received_storage(move(properties), storage);
 }
 
-NonnullRefPtr<DisplayList> DisplayList::adopt_rust_command_storage(AccumulatedVisualContextTree const& visual_context_tree, void const* storage)
+DisplayList::Properties DisplayList::properties() const
 {
-    VERIFY(storage);
-    auto recorded = Compositing::RustFFI::display_list_command_storage_view(storage);
-    auto display_list = create(visual_context_tree);
-    display_list->m_rust_command_storage = storage;
-    display_list->m_shared_command_bytes = { recorded.bytes, recorded.byte_count };
-    display_list->m_shared_command_runs = { recorded.command_runs, recorded.command_run_count };
-    MUST(validate_display_list_command_runs(display_list->command_bytes(), display_list->command_runs()));
-    return display_list;
-}
-
-NonnullRefPtr<DisplayList> DisplayList::create_from_command_bytes(AccumulatedVisualContextTree const& visual_context_tree, ByteBuffer&& command_bytes, Vector<DisplayListCommandRun>&& command_runs)
-{
-    MUST(validate_display_list_command_runs(command_bytes, command_runs));
-    auto display_list = create(visual_context_tree);
-    display_list->m_command_bytes = move(command_bytes);
-    display_list->m_command_runs = move(command_runs);
-    return display_list;
+    return {
+        .id = m_id,
+        .compatible_visual_context_tree_structural_epoch = m_compatible_visual_context_tree_structural_epoch,
+        .surface_clear_color = m_surface_clear_color,
+        .root_group_color = m_root_group_color,
+        .async_scrolling_metadata = m_async_scrolling_metadata,
+    };
 }
 
 ErrorOr<void> validate_display_list_references_live_visual_context_nodes(DisplayList const& display_list, AccumulatedVisualContextTree const& visual_context_tree)
 {
-    auto command_runs = display_list.command_runs();
-    if (!Compositing::RustFFI::display_list_references_only_live_visual_context_nodes(visual_context_tree.rust_handle(), command_runs.data(), command_runs.size()))
+    if (!RustFFI::display_list_references_only_live_visual_context_nodes(visual_context_tree.rust_handle(), display_list.rust_handle()))
         return Error::from_string_literal("Display list references a visual context node that is not live");
     return {};
-}
-
-ErrorOr<void> validate_display_list_command_runs(ReadonlyBytes command_bytes, ReadonlySpan<DisplayListCommandRun> runs)
-{
-    size_t next_offset = 0;
-    for (auto const& run : runs) {
-        if (run.offset != next_offset || run.size == 0 || run.size % DisplayList::command_alignment != 0)
-            return Error::from_string_literal("Display list command runs do not cover the command bytes");
-        if (run.size > command_bytes.size() - next_offset)
-            return Error::from_string_literal("Display list command runs exceed the command bytes");
-        next_offset += run.size;
-    }
-    if (next_offset != command_bytes.size())
-        return Error::from_string_literal("Display list command runs do not cover the command bytes");
-    if constexpr (DISPLAY_LIST_RUNS_DEBUG) {
-        Optional<ContextRef> previous_context;
-        for (auto const& run : runs) {
-            if (previous_context == run.context)
-                return Error::from_string_literal("Adjacent display list command runs share a visual context");
-            previous_context = run.context;
-            DisplayListCommandRun computed_run {};
-            computed_run.offset = run.offset;
-            computed_run.context = run.context;
-            auto bytes = command_bytes.slice(run.offset, run.size);
-            for (size_t offset = 0; offset < bytes.size();) {
-                if (bytes.size() - offset < sizeof(DisplayListCommandHeader))
-                    return Error::from_string_literal("Display list command run ends inside a command header");
-                auto header = read_display_list_object<DisplayListCommandHeader>(bytes.slice(offset));
-                auto record_size = sizeof(DisplayListCommandHeader) + static_cast<size_t>(header.payload_size);
-                if (record_size > bytes.size() - offset || record_size % DisplayList::command_alignment != 0)
-                    return Error::from_string_literal("Display list command run ends inside a command");
-                offset += record_size;
-                computed_run.size += record_size;
-                if (display_list_command_is_compositor_metadata(header.command_type))
-                    computed_run.has_compositor_metadata = true;
-                else if (header.has_bounding_rect)
-                    computed_run.ink_bounds.unite(header.bounding_rect);
-                else
-                    computed_run.has_unbounded_draw = true;
-            }
-            if (computed_run != run)
-                return Error::from_string_literal("Display list command run summary disagrees with its command bytes");
-        }
-    }
-    return {};
-}
-
-void DisplayListPlayer::execute(
-    DisplayList const& display_list,
-    AccumulatedVisualContextTree const& visual_context_tree,
-    DisplayListResourceStorage const& resource_storage,
-    ScrollStateSnapshot const& scroll_state_snapshot,
-    RefPtr<Gfx::PaintingSurface> surface,
-    CanvasSurfaceRegistry const* canvas_surface_registry)
-{
-    VERIFY(display_list.compatible_visual_context_tree_structural_epoch() == visual_context_tree.structural_epoch());
-    m_surface = surface;
-    m_active_display_list = &display_list;
-    m_active_visual_context_tree = &visual_context_tree;
-    m_resource_storage = &resource_storage;
-    m_canvas_surface_registry = canvas_surface_registry;
-    execute_impl(display_list, scroll_state_snapshot);
-    m_canvas_surface_registry = nullptr;
-    m_resource_storage = nullptr;
-    m_active_visual_context_tree = nullptr;
-    m_active_display_list = nullptr;
-    m_surface = nullptr;
-}
-
-void DisplayListPlayer::execute_display_list_into_surface(DisplayList const& display_list, AccumulatedVisualContextTree const& visual_context_tree, Gfx::PaintingSurface& target_surface)
-{
-    VERIFY(display_list.compatible_visual_context_tree_structural_epoch() == visual_context_tree.structural_epoch());
-    TemporaryChange surface_change { m_surface, RefPtr<Gfx::PaintingSurface> { target_surface } };
-    TemporaryChange display_list_change { m_active_display_list, &display_list };
-    TemporaryChange visual_context_tree_change { m_active_visual_context_tree, &visual_context_tree };
-    VERIFY(m_resource_storage);
-    ScrollStateSnapshot scroll_state_snapshot;
-    execute_impl(display_list, scroll_state_snapshot);
-}
-
-void DisplayListPlayer::execute_command_bytes_into_surface(ReadonlyBytes command_bytes, Gfx::PaintingSurface& target_surface)
-{
-    TemporaryChange surface_change { m_surface, RefPtr<Gfx::PaintingSurface> { target_surface } };
-    ScrollStateSnapshot scroll_state_snapshot;
-    execute_command_bytes(command_bytes, scroll_state_snapshot);
-}
-
-void DisplayListPlayer::execute_nested_display_list(
-    DisplayList const& display_list,
-    AccumulatedVisualContextTree const& visual_context_tree,
-    ScrollStateSnapshot const& scroll_state_snapshot)
-{
-    VERIFY(display_list.compatible_visual_context_tree_structural_epoch() == visual_context_tree.structural_epoch());
-    TemporaryChange display_list_change { m_active_display_list, &display_list };
-    TemporaryChange visual_context_tree_change { m_active_visual_context_tree, &visual_context_tree };
-    VERIFY(m_resource_storage);
-    execute_impl(display_list, scroll_state_snapshot);
-}
-
-void DisplayListPlayer::execute_run_commands(DisplayListCommandRun const& run, ScrollStateSnapshot const& scroll_state)
-{
-    execute_command_bytes(active_display_list().command_bytes_of_run(run), scroll_state);
-}
-
-void DisplayListPlayer::execute_command_bytes(ReadonlyBytes command_bytes, ScrollStateSnapshot const& scroll_state)
-{
-    DisplayList::for_each_command_header(command_bytes, [&](DisplayListCommandHeader const& header, ReadonlyBytes payload) {
-        if (display_list_command_is_compositor_metadata(header.command_type))
-            return;
-
-        auto bounding_rect = header.has_bounding_rect
-            ? Optional<Gfx::IntRect>(header.bounding_rect)
-            : Optional<Gfx::IntRect> {};
-
-        if (bounding_rect.has_value() && (bounding_rect->is_empty() || would_be_fully_clipped_by_painter(*bounding_rect)))
-            return;
-
-        TemporaryChange current_command_payload_change { m_current_command_payload, payload };
-        for_each_display_list_inline_clip(header, payload, [&](DisplayListInlineClip const& inline_clip) {
-            if (inline_clip.kind == InlineClipKind::Path) {
-                auto path_bytes = payload.slice(inline_clip.path_data.offset, inline_clip.path_data.size);
-                push_clip_path(Gfx::Path::from_serialized_bytes(path_bytes), inline_clip.path_winding_rule);
-            } else {
-                push_clip(ReplayClip { .rect = inline_clip.clip_rect_or_path_device_bounds, .corner_radii = inline_clip.corner_radii, .mode = inline_clip.mode });
-            }
-        });
-        auto inline_transform = display_list_inline_transform(header, payload);
-        if (inline_transform.has_value())
-            push_transform(*inline_transform);
-        auto dispatch_command = [&]<DisplayListCommand Command>(auto&& callback) {
-            auto command = read_display_list_command_payload<Command>(payload);
-            if constexpr (IsSame<Command, PaintScrollBar>) {
-                auto device_offset = scroll_state.device_offset_for_index(command.scroll_node_index);
-                if (command.vertical)
-                    command.thumb_rect.translate_by(0, static_cast<int>(-device_offset.y() * command.scroll_size));
-                else
-                    command.thumb_rect.translate_by(static_cast<int>(-device_offset.x() * command.scroll_size), 0);
-            }
-            callback(command);
-        };
-
-        switch (header.command_type) {
-#define DISPATCH_DISPLAY_LIST_COMMAND(command_type, player_method)                    \
-    case DisplayListCommandType::command_type:                                        \
-        dispatch_command.template operator()<command_type>([&](auto const& command) { \
-            play_command(command);                                                    \
-        });                                                                           \
-        break;
-            ENUMERATE_DISPLAY_LIST_COMMANDS(DISPATCH_DISPLAY_LIST_COMMAND)
-#undef DISPATCH_DISPLAY_LIST_COMMAND
-        }
-        if (inline_transform.has_value())
-            pop();
-        for (u8 index = 0; index < header.inline_clip_count; ++index)
-            pop();
-    });
-}
-
-void DisplayListPlayer::declare_mask_content(EffectNodeIndex effect, ReadonlyBytes content)
-{
-    m_declared_mask_contents.set(effect.value(), content);
-}
-
-Optional<ReadonlyBytes> DisplayListPlayer::declared_mask_content(EffectNodeIndex effect) const
-{
-    return m_declared_mask_contents.get(effect.value());
-}
-
-void DisplayListPlayer::execute_impl(DisplayList const& display_list, ScrollStateSnapshot const& scroll_state)
-{
-    TemporaryChange active_scroll_state_change { m_active_scroll_state, &scroll_state };
-    TemporaryChange declared_mask_contents_change { m_declared_mask_contents, HashMap<u32, ReadonlyBytes> {} };
-    auto const& visual_context_tree = active_visual_context_tree();
-    VERIFY(display_list.compatible_visual_context_tree_structural_epoch() == visual_context_tree.structural_epoch());
-    VERIFY(m_surface);
-
-    struct ReplayContext {
-        DisplayListPlayer& player;
-        ScrollStateSnapshot const& scroll_state;
-    } replay_context { *this, scroll_state };
-
-    Compositing::RustFFI::FfiDisplayListReplayCallbacks callbacks {
-        .context = &replay_context,
-        .canvas_matrix = [](void* context) -> Gfx::FloatMatrix4x4 { return static_cast<ReplayContext*>(context)->player.canvas_matrix(); },
-        .set_matrix = [](void* context, Gfx::FloatMatrix4x4 const* matrix) { static_cast<ReplayContext*>(context)->player.set_matrix(*matrix); },
-        .would_be_fully_clipped_by_painter = [](void* context, Gfx::IntRect rect) -> bool {
-            return static_cast<ReplayContext*>(context)->player.would_be_fully_clipped_by_painter(rect);
-        },
-        .push_clip = [](void* context, ReplayClip const* clip) { static_cast<ReplayContext*>(context)->player.push_clip(*clip); },
-        .push_clip_path = [](void* context, void const* path, Gfx::WindingRule winding_rule) { static_cast<ReplayContext*>(context)->player.push_clip_path(*static_cast<Gfx::Path const*>(path), winding_rule); },
-        .push_layer = [](void* context, ReplayLayer const* layer) { static_cast<ReplayContext*>(context)->player.push_layer(*layer); },
-        .push_mask = [](void* context, ReplayMask const* mask) { static_cast<ReplayContext*>(context)->player.push_mask(*mask); },
-        .pop_mask = [](void* context, ReplayMask const* mask, EffectNodeIndex effect) { static_cast<ReplayContext*>(context)->player.pop_mask(*mask, effect); },
-        .pop = [](void* context) { static_cast<ReplayContext*>(context)->player.pop(); },
-        .push_device_space_plane_clip = [](void* context, Gfx::FloatVector3 const* vertices, size_t vertex_count) {
-            Gfx::Path path;
-            path.move_to({ vertices[0].x(), vertices[0].y() });
-            for (size_t i = 1; i < vertex_count; ++i)
-                path.line_to({ vertices[i].x(), vertices[i].y() });
-            path.close();
-            static_cast<ReplayContext*>(context)->player.push_device_space_plane_clip(path); },
-        .execute_run = [](void* context, size_t run_index) {
-            auto& replay = *static_cast<ReplayContext*>(context);
-            replay.player.execute_run_commands(replay.player.active_display_list().command_runs()[run_index], replay.scroll_state); },
-    };
-
-    auto command_runs = display_list.command_runs();
-    auto scroll_offsets = scroll_state.device_offsets();
-    Compositing::RustFFI::display_list_replay(visual_context_tree.rust_handle(), display_list.replay_effect_clip_plan(visual_context_tree), command_runs.data(), command_runs.size(), scroll_offsets.data(), scroll_offsets.size(), &callbacks);
 }
 
 }
@@ -302,10 +184,13 @@ namespace IPC {
 template<>
 ErrorOr<void> encode(Encoder& encoder, Compositing::DisplayList::AsyncScrollingMetadata const& metadata)
 {
+    TRY(encoder.encode(metadata.document_id));
     TRY(encoder.encode(metadata.viewport_rect));
     TRY(encoder.encode(metadata.wheel_event_listener_state_generation));
     TRY(encoder.encode(metadata.has_blocking_wheel_event_listeners));
     TRY(encoder.encode(metadata.has_blocking_wheel_event_region_covering_viewport));
+    TRY(encoder.encode(metadata.viewport_keeps_horizontal_scrolls));
+    TRY(encoder.encode(metadata.viewport_keeps_vertical_scrolls));
     TRY(encoder.encode(metadata.device_pixels_per_css_pixel));
     TRY(encoder.encode(metadata.keyboard_scroll_state));
     return {};
@@ -315,30 +200,50 @@ template<>
 ErrorOr<Compositing::DisplayList::AsyncScrollingMetadata> decode(Decoder& decoder)
 {
     return Compositing::DisplayList::AsyncScrollingMetadata {
+        .document_id = TRY(decoder.decode<Optional<Web::UniqueNodeID>>()),
         .viewport_rect = TRY(decoder.decode<Gfx::IntRect>()),
         .wheel_event_listener_state_generation = TRY(decoder.decode<u64>()),
         .has_blocking_wheel_event_listeners = TRY(decoder.decode<bool>()),
         .has_blocking_wheel_event_region_covering_viewport = TRY(decoder.decode<bool>()),
+        .viewport_keeps_horizontal_scrolls = TRY(decoder.decode<bool>()),
+        .viewport_keeps_vertical_scrolls = TRY(decoder.decode<bool>()),
         .device_pixels_per_css_pixel = TRY(decoder.decode<double>()),
         .keyboard_scroll_state = TRY(decoder.decode<Compositing::KeyboardScrollState>()),
     };
 }
 
 template<>
+ErrorOr<void> encode(Encoder& encoder, Compositing::DisplayList::Properties const& properties)
+{
+    TRY(encoder.encode(properties.id));
+    TRY(encoder.encode(properties.compatible_visual_context_tree_structural_epoch));
+    TRY(encoder.encode(properties.surface_clear_color));
+    TRY(encoder.encode(properties.root_group_color));
+    TRY(encoder.encode(properties.async_scrolling_metadata));
+    return {};
+}
+
+template<>
+ErrorOr<Compositing::DisplayList::Properties> decode(Decoder& decoder)
+{
+    return Compositing::DisplayList::Properties {
+        .id = TRY(decoder.decode<u64>()),
+        .compatible_visual_context_tree_structural_epoch = TRY(decoder.decode<u64>()),
+        .surface_clear_color = TRY(decoder.decode<Optional<Gfx::Color>>()),
+        .root_group_color = TRY(decoder.decode<Gfx::Color>()),
+        .async_scrolling_metadata = TRY(decoder.decode<Optional<Compositing::DisplayList::AsyncScrollingMetadata>>()),
+    };
+}
+
+template<>
 ErrorOr<void> encode(Encoder& encoder, Compositing::DisplayList const& display_list)
 {
-    TRY(encoder.encode(display_list.m_id));
-    auto command_bytes = display_list.command_bytes();
-    TRY(encoder.encode_size(command_bytes.size()));
-    TRY(encoder.append(command_bytes.data(), command_bytes.size()));
-    TRY(encoder.encode(display_list.m_compatible_visual_context_tree_structural_epoch));
-    TRY(encoder.encode(display_list.m_surface_clear_color));
-    TRY(encoder.encode(display_list.m_async_scrolling_metadata));
-    // Trivially copyable records, so they travel as raw bytes like the command tape does.
-    auto command_runs = display_list.command_runs();
-    TRY(encoder.encode_size(command_runs.size()));
-    if (!command_runs.is_empty())
-        TRY(encoder.append(reinterpret_cast<u8 const*>(command_runs.data()), command_runs.size() * sizeof(Compositing::DisplayListCommandRun)));
+    TRY(encoder.encode(display_list.properties()));
+    TRY(encoder.encode_size(display_list.tape_size()));
+    TRY(encoder.encode_size(display_list.run_count()));
+    auto packed = TRY(ByteBuffer::create_uninitialized(Compositing::RustFFI::display_list_storage_packed_size(display_list.rust_handle())));
+    Compositing::RustFFI::display_list_storage_write_packed(display_list.rust_handle(), packed.data());
+    TRY(encoder.append(packed.data(), packed.size()));
     return {};
 }
 
@@ -351,18 +256,15 @@ ErrorOr<void> encode(Encoder& encoder, NonnullRefPtr<Compositing::DisplayList> c
 template<>
 ErrorOr<NonnullRefPtr<Compositing::DisplayList>> decode(Decoder& decoder)
 {
-    auto id = TRY(decoder.decode<u64>());
-    auto command_bytes = TRY(decoder.decode<ByteBuffer>());
-    auto compatible_visual_context_tree_structural_epoch = TRY(decoder.decode<u64>());
-    auto surface_clear_color = TRY(decoder.decode<Optional<Gfx::Color>>());
-    auto async_scrolling_metadata = TRY(decoder.decode<Optional<Compositing::DisplayList::AsyncScrollingMetadata>>());
-    auto command_run_count = TRY(decoder.decode_size());
-    Vector<Compositing::DisplayListCommandRun> command_runs;
-    TRY(command_runs.try_resize(command_run_count));
-    if (!command_runs.is_empty())
-        TRY(decoder.decode_into(Bytes { reinterpret_cast<u8*>(command_runs.data()), command_runs.size() * sizeof(Compositing::DisplayListCommandRun) }));
-    TRY(Compositing::validate_display_list_command_runs(command_bytes, command_runs));
-    return adopt_ref(*new Compositing::DisplayList(compatible_visual_context_tree_structural_epoch, id, move(command_bytes), move(command_runs), surface_clear_color, move(async_scrolling_metadata)));
+    auto properties = TRY(decoder.decode<Compositing::DisplayList::Properties>());
+    auto tape_size = TRY(decoder.decode_size());
+    auto run_count = TRY(decoder.decode_size());
+    auto const* storage = TRY(Compositing::receive_display_list_tape(tape_size, run_count, [&](Bytes tape, Bytes run_bytes) -> ErrorOr<void> {
+        TRY(decoder.decode_into(tape));
+        TRY(decoder.decode_into(run_bytes));
+        return {};
+    }));
+    return Compositing::DisplayList::adopt_received_storage(move(properties), storage);
 }
 
 }

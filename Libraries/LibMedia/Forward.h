@@ -7,18 +7,19 @@
 
 #pragma once
 
+#include <LibMediaCodecs/Forward.h>
+
 namespace Media {
 
 class AudioDecoder;
 class AudioMixer;
+class AudioOutputFactory;
 class AudioPlaybackSink;
 class AudioProducer;
 class AudioSink;
-class CodedFrame;
 class ContainerNavigator;
 class DecodedAudioProducer;
 class DecodedVideoProducer;
-class DecoderError;
 class Demuxer;
 class DisplayingVideoSink;
 class FrameQueueItem;
@@ -31,8 +32,6 @@ class PlaybackManager;
 class ReadonlyBytesCursor;
 class AudioTimeStretchProcessor;
 class Track;
-class VideoDecoder;
-class VideoFrame;
 class VideoProducer;
 class VideoPresentationServerConnection;
 class VideoSink;

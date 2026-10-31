@@ -7,7 +7,16 @@ option(UNDEFINED_BEHAVIOR_IS_FATAL "Make undefined behavior sanitizer errors non
 option(ENABLE_ALL_THE_DEBUG_MACROS "Enable all debug macros to validate they still compile" OFF)
 
 option(INCLUDE_WASM_SPEC_TESTS "Download and include the WebAssembly spec testsuite" OFF)
-option(ENABLE_CRANELIFT_JIT "Enable Cranelift-based AOT compilation for WebAssembly" ON)
+option(BUILD_BROWSER_TESTS_ONLY "Only build the tests that run the browser's own executables" OFF)
+
+# The optimizing JIT for JavaScript generates code for x86-64 and AArch64 with the calling conventions of Linux and
+# macOS. Elsewhere, LibJS runs JavaScript in its interpreter alone.
+if (((LINUX AND NOT ANDROID) OR APPLE) AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
+    set(js_jit_default ON)
+else()
+    set(js_jit_default OFF)
+endif()
+option(ENABLE_JS_JIT "Enable the optimizing JIT for JavaScript" ${js_jit_default})
 
 set(LADYBIRD_CACHE_DIR "${PROJECT_BINARY_DIR}/../caches" CACHE PATH "Location of shared cache of downloaded files")
 option(ENABLE_NETWORK_DOWNLOADS "Allow downloads of required files. If OFF, required files must already be present in LADYBIRD_CACHE_DIR" ON)
@@ -26,7 +35,31 @@ option(ENABLE_INSTALL_HEADERS "Enable installing headers" ON)
 option(ENABLE_INSTALL_FREEDESKTOP_FILES "Enable installing .desktop and .service files" ${freedesktop_files_default})
 option(LADYBIRD_ENABLE_CPPTRACE "Enable use of cpptrace as the default library for stacktraces. If not available falls back to backtrace.h" ON)
 option(LADYBIRD_GENERATE_DSYM "Generate dSYM bundles for binaries and libraries (macOS only)" OFF)
-option(ENABLE_CI_BASELINE_CPU "Use a baseline CPU target for improved ccache sharing" OFF)
+option(LADYBIRD_GENERATE_SYMBOL_FILES "Build with debug info and write the symbols of the installed executables to separate files" OFF)
+if (LADYBIRD_GENERATE_SYMBOL_FILES AND MSVC)
+    message(FATAL_ERROR "LADYBIRD_GENERATE_SYMBOL_FILES is not supported with MSVC-style toolchains")
+endif()
+option(ENABLE_CI_BASELINE_CPU "Use a common CPU baseline for portable binaries and ccache sharing" OFF)
+
+set(LADYBIRD_VERSION "" CACHE STRING "Version of a release: year.month.patch, optionally followed by .alpha or .beta")
+set(LADYBIRD_BUNDLE_VERSION "${PROJECT_VERSION}")
+set(LADYBIRD_PACKAGE_VERSION "${PROJECT_VERSION}")
+if (NOT LADYBIRD_VERSION STREQUAL "")
+    if (NOT LADYBIRD_VERSION MATCHES "^([0-9][0-9][0-9][0-9]\\.([1-9]|1[0-2])\\.(0|[1-9][0-9]*))(\\.alpha|\\.beta)?$")
+        message(FATAL_ERROR "LADYBIRD_VERSION must be year.month.patch, optionally followed by .alpha or .beta: "
+            "${LADYBIRD_VERSION}")
+    endif()
+
+    # macOS compares bundle versions as numbers, so they leave out the suffix.
+    set(LADYBIRD_BUNDLE_VERSION "${CMAKE_MATCH_1}")
+
+    # Debian and RPM sort a tilde before everything else, which puts 2026.12.3~beta before 2026.12.3.
+    string(REPLACE "." "~" package_version_suffix "${CMAKE_MATCH_4}")
+    set(LADYBIRD_PACKAGE_VERSION "${CMAKE_MATCH_1}${package_version_suffix}")
+endif()
+
+# Like other browsers, our Linux packages keep Ladybird in a directory of its own.
+set(LADYBIRD_PACKAGE_INSTALL_PREFIX "/opt/ladybird")
 
 # lto1 uses a crazy amount of RAM in static builds.
 # Disable LTO for static gcc builds unless explicitly asked for.

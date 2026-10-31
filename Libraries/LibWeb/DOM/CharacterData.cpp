@@ -17,7 +17,9 @@
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/EditingHistory.h>
-#include <LibWeb/Layout/TextNode.h>
+#include <LibWeb/Editing/SpellingMarkers.h>
+#include <LibWeb/Editing/WritingSuggestionController.h>
+#include <LibWeb/PaintTiming/PaintTiming.h>
 #include <LibWeb/Selection/Selection.h>
 
 namespace Web::DOM {
@@ -169,6 +171,14 @@ WebIDL::ExceptionOr<void> CharacterData::replace_data(size_t offset, size_t coun
     if (m_data == old_data)
         return {};
 
+    // A spelling marker covers the text it was flagged on: Data replaced around it moves it, and data replaced inside
+    // it ends it.
+    if (has_spelling_markers())
+        document().spelling_markers().did_replace_data(as<Text>(*this), offset, count, data.length_in_code_units());
+
+    if (auto* controller = document().writing_suggestion_controller_if_exists(); controller && is<Text>(*this))
+        controller->did_change_text(as<Text>(*this));
+
     // A text node holding nothing leaves its parent `:empty`, so data arriving in it or leaving it
     // moves the parent's emptiness without any node being created or destroyed.
     if (is<Text>(*this) && old_data.is_empty() != m_data.is_empty()) {
@@ -179,29 +189,25 @@ WebIDL::ExceptionOr<void> CharacterData::replace_data(size_t offset, size_t coun
     // NB: Called during DOM text mutation, layout is stale.
     if (is<Text>(*this)) {
         if (auto* parent = this->parent()) {
-            if (auto* first_letter_owner = parent->first_letter_owner_for_layout_subtree_from(*parent))
+            Layout::ForcedReadScope read { document() };
+            if (auto* first_letter_owner = parent->first_letter_owner_for_layout_subtree_from(read, *parent))
                 first_letter_owner->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData);
         }
+        CSS::record_text_data_changed(as<Text>(*this));
         auto whitespace_only_changed = old_data.is_ascii_whitespace() != m_data.is_ascii_whitespace();
-        auto* text_layout_node = as_if<Layout::TextNode>(unsafe_layout_node());
-        if (text_layout_node && Layout::RustFFI::layout_arena_text_has_source_range(text_layout_node->arena_handle(), Layout::Node::slot_id(text_layout_node))) {
-            // First-letter source ranges are determined while building the layout tree.
-            if (parent())
-                parent()->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData);
-        } else if (text_layout_node) {
-            // NB: Since the text node's data has changed, we need to invalidate the text for rendering.
-            //     This ensures that the new text is reflected in layout, even if we don't end up doing a full layout
-            //     tree rebuild.
-            text_layout_node->invalidate_text_for_rendering();
-
-            // We also need to relayout.
-            text_layout_node->set_needs_layout_update(SetNeedsLayoutReason::CharacterDataReplaceData);
-
-            if (whitespace_only_changed)
+        Layout::RustFFI::FfiBoxMarks marks {};
+        marks.text_data_changed = true;
+        mark_box(marks);
+        // Whitespace alone may render as nothing, so a text that turns into it or out of it may gain or lose its box.
+        if (whitespace_only_changed && is_connected()) {
+            if (has_layout_box())
                 set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData);
-        } else if (whitespace_only_changed && is_connected()) {
-            if (auto* parent = this->parent())
+            else if (auto* parent = this->parent())
                 parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData);
+
+            // NB: Paint timing stops looking at text that is all white space, which this text no longer is.
+            if (!m_data.is_ascii_whitespace())
+                PaintTiming::text_node_may_be_painted_for_the_first_time(as<Text>(*this));
         }
     }
 

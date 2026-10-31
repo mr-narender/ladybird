@@ -7,9 +7,11 @@
 #include <LibGC/Heap.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Location.h>
+#include <LibWeb/HTML/NavigationSourceSnapshot.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/RemoteWindow.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/SourceSnapshotParams.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWebCommon/HTML/PostedMessageDescriptor.h>
@@ -112,17 +114,21 @@ GC::Ptr<WindowProxy const> RemoteWindow::top() const
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-opener
-GC::Ptr<WindowProxy const> RemoteWindow::opener() const
+JS::Value RemoteWindow::opener() const
 {
     // 1. Let current be this's browsing context.
     // 2. If current is null, then return null.
     auto navigable = this->navigable();
     if (!navigable)
-        return {};
+        return JS::js_null();
 
     // 3. If current's opener browsing context is null, then return null.
+    auto opener_window_proxy = navigable->active_browsing_context_opener_window_proxy();
+    if (!opener_window_proxy)
+        return JS::js_null();
+
     // 4. Return current's opener browsing context's WindowProxy object.
-    return navigable->active_browsing_context_opener_window_proxy();
+    return &opener_window_proxy->object();
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-parent
@@ -160,20 +166,35 @@ void RemoteWindow::close()
     // 4. Let browsingContext be thisTraversable's active browsing context.
     // NB: Familiarity is checked on the navigables whose active browsing contexts these are.
 
-    // 5. Let sourceSnapshotParams be the result of snapshotting source snapshot params given thisTraversable's active document.
-    // NB: That document is in the process hosting the traversable, which runs the steps needing it.
+    auto& incumbent_global_object = incumbent_window();
 
-    auto incumbent_navigable = incumbent_window().navigable();
+    // 5. Let sourceSnapshotParams be the result of snapshotting source snapshot params given the incumbent global object's
+    //    associated Document.
+    auto source_snapshot_params = snapshot_source_snapshot_params(incumbent_global_object.associated_document());
+
+    auto incumbent_navigable = incumbent_global_object.navigable();
+    if (!incumbent_navigable)
+        return;
 
     // 6. If all the following are true:
-    //    - thisTraversable is script-closable;
-    //    - the incumbent global object's browsing context is familiar with browsingContext; and
-    //    - the incumbent global object's navigable is allowed by sandboxing to navigate thisTraversable, given sourceSnapshotParams,
-    //    then set thisTraversable's is closing to true, and queue a task on the DOM manipulation task source to definitely close thisTraversable.
-    // NB: Familiarity is checked here; the process hosting the traversable's document checks the rest and closes it.
-    if (!incumbent_navigable || !incumbent_navigable->is_familiar_with(*traversable))
-        return;
-    m_navigable->page().client().request_close_of_remote_traversable(*traversable, *incumbent_navigable);
+    if (
+        // thisTraversable is script-closable;
+        traversable->is_script_closable()
+
+        // the incumbent global object's browsing context is familiar with browsingContext; and
+        && incumbent_navigable->is_familiar_with(*traversable)
+
+        // the incumbent global object's navigable is allowed by sandboxing to navigate thisTraversable, given sourceSnapshotParams,
+        && incumbent_navigable->allowed_by_sandboxing_to_navigate(*traversable, source_snapshot_params))
+    // then:
+    {
+        // 1. Set thisTraversable's is closing to true.
+        traversable->set_closing(true);
+
+        // 2. Queue a task on the DOM manipulation task source to definitely close thisTraversable.
+        // NB: The process hosting thisTraversable queues it once the UI process has checked the request.
+        m_navigable->page().client().request_close_of_remote_traversable(*traversable, *incumbent_navigable, create_navigation_source_snapshot(source_snapshot_params));
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-window-focus
@@ -226,15 +247,17 @@ WebIDL::ExceptionOr<void> RemoteWindow::post_message(JS::Realm& realm, JS::Value
     //     process, which forwards it there. That process represents the source's navigable, which names the source.
     //     A source whose [[Window]] has no navigable is null there.
     Optional<CrossProcessId> source_navigable_id;
-    if (auto remote_window = prepared.source->remote_window()) {
-        if (auto source_navigable = remote_window->navigable())
+    // AD-HOC: The UI process takes the source only from a navigable this process hosts, so a source whose [[Window]] is
+    //         in another process is null.
+    // NB: A navigable in a destroyed subtree is discarded, like it is for the source's window.parent.
+    if (auto window = prepared.source->window()) {
+        if (auto source_navigable = window->navigable(); source_navigable && !source_navigable->is_in_a_destroyed_subtree())
             source_navigable_id = source_navigable->id();
-    } else if (auto source_navigable = prepared.source->window()->navigable()) {
-        source_navigable_id = source_navigable->id();
     }
     PostedMessageDescriptor posted_message {
         .serialize_with_transfer_result = move(prepared.serialize_with_transfer_result),
         .target_origin = move(prepared.target_origin),
+        .incumbent_settings_id = move(prepared.incumbent_settings_id),
         .source_origin = move(prepared.source_origin),
         .source_navigable_id = source_navigable_id,
     };
@@ -259,7 +282,7 @@ Vector<GC::Root<Navigable>> RemoteWindow::document_tree_child_navigables()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#document-tree-child-navigable-target-name-property-set
-OrderedHashMap<Utf16FlyString, GC::Ref<Navigable>> RemoteWindow::document_tree_child_navigable_target_name_property_set()
+GC::OrderedRootHashMap<Utf16FlyString, GC::Ref<Navigable>> RemoteWindow::document_tree_child_navigable_target_name_property_set()
 {
     // The document-tree child navigable target name property set of a Window object window is the return value of running these steps:
 
@@ -267,7 +290,7 @@ OrderedHashMap<Utf16FlyString, GC::Ref<Navigable>> RemoteWindow::document_tree_c
     auto children = document_tree_child_navigables();
 
     // 2. Let firstNamedChildren be an empty ordered set.
-    OrderedHashMap<Utf16FlyString, GC::Ref<Navigable>> first_named_children;
+    GC::OrderedRootHashMap<Utf16FlyString, GC::Ref<Navigable>> first_named_children;
 
     // 3. For each navigable of children:
     for (auto const& navigable : children) {
@@ -288,7 +311,7 @@ OrderedHashMap<Utf16FlyString, GC::Ref<Navigable>> RemoteWindow::document_tree_c
     }
 
     // 4. Let names be an empty ordered set.
-    OrderedHashMap<Utf16FlyString, GC::Ref<Navigable>> names;
+    GC::OrderedRootHashMap<Utf16FlyString, GC::Ref<Navigable>> names;
 
     // 5. For each navigable of firstNamedChildren:
     for (auto const& [name, navigable] : first_named_children) {

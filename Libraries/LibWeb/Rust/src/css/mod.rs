@@ -8,6 +8,7 @@ pub(crate) mod absolutize;
 pub mod animated_overlay;
 pub mod animation;
 pub mod calc;
+pub(crate) mod calc_size;
 pub mod cascaded_properties;
 pub(crate) mod color_conversion;
 pub mod color_interpolation;
@@ -17,6 +18,7 @@ pub mod computed_value_types;
 pub(crate) mod computed_value_views;
 pub mod computed_values;
 pub(crate) mod container_conditions;
+pub(crate) mod counter_representation;
 pub(crate) mod counter_style;
 pub mod css_enums;
 pub mod css_path;
@@ -29,9 +31,11 @@ pub(crate) mod descriptor_block;
 pub(crate) mod descriptor_metadata;
 pub mod display;
 pub use libcompositing_rust::easing;
+mod dom_selector_matching;
 pub mod ffi_stats;
 pub mod ffi_support;
 pub(crate) mod font_feature_values;
+pub(crate) mod font_matching;
 pub(crate) mod function_signature;
 pub(crate) mod host_shared;
 pub(crate) mod import_rule;
@@ -59,7 +63,12 @@ pub(crate) mod style_sheet;
 pub(crate) mod style_value;
 pub mod table_group_builder;
 pub mod transition;
+pub(crate) mod value_codes;
 
-pub use css_tokenizer::CssHashType;
-pub use css_tokenizer::CssNumberType;
-pub use css_tokenizer::CssTokenType;
+pub(crate) mod dimension_units {
+    include!(concat!(env!("OUT_DIR"), "/dimension_units_generated.rs"));
+}
+
+pub(crate) mod transform_functions {
+    include!(concat!(env!("OUT_DIR"), "/transform_functions_generated.rs"));
+}

@@ -18,8 +18,8 @@
 #include <AK/Time.h>
 #include <AK/Vector.h>
 #include <LibCore/EventLoop.h>
-#include <LibMedia/AudioOutput.h>
-#include <LibMedia/DecoderError.h>
+#include <LibCore/Promise.h>
+#include <LibMedia/DemuxerScanState.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/MediaClock.h>
@@ -27,12 +27,13 @@
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/PlaybackStates/Forward.h>
 #include <LibMedia/PlaybackStates/PlaybackState.h>
+#include <LibMedia/Sinks/AudioOutputFactory.h>
 #include <LibMedia/Sinks/RemoteVideoSink.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibMedia/Track.h>
-#include <LibMedia/VideoFrameHandle.h>
-#include <LibMedia/VideoPresentation/PresentedFramePage.h>
 #include <LibMedia/VideoSinkHandle.h>
+#include <LibMediaCodecs/DecoderError.h>
+#include <LibMediaCodecs/VideoFrameMetadata.h>
 
 namespace Media {
 
@@ -59,10 +60,8 @@ public:
 
     using AudioTracks = Vector<Track, EXPECTED_AUDIO_TRACK_COUNT>;
 
-    static NonnullOwnPtr<PlaybackManager> create();
+    static NonnullOwnPtr<PlaybackManager> create(NonnullRefPtr<AudioOutputFactory>);
     ~PlaybackManager();
-
-    void set_audio_output(AudioOutput audio_output) { m_audio_output = audio_output; }
 
     AK::Duration duration() const { return m_duration; }
     void set_duration(AK::Duration);
@@ -98,20 +97,25 @@ public:
     bool is_playing();
     PlaybackState state();
     AvailableData available_data();
-    TimeRanges buffered_time_ranges() const;
+    BufferedRanges buffered_time_ranges() const;
 
     void set_volume(double);
     void set_playback_rate(float);
 
-    Function<void()> on_metadata_parsed;
-    Function<void(Track const&)> on_track_added;
     Function<void()> on_playback_state_change;
     Function<void(AK::Duration)> on_duration_change;
     Function<void()> on_buffered_ranges_change;
     Function<void(DecoderError&&)> on_error;
 
-    void add_media_source(NonnullRefPtr<MediaStream> const&);
-    void add_media_source(NonnullRefPtr<Demuxer> const&);
+    struct AddedTracks {
+        NonnullRefPtr<Demuxer> demuxer;
+        Vector<Track> audio_tracks;
+        Vector<Track> video_tracks;
+    };
+    // Settles on the thread that added the source, once its metadata is parsed and its tracks are added.
+    using AddMediaSourcePromise = Core::Promise<AddedTracks, DecoderError>;
+    NonnullRefPtr<AddMediaSourcePromise> add_media_source(NonnullRefPtr<MediaStream> const&);
+    NonnullRefPtr<AddMediaSourcePromise> add_media_source(NonnullRefPtr<Demuxer> const&);
 
     struct RemoteVideoEdge {
         NonnullRefPtr<RemoteVideoSink> sink;
@@ -122,15 +126,11 @@ public:
     static bool has_video_sink_handle(Badge<VideoPresentationServerConnection>, VideoSinkHandle);
     static ErrorOr<RemoteVideoEdge> create_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle, RemoteVideoSink::Delegates);
     static void attach_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle, NonnullRefPtr<RemoteVideoSink> const&);
-    static RefPtr<VideoFrame> current_presented_frame(VideoSinkHandle);
-    static Optional<RemoteVideoSink::SlotStorage> presented_frame_slot_storage(VideoSinkHandle, VideoFramePoolID, u32 slot_index);
     static void release_video_edge(Badge<VideoPresentationServerConnection>, VideoSinkHandle, VideoSink const& released_sink);
 
     // For a process hosting playback on behalf of an owner in another process; not owner API.
     struct HostHooks {
         Function<void(MediaTimeReader const&)> on_clock_changed;
-        Function<void(VideoSinkHandle, PresentedFramePage const&)> on_video_edge_attached;
-        Function<void(VideoSinkHandle, VideoFramePoolID)> on_video_frame_pool_retired;
     };
     void set_host_hooks(HostHooks);
     MediaTimeReader const& time_reader() const { return m_time_reader; }
@@ -140,6 +140,7 @@ public:
 private:
     struct VideoTrackData {
         Track track;
+        NonnullRefPtr<Demuxer> demuxer;
         NonnullRefPtr<DecodedVideoProducer> producer;
         Optional<VideoSinkHandle> handle { OptionalNone() };
         RefPtr<VideoSink> video_sink { nullptr };
@@ -156,18 +157,21 @@ private:
 
     struct AudioTrackData {
         Track track;
+        NonnullRefPtr<Demuxer> demuxer;
         NonnullRefPtr<DecodedAudioProducer> producer;
         bool enabled { false };
         bool read_blocked { false };
     };
     using AudioTrackDatas = Vector<AudioTrackData, EXPECTED_AUDIO_TRACK_COUNT>;
 
-    PlaybackManager();
+    explicit PlaybackManager(NonnullRefPtr<AudioOutputFactory>);
 
     WeakPlaybackManager weak();
 
     void apply_track_change_to_ended_state(ResumeEndedPlayback);
     void seek_clock_and_video_sinks(AK::Duration);
+    void seek_tracks_with_invalidated_data(Demuxer const&, TimeRanges const& invalidated_ranges);
+    void resume_clock_and_notify_video_sinks();
 
     void set_clock(NonnullRefPtr<MediaClock> const&);
     void disable_audio();
@@ -179,14 +183,15 @@ private:
     void on_audio_sink_state_changed(PipelineStatus);
     void on_video_sink_state_changed(Track const&, PipelineStatus);
     void update_duration_from_scan_states();
-    bool is_enabled_supported_track(Track const&) const;
-    Optional<AK::Duration> verified_end_time_for_track(Track const&) const;
+    bool source_has_enabled_track(Demuxer const&) const;
+    Optional<AK::Duration> verified_end_time_for_source(Demuxer const&) const;
+    CombinedScanState scan_state_for_enabled_tracks(Demuxer const&) const;
     void update_pipeline_state();
     void reset_pipeline_state();
     PipelineStatus combined_pipeline_status() const;
     void check_for_demuxed_duration_change(AK::Duration);
     void dispatch_error(DecoderError&&);
-    static void dispatch_media_init_error(WeakPlaybackManager, Core::EventLoop& main_thread_event_loop, DecoderError);
+    static void reject_media_source(WeakPlaybackManager, NonnullRefPtr<AddMediaSourcePromise>&&, Core::EventLoop& main_thread_event_loop, DecoderError);
     void dispatch_buffered_ranges_change();
 
     template<typename Self>
@@ -227,7 +232,7 @@ private:
         VERIFY_NOT_REACHED();
     }
 
-    static DecoderErrorOr<void> prepare_playback_from_demuxer(WeakPlaybackManager const&, NonnullRefPtr<Demuxer> const&, Core::EventLoop&);
+    static DecoderErrorOr<void> prepare_playback_from_demuxer(WeakPlaybackManager const&, NonnullRefPtr<Demuxer> const&, Core::EventLoop&, NonnullRefPtr<AddMediaSourcePromise>&);
 
     template<typename T, typename... Args>
     void replace_state_handler(Args&&... args);
@@ -237,12 +242,12 @@ private:
 
     NonnullRefPtr<WeakPlaybackManagerLink> m_weak_link;
 
+    NonnullRefPtr<AudioOutputFactory> m_audio_output_factory;
     NonnullRefPtr<MediaClock> m_clock;
     MediaTimeReader m_time_reader;
     HostHooks m_host_hooks;
     float m_playback_rate { 1.0f };
 
-    AudioOutput m_audio_output { AudioOutput::Platform };
     bool m_started { false };
 
     Vector<NonnullRefPtr<Demuxer>> m_demuxers;

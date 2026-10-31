@@ -5,49 +5,28 @@
  */
 
 #include <LibCore/Process.h>
-#include <LibWebCommon/WebView/ProcessHandle.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/AudioServerControlClient.h>
 #include <LibWebView/BlobURLStore.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CookieJar.h>
-#include <LibWebView/FontService.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/PermissionManager.h>
 #include <LibWebView/WebWorkerClient.h>
 #include <LibWebView/WorkerProcessManager.h>
 
 namespace WebView {
 
-Messages::WebWorkerClient::OpenSystemFontResponse WebWorkerClient::open_system_font(u64 generation, u64 face_id)
-{
-    auto font = Application::font_service().open_font(generation, face_id);
-    return { move(font) };
-}
-
-Messages::WebWorkerClient::MatchSystemFontResponse WebWorkerClient::match_system_font(String family, u16 weight, u16 width, u8 slope)
-{
-    auto font = Application::font_service().match_font(family, weight, width, slope);
-    return { move(font) };
-}
-
-Messages::WebWorkerClient::MatchSystemFontForCodePointResponse WebWorkerClient::match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
-{
-    auto font = Application::font_service().match_font_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
-    return { move(font) };
-}
-
-Messages::WebWorkerClient::ResolveGenericFontResponse WebWorkerClient::resolve_generic_font(String family, u16 weight, u8 slope)
-{
-    auto resolved = Application::font_service().resolve_generic_family(family, weight, slope);
-    if (!resolved.has_value())
-        return Optional<String> {};
-    return Optional<String> { resolved->to_string() };
-}
-
 WebWorkerClient::WebWorkerClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, Web::HTML::WorkerAgentId agent_id)
     : IPC::ConnectionToServer<WebWorkerClientEndpoint, WebWorkerServerEndpoint>(*this, move(transport))
     , m_is_private(is_private)
+    , m_request_server_site_bindings([this](RequestServerClientConnection& connection, Optional<Utf16String> const& top_level_site) {
+        async_connect_to_request_server(move(connection.handle), connection.client_id, top_level_site);
+    })
     , m_agent_id(agent_id)
+    , m_audio_tab_id(allocate_audio_tab_id())
 {
     if (auto session = Application::existing_session(is_private))
         m_session = session->make_weak_ptr();
@@ -61,15 +40,23 @@ WebWorkerClient::~WebWorkerClient()
 void WebWorkerClient::did_misbehave(StringView message_name, StringView reason)
 {
     dbgln("WebWorkerClient: terminating helper process {}: {} rejected: {}", pid(), message_name, reason);
-    if (should_terminate_pid(pid()))
-        (void)Core::Process::terminate_process(pid(), Core::Process::TerminationMode::Forceful);
+    terminate_process();
     shutdown();
+}
+
+void WebWorkerClient::terminate_process()
+{
+    (void)Application::process_manager().terminate_child(child_id(), Core::Process::TerminationMode::Forceful);
 }
 
 void WebWorkerClient::die()
 {
     remove_blob_url_entries();
     WorkerProcessManager::the().worker_did_die(m_agent_id);
+
+    // NB: A worker whose connection is gone does no more work, so a process that outlives its connection is ended.
+    terminate_process();
+    WorkerProcessManager::the().worker_process_did_exit(*this);
 
     // Otherwise nested workers we own would outlive us, in violation of the HTML spec.
     WorkerProcessManager::the().remove_web_worker_owner(*this);
@@ -95,6 +82,11 @@ void WebWorkerClient::did_report_worker_exception(Utf16String message, Utf16Stri
     WorkerProcessManager::the().worker_did_report_exception(m_agent_id, move(message), move(filename), lineno, colno);
 }
 
+void WebWorkerClient::did_report_outside_settings_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource)
+{
+    WorkerProcessManager::the().worker_did_report_outside_settings_content_security_policy_violation(m_agent_id, policy_index, move(effective_directive), move(resource));
+}
+
 void WebWorkerClient::remove_blob_url_entries()
 {
     if (auto session = m_session.strong_ref())
@@ -110,6 +102,19 @@ Optional<CanonicalEnvironmentSettingsObject const&> WebWorkerClient::hosted_envi
     return *inside_settings;
 }
 
+// A worker may learn the permissions only of its own top-level site; asking about any other gets just the defaults.
+Messages::WebWorkerClient::DidRequestPermissionSnapshotResponse WebWorkerClient::did_request_permission_snapshot(URL::Origin top_level_origin)
+{
+    auto session = m_session.strong_ref();
+    if (!session)
+        return Web::Permissions::PermissionSnapshot {};
+
+    auto worker_top_level_origin = WorkerProcessManager::the().top_level_origin(m_agent_id);
+    if (worker_top_level_origin.has_value() && worker_top_level_origin->is_same_origin(top_level_origin) && !top_level_origin.is_opaque() && !m_permission_origins.contains_slow(top_level_origin))
+        m_permission_origins.append(top_level_origin);
+    return session->permission_manager->snapshot_for(m_permission_origins);
+}
+
 Messages::WebWorkerClient::DidRequestCookieResponse WebWorkerClient::did_request_cookie(URL::URL url, HTTP::Cookie::Source source)
 {
     // RequestServer handles the cookies of HTTP requests itself, so a worker has no use for HttpOnly cookies.
@@ -122,9 +127,14 @@ Messages::WebWorkerClient::DidRequestCookieResponse WebWorkerClient::did_request
     if (!inside_settings.has_value() || !inside_settings->may_use_cookies_of(url))
         return HTTP::Cookie::VersionedCookie {};
 
+    auto top_level_site = network_isolation_top_level_site(*inside_settings);
+    if (!top_level_site.has_value())
+        return HTTP::Cookie::VersionedCookie {};
+
+    HTTP::Cookie::PartitionContext partition_context { top_level_site.release_value(), inside_settings->has_cross_site_ancestor() };
     HTTP::Cookie::VersionedCookie cookie;
     if (auto session = m_session.strong_ref())
-        cookie.cookie = session->cookie_jar->get_cookie(url, source);
+        cookie.cookie = session->cookie_jar->get_cookie(url, source, partition_context);
     return cookie;
 }
 
@@ -168,12 +178,18 @@ Messages::WebWorkerClient::DidIsKnownHstsHostResponse WebWorkerClient::did_is_kn
 
 Messages::WebWorkerClient::RequestMediaServerConnectionResponse WebWorkerClient::request_media_server_connection()
 {
-    auto handle = connect_new_media_server_client(m_media_server_client);
-    if (handle.is_error()) {
-        warnln("Unable to connect a MediaServer client: {}", handle.error());
+    auto connection = connect_new_media_server_client(m_media_server_client, child_id(), [weak_self = make_weak_ptr<WebWorkerClient>()]() -> ErrorOr<IPC::TransportHandle> {
+        auto self = weak_self.strong_ref();
+        if (!self)
+            return Error::from_string_literal("The worker process is gone");
+        TRY(ensure_audio_server_is_running(self->m_audio_server_client, self->child_id()));
+        return connect_new_audio_server_client(*self->m_audio_server_client, self->m_audio_tab_id);
+    });
+    if (connection.is_error()) {
+        warnln("Unable to connect a MediaServer client: {}", connection.error());
         return OptionalNone {};
     }
-    return handle.release_value();
+    return move(connection.value().handle);
 }
 
 void WebWorkerClient::did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message)

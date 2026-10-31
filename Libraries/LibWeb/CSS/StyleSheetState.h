@@ -13,6 +13,7 @@
 #include <AK/Function.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16View.h>
 #include <AK/Weakable.h>
@@ -28,6 +29,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/TraversalOrder.h>
 #include <LibWeb/WebIDL/Promise.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::ViewTransition {
@@ -41,7 +43,7 @@ namespace Web::CSS {
 class SharedCompiledStyleSheet;
 class StyleSheetImport;
 class StyleScope;
-struct StyleCache;
+struct StyleRuleCache;
 
 using CSSStyleSheetOptions = Bindings::CSSStyleSheetInit;
 
@@ -64,7 +66,7 @@ public:
     };
     static StringView loading_state_name(LoadingState);
 
-    [[nodiscard]] static NonnullRefPtr<StyleSheetState> create(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location);
+    [[nodiscard]] static NonnullRefPtr<StyleSheetState> create(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy = {});
     static WebIDL::ExceptionOr<NonnullRefPtr<StyleSheetState>> create_constructed(DOM::Document const&, CSSStyleSheetOptions const& options = {});
 
     ~StyleSheetState();
@@ -112,11 +114,8 @@ public:
     GC::Ptr<DOM::Document> owning_document() const;
     void set_disabled(bool);
     void for_each_owning_style_scope(Function<void(StyleScope&)> const&) const;
-    NonnullRefPtr<StyleCache> shared_single_constructed_sheet_style_cache();
-
-    // Bumped whenever state that shared style caches derive from changes (rule mutations, media match-state flips).
-    // Lets sheet-set style cache registry entries detect staleness at lookup time.
-    u64 shared_style_cache_generation() const { return m_shared_style_cache_generation; }
+    // What this constructed sheet's rules define, collected once for every scope that adopts it.
+    StyleRuleCache const& rule_cache();
 
     Optional<Utf16FlyString> default_namespace() const;
     RustNamespaceContext declared_namespaces() const;
@@ -130,6 +129,7 @@ public:
     void disconnect_font_faces_in_rules(Parser::ValueParserFFI::NativeRuleList const*);
 
     Vector<NonnullRefPtr<StyleSheetImport>> const& import_rules() const { return m_import_rules; }
+    bool has_counter_style_rules() const;
     StyleSheetImport* import_for_rule(u64 identity) const;
 
     Optional<::URL::URL> base_url() const { return m_base_url; }
@@ -177,6 +177,10 @@ public:
     Optional<::URL::URL> location() const { return m_location; }
     void set_location(Optional<::URL::URL> location) { m_location = move(location); }
 
+    // AD-HOC: The referrer policy of the response that this style sheet was fetched from, or none if it was not fetched.
+    //         See fetch_a_style_resource().
+    Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy() const { return m_fetched_referrer_policy; }
+
     Utf16String const& title() const { return m_title; }
     Optional<Utf16String> title_for_bindings() const;
     void set_title(Utf16String title) { m_title = move(title); }
@@ -198,12 +202,12 @@ public:
     void set_parent_css_style_sheet(StyleSheetState*);
 
 private:
-    StyleSheetState(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location);
+    StyleSheetState(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy);
 
     void recalculate_rule_caches();
     void set_rules(RustRuleList);
-    void invalidate_shared_style_cache();
     bool has_document_owner() const;
+    void forget_font_feature_values();
 
     void set_constructed(bool constructed) { m_native_sheet.set_flag(RustStyleSheet::Flag::Constructed, constructed); }
     void set_disallow_modification(bool disallow_modification) { m_native_sheet.set_flag(RustStyleSheet::Flag::DisallowModification, disallow_modification); }
@@ -226,6 +230,7 @@ private:
     GC::Ptr<DOM::Element> m_owner_node;
     WeakPtr<StyleSheetState> m_parent_style_sheet;
     Optional<::URL::URL> m_location;
+    Optional<ReferrerPolicy::ReferrerPolicy> m_fetched_referrer_policy;
     Utf16String m_title;
 
     Optional<Utf16String> m_source_text;
@@ -241,8 +246,7 @@ private:
     Optional<::URL::URL> m_base_url;
     GC::Ptr<DOM::Document const> m_constructor_document;
     HashTable<GC::Ptr<DOM::Node>> m_owning_documents_or_shadow_roots;
-    RefPtr<StyleCache> m_shared_single_constructed_sheet_style_cache;
-    u64 m_shared_style_cache_generation { 0 };
+    OwnPtr<StyleRuleCache> m_rule_cache;
 
     Vector<StyleSheetImport&> m_critical_subresources;
 

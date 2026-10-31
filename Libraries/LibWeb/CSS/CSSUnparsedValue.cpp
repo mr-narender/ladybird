@@ -20,7 +20,7 @@ GC_DEFINE_ALLOCATOR(CSSUnparsedValue);
 GC::Ref<CSSUnparsedValue> CSSUnparsedValue::create(ReadonlySpan<CSSUnparsedSegment> value)
 {
     // NB: Convert our Span into a Vector of Refs.
-    Vector<CSSUnparsedSegment> converted_value;
+    GC::ConservativeVector<CSSUnparsedSegment> converted_value;
     for (auto const& variant : value) {
         variant.visit(
             [&](GC::Ref<CSSVariableReferenceValue> it) { converted_value.append(it); },
@@ -166,7 +166,7 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> CSSUnparsedValue::create_an
     if (Parser::Parser::collect_arbitrary_substitution_function_presence(utf16_string, substitution_presence).is_error())
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid arbitrary substitution function syntax"_utf16 };
 
-    return UnresolvedStyleValue::create(move(utf16_string), substitution_presence, {}, UnresolvedStyleValue::SourceTextMode::Preserve);
+    return UnresolvedStyleValue::create(move(utf16_string), substitution_presence, UnresolvedStyleValue::SourceTextMode::Preserve);
 }
 
 }

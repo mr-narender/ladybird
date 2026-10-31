@@ -15,6 +15,9 @@ unsafe extern "C" {
         column: u32,
         is_panicking: extern "C" fn() -> bool,
     );
+    fn ladybird_rust_panic_hook_returned();
+    #[cfg(panic = "abort")]
+    fn ladybird_rust_panic_may_abort();
     fn ladybird_rust_panic_will_abort();
 }
 
@@ -26,7 +29,7 @@ extern "C" fn is_panicking() -> bool {
 
 #[cfg(not(test))]
 #[unsafe(export_name = concat!("ladybird_init_rust_panic_", env!("CARGO_PKG_NAME")))]
-extern "C" fn initialize() {
+pub(crate) extern "C" fn initialize() {
     static INITIALIZE: std::sync::Once = std::sync::Once::new();
     INITIALIZE.call_once(|| {
         let previous = std::panic::take_hook();
@@ -52,7 +55,18 @@ extern "C" fn initialize() {
                     is_panicking,
                 );
             }
+            // Nothing in this crate can catch the panic, but the hook also sees the panics of other crates that share
+            // its standard library, which code built with unwinding may catch.
+            #[cfg(panic = "abort")]
+            // SAFETY: The bridge only reads the message stored above.
+            unsafe {
+                ladybird_rust_panic_may_abort();
+            }
             previous(info);
+            // SAFETY: The bridge only updates its own per-thread state.
+            unsafe {
+                ladybird_rust_panic_hook_returned();
+            }
         }));
     });
 }

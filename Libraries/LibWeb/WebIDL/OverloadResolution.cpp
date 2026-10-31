@@ -11,6 +11,7 @@
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/WebIDL/OverloadResolution.h>
 
 namespace Web::WebIDL {
@@ -19,16 +20,21 @@ static bool is_platform_object(JS::Value value)
 {
     if (!value.is_object())
         return false;
-    return is<Bindings::PlatformObject>(value.as_object());
+    return value.as_object().is_platform_object();
 }
 
 static bool platform_object_implements_interface(JS::Value value, StringView interface_name)
 {
-    auto const* platform_object = as_if<Bindings::PlatformObject>(&value.as_object());
-    if (!platform_object)
+    // NB: The wrappers of a Rust object that inherits from a C++ interface hold the C++ object it owns as their
+    //     wrappable, which implements only the C++ interface.
+    if (Bindings::rust_interface_object_implements_interface(value.as_object(), interface_name))
+        return true;
+
+    auto const* wrappable = Bindings::wrappable_impl_from(&value.as_object());
+    if (!wrappable)
         return false;
 
-    return platform_object->implements_interface(MUST(String::from_utf8(interface_name)));
+    return wrappable->implements_interface(MUST(String::from_utf8(interface_name)));
 }
 
 // https://webidl.spec.whatwg.org/#dfn-convert-ecmascript-to-idl-value
@@ -71,6 +77,8 @@ static bool has_overload_with_argument_type_or_subtype_matching(EffectiveOverloa
 }
 
 // https://webidl.spec.whatwg.org/#es-overloads
+// NB: Meta/Generators/libweb_bindings/rust_overloads.py writes the steps of this function out for the overloads of the
+//     interfaces implemented in Rust, so a change to its steps has to be made there as well.
 JS::ThrowCompletionOr<ResolvedOverload> resolve_overload(JS::VM& vm, EffectiveOverloadSet& overloads, ReadonlySpan<StringView> dictionary_types)
 {
     auto is_dictionary = [&dictionary_types](Type const& type) {
@@ -101,7 +109,7 @@ JS::ThrowCompletionOr<ResolvedOverload> resolve_overload(JS::VM& vm, EffectiveOv
         distinguishing_argument_index = overloads.distinguishing_argument_index();
 
     // 9. Initialize values to be an empty list, where each entry will be either an IDL value or the special value “missing”.
-    Vector<ResolvedOverload::Argument> values;
+    GC::ConservativeVector<ResolvedOverload::Argument> values;
 
     // 10. Initialize i to 0.
     auto i = 0;
@@ -244,7 +252,7 @@ JS::ThrowCompletionOr<ResolvedOverload> resolve_overload(JS::VM& vm, EffectiveOv
         //    then remove from S all other entries.
         else if (value.is_object() && value.as_object().is_typed_array()
             && has_overload_with_argument_type_or_subtype_matching(overloads, i, [&](Type const& type) {
-                   if (type.is_plain() && (type.name() == static_cast<JS::TypedArrayBase const&>(value.as_object()).element_name() || type.name() == "BufferSource" || type.name() == "ArrayBufferView"))
+                   if (type.is_plain() && (type.name() == JS::typed_array_element_name(static_cast<JS::TypedArrayBase const&>(value.as_object()).kind()) || type.name() == "BufferSource" || type.name() == "ArrayBufferView"))
                        return true;
                    if (type.is_object())
                        return true;

@@ -18,7 +18,7 @@ jobs:
     runs-on: 'blacksmith-16vcpu-ubuntu-2404'
     if: github.repository == 'LadybirdBrowser/ladybird'
     container:
-      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.08.28
+      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.10.29
 
     steps:
       - name: Checkout LadybirdBrowser/ladybird
@@ -72,6 +72,7 @@ jobs:
           toolchain: 'Clang'
           cache_key_extra: 'test262'
           ccache_path: ${{ steps.setup.outputs.ccache_path }}
+          sccache_path: ${{ steps.setup.outputs.sccache_path }}
           vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
 
       - name: Get previous results
@@ -87,6 +88,7 @@ jobs:
           cmake --preset Release -B libjs-test262/Build \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DENABLE_CI_BASELINE_CPU=ON \
             -DWASM_SPEC_TEST_SKIP_FORMATTING=ON \
             -DINCLUDE_WASM_SPEC_TESTS=ON \
             -DENABLE_GUI_TARGETS=OFF
@@ -98,6 +100,8 @@ jobs:
           arch: 'x86_64'
           ccache_path: ${{ steps.setup.outputs.ccache_path }}
           ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          sccache_path: ${{ steps.setup.outputs.sccache_path }}
+          sccache_primary_key: ${{ steps.cache-restore.outputs.sccache_primary_key }}
           vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
           vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
 

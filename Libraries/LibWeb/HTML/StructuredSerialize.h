@@ -30,9 +30,9 @@
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
-namespace Web::Bindings {
+namespace JS {
 
-class PlatformObject;
+class HostObject;
 
 }
 
@@ -42,6 +42,8 @@ class StructuredSerializeDataDecoder;
 class StructuredSerializeDataEncoder;
 
 class WEB_API TransferDataDecoder {
+    AK_ALLOC_WITH_KMALLOC;
+
 public:
     explicit TransferDataDecoder(IPCSerializationRecord const&);
     explicit TransferDataDecoder(TransferDataEncoder&&);
@@ -55,6 +57,10 @@ public:
     WebIDL::ExceptionOr<ByteBuffer> decode_buffer();
     WebIDL::ExceptionOr<::Crypto::UnsignedBigInteger> decode_unsigned_big_integer();
 
+    // The shared memory of the record that this transfer data belongs to, for transfer-receiving steps that map theirs.
+    void set_shared_buffers(Vector<Core::AnonymousBuffer> const& shared_buffers) { m_shared_buffers = &shared_buffers; }
+    Vector<Core::AnonymousBuffer> const* shared_buffers() const { return m_shared_buffers; }
+
 private:
     IPC::MessageBuffer m_buffer;
 
@@ -62,6 +68,8 @@ private:
     Queue<IPC::Attachment> m_attachments;
 
     IPC::Decoder m_decoder;
+
+    Vector<Core::AnonymousBuffer> const* m_shared_buffers { nullptr };
 };
 
 class WEB_API StructuredSerializeWriter {
@@ -175,9 +183,6 @@ WebIDL::ExceptionOr<T> decode_or_throw_data_clone_error(JS::Realm& realm, Struct
     return result.release_value();
 }
 
-// Decode stored text to UTF-8 and reject lone surrogates as DataCloneError.
-WEB_API WebIDL::ExceptionOr<String> decode_utf8_text_or_throw_data_clone_error(JS::Realm& realm, StructuredSerializeReader& reader);
-
 // Pairs each serializable interface with its storage identifier.
 struct SerializableRegistryEntry {
     Bindings::InterfaceName interface_name;
@@ -215,27 +220,57 @@ WebIDL::ExceptionOr<T> decode_or_throw_data_clone_error(JS::Realm& realm, Transf
 }
 
 WEB_API WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer(JS::Realm&, JS::Value, ReadonlySpan<GC::Ref<JS::Object>> transfer_list);
-WebIDL::ExceptionOr<DeserializedTransferRecord> structured_deserialize_with_transfer(SerializedTransferRecord&, JS::Realm&);
+WEB_API WebIDL::ExceptionOr<DeserializedTransferRecord> structured_deserialize_with_transfer(SerializedTransferRecord&, JS::Realm&);
 WEB_API WebIDL::ExceptionOr<JS::Value> structured_deserialize_with_transfer_internal(TransferDataDecoder&, JS::Realm&);
+
+}
+
+namespace Web::HTML {
+
+struct ImageBitmapSharedPixels;
 
 }
 
 namespace Web::Bindings {
 
-class PlatformObject;
+class RustInterfaceCell;
 class Serializable;
 class Transferable;
 
+// A platform object that is a serializable object: an implementation object of an interface implemented in C++, or
+// the cell of an object of an interface implemented in Rust, whose steps the Rust bindings run.
 struct SerializablePlatformObject {
     Serializable* serializable { nullptr };
+    GC::Ptr<RustInterfaceCell> rust_object { nullptr };
     InterfaceName interface_name;
     GC::Ptr<JS::Realm> realm;
+
+    WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) const;
 };
 
-WEB_API Transferable* transferable_from_object(JS::Object&);
+// A platform object that is a transferable object, of an interface implemented in C++ or in Rust.
+struct TransferablePlatformObject {
+    Transferable* transferable { nullptr };
+    GC::Ptr<RustInterfaceCell> rust_object { nullptr };
+    HTML::TransferType primary_interface { HTML::TransferType::Unknown };
+
+    // https://html.spec.whatwg.org/multipage/structured-data.html#detached
+    bool is_detached() const;
+    void set_detached() const;
+
+    // The pixels of a transferred ImageBitmap go to the shared memory of the transfer, if there is room for them.
+    WebIDL::ExceptionOr<void> transfer_steps(JS::Realm&, HTML::TransferDataEncoder&, HTML::ImageBitmapSharedPixels*) const;
+};
+
+WEB_API Optional<TransferablePlatformObject> transferable_from_object(JS::Object&);
 WEB_API Optional<SerializablePlatformObject> serializable_from_object(JS::Object&);
 WEB_API bool is_platform_object(JS::Object const&);
-WEB_API GC::Ref<PlatformObject> create_serialized_platform_object(InterfaceName, JS::Realm&);
-WEB_API WebIDL::ExceptionOr<GC::Ref<PlatformObject>> create_transferred_platform_object(HTML::TransferType, JS::Realm&, HTML::TransferDataDecoder&);
+WEB_API GC::Ref<JS::HostObject> create_serialized_platform_object(InterfaceName, JS::Realm&);
+WEB_API WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> create_transferred_platform_object(HTML::TransferType, JS::Realm&, HTML::TransferDataDecoder&);
+
+// The deserialization steps of an interface implemented in Rust create its object from what they read, rather than
+// fill in an object that was created before them.
+WEB_API bool serializable_interface_is_implemented_in_rust(InterfaceName);
+WEB_API WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> deserialize_rust_platform_object(InterfaceName, JS::Realm&, HTML::StructuredSerializeReader&, HTML::DeserializationMemory&);
 
 }

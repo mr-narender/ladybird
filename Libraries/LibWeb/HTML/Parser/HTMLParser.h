@@ -20,6 +20,7 @@
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLTokenizer.h>
 #include <LibWeb/HTML/Parser/ParserScriptingMode.h>
+#include <LibWeb/HTML/SanitizerConfiguration.h>
 #include <LibWeb/Platform/Timer.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
 
@@ -27,6 +28,8 @@ struct RustFfiHtmlParserHandle;
 struct RustFfiHtmlParserAttribute;
 
 namespace Web::HTML {
+
+class IncrementalDocumentParser;
 
 class WEB_API HTMLParser final : public JS::Cell {
     GC_CELL(HTMLParser, JS::Cell);
@@ -37,7 +40,7 @@ public:
 
     static GC::Ref<HTMLParser> create_for_scripting(DOM::Document&);
     static GC::Ref<HTMLParser> create_with_open_input_stream(DOM::Document&, EncodingConfidence = EncodingConfidence::Irrelevant);
-    static GC::Ref<HTMLParser> create_with_uncertain_encoding(DOM::Document&, ByteBuffer const& input, Optional<MimeSniff::MimeType> maybe_mime_type = {});
+    static GC::Ref<HTMLParser> create_with_uncertain_encoding(DOM::Document&, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type = {});
     static GC::Ref<HTMLParser> create_from_byte_string(DOM::Document&, StringView input, ParserScriptingMode, StringView encoding);
     static GC::Ref<HTMLParser> create_for_decoded_string(DOM::Document&, Utf16View input, ParserScriptingMode, Utf16View encoding);
 
@@ -60,7 +63,16 @@ public:
     };
 
     static WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> parse_html_fragment(Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::DocumentFragment>> target, Utf16View markup,
-        AllowDeclarativeShadowRoots = AllowDeclarativeShadowRoots::No, ParserScriptingMode = ParserScriptingMode::Inert);
+        AllowDeclarativeShadowRoots = AllowDeclarativeShadowRoots::No, ParserScriptingMode = ParserScriptingMode::Inert, FragmentFastPath = FragmentFastPath::Allow, SanitizerConfiguration const* = nullptr);
+
+    // Parses a restricted subset of in-body markup in context. On success, appends the parsed top-level nodes to
+    // top_level_nodes. Their subtrees are linked without running the insertion steps, which inserting each top-level
+    // node into a parent runs for the whole subtree.
+    static bool try_parse_html_fragment_fast_into_detached_nodes(DOM::Element& context, Utf16View, GC::RootVector<GC::Ref<DOM::Node>>& top_level_nodes);
+
+    // Parses a document from markup whose content is in the same subset of in-body markup without a parser, then runs
+    // "the end". Returns false without changing anything when the markup is not in that subset.
+    static bool try_parse_document_fast(DOM::Document&, Utf16View);
 
     enum class SerializableShadowRoots {
         No,
@@ -69,8 +81,14 @@ public:
     static Utf16String serialize_html_fragment(DOM::Node const&, SerializableShadowRoots, ReadonlySpan<GC::Ref<DOM::ShadowRoot>>, DOM::FragmentSerializationMode = DOM::FragmentSerializationMode::Inner);
 
     HTMLTokenizer& tokenizer() { return m_tokenizer; }
+    bool streaming_body_is_exhausted() const { return m_streaming_body_is_exhausted; }
+    void did_exhaust_streaming_body(Badge<IncrementalDocumentParser>) { m_streaming_body_is_exhausted = true; }
 
     void set_allow_declarative_shadow_roots(AllowDeclarativeShadowRoots allow) { m_allow_declarative_shadow_roots = allow; }
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#parser-sanitizer-configuration
+    SanitizerConfiguration const* sanitizer_configuration() const { return m_sanitizer_configuration.has_value() ? &*m_sanitizer_configuration : nullptr; }
+    void set_sanitizer_configuration(SanitizerConfiguration const&);
 
     void configure_element_created_by_rust_parser(DOM::Element&);
     GC::Ref<DOM::Element> create_element_for_rust_parser(Utf16FlyString const&, ReadonlySpan<RustFfiHtmlParserAttribute>, Optional<Utf16FlyString> const& namespace_, DOM::Node& intended_parent, bool had_duplicate_attribute, GC::Ptr<HTMLFormElement>, bool has_template_element_on_stack);
@@ -138,6 +156,7 @@ private:
     void invoke_post_parse_action();
     static void the_end(GC::Ref<DOM::Document>, GC::Ptr<HTMLParser>, u64 parser_generation);
 
+    bool m_streaming_body_is_exhausted { false };
     HTMLTokenizer m_tokenizer;
     RustFfiHtmlParserHandle* m_rust_parser { nullptr };
 
@@ -148,6 +167,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/parsing.html#allow-declarative-shadow-roots
     AllowDeclarativeShadowRoots m_allow_declarative_shadow_roots { AllowDeclarativeShadowRoots::No };
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#parser-sanitizer-configuration
+    Optional<SanitizerConfiguration> m_sanitizer_configuration;
 
     bool m_script_created { false };
 
@@ -214,6 +236,8 @@ private:
 };
 
 RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View);
+// Also expose the numeric value before layout clamping when parsing succeeds.
+RefPtr<CSS::StyleValue const> parse_dimension_value(Utf16View, double& unclamped_value);
 RefPtr<CSS::StyleValue const> parse_nonzero_dimension_value(Utf16View);
 Optional<Color> parse_legacy_color_value(Utf16View);
 RefPtr<CSS::StyleValue const> parse_table_child_element_align_value(Utf16View);

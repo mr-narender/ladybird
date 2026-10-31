@@ -9,10 +9,10 @@
 #include <LibGC/Heap.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceSet.h>
-#include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
+#include <LibWeb/ContentSecurityPolicy/Directives/HTMLIntegration.h>
 #include <LibWeb/ContentSecurityPolicy/Policy.h>
 #include <LibWeb/ContentSecurityPolicy/PolicyList.h>
-#include <LibWeb/Fetch/Infrastructure/URL.h>
+#include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/EventHandler.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/MessageEvent.h>
@@ -26,6 +26,7 @@
 #include <LibWeb/HTML/WorkerNavigator.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/ServiceWorker/ServiceWorkerGlobalScope.h>
+#include <LibWebCommon/Fetch/Infrastructure/URL.h>
 
 namespace Web::HTML {
 
@@ -62,7 +63,6 @@ void WorkerGlobalScope::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_page);
     visitor.visit(m_fonts);
     visitor.visit(m_font_computer);
-    visitor.visit(m_policy_container);
 }
 
 void WorkerGlobalScope::finalize()
@@ -81,13 +81,13 @@ void WorkerGlobalScope::set_internal_port(GC::Ref<MessagePort> port)
 void WorkerGlobalScope::close_a_worker()
 {
     // 1. Discard any tasks that have been added to workerGlobal's relevant agent's event loop's task queues.
-    relevant_settings_object(*this).responsible_event_loop().task_queue().remove_tasks_matching([](HTML::Task const& task) {
-        // NOTE: We don't discard tasks with the PostedMessage source, as the spec expects PostMessage() to act as if it is invoked immediately
-        return task.source() != HTML::Task::Source::PostedMessage;
+    relevant_settings_object(*this).responsible_event_loop().task_queue().remove_tasks_matching([](HTML::Task const&) {
+        return true;
     });
 
     // 2. Set workerGlobal's closing flag to true. (This prevents any further tasks from being queued.)
     m_closing = true;
+    relevant_settings_object(*this).responsible_event_loop().task_queue().discard_further_tasks();
 }
 
 // https://html.spec.whatwg.org/multipage/workers.html#importing-scripts-and-libraries
@@ -170,40 +170,89 @@ ENUMERATE_WORKER_GLOBAL_SCOPE_EVENT_HANDLERS(__ENUMERATE)
 
 GC::Ref<CSS::FontFaceSet> WorkerGlobalScope::fonts()
 {
-    if (!m_fonts)
+    if (!m_fonts) {
         m_fonts = CSS::FontFaceSet::create(relevant_settings_object(*this));
+        // A worker has no document to wait for, so its font source is never pending on the environment.
+        m_fonts->set_is_pending_on_the_environment(false);
+    }
     return *m_fonts;
 }
 
 CSS::FontComputer& WorkerGlobalScope::font_computer()
 {
     if (!m_font_computer)
-        m_font_computer = heap().allocate<CSS::FontComputer>();
+        m_font_computer = heap().allocate<CSS::FontComputer>(relevant_settings_object(*this));
     return *m_font_computer;
 }
 
-GC::Ref<PolicyContainer> WorkerGlobalScope::policy_container() const
+NonnullRefPtr<PolicyContainer> WorkerGlobalScope::policy_container() const
 {
     if (!m_policy_container) {
-        m_policy_container = GC::Heap::the().allocate<PolicyContainer>(GC::Heap::the());
+        m_policy_container = PolicyContainer::create();
     }
     return *m_policy_container;
 }
 
 // https://html.spec.whatwg.org/multipage/browsers.html#initialize-worker-policy-container
-void WorkerGlobalScope::initialize_policy_container(GC::Ref<Fetch::Infrastructure::Response const> response, GC::Ref<EnvironmentSettingsObject> environment)
+void WorkerGlobalScope::initialize_policy_container(GC::Ref<Fetch::Infrastructure::ResponseView const> response, GC::Ref<EnvironmentSettingsObject> environment)
 {
     // 1. If workerGlobalScope's url is local but its scheme is not "blob":
     if (m_url.has_value() && Fetch::Infrastructure::is_local_url(m_url.value()) && m_url->scheme() != "blob"sv) {
-        // FIXME: 1. Assert: workerGlobalScope's owner set's size is 1.
-        // FIXME: 2. Set workerGlobalScope's policy container to a clone of workerGlobalScope's owner set[0]'s relevant settings object's policy container.
-        dbgln("FIXME: WorkerGlobalScope::initialize_policy_container: Clone owner's policy container for local, non-blob URL.");
+        // 1. Assert: workerGlobalScope's owner set's size is 1.
+        VERIFY(m_owner_set.size() == 1);
+
+        // 2. Set workerGlobalScope's policy container to a clone of workerGlobalScope's owner set[0]'s relevant
+        //    settings object's policy container.
+        auto const& owner_policy_container = m_owner_set.first().visit([](auto const& owner) -> SerializedPolicyContainer const& {
+            return owner.relevant_settings_object_policy_container;
+        });
+        m_policy_container = create_a_policy_container_from_serialized_policy_container(owner_policy_container);
         return;
     }
 
     // 2. Otherwise, set workerGlobalScope's policy container to the result of creating a policy container from a fetch
     //    response given response and environment.
     m_policy_container = create_a_policy_container_from_a_fetch_response(response, environment);
+
+    // https://w3c.github.io/webappsec-upgrade-insecure-requests/#nesting
+    // AD-HOC: Upgrade Insecure Requests has a worker inherit the insecure requests policy of its inherited responsible
+    //         browsing context, which HTML no longer has. It inherits that of owner set[0]'s relevant settings object,
+    //         which is outside settings, here instead. The clone in step 1 holds it already.
+    auto const& owner_serialized_policy_container = m_owner_set.first().visit([](auto const& owner) -> SerializedPolicyContainer const& {
+        return owner.relevant_settings_object_policy_container;
+    });
+    m_policy_container->inherit_insecure_requests_policy(owner_serialized_policy_container.insecure_requests_policy, owner_serialized_policy_container.upgrade_insecure_navigations_set);
+}
+
+// https://html.spec.whatwg.org/multipage/browsers.html#check-a-global-object's-embedder-policy
+// NB: response is only used for violation reports, which are not queued. owner is given as its embedder policy.
+bool WorkerGlobalScope::check_embedder_policy(EmbedderPolicy const& owner_policy) const
+{
+    // 1. If workerGlobalScope is not a DedicatedWorkerGlobalScope object, then return true.
+    if (!is<DedicatedWorkerGlobalScope>(*this))
+        return true;
+
+    // 2. Let policy be workerGlobalScope's embedder policy.
+    // AD-HOC: Nothing sets workerGlobalScope's embedder policy. This reads its policy container's embedder policy
+    //         instead. See https://github.com/whatwg/html/issues/11316.
+    auto const& policy = policy_container()->embedder_policy;
+
+    // 3. Let ownerPolicy be owner's policy container's embedder policy.
+
+    // FIXME: 4. If ownerPolicy's report-only value is compatible with cross-origin isolation and policy's value is
+    //           not, then queue a cross-origin embedder policy inheritance violation with response, "worker
+    //           initialization", ownerPolicy's report-only reporting endpoint, "reporting", and owner.
+
+    // 5. If ownerPolicy's value is not compatible with cross-origin isolation or policy's value is compatible with
+    //    cross-origin isolation, then return true.
+    if (!is_compatible_with_cross_origin_isolation(owner_policy.value) || is_compatible_with_cross_origin_isolation(policy.value))
+        return true;
+
+    // FIXME: 6. Queue a cross-origin embedder policy inheritance violation with response, "worker initialization",
+    //           ownerPolicy's reporting endpoint, "enforce", and owner.
+
+    // 7. Return false.
+    return false;
 }
 
 // https://w3c.github.io/webappsec-csp/#run-global-object-csp-initialization
@@ -213,12 +262,12 @@ ContentSecurityPolicy::Directives::Directive::Result WorkerGlobalScope::run_csp_
     auto result = ContentSecurityPolicy::Directives::Directive::Result::Allowed;
 
     // 2. For each policy of global’s CSP list:
-    for (auto policy : policy_container()->csp_list->policies()) {
+    for (auto const& policy : policy_container()->csp_list.policies()) {
         // 1. For each directive of policy:
-        for (auto directive : policy->directives()) {
+        for (auto const& directive : policy->directives()) {
             // 1. Execute directive’s initialization algorithm on global. If its returned value is "Blocked", then set
             //    result to "Blocked".
-            auto directive_result = directive->initialization(GC::Ref { *this }, policy);
+            auto directive_result = ContentSecurityPolicy::Directives::initialization(directive, GC::Ref { *this }, policy);
             if (directive_result == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
                 result = ContentSecurityPolicy::Directives::Directive::Result::Blocked;
             }
@@ -252,7 +301,7 @@ JS::Realm& main_world_realm(HTML::WorkerGlobalScope const& worker_global_scope)
 {
     auto wrapper = worker_global_scope.cached_main_world_wrapper();
     VERIFY(wrapper);
-    return wrapper->realm();
+    return wrapper->shape().realm();
 }
 
 void initialize_worker_web_interfaces(HTML::WorkerGlobalScope& worker_global_scope)

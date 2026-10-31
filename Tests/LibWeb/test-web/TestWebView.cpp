@@ -11,13 +11,14 @@
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ShareableBitmap.h>
+#include <LibWebView/PermissionManager.h>
 
 namespace TestWeb {
 
 NonnullOwnPtr<TestWebView> TestWebView::create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size)
 {
     auto view = adopt_own(*new TestWebView(move(theme), window_size));
-    view->initialize_client(CreateNewClient::Yes);
+    view->initialize_tab(Web::HTML::VisibilityState::Visible);
 
     return view;
 }
@@ -30,7 +31,7 @@ TestWebView::TestWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewp
 
 void TestWebView::clear_content_blockers()
 {
-    client().async_set_content_blockers(MUST(Core::AnonymousBuffer::create_with_size(0)));
+    page().client().async_set_content_blockers(MUST(Core::AnonymousBuffer::create_with_size(0)));
 }
 
 // Force-dark rides on the navigable, so a test that turns it on leaves it on for whatever runs next in this view.
@@ -45,20 +46,29 @@ void TestWebView::reset_line_box_borders()
     debug_request("set-line-box-borders"sv, "off"sv);
 }
 
+// The user style lives on the page too, so one that a test sets would otherwise style every test after it in this view.
+void TestWebView::reset_user_style()
+{
+    debug_request("clear-user-style"sv);
+}
+
 // The emulated position lives on the page, so a test that moves it would otherwise hand its position to the next test.
 void TestWebView::reset_geolocation_emulated_position()
 {
     geolocation_settings_changed();
 }
 
-NonnullRefPtr<Core::Promise<Empty>> TestWebView::reset_session_history()
+// Permissions live in the UI process, and outlive the test that changed them. Each test has an origin of its own, and
+// tests run concurrently, so only this test's origin is reset.
+void TestWebView::reset_permissions()
 {
-    return WebView::ViewImplementation::reset_session_history_for_testing();
+    session().permission_manager->reset_origin(url().origin());
+    reset_permission_prompts_for_testing();
 }
 
-pid_t TestWebView::web_content_pid() const
+NonnullRefPtr<Core::Promise<Empty>> TestWebView::reset_state_for_next_test()
 {
-    return client().pid();
+    return WebView::ViewImplementation::reset_state_for_testing();
 }
 
 NonnullRefPtr<Core::Promise<RefPtr<Gfx::Bitmap const>>> TestWebView::take_screenshot()
@@ -66,7 +76,7 @@ NonnullRefPtr<Core::Promise<RefPtr<Gfx::Bitmap const>>> TestWebView::take_screen
     VERIFY(!m_pending_screenshot);
 
     m_pending_screenshot = Core::Promise<RefPtr<Gfx::Bitmap const>>::construct();
-    client().async_take_document_screenshot(page_id());
+    page().async_take_document_screenshot();
 
     return *m_pending_screenshot;
 }
@@ -88,10 +98,8 @@ void TestWebView::on_test_complete(TestCompletion completion)
     m_pending_prompt_text.clear();
     m_is_fullscreen = Web::ViewportIsFullscreen::No;
 
-    // A crash of a child view's WebContent completes the test through its parent view, which can share the crashed
-    // process and not have replaced it yet. The replacement process gets the view's viewport when it is set up.
-    if (page().routed_connection())
-        client().async_set_viewport(page_id(), viewport_size(), 1.0, Web::ViewportIsFullscreen::No);
+    m_device_pixel_ratio = 1.0;
+    page().async_set_viewport(viewport_size(), m_device_pixel_ratio, Web::ViewportIsFullscreen::No);
 
     m_test_promise->resolve(move(completion));
 }

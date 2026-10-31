@@ -18,13 +18,19 @@
 #include <LibMedia/MediaTime.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Sinks/VideoSink.h>
-#include <LibMedia/VideoPresentation/PresentedFramePage.h>
 
 namespace Media {
 
 struct DisplayingVideoSinkUpdateResult {
     bool new_frame_available { false };
     bool may_require_updates { false };
+};
+
+struct DisplayingVideoSinkFrameCounts {
+    u64 presented { 0 };
+    u64 dropped { 0 };
+
+    bool is_zero() const { return presented == 0 && dropped == 0; }
 };
 
 class MEDIA_API DisplayingVideoSink final : public VideoSink
@@ -42,23 +48,30 @@ public:
     virtual ErrorOr<void> connect_input(NonnullRefPtr<VideoProducer> const&) override;
     virtual void disconnect_input(NonnullRefPtr<VideoProducer> const&) override;
 
-    virtual void seek(AK::Duration timestamp) override;
+    virtual void seek(AK::Duration timestamp, InvalidateHeldData = InvalidateHeldData::No) override;
+    virtual void notify_clock_resumed() override;
+    void set_ticking(bool);
+    bool is_ticking() const { return m_is_ticking; }
 
     DisplayingVideoSinkUpdateResult update(MonotonicTime now);
-    virtual RefPtr<VideoFrame> current_frame() const override;
+    RefPtr<VideoFrame> current_frame() const;
+    DisplayingVideoSinkFrameCounts take_frame_counts() { return exchange(m_frame_counts, {}); }
 
     void set_on_present_needed(Function<void()> handler) { m_on_present_needed = move(handler); }
-    void set_presented_frame_page(PresentedFramePage page) { m_presented_frame_page = move(page); }
 
 private:
     void dispatch_state_if_changed(PipelineStatus);
+    void seek_back_to_current_time();
 
     MediaTimeReader m_time_reader;
     RefPtr<VideoProducer> m_input;
 
+    bool m_is_ticking { true };
     RefPtr<VideoFrame> m_next_frame;
     RefPtr<VideoFrame> m_current_frame;
     bool m_cached_frames_are_discontinuous { false };
+    bool m_seek_resolution_is_pending_frame_at_target { false };
+    DisplayingVideoSinkFrameCounts m_frame_counts;
 
     enum class SeekStatus : u8 {
         None,
@@ -74,7 +87,7 @@ private:
     Gfx::Size<u32> m_last_dispatched_size;
 
     Function<void()> m_on_present_needed;
-    Optional<PresentedFramePage> m_presented_frame_page;
+    bool m_last_update_may_require_updates { false };
 };
 
 }

@@ -424,6 +424,7 @@ void WebDriverConnection::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_document_observer);
     visitor.visit(m_navigation_observer);
     visitor.visit(m_navigation_timer);
+    visitor.visit(m_script_timer);
 }
 
 // 10.2 Get Current URL, https://w3c.github.io/webdriver/#get-current-url
@@ -599,15 +600,15 @@ Web::WebDriver::Response WebDriverConnection::switch_to_frame(JsonValue payload)
             auto window = current_browsing_context().active_document()->window()->window();
 
             // 5. If id is not a supported property index of window, return error with error code no such frame.
-            auto property = window->get(id);
+            auto property = window->object().get(id);
 
-            if (property.is_error() || !property.value().is_object() || !is<Web::HTML::WindowProxy>(property.value().as_object())) {
+            if (property.is_error() || !property.value().is_object() || !Web::HTML::WindowProxy::from_object(property.value().as_object())) {
                 driver_execution_complete(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::NoSuchFrame, MUST(String::formatted("Frame ID {} not found", id))));
                 return;
             }
 
             // 6. Let child window be the WindowProxy object obtained by calling window.[[GetOwnProperty]] (id).
-            auto const& child_window = static_cast<Web::HTML::WindowProxy const&>(property.value().as_object());
+            auto const& child_window = *Web::HTML::WindowProxy::from_object(property.value().as_object());
 
             // 7. Set the current browsing context with session and child window's browsing context.
             auto child_navigable = child_window.navigable();
@@ -1978,7 +1979,7 @@ Web::WebDriver::Response WebDriverConnection::execute_script(JsonValue payload)
         auto timeout_ms = m_timeouts_configuration.script_timeout;
 
         // This handles steps 5 to 9 and produces the appropriate result type for the following steps.
-        Web::WebDriver::execute_script(current_browsing_context(), move(body), move(arguments), timeout_ms, GC::create_function(GC::Heap::the(), [this, script_execution_id](Web::WebDriver::ExecutionResult result) {
+        m_script_timer = Web::WebDriver::execute_script(current_browsing_context(), move(body), move(arguments), timeout_ms, GC::create_function(GC::Heap::the(), [this, script_execution_id](Web::WebDriver::ExecutionResult result) {
             dbgln_if(WEBDRIVER_DEBUG, "Executing script returned: {}", result.value);
             handle_script_response(result, script_execution_id);
         }));
@@ -2005,7 +2006,7 @@ Web::WebDriver::Response WebDriverConnection::execute_async_script(JsonValue pay
         auto timeout_ms = m_timeouts_configuration.script_timeout;
 
         // This handles steps 5 to 9 and produces the appropriate result type for the following steps.
-        Web::WebDriver::execute_async_script(current_browsing_context(), move(body), move(arguments), timeout_ms, GC::create_function(GC::Heap::the(), [this, script_execution_id](Web::WebDriver::ExecutionResult result) {
+        m_script_timer = Web::WebDriver::execute_async_script(current_browsing_context(), move(body), move(arguments), timeout_ms, GC::create_function(GC::Heap::the(), [this, script_execution_id](Web::WebDriver::ExecutionResult result) {
             dbgln_if(WEBDRIVER_DEBUG, "Executing async script returned: {}", result.value);
             handle_script_response(result, script_execution_id);
         }));
@@ -2019,6 +2020,7 @@ void WebDriverConnection::handle_script_response(Web::WebDriver::ExecutionResult
     if (script_execution_id != m_current_script_execution_id)
         return;
     m_current_script_execution_id.clear();
+    m_script_timer = nullptr;
 
     auto response = [&]() -> Web::WebDriver::Response {
         switch (result.state) {
@@ -2193,7 +2195,7 @@ Web::WebDriver::Response WebDriverConnection::add_cookie_impl(JsonObject const& 
             return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Invalid same-site attribute"sv);
     }
 
-    current_browsing_context().page().client().page_did_set_cookie(document->url(), cookie, HTTP::Cookie::Source::Http);
+    current_browsing_context().page().client().page_did_set_cookie({}, document->url(), cookie, HTTP::Cookie::Source::Http);
 
     // If there is an error during this step, return error with error code unable to set cookie.
     // NOTE: This probably should only apply to the actual setting of the cookie in the Browser, which cannot fail in our case.
@@ -2407,7 +2409,8 @@ Web::WebDriver::Response WebDriverConnection::send_alert_text(JsonValue payload)
         break;
 
     // -> Otherwise
-    default:
+    case Web::Page::PendingDialog::BeforeUnload:
+    case Web::Page::PendingDialog::None:
         // Return error with error code unsupported operation.
         return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnsupportedOperation, "Unknown dialog type"sv);
     }
@@ -2684,6 +2687,7 @@ void WebDriverConnection::page_did_open_dialog(Badge<PageClient>)
     // [[Value]]: null, [[Target]]: empty }, but continue to run the other steps of this algorithm in parallel.
     if (m_current_script_execution_id.has_value()) {
         m_current_script_execution_id.clear();
+        m_script_timer = nullptr;
         driver_execution_complete(JsonValue {});
     }
 }
@@ -2779,15 +2783,26 @@ public:
     {
     }
 
+    void complete(Web::WebDriver::Response result)
+    {
+        if (m_completed)
+            return;
+        m_completed = true;
+        m_timer->stop();
+        m_on_complete->function()(move(result));
+    }
+
     void search_for_element()
     {
+        // https://w3c.github.io/webdriver/#dfn-find
+        // 7. While elements returned is empty and timer's timeout fired flag is not set:
+        if (m_completed || m_timer->is_timed_out())
+            return;
+
         if (auto result = perform_search(); result.has_value()) {
-            m_on_complete->function()(result.release_value());
+            complete(result.release_value());
             return;
         }
-
-        if (m_timer->is_timed_out())
-            return;
 
         Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, nullptr, GC::create_function(GC::Heap::the(), [this]() {
             search_for_element();
@@ -2841,6 +2856,7 @@ private:
     WebDriverConnection::OnFindComplete m_on_complete;
 
     GC::Ref<GC::Timer> m_timer;
+    bool m_completed { false };
 };
 
 GC_DEFINE_ALLOCATOR(ElementLocator);
@@ -2857,25 +2873,26 @@ void WebDriverConnection::find(Web::WebDriver::LocationStrategy location_strateg
     // 4. Let timer be a new timer.
     auto timer = GC::Heap::the().allocate<GC::Timer>();
 
-    auto wrapped_on_complete = GC::create_function(GC::Heap::the(), [this, on_complete, timer](Web::WebDriver::Response result) {
+    auto wrapped_on_complete = GC::create_function(GC::Heap::the(), [this, on_complete](Web::WebDriver::Response result) {
         m_element_locator = nullptr;
-        timer->stop();
 
         on_complete->function()(move(result));
     });
 
+    auto locator = GC::Heap::the().allocate<ElementLocator>(current_browsing_context(), location_strategy, move(selector), get_start_node, wrapped_on_complete, timer);
+    m_element_locator = locator;
+
     // 5. If timeout is not null:
     if (timeout.has_value()) {
         // 1. Start the timer with timer and timeout.
-        timer->start(*timeout, GC::create_function(GC::Heap::the(), [wrapped_on_complete]() {
-            wrapped_on_complete->function()({ JsonArray {} });
+        timer->start(*timeout, GC::create_function(GC::Heap::the(), [locator]() {
+            locator->complete(JsonValue { JsonArray {} });
         }));
     }
 
     // 6. Let elements returned be an empty List.
     // 7. While elements returned is empty and timer's timeout fired flag is not set:
-    m_element_locator = GC::Heap::the().allocate<ElementLocator>(current_browsing_context(), location_strategy, move(selector), get_start_node, wrapped_on_complete, timer);
-    m_element_locator->search_for_element();
+    locator->search_for_element();
 }
 
 // https://w3c.github.io/webdriver/#dfn-extract-the-script-arguments-from-a-request

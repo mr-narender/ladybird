@@ -14,24 +14,17 @@
 //! only reads the order labels imply. Relabeling is therefore invisible to selector truth, cascade
 //! winners, and computed values.
 
-use super::capacity::capacity_bytes;
-
 define_id! {
     /// A stable handle on one position in an order. The numeric label behind it may be rewritten at
     /// any time; the handle does not change.
     pub struct OrderToken();
 }
 
-impl OrderToken {
-    #[must_use]
-    pub fn raw(self) -> u32 {
-        self.0
-    }
-}
+impl OrderToken {}
 
 /// One totally ordered axis: stylesheet order within a tree context, nested rule order within a
 /// sheet, or layer order within an origin.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct OrderMaintenance {
     labels: Vec<u64>,
     free_entries: Vec<u32>,
@@ -45,11 +38,13 @@ impl OrderMaintenance {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.order.len()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
@@ -88,16 +83,7 @@ impl OrderMaintenance {
         self.free_entries.push(token.0);
     }
 
-    #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.labels, self.free_entries, self.order];
-            cached [];
-            nested [];
-            skip [];
-        }
-    }
-
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = OrderToken> + '_ {
         self.order.iter().copied()
     }
@@ -235,10 +221,8 @@ mod tests {
         assert!(order.is_empty());
         assert_eq!(order.iter().count(), 0);
 
-        let bytes = order.capacity_bytes();
         let reinserted: Vec<OrderToken> = (0..300).map(|_| order.insert_last()).collect();
         assert!(is_sorted(&order, &reinserted));
-        assert_eq!(order.capacity_bytes(), bytes);
     }
 
     #[test]

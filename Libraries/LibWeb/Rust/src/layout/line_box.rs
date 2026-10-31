@@ -39,11 +39,37 @@ pub(crate) struct InlineBoxBaseline {
     pub(crate) accumulated_vertical_shift: CssPixels,
 }
 
+/// What text-overflow elided from the end of a line.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct TextOverflowElision {
+    /// The inline length of the line before the ellipsis.
+    pub(crate) inline_length: CssPixels,
+    /// Where in the line the fragment that ends in the ellipsis starts.
+    pub(crate) ellipsis_fragment_start: CssPixels,
+    /// The inline length of the fragment that ends in the ellipsis before it was shortened.
+    pub(crate) ellipsis_fragment_inline_length: CssPixels,
+}
+
+/// What a line its block container interrupted for a block-level box keeps of the box, as the layout of the box left it.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct BlockLevelBoxOnLine {
+    /// The offset of the content box of the box in its containing block.
+    pub(crate) content_offset: FfiCssPixelPoint,
+    /// The sizes and box sides of the box.
+    pub(crate) cells: used_values::RootInputCells,
+    /// The baselines the box gives the line.
+    pub(crate) baselines: formatting_context::LineBaselines,
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) struct LineBoxData {
+    pub(crate) start: super::fragmentation::LinePosition,
     pub(crate) fragments: Vec<line_box_fragment::LineBoxFragmentData>,
     pub(crate) static_position_markers: Vec<StaticPositionMarker>,
     pub(crate) inline_box_baselines: Vec<InlineBoxBaseline>,
+    pub(crate) text_overflow_elision: Option<TextOverflowElision>,
+    /// The block-level box the line holds, where the line is interrupted for one.
+    pub(crate) block_level_box: Option<BlockLevelBoxOnLine>,
     pub(crate) record: inline_content::LineRecord,
 }
 
@@ -61,11 +87,14 @@ impl std::ops::DerefMut for LineBoxData {
 }
 
 impl LineBoxData {
-    pub(crate) fn new(direction: u8, writing_mode: u8) -> Self {
+    pub(crate) fn new(direction: u8, writing_mode: u8, start: super::fragmentation::LinePosition) -> Self {
         Self {
+            start,
             fragments: Vec::new(),
             static_position_markers: Vec::new(),
             inline_box_baselines: Vec::new(),
+            text_overflow_elision: None,
+            block_level_box: None,
             record: inline_content::LineRecord {
                 direction,
                 writing_mode,
@@ -77,8 +106,6 @@ impl LineBoxData {
 
     pub(crate) fn retained_metrics(&self) -> inline_content::LineRecord {
         inline_content::LineRecord {
-            layout_fragment_count: self.fragments.len(),
-            first_fragment_node: self.fragments.first().map(|fragment| fragment.layout_node),
             is_empty: self.is_empty(),
             horizontal_extent: inline_formatting_context::line_physical_horizontal_extent(self),
             ..self.record
@@ -117,17 +144,16 @@ impl LineBoxData {
                 && self.fragments.last().is_some_and(|last| {
                     !last.has_soft_wrap_opportunity_after
                         && last.layout_node == layout_node
-                        && last
-                            .glyphs
-                            .as_ref()
-                            .is_some_and(|last_glyphs| last_glyphs.font == glyphs.font)
+                        && last.glyphs.as_ref().is_some_and(|last_glyphs| {
+                            last_glyphs.font == glyphs.font && last_glyphs.is_upright == glyphs.is_upright
+                        })
                         && last.start + last.length_in_code_units == start
                 })
         });
         if can_merge {
             let last = self.fragments.last_mut().unwrap();
             last.length_in_code_units += length;
-            last.append_glyph_run(glyphs.unwrap(), content_inline_size);
+            last.append_glyph_run(glyphs.unwrap(), content_inline_size, start - last.start);
             if trailing_whitespace.length_in_code_units == length {
                 last.trailing_whitespace.length_in_code_units += trailing_whitespace.length_in_code_units;
                 last.trailing_whitespace.inline_size += trailing_whitespace.inline_size;

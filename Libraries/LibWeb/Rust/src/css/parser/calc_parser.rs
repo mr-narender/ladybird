@@ -9,23 +9,25 @@
 // Calculation trees are main-thread-only because some leaves retain C++ style values.
 #![allow(clippy::arc_with_non_send_sync)]
 
+use super::value_parser::{
+    ANGLE_UNIT_NAMES, FLEX_UNIT_NAMES, FREQUENCY_UNIT_NAMES, NumericRange, ParseContext, RESOLUTION_UNIT_NAMES,
+    RandomFunctionIndex, TIME_UNIT_NAMES, context_allows_tree_counting_functions,
+    parse_calculated_numeric_value_with_ranges,
+};
 use crate::css::calc::{
-    CalcNode, CalcNumericType, CalcNumericValue, resolve_as_for_value_type, simplify_parsed_calculation,
+    CalcNode, CalcNumericType, CalcNumericValue, CalcRoundingStrategy, resolve_as_for_value_type,
+    simplify_parsed_calculation,
 };
 use crate::css::css_enums::{keyword_from_ascii_case_insensitive, keyword_to_channel_keyword};
 use crate::css::css_string::CssString;
 use crate::css::css_tokenizer::ParserTokenKind;
 use crate::css::math_functions::{MathFunction, math_function_from_name};
 use crate::css::parser::component_value::{ComponentKind, ComponentValue};
-use crate::css::parser::positions_shapes_parser::parse_anchor_function;
-use crate::css::parser::value_parser::{
-    ANGLE_UNIT_NAMES, FLEX_UNIT_NAMES, FREQUENCY_UNIT_NAMES, NumericRange, ParseContext, RESOLUTION_UNIT_NAMES,
-    TIME_UNIT_NAMES, VALUE_TYPE_NUMBER, context_allows_tree_counting_functions,
-    parse_calculated_numeric_value_with_ranges,
-};
+use crate::css::parser::positions_shapes_parser::{parse_anchor_function, parse_anchor_size_function};
 use crate::css::property_metadata::property_name;
 use crate::css::style_compute::LENGTH_UNIT_NAMES;
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
+use crate::css::value_codes::VALUE_TYPE_NUMBER;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,25 +39,30 @@ pub(crate) enum CalcParseError {
 type Result<T> = std::result::Result<T, CalcParseError>;
 
 #[derive(Clone, Copy)]
-pub(crate) struct CalcParserContext {
+pub(crate) struct CalcParserContext<'a> {
     pub percentages_resolve_as: Option<u8>,
+    pub allow_percentages: bool,
     pub property: u16,
-    pub random_function_index: *mut usize,
+    pub random_function_index: Option<&'a RandomFunctionIndex>,
     pub allowed_color_channels: u64,
+    /// Whether the calc-size() size keyword may appear, as in a calc-size() calculation.
+    pub allow_size_keyword: bool,
     pub allow_random_functions: bool,
-    pub parse_context: *const ParseContext,
+    pub parse_context: Option<&'a ParseContext<'a>>,
 }
 
-impl CalcParserContext {
+impl CalcParserContext<'_> {
     #[cfg(test)]
     fn for_test(percentages_resolve_as: Option<u8>) -> Self {
         Self {
             percentages_resolve_as,
+            allow_percentages: true,
             property: 0,
-            random_function_index: std::ptr::null_mut(),
+            random_function_index: None,
             allowed_color_channels: 0,
+            allow_size_keyword: false,
             allow_random_functions: false,
-            parse_context: std::ptr::null(),
+            parse_context: None,
         }
     }
 }
@@ -78,11 +85,11 @@ fn unit_index(unit: &[u16], names: &[&str]) -> Option<u8> {
 struct CalculationParser<'a> {
     values: Vec<&'a ComponentValue>,
     position: usize,
-    context: CalcParserContext,
+    context: CalcParserContext<'a>,
 }
 
 impl<'a> CalculationParser<'a> {
-    fn new(values: &'a [ComponentValue], context: CalcParserContext) -> Self {
+    fn new(values: &'a [ComponentValue], context: CalcParserContext<'a>) -> Self {
         Self {
             values: values.iter().filter(|value| !value.is_whitespace()).collect(),
             position: 0,
@@ -175,6 +182,11 @@ impl<'a> CalculationParser<'a> {
                 })))
             }
             ComponentKind::Token(ParserTokenKind::Percentage { value, .. }) => {
+                // https://drafts.csswg.org/css-values-4/#calc-context
+                // Math functions always inherit the calculation context from wherever they’re used.
+                if !self.context.allow_percentages {
+                    return Err(CalcParseError::Invalid);
+                }
                 Ok(Arc::new(CalcNode::Numeric(CalcNumericValue::Percentage(*value))))
             }
             ComponentKind::Token(ParserTokenKind::Dimension { value, unit, .. }) => {
@@ -206,7 +218,7 @@ fn parse_non_math_function(
     arguments: &[ComponentValue],
     context: CalcParserContext,
 ) -> Result<Arc<CalcNode>> {
-    let parse_context = unsafe { context.parse_context.as_ref() }.ok_or(CalcParseError::NotHandled)?;
+    let parse_context = context.parse_context.ok_or(CalcParseError::NotHandled)?;
     if (equals_ascii_case_insensitive(name, b"sibling-count") || equals_ascii_case_insensitive(name, b"sibling-index"))
         && arguments.iter().all(ComponentValue::is_whitespace)
         && context_allows_tree_counting_functions(parse_context)
@@ -219,9 +231,8 @@ fn parse_non_math_function(
             numeric_type: CalcNumericType::default(),
         }));
     }
-    // NB: Only anchor() becomes a NonMathFunction calc leaf. anchor-size() remains a native
-    //     style value.
-    let parsed = parse_anchor_function(parse_context, context.property, value);
+    let parsed = parse_anchor_function(parse_context, context.property, value)
+        .or_else(|| parse_anchor_size_function(parse_context, context.property, value));
     let Some(parsed) = parsed else {
         return Err(CalcParseError::NotHandled);
     };
@@ -238,6 +249,9 @@ fn parse_calc_keyword(identifier: &[u16], context: CalcParserContext) -> Result<
         && context.allowed_color_channels & (1 << channel) != 0
     {
         return Ok(Arc::new(CalcNode::ChannelKeyword(channel)));
+    }
+    if context.allow_size_keyword && equals_ascii_case_insensitive(identifier, b"size") {
+        return Ok(Arc::new(CalcNode::SizeKeyword));
     }
     let value = if equals_ascii_case_insensitive(identifier, b"e") {
         std::f64::consts::E
@@ -432,7 +446,7 @@ pub(crate) fn parse_a_calc_function_node(
                     if !types.iter().all(accepts_dimension_or_percentage) {
                         return Err(CalcParseError::Invalid);
                     }
-                    require_same(&types)?;
+                    require_consistent(&types)?;
                 }
                 _ => unreachable!(),
             }
@@ -455,7 +469,42 @@ pub(crate) fn parse_a_calc_function_node(
                 },
             })
         }
-        MathFunction::Clamp | MathFunction::Progress => {
+        MathFunction::Clamp => {
+            if arguments.len() != 3 {
+                return Err(CalcParseError::Invalid);
+            }
+            // https://drafts.csswg.org/css-values-4/#funcdef-clamp
+            // Either the min or max calculations (or even both) can instead be the keyword none, which indicates
+            // the value is not clamped from that side.
+            let parse_bound = |values: &[ComponentValue]| {
+                let mut significant = values.iter().filter(|value| !value.is_whitespace());
+                if significant
+                    .next()
+                    .and_then(ComponentValue::ident)
+                    .is_some_and(|ident| equals_ascii_case_insensitive(ident, b"none"))
+                    && significant.next().is_none()
+                {
+                    Ok(None)
+                } else {
+                    parse_argument(values, context).map(Some)
+                }
+            };
+            let min = parse_bound(arguments[0])?;
+            let center = parse_argument(arguments[1], context)?;
+            let max = parse_bound(arguments[2])?;
+            let types = min
+                .iter()
+                .chain(std::iter::once(&center))
+                .chain(max.iter())
+                .map(|node| argument_type(node, percentages_resolve_as))
+                .collect::<Result<Vec<_>>>()?;
+            if !types.iter().all(accepts_dimension_or_percentage) {
+                return Err(CalcParseError::Invalid);
+            }
+            require_consistent(&types)?;
+            Arc::new(CalcNode::Clamp { min, center, max })
+        }
+        MathFunction::Progress => {
             let nodes = parse_fixed_arguments(&arguments, 3, context)?;
             let types = nodes
                 .iter()
@@ -465,19 +514,11 @@ pub(crate) fn parse_a_calc_function_node(
                 return Err(CalcParseError::Invalid);
             }
             require_consistent(&types)?;
-            Arc::new(if function == MathFunction::Clamp {
-                CalcNode::Clamp {
-                    min: nodes[0].clone(),
-                    center: nodes[1].clone(),
-                    max: nodes[2].clone(),
-                }
-            } else {
-                CalcNode::Progress {
-                    no_clamp: progress_no_clamp,
-                    progress: nodes[0].clone(),
-                    from: nodes[1].clone(),
-                    to: nodes[2].clone(),
-                }
+            Arc::new(CalcNode::Progress {
+                no_clamp: progress_no_clamp,
+                progress: nodes[0].clone(),
+                from: nodes[1].clone(),
+                to: nodes[2].clone(),
             })
         }
         MathFunction::Log => {
@@ -508,16 +549,31 @@ pub(crate) fn parse_a_calc_function_node(
             })
         }
         MathFunction::Round => {
-            if !(2..=3).contains(&arguments.len()) {
+            let (strategy, arguments) = match parse_rounding_strategy(arguments[0]) {
+                Some(strategy) => (strategy, &arguments[1..]),
+                None => (CalcRoundingStrategy::Nearest, arguments.as_slice()),
+            };
+
+            if !(1..=2).contains(&arguments.len()) {
                 return Err(CalcParseError::Invalid);
             }
-            let (strategy, arguments) = if arguments.len() == 3 {
-                let strategy = parse_rounding_strategy(arguments[0]).ok_or(CalcParseError::Invalid)?;
-                (strategy, &arguments[1..])
-            } else {
-                (1, arguments.as_slice())
-            };
-            let nodes = parse_fixed_arguments(arguments, 2, context)?;
+
+            let mut nodes = arguments
+                .iter()
+                .map(|argument| parse_argument(argument, context))
+                .collect::<Result<Vec<_>>>()?;
+
+            // https://drafts.csswg.org/css-values-4/#funcdef-round
+            // If the type of A matches <number>, then B may be omitted, and defaults to 1.
+            // NB: We add the default interval of 1 if it is omitted and let the later type check reject the non-number
+            //     A argument case.
+            if nodes.len() == 1 {
+                nodes.push(Arc::new(CalcNode::Numeric(CalcNumericValue::Number {
+                    value: 1.0,
+                    number_type: 0,
+                })));
+            }
+
             let types = nodes
                 .iter()
                 .map(|node| argument_type(node, percentages_resolve_as))
@@ -540,20 +596,20 @@ pub(crate) fn parse_a_calc_function_node(
         .ok_or(CalcParseError::Invalid)
 }
 
-fn parse_rounding_strategy(values: &[ComponentValue]) -> Option<u8> {
+fn parse_rounding_strategy(values: &[ComponentValue]) -> Option<CalcRoundingStrategy> {
     let mut values = values.iter().filter(|value| !value.is_whitespace());
     let identifier = values.next()?.ident()?;
     if values.next().is_some() {
         return None;
     }
     if equals_ascii_case_insensitive(identifier, b"down") {
-        Some(0)
+        Some(CalcRoundingStrategy::Down)
     } else if equals_ascii_case_insensitive(identifier, b"nearest") {
-        Some(1)
+        Some(CalcRoundingStrategy::Nearest)
     } else if equals_ascii_case_insensitive(identifier, b"to-zero") {
-        Some(2)
+        Some(CalcRoundingStrategy::ToZero)
     } else if equals_ascii_case_insensitive(identifier, b"up") {
-        Some(3)
+        Some(CalcRoundingStrategy::Up)
     } else {
         None
     }
@@ -586,7 +642,7 @@ fn parse_random_value_sharing(
                 StyleValueData::Number { value }
             }
             ComponentKind::Function { ref name, ref values } if math_function_from_name(name).is_some() => {
-                let parse_context = unsafe { context.parse_context.as_ref() }.ok_or(CalcParseError::NotHandled)?;
+                let parse_context = context.parse_context.ok_or(CalcParseError::NotHandled)?;
                 parse_calculated_numeric_value_with_ranges(
                     parse_context,
                     context.property,
@@ -649,11 +705,11 @@ fn parse_random_value_sharing(
 }
 
 fn parse_random(arguments: &[&[ComponentValue]], context: CalcParserContext) -> Result<Arc<CalcNode>> {
-    if !context.allow_random_functions || context.random_function_index.is_null() {
+    let Some(random_function_index) = context.random_function_index.filter(|_| context.allow_random_functions) else {
         return Err(CalcParseError::NotHandled);
-    }
-    let index = unsafe { *context.random_function_index };
-    unsafe { *context.random_function_index += 1 };
+    };
+    let index = random_function_index.get();
+    random_function_index.set(index + 1);
     let auto_name = random_auto_name(context, index);
     let explicit_sharing = arguments
         .first()
@@ -760,17 +816,19 @@ mod tests {
         let values =
             consume_a_list_of_component_values(tokenize_for_parser(b"random(element-shared, 1px, 3px)")).unwrap();
         let (name, values) = values[0].function().unwrap();
-        let mut random_function_index = 4;
+        let random_function_index = RandomFunctionIndex::new(4);
         let context = CalcParserContext {
             percentages_resolve_as: None,
+            allow_percentages: true,
             property: 1,
-            random_function_index: &raw mut random_function_index,
+            random_function_index: Some(&random_function_index),
             allowed_color_channels: 0,
+            allow_size_keyword: false,
             allow_random_functions: true,
-            parse_context: std::ptr::null(),
+            parse_context: None,
         };
         let parsed = parse_a_calc_function_node(name, values, context).unwrap();
         assert!(matches!(&*parsed, CalcNode::Random { .. }));
-        assert_eq!(random_function_index, 5);
+        assert_eq!(random_function_index.get(), 5);
     }
 }

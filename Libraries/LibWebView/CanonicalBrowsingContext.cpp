@@ -9,6 +9,7 @@
 #include <LibWebView/CanonicalBrowsingContext.h>
 #include <LibWebView/CanonicalBrowsingContextGroup.h>
 #include <LibWebView/CanonicalDocument.h>
+#include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/CanonicalWindow.h>
 #include <LibWebView/WebContentClient.h>
@@ -31,7 +32,7 @@ Web::HTML::SandboxingFlagSet determine_the_creation_sandboxing_flags(CanonicalBr
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-browsing-context
-CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::create_a_new_browsing_context_and_document(CanonicalDocument const* creator, Optional<Web::HTML::ReplicatedContainerState const&> embedder, CanonicalBrowsingContextGroup& group, Optional<Web::HTML::EnvironmentId> environment_id, Optional<URL::Origin> given_origin)
+CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::create_a_new_browsing_context_and_document(CanonicalDocument const* creator, Optional<Web::HTML::ReplicatedContainerState const&> embedder, CanonicalBrowsingContextGroup& group, Web::HTML::CrossProcessId document_id, Optional<Web::HTML::EnvironmentId> environment_id, Optional<URL::Origin> given_origin)
 {
     // 1. Let browsingContext be a new browsing context.
     auto browsing_context = adopt_ref(*new CanonicalBrowsingContext);
@@ -68,6 +69,13 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::c
             origin = given_origin.release_value();
     }
 
+    // 8. Let permissionsPolicy be the result of creating a permissions policy given embedder and origin.
+    // NB: embedder's node document is creator, and the process holding embedder reports its container policy.
+    Optional<Web::PermissionsPolicy::NavigableContainerPolicyInputs> container;
+    if (embedder.has_value())
+        container.emplace(creator->permissions_policy(), creator->origin(), embedder->container_policy);
+    auto permissions_policy = Web::PermissionsPolicy::create_a_permissions_policy_for_a_navigable(container, origin);
+
     // 9. Let agent be the result of obtaining a similar-origin window agent given origin, group, and false.
     auto agent = group.obtain_similar_origin_window_agent(origin, false);
 
@@ -77,18 +85,46 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::c
     // NB: The realm is in the process creating the document, which hosts agent once it holds the document.
     auto window = CanonicalWindow::create(agent);
 
+    // 11. Let topLevelCreationURL be the return value of running these steps:
+    //     1. If embedder is non-null, then return embedder's relevant settings object's top-level creation URL.
+    //     2. If creator is non-null, then return creator's relevant settings object's top-level creation URL.
+    //     3. Return about:blank.
+    // NB: An embedder's relevant settings object is that of its node document, which is creator.
+    auto top_level_creation_url = creator ? creator->relevant_global_object().relevant_settings_object().top_level_creation_url().value() : about_blank;
+
     // 13. Set up a window environment settings object with about:blank, realm execution context, null,
     //     topLevelCreationURL, and topLevelOrigin.
-    window->set_up_a_window_environment_settings_object(move(environment_id));
+    window->set_up_a_window_environment_settings_object(move(environment_id), move(top_level_creation_url));
 
     // 15. Let document be a new Document, with:
     //     origin: origin
     //     browsing context: browsingContext
+    //     permissions policy: permissionsPolicy
+    //     active sandboxing flag set: sandboxFlags
     //     is initial about:blank: true
-    auto document = CanonicalDocument::create(URL::about_blank(), origin, browsing_context, window, CanonicalDocument::IsInitialAboutBlank::Yes);
+    auto document = CanonicalDocument::create(document_id, URL::about_blank(), origin, browsing_context, window, sandbox_flags, CanonicalDocument::IsInitialAboutBlank::Yes);
+    document->set_permissions_policy(move(permissions_policy));
+
+    // 19. If creator is non-null:
+    //     2. Set document's policy container to a clone of creator's policy container.
+    //     3. If creator's origin is same origin with creator's relevant settings object's top-level origin, then set
+    //        document's opener policy to creator's browsing context's top-level browsing context's active document's
+    //        opener policy.
+    // NB: The UI process holds the embedder policy of a document's policy container. creator is fully active, so its
+    //     relevant settings object's top-level origin is its top-level browsing context's active document's origin.
+    if (creator) {
+        document->set_embedder_policy(creator->embedder_policy());
+
+        auto top_level_document = creator->browsing_context().top_level_browsing_context().active_document();
+        if (creator->origin().is_same_origin(top_level_document->origin()))
+            document->set_opener_policy(top_level_document->opener_policy());
+    }
 
     // 23. Make active document.
     document->make_active();
+
+    // 24. Completely finish loading document.
+    document->set_completely_loaded();
 
     // 25. Return browsingContext and document.
     return { browsing_context, document };
@@ -96,7 +132,7 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::c
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-top-level-browsing-context
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-browsing-context-group-and-document
-CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document(Optional<URL::Origin> given_origin)
+CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document(Web::HTML::CrossProcessId document_id, Optional<URL::Origin> given_origin)
 {
     // NB: A group is kept alive by the browsing contexts in its browsing context set, so creating a new browsing context
     //     group and document is folded in here, where the browsing context holding the group is returned.
@@ -108,7 +144,7 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::c
     CanonicalBrowsingContextGroup::append_to_user_agent_browsing_context_group_set(*group);
 
     // 3. Let browsingContext and document be the result of creating a new browsing context and document with null, null, and group.
-    auto browsing_context_and_document = create_a_new_browsing_context_and_document(nullptr, {}, *group, {}, move(given_origin));
+    auto browsing_context_and_document = create_a_new_browsing_context_and_document(nullptr, {}, *group, document_id, {}, move(given_origin));
 
     // 4. Append browsingContext to group.
     group->append(*browsing_context_and_document.browsing_context);
@@ -119,7 +155,7 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::c
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-auxiliary-browsing-context
-CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::create_a_new_auxiliary_browsing_context_and_document(CanonicalNavigable& opener)
+CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::create_a_new_auxiliary_browsing_context_and_document(CanonicalNavigable& opener, Web::HTML::CrossProcessId document_id)
 {
     // 1. Let openerTopLevelBrowsingContext be opener's top-level traversable's active browsing context.
     auto& opener_top_level_browsing_context = opener.top_level_traversable().active_browsing_context();
@@ -131,7 +167,7 @@ CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalBrowsingContext::c
     VERIFY(group);
 
     // 4. Let browsingContext and document be the result of creating a new browsing context and document with opener's active document, null, and group.
-    auto browsing_context_and_document = create_a_new_browsing_context_and_document(&opener.active_document(), {}, *group, {});
+    auto browsing_context_and_document = create_a_new_browsing_context_and_document(&opener.active_document(), {}, *group, document_id, {});
 
     // 5. Set browsingContext's is auxiliary to true.
     browsing_context_and_document.browsing_context->m_is_auxiliary = true;
@@ -189,6 +225,13 @@ CanonicalBrowsingContext& CanonicalBrowsingContext::top_level_browsing_context()
     if (m_top_level_browsing_context)
         return *m_top_level_browsing_context;
     return *this;
+}
+
+RefPtr<CanonicalBrowsingContext> CanonicalBrowsingContext::opener_browsing_context() const
+{
+    if (!m_opener_browsing_context || m_opener_browsing_context->has_been_discarded())
+        return nullptr;
+    return m_opener_browsing_context;
 }
 
 void CanonicalBrowsingContext::set_opener_browsing_context(RefPtr<CanonicalBrowsingContext> opener)

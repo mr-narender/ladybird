@@ -6,8 +6,6 @@
 
 //! The compositor animations a visual context tree carries, and the trees derived by sampling them.
 
-use std::rc::Rc;
-
 use super::{EffectNodeData, EffectNodeIndex, EffectsData, SpatialData, SpatialNodeIndex, VisualContextTree};
 use crate::host::{FfiVisualAnimationSummary, FfiVisualAnimationTargetKind, FfiVisualAnimationTransformOperationKind};
 use crate::visual_animation::{VisualAnimation, VisualAnimationSample, VisualAnimationValue};
@@ -35,13 +33,17 @@ impl VisualContextTree {
     }
 
     pub fn set_visual_animations(&mut self, animations: Vec<VisualAnimation>) {
-        self.visual_animations = Rc::from(animations);
+        self.visual_animations = std::sync::Arc::from(animations);
     }
 
     pub fn clear_visual_animations(&mut self) {
         if self.has_visual_animations() {
-            self.visual_animations = Rc::from(Vec::new());
+            self.visual_animations = std::sync::Arc::from(Vec::new());
         }
+    }
+
+    pub fn shared_visual_animations(&self) -> std::sync::Arc<[VisualAnimation]> {
+        self.visual_animations.clone()
     }
 
     fn effects_mut(&mut self, node_index: u32) -> Option<&mut EffectsData> {
@@ -211,6 +213,7 @@ mod tests {
 
     fn opacity_effect() -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode: CompositingAndBlendingOperator::Normal,
             filter: None,

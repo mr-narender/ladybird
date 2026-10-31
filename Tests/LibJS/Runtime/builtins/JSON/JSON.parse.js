@@ -123,6 +123,30 @@ test("string escape sequences", () => {
     expect(JSON.parse('"\\u0000"')).toBe("\0");
 });
 
+test("malformed literals inside arrays and objects", () => {
+    expect(() => JSON.parse("[nope]")).toThrow(SyntaxError);
+    expect(() => JSON.parse("[nul]")).toThrow(SyntaxError);
+    expect(() => JSON.parse("[nulltrue]")).toThrow(SyntaxError);
+    expect(() => JSON.parse('{"a":nonsense}')).toThrow(SyntaxError);
+    expect(JSON.parse('[null, {"a": null}]')).toEqual([null, { a: null }]);
+});
+
+test("malformed literals at the top level", () => {
+    expect(() => JSON.parse("falsy")).toThrow(SyntaxError);
+    expect(() => JSON.parse("falsz\t")).toThrow(SyntaxError);
+    expect(JSON.parse("false")).toBeFalse();
+    expect(JSON.parse(" true ")).toBeTrue();
+});
+
+test("overflowing numbers followed by other content", () => {
+    expect(() => JSON.parse("1e400 x")).toThrow(SyntaxError);
+    expect(() => JSON.parse("1e400\f")).toThrow(SyntaxError);
+    expect(() => JSON.parse("1\v")).toThrow(SyntaxError);
+    expect(JSON.parse("1e400 ")).toBe(Infinity);
+    expect(JSON.parse("[1e400 ]")).toEqual([Infinity]);
+    expect(JSON.parse('{"a": -1e400\n}')).toEqual({ a: -Infinity });
+});
+
 test("unicode and surrogate pairs", () => {
     expect(JSON.parse('"café"')).toBe("café");
     expect(JSON.parse('"日本語"')).toBe("日本語");
@@ -162,6 +186,13 @@ test("lone surrogates among non-ASCII text", () => {
     expect(() => JSON.parse("\uD800")).toThrow(SyntaxError);
 });
 
+test("lone surrogate after a backslash", () => {
+    expect(() => JSON.parse('"\\' + "\uD800" + '"')).toThrow(SyntaxError);
+    expect(() => JSON.parse('{"\\' + "\uDC00" + '": 1}')).toThrow(SyntaxError);
+    expect(() => JSON.rawJSON('"\\' + "\uD800" + '"')).toThrow(SyntaxError);
+    expect(JSON.parse('"\\\\' + "\uD800" + '"')).toBe("\\\uD800");
+});
+
 test("object keys repeated across many objects", () => {
     const text = JSON.stringify(
         Array.from({ length: 300 }, (_, i) => ({ title: "やること " + i, completed: i % 2 === 0, id: "id" + i }))
@@ -194,4 +225,87 @@ test("whitespace handling", () => {
     expect(JSON.parse("\r\n123\r\n")).toBe(123);
     expect(JSON.parse("  {  }  ")).toEqual({});
     expect(JSON.parse("  [  ]  ")).toEqual([]);
+});
+
+test("objects with the same keys", () => {
+    const parsed = JSON.parse('[{"a":1,"b":{"a":2,"b":3}},{"a":4,"b":{"a":5,"b":6}},{"b":7,"a":8}]');
+    expect(parsed).toEqual([
+        { a: 1, b: { a: 2, b: 3 } },
+        { a: 4, b: { a: 5, b: 6 } },
+        { b: 7, a: 8 },
+    ]);
+    expect(Object.keys(parsed[2])).toEqual(["b", "a"]);
+    parsed[0].c = 9;
+    expect(parsed[1].c).toBeUndefined();
+    expect(Object.getOwnPropertyDescriptor(parsed[1], "a")).toEqual({
+        value: 4,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    });
+
+    // The same keys in later texts, and in texts stored as UTF-16.
+    expect(JSON.parse('{"a":1,"b":2}')).toEqual({ a: 1, b: 2 });
+    expect(JSON.parse('{"a":"é","b":2}')).toEqual({ a: "é", b: 2 });
+    expect(JSON.parse('{"é":1,"b":2}')).toEqual({ é: 1, b: 2 });
+    expect(JSON.parse('{"é":1,"b":2,"b":3}')).toEqual({ é: 1, b: 3 });
+});
+
+test("repeated keys keep the place of their first value", () => {
+    const parsed = JSON.parse('[{"a":1,"b":2,"a":3},{"a":1,"b":2,"a":3}]');
+    expect(Object.keys(parsed[1])).toEqual(["a", "b"]);
+    expect(parsed[1].a).toBe(3);
+});
+
+test("objects with many keys", () => {
+    for (const count of [2, 3, 64, 65, 200]) {
+        const object = Object.fromEntries(Array.from({ length: count }, (_, i) => ["key" + i, i]));
+        const text = JSON.stringify([object, object]);
+        const parsed = JSON.parse(text);
+        expect(Object.keys(parsed[1])).toEqual(Object.keys(object));
+        expect(parsed[1]["key" + (count - 1)]).toBe(count - 1);
+    }
+});
+
+test("__proto__ is an own property", () => {
+    const parsed = JSON.parse('[{"__proto__":1},{"__proto__":{"a":2}}]');
+    expect(Object.getPrototypeOf(parsed[0])).toBe(Object.prototype);
+    expect(Object.getOwnPropertyNames(parsed[0])).toEqual(["__proto__"]);
+    expect(Object.getPrototypeOf(parsed[1])).toBe(Object.prototype);
+    expect(parsed[1].a).toBeUndefined();
+});
+
+test("special characters at every place in long strings", () => {
+    for (const string of ["", "a", "abcdefg", "abcdefgh", "abcdefghijklmnopq", "äbcdefghijklmnopq"]) {
+        for (let i = 0; i <= string.length; ++i) {
+            for (const [escaped, unescaped] of [
+                ['\\"', '"'],
+                ["\\\\", "\\"],
+                ["\\n", "\n"],
+                ["\\u0001", "\u0001"],
+                ["\u007f", "\u007f"],
+                ["ÿ", "ÿ"],
+                [" ", " "],
+            ]) {
+                const text = '"' + string.slice(0, i) + escaped + string.slice(i) + '"';
+                expect(JSON.parse(text)).toBe(string.slice(0, i) + unescaped + string.slice(i));
+            }
+            for (const unit of ["\u0000", "\n", "\u001f"]) {
+                const text = '"' + string.slice(0, i) + unit + string.slice(i) + '"';
+                expect(() => JSON.parse(text)).toThrow(SyntaxError);
+            }
+            expect(() => JSON.parse('"' + string.slice(0, i))).toThrow(SyntaxError);
+        }
+    }
+});
+
+test("deeply nested text", () => {
+    expect(JSON.parse("[".repeat(1000) + "]".repeat(1000))).toHaveLength(1);
+    expect(() => JSON.parse('{"a":'.repeat(1000000) + "1" + "}".repeat(1000000))).toThrow(InternalError);
+    expect(JSON.parse('{"a":[1,{"b":2}]}')).toEqual({ a: [1, { b: 2 }] });
+});
+
+test("text that is not valid in the middle of objects and arrays", () => {
+    expect(() => JSON.parse('[{"a":1,"b":[1,2,{"c":}]}]')).toThrow(SyntaxError);
+    expect(JSON.parse('[{"a":1,"b":[1,2,{"c":3}]}]')).toEqual([{ a: 1, b: [1, 2, { c: 3 }] }]);
 });

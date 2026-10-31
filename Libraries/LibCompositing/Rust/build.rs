@@ -8,6 +8,22 @@ use std::env;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+// AK::Optional is not trivial for calls under every C++ ABI: Apple clang returns it through memory, where Rust
+// returns the matching #[repr(C)] struct in registers. Keep it out of extern "C" signatures; pass a plain
+// #[repr(C)] struct and convert it to an Optional on the C++ side.
+fn reject_optional_in_extern_c_signatures(header: &Path) {
+    let text = std::fs::read_to_string(header).unwrap_or_default();
+    for block in text.split("extern \"C\" {").skip(1) {
+        let (signatures, _) = block.split_once("}  // extern \"C\"").unwrap_or((block, ""));
+        if let Some(line) = signatures.lines().find(|line| line.contains("Optional<")) {
+            panic!(
+                "{}: AK::Optional in an extern \"C\" signature: {line}",
+                header.display()
+            );
+        }
+    }
+}
+
 fn generate_ffi_header(config: cbindgen::Config, sources: &[PathBuf], out_dir: &Path, header: &Path) {
     let builder = sources
         .iter()
@@ -24,7 +40,8 @@ fn generate_ffi_header(config: cbindgen::Config, sources: &[PathBuf], out_dir: &
         |bindings| {
             let output_header = out_dir.join(header);
             std::fs::create_dir_all(output_header.parent().unwrap()).unwrap();
-            bindings.write_to_file(output_header);
+            bindings.write_to_file(&output_header);
+            reject_optional_in_extern_c_signatures(&output_header);
         },
     );
 }
@@ -40,7 +57,8 @@ fn generate_ffi_header_strict(config: cbindgen::Config, sources: &[PathBuf], out
         |bindings| {
             let output_header = out_dir.join(header);
             std::fs::create_dir_all(output_header.parent().unwrap()).unwrap();
-            bindings.write_to_file(output_header);
+            bindings.write_to_file(&output_header);
+            reject_optional_in_extern_c_signatures(&output_header);
         },
     );
 }
@@ -56,11 +74,6 @@ fn expose_css_pixel_types_as_web_types(config: &mut cbindgen::Config) {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
     config.includes.push("LibWebCommon/PixelUnits.h".to_string());
-    config.after_includes = Some(
-        "#if defined(__clang__)\n#pragma clang diagnostic push\n#pragma clang diagnostic ignored \"-Wreturn-type-c-linkage\"\n#endif"
-            .to_string(),
-    );
-    config.trailer = Some("#if defined(__clang__)\n#pragma clang diagnostic pop\n#endif".to_string());
 }
 
 // The types the C++ side defines itself, which the generated header refers to by their C++ names.
@@ -84,11 +97,16 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "ClipNodeIndex",
             "EffectNodeIndex",
             "ContextRef",
-            "DisplayListCommandRun",
+            "DisplayListCommandType",
             "ReplayClip",
             "ReplayLayer",
             "ReplayMask",
             "FfiVisualViewportTransform",
+            "CanvasId",
+            "VideoSinkResourceId",
+            "Canvas2DPaintKind",
+            "Canvas2DPatternRepetition",
+            "PathGeometryData",
         ]
         .map(String::from),
     );
@@ -129,11 +147,18 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("ClipNodeIndex", "Compositing::ClipNodeIndex"),
         ("EffectNodeIndex", "Compositing::EffectNodeIndex"),
         ("ContextRef", "Compositing::ContextRef"),
-        ("DisplayListCommandRun", "Compositing::DisplayListCommandRun"),
+        ("DisplayListCommandType", "Compositing::DisplayListCommandType"),
         ("ReplayClip", "Compositing::ReplayClip"),
         ("ReplayLayer", "Compositing::ReplayLayer"),
         ("ReplayMask", "Compositing::ReplayMask"),
         ("FfiVisualViewportTransform", "Compositing::TransformWithOrigin"),
+        ("CanvasId", "Compositing::CanvasId"),
+        ("VideoSinkResourceId", "Compositing::VideoSinkResourceId"),
+        ("Canvas2DPaintKind", "Compositing::Canvas2DPaintKind"),
+        ("Canvas2DPatternRepetition", "Compositing::Canvas2DPatternRepetition"),
+        ("CapStyle", "Gfx::Path::CapStyle"),
+        ("JoinStyle", "Gfx::Path::JoinStyle"),
+        ("PathGeometryData", "Gfx::FFI::PathGeometryData"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
@@ -143,12 +168,13 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "AK/Optional.h",
             "LibGfx/AffineTransform.h",
             "LibGfx/Color.h",
+            "LibGfx/ColorFilterType.h",
             "LibGfx/CompositingAndBlendingOperator.h",
             "LibGfx/CornerRadii.h",
-            "LibGfx/Filter.h",
             "LibGfx/GradientInterpolation.h",
             "LibGfx/InterpolationColorSpace.h",
             "LibGfx/Matrix4x4.h",
+            "LibGfx/Path.h",
             "LibGfx/Point.h",
             "LibGfx/Rect.h",
             "LibGfx/ScalingMode.h",
@@ -198,6 +224,38 @@ fn display_list_command_names(path: &Path) -> Result<Vec<String>, Box<dyn Error>
     Ok(names)
 }
 
+// The variants of DisplayListCommandType in declaration order, which is the order of their discriminants.
+fn display_list_command_type_variants(path: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let source = std::fs::read_to_string(path)?;
+    let (_, body) = source
+        .split_once("pub enum DisplayListCommandType {")
+        .ok_or("DisplayListCommandType not found")?;
+    let (body, _) = body.split_once('}').ok_or("unterminated DisplayListCommandType")?;
+    let variants: Vec<String> = body
+        .lines()
+        .map(|line| line.trim().trim_end_matches(','))
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(String::from)
+        .collect();
+    if variants.is_empty() || variants.iter().any(|name| !name.chars().all(|c| c.is_alphanumeric())) {
+        return Err(format!("unparsable DisplayListCommandType variants: {variants:?}").into());
+    }
+    Ok(variants)
+}
+
+fn display_list_payload_alignment(path: &Path) -> Result<String, Box<dyn Error>> {
+    let source = std::fs::read_to_string(path)?;
+    let value = source
+        .lines()
+        .find_map(|line| line.strip_prefix("pub const COMMAND_ALIGNMENT: usize = "))
+        .and_then(|rest| rest.strip_suffix(';'))
+        .ok_or("COMMAND_ALIGNMENT not found")?;
+    if value.is_empty() || !value.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("unparsable COMMAND_ALIGNMENT: {value}").into());
+    }
+    Ok(value.to_string())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
@@ -213,6 +271,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     ffi_config.namespaces = Some(vec!["Compositing".to_string(), "RustFFI".to_string()]);
     expose_css_pixel_types_as_web_types(&mut ffi_config);
     expose_shared_abi_types_as_cpp_types(&mut ffi_config);
+    // An ak::Span is laid out as an AK ReadonlySpan, which C++ passes it as.
+    ffi_config
+        .export
+        .rename
+        .insert("Span".to_string(), "AK::ReadonlySpan".to_string());
+    ffi_config.includes.push("AK/Span.h".to_string());
     // The values WebContent's own entry points take and return, which its headers refer to here.
     ffi_config.export.include = [
         "NodeSlotId",
@@ -227,7 +291,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "FfiVisualAnimationSummary",
         "FfiAnimatedContentViewportEffect",
         "FfiTestStickyConstraints",
-        "FfiRecordedDisplayList",
         "FfiDisplayListReplayCallbacks",
         "FfiEasingDescriptor",
         "FfiEasingKind",
@@ -235,6 +298,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     ]
     .map(String::from)
     .to_vec();
+    let mut test_builder_config = ffi_config.clone();
+    test_builder_config.export.include.clear();
+    generate_ffi_header(
+        test_builder_config,
+        &[manifest_dir.join("src/test_builder.rs")],
+        &out_dir,
+        Path::new("TestBuilderRustFFI.h"),
+    );
     generate_ffi_header(
         ffi_config,
         &[
@@ -245,6 +316,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/visual_context/ffi_types.rs"),
             manifest_dir.join("src/host/replay.rs"),
             manifest_dir.join("src/display_list/storage.rs"),
+            manifest_dir.join("src/display_list/canvas_2d.rs"),
+            manifest_dir.join("src/display_list/canvas_2d_recorder.rs"),
             manifest_dir.join("src/ffi.rs"),
         ],
         &out_dir,
@@ -338,7 +411,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("FloatMatrix4x4", "Gfx::FloatMatrix4x4"),
         ("CornerRadius", "Gfx::CornerRadius"),
         ("CornerRadii", "Gfx::CornerRadii"),
-        ("CornerClip", "Gfx::CornerClip"),
         ("GradientInterpolationMethod", "Gfx::GradientInterpolationMethod"),
         ("GradientInterpolationType", "Gfx::GradientInterpolationMethod::Type"),
         ("RectangularColorSpace", "Gfx::RectangularColorSpace"),
@@ -401,6 +473,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     .into_iter()
     .map(String::from)
     .collect();
+    // The commands of the canvas 2D stream go into a list of their own, as only the canvas player plays them.
+    let variants = display_list_command_type_variants(&commands_source)?;
+    let mut after_includes = String::new();
+    for (macro_name, canvas_2d) in [
+        ("ENUMERATE_DISPLAY_LIST_COMMANDS", false),
+        ("ENUMERATE_CANVAS_2D_COMMANDS", true),
+    ] {
+        after_includes.push_str(&format!("\n#define {macro_name}(V)"));
+        for name in variants.iter().filter(|name| name.starts_with("Canvas2D") == canvas_2d) {
+            after_includes.push_str(&format!(" \\\n    V({name})"));
+        }
+        after_includes.push('\n');
+    }
+    after_includes.push_str(&format!(
+        "\nnamespace Compositing {{\n\n// Every record and every payload starts at a multiple of this.\nconstexpr size_t display_list_payload_alignment = {};\n\n}}",
+        display_list_payload_alignment(&manifest_dir.join("src/display_list/builder.rs"))?
+    ));
+    commands_config.after_includes = Some(after_includes);
     for name in display_list_command_names(&commands_source)? {
         commands_config.export.pre_body.insert(
             name.clone(),

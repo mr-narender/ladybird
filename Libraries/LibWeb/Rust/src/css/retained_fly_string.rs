@@ -41,6 +41,18 @@ impl RetainedUtf16FlyString {
         &self.raw
     }
 
+    /// The code units the string holds, borrowed where it stores them as UTF-16.
+    pub(crate) fn to_utf16(&self) -> std::borrow::Cow<'_, [u16]> {
+        if self.raw == 0 {
+            return std::borrow::Cow::Borrowed(&[]);
+        }
+        // SAFETY: Every non-zero value owns one reference to a valid fly string.
+        match unsafe { ak::utf16_string_units(&self.raw) } {
+            ak::Utf16StringUnits::Ascii(units) => units.iter().map(|&unit| u16::from(unit)).collect(),
+            ak::Utf16StringUnits::Utf16(units) => std::borrow::Cow::Borrowed(units),
+        }
+    }
+
     /// The no-string sentinel; holds no reference. No real fly string uses the
     /// zero raw representation.
     pub(crate) fn none() -> Self {
@@ -137,7 +149,7 @@ impl RetainedUtf16FlyStringList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 
     /// The list viewed as raw fly-string words; fly strings are interned, so
@@ -147,7 +159,7 @@ impl RetainedUtf16FlyStringList {
             return &[];
         }
         // SAFETY: `RetainedUtf16FlyString` is represented by its single raw word.
-        unsafe { std::slice::from_raw_parts(self.pointer.cast::<usize>(), self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer.cast::<usize>(), self.length) }
     }
 }
 

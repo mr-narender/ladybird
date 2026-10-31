@@ -51,10 +51,17 @@ public:
 
     ReplicatedContainerState replicated_container_state();
 
+    // https://w3c.github.io/webappsec-permissions-policy/#algo-process-policy-attributes
+    PermissionsPolicy::PolicyDirective process_permissions_policy_attributes() const;
+
+    // https://w3c.github.io/webappsec-permissions-policy/#algo-create-for-navigable
+    static PermissionsPolicy::PermissionsPolicy create_a_permissions_policy(GC::Ptr<NavigableContainer const>, URL::Origin const&);
+
     // The UI process routes input over a navigable another process hosts by the rect of its container's content box
     // in the viewport of the local root, and tells that navigable the part of it the top-level viewport shows. Both
     // are reported whenever they change.
-    void report_content_navigable_viewport_rect();
+    void report_content_navigable_viewport_rect(Layout::BegunRead const& read);
+    bool stats_displayed() const { return m_reported_stats_displayed.value_or(false); }
 
 protected:
     NavigableContainer(DOM::Document&, DOM::QualifiedName);
@@ -81,6 +88,9 @@ private:
 
     static void finish_destroying_the_child_navigable(Navigable&);
 
+    void report_stats_displayed(bool);
+    Optional<bool> m_reported_stats_displayed;
+
     bool m_potentially_delays_the_load_event { true };
 
     struct ReportedContentNavigableViewport {
@@ -89,6 +99,9 @@ private:
         bool operator==(ReportedContentNavigableViewport const&) const = default;
     };
     Optional<ReportedContentNavigableViewport> m_reported_content_navigable_viewport;
+
+    void report_used_color_scheme(CSS::PreferredColorScheme);
+    CSS::PreferredColorScheme m_used_color_scheme { CSS::PreferredColorScheme::Light };
 };
 
 }

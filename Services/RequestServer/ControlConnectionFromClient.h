@@ -34,22 +34,25 @@ public:
     static Optional<ControlConnectionFromClient&> the();
 
 private:
-    ControlConnectionFromClient(NonnullOwnPtr<IPC::Transport>, RequestServer::ConnectionFromClient::ConnectionMap&, RequestServer::ConnectionFromClient::RequestTransferLeaseMap&, Optional<HTTP::DiskCache&>, ByteString alt_svc_cache_path);
+    ControlConnectionFromClient(NonnullOwnPtr<IPC::Transport>, RequestServer::ConnectionFromClient::ConnectionMap&, RequestServer::ConnectionFromClient::RequestTransferLeaseMap&, Optional<HTTP::DiskCache&>);
 
-    virtual Messages::RequestServerControl::InitTransportResponse init_transport(int peer_pid) override;
-
-    virtual Messages::RequestServerControl::ConnectNewClientResponse connect_new_client(IsPrivate) override;
-    virtual Messages::RequestServerControl::ConnectNewClientsResponse connect_new_clients(size_t count, IsPrivate) override;
+    virtual Messages::RequestServerControl::ConnectNewClientResponse connect_new_client(IsPrivate, SiteBinding) override;
+    virtual Messages::RequestServerControl::ConnectNewClientsResponse connect_new_clients(size_t count, IsPrivate, SiteBinding) override;
+    virtual void bind_client_to_site(int client_id, Utf16String top_level_site, Optional<Utf16String> frame_site) override;
 
     virtual void set_disk_cache_settings(HTTP::DiskCacheSettings) override;
 
     virtual void set_dns_server(ByteString host_or_address, u16 port, bool use_tls, bool validate_dnssec_locally) override;
     virtual void set_use_system_dns() override;
 
+    virtual void set_proxy_configuration(HTTP::ProxyConfiguration) override;
+
     virtual void set_performance_monitor_enabled(bool) override;
 
     virtual void estimate_cache_size_accessed_since(u64 cache_size_estimation_id, UnixDateTime since) override;
     virtual void remove_cache_entries_accessed_since(u64 clear_cache_request_id, UnixDateTime since) override;
+    virtual void retrieve_cache_access_profile(u64 access_profile_request_id, AK::Duration granularity) override;
+    virtual void remove_cache_entries_accessed_before(UnixDateTime before) override;
 
     virtual void retrieved_http_cookie(int client_id, u64 request_id, RequestType request_type, u64 cookie_request_id, String cookie) override;
     virtual void stored_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id) override;
@@ -58,15 +61,16 @@ private:
         IPC::TransportHandle handle;
         int client_id { -1 };
     };
-    ErrorOr<ClientSocket> create_client_socket(IsPrivate);
+    ErrorOr<ClientSocket> create_client_socket(IsPrivate, SiteBinding);
     void push_network_usage();
 
     RequestServer::ConnectionFromClient::ConnectionMap& m_connections;
     RequestServer::ConnectionFromClient::RequestTransferLeaseMap& m_request_transfer_leases;
     Optional<HTTP::DiskCache&> m_disk_cache;
-    ByteString m_alt_svc_cache_path;
 
     NonnullRefPtr<Resolver> m_resolver;
+
+    RefPtr<Core::Timer> m_disk_cache_size_report_timer;
 
     RefPtr<Core::Timer> m_performance_timer;
     Optional<MonotonicTime> m_last_performance_push;

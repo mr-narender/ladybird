@@ -7,22 +7,23 @@
 #pragma once
 
 #include <AK/Function.h>
+#include <AK/Mutex.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Optional.h>
+#include <LibAudio/ChannelMap.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/File.h>
-#include <LibMedia/Audio/ChannelMap.h>
-#include <LibMedia/CodedFrame.h>
 #include <LibMedia/Containers/Matroska/MatroskaDemuxer.h>
 #include <LibMedia/Containers/Matroska/Reader.h>
 #include <LibMedia/Containers/Matroska/Utilities.h>
 #include <LibMedia/Demuxer.h>
-#include <LibMedia/FFmpeg/FFmpegDemuxer.h>
+#include <LibMedia/DemuxerRegistry.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Producers/DecodedAudioProducer.h>
 #include <LibMedia/Producers/VideoProducer.h>
-#include <LibMedia/VideoDecoder.h>
-#include <LibMedia/VideoFrame.h>
+#include <LibMediaCodecs/CodedFrame.h>
+#include <LibMediaCodecs/VideoDecoder.h>
+#include <LibMediaCodecs/VideoFrame.h>
 #include <LibTest/TestCase.h>
 
 static inline Core::EventLoop& never_destroyed_event_loop()
@@ -92,12 +93,7 @@ static inline void decode_audio(StringView path, u32 sample_rate, u8 channel_cou
 
     auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
-    auto demuxer = MUST([&] -> Media::DecoderErrorOr<NonnullRefPtr<Media::Demuxer>> {
-        auto matroska_result = Media::Matroska::MatroskaDemuxer::from_stream(stream);
-        if (!matroska_result.is_error())
-            return matroska_result.release_value();
-        return Media::FFmpeg::FFmpegDemuxer::from_stream(stream);
-    }());
+    auto demuxer = MUST(Media::create_demuxer(stream));
     auto tracks = TRY_OR_FAIL(demuxer->get_tracks_for_type(Media::TrackType::Audio));
     VERIFY(!tracks.is_empty());
     auto producer = TRY_OR_FAIL(Media::DecodedAudioProducer::try_create(loop, demuxer, tracks[0]));
@@ -162,6 +158,7 @@ public:
 
     void append_output(RefPtr<Media::VideoFrame> frame, Media::PipelineStatus status)
     {
+        MutexLocker locker { m_mutex };
         m_outputs.append({ move(frame), status });
     }
 
@@ -174,19 +171,25 @@ public:
     virtual void start() override { }
     virtual Media::VideoProducerOutput peek() override
     {
+        MutexLocker locker { m_mutex };
         if (m_outputs.is_empty())
             return { nullptr, Media::PipelineStatus::Pending };
         return m_outputs.first();
     }
-    virtual void consume() override { (void)m_outputs.take_first(); }
+    virtual void consume() override
+    {
+        MutexLocker locker { m_mutex };
+        (void)m_outputs.take_first();
+    }
     virtual void set_wake_handler(Media::PipelineWakeHandler handler) override { m_wake_handler = move(handler); }
-    virtual void seek(AK::Duration) override { m_seek_count++; }
+    virtual void seek(AK::Duration, Media::InvalidateHeldData = Media::InvalidateHeldData::No) override { m_seek_count++; }
 
     size_t seek_count() const { return m_seek_count; }
 
 private:
     ScriptedVideoProducer() = default;
 
+    Mutex m_mutex;
     Vector<Media::VideoProducerOutput> m_outputs;
     size_t m_seek_count { 0 };
     Media::PipelineWakeHandler m_wake_handler;

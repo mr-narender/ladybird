@@ -6,8 +6,11 @@
 
 #pragma once
 
+#include <AK/Forward.h>
 #include <AK/Function.h>
+#include <AK/HashMap.h>
 #include <AK/Noncopyable.h>
+#include <AK/OwnPtr.h>
 #include <AK/Queue.h>
 #include <LibCore/Forward.h>
 #include <LibGC/Ptr.h>
@@ -15,9 +18,30 @@
 #include <LibJS/Forward.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/EventLoop/TaskQueue.h>
+#include <LibWeb/HTML/Scripting/EnvironmentSettingsObjectAddress.h>
 #include <LibWebCommon/HighResolutionTime/DOMHighResTimeStamp.h>
 
+namespace Web::Layout::RustFFI {
+
+enum class FfiFlightBlocker : uint8_t;
+
+}
+
 namespace Web::HTML {
+
+// What the render clock's lanes do with a document's running animations.
+enum class ClockAnimations : u8 {
+    // Leaves them alone: the event loop is idle, and its rendering updates run them.
+    Hold,
+    // Samples them: a task begins, beside which only the render clock runs them.
+    Run,
+};
+
+// Whether a committed frame records the document, rather than keep the display list the compositor has.
+enum class CommittedFrameRecords : bool {
+    No,
+    Yes,
+};
 
 class WEB_API EventLoop : public JS::Cell {
     GC_CELL(EventLoop, JS::Cell);
@@ -36,6 +60,10 @@ class WEB_API EventLoop : public JS::Cell {
     };
 
 public:
+    // Whether the style transaction of a document in a rendering update may fly beside the event loop, or what keeps it
+    // in step.
+    Layout::RustFFI::FfiFlightBlocker style_flight_blocker(DOM::Document&) const;
+
     struct RenderingSchedulerCounters {
         u64 update_requests { 0 };
         u64 coalesced_update_requests { 0 };
@@ -92,6 +120,7 @@ public:
     };
     bool rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp frame_time, RenderingOpportunitySource);
     bool rendering_task_queued_or_running() const { return m_rendering_task_queued || m_running_rendering_task; }
+    void queue_task_to_process_input_events();
     bool running_synchronous_rendering_update() const { return m_running_synchronous_rendering_update; }
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#termination-nesting-level
@@ -112,6 +141,7 @@ public:
     void document_navigable_did_change(Badge<DOM::Document>);
 
     [[nodiscard]] Vector<GC::Root<DOM::Document>> documents_in_this_event_loop_matching(Function<bool(DOM::Document&)> callback) const;
+    void add_stats(JsonObject&) const;
 
     Vector<GC::Root<HTML::Window>> same_loop_windows() const;
 
@@ -122,6 +152,8 @@ public:
 
     void register_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject&);
     void unregister_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject&);
+    GC::Ptr<EnvironmentSettingsObject> environment_settings_object_at(EnvironmentSettingsObjectAddress) const;
+    GC::Ptr<EnvironmentSettingsObject> environment_settings_object_with_id(EnvironmentId const&) const;
 
     double compute_deadline() const;
 
@@ -136,16 +168,71 @@ public:
 
     bool running_rendering_task() const { return m_running_rendering_task; }
 
+    // A rendering update's style transaction and its frame fly beside the event loop until the event loop takes them in
+    // between two tasks. A rendering update whose style transaction flies runs its steps from its style and layout on
+    // once the transaction is taken in.
+    void did_commit_frame(LocalNavigable&, CommittedFrameRecords);
+    void did_take_frame_in(LocalNavigable&);
+    // Waits for every frame the navigables committed to be presented, and takes it in.
+    void take_committed_frames_in();
+    // A test that injects its rendering opportunities injects its render clock's ticks as well.
+    // Called before a rendering update submits a recording, on a thread with a Core event loop.
+    void ensure_frame_completion_registered();
+    // Whether a frame flies beside the event loop, which has not taken it in yet.
+    bool has_frame_in_flight() const;
+    // Whether a rendering update has let its frame fly and has not run its steps from its style and layout on yet.
+    bool has_rendering_update_in_flight() const { return m_rendering_update_in_flight; }
+    // Whether the layout of the rendering update in flight runs, or ran, beside the event loop.
+    bool lays_out_rendering_update_in_flight() const;
+    // Runs the steps of the rendering update whose style transaction flies, which take the transaction in.
+    void finish_rendering_update_in_flight();
+    // The serial number of the first rendering update that may gather a resize observation of `document` made now. A
+    // task beside a rendering update whose style and layout of the document have yet to run comes after the whole of it.
+    u64 first_rendering_update_to_gather_resize_observations_of(DOM::Document const&) const;
+    // A rendering task that would find a rendering update not yet finished keeps its place in the queue until the update
+    // has finished, rather than wait for it. One that finds a frame still in flight runs beside it.
+    bool holds_rendering_opportunity() const;
+    // Whether the tasks of `document` wait for the rendering update in flight: its steps after its style and layout
+    // deliver to the document's script what comes before any of its tasks. A task of no document waits whenever the
+    // tasks of any document do, and an update with intersection observations to update holds every task.
+    bool holds_tasks_of(DOM::Document const*) const;
+    // Whether the rendering update in flight holds back the tasks of `document`, as it does where no test holds it.
+    bool rendering_update_in_flight_holds_tasks_of_for_testing(DOM::Document const&) const;
+    void hold_next_frame_for_testing() { m_holds_next_frame_for_testing = true; }
+    void hold_next_layout_for_testing() { m_holds_next_layout_for_testing = true; }
+    void release_held_frames_for_testing();
+
     RenderingSchedulerCounters const& rendering_scheduler_counters() const { return m_rendering_scheduler_counters; }
     void reset_rendering_scheduler_counters();
 
 private:
+    bool rendering_update_in_flight_holds_tasks_of(DOM::Document const*) const;
     explicit EventLoop(Type);
 
     virtual void visit_edges(Visitor&) override;
 
     void process_input_events() const;
+    Vector<GC::Root<DOM::Document>> take_clock_lanes_and_input_events_in(u64 update_serial);
     void update_the_rendering();
+    // How the steps after style and layout take the layout of the docs: up to date, or as the update's layout that flew
+    // left it, whatever was written since.
+    enum class TakenLayout : u8 {
+        UpToDate,
+        AsItFlew,
+    };
+    struct RenderingUpdateInFlight;
+    // `update_in_flight` is the rendering update whose steps go on, if it flew.
+    void update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, u64 update_serial, TakenLayout = TakenLayout::UpToDate, RenderingUpdateInFlight const* update_in_flight = nullptr);
+    void update_whether_font_face_sets_are_pending_on_the_environment(Vector<GC::Root<DOM::Document>> const& docs, TakenLayout);
+    void finish_rendering_update(double update_start_time);
+    void resume_rendering_update_in_flight();
+    void finish_ended_rendering_update_in_flight();
+    bool finish_ended_rendering_update_as_its_layout_flew();
+    void note_script_ran_beside_rendering_update_in_flight();
+    // Goes on with the rendering update in flight where it has landed, and presents the recordings that have landed.
+    void take_finished_frames_in();
+    bool let_layout_of_rendering_update_fly();
+    void note_clock_lanes(ClockAnimations);
 
     Type m_type { Type::Window };
 
@@ -176,7 +263,7 @@ private:
 
     // Used to implement step 4 of "perform a microtask checkpoint".
     // NOTE: These are weak references! ESO registers and unregisters itself from the event loop manually.
-    Vector<RawPtr<EnvironmentSettingsObject>> m_related_environment_settings_objects;
+    OrderedHashMap<EnvironmentSettingsObjectAddress, RawPtr<EnvironmentSettingsObject>> m_related_environment_settings_objects;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#backup-incumbent-settings-object-stack
     Vector<GC::Ref<EnvironmentSettingsObject>> m_backup_incumbent_realm_stack;
@@ -189,6 +276,7 @@ private:
     bool m_running_rendering_task { false };
     bool m_running_synchronous_rendering_update { false };
     bool m_rendering_task_queued { false };
+    bool m_input_events_task_queued { false };
     bool m_rendering_update_requested { false };
 
     RenderingSchedulerCounters m_rendering_scheduler_counters;
@@ -196,12 +284,28 @@ private:
     double m_last_rendering_update_end_time { 0 };
 
     GC::Ptr<GC::Function<void()>> m_rendering_task_function;
+
+    // The navigables whose committed frame flies beside the event loop, which has not taken it in yet.
+    Vector<GC::Ref<LocalNavigable>> m_navigables_with_frames_in_flight;
+    // The navigables whose active document a rendering update left a plan for the lane of its frame, which the event
+    // loop tells whether it runs a task.
+    Vector<GC::Ref<LocalNavigable>> m_navigables_with_clock_lanes;
+    bool m_frame_completion_registered { false };
+    bool m_holds_next_frame_for_testing { false };
+    bool m_holds_next_layout_for_testing { false };
+
+    OwnPtr<RenderingUpdateInFlight> m_rendering_update_in_flight;
+    // The serial number of the last rendering update that began: the lanes an update takes in wait for its own plan,
+    // not for that of an update before it.
+    u64 m_rendering_update_serial { 0 };
+    // How deep the event loop is spun inside a task.
+    size_t m_spin_depth { 0 };
 };
 
 WEB_API EventLoop& main_thread_event_loop();
 WEB_API void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps);
-WEB_API TaskID queue_a_task(HTML::Task::Source, GC::Ptr<EventLoop>, GC::Ptr<DOM::Document>, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal);
-WEB_API TaskID queue_global_task(HTML::Task::Source, JS::Object&, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal);
+WEB_API TaskID queue_a_task(HTML::Task::Source, GC::Ptr<EventLoop>, GC::Ptr<DOM::Document>, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});
+WEB_API TaskID queue_global_task(HTML::Task::Source, JS::Object&, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});
 WEB_API void queue_a_microtask(GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps);
 void perform_a_microtask_checkpoint();
 

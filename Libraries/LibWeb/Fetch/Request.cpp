@@ -15,9 +15,43 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Request.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/Streams/ReadableStream.h>
+#include <LibWeb/Streams/TransformStream.h>
+#include <LibWeb/WebIDL/Promise.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
 namespace Web::Fetch {
+
+// https://streams.spec.whatwg.org/#create-an-identity-transformstream
+static GC::Ref<Streams::TransformStream> create_an_identity_transform_stream(HTML::EnvironmentSettingsObject& settings_object)
+{
+    auto& realm = settings_object.realm();
+
+    // 1. Let transformStream be a new TransformStream.
+    auto transform_stream = Streams::TransformStream::create(realm);
+
+    // 2. Set up transformStream with transformAlgorithm set to an algorithm which, given chunk, enqueues chunk in
+    //    transformStream.
+    auto transform_algorithm = GC::create_function(GC::Heap::the(), [&realm, transform_stream](JS::Value chunk) -> GC::Ref<WebIDL::Promise> {
+        if (auto result = transform_stream->enqueue(chunk); result.is_error())
+            return WebIDL::create_rejected_promise_from_exception(realm, result.release_error());
+        return WebIDL::create_resolved_promise(realm, JS::js_undefined());
+    });
+    transform_stream->set_up(realm, transform_algorithm);
+
+    // 3. Return transformStream.
+    return transform_stream;
+}
+
+// https://streams.spec.whatwg.org/#readablestream-create-a-proxy
+static GC::Ref<Streams::ReadableStream> create_a_proxy(HTML::EnvironmentSettingsObject& settings_object, GC::Ref<Streams::ReadableStream> stream)
+{
+    // 1. Let identityTransform be the result of creating an identity TransformStream.
+    auto identity_transform = create_an_identity_transform_stream(settings_object);
+
+    // 2. Return the result of stream piped through identityTransform.
+    return stream->piped_through(identity_transform);
+}
 
 static Bindings::ReferrerPolicy referrer_policy_to_bindings(ReferrerPolicy::ReferrerPolicy referrer_policy)
 {
@@ -172,7 +206,7 @@ static bool is_empty(Bindings::RequestInit const& request_init)
 
 GC_DEFINE_ALLOCATOR(Request);
 
-Request::Request(GC::Ref<Infrastructure::Request> request)
+Request::Request(NonnullRefPtr<Infrastructure::Request> request)
     : m_request(request)
 {
 }
@@ -182,7 +216,7 @@ Request::~Request() = default;
 void Request::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(m_request);
+    visitor.visit(m_body);
     visitor.visit(m_headers);
     visitor.visit(m_signal);
 }
@@ -202,11 +236,10 @@ GC::Ptr<Infrastructure::Body const> Request::body_impl() const
 {
     // Objects including the Body interface mixin have an associated body (null or a body).
     // A Request object’s body is its request’s body.
-    return m_request->body().visit(
-        [](GC::Ref<Infrastructure::Body> const& b) -> GC::Ptr<Infrastructure::Body const> { return b; },
-        [](Empty) -> GC::Ptr<Infrastructure::Body const> { return nullptr; },
-        // A byte sequence will be safely extracted into a body early on in fetch.
-        [](ByteBuffer const&) -> GC::Ptr<Infrastructure::Body const> { VERIFY_NOT_REACHED(); });
+    // NB: A body that fetching extracts again from the same source keeps this object's stream.
+    if (m_request->body().has<Empty>())
+        return nullptr;
+    return m_body;
 }
 
 // https://fetch.spec.whatwg.org/#concept-body-body
@@ -215,20 +248,19 @@ GC::Ptr<Infrastructure::Body> Request::body_impl()
 {
     // Objects including the Body interface mixin have an associated body (null or a body).
     // A Request object’s body is its request’s body.
-    return m_request->body().visit(
-        [](GC::Ref<Infrastructure::Body>& b) -> GC::Ptr<Infrastructure::Body> { return b; },
-        [](Empty) -> GC::Ptr<Infrastructure::Body> { return {}; },
-        // A byte sequence will be safely extracted into a body early on in fetch.
-        [](ByteBuffer&) -> GC::Ptr<Infrastructure::Body> { VERIFY_NOT_REACHED(); });
+    // NB: A body that fetching extracts again from the same source keeps this object's stream.
+    if (m_request->body().has<Empty>())
+        return nullptr;
+    return m_body;
 }
 
 // https://fetch.spec.whatwg.org/#request-create
-GC::Ref<Request> Request::create(GC::Ref<Infrastructure::Request> request)
+GC::Ref<Request> Request::create(NonnullRefPtr<Infrastructure::Request> request)
 {
     return GC::Heap::the().allocate<Request>(request);
 }
 
-GC::Ref<Request> Request::create(GC::Ref<Infrastructure::Request> request, Headers::Guard guard, GC::Ref<DOM::AbortSignal> signal)
+GC::Ref<Request> Request::create(NonnullRefPtr<Infrastructure::Request> request, Headers::Guard guard, GC::Ref<DOM::AbortSignal> signal)
 {
     // 1. Let requestObject be a new Request object with realm.
     // 2. Set requestObject’s request to request.
@@ -258,7 +290,7 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::create_with_settings(HTML::Enviro
     auto request_object = create(Infrastructure::Request::create());
 
     // 1. Let request be null.
-    GC::Ptr<Infrastructure::Request> input_request;
+    RefPtr<Infrastructure::Request> input_request;
 
     // 2. Let fallbackMode be null.
     Optional<Infrastructure::Request::Mode> fallback_mode;
@@ -309,11 +341,7 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::create_with_settings(HTML::Enviro
 
     // 9. If request’s traversable for user prompts is an environment settings object and its origin is same origin with
     //    origin, then set traversableForUserPrompts to request’s traversable for user prompts.
-    if (input_request->traversable_for_user_prompts().has<GC::Ptr<HTML::EnvironmentSettingsObject>>()) {
-        auto eso = input_request->traversable_for_user_prompts().get<GC::Ptr<HTML::EnvironmentSettingsObject>>();
-        if (eso->origin().is_same_origin(origin))
-            traversable_for_user_prompts = input_request->traversable_for_user_prompts();
-    }
+    // NB: A request's traversable for user prompts is never an environment settings object.
 
     // 11. If init["window"] exists, then set traversableForUserPrompts to "no-traversable".
     if (init.window.has_value()) {
@@ -350,7 +378,7 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::create_with_settings(HTML::Enviro
 
     // client
     //     This’s relevant settings object.
-    request->set_client(&relevant_settings_object);
+    request->set_client(relevant_settings_object.address());
 
     // traversable for user prompts
     //     traversableForUserPrompts.
@@ -584,7 +612,7 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::create_with_settings(HTML::Enviro
             // 4. If headers is a Headers object, then for each header of its header list, append header to this’s headers.
             [&](NonnullRefPtr<HTTP::HeaderList> const& headers) -> WebIDL::ExceptionOr<void> {
                 for (auto const& header : *headers)
-                    TRY(request_object->headers()->append(HTTP::Header::isomorphic_encode(header.name, header.value)));
+                    TRY(request_object->headers()->append(header));
                 return {};
             },
             // 5. Otherwise, fill this’s headers with headers.
@@ -595,16 +623,16 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::create_with_settings(HTML::Enviro
     }
 
     // 34. Let inputBody be input’s request’s body if input is a Request object; otherwise null.
-    Optional<Infrastructure::Request::BodyType const&> input_body;
+    GC::Ptr<Infrastructure::Body> input_body;
     if (input.has<GC::Ref<Request>>())
-        input_body = input.get<GC::Ref<Request>>()->request()->body();
+        input_body = input.get<GC::Ref<Request>>()->body_impl();
 
     // 35. If either init["body"] exists and is non-null or inputBody is non-null, and request’s method is `GET` or `HEAD`, then throw a TypeError.
-    if (((init.body.has_value() && !init.body->has<Empty>()) || (input_body.has_value() && !input_body.value().has<Empty>())) && request->method().is_one_of("GET"sv, "HEAD"sv))
+    if (((init.body.has_value() && !init.body->has<Empty>()) || input_body) && request->method().is_one_of("GET"sv, "HEAD"sv))
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Method must not be GET or HEAD when body is provided"_utf16 };
 
     // 36. Let initBody be null.
-    Optional<Infrastructure::Request::BodyType> init_body;
+    GC::Ptr<Infrastructure::Body> init_body;
 
     // 37. If init["body"] exists and is non-null, then:
     if (init.body.has_value() && !init.body->has<Empty>()) {
@@ -623,13 +651,12 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::create_with_settings(HTML::Enviro
     }
 
     // 38. Let inputOrInitBody be initBody if it is non-null; otherwise inputBody.
-    auto input_or_init_body = init_body.value_or<Optional<Infrastructure::Request::BodyType const&>>(input_body);
+    auto input_or_init_body = init_body ? init_body : input_body;
 
     // 39. If inputOrInitBody is non-null and inputOrInitBody’s source is null, then:
-    // FIXME: The spec doesn't check if inputOrInitBody is a body before accessing source.
-    if (input_or_init_body.has_value() && input_or_init_body->has<GC::Ref<Infrastructure::Body>>() && input_or_init_body->get<GC::Ref<Infrastructure::Body>>()->source().has<Empty>()) {
+    if (input_or_init_body && !input_or_init_body->source().has_value()) {
         // 1. If initBody is non-null and init["duplex"] does not exist, then throw a TypeError.
-        if (init_body.has_value() && !init.duplex.has_value())
+        if (init_body && !init.duplex.has_value())
             return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Body without source requires 'duplex' value to be set"_utf16 };
 
         // 2. If this’s request’s mode is neither "same-origin" nor "cors", then throw a TypeError.
@@ -641,20 +668,25 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::create_with_settings(HTML::Enviro
     }
 
     // 40. Let finalBody be inputOrInitBody.
-    auto const& final_body = input_or_init_body;
+    auto final_body = input_or_init_body;
 
     // 41. If initBody is null and inputBody is non-null, then:
-    if (!init_body.has_value() && input_body.has_value()) {
-        // 2. If input is unusable, then throw a TypeError.
+    if (!init_body && input_body) {
+        // 1. If inputBody is unusable, then throw a TypeError.
         if (input.has<GC::Ref<Request>>() && input.get<GC::Ref<Request>>()->is_unusable())
             return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Request is unusable"_utf16 };
 
-        // FIXME: 2. Set finalBody to the result of creating a proxy for inputBody.
+        // 2. Set finalBody to the result of creating a proxy for inputBody.
+        // NB: The proxy is a new body whose stream is the proxy of inputBody's stream. It keeps inputBody's source and
+        //     length, so that it can still be transmitted and recreated like inputBody.
+        final_body = Infrastructure::Body::create(create_a_proxy(relevant_settings_object, input_body->stream()), input_body->fetch_body());
     }
 
     // 42. Set this’s request’s body to finalBody.
-    if (final_body.has_value())
-        request_object->request()->set_body(*final_body);
+    if (final_body) {
+        request_object->request()->set_body(final_body->fetch_body());
+        request_object->m_body = final_body;
+    }
 
     return GC::Ref { *request_object };
 }
@@ -789,7 +821,9 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::clone(JS::Realm& realm) const
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Request is unusable"_utf16 };
 
     // 2. Let clonedRequest be the result of cloning this’s request.
-    auto cloned_request = m_request->clone(realm);
+    // NB: Cloning the body tees the stream held here.
+    auto cloned_request = m_request->clone();
+    auto cloned_body = body_impl() ? m_body->clone(realm) : GC::Ptr<Infrastructure::Body> {};
 
     // 3. Assert: this’s signal is non-null.
     VERIFY(m_signal);
@@ -799,6 +833,7 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::clone(JS::Realm& realm) const
 
     // 5. Let clonedRequestObject be the result of creating a Request object, given clonedRequest, this’s headers’s guard, clonedSignal and this’s relevant realm.
     auto cloned_request_object = Request::create(cloned_request, m_headers->guard(), cloned_signal);
+    cloned_request_object->m_body = cloned_body;
 
     // 6. Return clonedRequestObject.
     return cloned_request_object;

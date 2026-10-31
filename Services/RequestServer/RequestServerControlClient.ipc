@@ -1,3 +1,4 @@
+#include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibRequests/CacheSizes.h>
@@ -11,11 +12,16 @@ endpoint RequestServerControlClient
     // A client is gone for good: its ID is never handed out again.
     client_disconnected(int client_id) =|
 
-    retrieve_http_cookie(int client_id, u64 request_id, ::RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url) =|
-    store_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id, URL::URL url, Vector<HTTP::Cookie::ParsedCookie> cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> hsts_policy) =|
+    // The partition context comes from the request's network isolation key, and is nothing for a request without one.
+    retrieve_http_cookie(int client_id, u64 request_id, ::RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context) =|
+    store_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context, Vector<HTTP::Cookie::ParsedCookie> cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> hsts_policy) =|
 
     network_usage(Vector<Requests::NetworkUsage> usage, u64 interval_microseconds) =|
 
     estimated_cache_size(u64 cache_size_estimation_id, Requests::CacheSizes sizes) =|
     removed_cache_entries(u64 clear_cache_request_id) =|
+
+    // Sent once the disk cache's size settles after changing.
+    disk_cache_size_changed(u64 size) =|
+    retrieved_cache_access_profile(u64 access_profile_request_id, Vector<Requests::CacheAccessBucket> buckets) =|
 }

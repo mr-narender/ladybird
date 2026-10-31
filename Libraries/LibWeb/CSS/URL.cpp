@@ -60,8 +60,6 @@ Utf16String URL::to_utf16_string() const
     return builder.to_string();
 }
 
-bool URL::operator==(URL const&) const = default;
-
 RequestURLModifier RequestURLModifier::create_cross_origin(CrossOriginModifierValue value)
 {
     return RequestURLModifier { Type::CrossOrigin, value };
@@ -83,7 +81,7 @@ RequestURLModifier::RequestURLModifier(Type type, Value value)
 {
 }
 
-void RequestURLModifier::modify_request(GC::Ref<Fetch::Infrastructure::Request> request) const
+void RequestURLModifier::modify_request(NonnullRefPtr<Fetch::Infrastructure::Request> request) const
 {
     switch (m_type) {
     case Type::CrossOrigin: {
@@ -167,7 +165,5 @@ Utf16String RequestURLModifier::to_utf16_string() const
     builder.append_ascii(')');
     return builder.to_string();
 }
-
-bool RequestURLModifier::operator==(RequestURLModifier const&) const = default;
 
 }

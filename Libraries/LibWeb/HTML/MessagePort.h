@@ -18,9 +18,14 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
+namespace JS {
+
+class HostObject;
+
+}
+
 namespace Web::Bindings {
 
-class PlatformObject;
 struct StructuredSerializeOptions;
 
 }
@@ -99,6 +104,7 @@ private:
     void post_port_message(SerializedTransferRecord const&);
     ErrorOr<void> send_message_on_transport(SerializedTransferRecord const&);
     void read_from_transport();
+    void update_keep_alive();
 
     // The HTML spec implies(!) that this is MessagePort.[[RemotePort]]
     GC::Ptr<MessagePort> m_remote_port;
@@ -118,13 +124,14 @@ private:
     u64 m_message_task_generation { 0 };
     bool m_should_shutdown_on_enable { false };
     bool m_enabled { false };
+    GC::Root<MessagePort> m_keep_alive;
 };
 
 }
 
 namespace Web::Bindings {
 
-WEB_API GC::Ref<PlatformObject> message_port(JS::Realm&, GC::Ref<HTML::MessagePort>);
+WEB_API GC::Ref<JS::HostObject> message_port(JS::Realm&, GC::Ref<HTML::MessagePort>);
 WEB_API HTML::MessagePort* message_port_from_value(JS::Value);
 WEB_API GC::RootVector<GC::Ref<HTML::MessagePort>> message_ports_from_transferred_values(Vector<GC::Root<JS::Object>> const&);
 WEB_API bool transfer_list_contains_message_port(GC::RootVector<GC::Ref<JS::Object>> const&, HTML::MessagePort const&);

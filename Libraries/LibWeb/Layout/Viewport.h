@@ -7,20 +7,22 @@
 #pragma once
 
 #include <LibWeb/Layout/Box.h>
+#include <LibWeb/Layout/SearchableText.h>
 
 namespace Web::Layout {
 
 class Viewport final : public Box {
 public:
-    explicit Viewport(DOM::Document&, CSS::LayoutStyle);
+    Viewport(DOM::Document&, BindToPreparedArenaSlot, Compositing::RustFFI::NodeSlotId, RustFFI::NodeKind);
     virtual ~Viewport() override;
 
-    void invalidate_text_blocks_cache() { RustFFI::layout_arena_invalidate_searchable_text(arena_handle()); }
-
     DOM::Document const& dom_node() const;
+    SearchableText const& searchable_text() { return m_searchable_text_cache.get(); }
+    void invalidate_searchable_text_cache() { m_searchable_text_cache.invalidate(); }
 
 private:
     virtual bool is_viewport() const override { return true; }
+    SearchableTextCache m_searchable_text_cache;
 };
 
 template<>
