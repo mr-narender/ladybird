@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
 #include <AK/Debug.h>
 #include <LibCore/Directory.h>
 #include <LibCore/MimeData.h>
@@ -16,8 +17,11 @@
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibURL/Parser.h>
+#include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Fetch/Infrastructure/URL.h>
+#include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/LoadRequest.h>
@@ -35,9 +39,25 @@ static RefPtr<ResourceLoader>& resource_loader()
     return resource_loader;
 }
 
-void ResourceLoader::initialize(GC::Heap& heap, NonnullRefPtr<Requests::RequestClient> request_client)
+static Optional<URL::URL>& proxy_autoconfig_url_storage()
 {
-    resource_loader() = adopt_ref(*new ResourceLoader(heap, move(request_client)));
+    static Optional<URL::URL>& proxy_autoconfig_url = *new Optional<URL::URL>;
+    return proxy_autoconfig_url;
+}
+
+void ResourceLoader::set_proxy_autoconfig_url(URL::URL url)
+{
+    proxy_autoconfig_url_storage() = move(url);
+}
+
+Optional<URL::URL> const& ResourceLoader::proxy_autoconfig_url()
+{
+    return proxy_autoconfig_url_storage();
+}
+
+void ResourceLoader::initialize(GC::Heap& heap)
+{
+    resource_loader() = adopt_ref(*new ResourceLoader(heap));
 }
 
 bool ResourceLoader::is_initialized()
@@ -54,53 +74,121 @@ ResourceLoader& ResourceLoader::the()
     return *resource_loader();
 }
 
-ResourceLoader::ResourceLoader(GC::Heap& heap, NonnullRefPtr<Requests::RequestClient> request_client)
+ResourceLoader::ResourceLoader(GC::Heap& heap)
     : m_heap(heap)
-    , m_user_agent(MUST(String::from_utf8(default_user_agent)))
     , m_platform(MUST(String::from_utf8(default_platform)))
-    , m_preferred_languages({ "en-US"_string })
-    , m_navigator_compatibility_mode(default_navigator_compatibility_mode)
 {
-    set_client(move(request_client));
 }
 
-void ResourceLoader::set_client(NonnullRefPtr<Requests::RequestClient> request_client)
+NavigatorCompatibilityMode ResourceLoader::s_navigator_compatibility_mode = default_navigator_compatibility_mode;
+
+void ResourceLoader::set_navigator_compatibility_mode(NavigatorCompatibilityMode mode)
 {
-    m_request_client = move(request_client);
-    m_request_client->on_request_server_died = [this, disconnected_client = m_request_client->make_weak_ptr<Requests::RequestClient>()]() {
-        if (m_request_client.ptr() == disconnected_client.ptr())
-            m_request_client = nullptr;
+    s_navigator_compatibility_mode = mode;
+
+    // A script reads two strings to tell engines apart that no navigator attribute covers: the frames of an error's
+    // stack, and the source text of a built-in function. Both follow the engine the navigator claims.
+    auto& vm = Bindings::main_thread_vm();
+    if (mode == NavigatorCompatibilityMode::Chrome)
+        vm.set_source_text_syntaxes(JS::VM::StackFrameSyntax::Indented, JS::VM::NativeFunctionSourceSyntax::SingleLine);
+    else
+        vm.set_source_text_syntaxes(JS::VM::StackFrameSyntax::AtSign, JS::VM::NativeFunctionSourceSyntax::MultiLine);
+}
+
+void ResourceLoader::set_client(Optional<Utf16String> const& top_level_site, NonnullRefPtr<Requests::RequestClient> request_client)
+{
+    request_client->on_request_server_died = [this, top_level_site, disconnected_client = request_client->make_weak_ptr<Requests::RequestClient>()]() {
+        auto& client = ensure_client_for(top_level_site);
+        if (client.ptr() == disconnected_client.ptr())
+            client = nullptr;
     };
+    ensure_client_for(top_level_site) = move(request_client);
 }
 
-void ResourceLoader::prefetch_dns(URL::URL const& url, URL::URL const& source_url)
+RefPtr<Requests::RequestClient> ResourceLoader::request_client_for(Optional<HTTP::NetworkIsolationKey> const& network_isolation_key) const
+{
+    if (!network_isolation_key.has_value())
+        return m_request_client;
+    return request_client_for_top_level_site(network_isolation_key->top_level_site);
+}
+
+RefPtr<Requests::RequestClient> ResourceLoader::request_client_for_top_level_site(Optional<Utf16String> const& top_level_site) const
+{
+    if (top_level_site.has_value()) {
+        if (auto it = m_site_request_clients.find(*top_level_site); it != m_site_request_clients.end())
+            return it->value;
+    }
+    return m_request_client;
+}
+
+RefPtr<Requests::RequestClient>& ResourceLoader::ensure_client_for(Optional<Utf16String> const& top_level_site)
+{
+    if (!top_level_site.has_value())
+        return m_request_client;
+    return m_site_request_clients.ensure(*top_level_site);
+}
+
+Vector<Utf16String> ResourceLoader::top_level_sites() const
+{
+    Vector<Utf16String> top_level_sites;
+    for (auto const& entry : m_site_request_clients)
+        top_level_sites.append(entry.key);
+    return top_level_sites;
+}
+
+RefPtr<Requests::RequestClient> ResourceLoader::take_client_for_testing(Optional<Utf16String> const& top_level_site)
+{
+    return move(ensure_client_for(top_level_site));
+}
+
+// Speculation warms up the RequestServer that the document's requests go through.
+static Optional<HTTP::NetworkIsolationKey> speculative_network_isolation_key(GC::Ptr<DOM::Document> document)
+{
+    if (!document)
+        return {};
+    return Fetch::Infrastructure::determine_the_network_partition_key(document->relevant_settings_object());
+}
+
+void ResourceLoader::prefetch_dns(GC::Ptr<DOM::Document> document, URL::URL const& url, URL::URL const& source_url)
 {
     if (url.scheme().is_one_of("file"sv, "data"sv))
         return;
 
-    if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
-        dbgln("ResourceLoader: Refusing to prefetch DNS for '{}': \033[31;1mURL was filtered\033[0m", url);
-        return;
+    if (!document || document->content_blocking_enabled()) {
+        if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
+            dbgln("ResourceLoader: Refusing to prefetch DNS for '{}': \033[31;1mURL was filtered\033[0m", url);
+            return;
+        }
     }
 
+    // Speculation would resolve and connect without the proxy that the PAC file would have picked.
+    if (proxy_autoconfig_url().has_value())
+        return;
+
     // FIXME: We could put this request in a queue until the client connection is re-established.
-    if (m_request_client)
-        m_request_client->ensure_connection(url, RequestServer::CacheLevel::ResolveOnly);
+    if (auto request_client = request_client_for(speculative_network_isolation_key(document)))
+        request_client->ensure_connection(url, RequestServer::CacheLevel::ResolveOnly);
 }
 
-void ResourceLoader::preconnect(URL::URL const& url, URL::URL const& source_url)
+void ResourceLoader::preconnect(GC::Ptr<DOM::Document> document, URL::URL const& url, URL::URL const& source_url)
 {
     if (url.scheme().is_one_of("file"sv, "data"sv))
         return;
 
-    if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
-        dbgln("ResourceLoader: Refusing to pre-connect to '{}': \033[31;1mURL was filtered\033[0m", url);
-        return;
+    if (!document || document->content_blocking_enabled()) {
+        if (ContentBlocker::the().is_filtered(url, source_url, ContentBlocker::ResourceType::Other)) {
+            dbgln("ResourceLoader: Refusing to pre-connect to '{}': \033[31;1mURL was filtered\033[0m", url);
+            return;
+        }
     }
 
+    // Speculation would resolve and connect without the proxy that the PAC file would have picked.
+    if (proxy_autoconfig_url().has_value())
+        return;
+
     // FIXME: We could put this request in a queue until the client connection is re-established.
-    if (m_request_client)
-        m_request_client->ensure_connection(url, RequestServer::CacheLevel::CreateConnection);
+    if (auto request_client = request_client_for(speculative_network_isolation_key(document)))
+        request_client->ensure_connection(url, RequestServer::CacheLevel::CreateConnection);
 }
 
 static ByteString sanitized_url_for_logging(URL::URL const& url)
@@ -119,7 +207,7 @@ bool ResourceLoader::is_known_hsts_host(Page& page, String const& host)
     return page.client().page_did_is_known_hsts_host(host);
 }
 
-static NonnullRefPtr<HTTP::HeaderList> response_headers_for_file(StringView path, Optional<time_t> const& modified_time)
+static NonnullRefPtr<HTTP::HeaderList> response_headers_for_file(StringView path, size_t content_length, Optional<time_t> const& modified_time)
 {
     // For file:// and resource:// URLs, we have to guess the MIME type, since there's no HTTP header to tell us what
     // it is. We insert a fake Content-Type header here, so that clients can use it to learn the MIME type.
@@ -128,6 +216,7 @@ static NonnullRefPtr<HTTP::HeaderList> response_headers_for_file(StringView path
     auto response_headers = HTTP::HeaderList::create({
         { "Access-Control-Allow-Origin"sv, "null"sv },
         { "Content-Type"sv, mime_type },
+        { "Content-Length"sv, ByteString::number(content_length) },
     });
 
     if (modified_time.has_value()) {
@@ -162,10 +251,45 @@ static void log_failure(LoadRequest const& request, ErrorType const& error)
     dbgln("ResourceLoader: Failed load of: \"{}\", \033[31;1mError: {}\033[0m, Duration: {}ms", url_for_logging, error, load_time_ms);
 }
 
-static void log_filtered_request(LoadRequest const& request)
+// What kind of resource a blocked request was for, as the browser names it to the user.
+static StringView blocked_resource_kind(LoadRequest const& request)
 {
-    auto url_for_logging = sanitized_url_for_logging(*request.url());
-    dbgln("ResourceLoader: Filtered request to: \"{}\"", url_for_logging);
+    using Destination = Fetch::Infrastructure::Request::Destination;
+    if (!request.destination().has_value())
+        return "Request"sv;
+    switch (*request.destination()) {
+    case Destination::Script:
+    case Destination::AudioWorklet:
+    case Destination::PaintWorklet:
+    case Destination::ServiceWorker:
+    case Destination::SharedWorker:
+    case Destination::Worker:
+        return "Script"sv;
+    case Destination::Image:
+        return "Image"sv;
+    case Destination::Style:
+    case Destination::XSLT:
+        return "Stylesheet"sv;
+    case Destination::Font:
+        return "Font"sv;
+    case Destination::Audio:
+    case Destination::Track:
+    case Destination::Video:
+        return "Media"sv;
+    case Destination::Document:
+    case Destination::Embed:
+    case Destination::Frame:
+    case Destination::IFrame:
+    case Destination::Object:
+        return "Frame"sv;
+    case Destination::JSON:
+    case Destination::Manifest:
+    case Destination::Report:
+    case Destination::Text:
+    case Destination::WebIdentity:
+        return "Request"sv;
+    }
+    VERIFY_NOT_REACHED();
 }
 
 static bool should_block_request(LoadRequest const& request)
@@ -186,10 +310,13 @@ static bool should_block_request(LoadRequest const& request)
         return true;
     }
 
-    auto source_url = request.source_url().value_or(url);
-    if (ContentBlocker::the().is_filtered(url, source_url, request.destination(), request.initiator_type(), request.request_mode())) {
-        log_filtered_request(request);
-        return true;
+    if (auto page = request.page(); !page || page->content_blocking_enabled_for_url(request.top_level_creation_url())) {
+        auto source_url = request.source_url().value_or(url);
+        if (ContentBlocker::the().is_filtered(url, source_url, request.destination(), request.initiator_type(), request.request_mode())) {
+            if (page)
+                page->client().page_did_block_resource(url, blocked_resource_kind(request));
+            return true;
+        }
     }
 
     return false;
@@ -254,7 +381,7 @@ void ResourceLoader::handle_file_load_request(LoadRequest& request, FileHandler 
 
         FileLoadResult load_result {
             .data = maybe_data.value().bytes(),
-            .response_headers = response_headers_for_file(request.url()->file_path(), st_or_error.value().st_mtime),
+            .response_headers = response_headers_for_file(request.url()->file_path(), maybe_data.value().size(), st_or_error.value().st_mtime),
         };
         on_file(load_result);
     });
@@ -334,13 +461,13 @@ void ResourceLoader::handle_resource_load_request(LoadRequest const& request, Re
 
     FileLoadResult load_result {
         .data = resource_value->data(),
-        .response_headers = response_headers_for_file(url.file_path(), resource_value->modified_time()),
+        .response_headers = response_headers_for_file(url.file_path(), resource_value->data().size(), resource_value->modified_time()),
         .timing_info = timing_info,
     };
     on_resource(load_result);
 }
 
-RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<OnHeadersReceived> on_headers_received, GC::Root<OnDataReceived> on_data_received, GC::Root<OnCachedBodyAvailable> on_cached_body_available, GC::Root<OnComplete> on_complete, Requests::RequestClient::TransferLease transfer_lease)
+RefPtr<Fetch::Engine::NetworkTransportHandle> ResourceLoader::load(LoadRequest& request, GC::Root<OnHeadersReceived> on_headers_received, GC::Root<OnDataReceived> on_data_received, GC::Root<OnCachedBodyAvailable> on_cached_body_available, GC::Root<OnComplete> on_complete, Requests::RequestClient::TransferLease transfer_lease)
 {
     auto const& url = request.url().value();
 
@@ -357,7 +484,7 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
             request,
             [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete, request](ReadonlyBytes data, Requests::RequestTimingInfo const& timing_info, HTTP::HeaderList const& response_headers) {
                 log_success(request);
-                on_headers_received->function()(nullptr, response_headers, {}, {}, {}, {}, Requests::CameFromCache::No);
+                on_headers_received->function()(nullptr, response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(data));
                 on_complete->function()(true, timing_info, {});
             },
@@ -373,7 +500,7 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         handle_resource_load_request(
             request,
             [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](FileLoadResult const& load_result) {
-                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CameFromCache::No);
+                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(load_result.data));
                 on_complete->function()(true, load_result.timing_info, {});
             },
@@ -389,7 +516,7 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
             request,
             [request, on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete](FileLoadResult const& load_result) {
                 log_success(request);
-                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CameFromCache::No);
+                on_headers_received->function()(nullptr, load_result.response_headers, {}, {}, {}, {}, Requests::CacheState::NotCached);
                 on_data_received->function()(Requests::ResponseData::from_bytes(load_result.data));
                 on_complete->function()(true, load_result.timing_info, {});
             },
@@ -408,17 +535,28 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
         return nullptr;
     }
 
+    // We cannot evaluate PAC files yet, and connecting directly would ignore the proxy that was asked for.
+    if (proxy_autoconfig_url().has_value()) {
+        dbgln("FIXME: Evaluate the PAC file to find the proxy for {}; failing the request", url);
+        auto error = "PAC proxy configurations are not supported"sv;
+        log_failure(request, error);
+        on_complete->function()(false, {}, error);
+        return nullptr;
+    }
+
     auto protocol_request = start_network_request(request, transfer_lease);
     if (!protocol_request) {
         on_complete->function()(false, {}, "Failed to start network request"sv);
         return nullptr;
     }
 
-    auto protocol_headers_received = [on_headers_received = move(on_headers_received), request, &protocol_request = *protocol_request](auto const& response_headers, auto status_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto came_from_cache) {
-        if (auto page = request.page())
-            page->client().page_did_receive_network_response_headers(protocol_request.id(), status_code.value_or(0), reason_phrase, response_headers->headers(), came_from_cache);
+    auto network_transport = Fetch::Engine::NetworkTransportHandle::create(*protocol_request);
 
-        on_headers_received->function()(&protocol_request, response_headers, move(status_code), reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, came_from_cache);
+    auto protocol_headers_received = [on_headers_received = move(on_headers_received), request, &protocol_request = *protocol_request, network_transport](auto const& response_headers, auto status_code, auto const& reason_phrase, auto javascript_bytecode, auto javascript_bytecode_cache_vary_key, auto cache_state) {
+        if (auto page = request.page())
+            page->client().page_did_receive_network_response_headers(protocol_request.id(), status_code.value_or(0), reason_phrase, response_headers->headers(), cache_state);
+
+        on_headers_received->function()(network_transport.ptr(), response_headers, move(status_code), reason_phrase, move(javascript_bytecode), javascript_bytecode_cache_vary_key, cache_state);
     };
 
     auto protocol_data_received = [on_data_received = move(on_data_received), request, request_id = protocol_request->id()](auto data) {
@@ -453,13 +591,25 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
     protocol_request->set_stop_callback([this, &protocol_request = *protocol_request] {
         finish_network_request(protocol_request);
     });
-    return protocol_request;
+    return network_transport;
+}
+
+static NonnullRefPtr<HTTP::HeaderList const> headers_with_normalized_values(HTTP::HeaderList const& headers)
+{
+    if (all_of(headers, [](auto const& header) { return HTTP::is_header_value(header.value); }))
+        return headers;
+
+    auto normalized_headers = HTTP::HeaderList::create();
+    for (auto const& header : headers)
+        normalized_headers->append_with_normalized_name({ header.name, HTTP::normalize_header_value(header.value) });
+    return normalized_headers;
 }
 
 RefPtr<Requests::Request> ResourceLoader::start_network_request(LoadRequest const& request, Requests::RequestClient::TransferLease transfer_lease)
 {
     // FIXME: We could put this request in a queue until the client connection is re-established.
-    if (!m_request_client) {
+    auto request_client = request_client_for(request.network_isolation_key());
+    if (!request_client) {
         log_failure(request, "RequestServer is currently unavailable"sv);
         return nullptr;
     }
@@ -470,15 +620,12 @@ RefPtr<Requests::Request> ResourceLoader::start_network_request(LoadRequest cons
     // NB: Workers have a Page shim without a navigable or a browser page ID. Their
     //     requests are attributed through the worker process's browser-level owners.
     auto originating_page_id = request.page() && request.page()->has_top_level_traversable() ? request.page()->client().id().value() : 0;
-    auto protocol_request = m_request_client->start_request(request.method(), request.url().value(), request.headers(), request.body(), request.cache_mode(), request.include_credentials(), transfer_lease, {}, cache_miss_notification, originating_page_id);
+    auto headers = headers_with_normalized_values(request.headers());
+    auto protocol_request = request_client->start_request(request.method(), request.url().value(), *headers, request.body(), request.cache_mode(), request.include_credentials(), transfer_lease, {}, cache_miss_notification, originating_page_id, request.network_isolation_key());
     if (!protocol_request) {
         log_failure(request, "Failed to initiate load"sv);
         return nullptr;
     }
-
-    protocol_request->on_certificate_requested = []() -> Requests::Request::CertificateAndKey {
-        return {};
-    };
 
     if (auto page = request.page()) {
         Optional<String> initiator_type_string;

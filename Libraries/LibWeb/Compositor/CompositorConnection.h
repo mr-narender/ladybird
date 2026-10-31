@@ -16,6 +16,7 @@
 #include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/ScrollState.h>
 #include <LibCompositing/Types.h>
 #include <LibCompositing/WebGL/Types.h>
@@ -26,12 +27,15 @@
 #include <LibGfx/Size.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibMedia/Forward.h>
+#include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/Export.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Page/PageId.h>
 
 namespace Web::Compositor {
+
+class CompositorConnectionFrameSink;
 
 class WEB_API CompositorConnection final
     : public IPC::ConnectionToServer<CompositorWebContentClientEndpoint, CompositorWebContentServerEndpoint>
@@ -40,41 +44,46 @@ class WEB_API CompositorConnection final
 
 public:
     explicit CompositorConnection(NonnullOwnPtr<IPC::Transport>);
+    virtual ~CompositorConnection() override;
 
     void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>);
     void stop_presenting_to_client(Web::CompositorContextId);
     void destroy_context(Web::CompositorContextId);
-    void update_display_list(Web::CompositorContextId, NonnullRefPtr<Compositing::DisplayList> const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayListResourceTransaction, Compositing::ScrollStateSnapshot const&);
-    void update_visual_context_tree(Web::CompositorContextId, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayListResourceTransaction);
-    void update_scroll_state(Web::CompositorContextId, Compositing::ScrollStateSnapshot const&, Compositing::KeyboardScrollState const&);
-    void add_video_sink(Media::VideoSinkHandle);
+    // Has the Paint thread present frames through this connection from now on.
+    void hand_frame_sink_to_paint_thread();
+    void add_video_sink(Media::VideoSinkHandle, NonnullRefPtr<Compositing::VideoFramePresentationPage>);
     void remove_video_sink(Media::VideoSinkHandle);
+    void release_video_frame_hold(Media::VideoSinkHandle, u64 generation);
     void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
-    Optional<Compositing::CanvasId> create_canvas_2d_context(Gfx::IntSize, bool alpha);
+    Optional<Compositing::CanvasId> create_canvas_2d_context(Gfx::IntSize, bool alpha, bool will_read_frequently, Gfx::ColorSpace const&);
     void update_canvas_2d_stream(Compositing::Canvas2DCommandStream&);
     void destroy_canvas_context(Compositing::CanvasId);
-    Gfx::ShareableBitmap get_canvas_pixels(Compositing::CanvasId, Gfx::IntRect);
+    Gfx::ShareableBitmap get_canvas_pixels(Compositing::CanvasId, Gfx::IntRect, Gfx::AlphaType = Gfx::AlphaType::Premultiplied, Gfx::ColorSpace const& = {});
     Optional<Web::Compositor::PlaceholderCanvasLink> allocate_placeholder_canvas();
     void release_placeholder_canvas(Compositing::CanvasId);
     void commit_placeholder_canvas(Web::Compositor::PlaceholderCanvasLink, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize, bool origin_clean);
     Web::Compositor::PlaceholderCanvasPixels get_placeholder_canvas_pixels(Compositing::CanvasId, Gfx::IntRect);
+    bool rasterize_display_list(Compositing::DisplayList const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayListResourceTransaction, NonnullRefPtr<Gfx::Bitmap> target);
     void invalidate_wheel_event_listener_state(Web::CompositorContextId, u64 generation);
     void invalidate_keyboard_scroll_state(Web::CompositorContextId, u64 generation);
-    Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking);
-    Compositing::AsyncScrollEnqueueResult smooth_scroll_to(Web::CompositorContextId, Web::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind, Compositing::SmoothScrollInitiator);
-    void cancel_smooth_scroll(Web::CompositorContextId, Web::AsyncScrollNodeStableID);
+    Compositing::AsyncScrollEnqueueResult async_scroll_by(Web::CompositorContextId, Web::UniqueNodeID document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta, Gfx::IntRect viewport_rect, Web::WheelDeltaPrecision, Web::ScrollGesturePhase, u32 modifiers, Compositing::AsyncScrollOperationTracking, Compositing::WheelStepDispatch, u64 input_event_id);
+    String scroll_state_for_testing(Web::CompositorContextId, Web::AsyncScrollNodeStableID stretched_scroller);
+    void synchronize_for_testing();
+    Optional<Compositing::FirstWheelStepRouteForTesting> route_first_wheel_step_for_testing(Web::CompositorContextId, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels);
+    void begin_input_trace_for_testing(Web::CompositorContextId);
+    void clear_per_test_input_state_for_testing(Web::CompositorContextId);
+    Vector<Web::InputTraceRecord> take_input_trace_for_testing(Web::CompositorContextId);
     Compositing::PendingAsyncScrollUpdates take_pending_async_scroll_updates(Web::CompositorContextId, Compositing::AsyncScrollUpdateFreshness);
-    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, Compositing::WindowResizingInProgress);
+    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
     bool request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
     void hurry_rendering_opportunity(Web::CompositorContextId);
-    void present_frame(Web::CompositorContextId, Gfx::IntRect viewport_rect);
-    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&&);
+    void request_screenshot(Web::CompositorContextId, NonnullRefPtr<Gfx::Bitmap>, Function<void()>&&);
 
     Optional<Compositing::CanvasId> create_webgl_context(Compositing::WebGL::WebGLVersion, Gfx::IntSize, bool depth, bool stencil, bool antialias, Vector<String>& out_supported_extensions);
     void set_webgl_command_buffer(Compositing::CanvasId, Core::AnonymousBuffer const&);
-    void send_webgl_commands_from_shared_buffer(Compositing::CanvasId, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Gfx::DecodedImageFrame> const& bitmaps);
+    void send_webgl_commands_from_shared_buffer(Compositing::CanvasId, u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Compositing::WebGL::ImageSourceFrame> const& frames);
     bool drain_webgl_command_buffer(Compositing::CanvasId);
-    void send_webgl_commands(Compositing::CanvasId, ByteBuffer const&, Vector<Gfx::DecodedImageFrame> const& bitmaps);
+    void send_webgl_commands(Compositing::CanvasId, ReadonlyBytes, Vector<Compositing::WebGL::ImageSourceFrame> const& frames);
     void present_webgl_canvas(Compositing::CanvasId, bool preserve_drawing_buffer);
     void clear_webgl_drawing_buffer(Compositing::CanvasId);
     ByteBuffer webgl_sync_call(Compositing::CanvasId, ByteBuffer request);
@@ -82,13 +91,18 @@ public:
     bool read_webgl_buffer_sub_data(Compositing::CanvasId, Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer const& data);
 
     void ensure_video_presentation_channel();
+    // Takes up the render clock channel the Browser made between this process and the Compositor, which delivers
+    // display ticks over it from then on.
+    void attach_render_clock(IPC::TransportHandle);
     Function<void(Web::PageId page_id, Web::MouseEvent)> on_mouse_event;
     Function<void(Web::PageId page_id, Web::KeyEvent)> on_key_event;
+    Function<void(Web::PageId page_id, Web::PinchEvent)> on_pinch_event;
     Function<void()> on_compositor_lost;
+    // Asks the Browser to connect this process's media server to the Compositor.
+    Function<void()> on_request_video_presentation_channel;
 
 private:
     struct PendingScreenshot {
-        NonnullRefPtr<Gfx::PaintingSurface> target_surface;
         NonnullRefPtr<Gfx::Bitmap> target_bitmap;
 
         Function<void()> callback;
@@ -98,6 +112,7 @@ private:
 
     virtual void mouse_event(u64 page_id, Web::MouseEvent) override;
     virtual void key_event(u64 page_id, Web::KeyEvent) override;
+    virtual void pinch_event(u64 page_id, Web::PinchEvent) override;
     virtual void request_rendering_update() override;
     virtual void rendering_opportunity(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) override;
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates) override;
@@ -105,11 +120,17 @@ private:
     virtual void did_fail_screenshot(Compositing::ScreenshotRequestId) override;
     virtual void did_lose_compositor() override;
     virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) override;
+    virtual void overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility>) override;
 
     bool can_send_message_to_compositor() const;
     void merge_async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates);
-    bool post_resource_additions_in_batches(Web::CompositorContextId, Compositing::DisplayListResourceTransaction&);
     Optional<PendingScreenshot> take_screenshot(Compositing::ScreenshotRequestId);
+
+    NonnullRefPtr<CompositorConnectionFrameSink> m_frame_sink;
+    u64 m_next_reserved_canvas_id { 0 };
+    u64 m_reserved_canvas_ids_remaining { 0 };
+    // The compositor holds exactly the fonts of the latest canvas 2D stream batch.
+    HashTable<Compositing::FontResourceId> m_canvas_font_ids_held_by_compositor;
 
     HashMap<Compositing::ScreenshotRequestId, PendingScreenshot> m_screenshots;
     // What the compositor process scrolled since the last rendering update adopted it, per context.

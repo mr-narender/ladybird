@@ -4,21 +4,27 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
 #include <AK/IDAllocator.h>
 #include <AK/Math.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/WeakPtr.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Socket.h>
-#include <LibCore/System.h>
 #include <LibHTTP/Cache/DiskCache.h>
+#include <LibHTTP/Header.h>
+#include <LibHTTP/Method.h>
+#include <LibHTTP/Port.h>
+#include <LibIPC/Limits.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/WebSocket.h>
 #include <LibURL/Parser.h>
+#include <LibURL/Site.h>
 #include <LibWebSocket/ConnectionInfo.h>
 #include <LibWebSocket/Message.h>
 #include <RequestServer/AIA.h>
+#include <RequestServer/AlternativeServices.h>
 #include <RequestServer/CURL.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/ControlConnectionFromClient.h>
@@ -29,6 +35,10 @@
 namespace RequestServer {
 
 static IDAllocator s_client_ids;
+static size_t s_private_connection_count { 0 };
+
+static constexpr size_t max_websockets_per_client = 256;
+static constexpr size_t max_websockets = 1024;
 
 static constexpr i64 TICK_GAP_THRESHOLD_MS = 100;
 static Optional<MonotonicTime> s_last_tick_at;
@@ -83,17 +93,18 @@ static auto time_curl_call(StringView label, F&& f)
 static constexpr i64 BURST_WINDOW_MS = 100;
 static constexpr u64 BURST_REPORT_THRESHOLD = 5;
 
-ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, ConnectionMap& connections, RequestTransferLeaseMap& request_transfer_leases, Optional<HTTP::DiskCache&> disk_cache, ByteString alt_svc_cache_path)
+ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, SiteBinding site_binding, ConnectionMap& connections, RequestTransferLeaseMap& request_transfer_leases, Optional<HTTP::DiskCache&> disk_cache)
     : IPC::ConnectionFromClient<RequestClientEndpoint, RequestServerEndpoint>(*this, move(transport), s_client_ids.allocate())
     , m_is_private(is_private)
+    , m_site_binding(site_binding)
     , m_connections(connections)
     , m_request_transfer_leases(request_transfer_leases)
     , m_disk_cache(disk_cache)
     , m_curl_multi(curl_multi_init())
-    , m_resolver(Resolver::default_resolver())
+    , m_resolver(is_private == IsPrivate::Yes ? Resolver::private_resolver() : Resolver::default_resolver())
 {
-    if (m_is_private == IsPrivate::No)
-        m_alt_svc_cache_path = move(alt_svc_cache_path);
+    if (m_is_private == IsPrivate::Yes)
+        ++s_private_connection_count;
 
     m_connections.set(client_id(), *this);
 
@@ -109,11 +120,10 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
     // https://curl.se/libcurl/c/CURLMOPT_TIMERFUNCTION.html
     // Your callback function timer_callback should install a single non-repeating timer with an expire time of
     // timeout_ms milliseconds.
-    m_timer = Core::Timer::create_single_shot(0, [this] {
+    m_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this] {
         auto now = MonotonicTime::now();
         if (m_curl_timer_due_at.has_value() && now < *m_curl_timer_due_at) {
-            auto remaining_ms = (*m_curl_timer_due_at - now).to_milliseconds();
-            m_timer->restart(AK::clamp_to<int>(remaining_ms));
+            m_timer->restart(*m_curl_timer_due_at - now);
             return;
         }
 
@@ -133,19 +143,15 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
 
 ConnectionFromClient::~ConnectionFromClient()
 {
-    m_active_requests.clear();
-    m_active_revalidation_requests.clear();
-    m_pending_websockets.clear();
-    m_websockets.clear();
-
-    for (auto& fetch : m_aia_fetches) {
-        curl_multi_remove_handle(m_curl_multi, fetch.key);
-        curl_easy_cleanup(fetch.key);
-    }
-    m_aia_fetches.clear();
+    cancel_owned_work();
 
     curl_multi_cleanup(m_curl_multi);
     m_curl_multi = nullptr;
+
+    if (m_is_private == IsPrivate::Yes && --s_private_connection_count == 0) {
+        clear_aia_state(IsPrivate::Yes);
+        AlternativeServiceCache::the().clear(IsPrivate::Yes);
+    }
 
     if (auto connection = ControlConnectionFromClient::the(); connection.has_value())
         connection->async_client_disconnected(client_id());
@@ -168,6 +174,25 @@ void ConnectionFromClient::request_complete(Badge<Request>, Request const& reque
     });
 }
 
+// Transferred requests may still need our curl multi handle.
+void ConnectionFromClient::cancel_owned_work()
+{
+    m_active_requests.clear();
+    m_active_revalidation_requests.clear();
+    m_pending_websockets.clear();
+    m_websocket_cookie_requests.clear();
+    m_websockets.clear();
+
+    for (auto& fetch : m_aia_fetches) {
+        curl_multi_remove_handle(m_curl_multi, fetch.key);
+        curl_easy_cleanup(fetch.key);
+        if (fetch.value->resolve_list)
+            curl_slist_free_all(fetch.value->resolve_list);
+    }
+    m_aia_fetches.clear();
+    m_pending_aia_lookups.clear();
+}
+
 void ConnectionFromClient::die()
 {
     Vector<Requests::RequestTransferLeaseKey> transfer_leases_to_cancel;
@@ -181,26 +206,84 @@ void ConnectionFromClient::die()
             m_active_requests.remove(lease->request_id);
     }
 
+    // Transferred requests can keep this object alive after the client disconnects.
+    cancel_owned_work();
+
     m_connections.remove(client_id());
 
     if (m_connections.is_empty() && !ControlConnectionFromClient::the().has_value())
         Core::EventLoop::current().quit(0);
 }
 
-Messages::RequestServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
+void ConnectionFromClient::bind_to_site(Badge<ControlConnectionFromClient>, Utf16String const& top_level_site, Optional<Utf16String> const& frame_site)
 {
-#ifdef AK_OS_WINDOWS
-    m_transport->set_peer_pid(peer_pid);
-    return Core::System::getpid();
-#else
-    did_misbehave("Unexpected RequestServer transport initialization");
-    return 0;
-#endif
+    m_bound_top_level_sites.set(top_level_site);
+    if (frame_site.has_value())
+        m_bound_sites.set({ top_level_site, *frame_site });
+}
+
+// A bound client may use only the network isolation keys of the documents that the UI process has its process host, so a
+// compromised process cannot reach the cache entries of another site.
+bool ConnectionFromClient::may_use_network_isolation_key(HTTP::NetworkIsolationKey const& key, URL::URL const* request_url) const
+{
+    if (m_site_binding == SiteBinding::Unrestricted)
+        return true;
+
+    // A site's RequestServer makes no requests under any other top-level site.
+    if (auto const& site = process_top_level_site(); site.has_value() && key.top_level_site != *site)
+        return false;
+
+    // FIXME: The process of the document that starts a navigation makes the navigation's requests, not the process that
+    //        will host the new document. Until the UI process makes navigation requests itself, a client may make a
+    //        request whose key is that of a navigation to the request's URL. Such keys only reach the partitions of
+    //        navigations, never the one a site's own documents use for their subresources.
+    if (request_url) {
+        auto url_site = URL::Site::serialize_for_partitioning(request_url->origin());
+        if (url_site.has_value() && key.frame_site == url_site) {
+            if (!key.is_subframe_document && key.is_cross_site_main_frame_navigation && key.top_level_site == *url_site)
+                return true;
+            if (key.is_subframe_document && m_bound_top_level_sites.contains(key.top_level_site))
+                return true;
+        }
+    }
+
+    if (!key.frame_site.has_value())
+        return m_bound_top_level_sites.contains(key.top_level_site);
+    return m_bound_sites.contains(BoundSite { key.top_level_site, *key.frame_site });
+}
+
+static bool is_supported_protocol_name(StringView protocol)
+{
+    return protocol.is_one_of("http"sv, "https"sv);
+}
+
+static bool is_fetchable_url(URL::URL const& url)
+{
+    if (!is_supported_protocol_name(url.scheme()))
+        return false;
+
+    // https://fetch.spec.whatwg.org/#block-bad-port
+    // 2. If url’s scheme is an HTTP(S) scheme and url’s port is a bad port, then return blocked.
+    return !url.port().has_value() || !HTTP::is_bad_port(*url.port());
+}
+
+// IPC does not validate enum values; the cache requires a known associated-data kind.
+static bool is_valid_associated_data(HTTP::CacheEntryAssociatedData associated_data)
+{
+    return HTTP::CACHE_ENTRY_ASSOCIATED_DATA_TYPES.contains_slow(associated_data);
+}
+
+// Headers go verbatim on the wire; newlines would allow request injection.
+static bool are_valid_headers(Vector<HTTP::Header> const& headers)
+{
+    return all_of(headers, [](auto const& header) {
+        return HTTP::is_header_name(header.name) && HTTP::is_header_value(header.value);
+    });
 }
 
 Messages::RequestServer::IsSupportedProtocolResponse ConnectionFromClient::is_supported_protocol(ByteString protocol)
 {
-    return protocol == "http"sv || protocol == "https"sv;
+    return is_supported_protocol_name(protocol);
 }
 
 Messages::RequestServer::GetClientIdResponse ConnectionFromClient::get_client_id()
@@ -208,14 +291,43 @@ Messages::RequestServer::GetClientIdResponse ConnectionFromClient::get_client_id
     return client_id();
 }
 
-void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL::URL url, Vector<HTTP::Header> request_headers, ByteBuffer request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, i32 originating_process_id, u64 originating_page_id)
+// Transfer leases outlive request-map entries during handoff.
+bool ConnectionFromClient::is_live_request_id(u64 request_id) const
+{
+    return m_active_requests.contains(request_id) || m_request_transfer_leases.contains({ client_id(), request_id });
+}
+
+void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL::URL url, Vector<HTTP::Header> request_headers, ByteBuffer request_body, HTTP::CacheMode cache_mode, Optional<HTTP::NetworkIsolationKey> network_isolation_key, HTTP::Cookie::IncludeCredentials include_credentials, bool create_transfer_lease, Optional<u32> address_selection_hint, bool notify_on_cache_miss, i32 originating_process_id, u64 originating_page_id)
 {
     note_event_tick("ipc-start-request"sv);
     dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: start_request({}, {})", request_id, url);
 
-    Requests::RequestTransferLeaseKey lease_key { client_id(), request_id };
-    if (m_active_requests.contains(request_id) || m_request_transfer_leases.contains(lease_key)) {
+    if (is_live_request_id(request_id)) {
         did_misbehave("reused live request ID");
+        return;
+    }
+
+    // https://fetch.spec.whatwg.org/#dom-request
+    // 25.2. If method is not a method or method is a forbidden method, then throw a TypeError.
+    if (!HTTP::is_method(method) || HTTP::is_forbidden_method(method)) {
+        did_misbehave("invalid or forbidden request method");
+        return;
+    }
+
+    if (!are_valid_headers(request_headers)) {
+        did_misbehave("invalid request header");
+        return;
+    }
+
+    // Validate again at the boundary that grants network access.
+    if (!is_fetchable_url(url)) {
+        async_request_finished(request_id, 0, {}, Requests::NetworkError::MalformedUrl);
+        return;
+    }
+
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key, &url)) {
+        dbgln("RequestServer: Client {} is not bound to the network isolation key of its request for {}", client_id(), url);
+        async_request_finished(request_id, 0, {}, Requests::NetworkError::Unknown);
         return;
     }
 
@@ -233,10 +345,11 @@ void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL:
         }
     }
 
+    Requests::RequestTransferLeaseKey lease_key { client_id(), request_id };
     auto transfer_lease = create_transfer_lease
         ? Optional<Requests::RequestTransferLeaseKey> { lease_key }
         : Optional<Requests::RequestTransferLeaseKey> {};
-    auto request = Request::fetch(request_id, m_disk_cache, cache_mode, *this, m_curl_multi, m_resolver, move(url), move(method), HTTP::HeaderList::create(move(request_headers)), move(request_body), include_credentials, m_alt_svc_cache_path, transfer_lease, address_selection_hint, notify_on_cache_miss);
+    auto request = Request::fetch(request_id, m_disk_cache, move(network_isolation_key), cache_mode, *this, m_curl_multi, m_resolver, move(url), move(method), HTTP::HeaderList::create(move(request_headers)), move(request_body), include_credentials, transfer_lease, address_selection_hint, notify_on_cache_miss);
     request->set_performance_origin(originating_process_id, originating_page_id);
     m_active_requests.set(request_id, move(request));
 
@@ -246,6 +359,11 @@ void ConnectionFromClient::start_request(u64 request_id, ByteString method, URL:
 
 void ConnectionFromClient::adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease)
 {
+    if (is_live_request_id(target_request_id)) {
+        did_misbehave("reused live request ID");
+        return;
+    }
+
     auto lease_key = Requests::RequestTransferLeaseKey { source_client_id, source_request_id };
     auto transfer_lease = m_request_transfer_leases.get(lease_key);
     if (!transfer_lease.has_value()) {
@@ -318,14 +436,14 @@ void ConnectionFromClient::release_request_transfer_lease(int source_client_id, 
     }
 }
 
-void ConnectionFromClient::start_revalidation_request(Badge<Request>, ByteString method, URL::URL url, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials include_credentials)
+void ConnectionFromClient::start_revalidation_request(Badge<Request>, HTTP::NetworkIsolationKey network_isolation_key, ByteString method, URL::URL url, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials include_credentials)
 {
     note_event_tick("ipc-start-revalidation"sv);
     auto request_id = m_next_revalidation_request_id++;
 
     dbgln_if(REQUESTSERVER_DEBUG, "RequestServer: start_revalidation_request({}, {})", request_id, url);
 
-    auto request = Request::revalidate(request_id, m_disk_cache, *this, m_curl_multi, m_resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, m_alt_svc_cache_path);
+    auto request = Request::revalidate(request_id, m_disk_cache, move(network_isolation_key), *this, m_curl_multi, m_resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials);
     m_active_revalidation_requests.set(request_id, move(request));
 }
 
@@ -395,10 +513,7 @@ int ConnectionFromClient::on_timeout_callback(void*, long timeout_ms, void* user
         // WARNING: do not call libcurl directly from within the callback itself when the timeout_ms value is zero, since
         // it risks triggering an unpleasant recursive behavior that immediately calls another call to the callback with
         // a zero timeout...
-        //
-        // Core::Timer intervals are ints, so wait for longer valid timeouts in chunks without calling libcurl before its
-        // requested expire time.
-        client->m_timer->restart(AK::clamp_to<int>(timeout_ms));
+        client->m_timer->restart(AK::Duration::from_milliseconds(timeout_ms));
     }
 
     // The timer callback should return 0 on success, and -1 on error.
@@ -484,6 +599,13 @@ void ConnectionFromClient::fetch_aia_intermediate(Badge<Request>, ByteString con
     auto fetch_url = parsed->serialize().to_byte_string();
     auto weak_self = make_weak_ptr<ConnectionFromClient>();
 
+    // Avoid leaking hostnames resolved by the proxy.
+    auto proxy = proxy_configuration().proxy_for(*parsed).copy();
+    if (proxy.has_value() && proxy->resolves_hostnames()) {
+        start_aia_fetch(url, fetch_url, move(proxy), {});
+        return;
+    }
+
     // Resolve through RequestServer's own resolver rather than letting curl do it, so the AIA fetch honors the
     // same DNS configuration (DoH included) as every other request this process makes.
     m_resolver->dns.lookup(host, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA }, { .validate_dnssec_locally = DNSInfo::the().validate_dnssec_locally })
@@ -493,7 +615,7 @@ void ConnectionFromClient::fetch_aia_intermediate(Badge<Request>, ByteString con
                 self->abandon_aia_lookup(url);
             }
         })
-        .when_resolved([weak_self, url, fetch_url, host, port](auto const& dns_result) {
+        .when_resolved([weak_self, url, fetch_url, host, port, proxy = move(proxy)](auto const& dns_result) mutable {
             auto self = weak_self.strong_ref();
             if (!self)
                 return;
@@ -502,7 +624,7 @@ void ConnectionFromClient::fetch_aia_intermediate(Badge<Request>, ByteString con
                 self->abandon_aia_lookup(url);
                 return;
             }
-            self->start_aia_fetch(url, fetch_url, build_curl_resolve_list(*dns_result, host, port));
+            self->start_aia_fetch(url, fetch_url, move(proxy), build_curl_resolve_list(*dns_result, host, port));
         });
 }
 
@@ -518,7 +640,7 @@ void ConnectionFromClient::abandon_aia_lookup(ByteString const& url)
     }
 }
 
-void ConnectionFromClient::start_aia_fetch(ByteString const& url, ByteString const& fetch_url, ByteString resolve_entry)
+void ConnectionFromClient::start_aia_fetch(ByteString const& url, ByteString const& fetch_url, Optional<HTTP::Proxy> proxy, Optional<ByteString> resolve_entry)
 {
     auto waiting = m_pending_aia_lookups.take(url);
     if (!waiting.has_value() || waiting->is_empty())
@@ -544,18 +666,20 @@ void ConnectionFromClient::start_aia_fetch(ByteString const& url, ByteString con
     set_option(CURLOPT_PRIVATE, reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(fetch.ptr()) | aia_fetch_private_tag));
     set_option(CURLOPT_URL, fetch_url.characters());
     set_option(CURLOPT_PROTOCOLS_STR, "http");
-    set_option(CURLOPT_REDIR_PROTOCOLS_STR, "http");
-    set_option(CURLOPT_FOLLOWLOCATION, 1L);
-    set_option(CURLOPT_MAXREDIRS, 5L);
+    // curl would resolve a redirect's host itself, bypassing our resolver.
+    set_option(CURLOPT_FOLLOWLOCATION, 0L);
     set_option(CURLOPT_TIMEOUT, 10L);
     set_option(CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(max_aia_response_size));
     set_option(CURLOPT_NOSIGNAL, 1L);
     set_option(CURLOPT_WRITEFUNCTION, aia_write_body);
     set_option(CURLOPT_WRITEDATA, fetch.ptr());
+    set_option(CURLOPT_PROXY, proxy.has_value() ? proxy->to_curl_url().characters() : "");
 
-    if (curl_slist* resolve_list = curl_slist_append(nullptr, resolve_entry.characters())) {
-        set_option(CURLOPT_RESOLVE, resolve_list);
-        fetch->resolve_list = resolve_list;
+    if (resolve_entry.has_value()) {
+        if (curl_slist* resolve_list = curl_slist_append(nullptr, resolve_entry->characters())) {
+            set_option(CURLOPT_RESOLVE, resolve_list);
+            fetch->resolve_list = resolve_list;
+        }
     }
 
     auto result = curl_multi_add_handle(m_curl_multi, easy_handle);
@@ -580,12 +704,20 @@ void ConnectionFromClient::complete_aia_fetch(void* easy_handle, int result_code
         curl_slist_free_all((*fetch)->resolve_list);
 
     bool added = false;
-    if (result_code == CURLE_OK && response_code == 200)
-        added = add_fetched_aia_intermediate((*fetch)->body.bytes());
+    if (result_code == CURLE_OK && response_code == 200) {
+        Vector<NonnullRefPtr<AIACollector>> collectors;
+        for (auto request_id : (*fetch)->request_ids) {
+            if (auto request = m_active_requests.get(request_id); request.has_value()) {
+                if (auto* collector = (*request)->aia_collector())
+                    collectors.append(*collector);
+            }
+        }
+        added = add_fetched_aia_intermediates((*fetch)->body.bytes(), collectors);
+    }
 
     if (!added) {
         dbgln_if(REQUESTSERVER_DEBUG, "AIA: intermediate fetch from {} failed (curl={}, status={})", (*fetch)->url, result_code, response_code);
-        mark_aia_url_failed((*fetch)->url);
+        mark_aia_url_failed(m_is_private, (*fetch)->url);
     }
 
     for (auto request_id : (*fetch)->request_ids) {
@@ -615,37 +747,131 @@ Messages::RequestServer::StopRequestResponse ConnectionFromClient::stop_request(
     return true;
 }
 
-Messages::RequestServer::SetCertificateResponse ConnectionFromClient::set_certificate(u64, ByteString, ByteString)
+Messages::RequestServer::ExportRequestResponse ConnectionFromClient::export_request(u64 request_id)
 {
-    return false;
+    if (m_site_binding != SiteBinding::Unrestricted) {
+        did_misbehave("export of a request by a bound client");
+        return Optional<Requests::ExportedRequest> {};
+    }
+
+    auto request = m_active_requests.get(request_id);
+    if (!request.has_value())
+        return Optional<Requests::ExportedRequest> {};
+
+    auto transfer_lease = (*request)->transfer_lease();
+    auto exported = (*request)->export_response();
+    if (exported.is_error()) {
+        dbgln("RequestServer: Failed to export request {}: {}", request_id, exported.error());
+        return Optional<Requests::ExportedRequest> {};
+    }
+
+    if (transfer_lease.has_value())
+        m_request_transfer_leases.remove(*transfer_lease);
+
+    // A finished transfer has nothing left to do here once its outcome is on its way.
+    if ((*request)->is_complete()) {
+        Core::deferred_invoke([weak_self = make_weak_ptr<ConnectionFromClient>(), request_id] {
+            if (auto self = weak_self.strong_ref())
+                self->m_active_requests.remove(request_id);
+        });
+    }
+
+    return exported.release_value();
+}
+
+void ConnectionFromClient::import_request(u64 request_id, Requests::ExportedRequest exported_request, bool create_transfer_lease)
+{
+    if (m_site_binding != SiteBinding::Unrestricted) {
+        did_misbehave("import of a request by a bound client");
+        return;
+    }
+    if (is_live_request_id(request_id)) {
+        did_misbehave("reused live request ID");
+        return;
+    }
+
+    Optional<Requests::RequestTransferLeaseKey> transfer_lease;
+    if (create_transfer_lease) {
+        transfer_lease = Requests::RequestTransferLeaseKey { client_id(), request_id };
+        m_request_transfer_leases.set(*transfer_lease, RequestTransferLease { *this, request_id });
+    }
+
+    auto request = Request::import(request_id, m_disk_cache, *this, m_resolver, move(exported_request), transfer_lease);
+    m_active_requests.set(request_id, move(request));
 }
 
 void ConnectionFromClient::ensure_connection(u64 request_id, URL::URL url, ::RequestServer::CacheLevel cache_level)
 {
+    if (is_live_request_id(request_id)) {
+        did_misbehave("reused live request ID");
+        return;
+    }
+
+    if (!is_fetchable_url(url))
+        return;
+
     auto request = Request::connect(request_id, *this, m_curl_multi, m_resolver, move(url), cache_level);
     m_active_requests.set(request_id, move(request));
 }
 
-Messages::RequestServer::StoreCacheAssociatedDataResponse ConnectionFromClient::store_cache_associated_data(URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, Core::AnonymousBuffer data)
+// The partition of this RequestServer's disk cache that a key reaches, if any.
+static Optional<Utf16String> disk_cache_partition_for(Optional<HTTP::NetworkIsolationKey> const& network_isolation_key)
 {
-    if (!m_disk_cache.has_value() || !data.is_valid())
-        return false;
-
-    auto result = m_disk_cache->store_associated_data(url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data, data.bytes());
-    if (result.is_error()) {
-        dbgln("Failed to store cache associated data for {}: {}", url, result.error());
-        return false;
-    }
-
-    return result.value();
+    if (!network_isolation_key.has_value() || !process_keeps_responses_under(network_isolation_key->top_level_site))
+        return {};
+    return network_isolation_key->disk_cache_partition();
 }
 
-Messages::RequestServer::RetrieveCacheAssociatedDataResponse ConnectionFromClient::retrieve_cache_associated_data(URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data)
+Messages::RequestServer::StoreCacheAssociatedDataResponse ConnectionFromClient::store_cache_associated_data(Optional<HTTP::NetworkIsolationKey> network_isolation_key, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data, Core::AnonymousBuffer data)
 {
-    if (!m_disk_cache.has_value())
+    if (!is_valid_associated_data(associated_data)) {
+        did_misbehave("invalid cache associated data kind");
+        return { Optional<IPC::File> {}, 0 };
+    }
+
+    if (!are_valid_headers(request_headers)) {
+        did_misbehave("invalid request header");
+        return { Optional<IPC::File> {}, 0 };
+    }
+
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key))
+        return { Optional<IPC::File> {}, 0 };
+
+    auto partition = disk_cache_partition_for(network_isolation_key);
+    if (!m_disk_cache.has_value() || !partition.has_value() || !data.is_valid())
+        return { Optional<IPC::File> {}, 0 };
+
+    auto result = m_disk_cache->store_associated_data(*partition, url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data, data.bytes());
+    if (result.is_error()) {
+        dbgln("Failed to store cache associated data for {}: {}", url, result.error());
+        return { Optional<IPC::File> {}, 0 };
+    }
+
+    if (!result.value().has_value())
+        return { Optional<IPC::File> {}, 0 };
+    return { IPC::File::adopt_fd(result.value()->fd), result.value()->size };
+}
+
+Messages::RequestServer::RetrieveCacheAssociatedDataResponse ConnectionFromClient::retrieve_cache_associated_data(Optional<HTTP::NetworkIsolationKey> network_isolation_key, URL::URL url, ByteString method, Vector<HTTP::Header> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData associated_data)
+{
+    if (!is_valid_associated_data(associated_data)) {
+        did_misbehave("invalid cache associated data kind");
+        return Optional<Core::AnonymousBuffer> {};
+    }
+
+    if (!are_valid_headers(request_headers)) {
+        did_misbehave("invalid request header");
+        return Optional<Core::AnonymousBuffer> {};
+    }
+
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key))
         return Optional<Core::AnonymousBuffer> {};
 
-    auto data = m_disk_cache->retrieve_associated_data(url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data);
+    auto partition = disk_cache_partition_for(network_isolation_key);
+    if (!m_disk_cache.has_value() || !partition.has_value())
+        return Optional<Core::AnonymousBuffer> {};
+
+    auto data = m_disk_cache->retrieve_associated_data(*partition, url, method, *HTTP::HeaderList::create(move(request_headers)), vary_key, associated_data);
     if (data.is_error()) {
         dbgln("Failed to retrieve cache associated data for {}: {}", url, data.error());
         return Optional<Core::AnonymousBuffer> {};
@@ -663,21 +889,57 @@ Messages::RequestServer::RetrieveCacheAssociatedDataResponse ConnectionFromClien
     return Optional<Core::AnonymousBuffer> { buffer.release_value() };
 }
 
-Messages::RequestServer::CreateSyntheticCacheEntryResponse ConnectionFromClient::create_synthetic_cache_entry(URL::URL url, ByteString method)
+size_t ConnectionFromClient::websocket_count() const
 {
-    if (!m_disk_cache.has_value())
-        return false;
-
-    auto result = m_disk_cache->create_synthetic_entry(url, method);
-    if (result.is_error()) {
-        dbgln("Failed to create synthetic cache entry for {}: {}", url, result.error());
-        return false;
-    }
-    return result.value();
+    return m_pending_websockets.size() + m_websockets.size();
 }
 
-void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers)
+size_t ConnectionFromClient::total_websocket_count() const
 {
+    size_t count = 0;
+    for (auto const& connection : m_connections)
+        count += connection.value->websocket_count();
+    return count;
+}
+
+void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, Optional<HTTP::NetworkIsolationKey> network_isolation_key, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers)
+{
+    if (m_pending_websockets.contains(websocket_id) || m_websockets.contains(websocket_id)) {
+        did_misbehave("reused live WebSocket ID");
+        return;
+    }
+
+    // The origin, protocols and extensions all become header values in the handshake.
+    auto is_header_value = [](auto const& value) { return HTTP::is_header_value(value); };
+    if (!are_valid_headers(additional_request_headers)
+        || !is_header_value(origin)
+        || !all_of(protocols, is_header_value)
+        || !all_of(extensions, is_header_value)) {
+        did_misbehave("invalid WebSocket handshake header");
+        return;
+    }
+
+    // https://websockets.spec.whatwg.org/#concept-websocket-establish
+    // 1. Let requestURL be a copy of url, with its scheme set to "http", if url’s scheme is "ws"; otherwise to "https".
+    // The fetch of requestURL then blocks bad ports like any other.
+    if (!url.scheme().is_one_of("ws"sv, "wss"sv) || !url.host().has_value() || (url.port().has_value() && HTTP::is_bad_port(*url.port()))) {
+        fail_websocket(websocket_id, Requests::WebSocket::Error::CouldNotEstablishConnection);
+        return;
+    }
+
+    // Bound shared descriptor usage, including pending WebSockets.
+    if (websocket_count() >= max_websockets_per_client || total_websocket_count() >= max_websockets) {
+        dbgln("WebSocketConnect: Refusing WebSocket beyond the limit of {} per client and {} overall", max_websockets_per_client, max_websockets);
+        fail_websocket(websocket_id, Requests::WebSocket::Error::CouldNotEstablishConnection);
+        return;
+    }
+
+    if (network_isolation_key.has_value() && !may_use_network_isolation_key(*network_isolation_key)) {
+        dbgln("RequestServer: Client {} is not bound to the network isolation key of its WebSocket for {}", client_id(), url);
+        fail_websocket(websocket_id, Requests::WebSocket::Error::CouldNotEstablishConnection);
+        return;
+    }
+
     // The handshake carries the user's cookies for the URL, which we retrieve from the UI process ourselves. The client
     // does not get to choose them.
     additional_request_headers.remove_all_matching([](auto const& header) {
@@ -706,7 +968,10 @@ void ConnectionFromClient::websocket_connect(u64 websocket_id, URL::URL url, Byt
                                                       },
                                                   });
 
-    control_connection->async_retrieve_http_cookie(client_id(), websocket_id, RequestType::WebSocket, cookie_request_id, url);
+    Optional<HTTP::Cookie::PartitionContext> partition_context;
+    if (network_isolation_key.has_value())
+        partition_context = HTTP::Cookie::PartitionContext { network_isolation_key->top_level_site, network_isolation_key->has_cross_site_ancestor };
+    control_connection->async_retrieve_http_cookie(client_id(), websocket_id, RequestType::WebSocket, cookie_request_id, url, move(partition_context));
 }
 
 bool ConnectionFromClient::websocket_retrieved_http_cookie(Badge<ControlConnectionFromClient>, u64 websocket_id, u64 cookie_request_id, String cookie)
@@ -734,6 +999,14 @@ void ConnectionFromClient::connect_websocket(u64 websocket_id, URL::URL url, Byt
         return;
     }
 
+    // Avoid leaking hostnames resolved by the proxy.
+    auto proxy = proxy_configuration().proxy_for(url).copy();
+    if (proxy.has_value() && proxy->resolves_hostnames()) {
+        if (m_pending_websockets.remove(websocket_id))
+            open_websocket(websocket_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy), nullptr);
+        return;
+    }
+
     m_resolver->dns.lookup(host, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA }, { .validate_dnssec_locally = DNSInfo::the().validate_dnssec_locally })
         ->when_rejected([weak_self, websocket_id](auto const& error) {
             auto self = weak_self.strong_ref();
@@ -744,7 +1017,7 @@ void ConnectionFromClient::connect_websocket(u64 websocket_id, URL::URL url, Byt
                 return;
             self->fail_websocket(websocket_id, Requests::WebSocket::Error::CouldNotEstablishConnection);
         })
-        .when_resolved([weak_self, websocket_id, host = move(host), url = move(url), origin = move(origin), protocols = move(protocols), extensions = move(extensions), additional_request_headers = move(additional_request_headers)](auto const& dns_result) mutable {
+        .when_resolved([weak_self, websocket_id, host = move(host), url = move(url), origin = move(origin), protocols = move(protocols), extensions = move(extensions), additional_request_headers = move(additional_request_headers), proxy = move(proxy)](auto const& dns_result) mutable {
             auto self = weak_self.strong_ref();
             if (!self)
                 return;
@@ -760,73 +1033,78 @@ void ConnectionFromClient::connect_websocket(u64 websocket_id, URL::URL url, Byt
             if (!self->m_pending_websockets.remove(websocket_id))
                 return;
 
-            WebSocket::ConnectionInfo connection_info(move(url));
-            connection_info.set_origin(move(origin));
-            connection_info.set_protocols(move(protocols));
-            connection_info.set_extensions(move(extensions));
-            connection_info.set_headers(HTTP::HeaderList::create(move(additional_request_headers)));
-            connection_info.set_dns_result(move(dns_result));
-
-            if (auto const& path = default_certificate_path(); !path.is_empty())
-                connection_info.set_root_certificates_path(path);
-
-            auto impl = WebSocketImplCurl::create(self->m_curl_multi);
-            auto connection = WebSocket::WebSocket::create(move(connection_info), move(impl));
-
-            connection->on_open = [self = weak_self, websocket_id]() {
-                if (auto strong_self = self.strong_ref())
-                    strong_self->async_websocket_connected(websocket_id);
-            };
-            connection->on_message = [self = weak_self, websocket_id](WebSocket::Message message) {
-                auto strong_self = self.strong_ref();
-                if (!strong_self)
-                    return;
-
-                auto const& data = message.data();
-
-                // NB: A single IPC message can't carry more than IPC::MAX_MESSAGE_PAYLOAD_SIZE, so a big message
-                // crosses in shared memory instead. Gecko/WebKit/Blink don't send one across inline either: Gecko sends
-                // it in chunks (SendOnMessageAvailableHelper()), WebKit's IPC moves the message body out of line
-                // (messageBodyIsOOL), and Blink reads it from a Mojo data pipe (ConsumePendingDataFrames()).
-                if (data.size() >= Requests::WEBSOCKET_SHARED_MEMORY_THRESHOLD) {
-                    auto buffer_or_error = Core::AnonymousBuffer::create_with_size(data.size());
-                    if (buffer_or_error.is_error()) {
-                        // NB: There's no falling back to an inline message here, since a message this big may not fit
-                        // in one. And a WebSocket can't skip a message — so, the connection closes instead.
-                        dbgln("WebSocket on_message: failed to allocate shared buffer for {} bytes: {}", data.size(), buffer_or_error.error());
-                        strong_self->async_websocket_errored(websocket_id, to_underlying(Requests::WebSocket::Error::ServerClosedSocket));
-                        if (auto* connection = strong_self->m_websockets.get(websocket_id).value_or({}))
-                            connection->close(to_underlying(WebSocket::CloseStatusCode::MessageTooBig), "Message too big");
-                        return;
-                    }
-                    auto buffer = buffer_or_error.release_value();
-                    __builtin_memcpy(buffer.data<void>(), data.data(), data.size());
-                    strong_self->async_websocket_received_shared(websocket_id, message.is_text(), move(buffer));
-                    return;
-                }
-                strong_self->async_websocket_received(websocket_id, message.is_text(), data);
-            };
-            connection->on_error = [self = weak_self, websocket_id](auto message) {
-                if (auto strong_self = self.strong_ref())
-                    strong_self->async_websocket_errored(websocket_id, (i32)message);
-            };
-            connection->on_close = [self = weak_self, websocket_id](u16 code, ByteString reason, bool was_clean) {
-                if (auto strong_self = self.strong_ref()) {
-                    strong_self->async_websocket_closed(websocket_id, code, move(reason), was_clean);
-                    Core::deferred_invoke([self, websocket_id] {
-                        if (auto strong_self = self.strong_ref())
-                            strong_self->m_websockets.remove(websocket_id);
-                    });
-                }
-            };
-            connection->on_ready_state_change = [self = weak_self, websocket_id](auto state) {
-                if (auto strong_self = self.strong_ref())
-                    strong_self->async_websocket_ready_state_changed(websocket_id, (u32)state);
-            };
-
-            connection->start();
-            self->m_websockets.set(websocket_id, move(connection));
+            self->open_websocket(websocket_id, move(url), move(origin), move(protocols), move(extensions), move(additional_request_headers), move(proxy), dns_result);
         });
+}
+
+void ConnectionFromClient::open_websocket(u64 websocket_id, URL::URL url, ByteString origin, Vector<ByteString> protocols, Vector<ByteString> extensions, Vector<HTTP::Header> additional_request_headers, Optional<HTTP::Proxy> proxy, RefPtr<DNS::LookupResult const> dns_result)
+{
+    auto weak_self = make_weak_ptr<ConnectionFromClient>();
+
+    WebSocket::ConnectionInfo connection_info(move(url));
+    connection_info.set_origin(move(origin));
+    connection_info.set_protocols(move(protocols));
+    connection_info.set_extensions(move(extensions));
+    connection_info.set_headers(HTTP::HeaderList::create(move(additional_request_headers)));
+    if (dns_result)
+        connection_info.set_dns_result(dns_result.release_nonnull());
+
+    if (auto const& path = default_certificate_path(); !path.is_empty())
+        connection_info.set_root_certificates_path(path);
+
+    auto impl = WebSocketImplCurl::create(m_curl_multi);
+    impl->set_proxy(move(proxy));
+    auto connection = WebSocket::WebSocket::create(move(connection_info), move(impl));
+
+    connection->on_open = [self = weak_self, websocket_id]() {
+        if (auto strong_self = self.strong_ref())
+            strong_self->async_websocket_connected(websocket_id);
+    };
+    connection->on_message = [self = weak_self, websocket_id](WebSocket::Message message) {
+        auto strong_self = self.strong_ref();
+        if (!strong_self)
+            return;
+
+        auto const& data = message.data();
+
+        // NB: Large messages can exceed IPC::MAX_MESSAGE_PAYLOAD_SIZE and need shared memory.
+        if (data.size() >= Requests::WEBSOCKET_SHARED_MEMORY_THRESHOLD) {
+            auto buffer_or_error = Core::AnonymousBuffer::create_with_size(data.size());
+            if (buffer_or_error.is_error()) {
+                // NB: Inline fallback may exceed the IPC limit, and WebSocket messages cannot be skipped.
+                dbgln("WebSocket on_message: failed to allocate shared buffer for {} bytes: {}", data.size(), buffer_or_error.error());
+                strong_self->async_websocket_errored(websocket_id, to_underlying(Requests::WebSocket::Error::ServerClosedSocket));
+                if (auto* connection = strong_self->m_websockets.get(websocket_id).value_or({}))
+                    connection->close(to_underlying(WebSocket::CloseStatusCode::MessageTooBig), "Message too big");
+                return;
+            }
+            auto buffer = buffer_or_error.release_value();
+            __builtin_memcpy(buffer.data<void>(), data.data(), data.size());
+            strong_self->async_websocket_received_shared(websocket_id, message.is_text(), move(buffer));
+            return;
+        }
+        strong_self->async_websocket_received(websocket_id, message.is_text(), data);
+    };
+    connection->on_error = [self = weak_self, websocket_id](auto message) {
+        if (auto strong_self = self.strong_ref())
+            strong_self->async_websocket_errored(websocket_id, (i32)message);
+    };
+    connection->on_close = [self = weak_self, websocket_id](u16 code, ByteString reason, bool was_clean) {
+        if (auto strong_self = self.strong_ref()) {
+            strong_self->async_websocket_closed(websocket_id, code, move(reason), was_clean);
+            Core::deferred_invoke([self, websocket_id] {
+                if (auto strong_self = self.strong_ref())
+                    strong_self->m_websockets.remove(websocket_id);
+            });
+        }
+    };
+    connection->on_ready_state_change = [self = weak_self, websocket_id](auto state) {
+        if (auto strong_self = self.strong_ref())
+            strong_self->async_websocket_ready_state_changed(websocket_id, (u32)state);
+    };
+
+    connection->start();
+    m_websockets.set(websocket_id, move(connection));
 }
 
 void ConnectionFromClient::websocket_send(u64 websocket_id, bool is_text, ByteBuffer data)
@@ -840,6 +1118,14 @@ void ConnectionFromClient::websocket_send_shared(u64 websocket_id, bool is_text,
     auto* connection = m_websockets.get(websocket_id).value_or({});
     if (!connection || connection->ready_state() != WebSocket::ReadyState::Open)
         return;
+
+    // Bound client-controlled allocations for copying and framing the message.
+    if (data.size() > IPC::MAX_MESSAGE_PAYLOAD_SIZE) {
+        dbgln("websocket_send_shared: refusing to send a {} byte message", data.size());
+        connection->close(to_underlying(WebSocket::CloseStatusCode::MessageTooBig), "Message too big");
+        return;
+    }
+
     auto byte_buffer_or_error = ByteBuffer::copy(data.bytes());
     if (byte_buffer_or_error.is_error()) {
         dbgln("websocket_send_shared: failed to copy {} bytes from shared buffer: {}", data.size(), byte_buffer_or_error.error());
@@ -859,17 +1145,6 @@ void ConnectionFromClient::websocket_close(u64 websocket_id, u16 code, ByteStrin
 
     if (auto* connection = m_websockets.get(websocket_id).value_or({}); connection && connection->ready_state() != WebSocket::ReadyState::Closed)
         connection->close(code, reason);
-}
-
-Messages::RequestServer::WebsocketSetCertificateResponse ConnectionFromClient::websocket_set_certificate(u64 websocket_id, ByteString, ByteString)
-{
-    auto success = false;
-    if (auto* connection = m_websockets.get(websocket_id).value_or({}); connection) {
-        // NO OP here
-        // connection->set_certificate(certificate, key);
-        success = true;
-    }
-    return success;
 }
 
 }

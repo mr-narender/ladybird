@@ -16,6 +16,7 @@
 #include <LibURL/URL.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/SessionHistoryEntryDescriptor.h>
+#include <LibWebCommon/HTML/UserAgentInitiated.h>
 #include <LibWebView/CanonicalDocument.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
@@ -30,6 +31,12 @@ struct CanonicalNestedHistory {
     Vector<NonnullRefPtr<CanonicalSessionHistoryEntry>> entries;
 };
 
+struct PopulatedDocument {
+    NonnullRefPtr<CanonicalDocument> document;
+    // The origin of a document the hosting process creates for inline content in place of the response.
+    Optional<URL::Origin> inline_content_origin {};
+};
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-2
 class WEBVIEW_API CanonicalDocumentState final : public RefCounted<CanonicalDocumentState> {
 public:
@@ -39,12 +46,18 @@ public:
     ~CanonicalDocumentState();
 
     Web::HTML::SessionHistoryDocumentStateDescriptor descriptor() const;
+    void save_the_origin_of_the_populated_document();
 
     // NB: The identity the processes hosting the document state's documents give it.
     Web::HTML::CrossProcessId id;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-document
     RefPtr<CanonicalDocument> document;
+
+    // AD-HOC: The document populated for the document state becomes its document when its entry is activated. A reload
+    //         populates the document state of the active session history entry, whose document stays the navigable's
+    //         active document until then.
+    Optional<PopulatedDocument> populated_document;
 
     Variant<Web::HTML::SerializedPolicyContainer, Web::HTML::DocumentStateClient> history_policy_container { Web::HTML::DocumentStateClient::Tag };
     Web::Fetch::Infrastructure::RequestReferrerType request_referrer { Web::Fetch::Infrastructure::RequestReferrer::Client };
@@ -54,9 +67,15 @@ public:
     Optional<URL::URL> about_base_url;
     Web::HTML::DocumentResource resource;
     bool reload_pending { false };
+    bool reload_bypasses_cache { false };
     bool ever_populated { false };
+    Web::HTML::UserAgentInitiated user_agent_initiated { Web::HTML::UserAgentInitiated::No };
     Utf16String navigable_target_name;
     Vector<CanonicalNestedHistory> nested_histories;
+
+    // Whether the UI process populated local file content for this document state. Only then may the process populating
+    // it again read the file its entry names: a process reports an entry's URL, but not this.
+    bool held_local_file_content { false };
 
 private:
     explicit CanonicalDocumentState(Web::HTML::CrossProcessId);
@@ -81,6 +100,8 @@ public:
 
     ~CanonicalSessionHistoryEntry();
 
+    ErrorOr<void> update_from_descriptor(Web::HTML::SessionHistoryEntryDescriptor const&);
+
     Web::HTML::SessionHistoryEntryDescriptor descriptor() const;
     Web::HTML::SessionHistoryEntryIdentity identity() const { return { document_state->id, navigation_api_id }; }
 
@@ -93,6 +114,8 @@ public:
     Utf16String navigation_api_id;
     Web::HTML::ScrollRestorationMode scroll_restoration_mode { Web::HTML::ScrollRestorationMode::Auto };
     Web::HTML::SessionHistoryEntryScrollPositionData scroll_position_data;
+    Web::HTML::CrossProcessId directive_state_id;
+    Optional<String> directive_state_value;
 
 private:
     explicit CanonicalSessionHistoryEntry(NonnullRefPtr<CanonicalDocumentState>);

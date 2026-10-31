@@ -9,6 +9,7 @@
 #include <LibJS/Forward.h>
 #include <LibJS/Runtime/PromiseCapability.h>
 #include <LibWeb/Animations/TimeValue.h>
+#include <LibWeb/Animations/TimelineRange.h>
 #include <LibWeb/Bindings/Animation.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/EventTarget.h>
@@ -19,6 +20,7 @@ namespace Web::Animations {
 // Sorted by composite order:
 // https://www.w3.org/TR/css-animations-2/#animation-composite-order
 enum class AnimationClass {
+    SMILAnimation,
     CSSAnimationWithOwningElement,
     CSSTransition,
     CSSAnimationWithoutOwningElement,
@@ -29,6 +31,16 @@ using AnimationReplaceState = Bindings::AnimationReplaceState;
 using AnimationPlayState = Bindings::AnimationPlayState;
 
 // https://www.w3.org/TR/web-animations-1/#the-animation-interface
+// (TimelineRangeOffset or CSSNumericValue or CSSKeywordValue or DOMString)
+using TimelineRangeBindingValue = Variant<Bindings::TimelineRangeOffset, GC::Ref<CSS::CSSNumericValue>, GC::Ref<CSS::CSSKeywordValue>, Utf16String>;
+
+// Parses an attachment range edge script gives, as KeyframeAnimationOptions's rangeStart and rangeEnd take it.
+enum class TimelineRangeEdgeSide : u8 {
+    Start,
+    End,
+};
+WebIDL::ExceptionOr<TimelineRangeEdge> parse_timeline_range_edge(DOM::Document&, TimelineRangeBindingValue const&, TimelineRangeEdgeSide);
+
 class Animation : public DOM::EventTarget {
     WEB_WRAPPABLE(Animation, DOM::EventTarget);
     GC_DECLARE_ALLOCATOR(Animation);
@@ -61,9 +73,24 @@ public:
         return NullableCSSNumberish::from_optional_css_numberish_time(start_time());
     }
     Optional<TimeValue> start_time() const { return m_start_time; }
+    Optional<TimeValue> hold_time() const { return m_hold_time; }
     virtual WebIDL::ExceptionOr<void> set_start_time_for_bindings(NullableCSSNumberish const&);
 
     void calculate_auto_aligned_start_time();
+    void normalize_timing_against_attachment_interval();
+
+    // https://drafts.csswg.org/scroll-animations-1/#animation-attachment-range
+    AnimationAttachmentRange const& range() const { return m_range; }
+    void set_range(AnimationAttachmentRange const&);
+
+    // https://drafts.csswg.org/web-animations-2/#dom-animation-rangestart
+    TimelineRangeBindingValue range_start_for_bindings() const;
+    virtual WebIDL::ExceptionOr<void> set_range_start_for_bindings(TimelineRangeBindingValue const&);
+    // https://drafts.csswg.org/web-animations-2/#dom-animation-rangeend
+    TimelineRangeBindingValue range_end_for_bindings() const;
+    virtual WebIDL::ExceptionOr<void> set_range_end_for_bindings(TimelineRangeBindingValue const&);
+    // The start and the end of the attachment range on a progress-based timeline, as timeline times.
+    Optional<AttachmentInterval> attachment_interval() const;
 
     // https://drafts.csswg.org/web-animations-2/#dom-animation-currenttime
     NullableCSSNumberish current_time_for_bindings() const;
@@ -129,11 +156,14 @@ public:
 
     GC::Ptr<DOM::Document> document_for_timing() const;
     void update();
+    // Runs the pending play task of the animation if it is ready.
+    void run_pending_play_task_if_ready();
 
     void effect_timing_changed(Badge<AnimationEffect>);
 
     virtual bool is_css_animation() const { return false; }
     virtual bool is_css_transition() const { return false; }
+    virtual bool is_smil_animation() const { return false; }
 
     Optional<DOM::AbstractElement> owning_element() const { return m_owning_element; }
     void set_owning_element(Optional<DOM::AbstractElement>&& value) { m_owning_element = move(value); }
@@ -204,7 +234,13 @@ private:
     GC::Ref<WebIDL::Promise> current_ready_promise() const;
     GC::Ref<WebIDL::Promise> current_finished_promise() const;
 
-    void invalidate_effect();
+    // Whether an invalidation changes the animation as the last rendering update planned it for the render clock, rather
+    // than move it on in time, as a rendering update does.
+    enum class ChangesPlan : bool {
+        No,
+        Yes,
+    };
+    void invalidate_effect(ChangesPlan = ChangesPlan::Yes);
 
     // https://www.w3.org/TR/web-animations-1/#dom-animation-id
     Utf16FlyString m_id;
@@ -224,6 +260,11 @@ private:
     Optional<TimeValue> m_start_time {};
 
     bool m_auto_align_start_time { false };
+
+    AnimationAttachmentRange m_range;
+
+    // The attachment interval the effect's timing was last normalized against.
+    Optional<AttachmentInterval> m_normalized_attachment_interval;
 
     // https://www.w3.org/TR/web-animations-1/#animation-hold-time
     Optional<TimeValue> m_hold_time {};

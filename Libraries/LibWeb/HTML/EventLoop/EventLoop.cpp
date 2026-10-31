@@ -7,18 +7,32 @@
 
 #include <AK/AnyOf.h>
 #include <AK/Debug.h>
+#include <AK/JsonObject.h>
 #include <AK/TemporaryChange.h>
 #include <LibCore/EventLoop.h>
 #include <LibGC/Heap.h>
+#include <LibGC/HeapAccess.h>
 #include <LibJS/Runtime/VM.h>
+#include <LibWeb/Animations/NamedTimelines.h>
 #include <LibWeb/Animations/ScrollTimeline.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/FontFaceSet.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/EventTiming/EventTiming.h>
+#include <LibWeb/HTML/AnimationFrameCallbackDriver.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/EventLoop/ClockPlan.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/EventLoop/FrameCompletion.h>
+#include <LibWeb/HTML/EventLoop/RenderingSchedulerCounters.h>
+#include <LibWeb/HTML/Focus.h>
+#include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
+#include <LibWeb/HTML/ListOfAvailableImages.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
@@ -28,9 +42,14 @@
 #include <LibWeb/HTML/WorkletGlobalScope.h>
 #include <LibWeb/HighResolutionTime/Performance.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/IndexedDB/Internal/Algorithms.h>
+#include <LibWeb/IndexedDB/IDBFactory.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/NodeArena.h>
+#include <LibWeb/Layout/TreeBuilderRustFFI.h>
+#include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
+#include <LibWeb/PaintTiming/PaintTiming.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -44,6 +63,12 @@ GC_DEFINE_ALLOCATOR(EventLoop);
 EventLoop::EventLoop(Type type)
     : m_type(type)
 {
+    if (m_type == Type::Window) {
+        // The threads a window's rendering runs on only read what the host lends them and never touch the heap
+        // themselves. This makes that a debug assertion (and a collection there a verification failure) for whatever
+        // C++ code they call.
+        Layout::RustFFI::stage_thread_set_thread_setup([] { GC::forbid_heap_access_on_this_thread(); });
+    }
     m_task_queue = GC::Heap::the().allocate<TaskQueue>(*this);
 
     m_rendering_task_function = GC::create_function(GC::Heap::the(), [this] {
@@ -73,12 +98,14 @@ void EventLoop::visit_edges(Visitor& visitor)
     visitor.visit(m_rendering_task_function);
     visitor.visit(m_system_event_loop_timer);
     visitor.visit(m_idle_period_timer);
+    visitor.visit(m_navigables_with_frames_in_flight);
+    visitor.visit(m_navigables_with_clock_lanes);
 }
 
 void EventLoop::schedule()
 {
     if (!m_system_event_loop_timer) {
-        m_system_event_loop_timer = Platform::Timer::create_single_shot(GC::Heap::the(), 0, GC::create_function(GC::Heap::the(), [this] {
+        m_system_event_loop_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), [this] {
             process();
         }));
     }
@@ -106,6 +133,10 @@ void EventLoop::spin_until(GC::Ref<GC::Function<bool()>> goal_condition)
     vm.save_execution_context_stack();
     vm.clear_execution_context_stack();
 
+    // AD-HOC: A rendering update whose style transaction flies finishes first, as a pause that updates the rendering
+    //         finishes it: the tasks the nested event loop runs come after the whole of it.
+    finish_rendering_update_in_flight();
+
     // 5. Perform a microtask checkpoint.
     perform_a_microtask_checkpoint();
 
@@ -116,6 +147,8 @@ void EventLoop::spin_until(GC::Ref<GC::Function<bool()>> goal_condition)
     //       2. Perform any steps that appear after this spin the event loop instance in the original algorithm.
     //       NOTE: This is achieved by returning from the function.
 
+    ++m_spin_depth;
+    ScopeGuard leave_spin = [this] { --m_spin_depth; };
     Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), [this, goal_condition] {
         if (goal_condition->function()())
             return true;
@@ -139,17 +172,33 @@ void EventLoop::process()
     if (execution_paused())
         return;
 
+    if (Core::StatsLog::the())
+        begin_rendering_pending_task();
+    ScopeGuard pending_task = [] {
+        if (Core::StatsLog::the())
+            end_rendering_pending_task();
+    };
+
     // 1. Let oldestTask and taskStartTime be null.
     GC::Ptr<Task> oldest_task;
     [[maybe_unused]] double task_start_time = 0;
 
     m_task_generation++;
 
+    // AD-HOC: A rendering update's style transaction and recording fly beside the tasks after it, and each is taken in
+    //         once it has finished, between two tasks.
+    take_finished_frames_in();
+
     // Some algorithms request that steps or states only occur once the event loop has reached step 1.
     // Invoke a set of tasks that these algorithms request us to in order to achieve this.
-    auto reached_step_1_tasks = move(m_reached_step_1_tasks);
+    GC::RootVector reached_step_1_tasks { move(m_reached_step_1_tasks) };
     for (auto& reached_step_1_task : reached_step_1_tasks)
         reached_step_1_task->function()();
+
+    // AD-HOC: Beside an idle event loop, whose rendering updates run a document's animations, the render clock's lanes
+    //         only hover what is under the pointer.
+    if (!m_task_queue->has_runnable_tasks())
+        note_clock_lanes(ClockAnimations::Hold);
 
     // 2. If the event loop has a task queue with at least one runnable task, then:
     if (m_task_queue->has_runnable_tasks()) {
@@ -163,6 +212,13 @@ void EventLoop::process()
         oldest_task = task_queue->take_first_runnable();
 
         // FIXME: 4. If oldestTask's document is not null, then record task start time given taskStartTime and oldestTask's document.
+
+        // AD-HOC: While a task runs, the render clock's lanes tick the animations the last rendering update planned for.
+        //         A task that runs beside a rendering update in flight comes after the whole of it.
+        if (oldest_task->source() != Task::Source::Rendering) {
+            note_clock_lanes(ClockAnimations::Run);
+            note_script_ran_beside_rendering_update_in_flight();
+        }
 
         // 5. Set the event loop's currently running task to oldestTask.
         m_currently_running_task = oldest_task.ptr();
@@ -182,7 +238,7 @@ void EventLoop::process()
 
     if (oldest_task && oldest_task->source() != Task::Source::Rendering) {
         auto task_duration = task_end_time - task_start_time;
-        auto task_duration_microseconds = static_cast<u64>(task_duration * 1000.0);
+        auto task_duration_microseconds = rendering_scheduler_duration_microseconds(task_duration);
         ++m_rendering_scheduler_counters.tasks_between_updates;
         m_rendering_scheduler_counters.task_microseconds_between_updates += task_duration_microseconds;
         switch (oldest_task->source()) {
@@ -235,7 +291,7 @@ void EventLoop::process()
             //     during an idle period belong to the next one; immediately starting it lets self-scheduling
             //     callbacks spin continuously even when they have no work to do.
             if (!m_idle_period_timer) {
-                m_idle_period_timer = Platform::Timer::create_single_shot(GC::Heap::the(), 50, GC::create_function(GC::Heap::the(), [this] {
+                m_idle_period_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(50), GC::create_function(GC::Heap::the(), [this] {
                     schedule();
                 }));
             }
@@ -328,6 +384,21 @@ bool EventLoop::rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp fr
     return true;
 }
 
+static InputRoutingDecision input_routing_decision_for_finished_input_event(EventResult result)
+{
+    switch (result) {
+    case EventResult::Accepted:
+        return InputRoutingDecision::FinishedAccepted;
+    case EventResult::Handled:
+        return InputRoutingDecision::FinishedHandled;
+    case EventResult::Dropped:
+        return InputRoutingDecision::FinishedDropped;
+    case EventResult::Cancelled:
+        return InputRoutingDecision::FinishedCancelled;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 void EventLoop::process_input_events() const
 {
     auto process_input_events_queue = [&](Page& page) {
@@ -336,6 +407,18 @@ void EventLoop::process_input_events() const
 
         // Process events only for this page, collecting others to re-enqueue
         Queue<Web::QueuedInputEvent> events_for_other_pages;
+
+        auto record_routing = [&](u64 event_id, InputRoutingDecision decision) {
+            page.input_trace().record({ .input_event_id = event_id, .stage = InputTraceStage::WebContent, .decision = decision });
+        };
+        auto finish_handling_input_event = [&](u64 event_id, EventResult result, InputRoutingDecision decision) {
+            record_routing(event_id, decision);
+            page_client.report_finished_handling_input_event(page_client.id(), event_id, result);
+        };
+        auto finish_handling_coalesced_input_events = [&](QueuedInputEvent const& event) {
+            for (auto coalesced_event_id : event.coalesced_event_ids)
+                finish_handling_input_event(coalesced_event_id, EventResult::Dropped, InputRoutingDecision::CoalescedIntoLaterEvent);
+        };
 
         while (!input_events_queue.is_empty()) {
             auto event = input_events_queue.dequeue();
@@ -357,24 +440,50 @@ void EventLoop::process_input_events() const
                 root = page.local_traversable();
 
             if (!root) {
-                for (auto coalesced_event_id : event.coalesced_event_ids)
-                    page_client.report_finished_handling_input_event(event.page_id, coalesced_event_id, EventResult::Dropped);
-                page_client.report_finished_handling_input_event(event.page_id, input_event_id(event.event), EventResult::Dropped);
+                finish_handling_coalesced_input_events(event);
+                finish_handling_input_event(input_event_id(event.event), EventResult::Dropped, InputRoutingDecision::DroppedWithoutLocalRoot);
                 continue;
             }
+
+            // AD-HOC: The screen showed the hover of a newer pointer move than a mouse event that reached the queue
+            //         before the task the hover of a clock lane took that move beside, which the host keeps where it
+            //         took in what the lanes did: the pointer never moves back to where the event says it was. A move
+            //         or leave is dropped, as the queue coalesces the moves it holds, and the newer move's own event
+            //         follows. Any other event is handled, without moving the hover or the pointer.
+            bool input_is_outdated = false;
+            if (auto const* mouse_event = event.event.get_pointer<Web::MouseEvent>(); mouse_event && (!mouse_event->pointer_data.ptr() || mouse_event->pointer_data.ptr()->pointer_type == PointerType::Mouse)) {
+                auto document = root->active_document();
+                auto* arena = document ? document->layout_node_arena_if_created() : nullptr;
+                input_is_outdated = arena && Layout::RustFFI::document_host_mouse_event_is_outdated(arena->host(), mouse_event->id);
+                // A move with a button held is a drag's, whose script hears every move: it is handled, as outdated.
+                if (input_is_outdated && mouse_event->buttons == 0 && first_is_one_of(mouse_event->type, Web::MouseEvent::Type::MouseMove, Web::MouseEvent::Type::MouseLeave)) {
+                    finish_handling_coalesced_input_events(event);
+                    finish_handling_input_event(mouse_event->id, EventResult::Dropped, InputRoutingDecision::DroppedOutdatedPointerMove);
+                    continue;
+                }
+            }
+            root->event_handler().set_handling_outdated_input(input_is_outdated);
+            auto const* handled_mouse_event = event.event.get_pointer<Web::MouseEvent>();
+            root->event_handler().set_handling_input_event_id(handled_mouse_event ? handled_mouse_event->id : 0);
+            ScopeGuard end_outdated_input = [&] {
+                root->event_handler().set_handling_outdated_input(false);
+                root->event_handler().set_handling_input_event_id(0);
+            };
 
             Optional<RemoteInputEventTarget> remote_target;
             auto result = event.event.visit(
                 [&](Web::KeyEvent const& key_event) {
                     switch (key_event.type) {
                     case Web::KeyEvent::Type::KeyDown:
-                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat, key_event.should_insert_text, key_event.async_scroll_performed_default_action);
+                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat, key_event.should_insert_text, key_event.async_scroll_performed_default_action, key_event.editing_commands, key_event.native_editing_binding_resolved);
                     case Web::KeyEvent::Type::KeyUp:
                         return page.handle_keyup(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat);
                     }
                     VERIFY_NOT_REACHED();
                 },
                 [&](Web::MouseEvent const& mouse_event) {
+                    if (auto* pointer = mouse_event.pointer_data.ptr(); pointer && pointer->pointer_type != PointerType::Mouse)
+                        return root->event_handler().handle_pointer_event(mouse_event, page.device_to_css_point(mouse_event.position), page.device_to_css_point(mouse_event.screen_position), &remote_target);
                     switch (mouse_event.type) {
                     case Web::MouseEvent::Type::MouseDown:
                         return page.handle_mousedown(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.click_count, mouse_event.scrollbar_dragged_by_compositor, &remote_target);
@@ -384,12 +493,14 @@ void EventLoop::process_input_events() const
                         return page.handle_mousemove(*root, mouse_event.position, mouse_event.screen_position, mouse_event.buttons, mouse_event.modifiers, &remote_target);
                     case Web::MouseEvent::Type::MouseLeave:
                         return page.handle_mouseleave(*root);
+                    case Web::MouseEvent::Type::MouseCancel:
+                        return page.handle_mousecancel(*root);
                     case Web::MouseEvent::Type::MouseWheel:
                         if (mouse_event.async_scroll_performed_default_action) {
                             dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Main thread handling DOM wheel after async default action");
-                            return page.handle_mousewheel(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, mouse_event.wheel_delta_precision, mouse_event.scroll_gesture_phase, true, nullptr, &remote_target);
+                            return page.handle_mousewheel(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, mouse_event.wheel_tick_120ths_x, mouse_event.wheel_tick_120ths_y, mouse_event.wheel_delta_precision, mouse_event.scroll_gesture_phase, true, nullptr, &remote_target, mouse_event.wheel_gesture_mark);
                         }
-                        return page.handle_mousewheel(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, mouse_event.wheel_delta_precision, mouse_event.scroll_gesture_phase, false, nullptr, &remote_target);
+                        return page.handle_mousewheel(*root, mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, mouse_event.wheel_tick_120ths_x, mouse_event.wheel_tick_120ths_y, mouse_event.wheel_delta_precision, mouse_event.scroll_gesture_phase, false, nullptr, &remote_target, mouse_event.wheel_gesture_mark);
                     }
                     VERIFY_NOT_REACHED();
                 },
@@ -397,15 +508,21 @@ void EventLoop::process_input_events() const
                     return page.handle_drag_and_drop_event(*root, drag_event.type, drag_event.position, drag_event.screen_position, drag_event.button, drag_event.buttons, drag_event.modifiers, move(drag_event.files));
                 },
                 [&](Web::PinchEvent& pinch_event) {
-                    return page.handle_pinch_event(*root, pinch_event.position, pinch_event.modifiers, pinch_event.scale_delta);
+                    return page.handle_pinch_event(*root, pinch_event, &remote_target);
                 });
 
-            for (auto coalesced_event_id : event.coalesced_event_ids)
-                page_client.report_finished_handling_input_event(event.page_id, coalesced_event_id, EventResult::Dropped);
+            finish_handling_coalesced_input_events(event);
 
             // The pointer is over content another process hosts: that process handles the event, at the position in
             // the viewport of the navigable it hosts, and finishes it.
             if (remote_target.has_value()) {
+                record_routing(input_event_id(event.event), InputRoutingDecision::ForwardedToRemoteFrame);
+                if (auto const* pinch_event = event.event.get_pointer<Web::PinchEvent>()) {
+                    auto forwarded_pinch_event = *pinch_event;
+                    forwarded_pinch_event.position = page.css_to_device_point(remote_target->position);
+                    page_client.forward_pinch_event_to_remote_navigable(event.page_id, remote_target->navigable_id, forwarded_pinch_event);
+                    continue;
+                }
                 auto mouse_event = event.event.get<Web::MouseEvent>().clone_without_browser_data();
                 mouse_event.position = page.css_to_device_point(remote_target->position);
                 page_client.forward_mouse_event_to_remote_navigable(event.page_id, remote_target->navigable_id, move(mouse_event));
@@ -413,19 +530,17 @@ void EventLoop::process_input_events() const
             }
 
             page_client.did_handle_input_event(event.page_id, event.event);
-            page_client.report_finished_handling_input_event(event.page_id, input_event_id(event.event), result);
+            finish_handling_input_event(input_event_id(event.event), result, input_routing_decision_for_finished_input_event(result));
         }
 
         // Re-enqueue events for other pages
         while (!events_for_other_pages.is_empty()) {
             input_events_queue.enqueue(events_for_other_pages.dequeue());
         }
-
-        page.handle_sdl_input_events();
     };
 
     // Every page hosting a document takes the input events queued for it, once.
-    Vector<GC::Ref<Page>> pages;
+    GC::RootVector<GC::Ref<Page>> pages;
     for (auto& navigable : all_local_navigables()) {
         if (!navigable->is_local_root() || navigable->has_been_destroyed())
             continue;
@@ -452,6 +567,308 @@ static GC::RootVector<GC::Ref<Page>> pages_of_local_roots()
     return pages;
 }
 
+enum class HeldTasks : u8 {
+    None,
+    OfLastDocument,
+    All,
+};
+
+// A rendering update whose style transaction flies for its last document, with what its steps from that document's style
+// and layout on read.
+struct EventLoop::RenderingUpdateInFlight {
+    AK_ALLOC_WITH_KMALLOC;
+
+    DOM::Document& document() const { return *docs.last(); }
+    // Whether the rest of the update's steps deliver nothing to script: an update of one doc that holds no task back
+    // ends before them, and they run as its frame is taken in, beside the tasks after it or in the next rendering update,
+    // which may begin beside the frame.
+    bool ended() const { return held_tasks == HeldTasks::None && docs.size() == 1; }
+    // Whether script of `document` ran beside the update.
+    bool ran_script_of_beside(DOM::Document const& document) const
+    {
+        if (!script_ran_beside)
+            return false;
+        if (held_for_testing)
+            return true;
+        switch (least_held_tasks) {
+        case HeldTasks::None:
+            return true;
+        case HeldTasks::OfLastDocument:
+            return &document != docs.last().ptr();
+        case HeldTasks::All:
+            return false;
+        }
+        VERIFY_NOT_REACHED();
+    }
+
+    Vector<GC::Root<DOM::Document>> docs;
+    double frame_timestamp { 0 };
+    // The serial number of the update, which the plans it seals carry.
+    u64 serial { 0 };
+    // The event loop does not take the transaction in while a test holds it.
+    bool held_for_testing { false };
+    // Whose tasks wait for the whole of the update rather than run beside it.
+    HeldTasks held_tasks { HeldTasks::None };
+    // Whether the first round of the doc's layout flew: after the transaction, once the event loop took it in, or in its
+    // place, where the update had no style to change.
+    bool layout_flew { false };
+    // The fewest tasks the update held back at any time while it flew.
+    HeldTasks least_held_tasks { HeldTasks::None };
+    // Whether a task, or a step of the next rendering update that runs script, ran beside the update.
+    bool script_ran_beside { false };
+};
+
+// The end of a rendering update, once its last step has run.
+void EventLoop::finish_rendering_update(double update_start_time)
+{
+    auto update_end_time = HighResolutionTime::unsafe_shared_current_time();
+    m_rendering_scheduler_counters.update_microseconds += rendering_scheduler_duration_microseconds(update_end_time - update_start_time);
+    m_running_rendering_task = false;
+
+    for (auto const& page : pages_of_local_roots())
+        page->client().did_finish_rendering_update();
+
+    auto const& current = m_rendering_scheduler_counters;
+    auto const& previous = m_rendering_scheduler_counters_at_last_update;
+    dbgln_if(RENDERING_SCHEDULER_DEBUG,
+        "[RenderSched] update #{} duration={:.1f}ms gap={:.1f}ms paints={} tasks={} ({:.1f}ms) "
+        "[postmsg {} ({:.1f}ms), timer {} ({:.1f}ms), net {} ({:.1f}ms), dom {} ({:.1f}ms)] "
+        "requests={} coalesced={} during_update={}",
+        current.updates_run, update_end_time - update_start_time,
+        m_last_rendering_update_end_time > 0 ? update_start_time - m_last_rendering_update_end_time : 0.0,
+        current.paints - previous.paints,
+        current.tasks_between_updates - previous.tasks_between_updates,
+        static_cast<double>(current.task_microseconds_between_updates - previous.task_microseconds_between_updates) / 1000.0,
+        current.posted_message_tasks_between_updates - previous.posted_message_tasks_between_updates,
+        static_cast<double>(current.posted_message_task_microseconds_between_updates - previous.posted_message_task_microseconds_between_updates) / 1000.0,
+        current.timer_tasks_between_updates - previous.timer_tasks_between_updates,
+        static_cast<double>(current.timer_task_microseconds_between_updates - previous.timer_task_microseconds_between_updates) / 1000.0,
+        current.networking_tasks_between_updates - previous.networking_tasks_between_updates,
+        static_cast<double>(current.networking_task_microseconds_between_updates - previous.networking_task_microseconds_between_updates) / 1000.0,
+        current.dom_manipulation_tasks_between_updates - previous.dom_manipulation_tasks_between_updates,
+        static_cast<double>(current.dom_manipulation_task_microseconds_between_updates - previous.dom_manipulation_task_microseconds_between_updates) / 1000.0,
+        current.update_requests - previous.update_requests,
+        current.coalesced_update_requests - previous.coalesced_update_requests,
+        current.update_requests_while_rendering - previous.update_requests_while_rendering);
+    m_rendering_scheduler_counters_at_last_update = current;
+    m_last_rendering_update_end_time = update_end_time;
+}
+
+// Whether `animation` is a CSS animation or transition that the style of a rendering update began, which the update
+// makes ready once its style and layout are done.
+static bool rendering_update_makes_ready(Animations::Animation const& animation)
+{
+    auto const* effect = as_if<Animations::KeyframeEffect>(animation.effect().ptr());
+    return animation.pending() && (animation.is_css_animation() || animation.is_css_transition()) && effect && !effect->may_run_on_the_compositor();
+}
+
+enum class StyleTakenIn : u8 {
+    No,
+    Yes,
+};
+
+enum class LayoutHeldForTesting : bool {
+    No,
+    Yes,
+};
+
+// Which tasks a rendering update whose style transaction flies for its last doc holds back until the whole of it has
+// run, as the steps after its style and layout deliver to script what comes before any task: the intersection
+// observations of every doc, whose roots and targets the script of any document may reach, rendered or not, the resize
+// observations the last doc's layout answers, and the animations it samples and transitions it starts, whose timing
+// script sees follow the update. Once the transaction is taken in, those are the ones its style began.
+// AD-HOC: The render clock's lanes of the docs the update took in present nothing until its frame: a task beside the
+//         update would leave the pointer unhovered and the animations still for as long as it runs, where the lanes
+//         would hover or animate beside it. A test that holds the layout that flies runs the doc's tasks beside it.
+
+static HeldTasks tasks_rendering_update_holds(Vector<GC::Root<DOM::Document>> const& docs, StyleTakenIn style_taken_in, LayoutHeldForTesting layout_held_for_testing)
+{
+    if (any_of(docs, [](auto const& document) { return document->has_intersection_observation_targets(); }))
+        return HeldTasks::All;
+    // The focus fixup of every doc whose focused area is not its viewport reads that area as the update leaves it.
+    if (any_of(docs.span().slice(0, docs.size() - 1), [](auto const& document) { return focus_fixup_rule_may_apply(*document); }))
+        return HeldTasks::All;
+    // The lanes of a doc the update took in present nothing until it seals their plan, which its tasks would hold up.
+    auto lanes_wait = [&](DOM::Document const& document) {
+        auto* arena = document.layout_node_arena_if_created();
+        return arena && layout_held_for_testing == LayoutHeldForTesting::No && Layout::RustFFI::document_host_lanes_wait_for_the_update(arena->host());
+    };
+    if (any_of(docs.span().slice(0, docs.size() - 1), [&](auto const& document) { return lanes_wait(*document); }))
+        return HeldTasks::All;
+    auto& document = *docs.last();
+    if (document.has_resize_observers() || focus_fixup_rule_may_apply(document))
+        return HeldTasks::OfLastDocument;
+    if (lanes_wait(document))
+        return HeldTasks::OfLastDocument;
+    for (auto const& timeline : document.associated_animation_timelines()) {
+        for (auto const& animation : timeline->associated_animations()) {
+            if (style_taken_in == StyleTakenIn::No || rendering_update_makes_ready(animation))
+                return HeldTasks::OfLastDocument;
+        }
+    }
+    if (style_taken_in == StyleTakenIn::No && document.style_computer().style_engine().css_transitions_may_observe_style_changes())
+        return HeldTasks::OfLastDocument;
+    return HeldTasks::None;
+}
+
+static void update_style_and_layout_for_rendering(DOM::Document&, u64 update_serial);
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
+// NB: The documents step 3 of update the rendering keeps.
+static bool is_renderable(DOM::Document const& document)
+{
+    if (!document.is_fully_active())
+        return false;
+
+    // doc is render-blocked;
+    if (document.is_render_blocked())
+        return false;
+
+    // doc's visibility state is "hidden";
+    if (document.hidden())
+        return false;
+
+    // doc's rendering is suppressed for view transitions; or
+    if (document.rendering_suppression_for_view_transitions())
+        return false;
+
+    auto navigable = document.navigable();
+    if (!navigable)
+        return false;
+
+    // doc's node navigable doesn't currently have a rendering opportunity.
+    if (!navigable->has_a_rendering_opportunity())
+        return false;
+
+    return true;
+}
+
+// Takes in what the render clock's lanes did, then the queued input events. The lanes wait for the plan of the rendering
+// update with the serial number `update_serial`. Answers the documents whose lanes were taken in.
+Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(u64 update_serial)
+{
+    // AD-HOC: The render clock's lanes present frames of a document's animations and hover beside the tasks since the
+    //         last update, at display ticks later than the opportunity this update renders for, which reached the event
+    //         loop only after those tasks. An update after a lane's tick presented a frame renders at the time it runs,
+    //         so nothing moves back from where the tick showed it.
+    //         The update keeps the hover the lanes moved what the screen shows to, and hovers the newest pointer move the
+    //         compositor told of: the move is the document's from now on, ahead of the input events that hover what is
+    //         under the pointer as the host sees it. The lanes present nothing until the update's frame, which shows
+    //         what the update took in, so the screen never goes back from what a lane showed.
+    //         The transitions the lanes' hover left elements running run on from when the lanes started them, in place
+    //         of those its steps ended, ahead of the update's own style changes.
+    //         A lane presents frames of a fork of the document's render state, which the host's state never held: the
+    //         update records and presents the host's frame again.
+    bool tick_presented = false;
+    Vector<GC::Root<DOM::Document>> documents_with_lanes;
+    for (auto& navigable : all_local_navigables()) {
+        auto document = navigable->active_document();
+        if (!document)
+            continue;
+        auto* arena = document->layout_node_arena_if_created();
+        if (!arena)
+            continue;
+        // A document the update does not render may still have lanes that follow the last plan it sealed: the update
+        // takes them in all the same, and drops their plan as it leaves the document out of docs.
+        if (!is_renderable(*document) && !Layout::RustFFI::document_host_may_have_lanes(arena->host()))
+            continue;
+        // A same-process iframe's lanes hear of the pointer from the lanes of its local root's document.
+        u64 outer_input_event = 0;
+        if (!navigable->is_local_root()) {
+            auto root_document = navigable->local_root()->active_document();
+            if (auto* root_arena = root_document ? root_document->layout_node_arena_if_created() : nullptr)
+                outer_input_event = Layout::RustFFI::document_host_newest_pointer_input_event(root_arena->host());
+        }
+        if (Layout::RustFFI::document_host_take_clock_lanes_in(arena->host(), update_serial, outer_input_event)) {
+            tick_presented = true;
+            navigable->set_needs_to_record_display_list();
+            navigable->set_needs_repaint();
+        }
+        documents_with_lanes.append(*document);
+    }
+    if (tick_presented)
+        m_last_render_opportunity_time = max(m_last_render_opportunity_time, HighResolutionTime::unsafe_shared_current_time());
+    if (!documents_with_lanes.is_empty()) {
+        // Starting and cancelling transitions settles their promises, which a rendering update runs without a script:
+        // their reactions run once every document took in what its lanes did.
+        HTML::TemporaryExecutionContext execution_context { documents_with_lanes.first()->relevant_settings_object() };
+        for (auto& document : documents_with_lanes)
+            CSS::CSSTransition::adopt_lane_transitions(*document);
+    }
+
+    process_input_events();
+
+    // AD-HOC: A hover a lane moved, which the update kept, owes the boundary events of the move where the update heard
+    //         of no mouse move: they fire now, from which on script reads the hover, as they would for a mouse move.
+    struct HoverEventsOwed {
+        GC::Root<LocalNavigable> navigable;
+        Optional<DevicePixelPoint> pointer;
+        GC::Root<DOM::Node> hover_target;
+    };
+    Vector<HoverEventsOwed> hover_events_owed;
+    for (auto& navigable : all_local_navigables()) {
+        auto document = navigable->active_document();
+        auto* arena = document ? document->layout_node_arena_if_created() : nullptr;
+        bool has_pointer = false;
+        float pointer_x = 0;
+        float pointer_y = 0;
+        bool has_target = false;
+        u32 target = 0;
+        if (!arena || !Layout::RustFFI::document_host_take_hover_events_owed(arena->host(), &has_pointer, &pointer_x, &pointer_y, &has_target, &target))
+            continue;
+        Optional<DevicePixelPoint> pointer;
+        if (has_pointer)
+            pointer = DevicePixelPoint { static_cast<i32>(pointer_x), static_cast<i32>(pointer_y) };
+        // The element the lane hovered there, which the screen shows.
+        GC::Ptr<DOM::Node> hover_target;
+        if (has_target && target != 0)
+            hover_target = document->style_computer().node_for_lane_style_node(CSS::StyleNodeID { target });
+        hover_events_owed.append({ navigable, pointer, hover_target });
+    }
+    for (auto& owed : hover_events_owed) {
+        auto document = owed.navigable->active_document();
+        if (!document || !document->is_fully_active() || owed.navigable->has_been_destroyed())
+            continue;
+        // Script that ran for an earlier navigable's events may have moved the element the lane hovered elsewhere.
+        GC::Ptr<DOM::Node> hover_target = owed.hover_target.ptr();
+        if (hover_target && &hover_target->document() != document.ptr())
+            hover_target = nullptr;
+        if (owed.pointer.has_value())
+            owed.navigable->event_handler().update_hover_at(owed.navigable->page().device_to_css_point(*owed.pointer), hover_target);
+        else
+            owed.navigable->event_handler().handle_mouseleave();
+    }
+    // What the lanes reported has been taken in: the style node ids that left their nodes since name nothing of theirs.
+    // A document with no lanes has none that report any.
+    for (auto& document : documents_in_this_event_loop_matching([](auto const&) { return true; })) {
+        // NB: A document that never made a style computer has retired no style nodes.
+        auto* style_computer = document->style_computer_if_created();
+        if (!style_computer)
+            continue;
+        auto* arena = document->layout_node_arena_if_created();
+        bool const lanes_taken_in = any_of(documents_with_lanes, [&](auto const& taken_in) { return taken_in.ptr() == document.ptr(); });
+        if (lanes_taken_in || !arena || !Layout::RustFFI::document_host_may_have_lanes(arena->host()))
+            style_computer->forget_style_nodes_retired_beside_lanes();
+    }
+    return documents_with_lanes;
+}
+
+// NB: Pointer moves and wheel steps wait for a rendering update, which coalesces those that come at the display's rate.
+//     A button or key press goes ahead of the next display tick, with the events queued before it, unless an update in
+//     flight holds what it would read.
+void EventLoop::queue_task_to_process_input_events()
+{
+    if (m_input_events_task_queued)
+        return;
+    m_input_events_task_queued = true;
+    queue_a_task(Task::Source::UserInteraction, this, nullptr, GC::create_function(GC::Heap::the(), [this] {
+        m_input_events_task_queued = false;
+        if (m_running_rendering_task || m_rendering_update_in_flight)
+            return;
+        take_clock_lanes_and_input_events_in(m_rendering_update_serial + 1);
+    }));
+}
+
 // https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
 void EventLoop::update_the_rendering()
 {
@@ -461,41 +878,15 @@ void EventLoop::update_the_rendering()
         page->client().will_begin_rendering_update();
     auto update_start_time = HighResolutionTime::unsafe_shared_current_time();
     ++m_rendering_scheduler_counters.updates_run;
-    ScopeGuard const guard = [this, update_start_time] {
-        auto update_end_time = HighResolutionTime::unsafe_shared_current_time();
-        m_rendering_scheduler_counters.update_microseconds += static_cast<u64>((update_end_time - update_start_time) * 1000.0);
-        m_running_rendering_task = false;
+    ++m_rendering_update_serial;
 
-        for (auto const& page : pages_of_local_roots())
-            page->client().did_finish_rendering_update();
+    // AD-HOC: The last rendering update may have ended as its style transaction flew. Its layout runs beside this
+    //         update's steps up to step 16, which takes the rest of it in, or the rest of it runs now.
+    if (m_rendering_update_in_flight && !m_rendering_update_in_flight->held_for_testing && !m_rendering_update_in_flight->layout_flew
+        && !let_layout_of_rendering_update_fly())
+        finish_rendering_update_in_flight();
 
-        auto const& current = m_rendering_scheduler_counters;
-        auto const& previous = m_rendering_scheduler_counters_at_last_update;
-        dbgln_if(RENDERING_SCHEDULER_DEBUG,
-            "[RenderSched] update #{} duration={:.1f}ms gap={:.1f}ms paints={} tasks={} ({:.1f}ms) "
-            "[postmsg {} ({:.1f}ms), timer {} ({:.1f}ms), net {} ({:.1f}ms), dom {} ({:.1f}ms)] "
-            "requests={} coalesced={} during_update={}",
-            current.updates_run, update_end_time - update_start_time,
-            m_last_rendering_update_end_time > 0 ? update_start_time - m_last_rendering_update_end_time : 0.0,
-            current.paints - previous.paints,
-            current.tasks_between_updates - previous.tasks_between_updates,
-            static_cast<double>(current.task_microseconds_between_updates - previous.task_microseconds_between_updates) / 1000.0,
-            current.posted_message_tasks_between_updates - previous.posted_message_tasks_between_updates,
-            static_cast<double>(current.posted_message_task_microseconds_between_updates - previous.posted_message_task_microseconds_between_updates) / 1000.0,
-            current.timer_tasks_between_updates - previous.timer_tasks_between_updates,
-            static_cast<double>(current.timer_task_microseconds_between_updates - previous.timer_task_microseconds_between_updates) / 1000.0,
-            current.networking_tasks_between_updates - previous.networking_tasks_between_updates,
-            static_cast<double>(current.networking_task_microseconds_between_updates - previous.networking_task_microseconds_between_updates) / 1000.0,
-            current.dom_manipulation_tasks_between_updates - previous.dom_manipulation_tasks_between_updates,
-            static_cast<double>(current.dom_manipulation_task_microseconds_between_updates - previous.dom_manipulation_task_microseconds_between_updates) / 1000.0,
-            current.update_requests - previous.update_requests,
-            current.coalesced_update_requests - previous.coalesced_update_requests,
-            current.update_requests_while_rendering - previous.update_requests_while_rendering);
-        m_rendering_scheduler_counters_at_last_update = current;
-        m_last_rendering_update_end_time = update_end_time;
-    };
-
-    process_input_events();
+    auto documents_with_lanes = take_clock_lanes_and_input_events_in(m_rendering_update_serial);
 
     // 1. Let frameTimestamp be eventLoop's last render opportunity time.
     auto frame_timestamp = m_last_render_opportunity_time;
@@ -514,34 +905,25 @@ void EventLoop::update_the_rendering()
     //      of their respective navigable containers in C's node tree.
     // 3. Filter non-renderable documents: Remove from docs any Document object doc for which any of the following are true:
     auto docs = documents_in_this_event_loop_matching([&](auto const& document) {
-        if (!document.is_fully_active())
-            return false;
-
-        // doc is render-blocked;
-        if (document.is_render_blocked()) {
-            return false;
-        }
-
-        // doc's visibility state is "hidden";
-        if (document.hidden())
-            return false;
-
-        // doc's rendering is suppressed for view transitions; or
-        if (document.rendering_suppression_for_view_transitions())
-            return false;
-
-        auto navigable = document.navigable();
-        if (!navigable)
-            return false;
-
-        // doc's node navigable doesn't currently have a rendering opportunity.
-        if (!navigable->has_a_rendering_opportunity())
-            return false;
-
-        return true;
+        return is_renderable(document);
     });
 
-    // FIXME: 4. Unnecessary rendering: Remove from docs any Document object doc for which all of the following are true:
+    // 4. Unnecessary rendering: Remove from docs any Document object doc for which all of the following are true:
+    //    - the user agent believes that updating the rendering of doc's node navigable would have no visible effect; and
+    //    - doc's map of animation frame callbacks is empty.
+    docs.remove_all_matching([](auto const& document) {
+        // NB: Nothing of a document whose navigable container isn't being rendered (e.g. a display: none iframe) can be
+        //     seen. Its animations, observers and media query lists still report through the steps below, so keep a
+        //     document that has any of them to report.
+        auto container = document->navigable()->container();
+        if (!container || container->has_layout_box())
+            return false;
+        return !document->window()->animation_frame_callback_driver().has_callbacks()
+            && !document->has_associated_animations()
+            && !document->has_intersection_observers()
+            && !document->has_resize_observers()
+            && !document->needs_media_query_list_evaluation();
+    });
 
     // FIXME: 5. Remove from docs all Document objects for which the user agent believes that it's preferable to skip updating the rendering for other reasons.
 
@@ -564,7 +946,12 @@ void EventLoop::update_the_rendering()
         if (auto navigable = document->navigable()) {
             navigable->process_main_thread_smooth_scrolls();
             navigable->adopt_pending_async_scroll_offsets();
+            navigable->end_scroll_sequences_that_completed_since_the_last_frame();
         }
+        // AD-HOC: A text control that script edited reveals its cursor now, once for all of the edits. See the note
+        //         at FormAssociatedTextControlElement::CursorRevealAfterEdit.
+        if (auto* text_control = as_if<FormAssociatedTextControlElement>(document->focused_area().ptr()))
+            text_control->reveal_cursor_if_pending();
         document->run_the_scroll_steps();
     }
 
@@ -585,150 +972,290 @@ void EventLoop::update_the_rendering()
 
     // FIXME: 13. For each doc of docs, if the user agent detects that the backing storage associated with a CanvasRenderingContext2D or an OffscreenCanvasRenderingContext2D, context, has been lost, then it must run the context lost steps for each such context:
 
+    // https://wicg.github.io/video-rvfc/#video-rvfc-rendering-step
+    // For each fully active Document in docs, for each associated video element for that Document, run the video
+    // frame request callbacks passing now as the timestamp.
+    for (auto& document : docs)
+        document->run_the_video_frame_request_callbacks(relative_frame_timestamp_for(*document));
+
     // 14. For each doc of docs, run the animation frame callbacks for doc, passing in the relative high resolution time given frameTimestamp and doc's relevant global object as the timestamp.
     for (auto& document : docs) {
         auto now = relative_frame_timestamp_for(*document);
         run_animation_frame_callbacks(*document, now);
+        document->window()->animation_frame_callback_driver().run_after_callbacks(now);
     }
+
+    // AD-HOC: Captures in this update's video frame and animation frame callbacks draw the frame that the video frame
+    //         callbacks' metadata described. Later captures draw whatever frame is presented then.
+    for (auto& document : docs)
+        document->release_video_frames_held_for_callbacks();
 
     // FIXME: 15. Let unsafeStyleAndLayoutStartTime be the unsafe shared current time.
 
-    // 16. For each doc of docs:
-    for (auto& document : docs) {
-        // 1. Let resizeObserverDepth be 0.
-        size_t resize_observer_depth = 0;
+    // AD-HOC: The rest of the last rendering update runs before anything of this one's style and layout, and after
+    //         the steps of this one that ran script.
+    note_script_ran_beside_rendering_update_in_flight();
+    finish_ended_rendering_update_in_flight();
 
-        // https://github.com/whatwg/html/pull/11613
-        // AD-HOC: Let didRunSnapshotPostLayoutStateSteps be false.
-        bool did_run_snapshot_post_layout_state_steps = false;
-
-        // 2. While true:
-        while (true) {
-            // 1. Recalculate styles and update layout for doc.
-            // NOTE: Recalculation of styles is handled by update_layout()
-            document->update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
-
-            // AD-HOC: Script that ran earlier in this rendering update may have spun the event loop (e.g. with a
-            //         synchronous XHR) and run tasks that stopped document from being actively rendered, for example
-            //         by detaching it from its navigable after its iframe was removed. update_layout() is a no-op for
-            //         such documents, which can leave them without a paint tree, so skip the rest of this step.
-            if (!document->navigable() || document->navigable()->active_document().ptr() != document.ptr())
-                break;
-
-            // Clamp viewport scroll offset to valid range after layout, in case the
-            // scrollable overflow area has shrunk (e.g. after a viewport size change).
-            if (auto navigable = document->navigable()) {
-                navigable->clamp_viewport_scroll_offset();
-
-                // AD-HOC: A user scroll gesture that ended while layout was out of date could not select the snap
-                //         position it ends at, so it does now.
-                navigable->snap_user_scroll_gestures_that_awaited_layout();
-            }
-
-            // https://github.com/whatwg/html/pull/11613
-            // AD-HOC: If didRunSnapshotPostLayoutStateSteps is false:
-            if (!did_run_snapshot_post_layout_state_steps) {
-                // 1. Run snapshot post-layout state steps for doc.
-                // NB: The state these steps snapshot is what scroll-state() container queries read. The content-visibility
-                //     steps below are part of them in that change, but they stay where they are until it lands.
-                bool snapshotted_state_changed = document->scroll_state_query_containers().snapshot_post_layout_state(*document, CSS::ScrollStateQueryContainers::Snapshot::AllContainers);
-
-                // 2. Set didRunSnapshotPostLayoutStateSteps to true.
-                did_run_snapshot_post_layout_state_steps = true;
-
-                // 3. If any snapshotted state changed, then continue.
-                if (snapshotted_state_changed)
-                    continue;
-            }
-
-            // AD-HOC: Set didRunSnapshotPostLayoutStateSteps to false.
-            did_run_snapshot_post_layout_state_steps = false;
-
-            // 2. Let hadInitialVisibleContentVisibilityDetermination be false.
-            bool had_initial_visible_content_visibility_determination = false;
-
-            // 3. For each element element with 'auto' used value of 'content-visibility':
-            auto* document_element = document->document_element();
-            if (document_element) {
-                for (auto box_slot : document->paint_state().boxes_with_auto_content_visibility()) {
-                    auto* layout_node = Painting::layout_node_for_committed_slot(document->layout_node_arena(), box_slot);
-                    if (!layout_node)
-                        continue;
-                    auto* element = as_if<DOM::Element>(layout_node->dom_node());
-                    if (!element)
-                        continue;
-
-                    // 1. Let checkForInitialDetermination be true if element's proximity to the viewport is not determined and it is not relevant to the user. Otherwise, let checkForInitialDetermination be false.
-                    bool check_for_initial_determination = element->proximity_to_the_viewport() == Web::DOM::ProximityToTheViewport::NotDetermined && !element->is_relevant_to_the_user();
-
-                    // 2. Determine proximity to the viewport for element.
-                    element->determine_proximity_to_the_viewport();
-
-                    // 3. If checkForInitialDetermination is true and element is now relevant to the user, then set hadInitialVisibleContentVisibilityDetermination to true.
-                    if (check_for_initial_determination && element->is_relevant_to_the_user()) {
-                        had_initial_visible_content_visibility_determination = true;
-                    }
-                }
-            }
-
-            // 4. If hadInitialVisibleContentVisibilityDetermination is true, then continue.
-            if (had_initial_visible_content_visibility_determination)
-                continue;
-
-            // 5. Gather active resize observations at depth resizeObserverDepth for doc.
-            document->gather_active_observations_at_depth(resize_observer_depth);
-
-            // 6. If doc has active resize observations:
-            if (document->has_active_resize_observations()) {
-                // 1. Set resizeObserverDepth to the result of broadcasting active resize observations given doc.
-                resize_observer_depth = document->broadcast_active_resize_observations();
-
-                // 2. Continue.
-                continue;
-            }
-
-            // 7. Otherwise, break.
-            break;
-        }
-
-        // 3. If doc has skipped resize observations, then deliver resize loop error given doc.
-        if (document->has_skipped_resize_observations()) {
-            // FIXME: Deliver resize loop error.
-        }
-
-        // https://drafts.csswg.org/scroll-animations-1/#event-loop
-        // During step 7.14.1 of the HTML Processing Model, any created scroll progress timelines or view progress
-        // timelines are collected into a stale timelines set. After step 7.14 if any timelines' named timeline ranges
-        // have changed, these timelines are added to the stale timelines set. If there are any stale timelines they now
-        // update their current time and associated ranges, the set of stale timelines is cleared and we run an additional
-        // step to recalculate styles and update layout.
-
-        // AD-HOC: This was step 7.14.1 at the time the CSS web-animations spec was written, but it has since been
-        //         moved, see https://github.com/w3c/csswg-drafts/issues/12120
-
-        bool requires_style_and_layout_update = false;
-
-        TemporaryExecutionContext context { document->relevant_settings_object() };
-
-        for (auto const& timeline : document->associated_animation_timelines()) {
-            auto* scroll_timeline = as_if<Animations::ScrollTimeline>(*timeline);
-
-            if (!scroll_timeline)
-                continue;
-
-            if (!scroll_timeline->is_stale())
-                continue;
-
-            // NB: The passed timestamp is ignored for ScrollTimelines so we can just use 0.
-            timeline->update_current_time(0);
-            requires_style_and_layout_update = true;
-        }
-
-        if (requires_style_and_layout_update)
-            document->update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
+    // AD-HOC: A doc the update took the lanes of in, which was not renderable or which script left unrenderable since,
+    //         seals no plan: its lanes present nothing more, and hold none of its tasks. The plan the last rendering
+    //         update sealed as it finished goes before.
+    for (auto& document : documents_with_lanes) {
+        if (any_of(docs, [&](auto const& rendered) { return rendered.ptr() == document.ptr(); }))
+            continue;
+        if (auto* arena = document->layout_node_arena_if_created())
+            Layout::RustFFI::document_host_drop_clock_plan(arena->host(), m_rendering_update_serial);
     }
 
-    // FIXME: 17. For each doc of docs, if the focused area of doc is not a focusable area, then run the focusing steps for doc's viewport, and set doc's relevant global object's navigation API's focus changed during ongoing navigation to false.
+    // 16. For each doc of docs:
+    for (size_t document_index = 0; document_index < docs.size(); ++document_index) {
+        // AD-HOC: The style transaction of the last doc of docs flies beside the event loop where nothing keeps it in
+        //         step, and the update ends its task here: it goes on with the doc's style and layout once the event
+        //         loop takes the transaction in, between two tasks. A styled doc with no style to change lets the
+        //         first round of its layout fly the same way. Every doc before it, its container's included, is laid
+        //         out in step first, so that no doc's step waits for another doc's frame to land.
+        auto& document = *docs[document_index];
+        if (document_index == docs.size() - 1) {
+            if (auto blocker = style_flight_blocker(document); blocker == Layout::RustFFI::FfiFlightBlocker::None) {
+                ensure_frame_completion_registered();
+                auto style_taken_in = StyleTakenIn::No;
+                bool flies = document.let_style_update_fly(blocker);
+                // A doc's first style and layout, as it loads, stay in step with the event loop.
+                if (!flies && document.has_completed_style_update()) {
+                    style_taken_in = StyleTakenIn::Yes;
+                    flies = document.let_layout_fly(blocker);
+                }
+                if (flies) {
+                    // The rendering task ends here: a rendering opportunity meanwhile queues the next one, which keeps
+                    // its place in the queue until this update has finished.
+                    m_running_rendering_task = false;
+                    auto layout_held_for_testing = style_taken_in == StyleTakenIn::Yes && exchange(m_holds_next_layout_for_testing, false) ? LayoutHeldForTesting::Yes : LayoutHeldForTesting::No;
+                    auto held_tasks = tasks_rendering_update_holds(docs, style_taken_in, layout_held_for_testing);
+                    m_rendering_update_in_flight = make<RenderingUpdateInFlight>(move(docs), frame_timestamp, m_rendering_update_serial, exchange(m_holds_next_frame_for_testing, false), held_tasks, style_taken_in == StyleTakenIn::Yes, held_tasks);
+                    // The next rendering opportunity is asked for now, so that the next update can begin as soon as
+                    // this one has run, or has ended.
+                    finish_rendering_update(update_start_time);
+                    return;
+                }
+            }
+        }
+        update_style_and_layout_for_rendering(document, m_rendering_update_serial);
+    }
+
+    update_the_rendering_after_style_and_layout(docs, frame_timestamp, m_rendering_update_serial);
+    finish_rendering_update(update_start_time);
+}
+
+void EventLoop::update_whether_font_face_sets_are_pending_on_the_environment(Vector<GC::Root<DOM::Document>> const& docs, TakenLayout taken_layout)
+{
+    for (auto& document : docs) {
+        // https://drafts.csswg.org/css-font-loading/#fontfaceset-pending-on-the-environment
+        // A FontFaceSet is pending on the environment if any of the following are true:
+        // - the document is still loading
+        // - the document has pending stylesheet requests
+        // - the document has pending layout operations which might cause the user agent to request a font, or which depend on recently-loaded fonts
+        TemporaryExecutionContext context(document->relevant_settings_object(), TemporaryExecutionContext::CallbacksEnabled::Yes);
+        document->fonts()->set_is_pending_on_the_environment(document->readiness() == DocumentReadyState::Loading
+            || document->has_pending_style_sheet_requests()
+            || (taken_layout == TakenLayout::UpToDate && !document->layout_is_up_to_date()));
+    }
+}
+
+// Step 16 of updating the rendering, for one doc of docs: its style and layout, and the resize observations they
+// answer.
+static void update_style_and_layout_for_rendering(DOM::Document& document, u64 update_serial)
+{
+    // 1. Let resizeObserverDepth be 0.
+    size_t resize_observer_depth = 0;
+
+    // https://github.com/whatwg/html/pull/11613
+    // AD-HOC: Let didRunSnapshotPostLayoutStateSteps be false.
+    bool did_run_snapshot_post_layout_state_steps = false;
+
+    // 2. While true:
+    while (true) {
+        // 1. Recalculate styles and update layout for doc.
+        // NOTE: Recalculation of styles is handled by update_layout()
+        Layout::ForcedReadScope read { document };
+        document.update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
+
+        // AD-HOC: Script that ran earlier in this rendering update may have spun the event loop (e.g. with a
+        //         synchronous XHR) and run tasks that stopped document from being actively rendered, for example
+        //         by detaching it from its navigable after its iframe was removed. update_layout() is a no-op for
+        //         such documents, which can leave them without a paint tree, so skip the rest of this step.
+        if (!document.navigable() || document.navigable()->active_document().ptr() != &document)
+            break;
+
+        // Clamp viewport scroll offset to valid range after layout, in case the
+        // scrollable overflow area has shrunk (e.g. after a viewport size change).
+        if (auto navigable = document.navigable()) {
+            navigable->clamp_viewport_scroll_offset();
+
+            // AD-HOC: A user scroll gesture that ended while layout was out of date could not select the snap
+            //         position it ends at, so it does now.
+            navigable->snap_user_scroll_gestures_that_awaited_layout();
+        }
+
+        // https://github.com/whatwg/html/pull/11613
+        // AD-HOC: If didRunSnapshotPostLayoutStateSteps is false:
+        if (!did_run_snapshot_post_layout_state_steps) {
+            // 1. Run snapshot post-layout state steps for doc.
+            // NB: The state these steps snapshot is what scroll-state() container queries read. The content-visibility
+            //     steps below are part of them in that change, but they stay where they are until it lands.
+            bool snapshotted_state_changed = document.scroll_state_query_containers().snapshot_post_layout_state(read, document, CSS::ScrollStateQueryContainers::Snapshot::AllContainers);
+
+            // 2. Set didRunSnapshotPostLayoutStateSteps to true.
+            did_run_snapshot_post_layout_state_steps = true;
+
+            // 3. If any snapshotted state changed, then continue.
+            if (snapshotted_state_changed)
+                continue;
+        }
+
+        // AD-HOC: Set didRunSnapshotPostLayoutStateSteps to false.
+        did_run_snapshot_post_layout_state_steps = false;
+
+        // 2. Let hadInitialVisibleContentVisibilityDetermination be false.
+        bool had_initial_visible_content_visibility_determination = false;
+
+        // 3. For each element element with 'auto' used value of 'content-visibility':
+        auto* document_element = document.document_element();
+        if (document_element) {
+            for (auto box_slot : document.paint_state().boxes_with_auto_content_visibility()) {
+                auto* layout_node = Painting::layout_node_for_committed_slot(read, document.layout_node_arena(), box_slot);
+                if (!layout_node)
+                    continue;
+                auto* element = as_if<DOM::Element>(layout_node->dom_node());
+                if (!element)
+                    continue;
+
+                // 1. Let checkForInitialDetermination be true if element's proximity to the viewport is not determined and it is not relevant to the user. Otherwise, let checkForInitialDetermination be false.
+                bool check_for_initial_determination = element->proximity_to_the_viewport() == Web::DOM::ProximityToTheViewport::NotDetermined && !element->is_relevant_to_the_user();
+
+                // 2. Determine proximity to the viewport for element.
+                element->determine_proximity_to_the_viewport(read);
+
+                // 3. If checkForInitialDetermination is true and element is now relevant to the user, then set hadInitialVisibleContentVisibilityDetermination to true.
+                if (check_for_initial_determination && element->is_relevant_to_the_user()) {
+                    had_initial_visible_content_visibility_determination = true;
+                }
+            }
+        }
+
+        // 4. If hadInitialVisibleContentVisibilityDetermination is true, then continue.
+        if (had_initial_visible_content_visibility_determination)
+            continue;
+
+        // 5. Gather active resize observations at depth resizeObserverDepth for doc.
+        document.gather_active_observations_at_depth(resize_observer_depth, update_serial);
+
+        // 6. If doc has active resize observations:
+        if (document.has_active_resize_observations()) {
+            // 1. Set resizeObserverDepth to the result of broadcasting active resize observations given doc.
+            resize_observer_depth = document.broadcast_active_resize_observations(read);
+
+            // 2. Continue.
+            continue;
+        }
+
+        // https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
+        // At the time that ResizeObserver events are determined and delivered, the box must record the last
+        // successful position option.
+        if (auto* layout_node_arena = document.layout_node_arena_if_created())
+            Layout::RustFFI::render_state_record_last_successful_position_options(layout_node_arena->host());
+
+        // 7. Otherwise, break.
+        break;
+    }
+
+    // 3. If doc has skipped resize observations, then deliver resize loop error given doc.
+    if (document.has_skipped_resize_observations()) {
+        // FIXME: Deliver resize loop error.
+    }
+
+    // https://drafts.csswg.org/scroll-animations-1/#event-loop
+    // During step 7.14.1 of the HTML Processing Model, any created scroll progress timelines or view progress
+    // timelines are collected into a stale timelines set. After step 7.14 if any timelines' named timeline ranges
+    // have changed, these timelines are added to the stale timelines set. If there are any stale timelines they now
+    // update their current time and associated ranges, the set of stale timelines is cleared and we run an additional
+    // step to recalculate styles and update layout.
+
+    // AD-HOC: This was step 7.14.1 at the time the CSS web-animations spec was written, but it has since been
+    //         moved, see https://github.com/w3c/csswg-drafts/issues/12120
+
+    bool requires_style_and_layout_update = false;
+
+    TemporaryExecutionContext context { document.relevant_settings_object() };
+
+    // NB: The animations that name their timeline find the timelines that style update and layout declared. An
+    //     animation that moved to another timeline takes its time from it in this frame, so the timelines update their
+    //     current time and style and layout run again.
+    bool animations_changed_timeline = false;
+    if (document.has_named_timelines())
+        animations_changed_timeline = document.named_timelines().update_tracked_animations();
+    if (animations_changed_timeline)
+        requires_style_and_layout_update = true;
+
+    GC::RootVector timelines = { document.associated_animation_timelines().values() };
+    for (auto const& timeline : timelines) {
+        auto* scroll_timeline = as_if<Animations::ScrollTimeline>(*timeline);
+
+        if (!scroll_timeline)
+            continue;
+
+        if (!animations_changed_timeline && !scroll_timeline->is_stale())
+            continue;
+
+        // NB: The passed timestamp is ignored for ScrollTimelines so we can just use 0.
+        timeline->update_current_time(0);
+        requires_style_and_layout_update = true;
+    }
+
+    if (requires_style_and_layout_update)
+        document.update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
+}
+
+// Steps 17 to 23 of updating the rendering, once step 16 has laid out every doc of docs.
+void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM::Document>> const& docs, double frame_timestamp, u64 update_serial, TakenLayout taken_layout, RenderingUpdateInFlight const* update_in_flight)
+{
+    auto relative_frame_timestamp_for = [&](DOM::Document const& document) {
+        return max(0.0, HighResolutionTime::relative_high_resolution_time(frame_timestamp, relevant_global_object(document)));
+    };
+
+    // AD-HOC: The CSS animations and transitions the style updates of step 16 began render their first frame in this
+    //         update, which makes them ready (https://drafts.csswg.org/web-animations-1/#ready): their pending play
+    //         tasks run at its time, and the layout of step 19 samples them from there. Left pending until the next
+    //         update, they would not run in the tasks before it, beside which the render clock ticks a document's
+    //         running animations. What the compositor may run keeps the start it is handed until then.
+    for (auto& document : docs) {
+        // NB: A play task resolves the animation's ready promise.
+        TemporaryExecutionContext execution_context { document->relevant_settings_object() };
+        GC::RootVector timelines = { document->associated_animation_timelines().values() };
+        for (auto const& timeline : timelines) {
+            GC::RootVector<GC::Ref<Animations::Animation>> pending_css_animations;
+            for (auto& animation : timeline->associated_animations()) {
+                if (rendering_update_makes_ready(animation))
+                    pending_css_animations.append(animation);
+            }
+            for (auto& animation : pending_css_animations)
+                animation->run_pending_play_task_if_ready();
+        }
+    }
+
+    // 17. For each doc of docs, if the focused area of doc is not a focusable area, then run the focusing steps for doc's viewport, and set doc's relevant global object's navigation API's focus changed during ongoing navigation to false.
+    for (auto& document : docs) {
+        if (!document->is_fully_active())
+            continue;
+        // AD-HOC: Script that ran beside a rendering update in flight comes after the whole of it. The update holds the
+        //         tasks of a doc whose focused area is not its viewport, so that script found the viewport focused, which
+        //         needs no fixup: the next rendering update fixes up what the script focused.
+        if (update_in_flight && update_in_flight->ran_script_of_beside(*document)) {
+            if (focus_fixup_rule_applies(*document))
+                document->page().client().request_frame();
+            continue;
+        }
+        run_focus_fixup_rule(*document);
+    }
 
     // 18. For each doc of docs, perform pending transition operations for doc. [CSSVIEWTRANSITIONS]
     for (auto& document : docs) {
@@ -737,6 +1264,10 @@ void EventLoop::update_the_rendering()
 
     // 19. For each doc of docs, run the update intersection observations steps for doc, passing in the relative high resolution time given now and doc's relevant global object as the timestamp. [INTERSECTIONOBSERVER]
     for (auto& document : docs) {
+        // NB: An update whose layout flew had nothing to observe as it ended: what was observed since is the next update's.
+        if (taken_layout == TakenLayout::AsItFlew)
+            break;
+
         // AD-HOC: Script that ran earlier in this rendering update may have detached document from its navigable, as
         //         in step 16. Its layout and paint state stay behind, but nothing is rendered for it anymore.
         if (!document->navigable() || document->navigable()->active_document().ptr() != document.ptr())
@@ -749,14 +1280,42 @@ void EventLoop::update_the_rendering()
         auto now = relative_frame_timestamp_for(*document);
         document->run_the_update_intersection_observations_steps(now);
 
-        // AD-HOC: Whether a video sink is ticked depends on whether the element would be painted, which is only known
-        //         once layout is settled, so it is decided here rather than at the points that invalidate it.
+        // AD-HOC: The cursor shows the style the update applied to what the pointer is over.
+        document->navigable()->event_handler().update_cursor_after_rendering_update();
+    }
+
+    // AD-HOC: Whether a video sink is ticked depends on whether the element would be painted, which is only known once
+    //         layout is settled, so it is decided here rather than at the points that invalidate it. A page's media
+    //         elements live in any of its documents, so this waits until step 19 has laid out every one of them: a task
+    //         that ran beside a later document's frame in flight may have left an earlier document's layout stale.
+    GC::RootVector<GC::Ref<Page>, 1> synced_pages;
+    for (auto& document : docs) {
+        if (!document->navigable() || document->navigable()->active_document().ptr() != document.ptr())
+            continue;
+        if (synced_pages.contains_slow(GC::Ref { document->page() }))
+            continue;
+        synced_pages.append(document->page());
         document->page().sync_media_element_video_sink_ticking();
     }
 
     // FIXME: 20. For each doc of docs, record rendering time for doc given unsafeStyleAndLayoutStartTime.
 
-    // FIXME: 21. For each doc of docs, mark paint timing for doc.
+    // 21. For each doc of docs, mark paint timing for doc.
+    for (auto& document : docs) {
+        // AD-HOC: Script that ran earlier in this rendering update may have detached document from its navigable, as
+        //         in step 16. Nothing is rendered for it anymore.
+        if (!document->navigable() || document->navigable()->active_document().ptr() != document.ptr())
+            continue;
+        PaintTiming::mark_paint_timing(*document);
+    }
+
+    // https://w3c.github.io/event-timing/#sec-modifications-HTML
+    // For each fully active Document in docs, invoke the algorithm to dispatch pending Event Timing entries for that
+    // Document.
+    for (auto& document : docs) {
+        if (document->is_fully_active())
+            EventTiming::dispatch_pending_event_timing_entries(*document);
+    }
 
     // AD-HOC: Flush dirty canvas contexts in documents' pages after callbacks
     // have had a chance to update them, and before painting snapshots the frame.
@@ -768,7 +1327,10 @@ void EventLoop::update_the_rendering()
         auto navigable = doc->navigable();
         // AD-HOC: Script that ran earlier in this rendering update may have spun the event loop and run tasks that
         //         detached doc from its navigable (e.g. after its iframe was removed).
-        if (!navigable || !navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate))
+        auto lay_out_first = taken_layout == TakenLayout::UpToDate ? LocalNavigable::LayOutFirst::Yes : LocalNavigable::LayOutFirst::No;
+        if (Core::StatsLog::the() && navigable && !navigable->needs_repaint())
+            did_update_rendering(*doc);
+        if (!navigable || !navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate, lay_out_first))
             continue;
         ++m_rendering_scheduler_counters.paints;
         if (navigable->is_local_root())
@@ -779,8 +1341,11 @@ void EventLoop::update_the_rendering()
     //         UI process routes input over the container's content navigable by. Report the rects of the containers
     //         in docs, whose layout is up to date along with that of every document above them.
     for (auto* container : NavigableContainer::all_instances()) {
-        if (any_of(docs, [&](auto const& document) { return document.ptr() == &container->document(); }))
-            container->report_content_navigable_viewport_rect();
+        if (any_of(docs, [&](auto const& document) { return document.ptr() == &container->document(); })) {
+            // The container's box is the rendering update's own read of its document's render state.
+            Layout::ForcedReadScope read { container->document() };
+            container->report_content_navigable_viewport_rect(read);
+        }
     }
 
     // 23. For each doc of docs, process top layer removals given doc.
@@ -788,17 +1353,240 @@ void EventLoop::update_the_rendering()
         document->process_top_layer_removals();
     }
 
+    // NB: Where the update's layout flew, this runs once the docs no longer read as that layout left them: a FontFaceSet
+    //     that stops being pending on the environment resolves its ready promise, whose reactions run script that may
+    //     write to the docs and read their layout.
+    if (taken_layout == TakenLayout::UpToDate)
+        update_whether_font_face_sets_are_pending_on_the_environment(docs, taken_layout);
+
+    // AD-HOC: The lane of the frame the update presented may tick the document's running animations beside the tasks
+    //         after it, until the next of their events, which the main thread sends, and hover what is under the
+    //         pointer. Only a rendering update leaves a plan for that, and each one leaves every document it renders its
+    //         own, or none, in place of the last.
+    bool const may_plan = !m_running_synchronous_rendering_update && m_spin_depth == 0 && taken_layout == TakenLayout::UpToDate;
     for (auto& document : docs) {
-        // https://drafts.csswg.org/css-font-loading/#fontfaceset-pending-on-the-environment
-        // A FontFaceSet is pending on the environment if any of the following are true:
-        // - the document is still loading
-        // - the document has pending stylesheet requests
-        // - the document has pending layout operations which might cause the user agent to request a font, or which depend on recently-loaded fonts
-        TemporaryExecutionContext context(document->relevant_settings_object(), TemporaryExecutionContext::CallbacksEnabled::Yes);
-        document->fonts()->set_is_pending_on_the_environment(document->readiness() == DocumentReadyState::Loading
-            || document->has_pending_style_sheet_requests()
-            || !document->layout_is_up_to_date());
+        auto* navigable = as_if<LocalNavigable>(document->navigable().ptr());
+        // A same-process iframe's document presents into a compositor context of its own, whose lane ticks its
+        // animations and hovers what the lane of the document around it hands it of the pointer.
+        bool const plans = may_plan && navigable && (navigable->is_local_root() || navigable->has_compositor_context()) && navigable->active_document().ptr() == document.ptr();
+        if (!seal_clock_plan(*document, plans, update_serial))
+            continue;
+        navigable->arm_clock_lane(LocalNavigable::TickNow::No);
+        if (!m_navigables_with_clock_lanes.contains_slow(GC::Ref { *navigable }))
+            m_navigables_with_clock_lanes.append(*navigable);
     }
+}
+
+Layout::RustFFI::FfiFlightBlocker EventLoop::style_flight_blocker(DOM::Document& document) const
+{
+    using Blocker = Layout::RustFFI::FfiFlightBlocker;
+    // A rendering update inside a nested event loop finishes before the task that spins it goes on.
+    if (m_running_synchronous_rendering_update || m_spin_depth > 0)
+        return Blocker::NotInRenderingUpdate;
+    if (document.has_active_view_transition())
+        return Blocker::ViewTransition;
+    if (document.scroll_state_query_containers().has_containers())
+        return Blocker::ScrollStateContainer;
+    if (document.has_boxes_with_auto_content_visibility())
+        return Blocker::ContentVisibilityAuto;
+    for (auto const& timeline : document.associated_animation_timelines()) {
+        if (is<Animations::ScrollTimeline>(*timeline))
+            return Blocker::ScrollTimeline;
+    }
+    // The animations that name their timeline look it up again after style and layout.
+    if (document.has_named_timelines())
+        return Blocker::ScrollTimeline;
+    return Blocker::None;
+}
+
+void EventLoop::resume_rendering_update_in_flight()
+{
+    auto update = m_rendering_update_in_flight.release_nonnull();
+    {
+        TemporaryChange running { m_running_rendering_task, true };
+        // The style and layout of the doc whose transaction flew take it in, waiting for it to land.
+        update_style_and_layout_for_rendering(update->document(), update->serial);
+        update_the_rendering_after_style_and_layout(update->docs, update->frame_timestamp, update->serial, TakenLayout::UpToDate, update.ptr());
+    }
+    // What the steps asked for, an animation frame of a promise they resolved for one, asks for the next rendering
+    // opportunity now, unless a rendering update runs, whose end asks for it.
+    if (!m_running_rendering_task) {
+        for (auto const& page : pages_of_local_roots())
+            page->client().did_finish_rendering_update();
+    }
+}
+
+// The rest of the last rendering update, which ended as its style transaction flew, runs before anything of the next
+// one's style and layout. Where its layout flew as well, its steps go on from that layout, as it left the document: what
+// the next update wrote since is that update's, which the render state takes in behind them.
+void EventLoop::finish_ended_rendering_update_in_flight()
+{
+    if (m_rendering_update_in_flight && m_rendering_update_in_flight->ended() && m_rendering_update_in_flight->layout_flew
+        && finish_ended_rendering_update_as_its_layout_flew())
+        return;
+    finish_rendering_update_in_flight();
+}
+
+// Answers whether the layout that flew laid the doc out, as the update's steps then went on from it.
+bool EventLoop::finish_ended_rendering_update_as_its_layout_flew()
+{
+    auto& document = m_rendering_update_in_flight->document();
+    OwnPtr<RenderingUpdateInFlight> update;
+    {
+        DOM::Document::LayoutAsItFlew layout_as_it_flew { document };
+        if (!document.take_flown_layout_in())
+            return false;
+        update = m_rendering_update_in_flight.release_nonnull();
+        if (auto navigable = document.navigable())
+            navigable->clamp_viewport_scroll_offset();
+        update_the_rendering_after_style_and_layout(update->docs, update->frame_timestamp, update->serial, TakenLayout::AsItFlew, update.ptr());
+    }
+    update_whether_font_face_sets_are_pending_on_the_environment(update->docs, TakenLayout::AsItFlew);
+    return true;
+}
+
+void EventLoop::note_script_ran_beside_rendering_update_in_flight()
+{
+    if (m_rendering_update_in_flight)
+        m_rendering_update_in_flight->script_ran_beside = true;
+}
+
+u64 EventLoop::first_rendering_update_to_gather_resize_observations_of(DOM::Document const& document) const
+{
+    if (m_rendering_update_in_flight && &m_rendering_update_in_flight->document() == &document)
+        return m_rendering_update_in_flight->serial + 1;
+    return 0;
+}
+
+void EventLoop::finish_rendering_update_in_flight()
+{
+    // The steps after the style transaction take it in, waiting for it to land.
+    if (m_rendering_update_in_flight)
+        resume_rendering_update_in_flight();
+}
+
+void EventLoop::did_commit_frame(LocalNavigable& navigable, CommittedFrameRecords records)
+{
+    // A test holds a recording itself, on the Paint thread; it only spends the hold the next style flight would take.
+    if (records == CommittedFrameRecords::Yes)
+        m_holds_next_frame_for_testing = false;
+    m_navigables_with_frames_in_flight.append(navigable);
+}
+
+void EventLoop::did_take_frame_in(LocalNavigable& navigable)
+{
+    auto removed = m_navigables_with_frames_in_flight.remove_first_matching([&](auto const& entry) { return entry.ptr() == &navigable; });
+    VERIFY(removed);
+}
+
+void EventLoop::take_committed_frames_in()
+{
+    while (!m_navigables_with_frames_in_flight.is_empty())
+        (void)m_navigables_with_frames_in_flight.last()->take_recording_in_flight_in(LocalNavigable::TakeIn::Wait);
+}
+
+void EventLoop::ensure_frame_completion_registered()
+{
+    // Every recording that finishes beside the event loop posts to it, so that an idle event loop wakes to take it in.
+    // This is set up before the first recording is submitted, so that not even the first finish goes unseen, and not
+    // in the constructor, which may run before the thread has a Core event loop.
+    if (exchange(m_frame_completion_registered, true))
+        return;
+    Layout::RustFFI::stage_thread_set_flight_finished([] { FrameCompletion::the().post(); });
+    FrameCompletion::the().register_event_loop([] { main_thread_event_loop().schedule(); });
+}
+
+bool EventLoop::has_frame_in_flight() const
+{
+    if (m_rendering_update_in_flight && m_rendering_update_in_flight->document().style_computer().style_engine().render_document().frame_flies())
+        return true;
+    return !m_navigables_with_frames_in_flight.is_empty();
+}
+
+bool EventLoop::lays_out_rendering_update_in_flight() const
+{
+    return m_rendering_update_in_flight && m_rendering_update_in_flight->layout_flew;
+}
+
+bool EventLoop::holds_rendering_opportunity() const
+{
+    return m_rendering_update_in_flight && !m_rendering_update_in_flight->ended();
+}
+
+bool EventLoop::holds_tasks_of(DOM::Document const* document) const
+{
+    // A test that holds the update in flight runs the document's tasks beside it.
+    if (!m_rendering_update_in_flight || m_rendering_update_in_flight->held_for_testing)
+        return false;
+    return rendering_update_in_flight_holds_tasks_of(document);
+}
+
+bool EventLoop::rendering_update_in_flight_holds_tasks_of_for_testing(DOM::Document const& document) const
+{
+    return m_rendering_update_in_flight && rendering_update_in_flight_holds_tasks_of(&document);
+}
+
+bool EventLoop::rendering_update_in_flight_holds_tasks_of(DOM::Document const* document) const
+{
+    auto const& update = *m_rendering_update_in_flight;
+    switch (update.held_tasks) {
+    case HeldTasks::None:
+        return false;
+    case HeldTasks::OfLastDocument:
+        return !document || document == &update.document();
+    case HeldTasks::All:
+        return true;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+// The layout of the doc whose style transaction flew runs beside the event loop as well, once the event loop has taken
+// the transaction in. Answers whether it flies.
+bool EventLoop::let_layout_of_rendering_update_fly()
+{
+    auto& update = *m_rendering_update_in_flight;
+    VERIFY(!update.layout_flew);
+    auto& document = update.document();
+    if (!document.let_layout_fly(style_flight_blocker(document)))
+        return false;
+    update.layout_flew = true;
+    update.held_tasks = tasks_rendering_update_holds(update.docs, StyleTakenIn::Yes, exchange(m_holds_next_layout_for_testing, false) ? LayoutHeldForTesting::Yes : LayoutHeldForTesting::No);
+    update.least_held_tasks = min(update.least_held_tasks, update.held_tasks);
+    return true;
+}
+
+void EventLoop::take_finished_frames_in()
+{
+    // A rendering update whose style transaction, then layout, has landed goes on; the tasks before that run beside it,
+    // but for those it holds back, which wait. None is in flight in a nested event loop, which finishes it as it begins,
+    // and a paused event loop does not come here.
+    if (m_rendering_update_in_flight && !m_rendering_update_in_flight->held_for_testing
+        && !CSS::StyleEngineFFI::style_engine_style_transaction_flies(m_rendering_update_in_flight->document().style_computer().style_engine().host())
+        && (m_rendering_update_in_flight->layout_flew || !let_layout_of_rendering_update_fly()))
+        resume_rendering_update_in_flight();
+
+    // A frame that was taken in leaves the list as it is, which moves only the entries after it.
+    for (size_t index = m_navigables_with_frames_in_flight.size(); index-- > 0;)
+        (void)m_navigables_with_frames_in_flight[index]->take_recording_in_flight_in(LocalNavigable::TakeIn::IfFinished);
+}
+
+// AD-HOC: The render clock's lanes follow the frames a document presents: they hover what is under the pointer whenever
+//         the pointer moves, and sample the document's running animations while a task runs. An idle event loop's
+//         rendering updates run the animations.
+void EventLoop::note_clock_lanes(ClockAnimations animations)
+{
+    m_navigables_with_clock_lanes.remove_all_matching([&](auto const& navigable) {
+        return !navigable->note_clock_lane(animations);
+    });
+}
+
+void EventLoop::release_held_frames_for_testing()
+{
+    m_holds_next_frame_for_testing = false;
+    m_holds_next_layout_for_testing = false;
+    if (m_rendering_update_in_flight)
+        m_rendering_update_in_flight->held_for_testing = false;
+    schedule();
 }
 
 void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps)
@@ -808,7 +1596,7 @@ void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps)
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-task
-TaskID queue_a_task(HTML::Task::Source source, GC::Ptr<EventLoop> event_loop, GC::Ptr<DOM::Document> document, GC::Ref<GC::Function<void()>> steps, Task::Priority priority)
+TaskID queue_a_task(HTML::Task::Source source, GC::Ptr<EventLoop> event_loop, GC::Ptr<DOM::Document> document, GC::Ref<GC::Function<void()>> steps, Task::Priority priority, GC::Ptr<GC::Function<void()>> discard_steps)
 {
     // 1. If event loop was not given, set event loop to the implied event loop.
     if (!event_loop)
@@ -821,7 +1609,7 @@ TaskID queue_a_task(HTML::Task::Source source, GC::Ptr<EventLoop> event_loop, GC
     // 5. Set task's source to source.
     // 6. Set task's document to the document.
     // 7. Set task's script evaluation environment settings object set to an empty set.
-    auto task = HTML::Task::create(source, document, steps, priority);
+    auto task = HTML::Task::create(source, document, steps, priority, discard_steps);
 
     // 8. Let queue be the task queue to which source is associated on event loop.
     // 9. Append task to queue.
@@ -834,7 +1622,7 @@ TaskID queue_a_task(HTML::Task::Source source, GC::Ptr<EventLoop> event_loop, GC
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task
-TaskID queue_global_task(HTML::Task::Source source, JS::Object& global_object, GC::Ref<GC::Function<void()>> steps, Task::Priority priority)
+TaskID queue_global_task(HTML::Task::Source source, JS::Object& global_object, GC::Ref<GC::Function<void()>> steps, Task::Priority priority, GC::Ptr<GC::Function<void()>> discard_steps)
 {
     // 1. Let event loop be global's relevant agent's event loop.
     auto& event_loop = relevant_agent(global_object).event_loop;
@@ -845,7 +1633,7 @@ TaskID queue_global_task(HTML::Task::Source source, JS::Object& global_object, G
         document = &window_object->associated_document();
 
     // 3. Queue a task given source, event loop, document, and steps.
-    return queue_a_task(source, *event_loop, document, steps, priority);
+    return queue_a_task(source, *event_loop, document, steps, priority, discard_steps);
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-microtask
@@ -907,7 +1695,9 @@ void EventLoop::perform_a_microtask_checkpoint()
     }
 
     // 4. For each environment settings object settingsObject whose responsible event loop is this event loop, notify about rejected promises given settingsObject's global object.
-    auto environments = GC::RootVector { m_related_environment_settings_objects };
+    GC::RootVector<GC::Ref<EnvironmentSettingsObject>> environments;
+    for (auto const& entry : m_related_environment_settings_objects)
+        environments.append(*entry.value);
     for (auto& environment_settings_object : environments) {
         auto& global_object = environment_settings_object->global_object();
         if (auto* worklet_global_scope = Bindings::impl_from<WorkletGlobalScope>(&global_object)) {
@@ -925,6 +1715,9 @@ void EventLoop::perform_a_microtask_checkpoint()
 
     // 7. Set the event loop's performing a microtask checkpoint to false.
     m_performing_a_microtask_checkpoint = false;
+
+    if (Core::StatsLog::the())
+        flush_rendering_pending();
 
     // FIXME: 8. Record timing info for microtask checkpoint.
 }
@@ -950,10 +1743,37 @@ void EventLoop::register_document(Badge<DOM::Document>, DOM::Document& document)
     m_documents_sort_dirty = true;
 }
 
+void EventLoop::add_stats(JsonObject& values) const
+{
+    // NB: Read container sizes from the existing document registry, without sorting it or walking any trees.
+    size_t available_images = 0;
+    size_t shared_image_requests = 0;
+    size_t style_sheets = 0;
+    size_t font_faces = 0;
+    for (auto const& document : m_documents) {
+        if (!document)
+            continue;
+        available_images += document->list_of_available_images().size();
+        shared_image_requests += document->shared_resource_requests().size();
+        style_sheets += document->style_scope().style_sheets().size();
+        font_faces += document->fonts()->set_size();
+    }
+    values.set("dom.documents"sv, m_documents.size());
+    values.set("images.available_entries"sv, available_images);
+    values.set("images.shared_requests"sv, shared_image_requests);
+    values.set("css.document_style_sheet_entries"sv, style_sheets);
+    values.set("fonts.face_entries"sv, font_faces);
+    values.set("rendering.updates"sv, m_rendering_scheduler_counters.updates_run);
+    values.set("rendering.paints"sv, m_rendering_scheduler_counters.paints);
+    values.set("rendering.update_duration_us"sv, m_rendering_scheduler_counters.update_microseconds);
+}
+
 void EventLoop::unregister_document(Badge<DOM::Document>, DOM::Document& document)
 {
-    bool did_remove = m_documents.remove_first_matching([&](auto& entry) { return entry.ptr().ptr() == &document; });
-    VERIFY(did_remove);
+    forget_rendering_stats(document);
+    // This runs from the document's finalizer, so the GC may already have cleared our weak pointer to it, as well as to
+    // any other document dying in the same collection.
+    m_documents.remove_all_matching([&](auto const& entry) { return !entry || entry.ptr().ptr() == &document; });
 }
 
 void EventLoop::document_navigable_did_change(Badge<DOM::Document>)
@@ -973,7 +1793,7 @@ void EventLoop::ensure_documents_sorted() const
         return;
     m_documents_sort_dirty = false;
 
-    HashMap<DOM::Document*, size_t> doc_to_index;
+    GC::RootHashMap<DOM::Document*, size_t> doc_to_index;
     doc_to_index.ensure_capacity(m_documents.size());
     for (size_t i = 0; i < m_documents.size(); ++i)
         doc_to_index.set(m_documents[i].ptr().ptr(), i);
@@ -1018,13 +1838,28 @@ EnvironmentSettingsObject& EventLoop::top_of_backup_incumbent_realm_stack()
 
 void EventLoop::register_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject& environment_settings_object)
 {
-    m_related_environment_settings_objects.append(&environment_settings_object);
+    auto result = m_related_environment_settings_objects.set(environment_settings_object.address(), &environment_settings_object);
+    VERIFY(result == HashSetResult::InsertedNewEntry);
 }
 
 void EventLoop::unregister_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject& environment_settings_object)
 {
-    bool did_remove = m_related_environment_settings_objects.remove_first_matching([&](auto& entry) { return entry == &environment_settings_object; });
+    bool did_remove = m_related_environment_settings_objects.remove(environment_settings_object.address());
     VERIFY(did_remove);
+}
+
+GC::Ptr<EnvironmentSettingsObject> EventLoop::environment_settings_object_at(EnvironmentSettingsObjectAddress address) const
+{
+    return m_related_environment_settings_objects.get(address).value_or(nullptr);
+}
+
+GC::Ptr<EnvironmentSettingsObject> EventLoop::environment_settings_object_with_id(EnvironmentId const& id) const
+{
+    for (auto const& entry : m_related_environment_settings_objects) {
+        if (entry.value->id == id)
+            return entry.value;
+    }
+    return nullptr;
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#same-loop-windows
@@ -1093,7 +1928,10 @@ EventLoop::PauseHandle EventLoop::pause(UpdateTheRendering should_update_the_ren
     // 3. If necessary, update the rendering or user interface of any Document or navigable to reflect the current state.
     // NB: UpdateTheRendering::No skips this step, for a caller that must not run author callbacks (e.g., rAF callbacks)
     //     while it's blocked — a sync XHR send(), which may itself have been invoked from within a microtask.
-    if (should_update_the_rendering == UpdateTheRendering::Yes && !m_running_rendering_task) {
+    // A rendering update whose style transaction flies finishes first, as the update whose rendering the user sees.
+    if (should_update_the_rendering == UpdateTheRendering::Yes && m_rendering_update_in_flight) {
+        finish_rendering_update_in_flight();
+    } else if (should_update_the_rendering == UpdateTheRendering::Yes && !m_running_rendering_task) {
         if (m_rendering_task_queued) {
             m_task_queue->remove_tasks_matching([](auto const& task) {
                 return task.source() == Task::Source::Rendering;

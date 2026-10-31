@@ -11,16 +11,20 @@
 //! [`StyleValueData`] is exposed to C++
 //! through cbindgen so that hot accessors compile to inline field reads with no FFI call.
 
+use crate::css::ffi_support::OwnedArc;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-#[cfg(any(test, feature = "style-replay"))]
-use std::cell::RefCell;
-#[cfg(any(test, feature = "style-replay"))]
-use std::collections::HashMap;
-
-use crate::css::css_tokenizer::{ParserSource, ParserTokenKind, SourcePosition, TokenizerInput};
-use crate::css::parser::component_value::{ComponentKind, ComponentSerializationMode, ComponentValue};
+use crate::css::css_tokenizer::{
+    ParserSource, ParserTokenKind, SourcePosition, TextDetacher, TokenizerInput,
+    trim_component_value_boundary_whitespace,
+};
+use crate::css::parser::component_value::{
+    ComponentKind, ComponentSerializationMode, ComponentValue, ComponentValueList, ComponentValueSlice,
+};
+use crate::css::serialize::{
+    original_component_values_source, serialize_component_values_to_utf16, trim_ascii_whitespace_start,
+};
 
 pub(crate) use crate::css::css_string::{CssString, CssStringList};
 
@@ -30,6 +34,7 @@ pub(crate) use crate::css::css_string::{CssString, CssStringList};
 pub struct RetainedComponentValueList {
     pointer: *mut c_void,
     length: usize,
+    token_count: usize,
 }
 
 // SAFETY: This handle owns an immutable boxed slice. The bounds cover the erased element type.
@@ -37,22 +42,30 @@ unsafe impl Send for RetainedComponentValueList where ComponentValue: Send {}
 unsafe impl Sync for RetainedComponentValueList where ComponentValue: Sync {}
 
 impl RetainedComponentValueList {
-    pub(crate) fn from_values(values: Vec<ComponentValue>) -> Self {
-        let mut values = values.into_boxed_slice();
+    pub(crate) fn from_values(values: impl Into<ComponentValueList>) -> Self {
+        let values = values.into();
+        let token_count = values.token_count;
+        let mut values = values.into_vec().into_boxed_slice();
+        TextDetacher::detach(|detacher| values.iter_mut().for_each(|value| value.detach(detacher)));
         let result = Self {
             pointer: values.as_mut_ptr().cast(),
             length: values.len(),
+            token_count,
         };
         std::mem::forget(values);
         result
     }
 
     pub(crate) fn from_source(source: &[u16]) -> Self {
-        let values = crate::css::parser::component_value::consume_a_list_of_component_values(
+        let values = crate::css::parser::component_value::consume_a_counted_list_of_component_values(
             crate::css::css_tokenizer::tokenize_for_parser(source),
         )
         .unwrap_or_default();
         Self::from_values(values)
+    }
+
+    pub(crate) fn as_counted_slice(&self) -> ComponentValueSlice<'_> {
+        ComponentValueSlice::with_token_count(self.as_slice(), self.token_count)
     }
 
     pub(crate) fn as_slice(&self) -> &[ComponentValue] {
@@ -60,7 +73,7 @@ impl RetainedComponentValueList {
             return &[];
         }
         // SAFETY: The allocation is owned by this handle and has `length` initialized elements.
-        unsafe { std::slice::from_raw_parts(self.pointer.cast(), self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer.cast(), self.length) }
     }
 }
 
@@ -103,7 +116,7 @@ fn component_values_without_whitespace(mut values: &[ComponentValue]) -> &[Compo
     values
 }
 
-fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
+pub(crate) fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
     value.len() == expected.len()
         && value
             .iter()
@@ -111,7 +124,7 @@ fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
             .all(|(&left, &right)| u8::try_from(left).is_ok_and(|left| left.eq_ignore_ascii_case(&right)))
 }
 
-fn split_var_arguments(values: &[ComponentValue]) -> Option<(&[u16], Option<&[ComponentValue]>)> {
+pub(crate) fn split_var_arguments(values: &[ComponentValue]) -> Option<(&[u16], Option<&[ComponentValue]>)> {
     if !crate::css::parser::arbitrary_substitution::arguments_are_valid_for_ffi(5, values) {
         return None;
     }
@@ -199,11 +212,9 @@ fn visit_reified_unresolved_segments(
     }
 }
 
-fn scan_custom_property_references(
-    values: &[ComponentValue],
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, *const u16, usize),
-) -> bool {
+// Appends the name of every custom property a `var()` or `inherit()` in `values` refers to, and returns whether every
+// reference names its property with a plain identifier.
+fn scan_custom_property_references<'a>(values: &'a [ComponentValue], references: &mut Vec<&'a [u16]>) -> bool {
     let mut all_references_visible = true;
     for value in values {
         let ComponentKind::Function {
@@ -212,7 +223,7 @@ fn scan_custom_property_references(
         } = &value.kind
         else {
             if let ComponentKind::SimpleBlock { values, .. } = &value.kind {
-                all_references_visible &= scan_custom_property_references(values, context, visit);
+                all_references_visible &= scan_custom_property_references(values, references);
             }
             continue;
         };
@@ -226,27 +237,22 @@ fn scan_custom_property_references(
                 && name[0] == u16::from(b'-')
                 && name[1] == u16::from(b'-')
             {
-                unsafe { visit(context, name.as_ptr(), name.len()) };
+                references.push(name);
             } else {
                 all_references_visible = false;
             }
         }
-        all_references_visible &= scan_custom_property_references(function_values, context, visit);
+        all_references_visible &= scan_custom_property_references(function_values, references);
     }
     all_references_visible
 }
 
-pub(crate) fn custom_property_references(value: &StyleValueData) -> Option<(Vec<Vec<u16>>, bool)> {
+pub(crate) fn custom_property_references(value: &StyleValueData) -> Option<(Vec<&[u16]>, bool)> {
     let StyleValueData::Unresolved { components, .. } = value else {
         return None;
     };
     let mut references = Vec::new();
-    unsafe extern "C" fn collect(context: *mut c_void, name: *const u16, name_length: usize) {
-        let references = unsafe { &mut *context.cast::<Vec<Vec<u16>>>() };
-        references.push(unsafe { std::slice::from_raw_parts(name, name_length) }.to_vec());
-    }
-    let all_references_visible =
-        scan_custom_property_references(components.as_slice(), (&raw mut references).cast(), collect);
+    let all_references_visible = scan_custom_property_references(components.as_slice(), &mut references);
     Some((references, all_references_visible))
 }
 
@@ -267,25 +273,6 @@ pub unsafe extern "C" fn rust_unresolved_style_value_visit_reification(
     };
     let segments = reify_unresolved_segments(components.as_slice());
     visit_reified_unresolved_segments(&segments, context, visit);
-}
-
-/// Visits the name of every custom property a `var()` in an unresolved value refers to, fallbacks
-/// and nested functions included. Returns whether every reference names its property with a plain
-/// identifier; a reference that substitutes its name can read anything.
-///
-/// # Safety
-/// `value` must point at live unresolved style value data, and `visit` must remain callable for
-/// the duration of this function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_unresolved_style_value_visit_custom_property_references(
-    value: *const c_void,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, *const u16, usize),
-) -> bool {
-    let StyleValueData::Unresolved { components, .. } = (unsafe { &*value.cast::<StyleValueData>() }) else {
-        return false;
-    };
-    scan_custom_property_references(components.as_slice(), context, visit)
 }
 
 #[cfg(test)]
@@ -324,16 +311,11 @@ mod unresolved_component_tests {
             && after == &")".encode_utf16().collect::<Vec<_>>()));
     }
 
-    unsafe extern "C" fn collect_reference(context: *mut c_void, name: *const u16, name_length: usize) {
-        let names = unsafe { &mut *context.cast::<Vec<Vec<u16>>>() };
-        names.push(unsafe { std::slice::from_raw_parts(name, name_length) }.to_vec());
-    }
-
     #[test]
     fn reference_scan_reports_dynamic_names() {
         let values = components("var(--one) [inherit(--two)] var(var(--dynamic))");
-        let mut names: Vec<Vec<u16>> = Vec::new();
-        let all_visible = scan_custom_property_references(&values, (&raw mut names).cast(), collect_reference);
+        let mut names = Vec::new();
+        let all_visible = scan_custom_property_references(&values, &mut names);
         assert!(!all_visible);
         assert_eq!(
             names,
@@ -344,15 +326,46 @@ mod unresolved_component_tests {
 
 impl Clone for RetainedComponentValueList {
     fn clone(&self) -> Self {
-        Self::from_values(self.as_slice().to_vec())
+        Self::from_values(self.as_counted_slice().to_owned())
     }
 }
 
 impl PartialEq for RetainedComponentValueList {
-    fn eq(&self, _other: &Self) -> bool {
-        // The retained tree is a parsing/serialization cache. Unresolved value identity is
-        // defined by the source and comparison text fields, as it was before this cache existed.
-        true
+    fn eq(&self, other: &Self) -> bool {
+        fn components_equal(first: &[ComponentValue], second: &[ComponentValue]) -> bool {
+            first.len() == second.len()
+                && first
+                    .iter()
+                    .zip(second)
+                    .all(|(first, second)| match (&first.kind, &second.kind) {
+                        (ComponentKind::Token(first), ComponentKind::Token(second)) => first == second,
+                        (
+                            ComponentKind::Function {
+                                name: first_name,
+                                values: first,
+                            },
+                            ComponentKind::Function {
+                                name: second_name,
+                                values: second,
+                            },
+                        ) => first_name == second_name && components_equal(first, second),
+                        (
+                            ComponentKind::SimpleBlock {
+                                opening: first_opening,
+                                values: first,
+                            },
+                            ComponentKind::SimpleBlock {
+                                opening: second_opening,
+                                values: second,
+                            },
+                        ) => first_opening == second_opening && components_equal(first, second),
+                        _ => false,
+                    })
+        }
+
+        // Parsing retained components depends on their token kinds, even when their normalized
+        // serialization is identical. Source text and positions do not affect this comparison.
+        components_equal(self.as_slice(), other.as_slice())
     }
 }
 
@@ -371,85 +384,11 @@ impl Drop for RetainedComponentValueList {
     }
 }
 
-#[cfg(any(test, feature = "style-replay"))]
-thread_local! {
-    static REPLAY_STYLE_VALUES: RefCell<HashMap<u64, usize>> = RefCell::new(HashMap::new());
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-#[derive(Clone, Copy)]
-struct ReplayStyleValue {
-    token: u64,
-    dependency_flags: u8,
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-fn replay_style_values() -> &'static std::sync::Mutex<HashMap<usize, Box<ReplayStyleValue>>> {
-    static VALUES: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, Box<ReplayStyleValue>>>> =
-        std::sync::OnceLock::new();
-    VALUES.get_or_init(Default::default)
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-pub(crate) fn register_replay_style_value(token: u64, dependency_flags: u8) -> *const StyleValueData {
-    assert!(token != 0, "style-value tokens are nonzero");
-    // Replay sessions may reuse token numbers. Allocate distinct opaque identities per session
-    // thread, but keep their metadata accessible when a retained handle moves to another thread.
-    let pointer = REPLAY_STYLE_VALUES.with(|values| {
-        *values.borrow_mut().entry(token).or_insert_with(|| {
-            let value = Box::new(ReplayStyleValue {
-                token,
-                dependency_flags,
-            });
-            let pointer = (&*value as *const ReplayStyleValue) as usize;
-            replay_style_values().lock().unwrap().insert(pointer, value);
-            pointer
-        })
-    });
-    assert_eq!(
-        replay_style_value_metadata(pointer as *const StyleValueData)
-            .unwrap()
-            .dependency_flags,
-        dependency_flags
-    );
-    pointer as *const StyleValueData
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-fn replay_style_value_metadata(value: *const StyleValueData) -> Option<ReplayStyleValue> {
-    replay_style_values()
-        .lock()
-        .unwrap()
-        .get(&(value as usize))
-        .map(|value| **value)
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-pub(crate) fn replay_style_value_token(value: *const StyleValueData) -> Option<u64> {
-    replay_style_value_metadata(value).map(|value| value.token)
-}
-
-fn replay_style_value_dependency_flags(value: *const StyleValueData) -> Option<u8> {
-    #[cfg(any(test, feature = "style-replay"))]
-    return replay_style_value_metadata(value).map(|value| value.dependency_flags);
-    #[cfg(not(any(test, feature = "style-replay")))]
-    {
-        let _ = value;
-        None
-    }
-}
-
-/// # Safety
-/// `value` must be null, a registered replay token, or point to a live `StyleValueData`.
-pub(crate) unsafe fn style_value_content_hash(value: *const StyleValueData) -> u64 {
-    if value.is_null() {
+pub(crate) fn style_value_content_hash(value: Option<&StyleValueData>) -> u64 {
+    let Some(value) = value else {
         return 0;
-    }
-    #[cfg(any(test, feature = "style-replay"))]
-    if let Some(value) = replay_style_value_metadata(value) {
-        return value.token;
-    }
-    unsafe { &*value }.content_hash()
+    };
+    value.content_hash()
 }
 
 /// A strong reference to immutable Rust-owned style value data.
@@ -514,9 +453,16 @@ impl RetainedStyleValueData {
     }
 
     pub(crate) fn from_owned(data: StyleValueData) -> Self {
-        let pointer = Arc::into_raw(shared_style_value(data));
+        Self::from_arc(shared_style_value(data))
+    }
+
+    pub(crate) fn from_arc(value: Arc<StyleValueData>) -> Self {
         // SAFETY: Arc::into_raw transfers one strong reference to this handle.
-        unsafe { Self::from_retained_pointer(pointer) }
+        unsafe { Self::from_retained_pointer(Arc::into_raw(value)) }
+    }
+
+    pub(crate) fn from_optional_arc(value: Option<Arc<StyleValueData>>) -> Self {
+        value.map_or_else(Self::none, Self::from_arc)
     }
 
     /// Borrow the handles' pointer storage without copying or transferring ownership.
@@ -528,15 +474,16 @@ impl RetainedStyleValueData {
         // SAFETY: This repr(C) type has exactly one field, a *const c_void, so its
         //         size, alignment and layout match that pointer. The shared slice
         //         borrows the handles and cannot outlive or modify their storage.
-        unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), values.len()) }
+        unsafe { ak::slice_from_raw_parts(values.as_ptr().cast(), values.len()) }
     }
 
     pub(crate) fn pointer(&self) -> *const StyleValueData {
         self.pointer.cast()
     }
 
+    /// The handle's value, which an empty handle does not have.
     pub(crate) fn data(&self) -> &StyleValueData {
-        unsafe { &*self.pointer.cast::<StyleValueData>() }
+        self.optional_data().expect("an empty style value handle has no data")
     }
 
     pub(crate) fn optional_data(&self) -> Option<&StyleValueData> {
@@ -567,6 +514,13 @@ impl RetainedStyleValueData {
     pub(crate) fn clone_retained(&self) -> Self {
         let pointer = unsafe { retain_style_value(self.pointer.cast()) };
         unsafe { Self::from_retained_optional_pointer(pointer) }
+    }
+
+    /// Releases the handle's reference to the caller as a raw pointer, null for an empty handle.
+    pub(crate) fn into_pointer(self) -> *const StyleValueData {
+        let pointer = self.pointer();
+        std::mem::forget(self);
+        pointer
     }
 
     /// Converts the retained reference into an Arc, transferring the strong reference.
@@ -602,7 +556,7 @@ impl RetainedStyleValueDataList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 
     pub(crate) fn from_retained_values(values: Vec<RetainedStyleValueData>) -> Self {
@@ -624,22 +578,31 @@ impl RetainedStyleValueDataList {
         let pointer = Box::into_raw(slice) as *mut RetainedStyleValueData;
         Self { pointer, length }
     }
+}
 
-    /// Takes ownership of one strong reference to each non-null value.
-    ///
-    /// # Safety
-    /// Every non-null entry in `values` must be a strong reference returned by
-    /// `rust_style_value_retain`.
-    unsafe fn from_retained_optional_pointers(values: *const *const StyleValueData, length: usize) -> Self {
-        let slice: Box<[RetainedStyleValueData]> = (0..length)
-            .map(|i| RetainedStyleValueData {
-                pointer: unsafe { *values.add(i) }.cast(),
-            })
-            .collect();
-        let length = slice.len();
-        let pointer = Box::into_raw(slice) as *mut RetainedStyleValueData;
-        Self { pointer, length }
+/// Preserve matrix-only literal angles only while their canonical argument is unchanged.
+/// All other slots come from the newly mapped values, so lengths and rotation axes cannot become stale.
+pub(crate) fn map_transform_matrix_values(
+    previous: &[RetainedStyleValueData],
+    values: &[RetainedStyleValueData],
+    matrix_values: &[RetainedStyleValueData],
+) -> RetainedStyleValueDataList {
+    let mut mapped = Vec::new();
+    for (index, matrix_value) in matrix_values.iter().enumerate() {
+        let (Some(previous), Some(value)) = (previous.get(index), values.get(index)) else {
+            continue;
+        };
+        if matches!(matrix_value.data(), StyleValueData::Angle { .. })
+            && previous.data() == value.data()
+            && matrix_value.data() != value.data()
+        {
+            if mapped.is_empty() {
+                mapped = values.to_vec();
+            }
+            mapped[index] = matrix_value.clone_retained();
+        }
     }
+    RetainedStyleValueDataList::from_retained_values(mapped)
 }
 
 impl Clone for RetainedStyleValueDataList {
@@ -650,7 +613,7 @@ impl Clone for RetainedStyleValueDataList {
             .iter()
             .map(|value| {
                 let Some(data) = value.optional_data() else {
-                    return unsafe { RetainedStyleValueData::from_retained_optional_pointer(std::ptr::null()) };
+                    return RetainedStyleValueData::none();
                 };
                 let pointer = data as *const StyleValueData as usize;
                 if let Some((_, cloned)) = cloned_by_pointer.iter().find(|(original, _)| *original == pointer) {
@@ -714,7 +677,7 @@ macro_rules! retained_list {
                         length: 0,
                     };
                 }
-                let elements = unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+                let elements = unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
                     .to_vec()
                     .into_boxed_slice();
                 let length = elements.len();
@@ -746,7 +709,7 @@ impl RetainedPropertyIdList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -860,20 +823,8 @@ impl Drop for RetainedString {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_css_url_text_view(text: &RetainedString) -> crate::css::ffi_support::FfiUtf16View {
-    use crate::css::ffi_support::FfiUtf16View;
-    match text.units() {
-        TokenizerInput::Ascii(bytes) => FfiUtf16View {
-            ascii: bytes.as_ptr(),
-            utf16: std::ptr::null(),
-            length: bytes.len(),
-        },
-        TokenizerInput::Utf16(units) => FfiUtf16View {
-            ascii: std::ptr::null(),
-            utf16: units.as_ptr(),
-            length: units.len(),
-        },
-    }
+pub extern "C" fn rust_css_url_text_view(text: &RetainedString) -> crate::css::ffi_support::FfiUtf16View<'_> {
+    crate::css::ffi_support::FfiUtf16View::from_input(text.units())
 }
 
 /// A retained CSS request URL modifier: the modifier type and either an enum value or a retained
@@ -900,14 +851,6 @@ pub struct FfiCounterDefinition {
     name: usize,
     is_reversed: bool,
     value: RetainedStyleValueData,
-}
-
-#[repr(C)]
-pub struct FfiImageSetOption {
-    image: RetainedStyleValueData,
-    resolution: RetainedStyleValueData,
-    has_type: bool,
-    type_string: usize,
 }
 
 impl RetainedRequestUrlModifier {
@@ -1011,7 +954,7 @@ impl RetainedByteList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -1099,23 +1042,6 @@ pub struct RetainedImageSetOptionList {
     length: usize,
 }
 
-impl RetainedImageSetOptionList {
-    unsafe fn from_raw(elements: *const FfiImageSetOption, length: usize) -> Self {
-        let elements = (0..length)
-            .map(|i| {
-                let element = unsafe { &*elements.add(i) };
-                RetainedImageSetOption {
-                    image: unsafe { std::ptr::read(&raw const element.image) },
-                    resolution: unsafe { std::ptr::read(&raw const element.resolution) },
-                    has_type: element.has_type,
-                    type_string: unsafe { CssString::from_leaked_raw(element.type_string) },
-                }
-            })
-            .collect();
-        Self::from_retained_elements(elements)
-    }
-}
-
 retained_list_drop!(RetainedImageSetOptionList);
 
 impl Clone for RetainedImageSetOptionList {
@@ -1142,11 +1068,24 @@ pub struct RetainedColorStopList {
     length: usize,
 }
 
-retained_list!(RetainedColorStopList, RetainedColorStop);
+retained_list!(RetainedColorStopList, RetainedColorStop, native);
 
 impl RetainedCounterDefinition {
     pub(crate) fn value(&self) -> &RetainedStyleValueData {
         &self.value
+    }
+
+    /// The counter's integer, or none when the definition leaves it out. A computed value only
+    /// ever holds an integer or a calculation that resolves to one.
+    pub(crate) fn integer(&self) -> Option<i32> {
+        match self.value.optional_data()? {
+            StyleValueData::Integer { value } => Some(*value),
+            calculated @ StyleValueData::Calculated { .. } => Some(
+                crate::css::calc::resolve_calculated_integer_without_context(calculated)
+                    .expect("a computed counter value resolves to an integer"),
+            ),
+            _ => panic!("a computed counter value is an integer"),
+        }
     }
 }
 
@@ -1199,7 +1138,7 @@ macro_rules! retained_list_as_slice {
                 if self.pointer.is_null() {
                     return &[];
                 }
-                unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+                unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
             }
         }
     };
@@ -1294,7 +1233,7 @@ impl RetainedColorStopList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -1408,7 +1347,6 @@ retained_list!(RetainedLinearEasingStopList, RetainedLinearEasingStop, native);
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 // The C++ constructor supplies every variant through the FFI input.
-#[allow(dead_code)]
 pub enum GridTrackEntryKind {
     LineNames,
     Size,
@@ -1445,7 +1383,7 @@ impl RetainedGridTrackEntryList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer.cast(), self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer.cast(), self.length) }
     }
 
     pub(crate) fn from_retained_entries(entries: Vec<RetainedGridTrackEntry>) -> Self {
@@ -1479,10 +1417,14 @@ impl RetainedGridTrackEntry {
     }
 
     pub(crate) fn size(value: StyleValueData) -> Self {
+        Self::retained_size(RetainedStyleValueData::from_owned(value))
+    }
+
+    fn retained_size(size_value: RetainedStyleValueData) -> Self {
         Self {
             kind: GridTrackEntryKind::Size,
             names: CssStringList::from_strings(Vec::new()),
-            size_value: RetainedStyleValueData::from_owned(value),
+            size_value,
             min_value: RetainedStyleValueData::none(),
             max_value: RetainedStyleValueData::none(),
             repeat_type: 0,
@@ -1609,11 +1551,25 @@ impl RetainedNumericRangeList {
         Self { pointer, length }
     }
 
+    pub(crate) fn from_numeric_ranges(ranges: impl IntoIterator<Item = (u8, f64, f64)>) -> Self {
+        let ranges = ranges
+            .into_iter()
+            .map(|(value_type, min, max)| RetainedNumericRangeByType { value_type, min, max })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            return Self::empty();
+        }
+        let ranges = ranges.into_boxed_slice();
+        let length = ranges.len();
+        let pointer = Box::into_raw(ranges) as *mut RetainedNumericRangeByType;
+        Self { pointer, length }
+    }
+
     pub(crate) fn as_slice(&self) -> &[RetainedNumericRangeByType] {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 
     pub(crate) fn clone_owned(&self) -> Self {
@@ -1641,7 +1597,7 @@ macro_rules! retained_list_partial_eq {
                     if list.pointer.is_null() {
                         &[]
                     } else {
-                        unsafe { std::slice::from_raw_parts(list.pointer.cast::<$element>(), list.length) }
+                        unsafe { ak::slice_from_raw_parts(list.pointer.cast::<$element>(), list.length) }
                     }
                 };
                 as_slice(self) == as_slice(other)
@@ -1727,6 +1683,99 @@ pub struct BasicShapeData {
     pub(crate) v4: RetainedStyleValueData,
     pub(crate) points: RetainedShapePointList,
     pub(crate) path: crate::css::css_path::CssPath,
+    /// The commands of a shape(), whose coordinates are `points` in order.
+    pub(crate) commands: ShapeCommands,
+}
+
+/// https://drafts.csswg.org/css-shapes-1/#shape-function
+/// One command of a shape(). Its points, in order, are its end point, then its control points, or its arc's
+/// radii and rotation. Each point holds two length-percentages, the two edges of a position, or a keyword.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeCommand {
+    pub(crate) kind: ShapeCommandKind,
+    /// Whether the end point is given with `by`, relative to the command's starting point.
+    pub(crate) relative: bool,
+    /// What each control point is relative to.
+    pub(crate) control_points: [ShapeControlPointAnchor; 2],
+    pub(crate) control_point_count: u8,
+    /// Whether an arc's single radius applies to both axes.
+    pub(crate) arc_has_one_radius: bool,
+    pub(crate) arc_clockwise: bool,
+    pub(crate) arc_large: bool,
+    /// Whether an arc's rotation was given. Arcs hold their rotation angle as a third point either way.
+    pub(crate) arc_has_rotation: bool,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeCommandKind {
+    From,
+    Move,
+    Line,
+    HorizontalLine,
+    VerticalLine,
+    Curve,
+    Smooth,
+    Arc,
+    Close,
+}
+
+/// What a shape() control point is relative to: the command's start or end point, or the reference box.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeControlPointAnchor {
+    Start,
+    End,
+    Origin,
+}
+
+impl ShapeCommand {
+    pub(crate) fn new(kind: ShapeCommandKind, relative: bool) -> Self {
+        Self {
+            kind,
+            relative,
+            control_points: [ShapeControlPointAnchor::Start; 2],
+            control_point_count: 0,
+            arc_has_one_radius: false,
+            arc_clockwise: false,
+            arc_large: false,
+            arc_has_rotation: false,
+        }
+    }
+}
+
+/// The commands of a shape().
+#[repr(C)]
+pub struct ShapeCommands {
+    pointer: *mut ShapeCommand,
+    length: usize,
+}
+
+retained_list!(ShapeCommands, ShapeCommand, native);
+retained_list_as_slice!(ShapeCommands, ShapeCommand);
+retained_list_from_vec!(ShapeCommands, ShapeCommand);
+retained_list_send_sync!(ShapeCommands, ShapeCommand);
+
+impl ShapeCommands {
+    pub(crate) fn new(commands: Vec<ShapeCommand>) -> Self {
+        Self::from_retained_elements(commands)
+    }
+}
+
+impl Default for ShapeCommands {
+    fn default() -> Self {
+        Self {
+            pointer: std::ptr::null_mut(),
+            length: 0,
+        }
+    }
+}
+
+impl PartialEq for ShapeCommands {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
 }
 
 /// A Rust-owned shape allocation with an explicit pointer layout for C++ bindings.
@@ -1771,6 +1820,10 @@ impl Drop for OwnedBasicShapeData {
     }
 }
 
+/// The `function` of `StyleValueData::Counter`.
+pub(crate) const COUNTER_FUNCTION_COUNTER: u8 = 0;
+pub(crate) const COUNTER_FUNCTION_COUNTERS: u8 = 1;
+
 /// The data of a single immutable CSS style value.
 ///
 /// Variant payload fields are read directly by the corresponding C++ StyleValue subclass, so
@@ -1778,7 +1831,6 @@ impl Drop for OwnedBasicShapeData {
 /// The byte discriminant shares each variant's padding instead of preceding a separate union.
 #[repr(u8)]
 // NB: Variant payload fields are only read by C++ through the exposed layout.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq)]
 pub enum StyleValueData {
     /// A CSS keyword. The value is the generated C++ `enum class Keyword : u16`, opaque to Rust.
@@ -1872,6 +1924,7 @@ pub enum StyleValueData {
     String {
         string: CssString,
         is_valid_animation_name_custom_ident: bool,
+        serialize_without_quotes: bool,
     },
     /// An unrecognized CSS function, kept as its name and argument value.
     Function {
@@ -1972,8 +2025,7 @@ pub enum StyleValueData {
         name: CssString,
     },
     /// A counter style reference: either a retained counter style name, or a symbols() function
-    /// with its type (the C++ `enum class SymbolsType : u8`, opaque to Rust) and retained
-    /// symbol strings.
+    /// with its type (a `css_enums::symbols_type` value) and retained symbol strings.
     CounterStyle {
         is_symbols: bool,
         name: CssString,
@@ -1993,15 +2045,14 @@ pub enum StyleValueData {
         name: CssString,
         origin_color: RetainedStyleValueData,
     },
-    /// color-mix() with its optional retained interpolation method value and two components,
-    /// each a retained color with an optional retained percentage.
+    /// color-mix() with its optional retained interpolation method value and its mix items:
+    /// one or more retained colors, each with an optional retained percentage. The two lists
+    /// have the same length, and an omitted percentage is a null entry.
     ColorMix {
         color_base: ColorBase,
         color_interpolation_method: RetainedStyleValueData,
-        first_color: RetainedStyleValueData,
-        first_percentage: RetainedStyleValueData,
-        second_color: RetainedStyleValueData,
-        second_percentage: RetainedStyleValueData,
+        colors: RetainedStyleValueDataList,
+        percentages: RetainedStyleValueDataList,
     },
     /// The shared data of every color style value: an optional color type and the color syntax
     /// (both C++ enums on ColorStyleValue, opaque to Rust).
@@ -2057,6 +2108,7 @@ pub enum StyleValueData {
     Easing {
         kind: u8,
         step_position: u8,
+        is_keyword: bool,
         linear_stops: RetainedLinearEasingStopList,
         x1: RetainedStyleValueData,
         y1: RetainedStyleValueData,
@@ -2098,8 +2150,8 @@ pub enum StyleValueData {
         implicit_start_name: CssString,
         implicit_end_name: CssString,
     },
-    /// counter() or counters(). The function is the C++ CounterFunction enum, opaque to Rust;
-    /// the join string is empty for counter().
+    /// counter() or counters(). The function is `COUNTER_FUNCTION_COUNTER` or
+    /// `COUNTER_FUNCTION_COUNTERS`; the join string is empty for counter().
     Counter {
         function: u8,
         counter_name: CssString,
@@ -2149,14 +2201,11 @@ pub enum StyleValueData {
         scheme_codes: RetainedByteList,
         only: bool,
     },
-    /// An unresolved value containing arbitrary substitution functions, kept as its retained
-    /// source text, an optional normalized comparison text (empty when absent), the presence
-    /// flags of each substitution function, the attr-taint flag, and an optional parsed value
-    /// cached for an attr()-tainted registered custom property.
+    /// An unresolved value with retained source text and components, flags for substitution functions,
+    /// attr taint, and an optional parsed value cached for an attr()-tainted registered custom property.
     Unresolved {
         components: RetainedComponentValueList,
         source_text: CssString,
-        value_comparison_text: CssString,
         presence_attr: bool,
         presence_dashed_function: bool,
         presence_env: bool,
@@ -2203,6 +2252,9 @@ pub enum StyleValueData {
         property: u16,
         transform_function: u8,
         values: RetainedStyleValueDataList,
+        /// Matrix-only arguments preserving literal angle precision across canonicalization.
+        /// Empty when the canonical arguments lower to the same matrix inputs.
+        matrix_values: RetainedStyleValueDataList,
     },
     /// A shorthand property value: the shorthand id, its longhand ids (both C++
     /// `enum class PropertyID : u16`, opaque to Rust) and their values.
@@ -2234,6 +2286,15 @@ pub enum StyleValueData {
         color_operation: u8,
         value: RetainedStyleValueData,
     },
+    /// https://drafts.csswg.org/motion-1/#ray-function
+    /// A ray() offset path: its angle, its <ray-size> keyword, whether it has `contain`, and its
+    /// optional `at <position>` (null when absent).
+    Ray {
+        size: u16,
+        contain: bool,
+        angle: RetainedStyleValueData,
+        position: RetainedStyleValueData,
+    },
 }
 
 // The kinds of a filter style value, which are C++ enum values.
@@ -2255,7 +2316,7 @@ const _: () = assert!(size_of::<StyleValueData>() <= 64);
 pub struct FfiComputedFontFamilyEntry {
     pub kind: u8,
     pub keyword: u16,
-    pub string: *const c_void,
+    pub string: *const CssString,
 }
 
 pub const COMPUTED_FONT_FAMILY_GENERIC: u8 = 0;
@@ -2305,39 +2366,48 @@ pub unsafe extern "C" fn rust_style_value_copy_computed_font_families(
 }
 
 /// Reads the primitive payload of a computed absolute length.
-///
-/// # Safety
-/// `value` must point at live Length StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_length_value(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_length_value(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Length { value, .. } => *value,
         _ => unreachable!("computed value must be a length"),
     }
 }
 
 /// Reads the primitive payload of a computed number.
-///
-/// # Safety
-/// `value` must point at live Number StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_number(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_number(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Number { value } => *value,
         _ => unreachable!("computed value must be a number"),
     }
 }
 
 /// Reads the primitive payload of a computed percentage.
-///
-/// # Safety
-/// `value` must point at live Percentage StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_percentage(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_percentage(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Percentage { value } => *value,
         _ => unreachable!("computed value must be a percentage"),
     }
+}
+
+/// Reads a computed `font-size-adjust` that scales the size fonts are selected at: true, with the
+/// metric (a `font_size_adjust_metric` value) and the number, for one naming a number, and false
+/// for `none` and `from-font`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_computed_font_size_adjust_number(
+    value: &StyleValueData,
+    metric: &mut u8,
+    number: &mut f64,
+) -> bool {
+    let (kind, value_metric, value_number) = crate::css::style::engine_sample::font_size_adjust_of(Some(value));
+    if kind != crate::css::style::bridge::FontSizeAdjustKind::Number {
+        return false;
+    }
+    *metric = value_metric;
+    *number = value_number;
+    true
 }
 
 impl StyleValueData {
@@ -2345,29 +2415,6 @@ impl StyleValueData {
         match self {
             Self::BasicShape { shape } => Some(shape.as_ref()),
             _ => None,
-        }
-    }
-
-    pub(crate) fn unresolved_authored_source(&self) -> Option<TokenizerInput<'_>> {
-        let Self::Unresolved { source_text, .. } = self else {
-            return None;
-        };
-        Some(TokenizerInput::from(source_text))
-    }
-
-    pub(crate) fn unresolved_token_source(&self) -> Option<TokenizerInput<'_>> {
-        let Self::Unresolved {
-            source_text,
-            value_comparison_text,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        if value_comparison_text.units().is_empty() {
-            Some(TokenizerInput::from(source_text))
-        } else {
-            Some(TokenizerInput::from(value_comparison_text))
         }
     }
 }
@@ -2391,8 +2438,8 @@ impl StyleValueData {
     ///
     /// Consistency holds by construction because the hash only ever omits fields, and derived
     /// equality requires every field to be equal, so any hashed subset agrees on equal values.
-    /// Opaque payloads (calc trees, geometry and stop lists) contribute nothing beyond the
-    /// variant discriminant; deep equality settles whatever shares a bucket. Floats hash by bit
+    /// Opaque payloads (calc trees and path geometry) contribute nothing beyond the variant
+    /// discriminant; deep equality settles whatever shares a bucket. Floats hash by bit
     /// pattern with negative zero normalized to zero; NaN never equals anything, so its hash is
     /// unconstrained.
     pub(crate) fn content_hash(&self) -> u64 {
@@ -2432,6 +2479,35 @@ impl StyleValueData {
             hasher.write_u8(base.color_type);
             hasher.write_u8(base.color_syntax);
         }
+        fn write_color_stops(hasher: &mut crate::css::style::fast_hash::FastHasher, stops: &RetainedColorStopList) {
+            hasher.write_usize(stops.as_slice().len());
+            for stop in stops.as_slice() {
+                for value in stop.values() {
+                    write_value(hasher, value);
+                }
+            }
+        }
+        fn write_grid_track_entries(
+            hasher: &mut crate::css::style::fast_hash::FastHasher,
+            entries: &[RetainedGridTrackEntry],
+        ) {
+            hasher.write_usize(entries.len());
+            for entry in entries {
+                hasher.write_u8(entry.kind as u8);
+                hasher.write_usize(entry.names.as_slice().len());
+                for name in entry.names.as_slice() {
+                    write_fly(hasher, name);
+                }
+                write_value(hasher, &entry.size_value);
+                write_value(hasher, &entry.min_value);
+                write_value(hasher, &entry.max_value);
+                hasher.write_u8(entry.repeat_type);
+                write_value(hasher, &entry.repeat_count);
+                write_bool(hasher, entry.repeat_is_subgrid);
+                write_bool(hasher, entry.repeat_preserve_line_name_sets);
+                write_grid_track_entries(hasher, entry.repeat_entries.as_slice());
+            }
+        }
 
         std::mem::discriminant(self).hash(hasher);
         match self {
@@ -2459,8 +2535,10 @@ impl StyleValueData {
                     fill_rule,
                     points: _,
                     path,
+                    commands,
                 } = shape.as_ref();
                 hasher.write_u8(*kind);
+                hasher.write_usize(commands.as_slice().len());
                 write_value(hasher, v0);
                 write_value(hasher, v1);
                 write_value(hasher, v2);
@@ -2689,35 +2767,37 @@ impl StyleValueData {
                 name,
                 origin_color,
             } => {
-                write_color_base(hasher, color_base);
+                // NB: Equality ignores the color syntax, and the color type and name when absent.
+                write_bool(hasher, color_base.has_color_type);
+                if color_base.has_color_type {
+                    hasher.write_u8(color_base.color_type);
+                }
                 write_value(hasher, channel_0);
                 write_value(hasher, channel_1);
                 write_value(hasher, channel_2);
                 write_value(hasher, alpha);
                 write_bool(hasher, *has_name);
-                write_fly(hasher, name);
+                if *has_name {
+                    write_fly(hasher, name);
+                }
                 write_value(hasher, origin_color);
             }
             Self::ColorMix {
                 color_base,
                 color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
+                colors,
+                percentages,
             } => {
                 write_color_base(hasher, color_base);
                 write_value(hasher, color_interpolation_method);
-                write_value(hasher, first_color);
-                write_value(hasher, first_percentage);
-                write_value(hasher, second_color);
-                write_value(hasher, second_percentage);
+                write_values(hasher, colors);
+                write_values(hasher, percentages);
             }
             Self::LinearGradient {
                 has_direction_value,
                 direction_value,
                 side_or_corner,
-                color_stop_list: _,
+                color_stop_list,
                 gradient_type,
                 repeating,
                 color_interpolation_method,
@@ -2726,6 +2806,7 @@ impl StyleValueData {
                 write_bool(hasher, *has_direction_value);
                 write_value(hasher, direction_value);
                 hasher.write_u8(*side_or_corner);
+                write_color_stops(hasher, color_stop_list);
                 hasher.write_u8(*gradient_type);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
@@ -2734,13 +2815,14 @@ impl StyleValueData {
             Self::ConicGradient {
                 from_angle,
                 position,
-                color_stop_list: _,
+                color_stop_list,
                 repeating,
                 color_interpolation_method,
                 color_syntax,
             } => {
                 write_value(hasher, from_angle);
                 write_value(hasher, position);
+                write_color_stops(hasher, color_stop_list);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
                 hasher.write_u8(*color_syntax);
@@ -2749,7 +2831,7 @@ impl StyleValueData {
                 ending_shape,
                 size,
                 position,
-                color_stop_list: _,
+                color_stop_list,
                 repeating,
                 color_interpolation_method,
                 color_syntax,
@@ -2757,6 +2839,7 @@ impl StyleValueData {
                 hasher.write_u8(*ending_shape);
                 write_value(hasher, size);
                 write_value(hasher, position);
+                write_color_stops(hasher, color_stop_list);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
                 hasher.write_u8(*color_syntax);
@@ -2765,18 +2848,33 @@ impl StyleValueData {
                 url.hash(hasher);
                 hasher.write_u8(*url_type);
             }
-            Self::ImageSet { options: _ } => {}
+            Self::ImageSet { options } => {
+                hasher.write_usize(options.as_slice().len());
+                for option in options.as_slice() {
+                    write_value(hasher, &option.image);
+                    write_value(hasher, &option.resolution);
+                    write_bool(hasher, option.has_type);
+                    write_fly(hasher, &option.type_string);
+                }
+            }
             Self::Easing {
                 kind,
-                linear_stops: _,
+                linear_stops,
                 x1,
                 y1,
                 x2,
                 y2,
                 number_of_intervals,
                 step_position,
+                is_keyword,
             } => {
                 hasher.write_u8(*kind);
+                write_bool(hasher, *is_keyword);
+                hasher.write_usize(linear_stops.as_slice().len());
+                for stop in linear_stops.as_slice() {
+                    write_value(hasher, &stop.output);
+                    write_value(hasher, &stop.input);
+                }
                 write_value(hasher, x1);
                 write_value(hasher, y1);
                 write_value(hasher, x2);
@@ -2792,20 +2890,37 @@ impl StyleValueData {
             Self::GridTrackSizeList {
                 is_subgrid,
                 preserve_line_name_sets,
-                entries: _,
+                entries,
             } => {
                 write_bool(hasher, *is_subgrid);
                 write_bool(hasher, *preserve_line_name_sets);
+                write_grid_track_entries(hasher, entries.as_slice());
             }
             Self::GridTemplateArea {
-                grid_areas: _,
+                grid_areas,
                 row_count,
                 column_count,
             } => {
+                hasher.write_usize(grid_areas.as_slice().len());
+                for area in grid_areas.as_slice() {
+                    write_fly(hasher, &area.name);
+                    write_fly(hasher, &area.implicit_start_name);
+                    write_fly(hasher, &area.implicit_end_name);
+                    for line in area.grid_lines() {
+                        hasher.write_usize(line);
+                    }
+                }
                 hasher.write_usize(*row_count);
                 hasher.write_usize(*column_count);
             }
-            Self::CounterDefinitions { counter_definitions: _ } => {}
+            Self::CounterDefinitions { counter_definitions } => {
+                hasher.write_usize(counter_definitions.as_slice().len());
+                for definition in counter_definitions.as_slice() {
+                    write_fly(hasher, &definition.name);
+                    write_bool(hasher, definition.is_reversed);
+                    write_value(hasher, &definition.value);
+                }
+            }
             Self::GridTrackPlacement {
                 kind,
                 value,
@@ -2887,7 +3002,6 @@ impl StyleValueData {
             Self::Unresolved {
                 components: _,
                 source_text,
-                value_comparison_text,
                 presence_attr,
                 presence_dashed_function,
                 presence_env,
@@ -2898,7 +3012,6 @@ impl StyleValueData {
                 parsed_value: _,
             } => {
                 hash_string_units(hasher, TokenizerInput::from(source_text));
-                hash_string_units(hasher, TokenizerInput::from(value_comparison_text));
                 write_bool(hasher, *presence_attr);
                 write_bool(hasher, *presence_dashed_function);
                 write_bool(hasher, *presence_env);
@@ -2954,10 +3067,12 @@ impl StyleValueData {
                 property,
                 transform_function,
                 values,
+                matrix_values,
             } => {
                 hasher.write_u16(*property);
                 hasher.write_u8(*transform_function);
                 write_values(hasher, values);
+                write_values(hasher, matrix_values);
             }
             Self::Shorthand {
                 shorthand_property,
@@ -2999,6 +3114,17 @@ impl StyleValueData {
                 hasher.write_u8(*kind);
                 hasher.write_u8(*color_operation);
                 write_value(hasher, value);
+            }
+            Self::Ray {
+                size,
+                contain,
+                angle,
+                position,
+            } => {
+                hasher.write_u16(*size);
+                write_bool(hasher, *contain);
+                write_value(hasher, angle);
+                write_value(hasher, position);
             }
         }
     }
@@ -3056,17 +3182,17 @@ pub extern "C" fn rust_style_value_create_time(value: f64, unit: u8) -> *const S
 
 /// Takes ownership of one strong reference to each of the numerator and denominator.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_ratio(
-    numerator: *const StyleValueData,
-    denominator: *const StyleValueData,
+pub extern "C" fn rust_style_value_create_ratio(
+    numerator: OwnedArc<StyleValueData>,
+    denominator: OwnedArc<StyleValueData>,
 ) -> *const StyleValueData {
     Arc::into_raw(Arc::new(StyleValueData::Ratio {
-        numerator: unsafe { RetainedStyleValueData::from_retained_pointer(numerator) },
-        denominator: unsafe { RetainedStyleValueData::from_retained_pointer(denominator) },
+        numerator: RetainedStyleValueData::from_arc(numerator.into_arc()),
+        denominator: RetainedStyleValueData::from_arc(denominator.into_arc()),
     }))
 }
 
-/// Takes ownership of one strong reference to the value.
+/// Takes ownership of one strong reference to the number, percentage or calculated value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_opacity_value(value: *const StyleValueData) -> *const StyleValueData {
     Arc::into_raw(Arc::new(StyleValueData::OpacityValue {
@@ -3074,183 +3200,7 @@ pub unsafe extern "C" fn rust_style_value_create_opacity_value(value: *const Sty
     }))
 }
 
-/// Takes ownership of one strong reference to the offset data if it is non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_edge(
-    has_edge: bool,
-    edge: u8,
-    offset: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Edge {
-        has_edge,
-        edge,
-        offset: unsafe { RetainedStyleValueData::from_retained_optional_pointer(offset) },
-    }))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_guaranteed_invalid() -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::GuaranteedInvalid))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_empty_optional() -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::EmptyOptional))
-}
-
-/// Takes ownership of one strong reference to the parameter data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_superellipse(
-    parameter: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Superellipse {
-        parameter: unsafe { RetainedStyleValueData::from_retained_pointer(parameter) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the original shorthand value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_pending_substitution(
-    original_shorthand_value: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::PendingSubstitution {
-        original_shorthand_value: unsafe { RetainedStyleValueData::from_retained_pointer(original_shorthand_value) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each color.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_scrollbar_color(
-    thumb_color: *const StyleValueData,
-    track_color: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ScrollbarColor {
-        thumb_color: unsafe { RetainedStyleValueData::from_retained_pointer(thumb_color) },
-        track_color: unsafe { RetainedStyleValueData::from_retained_pointer(track_color) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each edge data allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_rect(
-    top: *const StyleValueData,
-    right: *const StyleValueData,
-    bottom: *const StyleValueData,
-    left: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Rect {
-        top: unsafe { RetainedStyleValueData::from_retained_pointer(top) },
-        right: unsafe { RetainedStyleValueData::from_retained_pointer(right) },
-        bottom: unsafe { RetainedStyleValueData::from_retained_pointer(bottom) },
-        left: unsafe { RetainedStyleValueData::from_retained_pointer(left) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the filter's value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_filter(
-    kind: u8,
-    color_operation: u8,
-    value: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Filter {
-        kind,
-        color_operation,
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each radius data allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_border_radius(
-    is_elliptical: bool,
-    horizontal_radius: *const StyleValueData,
-    vertical_radius: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::BorderRadius {
-        is_elliptical,
-        horizontal_radius: unsafe { RetainedStyleValueData::from_retained_pointer(horizontal_radius) },
-        vertical_radius: unsafe { RetainedStyleValueData::from_retained_pointer(vertical_radius) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each corner radius data allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_border_radius_rect(
-    top_left: *const StyleValueData,
-    top_right: *const StyleValueData,
-    bottom_right: *const StyleValueData,
-    bottom_left: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::BorderRadiusRect {
-        top_left: unsafe { RetainedStyleValueData::from_retained_pointer(top_left) },
-        top_right: unsafe { RetainedStyleValueData::from_retained_pointer(top_right) },
-        bottom_right: unsafe { RetainedStyleValueData::from_retained_pointer(bottom_right) },
-        bottom_left: unsafe { RetainedStyleValueData::from_retained_pointer(bottom_left) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to the string.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_string(
-    string: usize,
-    is_valid_animation_name_custom_ident: bool,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::String {
-        string: unsafe { CssString::from_leaked_raw(string) },
-        is_valid_animation_name_custom_ident,
-    }))
-}
-
-/// Takes ownership of one leaked reference to the string.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_custom_ident(custom_ident: usize) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::CustomIdent {
-        custom_ident: unsafe { CssString::from_leaked_raw(custom_ident) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to the name and one strong reference to the value data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_function(
-    name: usize,
-    value: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Function {
-        name: unsafe { CssString::from_leaked_raw(name) },
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to the tag and one strong reference to the value data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_open_type_tagged(
-    mode: u8,
-    tag: usize,
-    packed_tag: u32,
-    value: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::OpenTypeTagged {
-        mode,
-        tag_name: unsafe { CssString::from_leaked_raw(tag) },
-        packed_tag,
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the angle value data if it is non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_font_style(
-    font_style: u8,
-    angle_value: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::FontStyle {
-        font_style,
-        angle_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(angle_value) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the length-percentage.
+/// Takes ownership of one strong reference to the length-percentage value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_text_indent(
     length_percentage: *const StyleValueData,
@@ -3264,130 +3214,126 @@ pub unsafe extern "C" fn rust_style_value_create_text_indent(
     }))
 }
 
-/// Takes ownership of one strong reference to the offset data.
+/// Takes ownership of one strong reference to each track size.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_overflow_clip_margin(
-    has_visual_box: bool,
-    visual_box: u8,
-    offset: *const StyleValueData,
+pub unsafe extern "C" fn rust_style_value_create_grid_track_size_list(
+    track_sizes: *const *const StyleValueData,
+    length: usize,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::OverflowClipMargin {
-        has_visual_box,
-        visual_box,
-        offset: unsafe { RetainedStyleValueData::from_retained_pointer(offset) },
+    let entries = unsafe { ak::slice_from_raw_parts(track_sizes, length) }
+        .iter()
+        .map(|&track_size| {
+            RetainedGridTrackEntry::retained_size(unsafe { RetainedStyleValueData::from_retained_pointer(track_size) })
+        })
+        .collect();
+    Arc::into_raw(Arc::new(StyleValueData::GridTrackSizeList {
+        is_subgrid: false,
+        preserve_line_name_sets: false,
+        entries: RetainedGridTrackEntryList::from_retained_entries(entries),
     }))
 }
 
-/// Takes ownership of one strong reference to each size.
+/// The track size of a grid track size list that holds just one track size, without line names, or null. The
+/// returned value is borrowed from `data`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_background_size(
-    size_x: *const StyleValueData,
-    size_y: *const StyleValueData,
+pub extern "C" fn rust_style_value_grid_track_size_list_single_size(data: &StyleValueData) -> *const StyleValueData {
+    let StyleValueData::GridTrackSizeList {
+        is_subgrid: false,
+        entries,
+        ..
+    } = data
+    else {
+        return std::ptr::null();
+    };
+    match entries.as_slice() {
+        [entry] if entry.kind == GridTrackEntryKind::Size => entry.size_value.pointer(),
+        _ => std::ptr::null(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_create_guaranteed_invalid() -> *const StyleValueData {
+    Arc::into_raw(Arc::new(StyleValueData::GuaranteedInvalid))
+}
+
+/// Takes ownership of one strong reference to the original shorthand value.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_create_pending_substitution(
+    original_shorthand_value: OwnedArc<StyleValueData>,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::BackgroundSize {
-        size_x: unsafe { RetainedStyleValueData::from_retained_pointer(size_x) },
-        size_y: unsafe { RetainedStyleValueData::from_retained_pointer(size_y) },
+    Arc::into_raw(Arc::new(StyleValueData::PendingSubstitution {
+        original_shorthand_value: RetainedStyleValueData::from_arc(original_shorthand_value.into_arc()),
     }))
 }
 
-/// Takes ownership of one strong reference to each offset data allocation.
+/// Takes ownership of one strong reference to the filter's value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_border_image_slice(
-    top: *const StyleValueData,
-    right: *const StyleValueData,
-    bottom: *const StyleValueData,
-    left: *const StyleValueData,
-    fill: bool,
+pub extern "C" fn rust_style_value_create_filter(
+    kind: u8,
+    color_operation: u8,
+    value: OwnedArc<StyleValueData>,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::BorderImageSlice {
-        top: unsafe { RetainedStyleValueData::from_retained_pointer(top) },
-        right: unsafe { RetainedStyleValueData::from_retained_pointer(right) },
-        bottom: unsafe { RetainedStyleValueData::from_retained_pointer(bottom) },
-        left: unsafe { RetainedStyleValueData::from_retained_pointer(left) },
-        fill,
+    Arc::into_raw(Arc::new(StyleValueData::Filter {
+        kind,
+        color_operation,
+        value: RetainedStyleValueData::from_arc(value.into_arc()),
     }))
 }
 
-/// Takes ownership of one strong reference to each edge data allocation.
+/// Takes ownership of one leaked reference to the string.
+///
+/// # Safety
+/// `custom_ident` must be zero or one leaked AK::Utf16FlyString reference.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_position(
-    edge_x: *const StyleValueData,
-    edge_y: *const StyleValueData,
+pub unsafe extern "C" fn rust_style_value_create_custom_ident(custom_ident: usize) -> *const StyleValueData {
+    Arc::into_raw(Arc::new(StyleValueData::CustomIdent {
+        custom_ident: unsafe { CssString::from_leaked_raw(custom_ident) },
+    }))
+}
+
+/// Takes ownership of one leaked reference to the name and one strong reference to the value data.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_value_create_function(
+    name: usize,
+    value: OwnedArc<StyleValueData>,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Position {
-        edge_x: unsafe { RetainedStyleValueData::from_retained_pointer(edge_x) },
-        edge_y: unsafe { RetainedStyleValueData::from_retained_pointer(edge_y) },
+    Arc::into_raw(Arc::new(StyleValueData::Function {
+        name: unsafe { CssString::from_leaked_raw(name) },
+        value: RetainedStyleValueData::from_arc(value.into_arc()),
+    }))
+}
+
+/// Takes ownership of one strong reference to the angle value data if it is non-null.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_create_font_style(
+    font_style: u8,
+    angle_value: OwnedArc<StyleValueData>,
+) -> *const StyleValueData {
+    Arc::into_raw(Arc::new(StyleValueData::FontStyle {
+        font_style,
+        angle_value: RetainedStyleValueData::from_optional_arc(angle_value.into_option()),
     }))
 }
 
 /// Takes ownership of one strong reference to each non-null style value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_shadow(
+pub extern "C" fn rust_style_value_create_shadow(
     shadow_type: u8,
-    color: *const StyleValueData,
-    offset_x: *const StyleValueData,
-    offset_y: *const StyleValueData,
-    blur_radius: *const StyleValueData,
-    spread_distance: *const StyleValueData,
+    color: OwnedArc<StyleValueData>,
+    offset_x: OwnedArc<StyleValueData>,
+    offset_y: OwnedArc<StyleValueData>,
+    blur_radius: OwnedArc<StyleValueData>,
+    spread_distance: OwnedArc<StyleValueData>,
     placement: u8,
 ) -> *const StyleValueData {
     Arc::into_raw(Arc::new(StyleValueData::Shadow {
         shadow_type,
-        color: unsafe { RetainedStyleValueData::from_retained_optional_pointer(color) },
-        offset_x: unsafe { RetainedStyleValueData::from_retained_pointer(offset_x) },
-        offset_y: unsafe { RetainedStyleValueData::from_retained_pointer(offset_y) },
-        blur_radius: unsafe { RetainedStyleValueData::from_retained_optional_pointer(blur_radius) },
-        spread_distance: unsafe { RetainedStyleValueData::from_retained_optional_pointer(spread_distance) },
+        color: RetainedStyleValueData::from_optional_arc(color.into_option()),
+        offset_x: RetainedStyleValueData::from_arc(offset_x.into_arc()),
+        offset_y: RetainedStyleValueData::from_arc(offset_y.into_arc()),
+        blur_radius: RetainedStyleValueData::from_optional_arc(blur_radius.into_option()),
+        spread_distance: RetainedStyleValueData::from_optional_arc(spread_distance.into_option()),
         placement,
-    }))
-}
-
-/// Takes ownership of one strong reference to the content list and, when non-null, the
-/// alt-text list.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_content(
-    content: *const StyleValueData,
-    alt_text: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Content {
-        content: unsafe { RetainedStyleValueData::from_retained_pointer(content) },
-        alt_text: unsafe { RetainedStyleValueData::from_retained_optional_pointer(alt_text) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to each string and one strong reference to the
-/// counter style.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_counter(
-    function: u8,
-    counter_name: usize,
-    counter_style: *const StyleValueData,
-    join_string: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Counter {
-        function,
-        counter_name: unsafe { CssString::from_leaked_raw(counter_name) },
-        counter_style: unsafe { RetainedStyleValueData::from_retained_pointer(counter_style) },
-        join_string: unsafe { CssString::from_leaked_raw(join_string) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the fixed value and one leaked reference to the
-/// name when they are present.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_random_value_sharing(
-    fixed_value: *const StyleValueData,
-    is_auto: bool,
-    has_name: bool,
-    name: usize,
-    element_shared: bool,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::RandomValueSharing {
-        fixed_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(fixed_value) },
-        is_auto,
-        has_name,
-        name: unsafe { CssString::from_leaked_raw(name) },
-        element_shared,
     }))
 }
 
@@ -3406,17 +3352,6 @@ pub unsafe extern "C" fn rust_style_value_create_value_list(
     }))
 }
 
-/// Takes ownership of one strong reference to each non-null value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_tuple(
-    values: *const *const StyleValueData,
-    length: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Tuple {
-        values: unsafe { RetainedStyleValueDataList::from_retained_optional_pointers(values, length) },
-    }))
-}
-
 /// Takes ownership of one strong reference to each value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_transformation(
@@ -3429,6 +3364,7 @@ pub unsafe extern "C" fn rust_style_value_create_transformation(
         property,
         transform_function,
         values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, length) },
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
     }))
 }
 
@@ -3453,30 +3389,8 @@ pub extern "C" fn rust_style_value_create_display(raw: u32) -> *const StyleValue
     Arc::into_raw(Arc::new(StyleValueData::Display { raw }))
 }
 
-/// Takes ownership of one strong reference to each non-null component value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_radial_size(
-    component_count: u8,
-    is_extent_0: bool,
-    extent_0: u8,
-    value_0: *const StyleValueData,
-    is_extent_1: bool,
-    extent_1: u8,
-    value_1: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::RadialSize {
-        component_count,
-        is_extent_0,
-        extent_0,
-        value_0: unsafe { RetainedStyleValueData::from_retained_optional_pointer(value_0) },
-        is_extent_1,
-        extent_1,
-        value_1: unsafe { RetainedStyleValueData::from_retained_optional_pointer(value_1) },
-    }))
-}
-
-/// Creates an unresolved value from borrowed token source. Rust derives the source and comparison
-/// strings according to the requested SourceTextMode and retains the component tree.
+/// Creates an unresolved value from borrowed token source, deriving its source text according to
+/// the requested SourceTextMode and retaining the component tree.
 ///
 /// Takes ownership of one strong reference to `parsed_value` when it is non-null.
 #[unsafe(no_mangle)]
@@ -3484,10 +3398,6 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved_from_source(
     token_source_ascii_units: *const u8,
     token_source_code_units: *const u16,
     token_source_length: usize,
-    has_original_source_text: bool,
-    original_source_text_ascii_units: *const u8,
-    original_source_text_code_units: *const u16,
-    original_source_text_length: usize,
     source_text_mode: u8,
     presence_attr: bool,
     presence_dashed_function: bool,
@@ -3506,53 +3416,26 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved_from_source(
         crate::css::css_tokenizer::tokenize_for_parser(token_source),
     )
     .unwrap_or_default();
-    let normalized = crate::css::serialize::serialize_component_values_to_utf16(
-        &components,
-        crate::css::parser::component_value::ComponentSerializationMode::Normalized,
-    );
-    let (source_text, value_comparison_text) = if has_original_source_text {
-        let original_source_text = unsafe {
-            TokenizerInput::from_raw_parts(
-                original_source_text_ascii_units,
-                original_source_text_code_units,
-                original_source_text_length,
-            )
-        }
-        .unwrap_or_default();
-        let mut source_text = Vec::with_capacity(original_source_text.len());
-        original_source_text.append_to(&mut source_text);
-        (
-            crate::css::serialize::trim_ascii_whitespace(&source_text).to_vec(),
-            crate::css::serialize::trim_ascii_whitespace(&normalized).to_vec(),
-        )
-    } else {
-        let source_text = match source_text_mode {
-            0 | 1 => crate::css::serialize::serialize_component_values_to_utf16(
-                &components,
-                crate::css::parser::component_value::ComponentSerializationMode::PreserveNumericSource,
-            ),
-            2 => crate::css::serialize::original_component_values_source(&components)
-                .unwrap_or_else(|| normalized.clone()),
-            _ => unreachable!("unknown unresolved source text mode"),
-        };
-        let source_text = if source_text_mode == 0 {
-            crate::css::serialize::trim_ascii_whitespace(&source_text)
-        } else if source_text_mode == 1 {
-            crate::css::serialize::trim_ascii_whitespace_start(&source_text)
-        } else {
-            &source_text
-        };
-        (source_text.to_vec(), Vec::new())
+    let normalized = serialize_component_values_to_utf16(&components, ComponentSerializationMode::Normalized);
+    let source_text = match source_text_mode {
+        0 | 1 => serialize_component_values_to_utf16(&components, ComponentSerializationMode::PreserveNumericSource),
+        2 => original_component_values_source(&components).unwrap_or(normalized),
+        _ => unreachable!("unknown unresolved source text mode"),
     };
-    let component_source = if value_comparison_text.is_empty() {
+    let source_text = if source_text_mode == 0 {
+        trim_component_value_boundary_whitespace(&source_text)
+    } else if source_text_mode == 1 {
+        trim_ascii_whitespace_start(&source_text)
+    } else {
         &source_text
-    } else {
-        &value_comparison_text
     };
+    let components = RetainedComponentValueList::from_source(source_text);
+    if presence_attr {
+        crate::css::parser::arbitrary_substitution::note_attr_names_read_by(components.as_slice());
+    }
     Arc::into_raw(Arc::new(StyleValueData::Unresolved {
-        components: RetainedComponentValueList::from_source(component_source),
-        source_text: CssString::from_utf16(&source_text),
-        value_comparison_text: CssString::from_utf16(&value_comparison_text),
+        components,
+        source_text: CssString::from_utf16(source_text),
         presence_attr,
         presence_dashed_function,
         presence_env,
@@ -3575,52 +3458,14 @@ pub unsafe extern "C" fn rust_style_value_create_counter_definitions(
     }))
 }
 
-/// Takes ownership of one strong reference to the first symbol and one leaked reference to the
-/// name when they are present.
+/// A counter style reference by name. Takes ownership of one leaked reference to the name.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_counter_style_system(
-    kind: u8,
-    system: u8,
-    first_symbol: *const StyleValueData,
-    name: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::CounterStyleSystem {
-        kind,
-        system,
-        first_symbol: unsafe { RetainedStyleValueData::from_retained_optional_pointer(first_symbol) },
-        name: unsafe { CssString::from_leaked_raw(name) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to the name (0 when this is a symbols() function)
-/// and to each symbol string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_counter_style(
-    is_symbols: bool,
-    name: usize,
-    symbols_type: u8,
-    symbols: *const usize,
-    symbol_count: usize,
-) -> *const StyleValueData {
+pub unsafe extern "C" fn rust_style_value_create_counter_style(name: usize) -> *const StyleValueData {
     Arc::into_raw(Arc::new(StyleValueData::CounterStyle {
-        is_symbols,
+        is_symbols: false,
         name: unsafe { CssString::from_leaked_raw(name) },
-        symbols_type,
-        symbols: unsafe { CssStringList::from_raw(symbols, symbol_count) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the image and to each non-null coordinate.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_cursor(
-    image: *const StyleValueData,
-    x: *const StyleValueData,
-    y: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Cursor {
-        image: unsafe { RetainedStyleValueData::from_retained_pointer(image) },
-        x: unsafe { RetainedStyleValueData::from_retained_optional_pointer(x) },
-        y: unsafe { RetainedStyleValueData::from_retained_optional_pointer(y) },
+        symbols_type: 0,
+        symbols: CssStringList::from_strings(Vec::new()),
     }))
 }
 
@@ -3631,13 +3476,13 @@ pub unsafe extern "C" fn rust_style_value_create_color_function(
     has_color_type: bool,
     color_type: u8,
     color_syntax: u8,
-    channel_0: *const StyleValueData,
-    channel_1: *const StyleValueData,
-    channel_2: *const StyleValueData,
-    alpha: *const StyleValueData,
+    channel_0: OwnedArc<StyleValueData>,
+    channel_1: OwnedArc<StyleValueData>,
+    channel_2: OwnedArc<StyleValueData>,
+    alpha: OwnedArc<StyleValueData>,
     has_name: bool,
     name: usize,
-    origin_color: *const StyleValueData,
+    origin_color: OwnedArc<StyleValueData>,
 ) -> *const StyleValueData {
     Arc::into_raw(Arc::new(StyleValueData::ColorFunction {
         color_base: ColorBase {
@@ -3645,102 +3490,13 @@ pub unsafe extern "C" fn rust_style_value_create_color_function(
             color_type,
             color_syntax,
         },
-        channel_0: unsafe { RetainedStyleValueData::from_retained_pointer(channel_0) },
-        channel_1: unsafe { RetainedStyleValueData::from_retained_pointer(channel_1) },
-        channel_2: unsafe { RetainedStyleValueData::from_retained_pointer(channel_2) },
-        alpha: unsafe { RetainedStyleValueData::from_retained_optional_pointer(alpha) },
+        channel_0: RetainedStyleValueData::from_arc(channel_0.into_arc()),
+        channel_1: RetainedStyleValueData::from_arc(channel_1.into_arc()),
+        channel_2: RetainedStyleValueData::from_arc(channel_2.into_arc()),
+        alpha: RetainedStyleValueData::from_optional_arc(alpha.into_option()),
         has_name,
         name: unsafe { CssString::from_leaked_raw(name) },
-        origin_color: unsafe { RetainedStyleValueData::from_retained_optional_pointer(origin_color) },
-    }))
-}
-
-/// Takes ownership of the options' retained values and strings.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_image_set(
-    options: *const FfiImageSetOption,
-    length: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ImageSet {
-        options: unsafe { RetainedImageSetOptionList::from_raw(options, length) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each non-null value and of the stops' retained
-/// values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_linear_gradient(
-    has_direction_value: bool,
-    direction_value: *const StyleValueData,
-    side_or_corner: u8,
-    stops: *const RetainedColorStop,
-    stop_count: usize,
-    gradient_type: u8,
-    repeating: bool,
-    color_interpolation_method: *const StyleValueData,
-    color_syntax: u8,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::LinearGradient {
-        has_direction_value,
-        direction_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(direction_value) },
-        side_or_corner,
-        color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
-        gradient_type,
-        repeating,
-        color_interpolation_method: unsafe {
-            RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
-        },
-        color_syntax,
-    }))
-}
-
-/// Takes ownership of one strong reference to each non-null value and of the stops' retained
-/// values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_conic_gradient(
-    from_angle: *const StyleValueData,
-    position: *const StyleValueData,
-    stops: *const RetainedColorStop,
-    stop_count: usize,
-    repeating: bool,
-    color_interpolation_method: *const StyleValueData,
-    color_syntax: u8,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ConicGradient {
-        from_angle: unsafe { RetainedStyleValueData::from_retained_optional_pointer(from_angle) },
-        position: unsafe { RetainedStyleValueData::from_retained_pointer(position) },
-        color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
-        repeating,
-        color_interpolation_method: unsafe {
-            RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
-        },
-        color_syntax,
-    }))
-}
-
-/// Takes ownership of one strong reference to each non-null value and of the stops' retained
-/// values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_radial_gradient(
-    ending_shape: u8,
-    size: *const StyleValueData,
-    position: *const StyleValueData,
-    stops: *const RetainedColorStop,
-    stop_count: usize,
-    repeating: bool,
-    color_interpolation_method: *const StyleValueData,
-    color_syntax: u8,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::RadialGradient {
-        ending_shape,
-        size: unsafe { RetainedStyleValueData::from_retained_pointer(size) },
-        position: unsafe { RetainedStyleValueData::from_retained_pointer(position) },
-        color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
-        repeating,
-        color_interpolation_method: unsafe {
-            RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
-        },
-        color_syntax,
+        origin_color: RetainedStyleValueData::from_optional_arc(origin_color.into_option()),
     }))
 }
 
@@ -3779,20 +3535,17 @@ pub unsafe extern "C" fn rust_style_value_create_image(
     url_modifier_count: usize,
     resource_base_url: crate::css::ffi_support::FfiUtf16View,
     has_resource_base_url: bool,
-    has_parent_style_sheet_origin_clean: bool,
-    parent_style_sheet_origin_clean: bool,
-    should_absolutize_url_for_computed_value: bool,
 ) -> *const StyleValueData {
     Arc::into_raw(Arc::new(StyleValueData::Image {
-        url: unsafe { RetainedString::from_units(url.units().expect("invalid URL text")) },
+        url: RetainedString::from_units(url.units().expect("invalid URL text")),
         url_type,
         url_modifiers: unsafe { RetainedRequestUrlModifierList::from_raw(url_modifiers, url_modifier_count) },
         resource_context: ImageResourceContext {
-            base_url: unsafe { RetainedString::from_units(resource_base_url.units().expect("invalid base URL text")) },
+            base_url: RetainedString::from_units(resource_base_url.units().expect("invalid base URL text")),
             has_base_url: has_resource_base_url,
-            has_parent_style_sheet_origin_clean,
-            parent_style_sheet_origin_clean,
-            should_absolutize_url_for_computed_value,
+            has_parent_style_sheet_origin_clean: false,
+            parent_style_sheet_origin_clean: false,
+            should_absolutize_url_for_computed_value: false,
         },
     }))
 }
@@ -3801,19 +3554,11 @@ pub(crate) unsafe fn release_style_value(value: *const StyleValueData) {
     if value.is_null() {
         return;
     }
-    if replay_style_value_dependency_flags(value).is_some() {
-        return;
-    }
-    let value_reference = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(value) });
-    if Arc::strong_count(&value_reference) == 1 {
-        crate::css::style::record_replay::invalidate_pointer(value as usize);
-    }
     unsafe { Arc::decrement_strong_count(value) };
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_release(value: *const StyleValueData) {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StyleValueDestroyEntry);
     unsafe { release_style_value(value) };
 }
 
@@ -3821,23 +3566,24 @@ pub unsafe extern "C" fn rust_style_value_release(value: *const StyleValueData) 
 ///
 /// The addresses are compared first because a shared allocation is the common case, and the values
 /// otherwise: two allocations built from the same declaration are equal, and a caller holding a
-/// freshly computed one has no way to know that from the pointer alone.
-///
-/// # Safety
-/// `first` and `second` must be null or point at live `StyleValueData` allocated by this module.
+/// freshly computed one has no way to know that from the pointer alone. Null stands for no value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_equals(first: *const StyleValueData, second: *const StyleValueData) -> bool {
-    if std::ptr::eq(first, second) {
-        return true;
+pub extern "C" fn rust_style_value_equals(first: Option<&StyleValueData>, second: Option<&StyleValueData>) -> bool {
+    optional_style_values_equal(first, second)
+}
+
+/// `rust_style_value_equals` for two handles.
+pub(crate) fn retained_style_values_equal(first: &RetainedStyleValueData, second: &RetainedStyleValueData) -> bool {
+    optional_style_values_equal(first.optional_data(), second.optional_data())
+}
+
+/// Two absent values are equal, and an absent value equals no present one.
+pub(crate) fn optional_style_values_equal(first: Option<&StyleValueData>, second: Option<&StyleValueData>) -> bool {
+    match (first, second) {
+        (None, None) => true,
+        (Some(first), Some(second)) => style_values_equal(first, second),
+        _ => false,
     }
-    if first.is_null() || second.is_null() {
-        return false;
-    }
-    // Replay pointers are opaque identity tokens rather than readable StyleValueData.
-    if replay_style_value_dependency_flags(first).is_some() || replay_style_value_dependency_flags(second).is_some() {
-        return false;
-    }
-    style_values_equal(unsafe { &*first }, unsafe { &*second })
 }
 
 fn style_values_equal(first: &StyleValueData, second: &StyleValueData) -> bool {
@@ -3887,9 +3633,6 @@ fn style_values_equal(first: &StyleValueData, second: &StyleValueData) -> bool {
 /// `value` must be null or point at a live `StyleValueData` allocated by this module.
 pub(crate) unsafe fn retain_style_value(value: *const StyleValueData) -> *const StyleValueData {
     if !value.is_null() {
-        if replay_style_value_dependency_flags(value).is_some() {
-            return value;
-        }
         unsafe { Arc::increment_strong_count(value) };
     }
     value
@@ -3898,6 +3641,40 @@ pub(crate) unsafe fn retain_style_value(value: *const StyleValueData) -> *const 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_retain(value: *const StyleValueData) -> *const StyleValueData {
     unsafe { retain_style_value(value) }
+}
+
+/// https://drafts.csswg.org/css-viewport/#zoom-om
+/// Computed style APIs (i.e., all values returned by getComputedStyle()) that are non-auto and non-percentage lengths
+/// must be unscaled.
+/// The computed value `value` of an element whose effective zoom is `zoom`, with its lengths unscaled, retained for the
+/// caller; null where unscaling changes nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_unscaled_by_zoom(value: &StyleValueData, zoom: f64) -> *const StyleValueData {
+    if zoom == 1.0 || !zoom.is_normal() || zoom < 0.0 {
+        return std::ptr::null();
+    }
+    let length = crate::css::style_compute::FfiLengthResolutionContext {
+        zoom: 1.0 / zoom,
+        ..Default::default()
+    };
+    let context = crate::css::absolutize::AbsolutizationContext {
+        length: &length,
+        scheme: None,
+        resolved_viewport_relative_length: std::cell::Cell::new(false),
+        tree_counting: None,
+        random_base_values: &[],
+        document_base_url: &[],
+        style_sheet_resource_context: None,
+        current_color: None,
+    };
+    match crate::css::absolutize::absolutize(value, &context) {
+        Some(crate::css::absolutize::Absolutized::Changed(unscaled)) => {
+            let pointer = unscaled.pointer();
+            std::mem::forget(unscaled);
+            pointer
+        }
+        _ => std::ptr::null(),
+    }
 }
 
 #[cfg(test)]
@@ -3975,6 +3752,24 @@ fn hash_string_units(hasher: &mut crate::css::style::fast_hash::FastHasher, unit
 #[cfg(test)]
 mod equality_tests {
     use super::*;
+    use crate::css::css_tokenizer::tokenize_for_parser;
+    use crate::css::parser::component_value::consume_a_list_of_component_values;
+    use crate::css::parser::value_parser::unresolved_value;
+
+    fn unresolved(source: &str) -> StyleValueData {
+        let values = consume_a_list_of_component_values(tokenize_for_parser(source.as_bytes())).unwrap();
+        let serialized = serialize_component_values_to_utf16(&values, ComponentSerializationMode::Normalized);
+        unresolved_value(&serialized, values, Default::default())
+    }
+
+    #[test]
+    fn unresolved_equality_preserves_numeric_token_types() {
+        for (first, second) in [("1", "1.0"), ("1", "1e0"), ("f(1)", "f(1.0)"), ("[1]", "[1.0]")] {
+            let first = unresolved(first);
+            let second = unresolved(second);
+            assert!(!style_values_equal(&first, &second));
+        }
+    }
 
     #[test]
     fn text_hashes_alike_in_either_spelling() {
@@ -3989,13 +3784,11 @@ mod equality_tests {
     }
 
     fn retained_number(value: f64) -> RetainedStyleValueData {
-        let value = Arc::into_raw(Arc::new(StyleValueData::Number { value }));
-        unsafe { RetainedStyleValueData::from_retained_pointer(value) }
+        RetainedStyleValueData::from_arc(Arc::new(StyleValueData::Number { value }))
     }
 
     fn retained(value: StyleValueData) -> RetainedStyleValueData {
-        let value = Arc::into_raw(Arc::new(value));
-        unsafe { RetainedStyleValueData::from_retained_pointer(value) }
+        RetainedStyleValueData::from_arc(Arc::new(value))
     }
 
     fn color_function(color_syntax: u8) -> StyleValueData {
@@ -4040,39 +3833,9 @@ mod equality_tests {
     }
 }
 
-#[cfg(test)]
-mod replay_tests {
-    use super::*;
-
-    #[test]
-    fn retained_replay_tokens_can_move_between_threads() {
-        let pointer = register_replay_style_value(0x1234, 0);
-        let value = unsafe { RetainedStyleValueData::from_retained_pointer(pointer) };
-        std::thread::spawn(move || {
-            let copy = value.clone();
-            assert_eq!(unsafe { style_value_content_hash(copy.pointer()) }, 0x1234);
-            assert_eq!(replay_style_value_token(copy.pointer()), Some(0x1234));
-        })
-        .join()
-        .unwrap();
-    }
-
-    #[test]
-    fn distinct_replay_tokens_compare_unequal_without_being_dereferenced() {
-        let first = register_replay_style_value(0x1234, 0);
-        let second = register_replay_style_value(0x5678, 0);
-
-        assert_eq!(replay_style_value_token(first), Some(0x1234));
-        assert_eq!(replay_style_value_token(second), Some(0x5678));
-        assert_eq!(replay_style_value_token(std::ptr::null()), None);
-        assert!(unsafe { rust_style_value_equals(first, first) });
-        assert!(!unsafe { rust_style_value_equals(first, second) });
-    }
-}
-
 /// Whether a value's computed color depends on the element's used currentcolor: the
-/// currentcolor keyword itself, a color function whose nested colors do, or an Effects
-/// list whose shadow or filter colors do.
+/// currentcolor keyword itself, a color function whose nested colors do, an Effects list
+/// whose shadow or filter colors do, or a scrollbar color whose thumb or track color does.
 pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
     let retained_data_depends =
         |retained: &RetainedStyleValueData| retained.optional_data().is_some_and(value_depends_on_current_color);
@@ -4080,15 +3843,15 @@ pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
     match value {
         StyleValueData::Keyword { keyword } => *keyword == crate::css::style_compute::keyword::CURRENTCOLOR,
         StyleValueData::ColorFunction { origin_color, .. } => retained_data_depends(origin_color),
-        StyleValueData::ColorMix {
-            first_color,
-            second_color,
-            ..
-        } => retained_data_depends(first_color) || retained_data_depends(second_color),
+        StyleValueData::ColorMix { colors, .. } => colors.as_slice().iter().any(retained_data_depends),
         StyleValueData::ContrastColor { color, .. } => retained_data_depends(color),
         StyleValueData::LightDark { light, dark, .. } => retained_data_depends(light) || retained_data_depends(dark),
         StyleValueData::Shadow { color, .. } => retained_data_depends(color),
         StyleValueData::Filter { value, .. } => retained_data_depends(value),
+        StyleValueData::ScrollbarColor {
+            thumb_color,
+            track_color,
+        } => retained_data_depends(thumb_color) || retained_data_depends(track_color),
         StyleValueData::ValueList { values, .. } => list_depends(values),
         _ => false,
     }
@@ -4106,11 +3869,7 @@ pub(crate) fn value_depends_on_color_scheme(value: &StyleValueData) -> bool {
         StyleValueData::ColorFunction { origin_color, .. } => {
             origin_color.optional_data().is_some_and(value_depends_on_color_scheme)
         }
-        StyleValueData::ColorMix {
-            first_color,
-            second_color,
-            ..
-        } => retained_data_depends(first_color) || retained_data_depends(second_color),
+        StyleValueData::ColorMix { colors, .. } => colors.as_slice().iter().any(retained_data_depends),
         StyleValueData::ContrastColor { color, .. } => retained_data_depends(color),
         StyleValueData::LightDark { .. } => true,
         _ => false,
@@ -4123,32 +3882,25 @@ pub(crate) fn value_may_depend_on_font_metrics(value: &StyleValueData) -> bool {
         .expect("font dependency requested for an unsupported value")
 }
 
-pub(crate) fn style_value_dependency_flags(value: *const StyleValueData) -> u8 {
-    if let Some(flags) = replay_style_value_dependency_flags(value) {
-        return flags;
-    }
-    let value = unsafe { &*value };
+pub(crate) fn style_value_dependency_flags(value: &StyleValueData) -> u8 {
     u8::from(value_depends_on_current_color(value))
         | (u8::from(value_depends_on_color_scheme(value)) << 1)
         | (u8::from(value_may_depend_on_font_metrics(value)) << 2)
 }
 
 pub(crate) fn retained_value_depends_on_current_color(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 1 != 0
+    style_value_dependency_flags(value.data()) & 1 != 0
 }
 
 pub(crate) fn retained_value_depends_on_color_scheme(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 2 != 0
+    style_value_dependency_flags(value.data()) & 2 != 0
 }
 
 pub(crate) fn retained_value_may_depend_on_font_metrics(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 4 != 0
+    style_value_dependency_flags(value.data()) & 4 != 0
 }
 
-/// # Safety
-/// `data` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_depends_on_current_color(data: *const c_void) -> bool {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StyleValueQueryEntry);
-    value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) })
+pub extern "C" fn rust_style_value_depends_on_current_color(data: &StyleValueData) -> bool {
+    value_depends_on_current_color(data)
 }

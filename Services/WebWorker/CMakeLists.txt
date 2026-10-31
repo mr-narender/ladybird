@@ -15,9 +15,6 @@ target_include_directories(webworkerservice PRIVATE ${LADYBIRD_SOURCE_DIR})
 target_include_directories(webworkerservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Services/)
 
 target_link_libraries(webworkerservice PUBLIC LibCore LibFileSystem LibGfx LibHTTP LibIPC LibJS LibRequests LibCompositing LibWeb LibUnicode LibImageDecoderClient LibMain LibMediaClient LibURL LibGC)
-if (ENABLE_CRANELIFT_JIT)
-    target_link_libraries(webworkerservice PUBLIC LibWasm LibWasmCompilerClient)
-endif()
 target_link_libraries(webworkerservice PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 
 add_executable(WebWorker main.cpp)
@@ -34,7 +31,6 @@ target_include_directories(WebWorker PRIVATE ${LADYBIRD_SOURCE_DIR})
 target_link_libraries(WebWorker PRIVATE webworkerservice LibSandbox OpenSSL::Crypto OpenSSL::SSL)
 
 if(WIN32)
-    target_include_directories(WebWorker PRIVATE $<BUILD_INTERFACE:${PTHREAD_INCLUDE_DIR}>)
     ladybird_windows_bin(WebWorker CONSOLE)
 endif()
 

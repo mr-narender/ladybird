@@ -25,9 +25,10 @@ public:
     void clear_content_blockers();
     void reset_force_dark();
     void reset_line_box_borders();
+    void reset_user_style();
     void reset_geolocation_emulated_position();
-    NonnullRefPtr<Core::Promise<Empty>> reset_session_history();
-    pid_t web_content_pid() const;
+    void reset_permissions();
+    NonnullRefPtr<Core::Promise<Empty>> reset_state_for_next_test();
 
     NonnullRefPtr<Core::Promise<RefPtr<Gfx::Bitmap const>>> take_screenshot();
 

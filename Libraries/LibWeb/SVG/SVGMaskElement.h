@@ -33,9 +33,7 @@ public:
 
     virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
-
-    CSSPixelRect resolve_masking_area(CSSPixelRect const& target_object_bounding_box, Gfx::FloatSize const& viewport_size, Gfx::AffineTransform const& user_space_to_css_pixels) const;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     MaskContentUnits mask_content_units() const;
     MaskUnits mask_units() const;
@@ -43,6 +41,21 @@ public:
     NumberPercentage mask_y() const;
     NumberPercentage mask_width() const;
     NumberPercentage mask_height() const;
+
+    GC::Ref<SVGAnimatedEnumeration> mask_units_for_bindings();
+    GC::Ref<SVGAnimatedEnumeration> mask_content_units_for_bindings();
+
+    // https://drafts.fxtf.org/css-masking/#dom-svgmaskelement-x
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(x, Horizontal, SVGLengthValue::percentage(-10));
+
+    // https://drafts.fxtf.org/css-masking/#dom-svgmaskelement-y
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(y, Vertical, SVGLengthValue::percentage(-10));
+
+    // https://drafts.fxtf.org/css-masking/#dom-svgmaskelement-width
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(width, Horizontal, SVGLengthValue::percentage(120));
+
+    // https://drafts.fxtf.org/css-masking/#dom-svgmaskelement-height
+    REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::percentage(120));
 
 private:
     SVGMaskElement(DOM::Document&, DOM::QualifiedName);

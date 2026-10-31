@@ -7,8 +7,6 @@
 //! Expression parsing: primary, secondary (binary/postfix), unary, and
 //! precedence climbing.
 
-use std::sync::Arc;
-
 use crate::ast::*;
 use crate::lexer::ch;
 use crate::parser::Associativity;
@@ -243,7 +241,7 @@ impl Parser<'_> {
         let original_forbidden = forbidden;
         let mut lhs_is_parenthesized = self.last_primary_was_parenthesized;
         self.last_primary_was_parenthesized = false;
-        while self.match_secondary_expression(&forbidden) {
+        while !self.recursion_limit_reached && self.match_secondary_expression(&forbidden) {
             let new_precedence = Self::operator_precedence(self.current_token_type());
             if new_precedence < min_precedence {
                 break;
@@ -660,19 +658,14 @@ impl Parser<'_> {
             Vec::new()
         };
         self.validate_regex_flags(&flags);
-        let compiled_regex = match crate::bytecode::ffi::compile_regex(&pattern, &flags) {
-            Ok(handle) => Arc::new(CompiledRegex::new(handle)),
-            Err(msg) => {
-                self.syntax_error_at_position(&String::from_utf16_lossy(&msg), start);
-                Arc::new(CompiledRegex::new(std::ptr::null_mut()))
-            }
-        };
+        if let Err(msg) = crate::host::validate_regex(&pattern, &flags) {
+            self.syntax_error_at_position(&String::from_utf16_lossy(&msg), start);
+        }
         self.expression(
             start,
             ExpressionKind::RegExpLiteral(Box::new(RegExpLiteralData {
                 pattern: pattern.into(),
                 flags: flags.into(),
-                compiled_regex,
             })),
         )
     }
@@ -1216,8 +1209,20 @@ impl Parser<'_> {
             self.parse_expression(PRECEDENCE_MEMBER, Associativity::Right, forbidden)
         };
 
-        if matches!(callee.inner, ExpressionKind::ImportCall(_)) && !callee_starts_with_grouping_paren {
-            self.syntax_error("Cannot call new on dynamic import");
+        // NB: An ImportCall is a CallExpression, not a MemberExpression, so neither it nor a member access or tagged
+        //     template on it can be the operand of `new` unless it is parenthesized.
+        if !callee_starts_with_grouping_paren {
+            let mut base = &callee;
+            loop {
+                match &base.inner {
+                    ExpressionKind::Member(member) => base = &member.object,
+                    ExpressionKind::TaggedTemplateLiteral(tagged_template) => base = &tagged_template.tag,
+                    _ => break,
+                }
+            }
+            if matches!(base.inner, ExpressionKind::ImportCall(_)) {
+                self.syntax_error("Cannot call new on dynamic import");
+            }
         }
 
         if self.match_token(TokenType::ParenOpen) {
@@ -2552,12 +2557,15 @@ impl Parser<'_> {
         insights.might_need_arguments_object = self.flags.function_might_need_arguments_object;
         self.flags.function_might_need_arguments_object = saved_might_need_arguments;
 
-        // Class constructors always need a function environment for `this` binding
-        // management (super() binds this in derived constructors, and base constructors
-        // need it for OrdinaryCallBindThis).
+        // Class constructors always bind `this`. Derived constructors need a function
+        // environment for it, since super() binds it there; base constructors bind it like
+        // other functions do (OrdinaryCallBindThis), and only need one if something in them
+        // does.
         if method_kind == MethodKind::Constructor {
             insights.uses_this = true;
-            insights.uses_this_from_environment = true;
+            if self.class_has_super_class {
+                insights.uses_this_from_environment = true;
+            }
         }
 
         let nested_function_ids = self.pop_function_context();

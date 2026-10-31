@@ -5,12 +5,20 @@
  */
 
 use crate::layout::node_data::NodeSlotId;
-use std::rc::Rc;
+use crate::painting::paint_read::GeometryRead;
+use crate::painting::record::paint::text::SelectionStyleAnswer;
+use crate::painting::selection::{
+    HighlightPseudoElement, SearchTextHighlights, SelectionRange, SpellingErrorHighlights,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 pub(crate) struct PendingRecording {
     pub(crate) recording: crate::painting::record::RecordingResult,
-    pub(crate) recording_from_scratch: Option<crate::painting::record::RecordingResult>,
     pub(crate) publishes_recording: bool,
+    /// The SVG paint resources the recording's frame was published with, whose filter images
+    /// its publication hands to the host.
+    pub(crate) svg_paint_resources: Arc<crate::painting::svg_paint_resources::SvgPaintResourceRows>,
 }
 
 pub(crate) struct PendingRecordingTrace {
@@ -18,32 +26,65 @@ pub(crate) struct PendingRecordingTrace {
     pub(crate) should_paint_overlay: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PaintState {
     pub(crate) trace_recordings: bool,
-    pub(crate) pending_recording_trace: Option<PendingRecordingTrace>,
-    pub(crate) pending_recording: Option<PendingRecording>,
     pub(crate) visual_context: crate::painting::visual_context::VisualContextState,
-    pub(crate) root_background_source: Option<crate::painting::host::FfiRootBackgroundSource>,
+    pub(crate) root_background_source: Option<crate::painting::host::RootBackgroundSource>,
     pub(crate) hit_test_list_generation: u64,
-    pub(crate) last_recording: Option<Rc<crate::painting::record::RecordingOutput>>,
-    pub(crate) published_frame: Option<Rc<crate::painting::record::RecordingOutput>>,
-    pub(crate) published_hit_test_items: Option<Rc<crate::painting::record::PublishedHitTestItems>>,
-    // The paint-order tree describing the published frame; a recording appends to it and
-    // publication or discarding decides what stays.
-    pub(crate) paint_order_tree: std::cell::RefCell<crate::painting::record::order_tree::PaintOrderTree>,
-    pub(crate) selection: Option<crate::painting::selection::SelectionRange>,
-    pub(crate) selection_pseudo_styles:
-        std::collections::HashMap<NodeSlotId, Rc<crate::painting::record::paint::text::SelectionStyleAnswer>>,
+    pub(crate) last_recording: Option<Arc<crate::painting::record::RecordingOutput>>,
+    /// The selection, shared with the frames published while it holds.
+    pub(crate) selection: Option<Arc<SelectionRange>>,
+    /// The `::selection` styles, shared with the frames published while they hold, so a write
+    /// copies the table only while a frame still holds it.
+    pub(crate) selection_pseudo_styles: Arc<SelectionPseudoStyles>,
+    /// The find-in-page matches, shared with the frames published while they hold.
+    pub(crate) search_text: Arc<SearchTextHighlights>,
+    /// The `::search-text` styles, shared as the `::selection` styles are.
+    pub(crate) search_text_pseudo_styles: Arc<SelectionPseudoStyles>,
+    /// The `::search-text:current` styles, shared as the `::selection` styles are.
+    pub(crate) search_text_current_pseudo_styles: Arc<SelectionPseudoStyles>,
+    /// The misspelled runs, shared with the frames published while they hold.
+    pub(crate) spelling_errors: Arc<SpellingErrorHighlights>,
+    /// The `::spelling-error` styles, shared as the `::selection` styles are.
+    pub(crate) spelling_error_pseudo_styles: Arc<SelectionPseudoStyles>,
 }
 
+/// Each row's committed style for one highlight pseudo-element.
+pub(crate) type SelectionPseudoStyles = HashMap<NodeSlotId, Arc<SelectionStyleAnswer>>;
+
 impl PaintState {
+    pub(crate) fn highlight_pseudo_styles_mut(
+        &mut self,
+        highlight: HighlightPseudoElement,
+    ) -> &mut Arc<SelectionPseudoStyles> {
+        match highlight {
+            HighlightPseudoElement::Selection => &mut self.selection_pseudo_styles,
+            HighlightPseudoElement::SearchText => &mut self.search_text_pseudo_styles,
+            HighlightPseudoElement::SearchTextCurrent => &mut self.search_text_current_pseudo_styles,
+            HighlightPseudoElement::SpellingError => &mut self.spelling_error_pseudo_styles,
+        }
+    }
+
+    pub(crate) fn reset_visual_context_state(&mut self) {
+        self.visual_context = crate::painting::visual_context::VisualContextState {
+            needs_to_refresh_scroll_state: true,
+            ..Default::default()
+        };
+        self.visual_context
+            .dirty_boxes
+            .request_full_rebuild(crate::painting::visual_context::dirty::VisualContextUpdateScope::FreshTree);
+    }
+}
+
+impl crate::layout::LayoutNodeArena {
+    /// Makes `source` the root background source, and pushes the damage of the boxes the move changes which paints
+    /// the root's background. Answers whether the source moved.
     pub(crate) fn update_root_background_source(
         &mut self,
-        arena: &crate::layout::LayoutNodeArena,
-        source: crate::painting::host::FfiRootBackgroundSource,
+        source: crate::painting::host::RootBackgroundSource,
     ) -> bool {
-        let Some(previous) = self.root_background_source.replace(source) else {
+        let Some(previous) = self.paint_state_mut().root_background_source.replace(source) else {
             return false;
         };
         if previous == source {
@@ -54,23 +95,25 @@ impl PaintState {
         // and new owners, including inline pieces painted by their containing block.
         for source in [previous, source] {
             for slot in [source.root_layout_node, source.body_layout_node] {
-                arena.push_paint_damage_for_repaint(slot, PaintDamage::DRAW_BACKGROUND);
+                self.push_paint_damage_for_repaint(slot, PaintDamage::DRAW_BACKGROUND);
             }
             // The viewport's scrollbars take their colors from the propagated background.
-            if let Some(viewport) = arena.node_parent_if_live(source.root_layout_node) {
-                arena.push_paint_damage(viewport, PaintDamage::DRAW_OVERLAY | PaintDamage::SCROLL_METADATA);
+            if let Some(viewport) = self.node_parent_if_live(source.root_layout_node) {
+                self.push_paint_damage(viewport, PaintDamage::DRAW_OVERLAY | PaintDamage::SCROLL_METADATA);
             }
         }
         true
     }
 
-    pub(crate) fn reset_visual_context_state(&mut self) {
-        self.visual_context = crate::painting::visual_context::VisualContextState {
-            needs_to_refresh_scroll_state: true,
-            ..Default::default()
-        };
-        self.visual_context
-            .dirty_boxes
-            .request_full_rebuild(crate::painting::visual_context::dirty::VisualContextGlobalRebuildReason::FirstBuild);
+    /// Lends the visual context state out of the paint state to `update`, which reads the rest of the arena beside it:
+    /// refreshing the scroll state and the sticky constraints reads the rows while it writes the state.
+    pub(crate) fn with_visual_context_state_lent<T>(
+        &mut self,
+        update: impl FnOnce(&Self, &mut crate::painting::visual_context::VisualContextState) -> T,
+    ) -> T {
+        let mut state = std::mem::take(&mut self.paint_state_mut().visual_context);
+        let answer = update(self, &mut state);
+        self.paint_state_mut().visual_context = state;
+        answer
     }
 }

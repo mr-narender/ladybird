@@ -14,11 +14,13 @@ use crate::painting::dump::{
     format_float_like_ak, push_affine_transform, push_float_like_ak, push_float_point, push_float_rect,
     push_float_size, push_int_point, push_int_rect, push_int_size,
 };
+use crate::painting::paint_read::PaintRead;
 #[cfg(test)]
 use crate::painting::visual_context::VisualContextTree;
 use crate::painting::visual_context::VisualContextTreeDump;
 use crate::painting::visual_context::dump::SlotKind;
-use libgfx_rust::path::OwnedPath;
+use crate::stage::MainThread;
+use libgfx_rust::path::Path;
 use libgfx_rust::{
     Color, CompositingAndBlendingOperator, CornerRadii, FloatPoint, FloatRect, FloatSize, IntPoint, IntRect, IntSize,
     LineStyle, ScalingMode,
@@ -27,63 +29,43 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write;
 
+crate::stage::main_thread_ffi_entries!();
+
+/// What a display list dump asks the document. The fields are private: the callbacks are reached
+/// only through the methods below, which take the main thread token.
+///
+/// NB: The callbacks are typed as safe functions because the table only comes from the host through an export
+///     whose safety contract keeps them callable, and the private fields let nothing else call them.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct FfiPaintingDumpCallbacks {
-    pub context: *mut c_void,
-    pub debug_description:
-        unsafe extern "C" fn(context: *mut c_void, layout_node_shell: *mut c_void, description_sink: *mut c_void),
-    pub command_bytes:
-        unsafe extern "C" fn(context: *mut c_void, display_list: *const c_void, byte_count: *mut usize) -> *const u8,
-    pub command_runs: unsafe extern "C" fn(
-        context: *mut c_void,
-        display_list: *const c_void,
-        run_count: *mut usize,
-    ) -> *const DisplayListCommandRun,
-    pub nested_display_list: unsafe extern "C" fn(context: *mut c_void, display_list_id: u64) -> *const c_void,
-    pub append_text: unsafe extern "C" fn(context: *mut c_void, bytes: *const u8, byte_count: usize),
+    context: *mut c_void,
+    /// Describes the row in the slot, as its layout node describes itself.
+    debug_description: extern "C" fn(context: *mut c_void, slot: NodeSlotId, description_sink: *mut c_void),
+    /// Answers the storage handle of a nested display list.
+    nested_display_list: extern "C" fn(context: *mut c_void, display_list_id: u64) -> *const c_void,
+    append_text: extern "C" fn(context: *mut c_void, bytes: *const u8, byte_count: usize),
 }
 
 impl FfiPaintingDumpCallbacks {
-    fn debug_description(&self, layout_node_shell: *mut c_void) -> String {
+    fn debug_description(&self, _: &MainThread, slot: NodeSlotId) -> String {
         let mut description = Vec::new();
-        // SAFETY: The C++ host fills the description sink synchronously through the exported push
+        // The C++ host fills the description sink synchronously through the exported push
         // function.
-        unsafe { (self.debug_description)(self.context, layout_node_shell, (&raw mut description).cast()) };
+        (self.debug_description)(self.context, slot, (&raw mut description).cast());
         String::from_utf8_lossy(&description).into_owned()
     }
 
-    fn command_bytes(&self, display_list: *const c_void) -> &[u8] {
-        let mut byte_count = 0;
-        // SAFETY: The host owns the display list for the duration of the dump and returns a span
-        // that stays live for this call.
-        let bytes = unsafe { (self.command_bytes)(self.context, display_list, &raw mut byte_count) };
-        if byte_count == 0 {
-            return &[];
-        }
-        assert!(!bytes.is_null());
-        // SAFETY: The host reported `byte_count` readable bytes at `bytes`.
-        unsafe { std::slice::from_raw_parts(bytes, byte_count) }
-    }
-
-    fn command_runs(&self, display_list: *const c_void) -> &[DisplayListCommandRun] {
-        let mut run_count = 0;
-        // SAFETY: The host owns the display list for the duration of the dump and returns its live runs.
-        let runs = unsafe { (self.command_runs)(self.context, display_list, &raw mut run_count) };
-        // SAFETY: The host reported `run_count` readable runs at `runs`.
-        unsafe { libcompositing_rust::ffi::ffi_slice(runs, run_count) }
-    }
-
-    fn nested_display_list(&self, display_list_id: DisplayListResourceId) -> *const c_void {
-        // SAFETY: Nested ids come from records the host produced, so they resolve in its storage.
-        let display_list = unsafe { (self.nested_display_list)(self.context, display_list_id.0) };
+    fn nested_display_list(&self, _: &MainThread, display_list_id: DisplayListResourceId) -> *const c_void {
+        // Nested ids come from records the host produced, so they resolve in its storage.
+        let display_list = (self.nested_display_list)(self.context, display_list_id.0);
         assert!(!display_list.is_null());
         display_list
     }
 
-    fn append_text(&self, text: &str) {
-        // SAFETY: The C++ sink copies the completed dump synchronously.
-        unsafe { (self.append_text)(self.context, text.as_ptr(), text.len()) };
+    fn append_text(&self, _: &MainThread, text: &str) {
+        // The C++ sink copies the completed dump synchronously.
+        (self.append_text)(self.context, text.as_ptr(), text.len());
     }
 }
 
@@ -95,17 +77,15 @@ struct VisualContextNodeOwners {
 
 impl VisualContextNodeOwners {
     fn collect(arena: &LayoutNodeArena, viewport: NodeSlotId) -> Self {
-        let paintable_rows = arena.paintable_rows();
         let mut owners = Self {
             spatial: HashMap::new(),
             clip: HashMap::new(),
             effect: HashMap::new(),
         };
         owners.spatial.insert(VISUAL_VIEWPORT_NODE_INDEX.0, viewport);
-        owners.spatial.insert(
-            paintable_rows.paintable_data(viewport).own_scroll_node_index.0,
-            viewport,
-        );
+        owners
+            .spatial
+            .insert(arena.live_paintable_data(viewport).own_scroll_node_index.0, viewport);
         let mut pending = vec![viewport];
         while let Some(slot) = pending.pop() {
             arena.with_paintable_visual_context_node_handles(slot, |handles| {
@@ -119,11 +99,7 @@ impl VisualContextNodeOwners {
                     owners.effect.insert(effect.0, slot);
                 }
             });
-            let mut child = arena.node_first_child_if_live(slot);
-            while let Some(current) = child {
-                pending.push(current);
-                child = arena.node_next_sibling_if_live(current);
-            }
+            pending.extend(arena.children(slot));
         }
         owners
     }
@@ -139,34 +115,40 @@ impl VisualContextNodeOwners {
 
 /// # Safety
 ///
-/// `arena` must be a live handle from `layout_arena_create`, used on the document thread, and
-/// `visual_context_tree` a live retained tree handle built from it; `command_runs` must address
-/// `command_run_count` runs; `display_list` and every pointer returned by `callbacks` must remain
-/// live for this call. The callback byte spans must contain display-list records produced by this
-/// build of LibWeb. `debug_description` is called synchronously with a `Vec<u8>` sink the host
-/// fills through `layout_arena_paint_push_bytes`.
+/// `host` must be a live document host, on its document's thread, and `visual_context_tree` a live retained tree
+/// handle built from its render state; `display_list` is the storage handle of the display list, and it and every
+/// storage handle `callbacks` returns must remain live for this call. `debug_description` is called synchronously
+/// with a `Vec<u8>` sink the host fills through `layout_arena_paint_push_bytes`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn painting_dump(
-    arena: *mut c_void,
+    host: &crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
     visual_context_tree: *const c_void,
-    command_runs: *const DisplayListCommandRun,
-    command_run_count: usize,
     display_list: *const c_void,
     callbacks: FfiPaintingDumpCallbacks,
 ) {
     assert!(!display_list.is_null());
-    let arena = unsafe { crate::painting::ffi::arena_from_handle(arena) };
+    // SAFETY: Guaranteed by the entry point's contract.
+    let main_thread = unsafe { main_thread(host) };
     let visual_context_tree = unsafe { libcompositing_rust::ffi::tree_from_handle(visual_context_tree) };
-    let command_runs = unsafe { libcompositing_rust::ffi::ffi_slice(command_runs, command_run_count) };
-    let owners = VisualContextNodeOwners::collect(arena, viewport);
+    let (_, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
+    let owners = {
+        crate::painting::ffi::read_arena(host, read, viewport, |arena, viewport| {
+            let mut owners = VisualContextNodeOwners::collect(arena, viewport);
+            for owners in [&mut owners.spatial, &mut owners.clip, &mut owners.effect] {
+                owners.retain(|_, &mut owner| arena.slot_is_live(owner));
+            }
+            owners
+        })
+    };
     let mut output = visual_context_tree.dump_nodes_reachable_from_runs(command_runs, |kind, index| {
-        let shell = arena.shell_if_live(owners.owner(kind, index)?);
-        (!shell.is_null()).then(|| callbacks.debug_description(shell))
+        let owner = owners.owner(kind, index)?;
+        Some(callbacks.debug_description(&main_thread, owner))
     });
     output.push_str("\nDisplayList:\n");
-    dump_commands(&mut output, &callbacks, display_list, 0);
-    callbacks.append_text(&output);
+    dump_commands(&main_thread, &mut output, &callbacks, display_list, 0);
+    callbacks.append_text(&main_thread, &output);
 }
 
 fn push_indent(output: &mut String, indent: usize) {
@@ -174,19 +156,22 @@ fn push_indent(output: &mut String, indent: usize) {
 }
 
 fn dump_commands(
+    main_thread: &MainThread,
     output: &mut String,
     callbacks: &FfiPaintingDumpCallbacks,
     display_list: *const c_void,
     base_indent: usize,
 ) {
-    let bytes = callbacks.command_bytes(display_list);
-    for run in callbacks.command_runs(display_list) {
+    // SAFETY: The caller keeps the storage live for the dump.
+    let (bytes, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
+    for run in command_runs {
         let run_bytes = &bytes[run.offset as usize..(run.offset + run.size) as usize];
-        dump_command_bytes(output, callbacks, run_bytes, run.context, base_indent);
+        dump_command_bytes(main_thread, output, callbacks, run_bytes, run.context, base_indent);
     }
 }
 
 fn dump_command_bytes(
+    main_thread: &MainThread,
     output: &mut String,
     callbacks: &FfiPaintingDumpCallbacks,
     command_bytes: &[u8],
@@ -208,6 +193,7 @@ fn dump_command_bytes(
         output.push('\n');
 
         dump_records_inside(
+            main_thread,
             output,
             callbacks,
             header.command_type,
@@ -219,9 +205,10 @@ fn dump_command_bytes(
             return;
         };
         dump_commands(
+            main_thread,
             output,
             callbacks,
-            callbacks.nested_display_list(nested.display_list),
+            callbacks.nested_display_list(main_thread, nested.display_list),
             base_indent + 1,
         );
     });
@@ -241,6 +228,7 @@ fn nested_display_lists(command_type: DisplayListCommandType, payload: &[u8]) ->
 }
 
 fn dump_records_inside(
+    main_thread: &MainThread,
     output: &mut String,
     callbacks: &FfiPaintingDumpCallbacks,
     command_type: DisplayListCommandType,
@@ -262,7 +250,14 @@ fn dump_records_inside(
             output.push_str(label);
             nested_indent += 1;
         }
-        dump_command_bytes(output, callbacks, span_bytes(payload, span), context, nested_indent);
+        dump_command_bytes(
+            main_thread,
+            output,
+            callbacks,
+            span_bytes(payload, span),
+            context,
+            nested_indent,
+        );
     });
 }
 
@@ -442,18 +437,43 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             write!(output, " blur_radius={}", command.blur_radius).unwrap();
             write_field(output, "color", command.color);
         }
+        DisplayListCommandType::PaintPathBoxShadow => {
+            let command = read_command::<PaintPathBoxShadow>(payload);
+            write_field(output, "shape_path_bounding_rect", command.shape_path_bounding_rect);
+            write_field(output, "offset", command.offset);
+            write!(
+                output,
+                " blur_radius={} spread_distance={}",
+                command.blur_radius, command.spread_distance
+            )
+            .unwrap();
+            write!(output, " inner={}", command.inner).unwrap();
+            write_field(output, "color", command.color);
+        }
         DisplayListCommandType::PaintTextShadow => {
             let command = read_command::<PaintTextShadow>(payload);
-            write_field(output, "shadow_rect", command.shadow_bounding_rect);
+            write_field(output, "shadows_rect", command.shadows_bounding_rect);
             write_field(output, "rect", command.rect);
             write_field(output, "translation", command.translation);
-            write!(output, " blur_radius={}", command.blur_radius).unwrap();
-            write_field(output, "color", command.color);
             let orientation = match command.orientation {
                 libgfx_rust::Orientation::Horizontal => "Horizontal",
                 libgfx_rust::Orientation::Vertical => "Vertical",
             };
             write!(output, " orientation={orientation}").unwrap();
+            output.push_str(" layers=[");
+            let (layer_chunks, _) =
+                span_bytes(payload, command.layers).as_chunks::<{ std::mem::size_of::<TextShadowLayer>() }>();
+            for (index, layer_bytes) in layer_chunks.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                let layer = read_command::<TextShadowLayer>(layer_bytes);
+                output.push_str("offset=");
+                layer.offset.push_dump(output);
+                write!(output, " blur_radius={}", layer.blur_radius).unwrap();
+                write_field(output, "color", layer.color);
+            }
+            output.push(']');
         }
         DisplayListCommandType::FillRectWithRoundedCorners => {
             let command = read_command::<FillRectWithRoundedCorners>(payload);
@@ -532,9 +552,7 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
         }
         DisplayListCommandType::DrawIsolatedGroup => {
             let command = read_command::<DrawIsolatedGroup>(payload);
-            if let Some(clip_rect) = command.clip_rect.get() {
-                write_field(output, "clip_rect", clip_rect);
-            }
+            write_field(output, "clip_rect", command.clip_rect);
             if command.opacity != 1.0 {
                 write!(output, " opacity={}", format_float_like_ak(command.opacity)).unwrap();
             }
@@ -588,6 +606,26 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             let command = read_command::<CompositorMainThreadWheelEventRegion>(payload);
             write_field(output, "rect", command.rect);
         }
+        DisplayListCommandType::CompositorNestedContextWheelRegion => {
+            let command = read_command::<CompositorNestedContextWheelRegion>(payload);
+            write_field(output, "rect", command.rect);
+            write_corner_radii(output, command.corner_radii);
+        }
+        DisplayListCommandType::CompositorScrollChainingBarrier => {
+            let command = read_command::<CompositorScrollChainingBarrier>(payload);
+            write_field(
+                output,
+                "scroll_node_index_above_barrier",
+                command.scroll_node_index_above_barrier,
+            );
+            write_field(output, "rect", command.rect);
+            write!(
+                output,
+                " keeps_horizontal_scrolls={} keeps_vertical_scrolls={}",
+                command.keeps_horizontal_scrolls, command.keeps_vertical_scrolls
+            )
+            .unwrap();
+        }
         DisplayListCommandType::CompositorScrollbar => {
             let command = read_command::<CompositorScrollbar>(payload);
             write_field(output, "scroll_node_index", command.scroll_node_index);
@@ -608,8 +646,8 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             write_field(output, "track_color", command.track_color);
             write!(
                 output,
-                " vertical={} is_painted_by_compositor={} display_list_paints_enlarged_scrollbar={}",
-                command.vertical, command.is_painted_by_compositor, command.display_list_paints_enlarged_scrollbar
+                " vertical={} is_painted_by_compositor={}",
+                command.vertical, command.is_painted_by_compositor
             )
             .unwrap();
         }
@@ -639,6 +677,21 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             )
             .unwrap();
         }
+        // The display list of a page holds none of the commands of the canvas 2D stream.
+        DisplayListCommandType::Canvas2DFillPath
+        | DisplayListCommandType::Canvas2DStrokePath
+        | DisplayListCommandType::Canvas2DDrawGlyphRun
+        | DisplayListCommandType::Canvas2DClearRect
+        | DisplayListCommandType::Canvas2DDrawImageFrame
+        | DisplayListCommandType::Canvas2DDrawCanvas
+        | DisplayListCommandType::Canvas2DDrawVideoFrame
+        | DisplayListCommandType::Canvas2DSetTransform
+        | DisplayListCommandType::Canvas2DSave
+        | DisplayListCommandType::Canvas2DRestore
+        | DisplayListCommandType::Canvas2DClipPath
+        | DisplayListCommandType::Canvas2DReset
+        | DisplayListCommandType::Canvas2DClearCanvas
+        | DisplayListCommandType::Canvas2DPutImageFrame => {}
     }
 }
 
@@ -657,7 +710,7 @@ fn dump_inline_clips(output: &mut String, header: &DisplayListCommandHeader, pay
             let start = clip.path_data.offset as usize;
             let size = clip.path_data.size as usize;
             assert!(start <= payload.len() && size <= payload.len() - start);
-            let path = OwnedPath::from_serialized_bytes(&payload[start..start + size]);
+            let path = Path::from_serialized_bytes(&payload[start..start + size]);
             let svg_path = path.to_svg_string();
             let has_host_dependent_curves = svg_path.contains('Q') || svg_path.contains('C');
             output.push_str("clip_path=[bounds: ");

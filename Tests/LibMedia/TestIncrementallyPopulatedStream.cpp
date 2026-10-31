@@ -7,6 +7,7 @@
 #include <AK/ByteBuffer.h>
 #include <AK/Function.h>
 #include <LibCore/EventLoop.h>
+#include <LibMedia/DemuxerScanThread.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
 #include <LibTest/TestCase.h>
 #include <LibThreading/Thread.h>
@@ -29,6 +30,140 @@ TEST_CASE(create_empty)
     stream->set_expected_size(500);
     EXPECT(stream->expected_size().has_value());
     EXPECT_EQ(stream->expected_size().value(), 500u);
+}
+
+TEST_CASE(full_file_availability_requires_no_gaps)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    EXPECT(!stream->availability().all_bytes_are_available());
+    auto data = make_test_data(100);
+    stream->set_expected_size(100);
+    stream->add_chunk_at(50, data.bytes().slice(50));
+    stream->close();
+    auto snapshot = stream->availability();
+    EXPECT(snapshot.closing_bytes_are_available());
+    EXPECT(!snapshot.all_bytes_are_available());
+
+    stream->add_chunk_at(0, data.bytes().slice(0, 50));
+    EXPECT(stream->availability().all_bytes_are_available());
+    EXPECT(!snapshot.all_bytes_are_available());
+    stream->remove_byte_range(20, 30);
+    EXPECT(!stream->availability().all_bytes_are_available());
+}
+
+TEST_CASE(buffered_scan_reports_completeness_even_if_time_ranges_do_not_change)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    auto data = make_test_data(100);
+    stream->add_chunk_at(50, data.bytes().slice(50));
+    stream->close();
+
+    auto scan = Media::DemuxerScanThread<int>::start(stream, {}, 0, [](auto&, auto&) {
+        Media::DemuxerScanState state;
+        state.duration = AK::Duration::from_seconds(1);
+        return state;
+    });
+    scan->set_change_handler([] { });
+    auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
+    while (scan->main_thread_state().duration == AK::Duration::zero() && MonotonicTime::now() < deadline)
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(scan->main_thread_state().duration, AK::Duration::from_seconds(1));
+    EXPECT(!scan->main_thread_state().resource_is_complete);
+
+    stream->add_chunk_at(0, data.bytes().slice(0, 50));
+    deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
+    while (!scan->main_thread_state().resource_is_complete && MonotonicTime::now() < deadline)
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT(scan->main_thread_state().resource_is_complete);
+    EXPECT(scan->main_thread_state().track_buffered_ranges.is_empty());
+    scan->shutdown();
+}
+
+TEST_CASE(close_during_buffered_scan_requires_another_pass)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    auto data = make_test_data(100);
+    stream->add_chunk_at(0, data.bytes());
+    auto scan = Media::DemuxerScanThread<int>::start(stream, {}, 0, [stream](Media::MediaStream::Availability const& availability, int& passes) {
+        if (++passes == 1)
+            stream->close();
+        EXPECT_EQ(availability.is_closed, passes > 1);
+        Media::DemuxerScanState state;
+        state.duration = AK::Duration::from_seconds(passes);
+        return state;
+    });
+    scan->set_change_handler([] { });
+    auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
+    while (!scan->main_thread_state().resource_is_complete && MonotonicTime::now() < deadline)
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT(scan->main_thread_state().resource_is_complete);
+    EXPECT(scan->main_thread_state().duration >= AK::Duration::from_seconds(2));
+    scan->shutdown();
+}
+
+TEST_CASE(expected_size_changes_request_buffered_scans)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto data = make_test_data(100);
+    auto stream = Media::IncrementallyPopulatedStream::create_from_data(data.bytes());
+    auto scan = Media::DemuxerScanThread<int>::start(stream, {}, 0, [](Media::MediaStream::Availability const& availability, auto&) {
+        Media::DemuxerScanState state;
+        state.duration = AK::Duration::from_seconds(availability.expected_size.value());
+        state.reached_end_of_stream = availability.closing_bytes_are_available();
+        return state;
+    });
+    scan->set_change_handler([] { });
+    auto await_size = [&](u64 size) {
+        auto duration = AK::Duration::from_seconds(size);
+        auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
+        while (scan->main_thread_state().duration != duration && MonotonicTime::now() < deadline)
+            loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        EXPECT_EQ(scan->main_thread_state().duration, duration);
+    };
+    await_size(100);
+    EXPECT(scan->main_thread_state().resource_is_complete);
+
+    stream->set_expected_size(200);
+    await_size(200);
+    EXPECT(!scan->main_thread_state().resource_is_complete);
+    EXPECT(!scan->main_thread_state().reached_end_of_stream);
+
+    stream->set_expected_size(100);
+    await_size(100);
+    EXPECT(scan->main_thread_state().resource_is_complete);
+    EXPECT(scan->main_thread_state().reached_end_of_stream);
+    scan->shutdown();
+}
+
+TEST_CASE(eviction_during_scan_does_not_change_its_availability_snapshot)
+{
+    auto& loop = never_destroyed_event_loop();
+    auto data = make_test_data(100);
+    auto stream = Media::IncrementallyPopulatedStream::create_from_data(data.bytes());
+    auto scan = Media::DemuxerScanThread<int>::start(stream, {}, 0, [stream](Media::MediaStream::Availability const& availability, int& passes) {
+        if (++passes == 1) {
+            stream->remove_byte_range(0, 50);
+            EXPECT(availability.all_bytes_are_available());
+            EXPECT_EQ(availability.byte_ranges.first().start, 0u);
+        } else {
+            EXPECT(!availability.all_bytes_are_available());
+            EXPECT_EQ(availability.byte_ranges.first().start, 50u);
+        }
+        Media::DemuxerScanState state;
+        state.duration = AK::Duration::from_seconds(passes);
+        state.reached_end_of_stream = availability.closing_bytes_are_available();
+        return state;
+    });
+    scan->set_change_handler([] { });
+    auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(5);
+    while (scan->main_thread_state().duration < AK::Duration::from_seconds(2) && MonotonicTime::now() < deadline)
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT(scan->main_thread_state().duration >= AK::Duration::from_seconds(2));
+    EXPECT(!scan->main_thread_state().resource_is_complete);
+    EXPECT(scan->main_thread_state().reached_end_of_stream);
+    scan->shutdown();
 }
 
 TEST_CASE(create_from_data_and_buffer)
@@ -252,6 +387,77 @@ TEST_CASE(cursor_abort_and_reset)
     EXPECT_EQ(result.value(), 10u);
 }
 
+TEST_CASE(missing_data_made_permanently_unavailable_fails_waiting_reads_only)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(100);
+    auto data = make_test_data(50);
+    stream->add_chunk_at(0, data.bytes());
+
+    auto waiting_cursor = stream->create_cursor();
+    MUST(waiting_cursor->seek(60, AK::SeekMode::SetPosition));
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> was_permanently_unavailable { false };
+    waiting_cursor->set_blocked_change_handler([&](Media::ReadBlocked blocked) {
+        read_blocked = blocked == Media::ReadBlocked::Yes;
+    });
+
+    auto thread = Threading::Thread::construct("TestUnavailableRead"sv, [&, waiting_cursor]() -> intptr_t {
+        Array<u8, 10> buffer;
+        auto result = waiting_cursor->read_into(buffer);
+        was_permanently_unavailable = result.is_error() && result.error().category() == Media::DecoderErrorCategory::PermanentlyUnavailable;
+        return 0;
+    });
+    thread->start();
+    while (!read_blocked.load())
+        ;
+
+    stream->make_missing_data_permanently_unavailable();
+    MUST(thread->join());
+    EXPECT(was_permanently_unavailable.load());
+
+    // Later reads of missing data fail the same way instead of waiting.
+    Array<u8, 10> buffer;
+    auto result = waiting_cursor->read_into(buffer);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::PermanentlyUnavailable);
+
+    // Data that is already there can still be read, and the stream does not end where that data ends.
+    auto cursor = stream->create_cursor();
+    auto read_result = cursor->read_into(buffer);
+    EXPECT(!read_result.is_error());
+    EXPECT_EQ(read_result.value(), 10u);
+    EXPECT(!stream->is_closed());
+    EXPECT_EQ(stream->expected_size(), 100u);
+}
+
+TEST_CASE(missing_data_made_permanently_unavailable_ends_the_wait_for_an_unknown_size)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    auto cursor = stream->create_cursor();
+
+    auto thread = Threading::Thread::construct("TestUnavailableSize"sv, [cursor]() -> intptr_t {
+        (void)cursor->blocking_size();
+        return 0;
+    });
+    thread->start();
+
+    stream->make_missing_data_permanently_unavailable();
+    MUST(thread->join());
+}
+
+TEST_CASE(missing_data_made_permanently_unavailable_leaves_an_unknown_size_past_every_chunk)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    auto data = make_test_data(200);
+    stream->add_chunk_at(100, data.bytes().slice(100));
+    stream->add_chunk_at(0, data.bytes().slice(0, 10));
+
+    stream->make_missing_data_permanently_unavailable();
+    EXPECT_EQ(stream->size(), 200u);
+}
+
 TEST_CASE(cursor_blocked_change_handler)
 {
     auto stream = Media::IncrementallyPopulatedStream::create_empty();
@@ -265,11 +471,11 @@ TEST_CASE(cursor_blocked_change_handler)
     IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_succeeded { false };
 
     cursor->set_blocked_change_handler([&](Media::ReadBlocked blocked) {
+        last_state = blocked == Media::ReadBlocked::Yes;
         if (blocked == Media::ReadBlocked::Yes)
             blocked_count++;
         else
             unblocked_count++;
-        last_state = blocked == Media::ReadBlocked::Yes;
     });
 
     auto thread = Threading::Thread::construct("TestBlockHandler"sv, [&, cursor]() -> intptr_t {
@@ -646,6 +852,56 @@ TEST_CASE(close_crossing_a_new_request_keeps_the_end_of_the_closing_fetch)
     EXPECT_EQ(stream->expected_size().value(), stream_size);
 }
 
+TEST_CASE(reading_past_the_end_of_a_chunk_requests_data_for_the_read)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    static constexpr u64 stream_size = 4 * MiB;
+    static constexpr u64 gap_position = 3 * MiB;
+    auto data = make_test_data(stream_size);
+
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(stream_size);
+    stream->add_chunk_at(0, data.bytes().trim(100));
+
+    Vector<u64> requested_offsets;
+    stream->set_data_request_callback([&](Optional<u64> offset) {
+        if (!offset.has_value())
+            return;
+        requested_offsets.append(*offset);
+        // Like a fetch, keep delivering data from the requested offset through the read.
+        stream->add_chunk_at(*offset, data.bytes().slice(*offset, gap_position + 200 - *offset));
+    });
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto cursor = stream->create_cursor();
+
+    // A read within the chunk decides that nothing needs requesting yet.
+    IGNORE_USE_IN_ESCAPING_LAMBDA Array<u8, 10> buffer;
+    MUST(cursor->read_into(buffer));
+    EXPECT(requested_offsets.is_empty());
+
+    // With nothing else changing, a read far past the chunk's end must still ask for its own data.
+    MUST(cursor->seek(gap_position, SeekMode::SetPosition));
+    IGNORE_USE_IN_ESCAPING_LAMBDA Optional<Media::DecoderErrorOr<size_t>> result;
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> finished { false };
+    auto thread = Threading::Thread::construct("TestRead"sv, [&]() -> intptr_t {
+        result = cursor->read_into(buffer);
+        finished = true;
+        return 0;
+    });
+    thread->start();
+    auto start_time = MonotonicTime::now_coarse();
+    while (!finished && MonotonicTime::now_coarse() - start_time < AK::Duration::from_seconds(1))
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    if (!finished)
+        cursor->abort();
+    MUST(thread->join());
+
+    EXPECT_EQ(requested_offsets.size(), 1u);
+    EXPECT(!result->is_error());
+    EXPECT_EQ(buffer[0], static_cast<u8>(gap_position));
+}
+
 TEST_CASE(chunks_past_the_end_are_dropped_once_closed)
 {
     auto stream = Media::IncrementallyPopulatedStream::create_empty();
@@ -844,4 +1100,188 @@ TEST_CASE(withdrawing_idle_asks_for_data_before_any_arrived)
     auto data = make_test_data(100);
     stream->add_chunk_at(0, data.bytes());
     MUST(thread->join());
+}
+
+TEST_CASE(a_read_after_idle_is_withdrawn_asks_for_data_when_none_has_arrived)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(100);
+
+    Vector<Optional<u64>> requests;
+    stream->set_data_request_callback([&](Optional<u64> offset) {
+        requests.append(offset);
+    });
+
+    stream->set_may_idle(true);
+    stream->set_may_idle(false);
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 1u);
+    EXPECT(!requests[0].has_value());
+
+    auto cursor = stream->create_cursor();
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+    cursor->set_blocked_change_handler([&](Media::ReadBlocked blocked) {
+        read_blocked = blocked == Media::ReadBlocked::Yes;
+    });
+    auto thread = Threading::Thread::construct("TestReadAfterWithdraw"sv, [cursor]() -> intptr_t {
+        Array<u8, 10> buffer;
+        MUST(cursor->read_into(buffer));
+        return 0;
+    });
+    thread->start();
+    while (!read_blocked.load())
+        ;
+
+    loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+    EXPECT_EQ(requests.size(), 2u);
+    EXPECT_EQ(requests[1], 0u);
+
+    auto data = make_test_data(100);
+    stream->add_chunk_at(0, data.bytes());
+    MUST(thread->join());
+}
+
+TEST_CASE(chunk_ending_past_the_representable_size_is_ignored)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(NumericLimits<u64>::max());
+    auto data = make_test_data(2);
+
+    stream->add_chunk_at(NumericLimits<u64>::max() - 1, data.bytes());
+    EXPECT(stream->availability().byte_ranges.is_empty());
+
+    stream->add_chunk_at(NumericLimits<u64>::max() - 2, data.bytes());
+    auto byte_ranges = stream->availability().byte_ranges;
+    EXPECT_EQ(byte_ranges.size(), 1u);
+    EXPECT_EQ(byte_ranges[0].start, NumericLimits<u64>::max() - 2);
+    EXPECT_EQ(byte_ranges[0].end, NumericLimits<u64>::max());
+}
+
+TEST_CASE(cursor_rejects_seeks_outside_the_stream)
+{
+    auto data = make_test_data(10);
+    auto stream = Media::IncrementallyPopulatedStream::create_from_data(data.bytes());
+    auto cursor = stream->create_cursor();
+
+    EXPECT(cursor->seek(-1, AK::SeekMode::SetPosition).is_error());
+    EXPECT(cursor->seek(-1, AK::SeekMode::FromCurrentPosition).is_error());
+    EXPECT(cursor->seek(NumericLimits<i64>::max(), AK::SeekMode::FromEndPosition).is_error());
+    EXPECT_EQ(cursor->position(), 0u);
+
+    EXPECT(!cursor->seek(5, AK::SeekMode::SetPosition).is_error());
+    EXPECT(!cursor->seek(-2, AK::SeekMode::FromEndPosition).is_error());
+    EXPECT_EQ(cursor->position(), 8u);
+}
+
+TEST_CASE(read_and_discard_requires_every_byte_in_between)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(100);
+    auto data = make_test_data(100);
+    stream->add_chunk_at(0, data.bytes().slice(0, 40));
+    stream->add_chunk_at(60, data.bytes().slice(60));
+
+    auto cursor = stream->create_cursor();
+    cursor->set_is_blocking(false);
+    MUST(cursor->seek(30, AK::SeekMode::SetPosition));
+
+    // The landing point is present, but the bytes before it are not.
+    auto result = cursor->read_and_discard(35);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::NeedsMoreInput);
+    EXPECT_EQ(cursor->position(), 30u);
+
+    stream->add_chunk_at(40, data.bytes().slice(40, 20));
+    MUST(cursor->read_and_discard(35));
+    EXPECT_EQ(cursor->position(), 65u);
+
+    stream->close();
+    result = cursor->read_and_discard(40);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::EndOfStream);
+    EXPECT_EQ(cursor->position(), 65u);
+}
+
+TEST_CASE(read_and_discard_in_a_closed_stream_requires_a_chunk_before_the_gap)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    auto data = make_test_data(100);
+    stream->add_chunk_at(60, data.bytes().slice(60));
+    stream->close();
+
+    auto cursor = stream->create_cursor();
+    cursor->set_is_blocking(false);
+    auto result = cursor->read_and_discard(10);
+    EXPECT(result.is_error());
+    EXPECT_EQ(result.error().category(), Media::DecoderErrorCategory::NeedsMoreInput);
+    EXPECT_EQ(cursor->position(), 0u);
+
+    stream->add_chunk_at(0, data.bytes().slice(0, 60));
+    EXPECT(!cursor->read_and_discard(10).is_error());
+    EXPECT_EQ(cursor->position(), 10u);
+}
+
+TEST_CASE(blocking_read_and_discard_past_the_expected_size_does_not_wait)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(100);
+    auto data = make_test_data(100);
+    stream->add_chunk_at(0, data.bytes());
+
+    auto cursor = stream->create_cursor();
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> reached_end_of_stream { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> discard_finished { false };
+    auto thread = Threading::Thread::construct("TestDiscard"sv, [&, cursor]() -> intptr_t {
+        auto result = cursor->read_and_discard(101);
+        reached_end_of_stream = result.is_error() && result.error().category() == Media::DecoderErrorCategory::EndOfStream;
+        discard_finished = true;
+        return 0;
+    });
+    thread->start();
+
+    auto start_time = MonotonicTime::now_coarse();
+    while (!discard_finished.load() && MonotonicTime::now_coarse() - start_time < AK::Duration::from_seconds(1))
+        ;
+    if (!discard_finished.load())
+        cursor->abort();
+    MUST(thread->join());
+
+    EXPECT(reached_end_of_stream.load());
+    EXPECT_EQ(cursor->position(), 0u);
+}
+
+TEST_CASE(blocking_read_and_discard_waits_for_every_byte)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(100);
+    auto data = make_test_data(100);
+    stream->add_chunk_at(0, data.bytes().slice(0, 40));
+    stream->add_chunk_at(60, data.bytes().slice(60));
+
+    auto cursor = stream->create_cursor();
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> discard_succeeded { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> discard_finished { false };
+    cursor->set_blocked_change_handler([&](Media::ReadBlocked blocked) {
+        read_blocked = blocked == Media::ReadBlocked::Yes;
+    });
+
+    auto thread = Threading::Thread::construct("TestDiscard"sv, [&, cursor]() -> intptr_t {
+        discard_succeeded = !cursor->read_and_discard(70).is_error();
+        discard_finished = true;
+        return 0;
+    });
+    thread->start();
+
+    while (!read_blocked.load() && !discard_finished.load())
+        ;
+    stream->add_chunk_at(40, data.bytes().slice(40, 20));
+    MUST(thread->join());
+
+    EXPECT(discard_succeeded.load());
+    EXPECT_EQ(cursor->position(), 70u);
 }

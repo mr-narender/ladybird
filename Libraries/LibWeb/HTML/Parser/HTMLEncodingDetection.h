@@ -31,13 +31,17 @@ Optional<StringView> extract_character_encoding_from_meta_element(ByteString con
 GC::Ptr<DOM::Attr> prescan_get_attribute(DOM::Document&, ReadonlyBytes input, size_t& position);
 Optional<ByteString> run_prescan_byte_stream_algorithm(DOM::Document&, ReadonlyBytes input);
 Optional<ByteString> run_bom_sniff(ReadonlyBytes input);
+Optional<ByteString> get_an_xml_encoding(ReadonlyBytes input);
 
 // Extracts the rightmost DNS label from a URL's host as a TLD hint for chardetng.
 // Returns an empty string if the host is absent or is an IP address. chardetng treats
 // an absent/empty TLD as equivalent to ".com".
 ByteString extract_tld_hint(URL::URL const&);
 
+// NB: A document that is being loaded by a navigation has no node navigable until it is activated, which can happen
+//     after its parser starts. Pass the container document of the navigable that the document is being loaded into as
+//     loading_container_document in that case.
 EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document&, ReadonlyBytes input,
-    Optional<MimeSniff::MimeType> maybe_mime_type = {});
+    Optional<MimeSniff::MimeType> maybe_mime_type = {}, GC::Ptr<DOM::Document> loading_container_document = {});
 
 }

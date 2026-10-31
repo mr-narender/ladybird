@@ -18,6 +18,7 @@
 #include <AK/Variant.h>
 #include <AK/Vector.h>
 #include <LibIPC/Forward.h>
+#include <LibMedia/DemuxerScanState.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/TimeRanges.h>
@@ -28,7 +29,7 @@ namespace Media::MediaSourceExtensions {
 class ByteStreamParser;
 struct DemuxedCodedFrame;
 class TrackBuffer;
-class TrackBufferDemuxer;
+class SourceBufferDemuxer;
 
 // https://w3c.github.io/media-source/#dom-appendmode
 enum class AppendMode : u8 {
@@ -43,15 +44,11 @@ enum class AppendState : u8 {
     ParsingMediaSegment,
 };
 
-struct InitializationSegmentTrack {
-    Media::Track track;
-    NonnullRefPtr<TrackBufferDemuxer> demuxer;
-};
-
 struct InitializationSegmentData {
-    Vector<InitializationSegmentTrack> audio_tracks;
-    Vector<InitializationSegmentTrack> video_tracks;
-    Vector<InitializationSegmentTrack> text_tracks;
+    NonnullRefPtr<SourceBufferDemuxer> demuxer;
+    Vector<Media::Track> audio_tracks;
+    Vector<Media::Track> video_tracks;
+    Vector<Media::Track> text_tracks;
 };
 
 // Every mutation of the processor is a command, so that ordering between them is the queue's
@@ -132,7 +129,8 @@ using Command = Variant<
 // read never races a command that has not finished.
 struct PublishedState {
     // https://w3c.github.io/media-source/#track-buffer-ranges
-    Media::TimeRanges buffered_ranges;
+    Vector<Media::TrackBufferedRanges> track_buffered_ranges;
+    Media::BufferedRangesPolicy buffered_ranges_policy { Media::BufferedRangesPolicy::AllTracks };
     // https://w3c.github.io/media-source/#dom-sourcebuffer-timestampoffset
     AK::Duration timestamp_offset;
     // https://w3c.github.io/media-source/#dfn-append-state
@@ -145,6 +143,9 @@ struct PublishedState {
     bool buffer_full { false };
     AK::Duration highest_presentation_timestamp;
     AK::Duration highest_end_time;
+    u64 buffered_bytes { 0 };
+    u64 capacity_bytes { 0 };
+    u64 evictable_bytes { 0 };
 };
 
 class MEDIA_API SourceBufferProcessor : public AtomicRefCounted<SourceBufferProcessor> {
@@ -161,11 +162,6 @@ public:
     void enqueue(Command);
     void run_pending_commands();
 
-    // NB: Abandons a queued or in-progress buffer append. The spec leaves the interruption point
-    //     undefined, so a partly consumed input buffer keeps whatever it already produced; see
-    //     https://github.com/w3c/media-source/issues/71.
-    void abandon_buffer_append();
-
     using DurationChangeCallback = Function<void(double new_duration)>;
     using InitializationSegmentCallback = Function<void(InitializationSegmentData&&)>;
     using AppendErrorCallback = Function<void()>;
@@ -177,6 +173,10 @@ public:
     void set_append_error_callback(AppendErrorCallback);
     void set_coded_frame_processing_done_callback(CodedFrameProcessingDoneCallback);
     void set_append_done_callback(AppendDoneCallback);
+
+    // The size of the coded frames that eviction would remove first at the given playback position, which never
+    // exceeds what it would make room for.
+    size_t evictable_bytes(AK::Duration current_time) const;
 
 private:
     void execute(Command&);
@@ -192,7 +192,7 @@ private:
     size_t capacity_in_bytes() const;
     AK::Duration highest_presentation_timestamp() const;
     AK::Duration highest_end_time() const;
-    Media::TimeRanges buffered_ranges() const;
+    Vector<Media::TrackBufferedRanges> track_buffered_ranges() const;
 
     void drop_consumed_bytes_from_input_buffer();
     void unset_all_track_buffer_timestamps();
@@ -211,6 +211,7 @@ private:
     OwnPtr<ByteStreamParser> m_parser;
     NonnullRefPtr<Media::ReadonlyBytesCursor> m_cursor;
     HashMap<u64, NonnullOwnPtr<TrackBuffer>> m_track_buffers;
+    RefPtr<SourceBufferDemuxer> m_demuxer;
 
     DurationChangeCallback m_duration_change_callback;
     InitializationSegmentCallback m_first_initialization_segment_callback;

@@ -31,25 +31,6 @@ namespace WebView {
 static constexpr auto file_url_prefix = "file://"sv;
 static constexpr auto about_url_prefix = "about:"sv;
 
-static constexpr auto builtin_autocomplete_engines = to_array<AutocompleteEngine>({
-    { "DuckDuckGo"sv, "https://duckduckgo.com/ac/?q={}"sv },
-    { "Google"sv, "https://www.google.com/complete/search?client=chrome&q={}"sv },
-    { "Kagi"sv, "https://kagisuggest.com/api/autosuggest?q={}"sv },
-    { "Yahoo"sv, "https://search.yahoo.com/sugg/gossip/gossip-us-ura/?output=sd1&command={}"sv },
-});
-
-ReadonlySpan<AutocompleteEngine> autocomplete_engines()
-{
-    return builtin_autocomplete_engines;
-}
-
-Optional<AutocompleteEngine const&> find_autocomplete_engine_by_name(StringView name)
-{
-    return find_value(builtin_autocomplete_engines, [&](auto const& engine) {
-        return engine.name == name;
-    });
-}
-
 Autocomplete::Autocomplete(IsPrivate is_private)
     : m_is_private(is_private)
 {
@@ -97,7 +78,7 @@ void Autocomplete::record_engagement(OmniboxEngagement engagement)
 {
     if (m_is_private == IsPrivate::Yes)
         return;
-    if (engagement.destination_kind == OmniboxDestinationKind::Search && !Application::settings().search_engine().has_value())
+    if (engagement.destination_kind == OmniboxDestinationKind::Search && !Application::settings().search_engine_settings().engine.has_value())
         return;
     Application::autocomplete_service().record_engagement(move(engagement));
 }
@@ -106,6 +87,9 @@ String autocomplete_suggestion_display_text(AutocompleteSuggestion const& sugges
 {
     if (suggestion.source == AutocompleteSuggestionSource::Search)
         return suggestion.text;
+    // NB: Choosing a search engine leaves the query in the field, rather than the address of the settings.
+    if (suggestion.source == AutocompleteSuggestionSource::ChooseSearchEngine)
+        return suggestion.highlight_input.is_empty() ? suggestion.text : suggestion.highlight_input;
 
     auto url = classify_user_input(suggestion.text).url;
     if (!url.has_value())
@@ -205,19 +189,30 @@ static Optional<AutocompleteSuggestion> search_for_query_suggestion(StringView q
     if (query.is_empty())
         return {};
 
-    auto const& search_engine = Application::settings().search_engine();
-    if (!search_engine.has_value())
-        return {};
-
     auto query_string = MUST(String::from_utf8(query));
-    auto subtitle = MUST(String::formatted("Search with {}", search_engine->name));
     auto contains_whitespace = any_of(query, [](auto code_unit) { return is_ascii_space(code_unit); });
+
+    auto const& search_engine = Application::settings().search_engine_settings().engine;
+    if (!search_engine.has_value()) {
+        return AutocompleteSuggestion {
+            .source = AutocompleteSuggestionSource::ChooseSearchEngine,
+            .text = "about:settings#search"_string,
+            .title = "Choose a search engine…"_string,
+            .subtitle = MUST(String::formatted("to search for “{}”", query_string)),
+            .favicon_png = {},
+            .highlight_input = {},
+            .relevance = contains_whitespace ? 1000 : 900,
+            .is_verbatim = true,
+            .can_be_automatically_selected = true,
+            .can_be_inline_completed = false,
+        };
+    }
 
     return AutocompleteSuggestion {
         .source = AutocompleteSuggestionSource::Search,
         .text = query_string,
         .title = query_string,
-        .subtitle = move(subtitle),
+        .subtitle = {},
         .favicon_png = {},
         .highlight_input = {},
         .relevance = contains_whitespace ? 1000 : 900,
@@ -275,6 +270,11 @@ static Vector<AutocompleteSuggestion> make_remote_suggestions(Vector<String> rem
     }
 
     return suggestions;
+}
+
+void Autocomplete::search_engine_settings_changed()
+{
+    cancel_pending_query();
 }
 
 void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, String query, size_t max_suggestions)
@@ -341,18 +341,19 @@ void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, Strin
         return;
     }
 
-    auto engine = Application::settings().autocomplete_engine();
-    if (!engine.has_value()) {
+    auto const& settings = Application::settings();
+    auto engine = settings.search_engine_settings().engine;
+    if (!settings.search_engine_settings().suggestions || !engine.has_value() || !engine->suggestions.has_value()) {
         m_remote_suggestions.clear();
         m_remote_query_complete = true;
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete because no engine is configured");
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete because search suggestions are disabled or unavailable");
         return;
     }
 
     dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Scheduling remote autocomplete suggestions from {} for '{}'", engine->name, m_query);
 
     static constexpr auto remote_query_debounce_delay_ms = 100;
-    m_remote_query_timer = Core::Timer::create_single_shot(remote_query_debounce_delay_ms, [this, query_id, engine = engine.release_value(), query = m_query] {
+    m_remote_query_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(remote_query_debounce_delay_ms), [this, query_id, engine = engine.release_value(), query = m_query] {
         if (m_query_id != query_id)
             return;
         start_remote_query(query_id, engine, move(query));
@@ -360,11 +361,11 @@ void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, Strin
     m_remote_query_timer->start();
 }
 
-void Autocomplete::start_remote_query(AutocompleteQueryID query_id, AutocompleteEngine engine, String query)
+void Autocomplete::start_remote_query(AutocompleteQueryID query_id, SearchEngine engine, String query)
 {
     dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Fetching remote autocomplete suggestions from {} for '{}'", engine.name, query);
 
-    auto url_string = MUST(String::formatted(engine.query_url, URL::percent_encode(query)));
+    auto url_string = MUST(engine.suggestions->query_url.replace("%s"sv, URL::percent_encode(query), ReplaceMode::All));
     auto url = URL::Parser::basic_parse(url_string);
 
     if (!url.has_value()) {
@@ -373,11 +374,21 @@ void Autocomplete::start_remote_query(AutocompleteQueryID query_id, Autocomplete
         return;
     }
 
-    m_request = Application::request_server_client(m_is_private).start_request("GET"sv, *url);
+    auto client = Application::request_server_client(m_is_private);
+    if (client.is_error()) {
+        warnln("Unable to fetch autocomplete suggestions: {}", client.error());
+        m_remote_query_complete = true;
+        deliver_current_result();
+        return;
+    }
+    m_request = client.value()->start_request("GET"sv, *url);
 
     m_request->set_buffered_request_finished_callback(
-        [this, query_id, engine, query = move(query)](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error, HTTP::HeaderList const& response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CameFromCache, Core::ImmutableBytes payload) {
-            Core::deferred_invoke([this]() { m_request.clear(); });
+        [this, query_id, engine, query = move(query)](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error, HTTP::HeaderList const& response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState, Core::ImmutableBytes payload) {
+            Core::deferred_invoke([self = make_weak_ptr(), query_id] {
+                if (self && self->m_query_id == query_id)
+                    self->m_request.clear();
+            });
 
             if (m_query_id != query_id) {
                 dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Discarding stale remote autocomplete response for '{}' while current query is '{}'", query, m_query);
@@ -399,7 +410,7 @@ void Autocomplete::start_remote_query(AutocompleteQueryID query_id, Autocomplete
 
             auto content_type = response_headers.get("Content-Type"sv);
 
-            if (auto result = received_autocomplete_response(engine, content_type, payload.bytes()); result.is_error()) {
+            if (auto result = received_autocomplete_response(*engine.suggestions, content_type, payload.bytes()); result.is_error()) {
                 warnln("Unable to handle autocomplete response: {}", result.error());
                 deliver_current_result();
             } else {
@@ -489,55 +500,22 @@ static ErrorOr<Vector<String>> parse_duckduckgo_autocomplete(JsonValue const& js
     return results;
 }
 
-static ErrorOr<Vector<String>> parse_google_autocomplete(JsonValue const& json)
+static ErrorOr<Vector<String>> parse_opensearch_autocomplete(JsonValue const& json)
 {
     if (!json.is_array())
-        return Error::from_string_literal("Expected Google autocomplete response to be a JSON array");
+        return Error::from_string_literal("Expected OpenSearch autocomplete response to be a JSON array");
 
     auto const& values = json.as_array();
-
-    if (values.size() != 5)
-        return Error::from_string_literal("Invalid Google autocomplete response, expected 5 elements in array");
-    if (!values[1].is_array())
-        return Error::from_string_literal("Invalid Google autocomplete response, expected second element to be an array");
+    if (values.size() < 2 || !values[1].is_array())
+        return Error::from_string_literal("Invalid OpenSearch autocomplete response, expected suggestions in the second element");
 
     auto const& suggestions = values[1].as_array();
-
     Vector<String> results;
     results.ensure_capacity(suggestions.size());
 
     TRY(suggestions.try_for_each([&](JsonValue const& suggestion) -> ErrorOr<void> {
         if (!suggestion.is_string())
-            return Error::from_string_literal("Invalid Google autocomplete response, expected value to be a string");
-
-        results.unchecked_append(suggestion.as_string());
-        return {};
-    }));
-
-    return results;
-}
-
-static ErrorOr<Vector<String>> parse_kagi_autocomplete(JsonValue const& json)
-{
-    if (!json.is_array())
-        return Error::from_string_literal("Expected Kagi autocomplete response to be a JSON array");
-
-    auto const& values = json.as_array();
-
-    if (values.size() != 2)
-        return Error::from_string_literal("Invalid Kagi autocomplete response, expected 2 elements in array");
-    if (!values[1].is_array())
-        return Error::from_string_literal("Invalid Kagi autocomplete response, expected second element to be an array");
-
-    auto const& suggestions = values[1].as_array();
-
-    Vector<String> results;
-    results.ensure_capacity(suggestions.size());
-
-    TRY(suggestions.try_for_each([&](JsonValue const& suggestion) -> ErrorOr<void> {
-        if (!suggestion.is_string())
-            return Error::from_string_literal("Invalid Kagi autocomplete response, expected value to be a string");
-
+            return Error::from_string_literal("Invalid OpenSearch autocomplete response, expected value to be a string");
         results.unchecked_append(suggestion.as_string());
         return {};
     }));
@@ -572,9 +550,9 @@ static ErrorOr<Vector<String>> parse_yahoo_autocomplete(JsonValue const& json)
     return results;
 }
 
-ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(AutocompleteEngine const& engine, Optional<ByteString const&> content_type, StringView response)
+ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(SearchSuggestions const& provider, Optional<ByteString const&> content_type, StringView response)
 {
-    auto decoder = [&]() -> Optional<TextCodec::Decoder&> {
+    auto decoder = [&]() -> Optional<TextCodec::Decoder> {
         if (!content_type.has_value())
             return {};
 
@@ -586,25 +564,24 @@ ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(Autocomplet
         if (!charset.has_value())
             return {};
 
-        return TextCodec::decoder_for_exact_name(*charset);
+        return TextCodec::decoder_for(*charset);
     }();
 
     if (!decoder.has_value())
-        decoder = TextCodec::decoder_for_exact_name("UTF-8"sv);
+        decoder = TextCodec::decoder_for("UTF-8"sv);
 
-    auto decoded_response = TRY(decoder->to_utf8(response, TextCodec::IgnoreBOM::No, TextCodec::ErrorMode::Replacement));
+    auto decoded_response = TRY(TextCodec::decode_to_utf8(response.bytes(), *decoder));
     auto json = TRY(JsonValue::from_string(decoded_response));
 
-    if (engine.name == "DuckDuckGo")
+    switch (provider.response_format) {
+    case SearchSuggestionsFormat::DuckDuckGo:
         return parse_duckduckgo_autocomplete(json);
-    if (engine.name == "Google")
-        return parse_google_autocomplete(json);
-    if (engine.name == "Kagi")
-        return parse_kagi_autocomplete(json);
-    if (engine.name == "Yahoo")
+    case SearchSuggestionsFormat::OpenSearch:
+        return parse_opensearch_autocomplete(json);
+    case SearchSuggestionsFormat::Yahoo:
         return parse_yahoo_autocomplete(json);
-
-    return Error::from_string_literal("Invalid engine name");
+    }
+    VERIFY_NOT_REACHED();
 }
 
 void Autocomplete::invoke_autocomplete_query_complete(AutocompleteQueryID query_id, Vector<AutocompleteSuggestion> suggestions, AutocompleteResultKind result_kind) const

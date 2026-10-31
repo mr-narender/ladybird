@@ -72,7 +72,7 @@ class WEB_API HTMLInputElement final
 public:
     virtual ~HTMLInputElement() override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
     virtual void set_being_activated(bool) override;
 
     enum class TypeAttributeState {
@@ -92,6 +92,8 @@ public:
     virtual Utf16String form_value() const override { return value(); }
     virtual Optional<Utf16String> optional_value() const override;
     WebIDL::ExceptionOr<void> set_value(Utf16View);
+    Utf16String value_binding() const { return value(); }
+    WebIDL::ExceptionOr<void> set_value_binding(Utf16View);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
     virtual Utf16String relevant_value() const override;
@@ -134,10 +136,6 @@ public:
 
     FileFilter parse_accept_attribute() const;
 
-    // NOTE: User interaction
-    // https://html.spec.whatwg.org/multipage/input.html#update-the-file-selection
-    void update_the_file_selection(GC::Ref<FileAPI::FileList>);
-
     WebIDL::Long max_length() const;
     WebIDL::ExceptionOr<void> set_max_length(WebIDL::Long);
 
@@ -164,11 +162,23 @@ public:
     GC::Ptr<JS::Object> value_as_date_object(JS::Object& relevant_global_object) const;
     WebIDL::ExceptionOr<void> set_value_as_date_object(GC::Ptr<JS::Object>);
 
+    Color value_as_color() const;
+
     double value_as_number() const;
     WebIDL::ExceptionOr<void> set_value_as_number(double value);
 
     WebIDL::ExceptionOr<void> step_up(WebIDL::Long n = 1);
     WebIDL::ExceptionOr<void> step_down(WebIDL::Long n = 1);
+
+    enum class StepDirection : u8 {
+        Up,
+        Down,
+    };
+    enum class CommitChange : u8 {
+        No,
+        Yes,
+    };
+    void step_for_user_interaction(StepDirection, CommitChange);
 
     WebIDL::ExceptionOr<void> show_picker();
 
@@ -260,7 +270,7 @@ public:
 
     // ^FormAssociatedTextControlElement
     virtual HTMLElement& text_control_to_html_element() override { return *this; }
-    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) override;
+    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value) override;
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() override { return m_text_node; }
     virtual GC::Ptr<DOM::Element> text_control_scroll_container() override { return m_inner_text_element; }
 
@@ -314,7 +324,6 @@ private:
     // ^Layout::ImageProvider
     virtual bool is_image_pending() const override;
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override { return image_data(); }
-    virtual Layout::Node const* image_provider_layout_node() const override;
     virtual void visit_edges(Cell::Visitor&) override;
     virtual void adopted_from(DOM::Document&) override;
 
@@ -332,7 +341,15 @@ private:
     double step_scale_factor() const;
     Optional<double> allowed_value_step() const;
     double step_base() const;
-    WebIDL::ExceptionOr<void> step_up_or_down(bool is_down, WebIDL::Long n);
+    enum class StepTrigger : u8 {
+        Script,
+        UserInteraction,
+    };
+    enum class StepResult : u8 {
+        NotStepped,
+        Stepped,
+    };
+    WebIDL::ExceptionOr<StepResult> step_up_or_down(bool is_down, WebIDL::Long n, StepTrigger = StepTrigger::Script);
 
     static TypeAttributeState parse_type_attribute(Utf16View);
 
@@ -357,6 +374,14 @@ private:
 
     // https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm
     Utf16String value_sanitization_algorithm(Utf16View) const;
+
+    enum class ColorSpaceState : u8 {
+        LimitedSRGB,
+        DisplayP3,
+    };
+    ColorSpaceState color_space_state() const;
+    Utf16String update_a_color_well_control_color(Utf16View element_value) const;
+    Utf16String serialize_a_color_well_control_color(CSS::StyleValue const&) const;
 
     enum class ValueAttributeMode {
         Value,

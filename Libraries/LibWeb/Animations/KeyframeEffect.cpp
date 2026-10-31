@@ -25,9 +25,13 @@
 #include <LibWeb/DOM/Slot.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/SVG/SMILAnimation.h>
+#include <LibWeb/SVG/SVGAnimationElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::Animations {
@@ -553,7 +557,7 @@ static WebIDL::ExceptionOr<Vector<BaseKeyframe>> process_a_keyframes_argument(JS
             if (property_string == "cssFloat"sv) {
                 property = CSS::PropertyNameAndID::from_id(CSS::PropertyID::Float);
             } else if (property_string == "cssOffset"sv) {
-                // FIXME: Support CSS offset property
+                property = CSS::PropertyNameAndID::from_id(CSS::PropertyID::Offset);
             } else if (property_string == "float"sv || property_string == "offset"sv) {
                 // Ignore these properties
             } else if (CSS::is_a_custom_property_name_string(property_string)) {
@@ -966,7 +970,21 @@ WebIDL::ExceptionOr<GC::RootVector<GC::Ref<JS::Object>>> KeyframeEffect::get_key
             }
 
             for (auto const& [property, value] : keyframe.parsed_properties()) {
-                auto key = property.is_custom_property() ? property.name() : CSS::camel_case_string_from_property_id(property.id());
+                // https://drafts.csswg.org/web-animations-1/#animation-property-name-to-idl-attribute-name
+                // 1. If property follows the <custom-property-name> production, return property.
+                // 2. If property refers to the CSS float property, return the string "cssFloat".
+                // 3. If property refers to the CSS offset property, return the string "cssOffset".
+                // 4. Otherwise, return the result of applying the CSS property to IDL attribute algorithm [CSSOM] to
+                //    property.
+                Utf16FlyString key;
+                if (property.is_custom_property())
+                    key = property.name();
+                else if (property.id() == CSS::PropertyID::Float)
+                    key = "cssFloat"_utf16_fly_string;
+                else if (property.id() == CSS::PropertyID::Offset)
+                    key = "cssOffset"_utf16_fly_string;
+                else
+                    key = CSS::camel_case_string_from_property_id(property.id());
                 // Serialization can still fall back to C++, which needs the typed facade; reflection is cold, so
                 // wrap on demand.
                 auto style_value = CSS::StyleValue::adopt_rust_style_value_data(CSS::StyleValueFFI::rust_style_value_retain(value.data()));
@@ -1078,20 +1096,38 @@ bool KeyframeEffect::can_skip_per_frame_style_update() const
         return true;
 
     auto target = this->target();
+    if (!target)
+        return false;
+
+    // An animation inside a box-less iframe can't affect its embedding document's rendering. Check the containers
+    // before the target-local cache, since their layout can change without changing the target's style or layout box.
+    // Reverse playback and effects with a finite end time need ticks to finish, even with an infinite iteration count.
+    if (auto animation = associated_animation(); animation && animation->playback_rate() > 0 && isinf(iteration_count()) && isinf(end_time().value)) {
+        for (auto navigable = target->document().navigable(); navigable;) {
+            auto container = navigable->container();
+            if (!container)
+                break;
+            if (container->document().layout_is_up_to_date() && !container->has_layout_box())
+                return true;
+            navigable = container->document().navigable();
+        }
+    }
+
+    Layout::ForcedReadScope read { target->document() };
     auto cache_result = [&](bool result) {
-        if (target && target->document().layout_is_up_to_date()) {
+        if (target->document().layout_is_up_to_date()) {
             m_can_skip_per_frame_style_update_cache = CanSkipPerFrameStyleUpdateCache {
                 .target_style_generation = target->animation_style_generation(),
                 .target_subtree_style_generation = target->animation_subtree_style_generation(),
                 .target_is_connected = target->is_connected(),
-                .layout_node = target->unsafe_layout_node(),
+                .layout_node = target->unsafe_layout_node(read),
                 .result = result,
             };
         }
         return result;
     };
-    if (target && target->document().layout_is_up_to_date()) {
-        auto const* layout_node = target->unsafe_layout_node();
+    if (target->document().layout_is_up_to_date()) {
+        auto const* layout_node = target->unsafe_layout_node(read);
         if (m_can_skip_per_frame_style_update_cache.has_value()
             && m_can_skip_per_frame_style_update_cache->target_style_generation == target->animation_style_generation()
             && m_can_skip_per_frame_style_update_cache->target_subtree_style_generation == target->animation_subtree_style_generation()
@@ -1104,13 +1140,11 @@ bool KeyframeEffect::can_skip_per_frame_style_update() const
             ++target->document().style_invalidation_counters().animation_style_skip_cache_misses;
     }
 
-    // INTEROP: Other engines suppress main-thread style sampling for invisible transform animations. Restrict this
-    // optimization to the infinite transform-only case until animation overflow updates can also be throttled safely.
+    // Restrict throttling within a rendered document to infinite transform-only effects until animation overflow
+    // updates can also be throttled safely.
     if (!isinf(iteration_count()) || pseudo_element_type().has_value())
         return cache_result(false);
 
-    if (!target)
-        return false;
     if (!target->is_connected())
         return cache_result(true);
     bool has_animated_property = false;
@@ -1143,7 +1177,7 @@ bool KeyframeEffect::can_skip_per_frame_style_update() const
 
     if (!target->document().layout_is_up_to_date())
         return false;
-    auto const* layout_node = target->unsafe_layout_node();
+    auto const* layout_node = target->unsafe_layout_node(read);
     if (!layout_node || layout_node->visibility() != CSS::Visibility::Hidden)
         return cache_result(false);
 
@@ -1187,17 +1221,59 @@ bool KeyframeEffect::can_skip_per_frame_animation_tick() const
     if ((m_is_compositor_driven || m_is_compositor_replaced) && (!isinf(iteration_count()) || m_is_observation_relevant_compositor_animation))
         return true;
 
-    // Script animations do not dispatch CSS animation events, even when an ancestor listens for them.
-    if (auto animation = associated_animation(); animation && !animation->is_css_animation())
-        return true;
-
     // NB: Infinite effects cannot reach their natural end, and finite offscreen paint effects have an end timer.
     //     Neither needs a continuous tick for animationend listeners.
     // NB: Starting or cancelling an active animation requests an update independently of playback.
     //     Only iteration events require future updates while a visually throttled effect runs.
-    auto only_iteration_events_require_a_tick = phase == Phase::Active;
-    auto has_css_animation_event_listener_requiring_animation_tick = [only_iteration_events_require_a_tick](DOM::EventTarget const& event_target) {
-        if (only_iteration_events_require_a_tick)
+    return !css_animation_events_are_heard(phase == Phase::Active);
+}
+
+bool KeyframeEffect::may_run_on_the_compositor() const
+{
+    return all_of(target_properties(), [](auto const& property) {
+        return first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor, CSS::PropertyID::Filter,
+            CSS::PropertyID::Translate, CSS::PropertyID::Rotate, CSS::PropertyID::Scale, CSS::PropertyID::Transform);
+    });
+}
+
+// Whether a listener on `target`, the nodes its events bubble to or its window hears an event `hears` names.
+template<typename Hears>
+static bool event_is_heard_at(DOM::Element& target, Hears const& hears)
+{
+    for (auto* node = static_cast<DOM::Node*>(&target); node;) {
+        if (hears(*node))
+            return true;
+        if (auto assigned_slot = DOM::assigned_slot_for_node(*node))
+            node = assigned_slot.ptr();
+        else
+            node = node->parent_or_shadow_host();
+    }
+    auto window = target.document().window();
+    return window && hears(*window);
+}
+
+// Whether a listener hears the CSS animation events of the effect that need a tick: only its iteration events if
+// `only_iteration_events`.
+bool KeyframeEffect::css_animation_events_are_heard(bool only_iteration_events) const
+{
+    // NB: SMIL animations raise time events at their animation element instead, which do not bubble.
+    if (auto animation = associated_animation(); animation && animation->is_smil_animation()) {
+        auto& animation_element = as<SVG::SMILAnimation>(*animation).animation_element();
+        if (only_iteration_events)
+            return animation_element.has_event_listener(HTML::EventNames::repeatEvent);
+        return animation_element.has_event_listener(HTML::EventNames::beginEvent)
+            || animation_element.has_event_listener(HTML::EventNames::endEvent)
+            || animation_element.has_event_listener(HTML::EventNames::repeatEvent);
+    }
+
+    // Script animations do not dispatch CSS animation events, even when an ancestor listens for them.
+    if (auto animation = associated_animation(); animation && !animation->is_css_animation())
+        return false;
+
+    auto target = this->target();
+    VERIFY(target);
+    return event_is_heard_at(*target, [only_iteration_events](DOM::EventTarget const& event_target) {
+        if (only_iteration_events)
             return event_target.has_event_listener(HTML::EventNames::animationiteration)
                 || event_target.has_event_listener(HTML::EventNames::webkitAnimationIteration);
 
@@ -1206,31 +1282,13 @@ bool KeyframeEffect::can_skip_per_frame_animation_tick() const
             || event_target.has_event_listener(HTML::EventNames::animationstart)
             || event_target.has_event_listener(HTML::EventNames::webkitAnimationIteration)
             || event_target.has_event_listener(HTML::EventNames::webkitAnimationStart);
-    };
-
-    auto target = this->target();
-    VERIFY(target);
-    for (auto* node = static_cast<DOM::Node*>(target.ptr()); node;) {
-        if (has_css_animation_event_listener_requiring_animation_tick(*node))
-            return false;
-        if (auto assigned_slot = DOM::assigned_slot_for_node(*node))
-            node = assigned_slot.ptr();
-        else
-            node = node->parent_or_shadow_host();
-    }
-    if (auto window = target->document().window(); window && has_css_animation_event_listener_requiring_animation_tick(*window))
-        return false;
-
-    return true;
+    });
 }
 
 static bool is_in_display_none_subtree_ignoring_animations(DOM::AbstractElement abstract_element)
 {
-    if (abstract_element.pseudo_element().has_value()) {
-        auto const& style_engine = abstract_element.document().style_computer().style_engine();
-        if (CSS::style_record_display_is_none(style_engine, abstract_element.style_record_identity()))
-            return true;
-    }
+    if (abstract_element.pseudo_element().has_value() && abstract_element.element().installed_style(abstract_element.pseudo_element()).display_is_none())
+        return true;
     return abstract_element.element().has_inclusive_ancestor_with_display_none_ignoring_animations();
 }
 
@@ -1254,12 +1312,13 @@ void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)
 
 void KeyframeEffect::update_computed_properties_for_style(AnimationUpdateContext& context, DOM::AbstractElement abstract_element)
 {
+    Layout::ForcedReadScope read { abstract_element.document() };
     auto& style_computer = abstract_element.element().document().style_computer();
-    auto& element_data = context.elements.ensure(abstract_element, [&abstract_element, &style_computer] {
+    auto& element_data = context.elements.ensure(abstract_element, [&abstract_element, &style_computer, &read] {
         auto style_record = abstract_element.style_record_identity();
         if (!style_record)
             return AnimationUpdateContext::ElementData {};
-        auto computed_properties = style_computer.reconstruct_computed_properties_for_animation(style_record);
+        auto computed_properties = style_computer.reconstruct_computed_properties_for_animation(read, style_record);
         return AnimationUpdateContext::ElementData { style_record, move(computed_properties) };
     });
 
@@ -1302,21 +1361,6 @@ CompositeOperation css_animation_composition_to_composite_operation(CSS::Animati
 CompositeOperationOrAuto css_animation_composition_to_composite_operation_or_auto(CSS::AnimationComposition composition)
 {
     return css_animation_composition_to_bindings_composite_operation_or_auto(composition);
-}
-
-StringView composite_operation_or_auto_to_string(CompositeOperationOrAuto operation)
-{
-    switch (operation) {
-    case CompositeOperationOrAuto::Replace:
-        return "replace"sv;
-    case CompositeOperationOrAuto::Add:
-        return "add"sv;
-    case CompositeOperationOrAuto::Accumulate:
-        return "accumulate"sv;
-    case CompositeOperationOrAuto::Auto:
-        return "auto"sv;
-    }
-    VERIFY_NOT_REACHED();
 }
 
 }

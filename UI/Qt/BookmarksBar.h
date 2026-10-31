@@ -26,27 +26,31 @@ public:
     explicit BookmarksBar(Tab* parent);
 
     void rebuild();
+    void update_chrome_style();
 
     String const& selected_bookmark_menu_item_id() const { return m_selected_bookmark_menu_item_id; }
     Optional<String> const& selected_bookmark_menu_target_folder_id() const { return m_selected_bookmark_menu_target_folder_id; }
+    Optional<String> const& selected_bookmark_menu_parent_folder_id() const { return m_selected_bookmark_menu_parent_folder_id; }
 
-    void show_context_menu(QPoint, Optional<WebView::BookmarkItem const&>, Optional<String const&> target_folder_id);
+    void show_context_menu(QPoint, Optional<WebView::BookmarkItem const&>, Optional<String const&> target_folder_id, Optional<String const&> parent_folder_id);
 
 private:
-    virtual bool event(QEvent*) override;
     virtual bool eventFilter(QObject* object, QEvent* event) override;
 
     bool handle_left_mouse_click(QMouseEvent*, QObject*);
     bool handle_middle_mouse_click(QMouseEvent*, QObject*);
     bool handle_right_mouse_click(QMouseEvent*, QObject*);
     void extract_item_properties(QObject*);
-    void update_chrome_style();
 
     QMenu& bookmarks_bar_context_menu();
     QMenu& bookmark_context_menu();
     QMenu& bookmark_folder_context_menu();
 
+    void slide_in(QWidget&, int width);
+    void slide_out(int index, QPixmap const& image);
+
     Tab* m_tab { nullptr };
+    bool m_has_been_built { false };
 
     QMenu* m_bookmarks_bar_context_menu { nullptr };
     QMenu* m_bookmark_context_menu { nullptr };
@@ -55,7 +59,7 @@ private:
     String m_selected_bookmark_menu_item_id;
     QString m_selected_bookmark_menu_item_type;
     Optional<String> m_selected_bookmark_menu_target_folder_id;
-    bool m_is_updating_chrome_style { false };
+    Optional<String> m_selected_bookmark_menu_parent_folder_id;
 };
 
 }

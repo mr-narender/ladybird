@@ -10,6 +10,7 @@
 #include <AK/Utf16View.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
@@ -19,11 +20,11 @@
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputEvent.h>
@@ -74,11 +75,20 @@ void HTMLTextAreaElement::did_receive_focus()
 
 void HTMLTextAreaElement::did_lose_focus()
 {
+    reveal_cursor_if_pending();
+
     if (m_text_node)
         m_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
 
     if (m_placeholder_text_node)
         m_placeholder_text_node->set_needs_repaint(InvalidateDisplayList::PaintCommands);
+
+    // NB: Consume the pending edit before dispatch, including removal, so reentrant focus changes cannot commit it again.
+    if (!m_value_before_first_user_edit.has_value())
+        return;
+    auto value_before_first_user_edit = m_value_before_first_user_edit.release_value();
+    if (!is_connected() || value_before_first_user_edit == api_value())
+        return;
 
     // The change event fires when the value is committed, if that makes sense for the control,
     // or else when the control loses focus
@@ -102,6 +112,7 @@ void HTMLTextAreaElement::reset_algorithm()
     // The reset algorithm for textarea elements is to set the user validity to false, the dirty value flag back to false,
     m_user_validity = false;
     m_dirty_value = false;
+    m_value_before_first_user_edit.clear();
     // and the raw value to its child text content.
     set_raw_value(child_text_content());
 
@@ -121,7 +132,11 @@ void HTMLTextAreaElement::clear_algorithm()
     m_dirty_value = false;
 
     // and set the raw value of element to an empty string.
+    if (!m_value_before_first_user_edit.has_value())
+        m_value_before_first_user_edit = api_value();
     set_raw_value({});
+    if (*m_value_before_first_user_edit == api_value())
+        m_value_before_first_user_edit.clear();
 
     // Unlike their associated reset algorithms, changes made to form controls as part of these algorithms do count as
     // changes caused by the user (and thus, e.g. do cause input events to fire).
@@ -171,6 +186,14 @@ Utf16String HTMLTextAreaElement::value() const
     return api_value();
 }
 
+void HTMLTextAreaElement::set_value_binding(Utf16View value)
+{
+    // INTEROP: Browsers forget the undo history of a text control when a script sets its value.
+    if (auto history = document().editing_history_if_exists())
+        history->forget_steps_for(*this);
+    set_value(value);
+}
+
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-textarea-value
 void HTMLTextAreaElement::set_value(Utf16View value)
 {
@@ -192,9 +215,11 @@ void HTMLTextAreaElement::set_value(Utf16View value)
         if (m_text_node) {
             MUST(m_text_node->replace_data(0, m_text_node->length_in_utf16_code_units(), m_raw_value));
             update_placeholder_visibility();
-
-            set_the_selection_range(m_text_node->length(), m_text_node->length());
         }
+
+        // NB: A textarea without a text node still has a selection, so this also applies to it.
+        auto end_of_text_control = m_text_node ? m_text_node->length() : api_value().length_in_code_units();
+        set_the_selection_range(end_of_text_control, end_of_text_control);
 
         CSS::Invalidation::invalidate_style_after_placeholder_shown_change(*this);
     }
@@ -473,10 +498,23 @@ void HTMLTextAreaElement::form_associated_element_attribute_changed(Utf16FlyStri
         CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
-void HTMLTextAreaElement::did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data)
+void HTMLTextAreaElement::record_user_edit(Utf16View previous_value)
+{
+    // NB: set_range_text() already updated the raw value, so callers supply the pre-edit value.
+    if (!m_value_before_first_user_edit.has_value())
+        m_value_before_first_user_edit = Utf16String::from_utf16(previous_value);
+    if (*m_value_before_first_user_edit == api_value())
+        m_value_before_first_user_edit.clear();
+}
+
+void HTMLTextAreaElement::did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value)
 {
     VERIFY(m_text_node);
     set_raw_value(m_text_node->data());
+    record_user_edit(previous_value);
+
+    // A textarea element's dirty value flag must be set to true whenever the user interacts with the control in a way that changes the raw value.
+    m_dirty_value = true;
 
     // AD-HOC: Editing the value may change which validity pseudo-classes match.
     CSS::Invalidation::invalidate_style_after_validity_change(*this);
@@ -493,9 +531,6 @@ void HTMLTextAreaElement::did_edit_text_node(Utf16FlyString const& input_type, O
     input_event_init.is_composing = document().is_input_method_composing();
     auto input_event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, input_event_init, {}, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
     dispatch_event(input_event);
-
-    // A textarea element's dirty value flag must be set to true whenever the user interacts with the control in a way that changes the raw value.
-    m_dirty_value = true;
 
     update_placeholder_visibility();
 }
@@ -536,9 +571,9 @@ Optional<Utf16String> HTMLTextAreaElement::placeholder_value() const
     return get_attribute_value(HTML::AttributeNames::placeholder);
 }
 
-Layout::Node* HTMLTextAreaElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLTextAreaElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::TextAreaBox);
+    return CSS::ElementBoxKind::TextArea;
 }
 
 }

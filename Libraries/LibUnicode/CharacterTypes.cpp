@@ -258,11 +258,6 @@ bool code_point_has_emoji_property(u32 code_point)
     return code_point_has_property(code_point, UCHAR_EMOJI);
 }
 
-bool code_point_has_emoji_modifier_base_property(u32 code_point)
-{
-    return code_point_has_property(code_point, UCHAR_EMOJI_MODIFIER_BASE);
-}
-
 bool code_point_has_emoji_presentation_property(u32 code_point)
 {
     return code_point_has_property(code_point, UCHAR_EMOJI_PRESENTATION);
@@ -281,16 +276,6 @@ bool code_point_has_identifier_start_property(u32 code_point)
 bool code_point_has_identifier_continue_property(u32 code_point)
 {
     return u_isIDPart(static_cast<UChar32>(code_point));
-}
-
-bool code_point_has_regional_indicator_property(u32 code_point)
-{
-    return code_point_has_property(code_point, UCHAR_REGIONAL_INDICATOR);
-}
-
-bool code_point_has_variation_selector_property(u32 code_point)
-{
-    return code_point_has_property(code_point, UCHAR_VARIATION_SELECTOR);
 }
 
 bool code_point_has_white_space_property(u32 code_point)
@@ -518,7 +503,7 @@ BidiClass bidirectional_class(u32 code_point)
     return char_direction_to_bidi_class(direction);
 }
 
-LineBreakClass line_break_class(u32 code_point)
+static LineBreakClass resolved_line_break_class(u32 code_point, bool allow_conditional_japanese_starters)
 {
     auto icu_code_point = static_cast<UChar32>(code_point);
     auto icu_line_break = static_cast<ULineBreak>(u_getIntPropertyValue(icu_code_point, UCHAR_LINE_BREAK));
@@ -539,9 +524,16 @@ LineBreakClass line_break_class(u32 code_point)
         return LineBreakClass::ComplexContext;
     case U_LB_COMBINING_MARK:
         return LineBreakClass::CombiningMark;
+    case U_LB_CONDITIONAL_JAPANESE_STARTER:
+        return allow_conditional_japanese_starters ? LineBreakClass::Ideographic : LineBreakClass::Other;
     default:
         return LineBreakClass::Other;
     }
+}
+
+LineBreakClass line_break_class(u32 code_point)
+{
+    return resolved_line_break_class(code_point, false);
 }
 
 // 22.2.2.7.3 Canonicalize ( rer, ch ), https://tc39.es/ecma262/#sec-runtime-semantics-canonicalize-ch
@@ -767,6 +759,10 @@ u32 unicode_simple_case_fold(u32, bool);
 
 bool unicode_code_point_matches_range_ignoring_case(u32, u32, u32, bool);
 u32 unicode_get_case_closure(u32, u32*, u32);
+
+u8 unicode_layout_bidirectional_class(u32);
+u8 unicode_layout_line_break_class(u32, bool);
+bool unicode_layout_code_point_has_emoji_property(u32);
 }
 
 extern "C" bool unicode_property_matches(
@@ -958,4 +954,21 @@ extern "C" u32 unicode_get_case_closure(
     });
 
     return count;
+}
+
+// LibWeb's text chunker classifies code points by these, mirroring the declaration order of BidiClass and
+// LineBreakClass.
+extern "C" u8 unicode_layout_bidirectional_class(u32 code_point)
+{
+    return to_underlying(Unicode::bidirectional_class(code_point));
+}
+
+extern "C" u8 unicode_layout_line_break_class(u32 code_point, bool allow_conditional_japanese_starters)
+{
+    return to_underlying(Unicode::resolved_line_break_class(code_point, allow_conditional_japanese_starters));
+}
+
+extern "C" bool unicode_layout_code_point_has_emoji_property(u32 code_point)
+{
+    return Unicode::code_point_has_emoji_property(code_point);
 }

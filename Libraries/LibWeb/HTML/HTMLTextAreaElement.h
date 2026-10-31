@@ -85,6 +85,8 @@ public:
     Utf16String value() const;
     virtual Utf16String form_value() const override { return value(); }
     void set_value(Utf16View);
+    Utf16String value_binding() const { return value(); }
+    void set_value_binding(Utf16View);
 
     // https://html.spec.whatwg.org/multipage/form-elements.html#the-textarea-element:concept-fe-api-value-3
     Utf16String api_value() const;
@@ -128,7 +130,8 @@ public:
 
     // ^FormAssociatedTextControlElement
     virtual HTMLElement& text_control_to_html_element() override { return *this; }
-    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) override;
+    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value) override;
+    void record_user_edit(Utf16View previous_value);
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() override { return m_text_node; }
     virtual GC::Ptr<DOM::Element> text_control_scroll_container() override { return this; }
 
@@ -150,7 +153,7 @@ private:
 
     virtual bool is_html_textarea_element() const final { return true; }
     virtual void visit_edges(Cell::Visitor&) override;
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     void set_raw_value(Utf16String);
 
@@ -180,6 +183,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-api-value
     mutable Optional<Utf16String> m_api_value;
+
+    // NB: A missing value means that no uncommitted user edit remains.
+    Optional<Utf16String> m_value_before_first_user_edit;
 };
 
 }

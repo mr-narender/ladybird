@@ -35,18 +35,22 @@ use crate::css::selector::PseudoElementSelector;
 use crate::css::selector::PseudoElementType;
 use crate::css::selector::PseudoElementValue;
 use crate::css::selector::SimpleSelector;
+use crate::css::selector::search_text_match_filter_of_pseudo_class;
 
 use super::atoms::synthetic_text_atom_key;
 use super::fnv::fnv1a64;
 use super::index::StyleAtomID;
 use super::relative_selector::RelativeAxis;
 use super::relative_selector::RelativeQuery;
+use super::selector::AtomSpace;
 use super::selector::AttributeCase;
 use super::selector::AttributeOperator;
 use super::selector::AttributeTest;
+use super::selector::EngineAtoms;
 use super::selector::FeatureTest;
 use super::selector::NamespaceTest;
 use super::selector::NthPosition;
+use super::selector::QueryAtoms;
 use super::selector::SelectorNodeID;
 use super::selector::SelectorOp;
 use super::selector::SelectorProgram;
@@ -161,27 +165,6 @@ pub struct NamespaceScope {
 }
 
 impl NamespaceScope {
-    pub(crate) fn from_rule_list(
-        rules: &crate::css::rule::NativeRuleList,
-        mut intern: impl FnMut(&[u16]) -> StyleAtomID,
-    ) -> Self {
-        let mut scope = Self::default();
-        rules.for_each_namespace(|namespace| {
-            let uri = if namespace.uri.units().is_empty() {
-                StyleAtomID::NONE
-            } else {
-                intern(namespace.uri.units())
-            };
-            if namespace.prefix.units().is_empty() {
-                scope.default = Some(uri);
-            } else {
-                let prefix = intern(namespace.prefix.units());
-                scope.by_prefix.push((prefix, uri));
-            }
-        });
-        scope
-    }
-
     /// A declared namespace name, as a constraint. The empty string is the namespace an element in
     /// no namespace has, so declaring it names exactly those.
     #[must_use]
@@ -220,8 +203,8 @@ impl NamespaceScope {
 struct UndeclaredPrefix;
 
 /// Compiles parsed selectors into one program, interning names through the document's atom table.
-pub struct SelectorCompiler<'a> {
-    builder: SelectorProgramBuilder,
+pub struct SelectorCompiler<'a, A: AtomSpace = EngineAtoms> {
+    builder: SelectorProgramBuilder<A>,
     /// The document-local atom for a name, optionally qualified by a namespace. A qualified name is
     /// a name of its own: `[ns|x]` names an attribute that `[x]` does not, and one element can
     /// carry both.
@@ -255,6 +238,9 @@ pub struct SelectorCompiler<'a> {
     /// A sheet's default namespace does not constrain that subject unless it writes a type or
     /// universal selector of its own.
     logical_pseudo_subject: Option<*const CompoundSelector>,
+    /// Whether the `::search-text` selector being compiled is compiled for the current match's
+    /// pseudo-element kind, which a rule naming neither `:current` nor `:not(:current)` styles too.
+    compiles_for_current_search_text_match: bool,
 }
 
 impl<'a> SelectorCompiler<'a> {
@@ -265,8 +251,55 @@ impl<'a> SelectorCompiler<'a> {
         html_element_namespace: StyleAtomID,
         namespaces: NamespaceScope,
     ) -> Self {
+        Self::with_atoms(intern, fold_id_and_class_name_case, html_element_namespace, namespaces)
+    }
+}
+
+impl<'a> SelectorCompiler<'a, QueryAtoms> {
+    /// Compile the selectors of a DOM query, whose names `intern` keys by the query's own atoms.
+    ///
+    /// https://dom.spec.whatwg.org/#scope-match-a-selectors-string
+    /// A query is matched with a scoping root, which `:scope` names, and so does `&`, which has no parent rule in a
+    /// query. No `@namespace` is in scope, so a query can name no namespace prefix.
+    #[must_use]
+    pub fn for_query(
+        intern: &'a mut dyn FnMut(usize, Option<StyleAtomID>) -> StyleAtomID,
+        html_element_namespace: StyleAtomID,
+    ) -> Self {
+        let mut compiler = Self::with_atoms(intern, false, html_element_namespace, NamespaceScope::default());
+        compiler.scope_root_is_bound = true;
+        compiler
+    }
+
+    /// Compile one selector of the query.
+    pub fn compile_for_query(&mut self, selector: &CompiledSelector) -> CompiledEntry {
+        let entry = self.compile(selector);
+        // https://dom.spec.whatwg.org/#scope-match-a-selectors-string
+        // NB: A selector query matches elements, never pseudo-elements. `::slotted()` is represented
+        //     as an operator on its assigned element for style matching, so it needs this explicit
+        //     query rejection rather than the entry's ordinary pseudo-element target check.
+        if selector.compound_selectors.iter().any(|compound| {
+            compound
+                .simple_selectors
+                .iter()
+                .any(|simple| matches!(simple, SimpleSelector::PseudoElement(_)))
+        }) {
+            let never = self.builder.push_never();
+            self.builder.set_entry_root(entry.entry, never);
+        }
+        entry
+    }
+}
+
+impl<'a, A: AtomSpace> SelectorCompiler<'a, A> {
+    fn with_atoms(
+        intern: &'a mut dyn FnMut(usize, Option<StyleAtomID>) -> StyleAtomID,
+        fold_id_and_class_name_case: bool,
+        html_element_namespace: StyleAtomID,
+        namespaces: NamespaceScope,
+    ) -> Self {
         Self {
-            builder: SelectorProgramBuilder::new(),
+            builder: SelectorProgramBuilder::default(),
             intern,
             fold_id_and_class_name_case,
             html_element_namespace,
@@ -276,11 +309,12 @@ impl<'a> SelectorCompiler<'a> {
             selector_names_the_scope: false,
             compound_names_the_host: false,
             logical_pseudo_subject: None,
+            compiles_for_current_search_text_match: false,
         }
     }
 
     #[must_use]
-    pub fn finish(self) -> SelectorProgram {
+    pub fn finish(self) -> SelectorProgram<A> {
         self.builder.finish()
     }
 
@@ -295,7 +329,7 @@ impl<'a> SelectorCompiler<'a> {
     /// The scope's `to` bound is not expressed. It can only narrow which elements match, so leaving
     /// it out keeps the entry a superset, which is the safe direction for invalidation and is what
     /// the exact evaluator settles afterwards.
-    pub fn compile_in_scope(&mut self, selector: &CompiledSelector, scope: &ScopeChain<'_>) -> CompiledEntry {
+    pub(super) fn compile_in_scope(&mut self, selector: &CompiledSelector, scope: &ScopeChain<'_>) -> CompiledEntry {
         let (scope_roots, scope_limits, scope_levels) = (scope.roots, scope.limits, scope.levels);
         let implicit_root_of = |level: usize| scope.implicit_roots.get(level).copied().flatten();
         if scope_levels.is_empty()
@@ -432,7 +466,7 @@ impl<'a> SelectorCompiler<'a> {
         }
     }
 
-    pub fn compile(&mut self, selector: &CompiledSelector) -> CompiledEntry {
+    fn compile(&mut self, selector: &CompiledSelector) -> CompiledEntry {
         // `::slotted()` and `::part()` name an element in another tree, which the sheet's default
         // namespace says nothing about.
         self.selector_escapes_its_namespace = selector.compound_selectors.iter().any(|compound| {
@@ -458,31 +492,18 @@ impl<'a> SelectorCompiler<'a> {
         let root = self.compile_chain(compounds, compounds.len() - 1, &mut marker);
         let pseudo_element = selector
             .target_pseudo_element
+            .map(|kind| {
+                if self.compiles_for_current_search_text_match {
+                    PseudoElementType::SearchTextCurrent
+                } else {
+                    kind
+                }
+            })
             .map(|kind| PseudoElementTarget::new(PseudoElementKind(kind as u16)));
         let entry = self.builder.push_entry_for_pseudo(root, pseudo_element);
         self.builder.set_entry_specificity(entry, selector.specificity());
 
         CompiledEntry { entry, marker }
-    }
-
-    pub fn compile_for_query(&mut self, selector: &CompiledSelector) -> CompiledEntry {
-        let outer_bound = std::mem::replace(&mut self.scope_root_is_bound, true);
-        let entry = self.compile(selector);
-        self.scope_root_is_bound = outer_bound;
-        // https://dom.spec.whatwg.org/#scope-match-a-selectors-string
-        // NB: A selector query matches elements, never pseudo-elements. `::slotted()` is represented
-        //     as an operator on its assigned element for style matching, so it needs this explicit
-        //     query rejection rather than the entry's ordinary pseudo-element target check.
-        if selector.compound_selectors.iter().any(|compound| {
-            compound
-                .simple_selectors
-                .iter()
-                .any(|simple| matches!(simple, SimpleSelector::PseudoElement(_)))
-        }) {
-            let never = self.builder.push_never();
-            self.builder.set_entry_root(entry.entry, never);
-        }
-        entry
     }
 
     /// Compile compounds `0..=index` with the subject at `index`.
@@ -599,6 +620,17 @@ impl<'a> SelectorCompiler<'a> {
         };
         let step = self.builder.push(constraint);
         self.builder.push_compound(&[compound, step])
+    }
+
+    pub(super) fn compile_in_scope_for_current_search_text_match(
+        &mut self,
+        selector: &CompiledSelector,
+        scope: &ScopeChain<'_>,
+    ) -> CompiledEntry {
+        self.compiles_for_current_search_text_match = true;
+        let entry = self.compile_in_scope(selector, scope);
+        self.compiles_for_current_search_text_match = false;
+        entry
     }
 
     fn compile_compound(
@@ -944,13 +976,16 @@ impl<'a> SelectorCompiler<'a> {
         // An exact case-sensitive test is an identity question, and the DOM publishes each attribute
         // value under the same text key, so both sides can answer it by comparing two integers -
         // and the dispatch can reject a rule whose value the element does not hold without
-        // evaluating anything. Other value tests read the literal for their exact comparison.
+        // evaluating anything. Other value tests read the literal for their exact comparison, and so
+        // does every test against storage that keeps no value atoms.
         let value_atom = match (operator, case) {
             (AttributeOperator::Presence, _) => StyleAtomID::NONE,
-            (AttributeOperator::Exact, AttributeCase::Sensitive) => match attribute.value_identity.optional_raw() {
-                Some(identity) => (self.intern)(identity, None),
-                None => self.intern_text(&attribute.value),
-            },
+            (AttributeOperator::Exact, AttributeCase::Sensitive) if A::KEYS_ATTRIBUTE_VALUES => {
+                match attribute.value_identity.optional_raw() {
+                    Some(identity) => (self.intern)(identity, None),
+                    None => self.intern_text(&attribute.value),
+                }
+            }
             _ => StyleAtomID::NONE,
         };
 
@@ -1014,7 +1049,11 @@ impl<'a> SelectorCompiler<'a> {
                 }
                 Some(any_of)
             }
+            Pc::Current => None,
             Pc::Not => {
+                if search_text_match_filter_of_pseudo_class(pseudo_class).is_some() {
+                    return None;
+                }
                 let any_of = self.compile_argument_list(pseudo_class, marker)?;
                 Some(self.builder.push(SelectorOp::Not(any_of)))
             }
@@ -1184,6 +1223,7 @@ impl<'a> SelectorCompiler<'a> {
             | Pc::OptimalValue
             | Pc::Optional
             | Pc::Paused
+            | Pc::PictureInPicture
             | Pc::PlaceholderShown
             | Pc::Playing
             | Pc::PopoverOpen

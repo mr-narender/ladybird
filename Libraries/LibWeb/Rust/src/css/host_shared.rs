@@ -86,6 +86,11 @@ impl<T> HostShared<T> {
         Self(pointer)
     }
 
+    /// The address of `value`, or null.
+    pub(crate) fn from_option(value: Option<&T>) -> Self {
+        Self(value.map_or(std::ptr::null(), std::ptr::from_ref))
+    }
+
     pub(crate) const fn as_ptr(self) -> *const T {
         self.0
     }
@@ -129,13 +134,13 @@ impl<T> HostShared<T> {
     /// layout; this is a reinterpretation, not a copy.
     pub(crate) fn as_pointer_slice(handles: &[Self]) -> &[*const T] {
         // SAFETY: `repr(transparent)` makes the element types layout-identical.
-        unsafe { std::slice::from_raw_parts(handles.as_ptr().cast::<*const T>(), handles.len()) }
+        unsafe { ak::slice_from_raw_parts(handles.as_ptr().cast::<*const T>(), handles.len()) }
     }
 
     /// The inverse of [`Self::as_pointer_slice`].
     pub(crate) fn from_pointer_slice(pointers: &[*const T]) -> &[Self] {
         // SAFETY: `repr(transparent)` makes the element types layout-identical.
-        unsafe { std::slice::from_raw_parts(pointers.as_ptr().cast::<Self>(), pointers.len()) }
+        unsafe { ak::slice_from_raw_parts(pointers.as_ptr().cast::<Self>(), pointers.len()) }
     }
 }
 

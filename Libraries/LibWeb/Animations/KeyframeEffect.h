@@ -44,7 +44,6 @@ struct BasePropertyIndexedKeyframe {
 
 CompositeOperation css_animation_composition_to_composite_operation(CSS::AnimationComposition composition);
 CompositeOperationOrAuto css_animation_composition_to_composite_operation_or_auto(CSS::AnimationComposition composition);
-StringView composite_operation_or_auto_to_string(CompositeOperationOrAuto);
 
 // https://www.w3.org/TR/web-animations-1/#dictdef-basekeyframe
 struct BaseKeyframe {
@@ -151,6 +150,8 @@ public:
     bool can_skip_per_frame_style_update() const;
     void clear_per_frame_style_update_cache() { m_can_skip_per_frame_style_update_cache.clear(); }
     bool can_skip_per_frame_animation_tick() const;
+    // Whether a compositor animation may run every property the effect targets.
+    bool may_run_on_the_compositor() const;
     bool is_compositor_driven() const { return m_is_compositor_driven; }
     void set_is_compositor_driven(bool value)
     {
@@ -211,6 +212,8 @@ public:
     void update_computed_properties_for_style(AnimationUpdateContext&, DOM::AbstractElement);
 
 private:
+    bool css_animation_events_are_heard(bool only_iteration_events) const;
+
     friend class Animation;
 
     KeyframeEffect();

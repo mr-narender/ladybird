@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+pub mod form_urlencoded;
 mod host;
 mod input;
 mod parser;
@@ -14,6 +15,7 @@ mod types;
 
 pub(crate) use self::host::parse_host_into;
 pub use self::input::UrlInput;
+pub use self::percent_encoding::percent_decode_bytes;
 pub use self::scheme::SchemeType;
 pub(crate) use self::scheme::default_port_for_scheme;
 pub(crate) use self::scheme::is_special_scheme;
@@ -51,6 +53,23 @@ impl<'a> BasicParseOptions<'a> {
 // https://url.spec.whatwg.org/#concept-basic-url-parser
 pub fn basic_parse<'a>(input: impl Into<UrlInput<'a>>, options: BasicParseOptions<'_>) -> Option<Url> {
     parser::basic_parse(input.into(), options.base_url, options.encoding)
+}
+
+pub fn create_with_data(mime_type: &str, payload: &str, is_base64: bool) -> Url {
+    let mut builder = String::from(mime_type);
+    if is_base64 {
+        builder.push_str(";base64");
+    }
+    builder.push(',');
+    builder.push_str(payload);
+    let mut url = String::from("data:");
+    percent_encoding::percent_encode_input_into(
+        UrlInput::from(builder.as_str()),
+        percent_encoding::PercentEncodeSet::Path,
+        false,
+        &mut url,
+    );
+    basic_parse(url.as_str(), BasicParseOptions::new()).expect("a data: URL parses")
 }
 
 // https://url.spec.whatwg.org/#concept-basic-url-parser

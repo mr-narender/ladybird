@@ -12,11 +12,9 @@
 #include <ImageDecoder/ImageDecoderClientEndpoint.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
-#include <LibCore/System.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImageFormats/ImageDecoder.h>
 #include <LibGfx/ImageFormats/TIFFMetadata.h>
-#include <LibIPC/TransportHandle.h>
 #include <LibThreading/ThreadPool.h>
 
 namespace ImageDecoder {
@@ -48,41 +46,6 @@ void ConnectionFromClient::die()
     if (s_connections.is_empty()) {
         Core::Process::terminate_immediately(0);
     }
-}
-
-Messages::ImageDecoderServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
-{
-#ifdef AK_OS_WINDOWS
-    m_transport->set_peer_pid(peer_pid);
-    return Core::System::getpid();
-#endif
-    VERIFY_NOT_REACHED();
-}
-
-ErrorOr<IPC::TransportHandle> ConnectionFromClient::connect_new_client()
-{
-    auto paired = TRY(IPC::Transport::create_paired());
-    auto handle = move(paired.remote_handle);
-
-    // Note: A ref is stored in the static s_connections map
-    auto client = adopt_ref(*new ConnectionFromClient(move(paired.local)));
-
-    return handle;
-}
-
-Messages::ImageDecoderServer::ConnectNewClientsResponse ConnectionFromClient::connect_new_clients(size_t count)
-{
-    Vector<IPC::TransportHandle> handles;
-    handles.ensure_capacity(count);
-    for (size_t i = 0; i < count; ++i) {
-        auto handle_or_error = connect_new_client();
-        if (handle_or_error.is_error()) {
-            dbgln("Failed to connect new client: {}", handle_or_error.error());
-            return Vector<IPC::TransportHandle> {};
-        }
-        handles.unchecked_append(handle_or_error.release_value());
-    }
-    return handles;
 }
 
 static void decode_image_to_bitmaps_and_durations_with_decoder(Gfx::ImageDecoder const& decoder, Optional<Gfx::IntSize> ideal_size, Vector<RefPtr<Gfx::Bitmap>>& bitmaps, Vector<u32>& durations)
@@ -238,6 +201,33 @@ void ConnectionFromClient::decode_image(Core::AnonymousBuffer encoded_buffer, Op
     }
 
     m_pending_jobs.set(request_id, start_decode_image_job(request_id, move(encoded_buffer), ideal_size, move(mime_type)));
+}
+
+Messages::ImageDecoderServer::DecodeFirstFrameSynchronouslyResponse ConnectionFromClient::decode_first_frame_synchronously(Core::AnonymousBuffer encoded_buffer, Optional<ByteString> mime_type)
+{
+    // NB: The client asks for this when it needs the pixels of an image it decoded before and has since discarded, so
+    //     it is waiting on the reply and the decode runs right here instead of on the thread pool.
+    if (!encoded_buffer.is_valid())
+        return { Gfx::BitmapSequence {}, Gfx::ColorSpace {} };
+
+    auto decoder_or_error = Gfx::ImageDecoder::try_create_for_raw_bytes(ReadonlyBytes { encoded_buffer.data<u8>(), encoded_buffer.size() }, mime_type);
+    if (decoder_or_error.is_error() || !decoder_or_error.value() || decoder_or_error.value()->frame_count() == 0)
+        return { Gfx::BitmapSequence {}, Gfx::ColorSpace {} };
+    auto decoder = decoder_or_error.release_value();
+
+    auto frame_or_error = decoder->frame(0);
+    if (frame_or_error.is_error())
+        return { Gfx::BitmapSequence {}, Gfx::ColorSpace {} };
+    auto bitmap = frame_or_error.release_value().image;
+    bitmap->set_alpha_type_destructive(Gfx::AlphaType::Premultiplied);
+
+    Gfx::ColorSpace color_space;
+    if (auto maybe_color_space = decoder->color_space(); !maybe_color_space.is_error())
+        color_space = maybe_color_space.release_value();
+
+    Vector<RefPtr<Gfx::Bitmap>> bitmaps;
+    bitmaps.append(move(bitmap));
+    return { Gfx::BitmapSequence { move(bitmaps) }, move(color_space) };
 }
 
 void ConnectionFromClient::cancel_decoding(i64 request_id)

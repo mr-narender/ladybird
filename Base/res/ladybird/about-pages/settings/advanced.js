@@ -1,6 +1,8 @@
 const configFilter = document.querySelector("#config-filter");
 const configList = document.querySelector("#config-list");
 
+const CONFIG_VARIABLES = new Map();
+
 function sendConfigVariableValue(variable, value) {
     ladybird.sendMessage("setConfigVariable", {
         name: variable.name,
@@ -63,17 +65,12 @@ function createControl(variable) {
 function createRow(variable) {
     const row = document.createElement("div");
     row.classList.add("card-group");
-    row.classList.add("card-separator");
     row.classList.add("config-row");
     row.classList.add("inline-container");
-    row.dataset.filterText = `${variable.name} ${variable.title} ${variable.description}`.toLowerCase();
+    row.dataset.filterText = `${variable.title} ${variable.description}`.toLowerCase();
 
     const title = document.createElement("p");
     title.textContent = variable.title;
-
-    const name = document.createElement("p");
-    name.classList.add("config-name");
-    name.textContent = variable.name;
 
     const description = document.createElement("p");
     description.classList.add("description");
@@ -81,7 +78,7 @@ function createRow(variable) {
 
     const label = document.createElement("label");
     label.htmlFor = variable.name;
-    label.append(title, name, description);
+    label.append(title, description);
 
     row.append(label, createControl(variable));
     return row;
@@ -96,11 +93,26 @@ function applyFilter() {
 }
 
 function loadConfigVariables(settings) {
-    const configVariables = settings.configVariableDefinitions || [];
-    configList.innerHTML = "";
+    if (!Object.hasOwn(settings, "configVariableDefinitions")) {
+        return;
+    }
 
+    const configVariables = settings.configVariableDefinitions || [];
     configVariables.forEach(variable => {
-        configList.append(createRow(variable));
+        const previous = CONFIG_VARIABLES.get(variable.name);
+        if (previous && JSON.stringify(previous.value) === JSON.stringify(variable.value)) {
+            return;
+        }
+
+        CONFIG_VARIABLES.set(variable.name, variable);
+
+        const row = createRow(variable);
+        const existing = document.getElementById(variable.name)?.closest(".config-row");
+        if (existing) {
+            existing.replaceWith(row);
+        } else {
+            configList.append(row);
+        }
     });
 
     applyFilter();

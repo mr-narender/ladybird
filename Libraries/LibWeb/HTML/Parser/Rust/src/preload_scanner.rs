@@ -75,21 +75,16 @@ pub struct RustFfiPreloadScannerEntry {
 /// Scan pending parser input for resources the speculative HTML parser can fetch.
 ///
 /// # Safety
-/// `input` must point to `input_len` valid UTF-8 bytes. `callback` must not retain pointers
-/// from the provided entry beyond the callback invocation.
+/// `input` must be valid UTF-8. `callback` must not retain pointers from the provided entry beyond the callback
+/// invocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_html_preload_scanner_scan(
-    input: *const u8,
-    input_len: usize,
+    input: ak::Span<'_, u8>,
     scripting_enabled: bool,
     ctx: *mut c_void,
     callback: unsafe extern "C" fn(ctx: *mut c_void, entry: *const RustFfiPreloadScannerEntry) -> bool,
 ) {
-    let input = if input.is_null() || input_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(input, input_len) }
-    };
+    let input = input.as_slice();
 
     scan(input, scripting_enabled, |entry| unsafe {
         callback(ctx, &raw const *entry)
@@ -99,21 +94,15 @@ pub unsafe extern "C" fn rust_html_preload_scanner_scan(
 /// Scan pending UTF-16 parser input for resources the speculative HTML parser can fetch.
 ///
 /// # Safety
-/// `input` must point to `input_len` UTF-16 code units. `callback` must not retain
-/// pointers from the provided entry beyond the callback invocation.
+/// `callback` must not retain pointers from the provided entry beyond the callback invocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_html_preload_scanner_scan_utf16(
-    input: *const u16,
-    input_len: usize,
+    input: ak::Span<'_, u16>,
     scripting_enabled: bool,
     ctx: *mut c_void,
     callback: unsafe extern "C" fn(ctx: *mut c_void, entry: *const RustFfiPreloadScannerEntry) -> bool,
 ) {
-    let input = if input.is_null() || input_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(input, input_len) }
-    };
+    let input = input.as_slice();
 
     scan_utf16(input, scripting_enabled, |entry| unsafe {
         callback(ctx, &raw const *entry)
@@ -329,17 +318,19 @@ fn script_type_from_attributes(attributes: &[Attribute]) -> Option<ScriptType> {
     //    - el has no type attribute but it has a language attribute and that attribute's value is the empty string; or
     //    - el has neither a type attribute nor a language attribute,
     //    then let the script block's type string for this script element be "text/javascript".
-    //    Otherwise, if el has a type attribute, then let the script block's type string be the value of that attribute
-    //    with leading and trailing ASCII whitespace stripped.
+    //    Otherwise, if el has a type attribute, then let the script block's type string be the value of that attribute.
     //    Otherwise, el has a non-empty language attribute; let the script block's type string be the concatenation of
     //    "text/" and the value of el's language attribute.
+    // FIXME: Preserve whitespace in the type string; only the classic JavaScript MIME comparison strips it.
     let type_string: Cow<'_, [u8]> = match (type_attribute, language_attribute) {
         (Some(""), _) | (None, Some("")) | (None, None) => Cow::Borrowed(b"text/javascript"),
         (Some(type_attribute), _) => Cow::Borrowed(type_attribute.as_bytes().trim_ascii()),
         (None, Some(language)) => Cow::Owned([b"text/".as_slice(), language.as_bytes()].concat()),
     };
 
-    // 9. If the script block's type string is a JavaScript MIME type essence match, then set el's type to "classic".
+    // 9. If the script block's type string is a JavaScript MIME type essence match, or el has a type attribute whose
+    //    value with leading and trailing ASCII whitespace stripped is a JavaScript MIME type essence match, then set
+    //    el's type to "classic".
     if JAVASCRIPT_MIME_TYPE_ESSENCES
         .iter()
         .any(|essence| type_string.eq_ignore_ascii_case(essence))
@@ -588,7 +579,7 @@ mod tests {
     fn collect_with_scripting(input: &str, scripting_enabled: bool) -> Vec<ScannedEntry> {
         let mut entries = Vec::new();
         scan(input.as_bytes(), scripting_enabled, |entry| {
-            let url = unsafe { std::slice::from_raw_parts(entry.url_ptr, entry.url_len) };
+            let url = unsafe { ak::slice_from_raw_parts(entry.url_ptr, entry.url_len) };
             entries.push(ScannedEntry {
                 action: entry.action,
                 url: std::str::from_utf8(url).unwrap().to_string(),
@@ -604,7 +595,7 @@ mod tests {
         let input = input.encode_utf16().collect::<Vec<_>>();
         let mut entries = Vec::new();
         scan_utf16(&input, true, |entry| {
-            let url = unsafe { std::slice::from_raw_parts(entry.url_ptr, entry.url_len) };
+            let url = unsafe { ak::slice_from_raw_parts(entry.url_ptr, entry.url_len) };
             entries.push(ScannedEntry {
                 action: entry.action,
                 url: std::str::from_utf8(url).unwrap().to_string(),
@@ -850,7 +841,7 @@ mod tests {
             true,
             |entry| {
                 let string = |pointer, length| {
-                    let bytes = unsafe { std::slice::from_raw_parts(pointer, length) };
+                    let bytes = unsafe { ak::slice_from_raw_parts(pointer, length) };
                     std::str::from_utf8(bytes).unwrap().to_string()
                 };
                 options = Some((

@@ -10,6 +10,7 @@
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/Layout/ImageProvider.h>
+#include <LibWeb/SVG/SVGAnimatedPreserveAspectRatio.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
 
 namespace Web::SVG {
@@ -43,7 +44,7 @@ public:
     // https://w3c.github.io/svgwg/svg2-draft/embedded.html#__svg__SVGImageElement__height
     REFLECT_ANIMATED_LENGTH_ATTRIBUTE(height, Vertical, SVGLengthValue::number(0));
 
-    Gfx::FloatRect bounding_box(CSSPixelSize viewport_size) const;
+    GC::Ref<SVGAnimatedPreserveAspectRatio> preserve_aspect_ratio_for_bindings();
 
     // ^Layout::ImageProvider
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override;
@@ -55,20 +56,23 @@ protected:
 
     void process_the_url(Optional<Utf16String> const& href);
     void fetch_the_document(URL::URL const& url);
+    void abandon_the_current_fetch();
 
 private:
     virtual void finalize() override;
 
     virtual bool is_svg_image_element() const override { return true; }
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
-    virtual void decoded_image_data_did_update() override { image_provider_contents_changed(); }
-    virtual Layout::Node const* image_provider_layout_node() const override;
+    virtual CSS::ElementBoxKind box_kind() const override;
+    virtual void decoded_image_data_did_update() override;
+    virtual bool decoded_image_data_may_be_rendered() const override { return has_layout_box(); }
 
     Optional<URL::URL> m_href;
 
     GC::Ptr<HTML::SharedResourceRequest> m_resource_request;
     Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
+    u64 m_current_fetch_id { 0 };
+    GC::Ptr<SVGAnimatedPreserveAspectRatio> m_preserve_aspect_ratio;
 };
 
 }

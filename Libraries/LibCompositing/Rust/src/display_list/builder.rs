@@ -6,11 +6,11 @@
 
 use super::commands::*;
 use crate::display_list::ffi_bytes::FfiBytes;
-use libgfx_rust::path::OwnedPath;
+use libgfx_rust::path::Path;
 use libgfx_rust::{AffineTransform, CornerRadii, FloatRect, IntRect, WindingRule, enclosing_int_rect};
 use std::rc::Rc;
 
-pub const COMMAND_ALIGNMENT: usize = 16;
+pub const COMMAND_ALIGNMENT: usize = 8;
 pub const HEADER_SIZE: usize = std::mem::size_of::<DisplayListCommandHeader>();
 const PATH_DATA_ALIGNMENT: usize = std::mem::align_of::<u32>();
 
@@ -67,7 +67,7 @@ impl PendingInlineClip {
         }
     }
 
-    pub fn intersecting_path(path: &OwnedPath, path_winding_rule: WindingRule) -> Self {
+    pub fn intersecting_path(path: &Path, path_winding_rule: WindingRule) -> Self {
         Self {
             kind: InlineClipKind::Path,
             path_winding_rule,
@@ -93,33 +93,6 @@ pub struct CommandRange {
 impl CommandRange {
     pub const fn is_empty(self) -> bool {
         self.size == 0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ContextRewrite {
-    pub recorded_context: ContextRef,
-    pub current_context: ContextRef,
-}
-
-impl ContextRewrite {
-    fn is_identity(&self) -> bool {
-        self.recorded_context == self.current_context
-    }
-
-    fn rewrite(&self, context: ContextRef) -> ContextRef {
-        let spatial = if context.spatial == self.recorded_context.spatial {
-            self.current_context.spatial
-        } else {
-            context.spatial
-        };
-        let (clip, effect) =
-            if context.clip == self.recorded_context.clip && context.effect == self.recorded_context.effect {
-                (self.current_context.clip, self.current_context.effect)
-            } else {
-                (context.clip, context.effect)
-            };
-        ContextRef { spatial, clip, effect }
     }
 }
 
@@ -250,6 +223,7 @@ impl DisplayListBuilder {
         &mut self,
         inline_clips_applying_to_the_group_record: Vec<PendingInlineClip>,
     ) -> OpenGroup {
+        const { assert!(std::mem::align_of::<C>() <= COMMAND_ALIGNMENT) };
         debug_assert_eq!(self.bytes.len() % COMMAND_ALIGNMENT, 0);
         let record_start = self.bytes.len();
         let fixed_payload_size = std::mem::size_of::<C>().next_multiple_of(COMMAND_ALIGNMENT);
@@ -385,6 +359,7 @@ impl DisplayListBuilder {
         inline_transform: Option<AffineTransform>,
         payload_size: usize,
     ) -> DisplayListCommandHeader {
+        const { assert!(std::mem::align_of::<C>() <= COMMAND_ALIGNMENT) };
         let inline_clip_count = u8::try_from(inline_clips.len()).expect("too many inline clips on one command");
         let mut bounding_rect = command.bounding_rect();
         if let (Some(transform), Some(rect)) = (inline_transform, bounding_rect) {
@@ -449,12 +424,7 @@ impl DisplayListBuilder {
         }
     }
 
-    pub fn append_command_range(
-        &mut self,
-        source: &RecordedDisplayList,
-        range: CommandRange,
-        rewrite: Option<ContextRewrite>,
-    ) -> u32 {
+    pub fn append_command_range(&mut self, source: &RecordedDisplayList, range: CommandRange) -> u32 {
         debug_assert_eq!(self.open_group_depth, 0, "captures are never spliced inside a group");
         debug_assert_eq!(self.bytes.len() % COMMAND_ALIGNMENT, 0);
         debug_assert_eq!(range.size as usize % COMMAND_ALIGNMENT, 0);
@@ -464,20 +434,7 @@ impl DisplayListBuilder {
         }
         let source_range = &source.bytes[range.offset as usize..(range.offset + range.size) as usize];
         self.bytes.extend_from_slice(source_range);
-        let rewrite = rewrite.filter(|rewrite| !rewrite.is_identity());
-        self.note_runs_copied_from_source(&source.command_runs, range, destination_offset, rewrite);
-        if let Some(rewrite) = rewrite
-            && !rewrite.recorded_context.effect.is_none()
-            && rewrite.recorded_context.effect != rewrite.current_context.effect
-        {
-            let mut offset = destination_offset;
-            while offset < self.bytes.len() {
-                let header = read_header(&self.bytes[offset..]);
-                rewrite_background_color_animation_effect(&mut self.bytes, offset, &header, rewrite);
-                offset += HEADER_SIZE + header.payload_size as usize;
-            }
-            assert_eq!(offset, self.bytes.len());
-        }
+        self.note_runs_copied_from_source(&source.command_runs, range, destination_offset);
         u32::try_from(destination_offset).expect("display list exceeds u32")
     }
 
@@ -486,7 +443,6 @@ impl DisplayListBuilder {
         source_runs: &[DisplayListCommandRun],
         range: CommandRange,
         destination_offset: usize,
-        rewrite: Option<ContextRewrite>,
     ) {
         let range_end = range.offset + range.size;
         let first = source_runs.partition_point(|run| run.offset + run.size <= range.offset);
@@ -497,7 +453,7 @@ impl DisplayListBuilder {
             let start = run.offset.max(range.offset);
             let end = (run.offset + run.size).min(range_end);
             let destination_start = destination_offset + (start - range.offset) as usize;
-            let context = rewrite.map_or(run.context, |rewrite| rewrite.rewrite(run.context));
+            let context = run.context;
             if start == run.offset && end == run.offset + run.size {
                 push_or_merge_run(
                     &mut self.runs,
@@ -524,30 +480,20 @@ impl DisplayListBuilder {
     }
 }
 
-fn rewrite_background_color_animation_effect(
-    bytes: &mut [u8],
-    record_offset: usize,
-    header: &DisplayListCommandHeader,
-    rewrite: ContextRewrite,
-) {
-    let payload_field_offset = match header.command_type {
-        DisplayListCommandType::FillRect => std::mem::offset_of!(FillRect, background_color_animation_effect),
-        DisplayListCommandType::FillRectWithRoundedCorners => {
-            std::mem::offset_of!(FillRectWithRoundedCorners, background_color_animation_effect)
-        }
-        _ => return,
-    };
-    let field_offset = record_offset + HEADER_SIZE + payload_field_offset;
-    let field_size = std::mem::size_of::<EffectNodeIndex>();
-    let effect = EffectNodeIndex(u32::from_ne_bytes(
-        bytes[field_offset..field_offset + field_size].try_into().unwrap(),
-    ));
-    if !effect.is_none() && effect == rewrite.recorded_context.effect {
-        rewrite
-            .current_context
-            .effect
-            .write_ffi_bytes(&mut bytes[field_offset..field_offset + field_size]);
-    }
+/// Appends one record, with neither inline clips nor an inline transform, to a tape without a run table, which the
+/// tape of a 2D canvas is.
+pub fn append_record<C: DisplayListCommand>(bytes: &mut Vec<u8>, command: &C, inline_data: &[u8]) {
+    debug_assert_eq!(bytes.len() % COMMAND_ALIGNMENT, 0);
+    let padded_record_size =
+        (HEADER_SIZE + std::mem::size_of::<C>() + inline_data.len()).next_multiple_of(COMMAND_ALIGNMENT);
+    let header = DisplayListBuilder::header_for(command, &[], None, padded_record_size - HEADER_SIZE);
+    let start = bytes.len();
+    bytes.resize(start + padded_record_size, 0);
+    header.write_ffi_bytes(&mut bytes[start..start + HEADER_SIZE]);
+    let payload_start = start + HEADER_SIZE;
+    command.write_ffi_bytes(&mut bytes[payload_start..payload_start + std::mem::size_of::<C>()]);
+    let inline_start = payload_start + std::mem::size_of::<C>();
+    bytes[inline_start..inline_start + inline_data.len()].copy_from_slice(inline_data);
 }
 
 fn push_or_merge_run(runs: &mut Vec<DisplayListCommandRun>, run: DisplayListCommandRun) {
@@ -557,7 +503,6 @@ fn push_or_merge_run(runs: &mut Vec<DisplayListCommandRun>, run: DisplayListComm
         debug_assert_eq!(last.offset + last.size, run.offset);
         last.size += run.size;
         last.has_compositor_metadata |= run.has_compositor_metadata;
-        last.has_unbounded_draw |= run.has_unbounded_draw;
         last.ink_bounds = last.ink_bounds.united(run.ink_bounds);
         return;
     }
@@ -585,10 +530,9 @@ pub(crate) fn note_command(
     run.size += record_size;
     if header.command_type.is_compositor_metadata() {
         run.has_compositor_metadata = true;
-    } else if header.has_bounding_rect {
-        run.ink_bounds = run.ink_bounds.united(header.bounding_rect);
     } else {
-        run.has_unbounded_draw = true;
+        debug_assert!(header.has_bounding_rect, "a draw command must report its bounding rect");
+        run.ink_bounds = run.ink_bounds.united(header.bounding_rect);
     }
 }
 
@@ -610,9 +554,10 @@ pub fn for_each_command<'a>(bytes: &'a [u8], mut f: impl FnMut(&DisplayListComma
 
 pub fn read_command<C: Copy>(payload: &[u8]) -> C {
     assert!(payload.len() >= std::mem::size_of::<C>());
-    // SAFETY: Display-list records are native-layout copies of these `Copy` command structs. The
-    // byte stream is validated at the C++ boundary, and `read_unaligned` does not require the
-    // payload pointer to have `C`'s alignment.
+    // SAFETY: Display-list records are native-layout copies of these `Copy` command structs. A
+    // tape is either recorded by this crate or checked by `validate::validate_tape` when it
+    // arrives from another process, so every enum and bool byte holds a valid value.
+    // `read_unaligned` does not require the payload pointer to have `C`'s alignment.
     unsafe { std::ptr::read_unaligned(payload.as_ptr().cast::<C>()) }
 }
 
@@ -626,6 +571,20 @@ pub fn inline_transform_entry_offset(header: &DisplayListCommandHeader, payload:
 pub fn inline_transform_of(header: &DisplayListCommandHeader, payload: &[u8]) -> Option<AffineTransform> {
     inline_transform_entry_offset(header, payload)
         .map(|offset| read_command::<DisplayListInlineTransform>(&payload[offset..]).transform)
+}
+
+/// The inline clip entries at the end of a record's payload, in the order the player pushes them.
+pub fn inline_clips_of<'a>(
+    header: &DisplayListCommandHeader,
+    payload: &'a [u8],
+) -> impl Iterator<Item = DisplayListInlineClip> + use<'a> {
+    let count = usize::from(header.inline_clip_count);
+    let entries = &payload[payload.len() - count * INLINE_CLIP_ENTRY_SIZE..];
+    entries
+        .as_chunks::<INLINE_CLIP_ENTRY_SIZE>()
+        .0
+        .iter()
+        .map(|entry| read_command::<DisplayListInlineClip>(entry))
 }
 
 pub fn read_header(bytes: &[u8]) -> DisplayListCommandHeader {
@@ -707,39 +666,6 @@ mod tests {
         }
     }
 
-    fn rewrite(recorded: ContextRef, current: ContextRef) -> ContextRewrite {
-        ContextRewrite {
-            recorded_context: recorded,
-            current_context: current,
-        }
-    }
-
-    fn command_contexts(builder: &DisplayListBuilder) -> Vec<ContextRef> {
-        let mut contexts = Vec::new();
-        for run in builder.command_runs() {
-            let bytes = &builder.bytes()[run.offset as usize..(run.offset + run.size) as usize];
-            for_each_command(bytes, |_, _, _| contexts.push(run.context));
-        }
-        contexts
-    }
-
-    fn background_color_animation_effects(builder: &DisplayListBuilder) -> Vec<EffectNodeIndex> {
-        let mut effects = Vec::new();
-        for_each_command(builder.bytes(), |header, _, payload| {
-            let field_offset = match header.command_type {
-                DisplayListCommandType::FillRect => {
-                    std::mem::offset_of!(FillRect, background_color_animation_effect)
-                }
-                DisplayListCommandType::FillRectWithRoundedCorners => {
-                    std::mem::offset_of!(FillRectWithRoundedCorners, background_color_animation_effect)
-                }
-                _ => return,
-            };
-            effects.push(EffectNodeIndex(HeaderReader { bytes: payload }.u32_at(field_offset)));
-        });
-        effects
-    }
-
     fn assert_runs_cover_tape(builder: &DisplayListBuilder) {
         let mut expected_offset = 0;
         for run in builder.command_runs() {
@@ -762,7 +688,6 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].context, root);
         assert_eq!(runs[0].ink_bounds, IntRect::new(0, 0, 30, 30));
-        assert!(!runs[0].has_unbounded_draw);
         assert!(!runs[0].has_compositor_metadata);
     }
 
@@ -811,7 +736,6 @@ mod tests {
         let run = builder.command_runs()[0];
         assert_eq!(run.ink_bounds, IntRect::new(5, 5, 10, 10));
         assert!(run.has_compositor_metadata);
-        assert!(!run.has_unbounded_draw);
     }
 
     fn inline_clip_entries(builder: &DisplayListBuilder, record_offset: usize) -> Vec<DisplayListInlineClip> {
@@ -923,15 +847,10 @@ mod tests {
         );
 
         let mut builder = DisplayListBuilder::new();
-        let current = context(7, Some(1));
-        let destination_offset = builder.append_command_range(
-            &finished(&source),
-            whole_tape(&source),
-            Some(rewrite(recorded, current)),
-        );
+        let destination_offset = builder.append_command_range(&finished(&source), whole_tape(&source));
         let source_header = read_header(source.bytes());
         let spliced_header = read_header(&builder.bytes()[destination_offset as usize..]);
-        assert_eq!(builder.command_runs()[0].context, current);
+        assert_eq!(builder.command_runs()[0].context, recorded);
         assert_eq!(builder.bytes(), source.bytes());
         assert_eq!(spliced_header.inline_clip_count, source_header.inline_clip_count);
         let payload_of = |bytes: &[u8], offset: usize| {
@@ -941,133 +860,6 @@ mod tests {
         assert_eq!(
             payload_of(source.bytes(), 0),
             payload_of(builder.bytes(), destination_offset as usize)
-        );
-    }
-
-    #[test]
-    fn a_rewritten_splice_merges_into_the_current_run() {
-        let mut source = DisplayListBuilder::new();
-        let recorded = context(4, None);
-        source.append(&fill_rect(0, 0, 10, 10), &[], recorded);
-        source.append(&fill_rect(50, 50, 10, 10), &[], recorded);
-
-        let mut builder = DisplayListBuilder::new();
-        let current = context(7, Some(1));
-        builder.append(&fill_rect(100, 100, 10, 10), &[], current);
-        let destination_offset = builder.append_command_range(
-            &finished(&source),
-            whole_tape(&source),
-            Some(rewrite(recorded, current)),
-        );
-        assert_ne!(destination_offset, 0);
-        assert_runs_cover_tape(&builder);
-        let runs = builder.command_runs();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].context, current);
-        assert_eq!(runs[0].ink_bounds, IntRect::new(0, 0, 110, 110));
-    }
-
-    #[test]
-    fn a_spliced_capture_leaves_other_effects_untouched() {
-        let mut source = DisplayListBuilder::new();
-        source.append(&fill_rect(0, 0, 10, 10), &[], context(2, Some(5)));
-        source.append(&fill_rect(20, 20, 10, 10), &[], context(2, Some(6)));
-        source.append(&fill_rect(40, 40, 10, 10), &[], context(2, Some(1)));
-        source.append(&fill_rect(60, 60, 10, 10), &[], context(2, None));
-
-        let mut builder = DisplayListBuilder::new();
-        builder.append_command_range(
-            &finished(&source),
-            whole_tape(&source),
-            Some(rewrite(context(2, Some(1)), context(3, Some(7)))),
-        );
-        assert_eq!(
-            command_contexts(&builder),
-            vec![
-                context(3, Some(5)),
-                context(3, Some(6)),
-                context(3, Some(7)),
-                context(3, None)
-            ]
-        );
-        assert_runs_cover_tape(&builder);
-        assert_eq!(builder.command_runs().len(), 4);
-    }
-
-    #[test]
-    fn a_spliced_capture_rewrites_clip_and_effect_together_and_preserves_unclipped_content() {
-        let recorded = context(2, Some(1));
-        let current = ContextRef {
-            clip: ClipNodeIndex(3),
-            ..context(4, Some(5))
-        };
-        let unclipped = ContextRef::spatial_only(recorded.spatial);
-        let mut source = DisplayListBuilder::new();
-        source.append(&fill_rect(0, 0, 10, 10), &[], recorded);
-        source.append(&fill_rect(20, 20, 10, 10), &[], unclipped);
-        let mut builder = DisplayListBuilder::new();
-        builder.append_command_range(
-            &finished(&source),
-            whole_tape(&source),
-            Some(rewrite(recorded, current)),
-        );
-        assert_eq!(
-            command_contexts(&builder),
-            vec![current, ContextRef::spatial_only(current.spatial)]
-        );
-        assert_runs_cover_tape(&builder);
-    }
-
-    #[test]
-    fn a_spliced_capture_rewrites_background_color_animation_effects() {
-        let recorded = context(2, Some(1));
-        let current = context(3, Some(7));
-        let mut source = DisplayListBuilder::new();
-        source.append(
-            &FillRect {
-                background_color_animation_effect: recorded.effect,
-                ..fill_rect(0, 0, 10, 10)
-            },
-            &[],
-            recorded,
-        );
-        source.append(
-            &FillRectWithRoundedCorners {
-                rect: IntRect::new(20, 20, 10, 10),
-                color: Color::default(),
-                corner_radii: CornerRadii::default(),
-                background_color_animation_effect: recorded.effect,
-            },
-            &[],
-            recorded,
-        );
-        source.append(&fill_rect(40, 40, 10, 10), &[], recorded);
-        source.append(
-            &FillRectWithRoundedCorners {
-                rect: IntRect::new(60, 60, 10, 10),
-                color: Color::default(),
-                corner_radii: CornerRadii::default(),
-                background_color_animation_effect: EffectNodeIndex(5),
-            },
-            &[],
-            recorded,
-        );
-
-        let mut builder = DisplayListBuilder::new();
-        builder.append_command_range(
-            &finished(&source),
-            whole_tape(&source),
-            Some(rewrite(recorded, current)),
-        );
-
-        assert_eq!(
-            background_color_animation_effects(&builder),
-            vec![
-                current.effect,
-                current.effect,
-                EffectNodeIndex::NONE,
-                EffectNodeIndex(5)
-            ]
         );
     }
 
@@ -1084,7 +876,7 @@ mod tests {
 
         let mut builder = DisplayListBuilder::new();
         builder.append(&fill_rect(0, 0, 1, 1), &[], context(9, None));
-        let destination_offset = builder.append_command_range(&finished(&source), whole_tape(&source), None);
+        let destination_offset = builder.append_command_range(&finished(&source), whole_tape(&source));
         assert_runs_cover_tape(&builder);
         let spliced_runs = &builder.command_runs()[1..];
         assert_eq!(spliced_runs.len(), source_runs.len());
@@ -1128,44 +920,42 @@ mod tests {
         for_each_command(&source.bytes, |_, offset, _| record_offsets.push(offset as u32));
         record_offsets.push(source.bytes.len() as u32);
 
-        for context_rewrite in [None, Some(rewrite(context(1, None), context(2, Some(0))))] {
-            for (start_index, &start) in record_offsets.iter().enumerate() {
-                for &end in &record_offsets[start_index + 1..] {
-                    let range = CommandRange {
-                        offset: start,
-                        size: end - start,
-                    };
-                    let mut copied = DisplayListBuilder::new();
-                    copied.append(&fill_rect(0, 0, 1, 1), &[], context(1, None));
-                    copied.append_command_range(&source, range, context_rewrite);
+        for (start_index, &start) in record_offsets.iter().enumerate() {
+            for &end in &record_offsets[start_index + 1..] {
+                let range = CommandRange {
+                    offset: start,
+                    size: end - start,
+                };
+                let mut copied = DisplayListBuilder::new();
+                copied.append(&fill_rect(0, 0, 1, 1), &[], context(1, None));
+                copied.append_command_range(&source, range);
 
-                    let mut walked = DisplayListBuilder::new();
-                    walked.append(&fill_rect(0, 0, 1, 1), &[], context(1, None));
-                    let destination_offset = walked.bytes.len();
-                    walked
-                        .bytes
-                        .extend_from_slice(&source.bytes[start as usize..end as usize]);
-                    for run in &source.command_runs {
-                        let run_start = run.offset.max(start) as usize;
-                        let run_end = (run.offset + run.size).min(end) as usize;
-                        if run_start >= run_end {
-                            continue;
-                        }
-                        for_each_command(&source.bytes[run_start..run_end], |header, offset, payload| {
-                            note_command(
-                                &mut walked.runs,
-                                header,
-                                context_rewrite.map_or(run.context, |rewrite| rewrite.rewrite(run.context)),
-                                destination_offset + run_start - start as usize + offset,
-                                HEADER_SIZE + payload.len(),
-                            );
-                        });
+                let mut walked = DisplayListBuilder::new();
+                walked.append(&fill_rect(0, 0, 1, 1), &[], context(1, None));
+                let destination_offset = walked.bytes.len();
+                walked
+                    .bytes
+                    .extend_from_slice(&source.bytes[start as usize..end as usize]);
+                for run in &source.command_runs {
+                    let run_start = run.offset.max(start) as usize;
+                    let run_end = (run.offset + run.size).min(end) as usize;
+                    if run_start >= run_end {
+                        continue;
                     }
-
-                    assert_eq!(copied.bytes(), walked.bytes());
-                    assert_eq!(copied.command_runs(), walked.command_runs(), "range {range:?}");
-                    assert_runs_cover_tape(&copied);
+                    for_each_command(&source.bytes[run_start..run_end], |header, offset, payload| {
+                        note_command(
+                            &mut walked.runs,
+                            header,
+                            run.context,
+                            destination_offset + run_start - start as usize + offset,
+                            HEADER_SIZE + payload.len(),
+                        );
+                    });
                 }
+
+                assert_eq!(copied.bytes(), walked.bytes());
+                assert_eq!(copied.command_runs(), walked.command_runs(), "range {range:?}");
+                assert_runs_cover_tape(&copied);
             }
         }
     }

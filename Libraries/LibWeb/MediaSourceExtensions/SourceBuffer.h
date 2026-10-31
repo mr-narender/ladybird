@@ -9,6 +9,7 @@
 
 #include <AK/NonnullRefPtr.h>
 #include <AK/Types.h>
+#include <LibGC/ActivityRoot.h>
 #include <LibMedia/Track.h>
 #include <LibMediaClient/Forward.h>
 #include <LibWeb/Bindings/SourceBuffer.h>
@@ -56,11 +57,25 @@ public:
     double append_window_end() const { return m_append_window_end; }
     WebIDL::ExceptionOr<void> set_append_window_end(double);
 
+    GC::Ref<MediaSource> media_source() const { return m_media_source; }
+
     // https://w3c.github.io/media-source/#dom-sourcebuffer-updating
     bool updating() const;
+    bool first_initialization_segment_received() const { return m_first_initialization_segment_received; }
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-buffered
     GC::Ref<HTML::TimeRanges> buffered();
+
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-audiotracks
+    GC::Ref<HTML::AudioTrackList> audio_tracks() const { return m_audio_tracks; }
+
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-videotracks
+    GC::Ref<HTML::VideoTrackList> video_tracks() const { return m_video_tracks; }
+
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-texttracks
+    GC::Ref<HTML::TextTrackList> text_tracks() const { return m_text_tracks; }
+
+    bool is_associated_with_an_enabled_or_selected_track() const;
 
     AK::Duration highest_presentation_timestamp() const;
     AK::Duration highest_end_time() const;
@@ -93,7 +108,7 @@ protected:
 private:
     virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
-    WebIDL::ExceptionOr<void> prepare_append();
+    WebIDL::ExceptionOr<void> prepare_append(size_t new_data_size);
     void run_buffer_append_algorithm(u64 append_generation);
     void abort_buffer_append_algorithm();
     void run_range_removal(AK::Duration start, AK::Duration end);
@@ -102,12 +117,20 @@ private:
     void finish_range_removal();
     void update_ready_state_and_duration_after_coded_frame_processing(AK::Duration group_end_timestamp);
     void finish_buffer_append();
+    void set_updating(bool);
 
     GC::Ref<MediaSource> m_media_source;
     NonnullRefPtr<MediaClient::RemoteSourceBuffer> m_remote_source_buffer;
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-updating
     bool m_updating { false };
+
+    // NB: The operation's events may still begin playback, so they keep this, its MediaSource and the media element
+    //     alive.
+    GC::ActivityRoot m_activity_root;
+
+    // https://w3c.github.io/media-source/#dom-sourcebuffer-timestampoffset
+    double m_timestamp_offset_assigned_by_script { 0 };
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-appendwindowstart
     double m_append_window_start { 0 };
@@ -122,6 +145,9 @@ private:
 
     // https://w3c.github.io/media-source/#sourcebuffer-range-removal
     bool m_range_removal_running { false };
+
+    // https://w3c.github.io/media-source/#dfn-first-initialization-segment-received-flag
+    bool m_first_initialization_segment_received { false };
 
     // https://w3c.github.io/media-source/#dom-sourcebuffer-audiotracks
     GC::Ref<HTML::AudioTrackList> m_audio_tracks;

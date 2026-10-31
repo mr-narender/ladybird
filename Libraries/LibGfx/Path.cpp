@@ -4,155 +4,306 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
+#include <AK/TypeCasts.h>
+#include <LibGfx/Font/Font.h>
 #include <LibGfx/Path.h>
-#include <LibGfx/PathSkia.h>
-#include <LibIPC/Decoder.h>
-#include <LibIPC/Encoder.h>
-#include <core/SkPath.h>
+#include <LibGfx/RustFFI.h>
 
-extern "C" {
-void ladybird_gfx_path_destroy(void*);
-bool ladybird_gfx_path_equals(void const*, void const*);
-void ladybird_gfx_path_append_svg_string(void const*, void (*)(void*, char const*, size_t), void*);
-void ladybird_gfx_path_bounding_box(void const*, float*);
-void ladybird_gfx_path_serialize(void const*, void (*)(void*, u8 const*, size_t), void*);
-float ladybird_gfx_path_length(void const*);
-void* ladybird_gfx_path_create_from_ops(u8 const* kinds, float const* values, size_t count);
-void* ladybird_gfx_path_create_from_serialized_bytes(u8 const* bytes, size_t count);
-void* ladybird_gfx_path_copy_transformed(void const*, float const* affine_values);
-bool ladybird_gfx_path_contains(void const*, float, float, int);
-}
+#include <harfbuzz/hb.h>
+
+#ifdef AK_OS_MACOS
+#    include <LibGfx/Font/TypefaceCoreText.h>
+#endif
+
+static_assert(sizeof(Gfx::FloatPoint) == sizeof(Gfx::FFI::FloatPoint));
+static_assert(to_underlying(Gfx::WindingRule::Nonzero) == 0 && to_underlying(Gfx::WindingRule::EvenOdd) == 1);
+static_assert(to_underlying(Gfx::PathVerb::Move) == to_underlying(Gfx::FFI::PathVerb::Move));
+static_assert(to_underlying(Gfx::PathVerb::Line) == to_underlying(Gfx::FFI::PathVerb::Line));
+static_assert(to_underlying(Gfx::PathVerb::Quad) == to_underlying(Gfx::FFI::PathVerb::Quad));
+static_assert(to_underlying(Gfx::PathVerb::Conic) == to_underlying(Gfx::FFI::PathVerb::Conic));
+static_assert(to_underlying(Gfx::PathVerb::Cubic) == to_underlying(Gfx::FFI::PathVerb::Cubic));
+static_assert(to_underlying(Gfx::PathVerb::Close) == to_underlying(Gfx::FFI::PathVerb::Close));
 
 namespace Gfx {
 
+Path::Path()
+    : m_geometry(FFI::path_geometry_create())
+{
+}
+
+Path::Path(FFI::PathGeometry* geometry)
+    : m_geometry(geometry)
+{
+}
+
+Path::~Path()
+{
+    FFI::path_geometry_destroy(m_geometry);
+}
+
+Path::Path(Path const& other)
+    : m_geometry(FFI::path_geometry_clone(other.m_geometry))
+{
+}
+
+Path& Path::operator=(Path const& other)
+{
+    if (this != &other) {
+        FFI::path_geometry_destroy(m_geometry);
+        m_geometry = FFI::path_geometry_clone(other.m_geometry);
+    }
+    return *this;
+}
+
+Path::Path(Path&& other)
+    : m_geometry(exchange(other.m_geometry, nullptr))
+{
+}
+
+Path& Path::operator=(Path&& other)
+{
+    if (this != &other)
+        swap(m_geometry, other.m_geometry);
+    return *this;
+}
+
 Path Path::from_serialized_bytes(ReadonlyBytes bytes)
 {
-    Gfx::Path path;
-    path.impl().deserialize_from_bytes(bytes);
-    return path;
+    return Path { FFI::path_geometry_decode(bytes.data(), bytes.size()) };
 }
 
-NonnullOwnPtr<Gfx::PathImpl> PathImpl::create()
+void Path::move_to(FloatPoint const& point)
 {
-    return PathImplSkia::create();
+    FFI::path_geometry_move_to(m_geometry, point.x(), point.y());
 }
 
-PathImpl::~PathImpl() = default;
-
-}
-
-namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Gfx::Path const& path)
+void Path::line_to(FloatPoint const& point)
 {
-    return encoder.encode(path.serialize_to_bytes());
+    FFI::path_geometry_line_to(m_geometry, point.x(), point.y());
 }
 
-template<>
-ErrorOr<Gfx::Path> decode(Decoder& decoder)
+void Path::close()
 {
-    auto path_data = TRY(decoder.decode<Vector<u8>>());
-    return Gfx::Path::from_serialized_bytes(path_data);
+    FFI::path_geometry_close(m_geometry);
 }
 
-}
-
-extern "C" void ladybird_gfx_path_destroy(void* path)
+PathData PathData::from_ffi(FFI::PathGeometryData const& data)
 {
-    delete static_cast<Gfx::Path*>(path);
+    return {
+        .verbs = { reinterpret_cast<PathVerb const*>(data.verbs), data.verb_count },
+        .points = { reinterpret_cast<FloatPoint const*>(data.points), data.point_count },
+        .conic_weights = { data.conic_weights, data.conic_weight_count },
+        .winding_rule = static_cast<WindingRule>(data.fill_rule),
+    };
 }
 
-extern "C" void ladybird_gfx_path_append_svg_string(void const* path, void (*append)(void*, char const*, size_t), void* context)
+PathData Path::data() const
 {
-    auto string = static_cast<Gfx::Path const*>(path)->to_svg_string();
-    append(context, reinterpret_cast<char const*>(string.bytes().data()), string.bytes().size());
+    FFI::PathGeometryData data;
+    FFI::path_geometry_data(m_geometry, &data);
+    return PathData::from_ffi(data);
 }
 
-extern "C" void ladybird_gfx_path_bounding_box(void const* path, float* out_x_y_width_height)
-{
-    auto rect = static_cast<Gfx::Path const*>(path)->bounding_box();
-    out_x_y_width_height[0] = rect.x();
-    out_x_y_width_height[1] = rect.y();
-    out_x_y_width_height[2] = rect.width();
-    out_x_y_width_height[3] = rect.height();
-}
+namespace {
 
-extern "C" void ladybird_gfx_path_serialize(void const* path, void (*append)(void*, u8 const*, size_t), void* context)
-{
-    auto bytes = static_cast<Gfx::Path const*>(path)->serialize_to_bytes();
-    append(context, bytes.data(), bytes.size());
-}
+// Maps the coordinates of a glyph outline from font units, with y up, to pixels, with y down. A contour starts only at
+// its first segment that goes somewhere, and segments that stay at one point are left out, so contours of a single
+// point, which fonts use as anchors, add nothing to the path.
+struct GlyphOutline {
+    FFI::PathGeometry* outline;
+    float units_to_pixels_x;
+    float units_to_pixels_y;
+    bool has_contour { false };
+    float current_x { 0 };
+    float current_y { 0 };
 
-extern "C" float ladybird_gfx_path_length(void const* path)
-{
-    return static_cast<Gfx::Path const*>(path)->length();
-}
+    float x(float units) const { return units * units_to_pixels_x; }
+    // Subtract from 0, so that a point on the baseline gets 0 and not -0.
+    float y(float units) const { return 0.0f - units * units_to_pixels_y; }
 
-enum class PathBuilderOpKind : u8 {
-    MoveTo,
-    LineTo,
-    QuadraticBezierCurveTo,
-    CubicBezierCurveTo,
-    EllipticalArcTo,
-    ArcTo,
-    Close,
+    bool is_at(float to_x, float to_y) const { return current_x == to_x && current_y == to_y; }
+
+    void go_to(float to_x, float to_y)
+    {
+        if (!has_contour) {
+            has_contour = true;
+            FFI::path_geometry_contour_move_to(outline, x(current_x), y(current_y));
+        }
+        current_x = to_x;
+        current_y = to_y;
+    }
+
+    void close_contour()
+    {
+        if (!has_contour)
+            return;
+        FFI::path_geometry_contour_close(outline);
+        has_contour = false;
+    }
 };
 
-extern "C" void* ladybird_gfx_path_create_from_ops(u8 const* kinds, float const* values, size_t count)
+// NOTE: HarfBuzz emits the implicit line that closes each contour as a regular line_to before close_path. The
+//       quadratic callback must be set, otherwise HarfBuzz converts quadratic segments to cubics.
+hb_draw_funcs_t* glyph_outline_draw_funcs()
 {
-    auto* path = new Gfx::Path;
-    for (size_t i = 0; i < count; ++i) {
-        auto const* v = values + i * 7;
-        switch (static_cast<PathBuilderOpKind>(kinds[i])) {
-        case PathBuilderOpKind::MoveTo:
-            path->move_to({ v[0], v[1] });
+    static hb_draw_funcs_t* draw_funcs = [] {
+        auto* funcs = hb_draw_funcs_create();
+        hb_draw_funcs_set_move_to_func(
+            funcs, [](hb_draw_funcs_t*, void* draw_data, hb_draw_state_t*, float to_x, float to_y, void*) {
+                auto& outline = *static_cast<GlyphOutline*>(draw_data);
+                outline.close_contour();
+                outline.current_x = to_x;
+                outline.current_y = to_y;
+            },
+            nullptr, nullptr);
+        hb_draw_funcs_set_line_to_func(
+            funcs, [](hb_draw_funcs_t*, void* draw_data, hb_draw_state_t*, float to_x, float to_y, void*) {
+                auto& outline = *static_cast<GlyphOutline*>(draw_data);
+                if (outline.is_at(to_x, to_y))
+                    return;
+                outline.go_to(to_x, to_y);
+                FFI::path_geometry_contour_line_to(outline.outline, outline.x(to_x), outline.y(to_y));
+            },
+            nullptr, nullptr);
+        hb_draw_funcs_set_quadratic_to_func(
+            funcs, [](hb_draw_funcs_t*, void* draw_data, hb_draw_state_t*, float control_x, float control_y, float to_x, float to_y, void*) {
+                auto& outline = *static_cast<GlyphOutline*>(draw_data);
+                if (outline.is_at(control_x, control_y) && outline.is_at(to_x, to_y))
+                    return;
+                outline.go_to(to_x, to_y);
+                FFI::path_geometry_contour_quad_to(outline.outline, outline.x(control_x), outline.y(control_y), outline.x(to_x), outline.y(to_y));
+            },
+            nullptr, nullptr);
+        hb_draw_funcs_set_cubic_to_func(
+            funcs, [](hb_draw_funcs_t*, void* draw_data, hb_draw_state_t*, float control1_x, float control1_y, float control2_x, float control2_y, float to_x, float to_y, void*) {
+                auto& outline = *static_cast<GlyphOutline*>(draw_data);
+                if (outline.is_at(control1_x, control1_y) && outline.is_at(control2_x, control2_y) && outline.is_at(to_x, to_y))
+                    return;
+                outline.go_to(to_x, to_y);
+                FFI::path_geometry_contour_cubic_to(outline.outline, outline.x(control1_x), outline.y(control1_y), outline.x(control2_x), outline.y(control2_y), outline.x(to_x), outline.y(to_y));
+            },
+            nullptr, nullptr);
+        hb_draw_funcs_set_close_path_func(
+            funcs, [](hb_draw_funcs_t*, void* draw_data, hb_draw_state_t*, void*) {
+                static_cast<GlyphOutline*>(draw_data)->close_contour();
+            },
+            nullptr, nullptr);
+        hb_draw_funcs_make_immutable(funcs);
+        return funcs;
+    }();
+    return draw_funcs;
+}
+
+#ifdef AK_OS_MACOS
+void append_core_text_glyph_outline(FFI::PathGeometry* outline, CTFontRef font, u32 glyph_id)
+{
+    auto path = CTFontCreatePathForGlyph(font, static_cast<CGGlyph>(glyph_id), nullptr);
+    if (!path)
+        return;
+    ScopeGuard release_path = [&] { CGPathRelease(path); };
+
+    // CoreText gives points in pixels with y up.
+    CGPathApply(path, outline, [](void* info, CGPathElement const* element) {
+        auto* outline = static_cast<FFI::PathGeometry*>(info);
+        auto x = [&](size_t index) { return static_cast<float>(element->points[index].x); };
+        auto y = [&](size_t index) { return 0.0f - static_cast<float>(element->points[index].y); };
+        switch (element->type) {
+        case kCGPathElementMoveToPoint:
+            FFI::path_geometry_contour_move_to(outline, x(0), y(0));
             break;
-        case PathBuilderOpKind::LineTo:
-            path->line_to({ v[0], v[1] });
+        case kCGPathElementAddLineToPoint:
+            FFI::path_geometry_contour_line_to(outline, x(0), y(0));
             break;
-        case PathBuilderOpKind::QuadraticBezierCurveTo:
-            path->quadratic_bezier_curve_to({ v[0], v[1] }, { v[2], v[3] });
+        case kCGPathElementAddQuadCurveToPoint:
+            FFI::path_geometry_contour_quad_to(outline, x(0), y(0), x(1), y(1));
             break;
-        case PathBuilderOpKind::CubicBezierCurveTo:
-            path->cubic_bezier_curve_to({ v[0], v[1] }, { v[2], v[3] }, { v[4], v[5] });
+        case kCGPathElementAddCurveToPoint:
+            FFI::path_geometry_contour_cubic_to(outline, x(0), y(0), x(1), y(1), x(2), y(2));
             break;
-        case PathBuilderOpKind::EllipticalArcTo:
-            path->elliptical_arc_to({ v[0], v[1] }, { v[2], v[3] }, v[4], v[5] != 0, v[6] != 0);
+        case kCGPathElementCloseSubpath:
+            FFI::path_geometry_contour_close(outline);
             break;
-        case PathBuilderOpKind::ArcTo:
-            path->arc_to({ v[0], v[1] }, v[2], v[3] != 0, v[4] != 0);
-            break;
-        case PathBuilderOpKind::Close:
-            path->close();
-            break;
-        default:
-            VERIFY_NOT_REACHED();
         }
+    });
+}
+#endif
+
+// Gives the outlines of the glyphs of a font in pixels, with their origin on the baseline.
+class GlyphOutliner {
+    AK_MAKE_NONCOPYABLE(GlyphOutliner);
+    AK_MAKE_NONMOVABLE(GlyphOutliner);
+
+public:
+    explicit GlyphOutliner(Font const& font)
+        : m_font(font)
+    {
+#ifdef AK_OS_MACOS
+        if (auto const* core_text_typeface = as_if<TypefaceCoreText>(font.typeface()); core_text_typeface && core_text_typeface->has_outlines_that_only_core_text_draws())
+            m_core_text_font = create_core_text_font_with_variations(core_text_typeface->core_text_font(), font.pixel_size(), font.variation_settings().to_sorted_list());
+#endif
     }
-    return path;
+
+    ~GlyphOutliner()
+    {
+#ifdef AK_OS_MACOS
+        if (m_core_text_font)
+            CFRelease(m_core_text_font);
+#endif
+    }
+
+    void draw_outline(u32 glyph_id, FFI::PathGeometry* outline) const
+    {
+#ifdef AK_OS_MACOS
+        if (m_core_text_font) {
+            append_core_text_glyph_outline(outline, m_core_text_font, glyph_id);
+            return;
+        }
+#endif
+
+        auto* hb_font = m_font.harfbuzz_font();
+        int x_scale = 0;
+        int y_scale = 0;
+        hb_font_get_scale(hb_font, &x_scale, &y_scale);
+        if (x_scale <= 0 || y_scale <= 0)
+            return;
+        GlyphOutline glyph_outline {
+            .outline = outline,
+            .units_to_pixels_x = m_font.pixel_size() / static_cast<float>(x_scale),
+            .units_to_pixels_y = m_font.pixel_size() / static_cast<float>(y_scale),
+        };
+        hb_font_draw_glyph(hb_font, glyph_id, glyph_outline_draw_funcs(), &glyph_outline);
+        glyph_outline.close_contour();
+    }
+
+    Font const& m_font;
+#ifdef AK_OS_MACOS
+    // The font at its size and variations, for outlines that only CoreText draws.
+    CTFontRef m_core_text_font { nullptr };
+#endif
+};
+
 }
 
-extern "C" void* ladybird_gfx_path_create_from_serialized_bytes(u8 const* bytes, size_t count)
-{
-    auto path_bytes_at_an_aligned_address = MUST(ByteBuffer::copy(bytes, count));
-    return new Gfx::Path(Gfx::Path::from_serialized_bytes(path_bytes_at_an_aligned_address));
 }
 
-extern "C" void* ladybird_gfx_path_copy_transformed(void const* path, float const* affine_values)
-{
-    Gfx::AffineTransform transform { affine_values[0], affine_values[1], affine_values[2], affine_values[3], affine_values[4], affine_values[5] };
-    return new Gfx::Path(static_cast<Gfx::Path const*>(path)->copy_transformed(transform));
+// The function through which Rust code builds glyph outlines into paths. See Rust/src/path.rs.
+
+extern "C" {
+void ladybird_gfx_font_glyph_outlines(void const* font, Gfx::FFI::DrawGlyph const* glyphs, size_t glyph_count, void (*visit)(void*, size_t, Gfx::FFI::PathGeometryData const*), void* context);
 }
 
-extern "C" bool ladybird_gfx_path_contains(void const* path, float x, float y, int winding_rule)
+// Calls the callback with the outline of each glyph, in pixels with its origin on the baseline.
+extern "C" void ladybird_gfx_font_glyph_outlines(void const* font, Gfx::FFI::DrawGlyph const* glyphs, size_t glyph_count, void (*visit)(void*, size_t, Gfx::FFI::PathGeometryData const*), void* context)
 {
-    return static_cast<Gfx::Path const*>(path)->contains({ x, y }, static_cast<Gfx::WindingRule>(winding_rule));
-}
-
-extern "C" bool ladybird_gfx_path_equals(void const* a, void const* b)
-{
-    auto const& path_a = *static_cast<Gfx::Path const*>(a);
-    auto const& path_b = *static_cast<Gfx::Path const*>(b);
-    return static_cast<Gfx::PathImplSkia const&>(path_a.impl()).sk_path() == static_cast<Gfx::PathImplSkia const&>(path_b.impl()).sk_path();
+    Gfx::GlyphOutliner outliner { *static_cast<Gfx::Font const*>(font) };
+    auto* outline = Gfx::FFI::path_geometry_create();
+    ScopeGuard destroy_outline = [&] { Gfx::FFI::path_geometry_destroy(outline); };
+    for (size_t index = 0; index < glyph_count; ++index) {
+        Gfx::FFI::path_geometry_clear(outline);
+        outliner.draw_outline(glyphs[index].glyph_id, outline);
+        Gfx::FFI::PathGeometryData data;
+        Gfx::FFI::path_geometry_data(outline, &data);
+        visit(context, index, &data);
+    }
 }

@@ -235,6 +235,25 @@ TEST_CASE(embedder_policy_value_round_trips)
     EXPECT_EQ(unknown.error().string_literal(), "Persisted embedder policy value has an unknown tag"sv);
 }
 
+TEST_CASE(insecure_requests_policy_round_trips)
+{
+    using Policy = Web::UpgradeInsecureRequests::InsecureRequestsPolicy;
+
+    // These tags are persisted.
+    EXPECT_EQ(encode_insecure_requests_policy(Policy::DoNotUpgrade), 0);
+    EXPECT_EQ(encode_insecure_requests_policy(Policy::Upgrade), 1);
+
+    for (auto policy : Array { Policy::DoNotUpgrade, Policy::Upgrade }) {
+        auto decoded = decode_insecure_requests_policy(encode_insecure_requests_policy(policy));
+        EXPECT(!decoded.is_error());
+        EXPECT(decoded.value() == policy);
+    }
+
+    auto unknown = decode_insecure_requests_policy(9);
+    EXPECT(unknown.is_error());
+    EXPECT_EQ(unknown.error().string_literal(), "Persisted insecure requests policy has an unknown tag"sv);
+}
+
 TEST_CASE(csp_disposition_round_trips)
 {
     using Disposition = Web::Bindings::SecurityPolicyViolationEventDisposition;
@@ -328,12 +347,13 @@ static void insert_minimal_entry(Database::Database& database, SessionHistorySna
     database.execute_statement(statements.insert_entry, {},
         history_id, entry_ordinal, static_cast<i64>(0), MUST(String::from_utf8("https://x.example/"sv)), static_cast<i64>(1), document_state_id,
         ByteString {}, ByteString {}, String {}, String {},
-        static_cast<i64>(0), absent_scroll, absent_scroll,
+        static_cast<i64>(0), static_cast<i64>(0), static_cast<i64>(0), absent_text,
+        absent_scroll, absent_scroll,
         static_cast<i64>(0), absent_text, absent_text, absent_text, absent_port, absent_text,
         static_cast<i64>(0), absent_text, absent_text, absent_text, absent_port, absent_text,
         static_cast<i64>(0), absent_text, static_cast<i64>(0),
         static_cast<i64>(0), absent_text,
-        absent_text, String {}, ever_populated, false);
+        absent_text, String {}, ever_populated, false, false);
 }
 
 static i32 count_tab_rows(Database::Database& database, StringView table, i64 tab_id)
@@ -386,6 +406,14 @@ static i32 count_history_owned_rows(Database::Database& database, StringView tab
     return count;
 }
 
+static Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet make_upgrade_insecure_navigations_set()
+{
+    Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet set;
+    set.insert({ URL::Host { "a.example"_string }, {} });
+    set.insert({ URL::Parser::parse_host("127.0.0.1"sv).release_value(), static_cast<u16>(8443) });
+    return set;
+}
+
 static Web::HTML::SerializedPolicyContainer make_policy_container()
 {
     Web::ContentSecurityPolicy::SerializedPolicy enforced_policy {
@@ -416,6 +444,9 @@ static Web::HTML::SerializedPolicyContainer make_policy_container()
             .report_only_reporting_endpoint = "coep-report"_utf16,
         },
         .referrer_policy = Web::ReferrerPolicy::ReferrerPolicy::NoReferrer,
+        .force_load_at_top = true,
+        .insecure_requests_policy = Web::UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade,
+        .upgrade_insecure_navigations_set = make_upgrade_insecure_navigations_set(),
     };
 }
 
@@ -440,6 +471,9 @@ static void expect_policy_containers_equal(Web::HTML::SerializedPolicyContainer 
     EXPECT_EQ(restored.embedder_policy.reporting_endpoint, original.embedder_policy.reporting_endpoint);
     EXPECT_EQ(restored.embedder_policy.report_only_reporting_endpoint, original.embedder_policy.report_only_reporting_endpoint);
     EXPECT(restored.referrer_policy == original.referrer_policy);
+    EXPECT_EQ(restored.force_load_at_top, original.force_load_at_top);
+    EXPECT(restored.insecure_requests_policy == original.insecure_requests_policy);
+    EXPECT(restored.upgrade_insecure_navigations_set.tuples() == original.upgrade_insecure_navigations_set.tuples());
 }
 
 TEST_CASE(snapshot_round_trips_flat_entries)
@@ -460,6 +494,7 @@ TEST_CASE(snapshot_round_trips_flat_entries)
     rich_entry.document_state.navigable_target_name = "main"_utf16;
     rich_entry.document_state.ever_populated = true;
     rich_entry.document_state.reload_pending = true;
+    rich_entry.document_state.user_agent_initiated = Web::HTML::UserAgentInitiated::Yes;
 
     auto plain_entry = make_entry(1, "https://b.example/"sv, 2, 0x33, 0x44, "keyB"sv, "idB"sv, {});
     plain_entry.document_state.initiator_origin = URL::Origin { "https"_string, URL::Host { "b.example"_string }, Optional<u16> {}, URL::Host { "b.example"_string } };
@@ -498,6 +533,7 @@ TEST_CASE(snapshot_round_trips_flat_entries)
         EXPECT(restored_state.navigable_target_name == original_state.navigable_target_name);
         EXPECT(restored_state.ever_populated == original_state.ever_populated);
         EXPECT(restored_state.reload_pending == original_state.reload_pending);
+        EXPECT(restored_state.user_agent_initiated == original_state.user_agent_initiated);
         EXPECT(restored_state.resource.has<Utf16String>() == original_state.resource.has<Utf16String>());
         if (original_state.resource.has<Utf16String>())
             EXPECT(restored_state.resource.get<Utf16String>() == original_state.resource.get<Utf16String>());
@@ -506,6 +542,93 @@ TEST_CASE(snapshot_round_trips_flat_entries)
     // is_same_origin ignores the domain, so pin each domain column explicitly.
     EXPECT_EQ(loaded.entries[0].document_state.origin->domain()->serialize(), "a.example"_string);
     EXPECT_EQ(loaded.entries[1].document_state.initiator_origin->domain()->serialize(), "b.example"_string);
+}
+
+// A database from before the user_agent_initiated column gains it with every entry saved there as No.
+TEST_CASE(snapshot_entries_saved_before_the_user_agent_initiated_column_load_as_no)
+{
+    auto database = make_database();
+    auto statements = prepare_snapshot_tables(*database);
+
+    insert_tab_row(*database, 42);
+
+    auto entry = make_entry(0, "https://a.example/"sv, 1, 0x11, 0x22, "keyA"sv, "idA"sv, {});
+    entry.document_state.user_agent_initiated = Web::HTML::UserAgentInitiated::Yes;
+
+    WebView::SessionHistorySnapshot snapshot;
+    snapshot.entries.append(move(entry));
+    snapshot.used_steps = { 0 };
+    snapshot.current_used_step_index = 0;
+
+    TRY_OR_FAIL(store_session_history_snapshot(*database, statements, 42, snapshot));
+
+    // Take the database back to the baseline schema, keeping the entry's row.
+    TRY_OR_FAIL(database->execute_raw(R"#(
+        DROP TABLE SessionUpgradeInsecureNavigations;
+        ALTER TABLE SessionPolicyContainers DROP COLUMN insecure_requests_policy;
+        ALTER TABLE Sessions DROP COLUMN maximized;
+        ALTER TABLE Sessions DROP COLUMN height;
+        ALTER TABLE Sessions DROP COLUMN width;
+        ALTER TABLE Sessions DROP COLUMN y;
+        ALTER TABLE Sessions DROP COLUMN x;
+        ALTER TABLE Sessions DROP COLUMN restore_at_launch;
+        ALTER TABLE Sessions DROP COLUMN activation_sequence;
+        DROP TABLE SessionLifecycle;
+        ALTER TABLE SessionTabs DROP COLUMN pinned;
+        ALTER TABLE SessionPolicyContainers DROP COLUMN force_load_at_top;
+        ALTER TABLE SessionEntries DROP COLUMN directive_state_value;
+        ALTER TABLE SessionEntries DROP COLUMN directive_state_local_id;
+        ALTER TABLE SessionEntries DROP COLUMN directive_state_namespace_id;
+        ALTER TABLE SessionEntries DROP COLUMN user_agent_initiated;
+        UPDATE SchemaVersions SET version = 1 WHERE store = 'Sessions';
+    )#"sv));
+
+    auto migrated_statements = prepare_snapshot_tables(*database);
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 9u });
+
+    auto loaded = TRY_OR_FAIL(load_session_history_snapshot(*database, migrated_statements, 42, 0));
+    EXPECT_EQ(loaded.entries.size(), 1uz);
+    EXPECT(loaded.entries[0].url == snapshot.entries[0].url);
+    EXPECT(loaded.entries[0].document_state.user_agent_initiated == Web::HTML::UserAgentInitiated::No);
+}
+
+// A database from before the insecure requests policy columns gains them with every policy container saved there as
+// Do Not Upgrade, with an empty upgrade insecure navigations set.
+TEST_CASE(snapshot_policy_containers_saved_before_the_insecure_requests_policy_load_as_do_not_upgrade)
+{
+    auto database = make_database();
+    auto statements = prepare_snapshot_tables(*database);
+
+    insert_tab_row(*database, 27);
+
+    auto entry = make_entry(0, "data:text/html,x"sv, 1, 0, 0, ""sv, ""sv, {});
+    entry.document_state.history_policy_container = make_policy_container();
+
+    WebView::SessionHistorySnapshot snapshot;
+    snapshot.entries.append(move(entry));
+    snapshot.used_steps = { 0 };
+    snapshot.current_used_step_index = 0;
+
+    TRY_OR_FAIL(store_session_history_snapshot(*database, statements, 27, snapshot));
+
+    // Take the database back to the schema before the insecure requests policy, keeping the container's row.
+    TRY_OR_FAIL(database->execute_raw(R"#(
+        DROP TABLE SessionUpgradeInsecureNavigations;
+        ALTER TABLE SessionPolicyContainers DROP COLUMN insecure_requests_policy;
+        UPDATE SchemaVersions SET version = 8 WHERE store = 'Sessions';
+    )#"sv));
+
+    auto migrated_statements = prepare_snapshot_tables(*database);
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 9u });
+
+    auto loaded = TRY_OR_FAIL(load_session_history_snapshot(*database, migrated_statements, 27, 0));
+    auto const* container = loaded.entries[0].document_state.history_policy_container.get_pointer<Web::HTML::SerializedPolicyContainer>();
+    EXPECT(container != nullptr);
+    if (container) {
+        EXPECT(container->insecure_requests_policy == Web::UpgradeInsecureRequests::InsecureRequestsPolicy::DoNotUpgrade);
+        EXPECT(container->upgrade_insecure_navigations_set.tuples().is_empty());
+        EXPECT_EQ(container->csp_list.size(), 2uz);
+    }
 }
 
 TEST_CASE(snapshot_load_rejects_non_contiguous_entries)
@@ -616,6 +739,59 @@ TEST_CASE(snapshot_round_trips_empty_policy_container)
         expect_policy_containers_equal(*container, Web::HTML::SerializedPolicyContainer {});
 }
 
+TEST_CASE(snapshot_round_trips_an_inherited_insecure_requests_policy)
+{
+    auto database = make_database();
+    auto statements = prepare_snapshot_tables(*database);
+
+    insert_tab_row(*database, 25);
+
+    // A popup's about:blank document that inherited the policy from its opener, with no CSP list of its own.
+    Web::HTML::SerializedPolicyContainer inherited_only {};
+    inherited_only.insecure_requests_policy = Web::UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade;
+    inherited_only.upgrade_insecure_navigations_set = make_upgrade_insecure_navigations_set();
+    auto entry = make_entry(0, "about:blank"sv, 1, 0, 0, ""sv, ""sv, {});
+    entry.document_state.history_policy_container = inherited_only;
+
+    WebView::SessionHistorySnapshot snapshot;
+    snapshot.entries.append(move(entry));
+    snapshot.used_steps = { 0 };
+    snapshot.current_used_step_index = 0;
+
+    TRY_OR_FAIL(store_session_history_snapshot(*database, statements, 25, snapshot));
+    EXPECT_EQ(count_rows(*database, "SessionCspPolicies"sv), 0);
+    EXPECT_EQ(count_rows(*database, "SessionUpgradeInsecureNavigations"sv), 2);
+
+    auto loaded = TRY_OR_FAIL(load_session_history_snapshot(*database, statements, 25, 0));
+    auto const* container = loaded.entries[0].document_state.history_policy_container.get_pointer<Web::HTML::SerializedPolicyContainer>();
+    EXPECT(container != nullptr);
+    if (container)
+        expect_policy_containers_equal(*container, inherited_only);
+}
+
+TEST_CASE(snapshot_load_rejects_an_unknown_insecure_requests_policy)
+{
+    auto database = make_database();
+    auto statements = prepare_snapshot_tables(*database);
+
+    insert_tab_row(*database, 26);
+
+    auto entry = make_entry(0, "about:blank"sv, 1, 0, 0, ""sv, ""sv, {});
+    entry.document_state.history_policy_container = Web::HTML::SerializedPolicyContainer {};
+
+    WebView::SessionHistorySnapshot snapshot;
+    snapshot.entries.append(move(entry));
+    snapshot.used_steps = { 0 };
+    snapshot.current_used_step_index = 0;
+
+    TRY_OR_FAIL(store_session_history_snapshot(*database, statements, 26, snapshot));
+    TRY_OR_FAIL(database->execute_raw("UPDATE SessionPolicyContainers SET insecure_requests_policy = 7;"sv));
+
+    auto loaded = load_session_history_snapshot(*database, statements, 26, 0);
+    EXPECT(loaded.is_error());
+    EXPECT_EQ(loaded.error().string_literal(), "Persisted insecure requests policy has an unknown tag"sv);
+}
+
 TEST_CASE(snapshot_delete_cascades_policy_container_rows)
 {
     auto database = make_database();
@@ -633,6 +809,7 @@ TEST_CASE(snapshot_delete_cascades_policy_container_rows)
 
     TRY_OR_FAIL(store_session_history_snapshot(*database, statements, 23, snapshot));
     EXPECT_EQ(count_rows(*database, "SessionCspDirectiveValues"sv), 3);
+    EXPECT_EQ(count_rows(*database, "SessionUpgradeInsecureNavigations"sv), 2);
 
     TRY_OR_FAIL(delete_session_history_snapshot(*database, statements, 23));
     EXPECT_EQ(count_history_owned_rows(*database, "SessionEntries"sv, 23), 0);
@@ -640,6 +817,7 @@ TEST_CASE(snapshot_delete_cascades_policy_container_rows)
     EXPECT_EQ(count_rows(*database, "SessionCspPolicies"sv), 0);
     EXPECT_EQ(count_rows(*database, "SessionCspDirectives"sv), 0);
     EXPECT_EQ(count_rows(*database, "SessionCspDirectiveValues"sv), 0);
+    EXPECT_EQ(count_rows(*database, "SessionUpgradeInsecureNavigations"sv), 0);
 }
 
 TEST_CASE(snapshot_store_rejects_oversized_policy_container_text)
@@ -910,6 +1088,47 @@ TEST_CASE(snapshot_load_rejects_oversized_snapshot)
     EXPECT_EQ(loaded.error().string_literal(), "Session history snapshot exceeds the maximum size"sv);
 }
 
+// Rows as a schema 9 database holds them, written without the production writer.
+TEST_CASE(snapshot_loads_persisted_upgrade_insecure_navigations)
+{
+    auto database = make_database();
+    auto statements = prepare_snapshot_tables(*database);
+    insert_tab_row(*database, 1);
+    insert_history_row(*database, 1, 1);
+    database->execute_statement(statements.insert_used_step, {}, static_cast<i64>(1), static_cast<i64>(0), static_cast<i64>(0));
+    insert_minimal_entry(*database, statements, 1, 0);
+    insert_minimal_policy_container(*database, 1, 0);
+    TRY_OR_FAIL(database->execute_raw(R"#(
+        UPDATE SessionPolicyContainers SET insecure_requests_policy = 1;
+        INSERT INTO SessionUpgradeInsecureNavigations (container_id, tuple_ordinal, host, port)
+        VALUES (1, 0, 'a.example', NULL), (1, 1, '127.0.0.1', 8443), (1, 2, '[::1]', 443);
+    )#"sv));
+
+    auto loaded = TRY_OR_FAIL(load_session_history_snapshot(*database, statements, 1, 0));
+    auto const* container = loaded.entries[0].document_state.history_policy_container.get_pointer<Web::HTML::SerializedPolicyContainer>();
+    EXPECT(container != nullptr);
+    if (!container)
+        return;
+
+    EXPECT(container->insecure_requests_policy == Web::UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade);
+    auto const& tuples = container->upgrade_insecure_navigations_set.tuples();
+    EXPECT_EQ(tuples.size(), 3uz);
+    if (tuples.size() != 3)
+        return;
+
+    EXPECT(tuples[0].host.is_domain());
+    EXPECT_EQ(tuples[0].host.serialize(), "a.example"_string);
+    EXPECT(!tuples[0].port.has_value());
+
+    EXPECT(tuples[1].host.has<IPv4Address>());
+    EXPECT_EQ(tuples[1].host.serialize(), "127.0.0.1"_string);
+    EXPECT_EQ(tuples[1].port.value_or(0), 8443);
+
+    EXPECT(tuples[2].host.has<IPv6Address>());
+    EXPECT_EQ(tuples[2].host.serialize(), "[::1]"_string);
+    EXPECT_EQ(tuples[2].port.value_or(0), 443);
+}
+
 TEST_CASE(snapshot_load_rejects_invalid_policy_container_rows)
 {
     auto insert_directive = [](Database::Database& database, SessionHistorySnapshotStatements const&, i64 id, i64 policy_id, i64 directive_ordinal) {
@@ -971,6 +1190,18 @@ TEST_CASE(snapshot_load_rejects_invalid_policy_container_rows)
         insert_value(database, statements, 1, 2);
     },
         "Session history CSP directive values are not contiguously ordered"sv);
+
+    expect_load_error([](auto& database, auto&) {
+        insert_minimal_policy_container(database, 1, 0);
+        MUST(database.execute_raw("INSERT INTO SessionUpgradeInsecureNavigations (container_id, tuple_ordinal, host, port) VALUES (1, 0, 'a.example', NULL), (1, 2, 'b.example', NULL);"sv));
+    },
+        "Session history upgrade insecure navigations are not contiguously ordered"sv);
+
+    expect_load_error([](auto& database, auto&) {
+        insert_minimal_policy_container(database, 1, 0);
+        MUST(database.execute_raw("INSERT INTO SessionUpgradeInsecureNavigations (container_id, tuple_ordinal, host, port) VALUES (1, 0, 'exa mple', NULL);"sv));
+    },
+        "Persisted upgrade insecure navigation has an unparseable host"sv);
 }
 
 TEST_CASE(snapshot_load_rejects_policy_container_for_missing_entry)

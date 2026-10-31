@@ -196,6 +196,18 @@ describe("in- and exports", () => {
         expectModulePassed("./import-with-attributes.mjs");
     });
 
+    test("import attribute keys must be unique", () => {
+        expectedModuleToThrowSyntaxError("./duplicate-import-attribute-key.mjs", "Duplicate import attribute key");
+    });
+
+    test("imported bindings cannot be redeclared", () => {
+        expectedModuleToThrowSyntaxError("./import-redeclared-by-let.mjs", "Identifier 'passed' already declared");
+        expectedModuleToThrowSyntaxError("./import-redeclared-by-var.mjs", "Identifier 'passed' already declared");
+        expectedModuleToThrowSyntaxError("./import-redeclared-by-function.mjs", "Identifier 'passed' already declared");
+        expectedModuleToThrowSyntaxError("./import-redeclaring-class.mjs", "Identifier 'passed' already declared");
+        expectedModuleToThrowSyntaxError("./duplicate-import-binding.mjs", "Identifier 'passed' already declared");
+    });
+
     test("namespace has expected ordering", () => {
         expectModulePassed("./namespace-order.mjs");
     });
@@ -224,7 +236,7 @@ describe("in- and exports", () => {
         expectModulePassed("./anon-func-decl-default-export.mjs");
     });
 
-    test.xfail("can have top level using declarations which trigger at the end of running a module", () => {
+    test("can have top level using declarations which trigger at the end of running a module", () => {
         expectModulePassed("./top-level-dispose.mjs");
     });
 
@@ -328,5 +340,30 @@ describe("scoping in modules", () => {
     test("module-level bindings stay reachable across top-level await", () => {
         const result = expectModulePassed("./module-level-bindings-with-top-level-await.mjs");
         expect(result.counterAfterAwait).toBe(11);
+    });
+});
+
+describe("top-level await", () => {
+    test("await continuations interleave with chained promise reactions", () => {
+        const result = expectModulePassed("./top-level-await-job-order.mjs");
+        const ticksFirst = ["tick 1", "await 1", "tick 2", "await 2", "tick 3", "await 3", "tick 4", "await 4"];
+        for (const order of result.ordersAfterAwait) {
+            expect(order).toEqual(ticksFirst);
+        }
+        expect(result.orderBeforeAwait).toEqual([
+            "await 1",
+            "tick 1",
+            "await 2",
+            "tick 2",
+            "await 3",
+            "tick 3",
+            "await 4",
+            "tick 4",
+        ]);
+    });
+
+    test("for await at the top level", () => {
+        const result = expectModulePassed("./top-level-for-await.mjs");
+        expect(result.result).toEqual([1, 2, "a", "b", "closed", "first", "iterator failed", "1x", "2x"]);
     });
 });

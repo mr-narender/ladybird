@@ -20,8 +20,12 @@ class HeaderList;
 class HttpRequest;
 class HttpResponse;
 class MemoryCache;
+class ProxyConfiguration;
 
 struct Header;
+struct Link;
+struct NetworkIsolationKey;
+struct Proxy;
 
 }
 
@@ -29,6 +33,7 @@ namespace HTTP::Cookie {
 
 struct Cookie;
 struct ParsedCookie;
+struct PartitionContext;
 struct VersionedCookie;
 
 enum class IncludeCredentials : u8;

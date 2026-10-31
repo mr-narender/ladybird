@@ -28,11 +28,35 @@ mod grid_tests {
     use crate::css::parser::value_parser::{ParseContext, ParseOutcome, parse_css_value};
     use crate::css::property_metadata::property_id;
 
+    /// Absolutizes against a zeroed length context, handing back the value itself when it is
+    /// unchanged.
+    fn absolutize_for_test(value: &StyleValueData) -> Arc<StyleValueData> {
+        // All fields are scalars or nullable pointers.
+        let length = FfiLengthResolutionContext::default();
+        let context = AbsolutizationContext {
+            length: &length,
+            scheme: None,
+            resolved_viewport_relative_length: Cell::new(false),
+            tree_counting: None,
+            random_base_values: &[],
+            document_base_url: &[],
+            style_sheet_resource_context: None,
+            current_color: None,
+        };
+        match absolutize(value, &context).unwrap() {
+            Absolutized::Unchanged => unsafe {
+                Arc::increment_strong_count(value);
+                Arc::from_raw(value)
+            },
+            Absolutized::Changed(value) => value.into_arc(),
+        }
+    }
+
     fn parse(property: u16, source: &str) -> Arc<StyleValueData> {
         let units: Vec<_> = source.encode_utf16().collect();
         let values = consume_a_list_of_component_values(tokenize_for_parser(TokenizerInput::Utf16(&units))).unwrap();
         // All fields are scalars or nullable pointers.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
+        let context = ParseContext::default();
         let ParseOutcome::Parsed(value) = parse_css_value(&context, property, &values) else {
             panic!("invalid test value");
         };
@@ -41,10 +65,6 @@ mod grid_tests {
 
     #[test]
     fn composite_resolution_preserves_shared_shapes_and_easing() {
-        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
-            unsafe { Arc::increment_strong_count(value) };
-            value
-        }
         for (property, source) in [
             (property_id::CLIP_PATH, "inset(1px round 2px)"),
             (property_id::CLIP_PATH, "circle(2px at 25% 75%)"),
@@ -60,20 +80,14 @@ mod grid_tests {
                 StyleValueData::ValueList { values, .. } => values.as_slice()[0].data(),
                 value => value,
             };
-            let same = unsafe {
-                Arc::from_raw(rust_composite_style_value_absolutize(
-                    value,
-                    std::ptr::null(),
-                    unchanged,
-                ))
-            };
+            let same = absolutize_for_test(value);
             assert!(std::ptr::eq(value, &*same));
             let mut children = Vec::new();
             let mut retain_child = |child: &RetainedStyleValueData, _: &mut bool| {
                 if child.optional_data().is_some() {
                     children.push((
                         child.clone(),
-                        crate::css::serialize::serialize_style_value_to_utf16(child.data()).unwrap(),
+                        crate::css::serialize::serialize_style_value_to_utf16(child.data()),
                     ));
                 }
                 Some(child.clone())
@@ -91,7 +105,7 @@ mod grid_tests {
             drop(parsed);
             for (child, expected) in children {
                 assert_eq!(
-                    crate::css::serialize::serialize_style_value_to_utf16(child.data()).unwrap(),
+                    crate::css::serialize::serialize_style_value_to_utf16(child.data()),
                     expected
                 );
             }
@@ -99,45 +113,9 @@ mod grid_tests {
     }
 
     #[test]
-    fn composite_resolution_preserves_color_mix_with_currentcolor() {
-        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
-            unsafe { Arc::increment_strong_count(value) };
-            value
-        }
-        let parsed = parse(property_id::COLOR, "color-mix(in srgb, currentcolor 20%, red 20%)");
-        let resolved = unsafe {
-            Arc::from_raw(rust_composite_style_value_absolutize(
-                &parsed,
-                std::ptr::null(),
-                unchanged,
-            ))
-        };
-        let StyleValueData::ColorMix {
-            first_percentage,
-            second_percentage,
-            ..
-        } = &*resolved
-        else {
-            unreachable!();
-        };
-        assert_eq!(percentage_from_style_value(first_percentage.data()), Some(20.0));
-        assert_eq!(percentage_from_style_value(second_percentage.data()), Some(20.0));
-    }
-
-    #[test]
     fn composite_resolution_resolves_contrast_color() {
-        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
-            unsafe { Arc::increment_strong_count(value) };
-            value
-        }
         let parsed = parse(property_id::COLOR, "contrast-color(red)");
-        let resolved = unsafe {
-            Arc::from_raw(rust_composite_style_value_absolutize(
-                &parsed,
-                std::ptr::null(),
-                unchanged,
-            ))
-        };
+        let resolved = absolutize_for_test(&parsed);
         assert!(matches!(&*resolved, StyleValueData::ColorFunction { .. }));
         assert_eq!(
             to_color(&resolved, &EMPTY_INPUT),
@@ -147,21 +125,11 @@ mod grid_tests {
 
     #[test]
     fn composite_resolution_canonicalizes_linear_easing_control_points() {
-        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
-            unsafe { Arc::increment_strong_count(value) };
-            value
-        }
         let parsed = parse(property_id::ANIMATION_TIMING_FUNCTION, "linear(0, 0.25, 0.5 60%, 1)");
         let StyleValueData::ValueList { values, .. } = &*parsed else {
             unreachable!();
         };
-        let resolved = unsafe {
-            Arc::from_raw(rust_composite_style_value_absolutize(
-                values.as_slice()[0].data(),
-                std::ptr::null(),
-                unchanged,
-            ))
-        };
+        let resolved = absolutize_for_test(values.as_slice()[0].data());
         let StyleValueData::Easing { linear_stops, .. } = &*resolved else {
             unreachable!();
         };
@@ -180,10 +148,6 @@ mod grid_tests {
 
     #[test]
     fn grid_leaf_resolution_preserves_identity_and_retained_children() {
-        unsafe extern "C" fn unchanged(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
-            unsafe { Arc::increment_strong_count(value) };
-            value
-        }
         for (property, source) in [
             (property_id::GRID_ROW_START, "3"),
             (
@@ -192,14 +156,8 @@ mod grid_tests {
             ),
         ] {
             let value = parse(property, source);
-            let original = crate::css::serialize::serialize_style_value_to_utf16(&value).unwrap();
-            let same = unsafe {
-                Arc::from_raw(rust_composite_style_value_absolutize(
-                    &value,
-                    std::ptr::null(),
-                    unchanged,
-                ))
-            };
+            let original = crate::css::serialize::serialize_style_value_to_utf16(&value);
+            let same = absolutize_for_test(&value);
             assert!(Arc::ptr_eq(&value, &same));
             let mut retained = Vec::new();
             let mapped = map_grid_values(&value, &mut |child| {
@@ -212,44 +170,39 @@ mod grid_tests {
             drop(value);
             drop(same);
             assert!(!retained.is_empty());
-            assert_eq!(
-                crate::css::serialize::serialize_style_value_to_utf16(&mapped).unwrap(),
-                original
-            );
+            assert_eq!(crate::css::serialize::serialize_style_value_to_utf16(&mapped), original);
             drop(mapped);
             for child in retained {
-                assert!(crate::css::serialize::serialize_style_value_to_utf16(child.data()).is_some());
+                crate::css::serialize::serialize_style_value_to_utf16(child.data());
             }
         }
     }
 
     #[test]
     fn grid_leaf_resolution_rebuilds_nested_tracks_without_changing_the_source() {
-        unsafe extern "C" fn resolve(_: *const core::ffi::c_void, value: &StyleValueData) -> *const StyleValueData {
-            match value {
-                StyleValueData::Length { value, unit } => Arc::into_raw(Arc::new(StyleValueData::Length {
-                    value: value * 2.0,
-                    unit: *unit,
-                })),
-                _ => {
-                    unsafe { Arc::increment_strong_count(value) };
-                    value
-                }
-            }
-        }
         let value = parse(
             property_id::GRID_TEMPLATE_COLUMNS,
             "[雪] repeat(2, minmax(10px, 1fr)) [雨]",
         );
-        let resolved =
-            unsafe { Arc::from_raw(rust_composite_style_value_absolutize(&value, std::ptr::null(), resolve)) };
+        let resolved = Arc::new(
+            map_grid_values(&value, &mut |child| {
+                Some(match child.optional_data() {
+                    Some(StyleValueData::Length { value, unit }) => retain_new(StyleValueData::Length {
+                        value: value * 2.0,
+                        unit: *unit,
+                    }),
+                    _ => child.clone(),
+                })
+            })
+            .unwrap(),
+        );
         assert!(!Arc::ptr_eq(&value, &resolved));
         for (value, expected) in [
             (&value, "[雪] repeat(2, minmax(10px, 1fr)) [雨]"),
             (&resolved, "[雪] repeat(2, minmax(20px, 1fr)) [雨]"),
         ] {
             assert_eq!(
-                crate::css::serialize::serialize_style_value_to_utf16(value).unwrap(),
+                crate::css::serialize::serialize_style_value_to_utf16(value),
                 expected.encode_utf16().collect::<Vec<_>>()
             );
         }
@@ -258,15 +211,17 @@ mod grid_tests {
 
 use crate::css::color_resolution::{
     ColorResolutionInput, EMPTY_INPUT, PREFERRED_COLOR_SCHEME_DARK, RECTANGULAR_COLOR_SPACE_OKLAB,
-    descriptor_for_color_type, normalize_percentage_pair, percentage_from_style_value, resolve_alpha,
-    resolve_color_for_interpolation, resolve_hue, resolve_relative_form, resolve_with_reference_value, to_color,
+    calculate_a_color_mix, descriptor_for_color_type, percentage_from_style_value, resolve_alpha, resolve_hue,
+    resolve_relative_form, resolve_with_reference_value, to_color,
 };
 use crate::css::css_enums::keyword;
+use crate::css::serialize::color_function_has_missing_component;
 use crate::css::style_compute::{FfiLengthResolutionContext, absolutize_length, keyword_is_color};
 use crate::css::style_value::{
     BasicShapeData, ColorBase, CssString, OwnedBasicShapeData, RetainedGridTrackEntryList, RetainedStyleValueData,
-    RetainedStyleValueDataList, StyleValueData, value_depends_on_current_color,
+    RetainedStyleValueDataList, StyleValueData, is_none_keyword, value_depends_on_current_color,
 };
+use crate::css::value_codes::*;
 
 pub(crate) struct AbsolutizationContext<'a> {
     pub(crate) length: &'a FfiLengthResolutionContext,
@@ -284,6 +239,10 @@ pub(crate) struct AbsolutizationContext<'a> {
     pub(crate) document_base_url: &'a [u8],
     /// The stylesheet resource context for the selected cascade source, if any.
     pub(crate) style_sheet_resource_context: Option<StyleSheetResourceContext<'a>>,
+    /// The computed value `currentcolor` names while the value computes, which only the `color` property knows: its
+    /// inherited value. Elsewhere `currentcolor` names the element's own color, which the computed value keeps
+    /// unresolved until it is used.
+    pub(crate) current_color: Option<&'a StyleValueData>,
 }
 
 #[derive(Clone, Copy)]
@@ -299,9 +258,7 @@ pub(crate) enum Absolutized {
 }
 
 fn retain_new(value: StyleValueData) -> RetainedStyleValueData {
-    let pointer = Arc::into_raw(Arc::new(value));
-    // SAFETY: The freshly leaked Arc reference is exactly one strong reference.
-    unsafe { RetainedStyleValueData::from_retained_pointer(pointer) }
+    RetainedStyleValueData::from_arc(Arc::new(value))
 }
 
 /// Absolutizes one retained child slot. Returns the child for the rebuilt parent, whether any
@@ -349,12 +306,9 @@ fn currentcolor_keyword() -> StyleValueData {
 }
 
 // ColorStyleValue.h: ColorSyntax::Legacy = 0, Modern = 1.
-pub(crate) const COLOR_SYNTAX_LEGACY: u8 = 0;
-const COLOR_SYNTAX_MODERN: u8 = 1;
 
 fn retained_null() -> RetainedStyleValueData {
-    // SAFETY: null encodes an absent optional value.
-    unsafe { RetainedStyleValueData::from_retained_optional_pointer(std::ptr::null()) }
+    RetainedStyleValueData::none()
 }
 
 fn absolutize_image(value: &StyleValueData, context: &AbsolutizationContext) -> Option<Absolutized> {
@@ -367,7 +321,9 @@ fn absolutize_image(value: &StyleValueData, context: &AbsolutizationContext) -> 
     else {
         return None;
     };
-    if url.is_empty() {
+    // https://drafts.csswg.org/css-values-4/#local-urls
+    // When serializing a url() with the local url flag set, it must serialize as just the fragment.
+    if url.is_empty() || url.is_fragment() {
         return Some(Absolutized::Unchanged);
     }
 
@@ -430,15 +386,20 @@ fn absolutize_image(value: &StyleValueData, context: &AbsolutizationContext) -> 
 }
 
 /// The color-resolution input the C++ absolutizers build from a computation context: the
-/// context's color scheme and calculation inputs, no currentcolor and no channels.
+/// context's color scheme and calculation inputs, the currentcolor it knows of, and no channels.
 fn color_resolution_input<'a>(context: &'a AbsolutizationContext) -> ColorResolutionInput<'a> {
-    ColorResolutionInput {
+    let mut input = ColorResolutionInput {
         scheme: context.scheme,
         current_color: None,
         current_color_value: None,
         length: Some(context.length),
         channels: None,
+    };
+    if let Some(current_color) = context.current_color {
+        input.current_color = to_color(current_color, &input);
+        input.current_color_value = Some(current_color);
     }
+    input
 }
 
 /// The rgb() function form ColorFunctionStyleValue::create builds for an already-resolved
@@ -515,8 +476,13 @@ fn hwb_to_absolutized_rgb(
     blackness_0_100: f64,
     alpha_0_1: f64,
 ) -> StyleValueData {
-    let whiteness = (whiteness_0_100 / 100.0).clamp(0.0, 1.0) as f32;
-    let blackness = (blackness_0_100 / 100.0).clamp(0.0, 1.0) as f32;
+    // https://drafts.csswg.org/css-color-4/#the-hwb-notation
+    // Values outside of these ranges are not invalid; hue angles outside the range [0,360) will be normalized to
+    // that range and values of white and black which sum to 100% or greater will produce achromatic colors as
+    // described below.
+    // NB: The handling of negative white or black is unspecified, so they are clamped to 0%.
+    let whiteness = (whiteness_0_100 / 100.0).max(0.0) as f32;
+    let blackness = (blackness_0_100 / 100.0).max(0.0) as f32;
 
     if whiteness + blackness >= 1.0 {
         // The gray channel value is shared across the three slots, like the C++ code.
@@ -565,6 +531,106 @@ fn hwb_to_absolutized_rgb(
     )
 }
 
+/// The computed form of an absolute rgb(), hsl() or hwb() function that keeps its color function: the same
+/// function with every present component resolved to a number (hues in degrees, other hsl() and hwb()
+/// components in percent, rgb() components from 0 to 255) and alpha clamped to [0, 1].
+fn resolved_srgb_function_components(value: &StyleValueData) -> Option<StyleValueData> {
+    let StyleValueData::ColorFunction {
+        color_base,
+        channel_0,
+        channel_1,
+        channel_2,
+        alpha,
+        ..
+    } = value
+    else {
+        return None;
+    };
+    let descriptor = descriptor_for_color_type(color_base.color_type);
+    let resolve_channel = |channel: &RetainedStyleValueData, index: usize| -> Option<RetainedStyleValueData> {
+        let value = channel.data();
+        if is_none_keyword(value) {
+            return Some(channel.clone_retained());
+        }
+        let channel_descriptor = &descriptor.channels[index];
+        let mut resolved = if channel_descriptor.is_hue {
+            resolve_hue(value, &EMPTY_INPUT)?
+        } else {
+            resolve_with_reference_value(value, f64::from(channel_descriptor.percent_reference), &EMPTY_INPUT)?
+        };
+        if color_base.color_type == crate::css::color_conversion::RGB {
+            resolved = resolved.clamp(0.0, 255.0);
+        }
+        // https://drafts.csswg.org/css-color-4/#the-hsl-notation
+        // For historical reasons, if the saturation is less than 0% it is clamped to 0% at parsed-value time,
+        // before being converted to an sRGB color.
+        if color_base.color_type == crate::css::color_conversion::HSL && index == 1 {
+            resolved = resolved.max(0.0);
+        }
+        Some(retain_new(StyleValueData::Number { value: resolved }))
+    };
+    let alpha = match alpha.optional_data() {
+        None => retained_null(),
+        Some(value) if is_none_keyword(value) => alpha.clone_retained(),
+        Some(value) => retain_new(StyleValueData::Number {
+            value: resolve_alpha(value, &EMPTY_INPUT)?,
+        }),
+    };
+    Some(StyleValueData::ColorFunction {
+        color_base: ColorBase {
+            color_syntax: COLOR_SYNTAX_MODERN,
+            ..*color_base
+        },
+        channel_0: resolve_channel(channel_0, 0)?,
+        channel_1: resolve_channel(channel_1, 1)?,
+        channel_2: resolve_channel(channel_2, 2)?,
+        alpha,
+        has_name: false,
+        name: CssString::none(),
+        origin_color: retained_null(),
+    })
+}
+
+/// Whether a value is an rgb(), hsl() or hwb() function that is not a relative color.
+fn is_absolute_srgb_function(value: &StyleValueData) -> bool {
+    matches!(value, StyleValueData::ColorFunction { color_base, origin_color, .. }
+        if color_base.has_color_type
+            && matches!(
+                color_base.color_type,
+                crate::css::color_conversion::RGB | crate::css::color_conversion::HSL | crate::css::color_conversion::HWB
+            )
+            && origin_color.optional_data().is_none())
+}
+
+/// Absolutizes an absolute rgb(), hsl() or hwb() function into the same function with resolved components.
+fn absolutize_srgb_function_keeping_form(
+    value: &StyleValueData,
+    context: &AbsolutizationContext,
+) -> Option<StyleValueData> {
+    let StyleValueData::ColorFunction {
+        color_base,
+        channel_0,
+        channel_1,
+        channel_2,
+        alpha,
+        ..
+    } = value
+    else {
+        return None;
+    };
+    let mut changed = false;
+    resolved_srgb_function_components(&StyleValueData::ColorFunction {
+        color_base: *color_base,
+        channel_0: absolutize_child(channel_0, context, &mut changed)?,
+        channel_1: absolutize_child(channel_1, context, &mut changed)?,
+        channel_2: absolutize_child(channel_2, context, &mut changed)?,
+        alpha: absolutize_child(alpha, context, &mut changed)?,
+        has_name: false,
+        name: CssString::none(),
+        origin_color: retained_null(),
+    })
+}
+
 /// Port of ColorFunctionStyleValue::absolutized: relative forms recurse their channels, alpha
 /// and origin; HSL and HWB resolve and convert to a legacy rgb() form; every other color
 /// function recurses its channels and alpha.
@@ -593,12 +659,16 @@ fn absolutize_color_function(value: &StyleValueData, context: &AbsolutizationCon
     let absolutized_alpha = absolutize_child(alpha, context, &mut changed)?;
 
     // https://drafts.csswg.org/css-color-5/#relative-color
-    if origin_color.optional_data().is_some() {
-        let absolutized_origin = absolutize_child(origin_color, context, &mut changed)?;
-        if !changed {
-            return Some(Absolutized::Unchanged);
-        }
-        return Some(Absolutized::Changed(retain_new(StyleValueData::ColorFunction {
+    if let Some(origin) = origin_color.optional_data() {
+        // NB: An rgb(), hsl() or hwb() origin color keeps its color function and full precision, rather than
+        //     computing to an 8-bit rgb() value, so that the relative color sees its exact components.
+        let absolutized_origin = if is_absolute_srgb_function(origin) {
+            changed = true;
+            retain_new(absolutize_srgb_function_keeping_form(origin, context)?)
+        } else {
+            absolutize_child(origin_color, context, &mut changed)?
+        };
+        let rebuilt = StyleValueData::ColorFunction {
             color_base: *color_base,
             channel_0: absolutized_c1,
             channel_1: absolutized_c2,
@@ -607,10 +677,57 @@ fn absolutize_color_function(value: &StyleValueData, context: &AbsolutizationCon
             has_name: *has_name,
             name: name.clone(),
             origin_color: absolutized_origin,
-        })));
+        };
+        // NB: Other properties keep currentcolor unresolved until the element's own color is available.
+        if !(context.current_color.is_none() && value_depends_on_current_color(&rebuilt))
+            && let Some(resolved) = resolve_relative_form(&rebuilt, &color_resolution_input(context))
+        {
+            return Some(Absolutized::Changed(retain_new(
+                crate::css::color_resolution::relative_color_computed_value_form(resolved),
+            )));
+        }
+        return Some(if changed {
+            Absolutized::Changed(retain_new(rebuilt))
+        } else {
+            Absolutized::Unchanged
+        });
     }
 
     let descriptor = descriptor_for_color_type(color_base.color_type);
+    let rebuilt = StyleValueData::ColorFunction {
+        color_base: *color_base,
+        channel_0: absolutized_c1,
+        channel_1: absolutized_c2,
+        channel_2: absolutized_c3,
+        alpha: absolutized_alpha,
+        has_name: *has_name,
+        name: name.clone(),
+        origin_color: retained_null(),
+    };
+
+    // https://drafts.csswg.org/css-color-4/#css-serialization-of-srgb
+    // An sRGB value with missing components keeps its color function, so that those components serialize as
+    // the none keyword.
+    if matches!(
+        color_base.color_type,
+        crate::css::color_conversion::RGB | crate::css::color_conversion::HSL | crate::css::color_conversion::HWB
+    ) && color_function_has_missing_component(&rebuilt)
+    {
+        return Some(Absolutized::Changed(retain_new(resolved_srgb_function_components(
+            &rebuilt,
+        )?)));
+    }
+    let StyleValueData::ColorFunction {
+        channel_0: absolutized_c1,
+        channel_1: absolutized_c2,
+        channel_2: absolutized_c3,
+        alpha: absolutized_alpha,
+        ..
+    } = &rebuilt
+    else {
+        unreachable!();
+    };
+
     if descriptor.absolutizes_to_rgb {
         // https://drafts.csswg.org/css-color-4/#resolving-sRGB-values
         let c1 = if descriptor.channels[0].is_hue {
@@ -645,17 +762,6 @@ fn absolutize_color_function(value: &StyleValueData, context: &AbsolutizationCon
         return Some(Absolutized::Changed(retain_new(canonical)));
     }
 
-    let rebuilt = StyleValueData::ColorFunction {
-        color_base: *color_base,
-        channel_0: absolutized_c1,
-        channel_1: absolutized_c2,
-        channel_2: absolutized_c3,
-        alpha: absolutized_alpha,
-        has_name: *has_name,
-        name: name.clone(),
-        origin_color: retained_null(),
-    };
-
     if color_base.color_type == crate::css::color_conversion::RGB
         && let Some(canonical) = canonical_legacy_rgb(&rebuilt)
     {
@@ -671,42 +777,34 @@ fn absolutize_color_function(value: &StyleValueData, context: &AbsolutizationCon
     Some(Absolutized::Changed(retain_new(rebuilt)))
 }
 
-/// Normalize the mix percentages, resolve relative color forms, and interpolate to a concrete
-/// color. When interpolation cannot complete, rebuild the color mix around its absolutized parts.
-// FIXME: Follow the spec algorithm. https://drafts.csswg.org/css-color-5/#calculate-a-color-mix
+/// Normalize the mix percentages, resolve relative color forms, and mix to a concrete color.
+/// When mixing cannot complete, rebuild the color mix around its absolutized parts.
+// https://drafts.csswg.org/css-color-5/#color-mix-result
 fn absolutize_color_mix(value: &StyleValueData, context: &AbsolutizationContext) -> Option<Absolutized> {
     let StyleValueData::ColorMix {
         color_interpolation_method,
-        first_color,
-        first_percentage,
-        second_color,
-        second_percentage,
+        colors,
+        percentages,
         ..
     } = value
     else {
         return None;
     };
 
-    // Port of normalize_percentages(): each present percentage absolutizes, then the pair
-    // normalizes per https://drafts.csswg.org/css-color-5/#color-mix-percent-norm.
-    let absolutized_percentage = |slot: &RetainedStyleValueData| -> Option<Option<f64>> {
-        if slot.optional_data().is_none() {
-            return Some(None);
-        }
-        let mut changed = false;
-        let absolutized = absolutize_child(slot, context, &mut changed)?;
-        Some(Some(percentage_from_style_value(absolutized.data())?))
-    };
-    let p1 = absolutized_percentage(first_percentage)?;
-    let p2 = absolutized_percentage(second_percentage)?;
-    let normalized = normalize_percentage_pair(p1, p2);
+    let mut percentages_changed = false;
+    let absolutized_percentages = absolutize_list(percentages, context, &mut percentages_changed)?;
+    let specified_percentages = absolutized_percentages
+        .iter()
+        .map(|percentage| match percentage.optional_data() {
+            None => Some(None),
+            Some(value) => Some(Some(percentage_from_style_value(value)?)),
+        })
+        .collect::<Option<Vec<_>>>()?;
 
     let input = color_resolution_input(context);
 
     let mut method_changed = false;
     let absolutized_method = absolutize_child(color_interpolation_method, context, &mut method_changed)?;
-
-    let delta = normalized.second_percentage / 100.0;
 
     // An absent method interpolates in the rectangular Oklab space.
     let default_method = StyleValueData::ColorInterpolationMethod {
@@ -718,45 +816,54 @@ fn absolutize_color_mix(value: &StyleValueData, context: &AbsolutizationContext)
 
     // Resolve relative-color components before interpolation so channel-keyword references
     // and `none` missing-channel markers are made visible during interpolation.
-    let resolve_if_relative = |color: &StyleValueData| -> Option<StyleValueData> {
-        if let StyleValueData::ColorFunction { origin_color, .. } = color
-            && origin_color.optional_data().is_some()
-        {
-            return resolve_relative_form(color, &input);
-        }
-        None
-    };
-    let resolved_first_storage = resolve_if_relative(first_color.data());
-    let resolved_second_storage = resolve_if_relative(second_color.data());
-    let resolved_first = resolved_first_storage.as_ref().unwrap_or(first_color.data());
-    let resolved_second = resolved_second_storage.as_ref().unwrap_or(second_color.data());
+    let resolved_colors: Vec<Option<StyleValueData>> = colors
+        .as_slice()
+        .iter()
+        .map(|color| {
+            if let StyleValueData::ColorFunction { origin_color, .. } = color.data()
+                && origin_color.optional_data().is_some()
+            {
+                return resolve_relative_form(color.data(), &input);
+            }
+            None
+        })
+        .collect();
+    let colors_for_mix = colors
+        .as_slice()
+        .iter()
+        .zip(&resolved_colors)
+        .map(|(color, resolved)| resolved.as_ref().unwrap_or(color.data()));
 
-    let interpolated = (|| -> Option<RetainedStyleValueData> {
-        let resolved_from = resolve_color_for_interpolation(resolved_first, &input)?;
-        let resolved_to = resolve_color_for_interpolation(resolved_second, &input)?;
-        let result = crate::css::color_interpolation::interpolate_color(
-            &resolved_from,
-            &resolved_to,
-            method,
-            delta as f32,
-            normalized.alpha_multiplier as f32,
-        )?;
-        Some(retain_new(result))
-    })();
-    if let Some(result) = interpolated {
-        return Some(Absolutized::Changed(result));
+    // NB: Without a currentcolor to resolve against, a mix reading it keeps the mix, which the color it is used as
+    //     resolves against the element's own color.
+    let reads_unknown_current_color = context.current_color.is_none()
+        && colors
+            .as_slice()
+            .iter()
+            .any(|color| color.optional_data().is_some_and(value_depends_on_current_color));
+    if !reads_unknown_current_color
+        && let Some(result) = calculate_a_color_mix(colors_for_mix, &specified_percentages, method, &input)
+    {
+        return Some(Absolutized::Changed(retain_new(result)));
     }
 
-    // Fall back to a color-mix() over absolutized values when interpolation cannot complete;
-    // currently that means a component relies on currentcolor.
+    // Fall back to a color-mix() over absolutized values when mixing cannot complete; currently
+    // that means a color relies on currentcolor.
     let mut colors_changed = false;
-    let absolutized_first = absolutize_child(first_color, context, &mut colors_changed)?;
-    let absolutized_second = absolutize_child(second_color, context, &mut colors_changed)?;
-    let percentage_matches = |slot: &RetainedStyleValueData, normalized_value: f64| matches!(slot.optional_data(), Some(StyleValueData::Percentage { value }) if *value == normalized_value);
-    if !colors_changed
-        && percentage_matches(first_percentage, normalized.first_percentage)
-        && percentage_matches(second_percentage, normalized.second_percentage)
-    {
+    let absolutized_colors = absolutize_list(colors, context, &mut colors_changed)?;
+    // NB: The percentages are kept as given, since normalizing them here would lose the alpha multiplier of a sum
+    //     under 100%. The mix normalizes them when it resolves.
+    let percentages_match =
+        percentages
+            .as_slice()
+            .iter()
+            .zip(&specified_percentages)
+            .all(|(slot, absolutized)| match (slot.optional_data(), absolutized) {
+                (None, None) => true,
+                (Some(StyleValueData::Percentage { value }), Some(absolutized)) => value == absolutized,
+                _ => false,
+            });
+    if !colors_changed && percentages_match {
         return Some(Absolutized::Unchanged);
     }
     Some(Absolutized::Changed(retain_new(StyleValueData::ColorMix {
@@ -766,70 +873,21 @@ fn absolutize_color_mix(value: &StyleValueData, context: &AbsolutizationContext)
             color_syntax: COLOR_SYNTAX_MODERN,
         },
         color_interpolation_method: absolutized_method,
-        first_color: absolutized_first,
-        first_percentage: retain_new(StyleValueData::Percentage {
-            value: normalized.first_percentage,
-        }),
-        second_color: absolutized_second,
-        second_percentage: retain_new(StyleValueData::Percentage {
-            value: normalized.second_percentage,
-        }),
+        colors: RetainedStyleValueDataList::from_retained_values(absolutized_colors),
+        percentages: RetainedStyleValueDataList::from_retained_values(
+            specified_percentages
+                .into_iter()
+                .map(|percentage| match percentage {
+                    Some(value) => retain_new(StyleValueData::Percentage { value }),
+                    None => retained_null(),
+                })
+                .collect(),
+        ),
     })))
 }
 
-// FIXME: Follow the spec algorithm. https://drafts.csswg.org/css-color-5/#calculate-a-color-mix
-fn absolutize_color_mix_with_resolved_children(
-    value: &StyleValueData,
-    map: &mut impl FnMut(&RetainedStyleValueData) -> Option<RetainedStyleValueData>,
-) -> Option<Absolutized> {
-    let StyleValueData::ColorMix {
-        color_interpolation_method,
-        first_color,
-        first_percentage,
-        second_color,
-        second_percentage,
-        ..
-    } = value
-    else {
-        return None;
-    };
-
-    let color_interpolation_method = map(color_interpolation_method)?;
-    let first_color = map(first_color)?;
-    let first_percentage = map(first_percentage)?;
-    let second_color = map(second_color)?;
-    let second_percentage = map(second_percentage)?;
-
-    let rebuilt = StyleValueData::ColorMix {
-        color_base: ColorBase {
-            has_color_type: false,
-            color_type: 0,
-            color_syntax: COLOR_SYNTAX_MODERN,
-        },
-        color_interpolation_method,
-        first_color,
-        first_percentage,
-        second_color,
-        second_percentage,
-    };
-
-    if !value_depends_on_current_color(&rebuilt)
-        && let Some(color) =
-            crate::css::color_resolution::resolve_color_mix(&rebuilt, &crate::css::color_resolution::EMPTY_INPUT)
-    {
-        return Some(Absolutized::Changed(retain_new(color)));
-    }
-
-    if rebuilt == *value {
-        Some(Absolutized::Unchanged)
-    } else {
-        Some(Absolutized::Changed(retain_new(rebuilt)))
-    }
-}
-
 /// The gradient absolutizers recurse their Rust-owned children and rebuild the retained stop
-/// list in place. The C++ linear gradient absolutization leaves the direction untouched, so this
-/// does too.
+/// list in place.
 fn absolutize_gradient(value: &StyleValueData, context: &AbsolutizationContext) -> Option<Absolutized> {
     let mut changed = false;
     let absolutize_stops = |color_stop_list: &crate::css::style_value::RetainedColorStopList,
@@ -864,13 +922,13 @@ fn absolutize_gradient(value: &StyleValueData, context: &AbsolutizationContext) 
             color_interpolation_method,
             color_syntax,
         } => {
-            // The C++ recursion deliberately leaves the direction untouched.
+            let direction_value = absolutize_child(direction_value, context, &mut changed)?;
             let color_stop_list = absolutize_stops(color_stop_list, &mut changed)?;
             let color_interpolation_method = absolutize_child(color_interpolation_method, context, &mut changed)?;
             if changed {
                 Some(Absolutized::Changed(retain_new(StyleValueData::LinearGradient {
                     has_direction_value: *has_direction_value,
-                    direction_value: direction_value.clone_retained(),
+                    direction_value,
                     side_or_corner: *side_or_corner,
                     color_stop_list,
                     gradient_type: *gradient_type,
@@ -1028,6 +1086,7 @@ fn absolutize_basic_shape(
         fill_rule,
         points,
         path,
+        commands,
     } = value.basic_shape()?;
     // Absolutizes a freshly built 100%-minus calculation for the inset lowering.
     let flipped = |values: &[&StyleValueData],
@@ -1073,6 +1132,7 @@ fn absolutize_basic_shape(
                     fill_rule: *fill_rule,
                     points: points.clone(),
                     path: path.clone(),
+                    commands: crate::css::style_value::ShapeCommands::default(),
                 }),
             })))
         }
@@ -1119,6 +1179,7 @@ fn absolutize_basic_shape(
                     fill_rule: *fill_rule,
                     points: points.clone(),
                     path: path.clone(),
+                    commands: crate::css::style_value::ShapeCommands::default(),
                 }),
             })))
         }
@@ -1140,16 +1201,49 @@ fn absolutize_basic_shape(
                     fill_rule: *fill_rule,
                     points: points.clone(),
                     path: path.clone(),
+                    commands: crate::css::style_value::ShapeCommands::default(),
                 }),
             })))
         }
-        5 => {
+        // polygon() and shape() hold their coordinates as points.
+        5 | 7 => {
             let mut changed = false;
             let mut absolutized_points = Vec::with_capacity(points.as_slice().len());
+            // https://drafts.csswg.org/css-shapes-1/#shape-function
+            // A horizontal or vertical line to a side keyword draws to that position.
+            let keyword_as_percentage = |value: &RetainedStyleValueData, changed: &mut bool| {
+                let percentage = match value.optional_data() {
+                    Some(StyleValueData::Keyword { keyword }) => match *keyword {
+                        keyword::LEFT | keyword::TOP | keyword::X_START | keyword::Y_START => 0.0,
+                        keyword::CENTER => 50.0,
+                        keyword::RIGHT | keyword::BOTTOM | keyword::X_END | keyword::Y_END => 100.0,
+                        _ => return value.clone_retained(),
+                    },
+                    _ => return value.clone_retained(),
+                };
+                *changed = true;
+                retain_new(StyleValueData::Percentage { value: percentage })
+            };
+            // NB: Drop resolved position wrappers so positions and explicit coordinate pairs have
+            //     identical computed representations, including implicit and explicit "from origin".
+            let mut resolve_coordinate = |value: &RetainedStyleValueData, changed: &mut bool| {
+                let value = resolve(&keyword_as_percentage(value, changed), changed)?;
+                if let Some(StyleValueData::Edge {
+                    has_edge: false,
+                    offset,
+                    ..
+                }) = value.optional_data()
+                {
+                    *changed = true;
+                    Some(offset.clone_retained())
+                } else {
+                    Some(value)
+                }
+            };
             for point in points.as_slice() {
                 let [x, y] = point.values();
-                let x = resolve(x, &mut changed)?;
-                let y = resolve(y, &mut changed)?;
+                let x = resolve_coordinate(x, &mut changed)?;
+                let y = resolve_coordinate(y, &mut changed)?;
                 absolutized_points.push(crate::css::style_value::RetainedShapePoint::from_retained_values(x, y));
             }
             if !changed {
@@ -1157,7 +1251,7 @@ fn absolutize_basic_shape(
             }
             Some(Absolutized::Changed(retain_new(StyleValueData::BasicShape {
                 shape: OwnedBasicShapeData::new(BasicShapeData {
-                    kind: 5,
+                    kind: *kind,
                     v0: v0.clone_retained(),
                     v1: v1.clone_retained(),
                     v2: v2.clone_retained(),
@@ -1166,6 +1260,7 @@ fn absolutize_basic_shape(
                     fill_rule: *fill_rule,
                     points: crate::css::style_value::RetainedShapePointList::from_retained_points(absolutized_points),
                     path: path.clone(),
+                    commands: commands.clone(),
                 }),
             })))
         }
@@ -1276,11 +1371,12 @@ fn absolutize_easing(
         y2,
         number_of_intervals,
         step_position,
+        is_keyword,
     } = value
     else {
         return None;
     };
-    let mut changed = false;
+    let mut changed = *is_keyword;
     let mut stops = Vec::with_capacity(linear_stops.as_slice().len());
     for stop in linear_stops.as_slice() {
         let [output, input] = stop.values();
@@ -1312,6 +1408,7 @@ fn absolutize_easing(
         y2,
         number_of_intervals,
         step_position: *step_position,
+        is_keyword: false,
     })))
 }
 
@@ -1379,83 +1476,15 @@ fn map_grid_values(
     })
 }
 
-/// Resolve context-dependent leaves without materializing a C++ composite value graph.
-///
-/// # Safety
-/// The value must be a live supported composite value. The callback must return one retained reference
-/// for each borrowed leaf and must not mutate the input graph.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_composite_style_value_absolutize(
-    value: &StyleValueData,
-    context: *const core::ffi::c_void,
-    resolve: unsafe extern "C" fn(*const core::ffi::c_void, &StyleValueData) -> *const StyleValueData,
-) -> *const StyleValueData {
-    let mut map = |child: &RetainedStyleValueData| {
-        Some(match child.optional_data() {
-            None => child.clone(),
-            Some(data) => unsafe { RetainedStyleValueData::from_retained_pointer(resolve(context, data)) },
-        })
-    };
-    let color_result = match value {
-        StyleValueData::ColorMix { .. } => absolutize_color_mix_with_resolved_children(value, &mut map),
-        StyleValueData::ContrastColor { color, .. } => map(color).map(|mapped| {
-            let rebuilt = StyleValueData::ContrastColor {
-                color_base: ColorBase {
-                    has_color_type: false,
-                    color_type: 0,
-                    color_syntax: COLOR_SYNTAX_MODERN,
-                },
-                color: mapped,
-            };
-            if !value_depends_on_current_color(&rebuilt)
-                && let Some(resolved) = to_color(&rebuilt, &EMPTY_INPUT)
-            {
-                return Absolutized::Changed(retain_new(rgb_color_function(
-                    f64::from(resolved.r),
-                    f64::from(resolved.g),
-                    f64::from(resolved.b),
-                    f64::from(resolved.a) / 255.0,
-                    COLOR_SYNTAX_MODERN,
-                )));
-            }
-            if rebuilt == *value {
-                Absolutized::Unchanged
-            } else {
-                Absolutized::Changed(retain_new(rebuilt))
-            }
-        }),
-        _ => None,
-    };
-    let mut resolve_child = |child: &RetainedStyleValueData, changed: &mut bool| {
-        let mapped = map(child)?;
-        *changed |= mapped != *child;
-        Some(mapped)
-    };
-    let result = if let Some(result) = color_result {
-        result
-    } else {
-        match value {
-            StyleValueData::BasicShape { .. } => absolutize_basic_shape(value, &mut resolve_child),
-            StyleValueData::Easing { .. } => absolutize_easing(value, &mut resolve_child),
-            StyleValueData::ColorMix { .. } | StyleValueData::ContrastColor { .. } => unreachable!(),
-            _ => {
-                let mapped = map_grid_values(value, &mut map).unwrap();
-                Some(if mapped == *value {
-                    Absolutized::Unchanged
-                } else {
-                    Absolutized::Changed(retain_new(mapped))
-                })
-            }
-        }
-        .unwrap()
-    };
-    if let Absolutized::Changed(mapped) = result {
-        let pointer = mapped.pointer();
-        core::mem::forget(mapped);
-        pointer
-    } else {
-        unsafe { Arc::increment_strong_count(value) };
-        value
+/// Canonicalizes the control points of a `linear()` easing function: resolves each one's
+/// calculated values and interpolates the inputs it was not given.
+pub(crate) fn canonicalize_linear_easing(value: &StyleValueData) -> RetainedStyleValueData {
+    match absolutize_easing(value, &mut |child, _| Some(child.clone())) {
+        Some(Absolutized::Changed(canonical)) => canonical,
+        // SAFETY: The caller's reference keeps the value alive while it gains one.
+        _ => unsafe {
+            RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(value))
+        },
     }
 }
 
@@ -1812,16 +1841,64 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
         StyleValueData::Transformation {
             property,
             transform_function,
-            values,
+            values: original_values,
+            matrix_values,
+            ..
         } => {
             let mut changed = false;
-            let values = absolutize_list(values, context, &mut changed)?;
+            let mut values = absolutize_list(original_values, context, &mut changed)?;
+            // https://drafts.csswg.org/css-viewport/#zoom-property
+            // NB: The translation of a matrix is a length given in pixels, which zoom applies to as it does to a
+            //     <length>.
+            let translation = match *transform_function {
+                crate::css::serialize::transform_function::MATRIX => 4..6,
+                crate::css::serialize::transform_function::MATRIX3D => 12..15,
+                _ => 0..0,
+            };
+            let zoom = context.length.zoom;
+            if zoom != 1.0 && !translation.is_empty() && values.len() >= translation.end {
+                for value in &mut values[translation] {
+                    if let Some(StyleValueData::Number { value: number }) = value.optional_data() {
+                        *value = retain_new(StyleValueData::Number { value: number * zoom });
+                        changed = true;
+                    }
+                }
+            }
+            let mut retained_matrix_values = crate::css::style_value::map_transform_matrix_values(
+                original_values.as_slice(),
+                &values,
+                matrix_values.as_slice(),
+            )
+            .as_slice()
+            .to_vec();
+            let original_values = original_values.as_slice();
+            let parameters = crate::css::serialize::TRANSFORM_FUNCTION_PARAMETER_TYPES[*transform_function as usize];
+            for (index, original) in original_values.iter().enumerate() {
+                if parameters.get(index) != Some(&crate::css::table_group_builder::TRANSFORM_PARAMETER_ANGLE)
+                    || !matches!(original.data(), StyleValueData::Angle { value, .. } if value.is_finite())
+                    || (!retained_matrix_values.is_empty()
+                        && retained_matrix_values[index].data() != values[index].data())
+                {
+                    continue;
+                }
+                let precise = crate::css::table_group_builder::transform_angle_radians(original.data()) as f32;
+                let canonical = crate::css::table_group_builder::transform_angle_radians(values[index].data()) as f32;
+                if precise.to_bits() != canonical.to_bits() {
+                    if retained_matrix_values.is_empty() {
+                        retained_matrix_values = values.clone();
+                    }
+                    retained_matrix_values[index] = original.clone_retained();
+                }
+            }
+            let retained_matrix_values = RetainedStyleValueDataList::from_retained_values(retained_matrix_values);
+            changed |= retained_matrix_values != *matrix_values;
             rebuild!(
                 changed,
                 StyleValueData::Transformation {
                     property: *property,
                     transform_function: *transform_function,
                     values: RetainedStyleValueDataList::from_retained_values(values),
+                    matrix_values: retained_matrix_values,
                 }
             )
         }
@@ -1903,7 +1980,7 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
             calc_length_context.resolved_viewport_relative_length = &raw mut tracked;
             let outcome = crate::css::calc::absolutize_calculation_value(
                 value,
-                (&raw const calc_length_context).cast(),
+                &calc_length_context,
                 context.tree_counting,
                 context.random_base_values,
             );
@@ -1923,6 +2000,24 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
             }
         }
         StyleValueData::Edge { .. } => absolutize_edge(value, context),
+        StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. } => {
+            let mut tracked = false;
+            let mut calc_length_context = *context.length;
+            calc_length_context.resolved_viewport_relative_length = &raw mut tracked;
+            let outcome = crate::css::calc::absolutize_anchor_function(
+                value,
+                &calc_length_context,
+                context.tree_counting,
+                context.random_base_values,
+            );
+            if tracked {
+                context.resolved_viewport_relative_length.set(true);
+            }
+            match outcome? {
+                None => Some(Absolutized::Unchanged),
+                Some(absolutized) => Some(Absolutized::Changed(retain_new(absolutized))),
+            }
+        }
         StyleValueData::Position { edge_x, edge_y } => {
             let mut changed = false;
             let edge_x = absolutize_child(edge_x, context, &mut changed)?;
@@ -1932,6 +2027,25 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
 
         StyleValueData::BasicShape { .. } => {
             absolutize_basic_shape(value, &mut |child, changed| absolutize_child(child, context, changed))
+        }
+        StyleValueData::Ray {
+            size,
+            contain,
+            angle,
+            position,
+        } => {
+            let mut changed = false;
+            let angle = absolutize_child(angle, context, &mut changed)?;
+            let position = absolutize_child(position, context, &mut changed)?;
+            rebuild!(
+                changed,
+                StyleValueData::Ray {
+                    size: *size,
+                    contain: *contain,
+                    angle,
+                    position,
+                }
+            )
         }
 
         StyleValueData::Cursor { image, x, y } => {
@@ -2018,8 +2132,81 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
                 }
             })))
         }
+        StyleValueData::Url {
+            url,
+            url_type,
+            modifiers,
+        } => {
+            // https://drafts.csswg.org/css-values-4/#local-urls
+            // When serializing a url() with the local url flag set, it must serialize as just the fragment.
+            if url.is_empty() || url.is_fragment() {
+                return Some(Absolutized::Unchanged);
+            }
+
+            // https://drafts.csswg.org/css-values-4/#relative-urls
+            // When a <url> appears in the computed value of a property, it is resolved to an absolute URL.
+            // The computed value of a URL that the UA cannot resolve to an absolute URL is the specified value.
+            let resolved_url = liburl_rust::basic_parse(url.url_input(), liburl_rust::BasicParseOptions::new())
+                .or_else(|| {
+                    let base_url = context
+                        .style_sheet_resource_context
+                        .map(|resource_context| resource_context.base_url)
+                        .filter(|base_url| !base_url.is_empty())
+                        .unwrap_or(context.document_base_url);
+                    let base_url = std::str::from_utf8(base_url).ok()?;
+                    let base_url = liburl_rust::basic_parse(base_url, liburl_rust::BasicParseOptions::new())?;
+                    liburl_rust::basic_parse(
+                        url.url_input(),
+                        liburl_rust::BasicParseOptions::new().base_url(&base_url),
+                    )
+                });
+            let Some(resolved_url) = resolved_url else {
+                return Some(Absolutized::Unchanged);
+            };
+            Some(Absolutized::Changed(retain_new(StyleValueData::Url {
+                url: crate::css::style_value::RetainedString::from_ascii(resolved_url.into()),
+                url_type: *url_type,
+                modifiers: modifiers.clone(),
+            })))
+        }
         StyleValueData::Image { .. } => absolutize_image(value, context),
-        StyleValueData::RandomValueSharing { .. } => None,
+        // https://drafts.csswg.org/css-values-5/#random-caching
+        // If the random function's <random-value-sharing> is fixed <number>, the random base value is that number.
+        // Otherwise, it is the base value drawn for the function's random caching key.
+        StyleValueData::RandomValueSharing {
+            fixed_value,
+            is_auto,
+            has_name,
+            name,
+            element_shared,
+        } => {
+            if fixed_value.optional_data().is_some() {
+                let mut changed = false;
+                let fixed_value = absolutize_child(fixed_value, context, &mut changed)?;
+                return rebuild!(
+                    changed,
+                    StyleValueData::RandomValueSharing {
+                        fixed_value,
+                        is_auto: *is_auto,
+                        has_name: *has_name,
+                        name: name.clone(),
+                        element_shared: *element_shared,
+                    }
+                );
+            }
+            let base_value = context
+                .random_base_values
+                .iter()
+                .find(|base_value| std::ptr::eq(base_value.source.cast(), value))?
+                .value;
+            Some(Absolutized::Changed(retain_new(StyleValueData::RandomValueSharing {
+                fixed_value: retain_new(StyleValueData::Number { value: base_value }),
+                is_auto: false,
+                has_name: false,
+                name: CssString::none(),
+                element_shared: false,
+            })))
+        }
 
         StyleValueData::ColorFunction { .. } => absolutize_color_function(value, context),
         StyleValueData::ColorMix { .. } => absolutize_color_mix(value, context),
@@ -2094,75 +2281,142 @@ pub(crate) fn absolutize(value: &StyleValueData, context: &AbsolutizationContext
     }
 }
 
-/// The absolutization outcome kinds for the FFI entry.
-pub const ABSOLUTIZED_DECLINED: u8 = 0;
-pub const ABSOLUTIZED_UNCHANGED: u8 = 1;
-pub const ABSOLUTIZED_CHANGED: u8 = 2;
-
-/// The FFI result: `data` carries one strong reference when kind is changed.
+/// The facts of the element a C++ caller computes a value for, which Rust asks for only when a
+/// value needs them.
 #[repr(C)]
-pub struct FfiAbsolutizedValue {
-    pub kind: u8,
-    pub data: *const core::ffi::c_void,
+pub struct FfiElementFacts {
+    pub has_element: bool,
+    pub callback_context: *const core::ffi::c_void,
+    /// Fills in the container bases that the given container-relative units read, into the
+    /// given copy of the length resolution context.
+    pub fill_container_bases: unsafe extern "C" fn(*const core::ffi::c_void, u8, *mut core::ffi::c_void),
+    /// Writes the element's sibling count and index. False when there is no element.
+    pub tree_counting: unsafe extern "C" fn(*const core::ffi::c_void, &mut u64, &mut u64) -> bool,
+    /// Draws the random base value of a random caching key. False when there is no element.
+    pub random_base_value: unsafe extern "C" fn(*const core::ffi::c_void, *const u16, usize, bool, &mut f64) -> bool,
 }
 
-/// Absolutizes a style value for the C++ dispatch outside the style drive: container and
-/// feature queries, custom property registration and counter-style definitions. Declines
-/// exactly where the in-drive recursion declines.
+impl FfiElementFacts {
+    pub(crate) fn fill_container_bases(&self, unit_mask: u8, length: &mut FfiLengthResolutionContext) {
+        unsafe { (self.fill_container_bases)(self.callback_context, unit_mask, std::ptr::from_mut(length).cast()) };
+    }
+
+    pub(crate) fn tree_counting(&self) -> Option<(u64, u64)> {
+        let (mut sibling_count, mut sibling_index) = (0, 0);
+        unsafe { (self.tree_counting)(self.callback_context, &mut sibling_count, &mut sibling_index) }
+            .then_some((sibling_count, sibling_index))
+    }
+
+    pub(crate) fn random_base_value(&self, name: &[u16], element_shared: bool) -> Option<f64> {
+        let mut value = 0.0;
+        unsafe {
+            (self.random_base_value)(
+                self.callback_context,
+                name.as_ptr(),
+                name.len(),
+                element_shared,
+                &mut value,
+            )
+        }
+        .then_some(value)
+    }
+}
+
+/// Absolutizes a value outside the style drive, asking the element's facts for what the value
+/// needs.
+pub(crate) fn absolutize_with_element_facts(
+    value: &StyleValueData,
+    length: &FfiLengthResolutionContext,
+    scheme: Option<u8>,
+    document_base_url: &[u8],
+    facts: Option<&FfiElementFacts>,
+) -> Option<Absolutized> {
+    let dependencies = crate::css::style_compute::collect_external_value_dependencies(value);
+    let mut length = *length;
+    let mut tree_counting = None;
+    let mut random_base_values = Vec::new();
+    if let Some(facts) = facts {
+        if dependencies.container_relative_length_unit_mask != 0 {
+            facts.fill_container_bases(dependencies.container_relative_length_unit_mask, &mut length);
+        }
+        if dependencies.uses_tree_counting_function {
+            tree_counting = facts.tree_counting();
+        }
+        if dependencies.has_unfixed_random_sharing {
+            let mut sharings = Vec::new();
+            crate::css::style_compute::collect_unfixed_random_sharings_in_value(value, &mut sharings);
+            for sharing in sharings {
+                // SAFETY: The value retains every sharing in it.
+                let (name, element_shared) = crate::css::style_compute::random_caching_key(unsafe { &*sharing });
+                if let Some(base_value) = facts.random_base_value(name, element_shared) {
+                    random_base_values.push(crate::css::style_compute::FfiRandomBaseValue {
+                        source: sharing.cast(),
+                        value: base_value,
+                    });
+                }
+            }
+        }
+    }
+    // The length context records a viewport-relative resolution through its own flag.
+    absolutize(
+        value,
+        &AbsolutizationContext {
+            length: &length,
+            scheme,
+            resolved_viewport_relative_length: Cell::new(false),
+            tree_counting,
+            random_base_values: &random_base_values,
+            document_base_url,
+            style_sheet_resource_context: None,
+            current_color: None,
+        },
+    )
+}
+
+/// What a C++ caller outside the style drive gives an absolutization.
+#[repr(C)]
+pub struct FfiAbsolutizationContext {
+    /// The length resolution context, as an opaque pointer since its type lives in the computed
+    /// values header.
+    pub length: *const core::ffi::c_void,
+    pub has_scheme: bool,
+    pub scheme: u8,
+    pub document_base_url: *const u8,
+    pub document_base_url_length: usize,
+    pub element_facts: FfiElementFacts,
+}
+
+/// Absolutizes a style value for a C++ caller outside the style drive. Returns one strong
+/// reference to the new value, or null when the value computes to itself.
 ///
 /// # Safety
-/// `value` must point at live style value data; `length` may be null or point at a valid
-/// length resolution context outliving the call.
+/// `context`'s pointers must be valid for the call, and its callbacks must accept its callback
+/// context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_absolutize(
-    value: *const core::ffi::c_void,
-    length: *const core::ffi::c_void,
-    has_scheme: bool,
-    scheme: u8,
-) -> FfiAbsolutizedValue {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StyleValueQueryEntry);
-    let value = unsafe { &*value.cast::<StyleValueData>() };
-    let length = unsafe { length.cast::<FfiLengthResolutionContext>().as_ref() };
-    // Without a length context the recursion still handles everything that does not
-    // resolve lengths; a zeroed context would silently mis-resolve, so decline instead.
-    let Some(length) = length else {
-        return match value {
-            value if crate::css::style_compute::value_absolutization_is_identity(value) => FfiAbsolutizedValue {
-                kind: ABSOLUTIZED_UNCHANGED,
-                data: core::ptr::null(),
-            },
-            _ => FfiAbsolutizedValue {
-                kind: ABSOLUTIZED_DECLINED,
-                data: core::ptr::null(),
-            },
-        };
+    value: &StyleValueData,
+    context: &FfiAbsolutizationContext,
+) -> *const StyleValueData {
+    let document_base_url = if context.document_base_url_length == 0 {
+        &[][..]
+    } else {
+        unsafe { ak::slice_from_raw_parts(context.document_base_url, context.document_base_url_length) }
     };
-    let context = AbsolutizationContext {
-        length,
-        scheme: has_scheme.then_some(scheme),
-        resolved_viewport_relative_length: Cell::new(false),
-        tree_counting: None,
-        random_base_values: &[],
-        document_base_url: &[],
-        style_sheet_resource_context: None,
-    };
-    match absolutize(value, &context) {
-        Some(Absolutized::Unchanged) => FfiAbsolutizedValue {
-            kind: ABSOLUTIZED_UNCHANGED,
-            data: core::ptr::null(),
-        },
+    match absolutize_with_element_facts(
+        value,
+        unsafe { &*context.length.cast::<FfiLengthResolutionContext>() },
+        context.has_scheme.then_some(context.scheme),
+        document_base_url,
+        Some(&context.element_facts),
+    ) {
         Some(Absolutized::Changed(new_value)) => {
             let pointer = new_value.pointer();
             core::mem::forget(new_value);
-            FfiAbsolutizedValue {
-                kind: ABSOLUTIZED_CHANGED,
-                data: pointer.cast(),
-            }
+            pointer
         }
-        None => FfiAbsolutizedValue {
-            kind: ABSOLUTIZED_DECLINED,
-            data: core::ptr::null(),
-        },
+        // A value whose facts are missing, like a tree-counting function without an element,
+        // computes to itself.
+        Some(Absolutized::Unchanged) | None => core::ptr::null(),
     }
 }
 

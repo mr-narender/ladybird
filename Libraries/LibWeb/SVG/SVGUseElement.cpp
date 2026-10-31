@@ -7,15 +7,16 @@
 
 #include <LibGC/Heap.h>
 #include <LibGC/HeapHashTable.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
@@ -45,12 +46,14 @@ void SVGUseElement::initialize_element()
     set_shadow_root(shadow_root);
 
     m_document_observer = DOM::DocumentObserver::create(document());
-    m_document_observer->set_document_completely_loaded([this]() {
-        // The href processing path already populated the shadow tree for resolved references,
-        // unless the referenced subtree changed while the document was still loading.
-        if (instance_root() && !m_needs_document_complete_reclone)
+    m_document_observer->set_document_readiness_observer([this](HTML::DocumentReadyState readiness) {
+        if (readiness != HTML::DocumentReadyState::Interactive)
             return;
-        m_needs_document_complete_reclone = false;
+        // The href processing path already populated the shadow tree for resolved references,
+        // unless the referenced subtree changed while the document was still being parsed.
+        if (instance_root() && !m_needs_parsing_complete_reclone)
+            return;
+        m_needs_parsing_complete_reclone = false;
         clone_element_tree_as_our_shadow_tree(referenced_element());
     });
 }
@@ -206,27 +209,6 @@ bool SVGUseElement::is_referenced_element_same_document() const
     return m_href->equals(document().base_url(), URL::ExcludeFragment::Yes);
 }
 
-Gfx::AffineTransform SVGUseElement::additional_element_transform() const
-{
-    CSSPixelSize viewport_size;
-    if (auto* svg_svg_element = first_flat_tree_ancestor_of_type<SVGSVGElement>()) {
-        if (auto view_box = svg_svg_element->active_view_box(); view_box.has_value())
-            viewport_size = { CSSPixels::nearest_value_for(view_box->width), CSSPixels::nearest_value_for(view_box->height) };
-        else if (auto svg_svg_layout_node = svg_svg_element->unsafe_layout_node())
-            viewport_size = { svg_svg_layout_node->width().to_px(0), svg_svg_layout_node->height().to_px(0) };
-    }
-
-    auto computed_values = this->computed_style();
-    VERIFY(computed_values);
-
-    auto x = computed_values->x().to_px(viewport_size.width()).to_float();
-    auto y = computed_values->y().to_px(viewport_size.height()).to_float();
-
-    // The x and y properties define an additional transformation (translate(x,y), where x and y represent the computed value of the corresponding property)
-    // to be applied to the ‘use’ element, after any transformations specified with other properties
-    return Gfx::AffineTransform {}.translate(x, y);
-}
-
 void SVGUseElement::svg_element_changed(SVGElement& svg_element)
 {
     auto to_clone = referenced_element();
@@ -240,7 +222,7 @@ void SVGUseElement::svg_element_changed(SVGElement& svg_element)
     }
 }
 
-void SVGUseElement::svg_element_changed_before_document_complete(SVGElement& svg_element)
+void SVGUseElement::svg_element_changed_before_parsing_complete(SVGElement& svg_element)
 {
     auto to_clone = referenced_element();
     if (!to_clone)
@@ -248,7 +230,7 @@ void SVGUseElement::svg_element_changed_before_document_complete(SVGElement& svg
 
     // NOTE: We need to check the ancestor because attribute_changed of a child doesn't call children_changed on the parent(s)
     if (to_clone == GC::Ref { svg_element } || to_clone->is_ancestor_of(svg_element))
-        m_needs_document_complete_reclone = true;
+        m_needs_parsing_complete_reclone = true;
 }
 
 void SVGUseElement::svg_element_removed(SVGElement& svg_element)
@@ -290,11 +272,20 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
 // https://svgwg.org/svg2-draft/linking.html#processingURL-fetch
 void SVGUseElement::fetch_the_document(URL::URL const& url)
 {
+    // AD-HOC: An element in a temporary document for fragment parsing does not fetch anything, so that markup parsed
+    //         into such a document, for example by the Sanitizer API, causes no network requests for elements that
+    //         are never inserted anywhere. The document is fetched once the element is adopted into another document.
+    if (document().is_temporary_document_for_fragment_parsing())
+        return;
+
     m_load_event_delayer.emplace(document());
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url, HTML::CORSSettingAttribute::NoCORS);
     m_resource_request->add_callbacks(
         [this] {
             clone_element_tree_as_our_shadow_tree(referenced_element());
+            m_load_event_delayer.clear();
+        },
+        [this] {
             m_load_event_delayer.clear();
         },
         [this] {
@@ -303,7 +294,7 @@ void SVGUseElement::fetch_the_document(URL::URL const& url)
 
     if (m_resource_request->needs_fetching()) {
         auto request = HTML::create_potential_CORS_request(url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
-        request->set_client(&document().relevant_settings_object());
+        request->set_client(document().relevant_settings_object().address());
         m_resource_request->fetch_resource(request);
     }
 }
@@ -395,9 +386,9 @@ GC::Ptr<SVGElement> SVGUseElement::instance_root() const
     return const_cast<DOM::ShadowRoot&>(*shadow_root()).first_child_of_type<SVGElement>();
 }
 
-Layout::Node* SVGUseElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind SVGUseElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGGraphicsBox);
+    return CSS::ElementBoxKind::SvgGraphics;
 }
 
 }

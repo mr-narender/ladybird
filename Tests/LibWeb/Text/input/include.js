@@ -60,6 +60,16 @@ async function waitForCondition(condition, attempts = 600, interval = 25) {
     return true;
 }
 
+// Each round runs in a task of its own, so that pending tasks can drop their references and the objects that WeakRefs
+// kept alive for an earlier job are released.
+async function collectGarbageUntilCleared(weakRefs, rounds = 100) {
+    for (let round = 0; round < rounds; ++round) {
+        await timeout(0);
+        await internals.gcAsync();
+        if (weakRefs.every(weakRef => weakRef.deref() === undefined)) return;
+    }
+}
+
 async function setSystemVisibilityState(state) {
     // Tests assume that the document reflects the UI process's system visibility state and that
     // no previous visibility state change is still pending.
@@ -101,12 +111,61 @@ async function scrollSettled(target, action) {
     await scrollend;
 }
 
+function __describeNodeOfInputHook(node, documentName = "document") {
+    // A nested document comes from another realm, whose Document it is an instance of.
+    if (node.nodeType === Node.DOCUMENT_NODE) return node === document ? documentName : `nested ${documentName}`;
+    if (node.id) return `#${node.id}`;
+    return node.nodeName.toLowerCase();
+}
+
+function __describeScrollerOfInputHook(result) {
+    if (!result.scroller) return "";
+    let description = ` scroller=${__describeNodeOfInputHook(result.scroller, "viewport")}`;
+    if (result.scrollerPseudoElement) description += `::${result.scrollerPseudoElement}`;
+    return description;
+}
+
+// Describes where internals.compositorWheelTargetAt() or internals.recordedDisplayListWheelTargetAt() says a wheel step
+// goes.
+function wheelTargetToString(target) {
+    return `${target.decision}${__describeScrollerOfInputHook(target)}`;
+}
+
+// Whether the compositor, holding a frame of this document, would scroll the first step of a wheel gesture at the
+// position itself.
+function compositorScrollsWheelStepAt(x, y, deltaX, deltaY) {
+    const target = internals.compositorWheelTargetAt(x, y, deltaX, deltaY);
+    return target.document === document && target.decision === "latched";
+}
+
+// Prints what internals.takeInputTrace() returned, one routing decision per line, optionally only those of the given
+// stages. Input events are numbered in the order they first appear, as the ids the UI gives them keep growing from test
+// to test; input that did not come from the UI is marked "-".
+function printInputTrace(trace, { stages } = {}) {
+    const eventNumbers = new Map();
+    for (const record of trace) {
+        let eventNumber = "-";
+        if (record.id !== 0) {
+            if (!eventNumbers.has(record.id)) eventNumbers.set(record.id, eventNumbers.size + 1);
+            eventNumber = `#${eventNumbers.get(record.id)}`;
+        }
+        if (stages && !stages.includes(record.stage)) continue;
+        let line = `${eventNumber} ${record.stage}: ${record.decision}${__describeScrollerOfInputHook(record)}`;
+        if (record.target) line += ` target=${__describeNodeOfInputHook(record.target)}`;
+        println(line);
+    }
+}
+
+// The offset has stopped once it holds for as long as five frames take at 60 Hz, however often frames come.
 async function scrollOffsetStopsChanging(readScrollOffset) {
-    let previousScrollOffset = null;
-    while (previousScrollOffset !== readScrollOffset()) {
-        previousScrollOffset = readScrollOffset();
-        for (let frame = 0; frame < 5; frame++) {
-            await animationFrame();
+    const settleDuration = (5 * 1000) / 60;
+    let scrollOffset = readScrollOffset();
+    let lastChangeTime = performance.now();
+    while (performance.now() - lastChangeTime < settleDuration) {
+        await animationFrame();
+        if (readScrollOffset() !== scrollOffset) {
+            scrollOffset = readScrollOffset();
+            lastChangeTime = performance.now();
         }
     }
 }
@@ -176,12 +235,23 @@ function promiseTest(f) {
     });
 }
 
+let __pageEchoScope = null;
+
+// The echo server, the HTTP cache and the cookie jar are shared by every test and every --repeat run, so echo paths
+// are scoped to the page that creates them. A test that spans page loads names a scope of its own to share them.
 class HTTPTestServer {
-    constructor(baseURL) {
+    constructor(baseURL, echoScope = null) {
         this.baseURL = baseURL;
+        this.echoScope = echoScope;
+    }
+    withEchoScope(echoScope) {
+        return new HTTPTestServer(this.baseURL, echoScope);
+    }
+    echoURL(path) {
+        return `${this.baseURL}${this.#echoPath(path)}`;
     }
     async createEcho(method, path, options) {
-        const echoPath = `/echo${path}`;
+        const echoPath = this.#echoPath(path);
         const result = await fetch(`${this.baseURL}/echo`, {
             method: "POST",
             headers: {
@@ -194,8 +264,25 @@ class HTTPTestServer {
         }
         return `${this.baseURL}${echoPath}`;
     }
+    recordedRequestHeadersURL(echoURL) {
+        return `${this.baseURL}/recorded-request-headers${new URL(echoURL).pathname}`;
+    }
+    // Resolves once the echo server has seen a request for echoURL, query included.
+    async waitForRequest(echoURL) {
+        const url = new URL(echoURL);
+        const recordedURL = `${this.baseURL}/recorded-request-headers${url.pathname}${url.search}`;
+        for (;;) {
+            const response = await fetch(recordedURL).catch(() => null);
+            if (response?.ok) return;
+            await timeout(10);
+        }
+    }
     getStaticURL(path) {
         return `${this.baseURL}/static/${path}`;
+    }
+    #echoPath(path) {
+        const echoScope = this.echoScope ?? (__pageEchoScope ??= uniqueID());
+        return `/echo/${echoScope}${path}`;
     }
 }
 
@@ -220,10 +307,20 @@ function httpTestServer() {
     return __httpTestServer;
 }
 
+// A random identifier that a page which is not a secure context can make too.
+function uniqueID() {
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 // Per-call unique loopback host, so tests that mutate global per-host state
 // (e.g. HSTS) don't collide under the parallel runner or --repeat clones.
 function uniqueLocalhostHostname(prefix) {
-    return `${prefix}-${crypto.randomUUID()}.localhost`;
+    return `${prefix}-${uniqueID()}.localhost`;
+}
+
+// Per-call unique loopback host whose http: origin is not potentially trustworthy.
+function uniqueTestHostname(prefix) {
+    return `${prefix}-${uniqueID()}.test`;
 }
 
 const remoteFrameCount = () => (internals.dumpSiteIsolationProcessTree().match(/remote/g) || []).length;

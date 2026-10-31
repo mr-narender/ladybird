@@ -151,7 +151,6 @@ public:
     FACESubmissionValue const& face_submission_value() const;
     void set_face_submission_value(Badge<ElementInternals>, FACESubmissionValue const& value);
 
-    FACESubmissionValue const& face_state() const;
     void set_face_state(Badge<ElementInternals>, FACESubmissionValue const& value);
 
     void set_custom_validity_error_message(Badge<ElementInternals>, Utf16View value);
@@ -279,7 +278,7 @@ public:
     virtual HTMLElement& text_control_to_html_element() = 0;
     HTMLElement const& text_control_to_html_element() const { return const_cast<FormAssociatedTextControlElement&>(*this).text_control_to_html_element(); }
 
-    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) = 0;
+    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value) = 0;
 
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() = 0;
     virtual GC::Ptr<DOM::Text const> form_associated_element_to_text_node() const { return const_cast<FormAssociatedTextControlElement&>(*this).form_associated_element_to_text_node(); }
@@ -287,6 +286,7 @@ public:
     virtual GC::Ptr<DOM::Element> text_control_scroll_container() = 0;
 
     virtual void handle_insert(Utf16FlyString const& input_type, Utf16View) override;
+    virtual GC::Ptr<DOM::StaticRange> deletion_target_range(Utf16FlyString const& input_type) override;
     virtual void handle_delete(Utf16FlyString const& input_type, DispatchInputEvent = DispatchInputEvent::Yes) override;
     virtual GC::Ptr<DOM::Node> mouse_selection_scope() override;
     virtual void select_all() override;
@@ -294,8 +294,13 @@ public:
     virtual void set_selection_focus(GC::Ref<DOM::Node>, size_t offset, TextAffinity = TextAffinity::Downstream) override;
     virtual void move_cursor_to_start(CollapseSelection) override;
     virtual void move_cursor_to_end(CollapseSelection) override;
-    void move_cursor_to_start_of_current_line(CollapseSelection);
-    void move_cursor_to_end_of_current_line(CollapseSelection);
+    virtual void move_cursor_to_start_of_current_line(CollapseSelection) override;
+    virtual void move_cursor_to_end_of_current_line(CollapseSelection) override;
+    virtual void move_cursor_to_start_of_paragraph(CollapseSelection) override;
+    virtual void move_cursor_to_end_of_paragraph(CollapseSelection) override;
+    virtual void move_cursor_to_physical_line_boundary(bool left, CollapseSelection) override;
+    virtual void move_cursor_to_previous_page(CollapseSelection collapse) override { move_cursor_by_page(false, collapse); }
+    virtual void move_cursor_to_next_page(CollapseSelection collapse) override { move_cursor_by_page(true, collapse); }
     virtual void increment_cursor_position_offset(CollapseSelection) override;
     virtual void decrement_cursor_position_offset(CollapseSelection) override;
     virtual void increment_cursor_position_to_next_word(CollapseSelection) override;
@@ -304,6 +309,16 @@ public:
     virtual void decrement_cursor_position_to_previous_line(CollapseSelection) override;
 
     GC::Ptr<DOM::Position> cursor_position() const;
+
+    // NB: Edits that script makes with execCommand() reveal the cursor in the next rendering update instead of right
+    //     away, so that a run of them lays out the text control once instead of after each edit. A pending reveal is
+    //     made right away if the control loses focus or script moves its selection before that rendering update.
+    enum class CursorRevealAfterEdit : u8 {
+        Immediately,
+        InNextRenderingUpdate,
+    };
+    void set_cursor_reveal_after_edit(CursorRevealAfterEdit reveal) { m_cursor_reveal_after_edit = reveal; }
+    void reveal_cursor_if_pending();
 
 protected:
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
@@ -316,7 +331,9 @@ private:
 
     void collapse_selection_to_offset(size_t, TextAffinity = TextAffinity::Downstream);
     void move_selection_end_to(size_t offset, TextAffinity, CollapseSelection);
+    void move_cursor_by_page(bool forward, CollapseSelection);
     void scroll_cursor_into_view();
+    void reveal_cursor_after_edit();
     void selection_was_changed(SelectionSource);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-selection
@@ -329,6 +346,9 @@ private:
 
     // https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event
     bool m_has_scheduled_selectionchange_event { false };
+
+    CursorRevealAfterEdit m_cursor_reveal_after_edit { CursorRevealAfterEdit::Immediately };
+    bool m_has_pending_cursor_reveal { false };
 };
 
 }

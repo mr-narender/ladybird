@@ -10,6 +10,7 @@
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
+#include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/HTMLDataListElement.h>
@@ -19,7 +20,9 @@
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLSelectedContentElement.h>
+#include <LibWeb/HTML/TagNames.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Namespace.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWebCommon/Infra/Strings.h>
 
@@ -40,9 +43,9 @@ void HTMLOptionElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_cached_nearest_select_element);
+    visitor.visit(m_label_sizer_text);
 }
 
-// FIXME: This needs to be called any time a descendant's text is modified.
 void HTMLOptionElement::update_selection_label()
 {
     if (selected()) {
@@ -50,24 +53,87 @@ void HTMLOptionElement::update_selection_label()
             select_element->clone_selected_option_into_select_button();
         }
     }
+    update_label_sizer_text();
+}
+
+void HTMLOptionElement::update_label_sizer_text()
+{
+    GC::Ptr<DOM::Element> label_sizer;
+    if (m_cached_nearest_select_element)
+        label_sizer = m_cached_nearest_select_element->m_label_sizer_element;
+
+    if (m_label_sizer_text && (!label_sizer || !m_label_sizer_text->parent() || m_label_sizer_text->parent()->parent() != label_sizer.ptr())) {
+        if (auto* row = m_label_sizer_text->parent())
+            row->remove();
+        m_label_sizer_text = nullptr;
+    }
+    if (!label_sizer)
+        return;
+
+    auto text = label();
+    if (text.is_empty()) {
+        if (m_label_sizer_text) {
+            if (auto* row = m_label_sizer_text->parent())
+                row->remove();
+            m_label_sizer_text = nullptr;
+        }
+        return;
+    }
+
+    // NB: Nonempty labels have a block row, with the same inherited white-space as the selected label.
+    if (m_label_sizer_text) {
+        if (m_label_sizer_text->data() != text)
+            m_label_sizer_text->set_data(text);
+        return;
+    }
+    auto row = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
+    m_label_sizer_text = document().create_text_node(move(text));
+    MUST(row->append_child(*m_label_sizer_text));
+    MUST(label_sizer->append_child(*row));
 }
 
 void HTMLOptionElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
 
+    if (namespace_.has_value())
+        return;
+
     if (name == HTML::AttributeNames::selected) {
-        if (!value.has_value()) {
-            // Whenever an option element's selected attribute is removed, if its dirtiness is false, its selectedness must be set to false.
-            if (!m_dirty)
-                set_selected_internal(false);
-        } else {
-            // Except where otherwise specified, when the element is created, its selectedness must be set to true
-            // if the element has a selected attribute. Whenever an option element's selected attribute is added,
-            // if its dirtiness is false, its selectedness must be set to true.
-            if (!m_dirty)
+        // https://html.spec.whatwg.org/multipage/form-elements.html#attr-option-selected
+        // Whenever an option element option's selected attribute is added or removed:
+        if (old_value.has_value() == value.has_value())
+            return;
+
+        // 1. Let hasChanged be false.
+        auto has_changed = HTMLSelectElement::HasChanged::No;
+
+        // 2. If option's dirtiness is false:
+        if (!m_dirty) {
+            // 1. If the selected attribute was added and option's selectedness is false, then set option's selectedness
+            //    to true and set hasChanged to true.
+            if (value.has_value() && !m_selected) {
                 set_selected_internal(true);
+                has_changed = HTMLSelectElement::HasChanged::Yes;
+            }
+
+            // 2. If the selected attribute was removed and option's selectedness is true, then set option's
+            //    selectedness to false and set hasChanged to true.
+            if (!value.has_value() && m_selected) {
+                set_selected_internal(false);
+                has_changed = HTMLSelectElement::HasChanged::Yes;
+            }
         }
+
+        // 3. Let select be option's cached nearest ancestor select element.
+        auto select = m_cached_nearest_select_element;
+
+        // 4. If select is null, then return.
+        if (!select)
+            return;
+
+        // 5. Reset a select's selectedness given select and hasChanged.
+        select->reset_selectedness(has_changed);
     } else if (name == HTML::AttributeNames::label) {
         update_selection_label();
     }
@@ -87,6 +153,12 @@ void HTMLOptionElement::set_selected_internal(bool selected)
     if (m_selected != selected) {
         CSS::Invalidation::invalidate_style_after_option_selected_state_change(*this, selected);
         document().bump_option_selectedness_version();
+        if (m_cached_nearest_select_element) {
+            if (selected)
+                ++m_cached_nearest_select_element->m_number_of_selected_options;
+            else
+                --m_cached_nearest_select_element->m_number_of_selected_options;
+        }
     }
 
     m_selected = selected;
@@ -99,7 +171,7 @@ Utf16String HTMLOptionElement::value() const
 {
     // The value of an option element is the value of the value content attribute, if there is one.
     // ...or, if there is not, the value of the element's text IDL attribute.
-    if (auto value = attribute(HTML::AttributeNames::value); value.has_value())
+    if (auto value = get_attribute_ns({}, HTML::AttributeNames::value); value.has_value())
         return value.release_value();
     return text();
 }
@@ -127,7 +199,7 @@ Utf16String HTMLOptionElement::label() const
 {
     // The label IDL attribute, on getting, if there is a label content attribute,
     // must return that attribute's value; otherwise, it must return the element's label.
-    if (auto label = attribute(HTML::AttributeNames::label); label.has_value())
+    if (auto label = get_attribute_ns({}, HTML::AttributeNames::label); label.has_value())
         return label.release_value();
     return text();
 }
@@ -192,9 +264,26 @@ void HTMLOptionElement::ask_for_a_reset()
 // https://html.spec.whatwg.org/multipage/form-elements.html#concept-option-disabled
 bool HTMLOptionElement::disabled() const
 {
-    // An option element is disabled if its disabled attribute is present or if it is a child of an optgroup element whose disabled attribute is present.
-    return has_attribute(AttributeNames::disabled)
-        || (parent() && is<HTMLOptGroupElement>(parent()) && static_cast<HTMLOptGroupElement const&>(*parent()).has_attribute(AttributeNames::disabled));
+    // An option element option is disabled if the following steps return true:
+
+    // 1. If option's disabled attribute is present, then return true.
+    if (has_attribute(AttributeNames::disabled))
+        return true;
+
+    // 2. For each ancestor of option's ancestors in reverse tree order:
+    for (auto const* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
+        // 1. If ancestor is a select, hr, datalist, or option element, then return false.
+        if (is<HTMLSelectElement>(*ancestor) || is<HTMLHRElement>(*ancestor) || is<HTMLDataListElement>(*ancestor) || is<HTMLOptionElement>(*ancestor))
+            return false;
+
+        // 2. If ancestor is an optgroup element, then return true if ancestor's disabled attribute is present;
+        //    otherwise false.
+        if (auto const* optgroup = as_if<HTMLOptGroupElement>(*ancestor))
+            return optgroup->has_attribute(AttributeNames::disabled);
+    }
+
+    // 3. Return false.
+    return false;
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-form
@@ -224,17 +313,28 @@ void HTMLOptionElement::update_nearest_select_element()
 
     // 3. If oldSelect is not newSelect:
     if (old_select != new_select) {
+        // OPTIMIZATION: Do step 4 first and move this option between the selects' counts of selected options, so that
+        //               selectedness changes made by the algorithms below are counted against newSelect.
+        if (selected()) {
+            if (old_select)
+                --old_select->m_number_of_selected_options;
+            if (new_select)
+                ++new_select->m_number_of_selected_options;
+        }
+        m_cached_nearest_select_element = new_select;
+        update_label_sizer_text();
+
         // 1. If oldSelect is not null, then run the selectedness setting algorithm given oldSelect.
         if (old_select)
             old_select->update_selectedness();
 
         // 2. If newSelect is not null, then run the selectedness setting algorithm given newSelect.
-        if (new_select)
+        if (new_select && !new_select->can_skip_selectedness_update_for_inserted_option(*this))
             new_select->update_selectedness();
     }
 
     // 4. Set option's cached nearest ancestor select element to newSelect.
-    m_cached_nearest_select_element = new_select;
+    // NOTE: Done in step 3.
 }
 
 Optional<ARIA::Role> HTMLOptionElement::default_role() const

@@ -9,6 +9,7 @@
 
 #include <LibGC/Heap.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/UserNavigationInvolvement.h>
 
@@ -20,7 +21,7 @@ bool can_load_document_with_type(MimeSniff::MimeType const&);
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-ua-inline
 template<typename MutateDocument>
-GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::LocalNavigable> navigable, Optional<Utf16String> navigation_id, Bindings::NavigationTimingType navigation_timing_type, HTML::UserNavigationInvolvement user_involvement, URL::Origin origin, MutateDocument mutate_document)
+GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::LocalNavigable> navigable, Optional<Utf16String> navigation_id, Bindings::NavigationTimingType navigation_timing_type, HTML::UserNavigationInvolvement user_involvement, URL::Origin origin, Optional<HTML::CrossProcessId> document_id, MutateDocument mutate_document)
 {
     VERIFY(navigable->active_document());
 
@@ -64,19 +65,20 @@ GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::LocalNav
         move(navigation_id),
         navigable,
         nullptr,
-        response,
+        Fetch::Infrastructure::ResponseView::create(response, nullptr),
         nullptr,
         nullptr,
         move(coop_enforcement_result),
         nullptr,
         move(origin),
-        heap.allocate<HTML::PolicyContainer>(heap),
+        HTML::PolicyContainer::create(),
         HTML::SandboxingFlagSet {},
         ReferrerPolicy::ReferrerPolicy::EmptyString,
         move(coop),
         navigation_timing_type,
         OptionalNone {},
         user_involvement);
+    navigation_params->document_id = document_id;
 
     // 5. Let document be the result of creating and initializing a Document object given "html", "text/html", and navigationParams.
     auto document = DOM::Document::create_and_initialize(DOM::Document::Type::HTML, "text/html"_utf16_fly_string, navigation_params).release_value_but_fixme_should_propagate_errors();

@@ -102,7 +102,15 @@ public:
 
     void did_select_item(Optional<u32> const& id);
 
-    void update_selectedness();
+    // NB: Returns whether the selectedness changed, in which case the select's selectedcontent was also updated.
+    bool update_selectedness();
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#reset-a-select%27s-selectedness
+    enum class HasChanged : u8 {
+        No,
+        Yes,
+    };
+    void reset_selectedness(HasChanged);
 
     void clone_selected_option_into_select_button();
 
@@ -129,6 +137,8 @@ public:
     virtual bool is_mutable() const override;
 
 private:
+    friend class HTMLOptionElement;
+
     HTMLSelectElement(DOM::Document&, DOM::QualifiedName);
     virtual void visit_edges(Cell::Visitor&) override;
 
@@ -150,14 +160,17 @@ private:
     u32 display_size() const;
 
     mutable Vector<GC::Ref<HTMLOptionElement>> m_cached_list_of_options;
-    mutable size_t m_cached_number_of_selected_options { 0 };
+    size_t m_number_of_selected_options { 0 };
 
     mutable GC::Ptr<HTMLOptionsCollection> m_options;
     GC::Ptr<DOM::HTMLCollection> m_selected_options;
     bool m_is_open { false };
     Vector<GC::Ref<HTMLOptionElement>> m_select_item_option_elements;
     GC::Ptr<DOM::Element> m_inner_text_element;
+    GC::Ptr<DOM::Element> m_selected_label_element;
+    GC::Ptr<DOM::Element> m_label_sizer_element;
     GC::Ptr<DOM::Element> m_chevron_icon_element;
+    bool m_chevron_icon_hidden { false };
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
     bool m_user_validity { false };

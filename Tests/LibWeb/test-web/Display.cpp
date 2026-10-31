@@ -71,7 +71,7 @@ void Display::begin_run()
     });
 #endif
 
-    display_timer = Core::Timer::create_repeating(1000, [this] { render_live_display(); });
+    display_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(1000), [this] { render_live_display(); });
     display_timer->start();
 }
 
@@ -235,7 +235,7 @@ void Display::render_live_display() const
                     return;
                 auto const& state = view_states()[i];
                 if (state.active && state.pid > 0) {
-                    auto duration = (now - state.start_time).to_truncated_seconds();
+                    auto duration = (now - state.start_time).to_seconds();
                     auto prefix = ByteString::formatted("⏺ {} ({}s): ", state.pid, duration);
                     t.label(prefix, state.test_name);
                 } else {
@@ -251,7 +251,7 @@ void Display::render_live_display() const
         }
 
         t.lines(
-            [] {},
+            [] { },
             [&] {
                 t.counter({
                     { .label = "Pass"sv, .color = ::Test::LiveDisplay::Green, .value = pass_count },
@@ -261,7 +261,7 @@ void Display::render_live_display() const
                     { .label = "Crashed"sv, .color = ::Test::LiveDisplay::Magenta, .value = crashed_count },
                 });
             },
-            [] {},
+            [] { },
             [&] {
                 if (total_tests() == 0)
                     return;

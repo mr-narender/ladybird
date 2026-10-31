@@ -5,14 +5,16 @@
  */
 
 #include <AK/ByteString.h>
+#include <LibAudio/RecordStream.h>
+#include <LibAudio/SampleSpecification.h>
 #include <LibGC/Heap.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Runtime/Value.h>
-#include <LibMedia/Audio/RecordStream.h>
-#include <LibMedia/Audio/SampleSpecification.h>
 #include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/MediaCapture/MediaDevices.h>
 #include <LibWeb/MediaCapture/MediaStreamTrack.h>
 #include <LibWeb/WebIDL/Promise.h>
 
@@ -197,10 +199,21 @@ GC::Ref<MediaStreamTrack> MediaStreamTrack::clone() const
     track_clone->update_audio_silence_state();
     track_clone->m_provider_id = s_next_provider_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed);
 
-    // FIXME: 8. Run source MediaStreamTrack source-specific clone steps with track and trackClone as parameters.
+    // 8. Run source MediaStreamTrack source-specific clone steps with track and trackClone as parameters.
+    // NB: The one source Ladybird captures from is the microphone, whose tracks end when the permission is taken away;
+    //     the clone of such a track ends with it.
+    if (auto media_devices = m_media_devices.ptr()) {
+        media_devices->track_was_cloned({}, track_clone);
+        track_clone->m_media_devices = m_media_devices;
+    }
 
     // 9. Return trackClone.
     return track_clone;
+}
+
+void MediaStreamTrack::set_media_devices(Badge<MediaDevices>, MediaDevices& media_devices)
+{
+    m_media_devices = media_devices;
 }
 
 bool MediaStreamTrack::is_audio() const
@@ -288,20 +301,11 @@ void MediaStreamTrack::ensure_audio_capture_started()
     m_audio_capture_start_pending = true;
     auto capture_request_id = ++m_audio_capture_request_id;
 
-    // FIXME: Support channel layouts beyond mono and stereo.
-    auto sample_rate = sample_rate_hz() != 0 ? sample_rate_hz() : 48000;
-    auto channel_map = channel_count() == 1 ? Audio::ChannelMap::mono() : Audio::ChannelMap::stereo();
-    Audio::SampleSpecification specification(sample_rate, channel_map);
-
-    // Use 20 ms fragments to balance latency and callback overhead.
-    auto fragment_frames = sample_rate / 50;
-    auto fragment_size_bytes = static_cast<u32>(fragment_frames * channel_map.channel_count() * sizeof(float));
-
     ByteString device_id_string;
     if (auto id = device_id(); id.has_value())
         device_id_string = id->to_byte_string();
 
-    auto stream_promise = Audio::RecordStream::create(specification, fragment_size_bytes, device_id_string,
+    auto stream_promise = Audio::RecordStream::create(device_id_string,
         [fanout = m_audio_fanout](ReadonlyBytes data, Audio::SampleSpecification const& stream_specification) {
             // Runs on the audio backend's capture thread. Only the ref-counted fan-out is
             // captured here: the GC may reap the track while a callback is in flight, so the
@@ -327,6 +331,21 @@ void MediaStreamTrack::ensure_audio_capture_started()
         if (track->m_state != MediaStreamTrackState::Live)
             return;
         track->m_audio_capture_stream = stream;
+        // The backend behind the stream is gone for good; a fresh stream picks the capture up again.
+        stream->on_capture_lost = [weak_track = GC::Weak<MediaStreamTrack>(track), capture_request_id] {
+            auto track = weak_track.ptr();
+            if (!track || track->m_audio_capture_request_id != capture_request_id)
+                return;
+            track->m_audio_capture_stream = nullptr;
+            track->ensure_audio_capture_started();
+        };
+        stream->on_capture_revoked = [weak_track = GC::Weak<MediaStreamTrack>(track), capture_request_id] {
+            auto track = weak_track.ptr();
+            if (!track || track->m_audio_capture_request_id != capture_request_id)
+                return;
+            if (track->on_audio_capture_revoked)
+                track->on_audio_capture_revoked();
+        };
     });
     stream_promise->when_rejected([track = GC::Ref(*this), capture_request_id](Error& error) {
         if (track->m_audio_capture_request_id != capture_request_id)

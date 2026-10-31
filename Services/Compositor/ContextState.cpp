@@ -5,17 +5,19 @@
  */
 
 #include <AK/GenericShorthands.h>
+#include <AK/JsonObject.h>
 #include <AK/Math.h>
+#include <AK/ScopeGuard.h>
 #include <AK/StdLibExtras.h>
 #include <Compositor/CompositorState.h>
 #include <Compositor/ContextState.h>
+#include <Compositor/DisplayListPlayerSkia.h>
+#include <Compositor/PaintingSurface.h>
 #include <Compositor/PausedDebuggerOverlay.h>
+#include <Compositor/SkiaUtils.h>
 #include <LibCompositing/DisplayList/DisplayListDamage.h>
-#include <LibCompositing/DisplayList/DisplayListPlayerSkia.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/PaintingSurface.h>
-#include <LibGfx/SkiaUtils.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <core/SkCanvas.h>
 #include <core/SkImage.h>
@@ -23,74 +25,23 @@
 
 namespace Compositor {
 
-template<typename Callback>
-static void for_each_drawn_canvas(Compositing::DisplayList const& display_list, Callback callback)
+// INTEROP: Holding a press beside the thumb pages again after these delays, as in Chromium and Firefox.
+static constexpr auto scrollbar_paging_initial_delay = AK::Duration::from_milliseconds(250);
+static constexpr auto scrollbar_paging_repeat_interval = AK::Duration::from_milliseconds(50);
+
+// INTEROP: The modifier that makes a press beside the thumb page instead of jumping there or the other way around, as in
+//          Chromium and Firefox.
+#if defined(AK_OS_MACOS)
+static constexpr auto scrollbar_track_press_inverting_modifier = Web::UIEvents::Mod_Alt;
+#else
+static constexpr auto scrollbar_track_press_inverting_modifier = Web::UIEvents::Mod_Shift;
+#endif
+
+// The offset of the visual viewport in the layout viewport, in device pixels of the content it scales.
+static Gfx::FloatPoint visual_viewport_scroll_offset(Compositing::TransformWithOrigin const& transform)
 {
-    display_list.for_each_command_header([&](Compositing::ContextRef context, Compositing::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
-        if (header.command_type != Compositing::DisplayListCommandType::DrawCanvas)
-            return;
-        callback(context, header, Compositing::read_display_list_object<Compositing::DrawCanvas>(payload));
-    });
-}
-
-template<typename Callback>
-static void for_each_caret(Compositing::DisplayList const& display_list, Callback callback)
-{
-    display_list.for_each_command_header([&](Compositing::ContextRef context, Compositing::DisplayListCommandHeader const& header, ReadonlyBytes payload) {
-        if (header.command_type != Compositing::DisplayListCommandType::PaintCaret)
-            return;
-        callback(context, header, Compositing::read_display_list_object<Compositing::PaintCaret>(payload));
-    });
-}
-
-static void set_or_append_pending_scroll_offset(
-    Vector<Compositing::AsyncScrollOffset>& pending_scroll_offsets,
-    Compositing::AsyncScrollOffset const& scroll_offset)
-{
-    for (auto& existing : pending_scroll_offsets) {
-        if (existing.stable_node_id == scroll_offset.stable_node_id) {
-            existing.merge_later_scroll(scroll_offset);
-            return;
-        }
-    }
-    pending_scroll_offsets.append(scroll_offset);
-}
-
-static bool visual_viewport_transforms_match(Compositing::TransformWithOrigin const& a, Compositing::TransformWithOrigin const& b)
-{
-    static constexpr float transform_epsilon = 0.01f;
-    static constexpr float translation_epsilon = 0.5f;
-
-    for (size_t row = 0; row < 4; ++row) {
-        for (size_t column = 0; column < 4; ++column) {
-            auto epsilon = (column == 3 && (row == 0 || row == 1)) ? translation_epsilon : transform_epsilon;
-            if (AK::fabs(a.matrix[row, column] - b.matrix[row, column]) > epsilon)
-                return false;
-        }
-    }
-
-    return AK::fabs(a.origin.x() - b.origin.x()) <= translation_epsilon
-        && AK::fabs(a.origin.y() - b.origin.y()) <= translation_epsilon;
-}
-
-static void update_visual_animation_sampling_state(Compositing::AccumulatedVisualContextTree const& visual_context_tree, Optional<i64>& sample_time_ns, bool& has_active_animations)
-{
-    auto now = MonotonicTime::now();
-    has_active_animations = visual_context_tree.has_active_visual_animation_at(now.nanoseconds());
-    // A replacement tree can be presented before the next vsync. Keep the most recent sample so that presentation
-    // remains continuous, but sample dormant and completed descriptors at the current boundary when necessary.
-    if (!visual_context_tree.has_visual_animations())
-        sample_time_ns.clear();
-    else if (!has_active_animations)
-        sample_time_ns = now.nanoseconds();
-}
-
-static Web::AsyncScrollNodeStableID viewport_stable_id_from(Compositing::AsyncScrollNodeID node_id)
-{
-    return {
-        .node_id = node_id.document_id,
-        .kind = Web::AsyncScrollNodeKind::Viewport,
-    };
+    auto scale = transform.matrix[0, 0];
+    return Gfx::FloatPoint { -transform.matrix[0, 3], -transform.matrix[1, 3] }.scaled(1.0f / scale);
 }
 
 static void clamp_visual_viewport_transform_to_viewport(Compositing::TransformWithOrigin& transform, Gfx::IntRect viewport_rect)
@@ -108,24 +59,25 @@ static void clamp_visual_viewport_transform_to_viewport(Compositing::TransformWi
     transform.matrix[1, 3] = clamp(transform.matrix[1, 3], min_y, 0.0f);
 }
 
-ContextState::ContextState(Web::CompositorContextId context_id, Optional<u64> page_id, CompositorStateWebContentClient& web_content_client, Compositing::CanvasSurfaceRegistry const& canvas_surface_registry, Function<void(Gfx::IntRect)> schedule_caret_repaint)
+ContextState::ContextState(Web::CompositorContextId context_id, Optional<u64> page_id, CompositorStateWebContentClient& web_content_client, OwnedCanvasSurfaces canvas_surfaces, Function<void(Gfx::IntRect)> schedule_caret_repaint, Function<void()> request_animation_frames)
     : m_web_content_client(web_content_client)
-    , m_canvas_surface_registry(canvas_surface_registry)
     , m_context_id(context_id)
     , m_page_id(page_id)
-    , m_schedule_caret_repaint(move(schedule_caret_repaint))
+    , m_presenter(m_scene, canvas_surfaces, page_id.has_value())
+    , m_caret_blink_timer([this] { return damage_rect_of_blinking_carets(); }, move(schedule_caret_repaint))
+    , m_request_animation_frames(move(request_animation_frames))
 {
-    if (page_id.has_value())
-        m_presents_to_client = true;
 }
 
 ContextState::~ContextState()
 {
-    discard_sampled_visual_context_tree();
-    stop_backing_store_shrink_timer();
-    if (m_caret_blink_timer) {
-        m_caret_blink_timer->on_timeout = {};
-        m_caret_blink_timer->stop();
+    if (m_scrollbar_paging_timer) {
+        m_scrollbar_paging_timer->on_timeout = {};
+        m_scrollbar_paging_timer->stop();
+    }
+    if (m_scrollbar_fade_out_timer) {
+        m_scrollbar_fade_out_timer->on_timeout = {};
+        m_scrollbar_fade_out_timer->stop();
     }
 }
 
@@ -143,10 +95,23 @@ void ContextState::request_rendering_update()
     m_web_content_client.request_rendering_update();
 }
 
-void ContextState::dispatch_mouse_event_to_web_content(Web::MouseEvent const& event)
+void ContextState::dispatch_mouse_event_to_web_content(Web::MouseEvent const& event, bool nested_context_scrolled_since_last_frame)
 {
     VERIFY(m_page_id.has_value());
     m_web_content_client.dispatch_mouse_event_to_web_content(*m_page_id, event);
+
+    // The render clock hears where the pointer went too, without waiting for WebContent's main thread, so that hover
+    // can follow the pointer while that thread runs a task. The lanes hit test it in the frames on screen, which a
+    // scroll since, here or in a nested context, has moved.
+    if (event.type == Web::MouseEvent::Type::MouseMove)
+        m_web_content_client.pointer_moved(m_context_id, event.position, to_underlying(event.buttons), scrolled_since_last_frame() || nested_context_scrolled_since_last_frame, event.id);
+    else if (event.type == Web::MouseEvent::Type::MouseLeave)
+        m_web_content_client.pointer_left(m_context_id, event.id);
+}
+
+bool ContextState::scrolled_since_last_frame() const
+{
+    return has_pending_async_scroll_updates() || m_scroll_offsets_differ_from_last_frame || has_active_smooth_scroll_animations() || has_active_scroll_fling();
 }
 
 void ContextState::dispatch_key_event_to_web_content(Web::KeyEvent const& event)
@@ -155,18 +120,18 @@ void ContextState::dispatch_key_event_to_web_content(Web::KeyEvent const& event)
     m_web_content_client.dispatch_key_event_to_web_content(*m_page_id, event);
 }
 
-void ContextState::stop_presenting_to_client()
+void ContextState::dispatch_pinch_event_to_web_content(Web::PinchEvent const& event)
 {
-    end_keyboard_scroll_gesture();
-    auto was_presenting_to_client = m_presents_to_client;
-    m_presents_to_client = false;
-    did_stop_presenting_to_client_if_needed(was_presenting_to_client, m_presents_to_client);
+    VERIFY(m_page_id.has_value());
+    m_web_content_client.dispatch_pinch_event_to_web_content(*m_page_id, event);
 }
 
-void ContextState::did_stop_presenting_to_client_if_needed(bool was_presenting_to_client, bool will_present_to_client)
+void ContextState::stop_presenting_to_client()
 {
-    (void)was_presenting_to_client;
-    (void)will_present_to_client;
+    m_pointer_in_nested_contexts = {};
+    end_keyboard_scroll_gesture();
+    m_elastic_overscroll_controller.forget();
+    m_presenter.stop_presenting_to_client();
 }
 
 void ContextState::set_parent_context(Optional<Web::CompositorContextId> parent_context_id)
@@ -176,7 +141,7 @@ void ContextState::set_parent_context(Optional<Web::CompositorContextId> parent_
 
 void ContextState::apply_display_list_resource_transaction(Compositing::DisplayListResourceTransaction&& resource_transaction)
 {
-    m_display_list_resource_storage.apply_transaction(move(resource_transaction));
+    m_scene.apply_resource_transaction(move(resource_transaction));
 }
 
 void ContextState::install_display_list_update(
@@ -185,131 +150,71 @@ void ContextState::install_display_list_update(
     Compositing::ScrollStateSnapshot&& scroll_state_snapshot)
 {
     VERIFY(display_list->compatible_visual_context_tree_structural_epoch() == visual_context_tree.structural_epoch());
-    invalidate_visual_context_tree_for_compositing();
-    m_keyboard_scroll_state.target.clear();
-    m_display_list = move(display_list);
-    m_visual_context_tree = move(visual_context_tree);
-    update_visual_animation_sampling_state(*m_visual_context_tree, m_visual_animation_sample_time_ns, m_has_active_visual_animations);
+    auto scroll_offsets_of_known_nodes = scroll_offsets_by_stable_id();
+    m_scene.install(move(display_list), move(visual_context_tree));
+    m_keyboard_scroll_controller.forget_target();
     m_scroll_state_snapshot = move(scroll_state_snapshot);
-    m_scroll_state_snapshot.set_node_count(m_visual_context_tree->spatial_node_count());
-    retire_reconciled_async_scroll_offsets(m_scroll_state_snapshot.adopted_async_scroll_sequence());
-    update_caret_blink_timer();
-    if (m_async_visual_viewport_transform.has_value() && visual_viewport_transforms_match(m_visual_context_tree->visual_viewport_transform(), *m_async_visual_viewport_transform))
-        m_async_visual_viewport_transform.clear();
+    m_scroll_state_snapshot.set_node_count(m_scene.visual_context_tree()->spatial_node_count());
+    m_caret_blink_timer.did_install_display_list(*m_scene.display_list());
 
-    auto async_scrolling_state = Compositing::async_scrolling_state_from_display_list(*m_display_list);
+    auto async_scrolling_state = Compositing::async_scrolling_state_from_display_list(*m_scene.display_list());
     auto async_scrolling_viewport_rect = async_scrolling_state.viewport_rect;
-    auto wheel_event_listener_state_generation = async_scrolling_state.wheel_event_listener_state_generation;
-    auto wheel_routing_admission = Compositing::wheel_routing_admission_for(async_scrolling_state);
-    if (wheel_event_listener_state_generation < m_wheel_event_listener_state_generation)
-        wheel_routing_admission = Compositing::WheelRoutingAdmission::StaleWheelEventListeners;
-    else
-        m_wheel_event_listener_state_generation = wheel_event_listener_state_generation;
-
-    m_wheel_routing_admission = wheel_routing_admission;
-    m_can_accept_async_wheel_events = wheel_routing_admission == Compositing::WheelRoutingAdmission::Accepted;
-    m_has_blocking_wheel_event_listeners = async_scrolling_state.has_blocking_wheel_event_listeners;
-    if (m_async_visual_viewport_transform.has_value() && (!m_can_accept_async_wheel_events || m_has_blocking_wheel_event_listeners)) {
-        invalidate_visual_context_tree_for_compositing();
-        m_async_visual_viewport_transform.clear();
+    m_wheel_gesture_routing.did_install_scrolling_state(async_scrolling_state);
+    // The visual viewport of another document is where that document's visual context tree has it.
+    if (m_scene.has_async_visual_viewport_transform() && async_scrolling_state.document_id != m_visual_viewport_document_id) {
+        m_scene.drop_async_visual_viewport_transform();
+        m_visual_viewport_document_id.clear();
     }
 
-    auto was_dragging_scrollbar = m_scrollbar_controller.has_captured_scrollbar();
+    auto box_of_dragged_scrollbar = box_of_captured_scrollbar();
     m_scrollbar_controller.set_scrollbars(async_scrolling_state.scrollbars);
-    note_user_scroll_gesture_end_if_drag_ended(was_dragging_scrollbar);
+    if (!m_scrollbar_controller.has_captured_scrollbar())
+        stop_scrollbar_paging();
+    note_user_scroll_gesture_end_if_drag_ended(box_of_dragged_scrollbar);
     m_async_scroll_tree.set_state(move(async_scrolling_state));
+    m_elastic_overscroll_controller.did_install_scrolling_state(m_async_scroll_tree);
     m_scroll_snap_controller.did_install_scrolling_state(m_async_scroll_tree);
-    if (auto viewport_scroll_offset = reapply_unreconciled_async_scroll_offsets(); viewport_scroll_offset.has_value())
+    if (auto viewport_scroll_offset = keep_scroll_offsets_of_known_nodes(scroll_offsets_of_known_nodes); viewport_scroll_offset.has_value())
         async_scrolling_viewport_rect.set_location(viewport_scroll_offset->to_type<int>());
     rebuild_wheel_hit_test_targets();
     m_async_scrolling_viewport_rect = async_scrolling_viewport_rect;
     m_has_async_scrolling_state = true;
-    if (auto const& metadata = m_display_list->async_scrolling_metadata(); metadata.has_value())
-        apply_keyboard_scroll_state(metadata->keyboard_scroll_state);
+    if (auto const& metadata = m_scene.display_list()->async_scrolling_metadata(); metadata.has_value())
+        adopt_keyboard_scroll_state(metadata->keyboard_scroll_state);
 }
 
-void ContextState::update_caret_blink_timer()
+Gfx::IntRect ContextState::damage_rect_of_blinking_carets()
 {
-    Optional<i64> blink_cycle_start_time_ns;
-    for_each_caret(*m_display_list, [&](auto const&, auto const&, auto const& caret) {
-        if (caret.should_blink)
-            blink_cycle_start_time_ns = caret.blink_cycle_start_time_ns;
-    });
-
-    if (blink_cycle_start_time_ns == m_caret_blink_cycle_start_time_ns)
-        return;
-    m_caret_blink_cycle_start_time_ns = blink_cycle_start_time_ns;
-
-    if (m_caret_blink_timer)
-        m_caret_blink_timer->stop();
-    if (!m_caret_blink_cycle_start_time_ns.has_value() || !m_schedule_caret_repaint)
-        return;
-
-    if (!m_caret_blink_timer) {
-        m_caret_blink_timer = Core::Timer::create_single_shot(500, [this] {
-            auto damage_rect = caret_damage_rect();
-            if (!damage_rect.is_empty())
-                m_schedule_caret_repaint(damage_rect);
-            schedule_next_caret_blink();
-        });
-    }
-    schedule_next_caret_blink();
-}
-
-void ContextState::schedule_next_caret_blink()
-{
-    if (!m_caret_blink_cycle_start_time_ns.has_value() || !m_caret_blink_timer)
-        return;
-
-    auto now_ns = MonotonicTime::now().nanoseconds();
-    auto elapsed_ns = now_ns > *m_caret_blink_cycle_start_time_ns
-        ? now_ns - *m_caret_blink_cycle_start_time_ns
-        : 0;
-    auto delay_ns = Compositing::caret_blink_interval_ns - elapsed_ns % Compositing::caret_blink_interval_ns;
-    auto delay_ms = max(static_cast<int>((delay_ns + 999'999) / 1'000'000), 1);
-    m_caret_blink_timer->restart(delay_ms);
-}
-
-Gfx::IntRect ContextState::caret_damage_rect()
-{
-    if (!m_display_list || !m_visual_context_tree.has_value())
+    if (!m_scene.display_list() || !m_scene.visual_context_tree().has_value())
         return {};
 
-    auto const& visual_context_tree = visual_context_tree_for_compositing();
+    auto const& visual_context_tree = m_scene.visual_context_tree_for_compositing();
+    auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
+    auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
     Gfx::IntRect damage_rect;
-    for_each_caret(*m_display_list, [&](auto context, auto const& header, auto const& caret) {
+    m_scene.display_list()->for_each_caret([&](auto context, auto bounding_rect, auto const& caret) {
         if (!caret.should_blink)
             return;
-        auto rect = visual_context_tree.transform_rect_to_viewport(context.spatial, header.bounding_rect.template to_type<float>(), m_scroll_state_snapshot);
+        auto rect = visual_context_tree.transform_rect_to_viewport(context.spatial, bounding_rect.template to_type<float>(), presented_scroll_state_snapshot);
         if (!isfinite(rect.x()) || !isfinite(rect.y()) || !isfinite(rect.width()) || !isfinite(rect.height())) {
-            damage_rect = { {}, m_viewport_size };
+            damage_rect = { {}, m_presenter.viewport_size() };
             return;
         }
-        rect.intersect(Gfx::IntRect { {}, m_viewport_size }.to_type<float>());
+        rect.intersect(Gfx::IntRect { {}, m_presenter.viewport_size() }.to_type<float>());
         if (!rect.is_empty())
             damage_rect.unite(Gfx::enclosing_int_rect(rect).inflated(1, 1, 1, 1));
     });
-    damage_rect.intersect({ {}, m_viewport_size });
+    damage_rect.intersect({ {}, m_presenter.viewport_size() });
     return damage_rect;
 }
 
 void ContextState::update_visual_context_tree(Compositing::AccumulatedVisualContextTree visual_context_tree, Compositing::DisplayListResourceTransaction&& resource_transaction)
 {
-    if (!m_display_list || m_display_list->compatible_visual_context_tree_structural_epoch() != visual_context_tree.structural_epoch()) {
-        dbgln("Compositor: Dropping stale visual context tree update (tree epoch {}, display list epoch {})",
-            visual_context_tree.structural_epoch(),
-            m_display_list ? m_display_list->compatible_visual_context_tree_structural_epoch() : 0);
+    if (!m_scene.replace_visual_context_tree(move(visual_context_tree), move(resource_transaction)))
         return;
-    }
-    invalidate_visual_context_tree_for_compositing();
-    apply_display_list_resource_transaction(move(resource_transaction));
-    m_visual_context_tree = move(visual_context_tree);
-    update_visual_animation_sampling_state(*m_visual_context_tree, m_visual_animation_sample_time_ns, m_has_active_visual_animations);
     // A constraints refresh changes sticky payloads without a new snapshot, and the snapshot that
     // pairs with this tree arrives in a separate message.
-    Compositing::resolve_sticky_offsets(*m_visual_context_tree, m_scroll_state_snapshot);
-    if (m_async_visual_viewport_transform.has_value() && visual_viewport_transforms_match(m_visual_context_tree->visual_viewport_transform(), *m_async_visual_viewport_transform))
-        m_async_visual_viewport_transform.clear();
+    Compositing::resolve_sticky_offsets(*m_scene.visual_context_tree(), m_scroll_state_snapshot);
 
     if (m_has_async_scrolling_state)
         rebuild_wheel_hit_test_targets();
@@ -317,60 +222,83 @@ void ContextState::update_visual_context_tree(Compositing::AccumulatedVisualCont
 
 void ContextState::update_scroll_state(Compositing::ScrollStateSnapshot&& scroll_state_snapshot, Compositing::KeyboardScrollState keyboard_scroll_state)
 {
-    m_animated_content_may_affect_viewport.clear();
+    m_scene.forget_whether_animated_content_may_affect_viewport();
+    auto scroll_offsets_of_known_nodes = scroll_offsets_by_stable_id();
     m_scroll_state_snapshot = move(scroll_state_snapshot);
-    m_scroll_state_snapshot.set_node_count(m_visual_context_tree.has_value() ? m_visual_context_tree->spatial_node_count() : 0);
-    retire_reconciled_async_scroll_offsets(m_scroll_state_snapshot.adopted_async_scroll_sequence());
+    m_scroll_state_snapshot.set_node_count(m_scene.visual_context_tree().has_value() ? m_scene.visual_context_tree()->spatial_node_count() : 0);
     if (!m_has_async_scrolling_state)
         return;
 
-    auto reconciled_viewport_scroll_offset = reapply_unreconciled_async_scroll_offsets();
+    auto kept_viewport_scroll_offset = keep_scroll_offsets_of_known_nodes(scroll_offsets_of_known_nodes);
     rebuild_wheel_hit_test_targets();
-    if (reconciled_viewport_scroll_offset.has_value()) {
-        auto reconciled_viewport_rect = m_async_scrolling_viewport_rect;
-        reconciled_viewport_rect.set_location(reconciled_viewport_scroll_offset->to_type<int>());
-        m_async_scrolling_viewport_rect = reconciled_viewport_rect;
-    }
-    apply_keyboard_scroll_state(move(keyboard_scroll_state));
+    if (kept_viewport_scroll_offset.has_value())
+        m_async_scrolling_viewport_rect.set_location(kept_viewport_scroll_offset->to_type<int>());
+    adopt_keyboard_scroll_state(move(keyboard_scroll_state));
 }
 
-void ContextState::set_video_sink(Compositing::VideoSinkResourceId frame_id, RefPtr<Media::VideoSink> sink)
+void ContextState::set_video_sink(Compositing::VideoSinkResourceId frame_id, RefPtr<Media::DisplayingVideoSink> sink)
 {
-    m_display_list_resource_storage.set_video_sink(frame_id, move(sink));
+    m_scene.set_video_sink(frame_id, move(sink));
 }
 
 void ContextState::invalidate_wheel_event_listener_state(u64 generation)
 {
-    m_wheel_event_listener_state_generation = max(m_wheel_event_listener_state_generation, generation);
-    m_wheel_routing_admission = Compositing::WheelRoutingAdmission::StaleWheelEventListeners;
-    m_can_accept_async_wheel_events = false;
-    m_has_blocking_wheel_event_listeners = true;
+    m_wheel_gesture_routing.invalidate_wheel_event_listener_state(generation);
 }
 
 void ContextState::invalidate_keyboard_scroll_state(u64 generation)
 {
-    if (generation < m_keyboard_scroll_state.generation)
-        return;
-    m_keyboard_scroll_state.generation = generation;
-    m_keyboard_scroll_state.target.clear();
+    m_keyboard_scroll_controller.invalidate_state(generation);
 }
 
-void ContextState::apply_keyboard_scroll_state(Compositing::KeyboardScrollState state)
+void ContextState::adopt_keyboard_scroll_state(Compositing::KeyboardScrollState state)
 {
-    if (state.generation < m_keyboard_scroll_state.generation)
-        return;
-    m_keyboard_scroll_state = move(state);
-    if (!m_keyboard_scroll_state.target.has_value())
+    if (m_keyboard_scroll_controller.adopt_state(move(state)) && !m_keyboard_scroll_controller.has_target())
         end_keyboard_scroll_gesture();
 }
 
 void ContextState::end_keyboard_scroll_gesture()
 {
-    if (m_held_scroll_keys.is_empty())
+    if (!m_keyboard_scroll_controller.release_all_keys())
         return;
-    m_held_scroll_keys.clear();
-    m_user_scroll_gesture_ended = true;
+    end_user_scroll_gesture_of_held_keys();
     request_rendering_update();
+}
+
+Optional<ContextState::KeyScroll> ContextState::key_scroll_for(Web::KeyEvent const& event) const
+{
+    if (!presents_to_client() || m_presenter.ui_overlays().paused_debugger.has_value()
+        || m_visibility != Compositing::ContextVisibility::Visible
+        || !Web::is_keyboard_scroll_key(event.key, event.modifiers)
+        || !m_keyboard_scroll_controller.has_target()
+        || !m_scene.visual_context_tree().has_value()
+        || !m_keyboard_scroll_controller.state_matches_visual_context_tree_epoch(m_scene.current_visual_context_tree().structural_epoch()))
+        return {};
+    // Keyboard scrolling has not yet been adapted to a separately panned visual viewport.
+    if (m_scene.visual_viewport_scale().value_or(1.0f) != 1.0f)
+        return {};
+
+    auto key_step = m_keyboard_scroll_controller.step_for_key(event, m_async_scroll_tree);
+    if (!key_step.has_value())
+        return {};
+    auto target = m_async_scroll_tree.scroll_node_for_keyboard_scroll(key_step->keyboard_scroll_target, key_step->delta, scroll_state_snapshot_at_keyboard_step_starts());
+    // If every destination is at its boundary, consume repeats while a scrolling box can still move toward it.
+    // Falling back would cancel the running animation and lose the steps already accumulated in its destination.
+    if (!target.has_value())
+        target = m_async_scroll_tree.scroll_node_for_keyboard_scroll(key_step->keyboard_scroll_target, key_step->delta, m_scroll_state_snapshot);
+    if (!target.has_value())
+        return {};
+    return KeyScroll { .step = key_step.release_value(), .target = target.value() };
+}
+
+Optional<Web::AsyncScrollNodeStableID> ContextState::box_scrolled_for_key_event(Web::KeyEvent const& event) const
+{
+    if (event.type != Web::KeyEvent::Type::KeyDown)
+        return {};
+    auto key_scroll = key_scroll_for(event);
+    if (!key_scroll.has_value())
+        return {};
+    return m_async_scroll_tree.scroll_node_for_id(key_scroll->target)->stable_node_id;
 }
 
 ContextState::ContextUpdateResult ContextState::handle_key_event(Web::KeyEvent const& event)
@@ -381,95 +309,85 @@ ContextState::ContextUpdateResult ContextState::handle_key_event(Web::KeyEvent c
     // Release the key even if focus, modifiers, or routing eligibility changed while it was held. Other scroll
     // keys may still be held, so only end the gesture when the last one is released.
     if (event.type == Web::KeyEvent::Type::KeyUp) {
-        if (event.repeat || !m_held_scroll_keys.remove_first_matching([&](auto key) { return key == event.key; }))
+        auto release = m_keyboard_scroll_controller.release_key(event);
+        if (release == KeyboardScrollController::KeyRelease::Ignored)
             return {};
-        if (m_held_scroll_keys.is_empty())
-            m_user_scroll_gesture_ended = true;
+        if (release == KeyboardScrollController::KeyRelease::ReleasedLastHeldKey)
+            end_user_scroll_gesture_of_held_keys();
         return { .accepted = true, .frame_to_present = {}, .should_request_rendering_update = true };
     }
 
-    if (!presents_to_client() || m_paused_debugger_overlay_visible
-        || m_visibility != Compositing::ContextVisibility::Visible
-        || !Web::is_keyboard_scroll_key(event.key, event.modifiers)
-        || !m_keyboard_scroll_state.target.has_value()
-        || !m_visual_context_tree.has_value()
-        || m_keyboard_scroll_state.visual_context_tree_structural_epoch != current_visual_context_tree().structural_epoch())
+    auto key_scroll = key_scroll_for(event);
+    if (!key_scroll.has_value())
         return {};
-    // Keyboard scrolling has not yet been adapted to a separately panned visual viewport.
-    if (visual_viewport_scale_for_compositing().value_or(1.0f) != 1.0f)
-        return {};
-
-    bool is_arrow = first_is_one_of(event.key, Web::UIEvents::Key_Up, Web::UIEvents::Key_Down, Web::UIEvents::Key_Left, Web::UIEvents::Key_Right);
-    auto distance = is_arrow ? m_keyboard_scroll_state.arrow_scroll_distance : m_keyboard_scroll_state.page_scroll_distance;
-    if (!isfinite(distance) || distance <= 0)
-        return {};
-    if (event.key == Web::UIEvents::KeyCode::Key_PageUp
-        || event.key == Web::UIEvents::KeyCode::Key_Up || event.key == Web::UIEvents::KeyCode::Key_Left
-        || (event.key == Web::UIEvents::KeyCode::Key_Space && (event.modifiers & Web::UIEvents::Mod_Shift)))
-        distance = -distance;
-    bool is_horizontal = first_is_one_of(event.key, Web::UIEvents::Key_Left, Web::UIEvents::Key_Right);
-    auto delta = is_horizontal ? Gfx::FloatPoint { distance, 0 } : Gfx::FloatPoint { 0, distance };
+    auto const& key_step = key_scroll->step;
+    auto delta = key_step.delta;
+    auto scrolls_to_extent = key_step.scrolls_to_extent;
     auto now = MonotonicTime::now();
-    auto scroll_state_at_step_starts = scroll_state_snapshot_at_keyboard_step_starts();
-    auto target = m_async_scroll_tree.scroll_node_for_keyboard_scroll(*m_keyboard_scroll_state.target, delta, scroll_state_at_step_starts);
-    // If every destination is at its boundary, consume repeats while a scrolling box can still move toward it.
-    // Falling back would cancel the running animation and lose the steps already accumulated in its destination.
-    if (!target.has_value())
-        target = m_async_scroll_tree.scroll_node_for_keyboard_scroll(*m_keyboard_scroll_state.target, delta, m_scroll_state_snapshot);
-    if (!target.has_value())
-        return {};
+    auto target = key_scroll->target;
 
-    if (!m_held_scroll_keys.contains_slow(event.key))
-        m_held_scroll_keys.append(event.key);
+    m_keyboard_scroll_controller.hold_key(event.key);
 
-    auto stable_node_id = m_async_scroll_tree.scroll_node_for_id(*target)->stable_node_id;
+    auto stable_node_id = m_async_scroll_tree.scroll_node_for_id(target)->stable_node_id;
+    if (!m_boxes_scrolled_by_held_keys.contains_slow(stable_node_id))
+        m_boxes_scrolled_by_held_keys.append(stable_node_id);
     Optional<Gfx::FloatPoint> scroll_in_flight_destination;
     for (auto const& running_animation : m_smooth_scroll_animations) {
-        if (running_animation.stable_node_id == stable_node_id && running_animation.is_user_scroll)
+        if (running_animation.stable_node_id == stable_node_id && running_animation.is_user_scroll && running_animation.animation.kind() == Compositing::ScrollAnimationKind::SmoothScroll)
             scroll_in_flight_destination = running_animation.animation.destination_offset();
     }
     auto css_scroll_in_flight_destination = scroll_in_flight_destination.map([&](auto offset) { return m_async_scroll_tree.css_pixels_from_device_offset(offset); });
-    auto snap_selection_intent = is_arrow ? Compositing::SnapSelectionStrategy::Type::Direction : Compositing::SnapSelectionStrategy::Type::EndPositionAndDirection;
-    if (auto decision = m_scroll_snap_controller.decide_key_step(m_async_scroll_tree, m_scroll_state_snapshot, *target, m_async_scroll_tree.css_pixels_from_device_offset(delta), snap_selection_intent, css_scroll_in_flight_destination, now); decision.has_value()) {
+    if (auto decision = m_scroll_snap_controller.decide_key_step(m_async_scroll_tree, m_scroll_state_snapshot, target, m_async_scroll_tree.css_pixels_from_device_offset(delta), key_step.snap_selection_intent, css_scroll_in_flight_destination, now); decision.has_value()) {
         schedule_end_of_scroll_step_gestures(now);
         if (auto* snap_scroll = decision->get_pointer<ScrollSnapController::SnapScrollStart>()) {
-            start_snap_scroll(*target, move(*snap_scroll), false, now);
+            snap_scroll->is_absolute_scroll = scrolls_to_extent;
+            start_snap_scroll(target, move(*snap_scroll), false, now);
             return {
                 .accepted = true,
                 .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
                 .should_request_rendering_update = true,
             };
         }
-        if (auto& updated_scroll = decision->get<ScrollSnapController::StepConsumed>().updated_scroll; updated_scroll.has_value())
-            m_started_user_scrolls.append(updated_scroll.release_value());
+        if (auto& updated_scroll = decision->get<ScrollSnapController::StepConsumed>().updated_scroll; updated_scroll.has_value()) {
+            updated_scroll->is_absolute_scroll = scrolls_to_extent;
+            note_user_input_scrolled(updated_scroll->stable_node_id);
+            m_async_scroll_update_outbox.record_started_user_scroll(updated_scroll.release_value());
+        }
         return { .accepted = true, .frame_to_present = {}, .should_request_rendering_update = true };
     }
 
-    auto current_offset = m_async_scroll_tree.scroll_offset_for_node(*target, m_scroll_state_snapshot);
+    auto current_offset = m_async_scroll_tree.scroll_offset_for_node(target, m_scroll_state_snapshot);
     VERIFY(current_offset.has_value());
     // A plain step continues toward the animation's destination, including any snap on the other axis.
     auto step_start = scroll_in_flight_destination.value_or(*current_offset);
-    auto destination = m_async_scroll_tree.clamped_scroll_offset_for_node(*target, { step_start.x() + delta.x(), step_start.y() + delta.y() });
+    auto destination = m_async_scroll_tree.clamped_scroll_offset_for_node(target, { step_start.x() + delta.x(), step_start.y() + delta.y() });
     if (destination == step_start)
         return { .accepted = true, .frame_to_present = {}, .should_request_rendering_update = true };
 
-    cancel_smooth_scroll_taken_over_by_user_input(*target);
-    auto operation_id = ++m_next_async_scroll_operation_id;
+    for (auto& animation : m_smooth_scroll_animations) {
+        if (animation.stable_node_id != stable_node_id || !animation.is_user_scroll || animation.animation.kind() != Compositing::ScrollAnimationKind::SmoothScroll)
+            continue;
+        retarget_user_scroll(animation, destination, now);
+        animation.heads_to_an_extent = scrolls_to_extent;
+        report_started_user_scroll(animation.operation_id, stable_node_id, step_start, destination, Compositing::ScrollAnimationKind::SmoothScroll, scrolls_to_extent);
+        return {
+            .accepted = true,
+            .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
+            .should_request_rendering_update = true,
+        };
+    }
+
+    cancel_smooth_scroll_taken_over_by_user_input(target);
+    auto operation_id = m_async_scroll_update_outbox.allocate_operation_id();
     m_smooth_scroll_animations.append({
         .stable_node_id = stable_node_id,
         .operation_id = operation_id,
         .animation = Compositing::SmoothScrollAnimation { *current_offset, destination, m_async_scroll_tree.device_pixels_per_css_pixel() },
         .started_at = now,
         .is_user_scroll = true,
+        .heads_to_an_extent = scrolls_to_extent,
     });
-    m_started_user_scrolls.append({
-        .stable_node_id = stable_node_id,
-        .operation_id = operation_id,
-        .initial_scroll_offset = m_async_scroll_tree.css_pixels_from_device_offset(*current_offset),
-        .unsnapped_scroll_destination = m_async_scroll_tree.css_pixels_from_device_offset(destination),
-        .selection = { .position = m_async_scroll_tree.css_pixels_from_device_offset(destination) },
-        .settles_gesture = false,
-    });
+    report_started_user_scroll(operation_id, stable_node_id, step_start, destination, Compositing::ScrollAnimationKind::SmoothScroll, scrolls_to_extent);
     return {
         .accepted = true,
         .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
@@ -481,8 +399,8 @@ Compositing::ScrollStateSnapshot ContextState::scroll_state_snapshot_at_keyboard
 {
     Compositing::ScrollStateSnapshot snapshot { m_scroll_state_snapshot };
     for (auto const& running_animation : m_smooth_scroll_animations) {
-        // A key takes over a programmatic animation from the presented offset, rather than its destination.
-        if (!running_animation.is_user_scroll)
+        // A key continues a keyboard animation, but takes over other animations from the presented offset.
+        if (!running_animation.is_user_scroll || running_animation.animation.kind() != Compositing::ScrollAnimationKind::SmoothScroll)
             continue;
         auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(running_animation.stable_node_id);
         if (!node_id.has_value())
@@ -499,37 +417,144 @@ Compositing::ScrollStateSnapshot ContextState::scroll_state_snapshot_at_keyboard
 ContextState::ContextUpdateResult ContextState::handle_mouse_event(Web::MouseEvent const& event)
 {
     if (!presents_to_client())
-        return {};
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::ContextNotPresenting);
 
     auto position = Gfx::FloatPoint {
         static_cast<float>(event.position.x().value()),
         static_cast<float>(event.position.y().value()),
     };
+    return handle_mouse_event_at(event, position);
+}
 
-    if (m_scrollbar_controller.is_empty())
+ContextState::ContextUpdateResult ContextState::handle_mouse_event_from_containing_context(Web::MouseEvent const& event, Gfx::FloatPoint position)
+{
+    return handle_mouse_event_at(event, position);
+}
+
+// The compositor presents how scrollbars expand, outside of what damage tracking sees.
+Optional<PendingFrame> ContextState::frame_repainting_scrollbars() const
+{
+    if (m_async_scrolling_viewport_rect.is_empty())
         return {};
+    return PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
+}
 
-    // The compositor paints how its own scrollbars expand, outside of what damage tracking sees.
-    auto frame_repainting_scrollbars_painted_by_compositor = [&]() -> Optional<PendingFrame> {
-        if (m_async_scrolling_viewport_rect.is_empty())
+Optional<PendingFrame> ContextState::clear_scrollbar_hover()
+{
+    if (!m_scrollbar_controller.set_hovered_scrollbar({}))
+        return {};
+    return frame_repainting_scrollbars();
+}
+
+Optional<size_t> ContextState::scrollbar_under_pointer(Gfx::FloatPoint position)
+{
+    if (auto scrollbar_index = m_scrollbar_controller.hit_test_scrollbar_painted_by_compositor(m_async_scroll_tree, m_scroll_state_snapshot, position); scrollbar_index.has_value())
+        return scrollbar_index;
+    return m_scrollbar_controller.hit_test_scrollbar_painted_by_display_list(m_async_scroll_tree, m_scene.visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
+}
+
+// The compositor paints its own scrollbars over everything, so a nested context only takes the pointer where none of
+// them is under it, and where no scrollbar the display list paints comes after the nested context's content in paint
+// order. A press passes by a scrollbar that has faded out, as it does here.
+Optional<Compositing::NestedContextHit> ContextState::nested_context_taking_mouse_event_at(Web::MouseEvent::Type type, Gfx::FloatPoint position)
+{
+    if (!m_has_async_scrolling_state)
+        return {};
+    auto const& visual_context_tree = m_scene.visual_context_tree_for_compositing();
+    auto hit = m_async_scroll_tree.nested_context_at(visual_context_tree, position);
+    if (!hit.has_value())
+        return {};
+    if (auto scrollbar_index = m_scrollbar_controller.hit_test_scrollbar_painted_by_compositor(m_async_scroll_tree, m_scroll_state_snapshot, position); scrollbar_index.has_value()) {
+        if (type != Web::MouseEvent::Type::MouseDown || m_scrollbar_controller.is_shown(*scrollbar_index))
             return {};
-        return PendingFrame::repainting_everything(m_async_scrolling_viewport_rect);
+    }
+    if (auto scrollbar_index = m_scrollbar_controller.hit_test_scrollbar_painted_by_display_list(m_async_scroll_tree, visual_context_tree, m_scroll_state_snapshot, position); scrollbar_index.has_value()) {
+        if (m_scrollbar_controller.scrollbars()[*scrollbar_index].paint_order_index > hit->paint_order_index)
+            return {};
+    }
+    return hit;
+}
+
+Optional<Compositing::NestedContextHit> ContextState::position_in_content_of_nested_context(Web::CompositorContextId nested_context_id, Gfx::FloatPoint position)
+{
+    if (!m_has_async_scrolling_state)
+        return {};
+    return m_async_scroll_tree.position_in_content_of_nested_context(nested_context_id, m_scene.visual_context_tree_for_compositing(), position);
+}
+
+ContextState::ContextUpdateResult ContextState::handle_mouse_event_at(Web::MouseEvent const& event, Gfx::FloatPoint position)
+{
+    if (m_scrollbar_controller.is_empty() && !m_async_scroll_tree.has_nested_contexts())
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::NotOverAScrollbar);
+
+    auto scroller_of_scrollbar = [&](size_t scrollbar_index) {
+        return m_scrollbar_controller.scrollbars()[scrollbar_index].scroller_stable_node_id;
+    };
+
+    // The pointer goes on into a nested context, and leaves the scrollbar here it was over.
+    auto hand_to_nested_context = [&](Compositing::NestedContextHit const& hit) {
+        return ContextUpdateResult {
+            .frame_to_present = clear_scrollbar_hover(),
+            .nested_context_mouse_hit = hit,
+        };
     };
 
     switch (event.type) {
     case Web::MouseEvent::Type::MouseDown: {
         if (event.button != Web::UIEvents::MouseButton::Primary)
-            return {};
+            return ContextUpdateResult::declined(Web::InputRoutingDecision::NotPrimaryButton);
 
-        auto drag = m_scrollbar_controller.begin_drag(m_async_scroll_tree, visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
+        if (auto hit = nested_context_taking_mouse_event_at(event.type, position); hit.has_value())
+            return hand_to_nested_context(*hit);
+
+        auto drag = m_scrollbar_controller.begin_drag(m_async_scroll_tree, m_scene.visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
         if (!drag.has_value())
-            return {};
+            return ContextUpdateResult::declined(Web::InputRoutingDecision::NotOverAScrollbar);
+        m_scrollbar_press_scroll_operation.clear();
+        stop_scrollbar_paging();
 
         ContextUpdateResult result;
         result.accepted = true;
-        result.scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list();
-        if (!result.scrollbar_dragged_by_compositor.has_value())
-            result.frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
+        result.routing_decision = Web::InputRoutingDecision::BeganScrollbarDrag;
+        result.routed_scroller = scroller_of_scrollbar(drag->scrollbar_index);
+        result.scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list(m_context_id);
+        result.frame_to_present = frame_repainting_scrollbars();
+
+        // A press beside the thumb pages toward the pointer or jumps there, as the platform says, and a modifier swaps
+        // the two.
+        auto press_jumps = m_scrollbar_track_press_jumps != static_cast<bool>(event.modifiers & scrollbar_track_press_inverting_modifier);
+        if (drag->is_press_beside_thumb && !press_jumps) {
+            auto const& scrollbar = m_scrollbar_controller.scrollbars()[drag->scrollbar_index];
+            auto scroll_offset = m_async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_id, m_scroll_state_snapshot);
+            VERIFY(scroll_offset.has_value());
+            m_scrollbar_paging = ScrollbarPaging {
+                .direction = m_scrollbar_controller.paging_direction(drag->scrollbar_index, drag->primary_position, *scroll_offset),
+                .primary_position = drag->primary_position,
+            };
+            if (auto frame_to_present = page_captured_scrollbar(); frame_to_present.has_value()) {
+                result.frame_to_present = *frame_to_present;
+                result.should_request_rendering_update = true;
+            }
+            if (!m_scrollbar_paging_timer) {
+                m_scrollbar_paging_timer = Core::Timer::create_single_shot(scrollbar_paging_initial_delay, [this] {
+                    // Paging ends with the press, and with the scrollbar the press holds.
+                    if (!m_scrollbar_paging.has_value() || !m_scrollbar_controller.has_captured_scrollbar()) {
+                        stop_scrollbar_paging();
+                        return;
+                    }
+                    // Once the thumb reaches the pointer, paging waits for the pointer to move.
+                    if (!page_captured_scrollbar().has_value())
+                        return;
+                    request_rendering_update();
+                    if (m_request_animation_frames)
+                        m_request_animation_frames();
+                    m_scrollbar_paging_timer->restart(scrollbar_paging_repeat_interval);
+                });
+            }
+            m_scrollbar_paging_timer->restart(scrollbar_paging_initial_delay);
+            return result;
+        }
+
         if (auto frame_to_present = apply_scrollbar_drag(*drag); frame_to_present.has_value()) {
             result.frame_to_present = *frame_to_present;
             result.should_request_rendering_update = true;
@@ -538,55 +563,77 @@ ContextState::ContextUpdateResult ContextState::handle_mouse_event(Web::MouseEve
     }
     case Web::MouseEvent::Type::MouseMove: {
         if (m_scrollbar_controller.has_captured_scrollbar()) {
-            auto scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list();
-            auto drag = m_scrollbar_controller.captured_drag(visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
+            auto scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list(m_context_id);
+            auto drag = m_scrollbar_controller.captured_drag(m_scene.visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
             VERIFY(drag.has_value());
-            auto frame_to_present = apply_scrollbar_drag(*drag);
+            // While paging, the pointer only says where the thumb pages to.
+            Optional<PendingFrame> frame_to_present;
+            if (m_scrollbar_paging.has_value()) {
+                m_scrollbar_paging->primary_position = drag->primary_position;
+                if (!m_scrollbar_paging_timer->is_active())
+                    m_scrollbar_paging_timer->restart(scrollbar_paging_repeat_interval);
+            } else {
+                frame_to_present = apply_scrollbar_drag(*drag);
+            }
             return {
                 .accepted = true,
                 .frame_to_present = frame_to_present,
                 .should_request_rendering_update = frame_to_present.has_value(),
                 .scrollbar_dragged_by_compositor = scrollbar_dragged_by_compositor,
+                .routing_decision = Web::InputRoutingDecision::ContinuedScrollbarDrag,
+                .routed_scroller = scroller_of_scrollbar(drag->scrollbar_index),
             };
         }
 
-        // The main thread hovers the scrollbars the display list paints.
-        auto hovered_scrollbar_index = m_scrollbar_controller.hit_test_scrollbar_painted_by_compositor(m_async_scroll_tree, m_scroll_state_snapshot, position);
+        if (auto hit = nested_context_taking_mouse_event_at(event.type, position); hit.has_value())
+            return hand_to_nested_context(*hit);
+
+        auto hovered_scrollbar_index = scrollbar_under_pointer(position);
         Optional<PendingFrame> frame_to_present;
         if (m_scrollbar_controller.set_hovered_scrollbar(hovered_scrollbar_index))
-            frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
+            frame_to_present = frame_repainting_scrollbars();
+        if (!hovered_scrollbar_index.has_value())
+            return { .frame_to_present = frame_to_present, .routing_decision = Web::InputRoutingDecision::NotOverAScrollbar };
+        // The page sees the pointer move over a scrollbar the display list paints, as it is part of the page's content.
+        auto is_painted_by_compositor = m_scrollbar_controller.scrollbars()[*hovered_scrollbar_index].is_painted_by_compositor;
         return {
-            .accepted = hovered_scrollbar_index.has_value(),
+            .accepted = is_painted_by_compositor,
             .frame_to_present = frame_to_present,
             .should_request_rendering_update = false,
+            .routing_decision = is_painted_by_compositor ? Web::InputRoutingDecision::HoveringScrollbarPaintedByCompositor : Web::InputRoutingDecision::HoveringScrollbarPaintedByDisplayList,
+            .routed_scroller = scroller_of_scrollbar(*hovered_scrollbar_index),
         };
     }
     case Web::MouseEvent::Type::MouseUp: {
         if (event.button != Web::UIEvents::MouseButton::Primary)
-            return {};
+            return ContextUpdateResult::declined(Web::InputRoutingDecision::NotPrimaryButton);
 
-        auto was_dragging_scrollbar = m_scrollbar_controller.has_captured_scrollbar();
-        auto scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list();
-        auto drag = m_scrollbar_controller.release_captured_drag(visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
+        auto box_of_dragged_scrollbar = box_of_captured_scrollbar();
+        auto scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list(m_context_id);
+        auto drag = m_scrollbar_controller.release_captured_drag(m_scene.visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
+        auto was_paging = m_scrollbar_paging.has_value();
+        stop_scrollbar_paging();
         if (!drag.has_value())
-            return {};
+            return ContextUpdateResult::declined(Web::InputRoutingDecision::NoScrollbarDrag);
 
-        note_user_scroll_gesture_end_if_drag_ended(was_dragging_scrollbar);
+        note_user_scroll_gesture_end_if_drag_ended(box_of_dragged_scrollbar);
 
         ContextUpdateResult result;
         result.accepted = true;
+        result.routing_decision = Web::InputRoutingDecision::EndedScrollbarDrag;
+        result.routed_scroller = scroller_of_scrollbar(drag->scrollbar_index);
         result.scrollbar_dragged_by_compositor = scrollbar_dragged_by_compositor;
         // The main thread learns of the release from the next update it takes, so one is asked for even when the
         // release scrolls nothing.
         result.should_request_rendering_update = true;
-        if (!scrollbar_dragged_by_compositor.has_value())
-            result.frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
-        if (auto frame_to_present = apply_scrollbar_drag(*drag); frame_to_present.has_value())
-            result.frame_to_present = *frame_to_present;
+        result.frame_to_present = frame_repainting_scrollbars();
+        if (!was_paging) {
+            if (auto frame_to_present = apply_scrollbar_drag(*drag); frame_to_present.has_value())
+                result.frame_to_present = *frame_to_present;
+        }
 
-        auto hovered_scrollbar_index = m_scrollbar_controller.hit_test_scrollbar_painted_by_compositor(m_async_scroll_tree, m_scroll_state_snapshot, position);
-        if (m_scrollbar_controller.set_hovered_scrollbar(hovered_scrollbar_index)) {
-            if (auto frame_to_present = frame_repainting_scrollbars_painted_by_compositor(); frame_to_present.has_value())
+        if (m_scrollbar_controller.set_hovered_scrollbar(scrollbar_under_pointer(position))) {
+            if (auto frame_to_present = frame_repainting_scrollbars(); frame_to_present.has_value())
                 result.frame_to_present = frame_to_present;
         }
 
@@ -596,13 +643,31 @@ ContextState::ContextUpdateResult ContextState::handle_mouse_event(Web::MouseEve
         auto had_capture = m_scrollbar_controller.has_captured_scrollbar();
         Optional<PendingFrame> frame_to_present;
         if (m_scrollbar_controller.set_hovered_scrollbar({}))
-            frame_to_present = frame_repainting_scrollbars_painted_by_compositor();
+            frame_to_present = frame_repainting_scrollbars();
         return {
             .accepted = had_capture,
             .frame_to_present = frame_to_present,
             .should_request_rendering_update = false,
-            .scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list(),
+            .scrollbar_dragged_by_compositor = m_scrollbar_controller.captured_scrollbar_painted_by_display_list(m_context_id),
+            .routing_decision = had_capture ? Web::InputRoutingDecision::LeftDuringScrollbarDrag : Web::InputRoutingDecision::NoScrollbarDrag,
         };
+    }
+    case Web::MouseEvent::Type::MouseCancel: {
+        // A cancel ends a drag where it last scrolled to, as a cancel has no position of its own, and the pointer then
+        // counts as having left. The page still sees the cancel, so it is not accepted.
+        auto was_dragging_scrollbar = m_scrollbar_controller.has_captured_scrollbar();
+        auto box_of_dragged_scrollbar = box_of_captured_scrollbar();
+        (void)m_scrollbar_controller.release_captured_drag(m_scene.visual_context_tree_for_compositing(), m_scroll_state_snapshot, position);
+        stop_scrollbar_paging();
+        note_user_scroll_gesture_end_if_drag_ended(box_of_dragged_scrollbar);
+        auto hovered_scrollbar_changed = m_scrollbar_controller.set_hovered_scrollbar({});
+
+        ContextUpdateResult result;
+        // As for a release, the main thread learns that the drag ended from the next update it takes.
+        result.should_request_rendering_update = was_dragging_scrollbar;
+        if (was_dragging_scrollbar || hovered_scrollbar_changed)
+            result.frame_to_present = frame_repainting_scrollbars();
+        return result;
     }
     case Web::MouseEvent::Type::MouseWheel:
         return {};
@@ -615,18 +680,16 @@ ContextState::ContextUpdateResult ContextState::handle_pinch_event(Web::PinchEve
 {
     if (!presents_to_client())
         return {};
-    if (!m_can_accept_async_wheel_events)
+    if (!m_wheel_gesture_routing.admits_async_pinch())
         return {};
-    if (m_has_blocking_wheel_event_listeners)
-        return {};
-    if (!m_visual_context_tree.has_value())
+    if (!m_scene.visual_context_tree().has_value())
         return {};
 
     auto scale = 1.0 + event.scale_delta;
     if (scale == 1.0)
         return {};
 
-    auto transform = m_async_visual_viewport_transform.value_or(m_visual_context_tree->visual_viewport_transform());
+    auto transform = m_scene.visual_viewport_transform();
     auto old_scale = transform.matrix[0, 0];
     if (old_scale <= 0)
         return {};
@@ -644,11 +707,27 @@ ContextState::ContextUpdateResult ContextState::handle_pinch_event(Web::PinchEve
         * Gfx::scale_matrix(Gfx::FloatVector3 { applied_scale, applied_scale, 1 })
         * Gfx::translation_matrix(Gfx::FloatVector3 { -position.x(), -position.y(), 0 });
 
+    auto old_scroll_offset = visual_viewport_scroll_offset(transform);
     transform.matrix = gesture_transform * transform.matrix;
     clamp_visual_viewport_transform_to_viewport(transform, m_async_scrolling_viewport_rect);
-    invalidate_visual_context_tree_for_compositing();
-    m_async_visual_viewport_transform = transform;
+    m_scene.set_async_visual_viewport_transform(transform);
     rebuild_wheel_hit_test_targets();
+
+    m_visual_viewport_document_id = m_async_scroll_tree.document_id();
+    if (auto document_id = m_async_scroll_tree.document_id(); document_id.has_value()) {
+        note_user_input_scrolled({ .node_id = document_id.value(), .kind = Web::AsyncScrollNodeKind::VisualViewport });
+        auto new_scroll_offset = visual_viewport_scroll_offset(transform);
+        Compositing::AsyncScrollOffset scroll_offset {
+            .stable_node_id = { .node_id = document_id.value(), .kind = Web::AsyncScrollNodeKind::VisualViewport },
+            .compositor_scroll_offset = new_scroll_offset,
+            .unadopted_scroll_delta = new_scroll_offset - old_scroll_offset,
+            .last_relative_scroll_delta = {},
+            .visual_viewport_scale = transform.matrix[0, 0],
+            .applied_scroll_request_id = 0,
+            .user_input_scroll_count = 0,
+        };
+        store_pending_async_scroll_offsets({ &scroll_offset, 1 });
+    }
 
     return {
         .accepted = true,
@@ -665,7 +744,7 @@ Compositing::AsyncScrollOperationID ContextState::start_snap_scroll(Compositing:
     auto running_animation = m_smooth_scroll_animations.find_if([&](auto const& animation) { return animation.stable_node_id == stable_node_id; });
     if (running_animation != m_smooth_scroll_animations.end()) {
         if (!m_scroll_snap_controller.is_snap_scroll(stable_node_id, running_animation->operation_id))
-            m_async_scroll_operation_ids_taken_over_by_user_input.append(running_animation->operation_id);
+            m_async_scroll_update_outbox.note_operation_taken_over_by_user_input(running_animation->operation_id);
         // Keep the accumulation state the controller just recorded when selecting this snap destination.
         retire_smooth_scroll_animation(stable_node_id);
     }
@@ -673,22 +752,27 @@ Compositing::AsyncScrollOperationID ContextState::start_snap_scroll(Compositing:
     auto current_offset = m_async_scroll_tree.scroll_offset_for_node(node_id, m_scroll_state_snapshot);
     VERIFY(current_offset.has_value());
     auto destination = snap_scroll.selection.position;
-    auto operation_id = ++m_next_async_scroll_operation_id;
+    auto operation_id = m_async_scroll_update_outbox.allocate_operation_id();
     m_smooth_scroll_animations.append({
         .stable_node_id = stable_node_id,
         .operation_id = operation_id,
         .animation = Compositing::SmoothScrollAnimation { *current_offset, m_async_scroll_tree.device_offset_from_css_pixels(destination), m_async_scroll_tree.device_pixels_per_css_pixel(), snap_scroll.animation_kind },
         .started_at = now,
         .is_user_scroll = true,
+        .heads_to_an_extent = false,
     });
     m_scroll_snap_controller.did_start_snap_scroll(stable_node_id, operation_id, destination);
-    m_started_user_scrolls.append({
+    note_user_input_scrolled(stable_node_id);
+    m_async_scroll_update_outbox.record_started_user_scroll({
         .stable_node_id = stable_node_id,
         .operation_id = operation_id,
         .initial_scroll_offset = snap_scroll.initial_scroll_offset,
         .unsnapped_scroll_destination = snap_scroll.unsnapped_scroll_destination,
+        .relative_scroll_delta = snap_scroll.relative_scroll_delta,
         .selection = move(snap_scroll.selection),
         .settles_gesture = settles_gesture,
+        .is_absolute_scroll = snap_scroll.is_absolute_scroll,
+        .animation_kind = snap_scroll.animation_kind,
     });
     return operation_id;
 }
@@ -717,43 +801,149 @@ Gfx::IntRect ContextState::note_async_scrolling_viewport_rect(Gfx::IntRect viewp
     return viewport_rect;
 }
 
-ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Compositing::AsyncScrollOperationTracking operation_tracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining scroll_chaining)
+ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Compositing::AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Compositing::AsyncScrollOperationTracking operation_tracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining scroll_chaining, VisualViewportPanning visual_viewport_panning)
+{
+    bool pans_visual_viewport = visual_viewport_panning == VisualViewportPanning::BeforeScrolling;
+    auto magnification = pans_visual_viewport ? m_scene.visual_viewport_magnification() : 1.0f;
+    auto step_delta = delta.scaled(1.0f / magnification);
+
+    auto const* latched_node = m_async_scroll_tree.scroll_node_for_id(node_id);
+    bool step_can_stretch_elastically = wheel_step_can_stretch_elastically(wheel_delta_precision, scroll_gesture_phase);
+    bool fingers_can_stretch_latched_scroller = step_can_stretch_elastically && scroll_gesture_phase == Web::ScrollGesturePhase::Ongoing && latched_node;
+    bool momentum_can_bounce_latched_scroller = step_can_stretch_elastically && scroll_gesture_phase == Web::ScrollGesturePhase::Momentum && latched_node
+        && m_wheel_gesture_routing.momentum_of_latched_gesture_can_spring_scroller_back();
+    auto presented_stretch_of_latched_scroller = [&]() -> Gfx::FloatPoint {
+        if (!latched_node)
+            return {};
+        return m_elastic_overscroll_controller.stretch_of(latched_node->stable_node_id);
+    };
+    auto stretch_before_step = presented_stretch_of_latched_scroller();
+
+    // Momentum only arrives once the fingers have lifted, and its first step can be the first sign that they did.
+    if (step_can_stretch_elastically && scroll_gesture_phase == Web::ScrollGesturePhase::Momentum)
+        m_elastic_overscroll_controller.release_held_by_fingers(now);
+    if (momentum_can_bounce_latched_scroller && m_elastic_overscroll_controller.has_active_overscroll_of(latched_node->stable_node_id)) {
+        // The fingers lifted from a stretched scroller, which this momentum already springs back with.
+        m_wheel_gesture_routing.set_momentum_of_latched_gesture_has_sprung_scroller_back(true);
+        momentum_can_bounce_latched_scroller = false;
+    }
+
+    // A stretched scroller is past the edge of everything the gesture moves, so the fingers relax the stretch before
+    // they pan the visual viewport away from its own edge.
+    auto delta_left = delta;
+    if (fingers_can_stretch_latched_scroller) {
+        m_wheel_gesture_routing.set_momentum_of_latched_gesture_has_sprung_scroller_back(false);
+        auto step_delta_left = m_elastic_overscroll_controller.relax_by(latched_node->stable_node_id, step_delta);
+        if (step_delta_left != step_delta)
+            delta_left = step_delta_left.scaled(magnification);
+    }
+
+    WheelScrollOutcome outcome;
+    bool visual_viewport_took_rest_of_step = false;
+    if (pans_visual_viewport) {
+        auto panned_delta = pan_visual_viewport_by(delta_left);
+        if (!panned_delta.is_zero()) {
+            delta_left -= panned_delta;
+            visual_viewport_took_rest_of_step = delta_left.is_zero();
+            outcome.viewport_rect_to_present = note_async_scrolling_viewport_rect(viewport_rect, {});
+        }
+    }
+
+    Optional<Gfx::FloatPoint> delta_the_scroller_did_not_scroll_by;
+    if (!visual_viewport_took_rest_of_step) {
+        auto node_scroll = scroll_node_by_wheel_delta(node_id, delta_left.scaled(1.0f / magnification), wheel_delta_precision, scroll_gesture_phase, operation_tracking, viewport_rect, now, scroll_chaining);
+        outcome.operation_id = node_scroll.outcome.operation_id;
+        if (node_scroll.outcome.viewport_rect_to_present.has_value())
+            outcome.viewport_rect_to_present = node_scroll.outcome.viewport_rect_to_present;
+        delta_the_scroller_did_not_scroll_by = node_scroll.delta_the_node_did_not_scroll_by;
+    }
+
+    if (delta_the_scroller_did_not_scroll_by.has_value()) {
+        if (fingers_can_stretch_latched_scroller) {
+            pull_elastic_overscroll_by(*latched_node, step_delta, *delta_the_scroller_did_not_scroll_by);
+        } else if (momentum_can_bounce_latched_scroller && pull_elastic_overscroll_by(*latched_node, step_delta, *delta_the_scroller_did_not_scroll_by)) {
+            // Momentum that carries a scroller into its edge bounces it: the velocity it arrives with takes the
+            // rebound out past the edge before the rebound brings it back.
+            m_elastic_overscroll_controller.release_held_by_fingers(now);
+            m_wheel_gesture_routing.set_momentum_of_latched_gesture_has_sprung_scroller_back(true);
+        }
+    }
+
+    if (!outcome.viewport_rect_to_present.has_value() && presented_stretch_of_latched_scroller() != stretch_before_step) {
+        outcome.viewport_rect_to_present = note_async_scrolling_viewport_rect(viewport_rect, {});
+        outcome.only_elastic_overscroll_changed = true;
+    }
+    return outcome;
+}
+
+ContextState::NodeScrollByWheelDelta ContextState::scroll_node_by_wheel_delta(Compositing::AsyncScrollNodeID node_id, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Compositing::AsyncScrollOperationTracking operation_tracking, Gfx::IntRect viewport_rect, MonotonicTime now, Compositing::ScrollChaining scroll_chaining)
 {
     WheelScrollOutcome outcome;
+    Optional<Compositing::WheelScrollTarget> wheel_scroll_target;
+    if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete) {
+        wheel_scroll_target = m_async_scroll_tree.select_wheel_scroll_target(node_id, delta, m_scroll_state_snapshot, [this](auto stable_node_id) { return in_flight_wheel_destination(stable_node_id); }, scroll_chaining);
+        if (wheel_scroll_target.has_value()) {
+            node_id = *m_async_scroll_tree.scroll_node_id_for_stable_id(wheel_scroll_target->stable_node_id);
+            m_wheel_gesture_routing.relatch_to(wheel_scroll_target->stable_node_id);
+        }
+    }
     auto css_delta = m_async_scroll_tree.css_pixels_from_device_offset(delta);
 
     Optional<ScrollSnapController::StepDecision> decision;
-    if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete)
-        decision = m_scroll_snap_controller.decide_discrete_step(m_async_scroll_tree, m_scroll_state_snapshot, node_id, css_delta, now);
-    else if (scroll_gesture_phase == Web::ScrollGesturePhase::Momentum)
+    if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete) {
+        Optional<Web::CSSPixelPoint> scroll_in_flight_destination;
+        if (auto const* node = m_async_scroll_tree.scroll_node_for_id(node_id))
+            scroll_in_flight_destination = in_flight_wheel_destination(node->stable_node_id).map([&](auto offset) { return m_async_scroll_tree.css_pixels_from_device_offset(offset); });
+        decision = m_scroll_snap_controller.decide_discrete_step(m_async_scroll_tree, m_scroll_state_snapshot, node_id, css_delta, scroll_in_flight_destination, now);
+    } else if (scroll_gesture_phase == Web::ScrollGesturePhase::Momentum) {
         decision = m_scroll_snap_controller.decide_momentum_delta(m_async_scroll_tree, m_scroll_state_snapshot, node_id, css_delta);
+    }
 
     if (decision.has_value()) {
         schedule_end_of_scroll_step_gestures(now);
         if (auto* snap_scroll = decision->get_pointer<ScrollSnapController::SnapScrollStart>()) {
+            if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete)
+                snap_scroll->animation_kind = Compositing::ScrollAnimationKind::Wheel;
             auto operation_id = start_snap_scroll(node_id, move(*snap_scroll), false, now);
             if (operation_tracking == Compositing::AsyncScrollOperationTracking::Yes)
                 outcome.operation_id = operation_id;
             outcome.viewport_rect_to_present = note_async_scrolling_viewport_rect(viewport_rect, {});
-            return outcome;
+            return { outcome, {} };
         }
         if (operation_tracking == Compositing::AsyncScrollOperationTracking::Yes) {
-            outcome.operation_id = ++m_next_async_scroll_operation_id;
-            m_completed_async_scroll_operation_ids.append(*outcome.operation_id);
+            outcome.operation_id = m_async_scroll_update_outbox.allocate_operation_id();
+            m_async_scroll_update_outbox.complete_operation(*outcome.operation_id);
         }
-        return outcome;
+        return { outcome, {} };
+    }
+
+    if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete) {
+        auto result = smooth_wheel_scroll_by(wheel_scroll_target, viewport_rect, now);
+        outcome.operation_id = result.enqueue_result.operation_id;
+        if (result.frame_to_present.has_value())
+            outcome.viewport_rect_to_present = viewport_rect;
+        return { outcome, {} };
     }
 
     cancel_smooth_scroll_taken_over_by_user_input(node_id);
     if (operation_tracking == Compositing::AsyncScrollOperationTracking::Yes)
-        outcome.operation_id = ++m_next_async_scroll_operation_id;
+        outcome.operation_id = m_async_scroll_update_outbox.allocate_operation_id();
 
-    auto scroll_offset = m_async_scroll_tree.apply_scroll_delta(node_id, delta, current_visual_context_tree(), m_scroll_state_snapshot, scroll_chaining);
+    auto scroll_offset = m_async_scroll_tree.apply_scroll_delta(node_id, delta, m_scene.current_visual_context_tree(), m_scroll_state_snapshot, scroll_chaining);
     if (!scroll_offset.has_value()) {
         if (outcome.operation_id.has_value())
-            m_completed_async_scroll_operation_ids.append(*outcome.operation_id);
-        return outcome;
+            m_async_scroll_update_outbox.complete_operation(*outcome.operation_id);
+        return { outcome, delta };
     }
+
+    note_user_input_scrolled(scroll_offset->stable_node_id);
+
+    // On the first step of a gesture, scroll node chaining may have scrolled an ancestor instead, which took the delta.
+    auto const* node = m_async_scroll_tree.scroll_node_for_id(node_id);
+    bool an_ancestor_scrolled = node && scroll_offset->stable_node_id != node->stable_node_id;
+    Optional<Gfx::FloatPoint> delta_the_node_did_not_scroll_by;
+    if (!an_ancestor_scrolled)
+        delta_the_node_did_not_scroll_by = delta - scroll_offset->unadopted_scroll_delta;
 
     // The box the delta moved is the one a gesture pans; on the first step of a gesture, scroll node chaining may have
     // moved an ancestor of the node the gesture latched to.
@@ -767,7 +957,7 @@ ContextState::WheelScrollOutcome ContextState::perform_wheel_scroll_of_node(Comp
     rebuild_wheel_hit_test_targets();
     store_pending_async_scroll_offsets({ &*scroll_offset, 1 }, outcome.operation_id);
     outcome.viewport_rect_to_present = note_async_scrolling_viewport_rect(viewport_rect, scroll_offset);
-    return outcome;
+    return { outcome, delta_the_node_did_not_scroll_by };
 }
 
 ContextState::AsyncScrollResult ContextState::async_scroll_by(
@@ -779,89 +969,435 @@ ContextState::AsyncScrollResult ContextState::async_scroll_by(
     Web::ScrollGesturePhase scroll_gesture_phase,
     u32 modifiers,
     Compositing::AsyncScrollOperationTracking operation_tracking,
+    Compositing::WheelStepDispatch wheel_step_dispatch,
+    u64 input_event_id,
     Optional<MonotonicTime> now_for_testing)
 {
-    if (!m_can_accept_async_wheel_events)
-        return {};
-
     auto now = now_for_testing.value_or(MonotonicTime::now());
+
+    // Nothing hit tests a wheel before the first display list shows where the scrollers are, and the page can let a
+    // touchpad step through to here before then.
+    if (!m_has_async_scrolling_state)
+        return AsyncScrollResult::declined(Web::InputRoutingDecision::NoAsyncScrollingState);
+
+    // The UI hands this context every wheel event before WebContent's main thread passes it on. A step that the main
+    // thread passes on after the UI sent one it cannot come before must neither latch a scroller nor pull a stretch,
+    // since nothing would be left to let go of either.
+    bool step_came_from_ui = input_event_id != 0 && presents_to_client();
+    if (step_came_from_ui && m_wheel_gesture_routing.step_was_overtaken_by_ui(scroll_gesture_phase, input_event_id))
+        return AsyncScrollResult::declined(Web::InputRoutingDecision::StepOvertakenByUI);
+
+    // The end of a gesture lets go of the scroller it stretched even if the context has stopped taking wheel events.
+    if (scroll_gesture_phase == Web::ScrollGesturePhase::Ended)
+        m_elastic_overscroll_controller.end_gesture(now);
+
+    // Blocking wheel event listeners have nothing left to hold back once the page has dispatched a step and did not
+    // cancel it. The compositor then scrolls the step of a touchpad gesture, so that the gesture stretches the edges
+    // it pulls past as it does where nothing holds its steps back.
+    bool page_let_touchpad_step_through = wheel_step_dispatch == Compositing::WheelStepDispatch::DispatchedAndNotCanceled
+        && step_came_from_ui
+        && wheel_delta_precision == Web::WheelDeltaPrecision::Precise
+        && first_is_one_of(scroll_gesture_phase, Web::ScrollGesturePhase::Ongoing, Web::ScrollGesturePhase::Momentum);
+    bool only_blocking_wheel_event_listeners_hold_steps_back = m_wheel_gesture_routing.only_blocking_wheel_event_listeners_hold_steps_back();
+
+    // A step the UI never sent, such as one a test makes on the main thread, is noted as the UI's events are.
+    if (input_event_id == 0)
+        m_wheel_gesture_routing.note_wheel_event(input_event_id, scroll_gesture_phase, modifiers, delta, position, m_async_scroll_tree, now);
+    auto latch = resolve_wheel_scroll_latch(scroll_gesture_phase);
+    // The compositor hands every step of a gesture latched to a nested context's scroller to that context itself.
+    if (latch.nested_context_id.has_value())
+        return AsyncScrollResult::declined(Web::InputRoutingDecision::ScrollerInOtherDocument);
+    auto latched_node_id = latch.node_id;
+    // The end of the gesture before this one may never have arrived. Whether a step of the UI starts another gesture
+    // was decided when the UI sent it.
+    if (!latched_node_id.has_value() && !step_came_from_ui)
+        m_elastic_overscroll_controller.end_gesture(now);
+
+    if (!m_wheel_gesture_routing.admits_async_wheel()
+        && !step_continues_touchpad_gesture_the_page_let_through(latched_node_id, wheel_delta_precision, scroll_gesture_phase)
+        && !(page_let_touchpad_step_through && only_blocking_wheel_event_listeners_hold_steps_back))
+        return AsyncScrollResult::declined(Compositing::input_routing_decision_for_wheel_step_not_admitted_by(m_wheel_gesture_routing.admission()));
+
     m_scroll_snap_controller.note_gesture_phase(scroll_gesture_phase);
-    auto latched_node_id = resolve_wheel_scroll_latch(position, scroll_gesture_phase, modifiers, now);
 
     // The end of a gesture carries no delta to hit test; it snaps the boxes the gesture panned.
     if (scroll_gesture_phase == Web::ScrollGesturePhase::Ended && delta.is_zero()) {
         auto operation_id = snap_at_gesture_end(now);
         if (!operation_id.has_value())
-            return {};
+            return AsyncScrollResult::declined(Web::InputRoutingDecision::GestureEndWithNothingToSnap);
         m_async_scrolling_viewport_rect = viewport_rect;
         return {
-            .enqueue_result = { true, operation_tracking == Compositing::AsyncScrollOperationTracking::Yes ? operation_id : Optional<Compositing::AsyncScrollOperationID> {} },
+            .enqueue_result = {
+                .accepted = true,
+                .operation_id = operation_tracking == Compositing::AsyncScrollOperationTracking::Yes ? operation_id : Optional<Compositing::AsyncScrollOperationID> {},
+                .routing_decision = Web::InputRoutingDecision::SnappedAtGestureEnd,
+            },
             .frame_to_present = PendingFrame::repainting_changes(viewport_rect),
         };
     }
 
     bool is_first_step_of_gesture = !latched_node_id.has_value();
+    auto routing_decision = Web::InputRoutingDecision::ContinuedLatch;
     if (is_first_step_of_gesture) {
-        latched_node_id = hit_test_and_latch_wheel_gesture(position, delta, scroll_gesture_phase, modifiers, now, expected_document_id);
-        if (!latched_node_id.has_value())
-            return {};
+        auto wheel_step_dispatch_for_hit_test = page_let_touchpad_step_through ? Compositing::WheelStepDispatch::DispatchedAndNotCanceled : Compositing::WheelStepDispatch::NotYetDispatched;
+        auto latch_attempt = hit_test_and_latch_wheel_gesture(position, delta, wheel_delta_precision, scroll_gesture_phase, expected_document_id, wheel_step_dispatch_for_hit_test, Compositing::NestedContextRegions::LeaveToMainThread);
+        if (!latch_attempt.latched_node_id.has_value())
+            return AsyncScrollResult::declined(latch_attempt.decision);
+        latched_node_id = latch_attempt.latched_node_id;
+        routing_decision = latch_attempt.decision;
     } else if (latched_node_id->document_id != expected_document_id) {
         // A step over another document than the latched scroller's is left to the navigable hosting that scroller,
         // which reports the same step with its own document.
-        return {};
+        return AsyncScrollResult::declined(Web::InputRoutingDecision::ScrollerInOtherDocument);
     }
+    if (page_let_touchpad_step_through)
+        m_wheel_gesture_routing.note_page_let_latched_gesture_through();
 
     auto scroll_chaining = is_first_step_of_gesture ? Compositing::ScrollChaining::ToScrollableAncestors : Compositing::ScrollChaining::None;
-    auto outcome = perform_wheel_scroll_of_node(*latched_node_id, delta, wheel_delta_precision, scroll_gesture_phase, operation_tracking, viewport_rect, now, scroll_chaining);
+    auto outcome = perform_wheel_scroll_of_node(*latched_node_id, delta, wheel_delta_precision, scroll_gesture_phase, operation_tracking, viewport_rect, now, scroll_chaining, VisualViewportPanning::No);
     return {
-        .enqueue_result = { true, outcome.operation_id },
+        .enqueue_result = {
+            .accepted = true,
+            .operation_id = outcome.operation_id,
+            .routing_decision = routing_decision,
+            .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
+        },
         .frame_to_present = outcome.viewport_rect_to_present.map([](auto const& rect) { return PendingFrame::repainting_changes(rect); }),
     };
 }
 
-ContextState::AsyncScrollResult ContextState::smooth_scroll_to(Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint destination_offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, Compositing::ScrollAnimationKind animation_kind, Compositing::SmoothScrollInitiator initiator)
+void ContextState::note_user_input_scrolled(Web::AsyncScrollNodeStableID stable_node_id)
 {
-    if (!m_has_async_scrolling_state)
+    m_user_input_scroll_counts.ensure(stable_node_id)++;
+}
+
+Optional<Gfx::Orientation> ContextState::axis_held_by_scrollbar_of(Compositing::AsyncScrollNodeID node_id) const
+{
+    // Paging steps toward the pointer like keys do, and takes a script's scroll along like them.
+    auto scrollbar_index = m_scrollbar_controller.captured_scrollbar_index();
+    if (!scrollbar_index.has_value() || m_scrollbar_paging.has_value())
         return {};
-
-    auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(stable_node_id);
-    if (!node_id.has_value())
+    auto const& scrollbar = m_scrollbar_controller.scrollbars()[scrollbar_index.value()];
+    if (scrollbar.scroll_node_id != node_id)
         return {};
-    auto current_offset = m_async_scroll_tree.scroll_offset_for_node(*node_id, m_scroll_state_snapshot);
-    if (!current_offset.has_value())
-        return {};
+    return scrollbar.vertical ? Gfx::Orientation::Vertical : Gfx::Orientation::Horizontal;
+}
 
-    cancel_smooth_scroll(stable_node_id);
+Optional<PendingFrame> ContextState::apply_scroll_requests(ReadonlySpan<Compositing::ScrollRequest> scroll_requests)
+{
+    Vector<Compositing::AsyncScrollOffset> answers;
+    for (auto const& scroll_request : scroll_requests) {
+        // The box's offsets are reported as of this request from here on, whether or not the box is here yet.
+        m_applied_scroll_request_ids.set(scroll_request.stable_node_id, scroll_request.request_id);
+        bool moved_the_box = false;
+        ScopeGuard note_request_applied = [&] {
+            m_async_scroll_update_outbox.note_scroll_request_applied({ scroll_request.stable_node_id, scroll_request.request_id, moved_the_box });
+        };
+        if (scroll_request.stable_node_id.kind == Web::AsyncScrollNodeKind::VisualViewport) {
+            moved_the_box = apply_visual_viewport_scroll_request(scroll_request, answers);
+            continue;
+        }
 
-    // The main thread can apply instant input scrolls that this context has not learned about yet, so a scroll whose
-    // presented offset already matches the destination starts from the main thread's offset to converge on it.
-    auto start_offset = *current_offset;
-    if (start_offset == destination_offset)
-        start_offset = main_thread_offset;
+        Optional<Compositing::AsyncScrollNodeID> node_id;
+        if (m_has_async_scrolling_state)
+            node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(scroll_request.stable_node_id);
+        auto old_offset = node_id.has_value() ? m_async_scroll_tree.scroll_offset_for_node(node_id.value(), m_scroll_state_snapshot) : Optional<Gfx::FloatPoint> {};
+        if (!old_offset.has_value()) {
+            if (scroll_request.smooth_scroll.has_value())
+                m_async_scroll_update_outbox.complete_operation(scroll_request.smooth_scroll->operation_id);
+            continue;
+        }
 
-    auto operation_id = ++m_next_async_scroll_operation_id;
-    Compositing::SmoothScrollAnimation animation { start_offset, destination_offset, m_async_scroll_tree.device_pixels_per_css_pixel(), animation_kind };
-    if (animation.duration().is_zero()) {
-        m_completed_async_scroll_operation_ids.append(operation_id);
+        // The answer tells the main thread where the box went for the request, even where it stayed where it was.
+        auto answer_with_the_offset_of_the_box = [&] {
+            auto new_offset = m_async_scroll_tree.scroll_offset_for_node(node_id.value(), m_scroll_state_snapshot).value();
+            moved_the_box = new_offset != old_offset.value();
+            if (m_async_scroll_tree.scroll_node_is_viewport(node_id.value()))
+                m_async_scrolling_viewport_rect.set_location(new_offset.to_type<int>());
+            answers.append({
+                .stable_node_id = scroll_request.stable_node_id,
+                .compositor_scroll_offset = new_offset,
+                .unadopted_scroll_delta = new_offset - old_offset.value(),
+                .last_relative_scroll_delta = {},
+                .visual_viewport_scale = {},
+                .applied_scroll_request_id = 0,
+                .user_input_scroll_count = 0,
+            });
+        };
+
+        // A request aborts the box's smooth scroll, unless it heads that very scroll somewhere else.
+        Optional<Compositing::AsyncScrollOperationID> retargeted_operation_id;
+        if (scroll_request.smooth_scroll.has_value() && scroll_request.smooth_scroll->retargets_operation)
+            retargeted_operation_id = scroll_request.smooth_scroll->operation_id;
+        auto running_animation = m_smooth_scroll_animations.find_if([&](auto const& animation) { return animation.stable_node_id == scroll_request.stable_node_id; });
+        bool retargets_running_animation = running_animation != m_smooth_scroll_animations.end() && running_animation->operation_id == retargeted_operation_id;
+        // A step of the user's by a distance goes on from where the user's scroll of the same kind is headed, unless the
+        // box jumped or scrolled elsewhere first.
+        Optional<Gfx::FloatPoint> destination_of_running_user_scroll;
+        if (running_animation != m_smooth_scroll_animations.end() && running_animation->is_user_scroll && scroll_request.smooth_scroll.has_value()
+            && running_animation->animation.kind() == scroll_request.smooth_scroll->animation_kind
+            && !scroll_request.jump_offset.has_value() && !scroll_request.relative_scroll.has_value())
+            destination_of_running_user_scroll = running_animation->animation.destination_offset();
+
+        // The main thread settled the user's gesture once it heard of no more input for the box. User input this
+        // context took since then carries the gesture on, and the box goes where that input takes it instead.
+        auto smooth_scroll = scroll_request.smooth_scroll;
+        if (smooth_scroll.has_value() && smooth_scroll->settled_user_input_scroll_count.has_value() && !retargets_running_animation
+            && m_user_input_scroll_counts.get(scroll_request.stable_node_id).value_or(0) > smooth_scroll->settled_user_input_scroll_count.value()) {
+            m_async_scroll_update_outbox.note_operation_taken_over_by_user_input(smooth_scroll->operation_id);
+            m_async_scroll_update_outbox.complete_operation(smooth_scroll->operation_id);
+            smooth_scroll.clear();
+            if (!scroll_request.jump_offset.has_value() && !scroll_request.relative_scroll.has_value()) {
+                answer_with_the_offset_of_the_box();
+                continue;
+            }
+        }
+
+        bool has_instant_scroll = scroll_request.jump_offset.has_value() || scroll_request.relative_scroll.has_value();
+        bool instant_scroll_is_for_script = has_instant_scroll && !scroll_request.instant_scroll_is_for_user_input;
+        bool smooth_scroll_is_for_script = smooth_scroll.has_value() && smooth_scroll->initiator == Compositing::SmoothScrollInitiator::Programmatic;
+
+        // The thumb of a scrollbar that the user holds stays under the pointer: the user scrolls the box along that axis
+        // from the moment a script does, which aborts a smooth scroll of the script's.
+        auto axis_held_by_scrollbar = axis_held_by_scrollbar_of(node_id.value());
+        if (axis_held_by_scrollbar.has_value() && smooth_scroll_is_for_script) {
+            m_async_scroll_update_outbox.note_operation_taken_over_by_user_input(smooth_scroll->operation_id);
+            m_async_scroll_update_outbox.complete_operation(smooth_scroll->operation_id);
+            smooth_scroll.clear();
+            smooth_scroll_is_for_script = false;
+        }
+
+        // A smooth scroll in progress is aborted by any other, and by an instant scroll, except that a script's instant
+        // scroll carries the steps of the user's scroll along with it. A request that only aborts is for the main
+        // thread's own scrolls.
+        bool shifts_running_animation = false;
+        if (running_animation != m_smooth_scroll_animations.end() && !retargets_running_animation) {
+            bool running_animation_is_requested = running_animation->operation_id >= Compositing::first_operation_id_the_main_thread_requests;
+            bool running_animation_is_user_step = running_animation->is_user_scroll
+                && running_animation->animation.kind() != Compositing::ScrollAnimationKind::Momentum
+                && !m_scroll_snap_controller.is_snap_scroll(scroll_request.stable_node_id, running_animation->operation_id);
+            if (smooth_scroll.has_value())
+                cancel_smooth_scroll(scroll_request.stable_node_id);
+            else if (has_instant_scroll && instant_scroll_is_for_script && running_animation_is_user_step)
+                shifts_running_animation = true;
+            else if (has_instant_scroll || running_animation_is_requested)
+                cancel_smooth_scroll(scroll_request.stable_node_id);
+        } else if (!retargets_running_animation && smooth_scroll.has_value()) {
+            m_scroll_snap_controller.did_start_main_thread_scroll(scroll_request.stable_node_id);
+        }
+
+        auto offset_before_instant_scroll = m_async_scroll_tree.scroll_offset_for_node(node_id.value(), m_scroll_state_snapshot).value();
+        if (scroll_request.jump_offset.has_value())
+            (void)m_async_scroll_tree.set_scroll_offset(node_id.value(), scroll_request.jump_offset.value(), m_scene.current_visual_context_tree(), m_scroll_state_snapshot);
+        // A box new to this context took its offset from the frame's snapshot, which has the frame's scrolls in it.
+        bool offset_has_the_request_in_it = m_scroll_nodes_seeded_by_last_frame.contains(scroll_request.stable_node_id);
+        if (auto const& relative_scroll = scroll_request.relative_scroll; relative_scroll.has_value() && !offset_has_the_request_in_it) {
+            if (scroll_request.relative_scroll_moves_visual_viewport_first && m_async_scroll_tree.scroll_node_is_viewport(node_id.value())) {
+                scroll_visual_viewport_position_in_page(node_id.value(), relative_scroll.value(), answers);
+            } else {
+                auto offset = m_async_scroll_tree.scroll_offset_for_node(node_id.value(), m_scroll_state_snapshot).value();
+                (void)m_async_scroll_tree.set_scroll_offset(node_id.value(), relative_scroll->applied_to(offset), m_scene.current_visual_context_tree(), m_scroll_state_snapshot);
+            }
+        }
+        if (axis_held_by_scrollbar.has_value() && instant_scroll_is_for_script) {
+            auto offset = m_async_scroll_tree.scroll_offset_for_node(node_id.value(), m_scroll_state_snapshot).value();
+            offset.set_primary_offset_for_orientation(axis_held_by_scrollbar.value(), offset_before_instant_scroll.primary_offset_for_orientation(axis_held_by_scrollbar.value()));
+            (void)m_async_scroll_tree.set_scroll_offset(node_id.value(), offset, m_scene.current_visual_context_tree(), m_scroll_state_snapshot);
+        }
+        auto instant_scroll_delta = m_async_scroll_tree.scroll_offset_for_node(node_id.value(), m_scroll_state_snapshot).value() - offset_before_instant_scroll;
+
+        if (shifts_running_animation) {
+            // A step that goes to an end of the scroll range still goes there.
+            if (!running_animation->heads_to_an_extent) {
+                running_animation->animation.shift_by(instant_scroll_delta);
+                auto destination_offset = running_animation->animation.destination_offset();
+                auto clamped_destination_offset = m_async_scroll_tree.clamped_scroll_offset_for_node(node_id.value(), destination_offset);
+                if (clamped_destination_offset != destination_offset)
+                    running_animation->animation.retarget(clamped_destination_offset, MonotonicTime::now() - running_animation->started_at);
+            }
+        }
+
+        if (instant_scroll_is_for_script)
+            m_elastic_overscroll_controller.drop_stretch_moved_by(scroll_request.stable_node_id, instant_scroll_delta);
+        if (smooth_scroll_is_for_script)
+            m_elastic_overscroll_controller.release_stretch_of(scroll_request.stable_node_id, MonotonicTime::now());
+
+        if (smooth_scroll.has_value()) {
+            auto destination_offset = smooth_scroll->destination_offset;
+            if (smooth_scroll->destination_is_relative) {
+                auto relative_scroll_start = m_async_scroll_tree.scroll_offset_for_node(node_id.value(), m_scroll_state_snapshot).value();
+                if (smooth_scroll->initiator == Compositing::SmoothScrollInitiator::UserInput && destination_of_running_user_scroll.has_value())
+                    relative_scroll_start = destination_of_running_user_scroll.value();
+                destination_offset.translate_by(relative_scroll_start);
+            }
+            destination_offset = m_async_scroll_tree.clamped_scroll_offset_for_node(node_id.value(), destination_offset);
+            if (retargets_running_animation) {
+                retarget_user_scroll(*running_animation, destination_offset, MonotonicTime::now());
+            } else {
+                auto start_offset = m_async_scroll_tree.scroll_offset_for_node(node_id.value(), m_scroll_state_snapshot).value();
+                Compositing::SmoothScrollAnimation animation { start_offset, destination_offset, m_async_scroll_tree.device_pixels_per_css_pixel(), smooth_scroll->animation_kind };
+                if (animation.duration().is_zero()) {
+                    m_async_scroll_update_outbox.complete_operation(smooth_scroll->operation_id);
+                } else {
+                    m_smooth_scroll_animations.append({
+                        .stable_node_id = scroll_request.stable_node_id,
+                        .operation_id = smooth_scroll->operation_id,
+                        .animation = move(animation),
+                        .started_at = MonotonicTime::now(),
+                        .is_user_scroll = smooth_scroll->initiator == Compositing::SmoothScrollInitiator::UserInput,
+                        .heads_to_an_extent = false,
+                    });
+                }
+            }
+        }
+
+        answer_with_the_offset_of_the_box();
+    }
+
+    if (answers.is_empty()) {
         request_rendering_update();
+        return {};
+    }
+    store_pending_async_scroll_offsets(answers);
+    if (m_has_async_scrolling_state)
+        rebuild_wheel_hit_test_targets();
+    request_rendering_update();
+    return PendingFrame::repainting_changes(m_async_scrolling_viewport_rect);
+}
+
+// https://drafts.csswg.org/cssom-view/#viewport-perform-a-scroll
+// The visual viewport takes as much of the scroll as it can before the layout viewport takes the rest.
+void ContextState::scroll_visual_viewport_position_in_page(Compositing::AsyncScrollNodeID viewport_node_id, Compositing::RequestedRelativeScroll const& relative_scroll, Vector<Compositing::AsyncScrollOffset>& answers)
+{
+    auto layout_viewport_offset = m_async_scroll_tree.scroll_offset_for_node(viewport_node_id, m_scroll_state_snapshot).value();
+    auto transform = m_scene.visual_viewport_transform();
+    auto scale = transform.matrix[0, 0];
+    auto old_visual_viewport_offset = visual_viewport_scroll_offset(transform);
+    auto page_position = layout_viewport_offset.translated(old_visual_viewport_offset);
+    auto delta = relative_scroll.applied_to(page_position) - page_position;
+
+    auto share_of_viewport_the_visual_viewport_moves_over = scale <= 1.0f ? 0.0f : (scale - 1.0f) / scale;
+    Gfx::FloatPoint maximum_visual_viewport_offset {
+        static_cast<float>(m_async_scrolling_viewport_rect.width()) * share_of_viewport_the_visual_viewport_moves_over,
+        static_cast<float>(m_async_scrolling_viewport_rect.height()) * share_of_viewport_the_visual_viewport_moves_over,
+    };
+    Gfx::FloatPoint new_visual_viewport_offset {
+        AK::clamp(old_visual_viewport_offset.x() + delta.x(), 0.0f, maximum_visual_viewport_offset.x()),
+        AK::clamp(old_visual_viewport_offset.y() + delta.y(), 0.0f, maximum_visual_viewport_offset.y()),
+    };
+    auto visual_delta = new_visual_viewport_offset - old_visual_viewport_offset;
+    (void)m_async_scroll_tree.set_scroll_offset(viewport_node_id, layout_viewport_offset.translated(delta - visual_delta), m_scene.current_visual_context_tree(), m_scroll_state_snapshot);
+    if (visual_delta.is_zero())
+        return;
+
+    transform.matrix[0, 3] = -new_visual_viewport_offset.x() * scale;
+    transform.matrix[1, 3] = -new_visual_viewport_offset.y() * scale;
+    m_scene.set_async_visual_viewport_transform(transform);
+    m_visual_viewport_document_id = m_async_scroll_tree.document_id();
+    answers.append({
+        .stable_node_id = { .node_id = m_async_scroll_tree.document_id().value(), .kind = Web::AsyncScrollNodeKind::VisualViewport },
+        .compositor_scroll_offset = new_visual_viewport_offset,
+        .unadopted_scroll_delta = visual_delta,
+        .last_relative_scroll_delta = {},
+        .visual_viewport_scale = scale,
+        .applied_scroll_request_id = 0,
+        .user_input_scroll_count = 0,
+    });
+}
+
+bool ContextState::apply_visual_viewport_scroll_request(Compositing::ScrollRequest const& scroll_request, Vector<Compositing::AsyncScrollOffset>& answers)
+{
+    // The main thread animates the visual viewport itself, one jump at a time.
+    if (scroll_request.smooth_scroll.has_value())
+        m_async_scroll_update_outbox.complete_operation(scroll_request.smooth_scroll->operation_id);
+    if (!m_scene.visual_context_tree().has_value() || scroll_request.stable_node_id.node_id != m_async_scroll_tree.document_id())
+        return false;
+
+    auto transform = m_scene.visual_viewport_transform();
+    auto old_scroll_offset = visual_viewport_scroll_offset(transform);
+    if (scroll_request.jump_offset.has_value()) {
+        auto scale = scroll_request.visual_viewport_scale.value_or(transform.matrix[0, 0]);
+        transform.matrix[0, 0] = scale;
+        transform.matrix[1, 1] = scale;
+        transform.matrix[0, 3] = -scroll_request.jump_offset->x() * scale;
+        transform.matrix[1, 3] = -scroll_request.jump_offset->y() * scale;
+        clamp_visual_viewport_transform_to_viewport(transform, m_async_scrolling_viewport_rect);
+        m_scene.set_async_visual_viewport_transform(transform);
+        m_visual_viewport_document_id = scroll_request.stable_node_id.node_id;
+        rebuild_wheel_hit_test_targets();
+    }
+
+    auto new_scroll_offset = visual_viewport_scroll_offset(transform);
+    answers.append({
+        .stable_node_id = scroll_request.stable_node_id,
+        .compositor_scroll_offset = new_scroll_offset,
+        .unadopted_scroll_delta = new_scroll_offset - old_scroll_offset,
+        .last_relative_scroll_delta = {},
+        .visual_viewport_scale = transform.matrix[0, 0],
+        .applied_scroll_request_id = 0,
+        .user_input_scroll_count = 0,
+    });
+    return new_scroll_offset != old_scroll_offset;
+}
+
+Optional<Gfx::FloatPoint> ContextState::in_flight_wheel_destination(Web::AsyncScrollNodeStableID stable_node_id) const
+{
+    for (auto const& animation : m_smooth_scroll_animations) {
+        if (animation.stable_node_id == stable_node_id && animation.animation.kind() == Compositing::ScrollAnimationKind::Wheel)
+            return animation.animation.destination_offset();
+    }
+    return {};
+}
+
+ContextState::AsyncScrollResult ContextState::smooth_wheel_scroll_by(Optional<Compositing::WheelScrollTarget> const& scroll_target, Gfx::IntRect viewport_rect, MonotonicTime now)
+{
+    if (!scroll_target.has_value()) {
+        auto operation_id = m_async_scroll_update_outbox.allocate_operation_id();
+        m_async_scroll_update_outbox.complete_operation(operation_id);
         return {
             .enqueue_result = { true, operation_id },
             .frame_to_present = {},
         };
     }
 
+    for (auto& active_animation : m_smooth_scroll_animations) {
+        if (active_animation.stable_node_id != scroll_target->stable_node_id)
+            continue;
+        if (active_animation.animation.kind() == Compositing::ScrollAnimationKind::Wheel) {
+            retarget_user_scroll(active_animation, scroll_target->destination_offset, now);
+            report_started_user_scroll(active_animation.operation_id, scroll_target->stable_node_id, scroll_target->start_offset, scroll_target->destination_offset, active_animation.animation.kind());
+            m_async_scrolling_viewport_rect = viewport_rect;
+            return {
+                .enqueue_result = { true, active_animation.operation_id },
+                .frame_to_present = PendingFrame::repainting_changes(viewport_rect),
+            };
+        }
+        m_async_scroll_update_outbox.note_operation_taken_over_by_user_input(active_animation.operation_id);
+        cancel_smooth_scroll(scroll_target->stable_node_id);
+        break;
+    }
+
+    auto operation_id = m_async_scroll_update_outbox.allocate_operation_id();
     m_smooth_scroll_animations.append({
-        .stable_node_id = stable_node_id,
+        .stable_node_id = scroll_target->stable_node_id,
         .operation_id = operation_id,
-        .animation = move(animation),
-        .started_at = MonotonicTime::now(),
-        .is_user_scroll = initiator == Compositing::SmoothScrollInitiator::UserInput,
+        .animation = Compositing::SmoothScrollAnimation { scroll_target->current_offset, scroll_target->destination_offset, m_async_scroll_tree.device_pixels_per_css_pixel(), Compositing::ScrollAnimationKind::Wheel },
+        .started_at = now,
+        .is_user_scroll = true,
+        .heads_to_an_extent = false,
     });
+    report_started_user_scroll(operation_id, scroll_target->stable_node_id, scroll_target->start_offset, scroll_target->destination_offset, Compositing::ScrollAnimationKind::Wheel);
     m_async_scrolling_viewport_rect = viewport_rect;
     return {
         .enqueue_result = { true, operation_id },
         .frame_to_present = PendingFrame::repainting_changes(viewport_rect),
     };
+}
+
+void ContextState::retarget_user_scroll(ActiveSmoothScrollAnimation& running_animation, Gfx::FloatPoint destination_offset, MonotonicTime now)
+{
+    m_scroll_snap_controller.did_retarget_scroll(running_animation.stable_node_id, running_animation.operation_id);
+    running_animation.animation.retarget(destination_offset, now - running_animation.started_at);
 }
 
 void ContextState::cancel_smooth_scroll(Web::AsyncScrollNodeStableID stable_node_id)
@@ -882,7 +1418,7 @@ void ContextState::retire_smooth_scroll_animation(Web::AsyncScrollNodeStableID s
                 scroll_offset = m_async_scroll_tree.css_scroll_offset_for_node(*node_id, m_scroll_state_snapshot);
             m_scroll_snap_controller.did_end_snap_scroll(stable_node_id, smooth_scroll_animation.operation_id, scroll_offset);
         }
-        m_completed_async_scroll_operation_ids.append(smooth_scroll_animation.operation_id);
+        m_async_scroll_update_outbox.complete_operation(smooth_scroll_animation.operation_id);
         m_smooth_scroll_animations.remove(index);
         request_rendering_update();
         return;
@@ -899,7 +1435,7 @@ Optional<Gfx::IntRect> ContextState::advance_smooth_scroll_animations(MonotonicT
         auto& active_animation = m_smooth_scroll_animations[index];
         auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(active_animation.stable_node_id);
         if (!node_id.has_value()) {
-            m_completed_async_scroll_operation_ids.append(active_animation.operation_id);
+            m_async_scroll_update_outbox.complete_operation(active_animation.operation_id);
             completed_operation = true;
             m_smooth_scroll_animations.remove(index);
             continue;
@@ -907,14 +1443,14 @@ Optional<Gfx::IntRect> ContextState::advance_smooth_scroll_animations(MonotonicT
 
         auto old_offset = m_async_scroll_tree.scroll_offset_for_node(*node_id, m_scroll_state_snapshot);
         if (!old_offset.has_value()) {
-            m_completed_async_scroll_operation_ids.append(active_animation.operation_id);
+            m_async_scroll_update_outbox.complete_operation(active_animation.operation_id);
             completed_operation = true;
             m_smooth_scroll_animations.remove(index);
             continue;
         }
 
         auto sample = active_animation.animation.sample(now - active_animation.started_at);
-        auto new_offset = m_async_scroll_tree.set_scroll_offset(*node_id, sample.offset, current_visual_context_tree(), m_scroll_state_snapshot);
+        auto new_offset = m_async_scroll_tree.set_scroll_offset(*node_id, sample.offset, m_scene.current_visual_context_tree(), m_scroll_state_snapshot);
         VERIFY(new_offset.has_value());
         auto scroll_delta = *new_offset - *old_offset;
         if (!scroll_delta.is_zero()) {
@@ -923,6 +1459,9 @@ Optional<Gfx::IntRect> ContextState::advance_smooth_scroll_animations(MonotonicT
                 .compositor_scroll_offset = *new_offset,
                 .unadopted_scroll_delta = scroll_delta,
                 .last_relative_scroll_delta = {},
+                .visual_viewport_scale = {},
+                .applied_scroll_request_id = 0,
+                .user_input_scroll_count = 0,
             });
             changed_scroll_offset = true;
             if (m_async_scroll_tree.scroll_node_is_viewport(*node_id))
@@ -931,7 +1470,7 @@ Optional<Gfx::IntRect> ContextState::advance_smooth_scroll_animations(MonotonicT
 
         if (sample.complete) {
             m_scroll_snap_controller.did_end_snap_scroll(active_animation.stable_node_id, active_animation.operation_id, m_async_scroll_tree.css_pixels_from_device_offset(*new_offset));
-            m_completed_async_scroll_operation_ids.append(active_animation.operation_id);
+            m_async_scroll_update_outbox.complete_operation(active_animation.operation_id);
             completed_operation = true;
             m_smooth_scroll_animations.remove(index);
         } else {
@@ -953,322 +1492,473 @@ Optional<Gfx::IntRect> ContextState::advance_smooth_scroll_animations(MonotonicT
 ContextState::ContextUpdateResult ContextState::handle_wheel_event(Web::MouseEvent const& event, Optional<MonotonicTime> now_for_testing)
 {
     VERIFY(event.type == Web::MouseEvent::Type::MouseWheel);
+    auto now = now_for_testing.value_or(MonotonicTime::now());
+    m_scroll_fling_controller.note_wheel_event(event, now);
+    return scroll_for_wheel_event(event, now);
+}
+
+static Gfx::FloatPoint wheel_event_position(Web::MouseEvent const& event)
+{
+    return {
+        static_cast<float>(event.position.x().value()),
+        static_cast<float>(event.position.y().value()),
+    };
+}
+
+Gfx::FloatPoint ContextState::wheel_event_delta_in_device_pixels(Web::MouseEvent const& event) const
+{
     auto wheel_delta_x = event.wheel_delta_x;
     auto wheel_delta_y = event.wheel_delta_y;
     if (event.modifiers & Web::UIEvents::KeyModifier::Mod_Shift)
         swap(wheel_delta_x, wheel_delta_y);
-
-    auto position = Gfx::FloatPoint {
-        static_cast<float>(event.position.x().value()),
-        static_cast<float>(event.position.y().value()),
-    };
-    auto delta_in_device_pixels = Gfx::FloatPoint { static_cast<float>(wheel_delta_x), static_cast<float>(wheel_delta_y) }
-                                      .scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
-    return async_scroll_by(position, delta_in_device_pixels, event.wheel_delta_precision, event.scroll_gesture_phase, event.modifiers, now_for_testing);
+    return Gfx::FloatPoint { static_cast<float>(wheel_delta_x), static_cast<float>(wheel_delta_y) }
+        .scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
 }
 
-ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, Optional<MonotonicTime> now_for_testing)
+bool ContextState::step_continues_touchpad_gesture_the_page_let_through(Optional<Compositing::AsyncScrollNodeID> const& latched_node_id, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase) const
+{
+    return latched_node_id.has_value() && presents_to_client() && m_wheel_gesture_routing.page_let_latched_touchpad_gesture_through(wheel_delta_precision, scroll_gesture_phase);
+}
+
+Web::WheelGestureMark ContextState::note_wheel_event_from_ui(Web::MouseEvent const& event, Optional<MonotonicTime> now_for_testing)
+{
+    VERIFY(event.type == Web::MouseEvent::Type::MouseWheel);
+    auto now = now_for_testing.value_or(MonotonicTime::now());
+    auto phase = event.scroll_gesture_phase;
+
+    if (phase == Web::ScrollGesturePhase::Momentum)
+        m_last_reported_scroll_momentum_step = event.clone_without_browser_data();
+    else
+        m_last_reported_scroll_momentum_step.clear();
+
+    // The end of the gesture before this one may never have arrived.
+    bool starts_gesture = m_wheel_gesture_routing.note_wheel_event_from_ui(event, wheel_event_position(event), m_async_scroll_tree, now);
+    if (starts_gesture)
+        m_elastic_overscroll_controller.end_gesture(now);
+
+    // A stretch is released with the velocity of the steps as they arrived from the UI, not as they were scrolled.
+    // Fling steps are not timed here, which leaves them out of the velocity; no platform both flings and stretches.
+    if (wheel_step_can_stretch_elastically(event.wheel_delta_precision, phase))
+        m_elastic_overscroll_controller.note_step_from_ui(wheel_event_delta_in_device_pixels(event).scaled(1.0f / m_scene.visual_viewport_magnification()), now);
+    return { .continues_gesture = !starts_gesture, .lasts_until_fingers_lift = m_wheel_gesture_routing.gesture_lasts_until_fingers_lift() };
+}
+
+bool ContextState::start_scroll_fling_if_flicked(Web::MouseEvent const& gesture_end_event, Optional<MonotonicTime> now_for_testing)
+{
+    return m_scroll_fling_controller.start_if_flicked(gesture_end_event, now_for_testing.value_or(MonotonicTime::now()));
+}
+
+Optional<Web::MouseEvent> ContextState::interrupt_scroll_fling(Web::MouseEvent const& event, Optional<MonotonicTime> now_for_testing)
+{
+    return m_scroll_fling_controller.interrupt(event, now_for_testing.value_or(MonotonicTime::now()));
+}
+
+Optional<Web::MouseEvent> ContextState::interrupt_reported_scroll_momentum()
+{
+    if (!m_last_reported_scroll_momentum_step.has_value())
+        return {};
+
+    // WebContent holds the gesture open while momentum events arrive. The end of the gesture releases it.
+    auto gesture_end = m_last_reported_scroll_momentum_step.release_value();
+    gesture_end.wheel_delta_x = 0;
+    gesture_end.wheel_delta_y = 0;
+    gesture_end.wheel_tick_120ths_x = 0;
+    gesture_end.wheel_tick_120ths_y = 0;
+    gesture_end.scroll_gesture_phase = Web::ScrollGesturePhase::Ended;
+    gesture_end.async_scroll_performed_default_action = false;
+    // The IDs of UI input events start at 1. Thus, ID 0 does not match a UI event.
+    gesture_end.id = 0;
+    m_reported_scroll_momentum_was_interrupted = true;
+    return gesture_end;
+}
+
+Optional<Web::MouseEvent> ContextState::end_momentum_scrolling(Web::AsyncScrollNodeStableID stable_node_id)
+{
+    if (m_wheel_gesture_routing.latched_scroller() != stable_node_id)
+        return {};
+    if (has_active_scroll_fling())
+        return end_scroll_fling();
+    return interrupt_reported_scroll_momentum();
+}
+
+void ContextState::clear_per_test_input_state()
+{
+    // A gesture held by fingers never ends by itself, so one a test left unended would take in the next test's steps.
+    m_wheel_gesture_routing.forget_gesture();
+    m_pointer_in_nested_contexts = {};
+    m_last_reported_scroll_momentum_step.clear();
+    m_reported_scroll_momentum_was_interrupted = false;
+}
+
+bool ContextState::absorbs_wheel_event_of_interrupted_momentum(Web::MouseEvent const& event)
+{
+    if (!m_reported_scroll_momentum_was_interrupted)
+        return false;
+    if (first_is_one_of(event.scroll_gesture_phase, Web::ScrollGesturePhase::Momentum, Web::ScrollGesturePhase::Ended))
+        return true;
+    m_reported_scroll_momentum_was_interrupted = false;
+    return false;
+}
+
+Optional<Web::MouseEvent> ContextState::take_scroll_fling_step(MonotonicTime frame_time)
+{
+    return m_scroll_fling_controller.take_step(frame_time);
+}
+
+Optional<Web::MouseEvent> ContextState::end_scroll_fling()
+{
+    return m_scroll_fling_controller.end();
+}
+
+ContextState::ContextUpdateResult ContextState::scroll_for_fling_step(Web::MouseEvent const& event, MonotonicTime now)
+{
+    return scroll_for_wheel_event(event, now);
+}
+
+void ContextState::end_scroll_fling_on_next_step()
+{
+    m_scroll_fling_controller.end_on_next_step();
+}
+
+ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event(Web::MouseEvent const& event, MonotonicTime now)
 {
     if (!presents_to_client())
-        return {};
-    if (!m_can_accept_async_wheel_events)
-        return {};
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::ContextNotPresenting);
 
-    auto now = now_for_testing.value_or(MonotonicTime::now());
-    m_scroll_snap_controller.note_gesture_phase(scroll_gesture_phase);
-    auto latched_node_id = resolve_wheel_scroll_latch(position, scroll_gesture_phase, modifiers, now);
+    auto position = wheel_event_position(event);
+    // The end of a gesture lets go of the scroller it stretched even if the context has stopped taking wheel events.
+    if (event.scroll_gesture_phase == Web::ScrollGesturePhase::Ended)
+        m_elastic_overscroll_controller.end_gesture(now);
 
-    if (scroll_gesture_phase == Web::ScrollGesturePhase::Ended && delta.is_zero()) {
+    auto latch = resolve_wheel_scroll_latch(event.scroll_gesture_phase);
+    if (latch.nested_context_id.has_value())
+        return { .nested_context_wheel_step = NestedContextWheelStep { .context_id = *latch.nested_context_id } };
+
+    // The first step of a gesture over the content of a nested context goes to that context. A gesture whose first step
+    // went elsewhere is not handed to a nested context that comes under the pointer later.
+    auto nested_context_regions = Compositing::NestedContextRegions::LeaveToMainThread;
+    bool may_hand_step_to_nested_context = !latch.node_id.has_value()
+        && m_wheel_gesture_routing.is_first_wheel_event_with_delta(event.id)
+        && may_hand_first_wheel_steps_to_nested_contexts();
+    if (may_hand_step_to_nested_context) {
+        nested_context_regions = Compositing::NestedContextRegions::HandToNestedContext;
+        if (auto hit = nested_context_for_wheel_at(position); hit.has_value())
+            return { .nested_context_wheel_step = NestedContextWheelStep { .context_id = hit->child_context_id, .hit = hit } };
+    }
+    return scroll_for_wheel_event_in_this_context(event, latch.node_id, nested_context_regions, now);
+}
+
+ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_passed_on_by_nested_context(Web::MouseEvent const& event, MonotonicTime now)
+{
+    return scroll_for_wheel_event_in_this_context(event, {}, Compositing::NestedContextRegions::Ignore, now);
+}
+
+ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_in_this_context(Web::MouseEvent const& event, Optional<Compositing::AsyncScrollNodeID> latched_node_id, Compositing::NestedContextRegions nested_context_regions, MonotonicTime now)
+{
+    auto position = wheel_event_position(event);
+    auto delta = wheel_event_delta_in_device_pixels(event);
+
+    // A page without scroll nodes still has a visual viewport to pan once it is zoomed in.
+    auto can_pan_zoomed_visual_viewport = m_wheel_gesture_routing.admission() == Compositing::WheelRoutingAdmission::NoScrollNode
+        && m_scene.visual_viewport_scale().value_or(1.0f) > 1.0f;
+    if (!m_wheel_gesture_routing.admits_async_wheel() && !can_pan_zoomed_visual_viewport
+        && !step_continues_touchpad_gesture_the_page_let_through(latched_node_id, event.wheel_delta_precision, event.scroll_gesture_phase))
+        return ContextUpdateResult::declined(Compositing::input_routing_decision_for_wheel_step_not_admitted_by(m_wheel_gesture_routing.admission()));
+
+    m_scroll_snap_controller.note_gesture_phase(event.scroll_gesture_phase);
+
+    if (event.scroll_gesture_phase == Web::ScrollGesturePhase::Ended && delta.is_zero()) {
         if (!snap_at_gesture_end(now).has_value())
-            return {};
-        return { .accepted = true, .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect), .should_request_rendering_update = true };
+            return ContextUpdateResult::declined(Web::InputRoutingDecision::GestureEndWithNothingToSnap);
+        return {
+            .accepted = true,
+            .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
+            .should_request_rendering_update = true,
+            .routing_decision = Web::InputRoutingDecision::SnappedAtGestureEnd,
+        };
     }
 
     // Whether a gesture scrolls here or on the main thread is decided by its first step; the steps of a latched
     // gesture are not held back by regions the cursor moves over later.
     bool is_first_step_of_gesture = !latched_node_id.has_value();
     if (is_first_step_of_gesture) {
-        auto initial_scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(visual_context_tree_for_compositing(), position, delta);
-        if (initial_scroll_target.blocked_by_main_thread_region || initial_scroll_target.blocked_by_wheel_event_region)
-            return {};
+        auto initial_scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(m_scene.visual_context_tree_for_compositing(), position, delta, {}, Compositing::WheelStepDispatch::NotYetDispatched, nested_context_regions);
+        if (initial_scroll_target.is_blocked_by_a_region())
+            return ContextUpdateResult::declined(Compositing::input_routing_decision_for_first_wheel_step(initial_scroll_target.outcome));
     }
 
-    Optional<PendingFrame> frame_to_present;
-    auto remaining_delta = delta;
-    if (auto visual_viewport_scroll_delta = apply_visual_viewport_scroll_delta(delta); visual_viewport_scroll_delta.has_value()) {
-        Vector<Compositing::AsyncScrollOffset> scroll_offsets;
-        scroll_offsets.append(visual_viewport_scroll_delta->scroll_offset);
-        store_pending_async_scroll_offsets(scroll_offsets);
-        remaining_delta.translate_by(-visual_viewport_scroll_delta->consumed_delta.x(), -visual_viewport_scroll_delta->consumed_delta.y());
-        frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect);
-    }
-
-    if (remaining_delta.is_zero())
+    if (delta.is_zero()) {
         return {
             .accepted = true,
-            .frame_to_present = frame_to_present,
-            .should_request_rendering_update = frame_to_present.has_value(),
+            .frame_to_present = {},
+            .should_request_rendering_update = false,
+            .routing_decision = Web::InputRoutingDecision::StepWithoutDelta,
+            .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
         };
+    }
 
-    auto async_scroll_delta = remaining_delta;
-    if (auto scale = visual_viewport_scale_for_compositing(); scale.has_value() && *scale > 1.0f)
-        async_scroll_delta.scale_by(1.0f / *scale);
-
+    // A gesture is latched before its first step pans the visual viewport, so that the scroller it belongs to is known
+    // for as long as the gesture only pans.
+    auto routing_decision = Web::InputRoutingDecision::ContinuedLatch;
     if (is_first_step_of_gesture) {
-        latched_node_id = hit_test_and_latch_wheel_gesture(position, async_scroll_delta, scroll_gesture_phase, modifiers, now, {});
-        if (!latched_node_id.has_value()) {
-            if (frame_to_present.has_value())
-                return {
-                    .accepted = true,
-                    .frame_to_present = frame_to_present,
-                    .should_request_rendering_update = true,
-                };
-            return {};
-        }
+        auto latch_attempt = hit_test_and_latch_wheel_gesture(position, delta.scaled(1.0f / m_scene.visual_viewport_magnification()), event.wheel_delta_precision, event.scroll_gesture_phase, {}, Compositing::WheelStepDispatch::NotYetDispatched, nested_context_regions);
+        latched_node_id = latch_attempt.latched_node_id;
+        routing_decision = latch_attempt.decision;
+    }
+
+    // A zoomed page still pans its visual viewport by a gesture that no scroller takes.
+    if (!latched_node_id.has_value()) {
+        if (pan_visual_viewport_by(delta).is_zero())
+            return ContextUpdateResult::declined(routing_decision);
+        return {
+            .accepted = true,
+            .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
+            .should_request_rendering_update = true,
+            .routing_decision = Web::InputRoutingDecision::PannedVisualViewport,
+        };
     }
 
     auto scroll_chaining = is_first_step_of_gesture ? Compositing::ScrollChaining::ToScrollableAncestors : Compositing::ScrollChaining::None;
-    auto outcome = perform_wheel_scroll_of_node(*latched_node_id, async_scroll_delta, wheel_delta_precision, scroll_gesture_phase, Compositing::AsyncScrollOperationTracking::No, m_async_scrolling_viewport_rect, now, scroll_chaining);
-    if (!outcome.viewport_rect_to_present.has_value())
+    auto outcome = perform_wheel_scroll_of_node(*latched_node_id, delta, event.wheel_delta_precision, event.scroll_gesture_phase, Compositing::AsyncScrollOperationTracking::No, m_async_scrolling_viewport_rect, now, scroll_chaining, VisualViewportPanning::BeforeScrolling);
+    return {
+        .accepted = true,
+        .frame_to_present = outcome.viewport_rect_to_present.map([](auto const& rect) { return PendingFrame::repainting_changes(rect); }),
+        .should_request_rendering_update = outcome.viewport_rect_to_present.has_value() && !outcome.only_elastic_overscroll_changed,
+        .routing_decision = routing_decision,
+        .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
+    };
+}
+
+bool ContextState::may_hand_first_wheel_steps_to_nested_contexts() const
+{
+    // A zoomed page pans its visual viewport before anything scrolls. This document's wheel event listeners never see
+    // the wheel events over a document nested in it, whatever state they are in.
+    return m_has_async_scrolling_state && m_scene.visual_viewport_scale().value_or(1.0f) == 1.0f;
+}
+
+Optional<Compositing::NestedContextHit> ContextState::nested_context_for_wheel_at(Gfx::FloatPoint position)
+{
+    if (!m_has_async_scrolling_state)
+        return {};
+    return m_async_scroll_tree.nested_context_for_wheel_at(m_scene.visual_context_tree_for_compositing(), position);
+}
+
+void ContextState::latch_wheel_gesture_to_nested_context(Web::CompositorContextId nested_context_id, Optional<Web::AsyncScrollNodeStableID> scroller, Web::MouseEvent const& event)
+{
+    m_wheel_gesture_routing.latch_to_nested_context(nested_context_id, scroller, event.scroll_gesture_phase);
+}
+
+ContextState::WheelStepFromContainingContext ContextState::WheelStepFromContainingContext::for_wheel_event(Web::MouseEvent const& event)
+{
+    Gfx::FloatPoint delta_in_css_pixels { static_cast<float>(event.wheel_delta_x), static_cast<float>(event.wheel_delta_y) };
+    if (event.modifiers & Web::UIEvents::KeyModifier::Mod_Shift)
+        delta_in_css_pixels = { delta_in_css_pixels.y(), delta_in_css_pixels.x() };
+    return {
+        .position = {},
+        .delta_in_css_pixels = delta_in_css_pixels,
+        .wheel_delta_precision = event.wheel_delta_precision,
+        .scroll_gesture_phase = event.scroll_gesture_phase,
+        .modifiers = event.modifiers,
+    };
+}
+
+ContextState::FirstWheelStepRoute ContextState::route_first_wheel_step_from_containing_context(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels, Web::WheelDeltaPrecision wheel_delta_precision, Compositing::NestedContextRegions nested_context_regions)
+{
+    using Kind = FirstWheelStepRoute::Kind;
+    auto admission = m_wheel_gesture_routing.admission();
+    if (!m_has_async_scrolling_state || admission == Compositing::WheelRoutingAdmission::NoAsyncScrollingState)
+        return { Kind::Declined, Web::InputRoutingDecision::NoAsyncScrollingState };
+
+    // A document's wheel event listeners never see the wheel events over a document nested in it.
+    auto const& visual_context_tree = m_scene.visual_context_tree_for_compositing();
+    if (nested_context_regions == Compositing::NestedContextRegions::HandToNestedContext) {
+        if (auto hit = m_async_scroll_tree.nested_context_for_wheel_at(visual_context_tree, position); hit.has_value())
+            return { .kind = Kind::NestedContext, .decision = Web::InputRoutingDecision::HandedToNestedContext, .nested_context_hit = hit };
+    }
+    if (first_is_one_of(admission, Compositing::WheelRoutingAdmission::BlockingWheelEventListeners, Compositing::WheelRoutingAdmission::StaleWheelEventListeners))
+        return { Kind::Declined, Compositing::input_routing_decision_for_wheel_step_not_admitted_by(admission) };
+
+    auto delta = delta_in_css_pixels.scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
+    Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> in_flight_destination_for;
+    if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete)
+        in_flight_destination_for = [this](auto stable_node_id) { return in_flight_wheel_destination(stable_node_id); };
+    auto scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(visual_context_tree, position, delta, in_flight_destination_for, Compositing::WheelStepDispatch::NotYetDispatched, nested_context_regions);
+    auto scroller_of = [&](Optional<Compositing::AsyncScrollNodeID> node_id) {
+        return node_id.map([&](auto id) { return m_async_scroll_tree.scroll_node_for_id(id)->stable_node_id; });
+    };
+    if (scroll_target.outcome == Compositing::WheelHitTestOutcome::FoundScrollTarget)
+        return { .kind = Kind::ScrollNode, .decision = Web::InputRoutingDecision::Latched, .node_id = scroll_target.node_id, .scroller = scroller_of(scroll_target.node_id) };
+    if (scroll_target.outcome != Compositing::WheelHitTestOutcome::NoScrollTarget)
+        return { Kind::Declined, Compositing::input_routing_decision_for_first_wheel_step(scroll_target.outcome) };
+
+    // https://drafts.csswg.org/css-overscroll-1/#scroll-chaining-and-boundary-default-actions
+    // A nested context does not stretch at its edge. It passes the step on to the document around it unless a scroller
+    // keeps it, the viewport included.
+    bool viewport_keeps_the_scroll = m_async_scroll_tree.viewport_keeps_scrolls_along_main_axis_of(delta);
+    if (!scroll_target.node_keeping_the_scroll.has_value() && !viewport_keeps_the_scroll)
+        return { Kind::PassedOn, Web::InputRoutingDecision::NestedContextPassedStepOn };
+    auto node_keeping_the_scroll = scroll_target.node_keeping_the_scroll.has_value() ? scroll_target.node_keeping_the_scroll : m_async_scroll_tree.viewport_scroll_node_id();
+    return { .kind = Kind::Kept, .decision = Web::InputRoutingDecision::ScrollKeptByOverscrollBehavior, .node_id = node_keeping_the_scroll, .scroller = scroller_of(node_keeping_the_scroll) };
+}
+
+ContextState::ContextUpdateResult ContextState::take_first_wheel_step_from_containing_context(FirstWheelStepRoute const& route, WheelStepFromContainingContext const& step, MonotonicTime now)
+{
+    VERIFY(first_is_one_of(route.kind, FirstWheelStepRoute::Kind::ScrollNode, FirstWheelStepRoute::Kind::Kept));
+    if (route.kind == FirstWheelStepRoute::Kind::Kept) {
+        if (route.scroller.has_value())
+            m_wheel_gesture_routing.latch(*route.scroller, step.scroll_gesture_phase);
+        else
+            m_wheel_gesture_routing.latch_keeping_steps(step.scroll_gesture_phase);
+        return { .accepted = true, .routing_decision = route.decision, .routed_scroller = route.scroller };
+    }
+    m_wheel_gesture_routing.latch(*route.scroller, step.scroll_gesture_phase);
+    return take_wheel_step_from_containing_context(*route.node_id, route.decision, step, Compositing::ScrollChaining::ToScrollableAncestors, now);
+}
+
+ContextState::ContextUpdateResult ContextState::take_latched_wheel_step_from_containing_context(WheelStepFromContainingContext const& step, MonotonicTime now)
+{
+    if (!m_has_async_scrolling_state)
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::NoAsyncScrollingState);
+    // A blocking listener added during the gesture holds its later steps back until a display list shows where it is.
+    auto admission = m_wheel_gesture_routing.admission();
+    if (first_is_one_of(admission, Compositing::WheelRoutingAdmission::BlockingWheelEventListeners, Compositing::WheelRoutingAdmission::StaleWheelEventListeners))
+        return ContextUpdateResult::declined(Compositing::input_routing_decision_for_wheel_step_not_admitted_by(admission));
+
+    auto latch = m_wheel_gesture_routing.resolve_latch(m_async_scroll_tree, m_scene.current_visual_context_tree(), step.scroll_gesture_phase);
+    if (latch.keeps_steps)
+        return { .accepted = true, .routing_decision = Web::InputRoutingDecision::ScrollKeptByOverscrollBehavior };
+    if (!latch.node_id.has_value())
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::NestedContextUnavailable);
+
+    if (step.scroll_gesture_phase == Web::ScrollGesturePhase::Ended && step.delta_in_css_pixels.is_zero()) {
+        m_scroll_snap_controller.note_gesture_phase(step.scroll_gesture_phase);
+        if (!snap_at_gesture_end(now).has_value())
+            return ContextUpdateResult::declined(Web::InputRoutingDecision::GestureEndWithNothingToSnap);
         return {
             .accepted = true,
-            .frame_to_present = frame_to_present,
-            .should_request_rendering_update = frame_to_present.has_value(),
+            .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
+            .should_request_rendering_update = true,
+            .routing_decision = Web::InputRoutingDecision::SnappedAtGestureEnd,
+            .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
         };
-    return { .accepted = true, .frame_to_present = PendingFrame::repainting_changes(*outcome.viewport_rect_to_present), .should_request_rendering_update = true };
+    }
+    return take_wheel_step_from_containing_context(*latch.node_id, Web::InputRoutingDecision::ContinuedLatch, step, Compositing::ScrollChaining::None, now);
+}
+
+ContextState::ContextUpdateResult ContextState::take_wheel_step_from_containing_context(Compositing::AsyncScrollNodeID node_id, Web::InputRoutingDecision decision, WheelStepFromContainingContext const& step, Compositing::ScrollChaining scroll_chaining, MonotonicTime now)
+{
+    m_scroll_snap_controller.note_gesture_phase(step.scroll_gesture_phase);
+    auto delta = step.delta_in_css_pixels.scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
+    auto outcome = perform_wheel_scroll_of_node(node_id, delta, step.wheel_delta_precision, step.scroll_gesture_phase, Compositing::AsyncScrollOperationTracking::No, m_async_scrolling_viewport_rect, now, scroll_chaining, VisualViewportPanning::No);
+    return {
+        .accepted = true,
+        .frame_to_present = outcome.viewport_rect_to_present.map([](auto const& rect) { return PendingFrame::repainting_changes(rect); }),
+        .should_request_rendering_update = outcome.viewport_rect_to_present.has_value() && !outcome.only_elastic_overscroll_changed,
+        .routing_decision = decision,
+        .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
+    };
+}
+
+bool ContextState::wheel_step_can_stretch_elastically(Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase) const
+{
+    return presents_to_client() && m_elastic_overscroll_controller.step_can_stretch(wheel_delta_precision, scroll_gesture_phase);
+}
+
+bool ContextState::pull_elastic_overscroll_by(Compositing::AsyncScrollNode const& node, Gfx::FloatPoint step_delta, Gfx::FloatPoint delta_the_scroller_did_not_scroll_by)
+{
+    auto scroll_offset = m_async_scroll_tree.scroll_offset_for_node(node.node_id, m_scroll_state_snapshot);
+    if (!scroll_offset.has_value())
+        return false;
+    return m_elastic_overscroll_controller.pull_by(node, *scroll_offset, step_delta, delta_the_scroller_did_not_scroll_by, m_scene.visual_viewport_magnification());
+}
+
+void ContextState::set_scroll_capabilities(ScrollCapabilities const& capabilities)
+{
+    m_elastic_overscroll_controller.set_enabled(capabilities.scrolls_elastically);
+    m_scrollbar_track_press_jumps = capabilities.scrollbar_track_press_jumps;
+    m_wheel_gesture_routing.set_touchpad_gesture_end(capabilities.touchpad_gesture_end);
+}
+
+Optional<Gfx::IntRect> ContextState::advance_elastic_overscroll_rebounds(MonotonicTime frame_time)
+{
+    if (!m_elastic_overscroll_controller.advance_rebounds(frame_time))
+        return {};
+    return m_async_scrolling_viewport_rect;
+}
+
+Compositing::FirstWheelStepRouteForTesting ContextState::route_first_wheel_step_for_testing(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels, Compositing::NestedContextRegions nested_context_regions)
+{
+    auto document_id = m_async_scroll_tree.document_id();
+    if (!presents_to_client())
+        return { { Web::InputRoutingDecision::ContextNotPresenting }, document_id };
+    if (!m_scene.display_list() || !m_scene.visual_context_tree().has_value())
+        return { { Web::InputRoutingDecision::NoAsyncScrollingState }, document_id };
+    auto delta = delta_in_css_pixels.scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()) / m_scene.visual_viewport_magnification());
+    return { m_async_scroll_tree.route_first_wheel_step(m_wheel_gesture_routing.admission(), m_scene.visual_context_tree_for_compositing(), position, delta, nested_context_regions), document_id };
+}
+
+String ContextState::scroll_state_for_testing(Web::AsyncScrollNodeStableID stretched_scroller) const
+{
+    auto const& display_list = m_scene.display_list();
+    auto scroll_state = Compositing::async_scrolling_state_to_json(display_list ? Compositing::async_scrolling_state_from_display_list(*display_list) : Compositing::AsyncScrollingState {});
+
+    auto admission = m_wheel_gesture_routing.admission();
+    auto admission_name = admission == Compositing::WheelRoutingAdmission::Accepted
+        ? "accepted"sv
+        : Web::input_routing_decision_name(Compositing::input_routing_decision_for_wheel_step_not_admitted_by(admission));
+    scroll_state.set("wheelRoutingAdmission"sv, admission_name);
+
+    auto stretch = m_elastic_overscroll_controller.stretch_of(stretched_scroller).scaled(1.0f / static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
+    JsonObject stretch_object;
+    stretch_object.set("x"sv, stretch.x());
+    stretch_object.set("y"sv, stretch.y());
+    scroll_state.set("stretch"sv, move(stretch_object));
+    scroll_state.set("visualViewportScale"sv, m_scene.visual_viewport_scale().value_or(1.0f));
+    return scroll_state.serialized();
+}
+
+Optional<Compositing::ScrollStateSnapshot> ContextState::scroll_state_snapshot_stretched_by_elastic_overscrolls() const
+{
+    return m_elastic_overscroll_controller.stretched_scroll_state_snapshot(m_scroll_state_snapshot, m_async_scroll_tree);
 }
 
 Compositing::PendingAsyncScrollUpdates ContextState::take_pending_async_scroll_updates()
 {
-    Compositing::PendingAsyncScrollUpdates updates;
+    auto updates = m_async_scroll_update_outbox.take_updates(user_scroll_gesture_state());
     updates.document_id = m_async_scroll_tree.document_id();
-    updates.sequence = ++m_next_async_scroll_update_sequence;
-    AK::swap(updates.scroll_offsets, m_pending_async_scroll_offsets);
-    for (auto const& scroll_offset : updates.scroll_offsets) {
-        bool replaced = false;
-        for (auto& unreconciled : m_unreconciled_async_scroll_offsets) {
-            if (unreconciled.stable_node_id != scroll_offset.stable_node_id)
-                continue;
-            unreconciled.sequence = updates.sequence;
-            unreconciled.compositor_scroll_offset = scroll_offset.compositor_scroll_offset;
-            replaced = true;
-            break;
-        }
-        if (!replaced)
-            m_unreconciled_async_scroll_offsets.append({ updates.sequence, scroll_offset.stable_node_id, scroll_offset.compositor_scroll_offset });
-    }
-    AK::swap(updates.completed_operation_ids, m_completed_async_scroll_operation_ids);
-    AK::swap(updates.operation_ids_taken_over_by_user_input, m_async_scroll_operation_ids_taken_over_by_user_input);
-    AK::swap(updates.started_user_scrolls, m_started_user_scrolls);
-    updates.user_scroll_gesture_in_progress = user_scroll_gesture_in_progress();
-    updates.user_scroll_gesture_ended = m_user_scroll_gesture_ended;
-    m_user_scroll_gesture_ended = false;
-    m_published_user_scroll_gesture_in_progress = updates.user_scroll_gesture_in_progress;
     return updates;
-}
-
-void ContextState::retire_reconciled_async_scroll_offsets(u64 adopted_sequence)
-{
-    m_unreconciled_async_scroll_offsets.remove_all_matching([&](auto const& unreconciled) { return unreconciled.sequence <= adopted_sequence; });
 }
 
 bool ContextState::has_pending_async_scroll_updates() const
 {
-    return !m_pending_async_scroll_offsets.is_empty()
-        || !m_completed_async_scroll_operation_ids.is_empty()
-        || !m_async_scroll_operation_ids_taken_over_by_user_input.is_empty()
-        || !m_started_user_scrolls.is_empty()
-        || m_user_scroll_gesture_ended
-        || user_scroll_gesture_in_progress() != m_published_user_scroll_gesture_in_progress;
+    return m_async_scroll_update_outbox.has_updates(user_scroll_gesture_state());
 }
 
-static Gfx::FloatSize bounded_composited_raster_scale(Gfx::FloatSize scale, Gfx::IntSize viewport_size)
+void ContextState::viewport_size_updated(Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
 {
-    if (viewport_size.is_empty())
-        return { 1, 1 };
-
-    scale = { clamp(scale.width(), 0.25f, 5.0f), clamp(scale.height(), 0.25f, 5.0f) };
-    // Reserve a pixel on each axis for fractional placement. The two backing stores together use at most
-    // 128 MiB, even when an embedding transform magnifies a large iframe.
-    constexpr float maximum_dimension = 16384;
-    constexpr float maximum_pixels = 16 * 1024 * 1024;
-    scale.set_width(min(scale.width(), (maximum_dimension - 1) / viewport_size.width()));
-    scale.set_height(min(scale.height(), (maximum_dimension - 1) / viewport_size.height()));
-    auto pixel_count = (viewport_size.width() * scale.width()) * (viewport_size.height() * scale.height());
-    constexpr float maximum_content_pixels = maximum_pixels - 2 * maximum_dimension - 1;
-    if (pixel_count > maximum_content_pixels)
-        scale.scale_by(sqrtf(maximum_content_pixels / pixel_count));
-    return scale;
-}
-
-void ContextState::viewport_size_updated(Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress)
-{
-    m_animated_content_may_affect_viewport.clear();
-    if (m_viewport_size != viewport_size)
-        m_keyboard_scroll_state.target.clear();
-    m_viewport_size = viewport_size;
+    m_scene.forget_whether_animated_content_may_affect_viewport();
+    if (m_presenter.viewport_size() != viewport_size)
+        m_keyboard_scroll_controller.forget_target();
     auto is_page_presentation_context = m_page_id.has_value() && !m_parent_context_id.has_value();
-    m_window_resize_in_progress = is_page_presentation_context
-        ? window_resize_in_progress
-        : Compositing::WindowResizingInProgress::No;
+    m_presenter.set_viewport_size(viewport_size, device_pixel_ratio, is_page_presentation_context ? window_resize_in_progress : Compositing::WindowResizingInProgress::No);
 }
 
-bool ContextState::set_paused_debugger_overlay(bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<Compositing::PausedDebuggerOverlayAction> hovered_action)
+bool ContextState::set_ui_overlays(Compositing::UIOverlays overlays)
 {
-    VERIFY(device_pixel_ratio > 0);
-    if (m_paused_debugger_overlay_visible == visible
-        && m_paused_debugger_overlay_device_pixel_ratio == device_pixel_ratio
-        && m_paused_debugger_overlay_font_family == font_family
-        && m_paused_debugger_overlay_hovered_action == hovered_action)
+    if (m_presenter.ui_overlays() == overlays)
         return false;
 
-    if (visible)
+    if (overlays.paused_debugger.has_value())
         end_keyboard_scroll_gesture();
-    m_paused_debugger_overlay_visible = visible;
-    m_paused_debugger_overlay_device_pixel_ratio = device_pixel_ratio;
-    m_paused_debugger_overlay_font_family = move(font_family);
-    m_paused_debugger_overlay_hovered_action = hovered_action;
+    m_presenter.set_ui_overlays(move(overlays));
     return true;
-}
-
-Optional<Gfx::IntRect> ContextState::viewport_rect_for_ui_overlay() const
-{
-    if (m_viewport_size.is_empty())
-        return {};
-
-    auto viewport_rect = m_pending_present_frame.has_value()
-        ? m_pending_present_frame->viewport_rect
-        : m_presented_frame.value_or(Gfx::IntRect {});
-    viewport_rect.set_size(m_viewport_size);
-    return viewport_rect;
-}
-
-bool ContextState::should_shrink_backing_stores_after_resize() const
-{
-    return m_window_resize_in_progress == Compositing::WindowResizingInProgress::Yes;
-}
-
-void ContextState::schedule_backing_store_shrink(Function<void()> on_timeout)
-{
-    if (!m_backing_store_shrink_timer)
-        m_backing_store_shrink_timer = Core::Timer::create_single_shot(3000, move(on_timeout));
-    m_backing_store_shrink_timer->restart();
-}
-
-void ContextState::finish_window_resize()
-{
-    m_window_resize_in_progress = Compositing::WindowResizingInProgress::No;
-}
-
-Optional<BackingStoreManager::Publication> ContextState::resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, BackingStoreManager::GpuSharing gpu_sharing)
-{
-    if (m_backing_store_manager.is_rendering())
-        return {};
-    if (!presents_to_client()) {
-        // A resize can arrive before the parent's next replay supplies the new embedding transform.
-        // Bound the existing scale before allocating backing stores for the new viewport.
-        auto scale = bounded_composited_raster_scale(m_raster_scale, m_viewport_size);
-        if (m_raster_scale != scale) {
-            m_raster_scale = scale;
-            m_latest_rendered_surface = nullptr;
-            m_last_rasterized_frame.clear();
-        }
-    }
-    auto allocation = m_backing_store_manager.resize_backing_stores_if_needed(raster_size(), m_window_resize_in_progress, presents_to_client());
-    if (!allocation.has_value())
-        return {};
-    m_latest_rendered_surface = nullptr;
-    m_last_rasterized_frame.clear();
-    return m_backing_store_manager.allocate_backing_stores(*allocation, skia_backend_context, presents_to_client(), gpu_sharing);
-}
-
-bool ContextState::update_composited_raster_transform(Gfx::FloatRect destination_rect, Gfx::FloatMatrix4x4 const& transform)
-{
-    if (presents_to_client() || m_backing_store_manager.is_rendering() || m_viewport_size.is_empty() || destination_rect.is_empty())
-        return false;
-
-    // Display list coordinates already include device scale and page zoom. Only the embedding transform and
-    // the viewport-to-destination mapping belong here; neither changes the child's layout or scroll geometry.
-    auto has_perspective = transform[3, 0] != 0 || transform[3, 1] != 0 || transform[3, 3] != 1;
-    float scale_x = 1;
-    float scale_y = 1;
-    if (!has_perspective) {
-        scale_x = hypotf(transform[0, 0], transform[1, 0]) * destination_rect.width() / m_viewport_size.width();
-        scale_y = hypotf(transform[0, 1], transform[1, 1]) * destination_rect.height() / m_viewport_size.height();
-    }
-    if (!isfinite(scale_x) || !isfinite(scale_y))
-        return false;
-
-    // Perspective keeps the native resolution until we can choose a scale from the visible projected region.
-    auto scale = bounded_composited_raster_scale({ scale_x, scale_y }, m_viewport_size);
-
-    Gfx::FloatPoint translation;
-    if (!has_perspective && transform[0, 1] == 0 && transform[1, 0] == 0 && scale.width() == scale_x && scale.height() == scale_y) {
-        auto x = transform[0, 0] * destination_rect.x() + transform[0, 3];
-        auto y = transform[1, 1] * destination_rect.y() + transform[1, 3];
-        if (!isfinite(x) || !isfinite(y))
-            return false;
-        // Mirrored placements need the opposite fractional phase so the remaining image transform still
-        // lands on integer device pixels.
-        if (transform[0, 0] < 0)
-            x = -x;
-        if (transform[1, 1] < 0)
-            y = -y;
-        translation = { x - floorf(x), y - floorf(y) };
-    }
-
-    if (m_raster_scale == scale && m_raster_translation == translation)
-        return false;
-    m_raster_scale = scale;
-    m_raster_translation = translation;
-    m_latest_rendered_surface = nullptr;
-    m_last_rasterized_frame.clear();
-    return true;
-}
-
-Gfx::IntSize ContextState::raster_size() const
-{
-    if (m_viewport_size.is_empty())
-        return {};
-    if (presents_to_client())
-        return m_viewport_size;
-    return {
-        static_cast<int>(ceilf(m_viewport_size.width() * m_raster_scale.width() + m_raster_translation.x())),
-        static_cast<int>(ceilf(m_viewport_size.height() * m_raster_scale.height() + m_raster_translation.y())),
-    };
-}
-
-Gfx::IntRect ContextState::raster_damage_rect(Gfx::IntRect damage_rect) const
-{
-    if (damage_rect.is_empty())
-        return {};
-    if (damage_rect.contains(Gfx::IntRect { {}, m_viewport_size }))
-        return { {}, raster_size() };
-    auto rect = damage_rect.to_type<float>();
-    rect.scale_by(m_raster_scale.width(), m_raster_scale.height());
-    rect.translate_by(m_raster_translation);
-    return Gfx::enclosing_int_rect(rect).intersected(Gfx::IntRect { {}, raster_size() });
-}
-
-Compositing::CompositedContextSurface ContextState::composited_surface() const
-{
-    if (!m_latest_rendered_surface || !m_last_rasterized_frame.has_value())
-        return {};
-    auto size = m_last_rasterized_frame->viewport_size.to_type<float>();
-    size.scale_by(m_raster_scale.width(), m_raster_scale.height());
-    return { m_latest_rendered_surface, { m_raster_translation, size } };
-}
-
-void ContextState::invalidate_backing_stores()
-{
-    m_backing_store_manager.invalidate();
 }
 
 bool ContextState::set_display_metadata(Optional<u64> display_id, double refresh_rate)
 {
     m_display_id = display_id;
     m_display_refresh_rate = refresh_rate;
-    return m_pending_present_frame_scheduled;
+    return m_presenter.pending_present_frame_scheduled();
 }
 
 bool ContextState::set_visibility(Compositing::ContextVisibility visibility)
@@ -1276,253 +1966,144 @@ bool ContextState::set_visibility(Compositing::ContextVisibility visibility)
     if (m_visibility == visibility)
         return false;
     m_visibility = visibility;
-    if (visibility == Compositing::ContextVisibility::Hidden)
+    if (visibility == Compositing::ContextVisibility::Hidden) {
         end_keyboard_scroll_gesture();
+        m_elastic_overscroll_controller.forget();
+    }
     return true;
 }
 
-bool ContextState::request_rendering_opportunity(double maximum_frames_per_second)
+Vector<Web::CompositorScrollOffset> ContextState::scroll_offsets() const
 {
-    m_rendering_opportunity_pacer.set_maximum_frames_per_second(maximum_frames_per_second);
-    if (m_rendering_opportunity_requested)
-        return false;
-    m_rendering_opportunity_requested = true;
-    return true;
-}
-
-double ContextState::rendering_opportunity_frame_interval(double display_refresh_rate) const
-{
-    return m_rendering_opportunity_pacer.frame_interval(display_refresh_rate);
-}
-
-bool ContextState::rendering_opportunity_is_due(MonotonicTime frame_time, double display_refresh_rate) const
-{
-    return m_rendering_opportunity_pacer.is_due(frame_time, display_refresh_rate);
-}
-
-void ContextState::did_deliver_rendering_opportunity(MonotonicTime frame_time)
-{
-    VERIFY(m_rendering_opportunity_requested);
-    m_rendering_opportunity_requested = false;
-    m_rendering_opportunity_pacer.did_deliver(frame_time);
-}
-
-Optional<Gfx::IntRect> ContextState::pending_present_frame_viewport_rect() const
-{
-    if (!m_pending_present_frame.has_value())
-        return {};
-    return m_pending_present_frame->viewport_rect;
-}
-
-void ContextState::queue_present_frame(PendingFrame pending_frame)
-{
-    if (!m_pending_present_frame.has_value()) {
-        m_pending_present_frame = pending_frame;
-        return;
+    auto scroll_nodes = m_async_scroll_tree.scroll_nodes();
+    Vector<Web::CompositorScrollOffset> scroll_offsets;
+    scroll_offsets.ensure_capacity(scroll_nodes.size());
+    for (auto const& node : scroll_nodes) {
+        if (auto offset = m_async_scroll_tree.css_scroll_offset_for_node(node.node_id, m_scroll_state_snapshot); offset.has_value())
+            scroll_offsets.unchecked_append({ node.stable_node_id, *offset });
     }
-
-    if (m_pending_present_frame->viewport_rect.size() != pending_frame.viewport_rect.size()) {
-        m_pending_present_frame = PendingFrame::repainting_everything(pending_frame.viewport_rect);
-        return;
-    }
-
-    m_pending_present_frame->viewport_rect = pending_frame.viewport_rect;
-    m_pending_present_frame->forced_damage_rect.unite(pending_frame.forced_damage_rect);
-}
-
-void ContextState::mark_pending_present_frame_scheduled()
-{
-    m_pending_present_frame_scheduled = true;
+    return scroll_offsets;
 }
 
 bool ContextState::has_pending_present_frame_scheduled_on(Optional<u64> display_id) const
 {
-    return m_pending_present_frame_scheduled && m_display_id == display_id;
+    return m_presenter.pending_present_frame_scheduled() && m_display_id == display_id;
 }
 
-bool ContextState::can_schedule_pending_present_frame_if_unblocked() const
+ContextPresenter::FrameContent ContextState::frame_content(Compositing::ScrollStateSnapshot const& presented_scroll_state_snapshot, CompositedContextResolver const* composited_context_resolver) const
 {
-    if (is_present_blocked())
-        return false;
-    if (!m_pending_present_frame.has_value())
-        return false;
-    if (m_pending_present_frame_scheduled)
-        return false;
-    return true;
-}
-
-Optional<ContextState::PendingFrame> ContextState::take_pending_present_frame_if_unblocked()
-{
-    if (is_present_blocked())
-        return {};
-    m_pending_present_frame_scheduled = false;
-    if (!m_pending_present_frame.has_value())
-        return {};
-    return m_pending_present_frame.release_value();
-}
-
-bool ContextState::needs_rasterization() const
-{
-    return m_pending_present_frame.has_value()
-        || (!m_latest_rendered_surface && m_presented_frame.has_value());
-}
-
-Optional<Gfx::IntRect> ContextState::frame_rect_to_repaint() const
-{
-    if (m_pending_present_frame.has_value())
-        return m_pending_present_frame->viewport_rect;
-    return m_presented_frame;
-}
-
-Optional<Gfx::IntRect> ContextState::self_present_rect() const
-{
-    if (m_presented_frame.has_value())
-        return m_presented_frame;
-    if (!m_viewport_size.is_empty())
-        return Gfx::IntRect { {}, m_viewport_size };
-    return {};
-}
-
-bool ContextState::draws_canvas(Compositing::CanvasId canvas_id) const
-{
-    return m_last_rasterized_frame.has_value() && m_last_rasterized_frame->canvas_content_generations.contains(canvas_id);
-}
-
-Optional<ContextState::PreparedFrame> ContextState::prepare_frame(Compositing::DisplayListPlayerSkia& display_list_player, PendingFrame pending_frame, CompositedContextResolver const* composited_context_resolver)
-{
-    if (is_present_blocked()) {
-        queue_present_frame(pending_frame);
-        return {};
-    }
-
-    if (!can_render_frame()) {
-        m_presented_frame = pending_frame.viewport_rect;
-        return {};
-    }
-
-    auto damage_rect = frame_damage_for(pending_frame);
-    // NB: A changed content rect must still reach the client even if the pixels are identical.
-    if (damage_rect.is_empty() && m_presented_frame == pending_frame.viewport_rect) {
-        remember_rasterized_frame(pending_frame.viewport_rect.size());
-        return {};
-    }
-    auto render_target = m_backing_store_manager.acquire_render_target(raster_damage_rect(damage_rect));
-    if (!render_target.has_value()) {
-        queue_present_frame(pending_frame);
-        return {};
-    }
-    auto& back_store = render_target->surface;
-    paint_current_display_list(display_list_player, back_store, composited_context_resolver, render_target->damage_rect);
-    remember_rasterized_frame(pending_frame.viewport_rect.size());
-
-    return PreparedFrame {
-        .rendered_surface = &back_store,
-        .bitmap_id = render_target->bitmap_id,
-        .damage_rect = damage_rect,
+    return {
+        .presented_scroll_state_snapshot = presented_scroll_state_snapshot,
+        .scrollbar_controller = m_scrollbar_controller,
+        .viewport_scroll_node_index = m_async_scroll_tree.viewport_scroll_node_id().map([](auto const& node_id) { return node_id.scroll_node_index; }),
+        .composited_context_resolver = composited_context_resolver,
     };
 }
 
-void ContextState::did_submit_prepared_frame(Gfx::IntRect viewport_rect)
+// Each frame shows the scrollbars as of when it is painted. An elastic overscroll moves the presented scroll offsets
+// only, and shows the scrollbars of the stretched scroller as a scroll does.
+void ContextState::update_scrollbar_visibility()
 {
-    m_presented_frame = viewport_rect;
+    auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
+    auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
+    auto now = MonotonicTime::now();
+    m_scrollbar_controller.update_visibility(presented_scroll_state_snapshot, now);
+    report_scrollbar_visibility_changes();
+
+    // A hovered scrollbar starts to grow here, which needs display ticks before anything else asks for a frame.
+    if (m_request_animation_frames && m_scrollbar_controller.fades_need_frame(now))
+        m_request_animation_frames();
+
+    // The fade out runs on display ticks, which the wait before it does not need.
+    auto fade_out_time = m_scrollbar_controller.next_fade_out_time();
+    if (!fade_out_time.has_value() || !m_request_animation_frames) {
+        if (m_scrollbar_fade_out_timer)
+            m_scrollbar_fade_out_timer->stop();
+        return;
+    }
+    if (!m_scrollbar_fade_out_timer) {
+        m_scrollbar_fade_out_timer = Core::Timer::create_single_shot(AK::Duration::zero(), [this] {
+            m_request_animation_frames();
+        });
+    }
+    auto delay = max(AK::Duration::zero(), *fade_out_time - now);
+    m_scrollbar_fade_out_timer->restart(delay);
 }
 
-bool ContextState::present_synchronously(Compositing::DisplayListPlayerSkia& display_list_player, CompositedContextResolver const* composited_context_resolver)
+// NB: This goes on the connection the compositor forwards input on, so the main thread knows which scrollbars have
+//     faded out before it hit tests any later press. A nested context another process owns reports to that process,
+//     which gets its input through the UI instead.
+void ContextState::report_scrollbar_visibility_changes()
 {
-    if (!can_render_frame())
-        return false;
-    // Don't race an async present already in flight for this context; its own completion will update the output.
-    if (is_present_blocked())
-        return false;
+    auto changes = m_scrollbar_controller.take_visibility_changes();
+    if (!changes.is_empty())
+        m_web_content_client.overlay_scrollbar_visibilities_changed(changes);
+}
 
-    Optional<PendingFrame> pending_frame = m_pending_present_frame;
-    if (!pending_frame.has_value() && m_presented_frame.has_value())
-        pending_frame = PendingFrame::repainting_everything(*m_presented_frame);
-    if (!pending_frame.has_value())
-        return false;
+Optional<PendingFrame> ContextState::advance_scrollbar_fades(MonotonicTime frame_time)
+{
+    if (!m_scene.visual_context_tree().has_value())
+        return {};
+    auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
+    auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
+    auto damage_rect = m_scrollbar_controller.advance_fades(m_scene.visual_context_tree_for_compositing(), presented_scroll_state_snapshot, frame_time);
+    report_scrollbar_visibility_changes();
+    auto viewport_rect = m_presenter.viewport_rect_for_ui_overlay();
+    if (damage_rect.is_empty() || !viewport_rect.has_value())
+        return {};
+    return PendingFrame { *viewport_rect, damage_rect };
+}
 
-    auto render_target = m_backing_store_manager.acquire_render_target(raster_damage_rect(frame_damage_for(*pending_frame)));
-    if (!render_target.has_value())
-        return false;
-    auto& back_store = render_target->surface;
-    paint_current_display_list(display_list_player, back_store, composited_context_resolver, render_target->damage_rect);
-    remember_rasterized_frame(pending_frame->viewport_rect.size());
-    display_list_player.flush(back_store);
-    m_backing_store_manager.complete_rendering(render_target->bitmap_id, false);
-    m_latest_rendered_surface = m_backing_store_manager.latest_rendered_surface();
-    m_presented_frame = pending_frame->viewport_rect;
-    m_pending_present_frame.clear();
-    m_pending_present_frame_scheduled = false;
-    return true;
+Optional<PreparedFrame> ContextState::prepare_frame(DisplayListPlayerSkia& display_list_player, PendingFrame pending_frame, CompositedContextResolver const* composited_context_resolver)
+{
+    update_scrollbar_visibility();
+    auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
+    auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
+    return m_presenter.prepare_frame(display_list_player, pending_frame, frame_content(presented_scroll_state_snapshot, composited_context_resolver));
+}
+
+bool ContextState::present_synchronously(DisplayListPlayerSkia& display_list_player, CompositedContextResolver const* composited_context_resolver)
+{
+    update_scrollbar_visibility();
+    auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
+    auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
+    return m_presenter.present_synchronously(display_list_player, frame_content(presented_scroll_state_snapshot, composited_context_resolver));
+}
+
+Optional<PendingFrame> ContextState::paint_screenshot(DisplayListPlayerSkia& display_list_player, Gfx::ShareableBitmap& target_bitmap, CompositedContextResolver const* composited_context_resolver)
+{
+    VERIFY(can_paint_screenshot(target_bitmap));
+
+    // Screenshot requests can arrive between display ticks, so sample animations and scrollbar visibility at capture
+    // time.
+    auto capture_time = MonotonicTime::now();
+    advance_visual_animations(capture_time);
+    update_scrollbar_visibility();
+    auto scrollbar_fade_frame = advance_scrollbar_fades(capture_time);
+
+    auto stretched_scroll_state_snapshot = scroll_state_snapshot_stretched_by_elastic_overscrolls();
+    auto const& presented_scroll_state_snapshot = stretched_scroll_state_snapshot.has_value() ? *stretched_scroll_state_snapshot : m_scroll_state_snapshot;
+    m_presenter.paint_screenshot(display_list_player, target_bitmap, frame_content(presented_scroll_state_snapshot, composited_context_resolver));
+    return scrollbar_fade_frame;
 }
 
 bool ContextState::can_paint_screenshot(Gfx::ShareableBitmap& target_bitmap) const
 {
-    return m_display_list && target_bitmap.is_valid() && target_bitmap.bitmap();
-}
-
-void ContextState::paint_screenshot(Compositing::DisplayListPlayerSkia& display_list_player, Gfx::ShareableBitmap& target_bitmap, CompositedContextResolver const* composited_context_resolver)
-{
-    VERIFY(can_paint_screenshot(target_bitmap));
-
-    auto target_surface = Gfx::PaintingSurface::wrap_bitmap(*target_bitmap.bitmap());
-    paint_current_display_list(display_list_player, *target_surface, composited_context_resolver, {}, PaintUIOverlay::No, false);
-    display_list_player.flush(*target_surface);
-}
-
-bool ContextState::acknowledge_presented_bitmap(i32 bitmap_id)
-{
-    return m_backing_store_manager.release_buffer(bitmap_id);
-}
-
-void ContextState::did_finish_gpu_present(i32 bitmap_id)
-{
-    m_backing_store_manager.complete_rendering(bitmap_id, presents_to_client());
-    m_latest_rendered_surface = m_backing_store_manager.latest_rendered_surface();
-}
-
-void ContextState::stop_backing_store_shrink_timer()
-{
-    if (!m_backing_store_shrink_timer)
-        return;
-    m_backing_store_shrink_timer->on_timeout = {};
-    m_backing_store_shrink_timer->stop();
-}
-
-Compositing::AccumulatedVisualContextTree const& ContextState::current_visual_context_tree() const
-{
-    VERIFY(m_display_list);
-    VERIFY(m_visual_context_tree.has_value());
-    return m_visual_context_tree.value();
-}
-
-Optional<float> ContextState::visual_viewport_scale_for_compositing() const
-{
-    if (!m_visual_context_tree.has_value())
-        return {};
-
-    if (m_async_visual_viewport_transform.has_value())
-        return m_async_visual_viewport_transform->matrix[0, 0];
-
-    return m_visual_context_tree->visual_viewport_transform().matrix[0, 0];
+    return m_scene.display_list() && target_bitmap.is_valid() && target_bitmap.bitmap();
 }
 
 Optional<ContextState::VisualViewportScrollDelta> ContextState::apply_visual_viewport_scroll_delta(Gfx::FloatPoint delta)
 {
     if (delta.is_zero())
         return {};
-    if (!m_visual_context_tree.has_value())
+    if (!m_scene.visual_context_tree().has_value())
         return {};
 
-    auto viewport_node_id = m_async_scroll_tree.viewport_scroll_node_id();
-    if (!viewport_node_id.has_value())
+    auto document_id = m_async_scroll_tree.document_id();
+    if (!document_id.has_value())
         return {};
 
-    auto viewport_scroll_offset = m_async_scroll_tree.scroll_offset_for_node(*viewport_node_id, m_scroll_state_snapshot);
-    if (!viewport_scroll_offset.has_value())
-        return {};
-
-    auto transform = m_async_visual_viewport_transform.value_or(m_visual_context_tree->visual_viewport_transform());
+    auto transform = m_scene.visual_viewport_transform();
     auto scale = transform.matrix[0, 0];
     if (scale <= 1.0f)
         return {};
@@ -1540,36 +2121,83 @@ Optional<ContextState::VisualViewportScrollDelta> ContextState::apply_visual_vie
 
     transform.matrix[0, 3] = new_x;
     transform.matrix[1, 3] = new_y;
-    invalidate_visual_context_tree_for_compositing();
-    m_async_visual_viewport_transform = transform;
+    m_scene.set_async_visual_viewport_transform(transform);
+    m_visual_viewport_document_id = document_id;
+    note_user_input_scrolled({ .node_id = document_id.value(), .kind = Web::AsyncScrollNodeKind::VisualViewport });
     rebuild_wheel_hit_test_targets();
 
     return VisualViewportScrollDelta {
         .scroll_offset = {
-            .stable_node_id = viewport_stable_id_from(*viewport_node_id),
-            .compositor_scroll_offset = *viewport_scroll_offset,
+            .stable_node_id = { .node_id = document_id.value(), .kind = Web::AsyncScrollNodeKind::VisualViewport },
+            .compositor_scroll_offset = visual_viewport_scroll_offset(transform),
             .unadopted_scroll_delta = consumed_delta.scaled(1.0f / scale),
             .last_relative_scroll_delta = {},
+            .visual_viewport_scale = scale,
+            .applied_scroll_request_id = 0,
+            .user_input_scroll_count = 0,
         },
         .consumed_delta = consumed_delta,
     };
 }
 
-Optional<Gfx::FloatPoint> ContextState::reapply_unreconciled_async_scroll_offsets()
+Gfx::FloatPoint ContextState::pan_visual_viewport_by(Gfx::FloatPoint delta_in_screen_pixels)
+{
+    auto visual_viewport_scroll_delta = apply_visual_viewport_scroll_delta(delta_in_screen_pixels);
+    if (!visual_viewport_scroll_delta.has_value())
+        return {};
+    store_pending_async_scroll_offsets({ &visual_viewport_scroll_delta->scroll_offset, 1 });
+    return visual_viewport_scroll_delta->consumed_delta;
+}
+
+HashMap<Web::AsyncScrollNodeStableID, Gfx::FloatPoint> ContextState::scroll_offsets_by_stable_id() const
+{
+    HashMap<Web::AsyncScrollNodeStableID, Gfx::FloatPoint> scroll_offsets;
+    if (!m_has_async_scrolling_state)
+        return scroll_offsets;
+    for (auto const& node : m_async_scroll_tree.scroll_nodes()) {
+        if (auto offset = m_async_scroll_tree.scroll_offset_for_node(node.node_id, m_scroll_state_snapshot); offset.has_value())
+            scroll_offsets.set(node.stable_node_id, offset.value());
+    }
+    return scroll_offsets;
+}
+
+// The main thread asks for every scroll of its own, so the offsets a snapshot of its scroll state has for the boxes
+// this context already scrolls are what it last heard of them. Only a box new to this context takes its offset from
+// the snapshot.
+Optional<Gfx::FloatPoint> ContextState::keep_scroll_offsets_of_known_nodes(HashMap<Web::AsyncScrollNodeStableID, Gfx::FloatPoint> const& scroll_offsets_of_known_nodes)
 {
     Optional<Gfx::FloatPoint> viewport_scroll_offset;
-    for (auto const& unreconciled : m_unreconciled_async_scroll_offsets) {
-        auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(unreconciled.stable_node_id);
-        if (!node_id.has_value())
+    Vector<Compositing::AsyncScrollOffset> clamped_scroll_offsets;
+    m_scroll_offsets_differ_from_last_frame = false;
+    m_scroll_nodes_seeded_by_last_frame.clear();
+    for (auto const& node : m_async_scroll_tree.scroll_nodes()) {
+        auto known_scroll_offset = scroll_offsets_of_known_nodes.get(node.stable_node_id);
+        if (!known_scroll_offset.has_value()) {
+            m_scroll_nodes_seeded_by_last_frame.set(node.stable_node_id);
             continue;
-        auto reconciled_scroll_offset = m_async_scroll_tree.set_scroll_offset(
-            *node_id,
-            unreconciled.compositor_scroll_offset,
-            current_visual_context_tree(),
-            m_scroll_state_snapshot);
-        if (reconciled_scroll_offset.has_value() && m_async_scroll_tree.scroll_node_is_viewport(*node_id))
-            viewport_scroll_offset = *reconciled_scroll_offset;
+        }
+        if (m_async_scroll_tree.scroll_offset_for_node(node.node_id, m_scroll_state_snapshot) != known_scroll_offset)
+            m_scroll_offsets_differ_from_last_frame = true;
+        auto kept_scroll_offset = m_async_scroll_tree.set_scroll_offset(node.node_id, known_scroll_offset.value(), m_scene.current_visual_context_tree(), m_scroll_state_snapshot);
+        if (!kept_scroll_offset.has_value())
+            continue;
+        if (node.is_viewport)
+            viewport_scroll_offset = kept_scroll_offset;
+        // A box whose scroll range shrank past its offset is told where it ended up.
+        if (kept_scroll_offset.value() != known_scroll_offset.value()) {
+            clamped_scroll_offsets.append({
+                .stable_node_id = node.stable_node_id,
+                .compositor_scroll_offset = kept_scroll_offset.value(),
+                .unadopted_scroll_delta = kept_scroll_offset.value() - known_scroll_offset.value(),
+                .last_relative_scroll_delta = {},
+                .visual_viewport_scale = {},
+                .applied_scroll_request_id = 0,
+                .user_input_scroll_count = 0,
+            });
+        }
     }
+    if (!clamped_scroll_offsets.is_empty())
+        store_pending_async_scroll_offsets(clamped_scroll_offsets);
     return viewport_scroll_offset;
 }
 
@@ -1577,55 +2205,77 @@ void ContextState::store_pending_async_scroll_offsets(
     ReadonlySpan<Compositing::AsyncScrollOffset> scroll_offsets,
     Optional<Compositing::AsyncScrollOperationID> operation_id)
 {
-    m_animated_content_may_affect_viewport.clear();
-    for (auto const& scroll_offset : scroll_offsets)
-        set_or_append_pending_scroll_offset(m_pending_async_scroll_offsets, scroll_offset);
+    m_scene.forget_whether_animated_content_may_affect_viewport();
+    Vector<Compositing::AsyncScrollOffset> stamped_scroll_offsets;
+    stamped_scroll_offsets.ensure_capacity(scroll_offsets.size());
+    for (auto scroll_offset : scroll_offsets) {
+        scroll_offset.applied_scroll_request_id = m_applied_scroll_request_ids.get(scroll_offset.stable_node_id).value_or(0);
+        scroll_offset.user_input_scroll_count = m_user_input_scroll_counts.get(scroll_offset.stable_node_id).value_or(0);
+        stamped_scroll_offsets.unchecked_append(scroll_offset);
+    }
+    m_async_scroll_update_outbox.record_scroll_offsets(stamped_scroll_offsets);
+    m_scroll_offsets_differ_from_last_frame = true;
     if (operation_id.has_value())
-        m_completed_async_scroll_operation_ids.append(*operation_id);
+        m_async_scroll_update_outbox.complete_operation(*operation_id);
 }
 
-Optional<Compositing::AsyncScrollNodeID> ContextState::resolve_wheel_scroll_latch(Gfx::FloatPoint position, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, MonotonicTime now)
+WheelGestureRouting::ResolvedLatch ContextState::resolve_wheel_scroll_latch(Web::ScrollGesturePhase scroll_gesture_phase)
 {
-    if (!m_wheel_scroll_latch.has_value())
+    // Only a hit test takes a latch, and it needs the tree of an installed display list.
+    if (!m_wheel_gesture_routing.has_latch())
         return {};
-    auto position_slop_in_device_pixels = Compositing::wheel_gesture_position_slop_in_css_pixels * static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel());
-    if (!m_wheel_scroll_latch->gesture.is_continued_by(position, scroll_gesture_phase, modifiers, now, position_slop_in_device_pixels)) {
-        m_wheel_scroll_latch.clear();
-        return {};
-    }
-    auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(m_wheel_scroll_latch->stable_node_id);
-    if (!node_id.has_value()) {
-        m_wheel_scroll_latch.clear();
-        return {};
-    }
-    // The hit test a latched step skips would refuse a tree the wheel hit-test targets were not built for.
-    if (!m_async_scroll_tree.has_wheel_hit_test_targets_for(current_visual_context_tree()))
-        return {};
-    m_wheel_scroll_latch->gesture.advance_to(scroll_gesture_phase, now);
-    return node_id;
+    return m_wheel_gesture_routing.resolve_latch(m_async_scroll_tree, m_scene.current_visual_context_tree(), scroll_gesture_phase);
 }
 
-Optional<Compositing::AsyncScrollNodeID> ContextState::hit_test_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::ScrollGesturePhase scroll_gesture_phase, u32 modifiers, MonotonicTime now, Optional<Web::UniqueNodeID> expected_document_id)
+ContextState::WheelGestureLatchAttempt ContextState::hit_test_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Optional<Web::UniqueNodeID> expected_document_id, Compositing::WheelStepDispatch wheel_step_dispatch, Compositing::NestedContextRegions nested_context_regions)
 {
-    auto scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(visual_context_tree_for_compositing(), position, delta);
-    if (scroll_target.blocked_by_main_thread_region || scroll_target.blocked_by_wheel_event_region || !scroll_target.node_id.has_value())
-        return {};
-    if (expected_document_id.has_value() && scroll_target.node_id->document_id != *expected_document_id)
-        return {};
-    auto const* node = m_async_scroll_tree.scroll_node_for_id(*scroll_target.node_id);
+    Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> in_flight_destination_for;
+    if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete)
+        in_flight_destination_for = [this](auto stable_node_id) { return in_flight_wheel_destination(stable_node_id); };
+    auto scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(m_scene.visual_context_tree_for_compositing(), position, delta, in_flight_destination_for, wheel_step_dispatch, nested_context_regions);
+    if (scroll_target.is_blocked_by_a_region())
+        return { Compositing::input_routing_decision_for_first_wheel_step(scroll_target.outcome) };
+
+    auto node_id_to_latch = scroll_target.node_id;
+    auto decision = Web::InputRoutingDecision::Latched;
+    // Fingers that start to pull where every scroller under them is already at its edge stretch the outermost one. A
+    // context nested in another one turns the gesture away instead, which passes it on to the document around it.
+    bool fingers_start_a_gesture_at_an_edge = !node_id_to_latch.has_value() && scroll_target.innermost_scroll_node_id.has_value() && !delta.is_zero()
+        && scroll_gesture_phase == Web::ScrollGesturePhase::Ongoing && wheel_step_can_stretch_elastically(wheel_delta_precision, scroll_gesture_phase);
+    if (fingers_start_a_gesture_at_an_edge) {
+        node_id_to_latch = m_async_scroll_tree.outermost_scroll_node_wheel_scrollable_along_main_axis_of(*scroll_target.innermost_scroll_node_id, delta);
+        decision = Web::InputRoutingDecision::LatchedOutermostScrollerToStretch;
+    }
+
+    if (!node_id_to_latch.has_value())
+        return { Compositing::input_routing_decision_for_first_wheel_step(scroll_target.outcome) };
+    if (expected_document_id.has_value() && node_id_to_latch->document_id != *expected_document_id)
+        return { Web::InputRoutingDecision::ScrollerInOtherDocument };
+    auto const* node = m_async_scroll_tree.scroll_node_for_id(*node_id_to_latch);
     VERIFY(node);
-    m_wheel_scroll_latch = WheelScrollLatch {
-        .stable_node_id = node->stable_node_id,
-        .gesture = Compositing::WheelGestureIdentity::started_by(position, scroll_gesture_phase, modifiers, now),
-    };
-    return scroll_target.node_id;
+    m_wheel_gesture_routing.latch(node->stable_node_id, scroll_gesture_phase);
+    return { decision, node_id_to_latch };
 }
 
-Optional<Web::AsyncScrollNodeStableID> ContextState::latched_wheel_scroller_for_testing() const
+void ContextState::report_started_user_scroll(Compositing::AsyncScrollOperationID operation_id, Web::AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint step_start_offset, Gfx::FloatPoint destination_offset, Compositing::ScrollAnimationKind animation_kind, bool is_absolute_scroll)
 {
-    if (!m_wheel_scroll_latch.has_value())
-        return {};
-    return m_wheel_scroll_latch->stable_node_id;
+    auto node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(stable_node_id);
+    VERIFY(node_id.has_value());
+    auto current_offset = m_async_scroll_tree.css_scroll_offset_for_node(*node_id, m_scroll_state_snapshot);
+    VERIFY(current_offset.has_value());
+    auto destination = m_async_scroll_tree.css_pixels_from_device_offset(destination_offset);
+    note_user_input_scrolled(stable_node_id);
+    m_async_scroll_update_outbox.record_started_user_scroll({
+        .stable_node_id = stable_node_id,
+        .operation_id = operation_id,
+        .initial_scroll_offset = *current_offset,
+        .unsnapped_scroll_destination = destination,
+        .relative_scroll_delta = destination - m_async_scroll_tree.css_pixels_from_device_offset(step_start_offset),
+        .selection = { .position = destination },
+        .settles_gesture = false,
+        .is_absolute_scroll = is_absolute_scroll,
+        .animation_kind = animation_kind,
+    });
 }
 
 void ContextState::cancel_smooth_scroll_taken_over_by_user_input(Compositing::AsyncScrollNodeID node_id)
@@ -1634,23 +2284,49 @@ void ContextState::cancel_smooth_scroll_taken_over_by_user_input(Compositing::As
         auto animated_node_id = m_async_scroll_tree.scroll_node_id_for_stable_id(smooth_scroll_animation.stable_node_id);
         if (animated_node_id != node_id)
             continue;
-        m_async_scroll_operation_ids_taken_over_by_user_input.append(smooth_scroll_animation.operation_id);
+        m_async_scroll_update_outbox.note_operation_taken_over_by_user_input(smooth_scroll_animation.operation_id);
         cancel_smooth_scroll(smooth_scroll_animation.stable_node_id);
         return;
     }
 }
 
-void ContextState::note_user_scroll_gesture_end_if_drag_ended(bool was_dragging_scrollbar)
+Optional<Web::AsyncScrollNodeStableID> ContextState::box_of_captured_scrollbar() const
 {
-    if (was_dragging_scrollbar && !m_scrollbar_controller.has_captured_scrollbar())
-        m_user_scroll_gesture_ended = true;
+    auto scrollbar_index = m_scrollbar_controller.captured_scrollbar_index();
+    if (!scrollbar_index.has_value())
+        return {};
+    return m_scrollbar_controller.scrollbars()[scrollbar_index.value()].scroller_stable_node_id;
 }
 
-bool ContextState::user_scroll_gesture_in_progress() const
+void ContextState::note_user_scroll_gesture_end_if_drag_ended(Optional<Web::AsyncScrollNodeStableID> box_of_dragged_scrollbar)
 {
-    return m_scrollbar_controller.has_captured_scrollbar()
-        || !m_held_scroll_keys.is_empty()
-        || m_scroll_snap_controller.has_gesture_awaiting_input();
+    if (box_of_dragged_scrollbar.has_value() && !m_scrollbar_controller.has_captured_scrollbar())
+        m_async_scroll_update_outbox.note_user_scroll_gesture_ended({ &box_of_dragged_scrollbar.value(), 1 });
+}
+
+void ContextState::end_user_scroll_gesture_of_held_keys()
+{
+    m_async_scroll_update_outbox.note_user_scroll_gesture_ended(m_boxes_scrolled_by_held_keys);
+    m_boxes_scrolled_by_held_keys.clear();
+}
+
+AsyncScrollUpdateOutbox::UserScrollGestureState ContextState::user_scroll_gesture_state() const
+{
+    AsyncScrollUpdateOutbox::UserScrollGestureState state;
+    if (auto box = box_of_captured_scrollbar(); box.has_value())
+        state.boxes_in_user_scroll_gesture.append(box.value());
+    for (auto box : m_boxes_scrolled_by_held_keys) {
+        if (!state.boxes_in_user_scroll_gesture.contains_slow(box))
+            state.boxes_in_user_scroll_gesture.append(box);
+    }
+    for (auto box : m_scroll_snap_controller.boxes_with_gesture_awaiting_input()) {
+        if (!state.boxes_in_user_scroll_gesture.contains_slow(box))
+            state.boxes_in_user_scroll_gesture.append(box);
+    }
+    if (auto box = m_wheel_gesture_routing.scroller_held_by_fingers(); box.has_value() && !state.boxes_in_user_scroll_gesture.contains_slow(box.value()))
+        state.boxes_in_user_scroll_gesture.append(box.value());
+    state.wheel_latched_scroller = m_wheel_gesture_routing.latched_scroller();
+    return state;
 }
 
 void ContextState::schedule_end_of_scroll_step_gestures(MonotonicTime now)
@@ -1662,25 +2338,102 @@ void ContextState::schedule_end_of_scroll_step_gestures(MonotonicTime now)
         return;
     }
     if (!m_scroll_step_gesture_input_timer) {
-        m_scroll_step_gesture_input_timer = Core::Timer::create_single_shot(0, [this] {
+        m_scroll_step_gesture_input_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this] {
             end_scroll_step_gestures_whose_input_ran_out(MonotonicTime::now());
         });
     }
-    // The gesture has run out of input once the clock reads past the deadline.
-    auto delay = max(*deadline - now, AK::Duration::zero()).to_milliseconds() + 1;
-    m_scroll_step_gesture_input_timer->restart(static_cast<int>(delay));
+    m_scroll_step_gesture_input_timer->restart(max(*deadline - now, AK::Duration::zero()));
 }
 
 void ContextState::end_scroll_step_gestures_whose_input_ran_out(MonotonicTime now)
 {
-    if (m_scroll_snap_controller.end_gestures_whose_input_ran_out(now)) {
-        m_user_scroll_gesture_ended = true;
+    if (auto ended_boxes = m_scroll_snap_controller.end_gestures_whose_input_ran_out(now); !ended_boxes.is_empty()) {
+        m_async_scroll_update_outbox.note_user_scroll_gesture_ended(ended_boxes);
         request_rendering_update();
     }
     schedule_end_of_scroll_step_gestures(now);
 }
 
-Optional<ContextState::PendingFrame> ContextState::apply_scrollbar_drag(ScrollbarController::Drag const& drag)
+Optional<PendingFrame> ContextState::start_scrollbar_press_scroll(Compositing::AsyncScrollNode const& node, Gfx::FloatPoint old_scroll_offset, Gfx::FloatPoint destination, bool is_absolute_scroll)
+{
+    auto operation_id = m_async_scroll_update_outbox.allocate_operation_id();
+    m_smooth_scroll_animations.append({
+        .stable_node_id = node.stable_node_id,
+        .operation_id = operation_id,
+        .animation = Compositing::SmoothScrollAnimation { old_scroll_offset, destination, m_async_scroll_tree.device_pixels_per_css_pixel() },
+        .started_at = MonotonicTime::now(),
+        .is_user_scroll = true,
+        .heads_to_an_extent = false,
+    });
+    report_started_user_scroll(operation_id, node.stable_node_id, old_scroll_offset, destination, Compositing::ScrollAnimationKind::SmoothScroll, is_absolute_scroll);
+    m_scrollbar_press_scroll_operation = operation_id;
+    return PendingFrame::repainting_changes(m_async_scrolling_viewport_rect);
+}
+
+// https://source.chromium.org/chromium/chromium/src/+/main:cc/input/scroll_utils.cc
+// INTEROP: A page is most of the scrollport, keeping as much of the last page in view as Chromium does.
+static float scrollbar_page_step(float scrollport_length, float device_pixels_per_css_pixel)
+{
+    static constexpr float min_fraction_to_step_when_paging = 0.875f;
+    static constexpr float max_overlap_between_pages = 40;
+    return max(1.0f, max(scrollport_length * min_fraction_to_step_when_paging, scrollport_length - max_overlap_between_pages * device_pixels_per_css_pixel));
+}
+
+// Pages the scroller of the captured scrollbar once toward the pointer, from where a page scroll in flight goes, unless
+// the thumb has reached the pointer there.
+Optional<PendingFrame> ContextState::page_captured_scrollbar()
+{
+    auto scrollbar_index = m_scrollbar_controller.captured_scrollbar_index();
+    if (!scrollbar_index.has_value() || !m_scrollbar_paging.has_value() || m_scrollbar_paging->direction == 0)
+        return {};
+    auto const& scrollbar = m_scrollbar_controller.scrollbars()[*scrollbar_index];
+    auto const* node = m_async_scroll_tree.scroll_node_for_id(scrollbar.scroll_node_id);
+    auto old_scroll_offset = m_async_scroll_tree.scroll_offset_for_node(scrollbar.scroll_node_id, m_scroll_state_snapshot);
+    if (!node || !old_scroll_offset.has_value())
+        return {};
+
+    auto* running_animation = running_scrollbar_press_scroll();
+    auto step_start = running_animation ? running_animation->animation.destination_offset() : *old_scroll_offset;
+    if (m_scrollbar_controller.paging_direction(*scrollbar_index, m_scrollbar_paging->primary_position, step_start) != m_scrollbar_paging->direction)
+        return {};
+
+    auto orientation = scrollbar.vertical ? Gfx::Orientation::Vertical : Gfx::Orientation::Horizontal;
+    auto step = scrollbar_page_step(static_cast<float>(node->scrollport_rect.primary_size_for_orientation(orientation)), m_async_scroll_tree.device_pixels_per_css_pixel());
+    auto destination = step_start;
+    destination.set_primary_offset_for_orientation(orientation, step_start.primary_offset_for_orientation(orientation) + static_cast<float>(m_scrollbar_paging->direction) * step);
+    destination = m_async_scroll_tree.clamped_scroll_offset_for_node(scrollbar.scroll_node_id, destination);
+    if (destination == step_start)
+        return {};
+
+    if (running_animation) {
+        retarget_user_scroll(*running_animation, destination, MonotonicTime::now());
+        report_started_user_scroll(running_animation->operation_id, node->stable_node_id, step_start, destination, Compositing::ScrollAnimationKind::SmoothScroll, false);
+        return PendingFrame::repainting_changes(m_async_scrolling_viewport_rect);
+    }
+    cancel_smooth_scroll_taken_over_by_user_input(scrollbar.scroll_node_id);
+    return start_scrollbar_press_scroll(*node, *old_scroll_offset, destination, false);
+}
+
+ContextState::ActiveSmoothScrollAnimation* ContextState::running_scrollbar_press_scroll()
+{
+    if (!m_scrollbar_press_scroll_operation.has_value())
+        return nullptr;
+    auto animation = m_smooth_scroll_animations.first_matching([&](auto const& animation) { return animation.operation_id == *m_scrollbar_press_scroll_operation; });
+    if (!animation.has_value()) {
+        m_scrollbar_press_scroll_operation.clear();
+        return nullptr;
+    }
+    return &animation.value();
+}
+
+void ContextState::stop_scrollbar_paging()
+{
+    m_scrollbar_paging.clear();
+    if (m_scrollbar_paging_timer)
+        m_scrollbar_paging_timer->stop();
+}
+
+Optional<PendingFrame> ContextState::apply_scrollbar_drag(ScrollbarController::Drag const& drag)
 {
     auto dragged_to = m_scrollbar_controller.scroll_offset_for_drag(m_async_scroll_tree, m_scroll_state_snapshot, drag);
     if (!dragged_to.has_value())
@@ -1692,11 +2445,28 @@ Optional<ContextState::PendingFrame> ContextState::apply_scrollbar_drag(Scrollba
     auto old_scroll_offset = m_async_scroll_tree.scroll_offset_for_node(node_id, m_scroll_state_snapshot);
     if (!node || !old_scroll_offset.has_value())
         return {};
-    if (m_async_scroll_tree.clamped_scroll_offset_for_node(node_id, dragged_to->scroll_offset) == *old_scroll_offset)
+    auto destination = m_async_scroll_tree.clamped_scroll_offset_for_node(node_id, dragged_to->scroll_offset);
+
+    // A press beside the thumb scrolls there smoothly, as a page step does. Dragging on before that scroll has ended
+    // moves where it goes.
+    if (auto* running_animation = running_scrollbar_press_scroll()) {
+        if (running_animation->animation.destination_offset() == destination)
+            return {};
+        retarget_user_scroll(*running_animation, destination, MonotonicTime::now());
+        report_started_user_scroll(running_animation->operation_id, node->stable_node_id, *old_scroll_offset, destination, Compositing::ScrollAnimationKind::SmoothScroll, true);
+        return PendingFrame::repainting_changes(m_async_scrolling_viewport_rect);
+    }
+
+    if (destination == *old_scroll_offset)
         return {};
 
     cancel_smooth_scroll_taken_over_by_user_input(node_id);
-    auto new_scroll_offset = m_async_scroll_tree.set_scroll_offset(node_id, dragged_to->scroll_offset, current_visual_context_tree(), m_scroll_state_snapshot);
+
+    if (drag.is_press_beside_thumb)
+        return start_scrollbar_press_scroll(*node, *old_scroll_offset, destination, true);
+
+    auto new_scroll_offset = m_async_scroll_tree.set_scroll_offset(node_id, dragged_to->scroll_offset, m_scene.current_visual_context_tree(), m_scroll_state_snapshot);
+    note_user_input_scrolled(node->stable_node_id);
     VERIFY(new_scroll_offset.has_value());
     rebuild_wheel_hit_test_targets();
 
@@ -1706,6 +2476,9 @@ Optional<ContextState::PendingFrame> ContextState::apply_scrollbar_drag(Scrollba
         .compositor_scroll_offset = *new_scroll_offset,
         .unadopted_scroll_delta = *new_scroll_offset - *old_scroll_offset,
         .last_relative_scroll_delta = {},
+        .visual_viewport_scale = {},
+        .applied_scroll_request_id = 0,
+        .user_input_scroll_count = 0,
     });
     store_pending_async_scroll_offsets(scroll_offsets);
 
@@ -1717,224 +2490,21 @@ Optional<ContextState::PendingFrame> ContextState::apply_scrollbar_drag(Scrollba
 
 void ContextState::rebuild_wheel_hit_test_targets()
 {
-    VERIFY(m_display_list);
+    VERIFY(m_scene.display_list());
     m_async_scroll_tree.rebuild_wheel_hit_test_targets(
-        m_display_list,
-        &visual_context_tree_for_compositing(),
+        m_scene.display_list(),
+        &m_scene.visual_context_tree_for_compositing(),
         m_scroll_state_snapshot);
-}
-
-bool ContextState::is_present_blocked() const
-{
-    return m_backing_store_manager.is_rendering()
-        || !m_backing_store_manager.has_available_buffer();
-}
-
-bool ContextState::can_render_frame() const
-{
-    return m_display_list && m_backing_store_manager.is_valid();
-}
-
-void ContextState::discard_sampled_visual_context_tree()
-{
-    m_sampled_visual_context_tree.clear();
-}
-
-void ContextState::invalidate_visual_context_tree_for_compositing()
-{
-    m_animated_content_may_affect_viewport.clear();
-    discard_sampled_visual_context_tree();
-    m_visual_context_tree_for_compositing.clear();
-}
-
-Compositing::AccumulatedVisualContextTree const& ContextState::visual_context_tree_for_compositing()
-{
-    if (m_async_visual_viewport_transform.has_value() && !m_visual_context_tree_for_compositing.has_value()) {
-        discard_sampled_visual_context_tree();
-        m_visual_context_tree_for_compositing = current_visual_context_tree().with_visual_viewport_transform(*m_async_visual_viewport_transform);
-        ++m_visual_context_tree_copy_count;
-    }
-
-    auto const& unsampled_tree = m_visual_context_tree_for_compositing.has_value()
-        ? *m_visual_context_tree_for_compositing
-        : *m_visual_context_tree;
-    if (!m_visual_animation_sample_time_ns.has_value())
-        return unsampled_tree;
-    if (!m_sampled_visual_context_tree.has_value())
-        m_sampled_visual_context_tree = unsampled_tree.with_visual_animation_samples(*m_visual_animation_sample_time_ns);
-    return *m_sampled_visual_context_tree;
-}
-
-Gfx::IntRect ContextState::frame_damage_for(PendingFrame const& pending_frame)
-{
-    Gfx::IntRect viewport_rect { {}, pending_frame.viewport_rect.size() };
-    auto forced_damage_rect = pending_frame.forced_damage_rect.intersected(viewport_rect);
-    if (forced_damage_rect.contains(viewport_rect))
-        return viewport_rect;
-    auto damage_rect = damage_since_last_raster(viewport_rect.size());
-    damage_rect.unite(forced_damage_rect);
-    return damage_rect;
-}
-
-Gfx::IntRect ContextState::damage_since_last_raster(Gfx::IntSize viewport_size)
-{
-    Gfx::IntRect viewport_rect { {}, viewport_size };
-    if (!m_last_rasterized_frame.has_value())
-        return viewport_rect;
-    auto const& last_frame = *m_last_rasterized_frame;
-    if (last_frame.viewport_size != viewport_size)
-        return viewport_rect;
-    if (last_frame.display_list->surface_clear_color() != m_display_list->surface_clear_color())
-        return viewport_rect;
-    if (auto viewport_scroll_node_id = m_async_scroll_tree.viewport_scroll_node_id(); viewport_scroll_node_id.has_value()) {
-        auto index = viewport_scroll_node_id->scroll_node_index;
-        if (last_frame.scroll_state_snapshot.device_offset_for_index(index) != m_scroll_state_snapshot.device_offset_for_index(index))
-            return viewport_rect;
-    }
-
-    auto const& visual_context_tree = visual_context_tree_for_compositing();
-    auto display_list_damage = Compositing::compute_display_list_damage(
-        *last_frame.display_list,
-        last_frame.visual_context_tree,
-        last_frame.scroll_state_snapshot,
-        *m_display_list,
-        visual_context_tree,
-        m_scroll_state_snapshot,
-        viewport_rect);
-    if (!display_list_damage.has_value())
-        return viewport_rect;
-
-    auto damage_rect = *display_list_damage;
-    for (auto const& scrollbar : m_scrollbar_controller.scrollbars()) {
-        if (!scrollbar.is_painted_by_compositor)
-            continue;
-        if (last_frame.scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index) == m_scroll_state_snapshot.device_offset_for_index(scrollbar.scroll_node_index))
-            continue;
-        damage_rect.unite(scrollbar.gutter_rect.united(scrollbar.expanded_gutter_rect));
-    }
-    for_each_drawn_canvas(*m_display_list, [&](auto context, auto const& header, auto const& draw_canvas) {
-        auto last_content_generation = last_frame.canvas_content_generations.get(draw_canvas.canvas_id);
-        if (last_content_generation.has_value() && *last_content_generation == m_canvas_surface_registry.canvas_content_generation(draw_canvas.canvas_id))
-            return;
-        if (!header.has_bounding_rect) {
-            damage_rect = viewport_rect;
-            return;
-        }
-        auto canvas_rect = visual_context_tree.transform_rect_to_viewport(context.spatial, header.bounding_rect.template to_type<float>(), m_scroll_state_snapshot);
-        if (!isfinite(canvas_rect.x()) || !isfinite(canvas_rect.y()) || !isfinite(canvas_rect.width()) || !isfinite(canvas_rect.height())) {
-            damage_rect = viewport_rect;
-            return;
-        }
-        canvas_rect.intersect(viewport_rect.to_type<float>());
-        if (canvas_rect.is_empty())
-            return;
-        damage_rect.unite(Gfx::enclosing_int_rect(canvas_rect).inflated(1, 1, 1, 1));
-    });
-    damage_rect.intersect(viewport_rect);
-    return damage_rect;
-}
-
-void ContextState::remember_rasterized_frame(Gfx::IntSize viewport_size)
-{
-    HashMap<Compositing::CanvasId, u64> canvas_content_generations;
-    for_each_drawn_canvas(*m_display_list, [&](auto const&, auto const&, auto const& draw_canvas) {
-        canvas_content_generations.set(draw_canvas.canvas_id, m_canvas_surface_registry.canvas_content_generation(draw_canvas.canvas_id));
-    });
-    m_last_rasterized_frame = RasterizedFrame {
-        .display_list = NonnullRefPtr { *m_display_list },
-        .visual_context_tree = visual_context_tree_for_compositing(),
-        .scroll_state_snapshot = m_scroll_state_snapshot,
-        .viewport_size = viewport_size,
-        .canvas_content_generations = move(canvas_content_generations),
-    };
 }
 
 bool ContextState::visual_animations_need_frame()
 {
-    if (!m_has_active_visual_animations)
-        return false;
-    if (m_animated_content_may_affect_viewport.has_value())
-        return *m_animated_content_may_affect_viewport;
-
-    auto sample_time_ns = m_visual_animation_sample_time_ns.value_or(MonotonicTime::now().nanoseconds());
-    auto tree = m_async_visual_viewport_transform.has_value()
-        ? current_visual_context_tree().with_visual_viewport_transform(*m_async_visual_viewport_transform)
-        : current_visual_context_tree();
-    auto effect = Compositing::animated_content_may_affect_viewport(
-        *m_display_list, tree, m_scroll_state_snapshot, { {}, m_viewport_size }, sample_time_ns);
-    if (effect.stable_until_scene_changes)
-        m_animated_content_may_affect_viewport = effect.may_affect_viewport;
-    return effect.may_affect_viewport;
+    return m_scene.visual_animations_need_frame(m_scroll_state_snapshot, m_presenter.viewport_size());
 }
 
 bool ContextState::advance_visual_animations(MonotonicTime now)
 {
-    if (!has_active_visual_animations())
-        return false;
-    discard_sampled_visual_context_tree();
-    m_visual_animation_sample_time_ns = now.nanoseconds();
-    visual_context_tree_for_compositing();
-
-    m_has_active_visual_animations = m_visual_context_tree->has_active_visual_animation_at(now.nanoseconds());
-    return m_has_active_visual_animations;
-}
-
-void ContextState::paint_current_display_list(Compositing::DisplayListPlayerSkia& display_list_player, Gfx::PaintingSurface& surface, CompositedContextResolver const* composited_context_resolver, Optional<Gfx::IntRect> damage_rect, PaintUIOverlay paint_ui_overlay, bool apply_raster_transform)
-{
-    VERIFY(m_display_list);
-    auto surface_clear_color = Gfx::to_skia_color(m_display_list->surface_clear_color().value_or(Gfx::Color::Transparent));
-    auto paint_display_list = [&](Gfx::PaintingSurface& target_surface) {
-        display_list_player.execute(
-            *m_display_list,
-            visual_context_tree_for_compositing(),
-            m_display_list_resource_storage,
-            m_scroll_state_snapshot,
-            target_surface,
-            &m_canvas_surface_registry,
-            composited_context_resolver);
-        m_scrollbar_controller.paint(target_surface, display_list_player, m_scroll_state_snapshot);
-        if (paint_ui_overlay == PaintUIOverlay::Yes && m_paused_debugger_overlay_visible)
-            paint_paused_debugger_overlay(target_surface, m_viewport_size, m_paused_debugger_overlay_device_pixel_ratio, m_paused_debugger_overlay_font_family, m_paused_debugger_overlay_hovered_action);
-    };
-
-    if (damage_rect.has_value() && !damage_rect->is_empty() && presents_to_client() && damage_rect->size() != surface.size() && surface.skia_backend_context()) {
-        if (!m_damage_surface || m_damage_surface->size() != damage_rect->size()) {
-            m_damage_surface = Gfx::PaintingSurface::create_with_size(
-                damage_rect->size(), Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, surface.skia_backend_context());
-        }
-
-        auto& damage_canvas = m_damage_surface->canvas();
-        damage_canvas.clear(surface_clear_color);
-        damage_canvas.save();
-        damage_canvas.translate(-damage_rect->x(), -damage_rect->y());
-        paint_display_list(*m_damage_surface);
-        damage_canvas.restore();
-
-        auto image = m_damage_surface->sk_image_snapshot<sk_sp<SkImage>>();
-        SkPaint paint;
-        paint.setBlendMode(SkBlendMode::kSrc);
-        surface.canvas().drawImageRect(
-            image.get(),
-            SkRect::MakeWH(damage_rect->width(), damage_rect->height()),
-            SkRect::MakeXYWH(damage_rect->x(), damage_rect->y(), damage_rect->width(), damage_rect->height()),
-            SkSamplingOptions {},
-            &paint,
-            SkCanvas::kStrict_SrcRectConstraint);
-        return;
-    }
-
-    auto& canvas = surface.canvas();
-    auto save_count = canvas.save();
-    if (damage_rect.has_value()) {
-        canvas.clipIRect(SkIRect::MakeXYWH(damage_rect->x(), damage_rect->y(), damage_rect->width(), damage_rect->height()));
-        canvas.clear(surface_clear_color);
-    }
-    if (apply_raster_transform) {
-        canvas.translate(m_raster_translation.x(), m_raster_translation.y());
-        canvas.scale(m_raster_scale.width(), m_raster_scale.height());
-    }
-    paint_display_list(surface);
-    canvas.restoreToCount(save_count);
+    return m_scene.advance_visual_animations(now);
 }
 
 }

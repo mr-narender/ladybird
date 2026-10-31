@@ -22,13 +22,9 @@
 //! - `ScopeData` is carried by block-like constructs (Program,
 //!   BlockStatement, FunctionBody, etc.) and holds scope analysis results.
 
-use std::ffi::c_void;
-use std::fmt;
 use std::ops::Index;
 use std::ops::IndexMut;
 use std::sync::Arc;
-use std::sync::atomic::AtomicPtr;
-use std::sync::atomic::Ordering;
 
 use crate::fast_hash::HashMap;
 
@@ -448,7 +444,7 @@ impl FunctionTable {
                 }
             }
             StatementKind::UsingDeclaration(declarations) => {
-                for decl in declarations.iter() {
+                for decl in &declarations.declarations {
                     self.collect_from_target(&decl.target, result, scopes);
                     if let Some(ref init) = decl.init {
                         self.collect_from_expression(init, result, scopes);
@@ -659,7 +655,7 @@ impl FunctionTable {
 }
 
 /// Bundles a `FunctionData` with a subtable of all nested functions
-/// reachable from its body. Stored as the raw pointer in C++ SFDs.
+/// reachable from its body. Stored in the runtime's SharedFunctionInstanceData.
 #[derive(Clone)]
 pub struct FunctionPayload {
     pub data: FunctionData,
@@ -1240,64 +1236,10 @@ pub struct TemplateLiteralData {
 // RegExp literal
 // =============================================================================
 
-unsafe extern "C" {
-    fn rust_free_compiled_regex(ptr: *mut c_void);
-}
-
-/// # Safety
-///
-/// `ptr` must identify a compiled regular expression whose ownership has not
-/// been transferred to C++ or released previously.
-pub unsafe fn free_compiled_regex(ptr: *mut c_void) {
-    unsafe { rust_free_compiled_regex(ptr) };
-}
-
-/// Handle to a compiled regex from C++.
-///
-/// Wrapped in `Arc` in `RegExpLiteralData` so that AST clones (e.g. for
-/// class field initializers) share the handle cheaply. The first codegen
-/// path to call `take()` gets the handle; `Drop` frees it if untaken.
-/// Uses `AtomicPtr` so the regex can be safely shared across threads
-/// during background compile of sibling functions.
-pub struct CompiledRegex(AtomicPtr<c_void>);
-
-impl CompiledRegex {
-    pub fn new(ptr: *mut c_void) -> Self {
-        Self(AtomicPtr::new(ptr))
-    }
-
-    /// Take ownership of the compiled regex handle, leaving null behind
-    /// so the destructor won't free it.
-    pub fn take(&self) -> *mut c_void {
-        self.0.swap(std::ptr::null_mut(), Ordering::AcqRel)
-    }
-
-    /// Set the compiled regex handle (used by deferred compilation).
-    pub fn set(&self, ptr: *mut c_void) {
-        self.0.store(ptr, Ordering::Release);
-    }
-}
-
-impl Drop for CompiledRegex {
-    fn drop(&mut self) {
-        let ptr = *self.0.get_mut();
-        if !ptr.is_null() {
-            unsafe { rust_free_compiled_regex(ptr) };
-        }
-    }
-}
-
-impl fmt::Debug for CompiledRegex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CompiledRegex({:p})", self.0.load(Ordering::Acquire))
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct RegExpLiteralData {
     pub pattern: Utf16String,
     pub flags: Utf16String,
-    pub compiled_regex: Arc<CompiledRegex>,
 }
 
 // =============================================================================
@@ -1484,6 +1426,9 @@ pub struct ScopeData {
     pub uses_this_from_environment: bool,
     pub contains_direct_call_to_eval: bool,
     pub contains_access_to_arguments_object: bool,
+    /// For the body of a named function expression: whether nothing can look up the function's own name in it, so
+    /// that the environment that binds the name is never observed.
+    pub function_name_is_unused: bool,
 }
 
 /// Scope analysis data for function bodies, populated by the scope collector.
@@ -1714,6 +1659,13 @@ pub struct VariableDeclarationData {
     pub declarations: Vec<VariableDeclarator>,
 }
 
+/// A `using` or an `await using` declaration.
+#[derive(Clone, Debug)]
+pub struct UsingDeclarationData {
+    pub is_await: bool,
+    pub declarations: Vec<VariableDeclarator>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FunctionDeclarationData {
     pub function_id: FunctionId,
@@ -1764,7 +1716,7 @@ pub enum StatementKind {
 
     // Declarations
     VariableDeclaration(Box<VariableDeclarationData>),
-    UsingDeclaration(Box<Vec<VariableDeclarator>>),
+    UsingDeclaration(Box<UsingDeclarationData>),
     FunctionDeclaration(Box<FunctionDeclarationData>),
     ClassDeclaration(Box<ClassData>),
     ErrorDeclaration,

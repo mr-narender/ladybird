@@ -2,20 +2,20 @@
 [Exposed=Window]
 interface SVGAnimationElement : SVGElement {
 
-    [FIXME] readonly attribute SVGElement? targetElement;
+    readonly attribute SVGElement? targetElement;
 
     attribute EventHandler onbegin;
     attribute EventHandler onend;
     attribute EventHandler onrepeat;
 
-    [FIXME] float getStartTime();
-    [FIXME] float getCurrentTime();
-    [FIXME] float getSimpleDuration();
+    float getStartTime();
+    float getCurrentTime();
+    float getSimpleDuration();
 
-    [FIXME] undefined beginElement();
-    [FIXME] undefined beginElementAt(float offset);
-    [FIXME] undefined endElement();
-    [FIXME] undefined endElementAt(float offset);
+    undefined beginElement();
+    undefined beginElementAt(float offset);
+    undefined endElement();
+    undefined endElementAt(float offset);
 };
 
-//SVGAnimationElement includes SVGTests;
+// FIXME: SVGAnimationElement includes SVGTests;

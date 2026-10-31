@@ -29,10 +29,14 @@ bool WebContentView::ensure_iosurface_layer_attached_to_native_view()
     if (!content_layer)
         return false;
 
+    // NB: Qt restores the native view's exposed state from the content layer's display callback after it is unhidden.
+    //     Presenting our own sublayer may leave that layer clean, which keeps Qt from routing mouse events to the view.
+    if (isVisible() && !window_handle->isExposed())
+        [content_layer setNeedsDisplay];
+
     if (!m_iosurface_layer) {
         auto* layer = [[CALayer alloc] init];
         layer.opaque = YES;
-        layer.masksToBounds = YES;
         // Without this every new frame would cross-fade in and geometry changes would slide.
         layer.actions = @ {
             @"contents" : NSNull.null,
@@ -54,8 +58,8 @@ bool WebContentView::ensure_iosurface_layer_attached_to_native_view()
     }
     update_iosurface_layer_frame();
     update_iosurface_layer_background_color();
-    // The crash overlay is a child widget that Qt paints into the content layer, underneath this one.
-    layer.hidden = m_crash_overlay && !m_crash_overlay->isHidden();
+    // Overlays are child widgets that Qt paints into the content layer, underneath this one.
+    layer.hidden = is_page_covered_by_overlay();
     return true;
 }
 
@@ -86,10 +90,12 @@ void WebContentView::present_current_paintable_as_layer_contents()
     auto painted_unit_height = static_cast<CGFloat>(painted_height) / surface_height;
 
     // The surface can be larger than what was painted into it (a live resize pads it), so only the painted part is
-    // shown, one surface pixel per device pixel, anchored at the visual top-left. Inside Qt's flipped view the y-axis
-    // of this layer points down, which turns both the gravity constant and the unit rectangle upside down.
+    // shown: unless frames are scaled to fit, one surface pixel per device pixel, anchored at the visual top-left.
+    // Inside Qt's flipped view the y-axis of this layer points down, which turns both the top-left gravity constant
+    // and the unit rectangle upside down.
     bool y_axis_points_down = [layer contentsAreFlipped];
-    layer.contentsGravity = y_axis_points_down ? kCAGravityBottomLeft : kCAGravityTopLeft;
+    auto top_left_gravity = y_axis_points_down ? kCAGravityBottomLeft : kCAGravityTopLeft;
+    layer.contentsGravity = m_scales_frames_to_fit ? kCAGravityResizeAspect : top_left_gravity;
     layer.contentsRect = y_axis_points_down
         ? CGRectMake(0, 0, painted_unit_width, painted_unit_height)
         : CGRectMake(0, 1 - painted_unit_height, painted_unit_width, painted_unit_height);
@@ -105,6 +111,42 @@ void WebContentView::update_iosurface_layer_frame()
     if (!m_iosurface_layer)
         return;
     as_layer(m_iosurface_layer).frame = CGRectMake(0, 0, width(), height());
+    if (m_page_dim_layer)
+        as_layer(m_page_dim_layer).frame = CGRectMake(0, 0, width(), height());
+}
+
+// The dim is a layer of its own right above the page, under the native views of the dialog and the other floating
+// surfaces.
+void WebContentView::set_page_dim(qreal dim)
+{
+    if (!m_page_dim_layer && dim <= 0)
+        return;
+    if (!ensure_iosurface_layer_attached_to_native_view())
+        return;
+
+    auto* page_layer = as_layer(m_iosurface_layer);
+    if (!m_page_dim_layer) {
+        auto* layer = [[CALayer alloc] init];
+        layer.actions = @ {
+            @"bounds" : NSNull.null,
+            @"position" : NSNull.null,
+            @"opacity" : NSNull.null,
+            @"hidden" : NSNull.null,
+        };
+        auto* black = CGColorCreateSRGB(0, 0, 0, 0.22);
+        layer.backgroundColor = black;
+        CGColorRelease(black);
+        m_page_dim_layer = layer;
+    }
+    auto* layer = as_layer(m_page_dim_layer);
+    if (layer.superlayer != page_layer.superlayer || [page_layer.superlayer.sublayers indexOfObject:layer] != [page_layer.superlayer.sublayers indexOfObject:page_layer] + 1) {
+        [layer removeFromSuperlayer];
+        [page_layer.superlayer insertSublayer:layer above:page_layer];
+    }
+    layer.frame = CGRectMake(0, 0, width(), height());
+    layer.opacity = dim;
+    layer.hidden = dim <= 0;
+    reinterpret_cast<NSView*>(winId()).window.viewsNeedDisplay = YES;
 }
 
 void WebContentView::update_iosurface_layer_background_color()
@@ -132,6 +174,12 @@ void WebContentView::destroy_iosurface_layer()
     [layer removeFromSuperlayer];
     [layer release];
     m_iosurface_layer = nullptr;
+
+    if (m_page_dim_layer) {
+        [as_layer(m_page_dim_layer) removeFromSuperlayer];
+        [as_layer(m_page_dim_layer) release];
+        m_page_dim_layer = nullptr;
+    }
 }
 
 }

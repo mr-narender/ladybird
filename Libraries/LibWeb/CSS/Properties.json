@@ -41,6 +41,9 @@
   "-webkit-appearance": {
     "legacy-alias-for": "appearance"
   },
+  "-webkit-backface-visibility": {
+    "legacy-alias-for": "backface-visibility"
+  },
   "-webkit-background-clip": {
     "legacy-alias-for": "background-clip"
   },
@@ -257,6 +260,18 @@
       "align-self"
     ]
   },
+  "alignment-baseline": {
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "baseline",
+    "requires-computation": "never",
+    "valid-types": [
+      "baseline-metric"
+    ],
+    "valid-identifiers": [
+      "baseline"
+    ]
+  },
   "all": {
     "affects-layout": true,
     "affects-stacking-context": true,
@@ -305,7 +320,9 @@
       "animation-fill-mode",
       "animation-play-state",
       "animation-name",
-      "animation-timeline"
+      "animation-timeline",
+      "animation-range-start",
+      "animation-range-end"
     ]
   },
   "animation-composition": {
@@ -422,6 +439,33 @@
       "paused"
     ]
   },
+  "animation-range": {
+    "affects-layout": false,
+    "initial": "normal",
+    "multiplicity": "coordinating-list",
+    "longhands": [
+      "animation-range-start",
+      "animation-range-end"
+    ]
+  },
+  "animation-range-end": {
+    "style-group": "AnimationValues",
+    "affects-layout": false,
+    "animation-type": "none",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "cascaded-value",
+    "multiplicity": "coordinating-list"
+  },
+  "animation-range-start": {
+    "style-group": "AnimationValues",
+    "affects-layout": false,
+    "animation-type": "none",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "cascaded-value",
+    "multiplicity": "coordinating-list"
+  },
   "animation-timeline": {
     "style-group": "AnimationValues",
     "affects-layout": false,
@@ -488,6 +532,7 @@
     "needs-layout-node-for-resolved-value": true,
     "__comment": "FIXME: List `filter-value-list` as a valid-type once it's generically supported.",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "cascaded-value",
     "valid-identifiers": [
       "none"
@@ -691,6 +736,37 @@
       "contain"
     ],
     "percentages-resolve-to": "length"
+  },
+  "baseline-shift": {
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "percentages-resolve-to": "length",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "sub",
+      "super",
+      "top",
+      "center",
+      "bottom"
+    ]
+  },
+  "baseline-source": {
+    "style-group": "BoxValues",
+    "affects-layout": true,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "first",
+      "last"
+    ]
   },
   "block-ellipsis": {
     "style-group": "InheritedTextValues",
@@ -1254,6 +1330,16 @@
     ],
     "needs-layout-node-for-resolved-value": true
   },
+  "border-shape": {
+    "style-group": "BorderValues",
+    "affects-accumulated-visual-contexts": true,
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "__comment": "FIXME: The spec animates border-shape by computed value.",
+    "inherited": false,
+    "initial": "none",
+    "requires-computation": "cascaded-value"
+  },
   "border-spacing": {
     "style-group": "InheritedTableValues",
     "_comment": "Follows the newer definition from: https://drafts.csswg.org/css-tables-3/#border-spacing-property",
@@ -1540,7 +1626,6 @@
     "valid-identifiers": [
       "none"
     ],
-    "__comment": "FIXME: This should be a <clip-source> | [ <basic-shape> || <geometry-box> ]",
     "valid-types": [
       "basic-shape",
       "url"
@@ -1762,7 +1847,10 @@
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "none",
-    "requires-computation": "cascaded-value"
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [0,∞]"
+    ]
   },
   "contain-intrinsic-inline-size": {
     "logical-alias-for": {
@@ -1786,7 +1874,10 @@
     "animation-type": "by-computed-value",
     "inherited": false,
     "initial": "none",
-    "requires-computation": "cascaded-value"
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [0,∞]"
+    ]
   },
   "container": {
     "initial": "none",
@@ -1802,6 +1893,7 @@
     "inherited": false,
     "initial": "none",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "never",
     "valid-types": [
       "custom-ident ![none,and,not,or]"
@@ -2180,6 +2272,16 @@
       "empty-cells"
     ]
   },
+  "field-sizing": {
+    "style-group": "BoxValues",
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "fixed",
+    "requires-computation": "never",
+    "valid-types": [
+      "field-sizing"
+    ]
+  },
   "fill": {
     "affects-hit-testing": true,
     "style-group": "InheritedSVGValues",
@@ -2226,10 +2328,27 @@
     "needs-layout-node-for-resolved-value": true,
     "__comment": "FIXME: List `filter-value-list` as a valid-type once it's generically supported.",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "cascaded-value",
     "valid-identifiers": [
       "none"
     ]
+  },
+  "fit-tolerance": {
+    "style-group": "GridValues",
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [0,∞]",
+      "percentage [0,∞]"
+    ],
+    "valid-identifiers": [
+      "normal",
+      "infinite"
+    ],
+    "percentages-resolve-to": "length"
   },
   "flex": {
     "initial": "0 1 auto",
@@ -2254,10 +2373,12 @@
       "percentage [0,∞]"
     ],
     "valid-identifiers": [
+      "-webkit-fill-available",
       "auto",
       "content",
       "max-content",
-      "min-content"
+      "min-content",
+      "stretch"
     ],
     "percentages-resolve-to": "length"
   },
@@ -2342,7 +2463,6 @@
   },
   "font": {
     "initial": "normal medium serif",
-    "__comment": "FIXME: Support font-size-adjust as a reset-only sub-property",
     "longhands": [
       "font-family",
       "font-size",
@@ -2355,7 +2475,8 @@
       "font-kerning",
       "font-language-override",
       "font-optical-sizing",
-      "font-variation-settings"
+      "font-variation-settings",
+      "font-size-adjust"
     ]
   },
   "font-family": {
@@ -2415,6 +2536,22 @@
       "font-optical-sizing"
     ]
   },
+  "font-palette": {
+    "__comment": "FIXME: Select the COLR palette when the font API supports palette selection. INTEROP: Animate discretely until palette-mix() is supported by multiple engines.",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "normal",
+    "requires-computation": "never",
+    "valid-types": [
+      "dashed-ident"
+    ],
+    "valid-identifiers": [
+      "normal",
+      "light",
+      "dark"
+    ]
+  },
   "font-size": {
     "style-group": "FontValues",
     "animation-type": "by-computed-value",
@@ -2435,6 +2572,19 @@
       "unitless-length"
     ]
   },
+  "font-size-adjust": {
+    "animation-type": "by-computed-value",
+    "inherited": true,
+    "initial": "none",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "number [0,∞]"
+    ],
+    "valid-identifiers": [
+      "none",
+      "from-font"
+    ]
+  },
   "font-stretch": {
     "legacy-alias-for": "font-width"
   },
@@ -2445,6 +2595,59 @@
     "requires-computation": "cascaded-value",
     "valid-types": [
       "font-style"
+    ]
+  },
+  "font-synthesis": {
+    "initial": "weight style small-caps position",
+    "longhands": [
+      "font-synthesis-position",
+      "font-synthesis-small-caps",
+      "font-synthesis-style",
+      "font-synthesis-weight"
+    ],
+    "valid-types": [
+      "string"
+    ]
+  },
+  "font-synthesis-position": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "none"
+    ]
+  },
+  "font-synthesis-small-caps": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "none"
+    ]
+  },
+  "font-synthesis-style": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "none",
+      "oblique-only"
+    ]
+  },
+  "font-synthesis-weight": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "none"
     ]
   },
   "font-variant": {
@@ -2580,6 +2783,17 @@
       "font-width"
     ]
   },
+  "forced-color-adjust": {
+    "style-group": "InheritedUIValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-types": [
+      "forced-color-adjust"
+    ]
+  },
   "gap": {
     "initial": "normal",
     "valid-types": [
@@ -2641,6 +2855,7 @@
       "auto"
     ],
     "valid-types": [
+      "flex [0,∞]",
       "length [0,∞]",
       "percentage [0,∞]",
       "string"
@@ -2664,6 +2879,7 @@
       "auto"
     ],
     "valid-types": [
+      "flex [0,∞]",
       "length [0,∞]",
       "percentage [0,∞]",
       "string"
@@ -2836,15 +3052,30 @@
       "percentage [0,∞]"
     ],
     "valid-identifiers": [
+      "-webkit-fill-available",
       "auto",
       "max-content",
-      "min-content"
+      "min-content",
+      "stretch"
     ],
     "percentages-resolve-to": "length",
     "quirks": [
       "unitless-length"
     ],
     "needs-layout-for-getcomputedstyle": true
+  },
+  "hyphenate-character": {
+    "__comment": "FIXME: Use this string when hyphenation is implemented.",
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-types": [
+      "string"
+    ],
+    "valid-identifiers": [
+      "auto"
+    ]
   },
   "image-rendering": {
     "style-group": "InheritedBoxValues",
@@ -2951,6 +3182,17 @@
     "max-values": 1,
     "needs-layout-for-getcomputedstyle": true
   },
+  "interpolate-size": {
+    "style-group": "InheritedUIValues",
+    "affects-layout": false,
+    "animation-type": "none",
+    "inherited": true,
+    "initial": "numeric-only",
+    "requires-computation": "never",
+    "valid-types": [
+      "interpolate-size"
+    ]
+  },
   "isolation": {
     "style-group": "EffectsValues",
     "affects-stacking-context": true,
@@ -3029,6 +3271,19 @@
     ],
     "quirks": [
       "unitless-length"
+    ]
+  },
+  "line-break": {
+    "style-group": "InheritedTextValues",
+    "animation-type": "discrete",
+    "initial": "auto",
+    "inherited": true,
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "loose",
+      "normal",
+      "strict"
     ]
   },
   "line-clamp": {
@@ -3462,9 +3717,11 @@
       "percentage [0,∞]"
     ],
     "valid-identifiers": [
+      "-webkit-fill-available",
       "max-content",
       "min-content",
-      "none"
+      "none",
+      "stretch"
     ],
     "percentages-resolve-to": "length",
     "quirks": [
@@ -3504,9 +3761,11 @@
       "percentage [0,∞]"
     ],
     "valid-identifiers": [
+      "-webkit-fill-available",
       "max-content",
       "min-content",
-      "none"
+      "none",
+      "stretch"
     ],
     "percentages-resolve-to": "length",
     "quirks": [
@@ -3532,9 +3791,11 @@
       "percentage [0,∞]"
     ],
     "valid-identifiers": [
+      "-webkit-fill-available",
       "auto",
       "max-content",
-      "min-content"
+      "min-content",
+      "stretch"
     ],
     "percentages-resolve-to": "length",
     "quirks": [
@@ -3560,9 +3821,11 @@
       "percentage [0,∞]"
     ],
     "valid-identifiers": [
+      "-webkit-fill-available",
       "auto",
       "max-content",
-      "min-content"
+      "min-content",
+      "stretch"
     ],
     "percentages-resolve-to": "length",
     "quirks": [
@@ -3605,6 +3868,98 @@
       "position"
     ],
     "percentages-resolve-to": "length"
+  },
+  "offset": {
+    "affects-layout": false,
+    "initial": "normal none 0 auto / auto",
+    "longhands": [
+      "offset-position",
+      "offset-path",
+      "offset-distance",
+      "offset-rotate",
+      "offset-anchor"
+    ]
+  },
+  "offset-anchor": {
+    "style-group": "TransformValues",
+    "affects-accumulated-visual-contexts": true,
+    "affects-layout": false,
+    "affects-scrollable-overflow": true,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "auto",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "position"
+    ],
+    "valid-identifiers": [
+      "auto"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "offset-distance": {
+    "style-group": "TransformValues",
+    "affects-accumulated-visual-contexts": true,
+    "affects-layout": false,
+    "affects-scrollable-overflow": true,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "0",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "length [-∞,∞]",
+      "percentage [-∞,∞]"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "offset-path": {
+    "style-group": "TransformValues",
+    "affects-accumulated-visual-contexts": true,
+    "affects-layout": false,
+    "affects-scrollable-overflow": true,
+    "affects-stacking-context": true,
+    "animation-type": "custom",
+    "inherited": false,
+    "initial": "none",
+    "requires-computation": "cascaded-value",
+    "valid-identifiers": [
+      "none"
+    ]
+  },
+  "offset-position": {
+    "style-group": "TransformValues",
+    "affects-accumulated-visual-contexts": true,
+    "affects-layout": false,
+    "affects-scrollable-overflow": true,
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "normal",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "position"
+    ],
+    "valid-identifiers": [
+      "auto",
+      "normal"
+    ],
+    "percentages-resolve-to": "length"
+  },
+  "offset-rotate": {
+    "style-group": "TransformValues",
+    "affects-accumulated-visual-contexts": true,
+    "affects-layout": false,
+    "affects-scrollable-overflow": true,
+    "animation-type": "custom",
+    "inherited": false,
+    "initial": "auto",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "angle [-∞,∞]"
+    ],
+    "valid-identifiers": [
+      "auto",
+      "reverse"
+    ]
   },
   "opacity": {
     "style-group": "EffectsValues",
@@ -3855,6 +4210,53 @@
       "overlay>auto"
     ]
   },
+  "overscroll-behavior": {
+    "longhands": [
+      "overscroll-behavior-x",
+      "overscroll-behavior-y"
+    ],
+    "positional-value-list-shorthand": true,
+    "initial": "auto",
+    "valid-types": [
+      "overscroll-behavior"
+    ]
+  },
+  "overscroll-behavior-block": {
+    "logical-alias-for": {
+      "group": "overscroll-behavior",
+      "mapping": "block-xy"
+    }
+  },
+  "overscroll-behavior-inline": {
+    "logical-alias-for": {
+      "group": "overscroll-behavior",
+      "mapping": "inline-xy"
+    }
+  },
+  "overscroll-behavior-x": {
+    "affects-hit-testing": true,
+    "style-group": "MiscResetValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-types": [
+      "overscroll-behavior"
+    ]
+  },
+  "overscroll-behavior-y": {
+    "affects-hit-testing": true,
+    "style-group": "MiscResetValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-types": [
+      "overscroll-behavior"
+    ]
+  },
   "padding": {
     "initial": "0",
     "positional-value-list-shorthand": true,
@@ -4049,6 +4451,7 @@
     "affects-layout": false,
     "inherited": false,
     "initial": "50% 50%",
+    "needs-layout-node-for-resolved-value": true,
     "requires-computation": "cascaded-value",
     "valid-types": [
       "position"
@@ -4127,6 +4530,13 @@
       "none"
     ]
   },
+  "position-try": {
+    "initial": "normal none",
+    "longhands": [
+      "position-try-order",
+      "position-try-fallbacks"
+    ]
+  },
   "position-try-fallbacks": {
     "style-group": "AnchorValues",
     "animation-type": "discrete",
@@ -4173,6 +4583,7 @@
     "inherited": true,
     "initial": "auto",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "never",
     "valid-types": [
       "string"
@@ -4837,6 +5248,22 @@
       "text-align"
     ]
   },
+  "text-align-last": {
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "auto",
+    "requires-computation": "never",
+    "valid-identifiers": [
+      "auto",
+      "start",
+      "end",
+      "left",
+      "right",
+      "center",
+      "justify",
+      "match-parent"
+    ]
+  },
   "text-anchor": {
     "style-group": "InheritedSVGValues",
     "animation-type": "discrete",
@@ -4919,6 +5346,19 @@
     ],
     "percentages-resolve-to": "length"
   },
+  "text-emphasis-position": {
+    "__comment": "FIXME: Use this position when text emphasis rendering is implemented.",
+    "animation-type": "discrete",
+    "inherited": true,
+    "initial": "over right",
+    "requires-computation": "non-inherited-value",
+    "valid-identifiers": [
+      "over",
+      "under",
+      "left",
+      "right"
+    ]
+  },
   "text-indent": {
     "style-group": "InheritedTextValues",
     "animation-type": "by-computed-value",
@@ -4949,6 +5389,16 @@
     ],
     "valid-identifiers": [
       "distribute>inter-character"
+    ]
+  },
+  "text-orientation": {
+    "style-group": "InheritedBoxValues",
+    "animation-type": "none",
+    "inherited": true,
+    "initial": "mixed",
+    "requires-computation": "never",
+    "valid-types": [
+      "text-orientation"
     ]
   },
   "text-overflow": {
@@ -5214,6 +5664,7 @@
     "inherited": false,
     "initial": "all",
     "multiplicity": "coordinating-list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "never",
     "valid-types": [
       "custom-ident ![none]"
@@ -5349,6 +5800,21 @@
     ],
     "multiplicity": "coordinating-list"
   },
+  "view-transition-class": {
+    "style-group": "MiscResetValues",
+    "affects-layout": false,
+    "animation-type": "discrete",
+    "inherited": false,
+    "initial": "none",
+    "multiplicity": "list",
+    "requires-computation": "never",
+    "valid-types": [
+      "custom-ident ![none]"
+    ],
+    "valid-identifiers": [
+      "none"
+    ]
+  },
   "view-transition-name": {
     "style-group": "MiscResetValues",
     "affects-layout": false,
@@ -5431,9 +5897,11 @@
       "percentage [0,∞]"
     ],
     "valid-identifiers": [
+      "-webkit-fill-available",
       "auto",
       "max-content",
-      "min-content"
+      "min-content",
+      "stretch"
     ],
     "percentages-resolve-to": "length",
     "quirks": [
@@ -5449,6 +5917,7 @@
     "inherited": false,
     "initial": "auto",
     "multiplicity": "list",
+    "typed-om-multiplicity": "single",
     "requires-computation": "never",
     "valid-types": [
       "custom-ident ![all,auto,contents,none,scroll-position,will-change]"
@@ -5548,6 +6017,19 @@
     ],
     "valid-identifiers": [
       "auto"
+    ]
+  },
+  "zoom": {
+    "animation-type": "by-computed-value",
+    "inherited": false,
+    "initial": "1",
+    "requires-computation": "cascaded-value",
+    "valid-types": [
+      "number [0,∞]",
+      "percentage [0,∞]"
+    ],
+    "valid-identifiers": [
+      "normal"
     ]
   }
 }

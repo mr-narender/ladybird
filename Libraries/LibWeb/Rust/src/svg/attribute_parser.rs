@@ -5,7 +5,7 @@
  */
 
 use super::parser::{Input, Parser};
-use super::path_parser::FfiSvgInput;
+use crate::css::ffi_support::FfiUtf16View;
 use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -47,28 +47,52 @@ fn parse_number_percentage(input: Input<'_>) -> Option<NumberPercentage> {
     parser.done().then_some(NumberPercentage { value, is_percentage })
 }
 
-fn parse_coordinate_pair(parser: &mut Parser<'_>) -> Result<[f32; 2], ()> {
-    let x = parser.parse_number()?;
+// https://svgwg.org/svg2-draft/types.html#syntax
+fn parse_number(input: Input<'_>) -> Option<f32> {
+    let mut parser = Parser::new(input);
+    parser.parse_whitespace();
+    let value = parser.parse_css_number().ok()?;
+    parser.parse_whitespace();
+    parser.done().then_some(value)
+}
+
+// https://drafts.fxtf.org/filter-effects/#typedef-number-optional-number
+// <number-optional-number> = <number> <number>?
+fn parse_number_optional_number(input: Input<'_>) -> Option<(f32, Option<f32>)> {
+    let mut parser = Parser::new(input);
+    parser.parse_whitespace();
+    let first = parser.parse_css_number().ok()?;
+    parser.parse_whitespace();
+    if parser.done() {
+        return Some((first, None));
+    }
     parser.parse_optional_comma_whitespace();
-    let y = parser.parse_number()?;
-    Ok([x, y])
+    let second = parser.parse_css_number().ok()?;
+    parser.parse_whitespace();
+    parser.done().then_some((first, Some(second)))
 }
 
 fn parse_points(input: Input<'_>) -> Vec<[f32; 2]> {
     let mut parser = Parser::new(input);
     parser.parse_whitespace();
     let mut points = Vec::new();
-    loop {
-        let point = match parse_coordinate_pair(&mut parser) {
-            Ok(point) => point,
-            Err(()) if points.is_empty() => return Vec::new(),
-            Err(()) => break,
+    while !parser.done() {
+        let Ok(x) = parser.parse_number() else {
+            return Vec::new();
         };
-        points.push(point);
         parser.parse_optional_comma_whitespace();
-        if !parser.matches_comma_whitespace() && !parser.matches_coordinate() {
+
+        // https://svgwg.org/svg2-draft/shapes.html#PolylineElementPointsAttribute
+        // In such error cases the user agent will drop the last, odd coordinate and otherwise render the shape.
+        if parser.done() {
             break;
         }
+
+        let Ok(y) = parser.parse_number() else {
+            return Vec::new();
+        };
+        points.push([x, y]);
+        parser.parse_optional_comma_whitespace();
     }
     points
 }
@@ -256,6 +280,89 @@ fn parse_view_box(input: Input<'_>) -> Option<[f64; 4]> {
     parser.done().then_some(values)
 }
 
+fn is_digits(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+// https://svgwg.org/specs/animations/#ClockValueSyntax
+// Timecount ::= DIGIT+
+// Fraction ::= DIGIT+
+// NB: This parses a Timecount ("." Fraction)?, which also matches a Seconds ("." Fraction)?.
+fn parse_digits_with_optional_fraction(value: &str) -> Option<f64> {
+    let (integer, fraction) = value.split_once('.').unwrap_or((value, "0"));
+    if !is_digits(integer) || !is_digits(fraction) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+// https://svgwg.org/specs/animations/#ClockValueSyntax
+// Minutes ::= 2DIGIT; range from 00 to 59
+// Seconds ::= 2DIGIT; range from 00 to 59
+fn parse_minutes_or_seconds(value: &str) -> Option<f64> {
+    if value.len() != 2 || !is_digits(value) {
+        return None;
+    }
+    let value = value.parse().ok()?;
+    (value < 60.0).then_some(value)
+}
+
+// https://svgwg.org/specs/animations/#ClockValueSyntax
+// Seconds ("." Fraction)?
+fn parse_seconds_with_optional_fraction(value: &str) -> Option<f64> {
+    let (seconds, _) = value.split_once('.').unwrap_or((value, ""));
+    parse_minutes_or_seconds(seconds)?;
+    parse_digits_with_optional_fraction(value)
+}
+
+// https://svgwg.org/specs/animations/#ClockValueSyntax
+fn parse_clock_value_in_milliseconds(input: Input<'_>) -> Option<f64> {
+    // No embedded white space is allowed in clock values, although leading and trailing white space characters will
+    // be ignored.
+    let mut parser = Parser::new(input);
+    parser.parse_whitespace();
+    let clock_value = String::from_utf16(&token(&mut parser)).ok()?;
+    parser.parse_whitespace();
+    if !parser.done() {
+        return None;
+    }
+
+    let fields = clock_value.split(':').collect::<Vec<_>>();
+    let seconds = match fields.as_slice() {
+        // Full-clock-val ::= Hours ":" Minutes ":" Seconds ("." Fraction)?
+        // Hours ::= DIGIT+; any positive number
+        [hours, minutes, seconds] => {
+            if !is_digits(hours) {
+                return None;
+            }
+            hours.parse::<f64>().ok()? * 3600.0
+                + parse_minutes_or_seconds(minutes)? * 60.0
+                + parse_seconds_with_optional_fraction(seconds)?
+        }
+        // Partial-clock-val ::= Minutes ":" Seconds ("." Fraction)?
+        [minutes, seconds] => {
+            parse_minutes_or_seconds(minutes)? * 60.0 + parse_seconds_with_optional_fraction(seconds)?
+        }
+        // Timecount-val ::= Timecount ("." Fraction)? (Metric)?
+        // Metric ::= "h" | "min" | "s" | "ms"
+        // For Timecount values, the default metric suffix is "s" (for seconds).
+        [timecount] => {
+            let (timecount, milliseconds_per_unit) =
+                [("h", 3_600_000.0), ("min", 60_000.0), ("ms", 1.0), ("s", 1000.0)]
+                    .into_iter()
+                    .find_map(|(metric, milliseconds_per_unit)| {
+                        timecount
+                            .strip_suffix(metric)
+                            .map(|timecount| (timecount, milliseconds_per_unit))
+                    })
+                    .unwrap_or((timecount, 1000.0));
+            return Some(parse_digits_with_optional_fraction(timecount)? * milliseconds_per_unit);
+        }
+        _ => return None,
+    };
+    Some(seconds * 1000.0)
+}
+
 fn is_whitespace(unit: u16) -> bool {
     matches!(unit, 0x09 | 0x0a | 0x0c | 0x0d | 0x20)
 }
@@ -274,46 +381,63 @@ pub struct FfiSvgTransform {
     pub values: [f32; 6],
 }
 
-fn with_input<T>(input: FfiSvgInput, parse: impl FnOnce(Input<'_>) -> T) -> Option<T> {
-    // SAFETY: FFI callers satisfy FfiSvgInput's pointer contract for the duration of the call.
-    Some(parse(unsafe { input.input()? }))
+fn with_input<T>(input: FfiUtf16View<'_>, parse: impl FnOnce(Input<'_>) -> T) -> Option<T> {
+    Some(parse(super::path_parser::svg_input(input)?))
 }
 
-/// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and `value` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_svg_integer(input: FfiSvgInput, value: *mut i32) -> bool {
+pub extern "C" fn rust_parse_svg_integer(input: FfiUtf16View<'_>, value: &mut i32) -> bool {
     let Some(parsed_value) = with_input(input, parse_integer).flatten() else {
         return false;
     };
-    unsafe { value.write(parsed_value) };
+    *value = parsed_value;
     true
 }
 
-/// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and the output pointers must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_svg_number_percentage(
-    input: FfiSvgInput,
-    value: *mut f32,
-    is_percentage: *mut bool,
+pub extern "C" fn rust_parse_svg_number(input: FfiUtf16View<'_>, value: &mut f32) -> bool {
+    let Some(parsed_value) = with_input(input, parse_number).flatten() else {
+        return false;
+    };
+    *value = parsed_value;
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_parse_svg_number_optional_number(
+    input: FfiUtf16View<'_>,
+    first: &mut f32,
+    second: &mut f32,
+    has_second: &mut bool,
+) -> bool {
+    let Some((parsed_first, parsed_second)) = with_input(input, parse_number_optional_number).flatten() else {
+        return false;
+    };
+    *first = parsed_first;
+    *second = parsed_second.unwrap_or(0.0);
+    *has_second = parsed_second.is_some();
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_parse_svg_number_percentage(
+    input: FfiUtf16View<'_>,
+    value: &mut f32,
+    is_percentage: &mut bool,
 ) -> bool {
     let Some(parsed_value) = with_input(input, parse_number_percentage).flatten() else {
         return false;
     };
-    unsafe {
-        value.write(parsed_value.value);
-        is_percentage.write(parsed_value.is_percentage);
-    }
+    *value = parsed_value.value;
+    *is_percentage = parsed_value.is_percentage;
     true
 }
 
 /// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and `context` must be valid for
-/// `set_points`.
+/// `context` must be valid for `set_points`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_parse_svg_points(
-    input: FfiSvgInput,
+    input: FfiUtf16View<'_>,
     context: *mut c_void,
     set_points: unsafe extern "C" fn(*mut c_void, *const FfiSvgPoint, usize),
 ) {
@@ -329,11 +453,10 @@ pub unsafe extern "C" fn rust_parse_svg_points(
 }
 
 /// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and `context` must be valid for
-/// `set_transforms`.
+/// `context` must be valid for `set_transforms`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_parse_svg_transform(
-    input: FfiSvgInput,
+    input: FfiUtf16View<'_>,
     context: *mut c_void,
     set_transforms: unsafe extern "C" fn(*mut c_void, *const FfiSvgTransform, usize),
 ) -> bool {
@@ -351,52 +474,43 @@ pub unsafe extern "C" fn rust_parse_svg_transform(
     true
 }
 
-/// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and the output pointers must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_svg_preserve_aspect_ratio(
-    input: FfiSvgInput,
-    align: *mut u8,
-    meet_or_slice: *mut u8,
+pub extern "C" fn rust_parse_svg_preserve_aspect_ratio(
+    input: FfiUtf16View<'_>,
+    align: &mut u8,
+    meet_or_slice: &mut u8,
 ) -> bool {
     let Some((parsed_align, parsed_meet_or_slice)) = with_input(input, parse_preserve_aspect_ratio).flatten() else {
         return false;
     };
-    unsafe {
-        align.write(parsed_align);
-        meet_or_slice.write(parsed_meet_or_slice);
-    }
+    *align = parsed_align;
+    *meet_or_slice = parsed_meet_or_slice;
     true
 }
 
-/// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and `value` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_svg_units(input: FfiSvgInput, value: *mut u8) -> bool {
+pub extern "C" fn rust_parse_svg_units(input: FfiUtf16View<'_>, value: &mut u8) -> bool {
     let Some(parsed_value) = with_input(input, parse_units).flatten() else {
         return false;
     };
-    unsafe { value.write(parsed_value) };
+    *value = parsed_value;
     true
 }
 
-/// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and `value` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_svg_spread_method(input: FfiSvgInput, value: *mut u8) -> bool {
+pub extern "C" fn rust_parse_svg_spread_method(input: FfiUtf16View<'_>, value: &mut u8) -> bool {
     let Some(parsed_value) = with_input(input, parse_spread_method).flatten() else {
         return false;
     };
-    unsafe { value.write(parsed_value) };
+    *value = parsed_value;
     true
 }
 
 /// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and `context` must be valid for
-/// `set_values`.
+/// `context` must be valid for `set_values`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_parse_svg_table_values(
-    input: FfiSvgInput,
+    input: FfiUtf16View<'_>,
     context: *mut c_void,
     set_values: unsafe extern "C" fn(*mut c_void, *const f32, usize),
 ) {
@@ -404,25 +518,30 @@ pub unsafe extern "C" fn rust_parse_svg_table_values(
     unsafe { set_values(context, values.as_ptr(), values.len()) };
 }
 
-/// # Safety
-/// `input` must satisfy [`FfiSvgInput::input`]'s requirements and the output pointers must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_svg_view_box(
-    input: FfiSvgInput,
-    min_x: *mut f64,
-    min_y: *mut f64,
-    width: *mut f64,
-    height: *mut f64,
+pub extern "C" fn rust_parse_svg_view_box(
+    input: FfiUtf16View<'_>,
+    min_x: &mut f64,
+    min_y: &mut f64,
+    width: &mut f64,
+    height: &mut f64,
 ) -> bool {
     let Some(values) = with_input(input, parse_view_box).flatten() else {
         return false;
     };
-    unsafe {
-        min_x.write(values[0]);
-        min_y.write(values[1]);
-        width.write(values[2]);
-        height.write(values[3]);
-    }
+    *min_x = values[0];
+    *min_y = values[1];
+    *width = values[2];
+    *height = values[3];
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_parse_svg_clock_value_in_milliseconds(input: FfiUtf16View<'_>, value: &mut f64) -> bool {
+    let Some(parsed_value) = with_input(input, parse_clock_value_in_milliseconds).flatten() else {
+        return false;
+    };
+    *value = parsed_value;
     true
 }
 
@@ -446,6 +565,16 @@ mod tests {
             })
         );
         assert_eq!(parse_number_percentage(input("12px")), None);
+        assert_eq!(parse_number(input(" +5 ")), Some(5.0));
+        assert_eq!(parse_number(input(".5")), Some(0.5));
+        assert_eq!(parse_number(input("5.")), None);
+        assert_eq!(parse_number(input("--3")), None);
+        assert_eq!(parse_number(input("3 4")), None);
+        assert_eq!(parse_number(input("")), None);
+        assert_eq!(parse_number_optional_number(input(" 3 ")), Some((3.0, None)));
+        assert_eq!(parse_number_optional_number(input("3, 4")), Some((3.0, Some(4.0))));
+        assert_eq!(parse_number_optional_number(input("3 abc")), None);
+        assert_eq!(parse_number_optional_number(input("3,")), None);
     }
 
     #[test]
@@ -484,6 +613,35 @@ mod tests {
         assert_eq!(transforms[2].values[..3], [4.0, 5.0, 6.0]);
         assert_eq!(transforms[5].values, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(parse_transform(input("translate()")), None);
+    }
+
+    #[test]
+    fn parses_clock_values() {
+        let milliseconds = |source| parse_clock_value_in_milliseconds(input(source));
+        assert_eq!(milliseconds("02:30:03"), Some(9_003_000.0));
+        assert_eq!(milliseconds("50:00:10.25"), Some(180_010_250.0));
+        assert_eq!(milliseconds("02:33"), Some(153_000.0));
+        assert_eq!(milliseconds("00:10.5"), Some(10_500.0));
+        assert_eq!(milliseconds("3.2h"), Some(11_520_000.0));
+        assert_eq!(milliseconds("45min"), Some(2_700_000.0));
+        assert_eq!(milliseconds("30s"), Some(30_000.0));
+        assert_eq!(milliseconds("5ms"), Some(5.0));
+        assert_eq!(milliseconds("12.467"), Some(12_467.0));
+        assert_eq!(milliseconds("00.5s"), Some(500.0));
+        assert_eq!(milliseconds("00:00.005"), Some(5.0));
+        assert_eq!(milliseconds(" 2s\t"), Some(2000.0));
+
+        assert_eq!(milliseconds(""), None);
+        assert_eq!(milliseconds("2 s"), None);
+        assert_eq!(milliseconds(".5s"), None);
+        assert_eq!(milliseconds("1."), None);
+        assert_eq!(milliseconds("-1s"), None);
+        assert_eq!(milliseconds("1sec"), None);
+        assert_eq!(milliseconds("indefinite"), None);
+        assert_eq!(milliseconds("2:30"), None);
+        assert_eq!(milliseconds("00:60"), None);
+        assert_eq!(milliseconds("1:60:00"), None);
+        assert_eq!(milliseconds("00:00:005"), None);
     }
 
     #[test]

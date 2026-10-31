@@ -9,12 +9,12 @@
 #include <AK/NeverDestroyed.h>
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/CanvasCommandList.h>
 #include <LibGfx/SharedImage.h>
 #include <LibWeb/Bindings/CanvasRenderingContext2DSettings.h>
 #include <LibWeb/Bindings/WebGLRenderingContextBase.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
@@ -40,7 +40,6 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/WebGL/WebGL2RenderingContext.h>
-#include <LibWeb/WebGL/WebGLContextProxy.h>
 #include <LibWeb/WebGL/WebGLRenderingContext.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
@@ -223,12 +222,10 @@ CSS::FontComputer& HTMLCanvasElement::canvas_font_computer()
     return document().font_computer();
 }
 
-CSS::ColorResolutionContext HTMLCanvasElement::canvas_color_resolution_context()
+CSS::ColorResolutionStyle HTMLCanvasElement::canvas_color_resolution_style()
 {
     document().update_style_for_element(*this, DOM::Document::StyleUpdateMode::OnlyIfNeeded);
-    if (has_style())
-        return CSS::ColorResolutionContext::for_element(*this);
-    return {};
+    return CSS::ColorResolutionStyle::for_element(*this);
 }
 
 CSSPixelRect HTMLCanvasElement::canvas_viewport_rect() const
@@ -329,9 +326,9 @@ void HTMLCanvasElement::attribute_changed(Utf16FlyString const& local_name, Opti
     }
 }
 
-Layout::Node* HTMLCanvasElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLCanvasElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::CanvasBox);
+    return CSS::ElementBoxKind::Canvas;
 }
 
 HTMLCanvasElement::HasOrCreatedContext HTMLCanvasElement::create_2d_context(CanvasRenderingContext2DSettings context_attributes)
@@ -409,10 +406,10 @@ WebIDL::ExceptionOr<Utf16String> HTMLCanvasElement::to_data_url(Utf16View type, 
 
     // 2. If this canvas element's bitmap has no pixels (i.e. either its horizontal dimension or its vertical dimension is zero),
     //    then return the string "data:,". (This is the shortest data: URL; it represents the empty string in a text/plain resource.)
-    auto bitmap = get_bitmap_from_surface();
+    auto bitmap = get_frame_for_serialization(type);
     if (!is_origin_clean())
         return WebIDL::SecurityError::create(HTML::relevant_realm(*this), "Canvas is not origin-clean"_utf16);
-    if (!bitmap)
+    if (!bitmap.has_value())
         return "data:,"_utf16;
 
     // 3. Let file be a serialization of this canvas element's bitmap as a file, passing type and quality if given.
@@ -444,7 +441,7 @@ WebIDL::ExceptionOr<void> HTMLCanvasElement::to_blob(GC::Ref<WebIDL::CallbackTyp
     // 2. Let result be null.
     // 3. If this canvas element's bitmap has pixels (i.e., neither its horizontal dimension nor its vertical dimension is zero),
     //    then set result to a copy of this canvas element's bitmap.
-    auto bitmap_result = get_bitmap_from_surface();
+    auto bitmap_result = get_frame_for_serialization(type);
     if (!is_origin_clean())
         return WebIDL::SecurityError::create(HTML::relevant_realm(*this), "Canvas is not origin-clean"_utf16);
 
@@ -454,7 +451,7 @@ WebIDL::ExceptionOr<void> HTMLCanvasElement::to_blob(GC::Ref<WebIDL::CallbackTyp
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this, callback, bitmap_result, type = move(type_string), quality] {
         // 1. If result is non-null, then set result to a serialization of result as a file with type and quality if given.
         Optional<SerializeBitmapResult> file_result;
-        if (bitmap_result) {
+        if (bitmap_result.has_value()) {
             if (auto result = serialize_bitmap(*bitmap_result, type, quality); !result.is_error())
                 file_result = result.release_value();
         }
@@ -487,7 +484,7 @@ Optional<Compositing::CanvasId> HTMLCanvasElement::canvas_id() const
     if (auto context = canvas_rendering_context_2d())
         return context->canvas_id();
     if (auto* webgl_context = canvas_webgl_context(); webgl_context && !webgl_context->is_context_lost())
-        return webgl_context->context().canvas_id();
+        return webgl_context->canvas_id();
     return {};
 }
 
@@ -504,6 +501,13 @@ void HTMLCanvasElement::set_canvas_content_dirty()
 
 void HTMLCanvasElement::prepare_for_compositing()
 {
+    // OPTIMIZATION: Nothing shows a 2D canvas that has no box, and its readbacks read what it drew rather than what it
+    //               presented, so what it draws stays unpresented until it has a box. That spares the Compositor a
+    //               copy of every frame it draws, which for a canvas that draws in memory is an upload. The rendering
+    //               update lays out before it prepares canvases, so a canvas presents in the update that gives it a box.
+    if (canvas_rendering_context_2d() && !has_layout_box())
+        return;
+
     if (m_canvas_content_dirty) {
         m_canvas_content_dirty = false;
 

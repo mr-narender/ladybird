@@ -6,11 +6,14 @@
 
 #pragma once
 
+#include <AK/GenericShorthands.h>
+#include <AK/Math.h>
 #include <AK/OwnPtr.h>
+#include <AK/Vector.h>
 #include <LibGfx/Point.h>
-#include <LibIPC/Forward.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/Page/AsyncScrollNodeStableID.h>
+#include <LibWebCommon/Page/TextEditingCommand.h>
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/UIEvents/KeyCode.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
@@ -38,11 +41,13 @@ struct WEBCOMMON_API KeyEvent {
     bool repeat { false };
     bool should_insert_text { false };
 
-    OwnPtr<BrowserInputData> browser_data;
+    OwnPtr<BrowserInputData> browser_data {};
     bool async_scroll_performed_default_action { false };
 
     // The UI process numbers the events it sends, and a completion names the event it finished.
     u64 id { 0 };
+    Vector<TextEditingCommand> editing_commands {};
+    bool native_editing_binding_resolved { false };
 };
 
 inline bool is_keyboard_scroll_key(Web::UIEvents::KeyCode key, u32 modifiers)
@@ -50,12 +55,15 @@ inline bool is_keyboard_scroll_key(Web::UIEvents::KeyCode key, u32 modifiers)
     switch (key) {
     case Web::UIEvents::KeyCode::Key_Space:
         return (modifiers & ~(Web::UIEvents::Mod_Shift | Web::UIEvents::Mod_Keypad)) == Web::UIEvents::Mod_None;
-    case Web::UIEvents::KeyCode::Key_PageUp:
-    case Web::UIEvents::KeyCode::Key_PageDown:
     case Web::UIEvents::KeyCode::Key_Up:
     case Web::UIEvents::KeyCode::Key_Down:
+        return first_is_one_of(modifiers & ~Web::UIEvents::Mod_Keypad, Web::UIEvents::Mod_None, Web::UIEvents::Mod_PlatformCtrl);
+    case Web::UIEvents::KeyCode::Key_PageUp:
+    case Web::UIEvents::KeyCode::Key_PageDown:
     case Web::UIEvents::KeyCode::Key_Left:
     case Web::UIEvents::KeyCode::Key_Right:
+    case Web::UIEvents::KeyCode::Key_Home:
+    case Web::UIEvents::KeyCode::Key_End:
         return (modifiers & ~Web::UIEvents::Mod_Keypad) == Web::UIEvents::Mod_None;
     default:
         return false;
@@ -69,6 +77,23 @@ enum class WheelDeltaPrecision : u8 {
     Precise,
 };
 
+// Besides its pixel delta, wheel input counts how far the wheel turned in 120ths of a tick, the unit of the legacy
+// wheelDelta. A tick is a wheel notch, or one line on platforms that accelerate the wheel by whole lines. Input that
+// reports only a pixel delta counts its ticks from that: a notch scrolls three 40-pixel lines, and precise input has
+// no notches, so it counts one tick per 40-pixel line step.
+// INTEROP: For macOS touchpad scrolling, Blink, WebKit, and Gecko all report 3 units per pixel; Blink and WebKit
+//          truncate, Gecko rounds. For the ctrl-wheel events of a pinch, WebKit and Gecko also report 3 units per
+//          pixel, while Blink reports 120 units per event.
+constexpr double wheel_tick_120ths_from_pixel_delta(double pixel_delta, WheelDeltaPrecision precision)
+{
+    constexpr double tick_120ths_per_tick = 120;
+    constexpr double pixels_per_notch = 3 * 40;
+    constexpr double pixels_per_precise_tick = 40;
+    if (precision == WheelDeltaPrecision::Precise)
+        return pixel_delta * (tick_120ths_per_tick / pixels_per_precise_tick);
+    return pixel_delta * (tick_120ths_per_tick / pixels_per_notch);
+}
+
 // Input that scrolls with a gesture, such as a touchpad, reports whether the user is still making that gesture,
 // whether a flick has handed the scrolling over to momentum, and when it ends.
 enum class ScrollGesturePhase : u8 {
@@ -78,12 +103,64 @@ enum class ScrollGesturePhase : u8 {
     Ended,
 };
 
+enum class PointerType : u8 {
+    Mouse,
+    Pen,
+    Touch,
+};
+
+// https://w3c.github.io/pointerevents/#pointerevent-interface
+struct PointerProperties {
+    AK_ALLOC_WITH_KMALLOC;
+
+    i32 pointer_id { 0 };
+    PointerType pointer_type { PointerType::Mouse };
+    double width { 1 };
+    double height { 1 };
+    double pressure { 0 };
+    double tangential_pressure { 0 };
+    i32 tilt_x { 0 };
+    i32 tilt_y { 0 };
+    i32 twist { 0 };
+    double altitude_angle { AK::Pi<double> / 2 };
+    double azimuth_angle { 0 };
+};
+
+// NB: Native mouse input leaves this empty, avoiding an allocation and keeping the input event small.
+class WEBCOMMON_API PointerInputData {
+public:
+    PointerInputData() = default;
+    explicit PointerInputData(Optional<PointerProperties>);
+    PointerInputData(PointerInputData const&);
+    PointerInputData(PointerInputData&&) = default;
+    PointerInputData& operator=(PointerInputData&&) = default;
+
+    Optional<PointerProperties> properties() const;
+    PointerProperties const* ptr() const { return m_properties.ptr(); }
+
+private:
+    OwnPtr<PointerProperties> m_properties;
+};
+
+// What the compositor found of a wheel event's gesture as it passed the event on, which WebContent follows rather
+// than deciding again.
+struct WheelGestureMark {
+    // Whether the event continues the gesture before it, rather than starting one.
+    bool continues_gesture { false };
+    // Whether the gesture goes on for as long as its fingers rest on the touchpad, which the platform reports the lift
+    // of, rather than until its events pause.
+    bool lasts_until_fingers_lift { false };
+
+    bool operator==(WheelGestureMark const&) const = default;
+};
+
 struct WEBCOMMON_API MouseEvent {
     enum class Type : u8 {
         MouseDown,
         MouseUp,
         MouseMove,
         MouseLeave,
+        MouseCancel,
         MouseWheel,
     };
 
@@ -97,43 +174,31 @@ struct WEBCOMMON_API MouseEvent {
     Web::UIEvents::KeyModifier modifiers { Web::UIEvents::KeyModifier::Mod_None };
     double wheel_delta_x { 0 };
     double wheel_delta_y { 0 };
+    double wheel_tick_120ths_x { 0 };
+    double wheel_tick_120ths_y { 0 };
     WheelDeltaPrecision wheel_delta_precision { WheelDeltaPrecision::Discrete };
     ScrollGesturePhase scroll_gesture_phase { ScrollGesturePhase::None };
     int click_count { 0 };
 
-    OwnPtr<BrowserInputData> browser_data;
+    OwnPtr<BrowserInputData> browser_data {};
     bool async_scroll_performed_default_action { false };
     u64 id { 0 };
     Optional<Web::ScrollbarDraggedByCompositor> scrollbar_dragged_by_compositor {};
+    PointerInputData pointer_data {};
+    Optional<WheelGestureMark> wheel_gesture_mark {};
 };
 
 struct WEBCOMMON_API PinchEvent {
     Web::DevicePixelPoint position;
     Web::UIEvents::KeyModifier modifiers { Web::UIEvents::KeyModifier::Mod_None };
     double scale_delta;
+    bool async_zoom_performed_default_action { false };
+    // A frame another process hosts dispatched the pinch's ctrl+wheel event and did not cancel it, which leaves only the
+    // zoom of the page's visual viewport to do.
+    bool wheel_event_was_dispatched { false };
     u64 id { 0 };
 };
 
 }
 
-namespace IPC {
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::KeyEvent const&);
-
-template<>
-WEBCOMMON_API ErrorOr<Web::KeyEvent> decode(Decoder&);
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::MouseEvent const&);
-
-template<>
-WEBCOMMON_API ErrorOr<Web::MouseEvent> decode(Decoder&);
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::PinchEvent const&);
-
-template<>
-WEBCOMMON_API ErrorOr<Web::PinchEvent> decode(Decoder&);
-
-}
+#include <LibWebCommon/Page/InputEventCodecs.h>

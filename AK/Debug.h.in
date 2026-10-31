@@ -26,10 +26,6 @@
 #    cmakedefine01 CALLBACK_MACHINE_DEBUG
 #endif
 
-#ifndef CANVAS_RENDERING_CONTEXT_2D_DEBUG
-#    cmakedefine01 CANVAS_RENDERING_CONTEXT_2D_DEBUG
-#endif
-
 #ifndef CRYPTO_DEBUG
 #    cmakedefine01 CRYPTO_DEBUG
 #endif
@@ -46,24 +42,12 @@
 #    cmakedefine01 CSS_PARSER_DEBUG
 #endif
 
-#ifndef CSS_TOKENIZER_DEBUG
-#    cmakedefine01 CSS_TOKENIZER_DEBUG
-#endif
-
-#ifndef CSS_TRANSITIONS_DEBUG
-#    cmakedefine01 CSS_TRANSITIONS_DEBUG
-#endif
-
 #ifndef CURL_DEBUG
 #    cmakedefine01 CURL_DEBUG
 #endif
 
 #ifndef DEVTOOLS_DEBUG
 #    cmakedefine01 DEVTOOLS_DEBUG
-#endif
-
-#ifndef DISPLAY_LIST_RUNS_DEBUG
-#    cmakedefine01 DISPLAY_LIST_RUNS_DEBUG
 #endif
 
 #ifndef DNS_DEBUG
@@ -82,10 +66,6 @@
 #    cmakedefine01 FLAC_ENCODER_DEBUG
 #endif
 
-#ifndef FORMATTING_CONTEXT_TRACE_DEBUG
-#    cmakedefine01 FORMATTING_CONTEXT_TRACE_DEBUG
-#endif
-
 #ifndef GIF_DEBUG
 #    cmakedefine01 GIF_DEBUG
 #endif
@@ -96,10 +76,6 @@
 
 #ifndef INCREMENTAL_SWEEP_DEBUG
 #    cmakedefine01 INCREMENTAL_SWEEP_DEBUG
-#endif
-
-#ifndef HIGHLIGHT_FOCUSED_FRAME_DEBUG
-#    cmakedefine01 HIGHLIGHT_FOCUSED_FRAME_DEBUG
 #endif
 
 #ifndef HTML_SCRIPT_DEBUG
@@ -120,10 +96,6 @@
 
 #ifndef ICO_DEBUG
 #    cmakedefine01 ICO_DEBUG
-#endif
-
-#ifndef IDB_DEBUG
-#    cmakedefine01 IDB_DEBUG
 #endif
 
 #ifndef IDL_DEBUG
@@ -152,10 +124,6 @@
 
 #ifndef LEXER_DEBUG
 #    cmakedefine01 LEXER_DEBUG
-#endif
-
-#ifndef LIBWEB_CSS_ANIMATION_DEBUG
-#    cmakedefine01 LIBWEB_CSS_ANIMATION_DEBUG
 #endif
 
 #ifndef LIBWEB_CSS_DEBUG
@@ -194,10 +162,6 @@
 #    cmakedefine01 HTML_PARSER_DEBUG
 #endif
 
-#ifndef PATH_DEBUG
-#    cmakedefine01 PATH_DEBUG
-#endif
-
 #ifndef PLAYBACK_MANAGER_DEBUG
 #    cmakedefine01 PLAYBACK_MANAGER_DEBUG
 #endif
@@ -228,10 +192,6 @@
 
 #ifndef RESOURCE_DEBUG
 #    cmakedefine01 RESOURCE_DEBUG
-#endif
-
-#ifndef SHARED_QUEUE_DEBUG
-#    cmakedefine01 SHARED_QUEUE_DEBUG
 #endif
 
 #ifndef SPAM_DEBUG
@@ -290,30 +250,6 @@
 #    cmakedefine01 VULKAN_VALIDATION_LAYERS_DEBUG
 #endif
 
-#ifndef WASI_DEBUG
-#    cmakedefine01 WASI_DEBUG
-#endif
-
-#ifndef WASI_FINE_GRAINED_DEBUG
-#    cmakedefine01 WASI_FINE_GRAINED_DEBUG
-#endif
-
-#ifndef WASM_BINPARSER_DEBUG
-#    cmakedefine01 WASM_BINPARSER_DEBUG
-#endif
-
-#ifndef WASM_CRANELIFT_DEBUG
-#    cmakedefine01 WASM_CRANELIFT_DEBUG
-#endif
-
-#ifndef WASM_TRACE_DEBUG
-#    cmakedefine01 WASM_TRACE_DEBUG
-#endif
-
-#ifndef WASM_VALIDATOR_DEBUG
-#    cmakedefine01 WASM_VALIDATOR_DEBUG
-#endif
-
 #ifndef WEBDRIVER_DEBUG
 #    cmakedefine01 WEBDRIVER_DEBUG
 #endif
@@ -326,10 +262,6 @@
 #    cmakedefine01 VIDEO_PRESENTATION_CHANNEL_DEBUG
 #endif
 
-#ifndef WEBGL_CONTEXT_DEBUG
-#    cmakedefine01 WEBGL_CONTEXT_DEBUG
-#endif
-
 #ifndef WEBVIEW_PROCESS_DEBUG
 #    cmakedefine01 WEBVIEW_PROCESS_DEBUG
 #endif
@@ -340,10 +272,6 @@
 
 #ifndef WEB_WORKER_DEBUG
 #    cmakedefine01 WEB_WORKER_DEBUG
-#endif
-
-#ifndef WEBP_DEBUG
-#    cmakedefine01 WEBP_DEBUG
 #endif
 
 #ifndef XML_PARSER_DEBUG

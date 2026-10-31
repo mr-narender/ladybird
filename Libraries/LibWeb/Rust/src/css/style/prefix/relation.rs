@@ -12,7 +12,6 @@
 
 use smallvec::SmallVec;
 
-use super::super::capacity::ShallowCapacityBytes;
 use super::super::fast_hash::FastSet as HashSet;
 use super::super::selector::RoutingKey;
 use super::super::tree::TreeScopeID;
@@ -30,15 +29,12 @@ pub(super) struct PrefixRelationProgram {
     compound_step_offsets: Vec<u32>,
     compound_steps: Vec<u32>,
     has_following_steps: bool,
+    /// Whether any step is reached over each geometry axis, in the order of `PrefixRelation::geometry_targets`: the
+    /// child, descendant, next-sibling and following-sibling axes.
+    geometry_axes: [bool; 4],
     compounds_by_key: HashMap<DispatchKey, std::ops::Range<u32>>,
     keyed_compounds: Vec<u32>,
     terminal_steps: HashMap<EntryID, SmallVec<[usize; 1]>>,
-    memory: super::super::memory::MemoryLease,
-}
-
-thread_local! {
-    static RELATION_PROGRAM_MEMORY: std::cell::RefCell<super::super::memory::MemoryController> =
-        std::cell::RefCell::new(super::super::memory::MemoryController::new(super::super::memory::DeviceClass::ForegroundDesktop));
 }
 
 /// A step in dependency order, with what an update reads of it as it runs: how it is reached, its compound and its
@@ -52,22 +48,6 @@ struct QueuedStep {
 }
 
 impl PrefixRelationProgram {
-    fn capacity_bytes(&self) -> u64 {
-        self.queue.shallow_capacity_bytes()
-            + self.step_ranks.shallow_capacity_bytes()
-            + self.compound_step_offsets.shallow_capacity_bytes()
-            + self.compound_steps.shallow_capacity_bytes()
-            + self.compounds_by_key.shallow_capacity_bytes()
-            + self.terminal_steps.shallow_capacity_bytes()
-            + self.keyed_compounds.shallow_capacity_bytes()
-            + self
-                .terminal_steps
-                .values()
-                .filter(|steps| steps.spilled())
-                .map(|steps| (steps.capacity() * size_of::<usize>()) as u64)
-                .sum::<u64>()
-    }
-
     fn compounds_for_key(&self, key: &DispatchKey) -> Option<impl Iterator<Item = usize> + '_> {
         let range = self.compounds_by_key.get(key)?;
         Some(
@@ -246,15 +226,6 @@ impl PositionSet {
     }
 }
 
-impl ShallowCapacityBytes for PositionSet {
-    fn shallow_capacity_bytes(&self) -> u64 {
-        match self {
-            Self::Listed(list) => list.shallow_capacity_bytes(),
-            Self::Bits { words, .. } => words.shallow_capacity_bytes(),
-        }
-    }
-}
-
 /// A position as a set lists it: a relation holds nowhere near 2^32 elements.
 fn position_u32(position: usize) -> u32 {
     debug_assert!(
@@ -308,8 +279,6 @@ pub(in crate::css::style) struct PrefixRelation {
     arrived: Vec<u64>,
     pub(in crate::css::style) handled_routing_keys: HashMap<RoutingKey, bool>,
     // Routine prefix-cache accounting must not walk every selector set for each matching node.
-    capacity_bytes: u64,
-    nested_capacity_bytes: u64,
 }
 
 impl PrefixRelation {
@@ -317,9 +286,8 @@ impl PrefixRelation {
         if !cfg!(test) && !super::super::verification::prefix_relation_is_enabled() {
             return;
         }
-        assert_eq!(self.nested_capacity_bytes, self.measure_nested_capacity_bytes());
         let mut scalar = PrefixStates::new();
-        let mut counters = Counters::default();
+        let counters = Counters::default();
         let mut context = if evaluation.facts_are_composite() {
             super::PrefixTransitionContext::new_composite(&mut scalar, evaluation.facts, &[])
         } else {
@@ -329,13 +297,9 @@ impl PrefixRelation {
             if !self.live[position] {
                 continue;
             }
-            let PrefixTransitionLookup::Known(answer) = scalar.match_set_for(
-                &mut context.scratch,
-                &mut context.effects,
-                evaluation,
-                node,
-                &mut counters,
-            ) else {
+            let PrefixTransitionLookup::Known(answer) =
+                scalar.match_set_for(&mut context.scratch, &mut context.effects, evaluation, node, &counters)
+            else {
                 panic!("a complete prefix relation must have a complete scalar answer");
             };
             assert_eq!(
@@ -346,60 +310,11 @@ impl PrefixRelation {
         }
     }
 
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        self.capacity_bytes
-    }
-
-    fn measure_nested_capacity_bytes(&self) -> u64 {
-        self.compound_matches
-            .iter()
-            .map(ShallowCapacityBytes::shallow_capacity_bytes)
-            .sum::<u64>()
-            + self
-                .matches
-                .iter()
-                .map(ShallowCapacityBytes::shallow_capacity_bytes)
-                .sum::<u64>()
-            + self
-                .answers
-                .iter()
-                .map(ShallowCapacityBytes::shallow_capacity_bytes)
-                .sum::<u64>()
-    }
-
-    fn refresh_capacity_bytes(&mut self) {
-        self.capacity_bytes = self.nested_capacity_bytes
-            + self.pending_steps.capacity_bytes()
-            + self.nodes.shallow_capacity_bytes()
-            + self.positions.shallow_capacity_bytes()
-            + self.parents.shallow_capacity_bytes()
-            + self.previous.shallow_capacity_bytes()
-            + self.live.shallow_capacity_bytes()
-            + self.free_slots.shallow_capacity_bytes()
-            + self.departures.shallow_capacity_bytes()
-            + self.compound_matches.shallow_capacity_bytes()
-            + self.matches.shallow_capacity_bytes()
-            + self.walk_truth.shallow_capacity_bytes()
-            + self.positional.shallow_capacity_bytes()
-            + self.old_previous.shallow_capacity_bytes()
-            + self
-                .geometry_targets
-                .iter()
-                .map(ShallowCapacityBytes::shallow_capacity_bytes)
-                .sum::<u64>()
-            + self.answers.shallow_capacity_bytes()
-            + self.changed_answers.shallow_capacity_bytes()
-            + self
-                .changed_answers
-                .iter()
-                .map(|(_, old, new)| old.shallow_capacity_bytes() + new.shallow_capacity_bytes())
-                .sum::<u64>()
-            + self.arrivals.shallow_capacity_bytes()
-            + self.arrived.shallow_capacity_bytes()
-            + self.handled_routing_keys.shallow_capacity_bytes();
-    }
-
-    pub(in crate::css::style) fn install_answers(&self, states: &mut PrefixStates) {
+    /// Install the answers into `states`: every live node's when `states` holds none yet, and
+    /// otherwise the ones the last update changed and its arrivals. Both are installed once: a
+    /// transaction that installs the relation again without an update or a geometry pass would
+    /// otherwise pay the size of that old update again.
+    pub(in crate::css::style) fn install_answers(&mut self, states: &mut PrefixStates) {
         if states.relation_answers.is_empty() {
             for (position, (&node, entries)) in self.nodes.iter().zip(&self.answers).enumerate() {
                 if self.live[position] {
@@ -414,6 +329,8 @@ impl PrefixRelation {
                 states.install_relation_answer(self.nodes[position], &self.answers[position]);
             }
         }
+        self.changed_answers.clear();
+        self.arrivals.clear();
     }
 
     /// Whether `node` is one of the live nodes the relation answers for.
@@ -433,7 +350,7 @@ impl PrefixRelation {
         automaton: &PrefixAutomaton,
         evaluation: &mut PrefixEvaluation<'_, '_>,
         changed: &[StyleNodeID],
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Vec<StyleNodeID> {
         let tree = evaluation.tree;
         let mut touched = changed.to_vec();
@@ -659,7 +576,7 @@ impl PrefixRelation {
         evaluation: &mut PrefixEvaluation<'_, '_>,
         old_evaluation: &mut PrefixEvaluation<'_, '_>,
         changed_nodes: &[StyleNodeID],
-        counters: &mut Counters,
+        counters: &Counters,
     ) {
         counters.bump(Counter::PrefixRelationUpdates);
         let following_geometry = self.following_geometry_changes(automaton, old_evaluation);
@@ -669,15 +586,16 @@ impl PrefixRelation {
         // memberships once per affected set; live siblings are handled by the geometry frontier.
         // Sharing the dispatch-key lookup across the batch avoids testing every possible local
         // compound again for every departed element.
+        let mut departed_keys = HashSet::default();
         for &position in &self.departures {
             let node = self.nodes[position];
             let row = old_evaluation.row_of(node).unwrap();
             row.facts
-                .for_each_dispatch_key(row.row, self.parents[position] == usize::MAX, |key| keys.push(key));
+                .for_each_dispatch_key(row.row, self.parents[position] == usize::MAX, |key| {
+                    departed_keys.insert(key);
+                });
         }
-        keys.sort_unstable();
-        keys.dedup();
-        for key in &keys {
+        for key in &departed_keys {
             let Some(compounds) = self.program.compounds_for_key(key) else {
                 continue;
             };
@@ -731,9 +649,12 @@ impl PrefixRelation {
                 continue;
             }
             keys.clear();
-            for row in [row, previous_row] {
-                row.facts
-                    .for_each_dispatch_key(row.row, evaluation.tree.parent(node).is_none(), |key| keys.push(key));
+            let is_root = evaluation.tree.parent(node).is_none();
+            row.facts.for_each_dispatch_key(row.row, is_root, |key| keys.push(key));
+            if !(std::ptr::eq(row.facts, previous_row.facts) && row.row == previous_row.row) {
+                previous_row
+                    .facts
+                    .for_each_dispatch_key(previous_row.row, is_root, |key| keys.push(key));
             }
             keys.sort_unstable();
             keys.dedup();
@@ -747,7 +668,6 @@ impl PrefixRelation {
                 counters,
             ) as usize;
             let identity = facts.dense_identity(identity, &mut next_local_identity);
-            let is_root = evaluation.tree.parent(node).is_none();
             for key in &keys {
                 let Some(compounds) = self.program.compounds_for_key(key) else {
                     continue;
@@ -785,7 +705,7 @@ impl PrefixRelation {
                                         ..
                                     } => automaton
                                         .features_for(*feature_start, *feature_len)
-                                        .all(|feature| matches_feature(row.facts, row.row, feature)),
+                                        .all(|feature| matches_feature(row, feature)),
                                     PrefixPredicate::Program { program, local, .. } => evaluation
                                         .evaluator
                                         .matches_prefix_local(
@@ -808,14 +728,18 @@ impl PrefixRelation {
             changes.sort_unstable();
             changes.dedup();
             let members = &mut self.compound_matches[index];
-            let before = members.shallow_capacity_bytes();
+
             members.toggle(changes);
-            self.nested_capacity_bytes = self.nested_capacity_bytes - before + members.shallow_capacity_bytes();
         }
         let mut geometry_memberships: [HashMap<usize, Vec<usize>>; 4] = std::array::from_fn(|_| HashMap::default());
+        // An arrival's memberships are all changes of its compounds already, which every step of those compounds
+        // visits, so geometry only reaches retained nodes, over the axes some step is reached by.
         for (axis, targets) in self.geometry_targets.iter().enumerate() {
+            if !self.program.geometry_axes[axis] {
+                continue;
+            }
             for &position in targets {
-                if !self.live[position] {
+                if !self.live[position] || has_bit(&self.arrived, position) {
                     continue;
                 }
                 let node = self.nodes[position];
@@ -858,6 +782,10 @@ impl PrefixRelation {
         let mut descendants = Vec::new();
         let mut following_parents = HashSet::default();
         let mut walk_truth = std::mem::take(&mut self.walk_truth);
+        // Which question `walk_truth` answers: whether a position's ancestors, or previous siblings, hold a member of a
+        // predecessor step. Steps sharing a predecessor and axis share the answers, as a step's members are final once
+        // it ran and steps run in dependency order.
+        let mut walk_truth_question: Option<(usize, u8)> = None;
         let mut ancestor_chain = Vec::new();
         // Every local change is seeded before evaluation. Dependency order ensures that a step
         // runs once, after all changes to its predecessor, and only propagates a changed result.
@@ -957,6 +885,7 @@ impl PrefixRelation {
                                 );
                             } else {
                                 walk_truth.clear();
+                                walk_truth_question = None;
                                 for position in candidates.iter() {
                                     ancestor_chain.clear();
                                     let mut source = self.parents[position];
@@ -1003,12 +932,17 @@ impl PrefixRelation {
                         _ => unreachable!(),
                     }
                 }
-                affected.sort_unstable();
+                // NB: Each source of `affected` is in position order, which the stable sort merges as runs.
+                affected.sort();
                 affected.dedup();
                 if affected.is_empty() {
                     continue;
                 }
-                walk_truth.clear();
+                let question = predecessor.map(|predecessor| (predecessor, axis as u8));
+                if question.is_none() || question != walk_truth_question {
+                    walk_truth.clear();
+                    walk_truth_question = question;
+                }
                 for &position in &affected {
                     // A step runs once per update, so what it held is what it held before, which no arrival is in.
                     let previously_matched =
@@ -1076,9 +1010,8 @@ impl PrefixRelation {
                     }
                 }
                 let members = &mut self.matches[step_index];
-                let before = members.shallow_capacity_bytes();
+
                 members.toggle(&changed_positions[first_change..]);
-                self.nested_capacity_bytes = self.nested_capacity_bytes - before + members.shallow_capacity_bytes();
             }
             let changes = first_change..changed_positions.len();
             if changes.is_empty() {
@@ -1100,7 +1033,8 @@ impl PrefixRelation {
             }
             step_changes.insert(step_index, changes);
         }
-        terminal_changes.sort_unstable();
+        // NB: Each step's changes are in position order, which the stable sort merges as runs.
+        terminal_changes.sort();
         terminal_changes.dedup();
         self.changed_answers.clear();
         let mut old = Vec::new();
@@ -1122,9 +1056,7 @@ impl PrefixRelation {
                         entries.remove(index);
                     }
                     (Err(index), true) => {
-                        let before = entries.shallow_capacity_bytes();
                         entries.insert(index, entry);
-                        self.nested_capacity_bytes += entries.shallow_capacity_bytes() - before;
                     }
                     _ => {}
                 }
@@ -1155,7 +1087,7 @@ impl PrefixRelation {
             self.arrived[position / 64] = 0;
         }
         self.walk_truth = walk_truth;
-        self.refresh_capacity_bytes();
+
         self.verify_answers(evaluation);
     }
 }
@@ -1173,7 +1105,7 @@ impl PrefixAutomaton {
         &self,
         evaluation: &mut PrefixEvaluation<'_, '_>,
         root: StyleNodeID,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> PrefixRelation {
         counters.bump(Counter::PrefixRelationBuilds);
         let tree = evaluation.tree;
@@ -1289,7 +1221,7 @@ impl PrefixAutomaton {
                                 ..
                             } => self
                                 .features_for(*feature_start, *feature_len)
-                                .all(|feature| matches_feature(row.facts, row.row, feature)),
+                                .all(|feature| matches_feature(row, feature)),
                             PrefixPredicate::Program { program, local, .. } => evaluation
                                 .evaluator
                                 .matches_prefix_local(
@@ -1441,7 +1373,17 @@ impl PrefixAutomaton {
             let has_following_steps = queue
                 .iter()
                 .any(|(_, axis)| matches!(axis, PrefixOutputKind::FollowingSibling));
-            let mut program = PrefixRelationProgram {
+            let mut geometry_axes = [false; 4];
+            for (_, axis) in &queue {
+                match axis {
+                    PrefixOutputKind::Child => geometry_axes[0] = true,
+                    PrefixOutputKind::Descendant => geometry_axes[1] = true,
+                    PrefixOutputKind::NextSibling => geometry_axes[2] = true,
+                    PrefixOutputKind::FollowingSibling => geometry_axes[3] = true,
+                    PrefixOutputKind::UniqueTerminal | PrefixOutputKind::SharedTerminal => {}
+                }
+            }
+            let program = PrefixRelationProgram {
                 queue: queue
                     .into_iter()
                     .map(|(step, axis)| (u32::try_from(step).expect("prefix step space exhausted"), axis))
@@ -1457,17 +1399,14 @@ impl PrefixAutomaton {
                 compound_step_offsets,
                 compound_steps,
                 has_following_steps,
+                geometry_axes,
                 compounds_by_key,
                 keyed_compounds,
                 terminal_steps,
-                memory: super::super::memory::MemoryLease::new(super::super::memory::MemoryCategory::RuleProgram),
             };
-            RELATION_PROGRAM_MEMORY.with_borrow_mut(|memory| {
-                program.memory.resize_required_to(memory, program.capacity_bytes());
-            });
             std::sync::Arc::new(program)
         }));
-        let mut relation = PrefixRelation {
+        let relation = PrefixRelation {
             program,
             nodes,
             positions,
@@ -1497,11 +1436,8 @@ impl PrefixAutomaton {
             arrivals: Vec::new(),
             arrived: Vec::new(),
             handled_routing_keys: HashMap::default(),
-            capacity_bytes: 0,
-            nested_capacity_bytes: 0,
         };
-        relation.nested_capacity_bytes = relation.measure_nested_capacity_bytes();
-        relation.refresh_capacity_bytes();
+
         relation.verify_answers(evaluation);
         relation
     }
@@ -1521,12 +1457,6 @@ impl Default for PrefixWalkMemo {
             stamps: Column::default(),
             generation: 2,
         }
-    }
-}
-
-impl ShallowCapacityBytes for PrefixWalkMemo {
-    fn shallow_capacity_bytes(&self) -> u64 {
-        self.stamps.shallow_capacity_bytes()
     }
 }
 
@@ -1687,20 +1617,11 @@ impl PendingPrefixSteps {
         }
         Some(result)
     }
-
-    fn capacity_bytes(&self) -> u64 {
-        self.levels.shallow_capacity_bytes()
-            + self
-                .levels
-                .iter()
-                .map(ShallowCapacityBytes::shallow_capacity_bytes)
-                .sum::<u64>()
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingPrefixSteps, PositionSet, PrefixWalkMemo, ShallowCapacityBytes, toggle_listed};
+    use super::{PendingPrefixSteps, PositionSet, PrefixWalkMemo, toggle_listed};
     use std::collections::BTreeSet;
 
     fn is_bitmap(set: &PositionSet) -> bool {
@@ -1850,22 +1771,19 @@ mod tests {
             _ => None,
         };
         let mut members = PositionSet::default();
-        assert_eq!(members.shallow_capacity_bytes(), 0);
         let mut drained = Vec::new();
         members.drain_into(&mut drained);
         assert!(drained.is_empty());
         assert!(!members.remove_departed(&[1], &[true, false]));
-        assert_eq!(members.shallow_capacity_bytes(), 0);
         members.toggle(&[1, 3]);
         assert!(members.iter().eq([1, 3]));
         let buffer = listed(&members);
         assert!(buffer.is_some(), "a small set is listed");
-        let capacity = members.shallow_capacity_bytes();
+
         members.drain_into(&mut drained);
         assert_eq!(drained, [1, 3]);
         members.toggle(&[2, 4]);
         assert_eq!(listed(&members), buffer);
-        assert_eq!(members.shallow_capacity_bytes(), capacity);
         assert!(members.iter().eq([2, 4]));
     }
 }

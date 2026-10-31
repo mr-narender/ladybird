@@ -42,14 +42,6 @@ CSSPixelPoint maximum_scroll_offset(Layout::Node const&);
 CSSPixelPoint clamp_scroll_offset(Layout::Node const&, CSSPixelPoint);
 CSSPixelRect scroll_snapport_rect(Layout::Node const&);
 CSSPixelRect scroll_snapport_rect(Layout::Node const&, CSSPixelRect scrollport);
-// The overflow the viewport applies to a wheel, in both axes. Both axes come from the same
-// element - the root's, or the body's where the root defers to it - so they are resolved together.
-struct ViewportWheelOverflow {
-    CSS::Overflow x { CSS::Overflow::Auto };
-    CSS::Overflow y { CSS::Overflow::Auto };
-};
-
-ViewportWheelOverflow overflow_values_applied_to_viewport_for_wheel_scrolling(DOM::Document const&);
 struct WheelScrollableAxes {
     bool horizontal { false };
     bool vertical { false };
@@ -57,7 +49,6 @@ struct WheelScrollableAxes {
 
 WheelScrollableAxes wheel_scrollable_axes(Layout::Node const&);
 bool could_be_scrolled_by_wheel_event(Layout::Node const&);
-bool could_be_scrolled_by_wheel_event(Layout::Node const&, ScrollDirection);
 WEB_API Optional<Web::AsyncScrollNodeStableID> async_scroll_node_stable_id(Layout::Node const&);
 ScrollHandled set_scroll_offset(Layout::Node&, CSSPixelPoint);
 ScrollHandled set_scroll_offset_from_user_input(Layout::Node&, CSSPixelPoint, ScrollKind = ScrollKind::Relative);
@@ -65,8 +56,11 @@ ScrollHandled scroll_by(Layout::Node&, double delta_x, double delta_y, ScrollKin
 // The box the walk scrolled, if any.
 Layout::Node* wheel_scroll_along_containing_block_chain(Layout::Node&, double wheel_delta_x, double wheel_delta_y, ScrollKind = ScrollKind::Relative);
 
-WEB_API Layout::Node* scrolling_box_for_scroll_step_in_containing_block_chain(Layout::Node&, CSSPixelPoint delta);
+WEB_API Layout::Node* scrolling_box_for_scroll_step_in_containing_block_chain(Layout::BegunRead const&, Layout::Node&, CSSPixelPoint delta);
 WEB_API Layout::Node* first_wheel_scrollable_box_in_containing_block_chain(Layout::Node const&);
-void scroll_text_offset_into_view(DOM::Text const&, size_t offset, TextAffinity = TextAffinity::Downstream, ScrollBlockDirection = ScrollBlockDirection::Yes);
+// The nearest box in the containing block chain, the given one included, that keeps a scroll step by the delta to
+// itself instead of passing it on to a scroller around it. The step scrolls that box or a box inside it, or nothing.
+Layout::Node* box_ending_scroll_chain(Layout::Node const&, double delta_x, double delta_y);
+void scroll_text_offset_into_view(Layout::BegunRead const&, DOM::Text const&, size_t offset, TextAffinity = TextAffinity::Downstream, ScrollBlockDirection = ScrollBlockDirection::Yes);
 
 }

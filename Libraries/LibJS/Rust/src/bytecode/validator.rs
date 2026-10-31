@@ -22,8 +22,7 @@ use super::instruction::instruction_length_from_bytes;
 use super::instruction::validate_instruction;
 
 /// Sentinel u32 used by `Operand::INVALID` and by `Optional<*TableIndex>` for
-/// "no value". Mirrors the C++ `0xFFFFFFFF` constant used throughout
-/// `Bytecode/Operand.h` and the per-table index types.
+/// "no value".
 const INVALID_INDEX_U32: u32 = 0xFFFF_FFFF;
 
 /// Sentinel u32 written into cache fields by the bytecode encoder when no
@@ -48,12 +47,14 @@ pub struct FFIValidatorBounds {
     pub object_shape_cache_count: u32,
     pub object_property_iterator_cache_count: u32,
     pub environment_shape_cache_count: u32,
+    pub arith_feedback_count: u32,
+    pub value_feedback_count: u32,
+    pub call_feedback_count: u32,
+    pub keyed_feedback_count: u32,
     pub class_blueprint_count: u32,
     pub shared_function_data_count: u32,
-    /// Variant counts for the C++ enum types referenced by bytecode declarations
-    /// fields. Plumbed across the FFI rather than hardcoded so that adding
-    /// or removing a variant in the C++ enum can't silently outdate the
-    /// Rust validator.
+    /// Variant counts for the enum types referenced by bytecode declarations
+    /// fields.
     pub completion_type_variant_count: u32,
     pub iterator_hint_variant_count: u32,
     pub environment_mode_variant_count: u32,
@@ -62,7 +63,7 @@ pub struct FFIValidatorBounds {
     pub function_name_prefix_variant_count: u32,
 }
 
-/// Categorization of validation failures, mirrored to C++ as an enum class.
+/// Categorization of validation failures.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationErrorKind {
@@ -95,9 +96,13 @@ pub enum ValidationErrorKind {
     SourceMapOffsetInvalid = 26,
     EnvironmentCoordinateCacheIndexOutOfRange = 27,
     EnvironmentShapeCacheIndexOutOfRange = 28,
+    ArithFeedbackIndexOutOfRange = 29,
+    ValueFeedbackIndexOutOfRange = 30,
+    CallFeedbackIndexOutOfRange = 31,
+    KeyedFeedbackIndexOutOfRange = 32,
 }
 
-/// Detail returned to the C++ caller on validation failure.
+/// Detail returned to the caller on validation failure.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FFIValidationError {
@@ -145,6 +150,11 @@ pub struct ValidationContext<'a> {
     pub bytes: &'a [u8],
     /// Sorted byte offsets of valid instruction starts, populated by Pass 1.
     pub valid_offsets: &'a [u32],
+}
+
+#[inline]
+pub fn read_u16(bytes: &[u8], at: usize) -> u16 {
+    u16::from_ne_bytes(bytes[at..at + 2].try_into().unwrap())
 }
 
 #[inline]
@@ -315,6 +325,38 @@ pub fn validate_object_property_iterator_cache_index(
 pub fn validate_environment_shape_cache_index(raw: u32, ctx: &ValidationContext) -> Result<(), ValidationErrorKind> {
     if raw >= ctx.bounds.environment_shape_cache_count {
         return Err(ValidationErrorKind::EnvironmentShapeCacheIndexOutOfRange);
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn validate_arith_feedback_index(raw: u16, ctx: &ValidationContext) -> Result<(), ValidationErrorKind> {
+    if u32::from(raw) >= ctx.bounds.arith_feedback_count {
+        return Err(ValidationErrorKind::ArithFeedbackIndexOutOfRange);
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn validate_value_feedback_index(raw: u16, ctx: &ValidationContext) -> Result<(), ValidationErrorKind> {
+    if u32::from(raw) >= ctx.bounds.value_feedback_count {
+        return Err(ValidationErrorKind::ValueFeedbackIndexOutOfRange);
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn validate_call_feedback_index(raw: u16, ctx: &ValidationContext) -> Result<(), ValidationErrorKind> {
+    if u32::from(raw) >= ctx.bounds.call_feedback_count {
+        return Err(ValidationErrorKind::CallFeedbackIndexOutOfRange);
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn validate_keyed_feedback_index(raw: u16, ctx: &ValidationContext) -> Result<(), ValidationErrorKind> {
+    if u32::from(raw) >= ctx.bounds.keyed_feedback_count {
+        return Err(ValidationErrorKind::KeyedFeedbackIndexOutOfRange);
     }
     Ok(())
 }
@@ -534,6 +576,10 @@ mod tests {
             object_shape_cache_count: 4,
             object_property_iterator_cache_count: 4,
             environment_shape_cache_count: 4,
+            arith_feedback_count: 4,
+            value_feedback_count: 4,
+            call_feedback_count: 4,
+            keyed_feedback_count: 4,
             class_blueprint_count: 4,
             shared_function_data_count: 4,
             completion_type_variant_count: 6,

@@ -108,27 +108,26 @@ fn parse_integer_component(
     if !stream.is_empty() {
         return None;
     }
-    let resolved = match &parsed {
-        StyleValueData::Integer { value } => *value,
-        // NB: This matches CalculatedStyleValue::resolve_integer() at
-        //     Libraries/LibWeb/CSS/StyleValues/CalculatedStyleValue.cpp, before descriptor
-        //     integer resolution moved to Rust.
-        StyleValueData::Calculated { .. } => {
-            super::stylesheet_cache::record_length_resolution_dependency();
-            unsafe {
-                context
-                    .length_resolution_context
-                    .cast::<FfiLengthResolutionContext>()
-                    .as_ref()
-            }
-            .and_then(|length_context| {
-                crate::css::calc::resolve_calculated_integer_with_context(&parsed, length_context)
-            })
-            .or_else(|| crate::css::calc::resolve_calculated_integer_without_context(&parsed))?
-        }
-        _ => return None,
-    };
-    Some((resolved, parsed))
+    if matches!(parsed, StyleValueData::Calculated { .. }) {
+        super::stylesheet_cache::record_length_resolution_dependency();
+    }
+    let length_context = context.length_resolution_context;
+    Some((resolve_descriptor_integer(&parsed, length_context)?, parsed))
+}
+
+/// A descriptor's `<integer>`, with a calculation resolved against the document's lengths when
+/// there are some to resolve against.
+pub(crate) fn resolve_descriptor_integer(
+    value: &StyleValueData,
+    length_context: Option<&FfiLengthResolutionContext>,
+) -> Option<i32> {
+    match value {
+        StyleValueData::Integer { value } => Some(*value),
+        StyleValueData::Calculated { .. } => length_context
+            .and_then(|length_context| crate::css::calc::resolve_calculated_integer_with_context(value, length_context))
+            .or_else(|| crate::css::calc::resolve_calculated_integer_without_context(value)),
+        _ => None,
+    }
 }
 
 fn parse_integer_symbol_pair(context: &ParseContext, values: &[ComponentValue]) -> Option<(i32, StyleValueData)> {
@@ -428,10 +427,14 @@ fn parse_value_type(
             Some(value_list(parsed, 0, false))
         }
         DescriptorValueType::OptionalDeclarationValue => {
-            if !declaration_value_is_valid(values) {
+            if !values.is_empty() && !declaration_value_is_valid(values) {
                 return None;
             }
-            Some(unresolved_value(source, &[], SubstitutionFunctionsPresence::default()))
+            Some(unresolved_value(
+                source,
+                values.to_vec(),
+                SubstitutionFunctionsPresence::default(),
+            ))
         }
         DescriptorValueType::PageSize => parse_page_size(context, values),
     }
@@ -443,6 +446,14 @@ fn parse_with_metadata(
     values: &[ComponentValue],
     source: &[u16],
 ) -> Option<StyleValueData> {
+    if !metadata.allow_css_wide_keywords
+        && single_non_whitespace(values)
+            .and_then(ComponentValue::ident)
+            .and_then(keyword_from_ascii_case_insensitive)
+            .is_some_and(|keyword| is_css_wide_keyword(&StyleValueData::Keyword { keyword }))
+    {
+        return None;
+    }
     for syntax in metadata.syntax {
         let parsed = match syntax {
             DescriptorSyntax::Keyword(keyword) => parse_keyword(values, keyword),
@@ -469,13 +480,7 @@ pub(crate) fn parse_descriptor(
     source: &[u16],
 ) -> Option<ParsedDescriptor> {
     let metadata = descriptor_metadata(at_rule, name)?;
-    let inherited_contexts = if context.value_context_count == 0 {
-        &[]
-    } else if context.value_contexts.is_null() {
-        return None;
-    } else {
-        unsafe { std::slice::from_raw_parts(context.value_contexts, context.value_context_count) }
-    };
+    let inherited_contexts = context.value_contexts.as_slice();
     let mut value_contexts = Vec::with_capacity(inherited_contexts.len() + 1);
     value_contexts.extend_from_slice(inherited_contexts);
     value_contexts.push(FfiValueParsingContext {
@@ -485,15 +490,14 @@ pub(crate) fn parse_descriptor(
         name: FfiUtf16View::default(),
     });
     let mut descriptor_context = *context;
-    descriptor_context.value_contexts = value_contexts.as_ptr();
-    descriptor_context.value_context_count = value_contexts.len();
+    descriptor_context.value_contexts = ak::Span::new(&value_contexts);
     let mut presence = SubstitutionFunctionsPresence::default();
     collect_arbitrary_substitution_function_presence(values, &mut presence).ok()?;
     let value = if presence.has_any() {
         if !metadata.allow_arbitrary_substitution_functions {
             return None;
         }
-        unresolved_value(source, &[], presence)
+        unresolved_value(source, values.to_vec(), presence)
     } else {
         parse_with_metadata(&descriptor_context, &metadata, values, source)?
     };
@@ -504,23 +508,20 @@ pub(crate) fn parse_descriptor(
 }
 
 /// Parses one descriptor value and returns retained Rust style-value data.
-///
-/// # Safety
-/// Every view and `context` must remain readable for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_css_descriptor(
-    context: *const ParseContext,
+pub extern "C" fn rust_parse_css_descriptor(
+    context: Option<&ParseContext>,
     at_rule: u8,
     name: FfiUtf16View,
     source: FfiUtf16View,
 ) -> *const c_void {
-    let Some(context) = (unsafe { context.as_ref() }) else {
+    let Some(context) = context else {
         return std::ptr::null();
     };
-    let Some(name) = (unsafe { name.units() }) else {
+    let Some(name) = name.units() else {
         return std::ptr::null();
     };
-    let Some(source) = (unsafe { source.units() }) else {
+    let Some(source) = source.units() else {
         return std::ptr::null();
     };
     let Ok(values) = consume_a_list_of_component_values(tokenize_for_parser(source)) else {
@@ -542,23 +543,8 @@ mod tests {
     use crate::css::style_value::StyleValueData;
     use std::sync::Arc;
 
-    fn context() -> ParseContext {
-        ParseContext {
-            in_quirks_mode: false,
-            is_svg_presentation_attribute: false,
-            is_substituted_value: false,
-            contains_attr_tainted_values: false,
-            is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index: std::ptr::null_mut(),
-        }
+    fn context() -> ParseContext<'static> {
+        ParseContext::default()
     }
 
     fn parse(at_rule: u8, name: &str, source: &str) -> Option<StyleValueData> {

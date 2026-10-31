@@ -15,7 +15,9 @@
 #include <LibCore/Platform/TaskRole.h>
 #include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/System.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibIPC/SingleServer.h>
 #include <LibMain/Main.h>
@@ -49,20 +51,30 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     StringView http_disk_cache_mode;
     StringView resource_map_path;
     StringView cache_path;
+    StringView top_level_site;
+    bool sites_have_their_own = false;
     bool wait_for_debugger = false;
     bool disable_sandbox = false;
+    bool enable_test_mode = false;
 
     int crash_report_fd = -1;
+    StringView stats_log_directory;
     Core::ArgsParser args_parser;
+    args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
     args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
     args_parser.add_option(http_disk_cache_mode, "HTTP disk cache mode", "http-disk-cache-mode", 0, "mode");
     args_parser.add_option(resource_map_path, "Path to JSON file mapping URLs to local files", "resource-map", 0, "path");
     args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
+    args_parser.add_option(top_level_site, "The top-level site this RequestServer serves", "site", 0, "site");
+    args_parser.add_option(sites_have_their_own, "Sites have RequestServers of their own; keep none of their responses", "sites-have-their-own");
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
+    args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.parse(arguments);
+
+    auto stats_log = TRY(Core::StatsLog::create(stats_log_directory, "RequestServer"sv));
 
     if (crash_report_fd >= 0) {
         if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
@@ -76,6 +88,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         warnln("Could not adopt the foreground application task role: {}", result.error());
     if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInitiated); result.is_error())
         warnln("Could not set main thread QoS: {}", result.error());
+
+    if (enable_test_mode)
+        RequestServer::DNSInfo::the().loopback_domains.append("test"sv);
 
     // FIXME: Update RequestServer to support multiple custom root certificates.
     if (!certificates.is_empty())
@@ -117,6 +132,15 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             disk_cache = cache.release_value();
     }
 
+    // Alternative services are no longer persisted, so this only holds history.
+    if (!cache_path.is_empty())
+        (void)FileSystem::remove(LexicalPath::join(cache_path, "alt-svc-cache.txt"sv).string(), FileSystem::RecursionMode::Disallowed);
+
+    if (!top_level_site.is_empty())
+        RequestServer::set_process_top_level_site(Utf16String::from_utf8(top_level_site));
+    else if (sites_have_their_own)
+        RequestServer::set_process_sites_have_their_own();
+
     TRY(RequestServer::initialize_libcurl());
 
     if (!disable_sandbox)
@@ -131,8 +155,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         mach_server_name,
         connections,
         request_transfer_leases,
-        disk_cache,
-        LexicalPath::join(cache_path, "alt-svc-cache.txt"sv).string()));
+        disk_cache));
+
+    if (stats_log)
+        stats_log->start_sampling([&](JsonObject& values) {
+            values.set("requests.clients"sv, connections.size());
+            values.set("requests.transfer_leases"sv, request_transfer_leases.size());
+        });
 
     return event_loop.exec();
 }

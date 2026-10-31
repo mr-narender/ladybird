@@ -4,12 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::style::capacity::ShallowCapacityBytes;
 use crate::css::style::fast_hash::FastMap as HashMap;
 use crate::css::style::program::RuleID;
 use std::num::NonZeroU32;
 
 const IDENTITIES_PER_PAGE: usize = 128;
+
+#[derive(Clone)]
 
 struct IdentityPage {
     slots: [Option<NonZeroU32>; IDENTITIES_PER_PAGE],
@@ -18,7 +19,7 @@ struct IdentityPage {
 
 /// Native identities are allocated in ranges by parsed stylesheets. Hash only their page
 /// number, then read the compact semantic identity directly from the page's slot.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::css::style) struct NativeRuleIdentities {
     pages: HashMap<u64, Box<IdentityPage>>,
 }
@@ -67,12 +68,6 @@ impl NativeRuleIdentities {
     #[cfg(test)]
     pub(super) fn contains_key(&self, identity: &u64) -> bool {
         self.get(identity).is_some()
-    }
-}
-
-impl ShallowCapacityBytes for NativeRuleIdentities {
-    fn shallow_capacity_bytes(&self) -> u64 {
-        self.pages.shallow_capacity_bytes() + (self.pages.len() * size_of::<IdentityPage>()) as u64
     }
 }
 

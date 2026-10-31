@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/DOM/Comment.h>
 #include <LibWeb/DOM/Document.h>
@@ -19,12 +20,16 @@
 #include <LibWeb/DOM/ProcessingInstruction.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/SelectionchangeEventDispatching.h>
+#include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/DOM/Slottable.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/Geometry/DOMRectList.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
+#include <LibWeb/HTML/HTMLInsertion.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/TextNode.h>
@@ -105,10 +110,7 @@ void Range::set_associated_selection(Badge<Selection::Selection>, GC::Ptr<Select
     } else if (had_selection) {
         // The range this selection painted through is no longer its range; take the highlight back.
         auto& document = m_start_container->document();
-        if (document.has_committed_viewport_box()) {
-            document.paint_state().reset_selection_states(document);
-            Painting::set_needs_repaint(*document.unsafe_layout_node(), InvalidateDisplayList::PaintCommands);
-        }
+        document.note_selection_changed();
 
         // https://w3c.github.io/selection-api/#selectionchange-event
         // When the selection is dissociated with its range, the user agent must schedule a selectionchange event on
@@ -126,11 +128,7 @@ void Range::update_associated_selection()
 
     auto& document = m_start_container->document();
 
-    // NB: Called during selection update after range change.
-    if (document.has_committed_viewport_box()) {
-        document.paint_state().recompute_selection_states(document, *this);
-        Painting::set_needs_repaint(*document.unsafe_layout_node(), InvalidateDisplayList::PaintCommands);
-    }
+    document.note_selection_changed();
 
     document.reset_cursor_blink_cycle();
     document.set_cursor_position_needs_repaint();
@@ -203,6 +201,86 @@ RelativeBoundaryPointPosition position_of_boundary_point_relative_to_other_bound
 
     // 5. Return before.
     return RelativeBoundaryPointPosition::Before;
+}
+
+static bool children_are_outside_flat_tree(Node const& node)
+{
+    if (auto const* element = as_if<Element>(node); element && element->is_shadow_host())
+        return true;
+    auto const* slot = as_if<HTML::HTMLSlotElement>(node);
+    return slot && !slot->assigned_nodes_internal().is_empty();
+}
+
+static size_t flat_tree_child_count_of_host_or_slot(Node const& node)
+{
+    if (auto const* slot = as_if<HTML::HTMLSlotElement>(node))
+        return slot->assigned_nodes_internal().size();
+    return as<Element>(node).shadow_root()->child_count();
+}
+
+static Optional<size_t> index_in_flat_tree(Node& node)
+{
+    if (auto slot = assigned_slot_for_node(node)) {
+        auto assigned_nodes = slot->assigned_nodes_internal();
+        auto index = find_index(assigned_nodes.begin(), assigned_nodes.end(), node.as_slottable());
+        if (index == assigned_nodes.size())
+            return {};
+        return index;
+    }
+    if (auto const* parent = node.parent(); parent && children_are_outside_flat_tree(*parent))
+        return {};
+    return node.index();
+}
+
+struct FlatTreePosition {
+    GC::Ref<Node> root;
+    Vector<size_t, 32> indices;
+};
+
+static Optional<FlatTreePosition> flat_tree_position(BoundaryPoint point)
+{
+    Vector<size_t, 32> indices;
+    auto node = point.node;
+    if (!children_are_outside_flat_tree(*node)) {
+        indices.append(point.offset);
+    } else if (point.offset == 0) {
+        indices.append(0);
+    } else if (auto* child = node->child_at_index(point.offset); child && index_in_flat_tree(*child).has_value()) {
+        node = *child;
+    } else {
+        indices.append(flat_tree_child_count_of_host_or_slot(*node));
+    }
+
+    while (auto* parent = node->flat_tree_parent()) {
+        if (!is<ShadowRoot>(*node)) {
+            auto index = index_in_flat_tree(*node);
+            if (!index.has_value())
+                return {};
+            indices.append(*index);
+        }
+        node = *parent;
+    }
+    indices.reverse();
+    return FlatTreePosition { node, move(indices) };
+}
+
+Optional<RelativeBoundaryPointPosition> position_of_boundary_point_relative_to_other_boundary_point_in_flat_tree(BoundaryPoint a, BoundaryPoint b)
+{
+    a.node->document().assign_slottables_if_needed();
+    auto a_position = flat_tree_position(a);
+    auto b_position = flat_tree_position(b);
+    if (!a_position.has_value() || !b_position.has_value() || a_position->root != b_position->root)
+        return {};
+
+    auto const& a_indices = a_position->indices;
+    auto const& b_indices = b_position->indices;
+    for (size_t i = 0; i < min(a_indices.size(), b_indices.size()); ++i) {
+        if (a_indices[i] != b_indices[i])
+            return a_indices[i] < b_indices[i] ? RelativeBoundaryPointPosition::Before : RelativeBoundaryPointPosition::After;
+    }
+    if (a_indices.size() == b_indices.size())
+        return RelativeBoundaryPointPosition::Equal;
+    return a_indices.size() < b_indices.size() ? RelativeBoundaryPointPosition::Before : RelativeBoundaryPointPosition::After;
 }
 
 // https://dom.spec.whatwg.org/#concept-range-bp-set
@@ -721,7 +799,7 @@ WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::extract()
     }
 
     // 11. Let containedChildren be a list of all children of commonAncestor that are contained in range, in tree order.
-    Vector<GC::Ref<Node>> contained_children;
+    GC::RootVector<GC::Ref<Node>> contained_children;
     for (Node* node = common_ancestor->first_child(); node; node = node->next_sibling()) {
         if (contains_node(*node))
             contained_children.append(*node);
@@ -1050,7 +1128,7 @@ WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::clone_the_contents()
     }
 
     // 11. Let contained children be a list of all children of common ancestor that are contained in range, in tree order.
-    Vector<GC::Ref<Node>> contained_children;
+    GC::RootVector<GC::Ref<Node>> contained_children;
     for (Node* node = common_ancestor->first_child(); node; node = node->next_sibling()) {
         if (contains_node(*node))
             contained_children.append(*node);
@@ -1217,14 +1295,19 @@ WebIDL::ExceptionOr<void> Range::delete_contents()
 // https://drafts.csswg.org/cssom-view/#extensions-to-the-range-interface
 GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
 {
+    return Geometry::DOMRectList::create(client_rects());
+}
+
+Vector<Gfx::DoubleRect> Range::client_rects()
+{
     // 1. return an empty DOMRectList object if the range is not in the document
     if (!start_container()->document().navigable())
-        return Geometry::DOMRectList::create({});
+        return {};
 
     auto& document = start_container()->document();
     document.update_layout(DOM::UpdateLayoutReason::RangeGetClientRects);
-
-    Vector<GC::Root<Geometry::DOMRect>> rects;
+    Layout::ForcedReadScope read { document };
+    Vector<Gfx::DoubleRect> rects;
     Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree;
     auto rect_to_viewport_transform = Painting::identity_rect_to_viewport_transform();
 
@@ -1285,9 +1368,8 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
             if (contains_node(*node) && (!node->parent() || !contains_node(*node->parent()))) {
                 auto const& element = static_cast<DOM::Element const&>(*node);
                 auto const element_rects = element.get_client_rects();
-                for (auto& rect : element_rects) {
-                    rects.append(Geometry::DOMRect::create(static_cast<double>(rect.x()), static_cast<double>(rect.y()), static_cast<double>(rect.width()), static_cast<double>(rect.height())));
-                }
+                for (auto& rect : element_rects)
+                    rects.append(rect.to_type<double>());
             }
         } else if (node_type == NodeType::TEXT_NODE) {
             // 2. For each Text node selected or partially selected by the range (including when the boundary-points
@@ -1296,7 +1378,7 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
             if (selection_state == Painting::SelectionState::None)
                 continue;
 
-            auto const* layout_node = text.layout_node();
+            auto const* layout_node = text.layout_node(read);
             if (!layout_node) {
                 dbgln("FIXME: Failed to get client rects for node {}", node->debug_description());
                 continue;
@@ -1327,72 +1409,53 @@ GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
                 VERIFY_NOT_REACHED();
             }
 
-            Layout::RustFFI::layout_arena_text_range_rects(
-                layout_node->arena_handle(), Layout::Node::slot_id(layout_node),
+            Layout::RustFFI::layout_script_text_range_rects(
+                layout_node->document_host(), Layout::Node::slot_id(layout_node),
                 to_underlying(selection_state), start_offset(), end_offset(), filter_dom_start, filter_dom_end,
                 rect_to_viewport_transform, &rects, [](void* context, CSSPixelRect rect) {
-                    static_cast<Vector<GC::Root<Geometry::DOMRect>>*>(context)->append(Geometry::DOMRect::create(rect.to_type<float>()));
+                    static_cast<Vector<Gfx::DoubleRect>*>(context)->append(rect.to_type<float>().to_type<double>());
                 });
         }
     }
-    return Geometry::DOMRectList::create(move(rects));
+    return rects;
 }
 
 // https://w3c.github.io/csswg-drafts/cssom-view/#dom-range-getboundingclientrect
 GC::Ref<Geometry::DOMRect> Range::get_bounding_client_rect()
 {
+    auto rect = bounding_client_rect();
+    return Geometry::DOMRect::create(rect.x(), rect.y(), rect.width(), rect.height());
+}
+
+Gfx::DoubleRect Range::bounding_client_rect()
+{
     // 1. Let list be the result of invoking getClientRects() on element.
-    auto list = get_client_rects();
+    auto list = client_rects();
 
     // 2. If the list is empty return a DOMRect object whose x, y, width and height members are zero.
-    if (list->length() == 0)
-        return Geometry::DOMRect::create(0, 0, 0, 0);
+    if (list.is_empty())
+        return {};
 
     // 3. If all rectangles in list have zero width or height, return the first rectangle in list.
-    auto all_rectangle_has_zero_width_or_height = true;
-    for (auto i = 0u; i < list->length(); ++i) {
-        auto const& rect = list->item(i);
-        if (rect->width() != 0 && rect->height() != 0) {
-            all_rectangle_has_zero_width_or_height = false;
-            break;
-        }
-    }
+    auto all_rectangle_has_zero_width_or_height = all_of(list, [](auto const& rect) { return rect.width() == 0 || rect.height() == 0; });
     if (all_rectangle_has_zero_width_or_height)
-        return GC::Ref { *const_cast<Geometry::DOMRect*>(list->item(0)) };
+        return list[0];
 
     // 4. Otherwise, return a DOMRect object describing the smallest rectangle that includes all of the rectangles in
     //    list of which the height or width is not zero.
-    auto const* first_rect = list->item(0);
-    auto bounding_rect = Gfx::Rect { first_rect->x(), first_rect->y(), first_rect->width(), first_rect->height() };
-    for (auto i = 1u; i < list->length(); ++i) {
-        auto const& rect = list->item(i);
-        if (rect->width() == 0 || rect->height() == 0)
+    auto bounding_rect = list[0];
+    for (auto const& rect : list.span().slice(1)) {
+        if (rect.width() == 0 || rect.height() == 0)
             continue;
-        bounding_rect.unite({ rect->x(), rect->y(), rect->width(), rect->height() });
+        bounding_rect.unite(rect);
     }
-    return Geometry::DOMRect::create(bounding_rect.to_type<float>());
-}
-
-WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const& string)
-{
-    // 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm with
-    //    TrustedHTML, this's relevant global object, string, "Range createContextualFragment", and "script".
-    auto const compliant_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(*start_container()),
-        string,
-        TrustedTypes::InjectionSink::Range_createContextualFragment,
-        "script"_utf16));
-
-    return create_contextual_fragment(compliant_string.to_utf8_but_should_be_ported_to_utf16());
+    return bounding_rect.to_type<float>().to_type<double>();
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
-WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(StringView string)
+// NB: The steps after node, compliantString and compliantOptions have been determined.
+static WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment_for_node(GC::Ref<Node> node, StringView string, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options)
 {
-    // 2. Let node be this's start node.
-    GC::Ref<Node> node = *start_container();
-
     // 3. Let element be null.
     GC::Ptr<Element> element = nullptr;
 
@@ -1409,14 +1472,39 @@ WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment
     //    - element's local name is "html"; and
     //    - element's namespace is the HTML namespace;
     if (!element || is<HTML::HTMLHtmlElement>(*element)) {
-        // then set element to the result of creating an element given this's node document,
+        // then set element to the result of creating an element given node's node document,
         // "body", and the HTML namespace.
         element = TRY(DOM::create_element(node->document(), HTML::TagNames::body, Namespace::HTML));
     }
 
-    // 7. Return the result of invoking the fragment parsing algorithm steps with element, compliantString, and Fragment.
+    // 7. Return the result of invoking the fragment parsing algorithm steps given element, compliantString,
+    //    compliantOptions, and Legacy.
     auto markup = Utf16String::from_utf8(string);
-    return Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *element }, markup.utf16_view(), HTML::ParserScriptingMode::Fragment);
+    return Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *element }, markup.utf16_view(), HTML::ParserScriptingMode::Fragment, HTML::FragmentFastPath::Allow, trusted_options);
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
+WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const& string)
+{
+    // 1. Let node be this's start node.
+    GC::Ref<Node> node = *start_container();
+
+    // 2. Let (compliantString, compliantOptions) be the result of invoking the get trusted type compliant input
+    //    algorithm with this's relevant global object, string, a new SetHTMLUnsafeOptions dictionary whose runScripts
+    //    member is set to true and whose other members are set to their default values, "Range
+    //    createContextualFragment", node's node document's type, and false.
+    // NOTE: A Trusted Types default policy can override the options, for example by setting runScripts to false to
+    //       prevent scripts from executing when inserting the returned fragment.
+    auto const [compliant_string, trusted_options] = TRY(HTML::get_trusted_type_compliant_input_for_legacy_sink(node, string, TrustedTypes::InjectionSink::Range_createContextualFragment, HTML::LegacySinkRunScripts::Yes));
+
+    return create_contextual_fragment_for_node(node, compliant_string.to_utf8_but_should_be_ported_to_utf16(), trusted_options);
+}
+
+// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
+WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(StringView string, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options)
+{
+    // 1. Let node be this's start node.
+    return create_contextual_fragment_for_node(*start_container(), string, trusted_options);
 }
 
 }

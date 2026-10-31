@@ -4,20 +4,23 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibAudio/ClientConnection.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/CrashHandler.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Platform/TaskRole.h>
 #include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
+#include <LibCore/StatsLog.h>
 #include <LibIPC/SingleServer.h>
 #include <LibMain/Main.h>
-#include <LibSandbox/ConnectBroker.h>
+#include <LibMedia/DecoderRegistrations.h>
+#include <LibMedia/RemoteVideoDecoder.h>
 #include <MediaServer/ConnectionFromClient.h>
 #include <MediaServer/Sandbox.h>
 
 #if defined(AK_OS_LINUX)
-#    include <LibMedia/FFmpeg/SystemFFmpeg.h>
+#    include <LibMediaCodecs/FFmpeg/SystemFFmpeg.h>
 #endif
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
@@ -25,18 +28,20 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     AK::set_rich_debug_enabled(true);
 
     int crash_report_fd = -1;
-    int connect_broker_fd = -1;
     StringView mach_server_name;
     bool wait_for_debugger = false;
     bool disable_sandbox = false;
 
+    StringView stats_log_directory;
     Core::ArgsParser args_parser;
+    args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
-    args_parser.add_option(connect_broker_fd, "Descriptor for the sandbox connection broker", "connect-broker-fd", 0, "fd");
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
     args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
     args_parser.parse(arguments);
+
+    auto stats_log = TRY(Core::StatsLog::create(stats_log_directory, "MediaServer"sv));
 
     if (crash_report_fd >= 0) {
         if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
@@ -54,17 +59,29 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
 #if defined(AK_OS_LINUX)
-    if (connect_broker_fd != -1)
-        Sandbox::set_connect_broker_fd(connect_broker_fd);
     // The system library's dependencies make syscalls the sandbox will not allow, so it loads first.
     (void)Media::FFmpeg::SystemFFmpeg::the();
 #endif
+
+    Media::install_video_decoders({ Media::remote_video_decoders(), Media::ffmpeg_video_decoders() });
+    Media::install_audio_decoders({ Media::audio_decoders() });
 
     if (!disable_sandbox)
         TRY(MediaServer::apply_sandbox(mach_server_name));
 
     auto client = TRY(IPC::take_over_accepted_client_from_system_server<MediaServer::ConnectionFromClient>(
         mach_server_name, MediaServer::ConnectionFromClient::Role::Controller));
+
+    // Every playback stream opens through the AudioServer; this process never reaches a device itself.
+    Audio::ClientConnection::set_transport_factory([client] {
+        return client->request_audio_server_transport();
+    });
+    Media::RemoteVideoDecoder::set_transport_requester([client](auto callback) {
+        client->request_video_decoder_server_transport(move(callback));
+    });
+
+    if (stats_log)
+        stats_log->start_sampling();
 
     return event_loop.exec();
 }

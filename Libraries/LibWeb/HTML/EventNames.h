@@ -22,7 +22,7 @@ namespace Web::HTML::EventNames {
     __ENUMERATE_HTML_EVENT(audioend)                 \
     __ENUMERATE_HTML_EVENT(audioprocess)             \
     __ENUMERATE_HTML_EVENT(audiostart)               \
-    __ENUMERATE_HTML_EVENT(begin)                    \
+    __ENUMERATE_HTML_EVENT(beginEvent)               \
     __ENUMERATE_HTML_EVENT(beforeinput)              \
     __ENUMERATE_HTML_EVENT(beforematch)              \
     __ENUMERATE_HTML_EVENT(beforeprint)              \
@@ -62,8 +62,10 @@ namespace Web::HTML::EventNames {
     __ENUMERATE_HTML_EVENT(durationchange)           \
     __ENUMERATE_HTML_EVENT(emptied)                  \
     __ENUMERATE_HTML_EVENT(end)                      \
+    __ENUMERATE_HTML_EVENT(endEvent)                 \
     __ENUMERATE_HTML_EVENT(ended)                    \
     __ENUMERATE_HTML_EVENT(enter)                    \
+    __ENUMERATE_HTML_EVENT(enterpictureinpicture)    \
     __ENUMERATE_HTML_EVENT(error)                    \
     __ENUMERATE_HTML_EVENT(exit)                     \
     __ENUMERATE_HTML_EVENT(finish)                   \
@@ -77,6 +79,7 @@ namespace Web::HTML::EventNames {
     __ENUMERATE_HTML_EVENT(input)                    \
     __ENUMERATE_HTML_EVENT(invalid)                  \
     __ENUMERATE_HTML_EVENT(languagechange)           \
+    __ENUMERATE_HTML_EVENT(leavepictureinpicture)    \
     __ENUMERATE_HTML_EVENT(load)                     \
     __ENUMERATE_HTML_EVENT(loaded)                   \
     __ENUMERATE_HTML_EVENT(loadeddata)               \
@@ -112,7 +115,7 @@ namespace Web::HTML::EventNames {
     __ENUMERATE_HTML_EVENT(rejectionhandled)         \
     __ENUMERATE_HTML_EVENT(remove)                   \
     __ENUMERATE_HTML_EVENT(removetrack)              \
-    __ENUMERATE_HTML_EVENT(repeat)                   \
+    __ENUMERATE_HTML_EVENT(repeatEvent)              \
     __ENUMERATE_HTML_EVENT(reset)                    \
     __ENUMERATE_HTML_EVENT(resize)                   \
     __ENUMERATE_HTML_EVENT(result)                   \

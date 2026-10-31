@@ -4,15 +4,16 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCompositing/FontServiceClient.h>
 #include <LibCore/Process.h>
-#include <LibCore/System.h>
-#include <LibGfx/Font/FontDatabase.h>
-#include <LibGfx/Font/SharedFontProvider.h>
 #include <LibWeb/Compositor/CompositorConnection.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/BroadcastChannel.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
+#include <LibWeb/Loader/LoaderConfig.h>
+#include <LibWeb/Loader/ResourceLoader.h>
+#include <LibWeb/PermissionsAPI/PermissionStore.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <WebWorker/ConnectionFromClient.h>
 #include <WebWorker/PageHost.h>
@@ -20,19 +21,10 @@
 
 namespace WebWorker {
 
-Messages::WebWorkerServer::InitTransportResponse ConnectionFromClient::init_transport([[maybe_unused]] int peer_pid)
-{
-#ifdef AK_OS_WINDOWS
-    m_transport->set_peer_pid(peer_pid);
-    return Core::System::getpid();
-#endif
-    VERIFY_NOT_REACHED();
-}
-
-void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle)
+void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle, int client_id, Optional<Utf16String> top_level_site)
 {
     if (on_request_server_connection)
-        on_request_server_connection(handle);
+        on_request_server_connection(handle, client_id, top_level_site);
 
     // A real connection loss defers this callback. Exercise the case where the replacement connection arrives before
     // that deferred callback runs.
@@ -40,13 +32,12 @@ void ConnectionFromClient::connect_to_request_server(IPC::TransportHandle handle
         request_server_died_callback();
 }
 
-void ConnectionFromClient::simulate_request_server_connection_loss_and_reconnect_for_testing(IPC::TransportHandle replacement_handle)
+void ConnectionFromClient::simulate_request_server_connection_loss_and_reconnect_for_testing(IPC::TransportHandle replacement_handle, int client_id, Optional<Utf16String> top_level_site)
 {
-    auto disconnected_client = move(Web::ResourceLoader::the().request_client());
-    m_request_server_died_callback_for_testing = move(disconnected_client->on_request_server_died);
-    disconnected_client = nullptr;
+    if (auto disconnected_client = Web::ResourceLoader::the().take_client_for_testing(top_level_site))
+        m_request_server_died_callback_for_testing = move(disconnected_client->on_request_server_died);
 
-    connect_to_request_server(move(replacement_handle));
+    connect_to_request_server(move(replacement_handle), client_id, move(top_level_site));
 }
 
 void ConnectionFromClient::connect_to_image_decoder(IPC::TransportHandle handle)
@@ -63,14 +54,6 @@ ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_media_serve
     return response->take_handle()->create_transport();
 }
 
-void ConnectionFromClient::connect_to_wasm_compiler([[maybe_unused]] IPC::TransportHandle handle)
-{
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    if (on_wasm_compiler_connection)
-        on_wasm_compiler_connection(move(handle));
-#endif
-}
-
 void ConnectionFromClient::connect_to_compositor(IPC::TransportHandle handle)
 {
     auto transport = MUST(handle.create_transport());
@@ -78,13 +61,6 @@ void ConnectionFromClient::connect_to_compositor(IPC::TransportHandle handle)
     m_compositor_connection->on_compositor_lost = [this] {
         m_page_host->compositor_process_lost();
     };
-
-#ifdef AK_OS_WINDOWS
-    if constexpr (requires { m_compositor_connection->transport().set_peer_pid(0); }) {
-        auto response = m_compositor_connection->send_sync<Messages::CompositorWebContentServer::InitTransport>(Core::System::getpid());
-        m_compositor_connection->transport().set_peer_pid(response->compositor_pid());
-    }
-#endif
 
     m_page_host->ensure_compositor_host();
 }
@@ -108,7 +84,27 @@ void ConnectionFromClient::set_site_compatibility_data(JsonValue data)
         warnln("Ignoring invalid site compatibility data: {}", parsed_data.error());
         return;
     }
-    Web::ResourceLoader::the().set_site_compatibility_data(parsed_data.release_value());
+    Web::set_site_compatibility_data(parsed_data.release_value());
+}
+
+void ConnectionFromClient::set_permission_snapshot(Web::Permissions::PermissionSnapshot snapshot)
+{
+    Web::PermissionsAPI::PermissionStore::the().apply_snapshot(move(snapshot));
+}
+
+void ConnectionFromClient::set_user_agent(String user_agent)
+{
+    Web::update_loader_config([&](auto& config) { config.user_agent = move(user_agent); });
+}
+
+void ConnectionFromClient::set_navigator_compatibility_mode(Web::NavigatorCompatibilityMode mode)
+{
+    Web::ResourceLoader::the().set_navigator_compatibility_mode(mode);
+}
+
+void ConnectionFromClient::set_preferred_languages(Vector<String> preferred_languages)
+{
+    Web::update_loader_config([&](auto& config) { config.preferred_languages = move(preferred_languages); });
 }
 
 void ConnectionFromClient::close_worker()
@@ -156,53 +152,10 @@ ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transpo
 
 ConnectionFromClient::~ConnectionFromClient() = default;
 
-void ConnectionFromClient::set_font_catalog(IPC::File file, u64 size, u64 generation)
+void ConnectionFromClient::set_font_service(IPC::TransportHandle handle, IPC::File catalog, u64 catalog_size, u64 generation)
 {
-    if (m_font_provider) {
-        if (auto result = m_font_provider->replace_catalog(move(file), size, generation); result.is_error())
-            dbgln("WebWorker: Unable to replace font catalog: {}", result.error());
-        else
-            Web::Platform::FontPlugin::the().update_generic_fonts();
-        return;
-    }
-
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.open_font = [this](u64 requested_generation, u64 face_id) {
-        auto response = send_sync_but_allow_failure<Messages::WebWorkerClient::OpenSystemFont>(requested_generation, face_id);
-        if (!response)
-            return Gfx::BrokeredFont {};
-        return response->take_font();
-    };
-    callbacks.match_font = [this](String const& family, u16 weight, u16 width, u8 slope) {
-        auto response = send_sync_but_allow_failure<Messages::WebWorkerClient::MatchSystemFont>(family, weight, width, slope);
-        if (!response)
-            return Gfx::BrokeredFont {};
-        return response->take_font();
-    };
-    callbacks.match_font_for_code_point = [this](u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) {
-        auto response = send_sync_but_allow_failure<Messages::WebWorkerClient::MatchSystemFontForCodePoint>(code_point, weight, width, slope, prefer_color_emoji);
-        if (!response)
-            return Gfx::BrokeredFont {};
-        return response->take_font();
-    };
-    callbacks.resolve_generic_family = [this](String const& family, u16 weight, u8 slope) -> Optional<FlyString> {
-        auto response = send_sync_but_allow_failure<Messages::WebWorkerClient::ResolveGenericFont>(family, weight, slope);
-        if (!response)
-            return {};
-        auto resolved_family = response->take_resolved_family();
-        if (!resolved_family.has_value())
-            return {};
-        return FlyString { resolved_family.release_value() };
-    };
-
-    auto provider = Gfx::SharedFontProvider::create_from_catalog_file_or_empty(move(file), size, generation, move(callbacks));
-    if (provider.is_error()) {
-        dbgln("WebWorker: Unable to install fallback font catalog: {}", provider.error());
-        return;
-    }
-    m_font_provider = provider.value().ptr();
-    Gfx::FontDatabase::the().install_system_font_provider(provider.release_value());
-    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(m_enable_test_mode, m_font_provider));
+    auto* font_provider = MUST(Compositing::install_font_service(move(handle), move(catalog), catalog_size, generation));
+    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(m_enable_test_mode, font_provider));
 }
 
 Web::Page& ConnectionFromClient::page()
@@ -252,6 +205,11 @@ void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::Worke
 void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno)
 {
     Web::HTML::WorkerAgentParent::did_report_worker_exception(owner_token, move(message), move(filename), lineno, colno);
+}
+
+void ConnectionFromClient::did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource)
+{
+    Web::HTML::WorkerAgentParent::did_report_content_security_policy_violation(owner_token, policy_index, move(effective_directive), move(resource));
 }
 
 void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token)

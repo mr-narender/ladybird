@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Base64.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/PaintingSurface.h>
+#include <LibGfx/ImageFormats/PNGWriter.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/HTML/BrowsingContext.h>
@@ -65,15 +66,13 @@ void draw_bounding_box_from_the_framebuffer(HTML::BrowsingContext& browsing_cont
     //    - Height: paint height
     Gfx::IntRect paint_rect { rect.x(), rect.y(), paint_width, paint_height };
 
-    auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, Gfx::IntSize { paint_width, paint_height }));
-    auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(bitmap);
+    auto bitmap = MUST(Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, Gfx::IntSize { paint_width, paint_height }));
     HTML::PaintConfig paint_config { .canvas_fill_rect = paint_rect };
-    browsing_context.active_document()->navigable()->render_screenshot(painting_surface, paint_config, [bitmap, element = GC::make_root(element), canvas = GC::make_root(canvas), callback = move(callback)] mutable {
+    browsing_context.active_document()->navigable()->render_screenshot(bitmap, paint_config, [bitmap, element = GC::make_root(element), canvas = GC::make_root(canvas), callback = move(callback)] mutable {
         HTML::TemporaryExecutionContext execution_context { element->document().relevant_settings_object() };
 
-        auto image_bitmap = HTML::ImageBitmap::create();
-        image_bitmap->set_bitmap(bitmap);
-        if (canvas->canvas_rendering_context_2d()->draw_image(image_bitmap, 0, 0).is_exception()) {
+        auto image_bitmap = HTML::ImageBitmap::create(bitmap);
+        if (!canvas->canvas_rendering_context_2d()->draw_image(*image_bitmap, 0, 0)) {
             callback(Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to draw the screenshot to the canvas"sv));
             return;
         }
@@ -95,18 +94,20 @@ Response encode_canvas_element(HTML::HTMLCanvasElement& canvas)
         return Error::from_code(ErrorCode::UnableToCaptureScreen, "Captured screenshot is empty"sv);
 
     // 3. Let file be a serialization of the canvas element’s bitmap as a file, using "image/png" as an argument.
-    // 4. Let data url be a data: URL representing file. [RFC2397]
-    auto data_url_result = canvas.to_data_url("image/png"sv, {});
-    if (data_url_result.is_exception())
+    auto bitmap = canvas.get_bitmap_from_surface();
+    if (!bitmap)
+        return Error::from_code(ErrorCode::UnableToCaptureScreen, "Captured screenshot is empty"sv);
+    Gfx::PNGWriterOptions png_options;
+    png_options.compression = Gfx::PNGCompression::Fast;
+    auto file = Gfx::PNGWriter::encode(*bitmap, png_options);
+    if (file.is_error())
         return Error::from_code(ErrorCode::UnableToCaptureScreen, "Failed to serialize canvas"sv);
-    auto data_url = data_url_result.release_value();
 
+    // 4. Let data url be a data: URL representing file. [RFC2397]
     // 5. Let index be the index of "," in data url.
-    auto index = data_url.utf16_view().find_code_unit_offset(',');
-    VERIFY(index.has_value());
-
     // 6. Let encoded string be a substring of data url using (index + 1) as the start argument.
-    auto encoded_string = MUST(data_url.utf16_view().substring_view(*index + 1).to_utf8());
+    // NB: That substring is file's base64 encoding.
+    auto encoded_string = MUST(encode_base64(file.value()));
 
     // 7. Return success with data encoded string.
     return JsonValue { move(encoded_string) };

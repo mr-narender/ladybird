@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Debug.h>
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
+#include <LibGC/Root.h>
 #include <LibGC/WeakInlines.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Bindings/PlatformObject.h>
@@ -17,6 +17,7 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/HTML/CustomElements/CustomElementAlgorithms.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
@@ -24,30 +25,11 @@
 
 namespace Web::Bindings {
 
-#ifndef NDEBUG
-static HashMap<InterfaceName, Vector<FlatPtr>>& hintless_main_world_wrapper_realms_by_interface()
-{
-    static NeverDestroyed<HashMap<InterfaceName, Vector<FlatPtr>>> realms_by_interface;
-    return *realms_by_interface;
-}
-
-static void log_hintless_main_world_wrapper_realm_if_new(Wrappable& wrappable, JS::Realm& realm)
-{
-    auto realm_address = bit_cast<FlatPtr>(&realm);
-    auto& seen_realms = hintless_main_world_wrapper_realms_by_interface().ensure(wrappable.interface_name());
-    if (seen_realms.contains_slow(realm_address))
-        return;
-
-    seen_realms.append(realm_address);
-    dbgln("Wrapper diagnostic: hint-less non-Node main-world wrapper for interface #{} was created in previously unseen realm {:p}", static_cast<u16>(wrappable.interface_name()), &realm);
-}
-#endif
-
 Wrappable::Wrappable() = default;
 
 struct PreservedWrapper {
     GC::Weak<WrapperWorld> world;
-    GC::Ptr<PlatformObject> wrapper;
+    GC::Ptr<JS::HostObject> wrapper;
 };
 
 static HashMap<GCAllocatedWrappable*, Vector<PreservedWrapper>>& non_main_world_preserved_wrappers()
@@ -78,7 +60,7 @@ bool Wrappable::is_supported_property_name(Utf16FlyString const& name) const
     return supported_property_names().contains_slow(name);
 }
 
-GC::Ref<PlatformObject> Wrappable::create_wrapper(JS::Realm& wrapper_realm)
+GC::Ref<JS::HostObject> Wrappable::create_wrapper(JS::Realm& wrapper_realm)
 {
     return create_wrapper_for_wrappable(wrapper_realm, GC::Ref { *this });
 }
@@ -105,26 +87,27 @@ void GCAllocatedWrappable::visit_edges(GC::Cell::Visitor& visitor)
     }
 }
 
-GC::Ptr<PlatformObject> Wrappable::cached_main_world_wrapper(WrapperWorld const& world) const
+GC::Ptr<JS::HostObject> Wrappable::cached_main_world_wrapper(WrapperWorld const& world) const
 {
+    // NB: set_cached_main_world_wrapper() verified that the wrapper belongs to the main world when it cached it, so a
+    //     read only walks to the wrapper's realm again in debug builds.
     VERIFY(world.is_main_world());
-    if (m_main_world_wrapper)
-        VERIFY(&host_defined_wrapper_world(m_main_world_wrapper->realm()) == &world);
+    ASSERT(!m_main_world_wrapper || &host_defined_wrapper_world(m_main_world_wrapper->shape().realm()) == &world);
     return m_main_world_wrapper.ptr();
 }
 
-GC::Ptr<PlatformObject> Wrappable::cached_main_world_wrapper() const
+GC::Ptr<JS::HostObject> Wrappable::cached_main_world_wrapper() const
 {
     return m_main_world_wrapper.ptr();
 }
 
-void Wrappable::set_cached_main_world_wrapper(PlatformObject& wrapper)
+void Wrappable::set_cached_main_world_wrapper(JS::HostObject& wrapper)
 {
-    VERIFY(wrapper.realm().host_defined());
-    auto& wrapper_world = host_defined_wrapper_world(wrapper.realm());
+    VERIFY(wrapper.shape().realm().host_defined());
+    auto& wrapper_world = host_defined_wrapper_world(wrapper.shape().realm());
     VERIFY(wrapper_world.is_main_world());
     if (m_main_world_wrapper) {
-        VERIFY(&host_defined_wrapper_world(m_main_world_wrapper->realm()) == &wrapper_world);
+        VERIFY(&host_defined_wrapper_world(m_main_world_wrapper->shape().realm()) == &wrapper_world);
         VERIFY(m_main_world_wrapper.ptr().ptr() == &wrapper);
         return;
     }
@@ -132,20 +115,31 @@ void Wrappable::set_cached_main_world_wrapper(PlatformObject& wrapper)
     m_main_world_wrapper = wrapper;
 }
 
-void Wrappable::clear_cached_main_world_wrapper(PlatformObject const& wrapper)
+void Wrappable::clear_cached_main_world_wrapper(JS::HostObject const& wrapper)
 {
     if (!m_main_world_wrapper || m_main_world_wrapper.ptr().ptr() == &wrapper)
         m_main_world_wrapper = nullptr;
 }
 
-GC::Ref<PlatformObject> create_global_object_wrapper(JS::Realm& wrapper_realm, GC::Ref<Wrappable> wrappable)
+// Until cache_global_object_wrapper() runs for its realm, a new realm is reachable only through the realm execution
+// context that creating it returned, which the GC does not see once it is off the execution context stack. Its global
+// object wrapper keeps it alive through the wrapper's shape, so the wrapper stays rooted until then. The realm's agent
+// holds the root, so that a realm whose setup never finishes does not leave a root behind that outlives its VM's heap.
+static Vector<GC::Root<JS::HostObject>>& global_object_wrappers_of_realms_being_set_up(JS::Realm& realm)
+{
+    return static_cast<HTML::Agent&>(*realm.vm().agent()).global_object_wrappers_of_realms_being_set_up;
+}
+
+GC::Ref<JS::HostObject> create_global_object_wrapper(JS::Realm& wrapper_realm, GC::Ref<Wrappable> wrappable)
 {
     // This helper is for JS::Realm::initialize_host_defined_realm() global
     // object callbacks. At that point HostDefined is not installed yet, so the
     // wrapper is created first and cache_global_object_wrapper() must be called
     // after the caller installs HostDefined/intrinsics for the new realm.
     VERIFY(!wrapper_realm.host_defined());
-    return wrappable->create_wrapper(wrapper_realm);
+    auto wrapper = wrappable->create_wrapper(wrapper_realm);
+    global_object_wrappers_of_realms_being_set_up(wrapper_realm).append(GC::make_root(wrapper));
+    return wrapper;
 }
 
 JS::Realm& wrapper_realm_for_node(WrapperWorld const& wrapper_world, JS::Realm& preferred_realm, DOM::Node& node)
@@ -169,17 +163,17 @@ JS::Realm& wrapper_realm_for_wrappable(WrapperWorld const& wrapper_world, JS::Re
         return wrapper_realm_for_node(wrapper_world, preferred_realm, *node);
 
     if (auto relevant_global_impl = wrappable->relevant_global_impl()) {
-        if (auto relevant_global_wrapper = relevant_global_impl->cached_main_world_wrapper(); relevant_global_wrapper && relevant_global_wrapper->realm().host_defined()) {
-            auto& relevant_global_world = host_defined_wrapper_world(relevant_global_wrapper->realm());
+        if (auto relevant_global_wrapper = relevant_global_impl->cached_main_world_wrapper(); relevant_global_wrapper && relevant_global_wrapper->shape().realm().host_defined()) {
+            auto& relevant_global_world = host_defined_wrapper_world(relevant_global_wrapper->shape().realm());
             if (&relevant_global_world == &wrapper_world)
-                return relevant_global_wrapper->realm();
+                return relevant_global_wrapper->shape().realm();
         }
     }
 
     return preferred_realm;
 }
 
-GC::Ref<PlatformObject> wrap(WrapperWorld& wrapper_world, JS::Realm& preferred_realm, GC::Ref<Wrappable> wrappable)
+GC::Ref<JS::HostObject> wrap(WrapperWorld& wrapper_world, JS::Realm& preferred_realm, GC::Ref<Wrappable> wrappable)
 {
     if (wrapper_world.is_main_world()) {
         if (auto cached_wrapper = wrappable->cached_main_world_wrapper(wrapper_world))
@@ -193,18 +187,13 @@ GC::Ref<PlatformObject> wrap(WrapperWorld& wrapper_world, JS::Realm& preferred_r
     }
 
     auto wrapper = wrappable->create_wrapper(actual_wrapper_realm);
-#ifndef NDEBUG
-    if (wrapper_world.is_main_world() && !is<DOM::Node>(wrappable.ptr()) && !wrappable->relevant_global_impl()) {
-        log_hintless_main_world_wrapper_realm_if_new(*wrappable, actual_wrapper_realm);
-    }
-#endif
     if (auto* element = as_if<DOM::Element>(wrappable.ptr()))
         set_prototype_from_custom_element_definition_if_needed(*element, wrapper);
     wrapper_world.set_wrapper(wrappable, wrapper);
     return wrapper;
 }
 
-GC::Ptr<PlatformObject> wrap(WrapperWorld& wrapper_world, JS::Realm& preferred_realm, GC::Ptr<Wrappable> wrappable)
+GC::Ptr<JS::HostObject> wrap(WrapperWorld& wrapper_world, JS::Realm& preferred_realm, GC::Ptr<Wrappable> wrappable)
 {
     if (!wrappable)
         return nullptr;
@@ -220,7 +209,7 @@ JS::Realm& this_value_realm(JS::Realm& fallback_realm, JS::Value this_value)
         return fallback_realm;
 
     auto& object = this_value.as_object();
-    if (auto* window_proxy = as_if<HTML::WindowProxy>(&object)) {
+    if (auto* window_proxy = HTML::WindowProxy::from_object(object)) {
         // NB: A Window hosted by another process has no realm in this one, so the caller's realm stands in.
         if (window_proxy->remote_window())
             return fallback_realm;
@@ -228,19 +217,6 @@ JS::Realm& this_value_realm(JS::Realm& fallback_realm, JS::Value this_value)
         auto& proxy_realm = object.shape().realm();
         if (!proxy_realm.host_defined())
             return fallback_realm;
-
-        // A main-world WindowProxy is created once, in the initial about:blank
-        // realm, then reused as globalThis across later navigations. Do not use
-        // that stale shape realm for receiver-realm decisions: HTML defines a
-        // WindowProxy's relevant realm as the realm of its current [[Window]].
-        //
-        // Isolated-world WindowProxy objects are created in their own world
-        // realm; keep those on the proxy's realm so cross-world wrapping stays
-        // isolated instead of leaking through the principal Window realm.
-        if (host_defined_wrapper_world(proxy_realm).is_main_world()) {
-            if (auto window = window_proxy->window())
-                return window->principal_realm();
-        }
     }
 
     return object.shape().realm();
@@ -253,9 +229,9 @@ JS::ThrowCompletionOr<void> set_prototype_of_cached_main_world_wrapper(Wrappable
         // an isolated-world prototype on any main-world wrapper. The agent
         // ownership invariant guarantees that two main-world cells cannot
         // legitimately meet here.
-        if (!wrapper->realm().host_defined() || !prototype.shape().realm().host_defined())
+        if (!wrapper->shape().realm().host_defined() || !prototype.shape().realm().host_defined())
             return {};
-        auto& wrapper_world = host_defined_wrapper_world(wrapper->realm());
+        auto& wrapper_world = host_defined_wrapper_world(wrapper->shape().realm());
         auto& prototype_world = host_defined_wrapper_world(prototype.shape().realm());
         if (!wrapper_world.is_main_world() || !prototype_world.is_main_world())
             return {};
@@ -264,10 +240,14 @@ JS::ThrowCompletionOr<void> set_prototype_of_cached_main_world_wrapper(Wrappable
     return {};
 }
 
-void preserve_wrapper(Wrappable& wrappable, PlatformObject& wrapper)
+void preserve_wrapper(Wrappable& wrappable, JS::HostObject& wrapper)
 {
+    // An object of an interface implemented in Rust keeps its wrappers alive itself, as wrapper_is_preserved() says.
+    if (wrappable.is_owned_by_rust_interface_object())
+        return;
+
     auto& gc_allocated_wrappable = as<GCAllocatedWrappable>(wrappable);
-    auto& world = host_defined_wrapper_world(wrapper.realm());
+    auto& world = host_defined_wrapper_world(wrapper.shape().realm());
 
     // Script can still run against a detached world's realm (e.g. a pending microtask after
     // WrapperWorld::detach()). Nothing in a detached world needs to survive GC, so preservation
@@ -292,14 +272,24 @@ void preserve_wrapper(Wrappable& wrappable, PlatformObject& wrapper)
     world.register_preserved_wrappable(gc_allocated_wrappable);
 }
 
-bool wrapper_is_preserved(PlatformObject const& wrapper)
+bool wrapper_is_preserved(JS::HostObject const& wrapper)
 {
+    // An object of an interface implemented in Rust keeps its wrapper in the main world alive itself. No other
+    // world keeps a wrapper of it alive.
+    if (JS::is_host_instance_of(wrapper, web_bindings_rust_interface_wrapper_host_class))
+        return host_defined_wrapper_world(wrapper.shape().realm()).is_main_world();
+
     auto const* wrappable = wrappable_impl_from(&wrapper);
     if (!wrappable)
         return false;
+
+    // NB: The wrappers of a Rust object that inherits from a C++ interface hold the C++ object it owns as their
+    //     wrappable.
+    if (wrappable->is_owned_by_rust_interface_object())
+        return host_defined_wrapper_world(wrapper.shape().realm()).is_main_world();
     auto const& gc_allocated_wrappable = as<GCAllocatedWrappable>(*wrappable);
 
-    auto& world = host_defined_wrapper_world(wrapper.realm());
+    auto& world = host_defined_wrapper_world(wrapper.shape().realm());
     if (world.is_main_world())
         return gc_allocated_wrappable.main_world_wrapper_is_preserved() && wrappable->m_main_world_wrapper.ptr().ptr() == &wrapper;
 
@@ -333,29 +323,34 @@ void GCAllocatedWrappable::clear_preserved_wrappers(WrapperWorld const& world)
 
 void cache_global_object_wrapper(JS::Realm& realm)
 {
-    auto* platform_object = as_if<PlatformObject>(&realm.global_object());
+    auto* platform_object = as_platform_object(realm.global_object());
     VERIFY(platform_object);
 
-    auto* wrappable = platform_object->wrappable_impl();
+    auto* wrappable = wrappable_impl_from(platform_object);
     VERIFY(wrappable);
 
     host_defined_wrapper_world(realm).set_wrapper(*wrappable, *platform_object);
+
+    global_object_wrappers_of_realms_being_set_up(realm).remove_all_matching([&](auto const& wrapper) {
+        return wrapper.ptr() == platform_object;
+    });
 }
 
+// NB: A WindowProxy is a platform object without a wrappable.
 Wrappable* wrappable_impl_from(JS::Object* object)
 {
-    auto* platform_object = as_if<PlatformObject>(object);
+    auto* platform_object = object ? as_platform_object(*object) : nullptr;
     if (!platform_object)
         return nullptr;
-    return platform_object->wrappable_impl();
+    return static_cast<Wrappable*>(platform_object->wrappable().ptr());
 }
 
 Wrappable const* wrappable_impl_from(JS::Object const* object)
 {
-    auto const* platform_object = as_if<PlatformObject>(object);
+    auto const* platform_object = object ? as_platform_object(*object) : nullptr;
     if (!platform_object)
         return nullptr;
-    return platform_object->wrappable_impl();
+    return static_cast<Wrappable const*>(platform_object->wrappable().ptr());
 }
 
 }

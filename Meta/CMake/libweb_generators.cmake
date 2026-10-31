@@ -58,12 +58,11 @@ function (generate_css_implementation)
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/PseudoElements.json"
     )
 
-    invoke_py_generator(
-        "TransformFunctions.cpp"
+    invoke_py_header_generator(
+        "TransformFunctions.h"
         "generate_libweb_css_transform_functions.py"
         "${LIBWEB_INPUT_FOLDER}/CSS/TransformFunctions.json"
         "CSS/TransformFunctions.h"
-        "CSS/TransformFunctions.cpp"
         arguments -j "${LIBWEB_INPUT_FOLDER}/CSS/TransformFunctions.json"
     )
 
@@ -210,27 +209,37 @@ function (generate_html_implementation)
     set(LIBWEB_ALL_GENERATED_HEADERS ${LIBWEB_ALL_GENERATED_HEADERS} PARENT_SCOPE)
 endfunction()
 
-function (generate_webgl_implementation)
-    set(LIBCOMPOSITING_INPUT_FOLDER "${LADYBIRD_SOURCE_DIR}/Libraries/LibCompositing")
+function (generate_picture_in_picture_implementation)
+    set(LIBWEB_INPUT_FOLDER "${CMAKE_CURRENT_SOURCE_DIR}")
 
     invoke_py_generator(
-        "WebGLContextProxy.cpp"
-        "generate_libweb_webgl_proxy.py"
-        "${LIBCOMPOSITING_INPUT_FOLDER}/WebGL/GLFunctions.json"
-        "WebGL/WebGLContextProxy.h"
-        "WebGL/WebGLContextProxy.cpp"
-        arguments -j "${LIBCOMPOSITING_INPUT_FOLDER}/WebGL/GLFunctions.json"
-        dependencies "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_webgl.py"
+        "PictureInPicturePlayerDOM.cpp"
+        "generate_dom_tree.py"
+        "${LIBWEB_INPUT_FOLDER}/PictureInPicture/PictureInPicturePlayer.html"
+        "PictureInPicture/PictureInPicturePlayerDOM.h"
+        "PictureInPicture/PictureInPicturePlayerDOM.cpp"
+        arguments -i "${LIBWEB_INPUT_FOLDER}/PictureInPicture/PictureInPicturePlayer.html"
+                  -s PictureInPicturePlayerDOM
+                  -n "Web::PictureInPicture"
+                  --html-tags "${LIBWEB_INPUT_FOLDER}/HTML/TagNames.h"
+                  --html-attributes "${LIBWEB_INPUT_FOLDER}/HTML/AttributeNames.h"
+                  --svg-tags "${LIBWEB_INPUT_FOLDER}/SVG/TagNames.h"
+                  --svg-attributes "${LIBWEB_INPUT_FOLDER}/SVG/AttributeNames.h"
+        dependencies "${LIBWEB_INPUT_FOLDER}/HTML/TagNames.h"
+                     "${LIBWEB_INPUT_FOLDER}/HTML/AttributeNames.h"
+                     "${LIBWEB_INPUT_FOLDER}/SVG/TagNames.h"
+                     "${LIBWEB_INPUT_FOLDER}/SVG/AttributeNames.h"
+                     "${LIBWEB_INPUT_FOLDER}/PictureInPicture/PictureInPicturePlayer.css"
     )
 
-    set(WEBGL_GENERATED_HEADERS
-       "WebGL/WebGLContextProxy.h"
+    set(PICTURE_IN_PICTURE_GENERATED_HEADERS
+       "PictureInPicture/PictureInPicturePlayerDOM.h"
     )
-    list(TRANSFORM WEBGL_GENERATED_HEADERS PREPEND "${CMAKE_CURRENT_BINARY_DIR}/")
+    list(TRANSFORM PICTURE_IN_PICTURE_GENERATED_HEADERS PREPEND "${CMAKE_CURRENT_BINARY_DIR}/")
     if (ENABLE_INSTALL_HEADERS)
-        install(FILES ${WEBGL_GENERATED_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibWeb/WebGL")
+        install(FILES ${PICTURE_IN_PICTURE_GENERATED_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/LibWeb/PictureInPicture")
     endif()
-    list(APPEND LIBWEB_ALL_GENERATED_HEADERS ${WEBGL_GENERATED_HEADERS})
+    list(APPEND LIBWEB_ALL_GENERATED_HEADERS ${PICTURE_IN_PICTURE_GENERATED_HEADERS})
     set(LIBWEB_ALL_GENERATED_HEADERS ${LIBWEB_ALL_GENERATED_HEADERS} PARENT_SCOPE)
 endfunction()
 
@@ -302,18 +311,31 @@ function (generate_js_bindings target)
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/default_values.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/extended_attributes.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/global_mixins.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/glue_headers.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/includes.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/interface_declaration.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/interfaces.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/intrinsics.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/iterables.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/json_conversions.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/named_and_indexed_properties.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/namespaces.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/operations.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/overload_resolution.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/realms.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_bindings.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_members.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_names.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_overloads.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_to_idl_value.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_to_js_value.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_types.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/rust_usage.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/security_checks.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/structured_serialize.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_idl_value.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/to_js_value.py"
+        "${LADYBIRD_SOURCE_DIR}/Meta/Generators/libweb_bindings/wrappers.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Utils/lexer.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Utils/utils.py"
         "${LADYBIRD_SOURCE_DIR}/Meta/Utils/webidl_parser.py")
@@ -370,8 +392,11 @@ function (generate_js_bindings target)
         set(LIBWEB_ALL_PARSED_IDL_FILES_ARGUMENT "@${CMAKE_CURRENT_BINARY_DIR}/all_parsed_idl_files.txt")
     endif()
 
+    # The bindings of the interfaces implemented in Rust, which libweb_bindings_rust includes.
+    set(rust_bindings_source "${CMAKE_CURRENT_BINARY_DIR}/Bindings/RustBindings.rs")
+
     add_custom_command(
-        OUTPUT ${LIBWEB_ALL_BINDINGS_SOURCES} ${LIBWEB_ALL_COMMON_BINDINGS_HEADERS} ${exposed_interface_sources}
+        OUTPUT ${LIBWEB_ALL_BINDINGS_SOURCES} ${LIBWEB_ALL_COMMON_BINDINGS_HEADERS} ${exposed_interface_sources} ${rust_bindings_source}
         COMMAND "${CMAKE_COMMAND}" -E make_directory "Bindings"
         COMMAND "${Python3_EXECUTABLE}" "${bindings_generator}" -o "Bindings"
                 --common-output-path "${LIBWEB_COMMON_BINDINGS_DIRECTORY}"
@@ -383,7 +408,7 @@ function (generate_js_bindings target)
         DEPENDS ${bindings_generator_dependencies} ${LIBWEB_ALL_IDL_FILES} ${LIBWEB_ALL_PARSED_IDL_FILES}
     )
 
-    add_custom_target(generate_bindings DEPENDS ${LIBWEB_ALL_BINDINGS_SOURCES} ${LIBWEB_ALL_COMMON_BINDINGS_HEADERS})
+    add_custom_target(generate_bindings DEPENDS ${LIBWEB_ALL_BINDINGS_SOURCES} ${LIBWEB_ALL_COMMON_BINDINGS_HEADERS} ${rust_bindings_source})
     add_dependencies(ladybird_codegen_accumulator generate_bindings)
     add_dependencies(${target} generate_bindings)
     add_dependencies(generate_bindings ${generated_idl_targets})

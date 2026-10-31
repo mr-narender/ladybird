@@ -8,7 +8,6 @@ use super::reconcile::BoxNodeWriter;
 use super::scroll_state::NO_SCROLL_STATE_SLOT;
 use super::*;
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
-use crate::painting::host::FfiVisualContextHostCallbacks;
 use crate::painting::paintable_data::*;
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::{PaintableRowsRead, PaintableRowsWrite};
@@ -16,7 +15,6 @@ use libgfx_rust::FloatPoint;
 
 pub(crate) struct BoxBuildEnvironment<'a, Arena> {
     pub layout_arena: &'a Arena,
-    pub callbacks: &'a FfiVisualContextHostCallbacks,
     pub pixel_ratio: f64,
 }
 
@@ -36,6 +34,10 @@ pub(crate) struct PaintableVisualContextAssignment {
     pub accumulated_visual_context_for_descendants: ContextRef,
     pub has_non_invertible_css_transform: bool,
     pub record: PaintableVisualContextRecord,
+    pub node_handles: BoxVisualContextNodeHandles,
+    /// The bounds of the SVG filter the box references, as the build gathered them, which the row takes as the
+    /// assignment applies. None for an assignment no build gathered.
+    pub gathered_svg_filter_bounds: Option<Option<crate::layout::used_values::FfiCssPixelRect>>,
 }
 
 impl PaintableVisualContextAssignment {
@@ -50,11 +52,16 @@ impl PaintableVisualContextAssignment {
             accumulated_visual_context_for_descendants: data.accumulated_visual_context_for_descendants,
             has_non_invertible_css_transform: data.has_flag(PaintableFlag::HasNonInvertibleCssTransform),
             record,
+            node_handles: BoxVisualContextNodeHandles::default(),
+            gathered_svg_filter_bounds: None,
         }
     }
 
     pub(crate) fn apply(self, layout_arena: &mut impl PaintableRowsWrite) {
         use crate::painting::record::damage::PaintDamage;
+        if let Some(svg_filter_bounds) = self.gathered_svg_filter_bounds {
+            super::node_values::set_svg_filter_bounds(layout_arena, self.slot, svg_filter_bounds);
+        }
         // Commands and hit-test items name the row's own nodes; the scroll metadata of every
         // descendant names the nearest scroll node above it.
         let (scroll_nodes_changed, non_invertible_transform_flipped) = match layout_arena
@@ -72,7 +79,7 @@ impl PaintableVisualContextAssignment {
             None => (false, false),
         };
         {
-            let data = layout_arena.paintable_data_mut(self.slot);
+            let mut data = layout_arena.paintable_data_mut(self.slot);
             data.establishes_stacking_context = self.record.stacking_context.establishes_stacking_context;
             data.enclosing_scroll_node_index = self.enclosing_scroll_node_index;
             data.own_scroll_node_index = self.own_scroll_node_index;
@@ -85,7 +92,7 @@ impl PaintableVisualContextAssignment {
                 self.has_non_invertible_css_transform,
             );
         }
-        layout_arena.set_paintable_visual_context_record(self.slot, self.record);
+        layout_arena.set_paintable_visual_context_record(self.slot, self.record, self.node_handles);
         if scroll_nodes_changed {
             layout_arena.push_paint_damage(self.slot, PaintDamage::ALL_PRODUCERS);
             layout_arena.push_paint_damage_to_paint_subtree(self.slot, PaintDamage::SCROLL_METADATA);
@@ -235,11 +242,10 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     sink: &mut BoxNodeWriter<'_>,
     slot: NodeSlotId,
     inherited: DescendantVisualContexts,
-    may_be_root_element: bool,
     anchor_scroll_shift_resolver: &dyn AnchorScrollShiftResolver,
 ) -> PaintableVisualContextAssignment {
     let layout_arena = env.layout_arena;
-    let facts = super::build::BoxFacts::gather(layout_arena, slot, env.pixel_ratio, true);
+    let (facts, svg_filter_bounds) = super::build::BoxFacts::gather(layout_arena, slot, env.pixel_ratio, true);
     let position = crate::painting::style_queries::position(layout_arena, slot);
     let is_fixed = position == crate::css::css_enums::positioning::FIXED;
     let is_absolute = position == crate::css::css_enums::positioning::ABSOLUTE;
@@ -256,9 +262,6 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         PaintableVisualContextRecord {
             inherited_input: inherited,
             output_for_descendants: inherited,
-            node_handles: BoxVisualContextNodeHandles::default(),
-            has_mask_nodes: false,
-            may_be_root_element,
             owns_geometry_dependent_nodes: false,
             subtree_may_own_geometry_dependent_nodes: false,
             stacking_context: stacking_context_facts,
@@ -267,6 +270,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
     assignment.enclosing_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     assignment.own_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     assignment.node_identity = 0;
+    assignment.gathered_svg_filter_bounds = Some(svg_filter_bounds);
 
     let mut nearest_scroll_nodes_for_descendants = if is_fixed {
         NearestScrollNodeIndices {
@@ -355,11 +359,17 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
 
     let mut sticky_scroll_node_index = VISUAL_VIEWPORT_NODE_INDEX;
     if creates_sticky_scroll_node {
+        // The scroll state fills in the geometry once the tree is built. The scroller is the nearest scroll node
+        // above any enclosing sticky boxes, as the scroll state resolves it.
+        let (scroller, parent_sticky) = match &sink.spatial_node_at(nearest_ancestor_scroll_node_index).data {
+            SpatialData::Sticky(parent) => (parent.scroller, Some(nearest_ancestor_scroll_node_index)),
+            _ => (nearest_ancestor_scroll_node_index, None),
+        };
         own_state = sink.append_spatial_node_under(
             own_state,
             SpatialData::Sticky(StickyData::unconstrained(
-                nearest_ancestor_scroll_node_index,
-                None,
+                scroller,
+                parent_sticky,
                 NO_SCROLL_STATE_SLOT,
                 slot,
                 nearest_ancestor_scroll_node_index,
@@ -499,18 +509,17 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         append_clip_to_own_and_positioned_descendant_contexts!(ClipNodeData::Path(facts.clip_path_data().unwrap()));
     }
 
-    // A backdrop filter is limited to the box's rounded border box in the box's own space, and a clip
-    // path clips the filtered backdrop along with the content, so its layer sits under the transform
-    // and clip nodes rather than above them.
-    if effects_layer_is_inside_transform_and_clips {
-        append_shared_effect!(EffectNodeData::Effects(facts.effects_data().unwrap()));
-    }
-
-    if !facts.mask_layers.is_empty() {
-        assignment.record.has_mask_nodes = true;
-    }
     for mask_layer in &facts.mask_layers {
         append_shared_effect!(EffectNodeData::Mask(*mask_layer));
+    }
+
+    // https://drafts.fxtf.org/filter-effects-2/#backdrop-filter-operation
+    // A backdrop filter is limited to the box's rounded border box in the box's own space, and a clip
+    // path clips the filtered backdrop along with the content, so its layer sits under the transform
+    // and clip nodes rather than above them. Masks apply to the filtered backdrop too, so the layer
+    // also sits under the box's masks, and replay draws the backdrop into the outermost mask's layer.
+    if effects_layer_is_inside_transform_and_clips {
+        append_shared_effect!(EffectNodeData::Effects(facts.effects_data().unwrap()));
     }
 
     if facts.needs_compositor_background_color_effect {
@@ -535,6 +544,9 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         && let Some(overflow_clip) = facts.overflow_clip
     {
         state_for_descendants = sink.append_clip_node_under(state_for_descendants, ClipNodeData::Rect(overflow_clip));
+        if let Some(contour) = facts.overflow_clip_contour {
+            state_for_descendants = sink.append_clip_node_under(state_for_descendants, ClipNodeData::Path(contour));
+        }
     }
 
     if paintable_geometry::has_scrollable_overflow(layout_arena, slot) {
@@ -553,7 +565,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
         );
         let scroll_node_index = state_for_descendants.spatial;
         assignment.own_scroll_node_index = scroll_node_index;
-        assignment.node_identity = env.callbacks.node_identity(layout_arena.shell_if_live(slot));
+        assignment.node_identity = layout_arena.unique_node_ids().id(slot);
         nearest_scroll_nodes_for_descendants = NearestScrollNodeIndices {
             stopping_at_fixed_position_ancestors: scroll_node_index,
             continuing_through_fixed_position_ancestors: scroll_node_index,
@@ -566,7 +578,7 @@ pub(crate) fn build_box_visual_context_nodes<Arena: PaintableRowsRead>(
             .node_style_if_live(slot)
             .is_some_and(|style| style.has_scroll_snap_alignment())
     {
-        assignment.node_identity = env.callbacks.node_identity(layout_arena.shell_if_live(slot));
+        assignment.node_identity = layout_arena.unique_node_ids().id(slot);
     }
 
     // Positioned descendants that escape into a viewport-establishing containing block lay

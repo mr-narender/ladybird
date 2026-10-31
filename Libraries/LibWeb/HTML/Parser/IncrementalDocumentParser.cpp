@@ -12,6 +12,9 @@
 #include <LibTextCodec/Decoder.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
+#include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/IncrementalDocumentParser.h>
@@ -25,16 +28,18 @@ static Utf16String utf16_string_from_standardized_encoding_label(StringView labe
     return Utf16String::from_ascii_without_validation(label.bytes());
 }
 
-GC::Ref<IncrementalDocumentParser> IncrementalDocumentParser::create(GC::Ref<DOM::Document> document, GC::Ref<Fetch::Infrastructure::Body> body, URL::URL url, Optional<MimeSniff::MimeType> mime_type)
+GC::Ref<IncrementalDocumentParser> IncrementalDocumentParser::create(GC::Ref<DOM::Document> document, Fetch::Infrastructure::ResponseView const& response, GC::Ptr<DOM::Document> container_document)
 {
-    return GC::Heap::the().allocate<IncrementalDocumentParser>(document, body, move(url), move(mime_type));
+    return GC::Heap::the().allocate<IncrementalDocumentParser>(document, response, container_document);
 }
 
-IncrementalDocumentParser::IncrementalDocumentParser(GC::Ref<DOM::Document> document, GC::Ref<Fetch::Infrastructure::Body> body, URL::URL url, Optional<MimeSniff::MimeType> mime_type)
+IncrementalDocumentParser::IncrementalDocumentParser(GC::Ref<DOM::Document> document, Fetch::Infrastructure::ResponseView const& response, GC::Ptr<DOM::Document> container_document)
     : m_document(document)
-    , m_body(body)
-    , m_url(move(url))
-    , m_mime_type(move(mime_type))
+    , m_container_document(container_document)
+    , m_body(response.body())
+    , m_url(response.url().value())
+    , m_mime_type(Fetch::Infrastructure::extract_mime_type(response.header_list()))
+    , m_response_header_list(response.header_list())
 {
 }
 
@@ -42,6 +47,7 @@ void IncrementalDocumentParser::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_document);
+    visitor.visit(m_container_document);
     visitor.visit(m_body);
     visitor.visit(m_parser);
 }
@@ -56,8 +62,9 @@ void IncrementalDocumentParser::start()
     // FIXME: The spec allows starting the parse after 500 ms or 1024 bytes, whichever comes first.
     // We only honor the byte threshold.
     auto parser = GC::Ref { *this };
-    m_body->wait_for_sniff_bytes(GC::create_function(GC::Heap::the(), [parser](ReadonlyBytes sniff_bytes) {
-        parser->initialize_parser(sniff_bytes);
+    m_body->wait_for_sniff_bytes(GC::create_function(GC::Heap::the(), [parser](Web::Fetch::Infrastructure::Body::SniffBytes sniff_bytes) {
+        // A failed response initializes the parser too.
+        parser->initialize_parser(sniff_bytes.bytes);
     }));
 }
 
@@ -80,7 +87,7 @@ void IncrementalDocumentParser::initialize_parser(ReadonlyBytes sniff_bytes)
     if (m_document->has_encoding()) {
         standardized_encoding = TextCodec::get_standardized_encoding(m_document->encoding().value());
     } else {
-        auto [encoding, confidence] = run_encoding_sniffing_algorithm(m_document, sniff_bytes, m_mime_type);
+        auto [encoding, confidence] = run_encoding_sniffing_algorithm(m_document, sniff_bytes, m_mime_type, m_container_document);
         standardized_encoding = TextCodec::get_standardized_encoding(encoding);
         encoding_confidence = confidence;
     }
@@ -180,6 +187,20 @@ void IncrementalDocumentParser::process_body_chunk(ByteBuffer bytes)
         m_input_bytes.append(bytes);
 
     feed_parser();
+    process_link_headers_after_first_task();
+}
+
+void IncrementalDocumentParser::process_link_headers_after_first_task()
+{
+    if (!m_response_header_list)
+        return;
+
+    // https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-html
+    // The first task that the networking task source places on the task queue while fetching runs must process link
+    // headers given document, navigationParams's response, and "media", after the task has been processed by the HTML
+    // parser.
+    auto response_header_list = m_response_header_list.release_nonnull();
+    HTMLLinkElement::process_link_headers(m_document, response_header_list, m_url, HTMLLinkElement::LinkHeaderPhase::Media);
 }
 
 static size_t encoding_independent_prefix_length(ReadonlyBytes bytes)
@@ -251,6 +272,8 @@ void IncrementalDocumentParser::process_end_of_body()
     // previous document alive until the new one has finished loading. Blink, WebKit, and Gecko all do this too.
     m_body = nullptr;
     m_body_is_exhausted = true;
+    if (m_parser)
+        m_parser->did_exhaust_streaming_body({});
 
     if (!should_continue()) {
         discard_input_bytes();
@@ -260,6 +283,7 @@ void IncrementalDocumentParser::process_end_of_body()
     // Bytes held back for a still-possible encoding declaration are fed first; the implied EOF character waits for
     // them in finish_body().
     feed_parser();
+    process_link_headers_after_first_task();
 }
 
 void IncrementalDocumentParser::finish_body()
@@ -272,7 +296,7 @@ void IncrementalDocumentParser::finish_body()
     VERIFY(m_body_is_exhausted);
     VERIFY(undecoded_input_bytes().is_empty());
 
-    auto decoded = m_decoder->finish_to_utf16().release_value_but_fixme_should_propagate_errors();
+    auto decoded = m_decoder->decode({}, TextCodec::Flush::Yes).release_value_but_fixme_should_propagate_errors();
     append_decoded(decoded);
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-html
@@ -294,9 +318,9 @@ ErrorOr<bool> IncrementalDocumentParser::change_encoding(StringView new_encoding
     auto decoder = make<TextCodec::StreamingDecoder>(new_encoding, TextCodec::IgnoreBOM::No, TextCodec::ErrorMode::Replacement);
 
     Utf16StringBuilder builder;
-    builder.append(TRY(decoder->to_utf16(decoded_input_bytes())));
+    builder.append(TRY(decoder->decode(decoded_input_bytes())));
     if (m_processed_implied_eof)
-        builder.append(TRY(decoder->finish_to_utf16()));
+        builder.append(TRY(decoder->decode({}, TextCodec::Flush::Yes)));
     auto redecoded_source = builder.to_string();
 
     auto current_source = m_processed_implied_eof ? m_document->source().utf16_view() : m_source.view();
@@ -324,7 +348,7 @@ void IncrementalDocumentParser::decode_and_process(size_t length)
     auto undecoded_bytes = undecoded_input_bytes();
     VERIFY(length <= undecoded_bytes.size());
 
-    auto decoded = m_decoder->to_utf16(undecoded_bytes.trim(length)).release_value_but_fixme_should_propagate_errors();
+    auto decoded = m_decoder->decode(undecoded_bytes.trim(length)).release_value_but_fixme_should_propagate_errors();
 
     // Count the bytes as converted before running the parser: a script it runs can deliver another body chunk, and
     // feed_parser() would otherwise convert these a second time.
@@ -391,7 +415,6 @@ void IncrementalDocumentParser::pump()
     if (m_parser->stopped())
         return;
 
-    // FIXME: Process link headers (read-html step 3, third paragraph) after the first parser pass.
     if (m_parser->tokenizer().is_input_stream_closed()) {
         m_parser->run_until_completion();
         return;

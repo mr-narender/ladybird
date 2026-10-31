@@ -15,6 +15,7 @@ pub enum ComputedSizeKind {
     MinContent,
     MaxContent,
     FitContent,
+    Stretch,
     None,
 }
 
@@ -26,6 +27,11 @@ pub enum ComputedSizeKind {
 pub struct ComputedStyleValueHandle {
     pub pointer: *const std::ffi::c_void,
 }
+
+// SAFETY: A non-null handle owns an Arc reference to immutable style value data and only exposes
+// shared access to it, as `RetainedStyleValueData` does.
+unsafe impl Send for ComputedStyleValueHandle where crate::css::style_value::StyleValueData: Send + Sync {}
+unsafe impl Sync for ComputedStyleValueHandle where crate::css::style_value::StyleValueData: Send + Sync {}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -74,12 +80,26 @@ pub struct AlignmentValues {
     pub align_content: u8,
     pub align_items: u8,
     pub align_self: u8,
+    pub align_items_is_last_baseline: bool,
+    pub align_self_is_last_baseline: bool,
     pub justify_content: u8,
     pub justify_items: u8,
     pub justify_self: u8,
+    /// The explicit overflow alignment: one of the OVERFLOW_ALIGNMENT_* values.
+    pub align_items_overflow: u8,
+    pub justify_items_overflow: u8,
+    pub align_self_overflow: u8,
+    pub justify_self_overflow: u8,
     pub column_gap: ComputedGap,
     pub row_gap: ComputedGap,
 }
+
+/// No explicit overflow alignment.
+pub const OVERFLOW_ALIGNMENT_DEFAULT: u8 = 0;
+/// The 'safe' overflow alignment.
+pub const OVERFLOW_ALIGNMENT_SAFE: u8 = 1;
+/// The 'unsafe' overflow alignment.
+pub const OVERFLOW_ALIGNMENT_UNSAFE: u8 = 2;
 
 /// A computed length-percentage-or-auto value.
 #[repr(C)]
@@ -174,6 +194,8 @@ pub struct BoxValues {
     pub overflow_x: u8,
     pub overflow_y: u8,
     pub box_sizing: u8,
+    pub field_sizing: u8,
+    pub baseline_source: u8,
     pub resize: u8,
     pub text_overflow: u8,
     pub unicode_bidi: u8,
@@ -250,6 +272,7 @@ pub struct BorderValues {
     pub corner_top_left_shape: f64,
     pub corner_top_right_shape: f64,
     pub border_image_source: ComputedStyleValueHandle,
+    pub border_shape: ComputedStyleValueHandle,
     pub border_image_slice: ComputedStyleValueHandle,
     pub border_image_width: ComputedStyleValueHandle,
     pub border_image_outset: ComputedStyleValueHandle,
@@ -293,6 +316,13 @@ pub struct ComputedOverflowClipMargin {
     pub bottom: ComputedOverflowClipMarginSide,
 }
 
+/// Property IDs to treat as included in will-change due to animations.
+#[repr(C)]
+pub struct RetainedWillChangePropertyList {
+    pub pointer: *mut u16,
+    pub length: usize,
+}
+
 /// Canonical non-inherited values which do not form a more specific group.
 #[repr(C)]
 pub struct MiscResetValues {
@@ -321,12 +351,6 @@ pub struct MiscResetValues {
     pub object_position_x: ComputedStyleValueHandle,
     pub object_position_y: ComputedStyleValueHandle,
     pub view_transition_name: ComputedStyleValueHandle,
-    pub touch_action_allow_left: bool,
-    pub touch_action_allow_right: bool,
-    pub touch_action_allow_up: bool,
-    pub touch_action_allow_down: bool,
-    pub touch_action_allow_pinch_zoom: bool,
-    pub touch_action_allow_other: bool,
     pub scroll_behavior: u8,
     pub scroll_snap_align_block: u8,
     pub scroll_snap_align_inline: u8,
@@ -335,10 +359,13 @@ pub struct MiscResetValues {
     pub scroll_snap_strictness: u8,
     pub scrollbar_gutter: u8,
     pub scrollbar_width: u8,
+    pub overscroll_behavior_x: u8,
+    pub overscroll_behavior_y: u8,
     pub shape_image_threshold: f64,
     pub shape_margin: ComputedStyleValueHandle,
     pub shape_outside: ComputedStyleValueHandle,
     pub will_change: ComputedStyleValueHandle,
+    pub implicit_will_change: RetainedWillChangePropertyList,
 }
 
 /// A computed text-indent value, mirroring the C++ TextIndentData layout:
@@ -361,6 +388,7 @@ pub struct InheritedTextLayoutFacts {
     pub white_space_collapse: u8,
     pub text_wrap_mode: u8,
     pub word_break: u8,
+    pub line_break: u8,
     pub tab_size_is_number: bool,
     pub letter_spacing: crate::css::css_pixels::CssPixels,
     pub word_spacing: crate::css::css_pixels::CssPixels,
@@ -393,6 +421,7 @@ pub struct InheritedTextValues {
     pub white_space_collapse: u8,
     pub text_wrap_mode: u8,
     pub word_break: u8,
+    pub line_break: u8,
     pub tab_size_is_number: bool,
     pub letter_spacing: crate::css::css_pixels::CssPixels,
     pub word_spacing: crate::css::css_pixels::CssPixels,
@@ -431,6 +460,8 @@ pub struct AnimationValues {
     pub animation_fill_mode: ComputedStyleValueHandle,
     pub animation_iteration_count: ComputedStyleValueHandle,
     pub animation_play_state: ComputedStyleValueHandle,
+    pub animation_range_start: ComputedStyleValueHandle,
+    pub animation_range_end: ComputedStyleValueHandle,
     pub animation_timeline: ComputedStyleValueHandle,
     pub animation_timing_function: ComputedStyleValueHandle,
     pub scroll_timeline_name: ComputedStyleValueHandle,
@@ -493,6 +524,10 @@ pub struct FontValues {
     pub font_zero_advance: f32,
     pub first_available_font: *const std::ffi::c_void,
     pub font_cascade_list: libgfx_rust::font::FontCascadeListHandle,
+    /// The same cascade, frozen at publication: what the render pipeline reads. The live
+    /// list beside it is the document's, and only the document thread may look a code point
+    /// up in it.
+    pub frozen_font_list: libgfx_rust::font::FrozenFontListRef,
     pub font_weight: f64,
     pub font_width: f64,
     pub math_shift: u8,
@@ -632,6 +667,7 @@ pub struct GridValues {
     pub grid_column_end_style_value: ComputedStyleValueHandle,
     pub grid_row_start_style_value: ComputedStyleValueHandle,
     pub grid_row_end_style_value: ComputedStyleValueHandle,
+    pub fit_tolerance_style_value: ComputedStyleValueHandle,
 }
 
 /// Layout of the non-inherited SVG geometry and painting properties.
@@ -694,6 +730,11 @@ pub struct RetainedComputedResolvedTransformList {
     pub length: usize,
 }
 
+// SAFETY: The list owns its array, which is written once as the style group is built and only read after, like the
+// style values its transforms name.
+unsafe impl Send for RetainedComputedResolvedTransformList where ComputedResolvedTransform: Send {}
+unsafe impl Sync for RetainedComputedResolvedTransformList where ComputedResolvedTransform: Sync {}
+
 /// Layout of the computed transform properties.
 #[repr(C)]
 pub struct TransformValues {
@@ -712,6 +753,13 @@ pub struct TransformValues {
     pub perspective_px: i32,
     pub perspective_origin_x: ComputedStyleValueHandle,
     pub perspective_origin_y: ComputedStyleValueHandle,
+    /// Whether offset-path is not none, which is all elements without an offset path pay for.
+    pub has_offset_path: bool,
+    pub offset_path: ComputedStyleValueHandle,
+    pub offset_distance: ComputedStyleValueHandle,
+    pub offset_position: ComputedStyleValueHandle,
+    pub offset_anchor: ComputedStyleValueHandle,
+    pub offset_rotate: ComputedStyleValueHandle,
 }
 
 /// One paint-ready CSS filter operation.
@@ -803,7 +851,7 @@ pub struct RetainedPositionAreaList {
 #[repr(C)]
 pub struct ComputedPositionTryFallback {
     pub name: crate::css::retained_fly_string::RetainedUtf16FlyString,
-    pub tactics: [u8; 3],
+    pub tactics: [u8; 5],
     pub tactic_count: usize,
     pub has_position_area: bool,
     pub position_area: RetainedPositionAreaList,
@@ -873,6 +921,8 @@ pub struct InheritedUIValues {
     pub accent_color: ComputedColorOrAuto,
     pub cursor: RetainedComputedCursorList,
     pub pointer_events: u8,
+    pub forced_color_adjust: u8,
+    pub interpolate_size: u8,
     pub scrollbar_color: ComputedScrollbarColor,
     pub color_scheme: u8,
     pub color_schemes: crate::css::retained_fly_string::RetainedUtf16FlyStringList,
@@ -952,6 +1002,7 @@ pub const STYLE_GROUP_INDEX_ANCHOR: usize = 10;
 pub const STYLE_GROUP_INDEX_EFFECTS: usize = 11;
 pub const STYLE_GROUP_INDEX_MASK: usize = 12;
 pub const STYLE_GROUP_INDEX_TEXT_RESET: usize = 13;
+pub const STYLE_GROUP_INDEX_CONTENT: usize = 14;
 pub const STYLE_GROUP_INDEX_TRANSFORM: usize = 15;
 pub const STYLE_GROUP_INDEX_BACKGROUND: usize = 16;
 pub const STYLE_GROUP_INDEX_BORDER: usize = 17;

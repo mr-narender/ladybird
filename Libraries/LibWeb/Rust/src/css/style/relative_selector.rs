@@ -14,13 +14,10 @@
 
 use super::fast_hash::FastMap as HashMap;
 
-use super::capacity::capacity_bytes;
 use super::index::LocalFeatureKey;
 use super::partial_view::Lookup;
 use super::program::SelectorProgramID;
 use super::selector::Incomplete;
-#[cfg(test)]
-use super::selector::InverseStep;
 use super::selector::SelectorNodeID;
 use super::tree::StyleNodeID;
 use super::tree::StyleNodeTree;
@@ -45,20 +42,6 @@ pub enum RelativeAxis {
     NextSiblingSubtree,
     /// `:has(~ .row .cell)`: the witness is somewhere under one of the following siblings.
     FollowingSiblingSubtree,
-}
-
-impl RelativeAxis {
-    /// The inverse step from a possible witness back to its possible anchors.
-    #[cfg(test)]
-    #[must_use]
-    pub fn inverse_step(self) -> InverseStep {
-        match self {
-            Self::Descendant => InverseStep::AnchorAncestors,
-            Self::Child => InverseStep::AnchorParent,
-            Self::NextSibling | Self::NextSiblingSubtree => InverseStep::AnchorPreviousSibling,
-            Self::FollowingSibling | Self::FollowingSiblingSubtree => InverseStep::AnchorPrecedingSiblings,
-        }
-    }
 }
 
 /// A compiled relative query.
@@ -284,31 +267,19 @@ pub(super) enum WitnessEffect {
 /// such evaluation that completed with no witness. An evaluation of an overlaid or hypothetical
 /// state must never write here, because that is the one way to plant an entry whose "was true"
 /// half is false - the read-side re-verification only re-establishes the "is true now" half.
+#[derive(Clone, Default)]
 pub struct RelationalWitnesses {
     entries: HashMap<RelationalWitnessKey, StyleNodeID>,
-    admitting: bool,
-}
-
-impl Default for RelationalWitnesses {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::default(),
-            admitting: true,
-        }
-    }
 }
 
 impl RelationalWitnesses {
     /// Retain `witness` for `key`, returning whether it was stored. A full table sheds the
     /// entries whose anchor or witness identity has been retired before refusing.
     pub fn retain(&mut self, key: RelationalWitnessKey, witness: StyleNodeID, tree: &StyleNodeTree) -> bool {
-        if !self.admitting || self.entries.len() >= MAX_RETAINED_WITNESSES {
+        if self.entries.len() >= MAX_RETAINED_WITNESSES {
             if let Some(retained) = self.entries.get_mut(&key) {
                 *retained = witness;
                 return true;
-            }
-            if !self.admitting {
-                return false;
             }
             self.entries
                 .retain(|entry, retained| tree.is_live(entry.anchor) && tree.is_live(*retained));
@@ -326,20 +297,6 @@ impl RelationalWitnesses {
 
     pub fn clear_all(&mut self) {
         self.entries = HashMap::default();
-    }
-
-    pub(super) fn set_admitting(&mut self, admitting: bool) {
-        self.admitting = admitting;
-    }
-
-    #[must_use]
-    pub fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.entries];
-            cached [];
-            nested [];
-            skip [self.admitting];
-        }
     }
 }
 
@@ -426,8 +383,6 @@ pub fn candidate_witnesses(
 #[cfg(test)]
 mod tests {
     use super::super::index::StyleAtomID;
-    use super::super::memory::DeviceClass;
-    use super::super::memory::MemoryController;
     use super::*;
 
     const ERROR_CLASS: LocalFeatureKey = LocalFeatureKey::Class(StyleAtomID(1));
@@ -440,9 +395,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-            let mut tree = StyleNodeTree::new(&mut memory);
-            let nodes: Vec<StyleNodeID> = (0..6).map(|_| tree.allocate_element(&mut memory)).collect();
+            let mut tree = StyleNodeTree::new();
+            let nodes: Vec<StyleNodeID> = (0..6).map(|_| tree.allocate_element()).collect();
             // 0 root, 1 card, 2 other; card's children 3, 4, 5
             tree.set_first_element_child(nodes[0], Some(nodes[1]));
             tree.set_parent(nodes[1], Some(nodes[0]));
@@ -509,20 +463,6 @@ mod tests {
     fn a_following_sibling_query_anchors_on_preceding_siblings() {
         let fixture = Fixture::new();
         assert_eq!(fixture.anchors(RelativeAxis::FollowingSibling, 5), vec![3, 4]);
-    }
-
-    #[test]
-    fn the_axis_inverses_are_the_ones_the_transpose_table_names() {
-        assert_eq!(RelativeAxis::Child.inverse_step(), InverseStep::AnchorParent);
-        assert_eq!(RelativeAxis::Descendant.inverse_step(), InverseStep::AnchorAncestors);
-        assert_eq!(
-            RelativeAxis::NextSibling.inverse_step(),
-            InverseStep::AnchorPreviousSibling
-        );
-        assert_eq!(
-            RelativeAxis::FollowingSibling.inverse_step(),
-            InverseStep::AnchorPrecedingSiblings
-        );
     }
 
     #[test]

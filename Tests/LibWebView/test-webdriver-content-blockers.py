@@ -6,6 +6,7 @@
 
 import http.server
 import json
+import os
 import runpy
 import subprocess
 import sys
@@ -68,7 +69,7 @@ with tempfile.TemporaryDirectory() as directory:
     (profile / "config" / "Settings.json").write_text(
         json.dumps(
             {
-                "contentBlockers": {"builtInLists": {"easyList": False}},
+                "contentBlockers": {"enabled": True, "builtInLists": {"easyList": False}},
             }
         )
     )
@@ -76,7 +77,8 @@ with tempfile.TemporaryDirectory() as directory:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = helpers["unused_port"]()
     process = subprocess.Popen(
-        [sys.argv[1], "--headless", "-l", "127.0.0.1", "-p", str(port), "--profile-path", directory]
+        [sys.argv[1], "--headless", "-l", "127.0.0.1", "-p", str(port), "--profile-path", directory],
+        env={**os.environ, "LADYBIRD_CONTENT_BLOCKER_LIST_UPDATE_TIMEOUT_MS": "1000"},
     )
     session = None
     try:
@@ -96,6 +98,8 @@ with tempfile.TemporaryDirectory() as directory:
                 const [name, data, waitForIdle, done] = arguments;
                 const receive = event => {
                     if (event.detail.name !== 'loadSettings') return;
+                    // Wait for the requested full snapshot rather than a partial broadcast.
+                    if (!Object.hasOwn(event.detail.data, 'firstRunComplete')) return;
                     if (waitForIdle && event.detail.data.contentBlockerListUpdateInProgress) {
                         setTimeout(() => ladybird.sendMessage('loadCurrentSettings'), 50);
                         return;
@@ -105,6 +109,7 @@ with tempfile.TemporaryDirectory() as directory:
                 };
                 document.addEventListener('WebUIMessage', receive);
                 ladybird.sendMessage(name, data);
+                if (name !== 'loadCurrentSettings') ladybird.sendMessage('loadCurrentSettings');
             """,
                     "args": [name, data, wait_for_idle],
                 },
@@ -145,20 +150,16 @@ with tempfile.TemporaryDirectory() as directory:
                 "script": """
                 const tab = document.querySelector('[aria-selected="true"]');
                 const panel = document.querySelector('#tab-blocking');
-                const description = panel.querySelector('.card-body > .description');
-                const form = description.nextElementSibling;
-                const lists = panel.querySelector('#built-in-content-blocker-lists');
-                const heading = panel.querySelector('.filter-list-header .card-title');
-                const details = lists.querySelector('.description');
-                const metadata = lists.querySelector('.filter-list-metadata');
-                return location.hash === '#blocking' && tab.textContent === 'Blocking'
+                const lists = panel.querySelector('#content-blocker-lists');
+                const heading = panel.querySelector('.list-section .list-heading');
+                const details = lists.querySelector('.item-name .description');
+                const form = panel.querySelector('#add-filter-list-form');
+                return location.hash === '#blocking' && tab.textContent.trim() === 'Content blocking'
                     && heading.getBoundingClientRect().left === lists.getBoundingClientRect().left
-                    && metadata.getBoundingClientRect().top >= details.getBoundingClientRect().bottom
-                    && getComputedStyle(metadata).fontSize === '12px'
-                    && metadata.textContent.includes('easylist.to') && !details.textContent.includes('easylist.to')
-                    && ['label', '.description', 'summary', 'textarea'].every(selector =>
-                        getComputedStyle(panel.querySelector(selector)).fontSize === '14px')
-                    && form.getBoundingClientRect().top - description.getBoundingClientRect().bottom >= 16;
+                    && getComputedStyle(details).fontSize === '12px' && !details.textContent.includes('easylist.to')
+                    && form.hidden
+                    && ['label', 'summary', 'textarea'].every(selector =>
+                        getComputedStyle(panel.querySelector(selector)).fontSize === '13px');
             """,
                 "args": [],
             },
@@ -170,10 +171,10 @@ with tempfile.TemporaryDirectory() as directory:
                 {
                     "script": """
                     const toggle = document.querySelector('#filter-list-updates');
-                    const style = getComputedStyle(toggle.parentElement);
+                    const label = document.querySelector('label[for="filter-list-updates"]');
                     return toggle.disabled === !arguments[0]
-                        && style.opacity === (arguments[0] ? '1' : '0.5')
-                        && (arguments[0] || style.filter === 'grayscale(1)');
+                        && getComputedStyle(label).opacity === (arguments[0] ? '1' : '0.5')
+                        && getComputedStyle(toggle).opacity === '1';
                 """,
                     "args": [enabled],
                 },

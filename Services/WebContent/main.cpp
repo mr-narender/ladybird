@@ -5,6 +5,7 @@
  */
 
 #include <AK/LexicalPath.h>
+#include <LibAudio/ClientConnection.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/CrashHandler.h>
 #include <LibCore/Environment.h>
@@ -14,21 +15,23 @@
 #include <LibCore/Platform/ThreadQoS.h>
 #include <LibCore/Process.h>
 #include <LibCore/Resource.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/System.h>
 #include <LibCore/TimeZone.h>
 #include <LibCrypto/OpenSSL.h>
 #include <LibCrypto/OpenSSLForward.h>
-#include <LibGfx/Font/FontDatabase.h>
+#include <LibGfx/Font/SystemFallbackFonts.h>
 #include <LibIPC/ConnectionFromClient.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibMain/Main.h>
 #include <LibMediaClient/Client.h>
 #include <LibRequests/RequestClient.h>
-#include <LibSandbox/ConnectBroker.h>
+#include <LibURL/Parser.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/Internals/Internals.h>
@@ -44,25 +47,9 @@
 #include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverConnection.h>
 
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-#    include <LibWasm/Types.h>
-#    include <LibWasmCompilerClient/State.h>
-#endif
-
 #include <openssl/thread.h>
 
-#if defined(AK_OS_MACOS)
-#    include <LibIPC/Transport.h>
-#    include <LibIPC/TransportBootstrapMach.h>
-#else
-#    include <LibIPC/SingleServer.h>
-#endif
-
-#if defined(AK_OS_WINDOWS)
-#    include <objbase.h>
-#endif
-
-#include <SDL3/SDL_init.h>
+#include <LibIPC/SingleServer.h>
 
 #if !defined(AK_OS_WINDOWS)
 #    include <signal.h>
@@ -106,31 +93,78 @@ static void install_crash_signal_handlers()
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGILL, &sa, nullptr);
 }
+#else
+#    include <AK/Windows.h>
+#    include <signal.h>
+
+static StringView crash_exception_name(DWORD code)
+{
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+        return "EXCEPTION_ACCESS_VIOLATION"sv;
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        return "EXCEPTION_ILLEGAL_INSTRUCTION"sv;
+    case EXCEPTION_STACK_OVERFLOW:
+        return "EXCEPTION_STACK_OVERFLOW"sv;
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        return "EXCEPTION_INT_DIVIDE_BY_ZERO"sv;
+    case EXCEPTION_IN_PAGE_ERROR:
+        return "EXCEPTION_IN_PAGE_ERROR"sv;
+    case EXCEPTION_BREAKPOINT:
+        return "EXCEPTION_BREAKPOINT"sv;
+    case EXCEPTION_PRIV_INSTRUCTION:
+        return "EXCEPTION_PRIV_INSTRUCTION"sv;
+    default:
+        return "unknown"sv;
+    }
+}
+
+// Runs only for exceptions nothing else handles, after the vectored handlers that recover from faults in compiled
+// Wasm code have declined them.
+static LONG WINAPI crash_exception_filter(EXCEPTION_POINTERS* exception)
+{
+    auto code = exception->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION && exception->ExceptionRecord->NumberParameters >= 2) {
+        auto operation = "executing"sv;
+        if (exception->ExceptionRecord->ExceptionInformation[0] == 0)
+            operation = "reading"sv;
+        else if (exception->ExceptionRecord->ExceptionInformation[0] == 1)
+            operation = "writing"sv;
+        warnln("\n\033[31;1mCRASH\033[0m: Received exception {} ({:#x}) {} {:p}", crash_exception_name(code), code,
+            operation, reinterpret_cast<void*>(exception->ExceptionRecord->ExceptionInformation[1]));
+    } else {
+        warnln("\n\033[31;1mCRASH\033[0m: Received exception {} ({:#x}) at {:p}", crash_exception_name(code), code,
+            exception->ExceptionRecord->ExceptionAddress);
+    }
+    dump_backtrace(2, 100);
+    Core::Process::terminate_immediately(static_cast<int>(code));
+}
+
+static void crash_abort_handler(int)
+{
+    warnln("\n\033[31;1mCRASH\033[0m: Received signal SIGABRT ({})", SIGABRT);
+    dump_backtrace(2, 100);
+    Core::Process::terminate_immediately(128 + SIGABRT);
+}
+
+static void install_crash_signal_handlers()
+{
+    // Leave room on an overflowed stack for the backtrace to be printed.
+    ULONG stack_guarantee = 64 * KiB;
+    SetThreadStackGuarantee(&stack_guarantee);
+    SetUnhandledExceptionFilter(crash_exception_filter);
+    (void)signal(SIGABRT, crash_abort_handler);
+}
 #endif
 
-static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle);
+static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id, Optional<Utf16String> const& top_level_site);
 static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
 
-#if !defined(AK_OS_WINDOWS)
     install_crash_signal_handlers();
-#endif
-
-#if defined(AK_OS_WINDOWS)
-    // NOTE: We need this here otherwise SDL inits COM in the APARTMENTTHREADED model which we don't want as we need to
-    // make calls across threads which would otherwise have a high overhead. It is safe for all the objects we use.
-    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
-    VERIFY(SUCCEEDED(hr));
-    ScopeGuard uninitialize_com = []() { CoUninitialize(); };
-#endif
-    // SDL is used for the Gamepad API.
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-        dbgln("Failed to initialize SDL3: {}", SDL_GetError());
-        return -1;
-    }
 
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
@@ -138,30 +172,28 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
-    StringView cache_path;
     StringView mach_server_name {};
     Vector<ByteString> certificates;
     int crash_report_fd = -1;
-    int connect_broker_fd = -1;
     bool enable_test_mode = false;
     bool expose_experimental_interfaces = false;
     bool expose_internals_object = false;
     bool wait_for_debugger = false;
     bool log_all_js_exceptions = false;
     bool enable_http_memory_cache = false;
-    bool force_fontconfig = false;
     bool collect_garbage_on_every_allocation = false;
     bool is_headless = false;
     bool disable_scrollbar_painting = false;
     bool disable_sandbox = false;
     StringView echo_server_port_string_view {};
+    StringView https_echo_server_port_string_view {};
     StringView default_time_zone {};
     bool file_origins_are_tuple_origins = false;
 
+    StringView stats_log_directory;
     Core::ArgsParser args_parser;
+    args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(crash_report_fd, "Descriptor for anonymous crash diagnostics", "crash-report-fd", 0, "fd");
-    args_parser.add_option(connect_broker_fd, "Descriptor for the sandbox connection broker", "connect-broker-fd", 0, "fd");
-    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
     args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
     args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
     args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
@@ -170,16 +202,31 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
     args_parser.add_option(log_all_js_exceptions, "Log all JavaScript exceptions", "log-all-js-exceptions");
     args_parser.add_option(enable_http_memory_cache, "Enable HTTP cache", "enable-http-memory-cache");
-    args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
     args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation");
     args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical viewport scrollbars", "disable-scrollbar-painting");
     args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
     args_parser.add_option(echo_server_port_string_view, "Echo server port used in test internals", "echo-server-port", 0, "echo_server_port");
+    args_parser.add_option(https_echo_server_port_string_view, "HTTPS echo server port used in test internals", "https-echo-server-port", 0, "https_echo_server_port");
     args_parser.add_option(is_headless, "Report that the browser is running in headless mode", "headless");
     args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
     args_parser.add_option(file_origins_are_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
+    args_parser.add_option(Core::ArgsParser::Option {
+        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
+        .help_string = "URL of a PAC file (not supported yet, requests fail)",
+        .long_name = "proxy-autoconfig-url",
+        .value_name = "url",
+        .accept_value = [&](StringView value) {
+            auto url = URL::Parser::basic_parse(value);
+            if (!url.has_value())
+                return false;
+            Web::ResourceLoader::set_proxy_autoconfig_url(url.release_value());
+            return true;
+        },
+    });
 
     args_parser.parse(arguments);
+
+    auto stats_log = TRY(Core::StatsLog::create(stats_log_directory, "WebContent"sv));
 
     if (crash_report_fd >= 0) {
         if (auto result = Core::CrashHandler::initialize(crash_report_fd); result.is_error())
@@ -204,9 +251,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     if (file_origins_are_tuple_origins)
         URL::set_file_scheme_urls_have_tuple_origins();
 
-    if (force_fontconfig)
-        Gfx::FontDatabase::the().set_force_freetype_rasterization(true);
-
     WebContent::PageClient::set_is_headless(is_headless);
 
     if (enable_http_memory_cache)
@@ -221,6 +265,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             VERIFY_NOT_REACHED();
     }
 
+    if (!https_echo_server_port_string_view.is_empty()) {
+        if (auto maybe_https_echo_server_port = https_echo_server_port_string_view.to_number<u16>(); maybe_https_echo_server_port.has_value())
+            Web::Internals::Internals::set_https_echo_server_port(maybe_https_echo_server_port.value());
+        else
+            VERIFY_NOT_REACHED();
+    }
+
     OPENSSL_TRY(OSSL_set_max_threads(nullptr, Core::System::hardware_concurrency()));
 
     Web::HTML::Window::set_enable_test_mode(enable_test_mode);
@@ -228,6 +279,8 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Web::HTML::WindowOrWorkerGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
 
     Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
+    if (stats_log)
+        Web::Bindings::main_thread_vm().heap().enable_stats();
 
     if (collect_garbage_on_every_allocation)
         Web::Bindings::main_thread_vm().heap().set_should_collect_on_every_allocation(true);
@@ -236,26 +289,14 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         JS::set_log_all_js_exceptions(true);
     }
 
-#if defined(AK_OS_LINUX)
-    if (connect_broker_fd != -1)
-        Sandbox::set_connect_broker_fd(connect_broker_fd);
-#endif
-
     if (!disable_sandbox)
-        TRY(RendererSandbox::apply_sandbox(mach_server_name, cache_path, RendererSandbox::AudioAccess::Yes));
+        TRY(RendererSandbox::apply_sandbox(mach_server_name));
 
-#if defined(AK_OS_MACOS)
-    auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
-    auto transport_ports = TRY(IPC::bootstrap_transport_from_server_port(browser_port));
-    auto webcontent_client = WebContent::ConnectionFromClient::construct(
-        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)), enable_test_mode);
-#else
     auto webcontent_client = TRY(IPC::take_over_accepted_client_from_system_server<WebContent::ConnectionFromClient>(mach_server_name, enable_test_mode));
-#endif
 
     auto& heap = Web::Bindings::main_thread_vm().heap();
-    webcontent_client->on_request_server_connection = [&heap](auto const& handle) {
-        if (auto result = connect_to_resource_loader(heap, handle); result.is_error())
+    webcontent_client->on_request_server_connection = [&heap](auto const& handle, auto client_id, auto const& top_level_site) {
+        if (auto result = connect_to_resource_loader(heap, handle, client_id, top_level_site); result.is_error())
             dbgln("Failed to connect to resource loader: {}", result.error());
     };
     webcontent_client->on_image_decoder_connection = [](auto const& handle) {
@@ -266,32 +307,32 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     MediaClient::Client::set_transport_factory([webcontent_client] {
         return webcontent_client->request_media_server_transport();
     });
-
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    Wasm::set_cranelift_compile_callback([](Core::AnonymousBuffer const& buffer) {
-        return WasmCompilerClient::compiler_state().compile(buffer);
+    // WebAudio's output plays through the AudioServer; this process never reaches a device itself.
+    Audio::ClientConnection::set_transport_factory([webcontent_client] {
+        return webcontent_client->request_audio_server_transport();
     });
 
-    webcontent_client->on_wasm_compiler_connection = [](auto handle) {
-        WasmCompilerClient::compiler_state().replace_connection(move(handle));
-    };
-#endif
+    if (stats_log) {
+        stats_log->start_sampling([&heap](JsonObject& values) {
+            heap.add_stats(values);
+            Web::HTML::main_thread_event_loop().add_stats(values);
+            values.set("fonts.system_fallback_cache_entries"sv, Gfx::system_fallback_font_cache_size());
+        });
+    }
 
     return event_loop.exec();
 }
 
-ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle)
+ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle, Optional<int> client_id, Optional<Utf16String> const& top_level_site)
 {
     auto transport = TRY(handle.create_transport());
-    auto request_client = TRY(try_make_ref_counted<Requests::RequestClient>(move(transport)));
-#ifdef AK_OS_WINDOWS
-    auto response = request_client->send_sync<Messages::RequestServer::InitTransport>(Core::System::getpid());
-    request_client->transport().set_peer_pid(response->peer_pid());
-#endif
-    if (Web::ResourceLoader::is_initialized())
-        Web::ResourceLoader::the().set_client(move(request_client));
-    else
-        Web::ResourceLoader::initialize(heap, move(request_client));
+    // Querying the client ID runs the event loop and could dispatch a request before the client is ready.
+    auto request_client = client_id.has_value()
+        ? TRY(try_make_ref_counted<Requests::RequestClient>(move(transport), *client_id))
+        : TRY(try_make_ref_counted<Requests::RequestClient>(move(transport)));
+    if (!Web::ResourceLoader::is_initialized())
+        Web::ResourceLoader::initialize(heap);
+    Web::ResourceLoader::the().set_client(top_level_site, move(request_client));
     return {};
 }
 
@@ -299,10 +340,6 @@ ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
 {
     auto transport = TRY(handle.create_transport());
     auto new_client = TRY(try_make_ref_counted<ImageDecoderClient::Client>(move(transport)));
-#ifdef AK_OS_WINDOWS
-    auto response = new_client->send_sync<Messages::ImageDecoderServer::InitTransport>(Core::System::getpid());
-    new_client->transport().set_peer_pid(response->peer_pid());
-#endif
     if (Web::Platform::ImageCodecPlugin::is_initialized())
         static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
     else

@@ -66,14 +66,28 @@ WebIDL::ExceptionOr<Utf16String> CSSMatrixComponent::to_string() const
 {
     // 1. Return the serialization of this’s matrix internal slot.
     // FIXME: This means we ignore our is_2d state. https://github.com/w3c/css-houdini-drafts/issues/1155
-    return Utf16String::from_utf8(TRY(m_matrix->to_string()));
+    return m_matrix->to_string();
 }
 
 WebIDL::ExceptionOr<GC::Ref<Geometry::DOMMatrix>> CSSMatrixComponent::to_matrix() const
 {
-    // AD-HOC: Not specced, but we already have a matrix so use that.
-    //          https://github.com/w3c/css-houdini-drafts/issues/1153
-    return matrix();
+    // https://drafts.css-houdini.org/css-typed-om-1/#dom-csstransformcomponent-tomatrix
+    // 1. Let matrix be a new DOMMatrix object, initialized to this’s equivalent 4x4 transform matrix, as defined in
+    //    CSS Transforms 1 § 12. Mathematical Description of Transform Functions, and with its is2D internal slot set to
+    //    the same value as this’s is2D internal slot.
+    // NB: The elements are m11, m12, m13, m14, m21, ..., m44. A 2D component only uses m11, m12, m21, m22, m41 and m42.
+    auto elements = m_matrix->elements();
+    if (is_2d()) {
+        elements = { elements[0], elements[1], 0, 0,
+            elements[4], elements[5], 0, 0,
+            0, 0, 1, 0,
+            elements[12], elements[13], 0, 1 };
+    }
+    auto matrix = Geometry::DOMMatrix::create();
+    matrix->set_elements(elements, is_2d());
+
+    // 2. Return matrix.
+    return matrix;
 }
 
 WebIDL::ExceptionOr<void> CSSMatrixComponent::set_matrix(GC::Ref<Geometry::DOMMatrix> matrix)
@@ -86,37 +100,19 @@ WebIDL::ExceptionOr<void> CSSMatrixComponent::set_matrix(GC::Ref<Geometry::DOMMa
 
 WebIDL::ExceptionOr<NonnullRefPtr<TransformationStyleValue const>> CSSMatrixComponent::create_style_value(PropertyNameAndID const& property) const
 {
+    // NB: The elements are m11, m12, m13, m14, m21, ..., m44, and the elements a to f of a 2D matrix are m11, m12, m21,
+    //     m22, m41 and m42.
+    auto elements = m_matrix->elements();
+    StyleValueVector values;
     if (is_2d()) {
-        return TransformationStyleValue::create(property.id(), TransformFunction::Matrix,
-            {
-                NumberStyleValue::create(m_matrix->a()),
-                NumberStyleValue::create(m_matrix->b()),
-                NumberStyleValue::create(m_matrix->c()),
-                NumberStyleValue::create(m_matrix->d()),
-                NumberStyleValue::create(m_matrix->e()),
-                NumberStyleValue::create(m_matrix->f()),
-            });
+        for (auto index : { 0, 1, 4, 5, 12, 13 })
+            values.append(NumberStyleValue::create(elements[index]));
+        return TransformationStyleValue::create(property.id(), TransformFunction::Matrix, move(values));
     }
 
-    return TransformationStyleValue::create(property.id(), TransformFunction::Matrix3d,
-        {
-            NumberStyleValue::create(m_matrix->m11()),
-            NumberStyleValue::create(m_matrix->m12()),
-            NumberStyleValue::create(m_matrix->m13()),
-            NumberStyleValue::create(m_matrix->m14()),
-            NumberStyleValue::create(m_matrix->m21()),
-            NumberStyleValue::create(m_matrix->m22()),
-            NumberStyleValue::create(m_matrix->m23()),
-            NumberStyleValue::create(m_matrix->m24()),
-            NumberStyleValue::create(m_matrix->m31()),
-            NumberStyleValue::create(m_matrix->m32()),
-            NumberStyleValue::create(m_matrix->m33()),
-            NumberStyleValue::create(m_matrix->m34()),
-            NumberStyleValue::create(m_matrix->m41()),
-            NumberStyleValue::create(m_matrix->m42()),
-            NumberStyleValue::create(m_matrix->m43()),
-            NumberStyleValue::create(m_matrix->m44()),
-        });
+    for (auto element : elements)
+        values.append(NumberStyleValue::create(element));
+    return TransformationStyleValue::create(property.id(), TransformFunction::Matrix3d, move(values));
 }
 
 }

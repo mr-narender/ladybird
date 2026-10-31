@@ -21,6 +21,7 @@
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/ValueParserRustFFI.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -37,7 +38,7 @@ GC::Ref<WebIDL::CallbackType> create_lazy_load_intersection_observer_callback(DO
         auto& entries = as<JS::Array>(vm.argument(0).as_object());
         auto entries_length = MUST(MUST(entries.get(vm.names.length)).to_length(vm));
 
-        Vector<GC::Ref<IntersectionObserverEntry>> intersection_observer_entries;
+        GC::RootVector<GC::Ref<IntersectionObserverEntry>> intersection_observer_entries;
         for (size_t i = 0; i < entries_length; ++i) {
             auto property_key = JS::PropertyKey { i };
             auto& entry_object = entries.get_without_side_effects(property_key).as_object();
@@ -169,21 +170,19 @@ IntersectionObserver::IntersectionObserver(GC::Ptr<WebIDL::CallbackType> callbac
 
 IntersectionObserver::~IntersectionObserver() = default;
 
-void IntersectionObserver::finalize()
-{
-    Base::finalize();
-    if (m_document)
-        m_document->unregister_intersection_observer({}, *this);
-}
-
 void IntersectionObserver::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_root);
     visitor.visit(m_callback);
     visitor.visit(m_queued_entries);
-    for (auto& observed_target : m_observation_targets)
-        visitor.visit(observed_target.target);
+}
+
+void IntersectionObserver::remove_dead_observation_targets()
+{
+    m_observation_targets.remove_all_matching([](auto const& observed_target) {
+        return !observed_target.target;
+    });
 }
 
 // https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-observe
@@ -193,7 +192,7 @@ void IntersectionObserver::observe(DOM::Element& target)
     // https://www.w3.org/TR/intersection-observer/#observe-a-target-element
     // 1. If target is in observer’s internal [[ObservationTargets]] slot, return.
     auto observed_target = m_observation_targets.find_if([&target](auto const& entry) {
-        return entry.target.ptr() == &target;
+        return entry.target == &target;
     });
     if (!observed_target.is_end())
         return;
@@ -220,6 +219,7 @@ void IntersectionObserver::observe(DOM::Element& target)
     // AD-HOC: Registering an observation changes whether transforms can remain compositor driven. Bring any pending
     //         throttled animation state to a point where compositor eligibility can be updated by the requested frame.
     target.document().flush_throttled_animation_style_update_for_node(target);
+    set_rendering_pending(*m_document, RenderingPendingReason::NeedsRenderingUpdate, 1);
     m_document->page().client().request_frame();
 }
 
@@ -233,7 +233,7 @@ void IntersectionObserver::unobserve(DOM::Element& target)
 
     // 2. Remove target from this’s internal [[ObservationTargets]] slot, if present
     m_observation_targets.remove_first_matching([&target](ObservationTarget const& entry) {
-        return entry.target.ptr() == &target;
+        return entry.target == &target;
     });
 }
 
@@ -245,7 +245,8 @@ void IntersectionObserver::disconnect()
     //    [[RegisteredIntersectionObservers]] slot.
     // 2. Remove target from this’s internal [[ObservationTargets]] slot.
     for (auto& observed_target : m_observation_targets) {
-        observed_target.target->unregister_intersection_observer({}, *this);
+        if (auto target = observed_target.target.ptr())
+            target->unregister_intersection_observer({}, *this);
     }
     m_observation_targets.clear();
 }
@@ -345,7 +346,7 @@ GC::Ref<DOM::Node> IntersectionObserver::intersection_root_node() const
 }
 
 // https://www.w3.org/TR/intersection-observer/#intersectionobserver-root-intersection-rectangle
-CSSPixelRect IntersectionObserver::root_intersection_rectangle(Compositing::AccumulatedVisualContextTree const* visual_context_tree) const
+CSSPixelRect IntersectionObserver::root_intersection_rectangle(Layout::BegunRead const& read, Compositing::AccumulatedVisualContextTree const* visual_context_tree) const
 {
     // If the IntersectionObserver is an implicit root observer,
     //    it’s treated as if the root were the top-level browsing context’s document, according to the following rule for document.
@@ -387,9 +388,9 @@ CSSPixelRect IntersectionObserver::root_intersection_rectangle(Compositing::Accu
         // Otherwise,
         //    it’s the result of getting the bounding box for the intersection root.
         rect = visual_context_tree
-            ? element->bounding_client_rect_assuming_layout_clean(*visual_context_tree)
+            ? element->bounding_client_rect_assuming_layout_clean(read, *visual_context_tree)
             : element->bounding_client_rect_assuming_layout_clean();
-        if (auto const* layout_node = element->layout_node(); layout_node && Painting::has_committed_box(*layout_node))
+        if (auto const* layout_node = element->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
             intersection_root_is_scrollable = layout_node->is_scroll_container();
     }
 

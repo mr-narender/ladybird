@@ -16,6 +16,7 @@
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGFitToViewBox.h>
 #include <LibWeb/SVG/SVGGradientElement.h>
+#include <LibWeb/SVG/SVGStringList.h>
 #include <LibWeb/SVG/TagNames.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -32,11 +33,6 @@ class WEB_API SVGGraphicsElement : public SVGElement {
     WEB_WRAPPABLE(SVGGraphicsElement, SVGElement);
 
 public:
-    // Presentation values the element resolves from its own layout row. Every caller already holds
-    // that row, so it passes it in rather than looking one up through the DOM.
-    Optional<Gfx::Color> stroke_color(Layout::NodeWithStyle const&) const;
-    Optional<float> stroke_width(Layout::NodeWithStyle const&) const;
-
     virtual Optional<ViewBox> active_view_box() const
     {
         if (auto const* fit_to_view_box = this->fit_to_view_box())
@@ -44,54 +40,34 @@ public:
         return {};
     }
 
-    float visible_stroke_width(Layout::NodeWithStyle const&) const;
-
-    GC::Ptr<SVG::SVGMaskElement const> mask(Layout::NodeWithStyle const&) const;
-    GC::Ptr<SVG::SVGClipPathElement const> clip_path(Layout::NodeWithStyle const&) const;
-
-    GC::Ptr<SVG::SVGPatternElement const> fill_pattern(Layout::NodeWithStyle const&) const;
-    GC::Ptr<SVG::SVGPatternElement const> stroke_pattern(Layout::NodeWithStyle const&) const;
-
     WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> get_b_box(Bindings::SVGBoundingBoxOptions const&);
-    GC::Ref<SVGAnimatedTransformList> transform() const;
+    GC::Ref<SVGAnimatedTransformList> transform();
 
     GC::Ptr<Geometry::DOMMatrix> get_ctm();
     GC::Ptr<Geometry::DOMMatrix> get_screen_ctm();
 
-    // The transform property carries the transform attribute through the cascade; this is the
-    // extra transformation some elements apply beyond it, such as the x/y translation of <use>.
-    virtual Gfx::AffineTransform additional_element_transform() const
-    {
-        return {};
-    }
+    GC::Ptr<DOM::Element> resolve_url_to_element(CSS::URL const& url) const;
 
-    GC::Ptr<DOM::Element> paint_server_element(Optional<CSS::SVGPaint> const&) const;
+    // https://svgwg.org/svg2-draft/types.html#InterfaceSVGTests
+    GC::Ref<SVGStringList> required_extensions_for_bindings();
+    GC::Ref<SVGStringList> system_language_for_bindings();
+
+    // https://svgwg.org/svg2-draft/struct.html#ConditionalProcessing
+    bool conditional_processing_attributes_evaluate_to_true() const;
 
 protected:
     SVGGraphicsElement(DOM::Document&, DOM::QualifiedName);
 
-    GC::Ptr<DOM::Element> resolve_url_to_element(CSS::URL const& url) const;
-    GC::Ptr<DOM::Element> resolve_url_to_element(Utf16String const& url) const;
-
-    template<typename T>
-    GC::Ptr<T> try_resolve_url_to(CSS::URL const& url) const
-    {
-        return as_if<T>(resolve_url_to_element(url).ptr());
-    }
-
-    template<typename T>
-    GC::Ptr<T> try_resolve_url_to(Utf16String const& url) const
-    {
-        return as_if<T>(resolve_url_to_element(url).ptr());
-    }
+    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
 
 private:
     virtual bool is_svg_graphics_element() const final { return true; }
     GC::Ptr<DOM::Element> resolve_fragment_identifier_to_element(Utf16String const& fragment) const;
-    float resolve_relative_to_viewport_size(CSS::LengthPercentage const& length_percentage) const;
 
-public:
-    CSSPixels viewport_percentage_basis() const;
+    GC::Ptr<SVGStringList> m_required_extensions;
+    GC::Ptr<SVGStringList> m_system_language;
+    GC::Ptr<SVGAnimatedTransformList> m_transform;
 };
 
 Gfx::AffineTransform transform_from_transform_list(ReadonlySpan<Transform> transform_list);

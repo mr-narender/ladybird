@@ -20,15 +20,16 @@
 
 namespace IPC {
 
-// Maximum size for decoded containers (strings, buffers, vectors, etc.)
-// This prevents a malicious peer from claiming huge sizes to cause OOM.
-static constexpr size_t MAX_DECODED_SIZE = 64 * MiB;
-
 ErrorOr<size_t> Decoder::decode_size()
 {
+    auto max_size = exchange(m_max_size_of_next_value, NumericLimits<size_t>::max());
     auto size = static_cast<size_t>(TRY(decode<u32>()));
-    if (size > MAX_DECODED_SIZE)
-        return Error::from_string_literal("IPC decode: Size exceeds maximum allowed");
+    if (size > max_size)
+        return Error::from_string_literal("IPC decode: Size exceeds the maximum");
+
+    // Every element of a string or container takes at least one byte or one attachment of the message.
+    if (size > m_stream.remaining() + m_attachments.size())
+        return Error::from_string_literal("IPC decode: Size exceeds the rest of the message");
     return size;
 }
 
@@ -183,8 +184,8 @@ ErrorOr<Core::AnonymousBuffer> decode(Decoder& decoder)
     if (auto valid = TRY(decoder.decode<bool>()); !valid)
         return Core::AnonymousBuffer {};
 
-    // We don't use decode_size() here since AnonymousBuffer is backed by shared memory, not heap allocation. The
-    // MAX_DECODED_SIZE limit doesn't apply because the memory is already allocated by the sender.
+    // We don't use decode_size() here since AnonymousBuffer is backed by shared memory, not heap allocation. Its
+    // contents are not part of the message.
     auto encoded_size = TRY(decoder.decode<u64>());
     if (!AK::is_within_range<size_t>(encoded_size))
         return Error::from_string_literal("Anonymous buffer size does not fit on this platform");
@@ -192,7 +193,11 @@ ErrorOr<Core::AnonymousBuffer> decode(Decoder& decoder)
     auto size = static_cast<size_t>(encoded_size);
     auto anon_file = TRY(decoder.decode<IPC::File>());
 
-    return Core::AnonymousBuffer::create_from_anon_fd(anon_file.take_fd(), size);
+    // The size is the sender's claim. Touching a mapping past the end of the file it maps raises SIGBUS, so a sender that
+    // claims more than it sent could crash us whenever we got to that part of the buffer.
+    auto buffer = TRY(Core::AnonymousBuffer::create_from_anon_fd(anon_file.take_fd(), size));
+    TRY(buffer.validate_backing_size());
+    return buffer;
 }
 
 }

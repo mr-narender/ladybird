@@ -10,6 +10,13 @@
 
 namespace Web::HTML {
 
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled
+enum class CheckIfUnloadingIsCanceledResult {
+    CanceledByBeforeUnload,
+    CanceledByNavigate,
+    Continue,
+};
+
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-history-step
 // They return "initiator-disallowed", "canceled-by-beforeunload", "canceled-by-navigate", or
 // "applied".
@@ -17,11 +24,6 @@ enum class HistoryStepResult {
     InitiatorDisallowed,
     CanceledByBeforeUnload,
     CanceledByNavigate,
-    // AD-HOC: This is an internal result used when WebContent no longer has the requested page.
-    CanceledByMissingPage,
-    // AD-HOC: An internal result for when the canonical session history has no entry matching the
-    //         requested operation (for example, a navigation API traversal to a pruned entry).
-    NoMatchingEntry,
     Applied,
 };
 
@@ -35,21 +37,7 @@ enum class ChangingNavigableHistoryStepJobDisposition : u8 {
     Stale,
 };
 
-// AD-HOC: A same-document traversal yields to a newer navigation of its navigable.
-enum class TraversalYieldsTo : u8 {
-    Nothing,
-    // The UI process admitted a navigation after the traversal.
-    AdmittedNavigation,
-    // The navigable's process started a navigation before it learned of the traversal.
-    UnadmittedNavigation,
-};
-
 enum class UnloadPromptShown : bool {
-    No,
-    Yes,
-};
-
-enum class UnloadDisplayedDocument : bool {
     No,
     Yes,
 };

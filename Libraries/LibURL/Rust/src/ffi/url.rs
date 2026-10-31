@@ -28,14 +28,14 @@ pub struct RustUrlInput {
 impl RustUrlInput {
     /// # Safety
     /// The selected pointer must borrow length storage units. Byte input must be valid UTF-8.
-    unsafe fn borrow<'a>(self) -> UrlInput<'a> {
+    pub(crate) unsafe fn borrow<'a>(self) -> UrlInput<'a> {
         if self.length == 0 {
             return UrlInput::Utf8("");
         }
         if !self.utf16.is_null() {
-            UrlInput::Utf16(unsafe { std::slice::from_raw_parts(self.utf16, self.length) })
+            UrlInput::Utf16(unsafe { ak::slice_from_raw_parts(self.utf16, self.length) })
         } else {
-            UrlInput::Utf8(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.utf8, self.length)) })
+            UrlInput::Utf8(unsafe { std::str::from_utf8_unchecked(ak::slice_from_raw_parts(self.utf8, self.length)) })
         }
     }
 }
@@ -48,7 +48,7 @@ pub struct RustUrlByteSlice {
 }
 
 impl RustUrlByteSlice {
-    fn from_str(string: &str) -> Self {
+    pub(crate) fn from_str(string: &str) -> Self {
         Self {
             data: string.as_ptr(),
             length: string.len(),
@@ -57,11 +57,11 @@ impl RustUrlByteSlice {
 
     /// # Safety
     /// A non-null data pointer must borrow length bytes of valid UTF-8.
-    unsafe fn borrow<'a>(self) -> Option<&'a str> {
+    pub(crate) unsafe fn borrow<'a>(self) -> Option<&'a str> {
         if self.data.is_null() {
             return None;
         }
-        let bytes = unsafe { std::slice::from_raw_parts(self.data, self.length) };
+        let bytes = unsafe { ak::slice_from_raw_parts(self.data, self.length) };
         Some(std::str::from_utf8(bytes).expect("URL strings should be valid UTF-8"))
     }
 }
@@ -103,7 +103,7 @@ pub struct FfiUrlHost {
 }
 
 impl FfiUrlHost {
-    fn new(kind: HostKind, serialized_host: &str) -> Self {
+    pub(crate) fn new(kind: HostKind, serialized_host: &str) -> Self {
         let mut host = Self {
             kind,
             ipv4: [0; 4],
@@ -329,7 +329,7 @@ pub unsafe extern "C" fn rust_url_set_path(
         let segments = if segment_count == 0 {
             &[]
         } else {
-            std::slice::from_raw_parts(segments, segment_count)
+            ak::slice_from_raw_parts(segments, segment_count)
         };
         modify_url(url, ctx, on_complete, |url| {
             url.set_path(segments.iter().map(|segment| segment.borrow().unwrap_or("")))

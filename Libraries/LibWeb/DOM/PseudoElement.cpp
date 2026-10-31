@@ -6,13 +6,13 @@
 
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/CSS/ComputedValues.h>
-#include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/PseudoElement.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/NodeArena.h>
 
 namespace Web::DOM {
 
@@ -21,15 +21,13 @@ GC_DEFINE_ALLOCATOR(SyntheticPseudoElement);
 GC_DEFINE_ALLOCATOR(SyntheticPseudoElementTreeNode);
 GC_DEFINE_ALLOCATOR(ElementReferencePseudoElement);
 
-struct SyntheticPseudoElement::CustomPropertyDataStorage {
-    AK_ALLOC_WITH_KMALLOC;
-
-    RefPtr<CSS::CustomPropertyData const> data;
-};
-
-SyntheticPseudoElement::SyntheticPseudoElement() = default;
-SyntheticPseudoElement::SyntheticPseudoElement(GC::Ref<Element> originating_element)
-    : m_originating_element(originating_element)
+SyntheticPseudoElement::SyntheticPseudoElement(CSS::PseudoElement type)
+    : m_type(type)
+{
+}
+SyntheticPseudoElement::SyntheticPseudoElement(CSS::PseudoElement type, GC::Ref<Element> originating_element)
+    : m_type(type)
+    , m_originating_element(originating_element)
 {
 }
 SyntheticPseudoElement::~SyntheticPseudoElement() = default;
@@ -39,22 +37,34 @@ void SyntheticPseudoElement::visit_edges(JS::Cell::Visitor& visitor)
     Base::visit_edges(visitor);
 
     visitor.visit(m_originating_element);
-    if (m_counters_set)
-        m_counters_set->visit_edges(visitor);
 }
 
-void SyntheticPseudoElement::set_layout_node(Layout::NodeWithStyle* value)
+Layout::NodeWithStyle* SyntheticPseudoElement::unsafe_layout_node(Layout::BegunRead const& read) const
 {
-    if (m_layout_node && m_layout_node.ptr() != value) {
-        m_layout_node->pin_style_record_for_detachment();
-        Layout::RustFFI::layout_arena_set_node_flag(m_layout_node->arena_handle(), Layout::Node::slot_id(m_layout_node), Layout::RustFFI::NodeFlag::IsPseudoElementPrincipalBox, false);
-    }
-    m_layout_node = value;
-    // The box becomes the pseudo-element's box here, which is when it starts holding its scroll offset.
-    if (value) {
-        Layout::RustFFI::layout_arena_set_node_flag(value->arena_handle(), Layout::Node::slot_id(value), Layout::RustFFI::NodeFlag::IsPseudoElementPrincipalBox, true);
-        value->update_has_scroll_offset_flag();
-    }
+    if (!m_originating_element)
+        return nullptr;
+    return m_originating_element->pseudo_element_unsafe_layout_node(read, m_type);
+}
+
+void SyntheticPseudoElement::set_scroll_offset(CSSPixelPoint offset)
+{
+    m_scroll_offset = offset;
+    publish_scroll_offset();
+}
+
+// The layout node arena holds what the pseudo-element has scrolled to against the originating element's identity and
+// this pseudo-element's kind, for the box a build binds to it.
+void SyntheticPseudoElement::publish_scroll_offset() const
+{
+    VERIFY(m_originating_element);
+    if (m_originating_element->style_node_id().value() == 0)
+        return;
+    auto& document = m_originating_element->document();
+    // Nothing has scrolled anything before a layout tree exists, so there is no offset to forget.
+    if (!document.layout_node_arena_if_created() && m_scroll_offset.is_zero())
+        return;
+    Layout::RustFFI::render_state_set_pseudo_element_scroll_offset(document.layout_node_arena().host(),
+        m_originating_element->style_node_id().value(), Layout::Node::encode_generated_for(m_type), m_scroll_offset);
 }
 
 Node& SyntheticPseudoElement::root() const
@@ -65,7 +75,7 @@ Node& SyntheticPseudoElement::root() const
 
 void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
 {
-    if (!m_style_record_identity)
+    if (!m_installed_style.record())
         return;
     effect.update_computed_properties_for_style(context, abstract_element);
 }
@@ -73,12 +83,17 @@ void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::K
 void SyntheticPseudoElement::replace_style_record(CSS::StyleRecordID style_record_identity)
 {
     VERIFY(m_originating_element);
-    auto old_style_record_identity = m_style_record_identity;
-    if (old_style_record_identity == style_record_identity)
+    Layout::ForcedReadScope read { m_originating_element->document() };
+    if (m_installed_style.record() == style_record_identity)
         return;
-    m_style_record_identity = style_record_identity;
-    if (m_layout_node)
-        m_layout_node->set_style_record_identity(style_record_identity);
+    auto& style_computer = m_originating_element->document().style_computer();
+    m_installed_style = style_computer.install_style(read, style_record_identity);
+    // The pseudo-element holds the record it installed before until the engine takes the new one in, so the layout node
+    // reads what it moves from before the pseudo-element lets go of it.
+    if (auto* layout_node = unsafe_layout_node(read))
+        layout_node->set_style_record_identity(m_installed_style.record());
+    if (auto style_node_id = m_originating_element->style_node_id(); style_node_id != 0)
+        CSS::StyleEngineFFI::style_engine_set_held_pseudo_style_record(style_computer.style_engine().host(), style_node_id, to_underlying(type()), style_record_identity.value());
 }
 
 void SyntheticPseudoElement::set_computed_style(CSS::StyleRecordID style_record_identity)
@@ -92,62 +107,32 @@ void SyntheticPseudoElement::set_computed_style(CSS::StyleRecordID style_record_
 
 void SyntheticPseudoElement::clear_computed_style(RefPtr<CSS::ComputedValues const> style_to_preserve_for_detachment)
 {
-    if (m_layout_node) {
-        if (style_to_preserve_for_detachment)
-            m_layout_node->set_computed_values(style_to_preserve_for_detachment.release_nonnull());
-        else
-            m_layout_node->pin_style_record_for_detachment();
+    if (m_originating_element) {
+        Layout::ForcedReadScope read { m_originating_element->document() };
+        if (auto* layout_node = unsafe_layout_node(read)) {
+            if (style_to_preserve_for_detachment)
+                layout_node->set_computed_values(read, style_to_preserve_for_detachment.release_nonnull());
+            else
+                layout_node->pin_style_record_for_detachment();
+        }
+        if (auto style_node_id = m_originating_element->style_node_id(); style_node_id != 0 && !!m_installed_style.record())
+            CSS::StyleEngineFFI::style_engine_set_held_pseudo_style_record(m_originating_element->document().style_computer().style_engine().host(), style_node_id, to_underlying(type()), 0);
     }
-    m_style_record_identity = 0;
+    m_installed_style = {};
 }
 
 void SyntheticPseudoElement::refresh_computed_style(CSS::StyleRecordID style_record_identity)
 {
     replace_style_record(style_record_identity);
-    VERIFY(m_style_record_identity);
+    VERIFY(m_installed_style.record());
 }
 
-RefPtr<CSS::CustomPropertyData const> SyntheticPseudoElement::custom_property_data() const
+SyntheticPseudoElementTreeNode::SyntheticPseudoElementTreeNode(CSS::PseudoElement type)
+    : SyntheticPseudoElement(type)
 {
-    if (!m_custom_property_data)
-        return nullptr;
-    return m_custom_property_data->data;
 }
-
-void SyntheticPseudoElement::set_custom_property_data(RefPtr<CSS::CustomPropertyData const> value)
-{
-    if (!value) {
-        m_custom_property_data = nullptr;
-        return;
-    }
-
-    if (!m_custom_property_data)
-        m_custom_property_data = make<CustomPropertyDataStorage>();
-    m_custom_property_data->data = move(value);
-}
-
-Optional<CSS::CountersSet const&> SyntheticPseudoElement::counters_set() const
-{
-    if (!m_counters_set)
-        return {};
-    return *m_counters_set;
-}
-
-CSS::CountersSet& SyntheticPseudoElement::ensure_counters_set()
-{
-    if (!m_counters_set)
-        m_counters_set = make<CSS::CountersSet>();
-    return *m_counters_set;
-}
-
-void SyntheticPseudoElement::set_counters_set(OwnPtr<CSS::CountersSet>&& counters_set)
-{
-    m_counters_set = move(counters_set);
-}
-
-SyntheticPseudoElementTreeNode::SyntheticPseudoElementTreeNode() = default;
-SyntheticPseudoElementTreeNode::SyntheticPseudoElementTreeNode(GC::Ref<Element> originating_element)
-    : SyntheticPseudoElement(originating_element)
+SyntheticPseudoElementTreeNode::SyntheticPseudoElementTreeNode(CSS::PseudoElement type, GC::Ref<Element> originating_element)
+    : SyntheticPseudoElement(type, originating_element)
 {
 }
 SyntheticPseudoElementTreeNode::~SyntheticPseudoElementTreeNode() = default;
@@ -158,14 +143,14 @@ void SyntheticPseudoElementTreeNode::visit_edges(JS::Cell::Visitor& visitor)
     TreeNode::visit_edges(visitor);
 }
 
-Layout::NodeWithStyle* ElementReferencePseudoElement::layout_node() const
+Layout::NodeWithStyle* ElementReferencePseudoElement::layout_node(Layout::BegunRead const& read) const
 {
-    return m_referenced_element->layout_node();
+    return m_referenced_element->layout_node(read);
 }
 
-Layout::NodeWithStyle* ElementReferencePseudoElement::unsafe_layout_node() const
+Layout::NodeWithStyle* ElementReferencePseudoElement::unsafe_layout_node(Layout::BegunRead const& read) const
 {
-    return m_referenced_element->unsafe_layout_node();
+    return m_referenced_element->unsafe_layout_node(read);
 }
 
 Node& ElementReferencePseudoElement::root() const
@@ -173,24 +158,14 @@ Node& ElementReferencePseudoElement::root() const
     return m_referenced_element->root();
 }
 
-CSS::StyleRecordID ElementReferencePseudoElement::style_record_identity() const
+CSS::InstalledStyle const& ElementReferencePseudoElement::installed_style() const
 {
-    return m_referenced_element->style_record_identity({});
+    return m_referenced_element->installed_style({});
 }
 
 void ElementReferencePseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const& badge, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
 {
     m_referenced_element->update_animated_properties_for_abstract_element(badge, abstract_element, effect, context);
-}
-
-RefPtr<CSS::CustomPropertyData const> ElementReferencePseudoElement::custom_property_data() const
-{
-    return m_referenced_element->custom_property_data({});
-}
-
-void ElementReferencePseudoElement::set_custom_property_data(RefPtr<CSS::CustomPropertyData const> value)
-{
-    m_referenced_element->set_custom_property_data({}, move(value));
 }
 
 void ElementReferencePseudoElement::visit_edges(JS::Cell::Visitor& visitor)

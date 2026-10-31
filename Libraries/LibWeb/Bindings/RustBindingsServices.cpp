@@ -1,0 +1,427 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/HostObject.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibURL/RustIntegration.h>
+#include <LibWeb/Bindings/DOMException.h>
+#include <LibWeb/Bindings/RustInterface.h>
+#include <LibWeb/Bindings/RustSerialization.h>
+#include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/StructuredSerialize.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowProxy.h>
+#include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/WebIDL/AbstractOperations.h>
+#include <LibWeb/WebIDL/CallbackType.h>
+#include <LibWeb/WebIDL/DOMException.h>
+#include <LibWeb/WebIDL/ExceptionOrUtils.h>
+#include <LibWeb/WebIDL/Promise.h>
+
+// What the Rust bindings of the interfaces implemented in Rust ask of LibWeb's C++ bindings, declared on the Rust
+// side in Libraries/LibWeb/Bindings/Rust/src/bindings/services.rs.
+
+// The wrapper of an object of an interface implemented in Rust that the C++ bindings name, in the wrapper world of
+// the realm, which the Rust bindings generated for those interfaces define.
+extern "C" JSObject* web_rust_bindings_wrap(JSVM*, void* realm, u16 interface_name, void* cell);
+
+namespace Web::Bindings {
+
+GC::Ref<JS::HostObject> wrap_rust_interface_object(WrapperWorld& wrapper_world, JS::Realm& preferred_realm, InterfaceName interface_name, RustInterfaceCell& cell)
+{
+    // NB: The Rust bindings find the wrapper world of an object through the realm that asks for its wrapper.
+    VERIFY(&wrapper_world == &host_defined_wrapper_world(preferred_realm));
+    auto* wrapper = web_rust_bindings_wrap(JS::HostABI::vm_to_abi(preferred_realm.vm()), &preferred_realm, to_underlying(interface_name), &cell);
+    return as<JS::HostObject>(*JS::HostABI::object_from_abi(wrapper));
+}
+
+constexpr JSHostClass web_bindings_rust_interface_wrapper_host_class = JS::make_host_class(JS_HOST_CLASS_OBJECT, "RustInterface"sv,
+    nullptr, nullptr, nullptr, JS_HOST_CLASS_IS_PLATFORM_OBJECT);
+
+RustInterfaceCell* rust_interface_cell_of_wrapper(JS::Object& object, JSHostClass const& wrapper_host_class)
+{
+    auto* wrapper = as_if<JS::HostObject>(object);
+    if (!wrapper || &wrapper->host_class() != &wrapper_host_class)
+        return nullptr;
+    return GC::static_cell_cast<RustInterfaceCell>(JS::host_data_of(object).ptr());
+}
+
+bool rust_interface_object_implements_interface(JS::Object const& object, StringView interface_name)
+{
+    auto const* wrapper = as_if<JS::HostObject>(object);
+    if (!wrapper || !JS::host_data_of(object))
+        return false;
+    // NB: The host class of an interface's wrappers is named after it, and chains through the parent interfaces'
+    //     classes up to the class of every Rust interface, or else to that of a C++ interface it inherits from.
+    for (auto const* host_class = &wrapper->host_class(); host_class && host_class != &web_bindings_rust_interface_wrapper_host_class; host_class = host_class->parent) {
+        if (StringView { host_class->name, host_class->name_length } == interface_name)
+            return true;
+    }
+    return false;
+}
+
+JSCompletion completion_to_abi(JS::Realm& realm, WebIDL::ExceptionOr<JS::Value> result)
+{
+    if (result.is_exception())
+        return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { WebIDL::exception_to_throw_completion(realm.vm(), realm, result.exception()) });
+    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { result.release_value() });
+}
+
+// A value of the type that the record of a structured deserialization holds next.
+template<typename T>
+static JSCompletion deserialize_plain_value(RustSerializationReader* reader, T* out_value)
+{
+    auto value = HTML::decode_or_throw_data_clone_error<T>(reader->realm, reader->serialized);
+    if (value.is_exception())
+        return completion_to_abi(reader->realm, value.exception());
+    *out_value = value.release_value();
+    return completion_to_abi(reader->realm, JS::js_undefined());
+}
+
+extern "C" {
+
+void* web_bindings_wrapper_world(void* realm, bool* is_main_world);
+JSObject* web_bindings_rust_wrapper_for(void* realm, void* cell);
+void web_bindings_set_rust_wrapper(void* realm, void* cell, JSObject* wrapper);
+JSObject* web_bindings_rejected_promise(void* current_realm, JSValue this_value, JSValue reason);
+void web_bindings_queue_a_microtask(void* realm, JSObject* function);
+void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, void*));
+void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
+u64 web_bindings_queue_a_global_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
+void web_bindings_remove_tasks(void* realm, ReadonlySpan<u64> task_ids);
+u64 web_bindings_currently_running_task(void* realm);
+void* web_bindings_create_callback_function(JSObject* callable, bool returns_promise);
+JSCompletion web_bindings_invoke_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
+void* web_bindings_invoke_promise_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
+bool web_bindings_realm_is_window(void* realm);
+void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*));
+bool web_bindings_object_implements_interface(JSObject* object, u16 interface_name);
+JSObject* web_bindings_create_dom_exception(void* realm, ReadonlyBytes name, FlatPtr message);
+bool web_bindings_extract_an_origin(JSObject* object, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
+JSCompletion web_bindings_serialize_value(RustSerializationWriter*, JSValue);
+void web_bindings_serialize_u32(RustSerializationWriter*, u32);
+void web_bindings_serialize_f64(RustSerializationWriter*, double);
+void web_bindings_serialize_bool(RustSerializationWriter*, bool);
+void web_bindings_serialize_i64(RustSerializationWriter*, i64);
+void web_bindings_serialize_optional_u64(RustSerializationWriter*, bool has_value, u64);
+void web_bindings_serialize_utf16_string(RustSerializationWriter*, FlatPtr string);
+void web_bindings_serialize_bytes(RustSerializationWriter*, ReadonlyBytes);
+JSCompletion web_bindings_deserialize_value(RustSerializationReader*);
+JSCompletion web_bindings_deserialize_u32(RustSerializationReader*, u32* out_value);
+JSCompletion web_bindings_deserialize_f64(RustSerializationReader*, double* out_value);
+JSCompletion web_bindings_deserialize_bool(RustSerializationReader*, bool* out_value);
+JSCompletion web_bindings_deserialize_i64(RustSerializationReader*, i64* out_value);
+JSCompletion web_bindings_deserialize_optional_u64(RustSerializationReader*, bool* out_has_value, u64* out_value);
+JSCompletion web_bindings_deserialize_bytes(RustSerializationReader*, void* bytes, void (*append)(void*, u8 const*, size_t));
+JSCompletion web_bindings_deserialize_utf16_string(RustSerializationReader*, FlatPtr* out_string);
+void web_bindings_serialize_inline_object_header(RustSerializationWriter*, u16 interface_name);
+JSCompletion web_bindings_deserialize_inline_object_header(RustSerializationReader*, u16 interface_name);
+
+void* web_bindings_wrapper_world(void* realm, bool* is_main_world)
+{
+    auto& wrapper_world = host_defined_wrapper_world(*static_cast<JS::Realm*>(realm));
+    *is_main_world = wrapper_world.is_main_world();
+    return &wrapper_world;
+}
+
+JSObject* web_bindings_rust_wrapper_for(void* realm, void* cell)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto wrapper = host_defined_wrapper_world(js_realm).rust_wrapper_for(*static_cast<RustInterfaceCell*>(cell), js_realm);
+    return JS::HostABI::object_to_abi(wrapper.ptr());
+}
+
+void web_bindings_set_rust_wrapper(void* realm, void* cell, JSObject* wrapper)
+{
+    auto& host_object = as<JS::HostObject>(*JS::HostABI::object_from_abi(wrapper));
+    host_defined_wrapper_world(*static_cast<JS::Realm*>(realm)).set_rust_wrapper(*static_cast<RustInterfaceCell*>(cell), host_object);
+}
+
+bool web_bindings_realm_is_window(void* realm)
+{
+    return HTML::window_from_global_object(static_cast<JS::Realm*>(realm)->global_object());
+}
+
+void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*))
+{
+    HTML::TemporaryExecutionContext execution_context { *static_cast<JS::Realm*>(realm), callbacks_enabled ? HTML::TemporaryExecutionContext::CallbacksEnabled::Yes : HTML::TemporaryExecutionContext::CallbacksEnabled::No };
+    steps(context);
+}
+
+bool web_bindings_object_implements_interface(JSObject* object, u16 interface_name)
+{
+    auto* wrappable = wrappable_impl_from(JS::HostABI::object_from_abi(object));
+    return wrappable && wrappable->implements_interface(static_cast<InterfaceName>(interface_name));
+}
+
+JSObject* web_bindings_create_dom_exception(void* realm, ReadonlyBytes name, FlatPtr message)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto exception = WebIDL::DOMException::create(FlyString::from_utf8_without_validation(name), Utf16String::from_raw(message));
+    return JS::HostABI::object_to_abi(wrap(host_defined_wrapper_world(js_realm), js_realm, exception).ptr());
+}
+
+// https://html.spec.whatwg.org/multipage/browsers.html#extract-an-origin
+bool web_bindings_extract_an_origin(JSObject* object, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*))
+{
+    auto* js_object = JS::HostABI::object_from_abi(object);
+    Optional<URL::Origin> origin;
+
+    // NB: IDL only ever sees HTML::WindowProxy but we want to use HTML::Window.
+    if (auto* window_proxy = HTML::WindowProxy::from_object(*js_object)) {
+        if (auto window = window_proxy->window())
+            origin = window->extract_an_origin();
+    } else if (auto const* wrappable = wrappable_impl_from(js_object)) {
+        origin = wrappable->extract_an_origin();
+    }
+
+    if (!origin.has_value())
+        return false;
+    URL::RustIntegration::lend_origin_to_ffi(*origin, [&](URL::FFI::FfiOrigin const& ffi_origin) {
+        on_origin(ctx, &ffi_origin);
+    });
+    return true;
+}
+
+// StructuredSerializeInternal of a value that the serialized form of an object of an interface implemented in Rust
+// holds, https://html.spec.whatwg.org/multipage/structured-data.html#sub-serialization
+JSCompletion web_bindings_serialize_value(RustSerializationWriter* writer, JSValue value)
+{
+    auto result = HTML::structured_serialize_internal(writer->realm->vm(), writer->serialized, JS::HostABI::value_from_abi(value), writer->for_storage, writer->memory);
+    if (result.is_exception())
+        return completion_to_abi(writer->realm, result.exception());
+    return completion_to_abi(writer->realm, JS::js_undefined());
+}
+
+void web_bindings_serialize_u32(RustSerializationWriter* writer, u32 value)
+{
+    writer->serialized.encode(value);
+}
+
+void web_bindings_serialize_f64(RustSerializationWriter* writer, double value)
+{
+    writer->serialized.encode(value);
+}
+
+void web_bindings_serialize_bool(RustSerializationWriter* writer, bool value)
+{
+    writer->serialized.encode(value);
+}
+
+void web_bindings_serialize_i64(RustSerializationWriter* writer, i64 value)
+{
+    writer->serialized.encode(value);
+}
+
+void web_bindings_serialize_optional_u64(RustSerializationWriter* writer, bool has_value, u64 value)
+{
+    writer->serialized.encode(has_value ? Optional<u64> { value } : Optional<u64> {});
+}
+
+void web_bindings_serialize_utf16_string(RustSerializationWriter* writer, FlatPtr string)
+{
+    writer->serialized.encode(Utf16String::from_raw(string));
+}
+
+void web_bindings_serialize_bytes(RustSerializationWriter* writer, ReadonlyBytes bytes)
+{
+    writer->serialized.encode(bytes);
+}
+
+// StructuredDeserialize of a value that the serialized form of an object holds, https://html.spec.whatwg.org/multipage/structured-data.html#sub-deserialization
+JSCompletion web_bindings_deserialize_value(RustSerializationReader* reader)
+{
+    return completion_to_abi(reader->realm, HTML::structured_deserialize_internal(reader->realm->vm(), reader->serialized, reader->realm, reader->memory));
+}
+
+JSCompletion web_bindings_deserialize_u32(RustSerializationReader* reader, u32* out_value)
+{
+    return deserialize_plain_value(reader, out_value);
+}
+
+JSCompletion web_bindings_deserialize_f64(RustSerializationReader* reader, double* out_value)
+{
+    return deserialize_plain_value(reader, out_value);
+}
+
+JSCompletion web_bindings_deserialize_bool(RustSerializationReader* reader, bool* out_value)
+{
+    return deserialize_plain_value(reader, out_value);
+}
+
+JSCompletion web_bindings_deserialize_i64(RustSerializationReader* reader, i64* out_value)
+{
+    return deserialize_plain_value(reader, out_value);
+}
+
+JSCompletion web_bindings_deserialize_optional_u64(RustSerializationReader* reader, bool* out_has_value, u64* out_value)
+{
+    Optional<u64> value;
+    auto result = deserialize_plain_value(reader, &value);
+    *out_has_value = value.has_value();
+    *out_value = value.value_or(0);
+    return result;
+}
+
+JSCompletion web_bindings_deserialize_bytes(RustSerializationReader* reader, void* bytes, void (*append)(void*, u8 const*, size_t))
+{
+    ByteBuffer buffer;
+    auto result = deserialize_plain_value(reader, &buffer);
+    if (!buffer.is_empty())
+        append(bytes, buffer.data(), buffer.size());
+    return result;
+}
+
+JSCompletion web_bindings_deserialize_utf16_string(RustSerializationReader* reader, FlatPtr* out_string)
+{
+    Utf16String string;
+    auto result = deserialize_plain_value(reader, &string);
+    *out_string = move(string).into_raw();
+    return result;
+}
+
+// The record of a serializable object of the interface as StructuredSerializeInternal starts it, for an object that
+// steps serialize in place, without a position in the memory of the serialization.
+void web_bindings_serialize_inline_object_header(RustSerializationWriter* writer, u16 interface_name)
+{
+    writer->serialized.encode(to_underlying(HTML::ValueTag::SerializableObject));
+    writer->serialized.encode(static_cast<InterfaceName>(interface_name));
+    if (writer->serialized.type() == HTML::SerializationType::Storage)
+        writer->serialized.encode(HTML::serializable_payload_version);
+}
+
+// Reads what web_bindings_serialize_inline_object_header() writes, and throws a "DataCloneError" DOMException if it is
+// not the start of the record of a serializable object of the interface.
+JSCompletion web_bindings_deserialize_inline_object_header(RustSerializationReader* reader, u16 interface_name)
+{
+    auto result = [&]() -> WebIDL::ExceptionOr<JS::Value> {
+        auto tag = TRY(HTML::decode_or_throw_data_clone_error<u8>(reader->realm, reader->serialized));
+        auto name = TRY(HTML::decode_or_throw_data_clone_error<InterfaceName>(reader->realm, reader->serialized));
+        if (tag != to_underlying(HTML::ValueTag::SerializableObject) || name != static_cast<InterfaceName>(interface_name))
+            return WebIDL::DataCloneError::create(reader->realm, "Unexpected serializable object"_utf16);
+        if (reader->serialized.type() == HTML::SerializationType::Storage) {
+            auto version = TRY(HTML::decode_or_throw_data_clone_error<u64>(reader->realm, reader->serialized));
+            if (version != HTML::serializable_payload_version)
+                return WebIDL::DataCloneError::create(reader->realm, "Unsupported serializable payload version"_utf16);
+        }
+        return JS::js_undefined();
+    }();
+    return completion_to_abi(reader->realm, move(result));
+}
+
+JSObject* web_bindings_rejected_promise(void* current_realm, JSValue this_value, JSValue reason)
+{
+    auto& realm = *static_cast<JS::Realm*>(current_realm);
+    auto promise_realm_this_value = JS::HostABI::value_from_abi(this_value);
+    if (promise_realm_this_value.is_nullish())
+        promise_realm_this_value = &realm.global_object();
+    auto& promise_realm = this_value_realm(realm, promise_realm_this_value);
+    auto promise = WebIDL::create_rejected_promise(promise_realm, JS::HostABI::value_from_abi(reason));
+    return JS::HostABI::object_to_abi(promise->promise().ptr());
+}
+
+void web_bindings_queue_a_microtask(void* realm, JSObject* function)
+{
+    GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
+    GC::Ref<JS::FunctionObject> steps = as<JS::FunctionObject>(*JS::HostABI::object_from_abi(function));
+    HTML::queue_a_microtask(nullptr, GC::create_function(GC::Heap::the(), [js_realm, steps] {
+        HTML::TemporaryExecutionContext execution_context { js_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+        MUST(JS::call(steps->vm(), *steps, JS::js_undefined()));
+    }));
+}
+
+void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, void*))
+{
+    GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
+    // NB: The function's captures, which the collector scans, keep the cell alive until the steps run.
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [js_realm, cell, steps] {
+        HTML::TemporaryExecutionContext execution_context { js_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell);
+    }));
+}
+
+// NB: The task sources of the Rust bindings' TaskSource.
+static_assert(to_underlying(HTML::Task::Source::Unspecified) == 0);
+static_assert(to_underlying(HTML::Task::Source::Networking) == 3);
+static_assert(to_underlying(HTML::Task::Source::FileReading) == 13);
+
+void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
+{
+    GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
+    // NB: The task's captures, which the collector scans, keep the cell alive until the steps run.
+    HTML::queue_a_task(static_cast<HTML::Task::Source>(task_source), nullptr, nullptr, GC::create_function(GC::Heap::the(), [js_realm, cell, steps] {
+        HTML::TemporaryExecutionContext execution_context { js_realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell);
+    }));
+}
+
+u64 web_bindings_queue_a_global_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
+{
+    GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
+    // NB: The task's captures, which the collector scans, keep the cell alive until the steps run.
+    auto task_id = HTML::queue_global_task(static_cast<HTML::Task::Source>(task_source), js_realm->global_object(), GC::create_function(GC::Heap::the(), [js_realm, cell, steps] {
+        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell);
+    }));
+    return task_id.value();
+}
+
+void web_bindings_remove_tasks(void* realm, ReadonlySpan<u64> task_ids)
+{
+    auto& event_loop = *HTML::relevant_agent(static_cast<JS::Realm*>(realm)->global_object()).event_loop;
+    event_loop.task_queue().remove_tasks_matching([&](auto const& task) {
+        return task_ids.contains_slow(task.id().value());
+    });
+}
+
+u64 web_bindings_currently_running_task(void* realm)
+{
+    auto& event_loop = *HTML::relevant_agent(static_cast<JS::Realm*>(realm)->global_object()).event_loop;
+    VERIFY(event_loop.currently_running_task());
+    return event_loop.currently_running_task()->id().value();
+}
+
+void* web_bindings_create_callback_function(JSObject* callable, bool returns_promise)
+{
+    auto& object = *JS::HostABI::object_from_abi(callable);
+    return GC::Heap::the().allocate<WebIDL::CallbackType>(object, HTML::incumbent_settings_object(), returns_promise ? WebIDL::OperationReturnsPromise::Yes : WebIDL::OperationReturnsPromise::No).ptr();
+}
+
+static GC::RootVector<JS::Value> callback_arguments(ReadonlySpan<JSValue> arguments)
+{
+    GC::RootVector<JS::Value> values;
+    values.ensure_capacity(arguments.size());
+    for (auto argument : arguments)
+        values.unchecked_append(JS::HostABI::value_from_abi(argument));
+    return values;
+}
+
+JSCompletion web_bindings_invoke_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments)
+{
+    Optional<JS::Value> this_argument;
+    if (has_this_value)
+        this_argument = JS::HostABI::value_from_abi(this_value);
+    auto completion = WebIDL::invoke_callback(*static_cast<WebIDL::CallbackType*>(callback), this_argument, callback_arguments(arguments));
+    if (completion.is_error())
+        return JS::HostABI::throw_completion_to_abi(completion.value());
+    return JS::HostABI::normal_completion_to_abi(JS::HostABI::value_to_abi(completion.value()));
+}
+
+void* web_bindings_invoke_promise_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments)
+{
+    Optional<JS::Value> this_argument;
+    if (has_this_value)
+        this_argument = JS::HostABI::value_from_abi(this_value);
+    return WebIDL::invoke_promise_callback(*static_cast<WebIDL::CallbackType*>(callback), this_argument, callback_arguments(arguments)).ptr();
+}
+}
+
+}

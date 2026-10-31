@@ -7,6 +7,7 @@
 #include "CSSMathValue.h"
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
+#include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
 
 namespace Web::CSS {
 
@@ -30,21 +31,23 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> CSSMathValue::create_an_int
     //
     //     Return the value.
 
-    // FIXME: Check types allowed by registered custom properties.
     auto context = CalculationContext::for_property(property);
     auto matches = [&] {
         if (type().matches_angle(context.percentages_resolve_as))
             return property_accepts_type(property.id(), ValueType::Angle);
-        if (type().matches_flex(context.percentages_resolve_as))
-            return property_accepts_type(property.id(), ValueType::Flex);
+        if (type().matches_flex(context.percentages_resolve_as)) {
+            // https://drafts.csswg.org/css-grid-2/#fr-unit
+            // NB: <flex> values "cannot be represented in or combined with other unit types in calc() expressions".
+            return property.is_custom_property() && property_accepts_type(property.id(), ValueType::Flex);
+        }
         if (type().matches_frequency(context.percentages_resolve_as))
             return property_accepts_type(property.id(), ValueType::Frequency);
         if (type().matches_length(context.percentages_resolve_as))
             return property_accepts_type(property.id(), ValueType::Length);
         if (type().matches_number(context.percentages_resolve_as))
-            return property_accepts_type(property.id(), ValueType::Number);
+            return property_accepts_type(property.id(), ValueType::Number) || property_accepts_type(property.id(), ValueType::Integer) || property_accepts_type(property.id(), ValueType::OpacityValue);
         if (type().matches_percentage())
-            return property_accepts_type(property.id(), ValueType::Percentage);
+            return property_accepts_type(property.id(), ValueType::Percentage) || property_accepts_type(property.id(), ValueType::OpacityValue);
         if (type().matches_resolution(context.percentages_resolve_as))
             return property_accepts_type(property.id(), ValueType::Resolution);
         if (type().matches_time(context.percentages_resolve_as))
@@ -55,7 +58,13 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleValue const>> CSSMathValue::create_an_int
     if (perform_type_check == PerformTypeCheck::Yes && !matches)
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Property does not accept values of this type."_utf16 };
 
-    return CalculatedStyleValue::create(TRY(create_calculation_node(context)), type(), move(context));
+    auto calculated_value = CalculatedStyleValue::create(TRY(create_calculation_node(context)), type(), move(context));
+
+    // NB: Our parser represents an <opacity-value> as an opacity value that holds the calculation.
+    if (property_accepts_type(property.id(), ValueType::OpacityValue) && (type().matches_number({}) || type().matches_percentage()))
+        return OpacityValueStyleValue::create(move(calculated_value));
+
+    return calculated_value;
 }
 
 }

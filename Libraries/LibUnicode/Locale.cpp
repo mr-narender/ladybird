@@ -13,9 +13,11 @@
 #include <AK/Utf16StringBuilder.h>
 #include <LibUnicode/ICU.h>
 #include <LibUnicode/Locale.h>
+#include <LibUnicode/TextMapping.h>
 
 #include <unicode/localebuilder.h>
 #include <unicode/locid.h>
+#include <unicode/uscript.h>
 
 namespace Unicode {
 
@@ -122,52 +124,32 @@ static Optional<typename Lexer::ViewType> consume_next_segment(Lexer& lexer, boo
     return segment;
 }
 
-bool is_type_identifier(StringView identifier)
+template<typename ViewType>
+static bool is_type_identifier_impl(ViewType identifier)
 {
     // type = alphanum{3,8} (sep alphanum{3,8})*
-    GenericLexer lexer { identifier };
-
-    while (true) {
-        auto type = consume_next_segment(lexer, lexer.tell() > 0);
-        if (!type.has_value())
-            break;
-        if (!is_single_type(*type))
-            return false;
-    }
-
-    return lexer.is_eof() && (lexer.tell() > 0);
-}
-
-bool is_type_identifier(Utf16View identifier)
-{
-    // type = alphanum{3,8} (sep alphanum{3,8})*
-    bool saw_type = false;
-    bool is_valid = true;
+    // NB: Only the hyphen form of sep is accepted, as in BCP 47 language tags.
     size_t start = 0;
 
-    auto validate_type = [&](Utf16View type) {
-        saw_type = true;
-        if (type.is_empty() || !is_single_type(type)) {
-            is_valid = false;
-            return IterationDecision::Break;
-        }
-        return IterationDecision::Continue;
-    };
-
-    for (size_t i = 0; i < identifier.length_in_code_units(); ++i) {
-        auto code_unit = identifier.code_unit_at(i);
-        if (code_unit != '-' && code_unit != '_')
+    for (size_t i = 0; i <= view_length(identifier); ++i) {
+        if (i < view_length(identifier) && view_code_unit_at(identifier, i) != '-')
             continue;
-
-        if (validate_type(identifier.substring_view(start, i - start)) == IterationDecision::Break)
+        if (!is_single_type(identifier.substring_view(start, i - start)))
             return false;
         start = i + 1;
     }
 
-    if (validate_type(identifier.substring_view(start)) == IterationDecision::Break)
-        return false;
+    return true;
+}
 
-    return saw_type && is_valid;
+bool is_type_identifier(StringView identifier)
+{
+    return is_type_identifier_impl(identifier);
+}
+
+bool is_type_identifier(Utf16View identifier)
+{
+    return is_type_identifier_impl(identifier);
 }
 
 template<typename Lexer>
@@ -577,12 +559,12 @@ Optional<LocaleID> parse_unicode_locale_id(Utf16View locale)
     return parse_unicode_locale_id_from_lexer(lexer);
 }
 
-Utf16String canonicalize_unicode_locale_id(StringView locale)
+Optional<Utf16String> canonicalize_unicode_locale_id(StringView locale)
 {
     return LocaleData::canonicalize(locale);
 }
 
-Utf16String canonicalize_unicode_locale_id(Utf16View locale)
+Optional<Utf16String> canonicalize_unicode_locale_id(Utf16View locale)
 {
     return LocaleData::canonicalize(locale.bytes());
 }
@@ -590,17 +572,21 @@ Utf16String canonicalize_unicode_locale_id(Utf16View locale)
 Utf16String canonicalize_unicode_extension_values(StringView key, Utf16View value)
 {
     VERIFY(value.has_ascii_storage());
+    auto lowercase_value = value.to_ascii_lowercase();
 
     UErrorCode status = U_ZERO_ERROR;
 
     icu::LocaleBuilder builder;
-    builder.setUnicodeLocaleKeyword(icu_string_piece(key), icu_string_piece(value.bytes()));
+    builder.setUnicodeLocaleKeyword(icu_string_piece(key), icu_string_piece(lowercase_value.ascii_view()));
 
     auto locale = builder.build(status);
     verify_icu_success(status);
 
     auto result = locale.getUnicodeKeywordValue<StringBuilder>(icu_string_piece(key), status);
     verify_icu_success(status);
+
+    if (result.string_view() == "true"sv)
+        return {};
 
     return Utf16String::from_ascii_without_validation(result.string_view().bytes());
 }
@@ -767,13 +753,22 @@ Optional<Utf16String> remove_likely_subtags(Utf16View locale)
     return Utf16String::from_ascii_without_validation(result.string_view().bytes());
 }
 
-bool is_locale_character_ordering_right_to_left(Utf16View locale)
+Optional<bool> is_script_right_to_left(Utf16View script)
 {
-    auto locale_data = LocaleData::for_locale(locale.bytes());
-    if (!locale_data.has_value())
-        return false; // Default to left-to-right
+    UErrorCode status = U_ZERO_ERROR;
 
-    return static_cast<bool>(locale_data->locale().isRightToLeft());
+    UScriptCode script_code = USCRIPT_INVALID_CODE;
+    auto script_name = MUST(script.to_byte_string());
+    auto count = uscript_getCode(script_name.characters(), &script_code, 1, &status);
+    if (icu_failure(status) || count != 1)
+        return {};
+
+    // ICU's direction predicate returns false for scripts with no direction data. Common and Inherited also do
+    // not have a writing direction.
+    if (script_code == USCRIPT_COMMON || script_code == USCRIPT_INHERITED || uscript_getUsage(script_code) <= USCRIPT_USAGE_UNKNOWN)
+        return {};
+
+    return static_cast<bool>(uscript_isRightToLeft(script_code));
 }
 
 static void append_to_builder(StringBuilder& builder, StringView string)
@@ -897,4 +892,12 @@ Utf16String LocaleID::to_utf16_string() const
     return builder.to_string();
 }
 
+}
+
+extern "C" void unicode_default_locale(UnicodeTextMappingOutput output)
+{
+    auto locale = Unicode::default_locale();
+    auto* destination = output.allocate_text(output.context, locale.length_in_code_units());
+    for (size_t i = 0; i < locale.length_in_code_units(); ++i)
+        destination[i] = locale.code_unit_at(i);
 }

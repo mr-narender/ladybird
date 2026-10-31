@@ -78,7 +78,7 @@ private:
     void reestablish_the_connection();
     void fail_the_connection();
 
-    void interpret_response(ReadonlyBytes);
+    void interpret_response(ReadonlyBytes, bool is_start_of_stream);
     void process_field(Utf16View field, Utf16View value);
     void dispatch_the_event();
     JS::Object& relevant_global_object() const;
@@ -89,7 +89,7 @@ private:
     URL::URL m_url;
 
     // https://html.spec.whatwg.org/multipage/server-sent-events.html#concept-event-stream-request
-    GC::Ptr<Fetch::Infrastructure::Request> m_request;
+    RefPtr<Fetch::Infrastructure::Request> m_request;
 
     // https://html.spec.whatwg.org/multipage/server-sent-events.html#concept-event-stream-reconnection-time
     AK::Duration m_reconnection_time { AK::Duration::from_seconds(3) };
@@ -106,6 +106,7 @@ private:
 
     GC::Ptr<Fetch::Infrastructure::FetchAlgorithms> m_fetch_algorithms;
     GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
+    GC::Ptr<Platform::Timer> m_reconnection_timer;
     GC::Ref<DOM::EventTarget> m_global_object;
 };
 

@@ -13,6 +13,7 @@
 #    include <dirent.h>
 #    include <errno.h>
 #    include <fcntl.h>
+#    include <link.h>
 #    include <linux/landlock.h>
 #    include <stdlib.h>
 #    include <string.h>
@@ -25,6 +26,7 @@
 #if defined(AK_OS_MACOS)
 #    include <AK/LexicalPath.h>
 #    include <AK/StringBuilder.h>
+#    include <LibCore/StatsLog.h>
 #    include <errno.h>
 #    include <limits.h>
 #    include <sandbox.h>
@@ -39,6 +41,10 @@ int sandbox_init_with_parameters(char const* profile, u64 flags, char const* con
 
 #if defined(__GLIBC__)
 #    include <malloc.h>
+#endif
+
+#if defined(AK_OS_LINUX) && defined(HAS_ADDRESS_SANITIZER)
+#    include <sanitizer/common_interface_defs.h>
 #endif
 
 namespace Sandbox {
@@ -57,6 +63,13 @@ ErrorOr<void> configure_runtime()
 #if defined(AK_OS_LINUX) && defined(__GLIBC__) && defined(M_ARENA_MAX) && !defined(HAS_ADDRESS_SANITIZER)
     if (mallopt(M_ARENA_MAX, 4) == 0)
         return Error::from_string_literal("mallopt(M_ARENA_MAX) failed");
+#endif
+#if defined(AK_OS_LINUX) && defined(HAS_ADDRESS_SANITIZER)
+    // The sanitizers symbolize a report through an llvm-symbolizer process they start the first time they need one, but
+    // the seccomp filter kills the fork and Landlock refuses the exec once the sandbox is in place, so a report would be
+    // lost with its stack. Symbolize one address now so that process is already running when a report needs it.
+    char symbolized_pc[64];
+    __sanitizer_symbolize_pc(__builtin_return_address(0), "%p %F", symbolized_pc, sizeof(symbolized_pc));
 #endif
     return {};
 }
@@ -81,6 +94,28 @@ ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringVie
     }
 
     TRY(paths.try_append({ move(path_bytes), access, is_directory }));
+    return {};
+}
+
+ErrorOr<void> add_loaded_library_directories(Vector<LandlockPath>& paths, Optional<StringView> root)
+{
+    Vector<ByteString> directories;
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void* data) {
+        auto& directories = *static_cast<Vector<ByteString>*>(data);
+        StringView name { info->dlpi_name, strlen(info->dlpi_name) };
+        if (name.starts_with('/')) {
+            auto directory = LexicalPath::dirname(name);
+            if (!directories.contains_slow(directory))
+                directories.append(move(directory));
+        }
+        return 0;
+    },
+        &directories);
+
+    for (auto const& directory : directories) {
+        if (!root.has_value() || LexicalPath { directory }.is_child_of(LexicalPath { root->to_byte_string() }))
+            TRY(add_landlock_path_if_exists(paths, directory, LandlockPath::Access::ReadOnly));
+    }
     return {};
 }
 #endif
@@ -249,6 +284,7 @@ static ErrorOr<void> append_allowed_executables(StringBuilder& builder, Readonly
     if (executable_paths.is_empty())
         return {};
 
+    builder.append("(allow syscall-unix (syscall-number SYS_posix_spawn SYS_wait4))\n"sv);
     builder.append("(allow process-fork)\n(allow process-exec"sv);
     for (auto const& path : executable_paths) {
         builder.append(" (literal "sv);
@@ -256,6 +292,9 @@ static ErrorOr<void> append_allowed_executables(StringBuilder& builder, Readonly
         builder.append(')');
     }
     builder.append(")\n"sv);
+
+    // NB: Child processes inherit the sandbox, and dyld needs F_GETPATH to find the shared library cache during startup.
+    builder.append("(allow system-fcntl (fcntl-command F_GETPATH))\n"sv);
 
     return {};
 }
@@ -308,11 +347,12 @@ static ErrorOr<void> append_allowed_mach_services(StringBuilder& builder, Seatbe
     (global-name "com.apple.audio.audiohald")
     (global-name "com.apple.audio.AudioSession")
     (xpc-service-name "com.apple.audio.SandboxHelper"))
+(allow device-microphone)
 )~~~"sv);
     }
 
     // Audio output units and audio decoders alike go through the component registrar.
-    if (has_flag(options.system_services, SystemService::Audio)) {
+    if (has_flag(options.system_services, SystemService::Audio) || has_flag(options.system_services, SystemService::AudioDecoding)) {
         builder.append(R"~~~(
 (allow mach-lookup
     (global-name "com.apple.audio.AudioComponentRegistrar"))
@@ -536,7 +576,6 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
         SYS_persona
         SYS_pipe
         SYS_poll
-        SYS_posix_spawn
         SYS_proc_info
         SYS_readlink
         SYS_removexattr
@@ -556,7 +595,6 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
         SYS_umask
         SYS_unlink
         SYS_unlinkat
-        SYS_wait4
         SYS_work_interval_ctl
         SYS_workq_kernreturn
         SYS_workq_open))
@@ -645,6 +683,10 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
 
 )~~~"sv));
 
+    // Core::System::pipe2() uses the native syscall on macOS 27. Older Seatbelt versions do not know this syscall.
+    if (__builtin_available(macOS 27.0, *))
+        TRY(profile.try_append("(allow syscall-unix (syscall-number SYS_pipe2))\n"sv));
+
     if (options.network_access == NetworkAccess::Allowed) {
         TRY(profile.try_append(R"~~~(
 ; Connect to hosts on the network and to the system's network daemons, but not to local sockets of other processes.
@@ -652,6 +694,10 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
     (remote ip)
     (control-name "com.apple.netsrc")
     (literal "/private/var/run/mDNSResponder"))
+
+; SecTrust evaluates TLS certificates through the per-user trust daemon.
+(allow mach-lookup
+    (global-name "com.apple.trustd.agent"))
 
 ; Sharing a port with another socket would let a helper receive traffic that is meant for another process.
 (deny socket-option-set
@@ -681,6 +727,12 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
     TRY(append_allowed_ancestor_directories(profile, options.paths));
     TRY(append_allowed_paths(profile, "file-map-executable"sv, options.paths, SeatbeltPath::Access::ReadAndExecute));
     TRY(append_allowed_paths(profile, "file-write*"sv, options.paths, SeatbeltPath::Access::ReadWrite));
+    if (auto* log = Core::StatsLog::the()) {
+        Vector<SeatbeltPath> log_paths;
+        TRY(add_seatbelt_path_if_exists(log_paths, log->path(), SeatbeltPath::Access::ReadWrite));
+        // Only append to this process's already-open log, without granting access to the statistics directory.
+        TRY(append_allowed_paths(profile, "file-write-data"sv, log_paths, SeatbeltPath::Access::ReadWrite));
+    }
     TRY(append_allowed_paths(profile, "file-lock"sv, options.paths, SeatbeltPath::Access::ReadWrite));
     TRY(append_allowed_path_extensions(profile, options.paths, SeatbeltPath::Access::ReadOnly));
     TRY(append_allowed_path_extensions(profile, options.paths, SeatbeltPath::Access::ReadWrite));

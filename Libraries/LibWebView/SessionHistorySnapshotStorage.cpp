@@ -431,6 +431,30 @@ ErrorOr<Web::ContentSecurityPolicy::PolicySource> decode_csp_source(i64 tag)
     }
 }
 
+// Schema-stable tags for the insecure requests policy. These values are persisted; never reorder them.
+i64 encode_insecure_requests_policy(Web::UpgradeInsecureRequests::InsecureRequestsPolicy policy)
+{
+    switch (policy) {
+    case Web::UpgradeInsecureRequests::InsecureRequestsPolicy::DoNotUpgrade:
+        return 0;
+    case Web::UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade:
+        return 1;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+ErrorOr<Web::UpgradeInsecureRequests::InsecureRequestsPolicy> decode_insecure_requests_policy(i64 tag)
+{
+    switch (tag) {
+    case 0:
+        return Web::UpgradeInsecureRequests::InsecureRequestsPolicy::DoNotUpgrade;
+    case 1:
+        return Web::UpgradeInsecureRequests::InsecureRequestsPolicy::Upgrade;
+    default:
+        return Error::from_string_literal("Persisted insecure requests policy has an unknown tag");
+    }
+}
+
 static constexpr size_t MAX_STATE_RECORD_BYTES = 8uz * 1024 * 1024;
 static constexpr size_t MAX_TEXT_COLUMN_BYTES = 8uz * 1024 * 1024;
 static constexpr size_t MAX_SNAPSHOT_BYTES = 64uz * 1024 * 1024;
@@ -441,6 +465,7 @@ static constexpr size_t MAX_SNAPSHOT_ENTRIES = 8192;
 static constexpr size_t MAX_SNAPSHOT_CSP_POLICIES = 16384;
 static constexpr size_t MAX_SNAPSHOT_CSP_DIRECTIVES = 65536;
 static constexpr size_t MAX_SNAPSHOT_CSP_DIRECTIVE_VALUES = 65536;
+static constexpr size_t MAX_SNAPSHOT_UPGRADE_INSECURE_NAVIGATIONS = 16384;
 
 struct SnapshotRowTotals {
     size_t histories { 1 }; // the root
@@ -448,6 +473,7 @@ struct SnapshotRowTotals {
     size_t csp_policies { 0 };
     size_t csp_directives { 0 };
     size_t csp_directive_values { 0 };
+    size_t upgrade_insecure_navigations { 0 };
     size_t bytes { 0 };
 };
 
@@ -504,6 +530,7 @@ static ErrorOr<void> validate_entry_within_column_caps(Web::HTML::SessionHistory
     TRY(validate_text_column_within_cap(entry.url.serialize(), totals));
     TRY(validate_text_column_within_cap(entry.navigation_api_key, totals));
     TRY(validate_text_column_within_cap(entry.navigation_api_id, totals));
+    TRY(validate_text_column_within_cap(entry.directive_state_value, totals));
     TRY(validate_text_column_within_cap(document_state.navigable_target_name, totals));
     if (document_state.about_base_url.has_value())
         TRY(validate_text_column_within_cap(document_state.about_base_url->serialize(), totals));
@@ -525,6 +552,8 @@ static ErrorOr<void> validate_entry_within_column_caps(Web::HTML::SessionHistory
                     TRY(validate_text_column_within_cap(value, totals));
             }
         }
+        for (auto const& tuple : container->upgrade_insecure_navigations_set.tuples())
+            TRY(validate_text_column_within_cap(tuple.host.serialize(), totals));
     }
 
     return {};
@@ -548,22 +577,24 @@ ErrorOr<SessionHistorySnapshotStatements> prepare_session_history_snapshot_state
                 history_id, entry_ordinal, step, url, document_state_namespace_id, document_state_local_id,
                 classic_state, navigation_state,
                 navigation_api_key, navigation_api_id, scroll_restoration_mode,
+                directive_state_namespace_id, directive_state_local_id, directive_state_value,
                 scroll_x_raw, scroll_y_raw,
                 origin_kind, origin_nonce, origin_scheme, origin_host, origin_port, origin_domain,
                 initiator_origin_kind, initiator_origin_nonce, initiator_origin_scheme,
                 initiator_origin_host, initiator_origin_port, initiator_origin_domain,
                 referrer_kind, referrer_url, referrer_policy, resource_kind, resource_string,
-                about_base_url, navigable_target_name, ever_populated, reload_pending)
+                about_base_url, navigable_target_name, ever_populated, reload_pending, user_agent_initiated)
             VALUES (
                 :history_id, :entry_ordinal, :step, :url, :document_state_namespace_id, :document_state_local_id,
                 :classic_state, :navigation_state,
                 :navigation_api_key, :navigation_api_id, :scroll_restoration_mode,
+                :directive_state_namespace_id, :directive_state_local_id, :directive_state_value,
                 :scroll_x_raw, :scroll_y_raw,
                 :origin_kind, :origin_nonce, :origin_scheme, :origin_host, :origin_port, :origin_domain,
                 :initiator_origin_kind, :initiator_origin_nonce, :initiator_origin_scheme,
                 :initiator_origin_host, :initiator_origin_port, :initiator_origin_domain,
                 :referrer_kind, :referrer_url, :referrer_policy, :resource_kind, :resource_string,
-                :about_base_url, :navigable_target_name, :ever_populated, :reload_pending);
+                :about_base_url, :navigable_target_name, :ever_populated, :reload_pending, :user_agent_initiated);
         )#"sv)),
         .insert_used_step = TRY(database.prepare_statement(
             "INSERT INTO SessionUsedSteps (tab_id, step_ordinal, step) VALUES (:tab_id, :step_ordinal, :step);"sv)),
@@ -571,11 +602,11 @@ ErrorOr<SessionHistorySnapshotStatements> prepare_session_history_snapshot_state
             INSERT INTO SessionPolicyContainers (
                 history_id, entry_ordinal, referrer_policy, embedder_policy_value,
                 embedder_policy_report_only_value, embedder_policy_reporting_endpoint,
-                embedder_policy_report_only_reporting_endpoint)
+                embedder_policy_report_only_reporting_endpoint, force_load_at_top, insecure_requests_policy)
             VALUES (
                 :history_id, :entry_ordinal, :referrer_policy, :embedder_policy_value,
                 :embedder_policy_report_only_value, :embedder_policy_reporting_endpoint,
-                :embedder_policy_report_only_reporting_endpoint)
+                :embedder_policy_report_only_reporting_endpoint, :force_load_at_top, :insecure_requests_policy)
             RETURNING id;
         )#"sv)),
         .insert_csp_policy = TRY(database.prepare_statement(R"#(
@@ -593,6 +624,8 @@ ErrorOr<SessionHistorySnapshotStatements> prepare_session_history_snapshot_state
             "INSERT INTO SessionCspDirectives (policy_id, directive_ordinal, name) VALUES (:policy_id, :directive_ordinal, :name) RETURNING id;"sv)),
         .insert_csp_directive_value = TRY(database.prepare_statement(
             "INSERT INTO SessionCspDirectiveValues (directive_id, value_ordinal, value) VALUES (:directive_id, :value_ordinal, :value);"sv)),
+        .insert_upgrade_insecure_navigation = TRY(database.prepare_statement(
+            "INSERT INTO SessionUpgradeInsecureNavigations (container_id, tuple_ordinal, host, port) VALUES (:container_id, :tuple_ordinal, :host, :port);"sv)),
         .select_histories = TRY(database.prepare_statement(
             "SELECT id FROM SessionHistories WHERE tab_id = :tab_id;"sv)),
         .select_nested_history_links = TRY(database.prepare_statement(R"#(
@@ -607,12 +640,13 @@ ErrorOr<SessionHistorySnapshotStatements> prepare_session_history_snapshot_state
             SELECT history_id, entry_ordinal, step, url, document_state_namespace_id, document_state_local_id,
                 classic_state, navigation_state,
                 navigation_api_key, navigation_api_id, scroll_restoration_mode,
+                directive_state_namespace_id, directive_state_local_id, directive_state_value,
                 scroll_x_raw, scroll_y_raw,
                 origin_kind, origin_nonce, origin_scheme, origin_host, origin_port, origin_domain,
                 initiator_origin_kind, initiator_origin_nonce, initiator_origin_scheme,
                 initiator_origin_host, initiator_origin_port, initiator_origin_domain,
                 referrer_kind, referrer_url, referrer_policy, resource_kind, resource_string,
-                about_base_url, navigable_target_name, ever_populated, reload_pending
+                about_base_url, navigable_target_name, ever_populated, reload_pending, user_agent_initiated
             FROM SessionEntries
             INNER JOIN SessionHistories ON SessionEntries.history_id = SessionHistories.id
             WHERE SessionHistories.tab_id = :tab_id;
@@ -622,7 +656,8 @@ ErrorOr<SessionHistorySnapshotStatements> prepare_session_history_snapshot_state
         .select_policy_containers = TRY(database.prepare_statement(R"#(
             SELECT SessionPolicyContainers.id AS id, history_id, entry_ordinal, referrer_policy,
                 embedder_policy_value, embedder_policy_report_only_value,
-                embedder_policy_reporting_endpoint, embedder_policy_report_only_reporting_endpoint
+                embedder_policy_reporting_endpoint, embedder_policy_report_only_reporting_endpoint,
+                force_load_at_top, insecure_requests_policy
             FROM SessionPolicyContainers
             INNER JOIN SessionHistories ON SessionPolicyContainers.history_id = SessionHistories.id
             WHERE SessionHistories.tab_id = :tab_id;
@@ -650,6 +685,13 @@ ErrorOr<SessionHistorySnapshotStatements> prepare_session_history_snapshot_state
             INNER JOIN SessionCspDirectives ON SessionCspDirectiveValues.directive_id = SessionCspDirectives.id
             INNER JOIN SessionCspPolicies ON SessionCspDirectives.policy_id = SessionCspPolicies.id
             INNER JOIN SessionPolicyContainers ON SessionCspPolicies.container_id = SessionPolicyContainers.id
+            INNER JOIN SessionHistories ON SessionPolicyContainers.history_id = SessionHistories.id
+            WHERE SessionHistories.tab_id = :tab_id;
+        )#"sv)),
+        .select_upgrade_insecure_navigations = TRY(database.prepare_statement(R"#(
+            SELECT container_id, tuple_ordinal, host, port
+            FROM SessionUpgradeInsecureNavigations
+            INNER JOIN SessionPolicyContainers ON SessionUpgradeInsecureNavigations.container_id = SessionPolicyContainers.id
             INNER JOIN SessionHistories ON SessionPolicyContainers.history_id = SessionHistories.id
             WHERE SessionHistories.tab_id = :tab_id;
         )#"sv)),
@@ -688,8 +730,22 @@ static ErrorOr<void> store_policy_container(Database::Database& database, Sessio
         TRY(bind("embedder_policy_report_only_value"sv, encode_embedder_policy_value(container.embedder_policy.report_only_value)));
         TRY(bind("embedder_policy_reporting_endpoint"sv, container.embedder_policy.reporting_endpoint));
         TRY(bind("embedder_policy_report_only_reporting_endpoint"sv, container.embedder_policy.report_only_reporting_endpoint));
+        TRY(bind("force_load_at_top"sv, container.force_load_at_top));
+        TRY(bind("insecure_requests_policy"sv, encode_insecure_requests_policy(container.insecure_requests_policy)));
         return {};
     }));
+
+    i64 tuple_ordinal = 0;
+    for (auto const& tuple : container.upgrade_insecure_navigations_set.tuples()) {
+        TRY(database.try_execute_bound_statement(statements.insert_upgrade_insecure_navigation, [&](auto& bind) -> ErrorOr<void> {
+            TRY(bind("container_id"sv, container_id));
+            TRY(bind("tuple_ordinal"sv, tuple_ordinal));
+            TRY(bind("host"sv, tuple.host.serialize()));
+            TRY(bind("port"sv, tuple.port));
+            return {};
+        }));
+        ++tuple_ordinal;
+    }
 
     i64 policy_ordinal = 0;
     for (auto const& policy : container.csp_list) {
@@ -762,6 +818,9 @@ static ErrorOr<void> validate_entries_storable(Vector<Web::HTML::SessionHistoryE
                         return Error::from_string_literal("Session history snapshot has more CSP directive values than the supported budget");
                 }
             }
+            totals.upgrade_insecure_navigations += container->upgrade_insecure_navigations_set.tuples().size();
+            if (totals.upgrade_insecure_navigations > MAX_SNAPSHOT_UPGRADE_INSECURE_NAVIGATIONS)
+                return Error::from_string_literal("Session history snapshot has more upgrade insecure navigations than the supported budget");
         }
 
         for (auto const& nested_history : document_state.nested_histories) {
@@ -805,6 +864,9 @@ static ErrorOr<void> store_history_entries(Database::Database& database, Session
             TRY(bind("navigation_api_key"sv, entry.navigation_api_key));
             TRY(bind("navigation_api_id"sv, entry.navigation_api_id));
             TRY(bind("scroll_restoration_mode"sv, encode_scroll_restoration_mode(entry.scroll_restoration_mode)));
+            TRY(bind("directive_state_namespace_id"sv, encode_cross_process_id_component(entry.directive_state_id.namespace_id)));
+            TRY(bind("directive_state_local_id"sv, encode_cross_process_id_component(entry.directive_state_id.local_id)));
+            TRY(bind("directive_state_value"sv, entry.directive_state_value));
             TRY(bind("scroll_x_raw"sv, scroll.map([](auto const& point) { return point.x().raw_value(); })));
             TRY(bind("scroll_y_raw"sv, scroll.map([](auto const& point) { return point.y().raw_value(); })));
             TRY(bind("origin_kind"sv, origin.kind));
@@ -828,6 +890,7 @@ static ErrorOr<void> store_history_entries(Database::Database& database, Session
             TRY(bind("navigable_target_name"sv, document_state.navigable_target_name));
             TRY(bind("ever_populated"sv, document_state.ever_populated));
             TRY(bind("reload_pending"sv, document_state.reload_pending));
+            TRY(bind("user_agent_initiated"sv, document_state.user_agent_initiated == Web::HTML::UserAgentInitiated::Yes));
             return {};
         }));
         ++entry_ordinal;
@@ -899,6 +962,9 @@ struct EntryRow {
     Utf16String navigation_api_key;
     Utf16String navigation_api_id;
     i64 scroll_restoration_mode { 0 };
+    i64 directive_state_namespace_id { 0 };
+    i64 directive_state_local_id { 0 };
+    Optional<String> directive_state_value;
     Optional<i32> scroll_x_raw;
     Optional<i32> scroll_y_raw;
     PersistedOrigin origin;
@@ -910,6 +976,7 @@ struct EntryRow {
     Utf16String navigable_target_name;
     bool ever_populated { false };
     bool reload_pending { false };
+    bool user_agent_initiated { false };
 };
 
 struct PolicyContainerRow {
@@ -921,6 +988,15 @@ struct PolicyContainerRow {
     i64 embedder_policy_report_only_value { 0 };
     Utf16String embedder_policy_reporting_endpoint;
     Utf16String embedder_policy_report_only_reporting_endpoint;
+    bool force_load_at_top { false };
+    i64 insecure_requests_policy { 0 };
+};
+
+struct UpgradeInsecureNavigationRow {
+    i64 container_id { 0 };
+    i64 tuple_ordinal { 0 };
+    String host;
+    Optional<u16> port;
 };
 
 struct CspPolicyRow {
@@ -1034,7 +1110,19 @@ static ErrorOr<Web::ContentSecurityPolicy::SerializedPolicy> build_csp_policy(Cs
     };
 }
 
-static ErrorOr<Web::HTML::SerializedPolicyContainer> build_policy_container(PolicyContainerRow const& row, Vector<Web::ContentSecurityPolicy::SerializedPolicy> csp_list)
+static ErrorOr<Web::UpgradeInsecureRequests::HostAndPort> build_upgrade_insecure_navigation(UpgradeInsecureNavigationRow const& row)
+{
+    URL::Host host = String {};
+    if (!row.host.is_empty()) {
+        auto parsed_host = URL::Parser::parse_host(row.host);
+        if (!parsed_host.has_value())
+            return Error::from_string_literal("Persisted upgrade insecure navigation has an unparseable host");
+        host = parsed_host.release_value();
+    }
+    return Web::UpgradeInsecureRequests::HostAndPort { .host = move(host), .port = row.port };
+}
+
+static ErrorOr<Web::HTML::SerializedPolicyContainer> build_policy_container(PolicyContainerRow const& row, Vector<Web::ContentSecurityPolicy::SerializedPolicy> csp_list, Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet upgrade_insecure_navigations_set)
 {
     return Web::HTML::SerializedPolicyContainer {
         .csp_list = move(csp_list),
@@ -1045,6 +1133,9 @@ static ErrorOr<Web::HTML::SerializedPolicyContainer> build_policy_container(Poli
             .report_only_reporting_endpoint = row.embedder_policy_report_only_reporting_endpoint,
         },
         .referrer_policy = TRY(decode_referrer_policy(row.referrer_policy)),
+        .force_load_at_top = row.force_load_at_top,
+        .insecure_requests_policy = TRY(decode_insecure_requests_policy(row.insecure_requests_policy)),
+        .upgrade_insecure_navigations_set = move(upgrade_insecure_navigations_set),
     };
 }
 
@@ -1064,6 +1155,21 @@ static ErrorOr<HashMap<i64, HashMap<i64, Web::HTML::SerializedPolicyContainer>>>
             row.embedder_policy_report_only_value = TRY(result_row.read_integer<i64>("embedder_policy_report_only_value"sv));
             row.embedder_policy_reporting_endpoint = TRY(read_snapshot_utf16_text(result_row, "embedder_policy_reporting_endpoint"sv, totals));
             row.embedder_policy_report_only_reporting_endpoint = TRY(read_snapshot_utf16_text(result_row, "embedder_policy_report_only_reporting_endpoint"sv, totals));
+            row.force_load_at_top = TRY(result_row.read_bool("force_load_at_top"sv));
+            row.insecure_requests_policy = TRY(result_row.read_integer<i64>("insecure_requests_policy"sv));
+            return row;
+        }));
+
+    auto upgrade_insecure_navigation_rows = TRY(database.try_collect_bound_statement<UpgradeInsecureNavigationRow>(
+        statements.select_upgrade_insecure_navigations,
+        MAX_SNAPSHOT_UPGRADE_INSECURE_NAVIGATIONS,
+        [&](auto& bind) -> ErrorOr<void> { return bind("tab_id"sv, tab_id); },
+        [&](Database::ResultRow& result_row) -> ErrorOr<UpgradeInsecureNavigationRow> {
+            UpgradeInsecureNavigationRow row;
+            row.container_id = TRY(result_row.read_integer<i64>("container_id"sv));
+            row.tuple_ordinal = TRY(result_row.read_integer<i64>("tuple_ordinal"sv));
+            row.host = TRY(read_snapshot_text(result_row, "host"sv, totals));
+            row.port = TRY(result_row.read_optional_integer<u16>("port"sv));
             return row;
         }));
 
@@ -1127,8 +1233,19 @@ static ErrorOr<HashMap<i64, HashMap<i64, Web::HTML::SerializedPolicyContainer>>>
     for (auto& row : policy_rows)
         policies_by_container.ensure(row.container_id).append(move(row));
 
+    HashMap<i64, Vector<UpgradeInsecureNavigationRow>> upgrade_insecure_navigations_by_container;
+    for (auto& row : upgrade_insecure_navigation_rows)
+        upgrade_insecure_navigations_by_container.ensure(row.container_id).append(move(row));
+
     HashMap<i64, HashMap<i64, Web::HTML::SerializedPolicyContainer>> containers;
     for (auto const& container_row : container_rows) {
+        auto upgrade_insecure_navigation_group = upgrade_insecure_navigations_by_container.take(container_row.id).value_or({});
+        TRY(sort_by_contiguous_ordinal(upgrade_insecure_navigation_group, &UpgradeInsecureNavigationRow::tuple_ordinal, "Session history upgrade insecure navigations are not contiguously ordered"));
+
+        Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet upgrade_insecure_navigations_set;
+        for (auto const& tuple_row : upgrade_insecure_navigation_group)
+            upgrade_insecure_navigations_set.insert(TRY(build_upgrade_insecure_navigation(tuple_row)));
+
         auto policy_group = policies_by_container.take(container_row.id).value_or({});
         TRY(sort_by_contiguous_ordinal(policy_group, &CspPolicyRow::policy_ordinal, "Session history CSP policies are not contiguously ordered"));
 
@@ -1152,7 +1269,7 @@ static ErrorOr<HashMap<i64, HashMap<i64, Web::HTML::SerializedPolicyContainer>>>
             }
             csp_list.unchecked_append(TRY(build_csp_policy(policy_row, move(directives))));
         }
-        containers.ensure(container_row.history_id).set(container_row.entry_ordinal, TRY(build_policy_container(container_row, move(csp_list))));
+        containers.ensure(container_row.history_id).set(container_row.entry_ordinal, TRY(build_policy_container(container_row, move(csp_list), move(upgrade_insecure_navigations_set))));
     }
     return containers;
 }
@@ -1194,12 +1311,15 @@ static ErrorOr<Web::HTML::SessionHistoryEntryDescriptor> build_entry(EntryRow&& 
     entry.document_state.resource = resource;
     entry.document_state.reload_pending = row.reload_pending;
     entry.document_state.ever_populated = row.ever_populated;
+    entry.document_state.user_agent_initiated = row.user_agent_initiated ? Web::HTML::UserAgentInitiated::Yes : Web::HTML::UserAgentInitiated::No;
     entry.document_state.navigable_target_name = row.navigable_target_name;
     entry.classic_history_api_state = Web::HTML::StorageSerializationRecord { move(row.classic_state) };
     entry.navigation_api_state = Web::HTML::StorageSerializationRecord { move(row.navigation_state) };
     entry.navigation_api_key = row.navigation_api_key;
     entry.navigation_api_id = row.navigation_api_id;
     entry.scroll_restoration_mode = scroll_restoration_mode;
+    entry.directive_state_id = Web::HTML::CrossProcessId { .namespace_id = decode_cross_process_id_component(row.directive_state_namespace_id), .local_id = decode_cross_process_id_component(row.directive_state_local_id) };
+    entry.directive_state_value = move(row.directive_state_value);
     if (row.scroll_x_raw.has_value())
         entry.scroll_position_data.viewport_scroll_position = Web::CSSPixelPoint { Web::CSSPixels::from_raw(*row.scroll_x_raw), Web::CSSPixels::from_raw(*row.scroll_y_raw) };
     return entry;
@@ -1301,6 +1421,9 @@ ErrorOr<SessionHistorySnapshot> load_session_history_snapshot(Database::Database
             row.navigation_api_key = TRY(read_snapshot_utf16_text(result_row, "navigation_api_key"sv, totals));
             row.navigation_api_id = TRY(read_snapshot_utf16_text(result_row, "navigation_api_id"sv, totals));
             row.scroll_restoration_mode = TRY(result_row.read_integer<i64>("scroll_restoration_mode"sv));
+            row.directive_state_namespace_id = TRY(result_row.read_integer<i64>("directive_state_namespace_id"sv));
+            row.directive_state_local_id = TRY(result_row.read_integer<i64>("directive_state_local_id"sv));
+            row.directive_state_value = TRY(read_optional_snapshot_text(result_row, "directive_state_value"sv, totals));
             row.scroll_x_raw = TRY(result_row.read_optional_integer<i32>("scroll_x_raw"sv));
             row.scroll_y_raw = TRY(result_row.read_optional_integer<i32>("scroll_y_raw"sv));
             row.origin = {
@@ -1332,6 +1455,7 @@ ErrorOr<SessionHistorySnapshot> load_session_history_snapshot(Database::Database
             row.navigable_target_name = TRY(read_snapshot_utf16_text(result_row, "navigable_target_name"sv, totals));
             row.ever_populated = TRY(result_row.read_bool("ever_populated"sv));
             row.reload_pending = TRY(result_row.read_bool("reload_pending"sv));
+            row.user_agent_initiated = TRY(result_row.read_bool("user_agent_initiated"sv));
             return row;
         }));
 

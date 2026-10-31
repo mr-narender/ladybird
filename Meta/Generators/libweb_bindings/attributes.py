@@ -70,11 +70,16 @@ def validate_direct_getter(context: GenerationContext, interface: Interface, att
     target_interface = context.interface(resolved_type)
     if target_interface is None or target_interface.is_callback_interface:
         raise RuntimeError(f"{description} must have an interface type")
+    if target_interface.extended_attributes.get("ImplementedIn") == "Rust":
+        # NB: The engine reads the wrapper of a direct getter's object as a Wrappable keeps it, and the object of an
+        #     interface implemented in Rust is a cell that keeps its wrapper elsewhere.
+        raise RuntimeError(f"{description} cannot return {target_interface.name}, which is implemented in Rust")
     if not cpp_type_for_idl_type_details(resolved_type, context).gc_ref_target_type:
         raise RuntimeError(f"{description} must convert from a GC pointer")
 
     incompatible_extended_attributes = (
         "CachedAttribute",
+        "CachedAccessor",
         "ImplementedInBindings",
         "LegacyUnforgeable",
         "Reflect",
@@ -246,13 +251,13 @@ def define_the_attributes(
                 attribute
             )
             includes.add("LibGC/Weak.h")
+            includes.add("LibJS/Runtime/HostObject.h")
             includes.add("LibJS/Runtime/NativeFunction.h")
-            includes.add("LibWeb/Bindings/PlatformObject.h")
             includes.add("LibWeb/Bindings/Wrappable.h")
             implementation_type = fully_qualified_name_for_interface(interface)
             definition.write(
                 f"""    auto {native_getter_name} = JS::DirectGetterFunction::create(realm, {getter_name}, 0, {cpp_name}_id, {{
-        .wrapper_implementation_offset = PlatformObject::wrapped_implementation_offset(),
+        .wrapper_implementation_offset = JS::HostObject::wrappable_offset(),
         .implementation_value_offset = {implementation_type}::{direct_getter_field}_offset(),
         .main_world_wrapper_offset = Wrappable::main_world_wrapper_offset(),
         .weak_impl_value_offset = GC::WeakImpl::value_offset(),
@@ -278,6 +283,8 @@ def define_the_attributes(
                 definition.write(
                     f'    auto {native_setter_name} = JS::NativeFunction::create(realm, {setter_name}, 1, {cpp_name}_id, &realm, "set"sv);\n'
                 )
+        if "CachedAccessor" in attribute.extended_attributes and not attribute.readonly:
+            raise RuntimeError(f"[CachedAccessor] attribute '{attribute.name}' must be readonly")
         define_accessor = f"object.define_direct_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);"
         if "CachedAttribute" in attribute.extended_attributes and "LegacyUnforgeable" in attribute.extended_attributes:
             # Cache the result only on the main-world wrapper, whose cached
@@ -289,6 +296,9 @@ def define_the_attributes(
         object.define_direct_cached_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);
     else
         object.define_direct_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes);"""
+        # [CachedAccessor] promises that the result is immutable for each receiver's lifetime.
+        if "CachedAccessor" in attribute.extended_attributes:
+            define_accessor = f"object.define_direct_cached_accessor({cpp_name}_id, {native_getter_name}, {native_setter_name}, {cpp_name}_attributes, JS::CachedAccessorValueLocation::Receiver);"
         definition.write(
             f"""
     // 4. Let configurable be false if attr is unforgeable and true otherwise.
@@ -373,7 +383,7 @@ def write_attribute_getter(
     // If a reflected IDL attribute has the type boolean:
     // 1. Let contentAttributeValue be the result of running this's get the content attribute.
     // 2. If contentAttributeValue is null, then return false.
-    auto R = idl_object->has_attribute(content_attribute);"""
+    auto R = idl_object->has_attribute_ns({{}}, content_attribute);"""
     elif is_non_nullable_reflected and attribute.type.name == "long":
         includes.add("LibWeb/HTML/Numbers.h")
         getter_steps = f"""{content_attribute_declaration}
@@ -384,7 +394,7 @@ def write_attribute_getter(
     //    1. Let parsedValue be the result of integer parsing contentAttributeValue.
     //    2. If parsedValue is not an error and is within the long range, then return parsedValue.
     i32 R = 0;
-    auto content_attribute_value = idl_object->get_attribute(content_attribute);
+    auto content_attribute_value = idl_object->get_attribute_ns({{}}, content_attribute);
     if (content_attribute_value.has_value()) {{
         auto maybe_parsed_value = Web::HTML::parse_integer(*content_attribute_value);
         if (maybe_parsed_value.has_value())
@@ -404,7 +414,7 @@ def write_attribute_getter(
     //    1. Let parsedValue be the result of non-negative integer parsing contentAttributeValue.
     //    2. If parsedValue is not an error and is in the range minimum to maximum, inclusive, then return parsedValue.
     u32 R = 0;
-    auto content_attribute_value = idl_object->get_attribute(content_attribute);
+    auto content_attribute_value = idl_object->get_attribute_ns({{}}, content_attribute);
     u32 minimum = 0;
     u32 maximum = 2147483647;
     if (content_attribute_value.has_value()) {{
@@ -422,7 +432,7 @@ def write_attribute_getter(
     // If a reflected IDL attribute has the type USVString:
     // 1. Let element be the result of running this's get the element.
     // 2. Let contentAttributeValue be the result of running this's get the content attribute.
-    auto content_attribute_value = idl_object->attribute(content_attribute);
+    auto content_attribute_value = idl_object->get_attribute_ns({{}}, content_attribute);
 
     // 3. Let attributeDefinition be the attribute definition of element's content attribute whose namespace is null and local name is the reflected content attribute name.
 
@@ -437,7 +447,7 @@ def write_attribute_getter(
     // If a reflected IDL attribute has the type USVString:
     // 1. Let element be the result of running this's get the element.
     // 2. Let contentAttributeValue be the result of running this's get the content attribute.
-    auto content_attribute_value = idl_object->attribute(content_attribute);
+    auto content_attribute_value = idl_object->get_attribute_ns({{}}, content_attribute);
 
     // 3. Let attributeDefinition be the attribute definition of element's content attribute whose namespace is null and local name is the reflected content attribute name.
 
@@ -468,7 +478,7 @@ def write_attribute_getter(
 
     // If a reflected IDL attribute is an enumerated attribute:
     // 1. Let contentAttributeValue be the result of running this's get the content attribute.
-    auto R = idl_object->attribute(content_attribute);
+    auto R = idl_object->get_attribute_ns({{}}, content_attribute);
 
     // 3. If contentAttributeValue is an ASCII case-insensitive match for one of the keywords, then return that keyword's canonical keyword.
     Array valid_values {{ {valid_values} }};
@@ -491,7 +501,7 @@ def write_attribute_getter(
 
     // If a reflected IDL attribute is an enumerated attribute:
     // 1. Let contentAttributeValue be the result of running this's get the content attribute.
-    auto content_attribute_value = idl_object->attribute(content_attribute);
+    auto content_attribute_value = idl_object->get_attribute_ns({{}}, content_attribute);
 
     // 2. If contentAttributeValue is null, then set contentAttributeValue to the missing value default.
     auto R = content_attribute_value.value_or("{missing_value_default}"_utf16);
@@ -802,6 +812,13 @@ def write_attribute_setter(
         static_utf16_fly_string("content_attribute", reflected_attribute_name(attribute)) if is_reflected else ""
     )
 
+    # ElementInternals deletes entries from its internal content attribute map.
+    delete_content_attribute = (
+        "idl_object->remove_attribute(content_attribute);"
+        if interface.name == "ElementInternals"
+        else "idl_object->remove_attribute_ns({}, content_attribute);"
+    )
+
     def as_utf16_string_expression(value: str) -> str:
         return value
 
@@ -809,7 +826,7 @@ def write_attribute_setter(
         setter_steps = f"""{content_attribute_declaration}
 
     if (!idl_value)
-        idl_object->remove_attribute(content_attribute);
+        {delete_content_attribute}
     else
         idl_object->set_attribute_value(content_attribute, Utf16String {{}});
     return {{}};"""
@@ -839,7 +856,7 @@ def write_attribute_setter(
         setter_steps = f"""{content_attribute_declaration}
 
     if (!idl_value.has_value())
-        idl_object->remove_attribute(content_attribute);
+        {delete_content_attribute}
     else
         idl_object->set_attribute_value(content_attribute, {as_utf16_string_expression("*idl_value")});
     return {{}};"""
@@ -849,7 +866,7 @@ def write_attribute_setter(
 
     if (!idl_value) {{
         idl_object->set_{idl_implementation_cpp_name(attribute)}({{}});
-        idl_object->remove_attribute(content_attribute);
+        {delete_content_attribute}
         return {{}};
     }}
 
@@ -869,7 +886,7 @@ def write_attribute_setter(
 
     if (!idl_value.has_value()) {{
         idl_object->set_{idl_implementation_cpp_name(attribute)}({{}});
-        idl_object->remove_attribute(content_attribute);
+        {delete_content_attribute}
         return {{}};
     }}
 

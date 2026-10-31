@@ -12,13 +12,12 @@ pub mod resolve;
 use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect};
 use crate::css::style::fast_hash::FastMap;
-use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::host::FfiHitTestQueryCallbacks;
-use crate::painting::paintable_rows::PaintableRowsRef;
+use crate::painting::paint_read::PaintRead;
 use crate::painting::visual_context::{ClipBehavior, VisualContextTree};
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -54,8 +53,12 @@ pub struct HitTestItem {
     pub block_container: NodeSlotId,
     pub context: ContextRef,
     pub border_radii: BorderRadii,
-    pub path: Option<Rc<libgfx_rust::path::OwnedPath>>,
-    pub winding_rule: i32,
+    pub path: Option<Arc<libgfx_rust::path::Path>>,
+    pub winding_rule: libgfx_rust::WindingRule,
+    /// For an SVG path, the `svg_hit_area` flags naming which of its areas pointer events can target.
+    pub svg_hit_areas: u8,
+    /// For an SVG path whose stroke pointer events can target, the shape of that stroke.
+    pub svg_stroke: Option<Arc<SvgStrokeHitRegion>>,
     pub writing_mode: u8,
     pub inline_axis_is_reverse: bool,
     pub block_axis_is_reverse: bool,
@@ -67,6 +70,54 @@ impl HitTestItem {
     fn recorded_caret_line(&self) -> Option<(ContextRef, NodeSlotId, usize)> {
         self.caret_line_index
             .map(|index| (self.context, self.block_container, index))
+    }
+}
+
+/// The areas of an SVG graphics element that pointer events can target.
+pub mod svg_hit_area {
+    pub const FILL: u8 = 1 << 0;
+    pub const STROKE: u8 = 1 << 1;
+    pub const BOUNDING_BOX: u8 = 1 << 2;
+}
+
+/// The stroke of an SVG path as hit testing reads it. The outline of the stroke is only built when a point first
+/// reaches it, and the copies of an item that later recordings reuse share it.
+#[derive(Debug)]
+pub struct SvgStrokeHitRegion {
+    style: libgfx_rust::path::StrokeStyle,
+    outline: std::sync::OnceLock<libgfx_rust::path::Path>,
+}
+
+impl SvgStrokeHitRegion {
+    pub fn new(style: libgfx_rust::path::StrokeStyle) -> Self {
+        Self {
+            style,
+            outline: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// How far past the path its stroke can reach.
+    pub fn outset(&self) -> f32 {
+        let mut factor = 1.0f32;
+        if self.style.join_style == libgfx_rust::JoinStyle::Miter {
+            factor = factor.max(self.style.miter_limit);
+        }
+        if self.style.cap_style == libgfx_rust::CapStyle::Square {
+            factor = factor.max(std::f32::consts::SQRT_2);
+        }
+        self.style.thickness / 2.0 * factor
+    }
+
+    pub fn contains(&self, path: &libgfx_rust::path::Path, x: f32, y: f32) -> bool {
+        self.outline
+            .get_or_init(|| path.stroke_to_fill(&self.style))
+            .contains(x, y, libgfx_rust::WindingRule::Nonzero)
+    }
+}
+
+impl PartialEq for SvgStrokeHitRegion {
+    fn eq(&self, other: &Self) -> bool {
+        self.style == other.style
     }
 }
 
@@ -83,6 +134,7 @@ pub struct SpatialIndex {
 pub struct CaretLine {
     pub rect: CssPixelRect,
     pub block_container: NodeSlotId,
+    pub box_fragment: u32,
     pub context: ContextRef,
     pub first_caret_item_index: usize,
     pub last_caret_item_index: usize,
@@ -127,7 +179,7 @@ pub fn rects_overlap_in_block_axis(a: CssPixelRect, b: CssPixelRect, writing_mod
 #[derive(Default)]
 pub struct HitTestList {
     pub generation: u64,
-    pub items: std::rc::Rc<Vec<HitTestItem>>,
+    pub items: Arc<Vec<HitTestItem>>,
     pub item_capacity_hint_from_previous_list: usize,
     /// Point queries read only the spatial indexes, and caret navigation reads only the caret lines,
     /// which resolve line box geometry for every caret-capable item. Each is built on first use.
@@ -145,7 +197,7 @@ impl HitTestList {
             !self.spatial_indexes_built && !self.caret_lines_built,
             "hit-test item appended after the derived structures were built"
         );
-        let items = std::rc::Rc::make_mut(&mut self.items);
+        let items = Arc::make_mut(&mut self.items);
         if items.capacity() == 0 {
             items.reserve(self.item_capacity_hint_from_previous_list);
         }
@@ -160,14 +212,32 @@ impl HitTestList {
         if source.is_empty() {
             return;
         }
-        let items = Rc::make_mut(&mut self.items);
+        let items = Arc::make_mut(&mut self.items);
         if items.capacity() == 0 {
             items.reserve(self.item_capacity_hint_from_previous_list.max(source.len()));
         }
         items.extend_from_slice(source);
     }
 
-    pub(crate) fn caret_line_rect_for_item(rows: &PaintableRowsRef<'_>, item: &HitTestItem) -> CssPixelRect {
+    fn box_fragment_of_caret_item(rows: &impl PaintRead, item: &HitTestItem) -> u32 {
+        let Some(line_index) = item.caret_line_index else {
+            return 0;
+        };
+        let line_root = match item.kind {
+            HitTestItemKind::TextFragment | HitTestItemKind::EmptyLine => item.paintable,
+            HitTestItemKind::Box => rows.paintable_data(item.paintable).containing_block,
+            HitTestItemKind::SvgPath | HitTestItemKind::EmptyEditable | HitTestItemKind::ChromeWidget => return 0,
+        };
+        if line_root.is_invalid() || !rows.paintable_row_is_populated(line_root) {
+            return 0;
+        }
+        rows.committed_side_data(line_root)
+            .lines()
+            .get(line_index)
+            .map_or(0, |line| line.box_fragment)
+    }
+
+    pub(crate) fn caret_line_rect_for_item(rows: &impl PaintRead, item: &HitTestItem) -> CssPixelRect {
         let Some(line_rect) = geometry::containing_line_box_rect(rows, item) else {
             return item.caret_rect;
         };
@@ -193,12 +263,12 @@ impl HitTestList {
         }
     }
 
-    pub(crate) fn build_caret_lines_if_needed(&mut self, arena: &LayoutNodeArena) {
+    pub(crate) fn build_caret_lines_if_needed(&mut self, arena: &impl PaintRead) {
         if self.caret_lines_built {
             return;
         }
         self.caret_lines_built = true;
-        let rows = arena.paintable_rows();
+        let rows = arena;
         // Inline boxes and text from one layout line can be separated in paint order.
         // Gather that line's caret targets together while preserving the order in
         // which lines first appeared, and the paint order of targets within each line.
@@ -220,7 +290,7 @@ impl HitTestList {
         }
         for group in groups {
             for item_index in group {
-                self.add_item_to_caret_items(&rows, item_index);
+                self.add_item_to_caret_items(rows, item_index);
             }
         }
     }
@@ -280,7 +350,7 @@ impl HitTestList {
         }
     }
 
-    fn add_item_to_caret_items(&mut self, rows: &PaintableRowsRef<'_>, item_index: usize) {
+    fn add_item_to_caret_items(&mut self, rows: &impl PaintRead, item_index: usize) {
         let item = &self.items[item_index];
         let caret_item_index = self.caret_item_indices.len();
         self.caret_item_indices.push(item_index);
@@ -311,6 +381,7 @@ impl HitTestList {
         self.caret_lines.push(CaretLine {
             rect: item_line_rect,
             block_container: item_block_container,
+            box_fragment: Self::box_fragment_of_caret_item(rows, item),
             context: item.context,
             first_caret_item_index: caret_item_index,
             last_caret_item_index: caret_item_index,

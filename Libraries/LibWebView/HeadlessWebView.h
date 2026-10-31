@@ -22,16 +22,20 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static NonnullOwnPtr<HeadlessWebView> create(Core::AnonymousBuffer theme, Web::DevicePixelSize window_size, IsPrivate = IsPrivate::No);
-    static NonnullOwnPtr<HeadlessWebView> create_child(HeadlessWebView&, WebContentClient& page_process, Web::PageId page_index);
+    enum class IsOwnedByParent : bool {
+        No,
+        Yes,
+    };
+    static NonnullOwnPtr<HeadlessWebView> create_child(HeadlessWebView&, CanonicalTraversable&, IsOwnedByParent = IsOwnedByParent::No);
+    static NonnullOwnPtr<PictureInPictureWindow> create_picture_in_picture_window(HeadlessWebView& requesting_view, CanonicalTraversable&, Gfx::IntSize video_size);
 
     void reset_viewport_size(Web::DevicePixelSize);
 
     void close_child_web_views()
     {
         for (auto& child : m_child_web_views) {
-            child->close_child_web_views();
             // Children sharing a crashed WebContent process are discarded by their pending crash callbacks.
-            if (!child->handle().is_empty() && child->client().is_open()) {
+            if (!child->handle().is_empty() && child->page().is_open()) {
                 child->request_close();
                 child->schedule_forced_close();
             }
@@ -43,20 +47,21 @@ public:
         // Disconnect crash handlers so child crashes don't propagate to parent.
         // We don't destroy the children because there may be pending deferred_invokes
         // that would cause use-after-free.
-        for (auto& child : m_child_web_views) {
+        for (auto& child : m_child_web_views)
             child->m_propagate_crashes_to_parent = false;
-            child->disconnect_child_crash_handlers();
-        }
     }
 
 protected:
     HeadlessWebView(Core::AnonymousBuffer theme, Web::DevicePixelSize viewport_size, IsPrivate = IsPrivate::No);
 
     void propagate_web_content_crash(WebContentCrashReason);
+    HeadlessWebView& adopt_child_web_view(NonnullOwnPtr<HeadlessWebView>);
     void discard_child_web_view(HeadlessWebView&);
     void schedule_forced_close();
-    void prepare_page_for_tab(WebContentPage&) override;
+    virtual Core::AnonymousBuffer system_theme() override { return m_theme; }
+    virtual Optional<ScreenRects> screen_rects() const override;
     void update_zoom() override;
+    ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) override;
 
     virtual Web::DevicePixelSize viewport_size() const override { return m_viewport_size; }
     virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override { return widget_position; }

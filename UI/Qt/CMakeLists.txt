@@ -2,31 +2,41 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 6.9 REQUIRED COMPONENTS Core Widgets)
+find_package(Qt6 6.10 REQUIRED COMPONENTS Core Widgets)
 
 if (NOT APPLE)
-    find_package(Qt6 6.9 REQUIRED COMPONENTS Positioning)
+    find_package(Qt6 6.10 REQUIRED COMPONENTS Positioning)
 endif()
 
 if (APPLE OR (LINUX AND NOT ANDROID) OR HAS_DIRECTX)
     # The native presentation paths use platform GPU buffer handles directly instead of copying frames through CPU memory.
     # Wayland activation also uses Qt platform APIs.
     set(QT_NO_PRIVATE_MODULE_WARNING ON)
-    find_package(Qt6 6.9 REQUIRED COMPONENTS GuiPrivate)
+    find_package(Qt6 6.10 REQUIRED COMPONENTS GuiPrivate)
 endif()
 
 if (LINUX AND NOT ANDROID)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
+    # NB: Without the Wayland client library, a tab dragged out of a window does not take a window along with it.
+    pkg_check_modules(WAYLAND_CLIENT IMPORTED_TARGET wayland-client)
+    # NB: Without the Wayland scanner, the browser cannot ask the Wayland compositor which GPU it presents on.
+    pkg_check_modules(WAYLAND_SCANNER wayland-scanner)
+    pkg_check_modules(XCB_ICCCM REQUIRED IMPORTED_TARGET xcb-icccm)
 endif()
 
 qt_add_executable(ladybird main.cpp)
 target_sources(ladybird PRIVATE
+    AllTabsPopover.cpp
     Application.cpp
     Autocomplete.cpp
+    BookmarkDialog.cpp
+    BookmarkPopover.cpp
     BookmarksBar.cpp
     BrowserWindow.cpp
     ChromeStyle.cpp
+    CrashReportNotifier.cpp
+    CrashReportReviewWidget.cpp
     DevToolsBanner.cpp
     EventLoopImplementationQt.cpp
     EventLoopImplementationQtEventTarget.cpp
@@ -35,20 +45,40 @@ target_sources(ladybird PRIVATE
     HiddenPageSizing.cpp
     InputMethodUtils.cpp
     JavaScriptDialog.cpp
+    LadybirdButton.cpp
     LocationEdit.cpp
     Menu.cpp
     NativeWindowContainer.cpp
+    NativeTextEditingLineEdit.cpp
     ProcessManagerWindow.cpp
     PerformanceMonitorWidget.cpp
+    PermissionPromptPopover.cpp
+    PictureInPictureWindow.cpp
+    Popover.cpp
+    ReportReview.cpp
+    RestoreSessionCard.cpp
+    ScreenshotSelectionOverlay.cpp
+    ScreenshotViewer.cpp
     SelectDropdown.cpp
-    Settings.cpp
+    SiteSettingsPopover.cpp
     StringUtils.cpp
+    SystemAppearance.cpp
     Tab.cpp
     TabBar.cpp
+    Theme.cpp
+    WebCompatReportReview.cpp
     WebContentView.cpp
+    WindowCloseCoordinator.cpp
     WindowControlButton.cpp
+    WindowScreenObserver.cpp
     ladybird.qrc
 )
+if (NOT APPLE AND NOT WIN32 AND NOT ANDROID)
+    target_sources(ladybird PRIVATE
+        AccessibilityInterface.cpp
+    )
+endif()
+
 target_link_libraries(ladybird PRIVATE Qt::Core Qt::Gui Qt::Widgets)
 
 if (TARGET Qt6::Positioning)
@@ -58,8 +88,44 @@ if (TARGET Qt6::Positioning)
 endif()
 
 if (LINUX AND NOT ANDROID)
-    target_sources(ladybird PRIVATE ExternalURLActivationToken.cpp ExternalURLHandler.cpp)
-    target_link_libraries(ladybird PRIVATE LibThreading PkgConfig::GIO Qt::GuiPrivate)
+    target_sources(ladybird PRIVATE ExternalURLActivationToken.cpp ExternalURLHandler.cpp X11Window.cpp X11Window.h)
+    target_link_libraries(ladybird PRIVATE LibThreading PkgConfig::GIO PkgConfig::XCB_ICCCM Qt::GuiPrivate)
+    if (WAYLAND_CLIENT_FOUND)
+        target_sources(ladybird PRIVATE WaylandWindow.cpp WaylandWindow.h)
+        target_link_libraries(ladybird PRIVATE PkgConfig::WAYLAND_CLIENT)
+        target_compile_definitions(ladybird PRIVATE LADYBIRD_HAS_WAYLAND_CLIENT)
+    endif()
+    if (WAYLAND_CLIENT_FOUND AND WAYLAND_SCANNER_FOUND AND USE_VULKAN_DMABUF_IMAGES)
+        pkg_get_variable(WAYLAND_SCANNER_EXECUTABLE wayland-scanner wayland_scanner)
+        foreach(protocol linux-dmabuf-v1 viewporter)
+            set(protocol_xml "${CMAKE_CURRENT_SOURCE_DIR}/Protocols/${protocol}.xml")
+            set(protocol_header "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-client-protocol.h")
+            set(protocol_code "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-protocol.c")
+            add_custom_command(
+                OUTPUT "${protocol_header}"
+                COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" client-header "${protocol_xml}" "${protocol_header}"
+                DEPENDS "${protocol_xml}"
+                VERBATIM
+            )
+            add_custom_command(
+                OUTPUT "${protocol_code}"
+                COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" private-code "${protocol_xml}" "${protocol_code}"
+                DEPENDS "${protocol_xml}"
+                VERBATIM
+            )
+            target_sources(ladybird PRIVATE "${protocol_header}" "${protocol_code}")
+        endforeach()
+        target_sources(ladybird PRIVATE
+            WaylandGpu.cpp
+            WaylandGpu.h
+            WaylandPageSurface.cpp
+            WaylandPageSurface.h
+            WaylandRegistry.cpp
+            WaylandRegistry.h
+        )
+        target_include_directories(ladybird PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_definitions(ladybird PRIVATE LADYBIRD_HAS_WAYLAND_GPU_QUERY)
+    endif()
 endif()
 
 if (APPLE)
@@ -68,14 +134,27 @@ if (APPLE)
         Conversions.mm
         DictionaryLookup.mm
         ExternalURLHandler.mm
+        LadybirdAccessibilityElement.mm
         MacWindow.mm
+        MacWindowFocus.mm
+        NativeTextEditingBindings.mm
         Menu.mm
+        ScrollbarPreferencesMac.mm
+        SpellCheckerMac.mm
+        SystemAppearanceMac.mm
+        WebContentViewAccessibility.mm
         WebContentViewMac.mm
     )
-    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    target_link_libraries(ladybird PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    set_source_files_properties(
+        LadybirdAccessibilityElement.mm
+        SpellCheckerMac.mm
+        WebContentViewAccessibility.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+    )
 endif()
 
-if (NOT APPLE AND USE_VULKAN_DMABUF_IMAGES AND Qt6_VERSION VERSION_GREATER_EQUAL 6.7.0)
+if (NOT APPLE AND USE_VULKAN_DMABUF_IMAGES)
     set(WEB_CONTENT_VIEW_LINUX_VERT_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/WebContentViewLinux.vert")
     set(WEB_CONTENT_VIEW_LINUX_FRAG_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/WebContentViewLinux.frag")
     set(WEB_CONTENT_VIEW_LINUX_VERT_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/WebContentViewLinuxVertShader.h")
@@ -152,14 +231,47 @@ qt_deploy_runtime_dependencies(
     )
 endif()
 
-if (BUILD_TESTING)
+if (BUILD_TESTING AND NOT BUILD_BROWSER_TESTS_ONLY)
+    if (APPLE)
+        add_library(NativeTextEditingTestMain OBJECT
+            ${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/NativeTextEditingTestMain.mm
+            ${LADYBIRD_SOURCE_DIR}/Libraries/LibTest/AssertionHandler.cpp
+        )
+        target_link_libraries(NativeTextEditingTestMain PRIVATE AK LibTest "-framework AppKit")
+        ladybird_test("${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/TestNativeTextEditingBindings.mm" UI/Qt
+            NO_TEST
+            CUSTOM_MAIN "$<TARGET_OBJECTS:NativeTextEditingTestMain>"
+            LIBS LibWebCommon Qt::Widgets "-framework AppKit"
+        )
+        foreach(mode default custom)
+            add_test(NAME TestNativeTextEditingBindings-${mode}
+                COMMAND ${Python3_EXECUTABLE}
+                    ${LADYBIRD_SOURCE_DIR}/Tests/UI/Qt/run-native-text-editing-tests.py
+                    $<TARGET_FILE:TestNativeTextEditingBindings> ${mode}
+            )
+        endforeach()
+    endif()
+
     add_executable(TestPerformanceMonitorWidget
         ${LADYBIRD_SOURCE_DIR}/Tests/LibWebView/TestPerformanceMonitorWidget.cpp
+        ChromeStyle.cpp
         PerformanceMonitorWidget.cpp
         StringUtils.cpp
+        SystemAppearance.cpp
+        Theme.cpp
     )
+    if (APPLE)
+        target_sources(TestPerformanceMonitorWidget PRIVATE SystemAppearanceMac.mm)
+        target_link_libraries(TestPerformanceMonitorWidget PRIVATE "-framework AppKit")
+    endif()
+    if (LINUX AND NOT ANDROID)
+        target_sources(TestPerformanceMonitorWidget PRIVATE X11Window.cpp)
+        target_link_libraries(TestPerformanceMonitorWidget PRIVATE PkgConfig::XCB_ICCCM)
+    endif()
+    set_target_properties(TestPerformanceMonitorWidget PROPERTIES AUTOMOC ON)
     target_include_directories(TestPerformanceMonitorWidget PRIVATE ${LADYBIRD_SOURCE_DIR})
     target_link_libraries(TestPerformanceMonitorWidget PRIVATE Qt6::Widgets LibWebView LibURL AK)
+    qt_import_plugins(TestPerformanceMonitorWidget INCLUDE Qt6::QOffscreenIntegrationPlugin)
     add_test(NAME TestPerformanceMonitorWidget COMMAND TestPerformanceMonitorWidget)
     set_tests_properties(TestPerformanceMonitorWidget PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()

@@ -7,6 +7,7 @@
 #include <LibIPC/Transport.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebContentPage.h>
 #include <LibWebView/WebUI.h>
 #include <LibWebView/WebUI/BookmarksUI.h>
 #include <LibWebView/WebUI/DownloadsUI.h>
@@ -26,6 +27,7 @@ static constexpr auto s_pages = to_array<WebUI::Page>({
     { "settings"sv, "Settings"sv, WebUI::PageType::Dynamic },
     { "services"sv, "Services"sv, WebUI::PageType::Static },
     { "version"sv, "Version"sv, WebUI::PageType::Dynamic },
+    { "welcome"sv, "Welcome"sv, WebUI::PageType::Dynamic },
 });
 
 ReadonlySpan<WebUI::Page> WebUI::pages()
@@ -50,7 +52,7 @@ static ErrorOr<NonnullRefPtr<WebUIType>> create_web_ui(WebContentClient& client,
     auto paired = TRY(IPC::Transport::create_paired());
     auto handle = move(paired.remote_handle);
 
-    auto web_ui = WebUIType::create(client, move(paired.local), move(host));
+    auto web_ui = WebUIType::create(client, page_id, move(paired.local), move(host));
     client.async_connect_to_web_ui(page_id, move(handle));
 
     return web_ui;
@@ -70,7 +72,7 @@ ErrorOr<RefPtr<WebUI>> WebUI::create(WebContentClient& client, Web::PageId page_
         web_ui = TRY(create_web_ui<DownloadsUI>(client, page_id, move(host)));
     else if (page->host == "history"sv)
         web_ui = TRY(create_web_ui<HistoryUI>(client, page_id, move(host)));
-    else if (page->host == "settings"sv)
+    else if (page->host.is_one_of("settings"sv, "welcome"sv))
         web_ui = TRY(create_web_ui<SettingsUI>(client, page_id, move(host)));
     else if (page->host == "version"sv)
         web_ui = TRY(create_web_ui<VersionUI>(client, page_id, move(host)));
@@ -81,9 +83,10 @@ ErrorOr<RefPtr<WebUI>> WebUI::create(WebContentClient& client, Web::PageId page_
     return web_ui;
 }
 
-WebUI::WebUI(WebContentClient& client, NonnullOwnPtr<IPC::Transport> transport, String host)
+WebUI::WebUI(WebContentClient& client, Web::PageId page_id, NonnullOwnPtr<IPC::Transport> transport, String host)
     : IPC::ConnectionToServer<WebUIClientEndpoint, WebUIServerEndpoint>(*this, move(transport))
     , m_client(client)
+    , m_page_id(page_id)
     , m_host(move(host))
 {
 }
@@ -92,7 +95,9 @@ WebUI::~WebUI() = default;
 
 void WebUI::die()
 {
-    m_client.web_ui_disconnected({});
+    if (auto client = m_client.strong_ref())
+        if (auto* page = client->page(m_page_id))
+            page->web_ui_disconnected({}, *this);
 }
 
 void WebUI::register_interface(StringView name, Interface interface)
@@ -103,6 +108,9 @@ void WebUI::register_interface(StringView name, Interface interface)
 
 void WebUI::received_message(String name, JsonValue data)
 {
+    if (!has_client())
+        return;
+
     auto interface = m_interfaces.get(name);
     if (!interface.has_value()) {
         warnln("Received message from WebUI for unrecognized interface: {}", name);

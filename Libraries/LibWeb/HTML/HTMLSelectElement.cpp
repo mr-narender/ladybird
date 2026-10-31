@@ -63,6 +63,8 @@ void HTMLSelectElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_options);
     visitor.visit(m_selected_options);
     visitor.visit(m_inner_text_element);
+    visitor.visit(m_selected_label_element);
+    visitor.visit(m_label_sizer_element);
     visitor.visit(m_chevron_icon_element);
     visitor.visit(m_cached_list_of_options);
     visitor.visit(m_select_item_option_elements);
@@ -203,7 +205,6 @@ void HTMLSelectElement::update_cached_list_of_options() const
 {
     // 1. Let options be « ».
     m_cached_list_of_options.clear();
-    m_cached_number_of_selected_options = 0;
 
     // Check if node is an optgroup element and node has an ancestor optgroup in between itself and this select
     auto is_nested_optgroup = [this](DOM::Node const& node) {
@@ -223,11 +224,8 @@ void HTMLSelectElement::update_cached_list_of_options() const
     // 3. While node is not null:
     for_each_in_subtree([&](auto& node) {
         // 1. If node is an option element, then append node to options.
-        if (auto maybe_option = as_if<HTMLOptionElement>(node)) {
-            if (maybe_option->selected())
-                ++m_cached_number_of_selected_options;
+        if (auto maybe_option = as_if<HTMLOptionElement>(node))
             m_cached_list_of_options.append(const_cast<HTMLOptionElement&>(*maybe_option));
-        }
 
         // 2. If any of the following conditions are true:
         //    - node is a select element;
@@ -354,10 +352,10 @@ bool HTMLSelectElement::can_skip_selectedness_update_for_inserted_option(HTMLOpt
     if (option.selected())
         return false;
 
-    if (m_cached_number_of_selected_options >= 2)
+    if (m_number_of_selected_options >= 2)
         return false;
 
-    if (display_size() == 1 && m_cached_number_of_selected_options == 0)
+    if (display_size() == 1 && m_number_of_selected_options == 0)
         return false;
 
     return true;
@@ -605,7 +603,10 @@ WebIDL::ExceptionOr<void> HTMLSelectElement::show_picker()
         return WebIDL::NotAllowedError::create("Too long since user activation to show picker"_utf16);
     }
 
-    // FIXME: 4. If this is a select element, and this is not being rendered, then throw a "NotSupportedError" DOMException.
+    // 4. If this is a select element, and this is not being rendered, then throw a "NotSupportedError" DOMException.
+    // NB: This treats an element outside a display: none subtree as being rendered, without forcing layout.
+    if (!meets_focusable_area_rendering_requirements())
+        return WebIDL::NotSupportedError::create("Element is not being rendered"_utf16);
 
     // 5. Show the picker, if applicable, for this.
     show_the_picker_if_applicable();
@@ -641,13 +642,33 @@ void HTMLSelectElement::form_associated_element_was_inserted()
     create_shadow_tree_if_needed();
 }
 
-void HTMLSelectElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const&, Optional<Utf16String> const& value, Optional<Utf16FlyString> const&)
+void HTMLSelectElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
-    if (name == HTML::AttributeNames::multiple) {
-        // If the multiple attribute is absent then update the selectedness of the option elements.
+    if (namespace_.has_value())
+        return;
+
+    // https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element
+    if (name == HTML::AttributeNames::size) {
+        // Whenever a select element's size attribute is set, changed, or removed, reset a select's selectedness given the select element and false.
+        reset_selectedness(HasChanged::No);
+    } else if (name == HTML::AttributeNames::multiple && old_value.has_value() != value.has_value()) {
+        // Whenever a select element select's multiple attribute is added or removed, run these steps:
+        // 1. If the multiple attribute was removed, then set the selectedness of all but the first option element
+        //    with its selectedness set to true in select's list of options to false.
         if (!value.has_value()) {
-            update_selectedness();
+            update_cached_list_of_options();
+            bool found_selected_option = false;
+            for (auto const& option : m_cached_list_of_options) {
+                if (!option->selected())
+                    continue;
+                if (found_selected_option)
+                    option->set_selected_internal(false);
+                found_selected_option = true;
+            }
         }
+
+        // 2. Reset a select's selectedness given select and true.
+        reset_selectedness(HasChanged::Yes);
     }
 
     // AD-HOC: Changing the required or multiple attribute can change whether the select satisfies its constraints.
@@ -657,18 +678,24 @@ void HTMLSelectElement::form_associated_element_attribute_changed(Utf16FlyString
 
 void HTMLSelectElement::computed_properties_changed()
 {
+    if (!m_chevron_icon_element)
+        return;
+
     // Hide chevron icon when appearance is none
-    if (m_chevron_icon_element) {
-        auto style = computed_style();
-        VERIFY(style);
-        auto appearance = style->appearance();
-        if (appearance == CSS::Appearance::None) {
-            MUST(m_chevron_icon_element->style()->set_property(CSS::PropertyID::Display, "none"_utf16));
-            MUST(m_inner_text_element->style()->set_property(CSS::PropertyID::MarginInlineEnd, "0"_utf16));
-        } else {
-            MUST(m_chevron_icon_element->style()->set_property(CSS::PropertyID::Display, "block"_utf16));
-            MUST(m_inner_text_element->style()->set_property(CSS::PropertyID::MarginInlineEnd, "20px"_utf16));
-        }
+    auto style = computed_style();
+    VERIFY(style);
+    // NB: This runs while the style engine's records are applied, and rewriting the shadow tree's declarations then
+    //     makes the records of its elements stale. So they are only written when appearance flips.
+    bool hide_chevron_icon = style->appearance() == CSS::Appearance::None;
+    if (hide_chevron_icon == m_chevron_icon_hidden)
+        return;
+    m_chevron_icon_hidden = hide_chevron_icon;
+    if (hide_chevron_icon) {
+        MUST(m_chevron_icon_element->style()->set_property(CSS::PropertyID::Display, "none"_utf16));
+        MUST(m_inner_text_element->style()->set_property(CSS::PropertyID::MarginInlineEnd, "0"_utf16));
+    } else {
+        MUST(m_chevron_icon_element->style()->set_property(CSS::PropertyID::Display, "block"_utf16));
+        MUST(m_inner_text_element->style()->set_property(CSS::PropertyID::MarginInlineEnd, "20px"_utf16));
     }
 }
 
@@ -700,10 +727,33 @@ void HTMLSelectElement::create_shadow_tree_if_needed()
     )~~~"_utf16);
     MUST(border->append_child(*m_inner_text_element));
 
+    m_selected_label_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
+    m_selected_label_element->set_attribute_value(HTML::AttributeNames::style, R"~~~(
+        overflow: clip;
+        text-overflow: inherit;
+    )~~~"_utf16);
+    MUST(m_inner_text_element->append_child(*m_selected_label_element));
+
+    // NB: The label sizer holds the label of every option in its own block row, without taking up any block size or
+    //     being painted. It gives the select enough inline size for its widest option, so choosing another option
+    //     does not resize it. It floats so that its rows never give the select a baseline, even when no option is selected.
+    m_label_sizer_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
+    m_label_sizer_element->set_attribute_value(HTML::AttributeNames::style, R"~~~(
+        float: inline-start;
+        block-size: 0;
+        overflow: clip;
+        visibility: hidden;
+    )~~~"_utf16);
+    MUST(m_inner_text_element->append_child(*m_label_sizer_element));
+    update_cached_list_of_options();
+    for (auto const& option : m_cached_list_of_options)
+        option->update_label_sizer_text();
+
     // NB: The chevron icon is positioned out of flow so that the label is the wrapper's only flex item, keeping the
     //     baseline of the select derived from the label text. The label's margin-inline-end reserves its space.
     m_chevron_icon_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
     m_chevron_icon_element->set_attribute_value(HTML::AttributeNames::style, R"~~~(
+        display: block;
         position: absolute;
         inset-inline-end: 0;
         top: calc(50% - 8px);
@@ -731,7 +781,7 @@ void HTMLSelectElement::clone_selected_option_into_select_button()
 {
     // To clone selected option into select button, given a select element select:
 
-    if (!m_inner_text_element)
+    if (!m_selected_label_element)
         return;
 
     update_cached_list_of_options();
@@ -748,12 +798,12 @@ void HTMLSelectElement::clone_selected_option_into_select_button()
         text = (*option)->label();
 
     // 4. Set select's select fallback button text to text.
-    m_inner_text_element->string_replace_all(move(text));
+    m_selected_label_element->string_replace_all(move(text));
 }
 
 // https://html.spec.whatwg.org/multipage/form-elements.html#selectedness-setting-algorithm
 // https://whatpr.org/html/11890/form-elements.html#selectedness-setting-algorithm
-void HTMLSelectElement::update_selectedness()
+bool HTMLSelectElement::update_selectedness()
 {
     // The selectedness setting algorithm, given a select element element, is to run the following steps:
     update_cached_list_of_options();
@@ -763,7 +813,7 @@ void HTMLSelectElement::update_selectedness()
 
     // 2. If element 's multiple attribute is absent, and element's display size is 1,
     //    and no option elements in the element's list of options have their selectedness set to true, then
-    if (!has_attribute(AttributeNames::multiple) && display_size() == 1 && m_cached_number_of_selected_options == 0) {
+    if (!has_attribute(AttributeNames::multiple) && display_size() == 1 && m_number_of_selected_options == 0) {
         // 1. Set the selectedness of the first option element in the list of options in tree order
         //    that is not disabled, if any, to true.
         for (auto const& option_element : m_cached_list_of_options) {
@@ -778,7 +828,7 @@ void HTMLSelectElement::update_selectedness()
     }
     // Otherwise, if element's multiple attribute is absent,
     // and two or more option elements in element's list of options have their selectedness set to true, then:
-    else if (!has_attribute(AttributeNames::multiple) && m_cached_number_of_selected_options >= 2) {
+    else if (!has_attribute(AttributeNames::multiple) && m_number_of_selected_options >= 2) {
         // 1. Set the selectedness of all but the last option element with its selectedness set to true
         //    in the list of options in tree order to false.
         GC::Ptr<HTML::HTMLOptionElement> last_selected_option;
@@ -814,6 +864,24 @@ void HTMLSelectElement::update_selectedness()
 
     // AD-HOC: A change to the selected option can change whether a required select satisfies its constraints.
     CSS::Invalidation::invalidate_style_after_validity_change(*this);
+
+    return should_update_selectedcontent;
+}
+
+// https://html.spec.whatwg.org/multipage/form-elements.html#reset-a-select%27s-selectedness
+void HTMLSelectElement::reset_selectedness(HasChanged has_changed)
+{
+    // 1. If the result of running the selectedness setting algorithm given select is true, then set hasChanged to true.
+    // NB: Our selectedness setting algorithm already updated the selectedcontent elements if it changed anything.
+    if (update_selectedness())
+        return;
+
+    // 2. If hasChanged is false, then return.
+    if (has_changed == HasChanged::No)
+        return;
+
+    // 3. Update a select's descendant selectedcontent elements given select.
+    MUST(update_selectedcontent());
 }
 
 bool HTMLSelectElement::is_focusable() const

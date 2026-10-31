@@ -41,7 +41,7 @@ public:
     virtual void did_create_canvas_backing_storage() override;
     virtual CSS::FontComputer& canvas_font_computer() override;
     virtual CSS::ComputationContext canvas_font_computation_context() override;
-    virtual CSS::ColorResolutionContext canvas_color_resolution_context() override;
+    virtual CSS::ColorResolutionStyle canvas_color_resolution_style() override;
     virtual CSSPixelRect canvas_viewport_rect() const override;
     virtual RefPtr<Gfx::Bitmap> get_bitmap_from_surface() override;
     virtual bool is_origin_clean() const override;
@@ -72,6 +72,7 @@ public:
     WebIDL::ExceptionOr<void> to_blob(GC::Ref<WebIDL::CallbackType> callback, Utf16View type, Optional<JS::Value> quality);
 
     void prepare_for_compositing();
+    bool has_unpresented_content() const { return m_canvas_content_dirty; }
     void notify_compositor_backing_storage_lost();
     void set_canvas_content_dirty();
     GC::Ptr<HTML::CanvasRenderingContext2D> canvas_rendering_context_2d() const
@@ -103,7 +104,7 @@ private:
     virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     template<typename ContextType>
     JS::ThrowCompletionOr<HasOrCreatedContext> create_webgl_context(JS::Value options);

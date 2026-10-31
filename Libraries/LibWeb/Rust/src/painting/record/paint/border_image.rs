@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::painting::paint_read::PaintRead;
 use crate::painting::record::trace::Observer;
 
 use crate::css::computed_value_views::LengthPercentageRef;
@@ -15,6 +16,7 @@ use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::ImageFrameResourceId;
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::FfiLayerImageList;
+use crate::painting::paintable_data::{PIECE_EDGE_BOTTOM, PIECE_EDGE_LEFT, PIECE_EDGE_RIGHT, PIECE_EDGE_TOP};
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::background::to_gfx_scaling_mode;
 use crate::painting::style_queries;
@@ -301,7 +303,10 @@ fn resolve_border_image_geometry(
     source_size: (i32, i32),
     border_box_rect: CssPixelRect,
     border_width: [CssPixels; 4],
+    present_edges: u8,
 ) -> ResolvedBorderImageGeometry {
+    let side_is_present =
+        [PIECE_EDGE_TOP, PIECE_EDGE_RIGHT, PIECE_EDGE_BOTTOM, PIECE_EDGE_LEFT].map(|edge| present_edges & edge != 0);
     let (source_width, source_height) = source_size;
     let source_width = CssPixels::from_integer(source_width as i64);
     let source_height = CssPixels::from_integer(source_height as i64);
@@ -319,12 +324,13 @@ fn resolve_border_image_geometry(
         shrink_opposite_sides_to_fit(top, bottom, source_height);
     }
 
-    let resolved_outset = [
-        resolve_outset_px(outset_items[0], border_width[0]),
-        resolve_outset_px(outset_items[1 % outset_items.len()], border_width[1]),
-        resolve_outset_px(outset_items[2 % outset_items.len()], border_width[2]),
-        resolve_outset_px(outset_items[3 % outset_items.len()], border_width[3]),
-    ];
+    let resolved_outset: [CssPixels; 4] = std::array::from_fn(|side| {
+        if side_is_present[side] {
+            resolve_outset_px(outset_items[side % outset_items.len()], border_width[side])
+        } else {
+            CssPixels::default()
+        }
+    });
 
     let mut border_image_rect = border_box_rect;
     border_image_rect.inflate(
@@ -335,32 +341,22 @@ fn resolve_border_image_geometry(
     );
 
     // https://drafts.csswg.org/css-backgrounds-3/#border-image-process
-    let mut widths = [
+    let mut widths: [CssPixels; 4] = std::array::from_fn(|side| {
+        if !side_is_present[side] {
+            return CssPixels::default();
+        }
+        let reference_length = if side % 2 == 0 {
+            border_image_rect.height
+        } else {
+            border_image_rect.width
+        };
         resolve_width_px(
-            width_items[0],
-            border_width[0],
-            border_image_rect.height,
-            source_slices[0],
-        ),
-        resolve_width_px(
-            width_items[1 % width_items.len()],
-            border_width[1],
-            border_image_rect.width,
-            source_slices[1],
-        ),
-        resolve_width_px(
-            width_items[2 % width_items.len()],
-            border_width[2],
-            border_image_rect.height,
-            source_slices[2],
-        ),
-        resolve_width_px(
-            width_items[3 % width_items.len()],
-            border_width[3],
-            border_image_rect.width,
-            source_slices[3],
-        ),
-    ];
+            width_items[side % width_items.len()],
+            border_width[side],
+            reference_length,
+            source_slices[side],
+        )
+    });
     {
         let [top, right, bottom, left] = &mut widths;
         shrink_opposite_sides_to_fit(left, right, border_image_rect.width);
@@ -392,9 +388,10 @@ pub(crate) fn paint_border_image<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
     css_border_widths: [CssPixels; 4],
+    present_edges: u8,
     border_box_rect: CssPixelRect,
 ) -> bool {
-    let layout_arena = recorder.layout_arena;
+    let layout_arena = recorder.source;
     let Some(style) = layout_arena.node_style_if_live(paintable) else {
         return false;
     };
@@ -409,7 +406,7 @@ pub(crate) fn paint_border_image<O: Observer>(
     }
     let image_rendering = style.image_rendering();
     let Some(crate::painting::image_content::ImageContent::Raster(Some(frame))) = recorder
-        .layout_arena
+        .source
         .layer_image_paint_facts(paintable, FfiLayerImageList::BorderImageSource, 0)
         .map(|facts| facts.content)
     else {
@@ -418,15 +415,22 @@ pub(crate) fn paint_border_image<O: Observer>(
     let frame_id = recorder.register_image_frame(&frame);
     let frame_size = (frame.width(), frame.height());
 
-    let Some(StyleValueData::BorderImageSlice {
-        top: slice_top,
-        right: slice_right,
-        bottom: slice_bottom,
-        left: slice_left,
-        fill,
-    }) = style_queries::handle_value(&border.border_image_slice)
-    else {
-        unreachable!("computed border-image-slice holds a slice value");
+    let slice_value = style_queries::handle_value(&border.border_image_slice)
+        .expect("computed border-image-slice lost its style value");
+    let (slice_values, fill) = match slice_value {
+        StyleValueData::BorderImageSlice {
+            top,
+            right,
+            bottom,
+            left,
+            fill,
+        } => ([top.data(), right.data(), bottom.data(), left.data()], *fill),
+        // NB: Typed OM can supply a single numeric slice directly, without the parser's four-sided wrapper.
+        StyleValueData::Number { .. }
+        | StyleValueData::Integer { .. }
+        | StyleValueData::Percentage { .. }
+        | StyleValueData::Calculated { .. } => ([slice_value; 4], false),
+        _ => unreachable!("computed border-image-slice holds a slice or numeric value"),
     };
     let width_value = style_queries::handle_value(&border.border_image_width)
         .expect("computed border-image-width lost its style value");
@@ -445,19 +449,14 @@ pub(crate) fn paint_border_image<O: Observer>(
     let repeat_y = repeat_keyword(repeat_items[1 % repeat_items.len()]);
 
     let geometry = resolve_border_image_geometry(
-        [
-            slice_top.data(),
-            slice_right.data(),
-            slice_bottom.data(),
-            slice_left.data(),
-        ],
+        slice_values,
         component_items(width_value),
         component_items(outset_value),
         frame_size,
         border_box_rect,
         css_border_widths,
+        present_edges,
     );
-    let fill = *fill;
     let source_columns = geometry.source_columns;
     let source_rows = geometry.source_rows;
     let destination_columns = geometry.destination_columns;

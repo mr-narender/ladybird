@@ -112,7 +112,7 @@ def run_test(webdriver_binary, process_name):
                 reports[0].name,
             ), reports[0].name
             assert f"Process: {process_name}\n" in text, text
-            assert "Captured signal:" in text, text
+            assert re.search(r"^Crashed at: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", text, re.MULTILINE), text
             captured_signal = re.search(r"^Captured signal: (.+)$", text, re.MULTILINE)
             assert captured_signal is not None, text
             assert f"Termination signal: {captured_signal.group(1)}\n" in text, text
@@ -122,12 +122,16 @@ def run_test(webdriver_binary, process_name):
                 assert "Verification failed:" not in text and "Assertion failed:" not in text, text
             assert "Executable build ID:" in text, text
             assert re.search(r"^Git commit: ([0-9a-f]{40}|[0-9a-f]{64}|unknown)$", text, re.MULTILINE), text
-            assert "C++ compiler:" in text and "C++ flags (" in text and "Build options:" in text, text
+            assert "C++ compiler:" in text and "C++ flags:" in text and "Build options:" in text, text
             assert "#0 " in text and "#1 " in text, text
-            assert " + 0x" in text or " at Services/" in text, text
+            # A frame names its binary by build ID and gives the object address, which is what resolving it afterwards
+            # takes. Whether the browser also attached a symbol depends on where the helper was when the signal landed:
+            # it symbolicates a frame only through an image it has loaded itself, so a frame in the helper's own
+            # executable never gets one, and a helper killed from outside may be anywhere in its own code.
+            assert re.search(r"^#\d+ [0-9a-f]{16,64} 0x[0-9a-f]+", text, re.MULTILINE), text
             assert "PRIVATE_CRASH" not in text, text
             assert temporary not in text and str(Path.home()) not in text, text
-            assert reports[0].stat().st_mode & 0o777 == 0o600
+            assert reports[0].stat().st_mode & 0o777 == 0o400
             assert directory.stat().st_mode & 0o777 == 0o700
             webdriver_helpers.request(port, "DELETE", f"/session/{session}")
         finally:
@@ -145,7 +149,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--process",
         default="WebContent",
-        choices=["WebContent", "WebWorker", "RequestServer", "ImageDecoder", "Compositor", "WasmCompiler"],
+        choices=["WebContent", "WebWorker", "RequestServer", "ImageDecoder", "Compositor"],
     )
     args = parser.parse_args()
     run_test(args.webdriver_binary, args.process)

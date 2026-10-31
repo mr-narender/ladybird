@@ -19,7 +19,9 @@
 #include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BrowsingSession.h>
+#include <LibWebView/ChildIdentity.h>
 #include <LibWebView/Export.h>
+#include <LibWebView/RequestServerSiteBindings.h>
 #include <WebWorker/WebWorkerClientEndpoint.h>
 #include <WebWorker/WebWorkerServerEndpoint.h>
 
@@ -31,38 +33,40 @@ class WEBVIEW_API WebWorkerClient final
     C_OBJECT_ABSTRACT(WebWorkerClient);
 
 public:
-    using InitTransport = Messages::WebWorkerServer::InitTransport;
-
     WebWorkerClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, Web::HTML::WorkerAgentId agent_id);
     ~WebWorkerClient();
 
     RefPtr<BrowsingSession> session() const { return m_session.strong_ref(); }
     IsPrivate is_private() const { return m_is_private; }
+
+    // The sites this process asked for the permissions of: at most its worker's top-level site.
+    Vector<URL::Origin> const& permission_origins() const { return m_permission_origins; }
+    RequestServerSiteBindings& request_server_site_bindings() { return m_request_server_site_bindings; }
     void remove_blob_url_entries();
 
-    pid_t pid() const { return m_pid; }
+    pid_t pid() const { return m_child_identity.pid; }
+    u64 child_id() const { return m_child_identity.child_id; }
+    void terminate_process();
 
     Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
-    void set_pid(pid_t pid) { m_pid = pid; }
+    void set_child_identity(ChildIdentity identity) { m_child_identity = identity; }
 
     virtual void did_close_worker() override;
     virtual void did_finish_loading_worker_script(bool worker_is_secure_context) override;
     virtual void did_fail_loading_worker_script() override;
     virtual void did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
+    virtual void did_report_outside_settings_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource) override;
     virtual Messages::WebWorkerClient::DidRequestCookieResponse did_request_cookie(URL::URL, HTTP::Cookie::Source) override;
     virtual Messages::WebWorkerClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
     virtual void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) override;
     virtual Messages::WebWorkerClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
     virtual Messages::WebWorkerClient::DidIsKnownHstsHostResponse did_is_known_hsts_host(String domain) override;
+    virtual Messages::WebWorkerClient::DidRequestPermissionSnapshotResponse did_request_permission_snapshot(URL::Origin top_level_origin) override;
     virtual Messages::WebWorkerClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
     virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage) override;
     virtual Messages::WebWorkerClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
-    virtual Messages::WebWorkerClient::OpenSystemFontResponse open_system_font(u64 generation, u64 face_id) override;
-    virtual Messages::WebWorkerClient::MatchSystemFontResponse match_system_font(String family, u16 weight, u16 width, u8 slope) override;
-    virtual Messages::WebWorkerClient::MatchSystemFontForCodePointResponse match_system_font_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji) override;
-    virtual Messages::WebWorkerClient::ResolveGenericFontResponse resolve_generic_font(String family, u16 weight, u8 slope) override;
 
 private:
     virtual void did_misbehave(StringView message_name, StringView reason) override;
@@ -71,12 +75,17 @@ private:
 
     IsPrivate m_is_private { IsPrivate::No };
     WeakPtr<BrowsingSession> m_session;
+    RequestServerSiteBindings m_request_server_site_bindings;
 
-    pid_t m_pid { -1 };
+    ChildIdentity m_child_identity;
     Web::HTML::WorkerAgentId m_agent_id { 0 };
+    Vector<URL::Origin> m_permission_origins;
 
-    // The controller connection to the MediaServer spawned for this process, from its first media use until it exits.
+    // The controller connections to the MediaServer and AudioServer spawned for this process, from its first media use
+    // until it exits.
     RefPtr<MediaClient::Client> m_media_server_client;
+    RefPtr<AudioServerControlClient> m_audio_server_client;
+    u64 m_audio_tab_id { 0 };
 };
 
 }

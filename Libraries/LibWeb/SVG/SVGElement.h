@@ -11,6 +11,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/GlobalEventHandlers.h>
 #include <LibWeb/HTML/HTMLOrSVGOrMathMLElement.h>
+#include <LibWeb/SVG/SVGAnimatedEnumeration.h>
 #include <LibWeb/SVG/SVGAnimatedLength.h>
 #include <LibWeb/SVG/SVGAnimatedString.h>
 #include <LibWeb/SVG/SVGLength.h>
@@ -33,18 +34,32 @@ class WEB_API SVGElement
 public:
     virtual bool requires_svg_container() const override { return true; }
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
+
+    // ^EventTarget
+    virtual bool is_focusable() const override;
+
+    bool is_in_never_rendered_subtree() const;
 
     GC::Ref<SVGAnimatedString> class_name();
     GC::Ptr<SVGSVGElement> owner_svg_element();
+    GC::Ptr<SVGSVGElement> outermost_svg_element();
     GC::Ptr<SVGElement> viewport_element();
 
     bool should_include_in_accessibility_tree() const;
     virtual Optional<ARIA::Role> default_role() const override;
 
-    Gfx::Size<double> viewport_size_for_percentage_resolution();
+    Gfx::Size<double> viewport_size_for_percentage_resolution(Layout::BegunRead const& read);
+
+    // Republishes the element's parsed attributes to the layout node arena, which is where a running
+    // layout pass reads them.
+    void publish_svg_attribute_facts();
+
+    bool is_resource_element() const;
+    bool is_referenceable_in_display_none_subtree() const;
 
     GC::Ref<SVGAnimatedLength> svg_animated_length_for_attribute(Utf16FlyString const&, SVGLength::Directionality, SVGLengthValue default_value);
+    GC::Ref<SVGAnimatedEnumeration> svg_animated_enumeration_for_attribute(Utf16FlyString const&, ReadonlySpan<SVGAnimatedEnumeration::Keyword>, u16 initial_value);
 
     virtual bool is_presentational_hint(Utf16FlyString const&) const final override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const final override;
@@ -52,9 +67,11 @@ public:
 
     virtual SVGFitToViewBox const* fit_to_view_box() const { return nullptr; }
 
-    void register_resource_box_referencing_element(Badge<Layout::LayoutTreeBuilderAccess>, DOM::Element&);
+    void register_resource_box_referencing_element(Badge<DOM::CommitMessages>, DOM::Element&);
     void mark_resource_box_referencing_elements_for_content_change();
     void note_svg_paint_resource_description_may_have_changed();
+
+    RefPtr<CSS::StyleValue const> parse_presentation_attribute(CSS::PropertyID, Utf16View) const;
 
 protected:
     SVGElement(DOM::Document&, DOM::QualifiedName);
@@ -79,7 +96,6 @@ private:
 
     virtual bool is_svg_element() const final { return true; }
 
-    RefPtr<CSS::StyleValue const> parse_presentation_attribute(CSS::PropertyID, Utf16View) const;
     Vector<CSS::StyleProperty> const& presentation_attribute_style() const;
     void update_presentation_attribute_style(Utf16FlyString const& name, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_);
     void publish_presentation_attribute_style();
@@ -90,6 +106,7 @@ private:
 
     // Many reflecting attributes are marked as SameObject so we cache the objects we create here.
     HashMap<Utf16FlyString, GC::Ref<SVGAnimatedLength>> m_reflected_attribute_cache;
+    HashMap<Utf16FlyString, GC::Ref<SVGAnimatedEnumeration>> m_reflected_enumeration_cache;
 
     // Elements whose layout subtrees contain a <mask>, <clipPath>, or <pattern> resource box built
     // from this element. Their subtrees must be rebuilt when this element is removed, since resource

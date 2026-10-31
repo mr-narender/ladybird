@@ -6,7 +6,7 @@
 
 use crate::css::css_enums::keyword_from_ascii_case_insensitive;
 use crate::css::css_tokenizer::tokenize_for_parser;
-use crate::css::ffi_support::FfiUtf16View;
+use crate::css::ffi_support::{FfiUtf16View, OwnedArc};
 use crate::css::parser::arbitrary_substitution::{
     SubstitutionFunctionsPresence, collect_arbitrary_substitution_function_presence, declaration_value_is_valid,
 };
@@ -17,7 +17,7 @@ use crate::css::parser::token_stream::TokenStream;
 use crate::css::parser::transforms_effects_parser::{parse_transform, parse_transform_function};
 use crate::css::parser::value_parser::{
     FfiParseStatus, ParseContext, is_valid_custom_ident, parse_custom_ident_value, parse_string_value,
-    parse_syntax_numeric_value, parse_url_value, unresolved_value, value_list,
+    parse_syntax_numeric_value, parse_url_value, unresolved_value, unresolved_value_from_component_values, value_list,
 };
 use crate::css::property_metadata::property_id;
 use crate::css::serialize::{StringUnits, TextSink, serialize_an_identifier};
@@ -30,6 +30,8 @@ pub(crate) enum SyntaxType {
     Angle,
     Color,
     CustomIdent,
+    /// Not a syntax a registration names: a `<style-range-value>` may be a `<frequency>`.
+    Frequency,
     Image,
     Integer,
     Length,
@@ -75,6 +77,7 @@ fn serialize_syntax(syntax: &SyntaxNode, sink: &mut TextSink) {
                 SyntaxType::Angle => "angle",
                 SyntaxType::Color => "color",
                 SyntaxType::CustomIdent => "custom-ident",
+                SyntaxType::Frequency => "frequency",
                 SyntaxType::Image => "image",
                 SyntaxType::Integer => "integer",
                 SyntaxType::Length => "length",
@@ -154,6 +157,15 @@ fn discard_whitespace(values: &[ComponentValue], position: &mut usize) {
     }
 }
 
+// https://drafts.css-houdini.org/css-properties-values-api/#consume-data-type-name
+// NB: Data type names are consumed as literal code points, unlike custom identifiers, which allow escapes.
+fn data_type_name(value: &ComponentValue) -> Option<&[u16]> {
+    if value.original_source_text.iter().any(|unit| unit == u16::from(b'\\')) {
+        return None;
+    }
+    value.ident()
+}
+
 fn parse_single_component(
     values: &[ComponentValue],
     position: &mut usize,
@@ -176,7 +188,7 @@ fn parse_single_component(
 
     if values.get(*position).is_some_and(|value| value.is_delim(b'<')) {
         *position += 1;
-        let name = values.get(*position).and_then(ComponentValue::ident);
+        let name = values.get(*position).and_then(data_type_name);
         *position += usize::from(name.is_some());
         if let Some(name) = name
             && values.get(*position).is_some_and(|value| value.is_delim(b'>'))
@@ -202,7 +214,7 @@ fn parse_component(
     if values.get(*position).is_some_and(|value| value.is_delim(b'<'))
         && values
             .get(*position + 1)
-            .and_then(ComponentValue::ident)
+            .and_then(data_type_name)
             .is_some_and(|name| equals_ascii(name, b"transform-list"))
         && values.get(*position + 2).is_some_and(|value| value.is_delim(b'>'))
     {
@@ -240,7 +252,7 @@ pub(crate) fn parse_syntax(source: &[u16], limit_ident_to_custom_ident: bool) ->
     parse_syntax_values(&values, limit_ident_to_custom_ident)
 }
 
-fn parse_syntax_values(values: &[ComponentValue], limit_ident_to_custom_ident: bool) -> Option<SyntaxNode> {
+pub(crate) fn parse_syntax_values(values: &[ComponentValue], limit_ident_to_custom_ident: bool) -> Option<SyntaxNode> {
     let mut position = 0;
     discard_whitespace(values, &mut position);
 
@@ -300,23 +312,13 @@ fn identifier_matches(value: &[u16], expected: &[u16], case_sensitive: bool) -> 
 
 fn parse_type(context: &ParseContext, syntax_type: SyntaxType, tokens: &mut TokenStream<'_>) -> Option<StyleValueData> {
     tokens.discard_whitespace();
-    let parsed = match syntax_type {
+    match syntax_type {
         SyntaxType::Color => parse_color_value(context, property_id::CUSTOM, tokens, false),
-        SyntaxType::CustomIdent => {
-            let value = parse_custom_ident_value(context, tokens.next_token(), &[])?;
-            tokens.discard_a_token();
-            Some(value)
-        }
+        SyntaxType::CustomIdent => parse_custom_ident_value(context, tokens.consume_a_token(), &[]),
         SyntaxType::Image => parse_image_value(context, property_id::CUSTOM, tokens, false),
-        SyntaxType::String => {
-            let value = parse_string_value(context, tokens.next_token())?;
-            tokens.discard_a_token();
-            Some(value)
-        }
+        SyntaxType::String => parse_string_value(context, tokens.consume_a_token()),
         SyntaxType::TransformFunction => {
-            let value = parse_transform_function(context, property_id::CUSTOM, tokens.next_token())?;
-            tokens.discard_a_token();
-            Some(value)
+            parse_transform_function(context, property_id::CUSTOM, tokens.consume_a_token())
         }
         SyntaxType::TransformList => {
             let start = tokens.current_index();
@@ -325,85 +327,68 @@ fn parse_type(context: &ParseContext, syntax_type: SyntaxType, tokens: &mut Toke
             }
             parse_transform(context, property_id::CUSTOM, tokens.tokens_since(start))
         }
-        SyntaxType::Url => {
-            let value = parse_url_value(context, tokens.next_token())?;
-            tokens.discard_a_token();
-            Some(value)
-        }
-        _ => {
-            let value = parse_syntax_numeric_value(context, syntax_type, tokens.next_token())?;
-            tokens.discard_a_token();
-            Some(value)
-        }
-    }?;
-    Some(parsed)
+        SyntaxType::Url => parse_url_value(context, tokens.consume_a_token()),
+        _ => parse_syntax_numeric_value(context, syntax_type, tokens.consume_a_token()),
+    }
 }
 
+/// May consume tokens on failure. Callers that retry must use a transaction.
 fn parse_node(context: &ParseContext, syntax: &SyntaxNode, tokens: &mut TokenStream<'_>) -> Option<StyleValueData> {
-    let mut transaction = tokens.begin_transaction();
-    let parsed = match syntax {
-        SyntaxNode::Universal => return None,
+    match syntax {
+        SyntaxNode::Universal => None,
         SyntaxNode::Ident { value, case_sensitive } => {
-            transaction.discard_whitespace();
-            let identifier = transaction.consume_a_token().ident()?;
+            tokens.discard_whitespace();
+            let identifier = tokens.consume_a_token().ident()?;
             if !identifier_matches(identifier, value, *case_sensitive) {
                 return None;
             }
             if let Some(keyword) = keyword_from_ascii_case_insensitive(value) {
-                StyleValueData::Keyword { keyword }
+                Some(StyleValueData::Keyword { keyword })
             } else {
-                StyleValueData::CustomIdent {
+                Some(StyleValueData::CustomIdent {
                     custom_ident: CssString::from_utf16(value),
-                }
+                })
             }
         }
-        SyntaxNode::Type(syntax_type) => parse_type(context, *syntax_type, &mut transaction)?,
+        SyntaxNode::Type(syntax_type) => parse_type(context, *syntax_type, tokens),
         SyntaxNode::Multiplier { child, multiplier } => {
             let mut values = Vec::new();
-            transaction.discard_whitespace();
+            tokens.discard_whitespace();
             loop {
-                values.push(parse_node(context, child, &mut transaction)?);
-                transaction.discard_whitespace();
+                values.push(parse_node(context, child, tokens)?);
+                tokens.discard_whitespace();
                 match multiplier {
-                    SyntaxMultiplier::CommaSeparated if transaction.next_token().is_comma() => {
-                        transaction.discard_a_token();
-                        transaction.discard_whitespace();
-                        if !transaction.has_next_token() {
+                    SyntaxMultiplier::CommaSeparated if tokens.next_token().is_comma() => {
+                        tokens.discard_a_token();
+                        tokens.discard_whitespace();
+                        if !tokens.has_next_token() {
                             return None;
                         }
                     }
-                    SyntaxMultiplier::SpaceSeparated if transaction.has_next_token() => {}
+                    SyntaxMultiplier::SpaceSeparated if tokens.has_next_token() => {}
                     _ => break,
                 }
             }
-            value_list(values, u8::from(*multiplier == SyntaxMultiplier::CommaSeparated), true)
+            Some(value_list(
+                values,
+                u8::from(*multiplier == SyntaxMultiplier::CommaSeparated),
+                true,
+            ))
         }
         SyntaxNode::Alternatives(alternatives) => {
             for alternative in alternatives {
-                let parsed = {
-                    let mut alternative_transaction = transaction.begin_transaction();
-                    if let Some(parsed) = parse_node(context, alternative, &mut alternative_transaction) {
-                        alternative_transaction.discard_whitespace();
-                        if !alternative_transaction.has_next_token() {
-                            alternative_transaction.commit();
-                            Some(parsed)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                let mut transaction = tokens.begin_transaction();
+                if let Some(parsed) = parse_node(context, alternative, &mut transaction) {
+                    transaction.discard_whitespace();
+                    if !transaction.has_next_token() {
+                        transaction.commit();
+                        return Some(parsed);
                     }
-                };
-                if let Some(parsed) = parsed {
-                    transaction.commit();
-                    return Some(parsed);
                 }
             }
-            return None;
+            None
         }
-    };
-    transaction.commit();
-    Some(parsed)
+    }
 }
 
 // https://drafts.csswg.org/css-values-5/#parse-with-a-syntax
@@ -412,27 +397,42 @@ pub(crate) fn parse_with_syntax(context: &ParseContext, source: &[u16], syntax: 
         crate::css::css_tokenizer::TokenizerInput::Utf16(source),
     ))
     .ok()?;
+    parse_with_syntax_component_values(context, &values, syntax, Some(source))
+}
+
+/// Parses component values against a syntax. Original source text is only used
+/// when constructing an unresolved value for the universal syntax; when absent,
+/// the component values are serialized instead.
+pub(crate) fn parse_with_syntax_component_values(
+    context: &ParseContext,
+    values: &[ComponentValue],
+    syntax: &SyntaxNode,
+    original_source: Option<&[u16]>,
+) -> Option<StyleValueData> {
     if matches!(syntax, SyntaxNode::Universal) {
-        if !declaration_value_is_valid(&values) {
+        if !values.is_empty() && !declaration_value_is_valid(values) {
             return None;
         }
+
         let mut presence = SubstitutionFunctionsPresence::default();
-        collect_arbitrary_substitution_function_presence(&values, &mut presence).ok()?;
-        return Some(unresolved_value(source, &[], presence));
+        collect_arbitrary_substitution_function_presence(values, &mut presence).ok()?;
+
+        return Some(match original_source {
+            Some(source) => unresolved_value(source, values.to_vec(), presence),
+            None => unresolved_value_from_component_values(values.to_vec(), presence),
+        });
     }
-    let mut tokens = TokenStream::new(&values);
+
+    let mut tokens = TokenStream::new(values);
     let parsed = parse_node(context, syntax, &mut tokens)?;
     tokens.discard_whitespace();
     (!tokens.has_next_token()).then_some(parsed)
 }
 
 /// Parses a complete CSS syntax definition and returns an opaque syntax tree.
-///
-/// # Safety
-/// `source` must remain readable for `source_length` UTF-16 code units during this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parse_syntax(source: FfiUtf16View, limit_ident_to_custom_ident: bool) -> *const c_void {
-    let Some(source) = (unsafe { source.to_utf16() }) else {
+pub extern "C" fn rust_parse_syntax(source: FfiUtf16View, limit_ident_to_custom_ident: bool) -> *const c_void {
+    let Some(source) = source.to_utf16() else {
         return std::ptr::null();
     };
     let Some(syntax) = parse_syntax(&source, limit_ident_to_custom_ident) else {
@@ -441,25 +441,14 @@ pub unsafe extern "C" fn rust_parse_syntax(source: FfiUtf16View, limit_ident_to_
     Arc::into_raw(Arc::new(syntax)).cast()
 }
 
-/// Returns an owned universal-syntax handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_syntax_create_universal() -> *const c_void {
-    Arc::into_raw(Arc::new(SyntaxNode::Universal)).cast()
+pub extern "C" fn rust_syntax_retain(syntax: crate::css::ffi_support::ArcRef<'_, SyntaxNode>) -> *const SyntaxNode {
+    Arc::into_raw(syntax.to_arc())
 }
 
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_retain(syntax: *const c_void) -> *const c_void {
-    unsafe { Arc::increment_strong_count(syntax.cast::<SyntaxNode>()) };
-    syntax
-}
-
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle whose strong count is released exactly once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_release(syntax: *const c_void) {
-    unsafe { Arc::decrement_strong_count(syntax.cast::<SyntaxNode>()) };
+pub extern "C" fn rust_syntax_release(syntax: OwnedArc<SyntaxNode>) {
+    drop(syntax);
 }
 
 /// # Safety
@@ -468,87 +457,91 @@ pub(crate) unsafe fn clone_syntax_handle(syntax: *const c_void) -> Option<Syntax
     unsafe { syntax.cast::<SyntaxNode>().as_ref() }.cloned()
 }
 
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_is_universal(syntax: *const c_void) -> bool {
-    matches!(unsafe { &*syntax.cast::<SyntaxNode>() }, SyntaxNode::Universal)
+pub extern "C" fn rust_syntax_is_universal(syntax: &SyntaxNode) -> bool {
+    matches!(syntax, SyntaxNode::Universal)
 }
 
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_is_single_component(syntax: *const c_void) -> bool {
-    is_single_syntax_component(unsafe { &*syntax.cast::<SyntaxNode>() })
+pub extern "C" fn rust_syntax_is_single_component(syntax: &SyntaxNode) -> bool {
+    is_single_syntax_component(syntax)
 }
 
-/// # Safety
-/// `left` and `right` must be live parsed-syntax handles.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_equals(left: *const c_void, right: *const c_void) -> bool {
-    let left = unsafe { &*left.cast::<SyntaxNode>() };
-    let right = unsafe { &*right.cast::<SyntaxNode>() };
+pub extern "C" fn rust_syntax_value_is_list(syntax: &SyntaxNode, value: &StyleValueData) -> bool {
+    match syntax {
+        SyntaxNode::Multiplier { .. } => true,
+        SyntaxNode::Alternatives(alternatives) => {
+            // NB: Select the same first matching alternative as parsing. A transform-list is one Typed OM value,
+            //     whereas a multiplier on transform-function produces multiple values.
+            let source = crate::css::serialize::serialize_style_value_to_utf16(value);
+            let context = ParseContext::default();
+            alternatives
+                .iter()
+                .find(|alternative| parse_with_syntax(&context, &source, alternative).is_some())
+                .is_some_and(|alternative| matches!(alternative, SyntaxNode::Multiplier { .. }))
+        }
+        _ => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_syntax_equals(left: &SyntaxNode, right: &SyntaxNode) -> bool {
     left == right
 }
 
-/// Serializes a syntax handle into an owned native `AK::Utf16String`.
-///
-/// # Safety
-/// `syntax` must be a live parsed-syntax handle. The returned raw string must be adopted by C++.
+/// Serializes a syntax handle into an owned native `AK::Utf16String`, which C++ must adopt.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_syntax_serialize(syntax: *const c_void) -> usize {
+pub extern "C" fn rust_syntax_serialize(syntax: &SyntaxNode) -> usize {
     let mut sink = TextSink::new();
-    serialize_syntax(unsafe { &*syntax.cast::<SyntaxNode>() }, &mut sink);
+    serialize_syntax(syntax, &mut sink);
     crate::css::serialize::sink_into_raw(sink)
 }
 
 /// Parses a CSS value against a registered syntax and returns one strong style-value handle.
 ///
 /// # Safety
-/// All non-null pointers must remain readable for their accompanying lengths during this call.
+/// The pointers `context` holds must remain readable for their accompanying lengths during this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_parse_with_syntax(
-    context: *const ParseContext,
+    context: Option<&ParseContext>,
     source: FfiUtf16View,
-    syntax: *const c_void,
-    out_status: *mut FfiParseStatus,
+    syntax: Option<&SyntaxNode>,
+    out_status: Option<&mut FfiParseStatus>,
 ) -> *const c_void {
-    if context.is_null() || syntax.is_null() || out_status.is_null() {
-        return std::ptr::null();
-    }
-    let Some(source) = (unsafe { source.to_utf16() }) else {
-        unsafe { *out_status = FfiParseStatus::Invalid };
+    let (Some(context), Some(syntax), Some(out_status)) = (context, syntax, out_status) else {
         return std::ptr::null();
     };
-    let Some(parsed) = parse_with_syntax(unsafe { &*context }, &source, unsafe { &*syntax.cast::<SyntaxNode>() })
-    else {
-        unsafe { *out_status = FfiParseStatus::Invalid };
+    let Some(source) = source.to_utf16() else {
+        *out_status = FfiParseStatus::Invalid;
         return std::ptr::null();
     };
-    unsafe { *out_status = FfiParseStatus::Parsed };
+    let Some(parsed) = parse_with_syntax(context, &source, syntax) else {
+        *out_status = FfiParseStatus::Invalid;
+        return std::ptr::null();
+    };
+    *out_status = FfiParseStatus::Parsed;
     Arc::into_raw(Arc::new(parsed)).cast()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::parser::value_parser::RandomFunctionIndex;
 
-    fn context(random_function_index: &mut usize) -> ParseContext {
+    fn context(random_function_index: &RandomFunctionIndex) -> ParseContext<'_> {
         ParseContext {
             in_quirks_mode: false,
             is_svg_presentation_attribute: false,
             is_substituted_value: false,
             contains_attr_tainted_values: false,
             is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index,
+            value_contexts: ak::Span::default(),
+            declared_namespaces: None,
+            document_url: ak::Span::default(),
+            document_base_url: ak::Span::default(),
+            length_resolution_context: None,
+            random_function_index: Some(random_function_index),
         }
     }
 
@@ -615,13 +608,48 @@ mod tests {
 
     #[test]
     fn parses_values_against_syntax() {
-        let mut random_function_index = 0;
-        let context = context(&mut random_function_index);
+        let random_function_index = RandomFunctionIndex::default();
+        let context = context(&random_function_index);
         let syntax = parse_syntax(&utf16("<length> | <number>#"), true).unwrap();
         assert!(parse_with_syntax(&context, &utf16("12px"), &syntax).is_some());
         assert!(parse_with_syntax(&context, &utf16("1, 2, calc(1 + 2)"), &syntax).is_some());
         assert!(parse_with_syntax(&context, &utf16("red"), &syntax).is_none());
         assert!(parse_with_syntax(&context, &utf16("1,"), &syntax).is_none());
+    }
+
+    #[test]
+    fn universal_syntax_uses_provided_source_text() {
+        let random_function_index = RandomFunctionIndex::default();
+        let context = context(&random_function_index);
+        let source = utf16("1.00px");
+        let values = consume_a_list_of_component_values(
+            crate::css::css_tokenizer::tokenize_for_parser_without_source(b"1.00px").into_vec(),
+        )
+        .unwrap();
+        let Some(StyleValueData::Unresolved { source_text, .. }) =
+            parse_with_syntax_component_values(&context, &values, &SyntaxNode::Universal, Some(&source))
+        else {
+            panic!("expected an unresolved value");
+        };
+        assert_eq!(source_text.units(), source);
+    }
+
+    #[test]
+    fn universal_syntax_serializes_component_values_without_original_source() {
+        let random_function_index = RandomFunctionIndex::default();
+        let context = context(&random_function_index);
+        let mut values = consume_a_list_of_component_values(tokenize_for_parser(b"a b".as_slice())).unwrap();
+        values.remove(1);
+        let Some(StyleValueData::Unresolved {
+            source_text,
+            components,
+            ..
+        }) = parse_with_syntax_component_values(&context, &values, &SyntaxNode::Universal, None)
+        else {
+            panic!("expected an unresolved value");
+        };
+        assert_eq!(source_text.units(), utf16("a/**/b"));
+        assert_eq!(components.as_slice(), values.as_slice());
     }
 
     #[test]

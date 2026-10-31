@@ -60,12 +60,8 @@ impl CssString {
         Self { raw: 0 }
     }
 
-    pub(crate) fn as_ptr(&self) -> *const std::ffi::c_void {
-        if self.raw == 0 {
-            std::ptr::null()
-        } else {
-            (self as *const Self).cast()
-        }
+    pub(crate) fn as_ptr(&self) -> *const Self {
+        if self.raw == 0 { std::ptr::null() } else { self }
     }
 
     pub(crate) fn units(&self) -> &[u16] {
@@ -208,21 +204,11 @@ impl CssStringList {
         }
     }
 
-    /// # Safety
-    /// `strings` must contain `length` leaked AK::Utf16FlyString references.
-    pub(crate) unsafe fn from_raw(strings: *const usize, length: usize) -> Self {
-        Self::from_strings(
-            (0..length)
-                .map(|index| unsafe { CssString::from_leaked_raw(*strings.add(index)) })
-                .collect(),
-        )
-    }
-
     pub(crate) fn as_slice(&self) -> &[CssString] {
         if self.length == 0 {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -252,11 +238,10 @@ pub struct CssStringView {
     pub length: usize,
 }
 
-/// # Safety
-/// `string` must point to a live CssString. The returned view borrows its storage.
+/// The returned view borrows the storage of `string`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_css_string_view(string: *const std::ffi::c_void) -> CssStringView {
-    let units = unsafe { &*string.cast::<CssString>() }.units();
+pub extern "C" fn rust_css_string_view(string: &CssString) -> CssStringView {
+    let units = string.units();
     CssStringView {
         data: units.as_ptr(),
         length: units.len(),

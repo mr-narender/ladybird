@@ -5,11 +5,15 @@
  */
 
 use super::StackingContextFacts;
+use crate::cow_column::{CowColumn, RowMut};
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::paint_order;
+use crate::painting::paint_read::GeometryRead;
+use crate::painting::paintable_rows::PAINTABLE_SLOTS_PER_CHUNK;
 use crate::painting::visual_context::dirty::VisualContextBoxDirtyKind;
-use std::cell::Ref;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NonzeroZIndexChildContext {
@@ -17,7 +21,7 @@ pub(crate) struct NonzeroZIndexChildContext {
     pub slot: NodeSlotId,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StackingContextEntries {
     pub child_contexts_with_nonzero_z_index: Vec<NonzeroZIndexChildContext>,
     pub stack_level_zero_boxes: Vec<NodeSlotId>,
@@ -42,66 +46,103 @@ impl StackingContextEntries {
     }
 }
 
+/// Each stacking context root's entry table, by row. It is published with the rows, so a write
+/// copies a table, and its chunk, only while a published frame shares them.
+pub(crate) type StackingContextEntryColumn = CowColumn<Option<Arc<StackingContextEntries>>, PAINTABLE_SLOTS_PER_CHUNK>;
+
+/// A root's table, for writing. It copies the table, and its row's chunk, only if a published
+/// frame shares them and the table changes.
+struct TableMut<'a>(
+    RowMut<&'a mut StackingContextEntryColumn, Option<Arc<StackingContextEntries>>, PAINTABLE_SLOTS_PER_CHUNK>,
+);
+
+impl Deref for TableMut<'_> {
+    type Target = StackingContextEntries;
+
+    fn deref(&self) -> &StackingContextEntries {
+        self.0.as_deref().expect("a table row holds a table")
+    }
+}
+
+impl DerefMut for TableMut<'_> {
+    fn deref_mut(&mut self) -> &mut StackingContextEntries {
+        Arc::make_mut(self.0.as_mut().expect("a table row holds a table"))
+    }
+}
+
+fn table_mut(tables: &mut StackingContextEntryColumn, root: NodeSlotId) -> Option<TableMut<'_>> {
+    let index = root.slot_index() as usize;
+    tables.get(index)?.as_ref()?;
+    tables.row_mut(index).map(TableMut)
+}
+
+/// Drops the table of the root in a row, if it has one.
+pub(crate) fn drop_table(tables: &mut StackingContextEntryColumn, index: usize) {
+    tables.set(index, None);
+}
+
 impl LayoutNodeArena {
-    pub(crate) fn stacking_context_entries(&self, root: NodeSlotId) -> Option<Ref<'_, StackingContextEntries>> {
+    pub(crate) fn stacking_context_entries(&self, root: NodeSlotId) -> Option<&StackingContextEntries> {
         if !self.paintable_row_is_populated(root) {
             return None;
         }
-        Ref::filter_map(self.paintable_rows.stacking_context_entries.borrow(), |tables| {
-            tables
-                .get(root.slot_index() as usize)
-                .and_then(|table| table.as_deref())
-        })
-        .ok()
-    }
-
-    pub(crate) fn ensure_stacking_context_entries_for_root(&self, root: NodeSlotId) {
-        debug_assert!(self.paintable_row_is_populated(root));
-        let mut tables = self.paintable_rows.stacking_context_entries.borrow_mut();
-        let table = &mut tables[root.slot_index() as usize];
-        if table.is_none() {
-            *table = Some(Box::default());
-        }
-    }
-
-    pub(crate) fn drop_stacking_context_entries_of_root(&self, root: NodeSlotId) {
-        if let Some(table) = self
-            .paintable_rows
+        self.paintable_rows
             .stacking_context_entries
-            .borrow_mut()
-            .get_mut(root.slot_index() as usize)
-        {
-            *table = None;
+            .get(root.slot_index() as usize)
+            .and_then(|table| table.as_deref())
+    }
+
+    pub(crate) fn ensure_stacking_context_entries_for_root(&mut self, root: NodeSlotId) {
+        debug_assert!(self.paintable_row_is_populated(root));
+        let tables = &mut self.paintable_rows.stacking_context_entries;
+        let index = root.slot_index() as usize;
+        if tables.get(index).is_some_and(Option::is_none) {
+            tables
+                .set(index, Some(Arc::default()))
+                .expect("the row is in the column");
         }
     }
 
-    pub(crate) fn register_stacking_context_contribution(&self, slot: NodeSlotId, facts: &StackingContextFacts) {
+    pub(crate) fn drop_stacking_context_entries_of_root(&mut self, root: NodeSlotId) {
+        drop_table(
+            &mut self.paintable_rows.stacking_context_entries,
+            root.slot_index() as usize,
+        );
+    }
+
+    pub(crate) fn register_stacking_context_contribution(&mut self, slot: NodeSlotId, facts: &StackingContextFacts) {
         let enclosing = facts.enclosing_stacking_context;
         if !self.paintable_row_is_populated(enclosing) {
             return;
         }
-        let mut tables = self.paintable_rows.stacking_context_entries.borrow_mut();
-        let Some(table) = tables
-            .get_mut(enclosing.slot_index() as usize)
-            .and_then(|table| table.as_deref_mut())
-        else {
+        let Some(entries) = self.stacking_context_entries(enclosing) else {
+            return;
+        };
+        // The places the box takes in the lists ordered by pre-order label, found before the table is written.
+        let nonzero_z_index_insertion = facts.nonzero_z_index_child_contribution().map(|z_index| {
+            let label = self.node_pre_order_label(slot);
+            let position = entries
+                .child_contexts_with_nonzero_z_index
+                .partition_point(|entry| (entry.z_index, self.node_pre_order_label(entry.slot)) < (z_index, label));
+            (position, z_index)
+        });
+        let stack_level_zero_position =
+            (nonzero_z_index_insertion.is_none() && facts.contributes_to_stack_level_zero()).then(|| {
+                let label = self.node_pre_order_label(slot);
+                entries
+                    .stack_level_zero_boxes
+                    .partition_point(|entry| self.node_pre_order_label(*entry) < label)
+            });
+        let Some(mut table) = table_mut(&mut self.paintable_rows.stacking_context_entries, enclosing) else {
             return;
         };
         let mut composition_changed = false;
-        if let Some(z_index) = facts.nonzero_z_index_child_contribution() {
-            let label = self.node_pre_order_label(slot);
-            let position = table
-                .child_contexts_with_nonzero_z_index
-                .partition_point(|entry| (entry.z_index, self.node_pre_order_label(entry.slot)) < (z_index, label));
+        if let Some((position, z_index)) = nonzero_z_index_insertion {
             table
                 .child_contexts_with_nonzero_z_index
                 .insert(position, NonzeroZIndexChildContext { z_index, slot });
             composition_changed = true;
-        } else if facts.contributes_to_stack_level_zero() {
-            let label = self.node_pre_order_label(slot);
-            let position = table
-                .stack_level_zero_boxes
-                .partition_point(|entry| self.node_pre_order_label(*entry) < label);
+        } else if let Some(position) = stack_level_zero_position {
             table.stack_level_zero_boxes.insert(position, slot);
             composition_changed = true;
         }
@@ -113,22 +154,18 @@ impl LayoutNodeArena {
             composition_changed |= table.inline_or_replaced_count == 0;
             table.inline_or_replaced_count += 1;
         }
-        drop(tables);
+        drop(table);
         if composition_changed {
             self.note_stacking_context_composition_changed(enclosing);
         }
     }
 
-    pub(crate) fn withdraw_stacking_context_contribution(&self, slot: NodeSlotId, facts: &StackingContextFacts) {
+    pub(crate) fn withdraw_stacking_context_contribution(&mut self, slot: NodeSlotId, facts: &StackingContextFacts) {
         let enclosing = facts.enclosing_stacking_context;
         if !self.paintable_row_is_populated(enclosing) {
             return;
         }
-        let mut tables = self.paintable_rows.stacking_context_entries.borrow_mut();
-        let Some(table) = tables
-            .get_mut(enclosing.slot_index() as usize)
-            .and_then(|table| table.as_deref_mut())
-        else {
+        let Some(mut table) = table_mut(&mut self.paintable_rows.stacking_context_entries, enclosing) else {
             return;
         };
         let mut composition_changed = false;
@@ -155,36 +192,29 @@ impl LayoutNodeArena {
             composition_changed |= table.inline_or_replaced_count == 1;
             table.inline_or_replaced_count = table.inline_or_replaced_count.saturating_sub(1);
         }
-        drop(tables);
+        drop(table);
         if composition_changed {
             self.note_stacking_context_composition_changed(enclosing);
         }
     }
 
-    fn flag_stacking_context_entries_for_resort(&self, root: NodeSlotId) {
+    fn flag_stacking_context_entries_for_resort(&mut self, root: NodeSlotId) {
         if !self.paintable_row_is_populated(root) {
             return;
         }
         self.note_stacking_context_composition_changed(root);
-        let mut tables = self.paintable_rows.stacking_context_entries.borrow_mut();
-        let Some(table) = tables
-            .get_mut(root.slot_index() as usize)
-            .and_then(|table| table.as_deref_mut())
-        else {
+        let Some(mut table) = table_mut(&mut self.paintable_rows.stacking_context_entries, root) else {
             return;
         };
         if table.needs_resort {
             return;
         }
         table.needs_resort = true;
-        self.paintable_rows
-            .stacking_context_roots_flagged_for_resort
-            .borrow_mut()
-            .push(root);
+        self.paintable_rows.stacking_context_roots_flagged_for_resort.push(root);
     }
 
     pub(crate) fn apply_stacking_context_facts_delta(
-        &self,
+        &mut self,
         slot: NodeSlotId,
         previous: Option<&StackingContextFacts>,
         next: &mut StackingContextFacts,
@@ -220,61 +250,56 @@ impl LayoutNodeArena {
         }
     }
 
-    pub(crate) fn resort_stacking_context_entries_flagged_for_resort(&self) {
-        let flagged_roots = std::mem::take(
-            &mut *self
-                .paintable_rows
-                .stacking_context_roots_flagged_for_resort
-                .borrow_mut(),
-        );
+    pub(crate) fn resort_stacking_context_entries_flagged_for_resort(&mut self) {
+        let flagged_roots = std::mem::take(&mut self.paintable_rows.stacking_context_roots_flagged_for_resort);
         for root in flagged_roots {
             if !self.paintable_row_is_populated(root) {
                 continue;
             }
-            let mut tables = self.paintable_rows.stacking_context_entries.borrow_mut();
-            let Some(table) = tables
-                .get_mut(root.slot_index() as usize)
-                .and_then(|table| table.as_deref_mut())
-            else {
+            let Some(mut table) = table_mut(&mut self.paintable_rows.stacking_context_entries, root) else {
                 continue;
             };
             table.needs_resort = false;
-            table
-                .child_contexts_with_nonzero_z_index
+            // The lists are ordered by pre-order label, which the arena answers while the table is not borrowed.
+            let mut child_contexts_with_nonzero_z_index =
+                std::mem::take(&mut table.child_contexts_with_nonzero_z_index);
+            let mut stack_level_zero_boxes = std::mem::take(&mut table.stack_level_zero_boxes);
+            drop(table);
+            child_contexts_with_nonzero_z_index
                 .sort_by_key(|entry| (entry.z_index, self.node_pre_order_label(entry.slot)));
-            table
-                .stack_level_zero_boxes
-                .sort_by_key(|entry| self.node_pre_order_label(*entry));
+            stack_level_zero_boxes.sort_by_key(|entry| self.node_pre_order_label(*entry));
+            let mut table = table_mut(&mut self.paintable_rows.stacking_context_entries, root)
+                .expect("the root's table was there before its lists were sorted");
+            table.child_contexts_with_nonzero_z_index = child_contexts_with_nonzero_z_index;
+            table.stack_level_zero_boxes = stack_level_zero_boxes;
         }
     }
 
-    pub(crate) fn rebuild_all_stacking_context_entries_from_records(&self, viewport: NodeSlotId) {
-        self.paintable_rows
-            .stacking_context_entries
-            .borrow_mut()
-            .iter_mut()
-            .for_each(|table| *table = None);
-        self.paintable_rows
-            .stacking_context_roots_flagged_for_resort
-            .borrow_mut()
-            .clear();
-        let paintable_rows = self.paintable_rows();
+    pub(crate) fn rebuild_all_stacking_context_entries_from_records(&mut self, viewport: NodeSlotId) {
+        let rows = self.paintable_row_count();
+        for index in 0..rows {
+            drop_table(&mut self.paintable_rows.stacking_context_entries, index);
+        }
+        self.paintable_rows.stacking_context_roots_flagged_for_resort.clear();
+        let mut slots_in_paint_order: Vec<NodeSlotId> = Vec::new();
+        paint_order::for_each_in_paint_subtree(&self.paintable_rows(), viewport, |slot| {
+            slots_in_paint_order.push(slot);
+        });
         let mut roots_in_visit_order: Vec<NodeSlotId> = Vec::new();
-        paint_order::for_each_in_paint_subtree(&paintable_rows, viewport, |slot| {
+        for slot in slots_in_paint_order {
             let Some(record) = self.paintable_visual_context_record(slot) else {
-                return;
+                continue;
             };
             let facts = record.stacking_context;
-            drop(record);
             if facts.establishes_stacking_context {
                 self.ensure_stacking_context_entries_for_root(slot);
                 roots_in_visit_order.push(slot);
             }
-            let mut tables = self.paintable_rows.stacking_context_entries.borrow_mut();
-            if let Some(table) = tables
-                .get_mut(facts.enclosing_stacking_context.slot_index() as usize)
-                .and_then(|table| table.as_deref_mut())
-                .filter(|_| self.paintable_row_is_populated(facts.enclosing_stacking_context))
+            if self.paintable_row_is_populated(facts.enclosing_stacking_context)
+                && let Some(mut table) = table_mut(
+                    &mut self.paintable_rows.stacking_context_entries,
+                    facts.enclosing_stacking_context,
+                )
             {
                 if let Some(z_index) = facts.nonzero_z_index_child_contribution() {
                     table
@@ -290,15 +315,11 @@ impl LayoutNodeArena {
                     table.inline_or_replaced_count += 1;
                 }
             }
-            drop(tables);
             self.set_paintable_record_stacking_context_contribution_registered(slot);
-        });
-        let mut tables = self.paintable_rows.stacking_context_entries.borrow_mut();
+        }
+        let tables = &mut self.paintable_rows.stacking_context_entries;
         for root in roots_in_visit_order {
-            if let Some(table) = tables
-                .get_mut(root.slot_index() as usize)
-                .and_then(|table| table.as_deref_mut())
-            {
+            if let Some(mut table) = table_mut(tables, root) {
                 table
                     .child_contexts_with_nonzero_z_index
                     .sort_by_key(|entry| entry.z_index);
@@ -307,7 +328,7 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn withdraw_stacking_context_state_of_reset_row(
-        &self,
+        &mut self,
         slot: NodeSlotId,
         facts: Option<StackingContextFacts>,
     ) {
@@ -319,19 +340,21 @@ impl LayoutNodeArena {
         self.drop_stacking_context_entries_of_root(slot);
     }
 
-    pub(crate) fn note_layout_subtree_attached(&self, subtree_root: NodeSlotId) {
+    pub(crate) fn note_layout_subtree_attached(&mut self, subtree_root: NodeSlotId) {
         if self.paintable_row_count() == 0 {
             return;
         }
         // The new parent lists the subtree from now on, and every row inside plans its own
         // descendants under the new ancestry.
         self.push_enclosing_paint_order_damage(subtree_root);
-        self.for_each_node_in_layout_subtree_in_pre_order(subtree_root, |node| {
+        let mut cursor = Some(subtree_root);
+        while let Some(node) = cursor {
             if self.paintable_row_is_populated(node) {
                 self.note_overflow_contained_box_added(node);
                 self.note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::ReattachedInLayoutTree);
                 self.push_paint_damage(node, crate::painting::record::damage::PaintDamage::ORDER);
             }
-        });
+            cursor = self.next_node_in_layout_subtree_in_pre_order(subtree_root, node);
+        }
     }
 }

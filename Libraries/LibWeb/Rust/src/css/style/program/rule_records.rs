@@ -5,77 +5,38 @@
  */
 
 use super::Rule;
-use crate::css::style::capacity::ShallowCapacityBytes;
-use crate::css::style::fast_hash::{FastMap as HashMap, fast_hasher};
-use crate::css::style::memory::{DeviceClass, MemoryCategory, MemoryController, MemoryLease};
-use std::cell::RefCell;
+use crate::css::style::fast_hash::fast_hasher;
+use crate::css::style::weak_pool::WeakPool;
 use std::hash::{Hash, Hasher};
 use std::ops::{Index, IndexMut};
-use std::sync::Arc;
-use std::sync::Weak;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const RULE_RECORDS_PER_PAGE: usize = 128;
 
 struct RuleRecordPage {
     values: [Option<Rule>; RULE_RECORDS_PER_PAGE],
     shared_hash: Option<u64>,
-    _memory: MemoryLease,
 }
 
 impl RuleRecordPage {
     fn new(values: [Option<Rule>; RULE_RECORDS_PER_PAGE]) -> Self {
-        let mut memory = MemoryLease::new(MemoryCategory::RuleProgram);
-        SHARED_RULE_RECORD_PAGES.with_borrow_mut(|pool| {
-            memory.resize_required_to(&mut pool.memory, size_of::<Self>() as u64);
-        });
         Self {
             values,
             shared_hash: None,
-            _memory: memory,
         }
     }
 }
 
-impl Clone for RuleRecordPage {
-    fn clone(&self) -> Self {
-        Self::new(self.values.clone())
-    }
+fn rule_record_pages() -> MutexGuard<'static, WeakPool<RuleRecordPage>> {
+    // Every engine interns through the same pool, from whichever thread runs it. Pages never reach
+    // back into the pool when they are dropped, so the lock is only held while interning.
+    static RULE_RECORD_PAGES: OnceLock<Mutex<WeakPool<RuleRecordPage>>> = OnceLock::new();
+    RULE_RECORD_PAGES.get_or_init(Mutex::default).lock().unwrap()
 }
 
-impl Drop for RuleRecordPage {
-    fn drop(&mut self) {
-        forget_dead_pages(self.shared_hash);
-    }
-}
-
-struct SharedRuleRecordPages {
-    by_hash: HashMap<u64, Vec<Weak<RuleRecordPage>>>,
-    memory: MemoryController,
-}
-
-thread_local! {
-    static SHARED_RULE_RECORD_PAGES: RefCell<SharedRuleRecordPages> = RefCell::new(SharedRuleRecordPages {
-        by_hash: HashMap::default(),
-        memory: MemoryController::new(DeviceClass::ForegroundDesktop),
-    });
-}
-
-fn forget_dead_pages(hash: Option<u64>) {
-    let Some(hash) = hash else { return };
-    let _ = SHARED_RULE_RECORD_PAGES.try_with(|pool| {
-        let Ok(mut pool) = pool.try_borrow_mut() else { return };
-        if let std::collections::hash_map::Entry::Occupied(mut entry) = pool.by_hash.entry(hash) {
-            entry.get_mut().retain(|page| page.strong_count() != 0);
-            if entry.get().is_empty() {
-                entry.remove();
-            }
-        }
-    });
-}
-
-/// Equal rule records share immutable pages. Document-local child lists remain outside the
-/// records; mutations detach only their page, including updates to its child-list slot.
-#[derive(Default)]
+/// Equal rule records share immutable pages through the process's pool. Child lists remain
+/// outside the records; mutations detach only their page, including updates to its child-list slot.
+#[derive(Clone, Default)]
 pub(super) struct RuleRecordTable {
     pages: Vec<Arc<RuleRecordPage>>,
     len: usize,
@@ -102,11 +63,11 @@ impl RuleRecordTable {
         assert!(index < self.len);
         self.needs_sharing = true;
         let page = &mut self.pages[index / RULE_RECORDS_PER_PAGE];
-        let previous_hash = page.shared_hash;
-        let page = Arc::make_mut(page);
+        if Arc::get_mut(page).is_none() {
+            rule_record_pages().make_private(page.shared_hash, page, |page| RuleRecordPage::new(page.values.clone()));
+        }
+        let page = Arc::get_mut(page).expect("a private page has one owner");
         page.shared_hash = None;
-        // make_mut can detach the pool's weak reference even when this was the only owner.
-        forget_dead_pages(previous_hash);
         page
     }
 
@@ -126,6 +87,7 @@ impl RuleRecordTable {
         if !self.needs_sharing {
             return;
         }
+        let mut pool = rule_record_pages();
         for page in &mut self.pages {
             if page.shared_hash.is_some() {
                 continue;
@@ -133,21 +95,17 @@ impl RuleRecordTable {
             let mut hasher = fast_hasher();
             page.values.hash(&mut hasher);
             let hash = hasher.finish();
-            let shared = SHARED_RULE_RECORD_PAGES.with_borrow_mut(|pool| {
-                let bucket = pool.by_hash.entry(hash).or_default();
-                bucket.retain(|candidate| candidate.strong_count() != 0);
-                if let Some(found) = bucket
-                    .iter()
-                    .filter_map(Weak::upgrade)
-                    .find(|candidate| candidate.values == page.values)
-                {
-                    return found;
-                }
-                Arc::get_mut(page).expect("an unpublished page is private").shared_hash = Some(hash);
-                bucket.push(Arc::downgrade(page));
-                Arc::clone(page)
-            });
-            *page = shared;
+            if let Some(found) = pool.find(hash, |candidate| candidate.values == page.values) {
+                *page = found;
+                continue;
+            }
+            // A clone of the table, as a fork of the style engine, holds the unpublished page too, and publishes a
+            // copy of its own.
+            if Arc::get_mut(page).is_none() {
+                *page = Arc::new(RuleRecordPage::new(page.values.clone()));
+            }
+            Arc::get_mut(page).expect("a private page has one owner").shared_hash = Some(hash);
+            pool.insert(hash, page);
         }
         self.needs_sharing = false;
     }
@@ -169,13 +127,6 @@ impl IndexMut<usize> for RuleRecordTable {
         self.page_mut(index).values[index % RULE_RECORDS_PER_PAGE]
             .as_mut()
             .expect("a live rule slot has a record")
-    }
-}
-
-impl ShallowCapacityBytes for RuleRecordTable {
-    fn shallow_capacity_bytes(&self) -> u64 {
-        // Page allocations are charged once to the process ledger, including private pages.
-        self.pages.shallow_capacity_bytes()
     }
 }
 
@@ -217,6 +168,21 @@ mod tests {
         drop(second);
         let third = make_program();
         for (left, right) in first.rules.pages.iter().zip(&third.rules.pages) {
+            assert!(Arc::ptr_eq(left, right));
+        }
+    }
+
+    #[test]
+    fn a_clone_shares_the_unpublished_pages_it_holds_with_the_original() {
+        let mut program = StyleSheetProgram::new();
+        let sheet = program.add_sheet(StyleSheetObjectID(0x5ee7), CascadeOrigin::Author);
+        for _ in 0..RULE_RECORDS_PER_PAGE + 1 {
+            program.append_rule(sheet, None, RuleKind::Style);
+        }
+        let mut clone = program.clone();
+        clone.share_rule_storage();
+        program.share_rule_storage();
+        for (left, right) in program.rules.pages.iter().zip(&clone.rules.pages) {
             assert!(Arc::ptr_eq(left, right));
         }
     }

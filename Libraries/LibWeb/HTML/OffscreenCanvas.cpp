@@ -33,7 +33,6 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/WebGL/WebGL2RenderingContext.h>
-#include <LibWeb/WebGL/WebGLContextProxy.h>
 #include <LibWeb/WebGL/WebGLRenderingContext.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOrUtils.h>
@@ -218,14 +217,15 @@ WebIDL::ExceptionOr<GC::Ref<ImageBitmap>> OffscreenCanvas::transfer_to_image_bit
     }
 
     // 3. Let image be a newly created ImageBitmap object that references the same underlying bitmap data as this OffscreenCanvas object's bitmap.
-    auto image = ImageBitmap::create();
-    image->set_bitmap(get_bitmap_from_surface());
+    auto image = ImageBitmap::create(get_frame_from_surface());
+    // NB: The bitmap data that image references keeps the origin-clean flag of this OffscreenCanvas object's bitmap.
+    image->set_origin_clean(is_origin_clean());
 
     // 4. Set this OffscreenCanvas object's bitmap to reference a newly created bitmap of the same dimensions and color space as the previous bitmap, and with its pixels initialized to transparent black, or opaque black if the rendering context' s alpha is false.
     if (auto* context = m_context.get_pointer<GC::Ref<OffscreenCanvasRenderingContext2D>>())
         (*context)->replace_bitmap_with_cleared_bitmap();
     else if (auto* webgl_context = canvas_webgl_context())
-        webgl_context->context().clear_drawing_buffer();
+        webgl_context->clear_drawing_buffer();
 
     // 5. Return image.
     return image;
@@ -284,7 +284,7 @@ CSS::FontComputer& OffscreenCanvas::canvas_font_computer()
     return worker_global_scope->font_computer();
 }
 
-CSS::ColorResolutionContext OffscreenCanvas::canvas_color_resolution_context()
+CSS::ColorResolutionStyle OffscreenCanvas::canvas_color_resolution_style()
 {
     return {};
 }
@@ -353,7 +353,7 @@ void OffscreenCanvas::commit_to_placeholder()
             if (context->is_context_lost())
                 return;
             context->prepare_for_compositing();
-            source_canvas_id = context->context().canvas_id();
+            source_canvas_id = context->canvas_id();
         },
         [](Empty) {
             // Do nothing.
@@ -424,8 +424,10 @@ GC::Ref<WebIDL::Promise> convert_to_blob(JS::Realm& realm, HTML::OffscreenCanvas
         return WebIDL::create_rejected_promise_for(offscreen_canvas.relevant_global_object(), error);
     }
 
+    auto image_encode_options = options.value_or({});
+
     // 4. Let bitmap be a copy of this's bitmap.
-    auto bitmap = offscreen_canvas.get_bitmap_from_surface();
+    auto bitmap = offscreen_canvas.get_frame_for_serialization(image_encode_options.type);
 
     // 5. Let result be a new promise object.
     auto result_promise = WebIDL::create_promise_for(offscreen_canvas.relevant_global_object());
@@ -433,14 +435,12 @@ GC::Ref<WebIDL::Promise> convert_to_blob(JS::Realm& realm, HTML::OffscreenCanvas
     // 6. Let global be this's relevant global object.
     auto& global = offscreen_canvas.relevant_global_object();
 
-    auto image_encode_options = options.value_or({});
-
     // 7. Run these steps in parallel:
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [realm = GC::Ref(realm), &global, result_promise, bitmap, image_encode_options] {
         // 1. Let file be a serialization of bitmap as a file, with options's type and quality if present.
         Optional<HTML::SerializeBitmapResult> file_result {};
 
-        if (bitmap) {
+        if (bitmap.has_value()) {
             if (auto result = HTML::serialize_bitmap(*bitmap, image_encode_options.type, image_encode_options.quality); !result.is_error())
                 file_result = result.release_value();
         }

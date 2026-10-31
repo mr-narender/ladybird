@@ -1,4 +1,7 @@
 == CSS property descriptors
+highlights writable: undefined
+highlights configurable: true
+highlights enumerable: true
 escape writable: true
 escape configurable: true
 escape enumerable: true
@@ -335,6 +338,9 @@ s enumerable: true
 s value before: function s() { [native code] }
 s value after: replaced
 == WebAssembly property descriptors
+JSTag writable: undefined
+JSTag configurable: true
+JSTag enumerable: true
 validate writable: true
 validate configurable: true
 validate enumerable: true
@@ -375,6 +381,11 @@ RuntimeError configurable: true
 RuntimeError enumerable: false
 RuntimeError value before: function RuntimeError() { [native code] }
 RuntimeError value after: replaced
+Exception writable: true
+Exception configurable: true
+Exception enumerable: false
+Exception value before: function Exception() { [native code] }
+Exception value after: replaced
 Global writable: true
 Global configurable: true
 Global enumerable: false
@@ -400,3 +411,8 @@ Table configurable: true
 Table enumerable: false
 Table value before: function Table() { [native code] }
 Table value after: replaced
+Tag writable: true
+Tag configurable: true
+Tag enumerable: false
+Tag value before: function Tag() { [native code] }
+Tag value after: replaced

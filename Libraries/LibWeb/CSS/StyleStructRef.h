@@ -11,7 +11,6 @@
 #include <AK/StdLibExtras.h>
 #include <AK/Types.h>
 #include <LibWeb/ComputedValuesRustFFI.h>
-#include <LibWeb/Export.h>
 #include <stdlib.h>
 
 namespace Web::CSS {
@@ -19,17 +18,16 @@ namespace Web::CSS {
 // NB: Must match STYLE_GROUP_STATIC_REFCOUNT in computed_values.rs.
 static constexpr size_t style_group_static_refcount = NumericLimits<size_t>::max();
 
-// Returns the intentionally leaked default payload for the given style group,
-// registering all group vtables with the Rust ownership machinery on first use.
-// Defined in ComputedValues.cpp, where the group types are visible.
-WEB_API void const* style_group_default_payload(size_t group_index);
+enum class StyleGroupInitialization {
+    Defaults,
+    Empty,
+};
 
 // A copy-on-write reference to a style value group struct.
 //
-// The payloads are owned by the Rust side of LibWeb (see computed_values.rs):
-// Rust-native groups use their Rust layout and lifecycle directly, while groups
-// containing C++ field types use registered lifecycle callbacks. Rust places an
-// atomic reference count in a header immediately before each payload. Reading a
+// The payloads are owned by the Rust side of LibWeb (see computed_values.rs),
+// which defines each group's layout and lifecycle. Rust places an atomic
+// reference count in a header immediately before each payload. Reading a
 // group is an inline field access and sharing one is an inline atomic operation;
 // only cloning for mutation and destroying the last reference cross the FFI
 // boundary.
@@ -47,7 +45,14 @@ template<typename T>
 class StyleStructRef {
 public:
     StyleStructRef()
-        : m_payload(static_cast<T*>(const_cast<void*>(default_payload())))
+        : StyleStructRef(StyleGroupInitialization::Defaults)
+    {
+    }
+
+    // NB: An empty borrowed reference is filled by borrow() or adopt() before its payload is read.
+    explicit StyleStructRef(StyleGroupInitialization initialization)
+        : m_payload(initialization == StyleGroupInitialization::Defaults ? static_cast<T*>(const_cast<void*>(default_payload())) : nullptr)
+        , m_is_borrowed(initialization == StyleGroupInitialization::Empty)
     {
     }
 
@@ -59,7 +64,7 @@ public:
 
     StyleStructRef& operator=(StyleStructRef const& other)
     {
-        if (m_payload == other.m_payload)
+        if (this == &other || (m_payload == other.m_payload && !m_is_borrowed))
             return *this;
         other.ref();
         deref();
@@ -80,6 +85,7 @@ public:
     // shared with anyone else (including the leaked default payload).
     T& access()
     {
+        VERIFY(m_payload);
         if (m_is_borrowed || refcount().load(AK::memory_order_acquire) != 1) {
             auto* clone = clone_payload(m_payload);
             deref();
@@ -112,7 +118,6 @@ public:
 
     // The shared payload's address, which is the group's identity: two references to the same
     // payload are the same group, and interning a style record is interning that tuple of addresses.
-    void const* payload_identity() const { return m_payload; }
     bool is_default() const { return m_payload == default_payload(); }
 
     static T const& default_value() { return *static_cast<T const*>(default_payload()); }
@@ -133,6 +138,7 @@ private:
 
     void ref() const
     {
+        VERIFY(m_payload);
         auto& count = refcount();
         if (count.load(AK::memory_order_relaxed) == style_group_static_refcount)
             return;
@@ -157,7 +163,7 @@ private:
 
     static void const* default_payload()
     {
-        static void const* payload = style_group_default_payload(T::style_group_index);
+        static void const* payload = ComputedValuesFFI::rust_style_group_default_payload(T::style_group_index);
         return payload;
     }
 

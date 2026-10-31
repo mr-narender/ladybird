@@ -20,7 +20,6 @@
 //! that relation rather than flattening both into a node set, because the relation is what a later
 //! stage needs in order to enumerate the region without materializing it.
 
-use super::capacity::capacity_bytes;
 use super::column::BitColumn;
 use super::column::PagedColumn;
 use super::column::PagedColumnPage;
@@ -107,8 +106,9 @@ impl ImpactRegion {
     /// Widen a region by one inverse relation step.
     ///
     /// Each case answers "where can this relation reach, starting from everything already in the
-    /// region". Sibling steps applied to a region wider than a single node escape upwards, because
-    /// the siblings of a subtree's root lie outside that subtree.
+    /// region". Sibling steps applied to a region that holds a subtree's root escape upwards,
+    /// because the siblings of that root lie outside the subtree. A region below its root keeps
+    /// them inside, since siblings share a parent.
     #[must_use]
     pub fn step(self, step: InverseStep, tree: &StyleNodeTree) -> Self {
         match (self, step) {
@@ -116,41 +116,35 @@ impl ImpactRegion {
             (Self::Document, _) => Self::Document,
             (Self::TreeScope(scope), _) => Self::TreeScope(scope),
 
-            (Self::StrictSubtree(node), _) => Self::Subtree(node).step(step, tree),
-            (Self::Node(node), InverseStep::Descendants) => Self::Subtree(node),
+            (Self::Node(node), InverseStep::Descendants) => Self::StrictSubtree(node),
             (Self::Node(node), InverseStep::Children) => Self::Children(node),
             (Self::Node(node), InverseStep::NextSibling) => Self::NextSibling(node),
             (Self::Node(node), InverseStep::FollowingSiblings) => Self::FollowingSiblings(node),
             (Self::Node(node), InverseStep::SiblingSequence) => Self::SiblingSequence(node),
 
-            // Relational anchors: from a possible witness back to the elements whose `:has()`
-            // Boolean it can flip.
-            (Self::Node(node), InverseStep::AnchorParent) => match tree.parent(node) {
-                Some(parent) => Self::Node(parent),
-                None => Self::Node(node),
-            },
-            (Self::Node(node), InverseStep::AnchorAncestors) => Self::Ancestors(node),
-            (Self::Node(node), InverseStep::AnchorPreviousSibling) => Self::PreviousSibling(node),
-            (Self::Node(node), InverseStep::AnchorPrecedingSiblings) => Self::PrecedingSiblings(node),
-
-            // From anything wider, an anchor step can reach any ancestor of the region, so it
-            // widens to the enclosing scope rather than guessing a narrower one.
-            (
-                _,
-                InverseStep::AnchorParent
-                | InverseStep::AnchorAncestors
-                | InverseStep::AnchorPreviousSibling
-                | InverseStep::AnchorPrecedingSiblings,
-            ) => Self::Document,
-
-            // Children of a node's children, and everything below them, stay inside its subtree.
-            (Self::Children(node), InverseStep::Descendants | InverseStep::Children) => Self::Subtree(node),
+            // Children of a node's children, and everything below them, stay below the node.
+            (Self::Children(node), InverseStep::Descendants | InverseStep::Children) => Self::StrictSubtree(node),
             (Self::Subtree(node), InverseStep::Descendants | InverseStep::Children) => Self::Subtree(node),
 
-            // A sibling step from anywhere inside a subtree can leave it through the root, so it
-            // widens to the parent's subtree.
+            // The siblings of a node's children are its children, and the siblings of anything below
+            // a node are below it too.
             (
-                Self::Children(node) | Self::Subtree(node),
+                Self::Children(node),
+                InverseStep::NextSibling | InverseStep::FollowingSiblings | InverseStep::SiblingSequence,
+            ) => Self::Children(node),
+            (
+                Self::StrictSubtree(node),
+                InverseStep::Descendants
+                | InverseStep::Children
+                | InverseStep::NextSibling
+                | InverseStep::FollowingSiblings
+                | InverseStep::SiblingSequence,
+            ) => Self::StrictSubtree(node),
+
+            // A sibling step from a subtree can leave it through the root, so it widens to the
+            // parent's subtree.
+            (
+                Self::Subtree(node),
                 InverseStep::NextSibling | InverseStep::FollowingSiblings | InverseStep::SiblingSequence,
             ) => match tree.parent(node) {
                 Some(parent) => Self::Subtree(parent),
@@ -545,10 +539,6 @@ impl RegionKindPages {
             page.kinds.fill(0);
         }
     }
-
-    fn capacity_bytes(&self) -> u64 {
-        self.0.capacity_bytes()
-    }
 }
 
 #[derive(Default)]
@@ -614,10 +604,6 @@ impl ImpactRegionIndex {
         self.tree_scopes.clear();
         self.document = false;
     }
-
-    fn capacity_bytes(&self) -> u64 {
-        self.tree_scopes.capacity_bytes() + self.element_kinds.capacity_bytes()
-    }
 }
 
 /// A region union compiled for repeated iteration and membership tests.
@@ -644,14 +630,6 @@ impl ImpactRegionBatch {
     }
 
     #[must_use]
-    pub(super) fn storage_bytes(&self) -> usize {
-        match &self.0 {
-            ImpactRegionBatchStorage::PreorderIntervals(intervals) => size_of_val(intervals.as_ref()),
-            ImpactRegionBatchStorage::Nodes(nodes) => size_of_val(nodes.as_ref()),
-        }
-    }
-
-    #[must_use]
     pub(super) fn interval_count(&self) -> Option<usize> {
         match &self.0 {
             ImpactRegionBatchStorage::PreorderIntervals(intervals) => Some(intervals.len()),
@@ -665,6 +643,7 @@ impl ImpactRegionBatch {
 /// The live tree deliberately retains no document-order label. Once a transaction asks enough
 /// region-membership questions to justify one pass over the tree, this workspace turns subtree
 /// membership into an interval comparison without adding anything to the mandatory per-node state.
+#[derive(Clone)]
 pub(super) struct TransactionTopology {
     nodes: Vec<StyleNodeID>,
     preorder_by_element_index: Vec<u32>,
@@ -688,17 +667,17 @@ impl TransactionTopology {
             let parent = tree.parent(node);
             while open.last().copied().is_some_and(|candidate| Some(candidate) != parent) {
                 let finished = open.pop().unwrap();
-                subtree_end_by_element_index[finished.element_index().unwrap() as usize] =
+                subtree_end_by_element_index[finished.element_slot()] =
                     u32::try_from(position).expect("transaction preorder space exhausted");
             }
             debug_assert!(node == root || open.last().copied() == parent);
-            preorder_by_element_index[node.element_index().unwrap() as usize] =
+            preorder_by_element_index[node.element_slot()] =
                 u32::try_from(position).expect("transaction preorder space exhausted");
             open.push(node);
         }
         let end = u32::try_from(nodes.len()).expect("transaction preorder space exhausted");
         for node in open {
-            subtree_end_by_element_index[node.element_index().unwrap() as usize] = end;
+            subtree_end_by_element_index[node.element_slot()] = end;
         }
 
         Self {
@@ -887,16 +866,6 @@ impl TransactionTopology {
     }
 
     #[must_use]
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.nodes, self.preorder_by_element_index, self.subtree_end_by_element_index];
-            cached [];
-            nested [];
-            skip [];
-        }
-    }
-
-    #[must_use]
     fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -979,26 +948,6 @@ impl ImpactRegions {
     }
 
     #[must_use]
-    pub fn topology_capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [];
-            cached [];
-            nested [self.topology.as_ref().map_or(0, TransactionTopology::capacity_bytes)];
-            skip [];
-        }
-    }
-
-    #[must_use]
-    pub fn region_index_capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [];
-            cached [self.region_index.capacity_bytes()];
-            nested [];
-            skip [];
-        }
-    }
-
-    #[must_use]
     pub fn topology_node_count(&self) -> usize {
         self.topology.as_ref().map_or(0, TransactionTopology::node_count)
     }
@@ -1012,28 +961,28 @@ impl ImpactRegions {
         self.exact_node_history_start_generation = self.exact_node_generation;
     }
 
-    fn insert_covered_subtree(&mut self, root: StyleNodeID) {
-        let Some(interval) = self
-            .topology
-            .as_ref()
-            .and_then(|topology| topology.subtree_interval(root))
-            .map(|(start, end)| PreorderInterval { start, end })
-        else {
-            return;
+    /// The preorder interval a subtree-shaped region covers, which leaves out the root of a strict subtree.
+    fn covered_interval(&self, region: ImpactRegion) -> Option<PreorderInterval> {
+        let (root, strict) = match region {
+            ImpactRegion::Subtree(root) => (root, false),
+            ImpactRegion::StrictSubtree(root) => (root, true),
+            _ => return None,
         };
-        Self::insert_covered_interval(&mut self.covered_subtrees, interval);
+        let (start, end) = self.topology.as_ref()?.subtree_interval(root)?;
+        let start = if strict { start + 1 } else { start };
+        (start < end).then_some(PreorderInterval { start, end })
     }
 
-    fn insert_full_covered_subtree(&mut self, root: StyleNodeID) {
-        let Some(interval) = self
-            .topology
-            .as_ref()
-            .and_then(|topology| topology.subtree_interval(root))
-            .map(|(start, end)| PreorderInterval { start, end })
-        else {
-            return;
-        };
-        Self::insert_covered_interval(&mut self.full_covered_subtrees, interval);
+    fn insert_covered_subtree(&mut self, region: ImpactRegion) {
+        if let Some(interval) = self.covered_interval(region) {
+            Self::insert_covered_interval(&mut self.covered_subtrees, interval);
+        }
+    }
+
+    fn insert_full_covered_subtree(&mut self, region: ImpactRegion) {
+        if let Some(interval) = self.covered_interval(region) {
+            Self::insert_covered_interval(&mut self.full_covered_subtrees, interval);
+        }
     }
 
     fn insert_covered_interval(covered: &mut Vec<PreorderInterval>, interval: PreorderInterval) {
@@ -1059,9 +1008,7 @@ impl ImpactRegions {
         for index in 0..self.regions.len() {
             let region = self.regions[index];
             self.region_index.insert(region);
-            if let ImpactRegion::Subtree(root) = region {
-                self.insert_covered_subtree(root);
-            }
+            self.insert_covered_subtree(region);
         }
     }
 
@@ -1069,9 +1016,7 @@ impl ImpactRegions {
         if !matches!(region, ImpactRegion::Empty | ImpactRegion::Node(_)) {
             self.unattributed.push(region);
         }
-        if let ImpactRegion::Subtree(root) = region {
-            self.insert_full_covered_subtree(root);
-        }
+        self.insert_full_covered_subtree(region);
         self.add_recorded(region);
     }
 
@@ -1114,9 +1059,7 @@ impl ImpactRegions {
         if !self.region_index.insert(region) {
             return;
         }
-        if let ImpactRegion::Subtree(root) = region {
-            self.insert_covered_subtree(root);
-        }
+        self.insert_covered_subtree(region);
         if matches!(region, ImpactRegion::Node(_)) {
             self.exact_node_generation = self.exact_node_generation.wrapping_add(1);
         }
@@ -1387,7 +1330,7 @@ impl ImpactRegions {
         self.rebuild_indexes();
     }
 
-    pub fn widen_to_document(&mut self, counters: &mut Counters) {
+    pub fn widen_to_document(&mut self, counters: &Counters) {
         counters.bump(Counter::DocumentWidenings);
         self.regions.clear();
         self.region_index.clear();
@@ -1703,8 +1646,6 @@ pub fn choose_plan(region_nodes: usize, candidate_cardinality: Option<usize>, ex
 
 #[cfg(test)]
 mod tests {
-    use super::super::memory::DeviceClass;
-    use super::super::memory::MemoryController;
     use super::*;
 
     /// `root > [a > [a1, a2], b > b1, c > c1]`
@@ -1716,9 +1657,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-            let mut tree = StyleNodeTree::new(&mut memory);
-            let nodes: Vec<StyleNodeID> = (0..8).map(|_| tree.allocate_element(&mut memory)).collect();
+            let mut tree = StyleNodeTree::new();
+            let nodes: Vec<StyleNodeID> = (0..8).map(|_| tree.allocate_element()).collect();
             // root=0, children a=1, b=2, c=3; a's children a1=4, a2=5
             tree.set_first_element_child(nodes[0], Some(nodes[1]));
             for index in 1..4 {
@@ -1778,20 +1718,19 @@ mod tests {
 
     #[test]
     fn a_document_region_includes_shadow_tree_scopes() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-        let mut tree = StyleNodeTree::new(&mut memory);
-        let document_root = tree.allocate_element(&mut memory);
-        let host = tree.allocate_element(&mut memory);
-        let shadow_root = tree.allocate_element(&mut memory);
-        let shadow_child = tree.allocate_element(&mut memory);
+        let mut tree = StyleNodeTree::new();
+        let document_root = tree.allocate_element();
+        let host = tree.allocate_element();
+        let shadow_root = tree.allocate_element();
+        let shadow_child = tree.allocate_element();
         tree.set_first_element_child(document_root, Some(host));
         tree.set_parent(host, Some(document_root));
         tree.set_first_element_child(shadow_root, Some(shadow_child));
         tree.set_parent(shadow_child, Some(shadow_root));
-        tree.enable_tree_scopes(&mut memory);
+        tree.enable_tree_scopes();
         tree.set_tree_scope(shadow_root, TreeScopeID(1));
         tree.set_tree_scope(shadow_child, TreeScopeID(1));
-        tree.set_shadow_root(host, shadow_root, &mut memory);
+        tree.set_shadow_root(host, shadow_root);
 
         let mut visited = Vec::new();
         ImpactRegion::Document.for_each(&tree, |node| visited.push(node));
@@ -1809,16 +1748,16 @@ mod tests {
 
         assert_eq!(
             ImpactRegion::follow(node, &[InverseStep::Descendants], &fixture.tree),
-            ImpactRegion::Subtree(node)
+            ImpactRegion::StrictSubtree(node)
         );
         assert_eq!(
             ImpactRegion::follow(node, &[InverseStep::Children], &fixture.tree),
             ImpactRegion::Children(node)
         );
-        // `.a > .b .c`: children, then their descendants, which stays inside the subtree.
+        // `.a > .b .c`: children, then their descendants, which stays below the node.
         assert_eq!(
             ImpactRegion::follow(node, &[InverseStep::Children, InverseStep::Descendants], &fixture.tree),
-            ImpactRegion::Subtree(node)
+            ImpactRegion::StrictSubtree(node)
         );
         // An empty path is the changed node itself.
         assert_eq!(ImpactRegion::follow(node, &[], &fixture.tree), ImpactRegion::Node(node));
@@ -1869,15 +1808,40 @@ mod tests {
     #[test]
     fn a_sibling_step_out_of_a_subtree_widens_to_the_parent() {
         let fixture = Fixture::new();
-        // Siblings of a descendant of `a` can lie outside `a`, so the region climbs.
+        // Siblings of `a` itself lie outside `a`, so the region climbs.
+        assert_eq!(
+            ImpactRegion::Subtree(fixture.nodes[1]).step(InverseStep::FollowingSiblings, &fixture.tree),
+            ImpactRegion::Subtree(fixture.nodes[0])
+        );
+    }
+
+    #[test]
+    fn a_sibling_step_below_a_node_stays_below_it() {
+        let fixture = Fixture::new();
+        let a = fixture.nodes[1];
+        // `.a .b ~ .c` and `.a > .b + .c`: siblings of something below `a` share a parent below or at `a`.
         assert_eq!(
             ImpactRegion::follow(
-                fixture.nodes[1],
+                a,
                 &[InverseStep::Descendants, InverseStep::FollowingSiblings],
                 &fixture.tree
             ),
-            ImpactRegion::Subtree(fixture.nodes[0])
+            ImpactRegion::StrictSubtree(a)
         );
+        assert_eq!(
+            ImpactRegion::follow(a, &[InverseStep::Children, InverseStep::NextSibling], &fixture.tree),
+            ImpactRegion::Children(a)
+        );
+        // `.a > * > .b + .c`: the shape of `li.done > div > .toggle + label`.
+        assert_eq!(
+            ImpactRegion::follow(
+                a,
+                &[InverseStep::Children, InverseStep::Children, InverseStep::NextSibling],
+                &fixture.tree
+            ),
+            ImpactRegion::StrictSubtree(a)
+        );
+        assert_eq!(fixture.collect(ImpactRegion::StrictSubtree(a)), vec![4, 5]);
     }
 
     #[test]
@@ -1943,10 +1907,6 @@ mod tests {
         assert!(!index.insert(ImpactRegion::Node(element)));
         assert!(index.contains(ImpactRegion::Node(element)));
         assert!(index.contains(ImpactRegion::Subtree(element)));
-        assert!(
-            index.capacity_bytes() < 64 * 1024,
-            "a sparse high identity must allocate one data page, not one row per preceding identity"
-        );
     }
 
     #[test]
@@ -1961,10 +1921,10 @@ mod tests {
 
     #[test]
     fn widening_replaces_the_plan_rather_than_adding_to_it() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let mut regions = ImpactRegions::new();
         regions.add(ImpactRegion::Node(fixture.nodes[4]));
-        regions.widen_to_document(&mut fixture.counters);
+        regions.widen_to_document(&fixture.counters);
         assert_eq!(regions.regions(), &[ImpactRegion::Document]);
         assert_eq!(fixture.counters.get(Counter::DocumentWidenings), 1);
     }
@@ -2134,7 +2094,6 @@ mod tests {
 
         assert_eq!(batch.interval_count(), Some(1));
         assert_eq!(batch.node_count(), 7);
-        assert_eq!(batch.storage_bytes(), size_of::<PreorderInterval>());
 
         let mut actual = Vec::new();
         plan.for_each_batch(&batch, |node| actual.push(node));
@@ -2229,17 +2188,16 @@ mod tests {
 
     #[test]
     fn patch_attributions_are_indexed_without_preorder_coordinates() {
-        let mut memory = MemoryController::new(DeviceClass::ForegroundDesktop);
-        let mut tree = StyleNodeTree::new(&mut memory);
-        let root = tree.allocate_element(&mut memory);
-        let host = tree.allocate_element(&mut memory);
-        let shadow_root = tree.allocate_element(&mut memory);
+        let mut tree = StyleNodeTree::new();
+        let root = tree.allocate_element();
+        let host = tree.allocate_element();
+        let shadow_root = tree.allocate_element();
         tree.set_first_element_child(root, Some(host));
         tree.set_parent(host, Some(root));
-        tree.enable_tree_scopes(&mut memory);
+        tree.enable_tree_scopes();
         tree.set_tree_scope(shadow_root, TreeScopeID(1));
-        tree.set_shadow_root(host, shadow_root, &mut memory);
-        let nodes: Vec<_> = (0..128).map(|_| tree.allocate_element(&mut memory)).collect();
+        tree.set_shadow_root(host, shadow_root);
+        let nodes: Vec<_> = (0..128).map(|_| tree.allocate_element()).collect();
         tree.set_first_element_child(shadow_root, Some(nodes[0]));
         for (index, &node) in nodes.iter().enumerate() {
             tree.set_parent(node, Some(shadow_root));
@@ -2249,7 +2207,7 @@ mod tests {
         let descendants: Vec<_> = nodes
             .iter()
             .map(|&node| {
-                let child = tree.allocate_element(&mut memory);
+                let child = tree.allocate_element();
                 tree.set_parent(child, Some(node));
                 tree.set_tree_scope(child, TreeScopeID(1));
                 tree.set_first_element_child(node, Some(child));

@@ -27,15 +27,16 @@ Each property will have some set of these fields on it:
 | `inherited`                         | Yes      |            | Boolean. Whether the property is inherited by its child elements. Only applicable to longhand properties.   | `bool is_inherited_property(PropertyID)`                                                                                                                                                                                                                    |
 | `initial`                           | Yes      |            | String. The property's initial value if it is not specified.                                                | `NonnullRefPtr<StyleValue const> property_initial_value(PropertyID)`                                                                                                                                                                                        |
 | `legacy-alias-for`                  | No       | Nothing    | String. The name of a property this is an alias for. See below.                                             |                                                                                                                                                                                                                                                             |
-| `logical-alias-for`                 | No       | Nothing    | An object. See below.                                                                                       | `bool property_is_logical_alias(PropertyID);`<br/>`PropertyID map_logical_alias_to_physical_property(PropertyID, LogicalAliasMappingContext const&)`<br/>`PropertyID map_physical_property_to_logical_alias(PropertyID, LogicalAliasMappingContext const&)` |
+| `logical-alias-for`                 | No       | Nothing    | An object. See below.                                                                                       | `bool property_is_logical_alias(PropertyID);`<br/>`PropertyID map_logical_alias_to_physical_property(PropertyID, LogicalAliasMappingContext const&)`                                                                                                        |
 | `longhands`                         | No       | `[]`       | Array of strings. If this is a shorthand, these are the property names that it expands out into.            | `Vector<PropertyID> longhands_for_shorthand(PropertyID)`<br/>`Vector<PropertyID> expanded_longhands_for_shorthand(PropertyID)`<br/>`Vector<PropertyID> shorthands_for_longhand(PropertyID)`                                                                 |
-| `max-values`                        | No       | `1`        | Integer. How many values can be parsed for this property. eg, `margin` can have up to 4 values.             | `size_t property_maximum_value_count(PropertyID)`                                                                                                                                                                                                           |
-| `multiplicity`                      | No       | `"single"` | String. Category for whether this property is a single value or a list of values. See below.                | `bool property_is_single_valued(PropertyID)`<br/>`bool property_is_list_valued(PropertyID)`<br/>`PropertyMultiplicity property_multiplicity(PropertyID)`                                                                                                    |
+| `max-values`                        | No       | `1`        | Integer. How many values can be parsed for this property. eg, `margin` can have up to 4 values.             |                                                                                                                                                                                                                                                             |
+| `multiplicity`                      | No       | `"single"` | String. Category for whether this property is a single value or a list of values. See below.                | `bool property_is_single_valued(PropertyID)`<br/>`bool property_is_list_valued(PropertyID)`                                                                                                                                                                 |
 | `percentages-resolve-to`            | No       | Nothing    | String. What type percentages get resolved to. eg, for `width` percentages are resolved to `length` values. | `Optional<ValueType> property_resolves_percentages_relative_to(PropertyID)`                                                                                                                                                                                 |
 | `positional-value-list-shorthand`   | No       | `false`    | Boolean. Whether this property is a "positional value list shorthand". See below.                           | `bool property_is_positional_value_list_shorthand(PropertyID)`                                                                                                                                                                                              |
-| `quirks`                            | No       | `[]`       | Array of strings. Some properties have special behavior in "quirks mode", which are listed here. See below. | `bool property_has_quirk(PropertyID, Quirk)`                                                                                                                                                                                                                |
+| `quirks`                            | No       | `[]`       | Array of strings. Some properties have special behavior in "quirks mode", which are listed here. See below. |                                                                                                                                                                                                                                                             |
 | `requires-computation`              | Yes      |            | String. When a property's value needs to be run through the computation process. See below.                 | `bool property_requires_computation_with_inherited_value(PropertyID)`<br/>`bool property_requires_computation_with_initial_value(PropertyID)`<br/>`bool property_requires_computation_with_cascaded_value(PropertyID)`                                      |
-| `valid-identifiers`                 | No       | `[]`       | Array of strings. Which keywords the property accepts. See below.                                           | `bool property_accepts_keyword(PropertyID, Keyword)`<br/>`Optional<Keyword> resolve_legacy_value_alias(PropertyID, Keyword)`                                                                                                                                |
+| `typed-om-multiplicity`             | No       | Nothing    | String. Overrides `multiplicity` for Typed OM. See `multiplicity` below.                                    | `bool property_is_single_valued(PropertyID)`<br/>`bool property_is_list_valued(PropertyID)`                                                                                                                                                                 |
+| `valid-identifiers`                 | No       | `[]`       | Array of strings. Which keywords the property accepts. See below.                                           | `bool property_accepts_keyword(PropertyID, Keyword)`                                                                                                                                                                                                        |
 | `valid-types`                       | No       | `[]`       | Array of strings. Which value types the property accepts. See below.                                        | `bool property_accepts_type(PropertyID, ValueType)`                                                                                                                                                                                                         |
 | `needs-layout-for-getcomputedstyle` | No       | `false`    | Boolean. Whether this property requires up-to-date layout before it could be queried by getComputedStyle()  | `bool property_needs_layout_for_getcomputedstyle(PropertyID)`                                                                                                                                                                                               |
 
@@ -80,6 +81,9 @@ commas; `counter-increment` doesn't have commas but also is a list of counters t
 
 Lists can also be [coordinating list properties](https://drafts.csswg.org/css-values-4/#linked-properties), in which
 case they are marked as `coordinating-list` instead of `list`.
+
+Typed OM divides the values of list-valued properties into iterations. Some properties are stored as lists internally
+even though Typed OM treats their value as a single item. Set `typed-om-multiplicity` to `"single"` for those.
 
 ### `positional-value-list-shorthand`
 Some shorthand properties work differently to normal in that mapping of provided values to longhands isn't necessarily
@@ -167,7 +171,6 @@ The generated code provides:
 - `Utf16FlyString const& to_string(DescriptorID)` for serializing descriptor names.
 - `bool at_rule_supports_descriptor(AtRuleID, DescriptorID)` to query if the given at-rule allows the descriptor.
 - `RefPtr<StyleValue const> descriptor_initial_value(AtRuleID, DescriptorID)` for getting a descriptor's initial value.
-- `DescriptorMetadata get_descriptor_metadata(AtRuleID, DescriptorID)` returns data used for parsing the descriptor.
 
 ### At-rule fields
 
@@ -257,6 +260,7 @@ Each entry has the following properties:
 
 | Field                | Required                   | Default        | Description                                                                                                                                                            |
 |----------------------|----------------------------|----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `accepts-animations` | No                         | `true`         | Whether the transition and animation properties apply to this pseudo-element, whatever its `property-whitelist` says.                                                  |
 | `alias-for`          | No                         | Nothing        | Use to specify that this should be treated as an alias for the named pseudo-element.                                                                                   |
 | `function-syntax`    | No                         | Nothing        | Syntax for the function arguments if this is a function-type pseudo-element. Copied directly from the spec.                                                            |
 | `implementation`     | Unless `type` is "function | Nothing        | How this pseudo-element is implemented, either `"synthetic"` or `"element-reference"` - see below.                                                                     |
@@ -281,7 +285,7 @@ The generated code provides:
 This is an array of strings. Properties can be named directly ("color"), or categories of properties with a leading `#`
 ("#font-properties"), as the specs often says a group is allowed instead of listing the properties exactly.
 Any properties we don't support yet can be prefixed with "FIXME:" and will be ignored.
-The property groups and the properties that always apply are defined in
+The property groups and the transition and animation properties are defined in
 `PseudoElementPropertyGroups.txt` and generated into the Rust cascade tables.
 
 The following categories are supported:
@@ -357,7 +361,7 @@ The generated code provides:
 
 This is a single JSON object, describing each [CSS transform function](https://www.w3.org/TR/css-transforms/#transform-functions),
 with the keys being the function name and the values being objects describing that function's properties.
-This generates `TransformFunctions.h` and `TransformFunctions.cpp`.
+This generates `TransformFunctions.h`, and the Rust parser and serializer read it directly.
 
 Each entry currently has a single property, `parameters`, which is an array of parameter definition objects.
 Parameter definitions have the following properties:
@@ -369,9 +373,6 @@ Parameter definitions have the following properties:
 
 The generated code provides:
 - A `TransformFunction` enum listing the transform functions
-- `Optional<TransformFunction> transform_function_from_string(StringView)` to parse a string as a `TransformFunction`
-- `StringView to_string(TransformFunction)` to convert a `TransformFunction` back to a string
-- `TransformFunctionMetadata transform_function_metadata(TransformFunction)` to obtain metadata about the transform function, such as its parameter list
 
 ## EnvironmentVariables.json
 

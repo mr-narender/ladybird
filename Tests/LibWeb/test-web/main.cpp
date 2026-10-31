@@ -60,6 +60,8 @@ static HashMap<WebView::ViewImplementation const*, size_t> s_view_index_by_view;
 static RefPtr<Core::Promise<Empty>> s_all_tests_complete;
 static Vector<ByteString> s_skipped_tests;
 static Vector<ByteString> s_loaded_from_http_server;
+static Vector<ByteString> s_frame_rate_capped;
+static Vector<ByteString> s_loaded_from_insecure_origin;
 static HashMap<WebView::ViewImplementation const*, size_t> s_current_test_index_by_view;
 
 struct TestRunContext {
@@ -118,9 +120,9 @@ static ErrorOr<void> add_config_paths(StringView test_root_path, Vector<ByteStri
     return {};
 }
 
-static ByteString unique_localhost_hostname(StringView prefix)
+static ByteString unique_hostname_within(StringView domain, StringView prefix)
 {
-    return ByteString::formatted("{}-{}.localhost", prefix, generate_random_uuid().to_byte_string());
+    return ByteString::formatted("{}-{}.{}", prefix, generate_random_uuid().to_byte_string(), domain);
 }
 
 static ErrorOr<void> load_test_config(StringView test_root_path)
@@ -141,6 +143,10 @@ static ErrorOr<void> load_test_config(StringView test_root_path)
             TRY(add_config_paths(test_root_path, config->keys(group), s_skipped_tests));
         } else if (group == "LoadFromHttpServer"sv) {
             TRY(add_config_paths(test_root_path, config->keys(group), s_loaded_from_http_server));
+        } else if (group == "CapFrameRate"sv) {
+            TRY(add_config_paths(test_root_path, config->keys(group), s_frame_rate_capped));
+        } else if (group == "LoadFromInsecureOrigin"sv) {
+            TRY(add_config_paths(test_root_path, config->keys(group), s_loaded_from_insecure_origin));
         } else {
             warnln("Unknown group '{}' in config {}", group, config_path);
         }
@@ -361,8 +367,8 @@ static ErrorOr<void> generate_result_files(ReadonlySpan<Test> tests, ReadonlySpa
         auto base_path = TRY(prepare_output_path(test));
         bool has_std_logs = FileSystem::exists(ByteString::formatted("{}.logs.html", base_path));
 
-        js.appendff("    {{ \"name\": \"{}\", \"result\": \"{}\", \"mode\": \"{}\", \"hasLogs\": {}",
-            test.safe_relative_path,
+        js.appendff("    {{ \"name\": {}, \"result\": \"{}\", \"mode\": \"{}\", \"hasLogs\": {}",
+            JsonValue(test.safe_relative_path.view()).serialized(),
             test_result_to_string(result.result),
             test_mode_to_string(test.mode),
             has_std_logs ? "true" : "false");
@@ -470,9 +476,11 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
         if (!expectation_file.is_error()) {
             auto expectation = expectation_file.value()->read_until_eof();
             if (!expectation.is_error()) {
-                auto expectation_view = StringView { expectation.value() };
-                if (expectation_view == web_content_termination_marker || expectation_view == "WebContent helper process terminated after rejected IPC.\n"sv)
+                auto expectation_view = StringView { expectation.value() }.trim("\n"sv, TrimMode::Right);
+                if (expectation_view == web_content_termination_marker)
                     test.expected_outcome = ExpectedOutcome::WebContentTermination;
+                else if (expectation_view == web_content_crash_marker)
+                    test.expected_outcome = ExpectedOutcome::WebContentCrash;
             }
         }
     }
@@ -526,7 +534,19 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
             view.on_test_complete({ test_index, result.value() });
     };
 
-    if (test.mode == TestMode::Layout) {
+    if (test.mode == TestMode::Accessibility) {
+        view.on_load_finish = [&view, &context, test_index, url, on_test_complete = move(on_test_complete)](auto const& loaded_url) {
+            if (!url.equals(loaded_url, URL::ExcludeFragment::Yes))
+                return;
+
+            auto promise = view.request_internal_page_info(WebView::PageInfoType::AccessibilityTree);
+
+            promise->when_resolved([&context, test_index, on_test_complete = move(on_test_complete)](auto const& text) {
+                context.tests[test_index].text = text;
+                on_test_complete();
+            });
+        };
+    } else if (test.mode == TestMode::Layout) {
         view.on_load_finish = [&view, &context, test_index, url](auto const& loaded_url) {
             // We don't want subframe loads to trigger the test finish.
             if (!url.equals(loaded_url, URL::ExcludeFragment::Yes))
@@ -562,7 +582,7 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
             auto& test = context.tests[test_index];
             test.did_finish_loading = true;
 
-            if (test.expected_outcome == ExpectedOutcome::WebContentTermination)
+            if (test.expected_outcome != ExpectedOutcome::Normal)
                 return;
 
             if (test.expectation_path.is_empty()) {
@@ -580,7 +600,7 @@ static void run_dump_test(TestWebView& view, TestRunContext& context, Test& test
 
         view.on_test_finish = [&context, test_index, on_test_complete](auto const& text) {
             auto& test = context.tests[test_index];
-            if (test.expected_outcome == ExpectedOutcome::WebContentTermination)
+            if (test.expected_outcome != ExpectedOutcome::Normal)
                 return;
 
             test.text = text;
@@ -651,7 +671,12 @@ static ErrorOr<void> write_screenshot_failure_results(Test& test, Gfx::Bitmap co
     return {};
 }
 
-static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL const& test_url)
+enum class WriteFailureResults {
+    No,
+    Yes,
+};
+
+static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL const& test_url, WriteFailureResults write_failure_results)
 {
     VERIFY(test.ref_test_expectation_index < test.ref_test_expectations.size());
 
@@ -662,7 +687,8 @@ static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL c
     if (should_match == screenshot_matches)
         return true;
 
-    TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
+    if (write_failure_results == WriteFailureResults::Yes)
+        TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
     return false;
 }
 
@@ -702,10 +728,28 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
                 test.expectation_screenshot = move(screenshot);
                 view.reset_zoom();
 
-                auto expectation_passed = compare_current_ref_test_expectation(test, url);
+                // A test passes if at least one of its match references matches, and all of its mismatch references
+                // mismatch. https://web-platform-tests.org/writing-tests/reftests.html#multiple-references
+                auto is_match = [](RefTestExpectation const& expectation) { return expectation.type == RefTestExpectationType::Match; };
+                auto const& expectations = test.ref_test_expectations;
+                auto current_is_match = is_match(expectations[test.ref_test_expectation_index]);
+                auto another_match_follows = current_is_match
+                    && any_of(expectations.span().slice(test.ref_test_expectation_index + 1), is_match);
+
+                // NB: A failed match is only a failure of the test if no other match reference remains to try.
+                auto expectation_passed = compare_current_ref_test_expectation(test, url,
+                    another_match_follows ? WriteFailureResults::No : WriteFailureResults::Yes);
                 if (expectation_passed.is_error() || !expectation_passed.value()) {
-                    view.on_test_complete({ test_index, TestResult::Fail });
-                    return;
+                    if (expectation_passed.is_error() || !another_match_follows) {
+                        view.on_test_complete({ test_index, TestResult::Fail });
+                        return;
+                    }
+                } else if (current_is_match) {
+                    // NB: One matching reference is enough, so only the mismatch references remain to be checked.
+                    for (size_t index = expectations.size() - 1; index > test.ref_test_expectation_index; --index) {
+                        if (is_match(expectations[index]))
+                            test.ref_test_expectations.remove(index);
+                    }
                 }
 
                 ++test.ref_test_expectation_index;
@@ -817,7 +861,7 @@ static void run_screenshot_test(TestWebView& view, TestRunContext& context, Test
             auto optipng_or_error = Core::Process::spawn({
                 .executable = "optipng"sv,
                 .search_for_executable_in_path = true,
-                .arguments = { "-strip"sv, "all"sv, test.expectation_path },
+                .arguments = Vector<ByteString> { "-strip"sv, "all"sv, test.expectation_path },
             });
             if (optipng_or_error.is_error()) {
                 warnln("Warning: Failed to run optipng: {}", optipng_or_error.error());
@@ -903,7 +947,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
     test_run_capture.begin_test_output_capture(view, test);
     auto timeout_in_milliseconds = app.per_test_timeout_in_seconds * 1000;
 
-    test.timeout_timer = Core::Timer::create_single_shot(timeout_in_milliseconds, [&view, &context, test_index]() {
+    test.timeout_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(timeout_in_milliseconds), [&view, &context, test_index]() {
         auto& test = context.tests[test_index];
         if (!test.did_start_test)
             dbgln("Timeout during pre-navigation for {}, WebContent process may be unresponsive", test.relative_path);
@@ -916,7 +960,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
         auto& test = context.tests[test_index];
         if (milliseconds <= 0)
             return;
-        test.timeout_timer->restart(AK::clamp_to<int>(milliseconds));
+        test.timeout_timer->restart(AK::Duration::from_milliseconds(AK::clamp_to<int>(milliseconds)));
     };
 
     // Clear the current document.
@@ -934,23 +978,27 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
     view.on_test_finish = {};
 
     promise->when_resolved([&view, test_index, &app, &context](auto) {
-        view.reset_session_history()->when_resolved([&view, test_index, &app, &context](auto) {
+        view.reset_state_for_next_test()->when_resolved([&view, test_index, &app, &context](auto) {
             auto& test = context.tests[test_index];
             test.did_start_test = true;
+
+            view.set_frame_rate_capped(s_frame_rate_capped.contains_slow(test.input_path));
 
             auto real_path = MUST(FileSystem::real_path(test.input_path));
             auto headers_path = ByteString::formatted("{}.headers", real_path);
 
             Optional<URL::URL> url;
-            if (FileSystem::exists(headers_path) || s_loaded_from_http_server.contains_slow(test.input_path)) {
+            auto is_loaded_from_insecure_origin = s_loaded_from_insecure_origin.contains_slow(test.input_path);
+            if (FileSystem::exists(headers_path) || is_loaded_from_insecure_origin || s_loaded_from_http_server.contains_slow(test.input_path)) {
                 // Some tests need to be served via the echo server so, for example, HTTP headers from .headers
                 // files are sent, or so that the resulting HTML document has a HTTP based origin (e.g for testing
-                // cookies).
+                // cookies), or one that is not potentially trustworthy.
                 auto echo_server_port = Application::web_content_options().echo_server_port;
                 VERIFY(echo_server_port.has_value());
                 auto relative_path = LexicalPath::relative_path(real_path, app.test_root_path);
                 VERIFY(relative_path.has_value());
-                url = URL::Parser::basic_parse(ByteString::formatted("http://{}:{}/static/{}", unique_localhost_hostname("test-web"sv), echo_server_port.value(), relative_path.value())).release_value();
+                auto hostname = unique_hostname_within(is_loaded_from_insecure_origin ? "test"sv : "localhost"sv, "test-web"sv);
+                url = URL::Parser::basic_parse(ByteString::formatted("http://{}:{}/static/{}", hostname, echo_server_port.value(), relative_path.value())).release_value();
             } else {
                 url = URL::create_with_file_scheme(real_path).release_value();
             }
@@ -962,6 +1010,7 @@ static void run_test(TestWebView& view, TestRunContext& context, size_t test_ind
             switch (test.mode) {
             case TestMode::Crash:
             case TestMode::Text:
+            case TestMode::Accessibility:
             case TestMode::Layout:
                 run_dump_test(view, context, test, *url);
                 return;
@@ -991,7 +1040,7 @@ static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& contex
 
         for (auto const& filter : accepted_file_types.filters) {
             filter.visit(
-                [](Web::HTML::FileFilter::FileType) {},
+                [](Web::HTML::FileFilter::FileType) { },
                 [&](Web::HTML::FileFilter::MimeType const& mime_type) {
                     if (mime_type.value == "text/plain"sv)
                         add_txt_files = true;
@@ -1032,7 +1081,10 @@ static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& contex
         test_run_capture.write_test_output(view);
 
         if (auto index = s_current_test_index_by_view.get(&view); index.has_value()) {
-            auto result = context.tests[*index].expected_outcome == ExpectedOutcome::WebContentTermination && crash_reason == WebView::ViewImplementation::WebContentCrashReason::RejectedIPC
+            using enum WebView::ViewImplementation::WebContentCrashReason;
+            auto expected_outcome = context.tests[*index].expected_outcome;
+            auto result = (expected_outcome == ExpectedOutcome::WebContentTermination && crash_reason == RejectedIPC)
+                    || (expected_outcome == ExpectedOutcome::WebContentCrash && crash_reason == ProcessCrash)
                 ? TestResult::Pass
                 : TestResult::Crashed;
             view.on_test_complete({ *index, result });
@@ -1042,6 +1094,11 @@ static void set_ui_callbacks_for_tests(TestWebView& view, TestRunContext& contex
     view.on_web_content_process_change_for_cross_site_navigation = [&view, &test_run_capture]() {
         test_run_capture.rebind_test_output_capture(view);
     };
+}
+
+static bool test_run_was_stopped()
+{
+    return s_all_tests_complete && s_all_tests_complete->is_rejected();
 }
 
 static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePixelSize window_size)
@@ -1070,6 +1127,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     if (app.test_globs.is_empty())
         app.test_globs.append("*"sv);
 
+    TRY(collect_dump_tests(app, tests, ByteString::formatted("{}/Accessibility", app.test_root_path), "."sv, TestMode::Accessibility));
     TRY(collect_dump_tests(app, tests, ByteString::formatted("{}/Layout", app.test_root_path), "."sv, TestMode::Layout));
     TRY(collect_dump_tests(app, tests, ByteString::formatted("{}/Text", app.test_root_path), "."sv, TestMode::Text));
     TRY(collect_ref_tests(app, tests, ByteString::formatted("{}/Ref", app.test_root_path), "."sv));
@@ -1084,11 +1142,9 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             "*/wpt-import/common/*"sv,
             "*/wpt-import/images/*"sv,
         };
-        auto normalize_path = [](ByteString const& path) { return path.replace("\\"sv, "/"sv); };
-        auto const test_input_path = normalize_path(test.input_path);
-        auto const test_relative_path = normalize_path(test.relative_path);
+        auto const test_input_path = test.input_path.replace("\\"sv, "/"sv);
         bool is_support_file = any_of(support_file_patterns, [&](auto pattern) { return test_input_path.matches(pattern); });
-        bool match_glob = any_of(app.test_globs, [&](auto const& glob) { return test_relative_path.matches(glob, CaseSensitivity::CaseSensitive); });
+        bool match_glob = any_of(app.test_globs, [&](auto const& glob) { return test.relative_path.matches(glob, CaseSensitivity::CaseSensitive); });
         return is_support_file || !match_glob;
     });
 
@@ -1133,7 +1189,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
                 Test test = base_test;
                 test.run_index = run_index;
                 test.total_runs = app.repeat_count;
-                test.safe_relative_path = LexicalPath::join(ByteString::formatted("run-{}", run_index), test.safe_relative_path).string();
+                test.safe_relative_path = ByteString::formatted("run-{}/{}", run_index, test.safe_relative_path);
                 tests.append(move(test));
             }
         }
@@ -1163,7 +1219,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     // test URL before the about:blank load completes. WebContent currently cannot handle this, and will drop the test URL.
     // Nothing else bounds this wait, so it gets the per-test timeout.
     bool initial_load_timed_out = false;
-    auto initial_load_timer = Core::Timer::create_single_shot(app.per_test_timeout_in_seconds * 1000, [&] {
+    auto initial_load_timer = Core::Timer::create_single_shot(AK::Duration::from_seconds(app.per_test_timeout_in_seconds), [&] {
         initial_load_timed_out = true;
     });
     initial_load_timer->start();
@@ -1228,13 +1284,18 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             view->disconnect_child_crash_handlers();
             view->close_child_web_views();
 
+            // A test's ignored and learned words live in this process, so they outlive a crashed WebContent.
+            view->reset_spell_checking();
+
             // Don't try to reset state if WebContent crashed - it's gone
             if (test_result != TestResult::Crashed) {
                 view->clear_content_blockers();
                 view->reset_zoom();
                 view->reset_force_dark();
                 view->reset_line_box_borders();
+                view->reset_user_style();
                 view->reset_geolocation_emulated_position();
+                view->reset_permissions();
                 view->reset_viewport_size(window_size);
             }
 
@@ -1254,7 +1315,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
         // run_next_test handles: reset promise, attach callback, pick test, run test
         auto run_next_test = [&, view = view.ptr(), cleanup_test, view_id]() {
-            if (app.fail_fast && fail_fast_triggered) {
+            if (test_run_was_stopped()) {
                 if (view_id < s_view_display_states.size())
                     s_view_display_states[view_id].active = false;
                 return;
@@ -1292,7 +1353,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
 
                 // Write captured std logs to results directory.
                 // NOTE: On crashes, we already flushed it in on_web_content_crashed.
-                if (result.result != TestResult::Crashed && test.expected_outcome != ExpectedOutcome::WebContentTermination)
+                if (result.result != TestResult::Crashed && test.expected_outcome == ExpectedOutcome::Normal)
                     test_run_capture.write_test_output(*view);
 
                 bool const is_non_passing_result = result.result != TestResult::Pass;
@@ -1337,6 +1398,8 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
             });
 
             Core::deferred_invoke([&, index]() mutable {
+                if (test_run_was_stopped())
+                    return;
                 if (s_skipped_tests.contains_slow(tests[index].input_path))
                     view->on_test_complete({ index, TestResult::Skipped });
                 else

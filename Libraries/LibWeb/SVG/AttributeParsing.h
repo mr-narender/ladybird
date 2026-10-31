@@ -121,13 +121,15 @@ private:
     bool m_is_percentage { false };
 };
 
-enum class TextAnchor {
-    Start,
-    Middle,
-    End
-};
-
 WEB_API Optional<i32> parse_integer(Utf16View);
+WEB_API Optional<float> parse_number(Utf16View);
+
+struct NumberOptionalNumber {
+    float first { 0 };
+    Optional<float> second;
+};
+WEB_API Optional<NumberOptionalNumber> parse_number_optional_number(Utf16View);
+
 WEB_API Optional<NumberPercentage> parse_number_percentage(Utf16View);
 WEB_API Vector<Gfx::FloatPoint> parse_points(Utf16View);
 WEB_API Optional<Vector<Transform>> parse_transform(Utf16View);
@@ -136,5 +138,6 @@ WEB_API Optional<SVGUnits> parse_units(Utf16View);
 WEB_API Vector<float> parse_table_values(Utf16View);
 WEB_API Optional<SpreadMethod> parse_spread_method(Utf16View);
 WEB_API Optional<ViewBox> parse_viewbox(Utf16View);
+WEB_API Optional<double> parse_clock_value_in_milliseconds(Utf16View);
 
 }

@@ -10,7 +10,7 @@ use crate::painting::record::hit_test_items::HitTestFacts;
 use crate::painting::record::paint::text::SelectionStyleAnswer;
 use crate::painting::record::{BasePaintFacts, PatternTileKey};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 struct StampedEntry<T> {
@@ -36,8 +36,11 @@ pub(crate) struct RecordingScratch {
     recording_stamp: u32,
     base_paint_facts: Vec<StampedEntry<BasePaintFacts>>,
     hit_test_facts: Vec<StampedEntry<HitTestFacts>>,
-    pub(super) pattern_tile_records: HashMap<PatternTileKey, Rc<Vec<u8>>>,
-    pub(super) selection_style_cache: HashMap<u32, Rc<SelectionStyleAnswer>>,
+    pub(super) pattern_tile_records: HashMap<PatternTileKey, Arc<Vec<u8>>>,
+    pub(super) selection_style_cache: HashMap<u32, Arc<SelectionStyleAnswer>>,
+    pub(super) search_text_style_cache: HashMap<u32, Arc<SelectionStyleAnswer>>,
+    pub(super) search_text_current_style_cache: HashMap<u32, Arc<SelectionStyleAnswer>>,
+    pub(super) spelling_error_style_cache: HashMap<u32, Arc<SelectionStyleAnswer>>,
     pub(super) wheel_hit_test_target_cache: HashMap<NodeSlotId, SpatialNodeIndex>,
 }
 
@@ -98,6 +101,9 @@ impl RecordingScratch {
     pub(super) fn clear_temporary_caches(&mut self) {
         self.pattern_tile_records.clear();
         self.selection_style_cache.clear();
+        self.search_text_style_cache.clear();
+        self.search_text_current_style_cache.clear();
+        self.spelling_error_style_cache.clear();
         self.wheel_hit_test_target_cache.clear();
     }
 

@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::capacity::capacity_bytes;
 use super::column::EpochColumn;
 use super::column::PagedColumn;
 use super::column::PagedColumnPage;
@@ -52,16 +51,13 @@ impl RemainingPostingDirectory {
             .map(|(_, posting)| posting)
     }
 
-    fn capacity_bytes(&self) -> u64 {
-        (self.entries.capacity() * size_of::<(PostingKey, RemainingPosting)>()) as u64
-    }
-
     fn insert(&mut self, key: PostingKey, posting: RemainingPosting) -> &mut RemainingPosting {
         self.entries.push((key, posting));
         &mut self.entries.last_mut().unwrap().1
     }
 }
 
+#[derive(Default)]
 pub(super) struct ImpactPlanningWorkspace {
     pub(super) batches: HashMap<Box<[ImpactRegion]>, Arc<ImpactRegionBatch>>,
     // Fact postings cannot change while one transaction is being planned, and the exact-node plan
@@ -69,19 +65,6 @@ pub(super) struct ImpactPlanningWorkspace {
     // workspace: later routes see the posting members that can still contribute, not the same
     // already-planned prefix over and over.
     pub(super) remaining_postings: RemainingPostingDirectory,
-    pub(super) memory: MemoryLease,
-    pub(super) nested_memory: MemoryLease,
-}
-
-impl Default for ImpactPlanningWorkspace {
-    fn default() -> Self {
-        Self {
-            batches: HashMap::default(),
-            remaining_postings: RemainingPostingDirectory::default(),
-            memory: MemoryLease::new(MemoryCategory::BatchScratch),
-            nested_memory: MemoryLease::new(MemoryCategory::BatchScratch),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -125,7 +108,7 @@ pub(super) struct AlreadyPlannedSelectorTruthCandidate {
 }
 
 /// A transaction batch whose common singleton form neither allocates nor sorts.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) enum DeltaBatch<T> {
     #[default]
     Empty,
@@ -153,19 +136,6 @@ impl<T> DeltaBatch<T> {
             Self::Many(items) => items,
         }
     }
-
-    #[must_use]
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        match self {
-            Self::Empty | Self::One(_) => 0,
-            Self::Many(items) => capacity_bytes! {
-                shallow [*items];
-                cached [];
-                nested [];
-                skip [];
-            },
-        }
-    }
 }
 
 impl<T: Ord> DeltaBatch<T> {
@@ -182,7 +152,7 @@ impl<T: Ord> DeltaBatch<T> {
 /// An exact change is both the retained-answer maintenance payload and its provenance. A route
 /// records a refresh only when it cannot preserve that old/new pair. Nodes reached through broad
 /// impact regions need no entry here because the region itself is already the refresh request.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SelectorTruthChanges {
     pub(super) deltas: DeltaBatch<SelectorTruthDelta>,
     pub(super) refreshes: DeltaBatch<SelectorTruthRefresh>,
@@ -211,26 +181,17 @@ impl RetainedState {
     /// DOM to rediscover slot and shadow relations already resident in the engine.
     pub(super) fn for_each_flat_tree_descendant(&mut self, root: StyleNodeID, mut visit: impl FnMut(StyleNodeID)) {
         let mut pending: Vec<_> = self.tree.flat_tree_children(root).collect();
-        let mut charged_bytes = pending.capacity() * size_of::<StyleNodeID>();
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, charged_bytes as u64);
 
         while let Some(node) = pending.pop() {
-            if node.element_index().is_some() {
-                visit(node);
+            // A text node holds a place among a slot's assigned nodes, but it has no style of its
+            // own and owns no child sequence the flat tree descends into.
+            if node.element_index().is_none() {
+                continue;
             }
+            visit(node);
 
-            let previous_capacity = pending.capacity();
             pending.extend(self.tree.flat_tree_children(node));
-            if pending.capacity() > previous_capacity {
-                let additional_bytes = (pending.capacity() - previous_capacity) * size_of::<StyleNodeID>();
-                self.memory
-                    .reserve_required(MemoryCategory::BatchScratch, additional_bytes as u64);
-                charged_bytes += additional_bytes;
-            }
         }
-
-        self.memory.release(MemoryCategory::BatchScratch, charged_bytes as u64);
     }
 
     /// Record that a route needs exact selector truth refreshed for a planned node.
@@ -301,13 +262,9 @@ impl RetainedState {
         &mut self,
         regions: &ImpactRegions,
         coarse_cover: Option<&ImpactRegionBatch>,
-        counters: &mut Counters,
     ) {
         let candidates = std::mem::take(&mut self.already_planned_selector_truth);
-        let candidate_bytes = candidates.capacity_bytes();
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, candidate_bytes);
-        let workspace_before = self.match_workspace.capacity_bytes();
+
         for candidate in candidates.as_slice() {
             if coarse_cover.is_some_and(|cover| regions.batch_contains_node(cover, candidate.node)) {
                 continue;
@@ -323,13 +280,9 @@ impl RetainedState {
                 exact_tree_evaluation: candidate.exact_tree_evaluation,
                 refresh_rule: None,
             };
-            let result = self.candidate_changes_exact_entry(candidate.node, &site, counters);
+            let result = self.candidate_changes_exact_entry(candidate.node, &site);
             self.record_exact_selector_truth_change(candidate.node, &site, result);
         }
-        let workspace_after = self.match_workspace.capacity_bytes();
-        self.memory
-            .reserve_required(MemoryCategory::BatchScratch, workspace_after - workspace_before);
-        self.memory.release(MemoryCategory::BatchScratch, candidate_bytes);
     }
 }
 
@@ -470,7 +423,7 @@ pub(super) fn repaired_selector_truth_deltas(
 }
 
 impl SelectorTruthChanges {
-    pub(super) fn consolidate(&mut self, counters: &mut Counters) {
+    pub(super) fn consolidate(&mut self, counters: &Counters) {
         match &mut self.deltas {
             DeltaBatch::Empty => {}
             DeltaBatch::One(delta) => {
@@ -551,46 +504,16 @@ impl SelectorTruthChanges {
         let items = self.refreshes.as_slice();
         &items[Self::range_for_node(items, node, |refresh| refresh.node)]
     }
-
-    #[must_use]
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [];
-            cached [];
-            nested [self.deltas.capacity_bytes(), self.refreshes.capacity_bytes()];
-            skip [];
-        }
-    }
 }
 
 impl ImpactPlanningWorkspace {
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [
-                self.batches,
-            ];
-            cached [self.nested_memory.bytes()];
-            nested [self.remaining_postings.capacity_bytes()];
-            skip [self.memory];
-        }
-    }
-
     pub(super) fn insert_batch(&mut self, regions: &[ImpactRegion], batch: Arc<ImpactRegionBatch>) {
         let regions: Box<[ImpactRegion]> = regions.into();
-        let payload_bytes = size_of_val(regions.as_ref()) + batch.storage_bytes();
         let previous = self.batches.insert(regions, batch);
         assert!(
             previous.is_none(),
             "region batches are inserted only after a cache miss"
         );
-        self.nested_memory.grow_committed(payload_bytes as u64);
-    }
-
-    pub(super) fn settle_memory(&mut self, memory: &mut MemoryController) {
-        let nested = self.nested_memory.bytes();
-        self.nested_memory.reconcile_committed(memory, nested);
-        let header = self.capacity_bytes() - self.nested_memory.bytes();
-        self.memory.resize_required_to(memory, header);
     }
 
     pub(super) fn extend_remaining_posting(
@@ -600,19 +523,17 @@ impl ImpactPlanningWorkspace {
         plan: &ImpactRegions,
         candidates: &mut Vec<StyleNodeID>,
         pruned_nodes: Option<&mut Vec<StyleNodeID>>,
-    ) -> Result<(u64, bool, usize, usize, usize), PostingKey> {
-        let bytes_before = self.capacity_bytes();
+    ) -> Result<(bool, usize, usize, usize), PostingKey> {
         let posting = match postings.lookup(key) {
             Lookup::Known(posting) => posting,
-            Lookup::KnownAbsent => return Ok((0, false, 0, 0, 0)),
+            Lookup::KnownAbsent => return Ok((false, 0, 0, 0)),
             Lookup::Missing(gap) => return Err(gap),
         };
         let (remaining, was_present, copied) = match self.remaining_postings.entry(key) {
             Some(remaining) => (remaining, true, 0),
             None => {
                 let candidates: Vec<StyleNodeID> = posting.candidates().collect();
-                self.nested_memory
-                    .grow_committed((candidates.capacity() * size_of::<StyleNodeID>()) as u64);
+
                 let remaining = self.remaining_postings.insert(
                     key,
                     RemainingPosting {
@@ -630,7 +551,6 @@ impl ImpactPlanningWorkspace {
         let plan_generation = plan.exact_node_generation();
         if remaining.plan_generation != plan_generation {
             let pruned_this_call = &mut remaining.pruned_nodes;
-            let pruned_capacity_before = pruned_this_call.capacity();
             let previous_pruned_length = pruned_this_call.len();
             let point_removed = plan.for_each_exact_node_added_after(
                 remaining.plan_generation,
@@ -657,9 +577,6 @@ impl ImpactPlanningWorkspace {
                 pruned = previous_length - posting.len();
             }
             remaining.plan_generation = plan_generation;
-            self.nested_memory.grow_committed(
-                ((pruned_this_call.capacity() - pruned_capacity_before) * size_of::<StyleNodeID>()) as u64,
-            );
         }
         // Every route consuming this posting reports the full pruned history: nodes dropped for
         // an earlier route are invisible to this one too. Without a consumer the history is
@@ -668,13 +585,7 @@ impl ImpactPlanningWorkspace {
             pruned_nodes.extend_from_slice(&remaining.pruned_nodes);
         }
         candidates.extend_from_slice(posting);
-        Ok((
-            self.capacity_bytes().saturating_sub(bytes_before),
-            was_present,
-            copied,
-            inspected,
-            pruned,
-        ))
+        Ok((was_present, copied, inspected, pruned))
     }
 }
 
@@ -831,10 +742,6 @@ impl<K: PendingRouteKey> PendingRegionTable<K> {
         self.entries.iter().map(|entry| entry.key)
     }
 
-    pub(super) fn values(&self) -> impl Iterator<Item = &Vec<ImpactRegion>> {
-        self.entries.iter().map(|entry| &entry.regions)
-    }
-
     pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut Vec<ImpactRegion>)> {
         self.entries.iter_mut().map(|entry| (entry.key, &mut entry.regions))
     }
@@ -850,15 +757,6 @@ impl<K: PendingRouteKey> PendingRegionTable<K> {
 
     pub(super) fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    pub(super) fn capacity_bytes(&self) -> usize {
-        (capacity_bytes! {
-            shallow [self.entries];
-            cached [self.pages.capacity_bytes()];
-            nested [];
-            skip [];
-        }) as usize
     }
 }
 
@@ -1009,20 +907,6 @@ impl SequenceChange {
         });
         positions.get(&child).map(|&at| at as usize)
     }
-
-    pub(super) fn auxiliary_capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.changed_types, self.arriving_nodes, self.relational_records];
-            cached [];
-            nested [self.positions.as_ref().map_or(0, |positions| capacity_bytes! {
-                shallow [*positions];
-                cached [];
-                nested [];
-                skip [];
-            })];
-            skip [self.children, self.arrivals, self.departures, self.span, self.unlocated, self.located_records];
-        }
-    }
 }
 
 /// The position of a relational sequence record that could not be located in the final sequence,
@@ -1092,27 +976,9 @@ impl SequenceChanges {
         let entry = self.pages.get(element_index)?;
         Some(&self.entries[entry as usize].1)
     }
-
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.entries];
-            cached [self.pages.capacity_bytes()];
-            nested [
-                self
-                .entries
-                .iter()
-                .map(|(_, change)| change.auxiliary_capacity_bytes())
-                .sum::<u64>(),
-            ];
-            skip [];
-        }
-    }
 }
 
-thread_local! {
-    static SHARED_SIBLING_ENTRY_MAPS: RefCell<SharedVectorPool<u32>> =
-        RefCell::new(SharedVectorPool::new(MemoryCategory::RoutingRegistry));
-}
+#[derive(Clone)]
 
 pub(super) struct SiblingCandidateWorkspace {
     entry_by_route: SharedVector<u32>,
@@ -1122,7 +988,7 @@ pub(super) struct SiblingCandidateWorkspace {
 }
 
 impl SiblingCandidateWorkspace {
-    pub(super) fn new(entries: &[SiblingEntry]) -> Self {
+    pub(super) fn new(entries: &[SiblingEntry], entry_map_pool: &mut SharedVectorPool<u32>) -> Self {
         let route_count = entries.iter().map(|entry| entry.route.index() + 1).max().unwrap_or(0);
         let mut entry_by_route: SharedVector<u32> = (0..route_count).map(|_| u32::MAX).collect();
         for (index, entry) in entries.iter().enumerate() {
@@ -1130,7 +996,7 @@ impl SiblingCandidateWorkspace {
             assert_ne!(index, u32::MAX, "sibling entry space exhausted");
             entry_by_route.make_mut()[entry.route.index()] = index;
         }
-        entry_by_route.share(&SHARED_SIBLING_ENTRY_MAPS);
+        entry_by_route.share(entry_map_pool);
         Self {
             entry_by_route,
             candidate_epochs: {
@@ -1140,15 +1006,6 @@ impl SiblingCandidateWorkspace {
             },
             candidates: Vec::with_capacity(entries.len()),
             epoch: 0,
-        }
-    }
-
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.entry_by_route, self.candidate_epochs, self.candidates];
-            cached [];
-            nested [];
-            skip [self.epoch];
         }
     }
 
@@ -1213,32 +1070,13 @@ pub(super) struct SequenceEntry {
 /// convergence walk reports whether its exact per-member diffs subsumed them. The held entries
 /// are not routed until then: `entries` is the complete live entry list, so the shared entry
 /// index applies to it, and `deferred` marks the ones held back.
+#[derive(Default)]
 pub(super) struct DeferredSequenceRoutes {
     pub(super) entries: Vec<SequenceEntry>,
     pub(super) deferred: Vec<bool>,
-    pub(super) memory: MemoryLease,
 }
 
-impl Default for DeferredSequenceRoutes {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            deferred: Vec::new(),
-            memory: MemoryLease::new(MemoryCategory::BatchScratch),
-        }
-    }
-}
-
-impl DeferredSequenceRoutes {
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.entries, self.deferred];
-            cached [];
-            nested [];
-            skip [self.memory];
-        }
-    }
-}
+impl DeferredSequenceRoutes {}
 
 /// Which sequence entries one routing pass handles: the ones the convergence walk cannot answer
 /// on the immediate pass, and the held-back ones when the walk failed to cover them.
@@ -1255,6 +1093,8 @@ impl SequenceEntrySelection<'_> {
     }
 }
 
+#[derive(Clone)]
+
 pub(super) struct NthSequenceEntryIndex {
     pub(super) nth: NthPosition,
     pub(super) unindexed: Vec<usize>,
@@ -1264,7 +1104,7 @@ pub(super) struct NthSequenceEntryIndex {
     pub(super) epoch: u32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SequenceEntryIndex {
     pub(super) empty: Vec<usize>,
     pub(super) nth: Vec<NthSequenceEntryIndex>,
@@ -1309,30 +1149,6 @@ impl SequenceEntryIndex {
             }
         }
         index
-    }
-
-    pub(super) fn capacity_bytes(&self) -> u64 {
-        capacity_bytes! {
-            shallow [self.empty, self.nth];
-            cached [];
-            nested [self
-                .nth
-                .iter()
-                .map(|group| {
-                    capacity_bytes! {
-                        shallow [group.unindexed, group.candidate_epochs, group.candidates, group.by_origin];
-                        cached [];
-                        nested [group
-                            .by_origin
-                            .values()
-                            .map(|entries| entries.capacity() * size_of::<usize>())
-                            .sum::<usize>()];
-                        skip [group.nth, group.epoch];
-                    }
-                })
-                .sum::<u64>()];
-            skip [];
-        }
     }
 }
 
@@ -1473,29 +1289,28 @@ impl ExactTreeEvaluation {
         old_matches: Option<bool>,
         transaction_fact_view: Option<&TransactionFactView>,
         match_workspace: &mut MatchScratch,
-        counters: &mut Counters,
+        counters: &Counters,
     ) -> Result<ExactEntryResult, Incomplete> {
         let (compiled, entry) = program;
         // The new side reads the authoritative tree, which every candidate of this transaction
         // shares. The workspace's current tree side was reset when the transaction began, so the
         // sibling positions it memoizes were all measured in this topology, and a sequence that
         // several positional entries ask about is counted once rather than once per candidate.
-        let evaluate_new = |match_workspace: &mut MatchScratch, counters: &mut Counters| {
+        let evaluate_new = |match_workspace: &mut MatchScratch, counters: &Counters| {
             MatchEvaluator::new(tree, facts)
                 .with_match_workspace(match_workspace, MatchEvaluationSide::Current)
                 .indexing_stepped_positions_only()
-                .matches_entry_without_program_caches(compiled, entry, node, counters)
+                .matches_entry(compiled, entry, node, counters)
         };
-        let evaluate_old =
-            |match_workspace: &mut MatchScratch, view: &TransactionFactView, counters: &mut Counters| match view
-                .is_present(tree, TransactionFactSide::Before, node)
-            {
+        let evaluate_old = |match_workspace: &mut MatchScratch, view: &TransactionFactView, counters: &Counters| {
+            match view.is_present(tree, TransactionFactSide::Before, node) {
                 false => Ok(false),
                 true => MatchEvaluator::new(tree, facts)
                     .with_transaction_fact_view(view, TransactionFactSide::Before)
                     .with_match_workspace(match_workspace, MatchEvaluationSide::OldTree)
-                    .matches_entry_without_program_caches(compiled, entry, node, counters),
-            };
+                    .matches_entry(compiled, entry, node, counters),
+            }
+        };
         match self {
             Self::Arrival => match evaluate_new(match_workspace, counters)? {
                 true => Ok(Lookup::Known(SetChange::Added)),

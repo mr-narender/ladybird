@@ -457,8 +457,11 @@ mod tests {
                 parent: "Instruction".to_string(),
                 fields: Vec::new(),
                 is_terminator: false,
+                falls_through: false,
                 layout: Default::default(),
                 array: None,
+                opcode: None,
+                is_fallback: false,
             },
             components: Vec::new(),
         }];
@@ -485,8 +488,11 @@ mod tests {
                     mode: crate::metadata::ParameterMode::In,
                 }],
                 is_terminator: false,
+                falls_through: false,
                 layout: Default::default(),
                 array: None,
+                opcode: None,
+                is_fallback: false,
             },
             components: vec![crate::metadata::SpecializedComponentLayout {
                 bytecode: "Source".to_string(),

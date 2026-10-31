@@ -16,25 +16,6 @@
 
 namespace Web::CSS {
 
-ValueComparingNonnullRefPtr<StyleValue const> StyleValueList::absolutized(ComputationContext const& computation_context) const
-{
-    auto values = this->values();
-    for (size_t i = 0; i < values.size(); ++i) {
-        auto absolutized_value = values[i]->absolutized(computation_context);
-        if (absolutized_value != values[i]) {
-            StyleValueVector result;
-            result.ensure_capacity(values.size());
-            for (size_t j = 0; j < i; ++j)
-                result.append(values[j]);
-            result.append(move(absolutized_value));
-            for (size_t j = i + 1; j < values.size(); ++j)
-                result.append(values[j]->absolutized(computation_context));
-            return StyleValueList::create(move(result), separator(), collapsible());
-        }
-    }
-    return *this;
-}
-
 void StyleValueList::set_style_sheet(StyleSheetState* style_sheet)
 {
     for (auto& value : values())
@@ -67,6 +48,11 @@ GC::Ref<CSSStyleValue> StyleValueList::reify(Utf16FlyString const& associated_pr
         if (auto transform_list = reify_a_transform_list(values))
             return transform_list.as_nonnull();
     }
+
+    // NB: A list with a single item, such as `text-decoration-line: underline`, is that item on its own. Reify the
+    //     item, so that a single keyword reifies as a CSSKeywordValue.
+    if (values.size() == 1)
+        return values.first()->reify(associated_property);
 
     // NB: Otherwise, there isn't an equivalent CSSStyleValue for StyleValueList, so just use the default.
     return default_reify(associated_property);

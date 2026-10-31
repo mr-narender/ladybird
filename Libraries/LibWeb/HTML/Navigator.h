@@ -7,7 +7,6 @@
 #pragma once
 
 #include <LibWeb/Bindings/Wrappable.h>
-#include <LibWeb/EncryptedMediaExtensions/NavigatorEncryptedMediaExtensionsPartial.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/GPC/GlobalPrivacyControl.h>
 #include <LibWeb/Gamepad/NavigatorGamepad.h>
@@ -35,7 +34,6 @@ class Navigator
     , public NavigatorDeviceMemoryMixin
     , public Gamepad::NavigatorGamepadPartial
     , public GlobalPrivacyControl::GlobalPrivacyControlMixin
-    , public EncryptedMediaExtensions::NavigatorEncryptedMediaExtensionsPartial
     , public NavigatorIDMixin
     , public NavigatorLanguageMixin
     , public NavigatorOnLineMixin
@@ -81,6 +79,7 @@ public:
 
     GC::Ref<MediaCapabilitiesAPI::MediaCapabilities> media_capabilities();
     GC::Ref<MediaCapture::MediaDevices> media_devices();
+    GC::Ptr<MediaCapture::MediaDevices> media_devices_if_created() const { return m_media_devices; }
 
     static WebIDL::Long max_touch_points();
 

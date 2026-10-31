@@ -5,7 +5,7 @@
  */
 
 use crate::css::css_string::CssString;
-use crate::css::ffi_support::FfiUtf16View;
+use crate::css::ffi_support::{FfiUtf16View, OwnedArc, OwnedBox};
 use crate::css::property_metadata::{property_is_logical_alias_including_shorthands, property_logical_group};
 use crate::css::style_compute::expand_shorthands_with;
 use crate::css::style_value::StyleValueData;
@@ -32,36 +32,6 @@ pub(crate) struct CustomProperty {
 pub struct DeclarationBlockData {
     pub(crate) properties: Vec<DeclaredProperty>,
     pub(crate) custom_properties: Vec<CustomProperty>,
-    custom_property_references: std::sync::OnceLock<(Vec<Vec<u16>>, bool)>,
-}
-
-/// Visit cached custom-property reads without creating declaration owners or C++ value views.
-///
-/// # Safety
-/// The callback must accept the context and borrowed UTF-16 names for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_data_visit_custom_property_references(
-    data: &DeclarationBlockData,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, *const u16, usize),
-) -> bool {
-    let (names, complete) = data.custom_property_references();
-    for name in names {
-        unsafe { visit(context, name.as_ptr(), name.len()) };
-    }
-    *complete
-}
-
-/// Facts used by style-sharing keys, read directly from the immutable declaration storage.
-#[derive(Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiDeclarationBlockDependencies {
-    pub has_custom_properties: bool,
-    pub has_unresolved_values: bool,
-    pub has_custom_functions: bool,
-    pub inherits_custom_properties_explicitly: bool,
-    pub reads_style_scope: bool,
-    pub declares_animation_name: bool,
 }
 
 const _: () = {
@@ -70,102 +40,6 @@ const _: () = {
 };
 
 impl DeclarationBlockData {
-    fn custom_property_references(&self) -> &(Vec<Vec<u16>>, bool) {
-        self.custom_property_references.get_or_init(|| {
-            let mut names = Vec::new();
-            let mut complete = true;
-            for value in self.properties.iter().map(|property| &*property.value).chain(
-                self.custom_properties
-                    .iter()
-                    .map(|property| &*property.declaration.value),
-            ) {
-                if matches!(value, StyleValueData::Unresolved { presence_var: true, .. }) {
-                    let (references, visible) = crate::css::style_value::custom_property_references(value).unwrap();
-                    names.extend(references);
-                    complete &= visible;
-                }
-            }
-            use crate::css::style_compute::keyword;
-            for property in &self.custom_properties {
-                if matches!(
-                    &*property.declaration.value,
-                    StyleValueData::Keyword {
-                        keyword: keyword::INHERIT | keyword::UNSET | keyword::REVERT | keyword::REVERT_LAYER
-                    }
-                ) {
-                    names.push(property.name.units().to_vec());
-                }
-            }
-            names.sort_unstable();
-            names.dedup();
-            (names, complete)
-        })
-    }
-
-    fn dependencies(&self) -> FfiDeclarationBlockDependencies {
-        use crate::css::property_metadata::property_id;
-        let mut dependencies = FfiDeclarationBlockDependencies {
-            has_custom_properties: !self.custom_properties.is_empty(),
-            ..Default::default()
-        };
-        for property in &self.properties {
-            let unresolved = matches!(&*property.value, StyleValueData::Unresolved { .. });
-            dependencies.has_unresolved_values |= unresolved;
-            dependencies.inherits_custom_properties_explicitly |= matches!(
-                &*property.value,
-                StyleValueData::Unresolved {
-                    presence_inherit: true,
-                    ..
-                }
-            );
-            dependencies.has_custom_functions |= matches!(
-                &*property.value,
-                StyleValueData::Unresolved {
-                    presence_dashed_function: true,
-                    ..
-                }
-            );
-            dependencies.reads_style_scope |= unresolved
-                || matches!(
-                    property.property_id,
-                    property_id::CONTENT | property_id::LIST_STYLE_TYPE
-                );
-            dependencies.declares_animation_name |= property.property_id == property_id::ANIMATION_NAME;
-        }
-        for custom_property in &self.custom_properties {
-            // NB: Substitution can produce an inherit keyword, which reads even non-inheriting
-            //     registered properties from the full parent environment.
-            dependencies.inherits_custom_properties_explicitly |= match &*custom_property.declaration.value {
-                StyleValueData::Unresolved {
-                    presence_attr,
-                    presence_dashed_function,
-                    presence_env,
-                    presence_if,
-                    presence_inherit,
-                    presence_var,
-                    ..
-                } => {
-                    *presence_attr
-                        || *presence_dashed_function
-                        || *presence_env
-                        || *presence_if
-                        || *presence_inherit
-                        || *presence_var
-                }
-                StyleValueData::Keyword { keyword } => *keyword == crate::css::style_compute::keyword::INHERIT,
-                _ => false,
-            };
-            dependencies.has_custom_functions |= matches!(
-                &*custom_property.declaration.value,
-                StyleValueData::Unresolved {
-                    presence_dashed_function: true,
-                    ..
-                }
-            );
-        }
-        dependencies
-    }
-
     pub(crate) fn external_memory_size(&self) -> usize {
         let mut size = size_of::<Self>()
             .saturating_add(self.properties.capacity().saturating_mul(size_of::<DeclaredProperty>()))
@@ -177,12 +51,6 @@ impl DeclarationBlockData {
         for property in &self.custom_properties {
             size = size.saturating_add(size_of_val(property.name.units()));
         }
-        if let Some((names, _)) = self.custom_property_references.get() {
-            size = size.saturating_add(names.capacity().saturating_mul(size_of::<Vec<u16>>()));
-            for name in names {
-                size = size.saturating_add(name.capacity().saturating_mul(size_of::<u16>()));
-            }
-        }
         size
     }
 
@@ -193,16 +61,27 @@ impl DeclarationBlockData {
         // the one with greatest cascading order must be represented, at the same relative position as it was specified.
         expand_shorthands_with(
             declaration.property_id,
-            Arc::as_ptr(&declaration.value).cast(),
+            &crate::css::style_value::RetainedStyleValueData::from_arc(declaration.value),
             false,
             &mut |property_id, value, _| {
                 self.append_normalized_property(DeclaredProperty {
                     property_id,
                     important: declaration.important,
-                    value: unsafe { retain_value(value) },
+                    value: value.clone().into_arc(),
                 });
             },
         );
+    }
+
+    /// Drops the growth slack of a block that is done growing. Shrinking in place may keep the whole allocation: the
+    /// allocator reuses a block for any size above half of it.
+    pub(crate) fn compact(&mut self) {
+        if self.properties.capacity() > self.properties.len() {
+            self.properties = self.properties.to_vec();
+        }
+        if self.custom_properties.capacity() > self.custom_properties.len() {
+            self.custom_properties = self.custom_properties.to_vec();
+        }
     }
 
     fn append_normalized_property(&mut self, declaration: DeclaredProperty) {
@@ -296,15 +175,15 @@ impl DeclarationBlockData {
 }
 
 #[repr(C)]
-pub struct FfiDeclaredProperty {
+pub struct FfiDeclaredProperty<'a> {
     pub property_id: u16,
     pub important: bool,
     pub value: *const c_void,
-    pub name: FfiUtf16View,
+    pub name: FfiUtf16View<'a>,
 }
 
 impl DeclaredProperty {
-    fn view(&self, name: FfiUtf16View) -> FfiDeclaredProperty {
+    fn view<'a>(&'a self, name: FfiUtf16View<'a>) -> FfiDeclaredProperty<'a> {
         FfiDeclaredProperty {
             property_id: self.property_id,
             important: self.important,
@@ -419,7 +298,6 @@ impl DeclarationBlock {
         let owner = self.owner();
         let mut owner = owner.borrow_mut();
         let data = Arc::make_mut(&mut owner.data);
-        data.custom_property_references.take();
         if !mutation(data) {
             return false;
         }
@@ -458,10 +336,32 @@ pub(crate) fn visit_declaration_images(data: &DeclarationBlockData, visit: &mut 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_is_empty(block: *const DeclarationBlock) -> bool {
-    let block = unsafe { &*block };
+pub extern "C" fn rust_declaration_block_is_empty(block: &DeclarationBlock) -> bool {
     let data = block.data();
     data.properties.is_empty() && data.custom_properties.is_empty()
+}
+
+/// Whether a declaration of the block holds an image or a gradient, as its value or as an item of its list.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_declaration_block_has_abstract_image_values(block: &DeclarationBlock) -> bool {
+    use crate::css::style_value::StyleValueData;
+    let is_abstract_image = |value: &StyleValueData| {
+        matches!(
+            value,
+            StyleValueData::Image { .. }
+                | StyleValueData::ImageSet { .. }
+                | StyleValueData::LinearGradient { .. }
+                | StyleValueData::ConicGradient { .. }
+                | StyleValueData::RadialGradient { .. }
+        )
+    };
+    block.data().properties.iter().any(|property| match &*property.value {
+        StyleValueData::ValueList { values, .. } => values
+            .as_slice()
+            .iter()
+            .any(|item| item.optional_data().is_some_and(is_abstract_image)),
+        value => is_abstract_image(value),
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -517,16 +417,15 @@ pub unsafe extern "C" fn rust_declaration_block_create(
     }
     for index in 0..custom_property_count {
         let property = unsafe { &*custom_properties.add(index) };
-        data.set_custom_property(
-            CssString::from_utf16(&unsafe { property.name.to_utf16() }.unwrap()),
-            unsafe { declaration_from_view(property) },
-        );
+        data.set_custom_property(CssString::from_utf16(&property.name.to_utf16().unwrap()), unsafe {
+            declaration_from_view(property)
+        });
     }
     Box::into_raw(Box::new(DeclarationBlock::new(Arc::new(data))))
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_share(block: &DeclarationBlock) -> *mut DeclarationBlock {
+pub extern "C" fn rust_declaration_block_share(block: &DeclarationBlock) -> *mut DeclarationBlock {
     Box::into_raw(Box::new(DeclarationBlock::new(block.data())))
 }
 
@@ -537,41 +436,17 @@ pub extern "C" fn rust_declaration_block_snapshot(block: &DeclarationBlock) -> *
 }
 
 /// Retain an immutable declaration snapshot without creating a live declaration owner.
-///
-/// # Safety
-/// `data` must be a live, Arc-owned declaration snapshot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_data_retain(
-    data: *const DeclarationBlockData,
+pub extern "C" fn rust_declaration_data_retain(
+    data: crate::css::ffi_support::ArcRef<'_, DeclarationBlockData>,
 ) -> *const DeclarationBlockData {
-    unsafe {
-        Arc::increment_strong_count(data);
-    }
-    data
+    Arc::into_raw(data.to_arc())
 }
 
 /// Release an immutable declaration snapshot returned by the style engine or retained from a view.
-///
-/// # Safety
-/// `data` must be null or own an Arc reference to declaration data.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_data_release(data: *const DeclarationBlockData) {
-    if !data.is_null() {
-        drop(unsafe { Arc::from_raw(data) });
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_declaration_data_dependencies(data: &DeclarationBlockData) -> FfiDeclarationBlockDependencies {
-    data.dependencies()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_declaration_block_dependencies(block: &DeclarationBlock) -> FfiDeclarationBlockDependencies {
-    match &*block.state.borrow() {
-        DeclarationBlockState::Immutable(data) => data.dependencies(),
-        DeclarationBlockState::Mutable(owner) => owner.borrow().data.dependencies(),
-    }
+pub extern "C" fn rust_declaration_data_release(data: OwnedArc<DeclarationBlockData>) {
+    drop(data);
 }
 
 /// Visit borrowed declaration values without materializing mutable owners or FFI arrays.
@@ -587,20 +462,16 @@ pub extern "C" fn rust_declaration_data_visit(
     for property in &data.custom_properties {
         visit(
             context,
-            &property.declaration.view(FfiUtf16View {
-                utf16: property.name.units().as_ptr(),
-                length: property.name.units().len(),
-                ..Default::default()
-            }),
+            &property
+                .declaration
+                .view(FfiUtf16View::from_utf16(property.name.units())),
         );
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_destroy(block: *mut DeclarationBlock) {
-    if !block.is_null() {
-        drop(unsafe { Box::from_raw(block) });
-    }
+pub extern "C" fn rust_declaration_block_destroy(block: OwnedBox<DeclarationBlock>) {
+    drop(block);
 }
 
 #[unsafe(no_mangle)]
@@ -637,7 +508,7 @@ pub unsafe extern "C" fn rust_declaration_block_set_custom(
     block: &mut DeclarationBlock,
     property: &FfiDeclaredProperty,
 ) {
-    let name = CssString::from_utf16(&unsafe { property.name.to_utf16() }.unwrap());
+    let name = CssString::from_utf16(&property.name.to_utf16().unwrap());
     let declaration = unsafe { declaration_from_view(property) };
     block.mutate(|data| {
         data.set_custom_property(name, declaration);
@@ -646,16 +517,13 @@ pub unsafe extern "C" fn rust_declaration_block_set_custom(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_remove(block: &mut DeclarationBlock, property_id: u16) -> bool {
+pub extern "C" fn rust_declaration_block_remove(block: &mut DeclarationBlock, property_id: u16) -> bool {
     block.remove(property_id)
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_remove_custom(
-    block: &mut DeclarationBlock,
-    name: FfiUtf16View,
-) -> bool {
-    let name = unsafe { name.to_utf16() }.unwrap();
+pub extern "C" fn rust_declaration_block_remove_custom(block: &mut DeclarationBlock, name: FfiUtf16View) -> bool {
+    let name = name.to_utf16().unwrap();
     let Some(index) = block
         .data()
         .custom_properties
@@ -671,7 +539,7 @@ pub unsafe extern "C" fn rust_declaration_block_remove_custom(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_declaration_block_external_memory_size(block: &DeclarationBlock) -> usize {
+pub extern "C" fn rust_declaration_block_external_memory_size(block: &DeclarationBlock) -> usize {
     let data = block.data();
     let mut size = size_of::<DeclarationBlock>().saturating_add(data.external_memory_size());
     if matches!(*block.state.borrow(), DeclarationBlockState::Mutable(_)) {
@@ -686,31 +554,17 @@ mod tests {
     use crate::css::parser::syntax_parser::parse_shared_stylesheet;
     use crate::css::parser::value_parser::ParseContext;
     use crate::css::property_metadata::property_id;
-    use crate::css::rule::{rust_rule_children, rust_rule_list_at, rust_rule_payload};
+    use crate::css::rule::rust_rule_payload;
 
     fn parsed_declarations(text: &str) -> Arc<DeclarationBlockData> {
         let units: Vec<_> = format!(".target {{ {text} }}").encode_utf16().collect();
         let input = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
         // All context fields are booleans, integers, or nullable pointers.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
-        let parse = unsafe { parse_shared_stylesheet(input, &context) };
+        let context = ParseContext::default();
+        let parse = parse_shared_stylesheet(input, Some(&context));
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
-        let rule = unsafe { &*rust_rule_list_at(&rules, 0) };
+        let rule = &rules.rule_at(0);
         rule.cascade_declarations().unwrap()
-    }
-
-    #[test]
-    fn cached_custom_property_reads_follow_copy_on_write_mutation() {
-        let data = parsed_declarations("width: var(--幅); --色: inherit");
-        let expected = ["--幅", "--色"].map(|name| name.encode_utf16().collect::<Vec<_>>());
-        assert_eq!(data.custom_property_references(), &(expected.to_vec(), true));
-        let mut block = DeclarationBlock::new(data.clone());
-        assert!(block.remove(property_id::WIDTH));
-        assert_eq!(
-            block.data().custom_property_references(),
-            &(vec![expected[1].clone()], true)
-        );
-        assert_eq!(data.custom_property_references(), &(expected.to_vec(), true));
     }
 
     #[test]
@@ -724,16 +578,10 @@ mod tests {
             view.important = true;
             assert!(unsafe { rust_declaration_block_set(&mut block, &view) });
             let name = block.data().custom_properties[0].name.clone();
-            assert!(unsafe {
-                rust_declaration_block_remove_custom(
-                    &mut block,
-                    FfiUtf16View {
-                        utf16: name.units().as_ptr(),
-                        length: name.units().len(),
-                        ..Default::default()
-                    },
-                )
-            });
+            assert!(rust_declaration_block_remove_custom(
+                &mut block,
+                FfiUtf16View::from_utf16(name.units())
+            ));
             assert!(block.data().properties[0].important);
             assert!(block.data().custom_properties.is_empty());
             assert_eq!(crate::css::ffi_stats::CPP_CALLBACK_COUNT.get(), 0);
@@ -745,189 +593,33 @@ mod tests {
     }
 
     #[test]
-    fn inline_cascade_snapshots_borrow_values_without_views_and_survive_mutation() {
-        let mut owner = DeclarationBlock::new(parsed_declarations("width: var(--幅); --幅: 30px; color: red"));
-        let owners = DECLARATION_OWNER_ALLOCATIONS.get();
-        let snapshot = unsafe { Arc::from_raw(rust_declaration_block_snapshot(&owner)) };
-        assert_eq!(DECLARATION_OWNER_ALLOCATIONS.get(), owners);
-        let cascade = crate::css::cascaded_properties::FfiCascadeBlock {
-            is_inline_style: true,
-            native_declarations: Arc::as_ptr(&snapshot),
-            ..unsafe { std::mem::zeroed() }
-        };
-        let values: Vec<_> = cascade
-            .declarations()
-            .map(|property| {
-                assert!(!property.has_style_sheet_context);
-                property.data
-            })
-            .collect();
-        assert_eq!(
-            values,
-            snapshot
-                .properties
-                .iter()
-                .map(|property| Arc::as_ptr(&property.value).cast())
-                .collect::<Vec<_>>()
-        );
-        let replacement = DeclarationBlock::new(parsed_declarations("width: 40px; --幅: 50px; color: blue"));
-        rust_declaration_block_replace(&mut owner, &replacement);
-        assert!(!Arc::ptr_eq(&owner.data(), &snapshot));
-        assert_eq!(
-            values,
-            cascade.declarations().map(|property| property.data).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn dependency_reads_borrow_native_declarations_without_owners_or_views() {
-        for (text, expected) in [
-            ("width: 13px", FfiDeclarationBlockDependencies::default()),
-            ("width: inherit", FfiDeclarationBlockDependencies::default()),
-            (
-                "--color: inherit",
-                FfiDeclarationBlockDependencies {
-                    has_custom_properties: true,
-                    inherits_custom_properties_explicitly: true,
-                    ..Default::default()
-                },
-            ),
-            (
-                "width: inherit(--width)",
-                FfiDeclarationBlockDependencies {
-                    has_unresolved_values: true,
-                    inherits_custom_properties_explicitly: true,
-                    reads_style_scope: true,
-                    ..Default::default()
-                },
-            ),
-            (
-                "--color: inherit(--parent)",
-                FfiDeclarationBlockDependencies {
-                    has_custom_properties: true,
-                    inherits_custom_properties_explicitly: true,
-                    ..Default::default()
-                },
-            ),
-            (
-                "--色: red",
-                FfiDeclarationBlockDependencies {
-                    has_custom_properties: true,
-                    ..Default::default()
-                },
-            ),
-            (
-                "width: var(--幅)",
-                FfiDeclarationBlockDependencies {
-                    has_unresolved_values: true,
-                    reads_style_scope: true,
-                    ..Default::default()
-                },
-            ),
-            (
-                "content: '文字'; list-style-type: disc",
-                FfiDeclarationBlockDependencies {
-                    reads_style_scope: true,
-                    ..Default::default()
-                },
-            ),
-            (
-                "animation: movement 1s",
-                FfiDeclarationBlockDependencies {
-                    declares_animation_name: true,
-                    ..Default::default()
-                },
-            ),
-        ] {
-            let data = parsed_declarations(text);
-            let block = DeclarationBlock::new(data.clone());
-            let owners = DECLARATION_OWNER_ALLOCATIONS.with(|count| count.get());
-            let references = Arc::strong_count(&data);
-            assert_eq!(rust_declaration_data_dependencies(&data), expected, "{text}");
-            assert_eq!(rust_declaration_block_dependencies(&block), expected, "{text}");
-            // Zero is Author; the other fields are integers, booleans, and nullable pointers.
-            let cascade = crate::css::cascaded_properties::FfiCascadeBlock {
-                native_declarations: Arc::as_ptr(&data),
-                ..unsafe { std::mem::zeroed() }
-            };
-            assert_eq!(cascade.declarations().count(), data.properties.len());
-            for (declaration, property) in cascade.declarations().zip(&data.properties) {
-                assert_eq!(declaration.data, Arc::as_ptr(&property.value).cast());
-                assert_eq!(declaration.property_id, property.property_id);
-                assert_eq!(declaration.important, property.important);
-            }
-            assert_eq!(Arc::strong_count(&data), references);
-            assert_eq!(DECLARATION_OWNER_ALLOCATIONS.with(|count| count.get()), owners);
-            assert!(matches!(*block.state.borrow(), DeclarationBlockState::Immutable(_)));
-        }
-    }
-
-    #[test]
-    fn dependency_reads_follow_mutation_without_changing_shared_snapshots() {
-        let data = parsed_declarations("width: var(--幅); animation-name: movement; --幅: 13px");
-        let original = DeclarationBlock::new(data.clone());
-        let mut fork = unsafe { Box::from_raw(rust_declaration_block_share(&original)) };
-        let expected = rust_declaration_data_dependencies(&data);
-        assert!(unsafe { rust_declaration_block_remove(&mut fork, property_id::WIDTH) });
-        assert!(unsafe { rust_declaration_block_remove(&mut fork, property_id::ANIMATION_NAME) });
-        let mut retained = unsafe { Box::from_raw(rust_declaration_block_retain(&fork)) };
-        let owners = DECLARATION_OWNER_ALLOCATIONS.with(|count| count.get());
-        assert_eq!(
-            rust_declaration_block_dependencies(&retained),
-            FfiDeclarationBlockDependencies {
-                has_custom_properties: true,
-                ..Default::default()
-            }
-        );
-        let name: Vec<_> = "--幅".encode_utf16().collect();
-        assert!(unsafe {
-            rust_declaration_block_remove_custom(
-                &mut retained,
-                FfiUtf16View {
-                    utf16: name.as_ptr(),
-                    length: name.len(),
-                    ..Default::default()
-                },
-            )
-        });
-        assert_eq!(
-            rust_declaration_block_dependencies(&fork),
-            FfiDeclarationBlockDependencies::default()
-        );
-        assert_eq!(rust_declaration_block_dependencies(&original), expected);
-        assert_eq!(rust_declaration_data_dependencies(&data), expected);
-        assert_eq!(DECLARATION_OWNER_ALLOCATIONS.with(|count| count.get()), owners);
-    }
-
-    #[test]
     fn native_nested_declarations_promote_only_for_live_handles_or_edits() {
         let units: Vec<_> = ".親 { .子 {} width: 13px; --幅: 19px; }".encode_utf16().collect();
         let input = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
         // All context fields are booleans, integers, or nullable pointers.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
-        let parse = unsafe { parse_shared_stylesheet(input, &context) };
+        let context = ParseContext::default();
+        let parse = parse_shared_stylesheet(input, Some(&context));
         let rules = crate::css::rule::NativeRuleList::from_parsed(parse);
-        let rule = unsafe { &*rust_rule_list_at(&rules, 0) };
-        let children = unsafe { &*rust_rule_children(rule) };
-        let nested = unsafe { &*rust_rule_list_at(children, 1) };
-        let block = unsafe { &*rust_rule_payload(nested).declarations };
+        let rule = rules.rule_at(0);
+        let nested = rule.child_rules().unwrap().rule_at(1);
+        let block = unsafe { &*rust_rule_payload(&nested).declarations };
         let snapshot = nested.cascade_declarations().unwrap();
         let old_data = Arc::downgrade(&snapshot);
         let borrowed = block.data();
         assert_eq!(borrowed.properties.len(), 1);
         assert_eq!(borrowed.custom_properties.len(), 1);
-        assert!(!unsafe { rust_declaration_block_is_empty(block) });
+        assert!(!rust_declaration_block_is_empty(block));
         assert_eq!(rust_declaration_block_revision(block), 0);
-        assert!(unsafe { rust_declaration_block_external_memory_size(block) } > 0);
+        assert!(rust_declaration_block_external_memory_size(block) > 0);
         let mut fork = unsafe { Box::from_raw(rust_declaration_block_share(block)) };
-        assert!(!unsafe { rust_declaration_block_remove(&mut fork, property_id::HEIGHT) });
+        assert!(!rust_declaration_block_remove(&mut fork, property_id::HEIGHT));
         assert!(matches!(*block.state.borrow(), DeclarationBlockState::Immutable(_)));
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Immutable(_)));
         assert!(Arc::ptr_eq(&snapshot, &fork.data()));
 
         let mut retained = unsafe { Box::from_raw(rust_declaration_block_retain(block)) };
         assert!(Rc::ptr_eq(&block.owner(), &retained.owner()));
-        assert!(unsafe { rust_declaration_block_remove(&mut retained, property_id::WIDTH) });
+        assert!(rust_declaration_block_remove(&mut retained, property_id::WIDTH));
         assert!(block.data().properties.is_empty());
         assert_eq!(rust_declaration_block_revision(block), 1);
         // A different handle's mutation cannot invalidate a pinned snapshot.
@@ -941,8 +633,8 @@ mod tests {
         assert_eq!(block.data().properties.len(), 1);
         assert_eq!(rust_declaration_block_revision(block), 2);
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Immutable(_)));
-        drop(rules);
-        assert!(unsafe { rust_declaration_block_remove(&mut fork, property_id::WIDTH) });
+        drop((nested, rule, rules));
+        assert!(rust_declaration_block_remove(&mut fork, property_id::WIDTH));
         assert!(matches!(*fork.state.borrow(), DeclarationBlockState::Mutable(_)));
         assert!(fork.data().properties.is_empty());
         assert_eq!(retained.data().properties.len(), 1);
@@ -951,5 +643,98 @@ mod tests {
         drop(borrowed);
         drop(snapshot);
         assert!(old_data.upgrade().is_none());
+    }
+    #[test]
+    fn font_synthesis_expands_existing_position_for_ordinary_values() {
+        use crate::css::css_enums::keyword;
+        let mut observed = Vec::new();
+        for source in ["none", "weight", "style", "small-caps", "weight style small-caps"] {
+            let data = parsed_declarations(&format!("font-synthesis-position: auto; font-synthesis: {source}"));
+            let position = data
+                .properties
+                .iter()
+                .find(|property| property.property_id == property_id::FONT_SYNTHESIS_POSITION)
+                .unwrap();
+            let StyleValueData::Keyword { keyword: value } = position.value.as_ref() else {
+                panic!("keyword expected")
+            };
+            observed.push((source, keyword::NAMES[*value as usize]));
+        }
+        assert_eq!(
+            observed,
+            vec![
+                ("none", "none"),
+                ("weight", "none"),
+                ("style", "none"),
+                ("small-caps", "none"),
+                ("weight style small-caps", "none")
+            ]
+        );
+    }
+
+    #[test]
+    fn font_synthesis_stylesheet_importance_covers_position() {
+        use crate::css::css_enums::keyword;
+        let kept = parsed_declarations("font-synthesis-position: auto !important; font-synthesis: none");
+        let position = kept
+            .properties
+            .iter()
+            .find(|property| property.property_id == property_id::FONT_SYNTHESIS_POSITION)
+            .unwrap();
+        assert!(position.important);
+        assert!(
+            matches!(position.value.as_ref(), StyleValueData::Keyword { keyword: value } if *value == keyword::AUTO)
+        );
+        let changed =
+            parsed_declarations("font-synthesis-position: auto !important; font-synthesis: weight !important");
+        assert_eq!(changed.properties.len(), 4);
+        for property in &changed.properties {
+            assert!(property.important);
+        }
+        let position = changed
+            .properties
+            .iter()
+            .find(|property| property.property_id == property_id::FONT_SYNTHESIS_POSITION)
+            .unwrap();
+        assert!(
+            matches!(position.value.as_ref(), StyleValueData::Keyword { keyword: value } if *value == keyword::NONE)
+        );
+    }
+
+    #[test]
+    fn font_synthesis_css_wide_and_pending_substitutions_cover_all_four() {
+        use crate::css::css_enums::keyword;
+        for (source, expected) in [
+            ("initial", keyword::INITIAL),
+            ("inherit", keyword::INHERIT),
+            ("unset", keyword::UNSET),
+            ("revert", keyword::REVERT),
+            ("revert-layer", keyword::REVERT_LAYER),
+        ] {
+            let data = parsed_declarations(&format!("font-synthesis: {source} !important"));
+            assert_eq!(data.properties.len(), 4, "{source}");
+            assert!(
+                data.properties
+                    .iter()
+                    .any(|property| property.property_id == property_id::FONT_SYNTHESIS_POSITION)
+            );
+            for property in &data.properties {
+                assert!(property.important);
+                assert!(matches!(property.value.as_ref(), StyleValueData::Keyword { keyword } if *keyword == expected));
+            }
+        }
+        let pending = parsed_declarations("font-synthesis: var(--s)");
+        assert_eq!(pending.properties.len(), 5);
+        assert_eq!(pending.properties[0].property_id, property_id::FONT_SYNTHESIS);
+        assert!(
+            pending.properties[1..]
+                .iter()
+                .any(|property| property.property_id == property_id::FONT_SYNTHESIS_POSITION)
+        );
+        assert!(
+            pending.properties[1..]
+                .iter()
+                .all(|property| matches!(property.value.as_ref(), StyleValueData::PendingSubstitution { .. }))
+        );
     }
 }

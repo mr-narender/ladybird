@@ -11,6 +11,7 @@
 #include <AK/HashTable.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/StackInfo.h>
 #include <AK/String.h>
@@ -64,20 +65,15 @@ public:
     template<typename T, typename... Args>
     Ref<T> allocate(Args&&... args)
     {
-        VERIFY(!m_collecting_garbage);
-        auto* memory = allocate_cell<T>();
-        defer_gc();
-        new (memory) T(forward<Args>(args)...);
-        auto* cell = static_cast<T*>(memory);
-        cell->set_cell_kind(T::cell_kind_for_class);
-        // Cells allocated during incremental sweep must be marked so they
-        // survive until the next GC cycle clears and re-establishes marks.
-        if (m_incremental_sweep_active) {
-            cell->set_marked(true);
-            m_cells_allocated_during_sweep.append(cell);
-        }
-        undefer_gc();
-        return *cell;
+        return construct_cell<T>(allocate_cell<T>(), forward<Args>(args)...);
+    }
+
+    // Like allocate(), but takes the cell from the given allocator instead of T's own. This lets one C++ type keep
+    // several kinds of objects apart, each in blocks of its own.
+    template<typename T, typename... Args>
+    Ref<T> allocate_with_descriptor(TypeIsolatingCellAllocator<T>& descriptor, Args&&... args)
+    {
+        return construct_cell<T>(allocate_cell(descriptor), forward<Args>(args)...);
     }
 
     enum class CollectionType {
@@ -96,7 +92,7 @@ public:
     bool is_collecting_everything() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectEverything; }
 
     void set_incremental_sweep_enabled(bool enabled) { m_incremental_sweep_enabled = enabled; }
-    void set_should_collect_on_every_allocation(bool b) { m_should_collect_on_every_allocation = b; }
+    void set_should_collect_on_every_allocation(bool);
 
     void did_create_root(Badge<RootImpl>, RootImpl&);
     void did_destroy_root(Badge<RootImpl>, RootImpl&);
@@ -123,12 +119,16 @@ public:
     void did_create_weak_container(Badge<WeakContainer>, WeakContainer&);
     void did_destroy_weak_container(Badge<WeakContainer>, WeakContainer&);
 
+    void enable_stats();
+    void add_stats(AK::JsonObject&) const;
+
     void register_sweep_callback(AK::Function<void()>);
 
     void register_cell_allocator(Badge<CellAllocator>, CellAllocator&);
     CellAllocator& cell_allocator_for(Badge<CellAllocatorDescriptorBase>, CellAllocatorDescriptorBase&);
 
     void uproot_cell(Cell* cell);
+    void uproot_cell(ForeignCell* cell) { uproot_cell(as_cell(cell)); }
 
     bool is_gc_deferred() const { return m_gc_deferrals > 0; }
     bool is_incremental_sweep_active() const { return m_incremental_sweep_active; }
@@ -145,6 +145,7 @@ public:
     void did_free_external_memory(size_t);
 
 private:
+    friend struct CAPI;
     friend class CellAllocator;
     friend class HeapBlock;
     friend class MarkingVisitor;
@@ -155,6 +156,19 @@ private:
     void undefer_gc();
 
     void dump_allocators();
+    void finish_stats_collection();
+
+    template<typename T, typename... Args>
+    Ref<T> construct_cell(Cell* memory, Args&&... args)
+    {
+        defer_gc();
+        new (memory) T(forward<Args>(args)...);
+        auto* cell = static_cast<T*>(memory);
+        cell->set_cell_kind(T::cell_kind_for_class);
+        mark_if_allocated_during_incremental_sweep(*cell);
+        undefer_gc();
+        return *cell;
+    }
 
     template<typename T>
     Cell* allocate_cell()
@@ -163,11 +177,51 @@ private:
         static_assert(IsSame<T, typename decltype(T::cell_allocator)::CellType>,
             "GC cell allocator type mismatch");
 
-        will_allocate(sizeof(T));
-        return T::cell_allocator.for_heap(*this).allocate_cell(*this);
+        return allocate_cell(T::cell_allocator);
     }
 
-    void will_allocate(size_t);
+    // Shared by allocate<T>() and any allocation whose cell type is only known through its allocator descriptor.
+    // Cells that other cells keep their storage in neither collect garbage nor count towards the next collection
+    // (see gc_heap_allocate_storage_cell()).
+    enum class TriggersCollection {
+        No,
+        Yes,
+    };
+    Cell* allocate_cell(CellAllocatorDescriptorBase& descriptor, TriggersCollection triggers_collection = TriggersCollection::Yes)
+    {
+        VERIFY(!m_collecting_garbage);
+        will_allocate(descriptor.cell_size(), triggers_collection);
+        return descriptor.for_heap(*this).allocate_cell(*this);
+    }
+
+    // Cells allocated during incremental sweep in a block that the sweep has
+    // yet to finish must be marked so that it keeps them. The sweep clears the
+    // marks of the blocks it has yet to sweep; cells in the block it is
+    // sweeping right now are remembered so their marks get cleared when the
+    // sweep finishes. Swept and new blocks need nothing.
+    bool mark_if_allocated_during_incremental_sweep(Cell& cell)
+    {
+        if (!m_incremental_sweep_active)
+            return false;
+        auto* block = HeapBlock::from_cell(&cell);
+        if (block->is_pending_sweep()) {
+            cell.set_marked(true);
+            return true;
+        }
+        if (block->is_being_swept()) {
+            cell.set_marked(true);
+            m_cells_allocated_during_sweep.append(&cell);
+            return true;
+        }
+        return false;
+    }
+
+    // Marking makes every block pending sweep again, which local free lists
+    // must never be in, so every collection does this once it has finished the
+    // pending sweep, whose destructors may take new local free lists.
+    void give_back_local_free_lists();
+
+    void will_allocate(size_t, TriggersCollection = TriggersCollection::Yes);
     void update_gc_bytes_threshold(size_t live_cell_bytes, size_t live_external_bytes);
 
     enum class IncludeIncomingCrossHeapMembers {
@@ -189,11 +243,12 @@ private:
     NEVER_INLINE AK::JsonObject build_graph(ReadonlySpan<FlatPtr> callee_saved_registers);
 
     void gather_roots(ConservativeScanOrigin const&, HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr, IncludeIncomingCrossHeapMembers = IncludeIncomingCrossHeapMembers::Yes);
-    static void mark_live_cells_across(ReadonlySpan<Heap* const>, HashMap<Cell*, HeapRoot> const& roots);
+    static void mark_live_cells_across(ReadonlySpan<Heap* const>, HashMap<Cell*, HeapRoot>& roots);
+    void clear_weak_pointers_to_dead_cells(bool report);
     void run_post_mark_phases(bool report);
     void gather_conservative_roots(ConservativeScanOrigin const&, HashMap<Cell*, HeapRoot>&, Vector<StackFrameInfo>* out_stack_frames = nullptr);
     void gather_asan_fake_stack_roots(HashMap<FlatPtr, HeapRoot>&, FlatPtr, FlatPtr heap_region_start, FlatPtr heap_region_end, FlatPtr stack_reference, FlatPtr stack_top);
-    void mark_live_cells(HashMap<Cell*, HeapRoot> const& live_cells);
+    void mark_live_cells(HashMap<Cell*, HeapRoot>& roots);
     void finalize_unmarked_cells();
     void sweep_dead_cells(bool print_report, Core::ElapsedTimer const&);
     void sweep_weak_blocks();
@@ -218,6 +273,21 @@ private:
                 return;
         }
     }
+
+    struct Stats {
+        AK_ALLOC_WITH_KMALLOC;
+
+        u64 collections { 0 };
+        u64 completed_collections { 0 };
+        u64 total_duration_ns { 0 };
+        u64 last_duration_ns { 0 };
+        u64 pause_duration_ns { 0 };
+        u64 sweep_duration_ns { 0 };
+        size_t bytes_before { 0 };
+        size_t live_cell_bytes { 0 };
+        size_t live_external_bytes { 0 };
+    };
+    OwnPtr<Stats> m_stats;
 
     size_t m_gc_bytes_threshold { 0 };
     size_t m_allocated_bytes_since_last_gc { 0 };
@@ -246,6 +316,7 @@ private:
     bool m_should_gc_when_deferral_ends { false };
 
     bool m_collecting_garbage { false };
+    bool m_weak_pointers_to_dead_cells_are_cleared { false };
     CollectionType m_current_collection_type { CollectionType::CollectGarbage };
     StackInfo m_stack_info;
     AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> m_gather_embedder_roots;
@@ -259,6 +330,7 @@ private:
     WeakBlock::List m_full_weak_blocks;
 
     bool m_incremental_sweep_active { false };
+    size_t m_block_sweeps_in_progress { 0 };
     size_t m_sweep_live_cell_bytes { 0 };
     size_t m_sweep_live_external_bytes { 0 };
     Vector<GC::Ptr<Cell>> m_cells_allocated_during_sweep;
@@ -267,6 +339,8 @@ private:
 
     RefPtr<Core::Timer> m_idle_gc_timer;
     u64 m_total_allocated_bytes { 0 };
+    // The context a heap created through LibGC/CAPI.h was created with.
+    void* m_foreign_context { nullptr };
     IdleCollectionPolicy m_idle_collection_policy;
 };
 

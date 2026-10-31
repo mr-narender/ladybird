@@ -6,11 +6,13 @@
 
 #include <AK/AnyOf.h>
 #include <AK/Array.h>
+#include <AK/ScopeGuard.h>
 #include <LibCore/Environment.h>
 #include <LibCore/File.h>
 #include <LibCore/Process.h>
 #include <LibCore/Socket.h>
 #include <LibCore/StandardPaths.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibWebView/Process.h>
@@ -26,17 +28,35 @@
 #endif
 
 #if defined(AK_OS_WINDOWS)
-#    include <AK/ScopeGuard.h>
 #    include <AK/Windows.h>
+#    include <LibIPC/HandleBrokerServer.h>
+#    include <LibWebView/Application.h>
 #endif
 
 namespace WebView {
 
 Process::Process(ProcessType type, RefPtr<IPC::ConnectionBase> connection, Core::Process process)
-    : m_process(move(process))
+    : m_pid(process.pid())
+    , m_process(move(process))
     , m_type(type)
     , m_connection(move(connection))
 {
+}
+
+Process::Process(ProcessType type, pid_t pid)
+    : m_pid(pid)
+    , m_type(type)
+{
+}
+
+Process Process::for_browser()
+{
+    return Process { ProcessType::Browser, Core::System::getpid() };
+}
+
+void Process::did_register(Badge<ProcessManager>, u64 child_id)
+{
+    m_child_id = child_id;
 }
 
 void Process::save_crash_report(Optional<int> exit_status)
@@ -44,12 +64,22 @@ void Process::save_crash_report(Optional<int> exit_status)
     if (m_crash_report && exit_status.has_value()) {
         if (auto result = m_crash_report->save(*exit_status); result.is_error())
             warnln("Could not save {} crash report: {}", process_name_from_type(m_type), result.error());
+        else
+            m_saved_crash_report_name = m_crash_report->saved_name();
     }
     m_crash_report = nullptr;
 }
 
 Process::~Process()
 {
+    // NB: A helper that never made it into the ProcessManager would run on untracked, so it is ended instead.
+    if (m_process.has_value() && m_child_id == 0) {
+        (void)Core::Process::terminate_process(m_pid, Core::Process::TerminationMode::Forceful);
+#if defined(AK_OS_MACOS)
+        Application::transport_bootstrap_server().unregister_child_transport(m_pid);
+#endif
+    }
+
     // shutdown() can release the connection's last owner while dispatching die().
     if (auto connection = m_connection.strong_ref())
         connection->shutdown();
@@ -79,24 +109,16 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
     };
     static constexpr Array allowed_prefixes {
         "ASAN_"sv,
-        "CRANELIFT_"sv,
         "LADYBIRD_"sv,
         "LC_"sv,
         "LIBGC_"sv,
         "LIBJS_"sv,
+        "LIBWASM_"sv,
         "LIBWEB_"sv,
         "LSAN_"sv,
         "RUST_"sv,
         "TSAN_"sv,
         "UBSAN_"sv,
-    };
-    // libcurl reads the proxy configuration from these, in either case.
-    static constexpr Array proxy_names {
-        "all_proxy"sv,
-        "ftp_proxy"sv,
-        "http_proxy"sv,
-        "https_proxy"sv,
-        "no_proxy"sv,
     };
     // OpenSSL reads these to find the system's certificates. OPENSSL_CONF is not here on purpose: a configuration file
     // can load providers and engines into the process.
@@ -124,12 +146,11 @@ Vector<ByteString> Process::helper_process_environment(ProcessType type)
         auto entry = Core::Environment::Entry::from_chars(*variable);
         auto is_allowed = allowed_names.contains_slow(entry.name) || any_of(allowed_prefixes, [&](auto prefix) { return entry.name.starts_with(prefix); });
         if (type == ProcessType::RequestServer) {
-            is_allowed |= any_of(proxy_names, [&](auto name) { return entry.name.equals_ignoring_ascii_case(name); });
             is_allowed |= certificate_names.contains_slow(entry.name);
         }
-        if (type == ProcessType::WebContent || type == ProcessType::MediaServer)
+        if (type == ProcessType::AudioServer)
             is_allowed |= audio_names.contains_slow(entry.name);
-        if (type == ProcessType::Compositor)
+        if (type == ProcessType::Compositor || type == ProcessType::VideoDecoderServer)
             is_allowed |= any_of(gpu_prefixes, [&](auto prefix) { return entry.name.starts_with(prefix); });
         if (is_allowed)
             environment.append(entry.full_entry);
@@ -169,6 +190,15 @@ static void watch_with_process_reaper(pid_t pid)
 }
 #endif
 
+ErrorOr<Process::ProcessAndTransport> Process::spawn_with_transport(ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output)
+{
+    auto [core_process, transport, output_capture] = TRY(spawn_and_connect_to_process(type, options, capture_output));
+
+    Process process { type, nullptr, move(core_process) };
+    process.m_output_capture = move(output_capture);
+    return ProcessAndTransport { move(process), move(transport) };
+}
+
 ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([[maybe_unused]] ProcessType type, Core::ProcessSpawnOptions const& options, bool capture_output)
 {
     // Set up pipes for stdout/stderr capture if requested
@@ -176,8 +206,17 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
     Array<int, 2> stdout_pipe {};
     Array<int, 2> stderr_pipe {};
 
-    Core::ProcessSpawnOptions spawn_options = options;
+    auto spawn_options = options;
     spawn_options.die_with_parent = true;
+    // Ctrl+C in the terminal that the Browser was started from must reach only the Browser, which ends its helpers once
+    // it has quit. A helper that died of it first would look like a crash to a Browser that is still running.
+    spawn_options.new_process_group = true;
+    Vector<ByteString> arguments_with_stats;
+    if (auto* stats_log = Core::StatsLog::the()) {
+        arguments_with_stats = Vector<ByteString> { options.arguments };
+        arguments_with_stats.append(ByteString::formatted("--stats-log-dir={}", stats_log->directory()));
+        spawn_options.arguments = arguments_with_stats;
+    }
 #if defined(AK_OS_MACOS) || defined(AK_OS_LINUX)
     spawn_options.environment = helper_process_environment(type);
 #endif
@@ -197,6 +236,17 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
         spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = stderr_pipe[1], .fd = STDERR_FILENO });
     }
 
+    // NB: A helper that we fail to connect to is ended rather than left running untracked.
+    Optional<Core::Process> process;
+    ArmedScopeGuard terminate_process_on_failure { [&] {
+        if (!process.has_value())
+            return;
+        (void)Core::Process::terminate_process(process->pid(), Core::Process::TerminationMode::Forceful);
+#if defined(AK_OS_MACOS)
+        Application::transport_bootstrap_server().unregister_child_transport(process->pid());
+#endif
+    } };
+
 #if defined(AK_OS_MACOS)
     auto port_a_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto port_a_send = TRY(port_a_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
@@ -207,39 +257,51 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
     IPC::TransportMachPort::raise_receive_queue_limit(port_b_recv);
 
     MutexLocker child_registration_locker(Application::transport_bootstrap_server().child_registration_lock());
-    auto process = TRY(Core::Process::spawn(spawn_options));
-    watch_with_process_reaper(process.pid());
+    process = TRY(Core::Process::spawn(spawn_options));
+    watch_with_process_reaper(process->pid());
 
-    Application::transport_bootstrap_server().register_child_transport(process.pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
+    Application::transport_bootstrap_server().register_child_transport(process->pid(), IPC::TransportBootstrapMachPorts { move(port_b_recv), move(port_a_send) });
 
     auto transport = make<IPC::Transport>(move(port_a_recv), move(port_b_send));
+#elif defined(AK_OS_WINDOWS)
+    // A Windows pipe cannot carry a handle, so the helper also gets a line to the Browser's handle broker.
+    auto channel = TRY(Core::System::duplex_pipe());
+    ArmedScopeGuard guard_channel_0 { [&] { MUST(Core::System::close(channel[0])); } };
+    ArmedScopeGuard guard_channel_1 { [&] { MUST(Core::System::close(channel[1])); } };
+    auto broker_channel = TRY(Core::System::duplex_pipe());
+    ArmedScopeGuard guard_broker_channel_0 { [&] { MUST(Core::System::close(broker_channel[0])); } };
+    ArmedScopeGuard guard_broker_channel_1 { [&] { MUST(Core::System::close(broker_channel[1])); } };
+
+    // Only the helper's ends reach the helper, and only this helper.
+    spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = channel[1], .fd = channel[1] });
+    spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = broker_channel[1], .fd = broker_channel[1] });
+    TRY(Core::Environment::set("SOCKET_TAKEOVER"sv, ByteString::formatted("ipc:{};handle-broker:{}", channel[1], broker_channel[1]), Core::Environment::Overwrite::Yes));
+
+    process = TRY(Core::Process::spawn(spawn_options));
+
+    auto transport = TRY(IPC::Transport::adopt_fd(channel[0]));
+    guard_channel_0.disarm();
+
+    guard_broker_channel_0.disarm();
+    Application::handle_broker_server().add_child(process->pid(), broker_channel[0]);
 #else
     int socket_fds[2] {};
-#    if defined(AK_OS_WINDOWS)
-    TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM, 0, socket_fds));
-#    else
     TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_fds));
-#    endif
 
     ArmedScopeGuard guard_fd_0 { [&] { MUST(Core::System::close(socket_fds[0])); } };
     ArmedScopeGuard guard_fd_1 { [&] { MUST(Core::System::close(socket_fds[1])); } };
 
-#    if defined(AK_OS_WINDOWS)
-    // Note: Core::System::socketpair creates inheritable sockets on Windows.
-    TRY(Core::System::set_close_on_exec(socket_fds[0], true));
-#    else
     // Only the helper's end reaches the helper, and only this helper.
     spawn_options.file_actions.append(Core::FileAction::DupFd { .write_fd = socket_fds[1], .fd = socket_fds[1] });
-#    endif
 
     // NB: Only the helper gets to see this, if it has an environment of its own.
-    auto takeover_string = ByteString::formatted("{}:{}", options.name, socket_fds[1]);
+    auto takeover_string = ByteString::formatted("ipc:{}", socket_fds[1]);
     if (spawn_options.environment.has_value())
         spawn_options.environment->append(ByteString::formatted("SOCKET_TAKEOVER={}", takeover_string));
     else
         TRY(Core::Environment::set("SOCKET_TAKEOVER"sv, takeover_string, Core::Environment::Overwrite::Yes));
 
-    auto process = TRY(Core::Process::spawn(spawn_options));
+    process = TRY(Core::Process::spawn(spawn_options));
 
     auto ipc_socket = TRY(Core::LocalSocket::adopt_fd(socket_fds[0]));
     guard_fd_0.disarm();
@@ -258,7 +320,8 @@ ErrorOr<Process::ProcessAndIPCTransport> Process::spawn_and_connect_to_process([
         output_capture.stderr_file = TRY(Core::File::adopt_fd(stderr_pipe[0], Core::File::OpenMode::Read));
     }
 
-    return ProcessAndIPCTransport { move(process), move(transport), move(output_capture) };
+    terminate_process_on_failure.disarm();
+    return ProcessAndIPCTransport { process.release_value(), move(transport), move(output_capture) };
 }
 
 ErrorOr<Optional<pid_t>> Process::get_process_pid(StringView process_name, StringView pid_path)
@@ -320,6 +383,10 @@ ErrorOr<Optional<pid_t>> Process::get_process_pid(StringView process_name, Strin
 // This is heavily based on how SystemServer's Service creates its socket.
 ErrorOr<int> Process::create_ipc_socket(ByteString const& socket_path)
 {
+    auto socket_address_un = Core::SocketAddress::local(socket_path).to_sockaddr_un();
+    if (!socket_address_un.has_value())
+        return Error::from_string_literal("IPC socket path does not fit in sockaddr_un; the runtime directory path is too long");
+
     if (FileSystem::exists(socket_path))
         TRY(FileSystem::remove(socket_path, FileSystem::RecursionMode::Disallowed));
 
@@ -344,10 +411,7 @@ ErrorOr<int> Process::create_ipc_socket(ByteString const& socket_path)
 #    endif
 #endif
 
-    auto socket_address = Core::SocketAddress::local(socket_path);
-    auto socket_address_un = socket_address.to_sockaddr_un().release_value();
-
-    TRY(Core::System::bind(socket_fd, reinterpret_cast<sockaddr*>(&socket_address_un), sizeof(socket_address_un)));
+    TRY(Core::System::bind(socket_fd, reinterpret_cast<sockaddr*>(&*socket_address_un), sizeof(*socket_address_un)));
     TRY(Core::System::listen(socket_fd, 16));
 
     return socket_fd;

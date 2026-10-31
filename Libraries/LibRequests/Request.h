@@ -12,11 +12,12 @@
 #include <AK/MemoryStream.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
+#include <AK/Variant.h>
 #include <AK/WeakPtr.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibCore/Notifier.h>
 #include <LibHTTP/HeaderList.h>
-#include <LibRequests/CameFromCache.h>
+#include <LibRequests/CacheState.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibRequests/RequestTransferLease.h>
@@ -27,30 +28,33 @@ class RequestClient;
 
 class ResponseData {
 public:
+    // A slice of a whole body, delivered with that whole body.
+    struct FileBackedSlice {
+        Core::ImmutableBytes slice;
+        Core::ImmutableBytes payload;
+    };
+
     static ResponseData from_bytes(ReadonlyBytes bytes) { return ResponseData { bytes }; }
-    static ResponseData from_immutable_bytes(Core::ImmutableBytes bytes) { return ResponseData { move(bytes) }; }
+    static ResponseData from_file_backed_payload(Core::ImmutableBytes const& payload, size_t offset, size_t length)
+    {
+        return ResponseData { FileBackedSlice { payload.slice(offset, length), payload } };
+    }
 
     [[nodiscard]] ReadonlyBytes bytes() const
     {
-        if (m_immutable_bytes.has_value())
-            return m_immutable_bytes->bytes();
-        return m_bytes;
+        return m_data.visit(
+            [](ReadonlyBytes bytes) { return bytes; },
+            [](FileBackedSlice const& file_backed) { return file_backed.slice.bytes(); });
     }
-    [[nodiscard]] Optional<Core::ImmutableBytes> const& immutable_bytes() const { return m_immutable_bytes; }
+    [[nodiscard]] FileBackedSlice const* file_backed_slice() const { return m_data.get_pointer<FileBackedSlice>(); }
 
 private:
-    explicit ResponseData(ReadonlyBytes bytes)
-        : m_bytes(bytes)
+    explicit ResponseData(Variant<ReadonlyBytes, FileBackedSlice> data)
+        : m_data(move(data))
     {
     }
 
-    explicit ResponseData(Core::ImmutableBytes bytes)
-        : m_immutable_bytes(move(bytes))
-    {
-    }
-
-    ReadonlyBytes m_bytes;
-    Optional<Core::ImmutableBytes> m_immutable_bytes;
+    Variant<ReadonlyBytes, FileBackedSlice> m_data;
 };
 
 class ReadStream {
@@ -79,11 +83,6 @@ private:
 class Request : public RefCounted<Request>
     , public Weakable<Request> {
 public:
-    struct CertificateAndKey {
-        ByteString certificate;
-        ByteString key;
-    };
-
     static NonnullRefPtr<Request> create_from_id(Badge<RequestClient>, RequestClient& client, u64 request_id, Optional<RequestTransferLeaseKey> transfer_lease = {})
     {
         return adopt_ref(*new Request(client, request_id, move(transfer_lease)));
@@ -94,25 +93,27 @@ public:
     u64 id() const { return m_request_id; }
     int request_server_client_id() const;
     int fd() const { return m_fd; }
+    ByteString const& http_version() const { return m_http_version; }
     bool stop();
     void set_body_delivery_paused(bool);
     void resume_body_delivery();
     void resume_body_delivery_up_to(size_t);
     void release_transfer_lease();
     [[nodiscard]] bool has_transfer_lease() const { return m_transfer_lease.has_value(); }
+    [[nodiscard]] Optional<RequestTransferLeaseKey> const& transfer_lease() const { return m_transfer_lease; }
     [[nodiscard]] bool has_file_backed_response_body() const;
 
     // Whether RequestServer has reported the request finished. Its response body may still be undelivered; e.g. while
     // body delivery is paused.
     [[nodiscard]] bool is_finished() const { return m_finished; }
 
-    using BufferedRequestFinished = Function<void(u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CameFromCache came_from_cache, Core::ImmutableBytes payload)>;
+    using BufferedRequestFinished = Function<void(u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CacheState cache_state, Core::ImmutableBytes payload)>;
 
     // Configure the request such that the entirety of the response data is buffered. The callback receives that data and
     // the response headers all at once. Using this method is mutually exclusive with `set_unbuffered_data_received_callback`.
     void set_buffered_request_finished_callback(BufferedRequestFinished);
 
-    using HeadersReceived = Function<void(NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CameFromCache came_from_cache)>;
+    using HeadersReceived = Function<void(NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CacheState cache_state)>;
     using DataReceived = Function<void(ResponseData data)>;
     using CachedBodyAvailable = Function<void(Core::ImmutableBytes data)>;
     using RequestFinished = Function<void(u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> network_error)>;
@@ -123,12 +124,18 @@ public:
     void set_unbuffered_request_callbacks(HeadersReceived, DataReceived, CachedBodyAvailable, RequestFinished);
     void set_stop_callback(RequestStopped);
 
-    Function<CertificateAndKey()> on_certificate_requested;
     Function<void()> on_requires_network;
 
+    enum class TeardownReason : u8 {
+        Stopped,
+        Transferred,
+    };
+
+    // Invoked at most once, when the request drops its delivery callbacks without a finish: a stop() or a transfer.
+    Function<void(TeardownReason)> on_teardown;
+
     void did_finish(Badge<RequestClient>, u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error);
-    void did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CameFromCache came_from_cache);
-    void did_request_certificates(Badge<RequestClient>);
+    void did_receive_headers(Badge<RequestClient>, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CacheState cache_state, ByteString http_version);
     void did_transfer(Badge<RequestClient>);
 
     RefPtr<Core::Notifier>& write_notifier(Badge<RequestClient>) { return m_write_notifier; }
@@ -142,6 +149,10 @@ private:
     void attach_read_stream();
     void set_up_internal_stream_data(DataReceived on_data_available);
     void defer_teardown();
+    void account_body_delivery(size_t byte_count);
+    [[nodiscard]] bool has_undelivered_file_backed_bytes() const;
+    void deliver_file_backed_payload();
+    void schedule_file_backed_delivery();
 
     WeakPtr<RequestClient> m_client;
     u64 m_request_id { 0 };
@@ -172,7 +183,7 @@ private:
         Optional<String> reason_phrase;
         Optional<Core::ImmutableBytes> javascript_bytecode;
         Optional<u64> javascript_bytecode_cache_vary_key;
-        CameFromCache came_from_cache { CameFromCache::No };
+        CacheState cache_state { CacheState::NotCached };
         Optional<Core::ImmutableBytes> payload;
     };
 
@@ -193,6 +204,8 @@ private:
         Function<void()> on_finish {};
         bool user_finish_called { false };
         Optional<Core::ImmutableBytes> file_backed_payload;
+        size_t file_backed_delivery_offset { 0 };
+        bool file_backed_delivery_scheduled { false };
         Optional<Core::ImmutableBytes> cached_payload;
         Optional<size_t> body_delivery_remaining_byte_count;
     };
@@ -202,6 +215,7 @@ private:
     Optional<NetworkError> m_body_delivery_error;
     bool m_body_delivery_paused { false };
     bool m_finished { false };
+    ByteString m_http_version;
 };
 
 }

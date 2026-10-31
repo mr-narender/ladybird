@@ -7,29 +7,25 @@
 //! What the main thread keeps alongside a visual context tree while it builds and updates it: the
 //! document's state, and the records the builder keeps per box.
 
-use std::rc::Rc;
-
 use super::{ClipNodeIndex, ContextRef, EffectNodeIndex, SpatialNodeIndex, VisualContextTree, dirty, scroll_state};
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::host::FfiCompositorAnimationPublishOutcome;
 use crate::painting::visual_animation::VisualAnimation;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct VisualContextState {
-    pub tree: Option<Rc<VisualContextTree>>,
-    pub paintables_with_mask_nodes: Vec<crate::layout::node_data::NodeSlotId>,
+    pub tree: Option<std::sync::Arc<VisualContextTree>>,
     pub scroll_state: scroll_state::ScrollState,
     pub needs_to_refresh_scroll_state: bool,
-    pub build_count: u64,
     pub dirty_boxes: dirty::VisualContextDirtySet,
-    pub incremental_update_count: u64,
     pub last_tree_inputs: Option<crate::painting::host::FfiVisualContextTreeInputs>,
-    pub last_full_build_reason: dirty::VisualContextGlobalRebuildReason,
+    // The viewport's overflow when the tree was last updated. A sticky box finds its scrolling box by it.
+    pub last_viewport_overflow: (u8, u8),
     pub quarantined_slots_are_releasable: bool,
-    // The compositor animations the effects of the current update pass have published so far.
-    pub pending_compositor_animations: Vec<VisualAnimation>,
     // The list the tree was last given, which the next pass compares its own against.
     pub published_compositor_animations: Vec<VisualAnimation>,
+    // The boxes whose transform node has an offset path, which depends on the geometry of their containing block.
+    pub offset_path_boxes: crate::fast_hash::FastSet<NodeSlotId>,
 }
 
 impl VisualContextState {
@@ -48,7 +44,7 @@ impl VisualContextState {
         }
         self.quarantined_slots_are_releasable = false;
         if let Some(tree) = self.tree.as_mut() {
-            Rc::make_mut(tree).release_quarantined_slots_after_recording();
+            std::sync::Arc::make_mut(tree).release_quarantined_slots_after_recording();
         }
     }
 }
@@ -58,14 +54,8 @@ impl VisualContextState {
 /// changed for the counters the document keeps.
 pub fn publish_compositor_animations(
     visual_context: &mut VisualContextState,
-    publish_pending: bool,
+    animations: Vec<VisualAnimation>,
 ) -> FfiCompositorAnimationPublishOutcome {
-    let animations = if publish_pending {
-        std::mem::take(&mut visual_context.pending_compositor_animations)
-    } else {
-        visual_context.pending_compositor_animations.clear();
-        Vec::new()
-    };
     let Some(tree) = visual_context.tree.as_mut() else {
         return FfiCompositorAnimationPublishOutcome::default();
     };
@@ -91,7 +81,7 @@ pub fn publish_compositor_animations(
         }
     }
     *published = animations.clone();
-    Rc::make_mut(tree).set_visual_animations(animations);
+    std::sync::Arc::make_mut(tree).set_visual_animations(animations);
     FfiCompositorAnimationPublishOutcome {
         published: true,
         parameters_changed,
@@ -166,9 +156,6 @@ pub(crate) struct DescendantVisualContexts {
 pub(crate) struct PaintableVisualContextRecord {
     pub inherited_input: DescendantVisualContexts,
     pub output_for_descendants: DescendantVisualContexts,
-    pub node_handles: BoxVisualContextNodeHandles,
-    pub has_mask_nodes: bool,
-    pub may_be_root_element: bool,
     pub owns_geometry_dependent_nodes: bool,
     pub subtree_may_own_geometry_dependent_nodes: bool,
     pub stacking_context: crate::painting::stacking_context::StackingContextFacts,

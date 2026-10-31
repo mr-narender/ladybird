@@ -4,44 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include "HeadlessTest.h"
 #include <AK/LexicalPath.h>
-#include <AK/Random.h>
-#include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/Utf16String.h>
-#include <LibCore/Directory.h>
-#include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
-#include <LibCore/StandardPaths.h>
-#include <LibFileSystem/FileSystem.h>
 #include <LibGfx/SystemTheme.h>
-#include <LibMain/Main.h>
+#include <LibTest/TestCase.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
 #include <LibWebCommon/Page/InputEvent.h>
-#include <LibWebView/Application.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/Utilities.h>
 
 namespace {
-
-class TestApplication : public WebView::Application {
-    WEB_VIEW_APPLICATION(TestApplication)
-
-public:
-    explicit TestApplication(Optional<ByteString> ladybird_binary_path)
-        : WebView::Application(move(ladybird_binary_path))
-    {
-    }
-
-    virtual void create_platform_options(WebView::BrowserOptions& browser_options, WebView::RequestServerOptions&, WebView::WebContentOptions& web_content_options) override
-    {
-        browser_options.headless_mode = WebView::HeadlessMode::Test;
-        browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
-        web_content_options.is_test_mode = WebView::IsTestMode::Yes;
-    }
-
-    virtual bool should_coordinate_browser_process() const override { return false; }
-};
 
 void move_mouse_to(WebView::ViewImplementation& view, Web::DevicePixelPoint position)
 {
@@ -73,23 +48,14 @@ void leave_view(WebView::ViewImplementation& view)
 // outgoing document, and a keyboard navigation moves no pointer. But only the handler that reported the hover ends it
 // that way: an iframe navigating underneath a hover in its parent document leaves the parent's link reported.
 
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
+TEST_CASE(link_hover_status)
 {
-    auto test_config_directory = ByteString::formatted("{}/Ladybird-TestLinkHoverStatus-{}", Core::StandardPaths::tempfile_directory(), generate_random_uuid());
-    TRY(Core::Directory::create(test_config_directory, Core::Directory::CreateDirectories::Yes));
-    auto cleanup_test_config_directory = ScopeGuard([&] {
-        MUST(FileSystem::remove(test_config_directory, FileSystem::RecursionMode::Allowed));
-    });
-    MUST(Core::Environment::set("XDG_CONFIG_HOME"sv, test_config_directory, Core::Environment::Overwrite::Yes));
+    Test::HeadlessTestEnvironment environment { "TestLinkHoverStatus"sv };
 
-#if defined(LADYBIRD_BINARY_PATH)
-    auto app = TRY(TestApplication::create(arguments, LADYBIRD_BINARY_PATH));
-#else
-    auto app = TRY(TestApplication::create(arguments, OptionalNone {}));
-#endif
+    auto app = TRY_OR_FAIL(environment.create_application());
 
     auto theme_path = LexicalPath::join(WebView::s_ladybird_resource_root, "themes"sv, "Default.ini"sv);
-    auto theme = TRY(Gfx::load_system_theme(theme_path.string()));
+    auto theme = TRY_OR_FAIL(Gfx::load_system_theme(theme_path.string()));
 
     auto view = WebView::HeadlessWebView::create(move(theme), { 800, 600 });
 
@@ -197,22 +163,21 @@ function navigate_frame() { frame.srcdoc = frame.getAttribute("srcdoc") + "<!-- 
     VERIFY(!hovered_url.has_value());
     Core::EventLoop::current().spin_until([&]() { return last_title == "frame load 2"sv; });
 
-    // The new iframe document's link is a fresh target. Then over to the page's own link: The page's handler reports
-    // it, while the iframe's handler still holds the iframe's link as the pointer's position, never having heard that
-    // the pointer left the iframe.
+    // The new iframe document's link is a fresh target. Then over to the page's own link: The iframe's handler hears
+    // that the pointer left the iframe, and reports the unhover, before the page's handler reports the page's link.
     move_mouse_to(*view, { 20, 20 });
     Core::EventLoop::current().spin_until([&]() { return hovers_reported >= 7; });
     VERIFY(hovered_url->serialize() == "https://example.com/in-iframe"sv);
     move_mouse_to(*view, { 600, 20 });
     Core::EventLoop::current().spin_until([&]() { return hovers_reported >= 8; });
     VERIFY(hovered_url->serialize() == "https://example.com/parent"sv);
-    VERIFY(unhovers_reported == 6);
+    VERIFY(unhovers_reported == 7);
 
     // So, the iframe navigating now must leave the page's link reported: The hover the client shows is the page's
     // handler's to end, not the iframe's. The iframe's load comes after any unhover its replacement would have sent.
     view->run_javascript("navigate_frame()"_string);
     Core::EventLoop::current().spin_until([&]() { return last_title == "frame load 3"sv; });
-    VERIFY(unhovers_reported == 6);
+    VERIFY(unhovers_reported == 7);
     VERIFY(hovered_url->serialize() == "https://example.com/parent"sv);
 
     // Back over the iframe's link, then a new top-level document: The iframe dies along with the old one, and its
@@ -221,10 +186,9 @@ function navigate_frame() { frame.srcdoc = frame.getAttribute("srcdoc") + "<!-- 
     Core::EventLoop::current().spin_until([&]() { return hovers_reported >= 9; });
     VERIFY(hovered_url->serialize() == "https://example.com/in-iframe"sv);
     view->load_html("<!DOCTYPE html><p>Plain</p>"sv);
-    Core::EventLoop::current().spin_until([&]() { return unhovers_reported >= 7; });
+    Core::EventLoop::current().spin_until([&]() { return unhovers_reported >= 8; });
     VERIFY(!hovered_url.has_value());
     VERIFY(hovers_reported == 9);
 
     outln("PASS: a MouseLeave or a document replacement ends the link hover, and the next move over the link reports it again");
-    return 0;
 }

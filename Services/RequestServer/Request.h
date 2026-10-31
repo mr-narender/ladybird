@@ -11,6 +11,7 @@
 #include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/Function.h>
+#include <AK/HashTable.h>
 #include <AK/MemoryStream.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
@@ -19,15 +20,20 @@
 #include <LibDNS/Resolver.h>
 #include <LibHTTP/Cache/CacheMode.h>
 #include <LibHTTP/Cache/CacheRequest.h>
+#include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Cookie/IncludeCredentials.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibHTTP/HeaderList.h>
+#include <LibHTTP/NetworkIsolationKey.h>
+#include <LibHTTP/Proxy.h>
 #include <LibIPC/File.h>
+#include <LibRequests/ExportedRequest.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibRequests/RequestTransferLease.h>
 #include <LibURL/URL.h>
+#include <RequestServer/AlternativeServices.h>
 #include <RequestServer/CacheLevel.h>
 #include <RequestServer/Forward.h>
 #include <RequestServer/RequestPipe.h>
@@ -46,6 +52,7 @@ public:
     static NonnullOwnPtr<Request> fetch(
         u64 request_id,
         Optional<HTTP::DiskCache&> disk_cache,
+        Optional<HTTP::NetworkIsolationKey> network_isolation_key,
         HTTP::CacheMode cache_mode,
         ConnectionFromClient& client,
         void* curl_multi,
@@ -55,7 +62,6 @@ public:
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
-        Optional<ByteString> alt_svc_cache_path,
         Optional<Requests::RequestTransferLeaseKey>,
         Optional<u32> address_selection_hint,
         bool notify_on_cache_miss);
@@ -71,6 +77,7 @@ public:
     static NonnullOwnPtr<Request> revalidate(
         u64 request_id,
         Optional<HTTP::DiskCache&> disk_cache,
+        HTTP::NetworkIsolationKey network_isolation_key,
         ConnectionFromClient& client,
         void* curl_multi,
         Resolver& resolver,
@@ -78,10 +85,21 @@ public:
         ByteString method,
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
-        HTTP::Cookie::IncludeCredentials include_credentials,
-        Optional<ByteString> alt_svc_cache_path);
+        HTTP::Cookie::IncludeCredentials include_credentials);
+
+    static NonnullOwnPtr<Request> import(
+        u64 request_id,
+        Optional<HTTP::DiskCache&> disk_cache,
+        ConnectionFromClient& client,
+        Resolver& resolver,
+        Requests::ExportedRequest,
+        Optional<Requests::RequestTransferLeaseKey>);
 
     virtual ~Request() override;
+
+    // Hands the response over to another RequestServer. The body keeps flowing into the response pipe, and the outcome
+    // goes to the status socket instead of to a client. The exporting client is told the request was transferred.
+    ErrorOr<Requests::ExportedRequest> export_response();
 
     static void set_performance_monitor_enabled(bool);
     static Vector<Requests::NetworkUsage> take_network_usage();
@@ -98,10 +116,10 @@ public:
     ErrorOr<void> transfer_to_client(ConnectionFromClient&, u64 request_id, Optional<Requests::RequestTransferLeaseKey>);
     void release_transfer_lease() { m_transfer_lease.clear(); }
 
-    // The disk cache defers a request while another request holds its cache entry open. These bound how long that other
-    // request may go without making progress before the deferred one goes to the network without the cache — and how
-    // long a background revalidation may go without receiving any data before it's abandoned. Tests shorten both.
+    // Bound cache-holder inactivity, background-revalidation inactivity and total cache wait. Tests shorten these
+    // limits.
     static void set_wait_for_cache_timeout(AK::Duration);
+    static void set_maximum_wait_for_cache(AK::Duration);
     static void set_revalidation_stall_timeout(AK::Duration);
 
     virtual void notify_request_unblocked(Badge<HTTP::DiskCache>) override;
@@ -110,6 +128,7 @@ public:
     bool notify_stored_response_cookies_and_hsts_policy(Badge<ControlConnectionFromClient>, u64 store_request_id);
     void notify_fetch_complete(Badge<ConnectionFromClient>, int result_code);
     void retry_after_aia(Badge<ConnectionFromClient>);
+    AIACollector* aia_collector() const { return m_aia_collector.ptr(); }
 
 private:
     struct TransferredBodyFile {
@@ -135,6 +154,7 @@ private:
         Connect,           // Issue a network request to connect to the URL.
         Fetch,             // Issue a network request to fetch the URL.
         WaitForAIA,        // Wait for an AIA intermediate-certificate fetch to complete, then retry the fetch.
+        ReadImported,      // Read the response another RequestServer is streaming to this one.
         Complete,          // Finalize the request with the client.
         Error,             // Any error occured during the request's lifetime.
     };
@@ -150,6 +170,8 @@ private:
             return "WaitForCache"sv;
         case State::WaitForAIA:
             return "WaitForAIA"sv;
+        case State::ReadImported:
+            return "ReadImported"sv;
         case State::FailedCacheOnly:
             return "FailedCacheOnly"sv;
         case State::ServeSubstitution:
@@ -174,6 +196,7 @@ private:
         u64 request_id,
         RequestType type,
         Optional<HTTP::DiskCache&> disk_cache,
+        Optional<HTTP::NetworkIsolationKey> network_isolation_key,
         HTTP::CacheMode cache_mode,
         ConnectionFromClient& client,
         void* curl_multi,
@@ -183,7 +206,6 @@ private:
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
-        Optional<ByteString> alt_svc_cache_path,
         Optional<Requests::RequestTransferLeaseKey> = {});
 
     Request(
@@ -203,9 +225,21 @@ private:
     void handle_failed_cache_only_state();
     void handle_serve_substitution_state();
     void handle_dns_lookup_state();
+    void continue_after_dns_lookup();
+    StringView connect_host() const;
+    void reset_for_retry();
+    void update_alternative_services();
+    bool should_retry_without_alternative_service(int curl_result_code) const;
+    u16 connect_port() const;
     void handle_retrieve_cookie_state();
     void handle_connect_state();
     void handle_fetch_state();
+    void handle_read_imported_state();
+    void read_imported_body();
+    void read_imported_status();
+    void complete_import_if_finished();
+    void write_export_result();
+    void importer_went_away();
     void handle_complete_state();
     void handle_error_state();
 
@@ -239,6 +273,8 @@ private:
 
     bool is_cache_only_request() const;
 
+    bool delivers_response_to_client() const { return m_type == RequestType::Fetch || m_type == RequestType::Imported; }
+
     u32 acquire_status_code() const;
     Requests::RequestTimingInfo acquire_timing_info() const;
 
@@ -267,7 +303,18 @@ private:
     RequestType m_type { RequestType::Fetch };
     State m_state { State::Init };
 
+    Optional<HTTP::Cookie::PartitionContext> cookie_partition_context() const
+    {
+        if (!m_network_isolation_key.has_value())
+            return {};
+        return HTTP::Cookie::PartitionContext { m_network_isolation_key->top_level_site, m_network_isolation_key->has_cross_site_ancestor };
+    }
+
+    Optional<HTTP::NetworkIsolationKey> m_network_isolation_key;
+
+    // A request without a disk cache partition never uses the disk cache.
     Optional<HTTP::DiskCache&> m_disk_cache;
+    Optional<Utf16String> m_disk_cache_partition;
     HTTP::CacheMode m_cache_mode { HTTP::CacheMode::Default };
     ConnectionFromClient* m_client { nullptr };
 
@@ -281,10 +328,12 @@ private:
     bool m_notify_on_cache_miss { false };
     bool m_informed_client_requires_network { false };
     bool m_informed_client_request_started { false };
+    bool m_cache_entry_was_revalidated { false };
     Optional<int> m_curl_result_code;
 
     NonnullRefPtr<Resolver> m_resolver;
     RefPtr<DNS::LookupResult const> m_dns_result;
+    Optional<HTTP::Proxy> m_proxy;
     CacheLevel m_connect_cache_level { CacheLevel::ResolveOnly };
 
     URL::URL m_url;
@@ -297,17 +346,22 @@ private:
 
     HTTP::Cookie::IncludeCredentials m_include_credentials { HTTP::Cookie::IncludeCredentials::Yes };
 
-    Optional<ByteString> m_alt_svc_cache_path;
+    Optional<AlternativeService> m_alternative_service;
+    bool m_alternative_services_disabled { false };
 
     Optional<u32> m_status_code;
     Optional<String> m_reason_phrase;
+    ByteString m_http_version;
 
     NonnullRefPtr<HTTP::HeaderList> m_response_headers;
+    // Cache the first spelling of each header name to avoid repeated HeaderList searches.
+    HashTable<ByteString, CaseInsensitiveASCIIStringTraits> m_received_response_header_names;
     bool m_sent_response_headers_to_client { false };
 
     AllocatingMemoryStream m_response_buffer;
     RefPtr<Core::Notifier> m_client_writer_notifier;
     RefPtr<Core::Timer> m_wait_for_cache_timer;
+    Optional<MonotonicTime> m_started_waiting_for_cache_at;
     Optional<RequestPipe> m_client_request_pipe;
     Optional<TransferredBodyFile> m_transferred_body_file;
     size_t m_bytes_transferred_to_client { 0 };
@@ -319,6 +373,41 @@ private:
 
     Optional<Requests::RequestTransferLeaseKey> m_transfer_lease;
     RefPtr<ConnectionFromClient> m_network_connection_keep_alive;
+
+    struct Export {
+        AK_MAKE_NONCOPYABLE(Export);
+
+    public:
+        Export() = default;
+        Export(Export&&);
+        Export& operator=(Export&&);
+        ~Export();
+        void close();
+
+        int status_fd { -1 };
+        RefPtr<Core::Notifier> notifier;
+    };
+    Optional<Export> m_export;
+
+    struct Import {
+        AK_MAKE_NONCOPYABLE(Import);
+
+    public:
+        Import() = default;
+        Import(Import&&);
+        Import& operator=(Import&&);
+        ~Import();
+
+        int body_fd { -1 };
+        int status_fd { -1 };
+        RefPtr<Core::Notifier> body_notifier;
+        RefPtr<Core::Notifier> status_notifier;
+        bool body_ended { false };
+        ByteBuffer status_bytes;
+        Optional<Requests::RequestTimingInfo> timing_info;
+        Optional<Requests::NetworkError> network_error;
+    };
+    Optional<Import> m_import;
 };
 
 }

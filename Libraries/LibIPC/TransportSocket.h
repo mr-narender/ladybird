@@ -31,9 +31,15 @@
 
 namespace IPC {
 
+// NB: One sendmsg() carries a limited number of descriptors, and at least one byte with them. A message with more
+//     descriptors sends the rest ahead of it, in Attachments frames that have no payload. A Payload frame's fd_count
+//     counts every descriptor of its message, including those that arrived ahead of it. A SharedMemoryPayload frame
+//     has no bytes, and its shared memory is the last descriptor of its message.
 struct SocketMessageHeader {
     enum class Type : u8 {
         Payload = 0,
+        Attachments = 1,
+        SharedMemoryPayload = 2,
     };
     Type type { Type::Payload };
     u32 payload_size { 0 };
@@ -78,6 +84,7 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static constexpr socklen_t SOCKET_BUFFER_SIZE = 128 * KiB;
+    static constexpr size_t MAX_INLINE_PAYLOAD_SIZE = 64 * KiB;
 
     struct Paired {
         NonnullOwnPtr<TransportSocket> local;
@@ -85,6 +92,7 @@ public:
     };
     static ErrorOr<Paired> create_paired();
     static ErrorOr<NonnullOwnPtr<TransportSocket>> from_socket(NonnullOwnPtr<Core::LocalSocket> socket);
+    static ErrorOr<NonnullOwnPtr<TransportSocket>> adopt_fd(int fd);
 
     explicit TransportSocket(NonnullOwnPtr<Core::LocalSocket> socket);
     ~TransportSocket();

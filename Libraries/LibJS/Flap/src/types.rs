@@ -86,6 +86,8 @@ macro_rules! define_named_types {
 pub(crate) enum RegisterClass {
     GeneralPurpose,
     FloatingPoint,
+    /// 128-bit vectors, which live in the floating-point registers.
+    Vector,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -144,6 +146,10 @@ define_interpreter_registers! {
     HeapRegionBase => "heap_region_base", Type::U64, false;
     StackPointer => "sp", Type::U64, true;
     FramePointer => "fp", Type::U64, true;
+    InstructionPointer => "ip", Type::U64, true;
+    SideTablePointer => "stp", Type::U64, true;
+    ValueStackPointer => "vsp", Type::U64, true;
+    MemoryBase => "memory_base", Type::U64, true;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -209,9 +215,13 @@ define_named_types! {
         DeclarativeEnvironmentRareData => "DeclarativeEnvironmentRareData", Some(8), true;
         GlobalVariableCache => "GlobalVariableCache", Some(8), true;
         PropertyLookupCache => "PropertyLookupCache", Some(8), true;
+        KeyedPropertyLookupCacheEntry => "KeyedPropertyLookupCacheEntry", Some(8), true;
+        ExecutableFeedback => "ExecutableFeedback", Some(8), true;
+        CallFeedback => "CallFeedback", Some(8), true;
+        KeyedFeedback => "KeyedFeedback", Some(8), true;
         ObjectPropertyIteratorCacheData => "ObjectPropertyIteratorCacheData", Some(8), true;
         ObjectPropertyIteratorCache => "ObjectPropertyIteratorCache", Some(8), true;
-        PrototypeChainValidity => "PrototypeChainValidity", Some(8), true;
+        WatchpointSet => "WatchpointSet", Some(8), true;
         Accessor => "Accessor", Some(8), true;
         FunctionObject => "FunctionObject", Some(8), true;
         ECMAScriptFunctionObject => "ECMAScriptFunctionObject", Some(8), true;
@@ -224,12 +234,17 @@ define_named_types! {
     source {
         F64 => "f64", Some(8), false;
         F32 => "f32", Some(4), false;
+        V128 => "v128", Some(16), false;
         InlineInt32 => "Int32", Some(4), false;
         SlotIndex => "SlotIndex", Some(4), false;
         BytecodeOffset => "BytecodeOffset", Some(4), false;
         EnvironmentCoordinateCacheIndex => "EnvironmentCoordinateCacheIndex", Some(4), false;
         GlobalVariableCacheIndex => "GlobalVariableCacheIndex", Some(4), false;
         PropertyLookupCacheIndex => "PropertyLookupCacheIndex", Some(4), false;
+        ArithFeedbackIndex => "ArithFeedbackIndex", Some(2), false;
+        ValueFeedbackIndex => "ValueFeedbackIndex", Some(2), false;
+        CallFeedbackIndex => "CallFeedbackIndex", Some(2), false;
+        KeyedFeedbackIndex => "KeyedFeedbackIndex", Some(2), false;
         Operand => "Operand", Some(8), false;
         Memory => "Memory", None, false;
         IntegerCondition => "IntegerCondition", None, false;
@@ -274,6 +289,7 @@ impl Type {
     pub(crate) fn register_class(&self) -> Option<RegisterClass> {
         match self {
             Type::F32 | Type::F64 => Some(RegisterClass::FloatingPoint),
+            Type::V128 => Some(RegisterClass::Vector),
             _ if self.width().is_some() => Some(RegisterClass::GeneralPurpose),
             _ => None,
         }
@@ -320,7 +336,7 @@ impl Type {
                 width: MemoryWidth::Float,
                 signed: false,
             },
-            Type::F64 => return None,
+            Type::F64 | Type::V128 => return None,
             _ if self.width() == Some(8) => MemoryOperation::Load {
                 width: MemoryWidth::DoubleWord,
                 signed: false,

@@ -5,7 +5,7 @@
  */
 
 use crate::css::css_tokenizer::TokenizerInput;
-use crate::css::ffi_support::FfiUtf16View;
+use crate::css::ffi_support::{FfiUtf16View, OwnedBox};
 use crate::css::parser::query_parser::{
     FfiMediaEnvironment, FfiQueryHandle, MediaEnvironment, VisitQuerySerialization, invalid_media_query,
     media_query_handle, parse_media_query_list, resolve_query_feature,
@@ -36,6 +36,10 @@ pub struct MediaList {
 }
 
 impl MediaList {
+    pub(crate) fn data(&self) -> Arc<MediaListData> {
+        self.owner.borrow().data.clone()
+    }
+
     pub(crate) fn share(&self) -> Self {
         Self::new(self.owner.borrow().data.clone())
     }
@@ -100,38 +104,36 @@ pub extern "C" fn rust_media_list_create() -> *mut MediaList {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_retain(list: &MediaList) -> *mut MediaList {
+pub extern "C" fn rust_media_list_retain(list: &MediaList) -> *mut MediaList {
     Box::into_raw(Box::new(list.clone()))
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_share(list: &MediaList) -> *mut MediaList {
+pub extern "C" fn rust_media_list_share(list: &MediaList) -> *mut MediaList {
     Box::into_raw(Box::new(list.share()))
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_free(list: *mut MediaList) {
-    if !list.is_null() {
-        drop(unsafe { Box::from_raw(list) });
-    }
+pub extern "C" fn rust_media_list_free(list: OwnedBox<MediaList>) {
+    drop(list);
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_length(list: &MediaList) -> usize {
+pub extern "C" fn rust_media_list_length(list: &MediaList) -> usize {
     list.owner.borrow().data.queries.len()
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_set_text(list: &MediaList, source: FfiUtf16View) {
-    list.set_text(unsafe { source.units() }.unwrap());
+pub extern "C" fn rust_media_list_set_text(list: &MediaList, source: FfiUtf16View) {
+    list.set_text(source.units().unwrap());
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_append(list: &MediaList, source: FfiUtf16View) -> bool {
+pub extern "C" fn rust_media_list_append(list: &MediaList, source: FfiUtf16View) -> bool {
     // https://drafts.csswg.org/cssom/#dom-medialist-appendmedium
     // 1. Let m be the result of parsing the given value.
     // 2. If m is null, then return.
-    let Some(query) = parse_medium(unsafe { source.units() }.unwrap()) else {
+    let Some(query) = parse_medium(source.units().unwrap()) else {
         return false;
     };
     // 3. If comparing m with any of the media queries in the collection of media queries returns true, then return.
@@ -154,11 +156,11 @@ pub enum MediaListDeleteResult {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_delete(list: &MediaList, source: FfiUtf16View) -> MediaListDeleteResult {
+pub extern "C" fn rust_media_list_delete(list: &MediaList, source: FfiUtf16View) -> MediaListDeleteResult {
     // https://drafts.csswg.org/cssom/#dom-medialist-deletemedium
     // 1. Let m be the result of parsing the given value.
     // 2. If m is null, then return.
-    let Some(query) = parse_medium(unsafe { source.units() }.unwrap()) else {
+    let Some(query) = parse_medium(source.units().unwrap()) else {
         return MediaListDeleteResult::Invalid;
     };
     // 3. Remove any media query from the collection of media queries for which comparing the media query with m
@@ -214,16 +216,16 @@ pub unsafe extern "C" fn rust_media_list_item(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_matches(list: &MediaList) -> bool {
+pub extern "C" fn rust_media_list_matches(list: &MediaList) -> bool {
     list.matches()
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_item_matches(list: &MediaList, index: usize) -> bool {
+pub extern "C" fn rust_media_list_item_matches(list: &MediaList, index: usize) -> bool {
     list.owner.borrow().matches[index]
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_media_list_evaluate(list: &MediaList, environment: FfiMediaEnvironment) -> bool {
-    list.evaluate(unsafe { environment.borrow() })
+pub extern "C" fn rust_media_list_evaluate(list: &MediaList, environment: FfiMediaEnvironment<'_>) -> bool {
+    list.evaluate(environment.borrow())
 }

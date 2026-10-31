@@ -29,23 +29,66 @@ pub enum ParameterMode {
     InOut,
 }
 
-#[derive(Debug, Clone)]
+/// One `Value` of an operation's `Op::Values` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlowPathField {
+    /// The name of the bytecode field that holds the operand.
+    pub name: String,
     pub instruction_offset: usize,
     pub value_offset: usize,
     pub mode: ParameterMode,
     pub optional: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+/// The variable-length input operands that end an `Op::Values` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowPathArray {
+    /// The name of the bytecode field that holds the operands.
+    pub name: String,
+    pub instruction_offset: usize,
+    /// The instruction offset of the operand count.
+    pub count_offset: usize,
+    pub optional: bool,
+}
+
+/// The `Op::Values` record of an operation: one `Value` per scalar operand
+/// field in declaration order, followed by the variable-length operands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlowPathLayout {
     pub fields: Vec<SlowPathField>,
-    /// Instruction offsets of the operand array and its count, and whether its entries are optional.
-    pub array: Option<(usize, usize, bool)>,
+    pub array: Option<SlowPathArray>,
+}
+
+/// How an operation's slow path receives its operands and returns its outputs.
+///
+/// The control word every form returns is the runtime's `SlowPathControl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlowPathAbi {
+    /// `AsmSlowPathResult f(VM*, u32 pc, Op::Name const*, Value inputs...)`,
+    /// where `AsmSlowPathResult` is `{ i64 control; u64 value; }` returned in
+    /// two registers and `value` is the encoded output, if there is one.
+    Scalar,
+    /// `i64 f(VM*, u32 pc, Op::Name const*, Op::Name::Values& outputs, Value inputs...)`,
+    /// where the inputs include input/output operands.
+    Mixed,
+    /// `i64 f(VM*, u32 pc, Op::Name const*, Op::Name::Values& values)`.
+    Record,
 }
 
 impl SlowPathLayout {
-    pub fn uses_scalar_arguments(&self) -> bool {
+    /// Classify the slow-path call of this operation, where `record_form_only`
+    /// is set for targets that always pass a record, which is what Windows does.
+    pub fn abi(&self, record_form_only: bool) -> SlowPathAbi {
+        if record_form_only || self.array.is_some() {
+            SlowPathAbi::Record
+        } else if self.uses_scalar_arguments() {
+            SlowPathAbi::Scalar
+        } else {
+            SlowPathAbi::Mixed
+        }
+    }
+
+    fn uses_scalar_arguments(&self) -> bool {
         self.array.is_none()
             && self
                 .fields
@@ -71,13 +114,15 @@ impl SlowPathLayout {
             let optional = field.ty == "Optional<Operand>";
             if field.is_array {
                 let array = op.array.as_ref().expect("operand array has a count");
-                layout.array = Some((
-                    array.offset,
-                    op.layout.field_offsets[&op.fields[array.count_field_index].name],
+                layout.array = Some(SlowPathArray {
+                    name: field.name.clone(),
+                    instruction_offset: array.offset,
+                    count_offset: op.layout.field_offsets[&op.fields[array.count_field_index].name],
                     optional,
-                ));
+                });
             } else {
                 layout.fields.push(SlowPathField {
+                    name: field.name.clone(),
                     instruction_offset: op.layout.field_offsets[&field.name],
                     value_offset: layout.fields.len() * 8,
                     mode: field.mode,
@@ -156,9 +201,26 @@ pub struct InstructionDefinition {
     pub name: String,
     pub parent: String,
     pub fields: Vec<Field>,
+    /// The instruction ends a basic block (`@terminator`).
     pub is_terminator: bool,
+    /// The terminator may also continue with the next instruction, like a
+    /// conditional jump with a single target (`@fallthrough`).
+    pub falls_through: bool,
     pub layout: OpLayout,
     pub array: Option<ArrayLayout>,
+    /// The opcode a raw-bytes instruction dispatches on (`@opcode(...)`).
+    pub opcode: Option<RawOpcode>,
+    /// The handler runs every opcode that has no handler of its own
+    /// (`@fallback`).
+    pub is_fallback: bool,
+}
+
+/// The encoding of a raw-bytes instruction: a primary opcode byte, or a prefix
+/// byte followed by a LEB128 sub-opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RawOpcode {
+    Primary(u8),
+    Prefixed { prefix: u8, sub_opcode: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +249,7 @@ impl From<(&'static str, usize, usize, &'static str)> for FieldType {
     }
 }
 
-/// The alignment of the C++ Instruction base class (`alignas(void*)`).
+/// The alignment of every instruction in the bytecode, that of a pointer.
 /// On 64-bit: alignof(void*) = 8.
 pub const STRUCT_ALIGN: usize = 8;
 
@@ -298,21 +360,72 @@ pub fn parse_flap_metadata(source_name: &str, content: &str) -> Result<Vec<Instr
         let close = find_matching_parenthesis(declaration, open)
             .ok_or_else(|| ParseError::new(source_name, start_line, 1, "unterminated handler parameter list"))?;
         let fields = parse_handler_fields(source_name, start_line, &declaration[open + 1..close])?;
+        let has_annotation = |annotation: &str| {
+            declaration[close + 1..]
+                .split_whitespace()
+                .any(|token| token == annotation)
+        };
+        let opcode = parse_opcode_annotation(&declaration[close + 1..])
+            .map_err(|message| ParseError::new(source_name, start_line, 1, format!("handler '{name}': {message}")))?;
         let mut op = InstructionDefinition {
             name: name.to_string(),
             parent: "Instruction".to_string(),
             fields,
-            is_terminator: declaration[close + 1..]
-                .split_whitespace()
-                .any(|token| token == "@terminator"),
+            is_terminator: has_annotation("@terminator"),
+            falls_through: has_annotation("@fallthrough"),
             layout: OpLayout::default(),
             array: None,
+            opcode,
+            is_fallback: has_annotation("@fallback"),
         };
+        if op.falls_through && !op.is_terminator {
+            return Err(ParseError::new(
+                source_name,
+                start_line,
+                1,
+                format!("handler '{name}' is @fallthrough but not @terminator"),
+            ));
+        }
         validate_op(&mut op).map_err(|message| ParseError::new(source_name, start_line, 1, message))?;
         ops.push(op);
         line_index += 1;
     }
     Ok(ops)
+}
+
+fn parse_integer_literal(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if let Some(hexadecimal) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        return u64::from_str_radix(hexadecimal, 16).ok();
+    }
+    text.parse().ok()
+}
+
+/// Parse the `@opcode(primary)` or `@opcode(prefix, sub_opcode)` annotation
+/// that follows a handler's parameter list, if it has one.
+fn parse_opcode_annotation(annotations: &str) -> Result<Option<RawOpcode>, String> {
+    let Some(start) = annotations.find("@opcode") else {
+        return Ok(None);
+    };
+    let rest = annotations[start + "@opcode".len()..].trim_start();
+    let arguments = rest
+        .strip_prefix('(')
+        .and_then(|rest| rest.split_once(')'))
+        .map(|(arguments, _)| arguments)
+        .ok_or("malformed @opcode annotation")?;
+    let values = arguments
+        .split(',')
+        .map(|argument| parse_integer_literal(argument).ok_or(format!("invalid opcode '{}'", argument.trim())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let byte = |value: u64| u8::try_from(value).map_err(|_| format!("opcode {value:#x} does not fit in a byte"));
+    match values.as_slice() {
+        [primary] => Ok(Some(RawOpcode::Primary(byte(*primary)?))),
+        [prefix, sub_opcode] => Ok(Some(RawOpcode::Prefixed {
+            prefix: byte(*prefix)?,
+            sub_opcode: u32::try_from(*sub_opcode).map_err(|_| format!("sub-opcode {sub_opcode:#x} is too large"))?,
+        })),
+        _ => Err("@opcode takes an opcode byte, or a prefix byte and a sub-opcode".to_string()),
+    }
 }
 
 fn find_matching_parenthesis(source: &str, open: usize) -> Option<usize> {
@@ -582,7 +695,6 @@ fn try_field_type_info(ty: &str) -> Option<FieldType> {
             "PropertyKeyTableIndex" => ("PropertyKeyTableIndex", 4, 4, "u32_newtype"),
             "StringTableIndex" => ("StringTableIndex", 4, 4, "u32_newtype"),
             "Optional<StringTableIndex>" => ("Option<StringTableIndex>", 4, 4, "optional_u32_newtype"),
-            "RegexTableIndex" => ("RegexTableIndex", 4, 4, "u32_newtype"),
             "EnvironmentCoordinate" => ("EnvironmentCoordinate", 4, 8, "env_coord"),
             "Builtin" => ("u8", 1, 1, "u8"),
             "Completion::Type" => ("u32", 4, 4, "u32"),
@@ -599,6 +711,9 @@ fn try_field_type_info(ty: &str) -> Option<FieldType> {
             | "ObjectShapeCacheIndex"
             | "ObjectPropertyIteratorCacheIndex"
             | "EnvironmentShapeCacheIndex" => ("u32", 4, 4, "u32"),
+            "ArithFeedbackIndex" | "CallFeedbackIndex" | "KeyedFeedbackIndex" | "ValueFeedbackIndex" => {
+                ("u16", 2, 2, "u16")
+            }
             _ => return None,
         }
         .into(),
@@ -733,7 +848,7 @@ fn validate_op(op: &mut InstructionDefinition) -> Result<(), String> {
 /// Computed layout info for a single opcode.
 #[derive(Debug, Clone, Default)]
 pub struct OpLayout {
-    /// Byte offset of each field within the C++ struct (keyed by field name, e.g. "m_dst").
+    /// Byte offset of each field within the instruction (keyed by field name, e.g. "m_dst").
     pub field_offsets: HashMap<String, usize>,
     /// Total encoded size (for fixed-size instructions), or None for variable-length.
     pub size: Option<usize>,
@@ -812,8 +927,11 @@ pub fn derive_specialized_instructions(
             parent: "Instruction".to_string(),
             fields,
             is_terminator: ops_by_name[last_component.bytecode.as_str()].is_terminator,
+            falls_through: ops_by_name[last_component.bytecode.as_str()].falls_through,
             layout: OpLayout::default(),
             array: None,
+            opcode: None,
+            is_fallback: false,
         };
         validate_op(&mut definition)?;
         derived.push(SpecializedInstruction { definition, components });
@@ -835,7 +953,7 @@ mod tests {
         .unwrap();
         let op = &ops[0];
         let layout = SlowPathLayout::new(op);
-        assert!(!layout.uses_scalar_arguments());
+        assert_eq!(layout.abi(false), SlowPathAbi::Record);
         assert_eq!(layout.fields.len(), 3);
         for (index, (name, mode)) in [
             ("m_dst", ParameterMode::Out),
@@ -845,6 +963,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
+            assert_eq!(layout.fields[index].name, name);
             assert_eq!(layout.fields[index].instruction_offset, op.layout.field_offsets[name]);
             assert_eq!(layout.fields[index].value_offset, index * 8);
             assert_eq!(layout.fields[index].mode, mode);
@@ -852,11 +971,12 @@ mod tests {
         }
         assert_eq!(
             layout.array,
-            Some((
-                op.array.as_ref().unwrap().offset,
-                op.layout.field_offsets["m_argument_count"],
-                false
-            ))
+            Some(SlowPathArray {
+                name: "m_arguments".to_string(),
+                instruction_offset: op.array.as_ref().unwrap().offset,
+                count_offset: op.layout.field_offsets["m_argument_count"],
+                optional: false,
+            })
         );
     }
 
@@ -866,10 +986,13 @@ mod tests {
             "test.flap",
             "handler Get(dst: out Operand, base: Operand, property: Optional<Operand>) { dispatch_next; }\nhandler Update(dst: out Operand, src: inout Operand) { dispatch_next; }\nhandler OptionalOutput(dst: out Optional<Operand>) { dispatch_next; }\nhandler Put(base: Operand, value: Operand) { dispatch_next; }",
         ).unwrap();
-        assert!(SlowPathLayout::new(&ops[0]).uses_scalar_arguments());
-        assert!(!SlowPathLayout::new(&ops[1]).uses_scalar_arguments());
-        assert!(!SlowPathLayout::new(&ops[2]).uses_scalar_arguments());
-        assert!(SlowPathLayout::new(&ops[3]).uses_scalar_arguments());
+        assert_eq!(SlowPathLayout::new(&ops[0]).abi(false), SlowPathAbi::Scalar);
+        assert_eq!(SlowPathLayout::new(&ops[1]).abi(false), SlowPathAbi::Mixed);
+        assert_eq!(SlowPathLayout::new(&ops[2]).abi(false), SlowPathAbi::Mixed);
+        assert_eq!(SlowPathLayout::new(&ops[3]).abi(false), SlowPathAbi::Scalar);
+        for op in &ops {
+            assert_eq!(SlowPathLayout::new(op).abi(true), SlowPathAbi::Record);
+        }
     }
 
     #[test]
@@ -889,8 +1012,21 @@ handler Call(
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].name, "Call");
         assert!(ops[0].is_terminator);
+        assert!(!ops[0].falls_through);
         assert_eq!(ops[0].fields.len(), 3);
         assert!(ops[0].fields[2].is_array);
+    }
+
+    #[test]
+    fn parses_fallthrough_terminators() {
+        let ops = parse_flap_metadata(
+            "test.flap",
+            "handler JumpTrue(condition: in Operand, target: BytecodeOffset) @terminator @fallthrough { dispatch_next; }\nhandler Jump(target: BytecodeOffset) @terminator = jump(target);",
+        )
+        .unwrap();
+
+        assert!(ops[0].is_terminator && ops[0].falls_through);
+        assert!(ops[1].is_terminator && !ops[1].falls_through);
     }
 
     #[test]
@@ -1114,6 +1250,10 @@ specialize Copy() + Convert() + Use();
             (
                 "handler Fields(value: u32, value: u64) { dispatch_next; }\n",
                 "duplicate handler parameter 'value'",
+            ),
+            (
+                "handler Fall() @fallthrough { dispatch_next; }\n",
+                "is @fallthrough but not @terminator",
             ),
             (
                 "handler Array(values: Value[]) { dispatch_next; }\n",

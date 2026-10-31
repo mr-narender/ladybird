@@ -21,15 +21,14 @@ use crate::visual_animation::{
     MAXIMUM_TRANSFORM_OPERATION_VALUE_COUNT, VisualAnimation, VisualAnimationKeyframe,
     VisualAnimationTransformOperation, VisualAnimationValue,
 };
-use libgfx_rust::path::OwnedPath;
+use libgfx_rust::path::Path;
 use libgfx_rust::{
     Color, ColorFilterType, CompositingAndBlendingOperator, CornerRadii, CornerRadius, FloatMatrix4x4, FloatPoint,
     FloatRect, FloatSize, IntRect, MaskKind, WindingRule,
 };
-use std::rc::Rc;
 
 const SERIALIZED_TREE_MAGIC: u32 = 0x5443_5641;
-const SERIALIZED_TREE_FORMAT: u32 = 6;
+const SERIALIZED_TREE_FORMAT: u32 = 9;
 
 const SPATIAL_KIND_SCROLL: u8 = 0;
 const SPATIAL_KIND_STICKY: u8 = 1;
@@ -321,6 +320,7 @@ fn write_spatial_data(writer: &mut TreeByteWriter, data: &SpatialData) {
             writer.size(sticky.scrollport_size);
             writer.float_rect(sticky.containing_block_region);
             writer.bool(sticky.needs_parent_offset_adjustment);
+            writer.u32(sticky.non_scrolling_scroll_container.index);
             writer.optional_f32(sticky.inset_top);
             writer.optional_f32(sticky.inset_right);
             writer.optional_f32(sticky.inset_bottom);
@@ -375,6 +375,7 @@ fn read_spatial_data(reader: &mut TreeByteReader<'_>) -> Option<SpatialData> {
                 scrollport_size: reader.size()?,
                 containing_block_region: reader.float_rect()?,
                 needs_parent_offset_adjustment: reader.bool()?,
+                non_scrolling_scroll_container: NodeSlotId { index: reader.u32()? },
                 inset_top: reader.optional_f32()?,
                 inset_right: reader.optional_f32()?,
                 inset_bottom: reader.optional_f32()?,
@@ -440,9 +441,9 @@ fn read_clip_data(reader: &mut TreeByteReader<'_>) -> Option<ClipNodeData> {
         CLIP_KIND_PATH => {
             let bounding_rect = reader.int_rect()?;
             let fill_rule = reader.winding_rule()?;
-            let path = OwnedPath::from_serialized_bytes(reader.length_prefixed_bytes()?);
+            let path = Path::from_serialized_bytes(reader.length_prefixed_bytes()?);
             ClipNodeData::Path(ClipPathData {
-                path: Rc::new(path),
+                path: std::sync::Arc::new(path),
                 bounding_rect,
                 fill_rule,
             })
@@ -466,12 +467,14 @@ fn write_effect_data(writer: &mut TreeByteWriter, data: &EffectNodeData) {
                 writer.corner_radii(backdrop_filter.corner_radii);
                 writer.length_prefixed_bytes(&backdrop_filter.filter);
             }
+            writer.bool(effects.isolation);
         }
         EffectNodeData::Mask(mask) => {
             writer.u8(EFFECT_KIND_MASK);
             writer.int_rect(mask.rect);
             writer.i32(mask.kind as i32);
             writer.u8(mask.origin as u8);
+            writer.bool(mask.masks_backdrop);
         }
         EffectNodeData::BackgroundColorAnimation => writer.u8(EFFECT_KIND_BACKGROUND_COLOR_ANIMATION),
         EffectNodeData::Dead => writer.u8(EFFECT_KIND_DEAD),
@@ -489,15 +492,16 @@ fn read_effect_data(reader: &mut TreeByteReader<'_>) -> Option<EffectNodeData> {
                 Some(BackdropFilterData {
                     region: reader.int_rect()?,
                     corner_radii: reader.corner_radii()?,
-                    filter: Rc::new(reader.length_prefixed_bytes()?.to_vec()),
+                    filter: std::sync::Arc::new(reader.length_prefixed_bytes()?.to_vec()),
                 })
             } else {
                 None
             };
             EffectNodeData::Effects(EffectsData {
+                isolation: reader.bool()?,
                 opacity,
                 blend_mode,
-                filter: has_filter.then(|| Rc::new(filter_bytes.to_vec())),
+                filter: has_filter.then(|| std::sync::Arc::new(filter_bytes.to_vec())),
                 backdrop_filter,
             })
         }
@@ -505,6 +509,7 @@ fn read_effect_data(reader: &mut TreeByteReader<'_>) -> Option<EffectNodeData> {
             rect: reader.int_rect()?,
             kind: reader.mask_kind()?,
             origin: reader.mask_layer_origin()?,
+            masks_backdrop: reader.bool()?,
         }),
         EFFECT_KIND_BACKGROUND_COLOR_ANIMATION => EffectNodeData::BackgroundColorAnimation,
         EFFECT_KIND_DEAD => EffectNodeData::Dead,
@@ -988,6 +993,7 @@ mod tests {
                 },
                 containing_block_region: FloatRect::new(0.0, 0.0, 800.0, 2000.0),
                 needs_parent_offset_adjustment: true,
+                non_scrolling_scroll_container: NodeSlotId::INVALID,
                 inset_top: Some(0.0),
                 inset_right: None,
                 inset_bottom: Some(2.5),
@@ -1013,6 +1019,7 @@ mod tests {
                 },
                 containing_block_region: FloatRect::new(0.0, 100.0, 800.0, 50.0),
                 needs_parent_offset_adjustment: false,
+                non_scrolling_scroll_container: NodeSlotId { index: 7 },
                 inset_top: None,
                 inset_right: Some(1.0),
                 inset_bottom: None,
@@ -1075,7 +1082,7 @@ mod tests {
         );
         let clip_path = tree.append_clip(
             ClipNodeData::Path(ClipPathData {
-                path: Rc::new(OwnedPath::from_serialized_bytes(&[])),
+                path: std::sync::Arc::new(Path::from_serialized_bytes(&[])),
                 bounding_rect: IntRect::new(5, 6, 7, 8),
                 fill_rule: WindingRule::EvenOdd,
             }),
@@ -1084,6 +1091,7 @@ mod tests {
         );
         let root_effect = tree.append_effect(
             EffectNodeData::Effects(EffectsData {
+                isolation: true,
                 opacity: 1.0,
                 blend_mode: CompositingAndBlendingOperator::Normal,
                 filter: None,
@@ -1095,11 +1103,12 @@ mod tests {
         );
         let effects = tree.append_effect(
             EffectNodeData::Effects(EffectsData {
+                isolation: false,
                 opacity: 0.25,
                 blend_mode: CompositingAndBlendingOperator::PlusLighter,
-                filter: Some(Rc::new(vec![1, 2, 3, 4])),
+                filter: Some(std::sync::Arc::new(vec![1, 2, 3, 4])),
                 backdrop_filter: Some(BackdropFilterData {
-                    filter: Rc::new(vec![5, 6, 7]),
+                    filter: std::sync::Arc::new(vec![5, 6, 7]),
                     region: IntRect::new(9, 10, 11, 12),
                     corner_radii: CornerRadii {
                         top_left: CornerRadius {
@@ -1119,6 +1128,7 @@ mod tests {
                 rect: IntRect::new(1, 2, 3, 4),
                 kind: MaskKind::Luminance,
                 origin: MaskLayerOrigin::SvgClip,
+                masks_backdrop: true,
             }),
             effects,
             sorting_root,
@@ -1274,7 +1284,8 @@ mod tests {
     fn effect_data_matches(a: &EffectNodeData, b: &EffectNodeData) -> bool {
         match (a, b) {
             (EffectNodeData::Effects(a), EffectNodeData::Effects(b)) => {
-                a.opacity == b.opacity
+                a.isolation == b.isolation
+                    && a.opacity == b.opacity
                     && a.blend_mode == b.blend_mode
                     && a.filter == b.filter
                     && a.backdrop_filter == b.backdrop_filter
@@ -1430,6 +1441,7 @@ mod tests {
         );
         let stale_effect = tree.append_effect(
             EffectNodeData::Effects(EffectsData {
+                isolation: false,
                 opacity: 0.5,
                 blend_mode: CompositingAndBlendingOperator::Normal,
                 filter: None,
@@ -1521,6 +1533,7 @@ mod tests {
 
         let effects = || {
             EffectNodeData::Effects(EffectsData {
+                isolation: false,
                 opacity: 1.0,
                 blend_mode: CompositingAndBlendingOperator::Normal,
                 filter: None,
@@ -1664,6 +1677,7 @@ mod tests {
         );
         tree.append_effect(
             EffectNodeData::Effects(EffectsData {
+                isolation: false,
                 opacity: 1.0,
                 blend_mode: CompositingAndBlendingOperator::Normal,
                 filter: None,
@@ -1675,6 +1689,7 @@ mod tests {
         );
         tree.append_effect(
             EffectNodeData::Effects(EffectsData {
+                isolation: false,
                 opacity: 0.5,
                 blend_mode: CompositingAndBlendingOperator::Normal,
                 filter: None,
@@ -1870,6 +1885,7 @@ mod tests {
             rect: IntRect::new(0, 0, 1, 1),
             kind: MaskKind::Alpha,
             origin: MaskLayerOrigin::CssMaskLayers,
+            masks_backdrop: false,
         });
         isolation_effect_is_a_mask.root_isolation_effect = Some(EffectNodeIndex(0));
         rejected(&isolation_effect_is_a_mask);

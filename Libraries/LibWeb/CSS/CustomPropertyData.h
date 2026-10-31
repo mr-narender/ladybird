@@ -6,24 +6,26 @@
 
 #pragma once
 
+#include <AK/AtomicRefCounted.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
-#include <AK/RefCounted.h>
 #include <AK/RefPtr.h>
 #include <AK/Types.h>
+#include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleEngineIdentifiers.h>
 #include <LibWeb/CSS/StyleProperty.h>
 #include <LibWeb/Export.h>
-#include <LibWebCommon/CSS/PreferredColorScheme.h>
 
 namespace Web::CSS {
 
 // Chain of custom property maps with structural sharing.
 // Each node stores only the properties declared directly on its element,
 // with a parent pointer to the inherited chain.
-class WEB_API CustomPropertyData : public RefCounted<CustomPropertyData> {
+// NB: The style engine references the data elements hold, and may take and give up those references on whichever
+//     thread it runs on.
+class WEB_API CustomPropertyData : public AtomicRefCounted<CustomPropertyData> {
 public:
     static NonnullRefPtr<CustomPropertyData> create(
         OrderedHashMap<Utf16FlyString, StyleProperty> own_values,
@@ -32,16 +34,21 @@ public:
         void const* prebuilt_rust_store = nullptr,
         // The identity the style engine minted for an environment it resolved; zero mints one here.
         u64 identity = 0);
+    // The values `owner`'s animations sample over `base`, the environment it holds beneath them.
     static NonnullRefPtr<CustomPropertyData> create_animation_overlay(
         OrderedHashMap<Utf16FlyString, StyleProperty> animated_values,
-        RefPtr<CustomPropertyData const> base);
+        RefPtr<CustomPropertyData const> base, DOM::AbstractElement const& owner);
     ~CustomPropertyData();
 
-    bool is_animation_overlay() const { return m_is_animation_overlay; }
+    // Whether these are the values the element's own animations sample. A child that inherits all of its parent's
+    // custom properties holds its parent's overlay itself, which is not an animation of the child's.
+    bool is_animation_overlay_for(DOM::AbstractElement const&) const;
 
     StyleProperty const* get(Utf16FlyString const& name) const;
     RefPtr<CustomPropertyData const> inheritable_impl(RefPtr<CustomPropertyData const> inheritable_parent, AK::Function<Optional<CustomPropertyRegistration const&>(Utf16FlyString const&)> get_custom_property_registration) const;
-    RefPtr<CustomPropertyData const> inheritable(DOM::Document const&) const;
+    RefPtr<CustomPropertyData const> inheritable(Layout::BegunRead const& read, DOM::Document const&) const;
+    // What a child inherits of an environment the style engine resolved, which the engine decided.
+    void set_inheritable(DOM::Document const&, RefPtr<CustomPropertyData const>) const;
 
     OrderedHashMap<Utf16FlyString, StyleProperty> const& own_values() const { return m_own_values; }
 
@@ -96,31 +103,6 @@ public:
     u64 identity() const { return m_identity; }
     void const* rust_store() const { return m_rust_store; }
 
-    // What this environment resolves to, which is a function of the values it holds and of the
-    // environment it inherits from - both of which are its identity. Two elements handed the same
-    // environment therefore resolve the same one, and the second of them does no work at all.
-    [[nodiscard]] RefPtr<CustomPropertyData const> cached_resolution(FlatPtr document_identity, size_t registration_generation, PreferredColorScheme color_scheme) const
-    {
-        if (m_cached_resolution_document_identity != document_identity || m_cached_resolution_generation != registration_generation)
-            return {};
-        // Registered color values can resolve light-dark() against the element's color scheme,
-        // so a resolution only answers for elements sharing the scheme it was made under.
-        if (m_cached_resolution_color_scheme != color_scheme)
-            return {};
-        if (m_cached_resolution_is_self)
-            return RefPtr<CustomPropertyData const>(this);
-        return m_cached_resolution;
-    }
-    void set_cached_resolution(FlatPtr document_identity, size_t registration_generation, PreferredColorScheme color_scheme, RefPtr<CustomPropertyData const> resolution) const
-    {
-        m_cached_resolution_document_identity = document_identity;
-        m_cached_resolution_generation = registration_generation;
-        m_cached_resolution_color_scheme = color_scheme;
-        // Storing a reference to itself would keep the object alive forever, so that case is a flag.
-        m_cached_resolution_is_self = resolution.ptr() == this;
-        m_cached_resolution = m_cached_resolution_is_self ? nullptr : move(resolution);
-    }
-
 private:
     CustomPropertyData(OrderedHashMap<Utf16FlyString, StyleProperty> own_values, RefPtr<CustomPropertyData const> parent, RefPtr<CustomPropertyData const> inheritance_parent, u8 ancestor_count, size_t declared_count, void const* prebuilt_rust_store, u64 identity = 0);
 
@@ -136,13 +118,16 @@ private:
     mutable size_t m_cached_inheritable_generation { NumericLimits<size_t>::max() };
     mutable RefPtr<CustomPropertyData const> m_cached_inheritable_data;
     mutable bool m_cached_inheritable_is_self { false };
-    mutable FlatPtr m_cached_resolution_document_identity { NumericLimits<FlatPtr>::max() };
-    mutable size_t m_cached_resolution_generation { NumericLimits<size_t>::max() };
-    mutable PreferredColorScheme m_cached_resolution_color_scheme { PreferredColorScheme::Auto };
-    mutable RefPtr<CustomPropertyData const> m_cached_resolution;
-    mutable bool m_cached_resolution_is_self { false };
-    bool m_is_animation_overlay { false };
+    struct AnimationOwner {
+        UniqueNodeID element;
+        Optional<PseudoElement> pseudo_element;
+    };
+    Optional<AnimationOwner> m_animation_owner;
     void const* m_rust_store { nullptr };
 };
 
 }
+
+// The style engine keeps the custom-property environment each element holds, with a reference of its own.
+extern "C" WEB_API void web_css_custom_property_data_reference(void const*);
+extern "C" WEB_API void web_css_custom_property_data_unreference(void const*);

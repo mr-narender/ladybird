@@ -8,14 +8,14 @@ use super::scroll_state::{NO_SCROLL_STATE_SLOT, ScrollState, ScrollStateSlot};
 use super::{SpatialData, StickyData, VisualContextTree};
 use crate::css::computed_value_types::ComputedLengthPercentageOrAuto;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixelSize, CssPixels};
+use crate::layout::geometry::{Frame, Side};
 use crate::layout::node_data::NodeSlotId;
-use crate::painting::chrome_geometry;
-use crate::painting::host::{FfiVisualContextHostCallbacks, FfiVisualContextTreeInputs};
+use crate::painting::host::FfiVisualContextTreeInputs;
+use crate::painting::paintable_data::FfiPixelBox;
 use crate::painting::paintable_geometry;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::style_queries;
 use libgfx_rust::{FloatPoint, FloatRect, FloatSize};
-use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResolvedStickyInsets {
@@ -25,23 +25,18 @@ pub(crate) struct ResolvedStickyInsets {
     pub left: Option<CssPixels>,
 }
 
-fn nearest_wheel_scrollable_ancestor_along_containing_blocks(
+// https://drafts.csswg.org/css-position/#stickypos-insets
+// The sticky view rectangle comes from the nearest scroll container, even one without scrollable overflow.
+fn nearest_scroll_container_along_containing_blocks(
     layout_arena: &impl PaintableRowsRead,
     slot: NodeSlotId,
-    tree_inputs: &FfiVisualContextTreeInputs,
 ) -> Option<NodeSlotId> {
     let mut block = layout_arena.paintable_data(slot).containing_block;
     while !block.is_invalid() {
         if !layout_arena.paintable_row_is_populated(block) {
             return None;
         }
-        let axes = chrome_geometry::wheel_scrollable_axes(
-            layout_arena,
-            block,
-            tree_inputs.viewport_wheel_overflow_x,
-            tree_inputs.viewport_wheel_overflow_y,
-        );
-        if axes.horizontal || axes.vertical {
+        if style_queries::is_scroll_container(layout_arena, block) {
             return Some(block);
         }
         if style_queries::is_fixed_position(layout_arena, block) {
@@ -53,28 +48,106 @@ fn nearest_wheel_scrollable_ancestor_along_containing_blocks(
 }
 
 // https://drafts.csswg.org/css-position/#insets
-pub(crate) fn resolve_sticky_insets_in_css_pixels(
+fn resolve_sticky_insets_in_css_pixels(
     layout_arena: &impl PaintableRowsRead,
     slot: NodeSlotId,
-    tree_inputs: &FfiVisualContextTreeInputs,
+    scrollport_size: CssPixelSize,
+    border_box_size: CssPixelSize,
 ) -> ResolvedStickyInsets {
     let Some(style) = layout_arena.node_style_if_live(slot) else {
         return ResolvedStickyInsets::default();
     };
-    let scrollport_size = nearest_wheel_scrollable_ancestor_along_containing_blocks(layout_arena, slot, tree_inputs)
-        .map_or(CssPixelSize::default(), |scroller| {
-            paintable_geometry::absolute_rect(layout_arena, scroller).size()
-        });
     let resolve_side = |side: &ComputedLengthPercentageOrAuto, scrollport_extent: CssPixels| {
         (!side.is_auto()).then(|| side.to_px(scrollport_extent))
     };
     let inset = &style.surround().inset;
-    ResolvedStickyInsets {
-        top: resolve_side(&inset.top, scrollport_size.height),
-        right: resolve_side(&inset.right, scrollport_size.width),
-        bottom: resolve_side(&inset.bottom, scrollport_size.height),
-        left: resolve_side(&inset.left, scrollport_size.width),
+    let mut insets = [
+        resolve_side(&inset.top, scrollport_size.height),
+        resolve_side(&inset.right, scrollport_size.width),
+        resolve_side(&inset.bottom, scrollport_size.height),
+        resolve_side(&inset.left, scrollport_size.width),
+    ];
+    // https://drafts.csswg.org/css-position-3/#sticky-pos
+    // If this results in a sticky view rectangle size in any axis less than the size of the border box of the sticky
+    // box in that axis, then the effective end-edge inset in the affected axis is reduced (possibly becoming negative)
+    // to bring the sticky view rectangle’s size up to the size of the border box in that axis (where end is
+    // interpreted relative to the writing mode of the containing block).
+    let containing_block = layout_arena.paintable_data(slot).containing_block;
+    let containing_style = layout_arena.node_style_if_live(containing_block);
+    let frame = containing_style.map_or(Frame::PHYSICAL, |style| Frame::of(style.writing_mode()));
+    let inline_end = if containing_style.is_some_and(|style| style.direction() == crate::css::css_enums::direction::RTL)
+    {
+        Side::Left
+    } else {
+        Side::Right
+    };
+    for end in [frame.physical_side(inline_end), frame.physical_side(Side::Bottom)] {
+        let (first, second, extent, border_extent) = match end {
+            Side::Top | Side::Bottom => (Side::Top, Side::Bottom, scrollport_size.height, border_box_size.height),
+            Side::Left | Side::Right => (Side::Left, Side::Right, scrollport_size.width, border_box_size.width),
+        };
+        let view_extent =
+            extent - insets[first as usize].unwrap_or_default() - insets[second as usize].unwrap_or_default();
+        if let Some(inset) = insets[end as usize].as_mut() {
+            *inset -= (border_extent - view_extent).max(CssPixels::default());
+        }
     }
+    ResolvedStickyInsets {
+        top: insets[Side::Top as usize],
+        right: insets[Side::Right as usize],
+        bottom: insets[Side::Bottom as usize],
+        left: insets[Side::Left as usize],
+    }
+}
+
+// NB: The computed margins, with auto as zero. The used margins of a block include the space its width leaves free.
+fn computed_margins_in_css_pixels(
+    layout_arena: &impl PaintableRowsRead,
+    slot: NodeSlotId,
+    percentage_basis: CssPixels,
+) -> FfiPixelBox {
+    let Some(style) = layout_arena.node_style_if_live(slot) else {
+        return FfiPixelBox::default();
+    };
+    let resolve = |side: &ComputedLengthPercentageOrAuto| {
+        if side.is_auto() {
+            CssPixels::from_raw(0)
+        } else {
+            side.to_px(percentage_basis)
+        }
+    };
+    let margin = &style.surround().margin;
+    FfiPixelBox {
+        top: resolve(&margin.top),
+        right: resolve(&margin.right),
+        bottom: resolve(&margin.bottom),
+        left: resolve(&margin.left),
+    }
+}
+
+fn deflated(rect: CssPixelRect, edges: FfiPixelBox) -> CssPixelRect {
+    let zero = CssPixels::from_raw(0);
+    CssPixelRect::new(
+        rect.x + edges.left,
+        rect.y + edges.top,
+        (rect.width - edges.left - edges.right).max(zero),
+        (rect.height - edges.top - edges.bottom).max(zero),
+    )
+}
+
+fn is_containing_block_descendant_of(
+    layout_arena: &impl PaintableRowsRead,
+    slot: NodeSlotId,
+    ancestor: NodeSlotId,
+) -> bool {
+    let mut block = layout_arena.paintable_data(slot).containing_block;
+    while !block.is_invalid() && layout_arena.paintable_row_is_populated(block) {
+        if block == ancestor {
+            return true;
+        }
+        block = layout_arena.paintable_data(block).containing_block;
+    }
+    false
 }
 
 // The geometry stays zero while either row has been replaced by a subtree relayout: the pending
@@ -102,27 +175,40 @@ pub(crate) fn compute_sticky_data(
     if scroller_slot == NO_SCROLL_STATE_SLOT {
         return data;
     }
-    let scroller = scroll_state.state_at_slot(scroller_slot).paintable;
+    let mut scroller = scroll_state.state_at_slot(scroller_slot).paintable;
     if !layout_arena.paintable_row_is_populated(paintable) || !layout_arena.paintable_row_is_populated(scroller) {
         return data;
+    }
+
+    // NB: Only scroll containers with scrollable overflow get a scroll node. When the nearest scroll container has
+    //     none, it sits inside the scroller of the scroll node, and its scrollport never moves. The box sticks to
+    //     that scrollport instead.
+    if let Some(scroll_container) = nearest_scroll_container_along_containing_blocks(layout_arena, paintable)
+        && scroll_container != scroller
+        && is_containing_block_descendant_of(layout_arena, scroll_container, scroller)
+    {
+        scroller = scroll_container;
+        data.non_scrolling_scroll_container = scroll_container;
     }
 
     let sticky_border_box_rect = paintable_geometry::absolute_border_box_rect(layout_arena, paintable);
     let containing_block = layout_arena.paintable_data(paintable).containing_block;
     let scroller_rect = paintable_geometry::absolute_rect(layout_arena, scroller);
-    let (containing_block_region, needs_parent_offset_adjustment) = if containing_block == scroller {
-        let size = paintable_geometry::scrollable_overflow_rect(layout_arena, containing_block)
-            .expect("scroll ancestor has scrollable overflow")
-            .size();
-        (
-            CssPixelRect::from_location_and_size(CssPixelPoint::default(), size),
-            false,
-        )
+    // NB: The box moves within the content box of its containing block, less its own margins. For the scroll
+    //     container itself, that is its scrollable overflow rectangle less its padding. This matches other engines.
+    let (containing_block_content_box, needs_parent_offset_adjustment) = if containing_block == scroller {
+        let overflow_rect = paintable_geometry::scrollable_overflow_rect(layout_arena, containing_block)
+            .unwrap_or_else(|| paintable_geometry::absolute_padding_box_rect(layout_arena, containing_block));
+        let padding = paintable_geometry::committed_padding(layout_arena, containing_block);
+        (deflated(overflow_rect, padding), false)
     } else {
-        let region = paintable_geometry::absolute_border_box_rect(layout_arena, containing_block)
-            .translated(-scroller_rect.x, -scroller_rect.y);
-        (region, true)
+        (paintable_geometry::absolute_rect(layout_arena, containing_block), true)
     };
+    let containing_block_width = paintable_geometry::absolute_rect(layout_arena, containing_block).width;
+    let containing_block_region = deflated(
+        containing_block_content_box.translated(-scroller_rect.x, -scroller_rect.y),
+        computed_margins_in_css_pixels(layout_arena, paintable, containing_block_width),
+    );
 
     let scale = device_pixels_per_css_pixel as f32;
     let device_point = |point: CssPixelPoint| FloatPoint {
@@ -134,7 +220,12 @@ pub(crate) fn compute_sticky_data(
         height: size.height.to_float() * scale,
     };
     let device_inset = |inset: Option<CssPixels>| inset.map(|inset| inset.to_float() * scale);
-    let insets = resolve_sticky_insets_in_css_pixels(layout_arena, paintable, tree_inputs);
+    let insets = resolve_sticky_insets_in_css_pixels(
+        layout_arena,
+        paintable,
+        scroller_rect.size(),
+        sticky_border_box_rect.size(),
+    );
     let region_location = device_point(containing_block_region.location());
     let region_size = device_size(containing_block_region.size());
 
@@ -161,7 +252,7 @@ pub(crate) fn compute_sticky_data(
 pub(crate) fn refresh_sticky_constraints(
     layout_arena: &impl PaintableRowsRead,
     scroll_state: &ScrollState,
-    tree: &mut Rc<VisualContextTree>,
+    tree: &mut std::sync::Arc<VisualContextTree>,
     tree_inputs: &FfiVisualContextTreeInputs,
 ) -> bool {
     let mut refreshed_sticky_payloads = Vec::new();
@@ -182,18 +273,14 @@ pub(crate) fn refresh_sticky_constraints(
     if refreshed_sticky_payloads.is_empty() {
         return false;
     }
-    let tree = Rc::make_mut(tree);
+    let tree = std::sync::Arc::make_mut(tree);
     for (node_index, refreshed) in refreshed_sticky_payloads {
         tree.spatial_nodes[node_index.0 as usize].data = SpatialData::Sticky(refreshed);
     }
     true
 }
 
-pub(crate) fn refresh_scroll_state(
-    layout_arena: &impl PaintableRowsRead,
-    callbacks: &FfiVisualContextHostCallbacks,
-    scroll_state: &mut ScrollState,
-) {
+pub(crate) fn refresh_scroll_state(layout_arena: &impl PaintableRowsRead, scroll_state: &mut ScrollState) {
     for slot in 0..scroll_state.slot_count() {
         let state = scroll_state.state_at_slot(slot);
         if state.is_sticky {
@@ -201,8 +288,8 @@ pub(crate) fn refresh_scroll_state(
         }
         let paintable = state.paintable;
         if layout_arena.paintable_row_is_populated(paintable) {
-            let offset: CssPixelPoint = callbacks.scroll_offset(layout_arena.shell_if_live(paintable)).into();
-            scroll_state.state_at_slot_mut(slot).own_offset = CssPixelPoint::new(-offset.x, -offset.y);
+            let offset = layout_arena.row_scroll_offset(paintable);
+            scroll_state.set_own_offset(slot, CssPixelPoint::new(-offset.x, -offset.y));
         }
     }
 }

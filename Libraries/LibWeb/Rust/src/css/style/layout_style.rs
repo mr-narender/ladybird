@@ -19,7 +19,6 @@ use crate::css::css_enums::{
 use crate::css::display::FfiDisplay;
 use crate::css::host_shared::{HostShared, SharedPayload};
 use crate::css::table_group_builder::group_index;
-use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AnonymousStyleKind {
@@ -34,19 +33,35 @@ pub(crate) enum AnonymousStyleKind {
     ButtonContentBox,
     FieldsetContentWrapper,
     InlineStyleWrapper,
+    /// The inline box a writing suggestion's text renders in after the caret.
+    WritingSuggestion,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AnonymousStyleOverrides {
-    pub inline_block_wrapper: bool,
     pub overflow_x: u8,
     pub overflow_y: u8,
+    pub columns_from_parent: bool,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct DerivedStyleRecord {
     pub record: u64,
-    pub payloads: *const c_void,
+    pub payloads: crate::layout::node_data::StylePayloadsRef,
+}
+
+impl DerivedStyleRecord {
+    /// Pins `record` for a layout row and names its group payloads.
+    pub(crate) fn pin(engine: &mut StyleEngine, record: u64) -> Self {
+        engine.pin_layout_style_record(record);
+        let payloads = engine
+            .style_record_payloads(record)
+            .expect("a layout style record is live");
+        Self {
+            record,
+            payloads: crate::layout::node_data::StylePayloadsRef::new(payloads.as_ptr().cast()),
+        }
+    }
 }
 
 trait LayoutStyleGroup: Clone + PartialEq {
@@ -77,6 +92,8 @@ pub(crate) struct LayoutStyle {
     changed: bool,
 }
 
+const _: () = assert!(group_index::COUNT == crate::layout::node_data::STYLE_GROUP_COUNT);
+
 impl Drop for LayoutStyle {
     fn drop(&mut self) {
         for (index, payload) in self.payloads.iter().copied().enumerate() {
@@ -94,7 +111,7 @@ impl Drop for LayoutStyle {
 }
 
 impl LayoutStyle {
-    pub(crate) fn from_record(engine: &StyleEngine, record: u64) -> Self {
+    pub(crate) fn from_record(engine: &super::RetainedState, record: u64) -> Self {
         let view = engine
             .style_record_view(record)
             .expect("layout style record must be live");
@@ -104,7 +121,7 @@ impl LayoutStyle {
             .expect("layout styles have every computed group");
         let mut style = Self {
             payloads,
-            longhand_table: view.longhand_table,
+            longhand_table: HostShared::from_option(view.longhand_table),
             changed: false,
         };
         for (index, payload) in style.payloads.iter().copied().enumerate() {
@@ -177,8 +194,74 @@ impl LayoutStyle {
         );
     }
 
+    /// Draws text in its color at half its alpha, i.e. `color-mix(in srgb, currentColor 50%, transparent)`, which
+    /// reads as a suggestion in light and dark color schemes alike.
+    fn fade_text_color(&mut self) {
+        let fade = |color: u32| (color >> 24).div_ceil(2) << 24 | (color & 0x00ff_ffff);
+        let index = group_index::INHERITED_TEXT;
+        // SAFETY: The clone is uniquely owned and is the inherited text group.
+        let payload = SharedPayload::new(unsafe { clone_group_payload(index, self.payloads[index].as_ptr()) });
+        // SAFETY: As above; the colors are plain values the payload doesn't retain.
+        unsafe {
+            let values = &mut *payload.cast::<InheritedTextValues>().cast_mut();
+            values.color = fade(values.color);
+            values.webkit_text_fill_color = fade(values.webkit_text_fill_color);
+        }
+        release_group_payload(index, std::mem::replace(&mut self.payloads[index], payload).as_ptr());
+        self.changed = true;
+    }
+
     pub(crate) fn is_unchanged(&self) -> bool {
         !self.changed
+    }
+
+    /// The group payloads of this style, for a row's style reads to see in place of its record's, as a record's
+    /// payloads are named. They address the style where it is, so the caller keeps it in place while reads see them.
+    pub(crate) fn payloads_for_style_reads(&self) -> crate::layout::node_data::StylePayloadsRef {
+        crate::layout::node_data::StylePayloadsRef::new(self.payloads.as_ptr().cast())
+    }
+
+    /// Builds the payloads of `groups` again from `table`, a longhand table holding the style's computed values with
+    /// some of them replaced.
+    /// The values `animated_overlay` samples over the table win over it where they do over the style's own table.
+    pub(crate) fn replace_groups_from_table(
+        &mut self,
+        table: &ComputedLonghandTable,
+        animated_overlay: Option<&crate::css::animated_overlay::AnimatedOverlay>,
+        groups: &[usize],
+    ) {
+        for &group in groups {
+            let current = self.payloads[group].as_ptr();
+            // SAFETY: The style holds a reference to its payload of every group.
+            let parent = unsafe { crate::css::computed_values::GroupPayloadRef::new(group, current) };
+            let payload = crate::css::table_group_builder::rebuild_group_from_table_and_overlay(
+                table,
+                animated_overlay,
+                group,
+                parent,
+                0,
+                0,
+                None,
+            )
+            .expect("a group of the accepted @position-try properties builds from a longhand table");
+            if payload == current {
+                release_group_payload(group, payload);
+                continue;
+            }
+            self.changed = true;
+            release_group_payload(
+                group,
+                std::mem::replace(&mut self.payloads[group], SharedPayload::new(payload)).as_ptr(),
+            );
+        }
+    }
+
+    pub(crate) fn position_area(&self) -> Vec<u8> {
+        self.group::<AnchorValues>().position_area.as_slice().to_vec()
+    }
+
+    pub(crate) fn set_position_area(&mut self, codes: Vec<u8>) {
+        self.edit::<AnchorValues>(|values| values.position_area = RetainedPositionAreaList::from_vec(codes));
     }
 
     pub(crate) fn set_display(&mut self, display: FfiDisplay) {
@@ -203,6 +286,13 @@ impl LayoutStyle {
         self.edit::<MiscResetValues>(|values| values.scrollbar_width = width);
     }
 
+    pub(crate) fn set_overscroll_behavior(&mut self, x: u8, y: u8) {
+        self.edit::<MiscResetValues>(|values| {
+            values.overscroll_behavior_x = x;
+            values.overscroll_behavior_y = y;
+        });
+    }
+
     // CSS table wrappers carry positioning and margins, and act as the table's grid item.
     // z-index and vertical-align also follow the wrapper for interoperable painting and
     // inline alignment; clip only applies on the wrapper that receives position.
@@ -224,8 +314,34 @@ impl LayoutStyle {
             target.has_z_index = box_values.has_z_index;
             target.z_index = box_values.z_index;
             target.vertical_align = box_values.vertical_align.clone();
+            target.baseline_source = box_values.baseline_source;
+        });
+        let misc_reset = source.group::<MiscResetValues>();
+        self.edit::<MiscResetValues>(|target| {
+            target.column_span = misc_reset.column_span;
+            target.break_before = misc_reset.break_before;
+            target.break_after = misc_reset.break_after;
+            target.break_inside = misc_reset.break_inside;
         });
         self.copy_table_properties(source);
+    }
+
+    pub(crate) fn copy_column_properties(&mut self, source: &Self) {
+        let box_values = source.group::<BoxValues>();
+        self.edit::<BoxValues>(|target| {
+            target.column_count = box_values.column_count;
+            target.column_count_has_value = box_values.column_count_has_value;
+            target.column_width = box_values.column_width.clone();
+        });
+        let misc_reset = source.group::<MiscResetValues>();
+        self.edit::<MiscResetValues>(|target| {
+            target.column_fill = misc_reset.column_fill;
+            target.column_rule_style = misc_reset.column_rule_style;
+            target.column_rule_width = misc_reset.column_rule_width;
+            target.column_rule_color = misc_reset.column_rule_color;
+        });
+        let alignment = source.group::<AlignmentValues>();
+        self.edit::<AlignmentValues>(|target| target.column_gap = alignment.column_gap.clone());
     }
 
     fn copy_table_properties(&mut self, source: &Self) {
@@ -244,6 +360,8 @@ impl LayoutStyle {
         self.edit::<AlignmentValues>(|target| {
             target.align_self = alignment.align_self;
             target.justify_self = alignment.justify_self;
+            target.align_self_overflow = alignment.align_self_overflow;
+            target.justify_self_overflow = alignment.justify_self_overflow;
             target.order = alignment.order;
         });
         self.edit::<GridValues>(|target| {
@@ -276,6 +394,7 @@ impl LayoutStyle {
             target.has_z_index = initial.has_z_index;
             target.z_index = initial.z_index;
             target.vertical_align = initial.vertical_align.clone();
+            target.baseline_source = initial.baseline_source;
         });
         self.copy_table_properties(&defaults);
     }
@@ -291,19 +410,7 @@ impl LayoutStyle {
         } else {
             Self::inherited(engine, parent)
         };
-        let block_flow = FfiDisplay::outside_and_inside(
-            if overrides.inline_block_wrapper {
-                display_outside::INLINE
-            } else {
-                display_outside::BLOCK
-            },
-            if overrides.inline_block_wrapper {
-                display_inside::FLOW_ROOT
-            } else {
-                display_inside::FLOW
-            },
-            false,
-        );
+        let block_flow = FfiDisplay::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, false);
         match kind {
             AnonymousStyleKind::Wrapper | AnonymousStyleKind::ButtonContentBox => style.set_display(block_flow),
             AnonymousStyleKind::TableRow => style.set_display(FfiDisplay::internal(display_internal::TABLE_ROW)),
@@ -357,11 +464,12 @@ impl LayoutStyle {
                 });
                 style.set_overflow(overrides.overflow_x, overrides.overflow_y);
             }
-            AnonymousStyleKind::InlineStyleWrapper => style.set_display(FfiDisplay::outside_and_inside(
-                display_outside::INLINE,
-                display_inside::FLOW,
-                false,
-            )),
+            AnonymousStyleKind::InlineStyleWrapper | AnonymousStyleKind::WritingSuggestion => style.set_display(
+                FfiDisplay::outside_and_inside(display_outside::INLINE, display_inside::FLOW, false),
+            ),
+        }
+        if kind == AnonymousStyleKind::WritingSuggestion {
+            style.fade_text_color();
         }
         if kind == AnonymousStyleKind::MissingTableCell {
             style.edit::<BoxValues>(|values| {
@@ -371,6 +479,9 @@ impl LayoutStyle {
                     value: ComputedStyleValueHandle::empty(),
                 }
             });
+        }
+        if overrides.columns_from_parent {
+            style.copy_column_properties(&Self::from_record(engine, parent));
         }
         if kind == AnonymousStyleKind::ButtonContentBox {
             style.edit::<SizingValues>(|values| {
@@ -402,30 +513,16 @@ impl LayoutStyle {
             std::ptr::null(),
         )
         .new_style_record;
-        engine.pin_layout_style_record(record);
-        DerivedStyleRecord {
-            record,
-            payloads: engine
-                .style_record_payloads(record)
-                .expect("new layout style must be live")
-                .as_ptr()
-                .cast(),
-        }
+        DerivedStyleRecord::pin(engine, record)
     }
 }
 
 impl StyleEngine {
     pub(crate) fn pin_layout_style_record(&mut self, record: u64) {
         self.pin_style_record(record);
-        self.record_boundary_call(super::record_replay::EventKind::PinStyleRecord, |payload| {
-            payload.write_u64(record);
-        });
     }
 
     pub(crate) fn unpin_layout_style_record(&mut self, record: u64) {
         self.unpin_style_record(record);
-        self.record_boundary_call(super::record_replay::EventKind::UnpinStyleRecord, |payload| {
-            payload.write_u64(record);
-        });
     }
 }

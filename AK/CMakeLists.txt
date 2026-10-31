@@ -4,8 +4,8 @@ set(SOURCES
     ByteString.cpp
     ByteStringImpl.cpp
     CircularBuffer.cpp
-    ConstrainedStream.cpp
     CountingStream.cpp
+    Demangle.cpp
     Error.cpp
     FFIHelpers.cpp
     FlyString.cpp
@@ -76,7 +76,7 @@ else()
 endif()
 configure_file(Backtrace.h.in Backtrace.h @ONLY)
 
-target_link_libraries(AK PRIVATE FastFloat::fast_float fmt::fmt simdutf::simdutf)
+target_link_libraries(AK PRIVATE FastFloat::fast_float simdutf::simdutf zmij::zmij)
 
 set(MIMALLOC_VISIBILITY PRIVATE)
 if (NOT BUILD_SHARED_LIBS)

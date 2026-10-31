@@ -7,12 +7,10 @@
 
 #include <LibGC/Heap.h>
 #include <LibGC/Timer.h>
-#include <LibJS/Runtime/ECMAScriptFunctionObject.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/ObjectEnvironment.h>
 #include <LibJS/Runtime/PromiseConstructor.h>
-#include <LibJS/Runtime/SharedFunctionInstanceData.h>
-#include <LibJS/RustIntegration.h>
+#include <LibJS/ScriptCompilation.h>
 #include <LibWeb/Bindings/Window.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
@@ -60,11 +58,10 @@ static JS::ThrowCompletionOr<JS::Value> execute_a_function_body(HTML::BrowsingCo
         }})~~~",
         body_utf16);
 
-    auto rust_compilation = JS::RustIntegration::compile_dynamic_function(
-        realm.vm(), source_text, Utf16String {}, body_utf16, JS::FunctionKind::Normal);
+    auto compiled_function = JS::CompiledDynamicFunction::compile(realm.vm(), source_text, Utf16String {}, body_utf16, JS::FunctionKind::Normal);
 
     // 4. If body is not parsable as a FunctionBody or if parsing detects an early error, return Completion { [[Type]]: normal, [[Value]]: null, [[Target]]: empty }.
-    if (!rust_compilation.has_value() || rust_compilation->is_error())
+    if (compiled_function.is_error())
         return JS::js_null();
 
     // 6. Prepare to run script with environment settings.
@@ -74,11 +71,7 @@ static JS::ThrowCompletionOr<JS::Value> execute_a_function_body(HTML::BrowsingCo
     HTML::prepare_to_run_callback(environment_settings);
 
     // 8. Let function be the result of calling FunctionCreate.
-    auto function = JS::ECMAScriptFunctionObject::create_from_function_data(
-        realm,
-        rust_compilation->value(),
-        &global_scope,
-        nullptr);
+    auto function = compiled_function.value().instantiate(realm, global_scope, nullptr, realm.vm().get_active_script_or_module());
 
     // 9. Let completion be Function.[[Call]](window, parameters) with function as the this value.
     // NOTE: This is not entirely clear, but I don't think they mean actually passing `function` as
@@ -115,7 +108,7 @@ static void fire_completion_when_resolved(GC::Ref<WebIDL::Promise> promise, GC::
     WebIDL::react_to_promise(promise, reaction_steps, reaction_steps);
 }
 
-void execute_script(HTML::BrowsingContext const& browsing_context, String body, GC::RootVector<JS::Value> arguments, Optional<u64> const& timeout_ms, GC::Ref<OnScriptComplete> on_complete)
+GC::Ref<GC::Timer> execute_script(HTML::BrowsingContext const& browsing_context, String body, GC::RootVector<JS::Value> arguments, Optional<u64> const& timeout_ms, GC::Ref<OnScriptComplete> on_complete)
 {
     auto const* document = browsing_context.active_document();
     auto& realm = document->relevant_settings_object().realm();
@@ -138,8 +131,13 @@ void execute_script(HTML::BrowsingContext const& browsing_context, String body, 
     auto promise = WebIDL::create_promise(realm);
 
     // 8. Run the following substeps in parallel:
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [&realm, &browsing_context, promise, body = move(body), arguments = move(arguments)]() mutable {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [&realm, &browsing_context, promise, body = move(body), captured_arguments = move(arguments)]() mutable {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+
+        // The roots of a function that died stay in place until a collection finalizes it, so take the arguments out of
+        // the function to have them released as soon as this task is done, rather than keeping everything they reach
+        // alive through one more collection.
+        auto arguments = move(captured_arguments);
 
         // 1. Let scriptPromise be the result of promise-calling execute a function body, with arguments body and arguments.
         auto script_promise = promise_call(realm, execute_a_function_body(browsing_context, body, arguments));
@@ -162,10 +160,12 @@ void execute_script(HTML::BrowsingContext const& browsing_context, String body, 
 
     // 9. Wait until promise is resolved, or timer's timeout fired flag is set, whichever occurs first.
     fire_completion_when_resolved(promise, timer, on_complete);
+
+    return timer;
 }
 
 // https://w3c.github.io/webdriver/#execute-async-script
-void execute_async_script(HTML::BrowsingContext const& browsing_context, String body, GC::RootVector<JS::Value> arguments, Optional<u64> const& timeout_ms, GC::Ref<OnScriptComplete> on_complete)
+GC::Ref<GC::Timer> execute_async_script(HTML::BrowsingContext const& browsing_context, String body, GC::RootVector<JS::Value> arguments, Optional<u64> const& timeout_ms, GC::Ref<OnScriptComplete> on_complete)
 {
     auto const* document = browsing_context.active_document();
     auto& realm = document->relevant_settings_object().realm();
@@ -189,8 +189,13 @@ void execute_async_script(HTML::BrowsingContext const& browsing_context, String 
     auto promise = WebIDL::create_promise(realm);
 
     // 8. Run the following substeps in parallel:
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [&vm, &realm, &browsing_context, promise, body = move(body), arguments = move(arguments)]() mutable {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [&vm, &realm, &browsing_context, promise, body = move(body), captured_arguments = move(arguments)]() mutable {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+
+        // The roots of a function that died stay in place until a collection finalizes it, so take the arguments out of
+        // the function to have them released as soon as this task is done, rather than keeping everything they reach
+        // alive through one more collection.
+        auto arguments = move(captured_arguments);
 
         // 1. Let resolvingFunctions be CreateResolvingFunctions(promise).
         auto resolving_functions = as<JS::Promise>(*promise->promise()).create_resolving_functions();
@@ -248,6 +253,8 @@ void execute_async_script(HTML::BrowsingContext const& browsing_context, String 
 
     // 9. Wait until promise is resolved, or timer's timeout fired flag is set, whichever occurs first.
     fire_completion_when_resolved(promise, timer, on_complete);
+
+    return timer;
 }
 
 }

@@ -13,7 +13,7 @@ endif()
 include("Meta/CMake/use_linker.cmake")
 
 if (APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET 14.0)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 14.4)
 endif()
 
 # Pass additional information to vcpkg if we are using it.
@@ -140,7 +140,17 @@ endif()
 if (ENABLE_GUI_TARGETS)
     add_subdirectory(Services)
     add_subdirectory(UI)
+
+    # Android has no Compositor process yet, so it keeps Skia elsewhere.
+    if (NOT ANDROID AND NOT VCPKG_TARGET_ANDROID)
+        include(check_skia_confinement)
+        set(processes_without_skia ${ladybird_helper_processes} ladybird WebDriver)
+        list(REMOVE_ITEM processes_without_skia Compositor)
+        ladybird_check_skia_confinement(${processes_without_skia})
+    endif()
 endif()
+
+include(packaging)
 
 add_custom_target(lint-shell-scripts
     COMMAND "${ladybird_SOURCE_DIR}/Meta/Linters/lint_shell_scripts.sh"

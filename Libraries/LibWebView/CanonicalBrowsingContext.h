@@ -15,6 +15,7 @@
 #include <AK/WeakPtr.h>
 #include <LibURL/Origin.h>
 #include <LibWebCommon/Forward.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebView/CanonicalDocument.h>
 #include <LibWebView/Export.h>
@@ -30,9 +31,9 @@ public:
         NonnullRefPtr<CanonicalDocument> document;
     };
 
-    static BrowsingContextAndDocument create_a_new_browsing_context_and_document(CanonicalDocument const* creator, Optional<Web::HTML::ReplicatedContainerState const&> embedder, CanonicalBrowsingContextGroup&, Optional<Web::HTML::EnvironmentId> environment_id, Optional<URL::Origin> given_origin = {});
-    static BrowsingContextAndDocument create_a_new_top_level_browsing_context_and_document(Optional<URL::Origin> given_origin = {});
-    static BrowsingContextAndDocument create_a_new_auxiliary_browsing_context_and_document(CanonicalNavigable& opener);
+    static BrowsingContextAndDocument create_a_new_browsing_context_and_document(CanonicalDocument const* creator, Optional<Web::HTML::ReplicatedContainerState const&> embedder, CanonicalBrowsingContextGroup&, Web::HTML::CrossProcessId document_id, Optional<Web::HTML::EnvironmentId> environment_id, Optional<URL::Origin> given_origin = {});
+    static BrowsingContextAndDocument create_a_new_top_level_browsing_context_and_document(Web::HTML::CrossProcessId document_id, Optional<URL::Origin> given_origin = {});
+    static BrowsingContextAndDocument create_a_new_auxiliary_browsing_context_and_document(CanonicalNavigable& opener, Web::HTML::CrossProcessId document_id);
 
     ~CanonicalBrowsingContext();
 
@@ -51,11 +52,15 @@ public:
     bool is_auxiliary() const { return m_is_auxiliary; }
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#opener-browsing-context
-    RefPtr<CanonicalBrowsingContext> opener_browsing_context() const { return m_opener_browsing_context; }
+    RefPtr<CanonicalBrowsingContext> opener_browsing_context() const;
     void set_opener_browsing_context(RefPtr<CanonicalBrowsingContext>);
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#virtual-browsing-context-group-id
     u64 virtual_browsing_context_group_id() const { return m_virtual_browsing_context_group_id; }
+
+    // https://html.spec.whatwg.org/multipage/browsers.html#one-permitted-sandboxed-navigator
+    CanonicalBrowsingContext const* the_one_permitted_sandboxed_navigator() const { return m_the_one_permitted_sandboxed_navigator; }
+    void set_the_one_permitted_sandboxed_navigator(CanonicalBrowsingContext const& browsing_context) { m_the_one_permitted_sandboxed_navigator = browsing_context; }
 
     // https://html.spec.whatwg.org/multipage/browsers.html#popup-sandboxing-flag-set
     Web::HTML::SandboxingFlagSet popup_sandboxing_flag_set() const { return m_popup_sandboxing_flag_set; }
@@ -63,6 +68,9 @@ public:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#bcg-remove
     void remove();
+
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#a-browsing-context-is-discarded
+    bool has_been_discarded() const { return m_active_document.is_null(); }
 
     RefPtr<CanonicalBrowsingContextGroup> group() const;
     void set_group(Badge<CanonicalBrowsingContextGroup>, CanonicalBrowsingContextGroup*);
@@ -79,14 +87,14 @@ private:
 
     bool m_is_auxiliary { false };
 
-    // NB: A browsing context keeps its opener browsing context once that is discarded: the opener's window is closed
-    //     then, and still the opener.
     RefPtr<CanonicalBrowsingContext> m_opener_browsing_context;
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#opener-origin-at-creation
     Optional<URL::Origin> m_opener_origin_at_creation;
 
     u64 m_virtual_browsing_context_group_id { 0 };
+
+    RefPtr<CanonicalBrowsingContext const> m_the_one_permitted_sandboxed_navigator;
 
     Web::HTML::SandboxingFlagSet m_popup_sandboxing_flag_set {};
 

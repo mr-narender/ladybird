@@ -1,8 +1,10 @@
 Harness status: OK
 
-Found 62 tests
+Found 65 tests
 
-62 Pass
+65 Pass
+Pass	alignment-baseline presentation attribute supported on a relevant element
+Pass	baseline-shift presentation attribute supported on a relevant element
 Pass	clip-path presentation attribute supported on a relevant element
 Pass	clip-rule presentation attribute supported on a relevant element
 Pass	color presentation attribute supported on a relevant element
@@ -23,6 +25,7 @@ Pass	flood-color presentation attribute supported on a relevant element
 Pass	flood-opacity presentation attribute supported on a relevant element
 Pass	font-family presentation attribute supported on a relevant element
 Pass	font-size presentation attribute supported on a relevant element
+Pass	font-size-adjust presentation attribute supported on a relevant element
 Pass	font-stretch presentation attribute supported on a relevant element
 Pass	font-style presentation attribute supported on a relevant element
 Pass	font-variant presentation attribute supported on a relevant element

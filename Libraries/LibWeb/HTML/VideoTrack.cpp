@@ -15,6 +15,8 @@
 #include <LibWeb/HTML/VideoTrack.h>
 #include <LibWeb/HTML/VideoTrackList.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/MediaSourceExtensions/MediaSource.h>
+#include <LibWeb/MediaSourceExtensions/SourceBuffer.h>
 
 namespace Web::HTML {
 
@@ -40,7 +42,17 @@ VideoTrack::~VideoTrack() = default;
 void VideoTrack::visit_edges(GC::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(m_video_track_list);
+    visitor.visit(m_video_track_lists);
+}
+
+void VideoTrack::add_video_track_list(Badge<VideoTrackList>, VideoTrackList& video_track_list)
+{
+    m_video_track_lists.append(video_track_list);
+}
+
+void VideoTrack::remove_video_track_list(Badge<VideoTrackList>, VideoTrackList& video_track_list)
+{
+    m_video_track_lists.remove_first_matching([&](auto const& list) { return list.ptr() == &video_track_list; });
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#dom-videotrack-selected
@@ -53,13 +65,17 @@ void VideoTrack::set_selected(bool selected)
     // If the track is in a VideoTrackList, then all the other VideoTrack objects in that list must be unselected. (If the track is
     // no longer in a VideoTrackList object, then the track being selected or unselected has no effect beyond changing the value of
     // the attribute on the VideoTrack object.)
-    if (m_video_track_list) {
-        auto previously_unselected_track_is_selected = !m_selected && selected;
-        auto selected_track_was_unselected_without_another_selection = m_selected && !selected;
+    auto previously_unselected_track_is_selected = !m_selected && selected;
+    auto selected_track_was_unselected_without_another_selection = m_selected && !selected;
 
-        for (auto video_track : m_video_track_list->video_tracks()) {
-            if (video_track.ptr() != this)
-                video_track->m_selected = false;
+    GC::Ptr<VideoTrack> previously_selected_track = m_selected ? this : nullptr;
+    for (auto video_track_list : m_video_track_lists) {
+        for (auto video_track : video_track_list->video_tracks()) {
+            if (video_track.ptr() == this)
+                continue;
+            if (video_track->m_selected)
+                previously_selected_track = video_track;
+            video_track->m_selected = false;
         }
 
         // Whenever a track in a VideoTrackList that was previously not selected is selected, and whenever the selected track in a
@@ -67,7 +83,7 @@ void VideoTrack::set_selected(bool selected)
         // task given the media element to fire an event named change at the VideoTrackList object. This task must be queued before
         // the task that fires the resize event, if any.
         if (previously_unselected_track_is_selected || selected_track_was_unselected_without_another_selection) {
-            media_element().queue_a_media_element_task([this, video_track_list = m_video_track_list](HTMLMediaElement&) {
+            media_element().queue_a_media_element_task([this, video_track_list](HTMLMediaElement&) {
                 video_track_list->dispatch_event(create_event_for_element(media_element(), HTML::EventNames::change));
             });
         }
@@ -77,6 +93,18 @@ void VideoTrack::set_selected(bool selected)
 
     // AD-HOC: Inform the element node that we have (un)selected a video track for layout.
     media_element().set_selected_video_track({}, m_selected ? this : nullptr);
+
+    if (auto source_buffer = source_buffer_in_attached_media_source()) {
+        GC::Ptr<MediaSourceExtensions::SourceBuffer> previously_selected_track_source_buffer;
+        if (previously_selected_track) {
+            previously_selected_track_source_buffer = previously_selected_track->source_buffer_in_attached_media_source();
+            VERIFY(previously_selected_track_source_buffer);
+        }
+        GC::Ptr<MediaSourceExtensions::SourceBuffer> newly_selected_track_source_buffer;
+        if (m_selected)
+            newly_selected_track_source_buffer = source_buffer;
+        media_element().attached_media_source()->selected_video_track_changed({}, previously_selected_track_source_buffer, newly_selected_track_source_buffer);
+    }
 }
 
 }

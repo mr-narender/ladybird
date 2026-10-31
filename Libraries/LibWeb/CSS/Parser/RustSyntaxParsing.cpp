@@ -87,6 +87,9 @@ static void report_diagnostics(RustStyleSheetParse const& parse)
         case FfiSyntaxDiagnosticCode::KeyframesInvalidName:
             report_invalid_rule("Invalid keyframes name."_string);
             break;
+        case FfiSyntaxDiagnosticCode::PositionTryInvalidName:
+            report_invalid_rule("Invalid position-try name."_string);
+            break;
         case FfiSyntaxDiagnosticCode::NamespaceMustBeStatement:
             report_invalid_rule("Must be a statement, not a block."_string);
             break;
@@ -104,6 +107,7 @@ static void report_diagnostics(RustStyleSheetParse const& parse)
         case FfiSyntaxDiagnosticCode::FunctionMustBeBlock:
         case FfiSyntaxDiagnosticCode::PageMustBeBlock:
         case FfiSyntaxDiagnosticCode::MarginMustBeBlock:
+        case FfiSyntaxDiagnosticCode::PositionTryMustBeBlock:
             report_invalid_rule("Must be a block, not a statement."_string);
             break;
         case FfiSyntaxDiagnosticCode::SupportsClauseInvalid:
@@ -205,8 +209,7 @@ RustRuleList RustStyleSheetParse::native_rules() const
 Optional<RustRule> Parser::parse_as_css_rule(Utf16View source, bool nested)
 {
     auto context = make_parse_context(ParseContextMode::Syntax);
-    static_assert(sizeof(RuleContext) == sizeof(u8));
-    RustStyleSheetParse parse { rust_parse_css_rule_syntax(ffi_utf16_view(source), reinterpret_cast<u8 const*>(m_rule_context.data()), m_rule_context.size(), nested, &context.context) };
+    RustStyleSheetParse parse { rust_parse_css_rule_syntax(ffi_utf16_view(source), rule_context_bytes(), nested, &context.context) };
     report_diagnostics(parse);
     if (rust_css_syntax_root_count(parse.handle()) != 1)
         return {};
@@ -222,8 +225,7 @@ Optional<RustRule> Parser::parse_as_keyframe_rule(Utf16View source)
     m_rule_context.append(RuleContext::AtKeyframes);
     ScopeGuard guard = [&] { m_rule_context.take_last(); };
     auto context = make_parse_context(ParseContextMode::Syntax);
-    static_assert(sizeof(RuleContext) == sizeof(u8));
-    RustStyleSheetParse parse { rust_parse_css_block_syntax(ffi_utf16_view(source), reinterpret_cast<u8 const*>(m_rule_context.data()), m_rule_context.size(), &context.context, false) };
+    RustStyleSheetParse parse { rust_parse_css_block_syntax(ffi_utf16_view(source), rule_context_bytes(), &context.context, false) };
     report_diagnostics(parse);
     if (rust_css_syntax_root_count(parse.handle()) != 1)
         return {};
@@ -235,11 +237,10 @@ Optional<RustRule> Parser::parse_as_keyframe_rule(Utf16View source)
 
 RustDeclarationBlock Parser::parse_as_property_declaration_block(Utf16View source)
 {
-    static_assert(sizeof(RuleContext) == sizeof(u8));
     auto context = make_parse_context(ParseContextMode::Syntax);
     // https://drafts.csswg.org/cssom/#parse-a-css-declaration-block
     // 1. Let declarations be the returned declarations from invoking parse a block’s contents with string.
-    auto* handle = rust_parse_css_block_syntax(ffi_utf16_view(source), reinterpret_cast<u8 const*>(m_rule_context.data()), m_rule_context.size(), &context.context, false);
+    auto* handle = rust_parse_css_block_syntax(ffi_utf16_view(source), rule_context_bytes(), &context.context, false);
     RustStyleSheetParse parse { handle };
     report_diagnostics(parse);
     rust_css_syntax_visit_declaration_errors(parse.handle(), report_declaration_error);
@@ -269,9 +270,8 @@ RustDescriptorBlock Parser::parse_as_descriptor_declaration_block(Utf16View sour
     m_rule_context.append(context_type);
     ScopeGuard guard = [&] { m_rule_context.take_last(); };
 
-    static_assert(sizeof(RuleContext) == sizeof(u8));
     auto context = make_parse_context(ParseContextMode::Syntax);
-    auto* handle = rust_parse_css_block_syntax(ffi_utf16_view(source), reinterpret_cast<u8 const*>(m_rule_context.data()), m_rule_context.size(), &context.context, false);
+    auto* handle = rust_parse_css_block_syntax(ffi_utf16_view(source), rule_context_bytes(), &context.context, false);
     RustStyleSheetParse parse { handle };
     report_diagnostics(parse);
     rust_css_syntax_visit_declaration_errors(parse.handle(), report_declaration_error);
@@ -280,9 +280,8 @@ RustDescriptorBlock Parser::parse_as_descriptor_declaration_block(Utf16View sour
 
 Vector<DevToolsStyleDeclaration> Parser::parse_as_devtools_property_declaration_block(Utf16View source)
 {
-    static_assert(sizeof(RuleContext) == sizeof(u8));
     auto context = make_parse_context(ParseContextMode::Syntax);
-    RustStyleSheetParse parse { rust_parse_css_block_syntax(ffi_utf16_view(source), reinterpret_cast<u8 const*>(m_rule_context.data()), m_rule_context.size(), &context.context, true) };
+    RustStyleSheetParse parse { rust_parse_css_block_syntax(ffi_utf16_view(source), rule_context_bytes(), &context.context, true) };
     report_diagnostics(parse);
     Vector<DevToolsStyleDeclaration> result;
     rust_css_syntax_visit_root_declarations(parse.handle(), &result, [](void* context, u16 const* values, size_t value_count, FfiSyntaxDeclaration const* declaration_pointer) {

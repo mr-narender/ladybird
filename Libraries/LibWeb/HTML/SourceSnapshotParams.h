@@ -9,6 +9,7 @@
 
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/PolicyContainers.h>
+#include <LibWeb/HTML/Scripting/FetchClient.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 
 namespace Web::HTML {
@@ -19,12 +20,15 @@ struct SourceSnapshotParams : public GC::Cell {
     GC_DECLARE_ALLOCATOR(SourceSnapshotParams);
 
 public:
-    SourceSnapshotParams(bool has_transient_activation, SandboxingFlagSet sandboxing_flags, bool allows_downloading, GC::Ptr<EnvironmentSettingsObject> fetch_client, GC::Ref<PolicyContainer> source_policy_container)
+    SourceSnapshotParams(bool has_transient_activation, SandboxingFlagSet sandboxing_flags, bool allows_downloading, Optional<FetchClient> fetch_client, NonnullRefPtr<PolicyContainer> source_policy_container, bool text_directive_user_activation = false, bool browsing_context_group_has_multiple_contexts = false, bool browsing_context_group_has_remote_contexts = false)
         : has_transient_activation(has_transient_activation)
         , sandboxing_flags(sandboxing_flags)
         , allows_downloading(allows_downloading)
-        , fetch_client(fetch_client)
+        , fetch_client(move(fetch_client))
         , source_policy_container(source_policy_container)
+        , text_directive_user_activation(text_directive_user_activation)
+        , browsing_context_group_has_multiple_contexts(browsing_context_group_has_multiple_contexts)
+        , browsing_context_group_has_remote_contexts(browsing_context_group_has_remote_contexts)
     {
     }
 
@@ -40,10 +44,13 @@ public:
     bool allows_downloading;
 
     // an environment settings object or null, only to be used as a request client
-    GC::Ptr<EnvironmentSettingsObject> fetch_client;
+    Optional<FetchClient> fetch_client;
 
     // a policy container
-    GC::Ref<PolicyContainer> source_policy_container;
+    NonnullRefPtr<PolicyContainer> source_policy_container;
+    bool text_directive_user_activation { false };
+    bool browsing_context_group_has_multiple_contexts { false };
+    bool browsing_context_group_has_remote_contexts { false };
 
 protected:
     virtual void visit_edges(Cell::Visitor&) override;

@@ -10,14 +10,14 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
-#include <LibMedia/Audio/SampleSpecification.h>
+#include <LibAudio/SampleSpecification.h>
 #include <LibMedia/Audio/TimeStretcher.h>
-#include <LibMedia/AudioBlock.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioProcessor.h>
 #include <LibMedia/Producers/AudioProducer.h>
 #include <LibMedia/SynchronizedWakeHandler.h>
+#include <LibMediaCodecs/AudioBlock.h>
 
 namespace Media {
 
@@ -31,6 +31,7 @@ public:
     virtual void disconnect_input(NonnullRefPtr<AudioProducer> const&) override;
 
     virtual void seek(AK::Duration) override;
+    virtual void seek_continuing_at_output_frame(AK::Duration, i64 output_frame_index) override;
     virtual ErrorOr<void> set_output_sample_specification(Audio::SampleSpecification) override;
     virtual void start() override;
 
@@ -41,6 +42,7 @@ public:
 
 private:
     void ensure_stretcher_while_locked() const;
+    void seek_with_output_frame(AK::Duration timestamp, Optional<i64> output_frame);
     void prime_stretcher_for_input_seek_while_locked(i64 target_frame, i64 output_frame) const;
     void maybe_recover_from_stale_upstream_eos_while_locked() const;
     bool input_is_suspended_while_locked() const;

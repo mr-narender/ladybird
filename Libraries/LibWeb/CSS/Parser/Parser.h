@@ -15,7 +15,6 @@
 #include <LibWeb/CSS/Descriptor.h>
 #include <LibWeb/CSS/DescriptorID.h>
 #include <LibWeb/CSS/Enums.h>
-#include <LibWeb/CSS/MediaQuery.h>
 #include <LibWeb/CSS/Parser/RuleContext.h>
 #include <LibWeb/CSS/Parser/RustSyntaxHandle.h>
 #include <LibWeb/CSS/Parser/RustSyntaxParsing.h>
@@ -42,6 +41,11 @@ using ValueParsingContext = Variant<PropertyID, SpecialContext>;
 enum class ParsingMode {
     Normal,
     SVGPresentationAttribute, // See https://svgwg.org/svg2-draft/types.html#presentation-attribute-css-value
+};
+
+enum class PseudoElementParsingMode {
+    Selector,
+    ComputedStyle,
 };
 
 enum class IsUAStyleSheet {
@@ -107,7 +111,7 @@ public:
     // Contrary to the name, these parse a comma-separated list of selectors, according to the spec.
     Optional<SelectorList> parse_as_selector(Utf16View, SelectorParsingMode = SelectorParsingMode::Standard);
 
-    Optional<Selector::PseudoElementSelector> parse_as_pseudo_element_selector(Utf16View);
+    Optional<Selector::PseudoElementSelector> parse_as_pseudo_element_selector(Utf16View, PseudoElementParsingMode = PseudoElementParsingMode::Selector);
 
     Optional<RustQueryHandle> parse_as_supports(Utf16View);
 
@@ -115,7 +119,7 @@ public:
     RefPtr<StyleValue const> parse_as_descriptor_value(Utf16View, AtRuleID, DescriptorNameAndID const&);
     RefPtr<StyleValue const> parse_primitive_value_from_source(ValueType, Utf16View, NumericRange const& = infinite_range);
 
-    [[nodiscard]] NonnullRefPtr<StyleValue const> parse_as_sizes_attribute(Utf16View, DOM::Element const& element, HTML::HTMLImageElement const* img = nullptr);
+    [[nodiscard]] NonnullRefPtr<StyleValue const> parse_as_sizes_attribute(Utf16View, HTML::HTMLImageElement const* img = nullptr);
 
     NonnullRefPtr<StyleValue const> parse_with_a_syntax(Utf16View input, RustSyntaxHandle const& syntax);
 
@@ -156,6 +160,12 @@ private:
 
     bool in_quirks_mode() const;
     bool is_parsing_svg_presentation_attribute() const;
+    // The rule contexts as the bytes the Rust parser reads them as.
+    ReadonlyBytes rule_context_bytes() const
+    {
+        static_assert(sizeof(RuleContext) == sizeof(u8));
+        return { reinterpret_cast<u8 const*>(m_rule_context.data()), m_rule_context.size() };
+    }
 
     GC::Ptr<DOM::Document const> m_document;
     ParsingMode m_parsing_mode { ParsingMode::Normal };
@@ -168,7 +178,6 @@ private:
 };
 
 Optional<RustRule> parse_keyframe_rule(ParsingParams const&, Utf16View);
-Optional<RustQueryHandle> parse_style_query(Utf16View);
 
 }
 
@@ -183,10 +192,8 @@ RefPtr<CSS::StyleValue const> parse_css_value(CSS::Parser::ParsingParams const&,
 RefPtr<CSS::StyleValue const> parse_css_type(CSS::Parser::ParsingParams const&, Utf16View, CSS::ValueType);
 RefPtr<CSS::StyleValue const> parse_css_descriptor(CSS::Parser::ParsingParams const&, CSS::AtRuleID, CSS::DescriptorNameAndID const&, Utf16View);
 Optional<CSS::SelectorList> parse_selector(CSS::Parser::ParsingParams const&, Utf16View);
-Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const&, Utf16View);
+Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const&, Utf16View, CSS::Parser::PseudoElementParsingMode = CSS::Parser::PseudoElementParsingMode::Selector);
 Optional<CSS::RustRule> parse_css_rule(CSS::Parser::ParsingParams const&, Utf16View, bool nested = false);
-RefPtr<CSS::MediaQuery> parse_media_query(Utf16View);
-Vector<NonnullRefPtr<CSS::MediaQuery>> parse_media_query_list(Utf16View);
 Optional<CSS::RustQueryHandle> parse_css_supports(CSS::Parser::ParsingParams const&, Utf16View);
 WEB_API ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_encoding, Optional<StringView> mime_type_charset, ReadonlyBytes encoded_string);
 bool is_valid_animation_name_custom_ident(Utf16View);

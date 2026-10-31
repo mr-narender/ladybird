@@ -83,12 +83,18 @@ public:
     virtual bool active_document_has_cross_site_ancestor() const = 0;
     virtual OpenerPolicy const& active_document_opener_policy() const = 0;
     virtual bool active_browsing_context_is_auxiliary() const = 0;
-    virtual GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const = 0;
+    virtual GC::Ptr<Navigable> active_browsing_context_opener_navigable() const = 0;
+    virtual GC::Ptr<Navigable> active_browsing_context_one_permitted_sandboxed_navigator() const = 0;
 
     virtual ReplicatedContainerState container_state() const = 0;
     bool container_is_in_document_tree() const { return container_state().is_in_document_tree; }
     SandboxingFlagSet container_iframe_sandboxing_flag_set() const { return container_state().iframe_sandboxing_flag_set; }
     SandboxingFlagSet container_document_active_sandboxing_flag_set() const { return container_state().document_active_sandboxing_flag_set; }
+    EmbedderPolicy container_document_embedder_policy() const { return container_state().document_embedder_policy; }
+
+    // https://w3c.github.io/webappsec-permissions-policy/#algo-create-from-response
+    // NB: Given this navigable's container, whose state another process can report.
+    PermissionsPolicy::PermissionsPolicy create_a_permissions_policy_from_a_response(URL::Origin const&, HTTP::HeaderList const& response_header_list) const;
     Optional<Utf16FlyString> container_local_name() const { return container_state().local_name; }
     ReferrerPolicy::ReferrerPolicy container_iframe_referrer_policy() const { return container_state().iframe_referrer_policy; }
 
@@ -106,7 +112,7 @@ public:
 protected:
     explicit Navigable(GC::Ref<Page>);
     void set_id(CrossProcessId id) { m_id = id; }
-    void set_parent(GC::Ptr<Navigable> parent) { m_parent = parent; }
+    void set_parent(GC::Ptr<Navigable>);
 
     virtual WebIDL::ExceptionOr<void> continue_navigation_in_active_document_agent(PreparedNavigation) = 0;
 

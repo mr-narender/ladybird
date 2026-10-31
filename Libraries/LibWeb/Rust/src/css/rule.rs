@@ -10,7 +10,7 @@ use crate::css::css_string::CssString;
 use crate::css::css_tokenizer::TokenizerInput;
 use crate::css::declaration_block::{DeclarationBlock, visit_declaration_images};
 use crate::css::descriptor_block::FfiDescriptorBlock;
-use crate::css::ffi_support::FfiUtf16View;
+use crate::css::ffi_support::{ArcRef, FfiUtf16View, OwnedArc, OwnedRc, RcRef};
 use crate::css::font_feature_values::FontFeatureValuesRule;
 use crate::css::function_signature::FunctionSignature;
 use crate::css::import_rule::ImportRuleData;
@@ -37,6 +37,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod compilation;
 mod function;
+pub(crate) use function::CompiledFunction;
+#[cfg(test)]
+pub(crate) use function::compile_functions_for_testing;
 pub(crate) mod mutation;
 pub(crate) mod read;
 use read::RuleRef;
@@ -66,13 +69,14 @@ pub enum NativeRuleType {
     FunctionDeclarations = 105,
     Container = 106,
     Scope = 107,
+    PositionTry = 108,
 }
 
 // Borrowed payload handles used when creating or inspecting a document-local
 // rule. Only the fields belonging to the rule's type are populated.
 #[derive(Default)]
 #[repr(C)]
-pub struct FfiRulePayload {
+pub struct FfiRulePayload<'a> {
     pub has_source_position: bool,
     pub start_line: usize,
     pub start_column: usize,
@@ -82,7 +86,7 @@ pub struct FfiRulePayload {
     pub descriptors: *const FfiDescriptorBlock,
     pub page_selectors: *const PageSelectorList,
     pub keyframe: *const FfiKeyframe,
-    pub name: FfiUtf16View,
+    pub name: FfiUtf16View<'a>,
     pub namespace_rule: *const NamespaceRuleData,
     pub counter_style: *const FfiCounterStyle,
     pub supports: *const FfiQueryHandle,
@@ -112,6 +116,10 @@ pub(crate) enum RulePayload {
     Keyframes(RefCell<CssString>),
     Keyframe(Box<FfiKeyframe>),
     Margin {
+        name: CssString,
+        declarations: Box<DeclarationBlock>,
+    },
+    PositionTry {
         name: CssString,
         declarations: Box<DeclarationBlock>,
     },
@@ -175,7 +183,9 @@ impl NativeRule {
     pub(crate) fn declaration_block(&self) -> Option<&DeclarationBlock> {
         match &self.payload {
             RulePayload::Style(data) => Some(&data.declarations),
-            RulePayload::NestedDeclarations(data) | RulePayload::Margin { declarations: data, .. } => Some(data),
+            RulePayload::NestedDeclarations(data)
+            | RulePayload::Margin { declarations: data, .. }
+            | RulePayload::PositionTry { declarations: data, .. } => Some(data),
             RulePayload::Keyframe(data) => Some(data.declaration_block()),
             _ => None,
         }
@@ -249,7 +259,12 @@ impl NativeRule {
         None
     }
 
-    pub(crate) unsafe fn matching_selectors(&self) -> Rc<RustParsedSelectorList> {
+    /// The rule's child rules, for a grouping rule.
+    pub(crate) fn child_rules(&self) -> Option<&Rc<NativeRuleList>> {
+        self.children.as_ref()
+    }
+
+    pub(crate) fn matching_selectors(&self) -> Rc<RustParsedSelectorList> {
         let parent = self.nesting_parent();
         let parent_kind = parent.as_ref().map_or(StyleNestingParent::None, |parent| {
             if parent.rule_type == NativeRuleType::Style {
@@ -259,7 +274,7 @@ impl NativeRule {
             }
         });
         let parents = if parent_kind == StyleNestingParent::Style {
-            Some(unsafe { parent.as_ref().unwrap().matching_selectors() })
+            Some(parent.as_ref().unwrap().matching_selectors())
         } else {
             None
         };
@@ -279,10 +294,10 @@ impl NativeRule {
             unreachable!()
         };
         let source = style.selectors();
-        unsafe { self.cached_matching_selectors(source, parent_kind, parents) }
+        self.cached_matching_selectors(source, parent_kind, parents)
     }
 
-    unsafe fn cached_matching_selectors(
+    fn cached_matching_selectors(
         &self,
         source: Arc<RustParsedSelectorList>,
         parent_kind: StyleNestingParent,
@@ -321,7 +336,7 @@ impl NativeRule {
         }
     }
 
-    pub(crate) unsafe fn scope_start_selectors(&self) -> Option<Rc<RustParsedSelectorList>> {
+    pub(crate) fn scope_start_selectors(&self) -> Option<Rc<RustParsedSelectorList>> {
         let source = self.scope().start.as_ref()?.clone();
         // Imports start a new sheet. A scope prelude uses its immediate enclosing rule's context.
         let parent = if self.rule_type == NativeRuleType::Scope {
@@ -337,14 +352,14 @@ impl NativeRule {
                 _ => StyleNestingParent::None,
             });
         let parents = if parent_kind == StyleNestingParent::Style {
-            Some(unsafe { parent.as_ref().unwrap().matching_selectors() })
+            Some(parent.as_ref().unwrap().matching_selectors())
         } else {
             None
         };
-        Some(unsafe { self.cached_matching_selectors(source, parent_kind, parents) })
+        Some(self.cached_matching_selectors(source, parent_kind, parents))
     }
 
-    pub(crate) unsafe fn scope_end_selectors(&self) -> Option<Rc<RustParsedSelectorList>> {
+    pub(crate) fn scope_end_selectors(&self) -> Option<Rc<RustParsedSelectorList>> {
         let source = self.scope().end.as_ref()?;
         if let Some(cached) = self.scope_end_selectors.borrow().as_ref() {
             return Some(cached.clone());
@@ -713,31 +728,24 @@ pub unsafe extern "C" fn rust_namespace_context_retain(
     context
 }
 
-/// # Safety
-/// Context must be null or an owned reference returned by this module.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_namespace_context_release(context: *const NativeNamespaceContext) {
-    if !context.is_null() {
-        drop(unsafe { Arc::from_raw(context) });
-    }
+pub extern "C" fn rust_namespace_context_release(context: OwnedArc<NativeNamespaceContext>) {
+    drop(context);
 }
 
-/// # Safety
-/// The name must be readable for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_keyframes_set_name(rule: &NativeRule, name: FfiUtf16View) {
+pub extern "C" fn rust_keyframes_set_name(rule: &NativeRule, name: FfiUtf16View) {
     let RulePayload::Keyframes(current) = &rule.payload else {
         unreachable!()
     };
-    *current.borrow_mut() = CssString::from_utf16(&unsafe { name.to_utf16() }.unwrap());
+    *current.borrow_mut() = CssString::from_utf16(&name.to_utf16().unwrap());
 }
 
-/// # Safety
-/// The selector must be readable for the duration of the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_keyframes_find_rule(rule: &NativeRule, selector: FfiUtf16View) -> usize {
-    let Some(selectors) =
-        (unsafe { selector.units() }).and_then(crate::css::parser::syntax_parser::parse_keyframe_selector_list)
+pub extern "C" fn rust_keyframes_find_rule(rule: &NativeRule, selector: FfiUtf16View) -> usize {
+    let Some(selectors) = selector
+        .units()
+        .and_then(crate::css::parser::syntax_parser::parse_keyframe_selector_list)
     else {
         return usize::MAX;
     };
@@ -771,14 +779,6 @@ fn reserve_rule_identities(count: u64) -> u64 {
         .expect("rule identity overflow")
 }
 
-unsafe fn retain_arc<T>(data: *const T) -> Arc<T> {
-    assert!(!data.is_null());
-    unsafe {
-        Arc::increment_strong_count(data);
-        Arc::from_raw(data)
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_nested_declarations_create(declarations: &DeclarationBlock) -> *const NativeRule {
     Rc::into_raw(NativeRule::new(
@@ -790,16 +790,13 @@ pub extern "C" fn rust_nested_declarations_create(declarations: &DeclarationBloc
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_retain(rule: *const NativeRule) -> *const NativeRule {
-    unsafe { Rc::increment_strong_count(rule) };
-    rule
+pub extern "C" fn rust_rule_retain(rule: RcRef<'_, NativeRule>) -> *const NativeRule {
+    Rc::into_raw(rule.to_rc())
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_release(rule: *const NativeRule) {
-    if !rule.is_null() {
-        drop(unsafe { Rc::from_raw(rule) });
-    }
+pub extern "C" fn rust_rule_release(rule: OwnedRc<NativeRule>) {
+    drop(rule);
 }
 
 #[unsafe(no_mangle)]
@@ -835,9 +832,11 @@ pub extern "C" fn rust_rule_containing_function(rule: &NativeRule) -> *const Nat
 pub unsafe extern "C" fn rust_rule_set_selector_text(
     rule: &NativeRule,
     input: FfiUtf16View,
-    sheet_rules: *const NativeRuleList,
+    sheet_rules: Option<&NativeRuleList>,
 ) -> bool {
-    unsafe { input.units() }.is_some_and(|input| rule.set_selector_text(input, unsafe { sheet_rules.as_ref() }))
+    input
+        .units()
+        .is_some_and(|input| rule.set_selector_text(input, sheet_rules))
 }
 
 #[unsafe(no_mangle)]
@@ -845,24 +844,22 @@ pub extern "C" fn rust_rule_selectors(rule: &NativeRule) -> *const c_void {
     Arc::as_ptr(&rule.style_rule().selectors()).cast()
 }
 
-/// # Safety
-/// Call only for style or nested-declaration rules on the document thread.
-/// The returned list must be released with `rust_parsed_selector_list_destroy` on that same thread.
+/// Call only for style or nested-declaration rules. The returned list must be released with
+/// `rust_parsed_selector_list_destroy` on the same thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_matching_selectors(rule: &NativeRule) -> *mut c_void {
-    let selectors = unsafe { rule.matching_selectors() };
+pub extern "C" fn rust_rule_matching_selectors(rule: &NativeRule) -> *mut c_void {
+    let selectors = rule.matching_selectors();
     Box::into_raw(Box::new(RustParsedSelectorList {
         selectors: selectors.selectors.clone(),
     }))
     .cast()
 }
 
-/// # Safety
-/// Call for a scope rule or scoped import on the document thread. A non-null result
-/// must be destroyed with `rust_parsed_selector_list_destroy`; null means the start is omitted.
+/// Call for a scope rule or scoped import. A non-null result must be destroyed with
+/// `rust_parsed_selector_list_destroy`; null means the start is omitted.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_scope_start_selectors(rule: &NativeRule) -> *mut c_void {
-    unsafe { rule.scope_start_selectors() }
+pub extern "C" fn rust_rule_scope_start_selectors(rule: &NativeRule) -> *mut c_void {
+    rule.scope_start_selectors()
         .map(|selectors| {
             Box::into_raw(Box::new(RustParsedSelectorList {
                 selectors: selectors.selectors.clone(),
@@ -872,12 +869,9 @@ pub unsafe extern "C" fn rust_rule_scope_start_selectors(rule: &NativeRule) -> *
         .unwrap_or(std::ptr::null_mut())
 }
 
-/// # Safety
-/// Call for a scope rule or scoped import on the document thread. A non-null result
-/// must be destroyed with `rust_parsed_selector_list_destroy`; null means the end is omitted.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_scope_end_selectors(rule: &NativeRule) -> *mut c_void {
-    unsafe { rule.scope_end_selectors() }
+pub extern "C" fn rust_rule_scope_end_selectors(rule: &NativeRule) -> *mut c_void {
+    rule.scope_end_selectors()
         .map(|selectors| {
             Box::into_raw(Box::new(RustParsedSelectorList {
                 selectors: selectors.selectors.clone(),
@@ -974,7 +968,9 @@ pub extern "C" fn rust_rule_external_memory_size(rule: &NativeRule) -> usize {
             size
         }
         RulePayload::Keyframe(_) => size_of::<FfiKeyframe>(),
-        RulePayload::Margin { name, .. } => size_of::<DeclarationBlock>().saturating_add(size_of_val(name.units())),
+        RulePayload::Margin { name, .. } | RulePayload::PositionTry { name, .. } => {
+            size_of::<DeclarationBlock>().saturating_add(size_of_val(name.units()))
+        }
         RulePayload::CounterStyle(_) => size_of::<FfiCounterStyle>(),
         RulePayload::FontFeatureValues(_) => size_of::<FontFeatureValuesRule>(),
         RulePayload::NestedDeclarations(_) => size_of::<DeclarationBlock>(),
@@ -984,8 +980,10 @@ pub extern "C" fn rust_rule_external_memory_size(rule: &NativeRule) -> usize {
     size_of::<NativeRule>().saturating_add(payload_size)
 }
 
+/// # Safety
+/// The caller must not set a keyframes rule's name while it uses the returned name view.
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_rule_payload(rule: &NativeRule) -> FfiRulePayload {
+pub unsafe extern "C" fn rust_rule_payload(rule: &NativeRule) -> FfiRulePayload<'_> {
     let mut result = FfiRulePayload::default();
     if let Some((line, column)) = rule.source_position {
         result.has_source_position = true;
@@ -1006,20 +1004,13 @@ pub extern "C" fn rust_rule_payload(rule: &NativeRule) -> FfiRulePayload {
             result.descriptors = &raw const **descriptors;
         }
         RulePayload::Keyframes(name) => {
-            let name = name.borrow();
-            result.name = FfiUtf16View {
-                utf16: name.units().as_ptr(),
-                length: name.units().len(),
-                ..Default::default()
-            };
+            // SAFETY: The caller reads the payload before it next sets the name.
+            let name = unsafe { name.try_borrow_unguarded() }.expect("the name is not being set");
+            result.name = FfiUtf16View::from_utf16(name.units());
         }
         RulePayload::Keyframe(data) => result.keyframe = &raw const **data,
-        RulePayload::Margin { name, declarations } => {
-            result.name = FfiUtf16View {
-                ascii: std::ptr::null(),
-                utf16: name.units().as_ptr(),
-                length: name.units().len(),
-            };
+        RulePayload::Margin { name, declarations } | RulePayload::PositionTry { name, declarations } => {
+            result.name = FfiUtf16View::from_utf16(name.units());
             result.declarations = &raw const **declarations;
         }
         RulePayload::Namespace(data) => result.namespace_rule = Arc::as_ptr(data),
@@ -1037,16 +1028,16 @@ pub extern "C" fn rust_rule_payload(rule: &NativeRule) -> FfiRulePayload {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_set_page_selectors(rule: &NativeRule, selectors: *const PageSelectorList) {
+pub extern "C" fn rust_rule_set_page_selectors(rule: &NativeRule, selectors: ArcRef<'_, PageSelectorList>) {
     let RulePayload::Page { selectors: current, .. } = &rule.payload else {
         unreachable!()
     };
-    *current.borrow_mut() = unsafe { retain_arc(selectors) };
+    *current.borrow_mut() = selectors.to_arc();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_rule_children(rule: &NativeRule) -> *const NativeRuleList {
-    rule.children.as_ref().map_or(std::ptr::null(), Rc::as_ptr)
+    rule.child_rules().map_or(std::ptr::null(), Rc::as_ptr)
 }
 
 #[unsafe(no_mangle)]
@@ -1065,16 +1056,13 @@ pub extern "C" fn rust_rule_list_remove_imports(list: &NativeRuleList) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_list_retain(list: *const NativeRuleList) -> *const NativeRuleList {
-    unsafe { Rc::increment_strong_count(list) };
-    list
+pub extern "C" fn rust_rule_list_retain(list: RcRef<'_, NativeRuleList>) -> *const NativeRuleList {
+    Rc::into_raw(list.to_rc())
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_list_release(list: *const NativeRuleList) {
-    if !list.is_null() {
-        drop(unsafe { Rc::from_raw(list) });
-    }
+pub extern "C" fn rust_rule_list_release(list: OwnedRc<NativeRuleList>) {
+    drop(list);
 }
 
 #[unsafe(no_mangle)]
@@ -1092,13 +1080,12 @@ pub unsafe extern "C" fn rust_rule_list_visit_namespaces(
     context: *const c_void,
     callback: unsafe extern "C" fn(*const c_void, FfiUtf16View, FfiUtf16View),
 ) {
-    let view = |units: &[u16]| FfiUtf16View {
-        ascii: std::ptr::null(),
-        utf16: units.as_ptr(),
-        length: units.len(),
-    };
     list.for_each_namespace(|namespace| unsafe {
-        callback(context, view(namespace.prefix.units()), view(namespace.uri.units()));
+        callback(
+            context,
+            FfiUtf16View::from_utf16(namespace.prefix.units()),
+            FfiUtf16View::from_utf16(namespace.uri.units()),
+        );
     });
 }
 
@@ -1140,9 +1127,8 @@ pub extern "C" fn rust_rule_list_identity_at(list: &NativeRuleList, index: usize
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_list_insert(list: &NativeRuleList, index: usize, rule: *const NativeRule) {
-    unsafe { Rc::increment_strong_count(rule) };
-    list.insert(index, unsafe { Rc::from_raw(rule) });
+pub extern "C" fn rust_rule_list_insert(list: &NativeRuleList, index: usize, rule: RcRef<'_, NativeRule>) {
+    list.insert(index, rule.to_rc());
 }
 
 #[repr(u8)]
@@ -1155,18 +1141,14 @@ pub enum RuleInsertionResult {
 }
 
 /// https://drafts.csswg.org/cssom/#insert-a-css-rule
-///
-/// # Safety
-/// Rule must be a live Rc-owned native rule. Call on the document thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_rule_list_insert_css_rule(
+pub extern "C" fn rust_rule_list_insert_css_rule(
     list: &NativeRuleList,
     index: usize,
-    rule: *const NativeRule,
+    rule: RcRef<'_, NativeRule>,
     nested: bool,
 ) -> RuleInsertionResult {
-    unsafe { Rc::increment_strong_count(rule) };
-    list.insert_css_rule(index, unsafe { Rc::from_raw(rule) }, nested)
+    list.insert_css_rule(index, rule.to_rc(), nested)
 }
 
 #[unsafe(no_mangle)]

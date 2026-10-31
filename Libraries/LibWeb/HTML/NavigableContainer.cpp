@@ -21,6 +21,7 @@
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/NavigationParams.h>
+#include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
@@ -31,7 +32,9 @@
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/WebDriver/BiDi/BiDi.h>
 
 namespace Web::HTML {
 
@@ -105,16 +108,22 @@ void NavigableContainer::create_new_child_navigable()
     // 9. Set element's content navigable to navigable.
     m_content_navigable = navigable;
     m_reported_content_navigable_viewport = {};
+    m_reported_stats_displayed = {};
     navigable->set_container({}, this);
 
-    if (auto* layout_node = unsafe_layout_node())
-        layout_node->refresh_dom_paint_facts();
+    publish_dom_paint_facts();
     set_needs_repaint();
 
     // 10. Let historyEntry be navigable's active session history entry.
     auto history_entry = navigable->active_session_history_entry();
 
-    page.client().page_did_create_child_frame(parent_navigable->id(), navigable->id(), navigable->hosted_state(), create_pending_session_history_entry_descriptor(*history_entry), document->origin(), document->relevant_settings_object().id);
+    page.client().page_did_create_child_frame(parent_navigable->id(), this->document(), navigable->id(), navigable->hosted_state(), create_pending_session_history_entry_descriptor(*history_entry), document->origin(), document->relevant_settings_object().id, document->id());
+
+    // NB: An SVG image's page has no UI process to run the traversal steps.
+    if (page.client().is_svg_page_client()) {
+        navigable->set_has_session_history_entry_and_ready_for_navigation();
+        return;
+    }
 
     // 12. Append the following session history traversal steps to traversable:
     page.history_executor().request_history_operation(
@@ -125,7 +134,7 @@ void NavigableContainer::create_new_child_navigable()
         {
             .local_target_navigable_id = navigable->id(),
             .local_target_entry = history_entry,
-            .on_complete = GC::create_function(heap(), [this, navigable](HistoryStepResult) {
+            .on_complete = GC::create_function(heap(), [this, navigable] {
                 if (navigable->has_been_destroyed() || content_navigable() != navigable)
                     return;
                 navigable->set_has_session_history_entry_and_ready_for_navigation();
@@ -191,6 +200,12 @@ HTML::WindowProxy* NavigableContainer::content_window()
 {
     if (!m_content_navigable)
         return nullptr;
+
+    // INTEROP: Browsers discard the navigables of a removed navigable container right away, while the spec only
+    //          destroys their documents in a later task. So a navigable in a destroyed subtree has no WindowProxy here.
+    if (m_content_navigable->is_in_a_destroyed_subtree())
+        return nullptr;
+
     return m_content_navigable->active_window_proxy().ptr();
 }
 
@@ -229,17 +244,7 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
     // 4. If url matches about:blank and initialInsertion is true, then perform the URL and history update steps given element's content navigable's active document and url.
     if (url_matches_about_blank(url) && initial_insertion == InitialInsertion::Yes) {
         // NB: A newly inserted element's content navigable was created in this process.
-        auto& local_navigable = as<LocalNavigable>(*m_content_navigable);
-
-        // AD-HOC: If the content navigable already has a navigation in progress or pending, skip the initial
-        //         about:blank URL update. Without this, the URL update creates a state machine that clobbers the
-        //         navigable's ongoing_navigation, causing the real navigation to be dropped when its populate completion
-        //         callback checks ongoing_navigation != navigation_id. Non-blank src navigations must still be processed
-        //         here, and will be queued by LocalNavigable::navigate() until the child navigable is ready for navigation.
-        if (local_navigable.has_pending_navigations() || !local_navigable.ongoing_navigation().has<Empty>())
-            return {};
-
-        perform_url_and_history_update_steps(*local_navigable.active_document(), url);
+        perform_url_and_history_update_steps(*as<LocalNavigable>(*m_content_navigable).active_document(), url);
     }
 
     // 5. Return url.
@@ -267,7 +272,11 @@ void NavigableContainer::navigate_an_iframe_or_frame(URL::URL url, ReferrerPolic
     if (auto* iframe = as_if<HTMLIFrameElement>(this)) {
         // 1. Set element's pending resource-timing start time to the current high resolution time given element's node
         //    document's relevant global object.
-        iframe->set_pending_resource_start_time(HighResolutionTime::current_high_resolution_time(relevant_global_object(document())));
+        // AD-HOC: Fetch timing info holds shared times, which Resource Timing converts to times relative to the time
+        //         origin. A relative time here would be made relative twice and come out as a large negative value,
+        //         so store the coarsened shared current time, as Fetch does for its own start time. See also:
+        //         https://github.com/whatwg/fetch/issues/1812
+        iframe->set_pending_resource_start_time(HighResolutionTime::coarsened_shared_current_time(relevant_settings_object(*this).cross_origin_isolated_capability()));
 
         // 2. Set element's pending resource-timing URL to url.
         iframe->set_pending_resource_timing_url(url);
@@ -307,10 +316,10 @@ void NavigableContainer::destroy_the_child_navigable()
     // 3. Set container's content navigable to null.
     m_content_navigable = nullptr;
     m_reported_content_navigable_viewport = {};
+    m_reported_stats_displayed = {};
     navigable->set_container({}, nullptr);
     document().schedule_html_parser_end_check();
-    if (auto* layout_node = unsafe_layout_node())
-        layout_node->refresh_dom_paint_facts();
+    publish_dom_paint_facts();
     set_needs_repaint();
 
     // The load-event delays and navigation API of the navigable's document are where the document is.
@@ -321,12 +330,6 @@ void NavigableContainer::destroy_the_child_navigable()
         //         Without this, the delayer lingers until GC collects the LocalNavigable, which can
         //         block the parent document's load event indefinitely.
         local_navigable->set_delaying_load_events(false);
-
-        // AD-HOC: Clear the navigation load event guard that may have been set by
-        //         finalize_a_cross_document_navigation. Without this, the guard's
-        //         DocumentLoadEventDelayer on the parent document persists until GC,
-        //         blocking the parent's load event indefinitely.
-        local_navigable->clear_navigation_load_event_guard();
 
         // 4. Inform the navigation API about child navigable destruction given navigable.
         local_navigable->inform_the_navigation_api_about_child_navigable_destruction();
@@ -357,6 +360,12 @@ void NavigableContainer::destroy_the_child_navigable()
     //     and the navigable's own document too when another page hosts it. It then continues the destruction here.
     document().page().hold_navigable_being_destroyed({}, *navigable);
     document().page().client().page_did_request_child_navigable_unload(navigable->id());
+
+    // 10. Invoke WebDriver BiDi navigable destroyed with navigable.
+    // NB: The browser process holds the navigable tree, whose navigables are removed once their documents are
+    //     destroyed. It reports navigable's destruction as the tree is now, and ignores the URL given.
+    if (WebDriver::BiDi::is_active())
+        WebDriver::BiDi::navigation_event(*navigable, "browsingContext.contextDestroyed"sv, {}, document().url());
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document-and-its-descendants
@@ -431,13 +440,11 @@ void NavigableContainer::swap_content_navigable_to_remote(Badge<Page>, Replicate
         window_proxy->set_window(remote_navigable->active_window());
     }
     m_content_navigable = remote_navigable;
-    if (auto* layout_node = unsafe_layout_node())
-        layout_node->refresh_dom_paint_facts();
+    publish_dom_paint_facts();
     set_needs_repaint();
 
     local_navigable.set_container({}, nullptr);
     local_navigable.set_delaying_load_events(false);
-    local_navigable.clear_navigation_load_event_guard();
     local_navigable.set_has_been_destroyed();
     local_navigable.remove_from_all_local_navigables();
 }
@@ -451,8 +458,7 @@ void NavigableContainer::swap_content_navigable_to_local(Badge<Page>, LocalNavig
     VERIFY(remote_navigable.provisional_navigable().ptr() == &navigable);
 
     m_content_navigable = navigable;
-    if (auto* layout_node = unsafe_layout_node())
-        layout_node->refresh_dom_paint_facts();
+    publish_dom_paint_facts();
     set_needs_repaint();
 
     remote_navigable.set_container({}, nullptr);
@@ -523,7 +529,16 @@ static CSSPixelRect transform_rect_to_local(Layout::Node const& layout_node, CSS
     return { top_left, { bottom_right.x() - top_left.x(), bottom_right.y() - top_left.y() } };
 }
 
-void NavigableContainer::report_content_navigable_viewport_rect()
+void NavigableContainer::report_stats_displayed(bool displayed)
+{
+    set_rendering_pending_displayed(*m_content_navigable, displayed);
+    if (m_reported_stats_displayed == displayed)
+        return;
+    m_reported_stats_displayed = displayed;
+    document().page().client().page_did_update_frame_stats_displayed(m_content_navigable->id(), displayed);
+}
+
+void NavigableContainer::report_content_navigable_viewport_rect(Layout::BegunRead const& read)
 {
     if (!m_content_navigable)
         return;
@@ -532,9 +547,14 @@ void NavigableContainer::report_content_navigable_viewport_rect()
     // document before it records.
     if (!document().layout_is_up_to_date())
         return;
-    auto const* layout_node = this->layout_node();
-    if (!layout_node || !Painting::is_navigable_container_viewport_paintable(*layout_node))
+    auto const* layout_node = this->layout_node(read);
+    if (layout_node)
+        report_used_color_scheme(layout_node->color_scheme());
+    if (!layout_node || !Painting::is_navigable_container_viewport_paintable(*layout_node)) {
+        if (Core::StatsLog::the())
+            report_stats_displayed(false);
         return;
+    }
 
     // The content navigable's viewport is the container's content box, which keeps its size under the transforms
     // above the container. Those place its origin in the viewport of the local root through the viewports of the
@@ -546,11 +566,16 @@ void NavigableContainer::report_content_navigable_viewport_rect()
     auto navigable = document().navigable();
     for (; navigable && !navigable->is_local_root();) {
         auto container = navigable->container();
-        if (container && !container->document().layout_is_up_to_date())
+        if (!container || !container->document().layout_is_up_to_date())
             return;
-        auto const* container_layout_node = container ? container->layout_node() : nullptr;
-        if (!container_layout_node || !Painting::is_navigable_container_viewport_paintable(*container_layout_node))
+        // Each container's box is a read of the render state of its own document.
+        Layout::ForcedReadScope container_read { container->document() };
+        auto const* container_layout_node = container->layout_node(container_read);
+        if (!container_layout_node || !Painting::is_navigable_container_viewport_paintable(*container_layout_node)) {
+            if (Core::StatsLog::the())
+                report_stats_displayed(false);
             return;
+        }
         // The content box's origin is the origin of the child's viewport, and the transforms above the container
         // apply to the child as they do to the container.
         auto container_position = Painting::absolute_position(*container_layout_node);
@@ -572,6 +597,12 @@ void NavigableContainer::report_content_navigable_viewport_rect()
     for (auto const* container_layout_node : containers.in_reverse())
         visible = transform_rect_to_local(*container_layout_node, visible).translated(-Painting::absolute_position(*container_layout_node));
     visible.intersect({ {}, content_box.size() });
+    if (Core::StatsLog::the()) {
+        bool displayed = !visible.is_empty() && !document().navigable()->has_inclusive_ancestor_with_visibility_hidden();
+        if (auto const* values = style_group<CSS::ComputedValues::InheritedBoxValues>())
+            displayed &= static_cast<CSS::Visibility>(values->visibility) != CSS::Visibility::Hidden;
+        report_stats_displayed(displayed);
+    }
 
     // The report is in the device pixels the content is laid out in, so a change of zoom level reports again.
     auto& page = document().page();
@@ -582,6 +613,18 @@ void NavigableContainer::report_content_navigable_viewport_rect()
     page.client().page_did_update_child_frame_viewport(m_content_navigable->id(), reported.rect, reported.intersection);
 }
 
+// A content navigable whose document another process hosts decides whether its canvas is opaque by the container's
+// used color scheme, which it reads through its replicated state.
+void NavigableContainer::report_used_color_scheme(CSS::PreferredColorScheme color_scheme)
+{
+    if (color_scheme == CSS::PreferredColorScheme::Auto)
+        color_scheme = CSS::PreferredColorScheme::Light;
+    if (m_used_color_scheme == color_scheme)
+        return;
+    m_used_color_scheme = color_scheme;
+    document().page().client().page_did_change_navigable_container_state(m_content_navigable->id(), replicated_container_state());
+}
+
 ReplicatedContainerState NavigableContainer::replicated_container_state()
 {
     ReplicatedContainerState state;
@@ -589,9 +632,82 @@ ReplicatedContainerState NavigableContainer::replicated_container_state()
     if (auto const* iframe = as_if<HTMLIFrameElement>(*this))
         state.iframe_sandboxing_flag_set = iframe->iframe_sandboxing_flag_set();
     state.document_active_sandboxing_flag_set = document().active_sandboxing_flag_set();
+    state.document_embedder_policy = document().policy_container()->embedder_policy;
+    state.document_permissions_policy = document().permissions_policy();
     state.local_name = local_name();
     state.iframe_referrer_policy = determine_iframe_element_referrer_policy(*this);
+    state.container_policy = process_permissions_policy_attributes();
+    auto document_policy_container = document().policy_container();
+    state.document_insecure_requests_policy = document_policy_container->insecure_requests_policy();
+    state.document_upgrade_insecure_navigations_set = document_policy_container->upgrade_insecure_navigations_set();
+    state.used_color_scheme = m_used_color_scheme;
     return state;
+}
+
+// https://w3c.github.io/webappsec-permissions-policy/#declared-origin
+static URL::Origin declared_origin(HTMLIFrameElement const& node)
+{
+    // 1. If node's node document's sandboxed origin browsing context flag is set, then return a new opaque origin.
+    if (has_flag(node.document().active_sandboxing_flag_set(), SandboxingFlagSet::SandboxedOrigin))
+        return URL::Origin::create_opaque();
+
+    // 2. If node's sandbox attribute is set, and does not contain the allow-same-origin keyword, then return a new
+    //    opaque origin.
+    if (auto sandbox = node.get_attribute(AttributeNames::sandbox); sandbox.has_value() && has_flag(parse_a_sandboxing_directive(sandbox->utf16_view()), SandboxingFlagSet::SandboxedOrigin))
+        return URL::Origin::create_opaque();
+
+    // 3. If node's srcdoc attribute is set, then return node's node document's origin.
+    if (node.has_attribute(AttributeNames::srcdoc))
+        return node.document().origin();
+
+    // 4. If node's src attribute is set:
+    if (auto src = node.get_attribute(AttributeNames::src); src.has_value()) {
+        // 1. Let url be the result of parsing node's src attribute, relative to node's node document.
+        auto url = node.document().encoding_parse_url(src->utf16_view());
+
+        // 2. If url is not failure, return url's origin.
+        if (url.has_value())
+            return url->origin();
+    }
+
+    // 5. Return node's node document's origin.
+    return node.document().origin();
+}
+
+// https://w3c.github.io/webappsec-permissions-policy/#algo-process-policy-attributes
+PermissionsPolicy::PolicyDirective NavigableContainer::process_permissions_policy_attributes() const
+{
+    // 1. If element is not an iframe element, then return an empty policy directive.
+    auto const* iframe = as_if<HTMLIFrameElement>(*this);
+    if (!iframe)
+        return {};
+
+    // 2. Let container policy be the result of running Parse policy directive given the value of element's allow
+    //    attribute, the origin of element's node document, and element's declared origin.
+    auto allow_attribute = get_attribute_value(AttributeNames::allow);
+    auto allow = allow_attribute.utf16_view().to_utf8_but_should_be_ported_to_utf16();
+    auto container_policy = PermissionsPolicy::parse_policy_directive(allow, document().origin(), declared_origin(*iframe));
+
+    // 3. If element's allowfullscreen attribute is specified, and container policy does not contain an entry for the
+    //    fullscreen feature,
+    if (has_attribute(AttributeNames::allowfullscreen) && !container_policy.contains(PermissionsPolicy::PolicyControlledFeature::Fullscreen)) {
+        // 1. Set container policy[fullscreen] = the special value *.
+        PermissionsPolicy::Allowlist allowlist;
+        allowlist.is_the_special_value_star = true;
+        container_policy.set(PermissionsPolicy::PolicyControlledFeature::Fullscreen, move(allowlist));
+    }
+
+    // 4. Return container policy.
+    return container_policy;
+}
+
+PermissionsPolicy::PermissionsPolicy NavigableContainer::create_a_permissions_policy(GC::Ptr<NavigableContainer const> container, URL::Origin const& origin)
+{
+    if (!container)
+        return PermissionsPolicy::create_a_permissions_policy_for_a_navigable({}, origin);
+    auto container_policy = container->process_permissions_policy_attributes();
+    auto const& node_document = container->document();
+    return PermissionsPolicy::create_a_permissions_policy_for_a_navigable(PermissionsPolicy::NavigableContainerPolicyInputs { node_document.permissions_policy(), node_document.origin(), container_policy }, origin);
 }
 
 bool NavigableContainer::content_navigable_has_session_history_entry_and_ready_for_navigation() const

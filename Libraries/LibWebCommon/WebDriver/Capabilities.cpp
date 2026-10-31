@@ -311,7 +311,7 @@ static JsonValue match_capabilities(JsonObject const& capabilities, SessionFlags
         else if (name == "proxy"sv) {
             // If the has proxy configuration flag is set, or if the proxy configuration defined in value is not one that
             // passes the endpoint node's implementation-specific validity checks, return success with data null.
-            if (has_proxy_configuration())
+            if (has_proxy_configuration() || !is_supported_proxy_configuration(value))
                 return AK::Error::from_string_literal("proxy");
         }
         // -> "unhandledPromptBehavior"
@@ -328,12 +328,11 @@ static JsonValue match_capabilities(JsonObject const& capabilities, SessionFlags
             // https://w3c.github.io/webdriver-bidi/#type-session-CapabilityRequest
             if (name == "webSocketUrl"sv) {
                 // 1. If value is false, return success with data null.
+                // NB: This is the match value, which is then not set on matched capabilities.
                 if (!value.as_bool())
-                    return AK::Error::from_string_literal("webSocketUrl");
+                    return {};
 
                 // 2. Return success with data value.
-                // FIXME: Remove this when we support BIDI communication.
-                return AK::Error::from_string_literal("webSocketUrl");
             }
         }
 

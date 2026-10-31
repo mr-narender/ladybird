@@ -17,9 +17,24 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::ReplicatedContainerState const
     TRY(encoder.encode(state.is_in_document_tree));
     TRY(encoder.encode(state.iframe_sandboxing_flag_set));
     TRY(encoder.encode(state.document_active_sandboxing_flag_set));
+    TRY(encoder.encode(state.document_embedder_policy));
+    TRY(encoder.encode(state.document_permissions_policy));
     TRY(encoder.encode(state.local_name));
     TRY(encoder.encode(state.iframe_referrer_policy));
+    TRY(Web::PermissionsPolicy::encode_policy_directive(encoder, state.container_policy));
+    TRY(encoder.encode(state.document_insecure_requests_policy));
+    TRY(encoder.encode(state.document_upgrade_insecure_navigations_set));
+    TRY(encoder.encode(to_underlying(state.used_color_scheme)));
     return {};
+}
+
+// A container's used color scheme is light or dark, never auto.
+static ErrorOr<Web::CSS::PreferredColorScheme> decode_used_color_scheme(Decoder& decoder)
+{
+    auto value = static_cast<Web::CSS::PreferredColorScheme>(TRY(decoder.decode<UnderlyingType<Web::CSS::PreferredColorScheme>>()));
+    if (value != Web::CSS::PreferredColorScheme::Light && value != Web::CSS::PreferredColorScheme::Dark)
+        return Error::from_string_literal("Invalid used color scheme");
+    return value;
 }
 
 template<>
@@ -29,18 +44,21 @@ ErrorOr<Web::HTML::ReplicatedContainerState> decode(Decoder& decoder)
         .is_in_document_tree = TRY(decoder.decode<bool>()),
         .iframe_sandboxing_flag_set = TRY(decoder.decode<Web::HTML::SandboxingFlagSet>()),
         .document_active_sandboxing_flag_set = TRY(decoder.decode<Web::HTML::SandboxingFlagSet>()),
+        .document_embedder_policy = TRY(decoder.decode<Web::HTML::EmbedderPolicy>()),
+        .document_permissions_policy = TRY(decoder.decode<Web::PermissionsPolicy::PermissionsPolicy>()),
         .local_name = TRY(decoder.decode<Optional<Utf16FlyString>>()),
         .iframe_referrer_policy = TRY(decoder.decode<Web::ReferrerPolicy::ReferrerPolicy>()),
+        .container_policy = TRY(Web::PermissionsPolicy::decode_policy_directive(decoder)),
+        .document_insecure_requests_policy = TRY(decoder.decode<Web::UpgradeInsecureRequests::InsecureRequestsPolicy>()),
+        .document_upgrade_insecure_navigations_set = TRY(decoder.decode<Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet>()),
+        .used_color_scheme = TRY(decode_used_color_scheme(decoder)),
     };
 }
 
 template<>
 ErrorOr<void> encode(Encoder& encoder, Web::HTML::HostedNavigableState const& state)
 {
-    TRY(encoder.encode(state.active_document_url));
     TRY(encoder.encode(state.active_document_is_fully_active));
-    TRY(encoder.encode(state.opener_policy));
-    TRY(encoder.encode(state.active_document_is_completely_loaded));
     TRY(encoder.encode(state.is_closing));
     TRY(encoder.encode(state.container));
     TRY(encoder.encode(state.delays_the_load_event_of_its_container));
@@ -52,10 +70,7 @@ template<>
 ErrorOr<Web::HTML::HostedNavigableState> decode(Decoder& decoder)
 {
     return Web::HTML::HostedNavigableState {
-        .active_document_url = TRY(decoder.decode<URL::URL>()),
         .active_document_is_fully_active = TRY(decoder.decode<bool>()),
-        .opener_policy = TRY(decoder.decode<Web::HTML::OpenerPolicy>()),
-        .active_document_is_completely_loaded = TRY(decoder.decode<bool>()),
         .is_closing = TRY(decoder.decode<bool>()),
         .container = TRY(decoder.decode<Web::HTML::ReplicatedContainerState>()),
         .delays_the_load_event_of_its_container = TRY(decoder.decode<bool>()),
@@ -72,12 +87,14 @@ ErrorOr<void> encode(Encoder& encoder, Web::HTML::ReplicatedNavigableState const
     TRY(encoder.encode(state.active_document_is_fully_active));
     TRY(encoder.encode(state.top_level_creation_url));
     TRY(encoder.encode(state.top_level_origin));
+    TRY(encoder.encode(state.top_level_is_created_by_web_content));
+    TRY(encoder.encode(state.top_level_session_history_entry_count));
     TRY(encoder.encode(state.has_cross_site_ancestor));
     TRY(encoder.encode(state.browsing_context_group_id));
     TRY(encoder.encode(state.opener_policy));
     TRY(encoder.encode(state.active_browsing_context_is_auxiliary));
-    TRY(encoder.encode(state.active_browsing_context_has_opener));
     TRY(encoder.encode(state.opener_navigable_id));
+    TRY(encoder.encode(state.one_permitted_sandboxed_navigator_navigable_id));
     TRY(encoder.encode(state.active_document_is_completely_loaded));
     TRY(encoder.encode(state.is_closing));
     TRY(encoder.encode(state.container));
@@ -97,12 +114,14 @@ ErrorOr<Web::HTML::ReplicatedNavigableState> decode(Decoder& decoder)
         .active_document_is_fully_active = TRY(decoder.decode<bool>()),
         .top_level_creation_url = TRY(decoder.decode<URL::URL>()),
         .top_level_origin = TRY(decoder.decode<URL::Origin>()),
+        .top_level_is_created_by_web_content = TRY(decoder.decode<bool>()),
+        .top_level_session_history_entry_count = TRY(decoder.decode<u64>()),
         .has_cross_site_ancestor = TRY(decoder.decode<bool>()),
         .browsing_context_group_id = TRY(decoder.decode<Optional<u64>>()),
         .opener_policy = TRY(decoder.decode<Web::HTML::OpenerPolicy>()),
         .active_browsing_context_is_auxiliary = TRY(decoder.decode<bool>()),
-        .active_browsing_context_has_opener = TRY(decoder.decode<bool>()),
         .opener_navigable_id = TRY(decoder.decode<Optional<Web::HTML::CrossProcessId>>()),
+        .one_permitted_sandboxed_navigator_navigable_id = TRY(decoder.decode<Optional<Web::HTML::CrossProcessId>>()),
         .active_document_is_completely_loaded = TRY(decoder.decode<bool>()),
         .is_closing = TRY(decoder.decode<bool>()),
         .container = TRY(decoder.decode<Web::HTML::ReplicatedContainerState>()),

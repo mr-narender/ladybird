@@ -1,19 +1,43 @@
 set(SOURCES
+    AsyncScrollUpdateOutbox.cpp
     BackingStoreManager.cpp
+    BitmapExport.cpp
+    Canvas2DCommandPlayer.cpp
     CanvasHost.cpp
+    CaretBlinkTimer.cpp
+    ColorSpaceSkia.cpp
     CompositorState.cpp
+    ContextPresenter.cpp
+    ContextScene.cpp
     ContextState.cpp
+    DisplayListPlayer.cpp
+    DisplayListPlayerSkia.cpp
+    DisplayListRasterCache.cpp
+    FontSkia.cpp
     ConnectionFromClient.cpp
+    ConnectionFromPresentation.cpp
     ConnectionFromWebContent.cpp
-    FontClient.cpp
+    ElasticOverscrollController.cpp
     FramePacer.cpp
     HostWebGLContext.cpp
+    KeyboardScrollController.cpp
     OpenGLContext.cpp
+    PainterSkia.cpp
+    PaintingSurface.cpp
     PausedDebuggerOverlay.cpp
+    PictureInPictureControls.cpp
+    RasterizeDisplayList.cpp
+    RenderClockConnection.cpp
+    ScrollFlingController.cpp
     ScrollSnapController.cpp
     ScrollbarController.cpp
+    SkiaBackendContext.cpp
+    SkiaUtils.cpp
+    VideoFrameHolds.cpp
+    VideoFrameSkia.cpp
     VSyncScheduler.cpp
     WebGLObjectMap.cpp
+    WheelGestureRouting.cpp
 )
 
 invoke_py_generator(
@@ -29,10 +53,12 @@ invoke_py_generator(
 set(GENERATED_SOURCES
     CompositorControlClientEndpoint.h
     CompositorControlServerEndpoint.h
-    CompositorFontClientEndpoint.h
-    CompositorFontServerEndpoint.h
+    CompositorPresentationClientEndpoint.h
+    CompositorPresentationServerEndpoint.h
     CompositorWebContentClientEndpoint.h
     CompositorWebContentServerEndpoint.h
+    RenderClockClientEndpoint.h
+    RenderClockServerEndpoint.h
     ${CMAKE_BINARY_DIR}/Libraries/LibCompositing/WebGL/GLFunctions.cpp
     WebGLCommandReplayer.cpp
 )
@@ -58,13 +84,21 @@ target_link_libraries(Compositor PRIVATE compositorservice LibCore LibMain LibSa
 # OpenGL framework pulled in by Skia.
 target_link_libraries(compositorservice PRIVATE LibCore LibGfx LibIPC LibMedia LibCompositing ${ANGLE_TARGETS} skia)
 
+if (HAS_VULKAN)
+    target_sources(compositorservice PRIVATE SkiaVulkanMemoryAllocator.cpp)
+    target_link_libraries(compositorservice PRIVATE Vulkan::Vulkan GPUOpen::VulkanMemoryAllocator)
+endif()
+
+if (USE_VULKAN_DMABUF_IMAGES)
+    target_sources(compositorservice PRIVATE VideoFrameSkiaVulkan.cpp)
+endif()
+
 if (APPLE)
+    target_sources(compositorservice PRIVATE VideoFrameSkia.mm)
     target_link_libraries(compositorservice PUBLIC "-framework CoreGraphics" "-framework CoreVideo")
 endif()
 
 if (WIN32)
-    target_include_directories(Compositor PRIVATE $<BUILD_INTERFACE:${PTHREAD_INCLUDE_DIR}>)
-    target_include_directories(compositorservice PRIVATE $<BUILD_INTERFACE:${PTHREAD_INCLUDE_DIR}>)
     ladybird_windows_bin(Compositor CONSOLE)
 endif()
 

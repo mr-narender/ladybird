@@ -10,6 +10,9 @@ use crate::ffi_bytes_fields;
 use crate::ffi_enum_bytes;
 use libgfx_rust::*;
 
+// The layout of records and runs on the tape, which only Rust reads.
+pub use super::tape::*;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum DisplayListCommandType {
@@ -28,6 +31,7 @@ pub enum DisplayListCommandType {
     PaintConicGradient,
     PaintOuterBoxShadow,
     PaintInnerBoxShadow,
+    PaintPathBoxShadow,
     PaintTextShadow,
     FillRectWithRoundedCorners,
     FillRoundedRectRing,
@@ -49,10 +53,26 @@ pub enum DisplayListCommandType {
     PaintScrollBar,
     CompositorSnapContainer,
     CompositorSnapArea,
+    CompositorScrollChainingBarrier,
+    CompositorNestedContextWheelRegion,
+    Canvas2DFillPath,
+    Canvas2DStrokePath,
+    Canvas2DDrawGlyphRun,
+    Canvas2DClearRect,
+    Canvas2DDrawImageFrame,
+    Canvas2DDrawCanvas,
+    Canvas2DDrawVideoFrame,
+    Canvas2DSetTransform,
+    Canvas2DSave,
+    Canvas2DRestore,
+    Canvas2DClipPath,
+    Canvas2DReset,
+    Canvas2DClearCanvas,
+    Canvas2DPutImageFrame,
 }
 ffi_enum_bytes!(DisplayListCommandType as u8);
 
-pub const DISPLAY_LIST_COMMAND_TYPE_COUNT: usize = DisplayListCommandType::CompositorSnapArea as usize + 1;
+pub const DISPLAY_LIST_COMMAND_TYPE_COUNT: usize = DisplayListCommandType::Canvas2DPutImageFrame as usize + 1;
 
 impl DisplayListCommandType {
     pub fn from_u8(value: u8) -> Option<Self> {
@@ -75,6 +95,32 @@ impl DisplayListCommandType {
                 | Self::CompositorBlockingWheelEventRegion
                 | Self::CompositorSnapContainer
                 | Self::CompositorSnapArea
+                | Self::CompositorScrollChainingBarrier
+                | Self::CompositorNestedContextWheelRegion
+        )
+    }
+
+    /// A command of the stream of a 2D canvas, which the canvas replays against its own surface in recording order,
+    /// under the state that the commands before it saved, transformed, clipped and restored. Such a command draws no
+    /// known rect, and the display list of a page never holds one. Its name starts with "Canvas2D", which is how the
+    /// build script tells it apart.
+    pub const fn is_canvas_2d(self) -> bool {
+        matches!(
+            self,
+            Self::Canvas2DFillPath
+                | Self::Canvas2DStrokePath
+                | Self::Canvas2DDrawGlyphRun
+                | Self::Canvas2DClearRect
+                | Self::Canvas2DDrawImageFrame
+                | Self::Canvas2DDrawCanvas
+                | Self::Canvas2DDrawVideoFrame
+                | Self::Canvas2DSetTransform
+                | Self::Canvas2DSave
+                | Self::Canvas2DRestore
+                | Self::Canvas2DClipPath
+                | Self::Canvas2DReset
+                | Self::Canvas2DClearCanvas
+                | Self::Canvas2DPutImageFrame
         )
     }
 
@@ -95,6 +141,7 @@ impl DisplayListCommandType {
             Self::PaintConicGradient => "PaintConicGradient",
             Self::PaintOuterBoxShadow => "PaintOuterBoxShadow",
             Self::PaintInnerBoxShadow => "PaintInnerBoxShadow",
+            Self::PaintPathBoxShadow => "PaintPathBoxShadow",
             Self::PaintTextShadow => "PaintTextShadow",
             Self::FillRectWithRoundedCorners => "FillRectWithRoundedCorners",
             Self::FillRoundedRectRing => "FillRoundedRectRing",
@@ -116,6 +163,22 @@ impl DisplayListCommandType {
             Self::PaintScrollBar => "PaintScrollBar",
             Self::CompositorSnapContainer => "CompositorSnapContainer",
             Self::CompositorSnapArea => "CompositorSnapArea",
+            Self::CompositorScrollChainingBarrier => "CompositorScrollChainingBarrier",
+            Self::CompositorNestedContextWheelRegion => "CompositorNestedContextWheelRegion",
+            Self::Canvas2DFillPath => "Canvas2DFillPath",
+            Self::Canvas2DStrokePath => "Canvas2DStrokePath",
+            Self::Canvas2DDrawGlyphRun => "Canvas2DDrawGlyphRun",
+            Self::Canvas2DClearRect => "Canvas2DClearRect",
+            Self::Canvas2DDrawImageFrame => "Canvas2DDrawImageFrame",
+            Self::Canvas2DDrawCanvas => "Canvas2DDrawCanvas",
+            Self::Canvas2DDrawVideoFrame => "Canvas2DDrawVideoFrame",
+            Self::Canvas2DSetTransform => "Canvas2DSetTransform",
+            Self::Canvas2DSave => "Canvas2DSave",
+            Self::Canvas2DRestore => "Canvas2DRestore",
+            Self::Canvas2DClipPath => "Canvas2DClipPath",
+            Self::Canvas2DReset => "Canvas2DReset",
+            Self::Canvas2DClearCanvas => "Canvas2DClearCanvas",
+            Self::Canvas2DPutImageFrame => "Canvas2DPutImageFrame",
         }
     }
 }
@@ -179,6 +242,7 @@ pub enum ClipMode {
     Intersect,
     Difference,
 }
+ffi_enum_bytes!(ClipMode as u8);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
@@ -200,6 +264,8 @@ pub struct ReplayLayer {
     pub backdrop_region: IntRect,
     pub backdrop_corner_radii: CornerRadii,
     pub effect: EffectNodeIndex,
+    /// Bounds of everything replay draws into the layer, in the effect's space, when known.
+    pub content_bounds: OptionalFloatRect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,87 +557,6 @@ ffi_bytes_fields!(DisplayListGradientColorStops {
     repeating
 });
 
-// Keep command payloads aligned, including inline object arrays.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C, align(16))]
-pub struct DisplayListCommandHeader {
-    pub command_type: DisplayListCommandType,
-    pub has_bounding_rect: bool,
-    pub inline_clip_count: u8,
-    pub has_inline_transform: bool,
-    pub payload_size: u32,
-    pub bounding_rect: IntRect,
-}
-ffi_bytes_fields!(DisplayListCommandHeader {
-    command_type,
-    has_bounding_rect,
-    inline_clip_count,
-    has_inline_transform,
-    payload_size,
-    bounding_rect
-});
-const _: () = assert!(std::mem::size_of::<DisplayListCommandHeader>() == 32);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum InlineClipKind {
-    #[default]
-    Rect,
-    RoundedRect,
-    Path,
-}
-ffi_enum_bytes!(InlineClipKind as u8);
-ffi_enum_bytes!(ClipMode as u8);
-
-// A clip applied by the player around a single command dispatch, stored as a
-// fixed-size entry at the tail of the command payload.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct DisplayListInlineClip {
-    pub clip_rect_or_path_device_bounds: FloatRect,
-    pub corner_radii: CornerRadii,
-    pub path_data: DisplayListDataSpan,
-    pub path_winding_rule: WindingRule,
-    pub kind: InlineClipKind,
-    pub mode: ClipMode,
-}
-ffi_bytes_fields!(DisplayListInlineClip {
-    clip_rect_or_path_device_bounds,
-    corner_radii,
-    path_data,
-    path_winding_rule,
-    kind,
-    mode
-});
-pub const INLINE_CLIP_ENTRY_SIZE: usize = std::mem::size_of::<DisplayListInlineClip>();
-const _: () = assert!(INLINE_CLIP_ENTRY_SIZE == 64);
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[repr(C)]
-pub struct DisplayListInlineTransform {
-    pub transform: AffineTransform,
-    pub padding: [u32; 2],
-}
-ffi_bytes_fields!(DisplayListInlineTransform { transform, padding });
-pub const INLINE_TRANSFORM_ENTRY_SIZE: usize = std::mem::size_of::<DisplayListInlineTransform>();
-const _: () = assert!(INLINE_TRANSFORM_ENTRY_SIZE == 32);
-
-// A maximal sequence of consecutive commands sharing one visual context, summarized as the tape is
-// built so that replay can enter a context, cull, and depth-sort per run. The run owns the visual
-// context of its commands, including records nested inside groups. Runs cover the whole tape.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct DisplayListCommandRun {
-    pub offset: u32,
-    pub size: u32,
-    pub context: ContextRef,
-    // Union of the draw commands' bounding rects in the run's spatial node space.
-    pub ink_bounds: IntRect,
-    pub has_unbounded_draw: bool,
-    pub has_compositor_metadata: bool,
-}
-const _: () = assert!(std::mem::size_of::<DisplayListCommandRun>() == 40);
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct DisplayListGlyph {
@@ -579,6 +564,15 @@ pub struct DisplayListGlyph {
     pub glyph_id: u32,
 }
 ffi_bytes_fields!(DisplayListGlyph { position, glyph_id });
+
+impl From<&text_layout::DrawGlyph> for DisplayListGlyph {
+    fn from(glyph: &text_layout::DrawGlyph) -> Self {
+        Self {
+            position: FloatPoint { x: glyph.x, y: glyph.y },
+            glyph_id: glyph.glyph_id,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
@@ -698,7 +692,15 @@ ffi_bytes_fields!(Repeat { x, y });
 
 pub trait DisplayListCommand: Copy + FfiBytes {
     const COMMAND_TYPE: DisplayListCommandType;
+    // Encloses everything the command draws. Only compositor metadata, which draws nothing, and the commands of the
+    // canvas 2D stream, which draw under state that only replay knows, have none.
     fn bounding_rect(&self) -> Option<IntRect> {
+        const {
+            assert!(
+                Self::COMMAND_TYPE.is_compositor_metadata() || Self::COMMAND_TYPE.is_canvas_2d(),
+                "a draw command must report its bounding rect"
+            );
+        };
         None
     }
 }
@@ -1051,29 +1053,89 @@ impl DisplayListCommand for PaintInnerBoxShadow {
     }
 }
 
+/// A box shadow of a box whose shape is a path: an outer shadow drawn outside the shape, or an inner one drawn inside
+/// it. The shadow's shape is the box's shape grown by the spread distance for an outer shadow, or what lies outside
+/// the box's shape shrunk by it for an inner one, moved by the offset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct PaintPathBoxShadow {
+    pub color: Color,
+    pub blur_radius: i32,
+    pub spread_distance: f32,
+    pub offset: FloatPoint,
+    pub shape_path_bounding_rect: FloatRect,
+    pub shape_path_data: DisplayListDataSpan,
+    pub inner: bool,
+}
+ffi_bytes_fields!(PaintPathBoxShadow {
+    color,
+    blur_radius,
+    spread_distance,
+    offset,
+    shape_path_bounding_rect,
+    shape_path_data,
+    inner
+});
+
+impl DisplayListCommand for PaintPathBoxShadow {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintPathBoxShadow;
+    fn bounding_rect(&self) -> Option<IntRect> {
+        let shape_rect = enclosing_int_rect(self.shape_path_bounding_rect);
+        if self.inner {
+            return Some(shape_rect);
+        }
+        // NB: The player grows the shape by the outline of a miter-joined stroke, whose miters reach out to Skia's default
+        //     miter limit of 4 times half the stroke width, so up to 4 times the spread at sharp corners.
+        const MITER_LIMIT: f32 = 4.0;
+        let margin = (self.spread_distance.max(0.0) * MITER_LIMIT).ceil() as i32 + self.blur_radius * 2;
+        let mut shadow_rect = shape_rect.inflated_edges(margin, margin, margin, margin);
+        shadow_rect.x += self.offset.x.floor() as i32;
+        shadow_rect.y += self.offset.y.floor() as i32;
+        shadow_rect.width += 1;
+        shadow_rect.height += 1;
+        Some(shadow_rect)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct TextShadowLayer {
+    // Added to the glyph run's translation.
+    pub offset: FloatPoint,
+    // Added to the glyph run's rect, which is the rotation pivot of vertical text.
+    pub rounded_offset: IntPoint,
+    pub blur_radius: i32,
+    pub color: Color,
+}
+ffi_bytes_fields!(TextShadowLayer {
+    offset,
+    rounded_offset,
+    blur_radius,
+    color
+});
+
+// Every text-shadow layer of one glyph run, in painting order (the bottom-most layer first).
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct PaintTextShadow {
     pub font_id: FontResourceId,
     pub glyphs: DisplayListDataSpan,
-    pub shadow_bounding_rect: IntRect,
+    pub layers: DisplayListDataSpan,
+    pub shadows_bounding_rect: IntRect,
     pub rect: IntRect,
     pub translation: FloatPoint,
     pub scale: f32,
-    pub blur_radius: i32,
-    pub color: Color,
     pub orientation: Orientation,
     pub font_smoothing: u8,
 }
 ffi_bytes_fields!(PaintTextShadow {
     font_id,
     glyphs,
-    shadow_bounding_rect,
+    layers,
+    shadows_bounding_rect,
     rect,
     translation,
     scale,
-    blur_radius,
-    color,
     orientation,
     font_smoothing
 });
@@ -1081,7 +1143,7 @@ ffi_bytes_fields!(PaintTextShadow {
 impl DisplayListCommand for PaintTextShadow {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintTextShadow;
     fn bounding_rect(&self) -> Option<IntRect> {
-        Some(self.shadow_bounding_rect)
+        Some(self.shadows_bounding_rect)
     }
 }
 
@@ -1205,8 +1267,22 @@ ffi_bytes_fields!(StrokePath {
 
 impl DisplayListCommand for StrokePath {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::StrokePath;
+    // The path bounding rect reaches half the thickness past the path, as far as round and bevel
+    // joins and butt and round caps paint. Miter joins reach out to the miter limit times that, and
+    // the corners of square caps reach out diagonally.
     fn bounding_rect(&self) -> Option<IntRect> {
-        Some(enclosing_int_rect(self.path_bounding_rect))
+        let mut reach_multiplier: f32 = 1.0;
+        if self.join_style == JoinStyle::Miter {
+            reach_multiplier = reach_multiplier.max(self.miter_limit);
+        }
+        if self.cap_style == CapStyle::Square {
+            reach_multiplier = reach_multiplier.max(std::f32::consts::SQRT_2);
+        }
+        let reach_past_path_bounding_rect = self.thickness / 2.0 * (reach_multiplier - 1.0);
+        Some(enclosing_int_rect(self.path_bounding_rect.inflated(
+            2.0 * reach_past_path_bounding_rect,
+            2.0 * reach_past_path_bounding_rect,
+        )))
     }
 }
 
@@ -1365,7 +1441,7 @@ impl DisplayListCommand for PaintNestedDisplayList {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct DrawIsolatedGroup {
-    pub clip_rect: OptionalFloatRect,
+    pub clip_rect: FloatRect,
     pub content: DisplayListDataSpan,
     pub mask: DisplayListDataSpan,
     pub filter: DisplayListDataSpan,
@@ -1386,7 +1462,7 @@ ffi_bytes_fields!(DrawIsolatedGroup {
 impl DisplayListCommand for DrawIsolatedGroup {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::DrawIsolatedGroup;
     fn bounding_rect(&self) -> Option<IntRect> {
-        self.clip_rect.get().map(enclosing_int_rect)
+        Some(enclosing_int_rect(self.clip_rect))
     }
 }
 
@@ -1421,6 +1497,12 @@ pub struct CompositorScrollNode {
     pub is_viewport: bool,
     pub can_be_wheel_scrolled_horizontally: bool,
     pub can_be_wheel_scrolled_vertically: bool,
+    /// Whether a scroll the scroller cannot scroll by is passed on to the scrollers around it.
+    pub chains_scroll_to_ancestors_horizontally: bool,
+    pub chains_scroll_to_ancestors_vertically: bool,
+    /// Whether a touchpad may pull the scroller past the edges of its scroll range.
+    pub shows_overscroll_effect_horizontally: bool,
+    pub shows_overscroll_effect_vertically: bool,
 }
 ffi_bytes_fields!(CompositorScrollNode {
     document_id,
@@ -1434,7 +1516,11 @@ ffi_bytes_fields!(CompositorScrollNode {
     pseudo_element_type,
     is_viewport,
     can_be_wheel_scrolled_horizontally,
-    can_be_wheel_scrolled_vertically
+    can_be_wheel_scrolled_vertically,
+    chains_scroll_to_ancestors_horizontally,
+    chains_scroll_to_ancestors_vertically,
+    shows_overscroll_effect_horizontally,
+    shows_overscroll_effect_vertically
 });
 
 impl DisplayListCommand for CompositorScrollNode {
@@ -1548,6 +1634,48 @@ impl DisplayListCommand for CompositorWheelHitTestTargetWithCornerRadii {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii;
 }
 
+/// A scroll container that has no scroll node, because a wheel can scroll nothing in it, and that keeps the scrolls
+/// along an axis to itself all the same: a wheel inside `rect` is not passed on to the scroll node above it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorScrollChainingBarrier {
+    pub document_id: UniqueNodeId,
+    pub scroll_node_index_above_barrier: SpatialNodeIndex,
+    pub rect: FloatRect,
+    pub keeps_horizontal_scrolls: bool,
+    pub keeps_vertical_scrolls: bool,
+}
+ffi_bytes_fields!(CompositorScrollChainingBarrier {
+    document_id,
+    scroll_node_index_above_barrier,
+    rect,
+    keeps_horizontal_scrolls,
+    keeps_vertical_scrolls
+});
+
+impl DisplayListCommand for CompositorScrollChainingBarrier {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorScrollChainingBarrier;
+}
+
+/// Where a nested context is painted: its content box, clipped to the rounded padding edge. The compositor can hand a
+/// wheel inside `rect` that nothing painted later covers to the nested context's own scroll nodes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct CompositorNestedContextWheelRegion {
+    pub rect: FloatRect,
+    pub corner_radii: CornerRadii,
+    pub child_context_id: CompositorContextId,
+}
+ffi_bytes_fields!(CompositorNestedContextWheelRegion {
+    rect,
+    corner_radii,
+    child_context_id
+});
+
+impl DisplayListCommand for CompositorNestedContextWheelRegion {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::CompositorNestedContextWheelRegion;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorMainThreadWheelEventRegion {
@@ -1577,7 +1705,6 @@ pub struct CompositorScrollbar {
     pub track_color: Color,
     pub vertical: bool,
     pub is_painted_by_compositor: bool,
-    pub display_list_paints_enlarged_scrollbar: bool,
 }
 ffi_bytes_fields!(CompositorScrollbar {
     document_id,
@@ -1594,8 +1721,7 @@ ffi_bytes_fields!(CompositorScrollbar {
     thumb_color,
     track_color,
     vertical,
-    is_painted_by_compositor,
-    display_list_paints_enlarged_scrollbar
+    is_painted_by_compositor
 });
 
 impl DisplayListCommand for CompositorScrollbar {
@@ -1609,6 +1735,8 @@ pub struct PaintScrollBar {
     pub gutter_rect: IntRect,
     pub thumb_rect: IntRect,
     pub track_rect: IntRect,
+    // The compositor presents the scrollbar growing into this rect as it is hovered.
+    pub expanded_gutter_rect: IntRect,
     pub scroll_size: f64,
     pub thumb_color: Color,
     pub track_color: Color,
@@ -1619,6 +1747,7 @@ ffi_bytes_fields!(PaintScrollBar {
     gutter_rect,
     thumb_rect,
     track_rect,
+    expanded_gutter_rect,
     scroll_size,
     thumb_color,
     track_color,
@@ -1628,10 +1757,368 @@ ffi_bytes_fields!(PaintScrollBar {
 impl DisplayListCommand for PaintScrollBar {
     const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintScrollBar;
     fn bounding_rect(&self) -> Option<IntRect> {
-        Some(self.track_rect.united(self.thumb_rect))
+        Some(
+            self.track_rect
+                .united(self.thumb_rect)
+                .united(self.expanded_gutter_rect),
+        )
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Canvas2DPaintKind {
+    #[default]
+    Color,
+    LinearGradient,
+    RadialGradient,
+    ConicGradient,
+    Pattern,
+}
+ffi_enum_bytes!(Canvas2DPaintKind as u8);
+
+// The values of Gfx::CanvasPatternPaintStyle::Repetition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Canvas2DPatternRepetition {
+    #[default]
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
+}
+ffi_enum_bytes!(Canvas2DPatternRepetition as u8);
+
+/// The fill or stroke style of a 2D canvas draw. Only the fields of its kind are read: the color, the points and the
+/// radii of a gradient, which are in the coordinates the draw is transformed from, or the image of a pattern. A
+/// pattern without an image is one whose image was not available when script created it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DPaint {
+    pub kind: Canvas2DPaintKind,
+    pub pattern_repetition: Canvas2DPatternRepetition,
+    pub pattern_has_image: bool,
+    pub color: Color,
+    pub start_point: FloatPoint,
+    pub end_point: FloatPoint,
+    pub start_radius: f32,
+    pub end_radius: f32,
+    pub start_angle: f32,
+    pub color_stops: DisplayListGradientColorStops,
+    pub pattern_image_id: ImageFrameResourceId,
+    pub pattern_transform: OptionalAffineTransform,
+}
+ffi_bytes_fields!(Canvas2DPaint {
+    kind,
+    pattern_repetition,
+    pattern_has_image,
+    color,
+    start_point,
+    end_point,
+    start_radius,
+    end_radius,
+    start_angle,
+    color_stops,
+    pattern_image_id,
+    pattern_transform
+});
+
+/// The shadow that a 2D canvas draw casts, with its offset and blur in the coordinates of the canvas, which the
+/// current transformation matrix does not affect.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DShadow {
+    pub color: Color,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+}
+ffi_bytes_fields!(Canvas2DShadow {
+    color,
+    offset_x,
+    offset_y,
+    blur
+});
+
+/// How a 2D canvas draw composites onto the canvas: through the serialized filter graph of the context, if it has one,
+/// with the global alpha of the context, with its compositing and blending operator, and with the shadow that it
+/// casts, if it casts one.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DCompositing {
+    pub filter: DisplayListDataSpan,
+    pub has_filter: bool,
+    pub global_alpha: f32,
+    pub compositing_and_blending_operator: CompositingAndBlendingOperator,
+    pub has_shadow: bool,
+    pub shadow: Canvas2DShadow,
+}
+ffi_bytes_fields!(Canvas2DCompositing {
+    filter,
+    has_filter,
+    global_alpha,
+    compositing_and_blending_operator,
+    has_shadow,
+    shadow
+});
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DFillPath {
+    pub path_data: DisplayListDataSpan,
+    pub paint: Canvas2DPaint,
+    pub winding_rule: WindingRule,
+    pub compositing: Canvas2DCompositing,
+}
+ffi_bytes_fields!(Canvas2DFillPath {
+    path_data,
+    paint,
+    winding_rule,
+    compositing
+});
+
+impl DisplayListCommand for Canvas2DFillPath {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DFillPath;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DStrokePath {
+    pub path_data: DisplayListDataSpan,
+    pub paint: Canvas2DPaint,
+    pub thickness: f32,
+    pub cap_style: CapStyle,
+    pub join_style: JoinStyle,
+    pub miter_limit: f32,
+    pub dash_array: DisplayListDataSpan,
+    pub dash_offset: f32,
+    pub compositing: Canvas2DCompositing,
+}
+ffi_bytes_fields!(Canvas2DStrokePath {
+    path_data,
+    paint,
+    thickness,
+    cap_style,
+    join_style,
+    miter_limit,
+    dash_array,
+    dash_offset,
+    compositing
+});
+
+impl DisplayListCommand for Canvas2DStrokePath {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DStrokePath;
+}
+
+// The glyphs of one font, positioned relative to the translation, with the top of the line box at the glyph position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DDrawGlyphRun {
+    pub font_id: FontResourceId,
+    pub glyphs: DisplayListDataSpan,
+    pub translation: FloatPoint,
+    pub paint: Canvas2DPaint,
+    pub compositing: Canvas2DCompositing,
+}
+ffi_bytes_fields!(Canvas2DDrawGlyphRun {
+    font_id,
+    glyphs,
+    translation,
+    paint,
+    compositing
+});
+
+impl DisplayListCommand for Canvas2DDrawGlyphRun {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DDrawGlyphRun;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DClearRect {
+    pub rect: FloatRect,
+    pub color: Color,
+}
+ffi_bytes_fields!(Canvas2DClearRect { rect, color });
+
+impl DisplayListCommand for Canvas2DClearRect {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DClearRect;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DDrawImageFrame {
+    pub frame_id: ImageFrameResourceId,
+    pub dst_rect: FloatRect,
+    pub src_rect: FloatRect,
+    pub scaling_mode: ScalingMode,
+    pub compositing: Canvas2DCompositing,
+}
+ffi_bytes_fields!(Canvas2DDrawImageFrame {
+    frame_id,
+    dst_rect,
+    src_rect,
+    scaling_mode,
+    compositing
+});
+
+impl DisplayListCommand for Canvas2DDrawImageFrame {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DDrawImageFrame;
+}
+
+// Draws what another canvas of the same connection holds at this point of the stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DDrawCanvas {
+    pub source_canvas_id: CanvasId,
+    pub dst_rect: FloatRect,
+    pub src_rect: FloatRect,
+    pub scaling_mode: ScalingMode,
+    pub compositing: Canvas2DCompositing,
+}
+ffi_bytes_fields!(Canvas2DDrawCanvas {
+    source_canvas_id,
+    dst_rect,
+    src_rect,
+    scaling_mode,
+    compositing
+});
+
+impl DisplayListCommand for Canvas2DDrawCanvas {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DDrawCanvas;
+}
+
+// Draws a frame of a video that WebContent holds for the stream, named by the handle of its sink and its generation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DDrawVideoFrame {
+    pub video_sink_handle: u64,
+    pub generation: u64,
+    pub dst_rect: FloatRect,
+    pub src_rect: FloatRect,
+    pub scaling_mode: ScalingMode,
+    pub compositing: Canvas2DCompositing,
+}
+ffi_bytes_fields!(Canvas2DDrawVideoFrame {
+    video_sink_handle,
+    generation,
+    dst_rect,
+    src_rect,
+    scaling_mode,
+    compositing
+});
+
+impl DisplayListCommand for Canvas2DDrawVideoFrame {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DDrawVideoFrame;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DSetTransform {
+    pub transform: AffineTransform,
+}
+ffi_bytes_fields!(Canvas2DSetTransform { transform });
+
+impl DisplayListCommand for Canvas2DSetTransform {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DSetTransform;
+}
+
+// NB: C++ gives a struct without fields a size of one byte, so the commands that take no arguments carry padding to
+//     be the same size on both sides.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DSave {
+    pub padding: u32,
+}
+ffi_bytes_fields!(Canvas2DSave { padding });
+
+impl DisplayListCommand for Canvas2DSave {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DSave;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DRestore {
+    pub padding: u32,
+}
+ffi_bytes_fields!(Canvas2DRestore { padding });
+
+impl DisplayListCommand for Canvas2DRestore {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DRestore;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DClipPath {
+    pub path_data: DisplayListDataSpan,
+    pub winding_rule: WindingRule,
+}
+ffi_bytes_fields!(Canvas2DClipPath {
+    path_data,
+    winding_rule
+});
+
+impl DisplayListCommand for Canvas2DClipPath {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DClipPath;
+}
+
+// Drops every saved state and clip, back to the state the canvas was created with.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DReset {
+    pub padding: u32,
+}
+ffi_bytes_fields!(Canvas2DReset { padding });
+
+impl DisplayListCommand for Canvas2DReset {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DReset;
+}
+
+// Sets every pixel of the canvas to the color, outside of any transform or clip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DClearCanvas {
+    pub color: Color,
+}
+ffi_bytes_fields!(Canvas2DClearCanvas { color });
+
+impl DisplayListCommand for Canvas2DClearCanvas {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DClearCanvas;
+}
+
+// Sets the pixels of the canvas at the position to those of the frame, regardless of the transform, the clip and the
+// compositing of the context, as putImageData() does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Canvas2DPutImageFrame {
+    pub frame_id: ImageFrameResourceId,
+    pub position: IntPoint,
+}
+ffi_bytes_fields!(Canvas2DPutImageFrame { frame_id, position });
+
+impl DisplayListCommand for Canvas2DPutImageFrame {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::Canvas2DPutImageFrame;
 }
 
 pub fn int_rect_from_two_points(a: IntPoint, b: IntPoint) -> IntRect {
     IntRect::new(a.x.min(b.x), a.y.min(b.y), (a.x - b.x).abs(), (a.y - b.y).abs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_commands_of_the_canvas_2d_stream_are_the_ones_whose_names_say_so() {
+        // The build script sorts the commands into the C++ lists by their names.
+        for value in 0..DISPLAY_LIST_COMMAND_TYPE_COUNT {
+            let command_type = DisplayListCommandType::from_u8(value as u8).unwrap();
+            assert_eq!(
+                command_type.is_canvas_2d(),
+                command_type.name().starts_with("Canvas2D"),
+                "{}",
+                command_type.name()
+            );
+            assert!(!(command_type.is_canvas_2d() && command_type.is_compositor_metadata()));
+        }
+    }
 }

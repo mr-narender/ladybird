@@ -28,7 +28,7 @@
 namespace Web::HTML {
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#timerhandler
-using TimerHandler = Variant<GC::Ref<WebIDL::CallbackType>, Utf16String>;
+using TimerHandler = Variant<Utf16String, GC::Ref<WebIDL::CallbackType>, GC::Ref<TrustedTypes::TrustedScript>>;
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#windoworworkerglobalscope
 class WEB_API WindowOrWorkerGlobalScopeMixin {
@@ -46,8 +46,8 @@ public:
     WebIDL::ExceptionOr<Utf16String> btoa(Utf16View data) const;
     WebIDL::ExceptionOr<Utf16String> atob(Utf16View data) const;
 
-    i32 set_timeout(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
-    i32 set_interval(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
+    WebIDL::ExceptionOr<i32> set_timeout(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
+    WebIDL::ExceptionOr<i32> set_interval(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
     void clear_timeout(i32);
     void clear_interval(i32);
     void clear_map_of_active_timers();
@@ -83,6 +83,7 @@ public:
     void add_resource_timing_entry(Badge<ResourceTiming::PerformanceResourceTiming>, GC::Ref<ResourceTiming::PerformanceResourceTiming> entry);
 
     void register_event_source(Badge<EventSource>, GC::Ref<EventSource>);
+    void register_permission_status(PermissionsAPI::PermissionStatus&);
     void unregister_event_source(Badge<EventSource>, GC::Ref<EventSource>);
     void forcibly_close_all_event_sources();
 
@@ -119,14 +120,8 @@ public:
 
     void report_error(JS::Value e);
 
-    enum class OmitError {
-        Yes,
-        No,
-    };
-    void report_an_exception(JS::Value exception, OmitError = OmitError::No);
-
-    GC::Ref<WebIDL::CallbackType> count_queuing_strategy_size_function();
-    GC::Ref<WebIDL::CallbackType> byte_length_queuing_strategy_size_function();
+    bool is_in_error_reporting_mode() const { return m_in_error_reporting_mode; }
+    void set_in_error_reporting_mode(bool value) { m_in_error_reporting_mode = value; }
 
     void push_onto_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise>);
     bool remove_from_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise>);
@@ -142,7 +137,7 @@ public:
 
     static void set_experimental_interfaces_exposed(bool);
     static bool expose_experimental_interfaces();
-    static bool expose_experimental_interface(EnvironmentSettingsObject&, StringView name);
+    static bool expose_experimental_interface(EnvironmentSettingsObject const&, StringView name);
 
     [[nodiscard]] GC::Ref<Crypto::Crypto> crypto();
     [[nodiscard]] GC::Ref<ServiceWorker::CacheStorage> caches();
@@ -162,7 +157,7 @@ private:
         Yes,
         No,
     };
-    i32 run_timer_initialization_steps(TimerHandler handler, i32 timeout, GC::RootVector<JS::Value> arguments, Repeat repeat, Optional<i32> previous_id = {});
+    WebIDL::ExceptionOr<i32> run_timer_initialization_steps(TimerHandler handler, i32 timeout, GC::RootVector<JS::Value> arguments, Repeat repeat, Optional<i32> previous_id = {});
     void run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass, Function<void()> completion_step, Optional<i32> timer_key, Repeat repeat = Repeat::No);
     bool document_is_hidden() const;
     bool timers_are_throttled() const;
@@ -211,6 +206,7 @@ private:
     // The open BroadcastChannel objects with a message or messageerror listener, which this global keeps alive. They're
     // held here rather than rooted — so a channel that's never closed can't keep its global alive.
     HashTable<GC::Ref<BroadcastChannel>> m_strongly_referenced_broadcast_channels;
+    Vector<GC::Weak<PermissionsAPI::PermissionStatus>> m_permission_statuses;
 
     GC::Ptr<HighResolutionTime::Performance> m_performance;
 
@@ -222,7 +218,7 @@ private:
 
     GC::Ptr<TrustedTypes::TrustedTypePolicyFactory> m_trusted_type_policy_factory;
 
-    bool m_error_reporting_mode { false };
+    bool m_in_error_reporting_mode { false };
 
     WebSockets::WebSocket::List m_registered_web_sockets;
 
@@ -243,12 +239,6 @@ private:
     // https://w3c.github.io/resource-timing/#dfn-resource-timing-secondary-buffer
     // A resource timing secondary buffer to store PerformanceResourceTiming objects that is initially empty.
     Vector<GC::Ref<ResourceTiming::PerformanceResourceTiming>> m_resource_timing_secondary_buffer;
-
-    // https://streams.spec.whatwg.org/#count-queuing-strategy-size-function
-    GC::Ptr<WebIDL::CallbackType> m_count_queuing_strategy_size_function;
-
-    // https://streams.spec.whatwg.org/#byte-length-queuing-strategy-size-function
-    GC::Ptr<WebIDL::CallbackType> m_byte_length_queuing_strategy_size_function;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#about-to-be-notified-rejected-promises-list
     GC::Ptr<GC::HeapVector<GC::Ref<JS::Promise>>> m_about_to_be_notified_rejected_promises_list;

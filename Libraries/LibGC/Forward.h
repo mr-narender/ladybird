@@ -6,16 +6,19 @@
 
 #pragma once
 
+#include <AK/StdLibExtras.h>
 #include <AK/Types.h>
 #include <LibGC/Export.h>
 
 namespace GC {
 
+struct CAPI;
 class Cell;
 class CellAllocator;
 struct CellTypeInfo;
 struct CellTypeThunks;
 class DeferGC;
+class ForeignCell;
 class RootImpl;
 class Heap;
 class HeapGroup;
@@ -41,8 +44,9 @@ class Ref;
 template<class T>
 class Ptr;
 
+// Precisely traceable pointers belong in RootVector rather than conservative storage.
 template<class T, size_t inline_capacity = 0>
-class ConservativeVector;
+requires(!IsSpecializationOf<RemoveCVReference<T>, Ptr> && !IsSpecializationOf<RemoveCVReference<T>, Ref>) class ConservativeVector;
 
 template<typename K, typename V, typename KeyTraits, typename ValueTraits, bool IsOrdered>
 class ConservativeHashMap;

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::painting::paint_read::GeometryRead;
 use crate::painting::record::trace::Observer;
 
 use crate::css::css_enums::flex_direction;
@@ -28,13 +29,13 @@ pub(crate) fn record_inspector_overlays<O: Observer>(recorder: &mut PaintRecorde
             paint_box_model_highlight(recorder, paintable, highlight);
         });
     }
-    for input in inputs.flex_overlays {
+    for input in &inputs.flex_overlays {
         with_highlight_context(recorder, input.paintable, |recorder, paintable| {
             paint_flex_overlay(recorder, paintable, input);
         });
     }
     if let Some(grid) = &inputs.grid_overlays {
-        for input in grid.inputs {
+        for input in &grid.inputs {
             with_highlight_context(recorder, input.paintable, |recorder, paintable| {
                 paint_grid_overlay(recorder, paintable, input, &grid.fonts);
             });
@@ -50,7 +51,7 @@ fn with_highlight_context<O: Observer>(
     paintable: NodeSlotId,
     callback: impl FnOnce(&mut PaintRecorder<'_, O>, NodeSlotId),
 ) {
-    if paintable.is_invalid() || !recorder.layout_arena.paintable_row_is_populated(paintable) {
+    if paintable.is_invalid() || !recorder.source.paintable_row_is_populated(paintable) {
         return;
     }
     // Overlays follow the highlighted element's transforms and scroll offsets, but must not be clipped
@@ -62,20 +63,20 @@ fn with_highlight_context<O: Observer>(
 fn paint_box_model_highlight<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
-    highlight: &InspectorHighlight<'_>,
+    highlight: &InspectorHighlight,
 ) {
-    let content_rect = paintable_geometry::absolute_rect(recorder.layout_arena, paintable);
-    let margin = paintable_geometry::committed_margin(recorder.layout_arena, paintable);
-    let border = paintable_geometry::committed_border(recorder.layout_arena, paintable);
-    let padding = paintable_geometry::committed_padding(recorder.layout_arena, paintable);
+    let content_rect = paintable_geometry::absolute_rect(recorder.source, paintable);
+    let margin = paintable_geometry::committed_margin(recorder.source, paintable);
+    let border = paintable_geometry::committed_border(recorder.source, paintable);
+    let padding = paintable_geometry::committed_padding(recorder.source, paintable);
     let margin_rect = content_rect.inflated(
         margin.top + border.top + padding.top,
         margin.right + border.right + padding.right,
         margin.bottom + border.bottom + padding.bottom,
         margin.left + border.left + padding.left,
     );
-    let border_rect = paintable_geometry::absolute_border_box_rect(recorder.layout_arena, paintable);
-    let padding_rect = paintable_geometry::absolute_padding_box_rect(recorder.layout_arena, paintable);
+    let border_rect = paintable_geometry::absolute_border_box_rect(recorder.source, paintable);
+    let padding_rect = paintable_geometry::absolute_padding_box_rect(recorder.source, paintable);
 
     let converter = recorder.converter;
     let paint_inspector_rect = |recorder: &mut PaintRecorder<'_, O>, rect: CssPixelRect, color: Color| {
@@ -115,11 +116,11 @@ fn paint_flex_overlay<O: Observer>(
     input: &FfiFlexOverlayInput,
 ) {
     let Some(flex_layout_data) =
-        crate::painting::paintable_geometry::committed_flex_layout_data(recorder.layout_arena, paintable)
+        crate::painting::paintable_geometry::committed_flex_layout_data(recorder.source, paintable)
     else {
         return;
     };
-    let content_rect = paintable_geometry::absolute_rect(recorder.layout_arena, paintable);
+    let content_rect = paintable_geometry::absolute_rect(recorder.source, paintable);
     let origin = CssPixelPoint {
         x: content_rect.x,
         y: content_rect.y,
@@ -257,11 +258,11 @@ fn paint_grid_overlay<O: Observer>(
     fonts: &OverlayLabelFonts,
 ) {
     let Some(grid_layout_data) =
-        crate::painting::paintable_geometry::committed_grid_layout_data(recorder.layout_arena, paintable)
+        crate::painting::paintable_geometry::committed_grid_layout_data(recorder.source, paintable)
     else {
         return;
     };
-    let content_rect = paintable_geometry::absolute_rect(recorder.layout_arena, paintable);
+    let content_rect = paintable_geometry::absolute_rect(recorder.source, paintable);
     let origin = CssPixelPoint {
         x: content_rect.x,
         y: content_rect.y,
@@ -469,7 +470,7 @@ struct OverlayLabel {
     device_ascent: f32,
     device_descent: f32,
     blob_bounds: [f32; 4],
-    glyphs: Vec<DisplayListGlyph>,
+    glyphs: libgfx_rust::text_layout::GlyphBuffer,
 }
 
 fn shape_overlay_label<O: Observer>(
@@ -491,14 +492,6 @@ fn shape_overlay_label<O: Observer>(
     let device_ascent = device_font.facts().ascent;
     let device_descent = device_font.facts().descent;
     let font_id = recorder.register_font(device_font);
-    let glyphs = shaped
-        .glyphs()
-        .iter()
-        .map(|glyph| DisplayListGlyph {
-            position: FloatPoint { x: glyph.x, y: glyph.y },
-            glyph_id: glyph.glyph_id,
-        })
-        .collect();
     OverlayLabel {
         font_id,
         css_width: css_font.measure_text_width(text),
@@ -507,7 +500,7 @@ fn shape_overlay_label<O: Observer>(
         device_ascent,
         device_descent,
         blob_bounds,
-        glyphs,
+        glyphs: shaped.into_glyphs(),
     }
 }
 
@@ -537,7 +530,7 @@ fn draw_label<O: Observer>(recorder: &mut PaintRecorder<'_, O>, label: &OverlayL
         GlyphRunForRecording {
             font_smoothing: crate::css::css_enums::font_smoothing::AUTO,
             font_id: FontResourceId(label.font_id),
-            glyphs: &label.glyphs,
+            glyphs: label.glyphs.iter().map(DisplayListGlyph::from),
         },
         color,
         rect,

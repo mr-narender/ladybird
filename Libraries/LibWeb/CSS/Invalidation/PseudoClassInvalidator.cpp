@@ -12,12 +12,13 @@
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/ShadowRoot.h>
 
 namespace Web::CSS::Invalidation {
 
 static bool pseudo_class_propagates_to_ancestors(CSS::PseudoClass pseudo_class)
 {
-    return first_is_one_of(pseudo_class, CSS::PseudoClass::Hover, CSS::PseudoClass::FocusWithin);
+    return pseudo_class == CSS::PseudoClass::FocusWithin;
 }
 
 static AncestorTraversal ancestor_traversal_for_pseudo_class(CSS::PseudoClass pseudo_class)
@@ -39,13 +40,13 @@ void invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass pseudo_cl
     auto traversal = ancestor_traversal_for_pseudo_class(pseudo_class);
 
     auto build_chain = [&](GC::Ptr<DOM::Node> start) {
-        HashTable<DOM::Element const*> chain;
+        GC::RootHashTable<DOM::Element const*> chain;
         if (!start)
             return chain;
         if (propagates) {
             for_each_inclusive_ancestor_element(*start, traversal, [&](DOM::Element& element) {
                 chain.set(&element);
-                return TraversalDecision::Continue;
+                return element.rendered_in_top_layer() ? TraversalDecision::Break : TraversalDecision::Continue;
             });
         } else if (auto* element = as_if<DOM::Element>(*start)) {
             chain.set(element);
@@ -78,7 +79,7 @@ void invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass pseudo_cl
                 if (other_chain.contains(&element))
                     return TraversalDecision::Break;
                 visit(element);
-                return TraversalDecision::Continue;
+                return element.rendered_in_top_layer() ? TraversalDecision::Break : TraversalDecision::Continue;
             });
         } else if (auto* element = as_if<DOM::Element>(*start)) {
             if (!other_chain.contains(element))
@@ -95,11 +96,11 @@ struct PropagatingState {
     GC::Ptr<DOM::Node> source;
 };
 
-static Array<PropagatingState, 2> propagating_states(DOM::Document& document)
+// The style engine moves `:hover` with the elements that hold it itself (see `record_subtree_disconnecting()`).
+static Array<PropagatingState, 1> propagating_states(DOM::Document& document)
 {
     return { {
         { CSS::PseudoClass::FocusWithin, document.focused_area() },
-        { CSS::PseudoClass::Hover, document.hovered_node() },
     } };
 }
 
@@ -109,6 +110,10 @@ static bool subtree_holds_propagating_state_source(DOM::Node const& subtree, CSS
         for (auto const* node = &source; node; node = node->flat_tree_parent()) {
             if (node == &subtree)
                 return true;
+            if (is<DOM::ShadowRoot>(subtree) && node->parent() == &subtree)
+                return true;
+            if (auto const* element = as_if<DOM::Element>(*node); element && element->rendered_in_top_layer())
+                break;
         }
         return false;
     }
@@ -135,12 +140,8 @@ void invalidate_style_after_subtree_place_changed(DOM::Node& subtree, GC::Ptr<DO
         if (!from)
             return;
         for_each_inclusive_ancestor_element(*from, ancestor_traversal_for_pseudo_class(pseudo_class), [&](DOM::Element& element) {
-            auto* hovered = element.document().hovered_node();
-            auto holds = pseudo_class == CSS::PseudoClass::FocusWithin
-                ? element.matches_focus_within_pseudo_class()
-                : hovered && (&element == hovered || element.is_shadow_including_ancestor_of(*hovered));
-            record_element_state_changed(element, pseudo_class, holds);
-            return TraversalDecision::Continue;
+            record_element_state_changed(element, pseudo_class, element.matches_focus_within_pseudo_class());
+            return element.rendered_in_top_layer() ? TraversalDecision::Break : TraversalDecision::Continue;
         });
     };
 

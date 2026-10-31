@@ -6,16 +6,13 @@
  */
 
 #include <LibURL/URL.h>
-#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
-#include <LibWeb/Fetch/Infrastructure/URL.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/Window.h>
 #include <LibWeb/ReferrerPolicy/AbstractOperations.h>
-#include <LibWeb/SecureContexts/AbstractOperations.h>
+#include <LibWebCommon/Fetch/Infrastructure/URL.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
+#include <LibWebCommon/SecureContexts/AbstractOperations.h>
 
 namespace Web::ReferrerPolicy {
 
@@ -60,7 +57,7 @@ Optional<URL::URL> determine_requests_referrer(Fetch::Infrastructure::Request co
     auto const& policy = request.referrer_policy();
 
     // 2. Let environment be request’s client.
-    auto environment = request.client();
+    auto const& environment = request.client_snapshot();
 
     // 3. Switch on request’s referrer:
     auto referrer_source = request.referrer().visit(
@@ -69,35 +66,19 @@ Optional<URL::URL> determine_requests_referrer(Fetch::Infrastructure::Request co
             // Note: If request’s referrer is "no-referrer", Fetch will not call into this algorithm.
             VERIFY(referrer == Fetch::Infrastructure::Request::Referrer::Client);
 
-            // FIXME: Add a const global_object() getter to ESO
-            auto& global_object = const_cast<HTML::EnvironmentSettingsObject&>(*environment).global_object();
+            // 1. If environment is null, then return no referrer.
+            if (!environment)
+                return {};
 
-            // 1. If environment’s global object is a Window object, then
-            if (auto const* window = HTML::window_from_global_object(global_object)) {
-                // 1. Let document be the associated Document of environment’s global object.
-                auto const& document = window->associated_document();
-
-                // 2. If document’s origin is an opaque origin, return no referrer.
-                if (document.origin().is_opaque())
-                    return {};
-
-                // FIXME: 3. While document is an iframe srcdoc document, let document be document’s browsing context’s
-                //           browsing context container’s node document.
-
-                // 4. Let referrerSource be document’s URL.
-                return document.url();
-            }
-            // 2. Otherwise, let referrerSource be environment’s creation URL.
-            else {
-                return environment->creation_url;
-            }
+            // AD-HOC: Steps 2 and 3 ran when the client's snapshot was taken, which holds their result.
+            return environment->referrer_source;
         },
         // a URL
         [&](URL::URL const& url) -> Optional<URL::URL> {
             // Let referrerSource be request’s referrer.
             return url;
         });
-    // NOTE: This only happens in step 1.2. of the "client" case above.
+    // NOTE: This only happens in steps 1 and 2.2. of the "client" case above.
     if (!referrer_source.has_value())
         return {};
 

@@ -27,6 +27,12 @@
 
 namespace Web::ViewTransition {
 
+static bool has_more_than_one_box_fragment(Layout::BegunRead const& read, DOM::Element const& element)
+{
+    auto const* layout_node = element.layout_node(read);
+    return layout_node && Painting::has_committed_box(*layout_node) && Painting::box_fragment_count(*layout_node) > 1;
+}
+
 CSS::RustStyleValueHandle make_translation_transform(CSSPixels x, CSSPixels y)
 {
     CSS::StyleValueFFI::StyleValueData const* values[] = {
@@ -46,7 +52,7 @@ GC_DEFINE_ALLOCATOR(CapturedElement);
 GC_DEFINE_ALLOCATOR(ViewTransition);
 
 NamedViewTransitionPseudoElement::NamedViewTransitionPseudoElement(CSS::PseudoElement type, Utf16FlyString view_transition_name)
-    : m_type(type)
+    : DOM::SyntheticPseudoElementTreeNode(type)
     , m_view_transition_name(view_transition_name)
 {
 }
@@ -69,7 +75,7 @@ ViewTransition::ViewTransition(GC::Ref<DOM::Document> document, GC::Ref<WebIDL::
     , m_ready_promise(ready_promise)
     , m_update_callback_done_promise(update_callback_done_promise)
     , m_finished_promise(finished_promise)
-    , m_transition_root_pseudo_element(GC::Heap::the().allocate<DOM::SyntheticPseudoElementTreeNode>())
+    , m_transition_root_pseudo_element(GC::Heap::the().allocate<DOM::SyntheticPseudoElementTreeNode>(CSS::PseudoElement::ViewTransition))
 
 {
 }
@@ -234,6 +240,7 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
     // 1. Let document be transition’s relevant global object’s associated document.
     auto& document = this->document();
 
+    Layout::ForcedReadScope read { document };
     document.update_layout(DOM::UpdateLayoutReason::ViewTransitionCapture);
 
     // 2. Let namedElements be transition’s named elements.
@@ -243,7 +250,7 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
     auto used_transition_names = AK::OrderedHashTable<Utf16FlyString>();
 
     // 4. Let captureElements be a new list of elements.
-    auto capture_elements = AK::Vector<DOM::Element&>();
+    GC::RootVector<GC::Ref<DOM::Element>> capture_elements;
 
     // 5. If the snapshot containing block size exceeds an implementation-defined maximum, then return failure.
     auto snapshot_containing_block = document.navigable()->snapshot_containing_block();
@@ -259,12 +266,13 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
     auto result = document.document_element()->for_each_in_inclusive_subtree_of_type<DOM::Element>([&](auto& element) {
         // NOTE: Step 1 is handled at the end of this function.
 
-        // 2. If element has more than one box fragment, then continue.
-        // FIXME: Implement this once we have fragments.
-
         // OPTIMIZATION: Continue early if the element is not rendered, so we don't have to ensure the computed
         //               properties are up to date.
-        if (element.not_rendered())
+        if (element.not_rendered(read))
+            return TraversalDecision::Continue;
+
+        // 2. If element has more than one box fragment, then continue.
+        if (has_more_than_one_box_fragment(read, element))
             return TraversalDecision::Continue;
 
         // 3. Let transitionName be the element’s document-scoped view transition name.
@@ -277,7 +285,7 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
         // 5. If usedTransitionNames contains transitionName, then:
         if (used_transition_names.contains(transition_name.value())) {
             // 1. For each element in captureElements:
-            for (auto& element : capture_elements)
+            for (DOM::Element& element : capture_elements)
                 // 1. Set element’s captured in a view transition to false.
                 element.set_captured_in_a_view_transition(false);
 
@@ -304,7 +312,7 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
         return Error::from_string_literal("Cannot include multiple elements with the same view-transition-name in a view transition.");
 
     // 8. For each element in captureElements:
-    for (auto& element : capture_elements) {
+    for (DOM::Element& element : capture_elements) {
         // 1. Let capture be a new captured element struct.
         auto capture = GC::Heap::the().allocate<CapturedElement>();
 
@@ -313,7 +321,7 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
 
         // 3. Let originalRect be snapshot containing block if element is the document element, otherwise, the
         //    element's border box.
-        auto const* layout_node = element.layout_node();
+        auto const* layout_node = element.layout_node(read);
         VERIFY(element.is_document_element() || (layout_node && Painting::has_committed_box(*layout_node)));
         auto original_rect = element.is_document_element() ? snapshot_containing_block : Painting::absolute_border_box_rect(*layout_node);
 
@@ -329,32 +337,32 @@ ErrorOr<void> ViewTransition::capture_the_old_state()
         capture->old_transform = make_translation_transform(0, 0);
 
         // 7. Set capture’s old writing-mode to the computed value of writing-mode on element.
-        capture->old_writing_mode = element.layout_node()->writing_mode();
+        capture->old_writing_mode = element.layout_node(read)->writing_mode();
 
         // 8. Set capture’s old direction to the computed value of direction on element.
-        capture->old_direction = element.layout_node()->direction();
+        capture->old_direction = element.layout_node(read)->direction();
 
         // 9. Set capture’s old text-orientation to the computed value of text-orientation on element.
         // FIXME: Implement this once we have text-orientation.
 
         // 10. Set capture’s old mix-blend-mode to the computed value of mix-blend-mode on element.
-        capture->old_mix_blend_mode = element.layout_node()->mix_blend_mode();
+        capture->old_mix_blend_mode = element.layout_node(read)->mix_blend_mode();
 
         // 11. Set capture’s old backdrop-filter to the computed value of backdrop-filter on element.
-        capture->old_backdrop_filter = element.layout_node()->backdrop_filter().materialize();
+        capture->old_backdrop_filter = element.layout_node(read)->backdrop_filter().filter_list();
 
         // 12. Set capture’s old color-scheme to the computed value of color-scheme on element.
-        capture->old_color_scheme = element.layout_node()->color_scheme();
+        capture->old_color_scheme = element.layout_node(read)->color_scheme();
 
         // 13. Let transitionName be the computed value of view-transition-name for element.
-        auto transition_name = element.layout_node()->view_transition_name();
+        auto transition_name = element.layout_node(read)->view_transition_name();
 
         // 14. Set namedElements[transitionName] to capture.
         named_elements.set(transition_name.value(), capture);
     }
 
     // 9. For each element in captureElements:
-    for (auto& element : capture_elements) {
+    for (DOM::Element& element : capture_elements) {
         // 1. Set element’s captured in a view transition to false.
         element.set_captured_in_a_view_transition(false);
     }
@@ -370,6 +378,7 @@ ErrorOr<void> ViewTransition::capture_the_new_state()
     // 1. Let document be transition’s relevant global object’s associated document.
     auto& document = this->document();
 
+    Layout::ForcedReadScope read { document };
     document.update_layout(DOM::UpdateLayoutReason::ViewTransitionCapture);
 
     // 2. Let namedElements be transition’s named elements.
@@ -386,7 +395,7 @@ ErrorOr<void> ViewTransition::capture_the_new_state()
 
         // OPTIMIZATION: Continue early if the element is not rendered, so we don't have to ensure the computed
         //               properties are up to date.
-        if (element.not_rendered())
+        if (element.not_rendered(read))
             return TraversalDecision::Continue;
 
         // 2. Let transitionName be the element’s document-scoped view transition name.
@@ -397,7 +406,8 @@ ErrorOr<void> ViewTransition::capture_the_new_state()
             return TraversalDecision::Continue;
 
         // 4. If element has more than one box fragment, then continue.
-        // FIXME: Implement this once we have fragments
+        if (has_more_than_one_box_fragment(read, element))
+            return TraversalDecision::Continue;
 
         // 5. If usedTransitionNames contains transitionName, then return failure.
         if (used_transition_names.contains(transition_name.value()))
@@ -824,6 +834,9 @@ void ViewTransition::handle_transition_frame()
 // https://drafts.csswg.org/css-view-transitions-1/#update-pseudo-element-styles
 ErrorOr<void> ViewTransition::update_pseudo_element_styles()
 {
+    Layout::ForcedReadScope read { *m_document };
+    // NB: Ensure layout is up to date before reading the new elements' boxes.
+    m_document->update_layout(DOM::UpdateLayoutReason::ViewTransitionPseudoElementStyles);
     // To update pseudo-element styles for a ViewTransition transition:
 
     // 1. For each transitionName → capturedElement of transition’s named elements:
@@ -837,7 +850,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
         Optional<CSS::Direction> direction = {};
         // FIXME: Implement this once we have text-orientation.
         Optional<CSS::MixBlendMode> mix_blend_mode = {};
-        Optional<CSS::Filter> backdrop_filter = {};
+        CSS::RustStyleValueHandle backdrop_filter;
         Optional<CSS::PreferredColorScheme> color_scheme = {};
 
         // 2. If capturedElement’s new element is null, then:
@@ -874,27 +887,29 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
         else {
             // 1. Return failure if any of the following conditions is true:
 
+            //    - capturedElement’s new element is not rendered.
+            // NB: This is checked first, as ancestors of an element that is not rendered may have no computed style.
+            if (captured_element->new_element->not_rendered(read))
+                return Error::from_string_literal("capturedElement’s new element is not rendered.");
+
             //    - capturedElement’s new element has a flat tree ancestor that skips its contents.
             for (auto ancestor = captured_element->new_element->flat_tree_parent_element(); ancestor; ancestor = ancestor->flat_tree_parent_element()) {
                 if (ancestor->skips_its_contents())
                     return Error::from_string_literal("capturedElement’s new element has a flat tree ancestor that skips its contents.");
             }
 
-            //    - capturedElement’s new element is not rendered.
-            if (captured_element->new_element->not_rendered())
-                return Error::from_string_literal("capturedElement’s new element is not rendered.");
-
             //    - capturedElement has more than one box fragment.
-            // FIXME: Implement this once we have fragments.
             // FIXME: capturedElement would not have box fragments. Update this once the spec issue for that has been resolved:
             //        https://github.com/w3c/csswg-drafts/issues/11991
+            if (has_more_than_one_box_fragment(read, *captured_element->new_element))
+                return Error::from_string_literal("capturedElement has more than one box fragment.");
 
             // NOTE: Other rendering constraints are enforced via capturedElement’s new element being
             //       captured in a view transition.
 
             // 2. Let newRect be the snapshot containing block if capturedElement’s new element is the
             //    document element, otherwise, capturedElement’s border box.
-            auto const* layout_node = captured_element->new_element->layout_node();
+            auto const* layout_node = captured_element->new_element->layout_node(read);
             VERIFY(captured_element->new_element->is_document_element() || (layout_node && Painting::has_committed_box(*layout_node)));
             auto new_rect = captured_element->new_element->is_document_element() ? captured_element->new_element->navigable()->snapshot_containing_block() : Painting::absolute_border_box_rect(*layout_node);
 
@@ -910,10 +925,10 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
             transform = make_translation_transform(offset.x(), offset.y());
 
             // 6. Set writingMode to the computed value of writing-mode on capturedElement’s new element.
-            writing_mode = captured_element->new_element->layout_node()->writing_mode();
+            writing_mode = captured_element->new_element->layout_node(read)->writing_mode();
 
             // 7. Set direction to the computed value of direction on capturedElement’s new element.
-            direction = captured_element->new_element->layout_node()->direction();
+            direction = captured_element->new_element->layout_node(read)->direction();
 
             // 8. Set textOrientation to the computed value of text-orientation on capturedElement’s new
             //    element.
@@ -921,13 +936,13 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
 
             // 9. Set mixBlendMode to the computed value of mix-blend-mode on capturedElement’s new
             //    element.
-            mix_blend_mode = captured_element->new_element->layout_node()->mix_blend_mode();
+            mix_blend_mode = captured_element->new_element->layout_node(read)->mix_blend_mode();
 
             // 10. Set backdropFilter to the computed value of backdrop-filter on capturedElement’s new element.
-            backdrop_filter = captured_element->new_element->layout_node()->backdrop_filter().materialize();
+            backdrop_filter = captured_element->new_element->layout_node(read)->backdrop_filter().filter_list();
 
             // 11. Set colorScheme to the computed value of color-scheme on capturedElement’s new element.
-            color_scheme = captured_element->new_element->layout_node()->color_scheme();
+            color_scheme = captured_element->new_element->layout_node(read)->color_scheme();
         }
 
         // 4. If capturedElement’s group styles rule is null, then set capturedElement’s group styles rule to a new
@@ -987,7 +1002,7 @@ ErrorOr<void> ViewTransition::update_pseudo_element_styles()
             // 1. Let new be the ::view-transition-new() with the view transition name transitionName.
             ReplacedNamedViewTransitionPseudoElement* new_;
             m_transition_root_pseudo_element->for_each_in_inclusive_subtree_of_type<ReplacedNamedViewTransitionPseudoElement>([&](auto& element) {
-                if (element.m_type == CSS::PseudoElement::ViewTransitionNew && element.m_view_transition_name == transition_name) {
+                if (element.type() == CSS::PseudoElement::ViewTransitionNew && element.m_view_transition_name == transition_name) {
                     new_ = &element;
                     return TraversalDecision::Break;
                 }

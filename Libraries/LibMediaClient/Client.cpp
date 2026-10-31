@@ -6,7 +6,6 @@
 
 #include <AK/Checked.h>
 #include <AK/NeverDestroyed.h>
-#include <LibCore/System.h>
 #include <LibCore/Timer.h>
 #include <LibMediaClient/Client.h>
 #include <LibMediaClient/RemoteMediaStream.h>
@@ -34,10 +33,6 @@ ErrorOr<NonnullRefPtr<Client>> Client::acquire()
 
     auto transport = TRY((*s_transport_factory)());
     auto client = TRY(try_make_ref_counted<Client>(move(transport)));
-#ifdef AK_OS_WINDOWS
-    auto response = client->send_sync<InitTransport>(Core::System::getpid());
-    client->transport().set_peer_pid(response->peer_pid());
-#endif
     *s_client = client;
     client->update_idle_timer();
     return client;
@@ -54,6 +49,8 @@ Client::~Client() = default;
 void Client::die()
 {
     verify_event_loop();
+    // NB: Forgetting this client below, or running its on_death callback, can drop the last reference to it.
+    NonnullRefPtr keep_client_alive_until_death_is_handled = *this;
     if (*s_client == this)
         *s_client = nullptr;
 
@@ -70,8 +67,39 @@ void Client::die()
     auto pending_decoder_capabilities_requests = move(m_pending_decoder_capabilities_requests);
     for (auto& [id, promise] : pending_decoder_capabilities_requests)
         promise->reject(Error::from_string_literal("The media server is gone"));
-    if (on_death)
-        on_death();
+}
+
+Messages::MediaClient::RequestAudioServerConnectionResponse Client::request_audio_server_connection()
+{
+    if (!on_request_audio_server_connection) {
+        dbgln("A MediaServer asked a non-controller for an AudioServer connection");
+        return OptionalNone {};
+    }
+    auto handle = on_request_audio_server_connection();
+    if (handle.is_error()) {
+        warnln("Unable to connect a MediaServer to the AudioServer: {}", handle.error());
+        return OptionalNone {};
+    }
+    return handle.release_value();
+}
+
+void Client::request_video_decoder_server_connection(u64 request_id)
+{
+    if (!on_request_video_decoder_server_connection) {
+        dbgln("A MediaServer asked a non-controller for a VideoDecoderServer connection");
+        async_video_decoder_server_connection_ready(request_id, OptionalNone {});
+        return;
+    }
+    on_request_video_decoder_server_connection([self = NonnullRefPtr(*this), request_id](ErrorOr<IPC::TransportHandle> handle) {
+        if (!self->is_open())
+            return;
+        if (handle.is_error()) {
+            warnln("Unable to connect a MediaServer to a VideoDecoderServer: {}", handle.error());
+            self->async_video_decoder_server_connection_ready(request_id, OptionalNone {});
+            return;
+        }
+        self->async_video_decoder_server_connection_ready(request_id, handle.release_value());
+    });
 }
 
 u64 Client::allocate_id()
@@ -79,28 +107,45 @@ u64 Client::allocate_id()
     return m_next_id++;
 }
 
-ErrorOr<IPC::TransportHandle> Client::create_video_presentation_channel()
+template<typename Reply, typename OtherReplyHandler>
+OwnPtr<Reply> Client::wait_for_reply_to(u64 request_id, OtherReplyHandler handle_other_reply)
 {
-    auto response = send_sync_but_allow_failure<Messages::MediaServer::CreateVideoPresentationChannel>();
-    if (!response || !response->handle().has_value())
-        return Error::from_string_literal("The media server did not create a video presentation channel");
-    return response->take_handle().release_value();
+    while (true) {
+        auto reply = wait_for_specific_endpoint_message<Reply>();
+        if (!reply || reply->request_id() == request_id)
+            return reply;
+        m_creation_event_loop->deferred_invoke([self = NonnullRefPtr(*this), reply = reply.release_nonnull(), handle_other_reply] mutable {
+            handle_other_reply(*self, *reply);
+        });
+    }
 }
 
 Media::MediaSupportInfo Client::query_file_media_support(StringView type, StringView subtype, Optional<String> codecs_parameter)
 {
-    auto response = send_sync_but_allow_failure<Messages::MediaServer::QueryFileMediaSupport>(String::from_utf8_without_validation(type.bytes()), String::from_utf8_without_validation(subtype.bytes()), move(codecs_parameter));
-    if (!response)
+    if (!is_open())
         return {};
-    return response->info();
+    auto request_id = allocate_id();
+    async_request_file_media_support(request_id, String::from_utf8_without_validation(type.bytes()), String::from_utf8_without_validation(subtype.bytes()), move(codecs_parameter));
+    auto reply = wait_for_reply_to<Messages::MediaClient::FileMediaSupportReported>(request_id, [](Client& client, auto& other_reply) {
+        client.file_media_support_reported(other_reply.request_id(), other_reply.take_info());
+    });
+    if (!reply)
+        return {};
+    return reply->take_info();
 }
 
 Optional<Media::DecoderCapabilities> Client::query_decoder_capabilities(StringView codecs_parameter)
 {
-    auto response = send_sync_but_allow_failure<Messages::MediaServer::QueryDecoderCapabilities>(String::from_utf8_without_validation(codecs_parameter.bytes()));
-    if (!response)
+    if (!is_open())
         return {};
-    return response->capabilities();
+    auto request_id = allocate_id();
+    async_request_decoder_capabilities(request_id, String::from_utf8_without_validation(codecs_parameter.bytes()));
+    auto reply = wait_for_reply_to<Messages::MediaClient::DecoderCapabilitiesReported>(request_id, [](Client& client, auto& other_reply) {
+        client.decoder_capabilities_reported(other_reply.request_id(), other_reply.take_capabilities());
+    });
+    if (!reply)
+        return {};
+    return reply->take_capabilities();
 }
 
 NonnullRefPtr<Client::FileMediaSupportPromise> Client::request_file_media_support(String const& type, String const& subtype, Optional<String const&> codecs_parameter)
@@ -225,7 +270,7 @@ void Client::update_idle_timer()
         return;
     }
     if (!m_idle_timer) {
-        m_idle_timer = Core::Timer::create_single_shot(IDLE_EXIT_DELAY_MS, [this] {
+        m_idle_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(IDLE_EXIT_DELAY_MS), [this] {
             // Clearing the client reference closes the connection and causes the server to exit.
             if (*s_client == this)
                 *s_client = nullptr;
@@ -251,10 +296,16 @@ void Client::playback_session_clock_changed(u64 session_id, Media::MediaTimeRead
         playback_manager->clock_changed({}, move(time_reader));
 }
 
-void Client::playback_session_metadata_parsed(u64 session_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<UnixDateTime> start_time_realtime)
+void Client::playback_session_media_source_added(u64 session_id, Optional<u64> stream_id, Vector<Media::Track> audio_tracks, Vector<Media::Track> video_tracks, Optional<Media::Track> preferred_audio_track, Optional<Media::Track> preferred_video_track, Optional<UnixDateTime> start_time_realtime, Media::DemuxerScanState scan_state)
 {
     if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->metadata_parsed({}, audio_tracks, video_tracks, move(preferred_audio_track), move(preferred_video_track), start_time_realtime);
+        playback_manager->media_source_added({}, stream_id, move(audio_tracks), move(video_tracks), move(preferred_audio_track), move(preferred_video_track), start_time_realtime, move(scan_state));
+}
+
+void Client::playback_session_media_stream_source_failed(u64 session_id, u64 stream_id, Media::DecoderError error)
+{
+    if (auto* playback_manager = find_playback_manager(session_id))
+        playback_manager->media_stream_source_failed({}, stream_id, move(error));
 }
 
 void Client::playback_session_duration_changed(u64 session_id, AK::Duration duration)
@@ -273,10 +324,10 @@ void Client::playback_session_state_changed(u64 session_id, u64 applied_seek_req
         playback_manager->state_changed({}, applied_seek_request_id, state, is_playing, available_data, current_time);
 }
 
-void Client::playback_session_buffered_ranges_changed(u64 session_id, Media::TimeRanges buffered_ranges)
+void Client::playback_session_media_stream_scan_state_changed(u64 session_id, u64 stream_id, Media::DemuxerScanState scan_state)
 {
     if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->buffered_ranges_changed({}, buffered_ranges);
+        playback_manager->media_stream_scan_state_changed({}, stream_id, move(scan_state));
 }
 
 void Client::playback_session_error(u64 session_id, Media::DecoderError error)
@@ -289,18 +340,6 @@ void Client::playback_session_video_resized(u64 session_id, Media::VideoSinkHand
 {
     if (auto* playback_manager = find_playback_manager(session_id))
         playback_manager->video_resized({}, handle, Gfx::Size<u32> { width, height });
-}
-
-void Client::playback_session_video_edge_attached(u64 session_id, Media::VideoSinkHandle handle, Media::PresentedFramePage presented_frame_page)
-{
-    if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->video_edge_attached({}, handle, move(presented_frame_page));
-}
-
-void Client::playback_session_video_frame_pool_retired(u64 session_id, Media::VideoSinkHandle handle, Media::VideoFramePoolID pool_id)
-{
-    if (auto* playback_manager = find_playback_manager(session_id))
-        playback_manager->video_frame_pool_retired({}, handle, pool_id);
 }
 
 void Client::source_buffer_duration_received(u64 session_id, u64 source_buffer_id, double duration)

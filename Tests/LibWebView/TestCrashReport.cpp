@@ -9,19 +9,68 @@
 #include <LibCore/CrashHandler.h>
 #include <LibCore/CrashReportData.h>
 #include <LibCore/DirIterator.h>
-#include <LibCore/Directory.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 #include <LibTest/TestCase.h>
-#include <LibWebCommon/WebView/ProcessHandle.h>
 #include <LibWebView/CrashReport.h>
 #include <LibWebView/ProcessManager.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(TEST_CRASH_REPORT_LATE_LIBRARY)
+#    include <dlfcn.h>
+#endif
+
+#if defined(AK_OS_LINUX)
+TEST_CASE(crash_scratch_has_fixed_size_and_allows_report_writes)
+{
+    auto report = MUST(WebView::CrashReport::create(WebView::ProcessType::WebContent));
+    auto fd = report->fd();
+    // NB: Depending on vm.memfd_noexec, the kernel can also add F_SEAL_EXEC.
+    auto seals = MUST(Core::System::fcntl(fd, F_GET_SEALS, static_cast<uintptr_t>(0)));
+    auto required_seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
+    EXPECT_EQ(seals & required_seals, required_seals);
+    EXPECT_EQ(seals & F_SEAL_WRITE, 0);
+    EXPECT(MUST(Core::System::fcntl(fd, F_GETFD, static_cast<uintptr_t>(0))) & FD_CLOEXEC);
+
+    auto metadata = MUST(Core::System::fstat(fd));
+    EXPECT_EQ(metadata.st_nlink, 0u);
+    EXPECT_EQ(metadata.st_mode & 0777, 0600u);
+    auto size = metadata.st_size;
+    // NB: The record holds the header, the frames, and a build description of at most 16 KiB after its length.
+    auto description_offset = sizeof(Core::CrashReportData::ReportHeader) + Core::CrashReportData::maximum_frames * sizeof(Core::CrashReportData::ReportFrame);
+    EXPECT_EQ(size, static_cast<off_t>(description_offset + sizeof(u32) + 16 * KiB));
+
+    auto shrink_result = ftruncate(fd, 0);
+    auto shrink_error = errno;
+    EXPECT_EQ(shrink_result, -1);
+    EXPECT_EQ(shrink_error, EPERM);
+    auto grow_result = ftruncate(fd, size + 1);
+    auto grow_error = errno;
+    EXPECT_EQ(grow_result, -1);
+    EXPECT_EQ(grow_error, EPERM);
+
+    Core::CrashReportData::ReportHeader header;
+    EXPECT_EQ(pwrite(fd, &header, sizeof(header), 0), static_cast<ssize_t>(sizeof(header)));
+    Core::CrashReportData::ReportHeader recorded;
+    EXPECT_EQ(pread(fd, &recorded, sizeof(recorded), 0), static_cast<ssize_t>(sizeof(recorded)));
+    EXPECT_EQ(recorded.magic, header.magic);
+
+    auto description = WebView::CrashReport::describe_current_build(WebView::ProcessType::WebContent);
+    MUST(report->record_build_description(description));
+    u32 recorded_length = 0;
+    EXPECT_EQ(pread(fd, &recorded_length, sizeof(recorded_length), description_offset), static_cast<ssize_t>(sizeof(recorded_length)));
+    EXPECT_EQ(recorded_length, description.length());
+    auto recorded_description = MUST(ByteBuffer::create_uninitialized(recorded_length));
+    EXPECT_EQ(pread(fd, recorded_description.data(), recorded_length, description_offset + sizeof(recorded_length)), static_cast<ssize_t>(recorded_length));
+    EXPECT_EQ(StringView { recorded_description.bytes() }, description.view());
+}
+#endif
 
 static ByteString test_directory()
 {
@@ -43,19 +92,13 @@ static void cleanup()
         MUST(FileSystem::remove(test_directory(), FileSystem::RecursionMode::Allowed));
 }
 
-TEST_CASE(helper_termination_requires_a_specific_process_id)
-{
-    EXPECT(!WebView::should_terminate_pid(-1));
-    EXPECT(!WebView::should_terminate_pid(0));
-    EXPECT(WebView::should_terminate_pid(1));
-}
-
 enum class CrashThread {
     Main,
     Worker,
 };
 
-static int crash_child(WebView::CrashReport& report, int signal, CrashThread thread = CrashThread::Main)
+template<typename Crash>
+static int crash_child_running(WebView::CrashReport& report, Crash crash)
 {
     auto pid = fork();
     VERIFY(pid >= 0);
@@ -63,6 +106,17 @@ static int crash_child(WebView::CrashReport& report, int signal, CrashThread thr
         struct rlimit limit { 0, 0 };
         setrlimit(RLIMIT_CORE, &limit);
         MUST(Core::CrashHandler::initialize(report.fd()));
+        crash();
+        _exit(0);
+    }
+    int status;
+    VERIFY(waitpid(pid, &status, 0) == pid);
+    return status;
+}
+
+static int crash_child(WebView::CrashReport& report, int signal, CrashThread thread = CrashThread::Main)
+{
+    return crash_child_running(report, [&] {
         if (thread == CrashThread::Worker) {
             auto crash_worker = [](void* argument) -> void* {
                 raise(*static_cast<int*>(argument));
@@ -74,12 +128,39 @@ static int crash_child(WebView::CrashReport& report, int signal, CrashThread thr
         } else {
             raise(signal);
         }
-        _exit(0);
-    }
-    int status;
-    VERIFY(waitpid(pid, &status, 0) == pid);
-    return status;
+    });
 }
+
+#if defined(TEST_CRASH_REPORT_LATE_LIBRARY)
+TEST_CASE(unresolved_frames_do_not_skip_stack_search)
+{
+    for (size_t frame_count : { 3uz, Core::CrashReportData::maximum_frames }) {
+        auto report = MUST(WebView::CrashReport::create(WebView::ProcessType::Compositor));
+        auto status = crash_child_running(*report, [&] {
+            auto* library = dlopen(TEST_CRASH_REPORT_LATE_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+            VERIFY(library);
+            auto crash = reinterpret_cast<void (*)(size_t)>(dlsym(library, "crash_with_unresolved_frames"));
+            VERIFY(crash);
+            crash(frame_count);
+        });
+        EXPECT(WIFSIGNALED(status));
+        EXPECT_EQ(WTERMSIG(status), SIGILL);
+        Core::CrashReportData::ReportHeader header;
+        EXPECT_EQ(pread(report->fd(), &header, sizeof(header), 0), static_cast<ssize_t>(sizeof(header)));
+        EXPECT(header.frame_count >= frame_count);
+        EXPECT(header.frame_count <= Core::CrashReportData::maximum_frames);
+        bool has_binary_identity = false;
+        for (size_t i = 0; i < header.frame_count; ++i) {
+            Core::CrashReportData::ReportFrame frame;
+            EXPECT_EQ(pread(report->fd(), &frame, sizeof(frame), sizeof(header) + i * sizeof(frame)), static_cast<ssize_t>(sizeof(frame)));
+            if (i < min(frame_count, Core::CrashReportData::maximum_frames - 1))
+                EXPECT_EQ(frame.binary.size, 0u);
+            has_binary_identity |= frame.binary.size != 0;
+        }
+        EXPECT(has_binary_identity);
+    }
+}
+#endif
 
 TEST_CASE(capture_native_crash_without_personal_data)
 {
@@ -98,6 +179,7 @@ TEST_CASE(capture_native_crash_without_personal_data)
         auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
         auto contents = MUST(file->read_until_eof());
         StringView text { contents };
+        EXPECT(text.contains("\nCrashed at: 20"sv));
         EXPECT(text.contains("Captured signal:"sv));
         EXPECT(text.contains("Executable build ID:"sv));
         EXPECT(text.contains("#0 "sv));
@@ -107,7 +189,7 @@ TEST_CASE(capture_native_crash_without_personal_data)
         EXPECT(!text.contains(test_directory()));
         EXPECT(!text.contains("/Users/"sv));
         EXPECT(!text.contains("/home/"sv));
-        EXPECT_EQ(MUST(file->stat()).st_mode & 0777u, 0600u);
+        EXPECT_EQ(MUST(file->stat()).st_mode & 0777u, 0400u);
     }
     EXPECT_EQ(MUST(Core::System::stat(test_directory())).st_mode & 0777u, 0700u);
 }
@@ -156,42 +238,9 @@ TEST_CASE(missing_or_malformed_capture_produces_a_minimal_report)
     auto file = MUST(Core::File::open(paths[0], Core::File::OpenMode::Read));
     auto contents = MUST(file->read_until_eof());
     StringView text { contents };
-    EXPECT(text.contains("Termination signal: SIGSEGV"sv));
+    EXPECT(text.contains("Termination signal: SIGSEGV\nTermination signal number: 11\n"sv));
     EXPECT(text.contains("Unavailable:"sv));
     EXPECT(!text.contains(private_text));
-}
-
-TEST_CASE(retention_is_bounded)
-{
-    cleanup();
-    ScopeGuard guard = cleanup;
-    MUST(Core::Directory::create(test_directory(), Core::Directory::CreateDirectories::Yes));
-    auto legacy_path = ByteString::formatted("{}/WebContent-legacy.txt", test_directory());
-    auto legacy_file = MUST(Core::File::open(legacy_path, Core::File::OpenMode::Write));
-    MUST(legacy_file->write_until_depleted("Legacy report\n"sv.bytes()));
-    timespec legacy_times[2] { { 1, 0 }, { 1, 0 } };
-    VERIFY(futimens(legacy_file->fd(), legacy_times) == 0);
-    Vector<ByteString> created_paths { legacy_path };
-    for (u32 i = 0; i < 25; ++i) {
-        auto type = i % 2 ? WebView::ProcessType::RequestServer : WebView::ProcessType::WebContent;
-        auto report = MUST(WebView::CrashReport::create(type));
-        MUST(report->save(SIGSEGV, test_directory()));
-        auto previous_count = created_paths.size();
-        for (auto const& path : report_paths()) {
-            if (created_paths.contains_slow(path))
-                continue;
-            auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
-            timespec times[2] { { 2 + i, 0 }, { 2 + i, 0 } };
-            VERIFY(futimens(file->fd(), times) == 0);
-            created_paths.append(path);
-        }
-        EXPECT_EQ(created_paths.size(), previous_count + 1);
-    }
-    auto retained_paths = report_paths();
-    EXPECT_EQ(retained_paths.size(), 20u);
-    for (auto const& path : created_paths.span().slice(6))
-        EXPECT(retained_paths.contains_slow(path));
-    EXPECT(!retained_paths.contains_slow(legacy_path));
 }
 
 TEST_CASE(invalid_frame_lengths_are_ignored)
@@ -274,12 +323,12 @@ TEST_CASE(helper_process_names)
 {
     cleanup();
     ScopeGuard guard = cleanup;
-    for (auto type : { WebView::ProcessType::WebContent, WebView::ProcessType::WebWorker, WebView::ProcessType::RequestServer, WebView::ProcessType::ImageDecoder, WebView::ProcessType::MediaServer, WebView::ProcessType::Compositor, WebView::ProcessType::WasmCompiler }) {
+    for (auto type : { WebView::ProcessType::WebContent, WebView::ProcessType::WebWorker, WebView::ProcessType::RequestServer, WebView::ProcessType::ImageDecoder, WebView::ProcessType::MediaServer, WebView::ProcessType::Compositor }) {
         auto report = MUST(WebView::CrashReport::create(type));
         MUST(report->save(SIGSEGV, test_directory()));
     }
     auto paths = report_paths();
-    EXPECT_EQ(paths.size(), 7u);
+    EXPECT_EQ(paths.size(), 6u);
     for (auto const& path : paths) {
         auto file = MUST(Core::File::open(path, Core::File::OpenMode::Read));
         auto contents = MUST(file->read_until_eof());

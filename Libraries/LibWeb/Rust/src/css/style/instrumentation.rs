@@ -9,9 +9,8 @@
 //! The engine chooses between selective and batch plans, between resident state and cold
 //! evaluation, and between narrow and widened impact regions. Those choices are only defensible if
 //! they are visible, so each one bumps a counter.
-//!
-//! Counters are per document and read from one thread, so they are plain integers rather than
-//! atomics.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! define_counters {
     ($($variant:ident => $name:literal,)+) => {
@@ -28,6 +27,7 @@ macro_rules! define_counters {
 
         impl Counter {
             #[must_use]
+            #[cfg(test)]
             pub fn name(self) -> &'static str {
                 COUNTER_NAMES[self as usize]
             }
@@ -61,10 +61,10 @@ define_counters! {
     AtomSweeps => "atomSweeps",
     AtomSweepsDeferredForActiveTraversal => "atomSweepsDeferredForActiveTraversal",
     AtomSweepRootSlotsVisited => "atomSweepRootSlotsVisited",
-    AtomSweepPinReleasesSkipped => "atomSweepPinReleasesSkipped",
     StyleAtomsReclaimed => "styleAtomsReclaimed",
     LanguageTextsPublished => "languageTextsPublished",
     CustomPropertyNamesPublished => "customPropertyNamesPublished",
+    SlotAssignedNodeListsPublished => "slotAssignedNodeListsPublished",
 
     // Exclusive transaction intervals. Fused stages retain one name until execution splits.
     TransactionMicroseconds => "transactionMicroseconds",
@@ -122,13 +122,6 @@ define_counters! {
     StructuralTests => "structuralTests",
     RelationalTests => "relationalTests",
 
-    // DOM selector queries. Candidate rows are the elements admitted by the query plan, while
-    // evaluations are the rows that reached the exact matcher after selector-list deduplication.
-    SelectorQueryCandidateRows => "selectorQueryCandidateRows",
-    SelectorQueryEvaluations => "selectorQueryEvaluations",
-    SelectorQueryAttributeValuePlanHits => "selectorQueryAttributeValuePlanHits",
-    SelectorQueryAttributeValueCatalogScans => "selectorQueryAttributeValueCatalogScans",
-
     // Candidate enumeration and cold evaluation.
     ColdMatchingBatchMissingRows => "coldMatchingBatchMissingRows",
     ColdMatchingBatchRows => "coldMatchingBatchRows",
@@ -151,53 +144,32 @@ define_counters! {
     EngineComputedRecordDeltas => "engineComputedRecordDeltas",
     EngineComputedRecordCohortHits => "engineComputedRecordCohortHits",
     EngineComputedRecordSharedHits => "engineComputedRecordSharedHits",
-    EngineComputedRecordGateReaction => "engineComputedRecordGateReaction",
-    EngineComputedRecordGateDeclarations => "engineComputedRecordGateDeclarations",
-    EngineComputedRecordGateIncompleteAnswer => "engineComputedRecordGateIncompleteAnswer",
     EngineComputedPseudoRecords => "engineComputedPseudoRecords",
+    PseudoRecordDemandsLeftToHost => "pseudoRecordDemandsLeftToHost",
     EngineComputedRecordUnchangedWinners => "engineComputedRecordUnchangedWinners",
     EngineComputedRecordsAbandoned => "engineComputedRecordsAbandoned",
-    RetryAfterAncestorCalls => "retryAfterAncestorCalls",
-    RetryAfterAncestorSettled => "retryAfterAncestorSettled",
-    RetryAfterAncestorPseudoAbandons => "retryAfterAncestorPseudoAbandons",
-    RetryAfterAncestorColdHits => "retryAfterAncestorColdHits",
-    RetryAfterAncestorMicroseconds => "retryAfterAncestorMicroseconds",
-    EngineComputedRecordBailPseudoStale => "engineComputedRecordBailPseudoStale",
-    EngineComputedRecordBailPseudoBackdrop => "engineComputedRecordBailPseudoBackdrop",
-    EngineComputedRecordBailPseudoMask => "engineComputedRecordBailPseudoMask",
-    EngineComputedRecordBailPseudoRow => "engineComputedRecordBailPseudoRow",
-    EngineComputedRecordBailPseudoFlip => "engineComputedRecordBailPseudoFlip",
     EngineComputedRecordGateAncestors => "engineComputedRecordGateAncestors",
     EngineComputedLonghandEvaluations => "engineComputedLonghandEvaluations",
-    EngineComputedRecordBailNoCascadeState => "engineComputedRecordBailNoCascadeState",
-    EngineComputedRecordBailStaleCascadeState => "engineComputedRecordBailStaleCascadeState",
-    EngineComputedRecordBailWinnerMissingNode => "engineComputedRecordBailWinnerMissingNode",
-    EngineComputedRecordBailWinnerStaleProgram => "engineComputedRecordBailWinnerStaleProgram",
-    EngineComputedRecordBailWinnerStalePriority => "engineComputedRecordBailWinnerStalePriority",
-    EngineComputedRecordBailUnchangedWinners => "engineComputedRecordBailUnchangedWinners",
     EngineComputedRecordBailIncompleteWinners => "engineComputedRecordBailIncompleteWinners",
-    EngineComputedRecordBailRecord => "engineComputedRecordBailRecord",
     EngineComputedRecordBailProperty => "engineComputedRecordBailProperty",
     EngineComputedRecordBailWinner => "engineComputedRecordBailWinner",
     EngineComputedRecordBailWinnerOperator => "engineComputedRecordBailWinnerOperator",
-    EngineComputedRecordBailWinnerSpelling => "engineComputedRecordBailWinnerSpelling",
     EngineComputedRecordBailWinnerElement => "engineComputedRecordBailWinnerElement",
     EngineComputedRecordBailWinnerAnimated => "engineComputedRecordBailWinnerAnimated",
-    EngineComputedRecordBailNoEnvironment => "engineComputedRecordBailNoEnvironment",
+    EngineComputedRecordBailUnhosted => "engineComputedRecordBailUnhosted",
     EngineComputedRecordBailCustomProperties => "engineComputedRecordBailCustomProperties",
     EngineComputedRecordBailSubstitution => "engineComputedRecordBailSubstitution",
     EngineComputedRecordSubstitutions => "engineComputedRecordSubstitutions",
     EngineComputedRecordSubstitutionMemoHits => "engineComputedRecordSubstitutionMemoHits",
     EngineCustomPropertyEnvironmentsResolved => "engineCustomPropertyEnvironmentsResolved",
     EngineCustomPropertyEnvironmentMemoHits => "engineCustomPropertyEnvironmentMemoHits",
+    EngineCustomPropertyEnvironmentAnswerHits => "engineCustomPropertyEnvironmentAnswerHits",
     EngineCustomPropertyEnvironmentBails => "engineCustomPropertyEnvironmentBails",
-    EngineComputedRecordBailFontPhase => "engineComputedRecordBailFontPhase",
+    EngineComputedRecordBailMonospaceQuirk => "engineComputedRecordBailMonospaceQuirk",
     EngineComputedRecordBailRecordParent => "engineComputedRecordBailRecordParent",
     EngineComputedRecordBailDrive => "engineComputedRecordBailDrive",
     EngineComputedRecordBailValue => "engineComputedRecordBailValue",
-    EngineComputedRecordBailAssemble => "engineComputedRecordBailAssemble",
     EngineComputedRecordBailRecordOverlay => "engineComputedRecordBailRecordOverlay",
-    EngineComputedRecordBailRecordTable => "engineComputedRecordBailRecordTable",
     PrefixDeadDeltaBailMatched => "prefixDeadDeltaBailMatched",
     PrefixDeadDeltaBailOwnAdditions => "prefixDeadDeltaBailOwnAdditions",
     PrefixDeadDeltaBailEndpoints => "prefixDeadDeltaBailEndpoints",
@@ -215,8 +187,6 @@ define_counters! {
     PrefixLocalFactIdentityMisses => "prefixLocalFactIdentityMisses",
     PrefixAnswerCacheHits => "prefixAnswerCacheHits",
     PrefixAnswerCacheMisses => "prefixAnswerCacheMisses",
-    Tier3BenefitEvictions => "tier3BenefitEvictions",
-    Tier3RefusalRetainedMatchAnswerBytes => "tier3RefusalRetainedMatchAnswerBytes",
     MatchAnswerSignatures => "matchAnswerSignatures",
     MatchAnswerSignatureReuses => "matchAnswerSignatureReuses",
     SelectorTruthSetMisses => "selectorTruthSetMisses",
@@ -225,6 +195,7 @@ define_counters! {
     SelectorTruthDerivedAnswerMisses => "selectorTruthDerivedAnswerMisses",
     SelectorTruthDerivedAnswerHits => "selectorTruthDerivedAnswerHits",
     RetainedMatchAnswerReuses => "retainedMatchAnswerReuses",
+    DeferredCascadeCompletions => "deferredCascadeCompletions",
     RetainedSelectorIncidenceBatchPrograms => "retainedSelectorIncidenceBatchPrograms",
     RetainedSelectorIncidenceBatchRows => "retainedSelectorIncidenceBatchRows",
     RetainedSelectorIncidenceBatchMissingRows => "retainedSelectorIncidenceBatchMissingRows",
@@ -242,7 +213,6 @@ define_counters! {
     PublishedMatchAnswerClosureCompletions => "publishedMatchAnswerClosureCompletions",
     PublishedClosureRetainedIdentityStops => "publishedClosureRetainedIdentityStops",
     MatchElementCallsDuringPublishedStyleTransaction => "matchElementCallsDuringPublishedStyleTransaction",
-    RetainedMatchAnswerRefusals => "retainedMatchAnswerRefusals",
     RetainedMatchAnswerPatches => "retainedMatchAnswerPatches",
     RetainedMatchAnswerDeltaPatches => "retainedMatchAnswerDeltaPatches",
     RetainedMatchAnswerDeltaMemoHits => "retainedMatchAnswerDeltaMemoHits",
@@ -289,6 +259,8 @@ define_counters! {
     ComputedGroupSetsReused => "computedGroupSetsReused",
     InheritedGroupNodeHandlesPublished => "inheritedGroupNodeHandlesPublished",
     InheritedGroupSetsReused => "inheritedGroupSetsReused",
+    InheritedGroupSwapComputations => "inheritedGroupSwapComputations",
+    InheritedGroupSwapReuses => "inheritedGroupSwapReuses",
     CustomPropertyEnvironmentNodeHandlesPublished => "customPropertyEnvironmentNodeHandlesPublished",
     CustomPropertyEnvironmentsReused => "customPropertyEnvironmentsReused",
     ComputedFixedMetadataNodeHandlesPublished => "computedFixedMetadataNodeHandlesPublished",
@@ -302,6 +274,8 @@ define_counters! {
     AnimationOverlaySlotsReleased => "animationOverlaySlotsReleased",
     AnimationOverlayRecordsUpdated => "animationOverlayRecordsUpdated",
     LiveAnimationOverlayRecords => "liveAnimationOverlayRecords",
+    // Read when counters are read: the reclaimed overlay records a published frame's lease still keeps.
+    RetiredAnimationOverlayRecords => "retiredAnimationOverlayRecords",
     ComputedPseudoAssignmentsPublished => "computedPseudoAssignmentsPublished",
     ComputedPseudoAssignmentsRemoved => "computedPseudoAssignmentsRemoved",
     ProgramCandidatesRejectedByCascade => "programCandidatesRejectedByCascade",
@@ -320,6 +294,7 @@ define_counters! {
     RoutedEntryPoints => "routedEntryPoints",
     OriginTruthRoutesFired => "originTruthRoutesFired",
     OriginTruthRoutesSkipped => "originTruthRoutesSkipped",
+    ScopeConfinedRoutesSkipped => "scopeConfinedRoutesSkipped",
     ArrivingNodeFactsFolded => "arrivingNodeFactsFolded",
     SheetChangeCandidatesRejected => "sheetChangeCandidatesRejected",
     RelationalAnchorsConsidered => "relationalAnchorsConsidered",
@@ -346,13 +321,15 @@ define_counters! {
     TransitionProofOperatorOrContinuation => "transitionProofOperatorOrContinuation",
     TransitionProofWinnerGap => "transitionProofWinnerGap",
     TransitionProofPriorityWin => "transitionProofPriorityWin",
-    SharedStyleRecordHits => "sharedStyleRecordHits",
 }
 
 /// The counter set for one document.
-#[derive(Clone, Debug)]
+///
+/// NB: Counters are bumped through shared references from wherever the engine runs, so each is an atomic. Only one
+///     thread runs the engine at a time, so a relaxed load and store is enough, and costs what a plain add does.
+#[derive(Debug)]
 pub struct Counters {
-    values: [u64; COUNTER_COUNT],
+    values: [AtomicU64; COUNTER_COUNT],
 }
 
 impl Default for Counters {
@@ -361,33 +338,52 @@ impl Default for Counters {
     }
 }
 
+impl Clone for Counters {
+    fn clone(&self) -> Self {
+        let clone = Self::new();
+        clone.restore(self);
+        clone
+    }
+}
+
 impl Counters {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            values: [0; COUNTER_COUNT],
+            values: [const { AtomicU64::new(0) }; COUNTER_COUNT],
         }
     }
 
-    pub fn bump(&mut self, counter: Counter) {
-        self.values[counter as usize] += 1;
+    pub fn bump(&self, counter: Counter) {
+        self.add(counter, 1);
     }
 
-    pub fn add(&mut self, counter: Counter, amount: u64) {
-        self.values[counter as usize] += amount;
+    pub fn add(&self, counter: Counter, amount: u64) {
+        let value = &self.values[counter as usize];
+        value.store(value.load(Ordering::Relaxed) + amount, Ordering::Relaxed);
     }
 
-    pub fn set(&mut self, counter: Counter, value: u64) {
-        self.values[counter as usize] = value;
+    pub fn set(&self, counter: Counter, value: u64) {
+        self.values[counter as usize].store(value, Ordering::Relaxed);
     }
 
     #[must_use]
     pub fn get(&self, counter: Counter) -> u64 {
-        self.values[counter as usize]
+        self.values[counter as usize].load(Ordering::Relaxed)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> {
-        COUNTER_NAMES.iter().copied().zip(self.values)
+    /// Puts every counter back to what `other` holds.
+    pub fn restore(&self, other: &Self) {
+        for (value, other) in self.values.iter().zip(&other.values) {
+            value.store(other.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        COUNTER_NAMES
+            .iter()
+            .copied()
+            .zip(self.values.iter().map(|value| value.load(Ordering::Relaxed)))
     }
 }
 
@@ -397,7 +393,7 @@ mod tests {
 
     #[test]
     fn peaks_and_totals_accumulate_differently() {
-        let mut counters = Counters::new();
+        let counters = Counters::new();
         counters.add(Counter::RawMutationRecords, 3);
         counters.add(Counter::RawMutationRecords, 4);
         assert_eq!(counters.get(Counter::RawMutationRecords), 7);

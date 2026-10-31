@@ -6,14 +6,18 @@
 
 #pragma once
 
+#include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
+#include <LibGC/Root.h>
 #include <LibWeb/Bindings/Internals.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/Scripting/DevToolsObjectTable.h>
 #include <LibWeb/Internals/InternalAnimationTimeline.h>
 #include <LibWeb/Internals/InternalsBase.h>
 #include <LibWeb/Painting/Forward.h>
+#include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
@@ -52,7 +56,6 @@ public:
     void set_show_line_box_borders(bool);
     void set_force_dark_thresholds(i32, i32);
     u64 visual_context_tree_node_count();
-    u64 visual_context_pending_dirty_box_count();
     u64 accumulated_visual_context_incremental_update_count();
     u64 visual_context_tree_node_capacity();
     u64 visual_context_tree_dead_node_count();
@@ -70,6 +73,7 @@ public:
 
     void gc();
     void gc_async(GC::Ref<WebIDL::Promise>);
+    WebIDL::UnsignedLongLong discard_decoded_image_frames();
     WebIDL::ExceptionOr<void> mark_as_garbage(Utf16String const& variable_name);
     bool wrapper_is_preserved(JS::Object&);
     bool has_activity_root(JS::Object&);
@@ -81,35 +85,64 @@ public:
     Optional<Painting::HitTestResult> hit_test(double x, double y);
     GC::Ptr<JS::Object> hit_test_result(double x, double y);
     GC::Ptr<JS::Object> take_context_menu_request();
+    void toggle_media_context_menu_picture_in_picture();
+
+    WebIDL::ExceptionOr<void> add_spelling_error_for_testing(GC::Ref<DOM::Node>, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end);
+    Utf16String spelling_error_ranges(GC::Ref<DOM::Node>);
+    GC::Ref<WebIDL::Promise> check_spelling_for_testing(Utf16String const& text);
+    GC::Ref<WebIDL::Promise> spell_check_settled();
+
+    GC::Ref<WebIDL::Promise> request_writing_suggestion_for_testing(Utf16String const& text, WebIDL::UnsignedLong caret_offset);
+    Utf16String writing_suggestion();
+    GC::Ref<WebIDL::Promise> writing_suggestion_settled();
+    GC::Ref<WebIDL::Promise> writing_suggestion_request_sent();
+    GC::Ref<WebIDL::Promise> activate_spelling_menu_item(Bindings::SpellingMenuItem, WebIDL::UnsignedLong guess_index);
 
     void send_text(HTML::HTMLElement&, Utf16String const&, WebIDL::UnsignedShort modifiers);
     void send_text_through_ui_process(Utf16String const&);
+    void send_key_through_ui_process(Utf16String const& key_name);
     void grant_transient_activation();
-    void click_through_ui_process(double x, double y);
-    void wheel_through_ui_process(double x, double y, double delta_x, double delta_y);
+    void click_through_ui_process(double x, double y, GC::Ref<WebIDL::Promise>);
+    void perform_actions(Utf16String const&, GC::Ref<WebIDL::Promise>);
+    void mouse_event_through_ui_process(Bindings::MouseEventThroughUIProcessType, double x, double y, Bindings::MouseEventThroughUIProcessOptions const&, GC::Ref<WebIDL::Promise>);
+    void wheel_through_ui_process(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, Bindings::WheelTicks const&, GC::Ref<WebIDL::Promise>);
     void send_key(HTML::HTMLElement&, Utf16String const&, WebIDL::UnsignedShort modifiers, WebIDL::UnsignedLong repeat_count);
+    WebIDL::ExceptionOr<void> send_text_editing_command(HTML::HTMLElement&, Utf16String const& command_name, bool extend_selection);
     void paste(HTML::HTMLElement& target, Utf16String const& text);
     void paste_from_clipboard();
     void commit_text();
 
     // Low-level mouse primitives
-    void mouse_down(double x, double y, WebIDL::UnsignedShort click_count, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers);
-    void mouse_down_on_scrollbar_dragged_by_compositor(double x, double y, DOM::Element& scroller, bool vertical);
-    void mouse_up(double x, double y, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers);
-    void mouse_move(double x, double y, WebIDL::UnsignedShort modifiers);
+    void mouse_down(double x, double y, WebIDL::UnsignedShort click_count, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers, Optional<WebIDL::UnsignedShort> buttons = {});
+    void mouse_up(double x, double y, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers, WebIDL::UnsignedShort buttons = 0);
+    void mouse_move(double x, double y, WebIDL::UnsignedShort modifiers, WebIDL::UnsignedShort buttons = 0);
     void mouse_leave();
+    void mouse_cancel();
 
     // High-level mouse conveniences
     void click(double x, double y, WebIDL::UnsignedShort click_count, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers);
     void click_and_hold(double x, double y, WebIDL::UnsignedShort click_count, WebIDL::UnsignedShort button, WebIDL::UnsignedShort modifiers);
-    void wheel(GC::Ref<WebIDL::Promise>, double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase);
-    void wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, GC::Ref<WebIDL::Promise>);
+    void wheel(GC::Ref<WebIDL::Promise>, double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, Bindings::WheelTicks const&);
+    void wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, Bindings::WheelTicks const&, GC::Ref<WebIDL::Promise>);
+    GC::Ref<JS::Object> compositor_scroll_state(GC::Ptr<DOM::Element> scroller);
     void pinch(double x, double y, double scale_delta, WebIDL::UnsignedShort modifiers);
+    void pinch_through_ui_process(double x, double y, double scale_delta);
     void reset_zoom();
 
     Utf16String current_cursor();
+    Optional<Utf16String> current_cursor_pixel(i32 x, i32 y);
+    Utf16String theme_color();
 
     Utf16String selected_text_for_clipboard();
+    Optional<Utf16String> generate_text_fragment_url(DOM::Range&, Utf16String const& current_url);
+    Utf16String devtools_grip(JS::Value);
+    Utf16String devtools_properties(JS::Value);
+    Optional<Vector<String>> complete_console_input(Utf16String const& input);
+
+    void find_in_page(Utf16String const& query, bool highlight_all);
+    void find_in_page_next_match();
+    void find_in_page_end();
+
     WebIDL::ExceptionOr<void> set_clipboard_file(Utf16String const& name, Utf16String const& mime_type, Utf16String const& data);
 
     void set_marked_text_from_input_method(Utf16String const& text);
@@ -120,6 +153,8 @@ public:
     WebIDL::ExceptionOr<bool> dispatch_user_activated_event(DOM::EventTarget&, DOM::Event& event);
 
     void spoof_current_url(Utf16String const& url);
+    void spoof_current_origin_in_this_process(Utf16String const& url);
+    void set_navigator_compatibility_mode(Bindings::InternalsNavigatorCompatibilityMode);
     void load_url(Utf16String const& url);
 
     GC::Ref<InternalAnimationTimeline> create_internal_animation_timeline();
@@ -129,10 +164,12 @@ public:
     void simulate_drop(double x, double y);
 
     void expire_cookies_with_time_offset(WebIDL::LongLong seconds);
+    void clear_storage_for_testing(Utf16String const& type);
     GC::Ref<WebIDL::Promise> delete_all_cookies();
     WebIDL::ExceptionOr<bool> has_cookie_for_url(Utf16String const& url, String const& name, String const& value);
 
     bool set_http_memory_cache_enabled(bool enabled);
+    bool set_disk_cache_enabled_for_navigations(bool enabled);
     void simulate_request_server_connection_loss();
     void simulate_worker_request_server_connection_loss();
     WebIDL::ExceptionOr<void> send_bad_ipc_message_for_testing(Utf16String const& kind);
@@ -144,23 +181,27 @@ public:
     void begin_layout_trace();
     void update_layout_for_testing();
     Utf16String take_layout_trace();
-    WebIDL::UnsignedLongLong table_cell_measurement_cache_miss_count();
-    WebIDL::UnsignedLongLong intrinsic_measurement_count();
-    WebIDL::UnsignedLongLong intrinsic_inline_measurement_count();
     WebIDL::UnsignedLongLong accumulated_visual_context_tree_build_count();
     void begin_display_list_trace();
     Utf16String take_display_list_trace();
-    GC::Ref<JS::Object> recorded_async_scrolling_state_object();
+    void begin_input_trace();
+    GC::Ref<JS::Object> take_input_trace();
+    GC::Ref<JS::Object> compositor_wheel_target_at(double x, double y, double delta_x, double delta_y);
+    GC::Ref<JS::Object> recorded_display_list_wheel_target_at(double x, double y, double delta_x, double delta_y);
     bool recorded_display_list_blocks_wheel_event_at(double x, double y);
+    GC::Ref<JS::Object> recorded_async_scrolling_state_object();
     void record_display_list_for_testing(bool paint_overlay, bool cold);
     void set_autoplay_policy(Utf16String const& policy);
 
     Utf16String get_computed_role(DOM::Element& element);
     Utf16String get_computed_label(DOM::Element& element);
     Utf16String get_computed_aria_level(DOM::Element& element);
+    void set_accessibility_focus_target(DOM::Element& element);
 
     static u16 get_echo_server_port();
     static void set_echo_server_port(u16 port);
+    static u16 get_https_echo_server_port();
+    static void set_https_echo_server_port(u16 port);
 
     WebIDL::ExceptionOr<void> set_hsts_policy(Utf16String const& domain, u64 max_age, bool include_sub_domains);
     WebIDL::ExceptionOr<void> ingest_hsts_header(Utf16String const& url, Utf16String const& header_value);
@@ -168,12 +209,15 @@ public:
 
     void set_browser_zoom(double factor);
     void set_device_pixel_ratio(double ratio);
+    void resize_window(i32 width, i32 height);
 
     bool headless();
     bool screen_wake_lock_active();
+    Utf16String picture_in_picture_window_state();
 
     bool needs_repaint();
     bool needs_display_list_record();
+    bool has_animation_frame_callbacks();
 
     Utf16String dump_display_list();
     Utf16String dump_accessibility_tree();
@@ -189,14 +233,21 @@ public:
     bool register_session_store_tab();
     Utf16String dump_session_store_tab_state();
     Utf16String dump_site_isolation_process_tree();
+    bool has_populated_document(HTML::HTMLIFrameElement&);
+    bool canvas_has_unpresented_content(HTML::HTMLCanvasElement&);
     void crash_remote_frame_processes();
+    void stop_loading_through_ui_process();
+    void reload_through_ui_process();
+    void reload_bypassing_cache_through_ui_process();
+    void traverse_history_through_ui_process(i32 delta);
     GC::Ref<WebIDL::Promise> flush_session_history_traversal_queue();
+    bool html_parser_body_is_exhausted(DOM::Document&);
     bool has_html_parser_end_state(DOM::Document& document) { return document.has_html_parser_end_state(); }
 
     bool has_shadow_root(GC::Ref<DOM::Element>);
     GC::Ptr<DOM::ShadowRoot> get_shadow_root(GC::Ref<DOM::Element>);
 
-    void handle_sdl_input_events();
+    void pump_gamepad_events();
 
     GC::Ref<InternalGamepad> connect_virtual_gamepad();
     void disconnect_virtual_gamepad(GC::Ref<InternalGamepad>);
@@ -207,7 +258,15 @@ public:
 
     void clear_element(HTML::HTMLElement&);
     void set_environments_top_level_url(Utf16String const& url);
-    void set_geolocation_emulated_position(double latitude, double longitude, double accuracy);
+    void set_geolocation_emulated_position(double latitude, double longitude, double accuracy, Optional<double> altitude, Optional<double> altitude_accuracy, Optional<double> heading, Optional<double> speed);
+    void set_geolocation_emulated_position_unavailable();
+
+    GC::Ref<WebIDL::Promise> request_permission(Utf16String const& name);
+    GC::Ref<WebIDL::Promise> set_permission(Utf16String const& name, Utf16String const& state);
+    void set_next_permission_prompt_outcome(Utf16String const& name, Utf16String const& outcome, bool held);
+    void release_held_permission_prompt(WebIDL::UnsignedLong waiters);
+    GC::Ref<WebIDL::Promise> advance_permission_clock(WebIDL::UnsignedLongLong milliseconds);
+    Vector<String> permission_cache_origins();
 
     u64 parser_non_append_insertions();
     DOM::Document::StyleInvalidationCounters const& style_invalidation_counters() const;
@@ -217,6 +276,23 @@ public:
     void reset_rendering_scheduler_counters();
     void set_manual_rendering_opportunities(bool enabled);
     void inject_rendering_opportunity(double frame_time_ms);
+    Utf16String frame_scheduler_state() const;
+    void synchronize_compositor();
+    void hold_next_frame(Utf16String const& hold);
+    Utf16String last_frame_presented_by(DOM::Document&);
+    void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
+    void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id);
+    u64 queue_mouse_move(double x, double y, u32 buttons);
+    void move_hover_pointer(double x, double y, Optional<u64> input_event_id);
+    Utf16String clock_lane_state(DOM::Document&);
+    bool clock_lane_is_coming(DOM::Document&);
+    GC::Ptr<Geometry::DOMRect> presented_border_box(DOM::Element&);
+    Optional<u32> presented_compositor_animation_count(DOM::Element&);
+    Optional<double> presented_opacity(DOM::Element&);
+    Optional<String> presented_color(DOM::Element&, Optional<Utf16String> const& pseudo_element);
+    bool last_frame_keyboard_scroll_state_is_current();
+    void release_held_frame();
+    bool rendering_update_holds_tasks_of(DOM::Document&);
     void update_compositor_animations();
     bool run_empty_animation_style_update_for_testing();
     void arm_compositor_animation_timers_for_testing();
@@ -235,6 +311,7 @@ public:
     u64 paint_style_record_identity(DOM::Element&);
     u64 layout_node_identity(DOM::Node&);
     u64 layout_arena_live_slot_count();
+    void panic_render_state_for_testing();
     u64 layout_arena_shell_count();
     double style_engine_match_document();
     Utf16String style_engine_matched_rules();
@@ -251,33 +328,38 @@ public:
     WebIDL::UnsignedLongLong active_timer_count(JS::Object& window);
     WebIDL::UnsignedLongLong task_queue_length();
     Utf16String canvas_color_scheme();
+    u64 image_request_count(DOM::Document const&) const;
     WebIDL::ExceptionOr<GC::Ref<JS::Object>> image_animation_state_for_url(Utf16String const& url);
     bool media_element_is_fetching(HTML::HTMLMediaElement&);
     bool media_element_is_playing_audio(HTML::HTMLMediaElement&);
+    bool document_is_playing_audio(DOM::Document&);
+    bool tab_is_playing_audio();
+    WebIDL::UnsignedLongLong tab_audibility_change_count();
     bool media_element_video_sink_is_ticking(HTML::HTMLMediaElement&);
     void set_media_element_ready_state(HTML::HTMLMediaElement&, u16 ready_state);
     void set_media_element_paused(HTML::HTMLMediaElement&, bool paused);
     void set_media_element_seeking(HTML::HTMLMediaElement&, bool seeking);
     void disconnect_media_server();
-    void set_page_muted(bool muted);
-    WebIDL::UnsignedLongLong active_image_style_value_animation_count();
-    Compositing::AsyncScrollingState async_scrolling_state();
-    GC::Ref<JS::Object> async_scrolling_state_object();
-    bool async_scrolling_state_blocks_wheel_event_at(double x, double y);
-    bool async_scrolling_state_can_wheel_scroll_at(double x, double y, double delta_x, double delta_y, bool force_stale_wheel_event_regions);
-    Utf16String async_scrolling_state_wheel_routing_admission();
-    Utf16String async_scrolling_state_wheel_scroll_admission_at(double x, double y, double delta_x, double delta_y, bool force_stale_wheel_event_regions);
-    Utf16String async_scrolling_state_wheel_target_at(double x, double y, double delta_x, double delta_y);
+    void disconnect_audio_server();
     String viewport_overflow_x();
 
+    GC::Ref<Streams::ReadableStream> create_stream_pulling_from_bytes(String const& bytes, WebIDL::UnsignedLong pull_size);
+
 private:
+    GC::Ref<JS::Object> first_wheel_step_route_to_object(Compositing::FirstWheelStepRouteForTesting const&);
+    Web::MouseEvent mouse_event_through_ui_process_at(Web::MouseEvent::Type, double x, double y);
+    void send_mouse_events_through_ui_process(Vector<Web::MouseEvent>, GC::Ref<WebIDL::Promise>);
     explicit Internals(HTML::Window&);
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
 
     UIEvents::MouseButton button_from_unsigned_short(WebIDL::UnsignedShort button);
 
+    GC::Root<JS::Cell> m_actions_executor;
+    bool m_actions_running { false };
+    Optional<Utf16String> m_pending_action_test_result;
     Vector<GC::Ref<InternalGamepad>> m_gamepads;
+    Optional<HTML::DevToolsObjectTable> m_devtools_object_table;
 };
 
 }

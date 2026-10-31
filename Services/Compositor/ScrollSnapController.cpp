@@ -46,13 +46,14 @@ void ScrollSnapController::end_gesture()
         state.gesture_start = {};
 }
 
-bool ScrollSnapController::has_gesture_awaiting_input() const
+Vector<Web::AsyncScrollNodeStableID> ScrollSnapController::boxes_with_gesture_awaiting_input() const
 {
+    Vector<Web::AsyncScrollNodeStableID> boxes;
     for (auto const& [stable_node_id, state] : m_nodes) {
         if (state.gesture_input_deadline.has_value())
-            return true;
+            boxes.append(stable_node_id);
     }
-    return false;
+    return boxes;
 }
 
 Optional<MonotonicTime> ScrollSnapController::earliest_gesture_input_deadline() const
@@ -67,17 +68,17 @@ Optional<MonotonicTime> ScrollSnapController::earliest_gesture_input_deadline() 
     return earliest;
 }
 
-bool ScrollSnapController::end_gestures_whose_input_ran_out(MonotonicTime now)
+Vector<Web::AsyncScrollNodeStableID> ScrollSnapController::end_gestures_whose_input_ran_out(MonotonicTime now)
 {
-    bool ended_any = false;
+    Vector<Web::AsyncScrollNodeStableID> ended_boxes;
     for (auto& [stable_node_id, state] : m_nodes) {
         if (!state.gesture_input_deadline.has_value() || now <= *state.gesture_input_deadline)
             continue;
         state.gesture_input_deadline = {};
         state.unsnapped_scroll_destination = {};
-        ended_any = true;
+        ended_boxes.append(stable_node_id);
     }
-    return ended_any;
+    return ended_boxes;
 }
 
 void ScrollSnapController::did_scroll_node_plainly(Web::AsyncScrollNodeStableID stable_node_id, Web::ScrollGesturePhase phase, Web::CSSPixelPoint scroll_offset_before_scroll)
@@ -112,6 +113,14 @@ void ScrollSnapController::did_end_snap_scroll(Web::AsyncScrollNodeStableID stab
     auto& state = node_state(stable_node_id);
     state.snap_scroll = {};
     state.expected_scroll_offset = scroll_offset;
+}
+
+void ScrollSnapController::did_retarget_scroll(Web::AsyncScrollNodeStableID stable_node_id, Compositing::AsyncScrollOperationID operation_id)
+{
+    // A snap scroll sent somewhere other than the snap position selected for it no longer goes where the gesture's
+    // input asked, so the gesture's steps then travel from where the scroll is headed instead.
+    if (is_snap_scroll(stable_node_id, operation_id))
+        m_nodes.remove(stable_node_id);
 }
 
 bool ScrollSnapController::is_snap_scroll(Web::AsyncScrollNodeStableID stable_node_id, Compositing::AsyncScrollOperationID operation_id) const
@@ -163,7 +172,7 @@ static bool selected_snap_position_along_travel(Compositing::SnapDestination con
     return (selection.snapped_x && displacement.x() != 0) || (selection.snapped_y && displacement.y() != 0);
 }
 
-Optional<ScrollSnapController::StepDecision> ScrollSnapController::decide_discrete_step(Compositing::AsyncScrollTree const& scroll_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Compositing::AsyncScrollNodeID node_id, Web::CSSPixelPoint delta, MonotonicTime now)
+Optional<ScrollSnapController::StepDecision> ScrollSnapController::decide_discrete_step(Compositing::AsyncScrollTree const& scroll_tree, Compositing::ScrollStateSnapshot const& scroll_state_snapshot, Compositing::AsyncScrollNodeID node_id, Web::CSSPixelPoint delta, Optional<Web::CSSPixelPoint> scroll_in_flight_destination, MonotonicTime now)
 {
     auto target = snap_target_for(scroll_tree, scroll_state_snapshot, node_id);
     if (!target.has_value())
@@ -183,9 +192,9 @@ Optional<ScrollSnapController::StepDecision> ScrollSnapController::decide_discre
     if (gesture_ended)
         state.unsnapped_scroll_destination = {};
 
-    // A step selects its snap position from the offset the gesture's input deltas have reached rather than from the
-    // snap position it is scrolling to.
-    auto step_start = state.unsnapped_scroll_destination.value_or(current_scroll_offset);
+    // A step selects its snap position from the offset the gesture's input deltas have reached, which a wheel scroll in
+    // flight is headed for, rather than from the snap position it is scrolling to.
+    auto step_start = state.unsnapped_scroll_destination.value_or(scroll_in_flight_destination.value_or(current_scroll_offset));
     auto unsnapped_destination = clamp_scroll_offset(step_start + delta, geometry);
 
     // NB: A step with only an intended direction ignores every snap position up to the offset its input asked for.
@@ -204,6 +213,8 @@ Optional<ScrollSnapController::StepDecision> ScrollSnapController::decide_discre
     state.gesture_input_deadline = now + Compositing::user_scroll_settle_delay;
 
     auto in_flight_destination = state.snap_scroll.map([](auto const& snap_scroll) { return snap_scroll.destination; });
+    if (!in_flight_destination.has_value())
+        in_flight_destination = scroll_in_flight_destination;
     if (selection.position == in_flight_destination.value_or(current_scroll_offset)) {
         if (!state.snap_scroll.has_value())
             state.expected_scroll_offset = current_scroll_offset;
@@ -214,6 +225,7 @@ Optional<ScrollSnapController::StepDecision> ScrollSnapController::decide_discre
         .stable_node_id = target->stable_node_id,
         .initial_scroll_offset = current_scroll_offset,
         .unsnapped_scroll_destination = unsnapped_destination,
+        .relative_scroll_delta = unsnapped_destination - step_start,
         .selection = move(selection),
         .animation_kind = Compositing::ScrollAnimationKind::SmoothScroll,
     } };
@@ -264,8 +276,10 @@ Optional<ScrollSnapController::StepDecision> ScrollSnapController::decide_key_st
                 .operation_id = state.snap_scroll->operation_id,
                 .initial_scroll_offset = current_scroll_offset,
                 .unsnapped_scroll_destination = unsnapped_destination,
+                .relative_scroll_delta = unsnapped_destination - step_start,
                 .selection = move(selection),
                 .settles_gesture = false,
+                .animation_kind = {},
             };
         }
         return StepDecision { StepConsumed { move(updated_scroll) } };
@@ -275,6 +289,7 @@ Optional<ScrollSnapController::StepDecision> ScrollSnapController::decide_key_st
         .stable_node_id = target->stable_node_id,
         .initial_scroll_offset = current_scroll_offset,
         .unsnapped_scroll_destination = unsnapped_destination,
+        .relative_scroll_delta = unsnapped_destination - step_start,
         .selection = move(selection),
         .animation_kind = Compositing::ScrollAnimationKind::SmoothScroll,
     } };
@@ -324,6 +339,7 @@ Optional<ScrollSnapController::StepDecision> ScrollSnapController::decide_moment
         .stable_node_id = target->stable_node_id,
         .initial_scroll_offset = target->current_scroll_offset,
         .unsnapped_scroll_destination = unsnapped_destination,
+        .relative_scroll_delta = unsnapped_destination - step_start,
         .selection = move(selection),
         .animation_kind = Compositing::ScrollAnimationKind::Momentum,
     } };
@@ -370,6 +386,7 @@ Vector<ScrollSnapController::GestureEndSnap> ScrollSnapController::decide_gestur
                 .stable_node_id = stable_node_id,
                 .initial_scroll_offset = current_scroll_offset,
                 .unsnapped_scroll_destination = current_scroll_offset,
+                .relative_scroll_delta = {},
                 .selection = move(selection),
                 .animation_kind = Compositing::ScrollAnimationKind::SmoothScroll,
             },

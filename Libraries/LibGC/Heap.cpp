@@ -25,10 +25,12 @@
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
+#include <LibCore/StatsLog.h>
 #include <LibCore/Timer.h>
 #include <LibGC/BlockAllocator.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Heap.h>
+#include <LibGC/HeapAccess.h>
 #include <LibGC/HeapBlock.h>
 #include <LibGC/NanBoxedValue.h>
 #include <LibGC/Root.h>
@@ -45,9 +47,15 @@
 
 namespace GC {
 
-static constexpr size_t GC_MIN_BYTES_THRESHOLD { 8 * 1024 * 1024 };
-static constexpr size_t GC_HEAP_GROWTH_FACTOR_NUMERATOR { 7 };
+static constexpr size_t GC_MIN_BYTES_THRESHOLD { 32 * 1024 * 1024 };
+static constexpr size_t GC_HEAP_GROWTH_FACTOR_NUMERATOR { 16 };
 static constexpr size_t GC_HEAP_GROWTH_FACTOR_DENOMINATOR { 4 };
+
+// NB: Memory that cells own outside the heap (array buffer contents, decoded images) is mostly large, long-lived data,
+//     and allocating more cells does not grow it. Letting it grow the threshold by the cell factor makes a page with
+//     1 GiB of such memory allocate ~4 GiB of cells between collections, so it only grows the threshold by a tenth.
+static constexpr size_t GC_EXTERNAL_GROWTH_FACTOR_NUMERATOR { 1 };
+static constexpr size_t GC_EXTERNAL_GROWTH_FACTOR_DENOMINATOR { 10 };
 
 static constexpr int GC_INCREMENTAL_SWEEP_INTERVAL_MS = 16;
 static constexpr int GC_INCREMENTAL_SWEEP_SLICE_MS = 5;
@@ -183,9 +191,9 @@ void print_gc_report(i64 total_us, size_t live_block_count)
     dbgln("      cell lookup               {:>10} us ({:>5.1f}%)", t.conservative_cell_lookup_us, pct(t.conservative_cell_lookup_us));
     dbgln("    explicit roots              {:>10} us ({:>5.1f}%)", t.gather_explicit_roots_us, pct(t.gather_explicit_roots_us));
     dbgln("  mark_live_cells               {:>10} us ({:>5.1f}%)", t.mark_live_cells_us, pct(t.mark_live_cells_us));
+    dbgln("    clear uprooted              {:>10} us ({:>5.1f}%)", t.mark_clear_uprooted_us, pct(t.mark_clear_uprooted_us));
     dbgln("    initial visit               {:>10} us ({:>5.1f}%)", t.mark_initial_visit_us, pct(t.mark_initial_visit_us));
     dbgln("    BFS marking                 {:>10} us ({:>5.1f}%)", t.mark_bfs_us, pct(t.mark_bfs_us));
-    dbgln("    clear uprooted              {:>10} us ({:>5.1f}%)", t.mark_clear_uprooted_us, pct(t.mark_clear_uprooted_us));
     dbgln("  finalize_unmarked_cells       {:>10} us ({:>5.1f}%)", t.finalize_unmarked_cells_us, pct(t.finalize_unmarked_cells_us));
     dbgln("  sweep_weak_blocks             {:>10} us ({:>5.1f}%)", t.sweep_weak_blocks_us, pct(t.sweep_weak_blocks_us));
     dbgln("  prune_weak_containers         {:>10} us ({:>5.1f}%)", t.prune_weak_containers_us, pct(t.prune_weak_containers_us));
@@ -318,14 +326,71 @@ Heap::~Heap()
     m_incoming_cross_heap_members.clear();
 }
 
-void Heap::will_allocate(size_t size)
+void Heap::enable_stats()
 {
-    if (should_collect_on_every_allocation()) {
-        m_allocated_bytes_since_last_gc = 0;
-        collect_garbage();
-    } else if (m_allocated_bytes_since_last_gc + size > m_gc_bytes_threshold) {
-        m_allocated_bytes_since_last_gc = 0;
-        collect_garbage();
+    VERIFY(!m_stats);
+    VERIFY(!is_incremental_sweep_active());
+    m_stats = make<Stats>();
+}
+
+void Heap::add_stats(AK::JsonObject& values) const
+{
+    VERIFY(m_stats);
+    values.set("gc.allocated_bytes_total"sv, m_total_allocated_bytes);
+    values.set("gc.allocated_bytes_since_gc"sv, m_allocated_bytes_since_last_gc);
+    values.set("gc.heap_blocks"sv, m_live_heap_blocks.size());
+    values.set("gc.heap_block_bytes"sv, m_live_heap_blocks.size() * HeapBlock::BLOCK_SIZE);
+    values.set("gc.cell_allocators"sv, m_cell_allocators_by_type.size());
+    values.set("gc.threshold_bytes"sv, m_gc_bytes_threshold);
+    values.set("gc.live_cell_bytes"sv, m_stats->live_cell_bytes);
+    values.set("gc.live_external_bytes"sv, m_stats->live_external_bytes);
+    values.set("gc.collections"sv, m_stats->collections);
+    values.set("gc.completed_collections"sv, m_stats->completed_collections);
+    values.set("gc.total_duration_ns"sv, m_stats->total_duration_ns);
+    values.set("gc.last_duration_ns"sv, m_stats->last_duration_ns);
+}
+
+void Heap::finish_stats_collection()
+{
+    VERIFY(m_stats);
+    auto& stats = *m_stats;
+    stats.last_duration_ns = stats.pause_duration_ns + stats.sweep_duration_ns;
+    stats.total_duration_ns += stats.last_duration_ns;
+    ++stats.completed_collections;
+    if (auto* log = Core::StatsLog::the()) {
+        AK::JsonObject data;
+        data.set("collection"sv, stats.collections);
+        data.set("duration_ns"sv, stats.last_duration_ns);
+        data.set("pause_duration_ns"sv, stats.pause_duration_ns);
+        data.set("sweep_duration_ns"sv, stats.sweep_duration_ns);
+        data.set("bytes_before"sv, stats.bytes_before);
+        data.set("bytes_after"sv, m_live_heap_blocks.size() * HeapBlock::BLOCK_SIZE);
+        data.set("live_cell_bytes"sv, stats.live_cell_bytes);
+        data.set("live_external_bytes"sv, stats.live_external_bytes);
+        log->event("gc"sv, move(data));
+    }
+}
+
+void Heap::will_allocate(size_t size, TriggersCollection triggers_collection)
+{
+    ASSERT(!heap_access_is_forbidden_on_this_thread());
+    if (triggers_collection == TriggersCollection::No) {
+        m_total_allocated_bytes += size;
+        return;
+    }
+
+    // NB: Sweeping a block destroys its dead cells, and a destructor may allocate. A collection started from there
+    //     would mark the block's reachable cells and queue the block for the next sweep, the rest of the current sweep
+    //     would then clear those marks, and the next sweep of the block would free cells that are still in use. So an
+    //     allocation made while a block is swept leaves the collection to the first allocation after the sweep.
+    if (m_block_sweeps_in_progress == 0) {
+        if (should_collect_on_every_allocation()) {
+            m_allocated_bytes_since_last_gc = 0;
+            collect_garbage();
+        } else if (m_allocated_bytes_since_last_gc + size > m_gc_bytes_threshold) {
+            m_allocated_bytes_since_last_gc = 0;
+            collect_garbage();
+        }
     }
 
     m_allocated_bytes_since_last_gc += size;
@@ -354,17 +419,18 @@ void Heap::did_free_external_memory(size_t size)
 
 void Heap::update_gc_bytes_threshold(size_t live_cell_bytes, size_t live_external_bytes)
 {
-    Checked<size_t> live_bytes = live_cell_bytes;
-    live_bytes += live_external_bytes;
-
-    if (live_bytes.has_overflow()) {
-        m_gc_bytes_threshold = NumericLimits<size_t>::max();
-        return;
+    if (m_stats) {
+        m_stats->live_cell_bytes = live_cell_bytes;
+        m_stats->live_external_bytes = live_external_bytes;
     }
-
-    Checked<size_t> next_gc_bytes_threshold = live_bytes.value();
+    Checked<size_t> next_gc_bytes_threshold = live_cell_bytes;
     next_gc_bytes_threshold *= GC_HEAP_GROWTH_FACTOR_NUMERATOR;
     next_gc_bytes_threshold /= GC_HEAP_GROWTH_FACTOR_DENOMINATOR;
+
+    Checked<size_t> external_growth = live_external_bytes;
+    external_growth *= GC_EXTERNAL_GROWTH_FACTOR_NUMERATOR;
+    external_growth /= GC_EXTERNAL_GROWTH_FACTOR_DENOMINATOR;
+    next_gc_bytes_threshold += external_growth;
 
     if (next_gc_bytes_threshold.has_overflow()) {
         m_gc_bytes_threshold = NumericLimits<size_t>::max();
@@ -574,6 +640,11 @@ AK::JsonObject Heap::build_graph(ReadonlySpan<FlatPtr> callee_saved_registers)
     // those freelist entries. Drain the sweep so we operate on a stable heap.
     finish_pending_incremental_sweep();
 
+    // NB: While an allocator has a block's never-allocated cells out, the block counts them as cells, and the
+    //     conservative scan in gather_roots() would take a possible pointer into one for a live cell. Give them back,
+    //     as a collection does, so that they are the block's lazy region again.
+    give_back_local_free_lists();
+
     HashMap<Cell*, HeapRoot> roots;
     Vector<StackFrameInfo> stack_frames;
     gather_roots(origin, roots, &stack_frames);
@@ -595,15 +666,20 @@ AK::JsonObject Heap::build_graph(ReadonlySpan<FlatPtr> callee_saved_registers)
     return graph;
 }
 
+// This must run before any finalizer, so that no finalizer can reach a dead cell through a weak pointer. Finalizers run
+// in no particular order, so such a cell may already have been finalized, and it may belong to another heap.
+void Heap::clear_weak_pointers_to_dead_cells(bool report)
+{
+    ScopedPhaseTimer timer { report, g_phase_timings.sweep_weak_blocks_us };
+    sweep_weak_blocks();
+    m_weak_pointers_to_dead_cells_are_cleared = true;
+}
+
 void Heap::run_post_mark_phases(bool report)
 {
     {
         ScopedPhaseTimer timer { report, g_phase_timings.finalize_unmarked_cells_us };
         finalize_unmarked_cells();
-    }
-    {
-        ScopedPhaseTimer timer { report, g_phase_timings.sweep_weak_blocks_us };
-        sweep_weak_blocks();
     }
 
     // Prune weak containers while we're still stop-the-world; doing this
@@ -629,8 +705,21 @@ void Heap::run_post_mark_phases(bool report)
     }
 }
 
+static thread_local bool s_heap_access_is_forbidden_on_this_thread = false;
+
+void forbid_heap_access_on_this_thread()
+{
+    s_heap_access_is_forbidden_on_this_thread = true;
+}
+
+bool heap_access_is_forbidden_on_this_thread()
+{
+    return s_heap_access_is_forbidden_on_this_thread;
+}
+
 NO_SANITIZE_ADDRESS void Heap::collect_garbage(CollectionType collection_type, bool print_report)
 {
+    VERIFY(!heap_access_is_forbidden_on_this_thread());
     jmp_buf registers;
     setjmp(registers);
     ReadonlySpan<FlatPtr> captured_registers { reinterpret_cast<FlatPtr const*>(registers), sizeof(jmp_buf) / (sizeof(FlatPtr)) };
@@ -647,6 +736,8 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
     VERIFY(!m_collecting_garbage);
 
     finish_pending_incremental_sweep();
+    auto stats_start_ns = m_stats ? MonotonicTime::now().nanoseconds() : 0;
+    give_back_local_free_lists();
     g_next_incremental_sweep_should_report = false;
 
     {
@@ -667,11 +758,16 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
         }
         ScopeGuard stop_recording = [&] { g_recording_phase_timings = false; };
 
+        if (collection_type == CollectionType::CollectGarbage && m_gc_deferrals) {
+            m_should_gc_when_deferral_ends = true;
+            return;
+        }
+        if (m_stats) {
+            ++m_stats->collections;
+            m_stats->bytes_before = m_live_heap_blocks.size() * HeapBlock::BLOCK_SIZE;
+            m_stats->sweep_duration_ns = 0;
+        }
         if (collection_type == CollectionType::CollectGarbage) {
-            if (m_gc_deferrals) {
-                m_should_gc_when_deferral_ends = true;
-                return;
-            }
             HashMap<Cell*, HeapRoot> roots;
             {
                 ScopedPhaseTimer timer { report, g_phase_timings.gather_roots_us };
@@ -682,7 +778,9 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
                 mark_live_cells(roots);
             }
         }
+        clear_weak_pointers_to_dead_cells(report);
         run_post_mark_phases(report);
+        m_weak_pointers_to_dead_cells_are_cleared = false;
 
         // For CollectEverything we must finish sweeping synchronously so that
         // every cell is collected before the Heap destructor returns. All
@@ -715,11 +813,31 @@ void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, Collecti
     else
         g_next_incremental_sweep_should_report = false;
 
+    if (m_stats) {
+        m_stats->pause_duration_ns = MonotonicTime::now().nanoseconds() - stats_start_ns;
+        if (!m_incremental_sweep_active)
+            finish_stats_collection();
+    }
+
     run_post_gc_tasks();
 
     // A collection just happened: restart the idle policy's episode (peak rate and watchdog tick count) from here, so
     // a threshold-driven GC mid-episode doesn't leave it comparing against stale state.
     m_idle_collection_policy.reset(m_total_allocated_bytes);
+}
+
+void Heap::set_should_collect_on_every_allocation(bool should_collect)
+{
+    m_should_collect_on_every_allocation = should_collect;
+    // NB: Code that pops local free lists itself would take cells from them without collecting.
+    if (should_collect)
+        give_back_local_free_lists();
+}
+
+void Heap::give_back_local_free_lists()
+{
+    for (auto& allocator : m_all_cell_allocators)
+        allocator.give_back_local_free_list({});
 }
 
 void Heap::run_post_gc_tasks()
@@ -731,6 +849,10 @@ void Heap::run_post_gc_tasks()
 
 void Heap::dump_allocators()
 {
+    // NB: While an allocator has a block's never-allocated cells out, the block counts them as cells. Give them back,
+    //     so that they are the block's lazy region again and are not counted.
+    give_back_local_free_lists();
+
     size_t total_in_committed_blocks = 0;
     size_t total_waste = 0;
     for (auto& allocator : m_all_cell_allocators) {
@@ -809,6 +931,9 @@ void Heap::register_sweep_callback(AK::Function<void()> callback)
 
 void Heap::gather_roots(ConservativeScanOrigin const& origin, HashMap<Cell*, HeapRoot>& roots, Vector<StackFrameInfo>* out_stack_frames, IncludeIncomingCrossHeapMembers include_incoming_cross_heap_members)
 {
+    for (auto& allocator : m_all_cell_allocators)
+        VERIFY(!allocator.m_local_block);
+
     // Cross-heap members targeting this heap act as roots for local collections (as the foreign holder is invisible to a local mark).
     if (include_incoming_cross_heap_members == IncludeIncomingCrossHeapMembers::Yes) {
         for (auto* member : m_incoming_cross_heap_members) {
@@ -1127,32 +1252,74 @@ public:
         }
     }
 
+    virtual void visit_ephemeron(Cell& key, NanBoxedValue const& value) override
+    {
+        if (!value.is_cell())
+            return;
+        // NB: This phase does not mark keys outside the domain, so their values stay reachable.
+        if (key.is_marked() || !cell_is_in_domain(key)) {
+            visit(value);
+            return;
+        }
+        m_pending_ephemerons.append({ &key, &value.as_cell() });
+    }
+
     void mark_all_live_cells()
     {
-        while (!m_work_queue.is_empty()) {
-            auto cell = m_work_queue.take_last();
-            if (cell->state() != Cell::State::Live)
-                continue;
-            cell->type_info().visit_edges(cell.ptr(), this);
+        // Marking can reach the key of a pending ephemeron, so repeat until no more values get marked.
+        for (;;) {
+            while (!m_work_queue.is_empty()) {
+                auto cell = m_work_queue.take_last();
+                if (cell->state() != Cell::State::Live)
+                    continue;
+                cell->type_info().visit_edges(cell.ptr(), this);
+            }
+
+            bool marked_a_value = false;
+            m_pending_ephemerons.remove_all_matching([&](auto const& ephemeron) {
+                if (!ephemeron.key->is_marked())
+                    return false;
+                visit(*ephemeron.value);
+                marked_a_value = true;
+                return true;
+            });
+            if (!marked_a_value)
+                break;
         }
     }
 
 private:
+    struct Ephemeron {
+        Cell* key { nullptr };
+        Cell* value { nullptr };
+    };
+
     ReadonlySpan<Heap* const> m_domain;
     Vector<Ref<Cell>> m_work_queue;
+    Vector<Ephemeron> m_pending_ephemerons;
     FlatPtr m_heap_region_start;
     FlatPtr m_heap_region_end;
 };
 
-void Heap::mark_live_cells(HashMap<Cell*, HeapRoot> const& roots)
+void Heap::mark_live_cells(HashMap<Cell*, HeapRoot>& roots)
 {
     Heap* domain[] = { this };
     mark_live_cells_across(domain, roots);
 }
 
-void Heap::mark_live_cells_across(ReadonlySpan<Heap* const> heaps, HashMap<Cell*, HeapRoot> const& roots)
+void Heap::mark_live_cells_across(ReadonlySpan<Heap* const> heaps, HashMap<Cell*, HeapRoot>& roots)
 {
     dbgln_if(HEAP_DEBUG, "mark_live_cells:");
+
+    {
+        ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.mark_clear_uprooted_us };
+        for (auto* heap : heaps) {
+            for (auto& cell : heap->m_uprooted_cells)
+                roots.remove(cell.ptr());
+
+            heap->m_uprooted_cells.clear();
+        }
+    }
 
     Optional<MarkingVisitor> visitor;
     {
@@ -1163,16 +1330,6 @@ void Heap::mark_live_cells_across(ReadonlySpan<Heap* const> heaps, HashMap<Cell*
     {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.mark_bfs_us };
         visitor->mark_all_live_cells();
-    }
-
-    {
-        ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.mark_clear_uprooted_us };
-        for (auto* heap : heaps) {
-            for (auto& inverse_root : heap->m_uprooted_cells)
-                inverse_root->set_marked(false);
-
-            heap->m_uprooted_cells.clear();
-        }
     }
 }
 
@@ -1295,9 +1452,20 @@ void Heap::sweep_dead_cells(bool print_report, Core::ElapsedTimer const& measure
 
 void Heap::sweep_block(HeapBlock& block)
 {
+    // A destructor can allocate and sweep another block. Its time is included in the outermost sweep.
+    bool record_stats = m_stats && m_block_sweeps_in_progress == 0;
+    auto stats_start_ns = record_stats ? MonotonicTime::now().nanoseconds() : 0;
+    ScopeGuard record_duration = [&] {
+        if (record_stats)
+            m_stats->sweep_duration_ns += MonotonicTime::now().nanoseconds() - stats_start_ns;
+    };
+    ++m_block_sweeps_in_progress;
+    ScopeGuard finish_block_sweep = [&] { --m_block_sweeps_in_progress; };
+
     // Remove from the allocator's pending sweep list.
     block.m_sweep_list_node.remove();
 
+    block.set_being_swept(true);
     bool block_has_live_cells = false;
     bool block_was_full = block.is_full();
     size_t collected_cells = 0;
@@ -1322,6 +1490,7 @@ void Heap::sweep_block(HeapBlock& block)
                 : m_sweep_live_external_bytes + cell_external_memory_size;
         }
     });
+    block.set_being_swept(false);
 
     if (!block_has_live_cells) {
         dbgln_if(HEAP_DEBUG, " - HeapBlock empty @ {}: cell_size={}", &block, block.cell_size());
@@ -1382,6 +1551,7 @@ void Heap::start_incremental_sweep()
     // and don't need sweeping.
     size_t total_blocks = 0;
     for (auto& allocator : m_all_cell_allocators) {
+        VERIFY(!allocator.m_local_block);
         allocator.for_each_block([&](HeapBlock& block) {
             allocator.m_blocks_pending_sweep.append(block);
             ++total_blocks;
@@ -1414,6 +1584,8 @@ void Heap::finish_incremental_sweep()
     m_cells_allocated_during_sweep.clear();
 
     m_incremental_sweep_active = false;
+    if (m_stats)
+        finish_stats_collection();
 
     stop_incremental_sweep_timer();
 
@@ -1443,7 +1615,7 @@ void Heap::finish_pending_incremental_sweep()
 void Heap::start_incremental_sweep_timer()
 {
     if (!m_incremental_sweep_timer) {
-        m_incremental_sweep_timer = Core::Timer::create_repeating(GC_INCREMENTAL_SWEEP_INTERVAL_MS, [this] {
+        m_incremental_sweep_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(GC_INCREMENTAL_SWEEP_INTERVAL_MS), [this] {
             sweep_on_timer();
         });
     }
@@ -1490,7 +1662,7 @@ void Heap::sweep_on_timer()
 void Heap::start_idle_gc_timer()
 {
     if (!m_idle_gc_timer) {
-        m_idle_gc_timer = Core::Timer::create_repeating(GC_IDLE_GC_INTERVAL_MS, [this] {
+        m_idle_gc_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(GC_IDLE_GC_INTERVAL_MS), [this] {
             idle_gc_on_timer();
         });
     }
@@ -1544,6 +1716,11 @@ void Heap::uproot_cell(Cell* cell)
 
 WeakImpl* Heap::create_weak_impl(void* ptr)
 {
+    // Once weak pointers to dead cells have been cleared, one that is created to a dead cell, e.g. by a finalizer of
+    // this or another heap, must be null as well, or nothing would clear it before the cell is swept.
+    if (m_weak_pointers_to_dead_cells_are_cleared && !static_cast<Cell*>(ptr)->is_marked())
+        return &WeakImpl::the_null_weak_impl;
+
     if (m_usable_weak_blocks.is_empty()) {
         // NOTE: These are leaked on Heap destruction, but that's fine since Heap is tied to process lifetime.
         auto* weak_block = WeakBlock::create();

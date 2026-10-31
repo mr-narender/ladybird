@@ -10,6 +10,7 @@
 
 #include <AK/ByteBuffer.h>
 #include <AK/Function.h>
+#include <LibGC/WeakHashSet.h>
 #include <LibWeb/Bindings/BaseAudioContext.h>
 #include <LibWeb/DOM/EventTarget.h>
 #include <LibWeb/WebAudio/AnalyserNode.h>
@@ -22,10 +23,12 @@
 #include <LibWeb/WebAudio/ControlMessageQueue.h>
 #include <LibWeb/WebAudio/ConvolverNode.h>
 #include <LibWeb/WebAudio/DelayNode.h>
+#include <LibWeb/WebAudio/IIRFilterNode.h>
 #include <LibWeb/WebAudio/PeriodicWave.h>
 #include <LibWeb/WebAudio/ScriptProcessorNode.h>
 #include <LibWeb/WebAudio/StereoPannerNode.h>
 #include <LibWeb/WebAudio/Types.h>
+#include <LibWeb/WebAudio/WaveShaperNode.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::WebIDL {
@@ -64,7 +67,7 @@ public:
 
     GC::Ref<AudioDestinationNode> destination() const { return *m_destination; }
     float sample_rate() const { return m_sample_rate; }
-    virtual double current_time() const { return m_current_time; }
+    virtual double current_time() const { return 0; }
     GC::Ref<AudioListener> listener() const
     {
         VERIFY(m_listener);
@@ -109,6 +112,7 @@ public:
     WebIDL::ExceptionOr<GC::Ref<OscillatorNode>> create_oscillator();
     WebIDL::ExceptionOr<GC::Ref<DynamicsCompressorNode>> create_dynamics_compressor();
     WebIDL::ExceptionOr<GC::Ref<GainNode>> create_gain();
+    WebIDL::ExceptionOr<GC::Ref<IIRFilterNode>> create_iir_filter(Vector<double> const& feedforward, Vector<double> const& feedback);
     WebIDL::ExceptionOr<GC::Ref<PannerNode>> create_panner();
     WebIDL::ExceptionOr<GC::Ref<PeriodicWave>> create_periodic_wave(Vector<float> const& real, Vector<float> const& imag, PeriodicWaveConstraints const& constraints = {});
     WebIDL::ExceptionOr<GC::Ref<ScriptProcessorNode>> create_script_processor(
@@ -116,6 +120,7 @@ public:
         WebIDL::UnsignedLong number_of_input_channels,
         WebIDL::UnsignedLong number_of_output_channels);
     WebIDL::ExceptionOr<GC::Ref<StereoPannerNode>> create_stereo_panner();
+    WebIDL::ExceptionOr<GC::Ref<WaveShaperNode>> create_wave_shaper();
 
     WebIDL::ExceptionOr<void> decode_audio_data(GC::Ref<WebIDL::Promise>, ByteBuffer, GC::Ptr<WebIDL::CallbackType>, GC::Ptr<WebIDL::CallbackType>);
     WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> decode_audio_data(JS::Realm&, GC::Ref<JS::ArrayBuffer>, GC::Ptr<WebIDL::CallbackType>, GC::Ptr<WebIDL::CallbackType>);
@@ -124,9 +129,8 @@ public:
     NonnullRefPtr<ControlMessageQueue> control_message_queue() const { return m_control_message_queue; }
 
     void add_playing_source(GC::Ref<AudioNode>);
+    void add_script_processor_node(ScriptProcessorNode&);
     void handle_ended_sources(ReadonlySpan<NodeID>);
-
-    void set_current_time(double current_time) { m_current_time = current_time; }
 
     NodeID next_node_id(Badge<AudioNode>) { return ++m_next_node_id; }
 
@@ -153,7 +157,6 @@ private:
     u64 m_next_node_id { 0 };
 
     float m_sample_rate { 0 };
-    double m_current_time { 0 };
 
     GC::Ptr<AudioListener> m_listener;
     GC::Ref<DOM::EventTarget> m_global_object;
@@ -170,6 +173,7 @@ private:
     NonnullRefPtr<ControlMessageQueue> m_control_message_queue;
 
     HashMap<NodeID, GC::Ref<AudioNode>> m_playing_sources;
+    GC::WeakHashSet<ScriptProcessorNode> m_script_processor_nodes;
 };
 
 void resolve_audio_buffer_promise(JS::Realm&, WebIDL::Promise const&, AudioBuffer&);

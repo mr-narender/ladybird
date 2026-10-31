@@ -45,32 +45,26 @@ fn visit_list(
     ControlFlow::Continue(())
 }
 
-pub(crate) fn successor(sheet: &NativeStyleSheet, identity: u64, mut compiled_id: impl FnMut(u64) -> u32) -> u32 {
+/// The identity of the first rule after the subtree of the rule `identity` that is `published`, or 0 for none.
+pub(crate) fn successor(sheet: &NativeStyleSheet, identity: u64, mut published: impl FnMut(u64) -> bool) -> u64 {
     fn walk(
         rule: RuleRef<'_>,
         sheet: &NativeStyleSheet,
         identity: u64,
         found: &mut bool,
-        compiled_id: &mut impl FnMut(u64) -> u32,
-    ) -> ControlFlow<u32> {
+        published: &mut impl FnMut(u64) -> bool,
+    ) -> ControlFlow<u64> {
         if rule.identity() == identity {
             *found = true;
             return ControlFlow::Continue(());
         }
-        if *found {
-            let id = compiled_id(rule.identity());
-            if id != 0 {
-                return ControlFlow::Break(id);
-            }
+        if *found && published(rule.identity()) {
+            return ControlFlow::Break(rule.identity());
         }
-        let mut successor = 0;
+        let mut successor = ControlFlow::Continue(());
         let mut visit = |child: RuleRef<'_>, sheet: &NativeStyleSheet| {
-            if let ControlFlow::Break(id) = walk(child, sheet, identity, found, compiled_id) {
-                successor = id;
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
+            successor = walk(child, sheet, identity, found, published);
+            successor.map_break(|_| ())
         };
         if rule.rule_type() == NativeRuleType::Import {
             if let Some(imported) = sheet.imported_sheet(rule.identity()) {
@@ -79,21 +73,12 @@ pub(crate) fn successor(sheet: &NativeStyleSheet, identity: u64, mut compiled_id
         } else if rule.rule_type() != NativeRuleType::Keyframes {
             let _ = rule.visit_children(&mut |child| visit(child, sheet));
         }
-        if successor != 0 {
-            ControlFlow::Break(successor)
-        } else {
-            ControlFlow::Continue(())
-        }
+        successor
     }
     let mut found = false;
     let mut successor = 0;
     let _ = sheet.rules().visit_rules(&mut |rule| {
-        if let ControlFlow::Break(id) = walk(rule, sheet, identity, &mut found, &mut compiled_id) {
-            successor = id;
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
+        walk(rule, sheet, identity, &mut found, &mut published).map_break(|identity| successor = identity)
     });
     successor
 }
@@ -131,14 +116,13 @@ mod tests {
     use crate::css::parser::syntax_parser::parse_shared_stylesheet;
     use crate::css::parser::value_parser::ParseContext;
     use crate::css::rule::rust_rule_list_remove;
-    use crate::css::style_sheet::rust_style_sheet_set_import;
 
     fn sheet(source: &str) -> Rc<NativeStyleSheet> {
         let units: Vec<_> = source.encode_utf16().collect();
         let view = crate::css::css_tokenizer::TokenizerInput::Utf16(&units);
         // All context fields are booleans, integers, or nullable pointers.
-        let context: ParseContext = unsafe { std::mem::zeroed() };
-        let parsed = unsafe { parse_shared_stylesheet(view, &context) };
+        let context = ParseContext::default();
+        let parsed = parse_shared_stylesheet(view, Some(&context));
         let rules = crate::css::rule::NativeRuleList::from_parsed(parsed);
         let media = MediaList::new(Default::default());
         NativeStyleSheet::new(rules, media)
@@ -152,21 +136,11 @@ mod tests {
         let inside = first.children.as_ref().unwrap().materialized_rules()[0].identity;
         let next = rules[2].children.as_ref().unwrap().materialized_rules()[0].identity;
         let last = rules[3].identity;
-        let compiled = |identity| {
-            if identity == inside {
-                1
-            } else if identity == next {
-                2
-            } else if identity == last {
-                3
-            } else {
-                0
-            }
-        };
-        assert_eq!(successor(&sheet, first.identity, compiled), 2);
-        assert_eq!(successor(&sheet, rules[2].identity, compiled), 3);
-        assert_eq!(successor(&sheet, last, compiled), 0);
-        assert_eq!(successor(&sheet, 0, compiled), 0);
+        let published = |identity| [inside, next, last].contains(&identity);
+        assert_eq!(successor(&sheet, first.identity, published), next);
+        assert_eq!(successor(&sheet, rules[2].identity, published), last);
+        assert_eq!(successor(&sheet, last, published), 0);
+        assert_eq!(successor(&sheet, 0, published), 0);
     }
 
     #[test]
@@ -176,28 +150,18 @@ mod tests {
         let nested = sheet("@keyframes 動き { from { opacity: 0 } to { opacity: 1 } } .先頭 {}");
         let import = root.rules().materialized_rules()[0].clone();
         let nested_import = imported.rules().materialized_rules()[0].clone();
-        unsafe {
-            rust_style_sheet_set_import(&root, import.identity, Rc::as_ptr(&imported));
-            rust_style_sheet_set_import(&imported, nested_import.identity, Rc::as_ptr(&nested));
-        }
+        root.set_import(import.identity, Some(imported.clone()));
+        imported.set_import(nested_import.identity, Some(nested.clone()));
         let middle = imported.rules().materialized_rules()[1].identity;
         let last = root.rules().materialized_rules()[1].identity;
-        let compiled = |identity| {
-            if identity == middle {
-                7
-            } else if identity == last {
-                8
-            } else {
-                0
-            }
-        };
-        assert_eq!(successor(&root, nested_import.identity, compiled), 7);
-        assert_eq!(successor(&root, import.identity, compiled), 8);
+        let published = |identity| identity == middle || identity == last;
+        assert_eq!(successor(&root, nested_import.identity, published), middle);
+        assert_eq!(successor(&root, import.identity, published), last);
         assert!(declares_layer(&import));
         assert!(!declares_layer(&nested_import));
 
         rust_rule_list_remove(root.rules(), 0);
-        unsafe { rust_style_sheet_set_import(&root, import.identity, std::ptr::null()) };
+        root.set_import(import.identity, None);
         let removed = unsafe { removed_rules(&import, &root, Some(&imported)) };
         let kinds: Vec<_> = removed.iter().map(|rule| rule.rule_type).collect();
         assert!(

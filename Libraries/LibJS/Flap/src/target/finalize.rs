@@ -65,7 +65,11 @@ fn finalize_function(function: AllocatedFunction, runtime: &RuntimeConstants) ->
             object_format: ObjectFormat::Elf,
         },
         has_jscvt: false,
+        has_lzcnt: false,
+        has_bmi1: false,
         enable_assertions: false,
+        profiling: false,
+        profile: crate::Profile::JavaScript,
     };
     finalize_function_for_target(function, runtime, &options)
 }
@@ -91,7 +95,10 @@ pub(crate) fn finalize_program(
     let machine = MachineProgram {
         runtime,
         dispatch_handlers: program.dispatch_handlers,
+        dispatch: program.dispatch,
         target,
+        profile: options.profile,
+        profiling: options.profiling,
         functions,
     };
     super::machine_verify::verify_program(&machine)?;
@@ -310,6 +317,14 @@ fn finalize_instruction(
         return Ok(());
     }
 
+    if let Operation::Branch(BranchOperation::OrderedFloat(comparison)) = operation {
+        let operands = &instruction.operands;
+        let [lhs, rhs] = [operands.physical_register(0), operands.physical_register(1)];
+        let target = operands.label(2);
+        emit.last_fp_compare = None;
+        return backend.branch_ordered_float(emit, lhs, rhs, comparison, &target);
+    }
+
     if let Operation::Branch(BranchOperation::Float(condition)) = operation {
         finalize_float_branch(backend, emit, condition, &instruction.operands);
         return Ok(());
@@ -382,6 +397,9 @@ fn finalize_instruction(
         Operation::Control(ControlOperation::GotoHandler) => {
             backend.goto_handler(emit, operands)?;
         }
+        Operation::Control(ControlOperation::DispatchSecondary) => {
+            backend.dispatch_secondary(emit, operands)?;
+        }
         Operation::Control(ControlOperation::JumpBytecode) => {
             backend.goto_bytecode_target(emit, operands)?;
         }
@@ -390,6 +408,9 @@ fn finalize_instruction(
         }
         Operation::Store64IndexedOffset => backend.finalize_indexed_offset_store(emit, operands),
         Operation::Increment32Memory => backend.finalize_memory_increment(emit, operands)?,
+        Operation::MemoryUpdate { operation, width } => {
+            backend.finalize_memory_update(emit, operation, width, operands)?;
+        }
         Operation::Memory(MemoryOperation::Load { width, signed, .. }) => {
             backend.finalize_scalar_load(emit, opcode, width, signed, operands)?;
         }
@@ -434,6 +455,9 @@ fn finalize_instruction(
             return emit.error("operation Cold was not expanded into legal machine instructions");
         }
         Operation::Modulo(width) => backend.finalize_divide(emit, width, operands),
+        Operation::Numeric(operation) => backend.finalize_numeric(emit, operation, operands)?,
+        Operation::Vector(operation) => backend.finalize_vector(emit, operation, operands)?,
+        Operation::Atomic(operation) => backend.finalize_atomic(emit, operation, operands)?,
         _ => emit.output.push(MachineInstruction {
             opcode,
             operands: instruction.operands,
@@ -486,7 +510,11 @@ mod tests {
                 object_format: ObjectFormat::Elf,
             },
             has_jscvt: false,
+            has_lzcnt: false,
+            has_bmi1: false,
             enable_assertions: false,
+            profiling: false,
+            profile: crate::Profile::JavaScript,
         }
     }
 

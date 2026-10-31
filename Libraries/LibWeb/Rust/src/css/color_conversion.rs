@@ -24,6 +24,8 @@ pub(crate) const PROPHOTO_RGB: u8 = 12;
 pub(crate) const REC2020: u8 = 13;
 pub(crate) const XYZ_D50: u8 = 14;
 pub(crate) const XYZ_D65: u8 = 15;
+// NB: alpha() has no color space of its own; its result is in the color space of its origin color.
+pub(crate) const ALPHA: u8 = 16;
 
 // https://drafts.csswg.org/css-color-4/#predefined-sRGB
 // https://drafts.csswg.org/css-color-4/#color-conversion-code
@@ -218,7 +220,7 @@ fn rectangular_to_polar(color: Components) -> Components {
 }
 
 // Algorithm from https://drafts.csswg.org/css-color-3/#hsl-color
-fn hsl_to_srgb(color: Components) -> Components {
+pub(crate) fn hsl_to_srgb(color: Components) -> Components {
     let mut hue = color[0] % 360.0;
     if hue < 0.0 {
         hue += 360.0;
@@ -232,7 +234,7 @@ fn hsl_to_srgb(color: Components) -> Components {
 }
 
 // https://drafts.csswg.org/css-color-4/#hwb-to-rgb
-fn hwb_to_srgb(color: Components) -> Components {
+pub(crate) fn hwb_to_srgb(color: Components) -> Components {
     if color[1] + color[2] >= 1.0 {
         let gray = color[1] / (color[1] + color[2]);
         return [gray, gray, gray, color[3]];

@@ -21,7 +21,7 @@
 
 namespace Web::CSS {
 
-StyleValueFFI::StyleValueData const* ImageStyleValue::make_image_url_data(URL const& url, Optional<::URL::URL> const& style_resource_base_url, Optional<bool> parent_style_sheet_origin_clean, bool should_absolutize_url_for_computed_value)
+StyleValueFFI::StyleValueData const* ImageStyleValue::make_image_url_data(URL const& url, Optional<::URL::URL> const& style_resource_base_url)
 {
     // Rust copies the borrowed URL text and takes ownership of each modifier string.
     auto modifiers = retain_url_modifiers_for_rust(url);
@@ -32,8 +32,7 @@ StyleValueFFI::StyleValueData const* ImageStyleValue::make_image_url_data(URL co
         { url_string.has_ascii_storage() ? reinterpret_cast<u8 const*>(url_string.ascii_span().data()) : nullptr,
             url_string.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(url_string.utf16_span().data()), url_string.length_in_code_units() },
         to_underlying(url.type()), modifiers.data(), modifiers.size(),
-        { resource_base_url_bytes.data(), nullptr, resource_base_url_bytes.size() }, style_resource_base_url.has_value(),
-        parent_style_sheet_origin_clean.has_value(), parent_style_sheet_origin_clean.value_or(false), should_absolutize_url_for_computed_value);
+        { resource_base_url_bytes.data(), nullptr, resource_base_url_bytes.size() }, style_resource_base_url.has_value());
 }
 
 URL ImageStyleValue::url_value() const
@@ -42,14 +41,15 @@ URL ImageStyleValue::url_value() const
     return url_from_rust_data(data.url, data.url_type, data.url_modifiers);
 }
 
-ImageStyleValueResource::ImageStyleValueResource(GC::Ref<HTML::SharedResourceRequest> request, GC::Ref<DOM::Document> const& document)
-    : m_resource_request(move(request))
+ImageStyleValueResource::ImageStyleValueResource(ImageStyleValueResourceKey key, GC::Ref<HTML::SharedResourceRequest> request, GC::Ref<DOM::Document> const& document)
+    : m_key(move(key))
+    , m_resource_request(move(request))
 {
     m_resource_request->add_callbacks(
-        [weak_document = GC::Weak(document), url = m_resource_request->url()] {
+        [weak_document = GC::Weak(document), key = m_key] {
             // FIXME: Can we directly access the resource (i.e. this) here instead of looking it up in the document?
             if (auto document = weak_document.ptr()) {
-                if (auto* resource = document->css_image_resource(url))
+                if (auto* resource = document->css_image_resource(key))
                     resource->on_decoded_image_data_loaded();
             }
         },
@@ -58,7 +58,8 @@ ImageStyleValueResource::ImageStyleValueResource(GC::Ref<HTML::SharedResourceReq
 
 ImageStyleValueResource::~ImageStyleValueResource()
 {
-    VERIFY(m_registration_counts_by_image_style_value.is_empty());
+    // Registrations are only left behind by clients that were collected along with our document, which then destroys
+    // us. See ImageStyleValue::unregister_client().
     unregister_with_decoded_image_data_if_needed();
 }
 
@@ -81,11 +82,6 @@ void ImageStyleValueResource::unregister_image_style_value(ImageStyleValue const
         m_registration_counts_by_image_style_value.remove(it);
     if (m_registration_counts_by_image_style_value.is_empty())
         unregister_with_decoded_image_data_if_needed();
-}
-
-::URL::URL const& ImageStyleValueResource::url() const
-{
-    return m_resource_request->url();
 }
 
 GC::Ptr<HTML::DecodedImageData> ImageStyleValueResource::decoded_image_data() const
@@ -137,11 +133,9 @@ ValueComparingNonnullRefPtr<ImageStyleValue const> ImageStyleValue::create(::URL
     return adopt_ref(*new (nothrow) ImageStyleValue(URL { url.to_string() }));
 }
 
-ImageStyleValue::ImageStyleValue(URL const& url, Optional<::URL::URL> style_resource_base_url, Optional<bool> parent_style_sheet_origin_clean, bool should_absolutize_url_for_computed_value)
-    : AbstractImageStyleValue(Type::Image, make_image_url_data(url, style_resource_base_url, parent_style_sheet_origin_clean, should_absolutize_url_for_computed_value))
+ImageStyleValue::ImageStyleValue(URL const& url, Optional<::URL::URL> style_resource_base_url)
+    : AbstractImageStyleValue(Type::Image, make_image_url_data(url, style_resource_base_url))
     , m_style_resource_base_url(move(style_resource_base_url))
-    , m_parent_style_sheet_origin_clean(parent_style_sheet_origin_clean)
-    , m_should_absolutize_url_for_computed_value(should_absolutize_url_for_computed_value)
 {
     facades_by_rust_style_value_data().set(m_value.data(), this);
 }
@@ -167,6 +161,13 @@ ImageStyleValue::~ImageStyleValue()
 
 GC::Ptr<HTML::SharedResourceRequest> ImageStyleValue::fetch_image(DOM::Document& document) const
 {
+    auto resolved_url = this->resolved_url(document);
+    if (!resolved_url.has_value())
+        return {};
+    // NB: Match the resource key while preserving URL modifiers and the stylesheet's referrer context.
+    auto original_url = url_value();
+    URL request_url { resolved_url->to_string(), original_url.type(), original_url.request_url_modifiers() };
+
     RuleOrDeclaration rule_or_declaration {
         .environment_settings_object = document.relevant_settings_object(),
         .value = RuleOrDeclaration::Rule {},
@@ -174,14 +175,19 @@ GC::Ptr<HTML::SharedResourceRequest> ImageStyleValue::fetch_image(DOM::Document&
         .parent_style_sheet_origin_clean = m_parent_style_sheet_origin_clean,
     };
 
-    return fetch_an_external_image_for_a_stylesheet(url_value(), rule_or_declaration, document);
+    return fetch_an_external_image_for_a_stylesheet(request_url, rule_or_declaration, document);
 }
 
 void ImageStyleValue::load_any_resources(DOM::Document& document)
 {
+    // NB: Prefetching for inactive documents would load images merely from parsing or cloning declarations. If these
+    //     declarations are later rendered in an active document, register_client() will fetch their images then.
+    if (!document.is_fully_active())
+        return;
+
     if (resource_registered_by_clients(document))
         return;
-    if (auto resolved_url = this->resolved_url(document); resolved_url.has_value() && document.css_image_resource(*resolved_url))
+    if (auto key = resource_key(document); key.has_value() && document.css_image_resource(*key))
         return;
     fetch_image(document);
 }
@@ -216,43 +222,6 @@ void ImageStyleValue::update_style_sheet_resource_context(StyleSheetState const&
     m_should_absolutize_url_for_computed_value = true;
 }
 
-ValueComparingNonnullRefPtr<StyleValue const> ImageStyleValue::absolutized(ComputationContext const& context) const
-{
-    // NB: Materialize the URL once; rebuilding it per use re-marshals the string and modifier list each time.
-    auto url_value = this->url_value();
-
-    if (url_value.url().is_empty())
-        return *this;
-
-    // FIXME: The spec has been updated to handle this better. The computation of the base URL here is roughly based on:
-    //        https://drafts.csswg.org/css-values-4/#style-resource-base-url
-    //        https://github.com/w3c/csswg-drafts/pull/12261
-    auto base_url = m_style_resource_base_url;
-    if (!base_url.has_value() && context.abstract_element.has_value())
-        base_url = context.abstract_element->document().base_url();
-
-    if (base_url.has_value()) {
-        if (m_should_absolutize_url_for_computed_value) {
-            if (DOMURL::parse(url_value.url()).has_value()) {
-                auto absolutized_image = adopt_ref(*new (nothrow) ImageStyleValue(url_value, *base_url, m_parent_style_sheet_origin_clean, true));
-                return absolutized_image;
-            }
-
-            if (auto resolved_url = DOMURL::parse(url_value.url(), *base_url); resolved_url.has_value()) {
-                auto absolutized_image = adopt_ref(*new (nothrow) ImageStyleValue(URL { resolved_url->to_string(), url_value.type(), url_value.request_url_modifiers() }, *base_url, m_parent_style_sheet_origin_clean, true));
-                return absolutized_image;
-            }
-
-            return *this;
-        }
-
-        auto absolutized_image = adopt_ref(*new (nothrow) ImageStyleValue(url_value, *base_url, m_parent_style_sheet_origin_clean));
-        return absolutized_image;
-    }
-
-    return *this;
-}
-
 void ImageStyleValue::register_client(Client& client) const
 {
     auto result = m_clients.set(&client);
@@ -263,11 +232,11 @@ void ImageStyleValue::register_client(Client& client) const
 
     auto* resource = resource_registered_by_clients(*document);
     if (!resource) {
-        auto resolved_url = this->resolved_url(*document);
-        if (!resolved_url.has_value())
+        auto key = resource_key(*document);
+        if (!key.has_value())
             return;
 
-        resource = document->css_image_resource(*resolved_url);
+        resource = document->css_image_resource(*key);
         if (!resource) {
             auto resource_request = fetch_image(*document);
 
@@ -275,7 +244,7 @@ void ImageStyleValue::register_client(Client& client) const
             //     the case here.
             VERIFY(resource_request);
 
-            resource = &document->create_css_image_resource(*resource_request);
+            resource = &document->create_css_image_resource(key.release_value(), *resource_request);
         }
     }
 
@@ -292,14 +261,15 @@ void ImageStyleValue::unregister_client(Client& client) const
     if (!resource)
         return;
 
-    // The document owns the resource, so a collected document has already destroyed it.
+    // The document owns the resource. A client only loses its document when the document is collected, which destroys
+    // the resource along with any registrations that are left.
     auto document = client.document();
     if (!document)
         return;
 
     resource->unregister_image_style_value(*this);
     if (resource->can_be_removed())
-        document->remove_css_image_resource_if_unused(resource->url());
+        document->remove_css_image_resource_if_unused(resource->key());
 }
 
 void ImageStyleValue::notify_clients_did_update() const
@@ -317,11 +287,27 @@ Optional<::URL::URL> ImageStyleValue::resolved_url(DOM::Document const& document
     if (url.is_empty())
         return {};
 
+    // https://drafts.csswg.org/css-values-4/#local-urls
+    // NB: A fragment-only image reference follows the document URL rather than a stylesheet or base element.
+    if (url.starts_with(u'#'))
+        return DOMURL::parse(url, document.url());
     auto resolved_url = DOMURL::parse(url, style_resource_base_url(document));
     // A value without a base URL of its own follows the document's base URL as that changes.
     if (m_style_resource_base_url.has_value())
         m_resolved_url = resolved_url;
     return resolved_url;
+}
+
+Optional<ImageStyleValueResourceKey> ImageStyleValue::resource_key(DOM::Document const& document) const
+{
+    auto resolved_url = this->resolved_url(document);
+    if (!resolved_url.has_value())
+        return {};
+
+    // OPTIMIZATION: Most url() values have no request modifiers, so don't rebuild the URL value for those.
+    if (m_value->image.url_modifiers.length == 0)
+        return ImageStyleValueResourceKey { .url = resolved_url.release_value(), .cross_origin = {}, .integrity = {}, .referrer_policy = {} };
+    return ImageStyleValueResourceKey::create(resolved_url.release_value(), url_value());
 }
 
 ::URL::URL ImageStyleValue::style_resource_base_url(DOM::Document const& document) const

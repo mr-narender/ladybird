@@ -5,10 +5,13 @@
  */
 
 #include <LibCore/File.h>
-#include <LibMedia/CodedFrame.h>
 #include <LibMedia/Containers/MP3/MP3Demuxer.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
+#include <LibMediaCodecs/CodedFrame.h>
 #include <LibTest/TestCase.h>
+#include <LibThreading/Thread.h>
+
+#include "TransientlyAbortingStream.h"
 
 static NonnullRefPtr<Media::Demuxer> create_demuxer(StringView path)
 {
@@ -29,6 +32,153 @@ static Media::Track audio_track(Media::Demuxer& demuxer)
     VERIFY(track.has_value());
     MUST(demuxer.create_context_for_track(*track));
     return *track;
+}
+
+static NonnullRefPtr<Media::Demuxer> create_demuxer_for(ReadonlyBytes bytes)
+{
+    auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(ByteBuffer::copy(bytes)));
+    return MUST(Media::MP3::MP3Demuxer::from_stream(stream));
+}
+
+static Vector<AK::Duration> timestamps_of_every_frame(Media::Demuxer& demuxer, Media::Track const& track)
+{
+    Vector<AK::Duration> timestamps;
+    while (true) {
+        auto frame = demuxer.get_next_sample_for_track(track);
+        if (frame.is_error()) {
+            EXPECT_EQ(frame.error().category(), Media::DecoderErrorCategory::EndOfStream);
+            break;
+        }
+        timestamps.append(frame.value().presentation_timestamp());
+    }
+    return timestamps;
+}
+
+static void expect_a_transient_abort_to_resume_with_its_frame(ReadonlyBytes bytes, size_t aborted_read_position)
+{
+    Vector<AK::Duration> expected_timestamps;
+    {
+        auto demuxer = create_demuxer_for(bytes);
+        auto track = audio_track(*demuxer);
+        expected_timestamps = timestamps_of_every_frame(*demuxer, track);
+    }
+
+    auto stream = TransientlyAbortingStream::create(MUST(ByteBuffer::copy(bytes)), aborted_read_position);
+    auto demuxer = MUST(Media::MP3::MP3Demuxer::from_stream(stream));
+    auto track = audio_track(*demuxer);
+
+    Vector<AK::Duration> actual_timestamps;
+    size_t aborted_read_count = 0;
+    while (true) {
+        auto frame = demuxer->get_next_sample_for_track(track);
+        if (frame.is_error()) {
+            if (frame.error().category() != Media::DecoderErrorCategory::Aborted) {
+                EXPECT_EQ(frame.error().category(), Media::DecoderErrorCategory::EndOfStream);
+                break;
+            }
+            aborted_read_count++;
+            continue;
+        }
+        actual_timestamps.append(frame.value().presentation_timestamp());
+    }
+    EXPECT(stream->has_aborted_a_read());
+    EXPECT_EQ(aborted_read_count, 1u);
+    EXPECT_EQ(actual_timestamps, expected_timestamps);
+}
+
+static void expect_an_aborted_read_to_resume_with_its_frame(ReadonlyBytes bytes, size_t initial_byte_count)
+{
+    Vector<AK::Duration> expected_timestamps;
+    {
+        auto demuxer = create_demuxer_for(bytes);
+        auto track = audio_track(*demuxer);
+        expected_timestamps = timestamps_of_every_frame(*demuxer, track);
+    }
+
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(bytes.size());
+    stream->add_chunk_at(0, bytes.trim(initial_byte_count));
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto demuxer = MUST(Media::MP3::MP3Demuxer::from_stream(stream));
+    IGNORE_USE_IN_ESCAPING_LAMBDA auto track = audio_track(*demuxer);
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_blocked { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA Atomic<bool> read_was_aborted { false };
+    demuxer->set_read_blocked_change_handler_for_track(track, [&](Media::ReadBlocked blocked) {
+        read_blocked = blocked == Media::ReadBlocked::Yes;
+    });
+
+    IGNORE_USE_IN_ESCAPING_LAMBDA Vector<AK::Duration> actual_timestamps;
+    auto reader_thread = Threading::Thread::construct("TestReader"sv, [&]() -> intptr_t {
+        while (true) {
+            auto frame = demuxer->get_next_sample_for_track(track);
+            if (frame.is_error()) {
+                EXPECT_EQ(frame.error().category(), Media::DecoderErrorCategory::Aborted);
+                break;
+            }
+            actual_timestamps.append(frame.value().presentation_timestamp());
+        }
+        demuxer->reset_blocking_reads_aborted_for_track(track);
+        read_was_aborted = true;
+        actual_timestamps.extend(timestamps_of_every_frame(*demuxer, track));
+        return 0;
+    });
+    reader_thread->start();
+
+    while (!read_blocked.load()) { }
+    demuxer->set_blocking_reads_aborted_for_track(track);
+    while (!read_was_aborted.load()) { }
+
+    stream->add_chunk_at(initial_byte_count, bytes.slice(initial_byte_count));
+    stream->close();
+    MUST(reader_thread->join());
+
+    EXPECT_EQ(actual_timestamps, expected_timestamps);
+}
+
+enum class SeekInterruption : u8 {
+    AbortedReads,
+    PermanentlyUnavailableData,
+};
+
+static void expect_an_interrupted_seek_to_keep_the_position(ReadonlyBytes bytes, size_t available_byte_count, SeekInterruption interruption)
+{
+    Vector<AK::Duration> expected_timestamps;
+    {
+        auto demuxer = create_demuxer_for(bytes);
+        auto track = audio_track(*demuxer);
+        expected_timestamps = timestamps_of_every_frame(*demuxer, track);
+    }
+
+    auto stream = Media::IncrementallyPopulatedStream::create_empty();
+    stream->set_expected_size(bytes.size());
+    stream->add_chunk_at(0, bytes.trim(available_byte_count));
+    auto demuxer = MUST(Media::MP3::MP3Demuxer::from_stream(stream));
+    auto track = audio_track(*demuxer);
+
+    constexpr size_t frames_read_before_seeking = 3;
+    for (size_t index = 0; index < frames_read_before_seeking; index++)
+        EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).presentation_timestamp(), expected_timestamps[index]);
+
+    auto expected_category = Media::DecoderErrorCategory::Aborted;
+    if (interruption == SeekInterruption::AbortedReads) {
+        demuxer->set_blocking_reads_aborted_for_track(track);
+    } else {
+        stream->make_missing_data_permanently_unavailable();
+        expected_category = Media::DecoderErrorCategory::PermanentlyUnavailable;
+    }
+
+    // The target lies in data the stream does not have, so the seek has to read it.
+    auto seek_result = demuxer->seek_to_most_recent_keyframe(track, expected_timestamps.last(), Media::DemuxerSeekOptions::None);
+    EXPECT(seek_result.is_error());
+    if (seek_result.is_error())
+        EXPECT_EQ(seek_result.error().category(), expected_category);
+
+    if (interruption == SeekInterruption::AbortedReads)
+        demuxer->reset_blocking_reads_aborted_for_track(track);
+    // A demuxer that moved into the missing data fails this read instead of waiting on it forever.
+    stream->make_missing_data_permanently_unavailable();
+    EXPECT_EQ(MUST(demuxer->get_next_sample_for_track(track)).presentation_timestamp(), expected_timestamps[frames_read_before_seeking]);
 }
 
 TEST_CASE(demuxer_describes_the_only_track_of_the_stream)
@@ -154,4 +304,49 @@ TEST_CASE(demuxer_declines_a_stream_that_holds_no_frames)
     auto demuxer = Media::MP3::MP3Demuxer::from_stream(stream);
     EXPECT(demuxer.is_error());
     EXPECT_EQ(demuxer.error().category(), Media::DecoderErrorCategory::UnrecognizedFormat);
+}
+
+static Vector<u8> constant_bitrate_mp3_frames(size_t count)
+{
+    // 128 kbps 48 kHz stereo Layer III frames, which each occupy 384 bytes.
+    Vector<u8> bytes;
+    for (size_t index = 0; index < count; index++) {
+        bytes.append(0xFF);
+        bytes.append(0xFB);
+        bytes.append(0x94);
+        bytes.append(0x00);
+        for (size_t padding = 4; padding < 384; padding++)
+            bytes.append(0);
+    }
+    return bytes;
+}
+
+TEST_CASE(demuxer_resumes_a_read_aborted_inside_a_frame_with_that_frame)
+{
+    auto bytes = constant_bitrate_mp3_frames(80);
+    expect_an_aborted_read_to_resume_with_its_frame(bytes, (40 * 384) + 100);
+}
+
+TEST_CASE(demuxer_resumes_a_read_aborted_inside_a_frame_header_with_that_frame)
+{
+    auto bytes = constant_bitrate_mp3_frames(80);
+    expect_an_aborted_read_to_resume_with_its_frame(bytes, (40 * 384) + 2);
+}
+
+TEST_CASE(demuxer_resumes_after_a_transient_abort)
+{
+    auto bytes = constant_bitrate_mp3_frames(80);
+    expect_a_transient_abort_to_resume_with_its_frame(bytes, 40 * 384);
+}
+
+TEST_CASE(demuxer_keeps_its_position_when_a_seek_is_aborted)
+{
+    auto bytes = constant_bitrate_mp3_frames(80);
+    expect_an_interrupted_seek_to_keep_the_position(bytes, 40 * 384, SeekInterruption::AbortedReads);
+}
+
+TEST_CASE(demuxer_keeps_its_position_when_a_seek_needs_permanently_unavailable_data)
+{
+    auto bytes = constant_bitrate_mp3_frames(80);
+    expect_an_interrupted_seek_to_keep_the_position(bytes, 40 * 384, SeekInterruption::PermanentlyUnavailableData);
 }
