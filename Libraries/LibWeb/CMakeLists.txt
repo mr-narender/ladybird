@@ -516,6 +516,7 @@ set(SOURCES
     HTML/HTMLIFrameElement.cpp
     HTML/HTMLImageElement.cpp
     HTML/HTMLInputElement.cpp
+    HTML/HTMLInputElementDateTimeFields.cpp
     HTML/HTMLInsertion.cpp
     HTML/HTMLLabelElement.cpp
     HTML/HTMLLegendElement.cpp
@@ -574,7 +575,6 @@ set(SOURCES
     HTML/Location.cpp
     HTML/MediaError.cpp
     HTML/MediaTrackBase.cpp
-    HTML/MessageChannel.cpp
     HTML/MessageEvent.cpp
     HTML/MessagePort.cpp
     HTML/MimeType.cpp
@@ -629,6 +629,7 @@ set(SOURCES
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
     HTML/Scripting/ConsoleInputCompletion.cpp
+    HTML/Scripting/DevToolsLoggedObjects.cpp
     HTML/Scripting/DevToolsObjectTable.cpp
     HTML/Scripting/Environments.cpp
     HTML/Scripting/ExceptionReporter.cpp

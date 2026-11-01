@@ -413,6 +413,7 @@ public:
     void set_listen_for_dom_mutations(bool);
     void did_connect_devtools_client();
     void did_disconnect_devtools_client();
+    void start_sending_console_output(bool messages, bool errors);
     void get_dom_node_inner_html(Web::UniqueNodeID node_id);
     void get_dom_node_outer_html(Web::UniqueNodeID node_id);
     void set_dom_node_outer_html(Web::UniqueNodeID node_id, String const& html);
@@ -448,6 +449,7 @@ public:
     void confirm_closed(bool accepted);
     void prompt_closed(Optional<Utf16String> const& response);
     void color_picker_update(Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state);
+    void date_picker_closed(Optional<Utf16String> picked_value);
     void file_picker_closed(Vector<Web::HTML::SelectedFile> selected_files);
     void select_dropdown_closed(Optional<u32> const& selected_item_id);
 
@@ -620,6 +622,7 @@ public:
     Function<void()> on_fullscreen_window;
     Function<void()> on_exit_fullscreen_window;
     Function<void(Color current_color)> on_request_color_picker;
+    Function<void(Utf16String const& input_type, Utf16String const& value, Utf16String const& minimum, Utf16String const& maximum)> on_request_date_picker;
     Function<void(WebContentPage& requesting_page, u64 request_id, Web::HTML::CrossProcessId document_id)> on_request_geolocation_position;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_cancel_geolocation_position_request;
     Function<void(WebContentPage& requesting_page, u64 request_id, Web::HTML::CrossProcessId document_id)> on_start_geolocation_position_watch;
@@ -673,6 +676,7 @@ public:
     void send_to_media_context_menu_page(Function<void(WebContentPage&)> const&);
 
     void did_request_color_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Color current_color);
+    void did_request_date_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum);
     void did_request_file_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles);
     void did_request_select_dropdown(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, i32 minimum_width, Vector<Web::HTML::SelectItem> items);
 
@@ -1134,6 +1138,7 @@ protected:
     Web::ViewportIsFullscreen m_is_fullscreen { Web::ViewportIsFullscreen::No };
 
     RefPtr<WebContentPage> m_color_picker_page;
+    RefPtr<WebContentPage> m_date_picker_page;
     RefPtr<WebContentPage> m_file_picker_page;
     RefPtr<WebContentPage> m_select_dropdown_page;
     RefPtr<WebContentPage> m_media_context_menu_page;
@@ -1232,6 +1237,8 @@ protected:
     DevTools::DevToolsDelegate::OnNodePickerEvent m_on_node_picker_event;
 
     bool m_devtools_connected { false };
+    bool m_devtools_takes_console_messages { false };
+    bool m_devtools_takes_console_errors { false };
 };
 
 }

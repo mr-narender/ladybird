@@ -67,17 +67,8 @@ pub(crate) fn srgb_color_in_predefined_color_space(color: [u8; 4], predefined_co
         .map(quantize)
 }
 
-/// The wide-gamut Gfx::Color::from_*() constructors funnel through color_from_linear_srgb().
-/// This reuses color_conversion::convert() instead of duplicating its matrices. Routing
-/// differences against the C++ code, all below u8 quantization error:
-/// - C++ from_xyz50/from_lab/from_pro_photo_rgb multiply a direct XYZ-D50-to-linear-sRGB
-///   matrix; convert() hops through XYZ-D65 instead.
-/// - C++ from_oklab uses the bottosson.github.io OKLab-to-linear-sRGB matrix; convert()
-///   composes the CSS Color 4 OKLab-to-XYZ-D65 and XYZ-D65-to-linear-sRGB matrices.
-/// - C++ from_linear_srgb gamma-encodes directly; convert() round-trips through XYZ-D65.
-/// - Two literals disagree with LibGfx by one f32 ulp: the display-p3 X-row green
-///   coefficient (0.26566769f vs 0.2656677) and xyz50_to_xyz65's first coefficient
-///   (0.9554734528f vs 0.9554735).
+/// Converts a color in the color space of `color_type` to an 8-bit sRGB color, like the Gfx::Color::from_*()
+/// constructors, but with more precise color space conversions.
 fn from_converted(color_type: u8, components: Components) -> Rgba {
     let srgb =
         color_conversion::convert(color_type, color_conversion::SRGB, components).expect("color type converts to sRGB");
@@ -1815,6 +1806,19 @@ fn extract_channels_and_missing_slots(
             let xyz65 =
                 color_conversion::convert(ct::SRGB, ct::XYZ_D65, srgb_fraction).expect("sRGB converts to XYZ-D65");
             set_channels_for_target(&mut context, target_color_type, xyz65, srgb_fraction, linear_srgb);
+            make_powerless_target_hue_missing(&mut context, &mut missing_slots, target_color_type);
+            return Some((context, missing_slots));
+        }
+
+        // Lab and LCH, and Oklab and OkLCh, are forms of the same color space, so convert between them directly.
+        if matches!(
+            (origin_native_type, target_color_type),
+            (ct::LAB, ct::LCH) | (ct::LCH, ct::LAB) | (ct::OKLAB, ct::OKLCH) | (ct::OKLCH, ct::OKLAB)
+        ) {
+            let converted = color_conversion::convert(origin_native_type, target_color_type, native_channels)?;
+            for (index, slot) in channel_slots(target_color_type)?.into_iter().enumerate() {
+                context[usize::from(slot)] = Some(f64::from(converted[index]));
+            }
             make_powerless_target_hue_missing(&mut context, &mut missing_slots, target_color_type);
             return Some((context, missing_slots));
         }

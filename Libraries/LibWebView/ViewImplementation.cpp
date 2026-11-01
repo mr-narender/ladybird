@@ -2523,9 +2523,18 @@ void ViewImplementation::did_connect_devtools_client()
     page().async_set_has_devtools_client(true);
 }
 
+void ViewImplementation::start_sending_console_output(bool messages, bool errors)
+{
+    m_devtools_takes_console_messages |= messages;
+    m_devtools_takes_console_errors |= errors;
+    page().async_start_sending_console_output(messages, errors);
+}
+
 void ViewImplementation::did_disconnect_devtools_client()
 {
     m_devtools_connected = false;
+    m_devtools_takes_console_messages = false;
+    m_devtools_takes_console_errors = false;
     page().async_set_has_devtools_client(false);
 }
 
@@ -2759,6 +2768,23 @@ void ViewImplementation::color_picker_update(Optional<Color> picked_color, Web::
     if (state == Web::HTML::ColorPickerUpdateState::Closed)
         m_color_picker_page.clear();
     target->async_color_picker_update(picked_color, state);
+}
+
+void ViewImplementation::did_request_date_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum)
+{
+    if (another_page_awaits(m_date_picker_page, requesting_page) || !on_request_date_picker) {
+        requesting_page.async_date_picker_closed({});
+        return;
+    }
+    m_date_picker_page = requesting_page;
+    on_request_date_picker(input_type, value, minimum, maximum);
+}
+
+void ViewImplementation::date_picker_closed(Optional<Utf16String> picked_value)
+{
+    NonnullRefPtr<WebContentPage> target = m_date_picker_page ? *m_date_picker_page : page();
+    m_date_picker_page.clear();
+    target->async_date_picker_closed(move(picked_value));
 }
 
 void ViewImplementation::did_request_file_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles allow_multiple_files)
@@ -3570,8 +3596,11 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
     if (m_accessibility_tree_requested)
         page.async_request_accessibility_tree();
 
-    // DevTools inspects the page that displays the tab, and no other.
+    // DevTools inspects the page that displays the tab, and no other. A client that took the console's messages or
+    // errors takes those of this page too.
     page.async_set_has_devtools_client(m_devtools_connected);
+    if (m_devtools_takes_console_messages || m_devtools_takes_console_errors)
+        page.async_start_sending_console_output(m_devtools_takes_console_messages, m_devtools_takes_console_errors);
     handle_resize();
     update_ui_overlays();
 

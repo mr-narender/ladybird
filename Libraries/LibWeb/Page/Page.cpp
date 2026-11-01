@@ -298,7 +298,11 @@ void Page::process_screenshot_requests()
             }
             auto bitmap = bitmap_or_error.release_value();
             HTML::PaintConfig paint_config { .canvas_fill_rect = rect.to_type<int>() };
-            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client] {
+            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client](auto result) {
+                if (result == Compositor::ScreenshotResult::Failed) {
+                    client.page_did_take_screenshot({});
+                    return;
+                }
                 client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
             });
         } else {
@@ -315,7 +319,11 @@ void Page::process_screenshot_requests()
             }
             auto bitmap = bitmap_or_error.release_value();
             HTML::PaintConfig paint_config { .paint_overlay = true, .canvas_fill_rect = rect.to_type<int>() };
-            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client] {
+            navigable->render_screenshot(bitmap, paint_config, [bitmap, &client](auto result) {
+                if (result == Compositor::ScreenshotResult::Failed) {
+                    client.page_did_take_screenshot({});
+                    return;
+                }
                 client.page_did_take_screenshot(bitmap->to_shareable_bitmap());
             });
         }
@@ -1297,6 +1305,9 @@ void Page::did_request_color_picker(GC::Weak<HTML::HTMLInputElement> target, Col
         m_pending_non_blocking_dialog_target = move(target);
 
         m_client->page_did_request_color_picker(current_color);
+    } else if (target && target.ptr() != m_pending_non_blocking_dialog_target.ptr()) {
+        // NB: Another dialog is showing, so no picker opens for this input.
+        target->set_is_open(false);
     }
 }
 
@@ -1312,6 +1323,37 @@ void Page::color_picker_update(Optional<Color> picked_color, HTML::ColorPickerUp
             if (state == HTML::ColorPickerUpdateState::Closed)
                 m_pending_non_blocking_dialog_target = nullptr;
         }
+    }
+}
+
+void Page::did_request_date_picker(GC::Weak<HTML::HTMLInputElement> target, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum)
+{
+    if (m_pending_non_blocking_dialog == PendingNonBlockingDialog::None) {
+        m_pending_non_blocking_dialog = PendingNonBlockingDialog::DatePicker;
+        m_pending_non_blocking_dialog_target = move(target);
+        m_pending_date_picker_input_type = input_type;
+
+        m_client->page_did_request_date_picker(move(input_type), move(value), move(minimum), move(maximum));
+    } else if (target && target.ptr() != m_pending_non_blocking_dialog_target.ptr()) {
+        // NB: Another dialog is showing, so no picker opens for this input.
+        target->set_is_open(false);
+    }
+}
+
+void Page::date_picker_closed(Optional<Utf16String> picked_value)
+{
+    if (m_pending_non_blocking_dialog != PendingNonBlockingDialog::DatePicker)
+        return;
+    m_pending_non_blocking_dialog = PendingNonBlockingDialog::None;
+    auto requested_input_type = move(m_pending_date_picker_input_type);
+
+    if (m_pending_non_blocking_dialog_target) {
+        auto& input_element = as<HTML::HTMLInputElement>(*m_pending_non_blocking_dialog_target);
+        m_pending_non_blocking_dialog_target = nullptr;
+        // NB: A picker opened for another type of input gives a value that does not apply to this one.
+        if (input_element.type() != requested_input_type)
+            picked_value = {};
+        input_element.did_pick_date(move(picked_value));
     }
 }
 

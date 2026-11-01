@@ -2310,6 +2310,12 @@ void ConnectionFromClient::set_has_devtools_client(Web::PageId page_id, bool has
         page->set_has_devtools_client(has_devtools_client);
 }
 
+void ConnectionFromClient::start_sending_console_output(Web::PageId page_id, bool messages, bool errors)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->start_sending_console_output(messages, errors);
+}
+
 void ConnectionFromClient::get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id)
 {
     auto* dom_node = Web::DOM::Node::from_unique_id(node_id);
@@ -3452,6 +3458,12 @@ void ConnectionFromClient::color_picker_update(Web::PageId page_id, Optional<Col
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().color_picker_update(picked_color, state);
+}
+
+void ConnectionFromClient::date_picker_closed(Web::PageId page_id, Optional<Utf16String> picked_value)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().date_picker_closed(move(picked_value));
 }
 
 void ConnectionFromClient::file_picker_closed(Web::PageId page_id, Vector<Web::HTML::SelectedFile> selected_files)

@@ -5225,7 +5225,15 @@ impl LayoutNodeArena {
         node: NodeSlotId,
         read: impl FnOnce(&std::sync::Arc<super::fragment_tree::Fragment>) -> R,
     ) -> Option<R> {
-        self.paintable_rows.with_current_committed_fragment(
+        self.with_current_committed_fragment_link(node, |link| read(&link.fragment))
+    }
+
+    pub(crate) fn with_current_committed_fragment_link<R>(
+        &self,
+        node: NodeSlotId,
+        read: impl FnOnce(&super::fragment_tree::FragmentLink) -> R,
+    ) -> Option<R> {
+        self.paintable_rows.with_current_committed_fragment_link(
             node.slot_index(),
             node.generation(),
             self.data(node).fragment_cache_epoch,
@@ -5403,6 +5411,14 @@ impl LayoutNodeArena {
             .get(id.slot_index() as usize)
             .filter(|slot| slot.generation == id.generation())
             .and_then(|slot| slot.facts)
+    }
+
+    #[inline]
+    pub(crate) fn has_replaced_content_facts(&self, id: NodeSlotId) -> bool {
+        assert!(!id.is_invalid(), "invalid layout node arena slot ID");
+        self.replaced_content_facts
+            .get(id.slot_index() as usize)
+            .is_some_and(|slot| slot.generation == id.generation() && slot.facts.is_some())
     }
 
     pub(crate) fn invalidate_searchable_text(&mut self) {
@@ -5658,12 +5674,16 @@ impl LayoutNodeArena {
         intrinsic_sizes: AncestorIntrinsicSizes,
     ) {
         self.invalidate_one(node, invalidation);
+        let mut ancestor_intrinsic_sizes = intrinsic_sizes;
         if intrinsic_sizes == AncestorIntrinsicSizes::Reset
             && super::node_facts::kind_is_box(self.data(node).kind.get())
         {
             self.reset_cached_intrinsic_sizes(node);
+            if self.box_contributes_to_no_ancestor_intrinsic_size(node) {
+                ancestor_intrinsic_sizes = AncestorIntrinsicSizes::Kept;
+            }
         }
-        self.invalidate_ancestors_for_change_below(node, invalidation, intrinsic_sizes);
+        self.invalidate_ancestors_for_change_below(node, invalidation, ancestor_intrinsic_sizes);
     }
 
     pub(super) fn invalidate_ancestors_for_change_below(
@@ -5700,14 +5720,16 @@ impl LayoutNodeArena {
     }
 
     /// Whether a change inside the box leaves the intrinsic sizes of its ancestors as they are.
-    /// Absolutely positioned elements don't contribute to ancestor intrinsic sizes. SVG root
-    /// elements have intrinsic sizes determined solely by their own attributes (width, height,
-    /// viewBox), not by their children.
+    /// SVG root elements have intrinsic sizes determined solely by their own attributes (width,
+    /// height, viewBox), not by their children.
     fn content_does_not_size_box(&self, node: NodeSlotId) -> bool {
-        self.data(node).kind.get() == NodeKind::SVGSVGBox
-            || self
-                .node_style_if_live(node)
-                .is_some_and(|style| style.is_absolutely_positioned())
+        self.data(node).kind.get() == NodeKind::SVGSVGBox || self.box_contributes_to_no_ancestor_intrinsic_size(node)
+    }
+
+    /// Absolutely positioned elements don't contribute to ancestor intrinsic sizes.
+    pub(super) fn box_contributes_to_no_ancestor_intrinsic_size(&self, node: NodeSlotId) -> bool {
+        self.node_style_if_live(node)
+            .is_some_and(|style| style.is_absolutely_positioned())
     }
 
     pub(super) fn invalidate_one(&mut self, node: NodeSlotId, invalidation: AncestorInvalidation) {

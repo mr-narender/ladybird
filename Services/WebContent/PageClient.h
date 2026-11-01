@@ -120,6 +120,9 @@ public:
     void set_has_devtools_client(bool);
     bool has_devtools_client() const { return m_has_devtools_client; }
     virtual bool has_active_devtools_client() const override { return has_devtools_client(); }
+    void start_sending_console_output(bool messages, bool errors);
+    bool devtools_takes_console_messages() const { return m_devtools_takes_console_messages; }
+    bool devtools_takes_console_errors() const { return m_devtools_takes_console_errors; }
 
     void initialize_js_console(Web::DOM::Document& document);
     void js_console_input(StringView js_source);
@@ -347,6 +350,7 @@ private:
     virtual void page_did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token) override;
     virtual Optional<Web::FileAPI::SerializedBlobURLEntry> page_did_request_blob_url_entry(Utf16String const& url, Optional<URL::BlobURLEntry::Token> token) override;
     virtual void page_did_request_color_picker(Color current_color) override;
+    virtual void page_did_request_date_picker(Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum) override;
     virtual void page_did_request_file_picker(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles) override;
     virtual void page_did_request_select_dropdown(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::CSSPixels minimum_width, Vector<Web::HTML::SelectItem> items) override;
     virtual void page_did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId requesting_document_id) override;
@@ -468,6 +472,8 @@ private:
     Optional<i64> m_pending_accessibility_focus;
 
     bool m_has_devtools_client { false };
+    bool m_devtools_takes_console_messages { false };
+    bool m_devtools_takes_console_errors { false };
 };
 
 }

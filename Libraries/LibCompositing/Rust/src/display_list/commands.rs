@@ -263,6 +263,8 @@ pub struct ReplayLayer {
     pub backdrop_filter_bytes_size: usize,
     pub backdrop_region: IntRect,
     pub backdrop_corner_radii: CornerRadii,
+    /// The color the backdrop is read over, transparent unless the parent layer is the root isolation layer.
+    pub backdrop_base_color: Color,
     pub effect: EffectNodeIndex,
     /// Bounds of everything replay draws into the layer, in the effect's space, when known.
     pub content_bounds: OptionalFloatRect,
@@ -1485,7 +1487,6 @@ impl DisplayListCommand for DeclareMaskContent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorScrollNode {
-    pub document_id: UniqueNodeId,
     pub scrollable_node_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub parent_scroll_node_index: SpatialNodeIndex,
@@ -1505,7 +1506,6 @@ pub struct CompositorScrollNode {
     pub shows_overscroll_effect_vertically: bool,
 }
 ffi_bytes_fields!(CompositorScrollNode {
-    document_id,
     scrollable_node_id,
     scroll_node_index,
     parent_scroll_node_index,
@@ -1532,7 +1532,6 @@ impl DisplayListCommand for CompositorScrollNode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorSnapContainer {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub snapport: FfiCssPixelRect,
     pub min_scroll_offset: FfiCssPixelPoint,
@@ -1543,7 +1542,6 @@ pub struct CompositorSnapContainer {
     pub horizontal_writing_mode: bool,
 }
 ffi_bytes_fields!(CompositorSnapContainer {
-    document_id,
     scroll_node_index,
     snapport,
     min_scroll_offset,
@@ -1563,7 +1561,6 @@ impl DisplayListCommand for CompositorSnapContainer {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorSnapArea {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub area_node_id: UniqueNodeId,
     pub pseudo_element_type: u8,
@@ -1573,7 +1570,6 @@ pub struct CompositorSnapArea {
     pub always_stop: bool,
 }
 ffi_bytes_fields!(CompositorSnapArea {
-    document_id,
     scroll_node_index,
     area_node_id,
     pseudo_element_type,
@@ -1601,12 +1597,10 @@ impl DisplayListCommand for CompositorBlockingWheelEventRegion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorWheelHitTestTarget {
-    pub document_id: UniqueNodeId,
     pub target_scroll_node_index: SpatialNodeIndex,
     pub rect: FloatRect,
 }
 ffi_bytes_fields!(CompositorWheelHitTestTarget {
-    document_id,
     target_scroll_node_index,
     rect
 });
@@ -1618,13 +1612,11 @@ impl DisplayListCommand for CompositorWheelHitTestTarget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorWheelHitTestTargetWithCornerRadii {
-    pub document_id: UniqueNodeId,
     pub target_scroll_node_index: SpatialNodeIndex,
     pub rect: FloatRect,
     pub corner_radii: CornerRadii,
 }
 ffi_bytes_fields!(CompositorWheelHitTestTargetWithCornerRadii {
-    document_id,
     target_scroll_node_index,
     rect,
     corner_radii
@@ -1639,14 +1631,12 @@ impl DisplayListCommand for CompositorWheelHitTestTargetWithCornerRadii {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorScrollChainingBarrier {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index_above_barrier: SpatialNodeIndex,
     pub rect: FloatRect,
     pub keeps_horizontal_scrolls: bool,
     pub keeps_vertical_scrolls: bool,
 }
 ffi_bytes_fields!(CompositorScrollChainingBarrier {
-    document_id,
     scroll_node_index_above_barrier,
     rect,
     keeps_horizontal_scrolls,
@@ -1690,7 +1680,6 @@ impl DisplayListCommand for CompositorMainThreadWheelEventRegion {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
 pub struct CompositorScrollbar {
-    pub document_id: UniqueNodeId,
     pub scroll_node_index: SpatialNodeIndex,
     pub gutter_rect: IntRect,
     pub thumb_rect: IntRect,
@@ -1707,7 +1696,6 @@ pub struct CompositorScrollbar {
     pub is_painted_by_compositor: bool,
 }
 ffi_bytes_fields!(CompositorScrollbar {
-    document_id,
     scroll_node_index,
     gutter_rect,
     thumb_rect,

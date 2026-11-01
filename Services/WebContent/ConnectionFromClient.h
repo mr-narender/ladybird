@@ -230,6 +230,7 @@ private:
 
     virtual void set_listen_for_dom_mutations(Web::PageId page_id, bool) override;
     virtual void set_has_devtools_client(Web::PageId page_id, bool has_devtools_client) override;
+    virtual void start_sending_console_output(Web::PageId page_id, bool messages, bool errors) override;
     virtual void get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void get_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id) override;
     virtual void set_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id, String html) override;
@@ -286,6 +287,7 @@ private:
     virtual void confirm_closed(Web::PageId page_id, bool accepted) override;
     virtual void prompt_closed(Web::PageId page_id, Optional<Utf16String> response) override;
     virtual void color_picker_update(Web::PageId page_id, Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state) override;
+    virtual void date_picker_closed(Web::PageId page_id, Optional<Utf16String> picked_value) override;
     virtual void file_picker_closed(Web::PageId page_id, Vector<Web::HTML::SelectedFile> selected_files) override;
     virtual void select_dropdown_closed(Web::PageId page_id, Optional<u32> selected_item_id) override;
 

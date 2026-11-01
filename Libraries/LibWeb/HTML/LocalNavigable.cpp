@@ -1675,6 +1675,12 @@ LocalNavigable::NavigationOrHistoryUpdatePermission LocalNavigable::allowed_to_p
     return NavigationOrHistoryUpdatePermission::Allowed;
 }
 
+void LocalNavigable::reset_navigation_or_history_update_rate_limit_for_testing()
+{
+    m_navigation_or_history_update_rate_limit_window_start = MonotonicTime::now_coarse();
+    m_navigation_or_history_updates_in_rate_limit_window = 0;
+}
+
 Optional<u64> LocalNavigable::browsing_context_group_id() const
 {
     Navigable const* top_level_traversable = this;
@@ -7118,10 +7124,10 @@ bool LocalNavigable::paint_next_frame_if_needed(DOM::UpdateLayoutReason layout_r
     return true;
 }
 
-void LocalNavigable::render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig paint_config, Function<void()>&& callback)
+void LocalNavigable::render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig paint_config, Function<void(Compositor::ScreenshotResult)>&& callback)
 {
     if (!has_compositor_context()) {
-        callback();
+        callback(Compositor::ScreenshotResult::Failed);
         return;
     }
 
@@ -7135,7 +7141,7 @@ void LocalNavigable::render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintC
     }
 
     if (!commit_frame(paint_config)) {
-        callback();
+        callback(Compositor::ScreenshotResult::Failed);
         return;
     }
     // The screenshot is of what the compositor composes, so every frame committed before it is presented first.

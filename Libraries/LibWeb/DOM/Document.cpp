@@ -6580,26 +6580,21 @@ void Document::destroy()
     // 3. Set document's salvageable state to false.
     m_salvageable = false;
 
-    // 4. Let ports be the list of MessagePorts whose relevant global object's associated Document is document.
-    // 5. For each port in ports, disentangle port.
-    HTML::MessagePort::for_each_message_port([&](HTML::MessagePort& port) {
-        auto& global = port.relevant_global_object();
-        auto* window = HTML::window_from_global_object(global);
-        if (!window)
-            return;
+    // AD-HOC: Disentangle the ports of the window's realm, which closes the transports of the channels that document
+    //         took part in, so that the ports at their other ends learn that nothing arrives any more. A window that
+    //         was reused for another document keeps its ports. The specification once did this here, as steps of
+    //         destroying a document, and no longer does.
+    if (auto window = this->window(); window && &window->associated_document() == this)
+        HTML::MessagePort::disentangle_ports_of_realm(HTML::relevant_realm(*window));
 
-        if (&window->associated_document() == this)
-            port.disentangle();
-    });
-
-    // 6. Run any unloading document cleanup steps for document that are defined by this specification and other applicable specifications.
+    // 4. Run any unloading document cleanup steps for document that are defined by this specification and other applicable specifications.
     run_unloading_cleanup_steps();
 
     // AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable().
     //         Tear the layout tree down now instead of holding it until finalization.
     tear_down_layout_tree();
 
-    // 7. Remove any tasks whose document is document from any task queue (without running those tasks).
+    // 5. Remove any tasks whose document is document from any task queue (without running those tasks).
     HTML::main_thread_event_loop().task_queue().remove_tasks_matching([this](auto& task) {
         return task.document() == this;
     });
@@ -6614,7 +6609,7 @@ void Document::destroy()
     }
     m_resize_observers.clear();
 
-    // 8. Set document's browsing context to null.
+    // 6. Set document's browsing context to null.
     m_browsing_context = nullptr;
 
     // Not in the spec:
@@ -6632,7 +6627,7 @@ void Document::destroy()
         }
     }
 
-    // 9. Set document's node navigable's active session history entry's document state's document to null.
+    // 7. Set document's node navigable's active session history entry's document state's document to null.
     if (auto navigable = this->navigable()) {
         navigable->set_active_document(nullptr);
 
@@ -6641,10 +6636,10 @@ void Document::destroy()
         page().navigable_document_destroyed({}, *navigable);
     }
 
-    // 10. Remove document from the owner set of each WorkerGlobalScope object whose set contains document.
+    // 8. Remove document from the owner set of each WorkerGlobalScope object whose set contains document.
     HTML::relevant_settings_object(*this).release_owned_worker_agents();
 
-    // FIXME: 11. For each workletGlobalScope in document's worklet global scopes, terminate workletGlobalScope.
+    // FIXME: 9. For each workletGlobalScope in document's worklet global scopes, terminate workletGlobalScope.
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#make-document-unsalvageable
@@ -9566,6 +9561,19 @@ static bool is_named_element_by_id(DOM::Element const& element)
     return is<HTML::HTMLObjectElement>(element) || (is<HTML::HTMLImageElement>(element) && element.name().has_value());
 }
 
+// NB: The potentially named elements are the only elements whose id or name can contribute a named property of
+//     Document, or a named property by name of Window. Window looks up every other element by id in the element by id
+//     map. Keeping any other element out of the list keeps the tree order insertions below cheap, which matters for
+//     documents with thousands of elements with an id, such as SVG icon sprites.
+//     Only elements in a document tree with the document as their root contribute, so an element in a shadow tree is
+//     kept out as well.
+static bool should_be_in_potentially_named_elements(DOM::Element const& element)
+{
+    return ((element.name().has_value() && is_potentially_named_element(element))
+               || (element.id().has_value() && is_potentially_named_element_by_id(element)))
+        && element.root().is_document();
+}
+
 static void insert_in_tree_order(Vector<GC::Ref<DOM::Element>>& elements, DOM::Element& element)
 {
     for (auto& el : elements) {
@@ -9658,11 +9666,11 @@ void Document::element_id_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> ele
     for (auto* form_associated_element : m_form_associated_elements_with_form_attribute)
         form_associated_element->element_id_changed({});
 
-    if (element->id().has_value()) {
+    if (should_be_in_potentially_named_elements(*element)) {
         insert_in_tree_order(m_potentially_named_elements, element);
-        if (is_named_element_by_id(*element))
+        if (element->id().has_value() && is_named_element_by_id(*element))
             did_add_supported_property_name();
-    } else if (!element->name().has_value()) {
+    } else {
         (void)m_potentially_named_elements.remove_first_matching([element](auto& e) { return e == element; });
     }
 
@@ -9685,7 +9693,7 @@ void Document::element_with_id_was_added(Badge<DOM::Element>, GC::Ref<DOM::Eleme
     for (auto* form_associated_element : m_form_associated_elements_with_form_attribute)
         form_associated_element->element_with_id_was_added_or_removed({});
 
-    if (is_potentially_named_element_by_id(*element)) {
+    if (is_potentially_named_element_by_id(*element) && element->root().is_document()) {
         insert_in_tree_order(m_potentially_named_elements, element);
         if (is_named_element_by_id(*element))
             did_add_supported_property_name();
@@ -9714,20 +9722,18 @@ void Document::element_with_id_was_removed(Badge<DOM::Element>, GC::Ref<DOM::Ele
 
 void Document::element_name_changed(Badge<DOM::Element>, GC::Ref<DOM::Element> element)
 {
-    if (element->name().has_value()) {
+    if (should_be_in_potentially_named_elements(*element)) {
         insert_in_tree_order(m_potentially_named_elements, element);
-        if (is_potentially_named_element(element))
+        if (element->name().has_value() && is_potentially_named_element(element))
             did_add_supported_property_name();
     } else {
-        if (is_potentially_named_element_by_id(element) && element->id().has_value())
-            return;
         (void)m_potentially_named_elements.remove_first_matching([element](auto& e) { return e == element; });
     }
 }
 
 void Document::element_with_name_was_added(Badge<DOM::Element>, GC::Ref<DOM::Element> element)
 {
-    if (is_potentially_named_element(element)) {
+    if (is_potentially_named_element(element) && element->root().is_document()) {
         insert_in_tree_order(m_potentially_named_elements, element);
         did_add_supported_property_name();
     }

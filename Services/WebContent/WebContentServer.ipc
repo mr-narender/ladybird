@@ -214,6 +214,7 @@ endpoint WebContentServer routed by Web::PageId page_id
 
     set_listen_for_dom_mutations(Web::PageId page_id, bool listen_for_dom_mutations) =|
     set_has_devtools_client(Web::PageId page_id, bool has_devtools_client) =|
+    start_sending_console_output(Web::PageId page_id, bool messages, bool errors) =|
     get_dom_node_inner_html(Web::PageId page_id, Web::UniqueNodeID node_id) =|
     get_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id) =|
     set_dom_node_outer_html(Web::PageId page_id, Web::UniqueNodeID node_id, String html) =|
@@ -293,6 +294,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     confirm_closed(Web::PageId page_id, bool accepted) =|
     prompt_closed(Web::PageId page_id, Optional<Utf16String> response) =|
     color_picker_update(Web::PageId page_id, Optional<Color> picked_color, Web::HTML::ColorPickerUpdateState state) =|
+    date_picker_closed(Web::PageId page_id, Optional<Utf16String> picked_value) =|
     file_picker_closed(Web::PageId page_id, Vector<Web::HTML::SelectedFile> selected_files) =|
     select_dropdown_closed(Web::PageId page_id, Optional<u32> selected_item_id) =|
 

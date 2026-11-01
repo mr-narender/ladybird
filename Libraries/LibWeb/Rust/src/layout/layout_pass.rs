@@ -38,7 +38,7 @@ pub(crate) struct LayoutPass<'arena> {
     /// passes after them, or inside a run whose result is discarded, that run's own.
     intrinsic_size_caches: &'arena super::layout_node_arena::IntrinsicSizeCaches,
     /// Whether this pass view is inside a run whose result is discarded, which reads no memoized layout from before it
-    /// and keeps none: the run cache, the in-flow block cache, inline item stashes and intrinsic sizes.
+    /// and keeps none: the run cache, the in-flow block cache, prepared inline content and intrinsic sizes.
     reads_no_memoized_layout: bool,
     /// The innermost of the position options the boxes this pass view lays out are laid out with.
     position_option_styles: Option<&'arena PositionOptionStyle<'arena>>,
@@ -132,6 +132,10 @@ impl<'arena> LayoutPass<'arena> {
         })
     }
 
+    pub(crate) fn lays_out_with_position_option(&self) -> bool {
+        self.position_option_styles.is_some()
+    }
+
     /// Runs `run` with this pass as it lays out `node` with `style`, the style of one of its position options, which
     /// the style reads of `node` see in place of the style of its row. The payloads `style` names must stay alive
     /// until `run` returns.
@@ -187,31 +191,6 @@ impl<'arena> LayoutPass<'arena> {
         self.reads_no_memoized_layout
     }
 
-    /// The inline items a block container generated earlier in the pass, which a run whose result is discarded does not
-    /// read.
-    pub(crate) fn inline_item_stash(
-        &self,
-        block_container: Node,
-    ) -> Option<super::inline_level_iterator::StashedInlineItems> {
-        if self.reads_no_memoized_layout {
-            return None;
-        }
-        self.scratch.inline_item_stash(block_container)
-    }
-
-    /// Keeps the inline items `block_container` generated for its later runs in the pass, unless this pass view is
-    /// inside a run whose result is discarded.
-    pub(crate) fn store_inline_item_stash(
-        &self,
-        block_container: Node,
-        stash: super::inline_level_iterator::StashedInlineItems,
-    ) {
-        if self.reads_no_memoized_layout {
-            return;
-        }
-        self.scratch.store_inline_item_stash(block_container, stash);
-    }
-
     /// Notes what the run this pass view was handed to found out for the host, or the pass outside any run.
     pub(crate) fn note_host_findings(&self, note: impl FnOnce(&mut super::run_state::HostFindings)) {
         note(&mut self.host_findings.borrow_mut());
@@ -254,6 +233,25 @@ impl<'arena> LayoutPass<'arena> {
             .text_chunks(node, self.text_content(node).rendered(), key, compute)
     }
 
+    pub(crate) fn prepared_inline_content_memos(
+        &self,
+    ) -> &'arena super::prepared_inline_content::PreparedInlineContentMemos {
+        self.scratch.prepared_inline_content_memos()
+    }
+
+    pub(crate) fn take_inline_content_preparation_buffers(
+        &self,
+    ) -> super::prepared_inline_content::InlineContentPreparationBuffers {
+        self.scratch.inline_content_preparation_buffers().take()
+    }
+
+    pub(crate) fn return_inline_content_preparation_buffers(
+        &self,
+        buffers: super::prepared_inline_content::InlineContentPreparationBuffers,
+    ) {
+        self.scratch.inline_content_preparation_buffers().set(buffers);
+    }
+
     /// Runs `read` with the grapheme segmenter of the text row `node`.
     pub(crate) fn with_grapheme_segmenter<R>(
         &self,
@@ -283,6 +281,11 @@ impl<'arena> LayoutPass<'arena> {
 
     pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<ReplacedContentFacts> {
         self.arena.replaced_content_facts(node)
+    }
+
+    #[inline]
+    pub(crate) fn has_replaced_content_facts(&self, node: Node) -> bool {
+        self.arena.has_replaced_content_facts(node)
     }
 
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'arena>> {

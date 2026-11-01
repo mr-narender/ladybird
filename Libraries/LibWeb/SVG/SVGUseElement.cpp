@@ -188,6 +188,10 @@ Optional<Utf16String> SVGUseElement::href_value() const
 // https://www.w3.org/TR/SVG2/linking.html#processingURL
 void SVGUseElement::process_the_url(Optional<Utf16String> const& href)
 {
+    // NB: A request for a document that is no longer referenced must neither update the shadow tree nor delay the load
+    //     event.
+    stop_using_resource_request();
+
     // In all other cases, the URL is for a resource to be used in this SVG document. The user agent
     // must parse the URL to separate out the target fragment from the rest of the URL, and compare
     // it with the document base URL. If all parts other than the target fragment are equal, this is
@@ -269,6 +273,15 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
     return as<SVG::SVGDecodedImageData>(*data).svg_document().get_element_by_id(decode_fragment_identifier(*m_href->fragment()));
 }
 
+void SVGUseElement::stop_using_resource_request()
+{
+    if (m_resource_request && m_resource_request_callbacks_id.has_value())
+        m_resource_request->remove_callbacks(*m_resource_request_callbacks_id);
+    m_resource_request_callbacks_id = {};
+    m_resource_request = nullptr;
+    m_load_event_delayer.clear();
+}
+
 // https://svgwg.org/svg2-draft/linking.html#processingURL-fetch
 void SVGUseElement::fetch_the_document(URL::URL const& url)
 {
@@ -278,9 +291,17 @@ void SVGUseElement::fetch_the_document(URL::URL const& url)
     if (document().is_temporary_document_for_fragment_parsing())
         return;
 
+    // NB: The fragment only identifies the target element within the fetched document, so every reference to the same
+    //     external document shares one fetch and one parsed document. The spec allows this re-use under "Processing
+    //     the subresource document".
+    auto document_url = url;
+    document_url.set_fragment({});
+
+    stop_using_resource_request();
+
     m_load_event_delayer.emplace(document());
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url, HTML::CORSSettingAttribute::NoCORS);
-    m_resource_request->add_callbacks(
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), document_url, HTML::CORSSettingAttribute::NoCORS);
+    m_resource_request_callbacks_id = m_resource_request->add_removable_callbacks(
         [this] {
             clone_element_tree_as_our_shadow_tree(referenced_element());
             m_load_event_delayer.clear();
@@ -293,7 +314,7 @@ void SVGUseElement::fetch_the_document(URL::URL const& url)
         });
 
     if (m_resource_request->needs_fetching()) {
-        auto request = HTML::create_potential_CORS_request(url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
+        auto request = HTML::create_potential_CORS_request(document_url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
         request->set_client(document().relevant_settings_object().address());
         m_resource_request->fetch_resource(request);
     }

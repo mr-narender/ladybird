@@ -132,9 +132,7 @@ pub(super) fn content_sizes_of_inline_content(
                 &parent,
             );
             let iterator = inline_level_iterator::InlineLevelIterator::for_intrinsic_inline_size(&mut context);
-            let sizes = context.content_sizes_from_items(iterator.items());
-            iterator.stash_for_reuse(&context);
-            sizes
+            context.content_sizes_from_items(iterator.items())
         };
         if !facts.lays_out_in_columns() {
             return sizes;
@@ -447,16 +445,11 @@ pub(super) fn content_sizes_of_flex_container(
     constraints: ContainingBlockConstraints,
     block_size: Option<CssPixels>,
 ) -> sizing_context::ContentInlineSizes {
-    content_sizes_of_container_under_each_inline_size_constraint(
-        callbacks,
-        node,
-        constraints,
-        block_size,
-        None,
-        |run, root_cells, input| {
-            flex_formatting_context::FlexFormattingContext::new(run, root_cells).content_inline_size(input)
-        },
-    )
+    let scope = ContentSizingScope::new(&callbacks, node, constraints, block_size);
+    scope.measure(callbacks, |run| {
+        flex_formatting_context::FlexFormattingContext::new(run, scope.root_cells())
+            .content_inline_sizes(scope.available_block_size(), constraints)
+    })
 }
 
 pub(super) fn content_sizes_of_grid_container(

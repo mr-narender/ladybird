@@ -233,6 +233,7 @@ public:
         Blocked,
     };
     NavigationOrHistoryUpdatePermission allowed_to_perform_a_navigation_or_history_update();
+    void reset_navigation_or_history_update_rate_limit_for_testing();
 
     virtual bool is_local_navigable() const override { return true; }
 
@@ -317,7 +318,7 @@ public:
     bool has_recording_in_flight() const { return m_recording_in_flight; }
 
     // Paints into the target, which must be a shareable bitmap, then calls the callback.
-    void render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig, Function<void()>&& callback);
+    void render_screenshot(NonnullRefPtr<Gfx::Bitmap> target, PaintConfig, Function<void(Compositor::ScreenshotResult)>&& callback);
     Compositing::DisplayListResourceStorage& display_list_resource_storage() { return presenter().display_list_resource_storage(); }
 
     // Tells the clock lanes of the active document whether a task begins or the event loop goes idle: a task that begins
