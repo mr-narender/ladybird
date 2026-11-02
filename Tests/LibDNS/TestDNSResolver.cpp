@@ -763,22 +763,35 @@ TEST_CASE(test_truncated_udp_response_is_retried_over_tcp)
 {
     Core::EventLoop loop;
 
-    // The server answers on one port over both UDP and TCP. The port the system picks for TCP isn't reserved for UDP,
-    // though, so another socket can already hold it for UDP — in which case, try again with a fresh port.
+    // The server answers on one port over both UDP and TCP. A port the system picks for TCP may be one it won't let
+    // UDP bind to, so take the port it picks for UDP, and listen for TCP on that one — trying again with a fresh port
+    // if TCP can't have it. A UDP server whose port TCP turns down stays open for the rest of the test: Closing it
+    // would free the port for the next bind, so a port the system reserves against TCP could keep coming back.
     RefPtr<Core::TCPServer> tcp_server;
     RefPtr<Core::UDPServer> udp_server;
+    Vector<NonnullRefPtr<Core::UDPServer>> rejected_udp_servers;
+    Vector<u16> tried_ports;
     u16 server_port = 0;
-    for (size_t attempt = 0; attempt < 10 && !udp_server; ++attempt) {
-        tcp_server = MUST(Core::TCPServer::try_create());
-        MUST(tcp_server->listen(IPv4Address { 127, 0, 0, 1 }, 0, Core::TCPServer::AllowAddressReuse::Yes));
-        server_port = tcp_server->local_port().value();
+    Optional<Error> listen_error;
+    for (size_t attempt = 0; attempt < 10 && !tcp_server; ++attempt) {
+        if (udp_server)
+            rejected_udp_servers.append(udp_server.release_nonnull());
+        udp_server = Core::UDPServer::construct();
+        if (!udp_server->bind(IPv4Address { 127, 0, 0, 1 }, 0)) {
+            FAIL("Couldn't bind UDP to a port the system picks");
+            return;
+        }
+        server_port = udp_server->local_port().value();
+        tried_ports.append(server_port);
 
-        auto candidate = Core::UDPServer::construct();
-        if (candidate->bind(IPv4Address { 127, 0, 0, 1 }, server_port))
-            udp_server = move(candidate);
+        auto candidate = MUST(Core::TCPServer::try_create());
+        if (auto result = candidate->listen(IPv4Address { 127, 0, 0, 1 }, server_port); result.is_error())
+            listen_error = result.release_error();
+        else
+            tcp_server = move(candidate);
     }
-    if (!udp_server) {
-        FAIL("Couldn't bind UDP to the port of a TCP server");
+    if (!tcp_server) {
+        FAIL(ByteString::formatted("Couldn't listen for TCP on the port of a UDP server (tried {}): {}", ByteString::join(", "sv, tried_ports), listen_error.value()));
         return;
     }
 

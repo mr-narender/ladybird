@@ -286,7 +286,6 @@ pub fn generate() -> LayoutHeader {
     let mut w = HeaderWriter::new();
 
     w.section("Cell header, at the start of every cell");
-    offset!(w, "CELL_CLASS", CellHeader, class);
     offset!(w, "CELL_MARK", CellHeader, mark);
     offset!(w, "CELL_STATE", CellHeader, state);
     offset!(w, "CELL_KIND", CellHeader, kind);
@@ -294,7 +293,8 @@ pub fn generate() -> LayoutHeader {
         w.define(&format!("CELL_KIND_{}", cell_kind_name(kind)), kind as u8);
     }
 
-    w.section("Class, which the first word of a cell points to: its id and the class it extends");
+    w.section("Class, which the block of a cell holds: its id and the class it extends");
+    w.define("BLOCK_CLASS_TAIL_TAG", BLOCK_CLASS_TAIL_TAG);
     offset!(w, "CLASS_ID", ClassLayout, id);
     offset!(w, "CLASS_PARENT", ClassLayout, parent);
 
@@ -397,7 +397,7 @@ pub fn generate() -> LayoutHeader {
     offset!(w, "TYPED_ARRAY_ELEMENT_SIZE", TypedArrayBase, element_size);
     offset!(w, "TYPED_ARRAY_ARRAY_LENGTH", TypedArrayBase, array_length.length);
     offset!(w, "TYPED_ARRAY_ARRAY_LENGTH_ALTERNATIVE_INDEX", TypedArrayBase, array_length.alternative_index);
-    w.define("TYPED_ARRAY_ARRAY_LENGTH_U32_ALTERNATIVE_INDEX", BYTE_LENGTH_U32_INDEX);
+    w.define("TYPED_ARRAY_ARRAY_LENGTH_LENGTH_ALTERNATIVE_INDEX", BYTE_LENGTH_LENGTH_INDEX);
     offset!(w, "TYPED_ARRAY_BYTE_OFFSET", TypedArrayBase, byte_offset);
 
     w.section("TypedArrayBase kinds");

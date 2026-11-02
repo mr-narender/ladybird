@@ -102,7 +102,7 @@ fn root_inputs_at_other_own_block_sizes(
                 has_definite_block_size: definite_own_block_size.is_some(),
                 ..root_cells
             };
-            let mut input = input;
+            let mut input = input.clone();
             input.available_space.block_size =
                 definite_own_block_size.map_or(AvailableSize::Indefinite, AvailableSize::definite);
             (cells, input)
@@ -140,7 +140,7 @@ pub(super) fn verify_run_ignores_its_unobserved_own_block_size_and_block_margins
     let own_block_size = outputs.inputs_never_observed.own_block_size;
     let mut reference_inputs = root_inputs_at_other_own_block_sizes(
         root_cells,
-        input,
+        input.clone(),
         own_block_size,
         outputs.result.automatic_content_block_size,
     )
@@ -222,17 +222,17 @@ impl ComparedLayouts<'_> {
         );
         assert!(
             same_elements_in_any_order(
-                &checked_root.payloads_past_run.pending_abspos,
-                &reference_root.payloads_past_run.pending_abspos
+                &checked_root.payloads_past_run().pending_abspos,
+                &reference_root.payloads_past_run().pending_abspos
             ) && same_elements_in_any_order(
-                &checked_root.payloads_past_run.anchor_candidates,
-                &reference_root.payloads_past_run.anchor_candidates
+                &checked_root.payloads_past_run().anchor_candidates,
+                &reference_root.payloads_past_run().anchor_candidates
             ) && same_elements_in_any_order(
-                &checked_root.payloads_past_run.inline_containing_block_rects,
-                &reference_root.payloads_past_run.inline_containing_block_rects
+                &checked_root.payloads_past_run().inline_containing_block_rects,
+                &reference_root.payloads_past_run().inline_containing_block_rects
             ) && same_elements_in_any_order(
-                &checked_root.payloads_past_run.abspos_containing_block_info,
-                &reference_root.payloads_past_run.abspos_containing_block_info
+                &checked_root.payloads_past_run().abspos_containing_block_info,
+                &reference_root.payloads_past_run().abspos_containing_block_info
             ),
             "{checked} propagates payloads {reference} does not"
         );
@@ -317,6 +317,12 @@ fn compare_links(expected: &fragment_tree::FragmentLink, fresh: &fragment_tree::
     }
     if expected.line_data.as_deref() != fresh.line_data.as_deref() {
         return Err(format!("{node:?} has line data unlike the fresh layout"));
+    }
+    if expected.scrollable_overflow != fresh.scrollable_overflow {
+        return Err(format!(
+            "{node:?} has scrollable overflow {:?} where the fresh layout has {:?}",
+            expected.scrollable_overflow, fresh.scrollable_overflow
+        ));
     }
     compare_children(node, &expected.children, &fresh.children)
 }

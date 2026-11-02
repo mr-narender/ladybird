@@ -51,6 +51,19 @@ inline fn box_object(object: Object) -> Value<Object> {
     value
 }
 
+# The field a direct getter returns is a compressed cell pointer for a GC::Member, and a full one otherwise.
+inline fn load_direct_getter_implementation_value(address: u64, is_compressed: u32) -> u64 {
+    if is_compressed != 0 {
+        let mut value: u64;
+        load_compressed_cell_ptr(value, [address]);
+        value
+    } else {
+        let mut value: u64;
+        load64(value, [address]);
+        value
+    }
+}
+
 inline fn load_direct_getter_value(
     function: Object,
     receiver_object: Object,
@@ -73,7 +86,11 @@ inline fn load_direct_getter_value(
     let receiver_pointer: u64 = alias(receiver_object);
     guard cached_receiver == receiver_pointer else failure;
 
-    let result_implementation = implementation_words[direct_getter.implementation_value_word_offset];
+    let result_implementation_address: u64 = implementation + alias(direct_getter.implementation_value_offset);
+    let result_implementation = load_direct_getter_implementation_value(
+        result_implementation_address,
+        direct_getter.implementation_value_is_compressed
+    );
     if result_implementation == 0 {
         let mut null_value: Value;
         mov(null_value, NULL_VALUE);
@@ -2975,7 +2992,11 @@ handler PutByValue(
     let cached_offset = object.typed_array_cached_data_offset;
     guard cached_offset != TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID else try_typed_array_slow;
     let elements = primitive_storage_cage_base();
-    guard index < object.typed_array_array_length else slow;
+    # NB: A negative key wraps to an index below a length of 2^32.
+    let signed_index = unbox_i32(key);
+    guard signed_index >= 0 else slow;
+    let element_index: u64 = alias(index);
+    guard element_index < object.typed_array_array_length else slow;
     let typed_array_kind = object.typed_array_kind;
     record_typed_array_keyed_feedback(elements, keyed_feedback, typed_array_kind);
     let source = load(src);
@@ -3520,7 +3541,11 @@ handler GetByValue(
     let cached_offset = object.typed_array_cached_data_offset;
     guard cached_offset != TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID else try_typed_array_slow;
     let elements = primitive_storage_cage_base();
-    guard index < object.typed_array_array_length else try_typed_array_slow;
+    # NB: A negative key wraps to an index below a length of 2^32.
+    let signed_index = unbox_i32(key);
+    guard signed_index >= 0 else try_typed_array_slow;
+    let element_index: u64 = alias(index);
+    guard element_index < object.typed_array_array_length else try_typed_array_slow;
     let kind = object.typed_array_kind;
     record_typed_array_keyed_feedback(elements, keyed_feedback, kind);
 

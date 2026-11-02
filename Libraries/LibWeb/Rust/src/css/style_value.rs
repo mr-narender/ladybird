@@ -733,12 +733,9 @@ impl RetainedString {
     fn from_units(units: TokenizerInput<'_>) -> Self {
         use crate::css::css_tokenizer::SourceStorage;
         Self::from_storage(match units {
-            TokenizerInput::Ascii(bytes) => {
-                assert!(bytes.is_ascii());
-                SourceStorage::Ascii(bytes.into())
-            }
+            TokenizerInput::Latin1(bytes) => SourceStorage::Latin1(bytes.into()),
             TokenizerInput::Utf16(units) if units.iter().all(|unit| *unit <= 0x7f) => {
-                SourceStorage::Ascii(units.iter().map(|unit| *unit as u8).collect())
+                SourceStorage::Latin1(units.iter().map(|unit| *unit as u8).collect())
             }
             TokenizerInput::Utf16(units) => SourceStorage::Utf16(units.into()),
         })
@@ -746,7 +743,7 @@ impl RetainedString {
 
     pub(crate) fn from_ascii(string: String) -> Self {
         assert!(string.is_ascii());
-        Self::from_storage(crate::css::css_tokenizer::SourceStorage::Ascii(
+        Self::from_storage(crate::css::css_tokenizer::SourceStorage::Latin1(
             string.into_bytes().into_boxed_slice(),
         ))
     }
@@ -761,22 +758,24 @@ impl RetainedString {
     pub(crate) fn units(&self) -> TokenizerInput<'_> {
         use crate::css::css_tokenizer::SourceStorage;
         match unsafe { &*self.storage.cast::<SourceStorage>() } {
-            SourceStorage::Ascii(bytes) => TokenizerInput::Ascii(bytes),
+            SourceStorage::Latin1(bytes) => TokenizerInput::Latin1(bytes),
             SourceStorage::Utf16(units) => TokenizerInput::Utf16(units),
         }
     }
 
     pub(crate) fn url_input(&self) -> liburl_rust::url::UrlInput<'_> {
         match self.units() {
-            TokenizerInput::Ascii(bytes) => {
+            // SAFETY: ASCII is UTF-8.
+            TokenizerInput::Latin1(bytes) if bytes.is_ascii() => {
                 liburl_rust::url::UrlInput::Utf8(unsafe { std::str::from_utf8_unchecked(bytes) })
             }
+            TokenizerInput::Latin1(bytes) => liburl_rust::url::UrlInput::Latin1(bytes),
             TokenizerInput::Utf16(units) => liburl_rust::url::UrlInput::Utf16(units),
         }
     }
 
     pub(crate) fn ascii_bytes(&self) -> &[u8] {
-        let TokenizerInput::Ascii(bytes) = self.units() else {
+        let TokenizerInput::Latin1(bytes) = self.units() else {
             panic!("Expected a serialized ASCII URL")
         };
         bytes
@@ -3732,7 +3731,7 @@ fn hash_string_units(hasher: &mut crate::css::style::fast_hash::FastHasher, unit
         hasher.write(&bytes[..chunk.len() * 2]);
     }
     match units {
-        TokenizerInput::Ascii(units) => {
+        TokenizerInput::Latin1(units) => {
             let mut widened = [0u16; CHUNK];
             for chunk in units.chunks(CHUNK) {
                 for (unit, destination) in chunk.iter().zip(widened.iter_mut()) {
@@ -3777,7 +3776,7 @@ mod equality_tests {
         let text = "a text longer than one chunk of the hasher, so that it takes more than one write";
         let utf16: Vec<u16> = text.encode_utf16().collect();
         let mut ascii_hasher = crate::css::style::fast_hash::fast_hasher();
-        hash_string_units(&mut ascii_hasher, TokenizerInput::Ascii(text.as_bytes()));
+        hash_string_units(&mut ascii_hasher, TokenizerInput::Latin1(text.as_bytes()));
         let mut utf16_hasher = crate::css::style::fast_hash::fast_hasher();
         hash_string_units(&mut utf16_hasher, TokenizerInput::Utf16(&utf16));
         assert_eq!(ascii_hasher.finish(), utf16_hasher.finish());

@@ -28,6 +28,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::{DeclarativeEnvironment, Environment, PrivateEnvironment};
 use crate::layout::function_object::{CallEnvironmentTemplate, EcmascriptFunctionObject, FUNCTION_ENVIRONMENT_WORDS};
+use crate::layout::member::NullableMember;
 use crate::layout::object::{INLINE_NAMED_STORAGE_CAPACITY, Object};
 use crate::layout::primitive_string::PrimitiveString;
 use crate::layout::realm::Realm;
@@ -67,6 +68,13 @@ fn cell_words<T>(cell: Gc<T>, size: usize) -> Vec<u64> {
     // SAFETY: The mark is a byte within the words.
     unsafe { words.as_mut_ptr().cast::<u8>().add(mark).write(0) };
     words
+}
+
+/// Clears the `size` bytes at `offset` of `words`, which may share their word with other fields.
+fn clear_bytes(words: &mut [u64], offset: usize, size: usize) {
+    for byte in offset..offset + size {
+        words[byte / 8] &= !(0xff << (8 * (byte % 8)));
+    }
 }
 
 /// What JIT code needs to allocate cells itself, for code of `realm`. The templates come from cells allocated here,
@@ -192,8 +200,8 @@ fn rope_template(vm: &Vm) -> Vec<u64> {
     let rope = PrimitiveString::create_from_concatenation(vm, half, half).must();
     assert!(class_of(rope).is_subclass_of(RopeString::CLASS));
     let mut words = cell_words(rope, size_of::<RopeString>());
-    words[ROPE_STRING_LHS_OFFSET / 8] = 0;
-    words[ROPE_STRING_RHS_OFFSET / 8] = 0;
+    clear_bytes(&mut words, ROPE_STRING_LHS_OFFSET, 4);
+    clear_bytes(&mut words, ROPE_STRING_RHS_OFFSET, 4);
     words
 }
 
@@ -268,8 +276,7 @@ impl FunctionEnvironmentFreeLists {
 /// of it, if they have none yet and JIT code can allocate them itself.
 pub fn make_call_environment_template(vm: &Vm, function: Gc<EcmascriptFunctionObject>, environment: Gc<Environment>) {
     let shared_data = function.shared_data();
-    // SAFETY: Nothing else refers to the template while this looks at whether there is one.
-    if unsafe { &*shared_data.call_environment_template.as_ptr() }.is_some() {
+    if !shared_data.call_environment_template.is_null() {
         return;
     }
     let Some(environment) = environment.downcast::<FunctionEnvironment>() else {
@@ -304,13 +311,16 @@ pub fn make_call_environment_template(vm: &Vm, function: Gc<EcmascriptFunctionOb
         words: [0; FUNCTION_ENVIRONMENT_WORDS],
     };
     template.words.copy_from_slice(&words);
-    for offset in [
-        core::mem::offset_of!(DeclarativeEnvironment, binding_values.data),
-        core::mem::offset_of!(Environment, outer),
-        FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET,
-        FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET,
+    for (offset, size) in [
+        (core::mem::offset_of!(DeclarativeEnvironment, binding_values.data), 8),
+        (
+            core::mem::offset_of!(Environment, outer),
+            size_of::<NullableMember<Environment>>(),
+        ),
+        (FUNCTION_ENVIRONMENT_FUNCTION_OBJECT_OFFSET, 8),
+        (FUNCTION_ENVIRONMENT_THIS_VALUE_OFFSET, 8),
     ] {
-        template.words[offset / 8] = 0;
+        clear_bytes(&mut template.words, offset, size);
     }
     shared_data
         .call_environment_template
@@ -555,7 +565,7 @@ pub extern "C" fn libjs_jit_clone_function(
     let closure = EcmascriptFunctionObject::create_from_function_data_with_prototype(
         vm,
         realm,
-        sample.shared_data.get(),
+        sample.shared_data(),
         environment,
         private_environment,
         realm.function_prototype(),

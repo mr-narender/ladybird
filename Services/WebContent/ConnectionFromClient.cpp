@@ -892,6 +892,14 @@ void ConnectionFromClient::mouse_event_in_hosted_root(Web::PageId page_id, Web::
     enqueue_mouse_event(page_id, navigable_id, move(event));
 }
 
+// The compositor numbers every wheel step, so only the gesture of the steps decides whether they may become one.
+static bool wheel_steps_are_of_one_gesture(Optional<Web::WheelGestureMark> const& first, Optional<Web::WheelGestureMark> const& second)
+{
+    if (!first.has_value() || !second.has_value())
+        return first.has_value() == second.has_value();
+    return first->gesture_id == second->gesture_id && first->lasts_until_fingers_lift == second->lasts_until_fingers_lift;
+}
+
 void ConnectionFromClient::enqueue_mouse_event(Web::PageId page_id, Optional<Web::HTML::CrossProcessId> navigable_id, Web::MouseEvent event)
 {
     auto page = m_page_host->page(page_id);
@@ -923,7 +931,7 @@ void ConnectionFromClient::enqueue_mouse_event(Web::PageId page_id, Optional<Web
                 && (mouse_event->async_scroll_performed_default_action != event.async_scroll_performed_default_action
                     || mouse_event->wheel_delta_precision != event.wheel_delta_precision
                     || mouse_event->scroll_gesture_phase != event.scroll_gesture_phase
-                    || mouse_event->wheel_gesture_mark != event.wheel_gesture_mark))
+                    || !wheel_steps_are_of_one_gesture(mouse_event->wheel_gesture_mark, event.wheel_gesture_mark)))
                 return nullptr;
             return mouse_event;
         }
@@ -1874,7 +1882,7 @@ void ConnectionFromClient::clear_grid_highlight(Web::PageId page_id, Web::Unique
 
 void ConnectionFromClient::inspect_accessibility_tree(Web::PageId page_id)
 {
-    if (auto page = this->page(page_id); page.has_value()) {
+    if (auto page = this->page(page_id); page.has_value() && page->page().has_local_traversable()) {
         if (auto doc = page->page().local_traversable()->active_document())
             async_did_inspect_accessibility_tree(page_id, doc->dump_accessibility_tree_as_json().to_utf8());
     }
@@ -1888,6 +1896,10 @@ void ConnectionFromClient::request_accessibility_tree(Web::PageId page_id)
     // path, so they pay for neither.
     if (auto page = this->page(page_id); page.has_value()) {
         page->page().set_accessibility_interested(true);
+        // A request can arrive after the tab's document moved to another process, which leaves this page's traversable
+        // remote, with no document of its own to report.
+        if (!page->page().has_local_traversable())
+            return;
         if (auto doc = page->page().local_traversable()->active_document()) {
             doc->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
             async_did_get_accessibility_tree(page_id, doc->build_accessibility_node_data());
@@ -3202,6 +3214,12 @@ void ConnectionFromClient::set_content_blockers(Core::AnonymousBuffer patterns_b
         m_page_host->invalidate_user_style();
 }
 
+void ConnectionFromClient::set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host)
+{
+    if (auto page = this->page(page_id); page.has_value() && page->page().has_local_traversable())
+        page->page().local_traversable()->set_force_dark_settings(enabled, move(per_host));
+}
+
 void ConnectionFromClient::set_autoplay_settings(Web::PageId, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist)
 {
     Web::HTML::AutoplaySettings::the().set_policy(policy, allowlist);
@@ -3275,6 +3293,30 @@ void ConnectionFromClient::permission_request_completed(Web::PageId page_id, u64
 {
     if (auto page = this->page(page_id); page.has_value())
         page->permission_request_completed(request_id, state);
+}
+
+void ConnectionFromClient::notification_shown(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_shown(notification_id);
+}
+
+void ConnectionFromClient::notification_show_failed(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_show_failed(notification_id);
+}
+
+void ConnectionFromClient::notification_clicked(Web::PageId page_id, u64 notification_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_clicked(notification_id);
+}
+
+void ConnectionFromClient::notification_closed(Web::PageId page_id, u64 notification_id, bool by_user)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().notification_closed(notification_id, by_user);
 }
 
 void ConnectionFromClient::set_has_focus(Web::PageId page_id, bool has_focus)

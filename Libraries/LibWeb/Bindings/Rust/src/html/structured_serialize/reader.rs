@@ -130,7 +130,7 @@ impl<'a> StructuredSerializeReader<'a> {
 
     pub(crate) fn decode_utf16_string(&self) -> WebIdlResult<Utf16String> {
         Ok(match self.decoded(self.decoder.decode_utf16_string())? {
-            DecodedString::Ascii(characters) => Utf16String::from_ascii(characters),
+            DecodedString::Latin1(characters) => Utf16String::from_latin1(characters),
             DecodedString::Utf16(code_units) => Utf16String::from_utf16(&code_units),
         })
     }
@@ -158,7 +158,7 @@ impl<'a> StructuredSerializeReader<'a> {
                 ak::Utf16StringUnits::Ascii(identifier) => {
                     serializable_interface_name_from_storage_identifier(identifier)
                 }
-                ak::Utf16StringUnits::Utf16(_) => None,
+                ak::Utf16StringUnits::Latin1(_) | ak::Utf16StringUnits::Utf16(_) => None,
             },
         };
         self.decoded(interface_name.ok_or(DecodeError("Unknown structured serialize interface name")))

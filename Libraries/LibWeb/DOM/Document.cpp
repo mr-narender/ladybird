@@ -293,8 +293,8 @@ namespace Web::DOM {
 static CSS::ComputedValuesFFI::FfiUtf16View ffi_utf16_view(Utf16View view)
 {
     return {
-        .ascii = view.has_ascii_storage() ? reinterpret_cast<u8 const*>(view.ascii_span().data()) : nullptr,
-        .utf16 = view.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
+        .latin1 = view.has_latin1_storage() ? view.latin1_span().data() : nullptr,
+        .utf16 = view.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(view.utf16_span().data()),
         .length = view.length_in_code_units(),
     };
 }
@@ -871,7 +871,6 @@ void Document::reset_style_invalidation_counters(Layout::BegunRead const& read) 
     (void)CSS::StyleEngineFFI::style_engine_size_query_container_scan_visits(style_computer().style_engine().host(), &read, true);
     if (m_layout_node_arena) {
         Layout::RustFFI::render_state_scrollable_overflow_recalculation_count(m_layout_node_arena->host(), true);
-        Layout::RustFFI::render_state_overflow_contained_box_index_refill_count(m_layout_node_arena->host(), true);
     }
     CSS::reset_longhand_wrappers_minted();
 }
@@ -5487,7 +5486,16 @@ void Document::set_bg_color(Utf16View value)
 
 Utf16String Document::dump_dom_tree_as_json() const
 {
-    const_cast<Document&>(*this).update_layout(UpdateLayoutReason::InspectDOMTree);
+    auto& document = const_cast<Document&>(*this);
+    document.update_layout(UpdateLayoutReason::InspectDOMTree);
+
+    // The tree takes in the document of each nested navigable in this process (see Node::serialize_tree_as_json()) and
+    // reads its layout too, so bring each of those up to date as well, every parent before its children.
+    for (auto& navigable : document.descendant_navigables()) {
+        auto* local_navigable = as_if<HTML::LocalNavigable>(navigable.ptr());
+        if (auto nested_document = local_navigable ? local_navigable->active_document() : GC::Ptr<Document> {})
+            nested_document->update_layout(UpdateLayoutReason::InspectDOMTree);
+    }
 
     Utf16StringBuilder builder;
     auto json = MUST(JsonObjectSerializer<>::try_create(builder));
@@ -6565,6 +6573,8 @@ void Document::destroy()
 
     // 2. Abort document.
     abort();
+
+    m_page->notifications_document_destroyed(*this);
     stop_compositor_animation_timers();
 
     // AD-HOC: Notify document observers that this document became inactive.
@@ -7224,6 +7234,8 @@ void Document::make_active()
             if (auto title = document->title(); !title.is_empty())
                 document->page().client().page_did_change_title(title);
         }));
+    } else if (current_navigable) {
+        page().client().page_did_change_active_document_in_child_navigable(*this);
     }
 
     // 4. Set window's relevant settings object's execution ready flag.
@@ -10498,8 +10510,8 @@ Vector<GC::Root<Range>> Document::find_matching_text(Utf16View query, CaseSensit
     };
     Search search { *this, {} };
     auto query_view = Layout::RustFFI::FfiUtf16View {
-        .ascii = query.has_ascii_storage() ? reinterpret_cast<u8 const*>(query.ascii_span().data()) : nullptr,
-        .utf16 = query.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(query.utf16_span().data()),
+        .latin1 = query.has_latin1_storage() ? query.latin1_span().data() : nullptr,
+        .utf16 = query.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(query.utf16_span().data()),
         .length = query.length_in_code_units(),
     };
     Layout::RustFFI::layout_script_find_matching_text(

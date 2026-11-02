@@ -16,7 +16,9 @@
 #include <AK/kmalloc.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Settings.h>
+#include <UI/Qt/BookmarksBar.h>
 #include <UI/Qt/Tab.h>
+#include <UI/Qt/WindowToolbar.h>
 
 #include <QHash>
 #include <QPixmap>
@@ -309,6 +311,10 @@ public:
     Tab* tab(int index) const { return as<Tab>(m_stacked_widget->widget(index)); }
     void set_current_tab(Tab*);
 
+    WindowToolbar& toolbar() const { return *m_toolbar; }
+    BookmarksBar& bookmarks_bar() const { return m_bookmarks_bar->bar(); }
+    void update_bookmarks_bar_visibility();
+
     int index_of(Tab* widget) const;
 
     void set_tab_text(int index, QString const& text);
@@ -375,11 +381,11 @@ private:
     // ending there until the sidebar is open, so the toolbar's other buttons stay in place under the sidebar.
     void rebuild_layout_for_vertical_tabs();
     void rebuild_page_column();
+    void add_page_to_page_column();
     void place_toolbar_over_page_column();
     void update_vertical_tabs_column_margins();
     void paint_vertical_tabs_column();
-    void update_toolbar_placement();
-    void update_tab_toolbar_window_controls_visibility();
+    void update_toolbar_window_controls_visibility();
     int current_vertical_tabs_width() const;
     void apply_vertical_tabs_expanded_width(int width);
     void persist_vertical_tabs_expanded_width();
@@ -421,7 +427,8 @@ private:
     QToolButton* m_maximize_window_button { nullptr };
     QToolButton* m_close_window_button { nullptr };
     QWidget* m_window_controls { nullptr };
-    QStackedWidget* m_toolbar_container { nullptr };
+    WindowToolbar* m_toolbar { nullptr };
+    BookmarksBarContainer* m_bookmarks_bar { nullptr };
     QWidget* m_page_column { nullptr };
     QWidget* m_toolbar_placeholder { nullptr };
     bool m_toolbar_follows_page_column { false };

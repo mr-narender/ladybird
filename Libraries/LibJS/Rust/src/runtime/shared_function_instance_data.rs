@@ -28,8 +28,8 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::function_object::CallEnvironmentTemplate;
 pub use crate::layout::function_object::{SharedFunctionInstanceData, asm_call_metadata};
+use crate::layout::member::NullableMember;
 use crate::runtime::environment_shape::{EnvironmentShape, EnvironmentShapeCache};
-use crate::runtime::private_environment::PrivateName;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::shape::Shape;
 use crate::source_code::SourceCode;
@@ -55,11 +55,12 @@ pub enum ConstructorKind {
     Derived,
 }
 
-/// [[ClassFieldInitializerName]]: Variant<PropertyKey, PrivateName, Empty>.
+/// [[ClassFieldInitializerName]]: Variant<PropertyKey, PrivateName, Empty>. Only whether there is a name matters, so a
+/// Private Name is kept as its description.
 #[derive(Clone, Debug, Default, Trace)]
 pub enum ClassFieldInitializerName {
     PropertyKey(PropertyKey),
-    PrivateName(#[gc(untraced)] PrivateName),
+    PrivateName(#[gc(untraced)] Utf16FlyString),
     #[default]
     Empty,
 }
@@ -106,8 +107,8 @@ pub struct SharedFunctionInstanceDataStorage {
 
     function_environment_bindings_count: Cell<usize>,
     var_environment_bindings_count: Cell<usize>,
-    function_environment_shape: Cell<Option<Gc<EnvironmentShape>>>,
-    var_environment_shape: Cell<Option<Gc<EnvironmentShape>>>,
+    function_environment_shape: NullableMember<EnvironmentShape>,
+    var_environment_shape: NullableMember<EnvironmentShape>,
 
     class_field_initializer_name: GcRefCell<ClassFieldInitializerName>, // [[ClassFieldInitializerName]]
     #[gc(untraced)]
@@ -140,6 +141,9 @@ pub struct SharedFunctionInstanceDataStorage {
     #[gc(untraced)]
     closure_count: Cell<ClosureCount>,
 }
+
+// NB: Every function has these bytes.
+const _: () = assert!(size_of::<SharedFunctionInstanceData>() == 264);
 
 /// The most properties that constructions make room for ahead (the largest inline capacity of plain objects).
 const MAX_CONSTRUCT_RESERVE: u32 = 16;
@@ -219,14 +223,14 @@ impl SharedFunctionInstanceData {
 
         Self {
             header: CellHeader::for_class(Self::CLASS),
-            executable: Cell::new(None),
+            executable: NullableMember::null(),
             asm_call_metadata: Cell::new(0),
             formal_parameter_count: Cell::new(formal_parameter_count),
             strict: Cell::new(strict),
             function_environment_needed: Cell::new(false),
             uses_this: Cell::new(false),
             can_inline_call: Cell::new(false),
-            call_environment_template: Cell::new(None),
+            call_environment_template: NullableMember::null(),
             storage: SharedFunctionInstanceDataStorage {
                 name,
                 source_code: RefCell::new(None),
@@ -246,8 +250,8 @@ impl SharedFunctionInstanceData {
                 this_value_needs_environment_resolution: Cell::new(false),
                 function_environment_bindings_count: Cell::new(0),
                 var_environment_bindings_count: Cell::new(0),
-                function_environment_shape: Cell::new(None),
-                var_environment_shape: Cell::new(None),
+                function_environment_shape: NullableMember::null(),
+                var_environment_shape: NullableMember::null(),
                 class_field_initializer_name: GcRefCell::new(ClassFieldInitializerName::Empty),
                 constructor_kind: Cell::new(ConstructorKind::Base),
                 is_class_constructor: Cell::new(false),
@@ -660,7 +664,7 @@ impl SharedFunctionInstanceData {
     pub fn set_class_field_initializer_name_from_utf16(&self, name: &[u16], is_private: bool) {
         let name = Utf16FlyString::from_utf16(name);
         self.set_class_field_initializer_name(if is_private {
-            ClassFieldInitializerName::PrivateName(PrivateName::new(0, name))
+            ClassFieldInitializerName::PrivateName(name)
         } else {
             ClassFieldInitializerName::PropertyKey(PropertyKey::from(name))
         });
@@ -801,11 +805,11 @@ impl SharedFunctionInstanceData {
         EnvironmentShapeCache::VarEnvironment(Gc::from_ref(self))
     }
 
-    pub(crate) fn function_environment_shape_slot(&self) -> &Cell<Option<Gc<EnvironmentShape>>> {
+    pub(crate) fn function_environment_shape_slot(&self) -> &NullableMember<EnvironmentShape> {
         &self.storage.function_environment_shape
     }
 
-    pub(crate) fn var_environment_shape_slot(&self) -> &Cell<Option<Gc<EnvironmentShape>>> {
+    pub(crate) fn var_environment_shape_slot(&self) -> &NullableMember<EnvironmentShape> {
         &self.storage.var_environment_shape
     }
 

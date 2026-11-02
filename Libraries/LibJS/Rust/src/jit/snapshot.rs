@@ -362,8 +362,12 @@ fn function_frame_fields(function: Gc<EcmascriptFunctionObject>) -> FunctionFram
             word_of(function, offset_of!(EcmascriptFunctionObject, script_or_module)),
             word_of(function, offset_of!(EcmascriptFunctionObject, script_or_module) + 8),
         ],
-        environment: word_of(function, offset_of!(EcmascriptFunctionObject, environment)),
-        private_environment: word_of(function, offset_of!(EcmascriptFunctionObject, private_environment)),
+        environment: function
+            .environment()
+            .map_or(0, |environment| environment.as_ptr() as u64),
+        private_environment: function
+            .private_environment()
+            .map_or(0, |environment| environment.as_ptr() as u64),
     }
 }
 
@@ -612,7 +616,8 @@ impl SnapshotBuilder<'_> {
                     Some(TypedArraySnapshot {
                         element,
                         fixed_length: (array.cached_data_offset() != TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID)
-                            .then(|| array.array_length.length.get()),
+                            .then(|| array.array_length.length.get())
+                            .and_then(|length| u32::try_from(length).ok()),
                     })
                 }),
         }
@@ -957,7 +962,8 @@ impl SnapshotBuilder<'_> {
                 let bytes = |word_offset: u32| word_offset * size_of::<u64>() as u32;
                 DirectGetterFields {
                     wrapper_implementation: bytes(getter.wrapper_implementation_word_offset.get()),
-                    implementation_value: bytes(getter.implementation_value_word_offset.get()),
+                    implementation_value: getter.implementation_value_offset.get(),
+                    implementation_value_is_compressed: getter.implementation_value_is_compressed.get() != 0,
                     main_world_wrapper: bytes(getter.main_world_wrapper_word_offset.get()),
                     weak_impl_value: bytes(getter.weak_impl_value_word_offset.get()),
                 }

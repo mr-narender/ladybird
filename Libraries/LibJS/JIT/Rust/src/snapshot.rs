@@ -26,6 +26,20 @@ use crate::code::ExitKind;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CellId(pub u64);
 
+/// How far a cell's address is shifted right to compress it: cells store
+/// pointers to other cells as the low 32 bits of the shifted address (their
+/// offset into the 32 GiB heap region, which is aligned to its size, in units
+/// of the 8-byte cell alignment), and 0 for null.
+pub const COMPRESSED_POINTER_SHIFT: u8 = 3;
+
+impl CellId {
+    /// The cell's compressed pointer, which a field that holds the cell
+    /// compares equal to without decoding.
+    pub fn compressed(self) -> u32 {
+        (self.0 >> COMPRESSED_POINTER_SHIFT) as u32
+    }
+}
+
 /// One bytecode executable: the function being compiled (index 0) or an
 /// inlining candidate.
 ///
@@ -601,11 +615,14 @@ pub struct NativeCallTarget {
 /// wrapper, the field of the implementation the attribute returns, the weak
 /// reference of an implementation to its main world wrapper, and the cell of
 /// that weak reference. The getter returns the main world wrapper of the
-/// field's implementation, or null for a null field.
+/// field's implementation, or null for a null field. The field holds a
+/// compressed cell pointer if `implementation_value_is_compressed`, and a
+/// full one otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectGetterFields {
     pub wrapper_implementation: u32,
     pub implementation_value: u32,
+    pub implementation_value_is_compressed: bool,
     pub main_world_wrapper: u32,
     pub weak_impl_value: u32,
 }
@@ -1646,8 +1663,9 @@ pub struct RuntimeLayout {
     pub object_flag_is_extensible: u16,
     /// `Object::Flag::HasMagicalLengthProperty`, which only arrays have.
     pub object_flag_has_magical_length: u16,
-    /// The classes (pointers) of `StringObject`s and of `%String.prototype%`,
-    /// which start their cells.
+    /// The classes (pointers) of plain objects, of `StringObject`s and of
+    /// `%String.prototype%`.
+    pub object_class: u64,
     pub string_object_class: u64,
     pub string_prototype_class: u64,
     /// `Object::Flag::MayInterfereWithIndexedPropertyAccess`.
@@ -1676,7 +1694,7 @@ pub struct RuntimeLayout {
     /// `typed_array_cached_data_offset_invalid`.
     pub typed_array_cached_data_offset: u32,
     pub typed_array_cached_data_offset_invalid: u64,
-    /// `TypedArrayBase::array_length.length`, as a u32.
+    /// `TypedArrayBase::array_length.length` (u64).
     pub typed_array_array_length: u32,
     /// `TypedArrayBase::kind` (u8).
     pub typed_array_kind: u32,
@@ -1897,8 +1915,17 @@ pub struct RuntimeLayout {
     pub property_lookup_cache_entry_type_get_own_property: u32,
     /// `PropertyLookupCache::Entry::Type::ChangeOwnProperty`.
     pub property_lookup_cache_entry_type_change_own_property: u32,
-    /// `Class::object_methods`, of the class every cell starts with, or 0 if
-    /// JIT code does not walk prototype chains.
+    /// The mask that rounds the address of a cell down to its block, and
+    /// where the block holds the class of its cells. A block of an allocator
+    /// that classes share holds that class with `block_class_tail_tag` set,
+    /// and each cell keeps its own class right after the
+    /// `Class::type_info.cell_size` bytes of that class.
+    pub cell_block_mask: u64,
+    pub block_class_offset: u32,
+    pub block_class_tail_tag: u64,
+    pub class_cell_size: u32,
+    /// `Class::object_methods`, or 0 if JIT code does not walk prototype
+    /// chains.
     pub class_object_methods: u32,
     /// `ObjectMethods::internal_get_prototype_of`, which is null for objects
     /// whose prototype is the prototype of their shape.

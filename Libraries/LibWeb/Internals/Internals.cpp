@@ -103,6 +103,7 @@
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/LoaderConfig.h>
 #include <LibWeb/Loader/ResourceLoader.h>
+#include <LibWeb/NotificationsAPI/Notification.h>
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -953,6 +954,11 @@ void Internals::click_and_hold(double x, double y, WebIDL::UnsignedShort click_c
 void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, Bindings::WheelTicks const& ticks)
 {
     auto& page = this->page();
+    // The compositor scrolls by the event from the frames it has. Like a user's, the event comes once the page has
+    // presented what changed in it.
+    for (auto& navigable : page.local_traversable()->hosted_inclusive_descendant_navigables())
+        navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::EventHandlerHandleMouseWheel);
+    let_compositor_take_in_every_rendered_frame(window());
 
     auto wheel_delta_precision = wheel_delta_precision_from(precise);
     auto scroll_gesture_phase = scroll_gesture_phase_from(phase);
@@ -1730,6 +1736,12 @@ void Internals::set_accessibility_focus_target(DOM::Element& element)
     element.document().set_accessibility_focus_target(&element);
 }
 
+// Makes the page report accessibility tree changes as it does once an assistive technology has asked for the tree.
+void Internals::set_accessibility_interested()
+{
+    page().set_accessibility_interested(true);
+}
+
 u16 Internals::get_echo_server_port()
 {
     return s_echo_server_port;
@@ -1904,6 +1916,14 @@ Utf16String Internals::stacking_context_structure_verification_report()
 Utf16String Internals::dump_gc_graph()
 {
     return dump_string_to_utf16(GC::Heap::the().dump_graph().serialized());
+}
+
+Utf16String Internals::heap_census()
+{
+    // Collect first, so that the census counts what is reachable rather than what the last collection left behind.
+    auto& heap = window().principal_realm().vm().heap();
+    heap.collect_garbage();
+    return dump_string_to_utf16(heap.census().serialized());
 }
 
 Utf16String Internals::dump_session_history()
@@ -2249,6 +2269,26 @@ GC::Ref<WebIDL::Promise> Internals::advance_permission_clock(WebIDL::UnsignedLon
 Vector<String> Internals::permission_cache_origins()
 {
     return PermissionsAPI::PermissionStore::the().cached_origins_for_testing();
+}
+
+String Internals::notifications_state_for_testing()
+{
+    return page().client().page_did_request_notifications_state_for_testing();
+}
+
+void Internals::click_notification_for_testing(NotificationsAPI::Notification& notification)
+{
+    page().client().page_did_request_click_notification_for_testing(notification.id_for_testing());
+}
+
+void Internals::click_notification_by_id_for_testing(WebIDL::UnsignedLongLong browser_notification_id)
+{
+    page().client().page_did_request_click_notification_by_id_for_testing(browser_notification_id);
+}
+
+void Internals::dismiss_notification_for_testing(NotificationsAPI::Notification& notification)
+{
+    page().client().page_did_request_dismiss_notification_for_testing(notification.id_for_testing());
 }
 
 bool Internals::html_parser_body_is_exhausted(DOM::Document& document)
@@ -3373,7 +3413,6 @@ GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
     object->define_direct_property("styleCascadeMicroseconds"_utf16_fly_string, JS::Value(counters.style_cascade_microseconds), JS::default_attributes);
     object->define_direct_property("styleValuesMicroseconds"_utf16_fly_string, JS::Value(counters.style_values_microseconds), JS::default_attributes);
     object->define_direct_property("scrollableOverflowRecalculations"_utf16_fly_string, JS::Value(Layout::RustFFI::render_state_scrollable_overflow_recalculation_count(document.layout_node_arena().host(), false)), JS::default_attributes);
-    object->define_direct_property("overflowContainedBoxIndexRefills"_utf16_fly_string, JS::Value(Layout::RustFFI::render_state_overflow_contained_box_index_refill_count(document.layout_node_arena().host(), false)), JS::default_attributes);
     return object;
 }
 

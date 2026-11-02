@@ -247,6 +247,7 @@ private:
     virtual void set_content_blocking_policy(Web::PageId page_id, bool enabled, Vector<String> disabled_sites) override;
     virtual void set_content_blockers(Core::AnonymousBuffer patterns) override;
 
+    virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
     virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) override;
     virtual void set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme) override;
     virtual void set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast) override;
@@ -259,6 +260,10 @@ private:
     virtual void set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void permission_request_completed(Web::PageId page_id, u64 request_id, Web::Permissions::EffectiveState state) override;
+    virtual void notification_shown(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_show_failed(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_clicked(Web::PageId page_id, u64 notification_id) override;
+    virtual void notification_closed(Web::PageId page_id, u64 notification_id, bool by_user) override;
     virtual void set_has_focus(Web::PageId page_id, bool) override;
     virtual void set_focused_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption) override;

@@ -1020,26 +1020,39 @@ void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin 
 
 void PageClient::page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document& document)
 {
-    auto& realm = document.relevant_settings_object().realm();
-
     clear_pending_dom_mutations();
 
     if (m_web_ui && &m_web_ui->document() != &document)
         m_web_ui.clear();
 
-    // NB: Only the active document of the top-level browsing context has its console client read, so a document gets
-    //     one when it becomes that, and the many documents that never do (such as those DOMParser creates) never pay
-    //     for one.
+    // The output that DevTools gets once it asks belongs to the document that the tab shows.
+    if (m_top_level_document_console_client && document.console_client() != m_top_level_document_console_client)
+        m_console_output_buffer = {};
+
+    if (auto console_client = attach_js_console(document))
+        m_top_level_document_console_client = *console_client;
+}
+
+void PageClient::page_did_change_active_document_in_child_navigable(Web::DOM::Document& document)
+{
+    // An iframe's document logs to the tab's console too.
+    (void)attach_js_console(document);
+}
+
+// NB: Only an active document has its console client read, so a document gets one when it becomes active, and the many
+//     documents that never do (such as those DOMParser creates) never incur one.
+GC::Ptr<WebContentConsoleClient> PageClient::attach_js_console(Web::DOM::Document& document)
+{
     if (!document.console_client())
         initialize_js_console(document);
 
-    if (auto console_client = document.console_client()) {
-        auto& web_content_console_client = as<WebContentConsoleClient>(*console_client);
-        m_top_level_document_console_client = web_content_console_client;
+    auto console_client = document.console_client();
+    if (!console_client)
+        return {};
 
-        auto console_object = realm.intrinsics().console_object();
-        console_object->console().set_client(*console_client);
-    }
+    auto& realm = document.relevant_settings_object().realm();
+    realm.intrinsics().console_object()->console().set_client(*console_client);
+    return as<WebContentConsoleClient>(*console_client);
 }
 
 void PageClient::page_did_finish_loading(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id)
@@ -1155,6 +1168,10 @@ void PageClient::schedule_accessibility_tree_update()
     if (!m_accessibility_update_timer) {
         m_accessibility_update_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(200), [this] {
             if (m_is_closed)
+                return;
+            // The tab's document can move to another process before the timer fires, which leaves this page's
+            // traversable remote, with no document of its own to report.
+            if (!page().has_local_traversable())
                 return;
             if (auto doc = page().local_traversable()->active_document()) {
                 doc->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
@@ -1305,6 +1322,49 @@ void PageClient::page_did_request_geolocation_position(u64 request_id, Web::HTML
 void PageClient::page_did_request_permission(u64 request_id, Web::HTML::CrossProcessId requesting_document_id, Utf16String const& name)
 {
     client().async_did_request_permission(m_id, request_id, requesting_document_id, name);
+}
+
+void PageClient::page_did_request_show_notification(u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData const& data, RefPtr<Gfx::Bitmap const> icon)
+{
+    Optional<Gfx::ShareableBitmap> shareable_icon;
+    if (icon)
+        shareable_icon = icon->to_shareable_bitmap();
+    client().async_did_request_show_notification(m_id, notification_id, document_id, data, move(shareable_icon));
+}
+
+void PageClient::page_did_request_close_notification(u64 notification_id)
+{
+    client().async_did_request_close_notification(m_id, notification_id);
+}
+
+void PageClient::page_did_abandon_notification(u64 notification_id)
+{
+    client().async_did_abandon_notification(m_id, notification_id);
+}
+
+void PageClient::page_did_handle_notification_click(u64 notification_id, bool into_focus)
+{
+    client().async_did_handle_notification_click(m_id, notification_id, into_focus);
+}
+
+String PageClient::page_did_request_notifications_state_for_testing()
+{
+    return client().did_request_notifications_state_for_testing(m_id);
+}
+
+void PageClient::page_did_request_click_notification_for_testing(u64 notification_id)
+{
+    client().async_did_request_click_notification_for_testing(m_id, notification_id);
+}
+
+void PageClient::page_did_request_click_notification_by_id_for_testing(u64 browser_notification_id)
+{
+    client().async_did_request_click_notification_by_id_for_testing(m_id, browser_notification_id);
+}
+
+void PageClient::page_did_request_dismiss_notification_for_testing(u64 notification_id)
+{
+    client().async_did_request_dismiss_notification_for_testing(m_id, notification_id);
 }
 
 Optional<Web::Permissions::PermissionSnapshot> PageClient::page_did_request_permission_snapshot(URL::Origin const& top_level_origin)
@@ -2375,8 +2435,7 @@ void PageClient::set_has_devtools_client(bool has_devtools_client)
     if (!has_devtools_client) {
         m_devtools_takes_console_messages = false;
         m_devtools_takes_console_errors = false;
-        if (m_top_level_document_console_client)
-            as<DevToolsConsoleClient>(*m_top_level_document_console_client).forget_logged_objects();
+        for_each_devtools_console_client([](DevToolsConsoleClient& client) { client.forget_logged_objects(); });
     }
 }
 
@@ -2389,8 +2448,32 @@ void PageClient::start_sending_console_output(bool messages, bool errors)
     m_devtools_takes_console_messages |= messages;
     m_devtools_takes_console_errors |= errors;
 
-    if ((new_messages || new_errors) && m_top_level_document_console_client)
-        as<DevToolsConsoleClient>(*m_top_level_document_console_client).send_buffered_console_output(new_messages, new_errors);
+    if (!new_messages && !new_errors)
+        return;
+    m_console_output_buffer.for_each([&](WebView::ConsoleOutput const& console_output) {
+        auto is_error = console_output.output.has<WebView::ConsoleError>();
+        if (is_error ? new_errors : new_messages)
+            did_output_js_console_message(console_output);
+    });
+}
+
+void PageClient::buffer_console_output(WebView::ConsoleOutput console_output)
+{
+    m_console_output_buffer.append(move(console_output));
+}
+
+// The console clients of the active documents that the page shows: the top-level one's and its iframes'.
+void PageClient::for_each_devtools_console_client(Function<void(DevToolsConsoleClient&)> const& callback)
+{
+    for (auto& navigable : Web::HTML::all_local_navigables()) {
+        if (&navigable->page() != &page())
+            continue;
+        auto active_document = navigable->active_document();
+        if (!active_document)
+            continue;
+        if (auto* console_client = as_if<DevToolsConsoleClient>(active_document->console_client().ptr()))
+            callback(*console_client);
+    }
 }
 
 void PageClient::page_did_finish_network_request(u64 request_id, u64 body_size, Requests::RequestTimingInfo const& timing_info, Optional<Requests::NetworkError> const& network_error)
@@ -2415,11 +2498,18 @@ void PageClient::did_execute_js_console_input(WebView::DebuggerValue const& resu
     client().async_did_execute_js_console_input(m_id, result);
 }
 
+// An object of a console result is in the top-level document's console, but a logged one is in the console of whichever
+// document logged it.
 ErrorOr<WebView::DebuggerObjectProperties> PageClient::console_object_properties(u64 object_id)
 {
-    if (!m_top_level_document_console_client)
+    GC::Ptr<DevToolsConsoleClient> console_client;
+    for_each_devtools_console_client([&](DevToolsConsoleClient& client) {
+        if (!console_client && client.has_object(object_id))
+            console_client = client;
+    });
+    if (!console_client)
         return Error::from_string_literal("Unable to locate console object");
-    return as<DevToolsConsoleClient>(*m_top_level_document_console_client).properties_for_object(object_id);
+    return console_client->properties_for_object(object_id);
 }
 
 void PageClient::js_console_input(StringView js_source)

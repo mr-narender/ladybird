@@ -46,6 +46,11 @@ if (BUILD_TESTING AND NOT WIN32)
         )
         set_tests_properties(TestWorkerErrorConsole PROPERTIES TIMEOUT 120)
         add_test(
+            NAME TestIframeConsole
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-iframe-console.py $<TARGET_FILE:ladybird>
+        )
+        set_tests_properties(TestIframeConsole PROPERTIES TIMEOUT 120)
+        add_test(
             NAME TestWindowSizeReachesEveryPage
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-window-size-reaches-every-page.py $<TARGET_FILE:ladybird>
         )
@@ -89,6 +94,12 @@ if (BUILD_TESTING AND NOT WIN32)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-location-policy.py $<TARGET_FILE:WebDriver>
     )
     set_tests_properties(TestWebDriverLocationPolicy PROPERTIES TIMEOUT 120)
+
+    add_test(
+        NAME TestWebDriverNotificationsPolicy
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-webdriver-notifications-policy.py $<TARGET_FILE:WebDriver>
+    )
+    set_tests_properties(TestWebDriverNotificationsPolicy PROPERTIES TIMEOUT 120)
 
     add_test(
         NAME TestWebDriverPermissionsSettings
@@ -171,10 +182,13 @@ set(TEST_SOURCES
     TestDownloadStore.cpp
     TestExternalURLHandler.cpp
     TestFaviconStore.cpp
+    TestForceDarkSettings.cpp
     TestHelperProcessEnvironment.cpp
     TestHistoryStore.cpp
     TestHSTSStore.cpp
     TestNavigationLoader.cpp
+    TestNotificationAttribution.cpp
+    TestNotificationFreedesktopArguments.cpp
     TestOmnibox.cpp
     TestPermissionManager.cpp
     TestPictureInPictureWindow.cpp
@@ -238,6 +252,7 @@ if (NOT WIN32)
         TestGamepadExposure.cpp
         TestImageDecoderIsolation.cpp
         TestInputMethodState.cpp
+        TestInspectDOMTree.cpp
         TestLinkHoverStatus.cpp
         TestNavigationDownloads.cpp
         TestPictureInPictureUserActivation.cpp
@@ -251,6 +266,8 @@ if (NOT WIN32)
         TestShadowTreeTooltipsAndLinks.cpp
         TestTabPerformanceMonitor.cpp
         TestUserActivation.cpp
+        TestViewDestruction.cpp
+        TestViewSource.cpp
         TestWebCompatReport.cpp
         TestWebCompatReportPage.cpp
     )
@@ -258,7 +275,7 @@ if (NOT WIN32)
 endif()
 
 target_sources(TestLibWebView PRIVATE ${TEST_SOURCES})
-target_link_libraries(TestLibWebView PRIVATE LibAudio LibCompositing LibDatabase LibGfx LibHTTP LibIPC LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
+target_link_libraries(TestLibWebView PRIVATE LibAudio LibCompositing LibDatabase LibGC LibGfx LibHTTP LibIPC LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
 
 if (APPLE)
     add_dependencies(TestLibWebView ProcessReaper)

@@ -46,6 +46,7 @@
 #    include <UI/Qt/MacWindow.h>
 #endif
 #include <UI/Qt/InputMethodUtils.h>
+#include <UI/Qt/Menu.h>
 #include <UI/Qt/SelectDropdown.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/SystemAppearance.h>
@@ -2343,6 +2344,11 @@ Gfx::IntPoint WebContentView::to_content_position(Gfx::IntPoint widget_position)
 Gfx::IntPoint WebContentView::to_widget_position(Gfx::IntPoint content_position) const
 {
     return content_position;
+}
+
+void WebContentView::show_context_menu(WebView::Menu& menu, Gfx::IntPoint widget_position)
+{
+    execute_context_menu_later(m_context_menu, *this, menu, map_point_to_global_position(widget_position));
 }
 
 #if defined(LADYBIRD_QT_USE_IOSURFACE_LAYER) || defined(LADYBIRD_HAS_WAYLAND_GPU_QUERY)

@@ -329,6 +329,26 @@ impl DisplayListRecorder {
         self.ambient_inline_clips.extend_from_slice(inline_clips);
     }
 
+    /// Whether one of the ambient inline clips already keeps what is recorded under it within `rect`.
+    pub fn has_ambient_inline_clip_within(&self, rect: FloatRect) -> bool {
+        self.ambient_inline_clips.iter().any(|clip| clip.lies_within(rect))
+    }
+
+    /// Makes every ambient inline clip apply in `space`, whatever space the commands recorded under them draw in,
+    /// and hands back the clips as they were, for the caller to restore with [`Self::replace_ambient_inline_clips`].
+    pub fn move_ambient_inline_clips_to_space(&mut self, space: SpatialNodeIndex) -> Vec<PendingInlineClip> {
+        let clips_in_space = self
+            .ambient_inline_clips
+            .iter()
+            .map(|clip| clip.in_space(space))
+            .collect();
+        self.replace_ambient_inline_clips(clips_in_space)
+    }
+
+    pub fn replace_ambient_inline_clips(&mut self, inline_clips: Vec<PendingInlineClip>) -> Vec<PendingInlineClip> {
+        std::mem::replace(&mut self.ambient_inline_clips, inline_clips)
+    }
+
     pub fn truncate_ambient_inline_clips(&mut self, enclosing_scope_clip_count: usize) {
         self.ambient_inline_clips.truncate(enclosing_scope_clip_count);
     }
@@ -1326,10 +1346,6 @@ impl DisplayListRecorder {
 
     pub fn compositor_main_thread_wheel_event_region(&mut self, region: CompositorMainThreadWheelEventRegion) {
         self.append_command(&region, &[]);
-    }
-
-    pub fn compositor_scroll_chaining_barrier(&mut self, barrier: CompositorScrollChainingBarrier) {
-        self.append_command(&barrier, &[]);
     }
 
     pub fn compositor_nested_context_wheel_region(&mut self, region: CompositorNestedContextWheelRegion) {

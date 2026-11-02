@@ -156,6 +156,14 @@ public:
 
     virtual OwnPtr<PictureInPictureWindow> create_picture_in_picture_window(WebContentPage& requesting_page, CanonicalTraversable&, Gfx::IntSize video_size);
 
+    // The platform's notification support; the NotificationManager asks once, the first time a page shows one.
+    virtual NonnullOwnPtr<NotificationBackend> create_notification_backend();
+    // A click on a notification brought its page's tab into focus (the page's click handler didn't cancel it).
+    virtual void focus_page_from_notification(WebContentPage&) { }
+    // A click on a notification whose page is gone: Open the URL in a new foreground tab of that window, if it's
+    // still open, or of the active window.
+    virtual void open_url_in_new_tab_from_notification(URL::URL const&, [[maybe_unused]] Web::PageId originating_page, CanonicalTraversable*, IsPrivate) { }
+
     void appearance_changed(Badge<ApplicationSettingsObserver>);
     void tab_settings_changed(Badge<ApplicationSettingsObserver>);
     void languages_changed(Badge<ApplicationSettingsObserver>);
@@ -173,8 +181,10 @@ public:
 
     // True unless the user has turned location off, or there's no way to find it.
     bool sites_can_ask_for_location() const;
+    bool sites_can_ask_for_notifications() const;
     Core::GeolocationAuthorization geolocation_authorization();
     void location_policy_changed(Badge<ApplicationSettingsObserver>);
+    void notifications_policy_changed(Badge<ApplicationSettingsObserver>);
     void permissions_changed(Badge<ApplicationPermissionManagerObserver>, PermissionManager const&);
 
     bool content_blocking_enabled() const;
@@ -316,7 +326,7 @@ public:
     virtual bool should_capture_web_content_output() const { return false; }
 
     virtual ErrorOr<LexicalPath> default_path_for_downloaded_file(ByteString const& file) const;
-    ErrorOr<LexicalPath> path_for_downloaded_file(ByteString const& file) const;
+    NonnullRefPtr<Core::Promise<LexicalPath>> path_for_downloaded_file(ByteString const& file) const;
 
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;
     virtual void display_error_dialog(StringView error_message) const;
@@ -385,6 +395,9 @@ public:
     Action& zoom_out_action() { return *m_zoom_out_action; }
     Action& reset_zoom_action() { return *m_reset_zoom_action; }
 
+    Action& force_dark_action() { return *m_force_dark_action; }
+    void update_force_dark_action();
+
     Menu& color_scheme_menu() { return *m_color_scheme_menu; }
     Menu& contrast_menu() { return *m_contrast_menu; }
     Menu& motion_menu() { return *m_motion_menu; }
@@ -403,6 +416,7 @@ public:
 
     Menu& inspect_menu() { return *m_inspect_menu; }
     Action& view_source_action() { return *m_view_source_action; }
+    void update_view_source_action();
 
     Action& report_website_issue_action() { return *m_report_website_issue_action; }
     void update_report_website_issue_action();
@@ -445,7 +459,7 @@ protected:
     virtual bool should_use_os_geolocation() const { return true; }
     virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::IFrame; }
 
-    virtual Optional<ByteString> ask_user_for_download_path([[maybe_unused]] ByteString const& file) const { return {}; }
+    virtual NonnullRefPtr<Core::Promise<ByteString>> ask_user_for_download_path(ByteString const& file) const;
 
     virtual void display_crash_report_notification([[maybe_unused]] ByteString const& report_name) { }
 
@@ -718,6 +732,7 @@ private:
     RefPtr<Action> m_zoom_out_action;
     RefPtr<Action> m_reset_zoom_action;
 
+    RefPtr<Action> m_force_dark_action;
     RefPtr<Menu> m_color_scheme_menu;
     Web::CSS::PreferredColorScheme m_color_scheme { Web::CSS::PreferredColorScheme::Auto };
 

@@ -1040,6 +1040,13 @@ impl HostStyle {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct CommittedLinkHolder {
+    generation: u8,
+    holder: Option<NodeSlotId>,
+    met_at_commit: u32,
+}
+
 #[derive(Clone)]
 pub(crate) struct LayoutNodeArena {
     chunks: Vec<Box<Chunk>>,
@@ -1102,7 +1109,11 @@ pub(crate) struct LayoutNodeArena {
     full_layout_count: u64,
     /// How many layouts were committed, full and partial.
     layout_commit_count: u64,
-    committed_subtree_tokens: Vec<u32>,
+    /// Per slot, which fragment held the box's committed link when a commit last met it.
+    committed_link_holders: Vec<CommittedLinkHolder>,
+    /// The boxes whose committed links a full commit met at the top of its pass, which no fragment holds.
+    pass_level_committed_links: Vec<NodeSlotId>,
+    pub(crate) links_held_apart_from_their_containing_blocks: crate::fast_hash::FastSet<NodeSlotId>,
     layout_tree_build_stats: FfiLayoutTreeBuildStats,
     pre_order_labels: Vec<u64>,
     pre_order_relabel_count: u64,
@@ -1157,8 +1168,6 @@ pub(crate) struct LayoutNodeArena {
     /// this escape bit is set. Partial relayout may only run while the bit is clear; a full
     /// layout pass re-derives every fact boundary qualification depends on, so it clears the bit.
     pub(crate) pending_updates_escape_partial_relayout: bool,
-    pub(crate) boxes_needing_scrollable_overflow_recalculation: Vec<NodeSlotId>,
-    pub(crate) needs_full_scrollable_overflow_recalculation: bool,
     text_nodes_enrolled_for_content_sync: HashSet<NodeSlotId>,
     /// The scroll containers a running tree build gave a style, which may be where scroll
     /// snapping happens once the build is over.
@@ -1227,7 +1236,9 @@ impl LayoutNodeArena {
             partial_layout_count: (0),
             full_layout_count: (0),
             layout_commit_count: 0,
-            committed_subtree_tokens: Vec::new(),
+            committed_link_holders: Vec::new(),
+            pass_level_committed_links: Vec::new(),
+            links_held_apart_from_their_containing_blocks: Default::default(),
             layout_tree_build_stats: (FfiLayoutTreeBuildStats::default()),
             pre_order_labels: Vec::new(),
             pre_order_relabel_count: 0,
@@ -1262,8 +1273,6 @@ impl LayoutNodeArena {
             inline_boxes_lifted_out_of: HashMap::default(),
             out_of_flow_positioning_contained: HashMap::default(),
             pending_updates_escape_partial_relayout: false,
-            boxes_needing_scrollable_overflow_recalculation: Vec::new(),
-            needs_full_scrollable_overflow_recalculation: false,
             text_nodes_enrolled_for_content_sync: HashSet::default(),
             built_scroll_containers: Default::default(),
             image_resources_owed_to_host: Default::default(),
@@ -1280,6 +1289,37 @@ impl LayoutNodeArena {
             counter_styles: Default::default(),
             style_node_tables: StyleNodeTables::default(),
         }
+    }
+
+    /// Notes that the commit numbered `commit` met the committed link of `id` in the fragment of `holder`, or at the top
+    /// of its pass where `holder` is invalid.
+    pub(crate) fn note_committed_link_holder(&mut self, id: NodeSlotId, holder: NodeSlotId, commit: u32) {
+        let index = id.slot_index() as usize;
+        if self.committed_link_holders.len() <= index {
+            self.committed_link_holders
+                .resize(index + 1, CommittedLinkHolder::default());
+        }
+        self.committed_link_holders[index] = CommittedLinkHolder {
+            generation: id.generation(),
+            holder: Some(holder),
+            met_at_commit: commit,
+        };
+    }
+
+    /// The fragment that held the committed link of `id` when a commit last met it, and that commit's number.
+    pub(crate) fn committed_link_holder(&self, id: NodeSlotId) -> Option<(NodeSlotId, u32)> {
+        self.committed_link_holders
+            .get(id.slot_index() as usize)
+            .filter(|holder| holder.generation == id.generation())
+            .and_then(|holder| holder.holder.map(|node| (node, holder.met_at_commit)))
+    }
+
+    pub(crate) fn take_pass_level_committed_links(&mut self) -> Vec<NodeSlotId> {
+        std::mem::take(&mut self.pass_level_committed_links)
+    }
+
+    pub(crate) fn set_pass_level_committed_links(&mut self, links: Vec<NodeSlotId>) {
+        self.pass_level_committed_links = links;
     }
 
     pub(crate) fn layout_commit_count(&self) -> u64 {
@@ -1303,7 +1343,7 @@ impl LayoutNodeArena {
         std::mem::take(&mut self.memo_invalidations)
     }
 
-    /// Drops the entries of `store` whose slot or epoch no longer matches, marks the entry whose fragments each box
+    /// Drops the entries of `store` whose slot or epoch no longer matches, keeps the entry whose fragments each box
     /// committed and ages the others. Checks only boxes whose entries were invalidated, stored or used since the
     /// previous sweep, or can still age out. Stale entries survive until commit so inline layout can reuse their
     /// undamaged line prefixes.
@@ -1319,40 +1359,9 @@ impl LayoutNodeArena {
                 let id = NodeSlotId::new(slot, metadata.generation);
                 self.data(id).fragment_cache_epoch == validity.fragment_cache_epoch
             },
-            |box_, entry| {
-                entry
-                    .describes_committed_subtree(self, box_)
-                    .then(|| self.committed_subtree_token(box_))
-            },
+            |box_, entry| entry.holds_committed_fragments(self, box_),
             self.layout_commit_count(),
         );
-    }
-
-    /// Moves on whenever a commit lays the subtree of `id` out anew or clears it, which tells a layout run cache
-    /// entry that found its fragments committed whether they still are.
-    pub(crate) fn committed_subtree_token(&self, id: NodeSlotId) -> u32 {
-        self.committed_subtree_tokens
-            .get(id.slot_index() as usize)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn note_subtree_committed_anew(&mut self, id: NodeSlotId) {
-        let tokens = &mut self.committed_subtree_tokens;
-        let index = id.slot_index() as usize;
-        if tokens.len() <= index {
-            tokens.resize(index + 1, 0);
-        }
-        tokens[index] = tokens[index].wrapping_add(1);
-    }
-
-    /// Notes that the subtrees of `id` and its ancestors were committed anew.
-    pub(crate) fn note_subtrees_of_self_and_ancestors_committed_anew(&mut self, id: NodeSlotId) {
-        let mut node = id;
-        while !node.is_invalid() && self.slot_is_live(node) {
-            self.note_subtree_committed_anew(node);
-            node = self.data(node).parent.get();
-        }
     }
 
     /// Checks that the calling thread may reach the arena: the StyleLayout thread, which the arena's render state lives
@@ -1504,17 +1513,12 @@ impl LayoutNodeArena {
             self.layout_root = NodeSlotId::INVALID;
             self.pending_rebuilt_subtree_roots.clear();
             self.pending_layout_tree_update_escaped_rebuild_roots = false;
-        }
-        // NB: The root was unlinked through remove_child(), which already noted what its subtree takes out of the
-        //     overflow index.
-        if self.scrollable_overflow.viewport == Some(root) {
-            self.scrollable_overflow.viewport = None;
-            self.scrollable_overflow.non_child_boxes.clear();
-            self.scrollable_overflow.full_layout_commit = false;
-            self.scrollable_overflow.geometry_changed = false;
-            self.scrollable_overflow.scrollability_changed = false;
-            self.boxes_needing_scrollable_overflow_recalculation.clear();
-            self.needs_full_scrollable_overflow_recalculation = false;
+            let overflow = &mut self.scrollable_overflow;
+            overflow.recalculation_requests.clear();
+            overflow.scroll_offset_clamp_candidates.clear();
+            overflow.geometry_changed = false;
+            overflow.scrollability_changed = false;
+            self.links_held_apart_from_their_containing_blocks.clear();
         }
         let mut rows = Vec::new();
         self.for_each_node_in_layout_subtree_in_pre_order(root, |slot| rows.push(slot));
@@ -2159,10 +2163,23 @@ impl LayoutNodeArena {
     /// Record whether the node sits in the user agent shadow tree of the focused text control.
     pub(crate) fn set_identity_in_focused_text_control(&mut self, node: StyleNodeID, value: bool) {
         let identities = &mut self.style_node_tables.identities_in_focused_text_control;
-        if value {
-            identities.insert(node);
+        let changed = if value {
+            identities.insert(node)
         } else {
-            identities.remove(&node);
+            identities.remove(&node)
+        };
+        if !changed {
+            return;
+        }
+        let mut row = self.first_rows_by_style_node.head(node);
+        while !row.is_invalid() {
+            if let Some(line_root) = self.node_containing_block_if_live(row)
+                && self.paintable_row_is_populated(line_root)
+            {
+                self.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(line_root);
+                self.request_fragment_overflow_recalculation(line_root);
+            }
+            row = self.next_rows_with_same_style_node[row.slot_index() as usize];
         }
     }
 
@@ -3868,7 +3885,6 @@ impl LayoutNodeArena {
             return;
         }
         self.set_needs_layout_update(node, true);
-        self.scrollable_overflow.contained_boxes_dirty = true;
         if releases_contained_boxes {
             self.record_partial_relayout_escape();
         }
@@ -4551,24 +4567,16 @@ impl LayoutNodeArena {
         }
         self.write_shape(id).set_flags(updated);
         // A box that becomes a flex or grid item can lay out to the fragment it committed before, but orders its
-        // painting differently, so its committed geometry no longer lets its commit be skipped.
+        // painting differently, so its committed geometry no longer lets its commit be skipped, nor that of the boxes
+        // whose committed fragments hold it.
         if matches!(flag, NodeFlag::IsFlexItem | NodeFlag::IsGridItem) && updated != previous {
             self.paintable_rows.invalidate_committed_geometry(id.slot_index());
+            self.invalidate_committed_geometry_of_ancestors(id);
         }
         // Retaining compositor-animated content decides whether a non-invertible transform
         // still records its stacking context.
         if flag == NodeFlag::HasAnimatedOpacityOrTransform && updated != previous {
             self.push_paint_damage(id, crate::painting::record::damage::PaintDamage::ELIGIBILITY);
-        }
-        // A commit leaves an ordinary inline's overflow unmeasured, since nothing reads it. Once the
-        // inline stores a scroll offset, its overflow clamps that offset, so the pass measures it.
-        if flag == NodeFlag::HasScrollOffset
-            && value
-            && updated != previous
-            && self.paintable_row_is_populated(id)
-            && !self.paintable_side_data(id).overflow_measured_this_commit
-        {
-            self.note_row_overflow_unmeasured(id);
         }
     }
 
@@ -5260,11 +5268,23 @@ impl LayoutNodeArena {
         link
     }
 
+    /// Makes the committed geometry of the ancestors of `id` stale up to the first that is stale already, so that the
+    /// next commit walks down to `id` rather than keeping a committed subtree that holds it.
+    pub(crate) fn invalidate_committed_geometry_of_ancestors(&mut self, id: NodeSlotId) {
+        let mut ancestor = self.data(id).parent.get();
+        while !ancestor.is_invalid()
+            && self.slot_is_live(ancestor)
+            && self.with_current_committed_fragment_link(ancestor, |_| ()).is_some()
+        {
+            self.paintable_rows.invalidate_committed_geometry(ancestor.slot_index());
+            ancestor = self.data(ancestor).parent.get();
+        }
+    }
+
     pub(crate) fn clear_committed_fragment_link(&mut self, id: NodeSlotId) {
         // Cached runs may reuse the committed paintable subtree without replaying its fragments.
         // Once that subtree is cleared, a later layout must rebuild it instead.
         self.memo_invalidations.note_run_cache_entries_dropped(id.slot_index());
-        self.note_subtrees_of_self_and_ancestors_committed_anew(id);
         drop(self.take_committed_fragment_link(id));
     }
 
@@ -5737,9 +5757,6 @@ impl LayoutNodeArena {
             self.memo_invalidations.note_structural_inline_change(node);
         }
         self.bump_fragment_cache_epoch(node);
-        if super::node_facts::kind_is_box(self.data(node).kind.get()) {
-            self.paintable_rows_mut().clear_cached_overflow_data(node);
-        }
     }
 
     pub(super) fn bump_fragment_cache_epoch(&mut self, node: NodeSlotId) {
@@ -5839,7 +5856,6 @@ impl LayoutNodeArena {
         self.assign_pre_order_labels_to_inserted_subtree(parent, child);
         self.note_layout_subtree_attached(child);
         self.pending_attached_subtree_roots.push(child);
-        self.note_overflow_contained_boxes_may_move_with_subtree(child);
         // NB: Resolving the deferred insertion marks the parent for layout, which resets its intrinsic sizes.
         self.invalidate_self_and_ancestors(
             parent,
@@ -5852,7 +5868,6 @@ impl LayoutNodeArena {
         if self.paintable_row_count() > 0 {
             self.push_enclosing_paint_order_damage(child);
         }
-        self.note_overflow_contained_boxes_may_move_with_subtree(child);
         self.unlink_child(parent, child);
         self.invalidate_self_and_ancestors(
             parent,

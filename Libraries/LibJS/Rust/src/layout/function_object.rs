@@ -6,10 +6,11 @@
 
 use core::cell::Cell;
 
-use super::cell::{CellHeader, Gc};
+use super::cell::CellHeader;
 use super::environment::{DeclarativeEnvironment, Environment, PrivateEnvironment};
 use super::executable::ExecutableHead;
 use super::execution_context::ScriptOrModule;
+use super::member::{Member, NullableMember};
 use super::object::Object;
 use super::realm::Realm;
 use crate::layout_forward::{
@@ -25,9 +26,12 @@ pub struct FunctionObject {
     /// Flags of the classes extending FunctionObject, in what would otherwise be padding (see
     /// ecmascript_function_flags).
     pub flags: Cell<u8>,
+    /// The shared data of an ECMAScript function object, in what would otherwise be padding (null for other
+    /// functions). See EcmascriptFunctionObject::shared_data().
+    pub ecmascript_shared_data: NullableMember<SharedFunctionInstanceData>,
 }
 
-const _: () = assert!(size_of::<FunctionObject>() == 80);
+const _: () = assert!(size_of::<FunctionObject>() == 56);
 
 #[repr(C)]
 pub struct NativeFunction {
@@ -35,24 +39,32 @@ pub struct NativeFunction {
     /// The name call stacks show, which only some native functions have.
     pub name: FlyStringSlot,
     pub initial_name: FlyStringSlot,
-    pub realm: Cell<Gc<Realm>>,
+    pub realm: Member<Realm>,
+    /// The index of a raw native function's function in the native function table, in what would otherwise be padding
+    /// (0 for other native functions).
+    pub raw_native_function_index: Cell<u32>,
 }
+
+const _: () = assert!(size_of::<NativeFunction>() == 80);
 
 #[repr(C)]
 pub struct RawNativeFunction {
     pub base: NativeFunction,
-    pub native_function_index: Cell<u32>,
 }
 
-/// A raw native getter that reads a wrapped value straight out of a platform object, at word offsets the embedder
-/// provides.
+const _: () = assert!(size_of::<RawNativeFunction>() == 80);
+
+/// A raw native getter that reads a wrapped value straight out of a platform object, at offsets the embedder provides:
+/// word offsets of pointer-sized fields, and the byte offset of the implementation value, which is a compressed cell
+/// pointer if `implementation_value_is_compressed` is 1, and pointer-sized if it is 0.
 #[repr(C)]
 pub struct DirectGetterFunction {
     pub base: RawNativeFunction,
     pub wrapper_implementation_word_offset: Cell<u32>,
-    pub implementation_value_word_offset: Cell<u32>,
+    pub implementation_value_offset: Cell<u32>,
     pub main_world_wrapper_word_offset: Cell<u32>,
     pub weak_impl_value_word_offset: Cell<u32>,
+    pub implementation_value_is_compressed: Cell<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,10 +87,9 @@ pub struct NativeFunctionTableEntry {
 #[repr(C)]
 pub struct EcmascriptFunctionObject {
     pub base: FunctionObject,
-    pub shared_data: Cell<Gc<SharedFunctionInstanceData>>,
+    pub environment: NullableMember<Environment>,
+    pub private_environment: NullableMember<PrivateEnvironment>,
     pub name: FlyStringSlot,
-    pub environment: Cell<Option<Gc<Environment>>>,
-    pub private_environment: Cell<Option<Gc<PrivateEnvironment>>>,
     pub script_or_module: Cell<ScriptOrModule>,
     pub storage: EcmascriptFunctionObjectStorage,
 }
@@ -100,7 +111,7 @@ pub mod asm_call_metadata {
 #[repr(C)]
 pub struct SharedFunctionInstanceData {
     pub header: CellHeader,
-    pub executable: Cell<Option<Gc<ExecutableHead>>>,
+    pub executable: NullableMember<ExecutableHead>,
     pub asm_call_metadata: Cell<u64>,
     pub formal_parameter_count: Cell<u32>,
     pub strict: Cell<bool>,
@@ -108,7 +119,7 @@ pub struct SharedFunctionInstanceData {
     pub uses_this: Cell<bool>,
     pub can_inline_call: Cell<bool>,
     /// How JIT code allocates the function environments of calls of the functions, once the runtime made one.
-    pub call_environment_template: Cell<Option<Gc<CallEnvironmentTemplate>>>,
+    pub call_environment_template: NullableMember<CallEnvironmentTemplate>,
     pub storage: SharedFunctionInstanceDataStorage,
 }
 

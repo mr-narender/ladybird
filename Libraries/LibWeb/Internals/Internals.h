@@ -201,6 +201,7 @@ public:
     Utf16String get_computed_label(DOM::Element& element);
     Utf16String get_computed_aria_level(DOM::Element& element);
     void set_accessibility_focus_target(DOM::Element& element);
+    void set_accessibility_interested();
 
     static u16 get_echo_server_port();
     static void set_echo_server_port(u16 port);
@@ -229,6 +230,7 @@ public:
     Utf16String dump_stacking_context_tree();
     Utf16String stacking_context_structure_verification_report();
     Utf16String dump_gc_graph();
+    Utf16String heap_census();
     Utf16String dump_session_history();
     Utf16String dump_ui_process_session_history();
     Utf16String dump_ui_process_session_history_without_update();
@@ -271,6 +273,10 @@ public:
     void release_held_permission_prompt(WebIDL::UnsignedLong waiters);
     GC::Ref<WebIDL::Promise> advance_permission_clock(WebIDL::UnsignedLongLong milliseconds);
     Vector<String> permission_cache_origins();
+    String notifications_state_for_testing();
+    void click_notification_for_testing(NotificationsAPI::Notification&);
+    void click_notification_by_id_for_testing(WebIDL::UnsignedLongLong browser_notification_id);
+    void dismiss_notification_for_testing(NotificationsAPI::Notification&);
 
     u64 parser_non_append_insertions();
     DOM::Document::StyleInvalidationCounters const& style_invalidation_counters() const;

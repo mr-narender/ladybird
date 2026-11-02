@@ -119,7 +119,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let fields_fit = u64::from(info.inline_storage_offset) <= template_bytes
             && info.inline_storage_offset.is_multiple_of(8)
             && info.named_properties_offset.is_multiple_of(8)
-            && info.shape_offset + 8 <= info.inline_storage_offset
+            && info.shape_offset + 4 <= info.inline_storage_offset
             && info.inline_capacity_offset < info.inline_storage_offset;
         let size_class = info.size_class_for(reserve).copied().filter(|_| fields_fit);
         let Some(size_class) = size_class else {
@@ -149,7 +149,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             .take(info.inline_storage_offset as usize)
             .collect::<Vec<u8>>();
         let shape_offset = info.shape_offset as usize;
-        image[shape_offset..shape_offset + 8].copy_from_slice(&shape.0.to_le_bytes());
+        image[shape_offset..shape_offset + 4].copy_from_slice(&shape.compressed().to_le_bytes());
         image[info.inline_capacity_offset as usize] =
             u8::try_from(size_class.inline_capacity).map_err(|_| CompileFailure::CodeGeneration)?;
         let mut fields: Vec<ConstantField> = (0u32..)
@@ -559,12 +559,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             .ok_or(CompileFailure::CodeGeneration)?;
         let (entry, resume) = self.defer_allocation(node, AllocationCall::Environment(shape_cache, capacity));
         let template_bytes = 8 * template.words.len() as u64;
-        let stored = [template.binding_values_offset, template.outer_offset];
+        let stored = [(template.binding_values_offset, 8), (template.outer_offset, 4)];
         let fits = template.allocator != 0
             && template_bytes <= u64::from(template.cell_size)
-            && stored
-                .iter()
-                .all(|offset| offset.is_multiple_of(8) && u64::from(*offset) + 8 <= template_bytes);
+            && stored_fields_fit(&stored, template_bytes);
         if !fits {
             self.masm.jump(entry);
             self.masm.bind(resume);
@@ -581,11 +579,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.emit_pop_free_list(template.allocator, environment, temp, entry);
         self.emit_count_allocation(template.cell_size, template.cell_size, temp, false);
 
-        let mut fields: Vec<ConstantField> = (0u32..)
-            .zip(&template.words)
-            .map(|(index, word)| (8 * index, 8, *word))
-            .filter(|(offset, _, _)| !stored.contains(offset))
-            .collect();
+        let mut fields = template_fields(&template.words, &stored);
         self.emit_constant_fields(environment, temp, &mut fields)?;
         if template.inline_binding_values {
             self.masm
@@ -596,8 +590,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             self.masm
                 .store_imm64(&at(environment, template.binding_values_offset), 0);
         }
-        self.emit_unbox_cell(temp, parent);
-        self.masm.store64(&at(environment, template.outer_offset), temp);
+        // NB: A cell value has the cell's offset into the heap region below its tag, so its low 32 bits shifted like
+        //     a cell pointer are the cell's compressed pointer.
+        self.emit_store_compressed_cell(&at(environment, template.outer_offset), parent, temp);
         self.masm.move64(output, environment);
         self.box_cell(output, output);
         self.masm.bind(resume);
@@ -622,16 +617,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let objects = self.runtime.object_allocation.clone();
         let offsets = self.runtime.offsets;
         let stored = [
-            objects.named_properties_offset,
-            offsets.ecmascript_function_environment,
-            offsets.ecmascript_function_private_environment,
+            (objects.named_properties_offset, 8),
+            (offsets.ecmascript_function_environment, 4),
+            (offsets.ecmascript_function_private_environment, 4),
         ];
         let template_bytes = 8 * closure.words.len() as u64;
         let fits = info.allocator != 0
             && template_bytes <= u64::from(info.cell_size)
-            && stored
-                .iter()
-                .all(|offset| offset.is_multiple_of(8) && u64::from(*offset) + 8 <= template_bytes);
+            && stored_fields_fit(&stored, template_bytes);
         if !fits {
             self.masm.jump(entry);
             self.masm.bind(resume);
@@ -648,23 +641,56 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.emit_pop_free_list(info.allocator, function, temp, entry);
         self.emit_count_allocation(info.cell_size, info.cell_size, temp, false);
 
-        let mut fields: Vec<ConstantField> = (0u32..)
-            .zip(&closure.words)
-            .map(|(index, word)| (8 * index, 8, *word))
-            .filter(|(offset, _, _)| !stored.contains(offset))
-            .collect();
+        let mut fields = template_fields(&closure.words, &stored);
         self.emit_constant_fields(function, temp, &mut fields)?;
         self.masm
             .load_effective_address(temp, &at(function, objects.inline_storage_offset));
         self.masm.store64(&at(function, objects.named_properties_offset), temp);
-        self.masm
-            .store64(&at(function, offsets.ecmascript_function_environment), environment);
-        self.masm.store64(
+        self.emit_store_compressed_cell(
+            &at(function, offsets.ecmascript_function_environment),
+            environment,
+            temp,
+        );
+        self.emit_store_compressed_cell(
             &at(function, offsets.ecmascript_function_private_environment),
             private_environment,
+            temp,
         );
         self.box_cell_with_tag(output, function, value::OBJECT_TAG);
         self.masm.bind(resume);
         Ok(())
     }
+}
+
+/// Whether the fields at `stored` (offsets and sizes of 4 or 8 bytes), which
+/// allocation stores itself, are aligned to their sizes and within the first
+/// `template_bytes` bytes of a cell.
+pub(super) fn stored_fields_fit(stored: &[(u32, u32)], template_bytes: u64) -> bool {
+    stored.iter().all(|&(offset, size)| {
+        matches!(size, 4 | 8) && offset.is_multiple_of(size) && u64::from(offset) + u64::from(size) <= template_bytes
+    })
+}
+
+/// The constant fields of a cell image `words` without the fields at
+/// `stored` (see `stored_fields_fit()`): whole words, and the halves of the
+/// words that share theirs with a 4-byte stored field.
+pub(super) fn template_fields(words: &[u64], stored: &[(u32, u32)]) -> Vec<ConstantField> {
+    let is_stored = |offset: u32, size: u32| {
+        stored
+            .iter()
+            .any(|&(start, length)| start < offset + size && offset < start + length)
+    };
+    let mut fields = Vec::with_capacity(words.len());
+    for (offset, word) in (0u32..).step_by(8).zip(words) {
+        if !is_stored(offset, 8) {
+            fields.push((offset, 8, *word));
+            continue;
+        }
+        for (half_offset, half) in [(offset, *word & 0xffff_ffff), (offset + 4, *word >> 32)] {
+            if !is_stored(half_offset, 4) {
+                fields.push((half_offset, 4, half));
+            }
+        }
+    }
+    fields
 }

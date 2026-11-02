@@ -611,21 +611,6 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             write_field(output, "rect", command.rect);
             write_corner_radii(output, command.corner_radii);
         }
-        DisplayListCommandType::CompositorScrollChainingBarrier => {
-            let command = read_command::<CompositorScrollChainingBarrier>(payload);
-            write_field(
-                output,
-                "scroll_node_index_above_barrier",
-                command.scroll_node_index_above_barrier,
-            );
-            write_field(output, "rect", command.rect);
-            write!(
-                output,
-                " keeps_horizontal_scrolls={} keeps_vertical_scrolls={}",
-                command.keeps_horizontal_scrolls, command.keeps_vertical_scrolls
-            )
-            .unwrap();
-        }
         DisplayListCommandType::CompositorScrollbar => {
             let command = read_command::<CompositorScrollbar>(payload);
             write_field(output, "scroll_node_index", command.scroll_node_index);
@@ -731,6 +716,10 @@ fn dump_inline_clips(output: &mut String, header: &DisplayListCommandHeader, pay
         }
         if clip.mode == ClipMode::Difference {
             output.push_str(" mode=difference");
+        }
+        if clip.has_own_space {
+            output.push_str(" in ");
+            write_spatial_node_index(output, clip.space);
         }
     }
     output.push(']');

@@ -27,7 +27,7 @@ use crate::bytecode::executable::{
     MAX_NUMBER_OF_SHAPES_TO_REMEMBER, MEGAMORPHIC_DATA_TAG, MEGAMORPHIC_HASH_MULTIPLIER, MEGAMORPHIC_INDEX_BITS,
     MEGAMORPHIC_PRIMARY_ENTRIES_OFFSET, MEGAMORPHIC_SECONDARY_ENTRIES_OFFSET,
 };
-use crate::gc::class::{Class, GcCell};
+use crate::gc::class::{BLOCK_CLASS_OFFSET, BLOCK_CLASS_TAIL_TAG, BLOCK_SIZE, Class, GcCell};
 use crate::gc::defer_gc::DeferGc;
 use crate::interpreter::runtime_functions::runtime_function_addresses;
 use crate::interpreter::vm::{
@@ -43,7 +43,7 @@ use crate::layout::executable::ExecutableHead;
 use crate::layout::execution_context::ExecutionContext;
 use crate::layout::function_object::{
     CallEnvironmentTemplate, EcmascriptFunctionObject, FUNCTION_ENVIRONMENT_WORDS, FunctionObject,
-    NATIVE_FUNCTION_TABLE_INDEX_MASK, NativeFunctionTableEntry, RawNativeFunction, SharedFunctionInstanceData,
+    NATIVE_FUNCTION_TABLE_INDEX_MASK, NativeFunction, NativeFunctionTableEntry, SharedFunctionInstanceData,
     asm_call_metadata,
 };
 use crate::layout::object::{
@@ -70,6 +70,10 @@ use crate::runtime::module_environment::ModuleEnvironment;
 use crate::runtime::object::{ORDINARY_OBJECT_METHODS, ObjectMethods, PropertyKind};
 use crate::runtime::string_object::StringObject;
 use crate::runtime::string_prototype::StringPrototype;
+
+// JIT code compresses and decodes the compressed cell pointers of cells like the runtime does.
+const _: () =
+    assert!(libjs_jit::snapshot::COMPRESSED_POINTER_SHIFT as u32 == crate::layout::member::COMPRESSED_POINTER_SHIFT);
 
 /// The addresses of the runtime functions JIT code calls, which every compile job's runtime info has.
 pub struct RuntimeFunctionAddresses {
@@ -178,6 +182,7 @@ fn runtime_layout() -> RuntimeLayout {
         indexed_storage_kind_holey: IndexedStorageKind::Holey as u8,
         object_flag_is_extensible: object_flag::IS_EXTENSIBLE,
         object_flag_has_magical_length: object_flag::HAS_MAGICAL_LENGTH_PROPERTY,
+        object_class: core::ptr::from_ref(Object::CLASS) as u64,
         string_object_class: core::ptr::from_ref(StringObject::CLASS) as u64,
         string_prototype_class: core::ptr::from_ref(StringPrototype::CLASS) as u64,
         object_flag_may_interfere: object_flag::MAY_INTERFERE_WITH_INDEXED_PROPERTY_ACCESS,
@@ -266,7 +271,7 @@ fn runtime_layout() -> RuntimeLayout {
         environment_shape_binding_names: offset(offset_of!(EnvironmentShape, binding_names)),
         environment_shape_has_unique_binding_names: offset(offset_of!(EnvironmentShape, has_unique_binding_names)),
         declarative_environment_binding_values: offset(offset_of!(DeclarativeEnvironment, binding_values.data)),
-        declarative_environment_shape: offset(offset_of!(DeclarativeEnvironment, shape)),
+        declarative_environment_shape: offset(offset_of!(Environment, shape)),
         declarative_environment_rare_data: offset(offset_of!(DeclarativeEnvironment, rare_data)),
         rare_data_binding_flags: offset(offset_of!(DeclarativeEnvironmentRareData, binding_flags.data)),
         environment_shape_binding_flags_size: offset(offset_of!(EnvironmentShape, binding_flags.size)),
@@ -340,6 +345,10 @@ fn runtime_layout() -> RuntimeLayout {
         property_lookup_cache_entry_type_add_own_property: PropertyLookupCacheEntryType::AddOwnProperty as u32,
         property_lookup_cache_entry_type_get_own_property: PropertyLookupCacheEntryType::GetOwnProperty as u32,
         property_lookup_cache_entry_type_change_own_property: PropertyLookupCacheEntryType::ChangeOwnProperty as u32,
+        cell_block_mask: !(BLOCK_SIZE as u64 - 1),
+        block_class_offset: offset(BLOCK_CLASS_OFFSET),
+        block_class_tail_tag: BLOCK_CLASS_TAIL_TAG as u64,
+        class_cell_size: offset(offset_of!(Class, type_info.cell_size)),
         class_object_methods: offset(offset_of!(Class, object_methods)),
         object_methods_get_prototype_of: offset(offset_of!(ObjectMethods, internal_get_prototype_of)),
         object_methods_is_cacheable_for_property_absence: offset(offset_of!(
@@ -558,7 +567,7 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
         .expect("the VM has a JIT entry table while the JIT is on");
     DynamicCallLayout {
         object_flag_is_ecmascript_function: object_flag::IS_ECMASCRIPT_FUNCTION_OBJECT,
-        ecmascript_function_shared_data: offset(offset_of!(EcmascriptFunctionObject, shared_data)),
+        ecmascript_function_shared_data: offset(offset_of!(FunctionObject, ecmascript_shared_data)),
         shared_data_executable: offset(offset_of!(SharedFunctionInstanceData, executable)),
         shared_data_asm_call_metadata: offset(offset_of!(SharedFunctionInstanceData, asm_call_metadata)),
         executable_jit_entry_slot: offset(offset_of!(ExecutableHead, jit_entry_slot)),
@@ -580,7 +589,7 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
         } else {
             0
         },
-        raw_native_function_index: offset(offset_of!(RawNativeFunction, native_function_index)),
+        raw_native_function_index: offset(offset_of!(NativeFunction, raw_native_function_index)),
         vm_native_function_table: offset(offset_of!(VmHead, native_function_table_data)),
         native_function_table_index_mask: NATIVE_FUNCTION_TABLE_INDEX_MASK,
         native_function_table_entry_size: offset(size_of::<NativeFunctionTableEntry>()),

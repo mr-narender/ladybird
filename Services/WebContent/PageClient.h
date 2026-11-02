@@ -33,6 +33,7 @@
 #include <LibWebCommon/WebDriver/Capabilities.h>
 #include <LibWebCommon/WebDriver/Response.h>
 #include <LibWebCommon/WebDriver/UserPrompt.h>
+#include <LibWebCommon/WebView/ConsoleOutputBuffer.h>
 #include <LibWebCommon/WebView/Geolocation.h>
 #include <LibWebCommon/WebView/Mutation.h>
 #include <LibWebCommon/WebView/StorageSetResult.h>
@@ -121,10 +122,13 @@ public:
     bool has_devtools_client() const { return m_has_devtools_client; }
     virtual bool has_active_devtools_client() const override { return has_devtools_client(); }
     void start_sending_console_output(bool messages, bool errors);
+    void buffer_console_output(WebView::ConsoleOutput);
     bool devtools_takes_console_messages() const { return m_devtools_takes_console_messages; }
     bool devtools_takes_console_errors() const { return m_devtools_takes_console_errors; }
 
     void initialize_js_console(Web::DOM::Document& document);
+    GC::Ptr<WebContentConsoleClient> attach_js_console(Web::DOM::Document&);
+    void for_each_devtools_console_client(Function<void(DevToolsConsoleClient&)> const&);
     void js_console_input(StringView js_source);
     Optional<Web::HTML::ConsoleInputCompletion> complete_js_console_input(StringView input);
     void did_execute_js_console_input(WebView::DebuggerValue const&);
@@ -272,6 +276,7 @@ private:
     virtual void page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*>) override;
     virtual void page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const&, Optional<Web::HTML::PreparedNavigationDescriptor>) override;
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) override;
+    virtual void page_did_change_active_document_in_child_navigable(Web::DOM::Document&) override;
     virtual void page_did_finish_loading(Web::HTML::CrossProcessId, Web::HTML::CrossProcessId) override;
     virtual Optional<u64> page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response) override;
     virtual Optional<u64> page_did_start_download(URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size) override;
@@ -363,6 +368,14 @@ private:
     virtual void page_did_set_next_permission_prompt_outcome_for_testing(String const& name, String const& outcome, bool held) override;
     virtual void page_did_release_held_permission_prompt_for_testing(u32 waiters) override;
     virtual Optional<Web::Permissions::PermissionSnapshot> page_did_advance_permission_clock_for_testing(u64 milliseconds) override;
+    virtual void page_did_request_show_notification(u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData const&, RefPtr<Gfx::Bitmap const> icon) override;
+    virtual void page_did_request_close_notification(u64 notification_id) override;
+    virtual void page_did_abandon_notification(u64 notification_id) override;
+    virtual void page_did_handle_notification_click(u64 notification_id, bool into_focus) override;
+    virtual String page_did_request_notifications_state_for_testing() override;
+    virtual void page_did_request_click_notification_for_testing(u64 notification_id) override;
+    virtual void page_did_request_click_notification_by_id_for_testing(u64 browser_notification_id) override;
+    virtual void page_did_request_dismiss_notification_for_testing(u64 notification_id) override;
     virtual void page_did_finish_test(Utf16String const& text) override;
     virtual void page_did_set_test_timeout(double milliseconds) override;
     virtual void page_did_receive_reference_test_metadata(JsonValue) override;
@@ -474,6 +487,10 @@ private:
     bool m_has_devtools_client { false };
     bool m_devtools_takes_console_messages { false };
     bool m_devtools_takes_console_errors { false };
+
+    // The latest output of the document that the tab shows and of its iframes, which a DevTools client gets once it
+    // asks, so it sees what the page output before.
+    WebView::ConsoleOutputBuffer m_console_output_buffer;
 };
 
 }

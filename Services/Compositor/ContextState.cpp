@@ -960,112 +960,6 @@ ContextState::NodeScrollByWheelDelta ContextState::scroll_node_by_wheel_delta(Co
     return { outcome, delta_the_node_did_not_scroll_by };
 }
 
-ContextState::AsyncScrollResult ContextState::async_scroll_by(
-    Web::UniqueNodeID expected_document_id,
-    Gfx::FloatPoint position,
-    Gfx::FloatPoint delta,
-    Gfx::IntRect viewport_rect,
-    Web::WheelDeltaPrecision wheel_delta_precision,
-    Web::ScrollGesturePhase scroll_gesture_phase,
-    u32 modifiers,
-    Compositing::AsyncScrollOperationTracking operation_tracking,
-    Compositing::WheelStepDispatch wheel_step_dispatch,
-    u64 input_event_id,
-    Optional<MonotonicTime> now_for_testing)
-{
-    auto now = now_for_testing.value_or(MonotonicTime::now());
-
-    // Nothing hit tests a wheel before the first display list shows where the scrollers are, and the page can let a
-    // touchpad step through to here before then.
-    if (!m_has_async_scrolling_state)
-        return AsyncScrollResult::declined(Web::InputRoutingDecision::NoAsyncScrollingState);
-
-    // The UI hands this context every wheel event before WebContent's main thread passes it on. A step that the main
-    // thread passes on after the UI sent one it cannot come before must neither latch a scroller nor pull a stretch,
-    // since nothing would be left to let go of either.
-    bool step_came_from_ui = input_event_id != 0 && presents_to_client();
-    if (step_came_from_ui && m_wheel_gesture_routing.step_was_overtaken_by_ui(scroll_gesture_phase, input_event_id))
-        return AsyncScrollResult::declined(Web::InputRoutingDecision::StepOvertakenByUI);
-
-    // The end of a gesture lets go of the scroller it stretched even if the context has stopped taking wheel events.
-    if (scroll_gesture_phase == Web::ScrollGesturePhase::Ended)
-        m_elastic_overscroll_controller.end_gesture(now);
-
-    // Blocking wheel event listeners have nothing left to hold back once the page has dispatched a step and did not
-    // cancel it. The compositor then scrolls the step of a touchpad gesture, so that the gesture stretches the edges
-    // it pulls past as it does where nothing holds its steps back.
-    bool page_let_touchpad_step_through = wheel_step_dispatch == Compositing::WheelStepDispatch::DispatchedAndNotCanceled
-        && step_came_from_ui
-        && wheel_delta_precision == Web::WheelDeltaPrecision::Precise
-        && first_is_one_of(scroll_gesture_phase, Web::ScrollGesturePhase::Ongoing, Web::ScrollGesturePhase::Momentum);
-    bool only_blocking_wheel_event_listeners_hold_steps_back = m_wheel_gesture_routing.only_blocking_wheel_event_listeners_hold_steps_back();
-
-    // A step the UI never sent, such as one a test makes on the main thread, is noted as the UI's events are.
-    if (input_event_id == 0)
-        m_wheel_gesture_routing.note_wheel_event(input_event_id, scroll_gesture_phase, modifiers, delta, position, m_async_scroll_tree, now);
-    auto latch = resolve_wheel_scroll_latch(scroll_gesture_phase);
-    // The compositor hands every step of a gesture latched to a nested context's scroller to that context itself.
-    if (latch.nested_context_id.has_value())
-        return AsyncScrollResult::declined(Web::InputRoutingDecision::ScrollerInOtherDocument);
-    auto latched_scroll_node_index = latch.scroll_node_index;
-    // The end of the gesture before this one may never have arrived. Whether a step of the UI starts another gesture
-    // was decided when the UI sent it.
-    if (!latched_scroll_node_index.has_value() && !step_came_from_ui)
-        m_elastic_overscroll_controller.end_gesture(now);
-
-    if (!m_wheel_gesture_routing.admits_async_wheel()
-        && !step_continues_touchpad_gesture_the_page_let_through(latched_scroll_node_index, wheel_delta_precision, scroll_gesture_phase)
-        && !(page_let_touchpad_step_through && only_blocking_wheel_event_listeners_hold_steps_back))
-        return AsyncScrollResult::declined(Compositing::input_routing_decision_for_wheel_step_not_admitted_by(m_wheel_gesture_routing.admission()));
-
-    m_scroll_snap_controller.note_gesture_phase(scroll_gesture_phase);
-
-    // The end of a gesture carries no delta to hit test; it snaps the boxes the gesture panned.
-    if (scroll_gesture_phase == Web::ScrollGesturePhase::Ended && delta.is_zero()) {
-        auto operation_id = snap_at_gesture_end(now);
-        if (!operation_id.has_value())
-            return AsyncScrollResult::declined(Web::InputRoutingDecision::GestureEndWithNothingToSnap);
-        m_async_scrolling_viewport_rect = viewport_rect;
-        return {
-            .enqueue_result = {
-                .accepted = true,
-                .operation_id = operation_tracking == Compositing::AsyncScrollOperationTracking::Yes ? operation_id : Optional<Compositing::AsyncScrollOperationID> {},
-                .routing_decision = Web::InputRoutingDecision::SnappedAtGestureEnd,
-            },
-            .frame_to_present = PendingFrame::repainting_changes(viewport_rect),
-        };
-    }
-
-    bool is_first_step_of_gesture = !latched_scroll_node_index.has_value();
-    auto routing_decision = Web::InputRoutingDecision::ContinuedLatch;
-    if (is_first_step_of_gesture) {
-        auto wheel_step_dispatch_for_hit_test = page_let_touchpad_step_through ? Compositing::WheelStepDispatch::DispatchedAndNotCanceled : Compositing::WheelStepDispatch::NotYetDispatched;
-        auto latch_attempt = hit_test_and_latch_wheel_gesture(position, delta, wheel_delta_precision, scroll_gesture_phase, expected_document_id, wheel_step_dispatch_for_hit_test, Compositing::NestedContextRegions::LeaveToMainThread);
-        if (!latch_attempt.latched_scroll_node_index.has_value())
-            return AsyncScrollResult::declined(latch_attempt.decision);
-        latched_scroll_node_index = latch_attempt.latched_scroll_node_index;
-        routing_decision = latch_attempt.decision;
-    } else if (m_async_scroll_tree.document_id() != expected_document_id) {
-        // A step over another document than the latched scroller's is left to the navigable hosting that scroller,
-        // which reports the same step with its own document.
-        return AsyncScrollResult::declined(Web::InputRoutingDecision::ScrollerInOtherDocument);
-    }
-    if (page_let_touchpad_step_through)
-        m_wheel_gesture_routing.note_page_let_latched_gesture_through();
-
-    auto scroll_chaining = is_first_step_of_gesture ? Compositing::ScrollChaining::ToScrollableAncestors : Compositing::ScrollChaining::None;
-    auto outcome = perform_wheel_scroll_of_node(*latched_scroll_node_index, delta, wheel_delta_precision, scroll_gesture_phase, operation_tracking, viewport_rect, now, scroll_chaining, VisualViewportPanning::No);
-    return {
-        .enqueue_result = {
-            .accepted = true,
-            .operation_id = outcome.operation_id,
-            .routing_decision = routing_decision,
-            .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
-        },
-        .frame_to_present = outcome.viewport_rect_to_present.map([](auto const& rect) { return PendingFrame::repainting_changes(rect); }),
-    };
-}
-
 void ContextState::note_user_input_scrolled(Web::AsyncScrollNodeStableID stable_node_id)
 {
     m_user_input_scroll_counts.ensure(stable_node_id)++;
@@ -1489,12 +1383,20 @@ Optional<Gfx::IntRect> ContextState::advance_smooth_scroll_animations(MonotonicT
     return {};
 }
 
-ContextState::ContextUpdateResult ContextState::handle_wheel_event(Web::MouseEvent const& event, Optional<MonotonicTime> now_for_testing)
+ContextState::ContextUpdateResult ContextState::handle_wheel_event(Web::MouseEvent const& event, bool is_first_wheel_event_with_delta, WheelEventListenerGate const& listener_gate, Optional<MonotonicTime> now_for_testing)
 {
     VERIFY(event.type == Web::MouseEvent::Type::MouseWheel);
+    if (!presents_to_client())
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::ContextNotPresenting);
     auto now = now_for_testing.value_or(MonotonicTime::now());
     m_scroll_fling_controller.note_wheel_event(event, now);
-    return scroll_for_wheel_event(event, now);
+    return scroll_for_wheel_event(event, is_first_wheel_event_with_delta, listener_gate, Compositing::AsyncScrollOperationTracking::No, now);
+}
+
+ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_from_main_thread(Web::MouseEvent const& event, bool is_first_wheel_event_with_delta, WheelEventListenerGate const& listener_gate, Compositing::AsyncScrollOperationTracking operation_tracking, MonotonicTime now)
+{
+    VERIFY(event.type == Web::MouseEvent::Type::MouseWheel);
+    return scroll_for_wheel_event(event, is_first_wheel_event_with_delta, listener_gate, operation_tracking, now);
 }
 
 static Gfx::FloatPoint wheel_event_position(Web::MouseEvent const& event)
@@ -1515,32 +1417,59 @@ Gfx::FloatPoint ContextState::wheel_event_delta_in_device_pixels(Web::MouseEvent
         .scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
 }
 
-bool ContextState::step_continues_touchpad_gesture_the_page_let_through(Optional<Compositing::SpatialNodeIndex> const& latched_scroll_node_index, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase) const
+ContextState::WheelEventListenerGate ContextState::wheel_event_listener_gate(Optional<u64> gesture_id) const
 {
-    return latched_scroll_node_index.has_value() && presents_to_client() && m_wheel_gesture_routing.page_let_latched_touchpad_gesture_through(wheel_delta_precision, scroll_gesture_phase);
+    return {
+        .page_let_the_gesture_through = m_wheel_gesture_routing.page_let_gesture_through(gesture_id),
+        .reason_to_hold_latched_steps_back = m_wheel_gesture_routing.reason_to_hold_latched_steps_back(gesture_id),
+    };
 }
 
-Web::WheelGestureMark ContextState::note_wheel_event_from_ui(Web::MouseEvent const& event, Optional<MonotonicTime> now_for_testing)
+void ContextState::note_wheel_event_left_to_the_page(Web::MouseEvent const& event)
+{
+    m_wheel_gesture_routing.note_delta_left_to_the_page(WheelStep::for_wheel_event(event, {}, Compositing::AsyncScrollOperationTracking::No).delta_in_css_pixels);
+}
+
+ContextState::NotedWheelEvent ContextState::note_wheel_event(Web::MouseEvent const& event, MonotonicTime now)
 {
     VERIFY(event.type == Web::MouseEvent::Type::MouseWheel);
+    // The end of the gesture before this one may never have arrived.
+    auto noted = m_wheel_gesture_routing.note_wheel_event(event, wheel_event_position(event), m_async_scroll_tree, now);
+    if (noted.starts_gesture)
+        m_elastic_overscroll_controller.end_gesture(now);
+    return {
+        .wheel_gesture_mark = {
+            .gesture_id = m_wheel_gesture_routing.gesture_id().value(),
+            .lasts_until_fingers_lift = m_wheel_gesture_routing.gesture_lasts_until_fingers_lift(),
+            .step_number = noted.step_number,
+        },
+        .is_first_wheel_event_with_delta = noted.is_first_wheel_event_with_delta,
+    };
+}
+
+ContextState::NotedWheelEvent ContextState::note_wheel_event_from_ui(Web::MouseEvent const& event, Optional<MonotonicTime> now_for_testing)
+{
     auto now = now_for_testing.value_or(MonotonicTime::now());
     auto phase = event.scroll_gesture_phase;
+    auto noted = note_wheel_event(event, now);
 
-    if (phase == Web::ScrollGesturePhase::Momentum)
+    if (phase == Web::ScrollGesturePhase::Momentum) {
         m_last_reported_scroll_momentum_step = event.clone_without_browser_data();
-    else
+        m_last_reported_scroll_momentum_step->wheel_gesture_mark = noted.wheel_gesture_mark;
+    } else {
         m_last_reported_scroll_momentum_step.clear();
-
-    // The end of the gesture before this one may never have arrived.
-    bool starts_gesture = m_wheel_gesture_routing.note_wheel_event_from_ui(event, wheel_event_position(event), m_async_scroll_tree, now);
-    if (starts_gesture)
-        m_elastic_overscroll_controller.end_gesture(now);
+    }
 
     // A stretch is released with the velocity of the steps as they arrived from the UI, not as they were scrolled.
     // Fling steps are not timed here, which leaves them out of the velocity; no platform both flings and stretches.
     if (wheel_step_can_stretch_elastically(event.wheel_delta_precision, phase))
         m_elastic_overscroll_controller.note_step_from_ui(wheel_event_delta_in_device_pixels(event).scaled(1.0f / m_scene.visual_viewport_magnification()), now);
-    return { .continues_gesture = !starts_gesture, .lasts_until_fingers_lift = m_wheel_gesture_routing.gesture_lasts_until_fingers_lift() };
+    return noted;
+}
+
+ContextState::NotedWheelEvent ContextState::note_wheel_event_from_main_thread(Web::MouseEvent const& event, MonotonicTime now)
+{
+    return note_wheel_event(event, now);
 }
 
 bool ContextState::start_scroll_fling_if_flicked(Web::MouseEvent const& gesture_end_event, Optional<MonotonicTime> now_for_testing)
@@ -1610,9 +1539,11 @@ Optional<Web::MouseEvent> ContextState::end_scroll_fling()
     return m_scroll_fling_controller.end();
 }
 
-ContextState::ContextUpdateResult ContextState::scroll_for_fling_step(Web::MouseEvent const& event, MonotonicTime now)
+ContextState::ContextUpdateResult ContextState::scroll_for_fling_step(Web::MouseEvent const& event, WheelEventListenerGate const& listener_gate, MonotonicTime now)
 {
-    return scroll_for_wheel_event(event, now);
+    if (!presents_to_client())
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::ContextNotPresenting);
+    return scroll_for_wheel_event(event, false, listener_gate, Compositing::AsyncScrollOperationTracking::No, now);
 }
 
 void ContextState::end_scroll_fling_on_next_step()
@@ -1620,69 +1551,134 @@ void ContextState::end_scroll_fling_on_next_step()
     m_scroll_fling_controller.end_on_next_step();
 }
 
-ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event(Web::MouseEvent const& event, MonotonicTime now)
+ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event(Web::MouseEvent const& event, bool is_first_wheel_event_with_delta, WheelEventListenerGate const& listener_gate, Compositing::AsyncScrollOperationTracking operation_tracking, MonotonicTime now)
 {
-    if (!presents_to_client())
-        return ContextUpdateResult::declined(Web::InputRoutingDecision::ContextNotPresenting);
-
-    auto position = wheel_event_position(event);
+    auto step = WheelStep::for_wheel_event(event, m_wheel_gesture_routing.gesture_id(), operation_tracking);
     // The end of a gesture lets go of the scroller it stretched even if the context has stopped taking wheel events.
-    if (event.scroll_gesture_phase == Web::ScrollGesturePhase::Ended)
+    if (step.scroll_gesture_phase == Web::ScrollGesturePhase::Ended)
         m_elastic_overscroll_controller.end_gesture(now);
 
-    auto latch = resolve_wheel_scroll_latch(event.scroll_gesture_phase);
+    auto latch = resolve_wheel_scroll_latch(step.scroll_gesture_phase, step.gesture_id);
     if (latch.nested_context_id.has_value())
         return { .nested_context_wheel_step = NestedContextWheelStep { .context_id = *latch.nested_context_id } };
+    if (latch.scroll_node_index.has_value()) {
+        // A blocking listener added during the gesture holds its later steps back until the page lets one through.
+        if (listener_gate.reason_to_hold_latched_steps_back.has_value())
+            return ContextUpdateResult::declined(*listener_gate.reason_to_hold_latched_steps_back);
+        auto admission = listener_gate.page_let_the_gesture_through ? WheelStepAdmission::LetThroughByThePage : WheelStepAdmission::ByThisPage;
+        return scroll_for_wheel_step_in_this_context(step, latch.scroll_node_index, Compositing::NestedContextRegions::LeaveToMainThread, admission, {}, now);
+    }
+
+    if (listener_gate.page_let_the_gesture_through)
+        return scroll_for_wheel_step_in_this_context(step, {}, Compositing::NestedContextRegions::Ignore, WheelStepAdmission::LetThroughByThePage, {}, now);
 
     // The first step of a gesture over the content of a nested context goes to that context. A gesture whose first step
     // went elsewhere is not handed to a nested context that comes under the pointer later.
     auto nested_context_regions = Compositing::NestedContextRegions::LeaveToMainThread;
-    bool may_hand_step_to_nested_context = !latch.scroll_node_index.has_value()
-        && m_wheel_gesture_routing.is_first_wheel_event_with_delta(event.id)
-        && may_hand_first_wheel_steps_to_nested_contexts();
-    if (may_hand_step_to_nested_context) {
+    if (is_first_wheel_event_with_delta && may_hand_first_wheel_steps_to_nested_contexts()) {
         nested_context_regions = Compositing::NestedContextRegions::HandToNestedContext;
-        if (auto hit = nested_context_for_wheel_at(position); hit.has_value())
+        if (auto hit = nested_context_for_wheel_at(step.position); hit.has_value())
             return { .nested_context_wheel_step = NestedContextWheelStep { .context_id = hit->child_context_id, .hit = hit } };
     }
-    return scroll_for_wheel_event_in_this_context(event, latch.scroll_node_index, nested_context_regions, now);
+    return scroll_for_wheel_step_in_this_context(step, {}, nested_context_regions, WheelStepAdmission::ByThisPage, {}, now);
 }
 
-ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_passed_on_by_nested_context(Web::MouseEvent const& event, MonotonicTime now)
+ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_passed_on_by_nested_context(Web::MouseEvent const& event, Compositing::AsyncScrollOperationTracking operation_tracking, MonotonicTime now)
 {
-    return scroll_for_wheel_event_in_this_context(event, {}, Compositing::NestedContextRegions::Ignore, now);
+    auto step = WheelStep::for_wheel_event(event, m_wheel_gesture_routing.gesture_id(), operation_tracking);
+    return scroll_for_wheel_step_in_this_context(step, {}, Compositing::NestedContextRegions::Ignore, WheelStepAdmission::PassedOnByNestedContext, {}, now);
 }
 
-ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_in_this_context(Web::MouseEvent const& event, Optional<Compositing::SpatialNodeIndex> latched_scroll_node_index, Compositing::NestedContextRegions nested_context_regions, MonotonicTime now)
+ContextState::ContextUpdateResult ContextState::scroll_for_first_wheel_step_the_page_let_through(WheelStep const& step, ReadonlySpan<Web::AsyncScrollNodeStableID> scroll_chain, MonotonicTime now)
 {
-    auto position = wheel_event_position(event);
-    auto delta = wheel_event_delta_in_device_pixels(event);
+    return scroll_for_wheel_step_in_this_context(step, {}, Compositing::NestedContextRegions::Ignore, WheelStepAdmission::LetThroughByThePage, scroll_chain, now);
+}
 
-    // A page without scroll nodes still has a visual viewport to pan once it is zoomed in.
-    auto can_pan_zoomed_visual_viewport = m_wheel_gesture_routing.admission() == Compositing::WheelRoutingAdmission::NoScrollNode
-        && m_scene.visual_viewport_scale().value_or(1.0f) > 1.0f;
-    if (!m_wheel_gesture_routing.admits_async_wheel() && !can_pan_zoomed_visual_viewport
-        && !step_continues_touchpad_gesture_the_page_let_through(latched_scroll_node_index, event.wheel_delta_precision, event.scroll_gesture_phase))
-        return ContextUpdateResult::declined(Compositing::input_routing_decision_for_wheel_step_not_admitted_by(m_wheel_gesture_routing.admission()));
+Optional<ContextState::ContextUpdateResult> ContextState::scroll_for_latched_wheel_step_the_page_let_through(WheelStep const& step, MonotonicTime now)
+{
+    auto latch = resolve_wheel_scroll_latch(step.scroll_gesture_phase, step.gesture_id);
+    if (!latch.scroll_node_index.has_value())
+        return {};
+    return scroll_for_wheel_step_in_this_context(step, latch.scroll_node_index, Compositing::NestedContextRegions::Ignore, WheelStepAdmission::LetThroughByThePage, {}, now);
+}
 
-    m_scroll_snap_controller.note_gesture_phase(event.scroll_gesture_phase);
+ContextState::ContextUpdateResult ContextState::scroll_for_overtaken_wheel_step(WheelStep const& step, ReadonlySpan<Web::AsyncScrollNodeStableID> scroll_chain, MonotonicTime now)
+{
+    if (!m_has_async_scrolling_state)
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::NoAsyncScrollingState);
+    auto delta = step.delta_in_css_pixels.scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
+    if (delta.is_zero())
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::StepOvertaken);
+    auto scroll_target = route_first_wheel_step(step.position, delta, step.wheel_delta_precision, Compositing::WheelStepDispatch::DispatchedAndNotCanceled, Compositing::NestedContextRegions::Ignore, scroll_chain);
+    if (!scroll_target.scroll_node_index.has_value())
+        return ContextUpdateResult::declined(Web::InputRoutingDecision::StepOvertaken);
 
-    if (event.scroll_gesture_phase == Web::ScrollGesturePhase::Ended && delta.is_zero()) {
-        if (!snap_at_gesture_end(now).has_value())
-            return ContextUpdateResult::declined(Web::InputRoutingDecision::GestureEndWithNothingToSnap);
+    m_scroll_snap_controller.note_gesture_phase(step.scroll_gesture_phase);
+    auto node_scroll = scroll_node_by_wheel_delta(*scroll_target.scroll_node_index, delta, step.wheel_delta_precision, step.scroll_gesture_phase, step.operation_tracking, m_async_scrolling_viewport_rect, now, Compositing::ScrollChaining::ToScrollableAncestors);
+    auto const& outcome = node_scroll.outcome;
+    return {
+        .accepted = true,
+        .frame_to_present = outcome.viewport_rect_to_present.map([](auto const& rect) { return PendingFrame::repainting_changes(rect); }),
+        .should_request_rendering_update = outcome.viewport_rect_to_present.has_value(),
+        .routing_decision = Web::InputRoutingDecision::StepOvertaken,
+        .tracked_scroll_operation = tracked_scroll_operation(step.operation_tracking, outcome.operation_id),
+    };
+}
+
+Optional<ContextState::TrackedScrollOperation> ContextState::tracked_scroll_operation(Compositing::AsyncScrollOperationTracking operation_tracking, Optional<Compositing::AsyncScrollOperationID> operation_id) const
+{
+    if (operation_tracking == Compositing::AsyncScrollOperationTracking::No || !operation_id.has_value())
+        return {};
+    return TrackedScrollOperation { .context_id = m_context_id, .operation_id = *operation_id };
+}
+
+ContextState::ContextUpdateResult ContextState::scroll_for_wheel_step_in_this_context(WheelStep const& step, Optional<Compositing::SpatialNodeIndex> latched_scroll_node_index, Compositing::NestedContextRegions nested_context_regions, WheelStepAdmission admission, ReadonlySpan<Web::AsyncScrollNodeStableID> scroll_chain, MonotonicTime now)
+{
+    auto delta = step.delta_in_css_pixels.scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
+    bool is_first_step_of_gesture = !latched_scroll_node_index.has_value();
+    auto found_nothing_to_scroll = [&](Web::InputRoutingDecision decision) {
+        bool there_is_nothing_to_scroll = first_is_one_of(decision, Web::InputRoutingDecision::NoScrollTarget, Web::InputRoutingDecision::NoScrollNode, Web::InputRoutingDecision::GestureEndWithNothingToSnap);
+        if (admission == WheelStepAdmission::LetThroughByThePage && there_is_nothing_to_scroll)
+            return ContextUpdateResult { .accepted = true, .routing_decision = decision };
+        return ContextUpdateResult::declined(decision);
+    };
+
+    if (is_first_step_of_gesture) {
+        auto routing_admission = m_wheel_gesture_routing.admission();
+        // A page without scroll nodes still has a visual viewport to pan once it is zoomed in.
+        auto can_pan_zoomed_visual_viewport = routing_admission == Compositing::WheelRoutingAdmission::NoScrollNode
+            && m_scene.visual_viewport_scale().value_or(1.0f) > 1.0f;
+        // Only the listeners of the page that sees the step may hold it back.
+        bool is_admitted = routing_admission == Compositing::WheelRoutingAdmission::Accepted
+            || (admission != WheelStepAdmission::ByThisPage && first_is_one_of(routing_admission, Compositing::WheelRoutingAdmission::BlockingWheelEventListeners, Compositing::WheelRoutingAdmission::StaleWheelEventListeners));
+        if (!is_admitted && !can_pan_zoomed_visual_viewport) {
+            auto decision = Compositing::input_routing_decision_for_wheel_step_not_admitted_by(routing_admission);
+            if (routing_admission == Compositing::WheelRoutingAdmission::NoScrollNode)
+                return found_nothing_to_scroll(decision);
+            return ContextUpdateResult::declined(decision);
+        }
+    }
+
+    m_scroll_snap_controller.note_gesture_phase(step.scroll_gesture_phase);
+
+    if (step.scroll_gesture_phase == Web::ScrollGesturePhase::Ended && delta.is_zero()) {
+        auto operation_id = snap_at_gesture_end(now);
+        if (!operation_id.has_value())
+            return found_nothing_to_scroll(Web::InputRoutingDecision::GestureEndWithNothingToSnap);
         return {
             .accepted = true,
             .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
             .should_request_rendering_update = true,
             .routing_decision = Web::InputRoutingDecision::SnappedAtGestureEnd,
+            .tracked_scroll_operation = tracked_scroll_operation(step.operation_tracking, operation_id),
         };
     }
 
-    // Whether a gesture scrolls here or on the main thread is decided by its first step; the steps of a latched
-    // gesture are not held back by regions the cursor moves over later.
-    bool is_first_step_of_gesture = !latched_scroll_node_index.has_value();
-    if (is_first_step_of_gesture) {
-        auto initial_scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(m_scene.visual_context_tree_for_compositing(), position, delta, {}, Compositing::WheelStepDispatch::NotYetDispatched, nested_context_regions);
+    // Whether a gesture waits for the page is decided by its first step; the steps of a latched gesture are not held
+    // back by regions the cursor moves over later.
+    auto wheel_step_dispatch = admission == WheelStepAdmission::ByThisPage ? Compositing::WheelStepDispatch::NotYetDispatched : Compositing::WheelStepDispatch::DispatchedAndNotCanceled;
+    if (is_first_step_of_gesture && wheel_step_dispatch == Compositing::WheelStepDispatch::NotYetDispatched) {
+        auto initial_scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(m_scene.visual_context_tree_for_compositing(), step.position, delta, {}, wheel_step_dispatch, nested_context_regions);
         if (initial_scroll_target.is_blocked_by_a_region())
             return ContextUpdateResult::declined(Compositing::input_routing_decision_for_first_wheel_step(initial_scroll_target.outcome));
     }
@@ -1701,7 +1697,7 @@ ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_in_this_c
     // for as long as the gesture only pans.
     auto routing_decision = Web::InputRoutingDecision::ContinuedLatch;
     if (is_first_step_of_gesture) {
-        auto latch_attempt = hit_test_and_latch_wheel_gesture(position, delta.scaled(1.0f / m_scene.visual_viewport_magnification()), event.wheel_delta_precision, event.scroll_gesture_phase, {}, Compositing::WheelStepDispatch::NotYetDispatched, nested_context_regions);
+        auto latch_attempt = route_and_latch_wheel_gesture(step.position, delta.scaled(1.0f / m_scene.visual_viewport_magnification()), step.wheel_delta_precision, step.scroll_gesture_phase, step.gesture_id, wheel_step_dispatch, nested_context_regions, scroll_chain);
         latched_scroll_node_index = latch_attempt.latched_scroll_node_index;
         routing_decision = latch_attempt.decision;
     }
@@ -1709,7 +1705,7 @@ ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_in_this_c
     // A zoomed page still pans its visual viewport by a gesture that no scroller takes.
     if (!latched_scroll_node_index.has_value()) {
         if (pan_visual_viewport_by(delta).is_zero())
-            return ContextUpdateResult::declined(routing_decision);
+            return found_nothing_to_scroll(routing_decision);
         return {
             .accepted = true,
             .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
@@ -1719,13 +1715,14 @@ ContextState::ContextUpdateResult ContextState::scroll_for_wheel_event_in_this_c
     }
 
     auto scroll_chaining = is_first_step_of_gesture ? Compositing::ScrollChaining::ToScrollableAncestors : Compositing::ScrollChaining::None;
-    auto outcome = perform_wheel_scroll_of_node(*latched_scroll_node_index, delta, event.wheel_delta_precision, event.scroll_gesture_phase, Compositing::AsyncScrollOperationTracking::No, m_async_scrolling_viewport_rect, now, scroll_chaining, VisualViewportPanning::BeforeScrolling);
+    auto outcome = perform_wheel_scroll_of_node(*latched_scroll_node_index, delta, step.wheel_delta_precision, step.scroll_gesture_phase, step.operation_tracking, m_async_scrolling_viewport_rect, now, scroll_chaining, VisualViewportPanning::BeforeScrolling);
     return {
         .accepted = true,
         .frame_to_present = outcome.viewport_rect_to_present.map([](auto const& rect) { return PendingFrame::repainting_changes(rect); }),
         .should_request_rendering_update = outcome.viewport_rect_to_present.has_value() && !outcome.only_elastic_overscroll_changed,
         .routing_decision = routing_decision,
         .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
+        .tracked_scroll_operation = tracked_scroll_operation(step.operation_tracking, outcome.operation_id),
     };
 }
 
@@ -1743,30 +1740,38 @@ Optional<Compositing::NestedContextHit> ContextState::nested_context_for_wheel_a
     return m_async_scroll_tree.nested_context_for_wheel_at(m_scene.visual_context_tree_for_compositing(), position);
 }
 
-void ContextState::latch_wheel_gesture_to_nested_context(Web::CompositorContextId nested_context_id, Optional<Web::AsyncScrollNodeStableID> scroller, Web::MouseEvent const& event)
+void ContextState::latch_wheel_gesture_to_nested_context(Web::CompositorContextId nested_context_id, Optional<Web::AsyncScrollNodeStableID> scroller, Web::ScrollGesturePhase scroll_gesture_phase)
 {
-    m_wheel_gesture_routing.latch_to_nested_context(nested_context_id, scroller, event.scroll_gesture_phase);
+    m_wheel_gesture_routing.latch_to_nested_context(nested_context_id, scroller, scroll_gesture_phase, m_wheel_gesture_routing.gesture_id());
 }
 
-ContextState::WheelStepFromContainingContext ContextState::WheelStepFromContainingContext::for_wheel_event(Web::MouseEvent const& event)
+Optional<Gfx::FloatPoint> ContextState::position_of_nested_context_position(Web::CompositorContextId nested_context_id, Gfx::FloatPoint position_in_nested_context, Gfx::IntSize nested_context_viewport_size)
+{
+    if (!m_has_async_scrolling_state)
+        return {};
+    return m_async_scroll_tree.position_of_nested_context_position(nested_context_id, position_in_nested_context, nested_context_viewport_size.to_type<float>(), m_scene.visual_context_tree_for_compositing());
+}
+
+ContextState::WheelStep ContextState::WheelStep::for_wheel_event(Web::MouseEvent const& event, Optional<u64> gesture_id, Compositing::AsyncScrollOperationTracking operation_tracking)
 {
     Gfx::FloatPoint delta_in_css_pixels { static_cast<float>(event.wheel_delta_x), static_cast<float>(event.wheel_delta_y) };
     if (event.modifiers & Web::UIEvents::KeyModifier::Mod_Shift)
         delta_in_css_pixels = { delta_in_css_pixels.y(), delta_in_css_pixels.x() };
     return {
-        .position = {},
+        .position = wheel_event_position(event),
         .delta_in_css_pixels = delta_in_css_pixels,
         .wheel_delta_precision = event.wheel_delta_precision,
         .scroll_gesture_phase = event.scroll_gesture_phase,
-        .modifiers = event.modifiers,
+        .gesture_id = gesture_id,
+        .operation_tracking = operation_tracking,
     };
 }
 
-ContextState::FirstWheelStepRoute ContextState::route_first_wheel_step_from_containing_context(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels, Web::WheelDeltaPrecision wheel_delta_precision, Compositing::NestedContextRegions nested_context_regions)
+ContextState::FirstWheelStepRoute ContextState::route_first_wheel_step_from_containing_context(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels, Web::WheelDeltaPrecision wheel_delta_precision, Compositing::NestedContextRegions nested_context_regions, WheelStepAdmission admission, ReadonlySpan<Web::AsyncScrollNodeStableID> scroll_chain)
 {
     using Kind = FirstWheelStepRoute::Kind;
-    auto admission = m_wheel_gesture_routing.admission();
-    if (!m_has_async_scrolling_state || admission == Compositing::WheelRoutingAdmission::NoAsyncScrollingState)
+    auto routing_admission = m_wheel_gesture_routing.admission();
+    if (!m_has_async_scrolling_state || routing_admission == Compositing::WheelRoutingAdmission::NoAsyncScrollingState)
         return { Kind::Declined, Web::InputRoutingDecision::NoAsyncScrollingState };
 
     // A document's wheel event listeners never see the wheel events over a document nested in it.
@@ -1775,14 +1780,13 @@ ContextState::FirstWheelStepRoute ContextState::route_first_wheel_step_from_cont
         if (auto hit = m_async_scroll_tree.nested_context_for_wheel_at(visual_context_tree, position); hit.has_value())
             return { .kind = Kind::NestedContext, .decision = Web::InputRoutingDecision::HandedToNestedContext, .nested_context_hit = hit };
     }
-    if (first_is_one_of(admission, Compositing::WheelRoutingAdmission::BlockingWheelEventListeners, Compositing::WheelRoutingAdmission::StaleWheelEventListeners))
-        return { Kind::Declined, Compositing::input_routing_decision_for_wheel_step_not_admitted_by(admission) };
+    bool listeners_of_this_page_see_the_step = admission == WheelStepAdmission::ByThisPage;
+    if (listeners_of_this_page_see_the_step && first_is_one_of(routing_admission, Compositing::WheelRoutingAdmission::BlockingWheelEventListeners, Compositing::WheelRoutingAdmission::StaleWheelEventListeners))
+        return { Kind::Declined, Compositing::input_routing_decision_for_wheel_step_not_admitted_by(routing_admission) };
 
     auto delta = delta_in_css_pixels.scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
-    Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> in_flight_destination_for;
-    if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete)
-        in_flight_destination_for = [this](auto stable_node_id) { return in_flight_wheel_destination(stable_node_id); };
-    auto scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(visual_context_tree, position, delta, in_flight_destination_for, Compositing::WheelStepDispatch::NotYetDispatched, nested_context_regions);
+    auto wheel_step_dispatch = listeners_of_this_page_see_the_step ? Compositing::WheelStepDispatch::NotYetDispatched : Compositing::WheelStepDispatch::DispatchedAndNotCanceled;
+    auto scroll_target = route_first_wheel_step(position, delta, wheel_delta_precision, wheel_step_dispatch, nested_context_regions, scroll_chain);
     auto scroller_of = [&](Optional<Compositing::SpatialNodeIndex> scroll_node_index) {
         return scroll_node_index.map([&](auto index) { return m_async_scroll_tree.scroll_node_for_index(index)->stable_node_id; });
     };
@@ -1801,30 +1805,26 @@ ContextState::FirstWheelStepRoute ContextState::route_first_wheel_step_from_cont
     return { .kind = Kind::Kept, .decision = Web::InputRoutingDecision::ScrollKeptByOverscrollBehavior, .scroll_node_index = scroll_node_index_keeping_the_scroll, .scroller = scroller_of(scroll_node_index_keeping_the_scroll) };
 }
 
-ContextState::ContextUpdateResult ContextState::take_first_wheel_step_from_containing_context(FirstWheelStepRoute const& route, WheelStepFromContainingContext const& step, MonotonicTime now)
+ContextState::ContextUpdateResult ContextState::take_first_wheel_step_from_containing_context(FirstWheelStepRoute const& route, WheelStep const& step, MonotonicTime now)
 {
     VERIFY(first_is_one_of(route.kind, FirstWheelStepRoute::Kind::ScrollNode, FirstWheelStepRoute::Kind::Kept));
     if (route.kind == FirstWheelStepRoute::Kind::Kept) {
         if (route.scroller.has_value())
-            m_wheel_gesture_routing.latch(*route.scroller, step.scroll_gesture_phase);
+            m_wheel_gesture_routing.latch(*route.scroller, step.scroll_gesture_phase, step.gesture_id);
         else
-            m_wheel_gesture_routing.latch_keeping_steps(step.scroll_gesture_phase);
+            m_wheel_gesture_routing.latch_keeping_steps(step.scroll_gesture_phase, step.gesture_id);
         return { .accepted = true, .routing_decision = route.decision, .routed_scroller = route.scroller };
     }
-    m_wheel_gesture_routing.latch(*route.scroller, step.scroll_gesture_phase);
+    m_wheel_gesture_routing.latch(*route.scroller, step.scroll_gesture_phase, step.gesture_id);
     return take_wheel_step_from_containing_context(*route.scroll_node_index, route.decision, step, Compositing::ScrollChaining::ToScrollableAncestors, now);
 }
 
-ContextState::ContextUpdateResult ContextState::take_latched_wheel_step_from_containing_context(WheelStepFromContainingContext const& step, MonotonicTime now)
+ContextState::ContextUpdateResult ContextState::take_latched_wheel_step_from_containing_context(WheelStep const& step, WheelStepAdmission admission, MonotonicTime now)
 {
     if (!m_has_async_scrolling_state)
         return ContextUpdateResult::declined(Web::InputRoutingDecision::NoAsyncScrollingState);
-    // A blocking listener added during the gesture holds its later steps back until a display list shows where it is.
-    auto admission = m_wheel_gesture_routing.admission();
-    if (first_is_one_of(admission, Compositing::WheelRoutingAdmission::BlockingWheelEventListeners, Compositing::WheelRoutingAdmission::StaleWheelEventListeners))
-        return ContextUpdateResult::declined(Compositing::input_routing_decision_for_wheel_step_not_admitted_by(admission));
 
-    auto latch = m_wheel_gesture_routing.resolve_latch(m_async_scroll_tree, m_scene.current_visual_context_tree(), step.scroll_gesture_phase);
+    auto latch = m_wheel_gesture_routing.resolve_latch(m_async_scroll_tree, m_scene.current_visual_context_tree(), step.scroll_gesture_phase, step.gesture_id);
     if (latch.keeps_steps)
         return { .accepted = true, .routing_decision = Web::InputRoutingDecision::ScrollKeptByOverscrollBehavior };
     if (!latch.scroll_node_index.has_value())
@@ -1832,30 +1832,36 @@ ContextState::ContextUpdateResult ContextState::take_latched_wheel_step_from_con
 
     if (step.scroll_gesture_phase == Web::ScrollGesturePhase::Ended && step.delta_in_css_pixels.is_zero()) {
         m_scroll_snap_controller.note_gesture_phase(step.scroll_gesture_phase);
-        if (!snap_at_gesture_end(now).has_value())
+        auto operation_id = snap_at_gesture_end(now);
+        if (!operation_id.has_value()) {
+            if (admission == WheelStepAdmission::LetThroughByThePage)
+                return { .accepted = true, .routing_decision = Web::InputRoutingDecision::GestureEndWithNothingToSnap };
             return ContextUpdateResult::declined(Web::InputRoutingDecision::GestureEndWithNothingToSnap);
+        }
         return {
             .accepted = true,
             .frame_to_present = PendingFrame::repainting_changes(m_async_scrolling_viewport_rect),
             .should_request_rendering_update = true,
             .routing_decision = Web::InputRoutingDecision::SnappedAtGestureEnd,
             .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
+            .tracked_scroll_operation = tracked_scroll_operation(step.operation_tracking, operation_id),
         };
     }
     return take_wheel_step_from_containing_context(*latch.scroll_node_index, Web::InputRoutingDecision::ContinuedLatch, step, Compositing::ScrollChaining::None, now);
 }
 
-ContextState::ContextUpdateResult ContextState::take_wheel_step_from_containing_context(Compositing::SpatialNodeIndex scroll_node_index, Web::InputRoutingDecision decision, WheelStepFromContainingContext const& step, Compositing::ScrollChaining scroll_chaining, MonotonicTime now)
+ContextState::ContextUpdateResult ContextState::take_wheel_step_from_containing_context(Compositing::SpatialNodeIndex scroll_node_index, Web::InputRoutingDecision decision, WheelStep const& step, Compositing::ScrollChaining scroll_chaining, MonotonicTime now)
 {
     m_scroll_snap_controller.note_gesture_phase(step.scroll_gesture_phase);
     auto delta = step.delta_in_css_pixels.scaled(static_cast<float>(m_async_scroll_tree.device_pixels_per_css_pixel()));
-    auto outcome = perform_wheel_scroll_of_node(scroll_node_index, delta, step.wheel_delta_precision, step.scroll_gesture_phase, Compositing::AsyncScrollOperationTracking::No, m_async_scrolling_viewport_rect, now, scroll_chaining, VisualViewportPanning::No);
+    auto outcome = perform_wheel_scroll_of_node(scroll_node_index, delta, step.wheel_delta_precision, step.scroll_gesture_phase, step.operation_tracking, m_async_scrolling_viewport_rect, now, scroll_chaining, VisualViewportPanning::No);
     return {
         .accepted = true,
         .frame_to_present = outcome.viewport_rect_to_present.map([](auto const& rect) { return PendingFrame::repainting_changes(rect); }),
         .should_request_rendering_update = outcome.viewport_rect_to_present.has_value() && !outcome.only_elastic_overscroll_changed,
         .routing_decision = decision,
         .routed_scroller = m_wheel_gesture_routing.latched_scroller(),
+        .tracked_scroll_operation = tracked_scroll_operation(step.operation_tracking, outcome.operation_id),
     };
 }
 
@@ -2219,20 +2225,29 @@ void ContextState::store_pending_async_scroll_offsets(
         m_async_scroll_update_outbox.complete_operation(*operation_id);
 }
 
-WheelGestureRouting::ResolvedLatch ContextState::resolve_wheel_scroll_latch(Web::ScrollGesturePhase scroll_gesture_phase)
+WheelGestureRouting::ResolvedLatch ContextState::resolve_wheel_scroll_latch(Web::ScrollGesturePhase scroll_gesture_phase, Optional<u64> gesture_id)
 {
     // Only a hit test takes a latch, and it needs the tree of an installed display list.
     if (!m_wheel_gesture_routing.has_latch())
         return {};
-    return m_wheel_gesture_routing.resolve_latch(m_async_scroll_tree, m_scene.current_visual_context_tree(), scroll_gesture_phase);
+    return m_wheel_gesture_routing.resolve_latch(m_async_scroll_tree, m_scene.current_visual_context_tree(), scroll_gesture_phase, gesture_id);
 }
 
-ContextState::WheelGestureLatchAttempt ContextState::hit_test_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Optional<Web::UniqueNodeID> expected_document_id, Compositing::WheelStepDispatch wheel_step_dispatch, Compositing::NestedContextRegions nested_context_regions)
+Compositing::WheelHitTestResult ContextState::route_first_wheel_step(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Compositing::WheelStepDispatch wheel_step_dispatch, Compositing::NestedContextRegions nested_context_regions, ReadonlySpan<Web::AsyncScrollNodeStableID> scroll_chain)
 {
     Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> in_flight_destination_for;
     if (wheel_delta_precision == Web::WheelDeltaPrecision::Discrete)
         in_flight_destination_for = [this](auto stable_node_id) { return in_flight_wheel_destination(stable_node_id); };
-    auto scroll_target = m_async_scroll_tree.hit_test_scroll_node_for_wheel(m_scene.visual_context_tree_for_compositing(), position, delta, in_flight_destination_for, wheel_step_dispatch, nested_context_regions);
+    for (auto stable_node_id : scroll_chain) {
+        if (auto scroll_node_index = m_async_scroll_tree.scroll_node_index_for_stable_id(stable_node_id); scroll_node_index.has_value())
+            return m_async_scroll_tree.hit_test_result_for_scroll_node(*scroll_node_index, delta, in_flight_destination_for);
+    }
+    return m_async_scroll_tree.hit_test_scroll_node_for_wheel(m_scene.visual_context_tree_for_compositing(), position, delta, in_flight_destination_for, wheel_step_dispatch, nested_context_regions);
+}
+
+ContextState::WheelGestureLatchAttempt ContextState::route_and_latch_wheel_gesture(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::WheelDeltaPrecision wheel_delta_precision, Web::ScrollGesturePhase scroll_gesture_phase, Optional<u64> gesture_id, Compositing::WheelStepDispatch wheel_step_dispatch, Compositing::NestedContextRegions nested_context_regions, ReadonlySpan<Web::AsyncScrollNodeStableID> scroll_chain)
+{
+    auto scroll_target = route_first_wheel_step(position, delta, wheel_delta_precision, wheel_step_dispatch, nested_context_regions, scroll_chain);
     if (scroll_target.is_blocked_by_a_region())
         return { Compositing::input_routing_decision_for_first_wheel_step(scroll_target.outcome) };
 
@@ -2249,11 +2264,9 @@ ContextState::WheelGestureLatchAttempt ContextState::hit_test_and_latch_wheel_ge
 
     if (!scroll_node_index_to_latch.has_value())
         return { Compositing::input_routing_decision_for_first_wheel_step(scroll_target.outcome) };
-    if (expected_document_id.has_value() && m_async_scroll_tree.document_id() != *expected_document_id)
-        return { Web::InputRoutingDecision::ScrollerInOtherDocument };
     auto const* node = m_async_scroll_tree.scroll_node_for_index(*scroll_node_index_to_latch);
     VERIFY(node);
-    m_wheel_gesture_routing.latch(node->stable_node_id, scroll_gesture_phase);
+    m_wheel_gesture_routing.latch(node->stable_node_id, scroll_gesture_phase, gesture_id);
     return { decision, scroll_node_index_to_latch };
 }
 

@@ -25,6 +25,7 @@ use crate::interpreter::vm::Vm;
 use crate::layout::cell::{CellHeader, Gc};
 use crate::layout::environment::DeclarativeEnvironment;
 pub use crate::layout::environment::Environment;
+use crate::layout::member::NullableMember;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::runtime::completion::ThrowCompletionOr;
@@ -111,10 +112,11 @@ pub const ENVIRONMENT_METHODS: EnvironmentMethods = EnvironmentMethods {
 
 define_cell!(Environment, Other);
 
-// SAFETY: The outer environment is the only cell an Environment holds.
+// SAFETY: The outer environment and the shape of a declarative environment are the cells an Environment holds.
 unsafe impl Trace for Environment {
     fn trace(&self, visitor: &mut Visitor) {
         self.outer.trace(visitor);
+        self.shape.trace(visitor);
     }
 }
 
@@ -127,12 +129,13 @@ impl Environment {
             permanently_screwed_by_eval: false.into(),
             declarative: is_declarative.into(),
             binding_values_are_inline: false.into(),
-            outer: outer_environment.into(),
+            outer: NullableMember::new(outer_environment),
+            shape: NullableMember::null(),
         }
     }
 
     pub fn class(&self) -> &'static Class {
-        self.header.class
+        self.header.class()
     }
 
     fn methods(&self) -> &'static EnvironmentMethods {
@@ -279,7 +282,7 @@ impl Value {
     /// The environment the value holds, which must be one.
     pub fn as_environment(self) -> Gc<Environment> {
         assert!(self.is_cell());
-        // SAFETY: The value holds a cell, and every cell starts with its class, which is checked below.
+        // SAFETY: The value holds a cell, whose block holds its class, which is checked below.
         let environment = unsafe { self.cell::<Environment>() };
         assert!(
             class_of(environment).is_subclass_of(Environment::CLASS),

@@ -2,6 +2,7 @@ ladybird_test_suite(LibGC)
 
 set(TEST_SOURCES
     TestBlockAllocator.cpp
+    TestCompressedPointer.cpp
     TestExternalEntityTable.cpp
     TestGCContainers.cpp
     TestGCEphemeron.cpp
@@ -10,6 +11,7 @@ set(TEST_SOURCES
     TestGCIdleCollection.cpp
     TestGCIncrementalSweep.cpp
     TestGCVisitor.cpp
+    TestMember.cpp
     TestNanBoxedValue.cpp
     TestPrimitiveStorage.cpp
 )
