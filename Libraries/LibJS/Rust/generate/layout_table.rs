@@ -186,6 +186,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
 
     w.section("Object flags");
     field!(w, "OBJECT_FLAGS", "Object.flags", "u16", Object, flags, 2, "nullable", "scalar");
+    field!(w, "OBJECT_CLASS_BITS", "Object.class_bits", "u8", Object, class_bits, 1, "nullable", "scalar");
     w.constant("OBJECT_FLAG_HAS_MAGICAL_LENGTH", object_flag::HAS_MAGICAL_LENGTH_PROPERTY);
     w.constant("OBJECT_FLAG_MAY_INTERFERE", object_flag::MAY_INTERFERE_WITH_INDEXED_PROPERTY_ACCESS);
     w.constant("OBJECT_FLAG_IS_TYPED_ARRAY", object_flag::IS_TYPED_ARRAY);
@@ -259,8 +260,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     offset!(w, "EXECUTABLE_ENVIRONMENT_COORDINATE_CACHES", ExecutableHead, environment_coordinate_caches);
     field!(w, "EXECUTABLE_REGISTERS_AND_LOCALS_COUNT", "Executable.registers_and_locals_count", "u32", ExecutableHead, registers_and_locals_count, 4, "nullable", "scalar", "slot_counts");
     field!(w, "EXECUTABLE_REGISTERS_AND_LOCALS_AND_CONSTANTS_COUNT", "Executable.registers_and_locals_and_constants_count", "u32", ExecutableHead, registers_and_locals_and_constants_count, 4, "nullable", "scalar", "slot_counts");
-    field!(w, "EXECUTABLE_ASM_CONSTANTS_SIZE", "Executable.asm_constants_size", "u64", ExecutableHead, asm_constants_size, 8, "nullable", "scalar", "constants");
-    field!(w, "EXECUTABLE_ASM_CONSTANTS_DATA", "Executable.asm_constants_data", "Sequence<Value>", ExecutableHead, asm_constants_data, 8, "nullable", "scalar", "constants");
+    field!(w, "EXECUTABLE_CONSTANTS_DATA", "Executable.constants_data", "Sequence<Value>", ExecutableHead, constants, 8, "nullable", "scalar");
     field!(w, "EXECUTABLE_TIER_UP_BUDGET", "Executable.tier_up_budget", "i32", ExecutableHead, tier_up_budget, 4, "nullable", "scalar");
     field!(w, "EXECUTABLE_JIT_COMPILE_STATE", "Executable.jit_compile_state", "u8", ExecutableHead, jit_compile_state, 1, "nullable", "scalar");
     w.constant("JIT_COMPILE_STATE_INSTALLED", JIT_COMPILE_STATE_INSTALLED);
@@ -329,7 +329,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     assert_eq!(align_of::<ExecutionContext>(), value_size);
     field!(w, "EXECUTION_CONTEXT_FUNCTION", "ExecutionContext.function", "Object", ExecutionContext, function, 8, "nullable", "cell", "function_and_realm");
     field!(w, "EXECUTION_CONTEXT_REALM", "ExecutionContext.realm", "Realm", ExecutionContext, realm, 8, "nullable", "cell", "function_and_realm");
-    field!(w, "EXECUTION_CONTEXT_SCRIPT_OR_MODULE", "ExecutionContext.script_or_module", "ScriptOrModule", ExecutionContext, script_or_module, 16, "nullable", "scalar");
+    field!(w, "EXECUTION_CONTEXT_SCRIPT_OR_MODULE", "ExecutionContext.script_or_module", "u64", ExecutionContext, script_or_module, 8, "nullable", "scalar");
     field!(w, "EXECUTION_CONTEXT_LEXICAL_ENVIRONMENT", "ExecutionContext.lexical_environment", "Environment", ExecutionContext, lexical_environment, 8, "nullable", "cell", "environments");
     field!(w, "EXECUTION_CONTEXT_VARIABLE_ENVIRONMENT", "ExecutionContext.variable_environment", "Environment", ExecutionContext, variable_environment, 8, "nullable", "cell", "environments");
     field!(w, "EXECUTION_CONTEXT_PRIVATE_ENVIRONMENT", "ExecutionContext.private_environment", "PrivateEnvironment", ExecutionContext, private_environment, 8, "nullable", "cell");
@@ -366,7 +366,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.line("field ExecutionContext.saved_lexical_environment Value EXECUTION_CONTEXT_SAVED_LEXICAL_ENVIRONMENT nullable scalar return_and_saved_environment");
     w.constant("ALIGNOF_EXECUTION_CONTEXT", align_of::<ExecutionContext>());
     w.constant("EXECUTION_CONTEXT_NO_YIELD_CONTINUATION", ExecutionContext::NO_YIELD_CONTINUATION);
-    size!(w, "SIZEOF_SCRIPT_OR_MODULE", ScriptOrModule);
+    size!(w, "SIZEOF_SCRIPT_OR_MODULE", ScriptOrModuleSlot);
     size!(w, "SIZEOF_VALUE", Value);
 
     w.section("InterpreterStack layout");
@@ -435,12 +435,10 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     w.line("field Executable.global_variable_caches GlobalVariableCaches EXECUTABLE_GLOBAL_VARIABLE_CACHES_DATA nonnull scalar");
     offset!(w, "EXECUTABLE_ENVIRONMENT_COORDINATE_CACHES_DATA", ExecutableHead, environment_coordinate_caches.data);
     w.line("field Executable.environment_coordinate_caches Sequence<EnvironmentCoordinateEntry> EXECUTABLE_ENVIRONMENT_COORDINATE_CACHES_DATA nullable scalar");
-    offset!(w, "EXECUTABLE_CONSTANTS_DATA", ExecutableHead, constants.data);
-    offset!(w, "EXECUTABLE_CONSTANTS_SIZE", ExecutableHead, constants.size);
     offset!(w, "OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTY_VALUES_DATA", ObjectPropertyIteratorCacheData, property_values.data);
     offset!(w, "OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTY_VALUES_SIZE", ObjectPropertyIteratorCacheData, property_values.size);
     w.line("field ObjectPropertyIteratorCacheData.property_values Sequence<Value> OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTY_VALUES_DATA nullable scalar");
-    w.line("field ObjectPropertyIteratorCacheData.property_value_count u64 OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTY_VALUES_SIZE nullable scalar");
+    w.line("field ObjectPropertyIteratorCacheData.property_value_count u32 OBJECT_PROPERTY_ITERATOR_CACHE_DATA_PROPERTY_VALUES_SIZE nullable scalar");
 
     w.section("PutKind enum");
     w.constant("PUT_KIND_NORMAL", PutKind::Normal as u8);
@@ -449,8 +447,8 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "WATCHPOINT_SET_VALID", "WatchpointSet.valid", "bool", WatchpointSet, valid, 1, "nonnull", "scalar");
 
     w.section("DeclarativeEnvironment layout");
-    field!(w, "DECLARATIVE_ENVIRONMENT_RARE_DATA", "DeclarativeEnvironment.rare_data", "DeclarativeEnvironmentRareData", DeclarativeEnvironment, rare_data, 8, "nullable", "scalar");
-    field!(w, "DECLARATIVE_ENVIRONMENT_SERIAL", "DeclarativeEnvironment.serial_number", "u64", DeclarativeEnvironment, serial_number, 8, "nullable", "scalar");
+    field!(w, "DECLARATIVE_ENVIRONMENT_RARE_DATA", "DeclarativeEnvironment.rare_data", "DeclarativeEnvironmentRareData", DeclarativeEnvironment, rare_data, 4, "nullable", "compressed");
+    field!(w, "DECLARATIVE_ENVIRONMENT_SERIAL", "DeclarativeEnvironment.serial_number", "u64", GlobalDeclarativeEnvironment, serial_number, 8, "nullable", "scalar");
 
     w.section("GlobalVariableCache layout");
     offset!(w, "GLOBAL_VARIABLE_CACHE_ENTRY", GlobalVariableCache, entry);
@@ -491,19 +489,17 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "DIRECT_GETTER_FUNCTION_IMPLEMENTATION_VALUE_IS_COMPRESSED", "DirectGetterFunction.implementation_value_is_compressed", "u32", DirectGetterFunction, implementation_value_is_compressed, 4, "nullable", "scalar");
 
     w.section("ECMAScriptFunctionObject layout");
-    field!(w, "ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA", "ECMAScriptFunctionObject.shared_data", "SharedFunctionInstanceData", FunctionObject, ecmascript_shared_data, 4, "nonnull", "compressed");
-    field!(w, "ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT", "ECMAScriptFunctionObject.environment", "Environment", EcmascriptFunctionObject, environment, 4, "nullable", "compressed");
-    field!(w, "ECMASCRIPT_FUNCTION_OBJECT_PRIVATE_ENVIRONMENT", "ECMAScriptFunctionObject.private_environment", "PrivateEnvironment", EcmascriptFunctionObject, private_environment, 4, "nullable", "compressed");
-    field!(w, "ECMASCRIPT_FUNCTION_OBJECT_SCRIPT_OR_MODULE", "ECMAScriptFunctionObject.script_or_module", "ScriptOrModule", EcmascriptFunctionObject, script_or_module, 16, "nullable", "scalar");
+    w.constant("ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA", ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA_OFFSET);
+    w.field("ECMAScriptFunctionObject.shared_data", "SharedFunctionInstanceData", "ECMASCRIPT_FUNCTION_OBJECT_SHARED_DATA", "nonnull", "compressed");
+    w.constant("ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT", ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT_OFFSET);
+    w.field("ECMAScriptFunctionObject.environment", "Environment", "ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT", "nullable", "compressed");
+    field!(w, "ECMASCRIPT_FUNCTION_OBJECT_PRIVATE_ENVIRONMENT", "ECMAScriptFunctionObject.private_environment", "PrivateEnvironment", EcmascriptFunctionObjectWithRareData, private_environment, 4, "nullable", "compressed");
+    w.constant("ECMASCRIPT_FUNCTION_FLAG_HAS_RARE_DATA", ecmascript_function_flags::HAS_RARE_DATA);
 
     w.section("SharedFunctionInstanceData layout");
+    field!(w, "SHARED_FUNCTION_INSTANCE_DATA_SCRIPT_OR_MODULE", "SharedFunctionInstanceData.script_or_module", "u64", SharedFunctionInstanceData, script_or_module, 8, "nullable", "scalar");
     field!(w, "SHARED_FUNCTION_INSTANCE_DATA_EXECUTABLE", "SharedFunctionInstanceData.executable", "Executable", SharedFunctionInstanceData, executable, 4, "nullable", "compressed");
     field!(w, "SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA", "SharedFunctionInstanceData.asm_call_metadata", "u64", SharedFunctionInstanceData, asm_call_metadata, 8, "nullable", "scalar");
-    offset!(w, "SHARED_FUNCTION_INSTANCE_DATA_FORMAL_PARAMETER_COUNT", SharedFunctionInstanceData, formal_parameter_count);
-    offset!(w, "SHARED_FUNCTION_INSTANCE_DATA_STRICT", SharedFunctionInstanceData, strict);
-    offset!(w, "SHARED_FUNCTION_INSTANCE_DATA_FUNCTION_ENVIRONMENT_NEEDED", SharedFunctionInstanceData, function_environment_needed);
-    offset!(w, "SHARED_FUNCTION_INSTANCE_DATA_USES_THIS", SharedFunctionInstanceData, uses_this);
-    offset!(w, "SHARED_FUNCTION_INSTANCE_DATA_CAN_INLINE_CALL", SharedFunctionInstanceData, can_inline_call);
     w.constant("SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_CAN_INLINE_CALL", asm_call_metadata::CAN_INLINE_CALL);
     w.constant("SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION", asm_call_metadata::NEEDS_ENVIRONMENT_OR_THIS_VALUE_RESOLUTION);
     w.constant("SHARED_FUNCTION_INSTANCE_DATA_ASM_CALL_METADATA_USES_THIS", asm_call_metadata::USES_THIS);
@@ -561,13 +557,13 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     offset!(w, "DECLARATIVE_ENVIRONMENT_RARE_DATA_BINDING_FLAGS", DeclarativeEnvironmentRareData, binding_flags);
     offset!(w, "ENVIRONMENT_SHAPE_BINDING_FLAGS", EnvironmentShape, binding_flags);
     w.constant("BINDING_FLAG_MUTABLE", BINDING_FLAG_MUTABLE);
-    offset!(w, "BINDING_VALUES_DATA_PTR", DeclarativeEnvironment, binding_values.data);
+    offset!(w, "BINDING_VALUES_DATA_PTR", DeclarativeEnvironment, binding_values);
     w.line("field DeclarativeEnvironment.binding_values BindingValues BINDING_VALUES_DATA_PTR nonnull scalar");
     offset!(w, "BINDING_FLAGS_DATA_PTR", DeclarativeEnvironmentRareData, binding_flags.data);
     w.line("field DeclarativeEnvironmentRareData.binding_flags BindingFlags BINDING_FLAGS_DATA_PTR nonnull scalar");
     offset!(w, "ENVIRONMENT_SHAPE_BINDING_FLAGS_DATA_PTR", EnvironmentShape, binding_flags.data);
     offset!(w, "ENVIRONMENT_SHAPE_BINDING_FLAGS_SIZE", EnvironmentShape, binding_flags.size);
-    w.line("field EnvironmentShape.binding_flags_size u64 ENVIRONMENT_SHAPE_BINDING_FLAGS_SIZE nullable scalar");
+    w.line("field EnvironmentShape.binding_flags_size u32 ENVIRONMENT_SHAPE_BINDING_FLAGS_SIZE nullable scalar");
     w.line("field EnvironmentShape.binding_flags BindingFlags ENVIRONMENT_SHAPE_BINDING_FLAGS_DATA_PTR nonnull scalar");
 
     w.section("EnvironmentCoordinate layout");

@@ -11,6 +11,7 @@ use core::ptr::NonNull;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use ak::{Utf16FlyString, Utf16String};
 use libjs_runtime_macros::Trace;
@@ -74,7 +75,7 @@ use crate::runtime::module::{Module, finish_loading_imported_module};
 use crate::runtime::module_loading::{ImportedModulePayload, ImportedModuleReferrer};
 use crate::runtime::module_request::ModuleRequest;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
-use crate::runtime::object::IntrinsicAccessor;
+use crate::runtime::object::{IndexedDictionary, IntrinsicAccessor};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 use crate::runtime::property_key::PropertyKey;
@@ -519,9 +520,16 @@ pub struct Vm {
     native_function_count: Cell<u32>,
     /// The index of each function in the native function table, by its address and type.
     native_function_indices: RefCell<HashMap<(usize, u32), u32>>,
+    /// The indexed property dictionaries of the ECMAScript function objects that have one, by address. Those objects
+    /// have no pointer to their indexed elements (see `EcmascriptFunctionFields`), and hardly any of them has indexed
+    /// properties. The objects trace and free their dictionaries.
+    pub(crate) function_indexed_dictionaries:
+        RefCell<HashMap<usize, *mut IndexedDictionary, foldhash::fast::RandomState>>,
     roots: RootSet,
 
     pub names: CommonPropertyNames,
+    /// What functions without parameter names share, since an empty Rc slice is an allocation of its own.
+    pub(crate) no_parameter_names: Rc<[Utf16FlyString]>,
     /// The strings in these two caches are weak: the sweep callback drops the ones that die.
     string_to_atom_cache: RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>>,
     fly_string_cache: Box<[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE]>,
@@ -676,8 +684,10 @@ impl Vm {
             native_function_table: RefCell::new(native_function_table),
             native_function_count: Cell::new(0),
             native_function_indices: RefCell::new(HashMap::new()),
+            function_indexed_dictionaries: RefCell::default(),
             roots: RootSet::default(),
             names: CommonPropertyNames::new(),
+            no_parameter_names: Rc::from([]),
             string_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| StringToAtomCacheEntry::default()))),
             fly_string_cache: Box::new([const { Cell::new(None) }; FLY_STRING_CACHE_SIZE]),
             numeric_string_cache: Box::new([const { Cell::new(None) }; NUMERIC_STRING_CACHE_SIZE]),

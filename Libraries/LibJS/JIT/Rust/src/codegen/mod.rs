@@ -91,7 +91,7 @@ use crate::code::Repr;
 use crate::code::Site;
 use crate::code::SiteKind;
 use crate::code::ValueLocation;
-use crate::fast_hash::HashMap;
+use crate::fast_hash::{HashMap, HashSet};
 use crate::ir;
 use crate::ir::BlockId;
 use crate::ir::BranchCondition;
@@ -298,6 +298,8 @@ struct Codegen<'a, M: PortableMacroAssembler> {
     /// `InitializeNamed` nodes whose constant the allocation of their object
     /// stored already.
     absorbed_initializations: Vec<NodeId>,
+    /// `InitializeNamed` nodes right after the allocation of their object, which still has its properties inline.
+    inline_initializations: HashSet<NodeId>,
     /// The slots of the compiled function's frame that hold its arguments
     /// object, which the code never created, when the node being emitted
     /// (in the compiled function or an inlined callee) leaves the code after
@@ -443,6 +445,7 @@ pub fn generate<M: PortableMacroAssembler>(
         deferred_allocations: Vec::new(),
         deferred_storage_growths: Vec::new(),
         absorbed_initializations: Vec::new(),
+        inline_initializations: HashSet::default(),
         leave_arguments: Vec::new(),
         leave_stubs: Vec::new(),
         leave_frame: None,
@@ -1392,8 +1395,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 let (output, function) = (self.output(node_id), self.input(node_id, 0));
                 let offsets = self.runtime.offsets;
                 if *private {
-                    let address = Address::new(function, offsets.ecmascript_function_private_environment as i32);
-                    self.emit_load_nullable_compressed_cell(output, &address);
+                    // NB: The output may be in the register of the function.
+                    let scratch = self.pinned.scratch;
+                    self.emit_load_function_private_environment(scratch, function);
+                    self.masm.move64(output, scratch);
                 } else {
                     // NB: ECMAScript functions always have an environment.
                     let address = Address::new(function, offsets.ecmascript_function_environment as i32);
@@ -2152,6 +2157,24 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.branch_test32(Condition::Zero, dst, u32::MAX, null);
         self.emit_decompress_cell(dst);
         self.masm.bind(null);
+    }
+
+    /// Loads the private environment of the ECMAScript function that
+    /// `function` holds into `dst`, another register, as a cell pointer, or 0
+    /// if it has none.
+    fn emit_load_function_private_environment(&mut self, dst: Gpr, function: Gpr) {
+        let offsets = self.runtime.offsets;
+        let done = self.masm.new_label();
+        self.masm
+            .load8(dst, &Address::new(function, offsets.object_class_bits as i32));
+        self.masm
+            .and32_imm(dst, dst, offsets.ecmascript_function_flag_has_rare_data);
+        self.masm.branch_test32(Condition::Zero, dst, u32::MAX, done);
+        self.emit_load_nullable_compressed_cell(
+            dst,
+            &Address::new(function, offsets.ecmascript_function_private_environment as i32),
+        );
+        self.masm.bind(done);
     }
 
     /// Loads the compressed cell pointer field at `address` into `dst` as a

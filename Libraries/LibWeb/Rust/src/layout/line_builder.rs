@@ -87,7 +87,7 @@ pub(crate) struct LineBuilder<'builder, 'context> {
     style_cache: Cell<Option<(Node, StyleValues<'context>)>>,
     /// The lookups behind the facts last asked for. Keeping the facts themselves copied the pass they
     /// hold into the cell and back, and the copy of the pass's padded tail stalled the loads after it.
-    facts_cache: Cell<Option<(Node, &'builder NodeData, Option<&'builder FfiStylePayloads>)>>,
+    facts_cache: Cell<Option<(Node, &'builder NodeData, Option<ComputedValuesView<'builder>>)>>,
 }
 
 impl<'builder, 'context> LineBuilder<'builder, 'context> {
@@ -226,7 +226,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             return NodeFacts::from_lookups(&self.context.callbacks, node, data, style_payloads);
         }
         let facts = NodeFacts::new(&self.context.callbacks, node);
-        self.facts_cache.set(Some((node, facts.data(), facts.style_payloads())));
+        self.facts_cache.set(Some((node, facts.data(), facts.style_view())));
         facts
     }
 
@@ -1375,14 +1375,20 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
     }
 
     pub(crate) fn did_introduce_clearance(&mut self, clearance: CssPixels) {
-        if clearance <= self.current_block_offset {
-            return;
+        // NB: The line the clearing break ends reaches down to the clearance, so that its block container does even
+        //     when no line follows. That's the last line before the current one that holds anything: Moving past a
+        //     float that left no room beside the break can leave empty lines between them. The line grows rather
+        //     than moves, so it keeps its start and its baseline.
+        let current = self.line_count() - 1;
+        if let Some(ended) = (0..current).rev().find(|&index| !self.line(index).is_empty()) {
+            let mut line = self.line_mut(ended);
+            let block_end = line.block_end;
+            if clearance > block_end {
+                line.block_length += clearance - block_end;
+                line.block_end = clearance;
+            }
         }
-        if self.line_count() > 1 {
-            let previous = self.line_count() - 2;
-            self.line_mut(previous).block_end = clearance;
-        }
-        self.current_block_offset = clearance;
+        self.current_block_offset = self.current_block_offset.max(clearance);
     }
 
     pub(crate) fn set_trailing_whitespace_on_previous_line(&mut self) {
@@ -1443,7 +1449,10 @@ impl TextLayoutBounds {
         // NB: The bounds above already enclose the glyphs of the first available font.
         if let Some(font) = font
             && style.line_height_is_normal()
-            && font.as_raw() != style.font().first_available_font
+            && style
+                .font()
+                .first_available_font()
+                .is_none_or(|first_available| font.as_raw() != first_available.as_raw())
         {
             bounds.ascent = bounds.ascent.max(CssPixels::nearest_value_for_f32(font.facts().ascent));
             bounds.descent = bounds

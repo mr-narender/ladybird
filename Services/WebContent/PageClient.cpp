@@ -153,7 +153,7 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
 {
     setup_palette();
 
-    // A hover of the render clock asks for its cursor on the StyleLayout thread, as the main thread does on its own: both
+    // A hover of the render clock asks for its cursor on the Render thread, as the main thread does on its own: both
     // over the one connection, under the page cursor's lock.
     m_page->cursor().set_send([&client = client(), id = m_id](Gfx::Cursor const& cursor) {
         client.async_did_request_cursor_change(id, cursor);
@@ -225,6 +225,8 @@ void PageClient::set_has_focus(bool has_focus)
             controller->dismiss();
         Web::Painting::request_document_repaint(*document, Web::InvalidateDisplayList::PaintCommands);
     }
+
+    page().system_focus_changed();
 }
 
 void PageClient::set_window_handle(Utf16String window_handle)
@@ -2220,6 +2222,21 @@ Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentSt
 void PageClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     client().async_close_worker_agent(m_id, agent_id, owner_token);
+}
+
+void PageClient::rtc_transform_init(Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record)
+{
+    client().async_rtc_transform_init(m_id, agent_id, transform_id, move(options_record));
+}
+
+void PageClient::rtc_transform_teardown(Web::HTML::WorkerAgentId agent_id, u64 transform_id)
+{
+    client().async_rtc_transform_teardown(m_id, agent_id, transform_id);
+}
+
+void PageClient::rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
+{
+    client().async_rtc_transform_encoded_audio_frame(m_id, agent_id, transform_id, payload.bytes(), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 void PageClient::page_did_mutate_dom(Utf16FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node>, GC::Ptr<Web::DOM::Node>, Optional<Utf16FlyString> const& attribute_name)

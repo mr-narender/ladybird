@@ -291,6 +291,7 @@ public:
     void hold_next_frame(Utf16String const& hold);
     Utf16String last_frame_presented_by(DOM::Document&);
     void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
+    void inject_clock_tick_scrolling_element(double frame_time_ms, DOM::Element& scroller, double x, double y);
     void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id);
     u64 queue_mouse_move(double x, double y, u32 buttons);
     void move_hover_pointer(double x, double y, Optional<u64> input_event_id);
@@ -314,6 +315,8 @@ public:
     GC::Ref<JS::Object> computed_values_stats();
     GC::Ref<JS::Object> style_ffi_counters();
     GC::Ref<JS::Object> style_engine_counters();
+    GC::Ref<JS::Object> style_memory_report();
+    u64 style_memory_of_frames();
     u64 style_record_identity(DOM::Element&);
     u64 layout_style_record_identity(DOM::Element&);
     u64 before_style_record_identity(DOM::Element&);
@@ -323,9 +326,12 @@ public:
     u64 layout_arena_live_slot_count();
     void panic_render_state_for_testing();
     u64 layout_arena_shell_count();
-    double style_engine_match_document();
+    GC::Ref<JS::Object> style_cold_pass(bool verify, u32 threads);
+    GC::Ref<JS::Object> style_live_report(bool verify);
+    GC::Ref<JS::Object> style_counters();
+    void reset_style_counters();
+    GC::Ref<JS::Object> style_last_pass();
     Utf16String style_engine_matched_rules();
-    GC::Ref<JS::Object> style_engine_transaction_reactions();
     void reset_style_ffi_counters();
     GC::Ref<JS::Object> style_group_sharing_info(DOM::Element&);
     void update_style();

@@ -388,6 +388,11 @@ Optional<Web::CSSPixelPoint> AsyncScrollTree::css_scroll_offset_for_node(Composi
     return scroll_offset_for_node(scroll_node_index, scroll_state_snapshot).map([&](auto device_offset) { return css_pixels_from_device_offset(device_offset); });
 }
 
+Web::CSSPixelPoint AsyncScrollTree::css_scroll_offset_for_node(AsyncScrollNode const& node, Compositing::ScrollStateSnapshot const& scroll_state_snapshot) const
+{
+    return css_pixels_from_device_offset(scroll_offset_for_node(node, scroll_state_snapshot));
+}
+
 Optional<Compositing::SpatialNodeIndex> AsyncScrollTree::viewport_scroll_node_index() const
 {
     for (auto const& node : m_scroll_nodes) {
@@ -631,9 +636,15 @@ Optional<Gfx::FloatPoint> AsyncScrollTree::set_scroll_offset(Compositing::Spatia
     if (!node)
         return {};
 
-    auto new_scroll_offset = clamp_scroll_offset_to_node(*node, scroll_offset);
-    scroll_state_snapshot.set_device_offset_for_index(node->scroll_node_index, { -new_scroll_offset.x(), -new_scroll_offset.y() });
+    auto new_scroll_offset = set_scroll_offset_leaving_sticky_offsets_unresolved(*node, scroll_offset, scroll_state_snapshot);
     Compositing::resolve_sticky_offsets(visual_context_tree, scroll_state_snapshot);
+    return new_scroll_offset;
+}
+
+Gfx::FloatPoint AsyncScrollTree::set_scroll_offset_leaving_sticky_offsets_unresolved(AsyncScrollNode const& node, Gfx::FloatPoint scroll_offset, Compositing::ScrollStateSnapshot& scroll_state_snapshot)
+{
+    auto new_scroll_offset = clamp_scroll_offset_to_node(node, scroll_offset);
+    scroll_state_snapshot.set_device_offset_for_index(node.scroll_node_index, { -new_scroll_offset.x(), -new_scroll_offset.y() });
     return new_scroll_offset;
 }
 

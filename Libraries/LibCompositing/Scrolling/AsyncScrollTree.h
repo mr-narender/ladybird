@@ -131,6 +131,7 @@ public:
     void rebuild_wheel_hit_test_targets(RefPtr<Compositing::DisplayList const> const&, Compositing::AccumulatedVisualContextTree const*, Compositing::ScrollStateSnapshot const&);
 
     Optional<Gfx::FloatPoint> scroll_offset_for_node(Compositing::SpatialNodeIndex, Compositing::ScrollStateSnapshot const&) const;
+    static Gfx::FloatPoint scroll_offset_for_node(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&);
     Optional<Web::UniqueNodeID> document_id() const { return m_document_id; }
     Optional<Compositing::SpatialNodeIndex> viewport_scroll_node_index() const;
     Optional<Compositing::SpatialNodeIndex> scroll_node_index_for_stable_id(Web::AsyncScrollNodeStableID) const;
@@ -144,6 +145,7 @@ public:
     Web::CSSPixelPoint css_pixels_from_device_offset(Gfx::FloatPoint) const;
     Gfx::FloatPoint device_offset_from_css_pixels(Web::CSSPixelPoint) const;
     Optional<Web::CSSPixelPoint> css_scroll_offset_for_node(Compositing::SpatialNodeIndex, Compositing::ScrollStateSnapshot const&) const;
+    Web::CSSPixelPoint css_scroll_offset_for_node(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&) const;
     bool blocks_wheel_event_at_position(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position) const;
     WheelHitTestResult hit_test_scroll_node_for_wheel(Compositing::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for = {}, WheelStepDispatch = WheelStepDispatch::NotYetDispatched, NestedContextRegions = NestedContextRegions::LeaveToMainThread) const;
     // The nested context whose content is the topmost thing taking pointer input at the position, if any.
@@ -178,10 +180,10 @@ public:
     Optional<AsyncScrollOffset> apply_scroll_delta(Compositing::SpatialNodeIndex, Gfx::FloatPoint delta, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&, ScrollChaining);
     Optional<WheelScrollTarget> select_wheel_scroll_target(Compositing::SpatialNodeIndex, Gfx::FloatPoint delta, Compositing::ScrollStateSnapshot const&, Function<Optional<Gfx::FloatPoint>(Web::AsyncScrollNodeStableID)> const& in_flight_destination_for, ScrollChaining scroll_chaining) const;
     Optional<Gfx::FloatPoint> set_scroll_offset(Compositing::SpatialNodeIndex, Gfx::FloatPoint, Compositing::AccumulatedVisualContextTree const&, Compositing::ScrollStateSnapshot&);
+    Gfx::FloatPoint set_scroll_offset_leaving_sticky_offsets_unresolved(AsyncScrollNode const&, Gfx::FloatPoint, Compositing::ScrollStateSnapshot&);
 
 private:
     static Gfx::FloatPoint clamp_scroll_offset_to_node(AsyncScrollNode const&, Gfx::FloatPoint);
-    static Gfx::FloatPoint scroll_offset_for_node(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&);
     static bool can_scroll_node_by_delta(AsyncScrollNode const&, Compositing::ScrollStateSnapshot const&, Gfx::FloatPoint);
     static bool can_scroll_node_from_offset_by_delta(AsyncScrollNode const&, Gfx::FloatPoint scroll_offset, Gfx::FloatPoint delta);
 

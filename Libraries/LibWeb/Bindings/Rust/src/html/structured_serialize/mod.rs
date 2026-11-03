@@ -15,6 +15,7 @@
 pub(crate) mod cpp;
 pub(crate) mod exports;
 pub(crate) mod memory;
+pub(crate) mod message_record;
 pub(crate) mod reader;
 pub(crate) mod writer;
 
@@ -38,11 +39,12 @@ use crate::html::structured_serialize::cpp::{
     TransferDataHolder, create_transferred_platform_object, current_settings_object_agent_cluster,
     current_settings_object_cross_origin_isolated_capability, data_clone_error_from_serialization_error,
     deserialize_rust_platform_object, is_exposed, is_platform_object, is_transferable,
-    is_transferable_interface_exposed, realm_agent_cluster, serializable_interface_name, serializable_payload_version,
-    serializable_steps, serialization_steps, transfer_steps, transferable_is_detached, transferable_primary_interface,
-    transferable_set_detached,
+    is_transferable_interface_exposed, realm_agent_cluster, serializable_interface_name,
+    serializable_interface_storage_identifier, serializable_payload_version, serializable_steps, serialization_steps,
+    transfer_steps, transferable_is_detached, transferable_primary_interface, transferable_set_detached,
 };
 use crate::html::structured_serialize::memory::{DeserializationMemory, SerializationMemory};
+use crate::html::structured_serialize::message_record::MessageRecord;
 use crate::html::structured_serialize::reader::StructuredSerializeReader;
 use crate::html::structured_serialize::writer::StructuredSerializeWriter;
 use crate::webidl::dom_exception::{self, DOMExceptionFields};
@@ -348,9 +350,7 @@ fn serialize_array_buffer(
             //         descriptor survive structured clone, whose main record is bytes-only, so an agent in another
             //         process references the same [[ArrayBufferData]]. Without a side list (e.g., serialization for
             //         storage) or a shared backing (e.g., a zero-length buffer), fall back to copying the bytes.
-            let shared_buffer_index = data_holder
-                .shared_buffers()
-                .and_then(|shared_buffers| shared_buffers.append_shared_memory_of(array_buffer));
+            let shared_buffer_index = data_holder.append_shared_memory_of(array_buffer);
             data_holder.encode_bool(shared_buffer_index.is_some());
             if let Some(index) = shared_buffer_index {
                 data_holder.encode_u32(index);
@@ -747,7 +747,7 @@ impl<'memory> Serializer<'_, '_, 'memory> {
 
                 // 2. Let typeString be the identifier of the primary interface of value.
                 // 3. Set serialized to { [[Type]]: typeString }.
-                encode_serializable_object_header(serialized, interface_name);
+                encode_serializable_object_header(serialized, interface_name)?;
 
                 // FIXME: 4. If value's primary interface is decorated with [SameAgentCluster], then set sameAgentCluster to true.
 
@@ -861,6 +861,13 @@ impl<'memory> Serializer<'_, '_, 'memory> {
                         quota_exceeded_error::serialization_steps(&QuotaExceededErrorFields::of(object), serialized);
                     }
                     SerializableSteps::CryptoKey => crypto_key::serialization_steps(object, serialized),
+                    SerializableSteps::RTCEncodedAudioFrame => {
+                        crate::webrtc::rtc_encoded_audio_frame::serialization_steps(
+                            object,
+                            &mut SerializationWriter::new(self),
+                            self.for_storage,
+                        )?;
+                    }
                     SerializableSteps::Rust => {
                         let realm = self.realm.unwrap_or_else(|| object.shape().realm());
                         serialization_steps(
@@ -915,12 +922,21 @@ impl<'memory> Serializer<'_, '_, 'memory> {
     }
 }
 
-pub(crate) fn encode_serializable_object_header(serialized: &StructuredSerializeWriter, interface_name: u16) {
+pub(crate) fn encode_serializable_object_header(
+    serialized: &StructuredSerializeWriter,
+    interface_name: u16,
+) -> WebIdlResult<()> {
+    if serialized.serialization_type() == SerializationType::Storage
+        && serializable_interface_storage_identifier(interface_name).is_none()
+    {
+        return Err(data_clone_error("This interface cannot be serialized for storage"));
+    }
     serialized.encode_u8(ValueTag::SerializableObject as u8);
     serialized.encode_interface_name(interface_name);
     if serialized.serialization_type() == SerializationType::Storage {
         serialized.encode_u64(serializable_payload_version());
     }
+    Ok(())
 }
 
 pub(crate) fn decode_serializable_object_header(
@@ -1139,7 +1155,7 @@ impl Deserializer<'_, '_, '_> {
                     let shared_object_id = self.serialized.decode_u64()?;
                     value = self
                         .serialized
-                        .array_buffer_from_shared_memory(index, shared_object_id)?;
+                        .array_buffer_from_shared_memory(vm, index, shared_object_id)?;
                     break 'shared_array_buffer;
                 }
 
@@ -1147,7 +1163,7 @@ impl Deserializer<'_, '_, '_> {
 
                 if let Some(array_buffer) =
                     self.serialized
-                        .array_buffer_sharing_side_table_entry(side_table_index, bytes.len(), false)
+                        .array_buffer_sharing_side_table_entry(vm, side_table_index, bytes.len(), false)
                 {
                     value = Value::from_object(array_buffer);
                     break 'shared_array_buffer;
@@ -1178,12 +1194,9 @@ impl Deserializer<'_, '_, '_> {
 
                 if let Some(array_buffer) =
                     self.serialized
-                        .array_buffer_sharing_side_table_entry(side_table_index, bytes.len(), true)
+                        .array_buffer_sharing_side_table_entry(vm, side_table_index, bytes.len(), true)
                 {
-                    let data = array_buffer
-                        .downcast::<ArrayBuffer>()
-                        .expect("the side table holds ArrayBuffers");
-                    data.set_max_byte_length(max_byte_length);
+                    array_buffer.set_max_byte_length(max_byte_length);
                     value = Value::from_object(array_buffer);
                     break 'growable_shared_array_buffer;
                 }
@@ -1427,7 +1440,7 @@ impl Deserializer<'_, '_, '_> {
                 // 3. Set value to a new instance of the interface identified by interfaceName, created in targetRealm.
                 // 4. Set deep to true.
                 // NB: The deserialization steps of an interface implemented in Rust, and those that run here for
-                //     DOMException, QuotaExceededError and CryptoKey, create the new instance from what they read, so
+                //     C++ objects, create the new instance from what they read, so
                 //     they run here, at the position in memory that the instance has, rather than in step 25.4.
                 let memory_index = self.memory.size();
                 self.memory.append(Value::UNDEFINED);
@@ -1442,6 +1455,12 @@ impl Deserializer<'_, '_, '_> {
                     }
                     SerializableSteps::CryptoKey => {
                         Value::from_object(crypto_key::deserialization_steps(realm, self.serialized)?)
+                    }
+                    SerializableSteps::RTCEncodedAudioFrame => {
+                        Value::from_object(crate::webrtc::rtc_encoded_audio_frame::deserialization_steps(
+                            realm,
+                            &mut SerializationReader::new(self),
+                        )?)
                     }
                     SerializableSteps::Rust => {
                         deserialize_rust_platform_object(interface_name, realm, &mut SerializationReader::new(self))?
@@ -1805,6 +1824,41 @@ pub(crate) fn structured_deserialize_with_transfer_internal(
     }
 
     Ok(value)
+}
+
+// https://html.spec.whatwg.org/multipage/structured-data.html#structuredserialize
+// AD-HOC: For a message that reaches agents in other processes, whose shared-memory-backed SharedArrayBuffers are handed
+//         over beside it. The caller finishes the writer into a MessageRecord.
+pub(crate) fn structured_serialize_for_message(
+    vm: &Vm,
+    realm: Gc<Realm>,
+    value: Value,
+) -> WebIdlResult<StructuredSerializeWriter<'_>> {
+    let memory = SerializationMemory::new(vm);
+    let serialized = StructuredSerializeWriter::new_for_message(vm);
+
+    // 1. Return ? StructuredSerializeInternal(value, false).
+    structured_serialize_internal(
+        vm,
+        Some(realm),
+        &serialized,
+        value,
+        false,
+        &memory,
+        AllowSharedArrayBuffers::CrossOriginIsolatedOnly,
+    )?;
+    Ok(serialized)
+}
+
+// https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserialize
+// NB: In the realm of the call.
+pub(crate) fn structured_deserialize_message(cx: &CallContext, serialized: &MessageRecord) -> WebIdlResult<Value> {
+    let target_realm = cx.realm();
+    let serialized = StructuredSerializeReader::new_message(target_realm, serialized);
+    let memory = DeserializationMemory::new(cx.vm());
+    with_temporary_execution_context(target_realm, || {
+        structured_deserialize_internal(cx, &serialized, &memory, false)
+    })
 }
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeforstorage

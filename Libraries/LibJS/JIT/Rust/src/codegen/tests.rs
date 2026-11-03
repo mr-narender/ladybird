@@ -71,7 +71,9 @@ fn offsets() -> RuntimeOffsets {
         execution_context_runs_jit_code: 157,
         ecmascript_function_environment: 0,
         ecmascript_function_private_environment: 8,
-        ecmascript_function_script_or_module: 16,
+        shared_function_script_or_module: 24,
+        object_class_bits: 40,
+        ecmascript_function_flag_has_rare_data: 8,
         vm_execution_generation: 8 * VM_EXECUTION_GENERATION_WORD as u32,
     }
 }
@@ -533,6 +535,17 @@ fn write_frame_states(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *con
 /// The primitive storage cage base of the fake runtime: fake typed arrays hold
 /// the offsets of their data from it.
 const PRIMITIVE_STORAGE_CAGE_BASE: u64 = 0x1000;
+
+/// The words of a fake ECMAScript function (see `offsets()`): `words` are the
+/// environment, the private environment and the script or module, of which the
+/// last two also are in its fake shared data, followed by the compressed shared
+/// data and flags saying it has rare data.
+fn fake_function_words(words: [u64; 4]) -> Vec<u64> {
+    let shared_data = fake_heap::cell(&[0, 0, 0, words[2], words[3]]);
+    let mut function = words.to_vec();
+    function.extend([fake_heap::compressed(shared_data.as_ptr() as u64), 8]);
+    function
+}
 
 fn runtime() -> RuntimeInfo {
     let mut slow_paths = vec![0; NUM_OPCODES as usize];
@@ -2490,7 +2503,7 @@ mod property_access {
 
     /// `Array.prototype.push` against fake arrays: `[shape, flags, named
     /// property storage, elements, storage kind (byte 0) and size (bytes
-    /// 4-7), length writable (byte 0) and proxy target (byte 1)]`, with
+    /// 4-7), array flags (length not writable: 1, proxy target: 2)]`, with
     /// shapes `[dictionary generation, compressed prototype]`.
     mod array_push {
         use super::*;
@@ -2519,7 +2532,7 @@ mod property_access {
                     0,
                     elements.as_ptr() as u64,
                     PACKED | u64::from(size) << 32,
-                    1,
+                    0,
                 ]))
             }
 
@@ -2604,8 +2617,9 @@ mod property_access {
                         object_flag_is_extensible: EXTENSIBLE as u16,
                         object_flag_has_magical_length: MAGICAL_LENGTH as u16,
                         object_flag_may_interfere: MAY_INTERFERE,
-                        array_length_writable: 40,
-                        array_is_proxy_target: 41,
+                        array_flags: 40,
+                        array_flag_length_not_writable: 1,
+                        array_flag_is_proxy_target: 2,
                         shape_prototype: 8,
                         ..runtime.layout
                     };
@@ -2668,8 +2682,8 @@ mod property_access {
                 &|array| array.0[1] = EXTENSIBLE,
                 &|array| array.0[1] |= u64::from(MAY_INTERFERE),
                 &|array| array.0[4] = 2 | 1 << 32,
-                &|array| array.0[5] = 0,
-                &|array| array.0[5] = 1 | 1 << 8,
+                &|array| array.0[5] = 1,
+                &|array| array.0[5] = 2,
             ] {
                 assert_eq!(exits(&world, change), [ExitKind::SlowPath]);
             }
@@ -2854,13 +2868,19 @@ mod inlining {
         configure: impl FnOnce(&mut Snapshot),
         prepare: impl FnOnce(&mut Machine),
     ) -> (JitResult, Machine, CompiledCode) {
-        let function_object = FUNCTION_WORDS.to_vec();
+        let function_object = fake_function_words(FUNCTION_WORDS);
         let mut function = function(true, false);
         function.function = CellId(function_object.as_ptr() as u64);
         let mut snapshot = snapshot_with_callee(caller, callee, function);
         snapshot.runtime = runtime();
         for executable in &mut snapshot.executables {
             executable.feedback.arith = vec![NUMBERS_AND_STRINGS_FEEDBACK];
+            // NB: The words of a function its frames start with are constants in code.
+            executable.function_fields = Some(FunctionFrameFields {
+                script_or_module: FUNCTION_WORDS[2],
+                environment: FUNCTION_WORDS[0],
+                private_environment: FUNCTION_WORDS[1],
+            });
         }
         configure(&mut snapshot);
         let compiled = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true).unwrap();
@@ -3295,7 +3315,7 @@ mod direct_calls {
     impl Callee {
         fn new() -> Self {
             let mut callee = Self {
-                function: FUNCTION_WORDS.to_vec(),
+                function: fake_function_words(FUNCTION_WORDS),
                 executable: fake_heap::cell(&[0; 7]),
                 entry_table: vec![0; 2 * ENTRY_TABLE_OWNERS_WORD],
                 interpreter_stack: vec![0xdead_beef_dead_beef; 512],
@@ -3344,7 +3364,7 @@ mod direct_calls {
                 registers_and_locals_and_constants_count: 9,
                 // NB: The fake function's words (see `offsets()`).
                 function_fields: FunctionFrameFields {
-                    script_or_module: [self.function[2], self.function[3]],
+                    script_or_module: self.function[2],
                     environment: self.function[0],
                     private_environment: self.function[1],
                 },
@@ -3453,7 +3473,7 @@ mod direct_calls {
             let byte = |offset: usize| (frame[offset / 8] >> (8 * (offset % 8))) as u8;
             assert_eq!(word(64), callee.function.as_ptr() as u64, "function");
             assert_eq!(word(72), REALM);
-            assert_eq!((word(80), word(88)), (FUNCTION_WORDS[2], FUNCTION_WORDS[3]));
+            assert_eq!(word(80), FUNCTION_WORDS[2]);
             assert_eq!(
                 (word(8), word(96), word(16)),
                 (FUNCTION_WORDS[0], FUNCTION_WORDS[0], FUNCTION_WORDS[1])
@@ -3748,10 +3768,13 @@ mod direct_calls {
                     fake_heap::compressed(callee.executable.as_ptr() as u64),
                     formal_parameter_count | flags,
                     0,
+                    FUNCTION_WORDS[2],
+                    FUNCTION_WORDS[3],
                 ]);
                 let mut function = vec![
                     fake_heap::compressed(shape.as_ptr() as u64),
-                    u64::from(ECMASCRIPT_FUNCTION_FLAG),
+                    // NB: The top byte holds the function's flags.
+                    u64::from(ECMASCRIPT_FUNCTION_FLAG) | 8 << 56,
                     fake_heap::compressed(shared_data.as_ptr() as u64),
                 ];
                 function.extend(FUNCTION_WORDS);
@@ -3780,7 +3803,7 @@ mod direct_calls {
             fake_heap::use_in(runtime);
             runtime.offsets.ecmascript_function_environment = 24;
             runtime.offsets.ecmascript_function_private_environment = 32;
-            runtime.offsets.ecmascript_function_script_or_module = 40;
+            runtime.offsets.object_class_bits = 15;
             runtime.dynamic_calls = crate::snapshot::DynamicCallLayout {
                 object_flag_is_ecmascript_function: ECMASCRIPT_FUNCTION_FLAG,
                 ecmascript_function_shared_data: 16,
@@ -3847,7 +3870,7 @@ mod direct_calls {
             let byte = |offset: usize| (frame[offset / 8] >> (8 * (offset % 8))) as u8;
             assert_eq!(word(64), callee.function.as_ptr() as u64, "function");
             assert_eq!(word(72), callee.realm);
-            assert_eq!((word(80), word(88)), (FUNCTION_WORDS[2], FUNCTION_WORDS[3]));
+            assert_eq!(word(80), FUNCTION_WORDS[2]);
             assert_eq!(
                 (word(8), word(96), word(16)),
                 (
@@ -4023,7 +4046,8 @@ mod direct_calls {
         #[test]
         fn callees_with_a_call_environment_template_get_it_inline() {
             // A fake template (size class, cell size, binding values offset,
-            // whether calls bind `this`, then six words) and heap, and the
+            // whether calls bind `this`, whether the environment has the
+            // fields of a function environment, then six words) and heap, and the
             // environment's fields: binding values at 16, outer environment at
             // 24, function object at 32 and this value at 40.
             struct Case {
@@ -4033,6 +4057,7 @@ mod direct_calls {
                 template: bool,
                 free_cell: bool,
                 inline: bool,
+                function_fields: bool,
             }
             let run = |case: Case| {
                 let flags = CAN_INLINE_CALL | NEEDS_ENVIRONMENT | USES_THIS | if case.strict { STRICT } else { 0 };
@@ -4053,7 +4078,13 @@ mod direct_calls {
                 // The free lists of size classes 0 to 3: the template's size
                 // class 6 masks to 2.
                 let free_lists = vec![0, 0, free_list.as_mut_ptr() as u64, 0];
-                let mut template = vec![6, 64, if case.inline { 48 } else { 0 }, u64::from(case.binds_this)];
+                let mut template = vec![
+                    6,
+                    64,
+                    if case.inline { 48 } else { 0 },
+                    u64::from(case.binds_this),
+                    u64::from(case.function_fields),
+                ];
                 template.extend([0x1000, 0x1001, 0, 0, 0, 0]);
                 let template = fake_heap::cell(&template);
                 // NB: Bits in the other half of the word, which the stub ignores.
@@ -4075,8 +4106,10 @@ mod direct_calls {
                     layout.call_environment_template_cell_size = 8;
                     layout.call_environment_template_binding_values_offset = 16;
                     layout.call_environment_template_binds_this = 24;
-                    layout.call_environment_template_words = 32;
+                    layout.call_environment_template_has_function_fields = 32;
+                    layout.call_environment_template_words = 40;
                     layout.function_environment_words = 6;
+                    layout.declarative_environment_words = 4;
                     layout.function_environment_binding_values = 16;
                     layout.function_environment_outer = 24;
                     layout.function_environment_function_object = 32;
@@ -4123,6 +4156,7 @@ mod direct_calls {
                 template: true,
                 free_cell: true,
                 inline,
+                function_fields: true,
             };
             for (case, this) in [
                 (inline(true, true, value::int32(3), true), value::int32(3)),
@@ -4139,10 +4173,29 @@ mod direct_calls {
                 assert_eq!(&cell[..2], &[0x1000, 0x1001]);
                 assert_eq!(cell[2], if in_cell { address + 48 } else { 0 });
                 assert_eq!(cell[3] as u32, FUNCTION_WORDS[0] as u32, "compressed outer environment");
-                assert_eq!(cell[4], callee.function.as_ptr() as u64, "function object");
+                assert_eq!(
+                    cell[4] as u32,
+                    (callee.function.as_ptr() as u64 >> 3) as u32,
+                    "compressed function object"
+                );
                 assert_eq!(cell[5], if binds_this { value::int32(3) } else { 0 });
                 assert_eq!(heap, [164, 10_000, 1064]);
             }
+
+            // Without the fields of a function environment, `this` only goes in
+            // the frame, and the cell's words after the declarative ones stay.
+            let (_, frame, from_runtime, _, block) = run(Case {
+                function_fields: false,
+                ..inline(true, true, value::int32(3), true)
+            });
+            assert!(!from_runtime);
+            let cell = block.cell();
+            let address = cell.as_ptr() as u64;
+            assert_eq!((frame[1], frame[12]), (address, address), "environments");
+            assert_eq!(frame[120 / 8], value::int32(3), "this");
+            assert_eq!(&cell[..2], &[0x1000, 0x1001]);
+            assert_eq!(cell[3] as u32, FUNCTION_WORDS[0] as u32, "compressed outer environment");
+            assert_eq!(&cell[4..6], &[0x5a5a, 0x5a5a]);
 
             // Sloppy callees binding primitives, callees without a template and
             // empty free lists get their environment from the runtime.

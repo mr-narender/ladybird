@@ -27,6 +27,7 @@ unsafe extern "C" {
         count: usize,
     );
     fn web_structured_serialize_set_storage_record(record: *mut c_void, data: ak::Span<'_, u8>);
+    fn web_structured_serialize_is_ipc_interface(interface_name: u16) -> bool;
     fn web_structured_serialize_interface_storage_identifier(
         interface_name: u16,
         identifier: &mut ak::Span<'static, u8>,
@@ -44,10 +45,7 @@ unsafe extern "C" {
     fn web_structured_serialize_ipc_record_data(record: *const c_void, data: &mut ak::Span<'static, u8>);
     fn web_structured_serialize_ipc_record_shared_array_buffer(
         record: *const c_void,
-        realm: *mut c_void,
         side_table_index: u32,
-        byte_length: usize,
-        preserve_growability: bool,
     ) -> *mut c_void;
     fn web_structured_serialize_shared_buffers_shared_array_buffer(
         shared_buffers: *mut c_void,
@@ -249,6 +247,12 @@ impl StorageSerializationRecord {
     }
 }
 
+/// Whether IPC records can contain this interface, including interfaces that cannot be stored.
+pub(crate) fn is_ipc_interface(interface_name: u16) -> bool {
+    // SAFETY: The call takes an interface identifier by value.
+    unsafe { web_structured_serialize_is_ipc_interface(interface_name) }
+}
+
 /// The identifier of the serializable interface that a storage record holds, from LibWeb's registry of them, if the
 /// Bindings::InterfaceName names one.
 pub(crate) fn serializable_interface_storage_identifier(interface_name: u16) -> Option<&'static [u8]> {
@@ -293,25 +297,20 @@ impl<'a> ReceivedIPCSerializationRecord<'a> {
         data.as_slice()
     }
 
-    /// A new SharedArrayBuffer in the realm that shares the storage of the buffer at the index of the record's
-    /// same-process side table, if there is such a buffer, and its storage can be shared.
-    pub(crate) fn shared_array_buffer(
-        self,
-        realm: Gc<Realm>,
-        side_table_index: u32,
-        byte_length: usize,
-        preserve_growability: bool,
-    ) -> Option<Gc<Object>> {
-        // SAFETY: The record is lent, and the realm is live. LibWeb returns a live object or null.
-        unsafe {
+    /// The SharedArrayBuffer at the index of the record's same-process side table, if there is one.
+    pub(crate) fn shared_array_buffer(self, side_table_index: u32) -> Option<Gc<ArrayBuffer>> {
+        // SAFETY: The record is lent. LibWeb returns a live object or null.
+        let object = unsafe {
             object_from_abi(web_structured_serialize_ipc_record_shared_array_buffer(
                 self.raw.as_ptr(),
-                realm.as_ptr().cast(),
                 side_table_index,
-                byte_length,
-                preserve_growability,
             ))
-        }
+        }?;
+        Some(
+            object
+                .downcast::<ArrayBuffer>()
+                .expect("the side table holds ArrayBuffers"),
+        )
     }
 }
 
@@ -473,6 +472,8 @@ pub(crate) enum SerializableSteps {
     QuotaExceededError,
     /// The steps of CryptoKey, which run in crate::crypto::crypto_key.
     CryptoKey,
+    /// The steps of RTCEncodedAudioFrame, which run in crate::webrtc::rtc_encoded_audio_frame.
+    RTCEncodedAudioFrame,
 }
 
 pub(crate) fn serializable_steps(interface_name: u16) -> SerializableSteps {
@@ -482,6 +483,7 @@ pub(crate) fn serializable_steps(interface_name: u16) -> SerializableSteps {
         1 => SerializableSteps::DOMException,
         2 => SerializableSteps::QuotaExceededError,
         3 => SerializableSteps::CryptoKey,
+        4 => SerializableSteps::RTCEncodedAudioFrame,
         steps => unreachable!("LibWeb names no serializable steps {steps}"),
     }
 }

@@ -13,21 +13,35 @@
 //! beside them. What the deserialization reads that the record does not hold throws a "DataCloneError" DOMException in
 //! the realm that it creates its values in.
 
+use core::ffi::c_void;
+use core::ptr::NonNull;
+
 use ak::Utf16String;
-use libjs_rust::api::{BigInt, Gc, Object, Realm, Value, Vm};
+use libjs_rust::api::{
+    ArrayBuffer, ArrayBufferShared, AsSharedMemory, BigInt, DataBlock, DataBlockStorage, ExternalPrimitiveStorage,
+    ForeignCellSlot, GC_PRIMITIVE_STORAGE_NULL_HANDLE, Gc, Realm, SharedBackingStore, Value, Vm,
+};
 use libwebcommon_rust::html::serialization_records::{DecodeError, DecodedString, RecordDecoder, SerializationType};
 
 use crate::bindings::WebIdlResult;
 use crate::html::structured_serialize::cpp::{
-    ReceivedIPCSerializationRecord, SharedBuffers, data_clone_error_from_serialization_error,
-    serializable_interface_name_from_storage_identifier, serializable_interface_storage_identifier,
+    ReceivedIPCSerializationRecord, SharedBuffers, data_clone_error_from_serialization_error, is_ipc_interface,
+    serializable_interface_name_from_storage_identifier,
 };
+use crate::html::structured_serialize::message_record::MessageRecord;
+
+/// Where the record keeps the SharedArrayBuffers that it shares.
+#[derive(Clone, Copy)]
+enum SharedArrayBuffers<'a> {
+    None,
+    Lent(ReceivedIPCSerializationRecord<'a>, Option<SharedBuffers>),
+    Message(&'a MessageRecord),
+}
 
 pub(crate) struct StructuredSerializeReader<'a> {
     decoder: RecordDecoder<'a>,
     realm: Gc<Realm>,
-    ipc_record: Option<ReceivedIPCSerializationRecord<'a>>,
-    shared_buffers: Option<SharedBuffers>,
+    shared_array_buffers: SharedArrayBuffers<'a>,
 }
 
 impl<'a> StructuredSerializeReader<'a> {
@@ -39,8 +53,15 @@ impl<'a> StructuredSerializeReader<'a> {
         Self {
             decoder: RecordDecoder::new(SerializationType::Ipc, record.data()).expect("an IPC record has no prologue"),
             realm,
-            ipc_record: Some(record),
-            shared_buffers,
+            shared_array_buffers: SharedArrayBuffers::Lent(record, shared_buffers),
+        }
+    }
+
+    pub(crate) fn new_message(realm: Gc<Realm>, record: &'a MessageRecord) -> Self {
+        Self {
+            decoder: RecordDecoder::new(SerializationType::Ipc, &record.bytes).expect("an IPC record has no prologue"),
+            realm,
+            shared_array_buffers: SharedArrayBuffers::Message(record),
         }
     }
 
@@ -51,8 +72,7 @@ impl<'a> StructuredSerializeReader<'a> {
         Ok(Self {
             decoder,
             realm,
-            ipc_record: None,
-            shared_buffers: None,
+            shared_array_buffers: SharedArrayBuffers::None,
         })
     }
 
@@ -152,7 +172,7 @@ impl<'a> StructuredSerializeReader<'a> {
         let interface_name = match self.serialization_type() {
             SerializationType::Ipc => {
                 let interface_name = self.decode_u16()?;
-                serializable_interface_storage_identifier(interface_name).map(|_| interface_name)
+                is_ipc_interface(interface_name).then_some(interface_name)
             }
             SerializationType::Storage => match self.decode_utf16_string()?.as_units() {
                 ak::Utf16StringUnits::Ascii(identifier) => {
@@ -174,23 +194,110 @@ impl<'a> StructuredSerializeReader<'a> {
         )))
     }
 
-    pub(crate) fn array_buffer_from_shared_memory(&self, index: u32, shared_object_id: u64) -> WebIdlResult<Value> {
-        let Some(shared_buffers) = self.shared_buffers else {
-            return Err(data_clone_error_from_serialization_error(
-                self.realm,
-                "SharedArrayBuffer side-list index out of range",
-            ));
-        };
-        shared_buffers.shared_array_buffer(self.realm, index, shared_object_id)
+    pub(crate) fn array_buffer_from_shared_memory(
+        &self,
+        vm: &Vm,
+        index: u32,
+        shared_object_id: u64,
+    ) -> WebIdlResult<Value> {
+        let index_out_of_range =
+            || data_clone_error_from_serialization_error(self.realm, "SharedArrayBuffer side-list index out of range");
+        match self.shared_array_buffers {
+            SharedArrayBuffers::Lent(_, Some(shared_buffers)) => {
+                shared_buffers.shared_array_buffer(self.realm, index, shared_object_id)
+            }
+            SharedArrayBuffers::Message(record) => {
+                let shared_memory = record
+                    .shared_memory
+                    .get(index as usize)
+                    .ok_or_else(index_out_of_range)?;
+                let array_buffer = ArrayBuffer::create_from_shared_memory(
+                    vm,
+                    self.realm,
+                    shared_memory.descriptor.as_shared_memory(),
+                    shared_memory.size,
+                    shared_object_id,
+                )
+                .map_err(|_| {
+                    data_clone_error_from_serialization_error(self.realm, "Unable to map SharedArrayBuffer memory")
+                })?;
+                Ok(Value::from_object(array_buffer))
+            }
+            SharedArrayBuffers::None | SharedArrayBuffers::Lent(_, None) => Err(index_out_of_range()),
+        }
     }
 
+    /// A new SharedArrayBuffer that shares the storage of the buffer at the index of the record's same-process side
+    /// table, if there is such a buffer, and its storage can be shared.
     pub(crate) fn array_buffer_sharing_side_table_entry(
         &self,
+        vm: &Vm,
         side_table_index: u32,
         byte_length: usize,
         preserve_growability: bool,
-    ) -> Option<Gc<Object>> {
-        self.ipc_record?
-            .shared_array_buffer(self.realm, side_table_index, byte_length, preserve_growability)
+    ) -> Option<Gc<ArrayBuffer>> {
+        let source_buffer = match self.shared_array_buffers {
+            SharedArrayBuffers::None => return None,
+            SharedArrayBuffers::Lent(record, _) => record.shared_array_buffer(side_table_index)?,
+            SharedArrayBuffers::Message(record) => *record.shared_array_buffers.get(side_table_index as usize)?,
+        };
+        array_buffer_sharing_storage_with(vm, self.realm, source_buffer, byte_length, preserve_growability)
     }
+}
+
+fn foreign_cell_slot(cell: NonNull<c_void>) -> ForeignCellSlot {
+    let slot = ForeignCellSlot::empty();
+    // SAFETY: The cell is a live cell of the heap, which the slot then keeps alive.
+    unsafe { slot.set(Some(cell)) };
+    slot
+}
+
+// Returns None when the source storage cannot be aliased, allowing the caller to copy it.
+fn array_buffer_sharing_storage_with(
+    vm: &Vm,
+    realm: Gc<Realm>,
+    source_buffer: Gc<ArrayBuffer>,
+    byte_length: usize,
+    preserve_growability: bool,
+) -> Option<Gc<ArrayBuffer>> {
+    assert!(source_buffer.is_shared_array_buffer());
+    let fixed_byte_length = (!preserve_growability).then_some(byte_length);
+    let data_block = source_buffer.with_data_block(|source_block| match &source_block.byte_buffer {
+        // Flatten alias chains to the actual owner. Keep this buffer's byte length because the owner's
+        // storage may be larger (for example, a fixed-length view of growable WebAssembly.Memory).
+        DataBlockStorage::External(external) => Some(DataBlock::external(
+            ExternalPrimitiveStorage::new(
+                foreign_cell_slot(external.owner()),
+                external.handle(),
+                fixed_byte_length,
+            ),
+            ArrayBufferShared::Yes,
+        )),
+
+        // AD-HOC: A fixed-length shared block backed by cross-process shared memory is aliased by referencing the same
+        //         shared object — so the clone shares its bytes, and can itself be shared with an agent in another
+        //         process.
+        DataBlockStorage::Shared(store) => {
+            SharedBackingStore::adopt(store.shared_memory(), store.size(), store.object_id())
+                .ok()
+                .map(DataBlock::shared_memory)
+        }
+
+        DataBlockStorage::Owned(owned) => {
+            // Zero-length buffers have no backing storage to share.
+            if owned.handle() == GC_PRIMITIVE_STORAGE_NULL_HANDLE {
+                return None;
+            }
+            // SAFETY: The source buffer is a live cell.
+            let owner = unsafe { NonNull::new_unchecked(source_buffer.as_ptr().cast()) };
+            Some(DataBlock::external(
+                ExternalPrimitiveStorage::new(foreign_cell_slot(owner), owned.handle(), fixed_byte_length),
+                ArrayBufferShared::Yes,
+            ))
+        }
+
+        // A detached block has no storage to share.
+        DataBlockStorage::Empty => None,
+    })?;
+    Some(ArrayBuffer::create_from_data_block(vm, realm, data_block))
 }

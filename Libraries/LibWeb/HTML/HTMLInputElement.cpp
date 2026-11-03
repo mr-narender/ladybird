@@ -806,7 +806,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16View value)
             relevant_value_was_changed();
 
             if (selection_or_range_applies())
-                set_the_selection_range(m_value.length_in_code_units(), m_value.length_in_code_units());
+                set_the_selection_range(m_value.length_in_code_units(), m_value.length_in_code_units(), SelectionDirection::None, SelectionSource::ValueChange);
 
             update_shadow_tree();
         } else if (!m_date_time_fields.is_empty()) {
@@ -1950,6 +1950,8 @@ void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, Type
 
     // 4. Update the element's rendering and behavior to the new state's.
     m_type = new_state;
+    // NB: Which box the element gets depends on its state.
+    set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementTypeAttribute);
     // Only the Image Button state maps align, border, width, height, hspace and vspace to hints,
     // so entering or leaving it changes the element's hints without any attribute changing.
     if ((old_state == TypeAttributeState::ImageButton) != (new_state == TypeAttributeState::ImageButton))

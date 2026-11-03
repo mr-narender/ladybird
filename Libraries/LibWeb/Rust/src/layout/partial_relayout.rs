@@ -189,9 +189,8 @@ impl LayoutNodeArena {
         //       boundary triggers ancestor scrollable overflow recomputation after commit.
 
         let parent_style = (!data.parent.get().is_invalid())
-            .then(|| self.style_payloads(data.parent.get()))
-            .flatten()
-            .map(|payloads| crate::css::computed_value_views::ComputedValuesView::new(&payloads.groups));
+            .then(|| self.style_view(data.parent.get()))
+            .flatten();
         matches!(
             formatting_context_type_created_by_node_data(
                 data,
@@ -283,7 +282,7 @@ impl LayoutNodeArena {
 
     /// Selects the boundary subtrees to relay out after the layout tree build. Consumes the
     /// escape bit either way: a refusal here is followed by a full layout pass in the same
-    /// update, which re-derives every fact the bit stands in for.
+    /// update.
     pub(crate) fn plan_partial_relayout(
         &mut self,
         root: NodeSlotId,
@@ -293,7 +292,11 @@ impl LayoutNodeArena {
     ) -> Option<Vec<PlannedBoundary>> {
         let pending_updates_escaped = std::mem::replace(&mut self.pending_updates_escape_partial_relayout, false)
             || layout_tree_update_escaped_rebuild_roots;
-        if self.node_needs_layout_update(root) || pending_updates_escaped {
+        // NB: A build can replace the root, which leaves nothing laid out around the boundaries, and no mark on the new box.
+        if self.node_needs_layout_update(root)
+            || pending_updates_escaped
+            || !self.paintable_rows().paintable_row_is_populated(root)
+        {
             return None;
         }
         self.collect_partial_relayout_roots(registered_root_slots, rebuilt_subtree_root_slots)
@@ -451,6 +454,10 @@ impl LayoutNodeArena {
         if inputs.containing_block_info.derives_from_own_computed_values {
             return false;
         }
+        // What the box's anchor functions resolved to last time says nothing of the style it has now.
+        if inputs.resolved_anchor_insets.is_some() {
+            return false;
+        }
 
         let Some(style) = node_facts::node_style_view(data) else {
             return false;
@@ -473,21 +480,20 @@ impl LayoutNodeArena {
     pub(crate) fn defer_child_list_insertion_layout_update(&mut self, parent: NodeSlotId) {
         let grandparent = self.data(parent).parent.get();
         self.deferred_child_list_insertion_parents.push((parent, grandparent));
+        self.deferred_child_list_insertion_parent_slots.insert(parent);
     }
 
-    /// Invalidate what the children attached by a layout tree build reach. `attached_roots` are the
-    /// roots of every subtree the build attached.
+    /// Invalidate what the children attached by a layout tree build reach. `inserted_children` are
+    /// the children the build attached to the deferred parents, each with the parent it was attached to.
     ///
     /// A child that is absolutely positioned against the box it was inserted into, with both axes
     /// placed by insets, changes neither that box nor anything around it: its containing block
     /// is the box's committed padding box, and it is laid out on its own from there. Only the
     /// cached runs above it have to forget their children. Any other insertion invalidates the
     /// box as the mutation did before the build.
-    pub(crate) fn resolve_deferred_child_list_insertions(
-        &mut self,
-        attached_roots: &crate::css::style::fast_hash::FastSet<NodeSlotId>,
-    ) {
+    pub(crate) fn resolve_deferred_child_list_insertions(&mut self, inserted_children: &[(NodeSlotId, NodeSlotId)]) {
         self.confined_abspos_layout_inputs.clear();
+        self.deferred_child_list_insertion_parent_slots.clear();
         let mut parents = std::mem::take(&mut self.deferred_child_list_insertion_parents);
         parents.sort_unstable_by_key(|(parent, _)| parent.index);
         parents.dedup_by_key(|(parent, _)| *parent);
@@ -504,11 +510,15 @@ impl LayoutNodeArena {
                 }
                 continue;
             }
-            let inserted: Vec<NodeSlotId> = attached_roots
+            let mut inserted: Vec<NodeSlotId> = inserted_children
                 .iter()
-                .copied()
-                .filter(|&root| self.slot_is_live(root) && self.data(root).parent.get() == parent)
+                .filter(|&&(inserted_parent, child)| {
+                    inserted_parent == parent && self.slot_is_live(child) && self.data(child).parent.get() == parent
+                })
+                .map(|&(_, child)| child)
                 .collect();
+            inserted.sort_unstable_by_key(|child| child.index);
+            inserted.dedup();
             let confined_inputs: Option<Vec<(NodeSlotId, AbsposLayoutInputs)>> = (!inserted.is_empty()
                 && !self.node_needs_layout_update(parent))
             .then(|| {
@@ -553,7 +563,7 @@ impl LayoutNodeArena {
         }
         let style = node_facts::node_style_view(data)?;
         let anchor = style.anchor();
-        if style.box_values().position != positioning::ABSOLUTE
+        if style.position() != positioning::ABSOLUTE
             || style.has_position_anchor()
             || anchor.position_area.length != 0
             || anchor.position_try_fallbacks.length != 0
@@ -605,9 +615,8 @@ impl LayoutNodeArena {
         let parent_style = node_facts::node_style_view(parent_data);
         let grandparent = parent_data.parent.get();
         let grandparent_style = (!grandparent.is_invalid())
-            .then(|| self.style_payloads(grandparent))
-            .flatten()
-            .map(|payloads| crate::css::computed_value_views::ComputedValuesView::new(&payloads.groups));
+            .then(|| self.style_view(grandparent))
+            .flatten();
         if !matches!(
             formatting_context_type_created_by_node_data(
                 parent_data,
@@ -688,6 +697,41 @@ impl LayoutNodeArena {
             damage |= PaintDamage::ALL_PRODUCERS;
         }
         self.push_paint_damage(parent, damage);
+    }
+
+    /// Marks for layout every box whose style renders in one of the font cascades of `font_lists`, which loads filled
+    /// faces into in place: as with a font fallback list resolving a loaded face, the styles stay, and only what lays
+    /// their text out runs again.
+    pub(crate) fn relayout_users_of_font_lists(&mut self, font_lists: &[u64]) {
+        let mut users = Vec::new();
+        let mut node = self.bound_viewport_row();
+        while !node.is_invalid() {
+            if self
+                .node_style_if_live(node)
+                .is_some_and(|style| font_lists.contains(&(style.font().font_cascade_list.as_raw() as u64)))
+            {
+                users.push(node);
+            }
+            let data = self.data(node);
+            node = data.first_child.get();
+            if node.is_invalid() {
+                let mut current = data;
+                loop {
+                    node = current.next_sibling.get();
+                    if !node.is_invalid() {
+                        break;
+                    }
+                    let parent = current.parent.get();
+                    if parent.is_invalid() {
+                        break;
+                    }
+                    current = self.data(parent);
+                }
+            }
+        }
+        for user in users {
+            self.set_needs_layout_update(user, true);
+        }
     }
 
     pub(crate) fn set_needs_layout_update(&mut self, node: NodeSlotId, propagate_through_ancestors: bool) {

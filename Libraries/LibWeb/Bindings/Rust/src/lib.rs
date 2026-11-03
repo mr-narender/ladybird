@@ -116,6 +116,8 @@ pub(crate) mod indexed_db;
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
 pub(crate) mod speech;
+#[cfg(not(test))]
+pub(crate) mod storage_api;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
@@ -151,6 +153,8 @@ pub(crate) mod web_assembly;
 pub(crate) mod web_gl;
 #[cfg(not(test))]
 pub(crate) mod webidl;
+#[cfg(not(test))]
+pub(crate) mod webrtc;
 
 // The generators of the build script, whose tests run with those of the crate.
 #[cfg(test)]

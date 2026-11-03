@@ -13,12 +13,16 @@ pub use crate::embedding::abi_types::{completion_into_abi, object_from_abi, vm_f
 pub use crate::embedding::host::host_function::HostFunction;
 pub use crate::embedding::host::host_module::{HostModule, host_class_of as host_module_class_of};
 pub use crate::embedding::host::host_object::{HostObject, host_class_of, host_data_of, is_host_instance_of};
+pub use crate::gc::capi::GC_PRIMITIVE_STORAGE_NULL_HANDLE;
 pub use crate::gc::class::ExternalMemorySize;
 pub use crate::gc::defer_gc::DeferGc;
 pub use crate::gc::embedder_cell::{EmbedderCell, EmbedderClass, EmbedderValue};
 pub use crate::gc::foreign::ForeignCellSlot;
 pub use crate::gc::gc_ref_cell::{GcRefCell, GcRefMut};
 pub use crate::gc::root::{CellRoot, MarkedVec, Root};
+pub use crate::gc::shared_memory::{
+    AsSharedMemory, OwnedSharedMemory, borrowed_from_raw_descriptor, into_raw_descriptor,
+};
 pub use crate::gc::visitor::{Trace, Visitor};
 pub use crate::gc::weak::GcWeak;
 pub use crate::interpreter::vm::{TypeErrorRealmScope, Vm};
@@ -41,7 +45,7 @@ pub use crate::runtime::agent::agent_can_suspend;
 pub use crate::runtime::array::Array;
 pub use crate::runtime::array_buffer::{
     ArrayBuffer, DataBlock, DataBlockStorage, ExternalPrimitiveStorage, Order as ArrayBufferOrder,
-    Shared as ArrayBufferShared, clone_array_buffer, create_byte_data_block, detach_array_buffer,
+    Shared as ArrayBufferShared, SharedBackingStore, clone_array_buffer, create_byte_data_block, detach_array_buffer,
 };
 pub use crate::runtime::big_int::BigInt;
 pub use crate::runtime::big_int_object::BigIntObject;

@@ -290,6 +290,7 @@ fn marker_runtime() -> RuntimeInfo {
     runtime.offsets.object_shape = 48;
     runtime.offsets.object_named_properties = 56;
     runtime.object_allocation.inline_storage_offset = 64;
+    runtime.object_allocation.plain_inline_storage_offset = 64;
     runtime.object_allocation.inline_capacity_offset = 40;
     runtime.offsets.shape_dictionary_generation = 84;
     runtime.object_allocation.template = vec![PLAIN_OBJECT_CLASS];
@@ -1194,8 +1195,9 @@ fn fake_object_layout() -> RuntimeLayout {
         string_object_class: STRING_OBJECT_CLASS,
         string_prototype_class: STRING_PROTOTYPE_CLASS,
         object_flag_may_interfere: FLAG_MAY_INTERFERE,
-        array_length_writable: 0,
-        array_is_proxy_target: 0,
+        array_flags: 0,
+        array_flag_length_not_writable: 1,
+        array_flag_is_proxy_target: 2,
         shape_prototype: 0,
         object_flag_is_typed_array: FLAG_IS_TYPED_ARRAY,
         object_flag_is_htmldda: HTMLDDA_FLAG,
@@ -1231,8 +1233,7 @@ fn fake_object_layout() -> RuntimeLayout {
         utf16_string_data_has_utf16_storage: 1,
         utf16_string_data_storage: 24,
         single_ascii_character_strings: 0,
-        function_object_builtin: 24,
-        function_object_has_builtin: 25,
+        function_object_builtin: 15,
         builtin_string_prototype_char_code_at: 7,
         builtin_string_prototype_char_at: 8,
         builtin_math_abs: 9,
@@ -1268,7 +1269,7 @@ fn fake_object_layout() -> RuntimeLayout {
         generator_object_pending_completion_value: 0,
         generator_object_pending_completion_type: 0,
         declarative_environment_binding_values_size: 32,
-        declarative_environment_binding_values_capacity: 40,
+        declarative_environment_inline_binding_capacity: 40,
         environment_shape_binding_names: 48,
         environment_shape_has_unique_binding_names: 32,
         declarative_environment_shape: 24,
@@ -1877,7 +1878,7 @@ const BINDING_MUTABLE: u8 = 2;
 struct FakeEnvironment {
     words: &'static mut [u64],
     values: Vec<u64>,
-    rare_data: Vec<u64>,
+    rare_data: &'static mut [u64],
     rare_flags: Vec<u8>,
     shape: &'static mut [u64],
     shape_flags: Vec<u8>,
@@ -1888,10 +1889,10 @@ impl FakeEnvironment {
     /// a shape (if any) and whose other flags are in its rare data.
     fn new(values: &[u64], flags: &[u8], shape_flags: Option<usize>, outer: Option<&FakeEnvironment>) -> Box<Self> {
         let in_shape = shape_flags.unwrap_or(0);
-        let mut environment = Box::new(Self {
+        let environment = Box::new(Self {
             words: super::fake_heap::cell(&[0; 10]),
             values: values.to_vec(),
-            rare_data: vec![0; 8],
+            rare_data: super::fake_heap::cell(&[0; 8]),
             rare_flags: flags[in_shape..].to_vec(),
             shape: super::fake_heap::cell(&[0; 8]),
             shape_flags: flags[..in_shape].to_vec(),
@@ -1904,7 +1905,7 @@ impl FakeEnvironment {
             environment.words[3] = super::fake_heap::compressed(environment.shape.as_ptr() as u64);
         }
         environment.words[6] = environment.values.as_ptr() as u64;
-        environment.words[7] = environment.rare_data.as_ptr() as u64;
+        environment.words[7] = super::fake_heap::compressed(environment.rare_data.as_ptr() as u64);
         environment
     }
 
@@ -2203,6 +2204,10 @@ impl FakeGlobals {
         globals.object[7] = globals.named_properties.as_ptr() as u64;
         globals.shape[10] = 7 << 32;
         globals.environment.words[8] = 99;
+        // NB: The code of these tests has a heap region base of 0, so compressed pointers name low fake cells.
+        let rare_data = low_cell(&[0; 8]);
+        rare_data[5] = globals.environment.rare_flags.as_ptr() as u64;
+        globals.environment.words[7] = compressed(rare_data);
         globals.realm[3] = globals.object.as_ptr() as u64;
         globals.realm[4] = globals.environment.address();
         globals.executable[1] = globals.caches.as_ptr() as u64;
@@ -3490,12 +3495,11 @@ fn saw_builtin(snapshot: &mut Snapshot, builtin: u8) {
     }];
 }
 
-/// Fake function memory: its flags at byte 8, and the builtin it is (if
-/// any) at bytes 24 and 25, see `function_object_builtin` in the test
-/// layout.
+/// Fake function memory: its flags at byte 8, and the builtin it is plus one
+/// (if any) at byte 15, see `function_object_builtin` in the test layout.
 fn fake_function(builtin: Option<u8>) -> u64 {
-    let builtin = builtin.map_or(0, |builtin| u64::from(builtin) | 1 << 8);
-    let memory: &'static mut [u64; 4] = Box::leak(Box::new([0, u64::from(FUNCTION_FLAG), 0, builtin]));
+    let builtin = builtin.map_or(0, |builtin| u64::from(builtin) + 1);
+    let memory: &'static mut [u64; 2] = Box::leak(Box::new([0, u64::from(FUNCTION_FLAG) | builtin << 56]));
     u64::from(value::OBJECT_TAG) << 48 | memory.as_ptr() as u64
 }
 

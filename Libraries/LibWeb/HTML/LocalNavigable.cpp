@@ -965,7 +965,17 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
     auto history_entry = create_session_history_entry_from_ui_process(create_session_history_entry_descriptor(move(request.history_entry), 0), reconstruction_state);
     history_entry->set_step(SessionHistoryEntry::Pending::Tag);
 
-    navigable->set_ongoing_navigation(request.navigation_id);
+    // AD-HOC: A navigation this process started after the UI process sent this request supersedes it, and the UI
+    //         process ends this one once it hears of that one. Until then the newer navigation stays parked here, or
+    //         queued if it is to a javascript: URL, and must stay the ongoing navigation: otherwise its unload check
+    //         would find itself superseded, leaving no navigation to go on. The task below finds this navigation
+    //         superseded, as it does one superseded after this point.
+    auto ongoing_navigation = navigable->ongoing_navigation();
+    auto const* ongoing_navigation_id = ongoing_navigation.get_pointer<Utf16String>();
+    auto is_superseded_by_newer_navigation = ongoing_navigation_id && *ongoing_navigation_id != request.navigation_id
+        && (navigable->has_navigation_parked_for_population(*ongoing_navigation_id) || navigable->m_queued_javascript_url_navigations.contains_slow(*ongoing_navigation_id));
+    if (!is_superseded_by_newer_navigation)
+        navigable->set_ongoing_navigation(request.navigation_id);
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate
     // 15. If navigable's parent is non-null, then set navigable's is delaying load events to true.
@@ -979,8 +989,10 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
     TemporaryExecutionContext execution_context { realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
     auto navigation_params_or_error = create_navigation_params_from_descriptor(realm, *navigable, move(result.navigation_params));
     if (navigation_params_or_error.is_error()) {
-        navigable->set_ongoing_navigation({});
-        navigable->set_delaying_load_events(false);
+        if (!is_superseded_by_newer_navigation) {
+            navigable->set_ongoing_navigation({});
+            navigable->set_delaying_load_events(false);
+        }
         page().client().navigation_population_failed(request.navigable_id, request.navigation_id);
         return;
     }
@@ -3223,11 +3235,16 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
                 // Async path: bytes not yet available, wait for them
                 nav_params->response->resume_body_delivery_up_to(Fetch::Infrastructure::MAX_SNIFF_BYTES);
                 body->wait_for_sniff_bytes(GC::create_function(heap(),
-                    [output, nav_params, navigation_params, completion_steps, source_allows_downloading, source_interface_origin, url](Fetch::Infrastructure::Body::SniffBytes sniff_bytes) {
+                    [output, nav_params, navigation_params, completion_steps, source_allows_downloading, source_interface_origin, url, navigation_id, is_reload_traversal](Fetch::Infrastructure::Body::SniffBytes sniff_bytes) {
                         // AD-HOC: The document may have been destroyed between when the fetch started and when the
                         //         bytes arrived. A response that failed mid-sniff must not be loaded as a document
                         //         off its partial bytes either.
-                        if (nav_params->navigable->active_browsing_context() && sniff_bytes.outcome == Fetch::Infrastructure::Body::SniffOutcome::Complete) {
+                        // AD-HOC: A navigation that a newer one superseded during the wait makes no document either:
+                        //         the document would take over the Window of an initial about:blank, whose tasks then
+                        //         wait for a document that never becomes active, among them those of the newer
+                        //         navigation.
+                        auto is_superseded = navigation_id.has_value() && nav_params->navigable->ongoing_navigation() != navigation_id && !is_reload_traversal;
+                        if (!is_superseded && nav_params->navigable->active_browsing_context() && sniff_bytes.outcome == Fetch::Infrastructure::Body::SniffOutcome::Complete) {
                             load_document_or_handle_download(nav_params, sniff_bytes.bytes, url, source_allows_downloading, source_interface_origin, *output);
                         } else {
                             stop_response_body_delivery(navigation_params);
@@ -4075,6 +4092,12 @@ GC::Ptr<DOM::Document> LocalNavigable::evaluate_javascript_url(URL::URL const& u
         return nullptr;
     }
 
+    // AD-HOC: As navigate_to_a_javascript_url() goes on for a navigation that a later one superseded, that one can be the
+    //         ongoing navigation here, or one the script itself began. It is what the navigable ends on, so the script's
+    //         result makes no document.
+    if (!ongoing_navigation().has<Empty>())
+        return nullptr;
+
     // 11. Let response be a new response with
     //     URL: targetNavigable's active document's URL
     //     header list: «(`Content-Type`, `text/html;charset=utf-8`)»
@@ -4176,7 +4199,10 @@ void LocalNavigable::navigate_to_a_javascript_url(NonnullRefPtr<Fetch::Infrastru
     }
 
     // 3. Set the ongoing navigation for targetNavigable to null.
-    set_ongoing_navigation({});
+    // AD-HOC: As step 2 goes on for a navigation a later one superseded, the ongoing navigation can be that later one.
+    bool const superseded = ongoing_navigation() != navigation_id;
+    if (!superseded)
+        set_ongoing_navigation({});
 
     // 4. If initiatorOrigin is not same origin-domain with targetNavigable's active document's origin, then return.
     if (!initiator_origin.is_same_origin_domain(active_document()->origin())) {
@@ -4204,7 +4230,9 @@ void LocalNavigable::navigate_to_a_javascript_url(NonnullRefPtr<Fetch::Infrastru
         //    about:blank is true:
         // NOTE: container can be null if author code, such as the Trusted Types default policy or
         //       javascript:frameElement.remove(), removed it.
-        if (initial_insertion == InitialInsertion::Yes && container && active_document()->is_initial_about_blank()) {
+        // AD-HOC: A navigation a later one superseded would have returned at step 2, and that one is still to replace the
+        //         document, so nothing has loaded yet.
+        if (!superseded && initial_insertion == InitialInsertion::Yes && container && active_document()->is_initial_about_blank()) {
             // 1. If container is an iframe element, then run the iframe load event steps given container.
             if (auto* iframe = as_if<HTMLIFrameElement>(*container)) {
                 run_iframe_load_event_steps(*iframe);
@@ -4695,6 +4723,7 @@ void LocalNavigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList 
     if (m_viewport_size == size && invalidate_display_list == InvalidateDisplayList::No)
         return;
 
+    auto previous_viewport_size = m_viewport_size;
     m_viewport_size = size;
 
     if (has_compositor_context()) {
@@ -4705,10 +4734,11 @@ void LocalNavigable::set_viewport_size(CSSPixelSize size, InvalidateDisplayList 
     }
 
     if (auto document = active_document()) {
+        // NB: A display list invalidated with the viewport is for a device pixel ratio that moved, as a zoom moves it.
         if (invalidate_display_list == InvalidateDisplayList::PaintCommandsAndHitTestList)
-            document->record_style_environment_change();
-        else
-            document->invalidate_style_for_viewport_change();
+            document->record_style_environment_change(DOM::StyleEnvironmentChange::DevicePixelRatio | DOM::StyleEnvironmentChange::MediaFeatures);
+        if (previous_viewport_size != size)
+            document->invalidate_style_for_viewport_change(previous_viewport_size);
         document->set_needs_media_query_evaluation();
         document->set_needs_layout_update(DOM::SetNeedsLayoutReason::NavigableSetViewportSize);
     }
@@ -6087,7 +6117,16 @@ void LocalNavigable::inform_the_navigation_api_about_aborting_navigation()
 GC::Ptr<DOM::Node> LocalNavigable::currently_focused_area()
 {
     // 1. If traversable does not have system focus, then return null.
-    if (!is_focused())
+    if (!page().client().has_focus())
+        return nullptr;
+    return focused_area_regardless_of_system_focus();
+}
+
+// The rest of the currently focused area's steps, which don't depend on system focus.
+GC::Ptr<DOM::Node> LocalNavigable::focused_area_regardless_of_system_focus()
+{
+    // NB: Below a top-level traversable, focus is here only while this is the tab's focused navigable.
+    if (!is_top_level_traversable() && page().focused_navigable().ptr() != this)
         return nullptr;
 
     // 2. Let candidate be traversable's active document.
@@ -6105,7 +6144,7 @@ GC::Ptr<DOM::Node> LocalNavigable::currently_focused_area()
         // NB: The active document of a navigable another process hosts is there. The walk goes on from it as the tab's
         //     focused navigable shows, and the container is as far as focus is seen here otherwise.
         if (!is<LocalNavigable>(*content_navigable)) {
-            if (auto focused_area = content_navigable->currently_focused_area_shown_by_focused_navigable())
+            if (auto focused_area = content_navigable->focused_area_shown_by_focused_navigable_regardless_of_system_focus())
                 return focused_area;
             return container;
         }
@@ -7369,7 +7408,7 @@ void LocalNavigable::abort_in_flight_smooth_scrolls_taken_over_by_user_input(Web
 static bool scrolls_smoothly(Bindings::ScrollBehavior behavior, GC::Ptr<DOM::Element> associated_element)
 {
     if (behavior == Bindings::ScrollBehavior::Auto && associated_element) {
-        if (auto const* values = associated_element->style_group<CSS::ComputedValues::MiscResetValues>())
+        if (auto const* values = associated_element->style_group<CSS::ComputedValues::MiscInteractionValues>())
             return static_cast<CSS::ScrollBehavior>(values->scroll_behavior) == CSS::ScrollBehavior::Smooth;
     }
     return behavior == Bindings::ScrollBehavior::Smooth;
@@ -7983,8 +8022,8 @@ void LocalNavigable::reset_zoom()
 bool LocalNavigable::has_inclusive_ancestor_with_visibility_hidden() const
 {
     if (auto container = this->container()) {
-        if (auto const* values = container->style_group<CSS::ComputedValues::InheritedBoxValues>()) {
-            if (static_cast<CSS::Visibility>(values->visibility) == CSS::Visibility::Hidden)
+        if (auto const* values = container->style_inherited_set_values()) {
+            if (CSS::visibility_from_inherited_bits(values->bits) == CSS::Visibility::Hidden)
                 return true;
         }
         if (auto ancestor_navigable = container->document().navigable()) {

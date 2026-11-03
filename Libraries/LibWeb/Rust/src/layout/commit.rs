@@ -18,6 +18,9 @@ pub enum FfiCommitMessageKind {
     /// The node is the element a box escaped its rebuild root under, so its layout tree has to be
     /// built again.
     LayoutTreeRebuildRequested,
+    /// The node is the element whose box keeps a white space text whose box the build could not add or take away
+    /// without building the element's child list again.
+    WhitespaceTextBoxesStale,
     /// A top layer member was reached with no box and nothing scheduled to rebuild it, so the
     /// document has to run another top layer zone pass. This one is about the document itself.
     TopLayerZoneRebuildNeeded,
@@ -461,8 +464,12 @@ impl<'tree> Commit<'_, 'tree> {
         if fragment.line_data.is_some() {
             line_root_changes_for_children = replaced.line_root_changes;
         }
-        if prepared.row_existed_before_this_commit
-            && let Some((old_content_size, new_content_size)) = replaced.content_size_change
+        let content_size_change = if prepared.row_existed_before_this_commit {
+            replaced.content_size_change
+        } else {
+            self.arena().content_size_change_of_rebuilt_box(node)
+        };
+        if let Some((old_content_size, new_content_size)) = content_size_change
             && crate::layout::node_facts::node_style_view(self.arena().data(node)).is_some_and(|style| {
                 content_size_change_affects_container_queries(style, old_content_size, new_content_size)
             })
@@ -698,7 +705,7 @@ impl<'tree> Commit<'_, 'tree> {
     }
 }
 
-fn content_size_change_affects_container_queries(
+pub(crate) fn content_size_change_affects_container_queries(
     style: crate::css::computed_value_views::ComputedValuesView<'_>,
     old_size: FfiCssPixelSize,
     new_size: FfiCssPixelSize,

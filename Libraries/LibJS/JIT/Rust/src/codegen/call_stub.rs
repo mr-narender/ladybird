@@ -45,6 +45,7 @@ use crate::ir::BlockId;
 use crate::ir::Graph;
 use crate::ir::value;
 use crate::regalloc::Allocation;
+use crate::snapshot::COMPRESSED_POINTER_SHIFT;
 use crate::snapshot::RuntimeInfo;
 
 /// Where the stub keeps its inputs and what must survive calls into the
@@ -112,6 +113,7 @@ pub fn generate_call_stub<M: PortableMacroAssembler>(runtime: &RuntimeInfo) -> R
         deferred_allocations: Vec::new(),
         deferred_storage_growths: Vec::new(),
         absorbed_initializations: Vec::new(),
+        inline_initializations: Default::default(),
     };
     codegen.emit_call_stub()?;
     let (code, _) = codegen
@@ -211,7 +213,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.emit_pop_free_list_of(scratch, cell, heap, from_runtime);
 
         // The environment, from the template's words and the call.
-        for index in 0..layout.function_environment_words {
+        for index in 0..layout.declarative_environment_words {
             self.masm.load64(
                 scratch,
                 &at(template, layout.call_environment_template_words + 8 * index),
@@ -236,8 +238,24 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             &at(function, self.runtime.offsets.ecmascript_function_environment),
         );
         self.masm.store32(&at(cell, layout.function_environment_outer), scratch);
+        // The rest of a function environment, which only some callees need.
+        let no_function_fields = self.masm.new_label();
+        self.masm.load64(
+            scratch,
+            &at(template, layout.call_environment_template_has_function_fields),
+        );
         self.masm
-            .store64(&at(cell, layout.function_environment_function_object), function);
+            .branch_test64(Condition::Zero, scratch, u64::MAX, no_function_fields);
+        for index in layout.declarative_environment_words..layout.function_environment_words {
+            self.masm.load64(
+                scratch,
+                &at(template, layout.call_environment_template_words + 8 * index),
+            );
+            self.masm.store64(&at(cell, 8 * index), scratch);
+        }
+        self.masm.shr64_imm(scratch, function, COMPRESSED_POINTER_SHIFT);
+        self.masm
+            .store32(&at(cell, layout.function_environment_function_object), scratch);
         let no_this = self.masm.new_label();
         self.masm
             .load64(scratch, &at(template, layout.call_environment_template_binds_this));
@@ -246,6 +264,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .store64(&at(cell, layout.function_environment_this_value), scratch);
         self.masm.bind(no_this);
+        self.masm.bind(no_function_fields);
         self.masm.store64(&environment_local, cell);
 
         // Count the cell like the heap does.
@@ -799,7 +818,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let mut constants = self.emit_stub_call_site_fields(native_frame, temp, false);
         constants.extend([
             (offsets.execution_context_script_or_module, 8, 0),
-            (offsets.execution_context_script_or_module + 8, 8, 0),
             (offsets.execution_context_executable, 8, 0),
         ]);
         self.emit_constant_fields_with_vector(native_frame, temp, &mut constants, Some(M::ARGUMENT_FPRS[0]), &[])?;

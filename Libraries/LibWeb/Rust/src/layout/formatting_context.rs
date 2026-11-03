@@ -3519,7 +3519,7 @@ impl LayoutStageJob {
     /// committing them owes the host.
     fn run(self, state: &mut super::ArenaHandle) -> commit::CommitNotifications {
         let Self { kind, root, stage } = self;
-        prepare_layout_stage(state, kind, root);
+        prepare_layout_stage(state, kind);
         let input = LayoutStageInput {
             arena: state.arena(),
             scratch: state.layout_scratch(),
@@ -3655,31 +3655,12 @@ fn compute_root_layout(input: LayoutStageInput<'_>, should_collect_devtools_layo
     })
 }
 
-/// Brings the arena up to date for a stage before the stage borrows it: derives the facts its runs read, marks the
-/// flex and grid items of the nodes marked for layout, and applies the arena's memo invalidations to the stage's
-/// memos.
-fn prepare_layout_stage(state: &mut super::ArenaHandle, kind: LayoutStageKind, root: NodeSlotId) {
+/// Brings the arena up to date for a stage before the stage borrows it: a root stage covers whatever kept pending
+/// updates from a partial relayout, and the stage's memos take the arena's memo invalidations.
+fn prepare_layout_stage(state: &mut super::ArenaHandle, kind: LayoutStageKind) {
     let (arena, scratch) = state.arena_mut_and_layout_scratch();
-    match kind {
-        LayoutStageKind::Root { .. } => {
-            // NB: The tree builder derives the facts of rebuilt subtrees. Unclassified invalidations
-            // require deriving them for the entire tree instead.
-            if arena.pending_updates_escape_partial_relayout {
-                arena.derive_facts_in_subtree(root);
-                arena.clear_partial_relayout_escape();
-                arena.pending_attached_subtree_roots.clear();
-            } else {
-                // NB: Top-layer updates can attach boxes without running the tree builder.
-                arena.derive_facts_after_tree_update(&[]);
-            }
-            arena.mark_flex_and_grid_items_of_nodes_marked_for_layout();
-        }
-        LayoutStageKind::Boundary { .. } => {
-            // The boundary can be wider than the rebuilt roots that led to it, and laying it out may
-            // re-enter intrinsic sizing for descendants outside those roots, including anonymous boxes
-            // the incremental tree build created; derive the facts of the whole subtree.
-            arena.derive_facts_in_subtree(root);
-        }
+    if matches!(kind, LayoutStageKind::Root { .. }) {
+        arena.clear_partial_relayout_escape();
     }
     scratch.apply_memo_invalidations(arena);
     scratch.layout_trace.take_over_from(&mut arena.layout_trace);
@@ -3843,12 +3824,11 @@ fn layout_subtree_with_frozen_root_geometry(run: &FormattingContextRun<'_>) {
 #[cfg(test)]
 mod baseline_tests {
     use super::*;
-    use crate::css::computed_values::{BoxValues, GroupPayloadRef, clone_group_payload, release_group_payload};
     use crate::css::css_enums::keyword;
     use crate::css::display::FfiDisplay;
-    use crate::css::table_group_builder::group_index;
+    use crate::css::style::layout_style::LayoutScratchStyle;
     use crate::layout::layout_node_arena::LayoutNodeArena;
-    use crate::layout::node_data::{NodeConstructionFacts, NodeKind, StylePayloadsRef};
+    use crate::layout::node_data::{NodeConstructionFacts, NodeKind};
     use crate::layout::run_state::LayoutScratch;
 
     #[test]
@@ -3864,20 +3844,10 @@ mod baseline_tests {
     fn check_block_derivation(display: u16) {
         let mut arena = LayoutNodeArena::new();
         let scratch = LayoutScratch::default();
-        let mut child_style = FfiStylePayloads {
-            groups: std::array::from_fn(|index| GroupPayloadRef::default_payload(index).as_ptr()),
-        };
-        let mut parent_style = child_style;
-        // SAFETY: The source is the immortal default box payload. The clone is private until installed below.
-        let parent_box = unsafe { clone_group_payload(group_index::BOX, parent_style.groups[group_index::BOX]) };
-        // SAFETY: The clone has the BoxValues layout and no readers yet.
-        unsafe { (*parent_box.cast::<BoxValues>()).display = FfiDisplay::block() };
-        parent_style.groups[group_index::BOX] = parent_box;
-        // SAFETY: The source is the immortal default box payload. The clone is private until installed below.
-        let child_box = unsafe { clone_group_payload(group_index::BOX, child_style.groups[group_index::BOX]) };
-        // SAFETY: The clone has the BoxValues layout and no readers yet.
-        unsafe { (*child_box.cast::<BoxValues>()).display = FfiDisplay::from_single_keyword(display).unwrap() };
-        child_style.groups[group_index::BOX] = child_box;
+        let parent_style = LayoutScratchStyle::over_defaults(|style| style.box_mut().display = FfiDisplay::block());
+        let child_style = LayoutScratchStyle::over_defaults(|style| {
+            style.box_mut().display = FfiDisplay::from_single_keyword(display).unwrap();
+        });
         let facts = NodeConstructionFacts {
             kind: NodeKind::BlockContainer,
             is_anonymous: false,
@@ -3893,8 +3863,8 @@ mod baseline_tests {
         };
         let parent = arena.allocate(facts);
         let child = arena.allocate(facts);
-        arena.set_node_style(parent, 0, StylePayloadsRef::new(&parent_style));
-        arena.set_node_style(child, 0, StylePayloadsRef::new(&child_style));
+        arena.set_node_style(parent, 0, Some(parent_style.style()));
+        arena.set_node_style(child, 0, Some(child_style.style()));
         arena.insert_child(parent, child, Node::INVALID);
         let callbacks = LayoutPass::new(
             &arena,
@@ -3929,7 +3899,5 @@ mod baseline_tests {
         arena
             .free_subtree(parent)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
-        release_group_payload(group_index::BOX, child_box);
-        release_group_payload(group_index::BOX, parent_box);
     }
 }

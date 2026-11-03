@@ -39,7 +39,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let (rare_at_index, rare_at_offset, check) =
             (self.masm.new_label(), self.masm.new_label(), self.masm.new_label());
         let rare_flags = |codegen: &mut Self| {
-            codegen.masm.load64(
+            codegen.emit_load_compressed_cell(
                 scratch,
                 &Address::new(environment, layout.declarative_environment_rare_data as i32),
             );
@@ -54,7 +54,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             rare_at_index,
         );
         // Flags past the shape's are in the rare data, after the shape's.
-        self.masm.load64(
+        self.masm.load32(
             temp,
             &Address::new(scratch, layout.environment_shape_binding_flags_size as i32),
         );
@@ -122,11 +122,11 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             &Address::new(shape, layout.environment_shape_has_unique_binding_names as i32),
         );
         self.masm.branch_test32(Condition::Zero, scratch, 0xFF, fail);
-        self.masm.load64(
+        self.masm.load32(
             index,
             &Address::new(environment, layout.declarative_environment_binding_values_size as i32),
         );
-        self.masm.load64(
+        self.masm.load32(
             scratch,
             &Address::new(shape, layout.environment_shape_binding_flags_size as i32),
         );
@@ -148,14 +148,25 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm.move_imm64(shape, name);
         self.masm.branch64(Condition::NotEqual, scratch, shape, fail);
 
-        // Values that do not fit in their storage move first.
-        self.masm.load64(
+        // Values that do not fit in their storage move first. Outside of the cell, they have their capacity in front of
+        // the first value, if there is any storage.
+        let have_capacity = self.masm.new_label();
+        self.masm.load8(
             scratch,
             &Address::new(
                 environment,
-                layout.declarative_environment_binding_values_capacity as i32,
+                layout.declarative_environment_inline_binding_capacity as i32,
             ),
         );
+        self.masm
+            .branch_test32(Condition::NonZero, scratch, 0xFF, have_capacity);
+        self.masm.load64(
+            scratch,
+            &Address::new(environment, layout.declarative_environment_binding_values as i32),
+        );
+        self.masm.branch64_imm(Condition::Equal, scratch, 0, fail);
+        self.masm.load64(scratch, &Address::new(scratch, -8));
+        self.masm.bind(have_capacity);
         self.masm.branch64(Condition::BelowOrEqual, scratch, index, fail);
     }
 
@@ -165,7 +176,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let scratch = self.pinned.scratch;
         let layout = self.runtime.layout;
         let index = self.temp(node, 0);
-        self.masm.load64(
+        self.masm.load32(
             index,
             &Address::new(environment, layout.declarative_environment_binding_values_size as i32),
         );
@@ -176,7 +187,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         self.masm
             .store_imm64(&Address::indexed(scratch, index, Scale::Eight, 0), value::EMPTY);
         self.masm.add64_imm(index, index, 1);
-        self.masm.store64(
+        self.masm.store32(
             &Address::new(environment, layout.declarative_environment_binding_values_size as i32),
             index,
         );

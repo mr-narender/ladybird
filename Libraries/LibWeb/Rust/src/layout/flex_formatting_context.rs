@@ -4369,13 +4369,16 @@ impl<'pass> FlexFormattingContext<'pass> {
     }
 
     /// The block size of the margin boxes of the container's in-flow children, once its items are placed, unless a box
-    /// among them is not an item.
+    /// among them is not an item. A run of collapsible white space is no item and renders nothing.
     fn margin_box_block_extent_of_placed_in_flow_items(&self) -> Option<CssPixels> {
         let mut block_start = CssPixels::default();
         let mut block_end = CssPixels::default();
         for child in self.run.callbacks.children(self.run.box_) {
             let facts = self.facts(child);
-            if facts.is_box() && !facts.is_absolutely_positioned() {
+            if facts.is_box()
+                && !facts.is_absolutely_positioned()
+                && !self.run.callbacks.can_skip_is_anonymous_text_run(child)
+            {
                 let index = self.index_of_flex_item(child)?;
                 let metrics = &self.flex_item_details[index].cells;
                 let content_block_offset = self.item_content_offset(index).y;
@@ -4537,10 +4540,9 @@ fn abs(value: CssPixels) -> CssPixels {
 #[cfg(test)]
 mod stretch_cross_limit_tests {
     use super::*;
-    use crate::css::computed_values::{GroupPayloadRef, clone_group_payload, release_group_payload};
+    use crate::css::style::layout_style::LayoutScratchStyle;
     use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
-    use crate::css::table_group_builder::group_index;
-    use crate::layout::node_data::{NodeConstructionFacts, StylePayloadsRef};
+    use crate::layout::node_data::NodeConstructionFacts;
     use crate::layout::run_state::LayoutScratch;
 
     fn length(value: i32) -> ComputedSize {
@@ -4624,38 +4626,15 @@ mod stretch_cross_limit_tests {
         let max_constrained = cross_space == CrossSpace::MaxConstrained;
         let mut arena = LayoutNodeArena::new();
         let scratch = LayoutScratch::default();
-        let defaults = FfiStylePayloads {
-            groups: std::array::from_fn(|index| GroupPayloadRef::default_payload(index).as_ptr()),
-        };
-        let mut styles = [defaults; 3];
-        let mut clones = Vec::new();
-        for style in &mut styles {
-            for group in [
-                group_index::BOX,
-                group_index::SIZING,
-                group_index::ALIGNMENT,
-                group_index::SURROUND,
-                group_index::BORDER,
-            ] {
-                // SAFETY: The source is the immortal default payload for this group.
-                let payload = unsafe { clone_group_payload(group, style.groups[group]) };
-                style.groups[group] = payload;
-                clones.push((group, payload));
-            }
-        }
-        for (index, style) in styles.iter().enumerate() {
-            // SAFETY: These private clones have the selected group's layout and no readers yet.
-            unsafe {
-                let box_values = &mut *style.groups[group_index::BOX].cast_mut().cast::<BoxValues>();
-                box_values.display = if index == 0 {
+        let styles: [LayoutScratchStyle; 3] = std::array::from_fn(|index| {
+            LayoutScratchStyle::over_defaults(|style| {
+                style.box_mut().display = if index == 0 {
                     FfiDisplay::from_single_keyword(keyword::FLEX).unwrap()
                 } else {
                     FfiDisplay::block()
                 };
-                let alignment = &mut *style.groups[group_index::ALIGNMENT]
-                    .cast_mut()
-                    .cast::<AlignmentValues>();
                 if index == 0 {
+                    let alignment = style.alignment_mut();
                     alignment.flex_direction = if column {
                         flex_direction::COLUMN
                     } else {
@@ -4674,7 +4653,29 @@ mod stretch_cross_limit_tests {
                         align_items::FLEX_START
                     };
                 }
-                let sizing = &mut *style.groups[group_index::SIZING].cast_mut().cast::<SizingValues>();
+                if index == 1 && max_constrained {
+                    let surround = style.surround_mut();
+                    for side in [&mut surround.margin.top, &mut surround.margin.bottom] {
+                        *side = ComputedLengthPercentageOrAuto {
+                            is_auto: false,
+                            value: crate::css::computed_values::ComputedStyleValueHandle::length(5.0),
+                        };
+                    }
+                    for side in [&mut surround.padding.top, &mut surround.padding.bottom] {
+                        *side = ComputedLengthPercentageOrAuto {
+                            is_auto: false,
+                            value: crate::css::computed_values::ComputedStyleValueHandle::length(2.0),
+                        };
+                    }
+                    let border = style.border_mut();
+                    for side in [&mut border.border_top, &mut border.border_bottom] {
+                        side.line_style = line_style::SOLID;
+                        side.width = CssPixels::from_integer(3);
+                    }
+                    border.border_top_computed_width = CssPixels::from_integer(3);
+                    border.border_bottom_computed_width = CssPixels::from_integer(3);
+                }
+                let sizing = style.sizing_mut();
                 let cross = if index == 0 {
                     100
                 } else if index == 1 {
@@ -4692,28 +4693,6 @@ mod stretch_cross_limit_tests {
                         assert!(!column);
                         sizing.max_height = length(100);
                     }
-                }
-                if index == 1 && max_constrained {
-                    let surround = &mut *style.groups[group_index::SURROUND].cast_mut().cast::<SurroundValues>();
-                    for side in [&mut surround.margin.top, &mut surround.margin.bottom] {
-                        *side = ComputedLengthPercentageOrAuto {
-                            is_auto: false,
-                            value: crate::css::computed_values::ComputedStyleValueHandle::length(5.0),
-                        };
-                    }
-                    for side in [&mut surround.padding.top, &mut surround.padding.bottom] {
-                        *side = ComputedLengthPercentageOrAuto {
-                            is_auto: false,
-                            value: crate::css::computed_values::ComputedStyleValueHandle::length(2.0),
-                        };
-                    }
-                    let border = &mut *style.groups[group_index::BORDER].cast_mut().cast::<BorderValues>();
-                    for side in [&mut border.border_top, &mut border.border_bottom] {
-                        side.line_style = line_style::SOLID;
-                        side.width = CssPixels::from_integer(3);
-                    }
-                    border.border_top_computed_width = CssPixels::from_integer(3);
-                    border.border_bottom_computed_width = CssPixels::from_integer(3);
                 }
                 if index == 1 {
                     if auto {
@@ -4733,8 +4712,8 @@ mod stretch_cross_limit_tests {
                     };
                     *limit = ComputedSize::keyword(ComputedSizeKind::Stretch);
                 }
-            }
-        }
+            })
+        });
         let facts = NodeConstructionFacts {
             kind: NodeKind::BlockContainer,
             is_anonymous: false,
@@ -4752,7 +4731,7 @@ mod stretch_cross_limit_tests {
         let target = arena.allocate(facts);
         let peer = arena.allocate(facts);
         for (node, style) in [container, target, peer].into_iter().zip(&styles) {
-            arena.set_node_style(node, 0, StylePayloadsRef::new(style));
+            arena.set_node_style(node, 0, Some(style.style()));
         }
         for child in [target, peer] {
             arena.set_node_flag(child, NodeFlag::IsFlexItem, true);
@@ -4847,8 +4826,5 @@ mod stretch_cross_limit_tests {
         arena
             .free_subtree(container)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
-        for (group, payload) in clones {
-            release_group_payload(group, payload);
-        }
     }
 }

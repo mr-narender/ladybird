@@ -41,6 +41,7 @@ enum class SerializableSteps : u8 {
     DOMException,
     QuotaExceededError,
     CryptoKey,
+    RTCEncodedAudioFrame,
 };
 
 extern "C" {
@@ -48,11 +49,12 @@ extern "C" {
 void web_structured_serialize_set_ipc_record(IPCSerializationRecord*, ReadonlyBytes data, JSObject* const* shared_array_buffers, size_t count);
 void web_structured_serialize_set_storage_record(StorageSerializationRecord*, ReadonlyBytes data);
 bool web_structured_serialize_interface_storage_identifier(u16 interface_name, ReadonlyBytes* identifier);
+bool web_structured_serialize_is_ipc_interface(u16 interface_name);
 bool web_structured_serialize_interface_name_from_storage_identifier(ReadonlyBytes identifier, u16* interface_name);
 bool web_structured_serialize_shared_buffers_append_shared_memory(Vector<Core::AnonymousBuffer>*, JSObject* array_buffer, u32* index);
 
 void web_structured_serialize_ipc_record_data(IPCSerializationRecord const*, ReadonlyBytes* data);
-JSObject* web_structured_serialize_ipc_record_shared_array_buffer(IPCSerializationRecord const*, void* realm, u32 side_table_index, size_t byte_length, bool preserve_growability);
+JSObject* web_structured_serialize_ipc_record_shared_array_buffer(IPCSerializationRecord const*, u32 side_table_index);
 JSCompletion web_structured_serialize_shared_buffers_shared_array_buffer(Vector<Core::AnonymousBuffer> const*, void* realm, u32 index, u64 shared_object_id);
 size_t web_structured_serialize_byte_buffer_size(ByteBuffer*);
 JSObject* web_structured_serialize_array_buffer_from_byte_buffer(void* realm, ByteBuffer*, bool shared);
@@ -160,6 +162,15 @@ bool web_structured_serialize_interface_storage_identifier(u16 interface_name, R
     return false;
 }
 
+bool web_structured_serialize_is_ipc_interface(u16 interface_name)
+{
+    // Encoded audio frames can be cloned between agents, but cannot be stored.
+    if (static_cast<Bindings::InterfaceName>(interface_name) == Bindings::InterfaceName::RTCEncodedAudioFrame)
+        return true;
+    ReadonlyBytes identifier;
+    return web_structured_serialize_interface_storage_identifier(interface_name, &identifier);
+}
+
 bool web_structured_serialize_interface_name_from_storage_identifier(ReadonlyBytes identifier, u16* interface_name)
 {
     for (auto const& entry : serializable_storage_registry()) {
@@ -215,49 +226,12 @@ JSCompletion web_structured_serialize_shared_buffers_shared_array_buffer(Vector<
     return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { JS::ArrayBuffer::create(js_realm, shared_buffers->at(index), shared_object_id) });
 }
 
-// Returns no value when the source storage cannot be aliased, allowing the caller to copy it.
-static Optional<JS::DataBlock> data_block_sharing_storage_with(JS::ArrayBuffer& source_buffer, size_t byte_length, bool preserve_growability = false)
-{
-    VERIFY(source_buffer.is_shared_array_buffer());
-    auto const& source_block = source_buffer.data_block();
-
-    // Flatten alias chains to the actual owner. Keep this buffer's byte length because the owner's
-    // storage may be larger (for example, a fixed-length view of growable WebAssembly.Memory).
-    if (auto const* external = source_block.byte_buffer.get_pointer<JS::DataBlock::ExternalPrimitiveStorage>()) {
-        if (preserve_growability)
-            return JS::DataBlock { JS::DataBlock::ExternalPrimitiveStorage { external->owner, external->handle }, JS::DataBlock::Shared::Yes };
-        return JS::DataBlock { JS::DataBlock::ExternalPrimitiveStorage { external->owner, external->handle, byte_length }, JS::DataBlock::Shared::Yes };
-    }
-
-    // AD-HOC: A fixed-length shared block backed by cross-process shared memory is aliased by referencing the same
-    //         shared object — so the clone shares its bytes, and can itself be shared with an agent in another process.
-    if (auto const* shared = source_block.byte_buffer.get_pointer<JS::DataBlock::SharedBackingStore>())
-        return JS::DataBlock { JS::DataBlock::SharedBackingStore { shared->buffer, shared->object_id }, JS::DataBlock::Shared::Yes };
-
-    if (auto const* owned = source_block.byte_buffer.get_pointer<JS::DataBlock::OwnedBackingStore>()) {
-        // Zero-length buffers have no backing storage to share.
-        if (!owned->handle().is_valid())
-            return {};
-        if (preserve_growability)
-            return JS::DataBlock { JS::DataBlock::ExternalPrimitiveStorage { GC::Ref<GC::Cell> { source_buffer }, owned->handle() }, JS::DataBlock::Shared::Yes };
-        return JS::DataBlock { JS::DataBlock::ExternalPrimitiveStorage { GC::Ref<GC::Cell> { source_buffer }, owned->handle(), byte_length }, JS::DataBlock::Shared::Yes };
-    }
-
-    // A detached block has no storage to share.
-    return {};
-}
-
-// A new SharedArrayBuffer that shares the storage of the buffer at the index of the record's same-process side table,
-// or null if there is no such buffer, or its storage cannot be shared.
-JSObject* web_structured_serialize_ipc_record_shared_array_buffer(IPCSerializationRecord const* record, void* realm, u32 side_table_index, size_t byte_length, bool preserve_growability)
+JSObject* web_structured_serialize_ipc_record_shared_array_buffer(IPCSerializationRecord const* record, u32 side_table_index)
 {
     auto shared_array_buffers = same_process_shared_array_buffers(*record);
     if (side_table_index >= shared_array_buffers.size())
         return nullptr;
-    auto data_block = data_block_sharing_storage_with(*shared_array_buffers[side_table_index], byte_length, preserve_growability);
-    if (!data_block.has_value())
-        return nullptr;
-    return JS::HostABI::object_to_abi(JS::ArrayBuffer::create(realm_from_abi(realm), data_block.release_value()).ptr());
+    return JS::HostABI::object_to_abi(shared_array_buffers[side_table_index].ptr());
 }
 
 JSCompletion web_structured_serialize_data_clone_error_from_serialization_error(void* realm, ReadonlyBytes message)
@@ -330,6 +304,8 @@ u8 web_structured_serialize_serializable_steps(u16 interface_name)
         return to_underlying(SerializableSteps::QuotaExceededError);
     case Bindings::InterfaceName::CryptoKey:
         return to_underlying(SerializableSteps::CryptoKey);
+    case Bindings::InterfaceName::RTCEncodedAudioFrame:
+        return to_underlying(SerializableSteps::RTCEncodedAudioFrame);
     default:
         VERIFY(Bindings::serializable_interface_is_implemented_in_rust(static_cast<Bindings::InterfaceName>(interface_name)));
         return to_underlying(SerializableSteps::Rust);
