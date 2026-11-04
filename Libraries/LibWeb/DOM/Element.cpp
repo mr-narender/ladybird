@@ -227,6 +227,8 @@ void Element::RareData::visit_edges(Cell::Visitor& visitor)
         for (auto& observer : *registered_intersection_observers)
             visitor.visit(observer);
     }
+    if (registered_resize_observers)
+        visitor.visit(*registered_resize_observers);
 }
 
 OwnPtr<Node::RareData> Element::create_rare_data() const
@@ -1971,16 +1973,19 @@ RefPtr<CSS::CustomPropertyData const> Element::style_custom_property_environment
     // NB: Where the animations of the element's parent sample custom properties, the parent holds their composition
     //     over the environment the style engine resolved the element's over. The element inherits the composition, and
     //     its own declarations stand over it, as when the animations move the parent's environment.
+    // NB: An environment names the environment it was resolved over last, which a descendant holding the store can have
+    //     moved. So this also comes to the root, whose declarations stand over nothing.
     auto parent = DOM::AbstractElement { const_cast<Element&>(*this) }.element_to_inherit_style_from();
-    VERIFY(parent.has_value());
     auto& style_computer = document().style_computer();
     auto& style_engine = style_computer.style_engine();
     RefPtr<CSS::CustomPropertyData const> inherited_data;
-    if (auto parent_data = parent->custom_property_data())
-        inherited_data = parent_data->inheritable(read, document());
-    auto const parent_identity = parent->installed_style().custom_property_environment();
-    if (identity == CSS::StyleEngineFFI::style_engine_inheritable_custom_property_environment(style_engine.host(), &read, parent_identity))
-        return inherited_data;
+    if (parent.has_value()) {
+        if (auto parent_data = parent->custom_property_data())
+            inherited_data = parent_data->inheritable(read, document());
+        auto const parent_identity = parent->installed_style().custom_property_environment();
+        if (identity == CSS::StyleEngineFFI::style_engine_inheritable_custom_property_environment(style_engine.host(), &read, parent_identity))
+            return inherited_data;
+    }
     auto declarations = style_computer.engine_custom_property_declarations_over(read, identity, inherited_data);
     VERIFY(declarations);
     return declarations;
@@ -5509,8 +5514,8 @@ void Element::replace_custom_property_data(Optional<CSS::PseudoElement> pseudo_e
     install_custom_property_data(read, pseudo_element, move(data), is_animation_overlay);
 }
 
-// The style engine keeps the custom-property environments an element and its synthetic pseudo-elements hold; the
-// element keeps no copy of its own. This is the only place they move.
+// An element and its synthetic pseudo-elements hold the custom-property environment of their records. The style engine
+// keeps the ones lying over that; the element keeps no copy of its own. This is the only place they move.
 void Element::install_custom_property_data(Layout::BegunRead const& read, Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data, CSS::IsAnimationOverlay is_animation_overlay)
 {
     VERIFY(data || is_animation_overlay == CSS::IsAnimationOverlay::No);
@@ -5522,6 +5527,9 @@ void Element::install_custom_property_data(Layout::BegunRead const& read, Option
         VERIFY(style_node != 0 || !data);
         if (style_node == 0)
             return;
+        // NB: What the record holds already lies over nothing.
+        if (is_animation_overlay == CSS::IsAnimationOverlay::No && data && data->identity() == installed_style(pseudo_element).custom_property_environment())
+            data = nullptr;
         auto& style_engine = document().style_computer().style_engine();
         if (!pseudo_element.has_value()) {
             style_engine.set_element_custom_property_data(read, *this, data.ptr(), is_animation_overlay);
@@ -5570,9 +5578,13 @@ RefPtr<CSS::CustomPropertyData const> Element::custom_property_data(Optional<CSS
         if (style_node == 0)
             return nullptr;
         auto const& style_engine = document().style_computer().style_engine();
-        if (!pseudo_element.has_value())
-            return static_cast<CSS::CustomPropertyData const*>(CSS::StyleEngineFFI::style_engine_element_custom_property_data(style_engine.host(), style_node.value()));
-        return static_cast<CSS::CustomPropertyData const*>(CSS::StyleEngineFFI::style_engine_pseudo_element_custom_property_data(style_engine.host(), style_node.value(), to_underlying(pseudo_element.value())));
+        auto const* lying_over = static_cast<CSS::CustomPropertyData const*>(pseudo_element.has_value()
+                ? CSS::StyleEngineFFI::style_engine_pseudo_element_custom_property_data(style_engine.host(), style_node.value(), to_underlying(pseudo_element.value()))
+                : CSS::StyleEngineFFI::style_engine_element_custom_property_data(style_engine.host(), style_node.value()));
+        if (lying_over)
+            return lying_over;
+        // NB: The identity of an environment is the address of its store, which the record holds a reference to.
+        return reinterpret_cast<CSS::CustomPropertyData const*>(static_cast<FlatPtr>(installed_style(pseudo_element).custom_property_environment()));
     }
 
     if (auto existing_pseudo_element = get_pseudo_element(pseudo_element.value()); existing_pseudo_element.has_value())
@@ -6004,6 +6016,24 @@ void Element::unregister_intersection_observer(Badge<IntersectionObserver::Inter
     });
 }
 
+void Element::register_resize_observer(Badge<ResizeObserver::ResizeObserver>, GC::Ref<ResizeObserver::ResizeObserver> observer)
+{
+    auto& registered_resize_observers = ensure_element_rare_data().registered_resize_observers;
+    if (!registered_resize_observers)
+        registered_resize_observers = make<Vector<GC::Ref<ResizeObserver::ResizeObserver>>>();
+    registered_resize_observers->append(observer);
+}
+
+void Element::unregister_resize_observer(Badge<ResizeObserver::ResizeObserver>, GC::Ref<ResizeObserver::ResizeObserver> observer)
+{
+    auto* rare_data = element_rare_data();
+    if (!rare_data || !rare_data->registered_resize_observers)
+        return;
+    rare_data->registered_resize_observers->remove_first_matching([&observer](GC::Ref<ResizeObserver::ResizeObserver> const& entry) {
+        return entry == observer;
+    });
+}
+
 CSSPixelPoint Element::scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type) const
 {
     if (pseudo_element_type.has_value()) {
@@ -6099,6 +6129,18 @@ bool Element::has_auto_directionality() const
 // https://html.spec.whatwg.org/multipage/dom.html#the-directionality
 Element::Directionality Element::directionality() const
 {
+    if (auto directionality = directionality_unless_from_parent(); directionality.has_value())
+        return *directionality;
+
+    // Otherwise:
+    // Return the parent directionality of element.
+    return parent_directionality();
+}
+
+// NB: Every case of the directionality of an element but the last, which reads the parent's. A caller that has the
+//     parent's at hand spares the walk up.
+Optional<Element::Directionality> Element::directionality_unless_from_parent() const
+{
     // The directionality of an element (any element, not just an HTML element) is either 'ltr' or 'rtl'.
     // To compute the directionality given an element element, switch on element's dir attribute state:
     auto maybe_dir = this->dir();
@@ -6148,9 +6190,7 @@ Element::Directionality Element::directionality() const
         return Directionality::Ltr;
     }
 
-    // Otherwise:
-    // Return the parent directionality of element.
-    return parent_directionality();
+    return {};
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#auto-directionality-form-associated-elements

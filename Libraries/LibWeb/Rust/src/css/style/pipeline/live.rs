@@ -10,12 +10,12 @@
 
 use super::super::component_matching::DocumentMatching;
 use super::super::index::dispatch_bloom_bit;
+use super::super::input_types::TransactionFactSide;
 use super::super::input_types::{
     STYLE_REACTION_FONT_INPUTS_CHANGED, STYLE_REACTION_PUBLISHED_STYLE, STYLE_REACTION_RECOMPUTE_DESCENDANT_STYLES,
     StyleEnvironment, StyleUpdate, TreeRelations,
 };
 use super::super::selector_evaluation::StructuralRead;
-use super::super::transaction_view::TransactionFactSide;
 use super::super::*;
 use super::drive::DriveRecords;
 use super::invalidation::{
@@ -28,8 +28,9 @@ use super::rule_changes::Restyled;
 use super::rule_store::RuleChanges;
 use super::rules::{IndexChanges, RuleIndex};
 use super::traversal::{
-    self, DIRTY_DESCENDANTS, HintBits, InitialStyle, MATCH_DESCENDANTS, MATCH_SELF, PARENT_CHANGED, PassContext,
-    RECOMPUTE_SELF, RESTYLE_DESCENDANTS, RESTYLE_PSEUDO_ELEMENTS, RESTYLE_SELF, RESTYLES_SELF, STYLES_SOMETHING,
+    self, CONTAINERS_MOVED, DIRTY_DESCENDANTS, HintBits, InitialStyle, MATCH_DESCENDANTS, MATCH_SELF, PARENT_CHANGED,
+    PassContext, RECOMPUTE_SELF, RESTYLE_DESCENDANTS, RESTYLE_PSEUDO_ELEMENTS, RESTYLE_SELF, RESTYLES_SELF,
+    STYLES_SOMETHING,
 };
 use crate::cow_column::CowColumn;
 use crate::css::style::custom_property_cascade::{
@@ -471,10 +472,9 @@ impl Live {
                 }
                 bytes += crate::css::computed_values::group_payload_allocation_bytes(group, payload.as_ptr());
                 // SAFETY: The initial style holds a reference to each of its groups.
-                bytes += crate::heap_size::HeapSize::heap_size(
-                    unsafe { crate::css::computed_values::group_values(group, payload.as_ptr()) },
-                    &mut report.sizer,
-                );
+                bytes += unsafe {
+                    crate::css::computed_values::group_held_values_heap_size(group, payload.as_ptr(), &mut report.sizer)
+                };
             }
             report.add(MemoryOwner::Initial, bytes);
             report.count(MemoryOwner::Initial, &initial.value_facts);
@@ -662,7 +662,8 @@ impl Live {
     ///
     /// The pass styled nothing of an element in `waiting`, nor anything below it: the next one
     /// restyles the element, and its descendants where this one restyled every element or the
-    /// descendants of the element or of an ancestor. Elsewhere the hints of the elements below it
+    /// descendants of the element or of an ancestor, as `waiting_restyling_descendants` holds where the pass's
+    /// walk asked that of the element, such as below an element displayed again. Elsewhere the hints of the elements below it
     /// stay for the next pass, and its children are restyled where its style moves.
     ///
     /// The next pass computes an element in `waiting_with_kept_matches`, which the pass matched to
@@ -677,11 +678,13 @@ impl Live {
         waiting: &[StyleNodeID],
         waiting_with_kept_matches: &[StyleNodeID],
         waiting_pseudo_elements: &[StyleNodeID],
+        waiting_restyling_descendants: &HashSet<StyleNodeID>,
     ) -> Vec<(StyleNodeID, HintBits)> {
         let kept_matches: HashSet<StyleNodeID> = waiting_with_kept_matches.iter().copied().collect();
         let element = waiting.iter().map(|&node| {
             let tree = &state.projection;
             let restyles_descendants = !hinted
+                || waiting_restyling_descendants.contains(&node)
                 || std::iter::successors(Some(node), |&ancestor| tree.inheritance_parent(ancestor))
                     .any(|ancestor| self.hints.get(ancestor) & RESTYLE_DESCENDANTS != 0);
             let bits = match restyles_descendants {
@@ -723,6 +726,36 @@ impl Live {
                 continue;
             }
             self.hints.mark(child, RESTYLE_SELF | PARENT_CHANGED);
+        }
+    }
+
+    /// Restyle, in the next pass, the elements and pseudo-elements below `node` whose `font-family: monospace` recascades
+    /// their font size, which goes on from the computed size of the nearest ancestor whose animations give it one, where
+    /// such animations of `node` came or went. What they inherit need not have moved.
+    fn note_animated_font_size_came_or_went(&mut self, state: &RetainedState, node: StyleNodeID) {
+        let is_monospace = |record: &Record| {
+            record
+                .longhand(crate::css::computed_values::LonghandID::new(
+                    crate::css::property_metadata::property_id::FONT_FAMILY,
+                ))
+                .optional_data()
+                .is_some_and(crate::css::style_compute::font_family_is_monospace)
+        };
+        self.hints.reserve(state.projection.element_slot_count());
+        for descendant in state.projection.style_preorder(node).skip(1) {
+            let Some(record) = self.records.get(descendant) else {
+                continue;
+            };
+            if is_monospace(record) {
+                self.hints.mark(descendant, RESTYLE_SELF | PARENT_CHANGED);
+            } else if self
+                .records
+                .pseudo_element_records(descendant)
+                .iter()
+                .any(|(_, record)| is_monospace(record))
+            {
+                self.hints.mark(descendant, RESTYLE_PSEUDO_ELEMENTS);
+            }
         }
     }
 
@@ -1173,7 +1206,8 @@ impl Live {
         // An element arriving, leaving or moving among its siblings changes what `sibling-index()`
         // and `sibling-count()` compute to for its siblings.
         for &parent in sibling_parents.iter() {
-            // NB: Every record reading it noted so on its element's parent as it was held.
+            // NB: Every record reading it noted so on its element's parent as it was held, and every style query
+            //     reading it on its container's parent as it answered.
             if !tree.is_live(parent)
                 || !projection
                     .structural_flags(parent)
@@ -1181,6 +1215,10 @@ impl Live {
             {
                 continue;
             }
+            let counted_containers = state
+                .containers_counted_by_style_queries
+                .lock()
+                .expect("the counted containers are never held across a panic");
             for child in projection.children(parent) {
                 if self
                     .records
@@ -1193,6 +1231,11 @@ impl Live {
                         .any(|(_, record)| record.rare().reads.reads_sibling_position)
                 {
                     self.hints.add(child, RESTYLE_SELF);
+                }
+                // A style() query counted where this child stands as a container, which no record of it may read: the
+                // elements below it that read their containers read them anew.
+                if counted_containers.contains(&child) {
+                    self.hints.add(child, CONTAINERS_MOVED);
                 }
             }
         }
@@ -2126,6 +2169,7 @@ impl Live {
         let (mut root_font, mut root_font_moved) = (None, None);
         let mut statistics = traversal::Statistics::default();
         let mut suspended = None;
+        let mut waiting_restyling_descendants = HashSet::default();
         for round in 1..=MAX_SUSPENDING_ROUNDS {
             let state: &RetainedState = retained;
             let reasons = self.hints.reasons();
@@ -2158,7 +2202,8 @@ impl Live {
                 break;
             }
             if round == MAX_SUSPENDING_ROUNDS {
-                traversal::settle_suspended(&context, std::mem::take(&mut statistics.suspended));
+                waiting_restyling_descendants =
+                    traversal::settle_suspended(&context, std::mem::take(&mut statistics.suspended));
                 break;
             }
             let (next, fonts, random_bases) = statistics.take_suspended();
@@ -2276,6 +2321,7 @@ impl Live {
             &statistics.waiting,
             &statistics.waiting_with_kept_matches,
             &statistics.waiting_pseudo_elements,
+            &waiting_restyling_descendants,
         );
         self.keep_deferred_hints(&state.projection, &statistics.deferred, &waiting);
         let styled = Instant::now();
@@ -4170,14 +4216,32 @@ impl StyleEngine {
         let display = |payloads: &crate::css::computed_values::StyleGroups| {
             crate::css::computed_value_views::ComputedValuesView::of(payloads).display()
         };
+        let font_size_animated = HeldComposition::animates_font_size(&view);
         let impact =
             match custom_properties == held.custom_properties && display(view.payloads) == display(&held.payloads) {
                 true => ChildImpact::of_groups(view.payloads, &held.payloads),
                 false => ChildImpact::All,
             };
+        // What resolved root-relative lengths against the font of the document element resolves them again, which the
+        // next pass tells as it restyles the element.
+        let root_font = super::compute::RootFontInputs::from_payloads(view.payloads, view.dependency_flags);
+        let root_font_moved = traversal::is_document_element(&self.retained, node)
+            && self
+                .retained
+                .live_style
+                .as_ref()
+                .and_then(|live| live.records.kept_root_font(node))
+                .is_some_and(|kept| kept != root_font);
         if let Some(mut live) = self.retained.live_style.take() {
             live.generation += 1;
             live.note_composition_moved(&self.retained, node, impact);
+            if font_size_animated != held.font_size_animated {
+                live.note_animated_font_size_came_or_went(&self.retained, node);
+            }
+            if root_font_moved {
+                live.hints.reserve(self.retained.projection.element_slot_count());
+                live.hints.mark(node, RESTYLE_PSEUDO_ELEMENTS);
+            }
             self.retained.live_style = Some(live);
         }
     }
@@ -4191,7 +4255,7 @@ impl RetainedState {
             .element_custom_property_data
             .get(&node)
             .and_then(|held| held.sampled_over.map(|_| held.identity));
-        Some(HeldComposition::new(view.payloads, custom_properties))
+        Some(HeldComposition::new(&view, custom_properties))
     }
 
     /// Restyle the elements naming a counter-style registry their style scope no longer has, in
@@ -4320,6 +4384,14 @@ impl StyleEngine {
     fn live_pass_rounds(&mut self, root: StyleNodeID, everything: bool) {
         let threads = self.retained.live_style.as_ref().map_or(0, |live| live.threads);
         let pool = self.style_pool(threads);
+        // NB: A thread that first asks for a font resolves it there and then, under a lock, rather than leave it for a
+        //     round between all the threads of the pass, each a barrier.
+        self.retained.pass_fonts = self
+            .host
+            .font_resolver
+            .as_ref()
+            .zip(self.retained.font_resolution.as_ref())
+            .map(|(resolver, cache)| Arc::new(super::super::font_resolution::PassFonts::new(resolver, cache)));
         let mut scope = match everything {
             true => RestyleScope::Everything,
             false => RestyleScope::Pending,
@@ -4347,6 +4419,14 @@ impl StyleEngine {
             // A pass after the first restyles what waited on a font or a random base value, now
             // that it resolved, as the last pass left it hinted.
             scope = RestyleScope::Pending;
+        }
+        if let Some(pass_fonts) = self.retained.pass_fonts.take().and_then(Arc::into_inner)
+            && let Some(cache) = self.retained.font_resolution.as_mut()
+        {
+            let resolved = cache.take_in_pass_fonts(pass_fonts);
+            self.retained
+                .counters
+                .add(Counter::FontResolutionRequests, resolved as u64);
         }
         if let Some(live) = self.retained.live_style.as_mut() {
             self.retained.live_counters.take_pass(&mut live.counts);
@@ -4390,14 +4470,26 @@ fn resolve_waits(
 pub(in super::super) struct HeldComposition {
     payloads: crate::css::computed_values::StyleGroups,
     custom_properties: Option<u64>,
+    /// Whether its animations gave it a font size.
+    font_size_animated: bool,
 }
 
 impl HeldComposition {
-    fn new(payloads: &crate::css::computed_values::StyleGroups, custom_properties: Option<u64>) -> Self {
+    fn new(view: &computed::StyleRecordView<'_>, custom_properties: Option<u64>) -> Self {
         Self {
-            payloads: payloads.clone(),
+            payloads: view.payloads.clone(),
             custom_properties,
+            font_size_animated: Self::animates_font_size(view),
         }
+    }
+
+    fn animates_font_size(view: &computed::StyleRecordView<'_>) -> bool {
+        view.longhands()
+            .overlay_value(
+                view.animated_overlay,
+                crate::css::property_metadata::property_id::FONT_SIZE,
+            )
+            .is_some()
     }
 }
 

@@ -43,11 +43,7 @@ pub(super) fn lay_out_discarded_run(
     if run_repeatability_verification() == RunRepeatabilityVerification::Off || callbacks.reads_no_memoized_layout() {
         return None;
     }
-    Some(
-        callbacks
-            .layout_trace()
-            .without_events(|| callbacks.lay_out_discarded_run(run)),
-    )
+    Some(callbacks.lay_out_discarded_run(run))
 }
 
 /// Checks that the run of `box_` that produced `used` repeated what the discarded run that produced `discarded` did.
@@ -125,7 +121,7 @@ pub(super) fn verify_run_ignores_its_unobserved_own_block_size_and_block_margins
     callbacks: &LayoutPass<'_>,
     box_: Node,
     root_cells: used_values::RootInputCells,
-    input: LayoutInput,
+    input: &LayoutInput,
     outputs: &formatting_context::RunOutputs,
     lay_out: impl for<'discarded> Fn(
         LayoutPass<'discarded>,
@@ -159,12 +155,11 @@ pub(super) fn verify_run_ignores_its_unobserved_own_block_size_and_block_margins
             "its layout at the block margins {:?} and {:?}",
             cells.margin_top, cells.margin_bottom
         );
-        reference_inputs.push((cells, input, reference));
+        reference_inputs.push((cells, input.clone(), reference));
     }
     for (reference_cells, reference_input, reference) in reference_inputs {
-        let reference_outputs = callbacks.layout_trace().without_events(|| {
-            callbacks.lay_out_discarded_run(|callbacks| lay_out(callbacks, reference_cells, reference_input))
-        });
+        let reference_outputs =
+            callbacks.lay_out_discarded_run(|callbacks| lay_out(callbacks, reference_cells, reference_input));
         ComparedLayouts {
             checked: &checked,
             reference: &reference,
@@ -263,6 +258,7 @@ fn host_findings_match(left: Option<&run_state::HostFindings>, right: Option<&ru
     let left = left.unwrap_or(&none);
     let right = right.unwrap_or(&none);
     same_elements_in_any_order(&left.messages, &right.messages)
+        && same_elements_in_any_order(&left.container_length_reads, &right.container_length_reads)
         && left.document_svg_root_natural_size == right.document_svg_root_natural_size
 }
 

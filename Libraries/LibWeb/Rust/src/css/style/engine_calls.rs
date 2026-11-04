@@ -88,8 +88,9 @@ pub(crate) enum EngineWrite {
         kind: super::bridge::FfiElementDeclarationKind,
         properties: Box<[crate::css::declaration_block::DeclaredProperty]>,
     },
-    /// An element's inline declaration block, or none.
-    InlineStyle {
+    /// The custom properties an element's inline declaration block declares, which the engine names in atoms of its own.
+    /// The rest of the block reaches it with the host's rows.
+    InlineCustomProperties {
         node: StyleNodeID,
         data: Option<crate::css::declaration_block::SharedDeclarationBlock>,
     },
@@ -254,7 +255,6 @@ impl EngineWrite {
                     properties
                         .iter()
                         .map(crate::css::declaration_block::DeclaredProperty::borrowed),
-                    Default::default(),
                 );
             }
             Self::AnimationKeyframes { tree_scope, row } => engine.animation_keyframes.set(tree_scope, row),
@@ -269,14 +269,10 @@ impl EngineWrite {
                         .keep_timing(node, 0, identity, timing);
                 }
             }
-            Self::InlineStyle { node, data } => {
-                super::bridge::register_element_declared_properties(
+            Self::InlineCustomProperties { node, data } => {
+                super::bridge::register_element_custom_properties(
                     engine,
                     node,
-                    super::bridge::FfiElementDeclarationKind::InlineStyle,
-                    data.as_ref()
-                        .map_or_else(Default::default, |data| data.properties())
-                        .iter(),
                     data.as_ref()
                         .map_or(Default::default(), |data| data.custom_properties()),
                 );
@@ -586,6 +582,19 @@ pub unsafe extern "C" fn style_engine_stage_element_arrival(
     }
 }
 
+/// Whether the host's projection row of `node` holds the attribute `name`.
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_row_holds_attribute(host: &DocumentHost, node: u32, name: u32) -> bool {
+    let name = StyleAtomID(name);
+    StyleNodeID::from_raw(node).is_some_and(|node| {
+        host.engine_memo()
+            .projection
+            .borrow()
+            .written_facts(node)
+            .is_some_and(|facts| facts.attributes().iter().any(|attribute| attribute.name == name))
+    })
+}
+
 /// Writes the local feature delta `delta` into the host's projection rows.
 #[unsafe(no_mangle)]
 pub extern "C" fn style_engine_stage_local_feature_delta(host: &DocumentHost, delta: &FfiLocalFeatureDelta) {
@@ -880,6 +889,8 @@ pub(crate) struct EngineMemo {
     takes_transaction_to_apply: std::cell::Cell<bool>,
     /// What `LIBWEB_STYLE_SELFCHECK` asked for as the host started.
     pub(super) style_self_check: super::pipeline::SelfCheckSettings,
+    /// Whether the self-check of a style update that flew is yet to run: it is the next update's to run.
+    pub(super) flown_update_awaits_self_check: std::cell::Cell<bool>,
 }
 
 impl EngineMemo {
@@ -1009,6 +1020,7 @@ impl Default for EngineMemo {
             applying_reactions: Default::default(),
             takes_transaction_to_apply: Default::default(),
             style_self_check: super::pipeline::SelfCheckSettings::from_environment(),
+            flown_update_awaits_self_check: Default::default(),
         }
     }
 }
@@ -1257,11 +1269,20 @@ pub extern "C" fn style_engine_for_each_element_custom_property_environment(
     // The engine keeps each environment alive while an element holds it, and nothing moves one on before the
     // callbacks have run.
     let held: Vec<(u32, *const c_void)> = with_engine(read, host, |engine| {
-        engine
-            .retained
-            .element_custom_property_data
+        let retained = &engine.retained;
+        let lying_over = &retained.element_custom_property_data;
+        let mut named = super::fast_hash::FastSet::default();
+        lying_over
             .iter()
             .map(|(node, held)| (node.raw(), held.data.data()))
+            .chain(
+                retained
+                    .computed_group_sets
+                    .installed_custom_property_environments()
+                    .filter(|&(node, environment)| environment != 0 && !lying_over.contains_key(&node))
+                    .filter(|&(_, environment)| named.insert(environment))
+                    .map(|(node, environment)| (node.raw(), std::ptr::with_exposed_provenance(environment as usize))),
+            )
             .collect()
     });
     for (node, data) in held {
@@ -1605,11 +1626,15 @@ pub unsafe extern "C" fn style_engine_decide_transitions(
     let element_box = crate::layout::node_data::NodeSlotId {
         index: input.element_box_slot,
     };
-    let actions = with_engine_and_arena(read, host, |engine, arena| {
+    let (mut actions, custom_properties) = with_engine_and_arena(read, host, |engine, arena| {
         let reference_box =
             crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
-        decision.decide(engine, reference_box, existing)
+        (
+            decision.decide(engine, reference_box, existing),
+            decision.decide_custom_properties(engine, existing),
+        )
     });
+    actions.extend_from_slice(&custom_properties.actions);
     hand_over(&actions);
 }
 

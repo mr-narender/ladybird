@@ -483,7 +483,7 @@ pub(crate) fn shared_style_value(value: StyleValueData) -> StyleValueArc {
         _ => None,
     };
     if let Some(index) = index {
-        StyleValueArc::clone(VALUES[index].get_or_init(|| StyleValueArc::new(value)))
+        StyleValueArc::clone(VALUES[index].get_or_init(|| StyleValueArc::immortal(value)))
     } else {
         StyleValueArc::new(value)
     }
@@ -497,7 +497,7 @@ impl RetainedStyleValueData {
             "the shared values hold every keyword"
         );
         let value =
-            VALUES[usize::from(keyword)].get_or_init(|| StyleValueArc::new(StyleValueData::Keyword { keyword }));
+            VALUES[usize::from(keyword)].get_or_init(|| StyleValueArc::immortal(StyleValueData::Keyword { keyword }));
         // SAFETY: A handle is one pointer at the value, as an arc is, and the shared values keep
         //         theirs for the life of the process.
         unsafe { &*std::ptr::from_ref(value).cast::<Self>() }
@@ -575,16 +575,6 @@ impl RetainedStyleValueData {
         // SAFETY: Both are one pointer at the counted value, `StyleValueArc` transparently and the
         //         handle as `repr(C)`, and a borrowed handle neither adds nor drops a reference.
         unsafe { ak::slice_from_raw_parts(values.as_ptr().cast(), values.len()) }
-    }
-
-    /// Whether this is the only reference to the value, which a handle without one is not.
-    pub(crate) fn is_unique(&self) -> bool {
-        if self.optional_data().is_none() {
-            return false;
-        }
-        // SAFETY: The handle holds a reference to the value, which the borrowed one never drops.
-        let value = std::mem::ManuallyDrop::new(unsafe { StyleValueArc::from_raw(self.pointer()) });
-        StyleValueArc::is_unique(&value)
     }
 
     /// Converts the retained reference into an Arc, transferring the strong reference.
@@ -4929,8 +4919,9 @@ pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
             retained_data_depends(light) || retained_data_depends(dark)
         }
         StyleValueData::Shadow(shadow_payload) => {
+            // A shadow without a color is `currentcolor`.
             let ShadowPayload { color, .. } = &**shadow_payload;
-            retained_data_depends(color)
+            color.optional_data().is_none_or(value_depends_on_current_color)
         }
         StyleValueData::Filter { value, .. } => retained_data_depends(value),
         StyleValueData::ScrollbarColor(scrollbar_color_payload) => {

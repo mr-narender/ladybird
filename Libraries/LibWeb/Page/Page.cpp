@@ -23,6 +23,7 @@
 #include <LibWeb/Editing/SpellingMarkers.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/HTML/CheckUnloadingCanceledState.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/Focus.h>
@@ -163,6 +164,7 @@ void Page::visit_edges(JS::Cell::Visitor& visitor)
         visitor.visit(request.value.callback);
     visitor.visit(m_pending_permission_requests);
     visitor.visit(m_notifications_list);
+    visitor.visit(m_unloading_canceled_checks);
     m_pending_fullscreen_operations.for_each([&](auto const& operation) {
         operation.visit([&](PendingFullscreenEnter const& enter_operation) {
                 visitor.visit(enter_operation.element);
@@ -624,7 +626,8 @@ EventResult Page::handle_drag_and_drop_event(DragEvent::Type type, DevicePixelPo
 
 EventResult Page::handle_pinch_event(HTML::LocalNavigable& root, PinchEvent const& event, Optional<RemoteInputEventTarget>* remote_target)
 {
-    if (event.async_zoom_performed_default_action && root.is_top_level_traversable())
+    // The compositor forwards its scroll updates ahead of the event. Listeners must see the zoom already presented.
+    if (root.is_top_level_traversable())
         root.adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
     return root.event_handler().handle_pinch_event(device_to_css_point(event.position), event, remote_target);
 }
@@ -636,10 +639,16 @@ EventResult Page::handle_pinch_event(DevicePixelPoint position, unsigned modifie
         .modifiers = static_cast<UIEvents::KeyModifier>(modifiers),
         .scale_delta = scale,
     };
+    auto result = handle_pinch_event(local_traversable(), event, nullptr);
+    if (result != EventResult::Accepted)
+        return result;
+
+    // NB: No UI process is there to ask for the zoom of an event left uncanceled.
+    event.wheel_event_was_dispatched = true;
     return handle_pinch_event(local_traversable(), event, nullptr);
 }
 
-EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved)
+EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action, ReadonlySpan<TextEditingCommand> editing_commands, bool native_editing_binding_resolved, Optional<u64> user_input_scroll_count_with_nothing_to_scroll)
 {
     // The compositor forwards these updates ahead of keyboard events. Both DOM listeners and a main-thread
     // fallback default action must observe the offsets that have already been presented.
@@ -647,6 +656,12 @@ EventResult Page::handle_keydown(UIEvents::KeyCode key, unsigned modifiers, u32 
     if (!navigable)
         return EventResult::Dropped;
     navigable->local_root()->adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness::Pushed);
+    // NB: The compositor found nothing to scroll for this key, and left it here for content the page may have added
+    //     past the end of a scroll range it knew. This thread may hear of the key late. Once the compositor has
+    //     scrolled for later input, the key has been left behind, and scrolling for it now would go against that input.
+    if (user_input_scroll_count_with_nothing_to_scroll.has_value()
+        && navigable->local_root()->compositor_user_input_scroll_count() > *user_input_scroll_count_with_nothing_to_scroll)
+        async_scroll_performed_default_action = true;
     return navigable->event_handler().handle_keydown(key, modifiers, code_point, repeat, should_insert_text, async_scroll_performed_default_action, editing_commands, native_editing_binding_resolved);
 }
 
@@ -1622,6 +1637,16 @@ void Page::permission_request_completed(u64 request_id, Web::Permissions::Effect
 {
     if (auto callback = m_pending_permission_requests.take(request_id); callback.has_value())
         callback.value()->function()(state);
+}
+
+void Page::add_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState> check)
+{
+    m_unloading_canceled_checks.set(check);
+}
+
+void Page::remove_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState> check)
+{
+    m_unloading_canceled_checks.remove(check);
 }
 
 void Page::register_showing_notification(u64 notification_id, GC::Ref<NotificationsAPI::Notification> notification)

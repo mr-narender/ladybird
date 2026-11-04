@@ -9,11 +9,11 @@ use super::*;
 /// What the layout stage keeps for itself besides what each of its runs keeps: what the runs of a layout pass share. It
 /// is the stage's scratch rather than arena columns: nothing outside a running pass reads it, but for the memos it
 /// keeps for later passes.
+#[derive(Default)]
 pub(crate) struct LayoutScratch {
     /// The intrinsic sizes passes measured, kept for the passes after them.
     pub(super) intrinsic_size_caches: super::layout_node_arena::IntrinsicSizeCaches,
-    /// What the pass found out for the host outside any run, which its driver reports itself.
-    pub(super) host_findings_outside_runs: RefCell<HostFindings>,
+    host_findings_noted_in_pass: Cell<u64>,
     /// The results of formatting context runs, kept for the runs after them in this pass and the passes after it.
     fc_run_cache_store: super::fc_run_cache::FcRunCacheStore,
     /// The layouts of in-flow blocks, kept for the passes after the one that laid them out.
@@ -25,6 +25,7 @@ pub(crate) struct LayoutScratch {
     text_memos: super::rendered_text::TextMemos,
     inline_content_preparation_buffers: Cell<super::prepared_inline_content::InlineContentPreparationBuffers>,
     prepared_inline_content_memos: super::prepared_inline_content::PreparedInlineContentMemos,
+    fragment_builder_scratch: RefCell<fragment_tree::FragmentBuilderScratch>,
 }
 
 /// What layout found out that the host hears of once the layout that found it is committed: what the
@@ -34,19 +35,35 @@ pub(crate) struct LayoutScratch {
 pub(crate) struct HostFindings {
     pub(crate) messages: Vec<super::commit::FfiCommitMessage>,
     pub(crate) document_svg_root_natural_size: Option<(NodeSlotId, crate::css::style::NaturalSize)>,
+    pub(crate) container_length_reads: Vec<ContainerLengthRead>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ContainerLengthRead {
+    pub(crate) reader: NodeSlotId,
+    pub(crate) element: crate::css::style::tree::StyleNodeID,
+    pub(crate) bases: crate::css::style::ContainerUnitBases,
 }
 
 impl HostFindings {
     pub(crate) fn is_empty(&self) -> bool {
-        self.messages.is_empty() && self.document_svg_root_natural_size.is_none()
+        self.messages.is_empty()
+            && self.document_svg_root_natural_size.is_none()
+            && self.container_length_reads.is_empty()
     }
 
     pub(crate) fn note_container_length_dependencies(
         &mut self,
+        reader: NodeSlotId,
         element: crate::css::style::tree::StyleNodeID,
         bases: &crate::css::style::ContainerUnitBases,
     ) {
         use super::commit::{FfiCommitMessage, FfiCommitMessageKind};
+        self.note_container_length_read(ContainerLengthRead {
+            reader,
+            element,
+            bases: *bases,
+        });
         self.note_message(FfiCommitMessage::new(
             element.raw(),
             FfiCommitMessageKind::StyleDependsOnSizeContainerQuery,
@@ -74,9 +91,18 @@ impl HostFindings {
         }
     }
 
+    fn note_container_length_read(&mut self, read: ContainerLengthRead) {
+        if !self.container_length_reads.contains(&read) {
+            self.container_length_reads.push(read);
+        }
+    }
+
     pub(crate) fn receive(&mut self, other: HostFindings) {
         for message in other.messages {
             self.note_message(message);
+        }
+        for read in other.container_length_reads {
+            self.note_container_length_read(read);
         }
         if other.document_svg_root_natural_size.is_some() {
             self.document_svg_root_natural_size = other.document_svg_root_natural_size;
@@ -89,21 +115,6 @@ const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<LayoutScratch>();
 };
-
-impl Default for LayoutScratch {
-    fn default() -> Self {
-        Self {
-            intrinsic_size_caches: Default::default(),
-            host_findings_outside_runs: RefCell::new(HostFindings::default()),
-            fc_run_cache_store: Default::default(),
-            in_flow_block_cache_store: Default::default(),
-            layout_trace: Default::default(),
-            text_memos: Default::default(),
-            inline_content_preparation_buffers: Default::default(),
-            prepared_inline_content_memos: Default::default(),
-        }
-    }
-}
 
 impl LayoutScratch {
     /// The scratch of a fork of the arena, which keeps the run memos the arena's entries were stored for and starts
@@ -120,6 +131,10 @@ impl LayoutScratch {
 
     pub(super) fn fc_run_cache_store(&self) -> &super::fc_run_cache::FcRunCacheStore {
         &self.fc_run_cache_store
+    }
+
+    pub(super) fn fragment_builder_scratch(&self) -> &RefCell<fragment_tree::FragmentBuilderScratch> {
+        &self.fragment_builder_scratch
     }
 
     pub(super) fn in_flow_block_cache_store(&self) -> &super::in_flow_block_cache::InFlowBlockCacheStore {
@@ -141,25 +156,29 @@ impl LayoutScratch {
     }
 
     /// Brings the run memos up to date with what the arena's writes since the last call did to their boxes.
-    pub(super) fn apply_memo_invalidations(&self, arena: &mut LayoutNodeArena) {
+    pub(super) fn apply_memo_invalidations(&mut self, arena: &mut LayoutNodeArena) {
         arena.take_memo_invalidations().apply_to(
-            &self.fc_run_cache_store,
-            &self.in_flow_block_cache_store,
-            &self.text_memos,
-            &self.prepared_inline_content_memos,
-            &self.intrinsic_size_caches,
+            &mut self.fc_run_cache_store,
+            &mut self.in_flow_block_cache_store,
+            &mut self.text_memos,
+            &mut self.prepared_inline_content_memos,
+            &mut self.intrinsic_size_caches,
         );
     }
 
-    /// What the pass found out outside any run, which its driver reports itself.
-    pub(crate) fn take_host_findings_outside_runs(&self) -> HostFindings {
-        std::mem::take(&mut self.host_findings_outside_runs.borrow_mut())
+    pub(super) fn note_host_findings_noted_in_pass(&self) {
+        self.host_findings_noted_in_pass
+            .set(self.host_findings_noted_in_pass.get() + 1);
+    }
+
+    pub(super) fn host_findings_noted_in_pass(&self) -> u64 {
+        self.host_findings_noted_in_pass.get()
     }
 
     /// Brings the run memos up to date with what the commit into `arena` did to their boxes, and sweeps the run cache.
-    pub(crate) fn end_layout_pass(&self, arena: &mut LayoutNodeArena) {
+    pub(crate) fn end_layout_pass(&mut self, arena: &mut LayoutNodeArena) {
         self.apply_memo_invalidations(arena);
-        arena.sweep_stale_fc_run_cache_entries(&self.fc_run_cache_store);
+        arena.sweep_stale_fc_run_cache_entries(&mut self.fc_run_cache_store);
     }
 }
 
@@ -177,6 +196,7 @@ pub(crate) struct RunState {
     root_anchor_resolved_values: Option<Box<style_values::AnchorResolvedValues>>,
     /// What the run found out for the host so far, which the pass the run is handed notes into.
     host_findings: RefCell<HostFindings>,
+    fragments: Option<fragment_tree::RunFragmentBuilder>,
 }
 
 /// Where a box is placed: the offset of its content box in the containing block it is placed in.
@@ -301,6 +321,26 @@ impl RunState {
             root_containing_block,
             root_anchor_resolved_values,
             ContentSizing::Layout,
+            None,
+            run,
+        )
+    }
+
+    pub(crate) fn with_root_building_fragments<R>(
+        callbacks: LayoutPass<'_>,
+        root: Node,
+        root_containing_block: Node,
+        root_anchor_resolved_values: Option<Box<style_values::AnchorResolvedValues>>,
+        fragments: Option<fragment_tree::RunFragmentBuilder>,
+        run: impl for<'run> FnOnce(&'run Self, LayoutPass<'run>) -> R,
+    ) -> R {
+        Self::enter(
+            callbacks,
+            root,
+            root_containing_block,
+            root_anchor_resolved_values,
+            ContentSizing::Layout,
+            fragments,
             run,
         )
     }
@@ -317,6 +357,7 @@ impl RunState {
             root_containing_block,
             None,
             ContentSizing::RootContributions,
+            None,
             run,
         )
     }
@@ -333,6 +374,7 @@ impl RunState {
             root_containing_block,
             None,
             ContentSizing::RootContentInlineSizes,
+            None,
             run,
         )
     }
@@ -343,6 +385,7 @@ impl RunState {
         root_containing_block: Node,
         root_anchor_resolved_values: Option<Box<style_values::AnchorResolvedValues>>,
         content_sizing: ContentSizing,
+        fragments: Option<fragment_tree::RunFragmentBuilder>,
         run: impl for<'run> FnOnce(&'run Self, LayoutPass<'run>) -> R,
     ) -> R {
         let state = Self {
@@ -354,11 +397,16 @@ impl RunState {
             )]),
             root_anchor_resolved_values,
             host_findings: RefCell::new(HostFindings::default()),
+            fragments,
         };
         run(
             &state,
             callbacks.for_run(root, root_containing_block, &state.host_findings),
         )
+    }
+
+    pub(crate) fn fragments(&self) -> Option<&fragment_tree::RunFragmentBuilder> {
+        self.fragments.as_ref()
     }
 
     /// What this run found out for the host, which its outputs carry to the run that uses its result.
@@ -465,10 +513,11 @@ mod tests {
     fn a_nested_run_keeps_its_own_root_and_host_findings() {
         let mut arena = LayoutNodeArena::new();
         let scratch = LayoutScratch::default();
+        let host_findings_outside_runs = RefCell::default();
         let root = arena.allocate_for_test().slot;
         let child = arena.allocate_for_test().slot;
         RunState::with_root(
-            LayoutPass::for_test(&arena, &scratch),
+            LayoutPass::for_test(&arena, &scratch, &host_findings_outside_runs),
             root,
             NodeSlotId::INVALID,
             None,
@@ -494,6 +543,6 @@ mod tests {
                 );
             },
         );
-        assert!(scratch.take_host_findings_outside_runs().is_empty());
+        assert!(host_findings_outside_runs.borrow().is_empty());
     }
 }

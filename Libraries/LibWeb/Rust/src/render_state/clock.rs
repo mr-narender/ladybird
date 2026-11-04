@@ -66,7 +66,7 @@ pub(crate) mod hover;
 mod lane;
 pub(crate) use hover::PendingPointer;
 pub(crate) use lane::LaneDelivery;
-pub(super) use lane::{LaneSlot, note_host_write, retire_slot, seal_plan, take_lanes_in};
+pub(super) use lane::{LaneSlot, note_host_write, retire_slot, seal_plan, take_lane_report, take_lanes_in};
 
 /// What the ticks of a lane sample, sealed at the end of the lane's frame's rendering update.
 pub(crate) struct ClockPlan {
@@ -413,10 +413,12 @@ impl LaneState {
     }
 }
 
-/// What a tick of a lane did: the pointer move its hover took, if it took one, and whether it presented a frame.
+/// What a tick of a lane did: the pointer move its hover took, if it took one, whether it presented a frame, and
+/// whether the samples of animations or transitions it showed in that frame moved boxes.
 struct Ticked {
     hover_move: Option<LaneMove>,
     presented: bool,
+    sampled: bool,
 }
 
 /// A pointer move a tick of a lane took, which the host takes in.
@@ -800,6 +802,13 @@ impl ClockTicks {
         self.pointer_state().moved(pointer, follows)
     }
 
+    /// Hands the lane that the pointer rests where an animation moves what is under it, which the next tick hovers
+    /// again, and answers what the lane wants next.
+    pub(super) fn pointer_rests_on_moving_content(&self) -> hover::PointerAnswer {
+        let follows = self.published().follows_pointer;
+        self.pointer_state().rests_on_moving_content(follows)
+    }
+
     /// Where the compositor said the pointer went last, beside the mouse event the host takes, if it said so.
     pub(super) fn newest_pointer(&self) -> Option<PendingPointer> {
         self.pointer_state().last()
@@ -836,6 +845,11 @@ impl ClockTicks {
     /// Hands the lane a pointer move, and ticks it at `frame_time_nanoseconds`. For a test.
     pub(super) fn inject_pointer(self: &Arc<Self>, pointer: PendingPointer, frame_time_nanoseconds: i64) {
         let _ = self.pointer_moved(pointer);
+        self.tick(frame_time_nanoseconds, &[]);
+    }
+
+    pub(super) fn inject_pointer_rest(self: &Arc<Self>, frame_time_nanoseconds: i64) {
+        let _ = self.pointer_rests_on_moving_content();
         self.tick(frame_time_nanoseconds, &[]);
     }
 
@@ -1365,6 +1379,22 @@ impl Lane {
         Some(ticked)
     }
 
+    /// Shows the cursor of what is under `pointer` in the frame the screen shows at `frame_time_nanoseconds`, on the
+    /// lane's fork, as a tick that may present nothing would (see [`Lane::show_cursor_only`]). Answers the move it
+    /// leaves to the host, or none where the lane has no fork to hit test on.
+    fn show_cursor_on_fork(&mut self, frame_time_nanoseconds: i64, pointer: PendingPointer) -> Option<LaneMove> {
+        let (mut fork, state_moved_on) = match std::mem::take(&mut self.state) {
+            LaneState::Forked { fork, state_moved_on } => (fork, state_moved_on),
+            state => {
+                self.state = state;
+                return None;
+            }
+        };
+        let left_to_host = self.show_cursor_only(&mut fork, pointer, frame_time_nanoseconds);
+        self.state = LaneState::Forked { fork, state_moved_on };
+        Some(left_to_host)
+    }
+
     fn tick(
         &mut self,
         state: &mut RenderState,
@@ -1379,7 +1409,14 @@ impl Lane {
         let mut ticked = Ticked {
             hover_move: None,
             presented: false,
+            sampled: false,
         };
+        // A parked hover, or a frame left to the host, hovers nothing: the cursor follows the pointer all the same.
+        if let Some(pointer) = pointer
+            && (hovers.is_none() || self.frame_left_to_host)
+        {
+            ticked.hover_move = Some(self.show_cursor_only(state, pointer, frame_time_nanoseconds));
+        }
         if self.frame_left_to_host || (!samples_animations && hovers.is_none() && !transitions) {
             return ticked;
         }
@@ -1396,12 +1433,14 @@ impl Lane {
         state.engine_mut().lend_tick_shown(std::mem::take(&mut self.shown));
         self.refresh_host_effect_timings(state);
         let mut moved = false;
+        let mut sampled = false;
         if transitions {
             // NB: Transitions a tick left to the host keep what their boxes showed, beside what the others moved.
-            moved |= self.sample_started_transitions(state, sampled_at.0).unwrap_or(true);
+            sampled |= self.sample_started_transitions(state, sampled_at.0).unwrap_or(true);
+            moved |= sampled;
         }
         if let Some(pointer) = hovers {
-            let hovered = self.hover(state, pointer, sampled_at.0);
+            let hovered = self.hover(state, pointer, sampled_at.0, frame_time_nanoseconds);
             ticked.hover_move = Some(LaneMove {
                 input_event_id: pointer.input_event_id,
                 target: match hovered {
@@ -1424,7 +1463,10 @@ impl Lane {
                         false => Ok(false),
                     });
                 match shown {
-                    Ok(sampled) => moved |= sampled,
+                    Ok(transitions_moved) => {
+                        moved |= transitions_moved;
+                        sampled |= transitions_moved;
+                    }
                     Err(Park(reason)) => {
                         if hover::logs_hover() {
                             eprintln!("{} hover lane: frame left to the host: {reason}", hover::log_time());
@@ -1448,6 +1490,7 @@ impl Lane {
             match self.sample_host_animations(state, samples) {
                 Ok(()) => {
                     moved = true;
+                    sampled = true;
                     self.shown_at = sampled_at.0;
                     self.shown_scroll_progress = progress;
                 }
@@ -1470,6 +1513,7 @@ impl Lane {
                         );
                     }
                     ticked.presented = true;
+                    ticked.sampled = sampled;
                 }
                 Err(Park(reason)) => {
                     if hover::logs_hover() {
@@ -1822,7 +1866,7 @@ pub extern "C" fn document_host_drop_clock_plan(host: &DocumentHost, update: u64
 /// stand, and the lanes' hover goes on.
 #[unsafe(no_mangle)]
 pub extern "C" fn document_host_note_animation_change(host: &DocumentHost) {
-    host.clock_ticks().note_animation_change();
+    host.note_animation_change();
 }
 
 /// Takes in what the lanes of `host`'s document did, as a rendering update begins, and answers whether a tick of a lane
@@ -1835,6 +1879,21 @@ pub extern "C" fn document_host_note_animation_change(host: &DocumentHost) {
 #[unsafe(no_mangle)]
 pub extern "C" fn document_host_take_clock_lanes_in(host: &DocumentHost, update: u64, outer_input_event: u64) -> bool {
     host.take_clock_lanes_in(update, outer_input_event)
+}
+
+/// Forgets where the compositor said the pointer of `host`'s document went: the lanes of the next document hear of no
+/// move before one of its own. For a test, whose documents follow each other with the pointer where the last left it.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_forget_pointer_for_testing(host: &DocumentHost) {
+    host.clock_ticks().pointer_state().forget();
+}
+
+/// Takes in what the lanes of `host`'s document did, as a task between two rendering updates handles a press, and
+/// answers as [`document_host_take_clock_lanes_in`] does. No frame of the host's follows yet, so the lanes tick on.
+/// `outer_input_event` is as there.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_take_in_what_clock_lanes_did(host: &DocumentHost, outer_input_event: u64) -> bool {
+    host.take_in_what_clock_lanes_did(outer_input_event)
 }
 
 /// Whether the lanes of `host`'s document may hover or run transitions beside the tasks: the last plan the host sealed for

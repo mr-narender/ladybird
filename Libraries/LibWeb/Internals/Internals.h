@@ -77,7 +77,7 @@ public:
     WebIDL::UnsignedLongLong discard_decoded_image_frames();
     WebIDL::ExceptionOr<void> mark_as_garbage(Utf16String const& variable_name);
     bool wrapper_is_preserved(JS::Object&);
-    bool has_activity_root(JS::Object&);
+    bool has_pending_activity(JS::Object&, GC::Ptr<DOM::Document>);
     WebIDL::UnsignedLongLong message_port_pending_outgoing_message_count(HTML::MessagePort&);
     WebIDL::UnsignedLongLong html_collection_cache_generation(DOM::HTMLCollection&);
     void fail_next_message_port_transfer(HTML::MessagePort&);
@@ -127,7 +127,7 @@ public:
     void wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase, Bindings::WheelTicks const&, GC::Ref<WebIDL::Promise>);
     GC::Ref<JS::Object> compositor_scroll_state(GC::Ptr<DOM::Element> scroller);
     void pinch(double x, double y, double scale_delta, WebIDL::UnsignedShort modifiers);
-    void pinch_through_ui_process(double x, double y, double scale_delta);
+    void pinch_through_ui_process(double x, double y, double scale_delta, bool continues_gesture);
     void reset_zoom();
 
     Utf16String current_cursor();
@@ -293,6 +293,8 @@ public:
     void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
     void inject_clock_tick_scrolling_element(double frame_time_ms, DOM::Element& scroller, double x, double y);
     void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id);
+    void note_animated_content_moved_under_pointer(double frame_time_ms);
+    void inject_pointer_rests_on_moving_content(double frame_time_ms);
     u64 queue_mouse_move(double x, double y, u32 buttons);
     void move_hover_pointer(double x, double y, Optional<u64> input_event_id);
     Utf16String clock_lane_state(DOM::Document&);
@@ -318,10 +320,8 @@ public:
     GC::Ref<JS::Object> style_memory_report();
     u64 style_memory_of_frames();
     u64 style_record_identity(DOM::Element&);
+    u64 custom_property_environment_identity(DOM::Element&);
     u64 layout_style_record_identity(DOM::Element&);
-    u64 before_style_record_identity(DOM::Element&);
-    u64 before_layout_style_record_identity(DOM::Element&);
-    u64 paint_style_record_identity(DOM::Element&);
     u64 layout_node_identity(DOM::Node&);
     u64 layout_arena_live_slot_count();
     void panic_render_state_for_testing();

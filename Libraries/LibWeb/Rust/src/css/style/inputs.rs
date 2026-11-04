@@ -324,6 +324,7 @@ impl RetainedState {
             tested_attribute_names: self.tested_attribute_names.iter().copied().collect(),
             attribute_value_text_names: self.attribute_value_text_names.iter().copied().collect(),
             tests_local_link: self.selectors_test_local_link,
+            tests_validity: self.selectors_test_validity,
             relational_arrival_keys: self.unresolved_relational_arrival_keys.iter().copied().collect(),
         }
     }
@@ -331,6 +332,7 @@ impl RetainedState {
     /// Note what the selectors `summary` sums up test, which the engine's fact projection reads.
     pub(super) fn note_selector_summary(&mut self, summary: super::selector_analysis::SelectorSummary) {
         self.selectors_test_local_link |= summary.tests_local_link;
+        self.selectors_test_validity |= summary.tests_validity;
         if !summary
             .tested_attribute_names
             .iter()
@@ -413,6 +415,10 @@ impl RetainedState {
     /// Whether a selector here tests `:local-link`.
     pub(crate) fn selectors_test_local_link(&self) -> bool {
         self.selectors_test_local_link
+    }
+
+    pub(crate) fn selectors_test_validity(&self) -> bool {
+        self.selectors_test_validity
     }
 
     /// The attribute names a selector here tests in any way.
@@ -1503,7 +1509,8 @@ impl RetainedState {
     ///
     /// Said as the rule is compiled rather than as an input: which layer a rule is in is part of what
     /// the rule is, and a rule that moves between layers is recompiled.
-    /// Record which longhand properties one of an element's own declarations covers.
+    /// Record which longhand properties an element's presentation attributes cover, each with the value it was written
+    /// with.
     ///
     /// An element-attached declaration is a cascade component above layers: a style attribute beats
     /// every layered and unlayered rule in its context, whatever layer they are in.
@@ -1512,54 +1519,15 @@ impl RetainedState {
         node: StyleNodeID,
         kind: ElementDeclarationKind,
         declarations: Vec<(DeclarationEntry, RetainedStyleValueData)>,
-        custom_declarations: Vec<(CustomDeclaration, RetainedStyleValueData)>,
     ) {
-        debug_assert!(custom_declarations.is_empty() || kind == ElementDeclarationKind::InlineStyle);
         let current = self.element_declarations.declarations(node, kind).unwrap_or_default();
-        let current_custom = match kind {
-            ElementDeclarationKind::InlineStyle => self.element_declarations.custom(node),
-            _ => None,
-        };
-        let current_custom_declarations = current_custom.map_or(&[][..], |custom| custom.declared());
-        let current_custom_values = current_custom.map_or(&[][..], |custom| custom.written_values());
         if current
             .iter()
             .eq(declarations.iter().map(|(declared, written)| (declared, written)))
-            && current_custom_declarations
-                .iter()
-                .zip(current_custom_values)
-                .eq(custom_declarations
-                    .iter()
-                    .map(|(declared, written)| (declared, written)))
         {
             return;
         }
-        // An element's declarations are its own allocations, but every value equal to one also has
-        // a canonical one, which elements declaring the same text then share, and the caches over
-        // computed values see as the same value. A value taking part in a substitution keeps its
-        // own: the longhands a shorthand awaiting substitution expands to name it by identity.
-        let declarations = declarations
-            .into_iter()
-            .map(|(declared, written)| {
-                use crate::css::style_value::StyleValueData;
-                let takes_part_in_substitution = matches!(
-                    written.optional_data(),
-                    Some(
-                        StyleValueData::Unresolved { .. }
-                            | StyleValueData::PendingSubstitution { .. }
-                            | StyleValueData::Shorthand { .. }
-                    )
-                );
-                if takes_part_in_substitution || written.optional_data().is_none() {
-                    return (declared, written);
-                }
-                (declared, self.canonical_value(&written.into_arc()))
-            })
-            .collect();
         self.element_declarations.set(node, kind, declarations);
-        if kind == ElementDeclarationKind::InlineStyle {
-            self.element_declarations.set_custom(node, custom_declarations);
-        }
     }
 }
 
@@ -1588,7 +1556,6 @@ impl StyleEngine {
                 process_style: Arc::clone(&process_style),
                 declaration_block_version: Arc::new(std::sync::atomic::AtomicU32::new(1)),
 
-                next_style_update_version: StyleUpdateVersion(1),
                 document_style_computation_inputs: Default::default(),
                 document_resource_contexts: Default::default(),
                 document_media: Default::default(),
@@ -1604,7 +1571,7 @@ impl StyleEngine {
                     ),
                 ),
                 font_resolution: None,
-                canonical_values: crate::fork::ForkShared::new(CanonicalValues::default()),
+                pass_fonts: None,
                 computed_group_sets: Default::default(),
                 style_record_view_epoch_depth: 0,
                 custom_property_environments: Default::default(),
@@ -1633,6 +1600,7 @@ impl StyleEngine {
 
                 html_element_namespace: StyleAtomID::NONE,
                 sibling_positions: crate::fork::ForkReset::default(),
+                containers_counted_by_style_queries: Default::default(),
                 cold_pass_report: [0; pipeline::ReportField::COUNT],
                 live_style: None,
                 live_style_may_start: crate::fork::ForkReset::original(),
@@ -1646,6 +1614,7 @@ impl StyleEngine {
                 tested_attribute_names: Arc::default(),
                 attribute_value_text_requirements_version: 0,
                 selectors_test_local_link: false,
+                selectors_test_validity: false,
                 relational_arrival_keys: Arc::default(),
                 unresolved_relational_arrival_keys: HashSet::default(),
                 relational_arrival_keys_version: 0,
@@ -1934,6 +1903,9 @@ impl StyleEngine {
         declarations: &[super::bridge::FfiElementDeclarationDelta],
     ) {
         let moves_links = projection.moves_links();
+        self.retained
+            .element_declarations
+            .adopt_inline(projection.inline_declarations.clone());
         for (counter, count) in self.retained.projection.adopt(projection) {
             self.retained.counters.add(counter, count);
         }
@@ -2484,15 +2456,14 @@ impl RetainedState {
             rules: _,
             process_style: _,
             declaration_block_version: _,
-            next_style_update_version: _,
             document_style_computation_inputs: _,
             document_resource_contexts: _,
             document_media: _,
             document_functions: _,
             custom_property_registry: _,
             font_resolution: _,
+            pass_fonts: _,
             monospace_font_family: _,
-            canonical_values: _,
             computed_group_sets,
             style_record_view_epoch_depth: _,
             custom_property_environments: _,
@@ -2527,6 +2498,8 @@ impl RetainedState {
             // Scratch of one traversal.
             // Keyed by the tree's DOM order version.
             sibling_positions: _,
+            // Too many only walk more, and an element's identity is used again.
+            containers_counted_by_style_queries: _,
             // Dropped in `forget_departed_elements` when a relation holds a departed element.
             // Scratch of one transaction.
             // Not keyed by style node.
@@ -2548,6 +2521,7 @@ impl RetainedState {
             tested_attribute_names: _,
             attribute_value_text_requirements_version: _,
             selectors_test_local_link: _,
+            selectors_test_validity: _,
             relational_arrival_keys: _,
             unresolved_relational_arrival_keys: _,
             relational_arrival_keys_version: _,

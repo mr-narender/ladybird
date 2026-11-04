@@ -10,8 +10,8 @@
 
 use super::super::animations::DeclarationScope;
 use super::super::container_queries::{ContainerRecords, ContainerVerdict};
+use super::super::input_types::TransactionFactSide;
 use super::super::selector_evaluation::StructuralRead;
-use super::super::transaction_view::TransactionFactSide;
 use super::super::*;
 use super::drive::DriveRecords;
 use super::traversal::InitialStyle;
@@ -38,9 +38,9 @@ pub(crate) struct Record {
 
 /// A record's header word, which the host reads from its own thread: the facts of the record,
 /// settled when it is made, the computed `display` in bits 0-12 and the flags in bits 16-23; whether
-/// its groups hold images in bit 15, settled as a slot takes it; and the identity of that slot, its
-/// index in bits 24-47 and its generation in bits 48-63, which the slot names as it takes the record
-/// and forgets as it lets go of it.
+/// its groups hold images in bit 15, which bit 14 says is settled, by the thread computing it or the
+/// slot taking it; and the identity of that slot, its index in bits 24-47 and its generation in bits
+/// 48-63, which the slot names as it takes the record and forgets as it lets go of it.
 pub(in super::super) struct RecordHeader(std::sync::atomic::AtomicU64);
 
 const _: () = assert!((InstalledRecordID::MAX_SLOT as u64) < RecordHeader::SLOT_MASK);
@@ -48,6 +48,7 @@ const _: () = assert!((InstalledRecordID::MAX_GENERATION as u64) <= u64::MAX >> 
 
 impl RecordHeader {
     const DISPLAY_MASK: u64 = (1 << 13) - 1;
+    const IMAGE_VALUES_SETTLED: u64 = 1 << 14;
     const HOLDS_IMAGE_VALUES: u64 = 1 << 15;
     const FLAGS_SHIFT: u32 = 16;
     const SLOT_SHIFT: u32 = 24;
@@ -90,13 +91,20 @@ impl RecordHeader {
 
     fn set_holds_image_values(&self, holds_image_values: bool) {
         self.replace(
-            Self::HOLDS_IMAGE_VALUES,
-            if holds_image_values {
-                Self::HOLDS_IMAGE_VALUES
-            } else {
-                0
-            },
+            Self::IMAGE_VALUES_SETTLED | Self::HOLDS_IMAGE_VALUES,
+            Self::IMAGE_VALUES_SETTLED
+                | if holds_image_values {
+                    Self::HOLDS_IMAGE_VALUES
+                } else {
+                    0
+                },
         );
+    }
+
+    /// Whether the groups of the record hold images, where that is settled.
+    fn settled_holds_image_values(&self) -> Option<bool> {
+        let header = self.load();
+        (header & Self::IMAGE_VALUES_SETTLED != 0).then_some(header & Self::HOLDS_IMAGE_VALUES != 0)
     }
 
     fn installed_record(&self) -> Option<InstalledRecordID> {
@@ -591,9 +599,7 @@ impl Record {
     }
 
     /// The custom properties the element holds, which its inherited set holds beside its groups.
-    pub(in super::super) fn custom_properties(
-        &self,
-    ) -> Option<&Arc<crate::css::custom_properties::CustomPropertyStore>> {
+    pub(crate) fn custom_properties(&self) -> Option<&Arc<crate::css::custom_properties::CustomPropertyStore>> {
         self.payloads.custom_properties()
     }
 
@@ -764,6 +770,23 @@ impl Record {
         computed::view_dependency_flags(&self.facts(), self.header.holds_image_values())
     }
 
+    /// Settles whether the groups of the record hold images: on the thread that built them, which has them at hand, and
+    /// among others, for the serial step that names the record's slot to read a flag.
+    pub(in super::super) fn settle_holds_image_values(&self) {
+        // SAFETY: The record holds a reference to each of its groups.
+        let holds_image_values =
+            unsafe { crate::css::computed_values::style_group_payloads_hold_image_values(&self.payloads.pointers()) };
+        self.header.set_holds_image_values(holds_image_values);
+    }
+
+    /// What a view of the record depends on, for a slot to take it.
+    pub(in super::super) fn dependency_flags_for_a_slot(&self) -> u8 {
+        match self.header.settled_holds_image_values() {
+            Some(holds_image_values) => computed::view_dependency_flags(&self.facts(), holds_image_values),
+            None => computed::record_dependency_flags(&self.facts(), &self.payloads),
+        }
+    }
+
     /// Forget the identity of the slot that let go of the record.
     pub(in super::super) fn forget_installed_record(&self) {
         self.header.forget_installed_record();
@@ -786,9 +809,10 @@ impl Record {
     /// Whether `other` holds the computed values this record does.
     fn holds_the_same_values_as(&self, other: &Record) -> bool {
         let (mine, theirs) = (self.value_groups(), other.value_groups());
-        // NB: The groups a derived record answers from are its source's, whose bits can differ from its own: a table's box
-        //     holds none of the outer properties the table computes.
-        mine.reset_bits() == theirs.reset_bits()
+        // NB: The longhands a derived record answers with are its source's, whose bits can differ from its own: a
+        //     table's box holds none of the outer properties the table computes, and an anonymous box's source can
+        //     hold another writing mode.
+        mine.style_bits() == theirs.style_bits()
             && mine
                 .iter()
                 .zip(theirs.iter())
@@ -1053,7 +1077,7 @@ impl RetainedState {
     }
 
     fn install_new_record(&mut self, record: Arc<Record>) -> computed::FinalStyleRecordID {
-        self.computed_group_sets.install_record(&record, || {
+        self.computed_group_sets.install_derived_record(&record, || {
             computed::record_dependency_flags(&record.facts(), &record.payloads)
         })
     }
@@ -1106,8 +1130,9 @@ impl Record {
             }
             payloads += crate::css::computed_values::group_payload_allocation_bytes(group, payload.as_ptr());
             // SAFETY: The record holds a reference to each of its groups.
-            payloads += unsafe { crate::css::computed_values::group_values(group, payload.as_ptr()) }
-                .heap_size(&mut report.sizer);
+            payloads += unsafe {
+                crate::css::computed_values::group_held_values_heap_size(group, payload.as_ptr(), &mut report.sizer)
+            };
         }
         report.add(MemoryOwner::Payloads, payloads);
         if let Some(store) = record.custom_properties() {
@@ -1261,6 +1286,12 @@ impl RetainedRecords {
     /// Keep the root font inputs a pass that styled the document element `node` resolved against.
     pub(super) fn keep_root_font(&mut self, node: StyleNodeID, root_font: super::compute::RootFontInputs) {
         self.root_font = Some((node, root_font));
+    }
+
+    /// The root font inputs the last pass that styled the document element `node` resolved against, where one did.
+    pub(super) fn kept_root_font(&self, node: StyleNodeID) -> Option<super::compute::RootFontInputs> {
+        let (kept, root_font) = self.root_font?;
+        (kept == node).then_some(root_font)
     }
 
     /// Whether the style of `node`, its own or one of its pseudo-elements', derives from the
@@ -1638,8 +1669,7 @@ impl<'a> Records<'a> {
     /// The root font inputs the last pass that styled the document element `node` resolved
     /// against, where one did.
     pub(super) fn kept_root_font(&self, node: StyleNodeID) -> Option<super::compute::RootFontInputs> {
-        let (kept, root_font) = self.previous?.root_font?;
-        (kept == node).then_some(root_font)
+        self.previous?.kept_root_font(node)
     }
 
     pub(super) fn new(state: &'a RetainedState, cells: &'a RecordCells, previous: Option<&'a RetainedRecords>) -> Self {
@@ -1779,6 +1809,26 @@ impl<'a> Records<'a> {
             })?
             .identity;
         Some(self.state.custom_property_environments.store(sampled))
+    }
+
+    /// The record `node` held before this pass, or the one the host holds for it or composes its animations over, where
+    /// it holds the style `record` does: what it keeps in place of `record`, so that its children compute from it as
+    /// they did, and the host has nothing to take.
+    pub(super) fn held_before_holding_the_same_style_as(
+        &self,
+        node: StyleNodeID,
+        record: &Record,
+    ) -> Option<&'a Arc<Record>> {
+        let previous = self.previous?.get(node);
+        let held = self
+            .state
+            .held_style_records
+            .get(node)
+            .map(|held| held.sample_of_animations().map_or(held, |sample| &sample.base));
+        previous
+            .into_iter()
+            .chain(held.filter(|held| previous.is_none_or(|previous| !Arc::ptr_eq(previous, held))))
+            .find(|candidate| candidate.holds_the_same_style_as(record))
     }
 
     /// Whether this pass computed `node`.

@@ -8,7 +8,7 @@ use super::bridge::{ElementBoxKind, FfiAnimationInvalidation, FfiStyleInvalidati
 use super::computed::{ComputedGroupSets, FinalStyleRecordID, StyleRecordView, ViewLonghands};
 use super::{RetainedState, StyleNodeID};
 use crate::css::animated_overlay::{AnimatedOverlay, overlay_wins};
-use crate::css::computed_value_types::SVG_PAINT_NONE;
+use crate::css::computed_value_types::{ComputedFilter, SVG_PAINT_NONE};
 use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::property_metadata::{
     self, FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID, NUMBER_OF_LONGHAND_PROPERTIES, property_id,
@@ -102,6 +102,7 @@ struct StyleInvalidation {
     affects_hit_testing: bool,
     repaint_highlights: bool,
     white_space_collapse_changed: bool,
+    cursor_changed: bool,
 }
 
 impl StyleInvalidation {
@@ -153,6 +154,7 @@ impl StyleInvalidation {
         self.affects_hit_testing |= other.affects_hit_testing;
         self.repaint_highlights |= other.repaint_highlights;
         self.white_space_collapse_changed |= other.white_space_collapse_changed;
+        self.cursor_changed |= other.cursor_changed;
     }
 
     /// Whether the damage stays in the box of its element: no layout tree, stacking context, visual context, scroll
@@ -188,6 +190,7 @@ impl StyleInvalidation {
             affects_hit_testing: has(FfiStyleInvalidationField::AffectsHitTesting),
             repaint_highlights: has(FfiStyleInvalidationField::RepaintHighlights),
             white_space_collapse_changed: has(FfiStyleInvalidationField::WhiteSpaceCollapseChanged),
+            cursor_changed: has(FfiStyleInvalidationField::CursorChanged),
         }
     }
 
@@ -209,6 +212,7 @@ impl StyleInvalidation {
         packed |= u32::from(self.repaint_highlights) * FfiStyleInvalidationField::RepaintHighlights as u32;
         packed |=
             u32::from(self.white_space_collapse_changed) * FfiStyleInvalidationField::WhiteSpaceCollapseChanged as u32;
+        packed |= u32::from(self.cursor_changed) * FfiStyleInvalidationField::CursorChanged as u32;
         packed
     }
 }
@@ -599,6 +603,7 @@ fn property_invalidation(property: u16, old: ComputedValuesView<'_>, new: Comput
 
     let mut result = StyleInvalidation {
         affects_hit_testing: property_metadata::property_affects_hit_testing(property),
+        cursor_changed: property == property_id::CURSOR,
         ..StyleInvalidation::default()
     };
     if matches!(property, property_id::CONTAINER_NAME | property_id::CONTAINER_TYPE) {
@@ -743,6 +748,31 @@ fn property_invalidation(property: u16, old: ComputedValuesView<'_>, new: Comput
     result
 }
 
+/// Whether `old` and `new`, the operations of one filter value, bake different colors.
+fn filter_colors_differ(old: &ComputedFilter, new: &ComputedFilter) -> bool {
+    let (old, new) = (old.operations.as_slice(), new.operations.as_slice());
+    old.len() == new.len()
+        && old
+            .iter()
+            .zip(new)
+            .any(|(old, new)| old.shadow_color != new.shadow_color)
+}
+
+/// What a move from `old` to `new` damages through the filters that bake the element's color: a filter stays the same
+/// value as that color moves, so no comparison of values finds it, and the visual context holding it would keep painting
+/// the old color.
+fn baked_filter_color_damage(old: ComputedValuesView<'_>, new: ComputedValuesView<'_>) -> StyleInvalidation {
+    let (old_effects, new_effects) = (old.effects(), new.effects());
+    let mut damage = StyleInvalidation::default();
+    if filter_colors_differ(&old_effects.filter, &new_effects.filter) {
+        damage.merge(property_invalidation(property_id::FILTER, old, new));
+    }
+    if filter_colors_differ(&old_effects.backdrop_filter, &new_effects.backdrop_filter) {
+        damage.merge(property_invalidation(property_id::BACKDROP_FILTER, old, new));
+    }
+    damage
+}
+
 /// The value of `property` in the record viewed by `view`, whose longhands are `longhands`, with
 /// the view's animated values over them.
 fn effective_value<'a>(
@@ -820,6 +850,14 @@ pub(crate) fn animation_overlay_changed(
         return true;
     }
 
+    // NB: Whether an animation gives an element its font size matters beyond the value: a monospace element below it
+    //     goes on from that size rather than from what the font-size cascade decides.
+    let animates_font_size =
+        |overlay: Option<&AnimatedOverlay>| longhands.overlay_value(overlay, property_id::FONT_SIZE).is_some();
+    if animates_font_size(old_overlay) != animates_font_size(new_overlay) {
+        return true;
+    }
+
     animation_overlay_properties(old_overlay, new_overlay)
         .any(|property| animation_value_changed(longhands, old_overlay, new_overlay, property))
 }
@@ -886,6 +924,7 @@ impl RetainedState {
             }
             invalidation.merge(property_damage);
         }
+        invalidation.merge(baked_filter_color_damage(old_values, new_values));
 
         // Animated properties other than text-decoration-line cannot make an undecorated box decorated.
         if invalidation.repaint_text_decorations
@@ -945,9 +984,9 @@ impl RetainedState {
                 || self.projection.first_element_child(node).is_none())
     }
 
-    /// What moving a box from the record `old_style_record` to `new_style_record` damages, of `properties` alone, read
-    /// from the records' payloads: a sample of animations over a record keeps the record's longhand table, and holds
-    /// the values it animates only in its payloads.
+    /// What moving a box from the record `old_style_record` to `new_style_record` damages, of `properties` and the
+    /// filters that bake the element's color alone, read from the records' payloads: a sample of animations over a
+    /// record keeps the record's longhand table, and holds the values it animates only in its payloads.
     pub(crate) fn sampled_properties_damage(
         &self,
         old_style_record: u64,
@@ -969,6 +1008,7 @@ impl RetainedState {
         for &property in properties {
             result.merge(property_invalidation(property, old_values, new_values));
         }
+        result.merge(baked_filter_color_damage(old_values, new_values));
         result.pack()
     }
 
@@ -1240,6 +1280,7 @@ fn record_move_damage(
             }
             result.merge(invalidation);
         }
+        result.merge(baked_filter_color_damage(old_values, new_values));
         let old_overlay = old_record.animated_overlay;
         let new_overlay = new_record.animated_overlay;
         if old_overlay.is_some() || new_overlay.is_some() {

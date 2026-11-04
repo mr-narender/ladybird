@@ -291,7 +291,7 @@ public:
     void did_lose_input_event_endpoint(Badge<WebContentPage>, WebContentPage&);
     void did_consume_input_event_in_compositor(Badge<WebContentPage>, u64 event_id);
     void did_not_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id);
-    void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action);
+    void did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool performed_default_action);
     void discard_input_events_routed_through_lost_compositor(Badge<Application>);
     size_t pending_input_event_count_for_testing() const { return m_pending_input_events.size(); }
     void handle_external_url(Badge<WebContentPage>, URL::URL, URL::Origin, bool has_transient_activation);
@@ -861,6 +861,7 @@ protected:
     SharedBitmap m_front_bitmap;
     Vector<SharedBitmap> m_other_bitmaps;
     bool m_has_usable_bitmap { false };
+    bool m_pinch_gesture_was_canceled { false };
     bool m_presents_from_cpu_memory { false };
 
     // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
@@ -947,6 +948,9 @@ protected:
         // Set while the compositor decides whether it consumes the event, forwards it or hands it back. A compositor
         // that dies forwards none of the events still marked this way.
         bool routed_through_compositor { false };
+
+        // Set while an answer of the compositor is still to come for a trip through it that WebContent already finished.
+        bool expects_stale_compositor_answer { false };
 
         // A key event stays routed through the compositor until it forwards the event or hands it back. Later input
         // waits until then.

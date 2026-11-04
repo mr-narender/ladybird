@@ -121,6 +121,21 @@ void HistoryExecutor::complete_ui_history_operation(CrossProcessId operation_id,
     auto local_target_navigable_id = operation->value.local_target_navigable_id;
     auto local_target_entry = move(operation->value.local_target_entry);
     auto on_complete = operation->value.on_complete;
+
+    // AD-HOC: A canceled or stale operation drops the documents it populated without activating them.
+    GC::RootVector<GC::Ref<DOM::Document>> populated_documents;
+    auto append_populated_document = [&](GC::Ptr<DOM::Document> document) {
+        if (document)
+            populated_documents.append(*document);
+    };
+    append_populated_document(operation->value.pending_document);
+    for (auto const& job : operation->value.changing_navigable_jobs) {
+        if (!job.value.continuation)
+            continue;
+        append_populated_document(job.value.continuation->pending_document);
+        if (auto population_output = job.value.continuation->population_output)
+            append_populated_document(population_output->document);
+    }
     m_history_operations.remove(operation);
 
     // AD-HOC: A canceled or stale operation can leave a claimed navigable whose continuation was never applied.
@@ -128,6 +143,9 @@ void HistoryExecutor::complete_ui_history_operation(CrossProcessId operation_id,
         if (auto navigable = local_navigable_with_id(navigable_id))
             navigable->clear_ongoing_history_traversal();
     }
+
+    for (auto& document : populated_documents)
+        document->destroy_if_dropped_before_activation();
 
     if (target_entry_step.has_value()
         && local_target_navigable_id.has_value()
@@ -231,7 +249,7 @@ void HistoryExecutor::run_ui_beforeunload_check(Vector<CrossProcessId> navigable
         if (auto navigable = local_navigable_with_id(navigable_id); navigable && !navigable->has_been_destroyed() && navigable->active_document())
             navigables.append(*navigable);
     }
-    check_if_unloading_is_canceled(move(navigables), traversable, traversable, move(target_entry), user_involvement_for_navigate_event, unload_prompt_shown, on_complete);
+    check_if_unloading_is_canceled(*m_page, move(navigables), traversable, traversable, move(target_entry), user_involvement_for_navigate_event, unload_prompt_shown, on_complete);
 }
 
 static bool is_same_document_push_or_replace(Optional<Bindings::NavigationType> navigation_type, SessionHistoryEntry const& target_entry, DOM::Document const& displayed_document)

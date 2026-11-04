@@ -222,7 +222,7 @@ public:
     EventResult handle_drag_and_drop_event(DragEvent::Type, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Vector<HTML::SelectedFile> files);
     EventResult handle_pinch_event(DevicePixelPoint point, unsigned modifiers, double scale);
 
-    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false);
+    EventResult handle_keydown(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat, bool should_insert_text, bool async_scroll_performed_default_action = false, ReadonlySpan<TextEditingCommand> editing_commands = {}, bool native_editing_binding_resolved = false, Optional<u64> user_input_scroll_count_with_nothing_to_scroll = {});
     EventResult handle_keyup(UIEvents::KeyCode, unsigned modifiers, u32 code_point, bool repeat);
 
     void handle_gamepad_connected(Gamepad::GamepadDescription const&);
@@ -304,6 +304,9 @@ public:
     Optional<Utf16String> const& pending_dialog_text() const { return m_pending_dialog_text; }
     void dismiss_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed);
     void accept_dialog(GC::Ref<GC::Function<void()>> on_dialog_closed);
+
+    void add_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState>);
+    void remove_unloading_canceled_check(Badge<HTML::CheckUnloadingCanceledState>, GC::Ref<HTML::CheckUnloadingCanceledState>);
 
     void did_request_color_picker(GC::Weak<HTML::HTMLInputElement> target, Color current_color);
     void color_picker_update(Optional<Color> picked_color, HTML::ColorPickerUpdateState state);
@@ -578,6 +581,10 @@ private:
     Optional<bool> m_pending_confirm_response;
     Optional<Optional<Utf16String>> m_pending_prompt_response;
     GC::Ptr<GC::Function<void()>> m_on_pending_dialog_closed;
+
+    // The checks if unloading is canceled that are still running. They wait on tasks and dialogs that may never come
+    // back, so this page keeps them alive until they finish, if need be by timing out.
+    HashTable<GC::Ref<HTML::CheckUnloadingCanceledState>> m_unloading_canceled_checks;
 
     PendingNonBlockingDialog m_pending_non_blocking_dialog { PendingNonBlockingDialog::None };
     GC::Weak<HTML::HTMLElement> m_pending_non_blocking_dialog_target;

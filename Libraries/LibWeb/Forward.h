@@ -670,6 +670,7 @@ class DOMRectReadOnly;
 namespace Web::HTML {
 
 enum class CheckIfUnloadingIsCanceledResult;
+enum class HoverUpdatePoint : u8;
 
 class AnimationFrameCallbackDriver;
 class AudioTrack;
@@ -681,6 +682,7 @@ class BrowsingContext;
 class Canvas2DContextBase;
 class CanvasHost;
 class CanvasRenderingContext2D;
+class CheckUnloadingCanceledState;
 class RemoteCanvas2DTransport;
 class ClassicScript;
 class CloseEvent;

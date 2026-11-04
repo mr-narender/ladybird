@@ -83,6 +83,12 @@ void ConnectionFromWebContent::pointer_left(Web::CompositorContextId context_id,
         m_render_clock_connection->async_pointer_left(context_id, input_event_id);
 }
 
+void ConnectionFromWebContent::pointer_rests_on_moving_content(Web::CompositorContextId context_id)
+{
+    if (m_render_clock_connection)
+        m_render_clock_connection->async_pointer_rests_on_moving_content(context_id);
+}
+
 void ConnectionFromWebContent::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
 {
     m_video_frame_holds.add_sink(video_sink_handle, move(presentation_page));
@@ -152,6 +158,11 @@ void ConnectionFromWebContent::rendering_opportunity(Web::CompositorContextId co
 void ConnectionFromWebContent::async_scroll_updates(Web::CompositorContextId context_id, Compositing::PendingAsyncScrollUpdates const& updates)
 {
     async_async_scroll_updates(context_id, updates);
+}
+
+void ConnectionFromWebContent::animated_content_moved_under_pointer(Web::CompositorContextId context_id, i64 frame_time_nanoseconds)
+{
+    async_animated_content_moved_under_pointer(context_id, frame_time_nanoseconds);
 }
 
 void ConnectionFromWebContent::overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> const& visibilities)

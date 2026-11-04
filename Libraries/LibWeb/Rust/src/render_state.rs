@@ -193,6 +193,7 @@ impl RenderState {
                 .selector_attribute_value_text_requirements_version(),
             relational_arrival_keys_version: engine.relational_arrival_keys_version(),
             selectors_test_local_link: engine.selectors_test_local_link(),
+            selectors_test_validity: engine.selectors_test_validity(),
         };
         let selector_value_text_names = std::sync::Arc::clone(engine.selector_attribute_value_text_names());
         let selector_tested_attribute_names = std::sync::Arc::clone(engine.selector_tested_attribute_names());
@@ -231,13 +232,21 @@ impl RenderState {
         answer.note_host_styled_boxes(arena);
         let work = OwedHostWork::default();
         arena.queue_box_presence();
-        let styled = arena.install_styles(HostCalls(&work), answer.rows(), |node| answer.element_install(node));
+        let next_effects = std::cell::Cell::new(0);
+        let styled = arena.install_styles(HostCalls(&work), answer.rows(), |node| {
+            answer.element_install(node, &next_effects)
+        });
+        assert_eq!(
+            next_effects.get(),
+            answer.effects_count(),
+            "the rows and the effects of an installation stand in one order"
+        );
         let host_work = work.resolve(arena);
         self.engine_mut().end_reinheriting_for_install();
         if !host_work.is_empty() {
             self.owed.push(host_work);
         }
-        answer.note_styled(styled);
+        answer.note_styled(styled, self.arena.arena());
     }
 
     /// The style engine, and the layout arena beside it.
@@ -326,6 +335,7 @@ pub(crate) struct StateFacts {
     pub(crate) relational_arrival_keys_version: u64,
     /// Whether the engine's selectors test `:local-link`.
     pub(crate) selectors_test_local_link: bool,
+    pub(crate) selectors_test_validity: bool,
 }
 
 /// What the style engine answers of itself as a job or a frame leaves it, which only a write to the engine moves (see

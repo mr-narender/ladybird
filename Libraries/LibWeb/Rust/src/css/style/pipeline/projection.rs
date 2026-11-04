@@ -45,6 +45,7 @@ use super::super::index::StateSet;
 use super::super::index::StyleAtomID;
 use super::super::index::dispatch_bloom_bit;
 use super::super::input_types::StateFact;
+use super::super::input_types::TransactionFactSide;
 use super::super::input_types::TreeRelations;
 use super::super::selector::Incomplete;
 use super::super::selector::MatchScratch;
@@ -60,7 +61,6 @@ use super::super::selector_evaluation::SelectorEvaluator;
 use super::super::selector_evaluation::SelectorSubject;
 use super::super::selector_evaluation::SelectorTree;
 use super::super::selector_evaluation::StructuralRead;
-use super::super::transaction_view::TransactionFactSide;
 use super::super::tree::StyleNodeID;
 use super::super::tree::TreeScopeID;
 use crate::cow_column::ColumnSnapshot;
@@ -80,6 +80,15 @@ pub(in crate::css::style) use writer::ProjectionWriter;
 /// How many rows a chunk of the projection holds, and so how many rows the first write after a fork
 /// copies.
 const ROWS_PER_CHUNK: usize = 64;
+
+/// Empty a list of what one transaction wrote or changed. Keep small lists warm for the next transaction, but do not
+/// retain what a batch of arriving elements grew one to for the lifetime of every document.
+fn clear_transaction_list<T>(list: &mut Vec<T>) {
+    list.clear();
+    if list.capacity() * size_of::<T>() > 4096 {
+        *list = Vec::new();
+    }
+}
 
 /// A set of elements whose rows were written, each listed once, with a bit per element slot saying
 /// which.
@@ -123,7 +132,7 @@ impl WrittenRows {
     /// Empty the set, keeping `nodes`, taken from it, as its allocation.
     fn reuse(&mut self, mut nodes: Vec<StyleNodeID>) {
         debug_assert!(self.nodes.is_empty());
-        nodes.clear();
+        clear_transaction_list(&mut nodes);
         self.nodes = nodes;
     }
 }
@@ -147,7 +156,7 @@ impl Clone for PendingChangeScan {
 
 impl PendingChangeScan {
     fn clear(&mut self) {
-        self.writes.clear();
+        clear_transaction_list(&mut self.writes);
         *self.checked.get_mut() = 0;
     }
 
@@ -699,7 +708,8 @@ impl StructuralFlags {
     pub(in crate::css::style) const CHILDREN_READ_POSITIONS: Self = Self(1 << 2);
     /// A selector read whether the element is `:empty`.
     pub(in crate::css::style) const READ_EMPTINESS: Self = Self(1 << 3);
-    /// The record of a child, or of a pseudo-element of it, computes from its place among its siblings.
+    /// The record of a child, or of a pseudo-element of it, or a style query asking the child as a container, computes
+    /// from its place among its siblings.
     pub(in crate::css::style) const CHILD_READS_SIBLING_POSITION: Self = Self(1 << 4);
     /// A selector read where a child stands counted from the end.
     pub(in crate::css::style) const CHILDREN_READ_POSITIONS_FROM_END: Self = Self(1 << 5);
@@ -1196,7 +1206,7 @@ impl Projection {
     pub(in crate::css::style) fn release(&mut self) {
         self.before = ColumnSnapshot::default();
         self.hover.before = HoveredFacts::default();
-        self.changes.clear();
+        clear_transaction_list(&mut self.changes);
         let links_written = self.links_written.take();
         self.links_written.reuse(links_written);
         let relations_written = self.relations_written.take();
@@ -1292,6 +1302,7 @@ impl Projection {
         let ProjectionPublication {
             rows,
             shadows,
+            inline_declarations: _,
             slot_count,
             catalogs,
             host_fact_sets,
@@ -1402,7 +1413,7 @@ impl Projection {
     /// Which principal box the element asks for.
     #[must_use]
     pub(in crate::css::style) fn box_kind(&self, node: StyleNodeID) -> super::super::bridge::ElementBoxKind {
-        self.host_facts(node).box_kind()
+        self.host_facts(node).box_kind
     }
 
     /// The element-backed pseudo-element kind of its shadow host the element stands for, as published.

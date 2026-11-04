@@ -117,14 +117,12 @@
 #include <LibWeb/PermissionsAPI/PermissionStore.h>
 #include <LibWeb/PermissionsAPI/Permissions.h>
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
-#include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/Streams/ReadableStream.h>
 #include <LibWeb/StyleValueRustFFI.h>
 #include <LibWeb/WebDriver/Actions.h>
 #include <LibWeb/WebDriver/InputState.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
-#include <LibWeb/WebSockets/WebSocket.h>
 #include <LibWeb/XHR/XMLHttpRequest.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
@@ -497,15 +495,14 @@ bool Internals::wrapper_is_preserved(JS::Object& object)
     return Bindings::wrapper_is_preserved(*platform_object);
 }
 
-bool Internals::has_activity_root(JS::Object& object)
+bool Internals::has_pending_activity(JS::Object& object, GC::Ptr<DOM::Document> document)
 {
-    if (auto* xhr = Bindings::impl_from<XHR::XMLHttpRequest>(&object))
-        return xhr->has_activity_root();
-    if (auto* resize_observer = Bindings::impl_from<ResizeObserver::ResizeObserver>(&object))
-        return resize_observer->has_activity_root();
-    if (auto* web_socket = Bindings::impl_from<WebSockets::WebSocket>(&object))
-        return web_socket->has_activity_root();
-    return false;
+    auto* target = Bindings::impl_from<DOM::EventTarget>(&object);
+    if (!target)
+        return false;
+    if (document)
+        return document->window() && document->window()->has_pending_activity(*target);
+    return HTML::relevant_window_or_worker_global_scope(object).has_pending_activity(*target);
 }
 
 WebIDL::UnsignedLongLong Internals::message_port_pending_outgoing_message_count(HTML::MessagePort& port)
@@ -1070,13 +1067,14 @@ void Internals::pinch(double x, double y, double scale_delta, WebIDL::UnsignedSh
     page.handle_pinch_event(position, modifiers, scale_delta);
 }
 
-void Internals::pinch_through_ui_process(double x, double y, double scale_delta)
+void Internals::pinch_through_ui_process(double x, double y, double scale_delta, bool continues_gesture)
 {
     let_compositor_take_in_every_rendered_frame(window());
 
     Web::PinchEvent event;
     event.position = page().css_to_device_point(window().navigable()->to_page_position({ x, y }));
     event.scale_delta = scale_delta;
+    event.continues_gesture = continues_gesture;
     page().client().page_did_request_pinch_event_for_testing(window().navigable()->local_root()->id(), event);
 }
 
@@ -2435,6 +2433,21 @@ void Internals::inject_hover_pointer(double x, double y, Optional<double> frame_
     Layout::RustFFI::document_host_inject_pointer(document.layout_node_arena().host(), static_cast<float>(x * device_pixels_per_css_pixel), static_cast<float>(y * device_pixels_per_css_pixel), static_cast<i64>(frame_time * 1'000'000.0), input_event_id.value_or(0));
 }
 
+void Internals::note_animated_content_moved_under_pointer(double frame_time_ms)
+{
+    auto& document = window().associated_document();
+    auto frame_time = document.relevant_settings_object().time_origin() + frame_time_ms;
+    if (auto navigable = document.navigable())
+        navigable->event_handler().note_animated_content_moved_under_pointer(static_cast<i64>(frame_time * 1'000'000.0));
+}
+
+void Internals::inject_pointer_rests_on_moving_content(double frame_time_ms)
+{
+    auto& document = window().associated_document();
+    auto frame_time = document.relevant_settings_object().time_origin() + frame_time_ms;
+    Layout::RustFFI::document_host_inject_pointer_rest(document.layout_node_arena().host(), static_cast<i64>(frame_time * 1'000'000.0));
+}
+
 u64 Internals::queue_mouse_move(double x, double y, u32 buttons)
 {
     // NB: Above every id a UI process hands out in a test.
@@ -2780,35 +2793,17 @@ u64 Internals::style_record_identity(DOM::Element& element)
     return element.style_record_identity().value();
 }
 
+u64 Internals::custom_property_environment_identity(DOM::Element& element)
+{
+    return element.installed_style().custom_property_environment();
+}
+
 u64 Internals::layout_style_record_identity(DOM::Element& element)
 {
     Layout::ForcedReadScope read { element.document() };
     element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
     auto const* layout_node = element.layout_node(read);
     return layout_node ? layout_node->style_record_identity().value() : 0;
-}
-
-u64 Internals::before_style_record_identity(DOM::Element& element)
-{
-    return element.style_record_identity(CSS::PseudoElement::Before).value();
-}
-
-u64 Internals::before_layout_style_record_identity(DOM::Element& element)
-{
-    Layout::ForcedReadScope read { element.document() };
-    element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = element.pseudo_element_layout_node(read, CSS::PseudoElement::Before);
-    return layout_node ? layout_node->style_record_identity().value() : 0;
-}
-
-u64 Internals::paint_style_record_identity(DOM::Element& element)
-{
-    Layout::ForcedReadScope read { element.document() };
-    element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = element.layout_node(read);
-    if (!layout_node || !Painting::has_committed_box(*layout_node))
-        return 0;
-    return Painting::style_record_identity(*layout_node).value();
 }
 
 u64 Internals::layout_node_identity(DOM::Node& node)

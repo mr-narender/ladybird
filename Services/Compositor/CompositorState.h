@@ -50,7 +50,7 @@ public:
     // No context could take the event; the UI sends it to WebContent itself.
     virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) = 0;
     // The compositor forwarded the key event to WebContent, after performing its default action by scrolling if it says so.
-    virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool async_scroll_performed_default_action) = 0;
+    virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool performed_default_action) = 0;
 };
 
 class CompositorStateWebContentClient {
@@ -65,7 +65,9 @@ public:
     virtual void clock_tick(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds, Vector<Web::CompositorScrollOffset> const& scroll_offsets) = 0;
     virtual void pointer_moved(Web::CompositorContextId, Web::DevicePixelPoint, u32 /* buttons */, bool /* scrolled_since_frame */, u64 /* input_event_id */) { }
     virtual void pointer_left(Web::CompositorContextId, u64 /* input_event_id */) { }
+    virtual void pointer_rests_on_moving_content(Web::CompositorContextId) { }
     virtual void async_scroll_updates(Web::CompositorContextId, Compositing::PendingAsyncScrollUpdates const&) = 0;
+    virtual void animated_content_moved_under_pointer(Web::CompositorContextId, i64 /* frame_time_nanoseconds */) { }
     virtual void overlay_scrollbar_visibilities_changed(Vector<Web::OverlayScrollbarVisibility> const&) { }
     virtual void create_video_edge(Media::VideoSinkHandle) = 0;
     virtual void release_video_edge(Media::VideoSinkHandle) = 0;
@@ -292,7 +294,7 @@ private:
     // without regard to where their content is or what clips it.
     Optional<Gfx::FloatPoint> position_in_nested_context_ignoring_clips(Web::CompositorContextId presenting_context_id, ContextState& presenting_context, ContextState& nested_context, Gfx::FloatPoint position);
     bool is_nested_in(Web::CompositorContextId containing_context_id, ContextState const&) const;
-    bool nested_context_may_cancel_pinch(Web::CompositorContextId) const;
+    bool page_under_pinch_may_cancel_it(Web::CompositorContextId, ContextState&, Gfx::FloatPoint position);
     void dispatch_scroll_fling_step(Web::CompositorContextId, ContextState&, Optional<Web::MouseEvent>, MonotonicTime now);
     void present_frame(Web::CompositorContextId, ContextState&, PendingFrame);
     void schedule_present_frame(Web::CompositorContextId, ContextState&, PendingFrame);

@@ -602,17 +602,21 @@ void CompositorState::handle_and_dispatch_key_event(Web::CompositorContextId con
         return;
     }
 
+    bool later_keys_need_not_wait = false;
     if (allow_keyboard_scroll) {
         if (auto box = context->box_scrolled_for_key_event(event); box.has_value())
             dispatch_scroll_fling_step(context_id, *context, context->end_momentum_scrolling(box.value()), MonotonicTime::now());
-        auto handled = apply_context_update_result(context_id, *context, context->handle_key_event(event));
-        event.async_scroll_performed_default_action = handled && event.type == Web::KeyEvent::Type::KeyDown;
+        auto result = context->handle_key_event(event);
+        later_keys_need_not_wait = apply_context_update_result(context_id, *context, result) && event.type == Web::KeyEvent::Type::KeyDown;
+        event.async_scroll_performed_default_action = later_keys_need_not_wait && !result.key_found_nothing_to_scroll;
+        if (later_keys_need_not_wait && result.key_found_nothing_to_scroll)
+            event.user_input_scroll_count_with_nothing_to_scroll = context->user_input_scroll_count();
     }
 
     // The scroll updates the event produced reach WebContent ahead of the event itself on the same connection.
     publish_pending_async_scroll_updates(context_id, *context);
     context->dispatch_key_event_to_web_content(event);
-    presentation->did_dispatch_input_event(context_id, event.id, event.async_scroll_performed_default_action);
+    presentation->did_dispatch_input_event(context_id, event.id, later_keys_need_not_wait);
 }
 
 void CompositorState::handle_and_dispatch_mouse_event(Web::CompositorContextId context_id, Web::MouseEvent event)
@@ -631,13 +635,18 @@ void CompositorState::handle_and_dispatch_mouse_event(Web::CompositorContextId c
         return;
     }
 
+    if (event.type == Web::MouseEvent::Type::MouseMove)
+        context->note_pointer_position(Gfx::FloatPoint { static_cast<float>(event.position.x().value()), static_cast<float>(event.position.y().value()) });
+    else if (first_is_one_of(event.type, Web::MouseEvent::Type::MouseLeave, Web::MouseEvent::Type::MouseCancel))
+        context->note_pointer_position({});
+
     if (event.type == Web::MouseEvent::Type::MouseDown)
         dispatch_scroll_fling_step(context_id, *context, context->end_scroll_fling(), MonotonicTime::now());
 
     auto is_wheel_event = event.type == Web::MouseEvent::Type::MouseWheel;
     bool is_first_wheel_event_with_delta = false;
     if (is_wheel_event) {
-        // A key or a script that scrolls takes over from momentum, until wheel input other than the momentum takes
+        // A key, or a script's smooth scroll, takes over from momentum, until wheel input other than the momentum takes
         // over again.
         if (context->absorbs_wheel_event_of_interrupted_momentum(event)) {
             record_routing(Web::InputRoutingDecision::MomentumInterrupted);
@@ -810,6 +819,7 @@ ContextState::ContextUpdateResult CompositorState::handle_mouse_event_in_nested_
         if (pointer.context_under_pointer == nested_context_id)
             return;
         if (auto* context_left = context_still_nested_in(context_id, pointer.context_under_pointer)) {
+            context_left->note_pointer_position({});
             if (auto frame_to_present = context_left->clear_scrollbar_hover(); frame_to_present.has_value())
                 schedule_present_frame(*pointer.context_under_pointer, *context_left, *frame_to_present);
         }
@@ -1164,17 +1174,31 @@ void CompositorState::dispatch_scroll_fling_step(Web::CompositorContextId contex
     context.dispatch_mouse_event_to_web_content(*event);
 }
 
-// A pinch over a document nested in the context is a ctrl+wheel event to that document first, which its blocking wheel
-// event listeners may cancel before anything zooms. Rather than hit test contexts the pinch may be zooming, any nested
-// context that would hold back a pinch of its own holds back the pinch of the context it is nested in.
-bool CompositorState::nested_context_may_cancel_pinch(Web::CompositorContextId context_id) const
+// A pinch is a ctrl+wheel event first, to the document under it, whose blocking wheel event listeners may cancel it
+// before anything zooms. Only the documents at the position can see that event.
+bool CompositorState::page_under_pinch_may_cancel_it(Web::CompositorContextId context_id, ContextState& context, Gfx::FloatPoint position)
 {
-    for (auto const& context_entry : m_contexts) {
-        auto const& nested_context = *context_entry.value;
-        if (!nested_context.admits_async_pinch() && is_nested_in(context_id, nested_context))
+    auto containing_context_id = context_id;
+    auto* containing_context = &context;
+    // A walk down the nested contexts that outlasts the number of contexts went around a loop.
+    for (size_t remaining_contexts = m_contexts.size(); remaining_contexts > 0; --remaining_contexts) {
+        if (containing_context->page_may_cancel_pinch_at(position))
             return true;
+        auto hit = containing_context->nested_context_for_wheel_at(position);
+        if (!hit.has_value())
+            return false;
+        // NB: Nothing is known yet of the listeners of a context that is not available.
+        auto* nested_context = context_if_present(hit->child_context_id);
+        if (!nested_context || nested_context->parent_context_id() != containing_context_id)
+            return true;
+        auto position_in_nested = position_in_nested_context(*hit, *nested_context);
+        if (!position_in_nested.has_value())
+            return true;
+        containing_context_id = hit->child_context_id;
+        containing_context = nested_context;
+        position = *position_in_nested;
     }
-    return false;
+    return true;
 }
 
 void CompositorState::handle_and_dispatch_pinch_event(Web::CompositorContextId context_id, Web::PinchEvent event)
@@ -1188,13 +1212,19 @@ void CompositorState::handle_and_dispatch_pinch_event(Web::CompositorContextId c
         return;
     }
 
-    // A nested document that already let the event through leaves only the zoom to do.
-    if (context->admits_async_pinch() && (event.wheel_event_was_dispatched || !nested_context_may_cancel_pinch(context_id)))
+    // The first step of a gesture decides for the steps after it: a gesture the page let through zooms from here on,
+    // whatever listeners have appeared since, and any other leaves each step to the page, wherever the pinch has moved.
+    // A page that already let this step through leaves only the zoom to do.
+    Gfx::FloatPoint position { static_cast<float>(event.position.x().value()), static_cast<float>(event.position.y().value()) };
+    auto may_zoom = event.continues_gesture ? context->pinch_gesture_was_let_through() : !page_under_pinch_may_cancel_it(context_id, *context, position);
+    if (event.wheel_event_was_dispatched || may_zoom)
         event.async_zoom_performed_default_action = apply_context_update_result(context_id, *context, context->handle_pinch_event(event));
+    context->set_pinch_gesture_was_let_through(event.async_zoom_performed_default_action);
 
     // The scroll updates the event produced reach WebContent ahead of the event itself on the same connection.
     publish_pending_async_scroll_updates(context_id, *context);
     context->dispatch_pinch_event_to_web_content(event);
+    presentation->did_dispatch_input_event(context_id, event.id, event.async_zoom_performed_default_action);
 }
 
 Compositing::WheelEventAnswer CompositorState::wheel_event_answer_for(AppliedWheelStep const& applied_step, Optional<Web::WheelGestureMark> wheel_gesture_mark)
@@ -1298,11 +1328,8 @@ void CompositorState::forget_wheel_gesture_the_page_canceled(Web::CompositorCont
         context_if_present(*routing_context_id)->forget_wheel_latch_of_gesture(gesture_id);
 }
 
-static bool scroll_request_scrolls_for_script(Compositing::ScrollRequest const& scroll_request)
+static bool scroll_request_smoothly_scrolls_for_script(Compositing::ScrollRequest const& scroll_request)
 {
-    bool has_instant_scroll = scroll_request.jump_offset.has_value() || scroll_request.relative_scroll.has_value();
-    if (has_instant_scroll && !scroll_request.instant_scroll_is_for_user_input)
-        return true;
     return scroll_request.smooth_scroll.has_value() && scroll_request.smooth_scroll->initiator == Compositing::SmoothScrollInitiator::Programmatic;
 }
 
@@ -1312,10 +1339,11 @@ void CompositorState::apply_scroll_requests(Web::CompositorContextId context_id,
     if (!context)
         return;
 
-    // A script's scroll of a box ends the momentum scrolling it, as a key's does.
+    // A script's smooth scroll of a box ends the momentum scrolling it, as a key's does. A script's instant scroll only
+    // moves the box, and the momentum goes on from there: pages keep their content in place under a flick that way.
     auto now = MonotonicTime::now();
     for (auto const& scroll_request : scroll_requests) {
-        if (scroll_request.takes_over_from_momentum || scroll_request_scrolls_for_script(scroll_request))
+        if (scroll_request.takes_over_from_momentum || scroll_request_smoothly_scrolls_for_script(scroll_request))
             dispatch_scroll_fling_step(context_id, *context, context->end_momentum_scrolling(scroll_request.stable_node_id), now);
     }
     if (auto frame_to_present = context->apply_scroll_requests(scroll_requests); frame_to_present.has_value())

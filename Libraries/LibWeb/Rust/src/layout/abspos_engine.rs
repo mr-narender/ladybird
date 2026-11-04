@@ -171,7 +171,7 @@ impl<'a> OutOfFlowBox<'a> {
 pub(crate) struct AbsposEngine<'pass> {
     state: &'pass RunState,
     callbacks: LayoutPass<'pass>,
-    fragments: Option<std::rc::Rc<fragment_tree::RunFragmentBuilder>>,
+    fragments: Option<&'pass fragment_tree::RunFragmentBuilder>,
 }
 
 impl<'pass> AbsposEngine<'pass> {
@@ -179,7 +179,7 @@ impl<'pass> AbsposEngine<'pass> {
         Self {
             state: run.state,
             callbacks: run.callbacks,
-            fragments: run.fragments.clone(),
+            fragments: run.fragments,
         }
     }
 
@@ -278,13 +278,12 @@ impl<'pass> AbsposEngine<'pass> {
     /// The fragments of the run this engine lays out boxes in, where its placements are kept.
     fn placed_box_fragments(&self) -> &fragment_tree::RunFragmentBuilder {
         self.fragments
-            .as_deref()
             .expect("absolutely positioned boxes are laid out in runs that build fragments")
     }
 
     /// Where the run placed `node`, if it placed the box.
     fn placement_of(&self, node: Node) -> Option<run_state::BoxPlacement> {
-        self.placed_box_fragments().placement_of(node)
+        self.placed_box_fragments().placement_of(&self.callbacks, node)
     }
 
     fn placement_containing_block(&self, node: Node) -> Node {
@@ -525,7 +524,6 @@ impl AbsposEngine<'_> {
                 .is_some_and(|kind| super::node_facts::kind_is_box(kind) || kind == NodeKind::InlineNode)
             || !self
                 .fragments
-                .as_deref()
                 .is_some_and(|fragments| fragments.find_anchor_candidate(anchor_box).is_some())
         {
             return false;
@@ -562,7 +560,6 @@ impl AbsposEngine<'_> {
     ) -> CssPixelRect {
         let (rect, coordinate_space_box) = self
             .fragments
-            .as_deref()
             .and_then(|fragments| fragments.find_anchor_candidate(anchor_box))
             .expect("an accepted anchor is placed in the draining subtree and propagated here");
         let fold_into_entry_space =
@@ -929,7 +926,7 @@ impl AbsposEngine<'_> {
         // https://drafts.csswg.org/css-anchor-position-1/#anchor-size-resolution
         // If no fallback value is specified, it makes the declaration referencing it invalid at computed-value time.
         let resolve_size = |size: &ComputedSize, is_horizontal: bool, initial: ComputedSizeKind| {
-            if !size.is_length_percentage() || !size.length_percentage().contains_anchor_function() {
+            if !size.contains_anchor_function() {
                 return None;
             }
             let extent = if is_horizontal { inline_size } else { block_size };
@@ -3549,17 +3546,14 @@ impl<'pass> AbsposEngine<'pass> {
 
         // 1. Let current styles be the current used styles of abspos, as derived from the computed base style (which
         //    might be the result of earlier fallback).
-        // NB: A box whose base styles, or the @position-try rule of its last successful position option, changed has
-        //     no last successful position option.
+        // NB: A box whose @position-try rule of its last successful position option changed has no last successful
+        //     position option.
         let last_successful_option = arena
             .last_successful_position_option(node)
             .filter(|choice| {
-                choice.base_style_record == base_style_record
-                    && entry_of(choice.option)
-                        .map_or(crate::css::style::position_try::PositionTryRuleID::NONE, |(_, rule)| {
-                            rule
-                        })
-                        == choice.rule
+                entry_of(choice.option).map_or(crate::css::style::position_try::PositionTryRuleID::NONE, |(_, rule)| {
+                    rule
+                }) == choice.rule
             })
             .map_or(0, |choice| choice.option);
         let current = options
@@ -3569,7 +3563,6 @@ impl<'pass> AbsposEngine<'pass> {
             .expect("the base styles are a position option");
         let choice_of = |option: u32| abspos_inputs::PositionOptionChoice {
             option,
-            base_style_record,
             rule: entry_of(option).map_or(crate::css::style::position_try::PositionTryRuleID::NONE, |(_, rule)| {
                 rule
             }),
@@ -3623,7 +3616,7 @@ impl<'pass> AbsposEngine<'pass> {
             callback(&AbsposEngine {
                 state: self.state,
                 callbacks,
-                fragments: self.fragments.clone(),
+                fragments: self.fragments,
             })
         })
     }
@@ -3774,7 +3767,6 @@ impl<'pass> AbsposEngine<'pass> {
         );
         let containing_block_info_override = child.containing_block_info_override.or_else(|| {
             self.fragments
-                .as_deref()
                 .and_then(|fragments| fragments.find_abspos_containing_block_info(child_box))
         });
         let unresolved_containing_block_info = containing_block_info_override.unwrap_or_else(|| {
@@ -3888,7 +3880,7 @@ impl<'pass> AbsposEngine<'pass> {
         if child.inline_containing_block().is_invalid() {
             return None;
         }
-        let fragments = self.fragments.as_deref()?;
+        let fragments = self.fragments?;
         let (rect, payload_space) = fragments.find_inline_containing_block_rect(child.inline_containing_block())?;
         let fold_into_entry_space =
             self.translation_between_payload_resting_spaces(payload_space, child.coordinate_space_box);
@@ -4016,7 +4008,7 @@ pub(crate) fn drain_abspos_with_placed_containing_blocks(
     state: &RunState,
     callbacks: LayoutPass<'_>,
     should_collect_devtools_layout_data: bool,
-    entry_fragments: &std::rc::Rc<fragment_tree::RunFragmentBuilder>,
+    entry_fragments: &fragment_tree::RunFragmentBuilder,
 ) {
     let accumulator_root = entry_fragments.root_node();
     let run = FormattingContextRun {
@@ -4025,7 +4017,7 @@ pub(crate) fn drain_abspos_with_placed_containing_blocks(
         callbacks,
         should_collect_devtools_layout_data,
         treat_block_axis_percentage_insets_as_auto_beyond_root: false,
-        fragments: Some(entry_fragments.clone()),
+        fragments: Some(entry_fragments),
         fragmentainer: None,
     };
     loop {

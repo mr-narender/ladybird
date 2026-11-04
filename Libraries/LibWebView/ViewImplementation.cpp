@@ -1052,25 +1052,27 @@ void ViewImplementation::enqueue_input_event(Web::InputEvent event)
 // Input waits while the compositor decides whether it forwards a key event, so a key it hands back is not overtaken.
 void ViewImplementation::send_queued_input_events()
 {
-    bool has_earlier_pinch = false;
+    bool has_earlier_pinch_yet_to_zoom = false;
     for (size_t index = 0; index < m_pending_input_events.size(); ++index) {
         // Pinches in different processes share the tab's visual viewport. A later pinch must not zoom it before an
-        // earlier frame has dispatched its wheel event and, if uncanceled, returned for the zoom.
-        if (m_pending_input_events[index].event.has<Web::PinchEvent>()) {
-            if (has_earlier_pinch)
-                continue;
-            has_earlier_pinch = true;
-        }
+        // earlier frame has dispatched its wheel event and, if uncanceled, returned for the zoom. A pinch the
+        // compositor zoomed for holds back nothing, so a busy page does not hold back the zoom.
+        if (m_pending_input_events[index].event.has<Web::PinchEvent>() && has_earlier_pinch_yet_to_zoom)
+            continue;
         if (!m_pending_input_events[index].sent)
             send_input_event(index);
+        if (auto const* pinch_event = m_pending_input_events[index].event.get_pointer<Web::PinchEvent>())
+            has_earlier_pinch_yet_to_zoom = !pinch_event->async_zoom_performed_default_action;
         if (m_pending_input_events[index].awaits_compositor_dispatch())
             return;
     }
 }
 
-// A key press may scroll in the compositor only while no earlier input the pages have yet to handle can change its
-// target. Key release always reaches the compositor's keyboard scrolling, even if it could no longer accept a new
-// scroll.
+// A key press may scroll in the compositor unless earlier input the pages have yet to handle is likely to change its
+// target: a key press the compositor left to the page or a mouse event other than a move. Key release always reaches
+// the compositor's keyboard scrolling, even if it could no longer accept a new scroll.
+// NB: A handler of a key release or a pointer move may change the target too. We accept that, as waiting for those
+//     would stall scrolling beside a busy page for every move of the pointer.
 bool ViewImplementation::may_scroll_for_key_event_in_compositor(size_t index) const
 {
     auto const& key_event = m_pending_input_events[index].event.get<Web::KeyEvent>();
@@ -1078,12 +1080,17 @@ bool ViewImplementation::may_scroll_for_key_event_in_compositor(size_t index) co
         return false;
     if (key_event.type == Web::KeyEvent::Type::KeyUp)
         return true;
-    if (!m_has_usable_bitmap)
-        return false;
     for (size_t preceding = 0; preceding < index; ++preceding) {
-        auto const* key = m_pending_input_events[preceding].event.get_pointer<Web::KeyEvent>();
-        if (!key || key->type != Web::KeyEvent::Type::KeyDown || !key->async_scroll_performed_default_action)
+        auto const& event = m_pending_input_events[preceding].event;
+        if (auto const* key = event.get_pointer<Web::KeyEvent>()) {
+            if (key->type == Web::KeyEvent::Type::KeyDown && !key->async_scroll_performed_default_action)
+                return false;
+        } else if (auto const* mouse = event.get_pointer<Web::MouseEvent>()) {
+            if (mouse->buttons != 0 || !first_is_one_of(mouse->type, Web::MouseEvent::Type::MouseMove, Web::MouseEvent::Type::MouseLeave))
+                return false;
+        } else {
             return false;
+        }
     }
     return true;
 }
@@ -1299,12 +1306,23 @@ void ViewImplementation::did_finish_handling_input_event(Badge<WebContentPage>, 
     // Keep the returned default action in its original position. Removing it and scheduling the queue first would
     // let a later pinch overtake it, which changes the zoom when focal points differ or a scale limit is reached.
     auto& pending_input = m_pending_input_events[*index];
+    auto pinch_default_action_returned = event_result == Web::EventResult::Accepted
+        || (pending_input.forwarded_to_child_frame && event_result != Web::EventResult::Handled && event_result != Web::EventResult::Cancelled);
+    // A gesture the page canceled stays canceled, even once the pinch moves to where nothing cancels it.
+    if (auto const* pinch_event = pending_input.event.get_pointer<Web::PinchEvent>()) {
+        if (!pinch_event->continues_gesture)
+            m_pinch_gesture_was_canceled = false;
+        if (event_result == Web::EventResult::Cancelled)
+            m_pinch_gesture_was_canceled = true;
+    }
     if (auto* pinch_event = pending_input.event.get_pointer<Web::PinchEvent>();
-        pinch_event && pending_input.forwarded_to_child_frame && !pinch_event->wheel_event_was_dispatched && !pinch_event->async_zoom_performed_default_action
-        && event_result != Web::EventResult::Handled && event_result != Web::EventResult::Cancelled) {
+        pinch_event && pinch_default_action_returned && !m_pinch_gesture_was_canceled && !pinch_event->wheel_event_was_dispatched && !pinch_event->async_zoom_performed_default_action) {
         pinch_event->wheel_event_was_dispatched = true;
         pending_input.endpoint = page();
         pending_input.sent = false;
+        // NB: WebContent's answer travels on another connection than the compositor's and may overtake it. What the
+        //     compositor still answers for this trip must not be taken for an answer to the next one.
+        pending_input.expects_stale_compositor_answer = pending_input.routed_through_compositor;
         pending_input.routed_through_compositor = false;
         send_queued_input_events();
         return;
@@ -1479,18 +1497,25 @@ void ViewImplementation::did_not_dispatch_input_event_through_compositor(Badge<W
     send_queued_input_events();
 }
 
-void ViewImplementation::did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool async_scroll_performed_default_action)
+void ViewImplementation::did_dispatch_input_event_through_compositor(Badge<WebContentPage>, u64 event_id, bool performed_default_action)
 {
     auto index = m_pending_input_events.find_first_index_if([&](auto const& pending) { return Web::input_event_id(pending.event) == event_id; });
     if (!index.has_value())
         return;
 
     auto& pending = m_pending_input_events[*index];
-    if (!pending.awaits_compositor_dispatch())
+    if (exchange(pending.expects_stale_compositor_answer, false))
+        return;
+    if (!pending.routed_through_compositor)
+        return;
+    if (auto* key_event = pending.event.get_pointer<Web::KeyEvent>())
+        key_event->async_scroll_performed_default_action = performed_default_action;
+    else if (auto* pinch_event = pending.event.get_pointer<Web::PinchEvent>())
+        pinch_event->async_zoom_performed_default_action = performed_default_action;
+    else
         return;
     // WebContent finishes the event from here on, as it does an event the view sends it directly.
     pending.routed_through_compositor = false;
-    pending.event.get<Web::KeyEvent>().async_scroll_performed_default_action = async_scroll_performed_default_action;
     send_queued_input_events();
 }
 

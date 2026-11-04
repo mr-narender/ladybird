@@ -471,6 +471,9 @@ pub(crate) struct HoverFrameLease {
 /// as many as they are, so that reading them costs a task less than what it made them for, but at least this many.
 const MIN_RECORDS_RELEASED_BEFORE_READING_LEASES: usize = 1024;
 
+/// How few released records a reclamation leaves to a later sweep.
+const MIN_RECORDS_RELEASED_BEFORE_SWEEPING: usize = 64;
+
 /// A reader's hold on the payloads of every style record published so far: while one is held, the
 /// engine frees no record's payloads, which a reader on another thread may be reading.
 pub(crate) struct StyleRecordLease {
@@ -831,6 +834,9 @@ pub struct ComputedGroupSets {
     hover_frame_leases: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Weak<HoverFrameLease>>>>,
     /// How many released records have the next sweep read the rows of the hover frames' leases.
     released_records_reading_leases: usize,
+    /// How many records have to be released, as a sweep leaves them, for a reclamation to sweep them. A sweep reads
+    /// every record it does not free, so a style update that releases a few sweeps only once they add up.
+    released_records_sweeping: usize,
     // Recyclable animation overlays are deliberately separate from the installed records above.
     // Dense element assignments and sparse pseudo assignments pin at most one slot each.
     animation_overlay_column: AnimationOverlayColumn,
@@ -860,6 +866,7 @@ impl Default for ComputedGroupSets {
             pseudo_rows_moved: Vec::new(),
             hover_frame_leases: std::sync::Arc::default(),
             released_records_reading_leases: MIN_RECORDS_RELEASED_BEFORE_READING_LEASES,
+            released_records_sweeping: MIN_RECORDS_RELEASED_BEFORE_SWEEPING,
             animation_overlay_column: AnimationOverlayColumn::default(),
             animation_overlay_slots: animation_overlay_slots::AnimationOverlaySlots::default(),
             animation_overlay_slots_by_record: HashMap::default(),
@@ -1013,11 +1020,6 @@ impl ComputedGroupSets {
         }
     }
 
-    /// The installed record `record` names, while it is live.
-    fn installed(&self, record: FinalStyleRecordID) -> Option<&InstalledRecord> {
-        self.installed.get(record.installed_record()?)
-    }
-
     /// Take a slot for a record the engine computed, or answer the one it holds already.
     /// `dependency_flags` says what the view of a record in a new slot depends on.
     pub(super) fn install_record(
@@ -1028,21 +1030,22 @@ impl ComputedGroupSets {
         FinalStyleRecordID::installed(self.installed.install(record, dependency_flags))
     }
 
+    /// Take a slot for a record derived for what no element is, or answer one holding the same.
+    /// `dependency_flags` says what the view of a record in a new slot depends on.
+    pub(super) fn install_derived_record(
+        &mut self,
+        record: &std::sync::Arc<super::pipeline::Record>,
+        dependency_flags: impl FnOnce() -> u8,
+    ) -> FinalStyleRecordID {
+        FinalStyleRecordID::installed(self.installed.install_derived(record, dependency_flags))
+    }
+
     /// The identity `record` holds already, if it holds one.
     pub(super) fn installed_record_named_by(
         &self,
         record: &std::sync::Arc<super::pipeline::Record>,
     ) -> Option<FinalStyleRecordID> {
         self.installed.named_by(record).map(FinalStyleRecordID::installed)
-    }
-
-    /// An installed record holding the style `record` does, which an element computing `record`
-    /// holds in its place.
-    pub(super) fn installed_record_holding_the_same_style_as(
-        &self,
-        record: &super::pipeline::Record,
-    ) -> Option<&std::sync::Arc<super::pipeline::Record>> {
-        self.installed.holding_the_same_style_as(record)
     }
 
     /// The record the engine computed that the installed `record` installs, where it is one.
@@ -1579,10 +1582,6 @@ impl ComputedGroupSets {
             .filter_map(|row| row.published.then_some(row.kind))
     }
 
-    fn longhands_for_target(&self, target: ComputedStyleTarget) -> Option<ViewLonghands<'_>> {
-        let installed = self.installed(self.assigned_final_style_record(target)?)?;
-        Some(ViewLonghands::of_record(installed.record()))
-    }
     /// The groups whose values read, from `values`, the recorded specified values of the longhands
     /// whose computed values depend on what the element inherits, one that `depends_on_input`.
     pub(super) fn specified_value_dependency_mask_of<'a>(
@@ -1597,19 +1596,15 @@ impl ComputedGroupSets {
             .fold(0, |mask, groups| mask | groups)
     }
 
-    /// The groups whose previous specified values actually read `currentColor` while computing.
-    /// Missing dependency coverage stays typed so a color winner change can widen safely.
+    /// The groups whose specified values in `longhands` actually read `currentColor` while computing.
     #[must_use]
-    pub fn current_color_dependency_mask(&self, target: ComputedStyleTarget) -> Option<u32> {
-        let longhands = self.longhands_for_target(target)?;
-        Some(
-            Self::specified_value_dependency_mask_of(
-                longhands.inheritance_dependent_values(),
-                retained_value_depends_on_current_color,
-            ) | crate::css::table_group_builder::groups_reading_current_color_through_inherited_values(|property| {
-                longhands.value(property)
-            }),
-        )
+    pub(crate) fn current_color_dependency_mask(longhands: ViewLonghands<'_>) -> u32 {
+        Self::specified_value_dependency_mask_of(
+            longhands.inheritance_dependent_values(),
+            retained_value_depends_on_current_color,
+        ) | crate::css::table_group_builder::groups_reading_current_color_through_inherited_values(|property| {
+            longhands.value(property)
+        })
     }
 
     /// Whether a raw final record identity still names a live installed record.
@@ -1623,6 +1618,15 @@ impl ComputedGroupSets {
     pub fn custom_property_environment_identity(&self, node: StyleNodeID) -> Option<u64> {
         let installed = self.installed_column.get(node.element_index()? as usize)?.as_ref()?.id;
         Some(self.installed.get(installed)?.custom_property_environment())
+    }
+
+    /// Each element holding an installed record, with the custom-property environment that names.
+    pub(super) fn installed_custom_property_environments(&self) -> impl Iterator<Item = (StyleNodeID, u64)> + '_ {
+        (0..self.installed_column.len()).filter_map(|index| {
+            let installed = self.installed_column.get(index)?.as_ref()?;
+            let node = StyleNodeID::element(u32::try_from(index).ok()?);
+            Some((node, installed.record.custom_property_environment()))
+        })
     }
 
     /// Every raw custom-property environment identity a live record was installed with.
@@ -1735,6 +1739,11 @@ impl ComputedGroupSets {
         self.sweep_installed_records();
     }
 
+    /// Has the next reclamation sweep however few records were released.
+    pub(super) fn sweep_at_next_reclamation(&mut self) {
+        self.released_records_sweeping = 0;
+    }
+
     /// Frees the installed records nothing holds, where nothing views or leases them, and answers
     /// whether enough were freed since the last time it did for what they named to be reclaimed.
     pub(super) fn reclaim_unreachable_if_needed(&mut self, records_are_viewed: bool) -> bool {
@@ -1743,7 +1752,11 @@ impl ComputedGroupSets {
         if records_are_viewed || self.style_records_are_leased() {
             return false;
         }
-        self.sweep_installed_records();
+        if self.installed.released_count() >= self.released_records_sweeping {
+            self.sweep_installed_records();
+            self.released_records_sweeping =
+                (self.installed.released_count() * 2).max(MIN_RECORDS_RELEASED_BEFORE_SWEEPING);
+        }
         if self.records_freed_since_reclamation < self.next_reclamation_after {
             return false;
         }
@@ -1853,7 +1866,7 @@ mod tests {
                 pseudo_element_styles,
             ))
             .with_test_dependency_flags(dependency_flags);
-        sets.install_record(&record, || 0)
+        sets.install_derived_record(&record, || 0)
     }
 
     /// Assigns `target` a record installed as [`install`] installs it.

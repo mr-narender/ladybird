@@ -92,31 +92,20 @@ pub(crate) struct EffectsIndex(u32);
 pub(crate) struct StyleInstallation {
     pub(crate) swaps: Vec<StyleSwap>,
     pub(crate) effects: Vec<InstalledElementEffects>,
-    /// The indices of the effects, sorted by the elements they are of, for the render side to find an element's, or
-    /// none where the effects are sorted by their elements already.
-    effects_by_node: Vec<EffectsIndex>,
     pub(crate) document_damage: u32,
     /// The records the elements and their pseudo-elements move away from, which their moves and effects read, pinned
     /// until the host ends the transaction.
     pub(crate) pinned_records: Vec<u64>,
+    /// The elements taking their first style whose parent, its layout tree parent as well, takes its first style in
+    /// this installation too, in the order of their effects, each with the index of those and that parent.
+    first_styles_below_first_styles: Vec<(EffectsIndex, StyleNodeID)>,
 }
 
 impl StyleInstallation {
     /// The effects of `node`, where its style moves.
+    #[cfg(test)]
     pub(crate) fn effects_of(&self, node: StyleNodeID) -> Option<&InstalledElementEffects> {
-        if self.effects_by_node.is_empty() {
-            let index = self
-                .effects
-                .binary_search_by_key(&node, InstalledElementEffects::node)
-                .ok()?;
-            return Some(&self.effects[index]);
-        }
-        let index = self
-            .effects_by_node
-            .binary_search_by_key(&node, |&EffectsIndex(index)| self.effects[index as usize].node())
-            .ok()?;
-        let EffectsIndex(index) = self.effects_by_node[index];
-        Some(&self.effects[index as usize])
+        self.effects.iter().find(|effects| effects.node() == node)
     }
 
     /// Takes what the main thread does, leaving the records the installation pinned, which stay pinned until the host
@@ -179,13 +168,24 @@ impl StyleInstallation {
         self.keep_effects_with_host_work();
     }
 
+    /// Notes that the element whose effects the installation noted last takes its first style below `parent`, which
+    /// takes its first style too.
+    fn note_first_style_below_first_style(&mut self, parent: StyleNodeID) {
+        let index = u32::try_from(self.effects.len() - 1).expect("an installation's effects fit their index");
+        self.first_styles_below_first_styles.push((EffectsIndex(index), parent));
+    }
+
+    /// Takes the elements `note_first_style_below_first_style` noted.
+    pub(crate) fn take_first_styles_below_first_styles(&mut self) -> Vec<(u32, StyleNodeID)> {
+        std::mem::take(&mut self.first_styles_below_first_styles)
+            .into_iter()
+            .map(|(EffectsIndex(index), parent)| (index, parent))
+            .collect()
+    }
+
     /// Keeps the effects of only the elements the main thread has anything to do for beside swapping in their styles.
     pub(crate) fn keep_effects_with_host_work(&mut self) {
-        let before = self.effects.len();
         self.effects.retain(InstalledElementEffects::has_host_work);
-        if self.effects.len() != before {
-            self.sort_effects_by_node();
-        }
     }
 
     /// Ends the element `node`, whose styles the installation noted from the swap `first_swap` on. The elements whose
@@ -201,26 +201,12 @@ impl StyleInstallation {
     /// Ends the installation: what all its moves damage is `document_damage`.
     fn finish(&mut self, document_damage: u32) {
         self.document_damage = document_damage;
-        self.sort_effects_by_node();
-    }
-
-    /// Indexes the effects by their elements, where they are not sorted by them already.
-    fn sort_effects_by_node(&mut self) {
-        self.effects_by_node.clear();
-        if self.effects.is_sorted_by(|a, b| a.node() < b.node()) {
-            return;
-        }
-        let count = u32::try_from(self.effects.len()).expect("an installation's effects fit their index");
-        self.effects_by_node = (0..count).map(EffectsIndex).collect();
-        let effects = &self.effects;
-        self.effects_by_node
-            .sort_unstable_by_key(|&EffectsIndex(index)| effects[index as usize].node());
     }
 }
 
 impl RetainedState {
     /// The identity `record` is installed under: the one it names, the one another element took
-    /// for it in this installation, kept in `installed`, or a new one.
+    /// for a copy of it in this installation, kept in `installed`, or a new one.
     #[expect(
         clippy::mutable_key_type,
         reason = "a key hashes and compares only the address it holds"
@@ -237,10 +223,11 @@ impl RetainedState {
         if let Some(&id) = installed.get(&PointerLookup::new(record, ())) {
             return id;
         }
-        let id = records.install_record(record, || {
-            computed::record_dependency_flags(&record.facts(), &record.payloads)
-        });
-        installed.insert(PointerKey::new(record, ()), id);
+        let id = records.install_record(record, || record.dependency_flags_for_a_slot());
+        // NB: A record a fork's slot names took a copy in this slot, which it finds again here.
+        if records.installed_record_named_by(record).is_none() {
+            installed.insert(PointerKey::new(record, ()), id);
+        }
         id
     }
 
@@ -301,9 +288,8 @@ impl RetainedState {
                 || parent.is_some_and(|parent| self.hidden_before(parent, scratch));
             scratch.note_hidden_before(node, below_display_none || self.record_is_display_none(old));
             let new_record = self.install_record(record, &mut scratch.installed);
-            // NB: Where the record holds what one installed before it does, or the element installs a copy of it in
-            //     another custom property environment, the element keeps what it installed, and its own goes: the
-            //     composition of its animations lies over what it holds.
+            // NB: Where the element installs a copy of the record, as in another custom property environment, the element
+            //     keeps what it installed, and its own goes: the composition of its animations lies over what it holds.
             if let Some(installed) = self.computed_group_sets.installed_record(new_record)
                 && !Arc::ptr_eq(installed, computed_record)
             {
@@ -353,8 +339,8 @@ impl RetainedState {
             };
             let plan_owed = plans_owed.binary_search(&node).is_ok();
             let composition_owed = compositions_owed.binary_search(&node).is_ok();
-            let owes_an_animation_plan =
-                (plan_owed && self.record_declares_animations(new)) || self.row_owes_an_animation_plan(node, old, new);
+            let owes_an_animation_plan = (plan_owed && self.record_declares_animations(new))
+                || self.row_owes_an_animation_plan(node, old, new, record);
             let owes_a_transition_step = self.row_owes_a_transition_step(node, old_record, new_record);
             // The host composes the record where the element has animations, or the row owes their plan
             // or the transition step, before it settles the element's pseudo-elements. It composes it too
@@ -529,9 +515,18 @@ impl RetainedState {
                     old_record: old_view.and(computed::FinalStyleRecordID::from_raw(old)),
                     pseudo_elements,
                 };
+                let first_style = facts.element_damage.is_none();
                 let effects = self.main_effects(node, old_view, new_view, facts);
                 scratch.document_damage.push(effects.damage());
                 installation.note_element_effects(effects, first_swap);
+                if first_style {
+                    scratch.note_first_style(node);
+                    if let Some(parent) = parent.filter(|&parent| {
+                        scratch.takes_first_style(parent) && self.projection.parent(node) == Some(parent)
+                    }) {
+                        installation.note_first_style_below_first_style(parent);
+                    }
+                }
             }
             installation.end_element(node, first_swap);
         }

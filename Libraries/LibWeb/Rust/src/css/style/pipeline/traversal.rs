@@ -59,7 +59,11 @@ const DEFAULT_MAX_THREAD_COUNT: usize = 8;
 /// How many threads the traversal runs on where none are asked for: three of every four logical
 /// processors, leaving the others to the main thread and the rest of the process, and at least one.
 pub(super) fn thread_count() -> usize {
-    std::thread::available_parallelism().map_or(1, |count| (count.get() * 3 / 4).clamp(1, DEFAULT_MAX_THREAD_COUNT))
+    // NB: Each pass asks, and the answer takes system calls and reading files of the control groups.
+    static THREAD_COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREAD_COUNT.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |count| (count.get() * 3 / 4).clamp(1, DEFAULT_MAX_THREAD_COUNT))
+    })
 }
 
 /// How many elements a task hands to another at once.
@@ -199,7 +203,7 @@ pub(super) const PARENT_CHANGED: HintBits = 1 << 5;
 const PARENT_RESTYLED: HintBits = 1 << 6;
 /// An ancestor of the element describes another container than it did, which the elements below
 /// it that read their containers are restyled for.
-const CONTAINERS_MOVED: HintBits = 1 << 7;
+pub(super) const CONTAINERS_MOVED: HintBits = 1 << 7;
 /// The element is restyled for its pseudo-elements, which inherit the composition of its
 /// animations that moved, as under a parent that changed. Where nothing else restyles it, the
 /// host owes it no other composition.
@@ -349,11 +353,18 @@ pub(super) fn is_document_element(state: &RetainedState, node: StyleNodeID) -> b
     state.projection.adjustment_facts(node) & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0
 }
 
-fn root_font_of(record: &Record) -> RootFontInputs {
-    RootFontInputs::from_payloads(
-        &record.payloads,
-        super::super::computed::record_dependency_flags(&record.facts(), &record.payloads),
-    )
+// https://drafts.csswg.org/css-values-4/#rem
+// Equal to the computed value of the em unit on the root element.
+// NB: The computed value holds what the root element's animations apply, which the composition of
+//     them over its record has where the host composed one.
+fn root_font_of(records: &Records<'_>, node: StyleNodeID, record: &Record) -> RootFontInputs {
+    match records.composition(node) {
+        Some(view) => RootFontInputs::from_payloads(view.payloads, view.dependency_flags),
+        None => RootFontInputs::from_payloads(
+            &record.payloads,
+            super::super::computed::record_dependency_flags(&record.facts(), &record.payloads),
+        ),
+    }
 }
 
 /// The document element, where `root` is it or its parent.
@@ -379,7 +390,7 @@ pub(super) fn held_root_font(
     Some(
         records
             .kept_root_font(document_element)
-            .unwrap_or_else(|| root_font_of(record)),
+            .unwrap_or_else(|| root_font_of(records, document_element, record)),
     )
 }
 
@@ -410,7 +421,7 @@ impl PassContext<'_> {
         let Some(record) = self.records.get(node) else {
             return;
         };
-        let root_font = root_font_of(record);
+        let root_font = root_font_of(self.records, node, record);
         let previous = self
             .held_root_font
             .unwrap_or_else(|| RootFontInputs::from_document(&self.state.document_style_computation_inputs));
@@ -682,10 +693,18 @@ impl<'a> Scratch<'a> {
 
     /// Make the filter hold exactly the keys of `parent` and its ancestors.
     fn enter_parent(&mut self, context: &PassContext<'_>, parent: Option<StyleNodeID>) {
-        if self.ancestors.last().map(|(node, _)| *node) == parent {
+        let held = self.ancestors.last().map(|(node, _)| *node);
+        if held == parent {
             return;
         }
         let tree = &context.state.projection;
+        // A walk down a tree holds everything above the new parent already.
+        if let Some(node) = parent
+            && tree.parent(node) == held
+        {
+            self.hold_ancestor(context, node);
+            return;
+        }
         let mut chain: SmallVec<[StyleNodeID; 32]> = SmallVec::new();
         let mut ancestor = parent;
         while let Some(node) = ancestor {
@@ -705,16 +724,22 @@ impl<'a> Scratch<'a> {
                 self.filter.remove(key);
             }
         }
-        let projection = &context.state.projection;
         for &node in &chain[common..] {
-            let keys = projection
-                .row_of(node)
-                .map_or_else(SmallVec::new, super::ancestor_keys_of);
-            for &key in &keys {
-                self.filter.insert(key);
-            }
-            self.ancestors.push((node, keys));
+            self.hold_ancestor(context, node);
         }
+    }
+
+    /// Put the keys of `node`, a child of the last ancestor held, into the filter.
+    fn hold_ancestor(&mut self, context: &PassContext<'_>, node: StyleNodeID) {
+        let keys = context
+            .state
+            .projection
+            .row_of(node)
+            .map_or_else(SmallVec::new, super::ancestor_keys_of);
+        for &key in &keys {
+            self.filter.insert(key);
+        }
+        self.ancestors.push((node, keys));
     }
 
     /// Test `node` against the entries of `reasons` alone, into `reason_answers`, and note in
@@ -1494,6 +1519,7 @@ impl<'a> Scratch<'a> {
             .with_custom_properties(custom_properties.as_ref()),
             header: super::records::RecordHeader::new(computed.facts),
         });
+        record.settle_holds_image_values();
         if let Some(matched_key) = matched_key
             && storable
             && sampled_custom_properties.is_none()
@@ -1903,15 +1929,14 @@ impl<'a> Scratch<'a> {
             )
             .with_custom_properties(custom_properties.as_ref()),
         });
-        // NB: An element computing what an installed record holds, as the clone of an element does,
-        //     holds that record: installing it takes the slot the record names, and the children of
-        //     the element are computed from the record the children of the original were.
         self.last_record = Some(record.clone());
-        let record = state
-            .computed_group_sets
-            .installed_record_holding_the_same_style_as(&record)
-            .cloned()
-            .unwrap_or(record);
+        let record = match context.records.held_before_holding_the_same_style_as(node, &record) {
+            Some(held) => held.clone(),
+            None => {
+                record.settle_holds_image_values();
+                record
+            }
+        };
         // Only what the key and the conditions of an entry name is read of what may differ between
         // the elements that find it.
         if let Some(key) = key
@@ -2021,6 +2046,11 @@ impl<'a> Scratch<'a> {
             return None;
         }
         let state = context.state;
+        // Elements styled by rules alone repeat; one with its own declarations mostly does not.
+        let declares_own = matched_declarations::declares_own(state, node);
+        if declares_own && !self.own_declaration_lookups.worth_looking() {
+            return None;
+        }
         let facts = state.projection.facts(node)?;
         let parent = state.projection.inheritance_parent(node)?;
         let records = context.records;
@@ -2039,11 +2069,6 @@ impl<'a> Scratch<'a> {
             return None;
         }
         let (parent_store, parent_held) = records.custom_stores_of(parent)?;
-        // Elements styled by rules alone repeat; one with its own declarations mostly does not.
-        let declares_own = matched_declarations::declares_own(state, node);
-        if declares_own && !self.own_declaration_lookups.worth_looking() {
-            return None;
-        }
         let matches = match self.gated {
             true => &self.applied,
             false => &self.matches,
@@ -2084,6 +2109,10 @@ impl<'a> Scratch<'a> {
         kind: u8,
     ) -> Option<MatchedKey<'k>> {
         if !context.uses_caches {
+            return None;
+        }
+        // An element that generates no box makes the box its pseudo-element would be in an ancestor's.
+        if inherited.record.facts().display().is_contents() {
             return None;
         }
         let state = context.state;
@@ -2826,14 +2855,24 @@ pub(super) fn resume(
 
 /// Keep the records of the pseudo-elements `suspended` holds back that did not wait, as no round
 /// resumes them: the next pass styles the others.
-pub(super) fn settle_suspended(context: &PassContext<'_>, suspended: Vec<Suspended>) {
+///
+/// Answers the elements whose ancestors asked this pass to restyle what is below them, which only the elements themselves
+/// knew: the next pass restyles those too.
+pub(super) fn settle_suspended(context: &PassContext<'_>, suspended: Vec<Suspended>) -> HashSet<StyleNodeID> {
+    let mut restyling_descendants = HashSet::default();
     for suspended in suspended {
-        if let Suspended::PseudoElements(suspended) = suspended {
-            context
+        match suspended {
+            Suspended::Element(queued) => {
+                if queued.hint & RESTYLE_DESCENDANTS != 0 {
+                    restyling_descendants.insert(queued.node);
+                }
+            }
+            Suspended::PseudoElements(suspended) => context
                 .records
-                .insert_pseudo_element_records(suspended.node, suspended.records);
+                .insert_pseudo_element_records(suspended.node, suspended.records),
         }
     }
+    restyling_descendants
 }
 
 /// Style the pseudo-elements of `pseudo_elements`, and the elements `queued` makes of `elements`

@@ -254,6 +254,8 @@ public:
     void perform_scroll_of_viewport_scrolling_box(CSSPixelPoint position);
     // Every change of a scroll offset here, other than one the compositor made, goes to the compositor as a request.
     void did_change_scroll_offset(Web::AsyncScrollNodeStableID);
+    u64 compositor_user_input_scroll_count() const;
+    void set_scroll_offset_settled_by_layout(Layout::Node& scrolling_box, CSSPixelPoint scroll_offset);
     // Changes a scrolling box's offset for user input on this thread, which the compositor is asked for as the user's.
     bool set_scroll_offset_for_user_input(Layout::Node& scrolling_box, Web::AsyncScrollNodeStableID, CSSPixelPoint);
     void adopt_pending_async_scroll_offsets(Compositing::AsyncScrollUpdateFreshness = Compositing::AsyncScrollUpdateFreshness::Pushed);
@@ -574,6 +576,8 @@ private:
     ScrollSequence* begin_scroll_sequence(Web::AsyncScrollNodeStableID);
     void note_scroll_sequence_moved(Web::AsyncScrollNodeStableID);
     UserScrollGesture* user_scroll_gesture_for(Web::AsyncScrollNodeStableID);
+    // Whether the user scrolls a box of this navigable: a gesture of theirs goes on.
+    bool has_user_scroll_gesture() const;
     bool has_scroll_in_progress(ScrollSequence const&, MonotonicTime now) const;
     void note_scroll_sequences_may_have_completed();
     void end_completed_scroll_sequences();
@@ -813,7 +817,7 @@ WEB_API GC::Ptr<LocalNavigable> local_navigable_with_id(CrossProcessId);
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document);
 void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Utf16String navigation_id);
 
-WEB_API void check_if_unloading_is_canceled(Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ptr<LocalTraversableNavigable> owner, GC::Ptr<LocalTraversableNavigable> traversable, RefPtr<SessionHistoryEntry> target_entry, Optional<UserNavigationInvolvement> user_involvement_for_navigate_events, UnloadPromptShown, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback);
+WEB_API void check_if_unloading_is_canceled(Page&, Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload, GC::Ptr<LocalTraversableNavigable> owner, GC::Ptr<LocalTraversableNavigable> traversable, RefPtr<SessionHistoryEntry> target_entry, Optional<UserNavigationInvolvement> user_involvement_for_navigate_events, UnloadPromptShown, GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback);
 void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<StorageSerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);
 
 }

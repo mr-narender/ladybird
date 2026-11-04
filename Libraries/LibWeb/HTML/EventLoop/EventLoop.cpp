@@ -475,7 +475,7 @@ void EventLoop::process_input_events() const
                 [&](Web::KeyEvent const& key_event) {
                     switch (key_event.type) {
                     case Web::KeyEvent::Type::KeyDown:
-                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat, key_event.should_insert_text, key_event.async_scroll_performed_default_action, key_event.editing_commands, key_event.native_editing_binding_resolved);
+                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat, key_event.should_insert_text, key_event.async_scroll_performed_default_action, key_event.editing_commands, key_event.native_editing_binding_resolved, key_event.user_input_scroll_count_with_nothing_to_scroll);
                     case Web::KeyEvent::Type::KeyUp:
                         return page.handle_keyup(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat);
                     }
@@ -753,8 +753,9 @@ static bool is_renderable(DOM::Document const& document)
 }
 
 // Takes in what the render clock's lanes did, then the queued input events. The lanes wait for the plan of the rendering
-// update with the serial number `update_serial`. Answers the documents whose lanes were taken in.
-Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(u64 update_serial)
+// update with the serial number `update_serial`, or tick on beside the task that handles a press where no update comes
+// with it. Answers the documents whose lanes were taken in.
+Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(Optional<u64> update_serial)
 {
     // AD-HOC: The render clock's lanes present frames of a document's animations and hover beside the tasks since the
     //         last update, at display ticks later than the opportunity this update renders for, which reached the event
@@ -788,7 +789,10 @@ Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(
             if (auto* root_arena = root_document ? root_document->layout_node_arena_if_created() : nullptr)
                 outer_input_event = Layout::RustFFI::document_host_newest_pointer_input_event(root_arena->host());
         }
-        if (Layout::RustFFI::document_host_take_clock_lanes_in(arena->host(), update_serial, outer_input_event)) {
+        auto const lane_presented = update_serial.has_value()
+            ? Layout::RustFFI::document_host_take_clock_lanes_in(arena->host(), *update_serial, outer_input_event)
+            : Layout::RustFFI::document_host_take_in_what_clock_lanes_did(arena->host(), outer_input_event);
+        if (lane_presented) {
             tick_presented = true;
             navigable->set_needs_to_record_display_list();
             navigable->set_needs_repaint();
@@ -847,6 +851,9 @@ Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(
         else
             owed.navigable->event_handler().handle_mouseleave();
     }
+    // AD-HOC: A hover left stale between the tasks, as the style or layout it reads was pending, follows now. The
+    //         update brings the style and layout up to date next, so the hover may bring them up to date first.
+    update_hovers_that_may_be_stale(HoverUpdatePoint::RenderingUpdateBegins);
     // What the lanes reported has been taken in: the style node ids that left their nodes since name nothing of theirs.
     // A document with no lanes has none that report any.
     for (auto& document : documents_in_this_event_loop_matching([](auto const&) { return true; })) {
@@ -855,8 +862,9 @@ Vector<GC::Root<DOM::Document>> EventLoop::take_clock_lanes_and_input_events_in(
         if (!style_computer)
             continue;
         auto* arena = document->layout_node_arena_if_created();
-        bool const lanes_taken_in = any_of(documents_with_lanes, [&](auto const& taken_in) { return taken_in.ptr() == document.ptr(); });
-        if (lanes_taken_in || !arena || !Layout::RustFFI::document_host_may_have_lanes(arena->host()))
+        // NB: Lanes that tick on beside a task may still name them, and report that later.
+        bool const lanes_stopped = update_serial.has_value() && any_of(documents_with_lanes, [&](auto const& taken_in) { return taken_in.ptr() == document.ptr(); });
+        if (lanes_stopped || !arena || !Layout::RustFFI::document_host_may_have_lanes(arena->host()))
             style_computer->forget_style_nodes_retired_beside_lanes();
     }
     return documents_with_lanes;
@@ -874,7 +882,9 @@ void EventLoop::queue_task_to_process_input_events()
         m_input_events_task_queued = false;
         if (m_running_rendering_task || m_rendering_update_in_flight)
             return;
-        take_clock_lanes_and_input_events_in(m_rendering_update_serial + 1);
+        // NB: No rendering update comes with this task, and script may run for long before the next one: the lanes
+        //     tick on.
+        take_clock_lanes_and_input_events_in({});
     }));
 }
 
@@ -1289,8 +1299,8 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         auto now = relative_frame_timestamp_for(*document);
         document->run_the_update_intersection_observations_steps(now);
 
-        // AD-HOC: The cursor shows the style the update applied to what the pointer is over.
-        document->navigable()->event_handler().update_cursor_after_rendering_update();
+        // AD-HOC: The hover and the cursor follow a style the update applied to what the pointer is over.
+        document->navigable()->event_handler().update_hover_after_rendering_update();
     }
 
     // AD-HOC: Whether a video sink is ticked depends on whether the element would be painted, which is only known once
@@ -1564,6 +1574,35 @@ bool EventLoop::let_layout_of_rendering_update_fly()
     return true;
 }
 
+void EventLoop::note_hover_may_be_stale(LocalNavigable& navigable)
+{
+    if (!queue_hover_that_may_be_stale(navigable))
+        return;
+    // An idle loop comes between two tasks only as the next task comes: this makes it come now.
+    schedule();
+}
+
+bool EventLoop::queue_hover_that_may_be_stale(LocalNavigable& navigable)
+{
+    if (any_of(m_navigables_with_hover_that_may_be_stale, [&](auto const& entry) { return entry.ptr() == &navigable; }))
+        return false;
+    m_navigables_with_hover_that_may_be_stale.append(navigable);
+    return true;
+}
+
+void EventLoop::update_hovers_that_may_be_stale(HoverUpdatePoint hover_update_point)
+{
+    // What the hover dispatches may note a hover as stale again, which waits for the next point.
+    auto navigables = move(m_navigables_with_hover_that_may_be_stale);
+    for (auto& navigable : navigables) {
+        if (navigable->has_been_destroyed())
+            continue;
+        // A hover that waits for a frame, or for a rendering update, comes here again as it lands or begins.
+        if (navigable->event_handler().update_hover_where_the_pointer_rests(hover_update_point))
+            queue_hover_that_may_be_stale(*navigable);
+    }
+}
+
 void EventLoop::take_finished_frames_in()
 {
     // A rendering update whose style update, then layout, has landed goes on; the tasks before that run beside it,
@@ -1577,6 +1616,8 @@ void EventLoop::take_finished_frames_in()
     // A frame that was taken in leaves the list as it is, which moves only the entries after it.
     for (size_t index = m_navigables_with_frames_in_flight.size(); index-- > 0;)
         (void)m_navigables_with_frames_in_flight[index]->take_recording_in_flight_in(LocalNavigable::TakeIn::IfFinished);
+    // The frames taken in are the ones the hover waits for.
+    update_hovers_that_may_be_stale(HoverUpdatePoint::BetweenTasks);
 
     // NB: This runs between tasks, so no end of a task takes what the style drains above queued, such as the reaction
     //     to a promise an animation resolved, and no task may follow for a long time.
@@ -1769,15 +1810,20 @@ void EventLoop::add_stats(JsonObject& values) const
     size_t shared_image_requests = 0;
     size_t style_sheets = 0;
     size_t font_faces = 0;
+    size_t destroyed_documents = 0;
     for (auto const& document : m_documents) {
         if (!document)
             continue;
+        // NB: Unless script still holds its objects, a destroyed document that survives a collection is leaked.
+        if (document->has_been_destroyed())
+            ++destroyed_documents;
         available_images += document->list_of_available_images().size();
         shared_image_requests += document->shared_resource_requests().size();
         style_sheets += document->style_scope().style_sheets().size();
         font_faces += document->fonts()->set_size();
     }
     values.set("dom.documents"sv, m_documents.size());
+    values.set("dom.destroyed_documents"sv, destroyed_documents);
     values.set("images.available_entries"sv, available_images);
     values.set("images.shared_requests"sv, shared_image_requests);
     values.set("css.document_style_sheet_entries"sv, style_sheets);

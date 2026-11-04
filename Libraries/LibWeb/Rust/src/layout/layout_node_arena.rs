@@ -51,6 +51,23 @@ pub(crate) use main_thread_entries::MainThreadFfiEntry;
 
 pub(crate) const SLOTS_PER_CHUNK: usize = 256;
 
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn invalid_slot_access(id: NodeSlotId) -> ! {
+    panic!("invalid layout node arena slot ID {id:?}")
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn stale_slot_access(id: NodeSlotId, slot_generation: u8, access: &str) -> ! {
+    panic!(
+        "layout node arena {access} a stale or unused slot: {id:?} has generation {}, the slot {slot_generation}",
+        id.generation()
+    )
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IntrinsicSizeCacheKey {
     /// The block size inline sizes were measured at, or the inline size a block size was measured at.
@@ -242,8 +259,8 @@ pub(crate) struct IntrinsicSizeCaches {
 }
 
 impl IntrinsicSizeCaches {
-    pub(crate) fn drop_entries_of_slot(&self, slot: u32) {
-        if let Some(slot) = self.slots.borrow_mut().get_mut(slot as usize) {
+    pub(crate) fn drop_entries_of_slot(&mut self, slot: u32) {
+        if let Some(slot) = self.slots.get_mut().get_mut(slot as usize) {
             *slot = IntrinsicSizeCacheSlot::default();
         }
     }
@@ -1075,6 +1092,7 @@ pub(crate) struct LayoutNodeArena {
     /// is a pin of its own beside the arena's, and it names the record it took rather than whichever
     /// record the row holds when it goes.
     style_records_pinned_by_host: Vec<u64>,
+    derived_styles_shown_before_host_installs: HashMap<NodeSlotId, DerivedStyleRecord>,
     /// The StyleNodeID of the element or text node each row is bound to, or of the element it is
     /// generated for. Rows carrying one identity are chained through `next_rows_with_same_style_node`
     /// from `first_rows_by_style_node`, so retiring an identity reaches every row that carries it,
@@ -1203,6 +1221,8 @@ pub(crate) struct LayoutNodeArena {
     /// The natural size layout last negotiated for the box of an `<svg>` document element, and that
     /// box. An `<object>` showing the document is sized from it.
     document_svg_root_natural_size: Option<(NodeSlotId, crate::css::style::NaturalSize)>,
+    container_bases_read_by_committed_layout:
+        HashMap<NodeSlotId, Vec<(StyleNodeID, crate::css::style::ContainerUnitBases)>>,
     /// The document element's natural size as it was last handed to the `<object>` showing the
     /// document, if it has been.
     handed_over_document_svg_root_natural_size: Option<crate::css::style::NaturalSize>,
@@ -1240,6 +1260,7 @@ impl LayoutNodeArena {
             image_resources_owed_records: Vec::new(),
             style_record_pins: Vec::new(),
             style_records_pinned_by_host: Vec::new(),
+            derived_styles_shown_before_host_installs: HashMap::default(),
             style_nodes: Vec::new(),
             next_rows_with_same_style_node: Vec::new(),
             first_rows_by_style_node: RowsByStyleNode::default(),
@@ -1307,6 +1328,7 @@ impl LayoutNodeArena {
             nodes_enrolled_for_replaced_content_facts_sync: Vec::new(),
             owned_image_natural_sizes: HashMap::default(),
             document_svg_root_natural_size: None,
+            container_bases_read_by_committed_layout: HashMap::default(),
             handed_over_document_svg_root_natural_size: (None),
             layout_style_snapshot_commit: Vec::new(),
             layout_tree_update_marks: Default::default(),
@@ -1371,7 +1393,7 @@ impl LayoutNodeArena {
     /// committed and ages the others. Checks only boxes whose entries were invalidated, stored or used since the
     /// previous sweep, or can still age out. Stale entries survive until commit so inline layout can reuse their
     /// undamaged line prefixes.
-    pub(crate) fn sweep_stale_fc_run_cache_entries(&self, store: &super::fc_run_cache::FcRunCacheStore) {
+    pub(crate) fn sweep_stale_fc_run_cache_entries(&self, store: &mut super::fc_run_cache::FcRunCacheStore) {
         store.sweep_pending_entries(
             |slot, validity| {
                 let Some(metadata) = self.slot_metadata.get(slot as usize) else {
@@ -1557,6 +1579,9 @@ impl LayoutNodeArena {
             if host_pinned_style_record != 0 {
                 arena_pinned_style_records.push(host_pinned_style_record);
             }
+            if let Some(shown) = self.derived_styles_shown_before_host_installs.remove(&slot) {
+                arena_pinned_style_records.push(shown.record);
+            }
             self.unlink_children_of_node_being_freed(slot);
             if let Some(reset) = self.free_unlinked_slot(slot) {
                 paintable_row_resets.push(reset);
@@ -1676,37 +1701,31 @@ impl LayoutNodeArena {
         paintable_row_reset
     }
 
+    // NB: The invalid ID names a slot past every chunk the arena can hold, or one whose generation never matches, so
+    //     the chunk lookup and the generation check reject it too.
     #[inline]
     pub(crate) fn data(&self, id: NodeSlotId) -> &NodeData {
-        assert!(!id.is_invalid(), "invalid layout node arena slot ID");
         let index = id.slot_index() as usize;
-        let chunk = self
-            .chunks
-            .get(index / SLOTS_PER_CHUNK)
-            .expect("invalid layout node arena slot ID");
+        let Some(chunk) = self.chunks.get(index / SLOTS_PER_CHUNK) else {
+            invalid_slot_access(id)
+        };
         let data = chunk.slot(index % SLOTS_PER_CHUNK);
-        assert_eq!(
-            data.slot_generation.get(),
-            id.generation(),
-            "layout node arena read a stale or unused slot"
-        );
+        if data.slot_generation.get() != id.generation() {
+            stale_slot_access(id, data.slot_generation.get(), "read")
+        }
         data
     }
 
     /// The node's shape, for writing. See [`ShapeWriter`].
     pub(crate) fn write_shape(&mut self, id: NodeSlotId) -> ShapeWriter<'_> {
-        assert!(!id.is_invalid(), "invalid layout node arena slot ID");
         let index = id.slot_index() as usize;
-        let shape = self
-            .chunks
-            .get_mut(index / SLOTS_PER_CHUNK)
-            .expect("invalid layout node arena slot ID")
-            .write_shape(index / SLOTS_PER_CHUNK, index % SLOTS_PER_CHUNK, &mut self.shape_writes);
-        assert_eq!(
-            shape.slot_generation.get(),
-            id.generation(),
-            "layout node arena wrote a stale or unused slot"
-        );
+        let Some(chunk) = self.chunks.get_mut(index / SLOTS_PER_CHUNK) else {
+            invalid_slot_access(id)
+        };
+        let shape = chunk.write_shape(index / SLOTS_PER_CHUNK, index % SLOTS_PER_CHUNK, &mut self.shape_writes);
+        if shape.slot_generation.get() != id.generation() {
+            stale_slot_access(id, shape.slot_generation.get(), "wrote")
+        }
         shape
     }
 
@@ -2313,9 +2332,88 @@ impl LayoutNodeArena {
         }
         self.publish_new_size_container_geometry(slot);
         self.enroll_node_for_svg_paint_resources_sync(slot);
-        if previous_payloads.is_some_and(|previous| !self.style_move_keeps_layout_inputs(slot, previous, payloads)) {
+        let Some(previous_payloads) = previous_payloads else {
+            return;
+        };
+        self.forget_last_successful_position_option_after_fallback_sensitive_change(slot, previous_payloads, payloads);
+        if !self.style_move_keeps_layout_inputs(slot, previous_payloads, payloads) {
             self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(slot);
         }
+    }
+
+    /// https://drafts.csswg.org/css-anchor-position-1/#last-successful-position-option
+    fn forget_last_successful_position_option_after_fallback_sensitive_change(
+        &mut self,
+        slot: NodeSlotId,
+        previous: Option<LayoutStyleRef>,
+        new: Option<LayoutStyleRef>,
+    ) {
+        if previous == new
+            || self.last_successful_position_options.is_empty()
+            || !self.last_successful_position_options.contains_key(&slot)
+        {
+            return;
+        }
+        let made_fallback_sensitive_change = match (previous, new) {
+            (Some(previous), Some(new)) => {
+                // SAFETY: A row's style is that of the record pinned for it.
+                let (previous, new) = unsafe { (previous.view(), new.view()) };
+                !crate::css::computed_values::style_payloads_position_fallback_inputs_equal(previous, new)
+            }
+            _ => true,
+        };
+        if made_fallback_sensitive_change {
+            self.last_successful_position_options.remove(&slot);
+        }
+    }
+
+    pub(crate) fn install_style_record_in_place_of_derived_style(
+        &mut self,
+        slot: NodeSlotId,
+        style_record: u64,
+        payloads: Option<LayoutStyleRef>,
+    ) {
+        let index = slot.slot_index() as usize;
+        debug_assert!(self.style_record_pins[index] == ArenaStylePin::Derived);
+        let shown = DerivedStyleRecord {
+            record: self.style_records[index],
+            payloads: self
+                .data(slot)
+                .style
+                .get()
+                .expect("a derived style row holds its style"),
+        };
+        self.style_record_pins[index] = ArenaStylePin::None;
+        let holds_an_older_shown_style = match self.derived_styles_shown_before_host_installs.entry(slot) {
+            std::collections::hash_map::Entry::Occupied(_) => true,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(shown);
+                false
+            }
+        };
+        if holds_an_older_shown_style {
+            self.with_style_engine(|engine| engine.unpin_layout_style_record(shown.record));
+        }
+        self.install_style_record(slot, style_record, payloads, None);
+    }
+
+    fn holds_derived_style_shown_before_host_install(&self, slot: NodeSlotId) -> bool {
+        !self.derived_styles_shown_before_host_installs.is_empty()
+            && self.derived_styles_shown_before_host_installs.contains_key(&slot)
+    }
+
+    fn decide_relayout_against_derived_style_shown_before_host_install(&mut self, slot: NodeSlotId) {
+        if self.derived_styles_shown_before_host_installs.is_empty() {
+            return;
+        }
+        let Some(shown) = self.derived_styles_shown_before_host_installs.remove(&slot) else {
+            return;
+        };
+        if !self.style_move_keeps_layout_inputs(slot, Some(shown.payloads), self.data(slot).style.get()) {
+            self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(slot);
+            self.set_needs_layout_update(slot, true);
+        }
+        self.with_style_engine(|engine| engine.unpin_layout_style_record(shown.record));
     }
 
     /// Whether the box `slot` keeps the layout it cached when it shows `new` in place of `previous` (see
@@ -2966,6 +3064,49 @@ impl LayoutNodeArena {
         self.document_svg_root_natural_size = Some((root_box, natural_size));
     }
 
+    pub(crate) fn note_container_bases_read_by_committed_layout(
+        &mut self,
+        reads: Vec<super::run_state::ContainerLengthRead>,
+    ) {
+        let mut readers_noted = HashSet::default();
+        for read in reads {
+            let bases_read = self
+                .container_bases_read_by_committed_layout
+                .entry(read.reader)
+                .or_default();
+            if readers_noted.insert(read.reader) {
+                bases_read.clear();
+            }
+            bases_read.push((read.element, read.bases));
+        }
+    }
+
+    pub(crate) fn mark_container_length_readers_whose_bases_moved_for_layout(&mut self) {
+        if self.container_bases_read_by_committed_layout.is_empty() {
+            return;
+        }
+        let mut readers_whose_bases_moved = Vec::new();
+        for (&reader, bases_read) in &self.container_bases_read_by_committed_layout {
+            if !self.slot_is_live(reader) {
+                readers_whose_bases_moved.push(reader);
+                continue;
+            }
+            let bases_moved = bases_read.iter().any(|&(element, bases)| {
+                self.dom_node_style_node(reader) != Some(element)
+                    || self.with_style_store(|engine| engine.container_unit_bases(element, false)) != bases
+            });
+            if bases_moved {
+                readers_whose_bases_moved.push(reader);
+            }
+        }
+        for reader in readers_whose_bases_moved {
+            self.container_bases_read_by_committed_layout.remove(&reader);
+            if self.slot_is_live(reader) {
+                self.set_needs_layout_update(reader, true);
+            }
+        }
+    }
+
     /// The natural size of the document's `<svg>` document element as its last layout negotiated
     /// it, unless it is what the last call handed over. The size is all absent if the document
     /// element is no `<svg>` with a box.
@@ -2999,8 +3140,16 @@ impl LayoutNodeArena {
         }
         !self.node_needs_layout_update(layout_root)
             && !document_needs_layout_tree_build
+            && !self.layout_tree_update_marks_need_build()
             && !self.needs_full_layout_tree_update()
             && !self.has_partial_relayout_boundary_roots()
+    }
+
+    pub(crate) fn layout_tree_update_marks_need_build(&self) -> bool {
+        self.document_style_node.is_some_and(|document| {
+            let marks = self.layout_tree_update_marks();
+            marks.needs(document) || marks.child_needs(document)
+        })
     }
 
     pub(crate) fn set_pending_rebuilt_subtree_roots(
@@ -3551,7 +3700,10 @@ impl LayoutNodeArena {
             );
             return;
         }
-        let shown_record = self.node_style_record(slot);
+        let shown_record = self
+            .derived_styles_shown_before_host_installs
+            .get(&slot)
+            .map_or_else(|| self.node_style_record(slot), |shown| shown.record);
         let damage = self
             .with_style_engine(|engine| engine.element_record_damage(originating, true, shown_record, derived.record));
         if self.apply_reinherited_style_record(host_calls, slot, derived) {
@@ -3658,6 +3810,11 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn reinherit_anonymous_descendants(&mut self, host_calls: HostCalls<'_>, node: NodeSlotId) {
+        self.reinherit_own_derived_style_and_anonymous_descendants(host_calls, node);
+        self.decide_relayout_against_derived_style_shown_before_host_install(node);
+    }
+
+    fn reinherit_own_derived_style_and_anonymous_descendants(&mut self, host_calls: HostCalls<'_>, node: NodeSlotId) {
         if self.node_style_record(node) == 0 {
             return;
         }
@@ -3754,8 +3911,8 @@ impl LayoutNodeArena {
         derived: DerivedStyleRecord,
     ) -> bool {
         let previous_payloads = self.data(slot).style.get();
-        let changes_layout_affecting_style =
-            !self.style_move_keeps_layout_inputs(slot, previous_payloads, Some(derived.payloads));
+        let changes_layout_affecting_style = !self.holds_derived_style_shown_before_host_install(slot)
+            && !self.style_move_keeps_layout_inputs(slot, previous_payloads, Some(derived.payloads));
         self.replace_arena_pinned_style_record(slot, derived);
         if changes_layout_affecting_style {
             self.invalidate_fragments_and_intrinsic_sizes_of_self_and_ancestors(slot);
@@ -7531,8 +7688,7 @@ mod tests {
     #[test]
     fn intrinsic_size_cache_entries_go_with_noted_resets_and_slot_reuse() {
         let mut arena = LayoutNodeArena::new();
-        let scratch = crate::layout::run_state::LayoutScratch::default();
-        let caches = &scratch.intrinsic_size_caches;
+        let mut scratch = crate::layout::run_state::LayoutScratch::default();
         let first = arena.allocate_for_test();
         scratch.apply_memo_invalidations(&mut arena);
         let key = IntrinsicSizeCacheKey {
@@ -7552,28 +7708,50 @@ mod tests {
             depends_on_percentage_inline_basis: false,
             depends_on_block_size: false,
         };
-        caches.max_content_block_size_cache_put(first.slot, key, value);
-        caches.intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
-        assert_eq!(caches.max_content_block_size_cache_get(first.slot, key), Some(value));
+        scratch
+            .intrinsic_size_caches
+            .max_content_block_size_cache_put(first.slot, key, value);
+        scratch
+            .intrinsic_size_caches
+            .intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .max_content_block_size_cache_get(first.slot, key),
+            Some(value)
+        );
+        assert_eq!(
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(first.slot, key),
             Some(inline_measurement)
         );
 
         arena.reset_cached_intrinsic_sizes(first.slot);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(first.slot, key),
             Some(inline_measurement),
             "a reset reaches the cache when the stage applies the arena's notes"
         );
         scratch.apply_memo_invalidations(&mut arena);
-        assert_eq!(caches.max_content_block_size_cache_get(first.slot, key), None);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(first.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .max_content_block_size_cache_get(first.slot, key),
+            None
+        );
+        assert_eq!(
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(first.slot, key),
             None
         );
 
-        caches.intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
+        scratch
+            .intrinsic_size_caches
+            .intrinsic_inline_size_measurement_cache_put(first.slot, key, inline_measurement);
         arena
             .free_subtree(first.slot)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
@@ -7581,13 +7759,17 @@ mod tests {
         assert_eq!(second.slot.slot_index(), first.slot.slot_index());
         assert_ne!(second.slot, first.slot);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(second.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(second.slot, key),
             None,
             "a reused slot misses by its generation before the stage applies the freeing note"
         );
         scratch.apply_memo_invalidations(&mut arena);
         assert_eq!(
-            caches.intrinsic_inline_size_measurement_cache_get(second.slot, key),
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_get(second.slot, key),
             None
         );
         arena

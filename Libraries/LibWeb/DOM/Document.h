@@ -640,6 +640,8 @@ public:
         m_effects_needing_animated_style_update.clear();
         m_effects_needing_animated_style_update_after_current_update.clear();
     }
+    void set_cursor_may_be_stale() { m_cursor_may_be_stale = true; }
+    [[nodiscard]] bool take_cursor_may_be_stale() { return exchange(m_cursor_may_be_stale, false); }
     [[nodiscard]] bool is_running_update_layout() const;
 
     // The selection changed, or lost its range, so the selection states of the boxes it paints through are stale. They
@@ -1188,6 +1190,7 @@ public:
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
     void destroy();
+    void destroy_if_dropped_before_activation();
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document-and-its-descendants
     void destroy_a_document_and_its_descendants(GC::Ptr<GC::Function<void()>> after_all_destruction = {});
 
@@ -1598,9 +1601,13 @@ public:
     RefPtr<Compositing::DisplayList> finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const&, Compositing::DisplayListResourceStorage&, Painting::HitTestListStands = Painting::HitTestListStands::Yes);
     // Takes in `display_list`, which `recording` published: the paint command cache source, and the hit-test list it made,
     // read in `hit_test_list_read`, where that still stands for the document's boxes. Where none does, nothing is read.
-    void adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&, NonnullRefPtr<Compositing::DisplayList>, Function<Compositing::DisplayListResourceSet()> const& referenced_resources);
-    Optional<Painting::HitTestQuery> prepare_hit_test_query(Layout::BegunRead const& read);
-    Optional<Painting::HitTestResult> hit_test(Layout::BegunRead const& read, CSSPixelPoint);
+    Painting::HitTestListAdoption adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&, NonnullRefPtr<Compositing::DisplayList>, Function<Compositing::DisplayListResourceSet()> const& referenced_resources);
+    // Indicates whether a query of the hit test list would require a synchronous update to it.
+    [[nodiscard]] bool hit_test_display_list_is_current(Layout::BegunRead const& read);
+    // Where a visual animation sample time is given, the hit test reads the compositor's animations at that time, as a
+    // frame of the compositor's shows them.
+    Optional<Painting::HitTestQuery> prepare_hit_test_query(Layout::BegunRead const& read, Optional<i64> visual_animation_sample_time_nanoseconds = {});
+    Optional<Painting::HitTestResult> hit_test(Layout::BegunRead const& read, CSSPixelPoint, Optional<i64> visual_animation_sample_time_nanoseconds = {});
     Optional<Painting::CaretPosition> caret_position_from_point(Layout::BegunRead const& read, CSSPixelPoint);
     Optional<Painting::CaretPosition> caret_position_from_point_for_selection_start(Layout::BegunRead const& read, CSSPixelPoint);
     Optional<Painting::CaretPosition> caret_position_from_point_for_selection(Layout::BegunRead const& read, CSSPixelPoint, GC::Ptr<Node const> constraint_scope = nullptr);
@@ -2127,6 +2134,7 @@ private:
     bool m_is_decoded_svg { false };
 
     bool m_needs_animated_style_update { false };
+    bool m_cursor_may_be_stale { false };
     bool m_reads_layout_as_it_flew { false };
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update;
     GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update_after_current_update;

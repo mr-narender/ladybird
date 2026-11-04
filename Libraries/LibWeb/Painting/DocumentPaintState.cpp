@@ -89,7 +89,8 @@ void DocumentPaintState::update_accumulated_visual_contexts(Layout::BegunRead co
         ++m_accumulated_visual_context_tree_incremental_update_count;
     if (result.requires_display_list_recording || svg_paint_resources_changed)
         document.set_needs_to_record_display_list();
-    m_visual_context_tree_needs_compositor_update = true;
+    if (result.values_may_have_changed)
+        m_visual_context_tree_needs_compositor_update = true;
 }
 
 void DocumentPaintState::update_visual_viewport_accumulated_visual_context(Layout::BegunRead const& read, DOM::Document& document)
@@ -139,8 +140,12 @@ void DocumentPaintState::refresh_scroll_state(Layout::BegunRead const& read, DOM
     // The render state hands over a new snapshot only where something invalidated the one kept.
     Layout::RustFFI::render_state_refresh_scroll_state(
         m_layout_node_arena->host(), &read, document.page().client().device_pixels_per_css_pixel(),
-        &m_scroll_state_snapshot, [](void* sink, Gfx::FloatPoint const* offsets, size_t count) {
-            static_cast<Compositing::ScrollStateSnapshot*>(sink)->assign_device_offsets({ offsets, count });
+        this, [](void* sink, Gfx::FloatPoint const* offsets, size_t count) {
+            auto& paint_state = *static_cast<DocumentPaintState*>(sink);
+            ReadonlySpan<Gfx::FloatPoint> device_offsets { offsets, count };
+            if (paint_state.m_scroll_state_snapshot.device_offsets() != device_offsets)
+                paint_state.m_scroll_state_changed = true;
+            paint_state.m_scroll_state_snapshot.assign_device_offsets(device_offsets);
         });
 }
 

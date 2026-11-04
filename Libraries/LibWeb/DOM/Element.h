@@ -805,6 +805,9 @@ public:
     void register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, GC::Ref<IntersectionObserver::IntersectionObserver>);
     void unregister_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, GC::Ref<IntersectionObserver::IntersectionObserver>);
 
+    void register_resize_observer(Badge<ResizeObserver::ResizeObserver>, GC::Ref<ResizeObserver::ResizeObserver>);
+    void unregister_resize_observer(Badge<ResizeObserver::ResizeObserver>, GC::Ref<ResizeObserver::ResizeObserver>);
+
     CSSPixelPoint scroll_offset(Optional<CSS::PseudoElement> type) const;
     void set_scroll_offset(Optional<CSS::PseudoElement> type, CSSPixelPoint offset);
     u8 last_relative_scroll_direction() const;
@@ -829,6 +832,7 @@ public:
         Rtl,
     };
     Directionality directionality() const;
+    Optional<Directionality> directionality_unless_from_parent() const;
     bool is_auto_directionality_form_associated_element() const;
 
     Optional<Utf16FlyString> const& id() const { return m_id; }
@@ -921,6 +925,11 @@ public:
     virtual void initialize_element() { }
 
     void prepare_for_style_computation(Badge<CSS::StyleComputer>) { prepare_for_style_computation(); }
+    virtual bool needs_preparation_for_style_computation() const { return false; }
+
+    // Whether the element holds a style node whose initial features the style engine has not been told yet.
+    bool initial_style_features_pending() const { return m_initial_style_features_pending; }
+    void set_initial_style_features_pending(bool value) { m_initial_style_features_pending = value; }
 
     // Unregisters the anchor names this element registered in the tree scope `tree_root` is the root of.
     void unregister_anchor_names_before_leaving_tree_scope(Badge<Node>, Node& tree_root);
@@ -1083,6 +1092,7 @@ private:
     friend class Attr;
     friend class NamedNodeMap;
 
+    bool m_initial_style_features_pending : 1 { false };
     bool m_is_being_activated : 1 { false };
     bool m_in_top_layer : 1 { false };
     bool m_rendered_in_top_layer : 1 { false };

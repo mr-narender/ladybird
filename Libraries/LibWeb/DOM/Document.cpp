@@ -250,8 +250,10 @@
 #include <LibWeb/SVG/SMILAnimation.h>
 #include <LibWeb/SVG/SMILTimeContainer.h>
 #include <LibWeb/SVG/SVGAnimateMotionElement.h>
+#include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGElement.h>
+#include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
@@ -279,7 +281,6 @@
 #include <LibWeb/WebIDL/ObservableArray.h>
 #include <LibWeb/WebIDL/Promise.h>
 #include <LibWeb/WebRTC/WebRTCAgent.h>
-#include <LibWeb/XHR/XMLHttpRequest.h>
 #include <LibWeb/XPath/XPath.h>
 #include <LibWebCommon/CSS/SystemColor.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
@@ -6131,6 +6132,18 @@ void Document::decrement_number_of_pending_style_sheet_requests(Badge<DocumentLo
     page().client().request_frame();
 }
 
+// AD-HOC: A navigation can drop the document it created before activating it. Its parser and fetch go on queueing
+//         tasks for it that can never run, and keep it alive. A document reusing an initial about:blank's window
+//         shares that window with the active document, so it is left alone.
+void Document::destroy_if_dropped_before_activation()
+{
+    if (m_has_been_destroyed || is_active())
+        return;
+    if (m_browsing_context && m_browsing_context->active_window() == window().ptr())
+        return;
+    destroy();
+}
+
 void Document::set_html_parser_end_state(GC::Ptr<HTML::HTMLParserEndState> state)
 {
     m_html_parser_end_state = state;
@@ -6620,7 +6633,9 @@ void Document::run_unloading_cleanup_steps()
     //         GC collects it. However, we need to be proactive about this when navigating for the sake of test-web.
     window.close_all_idb_connections();
     WebRTC::WebRTCAgent::the().close_connections_for_global(window.this_impl());
-    XHR::XMLHttpRequest::release_activity_roots_for_relevant_global_object(window.this_impl());
+
+    // AD-HOC: An unloaded document's objects have no activity left to finish, so the window stops keeping them alive.
+    window.clear_objects_with_pending_activity();
 
     FileAPI::run_unloading_cleanup_steps(*this);
     fully_exit_fullscreen();
@@ -6673,6 +6688,13 @@ void Document::destroy()
     HTML::main_thread_event_loop().task_queue().remove_tasks_matching([this](auto& task) {
         return task.document() == this;
     });
+
+    // AD-HOC: Destroying the document abandons "the end", whose remaining steps run in tasks that step 5 just
+    //         removed. Cancel its state, so that its timeout doesn't report it as stuck.
+    if (m_html_parser_end_state) {
+        m_html_parser_end_state->cancel();
+        m_html_parser_end_state = nullptr;
+    }
 
     // AD-HOC: Mark this document as destroyed so we can remove tasks from the queue that will never be able to run.
     m_has_been_destroyed = true;
@@ -8448,6 +8470,77 @@ static Painting::CompositorAnimationKeyframes const& compositor_animation_keyfra
     });
 }
 
+// Whether a box inside an SVG paints or places itself by its bounding box, which includes the transforms of the boxes
+// inside it. The compositor knows no bounding boxes, so such a box needs those transforms kept current by the main
+// thread.
+static bool svg_box_uses_its_bounding_box(Layout::NodeWithStyle const& svg_box)
+{
+    auto resource_box = [&](Layout::RustFFI::NodeKind kind) -> Layout::Node const* {
+        for (auto const* child = svg_box.first_child(); child; child = child->next_sibling()) {
+            if (child->kind() == kind)
+                return child;
+        }
+        return nullptr;
+    };
+    auto const* element = as_if<Element>(svg_box.dom_node());
+    if (!element)
+        return false;
+    auto computed_style = element->computed_style();
+    if (!computed_style)
+        return true;
+
+    // NB: A filter function works on what is painted. A filter element's region comes from the bounding box.
+    if (!svg_box.filter().is_none()) {
+        auto filter = computed_style->computed_style_value(CSS::PropertyID::Filter);
+        if (!filter || filter->to_string(CSS::SerializationMode::Normal).contains("url("sv))
+            return true;
+    }
+
+    // NB: A clip path element in user space leaves the bounding box alone, unlike its other units and a basic shape.
+    auto clip_path_value = computed_style->computed_style_value(CSS::PropertyID::ClipPath);
+    if (!clip_path_value || !clip_path_value->is_keyword() || clip_path_value->to_keyword() != CSS::Keyword::None) {
+        auto const* clip_box = resource_box(Layout::RustFFI::NodeKind::SVGClipBox);
+        auto const* clip_path = clip_box ? as_if<SVG::SVGClipPathElement>(clip_box->dom_node()) : nullptr;
+        if (!clip_path || clip_path->clip_path_units() != SVG::ClipPathUnits::UserSpaceOnUse)
+            return true;
+    }
+
+    // NB: The same goes for a mask element whose area and content are both in user space, and not for a mask image.
+    auto has_mask = svg_box.style_group<CSS::ComputedValues::MaskValues>().mask_url_value().has_value()
+        || any_of(svg_box.mask_images(), [](auto const& image) { return image; });
+    if (has_mask) {
+        auto const* mask_box = resource_box(Layout::RustFFI::NodeKind::SVGMaskBox);
+        auto const* mask = mask_box ? as_if<SVG::SVGMaskElement>(mask_box->dom_node()) : nullptr;
+        if (!mask || mask->mask_units() != SVG::MaskUnits::UserSpaceOnUse || mask->mask_content_units() != SVG::MaskContentUnits::UserSpaceOnUse)
+            return true;
+    }
+
+    // NB: Any transform property or animation of it may start from none, so a box's transform-box alone decides this.
+    return svg_box.style_group<CSS::ComputedValues::TransformValues>().transform_box != to_underlying(CSS::TransformBox::ViewBox);
+}
+
+static bool svg_transform_may_run_on_the_compositor(Element const& target, Layout::Node const& layout_node)
+{
+    // FIXME: Let the root of an SVG document run on the compositor too.
+    if (layout_node.kind() == Layout::RustFFI::NodeKind::SVGSVGBox && !target.parent_element())
+        return false;
+
+    // NB: A box's own bounding box leaves out its own transform, but those of the boxes around it include it.
+    for (auto const* ancestor = layout_node.parent(); ancestor && ancestor->is_svg_box(); ancestor = ancestor->parent()) {
+        if (svg_box_uses_its_bounding_box(*ancestor))
+            return false;
+    }
+
+    // NB: The width of a non-scaling stroke undoes the scale of all transforms around it, and only recording does that.
+    auto has_non_scaling_stroke = layout_node.for_each_in_inclusive_subtree([](Layout::Node const& node) {
+        auto const* node_with_style = as_if<Layout::NodeWithStyle>(node);
+        if (node_with_style && node_with_style->style_group<CSS::ComputedValues::SVGResetValues>().vector_effect == to_underlying(CSS::VectorEffect::NonScalingStroke))
+            return TraversalDecision::Break;
+        return TraversalDecision::Continue;
+    }) == TraversalDecision::Break;
+    return !has_non_scaling_stroke;
+}
+
 // Builds the compositor animation of one target kind for an effect the compositor could drive, and
 // keeps it pending with the effect. The checks here are the ones that read the animation objects; the
 // builder in Rust lowers and validates the keyframes.
@@ -8496,12 +8589,11 @@ static Painting::CompositorAnimationEffectState::BuildOutcome build_compositor_a
     if (!target.has_value())
         return {};
     if (target->element().namespace_uri() == Namespace::SVG) {
-        // NB: An outer SVG viewport embedded in HTML uses the CSS box transform independently of its SVG
-        //     contents. Internal SVG transforms also affect SVG geometry and must remain on the main thread.
         auto const* layout_node = target->unsafe_layout_node(read);
-        auto parent = target->element().parent_element();
-        if (!targets_transform || !layout_node || layout_node->kind() != Layout::RustFFI::NodeKind::SVGSVGBox
-            || !parent || parent->namespace_uri() != Namespace::HTML)
+        // NB: The compositor has no animations for the documents of SVG images.
+        if (!layout_node || (!targets_transform && !targets_opacity && !targets_filter) || target->document().is_decoded_svg())
+            return {};
+        if (targets_transform && !svg_transform_may_run_on_the_compositor(target->element(), *layout_node))
             return {};
     }
     auto monotonic_time_at_anchor_ms = [&]() -> Optional<double> {
@@ -11584,17 +11676,30 @@ RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Layout:
     return display_list;
 }
 
-void Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Function<Compositing::DisplayListResourceSet()> const& referenced_resources)
+Painting::HitTestListAdoption Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Function<Compositing::DisplayListResourceSet()> const& referenced_resources)
 {
     auto& document_paint_state = paint_state();
     bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
-    if (!hit_test_list_read.has_value())
+    auto adoption = Painting::HitTestListAdoption::Kept;
+    if (!hit_test_list_read.has_value()) {
         m_hit_test_display_list = nullptr;
-    else if (!recording_returned_the_paint_command_cache_source || !m_hit_test_display_list || !m_hit_test_display_list->is_current())
+        adoption = Painting::HitTestListAdoption::Dropped;
+    } else if (!m_hit_test_display_list || !m_hit_test_display_list->is_current()) {
         m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(*hit_test_list_read, recording.visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
+        adoption = Painting::HitTestListAdoption::TookNew;
+    }
 
     if (recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source)
         document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, referenced_resources());
+    return adoption;
+}
+
+bool Document::hit_test_display_list_is_current(Layout::BegunRead const& read)
+{
+    update_paint_and_hit_testing_properties_if_needed();
+    if (!has_committed_viewport_box())
+        return false;
+    return m_hit_test_display_list && m_hit_test_display_list->is_current() && m_hit_test_display_list->visual_context_tree_structural_epoch() == paint_state().visual_context_tree_structural_epoch_without_update(read);
 }
 
 void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
@@ -11608,7 +11713,7 @@ void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
     page().client().request_frame();
 }
 
-Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunRead const& read)
+Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunRead const& read, Optional<i64> visual_animation_sample_time_nanoseconds)
 {
     update_paint_and_hit_testing_properties_if_needed();
 
@@ -11627,35 +11732,34 @@ Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunR
         (void)record_display_list(read, paint_config, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
     };
 
-    // The paint properties were prepared above, and a query reads them as they were left there: preparing them again
-    // for every item a query converts would find nothing to do, but still ask the render state to do it.
-    auto hit_test_display_list_is_current = [&] {
-        return m_hit_test_display_list && m_hit_test_display_list->is_current() && m_hit_test_display_list->visual_context_tree_structural_epoch() == paint_state().visual_context_tree_structural_epoch_without_update(read);
-    };
     // The recording in flight replaces the hit-test list once it lands, so a list that is not current waits for it
     // first.
-    if (!hit_test_display_list_is_current()) {
+    if (!hit_test_display_list_is_current(read)) {
         if (auto navigable = this->navigable())
             navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
     }
-    if (!hit_test_display_list_is_current()) {
+    if (!hit_test_display_list_is_current(read)) {
         rebuild_hit_test_display_list();
-        if (!hit_test_display_list_is_current())
+        if (!hit_test_display_list_is_current(read))
             return {};
     }
 
+    auto visual_context_tree = paint_state().visual_context_tree_without_update(read, *this);
+    if (visual_animation_sample_time_nanoseconds.has_value() && visual_context_tree.has_visual_animations())
+        visual_context_tree = visual_context_tree.with_visual_animation_samples(*visual_animation_sample_time_nanoseconds);
     return Painting::HitTestQuery {
         *m_hit_test_display_list,
-        paint_state().visual_context_tree_without_update(read, *this),
+        move(visual_context_tree),
         scroll_state_snapshot(),
         page().client().device_pixels_per_css_pixel(),
         page().chrome_metrics(),
+        visual_animation_sample_time_nanoseconds,
     };
 }
 
-Optional<Painting::HitTestResult> Document::hit_test(Layout::BegunRead const& read, CSSPixelPoint position)
+Optional<Painting::HitTestResult> Document::hit_test(Layout::BegunRead const& read, CSSPixelPoint position, Optional<i64> visual_animation_sample_time_nanoseconds)
 {
-    auto query = prepare_hit_test_query(read);
+    auto query = prepare_hit_test_query(read, visual_animation_sample_time_nanoseconds);
     if (!query.has_value())
         return {};
     // https://w3c.github.io/pointerevents/#hit-test

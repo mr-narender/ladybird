@@ -571,9 +571,6 @@ impl LayoutNodeArena {
             return None;
         }
         // Anchor functions resolve against anchors this path does not look up.
-        let size_contains_anchor_function = |size: &crate::layout::ComputedSize| {
-            size.is_length_percentage() && size.length_percentage().contains_anchor_function()
-        };
         let side_contains_anchor_function = |side: &crate::layout::ComputedLengthPercentageOrAuto| {
             side.length_percentage()
                 .is_some_and(|length_percentage| length_percentage.contains_anchor_function())
@@ -588,7 +585,7 @@ impl LayoutNodeArena {
             style.max_height(),
         ]
         .into_iter()
-        .any(size_contains_anchor_function)
+        .any(crate::layout::ComputedSize::contains_anchor_function)
             || [&surround.inset, &surround.margin].into_iter().any(|sides| {
                 [&sides.top, &sides.right, &sides.bottom, &sides.left]
                     .into_iter()
@@ -963,7 +960,7 @@ mod tests {
     #[test]
     fn marking_a_node_marks_clean_ancestors_and_drops_their_intrinsic_sizes() {
         let mut arena = LayoutNodeArena::new();
-        let scratch = LayoutScratch::default();
+        let mut scratch = LayoutScratch::default();
         let parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
         arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);
@@ -1000,7 +997,7 @@ mod tests {
     #[test]
     fn remarking_a_dirty_non_boundary_node_leaves_its_parent_clean_and_drops_their_intrinsic_sizes() {
         let mut arena = LayoutNodeArena::new();
-        let scratch = LayoutScratch::default();
+        let mut scratch = LayoutScratch::default();
         let parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
         arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);

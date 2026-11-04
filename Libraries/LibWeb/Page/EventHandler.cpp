@@ -36,6 +36,7 @@
 #include <LibWeb/HTML/CloseWatcherManager.h>
 #include <LibWeb/HTML/DataTransfer.h>
 #include <LibWeb/HTML/DragDataStore.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
@@ -672,7 +673,6 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
 
         if (found_parent_element) {
             update_cursor(read, target_layout_node, *node, chrome_widget, hit_text_fragment);
-            m_cursor_resolved_before_hover = true;
             clear_cursor.disarm();
 
             auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *layout_node);
@@ -1384,14 +1384,14 @@ void EventHandler::update_nested_navigable_under_pointer(GC::Ptr<HTML::LocalNavi
         (void)previous->event_handler().handle_mouseleave();
 }
 
-void EventHandler::update_hover_after_scroll()
+void EventHandler::update_hover_at_last_known_mouse_position(Optional<i64> visual_animation_sample_time_nanoseconds)
 {
     if (!m_last_known_mouse_visual_viewport_position.has_value())
         return;
     if (m_mousedown_target)
         return;
 
-    update_hover_after_scroll(*m_last_known_mouse_visual_viewport_position, m_last_known_mouse_screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers);
+    update_hover_after_scroll(*m_last_known_mouse_visual_viewport_position, m_last_known_mouse_screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers, {}, visual_animation_sample_time_nanoseconds);
 }
 
 // AD-HOC: `hover_target`, where given, is the element the render clock's lane hovered at the position, which the screen
@@ -1406,38 +1406,98 @@ void EventHandler::update_hover_at(CSSPixelPoint visual_viewport_position, GC::P
     if (m_last_known_mouse_visual_viewport_position.has_value())
         screen_position = m_last_known_mouse_screen_position + (visual_viewport_position - *m_last_known_mouse_visual_viewport_position);
     record_last_known_mouse_position(visual_viewport_position, screen_position, m_last_known_mouse_buttons, m_last_known_mouse_modifiers);
-    update_hover_after_scroll(visual_viewport_position, screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers, hover_target);
+    // A hit test of the host's own finds what the screen shows where it samples the compositor's animations at the
+    // frame time the compositor reported last. The hover the pointer rests on clears the time as it reads it.
+    Optional<i64> visual_animation_sample_time_nanoseconds;
+    if (!hover_target)
+        visual_animation_sample_time_nanoseconds = m_visual_animation_sample_time_nanoseconds;
+    update_hover_after_scroll(visual_viewport_position, screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers, hover_target, visual_animation_sample_time_nanoseconds);
 }
 
-// AD-HOC: A move resolves the cursor before it hovers what is under the pointer, which the style of the hover (a :hover
-//         rule, or a style a handler of the move's events set) then gives a cursor of its own. Blink resolves the
-//         cursor again on a timer once a style change moved a box's cursor. Here the rendering update after the move
-//         resolves it again, once.
-void EventHandler::update_cursor_after_rendering_update()
+// AD-HOC: The hover and the cursor follow what is under the pointer while it rests. A frame may move what is there,
+//         and a style a rendering update applies may change the `cursor` of what is there. Blink, WebKit and Gecko
+//         hover again after a layout, and Blink resolves the cursor again once a style change moved a box's cursor.
+//         The event loop follows the pointer once a frame shows the change, between two tasks or as the next rendering
+//         update begins, where it reads the frame's hit-test list.
+void EventHandler::update_hover_after_rendering_update()
 {
-    if (!exchange(m_cursor_resolved_before_hover, false))
-        return;
-    if (!m_last_known_mouse_visual_viewport_position.has_value() || should_ignore_device_input_event())
-        return;
     auto document = m_navigable->active_document();
-    if (!document || !document->is_fully_active() || !has_committed_root_box())
-        return;
-    Layout::ForcedReadScope read { *document };
-    auto target = target_for_mouse_position(*m_last_known_mouse_visual_viewport_position);
-    if (!target.has_value())
-        return;
-    auto node = target->dom_node();
-    auto* target_layout_node = target->layout_node(read);
-    // A nested navigable's own event handler shows the cursor over its content.
-    if (!node || !target_layout_node || Painting::is_navigable_container_viewport_paintable(*target_layout_node))
-        return;
-    Layout::Node* layout_node = nullptr;
-    if (!parent_element_for_event_dispatch(*target_layout_node, node, layout_node))
-        return;
-    update_cursor(read, target_layout_node, *node, target->chrome_widget, target->is_text_fragment);
+    if (document && document->take_cursor_may_be_stale())
+        note_hover_may_be_stale();
 }
 
-void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target)
+void EventHandler::note_frame_landed(FramePlacement frame_placement)
+{
+    if (frame_placement == FramePlacement::Changed)
+        note_hover_may_be_stale();
+}
+
+void EventHandler::note_hover_may_be_stale()
+{
+    // The next move hovers where the pointer is, where none has said yet.
+    if (!m_last_known_mouse_visual_viewport_position.has_value())
+        return;
+    m_hover_may_be_stale = true;
+    HTML::main_thread_event_loop().note_hover_may_be_stale(*m_navigable);
+}
+
+void EventHandler::note_animated_content_moved_under_pointer(i64 frame_time_nanoseconds)
+{
+    note_hover_may_be_stale();
+    if (m_hover_may_be_stale)
+        m_visual_animation_sample_time_nanoseconds = frame_time_nanoseconds;
+}
+
+bool EventHandler::update_hover_where_the_pointer_rests(HTML::HoverUpdatePoint hover_update_point)
+{
+    if (!m_hover_may_be_stale)
+        return false;
+    auto document = m_navigable->active_document();
+    if (!document || !m_last_known_mouse_visual_viewport_position.has_value()) {
+        m_hover_may_be_stale = false;
+        return false;
+    }
+    // A style or layout the host owes, and a hit-test list that is not current, each come with a frame: the hover
+    // follows once it landed. A rendering update brings the style and layout up to date as it begins, which the hover
+    // may do ahead of it.
+    if (document->layout_is_known_stale()) {
+        return true;
+    }
+    Layout::ForcedReadScope read { *document };
+    if (hover_update_point == HTML::HoverUpdatePoint::BetweenTasks && (document->style_computer().style_engine().has_pending_transaction(read) || !document->layout_is_up_to_date())) {
+        return true;
+    }
+    // A layout the host does not know is stale may still be. The update lays the document out, or lets its style
+    // update fly.
+    if (hover_update_point == HTML::HoverUpdatePoint::RenderingUpdateBegins) {
+        document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseMove);
+        if (document->layout_is_known_stale())
+            return true;
+    }
+    if (hover_update_point == HTML::HoverUpdatePoint::BetweenTasks && !document->hit_test_display_list_is_current(read)) {
+        return true;
+    }
+    m_hover_may_be_stale = false;
+    auto visual_animation_sample_time_nanoseconds = m_visual_animation_sample_time_nanoseconds;
+    m_visual_animation_sample_time_nanoseconds.clear();
+    if (should_ignore_device_input_event() || !document->is_fully_active() || !has_committed_root_box())
+        return false;
+    // The hover moves where another node is under the pointer. Where the same node is, only its cursor may have
+    // changed, which is shown without the boundary events and the style work of a hover.
+    auto target = target_for_mouse_position(*m_last_known_mouse_visual_viewport_position, visual_animation_sample_time_nanoseconds);
+    auto node = target.has_value() ? target->dom_node() : nullptr;
+    auto* target_layout_node = target.has_value() ? target->layout_node(read) : nullptr;
+    if (node && target_layout_node && node.ptr() == document->hovered_node() && !Painting::is_navigable_container_viewport_paintable(*target_layout_node)) {
+        Layout::Node* layout_node = nullptr;
+        if (parent_element_for_event_dispatch(*target_layout_node, node, layout_node))
+            update_cursor(read, target_layout_node, *node, target->chrome_widget, target->is_text_fragment);
+        return false;
+    }
+    update_hover_at_last_known_mouse_position(visual_animation_sample_time_nanoseconds);
+    return false;
+}
+
+void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target, Optional<i64> visual_animation_sample_time_nanoseconds)
 {
     if (m_effective_legacy_mouse_pointer_type != PointerType::Mouse)
         return;
@@ -1468,7 +1528,7 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
         auto nested_navigable = [&]() -> GC::Ptr<HTML::LocalNavigable> {
             if (hover_target)
                 return hover_target_nested_navigable();
-            auto hit = target_for_mouse_position(visual_viewport_position);
+            auto hit = target_for_mouse_position(visual_viewport_position, visual_animation_sample_time_nanoseconds);
             auto* layout_node = hit.has_value() ? hit->layout_node(read) : nullptr;
             return layout_node ? local_nested_navigable_at(*layout_node, hit->dom_node()) : nullptr;
         }();
@@ -1486,7 +1546,7 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
     RefPtr<Painting::ChromeWidget> chrome_widget;
     GC::Ptr<DOM::Node> node;
     bool hit_text_fragment = false;
-    if (auto result = target_for_mouse_position(visual_viewport_position); result.has_value()) {
+    if (auto result = target_for_mouse_position(visual_viewport_position, visual_animation_sample_time_nanoseconds); result.has_value()) {
         target = move(*result);
         chrome_widget = target->chrome_widget;
         node = target->dom_node();
@@ -1536,7 +1596,6 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
         return;
 
     update_cursor(read, target_layout_node, *node, chrome_widget, hit_text_fragment);
-    m_cursor_resolved_before_hover = true;
 
     auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *layout_node);
     track_the_effective_position_of_the_legacy_mouse_pointer(node, DOM::HoverEventData {
@@ -1650,17 +1709,18 @@ EventHandler::KeyboardScrollSnapshot EventHandler::keyboard_scroll_snapshot() co
     DOM::EventTarget* event_target = focused_area.ptr();
     if (!event_target)
         event_target = document->body() ?: &document->root();
-    bool has_keyboard_listeners = false;
+    bool has_blocking_keyboard_listeners = false;
     for (; event_target; event_target = event_target->get_parent(*event)) {
         snapshot.event_path.append(event_target);
-        // Even passive listeners can change focus or install a keypress listener during keydown.
-        has_keyboard_listeners |= event_target->has_event_listener(UIEvents::EventNames::keydown) || event_target->has_event_listener(UIEvents::EventNames::keypress);
+        // NB: A passive listener can't cancel the key's default action, so the compositor scrolls ahead of it. One that
+        //     moves focus or adds a blocking listener only changes what the next key does.
+        has_blocking_keyboard_listeners |= event_target->has_blocking_keyboard_event_listener();
     }
 
     if (document->page().focused_navigable().ptr() != m_navigable.ptr()
         || !document->page().client().has_focus()
         || !document->has_committed_viewport_box() || document->active_input_events_target()
-        || should_ignore_device_input_event() || has_keyboard_listeners
+        || should_ignore_device_input_event() || has_blocking_keyboard_listeners
         || focused_area_activates_on_space(focused_area.ptr()) || is<HTML::NavigableContainer>(focused_area.ptr())
         || is<HTML::HTMLMediaElement>(focused_area.ptr()))
         return snapshot;
@@ -2451,8 +2511,9 @@ EventResult EventHandler::handle_pinch_event(CSSPixelPoint point, PinchEvent con
         return EventResult::Handled;
 
     // The pinch zooms the visual viewport of the top-level traversable. A frame hosted apart from it leaves the zoom to
-    // the page displaying the tab, which the UI asks once the event is left uncanceled.
-    if (!m_navigable->is_top_level_traversable())
+    // the page displaying the tab, which the UI asks once the event is left uncanceled. The page leaves it to the
+    // compositor likewise, whose scale may be newer than ours, and zooms only where the compositor could not.
+    if (!m_navigable->is_top_level_traversable() || !event.wheel_event_was_dispatched)
         return EventResult::Accepted;
 
     document = m_navigable->active_document();
@@ -3340,14 +3401,14 @@ Layout::Node* EventHandler::validated_latched_wheel_event_target_layout_node(Lay
     return layout_node;
 }
 
-Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelPoint position)
+Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelPoint position, Optional<i64> visual_animation_sample_time_nanoseconds)
 {
     auto document = m_navigable->active_document();
     if (!document)
         return {};
     Layout::ForcedReadScope read { *document };
 
-    if (auto result = document->hit_test(read, position); result.has_value()) {
+    if (auto result = document->hit_test(read, position, visual_animation_sample_time_nanoseconds); result.has_value()) {
         return Target {
             .hit_node = result->hit_node,
             .arena = result->arena,
@@ -5680,6 +5741,14 @@ void EventHandler::clear_per_test_input_state(Badge<Internals::Internals>)
     m_native_mouse_hover_target = nullptr;
     m_drag_and_drop_event_handler->reset();
     m_mousemove_previous_screen_position.clear();
+    m_visual_animation_sample_time_nanoseconds.clear();
+    m_last_known_mouse_visual_viewport_position.clear();
+    m_hover_may_be_stale = false;
+    // The lanes carry the pointer over to the next document, which the host then hovers where it rests.
+    if (auto document = m_navigable->active_document()) {
+        if (auto* arena = document->layout_node_arena_if_created())
+            Layout::RustFFI::document_host_forget_pointer_for_testing(arena->host());
+    }
     m_wheel_event_target_latch.clear();
     m_navigable->page().clear_context_menu_request();
 }

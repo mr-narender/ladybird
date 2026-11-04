@@ -645,12 +645,19 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     explicit TabPreviewPopup(QWidget* parent)
-        // NB: The preview only shows, and the room around it for its shadow lies over the tabs, so it lets the mouse through.
-        : QWidget(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint | Qt::WindowTransparentForInput)
+        // NB: The preview only shows, and the room around it for its shadow lies over the tabs, so it lets the mouse
+        //     through. On X11, Qt adds the stays-on-top hint to a tooltip itself, takes that for a change of flags, and
+        //     recreates the window as it is first shown, and the new window takes the mouse again. Asking for the hint
+        //     here keeps the window from being recreated.
+        : QWidget(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint | Qt::WindowTransparentForInput | Qt::WindowStaysOnTopHint)
     {
         setAttribute(Qt::WA_TranslucentBackground);
         setAttribute(Qt::WA_ShowWithoutActivating);
         setAttribute(Qt::WA_TransparentForMouseEvents);
+
+        // NB: KDE's widget styles have the window system cast a shadow around any tooltip window. The card casts its own
+        //     within this window, so that would be a second shadow around the room left for the first.
+        setProperty("_KDE_NET_WM_SKIP_SHADOW", true);
 
         auto* outer_layout = new QVBoxLayout(this);
         outer_layout->setContentsMargins(TAB_PREVIEW_SHADOW_MARGINS);

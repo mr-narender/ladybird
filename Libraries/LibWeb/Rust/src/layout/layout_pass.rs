@@ -54,9 +54,12 @@ struct PositionOptionStyle<'pass> {
 }
 
 impl<'arena> LayoutPass<'arena> {
+    /// A pass over `arena` and `scratch`, which notes what it finds out for the host outside any run in
+    /// `host_findings_outside_runs`.
     pub(crate) fn new(
         arena: &'arena LayoutNodeArena,
         scratch: &'arena super::run_state::LayoutScratch,
+        host_findings_outside_runs: &'arena RefCell<super::run_state::HostFindings>,
         stage: super::formatting_context::LayoutStageFacts,
     ) -> Self {
         Self {
@@ -67,7 +70,7 @@ impl<'arena> LayoutPass<'arena> {
             document_in_quirks_mode: stage.document_in_quirks_mode,
             frame: super::geometry::Frame::PHYSICAL,
             innermost_run: (NodeSlotId::INVALID, NodeSlotId::INVALID),
-            host_findings: &scratch.host_findings_outside_runs,
+            host_findings: host_findings_outside_runs,
             intrinsic_size_caches: &scratch.intrinsic_size_caches,
             reads_no_memoized_layout: false,
             position_option_styles: None,
@@ -76,10 +79,15 @@ impl<'arena> LayoutPass<'arena> {
 
     /// A pass over `arena` and `scratch` with no viewport, in no-quirks mode.
     #[cfg(test)]
-    pub(crate) fn for_test(arena: &'arena LayoutNodeArena, scratch: &'arena super::run_state::LayoutScratch) -> Self {
+    pub(crate) fn for_test(
+        arena: &'arena LayoutNodeArena,
+        scratch: &'arena super::run_state::LayoutScratch,
+        host_findings_outside_runs: &'arena RefCell<super::run_state::HostFindings>,
+    ) -> Self {
         Self::new(
             arena,
             scratch,
+            host_findings_outside_runs,
             super::formatting_context::LayoutStageFacts {
                 viewport_inline_size: CssPixels::default(),
                 viewport_block_size: CssPixels::default(),
@@ -170,14 +178,22 @@ impl<'arena> LayoutPass<'arena> {
         None
     }
 
-    /// The document's layout trace, which records what the pass does while the document traces its layout.
-    pub(crate) fn layout_trace(&self) -> &'arena super::trace::LayoutTrace {
-        &self.scratch.layout_trace
+    /// Where this pass view records what its runs do while the document traces its layout: the document's layout trace,
+    /// or nowhere inside a run whose result is discarded.
+    pub(crate) fn layout_trace(&self) -> super::trace::LayoutTraceTarget<'arena> {
+        if self.reads_no_memoized_layout {
+            return super::trace::LayoutTraceTarget::recording_nothing();
+        }
+        super::trace::LayoutTraceTarget::recording_into(&self.scratch.layout_trace)
     }
 
     /// The results of formatting context runs, kept for the runs and passes after them.
     pub(crate) fn fc_run_cache_store(&self) -> &'arena super::fc_run_cache::FcRunCacheStore {
         self.scratch.fc_run_cache_store()
+    }
+
+    pub(crate) fn fragment_builder_scratch(&self) -> &'arena RefCell<super::fragment_tree::FragmentBuilderScratch> {
+        self.scratch.fragment_builder_scratch()
     }
 
     /// The layouts of in-flow blocks, kept for the passes after the one that laid them out.
@@ -193,7 +209,12 @@ impl<'arena> LayoutPass<'arena> {
 
     /// Notes what the run this pass view was handed to found out for the host, or the pass outside any run.
     pub(crate) fn note_host_findings(&self, note: impl FnOnce(&mut super::run_state::HostFindings)) {
+        self.scratch.note_host_findings_noted_in_pass();
         note(&mut self.host_findings.borrow_mut());
+    }
+
+    pub(crate) fn host_findings_noted_in_pass(&self) -> u64 {
+        self.scratch.host_findings_noted_in_pass()
     }
 
     /// Hands what a finished run found out to the run this pass view was handed to, which used its result.
@@ -281,11 +302,19 @@ impl<'arena> LayoutPass<'arena> {
     /// The style of `node`: that of its row, or the position option it is being laid out with.
     #[inline]
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'arena>> {
+        self.row_and_style(node).1
+    }
+
+    /// The row of `node` together with its style as [`Self::computed_values_view_if_styled`] answers it, from one
+    /// lookup of the row.
+    #[inline]
+    pub(crate) fn row_and_style(&self, node: Node) -> (&'arena NodeData, Option<ComputedValuesView<'arena>>) {
+        let data = self.node_data(node);
         if let Some(style) = self.position_option_style(node) {
             // SAFETY: A position option's style stays alive while a box is laid out with it.
-            return Some(unsafe { style.view() });
+            return (data, Some(unsafe { style.view() }));
         }
-        self.arena.style_view(node)
+        (data, node_facts::node_style_view(data))
     }
 
     pub(crate) fn can_skip_is_anonymous_text_run(&self, node: Node) -> bool {

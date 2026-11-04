@@ -2180,6 +2180,8 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 
     for (auto const& state : previous_read_write_states)
         CSS::Invalidation::invalidate_style_after_read_write_state_change(*state.element, state.value);
+    if (!previous_read_write_states.is_empty())
+        CSS::Invalidation::invalidate_style_after_focused_element_keyboard_input_change(document());
 
     // 26. Queue a tree mutation record for oldParent with « », « node », oldPreviousSibling, and oldNextSibling.
     GC::Ref<Node> moved_node = *this;
@@ -2456,11 +2458,17 @@ void Node::recompute_editable_subtree_flags_and_repaint()
         return TraversalDecision::Continue;
     });
     document().page().keyboard_scroll_editability_changed(document());
+    CSS::Invalidation::invalidate_style_after_focused_element_keyboard_input_change(document());
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#editable
 bool Node::is_editable() const
 {
+    // OPTIMIZATION: Nothing below an unedited parent is editable, which answers for nearly every node without asking
+    //               what kind of node it is.
+    if (!parent() || !parent()->m_in_editable_subtree)
+        return false;
+
     // Something is editable if it is a node; it is not an editing host;
     if (is_editing_host())
         return false;
@@ -2471,8 +2479,7 @@ bool Node::is_editable() const
         return false;
 
     // its parent is an editing host or editable;
-    if (!parent() || !parent()->m_in_editable_subtree)
-        return false;
+    // NB: Checked first, above.
 
     // https://html.spec.whatwg.org/multipage/interaction.html#inert-subtrees
     // When a node is inert:
@@ -2500,25 +2507,23 @@ bool Node::is_editing_host() const
     if (!html_element)
         return false;
 
-    // INTEROP: See recompute_editable_subtree_flag(). Select, optgroup and option elements are not editing hosts
-    //          either.
-    if (is<HTML::HTMLSelectElement>(*this) || is<HTML::HTMLOptGroupElement>(*this) || is<HTML::HTMLOptionElement>(*this))
-        return false;
-
     // An editing host is either an HTML element with its contenteditable attribute in the true state or
     // plaintext-only state,
     // AD-HOC: Only return true here if this node is not the child of another editable node or an editing host,
     //         effectively merging this potential editing host with its editing host ancestor. This causes a call to
     //         `::editing_host()` to automatically traverse to the top-most editing host.
     auto state = html_element->content_editable_state();
-    if ((state == HTML::ContentEditableState::True || state == HTML::ContentEditableState::PlaintextOnly)
-        && (!parent() || !parent()->m_in_editable_subtree)) {
-        return true;
-    }
+    bool const hosts_by_attribute = (state == HTML::ContentEditableState::True || state == HTML::ContentEditableState::PlaintextOnly)
+        && (!parent() || !parent()->m_in_editable_subtree);
 
     // or a child HTML element of a Document whose design mode enabled is true.
     auto* doc = as_if<Document>(parent());
-    return doc && doc->design_mode_enabled_state();
+    if (!hosts_by_attribute && !(doc && doc->design_mode_enabled_state()))
+        return false;
+
+    // INTEROP: See recompute_editable_subtree_flag(). Select, optgroup and option elements are not editing hosts
+    //          either.
+    return !is<HTML::HTMLSelectElement>(*this) && !is<HTML::HTMLOptGroupElement>(*this) && !is<HTML::HTMLOptionElement>(*this);
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#editing-host-of
@@ -4065,6 +4070,9 @@ void Node::mark_box(Layout::RustFFI::FfiBoxMarks marks)
 // published answer for a node that gains one.
 void Node::publish_dom_paint_facts()
 {
+    // NB: A node the style mirror has not named has nowhere to publish them, and publishes them as it arrives.
+    if (!NodeIdentity::of(*this))
+        return;
     auto& document = this->document();
     auto facts = Layout::Node::dom_paint_facts_of(this);
     // A document where nothing is ever inert, editable or inside a wheel handler publishes nothing, which keeps a

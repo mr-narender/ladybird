@@ -86,6 +86,7 @@
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
+#include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
@@ -1026,6 +1027,8 @@ void LocalNavigable::continue_navigation_at_population(NavigationPopulationReque
         GC::create_function(navigable->heap(), [navigable, history_entry, history_handling = request.history_handling, navigation_id = request.navigation_id, user_involvement = request.user_involvement](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) mutable {
             // AD-HOC: This check is not in the spec but we should not continue navigation if ongoing navigation id has changed.
             if (navigable->ongoing_navigation() != navigation_id) {
+                if (output && output->document)
+                    output->document->destroy_if_dropped_before_activation();
                 navigable->stop_delaying_load_events_for_navigation(navigation_id);
                 navigable->page().client().navigation_population_failed(navigable->id(), navigation_id);
                 return;
@@ -3836,7 +3839,7 @@ void LocalNavigable::run_navigation_unload_check(Utf16String const& navigation_i
     // 1. Let unloadPromptCanceled be the result of checking if unloading is user-canceled for navigable's active document's inclusive descendant navigables.
     // NB: This page checks the documents it hosts, last: the UI process, which requested the check, ran it in the
     //     pages hosting the others first, and whether one of them showed the prompt comes with the request.
-    check_if_unloading_is_canceled(hosted_inclusive_descendant_navigables(), as_if<LocalTraversableNavigable>(this), {}, {}, {}, unload_prompt_shown,
+    check_if_unloading_is_canceled(page(), hosted_inclusive_descendant_navigables(), as_if<LocalTraversableNavigable>(this), {}, {}, {}, unload_prompt_shown,
         GC::create_function(heap(), [this, navigation_id, completion_steps](CheckIfUnloadingIsCanceledResult unload_prompt_canceled, UnloadPromptShown) {
             if (has_been_destroyed() || !active_window()) {
                 completion_steps->function()(false);
@@ -4367,6 +4370,7 @@ bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& docu
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#checking-if-unloading-is-canceled
 void check_if_unloading_is_canceled(
+    Page& page,
     Vector<GC::Root<LocalNavigable>> navigables_that_need_before_unload,
     GC::Ptr<LocalTraversableNavigable> owner,
     GC::Ptr<LocalTraversableNavigable> traversable,
@@ -4376,6 +4380,7 @@ void check_if_unloading_is_canceled(
     GC::Ref<GC::Function<void(CheckIfUnloadingIsCanceledResult, UnloadPromptShown)>> callback)
 {
     auto state = GC::Heap::the().allocate<CheckUnloadingCanceledState>(
+        page,
         owner,
         traversable,
         user_involvement_for_navigate_events,
@@ -4404,7 +4409,7 @@ void LocalTraversableNavigable::request_close_preflight(GC::Ref<GC::Function<voi
     auto state_callback = GC::create_function(heap(), [callback](CheckIfUnloadingIsCanceledResult result, UnloadPromptShown) {
         callback->function()(result == CheckIfUnloadingIsCanceledResult::Continue);
     });
-    auto state = heap().allocate<CheckUnloadingCanceledState>(GC::Ptr<LocalTraversableNavigable> { this }, GC::Ptr<LocalTraversableNavigable> {}, Optional<UserNavigationInvolvement> {}, UnloadPromptShown::No, state_callback);
+    auto state = heap().allocate<CheckUnloadingCanceledState>(page(), GC::Ptr<LocalTraversableNavigable> { this }, GC::Ptr<LocalTraversableNavigable> {}, Optional<UserNavigationInvolvement> {}, UnloadPromptShown::No, state_callback);
     Vector<GC::Root<LocalNavigable>> local_navigables;
     for (auto& navigable : document->inclusive_descendant_navigables()) {
         if (auto* local_navigable = as_if<LocalNavigable>(navigable.ptr()))
@@ -4420,6 +4425,8 @@ void finalize_a_cross_document_navigation(GC::Ref<LocalNavigable> navigable, His
 {
     // NOTE: This is not in the spec but we should not navigate destroyed navigable.
     if (navigable->has_been_destroyed()) {
+        if (pending_document)
+            pending_document->destroy_if_dropped_before_activation();
         navigable->set_delaying_load_events(false);
         navigable->page().client().navigation_population_failed(navigable->id(), navigation_id);
         return;
@@ -5253,6 +5260,11 @@ void LocalNavigable::note_scroll_sequence_moved(Web::AsyncScrollNodeStableID sta
     }
 }
 
+bool LocalNavigable::has_user_scroll_gesture() const
+{
+    return any_of(m_scroll_sequences, [](auto const& sequence) { return sequence.user_gesture.has_value(); });
+}
+
 LocalNavigable::UserScrollGesture* LocalNavigable::user_scroll_gesture_for(Web::AsyncScrollNodeStableID stable_node_id)
 {
     auto* sequence = scroll_sequence_for(stable_node_id);
@@ -5971,11 +5983,13 @@ void LocalNavigable::adopt_pending_async_scroll_offsets(Compositing::AsyncScroll
         }
     }
 
-    if (adopted_any_scroll_offset)
-        schedule_hover_update_after_async_scroll();
-
-    for (auto const& applied_scroll_request : async_scroll_updates.applied_scroll_requests)
+    bool moved_a_box_by_request = false;
+    for (auto const& applied_scroll_request : async_scroll_updates.applied_scroll_requests) {
+        moved_a_box_by_request |= applied_scroll_request.moved_the_box;
         finish_instant_scrolls_answered_by(applied_scroll_request);
+    }
+    if (adopted_any_scroll_offset || moved_a_box_by_request)
+        schedule_hover_update_after_async_scroll();
 
     for (auto operation_id : async_scroll_updates.completed_operation_ids)
         resolve_async_scroll_operation(operation_id);
@@ -6042,7 +6056,7 @@ void LocalNavigable::update_hover_after_async_scroll_stops()
 {
     if (has_been_destroyed())
         return;
-    event_handler().update_hover_after_scroll();
+    event_handler().update_hover_at_last_known_mouse_position();
 }
 
 void LocalNavigable::cancel_hover_update_after_async_scroll()
@@ -7058,6 +7072,7 @@ Compositor::SealedPresentation LocalNavigable::seal_presentation(DOM::Document& 
         .paint_config = paint_config,
         .visual_context_tree = move(visual_context_tree),
         .sends_visual_context_tree = sends_visual_context_tree,
+        .scroll_state_changed = paint_state.take_scroll_state_change(),
         .scroll_state_snapshot = move(scroll_state_snapshot),
         .scroll_requests = take_unsent_scroll_requests(),
         .keyboard_scroll_state = move(keyboard_scroll_state),
@@ -7077,6 +7092,8 @@ void LocalNavigable::unseal_presentation(DOM::Document& document, Compositor::Se
 {
     if (sealed.sends_visual_context_tree && document.has_paint_state())
         document.paint_state().did_update_visual_context_values();
+    if (sealed.scroll_state_changed && document.has_paint_state())
+        document.paint_state().did_change_scroll_state();
     give_back_unsent_scroll_requests(move(sealed.scroll_requests));
 }
 
@@ -7120,20 +7137,38 @@ void LocalNavigable::finish_recording_in_flight(RecordingInFlight& in_flight, La
     // A frame the render owner found no box to record of presents nothing.
     if (landing == Layout::RustFFI::FfiRecordingLanding::NothingRecorded) {
         unseal_presentation(document, *sealed);
+        if (!has_been_destroyed() && active_document().ptr() == document.ptr())
+            event_handler().note_frame_landed(Web::EventHandler::FramePlacement::Unchanged);
         return;
     }
-    if (landing == Layout::RustFFI::FfiRecordingLanding::PresentedUnrecorded)
-        return;
-
     Layout::ForcedReadScope read { *document };
     // What the recording made goes to a document this navigable still presents, which still has the boxes it recorded.
     if (has_been_destroyed() || !has_compositor_context() || active_document().ptr() != document.ptr() || !document->has_committed_viewport_box())
         return;
-    // What the recording made stands as the compositor's frame. One that landed after the host wrote the document's rows
-    // leaves no hit-test list, as the boxes it names may be gone.
-    auto const hit_test_list_stands = landing == Layout::RustFFI::FfiRecordingLanding::LandedBehindRows ? Painting::HitTestListStands::No : Painting::HitTestListStands::Yes;
-    Painting::take_recording_trace_if_pending(read, *document);
-    document->adopt_published_recording(Painting::hit_test_list_read(read, hit_test_list_stands), *in_flight.recording, sealed->published->display_list, [&] { return sealed->published->referenced_resources; });
+    // A frame presented without a recording keeps the hit-test list.
+    auto hit_test_list_adoption = Painting::HitTestListAdoption::Kept;
+    if (landing != Layout::RustFFI::FfiRecordingLanding::PresentedUnrecorded) {
+        // What the recording made stands as the compositor's frame. One that landed after the host wrote the document's
+        // rows leaves no hit-test list, as the boxes it names may be gone.
+        auto const hit_test_list_stands = landing == Layout::RustFFI::FfiRecordingLanding::LandedBehindRows ? Painting::HitTestListStands::No : Painting::HitTestListStands::Yes;
+        Painting::take_recording_trace_if_pending(read, *document);
+        hit_test_list_adoption = document->adopt_published_recording(Painting::hit_test_list_read(read, hit_test_list_stands), *in_flight.recording, sealed->published->display_list, [&] { return sealed->published->referenced_resources; });
+    }
+    // A frame that kept its hit-test items, and sent no visual context tree, placed them as the frame before it did,
+    // unless it scrolled them. The hover waits for a scroll of the user's to stop instead (see
+    // schedule_hover_update_after_async_scroll).
+    auto const frame_placement = [&] {
+        if (hit_test_list_adoption == Painting::HitTestListAdoption::TookNew)
+            return Web::EventHandler::FramePlacement::Changed;
+        if (hit_test_list_adoption != Painting::HitTestListAdoption::Kept)
+            return Web::EventHandler::FramePlacement::Unchanged;
+        if (sealed->sends_visual_context_tree)
+            return Web::EventHandler::FramePlacement::Changed;
+        if (sealed->scroll_state_changed && !has_user_scroll_gesture())
+            return Web::EventHandler::FramePlacement::Changed;
+        return Web::EventHandler::FramePlacement::Unchanged;
+    }();
+    event_handler().note_frame_landed(frame_placement);
 }
 
 void LocalNavigable::record_rendering_invalidation()
@@ -7277,12 +7312,21 @@ void LocalNavigable::request_scroll_jump(Web::AsyncScrollNodeStableID stable_nod
     scroll_request.relative_scroll.clear();
     scroll_request.relative_scroll_moves_visual_viewport_first = false;
     scroll_request.instant_scroll_is_for_user_input = trigger != ScrollTrigger::Programmatic;
-    if (stable_node_id.kind == Web::AsyncScrollNodeKind::VisualViewport)
-        scroll_request.visual_viewport_scale = active_document()->visual_viewport()->scale();
+    // NB: The compositor zooms on its own, so the scale this thread knows may be old. Only a change made here goes along.
+    if (stable_node_id.kind == Web::AsyncScrollNodeKind::VisualViewport) {
+        if (auto scale = active_document()->visual_viewport()->take_scale_for_compositor(); scale.has_value())
+            scroll_request.visual_viewport_scale = static_cast<float>(scale.value());
+    }
 }
 
 void LocalNavigable::request_smooth_scroll(Web::AsyncScrollNodeStableID stable_node_id, Compositing::RequestedSmoothScroll smooth_scroll)
 {
+    if (smooth_scroll.destination_is_relative) {
+        if (auto const* scrolling_box = committed_scrolling_box_for_async_scroll_node(*active_document(), stable_node_id)) {
+            smooth_scroll.relative_lower_bound = device_scroll_offset(Painting::minimum_scroll_offset(*scrolling_box));
+            smooth_scroll.relative_upper_bound = device_scroll_offset(Painting::maximum_scroll_offset(*scrolling_box));
+        }
+    }
     auto& scroll_request = unsent_scroll_request_for(stable_node_id);
     // A scroll that continues the same operation folds into the request for it, whose promises carry over.
     if (scroll_request.smooth_scroll.has_value() && scroll_request.smooth_scroll->operation_id == smooth_scroll.operation_id) {
@@ -7361,6 +7405,22 @@ bool LocalNavigable::set_scroll_offset_for_user_input(Layout::Node& scrolling_bo
     if (did_scroll && has_compositor_context())
         request_scroll_jump(stable_node_id, ScrollTrigger::UserInput);
     return did_scroll;
+}
+
+void LocalNavigable::set_scroll_offset_settled_by_layout(Layout::Node& scrolling_box, CSSPixelPoint scroll_offset)
+{
+    // NB: The compositor keeps the box in the same scroll range as it takes in the frame of this layout, from wherever
+    //     the user has scrolled it since. A jump to the offset this thread knows would take that scroll back.
+    TemporaryChange compositor_keeps_the_box_in_range { m_scroll_offset_changes_need_no_request, true };
+    (void)Painting::set_scroll_offset(scrolling_box, scroll_offset);
+}
+
+u64 LocalNavigable::compositor_user_input_scroll_count() const
+{
+    u64 count = 0;
+    for (auto const& entry : m_compositor_user_input_scroll_counts)
+        count += entry.value;
+    return count;
 }
 
 void LocalNavigable::did_change_scroll_offset(Web::AsyncScrollNodeStableID stable_node_id)

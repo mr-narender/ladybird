@@ -716,9 +716,6 @@ impl CustomPropertyRegistry {
             ) => Some(parse_substituted_value(
                 parse_context,
                 property_id::CUSTOM,
-                // NB: The value keeps this text alone and tokenizes it where it is read, so it is the
-                //     serialization that tokenizes back to the components.
-                &serialize_component_values_to_utf16(&components, ComponentSerializationMode::Retokenize),
                 &components,
                 contains_attr_tainted_values,
             )),
@@ -995,6 +992,12 @@ impl CustomPropertyStore {
             .or_else(|| self.parent.as_ref()?.get(name_raw))
     }
 
+    /// The names of the values the store, or a store it is built over, holds. A name can come more than once.
+    pub(crate) fn held_names(&self) -> impl Iterator<Item = &Utf16FlyString> {
+        std::iter::successors(Some(self), |store| store.parent.as_deref())
+            .flat_map(|store| store.own_values.values().map(|entry| &entry.name))
+    }
+
     /// Whether the store, or a store it is built over, holds a value of `name`.
     pub(crate) fn holds(&self, name: &Utf16FlyString) -> bool {
         self.get_by_name_with_owner(name).is_some()
@@ -1195,9 +1198,8 @@ const MAX_SUBSTITUTION_RECURSION_DEPTH: u32 = 64;
 
 pub(crate) enum NativeVarResolution {
     Resolved {
-        /// The substituted components, serialized to tokenize back to them where comments only keep
-        /// tokens apart.
-        source: Vec<u16>,
+        /// The substituted components.
+        components: ComponentValueList,
         contains_attr_tainted_values: bool,
     },
     Invalid,
@@ -2747,12 +2749,15 @@ pub(crate) fn evaluate_retained_container_style_feature(
     length_resolution_context: &crate::css::style_compute::FfiLengthResolutionContext,
     color_resolution_input: crate::css::color_resolution::ColorResolutionInput<'_>,
     tree_counting: Option<(u64, u64)>,
+    read_sibling_position: &mut bool,
 ) -> MatchResult {
+    let mut dependencies = None;
     let mut context = ASFResolutionContext {
         inheritance_store: store.and_then(|store| store.inheritance_parent.as_deref()),
         style_query_length_resolution_context: Some(length_resolution_context),
         style_query_color_resolution_input: Some(color_resolution_input),
         style_query_tree_counting: tree_counting,
+        style_query_dependencies: Some(&mut dependencies),
         ..Default::default()
     };
     let registry = Some(registry);
@@ -2763,6 +2768,8 @@ pub(crate) fn evaluate_retained_container_style_feature(
         }
         StyleFeature::Range { .. } => evaluate_style_range(store, registry, feature, &mut context, 0),
     };
+    *read_sibling_position |=
+        dependencies.is_some_and(|dependencies: Box<StyleQueryDependencies>| dependencies.sibling_position);
     match result {
         ConditionEvaluation::Match(true) => MatchResult::True,
         ConditionEvaluation::Match(false) => MatchResult::False,
@@ -3807,8 +3814,8 @@ pub(crate) fn resolve_vars(
     match result {
         // A custom property carries its taint to the values that substitute it; another property is invalid where a
         // tainted value reaches a URL.
-        TokenResolution::Resolved(tokens) => NativeVarResolution::Resolved {
-            source: serialize_component_values_to_utf16(&tokens, ComponentSerializationMode::Retokenize),
+        TokenResolution::Resolved(components) => NativeVarResolution::Resolved {
+            components,
             contains_attr_tainted_values: if property_id == crate::css::property_metadata::property_id::CUSTOM {
                 context.contains_attr_tainted_values
             } else {

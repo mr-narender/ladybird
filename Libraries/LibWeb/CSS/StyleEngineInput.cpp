@@ -8,6 +8,7 @@
 #include <AK/QuickSort.h>
 #include <AK/SetUnion.h>
 #include <AK/TemporaryChange.h>
+#include <LibGC/ConservativeVector.h>
 #include <LibGC/RootHashTable.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/CSS/CSSAnimation.h>
@@ -15,6 +16,7 @@
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
 #include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
 #include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
 #include <LibWeb/CSS/Selector.h>
@@ -65,7 +67,32 @@
 namespace Web::CSS {
 
 static void record_element_heading_level(DOM::Element&);
-static void record_element_initial_features(DOM::Element&);
+
+// The directionalities of the elements on the way from the root to the one published last, as far as they were published
+// in this batch. A batch comes mostly in tree order, so most elements find their parent's here and don't walk to the root.
+class PublishedDirectionalities {
+public:
+    DOM::Element::Directionality publish(DOM::Element const& element)
+    {
+        auto const* parent = element.parent_or_shadow_host_element();
+        while (!m_elements_to_parent.is_empty() && m_elements_to_parent.last().element.ptr() != parent)
+            m_elements_to_parent.take_last();
+        auto directionality = element.directionality_unless_from_parent().value_or_lazy_evaluated([&] {
+            return m_elements_to_parent.is_empty() ? element.directionality() : m_elements_to_parent.last().directionality;
+        });
+        m_elements_to_parent.append({ element, directionality });
+        return directionality;
+    }
+
+private:
+    struct Row {
+        GC::Ptr<DOM::Element const> element;
+        DOM::Element::Directionality directionality;
+    };
+    GC::ConservativeVector<Row, 32> m_elements_to_parent;
+};
+
+static void record_element_initial_features(DOM::Element&, PublishedDirectionalities&);
 static void record_element_inline_style_properties(DOM::Element&);
 static void record_heading_levels_in_subtree(DOM::Element&);
 static void republish_assigned_slots_of(ReadonlySpan<GC::Ref<DOM::Node>>);
@@ -96,7 +123,7 @@ static StyleEngine* style_engine_for_identified(DOM::Element& element)
 static StyleEngine* style_engine_for_published(DOM::Element& element)
 {
     auto* style_engine = style_engine_for_identified(element);
-    return style_engine && !style_engine->has_deferred_element_initial_features(element.style_node_id()) ? style_engine : nullptr;
+    return style_engine && !element.initial_style_features_pending() ? style_engine : nullptr;
 }
 
 // A relation is only nameable if the element on its other end already has an identity. Naming a
@@ -321,27 +348,34 @@ static void record_element_relinked(StyleEngine& style_engine, StyleNodeID node,
 
 void publish_pending_element_features(StyleEngine& style_engine, StyleComputer& style_computer, Layout::BegunRead const& read)
 {
-    auto nodes = style_engine.take_deferred_element_initial_features().values();
+    auto nodes = style_engine.take_deferred_element_initial_features();
     // What the engine reads decides what of the elements is withheld from it, which the host asks the engine where a
     // rule it queued since its last job leaves it not knowing.
     if (!nodes.is_empty())
         StyleEngineFFI::document_host_learn_selector_requirements(style_engine.host(), &read);
-    // Feature postings are ordered by node identity. Publish arrivals in that order so growing
-    // their indexes appends members instead of repeatedly searching and splitting posting chunks.
-    quick_sort(nodes);
+    PublishedDirectionalities directionalities;
     for (auto node : nodes) {
         auto element = style_computer.element_for_style_node(node);
-        if (!element)
+        // NB: An element that left the tree gave up its mark. Its identity may have gone to an element since, which is
+        //     then listed twice and published at the first.
+        if (!element || !element->initial_style_features_pending())
             continue;
         // An inserted subtree takes its identities before its insertion steps mark its nodes connected, in tree order.
         // A step that submits the recorded input on the way, as a <style> writing its sheet to the engine in place
         // while a style update flies, finds the elements after it unconnected: their arrivals are submitted, and
         // their features wait for the next submit, which folds them onto those arrivals.
         if (!element->is_connected()) {
-            style_engine.defer_element_initial_features(node);
+            style_engine.defer_element_initial_features(*element);
             continue;
         }
-        record_element_initial_features(*element);
+        element->set_initial_style_features_pending(false);
+        record_element_initial_features(*element, directionalities);
+    }
+    // NB: A tag read now may not be final, as an XML parser sets attributes after insertion, so none is left cached. They
+    //     stay for the length of this loop, as the batch itself changes no tag and each element reads its parent's.
+    for (auto node : nodes) {
+        if (auto element = style_computer.element_for_style_node(node))
+            element->invalidate_lang_value();
     }
 }
 
@@ -715,7 +749,7 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
                 .node = element->style_node_id().value(),
                 .relations = relations_of(*element, style_engine, arrival.tree_scope),
             });
-            style_engine.defer_element_initial_features(element->style_node_id());
+            style_engine.defer_element_initial_features(*element);
         }
         style_engine.record_element_arrivals(arriving_elements.span());
         for (auto const& slottable : slottables_identified_earlier)
@@ -1011,7 +1045,7 @@ static u8 associated_pseudo_kind_plus_one(DOM::Element const& element)
 // An element arrives with facts already true of it, and the engine has heard none of them. They are
 // published as ordinary deltas from absent, so the projection learns them by exactly the same path
 // later mutations take rather than by a second one.
-static void publish_element_selector_features(StyleEngine& style_engine, DOM::Element& element)
+static void publish_element_selector_features(StyleEngine& style_engine, DOM::Element& element, PublishedDirectionalities& directionalities)
 {
     auto node = element.style_node_id();
     // Everything the element's selectors test arrives as one row, which the engine writes in one go.
@@ -1035,7 +1069,7 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
     for (auto const& [name, value] : element.attribute_list()) {
         auto name_atom = style_engine.intern_attribute_name(name.local_name(), name.namespace_());
         if (style_engine.attribute_is_known_unread(name_atom)) {
-            style_engine.note_attribute_withheld(name.local_name(), name.namespace_(), node);
+            style_engine.note_attribute_withheld(name.local_name(), name.namespace_());
             continue;
         }
         attributes.append(name_atom);
@@ -1053,28 +1087,30 @@ static void publish_element_selector_features(StyleEngine& style_engine, DOM::El
     auto ask_local_link = SelectorMatching::AskLocalLink::Yes;
     if (element.matches_link_pseudo_class() && style_engine.local_link_is_known_untested()) {
         ask_local_link = SelectorMatching::AskLocalLink::No;
-        style_engine.note_local_link_state_withheld(node);
+        style_engine.note_local_link_state_withheld();
     }
-    auto states = SelectorMatching::element_states(element, ask_local_link);
+    auto ask_validity = SelectorMatching::AskValidity::Yes;
+    if (SelectorMatching::element_can_have_validity(element) && style_engine.validity_is_known_untested()) {
+        ask_validity = SelectorMatching::AskValidity::No;
+        style_engine.note_validity_state_withheld();
+    }
+    auto states = SelectorMatching::element_states(element, ask_local_link, ask_validity);
     u64 state_bits = 0;
-    for (size_t index = 0; index < to_underlying(PseudoClass::__Count); ++index) {
-        auto pseudo_class = static_cast<PseudoClass>(index);
+    states.for_each_set([&](PseudoClass pseudo_class) {
         // The engine's hover chain holds `:hover`, which the hover follows to an element that arrives hovered.
-        if (pseudo_class == PseudoClass::Hover || !states.get(pseudo_class))
-            continue;
+        if (pseudo_class == PseudoClass::Hover)
+            return;
         if (auto fact = state_fact_for(pseudo_class); fact.has_value())
             state_bits |= static_cast<u64>(1) << to_underlying(*fact);
-    }
+    });
 
-    // The tag is computed afresh and not left cached. One cached where the element used to be says nothing about where
-    // it arrives, as a subtree that moves while detached is never reached by the walk a `lang` change runs, and one
-    // read now may not be final, as an XML parser sets attributes after insertion.
+    // The tag is computed afresh. One cached where the element used to be says nothing about where it arrives, as a
+    // subtree that moves while detached is never reached by the walk a `lang` change runs.
     element.invalidate_lang_value();
     auto const language = element.lang_view();
     auto language_atom = language.has_value() ? style_engine.intern_language_atom(*language) : StyleAtomID {};
-    auto const directionality = element.directionality() == DOM::Element::Directionality::Rtl ? "rtl"_utf16_fly_string : "ltr"_utf16_fly_string;
+    auto const directionality = directionalities.publish(element) == DOM::Element::Directionality::Rtl ? "rtl"_utf16_fly_string : "ltr"_utf16_fly_string;
     auto directionality_atom = style_engine.intern_atom(directionality);
-    element.invalidate_lang_value();
 
     GC::Ptr<HTML::HTMLHeadingElement const> heading = as_if<HTML::HTMLHeadingElement>(element);
     auto heading_level = static_cast<u8>(min(heading ? heading->heading_level() : 0, 255u));
@@ -1146,12 +1182,7 @@ static bool element_has_presentational_hints_to_publish(DOM::Element const& elem
             && (navigable->container()->has_attribute(HTML::AttributeNames::marginwidth) || navigable->container()->has_attribute(HTML::AttributeNames::marginheight)))
             return true;
     }
-    bool has_presentational_hint = false;
-    element.for_each_attribute([&](Utf16FlyString const& name, Utf16View) {
-        if (!has_presentational_hint && element.is_presentational_hint(name))
-            has_presentational_hint = true;
-    });
-    return has_presentational_hint;
+    return any_of(element.attribute_list(), [&](auto const& attribute) { return element.is_presentational_hint(attribute.name.as_string()); });
 }
 
 // The element facts the style computation's box-type transformation and element style adjustments
@@ -1585,56 +1616,49 @@ void record_element_construction_facts(DOM::Element& element)
 void publish_withheld_element_features(StyleEngine& style_engine, StyleComputer& style_computer, Layout::BegunRead const& read)
 {
     auto now_read = style_engine.take_withheld_features_now_read(read);
-    if (now_read.local_link_states.is_empty() && now_read.attributes.is_empty())
+    if (!now_read.local_link_state && !now_read.validity_state && now_read.attributes.is_empty())
         return;
-    auto element_holding = [&](StyleNodeID node) -> GC::Ptr<DOM::Element> {
-        auto element = style_computer.element_for_style_node(node);
-        if (!element || !element->is_connected() || element->style_node_id() != node)
-            return nullptr;
-        return element;
-    };
     auto local_link = state_fact_for(PseudoClass::LocalLink);
     VERIFY(local_link.has_value());
-    for (auto node : now_read.local_link_states) {
-        if (auto element = element_holding(node); element && element->matches_local_link_pseudo_class())
+    struct NameNowRead {
+        StyleEngine::WithheldAttributeName name;
+        StyleAtomID atom;
+    };
+    Vector<NameNowRead, 2> names_now_read;
+    names_now_read.ensure_capacity(now_read.attributes.size());
+    for (auto const& name : now_read.attributes)
+        names_now_read.unchecked_append({ name, style_engine.intern_attribute_name(name.local_name, name.namespace_uri) });
+    // NB: A name comes to be read once in a document's life, so nothing is kept per element for it. An element whose
+    //     initial features still wait reads the names as they are by then.
+    style_computer.for_each_element_with_style_node([&](DOM::Element& element) {
+        if (!element.is_connected() || element.initial_style_features_pending())
+            return;
+        auto node = element.style_node_id();
+        if (now_read.local_link_state && element.matches_local_link_pseudo_class())
             style_engine.record_state_delta({ .node = node.value(), .fact = *local_link, .new_value = true });
-    }
-    // Each element is asked once about every name now read that was withheld from it.
-    HashMap<StyleNodeID, Vector<StyleEngine::WithheldAttributeName, 2>> names_by_carrier;
-    for (auto const& [name, carriers] : now_read.attributes) {
-        for (auto node : carriers)
-            names_by_carrier.ensure(node).append(name);
-    }
-    for (auto const& [node, names] : names_by_carrier) {
-        auto element = element_holding(node);
-        if (!element)
-            continue;
-        Vector<StyleEngine::WithheldAttributeName, 2> names_gone = names;
-        element->for_each_attribute([&](DOM::QualifiedName const& name, Utf16String const& value) {
-            StyleEngine::WithheldAttributeName withheld { name.local_name(), name.namespace_() };
-            if (!names.contains_slow(withheld))
-                return;
-            names_gone.remove_all_matching([&](auto const& gone) { return gone == withheld; });
-            auto name_atom = style_engine.intern_attribute_name(name.local_name(), name.namespace_());
-            style_engine.record_local_feature_delta({
-                .node = node.value(),
-                .feature_kind = StyleEngineFFI::FfiFeatureKind::Attribute,
-                .name_atom = name_atom.value(),
-                .new_kind = StyleEngineFFI::FfiFeatureValueKind::Atom,
-                .new_atom = style_engine.intern_attribute_value(name_atom, value).value(),
-            });
-        });
-        // NB: The row may hold a value published before the name was known to be unread, of an attribute removed since.
-        for (auto const& name : names_gone) {
-            style_engine.record_local_feature_delta({
-                .node = node.value(),
-                .feature_kind = StyleEngineFFI::FfiFeatureKind::Attribute,
-                .name_atom = style_engine.intern_attribute_name(name.local_name, name.namespace_uri).value(),
-                .new_kind = StyleEngineFFI::FfiFeatureValueKind::Absent,
-                .new_atom = 0,
-            });
+        if (now_read.validity_state && SelectorMatching::element_can_have_validity(element))
+            Invalidation::record_validity_states(element);
+        for (auto const& [name, atom] : names_now_read) {
+            if (auto value = element.get_attribute_ns(name.namespace_uri, name.local_name); value.has_value()) {
+                style_engine.record_local_feature_delta({
+                    .node = node.value(),
+                    .feature_kind = StyleEngineFFI::FfiFeatureKind::Attribute,
+                    .name_atom = atom.value(),
+                    .new_kind = StyleEngineFFI::FfiFeatureValueKind::Atom,
+                    .new_atom = style_engine.intern_attribute_value(atom, *value).value(),
+                });
+            } else if (StyleEngineFFI::style_engine_row_holds_attribute(style_engine.host(), node.value(), atom.value())) {
+                // NB: The row holds a value published before the name was known to be unread, of an attribute removed since.
+                style_engine.record_local_feature_delta({
+                    .node = node.value(),
+                    .feature_kind = StyleEngineFFI::FfiFeatureKind::Attribute,
+                    .name_atom = atom.value(),
+                    .new_kind = StyleEngineFFI::FfiFeatureValueKind::Absent,
+                    .new_atom = 0,
+                });
+            }
         }
-    }
+    });
 }
 
 // The atom an id or class name is published under. A quirks-mode document matches those selectors
@@ -1647,13 +1671,13 @@ static StyleAtomID intern_id_or_class_atom(StyleEngine& style_engine, DOM::Eleme
     return style_engine.intern_atom(name);
 }
 
-static void record_element_initial_features(DOM::Element& element)
+static void record_element_initial_features(DOM::Element& element, PublishedDirectionalities& directionalities)
 {
     auto* style_engine = style_engine_for_identified(element);
     if (!style_engine)
         return;
 
-    publish_element_selector_features(*style_engine, element);
+    publish_element_selector_features(*style_engine, element, directionalities);
 
     if (auto const& id = element.id(); id.has_value())
         StyleEngineFFI::style_engine_set_element_id_name(style_engine->host(), element.style_node_id(), style_engine->intern_atom(*id));
@@ -1876,7 +1900,7 @@ static void record_element_disconnecting(DOM::Element& element, TreeScopeID tree
         }
     }
 
-    style_engine->cancel_deferred_element_initial_features(node);
+    style_engine->cancel_deferred_element_initial_features(element);
 
     style_engine->record_tree_delta({
         .node = node.value(),
@@ -3143,6 +3167,15 @@ void record_stylesheet_detached(StyleSheetState& sheet, DOM::Node& document_or_s
 // inputs the engine already routes, not with a state transition published here.
 #include <LibWeb/StyleEngineStateFactsGenerated.inc>
 
+bool element_validity_is_withheld(DOM::Element& element)
+{
+    auto* style_engine = style_engine_for(element);
+    if (!style_engine || !style_engine->validity_is_known_untested())
+        return false;
+    style_engine->note_validity_state_withheld();
+    return true;
+}
+
 bool can_record_element_state_change(DOM::Element& element)
 {
     // A state an element waiting in a display:none subtree takes matters where a `:has()` argument may reach the
@@ -3324,7 +3357,7 @@ void record_element_attribute_changed(DOM::Element& element, Utf16FlyString cons
     // OPTIMIZATION: Nothing of the engine reads this name, so the element's row need not hear of the change. The element
     //               is noted as an arrival withholding the name is, and is published if something comes to read it.
     if (style_engine->attribute_is_known_unread(atom)) {
-        style_engine->note_attribute_withheld(name, namespace_uri, element.style_node_id());
+        style_engine->note_attribute_withheld(name, namespace_uri);
         return;
     }
     auto kind_of = [](Optional<Utf16String> const& value) {
