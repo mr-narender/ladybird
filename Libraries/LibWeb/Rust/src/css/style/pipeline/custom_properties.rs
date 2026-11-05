@@ -274,6 +274,9 @@ impl RetainedState {
             computed.reads.environment_reads |= crate::css::style::input_types::StyleEnvironment::COLOR_SCHEME;
         }
         if reads.viewport {
+            computed
+                .facts
+                .add_dependency_flags(crate::css::computed_longhand_table::DEPENDS_ON_VIEWPORT_METRICS);
             computed.reads.environment_reads |= crate::css::style::input_types::StyleEnvironment::VIEWPORT;
         }
         computed.element_dependent |= reads.sibling_position || reads.container_unit_mask != 0;
@@ -452,7 +455,6 @@ impl RetainedState {
             .filter(|(_, all_visible)| *all_visible)
             .and_then(|(names, _)| {
                 names
-                    .iter()
                     .map(|name| {
                         stores.own.map_or(Some(0), |store| {
                             store.resolved_value_identity(&ak::Utf16FlyString::from_utf16(name))

@@ -146,6 +146,18 @@ public:
         Paragraph,
     };
     bool is_handling_mouse_selection() const { return m_selection_mode != SelectionMode::None; }
+
+    // What a clock lane reads of a drag selecting the page's text by characters, which it shows beside a task.
+    struct SelectionDragForLanes {
+        CSS::StyleNodeID anchor;
+        // Where the anchor is a text node, the offset in its text.
+        size_t anchor_offset { 0 };
+        // Where the anchor is an element, the first child after the boundary point that the lane knows of.
+        CSS::StyleNodeID anchor_child;
+        Optional<CSSPixelRect> scrollport;
+    };
+    Optional<SelectionDragForLanes> selection_drag_for_lanes(Layout::BegunRead const&) const;
+
     void reset_mouse_input_tracking(Badge<Page>);
     void reset_hover_for_document_replacement(Badge<HTML::LocalNavigable>);
 
@@ -259,6 +271,9 @@ private:
     bool maybe_request_paste_for_middle_click(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position);
 
     Optional<Painting::CaretPosition> prepare_mouse_selection(DOM::Document&, CSSPixelPoint visual_viewport_position);
+    Optional<Painting::CaretPosition> caret_position_for_mouse_selection(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position, GC::Ptr<DOM::Node> editable_hit_node_before_focus, GC::Ptr<DOM::Node> editing_host_before_focus);
+    bool dispatch_selectstart_event(DOM::Document&, DOM::Node& target);
+    bool fire_selectstart_event(Layout::BegunRead const& read, DOM::Document&, CSSPixelPoint visual_viewport_position, Optional<Painting::CaretPosition>&, CSS::UserSelect&);
     bool initiate_character_selection(DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect, bool shift_held);
     bool initiate_word_selection(Layout::BegunRead const& read, DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect);
     bool initiate_paragraph_selection(DOM::Document&, Painting::CaretPosition const&, CSS::UserSelect);
@@ -277,7 +292,11 @@ private:
     void clear_mousedown_tracking();
     void stop_updating_selection();
 
-    void update_hover_after_scroll(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target = {}, Optional<i64> visual_animation_sample_time_nanoseconds = {});
+    enum class HoverUpdateCause : u8 {
+        PointerMoved,
+        PointerRests,
+    };
+    void update_hover_after_scroll(HoverUpdateCause, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target = {}, Optional<i64> visual_animation_sample_time_nanoseconds = {});
     EventResult dispatch_wheel_event(Layout::BegunRead const& read, Layout::Node&, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, double wheel_delta_x, double wheel_delta_y, double wheel_tick_120ths_x, double wheel_tick_120ths_y, bool is_cancelable);
     // Both drop the latch when what it refers to is gone from the document, so that the event is targeted afresh.
     Layout::Node* validated_latched_wheel_event_target_layout_node(Layout::BegunRead const& read, DOM::Document&);

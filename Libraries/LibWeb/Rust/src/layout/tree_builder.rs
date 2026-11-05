@@ -2288,6 +2288,7 @@ fn update_principal_node_descendants(
         // Add the ::before pseudo-element before walking normal children.
         if update.kind.is_element()
             && layout_node_can_have_children
+            && box_can_have_generated_children(host, update.mirror_identity, layout_node)
             && !content_visibility_hidden
             && !context.has_svg_root
         {
@@ -2499,7 +2500,10 @@ fn update_principal_node_descendants(
         }
     }
 
-    if update.update_pseudo_elements_in_place && !should_create_layout_node {
+    if update.update_pseudo_elements_in_place
+        && !should_create_layout_node
+        && box_can_have_generated_children(host, update.mirror_identity, layout_node)
+    {
         state.ancestor_stack.push(layout_node);
         let placed = create_pseudo_element(
             host,
@@ -2544,15 +2548,39 @@ fn create_marker_and_after_boxes(
         );
         assert!(placed.is_none());
     }
-    let placed = create_pseudo_element(
-        host,
-        state,
-        element,
-        FfiPseudoElement::After,
-        Some(FfiInsertionMode::Append),
-    );
-    assert!(placed.is_none());
+    if box_can_have_generated_children(host, element, layout_node) {
+        let placed = create_pseudo_element(
+            host,
+            state,
+            element,
+            FfiPseudoElement::After,
+            Some(FfiInsertionMode::Append),
+        );
+        assert!(placed.is_none());
+    }
     assert!(state.ancestor_stack.pop().is_some());
+}
+
+/// Whether the box of `element` can hold the boxes of its ::before and ::after pseudo-elements. A form control whose
+/// content the user agent supplies holds none: a text control, a range input, an input element shown as a button, or a
+/// select.
+fn box_can_have_generated_children(host: &TreeBuilderHost<'_>, element: StyleNodeID, layout_node: LayoutNode) -> bool {
+    use crate::css::style::bridge::element_construction_fact::IS_HTML_SELECT_ELEMENT;
+    let data = host.data(layout_node);
+    if matches!(
+        data.kind.get(),
+        NodeKind::TextInputBox | NodeKind::TextAreaBox | NodeKind::RangeInputBox
+    ) {
+        return false;
+    }
+    if node_facts::has_flag(data, NodeFlag::IsHtmlInputElement)
+        && node_facts::has_flag(data, NodeFlag::UsesButtonLayout)
+    {
+        return false;
+    }
+    !host
+        .arena()
+        .with_style_store(|engine| engine.element_construction_facts(element) & IS_HTML_SELECT_ELEMENT != 0)
 }
 
 /// Empties the child list of a box that keeps its place while its children are placed again: frees the element's
@@ -3565,7 +3593,10 @@ fn stamp_nested_list_marker_row(
     generator: StyleNodeID,
     pseudo_element: FfiPseudoElement,
     list_item_box: NodeSlotId,
-) -> NodeSlotId {
+) -> Option<NodeSlotId> {
+    let list_item_shows_its_type = host
+        .style(list_item_box)
+        .is_some_and(|style| !style.list_style_type_is_none());
     let derived = host.arena_mut().with_style_engine(|engine| {
         // The generator's own `::marker` record, which the engine derives for this read alone where the generator
         // holds none. It answers one for every list item; should it not, the marker takes the generator's style.
@@ -3581,10 +3612,18 @@ fn stamp_nested_list_marker_row(
             })
             .or_else(|| engine.element_published_style_record(generator))
             .expect("a list item the build reaches has published its style");
+        // As for an element's ::marker, the marker shows its own list-style-image, or else the list item's
+        // list-style-type, which shows nothing where it's none. Where neither shows anything, there's no marker.
+        let marker_shows_its_image = engine
+            .style_record_view(record)
+            .is_some_and(|view| ComputedValuesView::of(view.payloads).list_style_image_is_set());
+        if !marker_shows_its_image && !list_item_shows_its_type {
+            return None;
+        }
         // NB: Republishing the generator's own `::marker` record can retire its animation record while the nested
         //     marker still refers to it. The marker takes a record of its own, copied from it.
-        LayoutStyle::from_record(engine, record).intern(engine)
-    });
+        Some(LayoutStyle::from_record(engine, record).intern(engine))
+    })?;
     let slot = host.arena.allocate_unbound();
     host.arena_mut()
         .stamp_anonymous_box(slot, NodeKind::ListItemMarkerBox, derived);
@@ -3602,7 +3641,7 @@ fn stamp_nested_list_marker_row(
             owns_content_replacement_image: false,
         },
     );
-    slot
+    Some(slot)
 }
 
 /// The row one item of a pseudo-element's generated content is built in, and its layout node. An
@@ -3761,8 +3800,10 @@ fn create_pseudo_element(
     let owner = resolve_counters(host, element_identity, pseudo_element);
 
     // FIXME: This code actually computes style for element::marker, and shouldn't for element::pseudo::marker.
-    if layout_node_kind == NodeKind::ListItemBox {
-        let marker_slot = stamp_nested_list_marker_row(host, element_identity, pseudo_element, layout_node);
+    let nested_marker_slot = (layout_node_kind == NodeKind::ListItemBox)
+        .then(|| stamp_nested_list_marker_row(host, element_identity, pseudo_element, layout_node))
+        .flatten();
+    if let Some(marker_slot) = nested_marker_slot {
         let marker = host.created(marker_slot);
         let first_child = host.first_child(layout_node);
         host.attach_child(layout_node, marker, first_child);
@@ -3948,6 +3989,30 @@ pub(crate) fn node_kind_is_node_with_style(kind: NodeKind) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn layout_node_kind_is_replaced_box(kind: NodeKind) -> bool {
     node_facts::kind_is_replaced_box(kind)
+}
+
+/// Whether a box of `kind`, built for an element whose style was `built_for`, can show the style `style` as it is. A box
+/// whose kind its display decided can't show a display that asks for another kind of box: the layout tree update that
+/// the display change marks replaces it, and until then it keeps the style it was built for.
+///
+/// # Safety
+/// Each of `built_for` and `style` is null or the groups of a style record the caller keeps alive for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_box_can_show_style(
+    kind: NodeKind,
+    built_for: *const std::ffi::c_void,
+    style: *const std::ffi::c_void,
+) -> bool {
+    use super::node_data::LayoutStyleRef;
+    // SAFETY: Guaranteed by the caller.
+    let (Some(built_for), Some(style)) = (unsafe { LayoutStyleRef::from_raw(built_for) }, unsafe {
+        LayoutStyleRef::from_raw(style)
+    }) else {
+        return true;
+    };
+    // SAFETY: Guaranteed by the caller.
+    let (built_for, style) = unsafe { (built_for.view().display(), style.view().display()) };
+    node_kind_for_display(built_for) != Some(kind) || node_kind_for_display(style) == Some(kind)
 }
 
 #[unsafe(no_mangle)]

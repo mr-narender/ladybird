@@ -56,8 +56,8 @@ ALLOWED_REALM_MENTIONS = {
     ),
     "FileAPI": (2, 9, "Blob glue still creates streams and buffers in selected realms"),
     "HTML": (
-        63,
-        185,
+        61,
+        179,
         "HTML algorithms still contain structured serialization, including posted-message preparation, canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; RemoteWindow mirrors Window's postMessage; "
         "the C++ glue of the Rust structured serialization creates platform objects and SharedArrayBuffers in a given realm",
     ),
@@ -67,7 +67,7 @@ ALLOWED_REALM_MENTIONS = {
         "the C++ glue of the Rust IndexedDB creates the factory in a global's realm and wraps values in a given realm",
     ),
     "Infra": (2, 13, "JSON parse/serialization helpers still expose JS values in selected realms"),
-    "Internals": (3, 3, "test-only internals still expose JS-facing helper objects and promises"),
+    "Internals": (1, 1, "test-only internals still expose JS-facing helper objects and promises"),
     "SVG": (2, 8, "SVG length objects still store/use realms for detached/reflected JS/CSS materialization"),
     "ServiceWorker": (
         6,
@@ -89,7 +89,7 @@ ALLOWED_REALM_MENTIONS = {
         "WebAudio buffers, AudioParamMap, and AudioWorklet APIs still materialize JS buffers and callback/promise values in selected realms",
     ),
     "WebDriver": (2, 7, "WebDriver execute/JSON conversion still materializes JS values for automation"),
-    "WebGL": (4, 9, "WebGL contexts are created in the realm of their canvas, and their events and promises in it"),
+    "WebGL": (4, 8, "WebGL contexts are created in the realm of their canvas, and their events in it"),
     "WebLocks": (6, 7, "Web Locks queue/callback algorithms still use callback and promise realms"),
     "WebRTC": (
         13,
@@ -97,7 +97,7 @@ ALLOWED_REALM_MENTIONS = {
         "peer connections, data channels and senders resolve promises and fire events in their relevant realm, encoded "
         "frames are constructed and deserialized in the worker's realm, and the stats report's maplike glue",
     ),
-    "XHR": (4, 7, "XHR/FormData/FileReader-style paths still materialize JS values and events"),
+    "XHR": (3, 3, "XHR/FormData/FileReader-style paths still materialize JS values and events"),
 }
 
 

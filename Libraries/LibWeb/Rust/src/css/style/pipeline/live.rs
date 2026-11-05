@@ -155,6 +155,9 @@ pub(in super::super) struct Live {
     /// is not displayed: the host asks for the styles of the SVG resources such a subtree holds,
     /// which paint wherever they are referenced, and of its elements with animations.
     pub(super) kept_hidden: Vec<StyleNodeID>,
+    /// Which records computed for `kept_hidden` still stand, so that an installation computes
+    /// only those something could have moved.
+    pub(super) kept_hidden_records: ForkReset<super::demand::KeptHiddenRecords>,
 }
 
 /// What passes and the invalidation of transactions work in, which holds nothing between them.
@@ -163,9 +166,9 @@ struct LiveScratch {
     /// The cells passes write their records to.
     cells: RecordCells,
     /// What a changed element matches, by thread, for the threads that followed a change.
-    memos: super::pool::PerThread<FollowScratch>,
+    memos: super::per_thread::PerThread<FollowScratch>,
     /// The group caches the passes keep for the next, by thread, for the threads that styled.
-    groups: super::pool::PerThread<super::compute::GroupCache>,
+    groups: super::per_thread::PerThread<super::compute::GroupCache>,
     /// The matched declarations cache the passes keep for the next.
     matched_declarations: super::matched_declarations::MatchedDeclarationsCache,
     /// The inputs of the document the entries of the matched declarations cache read, as they
@@ -436,6 +439,15 @@ struct MatchedDeclarationsInputs {
 }
 
 impl MatchedDeclarationsInputs {
+    /// Whether these inputs differ from `other` in nothing but the size of the viewport, which the
+    /// records reading it name.
+    fn same_besides_viewport(&self, other: &Self) -> bool {
+        Self {
+            viewport: other.viewport,
+            ..*self
+        } == *other
+    }
+
     fn of(inputs: &super::super::bridge::FfiDocumentStyleComputationInputs) -> Self {
         Self {
             initial_style: InitialStyleInputs::of(inputs),
@@ -544,6 +556,18 @@ impl Live {
             self.scratch.matched_declarations.forget();
         }
         let changes = state.projection.changes();
+        if transaction.restyles_everything {
+            self.kept_hidden_records.forget();
+        } else {
+            self.kept_hidden_records.note_environment_moved(transaction.environment);
+        }
+        self.kept_hidden_records
+            .note_moved(transaction.style_inputs.iter().map(|&(node, _)| node));
+        self.kept_hidden_records
+            .note_left(changes.iter().filter_map(|&(node, change)| match change {
+                ElementChange::Relations(_, None) => Some(node),
+                _ => None,
+            }));
         if transaction.has_no_element_inputs() && changes.is_empty() && transaction.rule_changes.is_empty() {
             return;
         }
@@ -569,6 +593,23 @@ impl Live {
             self.invalidate(state, transaction, changes);
         }
         self.bump(LiveField::InvalidationNanoseconds, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Note what no pass tells of the hints: a pass styles the elements holding a record and tells
+    /// whether their children compute from something else, but not those below an element that is
+    /// not displayed, or what restyling descendants reaches.
+    pub(super) fn note_hints_moved_kept_hidden_records(&mut self) {
+        let (hints, records, kept) = (&self.hints, &self.records, &mut *self.kept_hidden_records);
+        if !kept.holds_computations() {
+            return;
+        }
+        for &node in &hints.marked {
+            if hints.get(node) & RESTYLE_DESCENDANTS != 0 {
+                kept.note_descendants_moved(node);
+            } else if records.get(node).is_none() || kept.computed(node) {
+                kept.note_moved([node]);
+            }
+        }
     }
 
     /// Whether the next pass has anything to do: an input since the last pass can restyle any
@@ -768,6 +809,7 @@ impl Live {
     /// so what a record names is compared with what it would name now.
     fn note_counter_style_environment_moved(&mut self, state: &RetainedState) {
         self.scratch.matched_declarations.forget();
+        self.kept_hidden_records.forget();
         self.restyle_records_where(state, |_, target, record| {
             record.rare().counter_style_environment_identity
                 != state.values_counter_style_environment_identity(target, |property| record.effective_value(property))
@@ -833,6 +875,7 @@ impl Live {
         }
         self.scratch.matched_declarations.forget();
         let raw: HashSet<usize> = names.iter().map(ak::Utf16FlyString::raw_identity).collect();
+        self.kept_hidden_records.forget();
         let texts: Vec<std::borrow::Cow<'_, [u16]>> = names.iter().map(ak::Utf16FlyString::to_utf16).collect();
         self.restyle_records_where(state, |records, target, record| {
             let node = target.node();
@@ -887,6 +930,10 @@ impl Live {
         }
         let program = &state.rules;
         let kind_of = |rule| program.rule_version(rule).kind;
+        // NB: Only what a style rule declares reaches an element through what it matches.
+        if changes.rules.iter().any(|&rule| kind_of(rule) != RuleKind::Style) {
+            self.kept_hidden_records.forget();
+        }
         let rules_of = |sheet| program.rules_in_sheet(sheet).into_iter().map(kind_of);
         // The `@keyframes` rules that moved, and those that may decide another rule of their name
         // where their scope was reordered.
@@ -943,6 +990,7 @@ impl Live {
     /// substitute something that may.
     fn note_custom_functions_moved(&mut self, state: &RetainedState) {
         self.scratch.matched_declarations.forget();
+        self.kept_hidden_records.forget();
         self.restyle_records_where(state, |_, _, record| {
             record.rare().custom_property_reads == LonghandCustomPropertyReads::Any
                 || record.custom_declarations().is_some_and(|declarations| {
@@ -955,6 +1003,12 @@ impl Live {
 
     pub(super) fn index(&self) -> &RuleIndex {
         &self.index
+    }
+
+    /// Whether a rule of the document's sheets styles `::selection`.
+    pub(in super::super) fn styles_selection(&self) -> bool {
+        self.index
+            .styles_pseudo_element(super::super::publication::pseudo_kind::SELECTION)
     }
 
     #[cfg(test)]
@@ -1694,7 +1748,7 @@ impl Live {
         }
         let by_element = &*by_element;
         const CHANGES_PER_TASK: usize = 8;
-        let pool = state.style_pool.as_ref().and_then(|pool| pool.started());
+        let pool = state.style_layout_pool.as_ref().and_then(|pool| pool.started());
         let follow_all = |chunk: &[std::ops::Range<usize>]| {
             let thread = pool.as_ref().and_then(|pool| pool.current_thread_index());
             let memo = self
@@ -1991,6 +2045,7 @@ impl Live {
     fn rebuild_index(&mut self, state: &RetainedState) {
         let index = RuleIndex::build(&state.rules, state.process_rule_indexes());
         self.counts.note_index_build(&index);
+        self.kept_hidden_records.forget();
         let renumbering = index.renumbering_from(&self.index);
         self.records.renumber_matches(&renumbering);
         self.hints.renumber_reasons(&renumbering);
@@ -2016,6 +2071,7 @@ impl Live {
         let state: &RetainedState = retained;
         let started = Instant::now();
         self.generation += 1;
+        self.note_hints_moved_kept_hidden_records();
         let slot_count = state.projection.element_slot_count();
         self.hints.reserve(slot_count);
         self.scratch.cells.reserve(slot_count);
@@ -2035,6 +2091,14 @@ impl Live {
         let reordered_scopes = std::mem::take(&mut self.reordered_scopes);
         let layered_scopes = std::mem::take(&mut self.layered_scopes);
         let matched_declarations_inputs = MatchedDeclarationsInputs::of(&state.document_style_computation_inputs);
+        if keyframes_moved.is_some()
+            || self
+                .scratch
+                .matched_declarations_inputs
+                .is_none_or(|inputs| !inputs.same_besides_viewport(&matched_declarations_inputs))
+        {
+            self.kept_hidden_records.forget();
+        }
         if rebuilds_index
             || updates_index
             || self.scratch.matched_declarations_inputs != Some(matched_declarations_inputs)
@@ -2061,6 +2125,8 @@ impl Live {
                 },
             );
             self.counts.note_index_update(&self.index, changes.arrived_entries);
+            self.kept_hidden_records
+                .note_rule_index_update(state, &self.index, &self.records, &changes);
             if hinted && !changes.is_empty() {
                 let roots = rule_change_roots(state, root, &changes.scopes);
                 let hints = &mut self.hints;
@@ -2324,6 +2390,19 @@ impl Live {
             &waiting_restyling_descendants,
         );
         self.keep_deferred_hints(&state.projection, &statistics.deferred, &waiting);
+        self.kept_hidden_records
+            .note_moved(statistics.children_moved.iter().copied());
+        // NB: A pass tells nothing of the children of an element that is not displayed, as it walks none of them.
+        let records = &self.records;
+        self.kept_hidden_records.note_moved(
+            statistics
+                .styled
+                .iter()
+                .copied()
+                .filter(|&node| records.get(node).is_none_or(|record| !record.is_displayed())),
+        );
+        self.kept_hidden_records
+            .note_moved(statistics.moved_custom_properties.iter().copied());
         let styled = Instant::now();
         self.bump(LiveField::Passes, 1);
         self.bump(LiveField::FullPasses, u64::from(!hinted));
@@ -4071,7 +4150,7 @@ impl StyleEngine {
         {
             return;
         }
-        self.start_live_style(root, super::pool::threads_from_environment(), true);
+        self.start_live_style(root, crate::style_layout_pool::threads_from_environment(), true);
     }
 
     /// Have the engine own the document under `root` from a cold pass of it, with what the cold
@@ -4104,7 +4183,7 @@ impl StyleEngine {
         // NB: How many threads the machine has is asked once, as the engine starts: the answer reads the
         //     process's CPU affinity and quota from the kernel, which takes longer than a small pass does.
         let threads = match threads {
-            0 => traversal::thread_count() as u32,
+            0 => crate::style_layout_pool::default_thread_count() as u32,
             threads => threads,
         };
         let index = RuleIndex::build(&self.retained.rules, self.retained.process_rule_indexes());
@@ -4147,6 +4226,7 @@ impl StyleEngine {
                 .style_preorder(root)
                 .filter(|&node| self.retained.keeps_style_in_display_none_subtree(node))
                 .collect(),
+            kept_hidden_records: Default::default(),
         }));
         self.retained
             .cold_passes
@@ -4383,7 +4463,7 @@ impl StyleEngine {
 
     fn live_pass_rounds(&mut self, root: StyleNodeID, everything: bool) {
         let threads = self.retained.live_style.as_ref().map_or(0, |live| live.threads);
-        let pool = self.style_pool(threads);
+        let pool = self.style_layout_pool(threads);
         // NB: A thread that first asks for a font resolves it there and then, under a lock, rather than leave it for a
         //     round between all the threads of the pass, each a barrier.
         self.retained.pass_fonts = self

@@ -41,6 +41,7 @@
 use std::collections::HashSet;
 
 use num_bigint::BigInt;
+use num_traits::FromPrimitive;
 use num_traits::One;
 use num_traits::Signed;
 use num_traits::ToPrimitive;
@@ -661,7 +662,8 @@ fn might_contain_assignment_expression(expression: &Expression) -> bool {
         | ExpressionKind::StringLiteral(_)
         | ExpressionKind::BooleanLiteral(_)
         | ExpressionKind::NullLiteral
-        | ExpressionKind::Identifier(_) => false,
+        | ExpressionKind::Identifier(_)
+        | ExpressionKind::PrivateIdentifier(_) => false,
         ExpressionKind::Unary { op: _, operand } => might_contain_assignment_expression(operand),
         ExpressionKind::Binary(data) => {
             might_contain_assignment_expression(&data.lhs) || might_contain_assignment_expression(&data.rhs)
@@ -672,6 +674,19 @@ fn might_contain_assignment_expression(expression: &Expression) -> bool {
         // Conservatively consider everything else, including assignments themselves as potentially
         // assigning.
         _ => true,
+    }
+}
+
+/// Copy a local operand that evaluating any of the later expressions might reassign.
+fn copy_if_reassignable_by<'a>(
+    generator: &mut Generator,
+    operand: ScopedOperand,
+    later: impl IntoIterator<Item = &'a Expression>,
+) -> ScopedOperand {
+    if later.into_iter().any(might_contain_assignment_expression) {
+        generator.copy_if_needed_to_preserve_evaluation_order(&operand)
+    } else {
+        operand
     }
 }
 
@@ -965,7 +980,7 @@ fn generate_member_expression(
         return Some(dst);
     }
     let obj = generate_expression(object, generator, None)?;
-    let obj = generator.copy_if_needed_to_preserve_evaluation_order(&obj);
+    let obj = copy_if_reassignable_by(generator, obj, [property]);
     let base_id = intern_base_identifier(generator, object);
     if computed {
         let property = generate_expression(property, generator, None)?;
@@ -3742,7 +3757,11 @@ fn try_generate_builtin_abstract_operation(
     }
     let arena = generator.arena.clone();
     let name = match &data.callee.inner {
-        ExpressionKind::Identifier(ident) => arena.name_slice(*ident),
+        ExpressionKind::Identifier(ident)
+            if arena.identifiers[*ident].is_global && arena.identifiers[*ident].declaration_kind.is_none() =>
+        {
+            arena.name_slice(*ident)
+        }
         _ => return None,
     };
     if data.arguments.iter().any(|a| a.is_spread) {
@@ -3753,7 +3772,7 @@ fn try_generate_builtin_abstract_operation(
 
     // Operations that map to dedicated bytecode instructions.
     if name == utf16!("IsCallable") {
-        let value = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        let [value] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::IsCallable {
             dst: dst.operand(),
             value: value.operand(),
@@ -3761,7 +3780,7 @@ fn try_generate_builtin_abstract_operation(
         return Some(Some(dst));
     }
     if name == utf16!("IsConstructor") {
-        let value = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        let [value] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::IsConstructor {
             dst: dst.operand(),
             value: value.operand(),
@@ -3769,7 +3788,7 @@ fn try_generate_builtin_abstract_operation(
         return Some(Some(dst));
     }
     if name == utf16!("ToBoolean") {
-        let value = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        let [value] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::ToBoolean {
             dst: dst.operand(),
             value: value.operand(),
@@ -3777,7 +3796,7 @@ fn try_generate_builtin_abstract_operation(
         return Some(Some(dst));
     }
     if name == utf16!("ToObject") {
-        let value = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        let [value] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::ToObject {
             dst: dst.operand(),
             value: value.operand(),
@@ -3785,7 +3804,7 @@ fn try_generate_builtin_abstract_operation(
         return Some(Some(dst));
     }
     if name == utf16!("ToLength") {
-        let value = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        let [value] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::ToLength {
             dst: dst.operand(),
             value: value.operand(),
@@ -3793,20 +3812,22 @@ fn try_generate_builtin_abstract_operation(
         return Some(Some(dst));
     }
     if name == utf16!("ThrowIfNotObject") {
-        let src = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        let [src] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::ThrowIfNotObject { src: src.operand() });
         return Some(Some(dst));
     }
     if name == utf16!("ThrowNotAFunction") {
-        let src = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        let [src] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::ThrowNotAFunction { src: src.operand() });
         return Some(Some(dst));
     }
     if name == utf16!("ArgumentCount") {
+        let [] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::GetArgumentCount { dst: dst.operand() });
         return Some(Some(dst));
     }
     if name == utf16!("ThrowTypeError") {
+        expect_builtin_argument_count(data, name, 1);
         if let ExpressionKind::StringLiteral(ref s) = data.arguments[0].value.inner {
             let message_string = generator.intern_string(s);
             let type_error_register = generator.allocate_register();
@@ -3823,6 +3844,7 @@ fn try_generate_builtin_abstract_operation(
         return None;
     }
     if name == utf16!("NewTypeError") {
+        expect_builtin_argument_count(data, name, 1);
         if let ExpressionKind::StringLiteral(ref s) = data.arguments[0].value.inner {
             let message_string = generator.intern_string(s);
             generator.emit(Instruction::NewTypeError {
@@ -3834,11 +3856,12 @@ fn try_generate_builtin_abstract_operation(
         return None;
     }
     if name == utf16!("NewObjectWithNoPrototype") {
+        let [] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::NewObjectWithNoPrototype { dst: dst.operand() });
         return Some(Some(dst));
     }
     if name == utf16!("NewArrayWithLength") {
-        let length = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
+        let [length] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::NewArrayWithLength {
             dst: dst.operand(),
             array_length: length.operand(),
@@ -3846,9 +3869,7 @@ fn try_generate_builtin_abstract_operation(
         return Some(Some(dst));
     }
     if name == utf16!("CreateAsyncFromSyncIterator") {
-        let iterator = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
-        let next_method = generate_expression_or_undefined(&data.arguments[1].value, generator, None);
-        let done = generate_expression_or_undefined(&data.arguments[2].value, generator, None);
+        let [iterator, next_method, done] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::CreateAsyncFromSyncIterator {
             dst: dst.operand(),
             iterator: iterator.operand(),
@@ -3858,9 +3879,7 @@ fn try_generate_builtin_abstract_operation(
         return Some(Some(dst));
     }
     if name == utf16!("CreateDataPropertyOrThrow") {
-        let object = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
-        let property = generate_expression_or_undefined(&data.arguments[1].value, generator, None);
-        let value = generate_expression_or_undefined(&data.arguments[2].value, generator, None);
+        let [object, property, value] = generate_builtin_call_arguments(generator, data, name);
         generator.emit(Instruction::CreateDataPropertyOrThrow {
             object: object.operand(),
             property: property.operand(),
@@ -3869,14 +3888,14 @@ fn try_generate_builtin_abstract_operation(
         return Some(Some(dst));
     }
     if name == utf16!("Call") {
-        let callee = generate_expression_or_undefined(&data.arguments[0].value, generator, None);
-        let this_value = generate_expression_or_undefined(&data.arguments[1].value, generator, None);
-        let extra_args = &data.arguments[2..];
-        let mut argument_holders = Vec::with_capacity(extra_args.len());
-        for argument in extra_args {
-            let val = generate_expression_or_undefined(&argument.value, generator, None);
-            argument_holders.push(generator.copy_if_needed_to_preserve_evaluation_order(&val));
-        }
+        assert!(
+            data.arguments.len() >= 2,
+            "builtin Call takes a callee and a this value"
+        );
+        let mut arguments = generate_builtin_call_argument_list(generator, &data.arguments).into_iter();
+        let callee = arguments.next().unwrap();
+        let this_value = arguments.next().unwrap();
+        let argument_holders: Vec<ScopedOperand> = arguments.collect();
         let arena_clone = generator.arena.clone();
         let callee_name = expression_string_approximation(&data.arguments[0].value, &arena_clone)
             .map(|s| generator.intern_string(&s));
@@ -3913,11 +3932,7 @@ fn try_generate_builtin_abstract_operation(
             let callee = generator.add_constant_abstract_operation(operation);
             let undefined = generator.add_constant_undefined();
             let expression_string = generator.intern_string(name);
-            let mut argument_holders = Vec::with_capacity(data.arguments.len());
-            for argument in &data.arguments {
-                let val = generate_expression_or_undefined(&argument.value, generator, None);
-                argument_holders.push(generator.copy_if_needed_to_preserve_evaluation_order(&val));
-            }
+            let argument_holders = generate_builtin_call_argument_list(generator, &data.arguments);
             let arguments: Vec<Operand> = argument_holders.iter().map(|a| a.operand()).collect();
             let value_feedback = generator.next_value_feedback();
             let call_feedback = generator.next_call_feedback();
@@ -3936,6 +3951,38 @@ fn try_generate_builtin_abstract_operation(
     }
 
     None
+}
+
+fn expect_builtin_argument_count(data: &CallExpressionData, name: &[u16], count: usize) {
+    assert_eq!(
+        data.arguments.len(),
+        count,
+        "builtin {} takes {count} argument(s)",
+        String::from_utf16_lossy(name)
+    );
+}
+
+fn generate_builtin_call_arguments<const N: usize>(
+    generator: &mut Generator,
+    data: &CallExpressionData,
+    name: &[u16],
+) -> [ScopedOperand; N] {
+    expect_builtin_argument_count(data, name, N);
+    let arguments = generate_builtin_call_argument_list(generator, &data.arguments);
+    arguments
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("argument count was checked"))
+}
+
+/// Evaluate builtin call arguments in order, snapshotting any that a later argument might reassign.
+fn generate_builtin_call_argument_list(generator: &mut Generator, arguments: &[CallArgument]) -> Vec<ScopedOperand> {
+    (0..arguments.len())
+        .map(|index| {
+            let value = generate_expression_or_undefined(&arguments[index].value, generator, None);
+            let later = arguments[index + 1..].iter().map(|later| &later.value);
+            copy_if_reassignable_by(generator, value, later)
+        })
+        .collect()
 }
 
 /// Try to generate a builtin constant (e.g. SYMBOL_ITERATOR).
@@ -4023,6 +4070,7 @@ fn generate_call_expression(
             }
             ExpressionKind::Member(data) => {
                 let obj = generate_expression_or_undefined(&data.object, generator, None);
+                let obj = copy_if_reassignable_by(generator, obj, [&*data.property]);
                 let base_id = intern_base_identifier(generator, &data.object);
                 let method = generator.allocate_register();
                 if data.computed {
@@ -5304,6 +5352,7 @@ fn emit_delete_reference(generator: &mut Generator, operand: &Expression) -> Sco
                 return generator.add_constant_undefined();
             }
             let base = generate_expression_or_undefined(&data.object, generator, None);
+            let base = copy_if_reassignable_by(generator, base, [&*data.property]);
             let dst = generator.allocate_register();
             if data.computed {
                 let key = generate_expression_or_undefined(&data.property, generator, None);
@@ -5415,6 +5464,7 @@ fn emit_evaluate_member_reference(generator: &mut Generator, target: &Expression
             }
         } else {
             let base = generate_expression_or_undefined(&member_data.object, generator, None);
+            let base = generator.copy_if_needed_to_preserve_evaluation_order(&base);
             if member_data.computed {
                 let property = generate_expression_or_undefined(&member_data.property, generator, None);
                 // If the computed property is a constant string (e.g. obj["key"]),
@@ -5538,6 +5588,7 @@ fn emit_store_to_reference(generator: &mut Generator, target: &Expression, value
                 );
             } else {
                 let base = generate_expression_or_undefined(&data.object, generator, None);
+                let base = copy_if_reassignable_by(generator, base, [&*data.property]);
                 emit_put_to_member(generator, &base, &data.property, data.computed, value, None);
             }
         }
@@ -5801,6 +5852,7 @@ fn generate_tagged_template_literal(
         ExpressionKind::Member(member_data) => {
             let arena = generator.arena.clone();
             let obj = generate_expression_or_undefined(&member_data.object, generator, None);
+            let obj = copy_if_reassignable_by(generator, obj, [&*member_data.property]);
             let method = generator.allocate_register();
             if member_data.computed {
                 let property = generate_expression_or_undefined(&member_data.property, generator, None);
@@ -5846,6 +5898,10 @@ fn generate_tagged_template_literal(
         unreachable!("TaggedTemplateLiteral template must be TemplateLiteral");
     };
 
+    // Substitutions are evaluated after the tag, so snapshot whatever a later substitution might reassign.
+    let tag_reg = copy_if_reassignable_by(generator, tag_reg, &data.expressions);
+    let this_value = this_value.map(|value| copy_if_reassignable_by(generator, value, &data.expressions));
+
     // Collect cooked strings (even indices). NullLiteral means invalid escape → undefined.
     let mut string_regs = Vec::new();
     for i in (0..data.expressions.len()).step_by(2) {
@@ -5878,7 +5934,7 @@ fn generate_tagged_template_literal(
     let mut argument_regs = vec![strings_array];
     for i in (1..data.expressions.len()).step_by(2) {
         let val = generate_expression_or_undefined(&data.expressions[i], generator, None);
-        argument_regs.push(val);
+        argument_regs.push(copy_if_reassignable_by(generator, val, &data.expressions[i + 1..]));
     }
 
     let dst = choose_dst(generator, preferred_dst);
@@ -6562,7 +6618,7 @@ fn generate_optional_chain_inner(
                 );
                 generator.emit_mov(current_base, &this_value);
             } else if member_data.computed {
-                let obj = generator.copy_if_needed_to_preserve_evaluation_order(&obj);
+                let obj = copy_if_reassignable_by(generator, obj, [&*member_data.property]);
                 let property = generate_expression(&member_data.property, generator, None)?;
                 emit_get_by_value(generator, &val, &obj, &property, None);
                 generator.emit_mov(current_base, &obj);
@@ -6710,7 +6766,7 @@ fn generate_optional_chain_start(
                 );
                 generator.emit_mov(current_base, &this_value);
             } else if member_data.computed {
-                let obj = generator.copy_if_needed_to_preserve_evaluation_order(&obj);
+                let obj = copy_if_reassignable_by(generator, obj, [&*member_data.property]);
                 let property = generate_expression(&member_data.property, generator, None)?;
                 emit_get_by_value(generator, &val, &obj, &property, None);
                 generator.emit_mov(current_base, &obj);
@@ -10102,16 +10158,7 @@ fn try_constant_loosely_equals(lhs: &ConstantValue, rhs: &ConstantValue) -> Opti
                 return Some(false);
             }
             let bi = parse_bigint(b)?;
-            // Compare: the number must be a safe integer that equals the BigInt.
-            // Only fold if the f64 value fits in i64 range for lossless conversion.
-            if *n > i64::MAX as f64 || *n < i64::MIN as f64 {
-                return None;
-            }
-            let n_i64 = *n as i64;
-            if n_i64 as f64 != *n {
-                return None;
-            }
-            Some(BigInt::from(n_i64) == bi)
+            Some(BigInt::from_f64(*n)? == bi)
         }
         // BigInt == String or String == BigInt: parse string as BigInt per StringToBigInt.
         // If the string cannot be parsed, the result is false (not equal).
@@ -10237,7 +10284,7 @@ fn constant_to_string(val: &ConstantValue) -> Option<Utf16String> {
         ConstantValue::Undefined => Some(Utf16String(utf16!("undefined").to_vec())),
         ConstantValue::BigInt(s) => {
             // BigInt.prototype.toString() returns the decimal string representation.
-            Some(Utf16String(s.encode_utf16().collect()))
+            Some(Utf16String(parse_bigint(s)?.to_string().encode_utf16().collect()))
         }
         _ => None,
     }
@@ -10259,16 +10306,11 @@ fn compare_bigint_and_number(bigint_str: &str, number: f64) -> Option<Option<std
         return Some(Some(Ordering::Greater)); // Any BigInt > -Infinity
     }
     let bigint = parse_bigint(bigint_str)?;
-    // Only fold if the f64 value is a safe integer for lossless comparison.
     if number.fract() != 0.0 {
         // The number has a fractional part, so we can still compare:
         // floor(number) < bigint means bigint > number, etc.
         let floored = number.floor();
-        if floored > i64::MAX as f64 || floored < i64::MIN as f64 {
-            return None;
-        }
-        let floored_i64 = floored as i64;
-        let floored_bigint = BigInt::from(floored_i64);
+        let floored_bigint = BigInt::from_f64(floored)?;
         if bigint <= floored_bigint {
             // bigint <= floor(number) means bigint < number
             return Some(Some(Ordering::Less));
@@ -10277,14 +10319,7 @@ fn compare_bigint_and_number(bigint_str: &str, number: f64) -> Option<Option<std
             return Some(Some(Ordering::Greater));
         }
     }
-    if number > i64::MAX as f64 || number < i64::MIN as f64 {
-        return None;
-    }
-    let number_i64 = number as i64;
-    if number_i64 as f64 != number {
-        return None;
-    }
-    let number_bigint = BigInt::from(number_i64);
+    let number_bigint = BigInt::from_f64(number)?;
     Some(Some(bigint.cmp(&number_bigint)))
 }
 
@@ -10353,6 +10388,7 @@ fn try_constant_fold_binary(
                 (ConstantValue::Boolean(a), ConstantValue::Boolean(b)) => a == b,
                 (ConstantValue::Null, ConstantValue::Null) => true,
                 (ConstantValue::Undefined, ConstantValue::Undefined) => true,
+                (ConstantValue::WellKnownSymbol(a), ConstantValue::WellKnownSymbol(b)) => a == b,
                 // Different types are never strictly equal.
                 _ => false,
             };
@@ -10506,6 +10542,137 @@ fn nanboxed_null() -> u64 {
 
 fn nanboxed_empty() -> u64 {
     nan_box::EMPTY_VALUE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_builtin_expression(source: &str, statement_index: usize) -> (crate::compile::ParsedProgram, Expression) {
+        let source: Vec<u16> = source.encode_utf16().collect();
+        let parsed = crate::compile::parse_builtin_file(&source);
+        let scope = match &parsed.program.inner {
+            StatementKind::Program(data) => data.scope,
+            _ => unreachable!(),
+        };
+        let statement = &parsed.arena.scopes[scope].children[statement_index];
+        let StatementKind::Expression(expression) = &statement.inner else {
+            panic!("expected expression statement at index {statement_index}");
+        };
+        let expression = *expression.clone();
+        (parsed, expression)
+    }
+
+    fn builtin_generator(arena: std::sync::Arc<AstArena>) -> Generator {
+        let mut generator = Generator::new();
+        generator.arena = arena;
+        generator.builtin_abstract_operations_enabled = true;
+        let block = generator.make_block();
+        generator.switch_to_basic_block(block);
+        generator
+    }
+
+    #[test]
+    fn constant_fold_compares_well_known_symbols_by_identity() {
+        let mut generator = Generator::new();
+        let lhs = generator.add_constant_well_known_symbol(WellKnownSymbolKind::SymbolIterator);
+        let rhs = generator.add_constant_well_known_symbol(WellKnownSymbolKind::SymbolIterator);
+
+        let result = try_constant_fold_binary(&mut generator, BinaryOp::StrictlyEquals, &lhs, &rhs)
+            .expect("well-known symbol equality should fold");
+
+        assert!(matches!(
+            generator.get_constant(&result),
+            Some(ConstantValue::Boolean(true))
+        ));
+    }
+
+    #[test]
+    fn builtin_intrinsic_lowering_respects_declared_global_shadows() {
+        let (parsed, expression) = parse_builtin_expression("let ToBoolean; ToBoolean(0);", 1);
+        let mut generator = builtin_generator(parsed.arena.clone());
+
+        generate_expression(&expression, &mut generator, None).expect("call expression should produce a value");
+
+        let instructions = &generator.basic_blocks[0].instructions;
+        assert!(
+            instructions
+                .iter()
+                .any(|(instruction, _, _)| matches!(instruction, Instruction::Call { .. }))
+        );
+        assert!(
+            !instructions
+                .iter()
+                .any(|(instruction, _, _)| matches!(instruction, Instruction::ToBoolean { .. }))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "builtin ToBoolean takes 1 argument(s)")]
+    fn builtin_intrinsic_lowering_rejects_wrong_argument_count() {
+        let (parsed, expression) = parse_builtin_expression("ToBoolean(true, false);", 0);
+        let mut generator = builtin_generator(parsed.arena.clone());
+
+        generate_expression(&expression, &mut generator, None);
+    }
+
+    #[test]
+    fn builtin_call_snapshots_callee_before_evaluating_later_arguments() {
+        let (mut parsed, expression) =
+            parse_builtin_expression("var target; Call(target, undefined, (target = 2));", 1);
+        let call = match &expression.inner {
+            ExpressionKind::Call(call) => call,
+            _ => unreachable!(),
+        };
+        let ExpressionKind::Identifier(target_argument) = call.arguments[0].value.inner else {
+            unreachable!();
+        };
+        let ExpressionKind::Assignment(assignment) = &call.arguments[2].value.inner else {
+            unreachable!();
+        };
+        let AssignmentLhs::Expression(lhs) = &assignment.lhs else {
+            unreachable!();
+        };
+        let ExpressionKind::Identifier(target_assignment) = lhs.inner else {
+            unreachable!();
+        };
+
+        let arena = std::sync::Arc::get_mut(&mut parsed.arena).expect("parsed arena should be uniquely owned");
+        for identifier in [target_argument, target_assignment] {
+            let identifier = &mut arena.identifiers[identifier];
+            identifier.local_type = Some(LocalType::Variable);
+            identifier.local_index = 0;
+            identifier.is_global = false;
+            identifier.declaration_kind = None;
+        }
+
+        let mut generator = builtin_generator(parsed.arena.clone());
+        generator
+            .local_variables
+            .push(crate::bytecode::generator::LocalVariable {
+                name: ak::Utf16FlyString::from_utf8("target"),
+                is_lexically_declared: false,
+                is_initialized_during_declaration_instantiation: true,
+                is_mutable: true,
+                scope_range: None,
+            });
+        generator.initialized_locals.push(true);
+
+        generate_expression(&expression, &mut generator, None).expect("call expression should produce a value");
+
+        let callee = generator.basic_blocks[0]
+            .instructions
+            .iter()
+            .find_map(|(instruction, _, _)| match instruction {
+                Instruction::Call { callee, .. } => Some(*callee),
+                _ => None,
+            })
+            .expect("builtin Call should lower to a Call instruction");
+        assert!(
+            callee.is_register(),
+            "callee value must be captured before later arguments run"
+        );
+    }
 }
 
 // =============================================================================

@@ -231,6 +231,42 @@ impl RetainedState {
         id
     }
 
+    /// What moving each of `elements` from the record assigned it to the one `live` holds for it damages, on the threads
+    /// of the pool where many move. Installing an element reads only its own records, which none of this changes.
+    fn element_move_damages(&self, live: &Live, elements: &[StyleNodeID]) -> Vec<u32> {
+        const ELEMENTS_PER_TASK: usize = 64;
+        let moves = |&(index, new): &(usize, &Arc<Record>)| {
+            let node = elements[index];
+            let old = self.computed_group_sets.assigned_style_record(node);
+            old.map_or(0, |old| self.element_record_damage_to(node, old.raw(), new))
+        };
+        // NB: An element's first style moves from nothing, which is every element of a page arriving.
+        let moving: Vec<(usize, &Arc<Record>)> = elements
+            .iter()
+            .enumerate()
+            .filter(|&(_, &node)| self.computed_group_sets.assigned_style_record(node).is_some())
+            .filter_map(|(index, &node)| Some((index, live.demanded_record(node)?)))
+            .collect();
+        let pool = self.style_layout_pool.as_ref().and_then(|pool| pool.started());
+        let answers: Vec<u32> = match pool.as_deref() {
+            Some(pool) if moving.len() > ELEMENTS_PER_TASK => {
+                use rayon::prelude::*;
+                pool.install(|| {
+                    moving
+                        .par_chunks(ELEMENTS_PER_TASK)
+                        .flat_map_iter(|chunk| chunk.iter().map(moves))
+                        .collect()
+                })
+            }
+            _ => moving.iter().map(moves).collect(),
+        };
+        let mut damages = vec![0; elements.len()];
+        for (&(index, _), answer) in moving.iter().zip(answers) {
+            damages[index] = answer;
+        }
+        damages
+    }
+
     /// The rows installing the records `live` holds for the elements of `changed`, in tree order,
     /// each element's pseudo-elements following it, noting in `installation` what the main thread
     /// does to take them. The elements of `plans_owed`, sorted, owe the host the plans of the
@@ -251,8 +287,15 @@ impl RetainedState {
         scratch.start(&self.projection);
         scratch.order(&self.projection, root, changed);
         let ordered = std::mem::take(&mut scratch.ordered);
+        let element_damages = self.element_move_damages(live, &ordered);
         let mut rows = Vec::with_capacity(ordered.len());
-        for &node in &ordered {
+        for (index, (&node, &element_damage)) in ordered.iter().zip(&element_damages).enumerate() {
+            if let Some(ahead) = ordered
+                .get(index + super::records::RECORDS_AHEAD)
+                .and_then(|&ahead| live.demanded_record(ahead))
+            {
+                ahead.prefetch();
+            }
             let Some(record) = live.demanded_record(node) else {
                 continue;
             };
@@ -331,10 +374,7 @@ impl RetainedState {
                     .push(StyleSwap::new(self, node, PseudoSlot::ELEMENT, new_record));
             }
             let record_damage = match old != 0 && old != new {
-                true => {
-                    self.element_record_damage(node, false, old, new)
-                        | bridge::FfiStyleInvalidationField::EngineComputed as u32
-                }
+                true => element_damage | bridge::FfiStyleInvalidationField::EngineComputed as u32,
                 false => 0,
             };
             let plan_owed = plans_owed.binary_search(&node).is_ok();
@@ -832,9 +872,39 @@ impl RetainedState {
 #[cfg(test)]
 mod tests {
     use super::super::super::TreeScopeID;
+    use super::super::super::computed;
     use super::super::super::custom_property_environments::environment_identity;
     use super::super::test_support::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_store_holding_what_the_record_of_an_element_holds_resolves_to_its_environment() {
+        let (mut engine, nodes) = nested_document();
+        let sheet = add_sheet(&mut engine, TreeScopeID::DOCUMENT);
+        add_rules(&mut engine, sheet, ".theme { --theme: 1px; }");
+        add_class(&mut engine, nodes[0], "theme");
+        start_live(&mut engine, nodes[0]);
+
+        let record = live_record(&engine, nodes[0]);
+        let store = record.custom_properties().unwrap().clone();
+        let state = &mut engine.retained;
+        let registry = state.document_style_computation_inputs.custom_property_registry();
+        let environment =
+            state
+                .custom_property_environments
+                .adopt_engine_environment(store.clone(), None, 0, None, registry);
+        let installed = state.computed_group_sets.install_derived_record(&record, || {
+            computed::record_dependency_flags(&record.facts(), &record.payloads)
+        });
+        state.computed_group_sets.assign_installed_record(nodes[0], installed);
+
+        // NB: The element holds no environment of its own, as nothing lies over its record.
+        assert!(!state.element_custom_property_data.contains_key(&nodes[0]));
+        assert_eq!(
+            state.environment_resolving_to_the_same_values(nodes[0], None, &store, registry),
+            Some(environment)
+        );
+    }
 
     #[test]
     fn a_pseudo_element_inheriting_a_store_leaves_the_environment_of_its_holder() {

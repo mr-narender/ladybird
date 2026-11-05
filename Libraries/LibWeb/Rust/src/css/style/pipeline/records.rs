@@ -545,6 +545,63 @@ const _: () = assert!(
 );
 
 impl ChildImpact {
+    /// Which children of an element computing `new` where it computed `old` compute anew, where
+    /// they inherited `inherited`.
+    pub(super) fn of_records(new: &Record, old: &Record, inherited: &crate::css::computed_values::StyleGroups) -> Self {
+        // An inherited longhand no group holds reaches the children through the table alone.
+        let ungrouped_inherited_moved = || {
+            crate::css::computed_values::StyleGroupMasks::get()
+                .ungrouped_inherited()
+                .iter()
+                .any(|&property| {
+                    match (
+                        computed::ViewLonghands::of_record(new).handle(property),
+                        computed::ViewLonghands::of_record(old).handle(property),
+                    ) {
+                        (Some(new), Some(old)) => !crate::css::style_value::retained_style_values_equal(new, old),
+                        (new, old) => new.is_some() != old.is_some(),
+                    }
+                })
+        };
+        if new.payloads.current_color() != old.payloads.current_color()
+            || new.payloads.inherited_values() != old.payloads.inherited_values()
+            // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-prop
+            // A child whose `color-scheme` is the one it inherits uses the scheme its parent uses.
+            || new.effective_color_scheme() != old.effective_color_scheme()
+            || new.facts().publication_dependency_flags() != old.facts().publication_dependency_flags()
+            || new.facts().display != old.facts().display
+            || ungrouped_inherited_moved()
+            // https://drafts.csswg.org/css-color-4/#resolving-other-colors
+            // A child inheriting a value that reads `currentcolor` resolves it against its own
+            // color, so the specified values the record retains reach the children where the
+            // colors they resolve to here did not move.
+            || crate::css::computed_longhand_table::inherited_inheritance_dependent_value_moved(
+                old.inheritance_dependent_values(),
+                new.inheritance_dependent_values(),
+            )
+        {
+            return ChildImpact::All;
+        }
+        let impact = match ChildImpact::of_groups(&new.payloads, inherited) {
+            ChildImpact::None
+                if crate::css::computed_longhand_table::non_inherited_inheritance_changes(
+                    old.inheritance_dependent_values(),
+                    new.inheritance_dependent_values(),
+                ) != 0 =>
+            {
+                Self::ResetReaders
+            }
+            impact => impact,
+        };
+        let stores_moved = !same_arc(new.custom_properties(), old.custom_properties())
+            || !same_arc(new.inheritable_custom_properties(), old.inheritable_custom_properties());
+        match (impact, stores_moved) {
+            (ChildImpact::None, true) => ChildImpact::CustomProperties,
+            (ChildImpact::ResetReaders, true) => ChildImpact::ResetReadersAndCustomProperties,
+            (impact, _) => impact,
+        }
+    }
+
     /// Which children of an element moving from the groups `old` to `new` restyle: all of them
     /// where an inherited group moved, and the ones reading their parent's values of properties
     /// that do not inherit where another did.
@@ -851,13 +908,7 @@ impl Record {
 
     /// Whether `other` holds what this record does, its longhand table aside.
     fn holds_the_same_besides_its_table_as(&self, other: &Record) -> bool {
-        let same_store =
-            |a: Option<&Arc<crate::css::custom_properties::CustomPropertyStore>>,
-             b: Option<&Arc<crate::css::custom_properties::CustomPropertyStore>>| match (a, b) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.holds_same_values_as(b),
-                _ => false,
-            };
+        let same_store = crate::css::custom_properties::CustomPropertyStore::absent_or_holding_the_same_values;
         self.payloads.current_color() == other.payloads.current_color()
             && self.rare().custom_property_reads == other.rare().custom_property_reads
             && self.rare().reads == other.rare().reads
@@ -1028,6 +1079,46 @@ impl Record {
 }
 
 impl RetainedState {
+    /// Which children of `node`, an element computing `new` where it computed `old`, compute anew:
+    /// those computing from something `new` differs in from what they inherited before, `old` or
+    /// the composition of its animations over that. A child computes from its parent's inherited
+    /// groups, color, zoom, publication dependencies, display and custom properties, as a result
+    /// is reused by, and from its other groups only where it read them.
+    pub(super) fn child_impact_of_records(
+        &self,
+        node: StyleNodeID,
+        new: &Arc<Record>,
+        old: &Arc<Record>,
+    ) -> ChildImpact {
+        if Arc::ptr_eq(new, old) {
+            return ChildImpact::None;
+        }
+        // The children inherited the composition of the element's animations over the record it
+        // held, where the host composed one, and the custom properties those sampled.
+        let composition = self.computed_group_sets.composition_over_record(node, old);
+        if self.sampled_custom_property_store(node).is_some() {
+            return ChildImpact::All;
+        }
+        ChildImpact::of_records(new, old, composition.map_or(&old.payloads, |view| view.payloads))
+    }
+
+    /// The custom properties the animations of `node` sampled, where the host sampled them over
+    /// the environment of the record the element holds, borrowed.
+    fn sampled_custom_property_store(
+        &self,
+        node: StyleNodeID,
+    ) -> Option<Option<&Arc<crate::css::custom_properties::CustomPropertyStore>>> {
+        let environment = self.computed_group_sets.custom_property_environment_identity(node);
+        let sampled = self
+            .element_custom_property_data
+            .get(&node)
+            .filter(|held| {
+                held.sampled_over.is_some() && (environment == Some(held.identity) || held.sampled_over == environment)
+            })?
+            .identity;
+        Some(self.custom_property_environments.store(sampled))
+    }
+
     /// Install the record of a style the host made holding `payloads`, whose computed values are
     /// the initial ones, and answer its identity. Nothing holds
     /// the record yet: the next sweep frees it unless a holder pins it first.
@@ -1178,6 +1269,25 @@ pub(super) type HeldCustomProperties = Option<Arc<crate::css::custom_properties:
 pub(super) type BorrowedCustomProperties<'a> = Option<Cow<'a, Arc<crate::css::custom_properties::CustomPropertyStore>>>;
 
 pub(super) type PseudoElementRecords = smallvec::SmallVec<[(u8, Arc<Record>); 2]>;
+
+/// https://drafts.csswg.org/css-pseudo-4/#highlight-cascade
+/// Whether the highlight pseudo-elements of `new` hold other styles than those of `old`, which the
+/// highlight pseudo-elements of an element's children inherit from.
+pub(super) fn highlights_moved(new: &[(u8, Arc<Record>)], old: &[(u8, Arc<Record>)]) -> bool {
+    let of_kind = |records: &'_ [(u8, Arc<Record>)], kind: u8| {
+        records
+            .iter()
+            .find(|(held, _)| *held == kind)
+            .map(|(_, record)| record.clone())
+    };
+    super::HIGHLIGHT_KINDS
+        .iter()
+        .any(|&kind| match (of_kind(new, kind), of_kind(old, kind)) {
+            (None, None) => false,
+            (Some(new), Some(old)) => !Arc::ptr_eq(&new, &old) && !new.holds_the_same_as(&old),
+            _ => true,
+        })
+}
 
 /// One element's record, with the identity it shares under. Elements holding one record need not
 /// share an identity: a record reused for an equal cascade says nothing of the elements' selectors.
@@ -1377,7 +1487,10 @@ impl RetainedRecords {
         // elements do, one per record and set of pseudo-elements, which elements sharing a style
         // share.
         let mut with_pseudo_element_styles: HashMap<(usize, PseudoElementStyles), Arc<Record>> = HashMap::default();
-        for node in styled {
+        for (index, node) in styled.iter().enumerate() {
+            if let Some(ahead) = styled.get(index + RECORDS_AHEAD) {
+                cells.prefetch_record(*ahead);
+            }
             let slot = node.element_slot();
             let Some(page) = cells.pages[slot / CELL_PAGE_SIZE].get_mut() else {
                 continue;
@@ -1570,6 +1683,21 @@ pub(super) struct RecordCells {
 /// How many elements a page of record cells holds.
 const CELL_PAGE_SIZE: usize = 64;
 
+/// How many elements ahead a thread going through the records a pass made on other threads asks for their memory.
+pub(super) const RECORDS_AHEAD: usize = 8;
+
+impl RecordCells {
+    /// Asks for the memory of the record the pass made for `node`.
+    fn prefetch_record(&self, node: StyleNodeID) {
+        let slot = node.element_slot();
+        if let Some(page) = self.pages[slot / CELL_PAGE_SIZE].get()
+            && let Some(held) = page.held[slot % CELL_PAGE_SIZE].get()
+        {
+            held.record.prefetch();
+        }
+    }
+}
+
 /// The record cells of `CELL_PAGE_SIZE` elements.
 struct CellPage {
     /// Elements that share a style hold one record.
@@ -1755,13 +1883,7 @@ impl<'a> Records<'a> {
         {
             return true;
         }
-        let same_store =
-            |a: Option<&Arc<crate::css::custom_properties::CustomPropertyStore>>,
-             b: Option<&Arc<crate::css::custom_properties::CustomPropertyStore>>| match (a, b) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.holds_same_values_as(b),
-                _ => false,
-            };
+        let same_store = crate::css::custom_properties::CustomPropertyStore::absent_or_holding_the_same_values;
         sets.held_record(node).is_some_and(|held| {
             same_store(held.custom_properties(), record.custom_properties())
                 && same_store(
@@ -1775,7 +1897,9 @@ impl<'a> Records<'a> {
     /// the environment of the record the element holds: the element's own custom properties with
     /// the animated values in place of theirs.
     pub(super) fn sampled_custom_properties(&self, node: StyleNodeID) -> Option<HeldCustomProperties> {
-        self.sampled_custom_property_store(node).map(|store| store.cloned())
+        self.state
+            .sampled_custom_property_store(node)
+            .map(|store| store.cloned())
     }
 
     /// The custom properties the animations of the pseudo-element of `kind` of `node` sampled:
@@ -1789,26 +1913,6 @@ impl<'a> Records<'a> {
             .iter()
             .find(|(pseudo, held)| *pseudo == kind && held.sampled_over.is_some())?;
         self.state.custom_property_environments.store(held.identity).cloned()
-    }
-
-    /// As [`Self::sampled_custom_properties`], borrowed.
-    fn sampled_custom_property_store(
-        &self,
-        node: StyleNodeID,
-    ) -> Option<Option<&'a Arc<crate::css::custom_properties::CustomPropertyStore>>> {
-        let environment = self
-            .state
-            .computed_group_sets
-            .custom_property_environment_identity(node);
-        let sampled = self
-            .state
-            .element_custom_property_data
-            .get(&node)
-            .filter(|held| {
-                held.sampled_over.is_some() && (environment == Some(held.identity) || held.sampled_over == environment)
-            })?
-            .identity;
-        Some(self.state.custom_property_environments.store(sampled))
     }
 
     /// The record `node` held before this pass, or the one the host holds for it or composes its animations over, where
@@ -1853,11 +1957,9 @@ impl<'a> Records<'a> {
             .is_none_or(|held| !Arc::ptr_eq(held, record) && !held.holds_the_same_style_as(record))
     }
 
-    /// Which children of `node` the record this pass computed for it restyles: those computing
-    /// from something it differs in from what they inherited before, the one it held or the
-    /// composition of its animations over that. A child computes from its parent's
-    /// inherited groups, color, zoom, publication dependencies, display and custom properties, as
-    /// a result is reused by, and from its other groups only where it read them.
+    /// Which children of `node` the record this pass computed for it restyles, as
+    /// [`RetainedState::child_impact_of_records`] finds of the one it held before, or all of them
+    /// where its highlight pseudo-elements moved.
     pub(super) fn child_impact(&self, node: StyleNodeID) -> ChildImpact {
         let (Some(new), Some(old)) = (
             self.cells.held(node.element_slot()),
@@ -1870,69 +1972,7 @@ impl<'a> Records<'a> {
         if self.highlights_moved(node) {
             return ChildImpact::All;
         }
-        let new = &new.record;
-        if Arc::ptr_eq(new, old) {
-            return ChildImpact::None;
-        }
-        // The children inherited the composition of the element's animations over the record it
-        // held, where the host composed one, and the custom properties those sampled.
-        let composition = self.state.computed_group_sets.composition_over_record(node, old);
-        if self.sampled_custom_properties(node).is_some() {
-            return ChildImpact::All;
-        }
-        // An inherited longhand no group holds reaches the children through the table alone.
-        let ungrouped_inherited_moved = || {
-            crate::css::computed_values::StyleGroupMasks::get()
-                .ungrouped_inherited()
-                .iter()
-                .any(|&property| {
-                    match (
-                        computed::ViewLonghands::of_record(new).handle(property),
-                        computed::ViewLonghands::of_record(old).handle(property),
-                    ) {
-                        (Some(new), Some(old)) => !crate::css::style_value::retained_style_values_equal(new, old),
-                        (new, old) => new.is_some() != old.is_some(),
-                    }
-                })
-        };
-        if new.payloads.current_color() != old.payloads.current_color()
-            || new.payloads.inherited_values() != old.payloads.inherited_values()
-            // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-prop
-            // A child whose `color-scheme` is the one it inherits uses the scheme its parent uses.
-            || new.effective_color_scheme() != old.effective_color_scheme()
-            || new.facts().publication_dependency_flags() != old.facts().publication_dependency_flags()
-            || new.facts().display != old.facts().display
-            || ungrouped_inherited_moved()
-            // https://drafts.csswg.org/css-color-4/#resolving-other-colors
-            // A child inheriting a value that reads `currentcolor` resolves it against its own
-            // color, so the specified values the record retains reach the children where the
-            // colors they resolve to here did not move.
-            || crate::css::computed_longhand_table::inherited_inheritance_dependent_value_moved(
-                old.inheritance_dependent_values(),
-                new.inheritance_dependent_values(),
-            )
-        {
-            return ChildImpact::All;
-        }
-        let inherited = composition.map_or(&old.payloads, |view| view.payloads);
-        let impact = match ChildImpact::of_groups(&new.payloads, inherited) {
-            ChildImpact::None
-                if crate::css::computed_longhand_table::non_inherited_inheritance_changes(
-                    old.inheritance_dependent_values(),
-                    new.inheritance_dependent_values(),
-                ) != 0 =>
-            {
-                ChildImpact::ResetReaders
-            }
-            impact => impact,
-        };
-        let stores_moved = !same_arc(new.custom_properties(), old.custom_properties())
-            || !same_arc(new.inheritable_custom_properties(), old.inheritable_custom_properties());
-        match (impact, stores_moved) {
-            (ChildImpact::None, true) => ChildImpact::CustomProperties,
-            (ChildImpact::ResetReaders, true) => ChildImpact::ResetReadersAndCustomProperties,
-            (impact, _) => impact,
-        }
+        self.state.child_impact_of_records(node, &new.record, old)
     }
 
     /// Whether the records this pass computed for the highlight pseudo-elements of `node` hold
@@ -1944,19 +1984,7 @@ impl<'a> Records<'a> {
         let old = self
             .previous
             .map_or(&[][..], |previous| previous.pseudo_element_records(node));
-        let of_kind = |records: &'_ [(u8, Arc<Record>)], kind: u8| {
-            records
-                .iter()
-                .find(|(held, _)| *held == kind)
-                .map(|(_, record)| record.clone())
-        };
-        super::HIGHLIGHT_KINDS
-            .iter()
-            .any(|&kind| match (of_kind(new, kind), of_kind(old, kind)) {
-                (None, None) => false,
-                (Some(new), Some(old)) => !Arc::ptr_eq(&new, &old) && !new.holds_the_same_as(&old),
-                _ => true,
-            })
+        highlights_moved(new, old)
     }
 
     pub(super) fn get(&self, node: StyleNodeID) -> Option<&'a Record> {
@@ -2268,7 +2296,7 @@ impl ContainerRecords for Records<'_> {
         }
         let record = self.get_shared(node)?;
         if self.samples_custom_properties_of(node, record)
-            && let Some(sampled) = self.sampled_custom_property_store(node)
+            && let Some(sampled) = self.state.sampled_custom_property_store(node)
         {
             return Some(sampled.map(|store| &**store));
         }
@@ -2277,8 +2305,14 @@ impl ContainerRecords for Records<'_> {
 }
 
 impl Record {
+    /// Asks for the memory of the fields a thread first reads of a record another thread made.
+    pub(super) fn prefetch(&self) {
+        crate::css::declaration_block::prefetch(std::ptr::from_ref(&self.payloads));
+        crate::css::declaration_block::prefetch(std::ptr::from_ref(&self.header));
+    }
+
     /// The view of the record, as the computation of the elements inheriting from it reads it.
-    fn view(self: &Arc<Self>) -> computed::StyleRecordView<'_> {
+    pub(in super::super) fn view(self: &Arc<Self>) -> computed::StyleRecordView<'_> {
         computed::StyleRecordView {
             payloads: &self.payloads,
             base_payloads: &self.payloads,

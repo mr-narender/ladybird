@@ -711,7 +711,18 @@ impl DeclarationBlockBuilder {
             self.append_normalized_property(declaration.to_declared());
         }
         for property in other.custom_properties().iter() {
-            self.set_custom_property(property.name.clone(), property.declaration.to_declared());
+            self.append_custom_property(property.name.clone(), property.declaration.to_declared());
+        }
+    }
+
+    pub(crate) fn append_custom_property(&mut self, name: CssString, declaration: DeclaredProperty) {
+        if let Some(property) = self.custom_properties.iter_mut().find(|property| property.name == name) {
+            if property.declaration.important && !declaration.important {
+                return;
+            }
+            property.declaration = declaration;
+        } else {
+            self.custom_properties.push(CustomProperty { name, declaration });
         }
     }
 
@@ -863,6 +874,21 @@ impl DeclarationBlock {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        match &*self.state.borrow() {
+            DeclarationBlockState::Immutable(data) => data.is_empty(),
+            DeclarationBlockState::Mutable(owner) => owner.borrow().data.is_empty(),
+        }
+    }
+
+    /// Asks for the memory [`Self::is_empty`] reads past the block.
+    fn prefetch_header(&self) {
+        match &*self.state.borrow() {
+            DeclarationBlockState::Immutable(data) => prefetch(data.as_ptr()),
+            DeclarationBlockState::Mutable(owner) => prefetch(owner.borrow().data.as_ptr()),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_immutable(&self) -> bool {
         matches!(&*self.state.borrow(), DeclarationBlockState::Immutable(_))
@@ -943,8 +969,13 @@ pub(crate) fn visit_declaration_images(data: &DeclarationBlockHeader, visit: &mu
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rust_declaration_block_prefetch_header(block: &DeclarationBlock) {
+    block.prefetch_header();
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_declaration_block_is_empty(block: &DeclarationBlock) -> bool {
-    block.data().is_empty()
+    block.is_empty()
 }
 
 /// Whether a declaration of the block holds an image or a gradient, as its value or as an item of its list.

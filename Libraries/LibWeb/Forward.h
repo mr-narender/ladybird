@@ -912,11 +912,9 @@ class IDBFactory;
 
 namespace Web::Internals {
 
-class FakeXRDevice;
 class Internals;
 class InternalGamepad;
 class WebUI;
-class XRTest;
 
 }
 
@@ -1069,13 +1067,6 @@ class PerformanceResourceTiming;
 namespace Web::Selection {
 
 class Selection;
-
-}
-
-namespace Web::Serial {
-
-class Serial;
-class SerialPort;
 
 }
 
@@ -1317,21 +1308,9 @@ class VTTRegion;
 
 }
 
-namespace Web::WebXR {
-
-class XRLayer;
-class XRRenderState;
-class XRSession;
-class XRSessionEvent;
-class XRSystem;
-class XRWebGLLayer;
-
-}
-
 namespace Web::XHR {
 
 class FormData;
-class FormDataIterator;
 class ProgressEvent;
 class XMLHttpRequest;
 class XMLHttpRequestEventTarget;

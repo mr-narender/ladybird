@@ -48,24 +48,6 @@ mod cache_audit;
 pub(super) use cache_audit::CacheAudit;
 pub(super) use cache_audit::mode_from_environment as cache_audit_mode_from_environment;
 
-/// The most threads the traversal runs on, however many are asked for.
-pub(super) const MAX_THREAD_COUNT: usize = 16;
-
-/// The most threads the traversal runs on where none are asked for. Beyond this many, passes over
-/// a thousand elements take no less time, while each thread more faults in pages of its own and
-/// keeps a stack and an allocator heap.
-const DEFAULT_MAX_THREAD_COUNT: usize = 8;
-
-/// How many threads the traversal runs on where none are asked for: three of every four logical
-/// processors, leaving the others to the main thread and the rest of the process, and at least one.
-pub(super) fn thread_count() -> usize {
-    // NB: Each pass asks, and the answer takes system calls and reading files of the control groups.
-    static THREAD_COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *THREAD_COUNT.get_or_init(|| {
-        std::thread::available_parallelism().map_or(1, |count| (count.get() * 3 / 4).clamp(1, DEFAULT_MAX_THREAD_COUNT))
-    })
-}
-
 /// How many elements a task hands to another at once.
 const WORK_UNIT: usize = 16;
 
@@ -282,7 +264,7 @@ pub(super) struct PassContext<'a> {
     /// The group caches of the threads, by thread, which a pass keeps for the next where it
     /// keeps its caches: an element restyled in a later pass finds the groups the elements styled
     /// before it built.
-    pub(super) group_caches: Option<&'a super::pool::PerThread<super::compute::GroupCache>>,
+    pub(super) group_caches: Option<&'a super::per_thread::PerThread<super::compute::GroupCache>>,
     /// The matched declarations cache a pass keeps for the next, where it keeps its caches.
     pub(super) kept_matched_declarations: Option<&'a MatchedDeclarationsCache>,
     /// The cache of a pass that keeps none for the next.
@@ -465,6 +447,8 @@ pub(super) struct Statistics {
     pub(super) moved_custom_properties: Vec<StyleNodeID>,
     /// How many of those it styled differently than before, in what their children compute from.
     pub(super) changed_elements: u64,
+    /// Those elements.
+    pub(super) children_moved: Vec<StyleNodeID>,
     /// The children of elements whose records moved beneath the composition of their animations,
     /// with the hints the pass kept for them, which the next pass restyles once the host composed
     /// the animations over the new records.
@@ -1607,7 +1591,8 @@ impl<'a> Scratch<'a> {
         };
         // What the element's pseudo-elements and animations compute reads the element's custom
         // properties beyond its own record, as do transitions, which start from the values that
-        // moved. A registered custom property computes against the element's own context.
+        // moved. A custom property the element declares that is registered computes against the
+        // element's own context, where one it only inherits arrives computed.
         if !records.pseudo_element_records(node).is_empty()
             || records.composition(node).is_some()
             || records.sampled_custom_properties(node).is_some()
@@ -1620,10 +1605,11 @@ impl<'a> Scratch<'a> {
                     crate::css::property_metadata::property_id::TRANSITION_DURATION,
                 )),
             )
-            || state
-                .document_style_computation_inputs
-                .custom_property_registry()
-                .has_registrations()
+            || old.custom_declarations().is_some_and(|declarations| {
+                declarations
+                    .iter()
+                    .any(|(declared, _)| state.custom_property_name_is_registered(declared.name))
+            })
         {
             return false;
         }
@@ -2705,6 +2691,9 @@ fn style_trees<'scope, 'a: 'scope>(
                     false => ChildImpact::None,
                 };
                 scratch.statistics.changed_elements += u64::from(impact != ChildImpact::None);
+                if impact != ChildImpact::None {
+                    scratch.statistics.children_moved.push(node);
+                }
                 let children = match hint & RESTYLE_DESCENDANTS != 0 {
                     true => {
                         RESTYLE_SELF
@@ -3121,6 +3110,7 @@ impl Statistics {
         statistics.styled.extend(round.styled);
         statistics.moved_custom_properties.extend(round.moved_custom_properties);
         statistics.changed_elements += round.changed_elements;
+        statistics.children_moved.extend(round.children_moved);
         statistics.deferred.extend(round.deferred);
         statistics
             .restyled_for_pseudo_elements

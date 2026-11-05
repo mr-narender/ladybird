@@ -56,6 +56,7 @@ pub(crate) use container_queries::ContainerUnitBases;
 mod custom_property_cascade;
 mod custom_property_environments;
 mod dom_reads;
+pub(crate) mod drag_selection;
 pub(crate) mod effect_descriptions;
 mod element_declarations;
 mod element_host_facts;
@@ -129,6 +130,9 @@ use std::sync::Mutex;
 
 /// Attribute names a document's selectors read, which its engine shares with its host.
 pub(crate) type SelectorAttributeNames = Arc<HashSet<StyleAtomID>>;
+
+/// The style record each pseudo-element of an element holds, by its kind.
+type HeldPseudoStyleRecords = crate::fork::ForkShared<HashMap<StyleNodeID, smallvec::SmallVec<[(u8, u64); 1]>>>;
 
 /// What an element's arrival has to carry to reach the anchor of a `:has()` argument: a name whose raw identity is
 /// among `names` as its tag, ID, class or attribute name, or a state among `states`. Where an argument can be reached
@@ -275,7 +279,7 @@ pub struct RetainedState {
     held_style_records: inputs::HeldStyleRecords,
     /// The style record each pseudo-element holds, by its kind, for the elements whose pseudo-elements
     /// hold one, as the host reports every record it installs or clears.
-    held_pseudo_style_records: crate::fork::ForkShared<HashMap<StyleNodeID, Vec<(u8, u64)>>>,
+    held_pseudo_style_records: HeldPseudoStyleRecords,
     /// The records a clock frame shows in place of the ones the host installed, which it lends the published reads
     /// for as long as it runs.
     tick_shown: engine_sample::TickShownRecords,
@@ -332,7 +336,7 @@ pub struct RetainedState {
     live_counters: pipeline::counters::Counters,
     /// The threads style passes run on, which the process shares where a render state holds the
     /// engine.
-    style_pool: Option<std::sync::Arc<pipeline::pool::StylePool>>,
+    style_layout_pool: Option<std::sync::Arc<crate::style_layout_pool::StyleLayoutPool>>,
     /// The font longhand values the engine substituted, one value per property and content: the
     /// font resolver knows a family and its feature values by their values' identities.
     substituted_font_values: std::sync::Arc<std::sync::Mutex<Vec<(u16, RetainedStyleValueData)>>>,
@@ -432,6 +436,14 @@ pub struct StyleEngine {
 }
 
 impl RetainedState {
+    pub(crate) fn deepest_element_depth(&self) -> u32 {
+        self.deepest_element.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn started_style_layout_pool(&self) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+        self.style_layout_pool.as_ref()?.started()
+    }
+
     /// The groups of default values every computation starting from nothing starts from.
     pub(crate) fn default_groups(&self) -> &crate::css::computed_values::DefaultGroups {
         &self.process_style.default_groups

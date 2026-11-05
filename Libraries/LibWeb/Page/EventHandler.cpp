@@ -572,8 +572,16 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
                 return EventResult::Accepted;
 
 #if defined(AK_OS_MACOS)
-            if (should_start_selection_from_preserved_mousedown)
+            if (should_start_selection_from_preserved_mousedown) {
                 start_selection_from_preserved_mousedown(read, *document);
+
+                // NB: Starting a selection fires selectstart, which may have disturbed the world.
+                if (m_navigable->active_document() != document)
+                    return EventResult::Accepted;
+                document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseMove);
+                if (!has_committed_root_box())
+                    return EventResult::Accepted;
+            }
 #endif
         }
     }
@@ -613,6 +621,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
     GC::Ptr<DOM::Node> node;
     Optional<int> start_index;
     bool hit_text_fragment = false;
+    bool page_cancelled_move = false;
 
     if (auto result = target_for_mouse_position(visual_viewport_position); result.has_value()) {
         target = move(*result);
@@ -679,8 +688,7 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
             auto movement = compute_mouse_event_movement(screen_position);
             m_mousemove_previous_screen_position = screen_position;
 
-            if (dispatch_a_pointer_event_for_a_device_that_supports_hover(read, PointerEventType::PointerMove, *node, chrome_widget, coordinates, screen_position, movement, UIEvents::MouseButton::Primary, buttons, modifiers).result != PointerEventDispatchResult::RunDefaultActions)
-                return EventResult::Cancelled;
+            page_cancelled_move = dispatch_a_pointer_event_for_a_device_that_supports_hover(read, PointerEventType::PointerMove, *node, chrome_widget, coordinates, screen_position, movement, UIEvents::MouseButton::Primary, buttons, modifiers).result != PointerEventDispatchResult::RunDefaultActions;
         }
     } else if (m_mousedown_target) {
         // NOTE: In some implementation environments, such as a browser, mousemove events can continue to fire if the
@@ -690,26 +698,29 @@ EventResult EventHandler::handle_mousemove(CSSPixelPoint visual_viewport_positio
         auto movement = compute_mouse_event_movement(screen_position);
         m_mousemove_previous_screen_position = screen_position;
 
-        if (dispatch_a_pointer_event_for_a_device_that_supports_hover(read, PointerEventType::PointerMove, document->html_element(), nullptr, coordinates, screen_position, movement, UIEvents::MouseButton::Primary, buttons, modifiers).result != PointerEventDispatchResult::RunDefaultActions)
-            return EventResult::Cancelled;
+        page_cancelled_move = dispatch_a_pointer_event_for_a_device_that_supports_hover(read, PointerEventType::PointerMove, document->html_element(), nullptr, coordinates, screen_position, movement, UIEvents::MouseButton::Primary, buttons, modifiers).result != PointerEventDispatchResult::RunDefaultActions;
     }
+
+    auto result_of_move = [&](EventResult result) { return page_cancelled_move ? EventResult::Cancelled : result; };
 
     // NB: Dispatching an event may have disturbed the world.
     if (m_navigable->active_document() != document)
-        return EventResult::Accepted;
+        return result_of_move(EventResult::Accepted);
 
     if (!m_middle_button_scroll_handler && !is_handling_mouse_selection())
-        return EventResult::Handled;
+        return result_of_move(EventResult::Handled);
 
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseMove);
     if (!has_committed_root_box())
-        return EventResult::Accepted;
+        return result_of_move(EventResult::Accepted);
 
     if (m_middle_button_scroll_handler)
         m_middle_button_scroll_handler->update_mouse_position(visual_viewport_position);
 
+    // https://w3c.github.io/uievents/#event-type-mousemove
+    // NB: The event has no default action, so a page that cancels it leaves a drag going.
     update_mouse_selection(read, visual_viewport_position);
-    return EventResult::Handled;
+    return result_of_move(EventResult::Handled);
 }
 
 static GC::Ptr<DOM::Node> target_for_click_event(DOM::Node* mouse_down_target, DOM::Node& mouse_up_target)
@@ -1391,7 +1402,7 @@ void EventHandler::update_hover_at_last_known_mouse_position(Optional<i64> visua
     if (m_mousedown_target)
         return;
 
-    update_hover_after_scroll(*m_last_known_mouse_visual_viewport_position, m_last_known_mouse_screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers, {}, visual_animation_sample_time_nanoseconds);
+    update_hover_after_scroll(HoverUpdateCause::PointerRests, *m_last_known_mouse_visual_viewport_position, m_last_known_mouse_screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers, {}, visual_animation_sample_time_nanoseconds);
 }
 
 // AD-HOC: `hover_target`, where given, is the element the render clock's lane hovered at the position, which the screen
@@ -1411,7 +1422,7 @@ void EventHandler::update_hover_at(CSSPixelPoint visual_viewport_position, GC::P
     Optional<i64> visual_animation_sample_time_nanoseconds;
     if (!hover_target)
         visual_animation_sample_time_nanoseconds = m_visual_animation_sample_time_nanoseconds;
-    update_hover_after_scroll(visual_viewport_position, screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers, hover_target, visual_animation_sample_time_nanoseconds);
+    update_hover_after_scroll(HoverUpdateCause::PointerMoved, visual_viewport_position, screen_position, UIEvents::MouseButton::None, m_last_known_mouse_buttons, m_last_known_mouse_modifiers, hover_target, visual_animation_sample_time_nanoseconds);
 }
 
 // AD-HOC: The hover and the cursor follow what is under the pointer while it rests. A frame may move what is there,
@@ -1497,12 +1508,18 @@ bool EventHandler::update_hover_where_the_pointer_rests(HTML::HoverUpdatePoint h
     return false;
 }
 
-void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target, Optional<i64> visual_animation_sample_time_nanoseconds)
+void EventHandler::update_hover_after_scroll(HoverUpdateCause cause, CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, GC::Ptr<DOM::Node> hover_target, Optional<i64> visual_animation_sample_time_nanoseconds)
 {
     if (m_effective_legacy_mouse_pointer_type != PointerType::Mouse)
         return;
     if (should_ignore_device_input_event())
         return;
+    // NB: A pointer at rest waits for a scroll of the user's to stop moving, here or in the frame the update reached.
+    //     The update then starts from this position, of which a nested navigable hears nothing else.
+    if (cause == HoverUpdateCause::PointerRests && m_navigable->leave_hover_update_to_end_of_user_scroll()) {
+        record_last_known_mouse_position(visual_viewport_position, screen_position, buttons, modifiers);
+        return;
+    }
 
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active())
@@ -1579,7 +1596,7 @@ void EventHandler::update_hover_after_scroll(CSSPixelPoint visual_viewport_posit
     if (!hover_target) {
         auto nested_navigable = local_nested_navigable_at(*target_layout_node, node);
         auto dispatch_result = dispatch_event_to_nested_navigable(*this, *target_layout_node, node, visual_viewport_position, nullptr, [&](EventHandler& event_handler, CSSPixelPoint position) {
-            event_handler.update_hover_after_scroll(position, screen_position, button, buttons, modifiers);
+            event_handler.update_hover_after_scroll(cause, position, screen_position, button, buttons, modifiers);
             return EventResult::Handled;
         });
         if (dispatch_result.has_value()) {
@@ -3532,6 +3549,9 @@ void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, 
     }
 #endif
 
+    if (!fire_selectstart_event(read, document, visual_viewport_position, caret_position, user_select))
+        return;
+
     auto selection_started = [&] {
         if (click_count == 3)
             return initiate_paragraph_selection(document, *caret_position, user_select);
@@ -3550,6 +3570,49 @@ void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, 
         if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_layout_node))
             m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
     }
+}
+
+// https://w3c.github.io/selection-api/#selectstart-event
+bool EventHandler::dispatch_selectstart_event(DOM::Document& document, DOM::Node& target)
+{
+    // When the user agent is about to associate a new range newRange to the selection in response to a user initiated
+    // action, the user agent must fire an event named selectstart, which bubbles and is cancelable, at the node
+    // associated with the boundary point of newRange's start prior to changing the selection if the selection was
+    // previously empty or the previously associated range was collapsed.
+    // INTEROP: Blink and WebKit fire it for any press that starts a selection, whatever the selection was before, which
+    //          is what lets a page keep the user from selecting its text at all.
+    auto event = DOM::Event::create(HTML::EventNames::selectstart, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(document)));
+    event->set_bubbles(true);
+    event->set_cancelable(true);
+    event->set_is_trusted(true);
+
+    // If the event is canceled, the user agent must not change the selection.
+    if (!target.dispatch_event(event))
+        return false;
+
+    // NB: Dispatching an event may have disturbed the world.
+    return m_navigable->active_document().ptr() == &document;
+}
+
+bool EventHandler::fire_selectstart_event(Layout::BegunRead const& read, DOM::Document& document, CSSPixelPoint visual_viewport_position, Optional<Painting::CaretPosition>& caret_position, CSS::UserSelect& user_select)
+{
+    auto target = caret_position->boundary_node();
+    if (!target || !dispatch_selectstart_event(document, *target))
+        return false;
+
+    // NB: A listener may have changed what the caret position points into, even if it left layout up to date.
+    document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
+    if (!has_committed_root_box())
+        return false;
+    GC::Ptr<DOM::Node> hit_node;
+    if (auto hit = document.hit_test(read, visual_viewport_position); hit.has_value())
+        hit_node = hit->dom_node();
+    auto editing_host = hit_node ? associated_descendant_editing_host(read, *hit_node) : nullptr;
+    caret_position = caret_position_for_mouse_selection(read, document, visual_viewport_position, hit_node, editing_host);
+    if (!caret_position.has_value())
+        return false;
+    user_select = user_select_used_value_for_caret_position(read, *caret_position);
+    return user_select != CSS::UserSelect::None;
 }
 
 Optional<Painting::CaretPosition> EventHandler::prepare_mouse_selection(DOM::Document& document, CSSPixelPoint visual_viewport_position)
@@ -3581,11 +3644,19 @@ Optional<Painting::CaretPosition> EventHandler::prepare_mouse_selection(DOM::Doc
             return {};
         focus_candidate = focus_candidate_for_position(read, visual_viewport_position);
     }
-    if (focus_candidate)
-        HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
-    else if (auto focused_area = document.focused_area())
-        HTML::run_unfocusing_steps(focused_area);
 
+    if (focus_candidate) {
+        HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
+    } else {
+        // INTEROP: For clicks without a focusable target, focus the clicked document's viewport.
+        HTML::run_focusing_steps(&document);
+    }
+
+    return caret_position_for_mouse_selection(read, document, visual_viewport_position, editable_hit_node_before_focus, editing_host_before_focus);
+}
+
+Optional<Painting::CaretPosition> EventHandler::caret_position_for_mouse_selection(Layout::BegunRead const& read, DOM::Document& document, CSSPixelPoint visual_viewport_position, GC::Ptr<DOM::Node> editable_hit_node_before_focus, GC::Ptr<DOM::Node> editing_host_before_focus)
+{
     // NB: Focusing may have invalidated layout.
     document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
     if (!has_committed_root_box())
@@ -3713,6 +3784,9 @@ bool EventHandler::select_word_at_position(Layout::BegunRead const& read, DOM::D
     if (user_select == CSS::UserSelect::None)
         return false;
 
+    if (!fire_selectstart_event(read, document, visual_viewport_position, caret_position, user_select))
+        return false;
+
     if (initiate_word_selection(read, document, *caret_position, user_select)) {
         stop_updating_selection();
         return true;
@@ -3733,6 +3807,9 @@ void EventHandler::start_selection_from_preserved_mousedown(Layout::BegunRead co
 
     auto user_select = user_select_used_value_for_caret_position(read, *caret_position);
     if (user_select == CSS::UserSelect::None)
+        return;
+
+    if (!fire_selectstart_event(read, document, *m_mousedown_visual_viewport_position, caret_position, user_select))
         return;
 
     if (!initiate_character_selection(document, *caret_position, user_select, false))
@@ -4325,6 +4402,10 @@ bool EventHandler::select_context_menu_text(Layout::BegunRead const& read, DOM::
     if (all_of(range->to_string(), Unicode::code_point_has_white_space_property) || !range_contains_viewport_position(*range, coordinates.viewport_position))
         return false;
 
+    // NB: The range follows what a listener changes, unless the listener takes the text away.
+    if (!dispatch_selectstart_event(document, *hit_node) || range->start_container().ptr() != hit_node || range->end_container().ptr() != hit_node)
+        return false;
+
     if (auto* target = document.active_input_events_target(hit_node)) {
         target->set_selection_anchor(*hit_node, range->start_offset());
         target->set_selection_focus(*hit_node, range->end_offset());
@@ -4381,6 +4462,43 @@ GC::Ptr<DOM::Range> EventHandler::context_menu_url_token_range(DOM::Text& hit_no
         return {};
 
     return DOM::Range::create(hit_node, token_start, hit_node, token_end);
+}
+
+static CSS::StyleNodeID style_node_of_text_or_element(DOM::Node const& node)
+{
+    if (auto const* text = as_if<DOM::Text>(node))
+        return text->style_node_id();
+    if (auto const* element = as_if<DOM::Element>(node))
+        return element->style_node_id();
+    return {};
+}
+
+Optional<EventHandler::SelectionDragForLanes> EventHandler::selection_drag_for_lanes(Layout::BegunRead const& read) const
+{
+    if (m_selection_mode != SelectionMode::Character || m_mouse_selection_target)
+        return {};
+    // NB: A press on something draggable drags it once the pointer leaves the drag threshold, which ends the selection.
+    if (auto mousedown_target = m_mousedown_target.ptr(); m_mousedown_target_is_drag_candidate && mousedown_target
+        && DragAndDropEventHandler::first_draggable_inclusive_ancestor(*mousedown_target))
+        return {};
+    auto document = m_navigable->active_document();
+    if (!document)
+        return {};
+    auto selection = document->get_selection();
+    if (!selection)
+        return {};
+    auto anchor = selection->anchor_node();
+    if (!anchor || !anchor->is_connected())
+        return {};
+    auto anchor_style_node = style_node_of_text_or_element(*anchor);
+    if (!anchor_style_node)
+        return {};
+    SelectionDragForLanes drag { .anchor = anchor_style_node, .anchor_offset = selection->anchor_offset(), .anchor_child = {}, .scrollport = {} };
+    for (auto* child = anchor->child_at_index(selection->anchor_offset()); child && !drag.anchor_child; child = child->next_sibling())
+        drag.anchor_child = style_node_of_text_or_element(*child);
+    if (m_auto_scroll_handler)
+        drag.scrollport = m_auto_scroll_handler->scrollport_in_viewport(read);
+    return drag;
 }
 
 void EventHandler::update_mouse_selection(Layout::BegunRead const& read, CSSPixelPoint visual_viewport_position)

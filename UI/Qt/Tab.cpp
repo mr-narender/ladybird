@@ -14,6 +14,7 @@
 #include <LibWakeLock/DisplaySleepInhibitor.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
@@ -547,26 +548,27 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         dialog->open();
     };
 
-    // A site's request for a permission hangs from the site settings button, or from the field when the page has no
-    // such button.
     m_permission_prompts.create_popover = [this](WebView::PermissionPromptRequest const& request) {
         auto* popover = new PermissionPromptPopover(this, request);
         popover->update_chrome_style(palette());
         auto position = [this, popover] {
-            auto& anchor = m_location_edit->site_settings_button();
-            QWidget& anchor_or_field = anchor.isVisible() ? anchor : static_cast<QWidget&>(*m_location_edit);
-            move_popover_below(*popover, anchor_or_field, PopoverAlignment::Leading);
+            move_popover_below(*popover, site_settings_anchor(), PopoverAlignment::Leading);
         };
         popover->adjustSize();
         position();
-        popover->on_shown = AK::move(position);
+        popover->on_shown = [this, position = AK::move(position), request] {
+            position();
+            view().did_show_permission_prompt(request);
+        };
+        popover->on_open_settings = [] {
+            Application::the().microphone_authorizer().open_system_settings();
+        };
         return popover;
     };
 
     view().on_request_permission = [this](WebView::PermissionPromptRequest const& request, WebView::PermissionPromptCallback on_outcome) {
-        // A tab opened in the background has never been shown, so no hideEvent has suspended its prompts yet.
-        if (!isVisible())
-            m_permission_prompts.suspend();
+        // A tab opened in the background, or in a window that was never active, has had nothing hold its prompts yet.
+        update_permission_prompts();
         m_permission_prompts.enqueue(request, AK::move(on_outcome));
     };
 
@@ -1245,15 +1247,23 @@ void Tab::hideEvent(QHideEvent* event)
         return;
 
     hide_hover_label();
-
-    // A tab's permission prompt waits, unanswered, while another tab is shown.
-    m_permission_prompts.suspend();
+    update_permission_prompts();
 }
 
 void Tab::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
-    m_permission_prompts.resume();
+    update_permission_prompts();
+}
+
+// A tab's permission prompt waits, unanswered, while another tab is shown or another window is active. A popup that
+// comes up over an inactive window is closed by the next click or activation anywhere else.
+void Tab::update_permission_prompts()
+{
+    if (isVisible() && isActiveWindow())
+        m_permission_prompts.resume();
+    else
+        m_permission_prompts.suspend();
 }
 
 void Tab::update_hover_label()
@@ -1346,9 +1356,11 @@ QImage Tab::render_hover_text(QString const& text) const
 
 bool Tab::event(QEvent* event)
 {
-    // An inactive window's toolbar icons drop to the muted color.
-    if ((event->type() == QEvent::WindowActivate || event->type() == QEvent::WindowDeactivate) && is_loaded())
+    if ((event->type() == QEvent::WindowActivate || event->type() == QEvent::WindowDeactivate) && is_loaded()) {
+        // An inactive window's toolbar icons drop to the muted color.
         recreate_location_edit_icons();
+        update_permission_prompts();
+    }
 
     if (event->type() == QEvent::PaletteChange && is_loaded()) {
         update_chrome_style();
@@ -1513,13 +1525,18 @@ void Tab::show_site_settings_popover()
         .content_blocking = view().content_blocking_snapshot(),
         .permissions = view().site_permission_rows(),
     });
-    // The site settings button is hidden for a page with no host, so the popover hangs from the field then.
-    auto& anchor = m_location_edit->site_settings_button();
-    QWidget& anchor_or_field = anchor.isVisible() ? anchor : static_cast<QWidget&>(*m_location_edit);
-    move_popover_below(*m_site_settings_popover, anchor_or_field, PopoverAlignment::Leading);
+    move_popover_below(*m_site_settings_popover, site_settings_anchor(), PopoverAlignment::Leading);
     m_site_settings_popover->show();
-    move_popover_below(*m_site_settings_popover, anchor_or_field, PopoverAlignment::Leading);
+    move_popover_below(*m_site_settings_popover, site_settings_anchor(), PopoverAlignment::Leading);
     m_site_settings_popover->raise();
+}
+
+// What the popovers about a site hang from: the site settings button, or the field for a page with no host, which has no
+// such button.
+QWidget& Tab::site_settings_anchor() const
+{
+    auto& button = m_location_edit->site_settings_button();
+    return button.isVisible() ? button : static_cast<QWidget&>(*m_location_edit);
 }
 
 // The rows are read again for the site the panel was opened for; a panel whose tab has moved on to another site closes
