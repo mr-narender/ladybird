@@ -28,6 +28,7 @@
 #include <UI/Qt/ExternalURLHandler.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/PictureInPictureWindow.h>
+#include <UI/Qt/PlainText.h>
 #include <UI/Qt/ProcessManagerWindow.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/Tab.h>
@@ -236,6 +237,7 @@ public:
         install_appkit_event_capture();
 #endif
         update_chrome_style();
+        installEventFilter(&m_plain_text_event_filter);
 
         // Suppress some warnings that end up flooding the console when Orca is in use. QSpiAccessibleBridge logs both
         // (1) one-time at startup, a couple warnings for some AT-SPI2 methods it doesn't implement, and (2) for *every*
@@ -541,6 +543,8 @@ private:
     // The application actions require a QWidget owner, which we don't have at the time of creation. We use this dummy
     // widget instead, which we also can't properly parent as it would need a QWidget owner as well.
     OwnPtr<QWidget> m_application_widget { nullptr };
+
+    PlainTextEventFilter m_plain_text_event_filter;
 
 #if defined(AK_OS_MACOS)
     QMenuBar* m_menu_bar { nullptr };
@@ -1519,16 +1523,23 @@ NonnullRefPtr<Core::Promise<ByteString>> Application::ask_user_for_download_path
     return promise;
 }
 
+static QMessageBox* create_message_box(QMessageBox::Icon icon, StringView text, QWidget* parent)
+{
+    auto* dialog = new QMessageBox(parent);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle("Ladybird");
+    dialog->setIcon(icon);
+    dialog->setTextFormat(Qt::PlainText);
+    dialog->setText(qstring_from_ak_string(text));
+    dialog->addButton(QMessageBox::Ok);
+    return dialog;
+}
+
 void Application::display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const
 {
     auto message = MUST(String::formatted("{} saved to: {}", download_name, path));
 
-    auto* dialog = new QMessageBox(active_window_if_any());
-    dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->setWindowTitle("Ladybird");
-    dialog->setIcon(QMessageBox::Information);
-    dialog->setText(qstring_from_ak_string(message));
-    dialog->addButton(QMessageBox::Ok);
+    auto* dialog = create_message_box(QMessageBox::Information, message, active_window_if_any());
 
     auto* open_folder_button = dialog->addButton(QMessageBox::Open);
     open_folder_button->setText("Open folder");
@@ -1546,9 +1557,7 @@ void Application::display_error_dialog(StringView error_message) const
         return;
     }
 
-    auto* dialog = new QMessageBox(QMessageBox::Warning, "Ladybird", qstring_from_ak_string(error_message), QMessageBox::Ok, active_window_if_any());
-    dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->open();
+    create_message_box(QMessageBox::Warning, error_message, active_window_if_any())->open();
 }
 
 void Application::open_download(WebView::FileDownloader::Download const& download) const

@@ -22,10 +22,17 @@ use super::broadcast_channel::{BROADCAST_CHANNEL_MESSAGE_CLASS, BroadcastChannel
 use super::image_bitmap::ImageBitmap;
 use super::image_data::ImageData;
 use super::message_port::MessagePort;
+use super::storage::{Storage, StorageType};
+use super::storage_event::{StorageEvent, StorageEventInit};
 use crate::bindings::CallContext;
+use crate::bindings::conversions::UsvString;
+use crate::bindings::environment_settings_object::relevant_settings_object;
 use crate::bindings::event_target::CppEventTarget;
 use crate::bindings::interface::{Interface, Ref, cell_from_abi, cell_into_abi, realm_arguments};
+use crate::dom::event::EventInit;
 use crate::html::structured_serialize::message_record::MessageRecord;
+use crate::storage_api::storage_area_mirror::StorageEndpointType;
+use crate::storage_api::storage_bottle::{obtain_a_local_storage_bottle_map, obtain_a_session_storage_bottle_map};
 use crate::storage_api::storage_key::StorageKey;
 
 /// The implementation of the object whose cell C++ lends, for as long as C++ keeps the cell alive.
@@ -389,4 +396,91 @@ pub unsafe extern "C" fn web_rust_broadcast_channel_deliver_message_locally(
         },
     });
     BroadcastChannel::deliver_message_locally(vm, message, None);
+}
+
+/// A new Storage object of the type, 0 for "local" and 1 for "session", for the Window of the realm, whose map is a new
+/// storage proxy map over the bottle for the realm's settings object: steps 2 to 4 of the localStorage and
+/// sessionStorage getters. Null when obtaining the bottle map fails.
+///
+/// # Safety
+///
+/// The pointers must be the live VM and the live realm of a Window.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_create_storage(
+    vm: *mut c_void,
+    realm: *mut c_void,
+    storage_type: u8,
+) -> *mut c_void {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    let storage_type = StorageType::from_abi(storage_type);
+    let environment = relevant_settings_object(realm.global_object());
+    let map = match storage_type {
+        StorageType::Local => obtain_a_local_storage_bottle_map(&environment, StorageEndpointType::LocalStorage),
+        StorageType::Session => obtain_a_session_storage_bottle_map(&environment, StorageEndpointType::SessionStorage),
+    };
+    map.map_or(core::ptr::null_mut(), |map| {
+        cell_into_abi(Storage::create(vm, realm, storage_type, map))
+    })
+}
+
+/// Loads the map of the Storage object now rather than on first access, so changes other processes make start
+/// arriving.
+///
+/// # Safety
+///
+/// `storage` must be the live cell of a Storage object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_storage_connect(storage: *mut c_void) {
+    // SAFETY: The caller passes a live Storage object.
+    unsafe { object_from_abi::<Storage>(storage) }.map().connect();
+}
+
+/// Calls `on_item` with each key of the map of the Storage object and its value, raw AK::Utf16Strings that Rust lends
+/// for the call.
+///
+/// # Safety
+///
+/// `storage` must be the live cell of a Storage object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_storage_for_each_item(
+    storage: *mut c_void,
+    ctx: *mut c_void,
+    on_item: unsafe extern "C" fn(*mut c_void, usize, usize),
+) {
+    // SAFETY: The caller passes a live Storage object.
+    let map = unsafe { object_from_abi::<Storage>(storage) }.map();
+    for key in map.keys() {
+        if let Some(value) = map.get(&key) {
+            // SAFETY: The strings outlive the call.
+            unsafe { on_item(ctx, key.raw_identity(), value.raw_identity()) };
+        }
+    }
+}
+
+/// The Event of a new StorageEvent in the realm whose type is the empty string and whose attributes are their
+/// defaults, for createEvent().
+///
+/// # Safety
+///
+/// The pointers must be the live VM and a live realm.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_rust_html_create_storage_event(vm: *mut c_void, realm: *mut c_void) -> *mut c_void {
+    // SAFETY: The caller passes the live VM and a live realm.
+    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+    let event_init = StorageEventInit {
+        parent: EventInit {
+            bubbles: false,
+            cancelable: false,
+            composed: false,
+        },
+        key: None,
+        old_value: None,
+        new_value: None,
+        url: UsvString::from_utf8(""),
+        storage_area: None,
+    };
+    StorageEvent::create(vm, realm, &Utf16String::from_utf8(""), event_init)
+        .event()
+        .as_ptr()
 }

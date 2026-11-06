@@ -227,6 +227,16 @@ interface Internals {
 
     DOMString dumpDisplayList();
     DOMString dumpAccessibilityTree();
+    // The per-character offsets that the accessibility tree reports for a text node, as space-separated "x,y" pairs.
+    DOMString accessibilityCharacterOffsets(Node node);
+    // The accessibility node data the UI process receives for a node and its exposed descendants, one line per node.
+    DOMString dumpAccessibilityNodeData(Node node);
+    // Each accessible name or description kept between builds of the accessibility tree that differs from what
+    // computing it again gives, one per line. Empty when every one is current.
+    DOMString accessibilityCachedTextMismatches();
+    // Each node whose accessibility data kept between builds of the tree differs from what computing it again gives,
+    // one per line. Empty when all of it is current.
+    DOMString accessibilityCachedRecordMismatches();
     DOMString dumpLayoutTree(Node node);
     DOMString dumpStackingContextTree();
     DOMString stackingContextStructureVerificationReport();
@@ -253,6 +263,9 @@ interface Internals {
     // Traverses the history by a delta as the browser's Back and Forward buttons do, with no source document.
     undefined traverseHistoryThroughUIProcess(long delta);
     Promise<undefined> flushSessionHistoryTraversalQueue();
+    // Uses up this navigable's navigations and history updates until the state reset between tests, as if the page had
+    // just made as many as the rate limit allows.
+    undefined exhaustNavigationRateLimit();
 
     boolean hasHTMLParserEndState(Document document);
     boolean htmlParserBodyIsExhausted(Document document);
@@ -463,8 +476,11 @@ interface Internals {
     boolean mediaElementIsFetching(HTMLMediaElement element);
     boolean mediaElementIsPlayingAudio(HTMLMediaElement element);
     boolean documentIsPlayingAudio(Document document);
-    // Whether the UI process shows this window's tab as playing audio, which the AudioServer decides by what it hears.
+    // Whether the UI process shows this window's tab as playing audio: while the AudioServer has recently heard the tab,
+    // and for a while after.
     boolean tabIsPlayingAudio();
+    // Whether the AudioServer has recently heard this window's tab, whatever the tab shows.
+    boolean tabIsHeardPlayingAudio();
     // How many times the UI process has changed whether this window's tab is shown as playing audio.
     unsigned long long tabAudibilityChangeCount();
     boolean mediaElementVideoSinkIsTicking(HTMLMediaElement element);

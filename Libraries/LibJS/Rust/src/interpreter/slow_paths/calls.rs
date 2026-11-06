@@ -27,6 +27,8 @@ use crate::runtime::abstract_operations::{
 };
 use crate::runtime::array::Array;
 use crate::runtime::bound_function::BoundFunction;
+use crate::runtime::class_construction::ClassHeritage;
+use crate::runtime::class_construction::class_proto_parent;
 use crate::runtime::class_construction::construct_class;
 use crate::runtime::class_field_definition::ClassElementName;
 use crate::runtime::completion::{Must, ThrowCompletionOr};
@@ -43,7 +45,7 @@ use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFun
 use crate::runtime::object::{Object, StackFrameInfo};
 use crate::runtime::property_attributes::DEFAULT_ATTRIBUTES;
 use crate::runtime::property_key::PropertyKey;
-use crate::runtime::shared_function_instance_data::{ConstructorKind, FunctionKind};
+use crate::runtime::shared_function_instance_data::{ClassFieldInitializerName, ConstructorKind, FunctionKind};
 use crate::utf16::Utf16Display;
 
 /// Op::CallType: how a call instruction calls its callee.
@@ -156,6 +158,29 @@ fn element_key_operands(instruction: &op::NewClass) -> &[OptionalOperand] {
     instruction.element_keys()
 }
 
+/// The [[ClassFieldInitializerName]] of the running field initializer, whose field has a computed key.
+pub fn get_class_field_initializer_name(
+    vm: &Vm,
+    pc: u32,
+    values: &mut op::GetClassFieldInitializerNameValues,
+) -> SlowPathControl {
+    let function = running_execution_context(vm)
+        .function
+        .get()
+        .and_then(as_ecmascript_function_object)
+        .expect("a field initializer is an ECMAScript function");
+    let ClassFieldInitializerName::PropertyKey(name) = function.class_field_initializer_name() else {
+        unreachable!("a field with a computed key is named by a property key");
+    };
+    values.dst = name.to_value(vm);
+    SlowPathControl::continue_at(pc + op::GetClassFieldInitializerName::LENGTH)
+}
+
+pub fn get_class_proto_parent(vm: &Vm, pc: u32, values: &mut op::GetClassProtoParentValues) -> SlowPathControl {
+    values.dst = asm_try!(vm, pc, class_proto_parent(vm, values.super_class));
+    SlowPathControl::continue_at(pc + op::GetClassProtoParent::LENGTH)
+}
+
 pub fn new_class(
     vm: &Vm,
     pc: u32,
@@ -163,9 +188,13 @@ pub fn new_class(
     values: &mut op::NewClassValues,
     element_keys: &mut [Value],
 ) -> SlowPathControl {
-    let mut super_class = Value::UNDEFINED;
+    let mut heritage = None;
     if instruction.super_class.get().is_some() {
-        super_class = values.super_class;
+        assert!(instruction.proto_parent.get().is_some());
+        heritage = Some(ClassHeritage {
+            super_class: values.super_class,
+            proto_parent: values.proto_parent,
+        });
     }
     // NB: The element keys stay in the operand record the interpreter passed, which lives on its stack, so the keys
     //     of elements without one become undefined in place.
@@ -186,10 +215,12 @@ pub fn new_class(
     if !blueprint.has_name
         && let Some(lhs_name) = instruction.lhs_name.get()
     {
-        class_name = executable.get_identifier(lhs_name).clone();
+        class_name = ClassElementName::PropertyKey(PropertyKey::from(executable.get_identifier(lhs_name).clone()));
+    } else if !blueprint.has_name && instruction.computed_name.get().is_some() {
+        class_name = ClassElementName::PropertyKey(asm_try!(vm, pc, values.computed_name.to_property_key(vm)));
     } else {
-        class_name = blueprint.name.clone();
-        binding_name = Some(class_name.clone());
+        class_name = ClassElementName::PropertyKey(PropertyKey::from(blueprint.name.clone()));
+        binding_name = Some(blueprint.name.clone());
     }
 
     let retval = asm_try!(
@@ -201,7 +232,7 @@ pub fn new_class(
             executable,
             Some(class_environment),
             outer_environment,
-            super_class,
+            heritage,
             element_keys,
             binding_name.as_ref(),
             &class_name,

@@ -11,19 +11,23 @@
 #include <LibJS/Runtime/Realm.h>
 #include <LibURL/RustIntegration.h>
 #include <LibWeb/Bindings/DOMException.h>
+#include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/Bindings/RustSerialization.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/CustomElements/CustomElementReactions.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/CallbackType.h>
@@ -100,17 +104,28 @@ JSObject* web_bindings_rejected_promise(void* current_realm, JSValue this_value,
 void web_bindings_queue_a_microtask(void* realm, JSObject* function);
 void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
-u64 web_bindings_queue_a_global_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
+u64 web_bindings_queue_a_global_task(JSObject* global_object, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_remove_tasks(void* realm, ReadonlySpan<u64> task_ids);
 u64 web_bindings_currently_running_task(void* realm);
 void* web_bindings_create_callback_function(JSObject* callable, bool returns_promise);
 JSCompletion web_bindings_invoke_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
 void* web_bindings_invoke_promise_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
+void web_bindings_push_element_queue();
+void web_bindings_pop_element_queue_and_invoke_reactions();
 bool web_bindings_realm_is_window(void* realm);
+bool web_bindings_realm_is_secure_context(void* realm);
 HTML::Window* web_bindings_window_from_global_object(JSObject* global_object);
+void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTML::Window*));
 DOM::Document* web_bindings_window_associated_document(HTML::Window*);
+u64 web_bindings_window_page_id(HTML::Window*);
+DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window*);
+bool web_bindings_document_has_navigable(DOM::Document*);
 bool web_bindings_document_is_fully_active(DOM::Document*);
+URL::FFI::RustUrl web_bindings_document_url(DOM::Document*);
 HTML::WorkerGlobalScope* web_bindings_worker_global_scope_from_global_object(JSObject* global_object);
+HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object);
+JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject*);
+void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject*, void* ctx, void (*on_id)(void*, ReadonlyBytes));
 bool web_bindings_worker_global_scope_is_closing(HTML::WorkerGlobalScope*);
 void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*));
 bool web_bindings_object_implements_interface(JSObject* object, u16 interface_name);
@@ -136,6 +151,9 @@ void web_bindings_message_port_transport_close_after_sending_all_pending_message
 bool web_bindings_message_port_transport_send(IPC::Transport*, HTML::SerializedTransferRecord const*);
 bool web_bindings_message_port_transport_read_messages(IPC::Transport*, void* records, void (*append)(void*, HTML::SerializedTransferRecord*));
 
+void* web_css_wrap_object(void* realm, void* cell);
+void* web_css_realm_document(void* realm);
+
 void* web_bindings_wrapper_world(void* realm, bool* is_main_world)
 {
     auto& wrapper_world = host_defined_wrapper_world(*static_cast<JS::Realm*>(realm));
@@ -156,6 +174,35 @@ void web_bindings_set_rust_wrapper(void* realm, void* cell, JSObject* wrapper)
     host_defined_wrapper_world(*static_cast<JS::Realm*>(realm)).set_rust_wrapper(*static_cast<RustInterfaceCell*>(cell), host_object);
 }
 
+void* web_css_wrap_object(void* realm, void* cell)
+{
+    auto& js_realm = *static_cast<JS::Realm*>(realm);
+    auto& wrappable = *static_cast<GCAllocatedWrappable*>(static_cast<GC::Cell*>(cell));
+    auto wrapper = wrap(host_defined_wrapper_world(js_realm), js_realm, GC::Ref<Wrappable> { wrappable });
+    return JS::HostABI::object_to_abi(wrapper.ptr());
+}
+
+void* web_css_realm_document(void* realm)
+{
+    return static_cast<GC::Cell*>(const_cast<DOM::Document*>(HTML::relevant_window(static_cast<JS::Realm*>(realm)->global_object()).document().ptr()));
+}
+
+bool web_bindings_realm_is_secure_context(void* realm)
+{
+    return HTML::is_secure_context(principal_host_defined_environment_settings_object(*static_cast<JS::Realm*>(realm)));
+}
+
+void web_bindings_push_element_queue()
+{
+    main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.append({});
+}
+
+void web_bindings_pop_element_queue_and_invoke_reactions()
+{
+    auto queue = main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.take_last();
+    HTML::invoke_custom_element_reactions(queue);
+}
+
 bool web_bindings_realm_is_window(void* realm)
 {
     return HTML::window_from_global_object(static_cast<JS::Realm*>(realm)->global_object());
@@ -166,14 +213,57 @@ HTML::Window* web_bindings_window_from_global_object(JSObject* global_object)
     return HTML::window_from_global_object(*JS::HostABI::object_from_abi(global_object));
 }
 
+void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTML::Window*))
+{
+    HTML::Window::for_each_active([&](HTML::Window& window) {
+        on_window(ctx, &window);
+        return IterationDecision::Continue;
+    });
+}
+
 DOM::Document* web_bindings_window_associated_document(HTML::Window* window)
 {
     return &window->associated_document();
 }
 
+u64 web_bindings_window_page_id(HTML::Window* window)
+{
+    return window->page().client().id().value();
+}
+
+DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window* window)
+{
+    return window;
+}
+
+bool web_bindings_document_has_navigable(DOM::Document* document)
+{
+    return document->navigable() != nullptr;
+}
+
 bool web_bindings_document_is_fully_active(DOM::Document* document)
 {
     return document->is_fully_active();
+}
+
+URL::FFI::RustUrl web_bindings_document_url(DOM::Document* document)
+{
+    return document->url().to_rust();
+}
+
+HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object)
+{
+    return &HTML::relevant_settings_object(*JS::HostABI::object_from_abi(global_object));
+}
+
+JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject* settings_object)
+{
+    return JS::HostABI::object_to_abi(&settings_object->global_object());
+}
+
+void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject* settings_object, void* ctx, void (*on_id)(void*, ReadonlyBytes))
+{
+    on_id(ctx, settings_object->id.to_string().bytes());
 }
 
 HTML::WorkerGlobalScope* web_bindings_worker_global_scope_from_global_object(JSObject* global_object)
@@ -400,6 +490,7 @@ void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, 
 static_assert(to_underlying(HTML::Task::Source::Unspecified) == 0);
 static_assert(to_underlying(HTML::Task::Source::Networking) == 3);
 static_assert(to_underlying(HTML::Task::Source::FileReading) == 13);
+static_assert(to_underlying(HTML::Task::Source::Storage) == 29);
 
 void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
 {
@@ -411,12 +502,12 @@ void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*s
     }));
 }
 
-u64 web_bindings_queue_a_global_task(void* realm, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
+u64 web_bindings_queue_a_global_task(JSObject* global_object, u8 task_source, void* cell, void (*steps)(JSVM*, void*))
 {
-    GC::Ref<JS::Realm> js_realm = *static_cast<JS::Realm*>(realm);
+    auto& global = *JS::HostABI::object_from_abi(global_object);
     // NB: The task's captures, which the collector scans, keep the cell alive until the steps run.
-    auto task_id = HTML::queue_global_task(static_cast<HTML::Task::Source>(task_source), js_realm->global_object(), GC::create_function(GC::Heap::the(), [js_realm, cell, steps] {
-        steps(JS::HostABI::vm_to_abi(js_realm->vm()), cell);
+    auto task_id = HTML::queue_global_task(static_cast<HTML::Task::Source>(task_source), global, GC::create_function(GC::Heap::the(), [&vm = global.vm(), cell, steps] {
+        steps(JS::HostABI::vm_to_abi(vm), cell);
     }));
     return task_id.value();
 }

@@ -6,6 +6,7 @@
 
 #include <AK/HashTable.h>
 #include <LibTest/TestCase.h>
+#include <LibWebCommon/WebView/AccessibilityTreePublisher.h>
 #include <LibWebView/AccessibilityTreeManager.h>
 
 namespace {
@@ -296,4 +297,458 @@ TEST_CASE(insertion_into_off_live_region_is_not_announced)
     manager.update_tree(move(second));
 
     EXPECT(announcements.is_empty());
+}
+
+namespace {
+
+// Every node of the tree held, in depth-first order, as "id(parent)[children] name" - so a test can check a tree
+// exactly, and check that a rejected delta left it exactly as it was.
+ByteString describe_tree(WebView::AccessibilityTreeManager const& manager)
+{
+    StringBuilder builder;
+    Vector<i64> stack;
+    if (manager.root_id() != -1)
+        stack.append(manager.root_id());
+    while (!stack.is_empty()) {
+        auto const* node = manager.node(stack.take_last());
+        if (!node) {
+            builder.append("missing "sv);
+            continue;
+        }
+        builder.appendff("{}({})[", node->id, node->parent_id);
+        builder.join(',', node->child_ids);
+        builder.appendff("]{} ", node->name);
+        for (size_t i = node->child_ids.size(); i > 0; --i)
+            stack.append(node->child_ids[i - 1]);
+    }
+    return builder.to_byte_string();
+}
+
+// 0 holds 1 and 2; 1 holds 3 and 4. 0 is a live region, so any change a delta makes to a name would announce.
+void seed_base_tree(WebView::AccessibilityTreeManager& manager)
+{
+    Vector<WebView::AccessibilityNodeData> nodes;
+    nodes.append(make_named_node(0, -1, ""sv, "polite"sv, { 1, 2 }));
+    nodes.append(make_node(1, 0, { 3, 4 }));
+    nodes.append(make_node(2, 0));
+    nodes.append(make_node(3, 1));
+    nodes.append(make_node(4, 1));
+    manager.update_tree(move(nodes));
+}
+
+}
+
+TEST_CASE(delta_changes_inserts_moves_and_removes_nodes)
+{
+    WebView::AccessibilityTreeManager manager;
+    seed_base_tree(manager);
+    auto generation = manager.generation();
+
+    // Rename 3, move 4 from 1 to 2, and give 2 a new child 5. 4's own data doesn't change, and 5 claims a wrong parent:
+    // The parent comes from the child lists alone.
+    WebView::AccessibilityTreeDelta delta;
+    delta.changed_nodes.append(make_node(1, 0, { 3 }));
+    delta.changed_nodes.append(make_node(2, 0, { 4, 5 }));
+    delta.changed_nodes.append(make_named_node(3, 1, "renamed"sv));
+    delta.changed_nodes.append(make_node(5, 3));
+    auto removed = manager.apply_delta(delta);
+    EXPECT(removed.has_value());
+    EXPECT(removed->is_empty());
+    EXPECT_EQ(describe_tree(manager), "0(-1)[1,2] 1(0)[3] 3(1)[]renamed 2(0)[4,5] 4(2)[] 5(2)[] "sv);
+    EXPECT_EQ(manager.generation(), generation + 1);
+
+    // Remove 2 with its subtree.
+    WebView::AccessibilityTreeDelta removal;
+    removal.changed_nodes.append(make_node(0, -1, { 1 }));
+    removal.removed_ids = { 2, 4, 5 };
+    removed = manager.apply_delta(removal);
+    EXPECT(removed.has_value());
+    EXPECT_EQ(removed->size(), 3u);
+    EXPECT_EQ(describe_tree(manager), "0(-1)[1] 1(0)[3] 3(1)[]renamed "sv);
+    EXPECT(!manager.node(2) && !manager.node(4) && !manager.node(5));
+    EXPECT_EQ(manager.generation(), generation + 2);
+}
+
+TEST_CASE(delta_that_does_not_fit_changes_nothing)
+{
+    struct Case {
+        StringView description;
+        Function<void(WebView::AccessibilityTreeDelta&)> build;
+    };
+    Vector<Case> cases;
+    cases.append({ "removes a node the tree doesn't hold"sv, [](auto& delta) {
+                      delta.changed_nodes.append(make_node(2, 0));
+                      delta.removed_ids = { 99 };
+                  } });
+    cases.append({ "removes the root"sv, [](auto& delta) { delta.removed_ids = { 0 }; } });
+    cases.append({ "removes a node its unchanged parent still lists"sv, [](auto& delta) { delta.removed_ids = { 3 }; } });
+    cases.append({ "removes a node but not its children"sv, [](auto& delta) {
+                      delta.changed_nodes.append(make_node(0, -1, { 2 }));
+                      delta.removed_ids = { 1 };
+                  } });
+    cases.append({ "adds a node no child list holds"sv, [](auto& delta) { delta.changed_nodes.append(make_node(9, 2)); } });
+    cases.append({ "lists one node in two child lists"sv, [](auto& delta) {
+                      delta.changed_nodes.append(make_node(1, 0, { 3, 4 }));
+                      delta.changed_nodes.append(make_node(2, 0, { 4 }));
+                  } });
+    cases.append({ "lists one node twice in a child list"sv, [](auto& delta) { delta.changed_nodes.append(make_node(2, 0, { 3, 3 })); } });
+    cases.append({ "moves a node its unchanged old parent still lists"sv, [](auto& delta) { delta.changed_nodes.append(make_node(2, 0, { 4 })); } });
+    cases.append({ "drops a child without removing or moving it"sv, [](auto& delta) { delta.changed_nodes.append(make_node(1, 0, { 3 })); } });
+    cases.append({ "forms a cycle"sv, [](auto& delta) {
+                      delta.changed_nodes.append(make_node(0, -1, { 2 }));
+                      delta.changed_nodes.append(make_node(3, 1, { 1 }));
+                  } });
+    cases.append({ "makes a node its own child"sv, [](auto& delta) { delta.changed_nodes.append(make_node(2, 0, { 2 })); } });
+    cases.append({ "lists a node that doesn't exist"sv, [](auto& delta) { delta.changed_nodes.append(make_node(2, 0, { 77 })); } });
+    cases.append({ "lists the root as a child"sv, [](auto& delta) { delta.changed_nodes.append(make_node(2, 0, { 0 })); } });
+    cases.append({ "changes one node twice"sv, [](auto& delta) {
+                      delta.changed_nodes.append(make_named_node(2, 0, "a"sv));
+                      delta.changed_nodes.append(make_named_node(2, 0, "b"sv));
+                  } });
+    cases.append({ "changes and removes the same node"sv, [](auto& delta) {
+                      delta.changed_nodes.append(make_node(1, 0, { 4 }));
+                      delta.changed_nodes.append(make_named_node(3, 1, "a"sv));
+                      delta.removed_ids = { 3 };
+                  } });
+    cases.append({ "changes a node with a negative ID"sv, [](auto& delta) {
+                      delta.changed_nodes.append(make_node(2, 0, { -1 }));
+                      delta.changed_nodes.append(make_named_node(-1, 2, "negative"sv));
+                  } });
+    cases.append({ "renames a node and removes one that doesn't exist"sv, [](auto& delta) {
+                      delta.changed_nodes.append(make_named_node(3, 1, "renamed"sv));
+                      delta.removed_ids = { 99 };
+                  } });
+    cases.append({ "makes the tree too deep"sv, [](auto& delta) {
+                      // 2 is at depth 1, so a chain of 1,000 new nodes under it ends at depth 1,001.
+                      delta.changed_nodes.append(make_node(2, 0, { 100 }));
+                      for (i64 id = 100; id < 1100; ++id)
+                          delta.changed_nodes.append(make_named_node(id, id - 1, "deep"sv, {}, id + 1 < 1100 ? Vector<i64> { id + 1 } : Vector<i64> {}));
+                  } });
+
+    for (auto& test_case : cases) {
+        WebView::AccessibilityTreeManager manager;
+        Vector<String> announcements;
+        manager.on_live_region_changed = [&](String const& text, String const&) { announcements.append(text); };
+        seed_base_tree(manager);
+        auto before = describe_tree(manager);
+        Vector<WebView::AccessibilityNodeData> base_nodes;
+        for (i64 id = 0; id <= 4; ++id)
+            base_nodes.append(*manager.node(id));
+        auto generation = manager.generation();
+
+        WebView::AccessibilityTreeDelta delta;
+        test_case.build(delta);
+        auto result = manager.apply_delta(delta);
+        if (result.has_value())
+            warnln("accepted a delta that {}", test_case.description);
+        EXPECT(!result.has_value());
+        EXPECT_EQ(describe_tree(manager), before);
+        for (auto const& base_node : base_nodes) {
+            auto const* node = manager.node(base_node.id);
+            EXPECT(node && *node == base_node);
+        }
+        for (auto const& changed_node : delta.changed_nodes) {
+            if (changed_node.id < 0 || changed_node.id > 4)
+                EXPECT(!manager.node(changed_node.id));
+        }
+        EXPECT_EQ(manager.generation(), generation);
+        EXPECT(announcements.is_empty());
+    }
+
+    // The deepest chain allowed fits: 999 new nodes under 2 end at depth 1,000.
+    WebView::AccessibilityTreeManager manager;
+    seed_base_tree(manager);
+    WebView::AccessibilityTreeDelta delta;
+    delta.changed_nodes.append(make_node(2, 0, { 100 }));
+    for (i64 id = 100; id < 1099; ++id)
+        delta.changed_nodes.append(make_node(id, id - 1, id + 1 < 1099 ? Vector<i64> { id + 1 } : Vector<i64> {}));
+    EXPECT(manager.apply_delta(delta).has_value());
+
+    // And with no tree held, there's nothing a delta can apply to.
+    WebView::AccessibilityTreeManager empty_manager;
+    WebView::AccessibilityTreeDelta any_delta;
+    EXPECT(!empty_manager.apply_delta(any_delta).has_value());
+}
+
+TEST_CASE(delta_announces_live_region_changes)
+{
+    WebView::AccessibilityTreeManager manager;
+    Vector<String> announcements;
+    manager.on_live_region_changed = [&](String const& text, String const&) { announcements.append(text); };
+
+    Vector<WebView::AccessibilityNodeData> nodes;
+    nodes.append(make_node(0, -1, { 1, 2 }));
+    nodes.append(make_named_node(1, 0, ""sv, "polite"sv, { 3 }));
+    nodes.append(make_node(2, 0));
+    nodes.append(make_named_node(3, 1, "first"sv));
+    manager.update_tree(move(nodes));
+
+    // A subtree inserted into a region that was already there announces once: the text of its topmost node, which
+    // comes first in tree order.
+    WebView::AccessibilityTreeDelta insertion;
+    insertion.changed_nodes.append(make_named_node(1, 0, ""sv, "polite"sv, { 3, 4 }));
+    insertion.changed_nodes.append(make_named_node(4, 1, "inserted"sv, {}, { 5 }));
+    insertion.changed_nodes.append(make_named_node(5, 4, "fragment"sv));
+    EXPECT(manager.apply_delta(insertion).has_value());
+    EXPECT_EQ(announcements.size(), 1u);
+    EXPECT_EQ(announcements[0], "inserted"sv);
+
+    // A changed name in the region announces; a node that changes with its name the same doesn't.
+    announcements.clear();
+    WebView::AccessibilityTreeDelta renaming;
+    renaming.changed_nodes.append(make_named_node(3, 1, "second"sv));
+    auto moved_but_same_name = make_named_node(4, 1, "inserted"sv, {}, { 5 });
+    moved_but_same_name.bounds = { 1, 2, 3, 4 };
+    renaming.changed_nodes.append(moved_but_same_name);
+    EXPECT(manager.apply_delta(renaming).has_value());
+    EXPECT_EQ(announcements.size(), 1u);
+    EXPECT_EQ(announcements[0], "second"sv);
+
+    // A region that arrives with its content announces nothing.
+    announcements.clear();
+    WebView::AccessibilityTreeDelta new_region;
+    new_region.changed_nodes.append(make_node(2, 0, { 6 }));
+    new_region.changed_nodes.append(make_named_node(6, 2, ""sv, "assertive"sv, { 7 }));
+    new_region.changed_nodes.append(make_named_node(7, 6, "born with this"sv));
+    EXPECT(manager.apply_delta(new_region).has_value());
+    EXPECT(announcements.is_empty());
+}
+
+namespace {
+
+using Publisher = WebView::AccessibilityTreePublisher;
+
+Vector<WebView::AccessibilityNodeData> base_tree_nodes()
+{
+    Vector<WebView::AccessibilityNodeData> nodes;
+    nodes.append(make_node(0, -1, { 1, 2 }));
+    nodes.append(make_node(1, 0, { 3 }));
+    nodes.append(make_node(2, 0));
+    nodes.append(make_node(3, 1));
+    return nodes;
+}
+
+// Applies what the publisher sent to the manager, as the UI process does, and returns whether the manager took it.
+bool deliver(WebView::AccessibilityTreeManager& manager, Publisher::Update update)
+{
+    return update.visit(
+        [](Publisher::NothingChanged) { return true; },
+        [&](Publisher::WholeTree& tree) {
+            manager.update_tree(move(tree.nodes), tree.sequence);
+            return true;
+        },
+        [&](Publisher::Change& change) {
+            return manager.apply_delta(change.delta, change.base_sequence, change.sequence).has_value();
+        });
+}
+
+}
+
+TEST_CASE(publisher_sends_the_whole_tree_only_when_it_has_to)
+{
+    Publisher publisher;
+
+    auto first = publisher.publish(7, base_tree_nodes(), false);
+    EXPECT(first.has<Publisher::WholeTree>());
+    EXPECT_EQ(first.get<Publisher::WholeTree>().sequence, 1u);
+    EXPECT_EQ(first.get<Publisher::WholeTree>().nodes.size(), 4u);
+
+    EXPECT(publisher.publish(7, base_tree_nodes(), false).has<Publisher::NothingChanged>());
+
+    // Rename 3 and remove 2: The change holds just 3 and the root, whose children changed, and names 2 as removed.
+    auto nodes = base_tree_nodes();
+    nodes[0].child_ids = { 1 };
+    nodes.remove(2);
+    nodes[2].name = "renamed"_string;
+    auto second = publisher.publish(7, nodes, false);
+    EXPECT(second.has<Publisher::Change>());
+    auto const& change = second.get<Publisher::Change>();
+    EXPECT_EQ(change.base_sequence, 1u);
+    EXPECT_EQ(change.sequence, 2u);
+    EXPECT_EQ(change.delta.changed_nodes.size(), 2u);
+    EXPECT_EQ(change.delta.changed_nodes[0].id, 0);
+    EXPECT_EQ(change.delta.changed_nodes[1].id, 3);
+    EXPECT_EQ(change.delta.removed_ids, Vector<i64> { 2 });
+
+    // The whole tree goes out when the UI process asks for it, and for a new document.
+    auto requested = publisher.publish(7, nodes, true);
+    EXPECT(requested.has<Publisher::WholeTree>());
+    EXPECT_EQ(requested.get<Publisher::WholeTree>().sequence, 3u);
+    auto new_document = publisher.publish(8, nodes, false);
+    EXPECT(new_document.has<Publisher::WholeTree>());
+    EXPECT_EQ(new_document.get<Publisher::WholeTree>().sequence, 4u);
+}
+
+TEST_CASE(change_to_a_tree_the_manager_does_not_hold_is_rejected)
+{
+    Publisher publisher;
+    WebView::AccessibilityTreeManager manager;
+    EXPECT(deliver(manager, publisher.publish(7, base_tree_nodes(), false)));
+
+    // The manager misses a change, so the next one names a tree it doesn't hold.
+    auto nodes = base_tree_nodes();
+    nodes[3].name = "first"_string;
+    (void)publisher.publish(7, nodes, false);
+    nodes[3].name = "second"_string;
+    auto before = describe_tree(manager);
+    EXPECT(!deliver(manager, publisher.publish(7, nodes, false)));
+    EXPECT_EQ(describe_tree(manager), before);
+
+    // The whole tree brings it back in step, and the changes after it apply again.
+    EXPECT(deliver(manager, publisher.publish(7, nodes, true)));
+    nodes[3].name = "third"_string;
+    EXPECT(deliver(manager, publisher.publish(7, nodes, false)));
+    EXPECT_EQ(manager.node(3)->name, "third"sv);
+}
+
+TEST_CASE(changes_the_publisher_sends_keep_the_manager_tree_identical)
+{
+    // A tree held as parent and child lists, edited at random, and serialized in tree order the way a document builds
+    // its node data.
+    struct Node {
+        i64 parent { -1 };
+        Vector<i64> children;
+        String name;
+    };
+    HashMap<i64, Node> tree;
+    tree.set(0, {});
+    i64 next_id = 1;
+
+    u64 state = 0x9e3779b97f4a7c15;
+    auto random = [&](size_t bound) -> size_t {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<size_t>((state >> 33) % bound);
+    };
+    auto random_node = [&]() {
+        auto keys = tree.keys();
+        return keys[random(keys.size())];
+    };
+    auto is_in_subtree = [&](i64 id, i64 subtree_root) {
+        for (auto current = id; current != -1; current = tree.get(current)->parent) {
+            if (current == subtree_root)
+                return true;
+        }
+        return false;
+    };
+    auto serialize = [&]() {
+        Vector<WebView::AccessibilityNodeData> nodes;
+        Vector<i64> stack { 0 };
+        while (!stack.is_empty()) {
+            auto id = stack.take_last();
+            auto const& node = *tree.get(id);
+            auto data = make_node(id, node.parent, node.children);
+            data.name = node.name;
+            nodes.append(move(data));
+            for (size_t i = node.children.size(); i > 0; --i)
+                stack.append(node.children[i - 1]);
+        }
+        return nodes;
+    };
+
+    Publisher publisher;
+    WebView::AccessibilityTreeManager manager;
+    for (size_t round = 0; round < 400; ++round) {
+        for (size_t edit = 0; edit < 5; ++edit) {
+            auto kind = tree.size() < 3 ? 0 : random(5);
+            if (kind == 0) {
+                // Insert a new node.
+                auto parent = random_node();
+                auto& children = tree.find(parent)->value.children;
+                children.insert(random(children.size() + 1), next_id);
+                tree.set(next_id, { parent, {}, MUST(String::formatted("node {}", next_id)) });
+                ++next_id;
+            } else if (kind == 1) {
+                // Remove a subtree.
+                auto root = random_node();
+                if (root == 0)
+                    continue;
+                tree.find(tree.get(root)->parent)->value.children.remove_first_matching([&](i64 child) { return child == root; });
+                Vector<i64> doomed { root };
+                while (!doomed.is_empty()) {
+                    auto id = doomed.take_last();
+                    doomed.extend(tree.get(id)->children);
+                    tree.remove(id);
+                }
+            } else if (kind == 2) {
+                // Move a subtree.
+                auto moved = random_node();
+                auto new_parent = random_node();
+                if (moved == 0 || is_in_subtree(new_parent, moved))
+                    continue;
+                tree.find(tree.get(moved)->parent)->value.children.remove_first_matching([&](i64 child) { return child == moved; });
+                auto& children = tree.find(new_parent)->value.children;
+                children.insert(random(children.size() + 1), moved);
+                tree.find(moved)->value.parent = new_parent;
+            } else if (kind == 3) {
+                // Rename a node.
+                tree.find(random_node())->value.name = MUST(String::formatted("renamed in round {}", round));
+            } else {
+                // Reverse a node's children.
+                auto& children = tree.find(random_node())->value.children;
+                children.reverse();
+            }
+        }
+
+        auto nodes = serialize();
+        auto update = publisher.publish(1, nodes, false);
+        // After the first round, nothing goes out but changes.
+        if (round > 0)
+            EXPECT(!update.has<Publisher::WholeTree>());
+        EXPECT(deliver(manager, move(update)));
+
+        EXPECT_EQ(manager.root_id(), 0);
+        size_t reachable = assert_valid_tree_and_collect(manager).size();
+        EXPECT_EQ(reachable, nodes.size());
+        for (auto const& expected : nodes) {
+            auto const* held = manager.node(expected.id);
+            EXPECT(held && *held == expected);
+        }
+        // And every node removed is gone, not just unreachable.
+        for (i64 id = 0; id < next_id; ++id) {
+            if (!tree.contains(id))
+                EXPECT(!manager.node(id));
+        }
+    }
+}
+
+TEST_CASE(no_change_applies_to_a_repaired_whole_tree)
+{
+    // A chain deeper than the manager allows: It keeps the chain only down to its depth limit, so it holds a tree that
+    // isn't the one WebContent changes, and every change has to be refused for the whole tree to come again.
+    Vector<WebView::AccessibilityNodeData> nodes;
+    for (i64 id = 0; id <= 1001; ++id)
+        nodes.append(make_node(id, id - 1, id < 1001 ? Vector<i64> { id + 1 } : Vector<i64> {}));
+    Publisher publisher;
+    WebView::AccessibilityTreeManager manager;
+    EXPECT(deliver(manager, publisher.publish(7, nodes, false)));
+    EXPECT(!manager.node(1001));
+
+    // Move 500 under the root: 1001 would fit again, but only a whole tree can bring it.
+    nodes[0].child_ids = { 1, 500 };
+    nodes[499].child_ids = {};
+    nodes[500].parent_id = 0;
+    EXPECT(!deliver(manager, publisher.publish(7, nodes, false)));
+    EXPECT(deliver(manager, publisher.publish(7, nodes, true)));
+    EXPECT(manager.node(1001));
+}
+
+TEST_CASE(root_focus_shown_for_the_assistive_technology_lasts_until_the_next_change)
+{
+    Publisher publisher;
+    WebView::AccessibilityTreeManager manager;
+    auto nodes = base_tree_nodes();
+    nodes[3].is_focused = true;
+    EXPECT(deliver(manager, publisher.publish(7, nodes, false)));
+    EXPECT_EQ(manager.focused_node_id(), 3);
+
+    manager.show_focus_on_root();
+    EXPECT(manager.root()->is_focused);
+    EXPECT(!manager.node(3)->is_focused);
+
+    // A change that doesn't touch 3 still puts back the focus WebContent reports, as a whole tree would.
+    nodes[2].name = "renamed"_string;
+    EXPECT(deliver(manager, publisher.publish(7, nodes, false)));
+    EXPECT(!manager.root()->is_focused);
+    EXPECT(manager.node(3)->is_focused);
+    EXPECT_EQ(manager.focused_node_id(), 3);
 }

@@ -299,6 +299,9 @@ fn generate_expression_inner(
     if !matches!(expression.inner, ExpressionKind::Function(_) | ExpressionKind::Class(_)) {
         generator.pending_lhs_name = None;
     }
+    if !matches!(expression.inner, ExpressionKind::Class(_)) {
+        generator.pending_computed_class_name = None;
+    }
 
     match &expression.inner {
         // === Literals ===
@@ -434,6 +437,7 @@ fn generate_expression_inner(
         // === ImportCall ===
         ExpressionKind::ImportCall(ic_data) => {
             let spec = generate_expression(&ic_data.specifier, generator, None)?;
+            let spec = copy_if_reassignable_by(generator, spec, ic_data.options.as_deref());
             let opts = match &ic_data.options {
                 Some(o) => generate_expression(o, generator, None)?,
                 None => generator.add_constant_undefined(),
@@ -1373,13 +1377,34 @@ pub fn generate_statement(
 
         // === ClassFieldInitializer ===
         StatementKind::ClassFieldInitializer(data) => {
-            // Only set pending_lhs_name for compile-time-known keys (non-empty names).
-            // For computed keys, field_name is empty and the name is set at runtime.
-            if !data.field_name.is_empty() {
-                generator.pending_lhs_name = Some(generator.intern_identifier(&data.field_name));
-            }
-            let value = generate_expression_or_undefined(&data.expression, generator, None);
-            generator.pending_lhs_name = None;
+            // https://tc39.es/ecma262/#sec-runtime-semantics-evaluatebody
+            // Initializer : = AssignmentExpression
+            // 3. If IsAnonymousFunctionDefinition(AssignmentExpression) is true, then
+            //     a. Let value be ? NamedEvaluation of Initializer with argument func.[[ClassFieldInitializerName]].
+            // 4. Else,
+            //     a. Let rhs be ? Evaluation of AssignmentExpression.
+            //     b. Let value be ? GetValue(rhs).
+            let value = if let Some(field_name) = &data.field_name {
+                generator.pending_lhs_name = Some(generator.intern_identifier(field_name));
+                let value = generate_expression_or_undefined(&data.expression, generator, None);
+                generator.pending_lhs_name = None;
+                value
+            } else if is_anonymous_function_definition(generator, &data.expression) {
+                // NB: A computed key is only known once the class is defined, so the function reads it.
+                let name = generator.allocate_register();
+                generator.emit(Instruction::GetClassFieldInitializerName { dst: name.operand() });
+                if matches!(data.expression.inner, ExpressionKind::Class(_)) {
+                    generator.pending_computed_class_name = Some(name);
+                    generate_expression_or_undefined(&data.expression, generator, None)
+                } else {
+                    let value = generate_expression_or_undefined(&data.expression, generator, None);
+                    emit_set_function_name(generator, &value, &name, FunctionNamePrefix::None);
+                    value
+                }
+            } else {
+                generate_expression_or_undefined(&data.expression, generator, None)
+            };
+            // 5. Return ReturnCompletion(value).
             generator.emit(Instruction::Return { value: value.operand() });
             None
         }
@@ -2023,27 +2048,8 @@ fn generate_identifier(
     let arena = generator.arena.clone();
     let ident = &arena.identifiers[id];
     if ident.is_local() {
-        let local_index = ident.local_index;
-        let local = generator.resolve_local(local_index, ident.local_type.unwrap());
-        // Check TDZ for uninitialized bindings.
-        // Arguments may need TDZ during default parameter evaluation;
-        // for variable-type locals, only lexically-declared (let/const) need TDZ.
-        let needs_tdz_check = if ident.local_type == Some(LocalType::Argument) {
-            !generator.is_argument_initialized(local_index)
-        } else {
-            generator.is_local_lexically_declared(local_index) && !generator.is_local_initialized(local_index)
-        };
-        if needs_tdz_check {
-            if ident.local_type == Some(LocalType::Argument) {
-                // Arguments are initialized to undefined by default, so we
-                // need to replace the value with the empty sentinel to
-                // trigger the TDZ check.
-                let empty = generator.add_constant_empty();
-                generator.emit_mov(&local, &empty);
-            }
-            generator.emit(Instruction::ThrowIfTDZ { src: local.operand() });
-        }
-        return local;
+        emit_tdz_check_if_needed(generator, id);
+        return generator.resolve_local(ident.local_index, ident.local_type.unwrap());
     }
 
     // OPTIMIZATION: Generate builtin constants (undefined, NaN, Infinity) directly.
@@ -2938,7 +2944,9 @@ fn generate_scope_children(
         if generator.must_propagate_completion
             && let Some(ref val) = result
         {
-            last_result = result.clone();
+            // A later statement that completes empty can still reassign a local the value is read from.
+            let val = &generator.copy_if_needed_to_preserve_evaluation_order(val);
+            last_result = Some(val.clone());
             if !generator.is_current_block_terminated()
                 && let Some(ref completion_reg) = generator.current_completion_register.clone()
             {
@@ -2985,6 +2993,7 @@ fn generate_block_statement(
     // environment and its only child is a for-loop variant, skip
     // generate_scope_children and generate the child directly to avoid
     // emitting a redundant completion Mov.
+    emit_tdz_reset_of_declared_locals(generator, scope.children.iter());
     let result = if !did_create_env && scope.children.len() == 1 && is_for_loop(&scope.children[0]) {
         generate_statement(&scope.children[0], generator, preferred_dst)
     } else {
@@ -2995,6 +3004,74 @@ fn generate_block_statement(
         generator.end_variable_scope();
     }
     result
+}
+
+/// Empty the locals that a scope declares lexically where the scope starts, so that entering it again (as a loop does)
+/// starts them uninitialized. The generator drops the store for a local that no TDZ check reads.
+fn emit_tdz_reset_of_declared_locals<'a>(generator: &mut Generator, statements: impl Iterator<Item = &'a Statement>) {
+    let arena = generator.arena.clone();
+    let mut locals = Vec::new();
+    for statement in statements {
+        collect_lexically_declared_locals(statement, &arena, &mut locals);
+    }
+    for index in locals {
+        generator.emit_tdz_reset(index);
+    }
+}
+
+/// Collect the locals that a statement directly in a scope declares lexically, including in a loop head.
+fn collect_lexically_declared_locals(statement: &Statement, arena: &AstArena, locals: &mut Vec<u32>) {
+    if let Some((declarations, _)) = lexical_declarators(statement) {
+        for declaration in declarations {
+            match &declaration.target {
+                VariableDeclaratorTarget::Identifier(id) => collect_local(*id, arena, locals),
+                VariableDeclaratorTarget::BindingPattern(pattern) => {
+                    collect_pattern_locals(pattern, arena, locals);
+                }
+            }
+        }
+        return;
+    }
+    match &statement.inner {
+        StatementKind::ClassDeclaration(data) => {
+            if let Some(id) = data.name {
+                collect_local(id, arena, locals);
+            }
+        }
+        StatementKind::For(data) => {
+            if let Some(ForInit::Declaration(declaration)) = &data.init {
+                collect_lexically_declared_locals(declaration, arena, locals);
+            }
+        }
+        StatementKind::ForInOf(data) => {
+            if let ForInOfLhs::Declaration(declaration) = &data.lhs {
+                collect_lexically_declared_locals(declaration, arena, locals);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_pattern_locals(pattern: &BindingPattern, arena: &AstArena, locals: &mut Vec<u32>) {
+    for entry in &pattern.entries {
+        match &entry.alias {
+            Some(BindingEntryAlias::Identifier(id)) => collect_local(*id, arena, locals),
+            Some(BindingEntryAlias::BindingPattern(sub_pattern)) => collect_pattern_locals(sub_pattern, arena, locals),
+            Some(BindingEntryAlias::MemberExpression(_)) => {}
+            None => {
+                if let Some(BindingEntryName::Identifier(id)) = &entry.name {
+                    collect_local(*id, arena, locals);
+                }
+            }
+        }
+    }
+}
+
+fn collect_local(id: IdentifierId, arena: &AstArena, locals: &mut Vec<u32>) {
+    let identifier = &arena.identifiers[id];
+    if identifier.is_local() && identifier.local_type == Some(LocalType::Variable) {
+        locals.push(identifier.local_index);
+    }
 }
 
 /// How the resources of a scope are disposed of, if the scope has `using` or `await using` declarations.
@@ -4089,20 +4166,7 @@ fn generate_call_expression(
                 (method, Some(obj))
             }
             ExpressionKind::Identifier(ident) if arena.identifiers[*ident].is_local() => {
-                let id_data = &arena.identifiers[*ident];
-                // Local identifier: use the local directly, with ThrowIfTDZ
-                // if not yet initialized.
-                let local = generator.resolve_local(id_data.local_index, id_data.local_type.unwrap());
-                let needs_tdz = if id_data.local_type == Some(LocalType::Argument) {
-                    !generator.is_argument_initialized(id_data.local_index)
-                } else {
-                    generator.is_local_lexically_declared(id_data.local_index)
-                        && !generator.is_local_initialized(id_data.local_index)
-                };
-                if needs_tdz {
-                    generator.emit(Instruction::ThrowIfTDZ { src: local.operand() });
-                }
-                (local, None)
+                (generate_identifier(*ident, generator, None), None)
             }
             ExpressionKind::Identifier(ident) if !arena.identifiers[*ident].is_global => {
                 // Non-local, non-global identifier: use GetCalleeAndThisFromEnvironment
@@ -4319,6 +4383,21 @@ fn emit_update_op(generator: &mut Generator, op: UpdateOp, prefixed: bool, value
     }
 }
 
+/// Convert a property name to the primitive that ToPropertyKey turns into a property key without observable effects,
+/// in a register of its own unless it is a constant, which is a primitive already.
+fn emit_to_primitive_property_key(generator: &mut Generator, property_name: &ScopedOperand) -> ScopedOperand {
+    if property_name.operand().is_constant() {
+        return property_name.clone();
+    }
+    // NB: The name can be the operand of a variable or of `this`, which converting it in place would change.
+    let property_key = generator.allocate_register();
+    generator.emit(Instruction::ToPrimitiveWithStringHint {
+        dst: property_key.operand(),
+        value: property_name.operand(),
+    });
+    property_key
+}
+
 /// Preserve the primitive key produced by GetValue so PutValue does not convert it again.
 fn emit_read_modify_write_property_key(
     generator: &mut Generator,
@@ -4349,7 +4428,11 @@ fn generate_update_expression(
     match &argument.inner {
         ExpressionKind::Identifier(ident) => {
             let resolved_binding = emit_resolve_binding_for_identifier_assignment(generator, *ident);
-            let value = generate_identifier_with_resolved_binding(generator, *ident, resolved_binding.as_ref());
+            let mut value = generate_identifier_with_resolved_binding(generator, *ident, resolved_binding.as_ref());
+            // The update is made in place, but storing to a constant throws, which must leave it unchanged.
+            if is_constant_local(generator, *ident) {
+                value = generator.copy_if_needed_to_preserve_evaluation_order(&value);
+            }
             let result = emit_update_op(generator, op, prefixed, &value);
             emit_set_variable_or_resolved_binding(generator, *ident, &value, resolved_binding.as_ref());
             Some(result)
@@ -4542,11 +4625,7 @@ fn generate_assignment_expression(
                     let rhs_val = generate_expression(rhs, generator, None)?;
                     generator.pending_lhs_name = None;
                     // Allocate dst after RHS evaluation.
-                    let dst = if lhs_val.operand().is_local() {
-                        lhs_val.clone()
-                    } else {
-                        choose_dst(generator, preferred_dst)
-                    };
+                    let dst = choose_dst(generator, preferred_dst);
                     generator.emit_mov(&dst, &rhs_val);
                     emit_set_variable_or_resolved_binding(generator, id, &dst, resolved_binding.as_ref());
                     generator.emit(Instruction::Jump { target: end_block });
@@ -4560,12 +4639,7 @@ fn generate_assignment_expression(
 
                 // Regular compound assignment (+=, -=, etc.)
                 let rhs_val = generate_expression(rhs, generator, None)?;
-                // OPTIMIZATION: If LHS is a local, write directly into it.
-                let dst = if lhs_val.operand().is_local() {
-                    lhs_val.clone()
-                } else {
-                    choose_dst(generator, preferred_dst)
-                };
+                let dst = choose_dst(generator, preferred_dst);
                 emit_compound_assignment(generator, op, &dst, &lhs_val, &rhs_val);
                 emit_set_variable_or_resolved_binding(generator, id, &dst, resolved_binding.as_ref());
                 return Some(dst);
@@ -4583,7 +4657,8 @@ fn generate_assignment_expression(
 
                     if op == AssignmentOp::Assignment {
                         let computed_key = if member_data.computed {
-                            Some(generate_expression_or_undefined(&member_data.property, generator, None))
+                            let key = generate_expression_or_undefined(&member_data.property, generator, None);
+                            Some(copy_if_reassignable_by(generator, key, [rhs]))
                         } else {
                             None
                         };
@@ -4852,35 +4927,7 @@ fn emit_resolve_this_if_needed(generator: &mut Generator) {
     generator.basic_blocks[index].resolved_this = true;
 }
 
-/// Emit a super property get (uses WithThis variants).
-/// For computed access, evaluates the property expression.
-/// Returns the evaluated property operand for computed access (so callers
-/// can reuse it for a subsequent put).
-fn emit_super_get(
-    generator: &mut Generator,
-    dst: &ScopedOperand,
-    base: &ScopedOperand,
-    property: &Expression,
-    computed: bool,
-    this_value: &ScopedOperand,
-) -> Option<ScopedOperand> {
-    if computed {
-        let property = generate_expression_or_undefined(property, generator, None);
-        emit_get_by_value_with_this(generator, dst, base, &property, this_value);
-        Some(property)
-    } else if let ExpressionKind::Identifier(ident) = &property.inner {
-        let arena = generator.arena.clone();
-        emit_get_by_id_with_this(generator, dst, base, arena.name_slice(*ident), this_value);
-        None
-    } else {
-        None
-    }
-}
-
-/// Emit a super property put (uses WithThis variants).
-/// For computed access, `computed_key` should be the operand returned by
-/// `emit_super_get` so the property is not re-evaluated. If `None` for
-/// computed access, the property expression will be evaluated.
+/// Emit a super property put (uses WithThis variants), to the computed key the caller evaluated for computed access.
 fn emit_super_put(
     generator: &mut Generator,
     base: &ScopedOperand,
@@ -4891,11 +4938,8 @@ fn emit_super_put(
     computed_key: Option<&ScopedOperand>,
 ) {
     if computed {
-        let property = match computed_key {
-            Some(k) => k.clone(),
-            None => generate_expression_or_undefined(property, generator, None),
-        };
-        emit_put_normal_by_value_with_this(generator, base, &property, this_value, value);
+        let property = computed_key.expect("a computed super property put has its evaluated key");
+        emit_put_normal_by_value_with_this(generator, base, property, this_value, value);
     } else if let ExpressionKind::Identifier(ident) = &property.inner {
         let arena = generator.arena.clone();
         let key = generator.intern_property_key_id(arena.identifiers[*ident].name);
@@ -5206,9 +5250,7 @@ fn emit_put_by_value(
     });
 }
 
-/// Emit a ThrowIfTDZ check for a local identifier if needed. This is used
-/// before assigning to a
-/// variable to ensure TDZ semantics for let/const bindings.
+/// Emit a ThrowIfTDZ check of a local identifier that is not known to be initialized here.
 fn emit_tdz_check_if_needed(generator: &mut Generator, id: crate::ast::IdentifierId) {
     let arena = generator.arena.clone();
     let ident = &arena.identifiers[id];
@@ -5226,21 +5268,28 @@ fn emit_tdz_check_if_needed(generator: &mut Generator, id: crate::ast::Identifie
         if ident.local_type == Some(LocalType::Argument) {
             let empty = generator.add_constant_empty();
             generator.emit_mov(&local, &empty);
+        } else {
+            generator.mark_local_tdz_checked(local_index);
         }
         generator.emit(Instruction::ThrowIfTDZ { src: local.operand() });
     }
 }
 
+fn is_constant_local(generator: &Generator, id: crate::ast::IdentifierId) -> bool {
+    let ident = &generator.arena.identifiers[id];
+    ident.is_local() && ident.declaration_kind == Some(DeclarationKind::Const)
+}
+
 fn emit_set_variable(generator: &mut Generator, id: crate::ast::IdentifierId, value: &ScopedOperand) {
+    if is_constant_local(generator, id) {
+        // The caller is responsible for emitting ThrowIfTDZ before calling
+        // emit_set_variable().
+        generator.emit(Instruction::ThrowConstAssignment {});
+        return;
+    }
     let arena = generator.arena.clone();
     let ident = &arena.identifiers[id];
     if ident.is_local() {
-        if ident.declaration_kind == Some(DeclarationKind::Const) {
-            // The caller is responsible for emitting ThrowIfTDZ before calling
-            // emit_set_variable().
-            generator.emit(Instruction::ThrowConstAssignment {});
-            return;
-        }
         let local_index = ident.local_index;
         let local = generator.resolve_local(local_index, ident.local_type.unwrap());
         // Skip self-move entirely, of variables and arguments alike.
@@ -5424,12 +5473,14 @@ fn emit_evaluate_member_reference(generator: &mut Generator, target: &Expression
         let is_super = matches!(member_data.object.inner, ExpressionKind::Super);
 
         if is_super {
-            // ResolveThisBinding first, then ResolveSuperBase.
+            // ResolveThisBinding first, then the computed property, then ResolveSuperBase.
             let this_value = emit_resolve_this_binding(generator);
+            let computed_property = member_data
+                .computed
+                .then(|| generate_expression_or_undefined(&member_data.property, generator, None));
             let base = generator.allocate_register();
             generator.emit(Instruction::ResolveSuperBase { dst: base.operand() });
-            if member_data.computed {
-                let property = generate_expression_or_undefined(&member_data.property, generator, None);
+            if let Some(property) = computed_property {
                 // If the computed property is a constant string (e.g. super["minutes"]),
                 // optimize to SuperMemberId.
                 if let Some(key) = generator.try_constant_string_to_property_key(&property) {
@@ -5569,12 +5620,16 @@ fn emit_store_to_evaluated_reference(generator: &mut Generator, reference: &Eval
 fn emit_store_to_reference(generator: &mut Generator, target: &Expression, value: &ScopedOperand) {
     match &target.inner {
         ExpressionKind::Identifier(ident) => {
+            emit_tdz_check_if_needed(generator, *ident);
             emit_set_variable(generator, *ident, value);
         }
         ExpressionKind::Member(data) => {
             if matches!(data.object.inner, ExpressionKind::Super) {
-                // ResolveThisBinding first, then ResolveSuperBase.
+                // ResolveThisBinding first, then the computed property, then ResolveSuperBase.
                 let this_value = emit_resolve_this_binding(generator);
+                let computed_key = data
+                    .computed
+                    .then(|| generate_expression_or_undefined(&data.property, generator, None));
                 let base = generator.allocate_register();
                 generator.emit(Instruction::ResolveSuperBase { dst: base.operand() });
                 emit_super_put(
@@ -5584,7 +5639,7 @@ fn emit_store_to_reference(generator: &mut Generator, target: &Expression, value
                     data.computed,
                     &this_value,
                     value,
-                    None,
+                    computed_key.as_ref(),
                 );
             } else {
                 let base = generate_expression_or_undefined(&data.object, generator, None);
@@ -5780,9 +5835,9 @@ fn generate_template_literal(
 
     if segments.len() == 1 {
         let val = generate_expression(segments[0], generator, None)?;
-        // If it's a constant, return directly.
-        if val.operand().is_constant() {
-            return Some(val);
+        // OPTIMIZATION: Convert a constant at compile time.
+        if let Some(string) = generator.get_constant(&val).and_then(constant_to_string) {
+            return Some(generator.add_constant_string(string));
         }
         // Otherwise, emit ToString.
         generator.emit(Instruction::ToString {
@@ -5988,6 +6043,13 @@ fn generate_switch_statement(
     }
 
     let initialized_locals_at_entry = generator.initialized_locals.clone();
+    let arena = generator.arena.clone();
+    emit_tdz_reset_of_declared_locals(
+        generator,
+        data.cases
+            .iter()
+            .flat_map(|case| arena.scopes[case.scope].children.iter()),
+    );
 
     // Create first test block and jump to it.
     let first_test_block = generator.make_block();
@@ -6252,12 +6314,7 @@ fn generate_object_expression(
         let effectively_computed = property.is_computed && !is_string_literal_key;
         let computed_key = if effectively_computed || !is_string_key {
             let key = generate_expression_or_undefined(&property.key, generator, None);
-            let key = generator.copy_if_needed_to_preserve_evaluation_order(&key);
-            generator.emit(Instruction::ToPrimitiveWithStringHint {
-                dst: key.operand(),
-                value: key.operand(),
-            });
-            Some(key)
+            Some(emit_to_primitive_property_key(generator, &key))
         } else {
             None
         };
@@ -6280,6 +6337,12 @@ fn generate_object_expression(
                     .value
                     .as_ref()
                     .is_some_and(|value| is_anonymous_function_definition(generator, value)));
+        // NB: A class has its name before its static elements are evaluated, so NewClass is given it.
+        let names_class = should_set_runtime_function_name
+            && property
+                .value
+                .as_ref()
+                .is_some_and(|value| matches!(value.inner, ExpressionKind::Class(_)));
 
         // Set pending LHS name for function name inference on non-computed properties.
         // ProtoSetter (__proto__) skips NamedEvaluation per spec.
@@ -6315,6 +6378,9 @@ fn generate_object_expression(
         if is_method_like {
             generator.home_objects.push(dst.clone());
         }
+        if names_class {
+            generator.pending_computed_class_name = computed_key.clone();
+        }
         let value = property
             .value
             .as_ref()
@@ -6324,7 +6390,7 @@ fn generate_object_expression(
             generator.home_objects.pop();
         }
         generator.pending_lhs_name = None;
-        if should_set_runtime_function_name {
+        if should_set_runtime_function_name && !names_class {
             emit_set_function_name(
                 generator,
                 &value,
@@ -6595,29 +6661,22 @@ fn generate_optional_chain_inner(
 ) -> Option<()> {
     // Evaluate base expression.
     let new_current_value = match &base.inner {
+        ExpressionKind::Member(member_data) if matches!(member_data.object.inner, ExpressionKind::Super) => {
+            let this_value = emit_resolve_this_binding(generator);
+            let value = generate_member_expression(
+                generator,
+                &member_data.object,
+                &member_data.property,
+                member_data.computed,
+                None,
+            )?;
+            generator.emit_mov(current_base, &this_value);
+            value
+        }
         ExpressionKind::Member(member_data) => {
-            let is_super = matches!(member_data.object.inner, ExpressionKind::Super);
-            // For super property access, resolve this binding first (before
-            // ResolveSuperBase) per spec evaluation order.
-            let this_value = if is_super {
-                Some(emit_resolve_this_binding(generator))
-            } else {
-                None
-            };
             let obj = generate_expression(&member_data.object, generator, None)?;
             let val = generator.allocate_register();
-            if is_super {
-                let this_value = this_value.unwrap();
-                emit_super_get(
-                    generator,
-                    &val,
-                    &obj,
-                    &member_data.property,
-                    member_data.computed,
-                    &this_value,
-                );
-                generator.emit_mov(current_base, &this_value);
-            } else if member_data.computed {
+            if member_data.computed {
                 let obj = copy_if_reassignable_by(generator, obj, [&*member_data.property]);
                 let property = generate_expression(&member_data.property, generator, None)?;
                 emit_get_by_value(generator, &val, &obj, &property, None);
@@ -6743,29 +6802,22 @@ fn generate_optional_chain_start(
     current_base: &ScopedOperand,
 ) -> Option<()> {
     let new_current_value = match &base.inner {
+        ExpressionKind::Member(member_data) if matches!(member_data.object.inner, ExpressionKind::Super) => {
+            let this_value = emit_resolve_this_binding(generator);
+            let value = generate_member_expression(
+                generator,
+                &member_data.object,
+                &member_data.property,
+                member_data.computed,
+                None,
+            )?;
+            generator.emit_mov(current_base, &this_value);
+            value
+        }
         ExpressionKind::Member(member_data) => {
-            let is_super = matches!(member_data.object.inner, ExpressionKind::Super);
-            // For super property access, resolve this binding first (before
-            // ResolveSuperBase) per spec evaluation order.
-            let this_value = if is_super {
-                Some(emit_resolve_this_binding(generator))
-            } else {
-                None
-            };
             let obj = generate_expression(&member_data.object, generator, None)?;
             let val = generator.allocate_register();
-            if is_super {
-                let this_value = this_value.unwrap();
-                emit_super_get(
-                    generator,
-                    &val,
-                    &obj,
-                    &member_data.property,
-                    member_data.computed,
-                    &this_value,
-                );
-                generator.emit_mov(current_base, &this_value);
-            } else if member_data.computed {
+            if member_data.computed {
                 let obj = copy_if_reassignable_by(generator, obj, [&*member_data.property]);
                 let property = generate_expression(&member_data.property, generator, None)?;
                 emit_get_by_value(generator, &val, &obj, &property, None);
@@ -7015,17 +7067,16 @@ fn generate_class_expression(
     preferred_dst: Option<&ScopedOperand>,
 ) -> ScopedOperand {
     let has_super = data.super_class.is_some();
-    // Always consume pending_lhs_name. Named classes don't use it, but we
-    // must clear it to prevent it from leaking to nested expressions.
-    let lhs_name = if data.name.is_none() {
-        generator.pending_lhs_name.take()
-    } else {
-        generator.pending_lhs_name = None;
-        None
-    };
+    // Always consume the pending names. Named classes don't use them, but we
+    // must clear them to prevent them from leaking to nested expressions.
+    let lhs_name = generator.pending_lhs_name.take().filter(|_| data.name.is_none());
+    let computed_name = generator
+        .pending_computed_class_name
+        .take()
+        .filter(|_| data.name.is_none());
 
     // Step 2: Save parent environment, create class lexical environment.
-    let has_class_binding = data.name.is_some() || lhs_name.is_none();
+    let has_class_binding = data.name.is_some() || (lhs_name.is_none() && computed_name.is_none());
     let parent_env = generator.current_lexical_environment();
     let class_env = generator.allocate_register();
     let shape_cache = generator.next_environment_shape_cache();
@@ -7062,11 +7113,22 @@ fn generate_class_expression(
     }
 
     // Evaluate super class if present
+    // NB: NewClass reads the superclass after the class elements, which can reassign the local it was read from.
     let super_class = if let Some(super_expression) = &data.super_class {
         generate_class_part_expression(super_expression, generator, None)
+            .map(|super_class| generator.copy_if_needed_to_preserve_evaluation_order(&super_class))
     } else {
         None
     };
+    // NB: The heritage is checked before any class element is evaluated.
+    let proto_parent = super_class.as_ref().map(|super_class| {
+        let proto_parent = generator.allocate_register();
+        generator.emit(Instruction::GetClassProtoParent {
+            dst: proto_parent.operand(),
+            super_class: super_class.operand(),
+        });
+        proto_parent
+    });
 
     // Create private environment for private class elements.
     let mut has_private_env = false;
@@ -7097,23 +7159,10 @@ fn generate_class_expression(
     let mut element_keys: Vec<Option<ScopedOperand>> = Vec::with_capacity(data.elements.len());
     for element_node in &data.elements {
         match &element_node.inner {
-            ClassElement::Method { key, .. } => {
-                if !is_private_key(key) {
-                    let key_val = generate_class_part_expression(key, generator, None);
-                    element_keys.push(key_val);
-                } else {
-                    element_keys.push(None);
-                }
+            ClassElement::Method { key, .. } | ClassElement::Field { key, .. } if !is_private_key(key) => {
+                element_keys.push(generate_class_element_key(generator, key));
             }
-            ClassElement::Field { key, .. } => {
-                if !is_private_key(key) {
-                    let key_val = generate_class_part_expression(key, generator, None);
-                    element_keys.push(key_val);
-                } else {
-                    element_keys.push(None);
-                }
-            }
-            ClassElement::StaticInitializer { .. } => {
+            ClassElement::Method { .. } | ClassElement::Field { .. } | ClassElement::StaticInitializer { .. } => {
                 element_keys.push(None);
             }
         }
@@ -7227,19 +7276,7 @@ fn generate_class_expression(
                     };
 
                     if !is_literal {
-                        // Determine field name for anonymous function naming.
-                        let arena = generator.arena.clone();
-                        let field_name = match &key.inner {
-                            ExpressionKind::Identifier(ident) => arena.name_of(*ident).clone(),
-                            ExpressionKind::StringLiteral(s) => (**s).clone(),
-                            ExpressionKind::PrivateIdentifier(p) => p.name.clone(),
-                            ExpressionKind::NumericLiteral(n) => crate::host::js_number_to_utf16(*n),
-                            ExpressionKind::BigIntLiteral(s) => {
-                                let digits = bigint_literal_digits(s);
-                                Utf16String(digits.to_vec())
-                            }
-                            _ => Utf16String::new(),
-                        };
+                        let field_name = class_field_literal_name(key);
 
                         // Use the ClassFieldInitializer statement directly as the
                         // synthetic function's body. compile_function_payload tolerates
@@ -7248,7 +7285,7 @@ fn generate_class_expression(
                             init_expression.range,
                             StatementKind::ClassFieldInitializer(Box::new(ClassFieldInitializerData {
                                 expression: Box::new(init_expression.as_ref().clone()),
-                                field_name,
+                                field_name: field_name.clone(),
                             })),
                         );
 
@@ -7275,16 +7312,8 @@ fn generate_class_expression(
                         });
                         let index = emit_new_function(generator, function_data, Some(utf16!("field")));
 
-                        let key_is_private = is_private_key(key);
-                        let key_name: Utf16String = match &key.inner {
-                            ExpressionKind::PrivateIdentifier(ident) => ident.name.clone(),
-                            ExpressionKind::Identifier(ident) => arena.name_of(*ident).clone(),
-                            ExpressionKind::StringLiteral(s) => (**s).clone(),
-                            ExpressionKind::NumericLiteral(n) => crate::host::js_number_to_utf16(*n),
-                            _ => Utf16String::new(),
-                        };
-                        if !key_name.is_empty() {
-                            generator.set_class_field_initializer_name(index, key_name, key_is_private);
+                        if let Some(field_name) = field_name {
+                            generator.set_class_field_initializer_name(index, field_name, is_private_key(key));
                         }
 
                         sfd_index = Some(index);
@@ -7380,9 +7409,11 @@ fn generate_class_expression(
     generator.emit(Instruction::NewClass {
         dst: dst.operand(),
         super_class: super_class.as_ref().map(|s| s.operand()),
+        proto_parent: proto_parent.as_ref().map(|p| p.operand()),
         class_environment: class_env.operand(),
         class_blueprint_index: blueprint_index,
         lhs_name,
+        computed_name: computed_name.as_ref().map(|name| name.operand()),
         element_keys_count: u32_from_usize(element_key_ops.len()),
         element_keys: element_key_ops,
     });
@@ -7392,6 +7423,33 @@ fn generate_class_expression(
     }
 
     dst
+}
+
+// https://tc39.es/ecma262/#sec-object-initializer-runtime-semantics-evaluation
+// ComputedPropertyName : [ AssignmentExpression ]
+fn generate_class_element_key(generator: &mut Generator, key: &Expression) -> Option<ScopedOperand> {
+    // 1. Let exprValue be ? Evaluation of AssignmentExpression.
+    // 2. Let propertyName be ? GetValue(exprValue).
+    let property_name = generate_class_part_expression(key, generator, None)?;
+    // 3. Return ? ToPropertyKey(propertyName).
+    // NB: NewClass converts the primitive this leaves to a property key, which a later key cannot observe.
+    Some(emit_to_primitive_property_key(generator, &property_name))
+}
+
+/// The name of a class field whose key is a literal, which a computed key gets only when the class is defined.
+// https://tc39.es/ecma262/#sec-static-semantics-propname
+fn class_field_literal_name(key: &Expression) -> Option<Utf16String> {
+    match &key.inner {
+        ExpressionKind::StringLiteral(string) => Some((**string).clone()),
+        ExpressionKind::PrivateIdentifier(identifier) => Some(identifier.name.clone()),
+        ExpressionKind::NumericLiteral(number) => Some(crate::host::js_number_to_utf16(*number)),
+        ExpressionKind::BigIntLiteral(literal) => {
+            let digits = String::from_utf16_lossy(bigint_literal_digits(literal));
+            let value = parse_bigint(&digits).expect("the lexer only produces valid BigInt literals");
+            Some(Utf16String(value.to_string().encode_utf16().collect()))
+        }
+        _ => None,
+    }
 }
 
 /// Synthesize a default constructor SharedFunctionInstanceData.
@@ -7638,19 +7696,28 @@ fn generate_for_in_statement(
     body: &Statement,
     preferred_dst: Option<&ScopedOperand>,
 ) -> Option<ScopedOperand> {
-    // B.3.5 Initializers in ForIn Statement Heads
-    // Evaluate the initializer for `for (var x = init in obj)` before the RHS.
+    // https://tc39.es/ecma262/#sec-initializers-in-forin-statement-heads
+    // ForInOfStatement : for ( var BindingIdentifier Initializer in Expression ) Statement
     if let ForInOfLhs::Declaration(statement) = lhs
         && let StatementKind::VariableDeclaration(vd) = &statement.inner
         && vd.kind == DeclarationKind::Var
         && let Some(declaration) = vd.declarations.first()
         && let (VariableDeclaratorTarget::Identifier(ident_id), Some(init)) = (&declaration.target, &declaration.init)
     {
+        // 1. Let name be the StringValue of BindingIdentifier.
+        // 2. Let lhs be ? ResolveBinding(name).
+        let resolved_binding = emit_resolve_binding_for_identifier_assignment(generator, *ident_id);
+        // 3. If IsAnonymousFunctionDefinition(Initializer) is true, then
+        //     a. Let value be ? NamedEvaluation of Initializer with argument name.
+        // 4. Else,
+        //     a. Let rhs be ? Evaluation of Initializer.
+        //     b. Let value be ? GetValue(rhs).
         let arena = generator.arena.clone();
         generator.pending_lhs_name = Some(generator.intern_identifier_id(arena.identifiers[*ident_id].name));
         let value = generate_expression_or_undefined(init, generator, None);
         generator.pending_lhs_name = None;
-        emit_set_variable(generator, *ident_id, &value);
+        // 5. Perform ? PutValue(lhs, value).
+        emit_set_variable_or_resolved_binding(generator, *ident_id, &value, resolved_binding.as_ref());
     }
 
     // Create end_block and update_block first, then nullish_block and
@@ -8905,11 +8972,7 @@ fn generate_object_binding_pattern(
             }
             Some(BindingEntryName::Expression(expression)) => {
                 let property_name = generate_expression_or_undefined(expression, generator, None);
-                let property_name = generator.copy_if_needed_to_preserve_evaluation_order(&property_name);
-                generator.emit(Instruction::ToPrimitiveWithStringHint {
-                    dst: property_name.operand(),
-                    value: property_name.operand(),
-                });
+                let property_name = emit_to_primitive_property_key(generator, &property_name);
                 if has_rest {
                     excluded_names.push(property_name.clone());
                 }

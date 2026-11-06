@@ -131,6 +131,7 @@
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/StorageAPI/StorageEndpoint.h>
 #include <LibWebCommon/WebDriver/Response.h>
+#include <LibWebCommon/WebView/AccessibilityNodeData.h>
 
 namespace Web::Internals {
 
@@ -1595,7 +1596,7 @@ static void define_scroller_properties(HTML::Window& window, JS::Object& object,
     object.define_direct_property("scroller"_utf16_fly_string, wrapped_node_with_unique_id(window, scroller.map([](auto const& id) { return id.node_id; })), JS::default_attributes);
     if (scroller.has_value() && scroller->kind == AsyncScrollNodeKind::PseudoElement) {
         auto pseudo_element = CSS::pseudo_element_name(static_cast<CSS::PseudoElement>(scroller->pseudo_element_type));
-        object.define_direct_property("scrollerPseudoElement"_utf16_fly_string, JS::PrimitiveString::create(vm, pseudo_element), JS::default_attributes);
+        object.define_direct_property("scrollerPseudoElement"_utf16_fly_string, JS::PrimitiveString::create(vm, Utf16View::from_ascii(pseudo_element)), JS::default_attributes);
     }
 }
 
@@ -1608,8 +1609,8 @@ GC::Ref<JS::Object> Internals::take_input_trace()
         auto const& record = records[i];
         auto object = JS::Object::create(realm, nullptr);
         object->define_direct_property("id"_utf16_fly_string, JS::Value(static_cast<double>(record.input_event_id)), JS::default_attributes);
-        object->define_direct_property("stage"_utf16_fly_string, JS::PrimitiveString::create(vm(), input_trace_stage_name(record.stage)), JS::default_attributes);
-        object->define_direct_property("decision"_utf16_fly_string, JS::PrimitiveString::create(vm(), input_routing_decision_name(record.decision)), JS::default_attributes);
+        object->define_direct_property("stage"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16View::from_ascii(input_trace_stage_name(record.stage))), JS::default_attributes);
+        object->define_direct_property("decision"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16View::from_ascii(input_routing_decision_name(record.decision))), JS::default_attributes);
         define_scroller_properties(window(), *object, record.scroller);
         object->define_direct_property("target"_utf16_fly_string, wrapped_node_with_unique_id(window(), record.dom_target), JS::default_attributes);
         MUST(array->create_data_property_or_throw(i, object));
@@ -1621,7 +1622,7 @@ GC::Ref<JS::Object> Internals::first_wheel_step_route_to_object(Compositing::Fir
 {
     auto& realm = HTML::relevant_realm(window());
     auto object = JS::Object::create(realm, nullptr);
-    object->define_direct_property("decision"_utf16_fly_string, JS::PrimitiveString::create(vm(), input_routing_decision_name(result.route.decision)), JS::default_attributes);
+    object->define_direct_property("decision"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16View::from_ascii(input_routing_decision_name(result.route.decision))), JS::default_attributes);
     define_scroller_properties(window(), *object, result.route.scroller);
     object->define_direct_property("document"_utf16_fly_string, wrapped_node_with_unique_id(window(), result.document_id), JS::default_attributes);
     return object;
@@ -1877,6 +1878,213 @@ Utf16String Internals::dump_accessibility_tree()
     return window().associated_document().dump_accessibility_tree_as_json();
 }
 
+String Internals::accessibility_character_offsets(GC::Ref<DOM::Node> node)
+{
+    auto& document = node->document();
+    document.update_layout(DOM::UpdateLayoutReason::InspectAccessibilityTree);
+    auto node_id = static_cast<i64>(node->unique_id().value());
+    StringBuilder builder;
+    for (auto const& node_data : document.build_accessibility_node_data()) {
+        if (node_data.id != node_id)
+            continue;
+        for (auto const& offset : node_data.character_offsets) {
+            if (!builder.is_empty())
+                builder.append(' ');
+            builder.appendff("{},{}", offset.x(), offset.y());
+        }
+        break;
+    }
+    return builder.to_string_without_validation();
+}
+
+// Dumps the node data in a form that stays the same from run to run: Node IDs become labels in tree order (n0 is the
+// dumped node), a reference to a node outside the dumped subtree prints as "outside", and only the fields that differ
+// from their defaults print. So a test can compare the data the UI process receives before and after a change.
+String Internals::dump_accessibility_node_data(GC::Ref<DOM::Node> node)
+{
+    auto& document = node->document();
+    document.update_layout(DOM::UpdateLayoutReason::InspectAccessibilityTree);
+    auto nodes = document.build_accessibility_node_data();
+
+    HashMap<i64, size_t> index_by_id;
+    for (size_t i = 0; i < nodes.size(); ++i)
+        index_by_id.set(nodes[i].id, i);
+    auto root_index = index_by_id.get(static_cast<i64>(node->unique_id().value()));
+    if (!root_index.has_value())
+        return "(not in the accessibility tree)"_string;
+
+    // Label the subtree's nodes in tree order.
+    HashMap<i64, size_t> label_by_id;
+    Vector<size_t> order;
+    Vector<size_t> depths;
+    auto label = [&](this auto const& self, size_t index, size_t depth) -> void {
+        if (label_by_id.contains(nodes[index].id))
+            return;
+        label_by_id.set(nodes[index].id, label_by_id.size());
+        order.append(index);
+        depths.append(depth);
+        for (auto child_id : nodes[index].child_ids) {
+            if (auto child_index = index_by_id.get(child_id); child_index.has_value())
+                self(*child_index, depth + 1);
+        }
+    };
+    label(*root_index, 0);
+
+    auto reference = [&](i64 id) -> String {
+        if (id == -1)
+            return "none"_string;
+        if (auto found = label_by_id.get(id); found.has_value())
+            return MUST(String::formatted("n{}", *found));
+        return "outside"_string;
+    };
+    auto references = [&](Vector<i64> const& ids) {
+        StringBuilder builder;
+        for (auto id : ids) {
+            if (!builder.is_empty())
+                builder.append(' ');
+            builder.append(reference(id));
+        }
+        return builder.to_string_without_validation();
+    };
+    auto quoted = [](String const& string) {
+        StringBuilder builder;
+        builder.append('"');
+        for (auto code_point : string.code_points()) {
+            if (code_point == '"' || code_point == '\\')
+                builder.append('\\');
+            if (code_point == '\n')
+                builder.append("\\n"sv);
+            else
+                builder.append_code_point(code_point);
+        }
+        builder.append('"');
+        return builder.to_string_without_validation();
+    };
+
+    StringBuilder builder;
+    for (size_t i = 0; i < order.size(); ++i) {
+        auto const& data = nodes[order[i]];
+        builder.append_repeated("  "sv, depths[i]);
+        builder.appendff("n{} {}", i, data.role.is_empty() ? "(no role)"sv : data.role.bytes_as_string_view());
+        auto field = [&](StringView name, auto const& value) { builder.appendff(" {}={}", name, value); };
+        if (!data.name.is_empty())
+            field("name"sv, quoted(data.name));
+        if (!data.description.is_empty())
+            field("description"sv, quoted(data.description));
+        if (!data.value.is_empty())
+            field("value"sv, quoted(data.value));
+        if (!data.url.is_empty())
+            field("url"sv, quoted(data.url));
+        if (!data.language.is_empty())
+            field("language"sv, data.language);
+        builder.appendff(" bounds={},{} {}x{}", data.bounds.x(), data.bounds.y(), data.bounds.width(), data.bounds.height());
+        if (data.is_focused)
+            builder.append(" focused"sv);
+        if (data.is_disabled)
+            builder.append(" disabled"sv);
+        if (data.heading_level != 0)
+            field("heading_level"sv, data.heading_level);
+        if (data.hierarchical_level != 0)
+            field("hierarchical_level"sv, data.hierarchical_level);
+        if (!data.live.is_empty())
+            field("live"sv, data.live);
+        if (data.column_span != 1 || data.row_span != 1)
+            builder.appendff(" span={}x{}", data.column_span, data.row_span);
+        if (data.cell_column_index != -1)
+            field("column_index"sv, data.cell_column_index);
+        if (data.table_row_count != -1 || data.table_column_count != -1)
+            builder.appendff(" table={}x{}", data.table_row_count, data.table_column_count);
+        if (data.table_caption_id != -1)
+            field("caption"sv, reference(data.table_caption_id));
+        if (!data.table_summary.is_empty())
+            field("summary"sv, quoted(data.table_summary));
+        if (!data.column_header_ids.is_empty())
+            builder.appendff(" column_headers=[{}]", references(data.column_header_ids));
+        if (!data.row_header_ids.is_empty())
+            builder.appendff(" row_headers=[{}]", references(data.row_header_ids));
+        if (!data.keybinding.is_empty())
+            field("keybinding"sv, quoted(data.keybinding));
+        if (data.value_numeric.has_value())
+            field("value_now"sv, *data.value_numeric);
+        if (data.value_minimum.has_value())
+            field("value_min"sv, *data.value_minimum);
+        if (data.value_maximum.has_value())
+            field("value_max"sv, *data.value_maximum);
+        if (data.value_step.has_value())
+            field("value_step"sv, *data.value_step);
+        if (data.is_selected)
+            builder.append(" selected"sv);
+        using CheckedState = WebView::AccessibilityNodeData::CheckedState;
+        using ExpandedState = WebView::AccessibilityNodeData::ExpandedState;
+        using PressedState = WebView::AccessibilityNodeData::PressedState;
+        auto tristate = [](bool is_true, bool is_mixed) {
+            if (is_mixed)
+                return "mixed"sv;
+            return is_true ? "true"sv : "false"sv;
+        };
+        if (data.checked_state != CheckedState::NotApplicable)
+            field("checked"sv, tristate(data.checked_state == CheckedState::Checked, data.checked_state == CheckedState::Mixed));
+        if (data.expanded_state != ExpandedState::NotApplicable)
+            field("expanded"sv, tristate(data.expanded_state == ExpandedState::Expanded, false));
+        if (data.pressed_state != PressedState::NotApplicable)
+            field("pressed"sv, tristate(data.pressed_state == PressedState::Pressed, data.pressed_state == PressedState::Mixed));
+        auto flag = [&](bool value, StringView name) {
+            if (value)
+                builder.appendff(" {}", name);
+        };
+        flag(data.is_editable, "editable"sv);
+        flag(data.is_multi_line, "multi_line"sv);
+        flag(data.is_password, "password"sv);
+        flag(data.is_read_only, "read_only"sv);
+        flag(data.is_required, "required"sv);
+        flag(data.is_invalid, "invalid"sv);
+        flag(data.is_multi_selectable, "multi_selectable"sv);
+        flag(data.is_visited, "visited"sv);
+        if (data.caret_offset != -1)
+            field("caret"sv, data.caret_offset);
+        if (data.selection_start != -1 || data.selection_end != -1)
+            builder.appendff(" selection={}..{}", data.selection_start, data.selection_end);
+        if (!data.font_family.is_empty())
+            builder.appendff(" font={} {} {} {}", quoted(data.font_family), data.font_size, data.font_weight, data.font_style);
+        if (!data.color.is_empty())
+            field("color"sv, data.color);
+        if (!data.background_color.is_empty())
+            field("background"sv, data.background_color);
+        if (!data.text_decoration.is_empty() && data.text_decoration != "none"sv)
+            field("decoration"sv, data.text_decoration);
+        if (!data.character_offsets.is_empty()) {
+            builder.append(" characters="sv);
+            for (size_t j = 0; j < data.character_offsets.size(); ++j)
+                builder.appendff("{}{},{}", j ? " "sv : ""sv, data.character_offsets[j].x(), data.character_offsets[j].y());
+        }
+        if (!data.line_break_character_offsets.is_empty()) {
+            builder.append(" lines="sv);
+            for (size_t j = 0; j < data.line_break_character_offsets.size(); ++j) {
+                auto height = j < data.line_heights.size() ? data.line_heights[j] : -1;
+                builder.appendff("{}{}@{}", j ? " "sv : ""sv, data.line_break_character_offsets[j], height);
+            }
+        }
+        builder.append('\n');
+    }
+    return builder.to_string_without_validation();
+}
+
+String Internals::accessibility_cached_text_mismatches()
+{
+    StringBuilder builder;
+    for (auto const& mismatch : window().associated_document().cached_accessible_text_mismatches())
+        builder.appendff("{}\n", mismatch);
+    return builder.to_string_without_validation();
+}
+
+String Internals::accessibility_cached_record_mismatches()
+{
+    StringBuilder builder;
+    for (auto const& mismatch : window().associated_document().cached_accessibility_record_mismatches())
+        builder.appendff("{}\n", mismatch);
+    return builder.to_string_without_validation();
+}
+
 Utf16String Internals::dump_layout_tree(GC::Ref<DOM::Node> node)
 {
     // The test API's read of the render state of the node's document.
@@ -2128,6 +2336,12 @@ GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()
     return promise;
 }
 
+void Internals::exhaust_navigation_rate_limit()
+{
+    if (auto navigable = window().associated_document().navigable())
+        navigable->exhaust_navigation_or_history_update_rate_limit_for_testing();
+}
+
 bool Internals::has_shadow_root(GC::Ref<DOM::Element> element)
 {
     return element->shadow_root() != nullptr;
@@ -2342,6 +2556,11 @@ bool Internals::document_is_playing_audio(DOM::Document& document)
 bool Internals::tab_is_playing_audio()
 {
     return window().associated_document().page().client().page_did_request_tab_is_playing_audio_for_testing();
+}
+
+bool Internals::tab_is_heard_playing_audio()
+{
+    return window().associated_document().page().client().page_did_request_tab_is_heard_playing_audio_for_testing();
 }
 
 WebIDL::UnsignedLongLong Internals::tab_audibility_change_count()
@@ -3313,11 +3532,13 @@ WebIDL::ExceptionOr<GC::Ref<JS::Object>> Internals::image_animation_state_for_ur
 
     auto object = JS::Object::create(window().principal_realm(), nullptr);
 
-    object->define_direct_property("timerActive"_utf16_fly_string, JS::Value(animated_bitmap_data->m_animation_timer->is_active()), JS::default_attributes);
+    auto state = animated_bitmap_data->state_for_testing();
+    object->define_direct_property("isAnimating"_utf16_fly_string, JS::Value(state.is_animating), JS::default_attributes);
     object->define_direct_property("sessionID"_utf16_fly_string, JS::Value(static_cast<double>(animated_bitmap_data->m_session_id)), JS::default_attributes);
-    object->define_direct_property("frameIndex"_utf16_fly_string, JS::Value(animated_bitmap_data->m_current_frame_index), JS::default_attributes);
+    object->define_direct_property("frameIndex"_utf16_fly_string, JS::Value(state.frame_index), JS::default_attributes);
+    object->define_direct_property("shownFrameIndex"_utf16_fly_string, JS::Value(state.shown_frame_index), JS::default_attributes);
     object->define_direct_property("frameCount"_utf16_fly_string, JS::Value(animated_bitmap_data->m_frame_count), JS::default_attributes);
-    object->define_direct_property("loopsCompleted"_utf16_fly_string, JS::Value(animated_bitmap_data->m_loops_completed), JS::default_attributes);
+    object->define_direct_property("loopsCompleted"_utf16_fly_string, JS::Value(state.loops_completed), JS::default_attributes);
     object->define_direct_property("loopCount"_utf16_fly_string, JS::Value(animated_bitmap_data->m_loop_count), JS::default_attributes);
     object->define_direct_property("clientCount"_utf16_fly_string, JS::Value(image_data->m_clients.size()), JS::default_attributes);
 

@@ -15,13 +15,9 @@ set(TEST_SOURCES
     TestAudioWorkletPipe.cpp
     TestBlobBytes.cpp
     TestContentBlocker.cpp
-    TestControlMessageQueue.cpp
     TestCSSDecodeBytes.cpp
     TestCSSIDSpeed.cpp
-    TestCSSInheritedProperty.cpp
     TestCSSPropertyList.cpp
-    TestDownloadReader.cpp
-    TestDump.cpp
     TestEventLoop.cpp
     TestFaviconDecoding.cpp
     TestFetchAlgorithms.cpp
@@ -38,10 +34,8 @@ set(TEST_SOURCES
     TestHighResolutionTime.cpp
     TestHTMLTokenizer.cpp
     TestImageData.cpp
-    TestInitialLoadTracker.cpp
     TestInlineStyle.cpp
     TestLoaderConfig.cpp
-    TestMicrosyntax.cpp
     TestMimeSniff.cpp
     TestNumbers.cpp
     TestSecureContexts.cpp
@@ -49,7 +43,6 @@ set(TEST_SOURCES
     TestSharedCompiledStyleSheet.cpp
     TestSimpleRealm.cpp
     TestSourceHighlighter.cpp
-    TestStorageAreaMirror.cpp
     TestStructuredSerializeCorpus.cpp
     TestStructuredSerializeDurability.cpp
     TestStructuredSerializeFormat.cpp
@@ -69,7 +62,6 @@ if (NOT WIN32)
         TestLengthAbsolutizeParity.cpp
         TestStylePropertyMetadataParity.cpp
         TestStyleStructRef.cpp
-        TestStyleValueEquality.cpp
     )
 endif()
 

@@ -33,19 +33,27 @@ pub(crate) struct SubtreeGeneratedContentEffects {
 impl RetainedState {
     /// The record a highlight pseudo-element inherits from: the same pseudo-element's record on its
     /// nearest flat-tree ancestor holding one, as the engine has it assigned.
-    pub(crate) fn retained_highlight_inheritance_parent_style_record(
+    pub(in crate::css::style) fn retained_highlight_inheritance_parent_style_record(
         &self,
         node: StyleNodeID,
-        pseudo_kind: u8,
+        target: pipeline::PseudoElementTarget,
     ) -> Option<computed::FinalStyleRecordID> {
         let mut ancestor = self.projection.inheritance_parent(node);
         while let Some(candidate) = ancestor {
-            if let Some(record) = self.computed_group_sets.pseudo_style_record(candidate, pseudo_kind) {
+            if let Some(record) = self.installed_pseudo_style_record(candidate, target) {
                 return Some(record);
             }
             ancestor = self.projection.inheritance_parent(candidate);
         }
         None
+    }
+
+    pub(in crate::css::style) fn installed_pseudo_style_record(
+        &self,
+        node: StyleNodeID,
+        target: pipeline::PseudoElementTarget,
+    ) -> Option<computed::FinalStyleRecordID> {
+        self.computed_group_sets.pseudo_style_record_of(node, target)
     }
 
     #[cfg(test)]
@@ -597,10 +605,6 @@ impl RetainedState {
     }
 
     pub(crate) fn take_released_animation_overlay_records(&mut self) -> computed::ReleasedAnimationOverlayRecords {
-        // Even an empty take copies the sets while a fork shares them.
-        if !self.computed_group_sets.has_released_animation_overlay_records() {
-            return computed::ReleasedAnimationOverlayRecords::default();
-        }
         self.computed_group_sets.take_released_animation_overlay_records()
     }
 
@@ -654,8 +658,16 @@ impl RetainedState {
         node: StyleNodeID,
         pseudo_kind: u8,
     ) -> Option<computed::FinalStyleRecordID> {
+        self.remove_computed_pseudo_of(node, pipeline::PseudoElementTarget::of_kind(pseudo_kind))
+    }
+
+    pub(in crate::css::style) fn remove_computed_pseudo_of(
+        &mut self,
+        node: StyleNodeID,
+        target: pipeline::PseudoElementTarget,
+    ) -> Option<computed::FinalStyleRecordID> {
         let live_animation_overlays_before = self.computed_group_sets.live_animation_overlay_records();
-        let removed_style_record = self.computed_group_sets.remove_pseudo(node, pseudo_kind);
+        let removed_style_record = self.computed_group_sets.remove_pseudo_of(node, target);
         let live_animation_overlays_after = self.computed_group_sets.live_animation_overlay_records();
         let removed_style_record = removed_style_record?;
         self.counters.bump(Counter::ComputedPseudoAssignmentsRemoved);
@@ -842,10 +854,15 @@ pub(super) mod pseudo_kind {
     pub(in crate::css::style) const SELECTION: u8 = 8;
     pub(in crate::css::style) const SPELLING_ERROR: u8 = 9;
     pub(in crate::css::style) const SYNTHETIC_COUNT: usize = 11;
+    pub(in crate::css::style) const HIGHLIGHT: u8 = 17;
+    const _: () = assert!(HIGHLIGHT as u16 == crate::css::selector::PseudoElementType::Highlight as u16);
 
     /// https://drafts.csswg.org/css-pseudo-4/#highlight-pseudos
     pub(in crate::css::style) const fn is_highlight(kind: u8) -> bool {
-        matches!(kind, SEARCH_TEXT | SEARCH_TEXT_CURRENT | SELECTION | SPELLING_ERROR)
+        matches!(
+            kind,
+            SEARCH_TEXT | SEARCH_TEXT_CURRENT | SELECTION | SPELLING_ERROR | HIGHLIGHT
+        )
     }
 }
 
@@ -876,16 +893,17 @@ mod tests {
         };
         let root_record = publish(&mut engine, root, 0);
         assert_eq!(
-            engine.retained_highlight_inheritance_parent_style_record(parent, 0),
+            engine
+                .retained_highlight_inheritance_parent_style_record(parent, pipeline::PseudoElementTarget::of_kind(0)),
             Some(root_record)
         );
         assert_eq!(
-            engine.retained_highlight_inheritance_parent_style_record(child, 0),
+            engine.retained_highlight_inheritance_parent_style_record(child, pipeline::PseudoElementTarget::of_kind(0)),
             Some(root_record)
         );
         let slot_record = publish(&mut engine, slot, 0);
         assert_eq!(
-            engine.retained_highlight_inheritance_parent_style_record(child, 0),
+            engine.retained_highlight_inheritance_parent_style_record(child, pipeline::PseudoElementTarget::of_kind(0)),
             Some(slot_record)
         );
     }

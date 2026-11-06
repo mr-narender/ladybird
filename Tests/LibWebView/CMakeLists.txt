@@ -50,7 +50,6 @@ ladybird_test_suite(LibWebView)
 
 set(TEST_SOURCES
     TestAccessibilityTreeManager.cpp
-    TestAudibilityHold.cpp
     TestAudioServerAudibility.cpp
     TestAutocompleteMuxer.cpp
     TestAutocompleteRanker.cpp
@@ -66,6 +65,7 @@ set(TEST_SOURCES
     TestHelperProcessEnvironment.cpp
     TestHistoryStore.cpp
     TestHSTSStore.cpp
+    TestLingeringIndicator.cpp
     TestNavigationLoader.cpp
     TestNotificationAttribution.cpp
     TestNotificationFreedesktopArguments.cpp
@@ -81,6 +81,7 @@ set(TEST_SOURCES
     TestStartupSettings.cpp
     TestStorageAreaRegistry.cpp
     TestStorageJar.cpp
+    TestTabIndicators.cpp
     TestTabPerformanceStats.cpp
     TestWebDriverBiDiNetwork.cpp
     TestWebViewURL.cpp
@@ -124,7 +125,6 @@ if (NOT WIN32)
         TestAutocomplete.cpp
         TestBeforeUnload.cpp
         TestBrowserHistoryTraversal.cpp
-        TestCompositorInputRouting.cpp
         TestCrashOverlay.cpp
         TestCrashReportSubmission.cpp
         TestFavicon.cpp
@@ -146,12 +146,9 @@ if (NOT WIN32)
         TestRequestServerClientSessions.cpp
         TestRequestServerDiskCaches.cpp
         TestShadowTreeTooltipsAndLinks.cpp
-        TestTabPerformanceMonitor.cpp
         TestUserActivation.cpp
-        TestViewDestruction.cpp
         TestViewSource.cpp
         TestWebCompatReport.cpp
-        TestWebCompatReportPage.cpp
     )
     list(APPEND TEST_SOURCES ${HEADLESS_TEST_SOURCES})
 endif()

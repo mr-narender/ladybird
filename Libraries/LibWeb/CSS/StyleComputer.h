@@ -43,8 +43,6 @@ class WEB_API StyleComputer final : public GC::Cell {
     GC_DECLARE_ALLOCATOR(StyleComputer);
 
 public:
-    static void for_each_property_expanding_shorthands(PropertyID, StyleValue const&, Function<void(PropertyID, StyleValue const&)> const& set_longhand_property);
-
     static Optional<Utf16String> user_agent_style_sheet_source(Utf16View name);
 
     static Vector<StyleProperty> collect_presentational_hint_properties(DOM::AbstractElement);
@@ -62,7 +60,7 @@ public:
     void update_root_element_font_metrics(ComputedValues const&);
     // The style of a pseudo-element the element holds no style for, as the style engine derives it for one read alone;
     // null where the engine leaves the read to C++.
-    [[nodiscard]] RefPtr<ComputedValues const> engine_transient_pseudo_element_style(Layout::BegunRead const& read, DOM::Element const&, StyleEngine::DemandedPseudoElement);
+    [[nodiscard]] RefPtr<ComputedValues const> engine_transient_pseudo_element_style(Layout::BegunRead const& read, DOM::Element const&, StyleEngine::DemandedPseudoElement, StyleAtomID highlight_name = {});
     [[nodiscard]] JsonArray collect_devtools_applied_style_rules(Layout::BegunRead const& read, DOM::AbstractElement, bool include_inherited, bool include_user_agent_styles);
 
     // The way back from a StyleEngine rule identity to what that rule contributes to the cascade.

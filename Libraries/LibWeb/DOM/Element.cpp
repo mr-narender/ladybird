@@ -54,6 +54,7 @@
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StylePropertyMap.h>
+#include <LibWeb/CSS/StylePropertyMapReadOnly.h>
 #include <LibWeb/CSS/StyleSheetInvalidation.h>
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ContentStyleValue.h>
@@ -1955,10 +1956,44 @@ void Element::swap_in_style_record(Layout::BegunRead const& read, Optional<CSS::
     ++m_animation_style_generation;
     VERIFY(record);
     m_installed_style = CSS::InstalledStyle { record };
+    // A new style can change the states and the text formatting the accessibility tree reports for the element.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_records_after_style_change(*this);
     auto const style_record = m_installed_style.record();
     // NB: The render side installed the record in a box it styles itself, which the box adopts.
     if (auto* layout_node = unsafe_layout_node(read))
         layout_node->set_style_record_identity(style_record);
+}
+
+Element::CustomHighlightStyles const* Element::custom_highlight_styles() const
+{
+    auto const* rare_data = element_rare_data();
+    if (!rare_data || rare_data->custom_highlight_styles.is_empty())
+        return nullptr;
+    return &rare_data->custom_highlight_styles;
+}
+
+void Element::swap_in_custom_highlight_style_record(CSS::StyleAtomID name, void const* record)
+{
+    if (record) {
+        ensure_element_rare_data().custom_highlight_styles.set(name, CSS::InstalledStyle { record });
+        return;
+    }
+    if (auto* rare_data = element_rare_data())
+        rare_data->custom_highlight_styles.remove(name);
+}
+
+void Element::clear_custom_highlight_styles()
+{
+    auto* rare_data = element_rare_data();
+    if (!rare_data || rare_data->custom_highlight_styles.is_empty())
+        return;
+    auto styles = move(rare_data->custom_highlight_styles);
+    if (style_node_id() == 0)
+        return;
+    auto& style_engine = document().style_computer().style_engine();
+    for (auto const& [name, style] : styles)
+        CSS::StyleEngineFFI::style_engine_set_held_pseudo_style_record(style_engine.host(), style_node_id(), to_underlying(CSS::PseudoElement::Highlight), name, 0, style.record_pointer());
 }
 
 // The custom-property environment of a style record: what the element inherits, or its own custom declarations over
@@ -2021,6 +2056,13 @@ void Element::apply_style_main_effects(Layout::BegunRead const& read, CSS::MainE
 
     if (has_flag(effects, CSS::MainEffects::ContainerEffects))
         record_engine_container_query_effects(read, *this);
+
+    // A style change that needs a relayout can change which nodes render and what generated content they have, and so
+    // the accessible names that come from them. Of the changes that need just a repaint, only one of visibility can:
+    // Content that isn't visible is left out of a name that comes from content.
+    auto visibility_changed = old_values && old_values->visibility() != new_computed_values->visibility();
+    if ((invalidation.needs_relayout() || visibility_changed) && document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_data(*this);
 
     // The environment the record was published with: what the element inherits, or what the engine resolved its own
     // custom declarations to over that, and those of the pseudo-elements over the element's.
@@ -2206,6 +2248,7 @@ void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunR
         element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
             pseudo_element.clear_computed_style();
         });
+        element->clear_custom_highlight_styles();
         return TraversalDecision::Continue;
     });
 }
@@ -2984,8 +3027,6 @@ double Element::current_css_zoom() const
 
 static bool style_attribute_is_blocked_by_content_security_policy(Element& element, Utf16View value)
 {
-    if (auto shadow_root = element.containing_shadow_root(); shadow_root && shadow_root->is_user_agent_internal())
-        return false;
     return ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(element, ContentSecurityPolicy::Directives::Directive::InlineType::StyleAttribute, value) == ContentSecurityPolicy::Directives::Directive::Result::Blocked;
 }
 
@@ -3087,6 +3128,7 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
         note_subtree_style_moved();
         pseudo_element.clear_computed_style();
     });
+    clear_custom_highlight_styles();
 
     // A shadow root's counter style names pass on to the scope its host is in, which a move of the host can change.
     if (m_shadow_root)
@@ -3180,6 +3222,8 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
             if (!pseudo_element.scroll_offset().is_zero())
                 pseudo_element.publish_scroll_offset();
         });
+        if (document().has_custom_highlights())
+            document().set_needs_highlight_style_update(CSS::PseudoElement::Highlight);
     }
     // NB: A newly minted identity holds no style on the render side, whatever the element and its pseudo-elements
     //     still hold: the render side styles the element as it arrives, and swaps in what it computed.
@@ -5329,6 +5373,10 @@ void Element::replace_installed_style(Layout::BegunRead const& read, CSS::Instal
     if (m_installed_style.record() == style_record_identity)
         return;
     auto held_before = exchange(m_installed_style, move(style));
+    // Every new style, an animation's included, can change the states and the text formatting the accessibility tree
+    // reports for the element.
+    if (document().page().accessibility_interested())
+        document().invalidate_cached_accessibility_records_after_style_change(*this);
     // The element holds the record it installed before until the engine takes the new one in, so the layout node reads
     // what it moves from, and everything below that compares against the old record is read from it, before the
     // element lets go of it. The engine keeps the old record until it takes the new one in.
@@ -7135,7 +7183,7 @@ GC::Ref<CSS::StylePropertyMapReadOnly> Element::computed_style_map()
     //    until a given property is actually requested.
     auto& computed_style_map_cache = ensure_element_rare_data().computed_style_map_cache;
     if (computed_style_map_cache == nullptr) {
-        computed_style_map_cache = CSS::StylePropertyMapReadOnly::create_computed_style(AbstractElement { *this });
+        computed_style_map_cache = CSS::StylePropertyMapReadOnly::create_computed_style(*this);
     }
 
     // 2. Return this’s [[computedStyleMapCache]] internal slot.

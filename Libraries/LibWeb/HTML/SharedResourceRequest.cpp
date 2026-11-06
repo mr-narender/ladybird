@@ -63,6 +63,32 @@ GC::Ref<SharedResourceRequest> SharedResourceRequest::get_or_create(DOM::Documen
     return get_or_create(document, { request.url(), cors_setting, request.integrity_metadata(), request.referrer_policy() });
 }
 
+GC::Ref<SharedResourceRequest> SharedResourceRequest::create_from_navigation_response_body(DOM::Document& document, Fetch::Infrastructure::Body const& body, GC::Ref<GC::Function<void()>> on_body_read)
+{
+    auto request = GC::Heap::the().allocate<SharedResourceRequest>(document.page(), Key { document.url(), CORSSettingAttribute::NoCORS, {}, ReferrerPolicy::ReferrerPolicy::EmptyString }, document);
+    request->m_can_be_shared = false;
+    request->m_state = State::Fetching;
+    // NB: The element that presents the image may start to wait for it only after the body has been read.
+    request->m_load_event_delayer.emplace(document);
+
+    GC::Weak weak_request { *request };
+    auto process_body = GC::create_function(GC::Heap::the(), [weak_request, on_body_read](ByteBuffer data) {
+        // NB: A document for an SVG image is an XML document, so this is never an SVG image.
+        if (auto request = weak_request.ptr())
+            request->handle_successful_fetch(request->url(), IsSVGImage::No, move(data), false);
+        on_body_read->function()();
+    });
+    auto process_body_error = GC::create_function(GC::Heap::the(), [weak_request, on_body_read](JS::Value) {
+        if (auto request = weak_request.ptr())
+            request->handle_failed_fetch();
+        on_body_read->function()();
+    });
+
+    auto& realm = HTML::relevant_realm(document);
+    body.fully_read(realm, process_body, process_body_error, GC::Ref { realm.global_object() });
+    return request;
+}
+
 SharedResourceRequest::SharedResourceRequest(GC::Ref<Page> page, Key key, GC::Ref<DOM::Document> document)
     : m_page(page)
     , m_key(move(key))
@@ -321,23 +347,13 @@ void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, 
     auto handle_successful_bitmap_decode = [strong_this = GC::Root(*this), image_data_is_cors_cross_origin, encoded_data = move(encoded_data)](Web::Platform::DecodedImage& result) mutable -> ErrorOr<void> {
         if (result.session_id != 0) {
             // Streaming animated decode: create AnimatedBitmapDecodedImageData.
-            Vector<NonnullRefPtr<Gfx::Bitmap>> initial_bitmaps;
-            initial_bitmaps.ensure_capacity(result.frames.size());
-            for (auto& frame : result.frames)
-                initial_bitmaps.unchecked_append(*frame.bitmap);
-
-            auto first_bitmap = result.frames.first().bitmap;
-            auto size = first_bitmap->size();
-
             strong_this->m_image_data = AnimatedBitmapDecodedImageData::create(
                 *strong_this->m_document,
                 result.session_id,
-                result.frame_count,
                 result.loop_count,
-                size,
                 move(result.color_space),
                 move(result.all_durations),
-                move(initial_bitmaps));
+                *result.frames.first().bitmap);
         } else {
             // Single-shot decode: create BitmapDecodedImageData as before.
             Vector<BitmapDecodedImageData::Frame> frames;

@@ -540,7 +540,7 @@ pub(crate) struct FcRunCacheStore {
     /// Written in place, while a fork of the arena reads them as they were when it was made.
     slots: super::pass_column::ForkSharedRows<FcRunCacheSlot>,
     /// Noted between passes, and only read during one.
-    inline_layout_damage: Vec<InlineLayoutDamage>,
+    inline_layout_damage: crate::fork_vec::ForkVec<InlineLayoutDamage>,
     queued_for_sweep: super::pass_column::PassFlags,
 }
 
@@ -549,7 +549,7 @@ impl FcRunCacheStore {
         Self {
             slots: self.slots.fork(),
             inline_layout_damage: self.inline_layout_damage.clone(),
-            queued_for_sweep: self.queued_for_sweep.copy(),
+            queued_for_sweep: super::pass_column::PassFlags::default(),
         }
     }
 
@@ -634,7 +634,7 @@ impl FcRunCacheStore {
         }
         let damage = &mut self.inline_layout_damage;
         if damage.len() <= box_.slot_index() as usize {
-            damage.resize(box_.slot_index() as usize + 1, InlineLayoutDamage::default());
+            damage.resize_with_default(box_.slot_index() as usize + 1);
         }
         let entry = &mut damage[box_.slot_index() as usize];
         if entry.generation != box_.generation() {

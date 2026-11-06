@@ -22,6 +22,8 @@ asm_dispatch_table:
     .quad asm_handler_ConcatString
     .quad asm_handler_CopyObjectExcludingProperties
     .quad asm_handler_ImportCall
+    .quad asm_handler_GetClassFieldInitializerName
+    .quad asm_handler_GetClassProtoParent
     .quad asm_handler_NewClass
     .quad asm_handler_Jump
     .quad asm_handler_JumpIf
@@ -237,8 +239,6 @@ asm_dispatch_table:
     .quad asm_handler_JumpStrictlyInequalsLoopRhsInt32
     .quad asm_handler_JumpLooselyEqualsLoopRhsInt32
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
@@ -569,6 +569,14 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_ImportCall_hot_end
     .quad asm_handler_ImportCall_cold
     .quad asm_handler_ImportCall_cold_end
+    .quad asm_handler_GetClassFieldInitializerName
+    .quad asm_handler_GetClassFieldInitializerName_hot_end
+    .quad asm_handler_GetClassFieldInitializerName_cold
+    .quad asm_handler_GetClassFieldInitializerName_cold_end
+    .quad asm_handler_GetClassProtoParent
+    .quad asm_handler_GetClassProtoParent_hot_end
+    .quad asm_handler_GetClassProtoParent_cold
+    .quad asm_handler_GetClassProtoParent_cold_end
     .quad asm_handler_NewClass
     .quad asm_handler_NewClass_hot_end
     .quad asm_handler_NewClass_cold
@@ -1429,14 +1437,6 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32_hot_end
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32_cold
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
     .quad asm_handler_fallback
     .quad asm_handler_fallback_hot_end
     .quad asm_handler_fallback_cold
@@ -9062,14 +9062,96 @@ asm_handler_ImportCall_cold:
 asm_handler_ImportCall_cold_end:
 
 .p2align 4
+asm_handler_GetClassFieldInitializerName:
+    mov x0, x20
+    sub w1, w21, w26
+    str w1, [x28, #64]
+    mov x0, x20
+    sub w1, w21, w26
+    mov x2, x21
+    bl CSYM(asm_slow_path_get_class_field_initializer_name)
+    tbnz x0, #63, .Lasm_GetClassFieldInitializerName.scalar_result_done_0
+    tbz x0, #32, .Lasm_GetClassFieldInitializerName.scalar_result_done_0
+    ldr w9, [x21, #4]
+    str x1, [x27, x9, lsl #3]
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+.Lasm_GetClassFieldInitializerName.scalar_result_done_0:
+    tbz x0, #63, 1f
+    b .Lexit
+1:
+    tbz x0, #32, .Lasm_GetClassFieldInitializerName.slow_path_transfer_1
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+.Lasm_GetClassFieldInitializerName.slow_path_transfer_1:
+    ldr x28, [x20]
+    ldr x9, [x28, #88]
+    ldr x26, [x9, #40]
+    add x27, x28, #128
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+asm_handler_GetClassFieldInitializerName_hot_end:
+asm_handler_GetClassFieldInitializerName_cold:
+asm_handler_GetClassFieldInitializerName_cold_end:
+
+.p2align 4
+asm_handler_GetClassProtoParent:
+    mov x0, x20
+    sub w1, w21, w26
+    str w1, [x28, #64]
+    ldr w9, [x21, #8]
+    ldr x10, [x27, x9, lsl #3]
+.Lasm_GetClassProtoParent.scalar_value_ready_0:
+    mov x3, x10
+    mov x0, x20
+    sub w1, w21, w26
+    mov x2, x21
+    bl CSYM(asm_slow_path_get_class_proto_parent)
+    tbnz x0, #63, .Lasm_GetClassProtoParent.scalar_result_done_1
+    tbz x0, #32, .Lasm_GetClassProtoParent.scalar_result_done_1
+    ldr w9, [x21, #4]
+    str x1, [x27, x9, lsl #3]
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+.Lasm_GetClassProtoParent.scalar_result_done_1:
+    tbz x0, #63, 1f
+    b .Lexit
+1:
+    tbz x0, #32, .Lasm_GetClassProtoParent.slow_path_transfer_2
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+.Lasm_GetClassProtoParent.slow_path_transfer_2:
+    ldr x28, [x20]
+    ldr x9, [x28, #88]
+    ldr x26, [x9, #40]
+    add x27, x28, #128
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+asm_handler_GetClassProtoParent_hot_end:
+asm_handler_GetClassProtoParent_cold:
+asm_handler_GetClassProtoParent_cold_end:
+
+.p2align 4
 asm_handler_NewClass:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
     add x9, sp, #0
-    ldr w10, [x21, #28]
+    ldr w10, [x21, #36]
     lsl x10, x10, #3
-    add x10, x10, #55
+    add x10, x10, #71
     and x10, x10, #0xfffffffffffffff0
     sub x14, x9, x10
     ldr x12, [x20, #40]
@@ -9100,59 +9182,75 @@ asm_handler_NewClass:
     ldr x11, [x27, x12, lsl #3]
 .Lasm_NewClass.value_ready_4:
     str x11, [sp, #24]
+    movz x11, #0x7ffb, lsl #48
     ldr w12, [x21, #16]
+    movn w13, #0
+    cmp w12, w13
+    b.eq .Lasm_NewClass.value_ready_5
     ldr x11, [x27, x12, lsl #3]
 .Lasm_NewClass.value_ready_5:
     str x11, [sp, #32]
+    ldr w12, [x21, #20]
+    ldr x11, [x27, x12, lsl #3]
+.Lasm_NewClass.value_ready_6:
+    str x11, [sp, #40]
+    movz x11, #0x7ffb, lsl #48
+    ldr w12, [x21, #32]
+    movn w13, #0
+    cmp w12, w13
+    b.eq .Lasm_NewClass.value_ready_7
+    ldr x11, [x27, x12, lsl #3]
+.Lasm_NewClass.value_ready_7:
+    str x11, [sp, #48]
     mov w9, #0
-    ldr w10, [x21, #28]
-    add x14, sp, #40
-    add x3, x21, #32
-.Lasm_NewClass.array_value_next_6:
+    ldr w10, [x21, #36]
+    add x14, sp, #56
+    add x3, x21, #40
+.Lasm_NewClass.array_value_next_8:
     cmp x9, x10
-    b.hs .Lasm_NewClass.array_values_end_8
+    b.hs .Lasm_NewClass.array_values_end_10
     ldr w12, [x3, x9, lsl #2]
     movz x11, #0x7ffb, lsl #48
     movn w13, #0
     cmp w12, w13
-    b.eq .Lasm_NewClass.array_value_ready_7
+    b.eq .Lasm_NewClass.array_value_ready_9
     ldr x11, [x27, x12, lsl #3]
-.Lasm_NewClass.array_value_ready_7:
+.Lasm_NewClass.array_value_ready_9:
     str x11, [x14, x9, lsl #3]
     add x9, x9, #1
-    b .Lasm_NewClass.array_value_next_6
-.Lasm_NewClass.array_values_end_8:
+    b .Lasm_NewClass.array_value_next_8
+.Lasm_NewClass.array_values_end_10:
     mov x0, x20
     sub w1, w21, w26
     mov x2, x21
     add x3, sp, #16
     bl CSYM(asm_slow_path_new_class)
-    tbnz x0, #63, .Lasm_NewClass.values_exceptional_outputs_10
-    tbz x0, #32, .Lasm_NewClass.values_exceptional_outputs_10
+    tbnz x0, #63, .Lasm_NewClass.values_exceptional_outputs_12
+    tbz x0, #32, .Lasm_NewClass.values_exceptional_outputs_12
     ldr w12, [x21, #8]
     ldr x11, [sp, #16]
     str x11, [x27, x12, lsl #3]
-.Lasm_NewClass.skip_output_value_11:
+.Lasm_NewClass.skip_output_value_13:
     ldr x9, [sp]
     add sp, x9, #0
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
     ldr x10, [x19, x9, lsl #3]
     br x10
-.Lasm_NewClass.values_exceptional_outputs_10:
-.Lasm_NewClass.values_restore_stack_9:
+.Lasm_NewClass.values_exceptional_outputs_12:
+.Lasm_NewClass.values_restore_stack_11:
     ldr x9, [sp]
     add sp, x9, #0
 .Lasm_NewClass.values_call_done_0:
     tbz x0, #63, 1f
     b .Lexit
 1:
-    tbz x0, #32, .Lasm_NewClass.slow_path_transfer_12
+    tbz x0, #32, .Lasm_NewClass.slow_path_transfer_14
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
     ldr x10, [x19, x9, lsl #3]
     br x10
-.Lasm_NewClass.slow_path_transfer_12:
+.Lasm_NewClass.slow_path_transfer_14:
     ldr x28, [x20]
     ldr x9, [x28, #88]
     ldr x26, [x9, #40]

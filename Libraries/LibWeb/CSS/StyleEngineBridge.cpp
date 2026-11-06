@@ -210,8 +210,6 @@ Optional<StyleEngine::DemandedPseudoElement> StyleEngine::demanded_pseudo_elemen
     // The engine numbers each pseudo-element it answers as its kind: the synthetic ones, the ones an element in the
     // shadow tree backs, and the named view transition ones. ::part() and ::slotted() name other elements.
     switch (pseudo_element) {
-    // FIXME: Compute the styles of ::highlight() pseudo-elements for each custom highlight name.
-    case PseudoElement::Highlight:
     case PseudoElement::Part:
     case PseudoElement::Slotted:
     case PseudoElement::KnownPseudoElementCount:
@@ -422,6 +420,14 @@ void StyleEngine::set_highlight_observing_elements(PseudoElement pseudo_element,
     flush_deferred_geometry_transaction_before_non_replayable_input(*this, m_style_computer);
     request_frame_for_first_recorded_input(*this, m_style_computer);
     StyleEngineFFI::style_engine_set_highlight_observing_elements(host(), to_underlying(pseudo_element), style_nodes);
+}
+
+void StyleEngine::set_custom_highlight_observing_elements(ReadonlySpan<StyleNodeID> style_nodes, ReadonlySpan<StyleAtomID> names)
+{
+    VERIFY(style_nodes.size() == names.size());
+    flush_deferred_geometry_transaction_before_non_replayable_input(*this, m_style_computer);
+    request_frame_for_first_recorded_input(*this, m_style_computer);
+    StyleEngineFFI::style_engine_set_custom_highlight_observing_elements(host(), style_nodes, names);
 }
 
 void StyleEngine::record_container_query_input_change(StyleNodeID style_node)

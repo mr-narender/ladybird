@@ -2284,6 +2284,10 @@ impl RuleIndex {
             .resolve(self.entries.view(entry as usize).selector())
     }
 
+    pub(super) fn entry_styles_custom_highlight(&self, entry: u32, name: StyleAtomID) -> bool {
+        self.selector_of_entry(entry).targets_custom_highlight(name)
+    }
+
     /// The arena holding the selector of entry `entry`.
     pub(super) fn arena_of_entry(&self, entry: u32) -> &crate::css::selector::SelectorListRef {
         let space = self.space_of_entry(entry);

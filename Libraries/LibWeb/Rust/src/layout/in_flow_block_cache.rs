@@ -17,8 +17,9 @@ use super::*;
 /// position, and collapses the margins its contents left with those now before it.
 ///
 /// NB: Reuse is exact only while this key covers every such read. A new read of block formatting context or
-///     containing block state inside the in-flow child path must be added here. Floats and line clamping read the
-///     position in the formatting context root; neither may be present for an entry to be stored or used.
+///     containing block state inside the in-flow child path must be added here. Line clamping reads the position in
+///     the formatting context root, so it may not be present for an entry to be stored or used. What the subtree
+///     reads of floats is kept in the entry and has to hold where the box is placed now.
 #[derive(Clone, PartialEq)]
 pub(super) struct InFlowBlockKey {
     pub(super) input: LayoutInput,
@@ -61,6 +62,18 @@ impl InFlowBlockKey {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct FloatsReadByContents {
+    pub(super) margins_before_box: block_formatting_context::CollapsedMargins,
+    pub(super) stored_in_open_top_margin_group: bool,
+    pub(super) introduced_clearance: bool,
+    /// Whether the contents read floats before their top margins settled, so that the margins before the box decide
+    /// where they read them.
+    pub(super) read_before_top_margins_settled: bool,
+    pub(super) read_start_from_border_box: Option<CssPixels>,
+    pub(super) floats_in_reach: smallvec::SmallVec<[block_formatting_context::FloatInReach; 2]>,
+}
+
 /// What the layout of an in-flow block container leaves behind for its parent, apart from the flow position it started
 /// at and the margins before it.
 #[derive(Clone)]
@@ -75,6 +88,9 @@ pub(super) struct InFlowBlockEntry {
     pub(super) content_inline_offset: CssPixels,
     /// What the child's contents left in their margin state, with the top margin group they collapsed into.
     pub(super) margins_left_by_contents: block_formatting_context::BlockMarginState,
+    pub(super) floats_read_by_contents: FloatsReadByContents,
+    /// The floats the child's contents placed, relative to the child's content box.
+    pub(super) floats_placed_by_contents: Vec<block_formatting_context::FloatingBox>,
     pub(super) outgoing_outside_marker_line: Option<block_formatting_context::OutsideMarkerLine>,
     pub(super) depends_on_percentage_block_size: bool,
     /// The fragment the stored layout placed. The committed subtree is reused only while it is still that fragment.

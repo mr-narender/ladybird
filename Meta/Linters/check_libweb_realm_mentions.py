@@ -36,7 +36,11 @@ CHECKED_SUFFIXES = {
 # the same change. If it goes up, justify the architecture change here.
 ALLOWED_REALM_MENTIONS = {
     "Animations": (5, 14, "animation callbacks/events and CSS value materialization still pass spec-selected realms"),
-    "CSS": (9, 24, "CSS Typed OM, parser-facing reification, style-value JS materialization, and setlike/maplike glue"),
+    "CSS": (
+        7,
+        11,
+        "CSS Typed OM, parser-facing reification, style-value JS materialization, setlike/maplike glue, and wrappers of declaration blocks owned by Rust objects",
+    ),
     "Clipboard": (4, 16, "clipboard item/data callbacks still materialize JS values in caller-selected realms"),
     "ContentSecurityPolicy": (4, 10, "CSP violation/report objects and callbacks still materialize JS-facing values"),
     "CookieStore": (2, 19, "cookie-store async callbacks and promise/value materialization still thread realms"),
@@ -56,10 +60,11 @@ ALLOWED_REALM_MENTIONS = {
     ),
     "FileAPI": (2, 9, "Blob glue still creates streams and buffers in selected realms"),
     "HTML": (
-        61,
-        179,
+        64,
+        183,
         "HTML algorithms still contain structured serialization, including posted-message preparation, canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; RemoteWindow mirrors Window's postMessage; "
-        "the C++ glue of the Rust structured serialization creates platform objects and SharedArrayBuffers in a given realm",
+        "the C++ glue of the Rust structured serialization creates platform objects and SharedArrayBuffers in a given realm; "
+        "the C++ glue of the Rust Storage and StorageEvent creates them in a given realm",
     ),
     "IndexedDB": (
         4,
@@ -74,7 +79,7 @@ ALLOWED_REALM_MENTIONS = {
         41,
         "service worker jobs, caches, and container promises still materialize results in selected realms",
     ),
-    "StorageAPI": (1, 3, "the C++ glue of the Rust storage keys reads the settings object of a realm's global"),
+    "StorageAPI": (2, 3, "the C++ glue of the Rust StorageManager creates one in a realm"),
     "Streams": (7, 17, "the C++ facade of the Rust streams creates streams and promises in caller-selected realms"),
     "TrustedTypes": (2, 9, "Trusted Types policy factory operations still use selected realms"),
     "WebAssembly": (

@@ -226,6 +226,10 @@ public:
 
     Utf16String dump_display_list();
     Utf16String dump_accessibility_tree();
+    String accessibility_character_offsets(GC::Ref<DOM::Node>);
+    String dump_accessibility_node_data(GC::Ref<DOM::Node>);
+    String accessibility_cached_text_mismatches();
+    String accessibility_cached_record_mismatches();
     Utf16String dump_layout_tree(GC::Ref<DOM::Node>);
     Utf16String dump_stacking_context_tree();
     Utf16String stacking_context_structure_verification_report();
@@ -247,6 +251,7 @@ public:
     void reload_bypassing_cache_through_ui_process();
     void traverse_history_through_ui_process(i32 delta);
     GC::Ref<WebIDL::Promise> flush_session_history_traversal_queue();
+    void exhaust_navigation_rate_limit();
     bool html_parser_body_is_exhausted(DOM::Document&);
     bool has_html_parser_end_state(DOM::Document& document) { return document.has_html_parser_end_state(); }
 
@@ -356,6 +361,7 @@ public:
     bool media_element_is_playing_audio(HTML::HTMLMediaElement&);
     bool document_is_playing_audio(DOM::Document&);
     bool tab_is_playing_audio();
+    bool tab_is_heard_playing_audio();
     WebIDL::UnsignedLongLong tab_audibility_change_count();
     bool media_element_video_sink_is_ticking(HTML::HTMLMediaElement&);
     void set_media_element_ready_state(HTML::HTMLMediaElement&, u16 ready_state);

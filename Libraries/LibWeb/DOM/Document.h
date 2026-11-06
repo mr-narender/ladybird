@@ -377,6 +377,9 @@ public:
     void recompute_search_text_paint_states(Layout::BegunRead const&);
     void note_spelling_markers_changed();
     void recompute_spelling_error_paint_states(Layout::BegunRead const&);
+    void recompute_custom_highlight_paint_states(Layout::BegunRead const&);
+    void invalidate_custom_highlights();
+    bool has_custom_highlights() const;
 
     WebIDL::ExceptionOr<Utf16String> cookie();
     WebIDL::ExceptionOr<void> set_cookie(Utf16View);
@@ -404,7 +407,7 @@ public:
     void set_referrer(Utf16String);
 
     void set_url(URL::URL const& url);
-    URL::URL url() const { return m_url; }
+    URL::URL const& url() const { return m_url; }
     URL::URL fallback_base_url() const;
     URL::URL base_url() const;
     Optional<URL::URL> get_the_base_url() const;
@@ -693,6 +696,7 @@ public:
     // https://drafts.csswg.org/css-font-loading/#font-source
     GC::Ref<CSS::FontFaceSet> fonts();
     GC::Ref<CSS::HighlightRegistry> highlight_registry();
+    CSS::HighlightRegistry* highlight_registry_if_exists() const { return m_highlight_registry.ptr(); }
 
     void clear();
     void capture_events();
@@ -1248,6 +1252,29 @@ public:
 
     Utf16String dump_accessibility_tree_as_json();
     Vector<WebView::AccessibilityNodeData> build_accessibility_node_data();
+
+    // The accessible name and description that the accessibility tree reports for an element, kept from one build of
+    // the tree to the next while an assistive technology consumes it, and dropped whenever a change could alter them.
+    struct CachedAccessibleText {
+        String name;
+        String description;
+    };
+    CachedAccessibleText const* cached_accessible_text(Element const&) const;
+    void cache_accessible_text(Element const&, CachedAccessibleText) const;
+    void invalidate_cached_accessibility_data(Node const&, Optional<Utf16FlyString> const& attribute_name = {}, ReadonlySpan<GC::Ref<Node>> added_nodes = {}, ReadonlySpan<GC::Ref<Node>> removed_nodes = {});
+
+    // What a build of the accessibility tree keeps of each node's data for the next build, while an assistive
+    // technology consumes the tree; see AccessibilityTreeNode::serialize_tree_as_node_data().
+    WebView::AccessibilityNodeData const* cached_accessibility_record(Node const&) const;
+    void cache_accessibility_record(Node const&, WebView::AccessibilityNodeData const&) const;
+    void invalidate_cached_accessibility_records_after_style_change(Element const&);
+    // For tests: builds that compute every node's data again, without what earlier builds kept.
+    bool accessibility_caches_bypassed() const { return m_accessibility_caches_bypassed; }
+    // For tests: each node whose kept data differs from what computing it again gives.
+    Vector<String> cached_accessibility_record_mismatches();
+    size_t cached_accessible_text_count() const { return m_cached_accessible_text.size(); }
+    // For tests: each cached name or description that differs from what computing it again gives.
+    Vector<String> cached_accessible_text_mismatches();
 
     void make_active();
 
@@ -1894,13 +1921,13 @@ private:
     template<typename GetNotifier, typename... Args>
     void notify_each_document_observer(GetNotifier&& get_notifier, Args&&... args)
     {
-        ScopeGuard guard { [&]() { m_document_observers_being_notified.clear_with_capacity(); } };
-        m_document_observers_being_notified.ensure_capacity(m_document_observers.size());
+        GC::RootVector<GC::Ref<DocumentObserver>> document_observers;
+        document_observers.ensure_capacity(m_document_observers.size());
 
         for (auto observer : m_document_observers)
-            m_document_observers_being_notified.unchecked_append(observer);
+            document_observers.unchecked_append(observer);
 
-        for (auto document_observer : m_document_observers_being_notified) {
+        for (auto document_observer : document_observers) {
             if (auto notifier = get_notifier(*document_observer))
                 notifier->function()(forward<Args>(args)...);
         }
@@ -2029,6 +2056,16 @@ private:
     GC::Ptr<Element> m_active_element;
     GC::Ptr<Element> m_target_element;
     GC::Ptr<Element> m_accessibility_focus_target;
+    mutable HashMap<UniqueNodeID, CachedAccessibleText> m_cached_accessible_text;
+    // The elements whose cached text can depend on nodes other than their inclusive ancestors and descendants: on
+    // label elements, on the elements whose IDs m_ids_referenced_by_cached_accessible_text holds, or on any node.
+    mutable HashTable<UniqueNodeID> m_cached_accessible_text_depending_on_labels;
+    mutable HashTable<UniqueNodeID> m_cached_accessible_text_depending_on_referenced_ids;
+    mutable HashTable<UniqueNodeID> m_cached_accessible_text_depending_on_any_node;
+    mutable HashTable<Utf16FlyString> m_ids_referenced_by_cached_accessible_text;
+    struct AccessibilityRecordCache;
+    mutable OwnPtr<AccessibilityRecordCache> m_accessibility_record_cache;
+    bool m_accessibility_caches_bypassed { false };
 
     // https://html.spec.whatwg.org/multipage/interaction.html#autofocus-candidates
     Vector<GC::Ref<Element>> m_autofocus_candidates;
@@ -2158,7 +2195,6 @@ private:
     // Document should not visit DocumentObserver to avoid leaks.
     // It's responsibility of object that requires DocumentObserver to keep it alive.
     HashTable<GC::RawRef<DocumentObserver>> m_document_observers;
-    Vector<GC::Ref<DocumentObserver>> m_document_observers_being_notified;
 
     // Every SVG use element connected to this document's node tree, maintained by SVGUseElement on insertion and
     // removal. This lets SVG elements notify interested use elements about mutations without traversing the entire
@@ -2249,6 +2285,11 @@ private:
     bool m_selection_states_are_stale { false };
     bool m_search_text_states_are_stale { false };
     bool m_spelling_error_states_are_stale { false };
+    bool m_custom_highlight_states_are_stale { false };
+    bool m_has_registered_custom_highlight_ranges { false };
+    u64 m_custom_highlight_states_dom_tree_version { 0 };
+    u64 m_custom_highlight_states_character_data_version { 0 };
+    u64 m_custom_highlight_states_row_generation { 0 };
     Utf16String m_find_in_page_active_match_text;
     Vector<GC::Ref<Range>> m_find_in_page_highlighted_matches;
     OwnPtr<Editing::SpellingMarkers> m_spelling_markers;
@@ -2262,9 +2303,12 @@ private:
         bool observable { false };
         bool needs_update { true };
     };
-    Array<HighlightStyleObservability, 3> m_highlight_style_observability;
+    Array<HighlightStyleObservability, 4> m_highlight_style_observability;
     HighlightStyleObservability& highlight_style_observability(CSS::PseudoElement);
     void update_highlight_style_observability(CSS::PseudoElement);
+    bool custom_highlight_static_ranges_may_have_changed() const;
+    bool m_custom_highlight_observers_read_static_ranges { false };
+    u64 m_custom_highlight_observers_character_data_version { 0 };
 
     // NOTE: This is a cache to make finding the first <base href> or <base target> element O(1).
     GC::Ptr<HTML::HTMLBaseElement> m_first_base_element_with_href_in_tree_order;

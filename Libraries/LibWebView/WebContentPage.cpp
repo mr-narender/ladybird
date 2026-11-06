@@ -663,10 +663,6 @@ void WebContentPage::close()
         m_client->forget_audio_playback(m_id);
         GamepadManager::the().page_closed(*this);
     }
-    if (m_traversable) {
-        if (auto view = m_traversable->view(); view.has_value())
-            view->did_close_page({}, m_id);
-    }
     set_audibility(Audio::Audibility::Inaudible);
     m_web_ui = nullptr;
     auto owed_replies = move(m_owed_replies);
@@ -1154,11 +1150,19 @@ void WebContentPage::did_inspect_accessibility_tree(String accessibility_tree)
     }
 }
 
-void WebContentPage::did_get_accessibility_tree(Vector<AccessibilityNodeData> nodes)
+void WebContentPage::did_get_accessibility_tree(u64 sequence, Vector<AccessibilityNodeData> nodes)
 {
     if (displays_tab()) {
         if (view().on_accessibility_tree_received)
-            view().on_accessibility_tree_received(move(nodes));
+            view().on_accessibility_tree_received(sequence, move(nodes));
+    }
+}
+
+void WebContentPage::did_change_accessibility_tree(u64 base_sequence, u64 sequence, AccessibilityTreeDelta delta)
+{
+    if (displays_tab()) {
+        if (view().on_accessibility_tree_changed)
+            view().on_accessibility_tree_changed(base_sequence, sequence, move(delta));
     }
 }
 
@@ -2193,9 +2197,14 @@ void WebContentPage::beforeunload_check_result(Web::HTML::CrossProcessId operati
     traversable().did_receive_beforeunload_check_result(*this, operation_id, result, unload_prompt_shown);
 }
 
-void WebContentPage::changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only, Optional<Web::HTML::CrossProcessId> target_document_id)
+void WebContentPage::changing_navigable_history_job_reached_population(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationSourceSnapshot active_document_source_snapshot_params)
 {
-    traversable().did_receive_changing_navigable_history_job_ready(*this, operation_id, navigable_id, disposition, update_only, target_document_id);
+    traversable().did_receive_changing_navigable_history_job_reached_population(*this, operation_id, navigable_id, move(active_document_source_snapshot_params));
+}
+
+void WebContentPage::changing_navigable_history_job_ready(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only)
+{
+    traversable().did_receive_changing_navigable_history_job_ready(*this, operation_id, navigable_id, disposition, update_only);
 }
 
 void WebContentPage::descendant_unload_task_complete(Web::HTML::CrossProcessId unload_id, Web::HTML::CrossProcessId navigable_id)
@@ -2624,10 +2633,10 @@ void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProce
     });
 }
 
-void WebContentPage::did_finish_history_navigation_params_creation(Web::HTML::CrossProcessId operation_id, Web::HTML::HistoryNavigationPopulation population)
+void WebContentPage::did_finish_history_navigation_params_creation(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationPopulationResult result)
 {
     auto& host = this->traversable();
-    host.top_level_traversable().did_finish_history_navigation_params_creation(*this, operation_id, move(population));
+    host.top_level_traversable().did_finish_history_navigation_params_creation(*this, operation_id, navigable_id, move(result));
 }
 
 void WebContentPage::did_fail_navigation_population(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id)
@@ -3389,13 +3398,19 @@ Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResp
 Messages::WebContentTestClient::DidRequestTabIsPlayingAudioForTestingResponse WebContentPage::did_request_tab_is_playing_audio_for_testing()
 {
     auto view = traversable().view();
-    return view.has_value() && view->audibility() == Audio::Audibility::Audible;
+    return view.has_value() && view->tab_indicator_visible(TabIndicator::PlayingAudio);
+}
+
+Messages::WebContentTestClient::DidRequestTabIsHeardPlayingAudioForTestingResponse WebContentPage::did_request_tab_is_heard_playing_audio_for_testing()
+{
+    auto view = traversable().view();
+    return view.has_value() && view->is_playing_audio();
 }
 
 Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResponse WebContentPage::did_request_tab_audibility_change_count_for_testing()
 {
     auto view = traversable().view();
-    return view.has_value() ? view->audibility_change_count() : 0;
+    return view.has_value() ? view->playing_audio_indicator_change_count() : 0;
 }
 
 void WebContentPage::did_request_crash_of_remote_frame_processes_for_testing()
