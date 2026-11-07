@@ -6,7 +6,6 @@
 
 #include <AK/NeverDestroyed.h>
 #include <LibGC/Heap.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
@@ -14,6 +13,7 @@
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/RemoteWindow.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/FetchClient.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/Layout/Node.h>
@@ -71,7 +71,6 @@ void RemoteNavigable::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_children);
     visitor.visit(m_window_proxy);
     visitor.visit(m_active_window);
-    visitor.visit(m_active_browsing_context_opener_window_proxy);
     visitor.visit(m_provisional_navigable);
 }
 
@@ -99,43 +98,39 @@ void RemoteNavigable::replace_child(Navigable& child, GC::Ref<Navigable> replace
 GC::Ptr<WindowProxy> RemoteNavigable::active_window_proxy()
 {
     // The WindowProxy of a navigable hosted by another process answers every access on the cross-origin path. It lives
-    // in the realm of a document this page hosts, or in the realm of the script asking for it when the page only
-    // represents an opener's tab and hosts no document.
+    // in the realm of the script asking for it.
+    return active_window_proxy_in_realm_of(current_window());
+}
+
+// Outside script, the caller gives the window it hands the WindowProxy to.
+GC::Ref<WindowProxy> RemoteNavigable::active_window_proxy_in_realm_of(Window& window)
+{
     if (!m_window_proxy) {
-        auto local_roots = page().local_roots();
-        if (local_roots.is_empty()) {
-            m_window_proxy = WindowProxy::create(*Bindings::main_thread_vm().current_realm());
-        } else {
-            auto window = local_roots.first()->active_window();
-            VERIFY(window);
-            m_window_proxy = WindowProxy::create(relevant_realm(*window));
-        }
+        m_window_proxy = WindowProxy::create(relevant_realm(window));
         m_window_proxy->set_window(active_window());
     }
-    return m_window_proxy;
+    return *m_window_proxy;
 }
 
 GC::Ptr<WindowProxy> RemoteNavigable::active_browsing_context_opener_window_proxy() const
 {
-    // NB: The active browsing context is in the process hosting this navigable, which replicates its opener browsing
-    //     context as the navigable that browsing context is active in. The opener can be in another tab, which this
-    //     process holds in a page of its own.
-    if (!m_replicated_state.active_browsing_context_has_opener)
-        return nullptr;
-    if (auto const& opener_navigable_id = m_replicated_state.opener_navigable_id; opener_navigable_id.has_value()) {
-        for (auto& local_navigable : all_local_navigables()) {
-            if (local_navigable->id() == *opener_navigable_id && !local_navigable->has_been_destroyed())
-                return m_active_browsing_context_opener_window_proxy = local_navigable->active_window_proxy();
-        }
-        for (auto& remote_navigable : all_remote_navigables()) {
-            if (remote_navigable->id() == *opener_navigable_id && !remote_navigable->has_been_destroyed())
-                return m_active_browsing_context_opener_window_proxy = remote_navigable->active_window_proxy();
-        }
-    }
+    if (auto opener_navigable = active_browsing_context_opener_navigable())
+        return opener_navigable->active_window_proxy();
+    return nullptr;
+}
 
-    // NB: A browsing context keeps its opener browsing context once that is discarded, and its window is closed. The
-    //     opener's navigable is not replicated then, and the WindowProxy found for it before stands for it.
-    return m_active_browsing_context_opener_window_proxy;
+GC::Ptr<Navigable> RemoteNavigable::active_browsing_context_opener_navigable() const
+{
+    if (!m_replicated_state.opener_navigable_id.has_value())
+        return nullptr;
+    return navigable_with_id_in_any_page(page(), *m_replicated_state.opener_navigable_id);
+}
+
+GC::Ptr<Navigable> RemoteNavigable::active_browsing_context_one_permitted_sandboxed_navigator() const
+{
+    if (!m_replicated_state.one_permitted_sandboxed_navigator_navigable_id.has_value())
+        return nullptr;
+    return navigable_with_id_in_any_page(page(), *m_replicated_state.one_permitted_sandboxed_navigator_navigable_id);
 }
 
 GC::Ref<RemoteWindow> RemoteNavigable::active_window()
@@ -166,13 +161,18 @@ Vector<GC::Root<Navigable>> RemoteNavigable::active_document_inclusive_descendan
     return navigables;
 }
 
+void RemoteNavigable::set_has_been_destroyed()
+{
+    m_has_been_destroyed = true;
+    DOM::Document::invalidate_full_activity();
+}
+
 void RemoteNavigable::set_replicated_state(ReplicatedNavigableState state)
 {
     auto was_delaying_the_load_event_of_its_container = m_replicated_state.delays_the_load_event_of_its_container;
     auto previous_compositor_context_id = m_replicated_state.compositor_context_id;
-    if (!state.active_browsing_context_has_opener || (state.opener_navigable_id.has_value() && state.opener_navigable_id != m_replicated_state.opener_navigable_id))
-        m_active_browsing_context_opener_window_proxy = nullptr;
     m_replicated_state = move(state);
+    DOM::Document::invalidate_full_activity();
 
     // The documents of the navigable's children hosted here composite into the context its document is painted
     // through, wherever that document is hosted.
@@ -188,11 +188,10 @@ void RemoteNavigable::set_replicated_state(ReplicatedNavigableState state)
     if (!container)
         return;
     if (previous_compositor_context_id != m_replicated_state.compositor_context_id) {
-        if (auto* layout_node = container->unsafe_layout_node())
-            layout_node->refresh_dom_paint_facts();
+        container->publish_dom_paint_facts();
         container->set_needs_repaint();
     }
-    if (was_delaying_the_load_event_of_its_container && !m_replicated_state.delays_the_load_event_of_its_container)
+    if (was_delaying_the_load_event_of_its_container != m_replicated_state.delays_the_load_event_of_its_container)
         container->document().schedule_html_parser_end_check();
 }
 
@@ -201,6 +200,19 @@ ReplicatedContainerState RemoteNavigable::container_state() const
     if (auto container = this->container())
         return container->replicated_container_state();
     return m_replicated_state.container;
+}
+
+// https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-closable
+bool RemoteNavigable::is_script_closable() const
+{
+    // A navigable is script-closable if it is a top-level traversable, and any of the following are true:
+    // - its is created by web content is true; or
+    // - its session history entries's size is 1.
+    if (!is_top_level_traversable())
+        return false;
+
+    return m_replicated_state.top_level_is_created_by_web_content
+        || m_replicated_state.top_level_session_history_entry_count == 1;
 }
 
 bool RemoteNavigable::has_session_history_entry_and_ready_for_navigation() const
@@ -236,7 +248,14 @@ WebIDL::ExceptionOr<void> RemoteNavigable::continue_navigation_in_active_documen
     //    window to continue these steps.
     // NB: The active window lives in the process hosting the active document, so the task is a request to the UI
     //     process, which forwards it to that process.
-    page().client().request_navigation_of_navigable(*this, create_prepared_navigation_descriptor(navigation));
+    auto fetch_client = settings_object_of_fetch_client(navigation.source_snapshot_params->fetch_client);
+    if (!fetch_client)
+        return {};
+    auto& source_document = window_from_global_object(fetch_client->global_object())->associated_document();
+    auto source_navigable = source_document.navigable();
+    if (!source_navigable)
+        return {};
+    page().client().request_navigation_of_navigable(*this, *source_navigable, source_document, create_prepared_navigation_descriptor(navigation));
     return {};
 }
 

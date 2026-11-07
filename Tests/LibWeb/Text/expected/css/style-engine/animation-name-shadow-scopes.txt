@@ -1,0 +1,4 @@
+document element: width 100px, animations 1
+shadow tree element: width 7px, animations 1
+:host rule: width 9px, animations 1
+adopted sheet element: width 13px, animations 1

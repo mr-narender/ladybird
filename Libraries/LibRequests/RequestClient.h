@@ -12,8 +12,10 @@
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibHTTP/Cookie/IncludeCredentials.h>
 #include <LibHTTP/HeaderList.h>
+#include <LibHTTP/NetworkIsolationKey.h>
 #include <LibIPC/ConnectionToServer.h>
-#include <LibRequests/CameFromCache.h>
+#include <LibRequests/CacheState.h>
+#include <LibRequests/ExportedRequest.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibRequests/RequestTransferLease.h>
 #include <LibRequests/WebSocket.h>
@@ -32,8 +34,6 @@ class RequestClient final
     C_OBJECT_ABSTRACT(RequestClient)
 
 public:
-    using InitTransport = Messages::RequestServer::InitTransport;
-
     enum class TransferLease : u8 {
         No,
         Yes,
@@ -45,25 +45,29 @@ public:
     };
 
     explicit RequestClient(NonnullOwnPtr<IPC::Transport>);
+    // For a client whose ID the process that connected it already knows, so that no round trip is needed.
+    RequestClient(NonnullOwnPtr<IPC::Transport>, int client_id);
     virtual ~RequestClient() override;
 
     // Best-effort index into the resolved address pool.
-    RefPtr<Request> start_request(ByteString const& method, URL::URL const&, Optional<HTTP::HeaderList const&> request_headers = {}, ReadonlyBytes request_body = {}, HTTP::CacheMode = HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials = HTTP::Cookie::IncludeCredentials::Yes, TransferLease = TransferLease::No, Optional<u32> address_selection_hint = {}, CacheMissNotification = CacheMissNotification::No, u64 originating_page_id = 0);
+    RefPtr<Request> start_request(ByteString const& method, URL::URL const&, Optional<HTTP::HeaderList const&> request_headers = {}, ReadonlyBytes request_body = {}, HTTP::CacheMode = HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials = HTTP::Cookie::IncludeCredentials::Yes, TransferLease = TransferLease::No, Optional<u32> address_selection_hint = {}, CacheMissNotification = CacheMissNotification::No, u64 originating_page_id = 0, Optional<HTTP::NetworkIsolationKey> = {});
     RefPtr<Request> adopt_request(int source_client_id, u64 source_request_id, TransferLease = TransferLease::No);
+
+    // Moves a response between RequestServers. The request leaves this client on export; the imported one is a new
+    // request of the importing client.
+    ErrorOr<ExportedRequest> export_request(Request&);
+    RefPtr<Request> import_request(ExportedRequest, TransferLease = TransferLease::No);
     bool stop_request(Badge<Request>, Request&);
     void release_request_transfer_lease(Badge<Request>, Request&, RequestTransferLeaseKey);
     void release_request_transfer_lease(RequestTransferLeaseKey);
     void ensure_connection(URL::URL const&, RequestServer::CacheLevel);
+    // Calls back with no addresses when the lookup fails or a proxy is configured.
+    void resolve_host(ByteString const& host, Function<void(Vector<ByteString>)> on_resolved);
     int request_server_client_id() const { return m_request_server_client_id; }
 
-    bool set_certificate(Badge<Request>, Request&, ByteString, ByteString);
+    RefPtr<WebSocket> websocket_connect(URL::URL const&, Optional<HTTP::NetworkIsolationKey> const&, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers);
 
-    RefPtr<WebSocket> websocket_connect(URL::URL const&, ByteString const& origin, Vector<ByteString> const& protocols, Vector<ByteString> const& extensions, HTTP::HeaderList const& request_headers);
-
-    ErrorOr<bool> store_cache_associated_data(URL::URL const&, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData, ReadonlyBytes);
-    ErrorOr<Optional<Core::AnonymousBuffer>> retrieve_cache_associated_data(URL::URL const&, ByteString const& method, Optional<HTTP::HeaderList const&> request_headers, Optional<u64> vary_key, HTTP::CacheEntryAssociatedData);
-
-    ErrorOr<bool> create_synthetic_cache_entry(URL::URL const&, ByteString const& method);
+    // Stores the data in the HTTP cache, and returns it mapped read-only from the cache's file, or nothing when it wasn't stored.
 
     Function<void()> on_request_server_died;
 
@@ -71,14 +75,14 @@ private:
     virtual void die() override;
 
     virtual void request_requires_network(u64 request_id) override;
+    virtual void request_upload_progress(u64 request_id, u64 bytes_sent) override;
     virtual void request_started(u64 request_id, IPC::File) override;
     virtual void request_body_file_available(u64 request_id, IPC::File, u64 offset, u64 size) override;
     virtual void request_cached_body_file_available(u64 request_id, IPC::File, u64 offset, u64 size) override;
     virtual void request_finished(u64 request_id, u64, RequestTimingInfo, Optional<NetworkError>) override;
-    virtual void headers_became_available(u64 request_id, Vector<HTTP::Header>, Optional<u32>, Optional<String>, Optional<IPC::File>, u64 javascript_bytecode_size, Optional<u64>, CameFromCache) override;
+    virtual void headers_became_available(u64 request_id, Vector<HTTP::Header>, Optional<u32>, Optional<String>, CacheState, ByteString http_version) override;
     virtual void request_transferred(u64 request_id) override;
-
-    virtual void certificate_requested(u64 request_id) override;
+    virtual void host_resolved(u64 lookup_id, Vector<ByteString> addresses) override;
 
     virtual void websocket_connected(u64 websocket_id) override;
     virtual void websocket_received(u64 websocket_id, bool, ByteBuffer) override;
@@ -87,7 +91,6 @@ private:
     virtual void websocket_closed(u64 websocket_id, u16, ByteString, bool) override;
     virtual void websocket_ready_state_changed(u64 websocket_id, u32 ready_state) override;
     virtual void websocket_subprotocol(u64 websocket_id, ByteString subprotocol) override;
-    virtual void websocket_certificate_requested(u64 websocket_id) override;
 
     HashMap<u64, RefPtr<Request>> m_requests;
     u64 m_next_request_id { 0 };
@@ -95,6 +98,9 @@ private:
 
     HashMap<u64, NonnullRefPtr<WebSocket>> m_websockets;
     u64 m_next_websocket_id { 0 };
+
+    HashMap<u64, Function<void(Vector<ByteString>)>> m_host_lookups;
+    u64 m_next_host_lookup_id { 0 };
 };
 
 }

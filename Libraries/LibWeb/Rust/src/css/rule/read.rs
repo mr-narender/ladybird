@@ -7,7 +7,7 @@
 use super::{NativeRule, NativeRuleList, NativeRuleType, RulePayload};
 use crate::css::container_conditions::ContainerConditionsData;
 use crate::css::css_string::CssString;
-use crate::css::declaration_block::DeclarationBlockData;
+use crate::css::declaration_block::SharedDeclarationBlock;
 use crate::css::descriptor_block::{DescriptorBlockData, FfiDescriptorBlock};
 use crate::css::font_feature_values::FontFeatureValuesData;
 use crate::css::function_signature::FunctionSignature;
@@ -56,6 +56,18 @@ pub extern "C" fn rust_rule_view_type(view: &NativeRuleView<'_>) -> NativeRuleTy
 pub extern "C" fn rust_rule_list_has_implicit_scope(list: &NativeRuleList) -> bool {
     list.visit_descendant_rules(&mut |rule| {
         if rule.scope().is_some_and(|scope| scope.start.is_none()) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_rule_list_has_counter_style_rules(list: &NativeRuleList) -> bool {
+    list.visit_descendant_rules(&mut |rule| {
+        if rule.rule_type() == NativeRuleType::CounterStyle {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -155,17 +167,14 @@ pub extern "C" fn rust_rule_view_import_media(view: &NativeRuleView<'_>) -> *mut
 /// Materialize a facade's import rule, including one first exposed after detachment.
 ///
 /// # Safety
-/// Identity must identify this import. Data must be Arc-owned; media must be its loading state.
+/// Identity must identify this import, and media must be its loading state.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_rule_materialize_import(
     identity: u64,
-    data: *const ImportRuleData,
+    data: crate::css::ffi_support::ArcRef<'_, ImportRuleData>,
     media: &MediaList,
 ) -> *const NativeRule {
-    unsafe {
-        Arc::increment_strong_count(data);
-    }
-    let data = unsafe { Arc::from_raw(data) };
+    let data = data.to_arc();
     let scope = data.scope.clone();
     std::rc::Rc::into_raw(NativeRule::with_identity(
         identity,
@@ -208,19 +217,36 @@ pub unsafe extern "C" fn rust_rule_view_name(
     }
 }
 
+/// The declarations of a `@position-try` rule, retained for the caller.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_rule_view_position_try_declarations(
+    view: &NativeRuleView<'_>,
+) -> *const crate::css::declaration_block::DeclarationBlockHeader {
+    assert!(view.rule.rule_type() == NativeRuleType::PositionTry);
+    view.rule.position_try_declarations().map_or(
+        std::ptr::null(),
+        crate::css::declaration_block::SharedDeclarationBlock::into_raw,
+    )
+}
+
 /// # Safety
 /// The callback must not mutate the graph. Keys and declarations are borrowed for the callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_rule_view_keyframes(
     view: &NativeRuleView<'_>,
     context: *const std::ffi::c_void,
-    visit: unsafe extern "C" fn(*const std::ffi::c_void, *const f64, usize, *const DeclarationBlockData),
+    visit: unsafe extern "C" fn(
+        *const std::ffi::c_void,
+        *const f64,
+        usize,
+        *const crate::css::declaration_block::DeclarationBlockHeader,
+    ),
 ) {
     assert!(view.rule.rule_type() == NativeRuleType::Keyframes);
     let _ = view.rule.visit_children(&mut |frame| {
         let (keys, declarations) = frame.keyframe();
         unsafe {
-            visit(context, keys.as_ptr(), keys.len(), Arc::as_ptr(&declarations));
+            visit(context, keys.as_ptr(), keys.len(), declarations.as_ptr());
         }
         ControlFlow::Continue(())
     });
@@ -278,7 +304,7 @@ impl<'a> RuleRef<'a> {
         }
     }
 
-    pub(super) fn keyframe(self) -> (&'a [f64], Arc<DeclarationBlockData>) {
+    pub(super) fn keyframe(self) -> (&'a [f64], SharedDeclarationBlock) {
         match self {
             Self::Materialized(rule) => {
                 let RulePayload::Keyframe(frame) = &rule.payload else {
@@ -342,6 +368,7 @@ impl<'a> RuleRef<'a> {
                 RulePayload::Property(property) => Some(property.name.clone()),
                 RulePayload::Keyframes(name) => Some(name.borrow().clone()),
                 RulePayload::CounterStyle(rule) => Some(rule.name()),
+                RulePayload::PositionTry { name, .. } => Some(name.clone()),
                 _ => None,
             },
             Self::Shared(rule, _) => rule.definition_name(),
@@ -419,6 +446,16 @@ impl<'a> RuleRef<'a> {
         }
     }
 
+    pub(crate) fn media_data(self) -> Arc<crate::css::media_list::MediaListData> {
+        match self {
+            Self::Materialized(rule) => match &rule.payload {
+                RulePayload::Media { list } => list.data(),
+                _ => unreachable!(),
+            },
+            Self::Shared(rule, _) => rule.media_data(),
+        }
+    }
+
     pub(crate) fn evaluate_media(self, environment: MediaEnvironment<'_>) -> bool {
         match self {
             Self::Materialized(rule) => match &rule.payload {
@@ -464,23 +501,35 @@ impl<'a> RuleRef<'a> {
     pub(crate) fn scope(self) -> Option<Arc<ScopeSelectors>> {
         match self {
             Self::Materialized(rule) => match &rule.payload {
-                RulePayload::Scope(scope) | RulePayload::Import { scope: Some(scope), .. } => Some(scope.clone()),
+                RulePayload::Scope(scope) => Some(scope.borrow().clone()),
+                RulePayload::Import { scope: Some(scope), .. } => Some(scope.clone()),
                 _ => None,
             },
             Self::Shared(rule, _) => rule.scope(),
         }
     }
 
-    pub(crate) fn cascade_declarations(self) -> Option<Arc<DeclarationBlockData>> {
+    pub(crate) fn cascade_declarations(self) -> Option<SharedDeclarationBlock> {
         match self {
             Self::Materialized(rule) => rule.cascade_declarations(),
             Self::Shared(rule, _) => rule.cascade_declarations(),
         }
     }
 
+    /// The declarations of a `@position-try` rule.
+    pub(crate) fn position_try_declarations(self) -> Option<SharedDeclarationBlock> {
+        match self {
+            Self::Materialized(rule) => match &rule.payload {
+                RulePayload::PositionTry { declarations, .. } => Some(declarations.data()),
+                _ => None,
+            },
+            Self::Shared(rule, _) => rule.position_try_declarations(),
+        }
+    }
+
     pub(crate) fn visit_children(self, visit: &mut impl FnMut(RuleRef<'_>) -> ControlFlow<()>) -> ControlFlow<()> {
         match self {
-            Self::Materialized(rule) => match &rule.children {
+            Self::Materialized(rule) => match rule.children.get() {
                 Some(children) => children.visit_rules(visit),
                 None => ControlFlow::Continue(()),
             },

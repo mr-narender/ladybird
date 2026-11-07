@@ -33,7 +33,9 @@ SessionHistoryEntryDescriptor create_initial_session_history_entry_descriptor(Cr
             .about_base_url = move(about_base_url),
             .resource = Empty {},
             .reload_pending = false,
+            .reload_bypasses_cache = false,
             .ever_populated = false,
+            .user_agent_initiated = UserAgentInitiated::No,
             .navigable_target_name = move(navigable_target_name),
             .nested_histories = {},
         },
@@ -43,6 +45,8 @@ SessionHistoryEntryDescriptor create_initial_session_history_entry_descriptor(Cr
         .navigation_api_id = generate_random_uuid_utf16(),
         .scroll_restoration_mode = ScrollRestorationMode::Auto,
         .scroll_position_data = {},
+        .directive_state_id = {},
+        .directive_state_value = {},
     };
 }
 
@@ -65,6 +69,8 @@ PendingSessionHistoryEntryDescriptor create_pending_session_history_entry_descri
         .navigation_api_id = move(entry.navigation_api_id),
         .scroll_restoration_mode = entry.scroll_restoration_mode,
         .scroll_position_data = move(entry.scroll_position_data),
+        .directive_state_id = entry.directive_state_id,
+        .directive_state_value = move(entry.directive_state_value),
     };
 }
 
@@ -80,6 +86,8 @@ SessionHistoryEntryDescriptor create_session_history_entry_descriptor(PendingSes
         .navigation_api_id = move(entry.navigation_api_id),
         .scroll_restoration_mode = entry.scroll_restoration_mode,
         .scroll_position_data = move(entry.scroll_position_data),
+        .directive_state_id = entry.directive_state_id,
+        .directive_state_value = move(entry.directive_state_value),
     };
 }
 
@@ -97,6 +105,8 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::SessionHistoryEntryDescri
     TRY(encoder.encode(entry.navigation_api_id));
     TRY(encoder.encode(entry.scroll_restoration_mode));
     TRY(encoder.encode(entry.scroll_position_data));
+    TRY(encoder.encode(entry.directive_state_id));
+    TRY(encoder.encode(entry.directive_state_value));
     return {};
 }
 
@@ -112,6 +122,8 @@ ErrorOr<Web::HTML::SessionHistoryEntryDescriptor> IPC::decode(Decoder& decoder)
     auto navigation_api_id = TRY(decoder.decode<Utf16String>());
     auto scroll_restoration_mode = TRY(decoder.decode<Web::HTML::ScrollRestorationMode>());
     auto scroll_position_data = TRY(decoder.decode<Web::HTML::SessionHistoryEntryScrollPositionData>());
+    auto directive_state_id = TRY(decoder.decode<Web::HTML::CrossProcessId>());
+    auto directive_state_value = TRY(decoder.decode<Optional<String>>());
 
     return Web::HTML::SessionHistoryEntryDescriptor {
         .step = step,
@@ -123,6 +135,8 @@ ErrorOr<Web::HTML::SessionHistoryEntryDescriptor> IPC::decode(Decoder& decoder)
         .navigation_api_id = move(navigation_api_id),
         .scroll_restoration_mode = scroll_restoration_mode,
         .scroll_position_data = move(scroll_position_data),
+        .directive_state_id = directive_state_id,
+        .directive_state_value = move(directive_state_value),
     };
 }
 
@@ -137,6 +151,8 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::PendingSessionHistoryEntr
     TRY(encoder.encode(entry.navigation_api_id));
     TRY(encoder.encode(entry.scroll_restoration_mode));
     TRY(encoder.encode(entry.scroll_position_data));
+    TRY(encoder.encode(entry.directive_state_id));
+    TRY(encoder.encode(entry.directive_state_value));
     return {};
 }
 
@@ -152,6 +168,8 @@ ErrorOr<Web::HTML::PendingSessionHistoryEntryDescriptor> IPC::decode(Decoder& de
         .navigation_api_id = TRY(decoder.decode<Utf16String>()),
         .scroll_restoration_mode = TRY(decoder.decode<Web::HTML::ScrollRestorationMode>()),
         .scroll_position_data = TRY(decoder.decode<Web::HTML::SessionHistoryEntryScrollPositionData>()),
+        .directive_state_id = TRY(decoder.decode<Web::HTML::CrossProcessId>()),
+        .directive_state_value = TRY(decoder.decode<Optional<String>>()),
     };
 }
 
@@ -200,7 +218,9 @@ ErrorOr<void> IPC::encode(Encoder& encoder, Web::HTML::SessionHistoryDocumentSta
     TRY(encoder.encode(document_state.about_base_url));
     TRY(encoder.encode(document_state.resource));
     TRY(encoder.encode(document_state.reload_pending));
+    TRY(encoder.encode(document_state.reload_bypasses_cache));
     TRY(encoder.encode(document_state.ever_populated));
+    TRY(encoder.encode(document_state.user_agent_initiated));
     TRY(encoder.encode(document_state.navigable_target_name));
     return {};
 }
@@ -217,7 +237,9 @@ ErrorOr<Web::HTML::SessionHistoryDocumentStateDescriptor> IPC::decode(Decoder& d
     auto about_base_url = TRY(decoder.decode<Optional<URL::URL>>());
     auto resource = TRY(decoder.decode<Web::HTML::DocumentResource>());
     auto reload_pending = TRY(decoder.decode<bool>());
+    auto reload_bypasses_cache = TRY(decoder.decode<bool>());
     auto ever_populated = TRY(decoder.decode<bool>());
+    auto user_agent_initiated = TRY(decoder.decode<Web::HTML::UserAgentInitiated>());
     auto navigable_target_name = TRY(decoder.decode<Utf16String>());
 
     return Web::HTML::SessionHistoryDocumentStateDescriptor {
@@ -230,7 +252,9 @@ ErrorOr<Web::HTML::SessionHistoryDocumentStateDescriptor> IPC::decode(Decoder& d
         .about_base_url = move(about_base_url),
         .resource = move(resource),
         .reload_pending = reload_pending,
+        .reload_bypasses_cache = reload_bypasses_cache,
         .ever_populated = ever_populated,
+        .user_agent_initiated = user_agent_initiated,
         .navigable_target_name = move(navigable_target_name),
         .nested_histories = {},
     };

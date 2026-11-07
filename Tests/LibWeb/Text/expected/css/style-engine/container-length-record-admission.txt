@@ -1,0 +1,4 @@
+initial: 1px, 1px
+direct: widths 40px, 60px
+mixed: widths 2px, 6px
+resized: 2.5px, 6px

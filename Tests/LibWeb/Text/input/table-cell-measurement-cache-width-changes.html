@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
+<script src="layout-test.js"></script>
 <style>
     body { margin: 0; }
     table { border-collapse: collapse; }
@@ -11,31 +12,22 @@
         const ROWS = 20;
         const parts = [];
         for (let i = 0; i < ROWS; ++i)
-            parts.push(`<tr><td>${i}</td><td>some words that wrap in a narrow column ${i}</td><td>text with <b>markup</b> ${i}</td></tr>`);
+            parts.push(`<tr><td class="index">${i}</td><td class="words">some words that wrap in a narrow column ${i}</td><td class="markup">text with <b>markup</b> ${i}</td></tr>`);
         document.getElementById("rows").innerHTML = parts.join("");
         const table = document.getElementById("table");
 
-        const missesAfterLayout = () => {
-            document.body.offsetHeight;
-            return internals.tableCellMeasurementCacheMissCount();
-        };
-
+        // Each cell is laid out once ahead of its intrinsic padding, and its committing run replays that layout.
         const measure = width => {
-            const previous = internals.tableCellMeasurementCacheMissCount();
-            table.style.width = `${width}px`;
-            const misses = missesAfterLayout() - previous;
-            println(`${width}px: ${misses} misses, height ${table.offsetHeight}`);
+            const work = layoutWork(() => table.style.width = `${width}px`);
+            const cellRuns = action => work.count(event => event.event === "run" && event.box.startsWith("BlockContainer<TD>") && event.action === action);
+            println(`${width}px: ${cellRuns("RUN AHEAD OF INTRINSIC BLOCK PADDING")} laid out ahead, ${cellRuns("REPLAY FRAGMENTS")} replayed, ${cellRuns("RUN")} laid out again, height ${table.offsetHeight}`);
         };
 
-        table.style.width = "1000px";
-        missesAfterLayout();
-        // Wide enough for every cell to fit on one line: only cells with markup are measured again.
+        layoutWork(() => table.style.width = "1000px");
         measure(900);
         measure(950);
-        // The middle column wraps: its cells are measured again, the text-only first column is not.
         measure(400);
         measure(350);
-        // Back above the max-content widths of the text-only cells.
         measure(1000);
     });
 </script>

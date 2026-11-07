@@ -6,11 +6,15 @@
 
 #include <AK/LexicalPath.h>
 #include <AK/NumericLimits.h>
+#include <AK/QuickSort.h>
 #include <LibCore/Directory.h>
+#include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <LibDatabase/Database.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibHTTP/Cache/CacheIndex.h>
 #include <LibHTTP/Cache/Utilities.h>
+#include <LibTest/TemporaryDirectory.h>
 #include <LibTest/TestCase.h>
 
 struct CacheIndexTestState {
@@ -48,7 +52,7 @@ TEST_CASE(create_entry_replaces_loaded_entry)
     });
 
     auto cache_key = 1u;
-    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers_v1);
+    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers_v1).value();
     auto now = UnixDateTime::now();
 
     TRY_OR_FAIL(state.index.create_entry(cache_key, vary_key, "https://example.com"_string, request_headers, response_headers_v1, 10, now, now));
@@ -72,7 +76,7 @@ TEST_CASE(remove_entries_exceeding_cache_limit_is_noop_when_under_limit)
 
     auto request_headers = HTTP::HeaderList::create();
     auto response_headers = HTTP::HeaderList::create();
-    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers);
+    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers).value();
     auto now = UnixDateTime::now();
 
     state.index.set_maximum_disk_cache_size(80);
@@ -95,7 +99,7 @@ TEST_CASE(remove_entries_exceeding_cache_limit_tolerates_replaced_unloaded_entri
 
     auto request_headers = HTTP::HeaderList::create();
     auto response_headers = HTTP::HeaderList::create();
-    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers);
+    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers).value();
     auto now = UnixDateTime::now();
 
     state.index.set_maximum_disk_cache_size(80);
@@ -115,32 +119,6 @@ TEST_CASE(remove_entries_exceeding_cache_limit_tolerates_replaced_unloaded_entri
     EXPECT_EQ(reloaded_index.estimate_cache_size_accessed_since(UnixDateTime::earliest()).total, 80u);
 }
 
-TEST_CASE(associated_data_counts_toward_cache_size)
-{
-    auto state = create_cache_index();
-
-    auto request_headers = HTTP::HeaderList::create();
-    auto response_headers = HTTP::HeaderList::create();
-    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers);
-    auto now = UnixDateTime::now();
-
-    state.index.set_maximum_disk_cache_size(80);
-
-    for (u64 cache_key = 1; cache_key <= 5; ++cache_key)
-        TRY_OR_FAIL(state.index.create_entry(cache_key, vary_key, "https://example.com/script.js"_string, request_headers, response_headers, 10, now, now));
-    TRY_OR_FAIL(state.index.update_associated_data_size(1, vary_key, 50));
-
-    EXPECT_EQ(state.index.estimate_cache_size_accessed_since(UnixDateTime::earliest()).total, 100u);
-
-    Vector<u64> removed_entries;
-    state.index.remove_entries_exceeding_cache_limit([&](auto removed_cache_key, auto) {
-        removed_entries.append(removed_cache_key);
-    });
-
-    EXPECT(removed_entries.size() > 0);
-    EXPECT(state.index.estimate_cache_size_accessed_since(UnixDateTime::earliest()).total <= 80u);
-}
-
 TEST_CASE(newer_cache_index_schema_reports_database_too_new)
 {
     auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
@@ -152,13 +130,56 @@ TEST_CASE(newer_cache_index_schema_reports_database_too_new)
     EXPECT_EQ(TRY_OR_FAIL(HTTP::CacheIndex::migrate_schema(*database, Database::MigrationMode::CheckOnly)), Database::MigrationOutcome::DatabaseTooNew);
 }
 
+TEST_CASE(entries_with_previous_vary_keys_are_dropped_on_migration)
+{
+    auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
+
+    TRY_OR_FAIL(database->execute_raw("CREATE TABLE SchemaVersions (store TEXT PRIMARY KEY, version INTEGER NOT NULL);"sv));
+    TRY_OR_FAIL(database->execute_raw("INSERT INTO SchemaVersions (store, version) VALUES ('CacheIndex', 2);"sv));
+    TRY_OR_FAIL(database->execute_raw("CREATE TABLE CacheIndex (cache_key INTEGER, vary_key INTEGER, url TEXT, request_headers BLOB, response_headers BLOB, data_size INTEGER, associated_data_size INTEGER, request_time INTEGER, response_time INTEGER, last_access_time INTEGER, PRIMARY KEY(cache_key, vary_key));"sv));
+    TRY_OR_FAIL(database->execute_raw("INSERT INTO CacheIndex VALUES (1, 0, 'https://example.com', x'', x'', 10, 0, 0, 0, 0);"sv));
+
+    EXPECT_EQ(TRY_OR_FAIL(HTTP::CacheIndex::migrate_schema(*database)), Database::MigrationOutcome::Success);
+
+    auto index = MUST(HTTP::CacheIndex::create(*database, cache_directory()));
+    EXPECT(!index.find_entry(1, *HTTP::HeaderList::create()).has_value());
+    EXPECT_EQ(index.estimate_cache_size_accessed_since(UnixDateTime::earliest()).total, 0u);
+}
+
+TEST_CASE(stored_responses_outlive_the_files_beside_them_on_migration)
+{
+    Test::TemporaryDirectory const directory { "TestCacheIndex"sv };
+    auto database = TRY_OR_FAIL(Database::Database::create(directory.path().string(), "INDEX"sv));
+
+    TRY_OR_FAIL(database->execute_raw("CREATE TABLE SchemaVersions (store TEXT PRIMARY KEY, version INTEGER NOT NULL);"sv));
+    TRY_OR_FAIL(database->execute_raw("INSERT INTO SchemaVersions (store, version) VALUES ('CacheIndex', 3);"sv));
+    TRY_OR_FAIL(database->execute_raw("CREATE TABLE CacheIndex (cache_key INTEGER, vary_key INTEGER, url TEXT, request_headers BLOB, response_headers BLOB, data_size INTEGER, associated_data_size INTEGER, request_time INTEGER, response_time INTEGER, last_access_time INTEGER, PRIMARY KEY(cache_key, vary_key));"sv));
+    TRY_OR_FAIL(database->execute_raw("INSERT INTO CacheIndex VALUES (1, 0, 'https://example.com', x'', x'', 10, 5, 0, 0, 0);"sv));
+
+    auto entry_file = directory.path().append("0000000000000001"sv);
+    auto bytecode_file = directory.path().append("0000000000000001.jsbc"sv);
+    auto partial_bytecode_file = directory.path().append("0000000000000001.jsbc.tmp"sv);
+    for (auto const& path : { entry_file, bytecode_file, partial_bytecode_file })
+        (void)TRY_OR_FAIL(Core::File::open(path.string(), Core::File::OpenMode::Write));
+
+    EXPECT_EQ(TRY_OR_FAIL(HTTP::CacheIndex::migrate_schema(*database)), Database::MigrationOutcome::Success);
+
+    EXPECT(FileSystem::exists(entry_file.string()));
+    EXPECT(!FileSystem::exists(bytecode_file.string()));
+    EXPECT(!FileSystem::exists(partial_bytecode_file.string()));
+
+    auto index = MUST(HTTP::CacheIndex::create(*database, directory.path()));
+    EXPECT(index.has_entry(1, 0));
+    EXPECT_EQ(index.estimate_cache_size_accessed_since(UnixDateTime::earliest()).total, 10u);
+}
+
 TEST_CASE(full_range_cache_keys_round_trip)
 {
     auto state = create_cache_index();
 
     auto request_headers = HTTP::HeaderList::create();
     auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
-    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers);
+    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers).value();
     auto now = UnixDateTime::now();
 
     for (u64 cache_key : { static_cast<u64>(NumericLimits<i64>::max()) + 1, NumericLimits<u64>::max() }) {
@@ -177,7 +198,7 @@ TEST_CASE(negative_stored_sizes_are_skipped_as_corrupt)
 
     auto request_headers = HTTP::HeaderList::create();
     auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
-    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers);
+    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers).value();
     auto now = UnixDateTime::now();
 
     TRY_OR_FAIL(state.index.create_entry(1, vary_key, "https://example.com"_string, request_headers, response_headers, 10, now, now));
@@ -186,4 +207,287 @@ TEST_CASE(negative_stored_sizes_are_skipped_as_corrupt)
     auto reloaded_index = MUST(HTTP::CacheIndex::create(*state.database, cache_directory()));
     auto entry = reloaded_index.find_entry(1, *request_headers);
     EXPECT(!entry.has_value());
+}
+
+// SQLite stores the root page of each b-tree in sqlite_schema. CacheIndex's table and primary-key index use separate
+// b-trees with different page layouts. Point the table's rootpage at the index's b-tree, then reload the schema with
+// writable_schema = RESET. Statements still prepare, but every statement that reads or writes the table reports
+// SQLITE_CORRUPT.
+static ErrorOr<void> corrupt_cache_index_table(Database::Database& database)
+{
+    return database.execute_raw(R"#(
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_schema
+        SET rootpage = (SELECT rootpage FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'CacheIndex')
+        WHERE name = 'CacheIndex';
+        PRAGMA writable_schema = RESET;
+    )#"sv);
+}
+
+TEST_CASE(creation_tolerates_failed_cleanup_and_size_queries)
+{
+    auto database = TRY_OR_FAIL(Database::Database::create_memory_backed());
+    TRY_OR_FAIL(HTTP::CacheIndex::migrate_schema(*database));
+    TRY_OR_FAIL(corrupt_cache_index_table(*database));
+
+    auto result = HTTP::CacheIndex::create(*database, cache_directory());
+    EXPECT(!result.is_error());
+}
+
+TEST_CASE(failed_statements_after_creation_do_not_abort)
+{
+    auto state = create_cache_index();
+
+    auto request_headers = HTTP::HeaderList::create();
+    auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
+    auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers).value();
+    auto now = UnixDateTime::now();
+
+    TRY_OR_FAIL(state.index.create_entry(1, vary_key, "https://example.com/1"_string, request_headers, response_headers, 10, now, now));
+    TRY_OR_FAIL(corrupt_cache_index_table(*state.database));
+
+    // Writes report that they failed.
+    EXPECT(state.index.create_entry(2, vary_key, "https://example.com/2"_string, request_headers, response_headers, 10, now, now).is_error());
+    EXPECT(state.index.update_response_headers(1, vary_key, response_headers).is_error());
+    state.index.update_last_access_time(1, vary_key);
+
+    // Entries that can't be read are missed.
+    EXPECT(!state.index.find_entry(3, *request_headers).has_value());
+
+    // Entries that can't be removed stay, as their rows do.
+    state.index.remove_entries_accessed_before(UnixDateTime::now(), {});
+    state.index.remove_entries_accessed_since(UnixDateTime::earliest(), {});
+    EXPECT(state.index.find_entry(1, *request_headers).has_value());
+
+    state.index.remove_entry(1, vary_key);
+    EXPECT(!state.index.find_entry(1, *request_headers).has_value());
+}
+
+TEST_CASE(variants_per_cache_key_are_limited)
+{
+    auto state = create_cache_index();
+
+    auto response_headers = HTTP::HeaderList::create({
+        { "Cache-Control"sv, "max-age=60"sv },
+        { "Vary"sv, "X-Variant"sv },
+    });
+    auto now = UnixDateTime::now();
+
+    auto request_headers_for_variant = [](size_t variant) {
+        return HTTP::HeaderList::create({ { "X-Variant"sv, ByteString::number(variant) } });
+    };
+
+    auto variant_count = HTTP::MAXIMUM_CACHE_ENTRY_VARIANT_COUNT + 4;
+    for (size_t variant = 0; variant < variant_count; ++variant) {
+        auto request_headers = request_headers_for_variant(variant);
+        auto vary_key = HTTP::create_vary_key(*request_headers, *response_headers).value();
+        TRY_OR_FAIL(state.index.create_entry(1, vary_key, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+    }
+
+    // Variants persisted by an earlier index count too.
+    auto reloaded_index = MUST(HTTP::CacheIndex::create(*state.database, cache_directory()));
+
+    auto newest_request_headers = request_headers_for_variant(variant_count);
+    auto newest_vary_key = HTTP::create_vary_key(*newest_request_headers, *response_headers).value();
+    TRY_OR_FAIL(reloaded_index.create_entry(1, newest_vary_key, "https://example.com"_string, newest_request_headers, response_headers, 10, now, now));
+
+    size_t removed_count = 0;
+    reloaded_index.remove_variants_exceeding_limit(1, newest_vary_key, [&](auto, auto) { ++removed_count; });
+
+    EXPECT_EQ(removed_count, variant_count + 1 - HTTP::MAXIMUM_CACHE_ENTRY_VARIANT_COUNT);
+    EXPECT(reloaded_index.find_entry(1, *newest_request_headers).has_value());
+
+    size_t remaining_count = 0;
+    for (size_t variant = 0; variant <= variant_count; ++variant) {
+        if (reloaded_index.find_entry(1, *request_headers_for_variant(variant)).has_value())
+            ++remaining_count;
+    }
+    EXPECT_EQ(remaining_count, HTTP::MAXIMUM_CACHE_ENTRY_VARIANT_COUNT);
+}
+
+TEST_CASE(most_recent_matching_variant_is_selected)
+{
+    auto state = create_cache_index();
+
+    auto request_headers = HTTP::HeaderList::create({ { "Accept"sv, "text/html"sv }, { "X-Variant"sv, "a"sv } });
+    auto newer_response_headers = HTTP::HeaderList::create({
+        { "Cache-Control"sv, "max-age=60"sv },
+        { "Vary"sv, "Accept"sv },
+        { "ETag"sv, "newer"sv },
+    });
+    auto older_response_headers = HTTP::HeaderList::create({
+        { "Cache-Control"sv, "max-age=60"sv },
+        { "Vary"sv, "Accept, X-Variant"sv },
+        { "ETag"sv, "older"sv },
+    });
+    auto now = UnixDateTime::now();
+
+    TRY_OR_FAIL(state.index.create_entry(1, HTTP::create_vary_key(*request_headers, *older_response_headers).value(), "https://example.com"_string, request_headers, older_response_headers, 10, now - AK::Duration::from_seconds(10), now - AK::Duration::from_seconds(10)));
+    TRY_OR_FAIL(state.index.create_entry(1, HTTP::create_vary_key(*request_headers, *newer_response_headers).value(), "https://example.com"_string, request_headers, newer_response_headers, 10, now, now));
+
+    auto entry = state.index.find_entry(1, *request_headers);
+    VERIFY(entry.has_value());
+    EXPECT_EQ(entry->response_headers->get("ETag"sv), Optional<ByteString> { ByteString { "newer"sv } });
+}
+
+TEST_CASE(updated_response_headers_respect_entry_size_limit)
+{
+    auto state = create_cache_index();
+
+    auto request_headers = HTTP::HeaderList::create();
+    auto response_headers = HTTP::HeaderList::create({ { "ETag"sv, "v1"sv } });
+    auto now = UnixDateTime::now();
+
+    state.index.set_maximum_disk_cache_size(800);
+    TRY_OR_FAIL(state.index.create_entry(1, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+
+    auto small_response_headers = HTTP::HeaderList::create({ { "ETag"sv, "v1"sv }, { "X-Small"sv, "x"sv } });
+    TRY_OR_FAIL(state.index.update_response_headers(1, 0, small_response_headers));
+
+    auto large_response_headers = HTTP::HeaderList::create({ { "ETag"sv, "v1"sv }, { "X-Large"sv, ByteString::repeated('x', 200) } });
+    EXPECT(state.index.update_response_headers(1, 0, large_response_headers).is_error());
+
+    auto entry = state.index.find_entry(1, *request_headers);
+    VERIFY(entry.has_value());
+    EXPECT(!entry->response_headers->contains("X-Large"sv));
+}
+
+TEST_CASE(persisted_entries_are_found_before_they_are_looked_up)
+{
+    auto state = create_cache_index();
+
+    auto request_headers = HTTP::HeaderList::create();
+    auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
+    auto now = UnixDateTime::now();
+
+    TRY_OR_FAIL(state.index.create_entry(1, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+
+    auto reloaded_index = MUST(HTTP::CacheIndex::create(*state.database, cache_directory()));
+    EXPECT(reloaded_index.has_entry(1, 0));
+
+    EXPECT_EQ(reloaded_index.estimate_cache_size_accessed_since(UnixDateTime::earliest()).total, 10u + 25u);
+}
+
+TEST_CASE(malformed_rows_are_dropped_when_the_index_is_opened)
+{
+    auto state = create_cache_index();
+
+    auto request_headers = HTTP::HeaderList::create();
+    auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
+    auto now = UnixDateTime::now();
+
+    for (u64 cache_key = 1; cache_key <= 5; ++cache_key)
+        TRY_OR_FAIL(state.index.create_entry(cache_key, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET request_headers = NULL WHERE cache_key = 1;"sv));
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET last_access_time = NULL WHERE cache_key = 2;"sv));
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET data_size = 9223372036854775807 WHERE cache_key = 3;"sv));
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET response_time = 'late' WHERE cache_key = 4;"sv));
+
+    auto reloaded_index = MUST(HTTP::CacheIndex::create(*state.database, cache_directory()));
+    for (u64 cache_key = 1; cache_key <= 4; ++cache_key)
+        EXPECT(!reloaded_index.find_entry(cache_key, *request_headers).has_value());
+    EXPECT(reloaded_index.find_entry(5, *request_headers).has_value());
+
+    EXPECT_EQ(reloaded_index.estimate_cache_size_accessed_since(UnixDateTime::earliest()).total, 10u + 25u);
+
+    TRY_OR_FAIL(reloaded_index.create_entry(6, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+    reloaded_index.set_maximum_disk_cache_size(40);
+    reloaded_index.remove_entries_exceeding_cache_limit({});
+    EXPECT(reloaded_index.estimate_cache_size_accessed_since(UnixDateTime::earliest()).total <= 40u);
+}
+
+TEST_CASE(clearing_every_entry_does_not_depend_on_row_contents)
+{
+    auto state = create_cache_index();
+
+    auto request_headers = HTTP::HeaderList::create();
+    auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
+    auto now = UnixDateTime::now();
+
+    TRY_OR_FAIL(state.index.create_entry(1, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+    TRY_OR_FAIL(state.index.create_entry(2, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET last_access_time = NULL WHERE cache_key = 1;"sv));
+
+    Vector<u64> removed_entries;
+    state.index.remove_entries_accessed_since(UnixDateTime::earliest(), [&](auto cache_key, auto) { removed_entries.append(cache_key); });
+
+    EXPECT_EQ(removed_entries.size(), 2u);
+    EXPECT(!state.index.find_entry(1, *request_headers).has_value());
+    EXPECT(!state.index.find_entry(2, *request_headers).has_value());
+
+    auto reloaded_index = MUST(HTTP::CacheIndex::create(*state.database, cache_directory()));
+    EXPECT(!reloaded_index.find_entry(1, *request_headers).has_value());
+}
+
+TEST_CASE(overflowing_cache_size_sums_do_not_abort)
+{
+    auto state = create_cache_index();
+
+    auto request_headers = HTTP::HeaderList::create();
+    auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
+    auto now = UnixDateTime::now();
+
+    TRY_OR_FAIL(state.index.create_entry(1, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET data_size = 9223372036854775807, request_headers = x'', response_headers = x'' WHERE cache_key = 1;"sv));
+
+    TRY_OR_FAIL(state.index.create_entry(2, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+    state.index.set_maximum_disk_cache_size(40);
+    state.index.remove_entries_exceeding_cache_limit({});
+    (void)state.index.estimate_cache_size_accessed_since(UnixDateTime::earliest());
+}
+
+TEST_CASE(stored_vary_wildcard_does_not_match)
+{
+    auto state = create_cache_index();
+
+    auto request_headers = HTTP::HeaderList::create();
+    auto response_headers = HTTP::HeaderList::create({
+        { "Cache-Control"sv, "max-age=60"sv },
+        { "Vary"sv, "*"sv },
+    });
+    auto now = UnixDateTime::now();
+
+    TRY_OR_FAIL(state.index.create_entry(1, 0, "https://example.com"_string, request_headers, response_headers, 10, now, now));
+
+    auto reloaded_index = MUST(HTTP::CacheIndex::create(*state.database, cache_directory()));
+    EXPECT(!reloaded_index.find_entry(1, *request_headers).has_value());
+}
+
+TEST_CASE(access_profile_and_eviction_by_last_access_time)
+{
+    auto state = create_cache_index();
+
+    size_t size_changes = 0;
+    state.index.on_total_estimated_size_change = [&] { ++size_changes; };
+
+    auto request_headers = HTTP::HeaderList::create();
+    auto response_headers = HTTP::HeaderList::create();
+    auto now = UnixDateTime::now();
+
+    TRY_OR_FAIL(state.index.create_entry(1, 0, "https://example.com/1"_string, request_headers, response_headers, 10, now, now));
+    TRY_OR_FAIL(state.index.create_entry(2, 0, "https://example.com/2"_string, request_headers, response_headers, 20, now, now));
+    TRY_OR_FAIL(state.index.create_entry(3, 0, "https://example.com/3"_string, request_headers, response_headers, 40, now, now));
+    EXPECT_EQ(size_changes, 3u);
+
+    // Entries 1 and 2 were last used in the same minute, entry 3 five minutes later.
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET last_access_time = 60000 WHERE cache_key = 1;"sv));
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET last_access_time = 119999 WHERE cache_key = 2;"sv));
+    TRY_OR_FAIL(state.database->execute_raw("UPDATE CacheIndex SET last_access_time = 360000 WHERE cache_key = 3;"sv));
+
+    auto buckets = state.index.access_profile(AK::Duration::from_seconds(60));
+    EXPECT_EQ(buckets.size(), 2u);
+    EXPECT_EQ(buckets[0].last_access_time, UnixDateTime::from_milliseconds_since_epoch(360000));
+    EXPECT_EQ(buckets[0].size, 40u);
+    EXPECT_EQ(buckets[1].last_access_time, UnixDateTime::from_milliseconds_since_epoch(60000));
+    EXPECT_EQ(buckets[1].size, 30u);
+
+    Vector<u64> removed_entries;
+    state.index.remove_entries_accessed_before(UnixDateTime::from_milliseconds_since_epoch(360000), [&](auto cache_key, auto) { removed_entries.append(cache_key); });
+    quick_sort(removed_entries);
+    EXPECT_EQ(removed_entries, (Vector<u64> { 1, 2 }));
+    EXPECT_EQ(state.index.total_estimated_size(), 40u);
+    EXPECT(size_changes >= 5u);
+    EXPECT(state.index.find_entry(3, *request_headers).has_value());
+    EXPECT(!state.index.find_entry(1, *request_headers).has_value());
 }

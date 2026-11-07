@@ -9,7 +9,6 @@
 <script>
     test(() => {
         internals.updateStyle();
-        const before = internals.getStyleInvalidationCounters().elementStyleSharedComputations;
         const nodes = [];
         for (const className of ["local", "imported"]) {
             for (let index = 0; index < 8; ++index) {
@@ -20,8 +19,6 @@
             }
         }
         internals.updateStyle();
-        const after = internals.getStyleInvalidationCounters().elementStyleSharedComputations;
-        println(`image styles share within each declaration context: ${after - before >= 14}`);
 
         function checkImages(label) {
             const correct = nodes.every(node => {

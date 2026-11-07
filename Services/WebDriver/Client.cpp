@@ -238,15 +238,40 @@ ResponsePromise Client::get_current_url(Web::WebDriver::Parameters parameters, J
 }
 
 // 10.3 Back, https://w3c.github.io/webdriver/#dfn-back
+// 10.4 Forward, https://w3c.github.io/webdriver/#dfn-forward
+static ResponsePromise traverse_history_and_wait_for_its_document(NonnullRefPtr<Session> session, i32 delta)
+{
+    // 6. Traverse the history by a delta –1 for session's current browsing context.
+    // NB: Forward's step 6 traverses by a delta 1 instead.
+    auto traversal_promise = session->traverse_history(delta, Session::HandleUserPrompts::Yes);
+
+    // The UI completes the traversal's navigation once its step has been applied, i.e. once the document the step
+    // activated is the current browsing context's. Only then can WebContent be asked about that document's readiness.
+    auto step_applied_promise = continue_with_promise(move(traversal_promise), [session] {
+        return session->wait_for_navigation_completion();
+    });
+
+    // 7. If the previous step completed results in a pageHide event firing, wait until pageShow event fires or timer'
+    //    timeout fired flag to be set, whichever occurs first.
+    // AD-HOC: A document the step populated fires pageshow right after its load event, so this waits for its readiness
+    //         the way "wait for navigation to complete" does, honoring the session's page load strategy and page load
+    //         timeout; a step that activates a document that has already loaded, or no new document, returns at once.
+    //         WebKit's WebAutomationSession::goBackInBrowsingContext() and Marionette's GeckoDriver goBack() wait
+    //         for the page load the traversal starts the same way, and chromedriver's ExecuteGoBack() waits for the
+    //         pending navigation before the command completes.
+    return continue_with_promise(move(step_applied_promise), [session] {
+        return session->run_top_level_content_command("wait_for_navigation"sv);
+    });
+}
+
+// 10.3 Back, https://w3c.github.io/webdriver/#dfn-back
 // POST /session/{session id}/back
 ResponsePromise Client::back(Web::WebDriver::Parameters parameters, JsonValue)
 {
     dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/back");
     auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
 
-    return continue_with_promise(session->traverse_history(-1, Session::HandleUserPrompts::Yes), [session] {
-        return session->wait_for_navigation_completion();
-    });
+    return traverse_history_and_wait_for_its_document(move(session), -1);
 }
 
 // 10.4 Forward, https://w3c.github.io/webdriver/#dfn-forward
@@ -256,9 +281,7 @@ ResponsePromise Client::forward(Web::WebDriver::Parameters parameters, JsonValue
     dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/forward");
     auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
 
-    return continue_with_promise(session->traverse_history(1, Session::HandleUserPrompts::Yes), [session] {
-        return session->wait_for_navigation_completion();
-    });
+    return traverse_history_and_wait_for_its_document(move(session), 1);
 }
 
 // 10.5 Refresh, https://w3c.github.io/webdriver/#dfn-refresh
@@ -445,7 +468,7 @@ ResponsePromise Client::new_window(Web::WebDriver::Parameters parameters, JsonVa
                               bool settled { false };
                           };
                           auto wait_state = adopt_ref(*new WaitState);
-                          wait_state->timer = Core::Timer::create_single_shot(CONNECTION_TIMEOUT_MS, [promise, session, handle, wait_state] {
+                          wait_state->timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(CONNECTION_TIMEOUT_MS), [promise, session, handle, wait_state] {
                               if (wait_state->settled)
                                   return;
                               wait_state->settled = true;
@@ -937,6 +960,16 @@ ResponsePromise Client::print_page(Web::WebDriver::Parameters parameters, JsonVa
     dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session id>/print");
     auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
     return session->run_top_level_content_command("print_page"sv, move(payload));
+}
+
+// Set Permission, https://w3c.github.io/permissions/#webdriver-command-set-permission
+// POST /session/{session id}/permissions
+ResponsePromise Client::set_permission(Web::WebDriver::Parameters parameters, JsonValue payload)
+{
+    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/permissions");
+    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
+
+    return session->set_permission(move(payload));
 }
 
 }

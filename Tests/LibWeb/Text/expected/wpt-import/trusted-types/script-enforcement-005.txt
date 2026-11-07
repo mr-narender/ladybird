@@ -1,0 +1,9 @@
+Harness status: OK
+
+Found 4 tests
+
+4 Pass
+Pass	Empty HTMLScriptElement is executed if the default policy makes it non-empty.
+Pass	Non-empty HTMLScriptElement is not executed if the default policy makes it empty.
+Pass	Empty SVGScriptElement is executed if the default policy makes it non-empty.
+Pass	Non-empty SVGScriptElement is not executed if the default policy makes it empty.

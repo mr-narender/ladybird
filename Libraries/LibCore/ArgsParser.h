@@ -86,7 +86,6 @@ public:
     void print_version(FILE*);
 
     void add_option(Option&&);
-    void add_ignored(char const* long_name, char short_name = 0, OptionHideMode hide_mode = OptionHideMode::None);
     void add_option(bool& value, char const* help_string, char const* long_name, char short_name = 0, OptionHideMode hide_mode = OptionHideMode::None);
     /// If the option is present, set the enum to have the given `new_value`.
     template<Enum T>
@@ -96,7 +95,7 @@ public:
             .help_string = help_string,
             .long_name = long_name,
             .short_name = short_name,
-            .accept_value = [&](StringView) {
+            .accept_value = [&value, new_value](StringView) {
                 value = new_value;
                 return true;
             },

@@ -19,19 +19,33 @@ use libgfx_rust::{CapStyle, Color, JoinStyle, ShouldAntiAlias};
 
 pub(crate) fn paint_outline_phase<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
     let node = paintable;
-    let outline = crate::painting::style_queries::outline_data(
-        recorder.layout_arena,
-        node,
-        recorder.inputs.window_is_focused,
-        recorder.inputs.outline_auto_color.0,
-    );
+    let outline = outline_data_for_paint(recorder, node);
     if outline.is_some() {
-        let outline_offset = crate::painting::style_queries::outline_offset(recorder.layout_arena, node);
-        let border_box_rect = paintable_geometry::absolute_border_box_rect(recorder.layout_arena, paintable);
-        let border_radii = recorder.border_radii(paintable);
-        paint_outline(recorder, outline, outline_offset, border_box_rect, border_radii);
+        let outline_offset = crate::painting::style_queries::outline_offset(recorder.source, node);
+        for (border_box_rect, border_radii) in recorder.border_boxes_of_fragments(paintable) {
+            paint_outline(recorder, outline, outline_offset, border_box_rect, border_radii);
+        }
     }
     paint_focused_area_outline(recorder, paintable);
+}
+
+// The assistive-technology focus target gets an auto-style ring in place of whatever outline its style computes —
+// so the ring shows on an element with outline: none, and replaces an author outline rather than stacking on it.
+pub(crate) fn outline_data_for_paint<O: Observer>(
+    recorder: &PaintRecorder<'_, O>,
+    node: NodeSlotId,
+) -> Option<crate::painting::style_queries::OutlineData> {
+    if Some(node) == recorder.inputs.accessibility_focus_target {
+        return Some(crate::painting::style_queries::auto_outline_data(
+            recorder.inputs.outline_auto_color.0,
+        ));
+    }
+    crate::painting::style_queries::outline_data(
+        recorder.source,
+        node,
+        || recorder.window_is_focused(),
+        recorder.inputs.outline_auto_color.0,
+    )
 }
 
 pub(crate) fn outline_border_geometry(
@@ -126,21 +140,29 @@ fn paint_focused_area_outline<O: Observer>(recorder: &mut PaintRecorder<'_, O>, 
     // inert.
     // NB: Focused area elements have no paintable of their own, so the image whose rendering makes the area's shape a
     // focusable area paints the focus outline along that shape.
-    let Some(outline) = recorder.inputs.focused_area_outline else {
+    // AD-HOC: Only the user agent focus ring is painted, as an `outline: auto` would paint it. Other engines do not let
+    //         author outline values style the focus indicator of an image map area.
+    let Some(outline) = &recorder.inputs.focused_area_outline else {
         return;
     };
-    if outline.image != paintable {
+    if outline.image != paintable || !recorder.window_is_focused() {
         return;
     }
-    let path = libgfx_rust::path::OwnedPath::from_serialized_bytes(outline.path_bytes);
+    let image_rect = paintable_geometry::absolute_rect(recorder.source, paintable);
+    let Some(path) = recorder.source.image_map_area_shape_path(
+        outline.image,
+        outline.area,
+        image_rect.width.to_float(),
+        image_rect.height.to_float(),
+    ) else {
+        return;
+    };
     let converter = recorder.converter;
-    let image_rect = paintable_geometry::absolute_rect(recorder.layout_arena, paintable);
     let scale = recorder.inputs.device_pixels_per_css_pixel as f32;
+    let color = recorder.inputs.outline_auto_color;
     let device_origin = converter.rounded_device_point(image_rect.location());
     let transformed = path.copy_transformed([scale, 0.0, 0.0, scale, device_origin.x as f32, device_origin.y as f32]);
 
-    // AD-HOC: Only the user agent focus ring is painted. Other engines do not let author outline values style the
-    // focus indicator of an image map area.
     recorder
         .recorder
         .record_clipped_to(converter.enclosing_device_rect(image_rect), |recorder| {
@@ -154,8 +176,8 @@ fn paint_focused_area_outline<O: Observer>(recorder: &mut PaintRecorder<'_, O>, 
                 dash_offset: 0.0,
                 path: &transformed,
                 opacity: 1.0,
-                paint_style_or_color: PaintStyleOrColor::Color(outline.color),
-                thickness: outline.width.to_double() as f32 * scale,
+                paint_style_or_color: PaintStyleOrColor::Color(color),
+                thickness: crate::painting::style_queries::auto_outline_width().to_double() as f32 * scale,
                 should_anti_alias: ShouldAntiAlias::Yes,
             });
         });

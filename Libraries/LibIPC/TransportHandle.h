@@ -19,10 +19,14 @@
 
 namespace IPC {
 
+struct TransportHandlePair;
+
 class TransportHandle {
     AK_MAKE_NONCOPYABLE(TransportHandle);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     TransportHandle() = default;
     TransportHandle(TransportHandle&&) = default;
     TransportHandle& operator=(TransportHandle&&) = default;
@@ -34,6 +38,9 @@ public:
 #endif
 
     ErrorOr<NonnullOwnPtr<Transport>> create_transport() const;
+
+    // Both ends of a new channel, for a process that connects two others without touching the channel itself.
+    static ErrorOr<TransportHandlePair> create_pair();
 
 private:
 #if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
@@ -48,6 +55,11 @@ private:
 
     template<typename U>
     friend ErrorOr<U> decode(Decoder&);
+};
+
+struct TransportHandlePair {
+    TransportHandle first;
+    TransportHandle second;
 };
 
 }

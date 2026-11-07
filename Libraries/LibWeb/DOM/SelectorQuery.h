@@ -7,7 +7,6 @@
 #pragma once
 
 #include <AK/HashMap.h>
-#include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
 #include <AK/Vector.h>
 #include <LibGC/Cell.h>
@@ -16,17 +15,21 @@
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/Forward.h>
 
-namespace Web::DOM {
+namespace Web::CSS::SelectorFFI {
 
-class IsolatedSelectorQueryEngine;
+struct DomSelectorProgram;
+
+}
+
+namespace Web::DOM {
 
 // A selectors string parsed for use by querySelector(All), matches() and closest().
 // Documents cache these per selector string, so one SelectorQuery may be reused by many queries.
 class SelectorQuery : public RefCounted<SelectorQuery> {
 public:
-    static NonnullRefPtr<SelectorQuery> create(Document& document, CSS::SelectorList&& selectors)
+    static NonnullRefPtr<SelectorQuery> create(CSS::SelectorList&& selectors)
     {
-        return adopt_ref(*new SelectorQuery(document, move(selectors)));
+        return adopt_ref(*new SelectorQuery(move(selectors)));
     }
 
     ~SelectorQuery();
@@ -36,10 +39,10 @@ public:
     bool is_result_cacheable() const { return m_is_result_cacheable; }
     bool depends_on_character_data() const { return m_depends_on_character_data; }
 
-    // Stamped by the document's selector query cache each time the query is handed out, so that a full cache can
-    // evict the query used least recently.
-    u64 last_use() const { return m_last_use; }
-    void set_last_use(u64 use) const { m_last_use = use; }
+    // Marked by the document's selector query cache each time it hands out the query again, so that a full cache can
+    // give a query in use another turn as it looks for one to evict.
+    void mark_used() const { m_used_mark = true; }
+    bool take_used_mark() const { return exchange(m_used_mark, false); }
 
     GC::Ptr<Element> query_first(ParentNode&) const;
     GC::Ref<NodeList> query_all(ParentNode&) const;
@@ -47,18 +50,15 @@ public:
     GC::Ptr<Element const> closest(Element const&) const;
 
 private:
-    SelectorQuery(Document&, CSS::SelectorList&&);
+    explicit SelectorQuery(CSS::SelectorList&&);
 
-    bool matches_simple_selector_in_dom(Element const&) const;
-    bool matches_in_style_engine(Element const&, ParentNode const& scope) const;
+    CSS::SelectorFFI::DomSelectorProgram const& program(Document const&) const;
 
     CSS::SelectorList m_selectors;
-    void* m_engine_query { nullptr };
-    mutable u64 m_last_use { 0 };
-    bool m_can_match_in_dom { false };
-    bool m_can_match_locally_in_dom { false };
-    bool m_dom_matching_needs_id { false };
-    bool m_dom_matching_needs_classes { false };
+    // The selectors compiled for the DOM matcher, when a query first needs them, for an HTML document or not.
+    mutable CSS::SelectorFFI::DomSelectorProgram* m_program { nullptr };
+    mutable bool m_program_is_for_html_document { false };
+    mutable bool m_used_mark { false };
 
     // Whether the selector is a lone `*`, which every element matches: a query then collects the
     // subtree's elements without matching any of them.
@@ -127,37 +127,6 @@ private:
     };
 
     HashMap<Key, Entry, KeyTraits> m_entries;
-};
-
-// The document's style engine knows only connected nodes, so a selector query against a disconnected element
-// matches in an engine of its own, populated with the whole tree the element is in. Building one costs a walk of
-// that tree, so this cache keeps one per tree root for every query against the tree to share. Entries are validated
-// lazily against the root's mutation version counters, like query results are.
-class IsolatedSelectorQueryEngineCache {
-    AK_MAKE_NONCOPYABLE(IsolatedSelectorQueryEngineCache);
-    AK_MAKE_NONMOVABLE(IsolatedSelectorQueryEngineCache);
-
-public:
-    AK_ALLOC_WITH_KMALLOC;
-
-    IsolatedSelectorQueryEngineCache();
-    ~IsolatedSelectorQueryEngineCache();
-
-    IsolatedSelectorQueryEngine& engine_for(ParentNode& root);
-    void clear();
-    void visit_edges(GC::Cell::Visitor&);
-
-private:
-    struct Entry {
-        // Weak so the cache never keeps a disconnected tree alive, and so that a dead root can never be confused with
-        // a new node allocated at the same address.
-        GC::Weak<ParentNode> root;
-        u64 dom_tree_version { 0 };
-        u64 character_data_version { 0 };
-        NonnullOwnPtr<IsolatedSelectorQueryEngine> engine;
-    };
-
-    HashMap<GC::RawPtr<ParentNode const>, Entry> m_entries;
 };
 
 }

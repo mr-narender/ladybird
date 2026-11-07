@@ -15,6 +15,15 @@ macro(add_cxx_compile_options)
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX,ASM>:${args}>)
 endmacro()
 
+# For options that only mean something to C++, some of which GCC rejects when it compiles C.
+macro(add_cxx_only_compile_options)
+    set(args "")
+    foreach(arg ${ARGN})
+        string(APPEND args ${arg}$<SEMICOLON>)
+    endforeach()
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:${args}>)
+endmacro()
+
 macro(add_cxx_compile_definitions)
     set(args "")
     foreach(arg ${ARGN})
@@ -47,14 +56,19 @@ function(add_cxx_link_option_if_supported option)
     cmake_pop_check_state()
 endfunction()
 
+# RUSTC_TARGET_CPU_FLAGS names the same CPU for rustc, so that Rust code runs on the instruction set C++ code does.
 if (ENABLE_CI_BASELINE_CPU)
     # In CI, we want to target a common architecture so different runners can share ccache caches effectively.
     if (APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
         add_cxx_compile_options(-mcpu=apple-m1)
+        set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=apple-m1)
     elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
         add_cxx_compile_options(-march=armv8.2-a)
+        set(RUSTC_TARGET_CPU_FLAGS -Ctarget-feature=+v8.2a)
     elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-        add_cxx_compile_options(-march=x86-64-v3)
+        # Keep distributed binaries usable on SSE4.2/POPCNT machines without AVX or BMI.
+        add_cxx_compile_options(-march=x86-64-v2)
+        set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=x86-64-v2)
     endif()
 elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
     # On RISC-V the generic -march=native is not yet supported and both gcc and clang require an explicit
@@ -64,6 +78,14 @@ elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "riscv64")
 elseif (NOT CMAKE_CROSSCOMPILING)
     # In all other cases, compile for the native architecture of the host system.
     add_cxx_compile_options(-march=native)
+    set(RUSTC_TARGET_CPU_FLAGS -Ctarget-cpu=native)
+endif()
+
+# Stack walks such as the crash handler's follow frame pointers. Apple platforms keep them by default, and Windows
+# unwinds through the unwind tables its ABI requires instead, so only other platforms need to ask for them.
+if (NOT APPLE AND NOT WIN32)
+    add_cxx_compile_options(-fno-omit-frame-pointer)
+    set(RUSTC_TARGET_FRAME_POINTER_FLAGS -Cforce-frame-pointers=yes)
 endif()
 
 add_cxx_compile_options(-Wcast-qual)
@@ -76,15 +98,15 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     # Apple Clang does not include this diagnostic in -Wmissing-field-initializers as upstream Clang does.
     add_cxx_compile_options(-Wmissing-designated-field-initializers)
 endif()
-add_cxx_compile_options(-Wsuggest-override)
+add_cxx_only_compile_options(-Wsuggest-override)
 
 add_cxx_compile_options(-Wno-expansion-to-defined)
-add_cxx_compile_options(-Wno-invalid-offsetof)
+add_cxx_only_compile_options(-Wno-invalid-offsetof)
 add_cxx_compile_options(-Wno-maybe-uninitialized)
 add_cxx_compile_options(-Wno-shorten-64-to-32)
 add_cxx_compile_options(-Wno-unknown-warning-option)
 add_cxx_compile_options(-Wno-unused-command-line-argument)
-add_cxx_compile_options(-Wno-user-defined-literals)
+add_cxx_only_compile_options(-Wno-user-defined-literals)
 
 add_cxx_compile_options(-Werror)
 
@@ -104,19 +126,19 @@ if (NOT MSVC)
     add_cxx_link_options(-fstack-protector-strong)
     if (UNIX AND NOT APPLE AND NOT ENABLE_FUZZERS)
         add_cxx_compile_options(-fno-semantic-interposition)
-        add_cxx_compile_options(-fvisibility-inlines-hidden)
+        add_cxx_only_compile_options(-fvisibility-inlines-hidden)
     endif()
 endif()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_SIMULATE_ID  MATCHES "MSVC")
     # Clang's default constexpr-steps limit is 1048576(2^20), GCC doesn't have one
-    add_cxx_compile_options(-fconstexpr-steps=16777216)
+    add_cxx_only_compile_options(-fconstexpr-steps=16777216)
 
     add_cxx_compile_options(-Wmissing-prototypes)
 
     add_cxx_compile_options(-Wno-implicit-const-int-float-conversion)
-    add_cxx_compile_options(-Wno-user-defined-literals)
-    add_cxx_compile_options(-Wno-unqualified-std-cast-call)
+    add_cxx_only_compile_options(-Wno-user-defined-literals)
+    add_cxx_only_compile_options(-Wno-unqualified-std-cast-call)
 
     # Used for the #embed directive.
     # FIXME: Remove this once #embed is no longer an extension.
@@ -124,8 +146,8 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_SIMULATE_ID  MATCHES
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # Only ignore expansion-to-defined for g++, clang's implementation doesn't complain about function-like macros
     add_cxx_compile_options(-Wno-expansion-to-defined)
-    add_cxx_compile_options(-Wno-literal-suffix)
-    add_cxx_compile_options(-Wno-unqualified-std-cast-call)
+    add_cxx_only_compile_options(-Wno-literal-suffix)
+    add_cxx_only_compile_options(-Wno-unqualified-std-cast-call)
     add_cxx_compile_options(-Wvla)
 
     # FIXME: These warnings trigger on Function and ByteBuffer in GCC (only when LTO is disabled...)
@@ -134,7 +156,7 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_cxx_compile_options(-Wno-stringop-overflow)
 
     # FIXME: This warning seems useful but has too many false positives with GCC 13.
-    add_cxx_compile_options(-Wno-dangling-reference)
+    add_cxx_only_compile_options(-Wno-dangling-reference)
 elseif (MSVC)
     # Warning options and defines
     add_cxx_compile_options(/W4)
@@ -163,8 +185,8 @@ elseif (MSVC)
     # Compiler options
     # disable exceptions
     add_cxx_compile_options(/EHs-)
-    # disable floating-point expression contraction
-    add_cxx_compile_options(/fp:precise)
+    # disable floating-point expression contraction, which the default /fp:precise allows
+    add_cxx_compile_options(/clang:-ffp-contract=off)
     # reduces object size
     add_cxx_compile_options(/Zc:inline)
     # equivalent of -fvisibility-inlines-hidden
@@ -212,6 +234,13 @@ endif()
 if (APPLE)
     list(APPEND CMAKE_PREFIX_PATH /opt/homebrew)
     add_cxx_link_options(LINKER:-dead_strip)
+
+    # The debug info of LTO code lives in the objects the linker generates, which it deletes after linking unless told
+    # where to keep them; dsymutil reads it from there.
+    if (LADYBIRD_GENERATE_SYMBOL_FILES)
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/lto")
+        add_cxx_link_options("LINKER:-object_path_lto,${CMAKE_BINARY_DIR}/lto/$<TARGET_PROPERTY:NAME>")
+    endif()
 endif()
 
 if (HAIKU)
@@ -223,6 +252,7 @@ endif()
 
 if (NOT WIN32)
     add_cxx_link_option_if_supported(LINKER:--gdb-index)
+    add_cxx_link_option_if_supported(LINKER:--build-id)
 
     if (NOT ENABLE_FUZZERS)
         add_cxx_link_option_if_supported(LINKER:-Bsymbolic-non-weak-functions)
@@ -266,6 +296,11 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
 elseif (CMAKE_BUILD_TYPE STREQUAL "Release")
     if (NOT MSVC)
         add_cxx_compile_options(-O3)
+
+        # Line tables, inlined frames included, are what symbolicating a crash report needs.
+        if (LADYBIRD_GENERATE_SYMBOL_FILES)
+            add_cxx_compile_options(-g1)
+        endif()
     else()
         add_cxx_compile_options(/O2)
     endif()
@@ -289,8 +324,4 @@ if (ENABLE_LAGOM_COVERAGE_COLLECTION)
         message(FATAL_ERROR
             "Collecting code coverage is unsupported in this configuration.")
     endif()
-endif()
-
-if (ENABLE_FUZZERS)
-    add_cxx_compile_options(-fno-omit-frame-pointer)
 endif()

@@ -15,23 +15,29 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
+#include <LibWebCommon/HTML/CrossOriginIsolationMode.h>
 #include <LibWebCommon/HTML/WorkerTypes.h>
 
 namespace Web::Bindings {
 
-struct WebEngineCustomJobCallbackData final : public JS::JobCallback::CustomData {
-    AK_ALLOC_WITH_KMALLOC;
+class WebEngineCustomJobCallbackData final : public JS::Cell {
+    GC_CELL(WebEngineCustomJobCallbackData, JS::Cell);
+    GC_DECLARE_ALLOCATOR(WebEngineCustomJobCallbackData);
 
+public:
+    virtual ~WebEngineCustomJobCallbackData() override = default;
+
+    GC::Ref<HTML::EnvironmentSettingsObject> incumbent_settings;
+    OwnPtr<JS::ExecutionContext> active_script_context;
+
+private:
     WebEngineCustomJobCallbackData(HTML::EnvironmentSettingsObject& incumbent_settings, OwnPtr<JS::ExecutionContext> active_script_context)
         : incumbent_settings(incumbent_settings)
         , active_script_context(move(active_script_context))
     {
     }
 
-    virtual ~WebEngineCustomJobCallbackData() override = default;
-
-    GC::Ref<HTML::EnvironmentSettingsObject> incumbent_settings;
-    OwnPtr<JS::ExecutionContext> active_script_context;
+    virtual void visit_edges(Cell::Visitor&) override;
 };
 
 HTML::Script* active_script();
@@ -39,7 +45,7 @@ HTML::Script* active_script();
 WEB_API void initialize_main_thread_vm(HTML::AgentType);
 WEB_API JS::VM& main_thread_vm();
 
-WEB_API NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM&, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_object, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_this_value);
+WEB_API NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM&, HTML::CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_object, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_this_value);
 
 // Creates a bare Window-backed realm for tests and tools that do not need a full Document.
 WEB_API GC::Ref<JS::Realm> create_a_simple_javascript_realm();

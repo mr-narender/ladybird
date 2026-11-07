@@ -51,12 +51,11 @@ def run_test(webdriver_binary):
             ("XDG_CACHE_HOME", "cache"),
         ):
             environment[variable] = str(Path(temporary) / directory)
-        port = webdriver_helpers.unused_port()
-        webdriver = subprocess.Popen(
-            [webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(port)], env=environment
+        profile = Path(temporary) / "profile"
+        webdriver, port = webdriver_helpers.launch_webdriver(
+            webdriver_binary, "--headless", f"--profile-path={profile}", env=environment
         )
         try:
-            webdriver_helpers.wait_for_port(port)
             session = webdriver_helpers.create_session(port)
             status, _, body = webdriver_helpers.request(
                 port, "POST", f"/session/{session}/url", {"url": "data:text/html,<title>Workers</title>"}
@@ -99,7 +98,7 @@ def run_test(webdriver_binary):
                 time.sleep(0.05)
 
             time.sleep(CRASH_REPORT_GRACE_SECONDS)
-            reports = list((Path(temporary) / "data/Ladybird/CrashReports").glob("*-WebWorker-*.txt"))
+            reports = list((profile / "data/CrashReports").glob("*-WebWorker-*.txt"))
             assert not reports, reports[0].read_text()
 
             webdriver_helpers.request(port, "DELETE", f"/session/{session}")

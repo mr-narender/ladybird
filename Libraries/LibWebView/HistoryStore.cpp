@@ -329,6 +329,7 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
                         END
                     END AS searchable_url
                 FROM History
+                WHERE url LIKE 'http://%' OR url LIKE 'https://%' OR url LIKE 'file:%'
             )
             WHERE ((?1 != '' AND LOWER(searchable_url) LIKE LOWER(?1) || '%')
                 OR (?2 != '' AND INSTR(LOWER(searchable_url), LOWER(?2)) > 0)
@@ -407,6 +408,7 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
                         END
                     END AS searchable_url
                 FROM History
+                WHERE url LIKE 'http://%' OR url LIKE 'https://%' OR url LIKE 'file:%'
             )
             WHERE ((?1 = '' AND ?2 = '')
                 OR (?1 != '' AND INSTR(LOWER(title), LOWER(?1)) > 0)
@@ -466,7 +468,8 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
     )#"sv));
     statements.delete_omnibox_engagements_for_url = TRY(database.prepare_statement(R"#(
         DELETE FROM OmniboxEngagements
-        WHERE destination_kind = 0 AND destination_key = ?;
+        WHERE destination_kind = 0
+          AND (destination_key = ?1 OR substr(destination_key, 1, length(?1) + 1) = ?1 || '#');
     )#"sv));
     statements.delete_omnibox_engagements_used_since = TRY(database.prepare_statement(R"#(
         DELETE FROM OmniboxEngagements
@@ -496,6 +499,14 @@ HistoryStore::HistoryStore(NonnullOwnPtr<StorageImpl>&& storage, bool is_disable
 
 HistoryStore::~HistoryStore() = default;
 
+// History records web pages and local files only. The browser opens what its history lists, and a javascript: URL would
+// run in whatever document opened it, such as about:history. A store holds other URLs only if something other than the
+// browser wrote to it, so the queries listing and suggesting entries skip them too.
+static bool is_browsable_url(URL::URL const& url)
+{
+    return url.scheme().is_one_of("http"sv, "https"sv, "file"sv);
+}
+
 Optional<String> HistoryStore::normalize_url(URL::URL const& url)
 {
     if (url.scheme().is_empty()) {
@@ -503,7 +514,7 @@ Optional<String> HistoryStore::normalize_url(URL::URL const& url)
         return {};
     }
 
-    if (url.scheme().is_one_of("about"sv, "data"sv)) {
+    if (!is_browsable_url(url)) {
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping non-browsable history URL: {}", url);
         return {};
     }
@@ -968,8 +979,11 @@ void HistoryStore::TransientStorage::remove_entry_for_url(String const& url, Rem
     if (remove_engagements == RemoveHistoryEntryEngagements::No)
         return;
     m_omnibox_engagements.remove_all_matching([&](auto const& engagement) {
-        return engagement.destination_kind == OmniboxDestinationKind::URL
-            && normalize_omnibox_destination(engagement.destination, engagement.destination_kind) == url;
+        if (engagement.destination_kind != OmniboxDestinationKind::URL)
+            return false;
+        auto destination = normalize_omnibox_destination(engagement.destination, engagement.destination_kind);
+        return destination == url
+            || (destination.bytes_as_string_view().starts_with(url) && destination.bytes_as_string_view()[url.bytes_as_string_view().length()] == '#');
     });
 }
 

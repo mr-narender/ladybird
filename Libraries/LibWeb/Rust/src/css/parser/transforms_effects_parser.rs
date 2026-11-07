@@ -5,13 +5,11 @@
  */
 
 // Parsed values use the thread-confined shared graph owned by the C++ style objects.
-#![allow(clippy::arc_with_non_send_sync)]
 
 use super::component_value::{ComponentKind, ComponentValue};
 use super::token_stream::TokenStream;
 use super::value_parser::{
-    NumericRange, ParseContext, ParseOutcome, VALUE_TYPE_ANGLE, VALUE_TYPE_INTEGER, VALUE_TYPE_NUMBER,
-    VALUE_TYPE_PERCENTAGE, equals_ascii_case_insensitive, parse_angle_value,
+    NumericRange, ParseContext, ParseOutcome, equals_ascii_case_insensitive, parse_angle_value,
     parse_calculated_numeric_value_with_ranges, parse_integer_value, parse_length_from_stream,
     parse_length_percentage_from_stream, parse_number_from_stream, parse_number_percentage_value, parse_number_value,
     parse_percentage_value, parse_tree_counting_value, parse_url_value,
@@ -22,13 +20,15 @@ use crate::css::math_functions::math_function_from_name;
 use crate::css::parser::color_parser::parse_color_value;
 use crate::css::property_metadata::{property_accepted_keywords, property_id};
 use crate::css::style_compute::px_length_unit;
+use crate::css::style_value::{EasingPayload, ShadowPayload, StyleValueBox, TransformationPayload};
 use crate::css::style_value::{
     RetainedLinearEasingStop, RetainedLinearEasingStopList, RetainedStyleValueData, RetainedStyleValueDataList,
     StyleValueData,
 };
-use std::sync::Arc;
+use crate::css::style_value_arc::StyleValueArc;
+use crate::css::value_codes::{VALUE_TYPE_ANGLE, VALUE_TYPE_INTEGER, VALUE_TYPE_NUMBER, VALUE_TYPE_PERCENTAGE};
 
-include!(concat!(env!("OUT_DIR"), "/transform_functions_generated.rs"));
+pub(crate) use crate::css::transform_functions::*;
 
 const PARAMETER_ANGLE: u8 = 0;
 const PARAMETER_LENGTH: u8 = 1;
@@ -42,11 +42,12 @@ fn retained(value: StyleValueData) -> RetainedStyleValueData {
 }
 
 fn transformation(property: u16, transform_function: u8, values: Vec<StyleValueData>) -> StyleValueData {
-    StyleValueData::Transformation {
+    StyleValueData::Transformation(StyleValueBox::new(TransformationPayload {
         property,
         transform_function,
         values: RetainedStyleValueDataList::from_retained_values(values.into_iter().map(retained).collect()),
-    }
+        matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
+    }))
 }
 
 fn value_list(values: Vec<StyleValueData>, separator: u8, collapsible: bool) -> StyleValueData {
@@ -360,9 +361,10 @@ fn easing(
     coordinates: [Option<StyleValueData>; 4],
     number_of_intervals: Option<StyleValueData>,
     step_position: u8,
+    is_keyword: bool,
 ) -> StyleValueData {
     let [x1, y1, x2, y2] = coordinates.map(|value| value.map_or_else(RetainedStyleValueData::none, retained));
-    StyleValueData::Easing {
+    StyleValueData::Easing(StyleValueBox::new(EasingPayload {
         kind,
         linear_stops: RetainedLinearEasingStopList::from_retained_elements(linear_stops),
         x1,
@@ -371,7 +373,8 @@ fn easing(
         y2,
         number_of_intervals: number_of_intervals.map_or_else(RetainedStyleValueData::none, retained),
         step_position,
-    }
+        is_keyword,
+    }))
 }
 
 fn parse_numeric_component(
@@ -449,7 +452,7 @@ fn parse_linear_easing(context: &ParseContext, property: u16, values: &[Componen
             }
         }
     }
-    (!stops.is_empty()).then(|| easing(0, stops, [None, None, None, None], None, 0))
+    (!stops.is_empty()).then(|| easing(0, stops, [None, None, None, None], None, 0, false))
 }
 
 fn parse_cubic_bezier_easing(
@@ -491,6 +494,7 @@ fn parse_cubic_bezier_easing(
         ],
         None,
         0,
+        false,
     ))
 }
 
@@ -526,6 +530,7 @@ fn parse_steps_easing(context: &ParseContext, property: u16, values: &[Component
         [None, None, None, None],
         Some(intervals),
         position,
+        false,
     ))
 }
 
@@ -553,6 +558,7 @@ fn parse_easing_value(context: &ParseContext, property: u16, values: &[Component
             [None, None, None, None],
             Some(StyleValueData::Integer { value: 1 }),
             position,
+            true,
         ));
     }
     let (name, arguments) = value[0].function()?;
@@ -655,7 +661,7 @@ fn parse_drop_shadow(context: &ParseContext, property: u16, values: &[ComponentV
     Some(filter(
         1,
         0,
-        StyleValueData::Shadow {
+        StyleValueData::Shadow(StyleValueBox::new(ShadowPayload {
             shadow_type: 1,
             color: color.map_or_else(RetainedStyleValueData::none, retained),
             offset_x: retained(offset_x),
@@ -663,7 +669,7 @@ fn parse_drop_shadow(context: &ParseContext, property: u16, values: &[ComponentV
             blur_radius: blur_radius.map_or_else(RetainedStyleValueData::none, retained),
             spread_distance: RetainedStyleValueData::none(),
             placement: 0,
-        },
+        })),
     ))
 }
 
@@ -812,7 +818,9 @@ pub(crate) fn parse_transform_effect_property(
         //     this parser does not have the context needed to parse it.
         return ParseOutcome::NotHandled;
     }
-    parsed.map_or(ParseOutcome::Invalid, |value| ParseOutcome::Parsed(Arc::new(value)))
+    parsed.map_or(ParseOutcome::Invalid, |value| {
+        ParseOutcome::Parsed(StyleValueArc::new(value))
+    })
 }
 
 #[cfg(test)]
@@ -821,23 +829,8 @@ mod tests {
     use crate::css::css_tokenizer::tokenize_for_parser;
     use crate::css::parser::component_value::consume_a_list_of_component_values;
 
-    fn context() -> ParseContext {
-        ParseContext {
-            in_quirks_mode: false,
-            is_svg_presentation_attribute: false,
-            is_substituted_value: false,
-            contains_attr_tainted_values: false,
-            is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index: std::ptr::null_mut(),
-        }
+    fn context() -> ParseContext<'static> {
+        ParseContext::default()
     }
 
     fn parse(property: u16, source: &str) -> ParseOutcome {

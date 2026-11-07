@@ -6,13 +6,15 @@
     test(() => {
         const style = addStyle(document.head, `.leaf { ${MATCH_DECLARATION} }`);
 
+        internals.updateStyle();
+
         function sharedWhileAdding(build) {
             const box = makeElement("section");
             build(box);
             document.body.append(box);
             resetStyleCounters();
             internals.updateStyle();
-            const shared = styleCounters().elementStyleSharedComputations;
+            const shared = internals.styleCounters().sharedElements;
             const probe = readProbe(box.firstChild);
             box.remove();
             internals.updateStyle();

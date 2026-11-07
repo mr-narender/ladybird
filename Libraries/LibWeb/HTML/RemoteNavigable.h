@@ -38,7 +38,7 @@ public:
     void set_provisional_navigable(GC::Ptr<LocalNavigable> navigable) { m_provisional_navigable = navigable; }
 
     virtual bool has_been_destroyed() const override { return m_has_been_destroyed; }
-    virtual void set_has_been_destroyed() override { m_has_been_destroyed = true; }
+    virtual void set_has_been_destroyed() override;
 
     Optional<Web::CompositorContextId> compositor_context_id() const { return m_replicated_state.compositor_context_id; }
 
@@ -47,12 +47,15 @@ public:
     void set_window_proxy(GC::Ref<WindowProxy> window_proxy) { m_window_proxy = window_proxy; }
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#is-closing
-    bool is_closing() const { return m_replicated_state.is_closing; }
+    bool is_closing() const { return m_closing || m_replicated_state.is_closing; }
+    void set_closing(bool value) { m_closing = value; }
+    bool is_script_closable() const;
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigable
     Vector<GC::Root<Navigable>> document_tree_child_navigables();
 
     virtual GC::Ptr<WindowProxy> active_window_proxy() override;
+    GC::Ref<WindowProxy> active_window_proxy_in_realm_of(Window&);
     GC::Ref<RemoteWindow> active_window();
     virtual Utf16String const& target_name() const override { return m_replicated_state.target_name; }
     virtual Optional<u64> browsing_context_group_id() const override { return m_replicated_state.browsing_context_group_id; }
@@ -71,7 +74,9 @@ public:
     virtual bool active_document_has_cross_site_ancestor() const override { return m_replicated_state.has_cross_site_ancestor; }
     virtual OpenerPolicy const& active_document_opener_policy() const override { return m_replicated_state.opener_policy; }
     virtual bool active_browsing_context_is_auxiliary() const override { return m_replicated_state.active_browsing_context_is_auxiliary; }
-    virtual GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const override;
+    GC::Ptr<WindowProxy> active_browsing_context_opener_window_proxy() const;
+    virtual GC::Ptr<Navigable> active_browsing_context_opener_navigable() const override;
+    virtual GC::Ptr<Navigable> active_browsing_context_one_permitted_sandboxed_navigator() const override;
     virtual ReplicatedContainerState container_state() const override;
 
     virtual bool has_session_history_entry_and_ready_for_navigation() const override;
@@ -95,9 +100,10 @@ private:
     GC::Ptr<WindowProxy> m_window_proxy;
     GC::Ptr<RemoteWindow> m_active_window;
 
-    mutable GC::Ptr<WindowProxy> m_active_browsing_context_opener_window_proxy;
-
     GC::Ptr<LocalNavigable> m_provisional_navigable;
+
+    // Set by window.close() here, before the process hosting the navigable replicates its own.
+    bool m_closing { false };
 
     bool m_has_been_destroyed { false };
 };

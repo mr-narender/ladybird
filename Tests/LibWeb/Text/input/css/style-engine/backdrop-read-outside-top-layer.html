@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    #target::backdrop { --own: backdrop; color: rgb(0, 128, 0); }
+</style>
+<dialog id="target"></dialog>
+<script>
+    test(() => {
+        // A ::backdrop outside the top layer generates no box, but a read of it computes it as its
+        // rules say, before and after the dialog was in the top layer.
+        const target = document.getElementById("target");
+        const read = label => {
+            internals.updateStyle();
+            const style = getComputedStyle(target, "::backdrop");
+            const values = `--own ${style.getPropertyValue("--own")}, color ${style.color}`;
+            println(`${label}: ${values}`);
+        };
+        read("never shown");
+        target.showModal();
+        read("modal");
+        target.close();
+        read("closed");
+    });
+</script>

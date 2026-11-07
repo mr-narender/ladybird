@@ -6,6 +6,7 @@
 
 //! CSS selector parsing.
 
+use crate::css::ffi_support::OwnedBox;
 use std::sync::Arc;
 
 use super::css_tokenizer::{CssNumberType, ParserTokenKind, TokenizerInput, tokenize_for_parser};
@@ -13,16 +14,21 @@ use super::ffi_support::FfiUtf16View;
 use super::ffi_support::ascii_lowercase;
 use super::parser::component_value::{ComponentKind, ComponentValue, consume_a_list_of_component_values};
 use super::parser::token_stream::TokenStream as Stream;
-use super::retained_fly_string::RetainedUtf16FlyString;
+#[cfg(test)]
+use super::selector::FfiStringView;
 use super::selector::{
-    AnPlusBPattern, AttributeCaseType, AttributeMatchType, Combinator, Direction, LanguageRange, NamespaceType,
+    AnPlusBPattern, AttributeCaseType, AttributeMatchType, Combinator, Direction, NamespaceType,
     PseudoClassParameterType, PseudoClassType, PseudoElementParameterType, PseudoElementType, SelectorString,
 };
-use super::selector::{
-    AttributeSelector, CompiledSelector, CompoundSelector, NameSelector, PseudoClassSelector, PseudoElementSelector,
-    PseudoElementValue, QualifiedName, SelectorList, SimpleSelector,
+use super::selector::{NameSelector, QualifiedName, RustSelector, SelectorListRef, SelectorRef};
+use super::selector_tree::{
+    AttributeSelector, CompiledSelector, CompoundSelector, LanguageRange, PseudoClassSelector, PseudoElementSelector,
+    PseudoElementValue, SelectorList, SimpleSelector, TransitionNameAndClassSelector, TransitionNameSelector,
+    search_text_match_filter,
 };
-use super::selector::{FfiStringView, RustSelector};
+use crate::css::retained_fly_string::RetainedUtf16FlyString;
+use crate::css::style::AtomLease;
+use crate::css::style::index::StyleAtomID;
 
 const MAXIMUM_SELECTOR_NESTING_DEPTH: usize = 128;
 
@@ -33,6 +39,7 @@ pub(crate) enum SelectorType {
 }
 
 pub use super::ffi_support::StyleNestingParent;
+use super::selector_arena::{NestingTarget, RuleOrdinal};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectorParsingMode {
@@ -60,16 +67,6 @@ fn lowercase(value: &[u16]) -> SelectorString {
         .into()
 }
 
-fn selector_name(value: &[u16]) -> NameSelector {
-    let name = RetainedUtf16FlyString::from_utf16(value);
-    let lowercase_name = if value.iter().all(|&unit| ascii_lowercase(unit) == unit) {
-        name.clone()
-    } else {
-        RetainedUtf16FlyString::from_utf16(&value.iter().map(|&unit| ascii_lowercase(unit)).collect::<Vec<_>>())
-    };
-    NameSelector { name, lowercase_name }
-}
-
 fn pseudo_class_selector(pseudo_class: PseudoClassType) -> PseudoClassSelector {
     PseudoClassSelector {
         pseudo_class,
@@ -78,8 +75,7 @@ fn pseudo_class_selector(pseudo_class: PseudoClassType) -> PseudoClassSelector {
         languages: Box::new([]),
         direction: None,
         identifier: None,
-        identifier_identity: RetainedUtf16FlyString::none(),
-        identifier_lowercase_identity: RetainedUtf16FlyString::none(),
+        identifier_identity: StyleAtomID::NONE,
         levels: Box::new([]),
         is_forgiving: false,
     }
@@ -311,6 +307,11 @@ struct SelectorParser<'a> {
     declared_namespaces: Option<&'a [TokenizerInput<'a>]>,
     pseudo_class_context: Vec<PseudoClassType>,
     nesting_limit_exceeded: bool,
+    compound_pseudo_element: Option<PseudoElementType>,
+    bare_current_allowed: bool,
+    /// A reference to each name the parse interned, which keeps its atom live until the selector
+    /// naming it leases it.
+    names: std::cell::RefCell<Vec<AtomLease>>,
 }
 
 impl<'a> SelectorParser<'a> {
@@ -319,6 +320,25 @@ impl<'a> SelectorParser<'a> {
             declared_namespaces,
             pseudo_class_context: Vec::new(),
             nesting_limit_exceeded: false,
+            compound_pseudo_element: None,
+            bare_current_allowed: false,
+            names: std::cell::RefCell::default(),
+        }
+    }
+
+    /// The process style atom of the name `value` spells.
+    fn name(&self, value: &[u16]) -> StyleAtomID {
+        let lease = crate::css::style::process_atoms().intern(value);
+        let atom = lease.atom();
+        self.names.borrow_mut().push(lease);
+        atom
+    }
+
+    /// The process style atom of a name a qualified name holds, none for `*`, which names any.
+    fn qualified_name_part(&self, value: &[u16]) -> StyleAtomID {
+        match value == [b'*' as u16] {
+            true => StyleAtomID::NONE,
+            false => self.name(value),
         }
     }
 
@@ -448,6 +468,64 @@ impl<'a> SelectorParser<'a> {
         {
             return Err(());
         }
+        for compound in &compounds {
+            if !matches!(compound.simple_selectors.first(), Some(SimpleSelector::PseudoElement(pseudo_element))
+                if pseudo_element.pseudo_element == PseudoElementType::SearchText)
+            {
+                continue;
+            }
+            match &compound.simple_selectors[1..] {
+                [] => {}
+                [filter] if search_text_match_filter(filter).is_some() => {}
+                _ => return Err(()),
+            }
+        }
+        for compound in &compounds {
+            let Some(SimpleSelector::PseudoElement(pseudo_element)) = compound.simple_selectors.first() else {
+                continue;
+            };
+            // https://drafts.csswg.org/css-shadow-1/#slotted-pseudo
+            // INTEROP: Selectors 4 permits logical and user action pseudo-classes after pseudo-elements, but
+            //          browsers require these tests inside the ::slotted() argument.
+            if pseudo_element.pseudo_element == PseudoElementType::Slotted && compound.simple_selectors.len() > 1 {
+                return Err(());
+            }
+            // https://drafts.csswg.org/css-pseudo-4/#highlight-selectors
+            // INTEROP: Selectors 4 allows logical combination and user action pseudo-classes after any
+            //          pseudo-element, but browsers reject every simple selector after a highlight pseudo-element.
+            //          ::search-text is checked above, as it allows :current.
+            if matches!(
+                pseudo_element.pseudo_element,
+                PseudoElementType::Highlight | PseudoElementType::Selection | PseudoElementType::SpellingError
+            ) && compound.simple_selectors.len() > 1
+            {
+                return Err(());
+            }
+            // https://drafts.csswg.org/css-view-transitions-1/#pseudo-root
+            // If a descendant pseudo of a pseudo-element root has no other siblings, then :only-child matches that
+            // pseudo.
+            // INTEROP: Selectors 4 allows logical combination and user action pseudo-classes after any
+            //          pseudo-element, but browsers reject every pseudo-class other than :only-child after a view
+            //          transition pseudo-element, and none at all after ::view-transition.
+            let allows_only_child = match pseudo_element.pseudo_element {
+                PseudoElementType::ViewTransition => false,
+                PseudoElementType::ViewTransitionGroup
+                | PseudoElementType::ViewTransitionImagePair
+                | PseudoElementType::ViewTransitionNew
+                | PseudoElementType::ViewTransitionOld => true,
+                _ => continue,
+            };
+            let is_only_child = |simple_selector: &SimpleSelector| {
+                matches!(simple_selector, SimpleSelector::PseudoClass(pseudo_class)
+                    if pseudo_class.pseudo_class == PseudoClassType::OnlyChild)
+            };
+            if !compound.simple_selectors[1..]
+                .iter()
+                .all(|simple_selector| allows_only_child && is_only_child(simple_selector))
+            {
+                return Err(());
+            }
+        }
         Ok(CompiledSelector::new(compounds.into_boxed_slice()))
     }
 
@@ -467,13 +545,11 @@ impl<'a> SelectorParser<'a> {
                 stream.position = original;
                 return None;
             }
-            let NameSelector { name, lowercase_name } = selector_name(parsed_name);
-            return Some(QualifiedName {
-                namespace_type: NamespaceType::None,
-                namespace: RetainedUtf16FlyString::none(),
-                lowercase_name,
-                name,
-            });
+            return Some(QualifiedName::new(
+                NamespaceType::None,
+                StyleAtomID::NONE,
+                self.qualified_name_part(parsed_name),
+            ));
         }
 
         let Some(first_name) = name(first) else {
@@ -506,29 +582,25 @@ impl<'a> SelectorParser<'a> {
                 stream.position = original;
                 return None;
             }
-            let NameSelector { name, lowercase_name } = selector_name(parsed_name);
-            return Some(QualifiedName {
+            return Some(QualifiedName::new(
                 namespace_type,
-                namespace: if namespace_type == NamespaceType::Named {
-                    RetainedUtf16FlyString::from_utf16(first_name)
+                if namespace_type == NamespaceType::Named {
+                    self.name(first_name)
                 } else {
-                    RetainedUtf16FlyString::none()
+                    StyleAtomID::NONE
                 },
-                lowercase_name,
-                name,
-            });
+                self.qualified_name_part(parsed_name),
+            ));
         }
         if !allow_wildcard && first_name == [b'*' as u16] {
             stream.position = original;
             return None;
         }
-        let NameSelector { name, lowercase_name } = selector_name(first_name);
-        Some(QualifiedName {
-            namespace_type: NamespaceType::Default,
-            namespace: RetainedUtf16FlyString::none(),
-            lowercase_name,
-            name,
-        })
+        Some(QualifiedName::new(
+            NamespaceType::Default,
+            StyleAtomID::NONE,
+            self.qualified_name_part(first_name),
+        ))
     }
 
     fn next_is_pseudo_element(&self, stream: &Stream<'_>) -> bool {
@@ -562,13 +634,11 @@ impl<'a> SelectorParser<'a> {
 
         let original = stream.position;
         if let Some(qualified_name) = self.parse_qualified_name(stream, true) {
-            return Ok(Some(
-                if qualified_name.name == RetainedUtf16FlyString::from_utf16(&[b'*' as u16]) {
-                    SimpleSelector::Universal(Box::new(qualified_name))
-                } else {
-                    SimpleSelector::TagName(Box::new(qualified_name))
-                },
-            ));
+            return Ok(Some(if qualified_name.name.is_none() {
+                SimpleSelector::Universal(Box::new(qualified_name))
+            } else {
+                SimpleSelector::TagName(Box::new(qualified_name))
+            }));
         }
         stream.position = original;
 
@@ -590,10 +660,10 @@ impl<'a> SelectorParser<'a> {
         }
         if first.is_delim(b'.') {
             let class_name = stream.next().and_then(ComponentValue::ident).ok_or(())?;
-            return Ok(Some(SimpleSelector::Class(selector_name(class_name))));
+            return Ok(Some(SimpleSelector::Class(NameSelector::new(self.name(class_name)))));
         }
         if let ComponentKind::Token(ParserTokenKind::Hash { value, is_id: true }) = &first.kind {
-            return Ok(Some(SimpleSelector::Id(selector_name(value))));
+            return Ok(Some(SimpleSelector::Id(NameSelector::new(self.name(value)))));
         }
         if let Some(values) = first.square_block() {
             return self.parse_attribute(values).map(Some);
@@ -611,7 +681,7 @@ impl<'a> SelectorParser<'a> {
                 match_type: AttributeMatchType::HasAttribute,
                 qualified_name,
                 value: SelectorString::default(),
-                value_identity: RetainedUtf16FlyString::from_utf16(&[]),
+                value_identity: StyleAtomID::NONE,
                 case_type: AttributeCaseType::Default,
             })));
         }
@@ -658,7 +728,7 @@ impl<'a> SelectorParser<'a> {
         Ok(SimpleSelector::Attribute(Box::new(AttributeSelector {
             match_type,
             qualified_name,
-            value_identity: value.to_fly_string(),
+            value_identity: self.name(value.units()),
             value,
             case_type,
         })))
@@ -672,6 +742,12 @@ impl<'a> SelectorParser<'a> {
         if let Some(name) = value.ident() {
             let pseudo_class = PseudoClassType::from_name(name).ok_or(())?;
             if !pseudo_class.metadata().is_valid_as_identifier {
+                return Err(());
+            }
+            if pseudo_class == PseudoClassType::Current
+                && self.compound_pseudo_element != Some(PseudoElementType::SearchText)
+                && !self.bare_current_allowed
+            {
                 return Err(());
             }
             return Ok(SimpleSelector::PseudoClass(Box::new(pseudo_class_selector(
@@ -693,9 +769,14 @@ impl<'a> SelectorParser<'a> {
             return Err(());
         }
 
+        let bare_current_allowed = std::mem::replace(
+            &mut self.bare_current_allowed,
+            pseudo_class == PseudoClassType::Not && self.compound_pseudo_element == Some(PseudoElementType::SearchText),
+        );
         self.pseudo_class_context.push(pseudo_class);
         let result = self.parse_pseudo_class_function(pseudo_class, metadata.parameter_type, function_values);
         self.pseudo_class_context.pop();
+        self.bare_current_allowed = bare_current_allowed;
         result.map(|selector| SimpleSelector::PseudoClass(Box::new(selector)))
     }
 
@@ -743,15 +824,9 @@ impl<'a> SelectorParser<'a> {
                 compound.combinator = Combinator::None;
                 selector.argument_selector_list = Box::new([CompiledSelector::new(Box::new([compound]))]);
             }
-            PseudoClassParameterType::ForgivingSelectorList
-            | PseudoClassParameterType::ForgivingRelativeSelectorList => {
-                let selector_type = if parameter_type == PseudoClassParameterType::ForgivingSelectorList {
-                    SelectorType::Standalone
-                } else {
-                    SelectorType::Relative
-                };
+            PseudoClassParameterType::ForgivingSelectorList => {
                 selector.argument_selector_list =
-                    self.parse_selector_list(values, selector_type, SelectorParsingMode::Forgiving)?;
+                    self.parse_selector_list(values, SelectorType::Standalone, SelectorParsingMode::Forgiving)?;
                 selector.is_forgiving = true;
             }
             PseudoClassParameterType::Ident => {
@@ -769,8 +844,7 @@ impl<'a> SelectorParser<'a> {
                 } else {
                     Direction::Other
                 });
-                selector.identifier_identity = RetainedUtf16FlyString::from_utf16(ident);
-                selector.identifier_lowercase_identity = lowercase(ident).to_fly_string();
+                selector.identifier_identity = self.name(ident);
                 selector.identifier = Some(ident.into());
             }
             PseudoClassParameterType::LanguageRanges => {
@@ -834,6 +908,14 @@ impl<'a> SelectorParser<'a> {
                 };
                 selector.argument_selector_list =
                     self.parse_selector_list(values, selector_type, SelectorParsingMode::Standard)?;
+                if parameter_type == PseudoClassParameterType::SelectorList
+                    && selector
+                        .argument_selector_list
+                        .iter()
+                        .any(|argument| contains_pseudo_element(argument))
+                {
+                    return Err(());
+                }
             }
             PseudoClassParameterType::None => return Err(()),
         }
@@ -902,9 +984,10 @@ impl<'a> SelectorParser<'a> {
             pseudo_element,
             serialized_name: alias.map(|alias| alias.encode_utf16().collect::<Vec<_>>().into()),
             identifier_identities: match &value {
-                PseudoElementValue::Identifiers(identifiers) => {
-                    identifiers.iter().map(SelectorString::to_fly_string).collect()
-                }
+                PseudoElementValue::Identifiers(identifiers) => identifiers
+                    .iter()
+                    .map(|identifier| self.name(identifier.units()))
+                    .collect(),
                 _ => Box::new([]),
             },
             value,
@@ -940,6 +1023,25 @@ impl<'a> SelectorParser<'a> {
                     compound,
                 ]))))
             }
+            // https://drafts.csswg.org/css-pseudo-4/#typedef-highlight-name-selector
+            // <highlight-name-selector> = '*' | <custom-ident>
+            PseudoElementParameterType::HighlightNameSelector => {
+                let argument = stream.next().ok_or(())?;
+                let value = if argument.is_delim(b'*') {
+                    PseudoElementValue::Universal
+                } else {
+                    let name = argument.ident().ok_or(())?;
+                    if is_css_wide_keyword(name) || ascii_eq(name, "default") {
+                        return Err(());
+                    }
+                    PseudoElementValue::Identifiers(Box::new([name.into()]))
+                };
+                stream.discard_whitespace();
+                if !stream.is_empty() {
+                    return Err(());
+                }
+                Ok(value)
+            }
             PseudoElementParameterType::IdentList => {
                 let mut identifiers = Vec::new();
                 while !stream.is_empty() {
@@ -951,39 +1053,82 @@ impl<'a> SelectorParser<'a> {
                 }
                 Ok(PseudoElementValue::Identifiers(identifiers.into_boxed_slice()))
             }
-            PseudoElementParameterType::PTNameSelector => {
-                let (is_universal, value) = if stream.peek().is_some_and(|value| value.is_delim(b'*')) {
-                    stream.position += 1;
-                    (true, SelectorString::default())
-                } else {
-                    let ident = stream.next().and_then(ComponentValue::ident).ok_or(())?;
+            // https://drafts.csswg.org/css-view-transitions-2/#typedef-pt-name-and-class-selector
+            // <pt-name-and-class-selector> = <pt-name-selector> <pt-class-selector>? | <pt-class-selector>
+            // <pt-class-selector> = ['.' <custom-ident>]+
+            // When interpreting the above grammar, white space is forbidden:
+            // * Between <pt-name-selector> and <pt-class-selector>
+            // * Between any of the components of <pt-class-selector>.
+            PseudoElementParameterType::PTNameAndClassSelector => {
+                fn custom_ident(value: Option<&ComponentValue>) -> Result<SelectorString, ()> {
+                    let ident = value.and_then(ComponentValue::ident).ok_or(())?;
                     if is_css_wide_keyword(ident) || ascii_eq(ident, "default") {
                         return Err(());
                     }
-                    (false, ident.into())
+                    Ok(ident.into())
+                }
+
+                // https://drafts.csswg.org/css-view-transitions-1/#typedef-pt-name-selector
+                // <pt-name-selector> = '*' | <custom-ident>
+                let name = if stream.peek().is_some_and(|value| value.is_delim(b'*')) {
+                    stream.position += 1;
+                    Some(TransitionNameSelector::Universal)
+                } else if stream.peek().is_some_and(|value| value.ident().is_some()) {
+                    Some(TransitionNameSelector::Name(custom_ident(stream.next())?))
+                } else {
+                    None
                 };
+
+                let mut classes = Vec::new();
+                while stream.peek().is_some_and(|value| value.is_delim(b'.')) {
+                    stream.position += 1;
+                    classes.push(custom_ident(stream.next())?);
+                }
+                if name.is_none() && classes.is_empty() {
+                    return Err(());
+                }
+
                 stream.discard_whitespace();
                 if !stream.is_empty() {
                     return Err(());
                 }
-                Ok(PseudoElementValue::TransitionName { is_universal, value })
+                Ok(PseudoElementValue::TransitionName(Box::new(
+                    TransitionNameAndClassSelector {
+                        name,
+                        classes: classes.into_boxed_slice(),
+                    },
+                )))
             }
         }
     }
 
     fn parse_compound_selector(&mut self, stream: &mut Stream<'_>) -> Result<CompoundSelector, ()> {
-        let mut simple_selectors = Vec::new();
-        while let Some(simple_selector) = self.parse_simple_selector(stream)? {
-            if matches!(simple_selector, SimpleSelector::TagName(_)) && !simple_selectors.is_empty() {
-                return Err(());
-            }
-            simple_selectors.push(simple_selector);
-        }
+        let outer_pseudo_element = self.compound_pseudo_element.take();
+        let simple_selectors = self.parse_compound_simple_selectors(stream);
+        self.compound_pseudo_element = outer_pseudo_element;
         Ok(CompoundSelector {
             combinator: Combinator::None,
             is_implicit_universal_anchor: false,
-            simple_selectors: simple_selectors.into_boxed_slice(),
+            simple_selectors: simple_selectors?.into_boxed_slice(),
         })
+    }
+
+    fn parse_compound_simple_selectors(&mut self, stream: &mut Stream<'_>) -> Result<Vec<SimpleSelector>, ()> {
+        let mut simple_selectors = Vec::new();
+        while let Some(simple_selector) = self.parse_simple_selector(stream)? {
+            if matches!(
+                simple_selector,
+                SimpleSelector::TagName(_) | SimpleSelector::Universal(_)
+            ) && !simple_selectors.is_empty()
+            {
+                return Err(());
+            }
+            if let SimpleSelector::PseudoElement(pseudo_element) = &simple_selector {
+                self.compound_pseudo_element = Some(pseudo_element.pseudo_element);
+            }
+            simple_selectors.push(simple_selector);
+        }
+        Ok(simple_selectors)
     }
 
     fn parse_combinator(&self, stream: &mut Stream<'_>) -> Option<Combinator> {
@@ -1017,6 +1162,15 @@ impl<'a> SelectorParser<'a> {
     }
 }
 
+fn contains_pseudo_element(selector: &CompiledSelector) -> bool {
+    selector.compound_selectors().iter().any(|compound| {
+        compound
+            .simple_selectors
+            .iter()
+            .any(|simple| matches!(simple, SimpleSelector::PseudoElement(_)))
+    })
+}
+
 fn normalize_pseudo_element_transitions(compounds: Vec<CompoundSelector>) -> Vec<CompoundSelector> {
     if !compounds.iter().any(|compound| {
         compound
@@ -1037,12 +1191,11 @@ fn normalize_pseudo_element_transitions(compounds: Vec<CompoundSelector>) -> Vec
                     normalized.push(CompoundSelector {
                         combinator,
                         is_implicit_universal_anchor: true,
-                        simple_selectors: vec![SimpleSelector::Universal(Box::new(QualifiedName {
-                            namespace_type: NamespaceType::Any,
-                            namespace: RetainedUtf16FlyString::none(),
-                            name: RetainedUtf16FlyString::from_utf16(&[u16::from(b'*')]),
-                            lowercase_name: RetainedUtf16FlyString::from_utf16(&[u16::from(b'*')]),
-                        }))]
+                        simple_selectors: vec![SimpleSelector::Universal(Box::new(QualifiedName::new(
+                            NamespaceType::Any,
+                            StyleAtomID::NONE,
+                            StyleAtomID::NONE,
+                        )))]
                         .into_boxed_slice(),
                     });
                 } else {
@@ -1072,53 +1225,160 @@ pub(crate) fn parse_selector_list<'a>(
     declared_namespaces: &[TokenizerInput<'_>],
     selector_type: SelectorType,
     parsing_mode: SelectorParsingMode,
-) -> Result<SelectorList, ()> {
+) -> Result<ParsedSelectorTree, ()> {
     let tokens = tokenize_for_parser(input);
     let values = consume_a_list_of_component_values(tokens.as_slice())?;
-    SelectorParser::new(Some(declared_namespaces)).parse_selector_list(&values, selector_type, parsing_mode)
+    parse_selector_list_with_mode(&values, declared_namespaces, selector_type, parsing_mode)
+}
+
+fn parse_selector_list_with_mode(
+    values: &[ComponentValue],
+    declared_namespaces: &[TokenizerInput<'_>],
+    selector_type: SelectorType,
+    parsing_mode: SelectorParsingMode,
+) -> Result<ParsedSelectorTree, ()> {
+    let mut parser = SelectorParser::new(Some(declared_namespaces));
+    let selectors = parser.parse_selector_list(values, selector_type, parsing_mode)?;
+    Ok(ParsedSelectorTree {
+        selectors,
+        _names: parser.names.into_inner(),
+    })
 }
 
 pub(crate) fn parse_selector_list_from_component_values(
     values: &[ComponentValue],
     declared_namespaces: &[TokenizerInput<'_>],
     selector_type: SelectorType,
-) -> Result<RustParsedSelectorList, ()> {
-    let selectors = SelectorParser::new(Some(declared_namespaces)).parse_selector_list(
+) -> Result<ParsedSelectorTree, ()> {
+    parse_selector_list_with_mode(
         values,
+        declared_namespaces,
         selector_type,
         SelectorParsingMode::Standard,
-    )?;
-    Ok(RustParsedSelectorList::new(selectors))
+    )
 }
 
-fn parse_pseudo_element_selector(input: TokenizerInput<'_>) -> Result<(Arc<CompiledSelector>, PseudoElementType), ()> {
+/// A selector list as the parser built it, with the names it interned, before it is packed into
+/// the arena a parsed list keeps.
+pub(crate) struct ParsedSelectorTree {
+    pub(crate) selectors: SelectorList,
+    /// A reference to each name the tree names, until the arena leases them.
+    _names: Vec<AtomLease>,
+}
+
+impl ParsedSelectorTree {
+    pub(crate) fn adapt_for_nesting(mut self, parent: StyleNestingParent) -> Self {
+        if parent == StyleNestingParent::None {
+            return self;
+        }
+        for selector in &mut self.selectors {
+            let first = selector
+                .compound_selectors()
+                .first()
+                .map_or(Combinator::None, |compound| compound.combinator);
+            let insert_nesting = parent == StyleNestingParent::Style
+                && (!matches!(first, Combinator::None | Combinator::Descendant)
+                    || !super::selector_operations::contains_nesting(selector));
+            if insert_nesting {
+                *selector = super::selector_operations::relative_to(selector, SimpleSelector::Nesting);
+            } else if first == Combinator::Descendant {
+                let mut compounds = selector.to_compounds();
+                compounds[0].combinator = Combinator::None;
+                *selector = CompiledSelector::new(compounds);
+            }
+        }
+        self
+    }
+
+    pub(crate) fn contains_pseudo_element(&self) -> bool {
+        self.selectors
+            .iter()
+            .any(|selector| super::selector_tree::target_pseudo_element(selector).is_some())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.selectors.is_empty()
+    }
+
+    /// The list, packed into an arena of its own, for a rule nested in `nesting_parent`. A `&`
+    /// naming a style rule is bound to it as the rule is placed.
+    pub(crate) fn into_list(self, nesting_parent: StyleNestingParent) -> RustParsedSelectorList {
+        self.into_list_declaring(nesting_parent, super::selector_arena::NamespaceDeclarations::default())
+    }
+
+    /// As [`Self::into_list`], for the selectors of a style rule of a sheet declaring `declarations`.
+    pub(crate) fn into_list_declaring(
+        self,
+        nesting_parent: StyleNestingParent,
+        declarations: super::selector_arena::NamespaceDeclarations,
+    ) -> RustParsedSelectorList {
+        let nesting = match nesting_parent {
+            StyleNestingParent::None => NestingTarget::Root,
+            StyleNestingParent::Scope => NestingTarget::Scope,
+            StyleNestingParent::Style => NestingTarget::Unbound,
+        };
+        let mut builder = super::selector_arena::SheetSelectorsBuilder::default();
+        builder.declare_namespaces(declarations);
+        RustParsedSelectorList {
+            selectors: builder.push(&self.selectors, self._names, nesting),
+        }
+    }
+
+    /// The selectors of a style rule, packed into the arena `selectors` builds, which it reads once
+    /// that is frozen, with the ordinal a `&` names the rule by there.
+    pub(crate) fn into_rule_list_in(
+        self,
+        selectors: &mut super::selector_arena::SheetSelectorsBuilder,
+        nesting: NestingTarget,
+    ) -> (RustParsedSelectorList, Option<RuleOrdinal>) {
+        let (selectors, ordinal) = selectors.push_rule(&self.selectors, self._names, nesting);
+        (RustParsedSelectorList { selectors }, ordinal)
+    }
+}
+
+fn parse_pseudo_element_selector(
+    input: TokenizerInput<'_>,
+    for_computed_style: bool,
+) -> Result<(SelectorRef, PseudoElementType), ()> {
     let tokens = tokenize_for_parser(input);
     let values = consume_a_list_of_component_values(tokens.as_slice())?;
     let mut stream = Stream::new(&values);
-    let simple = SelectorParser::new(Some(&[])).parse_pseudo_element(&mut stream)?;
+    // NB: The parser holds the names it interned until the selector built below leases them.
+    let mut parser = SelectorParser::new(Some(&[]));
+    let simple = parser.parse_pseudo_element(&mut stream)?;
     if !stream.is_empty() {
         return Err(());
     }
     let SimpleSelector::PseudoElement(pseudo_element) = &simple else {
         unreachable!();
     };
+    // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
+    // Parse pseudoElt as a <pseudo-element-selector>, and let type be the result.
+    // NB: Computed style lookup identifies one pseudo-element, so a view-transition argument must name it exactly.
+    if for_computed_style
+        && let PseudoElementValue::TransitionName(argument) = &pseudo_element.value
+        && (!matches!(argument.name, Some(TransitionNameSelector::Name(_))) || !argument.classes.is_empty())
+    {
+        return Err(());
+    }
     let pseudo_element_type = pseudo_element.pseudo_element;
-    Ok((
-        CompiledSelector::new(
-            normalize_pseudo_element_transitions(vec![CompoundSelector {
-                combinator: Combinator::None,
-                is_implicit_universal_anchor: false,
-                simple_selectors: Box::new([simple]),
-            }])
-            .into_boxed_slice(),
-        ),
-        pseudo_element_type,
-    ))
+    let selector = CompiledSelector::new(
+        normalize_pseudo_element_transitions(vec![CompoundSelector {
+            combinator: Combinator::None,
+            is_implicit_universal_anchor: false,
+            simple_selectors: Box::new([simple]),
+        }])
+        .into_boxed_slice(),
+    );
+    let list = SelectorListRef::pack(&[selector]);
+    let selector = list.owned().next().expect("the list holds the selector");
+    Ok((selector, pseudo_element_type))
 }
 
+/// A parsed selector list, in the arena it is packed into.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RustParsedSelectorList {
-    pub(crate) selectors: SelectorList,
+    pub(crate) selectors: SelectorListRef,
 }
 
 // Parsed selectors and their interned names can be shared across threads.
@@ -1128,53 +1388,16 @@ const _: fn() = || {
 };
 
 impl RustParsedSelectorList {
-    pub(crate) fn adapt_for_nesting(mut self, parent: StyleNestingParent) -> Self {
-        if parent == StyleNestingParent::None {
-            return self;
-        }
-        for selector in &mut self.selectors {
-            let first = selector
-                .compound_selectors
-                .first()
-                .map_or(Combinator::None, |compound| compound.combinator);
-            let insert_nesting = parent == StyleNestingParent::Style
-                && (!matches!(first, Combinator::None | Combinator::Descendant)
-                    || !super::selector_operations::contains_nesting(selector));
-            if insert_nesting {
-                *selector = super::selector_operations::relative_to(selector, SimpleSelector::Nesting);
-            } else if first == Combinator::Descendant {
-                let mut compounds = selector.compound_selectors.clone();
-                compounds[0].combinator = Combinator::None;
-                *selector = CompiledSelector::new(compounds);
-            }
-        }
-        self
-    }
-
-    pub(crate) fn new(selectors: SelectorList) -> Self {
-        Self { selectors }
-    }
-
     #[cfg(test)]
-    pub(crate) fn selectors(&self) -> &SelectorList {
+    pub(crate) fn selectors(&self) -> &SelectorListRef {
         &self.selectors
-    }
-
-    pub(crate) fn contains_pseudo_element(&self) -> bool {
-        self.selectors
-            .iter()
-            .any(|selector| selector.target_pseudo_element.is_some())
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.selectors.is_empty()
     }
 }
 
 /// # Safety
 /// `input` and each namespace view must point to readable storage for the duration of this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_parse(
+#[cfg(test)]
+pub(crate) unsafe fn selector_parse(
     input: FfiUtf16View,
     namespaces: *const FfiStringView,
     namespace_count: usize,
@@ -1195,19 +1418,17 @@ pub unsafe extern "C" fn rust_selector_parse(
     .map_or(std::ptr::null_mut(), |selectors| Box::into_raw(Box::new(selectors)))
 }
 
-/// # Safety
-/// Input and the optional immutable namespace context must be readable for this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_parse_with_namespace_context(
+pub extern "C" fn rust_selector_parse_with_namespace_context(
     input: FfiUtf16View,
-    namespaces: *const std::ffi::c_void,
+    namespaces: Option<&crate::css::rule::NativeNamespaceContext>,
     is_relative: bool,
     is_forgiving: bool,
 ) -> *mut RustParsedSelectorList {
-    let Some(input) = (unsafe { input.units() }) else {
+    let Some(input) = input.units() else {
         return std::ptr::null_mut();
     };
-    let namespaces = unsafe { namespaces.cast::<crate::css::rule::NativeNamespaceContext>().as_ref() };
+    let declarations = namespaces.map(crate::css::rule::NativeNamespaceContext::declarations);
     let namespaces: Vec<_> = namespaces
         .into_iter()
         .flat_map(|namespaces| namespaces.prefixes.iter())
@@ -1228,10 +1449,13 @@ pub unsafe extern "C" fn rust_selector_parse_with_namespace_context(
         },
     )
     .map_or(std::ptr::null_mut(), |selectors| {
-        Box::into_raw(Box::new(RustParsedSelectorList::new(selectors)))
+        Box::into_raw(Box::new(
+            selectors.into_list_declaring(StyleNestingParent::None, declarations.unwrap_or_default()),
+        ))
     })
 }
 
+#[cfg(test)]
 pub(crate) unsafe fn parse_selector_list_from_ffi(
     input: FfiUtf16View,
     namespaces: *const FfiStringView,
@@ -1246,7 +1470,7 @@ pub(crate) unsafe fn parse_selector_list_from_ffi(
             &[]
         } else {
             assert!(!namespaces.is_null());
-            std::slice::from_raw_parts(namespaces, namespace_count)
+            ak::slice_from_raw_parts(namespaces, namespace_count)
         };
         let namespace_storage = namespace_views
             .iter()
@@ -1255,7 +1479,7 @@ pub(crate) unsafe fn parse_selector_list_from_ffi(
                     TokenizerInput::Utf16(&[])
                 } else {
                     assert!(!namespace.data.is_null());
-                    TokenizerInput::Utf16(std::slice::from_raw_parts(namespace.data, namespace.length))
+                    TokenizerInput::Utf16(ak::slice_from_raw_parts(namespace.data, namespace.length))
                 }
             })
             .collect::<Vec<_>>();
@@ -1275,7 +1499,7 @@ pub(crate) unsafe fn parse_selector_list_from_ffi(
         ) else {
             return None;
         };
-        Some(RustParsedSelectorList::new(selectors).adapt_for_nesting(nesting_parent))
+        Some(selectors.adapt_for_nesting(nesting_parent).into_list(nesting_parent))
     }
 }
 
@@ -1283,64 +1507,52 @@ pub(crate) unsafe fn parse_selector_list_from_ffi(
 pub struct FfiParsedPseudoElement {
     pub selector: *mut RustSelector,
     pub pseudo_element: u8,
+    pub highlight_name: usize,
 }
 
 /// Parses the restricted pseudo-element syntax accepted by `getComputedStyle()` and animation APIs.
-///
-/// # Safety
-/// `input` must contain readable storage for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_selector_parse_pseudo_element(input: FfiUtf16View) -> FfiParsedPseudoElement {
-    unsafe {
-        let Some(input) = input.units() else {
-            return FfiParsedPseudoElement {
-                selector: std::ptr::null_mut(),
-                pseudo_element: u8::MAX,
-            };
-        };
-        let Ok((selector, pseudo_element)) = parse_pseudo_element_selector(input) else {
-            return FfiParsedPseudoElement {
-                selector: std::ptr::null_mut(),
-                pseudo_element: u8::MAX,
-            };
-        };
-        FfiParsedPseudoElement {
-            selector: Box::into_raw(Box::new(RustSelector { selector })),
-            pseudo_element: pseudo_element as u8,
-        }
+pub extern "C" fn rust_selector_parse_pseudo_element(
+    input: FfiUtf16View,
+    for_computed_style: bool,
+) -> FfiParsedPseudoElement {
+    let failure = FfiParsedPseudoElement {
+        selector: std::ptr::null_mut(),
+        pseudo_element: u8::MAX,
+        highlight_name: 0,
+    };
+    let Some(input) = input.units() else {
+        return failure;
+    };
+    let Ok((selector, pseudo_element)) = parse_pseudo_element_selector(input, for_computed_style) else {
+        return failure;
+    };
+    let highlight_name = selector.view().target_highlight_name_text().map_or(0, |name| {
+        std::mem::ManuallyDrop::new(RetainedUtf16FlyString::from_utf16(name)).raw()
+    });
+    FfiParsedPseudoElement {
+        selector: Box::into_raw(Box::new(RustSelector { selector })),
+        pseudo_element: pseudo_element as u8,
+        highlight_name,
     }
 }
 
-/// # Safety
-/// `list` must be null or an owned selector list that has not been destroyed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_destroy(list: *mut RustParsedSelectorList) {
-    unsafe {
-        if !list.is_null() {
-            drop(Box::from_raw(list));
-        }
-    }
+pub extern "C" fn rust_parsed_selector_list_destroy(list: OwnedBox<RustParsedSelectorList>) {
+    drop(list);
 }
 
-/// # Safety
-/// `list` must point to a live parsed selector list.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_length(list: *const RustParsedSelectorList) -> usize {
-    unsafe { (&*list).selectors.len() }
+pub extern "C" fn rust_parsed_selector_list_length(list: &RustParsedSelectorList) -> usize {
+    list.selectors.len()
 }
 
-/// # Safety
-/// `list` must point to a live selector list and `index` must be in bounds.
+/// The selector at `index`, which must be in bounds, as a new selector that C++ owns.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_parsed_selector_list_selector(
-    list: *const RustParsedSelectorList,
-    index: usize,
-) -> *mut RustSelector {
-    unsafe {
-        Box::into_raw(Box::new(RustSelector {
-            selector: (&(*list).selectors)[index].clone(),
-        }))
-    }
+pub extern "C" fn rust_parsed_selector_list_selector(list: &RustParsedSelectorList, index: usize) -> *mut RustSelector {
+    Box::into_raw(Box::new(RustSelector {
+        selector: list.selectors.owned().nth(index).expect("the index is in bounds"),
+    }))
 }
 
 #[cfg(test)]
@@ -1355,12 +1567,8 @@ mod tests {
             length: prefix.len(),
         };
         unsafe {
-            let parsed = rust_selector_parse(
-                FfiUtf16View {
-                    utf16: units.as_ptr(),
-                    length: units.len(),
-                    ..Default::default()
-                },
+            let parsed = selector_parse(
+                FfiUtf16View::from_utf16(&units),
                 &prefix,
                 1,
                 false,
@@ -1372,7 +1580,7 @@ mod tests {
         }
     }
 
-    fn serialize(selector: &Arc<CompiledSelector>) -> Vec<u16> {
+    fn serialize(selector: &SelectorRef) -> Vec<u16> {
         crate::css::selector_serialization::serialize_selector_without_namespaces(&RustSelector {
             selector: selector.clone(),
         })
@@ -1390,13 +1598,18 @@ mod tests {
             let parsed = std::thread::spawn(move || parse(source)).join().unwrap();
             let first = parsed.clone();
             let second = parsed.clone();
-            assert!(Arc::ptr_eq(&first.selectors[0], &second.selectors[0]));
+            let first_selector = first.selectors.owned().next().unwrap();
+            let second_selector = second.selectors.owned().next().unwrap();
+            assert_eq!(first_selector.view(), second_selector.view());
             drop(parsed);
-            let expected = serialize(&first.selectors[0]);
-            assert_eq!(serialize(&second.selectors[0]), expected);
-            assert_eq!(first.selectors[0].specificity(), second.selectors[0].specificity());
-            drop(first);
-            assert_eq!(serialize(&second.selectors[0]), expected);
+            let expected = serialize(&first_selector);
+            assert_eq!(serialize(&second_selector), expected);
+            assert_eq!(
+                first_selector.view().specificity(),
+                second_selector.view().specificity()
+            );
+            drop((first, first_selector));
+            assert_eq!(serialize(&second_selector), expected);
         }
     }
 
@@ -1427,7 +1640,7 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(
-            serialize(&bound.selectors[0]),
+            serialize(&bound.selectors.owned().next().unwrap()),
             "é|DIV#😀:is(.é, :not([data-name=\"😀\"])):nth-child(2n+1 of .item)::part(label)"
                 .encode_utf16()
                 .collect::<Vec<_>>()

@@ -56,9 +56,7 @@ ErrorOr<Compositing::DisplayListFontResource> decode(Decoder& decoder)
     auto variations = TRY(decoder.decode<Gfx::FontVariationSettings>());
     auto features = TRY(decoder.decode<Gfx::ShapeFeatures>());
     auto invisible = TRY(decoder.decode<bool>());
-    auto font = typeface->font(point_size, move(variations), move(features));
-    if (invisible)
-        font = font->invisible_variant();
+    auto font = invisible ? typeface->invisible_font(point_size, variations, features) : typeface->font(point_size, variations, features);
 
     return Compositing::DisplayListFontResource {
         .id = id,
@@ -135,6 +133,9 @@ ErrorOr<Compositing::DisplayListResourceTransaction> decode(Decoder& decoder)
     for (size_t i = 0; i < display_list_count; ++i) {
         auto display_list = TRY(decoder.decode<NonnullRefPtr<Compositing::DisplayList>>());
         auto visual_context_tree = TRY(decoder.decode<Compositing::AccumulatedVisualContextTree>());
+        if (display_list->compatible_visual_context_tree_structural_epoch() != visual_context_tree.structural_epoch())
+            return Error::from_string_literal("Display list resource does not match its visual context tree");
+        TRY(Compositing::validate_display_list_references_live_visual_context_nodes(*display_list, visual_context_tree));
         display_lists.unchecked_append({ move(display_list), move(visual_context_tree) });
     }
 

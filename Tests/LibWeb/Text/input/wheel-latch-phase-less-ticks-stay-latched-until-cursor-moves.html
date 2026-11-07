@@ -17,16 +17,18 @@
 <div id="nested"><div></div></div>
 <script>
     promiseTest(async () => {
-        // A blocking wheel event listener keeps the scrolling of these gestures on the main thread.
+        // A blocking wheel event listener makes the compositor wait for the page before it scrolls these gestures.
         nested.addEventListener("wheel", () => {}, { passive: false });
         await animationFrame();
         await animationFrame();
 
         // Mouse wheel ticks carry no gesture phase; ticks in quick succession at one spot are one gesture, which the
         // nested scroller absorbs once it reaches its extent.
-        await internals.wheel(50, 50, 0, 150);
-        await internals.wheel(50, 50, 0, 150);
-        await internals.wheel(50, 50, 0, 100);
+        await Promise.all([
+            internals.wheel(50, 50, 0, 150),
+            internals.wheel(50, 50, 0, 150),
+            internals.wheel(50, 50, 0, 100),
+        ]);
         println(`nested.scrollTop after three ticks: ${nested.scrollTop}`);
         println(`window.scrollY after three ticks: ${window.scrollY}`);
 

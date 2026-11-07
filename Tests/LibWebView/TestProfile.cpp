@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/ByteBuffer.h>
 #include <AK/LexicalPath.h>
 #include <AK/Time.h>
 #include <LibCore/Directory.h>
@@ -12,10 +11,13 @@
 #include <LibCore/System.h>
 #include <LibDatabase/Database.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibHTTP/Cache/CacheEntry.h>
+#include <LibHTTP/Cache/CacheRequest.h>
 #include <LibHTTP/Cache/DiskCache.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibHTTP/HeaderList.h>
+#include <LibHTTP/NetworkIsolationKey.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
 #include <LibWebView/BookmarkStore.h>
@@ -202,7 +204,7 @@ TEST_CASE(profile_databases_are_isolated)
             .value = "first"_string,
             .expiry_time_from_expires_attribute = UnixDateTime::now() + AK::Duration::from_seconds(3600),
         };
-        cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http);
+        cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, {});
 
         auto hsts_store = TRY_OR_FAIL(WebView::HSTSStore::create(*database));
         hsts_store->store_policy("profile-isolation.example"_string, HTTP::HSTS::ParsedHSTSPolicy { AK::Duration::from_seconds(3600), false });
@@ -260,6 +262,11 @@ TEST_CASE(profile_databases_are_isolated)
     remove_test_root();
 }
 
+struct TestCacheRequest final : public HTTP::CacheRequest {
+    virtual bool is_revalidation_request() const override { return false; }
+    virtual void notify_request_unblocked(Badge<HTTP::DiskCache>) override { }
+};
+
 TEST_CASE(profile_caches_are_isolated)
 {
     remove_test_root();
@@ -267,24 +274,39 @@ TEST_CASE(profile_caches_are_isolated)
     auto second_profile = MUST(WebView::Profile::create({ .name = "second" }, roots()));
     auto url = parse_url("https://profile-isolation.example/script.js"sv);
     auto request_headers = HTTP::HeaderList::create({});
-    auto bytecode = TRY_OR_FAIL(ByteBuffer::copy("first-profile-bytecode"sv.bytes()));
+    auto response_headers = HTTP::HeaderList::create({ { "Cache-Control"sv, "max-age=60"sv } });
+    auto partition = HTTP::NetworkIsolationKey {
+        .top_level_site = "https://profile-isolation.example"_utf16,
+        .frame_site = "https://profile-isolation.example"_utf16,
+    }
+                         .disk_cache_partition()
+                         .release_value();
+
+    TestCacheRequest request;
+    auto has_stored_response = [&](HTTP::DiskCache& cache) {
+        return cache.open_entry(request, partition, url, "GET"sv, *request_headers, HTTP::CacheMode::Default, HTTP::DiskCache::OpenMode::Read)
+            .visit(
+                [](Optional<HTTP::CacheEntryReader&> reader) { return reader.has_value(); },
+                [](HTTP::DiskCache::CacheHasOpenEntry) { return false; });
+    };
 
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { first_profile.paths().cache })).release_value();
-        EXPECT(TRY_OR_FAIL(cache.create_synthetic_entry(url, "GET"sv)));
-        EXPECT(TRY_OR_FAIL(cache.store_associated_data(url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode, bytecode.bytes())));
+        auto writer = cache.create_entry(request, partition, url, "GET"sv, *request_headers, UnixDateTime::now()).get<Optional<HTTP::CacheEntryWriter&>>();
+        VERIFY(writer.has_value());
+        TRY_OR_FAIL(writer->write_status_and_reason(200, "OK"_string, *request_headers, *response_headers));
+        TRY_OR_FAIL(writer->write_data("first-profile-script"sv.bytes()));
+        TRY_OR_FAIL(writer->flush(request_headers));
     }
 
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { second_profile.paths().cache })).release_value();
-        EXPECT(!TRY_OR_FAIL(cache.retrieve_associated_data(url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode)).has_value());
+        EXPECT(!has_stored_response(cache));
     }
 
     {
         auto cache = TRY_OR_FAIL(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Normal, LexicalPath { first_profile.paths().cache })).release_value();
-        auto retrieved_bytecode = TRY_OR_FAIL(cache.retrieve_associated_data(url, "GET"sv, *request_headers, {}, HTTP::CacheEntryAssociatedData::JavaScriptBytecode));
-        VERIFY(retrieved_bytecode.has_value());
-        EXPECT_EQ(retrieved_bytecode->bytes(), bytecode.bytes());
+        EXPECT(has_stored_response(cache));
     }
 
     remove_test_root();

@@ -15,20 +15,19 @@ use crate::css::css_enums::{
     scroll_snap_align, scroll_snap_axis, scroll_snap_stop, scroll_snap_strictness, writing_mode,
 };
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
-use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::chrome_geometry::{maximum_scroll_offset, minimum_scroll_offset};
 use crate::painting::host::{FfiSnapAreaGeometry, FfiSnapAxes, FfiSnapContainerGeometry};
+use crate::painting::paint_read::PaintRead;
 use crate::painting::paintable_geometry;
-use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::style_queries;
 use crate::painting::visual_context::node_values::compute_transform;
 use libgfx_rust::{FloatMatrix4x4, FloatPoint, FloatRect};
 
 /// The box whose style the snap properties of a scroll container come from. The properties
 /// specified on the root element apply to the viewport rather than to its own box.
-fn snap_style_source(arena: &LayoutNodeArena, snap_container: NodeSlotId) -> Option<NodeSlotId> {
+fn snap_style_source(arena: &impl PaintRead, snap_container: NodeSlotId) -> Option<NodeSlotId> {
     if arena.node_kind_if_live(snap_container) == Some(NodeKind::Viewport) {
         document_element_box_under(arena, snap_container)
     } else {
@@ -36,17 +35,17 @@ fn snap_style_source(arena: &LayoutNodeArena, snap_container: NodeSlotId) -> Opt
     }
 }
 
-fn snap_style(arena: &LayoutNodeArena, snap_container: NodeSlotId) -> Option<ComputedValuesView<'_>> {
+fn snap_style(arena: &impl PaintRead, snap_container: NodeSlotId) -> Option<ComputedValuesView<'_>> {
     arena.node_style_if_live(snap_style_source(arena, snap_container)?)
 }
 
 // https://drafts.csswg.org/css-scroll-snap-1/#snap-axis
-pub(crate) fn snap_axes_of_scroll_container(arena: &LayoutNodeArena, snap_container: NodeSlotId) -> FfiSnapAxes {
+pub(crate) fn snap_axes_of_scroll_container(arena: &impl PaintRead, snap_container: NodeSlotId) -> FfiSnapAxes {
     snap_style(arena, snap_container).map_or_else(FfiSnapAxes::default, snap_axes_of_style)
 }
 
 fn snap_axes_of_style(style: ComputedValuesView<'_>) -> FfiSnapAxes {
-    let snap_type = style.misc_reset();
+    let snap_type = style.misc_interaction();
     if snap_type.scroll_snap_strictness == scroll_snap_strictness::NONE {
         return FfiSnapAxes::default();
     }
@@ -66,21 +65,17 @@ fn snap_axes_of_style(style: ComputedValuesView<'_>) -> FfiSnapAxes {
     }
 }
 
-fn document_element_box_under(arena: &LayoutNodeArena, parent: NodeSlotId) -> Option<NodeSlotId> {
-    let mut child = arena.data(parent).first_child.get();
-    while !child.is_invalid() {
+fn document_element_box_under(arena: &impl PaintRead, parent: NodeSlotId) -> Option<NodeSlotId> {
+    arena.children(parent).find_map(|child| {
         let flags = arena.node_flags_if_live(child);
         if flags & NodeFlag::IsDocumentElement as u32 != 0 {
             return Some(child);
         }
-        if flags & NodeFlag::Anonymous as u32 != 0
-            && let Some(found) = document_element_box_under(arena, child)
-        {
-            return Some(found);
+        if flags & NodeFlag::Anonymous as u32 != 0 {
+            return document_element_box_under(arena, child);
         }
-        child = arena.data(child).next_sibling.get();
-    }
-    None
+        None
+    })
 }
 
 // https://drafts.csswg.org/css-scroll-snap-1/#scroll-padding
@@ -88,14 +83,14 @@ fn document_element_box_under(arena: &LayoutNodeArena, parent: NodeSlotId) -> Op
 // scrollport that is used as the alignment container for the scroll snap areas when calculating
 // snap positions.
 pub(crate) fn scroll_snapport_rect(
-    arena: &LayoutNodeArena,
+    arena: &impl PaintRead,
     snap_container: NodeSlotId,
     scrollport: CssPixelRect,
 ) -> CssPixelRect {
     let Some(style) = snap_style(arena, snap_container) else {
         return scrollport;
     };
-    shrink_by_scroll_padding(scrollport, &style.misc_reset().scroll_padding)
+    shrink_by_scroll_padding(scrollport, &style.misc_interaction().scroll_padding)
 }
 
 fn shrink_by_scroll_padding(scrollport: CssPixelRect, scroll_padding: &ComputedLengthBox) -> CssPixelRect {
@@ -121,7 +116,7 @@ fn inflate_by_scroll_margin(rect: CssPixelRect, scroll_margin: &ComputedLengthBo
 
 /// The geometry of a snap container, or `None` for a scroll container that snaps in no axis.
 pub(crate) fn snap_container_geometry(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     snap_container: NodeSlotId,
 ) -> Option<FfiSnapContainerGeometry> {
     if !arena.paintable_row_is_populated(snap_container) {
@@ -135,10 +130,10 @@ pub(crate) fn snap_container_geometry(
     paintable_geometry::scrollable_overflow_rect(arena, snap_container)?;
     let scrollport = paintable_geometry::absolute_padding_box_rect(arena, snap_container);
     Some(FfiSnapContainerGeometry {
-        snapport: shrink_by_scroll_padding(scrollport, &style.misc_reset().scroll_padding).into(),
+        snapport: shrink_by_scroll_padding(scrollport, &style.misc_interaction().scroll_padding).into(),
         min_scroll_offset: minimum_scroll_offset(arena, snap_container).into(),
         max_scroll_offset: maximum_scroll_offset(arena, snap_container).into(),
-        strictness: style.misc_reset().scroll_snap_strictness,
+        strictness: style.misc_interaction().scroll_snap_strictness,
         axes,
         horizontal_writing_mode: style.writing_mode() == writing_mode::HORIZONTAL_TB,
     })
@@ -146,7 +141,7 @@ pub(crate) fn snap_container_geometry(
 
 /// Calls back with the geometry of every snap area the snap container captures, in tree order.
 pub(crate) fn for_each_snap_area(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     snap_container: NodeSlotId,
     mut callback: impl FnMut(NodeSlotId, FfiSnapAreaGeometry),
 ) {
@@ -155,7 +150,7 @@ pub(crate) fn for_each_snap_area(
     };
     let snapport = shrink_by_scroll_padding(
         paintable_geometry::absolute_padding_box_rect(arena, snap_container),
-        &container_style.misc_reset().scroll_padding,
+        &container_style.misc_interaction().scroll_padding,
     );
     let container_writing_mode = WritingModeFacts::of(container_style);
     for_each_descendant_with_snap_alignment(arena, snap_container, &mut |snap_area, style| {
@@ -173,22 +168,20 @@ pub(crate) fn for_each_snap_area(
 }
 
 fn for_each_descendant_with_snap_alignment<'a>(
-    arena: &'a impl PaintableRowsRead,
+    arena: &'a impl PaintRead,
     parent: NodeSlotId,
     callback: &mut impl FnMut(NodeSlotId, ComputedValuesView<'a>),
 ) {
-    let mut child = arena.node_first_child_if_live(parent);
-    while let Some(slot) = child {
+    for slot in arena.children(parent) {
         if let Some(style) = snap_alignment_style(arena, slot) {
             callback(slot, style);
         }
         for_each_descendant_with_snap_alignment(arena, slot, callback);
-        child = arena.node_next_sibling_if_live(slot);
     }
 }
 
 /// The style of a box with a snap alignment that has a committed paintable.
-fn snap_alignment_style(arena: &impl PaintableRowsRead, slot: NodeSlotId) -> Option<ComputedValuesView<'_>> {
+fn snap_alignment_style(arena: &impl PaintRead, slot: NodeSlotId) -> Option<ComputedValuesView<'_>> {
     let kind = arena.node_kind_if_live(slot)?;
     if node_facts::kind_is_text(kind) || !arena.paintable_row_is_populated(slot) {
         return None;
@@ -200,14 +193,14 @@ fn snap_alignment_style(arena: &impl PaintableRowsRead, slot: NodeSlotId) -> Opt
 
 // https://drafts.csswg.org/css-scroll-snap-1/#scroll-snap-area
 fn snap_area_geometry(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     snap_area: NodeSlotId,
     style: ComputedValuesView<'_>,
     snap_container: NodeSlotId,
     snapport: CssPixelRect,
     container_writing_mode: WritingModeFacts,
 ) -> Option<FfiSnapAreaGeometry> {
-    let misc = style.misc_reset();
+    let misc = style.misc_interaction();
     let rect = inflate_by_scroll_margin(
         captured_snap_area_rect(arena, snap_area, snap_container)?,
         &misc.scroll_margin,
@@ -244,7 +237,7 @@ fn snap_area_geometry(
 // outsets.
 /// `None` when the snap container does not capture the area.
 fn captured_snap_area_rect(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     snap_area: NodeSlotId,
     snap_container: NodeSlotId,
 ) -> Option<CssPixelRect> {
@@ -274,11 +267,7 @@ fn captured_snap_area_rect(
     None
 }
 
-fn map_rect_through_node_transform(
-    arena: &impl PaintableRowsRead,
-    node: NodeSlotId,
-    rect: CssPixelRect,
-) -> CssPixelRect {
+fn map_rect_through_node_transform(arena: &impl PaintRead, node: NodeSlotId, rect: CssPixelRect) -> CssPixelRect {
     if !arena.paintable_row_is_populated(node) {
         return rect;
     }

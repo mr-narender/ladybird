@@ -5,11 +5,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/GenericShorthands.h>
 #include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/EmbeddedContentInvalidator.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
+#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
@@ -24,7 +28,6 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Infra/SerializedURL.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
@@ -40,14 +43,17 @@ HTMLIFrameElement::HTMLIFrameElement(DOM::Document& document, DOM::QualifiedName
 
 HTMLIFrameElement::~HTMLIFrameElement() = default;
 
-Layout::Node* HTMLIFrameElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLIFrameElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::NavigableContainerViewport);
+    return CSS::ElementBoxKind::NavigableContainerViewport;
 }
 
 void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     Base::attribute_changed(name, old_value, value, namespace_);
+
+    if (namespace_.has_value())
+        return;
 
     if (name == HTML::AttributeNames::sandbox) {
         if (m_sandbox)
@@ -61,8 +67,12 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
     // Similarly, whenever an iframe element with a non-null content navigable but with no srcdoc attribute specified
     // has its src attribute set, changed, or removed, the user agent must process the iframe attributes.
     if (m_content_navigable) {
-        if (name == AttributeNames::srcdoc || (name == AttributeNames::src && !has_attribute(AttributeNames::srcdoc)))
+        if (name == AttributeNames::srcdoc || (name == AttributeNames::src && !has_attribute(AttributeNames::srcdoc))) {
+            // NB: The UI process creates the permissions policy of the navigable's next document with the container
+            //     policy, which these attributes change through the declared origin.
+            document().page().client().page_did_change_navigable_container_state(m_content_navigable->id(), replicated_container_state());
             process_the_iframe_attributes();
+        }
 
         // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:iframe-sandboxing-flag-set-2
         // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:iframe-sandboxing-flag-set-3
@@ -79,10 +89,27 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
             }
         }
 
-        // A content navigable whose document another process hosts reads the sandbox and referrerpolicy attributes
-        // through its replicated state, which the UI process keeps current from these reports.
-        if (name == AttributeNames::sandbox || name == AttributeNames::referrerpolicy)
+        // A content navigable whose document another process hosts reads these attributes through its replicated
+        // state, which the UI process keeps current from these reports.
+        if (name == AttributeNames::sandbox || name == AttributeNames::referrerpolicy || name == AttributeNames::allow || name == AttributeNames::allowfullscreen)
             document().page().client().page_did_change_navigable_container_state(m_content_navigable->id(), replicated_container_state());
+    }
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#attr-iframe-loading
+    // When the loading attribute's state is changed to the Eager state, the user agent must run these steps:
+    if (name == AttributeNames::loading && lazy_loading_state(old_value) == LazyLoading::Lazy && lazy_loading_state(value) == LazyLoading::Eager) {
+        // 1. Let resumptionSteps be the iframe element's lazy load resumption steps.
+        // 3. Set the iframe's lazy load resumption steps to null.
+        auto resumption_steps = take_lazy_load_resumption_steps_internal();
+
+        // 2. If resumptionSteps is null, then return.
+        if (resumption_steps) {
+            // NB: Only an iframe with lazy load resumption steps is intersection-observed, so this one no longer is.
+            document().stop_intersection_observing_a_lazy_loading_element(*this);
+
+            // 4. Invoke resumptionSteps.
+            resumption_steps->function()();
+        }
     }
 
     if (name == HTML::AttributeNames::width || name == HTML::AttributeNames::height)
@@ -90,10 +117,9 @@ void HTMLIFrameElement::attribute_changed(Utf16FlyString const& name, Optional<U
 
     if (name == HTML::AttributeNames::marginwidth || name == HTML::AttributeNames::marginheight) {
         if (auto* document = this->content_document_without_origin_check()) {
-            if (auto* body_element = document->body()) {
-                auto& mutable_body_element = const_cast<HTMLElement&>(*body_element);
-                mutable_body_element.document().style_computer().style_engine().record_element_style_input_change(mutable_body_element.style_node_id());
-            }
+            // The body's margins are hints mapped from these.
+            if (auto* body_element = document->body())
+                CSS::republish_presentational_hints(const_cast<HTMLElement&>(*body_element));
         }
     }
 }
@@ -212,17 +238,29 @@ void HTMLIFrameElement::removed_from(IsSubtreeRoot is_subtree_root, DOM::Node* o
 
     // When an iframe element is removed from a document, the user agent must destroy the nested navigable of the element.
     destroy_the_child_navigable();
+
+    // AD-HOC: A lazy loading iframe's resumption steps navigate its content navigable, which is gone now. Inserting
+    //         the iframe again processes its attributes, and lazy loads it anew.
+    stop_lazy_loading();
+}
+
+// Stops intersection-observing the iframe as a lazy loading element, and sets its lazy load resumption steps to null.
+// NB: Only an iframe that has lazy load resumption steps is intersection-observed. One without a src never started lazy
+//     loading, and its document can have no lazy load intersection observer to stop.
+void HTMLIFrameElement::stop_lazy_loading()
+{
+    if (take_lazy_load_resumption_steps_internal())
+        document().stop_intersection_observing_a_lazy_loading_element(*this);
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-load-event-steps
 void run_iframe_load_event_steps(HTMLIFrameElement& element)
 {
-    // FIXME: 1. Assert: element's content navigable is not null.
-    if (!element.content_navigable()) {
-        // FIXME: For some reason, we sometimes end up here in the middle of SunSpider.
-        dbgln("FIXME: run_iframe_load_event_steps called with null nested browsing context");
+    // 1. Assert: element's content navigable is not null.
+    // AD-HOC: The steps run from a queued task, and the iframe can be removed from its document before the task runs,
+    //         which destroys its content navigable. There is no load event to fire then.
+    if (!element.content_navigable())
         return;
-    }
 
     // The iframe load event is queued by the child document's completely-finish-loading
     // steps, but the parent's load event must continue to wait while anything in the
@@ -241,8 +279,15 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         }
     }
 
-    // FIXME: 2. Let childDocument be element's content navigable's active document.
-    // FIXME: 3. If childDocument has its mute iframe load flag set, then return.
+    // 2. Let childDocument be element's content navigable's active document.
+    // NB: A document hosted by another process can't be opened from this one, so it is never muted.
+    GC::Ptr<DOM::Document> child_document;
+    if (auto* local_navigable = as_if<LocalNavigable>(*element.content_navigable()))
+        child_document = local_navigable->active_document();
+
+    // 3. If childDocument has its mute iframe load flag set, then return.
+    if (child_document && child_document->mute_iframe_load())
+        return;
 
     // 4. If element's pending resource-timing start time is not null:
     if (element.pending_resource_start_time().has_value()) {
@@ -256,7 +301,8 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         //    start time and whose response end time is the current high resolution time given global.
         auto fallback_timing_info = Fetch::Infrastructure::FetchTimingInfo::create();
         fallback_timing_info->set_start_time(element.pending_resource_start_time().value());
-        fallback_timing_info->set_end_time(HighResolutionTime::current_high_resolution_time(global));
+        // AD-HOC: Use a shared time for the end time too. See the note where the pending start time is set.
+        fallback_timing_info->set_end_time(HighResolutionTime::coarsened_shared_current_time(relevant_settings_object(element).cross_origin_isolated_capability()));
 
         // 4. Mark resource timing given fallbackTimingInfo, the result of parsing element's pending resource-timing
         //    URL, "iframe", global, the empty string, a new response body info, and 0.
@@ -277,12 +323,18 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         element.set_pending_resource_timing_url({});
     }
 
-    // 5. Fire an event named load at element.
+    // 5. Set childDocument's iframe load in progress flag.
+    if (child_document)
+        child_document->set_iframe_load_in_progress(true);
+
+    // 6. Fire an event named load at element.
     element.dispatch_event(DOM::Event::create(
         HTML::EventNames::load,
         HighResolutionTime::current_high_resolution_time(relevant_global_object(element))));
 
-    // FIXME: 7. Unset childDocument's iframe load in progress flag.
+    // 7. Unset childDocument's iframe load in progress flag.
+    if (child_document)
+        child_document->set_iframe_load_in_progress(false);
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
@@ -297,12 +349,22 @@ bool HTMLIFrameElement::is_presentational_hint(Utf16FlyString const& name) const
     if (Base::is_presentational_hint(name))
         return true;
 
-    return name == HTML::AttributeNames::frameborder;
+    return first_is_one_of(name, HTML::AttributeNames::align, HTML::AttributeNames::frameborder);
 }
 
 void HTMLIFrameElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
 {
     Base::apply_presentational_hints(properties);
+
+    // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images
+    // When an embed, iframe, img, or object element, or an input element whose type attribute is in the Image Button state,
+    // has an align attribute whose value is an ASCII case-insensitive match for the string "center" or the string "middle",
+    // the user agent is expected to act as if the element's 'vertical-align' property was set to a value that aligns the
+    // vertical middle of the element with the parent element's baseline.
+    if (auto align = get_attribute(HTML::AttributeNames::align); align.has_value()) {
+        if (align->equals_ignoring_ascii_case(u"center"sv) || align->equals_ignoring_ascii_case(u"middle"sv))
+            properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::LibwebBaselineMiddle) });
+    }
 
     // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images:attr-iframe-frameborder
     // When an iframe element has a frameborder attribute whose value, when parsed using the rules for parsing integers,

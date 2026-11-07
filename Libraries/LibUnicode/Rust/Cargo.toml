@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-allocator = []
+allocator = ["dep:ladybird_allocator"]
 idna = []
 
 [lib]
@@ -14,8 +14,11 @@ crate-type = ["staticlib", "rlib"]
 # After changing dependencies, regenerate the Flatpak sources:
 #   python3 Meta/CMake/flatpak/generate-cargo-sources.py
 [dependencies]
+ak = { path = "../../../AK/Rust" }
 calendrical_calculations = "=0.2.4"
-icu_calendar = { version = "=2.2.1", features = ["compiled_data"] }
+icu_calendar = { version = "=2.3.0", features = ["compiled_data"] }
+ladybird_allocator = { path = "../../RustAllocator", optional = true }
+rustc-demangle = "0.1"
 
 [build-dependencies]
 cbindgen = "0.29"

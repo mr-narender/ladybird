@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibCore/BrowserVersion.h>
 #include <LibCore/GeolocationProvider.h>
 #include <LibMain/Main.h>
 #include <LibWebView/Application.h>
@@ -12,10 +13,12 @@
 #include <LibWebView/Utilities.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/BrowserWindow.h>
+#include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/SystemAppearance.h>
 #if defined(LADYBIRD_QT_HAVE_POSITIONING)
 #    include <UI/Qt/GeolocationProviderQt.h>
 #endif
-#include <UI/Qt/Settings.h>
+#include <UI/Qt/WebContentView.h>
 
 #include <QCoreApplication>
 #include <QStyleHints>
@@ -26,27 +29,11 @@
 #    include <QSurfaceFormat>
 #    include <UI/Qt/ApplicationIcon.h>
 #    include <UI/Qt/MacWindow.h>
+#    include <UI/Qt/SpellCheckerMac.h>
 #endif
-
-namespace Ladybird {
-
-// FIXME: Find a place to put this declaration (and other helper functions).
-bool is_using_dark_system_theme(QWidget&);
-bool is_using_dark_system_theme(QWidget& widget)
-{
-    // Use the explicitly set or system default color scheme whenever available
-    auto color_scheme = QGuiApplication::styleHints()->colorScheme();
-    if (color_scheme != Qt::ColorScheme::Unknown)
-        return color_scheme == Qt::ColorScheme::Dark;
-
-    // Calculate luma based on Rec. 709 coefficients
-    // https://en.wikipedia.org/wiki/Rec._709#Luma_coefficients
-    auto color = widget.palette().color(widget.backgroundRole());
-    auto luma = 0.2126f * color.redF() + 0.7152f * color.greenF() + 0.0722f * color.blueF();
-    return luma <= 0.5f;
-}
-
-}
+#if defined(LADYBIRD_HAS_TRANSLATOR)
+#    include <UI/Qt/TranslatorMac.h>
+#endif
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
@@ -70,6 +57,13 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #endif
 
     auto app = TRY(Ladybird::Application::create(arguments));
+    Ladybird::ChromeStyle::install_application_style();
+#if defined(AK_OS_MACOS)
+    app->set_spell_checker(Ladybird::create_platform_spell_checker());
+#endif
+#if defined(LADYBIRD_HAS_TRANSLATOR)
+    app->set_translator(Ladybird::create_platform_translator());
+#endif
     if (app->should_exit_after_profile_coordination()) {
         outln("Opening in existing process");
         return 0;
@@ -81,6 +75,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
 #if defined(AK_OS_MACOS)
         Ladybird::set_profile_application_icon(Ladybird::Application::profile());
 #endif
+        Ladybird::SystemAppearance::the().apply_interface_theme(Ladybird::Application::settings().appearance().interface_theme);
 
         app->on_open_file = [&](auto const& file_url) {
             if (auto* window = app->non_private_window_if_any()) {
@@ -123,18 +118,19 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             app->new_window(urls, app->configuration_for_new_window());
         };
 
-        auto last_size = Ladybird::Settings::the()->last_size();
-        Ladybird::WindowConfiguration configuration {
-            .width = last_size.width(),
-            .height = last_size.height(),
-            .maximized = Ladybird::Settings::the()->is_maximized(),
-        };
-        if (auto last_position = Ladybird::Settings::the()->last_position(); last_position.has_value()) {
-            configuration.x = last_position->x();
-            configuration.y = last_position->y();
+        auto configuration = app->configuration_for_new_window();
+        if (auto* restored_window = app->restore_previous_session(configuration)) {
+            // A whole restored session replaces the usual startup tab, so only the URLs the user passed open with it.
+            // With only pinned tabs restored, the usual startup tabs open after them.
+            auto restored_everything = app->launch_restore_policy() == WebView::SessionLaunchPolicy::Everything;
+            if (!restored_everything || !browser_options.raw_urls.is_empty())
+                app->open_startup_tabs(*restored_window, browser_options.urls);
+            app->offer_to_restore_unexpectedly_closed_tabs(*restored_window);
+        } else {
+            auto& window = app->new_window(browser_options.urls, configuration);
+            window.setWindowTitle(BROWSER_PRODUCT_NAME);
+            app->offer_to_restore_unexpectedly_closed_tabs(window);
         }
-        auto& window = app->new_window(browser_options.urls, configuration);
-        window.setWindowTitle("Ladybird");
     }
 
     return app->execute();

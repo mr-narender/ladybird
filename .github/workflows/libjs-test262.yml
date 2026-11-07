@@ -17,8 +17,13 @@ jobs:
   run_and_update_results:
     runs-on: 'blacksmith-16vcpu-ubuntu-2404'
     if: github.repository == 'LadybirdBrowser/ladybird'
+    # Master runs check out libjs-data when they start and force-push it with their results appended, so they must not
+    # overlap, or the run that pushes second drops the other's entry. Pull request runs never push, so they don't wait.
+    concurrency:
+      group: ${{ github.ref == 'refs/heads/master' && 'libjs-test262-master' || format('libjs-test262-{0}', github.run_id) }}
+      cancel-in-progress: false
     container:
-      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.08.28
+      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.10.29
 
     steps:
       - name: Checkout LadybirdBrowser/ladybird
@@ -72,6 +77,7 @@ jobs:
           toolchain: 'Clang'
           cache_key_extra: 'test262'
           ccache_path: ${{ steps.setup.outputs.ccache_path }}
+          sccache_path: ${{ steps.setup.outputs.sccache_path }}
           vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
 
       - name: Get previous results
@@ -87,6 +93,7 @@ jobs:
           cmake --preset Release -B libjs-test262/Build \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DENABLE_CI_BASELINE_CPU=ON \
             -DWASM_SPEC_TEST_SKIP_FORMATTING=ON \
             -DINCLUDE_WASM_SPEC_TESTS=ON \
             -DENABLE_GUI_TARGETS=OFF
@@ -98,6 +105,8 @@ jobs:
           arch: 'x86_64'
           ccache_path: ${{ steps.setup.outputs.ccache_path }}
           ccache_primary_key: ${{ steps.cache-restore.outputs.ccache_primary_key }}
+          sccache_path: ${{ steps.setup.outputs.sccache_path }}
+          sccache_primary_key: ${{ steps.cache-restore.outputs.sccache_primary_key }}
           vcpkg_cache_path: ${{ steps.setup.outputs.vcpkg_cache_path }}
           vcpkg_cache_primary_key: ${{ steps.cache-restore.outputs.vcpkg_cache_primary_key }}
 
@@ -144,6 +153,17 @@ jobs:
       - name: Compare Wasm results
         run: ./libjs-test262/per_file_result_diff.py -o old-libjs-data/wasm/per-file-master.json -n libjs-data/wasm/per-file-master.json
 
+      - name: Create libjs-data token
+        id: libjs-data-token
+        if: ${{ github.ref == 'refs/heads/master' }}
+        uses: actions/create-github-app-token@v3.3.0
+        with:
+          client-id: ${{ vars.LIBJS_DATA_APP_CLIENT_ID }}
+          private-key: ${{ secrets.LIBJS_DATA_APP_PRIVATE_KEY }}
+          owner: LadybirdBrowser
+          repositories: libjs-data
+          permission-contents: write
+
       - name: Deploy to GitHub
         if: ${{ github.ref == 'refs/heads/master' }}
         uses: JamesIves/github-pages-deploy-action@v4.9.0
@@ -152,5 +172,5 @@ jobs:
           git-config-email: ladybirdbot@ladybird.org
           branch: master
           repository-name: LadybirdBrowser/libjs-data
-          token: ${{ secrets.LADYBIRD_BOT_TOKEN }}
+          token: ${{ steps.libjs-data-token.outputs.token }}
           folder: libjs-data

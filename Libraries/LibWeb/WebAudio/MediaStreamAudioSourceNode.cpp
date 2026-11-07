@@ -5,10 +5,10 @@
  */
 
 #include <AK/QuickSort.h>
+#include <LibAudio/SpscAudioFrameRing.h>
 #include <LibGC/Heap.h>
-#include <LibMedia/Audio/SpscAudioFrameRing.h>
-#include <LibMedia/AudioBlock.h>
 #include <LibMedia/FFmpeg/FFmpegAudioConverter.h>
+#include <LibMediaCodecs/AudioBlock.h>
 #include <LibWeb/MediaCapture/MediaStream.h>
 #include <LibWeb/MediaCapture/MediaStreamTrack.h>
 #include <LibWeb/WebAudio/AudioContext.h>
@@ -22,7 +22,7 @@ namespace Web::WebAudio {
 GC_DEFINE_ALLOCATOR(MediaStreamAudioSourceNode);
 
 // Drop whole incoming blocks that cannot fit so the producer never mutates the consumer index.
-static void push_frames_if_enough_room(Media::SpscAudioFrameRing& ring, ReadonlySpan<float> interleaved_samples)
+static void push_frames_if_enough_room(Audio::SpscAudioFrameRing& ring, ReadonlySpan<float> interleaved_samples)
 {
     auto channel_count = ring.channel_count();
     auto frame_count = interleaved_samples.size() / channel_count;
@@ -70,6 +70,7 @@ WebIDL::ExceptionOr<GC::Ref<MediaStreamAudioSourceNode>> MediaStreamAudioSourceN
 
     node->queue_render_node_creation(make<Rendering::MediaStreamSourceRenderNode>(node->node_id(), BaseAudioContext::render_quantum_size()));
     node->attach_input_track();
+    context->add_media_stream_source(*node);
 
     return node;
 }
@@ -90,7 +91,7 @@ void MediaStreamAudioSourceNode::attach_input_track()
     // fragment.
     static constexpr size_t ring_capacity_in_frames = 3 * 960;
     auto channel_count = m_input_track->channel_count() == 1 ? 1u : 2u;
-    m_ring = adopt_ref(*new Media::SpscAudioFrameRing(ring_capacity_in_frames, channel_count));
+    m_ring = adopt_ref(*new Audio::SpscAudioFrameRing(ring_capacity_in_frames, channel_count));
 
     context()->queue_control_message(NodeMessage { SetMediaStreamSourceRing { node_id(), m_ring, channel_count } });
 
@@ -132,6 +133,11 @@ void MediaStreamAudioSourceNode::attach_input_track()
         }
     };
     m_input_track->add_audio_sink(*m_sink);
+}
+
+bool MediaStreamAudioSourceNode::has_live_input_track() const
+{
+    return m_input_track && m_input_track->track_ready_state() == MediaCapture::MediaStreamTrackState::Live;
 }
 
 void MediaStreamAudioSourceNode::visit_edges(Cell::Visitor& visitor)

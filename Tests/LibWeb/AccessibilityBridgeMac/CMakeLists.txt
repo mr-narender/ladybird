@@ -1,0 +1,30 @@
+if (NOT BUILD_TESTING)
+    return()
+endif()
+
+if (NOT ENABLE_GUI_TARGETS)
+    # These tests run the ladybird binary, which is only built with the GUI targets.
+    return()
+endif()
+
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    return()
+endif()
+
+find_package(Python3 REQUIRED)
+
+set(LADYBIRD_A11Y_BRIDGE_MAC_ENV
+    "LADYBIRD_BINARY=$<TARGET_FILE:ladybird>"
+)
+
+add_test(
+    NAME LibWebAccessibilityBridgeMacLayer1
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_tests.sh
+)
+set_tests_properties(LibWebAccessibilityBridgeMacLayer1 PROPERTIES
+    ENVIRONMENT "${LADYBIRD_A11Y_BRIDGE_MAC_ENV}"
+    # run_tests.sh exits with 77 when this machine lacks PyObjC or Accessibility permission.
+    SKIP_RETURN_CODE 77
+    TIMEOUT 600
+    TIMEOUT_SIGNAL_NAME SIGTERM
+)

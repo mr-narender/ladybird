@@ -12,19 +12,22 @@
 //! the table (with a sparse override span for effective values the table does
 //! not hold, like the animated overlay), resolves the color and opacity
 //! sidecars natively, and runs the existing group builders, so the sharing
-//! rules - adopt the parent's payload on equality, fall back to the immortal
+//! rules - adopt the parent's payload on equality, fall back to the process's
 //! default payload - are exactly the ones the marshalled calls used.
 
+use crate::css::style::ViewLonghands;
+use crate::css::style_value::{
+    BorderRadiusPayload, CalculatedPayload, ColorSchemePayload, GridTemplateAreaPayload, GridTrackPlacementPayload,
+    GridTrackSizeListPayload, PositionPayload, RatioPayload, RectPayload, ScrollbarColorPayload, ShadowPayload,
+    TransformationPayload,
+};
+use ak::math;
 use std::collections::HashMap;
 use std::ffi::c_void;
 
 use crate::css::animated_overlay::AnimatedOverlay;
 use crate::css::calc::{resolve_calculated_flex_without_context, resolve_calculated_integer_without_context};
-use crate::css::color_resolution::{
-    ColorResolutionInput, FfiColorResolutionInput, PREFERRED_COLOR_SCHEME_DARK, Rgba, accent_color,
-    relative_color_context_from_ffi, resolution_input_from_ffi, to_color,
-};
-use crate::css::computed_longhand_table::ComputedLonghandTable;
+use crate::css::color_resolution::{ColorResolutionInput, PREFERRED_COLOR_SCHEME_DARK, Rgba, accent_color, to_color};
 use crate::css::computed_value_types::{
     AnchorValues, AnimationValues, BackgroundValues, BorderValues, ComputedClipEdge, ComputedColorOrAuto,
     ComputedCursor, ComputedFilter, ComputedFilterOperation, ComputedGridArea, ComputedGridPlacement,
@@ -33,71 +36,63 @@ use crate::css::computed_value_types::{
     ComputedOverflowClipMarginSide, ComputedPositionTryFallback, ComputedResolvedTransform, ComputedScrollbarColor,
     ComputedShadow, ComputedSize, ComputedSizeKind, ComputedStyleValueHandle, ComputedSvgDash, ComputedSvgPaint,
     ComputedTextIndent, ComputedTextUnderlineOffset, ComputedTextUnderlinePosition, ContentValues, EffectsValues,
-    FontValues, GRID_NO_INDEX, GridValues, InheritedListValues, InheritedSVGValues, InheritedTextValues,
-    InheritedUIValues, MaskValues, MiscResetValues, RetainedComputedCursorList, RetainedComputedFilterOperationList,
-    RetainedComputedResolvedTransformList, RetainedComputedShadowList, RetainedComputedSvgDashList,
-    RetainedGridAreaList, RetainedGridNameIndexList, RetainedGridTrackEntryList, RetainedPositionAreaList,
-    RetainedPositionTryFallbackList, SVGResetValues, TransformValues,
+    FontValues, GRID_NO_INDEX, GridValues, InheritedListTableValues, InheritedSVGValues, InheritedTextValues,
+    InheritedUIValues, MaskValues, MiscInteractionValues, MiscLayoutValues, RetainedComputedCursorList,
+    RetainedComputedFilterOperationList, RetainedComputedResolvedTransformList, RetainedComputedShadowList,
+    RetainedComputedSvgDashList, RetainedGridAreaList, RetainedGridNameIndexList, RetainedGridTrackEntryList,
+    RetainedPositionAreaList, RetainedPositionTryFallbackList, RetainedWillChangePropertyList, SVGResetValues,
+    StyleColor, TransformValues,
 };
 use crate::css::computed_values::{
-    FfiGroupValueEntry, GROUP_FIELD_COLOR, GROUP_FIELD_COLOR_OR_KEYWORD, GROUP_FIELD_RESOLVED_F32,
-    GROUP_FIELD_RESOLVED_F64, GROUP_FIELD_RESOLVED_U8, MAX_GROUP_FIELD_COUNT, build_svg_reset_group_payload,
-    registered_group_field_descriptors, rust_build_alignment_group, rust_build_grid_group,
-    rust_build_inherited_box_group, rust_build_inherited_table_group, rust_build_sizing_group, rust_build_style_group,
-    rust_build_surround_group, rust_build_text_reset_group,
+    GroupFieldKind, GroupReads, GroupShares, GroupValueEntry, GroupValueLayout, GroupValues, LonghandID,
+    MAX_GROUP_FIELD_COUNT, build_sizing_group, build_style_group, build_svg_reset_group_payload,
+    group_field_descriptors, rust_build_alignment_group, rust_build_grid_group, rust_build_surround_group,
+    rust_build_text_reset_group,
 };
 use crate::css::css_enums::keyword;
 use crate::css::css_pixels::CssPixels;
 use crate::css::property_metadata::property_id;
 use crate::css::retained_fly_string::{RetainedUtf16FlyString, RetainedUtf16FlyStringList};
-use crate::css::style_value::{GridTrackEntryKind, RetainedGridTrackEntry, StyleValueData};
+use crate::css::style_value::{GridTrackEntryKind, RetainedGridTrackEntry, RetainedStyleValueData, StyleValueData};
 
-/// Mirror of the C++ StyleGroupIndex numbering; ComputedValues.cpp
-/// static-asserts these values against the enum, and the entry point asserts
-/// the caller's group count.
+/// The style groups' indices, which `computed_value_types` exports to the host: the C++
+/// StyleGroupIndex numbering, which the host static-asserts these against.
 pub(crate) mod group_index {
-    pub const INHERITED_TABLE: usize = 0;
-    pub const INHERITED_LIST: usize = 1;
-    pub const INHERITED_UI: usize = 2;
-    pub const INHERITED_SVG: usize = 3;
-    pub const INHERITED_TEXT: usize = 4;
-    pub const INHERITED_BOX: usize = 5;
-    pub const FONT: usize = 6;
-    pub const ANIMATION: usize = 7;
-    pub const SVG_RESET: usize = 8;
-    pub const GRID: usize = 9;
-    pub const ANCHOR: usize = 10;
-    pub const EFFECTS: usize = 11;
-    pub const MASK: usize = 12;
-    pub const TEXT_RESET: usize = 13;
-    pub const CONTENT: usize = 14;
-    pub const TRANSFORM: usize = 15;
-    pub const BACKGROUND: usize = 16;
-    pub const BORDER: usize = 17;
-    pub const ALIGNMENT: usize = 18;
-    pub const MISC_RESET: usize = 19;
-    pub const SIZING: usize = 20;
-    pub const SURROUND: usize = 21;
-    pub const BOX: usize = 22;
-    pub const COUNT: usize = 23;
+    pub const INHERITED_LIST_TABLE: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_LIST_TABLE;
+    pub const INHERITED_UI: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_UI;
+    pub const INHERITED_SVG: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_SVG;
+    pub const INHERITED_TEXT: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_INHERITED_TEXT;
+    pub const FONT: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_FONT;
+    pub const ANIMATION: usize = 5;
+    pub const SVG_RESET: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_SVG_RESET;
+    pub const GRID: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_GRID;
+    pub const ANCHOR: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_ANCHOR;
+    pub const EFFECTS: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_EFFECTS;
+    pub const MASK: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_MASK;
+    pub const TEXT_RESET: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_TEXT_RESET;
+    pub const CONTENT: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_CONTENT;
+    pub const TRANSFORM: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_TRANSFORM;
+    pub const BACKGROUND: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_BACKGROUND;
+    pub const BORDER: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_BORDER;
+    pub const ALIGNMENT: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_ALIGNMENT;
+    pub const MISC_LAYOUT: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_MISC_LAYOUT;
+    pub const MISC_INTERACTION: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_MISC_INTERACTION;
+    pub const SIZING: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_SIZING;
+    pub const SURROUND: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_SURROUND;
+    pub const BOX: usize = crate::css::computed_value_types::STYLE_GROUP_INDEX_BOX;
+    pub const COUNT: usize = 22;
 }
 
-/// The pre-resolved inputs one table-driven group build needs from C++: the
-/// color resolution context (whose current color is the element's own
-/// resolved color), the used color-scheme, and platform font data.
-#[repr(C)]
-pub struct FfiTableGroupBuildInputs {
-    /// A marshalled StyleValueFFI::FfiColorResolutionInput whose current
-    /// color is the element's own resolved color, matching the context the
-    /// C++ sidecar loops resolved against.
-    pub color_input: *const c_void,
+/// What one table-driven group build reads beside the table: the color resolution input (whose current color is the
+/// element's own resolved color), the used color-scheme, the animated overlay over the table, and platform font data.
+pub(crate) struct GroupBuildInputs<'a> {
+    pub color_input: &'a ColorResolutionInput<'a>,
     /// The used color-scheme code (PreferredColorScheme underlying value).
     pub used_color_scheme: u8,
-    pub animated_overlay: *const AnimatedOverlay,
-    /// The raw bits of the C++ Display value before the box type
-    /// transformation, a C++-side member the table does not hold.
+    /// The raw bits of the Display value before the box type transformation, which the table does not hold.
     pub box_display_before_transformation_raw: u32,
-    pub font: *const FfiFontGroupBuildInputs,
+    pub font: Option<&'a FfiFontGroupBuildInputs>,
+    pub defaults: &'a crate::css::computed_values::DefaultGroups,
 }
 
 /// Platform font resources and derived facts supplied to the Rust-owned font
@@ -121,62 +116,201 @@ pub struct FfiFontGroupBuildInputs {
     pub math_depth: i32,
 }
 
-/// The longhand table joined with the effective-value overrides: exactly the
-/// values `ComputedStyleWorkingSet::property()` returns during a group build.
-struct EffectiveValues<'a> {
-    table: &'a ComputedLonghandTable,
-    animated_overlay: Option<&'a AnimatedOverlay>,
+/// Where a group build reads an element's computed longhand values from: exactly the values
+/// `ComputedStyleWorkingSet::property()` returns during a group build.
+pub(crate) enum LonghandSource<'a> {
+    /// An element's longhands, of a table or of a record, joined with their effective-value
+    /// overrides: the animated overlay where its values win, and the recorded
+    /// currentcolor-dependent specified values.
+    Longhands {
+        longhands: ViewLonghands<'a>,
+        animated_overlay: Option<&'a AnimatedOverlay>,
+    },
+    /// The element's computed values by group, before its groups are built.
+    Values {
+        values: &'a GroupValues<'a>,
+        /// Where known, the values the build may read, which its group's cache key covers: a read
+        /// of another value aborts.
+        reads: Option<&'a GroupReads>,
+    },
 }
 
-struct GroupValueEntries {
-    entries: [std::mem::MaybeUninit<FfiGroupValueEntry>; MAX_GROUP_FIELD_COUNT],
-    len: usize,
-}
+/// The gathered entries of one group, which has at most `MAX_GROUP_FIELD_COUNT` fields.
+type GroupValueEntries<'a> = smallvec::SmallVec<[GroupValueEntry<'a>; MAX_GROUP_FIELD_COUNT]>;
 
-impl GroupValueEntries {
-    fn new() -> Self {
-        Self {
-            entries: [const { std::mem::MaybeUninit::uninit() }; MAX_GROUP_FIELD_COUNT],
-            len: 0,
+impl<'a> LonghandSource<'a> {
+    fn handle(&self, property_id: u16) -> &'a RetainedStyleValueData {
+        match self {
+            Self::Longhands {
+                longhands,
+                animated_overlay,
+            } => longhands.effective_value(*animated_overlay, property_id),
+            Self::Values { values, reads } => {
+                // NB: A build reads the element's color to resolve `currentcolor`, which the key
+                //     covers as the resolved current color.
+                if let Some(reads) = reads
+                    && property_id != property_id::COLOR
+                    && !GroupValueLayout::reads(reads, GroupValueLayout::get().place(LonghandID::new(property_id)))
+                {
+                    eprintln!("a style group build reads longhand {property_id}, which its key does not cover");
+                    std::process::abort();
+                }
+                values.effective_value(property_id)
+            }
         }
     }
 
-    fn push(&mut self, entry: FfiGroupValueEntry) {
-        assert!(
-            self.len < self.entries.len(),
-            "a computed style group has too many fields"
-        );
-        self.entries[self.len].write(entry);
-        self.len += 1;
-    }
-}
-
-impl std::ops::Deref for GroupValueEntries {
-    type Target = [FfiGroupValueEntry];
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: push initializes every entry below len and FfiGroupValueEntry has no drop glue.
-        unsafe { std::slice::from_raw_parts(self.entries.as_ptr().cast(), self.len) }
-    }
-}
-
-impl EffectiveValues<'_> {
-    fn pointer(&self, property_id: u16) -> *const c_void {
-        self.table
-            .effective_value(self.animated_overlay, property_id, true)
-            .value
+    fn value(&self, property_id: u16) -> Option<&'a StyleValueData> {
+        self.handle(property_id).optional_data()
     }
 
-    fn value(&self, property_id: u16) -> Option<&StyleValueData> {
-        // SAFETY: Table slots retain their data and override pointers borrow
-        // values the caller keeps alive across the build.
-        unsafe { self.pointer(property_id).cast::<StyleValueData>().as_ref() }
+    fn animated_overlay(&self) -> Option<&'a AnimatedOverlay> {
+        match self {
+            Self::Longhands { animated_overlay, .. } => *animated_overlay,
+            Self::Values { .. } => None,
+        }
+    }
+
+    fn effective_zoom(&self) -> f32 {
+        match self {
+            Self::Longhands { longhands, .. } => longhands.effective_zoom(),
+            Self::Values { values, .. } => values.facts().effective_zoom(),
+        }
+    }
+
+    /// What a style holding these values holds as bits beside its groups.
+    pub(crate) fn style_bits(&self) -> crate::css::computed_value_types::StyleBits {
+        match self {
+            Self::Longhands { .. } => crate::css::computed_value_types::StyleBits::of_values(
+                |property| self.handle(property),
+                self.effective_zoom(),
+            ),
+            Self::Values { values, .. } => values.style_bits(),
+        }
+    }
+
+    fn display_before_box_type_transformation(&self) -> u32 {
+        match self {
+            Self::Longhands { longhands, .. } => longhands.display_before_box_type_transformation(),
+            Self::Values { values, .. } => values.facts().display_before_box_type_transformation(),
+        }
+    }
+
+    fn effective_color_scheme(&self) -> i16 {
+        match self {
+            Self::Longhands { longhands, .. } => longhands.effective_color_scheme(),
+            Self::Values { values, .. } => values.facts().effective_color_scheme(),
+        }
+    }
+
+    /// https://drafts.csswg.org/css-ui/#appearance-disabling-properties
+    /// Whether an author declaration disables the element's native appearance.
+    fn native_appearance_disabled(&self) -> bool {
+        match self {
+            Self::Longhands { longhands, .. } => {
+                longhands.dependency_flags() & crate::css::computed_longhand_table::NATIVE_APPEARANCE_DISABLED != 0
+            }
+            Self::Values { values, .. } => values.facts().native_appearance_disabled(),
+        }
     }
 }
 
 /// The C++ Color::value() bit layout.
 fn packed_color(color: Rgba) -> u32 {
     (u32::from(color.a) << 24) | (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+}
+
+/// The groups that hold plain `currentcolor` as a [`StyleColor`] wherever they hold a color, which
+/// depend on the element's color only through a value whose color is more than plain `currentcolor`.
+pub(crate) const GROUPS_HOLDING_CURRENT_COLOR_FOR_THEIR_READER: u32 = (1 << group_index::BORDER)
+    | (1 << group_index::MISC_LAYOUT)
+    | (1 << group_index::TEXT_RESET)
+    | (1 << group_index::BACKGROUND)
+    | (1 << group_index::SVG_RESET)
+    | (1 << group_index::INHERITED_UI)
+    | (1 << group_index::INHERITED_SVG)
+    | (1 << group_index::EFFECTS);
+
+/// Whether a group holds `property`'s value `data` as `currentcolor` for its reader to resolve,
+/// rather than resolving it against the element's color.
+pub(crate) fn group_holds_current_color_for_its_reader(property: u16, data: Option<&StyleValueData>) -> bool {
+    // A shadow without a color is `currentcolor` too, and a layer whose color reads no
+    // `currentcolor` reads nothing of the element's color.
+    if property == property_id::BOX_SHADOW {
+        return match data {
+            Some(StyleValueData::ValueList { values, .. }) => {
+                values.as_slice().iter().all(|layer| match layer.data() {
+                    StyleValueData::Shadow(shadow) => match shadow.color.optional_data() {
+                        None => true,
+                        Some(StyleValueData::Keyword { keyword }) if *keyword == keyword::CURRENTCOLOR => true,
+                        Some(color) => !crate::css::style_value::value_depends_on_current_color(color),
+                    },
+                    _ => false,
+                })
+            }
+            _ => false,
+        };
+    }
+    matches!(
+        property,
+        property_id::BORDER_TOP_COLOR
+            | property_id::BORDER_RIGHT_COLOR
+            | property_id::BORDER_BOTTOM_COLOR
+            | property_id::BORDER_LEFT_COLOR
+            | property_id::OUTLINE_COLOR
+            | property_id::COLUMN_RULE_COLOR
+            | property_id::TEXT_DECORATION_COLOR
+            | property_id::BACKGROUND_COLOR
+            | property_id::STOP_COLOR
+            | property_id::FLOOD_COLOR
+            | property_id::CARET_COLOR
+            | property_id::ACCENT_COLOR
+            | property_id::FILL
+            | property_id::STROKE
+    ) && matches!(data, Some(StyleValueData::Keyword { keyword }) if *keyword == keyword::CURRENTCOLOR)
+}
+
+/// The groups an element's color reaches through the colors it inherits, which it holds no record of having
+/// declared: a color reading `currentcolor` that is more than plain `currentcolor` resolves against the color of the
+/// element holding it, not the parent's. The other inherited groups hold the color itself, and rebuild with it.
+pub(crate) fn groups_reading_current_color_through_inherited_values<'a>(
+    value: impl Fn(u16) -> Option<&'a StyleValueData>,
+) -> u32 {
+    let reads_current_color = |property: u16| {
+        value(property).is_some_and(|data| {
+            crate::css::style_value::value_depends_on_current_color(data)
+                && !group_holds_current_color_for_its_reader(property, Some(data))
+        })
+    };
+    let mut groups = 0;
+    if [
+        property_id::CARET_COLOR,
+        property_id::ACCENT_COLOR,
+        property_id::SCROLLBAR_COLOR,
+    ]
+    .into_iter()
+    .any(reads_current_color)
+    {
+        groups |= 1 << group_index::INHERITED_UI;
+    }
+    if [property_id::FILL, property_id::STROKE]
+        .into_iter()
+        .any(reads_current_color)
+    {
+        groups |= 1 << group_index::INHERITED_SVG;
+    }
+    groups
+}
+
+/// The computed color `data` is, as a group holds it: `currentcolor` stays for the group's reader
+/// to resolve against the element's color.
+fn style_color(data: &StyleValueData, input: &ColorResolutionInput) -> Option<StyleColor> {
+    if let StyleValueData::Keyword { keyword: code } = data
+        && *code == keyword::CURRENTCOLOR
+    {
+        return Some(StyleColor::CURRENT_COLOR);
+    }
+    to_color(data, input).map(|color| StyleColor::rgba(packed_color(color)))
 }
 
 /// The resolved color the C++ sidecar loops produced for one color-kind
@@ -188,11 +322,7 @@ fn resolved_color(input: &ColorResolutionInput, property: u16, data: &StyleValue
         return input.current_color.map(packed_color);
     }
     if let StyleValueData::Keyword { keyword: code } = data {
-        // An auto caret-color is the element's own color; an auto
-        // accent-color is the system accent color for the used scheme.
-        if property == property_id::CARET_COLOR && *code == keyword::AUTO {
-            return input.current_color.map(packed_color);
-        }
+        // An auto accent-color is the system accent color for the used scheme.
         if property == property_id::ACCENT_COLOR && *code == keyword::AUTO {
             return Some(packed_color(accent_color(
                 input.scheme == Some(PREFERRED_COLOR_SCHEME_DARK),
@@ -221,39 +351,39 @@ fn resolved_wrapped_number(data: &StyleValueData) -> Option<f64> {
 
 /// Gathers one group's descriptor entries from the table, resolving the
 /// color and number sidecars the descriptor kinds ask for.
-unsafe fn gather_group_entries(
+fn gather_group_entries<'a>(
     group_index: usize,
-    values: &EffectiveValues,
+    values: &LonghandSource<'a>,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-) -> Option<GroupValueEntries> {
-    let descriptors = registered_group_field_descriptors(group_index)?;
+) -> Option<GroupValueEntries<'a>> {
+    let descriptors = group_field_descriptors(group_index);
     assert!(descriptors.len() <= MAX_GROUP_FIELD_COUNT);
     let mut entries = GroupValueEntries::new();
     for descriptor in descriptors {
-        let data_pointer = values.pointer(descriptor.property_id);
-        let data = unsafe { data_pointer.cast::<StyleValueData>().as_ref() }?;
-        let mut entry = FfiGroupValueEntry {
-            data: data_pointer,
+        let handle = values.handle(descriptor.property_id);
+        let data = handle.optional_data()?;
+        let mut entry = GroupValueEntry {
+            data: handle,
             resolved_color: 0,
             has_resolved_color: false,
             resolved_number: 0.0,
             has_resolved_number: false,
         };
         match descriptor.kind {
-            GROUP_FIELD_COLOR | GROUP_FIELD_COLOR_OR_KEYWORD => {
+            GroupFieldKind::Color | GroupFieldKind::HeldColor | GroupFieldKind::HeldColorOrKeyword(_) => {
                 if let Some(color) = resolved_color(input, descriptor.property_id, data) {
                     entry.resolved_color = color;
                     entry.has_resolved_color = true;
                 }
             }
-            GROUP_FIELD_RESOLVED_F32 | GROUP_FIELD_RESOLVED_F64 => {
+            GroupFieldKind::ResolvedF32 | GroupFieldKind::ResolvedF64 => {
                 if let Some(number) = resolved_wrapped_number(data) {
                     entry.resolved_number = number;
                     entry.has_resolved_number = true;
                 }
             }
-            GROUP_FIELD_RESOLVED_U8 => {
+            GroupFieldKind::ResolvedU8 => {
                 // The only resolved-u8 field is the used color-scheme.
                 entry.resolved_number = f64::from(used_color_scheme);
                 entry.has_resolved_number = true;
@@ -265,107 +395,95 @@ unsafe fn gather_group_entries(
     Some(entries)
 }
 
-/// Builds one descriptor-driven group through `rust_build_style_group`,
+/// Builds one descriptor-driven group through `build_style_group`,
 /// gathering the entries from the table instead of a marshalled span.
-unsafe fn build_generic_group(
+fn build_generic_group(
     group_index: usize,
-    values: &EffectiveValues,
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) = (unsafe { gather_group_entries(group_index, values, input, used_color_scheme) }) else {
+    let Some(entries) = gather_group_entries(group_index, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
-    // SAFETY: The entries hold live value data gathered above and the caller
-    // warrants the parent payload.
-    unsafe { rust_build_style_group(group_index, entries.as_ptr(), entries.len(), parent_payload) }
+    build_style_group(group_index, &entries, parent)
 }
 
-unsafe fn build_surround_group(values: &EffectiveValues, parent_payload: *const c_void) -> *const c_void {
+fn build_surround_group(values: &LonghandSource, parent: GroupShares<'_>) -> *const c_void {
     let position_anchor = match values.value(property_id::POSITION_ANCHOR) {
-        Some(StyleValueData::CustomIdent { .. }) => values.pointer(property_id::POSITION_ANCHOR),
-        _ => std::ptr::null(),
+        Some(StyleValueData::CustomIdent { .. }) => Some(values.handle(property_id::POSITION_ANCHOR)),
+        _ => None,
     };
-    // SAFETY: Every pointer names live value data from the table and the
-    // caller warrants the parent payload.
-    unsafe {
-        rust_build_surround_group(
-            group_index::SURROUND,
-            values.pointer(property_id::TOP),
-            values.pointer(property_id::RIGHT),
-            values.pointer(property_id::BOTTOM),
-            values.pointer(property_id::LEFT),
-            values.pointer(property_id::MARGIN_TOP),
-            values.pointer(property_id::MARGIN_RIGHT),
-            values.pointer(property_id::MARGIN_BOTTOM),
-            values.pointer(property_id::MARGIN_LEFT),
-            values.pointer(property_id::PADDING_TOP),
-            values.pointer(property_id::PADDING_RIGHT),
-            values.pointer(property_id::PADDING_BOTTOM),
-            values.pointer(property_id::PADDING_LEFT),
-            position_anchor,
-            parent_payload,
-        )
-    }
+    rust_build_surround_group(
+        group_index::SURROUND,
+        values.handle(property_id::TOP),
+        values.handle(property_id::RIGHT),
+        values.handle(property_id::BOTTOM),
+        values.handle(property_id::LEFT),
+        values.handle(property_id::MARGIN_TOP),
+        values.handle(property_id::MARGIN_RIGHT),
+        values.handle(property_id::MARGIN_BOTTOM),
+        values.handle(property_id::MARGIN_LEFT),
+        values.handle(property_id::PADDING_TOP),
+        values.handle(property_id::PADDING_RIGHT),
+        values.handle(property_id::PADDING_BOTTOM),
+        values.handle(property_id::PADDING_LEFT),
+        position_anchor,
+        parent,
+    )
 }
 
-unsafe fn build_alignment_group(values: &EffectiveValues, parent_payload: *const c_void) -> *const c_void {
+fn build_alignment_group(values: &LonghandSource, parent: GroupShares<'_>) -> *const c_void {
     let number = |property: u16| required_number(values.value(property).expect("the table holds the flex factor"));
     let flex_grow = number(property_id::FLEX_GROW);
     let flex_shrink = number(property_id::FLEX_SHRINK);
     let order = required_integer(values.value(property_id::ORDER).expect("the table holds order"));
-    // SAFETY: Every pointer names live value data from the table and the
-    // caller warrants the parent payload.
-    unsafe {
-        rust_build_alignment_group(
-            group_index::ALIGNMENT,
-            values.pointer(property_id::_WEBKIT_BOX_ORIENT),
-            values.pointer(property_id::FLEX_DIRECTION),
-            values.pointer(property_id::FLEX_WRAP),
-            values.pointer(property_id::FLEX_BASIS),
-            flex_grow,
-            flex_shrink,
-            order,
-            values.pointer(property_id::ALIGN_CONTENT),
-            values.pointer(property_id::ALIGN_ITEMS),
-            values.pointer(property_id::ALIGN_SELF),
-            values.pointer(property_id::JUSTIFY_CONTENT),
-            values.pointer(property_id::JUSTIFY_ITEMS),
-            values.pointer(property_id::JUSTIFY_SELF),
-            values.pointer(property_id::COLUMN_GAP),
-            values.pointer(property_id::ROW_GAP),
-            parent_payload,
-        )
-    }
+    rust_build_alignment_group(
+        group_index::ALIGNMENT,
+        values.handle(property_id::_WEBKIT_BOX_ORIENT),
+        values.handle(property_id::FLEX_DIRECTION),
+        values.handle(property_id::FLEX_WRAP),
+        values.handle(property_id::FLEX_BASIS),
+        flex_grow,
+        flex_shrink,
+        order,
+        values.handle(property_id::ALIGN_CONTENT),
+        values.handle(property_id::ALIGN_ITEMS),
+        values.handle(property_id::ALIGN_SELF),
+        values.handle(property_id::JUSTIFY_CONTENT),
+        values.handle(property_id::JUSTIFY_ITEMS),
+        values.handle(property_id::JUSTIFY_SELF),
+        values.handle(property_id::COLUMN_GAP),
+        values.handle(property_id::ROW_GAP),
+        parent,
+    )
 }
 
-unsafe fn build_svg_reset_group(
-    values: &EffectiveValues,
+fn build_svg_reset_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
     let color = |property: u16| {
-        packed_color(
-            to_color(
-                values.value(property).expect("the table holds the computed color"),
-                input,
-            )
-            .expect("a computed SVG reset color resolves in the Rust color context"),
+        style_color(
+            values.value(property).expect("the table holds the computed color"),
+            input,
         )
+        .expect("a computed SVG reset color resolves in the Rust color context")
     };
     let opacity = |property: u16| {
         resolved_wrapped_number(values.value(property).expect("the table holds the computed opacity"))
             .expect("a computed SVG reset opacity resolves")
     };
-    let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
+    let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
     let built = SVGResetValues {
         cx: retained(property_id::CX),
         cy: retained(property_id::CY),
         d: retained(property_id::D),
         r: retained(property_id::R),
-        rx: ComputedLengthPercentageOrAuto::from_data(values.pointer(property_id::RX)),
-        ry: ComputedLengthPercentageOrAuto::from_data(values.pointer(property_id::RY)),
+        rx: ComputedLengthPercentageOrAuto::from_data(values.handle(property_id::RX)),
+        ry: ComputedLengthPercentageOrAuto::from_data(values.handle(property_id::RY)),
         x: retained(property_id::X),
         y: retained(property_id::Y),
         stop_color: color(property_id::STOP_COLOR),
@@ -378,8 +496,7 @@ unsafe fn build_svg_reset_group(
             crate::css::css_enums::keyword_to_vector_effect,
         ),
     };
-    // SAFETY: The caller warrants the parent payload.
-    unsafe { build_svg_reset_group_payload(group_index::SVG_RESET, built, parent_payload) }
+    build_svg_reset_group_payload(group_index::SVG_RESET, built, parent)
 }
 
 /// The name table, name-index spans, track entries and named areas one grid
@@ -436,7 +553,8 @@ fn auto_grid_track_breadth() -> ComputedGridTrackBreadth {
 /// GridSize lowering: flex values - including calc that resolves to flex -
 /// carry their fr factor, everything else maps through the shared computed
 /// size representation.
-fn grid_track_breadth(data: &StyleValueData) -> ComputedGridTrackBreadth {
+fn grid_track_breadth(handle: &RetainedStyleValueData) -> ComputedGridTrackBreadth {
+    let data = handle.data();
     let flex_factor = match data {
         StyleValueData::Flex { value, unit } => {
             Some(value * crate::css::calc::FLEX_UNIT_CANONICAL_RATIOS[*unit as usize])
@@ -451,7 +569,7 @@ fn grid_track_breadth(data: &StyleValueData) -> ComputedGridTrackBreadth {
             size: ComputedSize::keyword(ComputedSizeKind::Auto),
         };
     }
-    let size = ComputedSize::from_data(std::ptr::from_ref(data).cast());
+    let size = ComputedSize::from_data(handle);
     assert!(size.kind != ComputedSizeKind::None, "a grid size cannot be none");
     ComputedGridTrackBreadth {
         is_flex: false,
@@ -522,14 +640,14 @@ fn build_grid_track_list(
                 entry.name_index_count = arena.name_indices.len() - name_index_start;
             }
             GridTrackEntryKind::Size => {
-                let size = grid_track_breadth(source.size_value.data());
+                let size = grid_track_breadth(&source.size_value);
                 let entry = &mut arena.entries[entry_index as usize];
                 entry.kind = ComputedGridTrackEntryKind::TrackSize as u8;
                 entry.size = size;
             }
             GridTrackEntryKind::MinMax => {
-                let min_size = grid_track_breadth(source.min_value.data());
-                let max_size = grid_track_breadth(source.max_value.data());
+                let min_size = grid_track_breadth(&source.min_value);
+                let max_size = grid_track_breadth(&source.max_value);
                 let entry = &mut arena.entries[entry_index as usize];
                 entry.kind = ComputedGridTrackEntryKind::MinMax as u8;
                 entry.min_size = min_size;
@@ -563,17 +681,17 @@ fn build_grid_track_list(
 }
 
 fn build_grid_placement(data: &StyleValueData, arena: &mut GridGroupArena) -> Option<ComputedGridPlacement> {
-    let StyleValueData::GridTrackPlacement {
+    let StyleValueData::GridTrackPlacement(grid_track_placement_payload) = data else {
+        return None;
+    };
+    let GridTrackPlacementPayload {
         kind,
         value,
         has_name,
         name,
         implicit_start_name,
         implicit_end_name,
-    } = data
-    else {
-        return None;
-    };
+    } = &**grid_track_placement_payload;
     let mut result = ComputedGridPlacement {
         kind: ComputedGridPlacementKind::Auto as u8,
         has_line_number: false,
@@ -614,8 +732,8 @@ fn build_grid_placement(data: &StyleValueData, arena: &mut GridGroupArena) -> Op
 /// Builds the grid group payload from the table's computed track lists,
 /// template areas and placements, in the C++ marshalled build's interning
 /// order so the arena layout stays deterministic.
-unsafe fn build_grid_group(values: &EffectiveValues, parent_payload: *const c_void) -> *const c_void {
-    // An all-initial grid shares the immortal default payload directly, with
+fn build_grid_group(values: &LonghandSource, parent: GroupShares<'_>) -> *const c_void {
+    // An all-initial grid shares the default payload directly, with
     // its empty style value handles, exactly as the descriptor constraints
     // used to. A value is initial by what it holds, so that equal tables build
     // equal payloads.
@@ -630,26 +748,28 @@ unsafe fn build_grid_group(values: &EffectiveValues, parent_payload: *const c_vo
         property_id::GRID_ROW_START,
         property_id::GRID_ROW_END,
     ];
-    let all_initial = GRID_PROPERTIES.iter().all(|property| unsafe {
-        crate::css::style_value::rust_style_value_equals(
-            values.pointer(*property).cast(),
-            crate::css::style_compute::initial_value_data(*property).cast(),
+    let all_initial = GRID_PROPERTIES.iter().all(|property| {
+        crate::css::style_value::retained_style_values_equal(
+            values.handle(*property),
+            crate::css::style_compute::initial_value_handle(*property),
         )
     });
     if all_initial {
-        // SAFETY: The caller warrants the parent payload.
-        return unsafe { crate::css::computed_values::share_default_group_payload(group_index::GRID, parent_payload) };
+        return crate::css::computed_values::share_default_group_payload(group_index::GRID, parent);
     }
 
     let mut arena = GridGroupArena::new();
 
     let track_list = |arena: &mut GridGroupArena, property: u16| -> Option<ComputedGridTrackList> {
         match values.value(property)? {
-            StyleValueData::GridTrackSizeList {
-                is_subgrid,
-                preserve_line_name_sets,
-                entries,
-            } => build_grid_track_list(*is_subgrid, *preserve_line_name_sets, entries.as_slice(), arena),
+            StyleValueData::GridTrackSizeList(grid_track_size_list_payload) => {
+                let GridTrackSizeListPayload {
+                    is_subgrid,
+                    preserve_line_name_sets,
+                    entries,
+                } = &**grid_track_size_list_payload;
+                build_grid_track_list(*is_subgrid, *preserve_line_name_sets, entries.as_slice(), arena)
+            }
             _ => None,
         }
     };
@@ -666,10 +786,12 @@ unsafe fn build_grid_group(values: &EffectiveValues, parent_payload: *const c_vo
         return std::ptr::null();
     };
 
-    let Some(StyleValueData::GridTemplateArea { grid_areas, .. }) = values.value(property_id::GRID_TEMPLATE_AREAS)
+    let Some(StyleValueData::GridTemplateArea(grid_template_area_payload)) =
+        values.value(property_id::GRID_TEMPLATE_AREAS)
     else {
         return std::ptr::null();
     };
+    let GridTemplateAreaPayload { grid_areas, .. } = &**grid_template_area_payload;
     for area in grid_areas.as_slice() {
         let [row_start, row_end, column_start, column_end] = area.grid_lines();
         let name_index = arena.intern_borrowed(area.name());
@@ -702,11 +824,7 @@ unsafe fn build_grid_group(values: &EffectiveValues, parent_payload: *const c_vo
         return std::ptr::null();
     };
 
-    let retained_slot = |property: u16| {
-        // SAFETY: Table slots and override values are live style value data
-        // across the build.
-        ComputedStyleValueHandle::retained(values.pointer(property).cast())
-    };
+    let retained_slot = |property: u16| ComputedStyleValueHandle::from_retained(values.handle(property));
     let built = GridValues {
         names: RetainedUtf16FlyStringList::from_retained_strings(arena.names),
         name_indices: RetainedGridNameIndexList::from_vec(arena.name_indices),
@@ -729,12 +847,9 @@ unsafe fn build_grid_group(values: &EffectiveValues, parent_payload: *const c_vo
         grid_column_end_style_value: retained_slot(property_id::GRID_COLUMN_END),
         grid_row_start_style_value: retained_slot(property_id::GRID_ROW_START),
         grid_row_end_style_value: retained_slot(property_id::GRID_ROW_END),
+        fit_tolerance_style_value: retained_slot(property_id::FIT_TOLERANCE),
     };
-    // SAFETY: The built payload is fully initialized; the builder assumes
-    // ownership of it, so the local value must not drop.
-    let payload = unsafe { rust_build_grid_group(group_index::GRID, &raw const built, parent_payload) };
-    std::mem::forget(built);
-    payload
+    rust_build_grid_group(group_index::GRID, built, parent)
 }
 
 // --- Transform and effects lowering ---------------------------------------
@@ -787,8 +902,22 @@ pub(crate) fn angle_radians(data: &StyleValueData) -> Option<f64> {
 }
 
 /// An angle-typed transform argument in radians.
-fn transform_angle_radians(data: &StyleValueData) -> f64 {
-    angle_radians(data).expect("a computed transform angle is an angle or a calculation that resolves without context")
+pub(crate) fn transform_angle_radians(data: &StyleValueData) -> f64 {
+    if let StyleValueData::Angle { value, unit } = data {
+        let period = match crate::css::calc::ANGLE_UNIT_NAMES[*unit as usize] {
+            "deg" => 360.0,
+            "grad" => 400.0,
+            "rad" => std::f64::consts::TAU,
+            "turn" => 1.0,
+            _ => unreachable!("the angle unit table names every unit"),
+        };
+        // NB: Reduce literal angles before unit conversion, which can round away their periodic equivalence.
+        return angle_value_to_radians(value % period, *unit);
+    }
+    let degrees = angle_degrees(data)
+        .expect("a computed transform angle is an angle or a calculation that resolves without context");
+    // NB: Calculated angles resolve in canonical degrees.
+    (degrees % 360.0).to_radians()
 }
 
 /// An angle in degrees. None for a value that is not an angle or a calculation that resolves
@@ -852,13 +981,9 @@ fn transform_number(data: &StyleValueData) -> f64 {
 fn value_contains_percentage(data: &StyleValueData) -> bool {
     match data {
         StyleValueData::Percentage { .. } => true,
-        StyleValueData::Calculated { .. } => {
-            // SAFETY: The calculated style value outlives the query.
-            unsafe {
-                let root = crate::css::calc::rust_calc_root_from_calculated(std::ptr::from_ref(data).cast());
-                assert!(!root.is_null());
-                crate::css::calc::rust_calc_node_contains_percentage(root)
-            }
+        StyleValueData::Calculated(calculated_payload) => {
+            let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
+            rust_calculation.node().contains_percentage()
         }
         _ => false,
     }
@@ -917,9 +1042,9 @@ fn matrix_rotation(axis: [f32; 3], angle: f32) -> [f32; 16] {
     std::array::from_fn(|index| rows[index / 4][index % 4])
 }
 
-/// The TransformationStyleValue::to_matrix port for computed values, which
-/// never carry reference-box percentages here: the translate family's
-/// percentage-bearing values lower into per-axis slots instead.
+/// The matrix of one transform function whose values resolve without a box: computed values,
+/// whose percentage-bearing translate values lower into per-axis slots instead, or the absolute
+/// values DOMMatrix accepts.
 pub(crate) fn transformation_to_matrix(
     function: u8,
     values: &[crate::css::style_value::RetainedStyleValueData],
@@ -1069,33 +1194,124 @@ pub(crate) fn transformation_to_matrix(
         functions::SKEW => {
             if count == 1 {
                 let mut matrix = matrix_identity();
-                matrix[1] = get_value(0).tan();
+                matrix[1] = math::tan(get_value(0));
                 return matrix;
             }
             if count == 2 {
                 let mut matrix = matrix_identity();
-                matrix[1] = get_value(0).tan();
-                matrix[4] = get_value(1).tan();
+                matrix[1] = math::tan(get_value(0));
+                matrix[4] = math::tan(get_value(1));
                 return matrix;
             }
         }
         functions::SKEW_X => {
             if count == 1 {
                 let mut matrix = matrix_identity();
-                matrix[1] = get_value(0).tan();
+                matrix[1] = math::tan(get_value(0));
                 return matrix;
             }
         }
         functions::SKEW_Y if count == 1 => {
             let mut matrix = matrix_identity();
-            matrix[4] = get_value(0).tan();
+            matrix[4] = math::tan(get_value(0));
             return matrix;
         }
         _ => {}
     }
-    // The C++ to_matrix logs and falls back to the identity for unhandled
-    // function and argument-count combinations.
+    // An unhandled function and argument-count combination is the identity.
     matrix_identity()
+}
+
+/// The abstract matrix of a parsed `transform` value or of one transform function, as DOMMatrix
+/// parses a string into one: the product of the functions' matrices, and whether every function is
+/// two-dimensional. False when a function needs a box or a font to resolve: a relative length, a
+/// percentage of a length, a calculation that does not simplify, or a tree-counting function.
+/// https://drafts.fxtf.org/geometry/#parse-a-string-into-an-abstract-matrix
+/// The matrix is written to the 16 floats of `out_matrix`, row by row.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_transform_list_to_abstract_matrix(
+    value: &StyleValueData,
+    out_matrix: ak::SpanMut<'_, f32>,
+    out_is_2d: &mut bool,
+) -> bool {
+    use crate::css::serialize::transform_function as functions;
+
+    // The keyword none is no function at all.
+    let transform_list = match value {
+        StyleValueData::ValueList { values, .. } => values.as_slice(),
+        _ => &[],
+    };
+    let single_function = matches!(value, StyleValueData::Transformation { .. }).then_some(value);
+    let mut matrix = libgfx_rust::FloatMatrix4x4::identity();
+    let mut is_2d = true;
+    for function in transform_list
+        .iter()
+        .map(|function| function.data())
+        .chain(single_function)
+    {
+        let StyleValueData::Transformation(transformation_payload) = function else {
+            return false;
+        };
+        let TransformationPayload {
+            transform_function,
+            values,
+            matrix_values,
+            ..
+        } = &**transformation_payload;
+        let values = if matrix_values.as_slice().is_empty() {
+            values.as_slice()
+        } else {
+            matrix_values.as_slice()
+        };
+        let parameters = crate::css::serialize::TRANSFORM_FUNCTION_PARAMETER_TYPES[*transform_function as usize];
+        if !values
+            .iter()
+            .zip(parameters)
+            .all(|(value, &parameter)| resolves_without_a_box(parameter, value.data()))
+        {
+            return false;
+        }
+        // https://drafts.csswg.org/css-transforms-1/#two-d-transform-functions
+        is_2d &= matches!(
+            *transform_function,
+            functions::MATRIX
+                | functions::TRANSLATE
+                | functions::TRANSLATE_X
+                | functions::TRANSLATE_Y
+                | functions::SCALE
+                | functions::SCALE_X
+                | functions::SCALE_Y
+                | functions::ROTATE
+                | functions::SKEW
+                | functions::SKEW_X
+                | functions::SKEW_Y
+        );
+        let function_matrix = transformation_to_matrix(*transform_function, values);
+        matrix = matrix.multiplied(libgfx_rust::FloatMatrix4x4 {
+            elements: std::array::from_fn(|row| std::array::from_fn(|column| function_matrix[row * 4 + column])),
+        });
+    }
+    out_matrix.into_slice().copy_from_slice(matrix.elements.as_flattened());
+    *out_is_2d = is_2d;
+    true
+}
+
+fn resolves_without_a_box(parameter: u8, value: &StyleValueData) -> bool {
+    match value {
+        StyleValueData::Length { value, unit } => {
+            crate::css::style_compute::absolute_length_to_px(*value, *unit).is_some()
+        }
+        StyleValueData::Percentage { .. } => parameter != TRANSFORM_PARAMETER_LENGTH_PERCENTAGE,
+        StyleValueData::Calculated { .. } => {
+            crate::css::calc::resolve_calculated_canonically(value, None).is_some()
+                && !(parameter == TRANSFORM_PARAMETER_LENGTH_PERCENTAGE && value_contains_percentage(value))
+        }
+        StyleValueData::TreeCountingFunction { .. } => !matches!(
+            parameter,
+            TRANSFORM_PARAMETER_NUMBER | TRANSFORM_PARAMETER_NUMBER_PERCENTAGE
+        ),
+        _ => true,
+    }
 }
 
 fn baked_matrix_entry(matrix: [f32; 16]) -> ComputedResolvedTransform {
@@ -1116,16 +1332,21 @@ fn baked_matrix_entry(matrix: [f32; 16]) -> ComputedResolvedTransform {
 fn lower_transformation(data: &StyleValueData) -> ComputedResolvedTransform {
     use crate::css::serialize::transform_function as functions;
 
-    let StyleValueData::Transformation {
-        transform_function,
-        values,
-        ..
-    } = data
-    else {
+    let StyleValueData::Transformation(transformation_payload) = data else {
         unreachable!("a computed transform function is a transformation value");
     };
+    let TransformationPayload {
+        transform_function,
+        values,
+        matrix_values,
+        ..
+    } = &**transformation_payload;
     let function = *transform_function;
-    let values = values.as_slice();
+    let values = if matrix_values.as_slice().is_empty() {
+        values.as_slice()
+    } else {
+        matrix_values.as_slice()
+    };
     let parameters = crate::css::serialize::TRANSFORM_FUNCTION_PARAMETER_TYPES[function as usize];
 
     let axis_needs_reference_box = |index: usize| {
@@ -1139,7 +1360,7 @@ fn lower_transformation(data: &StyleValueData) -> ComputedResolvedTransform {
         }
         let value = &values[index];
         if axis_needs_reference_box(index) {
-            return (0.0, ComputedStyleValueHandle::retained(value.pointer()));
+            return (0.0, ComputedStyleValueHandle::from_retained(value));
         }
         (
             length_to_css_pixels(value.data()).to_float(),
@@ -1186,20 +1407,19 @@ fn lower_transformation(data: &StyleValueData) -> ComputedResolvedTransform {
 
 /// Builds the complete transform payload in Rust, including paint-ready
 /// matrices and retained computed-value handles.
-unsafe fn build_transform_group(
-    values: &EffectiveValues,
+fn build_transform_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) = (unsafe { gather_group_entries(group_index::TRANSFORM, values, input, used_color_scheme) })
-    else {
+    let Some(entries) = gather_group_entries(group_index::TRANSFORM, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
 
     let retained = |property: u16| -> ComputedStyleValueHandle {
         match values.value(property) {
-            Some(_) => ComputedStyleValueHandle::retained(values.pointer(property).cast()),
+            Some(_) => ComputedStyleValueHandle::from_retained(values.handle(property)),
             None => ComputedStyleValueHandle::empty(),
         }
     };
@@ -1235,9 +1455,9 @@ unsafe fn build_transform_group(
         Some(StyleValueData::ValueList { values: list, .. }) if list.as_slice().len() == 3 => {
             let offsets = list.as_slice();
             (
-                ComputedStyleValueHandle::retained(offsets[0].pointer()),
-                ComputedStyleValueHandle::retained(offsets[1].pointer()),
-                ComputedStyleValueHandle::retained(offsets[2].pointer()),
+                ComputedStyleValueHandle::from_retained(&offsets[0]),
+                ComputedStyleValueHandle::from_retained(&offsets[1]),
+                ComputedStyleValueHandle::from_retained(&offsets[2]),
             )
         }
         _ => unreachable!("computed transform-origin is a three-value list"),
@@ -1249,66 +1469,61 @@ unsafe fn build_transform_group(
         None => (false, 0),
     };
 
-    let Some(StyleValueData::Position { edge_x, edge_y }) = values.value(property_id::PERSPECTIVE_ORIGIN) else {
+    let Some(StyleValueData::Position(position_payload)) = values.value(property_id::PERSPECTIVE_ORIGIN) else {
         unreachable!("computed perspective-origin is a position value");
     };
+    let PositionPayload { edge_x, edge_y } = &**position_payload;
     let position_offset = |edge: &crate::css::style_value::RetainedStyleValueData| {
         let StyleValueData::Edge { offset, .. } = edge.data() else {
             unreachable!("computed position component is an edge value");
         };
-        ComputedStyleValueHandle::retained(offset.pointer())
+        ComputedStyleValueHandle::from_retained(offset)
     };
+    let has_offset_path = values
+        .value(property_id::OFFSET_PATH)
+        .is_some_and(|value| !crate::css::style_value::is_none_keyword(value));
+
     let perspective_origin_x = position_offset(edge_x);
     let perspective_origin_y = position_offset(edge_y);
 
-    // SAFETY: The closure casts the scratch payload to its registered
-    // Rust-native type and the caller warrants the parent payload.
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::TRANSFORM,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<TransformValues>();
-                payload.transformations = transform_list;
-                payload.resolved_transforms = RetainedComputedResolvedTransformList::from_vec(resolved);
-                payload.transform_origin_x = transform_origin_x;
-                payload.transform_origin_y = transform_origin_y;
-                payload.transform_origin_z = transform_origin_z;
-                payload.rotate = rotate;
-                payload.translate = translate;
-                payload.scale = scale;
-                payload.has_perspective = has_perspective;
-                payload.perspective_px = perspective_px;
-                payload.perspective_origin_x = perspective_origin_x;
-                payload.perspective_origin_y = perspective_origin_y;
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::TRANSFORM,
+        &entries,
+        |payload: &mut TransformValues| {
+            payload.transformations = transform_list;
+            payload.resolved_transforms = RetainedComputedResolvedTransformList::from_vec(resolved);
+            payload.transform_origin_x = transform_origin_x;
+            payload.transform_origin_y = transform_origin_y;
+            payload.transform_origin_z = transform_origin_z;
+            payload.rotate = rotate;
+            payload.translate = translate;
+            payload.scale = scale;
+            payload.has_perspective = has_perspective;
+            payload.perspective_px = perspective_px;
+            payload.perspective_origin_x = perspective_origin_x;
+            payload.perspective_origin_y = perspective_origin_y;
+            payload.has_offset_path = has_offset_path;
+            payload.offset_path = retained(property_id::OFFSET_PATH);
+            payload.offset_distance = retained(property_id::OFFSET_DISTANCE);
+            payload.offset_position = retained(property_id::OFFSET_POSITION);
+            payload.offset_anchor = retained(property_id::OFFSET_ANCHOR);
+            payload.offset_rotate = retained(property_id::OFFSET_ROTATE);
+        },
+        parent,
+    )
 }
 
 /// The shared prefix of every color style value variant.
 fn color_base_of(data: &StyleValueData) -> Option<&crate::css::style_value::ColorBase> {
-    match data {
-        StyleValueData::ColorFunction { color_base, .. }
-        | StyleValueData::ColorMix { color_base, .. }
-        | StyleValueData::LightDark { color_base, .. }
-        | StyleValueData::ContrastColor { color_base, .. } => Some(color_base),
-        _ => None,
-    }
+    data.color_base()
 }
 
 /// The C++ shadow color-syntax classification: non-color values are legacy,
 /// the named color-function types split into the legacy rgb/hsl/hwb family
 /// and the modern rest, and untyped colors carry their own syntax flag.
 fn shadow_color_syntax(color: Option<&StyleValueData>) -> u8 {
-    const COLOR_SYNTAX_LEGACY: u8 = 0;
-    const COLOR_SYNTAX_MODERN: u8 = 1;
     // The C++ ColorStyleValue::ColorType codes, pinned by static asserts in
     // ComputedValues.cpp.
-    const COLOR_TYPE_RGB: u8 = 0;
-    const COLOR_TYPE_HSL: u8 = 4;
-    const COLOR_TYPE_HWB: u8 = 5;
 
     let Some(base) = color.and_then(color_base_of) else {
         return COLOR_SYNTAX_LEGACY;
@@ -1327,7 +1542,7 @@ fn shadow_color_syntax(color: Option<&StyleValueData>) -> u8 {
 /// Returns the operations plus the retained list handle; a value that is not
 /// a filter list lowers to none, as the C++ extractor did.
 fn lower_filter_operations(
-    values: &EffectiveValues,
+    values: &LonghandSource,
     property: u16,
     input: &ColorResolutionInput,
 ) -> (Vec<ComputedFilterOperation>, ComputedStyleValueHandle) {
@@ -1375,7 +1590,7 @@ fn lower_filter_operations(
             StyleValueData::Url { .. } => {
                 operations.push(ComputedFilterOperation {
                     kind: FILTER_KIND_URL,
-                    url_value: ComputedStyleValueHandle::retained(value.pointer()),
+                    url_value: ComputedStyleValueHandle::from_retained(value),
                     ..empty_operation()
                 });
             }
@@ -1392,16 +1607,16 @@ fn lower_filter_operations(
                     });
                 }
                 FILTER_KIND_DROP_SHADOW => {
-                    let StyleValueData::Shadow {
+                    let StyleValueData::Shadow(shadow_payload) = filter_value.data() else {
+                        unreachable!("a computed drop-shadow filter holds a shadow value");
+                    };
+                    let ShadowPayload {
                         color,
                         offset_x,
                         offset_y,
                         blur_radius,
                         ..
-                    } = filter_value.data()
-                    else {
-                        unreachable!("a computed drop-shadow filter holds a shadow value");
-                    };
+                    } = &**shadow_payload;
                     let fallback = input.current_color.unwrap_or(Rgba {
                         r: 0,
                         g: 0,
@@ -1447,18 +1662,21 @@ fn lower_filter_operations(
     }
     (
         operations,
-        ComputedStyleValueHandle::retained(values.pointer(property).cast()),
+        ComputedStyleValueHandle::from_retained(values.handle(property)),
     )
 }
 
-fn lower_shadow_layers(values: &EffectiveValues, property: u16, input: &ColorResolutionInput) -> Vec<ComputedShadow> {
+fn lower_shadow_layers(values: &LonghandSource, property: u16, input: &ColorResolutionInput) -> Vec<ComputedShadow> {
     let Some(StyleValueData::ValueList { values: list, .. }) = values.value(property) else {
         // A computed shadow list is the none keyword or a value list.
         return Vec::new();
     };
     let mut shadows = Vec::with_capacity(list.as_slice().len());
     for value in list.as_slice() {
-        let StyleValueData::Shadow {
+        let StyleValueData::Shadow(shadow_payload) = value.data() else {
+            unreachable!("a computed box-shadow layer is a shadow value");
+        };
+        let ShadowPayload {
             color,
             offset_x,
             offset_y,
@@ -1466,15 +1684,11 @@ fn lower_shadow_layers(values: &EffectiveValues, property: u16, input: &ColorRes
             spread_distance,
             placement,
             ..
-        } = value.data()
-        else {
-            unreachable!("a computed box-shadow layer is a shadow value");
-        };
-        // A missing color is the element's own color, matching the
-        // currentcolor default the C++ accessor materialized.
-        let resolved_color = match color.optional_data() {
-            Some(color) => to_color(color, input).expect("a computed shadow color resolves"),
-            None => input.current_color.expect("the build input carries the element color"),
+        } = &**shadow_payload;
+        // A missing color is `currentcolor`, which the shadow's reader resolves.
+        let held_color = match color.optional_data() {
+            Some(color) => style_color(color, input).expect("a computed shadow color resolves"),
+            None => StyleColor::CURRENT_COLOR,
         };
         shadows.push(ComputedShadow {
             offset_x: length_to_css_pixels(offset_x.data()).raw_value(),
@@ -1485,7 +1699,7 @@ fn lower_shadow_layers(values: &EffectiveValues, property: u16, input: &ColorRes
             spread_distance: spread_distance
                 .optional_data()
                 .map_or(0, |spread| length_to_css_pixels(spread).raw_value()),
-            color: packed_color(resolved_color),
+            color: held_color,
             color_syntax: shadow_color_syntax(color.optional_data()),
             placement: u32::from(*placement),
         });
@@ -1516,14 +1730,13 @@ fn lower_clip_edge(data: &StyleValueData) -> ComputedClipEdge {
 }
 
 /// Builds the complete effects payload in Rust.
-unsafe fn build_effects_group(
-    values: &EffectiveValues,
+fn build_effects_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) = (unsafe { gather_group_entries(group_index::EFFECTS, values, input, used_color_scheme) })
-    else {
+    let Some(entries) = gather_group_entries(group_index::EFFECTS, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
 
@@ -1537,20 +1750,23 @@ unsafe fn build_effects_group(
         unit: crate::css::style_compute::px_length_unit(),
     };
     let (clip_is_rect, clip_edges) = match values.value(property_id::CLIP) {
-        Some(StyleValueData::Rect {
-            top,
-            right,
-            bottom,
-            left,
-        }) => (
-            true,
-            [
-                lower_clip_edge(top.data()),
-                lower_clip_edge(right.data()),
-                lower_clip_edge(bottom.data()),
-                lower_clip_edge(left.data()),
-            ],
-        ),
+        Some(StyleValueData::Rect(rect_payload)) => {
+            let RectPayload {
+                top,
+                right,
+                bottom,
+                left,
+            } = &**rect_payload;
+            (
+                true,
+                [
+                    lower_clip_edge(top.data()),
+                    lower_clip_edge(right.data()),
+                    lower_clip_edge(bottom.data()),
+                    lower_clip_edge(left.data()),
+                ],
+            )
+        }
         _ => (false, [auto_edge(), auto_edge(), auto_edge(), auto_edge()]),
     };
 
@@ -1562,34 +1778,29 @@ unsafe fn build_effects_group(
         filter_list: backdrop_list,
         operations: RetainedComputedFilterOperationList::from_vec(backdrop_operations),
     };
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::EFFECTS,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<EffectsValues>();
-                payload.filter = filter;
-                payload.backdrop_filter = backdrop_filter;
-                payload.box_shadows = RetainedComputedShadowList::from_vec(shadows);
-                payload.clip_is_rect = clip_is_rect;
-                payload.clip_edges = clip_edges;
-                payload.opacity_style_value =
-                    ComputedStyleValueHandle::retained(values.pointer(property_id::OPACITY).cast());
-                payload.filter_style_value =
-                    ComputedStyleValueHandle::retained(values.pointer(property_id::FILTER).cast());
-                payload.backdrop_filter_style_value =
-                    ComputedStyleValueHandle::retained(values.pointer(property_id::BACKDROP_FILTER).cast());
-                payload.mix_blend_mode_style_value =
-                    ComputedStyleValueHandle::retained(values.pointer(property_id::MIX_BLEND_MODE).cast());
-                payload.isolation_style_value =
-                    ComputedStyleValueHandle::retained(values.pointer(property_id::ISOLATION).cast());
-                payload.box_shadow_style_value =
-                    ComputedStyleValueHandle::retained(values.pointer(property_id::BOX_SHADOW).cast());
-                payload.clip_style_value = ComputedStyleValueHandle::retained(values.pointer(property_id::CLIP).cast());
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::EFFECTS,
+        &entries,
+        |payload: &mut EffectsValues| {
+            payload.filter = filter;
+            payload.backdrop_filter = backdrop_filter;
+            payload.box_shadows = RetainedComputedShadowList::from_vec(shadows);
+            payload.clip_is_rect = clip_is_rect;
+            payload.clip_edges = clip_edges;
+            payload.opacity_style_value = ComputedStyleValueHandle::from_retained(values.handle(property_id::OPACITY));
+            payload.filter_style_value = ComputedStyleValueHandle::from_retained(values.handle(property_id::FILTER));
+            payload.backdrop_filter_style_value =
+                ComputedStyleValueHandle::from_retained(values.handle(property_id::BACKDROP_FILTER));
+            payload.mix_blend_mode_style_value =
+                ComputedStyleValueHandle::from_retained(values.handle(property_id::MIX_BLEND_MODE));
+            payload.isolation_style_value =
+                ComputedStyleValueHandle::from_retained(values.handle(property_id::ISOLATION));
+            payload.box_shadow_style_value =
+                ComputedStyleValueHandle::from_retained(values.handle(property_id::BOX_SHADOW));
+            payload.clip_style_value = ComputedStyleValueHandle::from_retained(values.handle(property_id::CLIP));
+        },
+        parent,
+    )
 }
 
 // --- Border lowering -------------------------------------------------------
@@ -1599,13 +1810,11 @@ unsafe fn build_effects_group(
 // wrapper-backed members travel as retained canonical handles.
 
 /// The comma-separated computed items of a repeatable-list property: the
-/// list's element pointers, or the single value itself.
-fn repeatable_item_pointers(values: &EffectiveValues, property: u16) -> Vec<*const c_void> {
+/// list's elements, or the single value itself.
+fn repeatable_items<'a>(values: &LonghandSource<'a>, property: u16) -> Vec<&'a RetainedStyleValueData> {
     match values.value(property) {
-        Some(StyleValueData::ValueList { values: list, .. }) => {
-            list.as_slice().iter().map(|value| value.pointer().cast()).collect()
-        }
-        _ => vec![values.pointer(property)],
+        Some(StyleValueData::ValueList { values: list, .. }) => list.as_slice().iter().collect(),
+        _ => vec![values.handle(property)],
     }
 }
 
@@ -1617,119 +1826,110 @@ fn keyword_of(data: &StyleValueData) -> Option<u16> {
 }
 
 fn border_radius_is_initial(data: &StyleValueData) -> bool {
-    let StyleValueData::BorderRadius {
+    let StyleValueData::BorderRadius(border_radius_payload) = data else {
+        return false;
+    };
+    let BorderRadiusPayload {
         horizontal_radius,
         vertical_radius,
         ..
-    } = data
-    else {
-        return false;
-    };
+    } = &**border_radius_payload;
     let is_zero_px = |radius: &crate::css::style_value::RetainedStyleValueData| matches!(radius.data(), StyleValueData::Length { value, unit } if *value == 0.0 && *unit == crate::css::style_compute::px_length_unit());
     is_zero_px(horizontal_radius) && is_zero_px(vertical_radius)
 }
 
 /// Builds the background group from retained canonical computed values.
-unsafe fn build_background_group(
-    values: &EffectiveValues,
+fn build_background_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) = (unsafe { gather_group_entries(group_index::BACKGROUND, values, input, used_color_scheme) })
-    else {
+    let Some(entries) = gather_group_entries(group_index::BACKGROUND, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
-    let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
-    let background_color = resolved_color(
-        input,
-        property_id::BACKGROUND_COLOR,
+    let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
+    let background_color = style_color(
         values
             .value(property_id::BACKGROUND_COLOR)
             .expect("background-color has a computed value"),
+        input,
     )
     .expect("a computed background-color resolves in Rust");
-    let image_items = repeatable_item_pointers(values, property_id::BACKGROUND_IMAGE);
-    let clip_items = repeatable_item_pointers(values, property_id::BACKGROUND_CLIP);
-    let final_clip_pointer = clip_items[(image_items.len() - 1) % clip_items.len()];
-    let final_clip = unsafe { &*final_clip_pointer.cast::<StyleValueData>() };
+    let image_items = repeatable_items(values, property_id::BACKGROUND_IMAGE);
+    let clip_items = repeatable_items(values, property_id::BACKGROUND_CLIP);
+    let final_clip = clip_items[(image_items.len() - 1) % clip_items.len()].data();
     let background_color_clip = keyword_of(final_clip)
         .and_then(crate::css::css_enums::keyword_to_background_box)
         .expect("a computed background-clip keyword maps to its enum");
 
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::BACKGROUND,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<BackgroundValues>();
-                payload.background_color = background_color;
-                payload.background_color_style_value = retained(property_id::BACKGROUND_COLOR);
-                payload.background_color_clip = background_color_clip;
-                payload.background_image = retained(property_id::BACKGROUND_IMAGE);
-                payload.background_attachment = retained(property_id::BACKGROUND_ATTACHMENT);
-                payload.background_blend_mode = retained(property_id::BACKGROUND_BLEND_MODE);
-                payload.background_clip = retained(property_id::BACKGROUND_CLIP);
-                payload.background_origin = retained(property_id::BACKGROUND_ORIGIN);
-                payload.background_position_x = retained(property_id::BACKGROUND_POSITION_X);
-                payload.background_position_y = retained(property_id::BACKGROUND_POSITION_Y);
-                payload.background_repeat = retained(property_id::BACKGROUND_REPEAT);
-                payload.background_size = retained(property_id::BACKGROUND_SIZE);
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::BACKGROUND,
+        &entries,
+        |payload: &mut BackgroundValues| {
+            payload.background_color = background_color;
+            payload.background_color_style_value = retained(property_id::BACKGROUND_COLOR);
+            payload.background_color_clip = background_color_clip;
+            payload.background_image = retained(property_id::BACKGROUND_IMAGE);
+            payload.background_attachment = retained(property_id::BACKGROUND_ATTACHMENT);
+            payload.background_blend_mode = retained(property_id::BACKGROUND_BLEND_MODE);
+            payload.background_clip = retained(property_id::BACKGROUND_CLIP);
+            payload.background_origin = retained(property_id::BACKGROUND_ORIGIN);
+            payload.background_position_x = retained(property_id::BACKGROUND_POSITION_X);
+            payload.background_position_y = retained(property_id::BACKGROUND_POSITION_Y);
+            payload.background_repeat = retained(property_id::BACKGROUND_REPEAT);
+            payload.background_size = retained(property_id::BACKGROUND_SIZE);
+        },
+        parent,
+    )
 }
 
 /// Builds the mask group from retained canonical computed values.
-unsafe fn build_mask_group(
-    values: &EffectiveValues,
+fn build_mask_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) = (unsafe { gather_group_entries(group_index::MASK, values, input, used_color_scheme) }) else {
+    let Some(entries) = gather_group_entries(group_index::MASK, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
-    let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::MASK,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<MaskValues>();
-                payload.mask_image = retained(property_id::MASK_IMAGE);
-                payload.mask_type = retained(property_id::MASK_TYPE);
-                payload.clip_path = retained(property_id::CLIP_PATH);
-                payload.mask_mode = retained(property_id::MASK_MODE);
-                payload.mask_repeat = retained(property_id::MASK_REPEAT);
-                payload.mask_position = retained(property_id::MASK_POSITION);
-                payload.mask_clip = retained(property_id::MASK_CLIP);
-                payload.mask_origin = retained(property_id::MASK_ORIGIN);
-                payload.mask_size = retained(property_id::MASK_SIZE);
-                payload.mask_composite = retained(property_id::MASK_COMPOSITE);
-            },
-            parent_payload,
-        )
-    }
+    let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::MASK,
+        &entries,
+        |payload: &mut MaskValues| {
+            payload.mask_image = retained(property_id::MASK_IMAGE);
+            payload.mask_type = retained(property_id::MASK_TYPE);
+            payload.clip_path = retained(property_id::CLIP_PATH);
+            payload.mask_mode = retained(property_id::MASK_MODE);
+            payload.mask_repeat = retained(property_id::MASK_REPEAT);
+            payload.mask_position = retained(property_id::MASK_POSITION);
+            payload.mask_clip = retained(property_id::MASK_CLIP);
+            payload.mask_origin = retained(property_id::MASK_ORIGIN);
+            payload.mask_size = retained(property_id::MASK_SIZE);
+            payload.mask_composite = retained(property_id::MASK_COMPOSITE);
+        },
+        parent,
+    )
 }
 
 /// Builds the border group from layout-facing side facts and retained
 /// canonical values for the C++ presentation views.
-unsafe fn build_border_group(
-    values: &EffectiveValues,
+fn build_border_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let generic = unsafe { build_generic_group(group_index::BORDER, values, input, used_color_scheme, parent_payload) };
+    let generic = build_generic_group(group_index::BORDER, values, input, used_color_scheme, parent);
     if !generic.is_null() {
         return generic;
     }
-    let Some(entries) = (unsafe { gather_group_entries(group_index::BORDER, values, input, used_color_scheme) }) else {
+    let Some(entries) = gather_group_entries(group_index::BORDER, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
-    let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
+    let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
     let has_noninitial_border_radii = [
         property_id::BORDER_BOTTOM_LEFT_RADIUS,
         property_id::BORDER_BOTTOM_RIGHT_RADIUS,
@@ -1751,12 +1951,11 @@ unsafe fn build_border_group(
                 .expect("a computed border width has a value"),
         );
         crate::css::computed_value_types::ComputedBorderSide {
-            color: resolved_color(
-                input,
-                color_property,
+            color: style_color(
                 values
                     .value(color_property)
                     .expect("a computed border color has a value"),
+                input,
             )
             .expect("a computed border color resolves in Rust"),
             line_style,
@@ -1769,83 +1968,81 @@ unsafe fn build_border_group(
         }
     };
 
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::BORDER,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<BorderValues>();
-                payload.border_left = side(
-                    property_id::BORDER_LEFT_STYLE,
-                    property_id::BORDER_LEFT_WIDTH,
-                    property_id::BORDER_LEFT_COLOR,
-                );
-                payload.border_top = side(
-                    property_id::BORDER_TOP_STYLE,
-                    property_id::BORDER_TOP_WIDTH,
-                    property_id::BORDER_TOP_COLOR,
-                );
-                payload.border_right = side(
-                    property_id::BORDER_RIGHT_STYLE,
-                    property_id::BORDER_RIGHT_WIDTH,
-                    property_id::BORDER_RIGHT_COLOR,
-                );
-                payload.border_bottom = side(
-                    property_id::BORDER_BOTTOM_STYLE,
-                    property_id::BORDER_BOTTOM_WIDTH,
-                    property_id::BORDER_BOTTOM_COLOR,
-                );
-                payload.border_left_color_style_value = retained(property_id::BORDER_LEFT_COLOR);
-                payload.border_top_color_style_value = retained(property_id::BORDER_TOP_COLOR);
-                payload.border_right_color_style_value = retained(property_id::BORDER_RIGHT_COLOR);
-                payload.border_bottom_color_style_value = retained(property_id::BORDER_BOTTOM_COLOR);
-                payload.border_left_computed_width = length_to_css_pixels(
-                    values
-                        .value(property_id::BORDER_LEFT_WIDTH)
-                        .expect("border-left-width has a computed value"),
-                );
-                payload.border_top_computed_width = length_to_css_pixels(
-                    values
-                        .value(property_id::BORDER_TOP_WIDTH)
-                        .expect("border-top-width has a computed value"),
-                );
-                payload.border_right_computed_width = length_to_css_pixels(
-                    values
-                        .value(property_id::BORDER_RIGHT_WIDTH)
-                        .expect("border-right-width has a computed value"),
-                );
-                payload.border_bottom_computed_width = length_to_css_pixels(
-                    values
-                        .value(property_id::BORDER_BOTTOM_WIDTH)
-                        .expect("border-bottom-width has a computed value"),
-                );
-                payload.border_bottom_left_radius = retained(property_id::BORDER_BOTTOM_LEFT_RADIUS);
-                payload.border_bottom_right_radius = retained(property_id::BORDER_BOTTOM_RIGHT_RADIUS);
-                payload.border_top_left_radius = retained(property_id::BORDER_TOP_LEFT_RADIUS);
-                payload.border_top_right_radius = retained(property_id::BORDER_TOP_RIGHT_RADIUS);
-                payload.has_noninitial_border_radii = has_noninitial_border_radii;
-                payload.border_image_source = retained(property_id::BORDER_IMAGE_SOURCE);
-                payload.border_image_slice = retained(property_id::BORDER_IMAGE_SLICE);
-                payload.border_image_width = retained(property_id::BORDER_IMAGE_WIDTH);
-                payload.border_image_outset = retained(property_id::BORDER_IMAGE_OUTSET);
-                payload.border_image_repeat = retained(property_id::BORDER_IMAGE_REPEAT);
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::BORDER,
+        &entries,
+        |payload: &mut BorderValues| {
+            payload.border_left = side(
+                property_id::BORDER_LEFT_STYLE,
+                property_id::BORDER_LEFT_WIDTH,
+                property_id::BORDER_LEFT_COLOR,
+            );
+            payload.border_top = side(
+                property_id::BORDER_TOP_STYLE,
+                property_id::BORDER_TOP_WIDTH,
+                property_id::BORDER_TOP_COLOR,
+            );
+            payload.border_right = side(
+                property_id::BORDER_RIGHT_STYLE,
+                property_id::BORDER_RIGHT_WIDTH,
+                property_id::BORDER_RIGHT_COLOR,
+            );
+            payload.border_bottom = side(
+                property_id::BORDER_BOTTOM_STYLE,
+                property_id::BORDER_BOTTOM_WIDTH,
+                property_id::BORDER_BOTTOM_COLOR,
+            );
+            payload.border_left_color_style_value = retained(property_id::BORDER_LEFT_COLOR);
+            payload.border_top_color_style_value = retained(property_id::BORDER_TOP_COLOR);
+            payload.border_right_color_style_value = retained(property_id::BORDER_RIGHT_COLOR);
+            payload.border_bottom_color_style_value = retained(property_id::BORDER_BOTTOM_COLOR);
+            payload.border_left_computed_width = length_to_css_pixels(
+                values
+                    .value(property_id::BORDER_LEFT_WIDTH)
+                    .expect("border-left-width has a computed value"),
+            );
+            payload.border_top_computed_width = length_to_css_pixels(
+                values
+                    .value(property_id::BORDER_TOP_WIDTH)
+                    .expect("border-top-width has a computed value"),
+            );
+            payload.border_right_computed_width = length_to_css_pixels(
+                values
+                    .value(property_id::BORDER_RIGHT_WIDTH)
+                    .expect("border-right-width has a computed value"),
+            );
+            payload.border_bottom_computed_width = length_to_css_pixels(
+                values
+                    .value(property_id::BORDER_BOTTOM_WIDTH)
+                    .expect("border-bottom-width has a computed value"),
+            );
+            payload.border_bottom_left_radius = retained(property_id::BORDER_BOTTOM_LEFT_RADIUS);
+            payload.border_bottom_right_radius = retained(property_id::BORDER_BOTTOM_RIGHT_RADIUS);
+            payload.border_top_left_radius = retained(property_id::BORDER_TOP_LEFT_RADIUS);
+            payload.border_top_right_radius = retained(property_id::BORDER_TOP_RIGHT_RADIUS);
+            payload.has_noninitial_border_radii = has_noninitial_border_radii;
+            payload.border_image_source = retained(property_id::BORDER_IMAGE_SOURCE);
+            payload.border_shape = retained(property_id::BORDER_SHAPE);
+            payload.border_image_slice = retained(property_id::BORDER_IMAGE_SLICE);
+            payload.border_image_width = retained(property_id::BORDER_IMAGE_WIDTH);
+            payload.border_image_outset = retained(property_id::BORDER_IMAGE_OUTSET);
+            payload.border_image_repeat = retained(property_id::BORDER_IMAGE_REPEAT);
+        },
+        parent,
+    )
 }
 
 // --- SVG, list and content lowering -----------------------------------------
 
 use crate::css::computed_value_types::{SVG_PAINT_COLOR, SVG_PAINT_NONE, SVG_PAINT_URL};
+use crate::css::value_codes::*;
 
-fn lower_svg_paint(values: &EffectiveValues, property: u16, input: &ColorResolutionInput) -> ComputedSvgPaint {
+fn lower_svg_paint(values: &LonghandSource, property: u16, input: &ColorResolutionInput) -> ComputedSvgPaint {
     let mut paint = ComputedSvgPaint {
         kind: SVG_PAINT_NONE,
         url: ComputedStyleValueHandle::empty(),
         has_color: false,
-        color: 0,
-        color_is_currentcolor: false,
+        color: StyleColor::rgba(0),
     };
     let data = values.value(property).expect("the table holds the paint property");
     match data {
@@ -1853,33 +2050,27 @@ fn lower_svg_paint(values: &EffectiveValues, property: u16, input: &ColorResolut
         StyleValueData::ValueList { values: list, .. } if list.as_slice().len() == 2 => {
             let components = list.as_slice();
             paint.kind = SVG_PAINT_URL;
-            paint.url = ComputedStyleValueHandle::retained(components[0].pointer());
+            paint.url = ComputedStyleValueHandle::from_retained(&components[0]);
             match components[1].data() {
                 StyleValueData::EmptyOptional => paint,
                 StyleValueData::Keyword { keyword: code } if *code == keyword::NONE => paint,
                 fallback => {
-                    let color = to_color(fallback, input).expect("a computed SVG paint fallback is a color");
                     paint.has_color = true;
-                    paint.color = packed_color(color);
-                    paint.color_is_currentcolor =
-                        matches!(fallback, StyleValueData::Keyword { keyword: code } if *code == keyword::CURRENTCOLOR);
+                    paint.color = style_color(fallback, input).expect("a computed SVG paint fallback is a color");
                     paint
                 }
             }
         }
         _ => {
-            let color = to_color(data, input).expect("a computed SVG paint is none, a color, or a URL paint");
             paint.kind = SVG_PAINT_COLOR;
             paint.has_color = true;
-            paint.color = packed_color(color);
-            paint.color_is_currentcolor =
-                matches!(data, StyleValueData::Keyword { keyword: code } if *code == keyword::CURRENTCOLOR);
+            paint.color = style_color(data, input).expect("a computed SVG paint is none, a color, or a URL paint");
             paint
         }
     }
 }
 
-fn lower_svg_length_percentage_or_number(values: &EffectiveValues, property: u16) -> ComputedStyleValueHandle {
+fn lower_svg_length_percentage_or_number(values: &LonghandSource, property: u16) -> ComputedStyleValueHandle {
     let data = values.value(property).expect("the table holds the property");
     let number = match data {
         StyleValueData::Number { value } => Some(*value),
@@ -1890,19 +2081,18 @@ fn lower_svg_length_percentage_or_number(values: &EffectiveValues, property: u16
         // FIXME: Converting to pixels isn't really correct - values should be in "user units"
         //        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
         Some(number) => ComputedStyleValueHandle::length(number),
-        None => ComputedStyleValueHandle::retained(values.pointer(property).cast()),
+        None => ComputedStyleValueHandle::from_retained(values.handle(property)),
     }
 }
 
 /// Builds the complete inherited SVG payload in Rust.
-unsafe fn build_inherited_svg_group(
-    values: &EffectiveValues,
+fn build_inherited_svg_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) = (unsafe { gather_group_entries(group_index::INHERITED_SVG, values, input, used_color_scheme) })
-    else {
+    let Some(entries) = gather_group_entries(group_index::INHERITED_SVG, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
 
@@ -1928,7 +2118,7 @@ unsafe fn build_inherited_svg_group(
                 None => ComputedSvgDash {
                     is_number: false,
                     number: 0.0,
-                    value: ComputedStyleValueHandle::retained(item.pointer()),
+                    value: ComputedStyleValueHandle::from_retained(item),
                 },
             });
         }
@@ -1979,144 +2169,146 @@ unsafe fn build_inherited_svg_group(
         .and_then(keyword_of)
         .and_then(crate::css::css_enums::keyword_to_baseline_metric);
 
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::INHERITED_SVG,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<InheritedSVGValues>();
-                payload.fill = lower_svg_paint(values, property_id::FILL, input);
-                payload.stroke = lower_svg_paint(values, property_id::STROKE, input);
-                payload.stroke_dasharray = RetainedComputedSvgDashList::from_vec(dashes);
-                payload.stroke_dashoffset =
-                    lower_svg_length_percentage_or_number(values, property_id::STROKE_DASHOFFSET);
-                payload.stroke_width = lower_svg_length_percentage_or_number(values, property_id::STROKE_WIDTH);
-                payload.paint_order = order;
-                payload.paint_order_serialization_length = serialization_length;
-                payload.paint_order_is_normal = is_normal;
-                payload.has_dominant_baseline = dominant_baseline.is_some();
-                payload.dominant_baseline = dominant_baseline.unwrap_or(0);
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::INHERITED_SVG,
+        &entries,
+        |payload: &mut InheritedSVGValues| {
+            payload.fill = lower_svg_paint(values, property_id::FILL, input);
+            payload.stroke = lower_svg_paint(values, property_id::STROKE, input);
+            payload.stroke_dasharray = RetainedComputedSvgDashList::from_vec(dashes);
+            payload.stroke_dashoffset = lower_svg_length_percentage_or_number(values, property_id::STROKE_DASHOFFSET);
+            payload.stroke_width = lower_svg_length_percentage_or_number(values, property_id::STROKE_WIDTH);
+            payload.paint_order = order;
+            payload.paint_order_serialization_length = serialization_length;
+            payload.paint_order_is_normal = is_normal;
+            payload.has_dominant_baseline = dominant_baseline.is_some();
+            payload.dominant_baseline = dominant_baseline.unwrap_or(0);
+        },
+        parent,
+    )
 }
 
 /// Builds the inherited list group from canonical values without leaving
 /// Rust. Counter-style scope resolution remains a consumer-side operation.
-unsafe fn build_inherited_list_group(
-    values: &EffectiveValues,
+fn build_inherited_list_table_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let generic = unsafe {
-        build_generic_group(
-            group_index::INHERITED_LIST,
-            values,
-            input,
-            used_color_scheme,
-            parent_payload,
-        )
-    };
+    let generic = build_generic_group(
+        group_index::INHERITED_LIST_TABLE,
+        values,
+        input,
+        used_color_scheme,
+        parent,
+    );
     if !generic.is_null() {
         return generic;
     }
-    let Some(entries) =
-        (unsafe { gather_group_entries(group_index::INHERITED_LIST, values, input, used_color_scheme) })
+    let Some(entries) = gather_group_entries(group_index::INHERITED_LIST_TABLE, values, input, used_color_scheme)
     else {
         return std::ptr::null();
     };
 
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::INHERITED_LIST,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<InheritedListValues>();
-                let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
-                payload.list_style_type = retained(property_id::LIST_STYLE_TYPE);
-                payload.list_style_position = values
-                    .value(property_id::LIST_STYLE_POSITION)
-                    .and_then(keyword_of)
-                    .and_then(crate::css::css_enums::keyword_to_list_style_position)
-                    .expect("a computed list-style-position maps to its enum");
-                payload.list_style_image = retained(property_id::LIST_STYLE_IMAGE);
-                payload.quotes = retained(property_id::QUOTES);
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::INHERITED_LIST_TABLE,
+        &entries,
+        |payload: &mut InheritedListTableValues| {
+            let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
+            payload.list_style_type = retained(property_id::LIST_STYLE_TYPE);
+            payload.list_style_image = retained(property_id::LIST_STYLE_IMAGE);
+            payload.quotes = retained(property_id::QUOTES);
+            // NB: Computed border-spacing is a pair of absolute pixel lengths.
+            let spacing_component = |data: &StyleValueData| -> i32 {
+                match data {
+                    StyleValueData::Length { value, unit } if *unit == crate::css::style_compute::px_length_unit() => {
+                        crate::css::css_pixels::CssPixels::nearest_value_for(*value).raw_value()
+                    }
+                    _ => panic!("computed border-spacing component is not an absolute pixel length"),
+                }
+            };
+            let components = match values.value(property_id::BORDER_SPACING) {
+                Some(StyleValueData::ValueList { values, .. }) if values.as_slice().len() == 2 => values.as_slice(),
+                _ => panic!("computed border-spacing is not a pair"),
+            };
+            payload.border_spacing_horizontal = spacing_component(components[0].data());
+            payload.border_spacing_vertical = spacing_component(components[1].data());
+        },
+        parent,
+    )
 }
 
 /// Builds the content group from its canonical values without leaving Rust.
-unsafe fn build_content_group(
-    values: &EffectiveValues,
+fn build_content_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let generic =
-        unsafe { build_generic_group(group_index::CONTENT, values, input, used_color_scheme, parent_payload) };
+    let generic = build_generic_group(group_index::CONTENT, values, input, used_color_scheme, parent);
     if !generic.is_null() {
         return generic;
     }
-    let Some(entries) = (unsafe { gather_group_entries(group_index::CONTENT, values, input, used_color_scheme) })
-    else {
+    let Some(entries) = gather_group_entries(group_index::CONTENT, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
 
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::CONTENT,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<ContentValues>();
-                let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
-                payload.content = retained(property_id::CONTENT);
-                payload.counter_increment = retained(property_id::COUNTER_INCREMENT);
-                payload.counter_reset = retained(property_id::COUNTER_RESET);
-                payload.counter_set = retained(property_id::COUNTER_SET);
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::CONTENT,
+        &entries,
+        |payload: &mut ContentValues| {
+            let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
+            payload.content = retained(property_id::CONTENT);
+            payload.counter_increment = retained(property_id::COUNTER_INCREMENT);
+            payload.counter_reset = retained(property_id::COUNTER_RESET);
+            payload.counter_set = retained(property_id::COUNTER_SET);
+        },
+        parent,
+    )
 }
 
 // --- Inherited UI, inherited text and misc lowering -------------------------
 
 /// Builds the complete inherited UI payload in Rust.
-unsafe fn build_inherited_ui_group(
-    values: &EffectiveValues,
+fn build_inherited_ui_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) = (unsafe { gather_group_entries(group_index::INHERITED_UI, values, input, used_color_scheme) })
-    else {
+    let Some(entries) = gather_group_entries(group_index::INHERITED_UI, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
 
-    let color_or_auto = |property: u16| -> ComputedColorOrAuto {
+    // An auto caret-color is the element's own color, which its reader resolves like
+    // `currentcolor`; an auto accent-color is the system accent color for the used scheme.
+    let color_or_auto = |property: u16, auto: StyleColor| -> ComputedColorOrAuto {
         let data = values.value(property).expect("the table holds the color property");
         let is_auto = matches!(data, StyleValueData::Keyword { keyword: code } if *code == keyword::AUTO);
-        let used_color = resolved_color(input, property, data).expect("computed UI colors are resolvable in Rust");
         ComputedColorOrAuto {
             is_auto,
-            computed_color: used_color,
-            used_color,
+            color: match is_auto {
+                true => auto,
+                false => style_color(data, input).expect("computed UI colors are resolvable in Rust"),
+            },
         }
     };
-    let caret_color = color_or_auto(property_id::CARET_COLOR);
-    let accent_color = color_or_auto(property_id::ACCENT_COLOR);
+    let caret_color = color_or_auto(property_id::CARET_COLOR, StyleColor::CURRENT_COLOR);
+    let accent_color = color_or_auto(
+        property_id::ACCENT_COLOR,
+        StyleColor::rgba(packed_color(accent_color(
+            input.scheme == Some(PREFERRED_COLOR_SCHEME_DARK),
+        ))),
+    );
 
     // The cursor list, with the extractor's rules: unmappable keywords are
     // skipped, and an empty result is the predefined auto cursor.
     let mut cursors: Vec<ComputedCursor> = Vec::new();
-    let mut push_cursor = |data: &StyleValueData, pointer: *const c_void| match data {
+    let mut push_cursor = |data: &StyleValueData, handle: &RetainedStyleValueData| match data {
         StyleValueData::Cursor { .. } => cursors.push(ComputedCursor {
             is_cursor_value: true,
-            cursor: ComputedStyleValueHandle::retained(pointer.cast()),
+            cursor: ComputedStyleValueHandle::from_retained(handle),
             predefined: 0,
         }),
         _ => {
@@ -2132,10 +2324,10 @@ unsafe fn build_inherited_ui_group(
     match values.value(property_id::CURSOR) {
         Some(StyleValueData::ValueList { values: list, .. }) => {
             for item in list.as_slice() {
-                push_cursor(item.data(), item.pointer().cast());
+                push_cursor(item.data(), item);
             }
         }
-        Some(data) => push_cursor(data, values.pointer(property_id::CURSOR)),
+        Some(data) => push_cursor(data, values.handle(property_id::CURSOR)),
         None => {}
     }
     if cursors.is_empty() {
@@ -2146,11 +2338,13 @@ unsafe fn build_inherited_ui_group(
         });
     }
 
-    let scrollbar_color = if let Some(StyleValueData::ScrollbarColor {
-        thumb_color,
-        track_color,
-    }) = values.value(property_id::SCROLLBAR_COLOR)
+    let scrollbar_color = if let Some(StyleValueData::ScrollbarColor(scrollbar_color_payload)) =
+        values.value(property_id::SCROLLBAR_COLOR)
     {
+        let ScrollbarColorPayload {
+            thumb_color,
+            track_color,
+        } = &**scrollbar_color_payload;
         ComputedScrollbarColor {
             thumb_color: packed_color(
                 to_color(thumb_color.data(), input).expect("computed scrollbar colors are resolvable in Rust"),
@@ -2168,29 +2362,27 @@ unsafe fn build_inherited_ui_group(
         }
     };
 
-    let Some(StyleValueData::ColorScheme { schemes, only, .. }) = values.value(property_id::COLOR_SCHEME) else {
+    let Some(StyleValueData::ColorScheme(color_scheme_payload)) = values.value(property_id::COLOR_SCHEME) else {
         unreachable!("a computed color-scheme is a color-scheme value");
     };
+    let ColorSchemePayload { schemes, only, .. } = &**color_scheme_payload;
     let color_schemes = RetainedUtf16FlyStringList::from_retained_strings(
         schemes.as_slice().iter().map(|name| name.to_fly_string()).collect(),
     );
 
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::INHERITED_UI,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<InheritedUIValues>();
-                payload.caret_color = caret_color;
-                payload.accent_color = accent_color;
-                payload.cursor = RetainedComputedCursorList::from_vec(cursors);
-                payload.scrollbar_color = scrollbar_color;
-                payload.color_schemes = color_schemes;
-                payload.color_scheme_only = *only;
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::INHERITED_UI,
+        &entries,
+        |payload: &mut InheritedUIValues| {
+            payload.caret_color = caret_color;
+            payload.accent_color = accent_color;
+            payload.cursor = RetainedComputedCursorList::from_vec(cursors);
+            payload.scrollbar_color = scrollbar_color;
+            payload.color_schemes = color_schemes;
+            payload.color_scheme_only = *only;
+        },
+        parent,
+    )
 }
 
 /// Resolves a computed length-percentage against the element's font size.
@@ -2216,15 +2408,13 @@ fn font_relative_length_to_css_pixels(data: &StyleValueData, input: &ColorResolu
 }
 
 /// Builds the complete inherited text payload in Rust.
-unsafe fn build_inherited_text_group(
-    values: &EffectiveValues,
+fn build_inherited_text_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) =
-        (unsafe { gather_group_entries(group_index::INHERITED_TEXT, values, input, used_color_scheme) })
-    else {
+    let Some(entries) = gather_group_entries(group_index::INHERITED_TEXT, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
 
@@ -2281,63 +2471,57 @@ unsafe fn build_inherited_text_group(
         font_relative_length_to_css_pixels(underline_offset_data, input)
     };
 
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::INHERITED_TEXT,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<InheritedTextValues>();
-                payload.text_shadow = RetainedComputedShadowList::from_vec(text_shadows);
-                payload.text_underline_position = ComputedTextUnderlinePosition {
-                    horizontal: *horizontal,
-                    vertical: *vertical,
-                };
-                payload.text_underline_offset = ComputedTextUnderlineOffset {
-                    used_value: underline_offset_used,
-                    is_auto: underline_offset_is_auto,
-                    value: if underline_offset_is_auto {
-                        ComputedStyleValueHandle::empty()
-                    } else {
-                        ComputedStyleValueHandle::retained(values.pointer(property_id::TEXT_UNDERLINE_OFFSET).cast())
-                    },
-                };
-                payload.text_indent = ComputedTextIndent {
-                    length_percentage: ComputedStyleValueHandle::retained(length_percentage.pointer()),
-                    each_line: *each_line,
-                    hanging: *hanging,
-                };
-                payload.tab_size_is_number = tab_size_is_number;
-                payload.tab_size_number = tab_size_number;
-                payload.tab_size_length = CssPixels::from_raw(tab_size_px);
-                payload.word_spacing = word_spacing;
-                payload.letter_spacing = letter_spacing;
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::INHERITED_TEXT,
+        &entries,
+        |payload: &mut InheritedTextValues| {
+            payload.text_shadow = RetainedComputedShadowList::from_vec(text_shadows);
+            payload.text_underline_position = ComputedTextUnderlinePosition {
+                horizontal: *horizontal,
+                vertical: *vertical,
+            };
+            payload.text_underline_offset = ComputedTextUnderlineOffset {
+                used_value: underline_offset_used,
+                is_auto: underline_offset_is_auto,
+                value: if underline_offset_is_auto {
+                    ComputedStyleValueHandle::empty()
+                } else {
+                    ComputedStyleValueHandle::from_retained(values.handle(property_id::TEXT_UNDERLINE_OFFSET))
+                },
+            };
+            payload.text_indent = ComputedTextIndent {
+                length_percentage: ComputedStyleValueHandle::from_retained(length_percentage),
+                each_line: *each_line,
+                hanging: *hanging,
+            };
+            payload.tab_size_is_number = tab_size_is_number;
+            payload.tab_size_number = tab_size_number;
+            payload.tab_size_length = CssPixels::from_raw(tab_size_px);
+            payload.word_spacing = word_spacing;
+            payload.letter_spacing = letter_spacing;
+        },
+        parent,
+    )
 }
 
-/// Builds the misc reset group entirely from Rust-owned canonical values.
-unsafe fn build_misc_reset_group(
-    values: &EffectiveValues,
+/// Builds the misc layout group entirely from Rust-owned canonical values.
+fn build_misc_layout_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let generic = unsafe {
-        build_generic_group(
-            group_index::MISC_RESET,
-            values,
-            input,
-            used_color_scheme,
-            parent_payload,
-        )
-    };
-    if !generic.is_null() {
-        return generic;
+    let native_appearance_disabled = values.native_appearance_disabled();
+
+    // NB: The generic builder only decodes property values, which leaves native_appearance_disabled at its default.
+    if !native_appearance_disabled {
+        let generic = build_generic_group(group_index::MISC_LAYOUT, values, input, used_color_scheme, parent);
+        if !generic.is_null() {
+            return generic;
+        }
     }
-    let Some(entries) = (unsafe { gather_group_entries(group_index::MISC_RESET, values, input, used_color_scheme) })
-    else {
+
+    let Some(entries) = gather_group_entries(group_index::MISC_LAYOUT, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
 
@@ -2395,48 +2579,80 @@ unsafe fn build_misc_reset_group(
         other => other,
     };
 
-    let Some(StyleValueData::Position { edge_x, edge_y }) = values.value(property_id::OBJECT_POSITION) else {
+    let Some(StyleValueData::Position(position_payload)) = values.value(property_id::OBJECT_POSITION) else {
         unreachable!("a computed object-position is a position value");
     };
+    let PositionPayload { edge_x, edge_y } = &**position_payload;
     let position_offset = |edge: &crate::css::style_value::RetainedStyleValueData| -> ComputedStyleValueHandle {
         let StyleValueData::Edge { offset, .. } = edge.data() else {
             unreachable!("a computed position component is an edge value");
         };
-        ComputedStyleValueHandle::retained(offset.pointer())
+        ComputedStyleValueHandle::from_retained(offset)
     };
 
-    // touch-action, with the extractor's keyword fan-out.
-    let mut allow = [true; 6];
-    match values.value(property_id::TOUCH_ACTION) {
-        Some(StyleValueData::Keyword { keyword: code }) => match *code {
-            keyword::AUTO => {}
-            keyword::NONE => allow = [false; 6],
-            keyword::MANIPULATION => allow[5] = false,
-            _ => unreachable!("a computed single-keyword touch-action is auto, none or manipulation"),
+    let outline_offset_data = values
+        .value(property_id::OUTLINE_OFFSET)
+        .expect("the table holds outline-offset");
+    let Some(outline_offset) = resolve_length(outline_offset_data) else {
+        return std::ptr::null();
+    };
+    let group_color = |property| {
+        style_color(values.value(property).expect("the table holds the color"), input)
+            .expect("a computed color resolves in the Rust color context")
+    };
+    let outline_color = group_color(property_id::OUTLINE_COLOR);
+    let column_rule_color = group_color(property_id::COLUMN_RULE_COLOR);
+
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::MISC_LAYOUT,
+        &entries,
+        |payload: &mut MiscLayoutValues| {
+            let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
+            payload.outline_offset_style_value = retained(property_id::OUTLINE_OFFSET);
+            payload.outline_offset = outline_offset;
+            payload.overflow_clip_margin = ComputedOverflowClipMargin {
+                left: overflow_clip_margin_side(property_id::OVERFLOW_CLIP_MARGIN_LEFT),
+                top: overflow_clip_margin_side(property_id::OVERFLOW_CLIP_MARGIN_TOP),
+                right: overflow_clip_margin_side(property_id::OVERFLOW_CLIP_MARGIN_RIGHT),
+                bottom: overflow_clip_margin_side(property_id::OVERFLOW_CLIP_MARGIN_BOTTOM),
+            };
+            payload.appearance = normalized_appearance;
+            payload.computed_appearance = computed_appearance;
+            payload.native_appearance_disabled = native_appearance_disabled;
+            payload.column_height = ComputedSize::from_data(values.handle(property_id::COLUMN_HEIGHT));
+            payload.outline_color = outline_color;
+            payload.column_rule_color = column_rule_color;
+            payload.object_position_x = position_offset(edge_x);
+            payload.object_position_y = position_offset(edge_y);
+            payload.shape_margin = retained(property_id::SHAPE_MARGIN);
+            payload.shape_outside = retained(property_id::SHAPE_OUTSIDE);
         },
-        Some(StyleValueData::ValueList { values: list, .. }) => {
-            allow = [false, false, false, false, false, false];
-            for item in list.as_slice() {
-                match keyword_of(item.data()).expect("a computed touch-action item is a keyword") {
-                    keyword::PAN_X => {
-                        allow[0] = true;
-                        allow[1] = true;
-                    }
-                    keyword::PAN_LEFT => allow[0] = true,
-                    keyword::PAN_RIGHT => allow[1] = true,
-                    keyword::PAN_Y => {
-                        allow[2] = true;
-                        allow[3] = true;
-                    }
-                    keyword::PAN_UP => allow[2] = true,
-                    keyword::PAN_DOWN => allow[3] = true,
-                    keyword::PINCH_ZOOM => allow[4] = true,
-                    _ => unreachable!("the touch-action keywords cover every list item"),
-                }
-            }
+        parent,
+    )
+}
+
+/// Builds the misc interaction group entirely from Rust-owned canonical values.
+fn build_misc_interaction_group(
+    values: &LonghandSource,
+    input: &ColorResolutionInput,
+    used_color_scheme: u8,
+    parent: GroupShares<'_>,
+) -> *const c_void {
+    let implicit_will_change = values
+        .animated_overlay()
+        .map_or(&[][..], |overlay| overlay.implicit_will_change.as_slice());
+
+    // NB: The generic builder only decodes property values, which leaves implicit_will_change empty.
+    if implicit_will_change.is_empty() {
+        let generic = build_generic_group(group_index::MISC_INTERACTION, values, input, used_color_scheme, parent);
+        if !generic.is_null() {
+            return generic;
         }
-        _ => {}
     }
+
+    let Some(entries) = gather_group_entries(group_index::MISC_INTERACTION, values, input, used_color_scheme) else {
+        return std::ptr::null();
+    };
 
     let Some(StyleValueData::ScrollbarGutter {
         value: scrollbar_gutter,
@@ -2491,76 +2707,36 @@ unsafe fn build_misc_reset_group(
         None => unreachable!("the table holds scroll-snap-type"),
     };
 
-    let outline_offset_data = values
-        .value(property_id::OUTLINE_OFFSET)
-        .expect("the table holds outline-offset");
-    let Some(outline_offset) = resolve_length(outline_offset_data) else {
-        return std::ptr::null();
-    };
-    let outline_color = packed_color(
-        to_color(
-            values
-                .value(property_id::OUTLINE_COLOR)
-                .expect("the table holds outline-color"),
-            input,
-        )
-        .expect("a computed outline-color resolves in the Rust color context"),
-    );
-
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::MISC_RESET,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<MiscResetValues>();
-                let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
-                payload.outline_offset_style_value = retained(property_id::OUTLINE_OFFSET);
-                payload.outline_offset = outline_offset;
-                payload.scroll_margin = ComputedLengthBox::from_data(
-                    values.pointer(property_id::SCROLL_MARGIN_TOP),
-                    values.pointer(property_id::SCROLL_MARGIN_RIGHT),
-                    values.pointer(property_id::SCROLL_MARGIN_BOTTOM),
-                    values.pointer(property_id::SCROLL_MARGIN_LEFT),
-                    false,
-                );
-                payload.scroll_padding = ComputedLengthBox::from_data(
-                    values.pointer(property_id::SCROLL_PADDING_TOP),
-                    values.pointer(property_id::SCROLL_PADDING_RIGHT),
-                    values.pointer(property_id::SCROLL_PADDING_BOTTOM),
-                    values.pointer(property_id::SCROLL_PADDING_LEFT),
-                    true,
-                );
-                payload.overflow_clip_margin = ComputedOverflowClipMargin {
-                    left: overflow_clip_margin_side(property_id::OVERFLOW_CLIP_MARGIN_LEFT),
-                    top: overflow_clip_margin_side(property_id::OVERFLOW_CLIP_MARGIN_TOP),
-                    right: overflow_clip_margin_side(property_id::OVERFLOW_CLIP_MARGIN_RIGHT),
-                    bottom: overflow_clip_margin_side(property_id::OVERFLOW_CLIP_MARGIN_BOTTOM),
-                };
-                payload.appearance = normalized_appearance;
-                payload.computed_appearance = computed_appearance;
-                payload.column_height = ComputedSize::from_data(values.pointer(property_id::COLUMN_HEIGHT));
-                payload.outline_color = outline_color;
-                payload.object_position_x = position_offset(edge_x);
-                payload.object_position_y = position_offset(edge_y);
-                payload.view_transition_name = retained(property_id::VIEW_TRANSITION_NAME);
-                payload.touch_action_allow_left = allow[0];
-                payload.touch_action_allow_right = allow[1];
-                payload.touch_action_allow_up = allow[2];
-                payload.touch_action_allow_down = allow[3];
-                payload.touch_action_allow_pinch_zoom = allow[4];
-                payload.touch_action_allow_other = allow[5];
-                payload.scroll_snap_align_block = scroll_snap_align_block;
-                payload.scroll_snap_align_inline = scroll_snap_align_inline;
-                payload.scroll_snap_axis = scroll_snap_axis;
-                payload.scroll_snap_strictness = scroll_snap_strictness;
-                payload.scrollbar_gutter = *scrollbar_gutter;
-                payload.shape_margin = retained(property_id::SHAPE_MARGIN);
-                payload.shape_outside = retained(property_id::SHAPE_OUTSIDE);
-                payload.will_change = retained(property_id::WILL_CHANGE);
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::MISC_INTERACTION,
+        &entries,
+        |payload: &mut MiscInteractionValues| {
+            let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
+            payload.scroll_margin = ComputedLengthBox::from_data(
+                values.handle(property_id::SCROLL_MARGIN_TOP),
+                values.handle(property_id::SCROLL_MARGIN_RIGHT),
+                values.handle(property_id::SCROLL_MARGIN_BOTTOM),
+                values.handle(property_id::SCROLL_MARGIN_LEFT),
+                false,
+            );
+            payload.scroll_padding = ComputedLengthBox::from_data(
+                values.handle(property_id::SCROLL_PADDING_TOP),
+                values.handle(property_id::SCROLL_PADDING_RIGHT),
+                values.handle(property_id::SCROLL_PADDING_BOTTOM),
+                values.handle(property_id::SCROLL_PADDING_LEFT),
+                true,
+            );
+            payload.view_transition_name = retained(property_id::VIEW_TRANSITION_NAME);
+            payload.scroll_snap_align_block = scroll_snap_align_block;
+            payload.scroll_snap_align_inline = scroll_snap_align_inline;
+            payload.scroll_snap_axis = scroll_snap_axis;
+            payload.scroll_snap_strictness = scroll_snap_strictness;
+            payload.scrollbar_gutter = *scrollbar_gutter;
+            payload.will_change = retained(property_id::WILL_CHANGE);
+            payload.implicit_will_change = RetainedWillChangePropertyList::from_vec(implicit_will_change.to_vec());
+        },
+        parent,
+    )
 }
 
 /// The C++ StyleValueList::Separator::Comma discriminant, static-asserted in
@@ -2568,10 +2744,10 @@ unsafe fn build_misc_reset_group(
 const SEPARATOR_COMMA: u8 = 1;
 
 /// Builds the complete text reset group in Rust.
-unsafe fn build_text_reset_group(
-    values: &EffectiveValues,
+fn build_text_reset_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
     let mut text_decoration_lines: Vec<u8> = Vec::new();
     match values.value(property_id::TEXT_DECORATION_LINE) {
@@ -2588,10 +2764,12 @@ unsafe fn build_text_reset_group(
         _ => unreachable!("a computed text-decoration-line is none or a value list"),
     }
 
-    let (thickness_kind, thickness_value) = match values.value(property_id::TEXT_DECORATION_THICKNESS) {
-        Some(StyleValueData::Keyword { keyword: code }) if *code == keyword::AUTO => (0u8, std::ptr::null()),
-        Some(StyleValueData::Keyword { keyword: code }) if *code == keyword::FROM_FONT => (1u8, std::ptr::null()),
-        Some(_) => (2u8, values.pointer(property_id::TEXT_DECORATION_THICKNESS)),
+    // The builder reads the thickness value only for the length kind.
+    let thickness_value = values.handle(property_id::TEXT_DECORATION_THICKNESS);
+    let thickness_kind = match thickness_value.optional_data() {
+        Some(StyleValueData::Keyword { keyword: code }) if *code == keyword::AUTO => 0u8,
+        Some(StyleValueData::Keyword { keyword: code }) if *code == keyword::FROM_FONT => 1u8,
+        Some(_) => 2u8,
         None => unreachable!("the table holds text-decoration-thickness"),
     };
 
@@ -2620,33 +2798,26 @@ unsafe fn build_text_reset_group(
     )
     .and_then(crate::css::css_enums::keyword_to_text_decoration_style)
     .expect("a computed text-decoration-style maps to its enum");
-    let text_decoration_color = packed_color(
-        to_color(
-            values
-                .value(property_id::TEXT_DECORATION_COLOR)
-                .expect("the table holds text-decoration-color"),
-            input,
-        )
-        .expect("a computed text-decoration-color resolves in the Rust color context"),
-    );
+    let text_decoration_color = style_color(
+        values
+            .value(property_id::TEXT_DECORATION_COLOR)
+            .expect("the table holds text-decoration-color"),
+        input,
+    )
+    .expect("a computed text-decoration-color resolves in the Rust color context");
 
-    // SAFETY: The list and value pointers remain live through the call and
-    // the caller warrants the parent payload.
-    unsafe {
-        rust_build_text_reset_group(
-            group_index::TEXT_RESET,
-            text_decoration_lines.as_ptr(),
-            text_decoration_lines.len(),
-            thickness_kind,
-            thickness_value,
-            text_decoration_style,
-            text_decoration_color,
-            discard_before,
-            discard_after,
-            discard_inner,
-            parent_payload,
-        )
-    }
+    rust_build_text_reset_group(
+        group_index::TEXT_RESET,
+        &text_decoration_lines,
+        thickness_kind,
+        thickness_value,
+        text_decoration_style,
+        text_decoration_color,
+        discard_before,
+        discard_after,
+        discard_inner,
+        parent,
+    )
 }
 
 /// The C++ PositionArea codes a value's keywords map to, fanning out a value
@@ -2670,17 +2841,17 @@ fn position_area_codes(data: &StyleValueData) -> Vec<u8> {
 }
 
 /// Builds the complete anchor-positioning payload in Rust.
-unsafe fn build_anchor_group(
-    values: &EffectiveValues,
+fn build_anchor_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let generic = unsafe { build_generic_group(group_index::ANCHOR, values, input, used_color_scheme, parent_payload) };
+    let generic = build_generic_group(group_index::ANCHOR, values, input, used_color_scheme, parent);
     if !generic.is_null() {
         return generic;
     }
-    let Some(entries) = (unsafe { gather_group_entries(group_index::ANCHOR, values, input, used_color_scheme) }) else {
+    let Some(entries) = gather_group_entries(group_index::ANCHOR, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
 
@@ -2733,7 +2904,7 @@ unsafe fn build_anchor_group(
     let mut append_fallback = |data: &StyleValueData| {
         let mut fallback = ComputedPositionTryFallback {
             name: RetainedUtf16FlyString::none(),
-            tactics: [0; 3],
+            tactics: [0; 5],
             tactic_count: 0,
             has_position_area: false,
             position_area: RetainedPositionAreaList::from_vec(Vec::new()),
@@ -2743,8 +2914,8 @@ unsafe fn build_anchor_group(
                 fallback.name = custom_ident.to_fly_string();
             } else if let Some(tactic) = keyword_of(data).and_then(crate::css::css_enums::keyword_to_try_tactic) {
                 assert!(
-                    fallback.tactic_count < 3,
-                    "a try tactic list holds at most three tactics"
+                    fallback.tactic_count < 5,
+                    "a try tactic list holds at most five tactics"
                 );
                 fallback.tactics[fallback.tactic_count] = tactic;
                 fallback.tactic_count += 1;
@@ -2834,18 +3005,16 @@ unsafe fn build_anchor_group(
         position_visibility_anchors_visible: anchors_visible,
         position_visibility_no_overflow: no_overflow,
     };
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::ANCHOR,
-            &entries,
-            |payload| *payload.cast::<AnchorValues>() = built,
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::ANCHOR,
+        &entries,
+        |payload: &mut AnchorValues| *payload = built,
+        parent,
+    )
 }
 
 /// The keyword code of a slot that must hold an enum keyword.
-fn required_keyword_code(values: &EffectiveValues, property: u16, map: fn(u16) -> Option<u8>) -> u8 {
+fn required_keyword_code(values: &LonghandSource, property: u16, map: fn(u16) -> Option<u8>) -> u8 {
     values
         .value(property)
         .and_then(keyword_of)
@@ -2879,18 +3048,17 @@ fn required_number(data: &StyleValueData) -> f64 {
 /// transformation happened at compute time, so the display slot already
 /// holds the transformed value; only the pre-transformation display is a
 /// C++-side member and arrives through the build inputs.
-unsafe fn build_box_group(
-    values: &EffectiveValues,
+fn build_box_group(
+    values: &LonghandSource,
     display_before_transformation_raw: u32,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
     use crate::css::computed_value_types::{
         BoxValues, ComputedAspectRatio, ComputedContainIntrinsicSize, ComputedVerticalAlign,
     };
     use crate::css::css_enums::{
-        keyword_to_box_sizing, keyword_to_clear, keyword_to_continue_value, keyword_to_float, keyword_to_overflow,
-        keyword_to_positioning, keyword_to_resize, keyword_to_table_layout, keyword_to_text_overflow,
-        keyword_to_unicode_bidi, keyword_to_vertical_align,
+        keyword_to_baseline_source, keyword_to_continue_value, keyword_to_field_sizing, keyword_to_resize,
+        keyword_to_text_overflow, keyword_to_vertical_align,
     };
 
     let display = match values.value(property_id::DISPLAY) {
@@ -2924,7 +3092,7 @@ unsafe fn build_box_group(
         Some(_) => ComputedVerticalAlign {
             is_keyword: false,
             keyword: 0,
-            value: ComputedStyleValueHandle::retained(values.pointer(property_id::VERTICAL_ALIGN).cast()),
+            value: ComputedStyleValueHandle::from_retained(values.handle(property_id::VERTICAL_ALIGN)),
         },
         None => unreachable!("the table holds vertical-align"),
     };
@@ -2932,9 +3100,10 @@ unsafe fn build_box_group(
     // aspect-ratio, with the extractor's degenerate-ratio handling; absent
     // ratios keep zeroed components so payload equality stays field-wise.
     let resolved_ratio = |data: &StyleValueData| -> (f64, f64) {
-        let StyleValueData::Ratio { numerator, denominator } = data else {
+        let StyleValueData::Ratio(ratio_payload) = data else {
             unreachable!("a computed aspect-ratio component is a ratio");
         };
+        let RatioPayload { numerator, denominator } = &**ratio_payload;
         (required_number(numerator.data()), required_number(denominator.data()))
     };
     let ratio_is_degenerate = |(numerator, denominator): (f64, f64)| {
@@ -3071,6 +3240,17 @@ unsafe fn build_box_group(
         }
     }
 
+    // https://drafts.csswg.org/css-contain-2/#skips-its-contents
+    // When an element skips its contents, the user agent must change the used value of the contain property so as to
+    // turn on layout containment, style containment, paint containment, and size containment.
+    if matches!(values.value(property_id::CONTENT_VISIBILITY), Some(StyleValueData::Keyword { keyword: code }) if *code == keyword::HIDDEN)
+    {
+        size_containment = true;
+        layout_containment = true;
+        style_containment = true;
+        paint_containment = true;
+    }
+
     // container-type, which the extractor only fans out from a value list.
     let mut is_size_container = false;
     let mut is_inline_size_container = false;
@@ -3101,24 +3281,18 @@ unsafe fn build_box_group(
         _ => unreachable!("a computed container-name is none or custom idents"),
     }
 
-    let built = std::mem::ManuallyDrop::new(BoxValues {
+    let built = BoxValues {
         display,
         display_before_box_type_transformation: crate::css::display::FfiDisplay::from_raw(
             display_before_transformation_raw,
         ),
-        float_: required_keyword_code(values, property_id::FLOAT, keyword_to_float),
-        clear: required_keyword_code(values, property_id::CLEAR, keyword_to_clear),
-        position: required_keyword_code(values, property_id::POSITION, keyword_to_positioning),
-        overflow_x: required_keyword_code(values, property_id::OVERFLOW_X, keyword_to_overflow),
-        overflow_y: required_keyword_code(values, property_id::OVERFLOW_Y, keyword_to_overflow),
-        box_sizing: required_keyword_code(values, property_id::BOX_SIZING, keyword_to_box_sizing),
+        field_sizing: required_keyword_code(values, property_id::FIELD_SIZING, keyword_to_field_sizing),
+        baseline_source: required_keyword_code(values, property_id::BASELINE_SOURCE, keyword_to_baseline_source),
         resize: required_keyword_code(values, property_id::RESIZE, keyword_to_resize),
         text_overflow: required_keyword_code(values, property_id::TEXT_OVERFLOW, keyword_to_text_overflow),
-        unicode_bidi: required_keyword_code(values, property_id::UNICODE_BIDI, keyword_to_unicode_bidi),
-        table_layout: required_keyword_code(values, property_id::TABLE_LAYOUT, keyword_to_table_layout),
         grid_auto_flow_row: grid_auto_flow.0,
         grid_auto_flow_dense: grid_auto_flow.1,
-        column_width: ComputedSize::from_data(values.pointer(property_id::COLUMN_WIDTH)),
+        column_width: ComputedSize::from_data(values.handle(property_id::COLUMN_WIDTH)),
         column_count_has_value: column_count.is_some(),
         column_count: column_count.unwrap_or(0),
         continue_: required_keyword_code(values, property_id::CONTINUE, keyword_to_continue_value),
@@ -3142,39 +3316,37 @@ unsafe fn build_box_group(
         is_inline_size_container,
         is_scroll_state_container,
         container_name: RetainedUtf16FlyStringList::from_retained_strings(container_names),
-    });
-    // SAFETY: The payload value is fully materialized and ownership of its
-    // retained references transfers to the builder; the caller warrants the
-    // parent payload.
-    unsafe {
-        crate::css::computed_values::rust_build_box_group(group_index::BOX, (&raw const built).cast(), parent_payload)
-    }
+    };
+    crate::css::computed_values::rust_build_box_group(group_index::BOX, built, parent)
 }
 
 /// Builds the inherited font group from canonical Rust longhands and the
 /// platform font resources supplied by C++.
 unsafe fn build_font_group(
-    values: &EffectiveValues,
+    values: &LonghandSource,
     inputs: &FfiFontGroupBuildInputs,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
     use crate::css::css_pixels::CssPixels;
 
     assert!(!inputs.first_available_font.is_null());
     assert!(!inputs.font_cascade_list.is_null());
-    let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
+    let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
     let built = FontValues {
         font_size: CssPixels::from_raw(inputs.font_size_raw),
-        line_height_used: CssPixels::from_raw(inputs.line_height_used_raw),
+        resolved_line_height_used: CssPixels::from_raw(inputs.line_height_used_raw),
         font_variant_emoji: inputs.font_variant_emoji,
-        font_ascent: inputs.font_ascent,
-        font_descent: inputs.font_descent,
-        font_x_height: inputs.font_x_height,
-        font_zero_advance: inputs.font_zero_advance,
-        first_available_font: inputs.first_available_font,
+        resolved_font_ascent: inputs.font_ascent,
+        resolved_font_descent: inputs.font_descent,
+        resolved_font_x_height: inputs.font_x_height,
+        resolved_font_zero_advance: inputs.font_zero_advance,
+        resolved_first_available_font: inputs.first_available_font,
         // SAFETY: The non-null check above and the caller's guarantee make the
         // list live for the call; the handle keeps it live afterwards.
         font_cascade_list: unsafe { libgfx_rust::font::FontCascadeListHandle::retain(inputs.font_cascade_list) },
+        // SAFETY: As above. A cascade the font computer published carries a frozen snapshot; one
+        // built for something else (canvas, a unit test) does not, and never reaches a stage.
+        frozen_font_list: unsafe { libgfx_rust::font::frozen_font_list_of(inputs.font_cascade_list) },
         font_weight: inputs.font_weight,
         font_width: inputs.font_width,
         math_shift: inputs.math_shift,
@@ -3200,30 +3372,27 @@ unsafe fn build_font_group(
         math_depth_value: retained(property_id::MATH_DEPTH),
         font_size_value: retained(property_id::FONT_SIZE),
     };
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::FONT,
-            &[],
-            |payload| *payload.cast::<FontValues>() = built,
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::FONT,
+        &[],
+        |payload: &mut FontValues| *payload = built,
+        parent,
+    )
 }
 
 /// Builds the animation group from the canonical Rust longhand values.
-unsafe fn build_animation_group(
-    values: &EffectiveValues,
+fn build_animation_group(
+    values: &LonghandSource,
     input: &ColorResolutionInput,
     used_color_scheme: u8,
-    parent_payload: *const c_void,
+    parent: GroupShares<'_>,
 ) -> *const c_void {
-    let Some(entries) = (unsafe { gather_group_entries(group_index::ANIMATION, values, input, used_color_scheme) })
-    else {
+    let Some(entries) = gather_group_entries(group_index::ANIMATION, values, input, used_color_scheme) else {
         return std::ptr::null();
     };
-    let retained = |property| ComputedStyleValueHandle::retained(values.pointer(property).cast());
+    let retained = |property| ComputedStyleValueHandle::from_retained(values.handle(property));
     let is_single_zero_time = |property| {
-        let value = unsafe { &*values.pointer(property).cast::<StyleValueData>() };
+        let value = values.handle(property).data();
         let StyleValueData::ValueList { values, .. } = value else {
             return false;
         };
@@ -3232,70 +3401,47 @@ unsafe fn build_animation_group(
         };
         matches!(item.data(), StyleValueData::Time { value, .. } if *value == 0.0)
     };
-    unsafe {
-        crate::css::computed_values::build_group_payload_with_rust_fill(
-            group_index::ANIMATION,
-            &entries,
-            |payload| {
-                let payload = &mut *payload.cast::<AnimationValues>();
-                payload.animation_name = retained(property_id::ANIMATION_NAME);
-                payload.animation_composition = retained(property_id::ANIMATION_COMPOSITION);
-                payload.animation_delay = retained(property_id::ANIMATION_DELAY);
-                payload.animation_direction = retained(property_id::ANIMATION_DIRECTION);
-                payload.animation_duration = retained(property_id::ANIMATION_DURATION);
-                payload.animation_fill_mode = retained(property_id::ANIMATION_FILL_MODE);
-                payload.animation_iteration_count = retained(property_id::ANIMATION_ITERATION_COUNT);
-                payload.animation_play_state = retained(property_id::ANIMATION_PLAY_STATE);
-                payload.animation_timeline = retained(property_id::ANIMATION_TIMELINE);
-                payload.animation_timing_function = retained(property_id::ANIMATION_TIMING_FUNCTION);
-                payload.scroll_timeline_name = retained(property_id::SCROLL_TIMELINE_NAME);
-                payload.scroll_timeline_axis = retained(property_id::SCROLL_TIMELINE_AXIS);
-                payload.timeline_scope = retained(property_id::TIMELINE_SCOPE);
-                payload.view_timeline_name = retained(property_id::VIEW_TIMELINE_NAME);
-                payload.view_timeline_axis = retained(property_id::VIEW_TIMELINE_AXIS);
-                payload.view_timeline_inset = retained(property_id::VIEW_TIMELINE_INSET);
-                payload.transition_property = retained(property_id::TRANSITION_PROPERTY);
-                payload.transition_duration = retained(property_id::TRANSITION_DURATION);
-                payload.transition_timing_function = retained(property_id::TRANSITION_TIMING_FUNCTION);
-                payload.transition_delay = retained(property_id::TRANSITION_DELAY);
-                payload.transition_behavior = retained(property_id::TRANSITION_BEHAVIOR);
-                payload.transition_delay_and_duration_are_single_zero =
-                    is_single_zero_time(property_id::TRANSITION_DELAY)
-                        && is_single_zero_time(property_id::TRANSITION_DURATION);
-            },
-            parent_payload,
-        )
-    }
+    crate::css::computed_values::build_group_payload_with_rust_fill(
+        group_index::ANIMATION,
+        &entries,
+        |payload: &mut AnimationValues| {
+            payload.animation_name = retained(property_id::ANIMATION_NAME);
+            payload.animation_composition = retained(property_id::ANIMATION_COMPOSITION);
+            payload.animation_delay = retained(property_id::ANIMATION_DELAY);
+            payload.animation_direction = retained(property_id::ANIMATION_DIRECTION);
+            payload.animation_duration = retained(property_id::ANIMATION_DURATION);
+            payload.animation_fill_mode = retained(property_id::ANIMATION_FILL_MODE);
+            payload.animation_iteration_count = retained(property_id::ANIMATION_ITERATION_COUNT);
+            payload.animation_play_state = retained(property_id::ANIMATION_PLAY_STATE);
+            payload.animation_timeline = retained(property_id::ANIMATION_TIMELINE);
+            payload.animation_range_start = retained(property_id::ANIMATION_RANGE_START);
+            payload.animation_range_end = retained(property_id::ANIMATION_RANGE_END);
+            payload.animation_timing_function = retained(property_id::ANIMATION_TIMING_FUNCTION);
+            payload.scroll_timeline_name = retained(property_id::SCROLL_TIMELINE_NAME);
+            payload.scroll_timeline_axis = retained(property_id::SCROLL_TIMELINE_AXIS);
+            payload.timeline_scope = retained(property_id::TIMELINE_SCOPE);
+            payload.view_timeline_name = retained(property_id::VIEW_TIMELINE_NAME);
+            payload.view_timeline_axis = retained(property_id::VIEW_TIMELINE_AXIS);
+            payload.view_timeline_inset = retained(property_id::VIEW_TIMELINE_INSET);
+            payload.transition_property = retained(property_id::TRANSITION_PROPERTY);
+            payload.transition_duration = retained(property_id::TRANSITION_DURATION);
+            payload.transition_timing_function = retained(property_id::TRANSITION_TIMING_FUNCTION);
+            payload.transition_delay = retained(property_id::TRANSITION_DELAY);
+            payload.transition_behavior = retained(property_id::TRANSITION_BEHAVIOR);
+            payload.transition_delay_and_duration_are_single_zero = is_single_zero_time(property_id::TRANSITION_DELAY)
+                && is_single_zero_time(property_id::TRANSITION_DURATION);
+        },
+        parent,
+    )
 }
 
-/// Rebuilds the font group from the table and the platform font inputs the engine resolved.
-///
-/// # Safety
-/// `table` must be a valid frozen table and `parent_payload` a valid font payload or null.
-pub(crate) unsafe fn rebuild_font_group_from_table(
-    table: &ComputedLonghandTable,
-    inputs: &FfiFontGroupBuildInputs,
-    parent_payload: *const c_void,
-) -> Option<*const c_void> {
-    let values = EffectiveValues {
-        table,
-        animated_overlay: None,
-    };
-    let payload = unsafe { build_font_group(&values, inputs, parent_payload) };
-    (!payload.is_null()).then_some(payload)
-}
-
-/// The element's own resolved color as the group builders consume it: the table's computed
-/// `color`, resolved against the initial color the way the C++ build seeds its context.
-pub(crate) fn own_color_from_table(
-    table: &ComputedLonghandTable,
+/// The element's own resolved color as the group builders consume it: the computed `color` of
+/// `values`, resolved against the initial color the way the C++ build seeds its context.
+fn own_color_from_source(
+    values: &LonghandSource<'_>,
     used_color_scheme: u8,
     length: Option<&crate::css::style_compute::FfiLengthResolutionContext>,
 ) -> Option<u32> {
-    let values = EffectiveValues {
-        table,
-        animated_overlay: None,
-    };
     let input = ColorResolutionInput {
         scheme: Some(used_color_scheme),
         current_color: Some(Rgba {
@@ -3311,44 +3457,111 @@ pub(crate) fn own_color_from_table(
     to_color(values.value(property_id::COLOR)?, &input).map(packed_color)
 }
 
-/// Rebuilds one non-inherited group whose specified values read the newly
-/// inherited `color`. These groups need no DOM, layout, or font input.
-pub(crate) unsafe fn rebuild_group_for_inherited_current_color(
-    table: &ComputedLonghandTable,
-    group: usize,
-    parent_payload: *const c_void,
-    current_color: u32,
-    used_color_scheme: u8,
-) -> Option<*const c_void> {
-    if !matches!(
-        group,
-        group_index::SVG_RESET
-            | group_index::EFFECTS
-            | group_index::TEXT_RESET
-            | group_index::BACKGROUND
-            | group_index::BORDER
-            | group_index::MISC_RESET
-    ) {
-        return None;
-    }
-    unsafe { rebuild_group_from_table(table, group, parent_payload, current_color, used_color_scheme, None) }
+/// The used color scheme of the values `values` holds.
+pub(crate) fn used_color_scheme_of_source(values: &LonghandSource<'_>) -> u8 {
+    u8::try_from(values.effective_color_scheme()).unwrap_or_else(|_| {
+        debug_assert!(false, "a driven table without a used color scheme");
+        crate::css::color_resolution::PREFERRED_COLOR_SCHEME_LIGHT
+    })
 }
 
-/// Rebuilds one of the groups whose payload is a function of the longhand table, the element's
-/// own `color` and its used color scheme alone. `parent_payload` is the group's previous payload,
-/// returned retained when the rebuilt values equal it.
-pub(crate) unsafe fn rebuild_group_from_table(
-    table: &ComputedLonghandTable,
+/// The used color scheme and the element's own resolved `color`, as [`assembly_color_inputs`]
+/// answers them, from the values `values` holds.
+pub(crate) fn assembly_color_inputs_from_source(
+    values: &LonghandSource<'_>,
+    length: &crate::css::style_compute::FfiLengthResolutionContext,
+) -> (u8, u32) {
+    let used_color_scheme = used_color_scheme_of_source(values);
+    let current_color = own_color_from_source(values, used_color_scheme, Some(length)).unwrap_or_else(|| {
+        debug_assert!(false, "a driven table whose color does not resolve");
+        0xff00_0000
+    });
+    (used_color_scheme, current_color)
+}
+
+/// One group's payload for a record assembled as [`assemble_group_from_table`] does, but from the
+/// values `values` holds.
+///
+/// # Safety
+/// `parent` must be a valid payload of the group or null.
+pub(crate) unsafe fn assemble_group_from_source(
+    values: &LonghandSource<'_>,
     group: usize,
-    parent_payload: *const c_void,
+    font: Option<&FfiFontGroupBuildInputs>,
+    parent: GroupShares<'_>,
+    (used_color_scheme, current_color): (u8, u32),
+    length: &crate::css::style_compute::FfiLengthResolutionContext,
+) -> *const c_void {
+    let payload = if group == group_index::FONT {
+        // SAFETY: The caller passes a valid parent payload or null.
+        font.map(|font| unsafe { build_font_group(values, font, parent) })
+            .filter(|payload| !payload.is_null())
+    } else {
+        rebuild_group_from_source(values, group, parent, current_color, used_color_scheme, Some(length))
+    };
+    payload.unwrap_or_else(|| {
+        debug_assert!(false, "style group {group} declined a driven table");
+        parent.default_retained()
+    })
+}
+
+/// The engine: the background group `source` holds, but with the background color `values` holds,
+/// which is all an element whose other background longhands hold the values of `source`'s needs.
+/// The payload carries one reference for the caller.
+///
+/// # Safety
+/// `source` must be a live background group payload.
+pub(crate) unsafe fn patch_background_color(
+    values: &LonghandSource<'_>,
+    source: *const c_void,
+    parent: GroupShares<'_>,
+    (used_color_scheme, current_color): (u8, u32),
+    length: &crate::css::style_compute::FfiLengthResolutionContext,
+) -> *const c_void {
+    let input = ColorResolutionInput {
+        scheme: Some(used_color_scheme),
+        current_color: Some(Rgba {
+            r: (current_color >> 16) as u8,
+            g: (current_color >> 8) as u8,
+            b: current_color as u8,
+            a: (current_color >> 24) as u8,
+        }),
+        current_color_value: values.value(property_id::COLOR),
+        length: Some(length),
+        channels: None,
+    };
+    let background_color = style_color(
+        values
+            .value(property_id::BACKGROUND_COLOR)
+            .expect("background-color has a computed value"),
+        &input,
+    )
+    .expect("a computed background-color resolves in Rust");
+    let style_value = ComputedStyleValueHandle::from_retained(values.handle(property_id::BACKGROUND_COLOR));
+    // SAFETY: The caller passes a live background group payload.
+    unsafe {
+        crate::css::computed_values::patch_group_payload(
+            group_index::BACKGROUND,
+            source,
+            |payload: &mut BackgroundValues| {
+                payload.background_color = background_color;
+                payload.background_color_style_value = style_value;
+            },
+            parent,
+        )
+    }
+}
+
+/// Rebuilds one of the groups whose payload is a function of the element's computed longhand values, its own `color`
+/// and its used color scheme alone, reading the values from `values`.
+pub(crate) fn rebuild_group_from_source(
+    values: &LonghandSource<'_>,
+    group: usize,
+    parent: GroupShares<'_>,
     current_color: u32,
     used_color_scheme: u8,
     length: Option<&crate::css::style_compute::FfiLengthResolutionContext>,
 ) -> Option<*const c_void> {
-    let values = EffectiveValues {
-        table,
-        animated_overlay: None,
-    };
     let input = ColorResolutionInput {
         scheme: Some(used_color_scheme),
         current_color: Some(Rgba {
@@ -3361,191 +3574,311 @@ pub(crate) unsafe fn rebuild_group_from_table(
         length,
         channels: None,
     };
-    let payload = unsafe {
-        match group {
-            // The font group needs platform font resources the table does not hold.
-            group_index::FONT => return None,
-            group_index::BOX => {
-                build_box_group(&values, table.display_before_box_type_transformation(), parent_payload)
-            }
-            group_index::INHERITED_TABLE => rust_build_inherited_table_group(
-                group,
-                values.pointer(property_id::BORDER_COLLAPSE),
-                values.pointer(property_id::CAPTION_SIDE),
-                values.pointer(property_id::EMPTY_CELLS),
-                values.pointer(property_id::BORDER_SPACING),
-                parent_payload,
-            ),
-            group_index::INHERITED_BOX => rust_build_inherited_box_group(
-                group,
-                values.pointer(property_id::VISIBILITY),
-                values.pointer(property_id::DIRECTION),
-                values.pointer(property_id::WRITING_MODE),
-                values.pointer(property_id::CONTENT_VISIBILITY),
-                values.pointer(property_id::IMAGE_RENDERING),
-                parent_payload,
-            ),
-            group_index::SIZING => rust_build_sizing_group(
-                group,
-                values.pointer(property_id::WIDTH),
-                values.pointer(property_id::MIN_WIDTH),
-                values.pointer(property_id::MAX_WIDTH),
-                values.pointer(property_id::HEIGHT),
-                values.pointer(property_id::MIN_HEIGHT),
-                values.pointer(property_id::MAX_HEIGHT),
-                parent_payload,
-            ),
-            group_index::SURROUND => build_surround_group(&values, parent_payload),
-            group_index::ANIMATION => build_animation_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::ANCHOR => build_anchor_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::TEXT_RESET => build_text_reset_group(&values, &input, parent_payload),
-            group_index::ALIGNMENT => build_alignment_group(&values, parent_payload),
-            group_index::SVG_RESET => build_svg_reset_group(&values, &input, parent_payload),
-            group_index::GRID => build_grid_group(&values, parent_payload),
-            group_index::TRANSFORM => build_transform_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::EFFECTS => build_effects_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::INHERITED_UI => build_inherited_ui_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::INHERITED_TEXT => {
-                build_inherited_text_group(&values, &input, used_color_scheme, parent_payload)
-            }
-            group_index::MISC_RESET => build_misc_reset_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::INHERITED_SVG => build_inherited_svg_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::INHERITED_LIST => {
-                build_inherited_list_group(&values, &input, used_color_scheme, parent_payload)
-            }
-            group_index::CONTENT => build_content_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::MASK => build_mask_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::BACKGROUND => build_background_group(&values, &input, used_color_scheme, parent_payload),
-            group_index::BORDER => build_border_group(&values, &input, used_color_scheme, parent_payload),
-            _ => return None,
+    let payload = match group {
+        // The font group needs platform font resources the table does not hold.
+        group_index::FONT => return None,
+        group_index::BOX => build_box_group(values, values.display_before_box_type_transformation(), parent),
+        group_index::SIZING => build_sizing_group(
+            group,
+            values.handle(property_id::WIDTH),
+            values.handle(property_id::MIN_WIDTH),
+            values.handle(property_id::MAX_WIDTH),
+            values.handle(property_id::HEIGHT),
+            values.handle(property_id::MIN_HEIGHT),
+            values.handle(property_id::MAX_HEIGHT),
+            parent,
+        ),
+        group_index::SURROUND => build_surround_group(values, parent),
+        group_index::ANIMATION => build_animation_group(values, &input, used_color_scheme, parent),
+        group_index::ANCHOR => build_anchor_group(values, &input, used_color_scheme, parent),
+        group_index::TEXT_RESET => build_text_reset_group(values, &input, parent),
+        group_index::ALIGNMENT => build_alignment_group(values, parent),
+        group_index::SVG_RESET => build_svg_reset_group(values, &input, parent),
+        group_index::GRID => build_grid_group(values, parent),
+        group_index::TRANSFORM => build_transform_group(values, &input, used_color_scheme, parent),
+        group_index::EFFECTS => build_effects_group(values, &input, used_color_scheme, parent),
+        group_index::INHERITED_UI => build_inherited_ui_group(values, &input, used_color_scheme, parent),
+        group_index::INHERITED_TEXT => build_inherited_text_group(values, &input, used_color_scheme, parent),
+        group_index::MISC_LAYOUT => build_misc_layout_group(values, &input, used_color_scheme, parent),
+        group_index::MISC_INTERACTION => build_misc_interaction_group(values, &input, used_color_scheme, parent),
+        group_index::INHERITED_SVG => build_inherited_svg_group(values, &input, used_color_scheme, parent),
+        group_index::INHERITED_LIST_TABLE => {
+            build_inherited_list_table_group(values, &input, used_color_scheme, parent)
         }
+        group_index::CONTENT => build_content_group(values, &input, used_color_scheme, parent),
+        group_index::MASK => build_mask_group(values, &input, used_color_scheme, parent),
+        group_index::BACKGROUND => build_background_group(values, &input, used_color_scheme, parent),
+        group_index::BORDER => build_border_group(values, &input, used_color_scheme, parent),
+        _ => return None,
     };
     (!payload.is_null()).then_some(payload)
 }
 
-/// Builds every applied group's payload from the longhand table, writing one
-/// payload per applied group into `out_payloads`.
-/// Non-null payloads carry one reference for the caller, with the marshalled
-/// builders' sharing rules.
+/// Builds every applied group's payload from `values`, writing one payload per applied group into `out` and null for
+/// every other group. Each payload carries one reference for the caller.
 ///
 /// # Safety
-/// `table` must be a valid frozen table holding the style's computed values;
-/// `parent_payloads` and `out_payloads` must each hold `group_count` entries,
-/// with each parent entry a valid payload of its group or null; `inputs` must
-/// be valid with its pointers live across the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_build_group_payloads_from_table(
-    table: *const ComputedLonghandTable,
+/// The pointers `inputs` borrow must stay live across the call.
+pub(crate) unsafe fn build_group_payloads(
+    values: &LonghandSource<'_>,
     groups_to_apply: u32,
-    parent_payloads: *const *const c_void,
-    inputs: *const FfiTableGroupBuildInputs,
-    out_payloads: *mut *const c_void,
-    group_count: usize,
+    inputs: &GroupBuildInputs<'_>,
+    out: &mut [*const c_void; group_index::COUNT],
 ) {
-    assert_eq!(
-        group_count,
-        group_index::COUNT,
-        "the C++ StyleGroupIndex numbering drifted from the table builder's mirror"
-    );
-    let table = unsafe { &*table };
-    let inputs = unsafe { &*inputs };
-    let parents = unsafe { std::slice::from_raw_parts(parent_payloads, group_count) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out_payloads, group_count) };
-    let values = EffectiveValues {
-        table,
-        animated_overlay: unsafe { inputs.animated_overlay.as_ref() },
-    };
-    let color_input = unsafe { &*inputs.color_input.cast::<FfiColorResolutionInput>() };
-    let channels = relative_color_context_from_ffi(color_input);
-    // SAFETY: The caller keeps the input's pointers live across the call.
-    let input = unsafe { resolution_input_from_ffi(color_input, &channels) };
+    let input = *inputs.color_input;
 
-    for group in 0..group_count {
-        out[group] = std::ptr::null();
+    for (group, out_payload) in out.iter_mut().enumerate() {
+        *out_payload = std::ptr::null();
         if (groups_to_apply >> group) & 1 == 0 {
             continue;
         }
-        let parent_payload = parents[group];
-        // SAFETY: Gathered pointers name live table or override data and
-        // the caller warrants the parent payloads.
+        let parent = GroupShares::new(inputs.defaults, group, None);
+        // SAFETY: Gathered pointers name live table or override data.
         let payload = unsafe {
             match group {
                 group_index::FONT => build_font_group(
-                    &values,
-                    inputs
-                        .font
-                        .as_ref()
-                        .expect("an applied font group has platform font inputs"),
-                    parent_payload,
+                    values,
+                    inputs.font.expect("an applied font group has platform font inputs"),
+                    parent,
                 ),
-                group_index::BOX => {
-                    build_box_group(&values, inputs.box_display_before_transformation_raw, parent_payload)
-                }
-                group_index::INHERITED_TABLE => rust_build_inherited_table_group(
+                group_index::BOX => build_box_group(values, inputs.box_display_before_transformation_raw, parent),
+                group_index::SIZING => build_sizing_group(
                     group,
-                    values.pointer(property_id::BORDER_COLLAPSE),
-                    values.pointer(property_id::CAPTION_SIDE),
-                    values.pointer(property_id::EMPTY_CELLS),
-                    values.pointer(property_id::BORDER_SPACING),
-                    parent_payload,
+                    values.handle(property_id::WIDTH),
+                    values.handle(property_id::MIN_WIDTH),
+                    values.handle(property_id::MAX_WIDTH),
+                    values.handle(property_id::HEIGHT),
+                    values.handle(property_id::MIN_HEIGHT),
+                    values.handle(property_id::MAX_HEIGHT),
+                    parent,
                 ),
-                group_index::INHERITED_BOX => rust_build_inherited_box_group(
-                    group,
-                    values.pointer(property_id::VISIBILITY),
-                    values.pointer(property_id::DIRECTION),
-                    values.pointer(property_id::WRITING_MODE),
-                    values.pointer(property_id::CONTENT_VISIBILITY),
-                    values.pointer(property_id::IMAGE_RENDERING),
-                    parent_payload,
-                ),
-                group_index::SIZING => rust_build_sizing_group(
-                    group,
-                    values.pointer(property_id::WIDTH),
-                    values.pointer(property_id::MIN_WIDTH),
-                    values.pointer(property_id::MAX_WIDTH),
-                    values.pointer(property_id::HEIGHT),
-                    values.pointer(property_id::MIN_HEIGHT),
-                    values.pointer(property_id::MAX_HEIGHT),
-                    parent_payload,
-                ),
-                group_index::SURROUND => build_surround_group(&values, parent_payload),
-                group_index::ANIMATION => {
-                    build_animation_group(&values, &input, inputs.used_color_scheme, parent_payload)
-                }
-                group_index::ANCHOR => build_anchor_group(&values, &input, inputs.used_color_scheme, parent_payload),
-                group_index::TEXT_RESET => build_text_reset_group(&values, &input, parent_payload),
-                group_index::ALIGNMENT => build_alignment_group(&values, parent_payload),
-                group_index::SVG_RESET => build_svg_reset_group(&values, &input, parent_payload),
-                group_index::GRID => build_grid_group(&values, parent_payload),
-                group_index::TRANSFORM => {
-                    build_transform_group(&values, &input, inputs.used_color_scheme, parent_payload)
-                }
-                group_index::EFFECTS => build_effects_group(&values, &input, inputs.used_color_scheme, parent_payload),
-                group_index::INHERITED_UI => {
-                    build_inherited_ui_group(&values, &input, inputs.used_color_scheme, parent_payload)
-                }
+                group_index::SURROUND => build_surround_group(values, parent),
+                group_index::ANIMATION => build_animation_group(values, &input, inputs.used_color_scheme, parent),
+                group_index::ANCHOR => build_anchor_group(values, &input, inputs.used_color_scheme, parent),
+                group_index::TEXT_RESET => build_text_reset_group(values, &input, parent),
+                group_index::ALIGNMENT => build_alignment_group(values, parent),
+                group_index::SVG_RESET => build_svg_reset_group(values, &input, parent),
+                group_index::GRID => build_grid_group(values, parent),
+                group_index::TRANSFORM => build_transform_group(values, &input, inputs.used_color_scheme, parent),
+                group_index::EFFECTS => build_effects_group(values, &input, inputs.used_color_scheme, parent),
+                group_index::INHERITED_UI => build_inherited_ui_group(values, &input, inputs.used_color_scheme, parent),
                 group_index::INHERITED_TEXT => {
-                    build_inherited_text_group(&values, &input, inputs.used_color_scheme, parent_payload)
+                    build_inherited_text_group(values, &input, inputs.used_color_scheme, parent)
                 }
-                group_index::MISC_RESET => {
-                    build_misc_reset_group(&values, &input, inputs.used_color_scheme, parent_payload)
+                group_index::MISC_LAYOUT => build_misc_layout_group(values, &input, inputs.used_color_scheme, parent),
+                group_index::MISC_INTERACTION => {
+                    build_misc_interaction_group(values, &input, inputs.used_color_scheme, parent)
                 }
                 group_index::INHERITED_SVG => {
-                    build_inherited_svg_group(&values, &input, inputs.used_color_scheme, parent_payload)
+                    build_inherited_svg_group(values, &input, inputs.used_color_scheme, parent)
                 }
-                group_index::INHERITED_LIST => {
-                    build_inherited_list_group(&values, &input, inputs.used_color_scheme, parent_payload)
+                group_index::INHERITED_LIST_TABLE => {
+                    build_inherited_list_table_group(values, &input, inputs.used_color_scheme, parent)
                 }
-                group_index::CONTENT => build_content_group(&values, &input, inputs.used_color_scheme, parent_payload),
-                group_index::BACKGROUND => {
-                    build_background_group(&values, &input, inputs.used_color_scheme, parent_payload)
-                }
-                group_index::MASK => build_mask_group(&values, &input, inputs.used_color_scheme, parent_payload),
-                group_index::BORDER => build_border_group(&values, &input, inputs.used_color_scheme, parent_payload),
-                _ => build_generic_group(group, &values, &input, inputs.used_color_scheme, parent_payload),
+                group_index::CONTENT => build_content_group(values, &input, inputs.used_color_scheme, parent),
+                group_index::BACKGROUND => build_background_group(values, &input, inputs.used_color_scheme, parent),
+                group_index::MASK => build_mask_group(values, &input, inputs.used_color_scheme, parent),
+                group_index::BORDER => build_border_group(values, &input, inputs.used_color_scheme, parent),
+                _ => build_generic_group(group, values, &input, inputs.used_color_scheme, parent),
             }
         };
         assert!(!payload.is_null(), "computed group build returned null");
-        out[group] = payload;
+        *out_payload = payload;
+    }
+}
+
+#[cfg(test)]
+mod transform_angle_tests {
+    use super::*;
+    use crate::css::style_value::StyleValueBox;
+    use crate::css::style_value_arc::StyleValueArc;
+
+    fn literal(value: f64, unit: &str) -> StyleValueData {
+        StyleValueData::Angle {
+            value,
+            unit: angle_unit_index(unit) as u8,
+        }
+    }
+
+    fn computed_transform(source: &str) -> RetainedStyleValueData {
+        use crate::css::absolutize::{Absolutized, absolutize_with_element_facts};
+        use crate::css::css_tokenizer::{TokenizerInput, tokenize_for_parser};
+        use crate::css::parser::component_value::consume_a_list_of_component_values;
+        use crate::css::parser::value_parser::{ParseContext, ParseOutcome, parse_css_value};
+        let units: Vec<_> = source.encode_utf16().collect();
+        let tokens = consume_a_list_of_component_values(tokenize_for_parser(TokenizerInput::Utf16(&units))).unwrap();
+        let ParseOutcome::Parsed(parsed) = parse_css_value(&ParseContext::default(), property_id::TRANSFORM, &tokens)
+        else {
+            panic!("valid transform");
+        };
+        match absolutize_with_element_facts(
+            &parsed,
+            &crate::css::style_compute::FfiLengthResolutionContext::default(),
+            None,
+            &[],
+            None,
+        )
+        .unwrap()
+        {
+            Absolutized::Changed(value) => value,
+            Absolutized::Unchanged => RetainedStyleValueData::from_arc(parsed),
+        }
+    }
+
+    fn first_transform(value: &RetainedStyleValueData) -> &StyleValueData {
+        let StyleValueData::ValueList { values, .. } = value.data() else {
+            panic!("transform list")
+        };
+        values.as_slice()[0].data()
+    }
+
+    #[test]
+    fn parsed_large_turns_remain_identity_after_absolutization_and_lowering() {
+        for source in ["rotate(1e30turn)", "rotate(-1e30turn)"] {
+            let value = computed_transform(source);
+            let matrix = lower_transformation(first_transform(&value)).matrix;
+            for (actual, expected) in matrix.into_iter().zip(matrix_identity()) {
+                assert!((actual - expected).abs() < 1e-6, "{source}: {matrix:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_arguments_and_serialization_survive_precise_matrix_inputs() {
+        let value = computed_transform("rotate(1e30turn)");
+        let transform = first_transform(&value);
+        let StyleValueData::Transformation(transformation_payload) = transform else {
+            panic!("transform function");
+        };
+        let TransformationPayload {
+            property,
+            transform_function,
+            values,
+            matrix_values,
+        } = &**transformation_payload;
+        assert!(!matrix_values.as_slice().is_empty());
+        assert!(
+            matches!(values.as_slice()[0].data(), StyleValueData::Angle { value, unit }
+            if *value == 1e30 * 360.0 && *unit as usize == angle_unit_index("deg"))
+        );
+        let without_matrix_inputs = StyleValueData::Transformation(StyleValueBox::new(TransformationPayload {
+            property: *property,
+            transform_function: *transform_function,
+            values: values.clone(),
+            matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
+        }));
+        assert_eq!(
+            crate::css::serialize::serialize_style_value_to_utf16(transform),
+            crate::css::serialize::serialize_style_value_to_utf16(&without_matrix_inputs)
+        );
+        assert!(transform != &without_matrix_inputs);
+        assert!(transform.content_hash() != without_matrix_inputs.content_hash());
+        let cloned = transform.clone();
+        assert!(transform == &cloned);
+        assert_eq!(transform.content_hash(), cloned.content_hash());
+        assert_eq!(
+            lower_transformation(transform).matrix,
+            lower_transformation(&cloned).matrix
+        );
+        let repeated = crate::css::absolutize::absolutize_with_element_facts(
+            &cloned,
+            &crate::css::style_compute::FfiLengthResolutionContext::default(),
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        match repeated {
+            crate::css::absolutize::Absolutized::Unchanged => {}
+            crate::css::absolutize::Absolutized::Changed(value) => {
+                assert!(value.data() == transform);
+                assert_eq!(
+                    lower_transformation(value.data()).matrix,
+                    lower_transformation(transform).matrix
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_matrix_inputs_follow_axes_and_drop_replaced_angles() {
+        let value = computed_transform("rotate3d(0, 0, 1, 1e30turn)");
+        let StyleValueData::Transformation(transformation_payload) = first_transform(&value) else {
+            panic!("transform function");
+        };
+        let TransformationPayload {
+            values, matrix_values, ..
+        } = &**transformation_payload;
+        let mut mapped = values.as_slice().to_vec();
+        mapped[0] = RetainedStyleValueData::from_arc(StyleValueArc::new(StyleValueData::Number { value: 1.0 }));
+        let retained =
+            crate::css::style_value::map_transform_matrix_values(values.as_slice(), &mapped, matrix_values.as_slice());
+        assert!(retained.as_slice()[0].data() == mapped[0].data());
+        assert!(
+            matches!(retained.as_slice()[3].data(), StyleValueData::Angle { value, unit }
+            if *value == 1e30 && *unit as usize == angle_unit_index("turn"))
+        );
+        mapped[3] = RetainedStyleValueData::from_arc(StyleValueArc::new(literal(90.0, "deg")));
+        let retained =
+            crate::css::style_value::map_transform_matrix_values(values.as_slice(), &mapped, matrix_values.as_slice());
+        assert!(retained.as_slice().is_empty());
+    }
+
+    #[test]
+    fn large_whole_turns_do_not_rotate() {
+        for value in [1e30, -1e30] {
+            assert_eq!(transform_angle_radians(&literal(value, "turn")), 0.0);
+        }
+    }
+
+    #[test]
+    fn large_grad_angles_preserve_their_remainder() {
+        // The representable f64 value 1e30 has a remainder of 256 grads, or 230.4 degrees.
+        let expected = std::f64::consts::PI * 1.28;
+        assert!((transform_angle_radians(&literal(1e30, "grad")) - expected).abs() < 1e-14);
+        assert!((transform_angle_radians(&literal(-1e30, "grad")) + expected).abs() < 1e-14);
+    }
+
+    #[test]
+    fn transform_angle_units_keep_their_periods() {
+        for (value, unit) in [
+            (450.0, "deg"),
+            (500.0, "grad"),
+            (1.25, "turn"),
+            (std::f64::consts::PI * 2.5, "rad"),
+        ] {
+            assert!((transform_angle_radians(&literal(value, unit)) - std::f64::consts::FRAC_PI_2).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn calculated_transform_angle_keeps_degree_resolution() {
+        use crate::css::calc::{CalcNode, CalcNodeHandle, CalcNumericType, CalcNumericValue, FfiNumericType};
+        let node = std::sync::Arc::new(CalcNode::Numeric(CalcNumericValue::Angle {
+            value: 450.0,
+            unit: angle_unit_index("deg") as u8,
+        }));
+        let value = StyleValueData::Calculated(StyleValueBox::new(CalculatedPayload {
+            resolved_type: FfiNumericType::from_calc(node.numeric_type(&CalcNumericType::default())),
+            rust_calculation: CalcNodeHandle::from_arc(node),
+            resolve_as_is_number: false,
+            resolve_as_base: 0,
+            has_percentages_resolve_as: false,
+            percentages_resolve_as: 0,
+            resolve_numbers_as_integers: false,
+            accepted_ranges: crate::css::style_value::RetainedNumericRangeList::empty(),
+        }));
+        assert_eq!(angle_degrees(&value), Some(450.0));
+        assert!((transform_angle_radians(&value) - std::f64::consts::FRAC_PI_2).abs() < 1e-14);
+        assert_eq!(angle_degrees(&value), Some(450.0));
+    }
+
+    #[test]
+    fn non_finite_transform_angles_stay_nan() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for unit in ["deg", "grad", "rad", "turn"] {
+                assert!(transform_angle_radians(&literal(value, unit)).is_nan());
+            }
+        }
     }
 }

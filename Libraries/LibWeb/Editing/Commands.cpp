@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ScopeGuard.h>
+#include <LibGC/ConservativeVector.h>
 #include <LibGC/RootVector.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibUnicode/Segmenter.h>
@@ -31,9 +33,8 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Namespace.h>
+#include <LibWeb/Selection/CaretNavigation.h>
 #include <LibWeb/Selection/SelectionModifier.h>
-#include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
-#include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 
 namespace Web::Editing {
 
@@ -100,7 +101,7 @@ bool command_create_link_action(DOM::Document& document, Utf16View value)
 
     // 2. For each editable a element that has an href attribute and is an ancestor of some node effectively contained
     //    in the active range, set that a element's href attribute to value.
-    HashTable<DOM::Node*> visited_ancestors;
+    GC::RootHashTable<DOM::Node*> visited_ancestors;
     auto set_value_for_ancestor_anchors = [&](GC::Ref<DOM::Node> node) {
         node->for_each_ancestor([&](GC::Ref<DOM::Node> ancestor) {
             if (visited_ancestors.contains(ancestor.ptr()))
@@ -152,6 +153,190 @@ Utf16String command_default_paragraph_separator_value(DOM::Document const& docum
     return document.default_single_line_container_name().to_utf16_string();
 }
 
+// Returns the Text node that follows text in tree order within block, if only inline elements are between them.
+static GC::Ptr<DOM::Text> next_text_in_inline_content(DOM::Text& text, DOM::Node& block)
+{
+    for (auto* node = text.next_in_pre_order(&block); node; node = node->next_in_pre_order(&block)) {
+        if (auto* next_text = as_if<DOM::Text>(*node))
+            return next_text;
+        if (!is<DOM::Element>(*node) || !is_inline_node(*node) || editing_ignores_content(*node))
+            return {};
+    }
+    return {};
+}
+
+// Returns the Text node that precedes text in tree order within block, if only inline elements are between them.
+static GC::Ptr<DOM::Text> previous_text_in_inline_content(DOM::Text& text, DOM::Node& block)
+{
+    for (auto* node = text.previous_in_pre_order(); node && node != &block; node = node->previous_in_pre_order()) {
+        if (auto* previous_text = as_if<DOM::Text>(*node))
+            return previous_text;
+        // NB: Inclusive ancestors of text precede it in tree order but are not between it and the previous Text node.
+        if (node->is_inclusive_ancestor_of(text))
+            continue;
+        if (!is<DOM::Element>(*node) || !is_inline_node(*node) || editing_ignores_content(*node))
+            return {};
+    }
+    return {};
+}
+
+// INTEROP: When the user deletes a character in text, browsers delete the content between the caret and the adjacent
+//          visible caret position, which includes collapsed white-space. They then rebalance the white-space after
+//          the deletion only in one Text node, instead of canonicalizing the white-space sequence across nodes. See the
+//          INTEROP note at rebalance_whitespace_in_text_node(). This handles the deletions in collapsible white-space
+//          that do not leave an element empty. It returns false if it did not handle the deletion.
+static bool delete_character_in_text(DOM::Document& document, Selection& selection, Web::Selection::SelectionDirection direction)
+{
+    auto range = selection.range();
+    if (!range || !range->collapsed())
+        return false;
+
+    // NB: See the INTEROP note at remove_collapsed_spaces_in_text_node().
+    if (auto* text = as_if<DOM::Text>(*range->start_container())) {
+        auto offset = offset_after_removing(remove_collapsed_spaces_in_text_node(*text, range->start_offset()), range->start_offset());
+        if (offset != range->start_offset())
+            MUST(selection.collapse(*text, offset));
+        range = selection.range();
+    }
+
+    Web::Selection::CaretNavigator navigator(document);
+    Web::Selection::CaretLocation caret { range->start_container(), range->start_offset(), selection.focus_affinity() };
+    auto destination = navigator.move(caret, Web::Selection::SelectionAlteration::Move, direction, Web::Selection::SelectionGranularity::Character);
+    if (!destination.has_value())
+        return false;
+
+    DOM::BoundaryPoint start { range->start_container(), range->start_offset() };
+    DOM::BoundaryPoint end { destination->node, static_cast<WebIDL::UnsignedLong>(destination->offset) };
+    if (direction == Web::Selection::SelectionDirection::Backward)
+        swap(start, end);
+    if (DOM::position_of_boundary_point_relative_to_other_boundary_point(start, end) != DOM::RelativeBoundaryPointPosition::Before)
+        return false;
+
+    auto* start_text = as_if<DOM::Text>(*start.node);
+    auto* end_text = as_if<DOM::Text>(*end.node);
+    if (!start_text || !end_text)
+        return false;
+    auto block = block_node_of_node(*start_text);
+    if (!block || block != block_node_of_node(*end_text))
+        return false;
+
+    // NB: Start from the upstream equivalent of the start, the end of the preceding Text node.
+    if (start.offset == 0) {
+        if (auto previous_text = previous_text_in_inline_content(*start_text, *block)) {
+            start_text = previous_text.ptr();
+            start = { *start_text, static_cast<WebIDL::UnsignedLong>(start_text->length()) };
+        }
+    }
+
+    // Collect the Text nodes from start to end, which must only have inline elements between them.
+    GC::RootVector<GC::Ref<DOM::Text>> texts;
+    texts.append(*start_text);
+    while (texts.last().ptr() != end_text) {
+        auto next_text = next_text_in_inline_content(*texts.last(), *block);
+        if (!next_text)
+            return false;
+        texts.append(*next_text);
+    }
+
+    // NB: Leave deletions in links to the steps below, which handle the link boundaries.
+    for (auto text : texts) {
+        if (!text->is_editable() || !text->parent() || text->first_ancestor_of_type<HTML::HTMLAnchorElement>()
+            || text_preserves_spaces(*text))
+            return false;
+    }
+
+    // Only handle blocks that contain nothing but text and inline elements that are not empty, and that keep some
+    // visible text.
+    bool block_has_only_inline_content = true;
+    bool keeps_visible_text = false;
+    block->for_each_in_subtree([&](GC::Ref<DOM::Node> descendant) {
+        if (auto* text = as_if<DOM::Text>(*descendant)) {
+            if (keeps_visible_text)
+                return TraversalDecision::Continue;
+            auto data = text->data().utf16_view();
+            size_t deleted_start = 0;
+            size_t deleted_end = 0;
+            if (text == start_text || text == end_text) {
+                deleted_start = text == start_text ? start.offset : 0;
+                deleted_end = text == end_text ? end.offset : data.length_in_code_units();
+            } else if (texts.contains_slow(GC::Ref { *text })) {
+                deleted_end = data.length_in_code_units();
+            }
+            for (size_t offset = 0; offset < data.length_in_code_units() && !keeps_visible_text; ++offset) {
+                if (offset >= deleted_start && offset < deleted_end)
+                    continue;
+                auto code_unit = data.code_unit_at(offset);
+                if (code_unit != ' ' && code_unit != '\t' && code_unit != '\n' && code_unit != '\r')
+                    keeps_visible_text = true;
+            }
+            return TraversalDecision::Continue;
+        }
+        if (!is<DOM::Element>(*descendant) || !is_inline_node(descendant) || editing_ignores_content(*descendant)
+            || !descendant->has_children()) {
+            block_has_only_inline_content = false;
+            return TraversalDecision::Break;
+        }
+        return TraversalDecision::Continue;
+    });
+    if (!block_has_only_inline_content || !keeps_visible_text)
+        return false;
+
+    // Do not handle deletions that leave an element without children.
+    for (auto text : texts) {
+        auto delete_start = text.ptr() == start_text ? start.offset : 0;
+        auto delete_end = text.ptr() == end_text ? end.offset : text->length();
+        if (delete_start == 0 && delete_end == text->length() && text->parent()->child_count() == 1)
+            return false;
+    }
+
+    // NB: See the INTEROP note at remove_collapsed_spaces_in_text_node().
+    auto removed_offsets = remove_collapsed_spaces_in_text_node(*start_text, start.offset);
+    if (end_text == start_text)
+        end.offset = offset_after_removing(removed_offsets, end.offset);
+    start.offset = offset_after_removing(removed_offsets, start.offset);
+    removed_offsets = remove_collapsed_spaces_in_text_node(*end_text, end.offset);
+    if (end_text == start_text)
+        start.offset = offset_after_removing(removed_offsets, start.offset);
+    end.offset = offset_after_removing(removed_offsets, end.offset);
+    if (end.offset == end_text->length()) {
+        if (auto next_text = next_text_in_inline_content(*end_text, *block))
+            (void)remove_collapsed_spaces_in_text_node(*next_text, 0);
+    }
+
+    for (auto text : texts) {
+        auto delete_start = text.ptr() == start_text ? start.offset : 0;
+        auto delete_end = text.ptr() == end_text ? end.offset : text->length();
+        if (delete_end > delete_start)
+            MUST(delete_data(text, delete_start, delete_end - delete_start));
+        if (text.ptr() != start_text && text->length() == 0)
+            remove_node(text);
+    }
+
+    // Rebalance the white-space at the downstream equivalent of the deletion point.
+    GC::Ref<DOM::Text> rebalanced_text = *start_text;
+    size_t rebalanced_offset = start.offset;
+    if (start.offset == start_text->length()) {
+        for (auto next_text = next_text_in_inline_content(*start_text, *block); next_text; next_text = next_text_in_inline_content(*next_text, *block)) {
+            if (next_text->length() == 0)
+                continue;
+            rebalanced_text = *next_text;
+            rebalanced_offset = 0;
+            break;
+        }
+    }
+    rebalance_whitespace_in_text_node(rebalanced_text, rebalanced_offset);
+
+    if (start_text->length() == 0 && start_text->parent()) {
+        auto parent = GC::Ref { *start_text->parent() };
+        auto index = start_text->index();
+        remove_node(*start_text);
+        MUST(selection.collapse(parent, index));
+    } else {
+        MUST(selection.collapse(*start_text, start.offset));
+    }
+    return true;
+}
+
 // https://w3c.github.io/editing/docs/execCommand/#the-delete-command
 bool command_delete_action(DOM::Document& document, Utf16View)
 {
@@ -162,6 +347,10 @@ bool command_delete_action(DOM::Document& document, Utf16View)
         delete_the_selection(selection);
         return true;
     }
+
+    // NB: See the INTEROP note at delete_character_in_text().
+    if (delete_character_in_text(document, selection, Web::Selection::SelectionDirection::Backward))
+        return true;
 
     // 2. Canonicalize whitespace at the active range's start.
     canonicalize_whitespace(active_range.start());
@@ -260,7 +449,7 @@ bool command_delete_action(DOM::Document& document, Utf16View)
     if (offset == 0 && node->index() == 0
         && node_element.local_name().is_one_of(HTML::TagNames::li, HTML::TagNames::dt, HTML::TagNames::dd)) {
         // 1. Let items be a list of all lis that are ancestors of node.
-        Vector<GC::Ref<DOM::Node>> items;
+        GC::RootVector<GC::Ref<DOM::Node>> items;
         node->for_each_ancestor([&items](GC::Ref<DOM::Node> ancestor) {
             if (is<HTML::HTMLLIElement>(*ancestor))
                 items.append(ancestor);
@@ -310,9 +499,10 @@ bool command_delete_action(DOM::Document& document, Utf16View)
 
     // 9. Repeat the following steps:
     while (true) {
-        // AD-HOC: If start node is not a Node, return false. This prevents a crash by dereferencing a null pointer in
-        //         step 1 below. Edits outside of <body> might be prohibited: https://github.com/w3c/editing/issues/405
-        if (!start_node)
+        // AD-HOC: If start node is not a Node or is a Document, return false. This prevents a crash by dereferencing a
+        //         null pointer in step 1 below, and by collapsing the selection into a doctype in step 17. Edits
+        //         outside of <body> might be prohibited: https://github.com/w3c/editing/issues/405
+        if (!start_node || start_node->is_document())
             return false;
 
         // 1. If start offset is zero, set start offset to the index of start node and then set
@@ -354,7 +544,7 @@ bool command_delete_action(DOM::Document& document, Utf16View)
             auto new_range = block_extend_a_range(DOM::Range::create(*node, 0, *node, 0));
 
             // 2. Let node list be a list of nodes, initially empty.
-            Vector<GC::Ref<DOM::Node>> node_list;
+            GC::RootVector<GC::Ref<DOM::Node>> node_list;
 
             // 3. For each node current node contained in new range, append current node to node list if
             //    the last member of node list (if any) is not an ancestor of current node, and current
@@ -698,7 +888,7 @@ bool command_format_block_action(DOM::Document& document, Utf16View value)
     auto new_range = block_extend_a_range(*active_range(document));
 
     // 5. Let node list be an empty list of nodes.
-    Vector<GC::Ref<DOM::Node>> node_list;
+    GC::RootVector<GC::Ref<DOM::Node>> node_list;
 
     // 6. For each node node contained in new range, append node to node list if it is editable, the last member of
     //    original node list (if any) is not an ancestor of node, node is either a non-list single-line container or an
@@ -755,7 +945,7 @@ bool command_format_block_action(DOM::Document& document, Utf16View value)
 
     // 10. While node list is not empty:
     while (!node_list.is_empty()) {
-        Vector<GC::Ref<DOM::Node>> sublist;
+        GC::RootVector<GC::Ref<DOM::Node>> sublist;
 
         // 1. If the first member of node list is a single-line container:
         if (is_single_line_container(node_list.first())) {
@@ -807,7 +997,9 @@ bool command_format_block_action(DOM::Document& document, Utf16View value)
         auto result = wrap(
             sublist,
             [&](GC::Ref<DOM::Node> sibling) {
-                if (resulting_value.is_one_of("div"sv, "p"sv))
+                // INTEROP: Browsers do not merge the sectioning and grouping elements that they also support with
+                //          their siblings.
+                if (resulting_value.is_one_of("div"sv, "p"sv) || is_additional_formattable_block_name(*local_name))
                     return false;
                 auto const* html_element = as_if<HTML::HTMLElement>(*sibling);
                 return html_element && html_element->local_name() == resulting_value && !html_element->has_attributes();
@@ -834,7 +1026,7 @@ bool command_format_block_indeterminate(DOM::Document const& document)
     auto new_range = block_extend_a_range(*range);
 
     // 3. Let node list be all visible editable nodes that are contained in new range and have no children.
-    Vector<GC::Ref<DOM::Node>> node_list;
+    GC::RootVector<GC::Ref<DOM::Node>> node_list;
     new_range->for_each_contained([&](GC::Ref<DOM::Node> node) {
         if (is_visible_node(node) && node->is_editable() && !node->has_children())
             node_list.append(node);
@@ -940,6 +1132,10 @@ bool command_forward_delete_action(DOM::Document& document, Utf16View)
         delete_the_selection(selection);
         return true;
     }
+
+    // NB: See the INTEROP note at delete_character_in_text().
+    if (delete_character_in_text(document, selection, Web::Selection::SelectionDirection::Forward))
+        return true;
 
     // 2. Canonicalize whitespace at the active range's start.
     canonicalize_whitespace(active_range.start());
@@ -1131,7 +1327,7 @@ bool command_forward_delete_action(DOM::Document& document, Utf16View)
 bool command_indent_action(DOM::Document& document, Utf16View)
 {
     // 1. Let items be a list of all lis that are inclusive ancestors of the active range's start and/or end node.
-    Vector<GC::Ref<DOM::Node>> items;
+    GC::RootVector<GC::Ref<DOM::Node>> items;
     auto add_all_lis = [&items](GC::Ref<DOM::Node> node) {
         node->for_each_inclusive_ancestor([&items](GC::Ref<DOM::Node> ancestor) {
             if (is<HTML::HTMLLIElement>(*ancestor) && !items.contains_slow(ancestor))
@@ -1151,7 +1347,7 @@ bool command_indent_action(DOM::Document& document, Utf16View)
     auto new_range = block_extend_a_range(*active_range(document));
 
     // 4. Let node list be a list of nodes, initially empty.
-    Vector<GC::Ref<DOM::Node>> node_list;
+    GC::RootVector<GC::Ref<DOM::Node>> node_list;
 
     // 5. For each node node contained in new range, if node is editable and is an allowed child of "div" or "ol" and if
     //    the last member of node list (if any) is not an ancestor of node, append node to node list.
@@ -1184,7 +1380,7 @@ bool command_indent_action(DOM::Document& document, Utf16View)
     // 7. While node list is not empty:
     while (!node_list.is_empty()) {
         // 1. Let sublist be a list of nodes, initially empty.
-        Vector<GC::Ref<DOM::Node>> sublist;
+        GC::RootVector<GC::Ref<DOM::Node>> sublist;
 
         // 2. Remove the first member of node list and append it to sublist.
         sublist.append(node_list.take_first());
@@ -1271,17 +1467,103 @@ bool command_insert_horizontal_rule_action(DOM::Document& document, Utf16View)
     return true;
 }
 
+enum class InsertTextContext {
+    Typing,
+    TextReplacement,
+    OtherReplacement,
+};
+
+static bool insert_text(DOM::Document&, Utf16View, InsertTextContext);
+
+// INTEROP: In a plaintext-only editing host, browsers insert the text that HTML renders as instead of its nodes. This
+//          returns that text for a parsed fragment. Content that is not rendered by default, such as scripts and the
+//          head, is left out. Block-level elements and br elements separate lines, and white-space collapses outside
+//          of preformatted elements.
+static Utf16String plain_text_of_fragment(DOM::DocumentFragment& fragment)
+{
+    Utf16StringBuilder builder;
+    bool at_line_start = true;
+    bool pending_space = false;
+    bool pending_line_break = false;
+
+    auto flush_line_break = [&] {
+        if (pending_line_break && !builder.is_empty()) {
+            builder.append_code_unit(u'\n');
+            at_line_start = true;
+            pending_space = false;
+        }
+        pending_line_break = false;
+    };
+
+    // NB: This walks the tree with a stack instead of recursion, since script can insert deeply nested HTML.
+    struct PendingNode {
+        GC::Ref<DOM::Node> node;
+        bool preserves_white_space;
+        bool is_block_end;
+    };
+    GC::ConservativeVector<PendingNode> pending_nodes;
+    pending_nodes.append({ fragment, false, false });
+    while (!pending_nodes.is_empty()) {
+        auto [node, preserves_white_space, is_block_end] = pending_nodes.take_last();
+        if (is_block_end) {
+            pending_line_break = true;
+            continue;
+        }
+
+        if (auto* text = as_if<DOM::Text>(*node)) {
+            for (auto code_unit : text->data().utf16_view()) {
+                bool is_white_space = code_unit == ' ' || code_unit == '\t' || code_unit == '\n' || code_unit == '\r' || code_unit == '\f';
+                if (!preserves_white_space && is_white_space) {
+                    pending_space = !at_line_start;
+                    continue;
+                }
+                flush_line_break();
+                if (pending_space) {
+                    builder.append_code_unit(u' ');
+                    pending_space = false;
+                }
+                builder.append_code_unit(code_unit);
+                at_line_start = code_unit == u'\n';
+            }
+            continue;
+        }
+
+        auto* element = as_if<DOM::Element>(*node);
+        if (element) {
+            if (element->local_name().is_one_of(HTML::TagNames::head, HTML::TagNames::title, HTML::TagNames::script,
+                    HTML::TagNames::style, HTML::TagNames::noscript, HTML::TagNames::noframes, HTML::TagNames::template_,
+                    HTML::TagNames::meta, HTML::TagNames::link, HTML::TagNames::base))
+                continue;
+            if (is<HTML::HTMLBRElement>(*element)) {
+                flush_line_break();
+                builder.append_code_unit(u'\n');
+                at_line_start = true;
+                pending_space = false;
+                continue;
+            }
+            preserves_white_space = preserves_white_space
+                || element->local_name().is_one_of(HTML::TagNames::pre, HTML::TagNames::listing, HTML::TagNames::xmp,
+                    HTML::TagNames::plaintext, HTML::TagNames::textarea);
+        }
+
+        bool is_block = element && is_prohibited_paragraph_child_name(element->local_name());
+        if (is_block) {
+            pending_line_break = true;
+            pending_nodes.append({ node, preserves_white_space, true });
+        }
+        for (auto* child = node->last_child(); child; child = child->previous_sibling())
+            pending_nodes.append({ *child, preserves_white_space, false });
+    }
+    return builder.to_string();
+}
+
 // https://w3c.github.io/editing/docs/execCommand/#the-inserthtml-command
 bool command_insert_html_action(DOM::Document& document, Utf16View value)
 {
     // 1. Set value to the result of invoking get trusted types compliant string with TrustedHTML, this's relevant
     //    global object, value, "Document execCommand", and "script".
-    auto const resulting_value = MUST(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(document),
-        Utf16String::from_utf16(value),
-        TrustedTypes::InjectionSink::Document_execCommand,
-        TrustedTypes::Script.view()));
+    // NB: Document::exec_command() does this for a script's value; see the AD-HOC note there. So, the fragments below
+    //     are parsed without the injection-sink check createContextualFragment() makes.
 
     // 2. Delete the selection.
     auto& selection = *document.get_selection();
@@ -1292,6 +1574,28 @@ bool command_insert_html_action(DOM::Document& document, Utf16View value)
     if (!range->start_container()->is_editable_or_editing_host())
         return true;
 
+    // NB: See the INTEROP note at plain_text_of_fragment(). Insert the lines as text, separated by line breaks.
+    if (auto editing_host = range->start_container()->editing_host(); is<HTML::HTMLElement>(editing_host.ptr())
+        && as<HTML::HTMLElement>(*editing_host).content_editable_state() == HTML::ContentEditableState::PlaintextOnly) {
+        GC::Ptr<DOM::DocumentFragment> fragment;
+        {
+            EditingHistory::ProxyMutationScope mutation_scope { *range->start_container() };
+            auto result = range->create_contextual_fragment(value.to_utf8_but_should_be_ported_to_utf16());
+            if (result.is_exception())
+                return false;
+            fragment = result.release_value();
+        }
+        auto text = plain_text_of_fragment(*fragment);
+        auto lines = text.utf16_view().split_view(u'\n', SplitBehavior::KeepEmpty);
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i > 0)
+                command_insert_linebreak_action(document, {});
+            if (!lines[i].is_empty())
+                insert_text(document, lines[i], InsertTextContext::Typing);
+        }
+        return true;
+    }
+
     // INTEROP: Blink and WebKit route both inline and block rich paste through their selection-replacement command.
     //          Keeping fragment parsing, inserted-range tracking, and completion in that command prevents the two
     //          structural cases from acquiring different whitespace and caret behavior.
@@ -1299,7 +1603,7 @@ bool command_insert_html_action(DOM::Document& document, Utf16View value)
     //          non-breaking space, just as it does when inserting text at the same boundary.
     canonicalize_whitespace(range->start());
     range = active_range(document);
-    replace_selection_with_fragment(document, resulting_value);
+    replace_selection_with_fragment(document, value);
     return true;
 }
 
@@ -1439,8 +1743,11 @@ bool command_insert_linebreak_action(DOM::Document& document, Utf16View)
     //         newlines, so inserting a literal newline character is more appropriate than a <br> element.
     //         However, padding line breaks (needed for empty last lines) should still be <br> because they won't
     //         appear in .textContent, making the content easier to work with programmatically.
+    // INTEROP: Browsers do insert a <br> if the white-space style comes from the default style of an element such as
+    //          pre.
     auto resolved_white_space_collapse = resolved_keyword(*start_node, CSS::PropertyID::WhiteSpaceCollapse);
-    if (resolved_white_space_collapse.has_value() && first_is_one_of(resolved_white_space_collapse.value(), CSS::Keyword::Preserve, CSS::Keyword::PreserveBreaks)) {
+    if (resolved_white_space_collapse.has_value() && first_is_one_of(resolved_white_space_collapse.value(), CSS::Keyword::Preserve, CSS::Keyword::PreserveBreaks)
+        && !white_space_is_from_default_style(*start_node)) {
         if (auto* text_node = as_if<DOM::Text>(*start_node)) {
             MUST(insert_data(*text_node, start_offset, "\n"_utf16));
             MUST(selection.collapse(start_node, start_offset + 1));
@@ -1448,6 +1755,9 @@ bool command_insert_linebreak_action(DOM::Document& document, Utf16View)
                 MUST(selection.collapse(start_node->parent(), start_node->index() + 1));
                 auto br = MUST(DOM::create_element(document, HTML::TagNames::br, Namespace::HTML));
                 MUST(insert_node_into_range(*active_range(document), br));
+
+                // NB: Inserting the br made the selection span it. Collapse it again after the newline.
+                MUST(selection.collapse(start_node, text_node->length()));
             }
             return true;
         }
@@ -1455,6 +1765,20 @@ bool command_insert_linebreak_action(DOM::Document& document, Utf16View)
             && as<HTML::HTMLElement>(*editing_host).content_editable_state() == HTML::ContentEditableState::PlaintextOnly) {
             auto text = document.create_text_node("\n"_utf16);
             MUST(insert_node_into_range(*active_range(document), text));
+            MUST(selection.collapse(text, 1));
+            return true;
+        }
+
+        // INTEROP: At an element boundary, insert the newline in a new Text node. If nothing follows it in its parent,
+        //          also insert a <br> after it, so that the new line is visible.
+        if (is<DOM::Element>(*start_node)) {
+            auto text = document.create_text_node("\n"_utf16);
+            MUST(insert_node_into_range(range, text));
+            MUST(selection.collapse(text->parent(), text->index() + 1));
+            if (!text->next_sibling()) {
+                auto br = MUST(DOM::create_element(document, HTML::TagNames::br, Namespace::HTML));
+                MUST(insert_node_into_range(*active_range(document), br));
+            }
             MUST(selection.collapse(text, 1));
             return true;
         }
@@ -1475,7 +1799,7 @@ bool command_insert_linebreak_action(DOM::Document& document, Utf16View)
     //     result, then call insertNode(extra br) on the active range.
     if (is_collapsed_line_break(br)) {
         auto extra_br = MUST(DOM::create_element(document, HTML::TagNames::br, Namespace::HTML));
-        MUST(insert_node_into_range(range, extra_br));
+        MUST(insert_node_into_range(*active_range(document), extra_br));
 
         // INTEROP: The range insertion leaves the range spanning extra br; Chromium keeps the caret collapsed
         //          between the two line breaks.
@@ -1513,17 +1837,57 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
 {
     // 1. Delete the selection.
     auto& selection = *document.get_selection();
+    auto selection_was_collapsed = selection.is_collapsed();
     delete_the_selection(selection);
 
-    // 2. If the active range's start node is neither editable nor an editing host, return true.
+    // INTEROP: Deleting the selection can set overrides to keep the formatting of the deleted content. Browsers keep
+    //          that formatting in the new paragraph, so keep the overrides that add formatting when the caret moves to
+    //          it, unless the new paragraph is of another kind, such as a div after a heading.
+    auto overrides = record_current_overrides(document);
+    auto keeps_overrides = true;
+    ScopeGuard restore_overrides = [&] {
+        if (keeps_overrides && selection.is_collapsed())
+            restore_overrides_that_add_formatting(document, overrides);
+    };
+
     GC::Ref<DOM::Range> active_range = *selection.range();
     GC::Ptr<DOM::Node> node = active_range->start_container();
+
+    // INTEROP: Browsers do not split the structure of a table outside of its cells. If the caret is in it, they
+    //          insert the new paragraph before the table, as if the caret were before it.
+    {
+        GC::Ptr<DOM::Node> element_to_insert_before;
+        for (GC::Ptr<DOM::Node> ancestor = node; selection_was_collapsed && ancestor && !ancestor->is_editing_host(); ancestor = ancestor->parent()) {
+            auto* element = as_if<HTML::HTMLElement>(*ancestor);
+            if (!element)
+                continue;
+            if (element->local_name().is_one_of(HTML::TagNames::td, HTML::TagNames::th, HTML::TagNames::caption))
+                break;
+            if (element->local_name().is_one_of(HTML::TagNames::table, HTML::TagNames::tbody, HTML::TagNames::thead,
+                    HTML::TagNames::tfoot, HTML::TagNames::tr, HTML::TagNames::colgroup, HTML::TagNames::col))
+                element_to_insert_before = element;
+        }
+        if (element_to_insert_before) {
+            if (auto parent = element_to_insert_before->parent(); parent && parent->is_editable_or_editing_host()) {
+                MUST(selection.collapse(parent, element_to_insert_before->index()));
+                active_range = *selection.range();
+                node = parent;
+            }
+        }
+    }
+
+    // 2. If the active range's start node is neither editable nor an editing host, return true.
     if (!node->is_editable_or_editing_host())
         return true;
 
     // 3. Let node and offset be the active range's start node and offset.
     // NOTE: node is set in step 2
     auto offset = active_range->start_offset();
+
+    // NB: See the INTEROP note at remove_collapsed_spaces_in_text_node(). Browsers remove the spaces that are not
+    //     rendered before they split the line.
+    if (auto* text = as_if<DOM::Text>(*node))
+        offset = static_cast<WebIDL::UnsignedLong>(offset_after_removing(remove_collapsed_spaces_in_text_node(*text, offset), offset));
 
     // 4. If node is a Text node, and offset is neither 0 nor the length of node, call splitText(offset) on node.
     if (is<DOM::Text>(*node) && offset != 0 && offset != node->length())
@@ -1549,9 +1913,18 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
     // 8. Let container equal node.
     auto container = node;
 
+    // INTEROP: Browsers split a flex or grid item that is not a single-line container, such as a span, instead of the
+    //          flex or grid container.
+    auto is_flex_or_grid_item = [](DOM::Node& node) {
+        if (!is<HTML::HTMLElement>(node) || !node.is_editable() || !node.parent())
+            return false;
+        auto parent_display = resolved_display(*node.parent());
+        return parent_display.has_value() && (parent_display->is_flex_inside() || parent_display->is_grid_inside());
+    };
+
     // 9. While container is not a single-line container, and container's parent is editable and in the same editing
     //    host as node, set container to its parent.
-    while (!is_single_line_container(*container)) {
+    while (!is_single_line_container(*container) && !is_flex_or_grid_item(*container)) {
         auto container_parent = container->parent();
         if (!container_parent->is_editable() || !is_in_same_editing_host(*node, *container_parent))
             break;
@@ -1584,8 +1957,35 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
             container = outer_container;
     }
 
+    auto container_is_editable_in_same_editing_host = container->is_editable() && is_in_same_editing_host(*container, *node);
+    auto container_display = resolved_display(*container);
+
+    // INTEROP: Browsers treat a single-line container that is inline-level like a span when its parent cannot contain
+    //          the default single-line container. They insert a line break in it instead of splitting it.
+    if (container_is_editable_in_same_editing_host && is_single_line_container(*container)
+        && container_display.has_value() && container_display->is_inline_outside() && container->parent()
+        && !is_allowed_child_of_node(document.default_single_line_container_name(), GC::Ref { *container->parent() }))
+        return command_insert_linebreak_action(document, {});
+
+    // INTEROP: Browsers do not create a new paragraph in an editing host that is inline-level, or that cannot contain
+    //          the default single-line container, such as a span. They insert a line break instead. But they split a
+    //          block-level element that is not a single-line container, such as a span with display: block.
+    auto should_split_block_level_container = container_is_editable_in_same_editing_host && is_flex_or_grid_item(*container);
+    if (!should_split_block_level_container && (!container_is_editable_in_same_editing_host || !is_single_line_container(*container))) {
+        if (auto editing_host = node->editing_host()) {
+            auto display = resolved_display(*editing_host);
+            if ((display.has_value() && display->is_inline_outside())
+                || !is_allowed_child_of_node(document.default_single_line_container_name(), GC::Ref { *editing_host })) {
+                should_split_block_level_container = container_is_editable_in_same_editing_host && is<HTML::HTMLElement>(*container)
+                    && container_display.has_value() && container_display->is_block_outside();
+                if (!should_split_block_level_container)
+                    return command_insert_linebreak_action(document, {});
+            }
+        }
+    }
+
     // 11. If container is not editable or not in the same editing host as node or is not a single-line container:
-    if (!container->is_editable() || !is_in_same_editing_host(*container, *node) || !is_single_line_container(*container)) {
+    if (!should_split_block_level_container && (!container_is_editable_in_same_editing_host || !is_single_line_container(*container))) {
         // 1. Let tag be the default single-line container name.
         auto tag = document.default_single_line_container_name();
 
@@ -1593,7 +1993,7 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
         auto new_range = block_extend_a_range(active_range);
 
         // 3. Let node list be a list of nodes, initially empty.
-        Vector<GC::Ref<DOM::Node>> node_list;
+        GC::RootVector<GC::Ref<DOM::Node>> node_list;
 
         // 4. Append to node list the first node in tree order that is contained in new range and is an allowed child of
         //    "p", if any.
@@ -1642,7 +2042,7 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
         auto new_container = wrap(
             node_list,
             [](auto) { return false; },
-            [&] { return MUST(DOM::create_element(document, tag, Namespace::HTML)); });
+            [&] { return MUST(DOM::create_element(document, tag, Namespace::HTML)); }, PreservePrecedingLineBreak::Yes);
         if (new_container)
             container = new_container;
     }
@@ -1717,10 +2117,43 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
     //     length of container).
     auto new_line_range = DOM::Range::create(active_range->start_container(), active_range->start_offset(), *container, container->length());
 
+    // INTEROP: Browsers keep the inline formatting of the caret in a line that the split leaves empty. They give it
+    //          clones of the inline ancestors of the caret that change its formatting, with its line break inside
+    //          them. They do not do this if the caret is in a link. Collect these ancestors here, before the split
+    //          moves the caret.
+    GC::RootVector<GC::Ref<DOM::Element>> inline_ancestors_to_clone;
+    for (GC::Ptr<DOM::Node> ancestor = active_range->start_container(); ancestor && ancestor != container; ancestor = ancestor->parent()) {
+        if (is<HTML::HTMLAnchorElement>(*ancestor)) {
+            inline_ancestors_to_clone.clear();
+            break;
+        }
+        auto* element = as_if<HTML::HTMLElement>(*ancestor);
+        if (element && is_inline_node(*element) && element_changes_formatting(*element))
+            inline_ancestors_to_clone.prepend(*element);
+    }
+    auto append_line_break = [&](DOM::Node& parent, GC::Ptr<DOM::Node> line_break) -> GC::Ref<DOM::Node> {
+        GC::Ref<DOM::Node> innermost = parent;
+        for (auto ancestor : inline_ancestors_to_clone) {
+            auto clone = MUST(clone_node_for_editing(ancestor, false));
+            if (auto* clone_element = as_if<DOM::Element>(*clone)) {
+                EditingHistory::ProxyMutationScope mutation_scope { *clone };
+                clone_element->remove_attribute(HTML::AttributeNames::id);
+            }
+            MUST(append_node(clone, innermost));
+            innermost = clone;
+        }
+        if (!line_break)
+            line_break = MUST(DOM::create_element(document, HTML::TagNames::br, Namespace::HTML));
+        MUST(append_node(*line_break, innermost));
+        return innermost;
+    };
+
     // 15. While new line range's start offset is zero and its start node is not a prohibited paragraph child, set its
     //     start to (parent of start node, index of start node).
     GC::Ptr<DOM::Node> start_container = new_line_range->start_container();
-    while (start_container->parent() && new_line_range->start_offset() == 0 && !is_prohibited_paragraph_child(*start_container)) {
+    // INTEROP: Keep the split boundary inside the paragraph container, so that the caret at the end of e.g. a flex or
+    //          grid item does not move the new paragraph outside of it.
+    while (start_container != container && start_container->parent() && new_line_range->start_offset() == 0 && !is_prohibited_paragraph_child(*start_container)) {
         MUST(new_line_range->set_start(*start_container->parent(), start_container->index()));
         start_container = start_container->parent();
     }
@@ -1728,7 +2161,7 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
     // 16. While new line range's start offset is the length of its start node and its start node is not a prohibited
     //     paragraph child, set its start to (parent of start node, 1 + index of start node).
     start_container = new_line_range->start_container();
-    while (start_container->parent() && new_line_range->start_offset() == start_container->length()
+    while (start_container != container && start_container->parent() && new_line_range->start_offset() == start_container->length()
         && !is_prohibited_paragraph_child(*start_container)) {
         MUST(new_line_range->set_start(*start_container->parent(), start_container->index() + 1));
         start_container = start_container->parent();
@@ -1737,7 +2170,7 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
     // 17. Let end of line be true if new line range contains either nothing or a single br, and false otherwise.
     auto end_of_line = new_line_range->collapsed()
         || ((new_line_range->start_container() == new_line_range->end_container() && new_line_range->start_offset() == new_line_range->end_offset() - 1)
-            && is<HTML::HTMLBRElement>(*new_line_range->start_container()));
+            && is<HTML::HTMLBRElement>(new_line_range->start_container()->child_at_index(new_line_range->start_offset())));
 
     auto& container_element = as<DOM::Element>(*container);
     auto new_container_name = [&] -> Utf16FlyString {
@@ -1757,6 +2190,8 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
         // 21. Otherwise, let new container name be the local name of container.
         return container_element.local_name();
     }();
+    if (new_container_name != container_element.local_name())
+        keeps_overrides = false;
 
     // 22. Let new container be the result of calling createElement(new container name) on the context object.
     auto new_container = MUST(DOM::create_element(document, new_container_name, Namespace::HTML));
@@ -1815,7 +2250,7 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
                 clone_element->remove_attribute(HTML::AttributeNames::id);
             }
             insert_node_before(clone, parent, start_node->next_sibling());
-            Vector<GC::Ref<DOM::Node>> children_to_move;
+            GC::RootVector<GC::Ref<DOM::Node>> children_to_move;
             for (auto* child = start_node->child_at_index(start_offset); child; child = child->next_sibling())
                 children_to_move.append(*child);
             for (auto child_to_move : children_to_move)
@@ -1824,11 +2259,48 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
         start_offset = index + 1;
         start_node = parent;
     }
-    Vector<GC::Ref<DOM::Node>> nodes_to_move;
+    GC::RootVector<GC::Ref<DOM::Node>> nodes_to_move;
     for (auto* child = container->child_at_index(start_offset); child; child = child->next_sibling())
         nodes_to_move.append(*child);
     for (auto node_to_move : nodes_to_move)
         MUST(append_node(node_to_move, *new_container));
+
+    // INTEROP: Splitting an inline-level container does not start a new line. Browsers wrap the new container, and
+    //          sometimes also container, in a new div in this case. Do this for both of them.
+    if (auto display = resolved_display(*container); display.has_value() && display->is_inline_outside()) {
+        for (GC::Ref<DOM::Node> node : { GC::Ref<DOM::Node> { *container }, GC::Ref<DOM::Node> { *new_container } }) {
+            auto wrapper = MUST(DOM::create_element(document, HTML::TagNames::div, Namespace::HTML));
+            insert_node_before(wrapper, *node->parent(), node);
+            MUST(append_node(node, wrapper));
+        }
+    }
+
+    // INTEROP: Browsers keep the white-space at the edges of the two lines visible. They remove white-space that would
+    //          collapse in a line which has nothing else that is visible, and rebalance the white-space at the end of
+    //          container and at the start of new container. See the INTEROP note at
+    //          rebalance_whitespace_in_text_node().
+    for (GC::Ref<DOM::Node> line : { GC::Ref<DOM::Node> { *container }, GC::Ref<DOM::Node> { *new_container } }) {
+        if (has_visible_children(line))
+            continue;
+        GC::RootVector<GC::Ref<DOM::Node>> collapsed_white_space;
+        line->for_each_child([&](GC::Ref<DOM::Node> child) {
+            if (is_whitespace_node(child) && child->is_editable())
+                collapsed_white_space.append(child);
+            return IterationDecision::Continue;
+        });
+        for (auto child : collapsed_white_space)
+            remove_node(child);
+    }
+    GC::Ptr<DOM::Node> last_descendant = container->last_child();
+    while (last_descendant && last_descendant->last_child())
+        last_descendant = last_descendant->last_child();
+    if (auto* text = as_if<DOM::Text>(last_descendant.ptr()))
+        rebalance_whitespace_in_text_node(*text, text->length());
+    GC::Ptr<DOM::Node> first_descendant = new_container->first_child();
+    while (first_descendant && first_descendant->first_child())
+        first_descendant = first_descendant->first_child();
+    if (auto* text = as_if<DOM::Text>(first_descendant.ptr()))
+        rebalance_whitespace_in_text_node(*text, 0);
 
     // 30. While container's lastChild is a prohibited paragraph child, set container to its lastChild.
     while (container->last_child() && is_prohibited_paragraph_child(*container->last_child()))
@@ -1842,26 +2314,26 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
 
     // 32. If container has no visible children, call createElement("br") on the context object, and append the result
     //     as the last child of container.
+    // NB: See the INTEROP note at step 14 for the inline ancestors that the br is placed in.
     if (!has_visible_children(*container))
-        MUST(append_node(MUST(DOM::create_element(document, HTML::TagNames::br, Namespace::HTML)), *container));
+        append_line_break(*container, {});
 
     // 33. If new container has no visible children, call createElement("br") on the context object, and append the
     //     result as the last child of new container.
-    if (!has_visible_children(*new_container))
-        MUST(append_node(MUST(DOM::create_element(document, HTML::TagNames::br, Namespace::HTML)), *new_container));
+    // NB: See the INTEROP note at step 14 for the inline ancestors that the br is placed in. If new container only
+    //     contains the br that ended the line, that br is moved into them.
+    GC::Ref<DOM::Node> caret_container = *new_container;
+    auto only_child_is_line_break = !inline_ancestors_to_clone.is_empty() && new_container->child_count() == 1
+        && is<HTML::HTMLBRElement>(new_container->first_child());
+    if (!has_visible_children(*new_container) || (end_of_line && only_child_is_line_break))
+        caret_container = append_line_break(*new_container, only_child_is_line_break ? new_container->first_child() : nullptr);
 
     // 34. Call collapse(new container, 0) on the context object's selection.
-    MUST(document.get_selection()->collapse(new_container, 0));
+    MUST(document.get_selection()->collapse(caret_container, 0));
 
     // 35. Return true
     return true;
 }
-
-enum class InsertTextContext {
-    Typing,
-    TextReplacement,
-    OtherReplacement,
-};
 
 // https://w3c.github.io/editing/docs/execCommand/#the-inserttext-command
 static bool insert_text(DOM::Document& document, Utf16View value, InsertTextContext context)
@@ -1944,11 +2416,35 @@ static bool insert_text(DOM::Document& document, Utf16View value, InsertTextCont
 
     // 11. Canonicalize whitespace at (node, offset).
     // INTEROP: Inserting a non-space character does not normalize an untouched whitespace run after the caret.
-    if (!is<DOM::Text>(*node) || value == " "sv
+    // NB: See the INTEROP note at rebalance_whitespace_in_text_node(). When typing, browsers only rebalance the
+    //     whitespace around the inserted text after inserting it. Keep using the steps below next to links, which
+    //     handle the link boundaries.
+    auto is_next_to_link = [&] {
+        if (is<HTML::HTMLAnchorElement>(*node) || node->first_ancestor_of_type<HTML::HTMLAnchorElement>())
+            return true;
+        DOM::Node* previous = nullptr;
+        DOM::Node* next = nullptr;
+        if (is<DOM::Text>(*node)) {
+            previous = node->previous_sibling();
+            next = node->next_sibling();
+        } else {
+            previous = offset > 0 ? node->child_at_index(offset - 1) : nullptr;
+            next = node->child_at_index(offset);
+        }
+        return is<HTML::HTMLAnchorElement>(previous) || is<HTML::HTMLAnchorElement>(next);
+    };
+    auto rebalances_whitespace = !replaces_selection && context == InsertTextContext::Typing && !is_next_to_link();
+    auto follows_or_inserts_space = !is<DOM::Text>(*node) || value == " "sv
         || (offset == 0 ? as<DOM::Text>(*node).data().starts_with(' ')
                         : as<DOM::Text>(*node).data().code_unit_at(offset - 1) == u' '
-                    || as<DOM::Text>(*node).data().code_unit_at(offset - 1) == u'\u00a0'))
+                    || as<DOM::Text>(*node).data().code_unit_at(offset - 1) == u'\u00a0');
+    if (!rebalances_whitespace && follows_or_inserts_space)
         canonicalize_whitespace({ node, offset });
+
+    // NB: See the INTEROP note at remove_collapsed_spaces_in_text_node(). Browsers remove the collapsed spaces when
+    //     typing a space.
+    if (auto* text = as_if<DOM::Text>(*node); rebalances_whitespace && text && (value.code_unit_at(0) == ' ' || value.code_unit_at(0) == u'\u00A0'))
+        MUST(selection.collapse(*text, offset_after_removing(remove_collapsed_spaces_in_text_node(*text, offset), offset)));
 
     // 12. Let (node, offset) be the active range's start.
     range = *active_range(document);
@@ -2035,8 +2531,20 @@ static bool insert_text(DOM::Document& document, Utf16View value, InsertTextCont
     // 15. Restore states and values from overrides.
     restore_states_and_values(document, overrides);
 
+    // NB: See the INTEROP note at rebalance_whitespace_in_text_node().
+    if (rebalances_whitespace) {
+        auto inserted_range = active_range(document);
+        if (auto* text = as_if<DOM::Text>(*inserted_range->start_container()); text && inserted_range->end_container().ptr() == text) {
+            auto start_offset = inserted_range->start_offset();
+            auto end_offset = inserted_range->end_offset();
+            rebalance_whitespace_in_text_node(*text, end_offset);
+            if (auto code_unit = value.code_unit_at(0); code_unit != ' ' && code_unit != u'\u00A0')
+                rebalance_whitespace_in_text_node(*text, start_offset);
+        }
+    }
+
     // 16. Canonicalize whitespace at the active range's start, with fix collapsed space false.
-    if (replaces_selection)
+    else if (replaces_selection)
         canonicalize_whitespace_after_selection_replacement(active_range(document)->start());
     else
         canonicalize_whitespace(active_range(document)->start(), false);
@@ -2044,7 +2552,7 @@ static bool insert_text(DOM::Document& document, Utf16View value, InsertTextCont
     // 17. Canonicalize whitespace at the active range's end, with fix collapsed space false.
     if (replaces_selection)
         canonicalize_whitespace_after_selection_replacement(active_range(document)->end());
-    else if (value == " "sv)
+    else if (!rebalances_whitespace && value == " "sv)
         canonicalize_whitespace(active_range(document)->end(), false);
 
     // 18. If value is a space character, autolink the active range's start.
@@ -2120,7 +2628,7 @@ static bool justify_indeterminate(DOM::Document const& document, JustifyAlignmen
 
     // Return true if among visible editable nodes that are contained in the result and have no children, at least one
     // has alignment value "[alignment]" and at least one does not. Otherwise return false.
-    Vector<GC::Ref<DOM::Node>> matching_nodes;
+    GC::RootVector<GC::Ref<DOM::Node>> matching_nodes;
     range->for_each_contained([&matching_nodes](GC::Ref<DOM::Node> node) {
         if (is_visible_node(node) && node->is_editable() && !node->has_children())
             matching_nodes.append(node);
@@ -2146,7 +2654,7 @@ static bool justify_state(DOM::Document const& document, JustifyAlignment alignm
 
     // Return true if there is at least one visible editable node that is contained in the result and has no children,
     // and all such nodes have alignment value "[alignment]". Otherwise return false.
-    Vector<GC::Ref<DOM::Node>> matching_nodes;
+    GC::RootVector<GC::Ref<DOM::Node>> matching_nodes;
     range->for_each_contained([&matching_nodes](GC::Ref<DOM::Node> node) {
         if (is_visible_node(node) && node->is_editable() && !node->has_children())
             matching_nodes.append(node);
@@ -2293,7 +2801,7 @@ Utf16String command_justify_right_value(DOM::Document const& document)
 bool command_outdent_action(DOM::Document& document, Utf16View)
 {
     // 1. Let items be a list of all lis that are inclusive ancestors of the active range's start and/or end node.
-    Vector<GC::Ref<DOM::Node>> items;
+    GC::RootVector<GC::Ref<DOM::Node>> items;
     auto add_all_lis = [&items](GC::Ref<DOM::Node> node) {
         node->for_each_inclusive_ancestor([&items](GC::Ref<DOM::Node> ancestor) {
             if (is<HTML::HTMLLIElement>(*ancestor) && !items.contains_slow(ancestor))
@@ -2313,7 +2821,7 @@ bool command_outdent_action(DOM::Document& document, Utf16View)
     auto new_range = block_extend_a_range(*active_range(document));
 
     // 4. Let node list be a list of nodes, initially empty.
-    Vector<GC::Ref<DOM::Node>> node_list;
+    GC::RootVector<GC::Ref<DOM::Node>> node_list;
 
     // 5. For each node node contained in new range, append node to node list if the last member of node list (if any)
     //    is not an ancestor of node; node is editable; and either node has no editable descendants, or is an ol or ul,
@@ -2352,7 +2860,7 @@ bool command_outdent_action(DOM::Document& document, Utf16View)
             break;
 
         // 3. Let sublist be a list of nodes, initially empty.
-        Vector<GC::Ref<DOM::Node>> sublist;
+        GC::RootVector<GC::Ref<DOM::Node>> sublist;
 
         // 4. Remove the first member of node list and append it to sublist.
         sublist.append(node_list.take_first());
@@ -2396,7 +2904,7 @@ bool command_redo_action(DOM::Document& document, Utf16View)
 bool command_remove_format_action(DOM::Document& document, Utf16View)
 {
     // 1. Let elements to remove be a list of every removeFormat candidate effectively contained in the active range.
-    Vector<GC::Ref<DOM::Element>> elements_to_remove;
+    GC::RootVector<GC::Ref<DOM::Element>> elements_to_remove;
     for_each_node_effectively_contained_in_range(active_range(document), [&](GC::Ref<DOM::Node> descendant) {
         if (is_remove_format_candidate(descendant))
             elements_to_remove.append(static_cast<DOM::Element&>(*descendant));
@@ -2432,7 +2940,7 @@ bool command_remove_format_action(DOM::Document& document, Utf16View)
         MUST(split_text(static_cast<DOM::Text&>(*end.node), end.offset));
 
     // 5. Let node list consist of all editable nodes effectively contained in the active range.
-    Vector<GC::Ref<DOM::Node>> node_list;
+    GC::RootVector<GC::Ref<DOM::Node>> node_list;
     for_each_node_effectively_contained_in_range(active_range(document), [&](GC::Ref<DOM::Node> descendant) {
         if (descendant->is_editable())
             node_list.append(descendant);
@@ -2677,7 +3185,7 @@ bool command_unlink_action(DOM::Document& document, Utf16View)
 {
     // 1. Let hyperlinks be a list of every a element that has an href attribute and is contained in the active range or
     //    is an ancestor of one of its boundary points.
-    Vector<GC::Ref<DOM::Element>> hyperlinks;
+    GC::RootVector<GC::Ref<DOM::Element>> hyperlinks;
     if (auto range = active_range(document)) {
         auto node_matches = [](GC::Ref<DOM::Node> node) {
             return is<HTML::HTMLAnchorElement>(*node)
@@ -2922,15 +3430,6 @@ static auto const& command_definitions()
             .action = command_outdent_action,
             .preserves_overrides = true,
             .mapped_value = "formatOutdent"_utf16_fly_string,
-        },
-        // AD-HOC: This is a Ladybird-specific formatting command that is not part of the spec. It has no action and as
-        //         such, it's not supported in userland (yet). The relevant CSS property `white-space` is used to indicate
-        //         that if this style value is found during editing commands, it is recorded and restored where necessary.
-        //         This is used to keep things like <div style="white-space: pre">..</div> intact when a selection is
-        //         deleted, for example.
-        CommandDefinition {
-            .command = CommandNames::preserveWhitespace,
-            .relevant_css_property = CSS::PropertyID::WhiteSpace,
         },
         // https://w3c.github.io/editing/docs/execCommand/#the-redo-command
         CommandDefinition {

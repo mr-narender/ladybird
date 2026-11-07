@@ -27,10 +27,6 @@ public:
     // Adopts a surface owned by someone else, such as one a decoder hands back, by retaining it.
     static IOSurfaceHandle from_ref(void* io_surface_ref);
 
-    // Whoever allocated the surface may recycle it as soon as its use count falls to zero. Retaining it does not
-    // make it used.
-    void increment_use_count();
-    void decrement_use_count();
     bool is_in_use() const;
 
     MachPort create_mach_port() const;
@@ -43,6 +39,7 @@ public:
     // The four character code the surface was allocated with, such as '420v' for biplanar 8-bit YCbCr.
     u32 pixel_format() const;
     size_t plane_count() const;
+    size_t alloc_size() const;
     size_t plane_width(size_t plane) const;
     size_t plane_height(size_t plane) const;
     size_t bytes_per_element() const;

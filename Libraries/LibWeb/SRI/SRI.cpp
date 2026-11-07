@@ -6,6 +6,9 @@
 
 #include <AK/Array.h>
 #include <AK/Base64.h>
+#include <AK/CharacterTypes.h>
+#include <AK/Find.h>
+#include <AK/StringBuilder.h>
 #include <AK/Vector.h>
 #include <LibCrypto/Hash/SHA2.h>
 #include <LibWeb/SRI/SRI.h>
@@ -21,10 +24,13 @@ constexpr Array supported_hash_functions {
     "sha512"sv,
 };
 
-static bool is_supported_hash_function(Utf16View algorithm)
+// https://w3c.github.io/webappsec-subresource-integrity/#valid-sri-hash-algorithm-token
+static bool is_valid_sri_hash_algorithm_token(Utf16View string)
 {
+    // A string is a valid SRI hash algorithm token if its ASCII lowercase is contained in the valid SRI hash algorithm
+    // token set.
     for (auto supported_hash_function : supported_hash_functions) {
-        if (algorithm == supported_hash_function)
+        if (string.equals_ignoring_ascii_case(supported_hash_function))
             return true;
     }
     return false;
@@ -83,34 +89,47 @@ ErrorOr<Vector<Metadata>> parse_metadata(Utf16View metadata)
 
     // 2. For each item returned by splitting metadata on spaces:
     for (auto item : metadata.split_view(u' ', SplitBehavior::Nothing)) {
-        // 1. Let hash-with-opt-token-list be the result of splitting item on U+003F (?).
-        auto hash_with_opt_token_list = item.split_view(u'?', SplitBehavior::Nothing);
-
-        // 2. Let hash-expression be hash-with-opt-token-list[0].
-        auto hash_expression = hash_with_opt_token_list[0];
+        // 1. Let expression-and-options be the result of splitting item on U+003F (?).
+        // 2. Let algorithm-expression be expression-and-options[0].
+        auto algorithm_expression = item.substring_view(0, item.find_code_unit_offset(u'?').value_or(item.length_in_code_units()));
 
         // 3. Let base64-value be the empty string.
         Utf16View base64_value;
 
-        // 4. Let hash-expr-token-list be the result of splitting hash-expression on U+002D (-).
-        auto hash_expr_token_list = hash_expression.split_view(u'-', SplitBehavior::Nothing);
+        // 4. Let algorithm-and-value be the result of splitting algorithm-expression on U+002D (-).
+        // 5. Let algorithm be algorithm-and-value[0].
+        auto separator = algorithm_expression.find_code_unit_offset(u'-');
+        auto algorithm = algorithm_expression.substring_view(0, separator.value_or(algorithm_expression.length_in_code_units()));
 
-        // 5. Let algorithm be hash-expr-token-list[0].
-        auto algorithm = hash_expr_token_list[0];
+        // 6. If algorithm is not a valid SRI hash algorithm token, then continue.
+        if (!is_valid_sri_hash_algorithm_token(algorithm))
+            continue;
 
-        // 6. If hash-expr-token-list[1] exists, set base64-value to hash-expr-token-list[1].
-        if (hash_expr_token_list.size() > 1)
-            base64_value = hash_expr_token_list[1];
+        // 7. If algorithm-and-value[1] exists, set base64-value to algorithm-and-value[1].
+        // INTEROP: A base64url-encoded value contains "-" itself, so like other engines, take everything after the
+        //          first "-" as the value.
+        if (separator.has_value())
+            base64_value = algorithm_expression.substring_view(*separator + 1);
 
-        // 7. If algorithm is not a hash function recognized by the user agent, continue.
-        if (!is_supported_hash_function(algorithm))
+        // NB: Integrity metadata uses CSP's base64-value grammar: at least one alphabet character and at most two
+        //     trailing padding characters. https://w3c.github.io/webappsec-csp/#grammardef-base64-value
+        // INTEROP: Firefox validates this grammar; Chromium only checks for an empty digest or invalid alphabet characters.
+        auto base64_data = base64_value;
+        for (size_t padding = 0; padding < 2 && base64_data.ends_with(u'='); ++padding)
+            base64_data = base64_data.substring_view(0, base64_data.length_in_code_units() - 1);
+        if (base64_data.is_empty() || !all_of(base64_data, [](u32 character) {
+                return is_ascii_alphanumeric(character) || character == '+' || character == '/' || character == '-'
+                    || character == '_';
+            }))
             continue;
 
         // 8. Let metadata be the ordered map «["alg" → algorithm, "val" → base64-value]».
         //    Note: Since no options are defined (see the §3.1 Integrity metadata), a corresponding entry is not set in metadata.
-        //    If options are defined in a future version, hash-with-opt-token-list[1] can be utilized as options.
+        //    If options are defined in a future version, expression-and-options[1] can be utilized as options.
+        // AD-HOC: Store algorithm in ASCII lowercase, since later steps look it up in the valid SRI hash algorithm token
+        //         set, which only contains lowercase tokens.
         auto metadata = Metadata {
-            .algorithm = TRY(algorithm.to_utf8()),
+            .algorithm = algorithm.to_ascii_lowercase().to_utf8(),
             .base64_value = TRY(base64_value.to_utf8()),
             .options = {},
         };
@@ -162,6 +181,21 @@ ErrorOr<Vector<Metadata>> get_strongest_metadata_from_set(Vector<Metadata> const
     return result;
 }
 
+// Converts a base64 or base64url-encoded value to base64 without padding, so values in either encoding compare equal.
+static String normalize_base64_value(StringView value)
+{
+    StringBuilder builder;
+    for (auto character : value.trim("="sv, TrimMode::Right)) {
+        if (character == '-')
+            builder.append('+');
+        else if (character == '_')
+            builder.append('/');
+        else
+            builder.append(character);
+    }
+    return builder.to_string_without_validation();
+}
+
 // https://w3c.github.io/webappsec-subresource-integrity/#does-response-match-metadatalist
 ErrorOr<bool> do_bytes_match_metadata_list(ByteBuffer const& bytes, Utf16View metadata_list)
 {
@@ -187,7 +221,8 @@ ErrorOr<bool> do_bytes_match_metadata_list(ByteBuffer const& bytes, Utf16View me
         auto actual_value = TRY(apply_algorithm_to_bytes(algorithm, bytes));
 
         // 4. If actualValue is a case-sensitive match for expectedValue, return true.
-        if (actual_value == expected_value)
+        // INTEROP: Other engines also accept an expectedValue that is base64url-encoded or that lacks its padding.
+        if (normalize_base64_value(actual_value) == normalize_base64_value(expected_value))
             return true;
     }
 

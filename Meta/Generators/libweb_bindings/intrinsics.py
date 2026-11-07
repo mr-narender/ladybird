@@ -11,12 +11,20 @@ from typing import TextIO
 
 from Generators.libweb_bindings.cpp_types import fully_qualified_name_for_interface
 from Generators.libweb_bindings.cpp_types import implementation_header_for_interface
+from Generators.libweb_bindings.named_and_indexed_properties import create_named_properties_object_function_name
 from Generators.libweb_bindings.named_and_indexed_properties import interface_supports_named_properties
+from Generators.libweb_bindings.named_and_indexed_properties import named_properties_object_name
+from Generators.libweb_bindings.overload_resolution import parameter_list_length
+from Generators.libweb_bindings.rust_bindings import interface_name_values
+from Generators.libweb_bindings.rust_bindings import is_implemented_in_rust
+from Generators.libweb_bindings.rust_bindings import write_ensure_web_prototype_declaration
+from Generators.libweb_bindings.rust_bindings import write_ensure_web_prototype_implementation
+from Generators.libweb_bindings.wrappers import create_wrapper_function_name
 from Generators.libweb_bindings.wrappers import interface_needs_wrapper as wrapper_interface_needs_wrapper
-from Generators.libweb_bindings.wrappers import wrapper_class_name
 from Utils.utils import title_case_to_snake_case
 from Utils.webidl_parser import Interface
 from Utils.webidl_parser import Module
+from Utils.webidl_parser import Parser
 
 ALL_WORKERS_EXPOSURE = {
     "DedicatedWorker",
@@ -66,6 +74,7 @@ class InterfaceSets:
 class LegacyConstructor:
     name: str
     constructor_class: str
+    length: int
 
 
 def collect_interface_sets(modules: List[Module]) -> InterfaceSets:
@@ -155,24 +164,6 @@ def interface_needs_wrapper(interface: Interface) -> bool:
     return not interface.constants
 
 
-def can_use_shared_interface_constructor(interface: Interface) -> bool:
-    return not interface.is_namespace and not interface.is_callback_interface
-
-
-def can_use_shared_interface_prototype(interface: Interface) -> bool:
-    return (
-        not interface.is_namespace
-        and not interface.is_callback_interface
-        and "Global" not in interface.extended_attributes
-        and not interface.has_special_member
-        and interface.named_property_getter is None
-        and interface.indexed_property_getter is None
-        and interface.named_property_setter is None
-        and interface.named_property_deleter is None
-        and interface.indexed_property_setter is None
-    )
-
-
 def interface_prototype_has_immutable_prototype(interface: Interface) -> bool:
     # NB: This currently assumes only Workers and Window can be globals.
     return (
@@ -182,22 +173,35 @@ def interface_prototype_has_immutable_prototype(interface: Interface) -> bool:
     )
 
 
+# NB: The host class name is the internal class name that LibJS prints in errors, such as "[object Node] is not a
+#     constructor".
+def interface_prototype_host_class(interface: Interface) -> str:
+    flags = "JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT"
+    if interface_prototype_has_immutable_prototype(interface):
+        flags += " | JS_HOST_CLASS_IMMUTABLE_PROTOTYPE"
+    return f'JS::make_host_class(JS_HOST_CLASS_OBJECT, "{interface.name}"sv, &interface_prototype_object_parent_host_class, nullptr, &metadata, {flags})'
+
+
+def interface_constructor_host_class(name: str, metadata_variable: str) -> str:
+    return f'JS::make_host_class(JS_HOST_CLASS_FUNCTION, "{name}"sv, &interface_constructor_parent_host_class, &interface_constructor_hooks, &{metadata_variable}, JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT | JS_HOST_CLASS_HAS_CONSTRUCTOR)'
+
+
 def lookup_legacy_constructor(interface: Interface) -> Optional[LegacyConstructor]:
     legacy_factory_function = interface.extended_attributes.get("LegacyFactoryFunction")
     if not legacy_factory_function:
         return None
 
-    legacy_factory_function = legacy_factory_function.lstrip()
-    name = []
-    for character in legacy_factory_function:
-        if character.isspace() or character == "(":
-            break
-        name.append(character)
+    name, opening_parenthesis, rest_of_argument_list = legacy_factory_function.partition("(")
+    parameters = []
+    if opening_parenthesis:
+        argument_list = opening_parenthesis + rest_of_argument_list
+        parameters = Parser(interface.path, argument_list).parse_parenthesized_parameters()
 
-    constructor_name = "".join(name)
+    constructor_name = name.strip()
     return LegacyConstructor(
         name=constructor_name,
         constructor_class=f"{constructor_name}Constructor",
+        length=parameter_list_length(parameters),
     )
 
 
@@ -206,6 +210,7 @@ def write_intrinsic_definitions_header(out: TextIO, interface_sets: InterfaceSet
         """#pragma once
 
 #include <AK/Types.h>
+#include <LibJS/HostObjectABI.h>
 
 namespace Web::Bindings {
 
@@ -214,14 +219,18 @@ enum class InterfaceName : u16 {
 """
     )
 
-    for index, interface in enumerate(interface_sets.intrinsics, start=1):
-        out.write(f"    {interface.name} = {index},\n")
+    for name, value in interface_name_values(interface_sets.intrinsics).items():
+        out.write(f"    {name} = {value},\n")
 
     out.write(
         """};
 
-bool is_exposed(InterfaceName, JS::Realm&);
-
+bool is_exposed(InterfaceName, JS::Realm const&);
+"""
+    )
+    write_ensure_web_prototype_declaration(out)
+    out.write(
+        """
 }
 """
     )
@@ -230,6 +239,8 @@ bool is_exposed(InterfaceName, JS::Realm&);
 def write_intrinsic_definitions_implementation(out: TextIO, interface_sets: InterfaceSets) -> None:
     out.write(
         """#include <LibGC/DeferGC.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/Intrinsics.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibWeb/Bindings/InterfaceObject.h>
 #include <LibWeb/Bindings/Intrinsics.h>
@@ -238,7 +249,9 @@ def write_intrinsic_definitions_implementation(out: TextIO, interface_sets: Inte
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/SharedWorkerGlobalScope.h>
+#include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/WebAudio/AudioWorkletGlobalScope.h>
+#include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
 """
     )
 
@@ -258,6 +271,7 @@ namespace Web::Bindings {
     write_secure_context_switch(out, interface_sets.intrinsics)
     write_experimental_switch(out, interface_sets.intrinsics)
     write_experimental_name_switch(out, interface_sets.intrinsics)
+    write_navigator_compatibility_mode_switch(out, interface_sets.intrinsics)
     write_global_exposed_switch(out, "window", interface_sets.window_exposed)
     write_global_exposed_switch(out, "dedicated_worker", interface_sets.dedicated_worker_exposed)
     write_global_exposed_switch(out, "shared_worker", interface_sets.shared_worker_exposed)
@@ -266,7 +280,7 @@ namespace Web::Bindings {
     out.write(
         """
 // An interface, callback interface, namespace, or member construct is exposed in a given realm realm if the following steps return true:
-bool is_exposed(InterfaceName name, JS::Realm& realm)
+bool is_exposed(InterfaceName name, JS::Realm const& realm)
 {
     auto const& global_object = realm.global_object();
 
@@ -296,6 +310,10 @@ bool is_exposed(InterfaceName name, JS::Realm& realm)
     if (is_experimental_interface(name) && !HTML::WindowOrWorkerGlobalScopeMixin::expose_experimental_interface(principal_host_defined_environment_settings_object(realm), experimental_interface_name(name)))
         return false;
 
+    // AD-HOC: An interface only one engine has exists only while the navigator claims to be that engine.
+    if (auto mode = navigator_compatibility_mode_of_interface(name); mode.has_value() && *mode != ResourceLoader::navigator_compatibility_mode())
+        return false;
+
     // FIXME: 3. If realm’s settings object’s cross-origin isolated capability is false, and construct is
     //           conditionally exposed on [CrossOriginIsolated], then return false.
 
@@ -311,6 +329,9 @@ bool is_exposed(InterfaceName name, JS::Realm& realm)
             write_namespace_creation(out, interface, interface_sets.intrinsics)
         else:
             write_interface_creation(out, interface)
+            write_iterator_prototype_creation(out, interface)
+
+    write_ensure_web_prototype_implementation(out, interface_sets.intrinsics)
 
     out.write(
         """}
@@ -352,6 +373,30 @@ def write_experimental_name_switch(out: TextIO, interfaces: List[Interface]) -> 
         if "Experimental" not in interface.extended_attributes:
             continue
         out.write(f'    case InterfaceName::{interface.name}:\n        return "{interface.name}"sv;\n')
+
+    out.write(
+        """    default:
+        return {};
+    }
+}
+
+"""
+    )
+
+
+def write_navigator_compatibility_mode_switch(out: TextIO, interfaces: List[Interface]) -> None:
+    # The engine an interface belongs to, for one that only exists while the navigator claims that engine.
+    out.write(
+        """static constexpr Optional<NavigatorCompatibilityMode> navigator_compatibility_mode_of_interface(InterfaceName name)
+{
+    switch (name) {
+"""
+    )
+    for interface in interfaces:
+        if "NavigatorCompatibilityMode" not in interface.extended_attributes:
+            continue
+        mode = interface.extended_attributes["NavigatorCompatibilityMode"]
+        out.write(f"    case InterfaceName::{interface.name}:\n        return NavigatorCompatibilityMode::{mode};\n")
 
     out.write(
         """    default:
@@ -411,7 +456,9 @@ def write_namespace_creation(out: TextIO, interface: Interface, interfaces: List
         f"""template<>
 void Intrinsics::create_web_namespace<{interface.namespace_class}>(JS::Realm& realm)
 {{
-    auto namespace_object = realm.create<{interface.namespace_class}>(realm);
+    // https://webidl.spec.whatwg.org/#namespace-object
+    auto namespace_object = JS::Object::create(realm, realm.intrinsics().object_prototype());
+    {interface.namespace_class}::initialize(realm, namespace_object);
     m_namespaces.set("{interface.name}"_utf16_fly_string, namespace_object);
 
     [[maybe_unused]] static constexpr u8 attr = JS::Attribute::Writable | JS::Attribute::Configurable;
@@ -440,117 +487,16 @@ def write_interface_creation(out: TextIO, interface: Interface) -> None:
 WEB_API void Intrinsics::create_web_prototype_and_constructor<{interface.prototype_class}>(JS::Realm& realm)
 {{
     static constexpr InterfaceObjectMetadata metadata {{
-        .name = "{interface.name}"sv,
         .namespaced_name = "{interface.namespaced_name}"sv,
         .utf16_name = "{interface.name}"sv,
         .utf16_namespaced_name = "{interface.namespaced_name}"sv,
         .initialize_constructor = &{interface.constructor_class}::initialize,
         .initialize_prototype = &{interface.prototype_class}::initialize,
+        .prototype_host_class = {interface_prototype_host_class(interface)},
+        .constructor_host_class = {interface_constructor_host_class(interface.name, "metadata")},
     }};
     create_web_prototype_and_constructor(realm, metadata);
 }}
-"""
-        )
-        return
-
-    if can_use_shared_interface_prototype(interface):
-        out.write(
-            f"""template<>
-WEB_API void Intrinsics::create_web_prototype_and_constructor<{interface.prototype_class}>(JS::Realm& realm)
-{{
-"""
-        )
-
-        ensure_parent_prototype = "nullptr"
-        ensure_parent_constructor = "nullptr"
-        if interface.parent_name:
-            ensure_parent_prototype = f"""[](JS::Realm& realm) -> JS::Object& {{ return Web::Bindings::ensure_web_prototype<{interface.parent_name}Prototype>(realm, "{interface.parent_name}"_utf16_fly_string); }}"""
-            ensure_parent_constructor = f"""[](JS::Realm& realm) -> JS::NativeFunction& {{ return Web::Bindings::ensure_web_constructor<{interface.parent_name}Prototype>(realm, "{interface.parent_name}"_utf16_fly_string); }}"""
-
-        out.write(
-            f"""    static constexpr InterfaceObjectMetadata metadata {{
-        .name = "{interface.name}"sv,
-        .namespaced_name = "{interface.namespaced_name}"sv,
-        .utf16_name = "{interface.name}"sv,
-        .utf16_namespaced_name = "{interface.namespaced_name}"sv,
-        .ensure_parent_prototype = {ensure_parent_prototype},
-        .ensure_parent_constructor = {ensure_parent_constructor},
-        .initialize_constructor = &{interface.constructor_class}::initialize,
-        .initialize_prototype = &{interface.prototype_class}::initialize,
-        .define_unforgeable_attributes = &{interface.prototype_class}::define_unforgeable_attributes,
-        .construct = &{interface.constructor_class}::construct,
-        .has_immutable_prototype = {str(interface_prototype_has_immutable_prototype(interface)).lower()},
-    }};
-    create_web_prototype_and_constructor(realm, metadata);
-"""
-        )
-
-        legacy_constructor = lookup_legacy_constructor(interface)
-        if legacy_constructor is not None:
-            out.write(
-                f"""    auto legacy_constructor = realm.create<{legacy_constructor.constructor_class}>(realm);
-    m_constructors.set("{legacy_constructor.name}"_utf16_fly_string, legacy_constructor.ptr());
-"""
-            )
-
-        out.write(
-            """}
-"""
-        )
-        return
-
-    if can_use_shared_interface_constructor(interface):
-        out.write(
-            f"""template<>
-WEB_API void Intrinsics::create_web_prototype_and_constructor<{interface.prototype_class}>(JS::Realm& realm)
-{{
-"""
-        )
-
-        ensure_parent_constructor = "nullptr"
-        if interface.parent_name:
-            ensure_parent_constructor = f"""[](JS::Realm& realm) -> JS::NativeFunction& {{ return Web::Bindings::ensure_web_constructor<{interface.parent_name}Prototype>(realm, "{interface.parent_name}"_utf16_fly_string); }}"""
-
-        out.write(
-            f"""    static constexpr InterfaceObjectMetadata metadata {{
-        .name = "{interface.name}"sv,
-        .namespaced_name = "{interface.namespaced_name}"sv,
-        .utf16_name = "{interface.name}"sv,
-        .utf16_namespaced_name = "{interface.namespaced_name}"sv,
-        .ensure_parent_constructor = {ensure_parent_constructor},
-        .initialize_constructor = &{interface.constructor_class}::initialize,
-        .construct = &{interface.constructor_class}::construct,
-    }};
-
-"""
-        )
-
-        if interface_supports_named_properties(interface):
-            out.write(
-                f"""    auto named_properties_object = realm.create<{interface.name}Properties>(realm);
-    m_prototypes.set("{interface.name}Properties"_utf16_fly_string, named_properties_object);
-
-"""
-            )
-
-        out.write(
-            f"""    auto prototype = realm.create<{interface.prototype_class}>(realm);
-    m_prototypes.set("{interface.namespaced_name}"_utf16_fly_string, prototype);
-
-    create_web_constructor(realm, metadata, prototype);
-"""
-        )
-
-        legacy_constructor = lookup_legacy_constructor(interface)
-        if legacy_constructor is not None:
-            out.write(
-                f"""    auto legacy_constructor = realm.create<{legacy_constructor.constructor_class}>(realm);
-    m_constructors.set("{legacy_constructor.name}"_utf16_fly_string, legacy_constructor.ptr());
-"""
-            )
-
-        out.write(
-            """}
 """
         )
         return
@@ -559,35 +505,49 @@ WEB_API void Intrinsics::create_web_prototype_and_constructor<{interface.prototy
         f"""template<>
 WEB_API void Intrinsics::create_web_prototype_and_constructor<{interface.prototype_class}>(JS::Realm& realm)
 {{
-    auto& vm = realm.vm();
-
 """
     )
 
+    out.write(
+        f"""    static constexpr InterfaceObjectMetadata metadata {{
+        .namespaced_name = "{interface.namespaced_name}"sv,
+        .utf16_name = "{interface.name}"sv,
+        .utf16_namespaced_name = "{interface.namespaced_name}"sv,
+        .initialize_constructor = &{interface.constructor_class}::initialize,
+        .initialize_prototype = &{interface.prototype_class}::initialize,
+        .construct = &{interface.constructor_class}::construct,
+        .prototype_host_class = {interface_prototype_host_class(interface)},
+        .constructor_host_class = {interface_constructor_host_class(interface.name, "metadata")},
+    }};
+"""
+    )
+
+    # https://webidl.spec.whatwg.org/#named-properties-object
+    # The interface prototype object's [[Prototype]] is its named properties object, so that has to exist first.
     if interface_supports_named_properties(interface):
         out.write(
-            f"""    auto named_properties_object = realm.create<{interface.name}Properties>(realm);
-    m_prototypes.set("{interface.name}Properties"_utf16_fly_string, named_properties_object);
-
+            f"""    auto named_properties_object = {create_named_properties_object_function_name(interface)}(realm);
+    m_prototypes.set("{named_properties_object_name(interface)}"_utf16_fly_string, named_properties_object);
 """
         )
 
-    out.write(
-        f"""    auto prototype = realm.create<{interface.prototype_class}>(realm);
-    m_prototypes.set("{interface.namespaced_name}"_utf16_fly_string, prototype);
-
-    auto constructor = realm.create<{interface.constructor_class}>(realm);
-    m_constructors.set("{interface.namespaced_name}"_utf16_fly_string, constructor);
-
-    prototype->define_direct_property(vm.names.constructor, constructor.ptr(), JS::Attribute::Writable | JS::Attribute::Configurable);
-"""
-    )
+    out.write("    create_web_prototype_and_constructor(realm, metadata);\n")
 
     legacy_constructor = lookup_legacy_constructor(interface)
     if legacy_constructor is not None:
         out.write(
-            f"""    auto legacy_constructor = realm.create<{legacy_constructor.constructor_class}>(realm);
-    m_constructors.set("{legacy_constructor.name}"_utf16_fly_string, legacy_constructor.ptr());
+            f"""
+    // https://webidl.spec.whatwg.org/#legacy-factory-functions
+    static constexpr InterfaceObjectMetadata legacy_factory_function_metadata {{
+        .namespaced_name = "{legacy_constructor.name}"sv,
+        .utf16_name = "{legacy_constructor.name}"sv,
+        .utf16_namespaced_name = "{legacy_constructor.name}"sv,
+        .ensure_interface_prototype_object = [](JS::Realm& realm) -> JS::Object& {{ return Web::Bindings::ensure_web_prototype<{interface.prototype_class}>(realm, "{interface.namespaced_name}"_utf16_fly_string); }},
+        .construct = &{legacy_constructor.constructor_class}::construct,
+        .function_length = {legacy_constructor.length},
+        .constructor_host_class = {interface_constructor_host_class(legacy_constructor.name, "legacy_factory_function_metadata")},
+    }};
+    create_legacy_factory_function(realm, legacy_factory_function_metadata);
 """
         )
 
@@ -595,6 +555,28 @@ WEB_API void Intrinsics::create_web_prototype_and_constructor<{interface.prototy
         """}
 """
     )
+
+
+# https://webidl.spec.whatwg.org/#dfn-iterator-prototype-object
+# https://webidl.spec.whatwg.org/#dfn-asynchronous-iterator-prototype-object
+def write_iterator_prototype_creation(out: TextIO, interface: Interface) -> None:
+    iterator_prototypes = []
+    if interface.iterable is not None and interface.iterable.key_type is not None:
+        iterator_prototypes.append((f"{interface.name}Iterator", "iterator_prototype"))
+    if interface.async_iterable is not None:
+        iterator_prototypes.append((f"{interface.name}AsyncIterator", "async_iterator_prototype"))
+
+    for iterator_name, parent_prototype_intrinsic in iterator_prototypes:
+        out.write(
+            f"""template<>
+WEB_API void Intrinsics::create_web_prototype_and_constructor<{iterator_name}Prototype>(JS::Realm& realm)
+{{
+    auto prototype = JS::Object::create(realm, realm.intrinsics().{parent_prototype_intrinsic}());
+    {iterator_name}Prototype::initialize(realm, prototype);
+    m_prototypes.set("{iterator_name}"_utf16_fly_string, prototype);
+}}
+"""
+        )
 
 
 def write_exposed_interface_header(out: TextIO, class_name: str) -> None:
@@ -621,6 +603,8 @@ def write_exposed_interface_implementation(out: TextIO, class_name: str, exposed
 #include <LibWeb/Bindings/{class_name}ExposedInterfaces.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
+#include <LibWeb/Loader/ResourceLoader.h>
+#include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
 """
     )
 
@@ -686,6 +670,14 @@ def write_interface_global_accessor(out: TextIO, class_name: str, interface: Int
         )
         indentation += "    "
 
+    if "NavigatorCompatibilityMode" in interface.extended_attributes:
+        mode = interface.extended_attributes["NavigatorCompatibilityMode"]
+        out.write(
+            f"""{indentation}if (ResourceLoader::navigator_compatibility_mode() == NavigatorCompatibilityMode::{mode}) {{
+"""
+        )
+        indentation += "    "
+
     write_constructor_accessor(interface.namespaced_name, interface.namespaced_name)
 
     if class_name == "Window":
@@ -702,6 +694,13 @@ def write_interface_global_accessor(out: TextIO, class_name: str, interface: Int
     legacy_constructor = lookup_legacy_constructor(interface)
     if legacy_constructor is not None:
         write_constructor_accessor(legacy_constructor.name, legacy_constructor.name)
+
+    if "NavigatorCompatibilityMode" in interface.extended_attributes:
+        indentation = indentation[:-4]
+        out.write(
+            f"""{indentation}}}
+"""
+        )
 
     if "Experimental" in interface.extended_attributes:
         indentation = indentation[:-4]
@@ -740,7 +739,12 @@ def interface_inherits_from(
 
 
 def write_wrapper_factory_implementation(out: TextIO, interface_sets: InterfaceSets) -> None:
-    interfaces = [interface for interface in interface_sets.intrinsics if wrapper_interface_needs_wrapper(interface)]
+    # NB: The implementation of an interface implemented in Rust is not a Wrappable, so it never reaches the factory.
+    interfaces = [
+        interface
+        for interface in interface_sets.intrinsics
+        if wrapper_interface_needs_wrapper(interface) and not is_implemented_in_rust(interface)
+    ]
     out.write(
         """#include <AK/Assertions.h>
 #include <LibJS/Runtime/Realm.h>
@@ -748,9 +752,6 @@ def write_wrapper_factory_implementation(out: TextIO, interface_sets: InterfaceS
 #include <LibWeb/DOM/BindingsGlue.h>
 #include <LibWeb/Fetch/BindingsGlue.h>
 #include <LibWeb/HTML/BindingsGlue.h>
-#include <LibWeb/Streams/BindingsGlue.h>
-#include <LibWeb/WebAssembly/BindingsGlue.h>
-#include <LibWeb/WebGL/BindingsGlue.h>
 #include <LibWeb/Bindings/PlatformObject.h>
 #include <LibWeb/Bindings/Wrappable.h>
 """
@@ -764,7 +765,7 @@ def write_wrapper_factory_implementation(out: TextIO, interface_sets: InterfaceS
         """
 namespace Web::Bindings {
 
-GC::Ref<PlatformObject> create_wrapper_for_wrappable(JS::Realm& realm, GC::Ref<Wrappable> wrappable)
+GC::Ref<JS::HostObject> create_wrapper_for_wrappable(JS::Realm& realm, GC::Ref<Wrappable> wrappable)
 {
     switch (wrappable->interface_name()) {
 """
@@ -773,7 +774,7 @@ GC::Ref<PlatformObject> create_wrapper_for_wrappable(JS::Realm& realm, GC::Ref<W
     for interface in interfaces:
         out.write(
             f"""    case InterfaceName::{interface.name}:
-        return realm.create<{wrapper_class_name(interface)}>(realm, GC::Ref {{ static_cast<{fully_qualified_name_for_interface(interface)}&>(*wrappable) }});
+        return {create_wrapper_function_name(interface)}(realm, GC::Ref {{ static_cast<{fully_qualified_name_for_interface(interface)}&>(*wrappable) }});
 """
         )
 

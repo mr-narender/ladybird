@@ -11,7 +11,7 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/WebAudio/AudioNode.h>
 
-namespace Media {
+namespace Audio {
 
 class SpscAudioFrameRing;
 
@@ -44,6 +44,8 @@ public:
     // https://webaudio.github.io/web-audio-api/#dom-mediastreamaudiosourcenode-mediastream
     GC::Ref<MediaCapture::MediaStream> media_stream() const { return m_media_stream; }
 
+    bool has_live_input_track() const;
+
 private:
     MediaStreamAudioSourceNode(GC::Ref<AudioContext>, MediaStreamAudioSourceOptions const&);
 
@@ -60,7 +62,7 @@ private:
 
     // Carries the track's audio from the producing thread to the render thread; the sink is
     // registered on the input track and only ever references the ring, never this GC node.
-    RefPtr<Media::SpscAudioFrameRing> m_ring;
+    RefPtr<Audio::SpscAudioFrameRing> m_ring;
     RefPtr<MediaCapture::AudioFrameSink> m_sink;
 };
 

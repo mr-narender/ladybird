@@ -6,6 +6,7 @@
 
 #include <AK/ByteBuffer.h>
 #include <LibGC/Heap.h>
+#include <LibJS/Runtime/VM.h>
 #include <LibURL/Parser.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
@@ -15,20 +16,21 @@
 #include <LibWeb/ContentSecurityPolicy/Violation.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
+#include <LibWeb/Fetch/Fetching/ClientContextSnapshots.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
-#include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Infra/JSON.h>
+#include <LibWebCommon/Fetch/Infrastructure/URL.h>
 
 namespace Web::ContentSecurityPolicy {
 
 GC_DEFINE_ALLOCATOR(Violation);
 
-Violation::Violation(GC::Ptr<DOM::EventTarget> global_scope, GC::Ref<Policy const> policy, String directive)
+Violation::Violation(GC::Ptr<DOM::EventTarget> global_scope, NonnullRefPtr<Policy const> policy, String directive)
     : m_global_scope(global_scope)
     , m_policy(policy)
     , m_effective_directive(Utf16String::from_utf8(directive))
@@ -47,16 +49,32 @@ static GC::Ptr<DOM::EventTarget> global_scope_from_global_object(GC::Ptr<JS::Obj
 }
 
 // https://w3c.github.io/webappsec-csp/#create-violation-for-global
-GC::Ref<Violation> Violation::create_a_violation_object_for_global_policy_and_directive(GC::Ptr<JS::Object> global_object, GC::Ref<Policy const> policy, String directive)
+GC::Ref<Violation> Violation::create_a_violation_object_for_global_policy_and_directive(GC::Ptr<JS::Object> global_object, NonnullRefPtr<Policy const> policy, String directive)
 {
     // 1. Let violation be a new violation whose global object is global, policy is policy, effective directive is
     //    directive, and resource is null.
     auto violation = GC::Heap::the().allocate<Violation>(global_scope_from_global_object(global_object), policy, move(directive));
 
-    // FIXME: 2. If the user agent is currently executing script, and can extract a source file’s URL, line number,
-    //           and column number from the global, set violation’s source file, line number, and column number
-    //           accordingly.
+    // 2. If the user agent is currently executing script, and can extract a source file’s URL, line number,
+    //    and column number from the global, set violation’s source file, line number, and column number
+    //    accordingly.
     // SPEC ISSUE 1:  Is this kind of thing specified anywhere? I didn’t see anything that looked useful in [ECMA262].
+    // NOTE: User agents need to ensure that the source file is the URL requested by the page, pre-redirects. If that’s
+    //       not possible, user agents need to strip the URL down to an origin to avoid unintentional leakage.
+    // NB: We use the innermost stack frame that has a source location.
+    for (auto const& frame : JS::VM::the().stack_trace()) {
+        if (!frame.source_range.has_value())
+            continue;
+        auto const& source_range = *frame.source_range;
+        auto source_file = URL::Parser::basic_parse(source_range.filename().utf16_view());
+        if (!source_file.has_value())
+            break;
+
+        violation->m_source_file = source_file.release_value();
+        violation->m_line_number = source_range.start.line;
+        violation->m_column_number = source_range.start.column;
+        break;
+    }
 
     // 3. If global is a Window object, set violation’s referrer to global’s document's referrer.
     if (auto* global = global_object.ptr()) {
@@ -72,7 +90,7 @@ GC::Ref<Violation> Violation::create_a_violation_object_for_global_policy_and_di
 }
 
 // https://w3c.github.io/webappsec-csp/#create-violation-for-request
-GC::Ref<Violation> Violation::create_a_violation_object_for_request_and_policy(GC::Ref<Fetch::Infrastructure::Request> request, GC::Ref<Policy const> policy)
+GC::Ref<Violation> Violation::create_a_violation_object_for_request_and_policy(NonnullRefPtr<Fetch::Infrastructure::Request> request, NonnullRefPtr<Policy const> policy)
 {
     // 1. Let directive be the result of executing § 6.8.1 Get the effective directive for request on request.
     auto directive = Directives::get_the_effective_directive_for_request(request);
@@ -83,7 +101,8 @@ GC::Ref<Violation> Violation::create_a_violation_object_for_request_and_policy(G
 
     // 2. Let violation be the result of executing § 2.4.1 Create a violation object for global, policy, and directive
     //      on request’s client’s global object, policy, and directive.
-    auto violation = create_a_violation_object_for_global_policy_and_directive(request->client()->global_object(), policy, String { directive->view().to_utf8_but_should_be_ported_to_utf16() });
+    auto client = Fetch::Fetching::resolve_client(request);
+    auto violation = create_a_violation_object_for_global_policy_and_directive(client->global_object(), policy, String { directive->view().to_utf8_but_should_be_ported_to_utf16() });
 
     // 3. Set violation’s resource to request’s url.
     // Spec Note: We use request’s url, and not its current url, as the latter might contain information about redirect
@@ -98,7 +117,6 @@ void Violation::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_global_scope);
-    visitor.visit(m_policy);
     visitor.visit(m_element);
 }
 
@@ -215,7 +233,7 @@ ByteBuffer Violation::obtain_the_deprecated_serialization(JS::Realm& realm) cons
 
     // "original-policy"
     //    The serialization of violation's policy
-    body.value.set("original-policy"_string, Infra::JSONValue { m_policy->pre_parsed_policy_string({}) });
+    body.value.set("original-policy"_string, Infra::JSONValue { m_policy->pre_parsed_policy_string() });
 
     // "disposition"
     //    The disposition of violation's policy
@@ -351,7 +369,7 @@ void Violation::report_a_violation(JS::Realm& realm)
 
             // originalPolicy
             //    The serialization of violation's policy
-            event_init.original_policy = Utf16String::from_utf8(m_policy->pre_parsed_policy_string({}));
+            event_init.original_policy = Utf16String::from_utf8(m_policy->pre_parsed_policy_string());
 
             // disposition
             //    violation's disposition
@@ -420,7 +438,7 @@ void Violation::report_a_violation(JS::Realm& realm)
 
                         // client
                         //    violation's global object's relevant settings object
-                        request->set_client(&environment_settings_object);
+                        request->set_client(environment_settings_object.address());
 
                         // destination
                         //    "report"
@@ -455,7 +473,7 @@ void Violation::report_a_violation(JS::Realm& realm)
                         request->set_redirect_mode(Fetch::Infrastructure::Request::RedirectMode::Error);
 
                         // 4. Fetch request. The result will be ignored.
-                        (void)Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create({}));
+                        (void)Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(Fetch::Infrastructure::FetchAlgorithms::Input { Fetch::Engine::BodyIntent::DrainAndDiscard }));
                     }
                 }
             }

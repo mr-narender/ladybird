@@ -9,6 +9,7 @@
 #include <LibGC/Forward.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Runtime/Completion.h>
+#include <LibJS/Runtime/Realm.h>
 #include <LibJS/Runtime/Value.h>
 #include <LibWeb/DOM/NodeFilter.h>
 #include <LibWeb/Export.h>
@@ -34,6 +35,10 @@ class ShadowRoot;
 
 namespace Web::Bindings {
 
+struct ParseHTMLUnsafeOptions;
+struct SetHTMLOptions;
+struct SetHTMLUnsafeOptions;
+
 WEB_API JS::ThrowCompletionOr<DOM::NodeFilter::Result> accept_node(JS::Realm&, DOM::NodeFilter&, DOM::Node&);
 WEB_API JS::Value filter(DOM::NodeIterator&);
 WEB_API JS::ThrowCompletionOr<GC::Ptr<DOM::Node>> next_node(JS::Realm&, DOM::NodeIterator&);
@@ -52,20 +57,26 @@ WEB_API void remove_event_listener(DOM::EventTarget&, Utf16String const&, GC::Pt
 WEB_API GC::Ref<JS::Environment> new_event_handler_object_environment(JS::Realm&, GC::Ref<DOM::EventTarget>, GC::Ref<JS::Environment>);
 WEB_API JS::Realm* callback_realm(WebIDL::CallbackType*);
 WEB_API HTML::Window* window_from_callback(WebIDL::CallbackType&);
+WEB_API DOM::EventTarget* current_target_global(WebIDL::CallbackType&, DOM::Event const&);
 WEB_API void report_exception_for_callback(WebIDL::CallbackType&, JS::Value);
 WEB_API JS::Completion invoke_event_listener(WebIDL::CallbackType&, DOM::Event&);
 WEB_API JS::Completion invoke_event_handler(WebIDL::CallbackType&, DOM::Event&, bool);
 WEB_API DOM::Event* event_from_value(JS::Value);
 WEB_API DOM::Event* event_from_callback_argument(JS::VM&);
 WEB_API JS::Value event(JS::Realm&, GC::Ref<DOM::Event>);
-WEB_API GC::Ptr<PlatformObject> current_target_wrapper(JS::Realm&, DOM::Event const&);
+WEB_API GC::Ptr<JS::Object> current_target_wrapper(JS::Realm&, DOM::Event const&);
 WEB_API JS::Value current_target_value(JS::Realm&, DOM::Event const&);
 
 WEB_API JS::Value document(JS::Realm&, GC::Ref<DOM::Document>);
 WEB_API GC::Ref<CSS::StyleSheetList> style_sheets(DOM::Document&);
 WEB_API JS::Value adopted_style_sheets(DOM::Document&);
 WEB_API WebIDL::ExceptionOr<void> set_adopted_style_sheets(DOM::Document&, JS::Value);
-WEB_API WebIDL::ExceptionOr<GC::Root<DOM::Document>> parse_html_unsafe(JS::Realm&, TrustedTypes::TrustedHTMLOrString const&);
+WEB_API WebIDL::ExceptionOr<GC::Root<DOM::Document>> parse_html_unsafe(JS::Realm&, TrustedTypes::TrustedHTMLOrString const&, Variant<ParseHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
+WEB_API WebIDL::ExceptionOr<GC::Root<DOM::Document>> parse_html(JS::Object&, Utf16String const&, SetHTMLOptions const&);
+inline WebIDL::ExceptionOr<GC::Root<DOM::Document>> parse_html(JS::Realm& realm, Utf16String const& html, SetHTMLOptions const& options)
+{
+    return parse_html(realm.global_object(), html, options);
+}
 WEB_API WebIDL::ExceptionOr<void> write(DOM::Document&, Vector<TrustedTypes::TrustedHTMLOrString> const&);
 WEB_API WebIDL::ExceptionOr<void> writeln(DOM::Document&, Vector<TrustedTypes::TrustedHTMLOrString> const&);
 WEB_API GC::Ptr<ViewTransition::ViewTransition> start_view_transition(DOM::Document&, GC::Ptr<WebIDL::CallbackType> update_callback);
@@ -73,9 +84,15 @@ WEB_API JS::Value document_named_item_value(WrapperWorld&, JS::Realm&, DOM::Docu
 
 WEB_API WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> inner_html(DOM::ShadowRoot&);
 WEB_API WebIDL::ExceptionOr<void> set_inner_html(DOM::ShadowRoot&, TrustedTypes::TrustedHTMLOrString const&);
-WEB_API WebIDL::ExceptionOr<void> set_html_unsafe(DOM::ShadowRoot&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html);
+WEB_API WebIDL::ExceptionOr<void> set_html_unsafe(DOM::ShadowRoot&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
+WEB_API WebIDL::ExceptionOr<void> append_html_unsafe(DOM::ShadowRoot&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
+WEB_API WebIDL::ExceptionOr<void> prepend_html_unsafe(DOM::ShadowRoot&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
 WEB_API GC::Ref<CSS::StyleSheetList> style_sheets(DOM::ShadowRoot&);
 WEB_API JS::Value adopted_style_sheets(DOM::ShadowRoot&);
 WEB_API WebIDL::ExceptionOr<void> set_adopted_style_sheets(DOM::ShadowRoot&, JS::Value);
+
+WEB_API WebIDL::ExceptionOr<void> before_html_unsafe(DOM::Node&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
+WEB_API WebIDL::ExceptionOr<void> after_html_unsafe(DOM::Node&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
+WEB_API WebIDL::ExceptionOr<void> replace_with_html_unsafe(DOM::Node&, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html, Variant<SetHTMLUnsafeOptions, GC::Ref<TrustedTypes::TrustedHTMLParserOptions>> const&);
 
 }

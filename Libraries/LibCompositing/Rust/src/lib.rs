@@ -5,9 +5,10 @@
  */
 
 #[cfg(feature = "allocator")]
-/// cbindgen:ignore
-#[path = "../../../RustAllocator.rs"]
-mod rust_allocator;
+extern crate ladybird_allocator;
+
+#[path = "../../../RustDemangle.rs"]
+mod rust_demangle;
 
 #[path = "../../../RustPanic.rs"]
 mod rust_panic;
@@ -25,3 +26,5 @@ pub mod node_slot_id;
 mod test_stubs;
 pub mod visual_animation;
 pub mod visual_context;
+
+mod test_builder;

@@ -6,36 +6,42 @@
  */
 
 #include <LibGfx/Bitmap.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibImageDecoderClient/Client.h>
 #include <LibWeb/Platform/RemoteImageCodecPlugin.h>
 
 namespace Web::Platform {
 
-RemoteImageCodecPlugin::RemoteImageCodecPlugin(NonnullRefPtr<ImageDecoderClient::Client> client)
-    : m_client(move(client))
+RemoteImageCodecPlugin::RemoteImageCodecPlugin(ConnectToImageDecoder connect_to_image_decoder)
+    : m_connect_to_image_decoder(move(connect_to_image_decoder))
 {
-    setup_client_callbacks();
 }
 
-void RemoteImageCodecPlugin::set_client(NonnullRefPtr<ImageDecoderClient::Client> client)
+ImageDecoderClient::Client* RemoteImageCodecPlugin::ensure_client()
 {
-    m_client = move(client);
-    setup_client_callbacks();
-}
+    if (m_client)
+        return m_client;
 
-void RemoteImageCodecPlugin::setup_client_callbacks()
-{
+    auto client = m_connect_to_image_decoder();
+    if (client.is_error()) {
+        dbgln("Failed to connect to an image decoder: {}", client.error());
+        return nullptr;
+    }
+
+    // NB: The generation also changes here, for a frame channel that was given up on while no client could be had.
+    m_client = client.release_value();
+    ++m_client_generation;
     m_client->on_death = [this] {
         m_client = nullptr;
+        ++m_client_generation;
     };
-    m_client->on_animation_frames_decoded = [this](i64 session_id, Vector<NonnullRefPtr<Gfx::Bitmap>> bitmaps) {
-        if (on_animation_frames_decoded)
-            on_animation_frames_decoded(session_id, move(bitmaps));
-    };
-    m_client->on_animation_decode_failed = [this](i64 session_id, String) {
-        if (on_animation_decode_failed)
-            on_animation_decode_failed(session_id);
-    };
+    return m_client;
+}
+
+void RemoteImageCodecPlugin::disconnect_client()
+{
+    if (auto client = m_client)
+        client->shutdown();
 }
 
 RemoteImageCodecPlugin::~RemoteImageCodecPlugin() = default;
@@ -48,12 +54,13 @@ NonnullRefPtr<Core::Promise<DecodedImage>> RemoteImageCodecPlugin::decode_image(
     if (on_rejected)
         promise->on_rejection = move(on_rejected);
 
-    if (!m_client) {
+    auto* client = ensure_client();
+    if (!client) {
         promise->reject(Error::from_string_literal("ImageDecoderClient is disconnected"));
         return promise;
     }
 
-    auto image_decoder_promise = m_client->decode_image(
+    auto image_decoder_promise = client->decode_image(
         bytes,
         [promise](ImageDecoderClient::DecodedImage& result) -> ErrorOr<void> {
             // FIXME: Remove this codec plugin and just use the ImageDecoderClient directly to avoid these copies
@@ -77,16 +84,25 @@ NonnullRefPtr<Core::Promise<DecodedImage>> RemoteImageCodecPlugin::decode_image(
     return promise;
 }
 
-void RemoteImageCodecPlugin::request_animation_frames(i64 session_id, u32 start_frame_index, u32 count)
+ErrorOr<DecodedFirstFrame> RemoteImageCodecPlugin::decode_first_frame_synchronously(ReadonlyBytes bytes)
 {
-    if (m_client)
-        m_client->request_animation_frames(session_id, start_frame_index, count);
+    auto* client = ensure_client();
+    if (!client)
+        return Error::from_string_literal("ImageDecoderClient is disconnected");
+    auto result = TRY(client->decode_first_frame_synchronously(bytes));
+    return DecodedFirstFrame { move(result.bitmap), move(result.color_space) };
 }
 
 void RemoteImageCodecPlugin::stop_animation_decode(i64 session_id)
 {
     if (m_client)
         m_client->stop_animation_decode(session_id);
+}
+
+void RemoteImageCodecPlugin::connect_frame_client(IPC::TransportHandle handle)
+{
+    if (auto* client = ensure_client())
+        client->async_connect_frame_client(handle);
 }
 
 }

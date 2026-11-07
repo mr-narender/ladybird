@@ -50,6 +50,11 @@ public:
     GC::Ref<WebIDL::Promise> decapsulate_key(JS::Realm&, AlgorithmIdentifier decapsulation_algorithm, GC::Ref<CryptoKey> decapsulation_key, WebIDL::BufferSourceVariant const& ciphertext, AlgorithmIdentifier shared_key_algorithm, bool extractable, Vector<KeyUsage> const& usages);
     GC::Ref<WebIDL::Promise> decapsulate_bits(JS::Realm&, AlgorithmIdentifier decapsulation_algorithm, GC::Ref<CryptoKey> decapsulation_key, WebIDL::BufferSourceVariant const& ciphertext);
 
+    GC::Ref<WebIDL::Promise> get_public_key(JS::Realm&, GC::Ref<CryptoKey> key, Vector<KeyUsage> key_usages);
+
+    static bool supports(JS::Realm&, Utf16String const& operation, AlgorithmIdentifier const& algorithm, Optional<u32> length);
+    static bool supports(JS::Realm&, Utf16String const& operation, AlgorithmIdentifier const& algorithm, AlgorithmIdentifier const& additional_algorithm);
+
 private:
     SubtleCrypto();
 };
@@ -65,15 +70,6 @@ WebIDL::ExceptionOr<NormalizedAlgorithmAndParameter> normalize_an_algorithm(JS::
 namespace Web::Bindings {
 
 WEB_API JS::ThrowCompletionOr<GC::Ref<JS::Object>> create_algorithm_dictionary(JS::Realm&, Utf16String const& name);
-
-WEB_API JS::ThrowCompletionOr<GC::Ref<WebIDL::Promise>> import_key(
-    JS::Realm&,
-    Crypto::SubtleCrypto&,
-    KeyFormat,
-    Crypto::KeyDataType,
-    Crypto::AlgorithmIdentifier,
-    bool extractable,
-    Vector<KeyUsage>);
 
 WEB_API GC::Ref<WebIDL::Promise> generate_key(JS::Realm&, Crypto::SubtleCrypto&, Crypto::AlgorithmIdentifier, bool extractable, Vector<KeyUsage>);
 WEB_API GC::Ref<WebIDL::Promise> derive_key(JS::Realm&, Crypto::SubtleCrypto&, Crypto::AlgorithmIdentifier, GC::Ref<Crypto::CryptoKey>, Crypto::AlgorithmIdentifier, bool extractable, Vector<KeyUsage>);

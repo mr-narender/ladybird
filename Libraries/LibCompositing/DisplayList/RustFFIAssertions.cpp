@@ -14,6 +14,7 @@
 #include <LibCompositing/TypesRustFFI.h>
 #include <LibGfx/AffineTransform.h>
 #include <LibGfx/Color.h>
+#include <LibGfx/ColorFilterType.h>
 #include <LibGfx/CompositingAndBlendingOperator.h>
 #include <LibGfx/CornerRadii.h>
 #include <LibGfx/GradientInterpolation.h>
@@ -115,9 +116,6 @@ static_assert(to_underlying(Compositing::RustFFI::Orientation::Vertical) == to_u
 static_assert(sizeof(Compositing::RustFFI::ShouldAntiAlias) == sizeof(Gfx::ShouldAntiAlias));
 static_assert(to_underlying(Compositing::RustFFI::ShouldAntiAlias::Yes) == to_underlying(Gfx::ShouldAntiAlias::Yes));
 static_assert(to_underlying(Compositing::RustFFI::ShouldAntiAlias::No) == to_underlying(Gfx::ShouldAntiAlias::No));
-static_assert(sizeof(Compositing::RustFFI::CornerClip) == sizeof(Gfx::CornerClip));
-static_assert(to_underlying(Compositing::RustFFI::CornerClip::Outside) == to_underlying(Gfx::CornerClip::Outside));
-static_assert(to_underlying(Compositing::RustFFI::CornerClip::Inside) == to_underlying(Gfx::CornerClip::Inside));
 static_assert(sizeof(Compositing::RustFFI::InterpolationColorSpace) == sizeof(Gfx::InterpolationColorSpace));
 static_assert(to_underlying(Compositing::RustFFI::InterpolationColorSpace::LinearRGB) == to_underlying(Gfx::InterpolationColorSpace::LinearRGB));
 static_assert(to_underlying(Compositing::RustFFI::InterpolationColorSpace::SRGB) == to_underlying(Gfx::InterpolationColorSpace::SRGB));
@@ -147,14 +145,14 @@ static_assert(to_underlying(Compositing::RustFFI::HueInterpolationMethod::Decrea
 static_assert(sizeof(Compositing::RustFFI::GradientInterpolationType) == sizeof(Gfx::GradientInterpolationMethod::Type));
 static_assert(to_underlying(Compositing::RustFFI::GradientInterpolationType::Rectangular) == to_underlying(Gfx::GradientInterpolationMethod::Type::Rectangular));
 static_assert(to_underlying(Compositing::RustFFI::GradientInterpolationType::Polar) == to_underlying(Gfx::GradientInterpolationMethod::Type::Polar));
-static_assert(sizeof(Compositing::RustFFI::CapStyle) == sizeof(Gfx::Path::CapStyle));
-static_assert(to_underlying(Compositing::RustFFI::CapStyle::Butt) == to_underlying(Gfx::Path::CapStyle::Butt));
-static_assert(to_underlying(Compositing::RustFFI::CapStyle::Round) == to_underlying(Gfx::Path::CapStyle::Round));
-static_assert(to_underlying(Compositing::RustFFI::CapStyle::Square) == to_underlying(Gfx::Path::CapStyle::Square));
-static_assert(sizeof(Compositing::RustFFI::JoinStyle) == sizeof(Gfx::Path::JoinStyle));
-static_assert(to_underlying(Compositing::RustFFI::JoinStyle::Miter) == to_underlying(Gfx::Path::JoinStyle::Miter));
-static_assert(to_underlying(Compositing::RustFFI::JoinStyle::Round) == to_underlying(Gfx::Path::JoinStyle::Round));
-static_assert(to_underlying(Compositing::RustFFI::JoinStyle::Bevel) == to_underlying(Gfx::Path::JoinStyle::Bevel));
+static_assert(sizeof(Compositing::RustFFI::CapStyle) == sizeof(Gfx::CapStyle));
+static_assert(to_underlying(Compositing::RustFFI::CapStyle::Butt) == to_underlying(Gfx::CapStyle::Butt));
+static_assert(to_underlying(Compositing::RustFFI::CapStyle::Round) == to_underlying(Gfx::CapStyle::Round));
+static_assert(to_underlying(Compositing::RustFFI::CapStyle::Square) == to_underlying(Gfx::CapStyle::Square));
+static_assert(sizeof(Compositing::RustFFI::JoinStyle) == sizeof(Gfx::JoinStyle));
+static_assert(to_underlying(Compositing::RustFFI::JoinStyle::Miter) == to_underlying(Gfx::JoinStyle::Miter));
+static_assert(to_underlying(Compositing::RustFFI::JoinStyle::Round) == to_underlying(Gfx::JoinStyle::Round));
+static_assert(to_underlying(Compositing::RustFFI::JoinStyle::Bevel) == to_underlying(Gfx::JoinStyle::Bevel));
 static_assert(sizeof(Compositing::RustFFI::ColorFilterType) == sizeof(Gfx::ColorFilterType));
 static_assert(to_underlying(Compositing::RustFFI::ColorFilterType::Brightness) == to_underlying(Gfx::ColorFilterType::Brightness));
 static_assert(to_underlying(Compositing::RustFFI::ColorFilterType::Contrast) == to_underlying(Gfx::ColorFilterType::Contrast));

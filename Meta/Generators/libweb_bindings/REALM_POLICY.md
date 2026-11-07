@@ -43,8 +43,8 @@ running user script under a different realm.
 Current `[NeedsCallerRealm]` opt-out categories:
 
 - WebAssembly JS API objects and namespace functions: JS-API algorithms create
-  ArrayBuffers, typed arrays, exports objects, and promises in the caller realm.
-- Promise/body/fetch/cache/credential/permission/serial/gamepad/media APIs:
+  ArrayBuffers, typed arrays, and promises in the caller realm.
+- Promise/body/fetch/cache/credential/permission/gamepad/media APIs:
   promise capability and result object allocation is caller-observable.
 - Structured serialization APIs (`postMessage`, `History`, `Navigation`
   state): cloning/deserialization is defined against the caller/current realm.

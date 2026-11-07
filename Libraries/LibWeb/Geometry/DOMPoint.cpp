@@ -5,39 +5,42 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGC/Heap.h>
-#include <LibWeb/Bindings/DOMPointReadOnly.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/VM.h>
 #include <LibWeb/Geometry/DOMPoint.h>
 
 namespace Web::Geometry {
 
-GC_DEFINE_ALLOCATOR(DOMPoint);
+extern "C" {
+
+// Defined in Bindings/Rust/src/geometry/exports.rs.
+void* web_dom_point_create(JSVM*, double x, double y, double z, double w);
+void web_dom_point_coordinates(void const* point, Array<double, 4>* out_coordinates);
+void web_dom_point_set_x_and_y(void* point, double x, double y);
+}
 
 GC::Ref<DOMPoint> DOMPoint::create(double x, double y, double z, double w)
 {
-    return GC::Heap::the().allocate<DOMPoint>(x, y, z, w);
+    return GC::Ref { *static_cast<DOMPoint*>(web_dom_point_create(JS::HostABI::vm_to_abi(JS::VM::the()), x, y, z, w)) };
 }
 
-GC::Ref<DOMPoint> DOMPoint::create()
+double DOMPoint::x() const
 {
-    return GC::Heap::the().allocate<DOMPoint>();
+    Array<double, 4> coordinates;
+    web_dom_point_coordinates(this, &coordinates);
+    return coordinates[0];
 }
 
-GC::Ref<DOMPoint> DOMPoint::dom_point_from_point(Bindings::DOMPointInit const& other)
+double DOMPoint::y() const
 {
-    return create(other.x, other.y, other.z, other.w);
+    Array<double, 4> coordinates;
+    web_dom_point_coordinates(this, &coordinates);
+    return coordinates[1];
 }
 
-DOMPoint::DOMPoint(double x, double y, double z, double w)
-    : DOMPointReadOnly(x, y, z, w)
+void DOMPoint::set_x_and_y(double x, double y)
 {
+    web_dom_point_set_x_and_y(this, x, y);
 }
-
-DOMPoint::DOMPoint()
-    : DOMPointReadOnly()
-{
-}
-
-DOMPoint::~DOMPoint() = default;
 
 }

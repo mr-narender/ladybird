@@ -1,0 +1,8 @@
+Harness status: OK
+
+Found 3 tests
+
+3 Pass
+Pass	getComputedStyle() for root element
+Pass	getComputedStyle() for root highlight applied to div
+Pass	getComputedStyle() for div specific highlight
