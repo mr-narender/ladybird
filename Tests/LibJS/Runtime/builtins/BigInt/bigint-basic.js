@@ -108,6 +108,9 @@ describe("correct behavior", () => {
         expect(1n == "0b10").toBeFalse();
         expect(1n == "0o2").toBeFalse();
         expect(1n == "0x2").toBeFalse();
+
+        expect(1n == "﻿1﻿").toBeTrue();
+        expect(1n == "\u00851").toBeFalse();
     });
 
     test("strong equality operators", () => {
@@ -192,6 +195,12 @@ describe("correct behavior", () => {
         expect("0x1" <= 1n).toBeTrue();
         expect("0X2" <= 2n).toBeTrue();
     });
+});
+
+test("constant right shift by a huge count", () => {
+    expect(~4n >> 18446744073709551615n).toBe(-1n);
+    expect(~0n >> 18446744073709551615n).toBe(-1n);
+    expect(5n >> 18446744073709551615n).toBe(0n);
 });
 
 describe("errors", () => {

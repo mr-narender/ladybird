@@ -48,7 +48,8 @@ namespace Web::Compositor {
 class CompositorConnection;
 class CompositorContextHandle;
 class CompositorHost;
-class CompositorHostBase;
+class NavigablePresenter;
+struct CompositorFrame;
 
 }
 
@@ -60,7 +61,6 @@ class ChromeWidgetRegistry;
 enum class PaintCommandCacheMode : u8;
 struct GradientPaintStyle;
 struct PatternPaintStyle;
-class Scrollbar;
 
 }
 
@@ -73,7 +73,9 @@ class AnimationPlaybackEvent;
 class AnimationTimeline;
 class DocumentTimeline;
 class KeyframeEffect;
+class NamedTimelines;
 class ScrollTimeline;
+class ViewTimeline;
 
 }
 
@@ -90,8 +92,6 @@ namespace Web::Bindings {
 
 class Intrinsics;
 enum class NamedPropertyDeletionResult : u8;
-class OptionConstructor;
-class PlatformObject;
 class Wrappable;
 class WrapperWorld;
 
@@ -148,17 +148,46 @@ class MediaStreamTrack;
 
 }
 
+namespace Web::WebRTC {
+
+class KeyFrameRequestEvent;
+class RTCCertificate;
+class RTCDataChannel;
+class RTCDataChannelEvent;
+class RTCDTMFSender;
+class RTCDTMFToneChangeEvent;
+class RTCDtlsTransport;
+class RTCEncodedAudioFrame;
+class RTCEncodedVideoFrame;
+class RTCError;
+class RTCErrorEvent;
+class RTCIceCandidate;
+class RTCIceTransport;
+class RTCPeerConnection;
+class RTCPeerConnectionIceErrorEvent;
+class RTCPeerConnectionIceEvent;
+class RTCRtpReceiver;
+class RTCRtpScriptTransform;
+class RTCRtpScriptTransformer;
+class RTCRtpSender;
+class RTCRtpTransceiver;
+class RTCSctpTransport;
+class RTCSessionDescription;
+class RTCSFrameReceiverTransform;
+class RTCSFrameSenderTransform;
+class RTCStatsReport;
+class RTCTrackEvent;
+class RTCTransformEvent;
+class SFrameDecrypterStream;
+class SFrameEncrypterStream;
+class SFrameTransformErrorEvent;
+
+}
+
 namespace Web::Clipboard {
 
 class Clipboard;
 class ClipboardItem;
-
-}
-
-namespace Web::Compression {
-
-class CompressionStream;
-class DecompressionStream;
 
 }
 
@@ -173,30 +202,7 @@ class Violation;
 
 namespace Web::ContentSecurityPolicy::Directives {
 
-class BaseUriDirective;
-class ChildSourceDirective;
-class ConnectSourceDirective;
-class DefaultSourceDirective;
 class Directive;
-class FontSourceDirective;
-class FormActionDirective;
-class FrameAncestorsDirective;
-class FrameSourceDirective;
-class ImageSourceDirective;
-class ManifestSourceDirective;
-class MediaSourceDirective;
-class ObjectSourceDirective;
-class ReportToDirective;
-class ReportUriDirective;
-class SandboxDirective;
-class ScriptSourceAttributeDirective;
-class ScriptSourceDirective;
-class ScriptSourceElementDirective;
-class StyleSourceAttributeDirective;
-class StyleSourceDirective;
-class StyleSourceElementDirective;
-class WebRTCDirective;
-class WorkerSourceDirective;
 
 }
 
@@ -226,21 +232,18 @@ class SubtleCrypto;
 
 namespace Web::CSS {
 
+enum class ElementBoxKind : u8;
+
 class AbstractImageStyleValue;
 class AbstractOrHypotheticalElement;
-class AnchorStyleValue;
 class Angle;
 class AnglePercentage;
 class AngleStyleValue;
 class BackgroundSizeStyleValue;
 class BlurFilterStyleValue;
-class BorderImageSliceStyleValue;
-class BorderRadiusRectStyleValue;
-class BorderRadiusStyleValue;
 class CalculatedStyleValue;
-class CascadedProperties;
 class CustomPropertyData;
-class Clip;
+enum class IsAnimationOverlay : bool;
 class ColorFilterStyleValue;
 class ColorFunctionStyleValue;
 class ColorSchemeStyleValue;
@@ -248,82 +251,37 @@ class ColorStyleValue;
 class ComputedStyleWorkingSet;
 class ComputedValues;
 class ComputedStyleRecordView;
-class LayoutStyle;
-class ConicGradientStyleValue;
 class ContainerQuery;
 class ContentStyleValue;
 class CounterDefinitionsStyleValue;
-class CounterStyle;
 class CounterStyleStyleValue;
-class CounterStyleSystemStyleValue;
-class CounterStyleValue;
-class CountersSet;
 class CSSAnimation;
-class CSSConditionRule;
-class CSSContainerRule;
-class CSSCounterStyleRule;
 class CSSDescriptors;
-class CSSFontFaceDescriptors;
 class CSSFontFaceRule;
-class CSSFontFeatureValuesMap;
 class CSSFontFeatureValuesRule;
-class CSSFunctionDescriptors;
 class CSSFunctionRule;
 class CSSGroupingRule;
-class CSSImageValue;
 class CSSImportRule;
-class CSSKeyframeRule;
 class CSSKeyframesRule;
 class CSSKeywordValue;
-class CSSLayerBlockRule;
-class CSSLayerStatementRule;
-class CSSMarginRule;
-class CSSMathClamp;
-class CSSMathInvert;
-class CSSMathMax;
-class CSSMathMin;
-class CSSMathNegate;
-class CSSMathProduct;
-class CSSMathSum;
-class CSSMathValue;
-class CSSMatrixComponent;
-class CSSMediaRule;
-class CSSNamespaceRule;
 class CSSNestedDeclarations;
-class CSSNumericArray;
 class CSSNumericValue;
-class CSSPageRule;
-class CSSPageDescriptors;
-class CSSPerspective;
-class CSSPropertyRule;
-class CSSRotate;
+class CSSPositionTryDescriptors;
 class CSSRule;
 class CSSRuleList;
-class CSSScale;
-class CSSScopeRule;
-class CSSSkew;
-class CSSSkewX;
-class CSSSkewY;
 class CSSStyleDeclaration;
 class CSSStyleProperties;
 class CSSStyleRule;
 class CSSStyleSheet;
 class StyleSheetState;
 class CSSStyleValue;
-class CSSSupportsRule;
-class CSSTransformComponent;
-class CSSTransformValue;
-class CSSTranslate;
 class CSSUnitValue;
-class CSSUnparsedValue;
-class CSSVariableReferenceValue;
 class CursorStyleValue;
 class CustomIdentStyleValue;
 class DimensionStyleValue;
 class Display;
 class DisplayStyleValue;
 class DropShadowFilterStyleValue;
-class EdgeStyleValue;
 class FilterStyleValue;
 class Flex;
 class FlexStyleValue;
@@ -337,6 +295,7 @@ class Frequency;
 class FrequencyPercentage;
 class FrequencyStyleValue;
 class FunctionStyleValue;
+class HighlightRegistry;
 class HueRotateFilterStyleValue;
 class ImageSetStyleValue;
 class ImageStyleValue;
@@ -344,62 +303,40 @@ class IntegerStyleValue;
 class KeywordStyleValue;
 class Length;
 class LengthBox;
-class LengthOrAuto;
 class LengthPercentage;
 class LengthPercentageOrAuto;
 class LengthStyleValue;
-class LinearGradientStyleValue;
 class MediaList;
-class MediaQuery;
 class MediaQueryList;
-class MediaQueryListEvent;
 class Number;
 class NumberStyleValue;
 class NumericType;
 class OpacityValueStyleValue;
-class OpenTypeTaggedStyleValue;
-class OverflowClipMarginStyleValue;
-class ParsedFontFace;
 class PendingSubstitutionStyleValue;
 class Percentage;
 class PercentageStyleValue;
-class PositionStyleValue;
 class PropertyNameAndID;
-class RadialGradientStyleValue;
-class RadialSizeStyleValue;
-class RandomValueSharingStyleValue;
 class Ratio;
 class RatioStyleValue;
-class RectStyleValue;
-class RepeatStyleStyleValue;
 class Resolution;
 class ResolutionStyleValue;
 class Screen;
-class ScreenOrientation;
 class Selector;
 class ShadowStyleValue;
 class ShorthandStyleValue;
-class Size;
-class ScrollbarColorStyleValue;
 class StringStyleValue;
 class StyleComputer;
 class StylePropertyMap;
 class StylePropertyMapReadOnly;
 class StyleScope;
-class StyleSheet;
 class StyleSheetImport;
 class StyleSheetList;
 class StyleValue;
 class StyleValueList;
-class SuperellipseStyleValue;
-class SVGPaint;
-class TextIndentStyleValue;
 class Time;
 class TimePercentage;
 class TimeStyleValue;
 class TransformationStyleValue;
-class TreeCountingFunctionStyleValue;
-class TupleStyleValue;
 class UnicodeRangeStyleValue;
 class UnresolvedStyleValue;
 class URL;
@@ -467,28 +404,25 @@ enum class TextUnderlinePositionVertical : u8;
 enum class TransitionBehavior : u8;
 enum class WritingMode : u8;
 
-struct BackgroundLayerData;
 struct CalculationContext;
 struct CalculationResolutionContext;
-struct ColorResolutionContext;
+struct ColorResolutionStyle;
 struct ComputationContext;
 struct CustomPropertyRegistration;
 struct LogicalAliasMappingContext;
 struct NormalGap;
-struct RandomCachingKey;
 struct RequiredInvalidationAfterStyleChange;
-struct TransitionProperties;
 
 // https://drafts.css-houdini.org/css-typed-om-1/#typedefdef-cssnumberish
 using CSSNumberish = Variant<double, GC::Ref<CSSNumericValue>>;
 using PaintOrderList = Array<PaintOrder, 3>;
 using StyleValueVector = Vector<ValueComparingNonnullRefPtr<StyleValue const>>;
-using StyleValueTuple = Vector<ValueComparingRefPtr<StyleValue const>>;
 
 }
 
 namespace Web::CSS::Parser::ValueParserFFI {
 
+struct DeclarationBlock;
 struct FfiMediaFeatureValue;
 
 }
@@ -508,6 +442,7 @@ class AbortController;
 class AbortSignal;
 class AbstractElement;
 class AbstractRange;
+class AccessibilityChangeTracker;
 class AccessibilityTreeNode;
 class AnchorNameMap;
 class Attr;
@@ -515,6 +450,7 @@ class CDATASection;
 class CaretPosition;
 class CharacterData;
 class Comment;
+class CommitMessages;
 class CustomEvent;
 class Document;
 class DocumentFragment;
@@ -530,6 +466,7 @@ class ElementByIdMap;
 class Event;
 class EventHandler;
 class EventTarget;
+class FragmentDirective;
 class HTMLCollection;
 class IDLEventListener;
 class LiveNodeList;
@@ -538,13 +475,13 @@ class MutationRecord;
 class NamedNodeMap;
 class Node;
 class NodeFilter;
+class NodeIdentity;
 class NodeIterator;
 class NodeList;
 class ParentNode;
 class Position;
 class ProcessingInstruction;
 class PseudoElement;
-class IsolatedSelectorQueryEngineCache;
 class QuerySelectorResultCache;
 class Range;
 class RegisteredObserver;
@@ -570,20 +507,21 @@ using SlotAssignmentMode = Bindings::SlotAssignmentMode;
 
 }
 
+namespace Web::Translation {
+
+class DocumentTranslator;
+
+}
+
 namespace Web::Editing {
 
 class EditCommand;
 class EditingHistory;
+class SpellCheckController;
+class SpellingMarkers;
+class WritingSuggestionController;
 class UndoStep;
 enum class HistoryAction : u8;
-
-}
-
-namespace Web::Encoding {
-
-class TextDecoder;
-class TextEncoder;
-class TextEncoderStream;
 
 }
 
@@ -601,7 +539,9 @@ class FileSystemEntry;
 
 namespace Web::EventTiming {
 
+class EventCounts;
 class PerformanceEventTiming;
+struct WindowEventTimingState;
 
 }
 
@@ -612,6 +552,15 @@ class Headers;
 class HeadersIterator;
 class Request;
 class Response;
+
+}
+
+namespace Web::Fetch::Engine {
+
+class FetchBodyDeliveryGate;
+class FetchByteChannel;
+class NetworkTransportHandle;
+class WholeBodyTransport;
 
 }
 
@@ -626,13 +575,17 @@ namespace Web::Fetch::Infrastructure {
 
 class Body;
 class FetchAlgorithms;
+class FetchControlBlock;
 class FetchController;
+class FetchControllerRegistry;
 class FetchParams;
 class FetchRecord;
 class FetchTimingInfo;
 class IncrementalReadLoopReadRequest;
+class KeepaliveQuotaAccountant;
 class Request;
 class Response;
+class ResponseView;
 
 struct BodyWithType;
 
@@ -671,7 +624,6 @@ class DOMMatrix;
 class DOMMatrixReadOnly;
 class DOMPoint;
 class DOMPointReadOnly;
-class DOMQuad;
 class DOMRect;
 class DOMRectList;
 class DOMRectReadOnly;
@@ -681,6 +633,7 @@ class DOMRectReadOnly;
 namespace Web::HTML {
 
 enum class CheckIfUnloadingIsCanceledResult;
+enum class HoverUpdatePoint : u8;
 
 class AnimationFrameCallbackDriver;
 class AudioTrack;
@@ -688,11 +641,11 @@ class AudioTrackList;
 class AutoplaySettings;
 class BarProp;
 class BeforeUnloadEvent;
-class BroadcastChannel;
 class BrowsingContext;
 class Canvas2DContextBase;
 class CanvasHost;
 class CanvasRenderingContext2D;
+class CheckUnloadingCanceledState;
 class RemoteCanvas2DTransport;
 class ClassicScript;
 class CloseEvent;
@@ -770,6 +723,7 @@ class HTMLOListElement;
 class HTMLOptGroupElement;
 class HTMLOptionElement;
 class HTMLOptionsCollection;
+class HTMLOrSVGScriptElement;
 class HTMLOutputElement;
 class HTMLParagraphElement;
 class HTMLParamElement;
@@ -810,7 +764,7 @@ class LocalNavigable;
 class LocalTraversableNavigable;
 class Location;
 class MediaError;
-class MessageChannel;
+class MediaStreamPlayback;
 class MessageEvent;
 class MessagePort;
 class MimeType;
@@ -831,7 +785,6 @@ class Navigator;
 class OffscreenCanvas;
 class OffscreenCanvasRenderingContext2D;
 class PageTransitionEvent;
-class Path2D;
 class Plugin;
 class PluginArray;
 class PopoverTargetAttributes;
@@ -842,16 +795,15 @@ class RadioButtonGroupRegistry;
 class RadioNodeList;
 class RemoteNavigable;
 class RemoteWindow;
+class Sanitizer;
+struct SanitizerConfiguration;
 class ScriptRegistry;
 class SessionHistoryEntry;
 class SharedResourceRequest;
 class SharedWorker;
 class SharedWorkerGlobalScope;
 class Storage;
-class StructuredSerializeReader;
-class StructuredSerializeWriter;
 class SubmitEvent;
-class TextMetrics;
 class TextTrack;
 class TextTrackCue;
 class TextTrackCueList;
@@ -861,10 +813,10 @@ class Timer;
 class TimeRanges;
 class ToggleEvent;
 class TrackEvent;
-class TransferDataDecoder;
 class UserActivation;
 class UserScrollGestureHold;
 class ValidityState;
+class VideoPlaybackQuality;
 class VideoTrack;
 class VideoTrackList;
 class Window;
@@ -902,6 +854,7 @@ struct NavigationParams;
 struct PreparedNavigation;
 struct PaintConfig;
 struct PolicyContainer;
+struct RemoteClientNavigation;
 struct SerializedFormData;
 struct SourceSnapshotParams;
 struct ToggleTaskTracker;
@@ -916,35 +869,15 @@ class Performance;
 
 namespace Web::IndexedDB {
 
-class Database;
-class IDBCursor;
-class IDBCursorWithValue;
-class IDBDatabase;
 class IDBFactory;
-class IDBIndex;
-class IDBKeyRange;
-class IDBObjectStore;
-class IDBOpenDBRequest;
-class IDBRecord;
-class IDBRequest;
-class IDBTransaction;
-class IDBVersionChangeEvent;
-class Index;
-class Key;
-class ObjectStore;
-class RequestList;
-
-using CursorDirection = Bindings::IDBCursorDirection;
 
 }
 
 namespace Web::Internals {
 
-class FakeXRDevice;
 class Internals;
 class InternalGamepad;
 class WebUI;
-class XRTest;
 
 }
 
@@ -955,16 +888,24 @@ class IntersectionObserverEntry;
 
 }
 
+namespace Web::Layout::RustFFI {
+
+struct BegunRead;
+
+}
+
 namespace Web::Layout {
 
 class ImageProvider;
 class Box;
+class ForcedReadScope;
 class Node;
 class NodeArena;
 class NodeWithStyle;
 class TextNode;
-class LayoutTreeBuilderAccess;
 class Viewport;
+
+using BegunRead = RustFFI::BegunRead;
 
 }
 
@@ -1010,6 +951,19 @@ class PerformanceTiming;
 namespace Web::NotificationsAPI {
 
 class Notification;
+struct NotificationData;
+
+}
+
+namespace Web::LargestContentfulPaint {
+
+class LargestContentfulPaint;
+
+}
+
+namespace Web::PaintTiming {
+
+class PerformancePaintTiming;
 
 }
 
@@ -1032,6 +986,14 @@ namespace Web::PermissionsAPI {
 
 class Permissions;
 class PermissionStatus;
+
+}
+
+namespace Web::PictureInPicture {
+
+class PictureInPictureController;
+class PictureInPictureEvent;
+class PictureInPictureWindow;
 
 }
 
@@ -1071,13 +1033,6 @@ class Selection;
 
 }
 
-namespace Web::Serial {
-
-class Serial;
-class SerialPort;
-
-}
-
 namespace Web::ServiceWorker {
 
 class Cache;
@@ -1099,7 +1054,6 @@ class SpeechGrammarList;
 class SpeechRecognition;
 class SpeechRecognitionAlternative;
 class SpeechRecognitionEvent;
-class SpeechRecognitionPhrase;
 class SpeechRecognitionResult;
 class SpeechRecognitionResultList;
 class SpeechSynthesis;
@@ -1110,41 +1064,26 @@ class SpeechSynthesisVoice;
 
 namespace Web::Streams {
 
-class ByteLengthQueuingStrategy;
-class CountQueuingStrategy;
-class ReadableByteStreamController;
 class ReadableStream;
-class ReadableStreamAsyncIterator;
-class ReadableStreamBYOBReader;
-class ReadableStreamBYOBRequest;
-class ReadableStreamDefaultController;
 class ReadableStreamDefaultReader;
-class ReadableStreamGenericReaderMixin;
-class ReadIntoRequest;
 class ReadRequest;
 class TransformStream;
-class TransformStreamDefaultController;
 class WritableStream;
-class WritableStreamDefaultController;
-class WritableStreamDefaultWriter;
-
-struct PullIntoDescriptor;
 
 }
 
 namespace Web::StorageAPI {
 
 class NavigatorStorage;
-class StorageBottle;
-class StorageBucket;
 class StorageManager;
-class StorageShelf;
 
 }
 
 namespace Web::SVG {
 
 class Path;
+class SMILAnimation;
+class SMILTimeContainer;
 class SVGAnimatedEnumeration;
 class SVGAnimatedInteger;
 class SVGAnimatedLength;
@@ -1152,6 +1091,8 @@ class SVGAnimatedLengthList;
 class SVGAnimatedNumber;
 class SVGAnimatedNumberList;
 class SVGAnimatedRect;
+class SVGAnimateElement;
+class SVGAnimateMotionElement;
 class SVGAnimationElement;
 class SVGCircleElement;
 class SVGClipPathElement;
@@ -1187,6 +1128,7 @@ class SVGLengthList;
 class SVGLineElement;
 class SVGMaskElement;
 class SVGMetadataElement;
+class SVGMPathElement;
 class SVGNumber;
 class SVGNumberList;
 class SVGPathElement;
@@ -1195,12 +1137,14 @@ class SVGPolygonElement;
 class SVGPolylineElement;
 class SVGRectElement;
 class SVGScriptElement;
+class SVGSetElement;
 class SVGSVGElement;
 class SVGSwitchElement;
 class SVGSymbolElement;
 class SVGTitleElement;
 class SVGTransformList;
 class SVGViewElement;
+class TimeEvent;
 
 }
 
@@ -1212,21 +1156,16 @@ class KeyboardEvent;
 class MouseEvent;
 class PointerEvent;
 class TextEvent;
+class Touch;
+class TouchEvent;
+class TouchList;
 class UIEvent;
-
-}
-
-namespace Web::URLPattern {
-
-class URLPattern;
 
 }
 
 namespace Web::DOMURL {
 
-class DOMURL;
 class URLSearchParams;
-class URLSearchParamsIterator;
 
 }
 
@@ -1240,23 +1179,6 @@ class PerformanceMeasure;
 namespace Web::ViewTransition {
 
 class ViewTransition;
-
-}
-
-namespace Web::WebAssembly {
-
-class Global;
-class Instance;
-class Memory;
-class Module;
-class Table;
-class WebAssemblyModule;
-
-namespace Detail {
-
-class WebAssemblyCache;
-
-}
 
 }
 
@@ -1294,39 +1216,9 @@ class PeriodicWave;
 namespace Web::WebGL {
 
 class RemoteWebGLTransport;
-class WebGLContextProxy;
 class WebGL2RenderingContext;
-class WebGLActiveInfo;
-class WebGLBuffer;
-class WebGLContextEvent;
-class WebGLFramebuffer;
-class WebGLObject;
-class WebGLProgram;
-class WebGLQuery;
-class WebGLRenderbuffer;
 class WebGLRenderingContext;
 class WebGLRenderingContextBase;
-class WebGLSampler;
-class WebGLShader;
-class WebGLShaderPrecisionFormat;
-class WebGLSync;
-class WebGLTexture;
-class WebGLTransformFeedback;
-class WebGLUniformLocation;
-class WebGLVertexArrayObject;
-class ANGLEInstancedArrays;
-class EXTBlendMinMax;
-class EXTColorBufferFloat;
-class EXTRenderSnorm;
-class EXTTextureFilterAnisotropic;
-class EXTTextureNorm16;
-class OESElementIndexUint;
-class OESStandardDerivatives;
-class OESVertexArrayObject;
-class WebGLCompressedTextureS3tc;
-class WebGLCompressedTextureS3tcSrgb;
-class WebGLDrawBuffers;
-class WebGLVertexArrayObjectOES;
 
 }
 
@@ -1355,9 +1247,7 @@ struct InputState;
 namespace Web::WebLocks {
 
 class Lock;
-class LockData;
 class LockManager;
-class LockRequest;
 class NavigatorLocks;
 
 }
@@ -1375,21 +1265,9 @@ class VTTRegion;
 
 }
 
-namespace Web::WebXR {
-
-class XRLayer;
-class XRRenderState;
-class XRSession;
-class XRSessionEvent;
-class XRSystem;
-class XRWebGLLayer;
-
-}
-
 namespace Web::XHR {
 
 class FormData;
-class FormDataIterator;
 class ProgressEvent;
 class XMLHttpRequest;
 class XMLHttpRequestEventTarget;
@@ -1402,6 +1280,7 @@ struct FormDataEntry;
 namespace Web::TrustedTypes {
 
 class TrustedHTML;
+class TrustedHTMLParserOptions;
 class TrustedScript;
 class TrustedScriptURL;
 class TrustedTypePolicy;

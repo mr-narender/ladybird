@@ -10,19 +10,13 @@
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
 #include <LibGC/Ptr.h>
+#include <LibWeb/Animations/TimelineRange.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/EasingFunction.h>
+#include <LibWeb/CSS/StyleValues/RustStyleValueHandle.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::CSS {
-
-struct TransitionProperties {
-    Vector<PropertyID> properties;
-    double duration;
-    EasingFunction timing_function;
-    double delay;
-    TransitionBehavior transition_behavior;
-};
 
 // The timeline an animation definition asks for. A scroll timeline is a GC object, and a definition
 // is built for every animation on every style recomputation while the timeline it names almost
@@ -33,11 +27,15 @@ struct AnimationTimelineSource {
         Document,
         None,
         Scroll,
+        View,
+        Named,
     };
 
     Kind kind { Kind::Document };
     Scroller scroller {};
     Axis axis {};
+    Animations::ViewTimelineInset view_inset {};
+    Utf16FlyString name {};
 
     bool operator==(AnimationTimelineSource const&) const = default;
 };
@@ -53,6 +51,10 @@ struct AnimationProperties {
     AnimationComposition composition;
     Utf16FlyString name;
     AnimationTimelineSource timeline;
+    Animations::AnimationAttachmentRange range;
+    // The computed `animation-timing-function` the easing was parsed out of, which the style engine
+    // compares the next computation's against.
+    RustStyleValueHandle timing_function_value;
 };
 
 }

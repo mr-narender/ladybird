@@ -76,7 +76,7 @@ CORE_API ErrorOr<sig_t> signal(int signal, sig_t handler);
 CORE_API ErrorOr<sighandler_t> signal(int signal, sighandler_t handler);
 #    endif
 CORE_API ErrorOr<struct stat> fstat(int fd);
-ErrorOr<struct stat> fstatat(int fd, StringView path, int flags);
+CORE_API ErrorOr<struct stat> fstatat(int fd, StringView path, int flags);
 ErrorOr<int> openat(int fd, StringView path, int options, mode_t mode = 0);
 CORE_API ErrorOr<int> fcntl(int fd, int command, ...);
 ErrorOr<void*> mmap(void* address, size_t, int protection, int flags, int fd, off_t, size_t alignment = 0, StringView name = {});
@@ -105,6 +105,7 @@ CORE_API ErrorOr<void> rmdir(StringView path);
 CORE_API ErrorOr<int> mkstemp(Span<char> pattern);
 CORE_API ErrorOr<void> fchmod(int fd, mode_t mode);
 CORE_API ErrorOr<void> rename(StringView old_path, StringView new_path);
+CORE_API ErrorOr<void> renameat(int old_directory_fd, StringView old_path, int new_directory_fd, StringView new_path);
 CORE_API ErrorOr<void> unlink(StringView path);
 CORE_API ErrorOr<void> utimensat(int fd, StringView path, struct timespec const times[2], int flag);
 CORE_API ErrorOr<void> access(StringView pathname, int mode, int flags = 0);
@@ -146,7 +147,18 @@ CORE_API ErrorOr<void> map_shared_memory_fixed(void* address, size_t size, int f
 
 CORE_API ErrorOr<void> close(int fd);
 CORE_API ErrorOr<int> dup(int source_fd);
-CORE_API ErrorOr<Array<int, 2>> pipe2(int flags);
+// Whether a pipe's read end is read by this process's own code, or by another process's, such as a child that is given
+// it as its standard input. On Windows, a Notifier can only watch a read end that is read internally, and only one that
+// is read externally can be read by code that does not use overlapped I/O.
+enum class PipeReadEnd : u8 {
+    ReadInternally,
+    ReadExternally,
+};
+CORE_API ErrorOr<Array<int, 2>> pipe2(int flags, PipeReadEnd = PipeReadEnd::ReadInternally);
+#if defined(AK_OS_WINDOWS)
+// Two connected ends of a named pipe, each read and written, as socketpair() gives elsewhere.
+CORE_API ErrorOr<Array<int, 2>> duplex_pipe();
+#endif
 CORE_API ErrorOr<void> set_close_on_exec(int fd, bool enabled);
 CORE_API bool is_socket(int fd);
 
@@ -159,7 +171,7 @@ ErrorOr<void> connect(int sockfd, struct sockaddr const*, socklen_t);
 CORE_API ErrorOr<size_t> send(int sockfd, ReadonlyBytes, int flags);
 ErrorOr<size_t> sendmsg(int sockfd, const struct msghdr*, int flags);
 ErrorOr<size_t> sendto(int sockfd, ReadonlyBytes, int flags, struct sockaddr const*, socklen_t);
-ErrorOr<size_t> recv(int sockfd, Bytes, int flags);
+CORE_API ErrorOr<size_t> recv(int sockfd, Bytes, int flags);
 ErrorOr<size_t> recvmsg(int sockfd, struct msghdr*, int flags);
 ErrorOr<size_t> recvfrom(int sockfd, Bytes, int flags, struct sockaddr*, socklen_t*);
 ErrorOr<void> getsockopt(int sockfd, int level, int option, void* value, socklen_t* value_size);

@@ -25,11 +25,8 @@ public:
 
         u32 status_code { 0 };
         ByteString reason_phrase;
-        NonnullRefPtr<HeaderList> request_headers;
         NonnullRefPtr<HeaderList> response_headers;
         Core::ImmutableBytes response_body;
-        Optional<Core::ImmutableBytes> javascript_bytecode_cache;
-        Optional<u64> javascript_bytecode_cache_vary_key;
 
         UnixDateTime request_time;
         UnixDateTime response_time;
@@ -39,11 +36,17 @@ public:
 
     Optional<Entry const&> open_entry(URL::URL const&, StringView method, HeaderList const& request_headers, CacheMode);
 
-    void create_entry(URL::URL const&, StringView method, HeaderList const& request_headers, UnixDateTime request_time, u32 status_code, ByteString reason_phrase, HeaderList const& response_headers, Optional<Core::ImmutableBytes> javascript_bytecode_cache = {}, Optional<u64> javascript_bytecode_cache_vary_key = {});
+    void create_entry(URL::URL const&, StringView method, HeaderList const& request_headers, UnixDateTime request_time, u32 status_code, ByteString reason_phrase, HeaderList const& response_headers);
     void finalize_entry(URL::URL const&, StringView method, HeaderList const& request_headers, u32 status_code, HeaderList const& response_headers, Core::ImmutableBytes response_body);
-    void update_javascript_bytecode_cache(URL::URL const&, StringView method, HeaderList const& request_headers, u64 vary_key, Core::ImmutableBytes javascript_bytecode_cache);
+    // Drops the oldest pending entry with the request's cache and vary keys, for a response whose body will not be
+    // finalized.
+    void abandon_entry(URL::URL const&, StringView method, HeaderList const& request_headers, HeaderList const& response_headers);
+
+    void invalidate(URL::URL const&);
 
 private:
+    Optional<Entry> take_pending_entry(u64 cache_key, Optional<u64> vary_key);
+
     HashMap<u64, Vector<Entry>, IdentityHashTraits<u64>> m_pending_entries;
     HashMap<u64, Vector<Entry>, IdentityHashTraits<u64>> m_complete_entries;
 };

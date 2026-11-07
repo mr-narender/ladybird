@@ -11,6 +11,7 @@
 #include <AK/Debug.h>
 #include <AK/Error.h>
 #include <AK/Function.h>
+#include <AK/NumericLimits.h>
 #include <AK/Try.h>
 #include <AK/Vector.h>
 #include <LibGfx/ImageFormats/BMPLoader.h>
@@ -565,6 +566,10 @@ static bool decode_bmp_core_dib(BMPLoadingContext& context, InputStreamer& strea
         dbgln("BMP has a negative width: {}", core.width);
         return false;
     }
+    if (core.height == NumericLimits<i32>::min()) {
+        dbgln("BMP has an invalid height: {}", core.height);
+        return false;
+    }
 
     auto color_planes = streamer.read_u16();
     if (color_planes != 1) {
@@ -613,6 +618,10 @@ static bool decode_bmp_osv2_dib(BMPLoadingContext& context, InputStreamer& strea
 
     if (core.width < 0) {
         dbgln("BMP has a negative width: {}", core.width);
+        return false;
+    }
+    if (core.height == NumericLimits<i32>::min()) {
+        dbgln("BMP has an invalid height: {}", core.height);
         return false;
     }
 
@@ -1309,7 +1318,7 @@ static ErrorOr<void> decode_bmp_pixel_data(BMPLoadingContext& context)
     u32 const absolute_height = static_cast<u32>(abs(static_cast<i64>(context.dib.core.height)));
     u32 const height = !context.is_included_in_ico ? absolute_height : (absolute_height / 2);
 
-    context.bitmap = TRY(Bitmap::create(format, Gfx::AlphaType::Unpremultiplied, { static_cast<int>(width), static_cast<int>(height) }));
+    context.bitmap = TRY(Bitmap::create_shareable(format, Gfx::AlphaType::Unpremultiplied, { static_cast<int>(width), static_cast<int>(height) }));
 
     ByteBuffer rle_buffer;
     ReadonlyBytes bytes { context.file_bytes + context.data_offset, context.file_size - context.data_offset };

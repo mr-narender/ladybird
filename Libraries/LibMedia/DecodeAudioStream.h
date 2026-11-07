@@ -9,10 +9,11 @@
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/Vector.h>
-#include <LibMedia/Audio/SampleSpecification.h>
-#include <LibMedia/DecoderError.h>
+#include <LibAudio/SampleSpecification.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
+#include <LibMediaCodecs/DecoderError.h>
+#include <LibMediaCodecs/Limits.h>
 
 namespace Media {
 
@@ -22,6 +23,6 @@ struct DecodedAudioData {
     Vector<Vector<float>> channels;
 };
 
-MEDIA_API DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaStream> const&, Optional<u32> output_sample_rate = {});
+MEDIA_API DecoderErrorOr<DecodedAudioData> decode_entire_audio_stream(NonnullRefPtr<MediaStream> const&, Optional<u32> output_sample_rate = {}, size_t maximum_decoded_byte_count = MAX_DECODED_AUDIO_BYTE_COUNT);
 
 }

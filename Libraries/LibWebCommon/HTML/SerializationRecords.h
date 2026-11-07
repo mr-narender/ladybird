@@ -15,7 +15,6 @@
 #include <AK/RefPtr.h>
 #include <AK/Vector.h>
 #include <LibCore/AnonymousBuffer.h>
-#include <LibCrypto/Forward.h>
 #include <LibIPC/Encoder.h>
 #include <LibIPC/Forward.h>
 #include <LibIPC/Message.h>
@@ -115,6 +114,8 @@ WEBCOMMON_API StorageSerializationRecord storage_serialization_record_for_undefi
 WEBCOMMON_API StorageSerializationRecord storage_serialization_record_for_null();
 
 class WEBCOMMON_API TransferDataEncoder {
+    AK_ALLOC_WITH_KMALLOC;
+
 public:
     explicit TransferDataEncoder();
     explicit TransferDataEncoder(IPC::MessageBuffer&&);
@@ -126,10 +127,6 @@ public:
         return m_encoder.encode(value);
     }
 
-    void append(IPCSerializationRecord&&);
-    void extend(Vector<TransferDataEncoder>);
-    void encode_unsigned_big_integer(::Crypto::UnsignedBigInteger const&);
-
     IPC::MessageBuffer const& buffer() const;
     IPC::MessageBuffer take_buffer() const;
 
@@ -140,6 +137,8 @@ private:
 };
 
 struct SerializedTransferRecord {
+    AK_ALLOC_WITH_KMALLOC;
+
     IPCSerializationRecord serialized;
     Vector<TransferDataEncoder> transfer_data_holders;
     // AD-HOC: Cross-process shared memory backing serialized SharedArrayBuffers — referenced by index from the main

@@ -47,6 +47,12 @@ static int memfd_create(char const* name, unsigned int flags)
 extern char** environ;
 #endif
 
+#if defined(AK_OS_MACOS)
+#    include <LibCore/MachPort.h>
+#    include <mach/mach.h>
+#    include <mach/mach_vm.h>
+#endif
+
 #if defined(AK_OS_BSD_GENERIC) && !defined(AK_OS_SOLARIS)
 #    include <sys/sysctl.h>
 #endif
@@ -156,14 +162,27 @@ static int mmap_anonymous_fd([[maybe_unused]] MemoryTag tag)
 
 ErrorOr<void*> reserve_address_space(size_t size, MemoryTag tag)
 {
+#ifdef AK_OS_MACOS
+    // On macOS, reserving address space that may later become accessible costs time in proportion to its size, while
+    // a reservation that can never become accessible costs nothing. Committing memory maps over the reservation, which
+    // replaces its protections, so the reservation itself never needs to become accessible.
+    int flags = VM_FLAGS_ANYWHERE;
+    if (auto tag_flags = mmap_anonymous_fd(tag); tag_flags != -1)
+        flags |= tag_flags;
+    mach_vm_address_t address = 0;
+    if (auto result = mach_vm_map(mach_task_self(), &address, size, 0, flags, MEMORY_OBJECT_NULL, 0, false, VM_PROT_NONE, VM_PROT_NONE, VM_INHERIT_DEFAULT); result != KERN_SUCCESS)
+        return mach_error_to_error(result);
+    return reinterpret_cast<void*>(address);
+#else
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-#ifdef MAP_NORESERVE
+#    ifdef MAP_NORESERVE
     flags |= MAP_NORESERVE;
-#endif
+#    endif
     auto* ptr = ::mmap(nullptr, size, PROT_NONE, flags, mmap_anonymous_fd(tag), 0);
     if (ptr == MAP_FAILED)
         return Error::from_syscall("mmap"sv, errno);
     return ptr;
+#endif
 }
 
 ErrorOr<void*> allocate_anonymous_memory(size_t size, MemoryTag tag)
@@ -273,10 +292,10 @@ ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int opti
         return Error::from_errno(saved_errno);
     }
 
-    // FIXME: Sealing is enforced only on Linux, via the memfd F_SEAL_* seals below. On macOS, the flag is
-    //        accepted, but the fd stays resizable (ftruncate remains possible). SAB backing relies on this seal to stop
-    //        a transferred fd from being shrunk under a peer. POSIX shared memory has no equivalent seal — so a macOS
-    //        equivalent would require implementing backing of the block with a Mach memory entry instead of an shm fd.
+    // FIXME: Sealing is enforced only on Linux, via the memfd F_SEAL_* seals below. macOS needs no seal, because it
+    //        allows only one successful ftruncate() per POSIX shared memory object. On other platforms, the flag is
+    //        accepted, but the fd stays resizable. SAB backing relies on this seal to stop a transferred fd from being
+    //        shrunk under a peer.
 #if defined(AK_OS_LINUX)
     // Seal a fixed-size shared fd against resizing: A peer process holding the transferred fd must not be able to
     // ftruncate it smaller, and SIGBUS siblings that touch the now-missing pages. Writes stay allowed on purpose (no
@@ -355,7 +374,10 @@ ErrorOr<struct stat> lstat(StringView path)
 
 ErrorOr<size_t> read(int fd, Bytes buffer)
 {
-    auto rc = ::read(fd, buffer.data(), buffer.size());
+    ssize_t rc;
+    do {
+        rc = ::read(fd, buffer.data(), buffer.size());
+    } while (rc < 0 && errno == EINTR);
     if (rc < 0)
         return Error::from_syscall("read"sv, errno);
     return rc;
@@ -363,7 +385,10 @@ ErrorOr<size_t> read(int fd, Bytes buffer)
 
 ErrorOr<size_t> write(int fd, ReadonlyBytes buffer)
 {
-    auto rc = ::write(fd, buffer.data(), buffer.size());
+    ssize_t rc;
+    do {
+        rc = ::write(fd, buffer.data(), buffer.size());
+    } while (rc < 0 && errno == EINTR);
     if (rc < 0)
         return Error::from_syscall("write"sv, errno);
     return rc;
@@ -583,6 +608,15 @@ ErrorOr<void> rename(StringView old_path, StringView new_path)
     return {};
 }
 
+ErrorOr<void> renameat(int old_directory_fd, StringView old_path, int new_directory_fd, StringView new_path)
+{
+    ByteString old_path_string = old_path;
+    ByteString new_path_string = new_path;
+    if (::renameat(old_directory_fd, old_path_string.characters(), new_directory_fd, new_path_string.characters()) < 0)
+        return Error::from_syscall("renameat"sv, errno);
+    return {};
+}
+
 ErrorOr<void> unlink(StringView path)
 {
     ByteString path_string = path;
@@ -747,7 +781,7 @@ ErrorOr<void> socketpair(int domain, int type, int protocol, int sv[2])
     return {};
 }
 
-ErrorOr<Array<int, 2>> pipe2(int flags)
+ErrorOr<Array<int, 2>> pipe2(int flags, PipeReadEnd)
 {
     Array<int, 2> fds;
 
@@ -755,6 +789,14 @@ ErrorOr<Array<int, 2>> pipe2(int flags)
     if (::pipe2(fds.data(), flags) < 0)
         return Error::from_syscall("pipe2"sv, errno);
 #else
+#    if defined(AK_OS_MACOS) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+    if (__builtin_available(macOS 27.0, *)) {
+        if (::pipe2(fds.data(), flags) < 0)
+            return Error::from_syscall("pipe2"sv, errno);
+        return fds;
+    }
+#    endif
+
     if (::pipe(fds.data()) < 0)
         return Error::from_syscall("pipe2"sv, errno);
 
@@ -825,7 +867,9 @@ ErrorOr<int> poll(Span<struct pollfd> poll_fds, int timeout)
 
 unsigned hardware_concurrency()
 {
-    return sysconf(_SC_NPROCESSORS_ONLN);
+    // A count the system can't report is one processor, rather than the failure's -1 cast to a huge count.
+    auto count = sysconf(_SC_NPROCESSORS_ONLN);
+    return count < 1 ? 1 : count;
 }
 
 u64 physical_memory_bytes()

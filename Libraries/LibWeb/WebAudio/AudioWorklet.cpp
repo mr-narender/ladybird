@@ -29,7 +29,7 @@ GC::Ref<AudioWorklet> AudioWorklet::create(GC::Ref<BaseAudioContext> context)
 AudioWorklet::AudioWorklet(GC::Ref<BaseAudioContext> context)
     : HTML::Worklet(context->relevant_global_event_target())
     , m_context(context)
-    , m_port(HTML::MessagePort::create(context->relevant_global_event_target()))
+    , m_port(HTML::MessagePort::create(HTML::relevant_realm(context->relevant_global_object())))
 {
 }
 
@@ -58,6 +58,7 @@ GC::Ref<HTML::WorkletGlobalScope> AudioWorklet::create_global_scope()
     GC::Ptr<AudioWorkletGlobalScope> scope;
     auto realm_execution_context = Bindings::create_a_new_javascript_realm(
         Bindings::main_thread_vm(),
+        outside_settings.agent_cluster_cross_origin_isolation_mode(),
         [&](JS::Realm& realm) -> GC::Ref<JS::Object> {
             scope = AudioWorkletGlobalScope::create(*this, m_context->sample_rate());
             return Bindings::create_global_object_wrapper(realm, GC::Ref { *scope });
@@ -71,7 +72,7 @@ GC::Ref<HTML::WorkletGlobalScope> AudioWorklet::create_global_scope()
     // Bindings initialization requires the realm's [[HostDefined]] slot.
     scope->initialize_web_interfaces_impl();
 
-    auto scope_port = HTML::MessagePort::create(*scope);
+    auto scope_port = HTML::MessagePort::create(scope->realm());
     m_port->entangle_with(*scope_port);
     m_port->enable();
     scope->set_port(scope_port);

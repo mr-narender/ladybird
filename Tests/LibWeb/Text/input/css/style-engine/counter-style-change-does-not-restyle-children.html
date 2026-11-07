@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style id="sheet">
+    @counter-style stars { system: cyclic; symbols: '*'; }
+    #list { display: list-item; list-style: stars inside; width: max-content; }
+    #generated { width: max-content; }
+    #generated::before { content: counter(c, stars); }
+</style>
+<div id="list"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+<div id="generated"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+<script>
+    // A counter style reaches the boxes built with it: the marker and the generated content rebuild.
+    // Their elements' children resolve no counter style, so the rebuild restyles none of them again.
+    test(() => {
+        const list = document.getElementById("list");
+        const generated = document.getElementById("generated");
+        internals.updateStyle();
+        const listWidth = list.getBoundingClientRect().width;
+        const generatedWidth = generated.getBoundingClientRect().width;
+        internals.resetStyleCounters();
+        document.getElementById("sheet").sheet.cssRules[0].symbols = "'++++'";
+        internals.updateStyle();
+        const markerRebuilt = list.getBoundingClientRect().width > listWidth;
+        const generatedRebuilt = generated.getBoundingClientRect().width > generatedWidth;
+        const counters = internals.styleCounters();
+        const elements = document.getElementsByTagName("*").length;
+        println(`elements: ${elements}`);
+        // FIXME: The change should restyle at most the two elements resolving the counter style, and none of
+        //        their children (styled <= 2), but the style engine also restyles the children whose records name
+        //        the counter-style registry through the list-style-type they inherit.
+        println(`styled: ${counters.styledElements}, full passes: ${counters.fullPasses}`);
+        println(`rebuilding the boxes restyles nothing again: ${counters.passes === 1}`);
+        println(`marker rebuilt: ${markerRebuilt}`);
+        println(`generated content rebuilt: ${generatedRebuilt}`);
+    });
+</script>

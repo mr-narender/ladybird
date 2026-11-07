@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibURL/Site.h>
 #include <LibWebView/CanonicalDocument.h>
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalWindow.h>
@@ -15,9 +16,10 @@ bool CanonicalEnvironmentSettingsObject::may_use_cookies_of(URL::URL const& url)
     return !origin().is_opaque() && url.origin().is_same_origin(origin());
 }
 
-CanonicalWindowEnvironmentSettingsObject::CanonicalWindowEnvironmentSettingsObject(CanonicalWindow& window, Web::HTML::EnvironmentId id)
+CanonicalWindowEnvironmentSettingsObject::CanonicalWindowEnvironmentSettingsObject(CanonicalWindow& window, Web::HTML::EnvironmentId id, URL::URL top_level_creation_url)
     : CanonicalEnvironmentSettingsObject(move(id))
     , m_window(window)
+    , m_top_level_creation_url(move(top_level_creation_url))
 {
 }
 
@@ -28,10 +30,27 @@ URL::Origin const& CanonicalWindowEnvironmentSettingsObject::origin() const
     return m_window.associated_document().origin();
 }
 
-CanonicalWorkerEnvironmentSettingsObject::CanonicalWorkerEnvironmentSettingsObject(URL::Origin origin, Web::HTML::EnvironmentId id)
+Optional<URL::Origin> CanonicalWindowEnvironmentSettingsObject::top_level_origin() const
+{
+    // NB: The top-level origin of a window's settings object is that of the top-level document of its associated
+    //     Document's browsing context.
+    return m_window.associated_document().top_level_origin();
+}
+
+CanonicalWorkerEnvironmentSettingsObject::CanonicalWorkerEnvironmentSettingsObject(URL::Origin origin, Optional<URL::Origin> top_level_origin, bool has_cross_site_ancestor, Web::HTML::EnvironmentId id)
     : CanonicalEnvironmentSettingsObject(move(id))
     , m_origin(move(origin))
+    , m_top_level_origin(move(top_level_origin))
+    , m_has_cross_site_ancestor(has_cross_site_ancestor)
 {
+}
+
+Optional<Utf16String> network_isolation_top_level_site(CanonicalEnvironmentSettingsObject const& environment)
+{
+    auto top_level_origin = environment.top_level_origin();
+    if (!top_level_origin.has_value())
+        return {};
+    return URL::Site::serialize_for_partitioning(*top_level_origin);
 }
 
 // https://storage.spec.whatwg.org/#obtain-a-storage-key-for-non-storage-purposes
@@ -49,18 +68,8 @@ Optional<Web::StorageAPI::StorageKey> obtain_a_storage_key(CanonicalEnvironmentS
     // 1. Let key be the result of running obtain a storage key for non-storage purposes with environment.
     auto key = obtain_a_storage_key_for_non_storage_purposes(environment);
 
-    // AD-HOC: file:// URLs are opaque, but other browsers support storage on file:// URLs.
-    if (key.origin.is_opaque_file_origin())
-        key.origin = URL::Origin { "file"_string, String {}, {} };
-
-    // 2. If key’s origin is an opaque origin, then return failure.
-    if (key.origin.is_opaque())
-        return {};
-
-    // FIXME: 3. If the user has disabled storage, then return failure.
-
-    // 4. Return key.
-    return key;
+    // 2-4. The rest is the same for every origin; see the overload taking one.
+    return Web::StorageAPI::obtain_a_storage_key(key.origin);
 }
 
 }

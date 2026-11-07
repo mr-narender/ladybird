@@ -67,6 +67,9 @@ public:
 
     bool has_visual_animations() const;
     bool has_active_visual_animation_at(i64 monotonic_time_ns) const;
+    // Whether the point lies in the bounds of a node that a transform animation running at the time moves, through the
+    // values this tree holds: those of a sample at the time, where a frame shows it.
+    bool running_transform_animation_covers_point(i64 monotonic_time_ns, Gfx::FloatPoint screen_point, ScrollStateSnapshot const&) const;
     VisualAnimationSummary visual_animation_summary() const;
     // One flag per spatial node: whether a transform animation moves the node or an ancestor.
     Vector<bool> spatial_nodes_in_subtrees_of_transform_animations() const;
@@ -80,10 +83,9 @@ public:
     AccumulatedVisualContextTree with_visual_viewport_transform(TransformWithOrigin const&) const;
     // A copy whose nodes carry the values the animations take at the time.
     AccumulatedVisualContextTree with_visual_animation_samples(i64 monotonic_time_ns) const;
-    Optional<float> effects_opacity(EffectNodeIndex) const;
     // The sampled background color of a recorded fill's animation effect.
     Optional<Gfx::Color> sampled_background_color(EffectNodeIndex) const;
-    Vector<bool> spatial_nodes_in_subtrees_of(ReadonlySpan<SpatialNodeIndex> roots) const;
+    bool can_snap_composited_context_origin(SpatialNodeIndex) const;
 
     Optional<Gfx::FloatPoint> transform_point_for_hit_test(ContextRef, Gfx::FloatPoint, ScrollStateSnapshot const&, ClipBehavior = ClipBehavior::Respect) const;
     Gfx::FloatPoint inverse_transform_point(SpatialNodeIndex, Gfx::FloatPoint) const;
@@ -92,9 +94,7 @@ public:
     Gfx::FloatPoint cumulative_scroll_chain_offset(SpatialNodeIndex, ScrollStateSnapshot const&) const;
     Gfx::FloatMatrix4x4 accumulated_matrix(SpatialNodeIndex, ScrollStateSnapshot const&, IncludeVisualViewportTransform) const;
 
-    bool effect_is_isolated_by_layer(EffectNodeIndex) const;
-    bool has_unisolated_destination_reading_effect() const;
-    void for_each_effects_filter_bytes(Function<void(ReadonlyBytes)> const&) const;
+    void for_each_effects_filter_image_frame_id(Function<void(u64)> const&) const;
 
 private:
     explicit AccumulatedVisualContextTree(void const* retained_tree);

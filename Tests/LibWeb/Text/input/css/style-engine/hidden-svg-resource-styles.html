@@ -16,8 +16,10 @@
 test(() => {
     const resources = ["inheritance-parent", "filter", "flood", "gradient", "stop"].map(id => document.getElementById(id));
     internals.updateStyle();
+    const beforeHiding = internals.getStyleInvalidationCounters();
     ancestor.style.display = "none";
     internals.updateStyle();
+    const afterHiding = internals.getStyleInvalidationCounters();
     for (const resource of resources)
         println(`${resource.id} has style after hiding: ${internals.styleRecordIdentity(resource) !== 0}`);
     println(`ordinary hidden style is cleared: ${internals.styleRecordIdentity(ordinary) === 0}`);

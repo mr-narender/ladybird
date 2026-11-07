@@ -9,9 +9,9 @@
 #include <AK/ByteBuffer.h>
 #include <AK/Math.h>
 #include <AK/Vector.h>
+#include <LibAudio/SpscAudioFrameRing.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/TypedArray.h>
-#include <LibMedia/Audio/SpscAudioFrameRing.h>
 #include <LibWeb/WebAudio/AnalyserNode.h>
 #include <LibWeb/WebAudio/BaseAudioContext.h>
 #include <LibWeb/WebAudio/Rendering/AnalyserRenderNode.h>
@@ -54,7 +54,7 @@ WebIDL::ExceptionOr<GC::Ref<AnalyserNode>> AnalyserNode::create(GC::Ref<BaseAudi
     TRY(node->initialize_audio_node_options(options, default_options));
 
     node->m_history.resize(MAX_FFT_SIZE);
-    node->m_time_domain_ring = adopt_ref(*new Media::SpscAudioFrameRing(MAX_FFT_SIZE, 1));
+    node->m_time_domain_ring = adopt_ref(*new Audio::SpscAudioFrameRing(MAX_FFT_SIZE, 1));
     node->queue_render_node_creation(make<Rendering::AnalyserRenderNode>(node->node_id(), BaseAudioContext::render_quantum_size(), *node->m_time_domain_ring));
 
     return node;
@@ -111,7 +111,7 @@ Vector<f32> AnalyserNode::apply_a_blackman_window(Vector<f32> const& x) const
     unsigned long const N = m_fft_size;
 
     auto w = [&](unsigned long n) {
-        return a0 - a1 * cos(2 * AK::Pi<f32> * (f32)n / (f32)N) + a2 * cos(4 * AK::Pi<f32> * (f32)n / (f32)N);
+        return a0 - a1 * AK::cos(2 * AK::Pi<f32> * (f32)n / (f32)N) + a2 * AK::cos(4 * AK::Pi<f32> * (f32)n / (f32)N);
     };
 
     Vector<f32> x_hat;

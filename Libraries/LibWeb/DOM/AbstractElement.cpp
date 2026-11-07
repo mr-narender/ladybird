@@ -16,22 +16,23 @@
 
 namespace Web::DOM {
 
-AbstractElement::AbstractElement(GC::Ref<Element> element, Optional<CSS::PseudoElement> pseudo_element)
+AbstractElement::AbstractElement(GC::Ref<Element> element, Optional<CSS::PseudoElement> pseudo_element, Utf16FlyString highlight_name)
     : m_element(element)
     , m_pseudo_element(move(pseudo_element))
+    , m_highlight_name(move(highlight_name))
 {
 }
 
-AbstractElement::AbstractElement(Element const& element, Optional<CSS::PseudoElement> pseudo_element)
+AbstractElement::AbstractElement(Element const& element, Optional<CSS::PseudoElement> pseudo_element, Utf16FlyString highlight_name)
     : m_element(const_cast<Element&>(element))
     , m_pseudo_element(move(pseudo_element))
+    , m_highlight_name(move(highlight_name))
 {
 }
 
 void AbstractElement::visit(GC::Cell::Visitor& visitor) const
 {
     visitor.visit(m_element);
-    visitor.visit(m_inheritance_override);
 }
 
 Document& AbstractElement::document() const
@@ -75,18 +76,18 @@ AbstractElement::TreeCountingFunctionResolutionContext AbstractElement::tree_cou
     };
 }
 
-Layout::NodeWithStyle* AbstractElement::layout_node()
+Layout::NodeWithStyle* AbstractElement::layout_node(Layout::BegunRead const& read)
 {
     if (m_pseudo_element.has_value())
-        return m_element->pseudo_element_layout_node(*m_pseudo_element);
-    return m_element->layout_node();
+        return m_element->pseudo_element_layout_node(read, *m_pseudo_element);
+    return m_element->layout_node(read);
 }
 
-Layout::NodeWithStyle* AbstractElement::unsafe_layout_node()
+Layout::NodeWithStyle* AbstractElement::unsafe_layout_node(Layout::BegunRead const& read)
 {
     if (m_pseudo_element.has_value())
-        return m_element->pseudo_element_unsafe_layout_node(*m_pseudo_element);
-    return m_element->unsafe_layout_node();
+        return m_element->pseudo_element_unsafe_layout_node(read, *m_pseudo_element);
+    return m_element->unsafe_layout_node(read);
 }
 
 GC::Ptr<Element const> AbstractElement::parent_element() const
@@ -105,59 +106,12 @@ Element* AbstractElement::flat_tree_parent_element() const
 
 Optional<AbstractElement> AbstractElement::element_to_inherit_style_from() const
 {
-    if (m_inheritance_override)
-        return AbstractElement { *m_inheritance_override };
-
     GC::Ptr<Element const> element = m_element->element_to_inherit_style_from(m_pseudo_element);
 
     if (!element)
         return OptionalNone {};
 
     return AbstractElement { const_cast<DOM::Element&>(*element) };
-}
-
-// https://drafts.csswg.org/css-pseudo-4/#highlight-cascade
-// When any supported property is not given a value by the cascade, or given a value of inherit or unset, its
-// specified value is determined by inheritance from the corresponding highlight pseudo-element of its originating
-// element's parent element.
-Optional<AbstractElement> AbstractElement::highlight_inheritance_parent() const
-{
-    if (!m_pseudo_element.has_value() || !CSS::is_highlight_pseudo_element(*m_pseudo_element))
-        return OptionalNone {};
-
-    // An ancestor without a record for this pseudo-element has no declarations for it, so the nearest record is
-    // what its own would have inherited anyway.
-    for (auto ancestor = m_element->element_to_inherit_style_from({}); ancestor; ancestor = ancestor->element_to_inherit_style_from({})) {
-        if (!!ancestor->style_record_identity(*m_pseudo_element))
-            return AbstractElement { *ancestor, m_pseudo_element };
-    }
-    return OptionalNone {};
-}
-
-Optional<AbstractElement> AbstractElement::walk_layout_tree(WalkMethod walk_method)
-{
-    // NB: Called during style recalculation.
-    Layout::Node* start_node = unsafe_layout_node();
-    if (!start_node)
-        return OptionalNone {};
-
-    auto* arena_handle = start_node->arena_handle();
-    auto slot = Layout::Node::slot_id(start_node);
-    while (true) {
-        slot = Layout::RustFFI::layout_arena_previous_dom_backed_or_generated_node(arena_handle, slot, walk_method == WalkMethod::PreviousSibling);
-        if (slot.index == Compositing::RustFFI::INVALID_NODE_SLOT_INDEX)
-            return OptionalNone {};
-
-        if (auto* previous_element = as_if<Element>(static_cast<Node*>(Layout::RustFFI::layout_arena_node_dom_node(arena_handle, slot))))
-            return AbstractElement { *previous_element };
-
-        auto* generated_node = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(arena_handle, slot));
-        if (generated_node && generated_node->is_generated_for_pseudo_element()) {
-            auto pseudo_element = generated_node->generated_for_pseudo_element();
-            if (pseudo_element.has_value() && CSS::is_tree_abiding_pseudo_element(*pseudo_element))
-                return AbstractElement { *generated_node->pseudo_element_generator(), pseudo_element };
-        }
-    }
 }
 
 GC::Ptr<Node> AbstractElement::root()
@@ -172,14 +126,6 @@ GC::Ptr<Node> AbstractElement::root()
     return m_element->root();
 }
 
-bool AbstractElement::is_before(AbstractElement const& other) const
-{
-    // NB: Called during style recalculation.
-    auto this_node = unsafe_layout_node();
-    auto other_node = other.unsafe_layout_node();
-    return this_node && other_node && this_node->is_before(*other_node);
-}
-
 CSS::ComputedStyleRecordView AbstractElement::computed_style() const
 {
     return m_element->computed_style(m_pseudo_element);
@@ -190,9 +136,14 @@ CSS::StyleRecordID AbstractElement::style_record_identity() const
     return m_element->style_record_identity(m_pseudo_element);
 }
 
-void const* AbstractElement::style_record_payloads() const
+CSS::InstalledStyle const& AbstractElement::installed_style() const
 {
-    return m_element->style_record_payloads(m_pseudo_element);
+    return m_element->installed_style(m_pseudo_element);
+}
+
+void const* AbstractElement::style_record_groups() const
+{
+    return m_element->style_record_groups(m_pseudo_element);
 }
 
 GC::Ptr<CSS::CSSStyleProperties const> AbstractElement::inline_style() const
@@ -221,9 +172,14 @@ void AbstractElement::set_custom_property_data(RefPtr<CSS::CustomPropertyData co
     m_element->set_custom_property_data(m_pseudo_element, move(data));
 }
 
-void AbstractElement::replace_custom_property_data(Badge<CSS::StyleComputer>, RefPtr<CSS::CustomPropertyData const> data)
+void AbstractElement::replace_custom_property_data(Badge<CSS::StyleComputer>, RefPtr<CSS::CustomPropertyData const> data, CSS::IsAnimationOverlay is_animation_overlay)
 {
-    m_element->replace_custom_property_data(m_pseudo_element, move(data));
+    m_element->replace_custom_property_data(m_pseudo_element, move(data), is_animation_overlay);
+}
+
+bool AbstractElement::custom_property_data_is_animation_overlay() const
+{
+    return m_element->custom_property_data_is_animation_overlay(m_pseudo_element);
 }
 
 RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(Utf16FlyString const& name) const
@@ -231,39 +187,9 @@ RefPtr<CSS::StyleValue const> AbstractElement::get_custom_property(Utf16FlyStrin
     auto data = custom_property_data();
     if (!data)
         return nullptr;
-    if (auto const* property = data->get(name))
+    if (auto property = data->get(name); property.has_value())
         return property->value;
     return nullptr;
-}
-
-bool AbstractElement::has_non_empty_counters_set() const
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_synthetic_pseudo_element(*m_pseudo_element)->has_non_empty_counters_set();
-    return m_element->has_non_empty_counters_set();
-}
-
-Optional<CSS::CountersSet const&> AbstractElement::counters_set() const
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_synthetic_pseudo_element(*m_pseudo_element)->counters_set();
-    return m_element->counters_set();
-}
-
-CSS::CountersSet& AbstractElement::ensure_counters_set()
-{
-    if (m_pseudo_element.has_value())
-        return m_element->get_synthetic_pseudo_element(*m_pseudo_element)->ensure_counters_set();
-    return m_element->ensure_counters_set();
-}
-
-void AbstractElement::set_counters_set(OwnPtr<CSS::CountersSet>&& counters_set)
-{
-    if (m_pseudo_element.has_value()) {
-        m_element->get_synthetic_pseudo_element(*m_pseudo_element)->set_counters_set(move(counters_set));
-    } else {
-        m_element->set_counters_set(move(counters_set));
-    }
 }
 
 Utf16String AbstractElement::debug_description() const
@@ -273,6 +199,11 @@ Utf16String AbstractElement::debug_description() const
         builder.append(m_element->debug_description());
         builder.append_ascii("::"sv);
         builder.append_ascii(CSS::pseudo_element_name(*m_pseudo_element));
+        if (!m_highlight_name.is_empty()) {
+            builder.append_code_unit('(');
+            builder.append(m_highlight_name);
+            builder.append_code_unit(')');
+        }
         return builder.to_string();
     }
     return m_element->debug_description();

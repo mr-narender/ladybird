@@ -1,6 +1,8 @@
 const configFilter = document.querySelector("#config-filter");
 const configList = document.querySelector("#config-list");
 
+const CONFIG_VARIABLES = new Map();
+
 function sendConfigVariableValue(variable, value) {
     ladybird.sendMessage("setConfigVariable", {
         name: variable.name,
@@ -63,17 +65,12 @@ function createControl(variable) {
 function createRow(variable) {
     const row = document.createElement("div");
     row.classList.add("card-group");
-    row.classList.add("card-separator");
     row.classList.add("config-row");
     row.classList.add("inline-container");
-    row.dataset.filterText = `${variable.name} ${variable.title} ${variable.description}`.toLowerCase();
+    row.dataset.filterText = `${variable.title} ${variable.description}`.toLowerCase();
 
     const title = document.createElement("p");
     title.textContent = variable.title;
-
-    const name = document.createElement("p");
-    name.classList.add("config-name");
-    name.textContent = variable.name;
 
     const description = document.createElement("p");
     description.classList.add("description");
@@ -81,7 +78,7 @@ function createRow(variable) {
 
     const label = document.createElement("label");
     label.htmlFor = variable.name;
-    label.append(title, name, description);
+    label.append(title, description);
 
     row.append(label, createControl(variable));
     return row;
@@ -96,11 +93,31 @@ function applyFilter() {
 }
 
 function loadConfigVariables(settings) {
-    const configVariables = settings.configVariableDefinitions || [];
-    configList.innerHTML = "";
+    if (!Object.hasOwn(settings, "configVariableDefinitions")) {
+        return;
+    }
 
+    const configVariables = settings.configVariableDefinitions || [];
     configVariables.forEach(variable => {
-        configList.append(createRow(variable));
+        // This one has its own switch on the Feedback tab.
+        if (variable.name === "ui.toolbar.show_feedback_button") {
+            return;
+        }
+
+        const previous = CONFIG_VARIABLES.get(variable.name);
+        if (previous && JSON.stringify(previous.value) === JSON.stringify(variable.value)) {
+            return;
+        }
+
+        CONFIG_VARIABLES.set(variable.name, variable);
+
+        const row = createRow(variable);
+        const existing = document.getElementById(variable.name)?.closest(".config-row");
+        if (existing) {
+            existing.replaceWith(row);
+        } else {
+            configList.append(row);
+        }
     });
 
     applyFilter();
@@ -111,17 +128,5 @@ configFilter.addEventListener("input", applyFilter);
 document.addEventListener("WebUIMessage", event => {
     if (event.detail.name === "loadSettings") {
         loadConfigVariables(event.detail.data);
-    }
-});
-
-const crashReportsStatus = document.querySelector("#crash-reports-status");
-document.querySelector("#open-crash-reports").addEventListener("click", () => {
-    crashReportsStatus.hidden = true;
-    ladybird.sendMessage("showCrashReports");
-});
-document.addEventListener("WebUIMessage", event => {
-    if (event.detail.name === "crashReportsStatus") {
-        crashReportsStatus.textContent = event.detail.data;
-        crashReportsStatus.hidden = !event.detail.data;
     }
 });

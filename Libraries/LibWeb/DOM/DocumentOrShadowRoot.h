@@ -19,6 +19,9 @@ namespace Web::DOM {
 template<typename T>
 concept DocumentOrShadowRoot = OneOf<T, Document, ShadowRoot>;
 
+Element const* calculate_element_from_point(Node&, double x, double y);
+GC::RootVector<GC::Ref<Element>> calculate_elements_from_point(Node&, double x, double y);
+
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-documentorshadowroot-activeelement
 template<DocumentOrShadowRoot T>
 GC::Ptr<Element> calculate_active_element(T& self)
@@ -60,11 +63,11 @@ GC::Ptr<Element> calculate_active_element(T& self)
 
 // https://drafts.csswg.org/web-animations-1/#dom-documentorshadowroot-getanimations
 template<DocumentOrShadowRoot T>
-WebIDL::ExceptionOr<Vector<GC::Ref<Animations::Animation>>> calculate_get_animations(T& self)
+WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animations::Animation>>> calculate_get_animations(T& self)
 {
     // Returns the set of relevant animations for a subtree for the document or shadow root on which this
     // method is called.
-    Vector<GC::Ref<Animations::Animation>> relevant_animations;
+    GC::RootVector<GC::Ref<Animations::Animation>> relevant_animations;
     TRY(self.template for_each_child_of_type_fallible<Element>([&](auto& child) -> WebIDL::ExceptionOr<IterationDecision> {
         relevant_animations.extend(TRY(child.get_animations_internal(
             Animations::Animatable::GetAnimationsSorted::No,

@@ -14,11 +14,11 @@
 
 namespace Web::SVG {
 
-static RustFFI::FfiSvgInput ffi_svg_input(Utf16View input)
+static RustFFI::FfiUtf16View ffi_svg_input(Utf16View input)
 {
     return {
-        .ascii = input.has_ascii_storage() ? reinterpret_cast<u8 const*>(input.ascii_span().data()) : nullptr,
-        .utf16 = input.has_ascii_storage() ? nullptr : reinterpret_cast<u16 const*>(input.utf16_span().data()),
+        .latin1 = input.has_latin1_storage() ? input.latin1_span().data() : nullptr,
+        .utf16 = input.has_latin1_storage() ? nullptr : reinterpret_cast<u16 const*>(input.utf16_span().data()),
         .length = input.length_in_code_units(),
     };
 }
@@ -36,6 +36,24 @@ float NumberPercentage::resolve_relative_to(float length) const
     if (!m_is_percentage)
         return m_value;
     return m_value * length;
+}
+
+Optional<float> parse_number(Utf16View input)
+{
+    float value;
+    if (!RustFFI::rust_parse_svg_number(ffi_svg_input(input), &value))
+        return {};
+    return value;
+}
+
+Optional<NumberOptionalNumber> parse_number_optional_number(Utf16View input)
+{
+    float first;
+    float second;
+    bool has_second;
+    if (!RustFFI::rust_parse_svg_number_optional_number(ffi_svg_input(input), &first, &second, &has_second))
+        return {};
+    return NumberOptionalNumber { first, has_second ? Optional<float> { second } : OptionalNone {} };
 }
 
 Optional<NumberPercentage> parse_number_percentage(Utf16View input)
@@ -156,6 +174,14 @@ Optional<ViewBox> parse_viewbox(Utf16View input)
     if (!RustFFI::rust_parse_svg_view_box(ffi_svg_input(input), &min_x, &min_y, &width, &height))
         return {};
     return ViewBox { min_x, min_y, width, height };
+}
+
+Optional<double> parse_clock_value_in_milliseconds(Utf16View input)
+{
+    double value;
+    if (!RustFFI::rust_parse_svg_clock_value_in_milliseconds(ffi_svg_input(input), &value))
+        return {};
+    return value;
 }
 
 }

@@ -12,6 +12,8 @@
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/Forward.h>
+#include <LibWebCommon/Page/CompositorContextId.h>
+#include <LibWebCommon/PixelUnits.h>
 
 namespace Web {
 
@@ -19,6 +21,7 @@ enum class AsyncScrollNodeKind : u8 {
     Viewport,
     Element,
     PseudoElement,
+    VisualViewport,
 };
 
 // Stable identity for reconciling compositor-side scroll offsets after the paint snapshot has been rebuilt.
@@ -30,13 +33,32 @@ struct AsyncScrollNodeStableID {
     bool operator==(AsyncScrollNodeStableID const&) const = default;
 };
 
+// Where the compositor has scrolled a scroll node to, in CSS pixels.
+struct CompositorScrollOffset {
+    AsyncScrollNodeStableID scroll_node;
+    CSSPixelPoint offset;
+
+    bool operator==(CompositorScrollOffset const&) const = default;
+};
+
 // The compositor drags the thumb of a scrollbar the display list paints, while the mouse events of that drag still
 // reach the main thread so that everything but the scrolling stays there.
 struct ScrollbarDraggedByCompositor {
+    // The context of the document the scroller is in, which may be nested in the one the event is dispatched to. Only
+    // the process that owns that context can tell which node the scroller's id names.
+    CompositorContextId context_id;
     AsyncScrollNodeStableID scroller_stable_node_id;
-    bool vertical { false };
 
     bool operator==(ScrollbarDraggedByCompositor const&) const = default;
+};
+
+// Whether an overlay scrollbar that the compositor fades has faded out, so that it takes no pointer input.
+struct OverlayScrollbarVisibility {
+    AsyncScrollNodeStableID scroller_stable_node_id;
+    bool vertical { false };
+    bool hidden { false };
+
+    bool operator==(OverlayScrollbarVisibility const&) const = default;
 };
 
 }
@@ -58,8 +80,18 @@ template<>
 WEBCOMMON_API ErrorOr<Web::AsyncScrollNodeStableID> decode(Decoder&);
 
 template<>
+WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::CompositorScrollOffset const&);
+template<>
+WEBCOMMON_API ErrorOr<Web::CompositorScrollOffset> decode(Decoder&);
+
+template<>
 WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::ScrollbarDraggedByCompositor const&);
 template<>
 WEBCOMMON_API ErrorOr<Web::ScrollbarDraggedByCompositor> decode(Decoder&);
+
+template<>
+WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::OverlayScrollbarVisibility const&);
+template<>
+WEBCOMMON_API ErrorOr<Web::OverlayScrollbarVisibility> decode(Decoder&);
 
 }

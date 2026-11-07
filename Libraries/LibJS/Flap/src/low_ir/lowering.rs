@@ -14,7 +14,7 @@ use crate::bytecode::{BytecodeFieldId, HandlerLayout as BytecodeHandlerLayout};
 use crate::frontend::layout::{KnownLayoutConstant, LayoutConstantCategory, LayoutConstants};
 use crate::hash::{HashMap, HashSet};
 use crate::intrinsic::{
-    AddressOperation, AggregateOperation, BranchOperation, BytecodeOperation, CallOperation, CheckedIntegerOperation,
+    AddressOperation, BranchOperation, BytecodeOperation, CallOperation, CheckedIntegerOperation,
     ClassificationOperation, ComparisonDomain, ComparisonRelation, ControlOperation, FieldWidth, FloatConversion,
     FloatingPointOperation, IntegerBinaryOperation, IntegerComparisonOperation, IntegerSignedness, Intrinsic,
     LowLevelOperation, MemoryOperation, OperandLoad, OperandOperation, OperandStore, ValueOperation,
@@ -1530,6 +1530,9 @@ fn select_branch(function: &FunctionUses<'_>, condition: ValueId) -> Option<Sele
                 ComparisonDomain::Value => return None,
             },
         ),
+        IntegerComparisonOperation::Float(comparison) => {
+            MachineOperation::Branch(BranchOperation::OrderedFloat(comparison))
+        }
         IntegerComparisonOperation::BitsSet => {
             MachineOperation::branch_bits(MemoryWidth::DoubleWord, TestCondition::Set)
         }
@@ -2069,11 +2072,7 @@ fn lower_edge_copies(
         let ty = copies[0].2.clone();
         let temporary = Operand::VirtualRegister(VirtualRegister::with_class(
             format!("ssa_edge_temporary_{}", *temporary_index),
-            if is_fpr(&ty) {
-                RegisterClass::FloatingPoint
-            } else {
-                RegisterClass::GeneralPurpose
-            },
+            ty.register_class().unwrap_or(RegisterClass::GeneralPurpose),
         ));
         *temporary_index += 1;
         output.push(copy_instruction(temporary.clone(), destination.clone(), &ty));
@@ -2133,6 +2132,19 @@ fn lower_memory_operation(
             return Err("'load_cell_ptr' requires one result and one address".to_string());
         };
         emit!(output; MachineOperation::load(MemoryWidth::DoubleWord, false) => [destination.clone(), address.clone()];);
+    } else if matches!(
+        operation,
+        MemoryOperation::LoadCompressedCellPointer | MemoryOperation::LoadNonnullCompressedCellPointer
+    ) {
+        let ([destination], [address]) = (results, inputs) else {
+            return Err("'load_compressed_cell_ptr' requires one result and one address".to_string());
+        };
+        let nullable = operation == MemoryOperation::LoadCompressedCellPointer;
+        emit!(output; MachineOperation::load(MemoryWidth::Word, false) => [destination.clone(), address.clone()];);
+        if !nullable {
+            emit!(output; MachineOperation::AssertNonzero => [destination.clone()];);
+        }
+        emit!(output; MachineOperation::DecompressCellPointer { nullable } => [destination.clone(), destination.clone()];);
     } else {
         output.push(machine_instruction(
             MachineOperation::Memory(operation),
@@ -2448,6 +2460,17 @@ fn lower_instruction(
             {
                 emit!(output; MachineOperation::Move(IntegerWidth::U64) => [destination.clone(), lhs.clone()];);
                 emit!(output; MachineOperation::IntegerBinary { operation: IntegerBinaryOperation::Binary(BinaryOperation::And), width: IntegerWidth::U16 } => [destination.clone(), rhs.clone()];);
+            } else if function.exact_u32_arithmetic
+                && !operation.supports_narrow_result()
+                && function.values[instruction.results[0].0].ty == Type::U32
+            {
+                let lhs = folded_32bit_operation_source(function, instruction.inputs[0])
+                    .map(|(_, source)| value_operand(function, source))
+                    .unwrap_or_else(|| Ok(lhs.clone()))?;
+                let rhs = folded_32bit_operation_source(function, instruction.inputs[1])
+                    .map(|(_, source)| value_operand(function, source))
+                    .unwrap_or_else(|| Ok(rhs.clone()))?;
+                emit!(output; narrow_integer_operation(machine_operation) => [destination.clone(), lhs, rhs];);
             } else if operation.supports_narrow_result()
                 && integer_result_can_stay_narrow(function, instruction.results[0])
             {
@@ -2490,6 +2513,68 @@ fn lower_instruction(
                 results.into_iter().chain(inputs).collect(),
             ));
         }
+        Operation::Intrinsic(Intrinsic::Atomic(operation))
+            if operation.kind() == crate::intrinsic::AtomicOperationKind::Fence =>
+        {
+            output.push(machine_instruction(MachineOperation::Atomic(*operation), Vec::new()));
+        }
+        Operation::Intrinsic(Intrinsic::Atomic(operation))
+            if operation.kind() == crate::intrinsic::AtomicOperationKind::Load =>
+        {
+            let [destination] = require_results(&results, operation.name())?;
+            let [memory] = require_inputs(&inputs, operation.name())?;
+            output.push(machine_instruction(
+                MachineOperation::Atomic(*operation),
+                vec![destination.clone(), memory.clone()],
+            ));
+        }
+        Operation::Intrinsic(Intrinsic::Atomic(operation)) => {
+            // The old value comes back in the register the operand was in.
+            let [destination] = require_results(&results, operation.name())?;
+            let (memory, operand, replacement) = match inputs.as_slice() {
+                [memory, operand] => (memory.clone(), operand.clone(), None),
+                [memory, operand, replacement] => (memory.clone(), operand.clone(), Some(replacement.clone())),
+                _ => return Err(format!("'{}' expects a memory operand and values", operation.name())),
+            };
+            emit!(output; MachineOperation::Move(IntegerWidth::U64) => [destination.clone(), operand];);
+            let mut operands = vec![destination.clone(), memory];
+            operands.extend(replacement);
+            output.push(machine_instruction(MachineOperation::Atomic(*operation), operands));
+        }
+        Operation::Intrinsic(Intrinsic::Vector(operation)) => {
+            if operation.kind() == crate::intrinsic::VectorOperationKind::Binary {
+                let [destination] = require_results(&results, operation.name())?;
+                let [lhs, rhs] = require_inputs(&inputs, operation.name())?;
+                emit!(output; MachineOperation::FloatMove => [destination.clone(), lhs.clone()];);
+                emit!(output; MachineOperation::Vector(*operation) => [destination.clone(), rhs.clone()];);
+            } else {
+                output.push(machine_instruction(
+                    MachineOperation::Vector(*operation),
+                    results.into_iter().chain(inputs).collect(),
+                ));
+            }
+        }
+        Operation::Intrinsic(Intrinsic::Numeric(operation)) => {
+            use crate::intrinsic::NumericOperation::*;
+            match operation {
+                RotateLeft32 | RotateRight32 | RotateLeft64 | RotateRight64 => {
+                    let [destination] = require_results(&results, operation.name())?;
+                    let [value, count] = require_inputs(&inputs, operation.name())?;
+                    emit!(output; MachineOperation::Move(IntegerWidth::U64) => [destination.clone(), value.clone()];);
+                    emit!(output; MachineOperation::Numeric(*operation) => [destination.clone(), count.clone()];);
+                }
+                AddFloat32 | SubtractFloat32 | MultiplyFloat32 | DivideFloat32 => {
+                    let [destination] = require_results(&results, operation.name())?;
+                    let [lhs, rhs] = require_inputs(&inputs, operation.name())?;
+                    emit!(output; MachineOperation::FloatMove => [destination.clone(), lhs.clone()];);
+                    emit!(output; MachineOperation::Numeric(*operation) => [destination.clone(), rhs.clone()];);
+                }
+                _ => output.push(machine_instruction(
+                    MachineOperation::Numeric(*operation),
+                    results.into_iter().chain(inputs).collect(),
+                )),
+            }
+        }
         Operation::Intrinsic(Intrinsic::Operand(OperandOperation::LoadPair)) => {
             let [lhs, rhs] = require_results(&results, "load_operand_pair")?;
             let [Operand::BytecodeField(lhs_field), Operand::BytecodeField(rhs_field)] = inputs.as_slice() else {
@@ -2515,27 +2600,6 @@ fn lower_instruction(
                 temporary
             };
             emit!(output; MachineOperation::Control(ControlOperation::GotoHandler) => [target];);
-        }
-        Operation::Intrinsic(Intrinsic::Aggregate(AggregateOperation::Copy16)) => {
-            let [destination, source] = require_inputs(&inputs, "copy16_field")?;
-            let suffix = output.len();
-            let destination_address = Operand::VirtualRegister(format!("ssa_copy16_{suffix}_destination").into());
-            let source_address = Operand::VirtualRegister(format!("ssa_copy16_{suffix}_source").into());
-            let low = Operand::VirtualRegister(format!("ssa_copy16_{suffix}_low").into());
-            let high = Operand::VirtualRegister(format!("ssa_copy16_{suffix}_high").into());
-            emit!(output; MachineOperation::LoadEffectiveAddress => [destination_address.clone(), destination.clone()];);
-            emit!(output; MachineOperation::LoadEffectiveAddress => [source_address.clone(), source.clone()];);
-            emit!(output; MachineOperation::load_pair(PairWidth::DoubleWord) => [low.clone(), high.clone(), offset_memory(&source_address, 0)?, offset_memory(&source_address, 8)?];);
-            emit!(output; MachineOperation::store_pair(PairWidth::DoubleWord) => [offset_memory(&destination_address, 0)?, offset_memory(&destination_address, 8)?, low, high];);
-        }
-        Operation::Intrinsic(Intrinsic::Aggregate(AggregateOperation::Zero16)) => {
-            let [destination] = require_inputs(&inputs, "zero16_field")?;
-            let suffix = output.len();
-            let destination_address = Operand::VirtualRegister(format!("ssa_zero16_{suffix}_destination").into());
-            let zero = Operand::VirtualRegister(format!("ssa_zero16_{suffix}_zero").into());
-            emit!(output; MachineOperation::IntegerBinary { operation: IntegerBinaryOperation::Binary(BinaryOperation::Xor), width: IntegerWidth::U64 } => [zero.clone(), zero.clone()];);
-            emit!(output; MachineOperation::LoadEffectiveAddress => [destination_address.clone(), destination.clone()];);
-            emit!(output; MachineOperation::store_pair(PairWidth::DoubleWord) => [offset_memory(&destination_address, 0)?, offset_memory(&destination_address, 8)?, zero.clone(), zero];);
         }
         Operation::Intrinsic(Intrinsic::Bytecode(operation @ BytecodeOperation::Load(field_width))) => {
             let [destination] = require_results(&results, operation.name())?;
@@ -2981,16 +3045,6 @@ fn value_operand(function: &FunctionUses<'_>, value: ValueId) -> Result<Operand,
         },
         ValueDefinition::Dead => return Err(format!("cannot select dead SSA value {value:?}")),
     })
-}
-
-fn offset_memory(base: &Operand, offset: i64) -> Result<Operand, String> {
-    let base = address_register(base).ok_or_else(|| "indexed memory requires a register base".to_string())?;
-    Ok(Operand::Address(MemoryAddress {
-        base,
-        index: None,
-        scale: None,
-        displacement: (offset != 0).then_some(AddressDisplacement::Immediate(offset)),
-    }))
 }
 
 fn address_register(operand: &Operand) -> Option<AddressRegister> {
@@ -3502,6 +3556,18 @@ fn low_level_machine_operation(operation: LowLevelOperation) -> MachineOperation
         LowLevelOperation::LoadEffectiveAddress => MachineOperation::LoadEffectiveAddress,
         LowLevelOperation::LoadVm => MachineOperation::LoadVm,
         LowLevelOperation::Increment32Memory => MachineOperation::Increment32Memory,
+        LowLevelOperation::Or8Memory => MachineOperation::MemoryUpdate {
+            operation: BinaryOperation::Or,
+            width: MemoryWidth::Byte,
+        },
+        LowLevelOperation::Or32Memory => MachineOperation::MemoryUpdate {
+            operation: BinaryOperation::Or,
+            width: MemoryWidth::Word,
+        },
+        LowLevelOperation::Subtract32Memory => MachineOperation::MemoryUpdate {
+            operation: BinaryOperation::Subtract,
+            width: MemoryWidth::Word,
+        },
         LowLevelOperation::ClearBit => MachineOperation::ClearBit,
         LowLevelOperation::ToggleBit => MachineOperation::ToggleBit,
         LowLevelOperation::Negate => MachineOperation::Negate,
@@ -3549,8 +3615,12 @@ fn operand_load_index(instruction: InstructionId, result_index: usize) -> Operan
     Operand::VirtualRegister(format!("ssa_operand_load_{}_{}_index", instruction.0, result_index).into())
 }
 
+/// Whether values of `ty` live in floating-point registers, which vectors do too.
 fn is_fpr(ty: &Type) -> bool {
-    ty.register_class() == Some(RegisterClass::FloatingPoint)
+    matches!(
+        ty.register_class(),
+        Some(RegisterClass::FloatingPoint | RegisterClass::Vector)
+    )
 }
 
 fn layout_operand(constants: &LayoutConstants, known: KnownLayoutConstant) -> Result<Operand, String> {

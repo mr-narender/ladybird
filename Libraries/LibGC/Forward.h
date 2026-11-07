@@ -6,16 +6,19 @@
 
 #pragma once
 
+#include <AK/StdLibExtras.h>
 #include <AK/Types.h>
 #include <LibGC/Export.h>
 
 namespace GC {
 
+struct CAPI;
 class Cell;
 class CellAllocator;
 struct CellTypeInfo;
 struct CellTypeThunks;
 class DeferGC;
+class ForeignCell;
 class RootImpl;
 class Heap;
 class HeapGroup;
@@ -41,8 +44,19 @@ class Ref;
 template<class T>
 class Ptr;
 
+template<class T>
+class Member;
+
+template<class T>
+class NonnullMember;
+
+// The cell pointers that are traced precisely. Ptr and Ref belong in RootVector rather than conservative storage, and
+// members only in cells.
+template<typename T>
+concept IsPreciselyTracedCellPointer = IsSpecializationOf<RemoveCVReference<T>, Ptr> || IsSpecializationOf<RemoveCVReference<T>, Ref> || IsSpecializationOf<RemoveCVReference<T>, Member> || IsSpecializationOf<RemoveCVReference<T>, NonnullMember>;
+
 template<class T, size_t inline_capacity = 0>
-class ConservativeVector;
+requires(!IsPreciselyTracedCellPointer<T>) class ConservativeVector;
 
 template<typename K, typename V, typename KeyTraits, typename ValueTraits, bool IsOrdered>
 class ConservativeHashMap;

@@ -10,10 +10,11 @@
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
 #include <AK/Variant.h>
-#include <LibMedia/Audio/SpscAudioFrameRing.h>
+#include <LibAudio/SpscAudioFrameRing.h>
 #include <LibWeb/Bindings/BiquadFilterNode.h>
 #include <LibWeb/Bindings/OscillatorNode.h>
 #include <LibWeb/Bindings/PannerNode.h>
+#include <LibWeb/Bindings/WaveShaperNode.h>
 #include <LibWeb/WebAudio/Rendering/AudioData.h>
 #include <LibWeb/WebAudio/Rendering/ConvolverKernel.h>
 #include <LibWeb/WebAudio/Types.h>
@@ -78,12 +79,18 @@ struct SetPannerParameters {
     double cone_outer_gain { 0 };
 };
 
+struct SetWaveShaperParameters {
+    NodeID node_id { 0 };
+    RefPtr<Rendering::WaveShaperCurve> curve;
+    Bindings::OverSampleType oversample { Bindings::OverSampleType::None };
+};
+
 // Attaches the ring buffer that carries a MediaStreamTrack's audio into a
 // MediaStreamAudioSourceNode's render node. Shipped as a message rather than a constructor
 // argument so the ring can be replaced without rebuilding the render node.
 struct SetMediaStreamSourceRing {
     NodeID node_id { 0 };
-    RefPtr<Media::SpscAudioFrameRing> ring;
+    RefPtr<Audio::SpscAudioFrameRing> ring;
     u32 channel_count { 0 };
 };
 
@@ -95,6 +102,7 @@ using NodeMessage = Variant<
     SetMediaStreamSourceRing,
     SetOscillatorWaveform,
     SetPannerParameters,
+    SetWaveShaperParameters,
     StartBufferSource,
     StartSource,
     StopSource>;

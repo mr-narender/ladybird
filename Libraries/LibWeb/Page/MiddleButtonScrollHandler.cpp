@@ -26,18 +26,12 @@ MiddleButtonScrollHandler::MiddleButtonScrollHandler(DOM::Element& container, CS
     , m_origin(origin)
     , m_mouse_position(origin)
 {
-    auto const* layout_node = m_container_element->document().layout_node();
-    if (layout_node && Painting::has_committed_box(*layout_node))
-        Painting::set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommands);
+    static_cast<DOM::Node&>(m_container_element->document()).set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 MiddleButtonScrollHandler::~MiddleButtonScrollHandler()
 {
-    if (!m_container_element->document().layout_is_up_to_date())
-        return;
-    auto const* layout_node = m_container_element->document().layout_node();
-    if (layout_node && Painting::has_committed_box(*layout_node))
-        Painting::set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommands);
+    static_cast<DOM::Node&>(m_container_element->document()).set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
 void MiddleButtonScrollHandler::visit_edges(JS::Cell::Visitor& visitor) const
@@ -73,10 +67,11 @@ void MiddleButtonScrollHandler::perform_tick()
     if (auto distance = AK::hypot(distance_x, distance_y); distance < DEAD_ZONE_RADIUS)
         return;
 
+    Layout::ForcedReadScope read { m_container_element->document() };
     m_container_element->document().update_layout(DOM::UpdateLayoutReason::AutoScrollSelection);
     m_mouse_has_moved_beyond_dead_zone = true;
 
-    auto* layout_node = AutoScrollHandler::auto_scroll_layout_node(m_container_element);
+    auto* layout_node = AutoScrollHandler::auto_scroll_layout_node(read, m_container_element);
     if (!layout_node)
         return;
 
@@ -98,6 +93,8 @@ void MiddleButtonScrollHandler::perform_tick()
         // until it runs out of scrolls, so it is held open for as long as this handler lives.
         if (!m_scroll_gesture_hold)
             m_scroll_gesture_hold = make<HTML::UserScrollGestureHold>(*navigable);
+        if (auto stable_node_id = Painting::async_scroll_node_stable_id(*layout_node); stable_node_id.has_value())
+            m_scroll_gesture_hold->hold(stable_node_id.value());
         navigable->note_user_scroll_input_intent(Compositing::SnapSelectionStrategy::Type::EndPosition);
     }
     Painting::scroll_by(*layout_node, scroll_x, scroll_y);

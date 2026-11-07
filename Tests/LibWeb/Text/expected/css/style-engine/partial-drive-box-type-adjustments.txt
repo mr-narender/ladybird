@@ -1,0 +1,49 @@
+block display: inline
+block padding: 2px
+block transitioning display: inline
+block transitioning padding: 0px
+block paused sample: rgb(50, 50, 50)
+block transition retained: true
+flex display: block
+flex padding: 2px
+flex transitioning display: block
+flex transitioning padding: 0px
+flex paused sample: rgb(50, 50, 50)
+flex transition retained: true
+grid display: block
+grid padding: 2px
+grid transitioning display: block
+grid transitioning padding: 0px
+grid paused sample: rgb(50, 50, 50)
+grid transition retained: true
+absolute display: block
+absolute padding: 2px
+absolute position retained: absolute
+absolute computed float: none
+fixed display: block
+fixed padding: 2px
+fixed position retained: fixed
+fixed computed float: none
+floating display: block
+floating padding: 2px
+float retained: left
+named slot in block display: inline
+named slot in block padding: 2px
+named moved slot blockifies: block
+named slot in flex display: block
+named slot in flex padding: 2px
+named moved slot restores inline: inline
+named flex slot display: block
+named flex slot padding: 2px
+named specified float retained in flex: left
+named contents slot restores inline: inline
+manual slot in block display: inline
+manual slot in block padding: 2px
+manual moved slot blockifies: block
+manual slot in flex display: block
+manual slot in flex padding: 2px
+manual moved slot restores inline: inline
+manual flex slot display: block
+manual flex slot padding: 2px
+manual specified float retained in flex: left
+manual contents slot restores inline: inline

@@ -11,11 +11,11 @@
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
-#include <LibMedia/DecoderError.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/Forward.h>
 #include <LibMedia/MediaStream.h>
 #include <LibMedia/TimeRanges.h>
+#include <LibMediaCodecs/DecoderError.h>
 
 #include "Document.h"
 #include "SampleIterator.h"
@@ -44,8 +44,8 @@ public:
     static DecoderErrorOr<SegmentInformation> parse_segment_information_element(Streamer&);
     static DecoderErrorOr<NonnullRefPtr<TrackEntry>> parse_track_entry(Streamer&);
     static DecoderErrorOr<Cluster> parse_cluster_element(Streamer&, u64 timestamp_scale);
-    static DecoderErrorOr<Block> parse_simple_block(Streamer&, AK::Duration cluster_timestamp, u64 segment_timestamp_scale, TrackBlockContexts const&);
-    static DecoderErrorOr<Block> parse_block_group(Streamer&, AK::Duration cluster_timestamp, u64 segment_timestamp_scale, TrackBlockContexts const&);
+    static DecoderErrorOr<Block> parse_simple_block(Streamer&, AK::Duration cluster_timestamp, u64 segment_timestamp_scale, TrackBlockContexts&);
+    static DecoderErrorOr<Block> parse_block_group(Streamer&, AK::Duration cluster_timestamp, u64 segment_timestamp_scale, TrackBlockContexts&);
 
     Optional<AK::Duration> duration() const { return m_segment_information.duration(); }
 
@@ -62,7 +62,7 @@ public:
 
     static size_t find_cue_point_index_at_or_before(Vector<TrackCuePoint> const&, Optional<AK::Duration> total_duration, AK::Duration target);
 
-    HashMap<u64, BufferedRangesScan> buffered_time_ranges_by_track_number(NonnullRefPtr<MediaStreamCursor> const&, Vector<MediaStream::ByteRange> const& byte_ranges) const;
+    Vector<BufferedRangesScan> buffered_time_ranges_by_track(NonnullRefPtr<MediaStreamCursor> const&, Vector<MediaStream::ByteRange> const& byte_ranges) const;
 
 private:
     Reader() = default;

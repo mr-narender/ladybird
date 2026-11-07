@@ -11,60 +11,24 @@
 //! [`StyleValueData`] is exposed to C++
 //! through cbindgen so that hot accessors compile to inline field reads with no FFI call.
 
+use crate::css::style_value_arc::OwnedStyleValue;
+use crate::css::style_value_arc::StyleValueArc;
 use std::ffi::c_void;
-use std::sync::Arc;
 
-#[cfg(any(test, feature = "style-replay"))]
-use std::cell::RefCell;
-#[cfg(any(test, feature = "style-replay"))]
-use std::collections::HashMap;
-
-use crate::css::css_tokenizer::{ParserSource, ParserTokenKind, SourcePosition, TokenizerInput};
-use crate::css::parser::component_value::{ComponentKind, ComponentSerializationMode, ComponentValue};
+use crate::css::css_tokenizer::{
+    ParserSource, ParserTokenKind, SourcePosition, TokenizerInput, trim_component_value_boundary_whitespace,
+};
+use crate::css::parser::arbitrary_substitution::SubstitutionFunctionsPresence;
+use crate::css::parser::component_value::{
+    ComponentKind, ComponentSerializationMode, ComponentValue, ComponentValueList,
+};
+use crate::css::serialize::{
+    original_component_values_source, serialize_component_values_to_utf16, trim_ascii_whitespace_start,
+};
 
 pub(crate) use crate::css::css_string::{CssString, CssStringList};
 
-/// A Rust-owned component-value slice. C++ retains the opaque allocation as part of an
-/// unresolved style value but never inspects its elements.
-#[repr(C)]
-pub struct RetainedComponentValueList {
-    pointer: *mut c_void,
-    length: usize,
-}
-
-// SAFETY: This handle owns an immutable boxed slice. The bounds cover the erased element type.
-unsafe impl Send for RetainedComponentValueList where ComponentValue: Send {}
-unsafe impl Sync for RetainedComponentValueList where ComponentValue: Sync {}
-
-impl RetainedComponentValueList {
-    pub(crate) fn from_values(values: Vec<ComponentValue>) -> Self {
-        let mut values = values.into_boxed_slice();
-        let result = Self {
-            pointer: values.as_mut_ptr().cast(),
-            length: values.len(),
-        };
-        std::mem::forget(values);
-        result
-    }
-
-    pub(crate) fn from_source(source: &[u16]) -> Self {
-        let values = crate::css::parser::component_value::consume_a_list_of_component_values(
-            crate::css::css_tokenizer::tokenize_for_parser(source),
-        )
-        .unwrap_or_default();
-        Self::from_values(values)
-    }
-
-    pub(crate) fn as_slice(&self) -> &[ComponentValue] {
-        if self.pointer.is_null() {
-            return &[];
-        }
-        // SAFETY: The allocation is owned by this handle and has `length` initialized elements.
-        unsafe { std::slice::from_raw_parts(self.pointer.cast(), self.length) }
-    }
-}
-
-enum ReifiedUnresolvedSegment {
+pub enum ReifiedUnresolvedSegment {
     Text(Vec<u16>),
     Variable {
         name: Vec<u16>,
@@ -103,7 +67,7 @@ fn component_values_without_whitespace(mut values: &[ComponentValue]) -> &[Compo
     values
 }
 
-fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
+pub(crate) fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
     value.len() == expected.len()
         && value
             .iter()
@@ -111,7 +75,7 @@ fn utf16_equals_ascii_case_insensitive(value: &[u16], expected: &[u8]) -> bool {
             .all(|(&left, &right)| u8::try_from(left).is_ok_and(|left| left.eq_ignore_ascii_case(&right)))
 }
 
-fn split_var_arguments(values: &[ComponentValue]) -> Option<(&[u16], Option<&[ComponentValue]>)> {
+pub(crate) fn split_var_arguments(values: &[ComponentValue]) -> Option<(&[u16], Option<&[ComponentValue]>)> {
     if !crate::css::parser::arbitrary_substitution::arguments_are_valid_for_ffi(5, values) {
         return None;
     }
@@ -174,35 +138,11 @@ fn reify_unresolved_segments(values: &[ComponentValue]) -> Vec<ReifiedUnresolved
     output
 }
 
-fn visit_reified_unresolved_segments(
-    segments: &[ReifiedUnresolvedSegment],
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, u8, *const u16, usize, bool),
-) {
-    for segment in segments {
-        match segment {
-            ReifiedUnresolvedSegment::Text(text) => unsafe {
-                visit(context, 0, text.as_ptr(), text.len(), false);
-            },
-            ReifiedUnresolvedSegment::Variable { name, fallback } => {
-                unsafe {
-                    visit(context, 1, name.as_ptr(), name.len(), fallback.is_some());
-                }
-                if let Some(fallback) = fallback {
-                    visit_reified_unresolved_segments(fallback, context, visit);
-                }
-                unsafe {
-                    visit(context, 2, std::ptr::null(), 0, false);
-                }
-            }
-        }
-    }
-}
-
-fn scan_custom_property_references(
-    values: &[ComponentValue],
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, *const u16, usize),
+// Appends the name of every custom property a `var()` or `inherit()` in `values` refers to, and returns whether every
+// reference names its property with a plain identifier.
+fn scan_custom_property_references<'a>(
+    values: &'a [ComponentValue],
+    references: &mut smallvec::SmallVec<[&'a [u16]; 4]>,
 ) -> bool {
     let mut all_references_visible = true;
     for value in values {
@@ -212,7 +152,7 @@ fn scan_custom_property_references(
         } = &value.kind
         else {
             if let ComponentKind::SimpleBlock { values, .. } = &value.kind {
-                all_references_visible &= scan_custom_property_references(values, context, visit);
+                all_references_visible &= scan_custom_property_references(values, references);
             }
             continue;
         };
@@ -226,71 +166,45 @@ fn scan_custom_property_references(
                 && name[0] == u16::from(b'-')
                 && name[1] == u16::from(b'-')
             {
-                unsafe { visit(context, name.as_ptr(), name.len()) };
+                references.push(name);
             } else {
                 all_references_visible = false;
             }
         }
-        all_references_visible &= scan_custom_property_references(function_values, context, visit);
+        all_references_visible &= scan_custom_property_references(function_values, references);
     }
     all_references_visible
 }
 
-pub(crate) fn custom_property_references(value: &StyleValueData) -> Option<(Vec<Vec<u16>>, bool)> {
-    let StyleValueData::Unresolved { components, .. } = value else {
+pub(crate) fn custom_property_references(value: &StyleValueData) -> Option<(impl Iterator<Item = &[u16]>, bool)> {
+    let StyleValueData::Unresolved(unresolved_payload) = value else {
         return None;
     };
-    let mut references = Vec::new();
-    unsafe extern "C" fn collect(context: *mut c_void, name: *const u16, name_length: usize) {
-        let references = unsafe { &mut *context.cast::<Vec<Vec<u16>>>() };
-        references.push(unsafe { std::slice::from_raw_parts(name, name_length) }.to_vec());
-    }
-    let all_references_visible =
-        scan_custom_property_references(components.as_slice(), (&raw mut references).cast(), collect);
-    Some((references, all_references_visible))
+    Some((unresolved_payload.references(), unresolved_payload.references_visible()))
 }
 
-/// Visits the Typed OM reification of an unresolved style value. Event 0 appends a text segment,
-/// event 1 begins a variable reference, and event 2 ends its optional fallback.
-///
-/// # Safety
-/// `value` must point at live unresolved style value data, and `visit` must remain callable for
-/// the duration of this function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_unresolved_style_value_visit_reification(
-    value: *const c_void,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, u8, *const u16, usize, bool),
-) {
-    let StyleValueData::Unresolved { components, .. } = (unsafe { &*value.cast::<StyleValueData>() }) else {
+/// The text and the variable references of an unresolved value, for a CSSUnparsedValue.
+pub(crate) fn reified_unresolved_segments(value: &StyleValueData) -> Vec<ReifiedUnresolvedSegment> {
+    let StyleValueData::Unresolved(unresolved_payload) = value else {
         unreachable!("reification requires an unresolved style value");
     };
-    let segments = reify_unresolved_segments(components.as_slice());
-    visit_reified_unresolved_segments(&segments, context, visit);
-}
-
-/// Visits the name of every custom property a `var()` in an unresolved value refers to, fallbacks
-/// and nested functions included. Returns whether every reference names its property with a plain
-/// identifier; a reference that substitutes its name can read anything.
-///
-/// # Safety
-/// `value` must point at live unresolved style value data, and `visit` must remain callable for
-/// the duration of this function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_unresolved_style_value_visit_custom_property_references(
-    value: *const c_void,
-    context: *mut c_void,
-    visit: unsafe extern "C" fn(*mut c_void, *const u16, usize),
-) -> bool {
-    let StyleValueData::Unresolved { components, .. } = (unsafe { &*value.cast::<StyleValueData>() }) else {
-        return false;
-    };
-    scan_custom_property_references(components.as_slice(), context, visit)
+    reify_unresolved_segments(&unresolved_payload.components())
 }
 
 #[cfg(test)]
 mod unresolved_component_tests {
     use super::*;
+
+    #[test]
+    fn unresolved_text_is_kept_as_ascii_however_it_arrives() {
+        let units: Vec<u16> = "var(--x, 1px)".encode_utf16().collect();
+        let from_utf16 = RetainedString::from_text(TokenizerInput::Utf16(&units));
+        let from_ascii = RetainedString::from_text(TokenizerInput::Latin1(b"var(--x, 1px)"));
+        assert!(matches!(from_utf16.units(), TokenizerInput::Latin1(_)));
+        assert!(from_utf16 == from_ascii);
+        let wide: Vec<u16> = "var(--\u{96ea})".encode_utf16().chain([0xd800]).collect();
+        assert_eq!(RetainedString::from_text(TokenizerInput::Utf16(&wide)).to_utf16(), wide);
+    }
 
     fn components(source: &str) -> Vec<ComponentValue> {
         crate::css::parser::component_value::consume_a_list_of_component_values(
@@ -324,138 +238,162 @@ mod unresolved_component_tests {
             && after == &")".encode_utf16().collect::<Vec<_>>()));
     }
 
-    unsafe extern "C" fn collect_reference(context: *mut c_void, name: *const u16, name_length: usize) {
-        let names = unsafe { &mut *context.cast::<Vec<Vec<u16>>>() };
-        names.push(unsafe { std::slice::from_raw_parts(name, name_length) }.to_vec());
-    }
-
     #[test]
     fn reference_scan_reports_dynamic_names() {
         let values = components("var(--one) [inherit(--two)] var(var(--dynamic))");
-        let mut names: Vec<Vec<u16>> = Vec::new();
-        let all_visible = scan_custom_property_references(&values, (&raw mut names).cast(), collect_reference);
-        assert!(!all_visible);
+        let references = CustomPropertyReferences::scan(&values);
+        assert!(!references.all_visible);
         assert_eq!(
-            names,
+            references.names.to_vec(),
             ["--one", "--two", "--dynamic"].map(|name| name.encode_utf16().collect::<Vec<_>>())
         );
     }
-}
 
-impl Clone for RetainedComponentValueList {
-    fn clone(&self) -> Self {
-        Self::from_values(self.as_slice().to_vec())
+    fn unresolved(source: &str) -> StyleValueData {
+        let units: Vec<u16> = source.encode_utf16().collect();
+        crate::css::parser::value_parser::unresolved_value_from_string(
+            &units,
+            crate::css::parser::arbitrary_substitution::SubstitutionFunctionsPresence::default(),
+        )
+    }
+
+    fn reference_names(value: &StyleValueData) -> (Vec<String>, bool) {
+        let (names, all_visible) = custom_property_references(value).unwrap();
+        (
+            names.map(|name| String::from_utf16(name).unwrap()).collect(),
+            all_visible,
+        )
+    }
+
+    #[test]
+    fn a_value_notes_the_custom_properties_it_references() {
+        assert_eq!(
+            reference_names(&unresolved("calc(var(--a) + inherit(--bc, 1px)) var(--a)")),
+            (vec!["--a".to_owned(), "--bc".to_owned(), "--a".to_owned()], true)
+        );
+        assert_eq!(reference_names(&unresolved("1px solid")), (vec![], true));
+        assert_eq!(
+            reference_names(&unresolved("var(var(--d))")),
+            (vec!["--d".to_owned()], false)
+        );
+        // NB: A name is noted with its escapes decoded, and a text that is not all ASCII is kept as
+        //     UTF-16, after which the names follow aligned all the same.
+        assert_eq!(
+            reference_names(&unresolved("var(--\\61 b)")),
+            (vec!["--ab".to_owned()], true)
+        );
+        assert_eq!(
+            reference_names(&unresolved("var(--\u{96ea}) var(--abc)")),
+            (vec!["--\u{96ea}".to_owned(), "--abc".to_owned()], true)
+        );
+        let copied = unresolved("var(--\u{96ea}, x) var(--abc)").clone();
+        assert_eq!(
+            reference_names(&copied),
+            (vec!["--\u{96ea}".to_owned(), "--abc".to_owned()], true)
+        );
+    }
+
+    #[test]
+    fn a_value_notes_what_its_text_holds() {
+        let facts = |source: &str| {
+            let StyleValueData::Unresolved(payload) = unresolved(source) else {
+                unreachable!();
+            };
+            (
+                payload.facts().is_lone_css_wide_keyword(),
+                payload.facts().calls_tree_counting_function(),
+            )
+        };
+        assert_eq!(facts(" inherit "), (true, false));
+        assert_eq!(facts("inherit green"), (false, false));
+        assert_eq!(facts("calc(sibling-index() * 1px)"), (false, true));
+    }
+
+    #[test]
+    fn a_value_made_of_its_serialization_tokenizes_back_to_its_components() {
+        use crate::css::parser::component_value::ComponentSerializationMode;
+        // NB: Two numbers with nothing between them, as a substitution leaves `var(--n)0`, which their
+        //     serialization keeps apart with a comment.
+        let values: Vec<ComponentValue> = components("12 1.0")
+            .into_iter()
+            .filter(|value| !value.is_whitespace())
+            .collect();
+        let source =
+            crate::css::serialize::serialize_component_values_to_utf16(&values, ComponentSerializationMode::Retokenize);
+        assert_eq!(String::from_utf16_lossy(&source), "12/**/1.0");
+        let made_of = |components| {
+            UnresolvedBox::new(
+                TokenizerInput::Utf16(&source),
+                components,
+                SubstitutionFunctionsPresence::default(),
+                false,
+                RetainedStyleValueData::none(),
+            )
+        };
+        let serialized = made_of(UnresolvedValueComponents::OfSerialization(&values));
+        assert!(components_equal(&serialized.components(), &values));
+        let written = made_of(UnresolvedValueComponents::OfText(&values));
+        assert_eq!(written.components().len(), 3);
     }
 }
 
-impl PartialEq for RetainedComponentValueList {
-    fn eq(&self, _other: &Self) -> bool {
-        // The retained tree is a parsing/serialization cache. Unresolved value identity is
-        // defined by the source and comparison text fields, as it was before this cache existed.
-        true
-    }
+/// Whether two lists hold the same components, by their token kinds, wherever their text came from.
+#[cfg(test)]
+pub(crate) fn components_equal(first: &[ComponentValue], second: &[ComponentValue]) -> bool {
+    first.len() == second.len()
+        && first
+            .iter()
+            .zip(second)
+            .all(|(first, second)| match (&first.kind, &second.kind) {
+                (ComponentKind::Token(first), ComponentKind::Token(second)) => first == second,
+                (
+                    ComponentKind::Function {
+                        name: first_name,
+                        values: first,
+                    },
+                    ComponentKind::Function {
+                        name: second_name,
+                        values: second,
+                    },
+                ) => first_name == second_name && components_equal(first, second),
+                (
+                    ComponentKind::SimpleBlock {
+                        opening: first_opening,
+                        values: first,
+                    },
+                    ComponentKind::SimpleBlock {
+                        opening: second_opening,
+                        values: second,
+                    },
+                ) => first_opening == second_opening && components_equal(first, second),
+                _ => false,
+            })
 }
 
-impl Drop for RetainedComponentValueList {
-    fn drop(&mut self) {
-        if self.pointer.is_null() {
-            return;
-        }
-        // SAFETY: `from_values` leaked exactly this boxed slice to the handle.
-        unsafe {
-            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                self.pointer.cast::<ComponentValue>(),
-                self.length,
-            )));
-        }
-    }
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-thread_local! {
-    static REPLAY_STYLE_VALUES: RefCell<HashMap<u64, usize>> = RefCell::new(HashMap::new());
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-#[derive(Clone, Copy)]
-struct ReplayStyleValue {
-    token: u64,
-    dependency_flags: u8,
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-fn replay_style_values() -> &'static std::sync::Mutex<HashMap<usize, Box<ReplayStyleValue>>> {
-    static VALUES: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, Box<ReplayStyleValue>>>> =
-        std::sync::OnceLock::new();
-    VALUES.get_or_init(Default::default)
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-pub(crate) fn register_replay_style_value(token: u64, dependency_flags: u8) -> *const StyleValueData {
-    assert!(token != 0, "style-value tokens are nonzero");
-    // Replay sessions may reuse token numbers. Allocate distinct opaque identities per session
-    // thread, but keep their metadata accessible when a retained handle moves to another thread.
-    let pointer = REPLAY_STYLE_VALUES.with(|values| {
-        *values.borrow_mut().entry(token).or_insert_with(|| {
-            let value = Box::new(ReplayStyleValue {
-                token,
-                dependency_flags,
-            });
-            let pointer = (&*value as *const ReplayStyleValue) as usize;
-            replay_style_values().lock().unwrap().insert(pointer, value);
-            pointer
-        })
-    });
-    assert_eq!(
-        replay_style_value_metadata(pointer as *const StyleValueData)
-            .unwrap()
-            .dependency_flags,
-        dependency_flags
-    );
-    pointer as *const StyleValueData
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-fn replay_style_value_metadata(value: *const StyleValueData) -> Option<ReplayStyleValue> {
-    replay_style_values()
-        .lock()
-        .unwrap()
-        .get(&(value as usize))
-        .map(|value| **value)
-}
-
-#[cfg(any(test, feature = "style-replay"))]
-pub(crate) fn replay_style_value_token(value: *const StyleValueData) -> Option<u64> {
-    replay_style_value_metadata(value).map(|value| value.token)
-}
-
-fn replay_style_value_dependency_flags(value: *const StyleValueData) -> Option<u8> {
-    #[cfg(any(test, feature = "style-replay"))]
-    return replay_style_value_metadata(value).map(|value| value.dependency_flags);
-    #[cfg(not(any(test, feature = "style-replay")))]
-    {
-        let _ = value;
-        None
-    }
-}
-
-/// # Safety
-/// `value` must be null, a registered replay token, or point to a live `StyleValueData`.
-pub(crate) unsafe fn style_value_content_hash(value: *const StyleValueData) -> u64 {
-    if value.is_null() {
+pub(crate) fn style_value_content_hash(value: Option<&StyleValueData>) -> u64 {
+    let Some(value) = value else {
         return 0;
-    }
-    #[cfg(any(test, feature = "style-replay"))]
-    if let Some(value) = replay_style_value_metadata(value) {
-        return value.token;
-    }
-    unsafe { &*value }.content_hash()
+    };
+    value.content_hash()
 }
 
 /// A strong reference to immutable Rust-owned style value data.
 #[repr(C)]
 pub struct RetainedStyleValueData {
     pointer: *const c_void,
+}
+
+impl crate::heap_size::HeapSize for RetainedStyleValueData {
+    /// Counts the value's allocation aside, the first time it is reached, as every owner holding
+    /// it shares it. The values a value holds are not counted.
+    fn heap_size(&self, sizer: &mut crate::heap_size::HeapSizer) -> usize {
+        if sizer.first_sight(self.pointer()) {
+            sizer.style_value_bytes += crate::heap_size::STYLE_VALUE_HEADER_BYTES
+                + size_of::<StyleValueData>()
+                + self.optional_data().map_or(0, StyleValueData::boxed_payload_bytes);
+        }
+        0
+    }
 }
 
 // SAFETY: This handle owns an Arc reference and only exposes shared access to its pointee.
@@ -472,41 +410,60 @@ impl PartialEq for RetainedStyleValueData {
     }
 }
 
-pub(crate) fn shared_style_value(value: StyleValueData) -> Arc<StyleValueData> {
-    // Common scalars recur in parsed values, computed styles, and values created through FFI.
-    // Direct indexing shares them without hashing every property or retaining arbitrary input.
-    const KEYWORDS: usize = 1024;
-    const INTEGERS: usize = 384;
-    const NUMBERS: usize = 256;
-    const LENGTHS: usize = 1024;
-    const PERCENTAGES: usize = 101;
-    const COUNT: usize = KEYWORDS + INTEGERS + NUMBERS + LENGTHS + PERCENTAGES;
-    static VALUES: [std::sync::OnceLock<Arc<StyleValueData>>; COUNT] = [const { std::sync::OnceLock::new() }; COUNT];
+// Common scalars recur in parsed values, computed styles, and values created through FFI.
+// Direct indexing shares them without hashing every property or retaining arbitrary input.
+const SHARED_KEYWORDS: usize = 1024;
+const SHARED_INTEGERS: usize = 384;
+const SHARED_NUMBERS: usize = 256;
+const SHARED_LENGTHS: usize = 1024;
+const SHARED_PERCENTAGES: usize = 101;
+const SHARED_VALUE_COUNT: usize =
+    SHARED_KEYWORDS + SHARED_INTEGERS + SHARED_NUMBERS + SHARED_LENGTHS + SHARED_PERCENTAGES;
+static VALUES: [std::sync::OnceLock<StyleValueArc>; SHARED_VALUE_COUNT] =
+    [const { std::sync::OnceLock::new() }; SHARED_VALUE_COUNT];
 
+pub(crate) fn shared_style_value(value: StyleValueData) -> StyleValueArc {
     let integer_index = |value: f64, count: usize| {
         (value >= 0.0 && value < count as f64 && value.to_bits() == (value as u16 as f64).to_bits())
             .then_some(value as usize)
     };
     let index = match &value {
-        StyleValueData::Keyword { keyword } if usize::from(*keyword) < KEYWORDS => Some(usize::from(*keyword)),
-        StyleValueData::Integer { value } if (-128..256).contains(value) => Some(KEYWORDS + (*value + 128) as usize),
-        StyleValueData::Number { value } => integer_index(*value, NUMBERS).map(|index| KEYWORDS + INTEGERS + index),
+        StyleValueData::Keyword { keyword } if usize::from(*keyword) < SHARED_KEYWORDS => Some(usize::from(*keyword)),
+        StyleValueData::Integer { value } if (-128..256).contains(value) => {
+            Some(SHARED_KEYWORDS + (*value + 128) as usize)
+        }
+        StyleValueData::Number { value } => {
+            integer_index(*value, SHARED_NUMBERS).map(|index| SHARED_KEYWORDS + SHARED_INTEGERS + index)
+        }
         StyleValueData::Length { value, unit } if *unit == crate::css::style_compute::px_length_unit() => {
-            integer_index(*value, LENGTHS).map(|index| KEYWORDS + INTEGERS + NUMBERS + index)
+            integer_index(*value, SHARED_LENGTHS)
+                .map(|index| SHARED_KEYWORDS + SHARED_INTEGERS + SHARED_NUMBERS + index)
         }
-        StyleValueData::Percentage { value } => {
-            integer_index(*value, PERCENTAGES).map(|index| KEYWORDS + INTEGERS + NUMBERS + LENGTHS + index)
-        }
+        StyleValueData::Percentage { value } => integer_index(*value, SHARED_PERCENTAGES)
+            .map(|index| SHARED_KEYWORDS + SHARED_INTEGERS + SHARED_NUMBERS + SHARED_LENGTHS + index),
         _ => None,
     };
     if let Some(index) = index {
-        Arc::clone(VALUES[index].get_or_init(|| Arc::new(value)))
+        StyleValueArc::clone(VALUES[index].get_or_init(|| StyleValueArc::immortal(value)))
     } else {
-        Arc::new(value)
+        StyleValueArc::new(value)
     }
 }
 
 impl RetainedStyleValueData {
+    /// The value of `keyword` the shared values hold, which every value of it shares.
+    pub(crate) fn shared_keyword(keyword: u16) -> &'static Self {
+        assert!(
+            usize::from(keyword) < SHARED_KEYWORDS,
+            "the shared values hold every keyword"
+        );
+        let value =
+            VALUES[usize::from(keyword)].get_or_init(|| StyleValueArc::immortal(StyleValueData::Keyword { keyword }));
+        // SAFETY: A handle is one pointer at the value, as an arc is, and the shared values keep
+        //         theirs for the life of the process.
+        unsafe { &*std::ptr::from_ref(value).cast::<Self>() }
+    }
+
     pub(crate) fn none() -> Self {
         Self {
             pointer: std::ptr::null(),
@@ -514,29 +471,25 @@ impl RetainedStyleValueData {
     }
 
     pub(crate) fn from_owned(data: StyleValueData) -> Self {
-        let pointer = Arc::into_raw(shared_style_value(data));
-        // SAFETY: Arc::into_raw transfers one strong reference to this handle.
-        unsafe { Self::from_retained_pointer(pointer) }
+        Self::from_arc(shared_style_value(data))
     }
 
-    /// Borrow the handles' pointer storage without copying or transferring ownership.
-    pub(crate) fn pointer_slice(values: &[Self]) -> &[*const c_void] {
-        const {
-            assert!(size_of::<RetainedStyleValueData>() == size_of::<*const c_void>());
-            assert!(align_of::<RetainedStyleValueData>() == align_of::<*const c_void>());
-        }
-        // SAFETY: This repr(C) type has exactly one field, a *const c_void, so its
-        //         size, alignment and layout match that pointer. The shared slice
-        //         borrows the handles and cannot outlive or modify their storage.
-        unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), values.len()) }
+    pub(crate) fn from_arc(value: StyleValueArc) -> Self {
+        // SAFETY: `into_raw` transfers one reference to this handle.
+        unsafe { Self::from_retained_pointer(StyleValueArc::into_raw(value)) }
+    }
+
+    pub(crate) fn from_optional_arc(value: Option<StyleValueArc>) -> Self {
+        value.map_or_else(Self::none, Self::from_arc)
     }
 
     pub(crate) fn pointer(&self) -> *const StyleValueData {
         self.pointer.cast()
     }
 
+    /// The handle's value, which an empty handle does not have.
     pub(crate) fn data(&self) -> &StyleValueData {
-        unsafe { &*self.pointer.cast::<StyleValueData>() }
+        self.optional_data().expect("an empty style value handle has no data")
     }
 
     pub(crate) fn optional_data(&self) -> Option<&StyleValueData> {
@@ -569,12 +522,28 @@ impl RetainedStyleValueData {
         unsafe { Self::from_retained_optional_pointer(pointer) }
     }
 
+    /// Releases the handle's reference to the caller as a raw pointer, null for an empty handle.
+    pub(crate) fn into_pointer(self) -> *const StyleValueData {
+        let pointer = self.pointer();
+        std::mem::forget(self);
+        pointer
+    }
+
+    /// The handles of `values`, borrowed: each is one pointer at the same value.
+    pub(crate) fn slice_from_shared(values: &[StyleValueArc]) -> &[Self] {
+        const _: () = assert!(size_of::<StyleValueArc>() == size_of::<RetainedStyleValueData>());
+        const _: () = assert!(align_of::<StyleValueArc>() == align_of::<RetainedStyleValueData>());
+        // SAFETY: Both are one pointer at the counted value, `StyleValueArc` transparently and the
+        //         handle as `repr(C)`, and a borrowed handle neither adds nor drops a reference.
+        unsafe { ak::slice_from_raw_parts(values.as_ptr().cast(), values.len()) }
+    }
+
     /// Converts the retained reference into an Arc, transferring the strong reference.
-    pub(crate) fn into_arc(self) -> std::sync::Arc<StyleValueData> {
+    pub(crate) fn into_arc(self) -> StyleValueArc {
         let pointer = self.pointer();
         std::mem::forget(self);
         // SAFETY: The retained reference owns exactly one strong reference.
-        unsafe { std::sync::Arc::from_raw(pointer) }
+        unsafe { StyleValueArc::from_raw(pointer) }
     }
 }
 
@@ -590,26 +559,71 @@ impl Drop for RetainedStyleValueData {
     }
 }
 
-/// A retained, Rust-owned array of shared style value data references.
+/// A retained, Rust-owned array of shared style value data references, held by one pointer to its
+/// first element, with the element count in the word before it (null when empty). A list fits in
+/// the value holding it beside a few small fields.
 #[repr(C)]
 pub struct RetainedStyleValueDataList {
     pointer: *mut RetainedStyleValueData,
-    length: usize,
 }
 
 impl RetainedStyleValueDataList {
+    const HEADER: usize = size_of::<usize>();
+
+    fn layout(length: usize) -> std::alloc::Layout {
+        const _: () = assert!(align_of::<RetainedStyleValueData>() <= size_of::<usize>());
+        let bytes = length
+            .checked_mul(size_of::<RetainedStyleValueData>())
+            .and_then(|bytes| bytes.checked_add(Self::HEADER))
+            .expect("style value list too long");
+        std::alloc::Layout::from_size_align(bytes, align_of::<usize>()).expect("style value list too long")
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        if self.pointer.is_null() {
+            return 0;
+        }
+        // SAFETY: A non-null pointer follows the element count of a live allocation.
+        unsafe { *self.pointer.cast::<usize>().sub(1) }
+    }
+
     pub(crate) fn as_slice(&self) -> &[RetainedStyleValueData] {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        // SAFETY: A non-null pointer points at `len()` initialized elements.
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.len()) }
+    }
+
+    fn from_iterator(values: impl ExactSizeIterator<Item = RetainedStyleValueData>) -> Self {
+        let length = values.len();
+        if length == 0 {
+            return Self {
+                pointer: std::ptr::null_mut(),
+            };
+        }
+        let layout = Self::layout(length);
+        // SAFETY: The layout has a nonzero size.
+        let base = unsafe { std::alloc::alloc(layout) };
+        if base.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        // SAFETY: The allocation holds the count, then `length` elements.
+        unsafe {
+            base.cast::<usize>().write(length);
+            let pointer = base.add(Self::HEADER).cast::<RetainedStyleValueData>();
+            let mut written = 0;
+            for value in values.take(length) {
+                pointer.add(written).write(value);
+                written += 1;
+            }
+            assert_eq!(written, length, "style value list iterator ended early");
+            Self { pointer }
+        }
     }
 
     pub(crate) fn from_retained_values(values: Vec<RetainedStyleValueData>) -> Self {
-        let slice = values.into_boxed_slice();
-        let length = slice.len();
-        let pointer = Box::into_raw(slice) as *mut RetainedStyleValueData;
-        Self { pointer, length }
+        Self::from_iterator(values.into_iter())
     }
 
     /// Takes ownership of one strong reference to each value.
@@ -617,29 +631,55 @@ impl RetainedStyleValueDataList {
     /// # Safety
     /// `values` must point to `length` strong references returned by `rust_style_value_retain`.
     unsafe fn from_retained_pointers(values: *const *const StyleValueData, length: usize) -> Self {
-        let slice: Box<[RetainedStyleValueData]> = (0..length)
-            .map(|i| unsafe { RetainedStyleValueData::from_retained_pointer(*values.add(i)) })
-            .collect();
-        let length = slice.len();
-        let pointer = Box::into_raw(slice) as *mut RetainedStyleValueData;
-        Self { pointer, length }
+        Self::from_iterator(
+            (0..length).map(|i| unsafe { RetainedStyleValueData::from_retained_pointer(*values.add(i)) }),
+        )
     }
+}
 
-    /// Takes ownership of one strong reference to each non-null value.
-    ///
-    /// # Safety
-    /// Every non-null entry in `values` must be a strong reference returned by
-    /// `rust_style_value_retain`.
-    unsafe fn from_retained_optional_pointers(values: *const *const StyleValueData, length: usize) -> Self {
-        let slice: Box<[RetainedStyleValueData]> = (0..length)
-            .map(|i| RetainedStyleValueData {
-                pointer: unsafe { *values.add(i) }.cast(),
-            })
-            .collect();
-        let length = slice.len();
-        let pointer = Box::into_raw(slice) as *mut RetainedStyleValueData;
-        Self { pointer, length }
+impl PartialEq for RetainedStyleValueDataList {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
     }
+}
+
+impl Drop for RetainedStyleValueDataList {
+    fn drop(&mut self) {
+        if self.pointer.is_null() {
+            return;
+        }
+        let length = self.len();
+        // SAFETY: The list owns its `length` elements and the allocation they are in.
+        unsafe {
+            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(self.pointer, length));
+            std::alloc::dealloc(self.pointer.cast::<u8>().sub(Self::HEADER), Self::layout(length));
+        }
+    }
+}
+
+/// Preserve matrix-only literal angles only while their canonical argument is unchanged.
+/// All other slots come from the newly mapped values, so lengths and rotation axes cannot become stale.
+pub(crate) fn map_transform_matrix_values(
+    previous: &[RetainedStyleValueData],
+    values: &[RetainedStyleValueData],
+    matrix_values: &[RetainedStyleValueData],
+) -> RetainedStyleValueDataList {
+    let mut mapped = Vec::new();
+    for (index, matrix_value) in matrix_values.iter().enumerate() {
+        let (Some(previous), Some(value)) = (previous.get(index), values.get(index)) else {
+            continue;
+        };
+        if matches!(matrix_value.data(), StyleValueData::Angle { .. })
+            && previous.data() == value.data()
+            && matrix_value.data() != value.data()
+        {
+            if mapped.is_empty() {
+                mapped = values.to_vec();
+            }
+            mapped[index] = matrix_value.clone_retained();
+        }
+    }
+    RetainedStyleValueDataList::from_retained_values(mapped)
 }
 
 impl Clone for RetainedStyleValueDataList {
@@ -650,13 +690,13 @@ impl Clone for RetainedStyleValueDataList {
             .iter()
             .map(|value| {
                 let Some(data) = value.optional_data() else {
-                    return unsafe { RetainedStyleValueData::from_retained_optional_pointer(std::ptr::null()) };
+                    return RetainedStyleValueData::none();
                 };
                 let pointer = data as *const StyleValueData as usize;
                 if let Some((_, cloned)) = cloned_by_pointer.iter().find(|(original, _)| *original == pointer) {
                     return unsafe { RetainedStyleValueData::from_retained_pointer(retain_style_value(*cloned)) };
                 }
-                let cloned = Arc::into_raw(Arc::new(data.clone()));
+                let cloned = StyleValueArc::into_raw(StyleValueArc::new(data.clone()));
                 cloned_by_pointer.push((pointer, cloned));
                 unsafe { RetainedStyleValueData::from_retained_pointer(cloned) }
             })
@@ -679,8 +719,6 @@ macro_rules! retained_list_drop {
     };
 }
 pub(crate) use retained_list_drop;
-
-retained_list_drop!(RetainedStyleValueDataList);
 
 /// Implements the shared behavior for a `Retained*List` struct whose `from_raw` input is an
 /// array of its own element type: `from_raw` copies `length` elements into a Rust-owned boxed
@@ -714,7 +752,7 @@ macro_rules! retained_list {
                         length: 0,
                     };
                 }
-                let elements = unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+                let elements = unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
                     .to_vec()
                     .into_boxed_slice();
                 let length = elements.len();
@@ -746,46 +784,97 @@ impl RetainedPropertyIdList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
 /// Shared native URL text, independent of host strings and the atom table.
 #[repr(C)]
 pub struct RetainedString {
+    /// Null for the empty string, which most images' unset base URL is.
     storage: *const c_void,
 }
 
-// SAFETY: This handle owns an Arc to immutable ASCII or UTF-16 storage.
+// SAFETY: This handle owns a reference to immutable ASCII or UTF-16 text, counted atomically.
 unsafe impl Send for RetainedString {}
 unsafe impl Sync for RetainedString {}
 
+/// The header of a retained string's one allocation, which its text follows: ASCII bytes or UTF-16
+/// code units.
+#[repr(C)]
+struct RetainedStringHeader {
+    references: std::sync::atomic::AtomicUsize,
+    length: u32,
+    is_latin1: bool,
+}
+
 impl RetainedString {
-    fn from_storage(storage: crate::css::css_tokenizer::SourceStorage) -> Self {
-        Self {
-            storage: Arc::into_raw(Arc::new(storage)).cast(),
+    fn layout(length: usize, is_latin1: bool) -> std::alloc::Layout {
+        let unit = if is_latin1 { 1 } else { size_of::<u16>() };
+        let bytes = length
+            .checked_mul(unit)
+            .and_then(|bytes| bytes.checked_add(size_of::<RetainedStringHeader>()))
+            .expect("retained string too long");
+        std::alloc::Layout::from_size_align(bytes, align_of::<RetainedStringHeader>())
+            .expect("retained string too long")
+    }
+
+    /// A string of `length` units, Latin-1 bytes or UTF-16 code units as `is_latin1` says, which
+    /// `write` fills.
+    fn with_units(length: usize, is_latin1: bool, write: impl FnOnce(*mut u8)) -> Self {
+        if length == 0 {
+            return Self {
+                storage: std::ptr::null(),
+            };
+        }
+        let layout = Self::layout(length, is_latin1);
+        // SAFETY: The layout is nonzero; the header is written, then `write` fills the text.
+        unsafe {
+            let base = std::alloc::alloc(layout);
+            if base.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            base.cast::<RetainedStringHeader>().write(RetainedStringHeader {
+                references: std::sync::atomic::AtomicUsize::new(1),
+                length: u32::try_from(length).expect("retained string too long"),
+                is_latin1,
+            });
+            write(base.add(size_of::<RetainedStringHeader>()));
+            Self { storage: base.cast() }
         }
     }
 
+    fn header(&self) -> Option<&RetainedStringHeader> {
+        // SAFETY: A non-null storage is a live allocation starting with its header.
+        (!self.storage.is_null()).then(|| unsafe { &*self.storage.cast::<RetainedStringHeader>() })
+    }
+
+    /// Any text, which need not be well-formed UTF-16.
+    pub(crate) fn from_text(units: TokenizerInput<'_>) -> Self {
+        Self::from_units(units)
+    }
+
     fn from_units(units: TokenizerInput<'_>) -> Self {
-        use crate::css::css_tokenizer::SourceStorage;
-        Self::from_storage(match units {
-            TokenizerInput::Ascii(bytes) => {
-                assert!(bytes.is_ascii());
-                SourceStorage::Ascii(bytes.into())
-            }
+        match units {
+            TokenizerInput::Latin1(bytes) => Self::with_units(bytes.len(), true, |text| unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), text, bytes.len());
+            }),
             TokenizerInput::Utf16(units) if units.iter().all(|unit| *unit <= 0x7f) => {
-                SourceStorage::Ascii(units.iter().map(|unit| *unit as u8).collect())
+                Self::with_units(units.len(), true, |text| {
+                    for (index, unit) in units.iter().enumerate() {
+                        unsafe { text.add(index).write(*unit as u8) };
+                    }
+                })
             }
-            TokenizerInput::Utf16(units) => SourceStorage::Utf16(units.into()),
-        })
+            TokenizerInput::Utf16(units) => Self::with_units(units.len(), false, |text| unsafe {
+                std::ptr::copy_nonoverlapping(units.as_ptr(), text.cast::<u16>(), units.len());
+            }),
+        }
     }
 
     pub(crate) fn from_ascii(string: String) -> Self {
         assert!(string.is_ascii());
-        Self::from_storage(crate::css::css_tokenizer::SourceStorage::Ascii(
-            string.into_bytes().into_boxed_slice(),
-        ))
+        Self::from_units(TokenizerInput::Latin1(string.as_bytes()))
     }
 
     pub(crate) fn from_utf16(string: &[u16]) -> Option<Self> {
@@ -795,25 +884,44 @@ impl RetainedString {
         Some(Self::from_units(TokenizerInput::Utf16(string)))
     }
 
+    /// The text as UTF-16 code units.
+    #[cfg(test)]
+    pub(crate) fn to_utf16(&self) -> Vec<u16> {
+        let units = self.units();
+        let mut text = Vec::with_capacity(units.len());
+        units.append_to(&mut text);
+        text
+    }
+
     pub(crate) fn units(&self) -> TokenizerInput<'_> {
-        use crate::css::css_tokenizer::SourceStorage;
-        match unsafe { &*self.storage.cast::<SourceStorage>() } {
-            SourceStorage::Ascii(bytes) => TokenizerInput::Ascii(bytes),
-            SourceStorage::Utf16(units) => TokenizerInput::Utf16(units),
+        let Some(header) = self.header() else {
+            return TokenizerInput::Latin1(&[]);
+        };
+        let length = header.length as usize;
+        // SAFETY: The text follows the header, `length` units of the kind the header names.
+        unsafe {
+            let text = self.storage.cast::<u8>().add(size_of::<RetainedStringHeader>());
+            if header.is_latin1 {
+                TokenizerInput::Latin1(ak::slice_from_raw_parts(text, length))
+            } else {
+                TokenizerInput::Utf16(ak::slice_from_raw_parts(text.cast::<u16>(), length))
+            }
         }
     }
 
     pub(crate) fn url_input(&self) -> liburl_rust::url::UrlInput<'_> {
         match self.units() {
-            TokenizerInput::Ascii(bytes) => {
+            // SAFETY: ASCII is UTF-8.
+            TokenizerInput::Latin1(bytes) if bytes.is_ascii() => {
                 liburl_rust::url::UrlInput::Utf8(unsafe { std::str::from_utf8_unchecked(bytes) })
             }
+            TokenizerInput::Latin1(bytes) => liburl_rust::url::UrlInput::Latin1(bytes),
             TokenizerInput::Utf16(units) => liburl_rust::url::UrlInput::Utf16(units),
         }
     }
 
     pub(crate) fn ascii_bytes(&self) -> &[u8] {
-        let TokenizerInput::Ascii(bytes) = self.units() else {
+        let TokenizerInput::Latin1(bytes) = self.units() else {
             panic!("Expected a serialized ASCII URL")
         };
         bytes
@@ -848,32 +956,31 @@ impl PartialEq for RetainedString {
 
 impl Clone for RetainedString {
     fn clone(&self) -> Self {
-        unsafe { Arc::increment_strong_count(self.storage.cast::<crate::css::css_tokenizer::SourceStorage>()) };
+        if let Some(header) = self.header() {
+            header.references.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Self { storage: self.storage }
     }
 }
 
 impl Drop for RetainedString {
     fn drop(&mut self) {
-        unsafe { Arc::decrement_strong_count(self.storage.cast::<crate::css::css_tokenizer::SourceStorage>()) };
+        let Some(header) = self.header() else {
+            return;
+        };
+        if header.references.fetch_sub(1, std::sync::atomic::Ordering::Release) != 1 {
+            return;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let layout = Self::layout(header.length as usize, header.is_latin1);
+        // SAFETY: The last reference frees the allocation it was made in.
+        unsafe { std::alloc::dealloc(self.storage.cast_mut().cast::<u8>(), layout) };
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_css_url_text_view(text: &RetainedString) -> crate::css::ffi_support::FfiUtf16View {
-    use crate::css::ffi_support::FfiUtf16View;
-    match text.units() {
-        TokenizerInput::Ascii(bytes) => FfiUtf16View {
-            ascii: bytes.as_ptr(),
-            utf16: std::ptr::null(),
-            length: bytes.len(),
-        },
-        TokenizerInput::Utf16(units) => FfiUtf16View {
-            ascii: std::ptr::null(),
-            utf16: units.as_ptr(),
-            length: units.len(),
-        },
-    }
+pub extern "C" fn rust_css_url_text_view(text: &RetainedString) -> crate::css::ffi_support::FfiUtf16View<'_> {
+    crate::css::ffi_support::FfiUtf16View::from_input(text.units())
 }
 
 /// A retained CSS request URL modifier: the modifier type and either an enum value or a retained
@@ -900,14 +1007,6 @@ pub struct FfiCounterDefinition {
     name: usize,
     is_reversed: bool,
     value: RetainedStyleValueData,
-}
-
-#[repr(C)]
-pub struct FfiImageSetOption {
-    image: RetainedStyleValueData,
-    resolution: RetainedStyleValueData,
-    has_type: bool,
-    type_string: usize,
 }
 
 impl RetainedRequestUrlModifier {
@@ -1011,7 +1110,7 @@ impl RetainedByteList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -1099,23 +1198,6 @@ pub struct RetainedImageSetOptionList {
     length: usize,
 }
 
-impl RetainedImageSetOptionList {
-    unsafe fn from_raw(elements: *const FfiImageSetOption, length: usize) -> Self {
-        let elements = (0..length)
-            .map(|i| {
-                let element = unsafe { &*elements.add(i) };
-                RetainedImageSetOption {
-                    image: unsafe { std::ptr::read(&raw const element.image) },
-                    resolution: unsafe { std::ptr::read(&raw const element.resolution) },
-                    has_type: element.has_type,
-                    type_string: unsafe { CssString::from_leaked_raw(element.type_string) },
-                }
-            })
-            .collect();
-        Self::from_retained_elements(elements)
-    }
-}
-
 retained_list_drop!(RetainedImageSetOptionList);
 
 impl Clone for RetainedImageSetOptionList {
@@ -1142,11 +1224,24 @@ pub struct RetainedColorStopList {
     length: usize,
 }
 
-retained_list!(RetainedColorStopList, RetainedColorStop);
+retained_list!(RetainedColorStopList, RetainedColorStop, native);
 
 impl RetainedCounterDefinition {
     pub(crate) fn value(&self) -> &RetainedStyleValueData {
         &self.value
+    }
+
+    /// The counter's integer, or none when the definition leaves it out. A computed value only
+    /// ever holds an integer or a calculation that resolves to one.
+    pub(crate) fn integer(&self) -> Option<i32> {
+        match self.value.optional_data()? {
+            StyleValueData::Integer { value } => Some(*value),
+            calculated @ StyleValueData::Calculated { .. } => Some(
+                crate::css::calc::resolve_calculated_integer_without_context(calculated)
+                    .expect("a computed counter value resolves to an integer"),
+            ),
+            _ => panic!("a computed counter value is an integer"),
+        }
     }
 }
 
@@ -1199,7 +1294,7 @@ macro_rules! retained_list_as_slice {
                 if self.pointer.is_null() {
                     return &[];
                 }
-                unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+                unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
             }
         }
     };
@@ -1294,7 +1389,7 @@ impl RetainedColorStopList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 }
 
@@ -1408,7 +1503,6 @@ retained_list!(RetainedLinearEasingStopList, RetainedLinearEasingStop, native);
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 // The C++ constructor supplies every variant through the FFI input.
-#[allow(dead_code)]
 pub enum GridTrackEntryKind {
     LineNames,
     Size,
@@ -1445,7 +1539,7 @@ impl RetainedGridTrackEntryList {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer.cast(), self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer.cast(), self.length) }
     }
 
     pub(crate) fn from_retained_entries(entries: Vec<RetainedGridTrackEntry>) -> Self {
@@ -1479,10 +1573,14 @@ impl RetainedGridTrackEntry {
     }
 
     pub(crate) fn size(value: StyleValueData) -> Self {
+        Self::retained_size(RetainedStyleValueData::from_owned(value))
+    }
+
+    fn retained_size(size_value: RetainedStyleValueData) -> Self {
         Self {
             kind: GridTrackEntryKind::Size,
             names: CssStringList::from_strings(Vec::new()),
-            size_value: RetainedStyleValueData::from_owned(value),
+            size_value,
             min_value: RetainedStyleValueData::none(),
             max_value: RetainedStyleValueData::none(),
             repeat_type: 0,
@@ -1576,6 +1674,10 @@ pub struct RetainedNumericRangeByType {
 }
 
 impl RetainedNumericRangeByType {
+    pub(crate) fn new(value_type: u8, min: f64, max: f64) -> Self {
+        Self { value_type, min, max }
+    }
+
     pub(crate) fn value_type(&self) -> u8 {
         self.value_type
     }
@@ -1609,11 +1711,25 @@ impl RetainedNumericRangeList {
         Self { pointer, length }
     }
 
+    pub(crate) fn from_numeric_ranges(ranges: impl IntoIterator<Item = (u8, f64, f64)>) -> Self {
+        let ranges = ranges
+            .into_iter()
+            .map(|(value_type, min, max)| RetainedNumericRangeByType { value_type, min, max })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            return Self::empty();
+        }
+        let ranges = ranges.into_boxed_slice();
+        let length = ranges.len();
+        let pointer = Box::into_raw(ranges) as *mut RetainedNumericRangeByType;
+        Self { pointer, length }
+    }
+
     pub(crate) fn as_slice(&self) -> &[RetainedNumericRangeByType] {
         if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.pointer, self.length) }
+        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
     }
 
     pub(crate) fn clone_owned(&self) -> Self {
@@ -1641,7 +1757,7 @@ macro_rules! retained_list_partial_eq {
                     if list.pointer.is_null() {
                         &[]
                     } else {
-                        unsafe { std::slice::from_raw_parts(list.pointer.cast::<$element>(), list.length) }
+                        unsafe { ak::slice_from_raw_parts(list.pointer.cast::<$element>(), list.length) }
                     }
                 };
                 as_slice(self) == as_slice(other)
@@ -1672,7 +1788,6 @@ retained_list_send_sync!(RetainedGridTrackEntryList, RetainedGridTrackEntry);
 retained_list_send_sync!(RetainedShapePointList, RetainedShapePoint);
 retained_list_send_sync!(RetainedNumericRangeList, RetainedNumericRangeByType);
 
-retained_list_partial_eq!(RetainedStyleValueDataList, RetainedStyleValueData);
 retained_list_partial_eq!(RetainedPropertyIdList, u16);
 retained_list_partial_eq!(RetainedRequestUrlModifierList, RetainedRequestUrlModifier);
 retained_list_partial_eq!(RetainedByteList, u8);
@@ -1727,6 +1842,160 @@ pub struct BasicShapeData {
     pub(crate) v4: RetainedStyleValueData,
     pub(crate) points: RetainedShapePointList,
     pub(crate) path: crate::css::css_path::CssPath,
+    /// The commands of a shape(), whose coordinates are `points` in order.
+    pub(crate) commands: ShapeCommands,
+}
+
+/// https://drafts.csswg.org/css-shapes-1/#shape-function
+/// One command of a shape(). Its points, in order, are its end point, then its control points, or its arc's
+/// radii and rotation. Each point holds two length-percentages, the two edges of a position, or a keyword.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeCommand {
+    pub(crate) kind: ShapeCommandKind,
+    /// Whether the end point is given with `by`, relative to the command's starting point.
+    pub(crate) relative: bool,
+    /// What each control point is relative to.
+    pub(crate) control_points: [ShapeControlPointAnchor; 2],
+    pub(crate) control_point_count: u8,
+    /// Whether an arc's single radius applies to both axes.
+    pub(crate) arc_has_one_radius: bool,
+    pub(crate) arc_clockwise: bool,
+    pub(crate) arc_large: bool,
+    /// Whether an arc's rotation was given. Arcs hold their rotation angle as a third point either way.
+    pub(crate) arc_has_rotation: bool,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeCommandKind {
+    From,
+    Move,
+    Line,
+    HorizontalLine,
+    VerticalLine,
+    Curve,
+    Smooth,
+    Arc,
+    Close,
+}
+
+/// What a shape() control point is relative to: the command's start or end point, or the reference box.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeControlPointAnchor {
+    Start,
+    End,
+    Origin,
+}
+
+impl ShapeCommand {
+    pub(crate) fn new(kind: ShapeCommandKind, relative: bool) -> Self {
+        Self {
+            kind,
+            relative,
+            control_points: [ShapeControlPointAnchor::Start; 2],
+            control_point_count: 0,
+            arc_has_one_radius: false,
+            arc_clockwise: false,
+            arc_large: false,
+            arc_has_rotation: false,
+        }
+    }
+}
+
+/// The commands of a shape().
+#[repr(C)]
+pub struct ShapeCommands {
+    pointer: *mut ShapeCommand,
+    length: usize,
+}
+
+retained_list!(ShapeCommands, ShapeCommand, native);
+retained_list_as_slice!(ShapeCommands, ShapeCommand);
+retained_list_from_vec!(ShapeCommands, ShapeCommand);
+retained_list_send_sync!(ShapeCommands, ShapeCommand);
+
+impl ShapeCommands {
+    pub(crate) fn new(commands: Vec<ShapeCommand>) -> Self {
+        Self::from_retained_elements(commands)
+    }
+}
+
+impl Default for ShapeCommands {
+    fn default() -> Self {
+        Self {
+            pointer: std::ptr::null_mut(),
+            length: 0,
+        }
+    }
+}
+
+impl PartialEq for ShapeCommands {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+/// The box a [`StyleValueData`] variant too large to sit beside the tag keeps its payload in, laid
+/// out as one pointer C++ reads the payload through.
+#[repr(C)]
+pub struct StyleValueBox<T> {
+    pointer: std::ptr::NonNull<T>,
+}
+
+// SAFETY: The box owns its payload as a `Box` would.
+unsafe impl<T: Send> Send for StyleValueBox<T> {}
+unsafe impl<T: Sync> Sync for StyleValueBox<T> {}
+
+impl<T> StyleValueBox<T> {
+    pub(crate) fn new(payload: T) -> Self {
+        Self {
+            pointer: std::ptr::NonNull::from(Box::leak(Box::new(payload))),
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> T {
+        let pointer = self.pointer.as_ptr();
+        std::mem::forget(self);
+        // SAFETY: The box owned the payload it leaked in `new`, and is forgotten.
+        *unsafe { Box::from_raw(pointer) }
+    }
+}
+
+impl<T> std::ops::Deref for StyleValueBox<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: The box owns a live payload.
+        unsafe { self.pointer.as_ref() }
+    }
+}
+
+impl<T> std::ops::DerefMut for StyleValueBox<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: The box owns a live payload, and `&mut self` borrows it exclusively.
+        unsafe { self.pointer.as_mut() }
+    }
+}
+
+impl<T: Clone> Clone for StyleValueBox<T> {
+    fn clone(&self) -> Self {
+        Self::new((**self).clone())
+    }
+}
+
+impl<T: PartialEq> PartialEq for StyleValueBox<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T> Drop for StyleValueBox<T> {
+    fn drop(&mut self) {
+        // SAFETY: The box owns the payload it leaked in `new`.
+        drop(unsafe { Box::from_raw(self.pointer.as_ptr()) });
+    }
 }
 
 /// A Rust-owned shape allocation with an explicit pointer layout for C++ bindings.
@@ -1771,6 +2040,10 @@ impl Drop for OwnedBasicShapeData {
     }
 }
 
+/// The `function` of `StyleValueData::Counter`.
+pub(crate) const COUNTER_FUNCTION_COUNTER: u8 = 0;
+pub(crate) const COUNTER_FUNCTION_COUNTERS: u8 = 1;
+
 /// The data of a single immutable CSS style value.
 ///
 /// Variant payload fields are read directly by the corresponding C++ StyleValue subclass, so
@@ -1778,7 +2051,6 @@ impl Drop for OwnedBasicShapeData {
 /// The byte discriminant shares each variant's padding instead of preceding a separate union.
 #[repr(u8)]
 // NB: Variant payload fields are only read by C++ through the exposed layout.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq)]
 pub enum StyleValueData {
     /// A CSS keyword. The value is the generated C++ `enum class Keyword : u16`, opaque to Rust.
@@ -1788,43 +2060,28 @@ pub enum StyleValueData {
     /// A CSS `<integer>`.
     Integer { value: i32 },
     /// A CSS `<angle>`. The unit is the C++ `enum class AngleUnit : u8`, opaque to Rust.
-    Angle { value: f64, unit: u8 },
+    Angle { unit: u8, value: f64 },
     /// A CSS `<flex>`. The unit is the C++ `enum class FlexUnit : u8`, opaque to Rust.
-    Flex { value: f64, unit: u8 },
+    Flex { unit: u8, value: f64 },
     /// A CSS `<frequency>`. The unit is the C++ `enum class FrequencyUnit : u8`, opaque to Rust.
-    Frequency { value: f64, unit: u8 },
+    Frequency { unit: u8, value: f64 },
     /// A CSS `<length>`. The unit is the C++ `enum class LengthUnit : u8`, opaque to Rust.
-    Length { value: f64, unit: u8 },
+    Length { unit: u8, value: f64 },
     /// A CSS `<percentage>`.
     Percentage { value: f64 },
     /// A CSS `<resolution>`. The unit is the C++ `enum class ResolutionUnit : u8`, opaque to Rust.
-    Resolution { value: f64, unit: u8 },
+    Resolution { unit: u8, value: f64 },
     /// A CSS `<time>`. The unit is the C++ `enum class TimeUnit : u8`, opaque to Rust.
-    Time { value: f64, unit: u8 },
+    Time { unit: u8, value: f64 },
     /// A basic shape. Kinds: inset (0), xywh (1) and rect (2) use five retained value slots;
     /// circle (3) and ellipse (4) use two; polygon (5) uses the fill rule and points; path (6)
     /// uses the fill rule and the retained serialized path data string.
     BasicShape { shape: OwnedBasicShapeData },
     /// A calc() or other math function: the retained calculation node tree root, its resolved
     /// numeric type, and the parse-time calculation context.
-    Calculated {
-        /// The resolve-against target, base-mapped at creation: whether one
-        /// exists, whether it is the number type, and otherwise its base type
-        /// index in the numeric type order.
-        resolve_as_is_number: bool,
-        resolve_as_base: u8,
-        has_percentages_resolve_as: bool,
-        percentages_resolve_as: u8,
-        resolve_numbers_as_integers: bool,
-        rust_calculation: crate::css::calc::CalcNodeHandle,
-        resolved_type: crate::css::calc::FfiNumericType,
-        accepted_ranges: RetainedNumericRangeList,
-    },
+    Calculated(StyleValueBox<CalculatedPayload>),
     /// A CSS `<ratio>`, e.g. `16 / 9`. The numerator and denominator are style values.
-    Ratio {
-        numerator: RetainedStyleValueData,
-        denominator: RetainedStyleValueData,
-    },
+    Ratio(StyleValueBox<RatioPayload>),
     /// A unicode-range, e.g. `U+0025-00FF`.
     UnicodeRange { min_code_point: u32, max_code_point: u32 },
     /// A CSS `<opacity-value>`: a number, percentage or calculated style value.
@@ -1851,41 +2108,28 @@ pub enum StyleValueData {
     },
     /// superellipse() with its retained parameter style value.
     Superellipse { parameter: RetainedStyleValueData },
-    /// A pending-substitution value retaining the shorthand value it came from.
+    /// A pending-substitution value retaining the shorthand it is part of and the value that
+    /// shorthand was written with.
     PendingSubstitution {
+        original_shorthand: u16,
         original_shorthand_value: RetainedStyleValueData,
     },
     /// scrollbar-color with retained thumb and track color values.
-    ScrollbarColor {
-        thumb_color: RetainedStyleValueData,
-        track_color: RetainedStyleValueData,
-    },
+    ScrollbarColor(StyleValueBox<ScrollbarColorPayload>),
     /// rect() with four retained edge style values.
-    Rect {
-        top: RetainedStyleValueData,
-        right: RetainedStyleValueData,
-        bottom: RetainedStyleValueData,
-        left: RetainedStyleValueData,
-    },
+    Rect(StyleValueBox<RectPayload>),
     /// A CSS `<string>`, with its animation-name custom-ident classification captured when C++
     /// creates the immutable value so computation does not read the string across FFI.
     String {
-        string: CssString,
         is_valid_animation_name_custom_ident: bool,
+        serialize_without_quotes: bool,
+        string: CssString,
     },
     /// An unrecognized CSS function, kept as its name and argument value.
-    Function {
-        name: CssString,
-        value: RetainedStyleValueData,
-    },
+    Function(StyleValueBox<FunctionPayload>),
     /// An OpenType tag with its value, from font-feature-settings or font-variation-settings.
     /// The mode is the C++ OpenTypeTaggedStyleValue::Mode, opaque to Rust.
-    OpenTypeTagged {
-        mode: u8,
-        tag_name: CssString,
-        packed_tag: u32,
-        value: RetainedStyleValueData,
-    },
+    OpenTypeTagged(StyleValueBox<OpenTypeTaggedPayload>),
     /// font-style: a keyword (the C++ `enum class FontStyleKeyword : u8`, opaque to Rust) and
     /// an optional oblique angle style value (null when absent).
     FontStyle {
@@ -1894,9 +2138,9 @@ pub enum StyleValueData {
     },
     /// text-indent: a length-percentage style value plus the hanging and each-line flags.
     TextIndent {
-        length_percentage: RetainedStyleValueData,
         hanging: bool,
         each_line: bool,
+        length_percentage: RetainedStyleValueData,
     },
     /// overflow-clip-margin: an optional visual box (the C++ `enum class BackgroundBox : u8`,
     /// opaque to Rust) and an offset style value.
@@ -1909,218 +2153,84 @@ pub enum StyleValueData {
     /// opaque to Rust.
     TreeCountingFunction { function: u8, computed_type: u8 },
     /// background-size with its two retained size style values.
-    BackgroundSize {
-        size_x: RetainedStyleValueData,
-        size_y: RetainedStyleValueData,
-    },
+    BackgroundSize(StyleValueBox<BackgroundSizePayload>),
     /// A background repeat-style. Both fields are the C++ `enum class Repetition : u8`, opaque
     /// to Rust.
     RepeatStyle { repeat_x: u8, repeat_y: u8 },
     /// border-image-slice: four retained offset data allocations and the fill keyword.
-    BorderImageSlice {
-        top: RetainedStyleValueData,
-        right: RetainedStyleValueData,
-        bottom: RetainedStyleValueData,
-        left: RetainedStyleValueData,
-        fill: bool,
-    },
+    BorderImageSlice(StyleValueBox<BorderImageSlicePayload>),
     /// anchor-size(): an optional anchor name, an optional size keyword (the C++ `enum class
     /// AnchorSize : u8`, opaque to Rust) and an optional retained fallback value.
-    AnchorSize {
-        has_anchor_name: bool,
-        anchor_name: CssString,
-        has_anchor_size: bool,
-        anchor_size: u8,
-        fallback_value: RetainedStyleValueData,
-    },
+    AnchorSize(StyleValueBox<AnchorSizePayload>),
     /// anchor(): an optional anchor name, the retained side style value and an optional
     /// retained fallback value.
-    Anchor {
-        has_anchor_name: bool,
-        anchor_name: CssString,
-        anchor_side: RetainedStyleValueData,
-        fallback_value: RetainedStyleValueData,
-    },
+    Anchor(StyleValueBox<AnchorPayload>),
     /// A CSS `<position>` with its two retained edge style values.
-    Position {
-        edge_x: RetainedStyleValueData,
-        edge_y: RetainedStyleValueData,
-    },
+    Position(StyleValueBox<PositionPayload>),
     /// A shadow. The type and placement are C++ enums, opaque to Rust; the color, blur radius
     /// and spread distance are optional retained style values (null when absent).
-    Shadow {
-        shadow_type: u8,
-        color: RetainedStyleValueData,
-        offset_x: RetainedStyleValueData,
-        offset_y: RetainedStyleValueData,
-        blur_radius: RetainedStyleValueData,
-        spread_distance: RetainedStyleValueData,
-        placement: u8,
-    },
+    Shadow(StyleValueBox<ShadowPayload>),
     /// content with its retained content list and optional alt-text list (null when absent).
-    Content {
-        content: RetainedStyleValueData,
-        alt_text: RetainedStyleValueData,
-    },
+    Content(StyleValueBox<ContentPayload>),
     /// A @counter-style system descriptor: a plain system keyword (kind 0, the C++ `enum class
     /// CounterStyleSystem : u8`, opaque to Rust), fixed with an optional retained first symbol
     /// (kind 1), or extends with a retained counter style name (kind 2).
-    CounterStyleSystem {
-        kind: u8,
-        system: u8,
-        first_symbol: RetainedStyleValueData,
-        name: CssString,
-    },
+    CounterStyleSystem(StyleValueBox<CounterStyleSystemPayload>),
     /// A counter style reference: either a retained counter style name, or a symbols() function
-    /// with its type (the C++ `enum class SymbolsType : u8`, opaque to Rust) and retained
-    /// symbol strings.
-    CounterStyle {
-        is_symbols: bool,
-        name: CssString,
-        symbols_type: u8,
-        symbols: CssStringList,
-    },
+    /// with its type (a `css_enums::symbols_type` value) and retained symbol strings.
+    CounterStyle(StyleValueBox<CounterStylePayload>),
     /// A color function such as rgb() or oklch(): three retained channel values, an optional
     /// retained alpha, an optional name and an optional retained origin color for relative
     /// color syntax.
-    ColorFunction {
-        color_base: ColorBase,
-        channel_0: RetainedStyleValueData,
-        channel_1: RetainedStyleValueData,
-        channel_2: RetainedStyleValueData,
-        alpha: RetainedStyleValueData,
-        has_name: bool,
-        name: CssString,
-        origin_color: RetainedStyleValueData,
-    },
-    /// color-mix() with its optional retained interpolation method value and two components,
-    /// each a retained color with an optional retained percentage.
-    ColorMix {
-        color_base: ColorBase,
-        color_interpolation_method: RetainedStyleValueData,
-        first_color: RetainedStyleValueData,
-        first_percentage: RetainedStyleValueData,
-        second_color: RetainedStyleValueData,
-        second_percentage: RetainedStyleValueData,
-    },
+    ColorFunction(StyleValueBox<ColorFunctionPayload>),
+    /// color-mix() with its optional retained interpolation method value and its mix items:
+    /// one or more retained colors, each with an optional retained percentage. The two lists
+    /// have the same length, and an omitted percentage is a null entry.
+    ColorMix(StyleValueBox<ColorMixPayload>),
     /// The shared data of every color style value: an optional color type and the color syntax
     /// (both C++ enums on ColorStyleValue, opaque to Rust).
     /// linear-gradient(): a direction (either a retained angle value or a side-or-corner
     /// keyword), the retained color stops, the gradient type, the repeating flag, an optional
     /// retained interpolation method and the color syntax. Enums are C++ types, opaque to Rust.
-    LinearGradient {
-        has_direction_value: bool,
-        direction_value: RetainedStyleValueData,
-        side_or_corner: u8,
-        color_stop_list: RetainedColorStopList,
-        gradient_type: u8,
-        repeating: bool,
-        color_interpolation_method: RetainedStyleValueData,
-        color_syntax: u8,
-    },
+    LinearGradient(StyleValueBox<LinearGradientPayload>),
     /// conic-gradient(): an optional retained from-angle, the retained position, the retained
     /// color stops, the repeating flag, an optional retained interpolation method and the color
     /// syntax (a C++ enum, opaque to Rust).
-    ConicGradient {
-        from_angle: RetainedStyleValueData,
-        position: RetainedStyleValueData,
-        color_stop_list: RetainedColorStopList,
-        repeating: bool,
-        color_interpolation_method: RetainedStyleValueData,
-        color_syntax: u8,
-    },
+    ConicGradient(StyleValueBox<ConicGradientPayload>),
     /// radial-gradient(): the ending shape (a C++ enum, opaque to Rust), the retained size and
     /// position values, the retained color stops, the repeating flag, an optional retained
     /// interpolation method and the color syntax.
-    RadialGradient {
-        ending_shape: u8,
-        size: RetainedStyleValueData,
-        position: RetainedStyleValueData,
-        color_stop_list: RetainedColorStopList,
-        repeating: bool,
-        color_interpolation_method: RetainedStyleValueData,
-        color_syntax: u8,
-    },
+    RadialGradient(StyleValueBox<RadialGradientPayload>),
     /// A url() image. The resource context is snapshotted into computed images so a later C++
     /// wrapper can remain a lazy consumer adapter. Loading state stays on the C++ side.
-    Image {
-        url: RetainedString,
-        url_type: u8,
-        url_modifiers: RetainedRequestUrlModifierList,
-        resource_context: ImageResourceContext,
-    },
+    Image(StyleValueBox<ImagePayload>),
     /// image-set() with its retained options.
-    ImageSet { options: RetainedImageSetOptionList },
+    ImageSet(StyleValueBox<ImageSetPayload>),
     /// An easing function: linear() with its retained stops (kind 0), cubic-bezier() with four
     /// retained control values (kind 1), or steps() with a retained interval count and a step
     /// position (kind 2, the C++ `enum class StepPosition : u8`, opaque to Rust).
-    Easing {
-        kind: u8,
-        step_position: u8,
-        linear_stops: RetainedLinearEasingStopList,
-        x1: RetainedStyleValueData,
-        y1: RetainedStyleValueData,
-        x2: RetainedStyleValueData,
-        y2: RetainedStyleValueData,
-        number_of_intervals: RetainedStyleValueData,
-    },
+    Easing(StyleValueBox<EasingPayload>),
     /// A cursor with its retained image value and optional retained hotspot coordinates (both
     /// null or both non-null).
-    Cursor {
-        image: RetainedStyleValueData,
-        x: RetainedStyleValueData,
-        y: RetainedStyleValueData,
-    },
+    Cursor(StyleValueBox<CursorPayload>),
     /// A grid track size list: the subgrid and preserve-line-name-sets flags and the retained
     /// track entries.
-    GridTrackSizeList {
-        is_subgrid: bool,
-        preserve_line_name_sets: bool,
-        entries: RetainedGridTrackEntryList,
-    },
+    GridTrackSizeList(StyleValueBox<GridTrackSizeListPayload>),
     /// grid-template-areas with its retained named areas and the row and column counts.
-    GridTemplateArea {
-        grid_areas: RetainedGridAreaList,
-        row_count: usize,
-        column_count: usize,
-    },
+    GridTemplateArea(StyleValueBox<GridTemplateAreaPayload>),
     /// counter-increment, counter-reset or counter-set with its retained counter definitions.
-    CounterDefinitions {
-        counter_definitions: RetainedCounterDefinitionList,
-    },
+    CounterDefinitions(StyleValueBox<CounterDefinitionsPayload>),
     /// A grid-row/grid-column placement: auto (0), a span (1) or an area/line (2), with an
     /// optional retained line value and an optional retained name.
-    GridTrackPlacement {
-        kind: u8,
-        value: RetainedStyleValueData,
-        has_name: bool,
-        name: CssString,
-        implicit_start_name: CssString,
-        implicit_end_name: CssString,
-    },
-    /// counter() or counters(). The function is the C++ CounterFunction enum, opaque to Rust;
-    /// the join string is empty for counter().
-    Counter {
-        function: u8,
-        counter_name: CssString,
-        counter_style: RetainedStyleValueData,
-        join_string: CssString,
-    },
+    GridTrackPlacement(StyleValueBox<GridTrackPlacementPayload>),
+    /// counter() or counters(). The function is `COUNTER_FUNCTION_COUNTER` or
+    /// `COUNTER_FUNCTION_COUNTERS`; the join string is empty for counter().
+    Counter(StyleValueBox<CounterPayload>),
     /// light-dark() with its two retained color style values.
-    LightDark {
-        color_base: ColorBase,
-        light: RetainedStyleValueData,
-        dark: RetainedStyleValueData,
-    },
+    LightDark(StyleValueBox<LightDarkPayload>),
     /// random-value-sharing: an optional retained fixed value (null when absent), the auto flag,
     /// an optional name and the element-shared flag.
-    RandomValueSharing {
-        fixed_value: RetainedStyleValueData,
-        is_auto: bool,
-        has_name: bool,
-        name: CssString,
-        element_shared: bool,
-    },
+    RandomValueSharing(StyleValueBox<RandomValueSharingPayload>),
     /// scrollbar-gutter. The value is the C++ `enum class ScrollbarGutter : u8`, opaque to Rust.
     ScrollbarGutter { value: u8 },
     /// A color interpolation method: either a rectangular color space, or a polar color space
@@ -2134,9 +2244,9 @@ pub enum StyleValueData {
     /// A list of style values. The separator and collapsible flag come from the C++
     /// StyleValueList enums, opaque to Rust.
     ValueList {
-        values: RetainedStyleValueDataList,
         separator: u8,
         collapsible: bool,
+        values: RetainedStyleValueDataList,
     },
     /// A tuple of optional style values (null entries represent absent optionals).
     Tuple { values: RetainedStyleValueDataList },
@@ -2144,88 +2254,32 @@ pub enum StyleValueData {
     /// packed u8 enums), opaque to Rust.
     Display { raw: u32 },
     /// color-scheme with its retained scheme names and the only keyword flag.
-    ColorScheme {
-        schemes: CssStringList,
-        scheme_codes: RetainedByteList,
-        only: bool,
-    },
-    /// An unresolved value containing arbitrary substitution functions, kept as its retained
-    /// source text, an optional normalized comparison text (empty when absent), the presence
-    /// flags of each substitution function, the attr-taint flag, and an optional parsed value
-    /// cached for an attr()-tainted registered custom property.
-    Unresolved {
-        components: RetainedComponentValueList,
-        source_text: CssString,
-        value_comparison_text: CssString,
-        presence_attr: bool,
-        presence_dashed_function: bool,
-        presence_env: bool,
-        presence_if: bool,
-        presence_inherit: bool,
-        presence_var: bool,
-        contains_attr_tainted_values: bool,
-        parsed_value: RetainedStyleValueData,
-    },
+    ColorScheme(StyleValueBox<ColorSchemePayload>),
+    /// An unresolved value with retained source text and components, flags for substitution functions,
+    /// attr taint, and an optional parsed value cached for an attr()-tainted registered custom property.
+    Unresolved(UnresolvedBox),
     /// A CSS url() or src() with its retained URL string, type (the C++ URL::Type, opaque to
     /// Rust) and request URL modifiers.
-    Url {
-        url: RetainedString,
-        url_type: u8,
-        modifiers: RetainedRequestUrlModifierList,
-    },
+    Url(StyleValueBox<UrlPayload>),
     /// A @font-face source: either local() with a retained family name value, or a URL (encoded
     /// as in [`StyleValueData::Url`]) with an optional format string and a list of font
     /// technologies (C++ `enum class FontTech : u8`, opaque to Rust).
-    FontSource {
-        is_local: bool,
-        url_type: u8,
-        has_format: bool,
-        local_name: RetainedStyleValueData,
-        url: RetainedString,
-        url_modifiers: RetainedRequestUrlModifierList,
-        format: CssString,
-        tech: RetainedByteList,
-    },
+    FontSource(StyleValueBox<FontSourcePayload>),
     /// A radial gradient size: one or two components, each either a RadialExtent keyword (the
     /// C++ `enum class RadialExtent : u8`, opaque to Rust) or a retained style value.
-    RadialSize {
-        component_count: u8,
-        is_extent_0: bool,
-        extent_0: u8,
-        value_0: RetainedStyleValueData,
-        is_extent_1: bool,
-        extent_1: u8,
-        value_1: RetainedStyleValueData,
-    },
+    RadialSize(StyleValueBox<RadialSizePayload>),
     /// A transform function with its argument values. The property (PropertyID : u16) and
     /// function are C++ enums, opaque to Rust.
-    Transformation {
-        property: u16,
-        transform_function: u8,
-        values: RetainedStyleValueDataList,
-    },
+    Transformation(StyleValueBox<TransformationPayload>),
     /// A shorthand property value: the shorthand id, its longhand ids (both C++
     /// `enum class PropertyID : u16`, opaque to Rust) and their values.
-    Shorthand {
-        shorthand_property: u16,
-        sub_properties: RetainedPropertyIdList,
-        values: RetainedStyleValueDataList,
-    },
+    Shorthand(StyleValueBox<ShorthandPayload>),
     /// A CSS `<custom-ident>`.
     CustomIdent { custom_ident: CssString },
     /// A border-radius rect of four retained corner radius data allocations.
-    BorderRadiusRect {
-        top_left: RetainedStyleValueData,
-        top_right: RetainedStyleValueData,
-        bottom_right: RetainedStyleValueData,
-        bottom_left: RetainedStyleValueData,
-    },
+    BorderRadiusRect(StyleValueBox<BorderRadiusRectPayload>),
     /// A single corner radius: the horizontal and vertical radii and whether they differ.
-    BorderRadius {
-        is_elliptical: bool,
-        horizontal_radius: RetainedStyleValueData,
-        vertical_radius: RetainedStyleValueData,
-    },
+    BorderRadius(StyleValueBox<BorderRadiusPayload>),
     /// A filter function. Kinds: blur (0, value = radius), drop-shadow (1, value = shadow),
     /// hue-rotate (2, value = angle), color (3, value = amount, with the color operation).
     /// The kind and the color operation are C++ enum values, opaque to Rust.
@@ -2234,6 +2288,875 @@ pub enum StyleValueData {
         color_operation: u8,
         value: RetainedStyleValueData,
     },
+    /// https://drafts.csswg.org/motion-1/#ray-function
+    /// A ray() offset path: its angle, its <ray-size> keyword, whether it has `contain`, and its
+    /// optional `at <position>` (null when absent).
+    Ray(StyleValueBox<RayPayload>),
+}
+
+/// What a [`StyleValueData::Calculated`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct CalculatedPayload {
+    /// The resolve-against target, base-mapped at creation: whether one
+    /// exists, whether it is the number type, and otherwise its base type
+    /// index in the numeric type order.
+    pub resolve_as_is_number: bool,
+    pub resolve_as_base: u8,
+    pub has_percentages_resolve_as: bool,
+    pub percentages_resolve_as: u8,
+    pub resolve_numbers_as_integers: bool,
+    pub rust_calculation: crate::css::calc::CalcNodeHandle,
+    pub resolved_type: crate::css::calc::FfiNumericType,
+    pub accepted_ranges: RetainedNumericRangeList,
+}
+
+/// What a [`StyleValueData::Ratio`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct RatioPayload {
+    pub numerator: RetainedStyleValueData,
+    pub denominator: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::ScrollbarColor`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ScrollbarColorPayload {
+    pub thumb_color: RetainedStyleValueData,
+    pub track_color: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::Rect`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct RectPayload {
+    pub top: RetainedStyleValueData,
+    pub right: RetainedStyleValueData,
+    pub bottom: RetainedStyleValueData,
+    pub left: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::Function`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct FunctionPayload {
+    pub name: CssString,
+    pub value: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::OpenTypeTagged`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct OpenTypeTaggedPayload {
+    pub mode: u8,
+    pub tag_name: CssString,
+    pub packed_tag: u32,
+    pub value: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::BackgroundSize`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct BackgroundSizePayload {
+    pub size_x: RetainedStyleValueData,
+    pub size_y: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::BorderImageSlice`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct BorderImageSlicePayload {
+    pub top: RetainedStyleValueData,
+    pub right: RetainedStyleValueData,
+    pub bottom: RetainedStyleValueData,
+    pub left: RetainedStyleValueData,
+    pub fill: bool,
+}
+
+/// What a [`StyleValueData::AnchorSize`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct AnchorSizePayload {
+    pub has_anchor_name: bool,
+    pub anchor_name: CssString,
+    pub has_anchor_size: bool,
+    pub anchor_size: u8,
+    pub fallback_value: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::Anchor`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct AnchorPayload {
+    pub has_anchor_name: bool,
+    pub anchor_name: CssString,
+    pub anchor_side: RetainedStyleValueData,
+    pub fallback_value: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::Position`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct PositionPayload {
+    pub edge_x: RetainedStyleValueData,
+    pub edge_y: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::Shadow`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ShadowPayload {
+    pub shadow_type: u8,
+    pub color: RetainedStyleValueData,
+    pub offset_x: RetainedStyleValueData,
+    pub offset_y: RetainedStyleValueData,
+    pub blur_radius: RetainedStyleValueData,
+    pub spread_distance: RetainedStyleValueData,
+    pub placement: u8,
+}
+
+/// What a [`StyleValueData::Content`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ContentPayload {
+    pub content: RetainedStyleValueData,
+    pub alt_text: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::CounterStyleSystem`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct CounterStyleSystemPayload {
+    pub kind: u8,
+    pub system: u8,
+    pub first_symbol: RetainedStyleValueData,
+    pub name: CssString,
+}
+
+/// What a [`StyleValueData::CounterStyle`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct CounterStylePayload {
+    pub is_symbols: bool,
+    pub name: CssString,
+    pub symbols_type: u8,
+    pub symbols: CssStringList,
+}
+
+/// What a [`StyleValueData::ColorFunction`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ColorFunctionPayload {
+    pub color_base: ColorBase,
+    pub channel_0: RetainedStyleValueData,
+    pub channel_1: RetainedStyleValueData,
+    pub channel_2: RetainedStyleValueData,
+    pub alpha: RetainedStyleValueData,
+    pub has_name: bool,
+    pub name: CssString,
+    pub origin_color: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::ColorMix`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ColorMixPayload {
+    pub color_base: ColorBase,
+    pub color_interpolation_method: RetainedStyleValueData,
+    pub colors: RetainedStyleValueDataList,
+    pub percentages: RetainedStyleValueDataList,
+}
+
+/// What a [`StyleValueData::LinearGradient`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct LinearGradientPayload {
+    pub has_direction_value: bool,
+    pub direction_value: RetainedStyleValueData,
+    pub side_or_corner: u8,
+    pub color_stop_list: RetainedColorStopList,
+    pub gradient_type: u8,
+    pub repeating: bool,
+    pub color_interpolation_method: RetainedStyleValueData,
+    pub color_syntax: u8,
+}
+
+/// What a [`StyleValueData::ConicGradient`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ConicGradientPayload {
+    pub from_angle: RetainedStyleValueData,
+    pub position: RetainedStyleValueData,
+    pub color_stop_list: RetainedColorStopList,
+    pub repeating: bool,
+    pub color_interpolation_method: RetainedStyleValueData,
+    pub color_syntax: u8,
+}
+
+/// What a [`StyleValueData::RadialGradient`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct RadialGradientPayload {
+    pub ending_shape: u8,
+    pub size: RetainedStyleValueData,
+    pub position: RetainedStyleValueData,
+    pub color_stop_list: RetainedColorStopList,
+    pub repeating: bool,
+    pub color_interpolation_method: RetainedStyleValueData,
+    pub color_syntax: u8,
+}
+
+/// What a [`StyleValueData::Image`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ImagePayload {
+    pub url: RetainedString,
+    pub url_type: u8,
+    pub url_modifiers: RetainedRequestUrlModifierList,
+    pub resource_context: ImageResourceContext,
+}
+
+/// What a [`StyleValueData::ImageSet`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ImageSetPayload {
+    pub options: RetainedImageSetOptionList,
+}
+
+/// What a [`StyleValueData::Easing`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct EasingPayload {
+    pub kind: u8,
+    pub step_position: u8,
+    pub is_keyword: bool,
+    pub linear_stops: RetainedLinearEasingStopList,
+    pub x1: RetainedStyleValueData,
+    pub y1: RetainedStyleValueData,
+    pub x2: RetainedStyleValueData,
+    pub y2: RetainedStyleValueData,
+    pub number_of_intervals: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::Cursor`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct CursorPayload {
+    pub image: RetainedStyleValueData,
+    pub x: RetainedStyleValueData,
+    pub y: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::GridTrackSizeList`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct GridTrackSizeListPayload {
+    pub is_subgrid: bool,
+    pub preserve_line_name_sets: bool,
+    pub entries: RetainedGridTrackEntryList,
+}
+
+/// What a [`StyleValueData::GridTemplateArea`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct GridTemplateAreaPayload {
+    pub grid_areas: RetainedGridAreaList,
+    pub row_count: usize,
+    pub column_count: usize,
+}
+
+/// What a [`StyleValueData::CounterDefinitions`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct CounterDefinitionsPayload {
+    pub counter_definitions: RetainedCounterDefinitionList,
+}
+
+/// What a [`StyleValueData::GridTrackPlacement`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct GridTrackPlacementPayload {
+    pub kind: u8,
+    pub value: RetainedStyleValueData,
+    pub has_name: bool,
+    pub name: CssString,
+    pub implicit_start_name: CssString,
+    pub implicit_end_name: CssString,
+}
+
+/// What a [`StyleValueData::Counter`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct CounterPayload {
+    pub function: u8,
+    pub counter_name: CssString,
+    pub counter_style: RetainedStyleValueData,
+    pub join_string: CssString,
+}
+
+/// What a [`StyleValueData::LightDark`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct LightDarkPayload {
+    pub color_base: ColorBase,
+    pub light: RetainedStyleValueData,
+    pub dark: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::RandomValueSharing`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct RandomValueSharingPayload {
+    pub fixed_value: RetainedStyleValueData,
+    pub is_auto: bool,
+    pub has_name: bool,
+    pub name: CssString,
+    pub element_shared: bool,
+}
+
+/// What a [`StyleValueData::ColorScheme`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ColorSchemePayload {
+    pub schemes: CssStringList,
+    pub scheme_codes: RetainedByteList,
+    pub only: bool,
+}
+
+/// What an unresolved value's text holds, found once when the value is made from the components it
+/// tokenizes to: which substitution functions it uses (bits 0-5, in the order of
+/// `SubstitutionFunctionsPresence`'s fields), whether it is a lone CSS-wide keyword (bit 6), whether
+/// it calls a tree-counting function (bit 7), whether it references a custom property by name (bit
+/// 8), whether a reference names its property by anything but a plain identifier (bit 9), and
+/// whether the engine serialized the text from tokens, so that its comments only keep tokens apart
+/// (bit 10).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct UnresolvedFacts(u16);
+
+const _: () = assert!(size_of::<UnresolvedFacts>() == 2);
+
+impl UnresolvedFacts {
+    const LONE_CSS_WIDE_KEYWORD: u16 = 1 << 6;
+    const CALLS_TREE_COUNTING_FUNCTION: u16 = 1 << 7;
+    const NAMES_CUSTOM_PROPERTIES: u16 = 1 << 8;
+    const HIDES_A_REFERENCE: u16 = 1 << 9;
+    const SERIALIZED_BY_THE_ENGINE: u16 = 1 << 10;
+
+    /// The facts of a value whose text tokenizes to `values` and uses the substitution functions
+    /// `presence` says, beside those of the custom properties it references.
+    pub(crate) fn of(values: &[ComponentValue], presence: SubstitutionFunctionsPresence) -> Self {
+        let presence_bits = [
+            presence.attr,
+            presence.dashed_function,
+            presence.env,
+            presence.if_,
+            presence.inherit,
+            presence.var,
+        ]
+        .iter()
+        .enumerate()
+        .fold(0_u16, |bits, (index, present)| bits | (u16::from(*present) << index));
+        let mut bits = presence_bits;
+        if crate::css::custom_properties::single_css_wide_keyword(values).is_some() {
+            bits |= Self::LONE_CSS_WIDE_KEYWORD;
+        }
+        if crate::css::parser::value_parser::contains_tree_counting_function(values) {
+            bits |= Self::CALLS_TREE_COUNTING_FUNCTION;
+        }
+        Self(bits)
+    }
+
+    fn with_references(self, references: &CustomPropertyReferences<'_>) -> Self {
+        let mut bits = self.0 & !(Self::NAMES_CUSTOM_PROPERTIES | Self::HIDES_A_REFERENCE);
+        if !references.names.is_empty() {
+            bits |= Self::NAMES_CUSTOM_PROPERTIES;
+        }
+        if !references.all_visible {
+            bits |= Self::HIDES_A_REFERENCE;
+        }
+        Self(bits)
+    }
+
+    /// Which substitution functions the text uses.
+    pub(crate) fn presence(self) -> SubstitutionFunctionsPresence {
+        let bit = |index: u16| self.0 & (1 << index) != 0;
+        SubstitutionFunctionsPresence {
+            attr: bit(0),
+            dashed_function: bit(1),
+            env: bit(2),
+            if_: bit(3),
+            inherit: bit(4),
+            var: bit(5),
+        }
+    }
+
+    /// Whether the text is one CSS-wide keyword, beside whitespace.
+    pub(crate) fn is_lone_css_wide_keyword(self) -> bool {
+        self.0 & Self::LONE_CSS_WIDE_KEYWORD != 0
+    }
+
+    /// Whether the text calls sibling-count() or sibling-index().
+    pub(crate) fn calls_tree_counting_function(self) -> bool {
+        self.0 & Self::CALLS_TREE_COUNTING_FUNCTION != 0
+    }
+
+    fn names_custom_properties(self) -> bool {
+        self.0 & Self::NAMES_CUSTOM_PROPERTIES != 0
+    }
+
+    /// What a comment in the text tokenizes as.
+    fn comments(self) -> crate::css::css_tokenizer::Comments {
+        match self.0 & Self::SERIALIZED_BY_THE_ENGINE != 0 {
+            true => crate::css::css_tokenizer::Comments::Separating,
+            false => crate::css::css_tokenizer::Comments::AsWhitespace,
+        }
+    }
+}
+
+/// The custom properties a value's `var()` and `inherit()` functions name, as written, and whether
+/// every one of them names its property with a plain identifier.
+pub(crate) struct CustomPropertyReferences<'a> {
+    pub(crate) names: smallvec::SmallVec<[&'a [u16]; 4]>,
+    pub(crate) all_visible: bool,
+}
+
+impl<'a> CustomPropertyReferences<'a> {
+    /// The references of a value whose text tokenizes to `values`.
+    pub(crate) fn scan(values: &'a [ComponentValue]) -> Self {
+        let mut names = smallvec::SmallVec::new();
+        let all_visible = scan_custom_property_references(values, &mut names);
+        Self { names, all_visible }
+    }
+}
+
+/// What a [`StyleValueData::Unresolved`] holds: the start of one allocation its source text
+/// follows, as one byte per unit where every unit is ASCII, else as UTF-16 code units. Where the
+/// text references custom properties by name, the names follow the text, aligned to 4 bytes: their
+/// count as a `u32`, then each name as its length in a `u32` and its UTF-16 code units, escapes
+/// decoded, aligned to 4 bytes.
+#[repr(C)]
+pub struct UnresolvedPayload {
+    pub parsed_value: RetainedStyleValueData,
+    pub contains_attr_tainted_values: bool,
+    units_are_latin1: bool,
+    facts: UnresolvedFacts,
+    length: u32,
+}
+
+const _: () = assert!(size_of::<UnresolvedPayload>() == 16);
+
+impl UnresolvedPayload {
+    /// The text the value was written as.
+    pub(crate) fn source_text(&self) -> TokenizerInput<'_> {
+        let length = self.length as usize;
+        // SAFETY: The text follows the payload in its allocation, `length` units of the kind it
+        //         says.
+        unsafe {
+            let text = std::ptr::from_ref(self).cast::<u8>().add(size_of::<Self>());
+            if self.units_are_latin1 {
+                TokenizerInput::Latin1(ak::slice_from_raw_parts(text, length))
+            } else {
+                TokenizerInput::Utf16(ak::slice_from_raw_parts(text.cast::<u16>(), length))
+            }
+        }
+    }
+
+    /// The components of the value, tokenized from its text for this read.
+    pub(crate) fn components(&self) -> ComponentValueList {
+        components_of_text(self.source_text(), self.facts.comments()).unwrap_or_default()
+    }
+
+    /// What the text holds.
+    pub(crate) fn facts(&self) -> UnresolvedFacts {
+        self.facts
+    }
+
+    /// Which substitution functions the text uses.
+    pub(crate) fn presence(&self) -> SubstitutionFunctionsPresence {
+        self.facts.presence()
+    }
+
+    /// The names of the custom properties the text references, as written, in the order it does.
+    pub(crate) fn references(&self) -> impl Iterator<Item = &[u16]> {
+        let (mut entry, mut remaining) = if self.facts.names_custom_properties() {
+            // SAFETY: Where the text names custom properties, their count follows it, aligned, and
+            //         the first name follows the count.
+            unsafe {
+                let count = self
+                    .base()
+                    .add(Self::table_offset(self.length as usize, self.units_are_latin1))
+                    .cast::<u32>();
+                (count.add(1), count.read())
+            }
+        } else {
+            (std::ptr::null(), 0)
+        };
+        std::iter::from_fn(move || {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            // SAFETY: Each name is its length followed by its units, aligned to 4 bytes; the next
+            //         one follows it.
+            unsafe {
+                let length = entry.read() as usize;
+                let units = entry.add(1).cast::<u16>();
+                entry = units.cast::<u8>().add(Self::name_units_bytes(length)).cast::<u32>();
+                Some(ak::slice_from_raw_parts(units, length))
+            }
+        })
+    }
+
+    /// Whether every custom property the text references is among [`Self::references()`]; one
+    /// that is named by anything but a plain identifier is not.
+    pub(crate) fn references_visible(&self) -> bool {
+        self.facts.0 & UnresolvedFacts::HIDES_A_REFERENCE == 0
+    }
+
+    fn base(&self) -> *const u8 {
+        std::ptr::from_ref(self).cast::<u8>()
+    }
+
+    fn text_end(length: usize, units_are_latin1: bool) -> usize {
+        let unit = if units_are_latin1 { 1 } else { size_of::<u16>() };
+        length
+            .checked_mul(unit)
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>()))
+            .expect("unresolved value text too long")
+    }
+
+    fn table_offset(length: usize, units_are_latin1: bool) -> usize {
+        Self::text_end(length, units_are_latin1).next_multiple_of(align_of::<u32>())
+    }
+
+    fn name_units_bytes(length: usize) -> usize {
+        (length * size_of::<u16>()).next_multiple_of(align_of::<u32>())
+    }
+
+    fn table_bytes<'a>(names: impl Iterator<Item = &'a [u16]>) -> usize {
+        names.fold(size_of::<u32>(), |bytes, name| {
+            bytes + size_of::<u32>() + Self::name_units_bytes(name.len())
+        })
+    }
+
+    /// The bytes of the allocation the payload starts.
+    fn allocation_size(&self) -> usize {
+        let length = self.length as usize;
+        if self.facts.names_custom_properties() {
+            Self::table_offset(length, self.units_are_latin1) + Self::table_bytes(self.references())
+        } else {
+            Self::text_end(length, self.units_are_latin1)
+        }
+    }
+
+    fn layout(bytes: usize) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(bytes, align_of::<Self>()).expect("unresolved value text too long")
+    }
+}
+
+/// The components `text` tokenizes to, whose comments tokenize as `comments` says: as whitespace
+/// in text an author wrote, as nothing in text the engine serialized from components with
+/// [`ComponentSerializationMode::Retokenize`], which tokenizes back to them.
+pub(crate) fn components_of_text(
+    text: TokenizerInput<'_>,
+    comments: crate::css::css_tokenizer::Comments,
+) -> Result<ComponentValueList, ()> {
+    crate::css::parser::component_value::consume_a_counted_list_of_component_values(
+        crate::css::css_tokenizer::tokenize_for_parser_with_comments(text, comments),
+    )
+}
+
+/// The box of an unresolved value's payload and text, laid out as one pointer C++ reads the
+/// payload through.
+#[repr(C)]
+pub struct UnresolvedBox {
+    pointer: std::ptr::NonNull<UnresolvedPayload>,
+}
+
+// SAFETY: The box owns its payload, whose fields are `Send + Sync`, and its immutable text.
+unsafe impl Send for UnresolvedBox {}
+unsafe impl Sync for UnresolvedBox {}
+
+/// What an unresolved value is made of, which it does not keep: the components its text, as an
+/// author wrote it, tokenizes to, or the components the engine serialized its text from with
+/// [`ComponentSerializationMode::Retokenize`], which the text tokenizes back to with its comments
+/// keeping tokens apart.
+pub(crate) enum UnresolvedValueComponents<'a> {
+    OfText(&'a [ComponentValue]),
+    OfSerialization(&'a [ComponentValue]),
+}
+
+/// The fields of a payload its text and names, written first, say.
+struct UnresolvedTextShape {
+    units_are_latin1: bool,
+    facts: UnresolvedFacts,
+    length: u32,
+}
+
+impl UnresolvedBox {
+    /// The payload of a value written as `source_text`, which need not be well-formed UTF-16, and
+    /// made of `components`, which uses the substitution functions `presence` says.
+    pub(crate) fn new(
+        source_text: TokenizerInput<'_>,
+        components: UnresolvedValueComponents<'_>,
+        presence: SubstitutionFunctionsPresence,
+        contains_attr_tainted_values: bool,
+        parsed_value: RetainedStyleValueData,
+    ) -> Self {
+        let (values, serialized) = match components {
+            UnresolvedValueComponents::OfText(values) => (values, false),
+            UnresolvedValueComponents::OfSerialization(values) => (values, true),
+        };
+        let mut facts = UnresolvedFacts::of(values, presence);
+        if serialized {
+            facts.0 |= UnresolvedFacts::SERIALIZED_BY_THE_ENGINE;
+        }
+        let (base, shape) = Self::allocate(source_text, facts, &CustomPropertyReferences::scan(values));
+        Self::finish(base, shape, contains_attr_tainted_values, parsed_value)
+    }
+
+    /// An allocation holding `source_text` and the names of `references`, whose payload is still
+    /// to be written.
+    fn allocate(
+        source_text: TokenizerInput<'_>,
+        facts: UnresolvedFacts,
+        references: &CustomPropertyReferences<'_>,
+    ) -> (std::ptr::NonNull<u8>, UnresolvedTextShape) {
+        let units_are_latin1 = match source_text {
+            TokenizerInput::Latin1(_) => true,
+            TokenizerInput::Utf16(units) => units.iter().all(|unit| *unit <= 0x7f),
+        };
+        let length = source_text.len();
+        let facts = facts.with_references(references);
+        let table_offset = UnresolvedPayload::table_offset(length, units_are_latin1);
+        let bytes = if facts.names_custom_properties() {
+            table_offset + UnresolvedPayload::table_bytes(references.names.iter().copied())
+        } else {
+            UnresolvedPayload::text_end(length, units_are_latin1)
+        };
+        let layout = UnresolvedPayload::layout(bytes);
+        // SAFETY: The layout is nonzero and covers the payload, its text and its names, each unit
+        //         of which is written once.
+        unsafe {
+            let base = std::alloc::alloc(layout);
+            if base.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            let text = base.add(size_of::<UnresolvedPayload>());
+            match source_text {
+                TokenizerInput::Latin1(bytes) => std::ptr::copy_nonoverlapping(bytes.as_ptr(), text, length),
+                TokenizerInput::Utf16(units) if units_are_latin1 => {
+                    for (index, unit) in units.iter().enumerate() {
+                        text.add(index).write(*unit as u8);
+                    }
+                }
+                TokenizerInput::Utf16(units) => {
+                    std::ptr::copy_nonoverlapping(units.as_ptr(), text.cast::<u16>(), length);
+                }
+            }
+            if facts.names_custom_properties() {
+                // NB: Every name is part of the text, so neither the count nor a length can exceed
+                //     the text's, which fits in a u32.
+                let count = base.add(table_offset).cast::<u32>();
+                count.write(references.names.len() as u32);
+                let mut entry = count.add(1);
+                for name in &references.names {
+                    entry.write(name.len() as u32);
+                    let units = entry.add(1).cast::<u16>();
+                    std::ptr::copy_nonoverlapping(name.as_ptr(), units, name.len());
+                    entry = units
+                        .cast::<u8>()
+                        .add(UnresolvedPayload::name_units_bytes(name.len()))
+                        .cast::<u32>();
+                }
+            }
+            let shape = UnresolvedTextShape {
+                units_are_latin1,
+                facts,
+                length: u32::try_from(length).expect("unresolved value text too long"),
+            };
+            (std::ptr::NonNull::new_unchecked(base), shape)
+        }
+    }
+
+    /// The box of the allocation `allocate` made, its payload written now.
+    fn finish(
+        base: std::ptr::NonNull<u8>,
+        shape: UnresolvedTextShape,
+        contains_attr_tainted_values: bool,
+        parsed_value: RetainedStyleValueData,
+    ) -> Self {
+        let pointer = base.cast::<UnresolvedPayload>();
+        // SAFETY: The allocation starts with room for the payload, written once here.
+        unsafe {
+            pointer.write(UnresolvedPayload {
+                parsed_value,
+                contains_attr_tainted_values,
+                units_are_latin1: shape.units_are_latin1,
+                facts: shape.facts,
+                length: shape.length,
+            });
+        }
+        Self { pointer }
+    }
+
+    /// This payload, written as `source_text`.
+    fn copy_with_text(&self, source_text: TokenizerInput<'_>) -> Self {
+        let references = CustomPropertyReferences {
+            names: self.references().collect(),
+            all_visible: self.references_visible(),
+        };
+        let (base, shape) = Self::allocate(source_text, self.facts, &references);
+        Self::finish(
+            base,
+            shape,
+            self.contains_attr_tainted_values,
+            self.parsed_value.clone(),
+        )
+    }
+
+    /// The payload, to change what it holds beside its text.
+    pub(crate) fn payload_mut(&mut self) -> &mut UnresolvedPayload {
+        // SAFETY: The box owns a live payload, which this borrow alone reaches.
+        unsafe { self.pointer.as_mut() }
+    }
+
+    /// This payload, written as `source_text` instead.
+    pub(crate) fn with_source_text(&self, source_text: TokenizerInput<'_>) -> Self {
+        self.copy_with_text(source_text)
+    }
+}
+
+impl std::ops::Deref for UnresolvedBox {
+    type Target = UnresolvedPayload;
+
+    fn deref(&self) -> &UnresolvedPayload {
+        // SAFETY: The box owns a live payload.
+        unsafe { self.pointer.as_ref() }
+    }
+}
+
+impl Clone for UnresolvedBox {
+    fn clone(&self) -> Self {
+        self.copy_with_text(self.source_text())
+    }
+}
+
+impl PartialEq for UnresolvedBox {
+    fn eq(&self, other: &Self) -> bool {
+        let same_text = match (self.source_text(), other.source_text()) {
+            (TokenizerInput::Latin1(first), TokenizerInput::Latin1(second)) => first == second,
+            (TokenizerInput::Utf16(first), TokenizerInput::Utf16(second)) => first == second,
+            // NB: Text up to U+00FF may be kept as bytes or as UTF-16, whichever it arrived as.
+            (TokenizerInput::Latin1(bytes), TokenizerInput::Utf16(units))
+            | (TokenizerInput::Utf16(units), TokenizerInput::Latin1(bytes)) => {
+                bytes.iter().copied().map(u16::from).eq(units.iter().copied())
+            }
+        };
+        same_text
+            && self.facts == other.facts
+            && self.contains_attr_tainted_values == other.contains_attr_tainted_values
+            && self.parsed_value == other.parsed_value
+    }
+}
+
+impl Drop for UnresolvedBox {
+    fn drop(&mut self) {
+        let layout = UnresolvedPayload::layout(self.allocation_size());
+        // SAFETY: The box owns the payload and the allocation `new` made.
+        unsafe {
+            std::ptr::drop_in_place(self.pointer.as_ptr());
+            std::alloc::dealloc(self.pointer.as_ptr().cast(), layout);
+        }
+    }
+}
+
+/// What a [`StyleValueData::Url`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct UrlPayload {
+    pub url: RetainedString,
+    pub url_type: u8,
+    pub modifiers: RetainedRequestUrlModifierList,
+}
+
+/// What a [`StyleValueData::FontSource`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct FontSourcePayload {
+    pub is_local: bool,
+    pub url_type: u8,
+    pub has_format: bool,
+    pub local_name: RetainedStyleValueData,
+    pub url: RetainedString,
+    pub url_modifiers: RetainedRequestUrlModifierList,
+    pub format: CssString,
+    pub tech: RetainedByteList,
+}
+
+/// What a [`StyleValueData::RadialSize`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct RadialSizePayload {
+    pub component_count: u8,
+    pub is_extent_0: bool,
+    pub extent_0: u8,
+    pub value_0: RetainedStyleValueData,
+    pub is_extent_1: bool,
+    pub extent_1: u8,
+    pub value_1: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::Transformation`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct TransformationPayload {
+    pub property: u16,
+    pub transform_function: u8,
+    pub values: RetainedStyleValueDataList,
+    /// Matrix-only arguments preserving literal angle precision across canonicalization.
+    /// Empty when the canonical arguments lower to the same matrix inputs.
+    pub matrix_values: RetainedStyleValueDataList,
+}
+
+/// What a [`StyleValueData::Shorthand`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct ShorthandPayload {
+    pub shorthand_property: u16,
+    pub sub_properties: RetainedPropertyIdList,
+    pub values: RetainedStyleValueDataList,
+}
+
+/// What a [`StyleValueData::BorderRadiusRect`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct BorderRadiusRectPayload {
+    pub top_left: RetainedStyleValueData,
+    pub top_right: RetainedStyleValueData,
+    pub bottom_right: RetainedStyleValueData,
+    pub bottom_left: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::BorderRadius`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct BorderRadiusPayload {
+    pub is_elliptical: bool,
+    pub horizontal_radius: RetainedStyleValueData,
+    pub vertical_radius: RetainedStyleValueData,
+}
+
+/// What a [`StyleValueData::Ray`] holds, boxed so that a style value stays small.
+#[repr(C)]
+#[derive(Clone, PartialEq)]
+pub struct RayPayload {
+    pub size: u16,
+    pub contain: bool,
+    pub angle: RetainedStyleValueData,
+    pub position: RetainedStyleValueData,
 }
 
 // The kinds of a filter style value, which are C++ enum values.
@@ -2242,12 +3165,111 @@ pub(crate) const FILTER_KIND_DROP_SHADOW: u8 = 1;
 pub(crate) const FILTER_KIND_HUE_ROTATE: u8 = 2;
 pub(crate) const FILTER_KIND_COLOR: u8 = 3;
 
+impl StyleValueData {
+    /// The shared prefix of every color variant.
+    pub(crate) fn color_base(&self) -> Option<&ColorBase> {
+        match self {
+            Self::ContrastColor { color_base, .. } => Some(color_base),
+            Self::ColorFunction(color_function) => Some(&color_function.color_base),
+            Self::ColorMix(color_mix) => Some(&color_mix.color_base),
+            Self::LightDark(light_dark) => Some(&light_dark.color_base),
+            _ => None,
+        }
+    }
+
+    /// The bytes of the box a variant too large to hold inline keeps its payload in.
+    pub(crate) fn boxed_payload_bytes(&self) -> usize {
+        match self {
+            Self::Calculated(payload) => size_of_val::<CalculatedPayload>(payload),
+            Self::Ratio(payload) => size_of_val::<RatioPayload>(payload),
+            Self::ScrollbarColor(payload) => size_of_val::<ScrollbarColorPayload>(payload),
+            Self::Rect(payload) => size_of_val::<RectPayload>(payload),
+            Self::Function(payload) => size_of_val::<FunctionPayload>(payload),
+            Self::OpenTypeTagged(payload) => size_of_val::<OpenTypeTaggedPayload>(payload),
+            Self::BorderImageSlice(payload) => size_of_val::<BorderImageSlicePayload>(payload),
+            Self::AnchorSize(payload) => size_of_val::<AnchorSizePayload>(payload),
+            Self::Anchor(payload) => size_of_val::<AnchorPayload>(payload),
+            Self::Position(payload) => size_of_val::<PositionPayload>(payload),
+            Self::Shadow(payload) => size_of_val::<ShadowPayload>(payload),
+            Self::Content(payload) => size_of_val::<ContentPayload>(payload),
+            Self::CounterStyleSystem(payload) => size_of_val::<CounterStyleSystemPayload>(payload),
+            Self::CounterStyle(payload) => size_of_val::<CounterStylePayload>(payload),
+            Self::ColorFunction(payload) => size_of_val::<ColorFunctionPayload>(payload),
+            Self::ColorMix(payload) => size_of_val::<ColorMixPayload>(payload),
+            Self::LinearGradient(payload) => size_of_val::<LinearGradientPayload>(payload),
+            Self::ConicGradient(payload) => size_of_val::<ConicGradientPayload>(payload),
+            Self::RadialGradient(payload) => size_of_val::<RadialGradientPayload>(payload),
+            Self::Image(payload) => size_of_val::<ImagePayload>(payload),
+            Self::ImageSet(payload) => size_of_val::<ImageSetPayload>(payload),
+            Self::Easing(payload) => size_of_val::<EasingPayload>(payload),
+            Self::Cursor(payload) => size_of_val::<CursorPayload>(payload),
+            Self::GridTrackSizeList(payload) => size_of_val::<GridTrackSizeListPayload>(payload),
+            Self::GridTemplateArea(payload) => size_of_val::<GridTemplateAreaPayload>(payload),
+            Self::CounterDefinitions(payload) => size_of_val::<CounterDefinitionsPayload>(payload),
+            Self::GridTrackPlacement(payload) => size_of_val::<GridTrackPlacementPayload>(payload),
+            Self::Counter(payload) => size_of_val::<CounterPayload>(payload),
+            Self::LightDark(payload) => size_of_val::<LightDarkPayload>(payload),
+            Self::RandomValueSharing(payload) => size_of_val::<RandomValueSharingPayload>(payload),
+            Self::ColorScheme(payload) => size_of_val::<ColorSchemePayload>(payload),
+            Self::Unresolved(payload) => size_of_val::<UnresolvedPayload>(payload),
+            Self::Url(payload) => size_of_val::<UrlPayload>(payload),
+            Self::FontSource(payload) => size_of_val::<FontSourcePayload>(payload),
+            Self::RadialSize(payload) => size_of_val::<RadialSizePayload>(payload),
+            Self::Transformation(payload) => size_of_val::<TransformationPayload>(payload),
+            Self::Shorthand(payload) => size_of_val::<ShorthandPayload>(payload),
+            Self::BorderRadiusRect(payload) => size_of_val::<BorderRadiusRectPayload>(payload),
+            Self::BorderRadius(payload) => size_of_val::<BorderRadiusPayload>(payload),
+            Self::Ray(payload) => size_of_val::<RayPayload>(payload),
+            Self::BackgroundSize(payload) => size_of_val::<BackgroundSizePayload>(payload),
+            _ => 0,
+        }
+    }
+
+    /// The values a list, tuple, shorthand or transform function holds.
+    pub(crate) fn child_values(&self) -> Option<&RetainedStyleValueDataList> {
+        match self {
+            Self::ValueList { values, .. } | Self::Tuple { values } => Some(values),
+            Self::Shorthand(shorthand) => Some(&shorthand.values),
+            Self::Transformation(transformation) => Some(&transformation.values),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_counter_style_system(&self) -> Option<&CounterStyleSystemPayload> {
+        match self {
+            Self::CounterStyleSystem(system) => Some(system),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_counter_style(&self) -> Option<&CounterStylePayload> {
+        match self {
+            Self::CounterStyle(counter_style) => Some(counter_style),
+            _ => None,
+        }
+    }
+
+    /// Whether an anchor() or anchor-size() names its anchor, the name, and its fallback value.
+    pub(crate) fn anchor_name_and_fallback(&self) -> Option<(bool, &CssString, &RetainedStyleValueData)> {
+        match self {
+            Self::Anchor(anchor) => Some((anchor.has_anchor_name, &anchor.anchor_name, &anchor.fallback_value)),
+            Self::AnchorSize(anchor_size) => Some((
+                anchor_size.has_anchor_name,
+                &anchor_size.anchor_name,
+                &anchor_size.fallback_value,
+            )),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) fn is_none_keyword(value: &StyleValueData) -> bool {
     matches!(value, StyleValueData::Keyword { keyword: code } if *code == crate::css::css_enums::keyword::NONE)
 }
 
-// A larger variant would increase every scalar value's allocation as well.
-const _: () = assert!(size_of::<StyleValueData>() <= 64);
+// Every value pays for the largest variant, so a variant that does not fit beside the tag in 16
+// bytes holds its payload in a box, and a length takes 16 bytes.
+const _: () = assert!(size_of::<StyleValueData>() <= 16);
 
 /// One entry in a computed font-family list. A generic family carries its Keyword code;
 /// a named family borrows the Rust string retained by the style value.
@@ -2255,7 +3277,7 @@ const _: () = assert!(size_of::<StyleValueData>() <= 64);
 pub struct FfiComputedFontFamilyEntry {
     pub kind: u8,
     pub keyword: u16,
-    pub string: *const c_void,
+    pub string: *const CssString,
 }
 
 pub const COMPUTED_FONT_FAMILY_GENERIC: u8 = 0;
@@ -2305,39 +3327,48 @@ pub unsafe extern "C" fn rust_style_value_copy_computed_font_families(
 }
 
 /// Reads the primitive payload of a computed absolute length.
-///
-/// # Safety
-/// `value` must point at live Length StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_length_value(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_length_value(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Length { value, .. } => *value,
         _ => unreachable!("computed value must be a length"),
     }
 }
 
 /// Reads the primitive payload of a computed number.
-///
-/// # Safety
-/// `value` must point at live Number StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_number(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_number(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Number { value } => *value,
         _ => unreachable!("computed value must be a number"),
     }
 }
 
 /// Reads the primitive payload of a computed percentage.
-///
-/// # Safety
-/// `value` must point at live Percentage StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_computed_percentage(value: *const c_void) -> f64 {
-    match unsafe { &*(value as *const StyleValueData) } {
+pub extern "C" fn rust_style_value_computed_percentage(value: &StyleValueData) -> f64 {
+    match value {
         StyleValueData::Percentage { value } => *value,
         _ => unreachable!("computed value must be a percentage"),
     }
+}
+
+/// Reads a computed `font-size-adjust` that scales the size fonts are selected at: true, with the
+/// metric (a `font_size_adjust_metric` value) and the number, for one naming a number, and false
+/// for `none` and `from-font`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_computed_font_size_adjust_number(
+    value: &StyleValueData,
+    metric: &mut u8,
+    number: &mut f64,
+) -> bool {
+    let (kind, value_metric, value_number) = crate::css::style::engine_sample::font_size_adjust_of(Some(value));
+    if kind != crate::css::style::bridge::FontSizeAdjustKind::Number {
+        return false;
+    }
+    *metric = value_metric;
+    *number = value_number;
+    true
 }
 
 impl StyleValueData {
@@ -2345,29 +3376,6 @@ impl StyleValueData {
         match self {
             Self::BasicShape { shape } => Some(shape.as_ref()),
             _ => None,
-        }
-    }
-
-    pub(crate) fn unresolved_authored_source(&self) -> Option<TokenizerInput<'_>> {
-        let Self::Unresolved { source_text, .. } = self else {
-            return None;
-        };
-        Some(TokenizerInput::from(source_text))
-    }
-
-    pub(crate) fn unresolved_token_source(&self) -> Option<TokenizerInput<'_>> {
-        let Self::Unresolved {
-            source_text,
-            value_comparison_text,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        if value_comparison_text.units().is_empty() {
-            Some(TokenizerInput::from(source_text))
-        } else {
-            Some(TokenizerInput::from(value_comparison_text))
         }
     }
 }
@@ -2391,8 +3399,8 @@ impl StyleValueData {
     ///
     /// Consistency holds by construction because the hash only ever omits fields, and derived
     /// equality requires every field to be equal, so any hashed subset agrees on equal values.
-    /// Opaque payloads (calc trees, geometry and stop lists) contribute nothing beyond the
-    /// variant discriminant; deep equality settles whatever shares a bucket. Floats hash by bit
+    /// Opaque payloads (calc trees and path geometry) contribute nothing beyond the variant
+    /// discriminant; deep equality settles whatever shares a bucket. Floats hash by bit
     /// pattern with negative zero normalized to zero; NaN never equals anything, so its hash is
     /// unconstrained.
     pub(crate) fn content_hash(&self) -> u64 {
@@ -2432,6 +3440,35 @@ impl StyleValueData {
             hasher.write_u8(base.color_type);
             hasher.write_u8(base.color_syntax);
         }
+        fn write_color_stops(hasher: &mut crate::css::style::fast_hash::FastHasher, stops: &RetainedColorStopList) {
+            hasher.write_usize(stops.as_slice().len());
+            for stop in stops.as_slice() {
+                for value in stop.values() {
+                    write_value(hasher, value);
+                }
+            }
+        }
+        fn write_grid_track_entries(
+            hasher: &mut crate::css::style::fast_hash::FastHasher,
+            entries: &[RetainedGridTrackEntry],
+        ) {
+            hasher.write_usize(entries.len());
+            for entry in entries {
+                hasher.write_u8(entry.kind as u8);
+                hasher.write_usize(entry.names.as_slice().len());
+                for name in entry.names.as_slice() {
+                    write_fly(hasher, name);
+                }
+                write_value(hasher, &entry.size_value);
+                write_value(hasher, &entry.min_value);
+                write_value(hasher, &entry.max_value);
+                hasher.write_u8(entry.repeat_type);
+                write_value(hasher, &entry.repeat_count);
+                write_bool(hasher, entry.repeat_is_subgrid);
+                write_bool(hasher, entry.repeat_preserve_line_name_sets);
+                write_grid_track_entries(hasher, entry.repeat_entries.as_slice());
+            }
+        }
 
         std::mem::discriminant(self).hash(hasher);
         match self {
@@ -2459,8 +3496,10 @@ impl StyleValueData {
                     fill_rule,
                     points: _,
                     path,
+                    commands,
                 } = shape.as_ref();
                 hasher.write_u8(*kind);
+                hasher.write_usize(commands.as_slice().len());
                 write_value(hasher, v0);
                 write_value(hasher, v1);
                 write_value(hasher, v2);
@@ -2469,23 +3508,25 @@ impl StyleValueData {
                 hasher.write_u8(*fill_rule);
                 path.write_content_hash(hasher);
             }
-            Self::Calculated {
-                rust_calculation: _,
-                resolve_as_is_number,
-                resolve_as_base,
-                resolved_type: _,
-                has_percentages_resolve_as,
-                percentages_resolve_as,
-                resolve_numbers_as_integers,
-                accepted_ranges: _,
-            } => {
+            StyleValueData::Calculated(calculated_payload) => {
+                let CalculatedPayload {
+                    rust_calculation: _,
+                    resolve_as_is_number,
+                    resolve_as_base,
+                    resolved_type: _,
+                    has_percentages_resolve_as,
+                    percentages_resolve_as,
+                    resolve_numbers_as_integers,
+                    accepted_ranges: _,
+                } = &**calculated_payload;
                 write_bool(hasher, *resolve_as_is_number);
                 hasher.write_u8(*resolve_as_base);
                 write_bool(hasher, *has_percentages_resolve_as);
                 hasher.write_u8(*percentages_resolve_as);
                 write_bool(hasher, *resolve_numbers_as_integers);
             }
-            Self::Ratio { numerator, denominator } => {
+            StyleValueData::Ratio(ratio_payload) => {
+                let RatioPayload { numerator, denominator } = &**ratio_payload;
                 write_value(hasher, numerator);
                 write_value(hasher, denominator);
             }
@@ -2518,36 +3559,41 @@ impl StyleValueData {
             Self::Superellipse { parameter } => write_value(hasher, parameter),
             Self::PendingSubstitution {
                 original_shorthand_value,
+                ..
             } => write_value(hasher, original_shorthand_value),
-            Self::ScrollbarColor {
-                thumb_color,
-                track_color,
-            } => {
+            StyleValueData::ScrollbarColor(scrollbar_color_payload) => {
+                let ScrollbarColorPayload {
+                    thumb_color,
+                    track_color,
+                } = &**scrollbar_color_payload;
                 write_value(hasher, thumb_color);
                 write_value(hasher, track_color);
             }
-            Self::Rect {
-                top,
-                right,
-                bottom,
-                left,
-            } => {
+            StyleValueData::Rect(rect_payload) => {
+                let RectPayload {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                } = &**rect_payload;
                 write_value(hasher, top);
                 write_value(hasher, right);
                 write_value(hasher, bottom);
                 write_value(hasher, left);
             }
             Self::String { string, .. } => write_fly(hasher, string),
-            Self::Function { name, value } => {
+            StyleValueData::Function(function_payload) => {
+                let FunctionPayload { name, value } = &**function_payload;
                 write_fly(hasher, name);
                 write_value(hasher, value);
             }
-            Self::OpenTypeTagged {
-                mode,
-                tag_name: tag,
-                packed_tag,
-                value,
-            } => {
+            StyleValueData::OpenTypeTagged(open_type_tagged_payload) => {
+                let OpenTypeTaggedPayload {
+                    mode,
+                    tag_name: tag,
+                    packed_tag,
+                    value,
+                } = &**open_type_tagged_payload;
                 hasher.write_u8(*mode);
                 write_fly(hasher, tag);
                 hasher.write_u32(*packed_tag);
@@ -2585,7 +3631,8 @@ impl StyleValueData {
                 hasher.write_u8(*function);
                 hasher.write_u8(*computed_type);
             }
-            Self::BackgroundSize { size_x, size_y } => {
+            StyleValueData::BackgroundSize(background_size_payload) => {
+                let BackgroundSizePayload { size_x, size_y } = &**background_size_payload;
                 write_value(hasher, size_x);
                 write_value(hasher, size_y);
             }
@@ -2593,56 +3640,61 @@ impl StyleValueData {
                 hasher.write_u8(*repeat_x);
                 hasher.write_u8(*repeat_y);
             }
-            Self::BorderImageSlice {
-                top,
-                right,
-                bottom,
-                left,
-                fill,
-            } => {
+            StyleValueData::BorderImageSlice(border_image_slice_payload) => {
+                let BorderImageSlicePayload {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                    fill,
+                } = &**border_image_slice_payload;
                 write_value(hasher, top);
                 write_value(hasher, right);
                 write_value(hasher, bottom);
                 write_value(hasher, left);
                 write_bool(hasher, *fill);
             }
-            Self::AnchorSize {
-                has_anchor_name,
-                anchor_name,
-                has_anchor_size,
-                anchor_size,
-                fallback_value,
-            } => {
+            StyleValueData::AnchorSize(anchor_size_payload) => {
+                let AnchorSizePayload {
+                    has_anchor_name,
+                    anchor_name,
+                    has_anchor_size,
+                    anchor_size,
+                    fallback_value,
+                } = &**anchor_size_payload;
                 write_bool(hasher, *has_anchor_name);
                 write_fly(hasher, anchor_name);
                 write_bool(hasher, *has_anchor_size);
                 hasher.write_u8(*anchor_size);
                 write_value(hasher, fallback_value);
             }
-            Self::Anchor {
-                has_anchor_name,
-                anchor_name,
-                anchor_side,
-                fallback_value,
-            } => {
+            StyleValueData::Anchor(anchor_payload) => {
+                let AnchorPayload {
+                    has_anchor_name,
+                    anchor_name,
+                    anchor_side,
+                    fallback_value,
+                } = &**anchor_payload;
                 write_bool(hasher, *has_anchor_name);
                 write_fly(hasher, anchor_name);
                 write_value(hasher, anchor_side);
                 write_value(hasher, fallback_value);
             }
-            Self::Position { edge_x, edge_y } => {
+            StyleValueData::Position(position_payload) => {
+                let PositionPayload { edge_x, edge_y } = &**position_payload;
                 write_value(hasher, edge_x);
                 write_value(hasher, edge_y);
             }
-            Self::Shadow {
-                shadow_type,
-                color,
-                offset_x,
-                offset_y,
-                blur_radius,
-                spread_distance,
-                placement,
-            } => {
+            StyleValueData::Shadow(shadow_payload) => {
+                let ShadowPayload {
+                    shadow_type,
+                    color,
+                    offset_x,
+                    offset_y,
+                    blur_radius,
+                    spread_distance,
+                    placement,
+                } = &**shadow_payload;
                 hasher.write_u8(*shadow_type);
                 write_value(hasher, color);
                 write_value(hasher, offset_x);
@@ -2651,27 +3703,30 @@ impl StyleValueData {
                 write_value(hasher, spread_distance);
                 hasher.write_u8(*placement);
             }
-            Self::Content { content, alt_text } => {
+            StyleValueData::Content(content_payload) => {
+                let ContentPayload { content, alt_text } = &**content_payload;
                 write_value(hasher, content);
                 write_value(hasher, alt_text);
             }
-            Self::CounterStyleSystem {
-                kind,
-                system,
-                first_symbol,
-                name,
-            } => {
+            StyleValueData::CounterStyleSystem(counter_style_system_payload) => {
+                let CounterStyleSystemPayload {
+                    kind,
+                    system,
+                    first_symbol,
+                    name,
+                } = &**counter_style_system_payload;
                 hasher.write_u8(*kind);
                 hasher.write_u8(*system);
                 write_value(hasher, first_symbol);
                 write_fly(hasher, name);
             }
-            Self::CounterStyle {
-                is_symbols,
-                name,
-                symbols_type,
-                symbols,
-            } => {
+            StyleValueData::CounterStyle(counter_style_payload) => {
+                let CounterStylePayload {
+                    is_symbols,
+                    name,
+                    symbols_type,
+                    symbols,
+                } = &**counter_style_payload;
                 write_bool(hasher, *is_symbols);
                 write_fly(hasher, name);
                 hasher.write_u8(*symbols_type);
@@ -2679,104 +3734,132 @@ impl StyleValueData {
                     write_fly(hasher, string);
                 }
             }
-            Self::ColorFunction {
-                color_base,
-                channel_0,
-                channel_1,
-                channel_2,
-                alpha,
-                has_name,
-                name,
-                origin_color,
-            } => {
-                write_color_base(hasher, color_base);
+            StyleValueData::ColorFunction(color_function_payload) => {
+                let ColorFunctionPayload {
+                    color_base,
+                    channel_0,
+                    channel_1,
+                    channel_2,
+                    alpha,
+                    has_name,
+                    name,
+                    origin_color,
+                } = &**color_function_payload;
+                // NB: Equality ignores the color syntax, and the color type and name when absent.
+                write_bool(hasher, color_base.has_color_type);
+                if color_base.has_color_type {
+                    hasher.write_u8(color_base.color_type);
+                }
                 write_value(hasher, channel_0);
                 write_value(hasher, channel_1);
                 write_value(hasher, channel_2);
                 write_value(hasher, alpha);
                 write_bool(hasher, *has_name);
-                write_fly(hasher, name);
+                if *has_name {
+                    write_fly(hasher, name);
+                }
                 write_value(hasher, origin_color);
             }
-            Self::ColorMix {
-                color_base,
-                color_interpolation_method,
-                first_color,
-                first_percentage,
-                second_color,
-                second_percentage,
-            } => {
+            StyleValueData::ColorMix(color_mix_payload) => {
+                let ColorMixPayload {
+                    color_base,
+                    color_interpolation_method,
+                    colors,
+                    percentages,
+                } = &**color_mix_payload;
                 write_color_base(hasher, color_base);
                 write_value(hasher, color_interpolation_method);
-                write_value(hasher, first_color);
-                write_value(hasher, first_percentage);
-                write_value(hasher, second_color);
-                write_value(hasher, second_percentage);
+                write_values(hasher, colors);
+                write_values(hasher, percentages);
             }
-            Self::LinearGradient {
-                has_direction_value,
-                direction_value,
-                side_or_corner,
-                color_stop_list: _,
-                gradient_type,
-                repeating,
-                color_interpolation_method,
-                color_syntax,
-            } => {
+            StyleValueData::LinearGradient(linear_gradient_payload) => {
+                let LinearGradientPayload {
+                    has_direction_value,
+                    direction_value,
+                    side_or_corner,
+                    color_stop_list,
+                    gradient_type,
+                    repeating,
+                    color_interpolation_method,
+                    color_syntax,
+                } = &**linear_gradient_payload;
                 write_bool(hasher, *has_direction_value);
                 write_value(hasher, direction_value);
                 hasher.write_u8(*side_or_corner);
+                write_color_stops(hasher, color_stop_list);
                 hasher.write_u8(*gradient_type);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
                 hasher.write_u8(*color_syntax);
             }
-            Self::ConicGradient {
-                from_angle,
-                position,
-                color_stop_list: _,
-                repeating,
-                color_interpolation_method,
-                color_syntax,
-            } => {
+            StyleValueData::ConicGradient(conic_gradient_payload) => {
+                let ConicGradientPayload {
+                    from_angle,
+                    position,
+                    color_stop_list,
+                    repeating,
+                    color_interpolation_method,
+                    color_syntax,
+                } = &**conic_gradient_payload;
                 write_value(hasher, from_angle);
                 write_value(hasher, position);
+                write_color_stops(hasher, color_stop_list);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
                 hasher.write_u8(*color_syntax);
             }
-            Self::RadialGradient {
-                ending_shape,
-                size,
-                position,
-                color_stop_list: _,
-                repeating,
-                color_interpolation_method,
-                color_syntax,
-            } => {
+            StyleValueData::RadialGradient(radial_gradient_payload) => {
+                let RadialGradientPayload {
+                    ending_shape,
+                    size,
+                    position,
+                    color_stop_list,
+                    repeating,
+                    color_interpolation_method,
+                    color_syntax,
+                } = &**radial_gradient_payload;
                 hasher.write_u8(*ending_shape);
                 write_value(hasher, size);
                 write_value(hasher, position);
+                write_color_stops(hasher, color_stop_list);
                 write_bool(hasher, *repeating);
                 write_value(hasher, color_interpolation_method);
                 hasher.write_u8(*color_syntax);
             }
-            Self::Image { url, url_type, .. } => {
+            StyleValueData::Image(image_payload) => {
+                let ImagePayload { url, url_type, .. } = &**image_payload;
                 url.hash(hasher);
                 hasher.write_u8(*url_type);
             }
-            Self::ImageSet { options: _ } => {}
-            Self::Easing {
-                kind,
-                linear_stops: _,
-                x1,
-                y1,
-                x2,
-                y2,
-                number_of_intervals,
-                step_position,
-            } => {
+            StyleValueData::ImageSet(image_set_payload) => {
+                let ImageSetPayload { options } = &**image_set_payload;
+                hasher.write_usize(options.as_slice().len());
+                for option in options.as_slice() {
+                    write_value(hasher, &option.image);
+                    write_value(hasher, &option.resolution);
+                    write_bool(hasher, option.has_type);
+                    write_fly(hasher, &option.type_string);
+                }
+            }
+            StyleValueData::Easing(easing_payload) => {
+                let EasingPayload {
+                    kind,
+                    linear_stops,
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    number_of_intervals,
+                    step_position,
+                    is_keyword,
+                } = &**easing_payload;
                 hasher.write_u8(*kind);
+                write_bool(hasher, *is_keyword);
+                hasher.write_usize(linear_stops.as_slice().len());
+                for stop in linear_stops.as_slice() {
+                    write_value(hasher, &stop.output);
+                    write_value(hasher, &stop.input);
+                }
                 write_value(hasher, x1);
                 write_value(hasher, y1);
                 write_value(hasher, x2);
@@ -2784,68 +3867,93 @@ impl StyleValueData {
                 write_value(hasher, number_of_intervals);
                 hasher.write_u8(*step_position);
             }
-            Self::Cursor { image, x, y } => {
+            StyleValueData::Cursor(cursor_payload) => {
+                let CursorPayload { image, x, y } = &**cursor_payload;
                 write_value(hasher, image);
                 write_value(hasher, x);
                 write_value(hasher, y);
             }
-            Self::GridTrackSizeList {
-                is_subgrid,
-                preserve_line_name_sets,
-                entries: _,
-            } => {
+            StyleValueData::GridTrackSizeList(grid_track_size_list_payload) => {
+                let GridTrackSizeListPayload {
+                    is_subgrid,
+                    preserve_line_name_sets,
+                    entries,
+                } = &**grid_track_size_list_payload;
                 write_bool(hasher, *is_subgrid);
                 write_bool(hasher, *preserve_line_name_sets);
+                write_grid_track_entries(hasher, entries.as_slice());
             }
-            Self::GridTemplateArea {
-                grid_areas: _,
-                row_count,
-                column_count,
-            } => {
+            StyleValueData::GridTemplateArea(grid_template_area_payload) => {
+                let GridTemplateAreaPayload {
+                    grid_areas,
+                    row_count,
+                    column_count,
+                } = &**grid_template_area_payload;
+                hasher.write_usize(grid_areas.as_slice().len());
+                for area in grid_areas.as_slice() {
+                    write_fly(hasher, &area.name);
+                    write_fly(hasher, &area.implicit_start_name);
+                    write_fly(hasher, &area.implicit_end_name);
+                    for line in area.grid_lines() {
+                        hasher.write_usize(line);
+                    }
+                }
                 hasher.write_usize(*row_count);
                 hasher.write_usize(*column_count);
             }
-            Self::CounterDefinitions { counter_definitions: _ } => {}
-            Self::GridTrackPlacement {
-                kind,
-                value,
-                has_name,
-                name,
-                implicit_start_name: _,
-                implicit_end_name: _,
-            } => {
+            StyleValueData::CounterDefinitions(counter_definitions_payload) => {
+                let CounterDefinitionsPayload { counter_definitions } = &**counter_definitions_payload;
+                hasher.write_usize(counter_definitions.as_slice().len());
+                for definition in counter_definitions.as_slice() {
+                    write_fly(hasher, &definition.name);
+                    write_bool(hasher, definition.is_reversed);
+                    write_value(hasher, &definition.value);
+                }
+            }
+            StyleValueData::GridTrackPlacement(grid_track_placement_payload) => {
+                let GridTrackPlacementPayload {
+                    kind,
+                    value,
+                    has_name,
+                    name,
+                    implicit_start_name: _,
+                    implicit_end_name: _,
+                } = &**grid_track_placement_payload;
                 hasher.write_u8(*kind);
                 write_value(hasher, value);
                 write_bool(hasher, *has_name);
                 write_fly(hasher, name);
             }
-            Self::Counter {
-                function,
-                counter_name,
-                counter_style,
-                join_string,
-            } => {
+            StyleValueData::Counter(counter_payload) => {
+                let CounterPayload {
+                    function,
+                    counter_name,
+                    counter_style,
+                    join_string,
+                } = &**counter_payload;
                 hasher.write_u8(*function);
                 write_fly(hasher, counter_name);
                 write_value(hasher, counter_style);
                 write_fly(hasher, join_string);
             }
-            Self::LightDark {
-                color_base,
-                light,
-                dark,
-            } => {
+            StyleValueData::LightDark(light_dark_payload) => {
+                let LightDarkPayload {
+                    color_base,
+                    light,
+                    dark,
+                } = &**light_dark_payload;
                 write_color_base(hasher, color_base);
                 write_value(hasher, light);
                 write_value(hasher, dark);
             }
-            Self::RandomValueSharing {
-                fixed_value,
-                is_auto,
-                has_name,
-                name,
-                element_shared,
-            } => {
+            StyleValueData::RandomValueSharing(random_value_sharing_payload) => {
+                let RandomValueSharingPayload {
+                    fixed_value,
+                    is_auto,
+                    has_name,
+                    name,
+                    element_shared,
+                } = &**random_value_sharing_payload;
                 write_value(hasher, fixed_value);
                 write_bool(hasher, *is_auto);
                 write_bool(hasher, *has_name);
@@ -2873,32 +3981,32 @@ impl StyleValueData {
             }
             Self::Tuple { values } => write_values(hasher, values),
             Self::Display { raw } => hasher.write_u32(*raw),
-            Self::ColorScheme {
-                schemes,
-                scheme_codes,
-                only,
-            } => {
+            StyleValueData::ColorScheme(color_scheme_payload) => {
+                let ColorSchemePayload {
+                    schemes,
+                    scheme_codes,
+                    only,
+                } = &**color_scheme_payload;
                 for string in schemes.as_slice() {
                     write_fly(hasher, string);
                 }
                 hasher.write(scheme_codes.as_slice());
                 write_bool(hasher, *only);
             }
-            Self::Unresolved {
-                components: _,
-                source_text,
-                value_comparison_text,
-                presence_attr,
-                presence_dashed_function,
-                presence_env,
-                presence_if,
-                presence_inherit,
-                presence_var,
-                contains_attr_tainted_values,
-                parsed_value: _,
-            } => {
-                hash_string_units(hasher, TokenizerInput::from(source_text));
-                hash_string_units(hasher, TokenizerInput::from(value_comparison_text));
+            StyleValueData::Unresolved(unresolved_payload) => {
+                let unresolved_payload: &UnresolvedPayload = unresolved_payload;
+                let UnresolvedPayload {
+                    contains_attr_tainted_values,
+                    ..
+                } = unresolved_payload;
+                let source_text = unresolved_payload.source_text();
+                let presence_attr = &unresolved_payload.presence().attr;
+                let presence_dashed_function = &unresolved_payload.presence().dashed_function;
+                let presence_env = &unresolved_payload.presence().env;
+                let presence_if = &unresolved_payload.presence().if_;
+                let presence_inherit = &unresolved_payload.presence().inherit;
+                let presence_var = &unresolved_payload.presence().var;
+                hash_string_units(hasher, source_text);
                 write_bool(hasher, *presence_attr);
                 write_bool(hasher, *presence_dashed_function);
                 write_bool(hasher, *presence_env);
@@ -2907,24 +4015,26 @@ impl StyleValueData {
                 write_bool(hasher, *presence_var);
                 write_bool(hasher, *contains_attr_tainted_values);
             }
-            Self::Url {
-                url,
-                url_type,
-                modifiers: _,
-            } => {
+            StyleValueData::Url(url_payload) => {
+                let UrlPayload {
+                    url,
+                    url_type,
+                    modifiers: _,
+                } = &**url_payload;
                 url.hash(hasher);
                 hasher.write_u8(*url_type);
             }
-            Self::FontSource {
-                is_local,
-                local_name,
-                url,
-                url_type,
-                url_modifiers: _,
-                has_format,
-                format,
-                tech,
-            } => {
+            StyleValueData::FontSource(font_source_payload) => {
+                let FontSourcePayload {
+                    is_local,
+                    local_name,
+                    url,
+                    url_type,
+                    url_modifiers: _,
+                    has_format,
+                    format,
+                    tech,
+                } = &**font_source_payload;
                 write_bool(hasher, *is_local);
                 write_value(hasher, local_name);
                 url.hash(hasher);
@@ -2933,15 +4043,16 @@ impl StyleValueData {
                 write_fly(hasher, format);
                 hasher.write(tech.as_slice());
             }
-            Self::RadialSize {
-                component_count,
-                is_extent_0,
-                extent_0,
-                value_0,
-                is_extent_1,
-                extent_1,
-                value_1,
-            } => {
+            StyleValueData::RadialSize(radial_size_payload) => {
+                let RadialSizePayload {
+                    component_count,
+                    is_extent_0,
+                    extent_0,
+                    value_0,
+                    is_extent_1,
+                    extent_1,
+                    value_1,
+                } = &**radial_size_payload;
                 hasher.write_u8(*component_count);
                 write_bool(hasher, *is_extent_0);
                 hasher.write_u8(*extent_0);
@@ -2950,20 +4061,24 @@ impl StyleValueData {
                 hasher.write_u8(*extent_1);
                 write_value(hasher, value_1);
             }
-            Self::Transformation {
-                property,
-                transform_function,
-                values,
-            } => {
+            StyleValueData::Transformation(transformation_payload) => {
+                let TransformationPayload {
+                    property,
+                    transform_function,
+                    values,
+                    matrix_values,
+                } = &**transformation_payload;
                 hasher.write_u16(*property);
                 hasher.write_u8(*transform_function);
                 write_values(hasher, values);
+                write_values(hasher, matrix_values);
             }
-            Self::Shorthand {
-                shorthand_property,
-                sub_properties,
-                values,
-            } => {
+            StyleValueData::Shorthand(shorthand_payload) => {
+                let ShorthandPayload {
+                    shorthand_property,
+                    sub_properties,
+                    values,
+                } = &**shorthand_payload;
                 hasher.write_u16(*shorthand_property);
                 for id in sub_properties.as_slice() {
                     hasher.write_u16(*id);
@@ -2971,22 +4086,24 @@ impl StyleValueData {
                 write_values(hasher, values);
             }
             Self::CustomIdent { custom_ident } => write_fly(hasher, custom_ident),
-            Self::BorderRadiusRect {
-                top_left,
-                top_right,
-                bottom_right,
-                bottom_left,
-            } => {
+            StyleValueData::BorderRadiusRect(border_radius_rect_payload) => {
+                let BorderRadiusRectPayload {
+                    top_left,
+                    top_right,
+                    bottom_right,
+                    bottom_left,
+                } = &**border_radius_rect_payload;
                 write_value(hasher, top_left);
                 write_value(hasher, top_right);
                 write_value(hasher, bottom_right);
                 write_value(hasher, bottom_left);
             }
-            Self::BorderRadius {
-                is_elliptical,
-                horizontal_radius,
-                vertical_radius,
-            } => {
+            StyleValueData::BorderRadius(border_radius_payload) => {
+                let BorderRadiusPayload {
+                    is_elliptical,
+                    horizontal_radius,
+                    vertical_radius,
+                } = &**border_radius_payload;
                 write_bool(hasher, *is_elliptical);
                 write_value(hasher, horizontal_radius);
                 write_value(hasher, vertical_radius);
@@ -3000,394 +4117,129 @@ impl StyleValueData {
                 hasher.write_u8(*color_operation);
                 write_value(hasher, value);
             }
+            StyleValueData::Ray(ray_payload) => {
+                let RayPayload {
+                    size,
+                    contain,
+                    angle,
+                    position,
+                } = &**ray_payload;
+                hasher.write_u16(*size);
+                write_bool(hasher, *contain);
+                write_value(hasher, angle);
+                write_value(hasher, position);
+            }
         }
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_value_create_keyword(keyword: u16) -> *const StyleValueData {
-    Arc::into_raw(shared_style_value(StyleValueData::Keyword { keyword }))
+    StyleValueArc::into_raw(shared_style_value(StyleValueData::Keyword { keyword }))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_value_create_number(value: f64) -> *const StyleValueData {
-    Arc::into_raw(shared_style_value(StyleValueData::Number { value }))
+    StyleValueArc::into_raw(shared_style_value(StyleValueData::Number { value }))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_value_create_integer(value: i32) -> *const StyleValueData {
-    Arc::into_raw(shared_style_value(StyleValueData::Integer { value }))
+    StyleValueArc::into_raw(shared_style_value(StyleValueData::Integer { value }))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_value_create_angle(value: f64, unit: u8) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Angle { value, unit }))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_flex(value: f64, unit: u8) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Flex { value, unit }))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_frequency(value: f64, unit: u8) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Frequency { value, unit }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Angle { value, unit }))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_value_create_length(value: f64, unit: u8) -> *const StyleValueData {
-    Arc::into_raw(shared_style_value(StyleValueData::Length { value, unit }))
+    StyleValueArc::into_raw(shared_style_value(StyleValueData::Length { value, unit }))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_value_create_percentage(value: f64) -> *const StyleValueData {
-    Arc::into_raw(shared_style_value(StyleValueData::Percentage { value }))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_resolution(value: f64, unit: u8) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Resolution { value, unit }))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_time(value: f64, unit: u8) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Time { value, unit }))
+    StyleValueArc::into_raw(shared_style_value(StyleValueData::Percentage { value }))
 }
 
 /// Takes ownership of one strong reference to each of the numerator and denominator.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_ratio(
-    numerator: *const StyleValueData,
-    denominator: *const StyleValueData,
+pub extern "C" fn rust_style_value_create_ratio(
+    numerator: OwnedStyleValue,
+    denominator: OwnedStyleValue,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Ratio {
-        numerator: unsafe { RetainedStyleValueData::from_retained_pointer(numerator) },
-        denominator: unsafe { RetainedStyleValueData::from_retained_pointer(denominator) },
-    }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Ratio(StyleValueBox::new(
+        RatioPayload {
+            numerator: RetainedStyleValueData::from_arc(numerator.into_arc()),
+            denominator: RetainedStyleValueData::from_arc(denominator.into_arc()),
+        },
+    ))))
 }
 
-/// Takes ownership of one strong reference to the value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_opacity_value(value: *const StyleValueData) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::OpacityValue {
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
-    }))
+/// Takes ownership of one strong reference to each track size.
+pub(crate) unsafe fn style_value_create_grid_track_size_list(
+    track_sizes: *const *const StyleValueData,
+    length: usize,
+) -> *const StyleValueData {
+    let entries = unsafe { ak::slice_from_raw_parts(track_sizes, length) }
+        .iter()
+        .map(|&track_size| {
+            RetainedGridTrackEntry::retained_size(unsafe { RetainedStyleValueData::from_retained_pointer(track_size) })
+        })
+        .collect();
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::GridTrackSizeList(
+        StyleValueBox::new(GridTrackSizeListPayload {
+            is_subgrid: false,
+            preserve_line_name_sets: false,
+            entries: RetainedGridTrackEntryList::from_retained_entries(entries),
+        }),
+    )))
 }
 
-/// Takes ownership of one strong reference to the offset data if it is non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_edge(
-    has_edge: bool,
-    edge: u8,
-    offset: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Edge {
-        has_edge,
-        edge,
-        offset: unsafe { RetainedStyleValueData::from_retained_optional_pointer(offset) },
-    }))
+/// The track size of a grid track size list that holds just one track size, without line names, or null. The
+/// returned value is borrowed from `data`.
+pub(crate) fn style_value_grid_track_size_list_single_size(data: &StyleValueData) -> *const StyleValueData {
+    let StyleValueData::GridTrackSizeList(grid_track_size_list) = data else {
+        return std::ptr::null();
+    };
+    if grid_track_size_list.is_subgrid {
+        return std::ptr::null();
+    }
+    match grid_track_size_list.entries.as_slice() {
+        [entry] if entry.kind == GridTrackEntryKind::Size => entry.size_value.pointer(),
+        _ => std::ptr::null(),
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_value_create_guaranteed_invalid() -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::GuaranteedInvalid))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_empty_optional() -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::EmptyOptional))
-}
-
-/// Takes ownership of one strong reference to the parameter data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_superellipse(
-    parameter: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Superellipse {
-        parameter: unsafe { RetainedStyleValueData::from_retained_pointer(parameter) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the original shorthand value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_pending_substitution(
-    original_shorthand_value: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::PendingSubstitution {
-        original_shorthand_value: unsafe { RetainedStyleValueData::from_retained_pointer(original_shorthand_value) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each color.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_scrollbar_color(
-    thumb_color: *const StyleValueData,
-    track_color: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ScrollbarColor {
-        thumb_color: unsafe { RetainedStyleValueData::from_retained_pointer(thumb_color) },
-        track_color: unsafe { RetainedStyleValueData::from_retained_pointer(track_color) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each edge data allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_rect(
-    top: *const StyleValueData,
-    right: *const StyleValueData,
-    bottom: *const StyleValueData,
-    left: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Rect {
-        top: unsafe { RetainedStyleValueData::from_retained_pointer(top) },
-        right: unsafe { RetainedStyleValueData::from_retained_pointer(right) },
-        bottom: unsafe { RetainedStyleValueData::from_retained_pointer(bottom) },
-        left: unsafe { RetainedStyleValueData::from_retained_pointer(left) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the filter's value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_filter(
-    kind: u8,
-    color_operation: u8,
-    value: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Filter {
-        kind,
-        color_operation,
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each radius data allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_border_radius(
-    is_elliptical: bool,
-    horizontal_radius: *const StyleValueData,
-    vertical_radius: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::BorderRadius {
-        is_elliptical,
-        horizontal_radius: unsafe { RetainedStyleValueData::from_retained_pointer(horizontal_radius) },
-        vertical_radius: unsafe { RetainedStyleValueData::from_retained_pointer(vertical_radius) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each corner radius data allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_border_radius_rect(
-    top_left: *const StyleValueData,
-    top_right: *const StyleValueData,
-    bottom_right: *const StyleValueData,
-    bottom_left: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::BorderRadiusRect {
-        top_left: unsafe { RetainedStyleValueData::from_retained_pointer(top_left) },
-        top_right: unsafe { RetainedStyleValueData::from_retained_pointer(top_right) },
-        bottom_right: unsafe { RetainedStyleValueData::from_retained_pointer(bottom_right) },
-        bottom_left: unsafe { RetainedStyleValueData::from_retained_pointer(bottom_left) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to the string.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_string(
-    string: usize,
-    is_valid_animation_name_custom_ident: bool,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::String {
-        string: unsafe { CssString::from_leaked_raw(string) },
-        is_valid_animation_name_custom_ident,
-    }))
-}
-
-/// Takes ownership of one leaked reference to the string.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_value_create_custom_ident(custom_ident: usize) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::CustomIdent {
-        custom_ident: unsafe { CssString::from_leaked_raw(custom_ident) },
-    }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::GuaranteedInvalid))
 }
 
 /// Takes ownership of one leaked reference to the name and one strong reference to the value data.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_create_function(
     name: usize,
-    value: *const StyleValueData,
+    value: OwnedStyleValue,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Function {
-        name: unsafe { CssString::from_leaked_raw(name) },
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to the tag and one strong reference to the value data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_open_type_tagged(
-    mode: u8,
-    tag: usize,
-    packed_tag: u32,
-    value: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::OpenTypeTagged {
-        mode,
-        tag_name: unsafe { CssString::from_leaked_raw(tag) },
-        packed_tag,
-        value: unsafe { RetainedStyleValueData::from_retained_pointer(value) },
-    }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Function(StyleValueBox::new(
+        FunctionPayload {
+            name: unsafe { CssString::from_leaked_raw(name) },
+            value: RetainedStyleValueData::from_arc(value.into_arc()),
+        },
+    ))))
 }
 
 /// Takes ownership of one strong reference to the angle value data if it is non-null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_font_style(
+pub extern "C" fn rust_style_value_create_font_style(
     font_style: u8,
-    angle_value: *const StyleValueData,
+    angle_value: OwnedStyleValue,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::FontStyle {
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::FontStyle {
         font_style,
-        angle_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(angle_value) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the length-percentage.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_text_indent(
-    length_percentage: *const StyleValueData,
-    hanging: bool,
-    each_line: bool,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::TextIndent {
-        length_percentage: unsafe { RetainedStyleValueData::from_retained_pointer(length_percentage) },
-        hanging,
-        each_line,
-    }))
-}
-
-/// Takes ownership of one strong reference to the offset data.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_overflow_clip_margin(
-    has_visual_box: bool,
-    visual_box: u8,
-    offset: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::OverflowClipMargin {
-        has_visual_box,
-        visual_box,
-        offset: unsafe { RetainedStyleValueData::from_retained_pointer(offset) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each size.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_background_size(
-    size_x: *const StyleValueData,
-    size_y: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::BackgroundSize {
-        size_x: unsafe { RetainedStyleValueData::from_retained_pointer(size_x) },
-        size_y: unsafe { RetainedStyleValueData::from_retained_pointer(size_y) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each offset data allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_border_image_slice(
-    top: *const StyleValueData,
-    right: *const StyleValueData,
-    bottom: *const StyleValueData,
-    left: *const StyleValueData,
-    fill: bool,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::BorderImageSlice {
-        top: unsafe { RetainedStyleValueData::from_retained_pointer(top) },
-        right: unsafe { RetainedStyleValueData::from_retained_pointer(right) },
-        bottom: unsafe { RetainedStyleValueData::from_retained_pointer(bottom) },
-        left: unsafe { RetainedStyleValueData::from_retained_pointer(left) },
-        fill,
-    }))
-}
-
-/// Takes ownership of one strong reference to each edge data allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_position(
-    edge_x: *const StyleValueData,
-    edge_y: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Position {
-        edge_x: unsafe { RetainedStyleValueData::from_retained_pointer(edge_x) },
-        edge_y: unsafe { RetainedStyleValueData::from_retained_pointer(edge_y) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each non-null style value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_shadow(
-    shadow_type: u8,
-    color: *const StyleValueData,
-    offset_x: *const StyleValueData,
-    offset_y: *const StyleValueData,
-    blur_radius: *const StyleValueData,
-    spread_distance: *const StyleValueData,
-    placement: u8,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Shadow {
-        shadow_type,
-        color: unsafe { RetainedStyleValueData::from_retained_optional_pointer(color) },
-        offset_x: unsafe { RetainedStyleValueData::from_retained_pointer(offset_x) },
-        offset_y: unsafe { RetainedStyleValueData::from_retained_pointer(offset_y) },
-        blur_radius: unsafe { RetainedStyleValueData::from_retained_optional_pointer(blur_radius) },
-        spread_distance: unsafe { RetainedStyleValueData::from_retained_optional_pointer(spread_distance) },
-        placement,
-    }))
-}
-
-/// Takes ownership of one strong reference to the content list and, when non-null, the
-/// alt-text list.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_content(
-    content: *const StyleValueData,
-    alt_text: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Content {
-        content: unsafe { RetainedStyleValueData::from_retained_pointer(content) },
-        alt_text: unsafe { RetainedStyleValueData::from_retained_optional_pointer(alt_text) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to each string and one strong reference to the
-/// counter style.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_counter(
-    function: u8,
-    counter_name: usize,
-    counter_style: *const StyleValueData,
-    join_string: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Counter {
-        function,
-        counter_name: unsafe { CssString::from_leaked_raw(counter_name) },
-        counter_style: unsafe { RetainedStyleValueData::from_retained_pointer(counter_style) },
-        join_string: unsafe { CssString::from_leaked_raw(join_string) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the fixed value and one leaked reference to the
-/// name when they are present.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_random_value_sharing(
-    fixed_value: *const StyleValueData,
-    is_auto: bool,
-    has_name: bool,
-    name: usize,
-    element_shared: bool,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::RandomValueSharing {
-        fixed_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(fixed_value) },
-        is_auto,
-        has_name,
-        name: unsafe { CssString::from_leaked_raw(name) },
-        element_shared,
+        angle_value: RetainedStyleValueData::from_optional_arc(angle_value.into_option()),
     }))
 }
 
@@ -3399,21 +4251,10 @@ pub unsafe extern "C" fn rust_style_value_create_value_list(
     separator: u8,
     collapsible: bool,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ValueList {
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::ValueList {
         values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, length) },
         separator,
         collapsible,
-    }))
-}
-
-/// Takes ownership of one strong reference to each non-null value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_tuple(
-    values: *const *const StyleValueData,
-    length: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Tuple {
-        values: unsafe { RetainedStyleValueDataList::from_retained_optional_pointers(values, length) },
     }))
 }
 
@@ -3425,11 +4266,14 @@ pub unsafe extern "C" fn rust_style_value_create_transformation(
     values: *const *const StyleValueData,
     length: usize,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Transformation {
-        property,
-        transform_function,
-        values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, length) },
-    }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Transformation(StyleValueBox::new(
+        TransformationPayload {
+            property,
+            transform_function,
+            values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, length) },
+            matrix_values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(Vec::new()),
+        },
+    ))))
 }
 
 /// Takes ownership of one strong reference to each value; the property ids are copied.
@@ -3441,42 +4285,22 @@ pub unsafe extern "C" fn rust_style_value_create_shorthand(
     values: *const *const StyleValueData,
     value_count: usize,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Shorthand {
-        shorthand_property,
-        sub_properties: unsafe { RetainedPropertyIdList::from_raw(sub_properties, sub_property_count) },
-        values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, value_count) },
-    }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Shorthand(StyleValueBox::new(
+        ShorthandPayload {
+            shorthand_property,
+            sub_properties: unsafe { RetainedPropertyIdList::from_raw(sub_properties, sub_property_count) },
+            values: unsafe { RetainedStyleValueDataList::from_retained_pointers(values, value_count) },
+        },
+    ))))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_style_value_create_display(raw: u32) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Display { raw }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Display { raw }))
 }
 
-/// Takes ownership of one strong reference to each non-null component value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_radial_size(
-    component_count: u8,
-    is_extent_0: bool,
-    extent_0: u8,
-    value_0: *const StyleValueData,
-    is_extent_1: bool,
-    extent_1: u8,
-    value_1: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::RadialSize {
-        component_count,
-        is_extent_0,
-        extent_0,
-        value_0: unsafe { RetainedStyleValueData::from_retained_optional_pointer(value_0) },
-        is_extent_1,
-        extent_1,
-        value_1: unsafe { RetainedStyleValueData::from_retained_optional_pointer(value_1) },
-    }))
-}
-
-/// Creates an unresolved value from borrowed token source. Rust derives the source and comparison
-/// strings according to the requested SourceTextMode and retains the component tree.
+/// Creates an unresolved value from borrowed token source, deriving its source text according to
+/// the requested SourceTextMode and retaining the component tree.
 ///
 /// Takes ownership of one strong reference to `parsed_value` when it is non-null.
 #[unsafe(no_mangle)]
@@ -3484,10 +4308,6 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved_from_source(
     token_source_ascii_units: *const u8,
     token_source_code_units: *const u16,
     token_source_length: usize,
-    has_original_source_text: bool,
-    original_source_text_ascii_units: *const u8,
-    original_source_text_code_units: *const u16,
-    original_source_text_length: usize,
     source_text_mode: u8,
     presence_attr: bool,
     presence_dashed_function: bool,
@@ -3506,62 +4326,35 @@ pub unsafe extern "C" fn rust_style_value_create_unresolved_from_source(
         crate::css::css_tokenizer::tokenize_for_parser(token_source),
     )
     .unwrap_or_default();
-    let normalized = crate::css::serialize::serialize_component_values_to_utf16(
-        &components,
-        crate::css::parser::component_value::ComponentSerializationMode::Normalized,
-    );
-    let (source_text, value_comparison_text) = if has_original_source_text {
-        let original_source_text = unsafe {
-            TokenizerInput::from_raw_parts(
-                original_source_text_ascii_units,
-                original_source_text_code_units,
-                original_source_text_length,
-            )
-        }
-        .unwrap_or_default();
-        let mut source_text = Vec::with_capacity(original_source_text.len());
-        original_source_text.append_to(&mut source_text);
-        (
-            crate::css::serialize::trim_ascii_whitespace(&source_text).to_vec(),
-            crate::css::serialize::trim_ascii_whitespace(&normalized).to_vec(),
-        )
-    } else {
-        let source_text = match source_text_mode {
-            0 | 1 => crate::css::serialize::serialize_component_values_to_utf16(
-                &components,
-                crate::css::parser::component_value::ComponentSerializationMode::PreserveNumericSource,
-            ),
-            2 => crate::css::serialize::original_component_values_source(&components)
-                .unwrap_or_else(|| normalized.clone()),
-            _ => unreachable!("unknown unresolved source text mode"),
-        };
-        let source_text = if source_text_mode == 0 {
-            crate::css::serialize::trim_ascii_whitespace(&source_text)
-        } else if source_text_mode == 1 {
-            crate::css::serialize::trim_ascii_whitespace_start(&source_text)
-        } else {
-            &source_text
-        };
-        (source_text.to_vec(), Vec::new())
+    let normalized = serialize_component_values_to_utf16(&components, ComponentSerializationMode::Normalized);
+    let source_text = match source_text_mode {
+        0 | 1 => serialize_component_values_to_utf16(&components, ComponentSerializationMode::PreserveNumericSource),
+        2 => original_component_values_source(&components).unwrap_or(normalized),
+        _ => unreachable!("unknown unresolved source text mode"),
     };
-    let component_source = if value_comparison_text.is_empty() {
+    let source_text = if source_text_mode == 0 {
+        trim_component_value_boundary_whitespace(&source_text)
+    } else if source_text_mode == 1 {
+        trim_ascii_whitespace_start(&source_text)
+    } else {
         &source_text
-    } else {
-        &value_comparison_text
     };
-    Arc::into_raw(Arc::new(StyleValueData::Unresolved {
-        components: RetainedComponentValueList::from_source(component_source),
-        source_text: CssString::from_utf16(&source_text),
-        value_comparison_text: CssString::from_utf16(&value_comparison_text),
-        presence_attr,
-        presence_dashed_function,
-        presence_env,
-        presence_if,
-        presence_inherit,
-        presence_var,
+    let presence = SubstitutionFunctionsPresence {
+        attr: presence_attr,
+        dashed_function: presence_dashed_function,
+        env: presence_env,
+        if_: presence_if,
+        inherit: presence_inherit,
+        var: presence_var,
+    };
+    let payload = UnresolvedBox::new(
+        TokenizerInput::Utf16(source_text),
+        UnresolvedValueComponents::OfText(&components),
+        presence,
         contains_attr_tainted_values,
-        parsed_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(parsed_value) },
-    }))
+        unsafe { RetainedStyleValueData::from_retained_optional_pointer(parsed_value) },
+    );
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Unresolved(payload)))
 }
 
 /// Takes ownership of the definitions' retained strings and values.
@@ -3570,58 +4363,24 @@ pub unsafe extern "C" fn rust_style_value_create_counter_definitions(
     definitions: *const FfiCounterDefinition,
     length: usize,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::CounterDefinitions {
-        counter_definitions: unsafe { RetainedCounterDefinitionList::from_raw(definitions, length) },
-    }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::CounterDefinitions(
+        StyleValueBox::new(CounterDefinitionsPayload {
+            counter_definitions: unsafe { RetainedCounterDefinitionList::from_raw(definitions, length) },
+        }),
+    )))
 }
 
-/// Takes ownership of one strong reference to the first symbol and one leaked reference to the
-/// name when they are present.
+/// A counter style reference by name. Takes ownership of one leaked reference to the name.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_counter_style_system(
-    kind: u8,
-    system: u8,
-    first_symbol: *const StyleValueData,
-    name: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::CounterStyleSystem {
-        kind,
-        system,
-        first_symbol: unsafe { RetainedStyleValueData::from_retained_optional_pointer(first_symbol) },
-        name: unsafe { CssString::from_leaked_raw(name) },
-    }))
-}
-
-/// Takes ownership of one leaked reference to the name (0 when this is a symbols() function)
-/// and to each symbol string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_counter_style(
-    is_symbols: bool,
-    name: usize,
-    symbols_type: u8,
-    symbols: *const usize,
-    symbol_count: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::CounterStyle {
-        is_symbols,
-        name: unsafe { CssString::from_leaked_raw(name) },
-        symbols_type,
-        symbols: unsafe { CssStringList::from_raw(symbols, symbol_count) },
-    }))
-}
-
-/// Takes ownership of one strong reference to the image and to each non-null coordinate.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_cursor(
-    image: *const StyleValueData,
-    x: *const StyleValueData,
-    y: *const StyleValueData,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Cursor {
-        image: unsafe { RetainedStyleValueData::from_retained_pointer(image) },
-        x: unsafe { RetainedStyleValueData::from_retained_optional_pointer(x) },
-        y: unsafe { RetainedStyleValueData::from_retained_optional_pointer(y) },
-    }))
+pub unsafe extern "C" fn rust_style_value_create_counter_style(name: usize) -> *const StyleValueData {
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::CounterStyle(StyleValueBox::new(
+        CounterStylePayload {
+            is_symbols: false,
+            name: unsafe { CssString::from_leaked_raw(name) },
+            symbols_type: 0,
+            symbols: CssStringList::from_strings(Vec::new()),
+        },
+    ))))
 }
 
 /// Takes ownership of one strong reference to each non-null value and one leaked reference to
@@ -3631,117 +4390,30 @@ pub unsafe extern "C" fn rust_style_value_create_color_function(
     has_color_type: bool,
     color_type: u8,
     color_syntax: u8,
-    channel_0: *const StyleValueData,
-    channel_1: *const StyleValueData,
-    channel_2: *const StyleValueData,
-    alpha: *const StyleValueData,
+    channel_0: OwnedStyleValue,
+    channel_1: OwnedStyleValue,
+    channel_2: OwnedStyleValue,
+    alpha: OwnedStyleValue,
     has_name: bool,
     name: usize,
-    origin_color: *const StyleValueData,
+    origin_color: OwnedStyleValue,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ColorFunction {
-        color_base: ColorBase {
-            has_color_type,
-            color_type,
-            color_syntax,
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::ColorFunction(StyleValueBox::new(
+        ColorFunctionPayload {
+            color_base: ColorBase {
+                has_color_type,
+                color_type,
+                color_syntax,
+            },
+            channel_0: RetainedStyleValueData::from_arc(channel_0.into_arc()),
+            channel_1: RetainedStyleValueData::from_arc(channel_1.into_arc()),
+            channel_2: RetainedStyleValueData::from_arc(channel_2.into_arc()),
+            alpha: RetainedStyleValueData::from_optional_arc(alpha.into_option()),
+            has_name,
+            name: unsafe { CssString::from_leaked_raw(name) },
+            origin_color: RetainedStyleValueData::from_optional_arc(origin_color.into_option()),
         },
-        channel_0: unsafe { RetainedStyleValueData::from_retained_pointer(channel_0) },
-        channel_1: unsafe { RetainedStyleValueData::from_retained_pointer(channel_1) },
-        channel_2: unsafe { RetainedStyleValueData::from_retained_pointer(channel_2) },
-        alpha: unsafe { RetainedStyleValueData::from_retained_optional_pointer(alpha) },
-        has_name,
-        name: unsafe { CssString::from_leaked_raw(name) },
-        origin_color: unsafe { RetainedStyleValueData::from_retained_optional_pointer(origin_color) },
-    }))
-}
-
-/// Takes ownership of the options' retained values and strings.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_image_set(
-    options: *const FfiImageSetOption,
-    length: usize,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ImageSet {
-        options: unsafe { RetainedImageSetOptionList::from_raw(options, length) },
-    }))
-}
-
-/// Takes ownership of one strong reference to each non-null value and of the stops' retained
-/// values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_linear_gradient(
-    has_direction_value: bool,
-    direction_value: *const StyleValueData,
-    side_or_corner: u8,
-    stops: *const RetainedColorStop,
-    stop_count: usize,
-    gradient_type: u8,
-    repeating: bool,
-    color_interpolation_method: *const StyleValueData,
-    color_syntax: u8,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::LinearGradient {
-        has_direction_value,
-        direction_value: unsafe { RetainedStyleValueData::from_retained_optional_pointer(direction_value) },
-        side_or_corner,
-        color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
-        gradient_type,
-        repeating,
-        color_interpolation_method: unsafe {
-            RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
-        },
-        color_syntax,
-    }))
-}
-
-/// Takes ownership of one strong reference to each non-null value and of the stops' retained
-/// values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_conic_gradient(
-    from_angle: *const StyleValueData,
-    position: *const StyleValueData,
-    stops: *const RetainedColorStop,
-    stop_count: usize,
-    repeating: bool,
-    color_interpolation_method: *const StyleValueData,
-    color_syntax: u8,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::ConicGradient {
-        from_angle: unsafe { RetainedStyleValueData::from_retained_optional_pointer(from_angle) },
-        position: unsafe { RetainedStyleValueData::from_retained_pointer(position) },
-        color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
-        repeating,
-        color_interpolation_method: unsafe {
-            RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
-        },
-        color_syntax,
-    }))
-}
-
-/// Takes ownership of one strong reference to each non-null value and of the stops' retained
-/// values.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_create_radial_gradient(
-    ending_shape: u8,
-    size: *const StyleValueData,
-    position: *const StyleValueData,
-    stops: *const RetainedColorStop,
-    stop_count: usize,
-    repeating: bool,
-    color_interpolation_method: *const StyleValueData,
-    color_syntax: u8,
-) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::RadialGradient {
-        ending_shape,
-        size: unsafe { RetainedStyleValueData::from_retained_pointer(size) },
-        position: unsafe { RetainedStyleValueData::from_retained_pointer(position) },
-        color_stop_list: unsafe { RetainedColorStopList::from_raw(stops, stop_count) },
-        repeating,
-        color_interpolation_method: unsafe {
-            RetainedStyleValueData::from_retained_optional_pointer(color_interpolation_method)
-        },
-        color_syntax,
-    }))
+    ))))
 }
 
 /// Takes ownership of one strong reference to the calculation node; the byte blob and ranges
@@ -3758,16 +4430,18 @@ pub unsafe extern "C" fn rust_style_value_create_calculated(
     accepted_ranges: *const RetainedNumericRangeByType,
     accepted_range_count: usize,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Calculated {
-        rust_calculation: unsafe { crate::css::calc::CalcNodeHandle::from_raw(rust_calculation) },
-        resolve_as_is_number,
-        resolve_as_base,
-        resolved_type,
-        has_percentages_resolve_as,
-        percentages_resolve_as,
-        resolve_numbers_as_integers,
-        accepted_ranges: unsafe { RetainedNumericRangeList::from_raw(accepted_ranges, accepted_range_count) },
-    }))
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Calculated(StyleValueBox::new(
+        CalculatedPayload {
+            rust_calculation: unsafe { crate::css::calc::CalcNodeHandle::from_raw(rust_calculation) },
+            resolve_as_is_number,
+            resolve_as_base,
+            resolved_type,
+            has_percentages_resolve_as,
+            percentages_resolve_as,
+            resolve_numbers_as_integers,
+            accepted_ranges: unsafe { RetainedNumericRangeList::from_raw(accepted_ranges, accepted_range_count) },
+        },
+    ))))
 }
 
 /// Copies the borrowed native URL text and takes ownership of each modifier string.
@@ -3779,41 +4453,32 @@ pub unsafe extern "C" fn rust_style_value_create_image(
     url_modifier_count: usize,
     resource_base_url: crate::css::ffi_support::FfiUtf16View,
     has_resource_base_url: bool,
-    has_parent_style_sheet_origin_clean: bool,
-    parent_style_sheet_origin_clean: bool,
-    should_absolutize_url_for_computed_value: bool,
 ) -> *const StyleValueData {
-    Arc::into_raw(Arc::new(StyleValueData::Image {
-        url: unsafe { RetainedString::from_units(url.units().expect("invalid URL text")) },
-        url_type,
-        url_modifiers: unsafe { RetainedRequestUrlModifierList::from_raw(url_modifiers, url_modifier_count) },
-        resource_context: ImageResourceContext {
-            base_url: unsafe { RetainedString::from_units(resource_base_url.units().expect("invalid base URL text")) },
-            has_base_url: has_resource_base_url,
-            has_parent_style_sheet_origin_clean,
-            parent_style_sheet_origin_clean,
-            should_absolutize_url_for_computed_value,
+    StyleValueArc::into_raw(StyleValueArc::new(StyleValueData::Image(StyleValueBox::new(
+        ImagePayload {
+            url: RetainedString::from_units(url.units().expect("invalid URL text")),
+            url_type,
+            url_modifiers: unsafe { RetainedRequestUrlModifierList::from_raw(url_modifiers, url_modifier_count) },
+            resource_context: ImageResourceContext {
+                base_url: RetainedString::from_units(resource_base_url.units().expect("invalid base URL text")),
+                has_base_url: has_resource_base_url,
+                has_parent_style_sheet_origin_clean: false,
+                parent_style_sheet_origin_clean: false,
+                should_absolutize_url_for_computed_value: false,
+            },
         },
-    }))
+    ))))
 }
 
 pub(crate) unsafe fn release_style_value(value: *const StyleValueData) {
     if value.is_null() {
         return;
     }
-    if replay_style_value_dependency_flags(value).is_some() {
-        return;
-    }
-    let value_reference = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(value) });
-    if Arc::strong_count(&value_reference) == 1 {
-        crate::css::style::record_replay::invalidate_pointer(value as usize);
-    }
-    unsafe { Arc::decrement_strong_count(value) };
+    unsafe { StyleValueArc::decrement_strong_count(value) };
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_value_release(value: *const StyleValueData) {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StyleValueDestroyEntry);
     unsafe { release_style_value(value) };
 }
 
@@ -3821,23 +4486,24 @@ pub unsafe extern "C" fn rust_style_value_release(value: *const StyleValueData) 
 ///
 /// The addresses are compared first because a shared allocation is the common case, and the values
 /// otherwise: two allocations built from the same declaration are equal, and a caller holding a
-/// freshly computed one has no way to know that from the pointer alone.
-///
-/// # Safety
-/// `first` and `second` must be null or point at live `StyleValueData` allocated by this module.
+/// freshly computed one has no way to know that from the pointer alone. Null stands for no value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_equals(first: *const StyleValueData, second: *const StyleValueData) -> bool {
-    if std::ptr::eq(first, second) {
-        return true;
+pub extern "C" fn rust_style_value_equals(first: Option<&StyleValueData>, second: Option<&StyleValueData>) -> bool {
+    optional_style_values_equal(first, second)
+}
+
+/// `rust_style_value_equals` for two handles.
+pub(crate) fn retained_style_values_equal(first: &RetainedStyleValueData, second: &RetainedStyleValueData) -> bool {
+    optional_style_values_equal(first.optional_data(), second.optional_data())
+}
+
+/// Two absent values are equal, and an absent value equals no present one.
+pub(crate) fn optional_style_values_equal(first: Option<&StyleValueData>, second: Option<&StyleValueData>) -> bool {
+    match (first, second) {
+        (None, None) => true,
+        (Some(first), Some(second)) => style_values_equal(first, second),
+        _ => false,
     }
-    if first.is_null() || second.is_null() {
-        return false;
-    }
-    // Replay pointers are opaque identity tokens rather than readable StyleValueData.
-    if replay_style_value_dependency_flags(first).is_some() || replay_style_value_dependency_flags(second).is_some() {
-        return false;
-    }
-    style_values_equal(unsafe { &*first }, unsafe { &*second })
 }
 
 fn style_values_equal(first: &StyleValueData, second: &StyleValueData) -> bool {
@@ -3846,7 +4512,10 @@ fn style_values_equal(first: &StyleValueData, second: &StyleValueData) -> bool {
     }
     match (first, second) {
         (
-            StyleValueData::ColorFunction {
+            StyleValueData::ColorFunction(color_function_payload_1),
+            StyleValueData::ColorFunction(color_function_payload_2),
+        ) => {
+            let ColorFunctionPayload {
                 color_base: first_base,
                 channel_0: first_channel_0,
                 channel_1: first_channel_1,
@@ -3855,8 +4524,8 @@ fn style_values_equal(first: &StyleValueData, second: &StyleValueData) -> bool {
                 has_name: first_has_name,
                 name: first_name,
                 origin_color: first_origin_color,
-            },
-            StyleValueData::ColorFunction {
+            } = &**color_function_payload_1;
+            let ColorFunctionPayload {
                 color_base: second_base,
                 channel_0: second_channel_0,
                 channel_1: second_channel_1,
@@ -3865,8 +4534,7 @@ fn style_values_equal(first: &StyleValueData, second: &StyleValueData) -> bool {
                 has_name: second_has_name,
                 name: second_name,
                 origin_color: second_origin_color,
-            },
-        ) => {
+            } = &**color_function_payload_2;
             first_base.has_color_type == second_base.has_color_type
                 && (!first_base.has_color_type || first_base.color_type == second_base.color_type)
                 && first_channel_0 == second_channel_0
@@ -3887,10 +4555,7 @@ fn style_values_equal(first: &StyleValueData, second: &StyleValueData) -> bool {
 /// `value` must be null or point at a live `StyleValueData` allocated by this module.
 pub(crate) unsafe fn retain_style_value(value: *const StyleValueData) -> *const StyleValueData {
     if !value.is_null() {
-        if replay_style_value_dependency_flags(value).is_some() {
-            return value;
-        }
-        unsafe { Arc::increment_strong_count(value) };
+        unsafe { StyleValueArc::increment_strong_count(value) };
     }
     value
 }
@@ -3900,15 +4565,61 @@ pub unsafe extern "C" fn rust_style_value_retain(value: *const StyleValueData) -
     unsafe { retain_style_value(value) }
 }
 
+/// https://drafts.csswg.org/css-viewport/#zoom-om
+/// Computed style APIs (i.e., all values returned by getComputedStyle()) that are non-auto and non-percentage lengths
+/// must be unscaled.
+/// The computed value `value` of an element whose effective zoom is `zoom`, with its lengths unscaled, retained for the
+/// caller; null where unscaling changes nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_style_value_unscaled_by_zoom(value: &StyleValueData, zoom: f64) -> *const StyleValueData {
+    if zoom == 1.0 || !zoom.is_normal() || zoom < 0.0 {
+        return std::ptr::null();
+    }
+    let length = crate::css::style_compute::FfiLengthResolutionContext {
+        zoom: 1.0 / zoom,
+        ..Default::default()
+    };
+    let context = crate::css::absolutize::AbsolutizationContext {
+        length: &length,
+        scheme: None,
+        resolved_viewport_relative_length: std::cell::Cell::new(false),
+        tree_counting: None,
+        random_base_values: &[],
+        document_base_url: &[],
+        style_sheet_resource_context: None,
+        current_color: None,
+    };
+    match crate::css::absolutize::absolutize(value, &context) {
+        Some(crate::css::absolutize::Absolutized::Changed(unscaled)) => {
+            let pointer = unscaled.pointer();
+            std::mem::forget(unscaled);
+            pointer
+        }
+        _ => std::ptr::null(),
+    }
+}
+
 #[cfg(test)]
 mod substitution_clone_tests {
     use super::*;
 
     #[test]
+    fn pending_substitution_retains_its_shorthand_value() {
+        let written = StyleValueArc::new(StyleValueData::Number { value: 1.0 });
+        let pending = StyleValueArc::new(StyleValueData::PendingSubstitution {
+            original_shorthand: crate::css::property_metadata::property_id::BORDER,
+            original_shorthand_value: RetainedStyleValueData::from_arc(written.clone()),
+        });
+        assert_eq!(StyleValueArc::strong_count(&written), 2);
+        drop(pending);
+        assert_eq!(StyleValueArc::strong_count(&written), 1);
+    }
+
+    #[test]
     fn shorthand_clone_preserves_repeated_child_aliases() {
-        let child = Arc::new(StyleValueData::Keyword { keyword: 1 });
+        let child = StyleValueArc::new(StyleValueData::Keyword { keyword: 1 });
         let properties = [1, 2];
-        let children = [Arc::into_raw(child.clone()), Arc::into_raw(child)];
+        let children = [StyleValueArc::into_raw(child.clone()), StyleValueArc::into_raw(child)];
         let shorthand = unsafe {
             rust_style_value_create_shorthand(
                 3,
@@ -3918,17 +4629,18 @@ mod substitution_clone_tests {
                 children.len(),
             )
         };
-        let cloned_shorthand = Arc::into_raw(Arc::new(unsafe { (*shorthand).clone() }));
+        let cloned_shorthand = StyleValueArc::into_raw(StyleValueArc::new(unsafe { (*shorthand).clone() }));
 
-        let StyleValueData::Shorthand { values: original, .. } = (unsafe { &*shorthand }) else {
+        let StyleValueData::Shorthand(shorthand_payload) = (unsafe { &*shorthand }) else {
             unreachable!()
         };
-        let StyleValueData::Shorthand {
+        let ShorthandPayload { values: original, .. } = &**shorthand_payload;
+        let StyleValueData::Shorthand(shorthand_payload) = (unsafe { &*cloned_shorthand }) else {
+            unreachable!()
+        };
+        let ShorthandPayload {
             values: cloned_values, ..
-        } = (unsafe { &*cloned_shorthand })
-        else {
-            unreachable!()
-        };
+        } = &**shorthand_payload;
         assert_eq!(original.as_slice()[0].pointer(), original.as_slice()[1].pointer());
         assert_eq!(
             cloned_values.as_slice()[0].pointer(),
@@ -3955,7 +4667,7 @@ fn hash_string_units(hasher: &mut crate::css::style::fast_hash::FastHasher, unit
         hasher.write(&bytes[..chunk.len() * 2]);
     }
     match units {
-        TokenizerInput::Ascii(units) => {
+        TokenizerInput::Latin1(units) => {
             let mut widened = [0u16; CHUNK];
             for chunk in units.chunks(CHUNK) {
                 for (unit, destination) in chunk.iter().zip(widened.iter_mut()) {
@@ -3975,6 +4687,24 @@ fn hash_string_units(hasher: &mut crate::css::style::fast_hash::FastHasher, unit
 #[cfg(test)]
 mod equality_tests {
     use super::*;
+    use crate::css::css_tokenizer::tokenize_for_parser;
+    use crate::css::parser::component_value::consume_a_list_of_component_values;
+    use crate::css::parser::value_parser::unresolved_value;
+
+    fn unresolved(source: &str) -> StyleValueData {
+        let values = consume_a_list_of_component_values(tokenize_for_parser(source.as_bytes())).unwrap();
+        let serialized = serialize_component_values_to_utf16(&values, ComponentSerializationMode::Retokenize);
+        unresolved_value(&serialized, values, Default::default())
+    }
+
+    #[test]
+    fn unresolved_equality_preserves_numeric_token_types() {
+        for (first, second) in [("1", "1.0"), ("1", "1e0"), ("f(1)", "f(1.0)"), ("[1]", "[1.0]")] {
+            let first = unresolved(first);
+            let second = unresolved(second);
+            assert!(!style_values_equal(&first, &second));
+        }
+    }
 
     #[test]
     fn text_hashes_alike_in_either_spelling() {
@@ -3982,24 +4712,22 @@ mod equality_tests {
         let text = "a text longer than one chunk of the hasher, so that it takes more than one write";
         let utf16: Vec<u16> = text.encode_utf16().collect();
         let mut ascii_hasher = crate::css::style::fast_hash::fast_hasher();
-        hash_string_units(&mut ascii_hasher, TokenizerInput::Ascii(text.as_bytes()));
+        hash_string_units(&mut ascii_hasher, TokenizerInput::Latin1(text.as_bytes()));
         let mut utf16_hasher = crate::css::style::fast_hash::fast_hasher();
         hash_string_units(&mut utf16_hasher, TokenizerInput::Utf16(&utf16));
         assert_eq!(ascii_hasher.finish(), utf16_hasher.finish());
     }
 
     fn retained_number(value: f64) -> RetainedStyleValueData {
-        let value = Arc::into_raw(Arc::new(StyleValueData::Number { value }));
-        unsafe { RetainedStyleValueData::from_retained_pointer(value) }
+        RetainedStyleValueData::from_arc(StyleValueArc::new(StyleValueData::Number { value }))
     }
 
     fn retained(value: StyleValueData) -> RetainedStyleValueData {
-        let value = Arc::into_raw(Arc::new(value));
-        unsafe { RetainedStyleValueData::from_retained_pointer(value) }
+        RetainedStyleValueData::from_arc(StyleValueArc::new(value))
     }
 
     fn color_function(color_syntax: u8) -> StyleValueData {
-        StyleValueData::ColorFunction {
+        StyleValueData::ColorFunction(StyleValueBox::new(ColorFunctionPayload {
             color_base: ColorBase {
                 has_color_type: true,
                 color_type: 0,
@@ -4012,7 +4740,7 @@ mod equality_tests {
             has_name: false,
             name: CssString::none(),
             origin_color: RetainedStyleValueData::none(),
-        }
+        }))
     }
 
     #[test]
@@ -4026,7 +4754,7 @@ mod equality_tests {
     #[test]
     fn color_equality_rejects_different_variants() {
         let color = color_function(0);
-        let light_dark = StyleValueData::LightDark {
+        let light_dark = StyleValueData::LightDark(StyleValueBox::new(LightDarkPayload {
             color_base: ColorBase {
                 has_color_type: false,
                 color_type: 0,
@@ -4034,61 +4762,47 @@ mod equality_tests {
             },
             light: retained(color_function(0)),
             dark: retained(color_function(0)),
-        };
+        }));
         assert!(!style_values_equal(&color, &light_dark));
         assert!(!style_values_equal(&light_dark, &color));
     }
 }
 
-#[cfg(test)]
-mod replay_tests {
-    use super::*;
-
-    #[test]
-    fn retained_replay_tokens_can_move_between_threads() {
-        let pointer = register_replay_style_value(0x1234, 0);
-        let value = unsafe { RetainedStyleValueData::from_retained_pointer(pointer) };
-        std::thread::spawn(move || {
-            let copy = value.clone();
-            assert_eq!(unsafe { style_value_content_hash(copy.pointer()) }, 0x1234);
-            assert_eq!(replay_style_value_token(copy.pointer()), Some(0x1234));
-        })
-        .join()
-        .unwrap();
-    }
-
-    #[test]
-    fn distinct_replay_tokens_compare_unequal_without_being_dereferenced() {
-        let first = register_replay_style_value(0x1234, 0);
-        let second = register_replay_style_value(0x5678, 0);
-
-        assert_eq!(replay_style_value_token(first), Some(0x1234));
-        assert_eq!(replay_style_value_token(second), Some(0x5678));
-        assert_eq!(replay_style_value_token(std::ptr::null()), None);
-        assert!(unsafe { rust_style_value_equals(first, first) });
-        assert!(!unsafe { rust_style_value_equals(first, second) });
-    }
-}
-
 /// Whether a value's computed color depends on the element's used currentcolor: the
-/// currentcolor keyword itself, a color function whose nested colors do, or an Effects
-/// list whose shadow or filter colors do.
+/// currentcolor keyword itself, a color function whose nested colors do, an Effects list
+/// whose shadow or filter colors do, or a scrollbar color whose thumb or track color does.
 pub(crate) fn value_depends_on_current_color(value: &StyleValueData) -> bool {
     let retained_data_depends =
         |retained: &RetainedStyleValueData| retained.optional_data().is_some_and(value_depends_on_current_color);
     let list_depends = |values: &RetainedStyleValueDataList| values.as_slice().iter().any(retained_data_depends);
     match value {
         StyleValueData::Keyword { keyword } => *keyword == crate::css::style_compute::keyword::CURRENTCOLOR,
-        StyleValueData::ColorFunction { origin_color, .. } => retained_data_depends(origin_color),
-        StyleValueData::ColorMix {
-            first_color,
-            second_color,
-            ..
-        } => retained_data_depends(first_color) || retained_data_depends(second_color),
+        StyleValueData::ColorFunction(color_function_payload) => {
+            let ColorFunctionPayload { origin_color, .. } = &**color_function_payload;
+            retained_data_depends(origin_color)
+        }
+        StyleValueData::ColorMix(color_mix_payload) => {
+            let ColorMixPayload { colors, .. } = &**color_mix_payload;
+            colors.as_slice().iter().any(retained_data_depends)
+        }
         StyleValueData::ContrastColor { color, .. } => retained_data_depends(color),
-        StyleValueData::LightDark { light, dark, .. } => retained_data_depends(light) || retained_data_depends(dark),
-        StyleValueData::Shadow { color, .. } => retained_data_depends(color),
+        StyleValueData::LightDark(light_dark_payload) => {
+            let LightDarkPayload { light, dark, .. } = &**light_dark_payload;
+            retained_data_depends(light) || retained_data_depends(dark)
+        }
+        StyleValueData::Shadow(shadow_payload) => {
+            // A shadow without a color is `currentcolor`.
+            let ShadowPayload { color, .. } = &**shadow_payload;
+            color.optional_data().is_none_or(value_depends_on_current_color)
+        }
         StyleValueData::Filter { value, .. } => retained_data_depends(value),
+        StyleValueData::ScrollbarColor(scrollbar_color_payload) => {
+            let ScrollbarColorPayload {
+                thumb_color,
+                track_color,
+            } = &**scrollbar_color_payload;
+            retained_data_depends(thumb_color) || retained_data_depends(track_color)
+        }
         StyleValueData::ValueList { values, .. } => list_depends(values),
         _ => false,
     }
@@ -4103,14 +4817,14 @@ pub(crate) fn value_depends_on_color_scheme(value: &StyleValueData) -> bool {
             *keyword != crate::css::style_compute::keyword::CURRENTCOLOR
                 && crate::css::style_compute::keyword_is_color(*keyword)
         }
-        StyleValueData::ColorFunction { origin_color, .. } => {
+        StyleValueData::ColorFunction(color_function_payload) => {
+            let ColorFunctionPayload { origin_color, .. } = &**color_function_payload;
             origin_color.optional_data().is_some_and(value_depends_on_color_scheme)
         }
-        StyleValueData::ColorMix {
-            first_color,
-            second_color,
-            ..
-        } => retained_data_depends(first_color) || retained_data_depends(second_color),
+        StyleValueData::ColorMix(color_mix_payload) => {
+            let ColorMixPayload { colors, .. } = &**color_mix_payload;
+            colors.as_slice().iter().any(retained_data_depends)
+        }
         StyleValueData::ContrastColor { color, .. } => retained_data_depends(color),
         StyleValueData::LightDark { .. } => true,
         _ => false,
@@ -4123,32 +4837,17 @@ pub(crate) fn value_may_depend_on_font_metrics(value: &StyleValueData) -> bool {
         .expect("font dependency requested for an unsupported value")
 }
 
-pub(crate) fn style_value_dependency_flags(value: *const StyleValueData) -> u8 {
-    if let Some(flags) = replay_style_value_dependency_flags(value) {
-        return flags;
-    }
-    let value = unsafe { &*value };
+pub(crate) fn style_value_dependency_flags(value: &StyleValueData) -> u8 {
     u8::from(value_depends_on_current_color(value))
         | (u8::from(value_depends_on_color_scheme(value)) << 1)
         | (u8::from(value_may_depend_on_font_metrics(value)) << 2)
 }
 
 pub(crate) fn retained_value_depends_on_current_color(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 1 != 0
+    style_value_dependency_flags(value.data()) & 1 != 0
 }
 
-pub(crate) fn retained_value_depends_on_color_scheme(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 2 != 0
-}
-
-pub(crate) fn retained_value_may_depend_on_font_metrics(value: &RetainedStyleValueData) -> bool {
-    style_value_dependency_flags(value.pointer()) & 4 != 0
-}
-
-/// # Safety
-/// `data` must point at a valid StyleValueData.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_value_depends_on_current_color(data: *const c_void) -> bool {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::StyleValueQueryEntry);
-    value_depends_on_current_color(unsafe { &*(data as *const StyleValueData) })
+pub extern "C" fn rust_style_value_depends_on_current_color(data: &StyleValueData) -> bool {
+    value_depends_on_current_color(data)
 }

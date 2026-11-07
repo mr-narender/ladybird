@@ -6,6 +6,7 @@ set(SOURCES
     File.cpp
     Message.cpp
     ReceivedMessageBytes.cpp
+    StartupTransport.cpp
     TransportHandle.cpp
 )
 
@@ -25,7 +26,10 @@ elseif (UNIX)
 else()
     list(APPEND SOURCES
         Attachment.cpp
-        TransportSocketWindows.cpp)
+        HandleBroker.cpp
+        HandleBrokerServer.cpp
+        RustTransportWindows.cpp
+        TransportWindows.cpp)
 endif()
 
 ladybird_lib(LibIPC ipc)

@@ -12,9 +12,11 @@
 #include <LibWeb/HTML/AnimationFrameCallbackDriver.h>
 #include <LibWeb/HTML/DedicatedWorkerGlobalScope.h>
 #include <LibWeb/HTML/EventHandler.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/Page/Page.h>
@@ -125,14 +127,18 @@ bool DedicatedWorkerGlobalScope::has_animation_frame_callbacks() const
 void DedicatedWorkerGlobalScope::schedule_rendering_update()
 {
     if (!m_rendering_update_timer) {
-        m_rendering_update_timer = Platform::Timer::create_single_shot(heap(), 0, GC::create_function(heap(), [this] {
+        m_rendering_update_timer = Platform::Timer::create_single_shot(heap(), AK::Duration::from_milliseconds(0), GC::create_function(heap(), [this] {
+            if (relevant_settings_object(*this).responsible_event_loop().execution_paused()) {
+                schedule_rendering_update();
+                return;
+            }
             run_rendering_update();
         }));
     }
     if (m_rendering_update_timer->is_active())
         return;
     auto interval_ms = static_cast<int>(AK::ceil(1000.0 / max(1.0, page()->client().maximum_frames_per_second())));
-    m_rendering_update_timer->start(interval_ms);
+    m_rendering_update_timer->start(AK::Duration::from_milliseconds(interval_ms));
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
@@ -180,7 +186,7 @@ WebIDL::ExceptionOr<void> DedicatedWorkerGlobalScope::post_message(JS::Realm& re
     // The postMessage(message, transfer) and postMessage(message, options) methods on DedicatedWorkerGlobalScope objects act as if,
     // when invoked, it immediately invoked the respective postMessage(message, transfer) and postMessage(message, options)
     // on the port, with the same arguments, and returned the same return value.
-    return m_internal_port->post_message(realm, message, options);
+    return m_internal_port->post_message(realm, message, options.transfer);
 }
 
 WebIDL::ExceptionOr<void> DedicatedWorkerGlobalScope::post_message(JS::Realm& realm, JS::Value message, Bindings::StructuredSerializeOptions const& options)
@@ -211,7 +217,7 @@ void DedicatedWorkerGlobalScope::set_onmessage(WebIDL::CallbackType* callback)
     // https://html.spec.whatwg.org/multipage/web-messaging.html#message-ports:handler-messageeventtarget-onmessage
     // The first time a MessagePort object's onmessage IDL attribute is set, the port's port message queue must be enabled,
     // as if the start() method had been called.
-    m_internal_port->start();
+    m_internal_port->enable();
 }
 
 void DedicatedWorkerGlobalScope::set_onmessageerror(WebIDL::CallbackType* callback)
@@ -222,6 +228,16 @@ void DedicatedWorkerGlobalScope::set_onmessageerror(WebIDL::CallbackType* callba
 WebIDL::CallbackType* DedicatedWorkerGlobalScope::onmessageerror()
 {
     return event_handler_attribute(EventNames::messageerror);
+}
+
+WebIDL::CallbackType* DedicatedWorkerGlobalScope::onrtctransform()
+{
+    return event_handler_attribute(EventNames::rtctransform);
+}
+
+void DedicatedWorkerGlobalScope::set_onrtctransform(WebIDL::CallbackType* callback)
+{
+    set_event_handler_attribute(EventNames::rtctransform, callback);
 }
 
 }

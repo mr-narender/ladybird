@@ -6,11 +6,14 @@
 
 #include <AK/HashMap.h>
 #include <AK/IDAllocator.h>
+#include <AK/Math.h>
 #include <AK/Mutex.h>
 #include <AK/MutexProtected.h>
 #include <AK/RWLock.h>
 #include <AK/Singleton.h>
 #include <AK/TemporaryChange.h>
+#include <AK/ThreadID.h>
+#include <AK/Time.h>
 #include <AK/kmalloc.h>
 #include <LibCore/Event.h>
 #include <LibCore/EventReceiver.h>
@@ -30,6 +33,7 @@
 #include <QTimer>
 #if defined(AK_OS_WINDOWS)
 #    include <AK/Windows.h>
+#    include <QPointer>
 #    include <QWinEventNotifier>
 #endif
 
@@ -39,13 +43,91 @@ constexpr bool AllocatedWithSystemAllocator<QEventLoop> = true;
 template<>
 constexpr bool AllocatedWithSystemAllocator<QSocketNotifier> = true;
 
+template<>
+constexpr bool AllocatedWithSystemAllocator<QObject> = true;
+
+#if defined(AK_OS_WINDOWS)
 namespace Ladybird {
+
+class PipeNotifier;
+
+}
+
+template<>
+constexpr bool AllocatedWithSystemAllocator<Ladybird::PipeNotifier> = true;
+#endif
+
+namespace Ladybird {
+
+static void qt_notifier_activated(Core::Notifier&);
+
+#if defined(AK_OS_WINDOWS)
+
+// QSocketNotifier watches only a socket on Windows. A pipe is watched by a zero-byte overlapped read of it, which ends
+// once there is something to read or the pipe is broken, and signals the event this waits on.
+class PipeNotifier final : public QWinEventNotifier {
+public:
+    explicit PipeNotifier(Core::Notifier& notifier)
+        : QWinEventNotifier(CreateEvent(nullptr, FALSE, FALSE, nullptr))
+        , m_pipe(to_handle(notifier.fd()))
+    {
+        VERIFY(handle());
+        QObject::connect(this, &QWinEventNotifier::activated, this, [self = QPointer<PipeNotifier>(this), weak_notifier = notifier.make_weak_ptr()] {
+            if (auto notifier = weak_notifier.strong_ref())
+                qt_notifier_activated(static_cast<Core::Notifier&>(*notifier));
+            // The reader may have unregistered this, and so deleted it, from within the activation.
+            if (self)
+                self->read_until_readable();
+        });
+        read_until_readable();
+    }
+
+    ~PipeNotifier()
+    {
+        setEnabled(false);
+        cancel_read();
+        CloseHandle(handle());
+    }
+
+private:
+    void read_until_readable()
+    {
+        static u8 s_zero_byte_buffer;
+        m_read = {};
+        m_read.hEvent = handle();
+        m_read_is_pending = false;
+        if (ReadFile(m_pipe, &s_zero_byte_buffer, 0, nullptr, &m_read))
+            return;
+        if (GetLastError() == ERROR_IO_PENDING) {
+            m_read_is_pending = true;
+            return;
+        }
+        // A read that fails at once, as one does at the end of the pipe, does not set the event, but the reader must
+        // still be activated to see it.
+        SetEvent(handle());
+    }
+
+    void cancel_read()
+    {
+        if (!m_read_is_pending || HasOverlappedIoCompleted(&m_read))
+            return;
+        CancelIoEx(m_pipe, &m_read);
+        // The read must have stopped writing to m_read before it can be freed.
+        while (!HasOverlappedIoCompleted(&m_read))
+            WaitForSingleObject(handle(), INFINITE);
+    }
+
+    ::HANDLE m_pipe { nullptr };
+    OVERLAPPED m_read {};
+    bool m_read_is_pending { false };
+};
+
+#endif
 
 struct ThreadData;
 static thread_local OwnPtr<ThreadData> s_this_thread_data;
-static HashMap<pthread_t, ThreadData*> s_thread_data;
+static HashMap<AK::ThreadID, ThreadData*> s_thread_data;
 static RWLock s_thread_data_lock;
-static thread_local Optional<pthread_t> s_thread_id;
 #if defined(AK_OS_WINDOWS)
 static MutexProtected<HashMap<pid_t, QWinEventNotifier*>> s_processes;
 #endif
@@ -55,17 +137,15 @@ struct ThreadData {
 
     static ThreadData& the()
     {
-        if (!s_thread_id.has_value())
-            s_thread_id = pthread_self();
         if (!s_this_thread_data) {
             s_this_thread_data = make<ThreadData>();
             RWLockLocker<RWLock::Mode::Write> locker(s_thread_data_lock);
-            s_thread_data.set(s_thread_id.value(), s_this_thread_data.ptr());
+            s_thread_data.set(AK::ThreadID::current(), s_this_thread_data.ptr());
         }
         return *s_this_thread_data;
     }
 
-    static ThreadData* for_thread(pthread_t thread_id)
+    static ThreadData* for_thread(AK::ThreadID thread_id)
     {
         RWLockLocker<RWLock::Mode::Read> locker(s_thread_data_lock);
         return s_thread_data.get(thread_id).value_or(nullptr);
@@ -73,12 +153,13 @@ struct ThreadData {
 
     ~ThreadData()
     {
+        Core::ThreadEventQueue::destroy_current();
         RWLockLocker<RWLock::Mode::Write> locker(s_thread_data_lock);
-        s_thread_data.remove(s_thread_id.value());
+        s_thread_data.remove(AK::ThreadID::current());
     }
 
     Mutex mutex;
-    HashMap<Core::Notifier*, NonnullOwnPtr<QSocketNotifier>> notifiers;
+    HashMap<Core::Notifier*, NonnullOwnPtr<QObject>> notifiers;
 };
 
 class QtEventLoopManagerEvent final : public QEvent {
@@ -306,11 +387,11 @@ static void qt_timer_fired(Core::EventReceiver& object)
     object.dispatch_event(event);
 }
 
-intptr_t EventLoopManagerQt::register_timer(Core::EventReceiver& object, int milliseconds, bool should_reload)
+intptr_t EventLoopManagerQt::register_timer(Core::EventReceiver& object, AK::Duration interval, bool should_reload)
 {
     auto timer = new QTimer;
     timer->setTimerType(Qt::PreciseTimer);
-    timer->setInterval(milliseconds);
+    timer->setInterval(AK::clamp_to<int>(interval.to_ceiled_milliseconds()));
     timer->setSingleShot(!should_reload);
     auto weak_object = object.make_weak_ptr();
     QObject::connect(timer, &QTimer::timeout, [weak_object = move(weak_object)] {
@@ -335,7 +416,7 @@ static void qt_notifier_activated(Core::Notifier& notifier)
     notifier.dispatch_event(event);
 }
 
-void EventLoopManagerQt::register_notifier(Core::Notifier& notifier)
+static NonnullOwnPtr<QObject> make_socket_notifier(Core::Notifier& notifier)
 {
     QSocketNotifier::Type type;
     switch (notifier.type()) {
@@ -354,13 +435,27 @@ void EventLoopManagerQt::register_notifier(Core::Notifier& notifier)
         if (auto notifier = weak_notifier.strong_ref())
             qt_notifier_activated(static_cast<Core::Notifier&>(*notifier));
     });
+    return socket_notifier;
+}
+
+void EventLoopManagerQt::register_notifier(Core::Notifier& notifier)
+{
+    NonnullOwnPtr<QObject> qt_notifier = [&]() -> NonnullOwnPtr<QObject> {
+#if defined(AK_OS_WINDOWS)
+        if (!Core::System::is_socket(notifier.fd()) && GetFileType(to_handle(notifier.fd())) == FILE_TYPE_PIPE) {
+            VERIFY(notifier.type() == Core::Notifier::Type::Read);
+            return make<PipeNotifier>(notifier);
+        }
+#endif
+        return make_socket_notifier(notifier);
+    }();
 
     {
         auto& thread_data = ThreadData::the();
         MutexLocker locker(thread_data.mutex);
-        thread_data.notifiers.set(&notifier, move(socket_notifier));
+        thread_data.notifiers.set(&notifier, move(qt_notifier));
     }
-    notifier.set_owner_thread(s_thread_id.value());
+    notifier.set_owner_thread(AK::ThreadID::current());
 }
 
 void EventLoopManagerQt::unregister_notifier(Core::Notifier& notifier)
@@ -530,23 +625,3 @@ NonnullOwnPtr<Core::EventLoopImplementation> EventLoopManagerQt::make_implementa
 }
 
 }
-
-#if defined(AK_OS_WINDOWS)
-namespace AK {
-
-template<>
-struct Traits<pthread_t> : public DefaultTraits<pthread_t> {
-    static unsigned hash(pthread_t thread_id)
-    {
-        return Traits<intptr_t>::hash(reinterpret_cast<intptr_t>(thread_id.p));
-    }
-
-    static constexpr bool equals(pthread_t a, pthread_t b)
-    {
-        return Traits<intptr_t>::equals(reinterpret_cast<intptr_t>(a.p), reinterpret_cast<intptr_t>(b.p));
-    }
-};
-
-}
-
-#endif

@@ -33,6 +33,11 @@ public:
     static constexpr size_t default_cage_size = 4ull * TiB;
     static_assert(is_power_of_two(default_cage_size));
     static constexpr size_t cage_offset_mask = default_cage_size - 1;
+    // NB: JIT code accesses typed array elements at a masked offset plus a
+    //     zero-extended 32-bit index scaled by at most 8, which this keeps in
+    //     inaccessible memory past the cage.
+    static constexpr size_t cage_guard_size = 32ull * GiB;
+    static_assert(cage_guard_size >= (1ull << 32) * 8, "JIT typed array accesses reach a 32-bit index times 8 bytes past a masked offset");
     static constexpr size_t invalid_offset = NumericLimits<size_t>::max();
 
     static PrimitiveStorage& the();
@@ -52,6 +57,13 @@ public:
     size_t size(PrimitiveStorageHandle) const;
     size_t capacity(PrimitiveStorageHandle) const;
     size_t committed_size(PrimitiveStorageHandle) const;
+
+    struct Layout {
+        size_t offset { invalid_offset };
+        size_t size { 0 };
+        size_t capacity { 0 };
+    };
+    Layout layout(PrimitiveStorageHandle) const;
 
     u8* data(PrimitiveStorageHandle);
     u8 const* data(PrimitiveStorageHandle) const;
@@ -116,8 +128,8 @@ private:
         };
 
         ErrorOr<Allocation> allocate_small_storage(size_t size, ZeroFillNewBytes);
-        ErrorOr<Allocation> allocate_large_storage(size_t size, size_t capacity, ZeroFillNewBytes, size_t guard_size);
-        ErrorOr<Allocation> allocate_from_new_slab(u16 size_class_index, size_t slot_size, ZeroFillNewBytes, size_t requested_size);
+        ErrorOr<Allocation> allocate_large_storage(size_t size, size_t capacity, size_t guard_size);
+        ErrorOr<Allocation> allocate_from_new_slab(u16 size_class_index, size_t slot_size);
         ErrorOr<size_t> allocate_cage_range(size_t reservation_size);
         ErrorOr<void> commit_large_storage(Allocation&, size_t new_size);
         void decommit_large_storage(Allocation const&);
@@ -132,6 +144,8 @@ private:
         size_t m_next_offset { 0 };
         Vector<FreeRange> m_free_ranges;
         Vector<Slab> m_small_slabs[13];
+        // The indices of the slabs of each size class that have a free slot, so that allocation never visits a full one.
+        Vector<u16> m_small_slabs_with_free_slots[13];
     };
 
     struct Entry {

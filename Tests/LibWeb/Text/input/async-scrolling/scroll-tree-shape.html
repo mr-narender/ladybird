@@ -27,8 +27,10 @@
         println(displayList);
     }
 
-    test(() => {
-        const state = internals.asyncScrollingState();
+    promiseTest(async () => {
+        await animationFrame();
+        await animationFrame();
+        const state = internals.compositorScrollState();
         const output = [
             `scroll node count: ${state.scrollNodeCount}`,
             `scroll nodes: ${state.scrollNodes.length}`,
@@ -41,7 +43,6 @@
         const childNodes = state.scrollNodes.filter(node => !node.isViewport);
         output.push(`child nodes: ${childNodes.length}`);
         for (const node of childNodes) {
-            output.push(`child has same document as viewport: ${node.documentID === viewportNode.documentID}`);
             output.push(`child parent is viewport: ${node.parentScrollNodeIndex === viewportNode.scrollNodeIndex}`);
         }
         printOutputAndDisplayList(output);

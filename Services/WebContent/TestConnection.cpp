@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageClient.h>
@@ -29,15 +30,27 @@ void TestConnection::die()
 {
 }
 
-void TestConnection::reset_session_history_for_testing(Web::PageId page_id)
+void TestConnection::reset_state_for_testing(Web::PageId page_id)
 {
     m_client.dispatch_pending_messages();
 
     if (auto page = m_client.page(page_id); page.has_value()) {
+        // A test that times out may never restore automatic rendering in its finally block. Both controls outlive
+        // the document, so restore them at the test boundary before acknowledging the reset.
+        Web::Compositor::RenderClock::the().set_manual_for_testing(false);
+        page->page().client().set_manual_rendering_opportunities(false);
         as<Web::HTML::LocalTraversableNavigable>(*page->page().local_traversable()).reset_session_history_for_testing();
+        // The navigable outlives the document too, and with it the navigations and history updates the previous test
+        // made, so a test that made many of them would leave the next test in this view blocked from making its own.
+        page->page().local_traversable()->reset_navigation_or_history_update_rate_limit_for_testing();
+        // A test that sets a preferred color scheme may never put it back, and the override outlives the document.
+        page->page().set_preferred_color_scheme_override_for_testing({});
+        // A test that asks for accessibility updates never stops asking, and the page outlives the document, so every
+        // later test in this view would build and serialize the accessibility tree on each change.
+        page->page().set_accessibility_interested(false);
         auto active_entry = page->page().local_traversable()->active_session_history_entry();
         VERIFY(active_entry);
-        async_did_reset_session_history_for_testing(page_id, Web::HTML::create_session_history_entry_descriptor(*active_entry));
+        async_did_reset_state_for_testing(page_id, Web::HTML::create_session_history_entry_descriptor(*active_entry));
     }
 }
 

@@ -10,10 +10,10 @@
 
 #include <AK/ByteBuffer.h>
 #include <AK/RefCounted.h>
+#include <AK/RefPtr.h>
 #include <AK/Time.h>
 #include <AK/Vector.h>
 #include <AK/Weakable.h>
-#include <LibGC/ActivityRoot.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibJS/Forward.h>
 #include <LibURL/URL.h>
@@ -102,16 +102,12 @@ public:
     GC::Ref<XMLHttpRequestUpload> upload() const;
     Utf16String get_text_response() const;
     ByteBuffer const& received_bytes() const { return m_received_bytes; }
-    bool response_body_is_null() const;
     bool response_object_is_failure() const { return m_response_object.has<Failure>(); }
     GC::Ptr<DOM::Document> response_document() const;
     GC::Ptr<FileAPI::Blob> response_blob() const;
     void set_blob_response_object(GC::Ref<FileAPI::Blob>);
     void set_document_response();
     MimeSniff::MimeType get_final_mime_type() const;
-    bool has_activity_root() const { return m_activity_root.is_taken(); }
-
-    static void release_activity_roots_for_relevant_global_object(DOM::EventTarget const&);
 
 private:
     virtual void visit_edges(Cell::Visitor&) override;
@@ -130,11 +126,12 @@ private:
     WebIDL::ExceptionOr<void> handle_errors();
     WebIDL::ExceptionOr<void> request_error_steps(Utf16FlyString const& event_name, GC::Ptr<WebIDL::DOMException> exception = nullptr);
 
+    void restart_timeout_timer();
     void stop_timeout_timer();
     bool should_be_kept_alive() const;
-    void update_activity_root();
+    void update_pending_activity();
 
-    XMLHttpRequest(GC::Ref<DOM::EventTarget> relevant_global_object, XMLHttpRequestUpload&, NonnullRefPtr<HTTP::HeaderList>, Fetch::Infrastructure::Response&, Fetch::Infrastructure::FetchController&);
+    XMLHttpRequest(GC::Ref<DOM::EventTarget> relevant_global_object, XMLHttpRequestUpload&, NonnullRefPtr<HTTP::HeaderList>, Fetch::Infrastructure::ResponseView&, Fetch::Infrastructure::FetchController&);
 
     // https://xhr.spec.whatwg.org/#upload-object
     // upload object
@@ -205,7 +202,7 @@ private:
     // https://xhr.spec.whatwg.org/#response
     // response
     //     A response, initially a network error.
-    GC::Ref<Fetch::Infrastructure::Response> m_response;
+    GC::Ref<Fetch::Infrastructure::ResponseView> m_response;
 
     // https://xhr.spec.whatwg.org/#received-bytes
     // received bytes
@@ -226,8 +223,8 @@ private:
     //     An object, failure, or null, initially null.
     Variant<GC::Ref<DOM::Document>, GC::Ref<FileAPI::Blob>, Failure, Empty> m_response_object;
     struct CachedResponseObject {
-        GC::Weak<Bindings::PlatformObject> wrapper;
-        GC::Ptr<JS::Object> object;
+        GC::Weak<JS::HostObject> wrapper;
+        JS::Value object;
     };
     Vector<CachedResponseObject> m_cached_response_objects;
 
@@ -248,8 +245,9 @@ private:
     Optional<MonotonicTime> m_last_upload_progress_timestamp;
     Optional<MonotonicTime> m_last_download_progress_timestamp;
 
+    RefPtr<Fetch::Infrastructure::Request> m_async_request;
+    MonotonicTime m_async_send_start_time;
     GC::Ptr<Platform::Timer> m_timeout_timer;
-    GC::ActivityRoot m_activity_root;
 };
 
 }

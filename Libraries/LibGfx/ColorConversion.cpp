@@ -41,7 +41,7 @@ ColorComponents srgb_to_linear_srgb(ColorComponents const& srgb)
         if (absolute <= 0.04045)
             return static_cast<float>(c / 12.92);
 
-        return static_cast<float>(sign * pow((absolute + 0.055) / 1.055, 2.4));
+        return static_cast<float>(sign * AK::pow<double>((absolute + 0.055) / 1.055, 2.4));
     };
 
     return { to_linear(srgb[0]), to_linear(srgb[1]), to_linear(srgb[2]), srgb.alpha() };
@@ -56,7 +56,7 @@ ColorComponents linear_srgb_to_srgb(ColorComponents const& linear)
         float absolute = abs(c);
 
         if (absolute > 0.0031308f)
-            return sign * static_cast<float>(1.055 * pow(absolute, 1.0 / 2.4) - 0.055);
+            return sign * static_cast<float>(1.055 * AK::pow<double>(absolute, 1.0 / 2.4) - 0.055);
 
         return 12.92f * c;
     };
@@ -86,7 +86,7 @@ ColorComponents display_p3_to_linear_display_p3(ColorComponents const& p3)
         if (absolute <= 0.04045f)
             return c / 12.92f;
 
-        return sign * static_cast<float>(pow((absolute + 0.055f) / 1.055f, 2.4));
+        return sign * static_cast<float>(AK::pow<double>((absolute + 0.055f) / 1.055f, 2.4));
     };
 
     return { to_linear(p3[0]), to_linear(p3[1]), to_linear(p3[2]), p3.alpha() };
@@ -100,7 +100,7 @@ ColorComponents a98rgb_to_xyz65(ColorComponents const& a98)
         float sign = c < 0 ? -1.0f : 1.0f;
         float absolute = abs(c);
 
-        return sign * static_cast<float>(pow(absolute, 563.0 / 256.0));
+        return sign * static_cast<float>(AK::pow<double>(absolute, 563.0 / 256.0));
     };
 
     auto linear_r = to_linear(a98[0]);
@@ -125,7 +125,7 @@ ColorComponents pro_photo_rgb_to_xyz50(ColorComponents const& prophoto)
         if (absolute <= 16.0f / 512.0f)
             return c / 16.0f;
 
-        return sign * static_cast<float>(pow(absolute, 1.8));
+        return sign * static_cast<float>(AK::pow<double>(absolute, 1.8));
     };
 
     auto linear_r = to_linear(prophoto[0]);
@@ -153,7 +153,7 @@ ColorComponents rec2020_to_xyz65(ColorComponents const& rec2020)
         if (absolute < beta * 4.5)
             return c / 4.5f;
 
-        return sign * static_cast<float>(pow((absolute + alpha - 1) / alpha, 1 / 0.45));
+        return sign * static_cast<float>(AK::pow<double>((absolute + alpha - 1) / alpha, 1 / 0.45));
     };
 
     auto linear_r = to_linear(rec2020[0]);
@@ -209,7 +209,7 @@ ColorComponents lab_to_xyz50(ColorComponents const& lab)
     };
 
     float x = compute(f0);
-    float y = L > kappa * epsilon ? static_cast<float>(pow((L + 16.0) / 116.0, 3)) : static_cast<float>(L / kappa);
+    float y = L > kappa * epsilon ? static_cast<float>(AK::pow<double>((L + 16.0) / 116.0, 3)) : static_cast<float>(L / kappa);
     float z = compute(f2);
 
     // D50
@@ -270,9 +270,9 @@ ColorComponents xyz65_to_oklab(ColorComponents const& components)
     float y = components[1];
     float z = components[2];
 
-    float long_cone = cbrtf(0.8190224379967030f * x + 0.3619062600528904f * y - 0.1288737815209879f * z);
-    float medium_cone = cbrtf(0.0329836539323885f * x + 0.9292868615863434f * y + 0.0361446663506424f * z);
-    float short_cone = cbrtf(0.0481771893596242f * x + 0.2642395317527308f * y + 0.6335478284694309f * z);
+    float long_cone = AK::cbrt<float>(0.8190224379967030f * x + 0.3619062600528904f * y - 0.1288737815209879f * z);
+    float medium_cone = AK::cbrt<float>(0.0329836539323885f * x + 0.9292868615863434f * y + 0.0361446663506424f * z);
+    float short_cone = AK::cbrt<float>(0.0481771893596242f * x + 0.2642395317527308f * y + 0.6335478284694309f * z);
 
     return {
         0.2104542683093140f * long_cone + 0.7936177747023054f * medium_cone - 0.0040720430116193f * short_cone,
@@ -305,38 +305,6 @@ ColorComponents oklab_to_xyz65(ColorComponents const& components)
     };
 }
 
-static ColorComponents rectangular_to_polar(ColorComponents const& components)
-{
-    float a = components[1];
-    float b = components[2];
-
-    float chroma = sqrtf(a * a + b * b);
-    float hue = atan2f(b, a) * 180.0f / AK::Pi<float>;
-    if (hue < 0.0f)
-        hue += 360.0f;
-
-    return { components[0], chroma, hue, components.alpha() };
-}
-
-static ColorComponents polar_to_rectangular(ColorComponents const& components)
-{
-    float chroma = components[1];
-    float hue_radians = components[2] * AK::Pi<float> / 180.0f;
-
-    return {
-        components[0],
-        chroma * cosf(hue_radians),
-        chroma * sinf(hue_radians),
-        components.alpha(),
-    };
-}
-
-// https://drafts.csswg.org/css-color-4/#lab-to-lch
-ColorComponents oklab_to_oklch(ColorComponents const& components) { return rectangular_to_polar(components); }
-
-// https://drafts.csswg.org/css-color-4/#lch-to-lab
-ColorComponents oklch_to_oklab(ColorComponents const& components) { return polar_to_rectangular(components); }
-
 // https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents xyz50_to_lab(ColorComponents const& components)
 {
@@ -350,7 +318,7 @@ ColorComponents xyz50_to_lab(ColorComponents const& components)
 
     auto f = [](float value) -> float {
         if (value > epsilon)
-            return cbrtf(value);
+            return AK::cbrt<float>(value);
         return static_cast<float>((kappa * value + 16.0) / 116.0);
     };
 
@@ -365,12 +333,6 @@ ColorComponents xyz50_to_lab(ColorComponents const& components)
         components.alpha(),
     };
 }
-
-// https://drafts.csswg.org/css-color-4/#lab-to-lch
-ColorComponents lab_to_lch(ColorComponents const& components) { return rectangular_to_polar(components); }
-
-// https://drafts.csswg.org/css-color-4/#lch-to-lab
-ColorComponents lch_to_lab(ColorComponents const& components) { return polar_to_rectangular(components); }
 
 // https://drafts.csswg.org/css-color-4/#rgb-to-hsl
 ColorComponents srgb_to_hsl(ColorComponents const& components)
@@ -463,23 +425,6 @@ ColorComponents srgb_to_hwb(ColorComponents const& components)
     return { hue, minimum, 1.0f - maximum, components.alpha() };
 }
 
-// https://drafts.csswg.org/css-color-4/#predefined-display-p3
-// https://drafts.csswg.org/css-color-4/#color-conversion-code
-ColorComponents linear_display_p3_to_display_p3(ColorComponents const& components)
-{
-    auto to_gamma = [](float c) {
-        float sign = c < 0 ? -1.0f : 1.0f;
-        float absolute = abs(c);
-
-        if (absolute > 0.0031308f)
-            return sign * static_cast<float>(1.055 * pow(absolute, 1.0 / 2.4) - 0.055);
-
-        return 12.92f * c;
-    };
-
-    return { to_gamma(components[0]), to_gamma(components[1]), to_gamma(components[2]), components.alpha() };
-}
-
 // https://drafts.csswg.org/css-color-4/#predefined-display-p3-linear
 // https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents xyz65_to_linear_display_p3(ColorComponents const& components)
@@ -497,41 +442,14 @@ ColorComponents xyz65_to_linear_display_p3(ColorComponents const& components)
 
 // https://drafts.csswg.org/css-color-4/#predefined-a98-rgb
 // https://drafts.csswg.org/css-color-4/#color-conversion-code
-ColorComponents a98_rgb_to_linear_a98_rgb(ColorComponents const& components)
-{
-    auto to_linear = [](float c) {
-        double sign = c < 0.0f ? -1.0 : 1.0;
-        return static_cast<float>(sign * pow(abs(c), 563.0 / 256.0));
-    };
-
-    return { to_linear(components[0]), to_linear(components[1]), to_linear(components[2]), components.alpha() };
-}
-
-// https://drafts.csswg.org/css-color-4/#predefined-a98-rgb
-// https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents linear_a98_rgb_to_a98_rgb(ColorComponents const& components)
 {
     auto to_gamma = [](float c) {
         double sign = c < 0.0f ? -1.0 : 1.0;
-        return static_cast<float>(sign * pow(abs(c), 256.0 / 563.0));
+        return static_cast<float>(sign * AK::pow<double>(abs(c), 256.0 / 563.0));
     };
 
     return { to_gamma(components[0]), to_gamma(components[1]), to_gamma(components[2]), components.alpha() };
-}
-
-// https://drafts.csswg.org/css-color-4/#predefined-a98-rgb
-// https://drafts.csswg.org/css-color-4/#color-conversion-code
-ColorComponents linear_a98_rgb_to_xyz65(ColorComponents const& components)
-{
-    double red = components[0];
-    double green = components[1];
-    double blue = components[2];
-    return {
-        static_cast<float>((573536.0 / 994567.0) * red + (263643.0 / 1420810.0) * green + (187206.0 / 994567.0) * blue),
-        static_cast<float>((591459.0 / 1989134.0) * red + (6239551.0 / 9945670.0) * green + (374412.0 / 4972835.0) * blue),
-        static_cast<float>((53769.0 / 1989134.0) * red + (351524.0 / 4972835.0) * green + (4929758.0 / 4972835.0) * blue),
-        components.alpha(),
-    };
 }
 
 // https://drafts.csswg.org/css-color-4/#predefined-a98-rgb
@@ -551,21 +469,6 @@ ColorComponents xyz65_to_linear_a98_rgb(ColorComponents const& components)
 
 // https://drafts.csswg.org/css-color-4/#predefined-prophoto-rgb
 // https://drafts.csswg.org/css-color-4/#color-conversion-code
-ColorComponents prophoto_rgb_to_linear_prophoto_rgb(ColorComponents const& components)
-{
-    auto to_linear = [](float c) -> float {
-        float sign = c < 0.0f ? -1.0f : 1.0f;
-        float absolute = abs(c);
-        if (absolute <= 16.0f / 512.0f)
-            return c / 16.0f;
-        return sign * static_cast<float>(pow(absolute, 1.8));
-    };
-
-    return { to_linear(components[0]), to_linear(components[1]), to_linear(components[2]), components.alpha() };
-}
-
-// https://drafts.csswg.org/css-color-4/#predefined-prophoto-rgb
-// https://drafts.csswg.org/css-color-4/#color-conversion-code
 ColorComponents linear_prophoto_rgb_to_prophoto_rgb(ColorComponents const& components)
 {
     auto to_gamma = [](float c) -> float {
@@ -573,25 +476,10 @@ ColorComponents linear_prophoto_rgb_to_prophoto_rgb(ColorComponents const& compo
         float absolute = abs(c);
         if (absolute <= 1.0f / 512.0f)
             return c * 16.0f;
-        return sign * static_cast<float>(pow(absolute, 1.0 / 1.8));
+        return sign * static_cast<float>(AK::pow<double>(absolute, 1.0 / 1.8));
     };
 
     return { to_gamma(components[0]), to_gamma(components[1]), to_gamma(components[2]), components.alpha() };
-}
-
-// https://drafts.csswg.org/css-color-4/#predefined-prophoto-rgb
-// https://drafts.csswg.org/css-color-4/#color-conversion-code
-ColorComponents linear_prophoto_rgb_to_xyz50(ColorComponents const& components)
-{
-    float red = components[0];
-    float green = components[1];
-    float blue = components[2];
-    return {
-        0.79776664f * red + 0.13518130f * green + 0.03134773f * blue,
-        0.28807483f * red + 0.71183523f * green + 0.00008994f * blue,
-        0.00000000f * red + 0.00000000f * green + 0.82510460f * blue,
-        components.alpha(),
-    };
 }
 
 // https://drafts.csswg.org/css-color-4/#predefined-prophoto-rgb
@@ -610,27 +498,6 @@ ColorComponents xyz50_to_linear_prophoto_rgb(ColorComponents const& components)
 }
 
 // https://drafts.csswg.org/css-color-4/#predefined-rec2020
-ColorComponents rec2020_to_linear_rec2020(ColorComponents const& components)
-{
-    auto to_linear = [](float c) -> float {
-        // AD-HOC: CSS Color 4 specifies a pure 2.4 gamma transfer function for rec2020, but all major engines
-        //         and the WPT rec2020 reftests use the piecewise OETF from ITU-R BT.2020-2, so we do the same.
-        constexpr auto alpha = 1.09929682680944;
-        constexpr auto beta = 0.018053968510807;
-
-        float sign = c < 0.0f ? -1.0f : 1.0f;
-        float absolute = abs(c);
-
-        if (absolute < beta * 4.5)
-            return c / 4.5f;
-
-        return sign * static_cast<float>(pow((absolute + alpha - 1) / alpha, 1 / 0.45));
-    };
-
-    return { to_linear(components[0]), to_linear(components[1]), to_linear(components[2]), components.alpha() };
-}
-
-// https://drafts.csswg.org/css-color-4/#predefined-rec2020
 ColorComponents linear_rec2020_to_rec2020(ColorComponents const& components)
 {
     auto to_gamma = [](float c) -> float {
@@ -645,25 +512,10 @@ ColorComponents linear_rec2020_to_rec2020(ColorComponents const& components)
         if (absolute < beta)
             return 4.5f * c;
 
-        return sign * static_cast<float>(alpha * pow(absolute, 0.45) - (alpha - 1));
+        return sign * static_cast<float>(alpha * AK::pow<double>(absolute, 0.45) - (alpha - 1));
     };
 
     return { to_gamma(components[0]), to_gamma(components[1]), to_gamma(components[2]), components.alpha() };
-}
-
-// https://drafts.csswg.org/css-color-4/#predefined-rec2020
-// https://drafts.csswg.org/css-color-4/#color-conversion-code
-ColorComponents linear_rec2020_to_xyz65(ColorComponents const& components)
-{
-    float red = components[0];
-    float green = components[1];
-    float blue = components[2];
-    return {
-        0.63695805f * red + 0.14461690f * green + 0.16888098f * blue,
-        0.26270021f * red + 0.67799807f * green + 0.05930172f * blue,
-        0.00000000f * red + 0.02807269f * green + 1.06098506f * blue,
-        components.alpha(),
-    };
 }
 
 // https://drafts.csswg.org/css-color-4/#predefined-rec2020

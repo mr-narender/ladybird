@@ -9,6 +9,7 @@ use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::node_painting;
 use crate::painting::paint_order;
+use crate::painting::paint_read::GeometryRead;
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -62,7 +63,6 @@ impl Verifier<'_> {
         match self.arena.paintable_visual_context_record(slot) {
             Some(record) => {
                 let stored = record.stacking_context;
-                drop(record);
                 let mut fresh_with_registered_contribution = fresh;
                 fresh_with_registered_contribution.contribution_is_registered = true;
                 if stored != fresh_with_registered_contribution {
@@ -123,13 +123,13 @@ impl Verifier<'_> {
 
         let paintable_rows = self.arena.paintable_rows();
         if node_painting::has_lines(&paintable_rows, slot)
-            && !self.arena.paintable_side_data(slot).inline_box_pieces().is_empty()
+            && !self.arena.committed_side_data(slot).inline_box_pieces().is_empty()
         {
             for (owner, recomputed_filter) in
                 crate::painting::fragment_ownership::compute_fragment_ownership_for_block(&paintable_rows, slot)
             {
-                let stored_filter = self.arena.paintable_side_data(owner).fragment_ownership.clone();
-                if stored_filter.as_ref() != Some(&recomputed_filter) {
+                let stored_filter = self.arena.committed_side_data(owner).fragment_ownership.clone();
+                if stored_filter.as_deref() != Some(&recomputed_filter) {
                     self.report.note(format_args!(
                         "fragment ownership of {owner:?} under line root {slot:?} diverges from a fresh computation"
                     ));
@@ -186,13 +186,9 @@ impl Verifier<'_> {
                     .note(format_args!("entries table of {root:?} is still flagged for a resort"));
             }
         }
-        let stored_table_count = self
-            .arena
-            .paintable_rows
-            .stacking_context_entries
-            .borrow()
-            .iter()
-            .filter(|table| table.is_some())
+        let tables = &self.arena.paintable_rows.stacking_context_entries;
+        let stored_table_count = (0..self.arena.paintable_row_count())
+            .filter(|index| tables.get(*index).is_some_and(Option::is_some))
             .count();
         let expected_table_count = self
             .expected_entries_by_root

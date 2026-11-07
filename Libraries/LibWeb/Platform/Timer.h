@@ -7,8 +7,8 @@
 #pragma once
 
 #include <AK/NonnullRefPtr.h>
+#include <AK/Time.h>
 #include <LibCore/Forward.h>
-#include <LibGC/ActivityRoot.h>
 #include <LibGC/CellAllocator.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibWeb/Export.h>
@@ -21,28 +21,26 @@ class WEB_API Timer : public JS::Cell {
 
 public:
     static GC::Ref<Timer> create(GC::Heap&);
-    static GC::Ref<Timer> create_repeating(GC::Heap&, int interval_ms, GC::Ptr<GC::Function<void()>> timeout_handler);
-    static GC::Ref<Timer> create_single_shot(GC::Heap&, int interval_ms, GC::Ptr<GC::Function<void()>> timeout_handler);
+    static GC::Ref<Timer> create_repeating(GC::Heap&, AK::Duration interval, GC::Ptr<GC::Function<void()>> timeout_handler);
+    static GC::Ref<Timer> create_single_shot(GC::Heap&, AK::Duration interval, GC::Ptr<GC::Function<void()>> timeout_handler);
 
     virtual ~Timer();
     virtual void finalize() override;
 
     void start();
-    void start(int interval_ms);
+    void start(AK::Duration interval);
     void restart();
-    void restart(int interval_ms);
+    void restart(AK::Duration interval);
     void stop();
 
     void set_active(bool);
 
     bool is_active() const;
-    int interval() const;
-    void set_interval(int interval_ms);
+    AK::Duration interval() const;
+    void set_interval(AK::Duration interval);
 
     bool is_single_shot() const;
     void set_single_shot(bool);
-
-    bool has_activity_root() const { return m_activity_root.is_taken(); }
 
     GC::Ptr<GC::Function<void()>> on_timeout;
 
@@ -52,7 +50,6 @@ private:
     virtual void visit_edges(JS::Cell::Visitor&) override;
 
     NonnullRefPtr<Core::Timer> m_timer;
-    GC::ActivityRoot m_activity_root;
 };
 
 }

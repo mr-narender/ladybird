@@ -7,14 +7,60 @@
 use crate::layout::LayoutNodeArena;
 use crate::layout::abspos_inputs::AbsposLayoutInputs;
 use crate::layout::formatting_context::{FormattingContextType, formatting_context_type_created_by_node_data};
+use crate::layout::layout_node_arena::{AncestorIntrinsicSizes, AncestorInvalidation};
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts;
-use std::ffi::c_void;
+use crate::painting::paint_read::PaintRead;
 
-#[repr(C)]
-pub struct FfiLayoutTreeUpdateClassification {
-    pub marks_partial_relayout_boundary_self_only: bool,
-    pub nearest_non_anonymous_ancestor_when_parent_is_anonymous: NodeSlotId,
+/// The boxes registered as roots of a partial relayout since a layout last took them, in the order they were
+/// registered, each once.
+#[derive(Clone, Default)]
+pub(crate) struct PartialRelayoutBoundaryRoots {
+    roots: Vec<NodeSlotId>,
+    registered: crate::css::style::fast_hash::FastSet<NodeSlotId>,
+    /// How many registered roots were freed since a registration last pruned the freed ones.
+    freed: usize,
+}
+
+impl PartialRelayoutBoundaryRoots {
+    pub(crate) fn roots(&self) -> &[NodeSlotId] {
+        &self.roots
+    }
+
+    /// Notes that the node `node` names is freed, which the next registration prunes where it is a registered root.
+    pub(crate) fn note_freed(&mut self, node: NodeSlotId) {
+        if self.registered.contains(&node) {
+            self.freed += 1;
+        }
+    }
+}
+
+crate::render_state::held_node_entries!();
+
+pub(crate) struct LayoutTreeUpdateClassification {
+    pub(crate) marks_partial_relayout_boundary_self_only: bool,
+    /// The node a rebuild escalates to past anonymous parents, if it does, named the way a commit
+    /// message names it.
+    pub(crate) escalation_target: Option<u32>,
+}
+
+/// A partial relayout boundary the planner found its committed layout stands for, with the containing block that layout
+/// was laid out in, which the tree as built still gives the box. Only the planner makes one, so the relayout of a
+/// boundary starts from the tree, never from a containing block its commit stored that the tree has dropped since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlannedBoundary {
+    root: NodeSlotId,
+    containing_block: NodeSlotId,
+}
+
+impl PlannedBoundary {
+    pub(crate) fn root(self) -> NodeSlotId {
+        self.root
+    }
+
+    pub(crate) fn containing_block(self) -> NodeSlotId {
+        self.containing_block
+    }
 }
 
 impl LayoutNodeArena {
@@ -25,10 +71,10 @@ impl LayoutNodeArena {
     /// anonymous siblings; otherwise a node under an anonymous parent escalates the rebuild
     /// to the nearest non-anonymous ancestor.
     pub(crate) fn classify_layout_tree_update(
-        &self,
+        &mut self,
         node: NodeSlotId,
         reason_is_structural_boundary_self_rebuild: bool,
-    ) -> FfiLayoutTreeUpdateClassification {
+    ) -> LayoutTreeUpdateClassification {
         let data = self.data(node);
         let (kind, parent) = (data.kind.get(), data.parent.get());
 
@@ -62,9 +108,9 @@ impl LayoutNodeArena {
             }
         }
 
-        FfiLayoutTreeUpdateClassification {
+        LayoutTreeUpdateClassification {
             marks_partial_relayout_boundary_self_only: marks_boundary_self_only,
-            nearest_non_anonymous_ancestor_when_parent_is_anonymous: nearest_non_anonymous_ancestor,
+            escalation_target: self.commit_message_style_node(nearest_non_anonymous_ancestor),
         }
     }
 
@@ -122,7 +168,13 @@ impl LayoutNodeArena {
         if node_facts::has_flag(data, NodeFlag::IsDocumentElement) {
             return false;
         }
-        if self.saved_abspos_layout_inputs(data).is_none() {
+        if self.saved_abspos_layout_inputs(node).is_none() {
+            return false;
+        }
+
+        // https://drafts.csswg.org/css-anchor-position-1/#fallback-apply
+        // NB: Only a full layout pass determines the position fallback styles of a box.
+        if style.is_some_and(|style| style.anchor().position_try_fallbacks.length != 0) {
             return false;
         }
 
@@ -137,14 +189,14 @@ impl LayoutNodeArena {
         //       boundary triggers ancestor scrollable overflow recomputation after commit.
 
         let parent_style = (!data.parent.get().is_invalid())
-            .then(|| self.style_payloads(data.parent.get()))
-            .flatten()
-            .map(|payloads| crate::css::computed_value_views::ComputedValuesView::new(&payloads.groups));
+            .then(|| self.style_view(data.parent.get()))
+            .flatten();
         matches!(
             formatting_context_type_created_by_node_data(
                 data,
                 style,
-                node_facts::node_is_flex_or_grid_container(parent_style)
+                node_facts::node_is_flex_or_grid_container(parent_style),
+                || parent_style.map(|style| style.writing_mode()),
             ),
             Some(
                 FormattingContextType::Block
@@ -155,35 +207,38 @@ impl LayoutNodeArena {
         )
     }
 
-    pub(crate) fn register_partial_relayout_boundary_root(&self, node: NodeSlotId) {
+    pub(crate) fn register_partial_relayout_boundary_root(&mut self, node: NodeSlotId) {
         let kind = self.data(node).kind.get();
         assert!(node_facts::kind_is_box(kind));
-        let mut roots = self.partial_relayout_boundary_roots.borrow_mut();
-        roots.retain(|candidate| self.slot_is_live(*candidate));
-        if roots.contains(&node) {
-            return;
+        let mut roots = std::mem::take(&mut self.partial_relayout_boundary_roots);
+        if roots.freed != 0 {
+            roots.roots.retain(|candidate| self.slot_is_live(*candidate));
+            roots.registered.retain(|candidate| self.slot_is_live(*candidate));
+            roots.freed = 0;
         }
-        roots.push(node);
+        if roots.registered.insert(node) {
+            roots.roots.push(node);
+        }
+        self.partial_relayout_boundary_roots = roots;
     }
 
     /// Counts stale entries for freed nodes on purpose: the C++ side treats a nonempty
     /// root set as "layout is not up to date", and a freed boundary still attributes a
     /// pending update, exactly as a nulled-out weak pointer did.
     pub(crate) fn has_partial_relayout_boundary_roots(&self) -> bool {
-        !self.partial_relayout_boundary_roots.borrow().is_empty()
+        !self.partial_relayout_boundary_roots.roots.is_empty()
     }
 
-    pub(crate) fn take_partial_relayout_boundary_roots(&self) -> Vec<NodeSlotId> {
-        std::mem::take(&mut *self.partial_relayout_boundary_roots.borrow_mut())
+    pub(crate) fn take_partial_relayout_boundary_roots(&mut self) -> Vec<NodeSlotId> {
+        std::mem::take(&mut self.partial_relayout_boundary_roots).roots
     }
 
-    pub(crate) fn record_partial_relayout_escape(&self) {
-        self.pending_updates_escape_partial_relayout.set(true);
-        self.set_needs_full_scrollable_overflow_recalculation();
+    pub(crate) fn record_partial_relayout_escape(&mut self) {
+        self.pending_updates_escape_partial_relayout = true;
     }
 
-    pub(crate) fn clear_partial_relayout_escape(&self) {
-        self.pending_updates_escape_partial_relayout.set(false);
+    pub(crate) fn clear_partial_relayout_escape(&mut self) {
+        self.pending_updates_escape_partial_relayout = false;
     }
 
     pub(crate) fn node_needs_layout_update(&self, node: NodeSlotId) -> bool {
@@ -193,10 +248,10 @@ impl LayoutNodeArena {
     /// Plans a partial relayout against the subtree roots the last layout tree build left
     /// pending, consuming them.
     pub(crate) fn plan_partial_relayout_with_pending_rebuilt_roots(
-        &self,
+        &mut self,
         root: NodeSlotId,
         registered_root_slots: &[NodeSlotId],
-    ) -> Option<Vec<NodeSlotId>> {
+    ) -> Option<Vec<PlannedBoundary>> {
         let (rebuilt_subtree_root_slots, layout_tree_update_escaped_rebuild_roots) =
             self.take_pending_rebuilt_subtree_roots();
         self.plan_partial_relayout(
@@ -218,8 +273,8 @@ impl LayoutNodeArena {
     ) -> bool {
         !(root.is_invalid()
             || self.needs_full_layout_tree_update()
-            || self.pending_updates_escape_partial_relayout.get()
-            || (registered_root_slots.is_empty() && self.deferred_child_list_insertion_parents.borrow().is_empty())
+            || self.pending_updates_escape_partial_relayout
+            || (registered_root_slots.is_empty() && self.deferred_child_list_insertion_parents.is_empty())
             || self.node_needs_layout_update(root)
             || facts.container_query_evaluation_is_pending
             || facts.should_collect_devtools_layout_data)
@@ -227,20 +282,21 @@ impl LayoutNodeArena {
 
     /// Selects the boundary subtrees to relay out after the layout tree build. Consumes the
     /// escape bit either way: a refusal here is followed by a full layout pass in the same
-    /// update, which re-derives every fact the bit stands in for.
+    /// update.
     pub(crate) fn plan_partial_relayout(
-        &self,
+        &mut self,
         root: NodeSlotId,
         registered_root_slots: &[NodeSlotId],
         rebuilt_subtree_root_slots: &[NodeSlotId],
         layout_tree_update_escaped_rebuild_roots: bool,
-    ) -> Option<Vec<NodeSlotId>> {
-        let pending_updates_escaped =
-            self.pending_updates_escape_partial_relayout.replace(false) || layout_tree_update_escaped_rebuild_roots;
-        if pending_updates_escaped {
-            self.set_needs_full_scrollable_overflow_recalculation();
-        }
-        if self.node_needs_layout_update(root) || pending_updates_escaped {
+    ) -> Option<Vec<PlannedBoundary>> {
+        let pending_updates_escaped = std::mem::replace(&mut self.pending_updates_escape_partial_relayout, false)
+            || layout_tree_update_escaped_rebuild_roots;
+        // NB: A build can replace the root, which leaves nothing laid out around the boundaries, and no mark on the new box.
+        if self.node_needs_layout_update(root)
+            || pending_updates_escaped
+            || !self.paintable_rows().paintable_row_is_populated(root)
+        {
             return None;
         }
         self.collect_partial_relayout_roots(registered_root_slots, rebuilt_subtree_root_slots)
@@ -292,9 +348,9 @@ impl LayoutNodeArena {
         &self,
         registered_root_slots: &[NodeSlotId],
         rebuilt_subtree_root_slots: &[NodeSlotId],
-    ) -> Option<Vec<NodeSlotId>> {
+    ) -> Option<Vec<PlannedBoundary>> {
         let mut collected_boundaries: crate::css::style::fast_hash::FastSet<NodeSlotId> = Default::default();
-        let mut partial_relayout_roots: Vec<NodeSlotId> = Vec::new();
+        let mut partial_relayout_roots: Vec<PlannedBoundary> = Vec::new();
         let mut collect_boundary = |boundary: NodeSlotId, boundary_box_was_replaced: bool| -> bool {
             if !collected_boundaries.insert(boundary) {
                 return true;
@@ -314,7 +370,13 @@ impl LayoutNodeArena {
                 return false;
             }
 
-            partial_relayout_roots.push(boundary);
+            let Some(containing_block) = self.containing_block_the_commit_stands_in(boundary) else {
+                return false;
+            };
+            partial_relayout_roots.push(PlannedBoundary {
+                root: boundary,
+                containing_block,
+            });
             true
         };
 
@@ -347,8 +409,8 @@ impl LayoutNodeArena {
         }
 
         // A root nested inside another root is relaid out as part of the ancestor's subtree.
-        partial_relayout_roots.retain(|&root| {
-            let mut ancestor = self.data(root).parent.get();
+        partial_relayout_roots.retain(|boundary| {
+            let mut ancestor = self.data(boundary.root).parent.get();
             while !ancestor.is_invalid() {
                 if collected_boundaries.contains(&ancestor) {
                     return false;
@@ -361,16 +423,29 @@ impl LayoutNodeArena {
         if partial_relayout_roots.is_empty()
             || partial_relayout_roots
                 .iter()
-                .any(|&root| self.subtree_may_affect_anchor_positioning(root, true))
+                .any(|boundary| self.subtree_may_affect_anchor_positioning(boundary.root, true))
         {
             return None;
         }
         Some(partial_relayout_roots)
     }
 
+    /// The containing block the committed layout of the boundary `node` was laid out in, where the tree as built still
+    /// gives the box that containing block. A box the build freed, replaced, or put another containing block in place
+    /// of leaves the commit nothing to relay out from: the slot the commit names may hold a box of a later tree.
+    fn containing_block_the_commit_stands_in(&self, node: NodeSlotId) -> Option<NodeSlotId> {
+        let data = self.data(node);
+        let committed = if node_facts::node_style_view(data).is_some_and(|style| style.is_absolutely_positioned()) {
+            self.saved_abspos_layout_inputs(node)?.containing_block
+        } else {
+            self.with_committed_fragment_link(node, |link| link.map(|link| link.containing_block))?
+        };
+        (!committed.is_invalid() && committed == self.containing_block_by_walking_ancestors(node)).then_some(committed)
+    }
+
     pub(crate) fn node_can_replay_saved_abspos_layout_inputs_after_style_change(&self, node: NodeSlotId) -> bool {
         let data = self.data(node);
-        let Some(inputs) = self.saved_abspos_layout_inputs(data) else {
+        let Some(inputs) = self.saved_abspos_layout_inputs(node) else {
             return false;
         };
         if inputs.containing_block.is_invalid() || !self.slot_is_live(inputs.containing_block) {
@@ -379,16 +454,28 @@ impl LayoutNodeArena {
         if inputs.containing_block_info.derives_from_own_computed_values {
             return false;
         }
+        // What the box's anchor functions resolved to last time says nothing of the style it has now.
+        if inputs.resolved_anchor_insets.is_some() {
+            return false;
+        }
 
         let Some(style) = node_facts::node_style_view(data) else {
             return false;
         };
         let inset = &style.surround().inset;
-        let uses_static_position =
-            (inset.left.is_auto() && inset.right.is_auto()) || (inset.top.is_auto() && inset.bottom.is_auto());
-        if uses_static_position
-            && (!inputs.static_position_rect.is_known
-                || inputs.static_position_rect.alignment_derives_from_own_computed_values)
+        let inline_uses_static_position = inset.left.is_auto() && inset.right.is_auto();
+        let block_uses_static_position = inset.top.is_auto() && inset.bottom.is_auto();
+        // NB: The saved inputs hold no static position in an axis the box's insets placed it in. Once it falls back to
+        //     its static position there, that has to be computed.
+        let (inline_placed_by_insets, block_placed_by_insets) =
+            inputs.containing_block_info.axes_placed_by_own_insets();
+        if (inline_uses_static_position && inline_placed_by_insets)
+            || (block_uses_static_position && block_placed_by_insets)
+        {
+            return false;
+        }
+        if (inline_uses_static_position || block_uses_static_position)
+            && inputs.static_position_rect.alignment_derives_from_own_computed_values
         {
             return false;
         }
@@ -398,27 +485,24 @@ impl LayoutNodeArena {
 
     /// Hold back the layout invalidation of a box whose child list gained children until the
     /// layout tree build has attached them.
-    pub(crate) fn defer_child_list_insertion_layout_update(&self, parent: NodeSlotId) {
+    pub(crate) fn defer_child_list_insertion_layout_update(&mut self, parent: NodeSlotId) {
         let grandparent = self.data(parent).parent.get();
-        self.deferred_child_list_insertion_parents
-            .borrow_mut()
-            .push((parent, grandparent));
+        self.deferred_child_list_insertion_parents.push((parent, grandparent));
+        self.deferred_child_list_insertion_parent_slots.insert(parent);
     }
 
-    /// Invalidate what the children attached by a layout tree build reach. `attached_roots` are the
-    /// roots of every subtree the build attached.
+    /// Invalidate what the children attached by a layout tree build reach. `inserted_children` are
+    /// the children the build attached to the deferred parents, each with the parent it was attached to.
     ///
     /// A child that is absolutely positioned against the box it was inserted into, with both axes
     /// placed by insets, changes neither that box nor anything around it: its containing block
     /// is the box's committed padding box, and it is laid out on its own from there. Only the
     /// cached runs above it have to forget their children. Any other insertion invalidates the
     /// box as the mutation did before the build.
-    pub(crate) fn resolve_deferred_child_list_insertions(
-        &self,
-        attached_roots: &crate::css::style::fast_hash::FastSet<NodeSlotId>,
-    ) {
-        self.confined_abspos_layout_inputs.borrow_mut().clear();
-        let mut parents = std::mem::take(&mut *self.deferred_child_list_insertion_parents.borrow_mut());
+    pub(crate) fn resolve_deferred_child_list_insertions(&mut self, inserted_children: &[(NodeSlotId, NodeSlotId)]) {
+        self.confined_abspos_layout_inputs.clear();
+        self.deferred_child_list_insertion_parent_slots.clear();
+        let mut parents = std::mem::take(&mut self.deferred_child_list_insertion_parents);
         parents.sort_unstable_by_key(|(parent, _)| parent.index);
         parents.dedup_by_key(|(parent, _)| *parent);
         for (parent, grandparent) in parents {
@@ -434,11 +518,15 @@ impl LayoutNodeArena {
                 }
                 continue;
             }
-            let inserted: Vec<NodeSlotId> = attached_roots
+            let mut inserted: Vec<NodeSlotId> = inserted_children
                 .iter()
-                .copied()
-                .filter(|&root| self.slot_is_live(root) && self.data(root).parent.get() == parent)
+                .filter(|&&(inserted_parent, child)| {
+                    inserted_parent == parent && self.slot_is_live(child) && self.data(child).parent.get() == parent
+                })
+                .map(|&(_, child)| child)
                 .collect();
+            inserted.sort_unstable_by_key(|child| child.index);
+            inserted.dedup();
             let confined_inputs: Option<Vec<(NodeSlotId, AbsposLayoutInputs)>> = (!inserted.is_empty()
                 && !self.node_needs_layout_update(parent))
             .then(|| {
@@ -451,7 +539,7 @@ impl LayoutNodeArena {
             match confined_inputs {
                 Some(confined_inputs) => {
                     self.note_contained_child_list_change(parent);
-                    self.confined_abspos_layout_inputs.borrow_mut().extend(confined_inputs);
+                    self.confined_abspos_layout_inputs.extend(confined_inputs);
                 }
                 None => self.set_needs_layout_update(parent, true),
             }
@@ -483,10 +571,34 @@ impl LayoutNodeArena {
         }
         let style = node_facts::node_style_view(data)?;
         let anchor = style.anchor();
-        if style.box_values().position != positioning::ABSOLUTE
+        if style.position() != positioning::ABSOLUTE
             || style.has_position_anchor()
             || anchor.position_area.length != 0
             || anchor.position_try_fallbacks.length != 0
+        {
+            return None;
+        }
+        // Anchor functions resolve against anchors this path does not look up.
+        let side_contains_anchor_function = |side: &crate::layout::ComputedLengthPercentageOrAuto| {
+            side.length_percentage()
+                .is_some_and(|length_percentage| length_percentage.contains_anchor_function())
+        };
+        let surround = style.surround();
+        if [
+            style.width(),
+            style.min_width(),
+            style.max_width(),
+            style.height(),
+            style.min_height(),
+            style.max_height(),
+        ]
+        .into_iter()
+        .any(crate::layout::ComputedSize::contains_anchor_function)
+            || [&surround.inset, &surround.margin].into_iter().any(|sides| {
+                [&sides.top, &sides.right, &sides.bottom, &sides.left]
+                    .into_iter()
+                    .any(side_contains_anchor_function)
+            })
         {
             return None;
         }
@@ -508,14 +620,14 @@ impl LayoutNodeArena {
         let parent_style = node_facts::node_style_view(parent_data);
         let grandparent = parent_data.parent.get();
         let grandparent_style = (!grandparent.is_invalid())
-            .then(|| self.style_payloads(grandparent))
-            .flatten()
-            .map(|payloads| crate::css::computed_value_views::ComputedValuesView::new(&payloads.groups));
+            .then(|| self.style_view(grandparent))
+            .flatten();
         if !matches!(
             formatting_context_type_created_by_node_data(
                 parent_data,
                 parent_style,
-                node_facts::node_is_flex_or_grid_container(grandparent_style)
+                node_facts::node_is_flex_or_grid_container(grandparent_style),
+                || grandparent_style.map(|style| style.writing_mode()),
             ),
             None | Some(FormattingContextType::Block | FormattingContextType::Flex)
         ) {
@@ -532,7 +644,6 @@ impl LayoutNodeArena {
                 inline_alignment: StaticPositionAlignment::Start,
                 block_alignment: StaticPositionAlignment::Start,
                 alignment_derives_from_own_computed_values: false,
-                is_known: false,
             },
             containing_block_info: AbsposContainingBlockInfo {
                 rect: LogicalRect {
@@ -550,15 +661,18 @@ impl LayoutNodeArena {
                 inline_alignment: None,
                 block_alignment: None,
                 derives_from_own_computed_values: false,
+                is_position_area: false,
             },
             resolved_anchor_insets: None,
+            resolved_anchor_sizes: Default::default(),
+            position_option: Default::default(),
         })
     }
 
     /// An absolutely positioned child is leaving `parent`, which is its containing block.
     /// Unless the removed subtree affects anchor positioning, only the cached runs that still
     /// describe it and the scrollable overflow it contributed to are invalidated.
-    pub(crate) fn note_contained_abspos_child_removal(&self, parent: NodeSlotId, child: NodeSlotId) {
+    pub(crate) fn note_contained_abspos_child_removal(&mut self, parent: NodeSlotId, child: NodeSlotId) {
         let parent_data = self.data(parent);
         if !node_facts::kind_is_box(parent_data.kind.get())
             || !self.paintable_rows().paintable_row_is_populated(parent)
@@ -568,16 +682,16 @@ impl LayoutNodeArena {
             return;
         }
         self.note_contained_child_list_change(parent);
-        self.schedule_scrollable_overflow_recalculation(parent);
+        self.request_fragment_overflow_recalculation(parent);
     }
 
     /// What a box that is not laid out again still owes a child list change that stays inside its
     /// children: the cached runs that describe the old list, and the paint that depends on it.
-    fn note_contained_child_list_change(&self, parent: NodeSlotId) {
+    fn note_contained_child_list_change(&mut self, parent: NodeSlotId) {
         use crate::layout::node_data::DomPaintFact;
         use crate::painting::record::damage::PaintDamage;
 
-        self.bump_fragment_cache_epoch_of_self_and_ancestors(parent);
+        self.invalidate_fragments_of_self_and_ancestors_for_change_that_sizes_no_box(parent);
         // A committed row plans its children's paint, and an empty editable box is a caret target
         // only while it has nothing to paint in it.
         let mut damage = PaintDamage::ORDER;
@@ -589,41 +703,43 @@ impl LayoutNodeArena {
         self.push_paint_damage(parent, damage);
     }
 
-    pub(crate) fn reset_cached_intrinsic_sizes_of_self_and_ancestors(&self, node: NodeSlotId) {
-        let node_kind = self.data(node).kind.get();
-        if node_facts::kind_is_box(node_kind) {
-            self.reset_cached_intrinsic_sizes(node);
-        }
-        self.reset_cached_intrinsic_sizes_of_ancestors(node);
-    }
-
-    // Reset intrinsic size caches for ancestors up to abspos or SVG root boundary.
-    // Absolutely positioned elements don't contribute to ancestor intrinsic sizes,
-    // so changes inside an abspos box don't require resetting ancestor caches.
-    // SVG root elements have intrinsic sizes determined solely by their own attributes
-    // (width, height, viewBox), not by their children, so the same logic applies.
-    fn reset_cached_intrinsic_sizes_of_ancestors(&self, node: NodeSlotId) {
-        let mut ancestor = self.data(node).parent.get();
-        while !ancestor.is_invalid() {
-            let ancestor_data = self.data(ancestor);
-            let (ancestor_kind, ancestor_parent) = { (ancestor_data.kind.get(), ancestor_data.parent.get()) };
-            if node_facts::kind_is_box(ancestor_kind) {
-                self.reset_cached_intrinsic_sizes(ancestor);
-                let ancestor_is_absolutely_positioned = self
-                    .node_style_if_live(ancestor)
-                    .is_some_and(|style| style.is_absolutely_positioned());
-                if ancestor_is_absolutely_positioned || ancestor_kind == NodeKind::SVGSVGBox {
-                    break;
+    /// Marks for layout every box whose style renders in one of the font cascades of `font_lists`, which loads filled
+    /// faces into in place: as with a font fallback list resolving a loaded face, the styles stay, and only what lays
+    /// their text out runs again.
+    pub(crate) fn relayout_users_of_font_lists(&mut self, font_lists: &[u64]) {
+        let mut users = Vec::new();
+        let mut node = self.bound_viewport_row();
+        while !node.is_invalid() {
+            if self
+                .node_style_if_live(node)
+                .is_some_and(|style| font_lists.contains(&(style.font().font_cascade_list.as_raw() as u64)))
+            {
+                users.push(node);
+            }
+            let data = self.data(node);
+            node = data.first_child.get();
+            if node.is_invalid() {
+                let mut current = data;
+                loop {
+                    node = current.next_sibling.get();
+                    if !node.is_invalid() {
+                        break;
+                    }
+                    let parent = current.parent.get();
+                    if parent.is_invalid() {
+                        break;
+                    }
+                    current = self.data(parent);
                 }
             }
-            ancestor = ancestor_parent;
+        }
+        for user in users {
+            self.set_needs_layout_update(user, true);
         }
     }
 
-    pub(crate) fn set_needs_layout_update(&self, node: NodeSlotId, propagate_through_ancestors: bool) {
-        // Bumped before the already-dirty early return below: a dirty node does not imply its
-        // whole ancestor chain was bumped for the current epoch values, and over-bumping is free.
-        self.bump_fragment_cache_epoch_of_self_and_ancestors(node);
+    pub(crate) fn set_needs_layout_update(&mut self, node: NodeSlotId, propagate_through_ancestors: bool) {
+        self.invalidate_one(node, AncestorInvalidation::ContentChange);
 
         let data = self.data(node);
         let (node_was_already_dirty, node_is_box, first_child, parent) = {
@@ -634,14 +750,32 @@ impl LayoutNodeArena {
                 data.parent.get(),
             )
         };
+        let ancestor_intrinsic_sizes_after_change =
+            if node_is_box && self.box_contributes_to_no_ancestor_intrinsic_size(node) {
+                AncestorIntrinsicSizes::Kept
+            } else {
+                AncestorIntrinsicSizes::Reset
+            };
 
-        if node_was_already_dirty && propagate_through_ancestors {
-            // A dirty node normally implies dirty ancestors, but the walk that marked a partial
-            // relayout boundary stopped there and left its ancestors clean, so a through-ancestors
-            // invalidation arriving on the boundary itself must still walk and mark them.
-            if !node_is_box || !self.node_is_partial_relayout_boundary(node) {
-                return;
+        // A dirty node normally implies dirty ancestors, but the walk that marked a partial
+        // relayout boundary stopped there and left its ancestors clean, so a through-ancestors
+        // invalidation arriving on the boundary itself must still walk and mark them.
+        if node_was_already_dirty
+            && propagate_through_ancestors
+            && !(node_is_box && self.node_is_partial_relayout_boundary(node))
+        {
+            // NB: A dirty node does not imply that its whole ancestor chain was bumped for the current epoch values or
+            //     had its intrinsic sizes reset: the walk that dirtied it may have stopped resetting below it. Doing
+            //     either again is free.
+            if node_is_box {
+                self.reset_cached_intrinsic_sizes(node);
             }
+            self.invalidate_ancestors_for_change_below(
+                node,
+                AncestorInvalidation::ContentChange,
+                ancestor_intrinsic_sizes_after_change,
+            );
+            return;
         }
 
         self.set_node_flag(node, NodeFlag::NeedsLayoutUpdate, true);
@@ -652,8 +786,6 @@ impl LayoutNodeArena {
 
         // Mark any anonymous children generated by this node for layout update.
         // NOTE: if this node generated an anonymous parent, all ancestors are indiscriminately marked below.
-        let fragment_cache_epochs_enabled =
-            super::fc_run_cache::fc_run_cache_mode_from_environment() != super::fc_run_cache::FcRunCacheMode::Disabled;
         let mut child = first_child;
         while !child.is_invalid() {
             let child_data = self.data(child);
@@ -665,62 +797,62 @@ impl LayoutNodeArena {
                 )
             };
             if node_facts::kind_is_box(child_kind) && child_is_anonymous && child_kind != NodeKind::TableWrapper {
-                if fragment_cache_epochs_enabled {
-                    self.bump_fragment_cache_epoch_below_bumped_parent(child);
-                }
+                self.bump_fragment_cache_epoch(child);
                 self.set_node_flag(child, NodeFlag::NeedsLayoutUpdate, true);
                 self.reset_cached_intrinsic_sizes(child);
             }
             child = next_sibling;
         }
 
-        if !propagate_through_ancestors {
-            self.register_partial_relayout_boundary_root(node);
-            return;
-        }
-
+        let mut marks_ancestors_for_layout_update = propagate_through_ancestors;
+        let mut ancestor_intrinsic_sizes = if propagate_through_ancestors {
+            ancestor_intrinsic_sizes_after_change
+        } else {
+            AncestorIntrinsicSizes::Kept
+        };
         let mut ancestor = parent;
         while !ancestor.is_invalid() {
+            ancestor_intrinsic_sizes = self.invalidate_ancestor_for_change_below(
+                ancestor,
+                AncestorInvalidation::ContentChange,
+                ancestor_intrinsic_sizes,
+            );
             let ancestor_data = self.data(ancestor);
-            let (ancestor_kind, ancestor_is_dirty, ancestor_parent) = {
+            let (ancestor_is_box, ancestor_is_dirty, ancestor_parent) = {
                 (
-                    ancestor_data.kind.get(),
+                    node_facts::kind_is_box(ancestor_data.kind.get()),
                     ancestor_data.flags.get() & NodeFlag::NeedsLayoutUpdate as u32 != 0,
                     ancestor_data.parent.get(),
                 )
             };
-            if ancestor_is_dirty {
-                break;
-            }
-            self.set_node_flag(ancestor, NodeFlag::NeedsLayoutUpdate, true);
-            if node_facts::kind_is_box(ancestor_kind) && self.node_is_partial_relayout_boundary(ancestor) {
-                self.register_partial_relayout_boundary_root(ancestor);
-                break;
+            if marks_ancestors_for_layout_update {
+                if ancestor_is_dirty {
+                    marks_ancestors_for_layout_update = false;
+                } else {
+                    self.set_node_flag(ancestor, NodeFlag::NeedsLayoutUpdate, true);
+                    if ancestor_is_box && self.node_is_partial_relayout_boundary(ancestor) {
+                        self.register_partial_relayout_boundary_root(ancestor);
+                        marks_ancestors_for_layout_update = false;
+                    }
+                }
             }
             ancestor = ancestor_parent;
         }
 
-        self.reset_cached_intrinsic_sizes_of_ancestors(node);
+        if !propagate_through_ancestors {
+            self.register_partial_relayout_boundary_root(node);
+        }
     }
 }
 
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `node` must name a live node
-/// in this arena.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_node_is_partial_relayout_boundary(arena: *mut c_void, node: NodeSlotId) -> bool {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.node_is_partial_relayout_boundary(node)
-}
-
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_has_partial_relayout_boundary_roots(arena: *mut c_void) -> bool {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.has_partial_relayout_boundary_roots()
+pub extern "C" fn render_state_node_is_partial_relayout_boundary(
+    host: &crate::render_state::DocumentHost,
+    node: NodeSlotId,
+) -> bool {
+    super::shell_reads::read_arena(host, node_read(), node, |arena, node| {
+        arena.node_is_partial_relayout_boundary(node)
+    })
 }
 
 /// The facts the host owns that take an update off the partial relayout path.
@@ -730,105 +862,34 @@ pub(crate) struct FfiPartialRelayoutHostFacts {
     pub should_collect_devtools_layout_data: bool,
 }
 
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_record_partial_relayout_escape(arena: *mut c_void) {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.record_partial_relayout_escape();
-}
-
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `node` must name a live node
-/// in this arena.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_reset_cached_intrinsic_sizes_of_self_and_ancestors(
-    arena: *mut c_void,
-    node: NodeSlotId,
-) {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.reset_cached_intrinsic_sizes_of_self_and_ancestors(node);
-}
-
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `node` must name a live node
-/// in this arena.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_classify_layout_tree_update(
-    arena: *mut c_void,
-    node: NodeSlotId,
-    reason_is_structural_boundary_self_rebuild: bool,
-) -> FfiLayoutTreeUpdateClassification {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }
-        .classify_layout_tree_update(node, reason_is_structural_boundary_self_rebuild)
-}
-
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `parent` must name a live node
-/// in this arena.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_defer_child_list_insertion_layout_update(arena: *mut c_void, parent: NodeSlotId) {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.defer_child_list_insertion_layout_update(parent);
-}
-
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `parent` and `child` must name
-/// live nodes in this arena. The child's subtree must still be intact.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_note_contained_abspos_child_removal(
-    arena: *mut c_void,
-    parent: NodeSlotId,
-    child: NodeSlotId,
-) {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.note_contained_abspos_child_removal(parent, child);
-}
-
-/// # Safety
-///
-/// The arena must remain valid for the duration of the call, and `node` must name a live node
-/// in this arena.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_set_needs_layout_update(
-    arena: *mut c_void,
-    node: NodeSlotId,
-    propagate_through_ancestors: bool,
-) {
-    // SAFETY: The C++ caller keeps the arena alive for this synchronous call.
-    unsafe { LayoutNodeArena::from_handle(arena) }.set_needs_layout_update(node, propagate_through_ancestors);
-}
-
 #[cfg(test)]
 mod tests {
     use super::FfiPartialRelayoutHostFacts;
-    use crate::layout::layout_node_arena::{LayoutNodeArena, NodeAllocation};
+    use crate::css::style::tree::StyleNodeID;
+    use crate::layout::CssPixels;
+    use crate::layout::layout_node_arena::{
+        FirstLineMaxContent, IntrinsicInlineSizeMeasurement, IntrinsicSizeCacheKey, LayoutNodeArena, NodeAllocation,
+    };
     use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
+    use crate::layout::run_state::LayoutScratch;
 
     fn allocate_box_with_a_dummy_shell(arena: &mut LayoutNodeArena) -> NodeAllocation {
         let allocation = arena.allocate_for_test();
-        arena.data(allocation.slot).kind.set(NodeKind::Box);
-        arena.data(allocation.slot).shell.set(std::ptr::dangling_mut());
+        arena.write_shape(allocation.slot).set_kind(NodeKind::Box);
         allocation
     }
 
     fn free_node(arena: &mut LayoutNodeArena, allocation: &NodeAllocation) {
         arena
             .free_subtree(allocation.slot)
-            .destroy_shells_and_invoke_callbacks();
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
     }
 
     #[test]
     fn a_box_without_a_committed_row_or_splice_derivable_ancestors_is_not_a_boundary() {
         let mut arena = LayoutNodeArena::new();
         let allocation = arena.allocate_for_test();
-        arena.data(allocation.slot).kind.set(NodeKind::Box);
+        arena.write_shape(allocation.slot).set_kind(NodeKind::Box);
         assert!(!arena.node_is_partial_relayout_boundary(allocation.slot));
         free_node(&mut arena, &allocation);
     }
@@ -877,23 +938,49 @@ mod tests {
         arena.data(allocation.slot).flags.get() & NodeFlag::NeedsLayoutUpdate as u32 != 0
     }
 
-    fn intrinsic_cache_epoch(arena: &LayoutNodeArena, allocation: &NodeAllocation) -> u16 {
-        arena.data(allocation.slot).intrinsic_cache_epoch.get()
+    fn store_intrinsic_sizes(scratch: &LayoutScratch, allocations: &[&NodeAllocation]) {
+        for allocation in allocations {
+            scratch
+                .intrinsic_size_caches
+                .intrinsic_inline_size_measurement_cache_put(
+                    allocation.slot,
+                    IntrinsicSizeCacheKey::default(),
+                    IntrinsicInlineSizeMeasurement {
+                        min_content_inline_size: CssPixels::from_raw(10),
+                        max_content_inline_size: CssPixels::from_raw(20),
+                        first_line_max_content: FirstLineMaxContent::default(),
+                        depends_on_percentage_block_size: false,
+                        depends_on_percentage_inline_basis: false,
+                        depends_on_block_size: false,
+                    },
+                );
+        }
+    }
+
+    fn intrinsic_sizes_are_kept(scratch: &LayoutScratch, allocation: &NodeAllocation) -> bool {
+        scratch
+            .intrinsic_size_caches
+            .intrinsic_inline_size_measurement_cache_get(allocation.slot, IntrinsicSizeCacheKey::default())
+            .is_some()
     }
 
     #[test]
-    fn marking_a_node_marks_clean_ancestors_and_bumps_their_intrinsic_epochs() {
+    fn marking_a_node_marks_clean_ancestors_and_drops_their_intrinsic_sizes() {
         let mut arena = LayoutNodeArena::new();
+        let mut scratch = LayoutScratch::default();
         let parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
         arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);
+        scratch.apply_memo_invalidations(&mut arena);
+        store_intrinsic_sizes(&scratch, &[&parent, &child]);
 
         arena.set_needs_layout_update(child.slot, true);
+        scratch.apply_memo_invalidations(&mut arena);
 
         assert!(node_is_dirty(&arena, &child));
         assert!(node_is_dirty(&arena, &parent));
-        assert_eq!(intrinsic_cache_epoch(&arena, &child), 1);
-        assert_eq!(intrinsic_cache_epoch(&arena, &parent), 1);
+        assert!(!intrinsic_sizes_are_kept(&scratch, &child));
+        assert!(!intrinsic_sizes_are_kept(&scratch, &parent));
         free_node(&mut arena, &parent);
     }
 
@@ -915,17 +1002,22 @@ mod tests {
     }
 
     #[test]
-    fn remarking_a_dirty_non_boundary_node_leaves_its_parent_clean() {
+    fn remarking_a_dirty_non_boundary_node_leaves_its_parent_clean_and_drops_their_intrinsic_sizes() {
         let mut arena = LayoutNodeArena::new();
+        let mut scratch = LayoutScratch::default();
         let parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
         arena.insert_child(parent.slot, child.slot, NodeSlotId::INVALID);
         arena.set_node_flag(child.slot, NodeFlag::NeedsLayoutUpdate, true);
+        scratch.apply_memo_invalidations(&mut arena);
+        store_intrinsic_sizes(&scratch, &[&parent, &child]);
 
         arena.set_needs_layout_update(child.slot, true);
+        scratch.apply_memo_invalidations(&mut arena);
 
         assert!(!node_is_dirty(&arena, &parent));
-        assert_eq!(intrinsic_cache_epoch(&arena, &parent), 0);
+        assert!(!intrinsic_sizes_are_kept(&scratch, &child));
+        assert!(!intrinsic_sizes_are_kept(&scratch, &parent));
         free_node(&mut arena, &parent);
     }
 
@@ -936,18 +1028,11 @@ mod tests {
         let anonymous_child = allocate_box_with_a_dummy_shell(&mut arena);
         let anonymous_table_wrapper_child = allocate_box_with_a_dummy_shell(&mut arena);
         let named_child = allocate_box_with_a_dummy_shell(&mut arena);
+        arena.set_node_flag(anonymous_child.slot, NodeFlag::Anonymous, true);
+        arena.set_node_flag(anonymous_table_wrapper_child.slot, NodeFlag::Anonymous, true);
         arena
-            .data(anonymous_child.slot)
-            .flags
-            .set(arena.data(anonymous_child.slot).flags.get() | (NodeFlag::Anonymous as u32));
-        arena
-            .data(anonymous_table_wrapper_child.slot)
-            .flags
-            .set(arena.data(anonymous_table_wrapper_child.slot).flags.get() | (NodeFlag::Anonymous as u32));
-        arena
-            .data(anonymous_table_wrapper_child.slot)
-            .kind
-            .set(NodeKind::TableWrapper);
+            .write_shape(anonymous_table_wrapper_child.slot)
+            .set_kind(NodeKind::TableWrapper);
         arena.insert_child(parent.slot, anonymous_child.slot, NodeSlotId::INVALID);
         arena.insert_child(parent.slot, anonymous_table_wrapper_child.slot, NodeSlotId::INVALID);
         arena.insert_child(parent.slot, named_child.slot, NodeSlotId::INVALID);
@@ -970,6 +1055,41 @@ mod tests {
         assert_eq!(arena.collect_partial_relayout_roots(&[stale_slot], &[]), None);
     }
 
+    // An in-flow SVG root relays out alone from the containing block its commit placed it in. Where the commit names a
+    // box the tree freed, whose slot the box the root sits in now took over, it names a box of an earlier tree: the
+    // relayout would lay the root out in it, and every walk that reached the root would find it.
+    #[test]
+    fn a_boundary_relays_out_only_from_a_committed_containing_block_the_tree_still_gives_it() {
+        let mut arena = LayoutNodeArena::new();
+        let freed = allocate_box_with_a_dummy_shell(&mut arena);
+        let earlier_tree_box = freed.slot;
+        free_node(&mut arena, &freed);
+        let parent = allocate_box_with_a_dummy_shell(&mut arena);
+        arena.write_shape(parent.slot).set_kind(NodeKind::BlockContainer);
+        assert_eq!(parent.slot.slot_index(), earlier_tree_box.slot_index());
+        assert_ne!(parent.slot, earlier_tree_box);
+        let svg_root = allocate_box_with_a_dummy_shell(&mut arena);
+        arena.write_shape(svg_root.slot).set_kind(NodeKind::SVGSVGBox);
+        arena.insert_child(parent.slot, svg_root.slot, NodeSlotId::INVALID);
+        arena.populate_paintable_row(svg_root.slot);
+        let plan_with_committed_containing_block = |arena: &mut LayoutNodeArena, containing_block| {
+            let mut link = crate::layout::fragment_tree::FragmentLink::for_test(svg_root.slot);
+            link.containing_block = containing_block;
+            arena.set_committed_fragment_link(svg_root.slot, link, None);
+            arena.collect_partial_relayout_roots(&[svg_root.slot], &[])
+        };
+
+        assert_eq!(
+            plan_with_committed_containing_block(&mut arena, parent.slot),
+            Some(vec![super::PlannedBoundary {
+                root: svg_root.slot,
+                containing_block: parent.slot,
+            }])
+        );
+        assert_eq!(plan_with_committed_containing_block(&mut arena, earlier_tree_box), None);
+        free_node(&mut arena, &parent);
+    }
+
     #[test]
     fn collecting_roots_fails_for_a_rebuilt_subtree_with_no_containing_boundary() {
         let mut arena = LayoutNodeArena::new();
@@ -986,29 +1106,21 @@ mod tests {
         let grandparent = allocate_box_with_a_dummy_shell(&mut arena);
         let anonymous_parent = allocate_box_with_a_dummy_shell(&mut arena);
         let child = allocate_box_with_a_dummy_shell(&mut arena);
-        arena
-            .data(anonymous_parent.slot)
-            .flags
-            .set(arena.data(anonymous_parent.slot).flags.get() | (NodeFlag::Anonymous as u32));
+        arena.set_node_flag(anonymous_parent.slot, NodeFlag::Anonymous, true);
         arena.insert_child(grandparent.slot, anonymous_parent.slot, NodeSlotId::INVALID);
         arena.insert_child(anonymous_parent.slot, child.slot, NodeSlotId::INVALID);
+        arena.set_style_node_for_test(grandparent.slot, StyleNodeID::from_raw(7));
 
         let classification = arena.classify_layout_tree_update(child.slot, false);
-        assert!(!arena.pending_updates_escape_partial_relayout.get());
+        assert!(!arena.pending_updates_escape_partial_relayout);
         assert!(!classification.marks_partial_relayout_boundary_self_only);
-        assert_eq!(
-            classification.nearest_non_anonymous_ancestor_when_parent_is_anonymous,
-            grandparent.slot
-        );
+        assert_eq!(classification.escalation_target, Some(7));
 
         let parent_classification = arena.classify_layout_tree_update(anonymous_parent.slot, false);
-        assert_eq!(
-            parent_classification.nearest_non_anonymous_ancestor_when_parent_is_anonymous,
-            NodeSlotId::INVALID
-        );
+        assert_eq!(parent_classification.escalation_target, None);
 
         arena.classify_layout_tree_update(grandparent.slot, false);
-        assert!(arena.pending_updates_escape_partial_relayout.get());
+        assert!(arena.pending_updates_escape_partial_relayout);
         free_node(&mut arena, &grandparent);
     }
 
@@ -1041,7 +1153,7 @@ mod tests {
         assert!(!arena.partial_relayout_may_be_attempted(parent.slot, &registered, facts));
 
         assert_eq!(arena.plan_partial_relayout(parent.slot, &registered, &[], false), None);
-        assert!(!arena.pending_updates_escape_partial_relayout.get());
+        assert!(!arena.pending_updates_escape_partial_relayout);
         assert!(arena.partial_relayout_may_be_attempted(parent.slot, &registered, facts));
         free_node(&mut arena, &parent);
     }
@@ -1050,7 +1162,7 @@ mod tests {
     fn planning_refuses_when_the_build_escaped_its_rebuild_roots() {
         let (mut arena, parent, registered) = arena_with_a_registered_child_root();
         assert_eq!(arena.plan_partial_relayout(parent.slot, &registered, &[], true), None);
-        assert!(!arena.pending_updates_escape_partial_relayout.get());
+        assert!(!arena.pending_updates_escape_partial_relayout);
         free_node(&mut arena, &parent);
     }
 

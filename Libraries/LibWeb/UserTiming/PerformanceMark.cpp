@@ -34,7 +34,7 @@ WebIDL::ExceptionOr<GC::Ref<PerformanceMark>> PerformanceMark::create_for_constr
     auto& vm = relevant_global_object.vm();
 
     // 1. If the current global object is a Window object and markName uses the same name as a read only attribute in the PerformanceTiming interface, throw a SyntaxError.
-    if (is<HTML::Window>(current_global_object)) {
+    if (HTML::window_from_global_object(current_global_object)) {
         bool matched = false;
 
 #define __ENUMERATE_NAVIGATION_TIMING_ENTRY_NAME(name, _)                    \
@@ -92,11 +92,11 @@ Utf16FlyString const& PerformanceMark::entry_type() const
     return PerformanceTimeline::EntryTypes::mark;
 }
 
-WebIDL::ExceptionOr<JS::Value> PerformanceMark::detail(JS::Object const& relevant_global_object) const
+// https://w3c.github.io/user-timing/#dom-performancemark-detail
+WebIDL::ExceptionOr<JS::Value> PerformanceMark::detail(JS::Object const&) const
 {
-    auto& relevant_realm = HTML::relevant_realm(relevant_global_object);
-    auto serialized = TRY(HTML::structured_serialize(relevant_realm.vm(), m_detail));
-    return HTML::structured_deserialize(relevant_realm.vm(), serialized, relevant_realm);
+    // NB: The detail was structured-cloned when this entry was created, so it is returned as is.
+    return m_detail;
 }
 
 void PerformanceMark::visit_edges(JS::Cell::Visitor& visitor)

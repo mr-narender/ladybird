@@ -31,9 +31,15 @@
 
 namespace IPC {
 
+// NB: One sendmsg() carries a limited number of descriptors, and at least one byte with them. A message with more
+//     descriptors sends the rest ahead of it, in Attachments frames that have no payload. A Payload frame's fd_count
+//     counts every descriptor of its message, including those that arrived ahead of it. A SharedMemoryPayload frame
+//     has no bytes, and its shared memory is the last descriptor of its message.
 struct SocketMessageHeader {
     enum class Type : u8 {
         Payload = 0,
+        Attachments = 1,
+        SharedMemoryPayload = 2,
     };
     Type type { Type::Payload };
     u32 payload_size { 0 };
@@ -42,7 +48,8 @@ struct SocketMessageHeader {
 
 class SendQueue : public AtomicRefCounted<SendQueue> {
 public:
-    void enqueue_message(SocketMessageHeader, MessageDataType payload, Vector<NonnullRefPtr<AutoCloseFileDescriptor>>&& fds);
+    // Answers whether the queue was empty before this message.
+    bool enqueue_message(SocketMessageHeader, MessageDataType payload, Vector<NonnullRefPtr<AutoCloseFileDescriptor>>&& fds);
     struct BytesAndFds {
         Vector<u8> bytes;
         Vector<int> fds;
@@ -78,6 +85,7 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static constexpr socklen_t SOCKET_BUFFER_SIZE = 128 * KiB;
+    static constexpr size_t MAX_INLINE_PAYLOAD_SIZE = 64 * KiB;
 
     struct Paired {
         NonnullOwnPtr<TransportSocket> local;
@@ -85,6 +93,7 @@ public:
     };
     static ErrorOr<Paired> create_paired();
     static ErrorOr<NonnullOwnPtr<TransportSocket>> from_socket(NonnullOwnPtr<Core::LocalSocket> socket);
+    static ErrorOr<NonnullOwnPtr<TransportSocket>> adopt_fd(int fd);
 
     explicit TransportSocket(NonnullOwnPtr<Core::LocalSocket> socket);
     ~TransportSocket();
@@ -136,6 +145,7 @@ private:
         SocketClosed,
     };
     [[nodiscard]] TransferState transfer_data(ReadonlyBytes& bytes, Vector<int>& fds);
+    [[nodiscard]] bool send_queued_messages_on_this_thread();
 
     static ErrorOr<void> send_message(Core::LocalSocket&, ReadonlyBytes& bytes, Vector<int>& unowned_fds);
 
@@ -161,6 +171,8 @@ private:
 
     RefPtr<Threading::Thread> m_io_thread;
     RefPtr<SendQueue> m_send_queue;
+    // Held by the thread that takes bytes from the send queue and writes them to the socket, which keeps them in order.
+    Mutex m_send_mutex;
     Atomic<IOThreadState> m_io_thread_state { IOThreadState::Running };
     Atomic<bool> m_is_being_transferred { false };
     Atomic<bool> m_peer_eof { false };

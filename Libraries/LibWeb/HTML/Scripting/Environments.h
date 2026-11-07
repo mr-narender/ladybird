@@ -10,13 +10,16 @@
 
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/FetchRecord.h>
+#include <LibWeb/Fetch/Infrastructure/KeepaliveQuotaAccountant.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/Scripting/EnvironmentSettingsObjectAddress.h>
 #include <LibWeb/HTML/Scripting/ModuleMap.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/ServiceWorker/Registration.h>
@@ -55,7 +58,7 @@ public:
     Optional<URL::Origin> top_level_origin;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-target-browsing-context
-    GC::Ptr<BrowsingContext> target_browsing_context;
+    GC::Weak<BrowsingContext> target_browsing_context;
 
     // FIXME: An active service worker https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-active-service-worker
 
@@ -67,15 +70,7 @@ public:
 
 protected:
     Environment() = default;
-    Environment(EnvironmentId id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context)
-        : id(move(id))
-        , creation_url(move(creation_url))
-        , top_level_creation_url(move(top_level_creation_url))
-        , top_level_origin(move(top_level_origin))
-        , target_browsing_context(move(target_browsing_context))
-    {
-    }
-    virtual void visit_edges(Cell::Visitor&) override;
+    Environment(EnvironmentId id, URL::URL creation_url, Optional<URL::URL> top_level_creation_url, Optional<URL::Origin> top_level_origin, GC::Ptr<BrowsingContext> target_browsing_context);
 };
 
 enum class RunScriptDecision {
@@ -89,6 +84,8 @@ struct WEB_API EnvironmentSettingsObject : public Environment {
 
 public:
     virtual void finalize() override;
+
+    EnvironmentSettingsObjectAddress address() const { return m_address; }
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-environment-target-browsing-context
     JS::ExecutionContext& realm_execution_context();
@@ -110,7 +107,7 @@ public:
     virtual bool has_cross_site_ancestor() const = 0;
 
     // A policy container https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-policy-container
-    virtual GC::Ref<PolicyContainer> policy_container() const = 0;
+    virtual NonnullRefPtr<PolicyContainer> policy_container() const = 0;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-cross-origin-isolated-capability
     virtual CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability() const = 0;
@@ -122,6 +119,10 @@ public:
     //         of its own. An empty value names no cluster at all, and so matches none.
     virtual Optional<u64> agent_cluster_id() const = 0;
 
+    // https://html.spec.whatwg.org/multipage/webappapis.html#agent-cluster-cross-origin-isolation
+    // Of the agent cluster agent_cluster_id names.
+    virtual CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode() const = 0;
+
     // https://html.spec.whatwg.org/multipage/webappapis.html#concept-settings-object-time-origin
     virtual double time_origin() const = 0;
 
@@ -130,12 +131,14 @@ public:
     Optional<Utf16String> encoding_parse_and_serialize_url(Utf16View);
 
     JS::Realm& realm();
+    JS::Realm const& realm() const;
     JS::Object& global_object();
     JS::Object const& global_object() const { return const_cast<EnvironmentSettingsObject*>(this)->global_object(); }
     EventLoop& responsible_event_loop();
 
     // https://fetch.spec.whatwg.org/#concept-fetch-group
     auto& fetch_group() { return m_fetch_group; }
+    Fetch::Infrastructure::KeepaliveQuotaAccountant& keepalive_quota_accountant() { return m_keepalive_quota_accountant; }
 
     SerializedEnvironmentSettingsObject serialize();
 
@@ -182,6 +185,7 @@ protected:
 
 private:
     NonnullOwnPtr<JS::ExecutionContext> m_realm_execution_context;
+    EnvironmentSettingsObjectAddress m_address;
     GC::Ptr<ModuleMap> m_module_map;
 
     GC::Ptr<EventLoop> m_responsible_event_loop;
@@ -189,6 +193,7 @@ private:
     // https://fetch.spec.whatwg.org/#concept-fetch-record
     // A fetch group holds an ordered list of fetch records
     Fetch::Infrastructure::FetchRecord::List m_fetch_group;
+    NonnullRefPtr<Fetch::Infrastructure::KeepaliveQuotaAccountant> m_keepalive_quota_accountant;
 
     // https://storage.spec.whatwg.org/#api
     // Each environment settings object has an associated StorageManager object.
@@ -225,6 +230,9 @@ WEB_API void clean_up_after_running_callback(EnvironmentSettingsObject const&);
 WEB_API bool module_type_allowed(EnvironmentSettingsObject const&, Utf16View module_type);
 
 WEB_API void add_module_to_resolved_module_set(EnvironmentSettingsObject&, Utf16View serialized_base_url, Utf16View normalized_specifier, Optional<URL::URL> const& as_url);
+
+WEB_API GC::Ptr<EnvironmentSettingsObject> environment_settings_object_at(EnvironmentSettingsObjectAddress);
+WEB_API GC::Ptr<EnvironmentSettingsObject> environment_settings_object_with_id(EnvironmentId const&);
 
 WEB_API EnvironmentSettingsObject& incumbent_settings_object();
 WEB_API JS::Realm& incumbent_realm();

@@ -36,6 +36,7 @@
 #include <LibWeb/WebAudio/ControlMessageQueue.h>
 #include <LibWeb/WebAudio/DynamicsCompressorNode.h>
 #include <LibWeb/WebAudio/GainNode.h>
+#include <LibWeb/WebAudio/MediaStreamAudioSourceNode.h>
 #include <LibWeb/WebAudio/OscillatorNode.h>
 #include <LibWeb/WebAudio/PannerNode.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -98,11 +99,40 @@ void BaseAudioContext::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_document_observer);
     visitor.visit(m_audio_worklet);
     visitor.visit(m_playing_sources);
+
+    if (state() == AudioContextState::Closed)
+        return;
+
+    // INTEROP: Blink keeps a ScriptProcessorNode with audioprocess listeners alive until its context is cleared
+    //          (ScriptProcessorNode::HasPendingActivity()), whether it is connected or not, so that a node script only
+    //          reaches through its listener keeps producing audio.
+    for (auto& node : m_script_processor_nodes) {
+        if (node.has_event_listener(HTML::EventNames::audioprocess))
+            visitor.visit(node);
+    }
+
+    // Keep a source and the nodes it feeds alive while its track is live, even after script drops the source.
+    // https://webaudio.github.io/web-audio-api/#AudioNode-actively-processing
+    // NB: A muted or disabled track only pauses its source, so it stays alive as well.
+    for (auto& source : m_media_stream_sources) {
+        if (source.has_live_input_track())
+            visitor.visit(source);
+    }
 }
 
 void BaseAudioContext::add_playing_source(GC::Ref<AudioNode> node)
 {
     m_playing_sources.set(node->node_id(), node);
+}
+
+void BaseAudioContext::add_script_processor_node(ScriptProcessorNode& node)
+{
+    m_script_processor_nodes.set(node);
+}
+
+void BaseAudioContext::add_media_stream_source(MediaStreamAudioSourceNode& source)
+{
+    m_media_stream_sources.set(source);
 }
 
 void BaseAudioContext::handle_ended_sources(ReadonlySpan<NodeID> ended_nodes)
@@ -261,6 +291,16 @@ WebIDL::ExceptionOr<GC::Ref<GainNode>> BaseAudioContext::create_gain()
     return GainNode::create(*this);
 }
 
+// https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createiirfilter
+WebIDL::ExceptionOr<GC::Ref<IIRFilterNode>> BaseAudioContext::create_iir_filter(Vector<double> const& feedforward, Vector<double> const& feedback)
+{
+    // Factory method for an IIRFilterNode representing a general IIR Filter.
+    IIRFilterOptions options;
+    options.feedforward = feedforward;
+    options.feedback = feedback;
+    return IIRFilterNode::create(*this, options);
+}
+
 // https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createpanner
 WebIDL::ExceptionOr<GC::Ref<PannerNode>> BaseAudioContext::create_panner()
 {
@@ -407,6 +447,13 @@ WebIDL::ExceptionOr<GC::Ref<StereoPannerNode>> BaseAudioContext::create_stereo_p
 {
     // Factory method for a StereoPannerNode.
     return StereoPannerNode::create(*this);
+}
+
+// https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createwaveshaper
+WebIDL::ExceptionOr<GC::Ref<WaveShaperNode>> BaseAudioContext::create_wave_shaper()
+{
+    // Factory method for a WaveShaperNode representing a non-linear distortion.
+    return WaveShaperNode::create(*this);
 }
 
 WebIDL::ExceptionOr<void> BaseAudioContext::verify_audio_options_inside_nominal_range(float sample_rate)

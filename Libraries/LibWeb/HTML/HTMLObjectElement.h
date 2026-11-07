@@ -9,6 +9,7 @@
 #include <AK/Utf16View.h>
 #include <LibCore/Forward.h>
 #include <LibGfx/Forward.h>
+#include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/Layout/ImageProvider.h>
 
@@ -34,6 +35,13 @@ public:
     virtual void form_associated_element_was_removed(DOM::Node*) override;
 
     Utf16String type() const { return get_attribute_value(HTML::AttributeNames::type); }
+
+    bool represents_its_content_navigable() const { return m_representation == Representation::ContentNavigable; }
+
+    // The natural size of the <svg> document element of the document the element shows as its content navigable's,
+    // which that document's layout works out and hands over here. Nothing if that document element is no <svg>.
+    CSS::SizeWithAspectRatio const& natural_size_of_content_document() const { return m_natural_size_of_content_document; }
+    void set_natural_size_of_content_document(CSS::SizeWithAspectRatio const&);
 
     // ^FormAssociatedElement
     virtual bool is_form_associated_element() const override { return true; }
@@ -61,19 +69,19 @@ private:
     virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
-    virtual Layout::Node* create_layout_node(CSS::LayoutStyle) override;
+    virtual CSS::ElementBoxKind box_kind() const override;
 
     bool has_ancestor_media_element_or_object_element_not_showing_fallback_content() const;
 
     void queue_element_task_to_run_object_representation_steps();
-    void run_object_representation_handler_steps(Fetch::Infrastructure::Response const&, MimeSniff::MimeType const&, ReadonlyBytes);
+    void run_object_representation_handler_steps(Fetch::Infrastructure::ResponseView const&, MimeSniff::MimeType const&, ReadonlyBytes);
     void run_object_representation_completed_steps(Representation);
     void run_object_representation_fallback_steps();
 
     void load_image();
     void update_layout_and_child_objects(Representation);
 
-    void resource_did_load(Fetch::Infrastructure::Response const&, ReadonlyBytes);
+    void resource_did_load(Fetch::Infrastructure::ResponseView const&, ReadonlyBytes);
     void resource_did_fail();
 
     // ^DOM::Element
@@ -81,11 +89,11 @@ private:
 
     // ^Layout::ImageProvider
     virtual GC::Ptr<DecodedImageData> decoded_image_data() const override { return image_data(); }
-    virtual Layout::Node const* image_provider_layout_node() const override;
 
     GC::Ptr<DecodedImageData> image_data() const;
 
     Representation m_representation { Representation::Unknown };
+    CSS::SizeWithAspectRatio m_natural_size_of_content_document;
 
     GC::Ptr<SharedResourceRequest> m_resource_request;
 

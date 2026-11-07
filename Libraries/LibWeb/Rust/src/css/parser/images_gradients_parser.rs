@@ -6,9 +6,11 @@
 
 //! CSS image and gradient parsing, mirroring ValueParsing.cpp and GradientParsing.cpp.
 
-#![allow(clippy::arc_with_non_send_sync)]
-
-use std::sync::Arc;
+use crate::css::style_value::{
+    ConicGradientPayload, ImagePayload, ImageSetPayload, LightDarkPayload, LinearGradientPayload,
+    RadialGradientPayload, RadialSizePayload, StyleValueBox, UrlPayload,
+};
+use crate::css::style_value_arc::StyleValueArc;
 
 use crate::css::css_string::CssString;
 use crate::css::css_tokenizer::ParserTokenKind;
@@ -40,49 +42,42 @@ fn value_list(values: Vec<StyleValueData>) -> StyleValueData {
     }
 }
 
-fn context_bytes(pointer: *const u8, length: usize) -> Option<&'static [u8]> {
-    if pointer.is_null() {
-        return (length == 0).then_some(&[]);
-    }
-    Some(unsafe { std::slice::from_raw_parts(pointer, length) })
-}
-
-fn image_resource_context(context: &ParseContext) -> Option<ImageResourceContext> {
-    super::stylesheet_cache::record_base_url_dependency();
-    let base_url = context_bytes(context.document_base_url, context.document_base_url_length)?;
-    Some(ImageResourceContext {
-        base_url: RetainedString::from_ascii(std::str::from_utf8(base_url).ok()?.to_owned()),
-        has_base_url: !base_url.is_empty(),
+fn image_resource_context() -> ImageResourceContext {
+    // The stylesheet supplies its resource context when the value is computed. Inline images
+    // follow their element's document, which can change after parsing in a template document.
+    ImageResourceContext {
+        base_url: RetainedString::from_ascii(String::new()),
+        has_base_url: false,
         has_parent_style_sheet_origin_clean: false,
         parent_style_sheet_origin_clean: false,
         should_absolutize_url_for_computed_value: false,
-    })
+    }
 }
 
-fn image_from_url(context: &ParseContext, url: StyleValueData) -> Option<StyleValueData> {
-    let StyleValueData::Url {
+fn image_from_url(url: StyleValueData) -> Option<StyleValueData> {
+    let StyleValueData::Url(url_payload) = url else {
+        return None;
+    };
+    let UrlPayload {
         url,
         url_type,
         modifiers,
-    } = url
-    else {
-        return None;
-    };
-    Some(StyleValueData::Image {
+    } = url_payload.into_inner();
+    Some(StyleValueData::Image(StyleValueBox::new(ImagePayload {
         url,
         url_type,
         url_modifiers: modifiers,
-        resource_context: image_resource_context(context)?,
-    })
+        resource_context: image_resource_context(),
+    })))
 }
 
-fn image_from_string(context: &ParseContext, string: &[u16]) -> Option<StyleValueData> {
-    Some(StyleValueData::Image {
+fn image_from_string(string: &[u16]) -> Option<StyleValueData> {
+    Some(StyleValueData::Image(StyleValueBox::new(ImagePayload {
         url: RetainedString::from_utf16(string)?,
         url_type: 0,
         url_modifiers: RetainedRequestUrlModifierList::from_retained_modifiers(Vec::new()),
-        resource_context: image_resource_context(context)?,
-    })
+        resource_context: image_resource_context(),
+    })))
 }
 
 fn parse_type(_context: &ParseContext, value: &ComponentValue) -> Option<CssString> {
@@ -107,7 +102,7 @@ fn parse_image_set(context: &ParseContext, property: u16, arguments: &[Component
         let mut tokens = TokenStream::new(option);
         tokens.discard_whitespace();
         let image = if let Some(string) = tokens.next_token().string() {
-            let image = image_from_string(context, string)?;
+            let image = image_from_string(string)?;
             tokens.discard_a_token();
             image
         } else {
@@ -145,8 +140,10 @@ fn parse_image_set(context: &ParseContext, property: u16, arguments: &[Component
             type_string,
         ));
     }
-    (!options.is_empty()).then(|| StyleValueData::ImageSet {
-        options: RetainedImageSetOptionList::from_retained_elements(options),
+    (!options.is_empty()).then(|| {
+        StyleValueData::ImageSet(StyleValueBox::new(ImageSetPayload {
+            options: RetainedImageSetOptionList::from_retained_elements(options),
+        }))
     })
 }
 
@@ -403,16 +400,18 @@ fn parse_linear_gradient(
         tokens.discard_a_token();
     }
     let (color_stop_list, color_syntax) = parse_color_stop_list(context, property, &mut tokens, false)?;
-    Some(StyleValueData::LinearGradient {
-        has_direction_value: direction_value.is_some(),
-        direction_value: optional_retained(direction_value),
-        side_or_corner,
-        color_stop_list,
-        gradient_type: u8::from(webkit.is_some()),
-        repeating: repeating.is_some(),
-        color_interpolation_method: optional_retained(interpolation_method),
-        color_syntax,
-    })
+    Some(StyleValueData::LinearGradient(StyleValueBox::new(
+        LinearGradientPayload {
+            has_direction_value: direction_value.is_some(),
+            direction_value: optional_retained(direction_value),
+            side_or_corner,
+            color_stop_list,
+            gradient_type: u8::from(webkit.is_some()),
+            repeating: repeating.is_some(),
+            color_interpolation_method: optional_retained(interpolation_method),
+            color_syntax,
+        },
+    )))
 }
 
 // https://drafts.csswg.org/css-images-4/#conic-gradients
@@ -479,18 +478,20 @@ fn parse_conic_gradient(
         tokens.discard_a_token();
     }
     let (color_stop_list, color_syntax) = parse_color_stop_list(context, property, &mut tokens, true)?;
-    Some(StyleValueData::ConicGradient {
-        from_angle: optional_retained(from_angle),
-        position: retained(position.unwrap_or_else(center_position)),
-        color_stop_list,
-        repeating,
-        color_interpolation_method: optional_retained(interpolation_method),
-        color_syntax,
-    })
+    Some(StyleValueData::ConicGradient(StyleValueBox::new(
+        ConicGradientPayload {
+            from_angle: optional_retained(from_angle),
+            position: retained(position.unwrap_or_else(center_position)),
+            color_stop_list,
+            repeating,
+            color_interpolation_method: optional_retained(interpolation_method),
+            color_syntax,
+        },
+    )))
 }
 
 fn default_radial_size() -> StyleValueData {
-    StyleValueData::RadialSize {
+    StyleValueData::RadialSize(StyleValueBox::new(RadialSizePayload {
         component_count: 1,
         is_extent_0: true,
         extent_0: 2,
@@ -498,7 +499,7 @@ fn default_radial_size() -> StyleValueData {
         is_extent_1: false,
         extent_1: 0,
         value_1: RetainedStyleValueData::none(),
-    }
+    }))
 }
 
 fn parse_ending_shape(tokens: &mut TokenStream<'_>) -> Option<u8> {
@@ -521,14 +522,14 @@ fn parse_ending_shape(tokens: &mut TokenStream<'_>) -> Option<u8> {
 }
 
 fn radial_size_shape(size: &StyleValueData) -> Option<(u8, bool)> {
-    let StyleValueData::RadialSize {
+    let StyleValueData::RadialSize(radial_size_payload) = size else {
+        return None;
+    };
+    let RadialSizePayload {
         component_count,
         is_extent_0,
         ..
-    } = size
-    else {
-        return None;
-    };
+    } = &**radial_size_payload;
     Some((*component_count, *is_extent_0))
 }
 
@@ -603,15 +604,17 @@ fn parse_radial_gradient(
         tokens.discard_a_token();
     }
     let (color_stop_list, color_syntax) = parse_color_stop_list(context, property, &mut tokens, false)?;
-    Some(StyleValueData::RadialGradient {
-        ending_shape,
-        size: retained(size),
-        position: retained(position.unwrap_or_else(center_position)),
-        color_stop_list,
-        repeating,
-        color_interpolation_method: optional_retained(interpolation_method),
-        color_syntax,
-    })
+    Some(StyleValueData::RadialGradient(StyleValueBox::new(
+        RadialGradientPayload {
+            ending_shape,
+            size: retained(size),
+            position: retained(position.unwrap_or_else(center_position)),
+            color_stop_list,
+            repeating,
+            color_interpolation_method: optional_retained(interpolation_method),
+            color_syntax,
+        },
+    )))
 }
 
 fn parse_gradient(
@@ -633,11 +636,8 @@ pub(crate) fn parse_image_value(
 ) -> Option<StyleValueData> {
     tokens.discard_whitespace();
     if let Some(url) = parse_url_value(context, tokens.next_token()) {
-        let is_fragment = matches!(&url, StyleValueData::Url { url, .. } if url.is_fragment());
-        if !is_fragment {
-            tokens.discard_a_token();
-            return image_from_url(context, url);
-        }
+        tokens.discard_a_token();
+        return image_from_url(url);
     }
     if allow_image_set
         && let Some((name, arguments)) = tokens.next_token().function()
@@ -654,7 +654,46 @@ pub(crate) fn parse_image_value(
         tokens.discard_a_token();
         return Some(parsed);
     }
+    if let Some((name, arguments)) = tokens.next_token().function()
+        && equals_ascii_case_insensitive(name, b"light-dark")
+        && let Some(parsed) = parse_light_dark_image(context, property, arguments, allow_image_set)
+    {
+        tokens.discard_a_token();
+        return Some(parsed);
+    }
     None
+}
+
+// https://drafts.csswg.org/css-color-5/#light-dark
+fn parse_light_dark_image(
+    context: &ParseContext,
+    property: u16,
+    arguments: &[ComponentValue],
+    allow_image_set: bool,
+) -> Option<StyleValueData> {
+    // <light-dark-image> = light-dark( [ <image> | none ] , [ <image> | none ] )
+    // FIXME: Support none, which computes to image(transparent).
+    let mut tokens = TokenStream::new(arguments);
+    let light = parse_image_value(context, property, &mut tokens, allow_image_set)?;
+    tokens.discard_whitespace();
+    if !tokens.next_token().is_comma() {
+        return None;
+    }
+    tokens.discard_a_token();
+    let dark = parse_image_value(context, property, &mut tokens, allow_image_set)?;
+    tokens.discard_whitespace();
+    if tokens.has_next_token() {
+        return None;
+    }
+    Some(StyleValueData::LightDark(StyleValueBox::new(LightDarkPayload {
+        color_base: crate::css::style_value::ColorBase {
+            has_color_type: false,
+            color_type: 0,
+            color_syntax: crate::css::value_codes::COLOR_SYNTAX_MODERN,
+        },
+        light: retained(light),
+        dark: retained(dark),
+    })))
 }
 
 pub(crate) fn is_image_function_name(name: &[u16]) -> bool {
@@ -686,14 +725,18 @@ fn parse_image_or_none(context: &ParseContext, property: u16, values: &[Componen
         StyleValueData::Keyword {
             keyword: crate::css::css_enums::keyword::NONE,
         }
-    } else if let Some(image) = parse_image_value(context, property, &mut tokens, true) {
-        image
-    } else if property == property_id::MASK_IMAGE {
-        let url = parse_url_value(context, tokens.next_token())?;
+    } else if property == property_id::MASK_IMAGE
+        && let Some(url) = parse_url_value(context, tokens.next_token())
+    {
         tokens.discard_a_token();
-        url
+        if matches!(&url, StyleValueData::Url(url) if url.url.is_fragment()) {
+            // NB: Preserve the SVG resource path for local mask references.
+            url
+        } else {
+            image_from_url(url)?
+        }
     } else {
-        return None;
+        parse_image_value(context, property, &mut tokens, true)?
     };
     tokens.discard_whitespace();
     (!tokens.has_next_token()).then_some(parsed)
@@ -719,7 +762,7 @@ pub(crate) fn parse_image_property(context: &ParseContext, property: u16, values
         parse_image_or_none(context, property, values)
     };
     parsed.map_or(ParseOutcome::NotHandled, |parsed| {
-        ParseOutcome::Parsed(Arc::new(parsed))
+        ParseOutcome::Parsed(StyleValueArc::new(parsed))
     })
 }
 
@@ -729,23 +772,8 @@ mod tests {
     use crate::css::css_tokenizer::tokenize_for_parser;
     use crate::css::parser::component_value::consume_a_list_of_component_values;
 
-    fn context() -> ParseContext {
-        ParseContext {
-            in_quirks_mode: false,
-            is_svg_presentation_attribute: false,
-            is_substituted_value: false,
-            contains_attr_tainted_values: false,
-            is_ua_style_sheet: false,
-            value_contexts: std::ptr::null(),
-            value_context_count: 0,
-            declared_namespaces: std::ptr::null(),
-            document_url: std::ptr::null(),
-            document_url_length: 0,
-            document_base_url: std::ptr::null(),
-            document_base_url_length: 0,
-            length_resolution_context: std::ptr::null(),
-            random_function_index: std::ptr::null_mut(),
-        }
+    fn context() -> ParseContext<'static> {
+        ParseContext::default()
     }
 
     fn parse(property: u16, source: &str) -> ParseOutcome {
@@ -777,7 +805,15 @@ mod tests {
             parse(property_id::BACKGROUND_IMAGE, "none, url(image.png)"),
             ParseOutcome::Parsed(_)
         ));
-        for source in ["image-set()", "image-set(url(one.png) 1x 2x)", "url(#mask)"] {
+        let ParseOutcome::Parsed(value) = parse(property_id::BACKGROUND_IMAGE, "url(#mask)") else {
+            panic!("fragment background image should parse");
+        };
+        let StyleValueData::ValueList { values, .. } = &*value else {
+            panic!("background-image should be a list");
+        };
+        assert_eq!(values.as_slice().len(), 1);
+        assert!(matches!(values.as_slice()[0].data(), StyleValueData::Image { .. }));
+        for source in ["image-set()", "image-set(url(one.png) 1x 2x)"] {
             assert!(matches!(
                 parse(property_id::BACKGROUND_IMAGE, source),
                 ParseOutcome::NotHandled

@@ -19,7 +19,6 @@
 #include <AK/Vector.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
-#include <LibGfx/Point.h>
 #include <LibWebView/Forward.h>
 
 namespace WebView {
@@ -28,6 +27,7 @@ enum class ActionID {
     NavigateBack,
     NavigateForward,
     Reload,
+    ReloadBypassingCache,
     ViewDownloads,
     ViewHistory,
     ClearBrowsingData,
@@ -41,9 +41,14 @@ enum class ActionID {
 
     LookUpSelectedText,
     SearchSelectedText,
+    CopyLinkToHighlight,
+    SpellingGuess,
+    NoSpellingGuesses,
+    IgnoreSpelling,
+    LearnSpelling,
 
-    TakeVisibleScreenshot,
-    TakeFullScreenshot,
+    TakeScreenshot,
+    ReportWebsiteIssue,
 
     ToggleVerticalTabsExpanded,
 
@@ -53,6 +58,7 @@ enum class ActionID {
     ToggleBookmark,
     ToggleBookmarkViaToolbar,
     ToggleBookmarksBar,
+    ShowBookmarksBar,
     BookmarkItem,
 
     OpenAllBookmarksInTabs,
@@ -69,6 +75,7 @@ enum class ActionID {
     OpenSettingsPage,
     ToggleDevTools,
     ViewSource,
+    InspectElement,
 
     OpenInNewTab,
     OpenInNewWindow,
@@ -92,6 +99,14 @@ enum class ActionID {
     ToggleMediaLoopState,
     EnterFullscreen,
     ExitFullscreen,
+    EnterPictureInPicture,
+    ExitPictureInPicture,
+
+    TranslatePage,
+    TranslateTo,
+    ShowOriginal,
+    DownloadTranslationLanguages,
+    EditPreferredLanguages,
 
     ZoomIn,
     ZoomOut,
@@ -99,6 +114,7 @@ enum class ActionID {
     ResetZoomViaToolbar,
 
     PreferredColorScheme,
+    ForceDark,
     PreferredContrast,
     PreferredMotion,
 
@@ -115,7 +131,7 @@ enum class ActionID {
     DumpLocalStorage,
     DumpSessionStorage,
     DumpGCGraph,
-    DumpWasmStats,
+    ReportLeakedDocuments,
     ShowLineBoxBorders,
     ShowCaretHitTestDebugOverlay,
     CollectGarbage,
@@ -124,7 +140,6 @@ enum class ActionID {
     SpoofUserAgent,
     NavigatorCompatibilityMode,
     EnableScripting,
-    EnableContentBlocking,
     BlockPopUps,
 };
 
@@ -256,7 +271,7 @@ public:
             item.visit(
                 [&](NonnullRefPtr<Action>& action) { callback(*action); },
                 [&](NonnullRefPtr<Menu>& submenu) { submenu->for_each_action(callback); },
-                [&](Separator) {});
+                [&](Separator) { });
         }
     }
 
@@ -270,8 +285,6 @@ public:
 
     void add_observer(NonnullOwnPtr<Observer>);
     void remove_observer(Observer const& observer);
-
-    Function<void(Gfx::IntPoint)> on_activation;
 
 private:
     explicit Menu(ActionText title)

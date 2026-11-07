@@ -13,17 +13,26 @@ import subprocess
 from pathlib import Path
 
 HELPERS = (
+    "AudioServer",
     "Compositor",
     "ImageDecoder",
     "MediaServer",
     "RequestServer",
-    "WasmCompiler",
+    "VideoDecoderServer",
     "WebContent",
     "WebWorker",
+    "WebRTCClient",
 )
 
 
 def git_revision(source):
+    # Source tarballs record their commit in a REVISION file, since they have no Git history of their own. They might be
+    # unpacked inside another Git repository though, so the file takes precedence.
+    revision_file = source / "REVISION"
+    if revision_file.exists():
+        revision = revision_file.read_text().strip()
+        return (revision if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision) else "unknown"), "unknown"
+
     try:
         revision = subprocess.check_output(
             ["git", "-C", str(source), "rev-parse", "--verify", "HEAD"], stderr=subprocess.DEVNULL, text=True
@@ -97,6 +106,8 @@ def generate(source, build, compiler):
 
 #include <AK/StringBuilder.h>
 #include <AK/StringView.h>
+#include <LibCore/BrowserVersion.h>
+#include <LibWebCommon/Loader/UserAgent.h>
 #include <LibWebView/ProcessType.h>
 
 namespace WebView {{
@@ -105,6 +116,8 @@ constexpr inline auto LADYBIRD_COMMIT = {json.dumps(revision)}sv;
 
 inline void append_build_information_for_process(StringBuilder& builder, ProcessType type)
 {{
+    builder.appendff("Version: {{}}\\nPlatform: {{}}\\nArchitecture: {{}}\\n", BROWSER_VERSION, OS_STRING, CPU_STRING);
+    builder.appendff("Build configuration: {{}}\\n", BROWSER_BUILD_CONFIGURATION);
     builder.appendff("Git commit: {{}}\\n", LADYBIRD_COMMIT);
     builder.appendff("Tracked source state: {{}}\\n", {json.dumps(state)}sv);
     builder.appendff("C++ compiler: {{}}\\n", {json.dumps(compiler)}sv);
@@ -123,7 +136,7 @@ inline void append_build_information_for_process(StringBuilder& builder, Process
         flags = compiler_flags(entry["command"]) if entry else "unavailable"
 
         result += f"""    case ProcessType::{helper}:
-        builder.appendff("C++ flags ({helper} main; paths and string defines omitted): {{}}\\n", {json.dumps(flags)}sv);
+        builder.appendff("C++ flags: {{}}\\n", {json.dumps(flags)}sv);
 """
 
         sdk = re.search(r"/MacOSX([0-9.]+)\.sdk", entry["command"]) if entry else None
@@ -147,7 +160,12 @@ def escape_depfile_path(path):
 
 
 def write_depfile(source, output, target):
-    tracked_files = subprocess.check_output(["git", "-C", str(source), "ls-files", "-z"]).split(b"\0")
+    try:
+        tracked_files = subprocess.check_output(
+            ["git", "-C", str(source), "ls-files", "-z"], stderr=subprocess.DEVNULL
+        ).split(b"\0")
+    except (OSError, subprocess.CalledProcessError):
+        tracked_files = []
 
     dependencies = (
         path

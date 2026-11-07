@@ -12,12 +12,13 @@
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/ShadowRoot.h>
 
 namespace Web::CSS::Invalidation {
 
 static bool pseudo_class_propagates_to_ancestors(CSS::PseudoClass pseudo_class)
 {
-    return first_is_one_of(pseudo_class, CSS::PseudoClass::Hover, CSS::PseudoClass::FocusWithin);
+    return pseudo_class == CSS::PseudoClass::FocusWithin;
 }
 
 static AncestorTraversal ancestor_traversal_for_pseudo_class(CSS::PseudoClass pseudo_class)
@@ -39,13 +40,13 @@ void invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass pseudo_cl
     auto traversal = ancestor_traversal_for_pseudo_class(pseudo_class);
 
     auto build_chain = [&](GC::Ptr<DOM::Node> start) {
-        HashTable<DOM::Element const*> chain;
+        GC::RootHashTable<DOM::Element const*> chain;
         if (!start)
             return chain;
         if (propagates) {
             for_each_inclusive_ancestor_element(*start, traversal, [&](DOM::Element& element) {
                 chain.set(&element);
-                return TraversalDecision::Continue;
+                return element.rendered_in_top_layer() ? TraversalDecision::Break : TraversalDecision::Continue;
             });
         } else if (auto* element = as_if<DOM::Element>(*start)) {
             chain.set(element);
@@ -78,7 +79,7 @@ void invalidate_style_after_pseudo_class_state_change(CSS::PseudoClass pseudo_cl
                 if (other_chain.contains(&element))
                     return TraversalDecision::Break;
                 visit(element);
-                return TraversalDecision::Continue;
+                return element.rendered_in_top_layer() ? TraversalDecision::Break : TraversalDecision::Continue;
             });
         } else if (auto* element = as_if<DOM::Element>(*start)) {
             if (!other_chain.contains(element))
@@ -95,11 +96,11 @@ struct PropagatingState {
     GC::Ptr<DOM::Node> source;
 };
 
-static Array<PropagatingState, 2> propagating_states(DOM::Document& document)
+// The style engine moves `:hover` with the elements that hold it itself (see `record_subtree_disconnecting()`).
+static Array<PropagatingState, 1> propagating_states(DOM::Document& document)
 {
     return { {
         { CSS::PseudoClass::FocusWithin, document.focused_area() },
-        { CSS::PseudoClass::Hover, document.hovered_node() },
     } };
 }
 
@@ -109,6 +110,10 @@ static bool subtree_holds_propagating_state_source(DOM::Node const& subtree, CSS
         for (auto const* node = &source; node; node = node->flat_tree_parent()) {
             if (node == &subtree)
                 return true;
+            if (is<DOM::ShadowRoot>(subtree) && node->parent() == &subtree)
+                return true;
+            if (auto const* element = as_if<DOM::Element>(*node); element && element->rendered_in_top_layer())
+                break;
         }
         return false;
     }
@@ -124,6 +129,25 @@ bool descendants_hold_a_propagating_state_source(DOM::Node& node)
     return false;
 }
 
+bool holds_a_propagating_state_source(DOM::Node& node)
+{
+    for (auto const& [pseudo_class, source] : propagating_states(node.document())) {
+        if (source && subtree_holds_propagating_state_source(node, pseudo_class, *source))
+            return true;
+    }
+    return false;
+}
+
+static void republish_propagating_state(CSS::PseudoClass pseudo_class, GC::Ptr<DOM::Node> from)
+{
+    if (!from)
+        return;
+    for_each_inclusive_ancestor_element(*from, ancestor_traversal_for_pseudo_class(pseudo_class), [&](DOM::Element& element) {
+        record_element_state_changed(element, pseudo_class, element.matches_focus_within_pseudo_class());
+        return element.rendered_in_top_layer() ? TraversalDecision::Break : TraversalDecision::Continue;
+    });
+}
+
 // A state that propagates to ancestors is a statement about the subtree below them, so moving a
 // subtree that holds one moves the state: the chain above where it was stops holding it and the
 // chain above where it landed starts, and no feature of any element in either chain moved to say
@@ -131,24 +155,44 @@ bool descendants_hold_a_propagating_state_source(DOM::Node& node)
 // than being told a transition.
 void invalidate_style_after_subtree_place_changed(DOM::Node& subtree, GC::Ptr<DOM::Node> old_parent)
 {
-    auto republish = [](CSS::PseudoClass pseudo_class, GC::Ptr<DOM::Node> from) {
-        if (!from)
-            return;
-        for_each_inclusive_ancestor_element(*from, ancestor_traversal_for_pseudo_class(pseudo_class), [&](DOM::Element& element) {
-            auto* hovered = element.document().hovered_node();
-            auto holds = pseudo_class == CSS::PseudoClass::FocusWithin
-                ? element.matches_focus_within_pseudo_class()
-                : hovered && (&element == hovered || element.is_shadow_including_ancestor_of(*hovered));
-            record_element_state_changed(element, pseudo_class, holds);
-            return TraversalDecision::Continue;
-        });
-    };
-
     for (auto const& [pseudo_class, source] : propagating_states(subtree.document())) {
         if (!source || !subtree_holds_propagating_state_source(subtree, pseudo_class, *source))
             continue;
-        republish(pseudo_class, source);
-        republish(pseudo_class, old_parent);
+        republish_propagating_state(pseudo_class, source);
+        republish_propagating_state(pseudo_class, old_parent);
+    }
+}
+
+// A slot's assigned nodes and its fallback content stand in the flat tree below it by turns, so what it is assigned moves
+// the chain of a source among either of them.
+void invalidate_style_after_slot_assignment_changed(DOM::Element& slot)
+{
+    for (auto const& [pseudo_class, source] : propagating_states(slot.document())) {
+        if (!source)
+            continue;
+        republish_propagating_state(pseudo_class, source);
+        republish_propagating_state(pseudo_class, &slot);
+    }
+}
+
+// Whether the focused element takes keyboard input decides whether it indicates focus, which then moves without focus
+// moving, so the element is asked its own answer.
+void invalidate_style_after_focused_element_keyboard_input_change(DOM::Document& document)
+{
+    if (auto* element = as_if<DOM::Element>(document.focused_area().ptr()))
+        record_element_state_changed(*element, CSS::PseudoClass::FocusVisible, element->should_indicate_focus());
+}
+
+// A slot leaving takes the flat tree chain of the elements assigned to it along, though they stay where they are, so
+// that the source stands in no chain through the subtree by the time the subtree has left.
+void invalidate_style_after_subtree_holding_a_state_source_left(DOM::Node& subtree, GC::Ptr<DOM::Node> old_parent)
+{
+    for (auto const& [pseudo_class, source] : propagating_states(subtree.document())) {
+        if (!source)
+            continue;
+        republish_propagating_state(pseudo_class, source);
+        republish_propagating_state(pseudo_class, &subtree);
+        republish_propagating_state(pseudo_class, old_parent);
     }
 }
 

@@ -7,7 +7,6 @@
 //! Legal target IR before and after physical register allocation.
 
 use crate::Architecture;
-use crate::frontend::layout::KnownLayoutConstant;
 use crate::identity::HandlerId;
 #[cfg(test)]
 pub(crate) use crate::low_ir::MemoryAddress;
@@ -231,6 +230,7 @@ pub(crate) type AllocatedInstruction = crate::low_ir::Instruction<AllocatedOpera
 pub(crate) use crate::low_ir::RuntimeConstants;
 
 /// A legal target function before physical register allocation.
+#[derive(Clone)]
 pub(crate) struct Function {
     pub(crate) id: HandlerId,
     pub(crate) name: String,
@@ -245,6 +245,7 @@ pub(crate) struct Function {
 pub struct Program {
     pub(crate) runtime: RuntimeConstants,
     pub(crate) dispatch_handlers: Vec<Option<HandlerId>>,
+    pub(crate) dispatch: crate::identity::DispatchLayout,
     pub(crate) architecture: Architecture,
     pub(crate) functions: Vec<Function>,
 }
@@ -262,6 +263,7 @@ pub(crate) struct AllocatedFunction {
 pub struct AllocatedProgram {
     pub(crate) runtime: RuntimeConstants,
     pub(crate) dispatch_handlers: Vec<Option<HandlerId>>,
+    pub(crate) dispatch: crate::identity::DispatchLayout,
     pub(crate) architecture: Architecture,
     pub(crate) functions: Vec<AllocatedFunction>,
 }
@@ -316,34 +318,40 @@ pub(crate) struct MachineFunction {
 pub struct MachineProgram {
     pub(crate) runtime: RuntimeConstants,
     pub(crate) dispatch_handlers: Vec<Option<HandlerId>>,
+    pub(crate) dispatch: crate::identity::DispatchLayout,
     pub(crate) target: crate::Target,
+    pub(crate) profile: crate::Profile,
+    pub(crate) profiling: bool,
     pub(crate) functions: Vec<MachineFunction>,
 }
 
 impl MachineProgram {
-    pub(crate) fn missing_required_runtime_constant(&self) -> Option<&'static str> {
-        use KnownLayoutConstant::*;
+    /// The name of a global interpreter symbol in this variant.
+    pub(crate) fn global_symbol(&self, name: &str) -> String {
+        if self.profiling {
+            format!("{name}_profiling")
+        } else {
+            name.to_string()
+        }
+    }
 
-        let architecture_constants: &[KnownLayoutConstant] = match self.target.architecture {
-            Architecture::X86_64 => &[],
-            Architecture::Aarch64 => &[Int32Tag, BooleanTag],
-        };
-        architecture_constants
+    /// The global symbol of the interpreter's entry point, or with a
+    /// `suffix`, of one of its tables.
+    pub(crate) fn interpreter_symbol(&self, suffix: &str) -> String {
+        let prefix = self.profile.symbol_prefix();
+        if suffix.is_empty() {
+            self.global_symbol(prefix)
+        } else {
+            self.global_symbol(&format!("{prefix}_{suffix}"))
+        }
+    }
+}
+
+impl MachineProgram {
+    pub(crate) fn missing_required_runtime_constant(&self) -> Option<&'static str> {
+        self.profile
+            .required_runtime_constants(self.target.architecture)
             .iter()
-            .chain(
-                [
-                    SlowPathContinuationBit,
-                    VmRunningExecutionContext,
-                    VmBreakpointController,
-                    VmHeapRegionBase,
-                    ExecutionContextExecutable,
-                    ExecutionContextProgramCounter,
-                    ExecutableBytecodeData,
-                    SizeOfExecutionContext,
-                    CanonicalNanBits,
-                ]
-                .iter(),
-            )
             .find_map(|constant| self.runtime.get(*constant).is_none().then_some(constant.name()))
     }
 }

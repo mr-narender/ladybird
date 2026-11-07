@@ -1,0 +1,4 @@
+full passes for 20 more shadow trees: 0
+shared elements: 20
+span font: 13px 700
+all spans alike: true

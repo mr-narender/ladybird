@@ -7,9 +7,9 @@
 use super::RecordingInputs;
 use super::inputs::UncapturedContentInputs;
 use crate::painting::force_dark::ForceDarkSettings;
-use crate::painting::paint_state::PaintState;
+use crate::painting::published_frame::PublishedPaintState;
 
-/// The recording inputs every producer may read. A frame copies from the published frame only
+/// The recording inputs every producer may read. A frame copies from the published recording only
 /// while they are unchanged; otherwise it records from scratch. They stay with the published
 /// frame, which a read-only recording never replaces.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -21,13 +21,13 @@ pub(crate) struct FrameInputs {
     pub(crate) should_show_line_box_borders: bool,
     pub(crate) should_paint_overlay: bool,
     pub(crate) uncaptured: UncapturedContentInputs,
-    // Whether any box but the viewport could take a wheel event decides if the scroll metadata
+    // Whether any box but the viewport could take or keep a wheel event decides if the scroll metadata
     // inside subtree captures carries per-box wheel hit-test targets.
     pub(crate) has_non_viewport_wheel_scroll_target_candidate: bool,
 }
 
 impl FrameInputs {
-    pub(crate) fn from_recording_inputs(inputs: &RecordingInputs<'_>, paint_state: &PaintState) -> Self {
+    pub(crate) fn from_recording_inputs(inputs: &RecordingInputs, paint_state: &PublishedPaintState) -> Self {
         Self {
             device_pixels_per_css_pixel: inputs.device_pixels_per_css_pixel,
             force_dark_enabled: inputs.force_dark_enabled,
@@ -35,10 +35,12 @@ impl FrameInputs {
             should_show_line_box_borders: inputs.should_show_line_box_borders,
             should_paint_overlay: inputs.should_paint_overlay,
             uncaptured: inputs.uncaptured,
-            has_non_viewport_wheel_scroll_target_candidate: paint_state
-                .visual_context
-                .scroll_state
-                .has_non_viewport_wheel_scroll_target_candidate,
+            has_non_viewport_wheel_scroll_target_candidate: paint_state.has_non_viewport_wheel_scroll_target_candidate,
         }
+    }
+
+    pub(crate) fn records_per_box_wheel_hit_test_targets(&self) -> bool {
+        self.has_non_viewport_wheel_scroll_target_candidate
+            || self.uncaptured.has_navigable_container_with_composited_context
     }
 }

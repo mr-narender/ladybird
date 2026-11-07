@@ -23,8 +23,14 @@ font-feature-settings: normal
 font-kerning: auto
 font-language-override: normal
 font-optical-sizing: auto
+font-palette: normal
 font-size: 16px
+font-size-adjust: none
 font-style: normal
+font-synthesis-position: auto
+font-synthesis-small-caps: auto
+font-synthesis-style: auto
+font-synthesis-weight: auto
 font-variant-alternates: normal
 font-variant-caps: normal
 font-variant-east-asian: normal
@@ -35,8 +41,12 @@ font-variant-position: normal
 font-variation-settings: normal
 font-weight: 400
 font-width: 100%
+forced-color-adjust: auto
+hyphenate-character: auto
 image-rendering: auto
+interpolate-size: numeric-only
 letter-spacing: normal
+line-break: auto
 line-height: normal
 list-style-image: none
 list-style-position: outside
@@ -61,10 +71,13 @@ stroke-opacity: 1
 stroke-width: 1px
 tab-size: 8
 text-align: start
+text-align-last: auto
 text-anchor: start
 text-decoration-skip-ink: auto
+text-emphasis-position: over
 text-indent: 0px
 text-justify: auto
+text-orientation: mixed
 text-rendering: auto
 text-shadow: none
 text-transform: none
@@ -82,6 +95,7 @@ writing-mode: horizontal-tb
 align-content: normal
 align-items: normal
 align-self: auto
+alignment-baseline: baseline
 anchor-name: none
 anchor-scope: none
 animation-composition: replace
@@ -92,6 +106,8 @@ animation-fill-mode: none
 animation-iteration-count: 1
 animation-name: none
 animation-play-state: running
+animation-range-end: normal
+animation-range-start: normal
 animation-timeline: auto
 animation-timing-function: ease
 appearance: none
@@ -108,7 +124,9 @@ background-position-x: 0%
 background-position-y: 0%
 background-repeat: repeat
 background-size: auto
-block-size: 1430px
+baseline-shift: 0px
+baseline-source: auto
+block-size: 100px
 border-block-end-color: rgb(0, 0, 0)
 border-block-end-style: none
 border-block-end-width: 0px
@@ -139,6 +157,7 @@ border-left-width: 0px
 border-right-color: rgb(0, 0, 0)
 border-right-style: none
 border-right-width: 0px
+border-shape: none
 border-start-end-radius: 0px
 border-start-start-radius: 0px
 border-top-color: rgb(0, 0, 0)
@@ -175,14 +194,14 @@ container-type: normal
 content: normal
 content-visibility: visible
 continue: auto
-corner-bottom-left-shape: round
-corner-bottom-right-shape: round
-corner-end-end-shape: round
-corner-end-start-shape: round
-corner-start-end-shape: round
-corner-start-start-shape: round
-corner-top-left-shape: round
-corner-top-right-shape: round
+corner-bottom-left-shape: superellipse(1)
+corner-bottom-right-shape: superellipse(1)
+corner-end-end-shape: superellipse(1)
+corner-end-start-shape: superellipse(1)
+corner-start-end-shape: superellipse(1)
+corner-start-start-shape: superellipse(1)
+corner-top-left-shape: superellipse(1)
+corner-top-right-shape: superellipse(1)
 counter-increment: none
 counter-reset: none
 counter-set: none
@@ -190,7 +209,9 @@ cx: 0px
 cy: 0px
 d: none
 display: block
+field-sizing: fixed
 filter: none
+fit-tolerance: normal
 flex-basis: auto
 flex-direction: row
 flex-grow: 0
@@ -209,8 +230,8 @@ grid-row-start: auto
 grid-template-areas: none
 grid-template-columns: none
 grid-template-rows: none
-height: 2743px
-inline-size: 784px
+height: 100px
+inline-size: 600px
 inset-block-end: auto
 inset-block-start: auto
 inset-inline-end: auto
@@ -249,6 +270,11 @@ min-width: auto
 mix-blend-mode: normal
 object-fit: fill
 object-position: 50% 50%
+offset-anchor: auto
+offset-distance: 0px
+offset-path: none
+offset-position: normal
+offset-rotate: auto
 opacity: 1
 order: 0
 outline-color: rgb(0, 0, 0)
@@ -267,6 +293,10 @@ overflow-clip-margin-top: 0px
 overflow-inline: visible
 overflow-x: visible
 overflow-y: visible
+overscroll-behavior-block: auto
+overscroll-behavior-inline: auto
+overscroll-behavior-x: auto
+overscroll-behavior-y: auto
 padding-block-end: 0px
 padding-block-start: 0px
 padding-bottom: 0px
@@ -276,7 +306,7 @@ padding-left: 0px
 padding-right: 0px
 padding-top: 0px
 perspective: none
-perspective-origin: 50% 50%
+perspective-origin: 300px 50px
 position: static
 position-anchor: normal
 position-area: none
@@ -331,7 +361,7 @@ top: auto
 touch-action: auto
 transform: none
 transform-box: view-box
-transform-origin: 392px 2164.5px
+transform-origin: 300px 50px
 transform-style: flat
 transition-behavior: normal
 transition-delay: 0s
@@ -346,10 +376,12 @@ vertical-align: baseline
 view-timeline-axis: block
 view-timeline-inset: auto
 view-timeline-name: none
+view-transition-class: none
 view-transition-name: none
 white-space-trim: none
-width: 784px
+width: 600px
 will-change: auto
 x: 0px
 y: 0px
 z-index: auto
+zoom: 1

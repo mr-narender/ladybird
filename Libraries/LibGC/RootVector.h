@@ -18,6 +18,8 @@
 namespace GC {
 
 class GC_API RootVectorBase {
+    AK_MAKE_NONCOPYABLE(RootVectorBase);
+
 public:
     virtual void gather_roots(HashMap<Cell*, GC::HeapRoot>&) const = 0;
 
@@ -53,6 +55,20 @@ public:
     RootVector(ReadonlySpan<T> other)
         : RootVectorBase()
         , Vector<T, inline_capacity>(other)
+    {
+    }
+
+    RootVector(VectorBase&& other)
+        : RootVectorBase()
+        , VectorBase(move(other))
+    {
+    }
+
+    // The element type is named through VectorBase so that class template argument deduction never picks this
+    // constructor, which would deduce a RootVector of Vectors from GC::RootVector { move(vector) }.
+    RootVector(std::initializer_list<typename VectorBase::ValueType> list)
+        : RootVectorBase()
+        , VectorBase(list)
     {
     }
 

@@ -4,20 +4,18 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/DOM/CDATASection.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentType.h>
-#include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ProcessingInstruction.h>
+#include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/HTMLScriptElement.h>
 #include <LibWeb/HTML/HTMLTemplateElement.h>
 #include <LibWeb/HTML/Parser/Entities.h>
 #include <LibWeb/HTML/Parser/NamedCharacterReferences.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/TagNames.h>
 #include <LibWeb/XML/XMLDocumentBuilder.h>
 
@@ -56,6 +54,7 @@ XMLDocumentBuilder::XMLDocumentBuilder(DOM::Document& document, XMLScriptingSupp
 
 ErrorOr<void> XMLDocumentBuilder::set_source(ByteString source)
 {
+    m_document->update_readiness(HTML::DocumentReadyState::Loading);
     m_document->set_source(Utf16String::from_utf8_with_replacement_character(source.view()));
     return {};
 }
@@ -137,14 +136,23 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
     // When an XML parser with XML scripting support enabled creates a script element,
     // it must have its parser document set and its "force async" flag must be unset.
     // FIXME: If the parser was created as part of the XML fragment parsing algorithm, then the element must be marked as "already started" also.
-    if (m_scripting_support == XMLScriptingSupport::Enabled && node->is_html_script_element()) {
-        auto& script_element = static_cast<HTML::HTMLScriptElement&>(*node);
-        script_element.set_parser_document(Badge<XMLDocumentBuilder> {}, m_document);
-        script_element.set_force_async(Badge<XMLDocumentBuilder> {}, false);
+    // AD-HOC: SVG script elements are processed like HTML script elements, since SVG defines them as equivalent.
+    if (auto* script_element = as_if<HTML::HTMLOrSVGScriptElement>(*node); script_element && m_scripting_support == XMLScriptingSupport::Enabled) {
+        script_element->set_parser_document(Badge<XMLDocumentBuilder> {}, m_document);
+        script_element->set_force_async(Badge<XMLDocumentBuilder> {}, false);
     }
+
+    // AD-HOC: Let <link> elements know which document they were originally parsed for.
+    //         This is used for the script-blocking and render-blocking logic.
+    if (auto* link_element = as_if<HTML::HTMLLinkElement>(*node)) {
+        link_element->set_parser_document(Badge<XMLDocumentBuilder> {}, m_document);
+        auto has_disabled_attribute = any_of(attributes, [](auto const& attribute) { return attribute.name == "disabled"sv; });
+        link_element->set_was_enabled_when_created_by_parser(Badge<XMLDocumentBuilder> {}, !has_disabled_attribute);
+    }
+
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     if (m_current_node->is_html_template_element()) {
         // When an XML parser would append a node to a template element, it must instead append it to the template element's template contents (a DocumentFragment node).
-        m_template_node_stack.append(*m_current_node);
         MUST(static_cast<HTML::HTMLTemplateElement&>(*m_current_node).content()->append_child(node));
     } else {
         MUST(m_current_node->append_child(node));
@@ -179,6 +187,7 @@ void XMLDocumentBuilder::element_start(Utf16FlyString const& name, Vector<XML::L
         }
     }
 
+    m_open_elements.append(node);
     m_current_node = node.ptr();
 }
 
@@ -194,12 +203,13 @@ void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
     VERIFY(m_current_node->node_name().equals_ignoring_ascii_case(name));
     // When an XML parser with XML scripting support enabled creates a script element, [...]
     // When the element's end tag is subsequently parsed,
-    if (m_scripting_support == XMLScriptingSupport::Enabled && m_current_node->is_html_script_element()) {
+    if (auto* script_element = as_if<HTML::HTMLOrSVGScriptElement>(*m_current_node); script_element && m_scripting_support == XMLScriptingSupport::Enabled) {
         // the user agent must perform a microtask checkpoint,
         HTML::perform_a_microtask_checkpoint();
         // and then prepare the script element.
-        auto& script_element = static_cast<HTML::HTMLScriptElement&>(*m_current_node);
-        script_element.prepare_script(Badge<XMLDocumentBuilder> {});
+        // AD-HOC: Set the script text value for Trusted Types as the HTML parser does, matching other engines.
+        script_element->set_script_text_from_parser();
+        script_element->prepare_script(Badge<XMLDocumentBuilder> {});
 
         // If this causes there to be a pending parsing-blocking script, then the user agent must run the following steps:
         if (auto pending_parsing_blocking_script = m_document->pending_parsing_blocking_script()) {
@@ -222,21 +232,14 @@ void XMLDocumentBuilder::element_end(Utf16FlyString const& name)
             // 5. Set the pending parsing-blocking script to null.
             m_document->set_pending_parsing_blocking_script(nullptr);
         }
-    } else if (m_scripting_support == XMLScriptingSupport::Enabled && m_current_node->is_svg_script_element()) {
-        // https://www.w3.org/TR/SVGMobile12/struct.html#ProgressiveRendering
-        // When an end element event occurs for a 'script' element, that element is processed according to the
-        // Script processing section of the Scripting chapter. Further parsing of the document will be blocked
-        // until processing of the 'script' is complete.
-        auto& script_element = static_cast<SVG::SVGScriptElement&>(*m_current_node);
-        script_element.process_the_script_element();
-    };
-
-    auto* parent = m_current_node->parent_node();
-    if (parent && parent->is_document_fragment()) {
-        auto template_parent_node = m_template_node_stack.take_last();
-        parent = template_parent_node.ptr();
     }
-    m_current_node = parent;
+
+    (void)m_open_elements.take_last();
+    if (m_open_elements.is_empty()) {
+        m_current_node = m_document.ptr();
+    } else {
+        m_current_node = m_open_elements.last().ptr();
+    }
 }
 
 void XMLDocumentBuilder::text(StringView data)
@@ -244,6 +247,7 @@ void XMLDocumentBuilder::text(StringView data)
     if (m_has_error)
         return;
 
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     if (auto* last = m_current_node->last_child(); last && last->is_text()) {
         auto& text_node = static_cast<DOM::Text&>(*last);
         m_text_builder.append(text_node.data());
@@ -261,6 +265,7 @@ void XMLDocumentBuilder::comment(StringView data)
     if (m_has_error || !m_current_node)
         return;
 
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     MUST(m_current_node->append_child(m_document->create_comment(Utf16String::from_utf8(data))));
 }
 
@@ -270,6 +275,7 @@ void XMLDocumentBuilder::cdata_section(StringView data)
         return;
 
     auto section = MUST(m_document->create_cdata_section(Utf16String::from_utf8(data)));
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     MUST(m_current_node->append_child(section));
 }
 
@@ -279,129 +285,17 @@ void XMLDocumentBuilder::processing_instruction(Utf16FlyString const& target, Ut
         return;
 
     auto processing_instruction = MUST(m_document->create_processing_instruction(target, data));
+    HTML::HTMLOrSVGScriptElement::ParserChildrenChangeScope script_children_change { *m_current_node };
     MUST(m_current_node->append_child(processing_instruction));
 }
 
 void XMLDocumentBuilder::document_end()
 {
-    // When an XML parser reaches the end of its input, it must stop parsing.
-    // If the active speculative HTML parser is not null, then stop the speculative HTML parser and return.
-    // NOTE: Noop.
-
-    // Set the insertion point to undefined.
-    m_template_node_stack.clear();
+    // When an XML parser reaches the end of its input, it must stop parsing, following the same rules as the HTML parser.
+    m_open_elements.clear();
     m_current_node = nullptr;
 
-    // Update the current document readiness to "interactive".
-    m_document->update_readiness(HTML::DocumentReadyState::Interactive);
-
-    // Pop all the nodes off the stack of open elements.
-    // NOTE: Noop.
-
-    if (!m_document->browsing_context() || m_document->is_decoded_svg()) {
-        // No need to spin the event loop waiting for scripts or load events
-        // when parsed via DOMParser or as a decoded SVG image.
-        m_document->update_readiness(HTML::DocumentReadyState::Complete);
-        return;
-    }
-
-    // While the list of scripts that will execute when the document has finished parsing is not empty:
-    while (!m_document->scripts_to_execute_when_parsing_has_finished().is_empty()) {
-        // Spin the event loop until the first script in the list of scripts that will execute when the document has finished parsing has its "ready to be parser-executed" flag set
-        // and the parser's Document has no style sheet that is blocking scripts.
-        HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), [&] {
-            return m_document->scripts_to_execute_when_parsing_has_finished().first()->is_ready_to_be_parser_executed()
-                && !m_document->has_a_style_sheet_that_is_blocking_scripts();
-        }));
-
-        // Execute the first script in the list of scripts that will execute when the document has finished parsing.
-        m_document->scripts_to_execute_when_parsing_has_finished().first()->execute_script();
-
-        // Remove the first script element from the list of scripts that will execute when the document has finished parsing (i.e. shift out the first entry in the list).
-        (void)m_document->scripts_to_execute_when_parsing_has_finished().take_first();
-    }
-    // Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following substeps:
-    queue_global_task(HTML::Task::Source::DOMManipulation, HTML::relevant_global_object(*m_document), GC::create_function(GC::Heap::the(), [document = m_document] {
-        // Set the Document's load timing info's DOM content loaded event start time to the current high resolution time given the Document's relevant global object.
-        document->load_timing_info().dom_content_loaded_event_start_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(*document));
-
-        // Fire an event named DOMContentLoaded at the Document object, with its bubbles attribute initialized to true.
-        auto content_loaded_event = DOM::Event::create(
-            HTML::EventNames::DOMContentLoaded,
-            HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*document)));
-        content_loaded_event->set_bubbles(true);
-        document->dispatch_event(content_loaded_event);
-
-        // Set the Document's load timing info's DOM content loaded event end time to the current high resolution time given the Document's relevant global object.
-        document->load_timing_info().dom_content_loaded_event_end_time = HighResolutionTime::current_high_resolution_time(relevant_global_object(*document));
-
-        // FIXME: Enable the client message queue of the ServiceWorkerContainer object whose associated service worker client is the Document object's relevant settings object.
-
-        // FIXME: Invoke WebDriver BiDi DOM content loaded with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "pending", and url is the Document object's URL.
-    }));
-
-    // Spin the event loop until the set of scripts that will execute as soon as possible and the list of scripts that will execute in order as soon as possible are empty.
-    HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), [&] {
-        return m_document->scripts_to_execute_as_soon_as_possible().is_empty();
-    }));
-
-    // Spin the event loop until there is nothing that delays the load event in the Document.
-    // AD-HOC: Update style first, so any font fetches that the computed styles depend on get started; an in-flight font
-    //         fetch delays the load event.
-    HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), [&] {
-        m_document->update_style();
-        return !m_document->anything_is_delaying_the_load_event();
-    }));
-
-    // Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following steps:
-    queue_global_task(HTML::Task::Source::DOMManipulation, HTML::relevant_global_object(*m_document), GC::create_function(GC::Heap::the(), [document = m_document] {
-        // Update the current document readiness to "complete".
-        document->update_readiness(HTML::DocumentReadyState::Complete);
-
-        // If the Document object's browsing context is null, then abort these steps.
-        if (!document->browsing_context())
-            return;
-
-        // Let window be the Document's relevant global object.
-        GC::Ref<HTML::Window> window = GC::Ref { HTML::relevant_window(*document) };
-
-        // Set the Document's load timing info's load event start time to the current high resolution time given window.
-        document->load_timing_info().load_event_start_time = HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window));
-
-        // Fire an event named load at window, with legacy target override flag set.
-        // FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
-        // We should reorganize this so that the flag appears explicitly here instead.
-        window->dispatch_event(DOM::Event::create(
-            HTML::EventNames::load,
-            HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window))));
-
-        // FIXME: Invoke WebDriver BiDi load complete with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "complete", and url is the Document object's URL.
-
-        // FIXME: Set the Document object's navigation id to null.
-
-        // Set the Document's load timing info's load event end time to the current high resolution time given window.
-        document->load_timing_info().load_event_end_time = HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(window));
-
-        // Assert: Document's page showing is false.
-        VERIFY(!document->page_showing());
-
-        // Set the Document's page showing flag to true.
-        document->set_page_showing(true);
-
-        // Fire a page transition event named pageshow at window with false.
-        window->fire_a_page_transition_event(HTML::EventNames::pageshow, false);
-
-        // Completely finish loading the Document.
-        document->completely_finish_loading();
-
-        // Queue the navigation timing entry for the Document.
-        document->queue_navigation_timing_entry();
-    }));
-
-    // FIXME: If the Document's print when loaded flag is set, then run the printing steps.
-
-    // The Document is now ready for post-load tasks.
-    m_document->set_ready_for_post_load_tasks(true);
+    HTML::HTMLParser::the_end(m_document, nullptr);
 }
 
 Optional<Utf16FlyString> XMLDocumentBuilder::namespace_for_name(Utf16FlyString const& name)

@@ -9,8 +9,6 @@
 //! description at a point in time, which both the compositor and the main thread's intersection
 //! observations run.
 
-use std::rc::Rc;
-
 use crate::easing::Easing;
 use crate::filter_bytes::filter_functions_graph;
 use crate::filter_bytes::{FfiFilterFunction, FfiFilterFunctionKind};
@@ -18,6 +16,7 @@ use crate::host::{
     FfiVisualAnimationFillMode, FfiVisualAnimationPlaybackDirection, FfiVisualAnimationTargetKind,
     FfiVisualAnimationTransformOperationKind,
 };
+use ak::math;
 use libgfx_rust::filter::Filter;
 use libgfx_rust::{Color, ColorFilterType, FloatMatrix4x4, rotation_matrix, scale_matrix, translation_matrix};
 
@@ -147,8 +146,8 @@ impl VisualAnimationTransformOperation {
         let first = self.value(0).unwrap_or(0.0);
         let skew = |x: f32, y: f32| FloatMatrix4x4 {
             elements: [
-                [1.0, x.tan(), 0.0, 0.0],
-                [y.tan(), 1.0, 0.0, 0.0],
+                [1.0, math::tan(x), 0.0, 0.0],
+                [math::tan(y), 1.0, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
@@ -361,7 +360,7 @@ pub struct VisualAnimationKeyframe {
 pub enum VisualAnimationSample {
     Opacity(f32),
     BackgroundColor(Color),
-    Filter(Option<Rc<Vec<u8>>>),
+    Filter(Option<std::sync::Arc<Vec<u8>>>),
     Transform(FloatMatrix4x4),
 }
 
@@ -636,7 +635,7 @@ impl VisualAnimation {
                 }
                 let graph = filter_functions_graph(functions.iter().copied().map(Filter::from));
                 Some(VisualAnimationSample::Filter(
-                    graph.map(|graph| Rc::new(graph.serialize())),
+                    graph.map(|graph| std::sync::Arc::new(graph.serialize())),
                 ))
             }
             (FfiVisualAnimationTargetKind::Transform, VisualAnimationValue::Transform(operations)) => {

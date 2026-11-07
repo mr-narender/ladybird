@@ -11,6 +11,7 @@
 #include <AK/Enumerate.h>
 #include <AK/MemoryStream.h>
 #include <AK/StringBuilder.h>
+#include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 
 static_assert(AK::Concepts::HashCompatible<Utf16String, Utf16View>);
@@ -113,8 +114,8 @@ TEST_CASE(from_utf8)
 
 TEST_CASE(from_utf8_with_replacement_character)
 {
-    auto string1 = Utf16String::from_utf8_with_replacement_character("long string \xf4\x8f\xbf\xc0"sv, Utf16String::WithBOMHandling::No); // U+110000
-    EXPECT_EQ(string1, u"long string \ufffd\ufffd\ufffd\ufffd"sv);
+    auto string1 = Utf16String::from_utf8_with_replacement_character("long string \xf4\x8f\xbf\xc0"sv, Utf16String::WithBOMHandling::No);
+    EXPECT_EQ(string1, u"long string \ufffd\ufffd"sv);
 
     auto string3 = Utf16String::from_utf8_with_replacement_character("A valid string!"sv, Utf16String::WithBOMHandling::No);
     EXPECT_EQ(string3, "A valid string!"sv);
@@ -129,7 +130,43 @@ TEST_CASE(from_utf8_with_replacement_character)
     EXPECT_EQ(string6, u"\ufeffWHF!"sv);
 
     auto string7 = Utf16String::from_utf8_with_replacement_character("\xED\xA0\x80WHF!"sv); // U+D800
-    EXPECT_EQ(string7, u"\ufffdWHF!"sv);
+    EXPECT_EQ(string7, u"\ufffd\ufffd\ufffdWHF!"sv);
+}
+
+TEST_CASE(from_utf8_with_replacement_character_matches_utf8_decoder)
+{
+    auto decode = [](StringView input) { return Utf16String::from_utf8_with_replacement_character(input, Utf16String::WithBOMHandling::No); };
+
+    EXPECT_EQ(decode("\xE0\x80\x80"sv), u"\ufffd\ufffd\ufffd"sv);
+    EXPECT_EQ(decode("\xC0\x80"sv), u"\ufffd\ufffd"sv);
+    EXPECT_EQ(decode("\xF0\x9F\x98"sv), u"\ufffd"sv);
+    EXPECT_EQ(decode("\xF0\x9F\x98"
+                     "A"sv),
+        u"\ufffdA"sv);
+    EXPECT_EQ(decode("\xF4\x90\x80\x80"sv), u"\ufffd\ufffd\ufffd\ufffd"sv);
+    EXPECT_EQ(decode("\xFF"sv), u"\ufffd"sv);
+    EXPECT_EQ(decode("a\x80"
+                     "b"sv),
+        u"a\ufffdb"sv);
+    EXPECT_EQ(decode("\xFF\xF0\x9F\x98\x80"sv), u"\ufffd\U0001F600"sv);
+}
+
+TEST_CASE(from_wtf8_with_replacement_character)
+{
+    EXPECT_EQ(Utf16String::from_wtf8_with_replacement_character("A valid string!"sv), "A valid string!"sv);
+    EXPECT_EQ(Utf16String::from_wtf8_with_replacement_character("\xF0\x9F\x98\x80"sv), u"\U0001F600"sv);
+    EXPECT_EQ(Utf16String::from_wtf8_with_replacement_character("\xEF\xBB\xBFWHF!"sv), u"\ufeffWHF!"sv);
+
+    // Each encoded surrogate is a single code point.
+    EXPECT_EQ(Utf16String::from_wtf8_with_replacement_character("\xED\xA0\x80-\xED\xB0\x80"sv), u"\ufffd-\ufffd"sv);
+    EXPECT_EQ(Utf16String::from_wtf8_with_replacement_character("\xED\xA0\xED\xBF\xBF"sv), u"\ufffd\ufffd"sv);
+
+    // Bytes that are not WTF-8 are replaced as UTF-8's decoder does.
+    EXPECT_EQ(Utf16String::from_wtf8_with_replacement_character("\xC0\x80"sv), u"\ufffd\ufffd"sv);
+    EXPECT_EQ(Utf16String::from_wtf8_with_replacement_character("\xF0\x9F\x98"
+                                                                "A"sv),
+        u"\ufffdA"sv);
+    EXPECT_EQ(Utf16String::from_wtf8_with_replacement_character("\xF4\x90\x80\x80"sv), u"\ufffd\ufffd\ufffd\ufffd"sv);
 }
 
 TEST_CASE(from_utf16)
@@ -445,22 +482,15 @@ TEST_CASE(from_ipc_stream)
         EXPECT(result.is_error());
     }
     {
-        auto data = u"😀"sv;
+        // One-byte storage is Latin-1, so each byte is the code unit of its value.
+        static constexpr u8 data[] = { 'c', 'r', 0xE8, 'm', 'e', ' ', 'b', 'r', 0xFB, 'l', 0xE9, 'e' };
+        FixedMemoryStream stream { ReadonlyBytes { data } };
 
-        auto buffer = MUST(ByteBuffer::copy({ reinterpret_cast<u8 const*>(data.utf16_span().data()), data.length_in_code_units() * sizeof(char16_t) }));
-        FixedMemoryStream stream { buffer.bytes() };
-
-        auto result = Utf16String::from_ipc_stream(stream, data.length_in_code_units(), true);
-        EXPECT(result.is_error());
-    }
-    {
-        auto data = u"hello 😀 there!"sv;
-
-        auto buffer = MUST(ByteBuffer::copy({ reinterpret_cast<u8 const*>(data.utf16_span().data()), data.length_in_code_units() * sizeof(char16_t) }));
-        FixedMemoryStream stream { buffer.bytes() };
-
-        auto result = Utf16String::from_ipc_stream(stream, data.length_in_code_units(), true);
-        EXPECT(result.is_error());
+        auto string = TRY_OR_FAIL(Utf16String::from_ipc_stream(stream, sizeof(data), true));
+        EXPECT(!string.is_ascii());
+        EXPECT(!string.has_long_ascii_storage());
+        EXPECT(string.utf16_view().has_latin1_storage());
+        EXPECT_EQ(string, u"crème brûlée"sv);
     }
 }
 
@@ -1315,4 +1345,72 @@ TEST_CASE(utf16_string_builder_clear_resets_ascii_flag)
     EXPECT_EQ(second.length_in_code_units(), 101u);
     EXPECT_EQ(second.code_unit_at(0), 0x000A); // Must be newline, not null.
     EXPECT_EQ(second.code_unit_at(1), 0x0020);
+}
+
+TEST_CASE(latin1_storage)
+{
+    // "crème brûlée", with each code unit as one byte.
+    static constexpr u8 bytes[] = { 'c', 'r', 0xE8, 'm', 'e', ' ', 'b', 'r', 0xFB, 'l', 0xE9, 'e' };
+    auto string = Utf16String::from_utf16(Utf16View::from_latin1(bytes, false));
+    auto utf16_string = Utf16String::from_utf8("crème brûlée"sv);
+    auto utf16_view = u"crème brûlée"sv;
+
+    EXPECT(string.has_long_storage());
+    EXPECT(!string.has_ascii_storage());
+    EXPECT(string.utf16_view().has_latin1_storage());
+    EXPECT(!utf16_view.has_latin1_storage());
+
+    EXPECT_EQ(string, utf16_string);
+    EXPECT_EQ(string, utf16_view);
+    EXPECT_EQ(string.hash(), utf16_view.hash());
+    EXPECT_EQ(string.to_utf8(), "crème brûlée"sv);
+    Utf16FlyString fly_string { utf16_string };
+    EXPECT_EQ(Utf16FlyString::from_utf16(string.utf16_view()), fly_string);
+
+    Utf16StringBuilder builder;
+    builder.append(string);
+    EXPECT_EQ(builder.to_string(), utf16_string);
+
+    // Latin-1 storage whose code units are all ASCII is ASCII storage.
+    static constexpr u8 ascii_bytes[] = { 'c', 'r', 'e', 'm', 'e', ' ', 'b', 'r', 'u', 'l', 'e', 'e' };
+    auto ascii_string = Utf16String::from_utf16(Utf16View::from_latin1(ascii_bytes, false));
+    EXPECT(ascii_string.has_long_ascii_storage());
+}
+
+TEST_CASE(latin1_storage_for_text_up_to_u00ff)
+{
+    auto expect_latin1 = [](Utf16String const& string) {
+        EXPECT(string.has_long_storage());
+        EXPECT(string.utf16_view().has_latin1_storage());
+        EXPECT(!string.has_ascii_storage());
+    };
+
+    expect_latin1(Utf16String::from_utf8("café"sv));
+    expect_latin1(Utf16String::from_utf16(u"café"sv));
+    expect_latin1(Utf16String::from_utf8("ÿ"sv));
+    // Only ASCII is stored in a short string.
+    expect_latin1(Utf16String::from_utf8("é"sv));
+
+    auto string = Utf16String::from_utf8("Grüße aus Köln"sv);
+    expect_latin1(string);
+    EXPECT_EQ(string.length_in_code_units(), 14uz);
+    EXPECT_EQ(string.utf16_view().code_unit_at(2), 0xFC);
+    EXPECT_EQ(string.to_utf8(), "Grüße aus Köln"sv);
+
+    EXPECT(Utf16String::from_utf8("café €"sv).has_long_utf16_storage());
+    EXPECT(Utf16String::from_utf16(u"Ā"sv).has_long_utf16_storage());
+    EXPECT(Utf16String::from_utf16(u"cafe"sv).has_short_ascii_storage());
+
+    // A substring that is ASCII is ASCII storage.
+    EXPECT(Utf16String::from_utf16(string.substring_view(6, 3)).has_short_ascii_storage());
+    EXPECT(Utf16String::from_utf16(Utf16String::from_utf8("éabcdefghij"sv).substring_view(1)).has_long_ascii_storage());
+}
+
+TEST_CASE(formatting_latin1_storage)
+{
+    auto string = Utf16String::from_utf8("Grüße aus Köln"sv);
+    EXPECT(string.utf16_view().has_latin1_storage());
+    EXPECT_EQ(ByteString::formatted("{}", string), "Grüße aus Köln"sv);
+    EXPECT_EQ(MUST(String::formatted("<{}>", string)), "<Grüße aus Köln>"sv);
+    EXPECT_EQ(Utf16String::formatted("function() {{ {} }}", Utf16String::from_utf8("return 'é'"sv)), u"function() { return 'é' }"sv);
 }

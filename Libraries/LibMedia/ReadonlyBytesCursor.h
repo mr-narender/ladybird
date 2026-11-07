@@ -7,8 +7,8 @@
 #pragma once
 
 #include <AK/Span.h>
-#include <LibMedia/DecoderError.h>
 #include <LibMedia/MediaStream.h>
+#include <LibMediaCodecs/DecoderError.h>
 
 namespace Media {
 
@@ -64,6 +64,15 @@ public:
         auto buffer = DECODER_TRY_ALLOC(FixedArray<u8>::create(m_data.slice(m_position, size)));
         m_position += size;
         return buffer;
+    }
+
+    virtual DecoderErrorOr<void> read_and_discard(size_t size) override
+    {
+        if (m_position > m_data.size() || size > m_data.size() - m_position)
+            return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "End of buffer"sv);
+
+        m_position += size;
+        return {};
     }
 
     virtual size_t position() const override { return m_position; }

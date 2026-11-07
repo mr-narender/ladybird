@@ -10,6 +10,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
 #include <LibGC/Cell.h>
+#include <LibGC/ConservativeVector.h>
 #include <LibGC/Ptr.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
@@ -31,11 +32,11 @@ struct NavigateParams {
     URL::URL url;
     GC::Ptr<DOM::Document> source_document = nullptr;
     DocumentResource document_resource = Empty {};
-    GC::Ptr<Fetch::Infrastructure::Response> response = nullptr;
+    GC::Ptr<Fetch::Infrastructure::ResponseView> response = nullptr;
     bool exceptions_enabled = false;
     Bindings::NavigationHistoryBehavior history_handling = Bindings::NavigationHistoryBehavior::Auto;
     Optional<StorageSerializationRecord> navigation_api_state = {};
-    Optional<Vector<XHR::FormDataEntry>> form_data_entry_list = {};
+    Optional<GC::ConservativeVector<XHR::FormDataEntry>> form_data_entry_list = {};
     ReferrerPolicy::ReferrerPolicy referrer_policy = ReferrerPolicy::ReferrerPolicy::EmptyString;
     UserNavigationInvolvement user_involvement = UserNavigationInvolvement::None;
     GC::Ptr<DOM::Element> source_element = nullptr;
@@ -48,10 +49,10 @@ struct NavigateParams {
 struct PreparedNavigation {
     URL::URL url;
     DocumentResource document_resource;
-    GC::Ptr<Fetch::Infrastructure::Response> response;
+    GC::Ptr<Fetch::Infrastructure::ResponseView> response;
     Bindings::NavigationHistoryBehavior history_handling;
     Optional<StorageSerializationRecord> navigation_api_state;
-    Optional<Vector<XHR::FormDataEntry>> form_data_entry_list;
+    Optional<GC::ConservativeVector<XHR::FormDataEntry>> form_data_entry_list;
     ReferrerPolicy::ReferrerPolicy referrer_policy;
     UserNavigationInvolvement user_involvement;
     Utf16String navigation_id;
