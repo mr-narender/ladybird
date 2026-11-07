@@ -68,7 +68,10 @@ fn is_non_negative_int32(value: Value) -> bool {
 }
 
 fn optional_identifier(vm: &Vm, index: &OptionalIndex<IdentifierTableIndex>) -> Option<Utf16FlyString> {
-    let index = index.get()?;
+    let Some(index) = index.get() else {
+        let program_counter = vm.running_execution_context_ref().program_counter.get();
+        return vm.current_executable().base_text_at(program_counter);
+    };
     Some(vm.current_executable().get_identifier(index).clone())
 }
 
@@ -578,7 +581,6 @@ fn put_by_value_with_keyed_store_cache(
                 // NB: These are the checks of an addition through the cache of a put (see put_by_property_key()).
                 let new_shape = entry.new_shape.expect("additions have a new shape");
                 if property_addition_is_cacheable(vm, &object, property_key)
-                    && object.internal_is_extensible(vm)?
                     && entry
                         .prototype_chain_validity
                         .is_none_or(|validity| validity.is_valid())
@@ -1584,9 +1586,6 @@ fn try_put_by_property_lookup_cache(
                 let Some(new_shape) = entry.new_shape.get() else {
                     continue;
                 };
-                if !object.extensible() {
-                    continue;
-                }
                 if entry
                     .prototype_chain_validity
                     .get()

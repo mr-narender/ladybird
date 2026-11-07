@@ -32,6 +32,7 @@
 #include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/NavigationLoader.h>
 #include <LibWebView/NotificationManager.h>
+#include <LibWebView/PageTranslation.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/RecordingNotificationBackend.h>
@@ -2443,6 +2444,16 @@ void WebContentPage::did_request_writing_suggestion(u64 request_id, Utf16String 
     view().did_request_writing_suggestion({}, *this, request_id, move(text), caret_offset);
 }
 
+void WebContentPage::did_get_translation_language_sample(u64 request_id, Web::TranslationLanguageSample sample)
+{
+    view().page_translation().did_get_language_sample({}, request_id, move(sample));
+}
+
+void WebContentPage::did_request_translation(Web::TranslationUnit unit)
+{
+    view().page_translation().did_request_translation({}, *this, move(unit));
+}
+
 void WebContentPage::did_request_set_system_focus(bool has_system_focus)
 {
     if (!may_change_window(*this, "did_request_set_system_focus"sv))
@@ -2961,6 +2972,16 @@ void WebContentPage::did_request_spelling_menu_action_for_testing(Web::SpellingM
     view().activate_spelling_menu_action_for_testing({}, *this, action, guess_index);
 }
 
+void WebContentPage::did_request_page_translation_for_testing(String target_language)
+{
+    // NB: This translates the tab as its menu would, so only automation may ask for it.
+    if (!WebContentClient::renderers_may_synthesize_input()) {
+        client().did_misbehave("did_request_page_translation_for_testing"sv, "not driven by WebDriver or a test"sv);
+        return;
+    }
+    view().page_translation().translate_for_testing({}, move(target_language));
+}
+
 void WebContentPage::did_request_link_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<u64> text_fragment_generation_id)
 {
     auto verified_navigation = navigation_from_page(client(), move(navigation));
@@ -2975,13 +2996,17 @@ void WebContentPage::did_generate_text_fragment_url(u64 request_id, Optional<URL
     view().did_generate_text_fragment_url(request_id, move(url));
 }
 
-void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap)
+void WebContentPage::did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString, unsigned, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type)
 {
     auto verified_navigation = navigation_from_page(client(), move(navigation));
     if (!verified_navigation.has_value())
         return;
+    // NB: A link the page may not navigate to takes only its own actions out of the menu, the image's stay.
+    Optional<Web::HTML::PreparedNavigationDescriptor> verified_link_navigation;
+    if (link_navigation.has_value())
+        verified_link_navigation = navigation_from_page(client(), link_navigation.release_value());
     if (auto target = view_position(local_root_id, content_position); target.has_value())
-        target->view.did_request_image_context_menu({}, target->position, verified_navigation.release_value(), move(bitmap));
+        target->view.did_request_image_context_menu({}, target->position, verified_navigation.release_value(), move(bitmap), move(verified_link_navigation), move(image_mime_type));
 }
 
 void WebContentPage::did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Gfx::IntPoint content_position, ByteString, unsigned, Web::MediaContextMenu menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)

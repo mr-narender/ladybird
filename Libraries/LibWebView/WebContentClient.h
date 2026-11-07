@@ -122,6 +122,9 @@ public:
     static bool renderers_may_access_cookies_like_http();
     static bool renderers_may_synthesize_input();
     bool may_read_local_files() const;
+    // Documents with no site, such as those of an opaque origin, come with whatever made them, so they do not count.
+    void did_host_document_of_site(Utf16String site);
+
     // A process that has hosted local file content may read local files. Site isolation gives such content processes
     // of its own, which host nothing else.
     bool has_hosted_local_file_content() const { return m_has_hosted_local_file_content; }
@@ -155,8 +158,6 @@ public:
 
     void did_lose_process();
     void did_save_crash_report(ByteString const& report_name);
-    // Whether a tab was told this process was lost, and so shows its crash.
-    bool has_crashed_views() const { return !m_crashed_view_ids.is_empty(); }
     ErrorOr<void> reconnect_to_compositor_process(Badge<Application>);
     ErrorOr<void> recreate_compositor_contexts(Badge<Application>);
     // The user let the page at the URL capture audio. The process's AudioServer hears of the permission before this
@@ -231,6 +232,7 @@ private:
     virtual Messages::WebContentClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
     virtual Messages::WebContentClient::RequestAudioServerConnectionResponse request_audio_server_connection() override;
     virtual Messages::WebContentClient::RequestWebrtcClientConnectionResponse request_webrtc_client_connection() override;
+    virtual Messages::WebContentClient::RequestImageDecoderConnectionResponse request_image_decoder_connection() override;
     virtual void request_video_presentation_channel() override;
     virtual void gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect) override;
     virtual void gamepad_stop_effects(Web::Gamepad::GamepadHandle handle) override;
@@ -245,6 +247,9 @@ private:
     RequestServerSiteBindings m_request_server_site_bindings;
     bool m_requested_close { false };
     bool m_rejected_ipc { false };
+    // The site of the documents this process hosts, if it has only hosted those of one.
+    Optional<Utf16String> m_site_of_hosted_documents;
+    bool m_has_hosted_documents_of_several_sites { false };
     bool m_has_hosted_local_file_content { false };
     Optional<String> m_hosted_web_ui;
     Vector<u64> m_crashed_view_ids;

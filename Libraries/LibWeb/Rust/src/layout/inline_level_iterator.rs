@@ -297,7 +297,7 @@ impl Item {
 
     pub(crate) fn is_ascii_whitespace(&self, context: &inline_formatting_context::InlineFormattingContext<'_>) -> bool {
         assert_eq!(self.type_, ItemType::Text);
-        let text = &context.callbacks.text_content(self.node).text;
+        let text = &context.pass.text_content(self.node).text;
         text[self.offset_in_node..self.offset_in_node + self.length_in_node]
             .iter()
             .all(|unit| *unit <= 0x7f && (*unit as u8).is_ascii_whitespace())
@@ -305,7 +305,7 @@ impl Item {
 
     pub(crate) fn ends_in_ascii_space(&self, context: &inline_formatting_context::InlineFormattingContext<'_>) -> bool {
         assert_eq!(self.type_, ItemType::Text);
-        let text = &context.callbacks.text_content(self.node).text;
+        let text = &context.pass.text_content(self.node).text;
         text[self.offset_in_node..self.offset_in_node + self.length_in_node]
             .last()
             .is_some_and(|unit| line_box_fragment::is_ascii_space(*unit))
@@ -820,7 +820,10 @@ impl<'pass> InlineContentPreparer<'pass> {
 
     fn exit_node_with_box_model_metrics(&mut self) {
         self.buffers.box_stack.pop().unwrap();
-        let event = InlineBoxEvent::leaving_innermost_box(self.inline_box_event_position());
+        // NB: The walk looks one node ahead, so a box usually ends while its last item is the current node. An inline
+        //     box as the current node has no item of its own, so nothing in the box comes with the next item.
+        let before_item = !self.current_node.is_invalid() && self.facts(self.current_node).is_fragmented_inline();
+        let event = InlineBoxEvent::leaving_innermost_box(self.inline_box_event_position(), before_item);
         self.buffers.box_events.push(event);
     }
 
@@ -1382,7 +1385,13 @@ impl<'context> RunItemResolver<'_, 'context> {
         self.accumulated_inline_size_for_tabs += advance;
     }
 
-    fn keep_inline_edge(&mut self, node: Node, sides: &used_values::RootInputCells, is_start: bool) {
+    fn keep_inline_edge(
+        &mut self,
+        node: Node,
+        sides: &used_values::RootInputCells,
+        is_start: bool,
+        takes_leading_metrics: bool,
+    ) {
         let reversed = self.context().facts(node).inline_axis_is_reverse();
         let (margin, border, padding) = if is_start != reversed {
             (sides.margin_left, sides.border_left, sides.padding_left)
@@ -1419,7 +1428,7 @@ impl<'context> RunItemResolver<'_, 'context> {
                 right_to_left_end_margin,
                 is_start,
                 is_low: is_start != reversed,
-                takes_leading_metrics: is_start,
+                takes_leading_metrics,
             });
         }
     }
@@ -1433,7 +1442,7 @@ impl<'context> RunItemResolver<'_, 'context> {
             self.next_box_event += 1;
             match event.entered_box() {
                 Some(node) => self.enter_node_with_box_model_metrics(node),
-                None => self.exit_node_with_box_model_metrics(),
+                None => self.exit_node_with_box_model_metrics(event.leaves_before_item()),
             }
         }
     }
@@ -1441,14 +1450,14 @@ impl<'context> RunItemResolver<'_, 'context> {
     fn enter_node_with_box_model_metrics(&mut self, node: Node) {
         self.entered_box_model_nodes.push(node);
         let sides = lay_out_entered_inline_box(self.context, node);
-        self.keep_inline_edge(node, &sides, true);
+        self.keep_inline_edge(node, &sides, true, true);
         self.box_model_node_stack.push(node);
     }
 
-    fn exit_node_with_box_model_metrics(&mut self) {
+    fn exit_node_with_box_model_metrics(&mut self, before_item: bool) {
         let node = self.box_model_node_stack.pop().unwrap();
         let sides = self.context().sides_of_entered_inline_box(node);
-        self.keep_inline_edge(node, &sides, false);
+        self.keep_inline_edge(node, &sides, false, before_item);
     }
 
     fn negative_right_to_left_end_margin(&self, node: Node, margin_left: CssPixels) -> CssPixels {
@@ -1677,7 +1686,7 @@ fn lay_out_entered_inline_box(
     node: Node,
 ) -> used_values::RootInputCells {
     let constraints = context.input.containing_block_constraints;
-    let mut sides = used_values::cells_before_sizing(&context.callbacks, node, constraints);
+    let mut sides = used_values::cells_before_sizing(&context.pass, node, constraints);
     let style = context.style(node);
     let basis = constraints.inline_basis();
     sides.resolve_box_model(&style, basis);
@@ -1688,7 +1697,7 @@ fn lay_out_entered_inline_box(
             context.run,
             node,
             formatting_context::PlacedChild::new(fragment_tree::FragmentGeometry {
-                cells: sides.in_frame(context.callbacks.frame, context.run.callbacks.frame),
+                cells: sides.in_frame(context.pass.frame, context.run.pass.frame),
                 line_data: None,
             })
             .with_in_flow_box_insets(insets),
@@ -1832,7 +1841,7 @@ impl InlineLevelIterator {
         context: &mut inline_formatting_context::InlineFormattingContext<'_>,
         atomic_sizing: AtomicInlineSizing,
     ) -> Self {
-        PreparedInlineContent::for_block_container(context.callbacks, context.containing_block)
+        PreparedInlineContent::for_block_container(context.pass, context.containing_block)
             .resolve_items_for_run(context, atomic_sizing)
     }
 
@@ -2002,8 +2011,8 @@ fn first_grapheme_cluster(
     item: &Item,
 ) -> Item {
     let style = context.style(context.style_source(item.node));
-    let text_content = context.callbacks.text_content(item.node);
-    let first_grapheme_cluster_inline_size = context.callbacks.with_grapheme_segmenter(item.node, |segmenter| {
+    let text_content = context.pass.text_content(item.node);
+    let first_grapheme_cluster_inline_size = context.pass.with_grapheme_segmenter(item.node, |segmenter| {
         item.first_grapheme_cluster_inline_size(
             prepared,
             &text_content.text,

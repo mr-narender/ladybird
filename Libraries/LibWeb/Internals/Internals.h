@@ -93,6 +93,9 @@ public:
     GC::Ref<WebIDL::Promise> check_spelling_for_testing(Utf16String const& text);
     GC::Ref<WebIDL::Promise> spell_check_settled();
 
+    void translate_page(Utf16String const& target_language);
+    GC::Ref<WebIDL::Promise> translation_settled();
+
     GC::Ref<WebIDL::Promise> request_writing_suggestion_for_testing(Utf16String const& text, WebIDL::UnsignedLong caret_offset);
     Utf16String writing_suggestion();
     GC::Ref<WebIDL::Promise> writing_suggestion_settled();
@@ -130,6 +133,7 @@ public:
     void pinch_through_ui_process(double x, double y, double scale_delta, bool continues_gesture);
     void reset_zoom();
 
+    Optional<Utf16String> hovered_link();
     Utf16String current_cursor();
     Optional<Utf16String> current_cursor_pixel(i32 x, i32 y);
     Utf16String theme_color();
@@ -173,6 +177,8 @@ public:
     WebIDL::ExceptionOr<bool> has_cookie_for_url(Utf16String const& url, String const& name, String const& value);
 
     bool set_http_memory_cache_enabled(bool enabled);
+    bool functions_share_code(JS::Value a, JS::Value b);
+    bool compiled_script_cache_contains(Utf16String const& url);
     bool set_disk_cache_enabled_for_navigations(bool enabled);
     void simulate_request_server_connection_loss();
     void simulate_worker_request_server_connection_loss();
@@ -230,6 +236,9 @@ public:
     String dump_accessibility_node_data(GC::Ref<DOM::Node>);
     String accessibility_cached_text_mismatches();
     String accessibility_cached_record_mismatches();
+    String accessibility_cached_geometry_mismatches();
+    String accessibility_change_tracking_mismatches();
+    String accessibility_last_change_size() const { return m_last_accessibility_change_size; }
     Utf16String dump_layout_tree(GC::Ref<DOM::Node>);
     Utf16String dump_stacking_context_tree();
     Utf16String stacking_context_structure_verification_report();
@@ -302,6 +311,7 @@ public:
     void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
     void inject_clock_tick_scrolling_element(double frame_time_ms, DOM::Element& scroller, double x, double y);
     void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id, u32 buttons);
+    void inject_hover_pointer_left(double frame_time_ms);
     void note_animated_content_moved_under_pointer(double frame_time_ms);
     void inject_pointer_rests_on_moving_content(double frame_time_ms);
     u64 queue_mouse_move(double x, double y, u32 buttons);
@@ -389,6 +399,10 @@ private:
     Vector<GC::Ref<InternalGamepad>> m_gamepads;
     Optional<HTML::DevToolsObjectTable> m_devtools_object_table;
     HTML::DevToolsLoggedObjects m_devtools_logged_objects;
+    // The accessibility tree as accessibility_change_tracking_mismatches() last left it, built up from changes alone.
+    DOM::AccessibilityChangeTracker m_accessibility_change_tracker;
+    HashMap<i64, WebView::AccessibilityNodeData> m_accessibility_tracked_tree;
+    String m_last_accessibility_change_size;
 };
 
 }

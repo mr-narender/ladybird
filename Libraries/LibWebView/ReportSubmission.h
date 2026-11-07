@@ -82,11 +82,17 @@ public:
     void start();
     void cancel();
 
+    // What another attempt needs to count as the same submission, once this one has been prepared.
+    ByteString prepared_manifest() const { return m_payload.has_value() ? m_payload->manifest : ByteString {}; }
+
     Function<void(Stage)> on_progress;
     Function<void(ByteString const& manifest)> on_prepared;
     Function<void(String reason, u32 retry_number, u32 maximum_retries, u32 delay_seconds)> on_retry;
     Function<void()> on_sent;
     Function<void(Failure, String reason)> on_failed;
+
+    // However it ended, even if it was canceled, and even if nothing is left of whoever started it.
+    Function<void()> on_finished;
 
 protected:
     ReportSubmission();
@@ -95,6 +101,8 @@ protected:
     virtual void did_send() { }
 
 private:
+    void did_finish();
+
     struct ProofOfWork {
         ByteString token;
         u64 nonce { 0 };

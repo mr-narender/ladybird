@@ -68,6 +68,7 @@ static constexpr auto TAB_CLOSE_BUTTON_POSITION = QTabBar::RightSide;
 static constexpr int LADYBIRD_MENU_WIDTH = 280;
 static constexpr int WINDOW_RESIZE_BORDER_WIDTH = 6;
 static constexpr int WINDOW_RESIZE_CORNER_WIDTH = WINDOW_RESIZE_BORDER_WIDTH * 2;
+static constexpr int MENU_BAR_LEADING_ROOM = 8;
 #if defined(AK_OS_MACOS)
 // NB: AppKit puts the traffic lights 10 px in, so they move this far to sit NATIVE_MACOS_WINDOW_CONTROLS_INSET in.
 static constexpr int NATIVE_WINDOW_CONTROL_X_OFFSET = NATIVE_MACOS_WINDOW_CONTROLS_INSET - 10;
@@ -1306,12 +1307,19 @@ void BrowserWindow::update_tab_button_icons()
 void BrowserWindow::create_menu_bar_window_controls()
 {
     if constexpr (!use_native_macos_window_controls()) {
-        auto window_control_buttons = create_window_control_buttons(*menuBar(), "LadybirdMenuBarWindowControls", { 16, 16 }, { 40, 30 });
+        auto window_control_buttons = create_window_control_buttons(*menuBar(), "LadybirdMenuBarWindowControls", { 16, 16 }, { 34, 30 });
         m_menu_bar_window_controls = window_control_buttons.container;
         m_menu_bar_minimize_window_button = window_control_buttons.minimize;
         m_menu_bar_maximize_window_button = window_control_buttons.maximize;
         m_menu_bar_close_window_button = window_control_buttons.close;
         menuBar()->setCornerWidget(m_menu_bar_window_controls, Qt::TopRightCorner);
+
+        // NB: A menu bar insets its corner widgets by its leading padding, so the room before the first menu comes from
+        //     a corner widget of its own, and the window controls can reach the window's edge.
+        auto* leading_room = new QWidget(menuBar());
+        auto* leading_room_layout = new QHBoxLayout(leading_room);
+        leading_room_layout->setContentsMargins(MENU_BAR_LEADING_ROOM, 0, 0, 0);
+        menuBar()->setCornerWidget(leading_room, Qt::TopLeftCorner);
 
         connect(m_menu_bar_minimize_window_button, &QToolButton::clicked, this, [this] {
             showMinimized();
@@ -1552,12 +1560,6 @@ void BrowserWindow::exit_fullscreen()
         showNormal();
 
     m_tabs_container->update_bookmarks_bar_visibility();
-
-    // A crash report that came in while the toolbar was hidden can be offered now, even on a tab other than the one
-    // that was current back then.
-    QTimer::singleShot(0, this, [] {
-        Application::the().crash_report_notifier().show_pending();
-    });
 }
 
 bool BrowserWindow::event(QEvent* event)
@@ -1590,7 +1592,6 @@ bool BrowserWindow::event(QEvent* event)
             report_activation_to_session_store();
         QTimer::singleShot(0, this, [this] {
             refresh_resize_cursor_at_current_position(true);
-            Application::the().crash_report_notifier().show_pending();
         });
         QTimer::singleShot(50, this, [this] {
             refresh_resize_cursor_at_current_position(true);
@@ -1632,6 +1633,9 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
     }
 
     if (event->type() == QEvent::ContextMenu) {
+        if (widget->contextMenuPolicy() == Qt::PreventContextMenu)
+            return QMainWindow::eventFilter(object, event);
+
         auto* context_menu_event = static_cast<QContextMenuEvent*>(event);
         auto position = context_menu_event->pos();
         auto is_empty_menu_bar_area = widget == menuBar() && menuBar()->actionAt(position) == nullptr;
@@ -1642,7 +1646,24 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
         return true;
     }
 
-    auto const is_button = qobject_cast<QAbstractButton*>(object) != nullptr;
+    auto is_button = qobject_cast<QAbstractButton*>(object) != nullptr;
+
+    // The window controls run to the window's right edge. While the window can be resized, that edge still resizes it.
+    if (is_button && uses_client_side_decorations() && !isMaximized() && !isFullScreen()) {
+        auto is_press = event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonDblClick;
+        auto is_mouse_event = is_press || event->type() == QEvent::MouseMove;
+        auto position = is_mouse_event ? widget->mapTo(this, static_cast<QMouseEvent*>(event)->position().toPoint()) : mapFromGlobal(QCursor::pos());
+        if (auto edges = resize_edges_for_position(position); edges.testFlag(Qt::RightEdge)) {
+            // NB: Even if the resize does not start, a press here must not reach the button and close the window.
+            if (is_press) {
+                auto* handle = windowHandle();
+                if (handle && event->type() == QEvent::MouseButtonPress && static_cast<QMouseEvent*>(event)->button() == Qt::LeftButton)
+                    handle->startSystemResize(edges);
+                return true;
+            }
+            is_button = false;
+        }
+    }
 
     if (is_button && (event->type() == QEvent::Enter || event->type() == QEvent::MouseMove || event->type() == QEvent::Leave)) {
         clear_resize_cursor();

@@ -197,6 +197,7 @@ set(SOURCES
     DOM/AbortSignal.cpp
     DOM/AbstractElement.cpp
     DOM/AbstractRange.cpp
+    DOM/AccessibilityChangeTracker.cpp
     DOM/AccessibilityTreeNode.cpp
     DOM/AdoptedStyleSheets.cpp
     DOM/AnchorNameMap.cpp
@@ -481,6 +482,7 @@ set(SOURCES
     HTML/HTMLOptionElement.cpp
     HTML/HTMLOptionsCollection.cpp
     HTML/HTMLOrSVGOrMathMLElement.cpp
+    HTML/HTMLOrSVGScriptElement.cpp
     HTML/HTMLOutputElement.cpp
     HTML/HTMLParagraphElement.cpp
     HTML/HTMLParamElement.cpp
@@ -574,6 +576,7 @@ set(SOURCES
     HTML/SanitizerConfiguration.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
+    HTML/Scripting/CompiledScriptCache.cpp
     HTML/Scripting/ConsoleInputCompletion.cpp
     HTML/Scripting/DevToolsLoggedObjects.cpp
     HTML/Scripting/DevToolsObjectTable.cpp
@@ -709,6 +712,7 @@ set(SOURCES
     Page/MiddleButtonScrollHandler.cpp
     Page/Page.cpp
     Page/PageCursor.cpp
+    Page/PageHoverLink.cpp
     Page/RenderingStats.cpp
     Page/ScreenWakeLockHandle.cpp
     PaintTiming/PaintTiming.cpp
@@ -887,6 +891,7 @@ set(SOURCES
     SVG/SVGViewElement.cpp
     SVG/TagNames.cpp
     SVG/TimeEvent.cpp
+    Translation/DocumentTranslator.cpp
     TrustedTypes/InjectionSink.cpp
     TrustedTypes/RequireTrustedTypesForDirective.cpp
     TrustedTypes/TrustedHTML.cpp
@@ -916,9 +921,7 @@ set(SOURCES
     ViewTransition/ViewTransition.cpp
     VisualLines.cpp
     WebLocks/AbstractOperations.cpp
-    WebLocks/Lock.cpp
     WebLocks/LockManager.cpp
-    WebLocks/LockRequest.cpp
     WebLocks/NavigatorLocks.cpp
     WebAssembly/WebAssembly.cpp
     WebAudio/AnalyserNode.cpp
@@ -995,7 +998,6 @@ set(SOURCES
     WebGL/EventNames.cpp
     WebGL/RemoteWebGLTransportFFI.cpp
     WebGL/WebGLContextAttributes.cpp
-    WebGL/WebGLContextEvent.cpp
     WebGL/WebGLRenderingContextBase.cpp
     WebIDL/AbstractOperations.cpp
     WebIDL/AsyncIterator.cpp

@@ -28,6 +28,7 @@
 #include <LibCore/Forward.h>
 #include <LibCore/SharedVersion.h>
 #include <LibGC/WeakHashSet.h>
+#include <LibGfx/Point.h>
 #include <LibJS/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
@@ -40,6 +41,7 @@
 #include <LibWeb/CSS/ScrollStateContainerQuery.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleUpdateInputs.h>
+#include <LibWeb/DOM/AccessibilityChangeTracker.h>
 #include <LibWeb/DOM/AnchorNameMap.h>
 #include <LibWeb/DOM/HoverEventData.h>
 #include <LibWeb/DOM/ParentNode.h>
@@ -85,6 +87,7 @@
 
 namespace Web {
 
+class HoverLinkReporter;
 struct RenderingStats;
 
 }
@@ -370,6 +373,10 @@ public:
     Editing::SpellingMarkers& spelling_markers();
     Editing::SpellCheckController& spell_check_controller();
     Editing::SpellCheckController* spell_check_controller_if_exists() { return m_spell_check_controller.ptr(); }
+
+    Translation::DocumentTranslator& document_translator();
+    Translation::DocumentTranslator* document_translator_if_exists() { return m_document_translator.ptr(); }
+    void forget_document_translator();
     Editing::WritingSuggestionController& writing_suggestion_controller();
     Editing::WritingSuggestionController* writing_suggestion_controller_if_exists() { return m_writing_suggestion_controller.ptr(); }
     Editing::WritingSuggestionController const* writing_suggestion_controller_if_exists() const { return m_writing_suggestion_controller.ptr(); }
@@ -413,6 +420,9 @@ public:
     Optional<URL::URL> get_the_base_url() const;
     String const& serialized_url() const;
     String const& serialized_base_url() const;
+    // What a hover of the render clock tells the page the link it is over with.
+    HoverLinkReporter& hover_link_reporter();
+    void update_hover_link_base();
 
     void update_base_element(Badge<HTML::HTMLBaseElement>);
     void did_set_frozen_base_url(Badge<HTML::HTMLBaseElement>);
@@ -725,24 +735,17 @@ public:
     WebIDL::ExceptionOr<GC::Ref<Event>> create_event(Utf16FlyString const& interface);
     GC::Ref<Range> create_range();
 
-    void set_pending_parsing_blocking_script(HTML::HTMLScriptElement*);
-    HTML::HTMLScriptElement* pending_parsing_blocking_script() { return m_pending_parsing_blocking_script.ptr(); }
-    GC::Ref<HTML::HTMLScriptElement> take_pending_parsing_blocking_script(Badge<HTML::HTMLParser>);
+    void set_pending_parsing_blocking_script(HTML::HTMLOrSVGScriptElement*);
+    HTML::HTMLOrSVGScriptElement* pending_parsing_blocking_script();
+    HTML::HTMLOrSVGScriptElement& take_pending_parsing_blocking_script(Badge<HTML::HTMLParser>);
+    bool has_pending_parsing_blocking_script() const { return m_pending_parsing_blocking_script.ptr(); }
 
-    void set_pending_parsing_blocking_svg_script(SVG::SVGScriptElement*);
-    SVG::SVGScriptElement* pending_parsing_blocking_svg_script() { return m_pending_parsing_blocking_svg_script.ptr(); }
-    GC::Ref<SVG::SVGScriptElement> take_pending_parsing_blocking_svg_script(Badge<HTML::HTMLParser>);
-    bool has_pending_parsing_blocking_script() const
-    {
-        return m_pending_parsing_blocking_script.ptr() || m_pending_parsing_blocking_svg_script.ptr();
-    }
+    void add_script_to_execute_when_parsing_has_finished(Badge<HTML::HTMLOrSVGScriptElement>, HTML::HTMLOrSVGScriptElement&);
+    Vector<GC::Ref<Element>>& scripts_to_execute_when_parsing_has_finished() { return m_scripts_to_execute_when_parsing_has_finished; }
 
-    void add_script_to_execute_when_parsing_has_finished(Badge<HTML::HTMLScriptElement>, HTML::HTMLScriptElement&);
-    Vector<GC::Ref<HTML::HTMLScriptElement>>& scripts_to_execute_when_parsing_has_finished() { return m_scripts_to_execute_when_parsing_has_finished; }
+    Vector<GC::Ref<Element>>& scripts_to_execute_as_soon_as_possible() { return m_scripts_to_execute_as_soon_as_possible; }
 
-    Vector<GC::Ref<HTML::HTMLScriptElement>>& scripts_to_execute_as_soon_as_possible() { return m_scripts_to_execute_as_soon_as_possible; }
-
-    Vector<GC::Ref<HTML::HTMLScriptElement>>& scripts_to_execute_in_order_as_soon_as_possible() { return m_scripts_to_execute_in_order_as_soon_as_possible; }
+    Vector<GC::Ref<Element>>& scripts_to_execute_in_order_as_soon_as_possible() { return m_scripts_to_execute_in_order_as_soon_as_possible; }
 
     HTML::ScriptRegistry& script_registry() { return m_script_registry; }
     HTML::ScriptRegistry const& script_registry() const { return m_script_registry; }
@@ -936,8 +939,9 @@ public:
     //         has completely loaded, the requests it makes without a cache mode of their own bypass the cache too.
     bool is_loading_bypassing_cache() const { return m_navigation_bypassed_cache && !is_completely_loaded(); }
 
-    GC::Ptr<HTML::HTMLScriptElement> current_script() const { return m_current_script.ptr(); }
-    void set_current_script(Badge<HTML::HTMLScriptElement>, GC::Ptr<HTML::HTMLScriptElement> script) { m_current_script = move(script); }
+    GC::Ptr<Element> current_script() const { return m_current_script; }
+    Variant<GC::Ref<HTML::HTMLScriptElement>, GC::Ref<SVG::SVGScriptElement>, Empty> current_script_for_bindings() const;
+    void set_current_script(Badge<HTML::HTMLOrSVGScriptElement>, GC::Ptr<Element> script) { m_current_script = move(script); }
     static constexpr size_t current_script_offset() { return offsetof(Document, m_current_script); }
 
     u32 ignore_destructive_writes_counter() const { return m_ignore_destructive_writes_counter; }
@@ -1252,6 +1256,10 @@ public:
 
     Utf16String dump_accessibility_tree_as_json();
     Vector<WebView::AccessibilityNodeData> build_accessibility_node_data();
+    // Builds the tree and hands over what changed in it since the tracker's last build: every node whose data changed,
+    // and the IDs of the nodes that are gone. Hands over the whole tree when asked to, and for the tracker's first build
+    // of this document.
+    AccessibilityChangeTracker::Change build_accessibility_tree_change(AccessibilityChangeTracker&, bool whole_tree);
 
     // The accessible name and description that the accessibility tree reports for an element, kept from one build of
     // the tree to the next while an assistive technology consumes it, and dropped whenever a change could alter them.
@@ -1266,8 +1274,50 @@ public:
     // What a build of the accessibility tree keeps of each node's data for the next build, while an assistive
     // technology consumes the tree; see AccessibilityTreeNode::serialize_tree_as_node_data().
     WebView::AccessibilityNodeData const* cached_accessibility_record(Node const&) const;
-    void cache_accessibility_record(Node const&, WebView::AccessibilityNodeData const&) const;
+    // A kept record, with the version it got when it was kept: Every record and geometry kept gets a new version, so
+    // the same version means the same data.
+    struct KeptAccessibilityRecord {
+        WebView::AccessibilityNodeData const* data { nullptr };
+        u64 version { 0 };
+    };
+    KeptAccessibilityRecord kept_accessibility_record(Node const&) const;
+    // Returns the version the record gets, or 0 when it isn't kept.
+    u64 cache_accessibility_record(Node const&, WebView::AccessibilityNodeData const&) const;
     void invalidate_cached_accessibility_records_after_style_change(Element const&);
+
+    // A text node's character geometry, kept with its record from one build to the next along with what layout
+    // computed it from: The same line content at the same positions gives the same geometry, so it's computed again
+    // only when one of them changes.
+    struct CachedTextGeometry {
+        AK_MAKE_NONCOPYABLE(CachedTextGeometry);
+
+    public:
+        CachedTextGeometry() = default;
+        CachedTextGeometry(CachedTextGeometry&&) = default;
+        // Releases the references this held, before taking the other's.
+        CachedTextGeometry& operator=(CachedTextGeometry&&);
+        ~CachedTextGeometry();
+
+        // A containing block's line content, which each source holds a reference to, and that block's raw
+        // document-absolute position.
+        struct Source {
+            void const* line_content { nullptr };
+            i32 x { 0 };
+            i32 y { 0 };
+            bool operator==(Source const&) const = default;
+        };
+        Vector<Source> sources;
+        u64 version { 0 };
+        Vector<Gfx::IntPoint> character_offsets;
+        Vector<i32> line_break_character_offsets;
+        Vector<i32> line_heights;
+    };
+    CachedTextGeometry const* cached_text_geometry(Node const&) const;
+    // Returns the version the geometry gets, or 0 when it isn't kept.
+    u64 cache_text_geometry(Node const&, CachedTextGeometry) const;
+    // For tests: each text node whose kept geometry differs from what computing it again gives.
+    Vector<String> cached_text_geometry_mismatches();
+
     // For tests: builds that compute every node's data again, without what earlier builds kept.
     bool accessibility_caches_bypassed() const { return m_accessibility_caches_bypassed; }
     // For tests: each node whose kept data differs from what computing it again gives.
@@ -1613,6 +1663,9 @@ public:
     // Maintained by LocalNavigable when it sets/clears its active document.
     GC::Ptr<HTML::LocalNavigable> navigable() const;
     void set_navigable(GC::Ptr<HTML::LocalNavigable>);
+
+    // The navigable whose active document this document, created for a navigation, is to become, until it does.
+    GC::Ptr<HTML::LocalNavigable> navigable_awaiting_activation() const { return m_navigable_awaiting_activation.ptr(); }
 
     void set_needs_repaint(Badge<Node, Painting::BoxViewRepaintAccess, HTML::LocalNavigable, CSS::VisualViewport, Web::EventHandler>, InvalidateDisplayList should_invalidate_display_list = InvalidateDisplayList::PaintCommandsAndHitTestList)
     {
@@ -2005,16 +2058,15 @@ private:
 
     Utf16String m_source;
 
-    GC::Ptr<HTML::HTMLScriptElement> m_pending_parsing_blocking_script;
-    GC::Ptr<SVG::SVGScriptElement> m_pending_parsing_blocking_svg_script;
+    GC::Ptr<Element> m_pending_parsing_blocking_script;
 
-    Vector<GC::Ref<HTML::HTMLScriptElement>> m_scripts_to_execute_when_parsing_has_finished;
+    Vector<GC::Ref<Element>> m_scripts_to_execute_when_parsing_has_finished;
 
     // https://html.spec.whatwg.org/multipage/scripting.html#list-of-scripts-that-will-execute-in-order-as-soon-as-possible
-    Vector<GC::Ref<HTML::HTMLScriptElement>> m_scripts_to_execute_in_order_as_soon_as_possible;
+    Vector<GC::Ref<Element>> m_scripts_to_execute_in_order_as_soon_as_possible;
 
     // https://html.spec.whatwg.org/multipage/scripting.html#set-of-scripts-that-will-execute-as-soon-as-possible
-    Vector<GC::Ref<HTML::HTMLScriptElement>> m_scripts_to_execute_as_soon_as_possible;
+    Vector<GC::Ref<Element>> m_scripts_to_execute_as_soon_as_possible;
 
     HTML::ScriptRegistry m_script_registry;
 
@@ -2107,7 +2159,7 @@ private:
     bool m_text_directive_user_activation { false };
     bool m_browsing_context_group_has_remote_contexts { false };
     bool m_navigation_bypassed_cache { false };
-    GC::Ptr<HTML::HTMLScriptElement> m_current_script;
+    GC::Ptr<Element> m_current_script;
 
     u32 m_ignore_destructive_writes_counter { 0 };
 
@@ -2215,6 +2267,8 @@ private:
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-about-base-url
     Optional<URL::URL> m_about_base_url;
 
+    RefPtr<HoverLinkReporter> m_hover_link_reporter;
+
     // https://dom.spec.whatwg.org/#document-base-url-override
     Optional<URL::URL> m_base_url_override;
 
@@ -2294,6 +2348,7 @@ private:
     Vector<GC::Ref<Range>> m_find_in_page_highlighted_matches;
     OwnPtr<Editing::SpellingMarkers> m_spelling_markers;
     OwnPtr<Editing::SpellCheckController> m_spell_check_controller;
+    OwnPtr<Translation::DocumentTranslator> m_document_translator;
     OwnPtr<Editing::WritingSuggestionController> m_writing_suggestion_controller;
     Vector<Utf16String> m_find_in_page_highlighted_match_texts;
     u64 m_find_in_page_highlighted_matches_dom_tree_version { 0 };
@@ -2515,6 +2570,7 @@ private:
 
     // NOTE: This is GC::Weak, not GC::Ptr, on purpose. We don't want the document to keep some old detached navigable alive.
     GC::Weak<HTML::LocalNavigable> m_navigable;
+    GC::Weak<HTML::LocalNavigable> m_navigable_awaiting_activation;
 
     Core::SharedVersion m_cookie_version { Core::INVALID_SHARED_VERSION };
     Optional<Core::SharedVersionIndex> m_cookie_version_index;

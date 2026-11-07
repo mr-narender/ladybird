@@ -127,15 +127,6 @@ public:
         return m_encoder.encode(value);
     }
 
-    // The size of a list, as the encoding of a Vector begins.
-    ErrorOr<void> encode_size(size_t size)
-    {
-        VERIFY(!m_buffer_has_been_taken);
-        return m_encoder.encode_size(size);
-    }
-
-    void extend(Vector<TransferDataEncoder>);
-
     IPC::MessageBuffer const& buffer() const;
     IPC::MessageBuffer take_buffer() const;
 

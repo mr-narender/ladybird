@@ -43,6 +43,7 @@
 #include <LibWeb/HTML/HTMLAnchorElement.h>
 #include <LibWeb/HTML/HTMLAreaElement.h>
 #include <LibWeb/HTML/HTMLButtonElement.h>
+#include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/HTMLDialogElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
@@ -53,11 +54,14 @@
 #include <LibWeb/HTML/HTMLSummaryElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
+#include <LibWeb/HTML/ImageRequest.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Navigator.h>
 #include <LibWeb/HTML/PaintConfig.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/SharedResourceRequest.h>
 #include <LibWeb/HTML/TextDirectiveGenerator.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Layout/LayoutRustFFI.h>
@@ -123,8 +127,10 @@ static GC::Ptr<DOM::Node> associated_descendant_editing_host(Layout::BegunRead c
         });
 
         if (editing_host && !has_multiple_editing_hosts) {
+            // NB: An editing host inside the hit node is not what the click is on: The click landed on the hit node
+            //     around it, as in its padding or below it.
             if (ancestor == &node)
-                return editing_host;
+                return nullptr;
             auto const* editing_host_layout_node = editing_host->layout_node(read);
             if (hit_node_rect.has_value() && editing_host_layout_node && Painting::has_committed_box(*editing_host_layout_node)
                 && hit_node_rect->intersects(Painting::absolute_rect(*editing_host_layout_node)))
@@ -201,6 +207,46 @@ static Optional<Painting::CaretPosition> caret_position_from_editable_hit_node(L
         .paintable = Painting::committed_row_slot(*layout_node),
         .arena = *arena,
         .boundary = { boundary_identity, 0 },
+    };
+}
+
+// A click on content outside a block-level editing host puts the caret before or after the host in its parent, rather
+// than inside it, as the caret position from the point does when it snaps to the host's nearest text. So the click
+// neither selects in the host nor focuses it. The caret goes before the host where it landed at the start of the
+// host's content, and after it otherwise. An inline editing host takes the caret, as on the line beside it.
+static Optional<Painting::CaretPosition> caret_position_beside_block_editing_host(Layout::BegunRead const& read, Painting::CaretPosition const& caret_position, DOM::Node& hit_node)
+{
+    auto boundary_node = caret_position.boundary_node();
+    if (!boundary_node || !boundary_node->is_editable_or_editing_host() || hit_node.is_editable_or_editing_host())
+        return {};
+    auto editing_host = boundary_node->is_editing_host() ? boundary_node : boundary_node->editing_host();
+    if (!editing_host || hit_node.is_inclusive_descendant_of(*editing_host))
+        return {};
+    auto const* editing_host_layout_node = as_if<Layout::NodeWithStyle>(editing_host->layout_node(read));
+    if (!editing_host_layout_node || editing_host_layout_node->display().is_inline_outside())
+        return {};
+    auto parent = editing_host->parent();
+    if (!parent)
+        return {};
+
+    auto first_leaf = first_editable_leaf_descendant(*editing_host);
+    bool const at_start = caret_position.boundary.offset == 0
+        && (boundary_node == editing_host || boundary_node == first_leaf);
+    auto offset = editing_host->index() + (at_start ? 0 : 1);
+
+    auto* arena = hit_node.document().layout_node_arena_if_created();
+    if (!arena)
+        return {};
+    auto* layout_node = DOM::NodeIdentity::of(*parent).bound_layout_node(read, *arena);
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
+        layout_node = DOM::NodeIdentity::of(hit_node).bound_layout_node(read, *arena);
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
+        return {};
+
+    return Painting::CaretPosition {
+        .paintable = Painting::committed_row_slot(*layout_node),
+        .arena = *arena,
+        .boundary = { DOM::NodeIdentity::of(*parent), static_cast<WebIDL::UnsignedLong>(offset) },
     };
 }
 
@@ -3688,6 +3734,11 @@ Optional<Painting::CaretPosition> EventHandler::caret_position_for_mouse_selecti
     if (!caret_position.has_value())
         return {};
 
+    if (editable_hit_node_before_focus && editable_hit_node_before_focus->is_connected() && !editing_host_before_focus) {
+        if (auto beside = caret_position_beside_block_editing_host(read, *caret_position, *editable_hit_node_before_focus); beside.has_value())
+            caret_position = beside;
+    }
+
     return caret_position;
 }
 
@@ -3883,6 +3934,54 @@ static bool range_contains_viewport_position(DOM::Range& range, CSSPixelPoint vi
     });
 }
 
+static bool node_or_ancestor_listens_for_contextmenu(DOM::Node const& node)
+{
+    for (auto const* current = &node; current; current = current->parent_or_shadow_host()) {
+        if (current->has_event_listener(UIEvents::EventNames::contextmenu))
+            return true;
+    }
+    return false;
+}
+
+// Media and editable content have menus of their own, which an image below them must not replace.
+static bool has_own_context_menu(DOM::Node const& node)
+{
+    return is<HTML::HTMLMediaElement>(node) || is<HTML::FormAssociatedTextControlElement>(node) || node.is_editable_or_editing_host();
+}
+
+// NB: A background image is not taken to hide anything, as we can't cheaply tell whether it is opaque, and overlays
+//     often draw a transparent one, such as a play icon.
+static bool box_hides_what_is_below_it(Layout::NodeWithStyle const& box)
+{
+    return box.opacity() == 1 && box.background_color().alpha() == 255;
+}
+
+// Sites often cover an image with a transparent layer, or a caption, so the topmost box at a position may not be what
+// the user is pointing at. This looks through such layers for an image, but stops at one that hides what is below it,
+// and at one whose page may be handling context menus itself.
+static HTML::HTMLImageElement* image_beneath_overlays(Layout::BegunRead const& read, DOM::Document& document, CSSPixelPoint position)
+{
+    HTML::HTMLImageElement* image = nullptr;
+    (void)document.hit_test_all(read, position, [&](Painting::HitTestResult result) {
+        auto* layout_node = result.layout_node(read);
+        if (!layout_node)
+            return TraversalDecision::Continue;
+        // NB: A pseudo-element's box has no DOM node, but it can hide what is below it all the same.
+        if (auto* node = layout_node->dom_node()) {
+            if (node_or_ancestor_listens_for_contextmenu(*node) || has_own_context_menu(*node) || is<HTML::HTMLCanvasElement>(*node) || is<HTML::NavigableContainer>(*node))
+                return TraversalDecision::Break;
+            if (auto* image_element = as_if<HTML::HTMLImageElement>(*node); image_element && !image_element->current_src().is_empty()) {
+                image = image_element;
+                return TraversalDecision::Break;
+            }
+        }
+        if (auto const* box = as_if<Layout::NodeWithStyle>(*layout_node); box && box_hides_what_is_below_it(*box))
+            return TraversalDecision::Break;
+        return TraversalDecision::Continue;
+    });
+    return image;
+}
+
 // https://w3c.github.io/uievents/#maybe-show-context-menu
 void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCoordinates const& coordinates, CSSPixelPoint screen_position, CSSPixelPoint viewport_position, unsigned buttons, unsigned modifiers)
 {
@@ -3936,101 +4035,121 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
 
     auto local_root_id = m_navigable->local_root()->id();
     auto page_viewport_position = m_navigable->to_page_position(viewport_position);
-    auto selected_text_range_at_context_menu_position = [&]() -> GC::Ptr<DOM::Range> {
-        if (!m_navigable->is_top_level_traversable())
-            return nullptr;
-
+    auto selected_range_at_context_menu_position = [&]() -> GC::Ptr<DOM::Range> {
         auto selection = document->get_selection();
         if (!selection || selection->is_collapsed())
             return nullptr;
 
         auto range = selection->range();
-        if (!range)
+        if (!range || !range_contains_viewport_position(*range, coordinates.viewport_position))
+            return nullptr;
+        return range;
+    };
+    auto selected_text_range_at_context_menu_position = [&]() -> GC::Ptr<DOM::Range> {
+        if (!m_navigable->is_top_level_traversable())
             return nullptr;
 
-        if (!range_contains_viewport_position(*range, coordinates.viewport_position)
-            || !HTML::selection_is_eligible_for_text_fragment_generation(*document, *range))
+        auto range = selected_range_at_context_menu_position();
+        if (!range || !HTML::selection_is_eligible_for_text_fragment_generation(*document, *range))
             return nullptr;
         return range->clone_range();
     };
 
-    if (auto const* link = node_under_pointer->enclosing_link_element()) {
+    // AD-HOC: Skip up the tree to the first ancestor that is not a UA shadow DOM node, and use its context menu.
+    //         Media elements' controls' shadow DOM nodes should not have their own context menu, but rather
+    //         activate their parent media element's menu.
+    auto context_menu_node = node_of_box_under_pointer;
+    while (auto shadow_root = context_menu_node->containing_shadow_root()) {
+        if (!shadow_root->is_user_agent_internal())
+            break;
+        VERIFY(shadow_root->host() != nullptr);
+        context_menu_node = *shadow_root->host();
+    }
+
+    auto const* link = node_under_pointer->enclosing_link_element();
+    Optional<URL::URL> link_url;
+    if (link)
+        link_url = document->encoding_parse_url(link->href());
+
+    // NB: An image without a source has nothing for the image menu to act on.
+    auto* image_element = as_if<HTML::HTMLImageElement>(*context_menu_node);
+    if (image_element && image_element->current_src().is_empty())
+        image_element = nullptr;
+    // NB: Selected text keeps its menu too, wherever it is and whatever it spans.
+    if (!image_element && !has_own_context_menu(*context_menu_node) && !selected_range_at_context_menu_position())
+        image_element = image_beneath_overlays(read, document, coordinates.visual_viewport_position);
+
+    Optional<URL::URL> image_url;
+    if (image_element)
+        image_url = image_element->document().encoding_parse_url(image_element->current_src());
+
+    if (image_url.has_value()) {
+        Optional<Gfx::Bitmap const*> bitmap;
+        if (auto frame = image_element->current_image_frame(); frame.has_value())
+            bitmap = &frame->bitmap();
+
+        // NB: An image inside a link, or under an image map's link, offers both the image and the link.
+        Optional<HTML::PreparedNavigationDescriptor> link_navigation;
+        if (link_url.has_value())
+            link_navigation = HTML::prepare_navigation_from_document(*document, *link_url, link->hyperlink_element_utils_element().hyperlink_referrer_policy());
+
+        Optional<String> image_mime_type;
+        if (auto request = image_element->current_request().shared_resource_request())
+            image_mime_type = request->image_mime_type();
+
+        auto navigation = HTML::prepare_navigation_from_document(image_element->document(), image_url.release_value(), ReferrerPolicy::ReferrerPolicy::EmptyString);
+        m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Image, .target = *image_element, .position = page_viewport_position, .link_url = move(link_url), .image_mime_type = image_mime_type });
+        m_navigable->page().client().page_did_request_image_context_menu(local_root_id, page_viewport_position, move(navigation), "", modifiers, bitmap, move(link_navigation), move(image_mime_type));
+    } else if (link) {
         // Right-clicking link text without an existing selection first selects the word under the pointer, as the
         // ordinary page context menu does. A selected range is still only offered when the click lands within it.
         (void)select_context_menu_text(read, document, coordinates);
-        auto href = link->href();
-        auto url = document->encoding_parse_url(href);
-        if (url.has_value()) {
+        if (link_url.has_value()) {
             auto const& element = link->hyperlink_element_utils_element();
-            auto navigation = HTML::prepare_navigation_from_document(*document, url.release_value(), element.hyperlink_referrer_policy());
+            auto navigation = HTML::prepare_navigation_from_document(*document, link_url.release_value(), element.hyperlink_referrer_policy());
             m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Link, .target = const_cast<DOM::Element&>(element), .position = page_viewport_position });
             m_navigable->page().client().page_did_request_link_context_menu(local_root_id, page_viewport_position, move(navigation), link->target().to_byte_string(), modifiers, selected_text_range_at_context_menu_position());
         }
+    } else if (is<HTML::HTMLMediaElement>(*context_menu_node)) {
+        auto& media_element = as<HTML::HTMLMediaElement>(*context_menu_node);
+        auto* video_element = as_if<HTML::HTMLVideoElement>(*context_menu_node);
+        auto is_video = video_element != nullptr;
+
+        // A media element without a source, or one whose source does not resolve against the document's base
+        // URL, has no URL to open or copy.
+        Optional<URL::URL> media_url;
+        if (auto const& current_src = media_element.current_src(); !current_src.is_empty())
+            media_url = media_element.document().encoding_parse_url(current_src);
+
+        Page::MediaContextMenu menu {
+            .media_url = move(media_url),
+            .is_video = is_video,
+            .is_playing = media_element.potentially_playing(),
+            .is_muted = media_element.muted(),
+            .has_user_agent_controls = media_element.has_attribute(HTML::AttributeNames::controls),
+            .is_looping = media_element.has_attribute(HTML::AttributeNames::loop),
+            .is_fullscreen = is_video && media_element.is_fullscreen_element(),
+            .is_picture_in_picture = media_element.is_picture_in_picture_element(),
+            .can_enter_picture_in_picture = is_video && video_element->can_enter_picture_in_picture(),
+        };
+
+        auto navigation = menu.media_url.map([&](auto const& url) {
+            return HTML::prepare_navigation_from_document(media_element.document(), url, ReferrerPolicy::ReferrerPolicy::EmptyString);
+        });
+        m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Media, .target = media_element, .position = page_viewport_position, .media = menu });
+        m_navigable->page().did_request_media_context_menu(media_element.unique_id(), local_root_id, page_viewport_position, "", modifiers, menu, move(navigation));
     } else {
-        // AD-HOC: Skip up the tree to the first ancestor that is not a UA shadow DOM node, and use its context menu.
-        //         Media elements' controls' shadow DOM nodes should not have their own context menu, but rather
-        //         activate their parent media element's menu.
-        auto context_menu_node = node_of_box_under_pointer;
-        while (auto shadow_root = context_menu_node->containing_shadow_root()) {
-            if (!shadow_root->is_user_agent_internal())
-                break;
-            VERIFY(shadow_root->host() != nullptr);
-            context_menu_node = *shadow_root->host();
-        }
+        auto misspelling = select_context_menu_misspelling(read, document, coordinates);
+        if (!misspelling.has_value())
+            select_context_menu_text(read, document, coordinates);
+        Optional<Utf16String> misspelled_word;
+        if (misspelling.has_value())
+            misspelled_word = misspelling->word;
+        m_navigable->page().record_context_menu_misspelling({}, move(misspelling));
 
-        if (is<HTML::HTMLImageElement>(*context_menu_node)) {
-            auto& image_element = as<HTML::HTMLImageElement>(*context_menu_node);
-            auto image_url = image_element.document().encoding_parse_url(image_element.current_src());
-            if (image_url.has_value()) {
-                Optional<Gfx::Bitmap const*> bitmap;
-                if (auto frame = image_element.current_image_frame(); frame.has_value())
-                    bitmap = &frame->bitmap();
-
-                auto navigation = HTML::prepare_navigation_from_document(image_element.document(), image_url.release_value(), ReferrerPolicy::ReferrerPolicy::EmptyString);
-                m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Image, .target = image_element, .position = page_viewport_position });
-                m_navigable->page().client().page_did_request_image_context_menu(local_root_id, page_viewport_position, move(navigation), "", modifiers, bitmap);
-            }
-        } else if (is<HTML::HTMLMediaElement>(*context_menu_node)) {
-            auto& media_element = as<HTML::HTMLMediaElement>(*context_menu_node);
-            auto* video_element = as_if<HTML::HTMLVideoElement>(*context_menu_node);
-            auto is_video = video_element != nullptr;
-
-            // A media element without a source, or one whose source does not resolve against the document's base
-            // URL, has no URL to open or copy.
-            Optional<URL::URL> media_url;
-            if (auto const& current_src = media_element.current_src(); !current_src.is_empty())
-                media_url = media_element.document().encoding_parse_url(current_src);
-
-            Page::MediaContextMenu menu {
-                .media_url = move(media_url),
-                .is_video = is_video,
-                .is_playing = media_element.potentially_playing(),
-                .is_muted = media_element.muted(),
-                .has_user_agent_controls = media_element.has_attribute(HTML::AttributeNames::controls),
-                .is_looping = media_element.has_attribute(HTML::AttributeNames::loop),
-                .is_fullscreen = is_video && media_element.is_fullscreen_element(),
-                .is_picture_in_picture = media_element.is_picture_in_picture_element(),
-                .can_enter_picture_in_picture = is_video && video_element->can_enter_picture_in_picture(),
-            };
-
-            auto navigation = menu.media_url.map([&](auto const& url) {
-                return HTML::prepare_navigation_from_document(media_element.document(), url, ReferrerPolicy::ReferrerPolicy::EmptyString);
-            });
-            m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Media, .target = media_element, .position = page_viewport_position, .media = menu });
-            m_navigable->page().did_request_media_context_menu(media_element.unique_id(), local_root_id, page_viewport_position, "", modifiers, menu, move(navigation));
-        } else {
-            auto misspelling = select_context_menu_misspelling(read, document, coordinates);
-            if (!misspelling.has_value())
-                select_context_menu_text(read, document, coordinates);
-            Optional<Utf16String> misspelled_word;
-            if (misspelling.has_value())
-                misspelled_word = misspelling->word;
-            m_navigable->page().record_context_menu_misspelling({}, move(misspelling));
-
-            auto for_input_events_target = document->active_input_events_target() ? ContextMenuForInputEventsTarget::Yes : ContextMenuForInputEventsTarget::No;
-            m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Page, .target = context_menu_node, .position = page_viewport_position });
-            m_navigable->page().client().page_did_request_context_menu(local_root_id, page_viewport_position, for_input_events_target, move(misspelled_word), selected_text_range_at_context_menu_position());
-        }
+        auto for_input_events_target = document->active_input_events_target() ? ContextMenuForInputEventsTarget::Yes : ContextMenuForInputEventsTarget::No;
+        m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Page, .target = context_menu_node, .position = page_viewport_position });
+        m_navigable->page().client().page_did_request_context_menu(local_root_id, page_viewport_position, for_input_events_target, move(misspelled_word), selected_text_range_at_context_menu_position());
     }
 }
 
@@ -5651,8 +5770,13 @@ void EventHandler::track_the_effective_position_of_the_legacy_mouse_pointer(GC::
     // NB: A primary touch or pen pointer can move the effective legacy mouse pointer position away from the native
     //     mouse pointer's boundary target, so the native pointer's boundary events also need to reach T.
     auto previous_pointer_target = m_native_mouse_hover_target;
-    if (m_effective_legacy_mouse_pointer_position == target && previous_pointer_target == target)
+    if (m_effective_legacy_mouse_pointer_position == target && previous_pointer_target == target) {
+        // AD-HOC: A hover of the render clock may have told the client of the link in the frame on screen, which may
+        //         not be what is under the pointer here. Nothing else would tell the client so, as the target did not
+        //         change.
+        report_hovered_link_to_client(target);
         return;
+    }
 
     // 3. Dispatch mouseover, mouseout, mouseenter and mouseleave events as per [UIEVENTS] for a mouse moving from the
     //    current effective legacy mouse pointer position to T. Consider an unset value of either current effective
@@ -5701,22 +5825,27 @@ void EventHandler::report_hovered_node_to_client(GC::Ptr<DOM::Node> target)
         page.set_is_in_tooltip_area(false);
     }
 
-    HTML::HTMLHyperlinkElementUtils const* hovered_link_element = nullptr;
-    if (target)
-        hovered_link_element = target->enclosing_link_element();
-    if (hovered_link_element) {
-        if (auto link_url = target->document().encoding_parse_url(hovered_link_element->href()); link_url.has_value()) {
-            page.client().page_did_hover_link(*link_url);
-            page.set_is_hovering_link(true);
-        }
-    } else if (page.is_hovering_link()) {
-        page.client().page_did_unhover_link();
-        page.set_is_hovering_link(false);
+    report_hovered_link_to_client(target);
+}
+
+void EventHandler::report_hovered_link_to_client(GC::Ptr<DOM::Node> target)
+{
+    auto& page = m_navigable->page();
+
+    Optional<URL::URL> hovered_link_url;
+    Optional<UniqueNodeID> hovered_document;
+    if (target) {
+        hovered_document = target->document().unique_id();
+        // NB: A link in editable content is text to edit, which clicking does not follow.
+        auto const* hovered_link_element = target->enclosing_link_element();
+        if (hovered_link_element && !hovered_link_element->hyperlink_element_utils_element().is_editable_or_editing_host())
+            hovered_link_url = target->document().encoding_parse_url(hovered_link_element->href());
     }
+    page.hover_link().request(move(hovered_link_url), hovered_document);
 
     // Whatever the client shows now, this handler reported — so the hover is this handler's to end.
     GC::Ptr<HTML::LocalNavigable> hover_reporting_navigable;
-    if (page.is_hovering_link() || page.is_in_tooltip_area())
+    if (page.hover_link().has_link() || page.is_in_tooltip_area())
         hover_reporting_navigable = m_navigable;
     page.set_hover_reporting_navigable({}, hover_reporting_navigable);
 }
@@ -5737,8 +5866,16 @@ void EventHandler::reset_hover_for_document_replacement(Badge<HTML::LocalNavigab
     m_mouse_pointer.capture_target = nullptr;
     m_mouse_pointer.buttons = 0;
     m_additional_pointers.clear();
+    // A hover of the render clock shows the frame on screen, which may be of the outgoing document for a while yet. It
+    // must not bring back a link of that document once the client has heard that the hover ended.
+    auto document = m_navigable->active_document();
+    if (document)
+        document->hover_link_reporter().retire();
     if (m_navigable->page().hover_reporting_navigable() == m_navigable)
         report_hovered_node_to_client(nullptr);
+    // A hover of the render clock may have told of a link there, of which no handler has heard yet.
+    if (document)
+        m_navigable->page().hover_link().withdraw(document->unique_id());
 }
 
 void EventHandler::record_last_known_mouse_position(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, unsigned buttons, unsigned modifiers)

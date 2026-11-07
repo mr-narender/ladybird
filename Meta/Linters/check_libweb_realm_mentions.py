@@ -50,7 +50,11 @@ ALLOWED_REALM_MENTIONS = {
         "WebCrypto algorithms still use realms for buffer/key/promise materialization and for normalizing algorithm "
         "dictionaries, which SubtleCrypto.supports() does in the caller realm",
     ),
-    "DOM": (10, 33, "DOM abort plumbing and node helpers still have callback/materialization realm use"),
+    "DOM": (
+        10,
+        35,
+        "DOM abort plumbing, including the Rust AbortSignal adapter, and node helpers use callback/materialization realms",
+    ),
     "Fetch": (
         20,
         60,
@@ -60,9 +64,9 @@ ALLOWED_REALM_MENTIONS = {
     ),
     "FileAPI": (2, 9, "Blob glue still creates streams and buffers in selected realms"),
     "HTML": (
-        64,
-        183,
-        "HTML algorithms still contain structured serialization, including posted-message preparation, canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; RemoteWindow mirrors Window's postMessage; "
+        63,
+        168,
+        "HTML algorithms still contain structured serialization, including canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; window postMessage glue supplies principal realms and routes remote messages; "
         "the C++ glue of the Rust structured serialization creates platform objects and SharedArrayBuffers in a given realm; "
         "the C++ glue of the Rust Storage and StorageEvent creates them in a given realm",
     ),
@@ -95,7 +99,7 @@ ALLOWED_REALM_MENTIONS = {
     ),
     "WebDriver": (2, 7, "WebDriver execute/JSON conversion still materializes JS values for automation"),
     "WebGL": (4, 8, "WebGL contexts are created in the realm of their canvas, and their events in it"),
-    "WebLocks": (6, 7, "Web Locks queue/callback algorithms still use callback and promise realms"),
+    "WebLocks": (2, 4, "the C++ glue creates a Rust LockManager and schedules Rust steps in selected realms"),
     "WebRTC": (
         13,
         22,

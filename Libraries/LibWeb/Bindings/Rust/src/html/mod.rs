@@ -65,6 +65,10 @@ pub(crate) mod message_channel;
 #[cfg(not(test))]
 pub(crate) mod message_port;
 #[cfg(not(test))]
+pub(crate) mod numbers;
+#[cfg(not(test))]
+pub(crate) mod offscreen_canvas;
+#[cfg(not(test))]
 pub(crate) mod offscreen_canvas_rendering_context2d;
 #[cfg(not(test))]
 pub(crate) mod path2d;
@@ -76,3 +80,7 @@ pub(crate) mod storage_event;
 pub(crate) mod structured_serialize;
 #[cfg(not(test))]
 pub(crate) mod text_metrics;
+#[cfg(not(test))]
+pub(crate) mod window;
+#[cfg(not(test))]
+pub(crate) mod window_or_worker_global_scope;

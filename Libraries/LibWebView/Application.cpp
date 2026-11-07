@@ -52,6 +52,7 @@
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/CompositorPresentationClient.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/FaviconStore.h>
 #include <LibWebView/FontService.h>
@@ -60,10 +61,12 @@
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
+#include <LibWebView/ImageDecoderManager.h>
 #include <LibWebView/Menu.h>
 #include <LibWebView/NoOpMicrophoneAuthorizer.h>
 #include <LibWebView/NoOpNotificationBackend.h>
 #include <LibWebView/PermissionManager.h>
+#include <LibWebView/PictureInPictureManager.h>
 #include <LibWebView/PictureInPictureWindow.h>
 #include <LibWebView/ProcessType.h>
 #include <LibWebView/RequestServerManager.h>
@@ -72,6 +75,7 @@
 #include <LibWebView/SpellChecker.h>
 #include <LibWebView/StorageAreaRegistry.h>
 #include <LibWebView/TabPerformanceMonitor.h>
+#include <LibWebView/Translator.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/Utilities.h>
@@ -280,6 +284,8 @@ Application::~Application()
     }
 
     m_spare_web_content_process = nullptr;
+
+    PictureInPictureManager::the().destroy_all_windows();
 
     // Connection die() handlers use the process manager, so destroy the processes while it is still reachable.
     if (m_process_manager)
@@ -668,10 +674,27 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         }
     }
 
+    // Reports belong to the profile they came from, whose own setting decides what happens to them. A temporary
+    // profile takes nothing over, since it would take it to its grave.
+    auto& crash_report_store = CrashReportStore::the();
+    crash_report_store.set_directory(LexicalPath::join(profile().paths().data, "CrashReports"sv).string());
+    if (!profile().is_temporary()) {
+        if (auto result = crash_report_store.adopt_reports_from(CrashReportStore::default_directory()); result.is_error())
+            warnln("Could not move crash reports into the profile: {}", result.error());
+    }
+    if (captures_browser_crashes()) {
+        if (auto result = crash_report_store.initialize_browser_crash_handler(); result.is_error())
+            warnln("Could not prepare Browser crash reporting: {}", result.error());
+    }
+
     // Test results must not depend on the languages of the machine running the tests.
     auto platform_languages = m_web_content_options.is_test_mode == IsTestMode::Yes ? Vector<String> {} : platform_preferred_languages();
 
     m_settings = make<Settings>(Settings::create(LexicalPath::join(profile().paths().config, "Settings.json"sv).string(), move(platform_languages)));
+    // A browser that crashed left a report that was recovered before the settings were read.
+    if (m_settings->crash_report_sending() == CrashReportSending::NeverSend)
+        CrashReportOutbox::the().discard_all();
+
     m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(profile().paths().config, "Bookmarks.json"sv).string()));
 
     if (m_web_content_options.is_test_mode == IsTestMode::Yes) {
@@ -716,6 +739,8 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     if (!m_event_loop)
         m_event_loop = &create_platform_event_loop();
+    if (captures_browser_crashes())
+        CrashReportOutbox::the().start_removing_expired_reports();
 
     // NB: The host's thread makes an event loop, which would install the default event loop manager if the platform
     //     one were not installed yet.
@@ -962,7 +987,7 @@ void Application::start_next_content_blocker_list_update()
     timeout->start();
 
     m_content_blocker_list_update_request->set_unbuffered_request_callbacks(
-        [this](NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Optional<Core::ImmutableBytes>, Optional<u64>, Requests::CacheState) {
+        [this](NonnullRefPtr<HTTP::HeaderList> headers, Optional<u32> response_code, Optional<String> const& reason_phrase, Requests::CacheState) {
             if (m_content_blocker_list_update_cancelled)
                 return;
             if (response_code.has_value() && Web::Fetch::Infrastructure::is_redirect_status(*response_code)) {
@@ -1171,7 +1196,6 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
 {
     // The client's WebContentClient picks up this same session when it is created.
     auto session = session_for_new_view(is_private);
-    auto image_decoder = TRY(launch_image_decoder_process());
 
     auto cross_process_id_allocator = allocate_cross_process_id_allocator();
     auto root_navigable_id = navigable_to_adopt.has_value() ? *navigable_to_adopt : cross_process_id_allocator.allocate();
@@ -1202,7 +1226,6 @@ ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(
     client->async_set_site_compatibility_data(m_site_compatibility_data);
     // A process learns a site's permissions only when it shows that site and asks; at launch, just the defaults.
     client->async_set_permission_snapshot(client->session().permission_manager->snapshot_for({}));
-    connect_to_image_decoder(*client, move(image_decoder));
 
     // NB: A WebDriver BiDi session gives its state to every process hosting web content when it changes.
     if (auto* webdriver_bidi = WebDriverBiDi::the(); webdriver_bidi && webdriver_bidi->session_state().is_active)
@@ -1924,6 +1947,7 @@ ErrorOr<void> Application::launch_services()
         }
     }
 
+    m_image_decoder_manager = make<ImageDecoderManager>();
     TRY(launch_request_server());
     TRY(launch_compositor_process());
 
@@ -2153,11 +2177,6 @@ void Application::configure_request_server_control_client(Requests::RequestContr
     TabPerformanceMonitor::configure(control_client);
 }
 
-void Application::set_image_decoder_exit_handler(u64 child_id, Function<void()> handler)
-{
-    m_image_decoder_exit_handlers.set(child_id, move(handler));
-}
-
 ErrorOr<void> Application::launch_devtools_server()
 {
     VERIFY(!m_devtools);
@@ -2324,10 +2343,11 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     if (m_event_loop->was_exit_requested())
         return;
 
+    m_image_decoder_manager->process_did_exit(process.child_id());
+
     dbgln_if(WEBVIEW_PROCESS_DEBUG, "Process {} died, type: {}", process.pid(), process_name_from_type(process.type()));
 
     auto const& report_name = process.saved_crash_report_name();
-    auto crash_is_shown_in_tab = false;
 
     switch (process.type()) {
     case ProcessType::Compositor:
@@ -2337,8 +2357,7 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         }
         break;
     case ProcessType::ImageDecoder:
-        if (auto handler = m_image_decoder_exit_handlers.take(process.child_id()); handler.has_value())
-            (*handler)();
+        // The processes it served ask for a new one when they next have an image to decode.
         break;
     case ProcessType::MediaServer:
         // The connection's holder launches a new MediaServer when it next connects a client.
@@ -2363,10 +2382,8 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>()) {
             client->did_lose_process();
-            if (!report_name.is_empty()) {
+            if (!report_name.is_empty())
                 client->did_save_crash_report(report_name);
-                crash_is_shown_in_tab = client->has_crashed_views();
-            }
             m_web_content_clients.remove(client.release_nonnull());
         }
         break;
@@ -2381,27 +2398,8 @@ void Application::process_did_exit(Process&& process, Optional<int>)
     if (report_name.is_empty())
         return;
 
-    // The tab's crash screen is this report's one automatic prompt, so it is not offered again. Every other crash is
-    // hidden from the user, so its report is offered right away.
-    if (!crash_is_shown_in_tab) {
-        offer_crash_report(report_name);
-    } else if (!browser_options().headless_mode.has_value()) {
-        if (auto result = CrashReportStore::the().mark_seen(report_name); result.is_error())
-            warnln("Could not mark crash report as seen: {}", result.error());
-    }
-}
-
-void Application::offer_newest_pending_crash_report()
-{
-    if (auto names = CrashReportStore::the().pending_report_names(); !names.is_error() && !names.value().is_empty())
-        offer_crash_report(names.value().first());
-}
-
-void Application::offer_crash_report(ByteString const& report_name)
-{
-    if (browser_options().headless_mode.has_value() || browser_options().webdriver_browser_endpoint.has_value())
-        return;
-    display_crash_report_notification(report_name);
+    // A report waits until it is answered, on a tab's crash screen or in the list of reports.
+    CrashReportOutbox::the().reports_changed();
 }
 
 static bool download_path_is_available(LexicalPath const& path)
@@ -2601,6 +2599,9 @@ NonnullRefPtr<Core::Promise<Empty>> Application::clear_browsing_data(ClearBrowsi
             if (auto result = private_session->session_store->remove_entries_accessed_since(options.since); result.is_error())
                 dbgln("Unable to remove closed private session entries: {}", result.error());
         }
+        if (auto result = CrashReportStore::the().remove_websites_saved_since(options.since); result.is_error())
+            dbgln("Unable to remove the websites of crash reports: {}", result.error());
+        CrashReportOutbox::the().reports_changed();
         did_change_history = true;
     }
 
@@ -3308,6 +3309,11 @@ void Application::toggle_bookmark_for_view(ViewImplementation& view)
 void Application::set_spell_checker(OwnPtr<SpellChecker> spell_checker)
 {
     m_spell_checker = move(spell_checker);
+}
+
+void Application::set_translator(OwnPtr<Translator> translator)
+{
+    m_translator = move(translator);
 }
 
 MicrophoneAuthorizer& Application::microphone_authorizer()

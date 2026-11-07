@@ -65,7 +65,10 @@ def run_test(webdriver_binary, process_name):
             ("XDG_CACHE_HOME", "cache"),
         ):
             environment[variable] = str(Path(temporary) / directory)
-        webdriver, port = webdriver_helpers.launch_webdriver(webdriver_binary, "--headless", env=environment)
+        profile = Path(temporary) / "profile"
+        webdriver, port = webdriver_helpers.launch_webdriver(
+            webdriver_binary, "--headless", f"--profile-path={profile}", env=environment
+        )
         try:
             status, payload, body = webdriver_helpers.request(
                 port,
@@ -106,10 +109,28 @@ def run_test(webdriver_binary, process_name):
                         },
                     )
                     assert status == 200 and payload == {"value": None}, body
+                elif process_name == "ImageDecoder":
+                    # A process gets its decoder when it first has an image to decode.
+                    status, payload, body = webdriver_helpers.request(
+                        port,
+                        "POST",
+                        f"/session/{session}/execute/async",
+                        {
+                            "script": """
+                            const done = arguments[0];
+                            window.image = new Image();
+                            image.onload = () => done();
+                            image.onerror = () => done('image failed');
+                            image.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+                        """,
+                            "args": [],
+                        },
+                    )
+                    assert status == 200 and payload == {"value": None}, body
                 elif process_name == "Compositor":
                     wait_for_compositor(port, session)
                 crash_helper(webdriver.pid, process_name)
-            directory = Path(temporary) / "data/Ladybird/CrashReports"
+            directory = profile / "data/CrashReports"
             deadline = time.monotonic() + webdriver_helpers.EVENT_TIMEOUT_SECONDS
             while True:
                 reports = list(directory.glob(f"*-{process_name}-*.txt"))

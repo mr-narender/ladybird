@@ -95,6 +95,8 @@ static constexpr int HORIZONTAL_WINDOW_ITEM_CENTER = 18;
 static constexpr int HORIZONTAL_WINDOW_CONTROL_HEIGHT = 2 * (HORIZONTAL_WINDOW_ITEM_CENTER - (HORIZONTAL_TAB_STRIP_HEIGHT - HORIZONTAL_TAB_HEIGHT));
 // The first item on the strip is as far from the window's edge as the traffic lights are from its corner on macOS.
 static constexpr int HORIZONTAL_TAB_STRIP_LEADING_MARGIN = use_native_macos_window_controls() ? NATIVE_MACOS_WINDOW_CONTROLS_INSET : 13;
+// The window controls run to the window's edge.
+static constexpr int HORIZONTAL_TAB_STRIP_TRAILING_MARGIN = use_native_macos_window_controls() ? 8 : 0;
 // Horizontal tabs shrink until they are just wide enough for their favicon, and past that the strip scrolls. Below the
 // padded width, a tab gives up the room around its card and its content, until only its favicon is left.
 static constexpr int HORIZONTAL_TAB_MIN_WIDTH = 20;
@@ -295,6 +297,15 @@ static void clear_layout(QLayout& layout)
 static constexpr int vertical_tabs_side_margin(bool expanded)
 {
     return expanded ? VERTICAL_TABS_EXPANDED_SIDE_MARGIN : VERTICAL_TABS_COLLAPSED_SIDE_MARGIN;
+}
+
+// The Ladybird button stays where it is as the sidebar on the left toggles: where the toolbar beside the collapsed
+// sidebar starts, or past the traffic lights while the open sidebar holds them.
+static constexpr int sidebar_ladybird_button_inset(bool after_traffic_lights)
+{
+    if (after_traffic_lights)
+        return NATIVE_MACOS_WINDOW_CONTROLS_INSET + NATIVE_MACOS_WINDOW_CONTROLS_WIDTH + LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP;
+    return TOOLBAR_HORIZONTAL_MARGIN;
 }
 
 static constexpr int vertical_tabs_horizontal_margin_width(TabLayout tab_layout)
@@ -3225,7 +3236,7 @@ TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
     if constexpr (use_native_macos_window_controls()) {
         m_window_controls = create_window_controls_spacer(*this, "LadybirdTabStripWindowControls", { NATIVE_MACOS_WINDOW_CONTROLS_WIDTH, HORIZONTAL_TAB_HEIGHT });
     } else {
-        auto window_control_buttons = create_window_control_buttons(*this, "LadybirdTabStripWindowControls", { 18, 18 }, { 46, HORIZONTAL_WINDOW_CONTROL_HEIGHT });
+        auto window_control_buttons = create_window_control_buttons(*this, "LadybirdTabStripWindowControls", { 16, 16 }, { HORIZONTAL_WINDOW_CONTROL_HEIGHT, HORIZONTAL_WINDOW_CONTROL_HEIGHT });
         m_window_controls = window_control_buttons.container;
         m_minimize_window_button = window_control_buttons.minimize;
         m_maximize_window_button = window_control_buttons.maximize;
@@ -3626,7 +3637,7 @@ void TabWidget::float_sidebar_buttons_while_toggling()
 
     auto& ladybird_buttons = *m_floating_ladybird_buttons;
     auto& toggle = *m_floating_sidebar_toggle;
-    auto ladybird_x = column_origin.x() + (vertical_tabs_hold_window_controls() ? NATIVE_MACOS_WINDOW_CONTROLS_INSET + NATIVE_MACOS_WINDOW_CONTROLS_WIDTH + LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP : vertical_tabs_side_margin(true));
+    auto ladybird_x = column_origin.x() + sidebar_ladybird_button_inset(vertical_tabs_hold_window_controls());
     auto collapsed_toggle_x = ladybird_x + ladybird_buttons.width() + m_toolbar->sidebar_slot().layout()->spacing();
     auto at_edge_x = column_origin.x() + current_vertical_tabs_width() - vertical_tabs_side_margin(true) - SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN - toggle.width();
     toggle.move(max(collapsed_toggle_x, at_edge_x), center_y(toggle));
@@ -3832,7 +3843,8 @@ bool TabWidget::eventFilter(QObject* watched, QEvent* event)
     if ((watched == m_page_column || watched == m_vertical_tabs_content) && (event->type() == QEvent::Move || event->type() == QEvent::Resize))
         place_toolbar_over_page_column();
 
-    if (watched == m_toolbar && event->type() == QEvent::Resize) {
+    // NB: Each step of a sidebar toggle lays out the sidebar itself, with the pictures of its buttons on top.
+    if (watched == m_toolbar && event->type() == QEvent::Resize && !slides_page_with_toggling_sidebar()) {
         update_vertical_tabs_column_margins();
         update_tab_layout();
     }
@@ -4151,7 +4163,7 @@ void TabWidget::rebuild_layout_for_horizontal_tabs()
 {
     m_tab_bar_row->setMinimumHeight(HORIZONTAL_TAB_STRIP_HEIGHT);
     m_tab_bar_row_layout->setSpacing(0);
-    m_tab_bar_row_layout->setContentsMargins(HORIZONTAL_TAB_STRIP_LEADING_MARGIN, HORIZONTAL_TAB_STRIP_HEIGHT - HORIZONTAL_TAB_HEIGHT, 8, 0);
+    m_tab_bar_row_layout->setContentsMargins(HORIZONTAL_TAB_STRIP_LEADING_MARGIN, HORIZONTAL_TAB_STRIP_HEIGHT - HORIZONTAL_TAB_HEIGHT, HORIZONTAL_TAB_STRIP_TRAILING_MARGIN, 0);
 
     set_dynamic_property_if_needed(*m_new_tab_button, VERTICAL_TABS_EXPANDED_PROPERTY, false);
     set_dynamic_property_if_needed(*m_new_tab_button, VERTICAL_TABS_BUTTON_PROPERTY, true);
@@ -4362,8 +4374,6 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
     set_dynamic_property_if_needed(*m_vertical_tab_bar_column, VERTICAL_TABS_POSITION_PROPERTY, vertical_tabs_position_property_value(m_vertical_tabs_position));
 
     m_vertical_tab_bar_column_layout->setSpacing(0);
-    if (auto* window_controls_layout = m_window_controls->layout())
-        window_controls_layout->setContentsMargins(0, 0, 0, 0);
     update_vertical_tabs_column_margins();
 
     update_vertical_tabs_button_layout();
@@ -4387,8 +4397,7 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
             top_row_layout->addStretch(1);
             top_row_layout->addWidget(m_ladybird_buttons, 0, Qt::AlignVCenter);
         } else {
-            if (vertical_tabs_hold_window_controls())
-                top_row_layout->addSpacing(NATIVE_MACOS_WINDOW_CONTROLS_INSET + NATIVE_MACOS_WINDOW_CONTROLS_WIDTH + LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP - vertical_tabs_side_margin(true));
+            top_row_layout->addSpacing(sidebar_ladybird_button_inset(vertical_tabs_hold_window_controls()) - vertical_tabs_side_margin(true));
             top_row_layout->addWidget(m_ladybird_buttons, 0, Qt::AlignVCenter);
             top_row_layout->addStretch(1);
             top_row_layout->addSpacing(SIDEBAR_TOGGLE_MINIMUM_GAP);
@@ -4498,8 +4507,13 @@ void TabWidget::place_toolbar_over_page_column()
         m_page_column_layout->activate();
     }
 
+    // NB: The toolbar lies over the page rather than in a layout, so its stand-in keeps the window wide enough for it.
+    m_toolbar_placeholder->setMinimumWidth(m_toolbar->minimumSizeHint().width());
+
     auto position = m_page_column->mapTo(this, QPoint());
-    m_toolbar->setGeometry(position.x(), position.y(), m_page_column->width(), m_toolbar_placeholder->height());
+    // NB: While the sidebar toggles, the page reaches past the window's edge, but the toolbar stays within the window.
+    auto toolbar_width = min(m_page_column->width(), width() - position.x());
+    m_toolbar->setGeometry(position.x(), position.y(), toolbar_width, m_toolbar_placeholder->height());
     m_toolbar->stackUnder(m_vertical_tab_bar_column);
 
     // Reparenting the page column when switching tab layouts can put its placeholder above the toolbar.
@@ -4671,8 +4685,10 @@ void TabWidget::update_tab_layout()
     auto margins = m_tab_bar_row_layout->contentsMargins();
     auto controls_width = margins.left() + margins.right() + HORIZONTAL_NEW_TAB_BUTTON_GAP - HORIZONTAL_TAB_END_ROOM + HORIZONTAL_NEW_TAB_BUTTON_SIZE + horizontal_tab_strip_drag_space();
     controls_width += m_ladybird_buttons->sizeHint().width() + LADYBIRD_BUTTONS_TRAILING_GAP - HORIZONTAL_TAB_END_ROOM;
+    // NB: This is the room the window controls need, and not their width, which shrinks along with a strip that is too
+    //     narrow for them. The minimum width below would then follow it down.
     if (!m_window_controls->isHidden())
-        controls_width += m_window_controls->width() + (use_native_macos_window_controls() ? LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP : 0);
+        controls_width += m_window_controls->sizeHint().expandedTo(m_window_controls->minimumSize()).width() + (use_native_macos_window_controls() ? LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP : 0);
 
     auto available_for_tabs = width() - controls_width;
     auto pinned_count = m_tab_bar->pinned_tab_count();
@@ -4989,8 +5005,14 @@ void TabBarButton::paintEvent(QPaintEvent*)
     // The speaker in the sidebar and both badges in the collapsed sidebar take the icon color, rather than the tabs'
     // quieter one.
     auto takes_icon_color = m_placement == Placement::RailBadge || (m_placement == Placement::SidebarRow && m_role == Role::Audio);
+    auto icon_mode = isEnabled() ? QIcon::Normal : QIcon::Disabled;
     if (takes_icon_color && isEnabled() && ChromeStyle::window_activity(*this) == ChromeStyle::WindowActivity::Active)
-        option.icon = QIcon(icon().pixmap(iconSize(), devicePixelRatioF(), QIcon::Active));
+        icon_mode = QIcon::Active;
+
+    // NB: The style would draw the icon into a whole number of logical pixels. Where that isn't a whole number of device
+    //     pixels, 14 px at 1.25x for one, the picture is resampled to fit and comes out blurry, so it is drawn here.
+    auto icon_pixmap = icon().pixmap(iconSize(), devicePixelRatioF(), icon_mode);
+    option.icon = {};
 
     QStylePainter painter(this);
     painter.setOpacity(m_opacity);
@@ -5011,6 +5033,7 @@ void TabBarButton::paintEvent(QPaintEvent*)
     }
 
     painter.drawControl(QStyle::CE_PushButton, option);
+    painter.drawPixmap(QStyle::alignedRect(layoutDirection(), Qt::AlignCenter, iconSize(), rect()).topLeft(), icon_pixmap);
 }
 
 }

@@ -442,6 +442,7 @@ class AbortController;
 class AbortSignal;
 class AbstractElement;
 class AbstractRange;
+class AccessibilityChangeTracker;
 class AccessibilityTreeNode;
 class AnchorNameMap;
 class Attr;
@@ -503,6 +504,12 @@ enum class UpdateLayoutReason;
 using HTMLSerializationOptions = Bindings::GetHTMLOptions;
 using ShadowRootMode = Bindings::ShadowRootMode;
 using SlotAssignmentMode = Bindings::SlotAssignmentMode;
+
+}
+
+namespace Web::Translation {
+
+class DocumentTranslator;
 
 }
 
@@ -716,6 +723,7 @@ class HTMLOListElement;
 class HTMLOptGroupElement;
 class HTMLOptionElement;
 class HTMLOptionsCollection;
+class HTMLOrSVGScriptElement;
 class HTMLOutputElement;
 class HTMLParagraphElement;
 class HTMLParamElement;
@@ -805,7 +813,6 @@ class Timer;
 class TimeRanges;
 class ToggleEvent;
 class TrackEvent;
-class TransferDataDecoder;
 class UserActivation;
 class UserScrollGestureHold;
 class ValidityState;
@@ -1210,7 +1217,6 @@ namespace Web::WebGL {
 
 class RemoteWebGLTransport;
 class WebGL2RenderingContext;
-class WebGLContextEvent;
 class WebGLRenderingContext;
 class WebGLRenderingContextBase;
 
@@ -1241,9 +1247,7 @@ struct InputState;
 namespace Web::WebLocks {
 
 class Lock;
-class LockData;
 class LockManager;
-class LockRequest;
 class NavigatorLocks;
 
 }

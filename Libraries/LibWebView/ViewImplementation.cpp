@@ -31,6 +31,7 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/BookmarkStore.h>
 #include <LibWebView/CanonicalSessionHistoryEntry.h>
+#include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportReview.h>
 #include <LibWebView/ErrorHTML.h>
 #include <LibWebView/FaviconStore.h>
@@ -38,6 +39,7 @@
 #include <LibWebView/HistoryDebug.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/Menu.h>
+#include <LibWebView/PageTranslation.h>
 #include <LibWebView/PermissionManager.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/TabPerformanceMonitor.h>
@@ -94,6 +96,7 @@ ViewImplementation::ViewImplementation(IsPrivate is_private)
     all_views().set(m_view_id, this);
 
     initialize_context_menus();
+    m_page_translation = make<PageTranslation>(*this);
 
     m_repeated_crash_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(1000), [this] {
         // Reset the "crashing a lot" counter after 1 second in case we just
@@ -347,6 +350,7 @@ void ViewImplementation::did_change_ongoing_navigation(Badge<CanonicalNavigable>
 
 void ViewImplementation::did_change_active_document(Badge<CanonicalTraversable>)
 {
+    m_page_translation->did_change_active_document();
     // A prompt the document that asked has left behind goes unanswered: the user ignored it.
     ignore_pending_permission_prompts();
     report_permission_presence();
@@ -1620,6 +1624,7 @@ void ViewImplementation::send_preferences_to_page(WebContentPage& page)
     auto* spell_checker = Application::the().spell_checker();
     page.async_set_spell_checking_available(spell_checker != nullptr);
     page.async_set_writing_suggestions_available(spell_checker && spell_checker->can_suggest());
+    m_page_translation->did_create_page(page);
     send_geolocation_emulated_position(page);
     page.async_set_has_picture_in_picture_support(Application::the().supports_picture_in_picture());
 }
@@ -3341,6 +3346,7 @@ void ViewImplementation::did_cancel_loading(Badge<CanonicalNavigable>, bool canc
 void ViewImplementation::did_finish_navigation()
 {
     set_loading_state(false);
+    m_page_translation->did_finish_loading();
 
     if (!m_webdriver_navigation_observation.has_value())
         return;
@@ -4380,6 +4386,14 @@ void ViewImplementation::did_save_crash_report(ByteString report_name)
     if (!m_crash_state.has_value())
         return;
     m_crash_state->report_name = move(report_name);
+
+    // It stays on this computer unless the user chooses to include it, and a private window leaves no trace of it.
+    if (auto website = crash_report_website(); website.has_value() && is_private() == IsPrivate::No) {
+        if (auto result = CrashReportStore::the().save_website(m_crash_state->report_name, *website); result.is_error())
+            warnln("Could not save the website of a crash report: {}", result.error());
+        CrashReportOutbox::the().reports_changed();
+    }
+
     if (on_crash_report_saved)
         on_crash_report_saved();
 }
@@ -4401,13 +4415,7 @@ Optional<String> ViewImplementation::crash_report_website() const
 {
     if (!m_crash_state.has_value())
         return {};
-    auto const& failed_url = m_crash_state->failed_url;
-    if (failed_url.scheme() != "http"sv && failed_url.scheme() != "https"sv)
-        return {};
-    auto serialized_url = failed_url.serialize();
-    if (serialized_url.bytes().size() > CrashReportReview::maximum_url_bytes)
-        return {};
-    return serialized_url;
+    return CrashReportReview::website_from_url(m_crash_state->failed_url);
 }
 
 String ViewImplementation::force_dark_host() const
@@ -5511,12 +5519,8 @@ void ViewImplementation::did_request_page_context_menu(Badge<WebContentPage>, We
     });
 }
 
-void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<u64> text_fragment_generation_id)
+void ViewImplementation::add_link_actions(Menu& menu, Web::HTML::PreparedNavigationDescriptor const& navigation)
 {
-    request_text_fragment_url(text_fragment_generation_id);
-    prepare_inspect_element_action(content_position);
-    ++m_context_menu_request_id;
-
     auto url = navigation.url;
     auto copy_url_text = [&] {
         switch (url_type(url)) {
@@ -5530,27 +5534,38 @@ void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gf
         VERIFY_NOT_REACHED();
     }();
 
-    auto menu = Menu::create("Link Context Menu"sv);
-    add_open_url_actions(*menu, url, navigation);
-    menu->add_separator();
-    menu->add_action(create_copy_url_action(copy_url_text, url));
-    menu->add_action(Action::create("Download Linked File"sv, ActionID::DownloadLinkedFile, [this, url]() {
+    add_open_url_actions(menu, url, navigation);
+    menu.add_separator();
+    menu.add_action(create_copy_url_action(copy_url_text, url));
+    menu.add_action(Action::create("Download Linked File"sv, ActionID::DownloadLinkedFile, [this, url]() {
         download_url(url, PromptForPath::No);
     }));
-    menu->add_action(Action::create("Save Link As…"sv, ActionID::DownloadLinkedFileAs, [this, url]() {
+    menu.add_action(Action::create("Save Link As…"sv, ActionID::DownloadLinkedFileAs, [this, url]() {
         download_url(url, PromptForPath::Yes);
     }));
+}
+
+void ViewImplementation::did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<u64> text_fragment_generation_id)
+{
+    request_text_fragment_url(text_fragment_generation_id);
+    prepare_inspect_element_action(content_position);
+    ++m_context_menu_request_id;
+
+    auto menu = Menu::create("Link Context Menu"sv);
+    add_link_actions(*menu, navigation);
     menu->add_action(*m_copy_link_to_highlight_action);
     menu->add_separator();
     menu->add_action(*m_inspect_element_action);
     open_context_menu(move(menu), content_position);
 }
 
-void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_for_path)
+void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_for_path, Optional<String> const& image_mime_type)
 {
     // URLs with an opaque path, such as data: URLs, do not contain a usable filename, so the default filename is
     // used instead.
     auto suggested_filename = url.has_an_opaque_path() ? ByteString {} : url.basename();
+    if (image_mime_type.has_value())
+        suggested_filename = image_filename_with_extension(move(suggested_filename), *image_mime_type);
 
     if (prompt_for_path == PromptForPath::No) {
         if (auto download_path = Application::the().default_path_for_downloaded_file(suggested_filename); !download_path.is_error())
@@ -5567,7 +5582,7 @@ void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_
     });
 }
 
-void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap)
+void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type)
 {
     prepare_inspect_element_action(content_position);
     ++m_context_menu_request_id;
@@ -5586,6 +5601,10 @@ void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, G
     copy_image_action->set_enabled(bitmap.has_value());
 
     auto menu = Menu::create("Image Context Menu"sv);
+    if (link_navigation.has_value()) {
+        add_link_actions(*menu, *link_navigation);
+        menu->add_separator();
+    }
     add_open_in_new_tab_action(*menu, "Open Image in New Tab"sv, url, navigation);
     menu->add_action(Action::create("Open Image"sv, ActionID::OpenImage, [this, navigation]() {
         load(navigation);
@@ -5593,8 +5612,8 @@ void ViewImplementation::did_request_image_context_menu(Badge<WebContentPage>, G
     menu->add_separator();
     menu->add_action(move(copy_image_action));
     menu->add_action(create_copy_url_action("Copy Image Address"sv, url));
-    menu->add_action(Action::create("Save Image As…"sv, ActionID::SaveImage, [this, url]() {
-        download_url(url, PromptForPath::Yes);
+    menu->add_action(Action::create("Save Image As…"sv, ActionID::SaveImage, [this, url, image_mime_type = move(image_mime_type)]() {
+        download_url(url, PromptForPath::Yes, image_mime_type);
     }));
     menu->add_separator();
     menu->add_action(*m_inspect_element_action);

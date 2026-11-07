@@ -75,7 +75,7 @@ private:
     void push_mask(Compositing::ReplayMask const&, Compositing::ReplayLayer const* backdrop) override;
     void pop_mask(Compositing::ReplayMask const&, Compositing::EffectNodeIndex) override;
     void pop() override;
-    void push_device_space_plane_clip(Gfx::Path const&) override;
+    void push_device_space_plane_clip(ReadonlySpan<Gfx::FloatVector3> polygon_vertices) override;
 
     void clip_path(SkPath, Gfx::WindingRule, bool anti_aliased);
 
@@ -83,7 +83,7 @@ private:
     sk_sp<SkImageFilter> layer_image_filter(Compositing::ReplayLayer const&);
     sk_sp<SkImageFilter> backdrop_image_filter(Compositing::ReplayLayer const&, bool limited_to_region);
     sk_sp<SkImageFilter> image_filter_from_bytes(ReadonlyBytes, Optional<Gfx::FloatRect> blur_edge = {});
-    Gfx::Path path_from_data(Compositing::DisplayListDataSpan) const;
+    SkPath path_from_data(Compositing::DisplayListDataSpan) const;
     sk_sp<SkImage> rasterize_records_into_tile(ReadonlyBytes tile_records, Gfx::IntRect tile_rect);
     ReadonlySpan<Color> gradient_colors(Compositing::DisplayListGradientColorStops) const;
     ReadonlySpan<float> gradient_positions(Compositing::DisplayListGradientColorStops) const;

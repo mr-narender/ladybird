@@ -42,6 +42,7 @@ from Generators.libweb_bindings.rust_names import rust_identifier
 from Generators.libweb_bindings.rust_names import rust_local_name
 from Generators.libweb_bindings.rust_overloads import write_constructor_overload_resolution
 from Generators.libweb_bindings.rust_overloads import write_operation_overload_resolution
+from Generators.libweb_bindings.rust_structured_serialize import write_rust_serializable_dispatch
 from Generators.libweb_bindings.rust_to_idl_value import rust_default_value
 from Generators.libweb_bindings.rust_to_idl_value import rust_to_idl_value
 from Generators.libweb_bindings.rust_to_idl_value import write_any_interface_from_js
@@ -89,8 +90,7 @@ SUPPORTED_INTERFACE_EXTENDED_ATTRIBUTES = {
     "NavigatorCompatibilityMode",
     "SecureContext",
     # NB: The implementation implements structured_data::Serializable or structured_data::Transferable, whose steps
-    #     StructuredSerialize of LibWeb's C++ runs through the entry points that write_rust_structured_data_entry_points()
-    #     writes.
+    #     crate::html::structured_serialize runs.
     "Serializable",
     "Transferable",
 }
@@ -154,8 +154,6 @@ def check_interface_is_supported(interface: Interface, module: Module, context: 
         fail(
             f"it inherits from {interface.parent_name}, which is neither implemented in Rust nor one of {CPP_PARENT_INTERFACES}"
         )
-    if module.callback_functions:
-        fail("its module defines callback functions")
 
     for other in inheriting_interfaces(interface, context):
         if not is_implemented_in_rust(other):
@@ -807,11 +805,24 @@ def implementation_method_signatures(
                 "WebIdlResult<()>"
             )
     for operation_set in members.operation_sets:
+        written_methods = set()
         for overload in operation_set.overloads:
-            if overload.is_default_to_json:
+            if overload.is_default_to_json or overload.method in written_methods:
                 continue
+            written_methods.add(overload.method)
             what = f"{interface.name}.{operation_set.name}()"
-            parameters = parameter_list(what, overload.operation.parameters)
+            if overload.implementation_parameters is not None:
+                parameters = "".join(
+                    f", {rust_identifier(parameter.name)}: "
+                    + (
+                        f"Option<{rust_parameter_type(parameter, context, what)}>"
+                        if index == overload.omitted_parameter_index
+                        else rust_parameter_type(parameter, context, what)
+                    )
+                    for index, parameter in enumerate(overload.implementation_parameters)
+                )
+            else:
+                parameters = parameter_list(what, overload.operation.parameters)
             signatures.append(
                 f"fn {overload.method}(&self, cx: &mut CallContext{parameters}) -> "
                 f"WebIdlResult<{rust_type(overload.operation.return_type, context, what, is_result=True)}>"
@@ -1132,7 +1143,6 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
     use crate::bindings::callback::{CallbackFunction, CallbackInterface, PromiseCallbackFunction};
     use crate::bindings::event_target::{event_handler_attribute, set_event_handler_attribute};
     use crate::bindings::promise::WebIdlPromise;
-    use crate::bindings::structured_data;
     use crate::bindings::{CallContext, WebIdlResult, with_custom_element_reactions};
 """
 
@@ -1481,7 +1491,6 @@ def write_rust_interface(
     }}
 """
         )
-    write_rust_structured_data_entry_points(out, interface)
     out.write("}\n")
 
 
@@ -2021,104 +2030,6 @@ def write_rust_static_operation(
     out.write("    }\n")
 
 
-def write_rust_structured_data_entry_points(out: TextIO, interface: Interface) -> None:
-    """The entry points through which StructuredSerialize of LibWeb's C++ runs the steps of an interface that is
-    serializable or transferable, which Meta/Generators/libweb_bindings/structured_serialize.py declares."""
-    if "Serializable" in interface.extended_attributes:
-        out.write(
-            f"""
-    /// The serialization steps of the interface, for StructuredSerialize of LibWeb's C++.
-    ///
-    /// # Safety
-    ///
-    /// The pointers must be the VM, a live realm, the live cell of an object of the interface, and a lent writer.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn {rust_entry_point_name(interface, "serialization_steps")}(
-        vm: *mut c_void,
-        realm: *mut c_void,
-        cell: *mut c_void,
-        serialized: *mut c_void,
-        for_storage: bool,
-    ) -> RawNativeFunctionResult {{
-        // SAFETY: The caller passes live pointers.
-        unsafe {{ structured_data::serialization_steps::<Implementation>(vm, realm, cell, serialized, for_storage) }}
-    }}
-
-    /// The deserialization steps of the interface, which return the wrapper of the new object.
-    ///
-    /// # Safety
-    ///
-    /// The pointers must be the VM, a live realm, and a lent reader.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn {rust_entry_point_name(interface, "deserialization_steps")}(
-        vm: *mut c_void,
-        realm: *mut c_void,
-        serialized: *mut c_void,
-    ) -> RawNativeFunctionResult {{
-        // SAFETY: The caller passes live pointers.
-        unsafe {{ structured_data::deserialization_steps::<Implementation>(vm, realm, serialized) }}
-    }}
-"""
-        )
-    if "Transferable" in interface.extended_attributes:
-        out.write(
-            f"""
-    /// The [[Detached]] internal slot of an object of the interface, for StructuredSerialize of LibWeb's C++.
-    ///
-    /// # Safety
-    ///
-    /// The cell must be the live cell of an object of the interface.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn {rust_entry_point_name(interface, "is_detached")}(cell: *mut c_void) -> bool {{
-        // SAFETY: The caller passes a live cell.
-        unsafe {{ structured_data::is_detached::<Implementation>(cell) }}
-    }}
-
-    /// Sets the [[Detached]] internal slot of an object of the interface to true.
-    ///
-    /// # Safety
-    ///
-    /// The cell must be the live cell of an object of the interface.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn {rust_entry_point_name(interface, "set_detached")}(cell: *mut c_void) {{
-        // SAFETY: The caller passes a live cell.
-        unsafe {{ structured_data::set_detached::<Implementation>(cell) }}
-    }}
-
-    /// The transfer steps of the interface.
-    ///
-    /// # Safety
-    ///
-    /// The pointers must be the VM, a live realm, the live cell of an object of the interface, and a lent data holder.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn {rust_entry_point_name(interface, "transfer_steps")}(
-        vm: *mut c_void,
-        realm: *mut c_void,
-        cell: *mut c_void,
-        data_holder: *mut c_void,
-    ) -> RawNativeFunctionResult {{
-        // SAFETY: The caller passes live pointers.
-        unsafe {{ structured_data::transfer_steps::<Implementation>(vm, realm, cell, data_holder) }}
-    }}
-
-    /// The transfer-receiving steps of the interface, which return the wrapper of the new object.
-    ///
-    /// # Safety
-    ///
-    /// The pointers must be the VM, a live realm, and a lent data holder.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn {rust_entry_point_name(interface, "transfer_receiving_steps")}(
-        vm: *mut c_void,
-        realm: *mut c_void,
-        data_holder: *mut c_void,
-    ) -> RawNativeFunctionResult {{
-        // SAFETY: The caller passes live pointers.
-        unsafe {{ structured_data::transfer_receiving_steps::<Implementation>(vm, realm, data_holder) }}
-    }}
-"""
-        )
-
-
 def write_this_implementation(out: TextIO, context: GenerationContext, interface: Interface) -> None:
     """The function that finds what an attribute or an operation of the interface runs on. For an interface that
     others inherit from, that is an object of any of them, which the implementation of each reaches the inherited
@@ -2377,6 +2288,13 @@ def write_rust_operation(
         steps.write("        drop(type_error_realm_scope);\n")
     arguments = "".join(f", {rust_local_name(parameter.name)}" for parameter in operation.parameters)
     returns_promise = is_promise_type(operation.return_type) and not operation.return_type.nullable
+    if overload.implementation_parameters is not None:
+        arguments = ""
+        for index, parameter in enumerate(overload.implementation_parameters):
+            argument = rust_local_name(parameter.name)
+            if index == overload.omitted_parameter_index:
+                argument = f"Some({argument})" if parameter in operation.parameters else "None"
+            arguments += f", {argument}"
     call = f"Implementation::{overload.method}(&implementation, &mut cx{arguments})"
     if "CEReactions" in operation.extended_attributes:
         if returns_promise:
@@ -2555,6 +2473,7 @@ def write_rust_bindings(
             write_rust_namespace(out, context, interface)
         else:
             write_rust_interface(out, context, module, interface, values[interface.name])
+    write_rust_serializable_dispatch(out, intrinsics, values)
     write_rust_wrap_for_cpp(out, context, usage)
 
 

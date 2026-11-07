@@ -25,16 +25,19 @@ use libwebcommon_rust::html::serialization_records::{DecodeError, DecodedString,
 
 use crate::bindings::WebIdlResult;
 use crate::html::structured_serialize::cpp::{
-    ReceivedIPCSerializationRecord, SharedBuffers, data_clone_error_from_serialization_error, is_ipc_interface,
-    serializable_interface_name_from_storage_identifier,
+    ReceivedIPCSerializationRecord, data_clone_error_from_serialization_error,
 };
 use crate::html::structured_serialize::message_record::MessageRecord;
+use crate::html::structured_serialize::serializable::{
+    is_ipc_interface, serializable_interface_name_from_storage_identifier,
+};
 
 /// Where the record keeps the SharedArrayBuffers that it shares.
 #[derive(Clone, Copy)]
 enum SharedArrayBuffers<'a> {
     None,
-    Lent(ReceivedIPCSerializationRecord<'a>, Option<SharedBuffers>),
+    /// The side table of a record that C++ lends.
+    Lent(ReceivedIPCSerializationRecord<'a>),
     Message(&'a MessageRecord),
 }
 
@@ -45,15 +48,11 @@ pub(crate) struct StructuredSerializeReader<'a> {
 }
 
 impl<'a> StructuredSerializeReader<'a> {
-    pub(crate) fn new_ipc(
-        realm: Gc<Realm>,
-        record: ReceivedIPCSerializationRecord<'a>,
-        shared_buffers: Option<SharedBuffers>,
-    ) -> Self {
+    pub(crate) fn new_ipc(realm: Gc<Realm>, record: ReceivedIPCSerializationRecord<'a>) -> Self {
         Self {
             decoder: RecordDecoder::new(SerializationType::Ipc, record.data()).expect("an IPC record has no prologue"),
             realm,
-            shared_array_buffers: SharedArrayBuffers::Lent(record, shared_buffers),
+            shared_array_buffers: SharedArrayBuffers::Lent(record),
         }
     }
 
@@ -200,31 +199,25 @@ impl<'a> StructuredSerializeReader<'a> {
         index: u32,
         shared_object_id: u64,
     ) -> WebIdlResult<Value> {
-        let index_out_of_range =
-            || data_clone_error_from_serialization_error(self.realm, "SharedArrayBuffer side-list index out of range");
-        match self.shared_array_buffers {
-            SharedArrayBuffers::Lent(_, Some(shared_buffers)) => {
-                shared_buffers.shared_array_buffer(self.realm, index, shared_object_id)
-            }
-            SharedArrayBuffers::Message(record) => {
-                let shared_memory = record
-                    .shared_memory
-                    .get(index as usize)
-                    .ok_or_else(index_out_of_range)?;
-                let array_buffer = ArrayBuffer::create_from_shared_memory(
-                    vm,
-                    self.realm,
-                    shared_memory.descriptor.as_shared_memory(),
-                    shared_memory.size,
-                    shared_object_id,
-                )
-                .map_err(|_| {
-                    data_clone_error_from_serialization_error(self.realm, "Unable to map SharedArrayBuffer memory")
-                })?;
-                Ok(Value::from_object(array_buffer))
-            }
-            SharedArrayBuffers::None | SharedArrayBuffers::Lent(_, None) => Err(index_out_of_range()),
-        }
+        let shared_memory = match self.shared_array_buffers {
+            SharedArrayBuffers::None | SharedArrayBuffers::Lent(_) => &[],
+            SharedArrayBuffers::Message(record) => record.shared_memory.as_slice(),
+        };
+        let Some(shared_memory) = shared_memory.get(index as usize) else {
+            return Err(data_clone_error_from_serialization_error(
+                self.realm,
+                "SharedArrayBuffer side-list index out of range",
+            ));
+        };
+        let array_buffer = ArrayBuffer::create_from_shared_memory(
+            vm,
+            self.realm,
+            shared_memory.descriptor.as_shared_memory(),
+            shared_memory.size,
+            shared_object_id,
+        )
+        .map_err(|_| data_clone_error_from_serialization_error(self.realm, "Unable to map SharedArrayBuffer memory"))?;
+        Ok(Value::from_object(array_buffer))
     }
 
     /// A new SharedArrayBuffer that shares the storage of the buffer at the index of the record's same-process side
@@ -238,7 +231,7 @@ impl<'a> StructuredSerializeReader<'a> {
     ) -> Option<Gc<ArrayBuffer>> {
         let source_buffer = match self.shared_array_buffers {
             SharedArrayBuffers::None => return None,
-            SharedArrayBuffers::Lent(record, _) => record.shared_array_buffer(side_table_index)?,
+            SharedArrayBuffers::Lent(record) => record.shared_array_buffer(side_table_index)?,
             SharedArrayBuffers::Message(record) => *record.shared_array_buffers.get(side_table_index as usize)?,
         };
         array_buffer_sharing_storage_with(vm, self.realm, source_buffer, byte_length, preserve_growability)

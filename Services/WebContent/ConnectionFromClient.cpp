@@ -94,6 +94,7 @@
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
@@ -452,10 +453,9 @@ void ConnectionFromClient::connect_to_web_ui(Web::PageId page_id, IPC::Transport
     }
 }
 
-void ConnectionFromClient::connect_to_image_decoder(IPC::TransportHandle handle)
+void ConnectionFromClient::disconnect_from_image_decoder()
 {
-    if (on_image_decoder_connection)
-        on_image_decoder_connection(handle);
+    static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).disconnect_client();
 }
 
 void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle)
@@ -514,6 +514,14 @@ ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_webrtc_clie
     auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestWebrtcClientConnection>();
     if (!response || !response->handle().has_value())
         return Error::from_string_literal("The Browser did not launch a WebRTCClient");
+    return response->take_handle()->create_transport();
+}
+
+ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_image_decoder_transport()
+{
+    auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestImageDecoderConnection>();
+    if (!response || !response->handle().has_value())
+        return Error::from_string_literal("The Browser did not connect an image decoder");
     return response->take_handle()->create_transport();
 }
 
@@ -3626,6 +3634,30 @@ void ConnectionFromClient::did_get_writing_suggestion(Web::PageId page_id, u64 r
 {
     if (auto page = this->page(page_id); page.has_value())
         page->page().did_get_writing_suggestion(request_id, move(suggestion));
+}
+
+void ConnectionFromClient::request_translation_language_sample(Web::PageId page_id, u64 request_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        async_did_get_translation_language_sample(page_id, request_id, page->page().translation_language_sample());
+}
+
+void ConnectionFromClient::start_translation(Web::PageId page_id, String source_language, String target_language)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().start_translation(move(source_language), move(target_language));
+}
+
+void ConnectionFromClient::stop_translation(Web::PageId page_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().stop_translation();
+}
+
+void ConnectionFromClient::did_translate(Web::PageId page_id, Web::TranslatedUnit unit)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().did_translate(move(unit));
 }
 
 void ConnectionFromClient::replace_context_menu_misspelling(Web::PageId page_id, Utf16String replacement)

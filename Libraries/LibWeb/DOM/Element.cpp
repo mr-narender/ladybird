@@ -149,10 +149,12 @@
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
+#include <LibWeb/MathML/MathMLAnchorElement.h>
 #include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/MathML/TagNames.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Page/PageHoverLink.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
@@ -611,7 +613,7 @@ bool Element::cannot_navigate() const
         return true;
 
     // - element is not an a element and is not connected.
-    return !(is_html_anchor_element() || is_svg_a_element()) && !is_connected();
+    return !(is_html_anchor_element() || is_svg_a_element() || is_mathml_anchor_element()) && !is_connected();
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#links-created-by-a-and-area-elements
@@ -620,6 +622,8 @@ HTML::HTMLHyperlinkElementUtils const* Element::created_hyperlink() const
     HTML::HTMLHyperlinkElementUtils const* hyperlink_element = as_if<HTML::HTMLAnchorElement>(*this);
     if (!hyperlink_element)
         hyperlink_element = as_if<HTML::HTMLAreaElement>(*this);
+    if (!hyperlink_element)
+        hyperlink_element = as_if<MathML::MathMLAnchorElement>(*this);
     if (!hyperlink_element)
         return nullptr;
 
@@ -646,7 +650,7 @@ void Element::follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML:
     Utf16String target_attribute_value;
 
     // 3. If subject is an a or area element, then set targetAttributeValue to the result of getting an element's target given subject.
-    if (is_html_anchor_element() || is_html_area_element() || is_svg_a_element())
+    if (is_html_anchor_element() || is_html_area_element() || is_svg_a_element() || is_mathml_anchor_element())
         target_attribute_value = get_an_elements_target();
 
     // 4. Let urlRecord be the result of encoding-parsing a URL given subject's href attribute value, relative to subject's node document.
@@ -1947,6 +1951,9 @@ void Element::swap_in_style_record(Layout::BegunRead const& read, Optional<CSS::
 {
     if (pseudo_element.has_value()) {
         VERIFY(is_synthetic_pseudo_element(*pseudo_element));
+        // NB: The compositor animations of a pseudo-element keep the values they took from its style for as long as
+        //     the generation of its element stays the same.
+        ++m_animation_style_generation;
         if (record)
             ensure_synthetic_pseudo_element(*pseudo_element).swap_in_style_record(read, record);
         else if (auto existing_pseudo_element = get_synthetic_pseudo_element(*pseudo_element); existing_pseudo_element.has_value())
@@ -3196,6 +3203,16 @@ void Element::record_style_environment_change()
     document().style_computer().style_engine().record_derived_element_style_input_change(style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 }
 
+void Element::update_hover_link()
+{
+    if (m_style_node_id == 0)
+        return;
+    Optional<Utf16String> href;
+    if (created_hyperlink())
+        href = attribute(HTML::AttributeNames::href);
+    document().hover_link_reporter().set_link(m_style_node_id.value(), move(href));
+}
+
 void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
 {
     if (m_style_node_id == style_node_id)
@@ -3204,6 +3221,11 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
     auto old_style_node_id = m_style_node_id;
     m_style_node_id = style_node_id;
     Layout::Node::dom_node_style_node_changed(*this, old_style_node_id);
+    if (created_hyperlink()) {
+        if (old_style_node_id != 0)
+            document().hover_link_reporter().set_link(old_style_node_id.value(), {});
+        update_hover_link();
+    }
     // An element keeps the random base values of its own keys for its whole life: it holds them while it has no style
     // node, and its next one takes them back.
     auto& style_engine = document().style_computer().style_engine();
@@ -3355,7 +3377,7 @@ bool Element::matches_placeholder_shown_pseudo_class() const
 bool Element::matches_link_pseudo_class() const
 {
     // All a elements that have an href attribute, and all area elements that have an href attribute, must match one of :link and :visited.
-    if (!is<HTML::HTMLAnchorElement>(*this) && !is<HTML::HTMLAreaElement>(*this) && !is<SVG::SVGAElement>(*this))
+    if (!is<HTML::HTMLAnchorElement>(*this) && !is<HTML::HTMLAreaElement>(*this) && !is<SVG::SVGAElement>(*this) && !is<MathML::MathMLAnchorElement>(*this))
         return false;
     return has_attribute(HTML::AttributeNames::href);
 }
@@ -5427,6 +5449,8 @@ void Element::set_computed_style(Layout::BegunRead const& read, Optional<CSS::Ps
     note_subtree_style_moved();
     if (pseudo_element_type.has_value()) {
         VERIFY(is_synthetic_pseudo_element(*pseudo_element_type));
+        // NB: As for a pseudo-element's style record, see swap_in_style_record().
+        ++m_animation_style_generation;
         if (style)
             ensure_synthetic_pseudo_element(*pseudo_element_type).set_computed_style(read, move(style));
         else if (auto existing_pseudo_element = get_synthetic_pseudo_element(*pseudo_element_type); existing_pseudo_element.has_value())

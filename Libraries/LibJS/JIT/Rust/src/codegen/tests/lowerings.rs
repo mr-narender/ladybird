@@ -314,12 +314,26 @@ fn run_program_with_snapshot(
     prepare_snapshot: impl FnOnce(&mut Snapshot),
     prepare: impl FnOnce(&mut Machine),
 ) -> (JitResult, Machine) {
+    let (snapshot, compiled) = compile_program(program, prepare_snapshot);
+    run_compiled_program(&snapshot, &compiled, arguments, prepare)
+}
+
+fn compile_program(program: &Program, prepare_snapshot: impl FnOnce(&mut Snapshot)) -> (Snapshot, CompiledCode) {
     let mut snapshot = crate::builder::tests::snapshot_for(program, layout());
     snapshot.runtime = marker_runtime();
     snapshot.executables[0].feedback.arith = vec![GENERAL_FEEDBACK];
     prepare_snapshot(&mut snapshot);
     let compiled = compile_for::<crate::asm::MacroAssembler>(&snapshot, &|_| true)
         .unwrap_or_else(|failure| panic!("compilation failed: {failure:?}"));
+    (snapshot, compiled)
+}
+
+fn run_compiled_program(
+    snapshot: &Snapshot,
+    compiled: &CompiledCode,
+    arguments: &[u64],
+    prepare: impl FnOnce(&mut Machine),
+) -> (JitResult, Machine) {
     let mut machine = Machine::new(layout(), arguments);
     // Room for the words the fakes here use.
     machine.vm.resize(12, 0);
@@ -328,7 +342,7 @@ fn run_program_with_snapshot(
     machine.executable[3] = NO_PROPERTY_CACHES.as_ptr() as u64;
     machine.frame[4] = machine.executable.as_ptr() as u64;
     prepare(&mut machine);
-    let result = machine.run(&snapshot, &compiled);
+    let result = machine.run(snapshot, compiled);
     (result, machine)
 }
 
@@ -341,6 +355,10 @@ fn run_instruction(instruction: Instruction, arguments: &[u64]) -> u64 {
 /// `EXITED` if the code exits. Also returns the number of calls of the
 /// fake comparison and jump slow paths.
 fn run_instruction_with(feedback: u8, instruction: Instruction, arguments: &[u64]) -> (u64, u64) {
+    compile_instruction(feedback, instruction)(arguments)
+}
+
+fn compile_instruction(feedback: u8, instruction: Instruction) -> impl Fn(&[u64]) -> (u64, u64) {
     let program = assemble(|_| {
         vec![
             Instruction::Enter,
@@ -348,12 +366,13 @@ fn run_instruction_with(feedback: u8, instruction: Instruction, arguments: &[u64
             Instruction::Return { value: r(5) },
         ]
     });
-    let (result, machine) = run_program_with_snapshot(
-        &program,
-        arguments,
-        |snapshot| snapshot.executables[0].feedback.arith = vec![feedback],
-        |_| {},
-    );
+    let (snapshot, compiled) = compile_program(&program, |snapshot| {
+        snapshot.executables[0].feedback.arith = vec![feedback]
+    });
+    move |arguments| instruction_result(run_compiled_program(&snapshot, &compiled, arguments, |_| {}))
+}
+
+fn instruction_result((result, machine): (JitResult, Machine)) -> (u64, u64) {
     let slow_calls = machine.vm[VM_SLOW_JUMPS_WORD];
     if result.status == crate::code::JitStatus::Resume as u64 {
         return (EXITED, slow_calls);
@@ -609,9 +628,10 @@ fn binary_operations_on_two_operands() {
                 OperationInput::Operand(argument(0)),
                 OperationInput::Operand(argument(1)),
             );
+            let run = compile_instruction(feedback, instruction);
             for lhs in &values {
                 for rhs in &values {
-                    let (result, _) = run_instruction_with(feedback, instruction.clone(), &[*lhs, *rhs]);
+                    let (result, _) = run(&[*lhs, *rhs]);
                     assert_eq!(
                         result,
                         binary(op, *lhs, *rhs, feedback),
@@ -634,8 +654,9 @@ fn binary_operations_with_an_int32_operand() {
                     OperationInput::Operand(argument(0)),
                     OperationInput::Int32(immediate),
                 );
+                let run = compile_instruction(feedback, instruction);
                 for lhs in &values {
-                    let (result, _) = run_instruction_with(feedback, instruction.clone(), &[*lhs, value::UNDEFINED]);
+                    let (result, _) = run(&[*lhs, value::UNDEFINED]);
                     let expected = binary(op, *lhs, value::int32(immediate), feedback);
                     assert_eq!(result, expected, "{op:?} {lhs:#x} {immediate}: got {result:#x}");
                 }
@@ -645,9 +666,9 @@ fn binary_operations_with_an_int32_operand() {
                         OperationInput::Int32(immediate),
                         OperationInput::Operand(argument(0)),
                     );
+                    let run = compile_instruction(feedback, instruction);
                     for rhs in &values {
-                        let (result, _) =
-                            run_instruction_with(feedback, instruction.clone(), &[*rhs, value::UNDEFINED]);
+                        let (result, _) = run(&[*rhs, value::UNDEFINED]);
                         let expected = binary(op, value::int32(immediate), *rhs, feedback);
                         assert_eq!(result, expected, "{immediate} + {rhs:#x}: got {result:#x}");
                     }
@@ -1085,17 +1106,18 @@ fn boolean(result: Option<bool>) -> u64 {
 #[test]
 fn comparisons() {
     let values = values();
-    let check = |instruction: &Instruction, lhs: u64, rhs: u64, expected: Option<bool>| {
-        let (result, slow_calls) = run_instruction_with(GENERAL_FEEDBACK, instruction.clone(), &[lhs, rhs]);
+    let check = |(result, slow_calls), instruction: &Instruction, lhs: u64, rhs: u64, expected: Option<bool>| {
         let context = format!("{instruction:?} {lhs:#x} {rhs:#x}: got {result:#x}");
         assert_eq!(result, boolean(expected), "{context}");
         assert_eq!(slow_calls, u64::from(expected.is_none()), "{context}");
     };
     for comparison in COMPARISONS {
         let instruction = compare_instruction(comparison, r(5), argument(0), OperationInput::Operand(argument(1)));
+        let run = compile_instruction(GENERAL_FEEDBACK, instruction.clone());
         for lhs in &values {
             for rhs in &values {
                 check(
+                    run(&[*lhs, *rhs]),
                     &instruction,
                     *lhs,
                     *rhs,
@@ -1105,9 +1127,11 @@ fn comparisons() {
         }
         for immediate in [0, 1, -1, 7, i32::MAX, i32::MIN] {
             let instruction = compare_instruction(comparison, r(5), argument(0), OperationInput::Int32(immediate));
+            let run = compile_instruction(GENERAL_FEEDBACK, instruction.clone());
             for lhs in &values {
                 let expected = self::comparison(comparison, *lhs, value::int32(immediate), true);
-                check(&instruction, *lhs, value::UNDEFINED, expected);
+                let actual = run(&[*lhs, value::UNDEFINED]);
+                check(actual, &instruction, *lhs, value::UNDEFINED, expected);
             }
         }
     }
@@ -1134,13 +1158,14 @@ fn conditional_jumps() {
                 });
                 let constants = crate::builder::tests::test_constants();
                 let (true_value, false_value) = (constants[1], constants[0]);
+                let (snapshot, compiled) = compile_program(&program, |_| {});
                 for lhs in &values {
                     for rhs_value in &values {
                         let (rhs_bits, rhs_is_immediate) = match rhs {
                             OperationInput::Operand(_) => (*rhs_value, false),
                             OperationInput::Int32(integer) => (value::int32(integer), true),
                         };
-                        let (result, machine) = run_program(&program, &[*lhs, *rhs_value], |_| {});
+                        let (result, machine) = run_compiled_program(&snapshot, &compiled, &[*lhs, *rhs_value], |_| {});
                         let expected = self::comparison(comparison, *lhs, rhs_bits, rhs_is_immediate);
                         let context = format!("{comparison:?} {lhs:#x} {rhs_bits:#x} loop {is_loop}");
                         let slow_jumps = machine.vm[VM_SLOW_JUMPS_WORD];
@@ -3262,10 +3287,9 @@ fn put_by_id_adds_properties_through_property_caches() {
     };
     assert_eq!(add(&mut fake, FLAG_IS_EXTENSIBLE), 0);
     assert_eq!(fake.properties[3], value::TRUE);
-    // Objects that are not extensible, may interfere with indexed accesses,
-    // require slow additions or have a magical length are left to the probe.
+    // Objects that may interfere with indexed accesses, require slow
+    // additions or have a magical length are left to the probe.
     for flags in [
-        0,
         FLAG_IS_EXTENSIBLE | FLAG_MAY_INTERFERE,
         FLAG_IS_EXTENSIBLE | FLAG_REQUIRES_SLOW_ADD_OWN_PROPERTY,
         FLAG_IS_EXTENSIBLE | FLAG_HAS_MAGICAL_LENGTH,

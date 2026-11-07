@@ -32,13 +32,16 @@ public:
 
     void serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& object, Document const&) const;
     static Document::CachedAccessibleText compute_accessible_text(Element const&, Document const&);
-    void serialize_tree_as_node_data(Vector<WebView::AccessibilityNodeData>& out, Document const&, Layout::BegunRead const&, i64 parent_id = -1) const;
+    void serialize_tree_as_node_data(Vector<WebView::AccessibilityNodeData>& out, Document const&, Layout::BegunRead const&, i64 parent_id = -1, AccessibilityChangeTracker* = nullptr) const;
 
 protected:
     virtual void visit_edges(Visitor&) override;
 
 private:
     explicit AccessibilityTreeNode(GC::Ptr<DOM::Node const>);
+
+    // Serializes just this node, and returns its ID: the parent ID its children's data carries.
+    i64 serialize_node_as_node_data(Vector<WebView::AccessibilityNodeData>& out, Document const&, Layout::BegunRead const&, i64 parent_id, AccessibilityChangeTracker*) const;
 
     GC::Ptr<DOM::Node const> m_value;
     Vector<GC::Ptr<AccessibilityTreeNode>> m_children;

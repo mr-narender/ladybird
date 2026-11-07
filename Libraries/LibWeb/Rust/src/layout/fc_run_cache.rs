@@ -11,12 +11,13 @@ use super::*;
 /// value a parent hands a spawned run that the run reads is part of the
 /// key. Viewport changes reach a run through that input or through the
 /// normal style/layout epoch invalidation for viewport-dependent computed
-/// values.
-#[derive(Clone, PartialEq)]
-pub(super) struct FcRunCacheKey {
-    fc_type: formatting_context::FormattingContextType,
-    input: LayoutInput,
-    root_cells: used_values::RootInputCells,
+/// values. The parent of the run holds it, and only a run whose outputs are
+/// stored copies it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FcRunCacheKey {
+    pub(crate) fc_type: formatting_context::FormattingContextType,
+    pub(crate) input: LayoutInput,
+    pub(crate) root_cells: used_values::RootInputCells,
 }
 
 /// The inputs a run never observed, at which its stored outputs are reused as they are.
@@ -115,41 +116,6 @@ fn root_input_cells_match_ignoring_unobserved(
 }
 
 impl FcRunCacheKey {
-    pub(super) fn new(
-        fc_type: formatting_context::FormattingContextType,
-        mut input: LayoutInput,
-        root_cells: used_values::RootInputCells,
-    ) -> Self {
-        // NB: The parent block formatting context sizes a float against its containing block position before the
-        //     run and places it after. The run lays the float out from its own origin.
-        if let ParticipationInParentFormattingContext::Float {
-            containing_block_position_in_bfc_root,
-            ..
-        } = &mut input.participation
-        {
-            *containing_block_position_in_bfc_root = FfiCssPixelPoint::default();
-        }
-        if let ParticipationInParentFormattingContext::AbsolutelyPositioned(inputs) = &mut input.participation {
-            let normalized_inputs = inputs.without_static_position_in_axes_placed_by_own_insets();
-            if normalized_inputs != **inputs {
-                *inputs = std::sync::Arc::new(normalized_inputs);
-            }
-        }
-        Self {
-            fc_type,
-            input,
-            root_cells,
-        }
-    }
-
-    fn as_probe(&self) -> FcRunCacheProbe<'_> {
-        FcRunCacheProbe {
-            fc_type: self.fc_type,
-            input: &self.input,
-            root_cells: self.root_cells,
-        }
-    }
-
     /// The key with the root's block paddings left out.
     fn without_root_block_paddings(&self) -> Self {
         let mut key = self.clone();
@@ -158,16 +124,11 @@ impl FcRunCacheKey {
         key
     }
 
-    #[cfg(test)]
     fn matches(&self, probe: &Self, unobserved: RunInputsTheStoredRunNeverObserved) -> bool {
-        self.matches_probe(&probe.as_probe(), unobserved)
-    }
-
-    fn matches_probe(&self, probe: &FcRunCacheProbe<'_>, unobserved: RunInputsTheStoredRunNeverObserved) -> bool {
         if self.fc_type != probe.fc_type {
             return false;
         }
-        if self.root_cells == probe.root_cells && layout_inputs_equal_to_probe(&self.input, probe.input) {
+        if self.root_cells == probe.root_cells && self.input == probe.input {
             return true;
         }
         if !unobserved.relaxes_any_input() {
@@ -178,65 +139,8 @@ impl FcRunCacheKey {
             probe.root_cells,
             unobserved.own_block_size,
             unobserved.inline_space_around_root,
-        ) && layout_inputs_match_ignoring_unobserved(&self.input, probe.input, unobserved)
+        ) && layout_inputs_match_ignoring_unobserved(&self.input, &probe.input, unobserved)
     }
-}
-
-pub(super) struct FcRunCacheProbe<'input> {
-    fc_type: formatting_context::FormattingContextType,
-    input: &'input LayoutInput,
-    root_cells: used_values::RootInputCells,
-}
-
-impl<'input> FcRunCacheProbe<'input> {
-    pub(super) fn new(
-        fc_type: formatting_context::FormattingContextType,
-        input: &'input LayoutInput,
-        root_cells: used_values::RootInputCells,
-    ) -> Self {
-        Self {
-            fc_type,
-            input,
-            root_cells,
-        }
-    }
-
-    fn key(&self) -> FcRunCacheKey {
-        FcRunCacheKey::new(self.fc_type, self.input.clone(), self.root_cells)
-    }
-}
-
-fn participation_matches_probe(
-    stored: &ParticipationInParentFormattingContext,
-    probe: &ParticipationInParentFormattingContext,
-) -> bool {
-    match (stored, probe) {
-        (
-            ParticipationInParentFormattingContext::Float {
-                flex_container_resolves_its_own_automatic_block_size: stored,
-                ..
-            },
-            ParticipationInParentFormattingContext::Float {
-                flex_container_resolves_its_own_automatic_block_size: probe,
-                ..
-            },
-        ) => stored == probe,
-        (
-            ParticipationInParentFormattingContext::AbsolutelyPositioned(stored),
-            ParticipationInParentFormattingContext::AbsolutelyPositioned(probe),
-        ) => {
-            std::sync::Arc::ptr_eq(stored, probe)
-                || **stored == probe.without_static_position_in_axes_placed_by_own_insets()
-        }
-        (stored, probe) => stored == probe,
-    }
-}
-
-fn layout_inputs_equal_to_probe(stored: &LayoutInput, probe: &LayoutInput) -> bool {
-    stored.available_space == probe.available_space
-        && stored.containing_block_constraints == probe.containing_block_constraints
-        && stored.sizing == probe.sizing
-        && participation_matches_probe(&stored.participation, &probe.participation)
 }
 
 fn available_block_sizes_match(a: AvailableSize, b: AvailableSize, block_size_definiteness_unobserved: bool) -> bool {
@@ -261,7 +165,7 @@ fn layout_inputs_match_ignoring_unobserved(
         percentage_basis_block_size,
         quirks_mode_percentage_basis_block_size,
     } = *containing_block_constraints;
-    if !participation_matches_probe(participation, &b.participation) {
+    if *participation != b.participation {
         return false;
     }
     let available_inline_sizes_match = available_space.inline_size == b.available_space.inline_size
@@ -412,10 +316,10 @@ impl FcRunCacheEntry {
 
     /// Whether the absolutely positioned boxes the stored run laid out against its root would be laid out against the
     /// same root block size by the probed run, where they are all that observed the root's own block size.
-    fn probe_leaves_root_with_block_size_its_abspos_were_laid_out_against(&self, probe: &FcRunCacheProbe<'_>) -> bool {
+    fn probe_leaves_root_with_block_size_its_abspos_were_laid_out_against(&self, probe: &FcRunCacheKey) -> bool {
         self.outputs.inputs_never_observed.own_block_size
             != formatting_context::OwnBlockSizeObservation::ObservedOnlyByAbsposContainedByRoot
-            || self.content_block_size_run_leaves_root_whose_cells_its_parent_owns(probe.input, probe.root_cells)
+            || self.content_block_size_run_leaves_root_whose_cells_its_parent_owns(&probe.input, probe.root_cells)
                 == self.content_block_size_run_leaves_root_whose_cells_its_parent_owns(
                     &self.key.input,
                     self.key.root_cells,
@@ -451,15 +355,14 @@ impl FcRunCacheEntry {
                 > LAYOUT_COMMITS_AN_UNCOMMITTED_ENTRY_SURVIVES_UNUSED
     }
 
-    fn answers_probe_for(&self, probe: &FcRunCacheProbe<'_>) -> bool {
+    fn answers_probe_for(&self, probe: &FcRunCacheKey) -> bool {
         let unobserved = self.outputs.inputs_never_observed;
-        (self.key.matches_probe(probe, unobserved)
-            || (self.table_cell_block_paddings_unobserved && {
-                let probe_key = probe.key().without_root_block_paddings();
-                self.key
+        (self.key.matches(probe, unobserved)
+            || (self.table_cell_block_paddings_unobserved
+                && self
+                    .key
                     .without_root_block_paddings()
-                    .matches_probe(&probe_key.as_probe(), unobserved)
-            }))
+                    .matches(&probe.without_root_block_paddings(), unobserved)))
             && self.probe_leaves_root_with_block_size_its_abspos_were_laid_out_against(probe)
     }
 }
@@ -668,7 +571,7 @@ impl FcRunCacheStore {
         &self,
         box_: Node,
         validity: FcRunCacheValidity,
-        probe: &FcRunCacheProbe<'_>,
+        key: &FcRunCacheKey,
     ) -> Option<std::sync::Arc<FcRunCacheEntry>> {
         let structural_epoch_bumps = self.structural_epoch_bumps_of(box_);
         let entry_was_damaged_since_stored = |entry: &FcRunCacheEntry| {
@@ -677,8 +580,8 @@ impl FcRunCacheStore {
             entry.outputs.root.is_some()
                 && structural_epoch_bumps_since_stored != 0
                 && entry.validity.slot_generation == validity.slot_generation
-                && entry.key.matches_probe(
-                    probe,
+                && entry.key.matches(
+                    key,
                     entry
                         .outputs
                         .inputs_never_observed
@@ -826,8 +729,8 @@ fn shared_entry_in_allocation_of(
     }
 }
 
-pub(super) fn run_root_validity(callbacks: &LayoutPass<'_>, box_: Node) -> FcRunCacheValidity {
-    let data = NodeFacts::new(callbacks, box_).data();
+pub(super) fn run_root_validity(pass: &LayoutPass<'_>, box_: Node) -> FcRunCacheValidity {
+    let data = NodeFacts::new(pass, box_).data();
     FcRunCacheValidity {
         slot_generation: data.slot_generation.get(),
         fragment_cache_epoch: data.fragment_cache_epoch,
@@ -877,28 +780,28 @@ impl FcRunCacheAttempt {
         builds_fragments: bool,
         should_collect_devtools_layout_data: bool,
         measurement_root_keeps_its_result: bool,
-        callbacks: &LayoutPass<'_>,
-        probe: &FcRunCacheProbe<'_>,
+        pass: &LayoutPass<'_>,
+        key: &FcRunCacheKey,
     ) -> Result<Self, FcRunCacheHit> {
         if !can_describe_run(
             box_,
             runs_as_subgrid,
             should_collect_devtools_layout_data,
             measurement_root_keeps_its_result,
-            callbacks,
-            probe,
+            pass,
+            key,
         ) {
             return Ok(Self::Bypass);
         }
-        let store = callbacks.fc_run_cache_store();
-        let validity = run_root_validity(callbacks, box_);
+        let store = pass.fc_run_cache_store();
+        let validity = run_root_validity(pass, box_);
         if !builds_fragments {
             if let Some(entry) = store.first_entry_where_summary_allows(
                 box_.slot_index(),
                 |summary| summary.may_answer_probe(validity, false),
-                |entry| entry.validity == validity && entry.answers_probe_for(probe),
+                |entry| entry.validity == validity && entry.answers_probe_for(key),
             ) {
-                entry.note_used_at_layout_commit(callbacks.arena().layout_commit_count());
+                entry.note_used_at_layout_commit(pass.arena().layout_commit_count());
                 return Err(FcRunCacheHit { entry });
             }
             return Ok(Self::StoreResultOnly { validity });
@@ -906,14 +809,14 @@ impl FcRunCacheAttempt {
         if let Some(entry) = store.first_entry_where_summary_allows(
             box_.slot_index(),
             |summary| summary.may_answer_probe(validity, true),
-            |entry| entry.validity == validity && entry.outputs.root.is_some() && entry.answers_probe_for(probe),
+            |entry| entry.validity == validity && entry.outputs.root.is_some() && entry.answers_probe_for(key),
         ) {
             // NB: Once the replayed fragments are committed, the sweep keeps the entry beside later ones.
             store.enqueue_for_sweep(box_.slot_index());
-            entry.note_used_at_layout_commit(callbacks.arena().layout_commit_count());
+            entry.note_used_at_layout_commit(pass.arena().layout_commit_count());
             return Err(FcRunCacheHit { entry });
         }
-        let structurally_damaged_entry = store.structurally_damaged_entry(box_, validity, probe);
+        let structurally_damaged_entry = store.structurally_damaged_entry(box_, validity, key);
         Ok(Self::Store {
             validity,
             structurally_damaged_entry,
@@ -925,29 +828,28 @@ impl FcRunCacheAttempt {
         builds_fragments: bool,
         should_collect_devtools_layout_data: bool,
         measurement_root_keeps_its_result: bool,
-        callbacks: &LayoutPass<'_>,
-        probe: &FcRunCacheProbe<'_>,
+        pass: &LayoutPass<'_>,
+        key: &FcRunCacheKey,
     ) -> bool {
         if !can_describe_run(
             box_,
             false,
             should_collect_devtools_layout_data,
             measurement_root_keeps_its_result,
-            callbacks,
-            probe,
+            pass,
+            key,
         ) {
             return false;
         }
-        let validity = run_root_validity(callbacks, box_);
-        callbacks
-            .fc_run_cache_store()
+        let validity = run_root_validity(pass, box_);
+        pass.fc_run_cache_store()
             .first_entry_where_summary_allows(
                 box_.slot_index(),
                 |summary| summary.may_answer_probe(validity, builds_fragments),
                 |entry| {
                     entry.validity == validity
                         && (!builds_fragments || entry.outputs.root.is_some())
-                        && entry.answers_probe_for(probe)
+                        && entry.answers_probe_for(key)
                 },
             )
             .is_some()
@@ -968,12 +870,12 @@ impl FcRunCacheAttempt {
     /// that the parent takes in what it keeps of them without a copy, or as they are.
     pub(super) fn conclude(
         self,
-        callbacks: &LayoutPass<'_>,
+        pass: &LayoutPass<'_>,
         box_: Node,
-        probe: &FcRunCacheProbe<'_>,
+        key: &FcRunCacheKey,
         outputs: formatting_context::RunOutputs,
     ) -> formatting_context::RunOutputsHandle {
-        let store = callbacks.fc_run_cache_store();
+        let store = pass.fc_run_cache_store();
         let (validity, structurally_damaged_entry) = match self {
             Self::Bypass => return formatting_context::RunOutputsHandle::Owned(outputs),
             Self::StoreResultOnly { validity } => {
@@ -981,16 +883,16 @@ impl FcRunCacheAttempt {
                 return formatting_context::RunOutputsHandle::Stored(store.store(
                     box_,
                     FcRunCacheEntry {
-                        key: probe.key(),
+                        key: key.clone(),
                         validity,
                         outputs,
                         table_cell_block_paddings_unobserved: false,
                         last_used_at_layout_commit: std::sync::atomic::AtomicU64::new(
-                            callbacks.arena().layout_commit_count(),
+                            pass.arena().layout_commit_count(),
                         ),
                         structural_epoch_bumps_when_stored: 0,
                     },
-                    |entry| entry.holds_committed_fragments(callbacks.arena(), box_),
+                    |entry| entry.holds_committed_fragments(pass.arena(), box_),
                 ));
             }
             Self::Store {
@@ -1003,20 +905,20 @@ impl FcRunCacheAttempt {
         if outputs.root.is_none() {
             return formatting_context::RunOutputsHandle::Owned(outputs);
         }
-        let table_cell_block_paddings_unobserved = NodeFacts::new(callbacks, box_).is_table_cell()
+        let table_cell_block_paddings_unobserved = NodeFacts::new(pass, box_).is_table_cell()
             && outputs.root_outcome.parent_owns_root_input_cells()
-            && !run_observes_root_block_padding(callbacks, box_, &outputs);
+            && !run_observes_root_block_padding(pass, box_, &outputs);
         let entry = FcRunCacheEntry {
-            key: probe.key(),
+            key: key.clone(),
             validity,
             outputs,
             table_cell_block_paddings_unobserved,
-            last_used_at_layout_commit: std::sync::atomic::AtomicU64::new(callbacks.arena().layout_commit_count()),
+            last_used_at_layout_commit: std::sync::atomic::AtomicU64::new(pass.arena().layout_commit_count()),
             structural_epoch_bumps_when_stored: 0,
         };
-        formatting_context::RunOutputsHandle::Stored(store.store(box_, entry, |entry| {
-            entry.holds_committed_fragments(callbacks.arena(), box_)
-        }))
+        formatting_context::RunOutputsHandle::Stored(
+            store.store(box_, entry, |entry| entry.holds_committed_fragments(pass.arena(), box_)),
+        )
     }
 }
 
@@ -1025,11 +927,11 @@ pub(super) fn can_describe_run(
     runs_as_subgrid: bool,
     should_collect_devtools_layout_data: bool,
     measurement_root_keeps_its_result: bool,
-    callbacks: &LayoutPass<'_>,
-    probe: &FcRunCacheProbe<'_>,
+    pass: &LayoutPass<'_>,
+    key: &FcRunCacheKey,
 ) -> bool {
-    let fc_type = probe.fc_type;
-    let input = probe.input;
+    let fc_type = key.fc_type;
+    let input = &key.input;
     if should_collect_devtools_layout_data
         || (input.participation == ParticipationInParentFormattingContext::Root && !measurement_root_keeps_its_result)
         || fc_type == formatting_context::FormattingContextType::InternalReplaced
@@ -1037,7 +939,7 @@ pub(super) fn can_describe_run(
         // Replaying a stored output costs more than rebuilding it and retains an entry needlessly.
         || (fc_type == formatting_context::FormattingContextType::Block
             && input.participation == ParticipationInParentFormattingContext::AtomicInline
-            && callbacks.first_child(box_).is_invalid())
+            && pass.first_child(box_).is_invalid())
     {
         return false;
     }
@@ -1052,10 +954,7 @@ pub(super) fn can_describe_run(
     // pass; scroll compensation compares chains that converge at the run root; and
     // anchor-size() resolves to None today, so inset properties are the only anchor
     // dependency a run can have.
-    !node_facts::has_flag(
-        NodeFacts::new(callbacks, box_).data(),
-        NodeFlag::InsetsUseAnchorFunctions,
-    )
+    !node_facts::has_flag(NodeFacts::new(pass, box_).data(), NodeFlag::InsetsUseAnchorFunctions)
 }
 
 /// Whether a run's outputs may depend on its root's block paddings. They hold the content in content box coordinates,
@@ -1065,11 +964,11 @@ pub(super) fn can_describe_run(
 /// containing block rects, anchors), which are placed against its padding box. Outputs without a root fragment cannot
 /// show those payloads.
 pub(super) fn run_observes_root_block_padding(
-    callbacks: &LayoutPass<'_>,
+    pass: &LayoutPass<'_>,
     box_: Node,
     outputs: &formatting_context::RunOutputs,
 ) -> bool {
-    let facts = NodeFacts::new(callbacks, box_);
+    let facts = NodeFacts::new(pass, box_);
     let places_rendered_legend_on_its_border_box = facts.is_fieldset_box() && !facts.rendered_legend().is_invalid();
     facts.is_scroll_container()
         || places_rendered_legend_on_its_border_box
@@ -1528,7 +1427,7 @@ mod tests {
             fragment_cache_epoch: 3,
         };
         let damaged = store
-            .structurally_damaged_entry(box_, damaged_validity, &at(300).as_probe())
+            .structurally_damaged_entry(box_, damaged_validity, &at(300))
             .expect("the entry stored before the damage supplies its line data");
         assert_eq!(
             damaged.key.input.available_space.inline_size,
@@ -1537,7 +1436,7 @@ mod tests {
         store.note_inline_layout_damage(box_);
         assert!(
             store
-                .structurally_damaged_entry(box_, damaged_validity, &at(300).as_probe())
+                .structurally_damaged_entry(box_, damaged_validity, &at(300))
                 .is_none()
         );
     }
@@ -1553,7 +1452,11 @@ mod tests {
             ContainingBlockConstraints::default(),
             ParticipationInParentFormattingContext::Item,
         );
-        let key_of = |input| FcRunCacheKey::new(formatting_context::FormattingContextType::Block, input, root_cells);
+        let key_of = |input| FcRunCacheKey {
+            fc_type: formatting_context::FormattingContextType::Block,
+            input,
+            root_cells,
+        };
         let stored = key_of(item_input.clone());
 
         let mut adopting_input = item_input;
@@ -1653,7 +1556,6 @@ mod tests {
             },
             |probe| {
                 probe.input.participation = ParticipationInParentFormattingContext::Float {
-                    containing_block_position_in_bfc_root: FfiCssPixelPoint::default(),
                     flex_container_resolves_its_own_automatic_block_size: false,
                 }
             },
@@ -1673,9 +1575,9 @@ mod tests {
             has_definite_block_size,
             ..used_values::RootInputCells::default()
         };
-        FcRunCacheKey::new(
-            formatting_context::FormattingContextType::Block,
-            LayoutInput::new(
+        FcRunCacheKey {
+            fc_type: formatting_context::FormattingContextType::Block,
+            input: LayoutInput::new(
                 AvailableSpace {
                     inline_size: AvailableSize::definite(px(300)),
                     block_size: if has_definite_block_size {
@@ -1688,7 +1590,7 @@ mod tests {
                 ParticipationInParentFormattingContext::Item,
             ),
             root_cells,
-        )
+        }
     }
 
     fn own_block_size(observation: formatting_context::OwnBlockSizeObservation) -> RunInputsTheStoredRunNeverObserved {

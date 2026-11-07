@@ -25,6 +25,7 @@ set(SOURCES
     CookieJar.cpp
     CrashReport.cpp
     CrashReportDiagnostics.cpp
+    CrashReportOutbox.cpp
     CrashReportReview.cpp
     CrashReportStore.cpp
     CrashReportSubmission.cpp
@@ -42,6 +43,8 @@ set(SOURCES
     HistoryDebug.cpp
     HistoryStore.cpp
     HSTSStore.cpp
+    ImageDecoderControlClient.cpp
+    ImageDecoderManager.cpp
     LingeringIndicator.cpp
     Menu.cpp
     NavigationLoader.cpp
@@ -50,6 +53,7 @@ set(SOURCES
     NotificationAttribution.cpp
     NotificationFreedesktopArguments.cpp
     NotificationManager.cpp
+    PageTranslation.cpp
     PictureInPictureManager.cpp
     PictureInPictureWindow.cpp
     PermissionManager.cpp
@@ -75,6 +79,8 @@ set(SOURCES
     StorageAreaRegistry.cpp
     StorageJar.cpp
     TestSpellChecker.cpp
+    TestTranslator.cpp
+    Translator.cpp
     URL.cpp
     UserAgent.cpp
     Utilities.cpp
@@ -89,6 +95,7 @@ set(SOURCES
     WebDriverBrowserConnection.cpp
     WebUI.cpp
     WebUI/BookmarksUI.cpp
+    WebUI/CrashReportsUI.cpp
     WebUI/DownloadsUI.cpp
     WebUI/HistoryUI.cpp
     WebUI/SettingsUI.cpp
@@ -127,6 +134,8 @@ set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
     ../../Services/AudioServer/AudioServerControlClientEndpoint.h
     ../../Services/AudioServer/AudioServerControlEndpoint.h
+    ../../Services/ImageDecoder/ImageDecoderControlClientEndpoint.h
+    ../../Services/ImageDecoder/ImageDecoderControlEndpoint.h
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
     ../../Services/VideoDecoderServer/VideoDecoderServerControlClientEndpoint.h

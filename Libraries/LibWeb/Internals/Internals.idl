@@ -54,6 +54,10 @@ interface Internals {
     Promise<DOMString> checkSpellingForTesting(DOMString text);
     Promise<undefined> spellCheckSettled();
 
+    // Translation
+    undefined translatePage(DOMString targetLanguage);
+    Promise<undefined> translationSettled();
+
     // Writing suggestions
     Promise<DOMString> requestWritingSuggestionForTesting(DOMString text, unsigned long caretOffset);
     DOMString writingSuggestion();
@@ -111,6 +115,8 @@ interface Internals {
     undefined pinchThroughUIProcess(double x, double y, double scaleDelta, optional boolean continuesGesture = false);
     undefined resetZoom();
 
+    // The URL of the link the page asks its client to show as hovered, or null when it shows none.
+    DOMString? hoveredLink();
     DOMString currentCursor();
     // The color of one pixel of the current image cursor's bitmap, or null when the cursor is no image.
     DOMString? currentCursorPixel(long x, long y);
@@ -171,6 +177,10 @@ interface Internals {
     boolean hasCookieForURL(DOMString url, ByteString name, ByteString value);
 
     boolean setHttpMemoryCacheEnabled(boolean enabled);
+    // Whether two functions run the same compiled code, which compiles them if they did not run yet.
+    boolean functionsShareCode(any a, any b);
+    // Whether a classic script from the given URL is in the compiled script cache for this window's partition.
+    boolean compiledScriptCacheContains(DOMString url);
     boolean setDiskCacheEnabledForNavigations(boolean enabled);
     undefined simulateRequestServerConnectionLoss();
     undefined simulateWorkerRequestServerConnectionLoss();
@@ -237,6 +247,9 @@ interface Internals {
     // Each node whose accessibility data kept between builds of the tree differs from what computing it again gives,
     // one per line. Empty when all of it is current.
     DOMString accessibilityCachedRecordMismatches();
+    DOMString accessibilityCachedGeometryMismatches();
+    DOMString accessibilityChangeTrackingMismatches();
+    DOMString accessibilityLastChangeSize();
     DOMString dumpLayoutTree(Node node);
     DOMString dumpStackingContextTree();
     DOMString stackingContextStructureVerificationReport();
@@ -330,6 +343,8 @@ interface Internals {
     // would, beside the mouse event with the given input event id, if any, and waits until the tick that hovers what is
     // under it has run, at the given frame time, or now.
     undefined injectHoverPointer(double x, double y, optional double frameTimeMs, optional unsigned long long inputEventId, optional unsigned long buttons = 0);
+    // Hands the clock lanes of the current document the pointer leaving it, and waits as injectHoverPointer() does.
+    undefined injectHoverPointerLeft(double frameTimeMs);
     // Reports to the current document's navigable, as the compositor would, that a frame of a transform animation it
     // runs moved content under the pointer at rest, or away from it, as of the given frame time.
     undefined noteAnimatedContentMovedUnderPointer(double frameTimeMs);

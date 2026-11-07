@@ -699,7 +699,7 @@ public:
     void reset_spell_checking();
     void did_request_link_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<u64> text_fragment_generation_id);
     void did_generate_text_fragment_url(u64 request_id, Optional<URL::URL>);
-    void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap);
+    void did_request_image_context_menu(Badge<WebContentPage>, Gfx::IntPoint content_position, Web::HTML::PreparedNavigationDescriptor, Optional<Gfx::ShareableBitmap> bitmap, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type);
     void did_request_media_context_menu(Badge<WebContentPage>, WebContentPage& requesting_page, Gfx::IntPoint content_position, Web::MediaContextMenu, Optional<Web::HTML::PreparedNavigationDescriptor>);
 
     void did_request_color_picker(Badge<WebContentPage>, WebContentPage& requesting_page, Color current_color);
@@ -711,6 +711,8 @@ public:
     Action& navigate_forward_action() { return *m_navigate_forward_action; }
     Action& toggle_bookmark_action() { return *m_toggle_bookmark_action; }
     Action& reset_zoom_action() { return *m_reset_zoom_action; }
+
+    PageTranslation& page_translation() { return *m_page_translation; }
 
     WebContentPage& page() const;
 
@@ -857,6 +859,7 @@ protected:
     NonnullRefPtr<Menu> create_selected_text_link_context_menu(bool is_editable, String const& selected_text, URL::URL const&, Optional<DictionaryLookup> const&, Gfx::IntPoint content_position);
     void add_open_in_new_tab_action(Menu&, StringView text, URL::URL const&, Optional<Web::HTML::PreparedNavigationDescriptor> const&);
     void add_open_url_actions(Menu&, URL::URL const&, Optional<Web::HTML::PreparedNavigationDescriptor> const&);
+    void add_link_actions(Menu&, Web::HTML::PreparedNavigationDescriptor const&);
     void add_text_edit_actions(Menu&, bool is_editable, bool has_selected_text);
     void add_look_up_action(Menu&, Optional<DictionaryLookup> const&, Gfx::IntPoint content_position);
     void update_report_website_issue_action();
@@ -873,7 +876,7 @@ protected:
         No,
         Yes,
     };
-    void download_url(URL::URL const&, PromptForPath);
+    void download_url(URL::URL const&, PromptForPath, Optional<String> const& image_mime_type = {});
 
     struct SharedBitmap {
         i32 id { -1 };
@@ -937,6 +940,7 @@ protected:
     RefPtr<Action> m_navigate_forward_action;
 
     RefPtr<Action> m_toggle_bookmark_action;
+    OwnPtr<PageTranslation> m_page_translation;
 
     RefPtr<Action> m_reset_zoom_action;
 

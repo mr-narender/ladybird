@@ -685,12 +685,33 @@ impl ProjectionGeneration {
             return Some(slot);
         }
         let parent = row.links.parent?;
+        // NB: The column only reaches as far as the last element that has a shadow root.
         let host = self
             .shadows
-            .get(parent.element_slot())?
-            .as_deref()
+            .get(parent.element_slot())
+            .and_then(Option::as_deref)
             .and_then(|shadow| shadow.host);
         Some(host.unwrap_or(parent))
+    }
+
+    /// The link around `element`, walking up as `DOM::Node::enclosing_link_element()` does: no link where none is
+    /// around it, or where the link is `is_editable`, and none at all where only the host knows.
+    pub(in crate::css::style) fn enclosing_link(
+        &self,
+        mut element: StyleNodeID,
+        is_link: impl Fn(StyleNodeID) -> bool,
+        is_editable: impl Fn(StyleNodeID) -> bool,
+    ) -> Option<Option<StyleNodeID>> {
+        loop {
+            self.committed.get(element.element_slot())?;
+            if is_link(element) {
+                return Some((!is_editable(element)).then_some(element));
+            }
+            match self.element_inheritance_parent(element) {
+                Some(parent) if parent.element_index().is_some() => element = parent,
+                _ => return Some(None),
+            }
+        }
     }
 }
 

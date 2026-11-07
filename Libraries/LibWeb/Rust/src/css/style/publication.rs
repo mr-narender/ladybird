@@ -566,7 +566,7 @@ impl RetainedState {
             .unwrap_or_else(|| self.default_groups().groups().clone());
         let record = std::sync::Arc::new(super::pipeline::Record::derived(&source, &payloads))
             .with_pseudo_element_styles(super::pipeline::PseudoElementStyles::from_bits(pseudo_element_styles));
-        let identity = self.computed_group_sets.install_derived_record(&record, || {
+        let identity = self.computed_group_sets.install_derived_record(&record, 0, || {
             computed::record_dependency_flags(&record.facts(), &record.payloads)
         });
         match target.is_pseudo() {
@@ -690,6 +690,12 @@ impl StyleEngine {
     pub(crate) fn free_style_records_kept_for_leases(&mut self) {
         self.retained.computed_group_sets.free_retired_animation_overlays();
         self.retained.computed_group_sets.sweep_at_next_reclamation();
+        self.reclaim_unreachable_computed_records();
+    }
+
+    /// Frees the records the samples of a clock tick let go of, as a style update does: a fork of the render state sees
+    /// no style update for as long as a task keeps the host from one.
+    pub(crate) fn free_style_records_after_tick(&mut self) {
         self.reclaim_unreachable_computed_records();
     }
 

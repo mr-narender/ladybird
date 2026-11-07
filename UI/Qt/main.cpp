@@ -9,7 +9,6 @@
 #include <LibMain/Main.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/BrowserProcess.h>
-#include <LibWebView/CrashReportStore.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
 #include <UI/Qt/Application.h>
@@ -32,13 +31,13 @@
 #    include <UI/Qt/MacWindow.h>
 #    include <UI/Qt/SpellCheckerMac.h>
 #endif
+#if defined(LADYBIRD_HAS_TRANSLATOR)
+#    include <UI/Qt/TranslatorMac.h>
+#endif
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
-
-    if (auto result = WebView::CrashReportStore::the().initialize_browser_crash_handler(); result.is_error())
-        warnln("Could not prepare Browser crash reporting: {}", result.error());
 
     // The web content view is presented in a native child window. Without this attribute, a widget
     // gaining a native window would force every other widget in the browser window to become native
@@ -61,6 +60,9 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     Ladybird::ChromeStyle::install_application_style();
 #if defined(AK_OS_MACOS)
     app->set_spell_checker(Ladybird::create_platform_spell_checker());
+#endif
+#if defined(LADYBIRD_HAS_TRANSLATOR)
+    app->set_translator(Ladybird::create_platform_translator());
 #endif
     if (app->should_exit_after_profile_coordination()) {
         outln("Opening in existing process");
@@ -129,8 +131,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
             window.setWindowTitle(BROWSER_PRODUCT_NAME);
             app->offer_to_restore_unexpectedly_closed_tabs(window);
         }
-
-        app->offer_newest_pending_crash_report();
     }
 
     return app->execute();

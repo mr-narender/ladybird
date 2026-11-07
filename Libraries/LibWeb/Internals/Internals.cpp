@@ -21,6 +21,7 @@
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
 #include <LibGfx/Cursor.h>
+#include <LibHTTP/Cache/Utilities.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
@@ -89,6 +90,7 @@
 #include <LibWeb/HTML/MessagePort.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
+#include <LibWeb/HTML/Scripting/CompiledScriptCache.h>
 #include <LibWeb/HTML/Scripting/ConsoleInputCompletion.h>
 #include <LibWeb/HTML/Scripting/DevToolsObjectTable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -99,6 +101,7 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Internals/InternalGamepad.h>
 #include <LibWeb/Internals/Internals.h>
 #include <LibWeb/Layout/NodeArena.h>
@@ -1086,6 +1089,14 @@ void Internals::reset_zoom()
         local_root->reset_zoom();
 }
 
+Optional<Utf16String> Internals::hovered_link()
+{
+    auto url = page().hover_link().current();
+    if (!url.has_value())
+        return {};
+    return utf16_string_from_url_ascii(url->serialize());
+}
+
 Utf16String Internals::current_cursor()
 {
     auto& page = this->page();
@@ -1401,6 +1412,32 @@ bool Internals::set_http_memory_cache_enabled(bool enabled)
     auto was_enabled = Web::Fetch::Fetching::http_memory_cache_enabled();
     Web::Fetch::Fetching::set_http_memory_cache_enabled(enabled);
     return was_enabled;
+}
+
+bool Internals::functions_share_code(JS::Value a, JS::Value b)
+{
+    if (!a.is_function() || !b.is_function())
+        return false;
+    return JS::functions_share_code(vm(), a.as_function(), b.as_function());
+}
+
+bool Internals::compiled_script_cache_contains(Utf16String const& url)
+{
+    auto parsed_url = DOMURL::parse(url);
+    if (!parsed_url.has_value())
+        return false;
+
+    auto key = Fetch::Infrastructure::determine_the_network_partition_key(window().associated_document().relevant_settings_object());
+    auto partition = key.has_value() ? key->disk_cache_partition() : OptionalNone {};
+    if (!partition.has_value())
+        return false;
+
+    return HTML::CompiledScriptCache::the().contains({
+        .partition = partition.release_value(),
+        .url_without_fragment = HTTP::serialize_url_for_cache_storage(*parsed_url),
+        .program_type = JS::ProgramType::Script,
+        .line_number_offset = 1,
+    });
 }
 
 bool Internals::set_disk_cache_enabled_for_navigations(bool enabled)
@@ -2085,6 +2122,49 @@ String Internals::accessibility_cached_record_mismatches()
     return builder.to_string_without_validation();
 }
 
+String Internals::accessibility_change_tracking_mismatches()
+{
+    auto& document = window().associated_document();
+    document.update_layout(DOM::UpdateLayoutReason::InspectAccessibilityTree);
+
+    // Apply what changed since the last call to the tree as it stood then, as the UI process does with what WebContent
+    // sends it, and compare the result with the whole tree built again.
+    auto change = document.build_accessibility_tree_change(m_accessibility_change_tracker, false);
+    m_last_accessibility_change_size = change.is_whole_tree
+        ? MUST(String::formatted("whole tree of {} nodes", change.nodes.size()))
+        : MUST(String::formatted("{} nodes changed, {} removed", change.nodes.size(), change.removed_ids.size()));
+    if (change.is_whole_tree)
+        m_accessibility_tracked_tree.clear();
+    for (auto id : change.removed_ids)
+        m_accessibility_tracked_tree.remove(id);
+    for (auto& node : change.nodes)
+        m_accessibility_tracked_tree.set(node.id, move(node));
+
+    StringBuilder builder;
+    HashTable<i64> built_ids;
+    for (auto const& node : document.build_accessibility_node_data()) {
+        built_ids.set(node.id);
+        auto tracked = m_accessibility_tracked_tree.find(node.id);
+        if (tracked == m_accessibility_tracked_tree.end())
+            builder.appendff("{} \"{}\": missing from the tree built from changes\n", node.role, node.name);
+        else if (tracked->value != node)
+            builder.appendff("{} \"{}\": differs in the tree built from changes\n", node.role, node.name);
+    }
+    for (auto const& [id, node] : m_accessibility_tracked_tree) {
+        if (!built_ids.contains(id))
+            builder.appendff("{} \"{}\": still in the tree built from changes\n", node.role, node.name);
+    }
+    return builder.to_string_without_validation();
+}
+
+String Internals::accessibility_cached_geometry_mismatches()
+{
+    StringBuilder builder;
+    for (auto const& mismatch : window().associated_document().cached_text_geometry_mismatches())
+        builder.appendff("{}\n", mismatch);
+    return builder.to_string_without_validation();
+}
+
 Utf16String Internals::dump_layout_tree(GC::Ref<DOM::Node> node)
 {
     // The test API's read of the render state of the node's document.
@@ -2671,6 +2751,13 @@ void Internals::inject_hover_pointer(double x, double y, Optional<double> frame_
     auto device_pixels_per_css_pixel = page().client().device_pixels_per_css_pixel();
     auto frame_time = frame_time_ms.has_value() ? document.relevant_settings_object().time_origin() + *frame_time_ms : HighResolutionTime::unsafe_shared_current_time();
     Layout::RustFFI::document_host_inject_pointer(document.layout_node_arena().host(), static_cast<float>(x * device_pixels_per_css_pixel), static_cast<float>(y * device_pixels_per_css_pixel), buttons, static_cast<i64>(frame_time * 1'000'000.0), input_event_id.value_or(0));
+}
+
+void Internals::inject_hover_pointer_left(double frame_time_ms)
+{
+    auto& document = window().associated_document();
+    auto frame_time = document.relevant_settings_object().time_origin() + frame_time_ms;
+    Layout::RustFFI::document_host_inject_pointer_left(document.layout_node_arena().host(), static_cast<i64>(frame_time * 1'000'000));
 }
 
 void Internals::note_animated_content_moved_under_pointer(double frame_time_ms)
@@ -3641,6 +3728,10 @@ GC::Ptr<JS::Object> Internals::take_context_menu_request()
     object->define_direct_property("target"_utf16_fly_string, target, JS::default_attributes);
     object->define_direct_property("x"_utf16_fly_string, JS::Value(request->position.x().to_double()), JS::default_attributes);
     object->define_direct_property("y"_utf16_fly_string, JS::Value(request->position.y().to_double()), JS::default_attributes);
+    if (request->link_url.has_value())
+        object->define_direct_property("linkURL"_utf16_fly_string, JS::PrimitiveString::create(vm(), utf16_string_from_url_ascii(request->link_url->serialize())), JS::default_attributes);
+    if (request->image_mime_type.has_value())
+        object->define_direct_property("imageMimeType"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16String::from_utf8(*request->image_mime_type)), JS::default_attributes);
     if (request->media.has_value()) {
         object->define_direct_property("isPictureInPicture"_utf16_fly_string, JS::Value(request->media->is_picture_in_picture), JS::default_attributes);
         object->define_direct_property("canEnterPictureInPicture"_utf16_fly_string, JS::Value(request->media->can_enter_picture_in_picture), JS::default_attributes);
@@ -3708,6 +3799,22 @@ GC::Ref<WebIDL::Promise> Internals::spell_check_settled()
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
     page().when_spell_checking_settled(GC::create_function(heap(), [&realm, promise] {
+        HTML::TemporaryExecutionContext execution_context { realm };
+        WebIDL::resolve_promise(promise);
+    }));
+    return promise;
+}
+
+void Internals::translate_page(Utf16String const& target_language)
+{
+    page().request_translation_for_testing(target_language.to_utf8_but_should_be_ported_to_utf16());
+}
+
+GC::Ref<WebIDL::Promise> Internals::translation_settled()
+{
+    auto& realm = window().principal_realm();
+    auto promise = WebIDL::create_promise_for(window());
+    page().when_translation_settled(GC::create_function(heap(), [&realm, promise] {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));

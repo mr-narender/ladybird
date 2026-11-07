@@ -158,6 +158,12 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
     m_page->cursor().set_send([&client = client(), id = m_id](Gfx::Cursor const& cursor) {
         client.async_did_request_cursor_change(id, cursor);
     });
+    m_page->hover_link().set_send([&client = client(), id = m_id](Optional<URL::URL> const& url) {
+        if (url.has_value())
+            client.async_did_hover_link(id, *url);
+        else
+            client.async_did_unhover_link(id);
+    });
 
     m_frame_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(0), [this] {
         if (m_is_closed)
@@ -1005,16 +1011,6 @@ void PageClient::page_did_leave_tooltip_area()
     client().async_did_leave_tooltip_area(m_id);
 }
 
-void PageClient::page_did_hover_link(URL::URL const& url)
-{
-    client().async_did_hover_link(m_id, url);
-}
-
-void PageClient::page_did_unhover_link()
-{
-    client().async_did_unhover_link(m_id);
-}
-
 void PageClient::page_did_click_link(Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers)
 {
     client().async_did_click_link(m_id, move(navigation), target, modifiers);
@@ -1179,7 +1175,7 @@ void PageClient::schedule_accessibility_tree_update()
 
     if (!m_accessibility_update_timer) {
         m_accessibility_update_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(200), [this] {
-            if (m_is_closed)
+            if (m_is_closed || !page().accessibility_interested())
                 return;
             publish_accessibility_tree(false);
         });
@@ -1206,15 +1202,16 @@ void PageClient::publish_accessibility_tree(bool whole_tree_requested)
         return;
     document->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
 
-    auto update = m_accessibility_tree_publisher.publish(static_cast<i64>(document->unique_id().value()), document->build_accessibility_node_data(), whole_tree_requested);
-    update.visit(
-        [](WebView::AccessibilityTreePublisher::NothingChanged) { },
-        [&](WebView::AccessibilityTreePublisher::WholeTree& tree) {
-            client().async_did_get_accessibility_tree(m_id, tree.sequence, move(tree.nodes));
-        },
-        [&](WebView::AccessibilityTreePublisher::Change& change) {
-            client().async_did_change_accessibility_tree(m_id, change.base_sequence, change.sequence, move(change.delta));
-        });
+    auto change = document->build_accessibility_tree_change(m_accessibility_change_tracker, whole_tree_requested);
+    if (change.is_whole_tree) {
+        client().async_did_get_accessibility_tree(m_id, ++m_accessibility_tree_sequence, move(change.nodes));
+        return;
+    }
+    if (change.nodes.is_empty() && change.removed_ids.is_empty())
+        return;
+    auto base_sequence = m_accessibility_tree_sequence++;
+    client().async_did_change_accessibility_tree(m_id, base_sequence, m_accessibility_tree_sequence,
+        WebView::AccessibilityTreeDelta { move(change.nodes), move(change.removed_ids) });
 }
 
 void PageClient::page_did_finish_test(Utf16String const& text)
@@ -1307,13 +1304,13 @@ void PageClient::page_did_request_link_context_menu(Web::HTML::CrossProcessId lo
     client().async_did_request_link_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, text_fragment_generation_id);
 }
 
-void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
+void PageClient::page_did_request_image_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, Web::HTML::PreparedNavigationDescriptor navigation, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer, Optional<Web::HTML::PreparedNavigationDescriptor> link_navigation, Optional<String> image_mime_type)
 {
     Optional<Gfx::ShareableBitmap> bitmap;
     if (bitmap_pointer.has_value() && bitmap_pointer.value())
         bitmap = bitmap_pointer.value()->to_shareable_bitmap();
 
-    client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, bitmap);
+    client().async_did_request_image_context_menu(m_id, local_root_id, page().css_to_device_point(content_position).to_type<int>(), move(navigation), target, modifiers, bitmap, move(link_navigation), move(image_mime_type));
 }
 
 void PageClient::page_did_request_media_context_menu(Web::HTML::CrossProcessId local_root_id, Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu, Optional<Web::HTML::PreparedNavigationDescriptor> navigation)
@@ -2136,6 +2133,16 @@ void PageClient::page_did_request_clipboard_entries(u64 request_id)
 void PageClient::page_did_request_spell_check(u64 request_id, Utf16String const& text)
 {
     client().async_did_request_spell_check(m_id, request_id, text);
+}
+
+void PageClient::page_did_request_translation(Web::TranslationUnit const& unit)
+{
+    client().async_did_request_translation(m_id, unit);
+}
+
+void PageClient::page_did_request_page_translation_for_testing(String const& target_language)
+{
+    client().async_did_request_page_translation_for_testing(m_id, target_language);
 }
 
 void PageClient::page_did_request_writing_suggestion(u64 request_id, Utf16String const& text, u32 caret_offset)

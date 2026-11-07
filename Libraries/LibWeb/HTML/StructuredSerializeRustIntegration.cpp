@@ -11,17 +11,16 @@
 #include <AK/Checked.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibGC/RootVector.h>
+#include <LibIPC/File.h>
+#include <LibIPC/Transport.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/Realm.h>
-#include <LibWeb/Bindings/ImageBitmap.h>
 #include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/MessagePort.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
-#include <LibWeb/Bindings/ReadableStream.h>
 #include <LibWeb/Bindings/RustSerialization.h>
-#include <LibWeb/Bindings/TransformStream.h>
-#include <LibWeb/Bindings/WritableStream.h>
+#include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/HTML/ImageBitmap.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
@@ -29,102 +28,84 @@
 
 // What the Rust implementation of structured serialization asks of LibWeb's C++ code, declared on the Rust side in
 // Libraries/LibWeb/Bindings/Rust/src/html/structured_serialize/cpp.rs. C++ keeps the records that the serializations
-// hand their bytes over to and the deserializations read the bytes of, the registry of serializable interfaces, the
-// platform objects, and the side tables that SharedArrayBuffers are shared through.
+// hand their bytes over to and the deserializations read the bytes of, C++ platform objects, and the side tables
+// that SharedArrayBuffers are shared through.
 
 using namespace Web;
 using namespace Web::HTML;
 
-// Whose steps serialize and deserialize the objects of a serializable interface.
-enum class SerializableSteps : u8 {
-    Rust,
-    DOMException,
-    QuotaExceededError,
-    CryptoKey,
-    RTCEncodedAudioFrame,
-};
+using ReceiveTransferPayload = void (*)(void*, ReadonlyBytes, TransferAttachment const*, size_t);
+
+namespace Web::HTML {
+
+Vector<IPC::Attachment> adopt_transfer_attachments(TransferAttachment const* raw, size_t count)
+{
+    Vector<IPC::Attachment> attachments;
+    for (size_t i = 0; i < count; ++i) {
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
+        auto disposition = static_cast<Core::MachPort::MessageRight>(raw[i].disposition);
+        auto right = Core::MachPort::PortRight::Send;
+        if (disposition == Core::MachPort::MessageRight::MoveReceive || disposition == Core::MachPort::MessageRight::MakeSend || disposition == Core::MachPort::MessageRight::MakeSendOnce)
+            right = Core::MachPort::PortRight::Receive;
+        else if (disposition == Core::MachPort::MessageRight::MoveSendOnce)
+            right = Core::MachPort::PortRight::SendOnce;
+        attachments.append(IPC::Attachment::from_mach_port(Core::MachPort::adopt_right(static_cast<mach_port_t>(raw[i].value), right), disposition));
+#else
+        attachments.append(IPC::Attachment::from_fd(raw[i].value));
+#endif
+    }
+    return attachments;
+}
+
+Vector<TransferAttachment> release_transfer_attachments(Vector<IPC::Attachment> attachments)
+{
+    Vector<TransferAttachment> raw;
+    for (auto& attachment : attachments) {
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
+        auto disposition = to_underlying(attachment.message_right());
+        raw.append({ static_cast<int>(attachment.release_mach_port().release()), disposition });
+#else
+        raw.append({ attachment.to_fd(), 0 });
+#endif
+    }
+    return raw;
+}
+
+}
 
 extern "C" {
 
 void web_structured_serialize_set_ipc_record(IPCSerializationRecord*, ReadonlyBytes data, JSObject* const* shared_array_buffers, size_t count);
 void web_structured_serialize_set_storage_record(StorageSerializationRecord*, ReadonlyBytes data);
-bool web_structured_serialize_interface_storage_identifier(u16 interface_name, ReadonlyBytes* identifier);
-bool web_structured_serialize_is_ipc_interface(u16 interface_name);
-bool web_structured_serialize_interface_name_from_storage_identifier(ReadonlyBytes identifier, u16* interface_name);
-bool web_structured_serialize_shared_buffers_append_shared_memory(Vector<Core::AnonymousBuffer>*, JSObject* array_buffer, u32* index);
 
 void web_structured_serialize_ipc_record_data(IPCSerializationRecord const*, ReadonlyBytes* data);
 JSObject* web_structured_serialize_ipc_record_shared_array_buffer(IPCSerializationRecord const*, u32 side_table_index);
-JSCompletion web_structured_serialize_shared_buffers_shared_array_buffer(Vector<Core::AnonymousBuffer> const*, void* realm, u32 index, u64 shared_object_id);
-size_t web_structured_serialize_byte_buffer_size(ByteBuffer*);
-JSObject* web_structured_serialize_array_buffer_from_byte_buffer(void* realm, ByteBuffer*, bool shared);
-void web_structured_serialize_byte_buffer_destroy(ByteBuffer*);
 JSCompletion web_structured_serialize_data_clone_error_from_serialization_error(void* realm, ReadonlyBytes message);
-
-u64 web_structured_serialize_serializable_payload_version();
 
 bool web_structured_serialize_current_settings_object_agent_cluster(u64* agent_cluster);
 bool web_structured_serialize_current_settings_object_cross_origin_isolated_capability();
 bool web_structured_serialize_realm_agent_cluster(void* realm, u64* agent_cluster);
 
-bool web_structured_serialize_is_platform_object(JSObject*);
-bool web_structured_serialize_serializable_interface_name(JSObject*, u16* interface_name);
-JSCompletion web_structured_serialize_serialization_steps(void* realm, JSObject*, void* serialized, bool for_storage);
+bool web_structured_serialize_cpp_interface_name(JSObject*, u16* interface_name);
 bool web_structured_serialize_is_exposed(u16 interface_name, void* realm);
-u8 web_structured_serialize_serializable_steps(u16 interface_name);
-JSCompletion web_structured_serialize_deserialize_rust_platform_object(u16 interface_name, void* realm, void* serialized);
 
-bool web_structured_serialize_is_transferable(JSObject*);
-bool web_structured_serialize_transferable_is_detached(JSObject*);
-void web_structured_serialize_transferable_set_detached(JSObject*);
-u8 web_structured_serialize_transferable_primary_interface(JSObject*);
-JSCompletion web_structured_serialize_transfer_steps(void* realm, JSObject*, TransferDataEncoder*, ImageBitmapSharedPixels*);
-bool web_structured_serialize_is_transferable_interface_exposed(u8 type, void* realm);
-JSCompletion web_structured_serialize_create_transferred_platform_object(u8 type, void* realm, TransferDataDecoder*);
-ImageBitmapSharedPixels* web_structured_serialize_gather_image_bitmap_pixels(Vector<Core::AnonymousBuffer>*, JSObject* const* transfer_list, size_t count);
+ImageBitmapSharedPixels* web_structured_serialize_gather_image_bitmap_pixels(JSObject* const* transfer_list, size_t count, u32 buffer_index, int* shared_memory, size_t* size);
 void web_structured_serialize_image_bitmap_pixels_destroy(ImageBitmapSharedPixels*);
 
-TransferDataEncoder* web_structured_serialize_transfer_data_holder_create();
-void web_structured_serialize_transfer_data_holder_encode_u8(TransferDataEncoder*, u8);
-void web_structured_serialize_transfer_data_holder_encode_bytes(TransferDataEncoder*, ReadonlyBytes);
-void web_structured_serialize_transfer_data_holder_encode_size(TransferDataEncoder*, size_t);
-void web_structured_serialize_transfer_data_holder_destroy(TransferDataEncoder*);
-SerializedTransferRecord* web_structured_serialize_transfer_record_create();
+TransferDataEncoder* web_structured_serialize_transfer_data_holder_create(ReadonlyBytes, TransferAttachment const*, size_t);
+void web_structured_serialize_transfer_data_holder_take(TransferDataEncoder*, void*, ReceiveTransferPayload);
+bool web_structured_serialize_validate_shared_memory(int, size_t);
+SerializedTransferRecord* web_structured_serialize_transfer_record_create(ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t, TransferDataEncoder* const*, size_t);
 void web_structured_serialize_transfer_record_destroy(SerializedTransferRecord*);
-void web_structured_serialize_transfer_record_set_serialized(SerializedTransferRecord*, ReadonlyBytes data, JSObject* const* shared_array_buffers, size_t count);
-Vector<Core::AnonymousBuffer>* web_structured_serialize_transfer_record_shared_buffers(SerializedTransferRecord*);
-void web_structured_serialize_transfer_record_append_data_holder(SerializedTransferRecord*, TransferDataEncoder*);
-size_t web_structured_serialize_transfer_record_data_holder_count(SerializedTransferRecord*);
-TransferDataDecoder* web_structured_serialize_transfer_record_take_data_holder(SerializedTransferRecord*, size_t index);
-IPCSerializationRecord const* web_structured_serialize_transfer_record_serialized(SerializedTransferRecord*);
-void web_structured_serialize_transfer_record_clear_shared_buffers(SerializedTransferRecord*);
+void web_structured_serialize_transfer_record_take(SerializedTransferRecord*, void*, void (*)(void*, ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t), void (*)(void*, TransferDataEncoder*));
+Vector<Core::AnonymousBuffer>* web_structured_serialize_shared_pixels_create(int const*, size_t const*, size_t);
+void web_structured_serialize_shared_pixels_destroy(Vector<Core::AnonymousBuffer>*);
 void web_structured_serialize_transferred_values_append(Vector<GC::Root<JS::Object>>*, JSObject*);
-JSCompletion web_structured_serialize_transfer_data_decoder_decode_u8(TransferDataDecoder*, void* realm, u8*);
-JSCompletion web_structured_serialize_transfer_data_decoder_decode_byte_buffer(TransferDataDecoder*, void* realm, ByteBuffer** buffer);
-JSCompletion web_structured_serialize_transfer_data_decoder_decode_size(TransferDataDecoder*, void* realm, size_t*);
-void web_structured_serialize_transfer_data_decoder_destroy(TransferDataDecoder*);
 }
 
 static JS::Realm& realm_from_abi(void* realm)
 {
     return *static_cast<JS::Realm*>(realm);
-}
-
-static JSCompletion void_completion_to_abi(JS::Realm& realm, WebIDL::ExceptionOr<void> result)
-{
-    if (result.is_exception())
-        return Bindings::completion_to_abi(realm, WebIDL::ExceptionOr<JS::Value> { result.release_error() });
-    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { JS::js_undefined() });
-}
-
-template<typename T>
-static JSCompletion decode_into(JS::Realm& realm, TransferDataDecoder& decoder, T& out_value)
-{
-    auto value = decode_or_throw_data_clone_error<T>(realm, decoder);
-    if (value.is_exception())
-        return Bindings::completion_to_abi(realm, WebIDL::ExceptionOr<JS::Value> { value.release_error() });
-    out_value = value.release_value();
-    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { JS::js_undefined() });
 }
 
 static JS::ArrayBuffer& array_buffer_from_abi(JSObject* array_buffer)
@@ -151,79 +132,9 @@ void web_structured_serialize_set_storage_record(StorageSerializationRecord* rec
     record->data = MUST(ByteBuffer::copy(data));
 }
 
-bool web_structured_serialize_interface_storage_identifier(u16 interface_name, ReadonlyBytes* identifier)
-{
-    for (auto const& entry : serializable_storage_registry()) {
-        if (entry.interface_name == static_cast<Bindings::InterfaceName>(interface_name)) {
-            *identifier = entry.identifier.bytes();
-            return true;
-        }
-    }
-    return false;
-}
-
-bool web_structured_serialize_is_ipc_interface(u16 interface_name)
-{
-    // Encoded audio frames can be cloned between agents, but cannot be stored.
-    if (static_cast<Bindings::InterfaceName>(interface_name) == Bindings::InterfaceName::RTCEncodedAudioFrame)
-        return true;
-    ReadonlyBytes identifier;
-    return web_structured_serialize_interface_storage_identifier(interface_name, &identifier);
-}
-
-bool web_structured_serialize_interface_name_from_storage_identifier(ReadonlyBytes identifier, u16* interface_name)
-{
-    for (auto const& entry : serializable_storage_registry()) {
-        if (entry.identifier.bytes() == identifier) {
-            *interface_name = to_underlying(entry.interface_name);
-            return true;
-        }
-    }
-    return false;
-}
-
-// AD-HOC: A SharedArrayBuffer backed by cross-process shared memory shares it through the side list of a record on the
-//         messaging path, which hands it over by file descriptor.
-bool web_structured_serialize_shared_buffers_append_shared_memory(Vector<Core::AnonymousBuffer>* shared_buffers, JSObject* array_buffer, u32* index)
-{
-    auto shared_buffer = array_buffer_from_abi(array_buffer).shared_buffer();
-    if (!shared_buffer.has_value())
-        return false;
-    *index = static_cast<u32>(shared_buffers->size());
-    shared_buffers->append(shared_buffer.release_value());
-    return true;
-}
-
 void web_structured_serialize_ipc_record_data(IPCSerializationRecord const* record, ReadonlyBytes* data)
 {
     *data = record->data.span();
-}
-
-size_t web_structured_serialize_byte_buffer_size(ByteBuffer* buffer)
-{
-    return buffer->size();
-}
-
-JSObject* web_structured_serialize_array_buffer_from_byte_buffer(void* realm, ByteBuffer* buffer, bool shared)
-{
-    auto array_buffer = JS::ArrayBuffer::create(realm_from_abi(realm), move(*buffer), shared ? JS::DataBlock::Shared::Yes : JS::DataBlock::Shared::No);
-    delete buffer;
-    return JS::HostABI::object_to_abi(array_buffer.ptr());
-}
-
-void web_structured_serialize_byte_buffer_destroy(ByteBuffer* buffer)
-{
-    delete buffer;
-}
-
-// AD-HOC: When the backing was transferred as cross-process shared memory, map it from the side list by index — so
-//         both agents reference the same bytes.
-JSCompletion web_structured_serialize_shared_buffers_shared_array_buffer(Vector<Core::AnonymousBuffer> const* shared_buffers, void* realm, u32 index, u64 shared_object_id)
-{
-    auto& js_realm = realm_from_abi(realm);
-    if (index >= shared_buffers->size())
-        return Bindings::completion_to_abi(js_realm, WebIDL::ExceptionOr<JS::Value> { data_clone_error_from_serialization_error(js_realm, AK::Error::from_string_literal("SharedArrayBuffer side-list index out of range")) });
-    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { JS::ArrayBuffer::create(js_realm, shared_buffers->at(index), shared_object_id) });
 }
 
 JSObject* web_structured_serialize_ipc_record_shared_array_buffer(IPCSerializationRecord const* record, u32 side_table_index)
@@ -239,11 +150,6 @@ JSCompletion web_structured_serialize_data_clone_error_from_serialization_error(
     auto& js_realm = realm_from_abi(realm);
     auto error = AK::Error::from_string_view(StringView { message });
     return Bindings::completion_to_abi(js_realm, WebIDL::ExceptionOr<JS::Value> { data_clone_error_from_serialization_error(js_realm, error) });
-}
-
-u64 web_structured_serialize_serializable_payload_version()
-{
-    return serializable_payload_version;
 }
 
 bool web_structured_serialize_current_settings_object_agent_cluster(u64* agent_cluster)
@@ -269,25 +175,13 @@ bool web_structured_serialize_realm_agent_cluster(void* realm, u64* agent_cluste
     return true;
 }
 
-bool web_structured_serialize_is_platform_object(JSObject* object)
+bool web_structured_serialize_cpp_interface_name(JSObject* object, u16* interface_name)
 {
-    return Bindings::is_platform_object(*JS::HostABI::object_from_abi(object));
-}
-
-bool web_structured_serialize_serializable_interface_name(JSObject* object, u16* interface_name)
-{
-    auto serializable = Bindings::serializable_from_object(*JS::HostABI::object_from_abi(object));
-    if (!serializable.has_value())
+    auto* wrappable = Bindings::wrappable_impl_from(JS::HostABI::object_from_abi(object));
+    if (!wrappable)
         return false;
-    *interface_name = to_underlying(serializable->interface_name);
+    *interface_name = to_underlying(wrappable->interface_name());
     return true;
-}
-
-JSCompletion web_structured_serialize_serialization_steps(void* realm, JSObject* object, void* serialized, bool for_storage)
-{
-    auto serializable = Bindings::serializable_from_object(*JS::HostABI::object_from_abi(object));
-    VERIFY(serializable.has_value());
-    return void_completion_to_abi(realm_from_abi(realm), serializable->serialization_steps(serialized, for_storage));
 }
 
 bool web_structured_serialize_is_exposed(u16 interface_name, void* realm)
@@ -295,97 +189,9 @@ bool web_structured_serialize_is_exposed(u16 interface_name, void* realm)
     return Bindings::is_exposed(static_cast<Bindings::InterfaceName>(interface_name), realm_from_abi(realm));
 }
 
-u8 web_structured_serialize_serializable_steps(u16 interface_name)
-{
-    switch (static_cast<Bindings::InterfaceName>(interface_name)) {
-    case Bindings::InterfaceName::DOMException:
-        return to_underlying(SerializableSteps::DOMException);
-    case Bindings::InterfaceName::QuotaExceededError:
-        return to_underlying(SerializableSteps::QuotaExceededError);
-    case Bindings::InterfaceName::CryptoKey:
-        return to_underlying(SerializableSteps::CryptoKey);
-    case Bindings::InterfaceName::RTCEncodedAudioFrame:
-        return to_underlying(SerializableSteps::RTCEncodedAudioFrame);
-    default:
-        VERIFY(Bindings::serializable_interface_is_implemented_in_rust(static_cast<Bindings::InterfaceName>(interface_name)));
-        return to_underlying(SerializableSteps::Rust);
-    }
-}
-
-JSCompletion web_structured_serialize_deserialize_rust_platform_object(u16 interface_name, void* realm, void* serialized)
-{
-    auto& js_realm = realm_from_abi(realm);
-    auto object = Bindings::deserialize_rust_platform_object(static_cast<Bindings::InterfaceName>(interface_name), js_realm, serialized);
-    if (object.is_exception())
-        return Bindings::completion_to_abi(js_realm, WebIDL::ExceptionOr<JS::Value> { object.release_error() });
-    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { object.release_value() });
-}
-
-bool web_structured_serialize_is_transferable(JSObject* object)
-{
-    return Bindings::transferable_from_object(*JS::HostABI::object_from_abi(object)).has_value();
-}
-
-bool web_structured_serialize_transferable_is_detached(JSObject* object)
-{
-    return Bindings::transferable_from_object(*JS::HostABI::object_from_abi(object))->is_detached();
-}
-
-void web_structured_serialize_transferable_set_detached(JSObject* object)
-{
-    Bindings::transferable_from_object(*JS::HostABI::object_from_abi(object))->set_detached();
-}
-
-u8 web_structured_serialize_transferable_primary_interface(JSObject* object)
-{
-    return to_underlying(Bindings::transferable_from_object(*JS::HostABI::object_from_abi(object))->primary_interface);
-}
-
-JSCompletion web_structured_serialize_transfer_steps(void* realm, JSObject* object, TransferDataEncoder* data_holder, ImageBitmapSharedPixels* image_bitmap_pixels)
-{
-    auto& js_realm = realm_from_abi(realm);
-    auto transferable = Bindings::transferable_from_object(*JS::HostABI::object_from_abi(object));
-    return void_completion_to_abi(js_realm, transferable->transfer_steps(js_realm, *data_holder, image_bitmap_pixels));
-}
-
-bool web_structured_serialize_is_transferable_interface_exposed(u8 type, void* realm)
-{
-    auto& js_realm = realm_from_abi(realm);
-    auto name = static_cast<TransferType>(type);
-    switch (name) {
-    case TransferType::MessagePort:
-        return is_exposed(Bindings::InterfaceName::MessagePort, js_realm);
-    case TransferType::ReadableStream:
-        return is_exposed(Bindings::InterfaceName::ReadableStream, js_realm);
-    case TransferType::WritableStream:
-        return is_exposed(Bindings::InterfaceName::WritableStream, js_realm);
-    case TransferType::TransformStream:
-        return is_exposed(Bindings::InterfaceName::TransformStream, js_realm);
-    case TransferType::ImageBitmap:
-        return is_exposed(Bindings::InterfaceName::ImageBitmap, js_realm);
-    case TransferType::OffscreenCanvas:
-        return is_exposed(Bindings::InterfaceName::OffscreenCanvas, js_realm);
-    case TransferType::Unknown:
-        dbgln("Unknown interface type for transfer: {}", to_underlying(name));
-        break;
-    default:
-        break;
-    }
-    return false;
-}
-
-JSCompletion web_structured_serialize_create_transferred_platform_object(u8 type, void* realm, TransferDataDecoder* decoder)
-{
-    auto& js_realm = realm_from_abi(realm);
-    auto object = Bindings::create_transferred_platform_object(static_cast<TransferType>(type), js_realm, *decoder);
-    if (object.is_exception())
-        return Bindings::completion_to_abi(js_realm, WebIDL::ExceptionOr<JS::Value> { object.release_error() });
-    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { object.release_value() });
-}
-
 // AD-HOC: Gather the pixels of the transferred ImageBitmaps in one buffer of shared memory. Without it, as when there
 //         is not enough memory for it, the pixels travel inline.
-ImageBitmapSharedPixels* web_structured_serialize_gather_image_bitmap_pixels(Vector<Core::AnonymousBuffer>* shared_buffers, JSObject* const* transfer_list, size_t count)
+ImageBitmapSharedPixels* web_structured_serialize_gather_image_bitmap_pixels(JSObject* const* transfer_list, size_t count, u32 buffer_index, int* shared_memory, size_t* size)
 {
     Checked<size_t> image_bitmap_pixels_size = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -397,8 +203,9 @@ ImageBitmapSharedPixels* web_structured_serialize_gather_image_bitmap_pixels(Vec
     auto buffer = Core::AnonymousBuffer::create_with_size(image_bitmap_pixels_size.value());
     if (buffer.is_error())
         return nullptr;
-    auto* image_bitmap_pixels = new ImageBitmapSharedPixels { .buffer = buffer.release_value(), .buffer_index = static_cast<u32>(shared_buffers->size()) };
-    shared_buffers->append(image_bitmap_pixels->buffer);
+    auto* image_bitmap_pixels = new ImageBitmapSharedPixels { .buffer = buffer.release_value(), .buffer_index = buffer_index };
+    *shared_memory = image_bitmap_pixels->buffer.fd();
+    *size = image_bitmap_pixels->buffer.size();
     return image_bitmap_pixels;
 }
 
@@ -407,34 +214,44 @@ void web_structured_serialize_image_bitmap_pixels_destroy(ImageBitmapSharedPixel
     delete image_bitmap_pixels;
 }
 
-TransferDataEncoder* web_structured_serialize_transfer_data_holder_create()
+TransferDataEncoder* web_structured_serialize_transfer_data_holder_create(ReadonlyBytes bytes, TransferAttachment const* attachments, size_t count)
 {
-    return new TransferDataEncoder;
+    IPC::MessageDataType data;
+    MUST(data.try_append(bytes.data(), bytes.size()));
+    return new TransferDataEncoder(IPC::MessageBuffer { move(data), adopt_transfer_attachments(attachments, count) });
 }
 
-void web_structured_serialize_transfer_data_holder_encode_u8(TransferDataEncoder* data_holder, u8 value)
+void web_structured_serialize_transfer_data_holder_take(TransferDataEncoder* holder, void* context, ReceiveTransferPayload receive)
 {
-    MUST(data_holder->encode(value));
+    auto owner = adopt_own(*holder);
+    auto buffer = owner->take_buffer();
+    auto attachments = release_transfer_attachments(buffer.take_attachments());
+    receive(context, buffer.data().span(), attachments.data(), attachments.size());
 }
 
-void web_structured_serialize_transfer_data_holder_encode_bytes(TransferDataEncoder* data_holder, ReadonlyBytes bytes)
+bool web_structured_serialize_validate_shared_memory(int descriptor, size_t size)
 {
-    MUST(data_holder->encode(bytes));
+    auto file = IPC::File::clone_fd(descriptor);
+    if (file.is_error())
+        return false;
+    auto buffer = Core::AnonymousBuffer::create_from_anon_fd(file.release_value().take_fd(), size);
+    if (buffer.is_error())
+        return false;
+    return !buffer.value().validate_backing_size().is_error();
 }
 
-void web_structured_serialize_transfer_data_holder_encode_size(TransferDataEncoder* data_holder, size_t value)
+// Takes over the descriptors and the data holders.
+SerializedTransferRecord* web_structured_serialize_transfer_record_create(ReadonlyBytes data, JSObject* const* shared_array_buffers, size_t shared_array_buffer_count, int const* shared_memory, size_t const* sizes, size_t shared_memory_count, TransferDataEncoder* const* holders, size_t holder_count)
 {
-    MUST(data_holder->encode(value));
-}
-
-void web_structured_serialize_transfer_data_holder_destroy(TransferDataEncoder* data_holder)
-{
-    delete data_holder;
-}
-
-SerializedTransferRecord* web_structured_serialize_transfer_record_create()
-{
-    return new SerializedTransferRecord;
+    auto* record = new SerializedTransferRecord;
+    record->serialized = create_ipc_serialization_record(data, shared_array_buffers_from_abi(shared_array_buffers, shared_array_buffer_count));
+    for (size_t i = 0; i < shared_memory_count; ++i)
+        record->shared_buffers.append(MUST(Core::AnonymousBuffer::create_from_anon_fd(shared_memory[i], sizes[i])));
+    for (size_t i = 0; i < holder_count; ++i) {
+        record->transfer_data_holders.append(move(*holders[i]));
+        delete holders[i];
+    }
+    return record;
 }
 
 void web_structured_serialize_transfer_record_destroy(SerializedTransferRecord* record)
@@ -442,74 +259,45 @@ void web_structured_serialize_transfer_record_destroy(SerializedTransferRecord* 
     delete record;
 }
 
-void web_structured_serialize_transfer_record_set_serialized(SerializedTransferRecord* record, ReadonlyBytes data, JSObject* const* shared_array_buffers, size_t count)
+// Rust roots the SharedArrayBuffers before this returns.
+void web_structured_serialize_transfer_record_take(SerializedTransferRecord* record, void* context, void (*receive)(void*, ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t), void (*append_holder)(void*, TransferDataEncoder*))
 {
-    record->serialized = create_ipc_serialization_record(data, shared_array_buffers_from_abi(shared_array_buffers, count));
-}
-
-Vector<Core::AnonymousBuffer>* web_structured_serialize_transfer_record_shared_buffers(SerializedTransferRecord* record)
-{
-    return &record->shared_buffers;
-}
-
-void web_structured_serialize_transfer_record_append_data_holder(SerializedTransferRecord* record, TransferDataEncoder* data_holder)
-{
-    record->transfer_data_holders.append(move(*data_holder));
-    delete data_holder;
-}
-
-size_t web_structured_serialize_transfer_record_data_holder_count(SerializedTransferRecord* record)
-{
-    return record->transfer_data_holders.size();
-}
-
-// A decoder of the data holder at the index, which it takes from the record, or null if the data holder is empty.
-TransferDataDecoder* web_structured_serialize_transfer_record_take_data_holder(SerializedTransferRecord* record, size_t index)
-{
-    auto& transfer_data_holder = record->transfer_data_holders[index];
-    if (transfer_data_holder.buffer().data().is_empty())
-        return nullptr;
-    auto* decoder = new TransferDataDecoder { move(transfer_data_holder) };
-    decoder->set_shared_buffers(record->shared_buffers);
-    return decoder;
-}
-
-IPCSerializationRecord const* web_structured_serialize_transfer_record_serialized(SerializedTransferRecord* record)
-{
-    return &record->serialized;
-}
-
-void web_structured_serialize_transfer_record_clear_shared_buffers(SerializedTransferRecord* record)
-{
+    Vector<JSObject*> buffers;
+    for (auto const& buffer : same_process_shared_array_buffers(record->serialized))
+        buffers.append(JS::HostABI::object_to_abi(buffer.ptr()));
+    Vector<int> descriptors;
+    Vector<size_t> sizes;
+    for (auto const& buffer : record->shared_buffers) {
+        descriptors.append(buffer.fd());
+        sizes.append(buffer.size());
+    }
+    receive(context, record->serialized.data.span(), buffers.data(), buffers.size(), descriptors.data(), sizes.data(), descriptors.size());
+    for (auto& holder : record->transfer_data_holders)
+        append_holder(context, new TransferDataEncoder(move(holder)));
     record->shared_buffers.clear();
+}
+
+Vector<Core::AnonymousBuffer>* web_structured_serialize_shared_pixels_create(int const* descriptors, size_t const* sizes, size_t count)
+{
+    Vector<Core::AnonymousBuffer> buffers;
+    for (size_t i = 0; i < count; ++i) {
+        auto file = IPC::File::clone_fd(descriptors[i]);
+        if (file.is_error())
+            return nullptr;
+        auto buffer = Core::AnonymousBuffer::create_from_anon_fd(file.release_value().take_fd(), sizes[i]);
+        if (buffer.is_error())
+            return nullptr;
+        buffers.append(buffer.release_value());
+    }
+    return new Vector<Core::AnonymousBuffer>(move(buffers));
+}
+
+void web_structured_serialize_shared_pixels_destroy(Vector<Core::AnonymousBuffer>* buffers)
+{
+    delete buffers;
 }
 
 void web_structured_serialize_transferred_values_append(Vector<GC::Root<JS::Object>>* transferred_values, JSObject* value)
 {
     transferred_values->append(GC::make_root(*JS::HostABI::object_from_abi(value)));
-}
-
-JSCompletion web_structured_serialize_transfer_data_decoder_decode_u8(TransferDataDecoder* decoder, void* realm, u8* value)
-{
-    return decode_into(realm_from_abi(realm), *decoder, *value);
-}
-
-JSCompletion web_structured_serialize_transfer_data_decoder_decode_byte_buffer(TransferDataDecoder* decoder, void* realm, ByteBuffer** buffer)
-{
-    auto& js_realm = realm_from_abi(realm);
-    auto decoded = decoder->decode_buffer();
-    if (decoded.is_exception())
-        return Bindings::completion_to_abi(js_realm, WebIDL::ExceptionOr<JS::Value> { decoded.release_error() });
-    *buffer = new ByteBuffer(decoded.release_value());
-    return JS::HostABI::completion_to_abi(JS::ThrowCompletionOr<JS::Value> { JS::js_undefined() });
-}
-
-JSCompletion web_structured_serialize_transfer_data_decoder_decode_size(TransferDataDecoder* decoder, void* realm, size_t* value)
-{
-    return decode_into(realm_from_abi(realm), *decoder, *value);
-}
-
-void web_structured_serialize_transfer_data_decoder_destroy(TransferDataDecoder* decoder)
-{
-    delete decoder;
 }

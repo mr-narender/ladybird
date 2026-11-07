@@ -43,6 +43,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ColorSpace.h>
 #include <LibGfx/DecodedImageFrame.h>
+#include <LibGfx/Gradients.h>
 
 namespace Compositor {
 
@@ -106,20 +107,6 @@ static void clip_to_rounded_rect(SkCanvas& canvas, auto const& rect, Gfx::Corner
         canvas.clipRect(to_skia_rect(rect), clip_op, true);
 }
 
-static SkMatrix to_skia_matrix(Gfx::AffineTransform const& affine_transform)
-{
-    SkScalar affine[6];
-    affine[0] = affine_transform.a();
-    affine[1] = affine_transform.b();
-    affine[2] = affine_transform.c();
-    affine[3] = affine_transform.d();
-    affine[4] = affine_transform.e();
-    affine[5] = affine_transform.f();
-
-    SkMatrix matrix;
-    matrix.setAffine(affine);
-    return matrix;
-}
 static SkM44 to_skia_matrix4x4(Gfx::FloatMatrix4x4 const& matrix)
 {
     return SkM44(
@@ -801,7 +788,7 @@ void DisplayListPlayerSkia::play_command(PaintOuterBoxShadow const& command)
 // shadows are.
 void DisplayListPlayerSkia::play_command(PaintPathBoxShadow const& command)
 {
-    auto shape = Gfx::to_skia_path(path_from_data(command.shape_path_data));
+    auto shape = path_from_data(command.shape_path_data);
 
     // The spread distance grows the shape of an outer shadow, and shrinks the shape whose outside casts an inner one,
     // by the outline of a stroke along the shape twice as wide.
@@ -1123,15 +1110,14 @@ SkPaint DisplayListPlayerSkia::paint_style_to_skia_paint(DisplayListPaintStyle c
     VERIFY_NOT_REACHED();
 }
 
-Gfx::Path DisplayListPlayerSkia::path_from_data(DisplayListDataSpan path_data) const
+SkPath DisplayListPlayerSkia::path_from_data(DisplayListDataSpan path_data) const
 {
-    auto bytes = inline_data(path_data);
-    return Gfx::Path::from_serialized_bytes(bytes);
+    return Gfx::skia_path_from_serialized_bytes(inline_data(path_data));
 }
 
 void DisplayListPlayerSkia::play_command(FillPath const& command)
 {
-    auto path = Gfx::to_skia_path(path_from_data(command.path_data));
+    auto path = path_from_data(command.path_data);
     path.setFillType(to_skia_path_fill_type(command.winding_rule));
 
     SkPaint paint;
@@ -1148,7 +1134,7 @@ void DisplayListPlayerSkia::play_command(FillPath const& command)
 
 void DisplayListPlayerSkia::play_command(StrokePath const& command)
 {
-    auto path = Gfx::to_skia_path(path_from_data(command.path_data));
+    auto path = path_from_data(command.path_data);
     SkPaint paint;
     if (command.paint_kind == PathPaintKind::PaintStyle) {
         paint = paint_style_to_skia_paint(command.paint_style, command.path_bounding_rect);
@@ -1510,7 +1496,7 @@ void DisplayListPlayerSkia::push_clip_path(Gfx::PathData const& path, u64 path_i
 void DisplayListPlayerSkia::push_clip_path_bytes(ReadonlyBytes path_bytes, Gfx::WindingRule winding_rule)
 {
     surface().canvas().save();
-    clip_path(Gfx::to_skia_path(Gfx::Path::from_serialized_bytes(path_bytes)), winding_rule, true);
+    clip_path(Gfx::skia_path_from_serialized_bytes(path_bytes), winding_rule, true);
 }
 
 void DisplayListPlayerSkia::push_transform(Gfx::AffineTransform const& transform)
@@ -1686,12 +1672,17 @@ void DisplayListPlayerSkia::pop()
     surface().canvas().restore();
 }
 
-void DisplayListPlayerSkia::push_device_space_plane_clip(Gfx::Path const& path)
+void DisplayListPlayerSkia::push_device_space_plane_clip(ReadonlySpan<Gfx::FloatVector3> polygon_vertices)
 {
+    Vector<SkPoint, 8> polygon_points;
+    polygon_points.ensure_capacity(polygon_vertices.size());
+    for (auto const& vertex : polygon_vertices)
+        polygon_points.unchecked_append(Gfx::to_skia_point(vertex));
+
     auto& canvas = surface().canvas();
     canvas.save();
     canvas.setMatrix(SkM44());
-    clip_path(Gfx::to_skia_path(path), Gfx::WindingRule::Nonzero, false);
+    clip_path(SkPath::Polygon({ polygon_points.data(), polygon_points.size() }, true), Gfx::WindingRule::Nonzero, false);
 }
 
 void DisplayListPlayerSkia::set_matrix(Gfx::FloatMatrix4x4 const& matrix)

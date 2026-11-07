@@ -12,6 +12,7 @@
 #include <AK/Noncopyable.h>
 #include <AK/OwnPtr.h>
 #include <AK/Queue.h>
+#include <AK/Time.h>
 #include <LibCore/Forward.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Weak.h>
@@ -141,6 +142,7 @@ public:
     u64 task_generation() const { return m_task_generation; }
 
     void schedule();
+    void schedule_for_queued_task();
 
     void perform_a_microtask_checkpoint();
 
@@ -173,6 +175,8 @@ public:
     GC::Ptr<EnvironmentSettingsObject> environment_settings_object_with_id(EnvironmentId const&) const;
 
     double compute_deadline() const;
+
+    void did_reject_promise_without_handler() { m_has_rejected_promises_to_notify_about = true; }
 
     void did_run_idle_callback() { m_task_generation_of_last_idle_callback = m_task_generation; }
     void did_request_idle_callback();
@@ -212,6 +216,8 @@ public:
     // The serial number of the first rendering update that may gather a resize observation of `document` made now. A
     // task beside a rendering update whose style and layout of the document have yet to run comes after the whole of it.
     u64 first_rendering_update_to_gather_resize_observations_of(DOM::Document const&) const;
+    // Whether the rendering task lets the tasks behind it go first, for a document to finish loading.
+    bool rendering_task_yields_to_document_loading() const;
     // A rendering task that would find a rendering update not yet finished keeps its place in the queue until the update
     // has finished, rather than wait for it. One that finds a frame still in flight runs beside it.
     bool holds_rendering_opportunity() const;
@@ -233,6 +239,8 @@ private:
     explicit EventLoop(Type);
 
     virtual void visit_edges(Visitor&) override;
+
+    [[nodiscard]] bool run_one_turn_of_the_processing_model();
 
     void process_input_events() const;
     Vector<GC::Root<DOM::Document>> take_clock_lanes_and_input_events_in(Optional<u64> update_serial);
@@ -280,9 +288,12 @@ private:
     GC::Ptr<Platform::Timer> m_idle_period_timer;
     u64 m_task_generation_of_last_idle_callback { 0 };
     bool m_idle_callback_requested_outside_idle_period { false };
+    bool m_may_have_idle_callbacks { false };
+    bool m_turn_requested_without_a_task { false };
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#performing-a-microtask-checkpoint
     bool m_performing_a_microtask_checkpoint { false };
+    bool m_has_rejected_promises_to_notify_about { false };
     u32 m_microtask_checkpoint_deferrals { 0 };
 
     mutable Vector<GC::Weak<DOM::Document>> m_documents;
@@ -306,6 +317,7 @@ private:
     bool m_rendering_task_queued { false };
     bool m_input_events_task_queued { false };
     bool m_rendering_update_requested { false };
+    MonotonicTime m_rendering_task_queued_time { MonotonicTime::now_coarse() };
 
     RenderingSchedulerCounters m_rendering_scheduler_counters;
     RenderingSchedulerCounters m_rendering_scheduler_counters_at_last_update;

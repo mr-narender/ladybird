@@ -105,6 +105,9 @@ public:
 
     SpellChecker* spell_checker() { return m_spell_checker.ptr(); }
     void set_spell_checker(OwnPtr<SpellChecker>);
+
+    Translator* translator() { return m_translator.ptr(); }
+    void set_translator(OwnPtr<Translator>);
     MicrophoneAuthorizer& microphone_authorizer();
     static FontService& font_service() { return *the().m_font_service; }
     static FontServiceHost& font_service_host() { return *the().m_font_service_host; }
@@ -122,6 +125,7 @@ public:
     virtual Web::CSS::PreferredColorScheme interface_color_scheme() const;
 
     static RequestServerManager& request_server_manager() { return *the().m_request_server_manager; }
+    static ImageDecoderManager& image_decoder_manager() { return *the().m_image_decoder_manager; }
     // The UI process's own client of the session's RequestServer with no site.
     static ErrorOr<NonnullRefPtr<Requests::RequestClient>> request_server_client(IsPrivate = IsPrivate::No);
     // The control connection of the default session's RequestServer with no site.
@@ -243,8 +247,6 @@ public:
     static IPC::HandleBrokerServer& handle_broker_server() { return *the().m_handle_broker_server; }
 #endif
 
-    // Runs the handler when the ImageDecoder with the given child ID exits.
-    void set_image_decoder_exit_handler(u64 child_id, Function<void()>);
 #if defined(AK_OS_MACOS)
     static IPC::TransportBootstrapMachServer& transport_bootstrap_server() { return the().m_transport_bootstrap_server; }
     void set_browser_process_transport_handler(Function<void(NonnullOwnPtr<IPC::Transport>)> handler);
@@ -335,8 +337,6 @@ public:
     ErrorOr<String> download_directory_path_for_frontend_action(FileDownloader::Download const&) const;
     virtual void open_download(FileDownloader::Download const&) const;
     virtual void show_download_in_folder(FileDownloader::Download const&) const;
-
-    void offer_newest_pending_crash_report();
 
     // FIXME: We should implement UI-agnostic platform APIs to interact with the system clipboard.
     enum class ClipboardType : u8 {
@@ -458,12 +458,11 @@ protected:
     virtual NonnullOwnPtr<MicrophoneAuthorizer> create_microphone_authorizer();
 
     virtual bool should_coordinate_browser_process() const { return true; }
+    virtual bool captures_browser_crashes() const { return false; }
     virtual bool should_use_os_geolocation() const { return true; }
     virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::IFrame; }
 
     virtual NonnullRefPtr<Core::Promise<ByteString>> ask_user_for_download_path(ByteString const& file) const;
-
-    virtual void display_crash_report_notification([[maybe_unused]] ByteString const& report_name) { }
 
     virtual void update_tabs_display() const { }
 
@@ -491,7 +490,6 @@ private:
     void handle_compositor_process_death();
     void recover_compositor_process();
     void crash_compositor_process();
-    void offer_crash_report(ByteString const& report_name);
     ErrorOr<void> launch_request_server();
     ErrorOr<void> launch_devtools_server();
     // Returns whether the combined rules changed.
@@ -671,7 +669,7 @@ private:
     WebDriverSessionConfig m_webdriver_session_config;
 
     OwnPtr<RequestServerManager> m_request_server_manager;
-    HashMap<u64, Function<void()>> m_image_decoder_exit_handlers;
+    OwnPtr<ImageDecoderManager> m_image_decoder_manager;
     RefPtr<CompositorClient> m_compositor_client;
     RefPtr<CompositorPresentationClient> m_compositor_presentation_client;
     u64 m_compositor_presentation_id { 0 };
@@ -708,6 +706,7 @@ private:
 
     OwnPtr<Core::GeolocationProvider> m_geolocation_provider;
     OwnPtr<SpellChecker> m_spell_checker;
+    OwnPtr<Translator> m_translator;
     OwnPtr<MicrophoneAuthorizer> m_microphone_authorizer;
     OwnPtr<Core::TimeZoneWatcher> m_time_zone_watcher;
 

@@ -6,6 +6,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/MemoryStream.h>
+#include <LibIPC/Decoder.h>
+#include <LibIPC/Encoder.h>
+#include <LibIPC/Transport.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibJS/Runtime/VM.h>
@@ -29,11 +34,21 @@ void web_rust_message_port_discard_pending_messages(void* port);
 size_t web_rust_message_port_pending_outgoing_message_count(void* port);
 void web_rust_message_port_fail_next_transfer_for_testing(void* port);
 void web_rust_message_port_disentangle_ports_of_realm(JSVM*, void* realm);
+JSCompletion web_rust_message_port_transfer_steps(JSVM*, void* realm, void* port, TransferDataEncoder** out_data_holder);
+JSCompletion web_rust_message_port_transfer_receiving_steps(JSVM*, void* realm, TransferDataEncoder*);
 
-// The entry points of the generated bindings of the interface.
-bool web_rust_message_port_is_detached(void* port);
-JSCompletion web_rust_message_port_transfer_steps(JSVM*, void* realm, void* port, Bindings::RustTransferDataWriter*);
-JSCompletion web_rust_message_port_transfer_receiving_steps(JSVM*, void* realm, Bindings::RustTransferDataReader*);
+// Declared in Bindings/Rust/src/html/message_port.rs.
+IPC::Transport* web_bindings_message_port_transport_create_paired(IPC::TransportHandle** out_remote_handle);
+void web_bindings_message_port_transport_destroy(IPC::Transport*);
+IPC::TransportHandle* web_bindings_message_port_transport_release_for_transfer(IPC::Transport*);
+void web_bindings_message_port_transport_set_up_read_hook(IPC::Transport*, void* state, void (*steps)(void*));
+bool web_bindings_message_port_transport_is_open(IPC::Transport*);
+void web_bindings_message_port_transport_close(IPC::Transport*);
+void web_bindings_message_port_transport_close_after_sending_all_pending_messages(IPC::Transport*);
+bool web_bindings_message_port_transport_send(IPC::Transport*, ReadonlyBytes, TransferAttachment const*, size_t);
+bool web_bindings_message_port_transport_read_messages(IPC::Transport*, void*, bool (*)(void*, ReadonlyBytes, TransferAttachment const*, size_t));
+void web_bindings_transport_handle_take(IPC::TransportHandle*, void*, void (*)(void*, ReadonlyBytes, TransferAttachment const*, size_t));
+IPC::Transport* web_bindings_transport_handle_create_transport(ReadonlyBytes, TransferAttachment const*, size_t);
 }
 
 static JSVM* vm_abi()
@@ -46,10 +61,9 @@ GC::Ref<MessagePort> MessagePort::create(JS::Realm& realm)
     return GC::Ref { *static_cast<MessagePort*>(web_rust_message_port_create(vm_abi(), &realm)) };
 }
 
-GC::Ref<MessagePort> MessagePort::create_from_transfer(JS::Realm& realm, TransferDataDecoder& data_holder)
+GC::Ref<MessagePort> MessagePort::create_from_transfer(JS::Realm& realm, TransferDataEncoder&& data_holder)
 {
-    Bindings::RustTransferDataReader reader { .realm = realm, .data_holder = data_holder };
-    auto wrapper = MUST(JS::HostABI::completion_from_abi<JS::Value>(web_rust_message_port_transfer_receiving_steps(vm_abi(), &realm, &reader)));
+    auto wrapper = MUST(JS::HostABI::completion_from_abi<JS::Value>(web_rust_message_port_transfer_receiving_steps(vm_abi(), &realm, new TransferDataEncoder(move(data_holder)))));
     return *Bindings::impl_from<MessagePort>(&wrapper.as_object());
 }
 
@@ -98,16 +112,13 @@ void MessagePort::discard_pending_messages()
     web_rust_message_port_discard_pending_messages(this);
 }
 
-WebIDL::ExceptionOr<void> MessagePort::transfer_steps(JS::Realm& realm, TransferDataEncoder& data_holder)
+WebIDL::ExceptionOr<TransferDataEncoder> MessagePort::transfer_steps(JS::Realm& realm)
 {
-    Bindings::RustTransferDataWriter writer { .realm = realm, .data_holder = data_holder };
-    TRY(JS::HostABI::completion_from_abi<void>(web_rust_message_port_transfer_steps(vm_abi(), &realm, this, &writer)));
-    return {};
-}
-
-bool MessagePort::is_detached() const
-{
-    return web_rust_message_port_is_detached(const_cast<MessagePort*>(this));
+    TransferDataEncoder* data_holder = nullptr;
+    TRY(JS::HostABI::completion_from_abi<void>(web_rust_message_port_transfer_steps(vm_abi(), &realm, this, &data_holder)));
+    auto result = move(*data_holder);
+    delete data_holder;
+    return result;
 }
 
 size_t MessagePort::pending_outgoing_message_count() const
@@ -120,18 +131,91 @@ void MessagePort::fail_next_transfer_for_testing()
     web_rust_message_port_fail_next_transfer_for_testing(this);
 }
 
+IPC::Transport* web_bindings_message_port_transport_create_paired(IPC::TransportHandle** out_remote_handle)
+{
+    auto paired = MUST(IPC::Transport::create_paired());
+    *out_remote_handle = new IPC::TransportHandle(move(paired.remote_handle));
+    return paired.local.leak_ptr();
 }
 
-namespace Web::Bindings {
-
-GC::RootVector<GC::Ref<HTML::MessagePort>> message_ports_from_transferred_values(Vector<GC::Root<JS::Object>> const& transferred_values)
+void web_bindings_message_port_transport_destroy(IPC::Transport* transport)
 {
-    GC::RootVector<GC::Ref<HTML::MessagePort>> ports;
-    for (auto const& object : transferred_values) {
-        if (auto* message_port = impl_from<HTML::MessagePort>(object.ptr()))
-            ports.append(*message_port);
+    delete transport;
+}
+
+// The rights of the transport's end as a handle, handed over, after its IO thread stops.
+IPC::TransportHandle* web_bindings_message_port_transport_release_for_transfer(IPC::Transport* transport)
+{
+    return new IPC::TransportHandle(MUST(transport->release_for_transfer()));
+}
+
+void web_bindings_message_port_transport_set_up_read_hook(IPC::Transport* transport, void* state, void (*steps)(void*))
+{
+    transport->set_up_read_hook([state, steps] { steps(state); });
+}
+
+bool web_bindings_message_port_transport_is_open(IPC::Transport* transport)
+{
+    return transport->is_open();
+}
+
+void web_bindings_message_port_transport_close(IPC::Transport* transport)
+{
+    transport->close();
+}
+
+void web_bindings_message_port_transport_close_after_sending_all_pending_messages(IPC::Transport* transport)
+{
+    transport->close_after_sending_all_pending_messages();
+}
+
+void web_bindings_transport_handle_take(IPC::TransportHandle* handle, void* context, void (*receive)(void*, ReadonlyBytes, TransferAttachment const*, size_t))
+{
+    auto owner = adopt_own(*handle);
+    IPC::MessageBuffer buffer;
+    IPC::Encoder encoder(buffer);
+    MUST(encoder.encode(*owner));
+    auto attachments = release_transfer_attachments(buffer.take_attachments());
+    receive(context, buffer.data().span(), attachments.data(), attachments.size());
+}
+
+IPC::Transport* web_bindings_transport_handle_create_transport(ReadonlyBytes bytes, TransferAttachment const* attachments, size_t count)
+{
+    FixedMemoryStream stream(bytes);
+    Queue<IPC::Attachment> queue;
+    for (auto& attachment : adopt_transfer_attachments(attachments, count))
+        queue.enqueue(move(attachment));
+    IPC::Decoder decoder(stream, queue);
+    auto handle = MUST(decoder.decode<IPC::TransportHandle>());
+    return MUST(handle.create_transport()).leak_ptr();
+}
+
+bool web_bindings_message_port_transport_send(IPC::Transport* transport, ReadonlyBytes bytes, TransferAttachment const* attachments, size_t count)
+{
+    IPC::MessageDataType data;
+    MUST(data.try_append(bytes.data(), bytes.size()));
+    IPC::MessageBuffer buffer { move(data), adopt_transfer_attachments(attachments, count) };
+    if (auto result = buffer.transfer_message(*transport); result.is_error()) {
+        dbgln("Failed to post message: {}", result.error());
+        return false;
     }
-    return ports;
+    return true;
+}
+
+bool web_bindings_message_port_transport_read_messages(IPC::Transport* transport, void* context, bool (*receive)(void*, ReadonlyBytes, TransferAttachment const*, size_t))
+{
+    bool failed_to_decode = false;
+    auto should_shutdown = transport->read_as_many_messages_as_possible_without_blocking([&](auto&& message) {
+        // The peer is treated as gone after a malformed record. Later messages still release all their attachments.
+        if (failed_to_decode)
+            return;
+        Vector<IPC::Attachment> attachments;
+        while (!message.attachments.is_empty())
+            attachments.append(message.attachments.dequeue());
+        auto raw_attachments = release_transfer_attachments(move(attachments));
+        failed_to_decode = !receive(context, message.bytes.bytes(), raw_attachments.data(), raw_attachments.size());
+    });
+    return failed_to_decode || should_shutdown == IPC::Transport::ShouldShutdown::Yes;
 }
 
 }

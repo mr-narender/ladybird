@@ -72,12 +72,12 @@ public:
     void did_destroy_compositor_context(Web::CompositorContextId);
 
     Function<void(IPC::TransportHandle const&, Optional<int> client_id, Optional<Utf16String> const& top_level_site)> on_request_server_connection;
-    Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
 
     // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_audio_server_transport();
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_webrtc_client_transport();
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_image_decoder_transport();
 
     // Null outside test mode: the UI process connects the test endpoint only when it runs tests.
     TestConnection* test_connection();
@@ -116,7 +116,7 @@ private:
     virtual void connect_to_web_ui(Web::PageId page_id, IPC::TransportHandle handle) override;
     virtual void connect_to_request_server(IPC::TransportHandle handle, int client_id, Optional<Utf16String> top_level_site) override;
     virtual void connect_to_test_endpoint(IPC::TransportHandle handle) override;
-    virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
+    virtual void disconnect_from_image_decoder() override;
     virtual void connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle) override;
     virtual void set_site_compatibility_data(JsonValue data) override;
     virtual void set_permission_snapshot(Web::Permissions::PermissionSnapshot snapshot) override;
@@ -302,6 +302,10 @@ private:
     virtual void retrieved_clipboard_entries(Web::PageId page_id, u64 request_id, Vector<Web::Clipboard::SystemClipboardItem>) override;
     virtual void did_check_spelling(Web::PageId page_id, u64 request_id, Vector<Web::SpellingError> errors) override;
     virtual void did_get_writing_suggestion(Web::PageId page_id, u64 request_id, Optional<Web::WritingSuggestion> suggestion) override;
+    virtual void request_translation_language_sample(Web::PageId page_id, u64 request_id) override;
+    virtual void start_translation(Web::PageId page_id, String source_language, String target_language) override;
+    virtual void stop_translation(Web::PageId page_id) override;
+    virtual void did_translate(Web::PageId page_id, Web::TranslatedUnit unit) override;
     virtual void replace_context_menu_misspelling(Web::PageId page_id, Utf16String replacement) override;
     virtual void accept_spelling_word(Web::PageId page_id, Utf16String word) override;
     virtual void forget_accepted_spelling_words(Web::PageId page_id) override;

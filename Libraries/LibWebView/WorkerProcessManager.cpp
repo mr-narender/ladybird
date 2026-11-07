@@ -9,6 +9,7 @@
 #include <LibCore/Timer.h>
 #include <LibIPC/File.h>
 #include <LibURL/Parser.h>
+#include <LibURL/Site.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalEnvironmentSettingsObject.h>
 #include <LibWebView/CanonicalNavigable.h>
@@ -210,8 +211,6 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
                 client->request_server_site_bindings().bind_sites_of(web_worker_owner.client->request_server_site_bindings());
             });
 
-        auto image_decoder = TRY(launch_image_decoder_process());
-
         // The worker's requests go through the RequestServers of its owner's sites.
         TRY(client->request_server_site_bindings().connect(*session));
         client->async_set_site_compatibility_data(Application::the().site_compatibility_data());
@@ -222,7 +221,6 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
         client->async_set_user_agent(Application::the().user_agent_string());
         client->async_set_navigator_compatibility_mode(Application::the().navigator_compatibility_mode());
         client->async_set_preferred_languages(Application::settings().languages());
-        connect_to_image_decoder(*client, move(image_decoder));
 
         if (auto compositor_handle = Application::the().connect_new_compositor_canvas_client(); !compositor_handle.is_error())
             client->async_connect_to_compositor(compositor_handle.release_value());
@@ -252,6 +250,7 @@ Web::HTML::WorkerAgentId WorkerProcessManager::start_worker_agent(Owner owner, O
     //     settings it is created for, too.
     auto inside_settings = make<CanonicalWorkerEnvironmentSettingsObject>(move(origin), outside_settings->top_level_origin(), has_cross_site_ancestor, Web::HTML::EnvironmentId::generate());
     auto environment_id = inside_settings->id();
+    client->set_site(URL::Site::serialize_for_partitioning(inside_settings->origin()));
 
     // NB: The task manager lists the worker's process with the process that started it, and once that one is gone,
     //     with the site of the worker's origin.

@@ -10,6 +10,8 @@
 #include <LibWebView/CanonicalTraversable.h>
 #include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/NotificationBackend.h>
+#include <LibWebView/PageTranslation.h>
+#include <LibWebView/PictureInPictureManager.h>
 #if defined(AK_OS_MACOS)
 #    include <LibWebView/MicrophoneAuthorizerMacOS.h>
 #    include <LibWebView/NotificationBackendMacOS.h>
@@ -66,6 +68,10 @@
 #include <QShortcut>
 #include <QStandardPaths>
 #include <QTimer>
+
+#if defined(AK_OS_MACOS)
+#    include <QUtiMimeConverter>
+#endif
 
 #if defined(AK_OS_WINDOWS)
 #    include <AK/Windows.h>
@@ -577,6 +583,34 @@ private:
     QAction* m_quit_action { nullptr };
 };
 
+#if defined(AK_OS_MACOS)
+// Qt stores a MIME type it has no converter for under a private type that only Qt applications can read. This puts PNG
+// data on the pasteboard as public.png, for other applications to paste. The bytes pass through undecoded, as they may
+// come from a page.
+class PNGMimeConverter final : public QUtiMimeConverter {
+public:
+    virtual QString utiForMime(QString const& mime) const override
+    {
+        return mime == "image/png" ? QStringLiteral("public.png") : QString {};
+    }
+
+    virtual QString mimeForUti(QString const& uti) const override
+    {
+        return uti == "public.png" ? QStringLiteral("image/png") : QString {};
+    }
+
+    virtual QVariant convertToMime(QString const&, QList<QByteArray> const& data, QString const&) const override
+    {
+        return data.isEmpty() ? QVariant {} : QVariant { data.first() };
+    }
+
+    virtual QList<QByteArray> convertFromMime(QString const&, QVariant const& data, QString const&) const override
+    {
+        return { data.toByteArray() };
+    }
+};
+#endif
+
 Application::Application() = default;
 Application::~Application()
 {
@@ -592,6 +626,9 @@ Application::~Application()
     }
     for (auto& window : windows)
         delete window.data();
+
+    // A Picture-in-Picture window is a widget too, so it must also go before the QApplication does.
+    WebView::PictureInPictureManager::the().destroy_all_windows();
 }
 
 void Application::show_process_manager()
@@ -647,6 +684,10 @@ Core::EventLoop& Application::create_platform_event_loop()
         qputenv("NO_AT_BRIDGE", "1");
 #endif
         m_application = make<LadybirdQApplication>(arguments());
+#if defined(AK_OS_MACOS)
+        // NB: Qt owns its converters, and deletes them along with the QApplication.
+        new PNGMimeConverter;
+#endif
 #if defined(AK_OS_LINUX)
         QGuiApplication::setDesktopFileName(QStringLiteral("org.ladybird.Ladybird"));
         Ladybird::clip_translucent_windows_that_cannot_blend();
@@ -1136,21 +1177,17 @@ void Application::reopen_recently_closed_tab(BrowserWindow* target_window, Optio
     update_reopen_recently_closed_actions();
 }
 
-void Application::display_crash_report_notification(ByteString const& report_name)
+void Application::crash_reports_changed()
 {
-    m_crash_report_notifier.offer(report_name);
+    update_feedback_buttons();
 }
 
-void Application::review_crash_report(ByteString const& report_name)
+void Application::update_feedback_buttons()
 {
-    if (!m_active_window)
-        return;
-
-    // The tab is blank, so no web content runs behind the review, and it closes once the review is left.
-    auto* current_tab = m_active_window->current_tab();
-    auto& tab = m_active_window->new_tab_from_url(URL::about_blank(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
-    tab.view().review_hidden_crash_report(report_name);
-    tab.enter_report_review(current_tab);
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget))
+            window->toolbar().update_feedback_button();
+    }
 }
 
 void Application::open_file()
@@ -1943,6 +1980,17 @@ QMenuBar* Application::create_application_menu_bar(ForBrowserWindow for_browser_
         zoom_menu->addAction(zoom_in_action());
         zoom_menu->addAction(zoom_out_action());
         zoom_menu->addAction(reset_zoom_action());
+
+        // The translation menu is the active tab's, so it's filled in as it opens.
+        if (WebView::Application::the().translator()) {
+            auto* translation_menu = view_menu->addMenu("&Translation");
+            QObject::connect(translation_menu, &QMenu::aboutToShow, translation_menu, [translation_menu] {
+                if (auto* tab = Application::the().active_tab())
+                    repopulate_application_menu(*translation_menu, tab->view().page_translation().translation_menu());
+                else
+                    translation_menu->clear();
+            });
+        }
         view_menu->addSeparator();
     }
     view_menu->addMenu(create_application_menu(*view_menu, application.color_scheme_menu()));

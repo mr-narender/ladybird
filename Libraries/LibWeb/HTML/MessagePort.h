@@ -27,7 +27,7 @@ public:
     [[nodiscard]] static GC::Ref<MessagePort> create(JS::Realm&);
 
     // https://html.spec.whatwg.org/multipage/web-messaging.html#message-ports:transfer-receiving-steps
-    [[nodiscard]] static GC::Ref<MessagePort> create_from_transfer(JS::Realm&, TransferDataDecoder&);
+    [[nodiscard]] static GC::Ref<MessagePort> create_from_transfer(JS::Realm&, TransferDataEncoder&&);
 
     static void disentangle_ports_of_realm(JS::Realm&);
 
@@ -49,19 +49,10 @@ public:
     void discard_pending_messages();
 
     // https://html.spec.whatwg.org/multipage/web-messaging.html#message-ports:transfer-steps
-    WebIDL::ExceptionOr<void> transfer_steps(JS::Realm&, TransferDataEncoder&);
-
-    // https://html.spec.whatwg.org/multipage/structured-data.html#detached
-    bool is_detached() const;
+    WebIDL::ExceptionOr<TransferDataEncoder> transfer_steps(JS::Realm&);
 
     size_t pending_outgoing_message_count() const;
     void fail_next_transfer_for_testing();
 };
-
-}
-
-namespace Web::Bindings {
-
-WEB_API GC::RootVector<GC::Ref<HTML::MessagePort>> message_ports_from_transferred_values(Vector<GC::Root<JS::Object>> const&);
 
 }

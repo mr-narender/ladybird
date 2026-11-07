@@ -271,6 +271,7 @@
 #include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/SVG/TagNames.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/Translation/DocumentTranslator.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 #include <LibWeb/UIEvents/CompositionEvent.h>
@@ -303,8 +304,39 @@ namespace Web::DOM {
 
 struct Document::AccessibilityRecordCache {
     AK_ALLOC_WITH_KMALLOC;
-    HashMap<UniqueNodeID, WebView::AccessibilityNodeData> records;
+    struct Record {
+        WebView::AccessibilityNodeData data;
+        u64 version { 0 };
+        Optional<CachedTextGeometry> text_geometry;
+    };
+    HashMap<UniqueNodeID, Record> records;
+    u64 next_version { 1 };
 };
+
+static void release_text_geometry_sources(Vector<Document::CachedTextGeometry::Source>& sources)
+{
+    for (auto const& source : sources)
+        Layout::RustFFI::layout_release_inline_content(source.line_content);
+    sources.clear();
+}
+
+Document::CachedTextGeometry& Document::CachedTextGeometry::operator=(CachedTextGeometry&& other)
+{
+    if (this == &other)
+        return *this;
+    release_text_geometry_sources(sources);
+    sources = move(other.sources);
+    version = other.version;
+    character_offsets = move(other.character_offsets);
+    line_break_character_offsets = move(other.line_break_character_offsets);
+    line_heights = move(other.line_heights);
+    return *this;
+}
+
+Document::CachedTextGeometry::~CachedTextGeometry()
+{
+    release_text_geometry_sources(sources);
+}
 
 static CSS::ComputedValuesFFI::FfiUtf16View ffi_utf16_view(Utf16View view)
 {
@@ -519,6 +551,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->m_content_type = move(content_type);
     document->set_origin(navigation_params.origin);
     document->set_browsing_context(browsing_context);
+    document->m_navigable_awaiting_activation = navigation_params.navigable.ptr();
     document->m_policy_container = navigation_params.policy_container;
     document->set_opener_policy(navigation_params.opener_policy);
     document->m_permissions_policy = permissions_policy.release_value();
@@ -1018,7 +1051,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_associated_inert_template_document);
     visitor.visit(m_appropriate_template_contents_owner_document);
     visitor.visit(m_pending_parsing_blocking_script);
-    visitor.visit(m_pending_parsing_blocking_svg_script);
     visitor.visit(m_history);
     visitor.visit(m_html_parser_end_state);
     visitor.visit(m_ongoing_navigation_fetch);
@@ -1088,6 +1120,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
         m_spelling_markers->visit_edges(visitor);
     if (m_spell_check_controller)
         m_spell_check_controller->visit_edges(visitor);
+    if (m_document_translator)
+        m_document_translator->visit_edges(visitor);
     if (m_writing_suggestion_controller)
         m_writing_suggestion_controller->visit_edges(visitor);
 
@@ -1383,6 +1417,18 @@ Editing::SpellCheckController& Document::spell_check_controller()
     return *m_spell_check_controller;
 }
 
+Translation::DocumentTranslator& Document::document_translator()
+{
+    if (!m_document_translator)
+        m_document_translator = make<Translation::DocumentTranslator>(*this);
+    return *m_document_translator;
+}
+
+void Document::forget_document_translator()
+{
+    m_document_translator = nullptr;
+}
+
 Editing::WritingSuggestionController& Document::writing_suggestion_controller()
 {
     if (!m_writing_suggestion_controller)
@@ -1607,14 +1653,11 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<Utf16String> const&, Opti
     //          parser script runner's pending parsing-blocking and deferred scripts when replacing the parser, and
     //          Gecko cancels pending parser script loads when terminating the parser. Stop discarded scripts from
     //          delaying the replacement document's load event before removing them from the parser's queues.
-    if (m_pending_parsing_blocking_script)
-        m_pending_parsing_blocking_script->stop_delaying_document_load_event({});
-    if (m_pending_parsing_blocking_svg_script)
-        m_pending_parsing_blocking_svg_script->stop_delaying_document_load_event({});
+    if (auto* pending_parsing_blocking_script = this->pending_parsing_blocking_script())
+        pending_parsing_blocking_script->stop_delaying_document_load_event({});
     for (auto& script : m_scripts_to_execute_when_parsing_has_finished)
-        script->stop_delaying_document_load_event({});
+        as<HTML::HTMLOrSVGScriptElement>(*script).stop_delaying_document_load_event({});
     m_pending_parsing_blocking_script = nullptr;
-    m_pending_parsing_blocking_svg_script = nullptr;
     m_scripts_to_execute_when_parsing_has_finished.clear();
 
     // 16. Create an HTML parser whose allow declarative shadow roots is document's allow declarative shadow roots, and
@@ -2262,6 +2305,21 @@ String const& Document::serialized_base_url() const
     if (!m_serialized_base_url.has_value())
         m_serialized_base_url = base_url().serialize();
     return *m_serialized_base_url;
+}
+
+HoverLinkReporter& Document::hover_link_reporter()
+{
+    if (!m_hover_link_reporter)
+        m_hover_link_reporter = HoverLinkReporter::create(page().hover_link(), unique_id());
+    return *m_hover_link_reporter;
+}
+
+void Document::update_hover_link_base()
+{
+    auto& reporter = hover_link_reporter();
+    auto encoding = encoding_or_default();
+    if (!reporter.resolves_as(serialized_base_url(), encoding))
+        reporter.set_base(base_url(), move(encoding));
 }
 
 // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#encoding-parsing-a-url
@@ -4036,35 +4094,38 @@ WebIDL::ExceptionOr<GC::Ref<Event>> Document::create_event(Utf16FlyString const&
     return GC::Ref(*event);
 }
 
-void Document::set_pending_parsing_blocking_script(HTML::HTMLScriptElement* script)
+void Document::set_pending_parsing_blocking_script(HTML::HTMLOrSVGScriptElement* script)
 {
-    m_pending_parsing_blocking_script = script;
+    m_pending_parsing_blocking_script = script ? &script->as_element() : nullptr;
 }
 
-GC::Ref<HTML::HTMLScriptElement> Document::take_pending_parsing_blocking_script(Badge<HTML::HTMLParser>)
+HTML::HTMLOrSVGScriptElement* Document::pending_parsing_blocking_script()
+{
+    if (!m_pending_parsing_blocking_script)
+        return nullptr;
+    return &as<HTML::HTMLOrSVGScriptElement>(*m_pending_parsing_blocking_script);
+}
+
+HTML::HTMLOrSVGScriptElement& Document::take_pending_parsing_blocking_script(Badge<HTML::HTMLParser>)
 {
     VERIFY(m_pending_parsing_blocking_script);
     auto script = m_pending_parsing_blocking_script;
     m_pending_parsing_blocking_script = nullptr;
-    return *script;
+    return as<HTML::HTMLOrSVGScriptElement>(*script);
 }
 
-void Document::set_pending_parsing_blocking_svg_script(SVG::SVGScriptElement* script)
+Variant<GC::Ref<HTML::HTMLScriptElement>, GC::Ref<SVG::SVGScriptElement>, Empty> Document::current_script_for_bindings() const
 {
-    m_pending_parsing_blocking_svg_script = script;
+    if (auto* html_script_element = as_if<HTML::HTMLScriptElement>(m_current_script.ptr()))
+        return GC::Ref { *html_script_element };
+    if (auto* svg_script_element = as_if<SVG::SVGScriptElement>(m_current_script.ptr()))
+        return GC::Ref { *svg_script_element };
+    return Empty {};
 }
 
-GC::Ref<SVG::SVGScriptElement> Document::take_pending_parsing_blocking_svg_script(Badge<HTML::HTMLParser>)
+void Document::add_script_to_execute_when_parsing_has_finished(Badge<HTML::HTMLOrSVGScriptElement>, HTML::HTMLOrSVGScriptElement& script)
 {
-    VERIFY(m_pending_parsing_blocking_svg_script);
-    auto script = m_pending_parsing_blocking_svg_script;
-    m_pending_parsing_blocking_svg_script = nullptr;
-    return *script;
-}
-
-void Document::add_script_to_execute_when_parsing_has_finished(Badge<HTML::HTMLScriptElement>, HTML::HTMLScriptElement& script)
-{
-    m_scripts_to_execute_when_parsing_has_finished.append(script);
+    m_scripts_to_execute_when_parsing_has_finished.append(script.as_element());
 }
 
 // https://dom.spec.whatwg.org/#dom-document-importnode
@@ -5475,6 +5536,7 @@ void Document::completely_finish_loading()
     //     document, reached through the UI process, which mirrors that the document is completely loaded.
     if (container)
         container->content_navigable_completely_finished_loading();
+    navigable->page().did_completely_load_document(*this);
     navigable->page().client().page_did_completely_finish_loading(navigable->id(), *this);
 }
 
@@ -7283,6 +7345,29 @@ Utf16String Document::dump_accessibility_tree_as_json()
     return builder.to_string();
 }
 
+AccessibilityChangeTracker::Change Document::build_accessibility_tree_change(AccessibilityChangeTracker& tracker, bool whole_tree)
+{
+    auto document_id = static_cast<i64>(unique_id().value());
+    AccessibilityChangeTracker::Change change;
+    change.is_whole_tree = whole_tree || tracker.needs_whole_tree(document_id);
+    tracker.begin(document_id, change.is_whole_tree);
+    auto accessibility_tree = AccessibilityTreeNode::create(nullptr);
+    build_accessibility_tree(*&accessibility_tree);
+    if (accessibility_tree->value()) {
+        // The tree reads what renders, as the caller's own read of the render state.
+        Layout::ForcedReadScope read { *this };
+        accessibility_tree->serialize_tree_as_node_data(change.nodes, *this, read, -1, &tracker);
+    } else {
+        WebView::AccessibilityNodeData root;
+        root.id = static_cast<i64>(unique_id().value());
+        root.role = "document"_string;
+        if (tracker.note(root, 0, 0))
+            change.nodes.append(move(root));
+    }
+    change.removed_ids = tracker.end();
+    return change;
+}
+
 Vector<WebView::AccessibilityNodeData> Document::build_accessibility_node_data()
 {
     Vector<WebView::AccessibilityNodeData> nodes;
@@ -7351,13 +7436,24 @@ WebView::AccessibilityNodeData const* Document::cached_accessibility_record(Node
 {
     if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
         return nullptr;
-    return m_accessibility_record_cache->records.get(node.unique_id()).map([](auto& record) { return &record; }).value_or(nullptr);
+    auto it = m_accessibility_record_cache->records.find(node.unique_id());
+    return it == m_accessibility_record_cache->records.end() ? nullptr : &it->value.data;
 }
 
-void Document::cache_accessibility_record(Node const& node, WebView::AccessibilityNodeData const& record) const
+Document::KeptAccessibilityRecord Document::kept_accessibility_record(Node const& node) const
+{
+    if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
+        return {};
+    auto it = m_accessibility_record_cache->records.find(node.unique_id());
+    if (it == m_accessibility_record_cache->records.end())
+        return {};
+    return { &it->value.data, it->value.version };
+}
+
+u64 Document::cache_accessibility_record(Node const& node, WebView::AccessibilityNodeData const& record) const
 {
     if (m_accessibility_caches_bypassed)
-        return;
+        return 0;
     if (!m_accessibility_record_cache)
         m_accessibility_record_cache = make<AccessibilityRecordCache>();
     // Leave out what every build computes again anyway, so it isn't kept, and copied out, for nothing.
@@ -7367,7 +7463,33 @@ void Document::cache_accessibility_record(Node const& node, WebView::Accessibili
     kept.character_offsets.clear();
     kept.line_break_character_offsets.clear();
     kept.line_heights.clear();
-    m_accessibility_record_cache->records.set(node.unique_id(), move(kept));
+    auto version = m_accessibility_record_cache->next_version++;
+    m_accessibility_record_cache->records.set(node.unique_id(), { move(kept), version, {} });
+    return version;
+}
+
+Document::CachedTextGeometry const* Document::cached_text_geometry(Node const& node) const
+{
+    if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
+        return nullptr;
+    auto it = m_accessibility_record_cache->records.find(node.unique_id());
+    if (it == m_accessibility_record_cache->records.end() || !it->value.text_geometry.has_value())
+        return nullptr;
+    return &*it->value.text_geometry;
+}
+
+u64 Document::cache_text_geometry(Node const& node, CachedTextGeometry geometry) const
+{
+    // The geometry goes with the node's record, so whatever drops the record drops the geometry too.
+    if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
+        return 0;
+    auto it = m_accessibility_record_cache->records.find(node.unique_id());
+    if (it == m_accessibility_record_cache->records.end())
+        return 0;
+    geometry.version = m_accessibility_record_cache->next_version++;
+    auto version = geometry.version;
+    it->value.text_geometry = move(geometry);
+    return version;
 }
 
 static bool is_table_structure(Element const& element)
@@ -7563,13 +7685,43 @@ Vector<String> Document::cached_accessibility_record_mismatches()
 
     Vector<String> mismatches;
     for (auto const& data : fresh) {
-        auto cached = m_accessibility_record_cache->records.get(UniqueNodeID { data.id });
-        if (!cached.has_value() || kept_part(*cached) == kept_part(data))
+        auto cached = m_accessibility_record_cache->records.find(UniqueNodeID { data.id });
+        if (cached == m_accessibility_record_cache->records.end() || kept_part(cached->value.data) == kept_part(data))
             continue;
         auto* node = Node::from_unique_id(UniqueNodeID { data.id });
         auto const* element = as_if<Element>(node);
         mismatches.append(MUST(String::formatted("{} \"{}\" (role {}): the kept data differs from computing it again",
             element ? element->local_name().to_utf16_string().to_utf8() : "#text"_string, data.name, data.role)));
+    }
+    quick_sort(mismatches);
+    return mismatches;
+}
+
+Vector<String> Document::cached_text_geometry_mismatches()
+{
+    update_layout(UpdateLayoutReason::InspectAccessibilityTree);
+    if (!m_accessibility_record_cache)
+        return {};
+
+    // A build that reuses the kept geometry wherever it's still good, against one that computes all of it again.
+    auto kept = build_accessibility_node_data();
+    m_accessibility_caches_bypassed = true;
+    auto fresh = build_accessibility_node_data();
+    m_accessibility_caches_bypassed = false;
+
+    HashMap<i64, WebView::AccessibilityNodeData const*> fresh_by_id;
+    for (auto const& data : fresh)
+        fresh_by_id.set(data.id, &data);
+    Vector<String> mismatches;
+    for (auto const& data : kept) {
+        auto fresh_data = fresh_by_id.get(data.id);
+        if (!fresh_data.has_value())
+            continue;
+        auto const& computed = **fresh_data;
+        if (data.bounds == computed.bounds && data.character_offsets == computed.character_offsets
+            && data.line_break_character_offsets == computed.line_break_character_offsets && data.line_heights == computed.line_heights)
+            continue;
+        mismatches.append(MUST(String::formatted("#text \"{}\": the kept geometry differs from computing it again", data.name)));
     }
     quick_sort(mismatches);
     return mismatches;
@@ -9105,6 +9257,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
     struct CompetingPropertyEffects {
         GC::Ptr<Animations::KeyframeEffect> winner;
         bool all_effects_use_replace { true };
+        u32 effect_count { 0 };
     };
     struct CompetingEffects {
         CompetingPropertyEffects opacity;
@@ -9444,6 +9597,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
             continue;
         auto& effects = competing_effects.ensure(*target);
         auto add_competing_effect = [&](CompetingPropertyEffects& property_effects) {
+            ++property_effects.effect_count;
             bool effect_produces_output = effect.is_in_effect();
             if (effect_produces_output && effect.composite() != Bindings::CompositeOperation::Replace)
                 property_effects.all_effects_use_replace = false;
@@ -9475,17 +9629,33 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
                 Bindings::CompositeOperationOrAuto::Replace);
         });
     };
+    // A keyframe that leaves a property out takes the underlying value, which is the output of the effects beneath the
+    // winner where there are any. The compositor only knows the element's own style.
+    auto winner_takes_the_underlying_value = [](Animations::KeyframeEffect& effect, auto is_property) {
+        auto const* key_frame_set = effect.key_frame_set();
+        if (!key_frame_set)
+            return false;
+        return any_of(key_frame_set->keyframes_by_key, [&](auto const& entry) {
+            return any_of(entry.properties, [&](auto const& property) {
+                return is_property(property.key.id()) && property.value.template has<Animations::KeyframeEffect::KeyFrameSet::UseInitial>();
+            });
+        });
+    };
     for (auto& [target, effects] : competing_effects) {
         (void)target;
-        auto validate_winner = [&](CompetingPropertyEffects& property_effects) {
+        auto validate_winner = [&](CompetingPropertyEffects& property_effects, auto is_property) {
             if (!property_effects.all_effects_use_replace
-                || (property_effects.winner && !winner_uses_replace_keyframes(*property_effects.winner)))
+                || (property_effects.winner && !winner_uses_replace_keyframes(*property_effects.winner))
+                || (property_effects.winner && property_effects.effect_count > 1 && winner_takes_the_underlying_value(*property_effects.winner, is_property)))
                 property_effects.winner = nullptr;
         };
-        validate_winner(effects.opacity);
-        validate_winner(effects.background_color);
-        validate_winner(effects.filter);
-        validate_winner(effects.transform);
+        auto is = [](CSS::PropertyID property_id) {
+            return [property_id](CSS::PropertyID id) { return id == property_id; };
+        };
+        validate_winner(effects.opacity, is(CSS::PropertyID::Opacity));
+        validate_winner(effects.background_color, is(CSS::PropertyID::BackgroundColor));
+        validate_winner(effects.filter, is(CSS::PropertyID::Filter));
+        validate_winner(effects.transform, is_transform_family_property);
     }
 
     // An opacity of 1 does not otherwise create an effects frame. Give an otherwise publishable opacity
@@ -11718,6 +11888,8 @@ void Document::set_navigable(GC::Ptr<HTML::LocalNavigable> navigable)
 
     GC::Ptr<Page> previous_page = m_navigable ? &m_navigable->page() : nullptr;
     m_navigable = navigable.ptr();
+    if (navigable)
+        m_navigable_awaiting_activation = nullptr;
     invalidate_full_activity();
     HTML::main_thread_event_loop().document_navigable_did_change({});
     rendering_pending_document_changed(*this);
