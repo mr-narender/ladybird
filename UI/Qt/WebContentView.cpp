@@ -191,7 +191,7 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
             schedule_repaint();
         });
     };
-    QObject::connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, update_palette_soon);
+    QObject::connect(&SystemAppearance::the(), &SystemAppearance::interface_appearance_changed, this, update_palette_soon);
     QObject::connect(&SystemAppearance::the(), &SystemAppearance::changed, this, update_palette_soon);
 
     m_tooltip_hover_timer.setSingleShot(true);
@@ -337,18 +337,6 @@ WebContentView::WebContentView(QWidget* window, Optional<WebView::CanonicalTrave
         show_appkit_dictionary_lookup(*this, lookup, position);
     };
 #endif
-
-    on_request_tooltip_override = [this](auto position, auto const& tooltip) {
-        m_tooltip_override = true;
-        if (m_tooltip_hover_timer.isActive())
-            m_tooltip_hover_timer.stop();
-
-        show_tooltip(mapToGlobal(QPoint(position.x(), position.y())), qstring_from_ak_string(tooltip), *this);
-    };
-
-    on_stop_tooltip_override = [this]() {
-        m_tooltip_override = false;
-    };
 
     on_enter_tooltip_area = [this](auto const& tooltip) {
         m_tooltip_text = tooltip;
@@ -897,10 +885,8 @@ void WebContentView::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
-    if (!m_tooltip_override) {
-        hide_tooltip();
-        m_tooltip_hover_timer.start(600);
-    }
+    hide_tooltip();
+    m_tooltip_hover_timer.start(600);
 
     enqueue_native_event(Web::MouseEvent::Type::MouseMove, *event);
     WebContentViewBase::mouseMoveEvent(event);
@@ -1736,9 +1722,17 @@ void WebContentView::add_floating_surface(QWidget& surface)
     new FloatingSurfaceWatcher(surface, [this] { schedule_repaint(); });
 }
 
+void WebContentView::set_suggestions_over_page(bool suggestions_over_page)
+{
+    if (m_suggestions_over_page == suggestions_over_page)
+        return;
+    m_suggestions_over_page = suggestions_over_page;
+    schedule_repaint();
+}
+
 bool WebContentView::has_floating_surface_over_page() const
 {
-    return any_of(m_floating_surfaces, [](auto const& surface) { return surface && surface->isVisible(); });
+    return m_suggestions_over_page || any_of(m_floating_surfaces, [](auto const& surface) { return surface && surface->isVisible(); });
 }
 
 // Overlays are painted by Qt, underneath whatever presents the page on some platforms, which has to step aside for them.
@@ -1984,9 +1978,11 @@ static Core::AnonymousBuffer make_system_theme_from_qt_palette(QWidget& widget, 
     auto palette_impl = Gfx::PaletteImpl::create_with_anonymous_buffer(theme);
     auto palette = Gfx::Palette(move(palette_impl));
 
-    // The widgets' palette follows the interface theme. When pages get the other appearance, they keep the colors of
-    // the theme file instead.
-    auto qt_palette_matches = ChromeStyle::is_dark(qt_palette) == dark;
+    // When the widgets' palette has the other appearance than pages get, pages keep the colors of the theme file instead.
+    // NB: The palette is judged by its own colors, as the platform theme may keep the system's palette whatever the
+    //     interface theme asks for.
+    auto qt_palette_is_dark = qt_palette.color(QPalette::Window).lightness() < 128;
+    auto qt_palette_matches = qt_palette_is_dark == dark;
     auto translate = [&](Gfx::ColorRole gfx_color_role, QPalette::ColorRole qt_color_role) {
         if (!qt_palette_matches)
             return;

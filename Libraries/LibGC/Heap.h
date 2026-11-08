@@ -35,6 +35,7 @@
 #include <LibGC/RootVector.h>
 #include <LibGC/WeakBlock.h>
 #include <LibGC/WeakContainer.h>
+#include <pthread.h>
 
 namespace GC {
 
@@ -52,14 +53,15 @@ class GC_API Heap {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    enum class BecomeProcessDefault {
+    enum class BecomeThreadDefault {
         No,
         Yes,
     };
 
-    explicit Heap(AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> gather_embedder_roots, BecomeProcessDefault = BecomeProcessDefault::Yes);
+    explicit Heap(AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> gather_embedder_roots, BecomeThreadDefault = BecomeThreadDefault::Yes);
     ~Heap();
 
+    // The default heap of the calling thread.
     static Heap& the();
     static void set_default_heap_for_testing(Heap&);
 
@@ -108,6 +110,11 @@ public:
     NEVER_INLINE Vector<RetainingPath> find_retaining_paths(AK::Function<bool(Cell&)> const& is_target, size_t max_paths);
     static String describe_root(HeapRoot const&);
 
+    // A heap belongs to the thread that created it: the collector only scans that thread's stack, and nothing in the heap
+    // is synchronized. That thread has to destroy it as well. Collections and destruction verify this, allocation and
+    // rooting are debug assertions.
+    bool is_on_owner_thread() const { return pthread_equal(m_owner_thread, pthread_self()); }
+
     bool should_collect_on_every_allocation() const { return m_should_collect_on_every_allocation; }
     // This is true for any CollectEverything cycle, not only heap teardown.
     bool is_collecting_everything() const { return m_collecting_garbage && m_current_collection_type == CollectionType::CollectEverything; }
@@ -150,7 +157,6 @@ public:
     void register_sweep_callback(AK::Function<void()>);
 
     void register_cell_allocator(Badge<CellAllocator>, CellAllocator&);
-    CellAllocator& cell_allocator_for(Badge<CellAllocatorDescriptorBase>, CellAllocatorDescriptorBase&);
 
     void uproot_cell(Cell* cell);
     void uproot_cell(ForeignCell* cell) { uproot_cell(as_cell(cell)); }
@@ -161,6 +167,15 @@ public:
     void sweep_block(HeapBlock&);
 
     bool is_live_heap_block(HeapBlock* block) const { return m_live_heap_blocks.contains(block); }
+
+    template<typename Callback>
+    void for_each_block(Callback callback)
+    {
+        for (auto& allocator : m_all_cell_allocators) {
+            if (allocator.for_each_block(callback) == IterationDecision::Break)
+                return;
+        }
+    }
 
     void enqueue_post_gc_task(AK::Function<void()>);
 
@@ -196,10 +211,21 @@ private:
         return *cell;
     }
 
+    CellAllocator& cell_allocator_for(CellAllocatorDescriptorBase& descriptor)
+    {
+        auto index = descriptor.index();
+        if (index < m_cell_allocators_by_descriptor_index.size()) [[likely]] {
+            if (auto* allocator = m_cell_allocators_by_descriptor_index[index].ptr()) [[likely]]
+                return *allocator;
+        }
+        return create_cell_allocator(descriptor);
+    }
+    CellAllocator& create_cell_allocator(CellAllocatorDescriptorBase&);
+
     template<typename T>
     Cell* allocate_cell()
     {
-        static_assert(requires { T::cell_allocator.for_heap(*this).allocate_cell(*this); }, "GC cell type must declare its own allocator using GC_DECLARE_ALLOCATOR(ClassName)");
+        static_assert(requires { cell_allocator_for(T::cell_allocator).allocate_cell(*this); }, "GC cell type must declare its own allocator using GC_DECLARE_ALLOCATOR(ClassName)");
         static_assert(IsSame<T, typename decltype(T::cell_allocator)::CellType>,
             "GC cell allocator type mismatch");
 
@@ -217,7 +243,7 @@ private:
     {
         VERIFY(!m_collecting_garbage);
         will_allocate(descriptor.cell_size(), triggers_collection);
-        return descriptor.for_heap(*this).allocate_cell(*this);
+        return cell_allocator_for(descriptor).allocate_cell(*this);
     }
 
     // Cells allocated during incremental sweep in a block that the sweep has
@@ -280,6 +306,7 @@ private:
     void finalize_unmarked_cells();
     void sweep_dead_cells(bool print_report, Core::ElapsedTimer const&);
     void sweep_weak_blocks();
+    void free_weak_blocks();
     void run_post_gc_tasks();
 
     bool sweep_next_block();
@@ -292,15 +319,6 @@ private:
 
     void start_idle_gc_timer();
     void idle_gc_on_timer();
-
-    template<typename Callback>
-    void for_each_block(Callback callback)
-    {
-        for (auto& allocator : m_all_cell_allocators) {
-            if (allocator.for_each_block(callback) == IterationDecision::Break)
-                return;
-        }
-    }
 
     struct Stats {
         AK_ALLOC_WITH_KMALLOC;
@@ -317,13 +335,15 @@ private:
     };
     OwnPtr<Stats> m_stats;
 
+    pthread_t m_owner_thread { pthread_self() };
+
     size_t m_gc_bytes_threshold { 0 };
     size_t m_allocated_bytes_since_last_gc { 0 };
 
     bool m_should_collect_on_every_allocation { false };
 
     CellAllocator::List m_all_cell_allocators;
-    HashMap<CellAllocatorDescriptorBase*, NonnullOwnPtr<CellAllocator>> m_cell_allocators_by_type;
+    Vector<OwnPtr<CellAllocator>> m_cell_allocators_by_descriptor_index;
 
     RootImpl::List m_roots;
     RootVectorBase::List m_root_vectors;

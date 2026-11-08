@@ -73,6 +73,7 @@ public:
     WebIDL::ExceptionOr<Utf16String> set_time_zone(Utf16String const& time_zone);
 
     void gc();
+    u32 worker_agent_count() const;
     void gc_async(GC::Ref<WebIDL::Promise>);
     WebIDL::UnsignedLongLong discard_decoded_image_frames();
     WebIDL::ExceptionOr<void> mark_as_garbage(Utf16String const& variable_name);
@@ -82,6 +83,8 @@ public:
     WebIDL::UnsignedLongLong html_collection_cache_generation(DOM::HTMLCollection&);
     void fail_next_message_port_transfer(HTML::MessagePort&);
     bool message_ports_are_directly_entangled(HTML::MessagePort&, HTML::MessagePort&);
+    String message_port_entanglement_kind(HTML::MessagePort&);
+    bool message_port_transport_is_closed(HTML::MessagePort&);
     GC::Ref<XHR::XMLHttpRequest> create_xml_http_request_for_document(DOM::Document&);
     Optional<Painting::HitTestResult> hit_test(double x, double y);
     GC::Ptr<JS::Object> hit_test_result(double x, double y);
@@ -255,6 +258,9 @@ public:
     bool has_populated_document(HTML::HTMLIFrameElement&);
     bool canvas_has_unpresented_content(HTML::HTMLCanvasElement&);
     void crash_remote_frame_processes();
+    i32 web_content_process_id();
+    u32 document_count_in_this_process();
+    void close_tab_through_ui_process();
     void stop_loading_through_ui_process();
     void reload_through_ui_process();
     void reload_bypassing_cache_through_ui_process();

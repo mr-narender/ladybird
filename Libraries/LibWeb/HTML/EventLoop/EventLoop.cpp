@@ -121,9 +121,30 @@ void EventLoop::schedule_for_queued_task()
         m_system_event_loop_timer->restart();
 }
 
+void EventLoop::destroy_once_script_has_finished()
+{
+    m_destruction_requested = true;
+    schedule();
+}
+
+bool EventLoop::destroy_if_requested()
+{
+    // NB: A paused event loop has script waiting further up the stack, as a spinning one has.
+    if (!m_destruction_requested || m_spin_depth > 0 || execution_paused())
+        return false;
+    if (auto on_destroyed = move(m_on_destroyed))
+        on_destroyed();
+    return true;
+}
+
 EventLoop& main_thread_event_loop()
 {
     return *static_cast<HTML::Agent*>(Bindings::main_thread_vm().agent())->event_loop;
+}
+
+EventLoop& current_event_loop()
+{
+    return *surrounding_agent().event_loop;
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#spin-the-event-loop
@@ -155,7 +176,11 @@ void EventLoop::spin_until(GC::Ref<GC::Function<bool()>> goal_condition)
     //       NOTE: This is achieved by returning from the function.
 
     ++m_spin_depth;
-    ScopeGuard leave_spin = [this] { --m_spin_depth; };
+    ScopeGuard leave_spin = [this] {
+        --m_spin_depth;
+        if (m_destruction_requested)
+            schedule();
+    };
     Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), [this, goal_condition] {
         if (goal_condition->function()())
             return true;
@@ -177,7 +202,7 @@ void EventLoop::process()
 {
     m_turn_requested_without_a_task = false;
 
-    if (execution_paused())
+    if (destroy_if_requested() || execution_paused())
         return;
 
     // OPTIMIZATION: A trip through the platform event loop costs more than a small task does, so run the tasks that are
@@ -195,6 +220,9 @@ void EventLoop::process()
         if (Core::ThreadEventQueue::current().has_pending_events() || MonotonicTime::now() >= turn_deadline)
             break;
     }
+
+    if (destroy_if_requested())
+        return;
 
     // If there are eligible tasks in the queue, schedule a new round of processing. :^)
     if (has_runnable_tasks || (!m_microtask_queue.is_empty() && !m_performing_a_microtask_checkpoint)) {
@@ -1726,7 +1754,7 @@ void EventLoop::release_held_frames_for_testing()
 
 void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps)
 {
-    auto& event_loop = main_thread_event_loop();
+    auto& event_loop = current_event_loop();
     event_loop.run_upon_reaching_step_1(steps);
 }
 
@@ -1735,7 +1763,7 @@ TaskID queue_a_task(HTML::Task::Source source, GC::Ptr<EventLoop> event_loop, GC
 {
     // 1. If event loop was not given, set event loop to the implied event loop.
     if (!event_loop)
-        event_loop = main_thread_event_loop();
+        event_loop = current_event_loop();
 
     // FIXME: 2. If document was not given, set document to the implied document.
 
@@ -1775,7 +1803,7 @@ TaskID queue_global_task(HTML::Task::Source source, JS::Object& global_object, G
 void queue_a_microtask(GC::Ptr<DOM::Document const> document, GC::Ref<GC::Function<void()>> steps)
 {
     // 1. If event loop was not given, set event loop to the implied event loop.
-    auto& event_loop = HTML::main_thread_event_loop();
+    auto& event_loop = HTML::current_event_loop();
 
     // FIXME: 2. If document was not given, set document to the implied document.
 
@@ -1793,7 +1821,7 @@ void queue_a_microtask(GC::Ptr<DOM::Document const> document, GC::Ref<GC::Functi
 
 void perform_a_microtask_checkpoint()
 {
-    main_thread_event_loop().perform_a_microtask_checkpoint();
+    current_event_loop().perform_a_microtask_checkpoint();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint
@@ -1820,7 +1848,8 @@ void EventLoop::perform_a_microtask_checkpoint()
     m_performing_a_microtask_checkpoint = true;
 
     // 3. While the event loop's microtask queue is not empty:
-    while (!m_microtask_queue.is_empty()) {
+    // AD-HOC: The script these would run was aborted, and nothing in the agent runs anymore.
+    while (!m_microtask_queue.is_empty() && !vm().interrupt_requested()) {
         // 1. Let oldestMicrotask be the result of dequeuing from the event loop's microtask queue.
         auto oldest_microtask = m_microtask_queue.dequeue();
 

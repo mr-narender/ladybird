@@ -95,9 +95,9 @@ void web_structured_serialize_image_bitmap_pixels_destroy(ImageBitmapSharedPixel
 TransferDataEncoder* web_structured_serialize_transfer_data_holder_create(ReadonlyBytes, TransferAttachment const*, size_t);
 void web_structured_serialize_transfer_data_holder_take(TransferDataEncoder*, void*, ReceiveTransferPayload);
 bool web_structured_serialize_validate_shared_memory(int, size_t);
-SerializedTransferRecord* web_structured_serialize_transfer_record_create(ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t, TransferDataEncoder* const*, size_t);
+SerializedTransferRecord* web_structured_serialize_transfer_record_create(ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t, int, TransferDataEncoder* const*, size_t);
 void web_structured_serialize_transfer_record_destroy(SerializedTransferRecord*);
-void web_structured_serialize_transfer_record_take(SerializedTransferRecord*, void*, void (*)(void*, ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t), void (*)(void*, TransferDataEncoder*));
+void web_structured_serialize_transfer_record_take(SerializedTransferRecord*, void*, void (*)(void*, ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t, int), void (*)(void*, TransferDataEncoder*));
 Vector<Core::AnonymousBuffer>* web_structured_serialize_shared_pixels_create(int const*, size_t const*, size_t);
 void web_structured_serialize_shared_pixels_destroy(Vector<Core::AnonymousBuffer>*);
 void web_structured_serialize_transferred_values_append(Vector<GC::Root<JS::Object>>*, JSObject*);
@@ -139,7 +139,7 @@ void web_structured_serialize_ipc_record_data(IPCSerializationRecord const* reco
 
 JSObject* web_structured_serialize_ipc_record_shared_array_buffer(IPCSerializationRecord const* record, u32 side_table_index)
 {
-    auto shared_array_buffers = same_process_shared_array_buffers(*record);
+    auto shared_array_buffers = same_agent_shared_array_buffers(*record);
     if (side_table_index >= shared_array_buffers.size())
         return nullptr;
     return JS::HostABI::object_to_abi(shared_array_buffers[side_table_index].ptr());
@@ -241,12 +241,13 @@ bool web_structured_serialize_validate_shared_memory(int descriptor, size_t size
 }
 
 // Takes over the descriptors and the data holders.
-SerializedTransferRecord* web_structured_serialize_transfer_record_create(ReadonlyBytes data, JSObject* const* shared_array_buffers, size_t shared_array_buffer_count, int const* shared_memory, size_t const* sizes, size_t shared_memory_count, TransferDataEncoder* const* holders, size_t holder_count)
+SerializedTransferRecord* web_structured_serialize_transfer_record_create(ReadonlyBytes data, JSObject* const* shared_array_buffers, size_t shared_array_buffer_count, int const* shared_memory, size_t const* sizes, size_t shared_memory_count, int shared_store_lifeline, TransferDataEncoder* const* holders, size_t holder_count)
 {
     auto* record = new SerializedTransferRecord;
     record->serialized = create_ipc_serialization_record(data, shared_array_buffers_from_abi(shared_array_buffers, shared_array_buffer_count));
     for (size_t i = 0; i < shared_memory_count; ++i)
         record->shared_buffers.append(MUST(Core::AnonymousBuffer::create_from_anon_fd(shared_memory[i], sizes[i])));
+    record->shared_store_lifeline = SharedStoreLifeline::adopting_fd(shared_store_lifeline);
     for (size_t i = 0; i < holder_count; ++i) {
         record->transfer_data_holders.append(move(*holders[i]));
         delete holders[i];
@@ -260,10 +261,10 @@ void web_structured_serialize_transfer_record_destroy(SerializedTransferRecord* 
 }
 
 // Rust roots the SharedArrayBuffers before this returns.
-void web_structured_serialize_transfer_record_take(SerializedTransferRecord* record, void* context, void (*receive)(void*, ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t), void (*append_holder)(void*, TransferDataEncoder*))
+void web_structured_serialize_transfer_record_take(SerializedTransferRecord* record, void* context, void (*receive)(void*, ReadonlyBytes, JSObject* const*, size_t, int const*, size_t const*, size_t, int), void (*append_holder)(void*, TransferDataEncoder*))
 {
     Vector<JSObject*> buffers;
-    for (auto const& buffer : same_process_shared_array_buffers(record->serialized))
+    for (auto const& buffer : same_agent_shared_array_buffers(record->serialized))
         buffers.append(JS::HostABI::object_to_abi(buffer.ptr()));
     Vector<int> descriptors;
     Vector<size_t> sizes;
@@ -271,7 +272,7 @@ void web_structured_serialize_transfer_record_take(SerializedTransferRecord* rec
         descriptors.append(buffer.fd());
         sizes.append(buffer.size());
     }
-    receive(context, record->serialized.data.span(), buffers.data(), buffers.size(), descriptors.data(), sizes.data(), descriptors.size());
+    receive(context, record->serialized.data.span(), buffers.data(), buffers.size(), descriptors.data(), sizes.data(), descriptors.size(), record->shared_store_lifeline.fd());
     for (auto& holder : record->transfer_data_holders)
         append_holder(context, new TransferDataEncoder(move(holder)));
     record->shared_buffers.clear();

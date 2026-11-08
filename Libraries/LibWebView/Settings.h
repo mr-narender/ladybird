@@ -44,11 +44,31 @@ enum class ThemePreference : u8 {
     Dark,
 };
 
+// The colors of the browser's own tabs, toolbars and menus. Each theme is made from one or two base colors.
+#define ENUMERATE_COLOR_THEMES(X) \
+    X(Neutral, "neutral")         \
+    X(Harbor, "harbor")           \
+    X(Glacier, "glacier")         \
+    X(Lagoon, "lagoon")           \
+    X(Moss, "moss")               \
+    X(Saffron, "saffron")         \
+    X(Copper, "copper")           \
+    X(Cherry, "cherry")           \
+    X(Blossom, "blossom")         \
+    X(Lavender, "lavender")
+
+enum class ColorTheme : u8 {
+#define __ENUMERATE_COLOR_THEME(name, string) name,
+    ENUMERATE_COLOR_THEMES(__ENUMERATE_COLOR_THEME)
+#undef __ENUMERATE_COLOR_THEME
+};
+
 struct Appearance {
     bool show_menu_bar { false };
     ShowBookmarksBar show_bookmarks_bar { ShowBookmarksBar::Never };
     ThemePreference interface_theme { ThemePreference::System };
     ThemePreference website_color_scheme { ThemePreference::System };
+    ColorTheme color_theme { ColorTheme::Neutral };
 };
 
 struct ContentSettings {
@@ -69,6 +89,9 @@ struct TabSettings {
     bool vertical_tabs_expanded { true };
     bool vertical_tabs_expand_on_hover { false };
     VerticalTabsPosition vertical_tabs_position { VerticalTabsPosition::Left };
+    // With vertical tabs, the open sidebar also holds the navigation buttons, the address field and the toolbar's other
+    // buttons, and there is no toolbar row. The sidebar is then always on the left.
+    bool everything_in_sidebar { false };
     Optional<u16> vertical_tabs_expanded_width;
 };
 
@@ -90,6 +113,12 @@ struct AutoplaySiteSetting : public SiteSetting {
 
 // Whether sites may ask for the user's location at all.
 enum class LocationPolicy : u8 {
+    Ask,
+    Block,
+};
+
+// Whether sites may ask to use the user's microphone at all.
+enum class MicrophonePolicy : u8 {
     Ask,
     Block,
 };
@@ -176,6 +205,7 @@ public:
     virtual void dns_settings_changed() { }
     virtual void config_variable_changed(ConfigVariableID) { }
     virtual void geolocation_settings_changed() { }
+    virtual void microphone_settings_changed() { }
     virtual void notifications_settings_changed() { }
     virtual void background_networking_settings_changed() { }
     virtual void content_blocker_settings_changed() { }
@@ -250,6 +280,9 @@ public:
 
     LocationPolicy location_policy() const { return m_location_policy; }
     void set_location_policy(LocationPolicy);
+
+    MicrophonePolicy microphone_policy() const { return m_microphone_policy; }
+    void set_microphone_policy(MicrophonePolicy);
 
     NotificationsPolicy notifications_policy() const { return m_notifications_policy; }
     void set_notifications_policy(NotificationsPolicy);
@@ -331,6 +364,7 @@ private:
 
     AutoplaySiteSetting m_autoplay;
     LocationPolicy m_location_policy { LocationPolicy::Ask };
+    MicrophonePolicy m_microphone_policy { MicrophonePolicy::Ask };
     NotificationsPolicy m_notifications_policy { NotificationsPolicy::Ask };
 
     BrowsingDataSettings m_browsing_data_settings;

@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <AK/HashTable.h>
+#include <AK/HashMap.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
 #include <AK/Utf16String.h>
@@ -19,7 +19,8 @@
 
 namespace WebView {
 
-// Launches ImageDecoders as processes first ask for them, and ends each once the last process it serves is gone.
+// Launches ImageDecoders as processes first ask for them, and ends each once each process it serves is gone or has let go
+// of it.
 //
 // A decoder sees the images of every process it serves, so a malicious image that takes one over gets at those images. The
 // processes of a site may share a decoder, because under site isolation they hold nothing of any other site's that they
@@ -43,10 +44,22 @@ public:
     ErrorOr<IPC::TransportHandle> connect_new_client(u64 client_child_id, RefPtr<BrowsingSession> const&, Optional<Utf16String> site);
 
     // Answers a renderer or worker that asked for a decoder, which may have exited by the time its request is handled.
-    Optional<IPC::TransportHandle> connect_requesting_process(u64 client_child_id, RefPtr<BrowsingSession> const&, Optional<Utf16String> site);
+    // Each of them has one client at a time, and keeps its generation in `client_generation`; see below.
+    Optional<IPC::TransportHandle> connect_requesting_process(u64 client_child_id, RefPtr<BrowsingSession> const&, Optional<Utf16String> site, Optional<u64>& client_generation);
 
     // Returns whether the process was served by the decoder of a site, and so has to disconnect from it.
     bool remove_client_from_decoder_of_site(u64 client_child_id);
+
+    // Lets go of one client that a process connected to its decoder, which ends once no process has a client left.
+    void process_did_release_decoder(u64 client_child_id);
+
+    // A client can be let go of long after its process left the decoder of that client, or lost it. So a renderer or
+    // worker notes the generation of its process as it connects, and a release from an older generation is about a
+    // decoder the process has left. One that connects again has lost its last client without saying so, which counts
+    // as a release.
+    u64 client_generation(u64 client_child_id) const { return m_client_generations.get(client_child_id).value_or(0); }
+    void note_connected_client(u64 client_child_id, Optional<u64>& client_generation);
+    void process_did_release_decoder(u64 client_child_id, u64 client_generation);
 
     void process_did_exit(u64 child_id);
 
@@ -55,10 +68,14 @@ private:
         NonnullRefPtr<ImageDecoderControlClient> control_client;
         WeakPtr<BrowsingSession> session;
         Optional<Utf16String> site;
-        HashTable<u64> client_child_ids;
+        // NB: The threads of a process each have a client of their own, and they let go of them one at a time.
+        HashMap<u64, size_t> client_counts;
     };
 
+    void did_lose_decoder(Instance const&);
+
     Vector<Instance> m_instances;
+    HashMap<u64, u64> m_client_generations;
 };
 
 }

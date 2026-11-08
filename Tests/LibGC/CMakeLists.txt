@@ -10,6 +10,8 @@ set(TEST_SOURCES
     TestGCHeapGroup.cpp
     TestGCIdleCollection.cpp
     TestGCIncrementalSweep.cpp
+    TestGCThreads.cpp
+    TestGCTypeIsolation.cpp
     TestGCVisitor.cpp
     TestMember.cpp
     TestNanBoxedValue.cpp
@@ -17,4 +19,4 @@ set(TEST_SOURCES
 )
 
 target_sources(TestLibGC PRIVATE ${TEST_SOURCES})
-target_link_libraries(TestLibGC PRIVATE LibGC)
+target_link_libraries(TestLibGC PRIVATE LibGC LibThreading)

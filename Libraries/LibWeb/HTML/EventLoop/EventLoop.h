@@ -144,6 +144,11 @@ public:
     void schedule();
     void schedule_for_queued_task();
 
+    // A worker event loop is destroyed once its worker's closing flag is set and the script on it has finished, which
+    // is what resumes the run a worker steps.
+    void set_on_destroyed(Function<void()> on_destroyed) { m_on_destroyed = move(on_destroyed); }
+    void destroy_once_script_has_finished();
+
     void perform_a_microtask_checkpoint();
 
     // NB: Style and layout run no script. A temporary execution context they use ends with an empty stack, which would
@@ -342,9 +347,20 @@ private:
     u64 m_rendering_update_serial { 0 };
     // How deep the event loop is spun inside a task.
     size_t m_spin_depth { 0 };
+
+    bool destroy_if_requested();
+
+    bool m_destruction_requested { false };
+    Function<void()> m_on_destroyed;
 };
 
+// The event loop of the window agent, from that agent's thread only. Code that a worker can reach has to use
+// current_event_loop().
 WEB_API EventLoop& main_thread_event_loop();
+
+// The event loop of the agent on the current thread.
+WEB_API EventLoop& current_event_loop();
+
 WEB_API void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps);
 WEB_API TaskID queue_a_task(HTML::Task::Source, GC::Ptr<EventLoop>, GC::Ptr<DOM::Document>, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});
 WEB_API TaskID queue_global_task(HTML::Task::Source, JS::Object&, GC::Ref<GC::Function<void()>> steps, Task::Priority = Task::Priority::Normal, GC::Ptr<GC::Function<void()>> discard_steps = {});

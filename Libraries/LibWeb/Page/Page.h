@@ -176,6 +176,7 @@ public:
     GC::Ptr<HTML::LocalNavigable> fullscreen_element_and_its_containers(GC::Ref<DOM::Element>, Fullscreen::RequestType, ElementIsRequestedElement);
 
     void discard();
+    bool has_been_discarded() const { return m_has_been_discarded; }
 
     HTML::HistoryExecutor& history_executor();
 
@@ -541,6 +542,8 @@ private:
     void set_find_in_page_active_match(GC::Ptr<DOM::Range>);
 
     void on_pending_dialog_closed();
+    void close_pending_dialog_of_discarded_page();
+    void finish_discarding();
 
     GC::Ref<PageClient> m_client;
 
@@ -556,6 +559,8 @@ private:
     GC::Ptr<HTML::Navigable> m_top_level_traversable;
     OwnPtr<Compositor::CompositorContextHandle> m_retired_page_compositor_context;
     Vector<GC::Ref<HTML::Navigable>> m_navigables_being_destroyed;
+    bool m_has_been_discarded { false };
+    size_t m_local_roots_left_to_discard { 0 };
 
     HTML::VisibilityState m_system_visibility_state { HTML::VisibilityState::Hidden };
 
@@ -751,6 +756,7 @@ public:
     virtual void page_did_destroy_child_frame(HTML::CrossProcessId) { }
     virtual String dump_site_isolation_process_tree_for_testing() { return {}; }
     virtual void crash_remote_frame_processes_for_testing() { }
+    virtual void close_tab_for_testing() { }
     virtual void page_did_spoof_document_origin_for_testing(HTML::EnvironmentSettingsObject const&, URL::Origin const&) { }
     virtual void stop_loading_through_ui_process_for_testing() { }
     virtual void reload_through_ui_process_for_testing([[maybe_unused]] bool bypass_cache) { }
@@ -787,6 +793,8 @@ public:
     }
     virtual HTML::CrossProcessId allocate_navigable_id() { return allocate_cross_process_id(); }
     virtual void request_frame() = 0;
+    // A frame request on behalf of one document, for a client whose page shows many documents.
+    virtual void request_frame_for(DOM::Document const&) { request_frame(); }
     virtual double rendering_frame_interval_in_milliseconds() const { return 1000.0 / 60.0; }
     virtual void rendering_opportunity([[maybe_unused]] i64 frame_time_nanoseconds, [[maybe_unused]] double frame_interval_milliseconds) { }
     virtual void will_begin_rendering_update() { }
@@ -797,7 +805,6 @@ public:
     virtual void page_did_change_title(Utf16String const&) { }
     virtual void page_did_update_editing_history_state(bool, bool) { }
     virtual void page_did_set_text_fragment_indication_visibility(bool) { }
-    virtual void page_did_request_refresh() { }
     virtual void page_did_request_resize_window(Gfx::IntSize, u64) { }
     virtual void page_did_request_reposition_window(Gfx::IntPoint, u64) { }
     virtual void page_did_request_restore_window() { }
@@ -846,8 +853,6 @@ public:
     virtual void page_did_click_link(HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_middle_click_link(HTML::PreparedNavigationDescriptor, [[maybe_unused]] ByteString const& target, [[maybe_unused]] unsigned modifiers) { }
     virtual void page_did_request_external_url([[maybe_unused]] URL::URL const& url, [[maybe_unused]] URL::Origin const& initiator_origin, [[maybe_unused]] bool has_transient_activation) { }
-    virtual void page_did_request_tooltip_override(CSSPixelPoint, ByteString const&) { }
-    virtual void page_did_stop_tooltip_override() { }
     virtual void page_did_enter_tooltip_area(ByteString const&) { }
     virtual void page_did_leave_tooltip_area() { }
     virtual void page_did_change_favicon(Gfx::Bitmap const&) { }
@@ -927,6 +932,7 @@ public:
     virtual void page_did_request_unload_check(HTML::CrossProcessId, GC::Ref<GC::Function<void(HTML::CheckIfUnloadingIsCanceledResult)>>) { VERIFY_NOT_REACHED(); }
     virtual void page_did_change_needs_beforeunload_check([[maybe_unused]] bool needs_beforeunload_check) { }
     virtual void page_did_consume_user_activation([[maybe_unused]] HTML::UserActivationConsumption consumption) { }
+    virtual void page_did_notify_about_user_activation([[maybe_unused]] HTML::CrossProcessId document_id) { }
 
     virtual void request_file(FileRequest) = 0;
 
@@ -1008,8 +1014,13 @@ public:
     virtual void page_did_report_navigation_violation_of_remote_client([[maybe_unused]] HTML::RemoteClientNavigation const& navigation, [[maybe_unused]] u64 policy_index, [[maybe_unused]] ContentSecurityPolicy::RemoteViolationDirective directive, [[maybe_unused]] bool url_is_https) { }
     virtual void page_did_register_javascript_source([[maybe_unused]] DOM::Document&, [[maybe_unused]] HTML::ScriptRegistry::Description const&) { }
     virtual void page_did_post_broadcast_channel_message([[maybe_unused]] HTML::PostedBroadcastChannelMessage const& message) { }
+    virtual void page_did_close_shared_worker() { }
 
-    virtual HTML::WorkerAgentId start_worker_agent([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
+    struct StartedWorkerAgent {
+        HTML::WorkerAgentId agent_id { 0 };
+        bool is_hosted_in_this_process { false };
+    };
+    virtual StartedWorkerAgent start_worker_agent([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
     virtual void close_worker_agent([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] HTML::WorkerAgentOwnerToken owner_token) { }
     virtual void rtc_transform_init([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] u64 transform_id, [[maybe_unused]] HTML::SerializedTransferRecord options_record) { }
     virtual void rtc_transform_teardown([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] u64 transform_id) { }

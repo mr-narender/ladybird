@@ -36,6 +36,7 @@
 #    include <UI/Qt/WaylandWindow.h>
 #endif
 #include <UI/Qt/WindowControlButton.h>
+#include <UI/Qt/WindowControlsReveal.h>
 
 #include <QApplication>
 #include <QContextMenuEvent>
@@ -51,6 +52,7 @@
 #include <QFontMetrics>
 #include <QFrame>
 #include <QGraphicsDropShadowEffect>
+#include <QGraphicsOpacityEffect>
 #include <QGraphicsPixmapItem>
 #include <QGraphicsScene>
 #include <QHBoxLayout>
@@ -142,6 +144,14 @@ static constexpr int TAB_CARD_SHAPE_TOP_INSET = 0;
 static constexpr int TAB_CARD_SHAPE_BOTTOM_INSET = 1;
 // The sidebar's tab bar leaves this much room above its first tab and below its last.
 static constexpr int VERTICAL_TAB_BAR_END_ROOM = 2;
+// With everything in the sidebar, the toolbar's rows and footer keep this far from the sidebar's edges, like its tabs.
+static constexpr int SIDEBAR_CONTENT_INSET = 8;
+// The gap between the address field's row and the sidebar's tabs below it.
+static constexpr int SIDEBAR_TOOLBAR_TABS_GAP = 4;
+// With everything in the sidebar, the toolbar's contents fade out of its row at the start of the sidebar's opening, and
+// the sidebar's own fade in at its end. Closing the sidebar plays this backwards.
+static constexpr int TOOLBAR_ROW_FADE_DURATION = 80;
+static constexpr int SIDEBAR_CONTENTS_FADE_DURATION = 120;
 // A horizontal tab's card holds its contents. It is inset from the tab on every side.
 static constexpr qreal HORIZONTAL_TAB_CARD_SHAPE_HORIZONTAL_INSET = 3;
 // NB: The card is as low in the tab as the selected tab's body is, so the contents of both share the strip's line.
@@ -220,6 +230,9 @@ static constexpr int TAB_TITLE_FADE_WIDTH = 24;
 static constexpr int SIDEBAR_ROW_AUDIO_BUTTON_SIZE = 22;
 static constexpr int SIDEBAR_ROW_AUDIO_ICON_SIZE = 16;
 static constexpr int SIDEBAR_ROW_BUTTON_GAP = 4;
+// A sidebar row's close button is lighter than the muted color at rest.
+static constexpr QRgb SIDEBAR_ROW_QUIET_CLOSE_ICON_LIGHT = 0x9C9CA3;
+static constexpr QRgb SIDEBAR_ROW_QUIET_CLOSE_ICON_DARK = 0x7A7A81;
 // In the collapsed sidebar, the close button and the speaker are round badges on opposite corners of the favicon,
 // reaching a little past them.
 static constexpr int RAIL_BADGE_SIZE = 18;
@@ -438,15 +451,18 @@ static QColor horizontal_tab_separator(QPalette const& palette)
 // In the sidebar, the selected tab is raised: a card in the toolbar's color, with a fine outline and a soft shadow.
 static void paint_selected_vertical_tab(QPainter& painter, QPalette const& palette, QRectF const& shape_rect, qreal radius)
 {
-    // NB: On a dark sidebar a card of the toolbar's color barely stands out, so there the selected tab is lit instead,
-    //     and ringed with a hairline inside its edge.
+    // NB: On a dark sidebar a card of the toolbar's color barely stands out, so there the selected tab is lit instead.
+    //     The fill is enough there, and a ring would stack up with the other outlines in the sidebar. With increased
+    //     contrast, it is outlined like the active tab.
     if (Theme::is_dark(palette)) {
         painter.setPen(Qt::NoPen);
         painter.setBrush(QColor(255, 255, 255, 38));
         painter.drawRoundedRect(shape_rect, radius, radius);
-        painter.setPen(QPen(QColor(255, 255, 255, 26), 1));
-        painter.setBrush(Qt::NoBrush);
-        painter.drawRoundedRect(shape_rect.adjusted(0.5, 0.5, -0.5, -0.5), radius - 0.5, radius - 0.5);
+        if (auto edge = Theme::chrome(palette).active_tab_edge; edge.alpha() > 0) {
+            painter.setPen(QPen(edge, 1));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRoundedRect(shape_rect.adjusted(0.5, 0.5, -0.5, -0.5), radius - 0.5, radius - 0.5);
+        }
         return;
     }
 
@@ -3027,6 +3043,8 @@ void TabBar::update_tab_button_geometry()
         if (!button)
             return;
         prepare_button(button, TabBarButton::Placement::SidebarRow);
+        if (auto* tab_bar_button = qobject_cast<TabBarButton*>(button))
+            tab_bar_button->set_row_emphasized(index == m_hovered_tab_index || index == currentIndex());
 
         auto button_size = button->size();
         if (button_size.isEmpty())
@@ -3218,17 +3236,30 @@ TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
     m_all_tabs_button->setIconSize(QSize(16, 16));
     m_all_tabs_button->setFocusPolicy(Qt::NoFocus);
     m_all_tabs_button->setToolTip(qformatted("All Tabs  {}", Application::the().search_tabs_action()->shortcut().toString(QKeySequence::NativeText)));
-    QObject::connect(m_all_tabs_button, &QToolButton::clicked, this, [this] { show_all_tabs(); });
+    // The button stays pressed while the list is open.
+    m_all_tabs_button->setCheckable(true);
+    QObject::connect(m_all_tabs_button, &QToolButton::clicked, this, [this] {
+        // NB: The button only stays checked while the list is open, which showing it sees to.
+        m_all_tabs_button->setChecked(m_all_tabs_popover && m_all_tabs_popover->isVisible());
+        show_all_tabs();
+    });
 
     // NB: The Ladybird button and the all-tabs button move together, between the strip, the open sidebar's top row and
     //     the toolbar beside the collapsed sidebar, so they keep their distance wherever they are.
     m_ladybird_buttons = new QWidget(this);
     auto* ladybird_buttons_layout = new QHBoxLayout(m_ladybird_buttons);
     ladybird_buttons_layout->setContentsMargins(0, 0, 0, 0);
-    ladybird_buttons_layout->setSpacing(ALL_TABS_BUTTON_LEADING_GAP);
+    // NB: The Ladybird button's room for its focus ring takes part of the gap after it.
+    ladybird_buttons_layout->setSpacing(ALL_TABS_BUTTON_LEADING_GAP - LADYBIRD_BUTTON_FOCUS_RING_ROOM);
     ladybird_buttons_layout->addWidget(m_ladybird_button, 0, Qt::AlignVCenter);
     ladybird_buttons_layout->addWidget(m_all_tabs_button, 0, Qt::AlignVCenter);
     m_ladybird_buttons->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    // NB: While pictures stand in for the buttons, they still take up their room, which the toolbar keeps clear of.
+    for (QWidget* button : { static_cast<QWidget*>(m_ladybird_button), static_cast<QWidget*>(m_all_tabs_button) }) {
+        auto size_policy = button->sizePolicy();
+        size_policy.setRetainSizeWhenHidden(true);
+        button->setSizePolicy(size_policy);
+    }
     // NB: The room around and between the buttons is empty chrome, which moves the window like the rest of it.
     m_ladybird_buttons->setProperty(WINDOW_DRAG_REGION_PROPERTY, true);
     m_vertical_tabs_expanded_width = clamp(m_vertical_tabs_expanded_width, minimum_vertical_tabs_expanded_width(), VERTICAL_TABS_MAX_EXPANDED_WIDTH);
@@ -3241,6 +3272,7 @@ TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
         m_minimize_window_button = window_control_buttons.minimize;
         m_maximize_window_button = window_control_buttons.maximize;
         m_close_window_button = window_control_buttons.close;
+        m_window_controls_reveal = new WindowControlsReveal(*this, *m_page_column);
     }
 
     recreate_icons();
@@ -3273,6 +3305,7 @@ TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
     m_vertical_tab_bar_column->setProperty(VERTICAL_TABS_RESIZE_HANDLE_HOVERED_PROPERTY, false);
     m_vertical_tab_bar_column->setProperty(VERTICAL_TABS_RESIZE_HANDLE_ACTIVE_PROPERTY, false);
     m_vertical_tab_bar_column->installEventFilter(this);
+    m_bookmarks_bar->set_sidebar(*m_vertical_tab_bar_column);
 
     m_vertical_tabs_toggle_button = new ChromeHeaderButton(m_vertical_tab_bar_column);
     m_vertical_tabs_toggle_button->setObjectName("LadybirdVerticalTabsToggleButton");
@@ -3286,6 +3319,11 @@ TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
     m_vertical_tabs_content_separator->setObjectName("LadybirdVerticalTabsContentSeparator");
     m_vertical_tabs_content_separator->setAttribute(Qt::WA_TransparentForMouseEvents);
     m_vertical_tabs_content_separator->hide();
+
+    m_collapsed_sidebar_top_edge = new QWidget(this);
+    m_collapsed_sidebar_top_edge->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_collapsed_sidebar_top_edge->setAutoFillBackground(true);
+    m_collapsed_sidebar_top_edge->hide();
 
     m_vertical_tabs_reserved_space = new QWidget(m_vertical_tabs_content);
     m_vertical_tabs_reserved_space->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
@@ -3525,6 +3563,28 @@ void TabWidget::set_vertical_tabs_enabled(bool enabled)
     rebuild_layout();
 }
 
+void TabWidget::set_everything_in_sidebar(bool everything_in_sidebar)
+{
+    if (m_everything_in_sidebar == everything_in_sidebar)
+        return;
+    m_everything_in_sidebar = everything_in_sidebar;
+    // NB: The sidebar's top row holds other things now, which may need more room.
+    apply_vertical_tabs_expanded_width(m_vertical_tabs_expanded_width);
+    rebuild_layout();
+}
+
+// With everything in the sidebar, the open sidebar holds the toolbar. The collapsed sidebar leaves it across the top of
+// the window, as without.
+bool TabWidget::toolbar_is_in_sidebar() const
+{
+    if (!m_everything_in_sidebar || !m_vertical_tabs_enabled || !m_vertical_tabs_expanded)
+        return false;
+    // NB: While the sidebar opens or closes, the toolbar moves once its contents have faded out of where it was.
+    if (toggle_moves_toolbar())
+        return m_toggling_toolbar_in_sidebar;
+    return true;
+}
+
 void TabWidget::set_vertical_tabs_expanded(bool expanded)
 {
     if (m_vertical_tabs_collapse_pending && !expanded)
@@ -3559,6 +3619,7 @@ void TabWidget::set_vertical_tabs_expanded(bool expanded)
         m_vertical_tabs_collapse_pending = true;
     m_vertical_tabs_toggling = true;
     m_vertical_tabs_toggle_progress = 0.0;
+    m_toggling_toolbar_in_sidebar = !expanded;
     // NB: The pictures of the buttons are taken where they are, before the layout changes.
     float_sidebar_buttons_while_toggling();
     rebuild_layout();
@@ -3594,54 +3655,98 @@ void TabWidget::set_vertical_tabs_expanded(bool expanded)
     m_vertical_tabs_toggle_animation->start();
 }
 
-// The Ladybird and all-tabs buttons sit after the window controls, in the toolbar beside the collapsed sidebar and in
-// the open sidebar's top row alike, and the sidebar's toggle sits after them, or at the edge of the open sidebar's top
-// row. While the sidebar opens or closes, neither layout holds them, so pictures of them stand in: The Ladybird and
-// all-tabs buttons keep their place, and the toggle rides the sidebar's edge.
+// The Ladybird and all-tabs buttons sit after the window controls, and the sidebar's toggle sits after them, in the toolbar
+// beside the collapsed sidebar. While the sidebar opens or closes, no layout holds them, so pictures of them stand in: The
+// Ladybird and all-tabs buttons keep their place, and the toggle rides the sidebar's edge. With everything in the sidebar,
+// the all-tabs button fades with the toolbar's row, and the toggle stays in its corner and needs no picture. The pictures
+// lie on a strip in the color of what is around them, which the page slides under.
+// NB: The page is native, and would cover pictures that aren't. The strip is native and opaque, as transparent native
+//     views over the page leave trails of what moves below them.
 void TabWidget::float_sidebar_buttons_while_toggling()
 {
     auto floats = m_vertical_tabs_toggling && !vertical_tabs_are_on_right();
     if (!floats) {
-        for (auto* image : { m_floating_ladybird_buttons, m_floating_sidebar_toggle }) {
-            if (image)
-                image->hide();
-        }
+        if (!m_floating_buttons_strip)
+            return;
+        m_floating_buttons_strip->hide();
+        m_ladybird_button->show();
+        m_all_tabs_button->show();
         return;
     }
 
-    auto make_image = [this](QLabel*& image, QWidget& button) {
+    if (!m_floating_buttons_strip) {
+        m_floating_buttons_strip = new QWidget(this);
+        m_floating_buttons_strip->setAttribute(Qt::WA_TransparentForMouseEvents);
+        m_floating_buttons_strip->setAutoFillBackground(true);
+#if defined(AK_OS_MACOS) || defined(LADYBIRD_QT_USE_RHI_WIDGET)
+        m_floating_buttons_strip->setAttribute(Qt::WA_DontCreateNativeAncestors);
+        m_floating_buttons_strip->setAttribute(Qt::WA_NativeWindow);
+#endif
+    }
+    // The strip goes from the color of the open sidebar's top row to that of the toolbar beside the collapsed sidebar.
+    auto open_color = ChromeStyle::chrome_sidebar_background(Theme::chrome_palette(*this));
+    auto collapsed_color = Theme::chrome(*this).toolbar;
+    auto collapsedness = vertical_tabs_toggle_collapsedness();
+    auto mix = [&](float open, float collapsed) { return open + ((collapsed - open) * collapsedness); };
+    auto strip_palette = m_floating_buttons_strip->palette();
+    strip_palette.setColor(QPalette::Window, QColor::fromRgbF(mix(open_color.redF(), collapsed_color.redF()), mix(open_color.greenF(), collapsed_color.greenF()), mix(open_color.blueF(), collapsed_color.blueF())));
+    m_floating_buttons_strip->setPalette(strip_palette);
+
+    // NB: The pictures are taken once, where the buttons were in place. A toggle that is reversed midway keeps them.
+    auto take_pictures = !m_floating_buttons_strip->isVisible();
+    auto make_image = [&](QLabel*& image, QWidget& button) {
         if (!image) {
-            image = new QLabel(this);
+            image = new QLabel(m_floating_buttons_strip);
             image->setAttribute(Qt::WA_TransparentForMouseEvents);
+            image->setGraphicsEffect(new QGraphicsOpacityEffect(image));
         }
-        // NB: The pictures are taken once, where the buttons were in place. A toggle that is reversed midway keeps them.
-        if (!image->isVisible() && button.isVisible()) {
-            auto device_pixel_ratio = button.devicePixelRatioF();
-            QPixmap picture(button.size() * device_pixel_ratio);
-            picture.setDevicePixelRatio(device_pixel_ratio);
-            picture.fill(Qt::transparent);
-            button.render(&picture, QPoint(), QRegion(), QWidget::DrawChildren);
-            image->setPixmap(picture);
-            image->setFixedSize(button.size());
-        }
-        button.hide();
-        image->show();
-        image->raise();
+        if (!take_pictures)
+            return;
+        auto device_pixel_ratio = button.devicePixelRatioF();
+        QPixmap picture(button.size() * device_pixel_ratio);
+        picture.setDevicePixelRatio(device_pixel_ratio);
+        picture.fill(Qt::transparent);
+        button.render(&picture, QPoint(), QRegion(), QWidget::DrawChildren);
+        image->setPixmap(picture);
+        image->setFixedSize(button.size());
     };
-    make_image(m_floating_ladybird_buttons, *m_ladybird_buttons);
+    make_image(m_floating_ladybird_button, *m_ladybird_button);
+    make_image(m_floating_all_tabs_button, *m_all_tabs_button);
     make_image(m_floating_sidebar_toggle, *m_vertical_tabs_toggle_button);
+
+    // NB: Once the toolbar is in the sidebar, the footer shows the real all-tabs button, which fades with it.
+    auto moves_toolbar = toggle_moves_toolbar();
+    auto button_is_in_footer = moves_toolbar && m_toggling_toolbar_in_sidebar;
+    auto toggle_floats = !sidebar_toggle_stays_in_corner();
+    m_ladybird_button->hide();
+    m_all_tabs_button->setVisible(button_is_in_footer);
+    m_vertical_tabs_toggle_button->setVisible(!toggle_floats);
+    m_floating_ladybird_button->show();
+    m_floating_all_tabs_button->setVisible(!button_is_in_footer);
+    m_floating_sidebar_toggle->setVisible(toggle_floats);
+
+    auto opacity = moves_toolbar ? clamp(1 - (static_cast<qreal>(sidebar_opening_time()) / TOOLBAR_ROW_FADE_DURATION), 0.0, 1.0) : 1.0;
+    static_cast<QGraphicsOpacityEffect*>(m_floating_all_tabs_button->graphicsEffect())->setOpacity(opacity);
 
     auto column_origin = m_vertical_tab_bar_column->mapTo(this, QPoint());
     auto toolbar_height = WindowToolbar::toolbar_height(should_show_window_controls_in_tab_toolbar());
-    auto center_y = [&](QWidget const& image) { return column_origin.y() + ((toolbar_height - image.height()) / 2); };
+    auto center_y = [&](QWidget const& image) { return (toolbar_height - image.height()) / 2; };
 
-    auto& ladybird_buttons = *m_floating_ladybird_buttons;
+    auto& ladybird = *m_floating_ladybird_button;
+    auto& all_tabs = *m_floating_all_tabs_button;
     auto& toggle = *m_floating_sidebar_toggle;
-    auto ladybird_x = column_origin.x() + sidebar_ladybird_button_inset(vertical_tabs_hold_window_controls());
-    auto collapsed_toggle_x = ladybird_x + ladybird_buttons.width() + m_toolbar->sidebar_slot().layout()->spacing();
-    auto at_edge_x = column_origin.x() + current_vertical_tabs_width() - vertical_tabs_side_margin(true) - SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN - toggle.width();
-    toggle.move(max(collapsed_toggle_x, at_edge_x), center_y(toggle));
-    ladybird_buttons.move(ladybird_x, center_y(ladybird_buttons));
+    auto ladybird_x = sidebar_ladybird_button_inset(vertical_tabs_hold_window_controls()) - LADYBIRD_BUTTON_FOCUS_RING_ROOM;
+    auto all_tabs_x = ladybird_x + ladybird.width() + m_ladybird_buttons->layout()->spacing();
+    auto after_all_tabs_x = all_tabs_x + all_tabs.width();
+    auto toggle_x = max(after_all_tabs_x + m_toolbar->sidebar_slot().layout()->spacing(), current_vertical_tabs_width() - vertical_tabs_side_margin(true) - SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN - toggle.width());
+    ladybird.move(ladybird_x, center_y(ladybird));
+    all_tabs.move(all_tabs_x, center_y(all_tabs));
+    toggle.move(toggle_x, center_y(toggle));
+    auto strip_width = toggle_floats ? toggle_x + toggle.width() : button_is_in_footer ? ladybird_x + ladybird.width()
+                                                                                       : after_all_tabs_x;
+    m_floating_buttons_strip->setGeometry(column_origin.x(), column_origin.y(), strip_width, toolbar_height);
+    m_floating_buttons_strip->show();
+    m_floating_buttons_strip->raise();
 }
 
 // While the sidebar on the left opens or closes, the page and its toolbar slide along with the sidebar's edge, so neither
@@ -3659,12 +3764,108 @@ void TabWidget::slide_page_with_toggling_sidebar()
 {
     if (!slides_page_with_toggling_sidebar()) {
         m_toolbar->set_leading_room(0);
+        m_toolbar->set_contents_opacity(1);
+        m_toolbar->set_field_clip({});
+        if (m_toolbar_row_backdrop)
+            m_toolbar_row_backdrop->hide();
+        return;
+    }
+    if (toggle_moves_toolbar()) {
+        move_toolbar_with_toggling_sidebar();
         return;
     }
     // NB: The toolbar's contents start where they sit beside the collapsed sidebar, until the sidebar's edge reaches them.
-    m_toolbar->set_leading_room(max(0, m_toolbar->lead_beside_collapsed_sidebar(*m_ladybird_buttons, COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE) - current_vertical_tabs_width()));
+    m_toolbar->set_leading_room(max(0, m_toolbar->lead_beside_collapsed_sidebar(*m_ladybird_buttons, sidebar_toggle_stays_in_corner() ? QSize(0, 0) : COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE) - current_vertical_tabs_width()));
     auto page_width = m_vertical_tabs_content->width() - min(m_vertical_tabs_toggle_from_width, m_vertical_tabs_toggle_to_width);
     m_page_column->setGeometry(current_vertical_tabs_width(), 0, page_width, m_vertical_tabs_content->height());
+}
+
+// With everything in the sidebar, the open sidebar holds the toolbar, and the collapsed one leaves it in its row across
+// the top of the window. As the sidebar opens, the row's contents fade out, the sidebar widens over the page while the
+// row shrinks to nothing and the page slides up with the row's bottom edge, and the sidebar's own contents fade in.
+// Closing the sidebar does the same backwards. Nothing moves from one place to the other, and the page is only moved
+// until it resizes at the end.
+bool TabWidget::toggle_moves_toolbar() const
+{
+    return m_vertical_tabs_toggling && m_everything_in_sidebar && m_vertical_tabs_enabled && !vertical_tabs_are_on_right();
+}
+
+// How far the sidebar is into opening, in milliseconds. Closing, this counts down.
+int TabWidget::sidebar_opening_time() const
+{
+    auto elapsed = m_vertical_tabs_toggle_animation && m_vertical_tabs_toggle_animation->state() == QAbstractAnimation::Running
+        ? m_vertical_tabs_toggle_animation->currentTime()
+        : 0;
+    return m_vertical_tabs_collapse_pending ? Motion::SLOW - elapsed : elapsed;
+}
+
+int TabWidget::toolbar_row_height_while_toggling() const
+{
+    return qRound(m_toolbar->height_in_row() * vertical_tabs_toggle_collapsedness());
+}
+
+void TabWidget::move_toolbar_with_toggling_sidebar()
+{
+    auto opening_time = sidebar_opening_time();
+    if (auto in_sidebar = opening_time >= TOOLBAR_ROW_FADE_DURATION; in_sidebar != m_toggling_toolbar_in_sidebar) {
+        m_toggling_toolbar_in_sidebar = in_sidebar;
+        // NB: This comes back here once the toolbar has moved.
+        rebuild_layout();
+        float_sidebar_buttons_while_toggling();
+        return;
+    }
+
+    // NB: The page reaches past the window's bottom edge while it is below the row, so it resizes only at the end.
+    auto row_height = toolbar_row_height_while_toggling();
+    auto page_left = min(m_vertical_tabs_toggle_from_width, m_vertical_tabs_toggle_to_width);
+    m_page_column->setGeometry(page_left, row_height, m_vertical_tabs_content->width() - page_left, m_vertical_tabs_content->height());
+
+    // NB: The tabs move down to make room for the toolbar in the sidebar, along with the row's bottom edge.
+    update_vertical_tabs_column_margins();
+    m_vertical_tab_bar_column_layout->activate();
+
+    if (!m_toggling_toolbar_in_sidebar) {
+        m_toolbar->setGeometry(0, 0, width(), m_toolbar->height_in_row());
+        m_toolbar->stackUnder(m_vertical_tab_bar_column);
+        // NB: The row's contents stay where they are beside the collapsed sidebar, whose buttons are in the sidebar now.
+        m_toolbar->set_leading_room(m_toolbar->lead_beside_collapsed_sidebar(*m_ladybird_buttons, sidebar_toggle_stays_in_corner() ? QSize(0, 0) : COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE));
+        m_toolbar->set_contents_opacity(clamp(1 - (static_cast<qreal>(opening_time) / TOOLBAR_ROW_FADE_DURATION), 0.0, 1.0));
+        // NB: The field's panel is above the page, which slides up over the row.
+        m_toolbar->set_field_clip(QRect(mapTo(window(), QPoint()), QSize(width(), row_height)));
+        if (m_toolbar_row_backdrop)
+            m_toolbar_row_backdrop->hide();
+        return;
+    }
+
+    // NB: The sidebar's contents are where they will be in the open sidebar, and its widening edge uncovers them.
+    auto open_width = max(m_vertical_tabs_toggle_from_width, m_vertical_tabs_toggle_to_width);
+    auto side_margin = vertical_tabs_side_margin(true);
+    auto contents_width = open_width - (2 * side_margin);
+    auto top_row_bottom = m_vertical_tab_bar_column_layout->itemAt(0)->geometry().bottom() + 1;
+    m_toolbar->setGeometry(side_margin, top_row_bottom, contents_width, m_toolbar->sizeHint().height());
+    auto& navigation_buttons = m_toolbar->navigation_buttons();
+    auto navigation_buttons_size = navigation_buttons.sizeHint();
+    auto navigation_buttons_right = open_width - side_margin - SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN;
+    navigation_buttons.setGeometry(navigation_buttons_right - navigation_buttons_size.width(), (top_row_bottom - navigation_buttons_size.height()) / 2, navigation_buttons_size.width(), navigation_buttons_size.height());
+    auto& footer = m_toolbar->sidebar_footer();
+    auto footer_height = footer.sizeHint().height();
+    auto footer_bottom = m_vertical_tab_bar_column->height() - m_vertical_tab_bar_column_layout->contentsMargins().bottom();
+    footer.setGeometry(side_margin, footer_bottom - footer_height, contents_width, footer_height);
+    auto fade_in_start = Motion::SLOW - SIDEBAR_CONTENTS_FADE_DURATION;
+    m_toolbar->set_contents_opacity(clamp(static_cast<qreal>(opening_time - fade_in_start) / SIDEBAR_CONTENTS_FADE_DURATION, 0.0, 1.0));
+    m_toolbar->set_field_clip({});
+
+    // The row that the toolbar has left shrinks above the page.
+    if (!m_toolbar_row_backdrop) {
+        m_toolbar_row_backdrop = new QWidget(this);
+        m_toolbar_row_backdrop->setAutoFillBackground(true);
+    }
+    auto backdrop_palette = m_toolbar_row_backdrop->palette();
+    backdrop_palette.setColor(QPalette::Window, Theme::chrome(*this).toolbar);
+    m_toolbar_row_backdrop->setPalette(backdrop_palette);
+    m_toolbar_row_backdrop->setGeometry(0, 0, width(), row_height);
+    m_toolbar_row_backdrop->show();
+    m_toolbar_row_backdrop->stackUnder(m_vertical_tab_bar_column);
 }
 
 // While the sidebar collapses, its tab titles fade out at the start of its narrowing.
@@ -3742,6 +3943,9 @@ bool TabWidget::eventFilter(QObject* watched, QEvent* event)
 {
     if (watched == m_tab_bar && (event->type() == QEvent::Move || event->type() == QEvent::Resize))
         place_horizontal_new_tab_button();
+
+    if (watched == m_vertical_tab_bar_column && event->type() == QEvent::Resize)
+        place_sidebar_toggle_in_corner();
 
     if (watched == m_vertical_tab_bar_column && event->type() == QEvent::Paint) {
         paint_vertical_tabs_column();
@@ -4024,7 +4228,7 @@ int TabWidget::vertical_tabs_layout_width() const
 
 bool TabWidget::should_show_window_controls_in_tab_toolbar() const
 {
-    return m_window_controls_visible && m_tab_bar->tab_layout() != TabLayout::Horizontal && !vertical_tabs_hold_window_controls();
+    return m_window_controls_visible && m_tab_bar->tab_layout() != TabLayout::Horizontal && !vertical_tabs_hold_window_controls() && !toolbar_is_in_sidebar();
 }
 
 // The native window controls sit in the window's top left corner, so the open sidebar on the left holds them.
@@ -4037,6 +4241,15 @@ bool TabWidget::vertical_tabs_hold_window_controls() const
 // under it. The open sidebar's tabs start as far down as the collapsed sidebar's, so they stay in place as it toggles.
 int TabWidget::vertical_tabs_header_spacing() const
 {
+    // NB: While the toolbar moves with the toggling sidebar, the tabs go from below the toolbar's row to below the
+    //     toolbar in the sidebar. They make room for it before it fades in, and take it after it has faded out.
+    if (toggle_moves_toolbar()) {
+        auto below_row = m_toolbar->height_in_row() - WindowToolbar::toolbar_height(should_show_window_controls_in_tab_toolbar()) + VERTICAL_TABS_TOP_MARGIN - VERTICAL_TAB_BAR_END_ROOM;
+        auto below_toolbar = m_toolbar->height_in_sidebar() + SIDEBAR_TOOLBAR_TABS_GAP - VERTICAL_TAB_BAR_END_ROOM;
+        auto room_time = Motion::SLOW - SIDEBAR_CONTENTS_FADE_DURATION;
+        auto room = Motion::move_easing().valueForProgress(clamp(static_cast<qreal>(sidebar_opening_time()) / room_time, 0.0, 1.0));
+        return below_row + qRound((below_toolbar - below_row) * room);
+    }
     auto toolbar_line_height = max(0, m_toolbar->height() - WindowToolbar::toolbar_height(should_show_window_controls_in_tab_toolbar()));
     return VERTICAL_TABS_TOP_MARGIN - VERTICAL_TAB_BAR_END_ROOM + toolbar_line_height;
 }
@@ -4045,11 +4258,18 @@ int TabWidget::vertical_tabs_header_spacing() const
 // do beside the collapsed sidebar, so none of them moves as it toggles.
 int TabWidget::minimum_vertical_tabs_expanded_width() const
 {
-    if (!use_native_macos_window_controls() || !m_ladybird_buttons)
+    if (!m_ladybird_buttons || (!use_native_macos_window_controls() && !m_everything_in_sidebar))
         return VERTICAL_TABS_MIN_EXPANDED_WIDTH;
-    return NATIVE_MACOS_WINDOW_CONTROLS_INSET + NATIVE_MACOS_WINDOW_CONTROLS_WIDTH + LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP
-        + m_ladybird_buttons->sizeHint().width() + SIDEBAR_TOGGLE_MINIMUM_GAP + VERTICAL_TABS_TOGGLE_BUTTON_SIZE
+    // NB: With everything in the sidebar, the navigation buttons sit after the Ladybird button instead.
+    auto after_ladybird_button = m_everything_in_sidebar
+        ? WindowToolbar::navigation_buttons_width_in_sidebar()
+        : m_ladybird_buttons->layout()->spacing() + m_all_tabs_button->sizeHint().width() + VERTICAL_TABS_TOGGLE_BUTTON_SIZE;
+    auto top_row_width = sidebar_ladybird_button_inset(use_native_macos_window_controls()) - LADYBIRD_BUTTON_FOCUS_RING_ROOM
+        + m_ladybird_button->sizeHint().width() + SIDEBAR_TOGGLE_MINIMUM_GAP + after_ladybird_button
         + SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN + vertical_tabs_side_margin(true);
+    if (use_native_macos_window_controls())
+        return top_row_width;
+    return max(VERTICAL_TABS_MIN_EXPANDED_WIDTH, top_row_width);
 }
 
 // How far the opening or closing sidebar is from open, from 0 when open to 1 when collapsed.
@@ -4068,7 +4288,8 @@ void TabWidget::rebuild_layout()
     // NB: Moving the page stack between layouts drops keyboard focus from the page, which leaves the window's keyboard
     //     shortcuts dead until something is clicked. Give focus back to whatever had it.
     QPointer<QWidget> focus_widget = QApplication::focusWidget();
-    if (focus_widget && !isAncestorOf(focus_widget))
+    // NB: In the sidebar, the address field floats in a panel of the window's own.
+    if (focus_widget && focus_widget->window() != window())
         focus_widget = nullptr;
     ScopeGuard restore_focus = [&] {
         if (!focus_widget)
@@ -4100,6 +4321,8 @@ void TabWidget::rebuild_layout()
     m_tab_bar->set_pinned_tabs_in_rows(m_vertical_tabs_hover_expanded && !m_vertical_tabs_expanded);
     m_tab_bar->set_tab_layout(current_tab_layout());
     update_toolbar_window_controls_visibility();
+    m_toolbar->set_arrangement(toolbar_is_in_sidebar() ? ToolbarArrangement::Sidebar : ToolbarArrangement::Row, SIDEBAR_CONTENT_INSET - vertical_tabs_side_margin(true));
+    place_all_tabs_and_sidebar_toggle();
 
     if (m_tab_bar->tab_layout() != TabLayout::Horizontal) {
         rebuild_layout_for_vertical_tabs();
@@ -4163,7 +4386,10 @@ void TabWidget::rebuild_layout_for_horizontal_tabs()
 {
     m_tab_bar_row->setMinimumHeight(HORIZONTAL_TAB_STRIP_HEIGHT);
     m_tab_bar_row_layout->setSpacing(0);
-    m_tab_bar_row_layout->setContentsMargins(HORIZONTAL_TAB_STRIP_LEADING_MARGIN, HORIZONTAL_TAB_STRIP_HEIGHT - HORIZONTAL_TAB_HEIGHT, HORIZONTAL_TAB_STRIP_TRAILING_MARGIN, 0);
+    // NB: Without the traffic lights, the Ladybird button starts the strip, and its room for its focus ring takes part of
+    //     the strip's margin.
+    auto leading_margin = HORIZONTAL_TAB_STRIP_LEADING_MARGIN - (use_native_macos_window_controls() ? 0 : LADYBIRD_BUTTON_FOCUS_RING_ROOM);
+    m_tab_bar_row_layout->setContentsMargins(leading_margin, HORIZONTAL_TAB_STRIP_HEIGHT - HORIZONTAL_TAB_HEIGHT, HORIZONTAL_TAB_STRIP_TRAILING_MARGIN, 0);
 
     set_dynamic_property_if_needed(*m_new_tab_button, VERTICAL_TABS_EXPANDED_PROPERTY, false);
     set_dynamic_property_if_needed(*m_new_tab_button, VERTICAL_TABS_BUTTON_PROPERTY, true);
@@ -4190,7 +4416,7 @@ void TabWidget::rebuild_layout_for_horizontal_tabs()
     };
     if constexpr (use_native_macos_window_controls()) {
         m_tab_bar_row_layout->addWidget(m_window_controls, 0, Qt::AlignVCenter);
-        m_tab_bar_row_layout->addSpacing(LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP);
+        m_tab_bar_row_layout->addSpacing(LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP - LADYBIRD_BUTTON_FOCUS_RING_ROOM);
         add_ladybird_buttons();
         m_tab_bar_row_layout->addWidget(m_tab_bar, 0, Qt::AlignBottom);
         m_tab_bar_row_layout->addSpacing(new_tab_button_room);
@@ -4251,6 +4477,9 @@ void TabWidget::show_all_tabs()
     if (!m_all_tabs_popover) {
         m_all_tabs_popover = new AllTabsPopover(this);
         m_all_tabs_popover->update_chrome_style(palette());
+        m_all_tabs_popover->on_visibility_change = [this](bool visible) {
+            m_all_tabs_button->setChecked(visible);
+        };
         m_all_tabs_popover->on_tab_activated = [this](size_t index) {
             if (static_cast<int>(index) < count())
                 set_current_index(static_cast<int>(index));
@@ -4263,10 +4492,15 @@ void TabWidget::show_all_tabs()
 
     update_all_tabs_entries();
 
-    // The list hangs from the button that opens it, toward the middle of the window.
+    // The list hangs from the button that opens it, toward the middle of the window. In the sidebar's footer, it rises
+    // from the button instead.
     auto button_center = m_all_tabs_button->mapTo(window(), m_all_tabs_button->rect().center());
     auto is_in_right_half = button_center.x() > window()->width() / 2;
-    move_popover_below(*m_all_tabs_popover, *m_all_tabs_button, is_in_right_half ? PopoverAlignment::Trailing : PopoverAlignment::Leading);
+    auto alignment = is_in_right_half ? PopoverAlignment::Trailing : PopoverAlignment::Leading;
+    if (toolbar_is_in_sidebar())
+        move_popover_above(*m_all_tabs_popover, *m_all_tabs_button, alignment);
+    else
+        move_popover_below(*m_all_tabs_popover, *m_all_tabs_button, alignment);
     m_all_tabs_popover->show();
 }
 
@@ -4339,6 +4573,55 @@ void TabWidget::update_all_tabs_entries()
     m_all_tabs_popover->set_recently_closed(AK::move(closed_entries));
 }
 
+// With everything in the sidebar, its toggle keeps to the bottom left corner, open or collapsed and all the way between.
+bool TabWidget::sidebar_toggle_stays_in_corner() const
+{
+    return m_everything_in_sidebar && m_vertical_tabs_enabled;
+}
+
+void TabWidget::place_sidebar_toggle_in_corner()
+{
+    if (!sidebar_toggle_stays_in_corner())
+        return;
+    auto size = COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE;
+    auto footer_top = m_vertical_tab_bar_column->height() - m_vertical_tab_bar_column_layout->contentsMargins().bottom() - WindowToolbar::sidebar_footer_height();
+    m_vertical_tabs_toggle_button->move((VERTICAL_TABS_COLLAPSED_WIDTH - size.width()) / 2, footer_top + ((WindowToolbar::sidebar_footer_height() - size.height()) / 2));
+    m_vertical_tabs_toggle_button->raise();
+}
+
+// With everything in the open sidebar, the all-tabs button starts its footer, after the toggle in the corner. It sits by
+// the Ladybird button everywhere else.
+void TabWidget::place_all_tabs_and_sidebar_toggle()
+{
+    if (sidebar_toggle_stays_in_corner()) {
+        if (m_vertical_tabs_toggle_button->parentWidget() != m_vertical_tab_bar_column)
+            m_vertical_tabs_toggle_button->setParent(m_vertical_tab_bar_column);
+        m_vertical_tabs_toggle_button->setFixedSize(COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE);
+        m_vertical_tabs_toggle_button->show();
+        place_sidebar_toggle_in_corner();
+        auto toggle_right = m_vertical_tabs_toggle_button->geometry().right() + 1;
+        m_toolbar->set_sidebar_footer_leading_room(toggle_right - vertical_tabs_side_margin(true));
+    }
+
+    if (!toolbar_is_in_sidebar()) {
+        if (m_all_tabs_button->parentWidget() != m_ladybird_buttons) {
+            m_all_tabs_button->setParent(m_ladybird_buttons);
+            m_ladybird_buttons->layout()->addWidget(m_all_tabs_button);
+            static_cast<QBoxLayout*>(m_ladybird_buttons->layout())->setAlignment(m_all_tabs_button, Qt::AlignVCenter);
+            m_all_tabs_button->show();
+        }
+        return;
+    }
+
+    auto& footer = m_toolbar->sidebar_footer();
+    auto* footer_layout = static_cast<QBoxLayout*>(footer.layout());
+    if (m_all_tabs_button->parentWidget() != &footer) {
+        m_all_tabs_button->setParent(&footer);
+        footer_layout->insertWidget(0, m_all_tabs_button, 0, Qt::AlignVCenter);
+    }
+    m_all_tabs_button->show();
+}
+
 void TabWidget::place_collapsed_sidebar_buttons()
 {
     auto collapsed = m_tab_bar_visible && m_tab_bar->tab_layout() != TabLayout::Horizontal && !m_vertical_tabs_expanded;
@@ -4354,13 +4637,15 @@ void TabWidget::place_collapsed_sidebar_buttons()
         m_ladybird_button->set_tile_vertical_offset(0);
         slot_layout->insertWidget(0, m_ladybird_buttons, 0, Qt::AlignVCenter);
     }
-    if (m_vertical_tabs_toggle_button->parentWidget() != &slot) {
-        m_vertical_tabs_toggle_button->setParent(&slot);
-        m_vertical_tabs_toggle_button->setFixedSize(COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE);
-        slot_layout->insertWidget(1, m_vertical_tabs_toggle_button, 0, Qt::AlignVCenter);
+    if (!sidebar_toggle_stays_in_corner()) {
+        if (m_vertical_tabs_toggle_button->parentWidget() != &slot) {
+            m_vertical_tabs_toggle_button->setParent(&slot);
+            m_vertical_tabs_toggle_button->setFixedSize(COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE);
+            slot_layout->insertWidget(1, m_vertical_tabs_toggle_button, 0, Qt::AlignVCenter);
+        }
+        m_vertical_tabs_toggle_button->show();
     }
     m_ladybird_buttons->show();
-    m_vertical_tabs_toggle_button->show();
     slot.show();
 }
 
@@ -4383,25 +4668,39 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
     if (m_vertical_tabs_expanded) {
         // The open sidebar runs the full height of the window. Its top row sits beside the toolbar, and holds the
         // window controls when they are on its side, then the Ladybird and all-tabs buttons where they are beside the
-        // collapsed sidebar, and the sidebar's toggle at the edge toward the page.
+        // collapsed sidebar, and the sidebar's toggle at the edge toward the page. With everything in the sidebar, the
+        // navigation buttons are at that edge, the all-tabs button is in the footer, and the toggle is in its corner.
         // NB: On the right, the all-tabs button keeps as clear of the window's edge as the toggle is of the page.
         top_row_layout->setContentsMargins(vertical_tabs_are_on_right() ? SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN : 0, 0, SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN, 0);
         top_row_layout->addStrut(WindowToolbar::toolbar_height(should_show_window_controls_in_tab_toolbar()));
-        m_vertical_tabs_toggle_button->setParent(m_vertical_tab_bar_column);
-        // NB: The button was smaller while it sat in the collapsed sidebar's slot.
-        m_vertical_tabs_toggle_button->setFixedSize(VERTICAL_TABS_TOGGLE_BUTTON_SIZE, VERTICAL_TABS_TOGGLE_BUTTON_SIZE);
-        m_vertical_tabs_toggle_button->show();
+        if (!sidebar_toggle_stays_in_corner()) {
+            m_vertical_tabs_toggle_button->setParent(m_vertical_tab_bar_column);
+            // NB: The button was smaller while it sat in the collapsed sidebar's slot.
+            m_vertical_tabs_toggle_button->setFixedSize(VERTICAL_TABS_TOGGLE_BUTTON_SIZE, VERTICAL_TABS_TOGGLE_BUTTON_SIZE);
+            m_vertical_tabs_toggle_button->show();
+        }
         if (vertical_tabs_are_on_right()) {
-            top_row_layout->addWidget(m_vertical_tabs_toggle_button, 0, Qt::AlignVCenter);
+            if (!sidebar_toggle_stays_in_corner())
+                top_row_layout->addWidget(m_vertical_tabs_toggle_button, 0, Qt::AlignVCenter);
             top_row_layout->addSpacing(SIDEBAR_TOGGLE_MINIMUM_GAP);
             top_row_layout->addStretch(1);
             top_row_layout->addWidget(m_ladybird_buttons, 0, Qt::AlignVCenter);
         } else {
-            top_row_layout->addSpacing(sidebar_ladybird_button_inset(vertical_tabs_hold_window_controls()) - vertical_tabs_side_margin(true));
+            top_row_layout->addSpacing(sidebar_ladybird_button_inset(vertical_tabs_hold_window_controls()) - vertical_tabs_side_margin(true) - LADYBIRD_BUTTON_FOCUS_RING_ROOM);
             top_row_layout->addWidget(m_ladybird_buttons, 0, Qt::AlignVCenter);
             top_row_layout->addStretch(1);
             top_row_layout->addSpacing(SIDEBAR_TOGGLE_MINIMUM_GAP);
-            top_row_layout->addWidget(m_vertical_tabs_toggle_button, 0, Qt::AlignVCenter);
+            if (toolbar_is_in_sidebar()) {
+                // NB: While the sidebar toggles, the buttons are placed by move_toolbar_with_toggling_sidebar().
+                auto& navigation_buttons = m_toolbar->navigation_buttons();
+                if (toggle_moves_toolbar())
+                    navigation_buttons.setParent(m_vertical_tab_bar_column);
+                else
+                    top_row_layout->addWidget(&navigation_buttons, 0, Qt::AlignVCenter);
+                navigation_buttons.show();
+            } else if (!sidebar_toggle_stays_in_corner()) {
+                top_row_layout->addWidget(m_vertical_tabs_toggle_button, 0, Qt::AlignVCenter);
+            }
         }
     } else {
         // The collapsed rail holds only tabs. The Ladybird and all-tabs buttons and the sidebar's toggle move to the
@@ -4414,8 +4713,23 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
         m_ladybird_button->set_tile_vertical_offset(0);
         m_ladybird_buttons->show();
         m_vertical_tab_bar_column_layout->addLayout(top_row_layout);
-        m_vertical_tabs_header_spacer = new QSpacerItem(0, vertical_tabs_header_spacing(), QSizePolicy::Fixed, QSizePolicy::Fixed);
-        m_vertical_tab_bar_column_layout->addItem(m_vertical_tabs_header_spacer);
+        if (toolbar_is_in_sidebar() && !toggle_moves_toolbar()) {
+            // Below its top row, the sidebar holds the toolbar's navigation buttons and address field.
+            m_vertical_tab_bar_column_layout->addWidget(m_toolbar);
+            m_toolbar->setVisible(m_tab_bar_visible);
+            m_vertical_tab_bar_column_layout->addSpacing(SIDEBAR_TOOLBAR_TABS_GAP - VERTICAL_TAB_BAR_END_ROOM);
+        } else {
+            // NB: While the sidebar toggles, the toolbar and the footer are placed by move_toolbar_with_toggling_sidebar().
+            if (toolbar_is_in_sidebar()) {
+                for (auto* widget : { static_cast<QWidget*>(m_toolbar), &m_toolbar->sidebar_footer() }) {
+                    if (widget->parentWidget() != m_vertical_tab_bar_column)
+                        widget->setParent(m_vertical_tab_bar_column);
+                    widget->setVisible(m_tab_bar_visible);
+                }
+            }
+            m_vertical_tabs_header_spacer = new QSpacerItem(0, vertical_tabs_header_spacing(), QSizePolicy::Fixed, QSizePolicy::Fixed);
+            m_vertical_tab_bar_column_layout->addItem(m_vertical_tabs_header_spacer);
+        }
     } else {
         delete top_row_layout;
     }
@@ -4423,6 +4737,11 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
     m_vertical_tab_bar_column_layout->addWidget(m_tab_bar);
     m_vertical_tab_bar_column_layout->addWidget(m_new_tab_button, 0, vertical_tabs_are_on_right() ? Qt::AlignRight : Qt::AlignLeft);
     m_vertical_tab_bar_column_layout->addStretch(1);
+    // The toolbar's other buttons sit at the bottom of the sidebar that holds it.
+    if (m_vertical_tabs_expanded && toolbar_is_in_sidebar() && !toggle_moves_toolbar())
+        m_vertical_tab_bar_column_layout->addWidget(&m_toolbar->sidebar_footer());
+    else if (sidebar_toggle_stays_in_corner())
+        m_vertical_tab_bar_column_layout->addSpacing(WindowToolbar::sidebar_footer_height());
 }
 
 // A divider runs along the sidebar's edge toward the page.
@@ -4472,18 +4791,40 @@ void TabWidget::update_vertical_tabs_column_margins()
 //     field. Instead, it is placed over a stand-in at the top of the page column.
 void TabWidget::rebuild_page_column()
 {
+    // NB: The open sidebar that holds the toolbar is a native view on macOS, which a widget lying over it cannot draw on,
+    //     so the toolbar moves into the sidebar after all. It comes back here when the sidebar no longer holds it.
+    if (toolbar_is_in_sidebar()) {
+        m_toolbar_follows_page_column = false;
+        m_toolbar_placeholder->hide();
+        add_page_to_page_column();
+        return;
+    }
+    if (m_toolbar->parentWidget() != this) {
+        m_toolbar->setParent(this);
+        m_toolbar->setVisible(m_tab_bar_visible);
+    }
+    // NB: While the sidebar toggles with everything in it, the toolbar keeps its row across the window instead.
+    if (toggle_moves_toolbar()) {
+        m_toolbar_follows_page_column = false;
+        m_toolbar_placeholder->hide();
+        add_page_to_page_column();
+        return;
+    }
+
     m_toolbar_follows_page_column = true;
     m_toolbar_placeholder->setVisible(m_tab_bar_visible);
     m_page_column_layout->addWidget(m_toolbar_placeholder);
     add_page_to_page_column();
 }
 
-// The bookmarks bar heads the page, unless it only shows over the page while the pointer is near the toolbar.
+// The bookmarks bar heads the page, unless it only shows over the page while the pointer is near the toolbar. The tab
+// performance monitor's row ends the column.
 void TabWidget::add_page_to_page_column()
 {
     if (!m_bookmarks_bar->shows_over_page())
         m_page_column_layout->addWidget(m_bookmarks_bar);
     m_page_column_layout->addWidget(m_stacked_widget, 1);
+    m_page_column_layout->addWidget(&m_toolbar->performance_monitor_row());
 }
 
 void TabWidget::update_bookmarks_bar_visibility()
@@ -4520,6 +4861,8 @@ void TabWidget::place_toolbar_over_page_column()
     if (m_page_column->parentWidget() == this)
         m_page_column->stackUnder(m_toolbar);
 
+    if (m_collapsed_sidebar_top_edge->isVisible())
+        m_collapsed_sidebar_top_edge->raise();
     if (m_vertical_tabs_content_separator->isVisible())
         m_vertical_tabs_content_separator->raise();
 }
@@ -4604,14 +4947,29 @@ void TabWidget::update_vertical_tabs_resize_handle()
 
 void TabWidget::update_vertical_tabs_content_separator()
 {
+    // NB: The toolbar's bottom line is only there over the page. Over the collapsed sidebar, the sidebar's color takes its
+    //     place, so that the toolbar's color doesn't show in a line along the sidebar's top.
+    auto show_top_edge = m_tab_bar_visible && m_tab_bar->tab_layout() != TabLayout::Horizontal && !m_vertical_tabs_expanded;
+    m_collapsed_sidebar_top_edge->setVisible(show_top_edge);
+    if (show_top_edge) {
+        auto palette = m_collapsed_sidebar_top_edge->palette();
+        palette.setColor(QPalette::Window, Theme::chrome(*this).sidebar);
+        m_collapsed_sidebar_top_edge->setPalette(palette);
+        auto sidebar_width = current_vertical_tabs_width();
+        m_collapsed_sidebar_top_edge->setGeometry(vertical_tabs_are_on_right() ? width() - sidebar_width : 0, max(0, m_toolbar->height() - 1), sidebar_width, 1);
+        m_collapsed_sidebar_top_edge->raise();
+    }
+
+    // NB: With the toolbar in the sidebar, the page runs up to the window's top, so there is no toolbar above it to
+    //     separate it from.
     auto has_page_bookmarks_bar = !m_bookmarks_bar->isHidden();
-    auto show_content_separator = m_tab_bar_visible && m_tab_bar->tab_layout() != TabLayout::Horizontal && !has_page_bookmarks_bar;
+    auto show_content_separator = m_tab_bar_visible && m_tab_bar->tab_layout() != TabLayout::Horizontal && !has_page_bookmarks_bar && !toolbar_is_in_sidebar();
     m_vertical_tabs_content_separator->setVisible(show_content_separator);
     if (!show_content_separator)
         return;
 
     auto separator_x = vertical_tabs_are_on_right() ? 0 : max(0, current_vertical_tabs_width() - 1);
-    auto separator_y = max(0, m_toolbar->height() - 1);
+    auto separator_y = max(0, (toggle_moves_toolbar() ? toolbar_row_height_while_toggling() : m_toolbar->height()) - 1);
     auto separator_width = vertical_tabs_are_on_right() ? max(0, width() - current_vertical_tabs_width()) : max(0, width() - separator_x);
     m_vertical_tabs_content_separator->setGeometry(separator_x, separator_y, separator_width, 1);
     m_vertical_tabs_content_separator->raise();
@@ -4688,7 +5046,7 @@ void TabWidget::update_tab_layout()
     // NB: This is the room the window controls need, and not their width, which shrinks along with a strip that is too
     //     narrow for them. The minimum width below would then follow it down.
     if (!m_window_controls->isHidden())
-        controls_width += m_window_controls->sizeHint().expandedTo(m_window_controls->minimumSize()).width() + (use_native_macos_window_controls() ? LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP : 0);
+        controls_width += m_window_controls->sizeHint().expandedTo(m_window_controls->minimumSize()).width() + (use_native_macos_window_controls() ? LADYBIRD_BUTTON_TRAFFIC_LIGHTS_GAP - LADYBIRD_BUTTON_FOCUS_RING_ROOM : 0);
 
     auto available_for_tabs = width() - controls_width;
     auto pinned_count = m_tab_bar->pinned_tab_count();
@@ -4740,7 +5098,15 @@ void TabWidget::update_tab_chrome_visibility()
 
     auto show_window_controls = m_window_controls_visible
         && m_tab_bar_visible
-        && is_horizontal;
+        && (is_horizontal || (!use_native_macos_window_controls() && toolbar_is_in_sidebar()));
+    if (m_window_controls_reveal) {
+        // NB: Without a toolbar row or a tab strip, nothing holds the window controls, so they stay out of sight.
+        if (show_window_controls && !is_horizontal) {
+            m_window_controls_reveal->hold(*m_window_controls);
+            return;
+        }
+        m_window_controls_reveal->release();
+    }
     m_window_controls->setVisible(show_window_controls);
 }
 
@@ -4774,6 +5140,8 @@ void TabWidget::update_chrome_style()
     m_vertical_tab_bar_column->setStyleSheet(style_sheet);
     m_vertical_tabs_content_separator->setStyleSheet(style_sheet);
     m_vertical_tabs_resize_handle->setStyleSheet(style_sheet);
+    if (m_window_controls_reveal)
+        m_window_controls_reveal->setStyleSheet(style_sheet);
     auto reserved_space_palette = m_vertical_tabs_reserved_space->palette();
     reserved_space_palette.setColor(QPalette::Window, ChromeStyle::chrome_sidebar_background(Theme::chrome_palette(*this)));
     m_vertical_tabs_reserved_space->setPalette(reserved_space_palette);
@@ -4987,6 +5355,14 @@ void TabBarButton::set_revealed(bool revealed)
     m_reveal_animation->start();
 }
 
+void TabBarButton::set_row_emphasized(bool emphasized)
+{
+    if (m_row_emphasized == emphasized)
+        return;
+    m_row_emphasized = emphasized;
+    update();
+}
+
 bool TabBarButton::event(QEvent* event)
 {
     if (event->type() == QEvent::Enter)
@@ -5014,13 +5390,25 @@ void TabBarButton::paintEvent(QPaintEvent*)
     auto icon_pixmap = icon().pixmap(iconSize(), devicePixelRatioF(), icon_mode);
     option.icon = {};
 
+    // A full sidebar would draw a dark stripe of close buttons down its side, so they are lighter but on the hovered and
+    // the selected rows, and on the button under the pointer.
+    auto is_hovered = isDown() || (underMouse() && rect().contains(mapFromGlobal(QCursor::pos())));
+    if (m_placement == Placement::SidebarRow && m_role == Role::Close && !m_row_emphasized && !is_hovered && isEnabled() && !Theme::has_increased_contrast()) {
+        auto dark = Theme::is_dark(*this);
+        if (m_quiet_close_icon.isNull() || m_quiet_close_icon_is_dark != dark) {
+            m_quiet_close_icon = create_chrome_icon(ChromeIcon::TabClose, QColor::fromRgb(dark ? SIDEBAR_ROW_QUIET_CLOSE_ICON_DARK : SIDEBAR_ROW_QUIET_CLOSE_ICON_LIGHT));
+            m_quiet_close_icon_is_dark = dark;
+        }
+        icon_pixmap = m_quiet_close_icon.pixmap(iconSize(), devicePixelRatioF());
+    }
+
     QStylePainter painter(this);
     painter.setOpacity(m_opacity);
 
     if (m_placement == Placement::RailBadge) {
         ChromeStyle::paint_control_frame(painter, *this, ChromeStyle::ControlFrameStyle::ActiveTabOverlay);
     } else if (m_role == Role::Close) {
-        if (isDown() || (underMouse() && rect().contains(mapFromGlobal(QCursor::pos())))) {
+        if (is_hovered) {
             // A tab's close button is a small rounded square that lights up over the tab's own fill.
             painter.setRenderHint(QPainter::Antialiasing, true);
             painter.setPen(Qt::NoPen);

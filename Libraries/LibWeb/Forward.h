@@ -847,6 +847,7 @@ enum class RequireWellFormed;
 enum class SelectionDirection : u8;
 
 struct Agent;
+class ScriptAbortHandle;
 struct DeserializedTransferRecord;
 struct Environment;
 struct EnvironmentSettingsObject;
@@ -1143,6 +1144,7 @@ class SVGSwitchElement;
 class SVGSymbolElement;
 class SVGTitleElement;
 class SVGTransformList;
+class SVGUseElement;
 class SVGViewElement;
 class TimeEvent;
 

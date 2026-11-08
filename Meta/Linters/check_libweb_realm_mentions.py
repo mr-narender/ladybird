@@ -56,11 +56,11 @@ ALLOWED_REALM_MENTIONS = {
         "DOM abort plumbing, including the Rust AbortSignal adapter, and node helpers use callback/materialization realms",
     ),
     "Fetch": (
-        20,
-        60,
+        22,
+        62,
         "Fetch bodies, headers, requests, responses, response views, and controllers still materialize JS values/streams; "
         "BodyStreamPullSource creates body streams and materializes their pulls and errors on the consumer side, each in "
-        "its stream's realm",
+        "its stream's realm; Body.textStream() creates its empty stream or streaming decoder in the receiver's realm",
     ),
     "FileAPI": (2, 9, "Blob glue still creates streams and buffers in selected realms"),
     "HTML": (
@@ -93,9 +93,10 @@ ALLOWED_REALM_MENTIONS = {
         "the agent cluster of one",
     ),
     "WebAudio": (
-        8,
-        19,
-        "WebAudio buffers, AudioParamMap, and AudioWorklet APIs still materialize JS buffers and callback/promise values in selected realms",
+        7,
+        27,
+        "the Worklet, event loop, and media services still wrap C++ values or report exceptions in the caller's realm; "
+        "the port passes that realm explicitly across the Rust boundary",
     ),
     "WebDriver": (2, 7, "WebDriver execute/JSON conversion still materializes JS values for automation"),
     "WebGL": (4, 8, "WebGL contexts are created in the realm of their canvas, and their events in it"),

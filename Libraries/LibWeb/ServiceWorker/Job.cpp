@@ -76,8 +76,14 @@ void Job::visit_edges(JS::Cell::Visitor& visitor)
 // https://w3c.github.io/ServiceWorker/#dfn-scope-to-job-queue-map
 static HashMap<ByteString, NonnullOwnPtr<JobQueue>>& scope_to_job_queue_map()
 {
-    static NeverDestroyed<HashMap<ByteString, NonnullOwnPtr<JobQueue>>> map;
+    // NB: The jobs in here are cells of the agent that scheduled them.
+    static thread_local NeverDestroyed<HashMap<ByteString, NonnullOwnPtr<JobQueue>>> map;
     return *map;
+}
+
+void forget_job_queues_of_this_agent()
+{
+    scope_to_job_queue_map().clear();
 }
 
 // https://w3c.github.io/ServiceWorker/#register-algorithm
@@ -444,7 +450,7 @@ static void update(JS::VM& vm, GC::Ref<Job> job)
         auto fetch_controller = fetch_job_script(*job, *request, move(fetch_algorithms_input), consume_body);
 
         // FIXME: This feels.. uncomfortable but it should work to block the current task until the fetch has progressed past our processResponse hook or aborted
-        auto& event_loop = job->client ? job->client->responsible_event_loop() : HTML::main_thread_event_loop();
+        auto& event_loop = job->client ? job->client->responsible_event_loop() : HTML::current_event_loop();
         event_loop.spin_until(GC::create_function(GC::Heap::the(), [fetch_controller, &process_response_completion_result]() -> bool {
             if (process_response_completion_result.has_value())
                 return true;
@@ -460,6 +466,9 @@ static void update(JS::VM& vm, GC::Ref<Job> job)
             return false;
         }));
 
+        // NB: The event loop gave up on an aborted script.
+        if (!process_response_completion_result.has_value())
+            return WebIDL::AbortError::create("Service Worker fetch was terminated or aborted"_utf16);
         return process_response_completion_result.release_value();
     };
     auto perform_the_fetch_hook = HTML::create_perform_the_fetch_hook(GC::Heap::the(), move(perform_the_fetch_hook_function));

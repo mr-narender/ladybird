@@ -30,11 +30,13 @@ import sys
 # or a stub in a test binary.
 ALLOWED = {
     "Libraries/LibGfx/Rust/src/text_layout.rs:SHAPING_CACHE": "per-thread memo of a pure function; a second copy costs memory, never an answer",
+    "AK/Rust/src/waiter_list.rs:LISTS": "only libjs_rust and libwasm_engine use it, which are in one library of a process, so they share a copy; a caller in another library needs the state moved to C++",
     "Libraries/LibCompositing/Rust/src/test_stubs.rs:NEXT": "test stub for LibGfx's C++ counters, in the cargo test binary that has no C++ side",
     "Libraries/LibCompositing/Rust/src/display_list/replay.rs:WARM_REPLAY_SCRATCH_STORAGE": "per-thread replay scratch; a second copy costs memory, never an answer",
     "Libraries/LibJS/Flap/src/low_ir/lowering.rs:LABELS": "per-thread scratch buffer; a second copy costs memory, never an answer",
     "Libraries/LibJS/JIT/Rust/src/asm/x86_64/sse.rs:FEATURES": "immutable CPU/OS feature cache; each copy computes the same supported instructions",
     "Libraries/LibJS/JIT/Rust/src/codegen/tests.rs:REGION": "the fake heap region of JIT unit tests, in the cargo test binary that has no runtime",
+    "Libraries/LibRegex/Rust/src/vm.rs:INTERRUPT_FLAG": "per-thread, and only libjs_rust's copy sets it; the copy of LibURL's crate has no VM to interrupt, so it only ever sees null",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_LISTS": "per-thread allocation pool; a second copy costs memory, never an answer",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_VALUES": "per-thread allocation pool; a second copy costs memory, never an answer",
 }
@@ -150,6 +152,7 @@ RENDER_STATE_ALLOWED = {
             "css/style_compute.rs:REMAINING_ORDER",
             "css/style_compute.rs:TABLE",
             "style_layout_pool.rs:THREAD_COUNT",
+            "web_audio/rendering/render_nodes.rs:COEFFICIENTS",
         ],
     ),
     **render_state_entries(

@@ -80,6 +80,7 @@
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebDriverConnection.h>
 #include <WebContent/WebUIConnection.h>
+#include <WebContent/Worker/WorkerThread.h>
 
 namespace WebContent {
 
@@ -935,11 +936,6 @@ void PageClient::page_did_set_text_fragment_indication_visibility(bool visible)
 {
     client().async_did_set_text_fragment_indication_visibility(m_id, visible);
 }
-void PageClient::page_did_request_refresh()
-{
-    client().async_did_request_refresh(m_id);
-}
-
 void PageClient::page_did_request_resize_window(Gfx::IntSize size, u64 completion_id)
 {
     client().async_did_request_resize_window(m_id, size, completion_id);
@@ -988,17 +984,6 @@ void PageClient::page_did_change_picture_in_picture_video_size(Gfx::IntSize vide
 void PageClient::page_did_change_picture_in_picture_player_controls_visibility(bool shown)
 {
     client().async_did_change_picture_in_picture_player_controls_visibility(m_id, shown);
-}
-
-void PageClient::page_did_request_tooltip_override(Web::CSSPixelPoint position, ByteString const& title)
-{
-    auto device_position = page().css_to_device_point(position);
-    client().async_did_request_tooltip_override(m_id, { device_position.x(), device_position.y() }, title);
-}
-
-void PageClient::page_did_stop_tooltip_override()
-{
-    client().async_did_leave_tooltip_area(m_id);
 }
 
 void PageClient::page_did_enter_tooltip_area(ByteString const& title)
@@ -1813,6 +1798,11 @@ void PageClient::page_did_consume_user_activation(Web::HTML::UserActivationConsu
     client().async_did_consume_user_activation(m_id, consumption);
 }
 
+void PageClient::page_did_notify_about_user_activation(Web::HTML::CrossProcessId document_id)
+{
+    client().async_did_notify_about_user_activation(m_id, document_id);
+}
+
 void PageClient::send_current_needs_beforeunload_check()
 {
     client().async_did_change_needs_beforeunload_check(m_id, page().needs_beforeunload_check());
@@ -1983,6 +1973,12 @@ void PageClient::crash_remote_frame_processes_for_testing()
 {
     if (auto* test_connection = client().test_connection())
         test_connection->async_did_request_crash_of_remote_frame_processes_for_testing(m_id);
+}
+
+void PageClient::close_tab_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        test_connection->async_did_request_close_tab_for_testing(m_id);
 }
 
 void PageClient::page_did_spoof_document_origin_for_testing(Web::HTML::EnvironmentSettingsObject const& environment, URL::Origin const& origin)
@@ -2266,15 +2262,22 @@ void PageClient::reset_gamepad_access_for_testing()
         test_connection->async_reset_gamepad_access_for_testing(m_id);
 }
 
-Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)
+Web::PageClient::StartedWorkerAgent PageClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest&& request)
 {
+    auto agent_type = request.agent_type;
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::StartWorkerAgent>(m_id, move(request));
     if (!response) {
         dbgln("WebContent client disconnected during StartWorkerAgent. Exiting peacefully.");
         Core::Process::terminate_immediately(0);
     }
 
-    return response->agent_id();
+    // NB: The UI process notices a transport that nobody takes up, and tells the owner that its worker is gone.
+    if (auto transport = response->take_thread_transport(); transport.has_value()) {
+        if (auto result = WebWorker::start_worker_thread(transport.release_value(), agent_type); result.is_error())
+            dbgln("Unable to start a thread for a worker: {}", result.error());
+    }
+
+    return { response->agent_id(), response->is_hosted_in_caller_process() };
 }
 
 void PageClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)

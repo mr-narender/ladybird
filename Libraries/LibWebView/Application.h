@@ -186,9 +186,11 @@ public:
 
     // True unless the user has turned location off, or there's no way to find it.
     bool sites_can_ask_for_location() const;
+    bool sites_can_ask_for_microphone() const;
     bool sites_can_ask_for_notifications() const;
     Core::GeolocationAuthorization geolocation_authorization();
     void location_policy_changed(Badge<ApplicationSettingsObserver>);
+    void microphone_policy_changed(Badge<ApplicationSettingsObserver>);
     void notifications_policy_changed(Badge<ApplicationSettingsObserver>);
     void permissions_changed(Badge<ApplicationPermissionManagerObserver>, PermissionManager const&);
 
@@ -262,6 +264,8 @@ public:
         NonnullRefPtr<WebContentClient> client;
         Web::PageId page_id { 0 };
     };
+    // For what may share a process with no page. It ends once nothing keeps it.
+    ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process_without_page(IsPrivate);
     ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state);
     Web::PageId allocate_page_id();
     Web::HTML::CrossProcessIdAllocator allocate_cross_process_id_allocator();
@@ -423,6 +427,7 @@ public:
     void update_report_website_issue_action();
 
     Menu& debug_menu() { return *m_debug_menu; }
+    Action& show_tab_performance_monitor_action() { return *m_show_tab_performance_monitor_action; }
 
     FileDownloader& file_downloader() { return m_file_downloader; }
 
@@ -768,6 +773,7 @@ private:
     RefPtr<Menu> m_debug_menu;
     RefPtr<Action> m_show_line_box_borders_action;
     RefPtr<Action> m_show_caret_hit_test_debug_overlay_action;
+    RefPtr<Action> m_show_tab_performance_monitor_action;
     RefPtr<Action> m_enable_scripting_action;
     RefPtr<Action> m_block_pop_ups_action;
     StringView m_user_agent_string;

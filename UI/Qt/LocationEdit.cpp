@@ -23,6 +23,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QClipboard>
+#include <QDynamicPropertyChangeEvent>
 #include <QEasingCurve>
 #include <QGraphicsEffect>
 #include <QGuiApplication>
@@ -399,7 +400,7 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
         m_omnibox.cursor_moved(at_end);
     });
 
-    connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this] {
+    connect(&SystemAppearance::the(), &SystemAppearance::interface_appearance_changed, this, [this] {
         schedule_chrome_style_update();
     });
 }
@@ -572,7 +573,7 @@ void LocationEdit::changeEvent(QEvent* event)
         if (!isActiveWindow())
             update_focus_ring(0);
         else if (m_is_editing_location && hasFocus())
-            update_focus_ring(1);
+            update_focus_ring(focus_ring_opacity_while_editing());
     }
     // NB: Repolishing for the hover look changes our palette to the hovered colors, which needs no new style.
     if (event->type() == QEvent::PaletteChange && m_is_updating_field_hover)
@@ -588,6 +589,8 @@ bool LocationEdit::event(QEvent* event)
         set_field_hovered(true);
     else if (event->type() == QEvent::Leave)
         set_field_hovered(false);
+    else if (event->type() == QEvent::DynamicPropertyChange && static_cast<QDynamicPropertyChangeEvent*>(event)->propertyName() == "autocompleteOpen" && m_is_editing_location)
+        show_focus_ring_at_once();
     return QLineEdit::event(event);
 }
 
@@ -787,15 +790,28 @@ void LocationEdit::update_focus_ring(qreal opacity)
 // The ring fades in when the field gets focus, and disappears at once when it loses it.
 void LocationEdit::show_focus_ring()
 {
-    m_is_editing_location = true;
+    if (!m_is_editing_location) {
+        m_is_editing_location = true;
+        emit editing_location_changed();
+    }
     update_trailing_action_visibility();
+    animate_focus_ring();
+}
 
+// While the field lists suggestions, it is part of their surface, and the ring goes around the whole surface instead.
+qreal LocationEdit::focus_ring_opacity_while_editing() const
+{
+    return property("autocompleteOpen").toBool() ? 0 : 1;
+}
+
+void LocationEdit::animate_focus_ring()
+{
     if (!m_focus_ring_animation)
         return;
 
     m_focus_ring_animation->stop();
     m_focus_ring_animation->setStartValue(m_focus_ring_opacity);
-    m_focus_ring_animation->setEndValue(1.0);
+    m_focus_ring_animation->setEndValue(focus_ring_opacity_while_editing());
     m_focus_ring_animation->start();
 }
 
@@ -805,12 +821,15 @@ void LocationEdit::show_focus_ring_at_once()
         return;
     if (m_focus_ring_animation)
         m_focus_ring_animation->stop();
-    update_focus_ring(1);
+    update_focus_ring(focus_ring_opacity_while_editing());
 }
 
 void LocationEdit::hide_focus_ring()
 {
-    m_is_editing_location = false;
+    if (m_is_editing_location) {
+        m_is_editing_location = false;
+        emit editing_location_changed();
+    }
     update_trailing_action_visibility();
     update_completion_title();
 
@@ -1227,7 +1246,7 @@ void LocationEdit::highlight_location()
                 scheme_and_subdomain = scheme_and_subdomain.substring_view(scheme_prefix_length);
             if (scheme_and_subdomain.starts_with("www."sv, CaseSensitivity::CaseInsensitive))
                 scheme_and_subdomain = scheme_and_subdomain.substring_view(4);
-            if (remainder == "/"sv)
+            if (remainder == "/"sv || m_shows_host_only)
                 remainder = {};
 
             append_attributes(scheme_and_subdomain, url_parts->effective_tld_plus_one, remainder);
@@ -1393,7 +1412,22 @@ QString LocationEdit::serialized_url() const
 QString LocationEdit::display_url() const
 {
     VERIFY(m_url.has_value());
+    if (m_shows_host_only && m_url->scheme().is_one_of("http"sv, "https"sv))
+        return qstring_from_ak_string(WebView::authority_for_display(*m_url));
     return qstring_from_ak_string(WebView::url_for_display(*m_url));
+}
+
+void LocationEdit::set_shows_host_only(bool shows_host_only)
+{
+    if (m_shows_host_only == shows_host_only)
+        return;
+    auto was_showing_display_url = m_url.has_value() && !hasFocus() && text() == display_url();
+    m_shows_host_only = shows_host_only;
+    if (was_showing_display_url) {
+        set_text_and_restart_editing(display_url());
+        setCursorPosition(0);
+        highlight_location();
+    }
 }
 
 QString LocationEdit::current_query() const
@@ -1401,6 +1435,11 @@ QString LocationEdit::current_query() const
     if (m_omnibox.is_editing())
         return qstring_from_ak_string(m_omnibox.query());
     return text();
+}
+
+void LocationEdit::set_suggestions_host(QWidget* host)
+{
+    m_autocomplete->set_host(host);
 }
 
 }

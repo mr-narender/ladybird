@@ -589,6 +589,7 @@ set(SOURCES
     HTML/Scripting/ModuleMap.cpp
     HTML/Scripting/ModuleScript.cpp
     HTML/Scripting/Script.cpp
+    HTML/Scripting/ScriptAbortHandle.cpp
     HTML/Scripting/ScriptRegistry.cpp
     HTML/Scripting/SimilarOriginWindowAgent.cpp
     HTML/Scripting/TemporaryExecutionContext.cpp
@@ -746,6 +747,7 @@ set(SOURCES
     Platform/FontPlugin.cpp
     Platform/ImageCodecPlugin.cpp
     Platform/RemoteImageCodecPlugin.cpp
+    Platform/ThreadPoolWork.cpp
     Platform/Timer.cpp
     ReferrerPolicy/AbstractOperations.cpp
     RequestIdleCallback/IdleDeadline.cpp
@@ -925,60 +927,15 @@ set(SOURCES
     WebLocks/NavigatorLocks.cpp
     WebAssembly/WebAssembly.cpp
     WebAudio/AnalyserNode.cpp
-    WebAudio/AudioParamMap.cpp
     WebAudio/AudioWorklet.cpp
     WebAudio/AudioWorkletGlobalScope.cpp
     WebAudio/AudioWorkletNode.cpp
     WebAudio/AudioWorkletProcessor.cpp
-    WebAudio/AudioArray.cpp
-    WebAudio/AudioBuffer.cpp
-    WebAudio/AudioBufferSourceNode.cpp
     WebAudio/AudioContext.cpp
-    WebAudio/AudioDestinationNode.cpp
-    WebAudio/AudioListener.cpp
-    WebAudio/AudioNode.cpp
-    WebAudio/AudioParam.cpp
-    WebAudio/AudioParamTimeline.cpp
-    WebAudio/AudioProcessingEvent.cpp
-    WebAudio/AudioScheduledSourceNode.cpp
     WebAudio/BaseAudioContext.cpp
-    WebAudio/BiquadFilterNode.cpp
-    WebAudio/ChannelMergerNode.cpp
-    WebAudio/ChannelSplitterNode.cpp
-    WebAudio/ConstantSourceNode.cpp
-    WebAudio/ControlMessageQueue.cpp
-    WebAudio/ConvolverNode.cpp
-    WebAudio/DelayNode.cpp
-    WebAudio/DynamicsCompressorNode.cpp
-    WebAudio/GainNode.cpp
-    WebAudio/IIRFilterNode.cpp
     WebAudio/MediaElementAudioSourceNode.cpp
     WebAudio/MediaStreamAudioDestinationNode.cpp
     WebAudio/MediaStreamAudioSourceNode.cpp
-    WebAudio/OfflineAudioCompletionEvent.cpp
-    WebAudio/OfflineAudioContext.cpp
-    WebAudio/OscillatorNode.cpp
-    WebAudio/PannerNode.cpp
-    WebAudio/PeriodicWave.cpp
-    WebAudio/Rendering/AnalyserRenderNode.cpp
-    WebAudio/Rendering/AudioBus.cpp
-    WebAudio/Rendering/AudioWorkletPipe.cpp
-    WebAudio/Rendering/AudioWorkletRenderNode.cpp
-    WebAudio/Rendering/BiquadCoefficients.cpp
-    WebAudio/Rendering/ConvolverKernel.cpp
-    WebAudio/Rendering/FFT.cpp
-    WebAudio/Rendering/MediaStreamDestinationRenderNode.cpp
-    WebAudio/Rendering/MediaStreamSourceRenderNode.cpp
-    WebAudio/Rendering/OfflineAudioRenderer.cpp
-    WebAudio/Rendering/RealtimeAudioRenderer.cpp
-    WebAudio/Rendering/RenderGraph.cpp
-    WebAudio/Rendering/RenderNode.cpp
-    WebAudio/Rendering/RenderNodes.cpp
-    WebAudio/Rendering/ScriptProcessorPipe.cpp
-    WebAudio/Rendering/ScriptProcessorRenderNode.cpp
-    WebAudio/ScriptProcessorNode.cpp
-    WebAudio/StereoPannerNode.cpp
-    WebAudio/WaveShaperNode.cpp
     WebDriver/Actions.cpp
     WebDriver/BiDi/BiDi.cpp
     WebDriver/BiDi/BrowsingContext.cpp
@@ -1129,6 +1086,7 @@ sync_rust_crate_ffi_headers(
     FFI_HEADERS
         HTML/Parser/RustFFI.h
         RustFFI.h
+        WebAudio/RustFFI.h
         SVG/ParserRustFFI.h
         SelectorRustFFI.h
         StyleValueRustFFI.h

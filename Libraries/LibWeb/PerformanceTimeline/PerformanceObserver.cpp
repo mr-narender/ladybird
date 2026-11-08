@@ -31,8 +31,13 @@ GC_DEFINE_ALLOCATOR(PerformanceObserver);
 
 static Bindings::WrapperWorldWeakValueCacheMap<JS::Object, JS::Object>& supported_entry_types_caches()
 {
-    static NeverDestroyed<Bindings::WrapperWorldWeakValueCacheMap<JS::Object, JS::Object>> caches;
+    static thread_local NeverDestroyed<Bindings::WrapperWorldWeakValueCacheMap<JS::Object, JS::Object>> caches;
     return *caches;
+}
+
+void clear_supported_entry_types_caches()
+{
+    supported_entry_types_caches().clear();
 }
 
 static Bindings::WrapperWorldWeakValueCache<JS::Object>& supported_entry_types_cache_for(JS::Object& global_object)

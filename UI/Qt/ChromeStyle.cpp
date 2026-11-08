@@ -89,6 +89,11 @@ QColor chrome_sidebar_background(QPalette const& palette)
     return Theme::chrome(palette).sidebar;
 }
 
+QColor crash_reports_dot_color(QPalette const& palette)
+{
+    return is_dark(palette) ? QColor(0xF2, 0xA3, 0x3A) : QColor(0xD9, 0x80, 0x0F);
+}
+
 QColor chrome_background(QPalette const& palette)
 {
     return Theme::chrome(palette).toolbar;
@@ -216,7 +221,7 @@ QString style_sheet_color(QColor const& color)
     return qformatted("rgb({}, {}, {})", color.red(), color.green(), color.blue());
 }
 
-QString application_style_sheet(QPalette const&)
+QString menu_zoom_row_style_sheet()
 {
     auto const& panel = Theme::panel();
     auto button_background = over(panel.control, panel.surface);
@@ -285,7 +290,14 @@ QWidget#LadybirdToolbarContainer[verticalTabs="true"] {{
     border-bottom-color: transparent;
 }}
 
-QWidget#LadybirdNavigationToolbar QToolButton {{
+QWidget#LadybirdToolbarContainer[inSidebar="true"] {{
+    background: transparent;
+    border-bottom: 0;
+}}
+
+QWidget#LadybirdNavigationToolbar QToolButton,
+QWidget#LadybirdNavigationButtons QToolButton,
+QWidget#LadybirdSidebarFooter QToolButton {{
     color: {4};
     background: transparent;
     border: 0;
@@ -295,30 +307,43 @@ QWidget#LadybirdNavigationToolbar QToolButton {{
     padding: 0;
 }}
 
-/* NB: Beside the collapsed sidebar, the all-tabs button sits in the toolbar, and keeps its own size there. */
-QWidget#LadybirdNavigationToolbar QToolButton#LadybirdAllTabsButton {{
+/* NB: The all-tabs button keeps its own size in the toolbar and the sidebar's footer, and the navigation buttons theirs,
+       which is smaller in the sidebar. */
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdAllTabsButton,
+QWidget#LadybirdSidebarFooter QToolButton#LadybirdAllTabsButton,
+QWidget#LadybirdNavigationButtons QToolButton {{
     min-width: 0;
     min-height: 0;
 }}
 
-QWidget#LadybirdNavigationToolbar QToolButton:hover {{
+QWidget#LadybirdNavigationToolbar QToolButton:hover,
+QWidget#LadybirdNavigationButtons QToolButton:hover,
+QWidget#LadybirdSidebarFooter QToolButton:hover {{
     background: transparent;
     border-color: transparent;
 }}
 
 QWidget#LadybirdNavigationToolbar QToolButton:pressed,
-QWidget#LadybirdNavigationToolbar QToolButton:checked {{
+QWidget#LadybirdNavigationButtons QToolButton:pressed,
+QWidget#LadybirdNavigationToolbar QToolButton:checked,
+QWidget#LadybirdNavigationButtons QToolButton:checked,
+QWidget#LadybirdSidebarFooter QToolButton:pressed,
+QWidget#LadybirdSidebarFooter QToolButton:checked {{
     background: transparent;
     border-color: transparent;
 }}
 
-QWidget#LadybirdNavigationToolbar QToolButton:disabled {{
+QWidget#LadybirdNavigationToolbar QToolButton:disabled,
+QWidget#LadybirdNavigationButtons QToolButton:disabled,
+QWidget#LadybirdSidebarFooter QToolButton:disabled {{
     color: {5};
     background: transparent;
     border-color: transparent;
 }}
 
-QWidget#LadybirdNavigationToolbar QToolButton::menu-indicator {{
+QWidget#LadybirdNavigationToolbar QToolButton::menu-indicator,
+QWidget#LadybirdNavigationButtons QToolButton::menu-indicator,
+QWidget#LadybirdSidebarFooter QToolButton::menu-indicator {{
     image: none;
 }}
 
@@ -513,6 +538,10 @@ QLineEdit#LadybirdLocationEdit[fieldHovered="true"] {{
 QLineEdit#LadybirdLocationEdit:focus {{
     background: {17};
     border-color: {3};
+}}
+
+QLineEdit#LadybirdLocationEdit[autocompleteOpen="true"] {{
+    border-color: {17};
 }}
 
 QLineEdit#LadybirdLocationEdit:disabled {{
@@ -1231,7 +1260,7 @@ QLabel#LadybirdDownloadsEmpty {{
 }}
 
 QLabel#LadybirdDownloadStatus[failed="true"] {{
-    color: {6};
+    color: {5};
 }}
 
 QFrame#LadybirdDownloadRow {{
@@ -1241,7 +1270,7 @@ QFrame#LadybirdDownloadRow {{
 }}
 
 QFrame#LadybirdDownloadRow:hover {{
-    background: {7};
+    background: {6};
 }}
 
 QProgressBar#LadybirdDownloadProgress {{
@@ -1253,7 +1282,7 @@ QProgressBar#LadybirdDownloadProgress {{
 }}
 
 QProgressBar#LadybirdDownloadProgress::chunk {{
-    background: {8};
+    background: {7};
     border-radius: 2px;
 }}
 
@@ -1263,17 +1292,21 @@ QFrame#LadybirdPopoverSeparator {{
 }}
 
 QPushButton#LadybirdPopoverLink {{
-    color: {5};
+    color: {0};
     background: transparent;
     border: 0;
     border-radius: 5px;
     padding: 4px 6px;
     font-size: 12px;
+    font-weight: 500;
 }}
 
-QPushButton#LadybirdPopoverLink:hover,
+QPushButton#LadybirdPopoverLink:hover {{
+    text-decoration: underline;
+}}
+
 QPushButton#LadybirdPopoverRow:hover {{
-    background: {7};
+    background: {6};
 }}
 
 QPushButton#LadybirdPopoverRow {{
@@ -1293,15 +1326,15 @@ QToolButton#LadybirdDownloadAction {{
 }}
 
 QToolButton#LadybirdDownloadAction:hover {{
-    background: {7};
+    background: {6};
 }}
 
 QToolButton#LadybirdDownloadAction:pressed {{
-    background: {9};
+    background: {8};
 }}
 )",
         style_sheet_color(panel.text), style_sheet_color(panel.surface), style_sheet_color(over(panel.edge, panel.surface)), style_sheet_color(panel.muted),
-        style_sheet_color(panel.separator), style_sheet_color(panel.link), style_sheet_color(panel.warning), style_sheet_color(panel.control), style_sheet_color(Theme::accent()),
+        style_sheet_color(panel.separator), style_sheet_color(panel.warning), style_sheet_color(panel.control), style_sheet_color(Theme::accent()),
         style_sheet_color(panel.pressed));
 }
 
@@ -1645,7 +1678,7 @@ QFrame#LadybirdSiteSettingsPopover QLabel#LadybirdSiteSettingsDetail {{
 }}
 
 QFrame#LadybirdSiteSettingsPopover QLabel#LadybirdSiteSettingsSecurity {{
-    color: {6};
+    color: {5};
     font-size: 12px;
 }}
 
@@ -1656,7 +1689,7 @@ QFrame#LadybirdPopoverSeparator {{
 
 QPushButton#LadybirdPopoverValueButton {{
     color: {0};
-    background: {7};
+    background: {6};
     border: 0;
     border-radius: 6px;
     min-height: 24px;
@@ -1667,20 +1700,21 @@ QPushButton#LadybirdPopoverValueButton {{
 
 QPushButton#LadybirdPopoverValueButton:hover,
 QPushButton#LadybirdPopoverValueButton:pressed {{
-    background: {8};
+    background: {7};
 }}
 
 QPushButton#LadybirdPopoverLink {{
-    color: {5};
+    color: {0};
     background: transparent;
     border: 0;
     border-radius: 5px;
     padding: 6px;
     font-size: 12px;
+    font-weight: 500;
 }}
 
 QPushButton#LadybirdPopoverLink:hover {{
-    background: {7};
+    text-decoration: underline;
 }}
 
 QPushButton#LadybirdPopoverLink:disabled {{
@@ -1695,12 +1729,12 @@ QPushButton#LadybirdPopoverRow {{
 
 QPushButton#LadybirdPopoverRow:hover,
 QToolButton#LadybirdPopoverIconButton:hover {{
-    background: {7};
+    background: {6};
 }}
 
 QPushButton#LadybirdPopoverRow:pressed,
 QToolButton#LadybirdPopoverIconButton:pressed {{
-    background: {8};
+    background: {7};
 }}
 
 QToolButton#LadybirdPopoverIconButton {{
@@ -1710,7 +1744,7 @@ QToolButton#LadybirdPopoverIconButton {{
 }}
 )",
         style_sheet_color(panel.text), style_sheet_color(panel.surface), style_sheet_color(over(panel.edge, panel.surface)), style_sheet_color(panel.muted),
-        style_sheet_color(panel.separator), style_sheet_color(panel.link), style_sheet_color(panel.warning), style_sheet_color(panel.control), style_sheet_color(panel.pressed));
+        style_sheet_color(panel.separator), style_sheet_color(panel.warning), style_sheet_color(panel.control), style_sheet_color(panel.pressed));
 }
 
 QString feedback_popover_style_sheet(QPalette const&)
@@ -1827,20 +1861,21 @@ QPushButton#LadybirdZoomButton:pressed {{
 }}
 
 QPushButton#LadybirdPopoverLink {{
-    color: {5};
+    color: {0};
     background: transparent;
     border: 0;
     border-radius: 5px;
     padding: 4px 6px;
     font-size: 12px;
+    font-weight: 500;
 }}
 
 QPushButton#LadybirdPopoverLink:hover {{
-    background: {3};
+    text-decoration: underline;
 }}
 )",
         style_sheet_color(panel.text), style_sheet_color(panel.surface), style_sheet_color(over(panel.edge, panel.surface)),
-        style_sheet_color(panel.control), style_sheet_color(panel.pressed), style_sheet_color(panel.link));
+        style_sheet_color(panel.control), style_sheet_color(panel.pressed));
 }
 
 // Tooltips appear after half a second of hover. Once one has shown, the ones next to it appear at once for 1.5 s.

@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/ByteString.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
@@ -26,12 +27,17 @@
 
 namespace Web {
 
+// Each agent has a loader of its own, which holds its connections to the RequestServer and its requests, and only its
+// thread can use it. The static settings are the process's.
 class WEB_API ResourceLoader : public Core::EventReceiver {
     C_OBJECT_ABSTRACT(ResourceLoader)
 
 public:
     static void initialize(GC::Heap&);
     static bool is_initialized();
+
+    // Forgets the loader of this agent, once its requests are stopped.
+    static void shut_down();
     static ResourceLoader& the();
 
     static void set_proxy_autoconfig_url(URL::URL);
@@ -46,6 +52,9 @@ public:
     using OnCachedBodyAvailable = GC::Function<void(Core::ImmutableBytes data)>;
     using OnComplete = GC::Function<void(bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message)>;
 
+    // A request keeps roots into the heap of the agent that made it.
+    void stop_all_requests();
+
     RefPtr<Fetch::Engine::NetworkTransportHandle> load(LoadRequest&, GC::Root<OnHeadersReceived>, GC::Root<OnDataReceived>, GC::Root<OnCachedBodyAvailable>, GC::Root<OnComplete>, Requests::RequestClient::TransferLease = Requests::RequestClient::TransferLease::No);
 
     RefPtr<Requests::RequestClient> request_client_for(Optional<HTTP::NetworkIsolationKey> const&) const;
@@ -59,9 +68,6 @@ public:
     void preconnect(GC::Ptr<DOM::Document>, URL::URL const&, URL::URL const& source_url);
 
     static bool is_known_hsts_host(Page&, String const& host);
-
-    String const& platform() const { return m_platform; }
-    void set_platform(String platform) { m_platform = move(platform); }
 
     // The engine the navigator claims to be. A process-wide setting, readable before the loader exists: the bindings
     // consult it while they build a realm's global object.
@@ -93,8 +99,7 @@ private:
     HashMap<Utf16String, RefPtr<Requests::RequestClient>> m_site_request_clients;
     HashTable<NonnullRefPtr<Requests::Request>> m_active_requests;
 
-    String m_platform;
-    static NavigatorCompatibilityMode s_navigator_compatibility_mode;
+    static Atomic<NavigatorCompatibilityMode, AK::MemoryOrder::memory_order_relaxed> s_navigator_compatibility_mode;
 };
 
 }

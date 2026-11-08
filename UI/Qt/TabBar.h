@@ -56,6 +56,7 @@ class LadybirdButton;
 
 class TabPreviewPopup;
 class TabWidget;
+class WindowControlsReveal;
 
 static constexpr int TAB_ICON_SIZE = 16;
 
@@ -329,6 +330,7 @@ public:
     void set_window_controls_visible(bool);
     void update_window_button_icons();
     void set_vertical_tabs_enabled(bool);
+    void set_everything_in_sidebar(bool);
     void set_vertical_tabs_expanded(bool);
     void set_vertical_tabs_expand_on_hover(bool);
     // How strongly the vertical tabs' titles show, which they don't for long once the sidebar starts to collapse.
@@ -369,16 +371,26 @@ private:
     int vertical_tabs_layout_width() const;
     bool should_show_window_controls_in_tab_toolbar() const;
     bool vertical_tabs_hold_window_controls() const;
+    bool toolbar_is_in_sidebar() const;
     int vertical_tabs_header_spacing() const;
     int minimum_vertical_tabs_expanded_width() const;
 
     void rebuild_layout();
     void rebuild_layout_for_horizontal_tabs();
+    bool sidebar_toggle_stays_in_corner() const;
+    void place_all_tabs_and_sidebar_toggle();
+    void place_sidebar_toggle_in_corner();
     void place_collapsed_sidebar_buttons();
     void float_sidebar_buttons_while_toggling();
     bool slides_page_with_toggling_sidebar() const;
     void slide_page_with_toggling_sidebar();
-    QLabel* m_floating_ladybird_buttons { nullptr };
+    bool toggle_moves_toolbar() const;
+    int sidebar_opening_time() const;
+    int toolbar_row_height_while_toggling() const;
+    void move_toolbar_with_toggling_sidebar();
+    QWidget* m_floating_buttons_strip { nullptr };
+    QLabel* m_floating_ladybird_button { nullptr };
+    QLabel* m_floating_all_tabs_button { nullptr };
     QLabel* m_floating_sidebar_toggle { nullptr };
     // Where the toolbar's slot for the buttons ends when the sidebar starts to open, in the window. The slot keeps
     // ending there until the sidebar is open, so the toolbar's other buttons stay in place under the sidebar.
@@ -430,6 +442,7 @@ private:
     QToolButton* m_maximize_window_button { nullptr };
     QToolButton* m_close_window_button { nullptr };
     QWidget* m_window_controls { nullptr };
+    WindowControlsReveal* m_window_controls_reveal { nullptr };
     WindowToolbar* m_toolbar { nullptr };
     BookmarksBarContainer* m_bookmarks_bar { nullptr };
     QWidget* m_page_column { nullptr };
@@ -439,6 +452,7 @@ private:
     QWidget* m_vertical_tabs_reserved_space { nullptr };
     QWidget* m_vertical_tab_bar_column { nullptr };
     QWidget* m_vertical_tabs_content_separator { nullptr };
+    QWidget* m_collapsed_sidebar_top_edge { nullptr };
     QWidget* m_vertical_tabs_resize_handle { nullptr };
     QWidget* m_vertical_tabs_content { nullptr };
     QTimer* m_vertical_tabs_hover_expand_timer { nullptr };
@@ -453,6 +467,7 @@ private:
     bool m_tab_bar_visible { true };
     bool m_window_controls_visible { true };
     bool m_vertical_tabs_enabled { false };
+    bool m_everything_in_sidebar { false };
     bool m_vertical_tabs_expanded { true };
     bool m_vertical_tabs_expand_on_hover { false };
     WebView::VerticalTabsPosition m_vertical_tabs_position { WebView::VerticalTabsPosition::Left };
@@ -467,6 +482,10 @@ private:
     int m_vertical_tabs_toggle_layout_width { 0 };
     bool m_vertical_tabs_toggling { false };
     bool m_vertical_tabs_collapse_pending { false };
+    // With everything in the sidebar, the toolbar is in its row or in the sidebar while the sidebar toggles, and an
+    // empty stand-in for the row shrinks once the toolbar has left it.
+    bool m_toggling_toolbar_in_sidebar { false };
+    QWidget* m_toolbar_row_backdrop { nullptr };
     bool m_is_resizing_vertical_tabs { false };
     bool m_is_updating_chrome_style { false };
     int m_vertical_tabs_expanded_width { 0 };
@@ -497,6 +516,8 @@ public:
     void set_placement(Placement);
     // Shows the button by fading it in, or fades it out and hides it.
     void set_revealed(bool);
+    // A sidebar row's close button is quieter, but on the hovered and the selected rows.
+    void set_row_emphasized(bool);
 
 protected:
     virtual bool event(QEvent* event) override;
@@ -508,6 +529,9 @@ private:
     Role m_role { Role::Close };
     Placement m_placement { Placement::Tab };
     bool m_revealed { false };
+    bool m_row_emphasized { false };
+    QIcon m_quiet_close_icon;
+    bool m_quiet_close_icon_is_dark { false };
     qreal m_opacity { 1 };
     QVariantAnimation* m_reveal_animation { nullptr };
 };

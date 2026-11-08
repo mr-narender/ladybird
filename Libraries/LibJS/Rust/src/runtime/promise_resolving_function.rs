@@ -45,6 +45,9 @@ const _: () = assert!(size_of::<PromiseResolvingFunction>() == 88);
 
 static PROMISE_RESOLVING_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFunctionMethods {
     call: PromiseResolvingFunction::call,
+    // NB: An embedder resolves a promise as a step that cannot throw, and it can do so at any stack depth. What these
+    //     steps run of script, a "then" getter, is a checked call of its own, and its error rejects the promise.
+    ignores_stack_space_limit: true,
     ..NATIVE_FUNCTION_VIRTUAL_METHODS
 };
 
@@ -74,6 +77,7 @@ impl PromiseResolvingFunction {
         realm.create_object(vm, |_| {
             Self::new(
                 vm,
+                realm,
                 promise,
                 PromiseResolvingFunctionKind::Resolve,
                 None,
@@ -91,6 +95,7 @@ impl PromiseResolvingFunction {
         realm.create_object(vm, |_| {
             Self::new(
                 vm,
+                realm,
                 promise,
                 PromiseResolvingFunctionKind::Reject,
                 Some(resolve_function),
@@ -101,13 +106,14 @@ impl PromiseResolvingFunction {
 
     fn new(
         vm: &Vm,
+        realm: Gc<Realm>,
         promise: Gc<Promise>,
         kind: PromiseResolvingFunctionKind,
         resolve_function: Option<Gc<PromiseResolvingFunction>>,
         prototype: Gc<Object>,
     ) -> PromiseResolvingFunction {
         PromiseResolvingFunction {
-            base: NativeFunction::new_with_prototype(vm, Self::CLASS, prototype),
+            base: NativeFunction::new_with_prototype(vm, Self::CLASS, realm, prototype, None),
             promise: Member::new(promise),
             resolve_function: NullableMember::new(resolve_function),
             already_resolved: Cell::new(false),

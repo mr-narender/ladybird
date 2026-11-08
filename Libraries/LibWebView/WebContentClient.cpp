@@ -49,7 +49,7 @@
 #include <LibWebView/WebContentTestClient.h>
 #include <LibWebView/WebDriverBiDi.h>
 #include <LibWebView/WebUI.h>
-#include <LibWebView/WorkerProcessManager.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 namespace WebView {
 
@@ -59,6 +59,25 @@ Messages::WebContentClient::DidAddBlobUrlEntryResponse WebContentClient::did_add
         return page->did_add_blob_url_entry(move(environment_id), move(url), move(entry));
 
     return URL::BlobURLEntry::Token { 0 };
+}
+
+void WebContentClient::did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls)
+{
+    if (auto* page = this->page(page_id)) {
+        page->did_remove_blob_url_entries(move(environment_id), move(urls));
+        return;
+    }
+
+    // NB: A closed page's environments went with it, so its process can only revoke the entries it added itself.
+    if (may_act_for_page(page_id))
+        m_session->blob_url_store->remove_entries_added_by(urls, WeakPtr<WebContentClient> { *this });
+}
+
+void WebContentClient::close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
+{
+    // NB: A page's workers are closed as its documents are destroyed, which happens after the tab's page has closed.
+    if (may_act_for_page(page_id))
+        WorkerAgentManager::the().close_worker_agent(*this, agent_id, owner_token);
 }
 
 bool WebContentClient::hosts_an_environment_with_storage_key(Web::StorageAPI::StorageKey const& storage_key)
@@ -149,7 +168,7 @@ WebContentClient::~WebContentClient()
     cancel_navigation_transactions();
     remove_blob_url_entries();
     StorageAreaRegistry::the().remove_listener(*this);
-    WorkerProcessManager::the().remove_web_content_owner(*this);
+    WorkerAgentManager::the().remove_web_content_owner(*this);
     GamepadManager::the().client_disconnected(*this);
     clients().remove(this);
 }
@@ -302,7 +321,13 @@ void WebContentClient::close_page_of_closed_tab(Web::PageId page_id)
         // e.g. because the user requested a forced close.
         if (page->needs_beforeunload_check())
             page->set_detached_close_pending(false);
+        // NB: The process can stay alive for other pages or for a shared worker, and the document must not go on in it.
+        //     Its close steps run through the traversable that is going away, so it cannot close by itself.
+        if (!page->detached_close_pending() || WorkerAgentManager::the().hosts_shared_worker(*this))
+            page->async_discard_embedded_page();
         PictureInPictureManager::the().close_window_and_its_page(*page);
+        // NB: Other tabs can keep the process alive, so its page has to go as well.
+        page->async_discard_embedded_page();
         page->close();
     }
     // Forgotten once the page is closed, so nothing registers it again.
@@ -429,12 +454,18 @@ Optional<CanonicalNavigable&> WebContentClient::hosted_navigable(Web::HTML::Cros
 
 void WebContentClient::close_server_if_unused()
 {
+    if (m_requested_close)
+        return;
+
     bool any_detached_close_pending = false;
     for (auto const& page : m_pages) {
         if (page.value->is_open())
             return;
         any_detached_close_pending |= page.value->detached_close_pending();
     }
+
+    if (WorkerAgentManager::the().hosts_shared_worker(*this))
+        return;
 
     if (!any_detached_close_pending) {
         if (m_detached_page_close_timer)
@@ -789,7 +820,7 @@ Messages::WebContentClient::StartWorkerAgentResponse WebContentClient::start_wor
     if (auto* page = this->page(page_id))
         return page->start_worker_agent(move(request));
 
-    return Web::HTML::WorkerAgentId {};
+    return { Web::HTML::WorkerAgentId {}, Optional<IPC::TransportHandle> {}, false };
 }
 
 void WebContentClient::did_close_browsing_context(Web::PageId page_id)
@@ -997,8 +1028,12 @@ bool WebContentClient::page_may_capture_audio(WebContentPage const& page) const
     // The top-level document's origin, which a popup on about:blank has from its opener; only a file page is left with
     // an opaque one, and reads its own grant by URL.
     auto origin = page.view().permission_origin();
-    if (origin.is_opaque())
+    if (origin.is_opaque()) {
+        // NB: The global default binds a file: page too; its own grant only matters while sites may ask.
+        if (session().permission_manager->global_default(Web::Permissions::PermissionName::Microphone) == Web::Permissions::EffectiveState::Denied)
+            return false;
         return m_audio_capture_grants.contains(audio_capture_permission_key(page.view().url()));
+    }
     return session().permission_manager->effective_state(Web::Permissions::PermissionName::Microphone, origin) == Web::Permissions::EffectiveState::Granted;
 }
 
@@ -1170,9 +1205,20 @@ void WebContentClient::did_host_document_of_site(Utf16String site)
     m_site_of_hosted_documents = move(site);
 }
 
+Optional<IPC::TransportHandle> WebContentClient::connect_new_image_decoder_client(Optional<u64>& client_generation)
+{
+    return ImageDecoderManager::the().connect_requesting_process(child_id(), m_session, m_site_of_hosted_documents, client_generation);
+}
+
 Messages::WebContentClient::RequestImageDecoderConnectionResponse WebContentClient::request_image_decoder_connection()
 {
-    return ImageDecoderManager::the().connect_requesting_process(child_id(), m_session, m_site_of_hosted_documents);
+    return connect_new_image_decoder_client(m_image_decoder_client_generation);
+}
+
+void WebContentClient::did_release_image_decoder()
+{
+    if (auto generation = exchange(m_image_decoder_client_generation, {}); generation.has_value())
+        ImageDecoderManager::the().process_did_release_decoder(child_id(), *generation);
 }
 
 Optional<u64> WebContentClient::exclusive_performance_owner() const

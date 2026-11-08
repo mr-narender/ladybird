@@ -32,7 +32,7 @@ struct CryptoKeyCacheEntry {
 
 static Vector<CryptoKeyCacheEntry>& crypto_key_caches()
 {
-    static NeverDestroyed<Vector<CryptoKeyCacheEntry>> caches;
+    static thread_local NeverDestroyed<Vector<CryptoKeyCacheEntry>> caches;
     return *caches;
 }
 
@@ -56,6 +56,15 @@ static CryptoKeyCacheEntry& cache_for(CryptoKey& key)
     caches.append(CryptoKeyCacheEntry { key, {} });
     return caches.last();
 }
+
+}
+
+void clear_crypto_key_caches()
+{
+    crypto_key_caches().clear();
+}
+
+namespace {
 
 static JS::ThrowCompletionOr<GC::Ref<JS::Uint8Array>> create_uint8_array_from_bytes(JS::Realm& realm, ReadonlyBytes bytes)
 {

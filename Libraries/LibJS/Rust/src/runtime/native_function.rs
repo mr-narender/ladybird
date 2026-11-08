@@ -29,6 +29,8 @@ pub use crate::layout_forward::{RawNativeFunctionPointer, RawNativeFunctionResul
 use crate::runtime::abstract_operations::new_function_environment_for_native_javascript_backed_function;
 use crate::runtime::class_field_definition::ClassElementName;
 use crate::runtime::completion::{Throw, ThrowCompletionOr};
+use crate::runtime::error::ErrorKind;
+use crate::runtime::error_types::ErrorType;
 use crate::runtime::function_object::{FUNCTION_OBJECT_METHODS, FunctionObject};
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
 use crate::runtime::object::{MayInterfereWithIndexedPropertyAccess, ObjectMethods, allocate_object};
@@ -42,6 +44,8 @@ pub struct NativeFunctionMethods {
     pub construct: fn(&NativeFunction, &Vm, Gc<FunctionObject>) -> ThrowCompletionOr<Gc<Object>>,
     pub function_environment_needed: fn(&NativeFunction) -> bool,
     pub function_environment_bindings_count: fn(&NativeFunction) -> usize,
+    /// For a function that the embedder calls as a step that cannot fail. Its own steps must have a bounded stack use.
+    pub ignores_stack_space_limit: bool,
 }
 
 pub static NATIVE_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFunctionMethods {
@@ -50,6 +54,7 @@ pub static NATIVE_FUNCTION_VIRTUAL_METHODS: NativeFunctionMethods = NativeFuncti
     construct: |_, _, _| unreachable!("NativeFunction::construct has to be overridden"),
     function_environment_needed: |_| false,
     function_environment_bindings_count: |_| 0,
+    ignores_stack_space_limit: false,
 };
 
 pub static NATIVE_FUNCTION_METHODS: ObjectMethods = ObjectMethods {
@@ -102,34 +107,27 @@ impl NativeFunction {
         realm: Gc<Realm>,
         builtin: Option<Builtin>,
     ) -> NativeFunction {
-        let base = FunctionObject::new_with_realm_and_prototype(
-            vm,
-            class,
-            realm,
-            prototype,
-            MayInterfereWithIndexedPropertyAccess::No,
-        );
+        let base =
+            FunctionObject::new_with_prototype(vm, class, realm, prototype, MayInterfereWithIndexedPropertyAccess::No);
         base.set_builtin(builtin);
         Self::from_function_object(base, None, realm)
     }
 
-    // FIXME: m_realm is supposed to be the realm argument of CreateBuiltinFunction, or the current
-    //        Realm Record. The former is not something that's commonly used or we support, the
-    //        latter is impossible as no ExecutionContext exists when most NativeFunctions are created...
-
-    pub fn new_with_prototype(vm: &Vm, class: &'static Class, prototype: Gc<Object>) -> NativeFunction {
-        let base = FunctionObject::new_with_prototype(vm, class, prototype, MayInterfereWithIndexedPropertyAccess::No);
-        Self::from_function_object(base, None, prototype.shape().realm())
-    }
-
-    pub fn new_with_name(
+    pub fn new_with_prototype(
         vm: &Vm,
         class: &'static Class,
-        name: Utf16FlyString,
+        realm: Gc<Realm>,
         prototype: Gc<Object>,
+        name: Option<Utf16FlyString>,
     ) -> NativeFunction {
-        let base = FunctionObject::new_with_prototype(vm, class, prototype, MayInterfereWithIndexedPropertyAccess::No);
-        Self::from_function_object(base, Some(name), prototype.shape().realm())
+        let base = FunctionObject::new_with_prototype(
+            vm,
+            class,
+            realm,
+            Some(prototype),
+            MayInterfereWithIndexedPropertyAccess::No,
+        );
+        Self::from_function_object(base, name, realm)
     }
 
     fn from_function_object(base: FunctionObject, name: Option<Utf16FlyString>, realm: Gc<Realm>) -> NativeFunction {
@@ -232,11 +230,12 @@ impl NativeFunction {
     {
         CapturingNativeFunction::create(
             vm,
-            NativeFunction::new_with_name(
+            NativeFunction::new_with_prototype(
                 vm,
                 CapturingNativeFunction::CLASS,
-                name.clone(),
+                realm,
                 realm.function_prototype(),
+                Some(name.clone()),
             ),
             captures,
             behaviour,
@@ -248,6 +247,16 @@ impl NativeFunction {
     pub fn captures_if<C: 'static>(object: &Object) -> Option<&C> {
         let function = crate::gc::class::downcast_ref::<Object, CapturingNativeFunction>(object)?;
         function.native_function.captures().downcast_ref::<C>()
+    }
+
+    /// The entry JIT code can call in an already initialized native frame, if this is a capturing native function.
+    #[cfg(feature = "jit")]
+    pub(crate) fn capturing_call_entry(&self) -> RawNativeFunctionPointer {
+        self.as_native_function_gc().downcast::<CapturingNativeFunction>()?;
+        crate::raw_native!(|vm| {
+            let function = vm.active_function_object().expect("the native frame has its function");
+            CapturingNativeFunction::call(cast_ref(&*function), vm)
+        })
     }
 
     pub fn as_native_function_gc(&self) -> Gc<NativeFunction> {
@@ -330,7 +339,10 @@ impl NativeFunction {
         // </8.> --------------------------------------------------------------------------
 
         // 9. Push calleeContext onto the execution context stack; calleeContext is now the running execution context.
-        vm.push_execution_context_checking_stack_space(NonNull::from(callee_context))?;
+        if vm.did_reach_stack_space_limit() && !function.methods().ignores_stack_space_limit {
+            return vm.throw_completion(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[]);
+        }
+        vm.push_execution_context(NonNull::from(callee_context));
 
         // 10. Let result be the Completion Record that is the result of evaluating F in a manner that conforms to the specification of F. thisArgument is the this value, argumentsList provides the named parameters, and the NewTarget value is undefined.
         let result = function.call(vm);
@@ -728,14 +740,15 @@ impl RawNativeFunction {
         RawNativeFunction { base }
     }
 
-    pub fn new_with_name(
+    pub fn new_with_prototype(
         vm: &Vm,
         class: &'static Class,
+        realm: Gc<Realm>,
+        prototype: Gc<Object>,
         name: Utf16FlyString,
         native_function: RawNativeFunctionPointer,
-        prototype: Gc<Object>,
     ) -> RawNativeFunction {
-        let base = NativeFunction::new_with_name(vm, class, name, prototype);
+        let base = NativeFunction::new_with_prototype(vm, class, realm, prototype, Some(name));
         base.set_is_raw_native_function();
         base.raw_native_function_index
             .set(vm.register_native_function(NativeFunctionTableEntry {
@@ -775,7 +788,14 @@ impl RawNativeFunction {
         function: RawNativeFunctionPointer,
     ) -> Gc<RawNativeFunction> {
         allocate_object(vm, |_| {
-            Self::new_with_name(vm, Self::CLASS, name.clone(), function, realm.function_prototype())
+            Self::new_with_prototype(
+                vm,
+                Self::CLASS,
+                realm,
+                realm.function_prototype(),
+                name.clone(),
+                function,
+            )
         })
     }
 

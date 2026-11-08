@@ -14,7 +14,10 @@ use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
 
-use libjs_rust::api::{ArrayBuffer, AsSharedMemory, Gc, Object, RawNativeFunctionResult, Realm, Value, raw_descriptor};
+use libjs_rust::api::{
+    ArrayBuffer, AsSharedMemory, Gc, Object, RawNativeFunctionResult, Realm, Value, raw_descriptor,
+    release_stores_of_lost_messages,
+};
 
 use crate::bindings::{Exception, WebIdlResult};
 use crate::html::structured_serialize::message_record::SharedMemory;
@@ -97,7 +100,7 @@ impl IPCSerializationRecord {
         Self(NonNull::new(record).expect("C++ lends a record"))
     }
 
-    /// Sets the record to the bytes, with the SharedArrayBuffers of its same-process side table.
+    /// Sets the record to the bytes, with the SharedArrayBuffers of its same-agent side table.
     pub(crate) fn set(self, data: &[u8], shared_array_buffers: &[Gc<ArrayBuffer>]) {
         let shared_array_buffers = objects_into_abi(shared_array_buffers);
         // SAFETY: The record is lent, the call borrows the bytes, and the buffers are live.
@@ -154,7 +157,7 @@ impl<'a> ReceivedIPCSerializationRecord<'a> {
         data.as_slice()
     }
 
-    /// The SharedArrayBuffer at the index of the record's same-process side table, if there is one.
+    /// The SharedArrayBuffer at the index of the record's same-agent side table, if there is one.
     pub(crate) fn shared_array_buffer(self, side_table_index: u32) -> Option<Gc<ArrayBuffer>> {
         // SAFETY: The record is lent. LibWeb returns a live object or null.
         let object = unsafe {
@@ -316,6 +319,7 @@ impl Drop for OwnedSerializedTransferRecord {
     fn drop(&mut self) {
         // SAFETY: This owns the record.
         unsafe { web_structured_serialize_transfer_record_destroy(self.0.0.as_ptr()) };
+        release_stores_of_lost_messages();
     }
 }
 

@@ -152,7 +152,6 @@ pub struct MaskData {
 pub struct ScrollData {
     pub state_slot: ScrollStateSlot,
     pub owner_paintable: NodeSlotId,
-    pub registry_parent_node: SpatialNodeIndex,
 }
 
 // A sticky box's shift is derived when the scroll state snapshot is resolved, from the scroller's
@@ -178,7 +177,6 @@ pub struct StickyData {
     pub inset_left: Option<f32>,
     pub state_slot: ScrollStateSlot,
     pub owner_paintable: NodeSlotId,
-    pub registry_parent_node: SpatialNodeIndex,
 }
 
 impl StickyData {
@@ -187,7 +185,6 @@ impl StickyData {
         parent_sticky: Option<SpatialNodeIndex>,
         state_slot: ScrollStateSlot,
         owner_paintable: NodeSlotId,
-        registry_parent_node: SpatialNodeIndex,
     ) -> Self {
         Self {
             scroller,
@@ -204,8 +201,11 @@ impl StickyData {
             inset_left: None,
             state_slot,
             owner_paintable,
-            registry_parent_node,
         }
+    }
+
+    pub fn parent_sticky_or_scroller(&self) -> SpatialNodeIndex {
+        self.parent_sticky.unwrap_or(self.scroller)
     }
 }
 
@@ -724,13 +724,11 @@ fn for_each_spatial_node_reference(
         visit(node.parent);
     }
     match &node.data {
-        SpatialData::Scroll(scroll) => visit(scroll.registry_parent_node),
         SpatialData::Sticky(sticky) => {
             visit(sticky.scroller);
             if let Some(parent_sticky) = sticky.parent_sticky {
                 visit(parent_sticky);
             }
-            visit(sticky.registry_parent_node);
         }
         SpatialData::Transform(transform) => {
             if let Some(root) = transform.sorting_context_root_index {
@@ -739,7 +737,7 @@ fn for_each_spatial_node_reference(
         }
         SpatialData::BackfaceVisibility(backface) => visit(backface.plane_root_index),
         SpatialData::AnchorScrollShift(shift) => visit(shift.scroll_node_index),
-        SpatialData::Perspective(_) | SpatialData::Dead => {}
+        SpatialData::Scroll(_) | SpatialData::Perspective(_) | SpatialData::Dead => {}
     }
 }
 
@@ -1530,7 +1528,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -1590,7 +1587,6 @@ mod tests {
         SpatialData::Scroll(ScrollData {
             state_slot: NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
         })
     }
 
@@ -1607,7 +1603,6 @@ mod tests {
                 None,
                 NO_SCROLL_STATE_SLOT,
                 NodeSlotId::INVALID,
-                scroll,
             )),
             VISUAL_VIEWPORT_NODE_INDEX,
         );

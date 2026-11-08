@@ -13,7 +13,7 @@ if (BUILD_TESTING AND NOT WIN32)
         ladybird_python_test(test-window-size-reaches-every-page.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-worker-error-console.py ARGS $<TARGET_FILE:ladybird>)
 
-        foreach(helper IN ITEMS Compositor ImageDecoder RequestServer WebWorker)
+        foreach(helper IN ITEMS Compositor ImageDecoder RequestServer)
             ladybird_python_test(test-webdriver-crash-report.py
                 NAME Test${helper}CrashReport
                 ARGS $<TARGET_FILE:WebDriver> --process ${helper}
@@ -27,6 +27,7 @@ if (BUILD_TESTING AND NOT WIN32)
     ladybird_python_test(test-webdriver-error-keep-alive.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-force-dark.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-location-policy.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-microphone-policy.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-notifications-policy.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-permissions-settings.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-search-engine-settings.py ARGS $<TARGET_FILE:WebDriver>)
@@ -145,6 +146,7 @@ if (NOT WIN32)
         TestRequestServerClientSessions.cpp
         TestRequestServerDiskCaches.cpp
         TestShadowTreeTooltipsAndLinks.cpp
+        TestSharedWorkerHost.cpp
         TestUserActivation.cpp
         TestViewSource.cpp
         TestWebCompatReport.cpp

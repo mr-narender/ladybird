@@ -277,9 +277,16 @@ pub(crate) fn enabled() -> bool {
 }
 
 impl Store {
+    fn compile_state(&mut self) -> &mut StoreJit {
+        let stack_limit = self.stack_limit_word() as u64;
+        let jit = self.jit.get_or_insert_with(Default::default);
+        jit.stack_limit = stack_limit;
+        jit
+    }
+
     /// Keeps everything in this store interpreted, whatever `LIBWASM_JIT` says, as tests comparing the tiers want.
     pub fn disable_jit(&mut self) {
-        self.jit.get_or_insert_with(Default::default).disabled = true;
+        self.compile_state().disabled = true;
     }
 }
 
@@ -718,6 +725,9 @@ mod native {
 
     const CHUNK_SIZE: usize = 16 << 20;
 
+    /// Where the code of a function starts, which the alignment of its loops relies on.
+    const CODE_ALIGNMENT: usize = 64;
+
     /// How many compiles a store installs between looking for modules that died.
     const SWEEP_INTERVAL: usize = 64;
 
@@ -760,7 +770,7 @@ mod native {
         }
 
         fn has_room(&self, length: usize) -> bool {
-            self.used.next_multiple_of(16) + length <= self.size
+            self.used.next_multiple_of(CODE_ALIGNMENT) + length <= self.size
         }
 
         /// Copies `code` in and returns its address, or None if the pages could not be made writable, which leaves them
@@ -768,7 +778,7 @@ mod native {
         // NB: On macOS, switching the thread's view of the code cannot fail.
         #[cfg_attr(target_os = "macos", allow(clippy::unnecessary_wraps))]
         fn add(&mut self, code: &[u8]) -> Option<u64> {
-            let start = self.used.next_multiple_of(16);
+            let start = self.used.next_multiple_of(CODE_ALIGNMENT);
             debug_assert!(start + code.len() <= self.size);
             #[cfg(target_os = "macos")]
             unsafe {
@@ -958,7 +968,7 @@ mod native {
                 unreachable!("the function is a WebAssembly function");
             };
             let body = &module.code[(*index - module.imported_function_count) as usize];
-            let jit = store.jit.get_or_insert_with(Default::default);
+            let jit = store.compile_state();
             let key = jit.key(module, *index, Some(body.code.start));
             assert_eq!(jit.compile(key, super::Compile::Now), super::CompileState::Compiled);
             unsafe { loops.get_mut() }.header.tier_up_budget = crate::abi::TIER_UP_CALL_COST;
@@ -1206,6 +1216,8 @@ mod native {
     /// instances hold it, and code of a module only runs in frames of its functions.
     #[derive(Default)]
     pub struct StoreJit {
+        /// The address of the store's stack limit, which compiled code polls.
+        pub stack_limit: u64,
         context: CompileContext,
         /// What the store compiled of each module, by the module's address.
         modules: HashMap<usize, ModuleCode>,
@@ -1277,6 +1289,7 @@ mod native {
                 module: self.modules[&key.module].module.upgrade()?,
                 function: key.function,
                 runtime: stubs().runtime,
+                stack_limit: self.stack_limit,
                 options: super::options().compile_options(),
                 osr: key.osr,
             })
@@ -1446,7 +1459,7 @@ mod native {
     /// Compiles every function of an instance, on the compile threads unless in sync mode, and installs the code.
     pub fn compile_instance(store: &mut Store, instance: InstanceAddress) {
         let functions = store.instance(instance).functions.clone();
-        let jit = store.jit.get_or_insert_with(Default::default);
+        let jit = store.compile_state();
         if jit.disabled {
             return;
         }
@@ -1469,7 +1482,7 @@ mod native {
     /// Compiles a WebAssembly function, unless the store compiled its module's function already, and installs the
     /// code once there is some.
     pub fn compile_function(store: &mut Store, address: FunctionAddress, when: Compile) -> CompileState {
-        let jit = store.jit.get_or_insert_with(Default::default);
+        let jit = store.compile_state();
         if jit.disabled {
             return CompileState::Failed;
         }
@@ -1571,7 +1584,7 @@ mod native {
                 ..NativeCall::default()
             };
             const SMALL_IMAGE: usize = 64;
-            let mut small_image = [0u64; SMALL_IMAGE];
+            let mut small_image = [std::mem::MaybeUninit::<u64>::uninit(); SMALL_IMAGE];
             let large = shape.image_slots > SMALL_IMAGE;
             let image = if large {
                 LARGE_IMAGES.with(|images| {
@@ -1587,7 +1600,10 @@ mod native {
                     images.buffers[index].as_mut_ptr()
                 })
             } else {
-                small_image.as_mut_ptr()
+                // Initialize only the part the trampoline copies, including any alignment padding.
+                let image = small_image.as_mut_ptr().cast::<u64>();
+                std::ptr::write_bytes(image, 0, shape.image_slots);
+                image
             };
             for (index, param) in shape.params.iter().enumerate() {
                 let source = argument(index, param);
@@ -1677,7 +1693,7 @@ mod native {
                 return LoopEntry::Never;
             };
             let offset = (pc - module.bytes.as_ptr() as u64) as u32;
-            let jit = store.jit.get_or_insert_with(Default::default);
+            let jit = store.compile_state();
             if jit.disabled {
                 return LoopEntry::Never;
             }
@@ -1725,6 +1741,7 @@ mod native {
 
     #[derive(Default)]
     pub struct StoreJit {
+        pub stack_limit: u64,
         pub disabled: bool,
     }
 

@@ -2467,6 +2467,35 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let base_config = cbindgen::Config::from_file(manifest_dir.join("cbindgen.toml"))?;
 
+    let mut web_audio_config = base_config.clone();
+    web_audio_config.namespaces = Some(vec!["Web".into(), "WebAudio".into(), "RustFFI".into()]);
+    for name in ["NodeHandle", "ControlMessageQueue", "RealtimeAudioRenderer"] {
+        web_audio_config.export.rename.insert(name.into(), "void".into());
+        web_audio_config.export.exclude.push(name.into());
+    }
+    web_audio_config.export.include.push("AutomationRate".into());
+    web_audio_config.export.item_types = vec![
+        cbindgen::ItemType::Enums,
+        cbindgen::ItemType::Structs,
+        cbindgen::ItemType::Typedefs,
+        cbindgen::ItemType::OpaqueItems,
+        cbindgen::ItemType::Functions,
+    ];
+    generate_ffi_header(
+        web_audio_config,
+        &[
+            manifest_dir.join("src/web_audio/rendering/render_node.rs"),
+            manifest_dir.join("src/web_audio/rendering/audio_frame_ring.rs"),
+            manifest_dir.join("src/web_audio/rendering/media_stream_destination_render_node.rs"),
+            manifest_dir.join("src/web_audio/rendering/pipe_callbacks.rs"),
+            manifest_dir.join("src/web_audio/rendering/realtime_audio_renderer.rs"),
+            manifest_dir.join("src/web_audio/control_message.rs"),
+            manifest_dir.join("src/web_audio/control_thread.rs"),
+        ],
+        &out_dir,
+        Path::new("WebAudio/RustFFI.h"),
+    );
+
     // CSS tokenizer header — namespace Web::CSS::Parser::FFI, CSS types only.
     let mut css_config = base_config.clone();
     css_config.namespaces = Some(vec![

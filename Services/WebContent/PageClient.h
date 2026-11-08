@@ -226,6 +226,7 @@ private:
     virtual void page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     virtual String dump_site_isolation_process_tree_for_testing() override;
     virtual void crash_remote_frame_processes_for_testing() override;
+    virtual void close_tab_for_testing() override;
     virtual void page_did_spoof_document_origin_for_testing(Web::HTML::EnvironmentSettingsObject const&, URL::Origin const&) override;
     virtual void stop_loading_through_ui_process_for_testing() override;
     virtual void reload_through_ui_process_for_testing(bool bypass_cache) override;
@@ -254,7 +255,6 @@ private:
     virtual void page_did_change_title(Utf16String const&) override;
     virtual void page_did_update_editing_history_state(bool can_undo, bool can_redo) override;
     virtual void page_did_set_text_fragment_indication_visibility(bool) override;
-    virtual void page_did_request_refresh() override;
     virtual void page_did_request_resize_window(Gfx::IntSize, u64 completion_id) override;
     virtual void page_did_request_reposition_window(Gfx::IntPoint, u64 completion_id) override;
     virtual void page_did_request_restore_window() override;
@@ -265,8 +265,6 @@ private:
     virtual void page_did_exit_picture_in_picture() override;
     virtual void page_did_change_picture_in_picture_video_size(Gfx::IntSize) override;
     virtual void page_did_change_picture_in_picture_player_controls_visibility(bool shown) override;
-    virtual void page_did_request_tooltip_override(Web::CSSPixelPoint, ByteString const&) override;
-    virtual void page_did_stop_tooltip_override() override;
     virtual void page_did_enter_tooltip_area(ByteString const&) override;
     virtual void page_did_leave_tooltip_area() override;
     virtual void page_did_click_link(Web::HTML::PreparedNavigationDescriptor, ByteString const& target, unsigned modifiers) override;
@@ -323,6 +321,7 @@ private:
     virtual void page_did_close() override;
     virtual void page_did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
     virtual void page_did_consume_user_activation(Web::HTML::UserActivationConsumption) override;
+    virtual void page_did_notify_about_user_activation(Web::HTML::CrossProcessId document_id) override;
     virtual void page_did_update_session_history_entry_navigation_api_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity const& entry_identity, Web::HTML::StorageSerializationRecord const& navigation_api_state) override;
     virtual void page_did_update_session_history_entry_scroll_restoration_mode(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity const& entry_identity, Web::HTML::ScrollRestorationMode scroll_restoration_mode) override;
     virtual void page_did_update_session_history_entry_document_state_navigable_target_name(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity const& entry_identity, Utf16String const& navigable_target_name) override;
@@ -412,7 +411,7 @@ private:
     virtual Web::Gamepad::ReceivedRumbleEffects virtual_gamepad_received_rumble_effects(Web::Gamepad::GamepadHandle) override;
     virtual void pump_gamepad_events() override;
     virtual void reset_gamepad_access_for_testing() override;
-    virtual Web::HTML::WorkerAgentId start_worker_agent(Web::HTML::WorkerAgentStartRequest&&) override;
+    virtual Web::PageClient::StartedWorkerAgent start_worker_agent(Web::HTML::WorkerAgentStartRequest&&) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
     virtual void rtc_transform_init(Web::HTML::WorkerAgentId, u64 transform_id, Web::HTML::SerializedTransferRecord options_record) override;
     virtual void rtc_transform_teardown(Web::HTML::WorkerAgentId, u64 transform_id) override;

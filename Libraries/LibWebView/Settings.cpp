@@ -35,6 +35,7 @@ static constexpr auto SHOW_MENU_BAR_KEY = "showMenuBar"sv;
 static constexpr auto SHOW_BOOKMARKS_BAR_KEY = "showBookmarksBar"sv;
 static constexpr auto INTERFACE_THEME_KEY = "interfaceTheme"sv;
 static constexpr auto WEBSITE_COLOR_SCHEME_KEY = "websiteColorScheme"sv;
+static constexpr auto COLOR_THEME_KEY = "colorTheme"sv;
 
 static constexpr auto WINDOW_SETTINGS_KEY = "window"sv;
 static constexpr auto WINDOW_POSITION_KEY = "position"sv;
@@ -57,6 +58,7 @@ static constexpr auto VERTICAL_TABS_EXPANDED_KEY = "verticalTabsExpanded"sv;
 static constexpr auto VERTICAL_TABS_EXPAND_ON_HOVER_KEY = "verticalTabsExpandOnHover"sv;
 static constexpr auto VERTICAL_TABS_POSITION_KEY = "verticalTabsPosition"sv;
 static constexpr auto VERTICAL_TABS_EXPANDED_WIDTH_KEY = "verticalTabsExpandedWidth"sv;
+static constexpr auto EVERYTHING_IN_SIDEBAR_KEY = "everythingInSidebar"sv;
 
 static constexpr auto BROWSING_BEHAVIOR_KEY = "browsingBehavior"sv;
 static constexpr auto ENABLE_AUTOSCROLL_KEY = "enableAutoscroll"sv;
@@ -76,6 +78,7 @@ static constexpr auto SITE_SETTING_SITE_FILTERS_KEY = "siteFilters"sv;
 
 static constexpr auto AUTOPLAY_KEY = "autoplay"sv;
 static constexpr auto LOCATION_POLICY_KEY = "locationPolicy"sv;
+static constexpr auto MICROPHONE_POLICY_KEY = "microphonePolicy"sv;
 static constexpr auto NOTIFICATIONS_POLICY_KEY = "notificationsPolicy"sv;
 
 static constexpr auto BROWSING_DATA_KEY = "browsingData"sv;
@@ -123,8 +126,8 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
     {
         .id = ConfigVariableID::ShowAdvancedDebugMenu,
         .name = "debug.ui.show_advanced_debug_menu"sv,
-        .title = "Show Advanced Debug Menu"sv,
-        .description = "Show the advanced Debug menu in the application menu."sv,
+        .title = "Show Debug menu"sv,
+        .description = "Show the Debug menu, with tools for inspecting Ladybird itself."sv,
         .default_value = false,
         .array_element_type = {},
     },
@@ -277,6 +280,28 @@ static constexpr Optional<ThemePreference> theme_preference_from_string(StringVi
         return ThemePreference::Light;
     if (preference == "dark"sv)
         return ThemePreference::Dark;
+    return {};
+}
+
+static constexpr StringView color_theme_to_string(ColorTheme theme)
+{
+    switch (theme) {
+#define __ENUMERATE_COLOR_THEME(name, string) \
+    case ColorTheme::name:                    \
+        return string##sv;
+        ENUMERATE_COLOR_THEMES(__ENUMERATE_COLOR_THEME)
+#undef __ENUMERATE_COLOR_THEME
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static constexpr Optional<ColorTheme> color_theme_from_string(StringView theme)
+{
+#define __ENUMERATE_COLOR_THEME(name, string) \
+    if (theme == string##sv)                  \
+        return ColorTheme::name;
+    ENUMERATE_COLOR_THEMES(__ENUMERATE_COLOR_THEME)
+#undef __ENUMERATE_COLOR_THEME
     return {};
 }
 
@@ -456,6 +481,8 @@ Settings Settings::create(ByteString settings_path, Vector<String> platform_lang
     //     choice; it's ignored, and every profile starts out letting sites ask.
     if (auto location_policy = settings_json.value().get_string(LOCATION_POLICY_KEY); location_policy.has_value() && *location_policy == "block"sv)
         settings.m_location_policy = LocationPolicy::Block;
+    if (auto microphone_policy = settings_json.value().get_string(MICROPHONE_POLICY_KEY); microphone_policy.has_value() && *microphone_policy == "block"sv)
+        settings.m_microphone_policy = MicrophonePolicy::Block;
     if (auto notifications_policy = settings_json.value().get_string(NOTIFICATIONS_POLICY_KEY); notifications_policy.has_value() && *notifications_policy == "block"sv)
         settings.m_notifications_policy = NotificationsPolicy::Block;
 
@@ -616,6 +643,7 @@ JsonValue Settings::serialize_json() const
     appearance.set(SHOW_BOOKMARKS_BAR_KEY, show_bookmarks_bar_to_string(m_appearance.show_bookmarks_bar));
     appearance.set(INTERFACE_THEME_KEY, theme_preference_to_string(m_appearance.interface_theme));
     appearance.set(WEBSITE_COLOR_SCHEME_KEY, theme_preference_to_string(m_appearance.website_color_scheme));
+    appearance.set(COLOR_THEME_KEY, color_theme_to_string(m_appearance.color_theme));
     settings.set(APPEARANCE_KEY, move(appearance));
 
     JsonObject zoom_per_host;
@@ -639,6 +667,7 @@ JsonValue Settings::serialize_json() const
     tab_settings.set(VERTICAL_TABS_POSITION_KEY, vertical_tabs_position_to_string(m_tab_settings.vertical_tabs_position));
     if (m_tab_settings.vertical_tabs_expanded_width.has_value())
         tab_settings.set(VERTICAL_TABS_EXPANDED_WIDTH_KEY, *m_tab_settings.vertical_tabs_expanded_width);
+    tab_settings.set(EVERYTHING_IN_SIDEBAR_KEY, m_tab_settings.everything_in_sidebar);
     settings.set(TAB_SETTINGS_KEY, move(tab_settings));
 
     JsonObject browsing_behavior;
@@ -684,6 +713,7 @@ JsonValue Settings::serialize_json() const
     save_site_setting(m_autoplay, AUTOPLAY_KEY);
 
     settings.set(LOCATION_POLICY_KEY, m_location_policy == LocationPolicy::Block ? "block"_string : "ask"_string);
+    settings.set(MICROPHONE_POLICY_KEY, m_microphone_policy == MicrophonePolicy::Block ? "block"_string : "ask"_string);
     settings.set(NOTIFICATIONS_POLICY_KEY, m_notifications_policy == NotificationsPolicy::Block ? "block"_string : "ask"_string);
 
     JsonObject disk_cache_settings;
@@ -899,6 +929,10 @@ Appearance Settings::parse_appearance(JsonValue const& settings)
         if (auto parsed = theme_preference_from_string(*website_color_scheme); parsed.has_value())
             appearance.website_color_scheme = *parsed;
     }
+    if (auto color_theme = settings.as_object().get_string(COLOR_THEME_KEY); color_theme.has_value()) {
+        if (auto parsed = color_theme_from_string(*color_theme); parsed.has_value())
+            appearance.color_theme = *parsed;
+    }
 
     return appearance;
 }
@@ -1022,6 +1056,8 @@ TabSettings Settings::parse_tab_settings(JsonValue const& settings)
     }
     if (auto vertical_tabs_expanded_width = settings.as_object().get_integer<u16>(VERTICAL_TABS_EXPANDED_WIDTH_KEY); vertical_tabs_expanded_width.has_value())
         tab_settings.vertical_tabs_expanded_width = *vertical_tabs_expanded_width;
+    if (auto everything_in_sidebar = settings.as_object().get_bool(EVERYTHING_IN_SIDEBAR_KEY); everything_in_sidebar.has_value())
+        tab_settings.everything_in_sidebar = *everything_in_sidebar;
 
     return tab_settings;
 }
@@ -1193,6 +1229,15 @@ void Settings::set_location_policy(LocationPolicy policy)
 
     for (auto& observer : m_observers)
         observer.geolocation_settings_changed();
+}
+
+void Settings::set_microphone_policy(MicrophonePolicy policy)
+{
+    m_microphone_policy = policy;
+    persist_settings();
+
+    for (auto& observer : m_observers)
+        observer.microphone_settings_changed();
 }
 
 void Settings::set_notifications_policy(NotificationsPolicy policy)

@@ -224,6 +224,7 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     // The window's toolbar holds the address field while it shows this tab.
     m_location_edit = new LocationEdit(this, m_window->is_private());
     m_location_edit->hide();
+    m_location_edit->installEventFilter(this);
 
     m_view->installEventFilter(this);
 
@@ -1396,6 +1397,8 @@ bool Tab::eventFilter(QObject* watched, QEvent* event)
         if (m_restore_session_card)
             m_restore_session_card->reposition();
     }
+    if (watched == m_location_edit && event->type() == QEvent::DynamicPropertyChange && static_cast<QDynamicPropertyChangeEvent*>(event)->propertyName() == "autocompleteOpen")
+        m_view->set_suggestions_over_page(m_location_edit->property("autocompleteOpen").toBool());
     return QWidget::eventFilter(watched, event);
 }
 
@@ -1645,9 +1648,8 @@ void Tab::request_close()
     m_preserve_close_retry_state_on_dialog_dismissal = false;
 
     if (!view().needs_beforeunload_check()) {
-        auto request_close = view().prepare_for_immediate_close();
-        if (m_window->definitely_close_tab(tab_index()))
-            Core::deferred_invoke(AK::move(request_close));
+        view().prepare_for_immediate_close();
+        m_window->definitely_close_tab(tab_index());
         return;
     }
 

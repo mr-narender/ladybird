@@ -82,8 +82,7 @@
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebDriverBiDi.h>
 #include <LibWebView/WebDriverBrowserConnection.h>
-#include <LibWebView/WebWorkerClient.h>
-#include <LibWebView/WorkerProcessManager.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 #if defined(AK_OS_MACOS)
 #    include <LibIPC/MachBootstrapListener.h>
@@ -159,6 +158,10 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
             auto enabled = Application::settings().config_variable_as_bool(ConfigVariableID::ShowAdvancedDebugMenu);
             Application::the().debug_menu().set_visible(enabled);
         }
+        if (variable == ConfigVariableID::ShowTabPerformanceMonitor) {
+            auto enabled = Application::settings().config_variable_as_bool(ConfigVariableID::ShowTabPerformanceMonitor);
+            Application::the().show_tab_performance_monitor_action().set_checked(enabled);
+        }
     }
 
     virtual void background_networking_settings_changed() override
@@ -174,6 +177,11 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
     virtual void geolocation_settings_changed() override
     {
         Application::the().location_policy_changed({});
+    }
+
+    virtual void microphone_settings_changed() override
+    {
+        Application::the().microphone_policy_changed({});
     }
 
     virtual void notifications_settings_changed() override
@@ -1247,7 +1255,7 @@ ErrorOr<void> Application::reload_site_compatibility_data()
         client.async_set_site_compatibility_data(m_site_compatibility_data);
         return IterationDecision::Continue;
     });
-    WorkerProcessManager::the().update_site_compatibility_data(m_site_compatibility_data);
+    WorkerAgentManager::the().update_site_compatibility_data(m_site_compatibility_data);
     return {};
 }
 
@@ -1315,7 +1323,7 @@ bool Application::request_server_client_may_use_cookies_in(int client_id, URL::U
         return IterationDecision::Break;
     };
     WebContentClient::for_each_client([&](WebContentClient& client) { return check_bindings(client.request_server_site_bindings()); });
-    WorkerProcessManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) { return check_bindings(bindings); });
+    WorkerAgentManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) { return check_bindings(bindings); });
     return may_use_cookies;
 }
 
@@ -1439,6 +1447,7 @@ void Application::reset_private_browsing_session()
     // NB: Those views own the session until they are deleted, so let go of it here. The private window opened next
     //     starts a new one rather than picking up what this was asked to clear.
     m_private_session.clear();
+    WorkerAgentManager::the().remove_private_workers_without_owners();
 }
 
 Web::CompositorContextId Application::allocate_compositor_context_id()
@@ -1492,7 +1501,7 @@ ErrorOr<IPC::TransportHandle> Application::connect_new_compositor_canvas_client(
         return Error::from_string_literal("Compositor process is not available");
 
     // The Compositor treats every renderer-side connection uniformly; canvas-only
-    // clients (worker processes) simply never register navigable contexts, so the
+    // clients (workers) simply never register navigable contexts, so the
     // returned connection id is not needed.
     auto response_or_error = m_compositor_client->try_connect_web_content();
     if (response_or_error.is_error())
@@ -1648,6 +1657,11 @@ ErrorOr<NonnullRefPtr<WebContentPage>> Application::open_page_for_new_tab(IsPriv
         web_content_client = TRY(create_web_content_client(IsPrivate::No, allocate_page_id()));
     }
     return web_content_client->open_initial_page_for_new_top_level_traversable();
+}
+
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process_without_page(IsPrivate is_private)
+{
+    return create_web_content_client(is_private, allocate_page_id());
 }
 
 ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
@@ -2387,9 +2401,6 @@ void Application::process_did_exit(Process&& process, Optional<int>)
             m_web_content_clients.remove(client.release_nonnull());
         }
         break;
-    case ProcessType::WebWorker:
-        dbgln_if(WEBVIEW_PROCESS_DEBUG, "WebWorker {} died, not sure what to do.", process.pid());
-        break;
     case ProcessType::Browser:
         dbgln("Invalid process type to be dying: Browser");
         VERIFY_NOT_REACHED();
@@ -2655,7 +2666,7 @@ void Application::initialize_actions()
     auto add_spoofed_value = [](auto& menu, auto name, auto value, auto& cached_value, auto request, auto notify_workers) {
         auto action = Action::create_checkable(name, ActionID::SpoofUserAgent, [value, &cached_value, request, notify_workers]() {
             cached_value = value;
-            // Workers take no debug requests; the worker process manager hands the new value to every live worker.
+            // Workers take no debug requests; the worker agent manager hands the new value to every live worker.
             notify_workers();
 
             ViewImplementation::for_each_view([&](ViewImplementation& view) {
@@ -2934,6 +2945,12 @@ void Application::initialize_actions()
 
     m_show_caret_hit_test_debug_overlay_action = Action::create_checkable("Show Caret Hit Test Debug Overlay"sv, ActionID::ShowCaretHitTestDebugOverlay, check(m_show_caret_hit_test_debug_overlay_action, "set-caret-hit-test-debug-overlay"sv));
     m_debug_menu->add_action(*m_show_caret_hit_test_debug_overlay_action);
+
+    m_show_tab_performance_monitor_action = Action::create_checkable("Show Tab Performance Monitor"sv, ActionID::ShowTabPerformanceMonitor, [this]() {
+        m_settings->set_config_variable(ConfigVariableID::ShowTabPerformanceMonitor, m_show_tab_performance_monitor_action->checked());
+    });
+    m_show_tab_performance_monitor_action->set_checked(m_settings->config_variable_as_bool(ConfigVariableID::ShowTabPerformanceMonitor));
+    m_debug_menu->add_action(*m_show_tab_performance_monitor_action);
     m_debug_menu->add_separator();
 
     m_debug_menu->add_action(Action::create("Report Leaked Documents"sv, ActionID::ReportLeakedDocuments, debug_request("report-leaked-documents"sv)));
@@ -2947,7 +2964,7 @@ void Application::initialize_actions()
         ? *WebView::user_agents.get(*m_web_content_options.user_agent_preset)
         : Web::default_user_agent;
 
-    auto notify_workers_of_user_agent = [this] { WorkerProcessManager::the().update_user_agent(user_agent_string()); };
+    auto notify_workers_of_user_agent = [this] { WorkerAgentManager::the().update_user_agent(user_agent_string()); };
     add_spoofed_value(spoof_user_agent_menu, "Disabled"sv, Web::default_user_agent, m_user_agent_string, "spoof-user-agent"sv, notify_workers_of_user_agent);
     for (auto const& user_agent : WebView::user_agents) {
         add_spoofed_value(spoof_user_agent_menu, user_agent.key, user_agent.value, m_user_agent_string, "spoof-user-agent"sv, notify_workers_of_user_agent);
@@ -2956,7 +2973,7 @@ void Application::initialize_actions()
     auto navigator_compatibility_mode_menu = Menu::create_group("Navigator Compatibility Mode"sv);
     m_navigator_compatibility_mode = navigator_compatibility_mode_to_string(Web::default_navigator_compatibility_mode);
 
-    auto notify_workers_of_navigator_compatibility_mode = [this] { WorkerProcessManager::the().update_navigator_compatibility_mode(navigator_compatibility_mode()); };
+    auto notify_workers_of_navigator_compatibility_mode = [this] { WorkerAgentManager::the().update_navigator_compatibility_mode(navigator_compatibility_mode()); };
     auto add_navigator_compatibility_mode = [&](StringView name, Web::NavigatorCompatibilityMode mode) {
         add_spoofed_value(navigator_compatibility_mode_menu, name, navigator_compatibility_mode_to_string(mode), m_navigator_compatibility_mode, "navigator-compatibility-mode"sv, notify_workers_of_navigator_compatibility_mode);
     };
@@ -3028,7 +3045,7 @@ void Application::permissions_changed(Badge<ApplicationPermissionManagerObserver
             client.async_set_permission_snapshot(manager.snapshot_for(client.permission_origins()));
         return IterationDecision::Continue;
     });
-    WorkerProcessManager::the().update_permission_snapshot(manager);
+    WorkerAgentManager::the().update_permission_snapshot(manager);
 
     schedule_permission_expiry();
 }
@@ -3068,6 +3085,16 @@ void Application::location_policy_changed(Badge<ApplicationSettingsObserver>)
     update_permission_defaults();
 }
 
+bool Application::sites_can_ask_for_microphone() const
+{
+    return settings().microphone_policy() == MicrophonePolicy::Ask;
+}
+
+void Application::microphone_policy_changed(Badge<ApplicationSettingsObserver>)
+{
+    update_permission_defaults();
+}
+
 bool Application::sites_can_ask_for_notifications() const
 {
     return settings().notifications_policy() == NotificationsPolicy::Ask;
@@ -3099,12 +3126,13 @@ void Application::update_permission_defaults()
     // NB: A private session reads its defaults from the ordinary one.
     auto state_for = [](bool sites_can_ask) { return sites_can_ask ? Web::Permissions::EffectiveState::Prompt : Web::Permissions::EffectiveState::Denied; };
     m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Geolocation, state_for(sites_can_ask_for_location()));
+    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Microphone, state_for(sites_can_ask_for_microphone()));
     m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Notifications, state_for(sites_can_ask_for_notifications()));
 }
 
 void Application::languages_changed(Badge<ApplicationSettingsObserver>)
 {
-    WorkerProcessManager::the().update_preferred_languages(m_settings->languages());
+    WorkerAgentManager::the().update_preferred_languages(m_settings->languages());
 }
 
 String Application::user_agent_string() const

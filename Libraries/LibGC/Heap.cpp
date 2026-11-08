@@ -9,12 +9,12 @@
 #include <AK/BinarySearch.h>
 #include <AK/Checked.h>
 #include <AK/Debug.h>
+#include <AK/Diagnostics.h>
 #include <AK/Function.h>
 #include <AK/HashTable.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/LexicalPath.h>
-#include <AK/NeverDestroyed.h>
 #include <AK/NumberFormat.h>
 #include <AK/Platform.h>
 #include <AK/ScopeGuard.h>
@@ -77,7 +77,8 @@ static constexpr int GC_INCREMENTAL_SWEEP_SLICE_MS = 5;
 // whether to proactively collect. See idle_gc_on_timer().
 static constexpr int GC_IDLE_GC_INTERVAL_MS = 4000;
 
-static Heap* s_the;
+// Every thread that runs a VM has a heap of its own, and all but the main thread may come and go.
+AK_TLS_INITIAL_EXEC static thread_local constinit Heap* s_the = nullptr;
 
 namespace {
 
@@ -100,8 +101,9 @@ i32 libgc_log_level()
 }
 
 // Per-phase timings recorded during a single collect_garbage() call. We keep
-// these at file scope (instead of threading more parameters through the GC's
-// internal helpers) since GC is single-threaded, guarded by m_collecting_garbage.
+// these per thread (instead of threading more parameters through the GC's
+// internal helpers) since a heap only collects on its own thread, guarded by
+// m_collecting_garbage.
 struct PhaseTimings {
     // Top-level phases.
     i64 gather_roots_us { 0 };
@@ -134,7 +136,7 @@ struct PhaseTimings {
     i64 sweep_block_reclassify_us { 0 };
     i64 sweep_update_threshold_us { 0 };
 };
-PhaseTimings g_phase_timings;
+thread_local PhaseTimings g_phase_timings;
 
 // Stats gathered during sweep_dead_cells() and consumed by the report printer
 // in collect_garbage().
@@ -146,7 +148,7 @@ struct SweepStats {
     size_t live_external_bytes { 0 };
     size_t freed_block_count { 0 };
 };
-SweepStats g_sweep_stats;
+thread_local SweepStats g_sweep_stats;
 
 struct IncrementalSweepBatchStats {
     size_t blocks_swept { 0 };
@@ -163,15 +165,20 @@ struct IncrementalSweepStats {
 
 IncrementalSweepStats& incremental_sweep_stats()
 {
-    static NeverDestroyed<IncrementalSweepStats> stats;
-    return *stats;
+    // NB: Free each thread's batches when that thread exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local IncrementalSweepStats stats)
+#else
+    static thread_local IncrementalSweepStats stats;
+#endif
+    return stats;
 }
 
-bool g_next_incremental_sweep_should_report { false };
+thread_local bool g_next_incremental_sweep_should_report { false };
 
 // Set by collect_garbage() while a reported collection is in flight. Used by
 // the GC's helpers to decide whether they should record subphase timings.
-bool g_recording_phase_timings { false };
+thread_local bool g_recording_phase_timings { false };
 
 void print_gc_report(i64 total_us, size_t live_block_count)
 {
@@ -304,17 +311,21 @@ void Heap::set_default_heap_for_testing(Heap& heap)
     s_the = &heap;
 }
 
-CellAllocator& Heap::cell_allocator_for(Badge<CellAllocatorDescriptorBase>, CellAllocatorDescriptorBase& descriptor)
+CellAllocator& Heap::create_cell_allocator(CellAllocatorDescriptorBase& descriptor)
 {
-    return *m_cell_allocators_by_type.ensure(&descriptor, [&] {
-        return make<CellAllocator>(descriptor);
-    });
+    auto index = descriptor.index();
+    if (index >= m_cell_allocators_by_descriptor_index.size())
+        m_cell_allocators_by_descriptor_index.resize(index + 1);
+    auto& allocator = m_cell_allocators_by_descriptor_index[index];
+    VERIFY(!allocator);
+    allocator = make<CellAllocator>(descriptor);
+    return *allocator;
 }
 
-Heap::Heap(AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> gather_embedder_roots, BecomeProcessDefault become_process_default)
+Heap::Heap(AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> gather_embedder_roots, BecomeThreadDefault become_thread_default)
     : m_gather_embedder_roots(move(gather_embedder_roots))
 {
-    if (become_process_default == BecomeProcessDefault::Yes)
+    if (become_thread_default == BecomeThreadDefault::Yes)
         s_the = this;
     m_gc_bytes_threshold = GC_MIN_BYTES_THRESHOLD;
     m_last_collection_end_ns = MonotonicTime::now().nanoseconds();
@@ -323,10 +334,14 @@ Heap::Heap(AK::Function<void(HashMap<Cell*, GC::HeapRoot>&)> gather_embedder_roo
 
 Heap::~Heap()
 {
+    VERIFY(is_on_owner_thread());
     collect_garbage(CollectionType::CollectEverything);
 
-    for (auto& entry : m_cell_allocators_by_type)
-        entry.key->forget_heap({}, *this);
+    // A root that outlives its heap would reach into freed memory when it goes.
+    VERIFY(m_roots.is_empty());
+
+    free_weak_blocks();
+
     while (auto* allocator = m_all_cell_allocators.first())
         m_all_cell_allocators.remove(*allocator);
 
@@ -338,6 +353,23 @@ Heap::~Heap()
     for (auto* member : m_incoming_cross_heap_members)
         member->detach_from_heap({});
     m_incoming_cross_heap_members.clear();
+
+    if (s_the == this)
+        s_the = nullptr;
+}
+
+void Heap::free_weak_blocks()
+{
+    // NB: A weak pointer outside the heap may outlive it, so a block that one still refers to has to stay. Its pointers
+    //     are all null by now, and it is leaked once this heap forgets about it.
+    auto free_blocks = [](WeakBlock::List& blocks) {
+        while (auto* block = blocks.take_first()) {
+            if (!block->has_referenced_impls())
+                WeakBlock::destroy(block);
+        }
+    };
+    free_blocks(m_usable_weak_blocks);
+    free_blocks(m_full_weak_blocks);
 }
 
 void Heap::enable_stats()
@@ -354,7 +386,7 @@ void Heap::add_stats(AK::JsonObject& values) const
     values.set("gc.allocated_bytes_since_gc"sv, m_allocated_bytes_since_last_gc);
     values.set("gc.heap_blocks"sv, m_live_heap_blocks.size());
     values.set("gc.heap_block_bytes"sv, m_live_heap_blocks.size() * HeapBlock::BLOCK_SIZE);
-    values.set("gc.cell_allocators"sv, m_cell_allocators_by_type.size());
+    values.set("gc.cell_allocators"sv, m_all_cell_allocators.size_slow());
     values.set("gc.threshold_bytes"sv, m_gc_bytes_threshold);
     values.set("gc.live_cell_bytes"sv, m_stats->live_cell_bytes);
     values.set("gc.live_external_bytes"sv, m_stats->live_external_bytes);
@@ -388,6 +420,7 @@ void Heap::finish_stats_collection()
 void Heap::will_allocate(size_t size, TriggersCollection triggers_collection)
 {
     ASSERT(!heap_access_is_forbidden_on_this_thread());
+    ASSERT(is_on_owner_thread());
     if (triggers_collection == TriggersCollection::No) {
         m_total_allocated_bytes += size;
         return;
@@ -922,6 +955,7 @@ bool heap_access_is_forbidden_on_this_thread()
 NO_SANITIZE_ADDRESS void Heap::collect_garbage(CollectionType collection_type, bool print_report)
 {
     VERIFY(!heap_access_is_forbidden_on_this_thread());
+    VERIFY(is_on_owner_thread());
     jmp_buf registers;
     setjmp(registers);
     ReadonlySpan<FlatPtr> captured_registers { reinterpret_cast<FlatPtr const*>(registers), sizeof(jmp_buf) / (sizeof(FlatPtr)) };
@@ -2027,11 +2061,17 @@ void Heap::undefer_gc()
     VERIFY(m_gc_deferrals > 0);
     --m_gc_deferrals;
 
-    if (!m_gc_deferrals) {
-        if (m_should_gc_when_deferral_ends)
-            collect_garbage();
-        m_should_gc_when_deferral_ends = false;
-    }
+    if (m_gc_deferrals || !m_should_gc_when_deferral_ends)
+        return;
+
+    // NB: A destructor that a block sweep runs can end a deferral of its own, e.g. the one around constructing a cell
+    //     it allocates. For the reason will_allocate() gives, no collection may start there, so the request waits for
+    //     a deferral that ends outside the sweep.
+    if (m_block_sweeps_in_progress > 0)
+        return;
+
+    collect_garbage();
+    m_should_gc_when_deferral_ends = false;
 }
 
 void Heap::uproot_cell(Cell* cell)
@@ -2047,7 +2087,6 @@ WeakImpl* Heap::create_weak_impl(void* ptr)
         return &WeakImpl::the_null_weak_impl;
 
     if (m_usable_weak_blocks.is_empty()) {
-        // NOTE: These are leaked on Heap destruction, but that's fine since Heap is tied to process lifetime.
         auto* weak_block = WeakBlock::create();
         m_usable_weak_blocks.append(*weak_block);
     }

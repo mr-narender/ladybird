@@ -89,6 +89,8 @@ public:
     static Optional<WebContentClient&> client_for_compositor_context_id(Web::CompositorContextId);
 
     virtual Messages::WebContentClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) override;
+    virtual void did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) override;
+    virtual void close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) override;
     virtual Messages::WebContentClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
 
@@ -124,6 +126,9 @@ public:
     bool may_read_local_files() const;
     // Documents with no site, such as those of an opaque origin, come with whatever made them, so they do not count.
     void did_host_document_of_site(Utf16String site);
+
+    // Connects a client to the ImageDecoder of this process, for its main thread or for a worker on a thread of it.
+    Optional<IPC::TransportHandle> connect_new_image_decoder_client(Optional<u64>& client_generation);
 
     // A process that has hosted local file content may read local files. Site isolation gives such content processes
     // of its own, which host nothing else.
@@ -186,13 +191,13 @@ public:
     Web::CompositorContextId allocate_compositor_context(Web::PageId page_id, Web::PagePresentationRegistration);
     Optional<Web::PageId> page_id_for_compositor_context_id(Web::CompositorContextId) const;
     bool has_requested_close() const { return m_requested_close; }
+    void close_server_if_unused();
 
     pid_t pid() const { return m_child_identity.pid; }
     u64 child_id() const { return m_child_identity.child_id; }
     void set_child_identity(ChildIdentity identity) { m_child_identity = identity; }
 
 private:
-    void close_server_if_unused();
     bool forget_compositor_context(Web::CompositorContextId);
     void destroy_all_compositor_contexts();
     void cancel_navigation_transactions();
@@ -233,6 +238,7 @@ private:
     virtual Messages::WebContentClient::RequestAudioServerConnectionResponse request_audio_server_connection() override;
     virtual Messages::WebContentClient::RequestWebrtcClientConnectionResponse request_webrtc_client_connection() override;
     virtual Messages::WebContentClient::RequestImageDecoderConnectionResponse request_image_decoder_connection() override;
+    virtual void did_release_image_decoder() override;
     virtual void request_video_presentation_channel() override;
     virtual void gamepad_play_effect(Web::Gamepad::GamepadHandle handle, Web::Gamepad::GamepadEffect effect) override;
     virtual void gamepad_stop_effects(Web::Gamepad::GamepadHandle handle) override;
@@ -249,6 +255,7 @@ private:
     bool m_rejected_ipc { false };
     // The site of the documents this process hosts, if it has only hosted those of one.
     Optional<Utf16String> m_site_of_hosted_documents;
+    Optional<u64> m_image_decoder_client_generation;
     bool m_has_hosted_documents_of_several_sites { false };
     bool m_has_hosted_local_file_content { false };
     Optional<String> m_hosted_web_ui;

@@ -37,8 +37,13 @@ struct ServiceWorkerContainerReadyPromiseCacheEntry {
 
 static Vector<ServiceWorkerContainerReadyPromiseCacheEntry>& service_worker_container_ready_promise_caches()
 {
-    static NeverDestroyed<Vector<ServiceWorkerContainerReadyPromiseCacheEntry>> caches;
+    static thread_local NeverDestroyed<Vector<ServiceWorkerContainerReadyPromiseCacheEntry>> caches;
     return *caches;
+}
+
+void clear_service_worker_container_ready_promise_caches()
+{
+    service_worker_container_ready_promise_caches().clear();
 }
 
 static void prune_service_worker_container_ready_promise_caches()

@@ -38,6 +38,7 @@ public:
         m_armed_sources.ensure(token, [&] { return GC::make_root(source); });
     }
     void disarm(BodyStreamWakeToken token) { m_armed_sources.remove(token); }
+    void disarm_all() { m_armed_sources.clear(); }
 
     void notify(BodyStreamWakeToken token, Engine::WakeTicket ticket)
     {
@@ -52,6 +53,11 @@ private:
     u64 m_next_token { 1 };
     HashMap<BodyStreamWakeToken, GC::Root<BodyStreamPullSource>> m_armed_sources;
 };
+
+void disarm_all_body_stream_wakes()
+{
+    BodyStreamWakeRegistry::the().disarm_all();
+}
 
 NonnullRefPtr<BodyStreamWakeSink> BodyStreamWakeSink::create()
 {
@@ -212,7 +218,7 @@ void BodyStreamPullSource::on_pull_wake()
 
     // AD-HOC: While the HTML event loop is paused, the pull runs now rather than in a fetch task, which would not run
     //         until the loop resumes.
-    if (HTML::main_thread_event_loop().execution_paused()) {
+    if (HTML::current_event_loop().execution_paused()) {
         run_pull_task();
         push_while_paused();
         return;
@@ -230,7 +236,7 @@ void BodyStreamPullSource::on_pull_wake()
 
     // AD-HOC: The tasks of a navigation body adopted from another process are queued without a document, since the
     //         previous document's tasks stop running once the new document replaces it.
-    HTML::queue_a_task(HTML::Task::Source::Networking, HTML::main_thread_event_loop(), nullptr, steps);
+    HTML::queue_a_task(HTML::Task::Source::Networking, HTML::current_event_loop(), nullptr, steps);
 }
 
 // AD-HOC: A sync XHR send() pauses the HTML event loop while it waits for exactly these bytes, and a stream set up
@@ -239,7 +245,7 @@ void BodyStreamPullSource::on_pull_wake()
 //         would deliver them (see the sync XHR body path in fetch_response_handover()).
 void BodyStreamPullSource::push_while_paused()
 {
-    if (m_detached || m_pending_pull_promise || m_push_ticket.has_value() || !HTML::main_thread_event_loop().execution_paused())
+    if (m_detached || m_pending_pull_promise || m_push_ticket.has_value() || !HTML::current_event_loop().execution_paused())
         return;
     if (!m_fetch_controller || m_fetch_controller->control_block().body_intent() != Engine::BodyIntent::SyncAccumulate)
         return;

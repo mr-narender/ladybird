@@ -387,23 +387,6 @@ pub unsafe extern "C" fn visual_context_tree_transform_rect_to_viewport(
 ///
 /// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn visual_context_tree_cumulative_scroll_chain_offset(
-    tree: *const c_void,
-    spatial: SpatialNodeIndex,
-    scroll_offsets: *const libgfx_rust::FloatPoint,
-    scroll_offsets_len: usize,
-    out: &mut libgfx_rust::FloatPoint,
-) {
-    let tree = unsafe { tree_from_handle(tree) };
-    // SAFETY: The caller guarantees the offsets address `scroll_offsets_len` points.
-    let scroll_offsets = unsafe { ak::slice_from_raw_parts(scroll_offsets, scroll_offsets_len) };
-    *out = tree.cumulative_scroll_chain_offset(spatial, scroll_offsets);
-}
-
-/// # Safety
-///
-/// `tree` must be a live retained tree handle; `scroll_offsets` must address `scroll_offsets_len` points.
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn visual_context_tree_accumulated_matrix(
     tree: *const c_void,
     spatial: SpatialNodeIndex,
@@ -676,7 +659,6 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_scroll(builder:
         crate::visual_context::SpatialData::Scroll(crate::visual_context::ScrollData {
             state_slot: crate::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: SpatialNodeIndex(parent),
         }),
         SpatialNodeIndex(parent),
     )
@@ -712,11 +694,6 @@ pub unsafe extern "C" fn visual_context_tree_test_builder_append_sticky(
             inset_left: inset(constraints.inset_left),
             state_slot: crate::visual_context::scroll_state::NO_SCROLL_STATE_SLOT,
             owner_paintable: NodeSlotId::INVALID,
-            registry_parent_node: if constraints.has_parent_sticky {
-                SpatialNodeIndex(constraints.parent_sticky)
-            } else {
-                SpatialNodeIndex(constraints.scroller)
-            },
         }),
         SpatialNodeIndex(parent),
     )

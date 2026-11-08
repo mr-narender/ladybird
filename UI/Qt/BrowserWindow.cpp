@@ -38,6 +38,7 @@
 #include <UI/Qt/WindowControlButton.h>
 
 #include <QAbstractButton>
+#include <QActionGroup>
 #include <QApplication>
 #include <QContextMenuEvent>
 #include <QCursor>
@@ -535,8 +536,6 @@ void BrowserWindow::initialize_ladybird_menu()
     m_ladybird_menu->addAction(application.open_settings_action());
     m_ladybird_menu->addMenu(application.inspect_menu());
     m_ladybird_menu->addMenu(application.debug_menu());
-    m_ladybird_menu->addSeparator();
-
     m_ladybird_menu->addMenu(application.help_menu());
     // NB: On macOS, the application menu has Quit.
 #if !defined(AK_OS_MACOS)
@@ -553,6 +552,8 @@ QAction* BrowserWindow::create_ladybird_menu_zoom_row()
 
     auto* row = new QWidget(m_ladybird_menu);
     row->setObjectName("LadybirdMenuZoomRow");
+    row->setStyleSheet(ChromeStyle::menu_zoom_row_style_sheet());
+    m_ladybird_menu_zoom_row = row;
     auto* layout = new QHBoxLayout(row);
     layout->setContentsMargins(10, 3, 10, 3);
     layout->setSpacing(2);
@@ -569,17 +570,26 @@ QAction* BrowserWindow::create_ladybird_menu_zoom_row()
         layout->addWidget(button);
         return button;
     };
-    add_button("LadybirdMenuZoomButton", "Zoom Out", application.zoom_out_action())->setIcon(create_chrome_icon(ChromeIcon::ZoomOut, Theme::panel().body));
+    m_ladybird_menu_zoom_out = add_button("LadybirdMenuZoomButton", "Zoom Out", application.zoom_out_action());
     m_ladybird_menu_zoom_level = add_button("LadybirdMenuZoomLevel", "Reset Zoom", application.reset_zoom_action());
     // NB: The level is drawn in figures of one width, so it doesn't shift as it changes.
     auto level_font = m_ladybird_menu_zoom_level->font();
     level_font.setFeature(QFont::Tag("tnum"), 1);
     m_ladybird_menu_zoom_level->setFont(level_font);
-    add_button("LadybirdMenuZoomButton", "Zoom In", application.zoom_in_action())->setIcon(create_chrome_icon(ChromeIcon::NewTab, Theme::panel().body));
+    m_ladybird_menu_zoom_in = add_button("LadybirdMenuZoomButton", "Zoom In", application.zoom_in_action());
+    update_ladybird_menu_zoom_icons();
 
     auto* action = new QWidgetAction(m_ladybird_menu);
     action->setDefaultWidget(row);
     return action;
+}
+
+void BrowserWindow::update_ladybird_menu_zoom_icons()
+{
+    if (!m_ladybird_menu_zoom_out || !m_ladybird_menu_zoom_in)
+        return;
+    m_ladybird_menu_zoom_out->setIcon(create_chrome_icon(ChromeIcon::ZoomOut, Theme::panel().body));
+    m_ladybird_menu_zoom_in->setIcon(create_chrome_icon(ChromeIcon::NewTab, Theme::panel().body));
 }
 
 void BrowserWindow::update_ladybird_menu_zoom_level()
@@ -587,6 +597,22 @@ void BrowserWindow::update_ladybird_menu_zoom_level()
     if (!m_current_tab || !m_ladybird_menu_zoom_level)
         return;
     m_ladybird_menu_zoom_level->setText(qformatted("{}%", round_to<int>(m_current_tab->view().zoom_level() * 100)));
+}
+
+enum class TabLayoutChoice : u8 {
+    AlongTheTop,
+    DownTheLeftSide,
+    DownTheRightSide,
+    InTheSidebar,
+};
+
+static TabLayoutChoice tab_layout_choice(WebView::TabSettings const& tab_settings)
+{
+    if (!tab_settings.vertical_tabs_enabled)
+        return TabLayoutChoice::AlongTheTop;
+    if (tab_settings.everything_in_sidebar)
+        return TabLayoutChoice::InTheSidebar;
+    return tab_settings.vertical_tabs_position == WebView::VerticalTabsPosition::Right ? TabLayoutChoice::DownTheRightSide : TabLayoutChoice::DownTheLeftSide;
 }
 
 void BrowserWindow::initialize_window_context_menu()
@@ -609,21 +635,38 @@ void BrowserWindow::initialize_window_context_menu()
 
     m_window_context_menu->addSeparator();
 
-    m_toggle_vertical_tabs_action = m_window_context_menu->addAction(QString {});
-    QObject::connect(m_toggle_vertical_tabs_action, &QAction::triggered, this, [] {
-        auto tab_settings = Application::settings().tab_settings();
-        tab_settings.vertical_tabs_enabled = !tab_settings.vertical_tabs_enabled;
-        Application::settings().set_tab_settings(tab_settings);
-    });
+    // The tab layouts of Settings, with the sidebar's side made part of the choice.
+    auto* tab_layout_menu = m_window_context_menu->addMenu("Tab &Layout");
+    m_tab_layout_actions = new QActionGroup(this);
+    auto add_tab_layout = [&](char const* text, TabLayoutChoice choice) {
+        auto* action = tab_layout_menu->addAction(text);
+        action->setCheckable(true);
+        action->setData(to_underlying(choice));
+        m_tab_layout_actions->addAction(action);
+        QObject::connect(action, &QAction::triggered, this, [choice] {
+            auto tab_settings = Application::settings().tab_settings();
+            tab_settings.vertical_tabs_enabled = choice != TabLayoutChoice::AlongTheTop;
+            tab_settings.everything_in_sidebar = choice == TabLayoutChoice::InTheSidebar;
+            if (choice == TabLayoutChoice::DownTheLeftSide)
+                tab_settings.vertical_tabs_position = WebView::VerticalTabsPosition::Left;
+            else if (choice == TabLayoutChoice::DownTheRightSide)
+                tab_settings.vertical_tabs_position = WebView::VerticalTabsPosition::Right;
+            Application::settings().set_tab_settings(tab_settings);
+        });
+    };
+    add_tab_layout("Along the &Top", TabLayoutChoice::AlongTheTop);
+    add_tab_layout("Down the &Left Side", TabLayoutChoice::DownTheLeftSide);
+    add_tab_layout("Down the &Right Side", TabLayoutChoice::DownTheRightSide);
+    add_tab_layout("In the &Sidebar", TabLayoutChoice::InTheSidebar);
 }
 
 void BrowserWindow::show_window_context_menu(QPoint global_position)
 {
-    auto vertical_tabs_enabled = Application::settings().tab_settings().vertical_tabs_enabled;
-
     m_reopen_closed_tab_action->setEnabled(m_session->session_store->has_closed_units());
     m_always_on_top_action->setChecked(windowFlags().testFlag(Qt::WindowStaysOnTopHint));
-    m_toggle_vertical_tabs_action->setText(vertical_tabs_enabled ? "Switch to &Horizontal Tabs" : "Switch to &Vertical Tabs");
+    auto current_tab_layout = to_underlying(tab_layout_choice(Application::settings().tab_settings()));
+    for (auto* action : m_tab_layout_actions->actions())
+        action->setChecked(action->data().toInt() == current_tab_layout);
 
     execute_context_menu(*m_window_context_menu, global_position);
 }
@@ -634,7 +677,9 @@ void BrowserWindow::update_tabs_display()
     m_tabs_container->set_vertical_tabs_enabled(settings.vertical_tabs_enabled);
     m_tabs_container->set_vertical_tabs_expanded(settings.vertical_tabs_expanded);
     m_tabs_container->set_vertical_tabs_expand_on_hover(settings.vertical_tabs_expand_on_hover);
-    m_tabs_container->set_vertical_tabs_position(settings.vertical_tabs_position);
+    // NB: With everything in the sidebar, the sidebar is on the left, beside the traffic lights.
+    m_tabs_container->set_vertical_tabs_position(settings.everything_in_sidebar ? WebView::VerticalTabsPosition::Left : settings.vertical_tabs_position);
+    m_tabs_container->set_everything_in_sidebar(settings.everything_in_sidebar);
 }
 
 void BrowserWindow::rebuild_bookmarks_menu()
@@ -1248,6 +1293,9 @@ void BrowserWindow::tab_favicon_changed(int index, QIcon const& icon)
 void BrowserWindow::update_chrome_style()
 {
     menuBar()->setStyleSheet(ChromeStyle::menu_bar_style_sheet(Theme::chrome_palette(*this)));
+    if (m_ladybird_menu_zoom_row)
+        m_ladybird_menu_zoom_row->setStyleSheet(ChromeStyle::menu_zoom_row_style_sheet());
+    update_ladybird_menu_zoom_icons();
 }
 
 TabBarButton* BrowserWindow::create_tab_close_button(Tab& tab)
@@ -1859,6 +1907,7 @@ void BrowserWindow::changeEvent(QEvent* event)
 void BrowserWindow::appearance_changed()
 {
     SystemAppearance::the().apply_interface_theme(WebView::Application::settings().appearance().interface_theme);
+    SystemAppearance::the().apply_color_theme(WebView::Application::settings().appearance().color_theme);
     update_menu_bar_visibility();
 
     m_tabs_container->update_bookmarks_bar_visibility();

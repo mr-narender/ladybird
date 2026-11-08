@@ -83,7 +83,7 @@ endpoint WebContentClient routed by Web::PageId page_id
 {
 
     [NotRouted] did_add_blob_url_entry(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) => (URL::BlobURLEntry::Token token)
-    did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
+    [NotRouted] did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
     did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) => (Optional<Web::FileAPI::SerializedBlobURLEntry> entry)
     did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) =|
 
@@ -119,13 +119,10 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_receive_download_data(Web::PageId page_id, u64 download_id, ByteBuffer data) =|
     did_finish_download(Web::PageId page_id, u64 download_id) =|
     did_fail_download(Web::PageId page_id, u64 download_id, String error) =|
-    did_request_refresh(Web::PageId page_id) =|
     did_request_cursor_change(Web::PageId page_id, Gfx::Cursor cursor) =|
     did_change_title(Web::PageId page_id, Utf16String title) =|
     did_update_editing_history_state(Web::PageId page_id, bool can_undo, bool can_redo) =|
     did_set_text_fragment_indication_visibility(Web::PageId page_id, bool visible) =|
-    did_request_tooltip_override(Web::PageId page_id, Gfx::IntPoint position, ByteString title) =|
-    did_stop_tooltip_override(Web::PageId page_id) =|
     did_enter_tooltip_area(Web::PageId page_id, ByteString title) =|
     did_leave_tooltip_area(Web::PageId page_id) =|
     did_hover_link(Web::PageId page_id, URL::URL url) =|
@@ -205,6 +202,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     request_audio_server_connection() => (Optional<IPC::TransportHandle> handle)
     request_webrtc_client_connection() => (Optional<IPC::TransportHandle> handle)
     request_image_decoder_connection() => (Optional<IPC::TransportHandle> handle)
+    did_release_image_decoder() =|
     request_video_presentation_channel() =|
 
     [NotRouted] did_request_storage_usage(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) => (u64 usage)
@@ -222,6 +220,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_complete_close_preflight(Web::PageId page_id, u64 request_id, bool approved) =|
     did_change_needs_beforeunload_check(Web::PageId page_id, bool needs_beforeunload_check) =|
     did_consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption consumption) =|
+    did_notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id) =|
     webdriver_user_prompt_handling_complete(Web::PageId page_id, u64 request_id, Web::WebDriver::Response response) =|
     webdriver_did_set_current_browsing_context(Web::PageId page_id, u64 command_id, Web::HTML::CrossProcessId navigable_id) =|
     webdriver_command_complete(Web::PageId page_id, u64 command_id, Web::WebDriver::Response response) =|
@@ -321,8 +320,8 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     did_find_in_page(Web::PageId page_id, size_t current_match_index, Optional<size_t> total_match_count) =|
 
-    [NotRouted] start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id)
-    close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
+    [NotRouted] start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id, Optional<IPC::TransportHandle> thread_transport, bool is_hosted_in_caller_process)
+    [NotRouted] close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
     rtc_transform_init(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record) =|
     rtc_transform_teardown(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id) =|
     rtc_transform_encoded_audio_frame(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) =|

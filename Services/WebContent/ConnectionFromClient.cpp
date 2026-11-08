@@ -113,6 +113,7 @@
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverBiDi.h>
+#include <WebContent/Worker/WorkerThread.h>
 
 namespace WebContent {
 
@@ -382,6 +383,13 @@ void ConnectionFromClient::close_server()
     shutdown();
 }
 
+void ConnectionFromClient::start_worker_thread(IPC::TransportHandle worker_transport, Web::HTML::AgentType agent_type)
+{
+    // NB: The UI process notices a transport that nobody takes up, and tells the owners that their worker is gone.
+    if (auto result = WebWorker::start_worker_thread(move(worker_transport), agent_type); result.is_error())
+        dbgln("Unable to start a thread for a worker: {}", result.error());
+}
+
 Messages::WebContentServer::GetWindowHandleResponse ConnectionFromClient::get_window_handle(Web::PageId page_id)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -455,7 +463,11 @@ void ConnectionFromClient::connect_to_web_ui(Web::PageId page_id, IPC::Transport
 
 void ConnectionFromClient::disconnect_from_image_decoder()
 {
-    static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).disconnect_client();
+    auto disconnect = [] {
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).disconnect_client();
+    };
+    disconnect();
+    WebWorker::post_to_worker_threads(disconnect);
 }
 
 void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle)
@@ -1287,6 +1299,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "clear-cache") {
         Web::Fetch::Fetching::clear_http_memory_cache();
+        WebWorker::post_to_worker_threads(Web::Fetch::Fetching::clear_http_memory_cache);
         Web::CSS::StyleScope::release_kept_data();
         return;
     }

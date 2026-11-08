@@ -47,7 +47,7 @@
 #include <LibWebView/WebContentTestClient.h>
 #include <LibWebView/WebDriverBiDi.h>
 #include <LibWebView/WebUI.h>
-#include <LibWebView/WorkerProcessManager.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 namespace WebView {
 
@@ -650,6 +650,9 @@ void WebContentPage::close()
     PictureInPictureManager::the().close_window(*this);
     NotificationManager::the().page_did_close(*this);
     m_is_open = false;
+    // NB: The process can outlive the page, for the shared workers it runs, or for other pages.
+    if (m_client)
+        WorkerAgentManager::the().remove_web_content_page_owner(*m_client, m_id);
     // NB: Nothing finishes the input this page held, including a page discarded while its process hosts other pages.
     if (m_traversable) {
         if (auto view = m_traversable->view(); view.has_value())
@@ -970,12 +973,6 @@ void WebContentPage::did_find_in_page(size_t current_match_index, Optional<size_
     }
 }
 
-void WebContentPage::did_request_refresh()
-{
-    if (displays_tab())
-        view().reload();
-}
-
 void WebContentPage::did_request_cursor_change(Gfx::Cursor cursor)
 {
     view().did_request_cursor_change({}, move(cursor));
@@ -994,20 +991,6 @@ void WebContentPage::did_set_text_fragment_indication_visibility(bool visible)
 {
     if (displays_tab())
         view().set_text_fragment_indication_visibility({}, visible);
-}
-
-void WebContentPage::did_request_tooltip_override(Gfx::IntPoint position, ByteString title)
-{
-    if (displays_tab()) {
-        if (view().on_request_tooltip_override)
-            view().on_request_tooltip_override(view().to_widget_position(position), title);
-    }
-}
-
-void WebContentPage::did_stop_tooltip_override()
-{
-    if (view().on_stop_tooltip_override)
-        view().on_stop_tooltip_override();
 }
 
 void WebContentPage::did_enter_tooltip_area(ByteString title)
@@ -1457,6 +1440,33 @@ void WebContentPage::did_consume_user_activation(Web::HTML::UserActivationConsum
             return;
         page.async_consume_user_activation(consumption);
     });
+}
+
+// https://html.spec.whatwg.org/multipage/interaction.html#activation-notification
+// NB: The renderer ran the steps for input in the document with the given ID, and notified the windows this page hosts.
+//     The windows of the steps that other pages host are notified here.
+void WebContentPage::did_notify_about_user_activation(Web::HTML::CrossProcessId document_id)
+{
+    // NB: The renderer runs the steps for input the view is delivering to it, and it sends this before it reports that
+    //     it finished handling that input. So any other claim is a renderer handing out activation for input it never
+    //     got, unless automation lets it synthesize input.
+    if (!WebContentClient::renderers_may_synthesize_input()) {
+        auto view = traversable().view();
+        if (!view.has_value() || !view->is_delivering_user_activation_to(*this))
+            return;
+    }
+
+    HashTable<Web::HTML::CrossProcessId> notified_document_ids;
+    CanonicalNavigable const* navigable = nullptr;
+    for_each_navigable_with_a_hosted_active_document([&](CanonicalNavigable const& hosted_navigable) {
+        auto hosted_document_id = hosted_navigable.active_document().id();
+        notified_document_ids.set(hosted_document_id);
+        if (hosted_document_id == document_id)
+            navigable = &hosted_navigable;
+        return IterationDecision::Continue;
+    });
+    if (navigable)
+        navigable->run_activation_notification_steps_for_active_document(notified_document_ids);
 }
 
 void WebContentPage::webdriver_user_prompt_handling_complete(u64 request_id, Web::WebDriver::Response response)
@@ -3343,8 +3353,8 @@ Messages::WebContentClient::StartWorkerAgentResponse WebContentPage::start_worke
 {
     // A page hosting an isolated iframe's document belongs to its tab's view as much as the view's own page does.
     auto outside_settings = hosted_environment(request.outside_settings.id);
-    auto agent_id = WorkerProcessManager::the().start_worker_agent(client(), m_id, outside_settings, move(request));
-    return { agent_id };
+    auto started_agent = WorkerAgentManager::the().start_worker_agent(client(), m_id, outside_settings, move(request));
+    return { started_agent.agent_id, move(started_agent.thread_transport), started_agent.is_hosted_in_owner_process };
 }
 
 Messages::WebContentClient::DidRequestStorageUsageResponse WebContentPage::did_request_storage_usage(Web::HTML::EnvironmentId environment_id)
@@ -3358,27 +3368,22 @@ Messages::WebContentClient::DidRequestStorageUsageResponse WebContentPage::did_r
 void WebContentPage::did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message)
 {
     if (auto settings = hosted_environment(message.environment_id); settings.has_value())
-        WorkerProcessManager::the().post_broadcast_channel_message(move(message), *settings, client().pid(), client().is_private());
-}
-
-void WebContentPage::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
-{
-    WorkerProcessManager::the().close_worker_agent(client(), agent_id, owner_token);
+        WorkerAgentManager::the().post_broadcast_channel_message(move(message), *settings, client(), client().is_private());
 }
 
 void WebContentPage::rtc_transform_init(Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record)
 {
-    WorkerProcessManager::the().rtc_transform_init(client(), agent_id, transform_id, move(options_record));
+    WorkerAgentManager::the().rtc_transform_init(client(), agent_id, transform_id, move(options_record));
 }
 
 void WebContentPage::rtc_transform_teardown(Web::HTML::WorkerAgentId agent_id, u64 transform_id)
 {
-    WorkerProcessManager::the().rtc_transform_teardown(client(), agent_id, transform_id);
+    WorkerAgentManager::the().rtc_transform_teardown(client(), agent_id, transform_id);
 }
 
 void WebContentPage::rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
 {
-    WorkerProcessManager::the().rtc_transform_encoded_audio_frame(client(), agent_id, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
+    WorkerAgentManager::the().rtc_transform_encoded_audio_frame(client(), agent_id, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 void WebContentPage::did_finish_test(String text)
@@ -3402,8 +3407,8 @@ void WebContentPage::did_receive_reference_test_metadata(JsonValue metadata)
 void WebContentPage::did_simulate_worker_request_server_connection_loss()
 {
     VERIFY(Application::web_content_options().is_test_mode == IsTestMode::Yes);
-    if (auto result = WorkerProcessManager::the().simulate_request_server_connection_loss_for_testing(client(), m_id); result.is_error()) {
-        warnln("Unable to reconnect WebWorker processes to RequestServer: {}", result.error());
+    if (auto result = WorkerAgentManager::the().simulate_request_server_connection_loss_for_testing(client(), m_id); result.is_error()) {
+        warnln("Unable to reconnect workers to RequestServer: {}", result.error());
         VERIFY_NOT_REACHED();
     }
 }
@@ -3436,6 +3441,12 @@ Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResp
 {
     auto view = traversable().view();
     return view.has_value() ? view->playing_audio_indicator_change_count() : 0;
+}
+
+void WebContentPage::did_request_close_tab_for_testing()
+{
+    if (displays_tab())
+        view().close_tab_for_testing();
 }
 
 void WebContentPage::did_request_crash_of_remote_frame_processes_for_testing()
@@ -3551,6 +3562,14 @@ void WebContentPage::did_remove_blob_url_entries(Web::HTML::EnvironmentId enviro
     if (!environment.has_value())
         return;
     client().session().blob_url_store->remove_entries(urls, environment->origin(), WeakPtr<WebContentClient> { client() });
+}
+
+Optional<bool> WebContentPage::hosted_environment_is_cross_origin_isolated(Web::HTML::EnvironmentId const& environment_id) const
+{
+    auto document = document_with_hosted_environment(environment_id);
+    if (!document.has_value())
+        return {};
+    return document->relevant_global_object().agent().agent_cluster_cross_origin_isolation_mode() != Web::HTML::CrossOriginIsolationMode::None;
 }
 
 Optional<bool> WebContentPage::hosted_environment_has_cross_site_ancestor(Web::HTML::EnvironmentId const& environment_id) const

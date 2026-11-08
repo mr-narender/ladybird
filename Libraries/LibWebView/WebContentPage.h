@@ -94,6 +94,7 @@ public:
     // Whether the document of an environment the page hosts has a cross-site ancestor, or nothing if the page hosts no
     // such environment.
     Optional<bool> hosted_environment_has_cross_site_ancestor(Web::HTML::EnvironmentId const& environment_id) const;
+    Optional<bool> hosted_environment_is_cross_origin_isolated(Web::HTML::EnvironmentId const& environment_id) const;
     bool hosts_an_environment_with_storage_key(Web::StorageAPI::StorageKey const&) const;
     void spoof_document_origin_for_testing(Web::HTML::EnvironmentId const& environment_id, URL::Origin);
     // Clears the bottle an environment of this page names, the way the browser's own clearing does: through the jar.
@@ -209,12 +210,9 @@ private:
     virtual void did_set_browser_zoom(double factor) override;
     virtual void did_set_device_pixel_ratio_for_testing(double device_pixel_ratio) override;
     virtual void did_find_in_page(size_t current_match_index, Optional<size_t> total_match_count) override;
-    virtual void did_request_refresh() override;
     virtual void did_request_cursor_change(Gfx::Cursor cursor) override;
     virtual void did_update_editing_history_state(bool can_undo, bool can_redo) override;
     virtual void did_set_text_fragment_indication_visibility(bool visible) override;
-    virtual void did_request_tooltip_override(Gfx::IntPoint position, ByteString title) override;
-    virtual void did_stop_tooltip_override() override;
     virtual void did_enter_tooltip_area(ByteString title) override;
     virtual void did_leave_tooltip_area() override;
     virtual void did_hover_link(URL::URL url) override;
@@ -258,10 +256,11 @@ private:
     virtual void did_request_dismiss_dialog() override;
     virtual void did_request_document_cookie_version_index(Web::HTML::EnvironmentId environment_id, i64 document_id, String domain) override;
     virtual void did_set_cookie(Optional<Web::HTML::EnvironmentId>, URL::URL, HTTP::Cookie::ParsedCookie, HTTP::Cookie::Source) override;
-    virtual void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) override;
+    void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls);
     Messages::WebContentClient::ConnectToStorageAreaResponse connect_to_storage_area(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id);
     virtual void did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
     virtual void did_consume_user_activation(Web::HTML::UserActivationConsumption consumption) override;
+    virtual void did_notify_about_user_activation(Web::HTML::CrossProcessId document_id) override;
     virtual void webdriver_user_prompt_handling_complete(u64 request_id, Web::WebDriver::Response response) override;
     virtual void webdriver_did_set_current_browsing_context(u64 command_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void webdriver_command_complete(u64 command_id, Web::WebDriver::Response response) override;
@@ -391,7 +390,6 @@ private:
     Messages::WebContentClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request);
     Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Web::HTML::EnvironmentId environment_id);
     virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message) override;
-    virtual void close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void rtc_transform_init(Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record) override;
     virtual void rtc_transform_teardown(Web::HTML::WorkerAgentId agent_id, u64 transform_id) override;
     virtual void rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) override;
@@ -410,6 +408,7 @@ private:
     Messages::WebContentTestClient::DidRequestTabIsHeardPlayingAudioForTestingResponse did_request_tab_is_heard_playing_audio_for_testing();
     Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResponse did_request_tab_audibility_change_count_for_testing();
     virtual void did_request_crash_of_remote_frame_processes_for_testing() override;
+    virtual void did_request_close_tab_for_testing() override;
     virtual void did_request_stop_loading_for_testing() override;
     virtual void did_request_reload_for_testing(bool bypass_cache) override;
     virtual void did_request_traverse_history_by_delta_for_testing(i32 delta) override;

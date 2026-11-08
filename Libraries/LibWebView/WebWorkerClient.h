@@ -19,11 +19,10 @@
 #include <LibWebCommon/HTML/WorkerAgentTypes.h>
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BrowsingSession.h>
-#include <LibWebView/ChildIdentity.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/RequestServerSiteBindings.h>
-#include <WebWorker/WebWorkerClientEndpoint.h>
-#include <WebWorker/WebWorkerServerEndpoint.h>
+#include <WebContent/WebWorkerClientEndpoint.h>
+#include <WebContent/WebWorkerServerEndpoint.h>
 
 namespace WebView {
 
@@ -39,22 +38,22 @@ public:
     RefPtr<BrowsingSession> session() const { return m_session.strong_ref(); }
     IsPrivate is_private() const { return m_is_private; }
 
-    // The site of the worker's origin, if it has one.
-    void set_site(Optional<Utf16String> site) { m_site = move(site); }
-
-    // The sites this process asked for the permissions of: at most its worker's top-level site.
+    // The sites this worker asked for the permissions of: at most its top-level site.
     Vector<URL::Origin> const& permission_origins() const { return m_permission_origins; }
     RequestServerSiteBindings& request_server_site_bindings() { return m_request_server_site_bindings; }
     void remove_blob_url_entries();
 
-    pid_t pid() const { return m_child_identity.pid; }
-    u64 child_id() const { return m_child_identity.child_id; }
-    void terminate_process();
+    // The process the worker's thread runs in.
+    u64 child_id() const { return m_host_child_id; }
+
+    // The WebContent process that runs this worker on a thread.
+    WebContentClient* host() const { return m_host.ptr(); }
+    void set_host(WebContentClient&);
 
     Optional<CanonicalEnvironmentSettingsObject const&> hosted_environment(Web::HTML::EnvironmentId const& environment_id) const;
-    void set_child_identity(ChildIdentity identity) { m_child_identity = identity; }
 
     virtual void did_close_worker() override;
+    virtual void did_close_shared_worker() override;
     virtual void did_finish_loading_worker_script(bool worker_is_secure_context) override;
     virtual void did_fail_loading_worker_script() override;
     virtual void did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
@@ -68,6 +67,8 @@ public:
     virtual Messages::WebWorkerClient::DidRequestPermissionSnapshotResponse did_request_permission_snapshot(URL::Origin top_level_origin) override;
     virtual Messages::WebWorkerClient::RequestMediaServerConnectionResponse request_media_server_connection() override;
     virtual Messages::WebWorkerClient::RequestImageDecoderConnectionResponse request_image_decoder_connection() override;
+    virtual void did_release_image_decoder() override;
+    virtual Messages::WebWorkerClient::RequestCompositorConnectionResponse request_compositor_connection() override;
     virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage) override;
     virtual Messages::WebWorkerClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request) override;
     virtual void close_worker_agent(Web::HTML::WorkerAgentId, Web::HTML::WorkerAgentOwnerToken) override;
@@ -79,16 +80,17 @@ private:
     virtual void die() override;
 
     IsPrivate m_is_private { IsPrivate::No };
-    Optional<Utf16String> m_site;
     WeakPtr<BrowsingSession> m_session;
     RequestServerSiteBindings m_request_server_site_bindings;
 
-    ChildIdentity m_child_identity;
+    u64 m_host_child_id { 0 };
+    WeakPtr<WebContentClient> m_host;
+    Optional<u64> m_image_decoder_client_generation;
     Web::HTML::WorkerAgentId m_agent_id { 0 };
     Vector<URL::Origin> m_permission_origins;
 
-    // The controller connections to the MediaServer and AudioServer spawned for this process, from its first media use
-    // until it exits.
+    // The controller connections to the MediaServer and AudioServer spawned for this worker, from its first media use
+    // until it ends.
     RefPtr<MediaClient::Client> m_media_server_client;
     RefPtr<AudioServerControlClient> m_audio_server_client;
     u64 m_audio_tab_id { 0 };

@@ -466,7 +466,6 @@ mod node_dump_tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -476,7 +475,6 @@ mod node_dump_tests {
                 None,
                 NO_SCROLL_STATE_SLOT,
                 NodeSlotId::INVALID,
-                scroll_node,
             )),
             scroll_node,
         );
@@ -502,7 +500,6 @@ mod node_dump_tests {
                 inset_left: None,
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: scroll_node,
             }),
             outer_sticky,
         );
@@ -681,7 +678,6 @@ mod section_dump_tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -689,7 +685,6 @@ mod section_dump_tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );

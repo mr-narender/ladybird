@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
+#include <AK/Diagnostics.h>
 #include <AK/HashMap.h>
-#include <AK/NeverDestroyed.h>
 #include <LibGC/Heap.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
@@ -34,8 +35,14 @@ GC_DEFINE_ALLOCATOR(WorkerAgentParent);
 
 static HashMap<WorkerAgentOwnerToken, GC::Ref<WorkerAgentParent>>& worker_agent_parents()
 {
-    static NeverDestroyed<HashMap<WorkerAgentOwnerToken, GC::Ref<WorkerAgentParent>>> map;
-    return *map;
+    using Parents = HashMap<WorkerAgentOwnerToken, GC::Ref<WorkerAgentParent>>;
+    // NB: Free what this thread kept when it exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local Parents map)
+#else
+    static thread_local Parents map;
+#endif
+    return map;
 }
 
 static void report_worker_exception(WindowOrWorkerGlobalScopeMixin& window_or_worker, ErrorEvent& error)
@@ -83,16 +90,19 @@ void WorkerAgentParent::start()
     m_message_port = MessagePort::create(realm);
     m_message_port->entangle_with(*m_outside_port);
 
-    auto data_holder = MUST(m_message_port->transfer_steps(realm));
+    // NB: A dedicated worker always runs in the process of its owner, and the browser process picks that of a shared one.
+    auto [data_holder, parked_end_token] = MUST(m_message_port->transfer_to_worker(realm,
+        m_agent_type == AgentType::DedicatedWorker ? MessagePort::WorkerMayBeInOtherProcess::No : MessagePort::WorkerMayBeInOtherProcess::Yes));
+    m_parked_end_token = parked_end_token;
 
     // FIXME: Specification says this supposed to happen in step 11 of onComplete handler defined in https://html.spec.whatwg.org/multipage/workers.html#run-a-worker
-    //        but that would require introducing a new IPC message type to communicate this from WebWorker to WebContent process,
+    //        but that would require introducing a new IPC message type to communicate this from the worker to its owner,
     //        so let's do it here for now.
     m_outside_port->enable();
 
     auto serialized_outside_settings = m_outside_settings->serialize();
 
-    // The worker process has no display connection of its own, so capture the spawning page's
+    // A worker has no display connection of its own, so capture the spawning page's
     // rendering rate to let the worker pace its rendering updates to match.
     auto maximum_frames_per_second = [&]() -> double {
         auto& global = m_outside_settings->global_object();
@@ -121,10 +131,20 @@ void WorkerAgentParent::start()
         .owner_token = m_owner_token,
     };
 
-    // NOTE: This blocking IPC call may launch another process.
+    // NB: This blocking IPC call may launch another process.
     //    If spinning the event loop for this can cause other javascript to execute, we're in trouble.
     worker_agent_parents().set(m_owner_token, *this);
-    m_agent_id = Bindings::principal_host_defined_page(realm).client().start_worker_agent(move(request));
+    auto started_agent = Bindings::principal_host_defined_page(realm).client().start_worker_agent(move(request));
+    m_agent_id = started_agent.agent_id;
+
+    // NB: This is before any script can use the port, so that it finds out right now whether its peer is in this process.
+    if (!started_agent.is_hosted_in_this_process)
+        give_up_on_parked_end();
+}
+
+void WorkerAgentParent::give_up_on_parked_end()
+{
+    MessagePort::give_up_on_parked_end(exchange(m_parked_end_token, 0));
 }
 
 void WorkerAgentParent::did_fail_loading_worker_script(WorkerAgentOwnerToken owner_token)
@@ -184,6 +204,7 @@ void WorkerAgentParent::terminate()
 void WorkerAgentParent::forget_agent()
 {
     m_agent_id = 0;
+    give_up_on_parked_end();
     worker_agent_parents().remove(m_owner_token);
     m_outside_settings->remove_owned_worker_agent(*this);
 }
@@ -230,8 +251,8 @@ void WorkerAgentParent::dispatch_worker_exception(Utf16String message, Utf16Stri
     }));
 }
 
-// NB: The worker fetches its script with outside settings as the request's client, from a snapshot of it in the
-//     worker's process. The violations of its policies are reported here, where outside settings' global object is.
+// NB: The worker fetches its script with outside settings as the request's client, from a snapshot of it on the
+//     worker's thread. The violations of its policies are reported here, where outside settings' global object is.
 void WorkerAgentParent::report_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource)
 {
     // NB: A worker's script requests can violate only worker-src, and a module worker's json and text imports
@@ -244,8 +265,9 @@ void WorkerAgentParent::report_content_security_policy_violation(u64 policy_inde
 
 WorkerAgentOwnerToken WorkerAgentParent::next_owner_token()
 {
-    static WorkerAgentOwnerToken s_next_owner_token = 0;
-    return ++s_next_owner_token;
+    // NB: The client of the owner tells workers apart by their tokens, so these stay unique across the agents of a process.
+    static Atomic<WorkerAgentOwnerToken, AK::MemoryOrder::memory_order_relaxed> s_next_owner_token = 0;
+    return s_next_owner_token.fetch_add(1) + 1;
 }
 
 void WorkerAgentParent::finalize()

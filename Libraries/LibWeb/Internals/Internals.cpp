@@ -17,6 +17,7 @@
 #include <LibCompositing/Scrolling/AsyncScrollTree.h>
 #include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/System.h>
 #include <LibCore/TimeZone.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
@@ -421,6 +422,11 @@ void Internals::gc()
     window().principal_realm().vm().heap().collect_garbage();
 }
 
+u32 Internals::worker_agent_count() const
+{
+    return Bindings::worker_agent_count();
+}
+
 void Internals::gc_async(GC::Ref<WebIDL::Promise> promise)
 {
     // Queue a LibCore event to run the collection, so that it runs outside the JS execution context with as small a
@@ -523,6 +529,16 @@ WebIDL::UnsignedLongLong Internals::html_collection_cache_generation(DOM::HTMLCo
 void Internals::fail_next_message_port_transfer(HTML::MessagePort& port)
 {
     port.fail_next_transfer_for_testing();
+}
+
+String Internals::message_port_entanglement_kind(HTML::MessagePort& port)
+{
+    return MUST(String::from_utf8(port.entanglement_kind_for_testing()));
+}
+
+bool Internals::message_port_transport_is_closed(HTML::MessagePort& port)
+{
+    return port.transport_is_closed_for_testing();
 }
 
 bool Internals::message_ports_are_directly_entangled(HTML::MessagePort& first, HTML::MessagePort& second)
@@ -2372,6 +2388,22 @@ Utf16String Internals::dump_site_isolation_process_tree()
 void Internals::crash_remote_frame_processes()
 {
     window().associated_document().page().client().crash_remote_frame_processes_for_testing();
+}
+
+i32 Internals::web_content_process_id()
+{
+    return Core::System::getpid();
+}
+
+u32 Internals::document_count_in_this_process()
+{
+    auto documents = HTML::main_thread_event_loop().documents_in_this_event_loop_matching([](auto const&) { return true; });
+    return documents.size();
+}
+
+void Internals::close_tab_through_ui_process()
+{
+    window().associated_document().page().client().close_tab_for_testing();
 }
 
 void Internals::stop_loading_through_ui_process()

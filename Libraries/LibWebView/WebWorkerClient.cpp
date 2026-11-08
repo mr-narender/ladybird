@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCore/Process.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/AudioServerControlClient.h>
 #include <LibWebView/BlobURLStore.h>
@@ -15,8 +14,9 @@
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/ImageDecoderManager.h>
 #include <LibWebView/PermissionManager.h>
+#include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebWorkerClient.h>
-#include <LibWebView/WorkerProcessManager.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 namespace WebView {
 
@@ -38,54 +38,66 @@ WebWorkerClient::~WebWorkerClient()
     remove_blob_url_entries();
 }
 
-void WebWorkerClient::did_misbehave(StringView message_name, StringView reason)
+void WebWorkerClient::set_host(WebContentClient& host)
 {
-    dbgln("WebWorkerClient: terminating helper process {}: {} rejected: {}", pid(), message_name, reason);
-    terminate_process();
-    shutdown();
+    m_host = host;
+    m_host_child_id = host.child_id();
 }
 
-void WebWorkerClient::terminate_process()
+void WebWorkerClient::did_misbehave(StringView message_name, StringView reason)
 {
-    (void)Application::process_manager().terminate_child(child_id(), Core::Process::TerminationMode::Forceful);
+    // NB: A worker on a thread is one trust domain with its process, so all of that goes.
+    if (auto host = m_host.strong_ref()) {
+        host->did_misbehave(message_name, reason);
+        shutdown();
+        return;
+    }
+    shutdown();
 }
 
 void WebWorkerClient::die()
 {
     remove_blob_url_entries();
-    WorkerProcessManager::the().worker_did_die(m_agent_id);
+    WorkerAgentManager::the().worker_did_die(m_agent_id);
 
-    // NB: A worker whose connection is gone does no more work, so a process that outlives its connection is ended.
-    terminate_process();
-    WorkerProcessManager::the().worker_process_did_exit(*this);
+    // NB: The process of a worker on a thread goes on, and so may its use of the decoder.
+    if (m_image_decoder_client_generation.has_value())
+        ImageDecoderManager::the().process_did_release_decoder(child_id(), *m_image_decoder_client_generation);
+
+    WorkerAgentManager::the().worker_thread_did_exit(*this);
 
     // Otherwise nested workers we own would outlive us, in violation of the HTML spec.
-    WorkerProcessManager::the().remove_web_worker_owner(*this);
+    WorkerAgentManager::the().remove_web_worker_owner(*this);
 }
 
 void WebWorkerClient::did_close_worker()
 {
-    WorkerProcessManager::the().worker_did_close(m_agent_id);
+    WorkerAgentManager::the().worker_did_close(m_agent_id);
+}
+
+void WebWorkerClient::did_close_shared_worker()
+{
+    WorkerAgentManager::the().shared_worker_did_close(m_agent_id);
 }
 
 void WebWorkerClient::did_finish_loading_worker_script(bool worker_is_secure_context)
 {
-    WorkerProcessManager::the().worker_did_finish_loading_script(m_agent_id, worker_is_secure_context);
+    WorkerAgentManager::the().worker_did_finish_loading_script(m_agent_id, worker_is_secure_context);
 }
 
 void WebWorkerClient::did_fail_loading_worker_script()
 {
-    WorkerProcessManager::the().worker_did_fail_loading_script(m_agent_id);
+    WorkerAgentManager::the().worker_did_fail_loading_script(m_agent_id);
 }
 
 void WebWorkerClient::did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno)
 {
-    WorkerProcessManager::the().worker_did_report_exception(m_agent_id, move(message), move(filename), lineno, colno);
+    WorkerAgentManager::the().worker_did_report_exception(m_agent_id, move(message), move(filename), lineno, colno);
 }
 
 void WebWorkerClient::did_report_outside_settings_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource)
 {
-    WorkerProcessManager::the().worker_did_report_outside_settings_content_security_policy_violation(m_agent_id, policy_index, move(effective_directive), move(resource));
+    WorkerAgentManager::the().worker_did_report_outside_settings_content_security_policy_violation(m_agent_id, policy_index, move(effective_directive), move(resource));
 }
 
 void WebWorkerClient::remove_blob_url_entries()
@@ -94,10 +106,10 @@ void WebWorkerClient::remove_blob_url_entries()
         session->blob_url_store->remove_entries_added_by(WeakPtr<WebWorkerClient> { *this });
 }
 
-// The environment a worker process names is its worker's.
+// The environment a worker names is its own.
 Optional<CanonicalEnvironmentSettingsObject const&> WebWorkerClient::hosted_environment(Web::HTML::EnvironmentId const& environment_id) const
 {
-    auto inside_settings = WorkerProcessManager::the().inside_settings(m_agent_id);
+    auto inside_settings = WorkerAgentManager::the().inside_settings(m_agent_id);
     if (!inside_settings.has_value() || inside_settings->id() != environment_id)
         return {};
     return *inside_settings;
@@ -110,7 +122,7 @@ Messages::WebWorkerClient::DidRequestPermissionSnapshotResponse WebWorkerClient:
     if (!session)
         return Web::Permissions::PermissionSnapshot {};
 
-    auto worker_top_level_origin = WorkerProcessManager::the().top_level_origin(m_agent_id);
+    auto worker_top_level_origin = WorkerAgentManager::the().top_level_origin(m_agent_id);
     if (worker_top_level_origin.has_value() && worker_top_level_origin->is_same_origin(top_level_origin) && !top_level_origin.is_opaque() && !m_permission_origins.contains_slow(top_level_origin))
         m_permission_origins.append(top_level_origin);
     return session->permission_manager->snapshot_for(m_permission_origins);
@@ -124,7 +136,7 @@ Messages::WebWorkerClient::DidRequestCookieResponse WebWorkerClient::did_request
         return HTTP::Cookie::VersionedCookie {};
     }
 
-    auto inside_settings = WorkerProcessManager::the().inside_settings(m_agent_id);
+    auto inside_settings = WorkerAgentManager::the().inside_settings(m_agent_id);
     if (!inside_settings.has_value() || !inside_settings->may_use_cookies_of(url))
         return HTTP::Cookie::VersionedCookie {};
 
@@ -168,7 +180,7 @@ Messages::WebWorkerClient::DidRequestBlobUrlEntryResponse WebWorkerClient::did_r
 
 void WebWorkerClient::did_request_file(ByteString path, i32 request_id)
 {
-    WorkerProcessManager::the().worker_did_request_file(m_agent_id, move(path), request_id);
+    WorkerAgentManager::the().worker_did_request_file(m_agent_id, move(path), request_id);
 }
 
 Messages::WebWorkerClient::DidIsKnownHstsHostResponse WebWorkerClient::did_is_known_hsts_host(String domain)
@@ -182,7 +194,7 @@ Messages::WebWorkerClient::RequestMediaServerConnectionResponse WebWorkerClient:
     auto connection = connect_new_media_server_client(m_media_server_client, child_id(), [weak_self = make_weak_ptr<WebWorkerClient>()]() -> ErrorOr<IPC::TransportHandle> {
         auto self = weak_self.strong_ref();
         if (!self)
-            return Error::from_string_literal("The worker process is gone");
+            return Error::from_string_literal("The worker is gone");
         TRY(ensure_audio_server_is_running(self->m_audio_server_client, self->child_id()));
         return connect_new_audio_server_client(*self->m_audio_server_client, self->m_audio_tab_id);
     });
@@ -195,29 +207,50 @@ Messages::WebWorkerClient::RequestMediaServerConnectionResponse WebWorkerClient:
 
 Messages::WebWorkerClient::RequestImageDecoderConnectionResponse WebWorkerClient::request_image_decoder_connection()
 {
-    return ImageDecoderManager::the().connect_requesting_process(child_id(), session(), m_site);
+    // NB: A thread is part of its process, and what the decoder of a process may see goes by all that the process hosts.
+    auto host = m_host.strong_ref();
+    if (!host)
+        return Optional<IPC::TransportHandle> {};
+    return host->connect_new_image_decoder_client(m_image_decoder_client_generation);
+}
+
+void WebWorkerClient::did_release_image_decoder()
+{
+    if (auto generation = exchange(m_image_decoder_client_generation, {}); generation.has_value())
+        ImageDecoderManager::the().process_did_release_decoder(child_id(), *generation);
+}
+
+Messages::WebWorkerClient::RequestCompositorConnectionResponse WebWorkerClient::request_compositor_connection()
+{
+    auto handle = Application::the().connect_new_compositor_canvas_client();
+    if (handle.is_error()) {
+        warnln("Unable to connect a worker to the compositor: {}", handle.error());
+        return Optional<IPC::TransportHandle> {};
+    }
+    return handle.release_value();
 }
 
 void WebWorkerClient::did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message)
 {
     if (auto settings = hosted_environment(message.environment_id); settings.has_value())
-        WorkerProcessManager::the().post_broadcast_channel_message(move(message), *settings, pid(), m_is_private);
+        WorkerAgentManager::the().post_broadcast_channel_message(move(message), *settings, *this, m_is_private);
 }
 
 Messages::WebWorkerClient::StartWorkerAgentResponse WebWorkerClient::start_worker_agent(Web::HTML::WorkerAgentStartRequest request)
 {
     auto outside_settings = hosted_environment(request.outside_settings.id);
-    return WorkerProcessManager::the().start_worker_agent(*this, outside_settings, move(request));
+    auto started_agent = WorkerAgentManager::the().start_worker_agent(*this, outside_settings, move(request));
+    return { started_agent.agent_id, move(started_agent.thread_transport), started_agent.is_hosted_in_owner_process };
 }
 
 void WebWorkerClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
 {
-    WorkerProcessManager::the().close_worker_agent(*this, agent_id, owner_token);
+    WorkerAgentManager::the().close_worker_agent(*this, agent_id, owner_token);
 }
 
 void WebWorkerClient::rtc_transform_encoded_audio_frame_written(u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
 {
-    WorkerProcessManager::the().worker_did_write_rtc_transform_encoded_audio_frame(m_agent_id, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
+    WorkerAgentManager::the().worker_did_write_rtc_transform_encoded_audio_frame(m_agent_id, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 }

@@ -29,6 +29,10 @@ interface Internals {
     DOMString setTimeZone(DOMString timeZone);
 
     undefined gc();
+
+    // How many worker agents are alive in this process. One that a worker's owner let go of still counts until its
+    // thread has shut it down.
+    unsigned long workerAgentCount();
     [CreatesPromise] Promise<undefined> gcAsync();
     // Discards every decoded image frame that can be decoded again, and returns how many were discarded.
     unsigned long long discardDecodedImageFrames();
@@ -42,6 +46,9 @@ interface Internals {
     unsigned long long htmlCollectionCacheGeneration(HTMLCollection collection);
     undefined failNextMessagePortTransfer(MessagePort port);
     boolean messagePortsAreDirectlyEntangled(MessagePort first, MessagePort second);
+    DOMString messagePortEntanglementKind(MessagePort port);
+    // True once the transport of the port closed, as it does when the port sees that its peer went.
+    boolean messagePortTransportIsClosed(MessagePort port);
     XMLHttpRequest createXMLHttpRequestForDocument(Document document);
     [ImplementedAs=hit_test_result] object hitTest(double x, double y);
     object? takeContextMenuRequest();
@@ -268,6 +275,11 @@ interface Internals {
     // Whether the canvas drew content that it has not presented to the compositor yet.
     boolean canvasHasUnpresentedContent(HTMLCanvasElement canvas);
     undefined crashRemoteFrameProcesses();
+    long webContentProcessId();
+    // The documents this process has not collected yet, whether or not they are still displayed.
+    unsigned long documentCountInThisProcess();
+    // Closes this tab as the browser's close button does when it has no beforeunload check to run.
+    undefined closeTabThroughUIProcess();
     // Stops loading and reloads as the browser's Stop and Reload buttons do.
     undefined stopLoadingThroughUIProcess();
     undefined reloadThroughUIProcess();

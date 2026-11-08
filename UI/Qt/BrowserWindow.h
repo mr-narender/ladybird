@@ -293,6 +293,7 @@ private:
     void initialize_application_menu();
     void initialize_ladybird_menu();
     QAction* create_ladybird_menu_zoom_row();
+    void update_ladybird_menu_zoom_icons();
     void update_ladybird_menu_zoom_level();
     void initialize_window_context_menu();
 
@@ -332,12 +333,15 @@ private:
     QToolButton* m_menu_bar_close_window_button { nullptr };
 
     QMenu* m_ladybird_menu { nullptr };
+    QWidget* m_ladybird_menu_zoom_row { nullptr };
+    QPushButton* m_ladybird_menu_zoom_out { nullptr };
     QPushButton* m_ladybird_menu_zoom_level { nullptr };
+    QPushButton* m_ladybird_menu_zoom_in { nullptr };
 
     QMenu* m_window_context_menu { nullptr };
     QAction* m_reopen_closed_tab_action { nullptr };
     QAction* m_always_on_top_action { nullptr };
-    QAction* m_toggle_vertical_tabs_action { nullptr };
+    QActionGroup* m_tab_layout_actions { nullptr };
 
     IsPopupWindow m_is_popup_window { IsPopupWindow::No };
 

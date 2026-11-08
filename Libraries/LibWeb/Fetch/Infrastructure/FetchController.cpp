@@ -77,7 +77,7 @@ void FetchController::set_original_fetch_params(Badge<FetchParams>, FetchParams 
 
 void FetchController::report_webdriver_bidi_fetch_error(StringView error_text) const
 {
-    if (!WebDriver::BiDi::g_network_events_enabled)
+    if (!WebDriver::BiDi::network_events_enabled())
         return;
     if (auto fetch_params = m_original_fetch_params.strong_ref())
         WebDriver::BiDi::network_fetch_error(*fetch_params, error_text);
@@ -222,7 +222,7 @@ void FetchController::stop_fetch()
     //         cancelling any queued fetch tasks and then ignoring any callbacks.
     auto ongoing_fetch_tasks = move(m_ongoing_fetch_tasks);
 
-    HTML::main_thread_event_loop().task_queue().remove_tasks_matching([&](auto const& task) {
+    HTML::current_event_loop().task_queue().remove_tasks_matching([&](auto const& task) {
         return ongoing_fetch_tasks.remove_all_matching([&](u64, HTML::TaskID task_id) {
             return task.id() == task_id;
         });

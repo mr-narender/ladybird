@@ -86,6 +86,8 @@ pub(crate) mod domurl;
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
 pub(crate) mod encoding;
+#[cfg(not(test))]
+pub(crate) mod fetch;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
@@ -207,6 +209,11 @@ pub(crate) mod webrtc;
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
 pub(crate) mod xhr;
+
+#[cfg(not(test))]
+#[cfg_attr(not(web_idl_bindings), allow(dead_code))]
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) mod web_audio;
 
 // The generators of the build script, whose tests run with those of the crate.
 #[cfg(test)]
