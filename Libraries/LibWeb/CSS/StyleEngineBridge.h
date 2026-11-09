@@ -54,10 +54,11 @@ void style_engine_set_text_is_ascii_whitespace(DocumentHost const*, StyleNodeID 
 void style_engine_set_node_dom_paint_facts(DocumentHost const*, StyleNodeID node, u8 facts);
 void style_engine_set_element_unique_node_id(DocumentHost const*, StyleNodeID node, u64 unique_node_id);
 void style_engine_set_element_table_spans(DocumentHost const*, StyleNodeID node, u32 column_span, u32 row_span);
+void style_engine_set_element_frameset_layout(DocumentHost const*, StyleNodeID node, ReadonlySpan<FfiFrameSetDimension> columns, ReadonlySpan<FfiFrameSetDimension> rows, ReadonlySpan<FfiFrameSetBorder> borders, u32 border_thickness);
 void style_engine_set_element_id_name(DocumentHost const*, StyleNodeID node, StyleAtomID name);
 void style_engine_set_shadow_root(DocumentHost const*, StyleNodeID shadow_host, StyleNodeID shadow_root);
 void style_engine_record_environment_change(DocumentHost const*, u8 changes);
-void style_engine_record_custom_property_registration_change(DocumentHost const*, StyleAtomID name);
+void style_engine_record_custom_property_registration_change(DocumentHost const*);
 void style_engine_flush(DocumentHost const*);
 void style_engine_finish_sheet_rules_replacement(DocumentHost const*, SheetID sheet, u32 declaration_block);
 void style_engine_attach_sheet(DocumentHost const*, SheetID sheet, TreeScopeID tree_scope, SheetID before_sheet);
@@ -225,8 +226,6 @@ public:
     StyleAtomID intern_atom(Utf16FlyString const&);
     // Counts the reclaims of this document's atoms, so a cache keyed by atoms can tell when one may have been reused.
     [[nodiscard]] u64 atom_generation() const;
-    // Moves a node's record to the environment its inherited custom-property data was refreshed
-    // to; the record the host holds for the new one, or null when nothing moved.
     // What a read of an element's style, or one of its pseudo-elements', made before the next style update asks of
     // the style engine, and the pseudo-element a demand may read.
     using RecordDemand = StyleEngineFFI::FfiRecordDemand;

@@ -1136,6 +1136,22 @@ impl Store {
         unsafe { TagAddress::from_ptr(identity as *const TagInstance) }
     }
 
+    /// How the collector follows a value of a type of this store, as one of the TRACE_* kinds of heap.rs.
+    pub fn trace_of(&self, ty: ValType) -> u8 {
+        gc::trace_of(ty, &self.types)
+    }
+
+    /// Whether a type is one of this store, which a concrete type is if it names an identity of the store.
+    pub fn knows_type(&self, ty: ValType) -> bool {
+        match ty {
+            ValType::Ref(RefType {
+                heap: HeapType::Concrete(identity),
+                ..
+            }) => (identity as usize) < self.types.len(),
+            _ => true,
+        }
+    }
+
     pub fn function_reference(&self, address: FunctionAddress) -> u64 {
         address.as_ptr() as u64
     }

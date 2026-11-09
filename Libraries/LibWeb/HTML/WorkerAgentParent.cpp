@@ -131,11 +131,27 @@ void WorkerAgentParent::start()
         .owner_token = m_owner_token,
     };
 
+    worker_agent_parents().set(m_owner_token, *this);
+    auto& page_client = Bindings::principal_host_defined_page(realm).client();
+
+    if (m_agent_type == AgentType::DedicatedWorker) {
+        m_dedicated_worker_thread_link = page_client.start_dedicated_worker(move(request));
+        if (!m_dedicated_worker_thread_link) {
+            dispatch_error_event();
+            forget_agent();
+        }
+        return;
+    }
+
     // NB: This blocking IPC call may launch another process.
     //    If spinning the event loop for this can cause other javascript to execute, we're in trouble.
-    worker_agent_parents().set(m_owner_token, *this);
-    auto started_agent = Bindings::principal_host_defined_page(realm).client().start_worker_agent(move(request));
+    auto started_agent = page_client.start_worker_agent(move(request));
     m_agent_id = started_agent.agent_id;
+    if (m_agent_id == 0) {
+        dispatch_error_event();
+        forget_agent();
+        return;
+    }
 
     // NB: This is before any script can use the port, so that it finds out right now whether its peer is in this process.
     if (!started_agent.is_hosted_in_this_process)
@@ -193,6 +209,12 @@ void WorkerAgentParent::did_worker_agent_die(WorkerAgentOwnerToken owner_token)
 
 void WorkerAgentParent::terminate()
 {
+    if (auto dedicated_worker_thread_link = m_dedicated_worker_thread_link) {
+        forget_agent();
+        dedicated_worker_thread_link->terminate();
+        return;
+    }
+
     if (m_agent_id == 0)
         return;
 
@@ -204,6 +226,7 @@ void WorkerAgentParent::terminate()
 void WorkerAgentParent::forget_agent()
 {
     m_agent_id = 0;
+    m_dedicated_worker_thread_link = nullptr;
     give_up_on_parked_end();
     worker_agent_parents().remove(m_owner_token);
     m_outside_settings->remove_owned_worker_agent(*this);
@@ -216,7 +239,7 @@ void WorkerAgentParent::dispatch_error_event()
     auto outside_global_object = GC::Ref { m_outside_settings->global_object() };
     auto event_target = GC::Ref { *m_worker_event_target };
     queue_global_task(Task::Source::DOMManipulation, *outside_global_object,
-        GC::create_function(GC::Heap::the(), [event_target, outside_global_object] {
+        GC::create_function(GC::Heap::the(), GC::captures(event_target, outside_global_object), [](auto& event_target, auto& outside_global_object) {
             event_target->dispatch_event(DOM::Event::create(
                 EventNames::error,
                 HighResolutionTime::current_high_resolution_time(*outside_global_object)));
@@ -227,8 +250,8 @@ void WorkerAgentParent::dispatch_worker_exception(Utf16String message, Utf16Stri
 {
     // https://html.spec.whatwg.org/multipage/webappapis.html#report-an-exception
     // 7.2: If global implements DedicatedWorkerGlobalScope, queue a global task on the DOM manipulation task source with the global's associated Worker's relevant global object to run these steps:
-    queue_global_task(Task::Source::DOMManipulation, m_outside_settings->global_object(), GC::create_function(GC::Heap::the(), [this, message = move(message), filename = move(filename), lineno, colno]() {
-        auto& realm = m_outside_settings->realm();
+    queue_global_task(Task::Source::DOMManipulation, m_outside_settings->global_object(), GC::create_function(GC::Heap::the(), GC::captures(*this, move(message), move(filename), lineno, colno), [](WorkerAgentParent& self, Utf16String& message, Utf16String& filename, u32 lineno, u32 colno) {
+        auto& realm = self.m_outside_settings->realm();
 
         // 2. Set notHandled to the result of firing an event named error at workerObject, using ErrorEvent, with the
         //    cancelable attribute initialized to true, and additional attributes initialized according to errorInfo.
@@ -240,11 +263,11 @@ void WorkerAgentParent::dispatch_worker_exception(Utf16String message, Utf16Stri
         event_init.colno = colno;
         event_init.error = JS::js_null();
         auto error = ErrorEvent::create(EventNames::error, event_init, HighResolutionTime::current_high_resolution_time(realm.global_object()));
-        bool not_handled = m_worker_event_target->dispatch_event(error);
+        bool not_handled = self.m_worker_event_target->dispatch_event(error);
 
         // 3. If notHandled is true, then report exception for workerObject's relevant global object with omitError set to true.
         if (not_handled) {
-            auto* window_or_worker = window_or_worker_global_scope_from_global_object(m_outside_settings->global_object());
+            auto* window_or_worker = window_or_worker_global_scope_from_global_object(self.m_outside_settings->global_object());
             VERIFY(window_or_worker);
             report_worker_exception(*window_or_worker, error);
         }
@@ -277,7 +300,7 @@ void WorkerAgentParent::finalize()
     worker_agent_parents().remove(m_owner_token);
 
     if (!heap().is_collecting_everything())
-        VERIFY(m_agent_id == 0);
+        VERIFY(m_agent_id == 0 && !m_dedicated_worker_thread_link);
 }
 
 void WorkerAgentParent::visit_edges(Cell::Visitor& visitor)
@@ -291,24 +314,25 @@ void WorkerAgentParent::visit_edges(Cell::Visitor& visitor)
 
 void WorkerAgentParent::rtc_transform_init(u64 transform_id, SerializedTransferRecord options_record)
 {
-    if (m_agent_id == 0)
+    if (!m_dedicated_worker_thread_link)
         return;
-    Bindings::principal_host_defined_page(m_outside_settings->realm()).client().rtc_transform_init(m_agent_id, transform_id, move(options_record));
+    options_record.serialized.same_agent_side_table = nullptr;
+    m_dedicated_worker_thread_link->rtc_transform_init(transform_id, move(options_record));
 }
 
 void WorkerAgentParent::rtc_transform_teardown(u64 transform_id)
 {
     m_transform_frame_callbacks.remove(transform_id);
-    if (m_agent_id == 0)
+    if (!m_dedicated_worker_thread_link)
         return;
-    Bindings::principal_host_defined_page(m_outside_settings->realm()).client().rtc_transform_teardown(m_agent_id, transform_id);
+    m_dedicated_worker_thread_link->rtc_transform_teardown(transform_id);
 }
 
 void WorkerAgentParent::rtc_transform_encoded_audio_frame(u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
 {
-    if (m_agent_id == 0)
+    if (!m_dedicated_worker_thread_link)
         return;
-    Bindings::principal_host_defined_page(m_outside_settings->realm()).client().rtc_transform_encoded_audio_frame(m_agent_id, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
+    m_dedicated_worker_thread_link->rtc_transform_encoded_audio_frame(transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 void WorkerAgentParent::register_transform_frame_callback(u64 transform_id, TransformFrameWrittenCallback callback)

@@ -14,6 +14,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16StringBuilder.h>
 #include <LibAudio/OutputSession.h>
+#include <LibAudio/RecordStream.h>
 #include <LibCore/Process.h>
 #include <LibCore/Timer.h>
 #include <LibDevTools/IndexedDBSerialization.h>
@@ -409,14 +410,14 @@ void PageClient::run_navigation_unload_check(Web::HTML::CrossProcessId navigable
         return;
     }
 
-    navigable->run_navigation_unload_check(navigation_id, unload_prompt_shown, GC::create_function(navigable->heap(), [this, navigable = GC::Ref { *navigable }, navigable_id, navigation_id](bool should_continue) {
+    navigable->run_navigation_unload_check(navigation_id, unload_prompt_shown, GC::create_function(navigable->heap(), GC::captures(*this, GC::Ref { *navigable }, navigable_id, navigation_id), [](auto& self, auto& navigable, auto& navigable_id, auto& navigation_id, bool should_continue) {
         // The UI process retained the pending entry at admission; a passed check only needs the signal.
         if (!should_continue) {
             navigable->resume_navigation_params_creation(navigation_id, {});
-            client().async_did_fail_navigation_population(m_id, navigable_id, navigation_id);
+            self.client().async_did_fail_navigation_population(self.m_id, navigable_id, navigation_id);
             return;
         }
-        client().async_did_complete_navigation_unload_check(m_id, navigable_id, navigation_id);
+        self.client().async_did_complete_navigation_unload_check(self.m_id, navigable_id, navigation_id);
     }));
 }
 
@@ -803,7 +804,7 @@ void PageClient::frame_timer_fired()
         // Defer the fallback once so an arrived reply is handled first, while a genuinely lost reply still falls back
         // on the next event-loop dispatch.
         auto watchdog_deadline = m_compositor_watchdog_deadline;
-        Web::Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [page_client = GC::Ref { *this }, watchdog_deadline] {
+        Web::Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *this }, watchdog_deadline), [](auto& page_client, auto& watchdog_deadline) {
             if (!page_client->m_compositor_rendering_opportunity_outstanding)
                 return;
             if (page_client->m_compositor_watchdog_deadline != watchdog_deadline)
@@ -1053,9 +1054,9 @@ void PageClient::page_did_finish_loading(Web::HTML::CrossProcessId navigable_id,
     client().async_did_finish_loading(m_id, navigable_id, document_id);
 }
 
-Optional<u64> PageClient::page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const& url, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
+Optional<u64> PageClient::page_did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const& url, ByteString const& suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
 {
-    auto response = client().send_sync<Messages::WebContentClient::DidStartDownload>(m_id, navigable_id, navigation_id, url, suggested_filename, total_size, request_server_client_id, request_server_request_id, move(initial_data), move(network_response));
+    auto response = client().send_sync<Messages::WebContentClient::DidStartDownload>(m_id, navigable_id, navigation_id, url, suggested_filename, total_size, same_site_context, request_server_client_id, request_server_request_id, move(initial_data), move(network_response));
     return response->download_id();
 }
 
@@ -1224,8 +1225,8 @@ void PageClient::page_did_set_browser_zoom(double factor)
     m_pending_browser_zoom = WebView::clamp_zoom_level(factor);
     client().async_did_set_browser_zoom(m_id, factor);
     auto& event_loop = Web::HTML::main_thread_event_loop();
-    event_loop.spin_until(GC::create_function(GC::Heap::the(), [this]() {
-        return !m_pending_browser_zoom.has_value() || !is_connection_open();
+    event_loop.spin_until(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        return !self.m_pending_browser_zoom.has_value() || !self.is_connection_open();
     }));
 }
 
@@ -1239,8 +1240,8 @@ void PageClient::page_did_set_device_pixel_ratio_for_testing(double ratio)
         return;
     m_pending_device_pixel_ratio_for_testing = ratio;
     client().async_did_set_device_pixel_ratio_for_testing(m_id, ratio);
-    Web::HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), [this]() {
-        return !m_pending_device_pixel_ratio_for_testing.has_value() || !is_connection_open();
+    Web::HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        return !self.m_pending_device_pixel_ratio_for_testing.has_value() || !self.is_connection_open();
     }));
 }
 
@@ -1955,6 +1956,32 @@ bool PageClient::page_did_request_tab_is_heard_playing_audio_for_testing()
     return false;
 }
 
+bool PageClient::page_did_request_tab_is_using_microphone_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        return test_connection->did_request_tab_is_using_microphone_for_testing(m_id);
+    return false;
+}
+
+bool PageClient::page_did_request_tab_is_capturing_audio_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        return test_connection->did_request_tab_is_capturing_audio_for_testing(m_id);
+    return false;
+}
+
+void PageClient::page_did_report_audio_capture_for_testing(Web::PageId labelled_page_id, bool capturing)
+{
+    if (auto* test_connection = client().test_connection())
+        (void)test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::ReportAudioCaptureForTesting>(m_id, labelled_page_id, capturing);
+}
+
+void PageClient::page_did_retire_picture_in_picture_window_for_testing()
+{
+    if (auto* test_connection = client().test_connection())
+        (void)test_connection->send_sync_but_allow_failure<Messages::WebContentTestClient::RetirePictureInPictureWindowForTesting>(m_id);
+}
+
 u64 PageClient::page_did_request_tab_audibility_change_count_for_testing()
 {
     if (auto* test_connection = client().test_connection())
@@ -2025,28 +2052,28 @@ bool PageClient::page_did_request_restore_session_history_snapshot_for_testing()
     return false;
 }
 
-bool PageClient::page_did_request_register_session_store_tab_for_testing()
+bool PageClient::page_did_request_record_reported_session_history_for_testing()
 {
     if (auto* test_connection = client().test_connection())
-        return test_connection->did_request_register_session_store_tab_for_testing(m_id);
+        return test_connection->did_request_record_reported_session_history_for_testing(m_id);
     return false;
 }
 
-String PageClient::page_did_request_session_store_tab_state_for_testing()
+String PageClient::page_did_request_reported_session_history_for_testing()
 {
     if (auto* test_connection = client().test_connection())
-        return test_connection->did_request_session_store_tab_state_for_testing(m_id);
+        return test_connection->did_request_reported_session_history_for_testing(m_id);
     return "{}"_string;
 }
 
 void PageClient::run_webdriver_user_prompt_handling(u64 request_id)
 {
     Web::WebDriver::handle_any_user_prompts(page(),
-        GC::create_function(heap(), [this, request_id](Optional<Web::WebDriver::Error> error) {
+        GC::create_function(heap(), GC::captures(*this, request_id), [](auto& self, auto& request_id, Optional<Web::WebDriver::Error> error) {
             auto response = error.has_value()
                 ? Web::WebDriver::Response { error.release_value() }
                 : Web::WebDriver::Response { JsonValue {} };
-            client().async_webdriver_user_prompt_handling_complete(m_id, request_id, move(response));
+            self.client().async_webdriver_user_prompt_handling_complete(self.m_id, request_id, move(response));
         }));
 }
 
@@ -2116,14 +2143,24 @@ void PageClient::page_did_change_background_color(Gfx::Color color)
     client().async_did_change_background_color(m_id, color);
 }
 
-void PageClient::page_did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem const& item, StringView presentation_style)
+void PageClient::page_did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem const& item, StringView presentation_style, Optional<Web::HTML::CrossProcessId> writing_document_id)
 {
-    client().async_did_insert_clipboard_item(m_id, item, presentation_style);
+    client().async_did_insert_clipboard_item(m_id, item, presentation_style, writing_document_id);
 }
 
-void PageClient::page_did_request_clipboard_entries(u64 request_id)
+void PageClient::page_did_request_clipboard_entries_for_paste(u64 request_id)
 {
-    client().async_did_request_clipboard_entries(m_id, request_id);
+    client().async_did_request_clipboard_entries_for_paste(m_id, request_id);
+}
+
+void PageClient::page_did_request_clipboard_entries(u64 request_id, Web::HTML::CrossProcessId reading_document_id)
+{
+    client().async_did_request_clipboard_entries(m_id, request_id, reading_document_id);
+}
+
+void PageClient::page_did_request_paste_from_clipboard_for_testing()
+{
+    client().async_did_request_paste_from_clipboard_for_testing(m_id);
 }
 
 void PageClient::page_did_request_spell_check(u64 request_id, Utf16String const& text)
@@ -2181,6 +2218,11 @@ NonnullOwnPtr<MediaClient::RemotePlaybackManager> PageClient::create_media_playb
 void PageClient::rebind_media_playback_manager(MediaClient::RemotePlaybackManager& playback_manager)
 {
     playback_manager.set_audio_group(audio_playback_group(m_id));
+}
+
+NonnullRefPtr<Audio::RecordStream::CreatePromise> PageClient::create_audio_record_stream(StringView device_id, Audio::RecordStream::RecordCallback callback)
+{
+    return Audio::RecordStream::create(device_id, audio_playback_group(m_id), move(callback));
 }
 
 void PageClient::page_did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
@@ -2271,7 +2313,7 @@ Web::PageClient::StartedWorkerAgent PageClient::start_worker_agent(Web::HTML::Wo
         Core::Process::terminate_immediately(0);
     }
 
-    // NB: The UI process notices a transport that nobody takes up, and tells the owner that its worker is gone.
+    // NB: The UI process notices a transport that nobody takes up, and tells the owners that their worker is gone.
     if (auto transport = response->take_thread_transport(); transport.has_value()) {
         if (auto result = WebWorker::start_worker_thread(transport.release_value(), agent_type); result.is_error())
             dbgln("Unable to start a thread for a worker: {}", result.error());
@@ -2280,24 +2322,20 @@ Web::PageClient::StartedWorkerAgent PageClient::start_worker_agent(Web::HTML::Wo
     return { response->agent_id(), response->is_hosted_in_caller_process() };
 }
 
+RefPtr<Web::HTML::DedicatedWorkerThreadLink> PageClient::start_dedicated_worker(Web::HTML::WorkerAgentStartRequest&& request)
+{
+    auto started_thread = WebWorker::start_dedicated_worker_thread(request.owner_token);
+    if (started_thread.is_error()) {
+        dbgln("Unable to start a dedicated worker: {}", started_thread.error());
+        return {};
+    }
+    client().async_register_dedicated_worker(m_id, move(request), move(started_thread.value().browser_end_of_worker_connection));
+    return move(started_thread.value().link);
+}
+
 void PageClient::close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     client().async_close_worker_agent(m_id, agent_id, owner_token);
-}
-
-void PageClient::rtc_transform_init(Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record)
-{
-    client().async_rtc_transform_init(m_id, agent_id, transform_id, move(options_record));
-}
-
-void PageClient::rtc_transform_teardown(Web::HTML::WorkerAgentId agent_id, u64 transform_id)
-{
-    client().async_rtc_transform_teardown(m_id, agent_id, transform_id);
-}
-
-void PageClient::rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
-{
-    client().async_rtc_transform_encoded_audio_frame(m_id, agent_id, transform_id, payload.bytes(), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 void PageClient::page_did_mutate_dom(Utf16FlyString const& type, Web::DOM::Node const& target, Web::DOM::NodeList& added_nodes, Web::DOM::NodeList& removed_nodes, GC::Ptr<Web::DOM::Node>, GC::Ptr<Web::DOM::Node>, Optional<Utf16FlyString> const& attribute_name)

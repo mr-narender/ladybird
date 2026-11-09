@@ -50,7 +50,7 @@ ladybird_test_suite(LibWebView)
 
 set(TEST_SOURCES
     TestAccessibilityTreeManager.cpp
-    TestAudioServerAudibility.cpp
+    TestAudioServerActivity.cpp
     TestAutocompleteMuxer.cpp
     TestAutocompleteRanker.cpp
     TestBackgroundNetworking.cpp
@@ -74,9 +74,7 @@ set(TEST_SOURCES
     TestPictureInPictureWindow.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
-    TestSessionHistorySnapshotStorage.cpp
     TestSessionHistoryTraversalQueue.cpp
-    TestSessionStore.cpp
     TestSiteCompatibilityDataLoading.cpp
     TestStartupSettings.cpp
     TestStorageAreaRegistry.cpp
@@ -147,6 +145,7 @@ if (NOT WIN32)
         TestRequestServerDiskCaches.cpp
         TestShadowTreeTooltipsAndLinks.cpp
         TestSharedWorkerHost.cpp
+        TestTitleElementChanges.cpp
         TestUserActivation.cpp
         TestViewSource.cpp
         TestWebCompatReport.cpp
@@ -155,7 +154,7 @@ if (NOT WIN32)
 endif()
 
 target_sources(TestLibWebView PRIVATE ${TEST_SOURCES})
-target_link_libraries(TestLibWebView PRIVATE LibAudio LibCompositing LibDatabase LibGC LibGfx LibHTTP LibIPC LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
+target_link_libraries(TestLibWebView PRIVATE LibAudio LibCompositing LibDatabase LibGamepad LibGC LibGfx LibHTTP LibIPC LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
 
 if (APPLE)
     add_dependencies(TestLibWebView ProcessReaper)

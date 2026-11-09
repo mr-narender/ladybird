@@ -18,7 +18,6 @@ endpoint WebWorkerClient {
     did_close_shared_worker() => ()
     did_finish_loading_worker_script(bool worker_is_secure_context) =|
     did_fail_loading_worker_script() =|
-    did_report_worker_exception(Utf16String message, Utf16String filename, u32 lineno, u32 colno) =|
     did_report_outside_settings_content_security_policy_violation(u64 policy_index, String effective_directive, URL::URL resource) =|
     did_request_cookie(URL::URL url, HTTP::Cookie::Source source) => (HTTP::Cookie::VersionedCookie cookie)
     did_request_file(ByteString path, i32 request_id) =|
@@ -29,8 +28,5 @@ endpoint WebWorkerClient {
     request_compositor_connection() => (Optional<IPC::TransportHandle> handle)
     did_release_image_decoder() =|
     did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message) =|
-    start_worker_agent(Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id, Optional<IPC::TransportHandle> thread_transport, bool is_hosted_in_caller_process)
-    close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
-
-    rtc_transform_encoded_audio_frame_written(u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) =|
+    register_dedicated_worker(Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport) =|
 }

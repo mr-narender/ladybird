@@ -10,7 +10,7 @@ use super::super::process_style::{InitialGroupsInputs, SharedInitialGroups};
 use super::super::publication::pseudo_kind;
 use super::super::*;
 use super::cascade::Winner;
-use super::drive::{self, Drive, Suspension, Unanswered, drive_font_metric};
+use super::drive::{self, drive_font_metric};
 use super::winner_store::{self, WinnerDeclaration, WinnerStore, WinnerValue, shorthand_longhand_data};
 use crate::css::computed_longhand_table::FONT_METRICS_DEPEND_ON_VIEWPORT_METRICS;
 use crate::css::computed_values::{GroupValueLayout, GroupValues, GroupValuesWriter, StyleGroupMasks};
@@ -119,7 +119,45 @@ impl RootFontInputs {
     }
 }
 
+/// What the drive of the initial values waits on, which can only be a font: they have no parent
+/// and no declarations.
+fn initial_drive_font_request(
+    suspended_font: Option<font_resolution::FontRequest>,
+) -> Box<font_resolution::FontRequest> {
+    Box::new(suspended_font.expect("an unanswered initial drive waits on a font"))
+}
+
+fn is_quirk_inherit(property: u16, value: &RetainedStyleValueData) -> bool {
+    property == crate::css::property_metadata::property_id::COLOR
+        && matches!(
+            value.data(),
+            StyleValueData::Keyword {
+                keyword: crate::css::style_compute::keyword::_LIBWEB_QUIRK_INHERIT
+            }
+        )
+}
+
 impl RetainedState {
+    pub(super) fn is_quirks_table(&self, node: StyleNodeID) -> bool {
+        self.document_style_computation_inputs.in_quirks_mode
+            && self.projection.adjustment_facts(node) & bridge::element_adjustment_fact::IS_TABLE != 0
+    }
+
+    // https://quirks.spec.whatwg.org/#the-document%27s-body-element
+    // The first HTML body child of the HTML document element supplies the color, wherever the table is.
+    pub(super) fn quirks_table_body(&self, node: StyleNodeID) -> Option<StyleNodeID> {
+        use bridge::element_adjustment_fact as fact;
+        let root = std::iter::successors(Some(node), |&node| self.projection.inheritance_parent(node))
+            .find(|&node| self.projection.adjustment_facts(node) & fact::IS_DOCUMENT_ELEMENT != 0)?;
+        if self.projection.adjustment_facts(root) & fact::IS_HTML_HTML_ELEMENT == 0 {
+            return None;
+        }
+        std::iter::successors(self.projection.first_element_child(root), |&child| {
+            self.projection.next_element_sibling(child)
+        })
+        .find(|&child| self.projection.adjustment_facts(child) & fact::IS_HTML_BODY_ELEMENT != 0)
+    }
+
     /// The engine: the computed initial values, as an element with no declarations and no parent
     /// computes them, with the groups they assemble into, each holding one reference, and the
     /// color they resolve. Every table is seeded from this one, and an element whose
@@ -128,7 +166,7 @@ impl RetainedState {
     pub(in crate::css::style) fn initial_style(
         &self,
         root: StyleNodeID,
-    ) -> Result<ComputedInitialStyle, Option<Box<font_resolution::FontRequest>>> {
+    ) -> Result<ComputedInitialStyle, Box<font_resolution::FontRequest>> {
         let inputs = InitialGroupsInputs::of(&self.document_style_computation_inputs);
         match self.process_style.initial_groups_of(&inputs) {
             Some(shared) => self.initial_style_over(root, &shared),
@@ -140,7 +178,7 @@ impl RetainedState {
     fn initial_style_driven(
         &self,
         root: StyleNodeID,
-    ) -> Result<ComputedInitialStyle, Option<Box<font_resolution::FontRequest>>> {
+    ) -> Result<ComputedInitialStyle, Box<font_resolution::FontRequest>> {
         let subject = DriveSubject {
             target: computed::ComputedStyleTarget::new(root, u8::MAX),
             parent: None,
@@ -148,7 +186,7 @@ impl RetainedState {
         };
         let store = WinnerStore::new(Vec::new());
         let inputs = self.document_style_computation_inputs;
-        let mut font_scratch = drive::FontDriveScratch::default();
+        let mut suspended_font = None;
         // The initial values compute from nothing: from the default groups, which hold no values.
         crate::css::computed_values::with_default_seed(&self.process_style.default_groups, |seed| {
             let mut writer = GroupValuesWriter::seeded_for_child(
@@ -158,11 +196,8 @@ impl RetainedState {
                 crate::css::computed_longhand_table::LonghandTableFlags::empty(),
                 0,
             );
-            match self.engine_full_drive(subject, &mut writer, &store, &inputs, &mut font_scratch) {
-                Ok(drive::DrivenValues {
-                    length,
-                    font: Some(font),
-                }) => {
+            match self.engine_drive_with(self, subject, &mut writer, None, &store, &inputs, &mut suspended_font) {
+                Some(drive::DrivenValues { length, font }) => {
                     let (values, flags, dependency_flags) = writer.finish(&[]);
                     let source = crate::css::table_group_builder::LonghandSource::Values {
                         values: &values,
@@ -207,10 +242,7 @@ impl RetainedState {
                         font: initial_font,
                     })
                 }
-                Err(Unanswered::Suspended(Suspension::Font)) => {
-                    Err(Some(Box::new(font_scratch.take_suspended_request())))
-                }
-                _ => Err(None),
+                None => Err(initial_drive_font_request(suspended_font)),
             }
         })
     }
@@ -221,7 +253,7 @@ impl RetainedState {
         &self,
         root: StyleNodeID,
         shared: &Arc<SharedInitialGroups>,
-    ) -> Result<ComputedInitialStyle, Option<Box<font_resolution::FontRequest>>> {
+    ) -> Result<ComputedInitialStyle, Box<font_resolution::FontRequest>> {
         use crate::css::computed_values::StyleGroupIndex;
         use crate::css::table_group_builder::group_index;
         let subject = DriveSubject {
@@ -231,7 +263,7 @@ impl RetainedState {
         };
         let store = WinnerStore::new(Vec::new());
         let inputs = self.document_style_computation_inputs;
-        let mut font_scratch = drive::FontDriveScratch::default();
+        let mut suspended_font = None;
         let held = shared.values();
         let seed = crate::css::computed_values::GroupSeed::new(shared.seed_groups(), &held.value_facts);
         let mut writer = GroupValuesWriter::seeded_for_child(
@@ -242,24 +274,16 @@ impl RetainedState {
             held.dependency_flags,
         );
         let selected = [0_u64; crate::css::property_metadata::LONGHAND_WORD_COUNT];
-        let driven = self.engine_drive_with(
+        let Some(drive::DrivenValues { length, font }) = self.engine_drive_with(
             self,
             subject,
             &mut writer,
             Some(&selected),
             &store,
             &inputs,
-            &mut font_scratch,
-        );
-        let (length, font) = match driven {
-            Ok(drive::DrivenValues {
-                length,
-                font: Some(font),
-            }) => (length, font),
-            Err(Unanswered::Suspended(Suspension::Font)) => {
-                return Err(Some(Box::new(font_scratch.take_suspended_request())));
-            }
-            _ => return Err(None),
+            &mut suspended_font,
+        ) else {
+            return Err(initial_drive_font_request(suspended_font));
         };
         let (values, _, _) = writer.finish(&[seed]);
         let source = crate::css::table_group_builder::LonghandSource::Values {
@@ -399,7 +423,8 @@ impl RetainedState {
         target_pseudo_element: super::PseudoElementTarget,
         root_font: Option<RootFontInputs>,
         group_seeds: GroupSeeds<'_>,
-    ) -> Drive<ComputedElement> {
+        quirks_color: Option<&RetainedStyleValueData>,
+    ) -> Option<ComputedElement> {
         use crate::css::property_metadata::{FIRST_LONGHAND_PROPERTY_ID, LONGHAND_WORD_COUNT, property_id as prop};
         use crate::css::style_compute::{
             DIRECTION_COUNT, LOGICAL_ALIAS_BIT, PHYSICAL_TO_LOGICAL_BIT, WRITING_MODE_COUNT,
@@ -418,7 +443,7 @@ impl RetainedState {
             parent: seeded_parent,
         } = group_seeds;
         let parent_view = match parent {
-            Some((parent, _)) => Some(records.assigned_record_view(parent).ok_or(Unanswered::AwaitsParent)?),
+            Some((parent, _)) => Some(records.assigned_record_view(parent)?),
             None => None,
         };
         let parent_longhands = parent_view.as_ref().map(computed::StyleRecordView::longhands);
@@ -523,7 +548,10 @@ impl RetainedState {
                 .declared_property(index)
                 .expect("the style engine answers every row");
             let written = block.written(index);
-            if !checks.is_plain() || declaration.operator() != CascadeOperator::Declared {
+            if !checks.is_plain()
+                || declaration.operator() != CascadeOperator::Declared
+                || is_quirk_inherit(property, written)
+            {
                 plain_dependencies = None;
                 break;
             }
@@ -563,6 +591,7 @@ impl RetainedState {
                     winner.property,
                     winner.source,
                     winner.index,
+                    quirks_color,
                 );
                 let rolls_back = classified.rolls_back();
                 if !rolls_back {
@@ -578,6 +607,7 @@ impl RetainedState {
                 &element_declarations,
                 custom_properties,
                 &defaulting,
+                quirks_color,
             );
         }
         let ElementWinnerReads {
@@ -833,28 +863,22 @@ impl RetainedState {
             let undrawn = store.undrawn_random_keys(self, node);
             if !undrawn.is_empty() {
                 random_requests.extend(undrawn);
-                return Err(Unanswered::Suspended(Suspension::RandomBaseValues));
+                return None;
             }
             let subject = DriveSubject {
                 target: computed::ComputedStyleTarget::of_pseudo_element(node, target_pseudo_element),
                 parent: parent.map(|(parent, _)| parent),
                 facts,
             };
-            let mut font_scratch = drive::FontDriveScratch::default();
-            let driven = self.engine_drive_with(
+            let drive::DrivenValues { length, font } = self.engine_drive_with(
                 records,
                 subject,
                 &mut writer,
                 (!drives_everything).then_some(&selected[..]),
                 &store,
                 &inputs,
-                &mut font_scratch,
-            );
-            if matches!(driven, Err(Unanswered::Suspended(Suspension::Font))) {
-                *suspended_font = Some(font_scratch.take_suspended_request());
-            }
-            let drive::DrivenValues { length, font } = driven?;
-            let font = font.expect("the style engine answers every row");
+                suspended_font,
+            )?;
             let scheme = u8::try_from(writer.effective_color_scheme()).ok();
             // A drive of every longhand computed the winners that compute directly too.
             if !drives_everything
@@ -1148,7 +1172,7 @@ impl RetainedState {
         drop(assembled);
         let style_bits = values.style_bits();
         let value_facts = values.into_facts();
-        Ok(ComputedElement {
+        Some(ComputedElement {
             flags,
             facts,
             value_facts,
@@ -1303,6 +1327,7 @@ impl RetainedState {
     /// decided before that was known.
     #[cold]
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn decide_rolling_back<'a>(
         &'a self,
         decided: &mut DecidedWinners<'_, 'a>,
@@ -1314,6 +1339,7 @@ impl RetainedState {
         )>; 3],
         custom_properties: super::custom_properties::CustomPropertyStores<'_>,
         defaulting: &WinnerDefaulting<'_>,
+        quirks_color: Option<&RetainedStyleValueData>,
     ) {
         decided.easy.clear();
         decided.hard.clear();
@@ -1341,8 +1367,14 @@ impl RetainedState {
                     source,
                     index,
                 } = winner;
-                let mut classified =
-                    self.classify_winner(element_declarations, custom_properties, property, source, index);
+                let mut classified = self.classify_winner(
+                    element_declarations,
+                    custom_properties,
+                    property,
+                    source,
+                    index,
+                    quirks_color,
+                );
                 // A declaration that rolls back still decides where it does.
                 decided
                     .reads
@@ -1478,8 +1510,30 @@ impl RetainedState {
         property: u16,
         source: WinnerSource,
         index: usize,
+        quirks_color: Option<&RetainedStyleValueData>,
     ) -> ClassifiedWinner<'a> {
         let (declaration, written, checks) = self.declaration_of(element_declarations, source, index);
+        // https://quirks.spec.whatwg.org/#the-tables-inherit-color-from-body-quirk
+        // Resolve the UA marker before computation, including when a revert exposes it.
+        if is_quirk_inherit(property, written) {
+            let value = quirks_color
+                .unwrap_or_else(|| crate::css::style_compute::initial_value_handle(property))
+                .clone();
+            let computation = match crate::css::style_compute::value_computes_directly(property, value.data(), None) {
+                true => WinnerComputation::Direct(None),
+                false => WinnerComputation::Full,
+            };
+            let environment = environment_reads(Some(value.data()), None);
+            return ClassifiedWinner {
+                value: ResolvedWinnerValue::Substituted(value),
+                computation,
+                reads: WinnerReads {
+                    element: true,
+                    environment,
+                    ..WinnerReads::default()
+                },
+            };
+        }
         if checks.waits_on_substitution() {
             use crate::css::style_value::StyleValueData;
             let value = match written.data() {
@@ -1670,7 +1724,7 @@ impl RetainedState {
             &crate::css::style_compute::FfiLengthResolutionContext,
         ) -> bool,
         suspended_font: &mut Option<font_resolution::FontRequest>,
-    ) -> Drive<(
+    ) -> Option<(
         crate::css::table_group_builder::FfiFontGroupBuildInputs,
         crate::css::style_compute::FfiLengthResolutionContext,
     )> {
@@ -1681,7 +1735,7 @@ impl RetainedState {
         );
         let Some(resolved) = self.resolved_font(request) else {
             *suspended_font = Some(font_resolution::FontRequest::new(request));
-            return Err(Unanswered::Suspended(Suspension::Font));
+            return None;
         };
         let own_length = |line_height: f64| {
             let font_metrics = crate::css::style_compute::FfiFontMetrics {
@@ -1712,7 +1766,7 @@ impl RetainedState {
             unreachable!("the style engine answers every row");
         }
         let line_height = engine_sample::used_line_height(|property| values.get(property), &request, &resolved);
-        Ok((
+        Some((
             engine_sample::font_group_build_inputs(|property| values.get(property), &request, line_height, &resolved),
             own_length(line_height),
         ))
@@ -2308,7 +2362,16 @@ impl<'a> DecidedWinners<'_, 'a> {
                         )
                         .filter(|value| !value.pointer().is_null())
                     };
-                    initial_value(property).filter(|value| initial_value(inherited_property) == Some(*value))
+                    // NB: A system color resolves against the element's own used color scheme, which the
+                    //     initial style can't know, so that initial value computes with the element.
+                    initial_value(property)
+                        .filter(|value| initial_value(inherited_property) == Some(*value))
+                        .filter(|_| {
+                            !matches!(
+                                crate::css::style_compute::initial_value_handle(property).data(),
+                                StyleValueData::Keyword { keyword } if crate::css::style_compute::keyword_is_color(*keyword)
+                            )
+                        })
                 }
             }
             .filter(|value| {
@@ -2592,8 +2655,7 @@ fn is_logical_counterpart(property: u16, other: u16) -> bool {
 /// adjustments read.
 #[derive(Clone, Copy)]
 pub(in crate::css::style) struct DriveSubject {
-    /// What is being driven, element or pseudo-element. A drive that suspends to wait for a font
-    /// names it, so the suspended drive can only be resumed by the one it belongs to.
+    /// What is being driven, element or pseudo-element.
     pub(in crate::css::style) target: computed::ComputedStyleTarget,
     /// The flat-tree parent the element inherits from; the document element has none and
     /// inherits from the initial values.
@@ -2691,6 +2753,8 @@ fn font_resolution_selects_by(property: u16) -> bool {
             | prop::FONT_WIDTH
             | prop::FONT_OPTICAL_SIZING
             | prop::FONT_SIZE_ADJUST
+            | prop::FONT_SYNTHESIS_WEIGHT
+            | prop::FONT_SYNTHESIS_STYLE
     )
 }
 
@@ -2745,13 +2809,6 @@ fn font_group_carries_longhand(property: u16) -> bool {
                 | prop::TEXT_RENDERING
         )
 }
-
-/// The proof that a record reads no resource context: no value its winners give it resolves a
-/// `url()` against a style sheet's or the document's base URL. The engine keeps only such records
-/// across transactions, so a move of those base URLs, which every `history.pushState()` makes
-/// without a `<base>`, leaves nothing it keeps to forget.
-#[derive(Clone, Copy)]
-pub(in crate::css::style) struct ReadsNoResourceContexts(pub(in crate::css::style) ());
 
 /// Static checks attached to the original declaration spelling at input preparation, in one word:
 /// the external dependencies of the value a longhand computes from, packed the way a winner

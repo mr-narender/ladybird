@@ -1547,7 +1547,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         // https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution
         if size.contains_percentage() {
             match formatting_context::cyclic_percentage_intrinsic_contribution(
-                self.facts(node).is_replaced_box(),
+                self.facts(node).resolves_cyclic_percentages_like_replaced_box(),
                 true,
                 available_space.inline_size,
                 formatting_context::CyclicPercentageSizeProperty::PreferredOrMaxSize,
@@ -2749,23 +2749,15 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         sized: SizedBox<'_>,
         constraints: ContainingBlockConstraints,
     ) -> Option<CssPixels> {
-        let node = sized.node;
         if !self.intrinsic_inline_sizes_are_transferred(sized, constraints) {
             return None;
         }
-        let facts = self.facts(node);
         let available_space = self.transferred_intrinsic_inline_sizing_space(sized);
-        // NB: Replaced elements resolve their sizes here without a percentage basis.
-        let sizing_constraints = if facts.is_replaced_box() {
-            ContainingBlockConstraints::default()
-        } else {
-            constraints
-        };
         // https://drafts.csswg.org/css2/#inline-replaced-width
         // "(used height) * (intrinsic ratio)"
-        let inline_size = self.compute_inline_size_for_replaced_element(sized, available_space, sizing_constraints);
+        let inline_size = self.compute_inline_size_for_replaced_element(sized, available_space, constraints);
         // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum
-        let block_size = self.compute_block_size_for_replaced_element(sized, available_space, sizing_constraints);
+        let block_size = self.compute_block_size_for_replaced_element(sized, available_space, constraints);
         let minimum = self.automatic_minimum_size_from_aspect_ratio(
             sized,
             SizingAxis::Inline,
@@ -3023,8 +3015,10 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         let answered_from_style = |size| Some(self.content_inline_size_answered_from_style(node, block_size, size));
         // https://drafts.csswg.org/css-sizing-3/#min-content-zero
         // input with any type that is not "button-like"; this can vary depending on the UA.
-        // NB: Text entry inputs are compressible even when their layout boxes are not replaced boxes.
-        let is_compressible_text_input = facts.is_text_input() && style.width().contains_percentage();
+        // NB: Text entry inputs and textareas are compressible even though their layout boxes are not replaced boxes.
+        let is_compressible_text_input = facts.resolves_cyclic_percentages_like_replaced_box()
+            && !facts.is_replaced_box()
+            && style.width().contains_percentage();
         if is_compressible_text_input
             || (facts.is_replaced_box()
                 && (style.width().contains_percentage() || style.max_width().contains_percentage()))
@@ -3351,7 +3345,8 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 ),
                 formatting_context::FormattingContextType::Svg
                 | formatting_context::FormattingContextType::InternalReplaced
-                | formatting_context::FormattingContextType::ReplacedWithChildren => (
+                | formatting_context::FormattingContextType::ReplacedWithChildren
+                | formatting_context::FormattingContextType::FrameSet => (
                     "REPLACED CONTENT",
                     intrinsic_sizing::content_sizes_of_replaced_content(self.pass, &scope()),
                 ),

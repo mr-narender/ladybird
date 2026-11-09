@@ -10,6 +10,7 @@
 #include <LibURL/URL.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/URL.h>
+#include <UI/Qt/Application.h>
 #include <UI/Qt/Autocomplete.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/Icon.h>
@@ -17,6 +18,7 @@
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/Motion.h>
 #include <UI/Qt/StringUtils.h>
+#include <UI/Qt/SuggestionProvider.h>
 #include <UI/Qt/SystemAppearance.h>
 #include <UI/Qt/Theme.h>
 
@@ -189,13 +191,122 @@ static constexpr int LOCATION_PILL_HORIZONTAL_PADDING = 16;
 // The zoom chip is at least wide enough for any zoom level up to 999%, so it keeps its width as the level changes.
 static constexpr int LOCATION_ZOOM_CHIP_MIN_WIDTH = 54;
 static constexpr int LOCATION_ZOOM_CHIP_GAP = 3;
-// The location chip says what it means at first, then shrinks to its icon.
-static constexpr int LOCATION_IN_USE_CHIP_COLLAPSE_DELAY_MS = 4000;
-static constexpr int LOCATION_IN_USE_CHIP_ICON_ONLY_WIDTH = 30;
+// The translate button's pulse while a download runs: one breath, and how far it fades.
+static constexpr int TRANSLATE_PULSE_DURATION_MS = 1600;
+static constexpr qreal TRANSLATE_PULSE_MINIMUM_OPACITY = 0.3;
+static constexpr int IN_USE_CHIP_COLLAPSE_DELAY_MS = 4000;
+static constexpr int IN_USE_CHIP_ICON_ONLY_WIDTH = 30;
+static constexpr int IN_USE_CHIP_ICON_SIZE = 16;
+static constexpr int IN_USE_CHIP_ICON_TEXT_GAP = 4;
+
+// A chip that says the page is using something of the user's, such as their location. It says so in words at first,
+// then shrinks to its icon. While the field has no room for its words, it shows only its icon, and its text stays its
+// accessible name.
+class InUseChip final : public QToolButton {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    InUseChip(QWidget* parent, ChromeIcon icon, QString const& text, QString const& tool_tip)
+        : QToolButton(parent)
+        , m_icon(icon)
+        , m_collapse_timer(new QTimer(this))
+    {
+        setObjectName("LadybirdInUseChip");
+        setIconSize({ IN_USE_CHIP_ICON_SIZE, IN_USE_CHIP_ICON_SIZE });
+        setText(text);
+        setToolTip(tool_tip);
+        setFixedHeight(LOCATION_PILL_HEIGHT);
+        setAutoRaise(true);
+        setFocusPolicy(Qt::NoFocus);
+        setCursor(Qt::ArrowCursor);
+        update_form();
+        hide();
+
+        m_collapse_timer->setSingleShot(true);
+        m_collapse_timer->setInterval(IN_USE_CHIP_COLLAPSE_DELAY_MS);
+        QObject::connect(m_collapse_timer, &QTimer::timeout, this, [this] {
+            m_says_in_words = false;
+            update_form();
+            if (on_size_change)
+                on_size_change();
+        });
+    }
+
+    void set_in_use(bool in_use)
+    {
+        if (in_use == !isHidden())
+            return;
+
+        m_says_in_words = in_use;
+        update_form();
+        setVisible(in_use);
+        if (in_use)
+            m_collapse_timer->start();
+        else
+            m_collapse_timer->stop();
+
+        if (on_size_change)
+            on_size_change();
+    }
+
+    void set_words_fit(bool words_fit)
+    {
+        m_words_fit = words_fit;
+        update_form();
+    }
+
+    // How much wider the chip would be, were it to say what it means in words where it now shows only its icon.
+    int width_missing_for_words() const
+    {
+        if (isHidden() || !m_says_in_words)
+            return 0;
+        return width_in_words() - width();
+    }
+
+    // How much wider the chip is than its icon alone.
+    int width_beyond_icon() const
+    {
+        if (isHidden())
+            return 0;
+        return width() - IN_USE_CHIP_ICON_ONLY_WIDTH;
+    }
+
+    void update_icon(QPalette const& palette)
+    {
+        setIcon(create_chrome_icon(m_icon, palette));
+    }
+
+    // Asks the field to make room for the chip as it shows, shrinks or hides.
+    Function<void()> on_size_change;
+
+private:
+    int width_in_words() const
+    {
+        ensurePolished();
+        return fontMetrics().horizontalAdvance(text()) + IN_USE_CHIP_ICON_SIZE + IN_USE_CHIP_ICON_TEXT_GAP + LOCATION_PILL_HORIZONTAL_PADDING;
+    }
+
+    void update_form()
+    {
+        if (m_says_in_words && m_words_fit) {
+            setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+            setFixedWidth(width_in_words());
+        } else {
+            setToolButtonStyle(Qt::ToolButtonIconOnly);
+            setFixedWidth(IN_USE_CHIP_ICON_ONLY_WIDTH);
+        }
+    }
+
+    ChromeIcon m_icon;
+    QTimer* m_collapse_timer { nullptr };
+    bool m_says_in_words { false };
+    bool m_words_fit { true };
+};
 
 LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
     : NativeTextEditingLineEdit(parent)
-    , m_omnibox(is_private)
+    , WebView::SettingsObserver(Application::settings())
+    , m_omnibox(make<SuggestionProvider>(is_private))
     , m_autocomplete(new Autocomplete(this))
 {
     setObjectName("LadybirdLocationEdit");
@@ -245,6 +356,20 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
     m_translate_button->setFocusPolicy(Qt::NoFocus);
     m_translate_button->setCursor(Qt::ArrowCursor);
     m_translate_button->hide();
+    // The button pulses while a download it needs runs, since the download doesn't say how far along it is.
+    m_translate_opacity = new QGraphicsOpacityEffect(m_translate_button);
+    m_translate_opacity->setEnabled(false);
+    m_translate_button->setGraphicsEffect(m_translate_opacity);
+    m_translate_pulse = new QVariantAnimation(this);
+    m_translate_pulse->setDuration(TRANSLATE_PULSE_DURATION_MS);
+    m_translate_pulse->setKeyValueAt(0, 1.0);
+    m_translate_pulse->setKeyValueAt(0.5, TRANSLATE_PULSE_MINIMUM_OPACITY);
+    m_translate_pulse->setKeyValueAt(1, 1.0);
+    m_translate_pulse->setEasingCurve(QEasingCurve::InOutSine);
+    m_translate_pulse->setLoopCount(-1);
+    connect(m_translate_pulse, &QVariantAnimation::valueChanged, this, [this](QVariant const& value) {
+        m_translate_opacity->setOpacity(value.toReal());
+    });
     connect(m_translate_button, &QToolButton::clicked, this, [this] {
         if (on_translate_requested)
             on_translate_requested();
@@ -287,32 +412,21 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
             on_zoom_requested();
     });
 
-    m_location_in_use_button = new QToolButton(this);
-    m_location_in_use_button->setObjectName("LadybirdLocationInUse");
-    m_location_in_use_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    m_location_in_use_button->setIconSize({ 16, 16 });
-    m_location_in_use_button->setText("Using your location");
-    m_location_in_use_button->setToolTip("This page is using your location");
-    m_location_in_use_button->setFixedHeight(LOCATION_PILL_HEIGHT);
-    m_location_in_use_button->setAutoRaise(true);
-    m_location_in_use_button->setFocusPolicy(Qt::NoFocus);
-    m_location_in_use_button->setCursor(Qt::ArrowCursor);
-    m_location_in_use_button->hide();
-    connect(m_location_in_use_button, &QToolButton::clicked, this, [this] {
-        if (on_site_settings_requested)
-            on_site_settings_requested();
-    });
-    m_location_in_use_collapse_timer = new QTimer(this);
-    m_location_in_use_collapse_timer->setSingleShot(true);
-    m_location_in_use_collapse_timer->setInterval(LOCATION_IN_USE_CHIP_COLLAPSE_DELAY_MS);
-    connect(m_location_in_use_collapse_timer, &QTimer::timeout, this, [this] {
-        m_location_in_use_button->setToolButtonStyle(Qt::ToolButtonIconOnly);
-        update_location_in_use_chip();
-        update_text_margins();
-        update_trailing_item_positions();
-    });
+    m_location_in_use_chip = new InUseChip(this, ChromeIcon::Location, "Using your location", "This page is using your location");
+    m_microphone_in_use_chip = new InUseChip(this, ChromeIcon::Microphone, "Using your microphone", "This page is using your microphone");
+    for (auto* chip : { m_location_in_use_chip, m_microphone_in_use_chip }) {
+        chip->on_size_change = [this] {
+            update_text_margins();
+            update_trailing_item_positions();
+        };
+        connect(chip, &QToolButton::clicked, this, [this] {
+            if (on_site_settings_requested)
+                on_site_settings_requested();
+        });
+    }
+    update_in_use_chip_icons();
 
-    for (auto* button : { m_leading_icon_button, m_trailing_action_button, m_translate_button, m_zoom_indicator_button, m_location_in_use_button })
+    for (auto* button : { m_leading_icon_button, m_trailing_action_button, m_translate_button, m_zoom_indicator_button, static_cast<QToolButton*>(m_location_in_use_chip), static_cast<QToolButton*>(m_microphone_in_use_chip) })
         button->installEventFilter(this);
 
     update_text_margins();
@@ -360,7 +474,7 @@ LocationEdit::LocationEdit(QWidget* parent, WebView::IsPrivate is_private)
         auto ctrl_held = QApplication::keyboardModifiers() & Qt::ControlModifier;
         auto append_tld = ctrl_held ? WebView::AppendTLD::Yes : WebView::AppendTLD::No;
 
-        auto url = WebView::sanitize_url(input, WebView::Application::settings().search_engine_settings().engine, append_tld);
+        auto url = WebView::sanitize_url(input, Application::settings().search_engine_settings().engine, append_tld);
         auto classified_input = WebView::classify_user_input(input, append_tld);
         if (destination_kind == WebView::OmniboxDestinationKind::Search
             || classified_input.classification != WebView::UserInputClassification::ExternalURL)
@@ -518,6 +632,19 @@ void LocationEdit::update_translate_button()
         m_translate_button->setIcon(m_translate_action->icon());
         m_translate_button->setToolTip(m_translate_action->toolTip());
     }
+
+    // Under reduced motion the button doesn't pulse; its tooltip and the menu still say that a download is running.
+    auto pulse = visible && m_translate_action->property(BUSY_ACTION_PROPERTY).toBool() && !SystemAppearance::prefers_reduced_motion();
+    if (pulse && m_translate_pulse->state() != QAbstractAnimation::Running) {
+        m_translate_opacity->setEnabled(true);
+        m_translate_pulse->start();
+    } else if (!pulse && m_translate_pulse->state() == QAbstractAnimation::Running) {
+        m_translate_pulse->stop();
+        m_translate_opacity->setOpacity(1);
+        // An enabled effect renders the button offscreen on every repaint, even at full opacity.
+        m_translate_opacity->setEnabled(false);
+    }
+
     if (m_translate_button->isHidden() != visible)
         return;
     m_translate_button->setVisible(visible);
@@ -641,7 +768,7 @@ void LocationEdit::contextMenuEvent(QContextMenuEvent* event)
     auto qt_clipboard_text = QGuiApplication::clipboard()->text();
     auto clipboard_text = ak_string_from_qstring(qt_clipboard_text);
 
-    bool has_search_engine = WebView::Application::settings().search_engine_settings().engine.has_value();
+    bool has_search_engine = Application::settings().search_engine_settings().engine.has_value();
     auto paste_and_go_text = WebView::Omnibox::text_for_paste_and_go_action(clipboard_text, has_search_engine);
     // Escape any &s so Qt doesn't treat them as mnemonics.
     paste_and_go_text = MUST(paste_and_go_text.replace("&"sv, "&&"sv, ReplaceMode::All));
@@ -926,7 +1053,47 @@ void LocationEdit::resizeEvent(QResizeEvent* event)
 {
     QLineEdit::resizeEvent(event);
 
+    update_text_margins();
     update_trailing_item_positions();
+}
+
+// The field asks only for room for the chips' icons, as the chips fall back to them when their words don't fit, so a
+// page using something of the user's never widens the window to fit those words.
+QSize LocationEdit::sizeHint() const
+{
+    auto hint = NativeTextEditingLineEdit::sizeHint();
+    hint.rwidth() -= in_use_chips_width_beyond_icons();
+    return hint;
+}
+
+QSize LocationEdit::minimumSizeHint() const
+{
+    auto hint = NativeTextEditingLineEdit::minimumSizeHint();
+    hint.rwidth() -= in_use_chips_width_beyond_icons();
+    return hint;
+}
+
+int LocationEdit::in_use_chips_width_beyond_icons() const
+{
+    auto width = 0;
+    for (auto* chip : { m_location_in_use_chip, m_microphone_in_use_chip }) {
+        if (chip)
+            width += chip->width_beyond_icon();
+    }
+    return width;
+}
+
+// The chips say what they mean in words while the field is as wide as its minimum would be with those words in it.
+// NB: Resizing the field never restarts a chip's timer, so its words only ever show within its first few seconds.
+void LocationEdit::fit_in_use_chips()
+{
+    auto margins = textMargins();
+    auto width_for_words = NativeTextEditingLineEdit::minimumSizeHint().width() - margins.left() - margins.right() + m_text_leading_margin + trailing_text_margin();
+    for (auto* chip : { m_location_in_use_chip, m_microphone_in_use_chip })
+        width_for_words += chip->width_missing_for_words();
+
+    for (auto* chip : { m_location_in_use_chip, m_microphone_in_use_chip })
+        chip->set_words_fit(width() >= width_for_words);
 }
 
 // The "Not secure" pill is inset as far from the field's leading edge as from its top and bottom.
@@ -964,13 +1131,18 @@ void LocationEdit::update_trailing_item_positions()
     m_zoom_indicator_button->move(items_x - LOCATION_ZOOM_CHIP_GAP - zoom_button_size.width(), zoom_y);
     m_zoom_indicator_button->raise();
 
-    // The location chip stands before the zoom chip, when there is one.
-    auto location_chip_x = items_x;
+    // The location chip stands before the zoom chip, when there is one, and the microphone chip before the location
+    // chip, when there is one.
+    auto chip_x = items_x;
     if (!m_zoom_indicator_button->isHidden())
-        location_chip_x -= LOCATION_ZOOM_CHIP_GAP + zoom_button_size.width();
-    auto location_chip_size = m_location_in_use_button->size();
-    m_location_in_use_button->move(location_chip_x - LOCATION_ZOOM_CHIP_GAP - location_chip_size.width(), (height() - location_chip_size.height()) / 2);
-    m_location_in_use_button->raise();
+        chip_x -= LOCATION_ZOOM_CHIP_GAP + zoom_button_size.width();
+    for (auto* chip : { m_location_in_use_chip, m_microphone_in_use_chip }) {
+        auto chip_size = chip->size();
+        chip->move(chip_x - LOCATION_ZOOM_CHIP_GAP - chip_size.width(), (height() - chip_size.height()) / 2);
+        chip->raise();
+        if (!chip->isHidden())
+            chip_x -= LOCATION_ZOOM_CHIP_GAP + chip_size.width();
+    }
     m_trailing_action_button->raise();
 }
 
@@ -981,6 +1153,8 @@ void LocationEdit::search_engine_settings_changed()
 
 void LocationEdit::update_text_margins()
 {
+    if (m_location_in_use_chip && m_microphone_in_use_chip)
+        fit_in_use_chips();
     setTextMargins(m_text_leading_margin, 0, trailing_text_margin(), 0);
 }
 
@@ -994,8 +1168,10 @@ int LocationEdit::trailing_text_margin() const
         margin += m_translate_button->width();
     if (m_zoom_indicator_button && !m_zoom_indicator_button->isHidden())
         margin += m_zoom_indicator_button->width() + LOCATION_ZOOM_CHIP_GAP;
-    if (m_location_in_use_button && !m_location_in_use_button->isHidden())
-        margin += m_location_in_use_button->width() + LOCATION_ZOOM_CHIP_GAP;
+    for (auto* chip : { m_location_in_use_chip, m_microphone_in_use_chip }) {
+        if (chip && !chip->isHidden())
+            margin += chip->width() + LOCATION_ZOOM_CHIP_GAP;
+    }
 
     return margin;
 }
@@ -1010,7 +1186,7 @@ void LocationEdit::update_chrome_style()
     setStyleSheet(ChromeStyle::location_edit_style_sheet(Theme::chrome_palette(*this)));
     m_is_updating_chrome_style = false;
     update_zoom_indicator();
-    update_location_in_use_chip();
+    update_in_use_chip_icons();
 }
 
 void LocationEdit::schedule_chrome_style_update()
@@ -1162,35 +1338,20 @@ void LocationEdit::update_zoom_indicator()
 
 void LocationEdit::set_location_in_use(bool in_use)
 {
-    if (in_use == !m_location_in_use_button->isHidden())
-        return;
-
-    if (in_use) {
-        m_location_in_use_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-        update_location_in_use_chip();
-        m_location_in_use_button->show();
-        m_location_in_use_collapse_timer->start();
-    } else {
-        m_location_in_use_collapse_timer->stop();
-        m_location_in_use_button->hide();
-    }
-
-    update_text_margins();
-    update_trailing_item_positions();
+    m_location_in_use_chip->set_in_use(in_use);
 }
 
-void LocationEdit::update_location_in_use_chip()
+void LocationEdit::set_microphone_in_use(bool in_use)
 {
-    if (!m_location_in_use_button)
-        return;
+    m_microphone_in_use_chip->set_in_use(in_use);
+}
 
-    m_location_in_use_button->setIcon(create_chrome_icon(ChromeIcon::Location, Theme::chrome_palette(*this)));
-    if (m_location_in_use_button->toolButtonStyle() == Qt::ToolButtonIconOnly) {
-        m_location_in_use_button->setFixedWidth(LOCATION_IN_USE_CHIP_ICON_ONLY_WIDTH);
-        return;
+void LocationEdit::update_in_use_chip_icons()
+{
+    for (auto* chip : { m_location_in_use_chip, m_microphone_in_use_chip }) {
+        if (chip)
+            chip->update_icon(Theme::chrome_palette(*this));
     }
-    auto width = m_location_in_use_button->fontMetrics().horizontalAdvance(m_location_in_use_button->text()) + 16 + 4 + LOCATION_PILL_HORIZONTAL_PADDING;
-    m_location_in_use_button->setFixedWidth(width);
 }
 
 void LocationEdit::highlight_location()

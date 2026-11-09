@@ -694,9 +694,14 @@ pub(crate) fn box_baseline_with_content_baselines(
     // baseline sets always derive from content; so do flex and grid containers, which are not block containers.
     // FIXME: Per CSS Align, a scroll container's content-derived baseline position should be clamped to its border
     //        edge.
+    // AD-HOC: A box with button layout derives its baselines from its content even when its overflow makes it a
+    //         scroll container, rather than taking its block-end margin edge, so that a button with overflow: hidden
+    //         sits on the line by the text it shows, as pages expect.
+    //         https://html.spec.whatwg.org/multipage/rendering.html#button-layout
     let derive_baseline_from_content = baseline_set == BaselineSet::First
         || style.baseline_source() != crate::css::css_enums::baseline_source::AUTO
         || is_flex_or_grid_container
+        || facts.uses_button_layout()
         || !facts.is_scroll_container();
 
     // AD-HOC: We also use the content-derived baseline for <input> elements with block children, even when their
@@ -712,7 +717,17 @@ pub(crate) fn box_baseline_with_content_baselines(
     if let Some(content_baseline) = content_baseline
         && (derive_baseline_from_content || input_derives_from_children)
     {
-        return metrics.margin_box_top(collapsed) + content_baseline;
+        let baseline = metrics.margin_box_top(collapsed) + content_baseline;
+        // https://drafts.csswg.org/css-align-3/#baseline-export
+        // "if the position of a scroll container's first/last baseline is outside its border edge, that baseline's
+        // position is clamped to the border edge."
+        // NB: Only a button takes a scroll container's baseline from its content here.
+        if facts.uses_button_layout() && facts.is_scroll_container() {
+            let border_box_top = metrics.margin_top();
+            let border_box_bottom = border_box_top + metrics.border_box_block_size(collapsed);
+            return baseline.max(border_box_top).min(border_box_bottom);
+        }
+        return baseline;
     }
 
     // AD-HOC: Inline buttons without a content baseline synthesize one from their content-box bottom edge in
@@ -964,6 +979,7 @@ pub enum FormattingContextType {
     Math,
     ReplacedWithChildren,
     InternalReplaced,
+    FrameSet,
 }
 
 impl FormattingContextType {
@@ -972,7 +988,7 @@ impl FormattingContextType {
     }
 
     fn lays_out_inside_its_root_as_definite_in_both_axes(self) -> bool {
-        matches!(self, Self::Svg | Self::ReplacedWithChildren)
+        matches!(self, Self::Svg | Self::ReplacedWithChildren | Self::FrameSet)
     }
 }
 
@@ -1395,6 +1411,7 @@ enum FormattingContextImplementation<'pass> {
     Math(math_formatting_context::MathFormattingContext<'pass>),
     ReplacedWithChildren,
     InternalReplaced,
+    FrameSet,
 }
 
 pub(crate) fn formatting_context_type_created_by_node_data(
@@ -1405,6 +1422,9 @@ pub(crate) fn formatting_context_type_created_by_node_data(
 ) -> Option<FormattingContextType> {
     if data.kind.get() == crate::layout::node_data::NodeKind::SVGSVGBox {
         return Some(FormattingContextType::Svg);
+    }
+    if data.kind.get() == crate::layout::node_data::NodeKind::FrameSetBox {
+        return Some(FormattingContextType::FrameSet);
     }
     let is_replaced_box = node_facts::kind_is_replaced_box(data.kind.get());
     let can_have_children = node_facts::node_can_have_children(data);
@@ -1511,6 +1531,7 @@ fn create_formatting_context_implementation<'pass>(
         ),
         FormattingContextType::ReplacedWithChildren => FormattingContextImplementation::ReplacedWithChildren,
         FormattingContextType::InternalReplaced => FormattingContextImplementation::InternalReplaced,
+        FormattingContextType::FrameSet => FormattingContextImplementation::FrameSet,
     }
 }
 
@@ -2459,6 +2480,11 @@ fn lay_out_run_root_and_contents<'pass>(
                 (result, root_after_body)
             }
             FormattingContextImplementation::InternalReplaced => (ChildLayoutResult::default(), own_root.get()),
+            FormattingContextImplementation::FrameSet => {
+                let mut root_after_body = own_root.get();
+                let result = frameset_formatting_context::layout_frameset(body_run, &mut root_after_body);
+                (result, root_after_body)
+            }
         }
     };
     let baselines_in_own_frame = result.baselines;
@@ -2671,7 +2697,9 @@ fn lay_out_run_root_and_contents<'pass>(
             FormattingContextImplementation::Math(context) => {
                 context.parent_did_dimension(root_in_own_frame_left_by_run);
             }
-            FormattingContextImplementation::Svg(_) | FormattingContextImplementation::ReplacedWithChildren => {}
+            FormattingContextImplementation::Svg(_)
+            | FormattingContextImplementation::ReplacedWithChildren
+            | FormattingContextImplementation::FrameSet => {}
             FormattingContextImplementation::InternalReplaced => {
                 let outputs = run.outputs(
                     result,

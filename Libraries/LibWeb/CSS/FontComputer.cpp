@@ -35,6 +35,7 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Platform/FontPlugin.h>
+#include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWebCommon/MimeSniff/Resource.h>
 
 namespace Web::CSS {
@@ -158,7 +159,7 @@ void FontLoader::start_loading_next_source()
         // failure or a byte stream stream:
         m_has_received_font_data = false;
         m_fetch_controller = fetch_a_style_resource(m_sources.take_first().get<URL>(), m_rule_or_declaration, Fetch::Infrastructure::Request::Destination::Font, CorsMode::Cors,
-            [loader = this](auto response, auto stream) {
+            GC::create_function(heap(), GC::captures(this), [](FontLoader* loader, GC::Ref<Fetch::Infrastructure::ResponseView> response, Fetch::Infrastructure::FetchAlgorithms::BodyBytes stream) {
                 // 1. If stream is null, return.
                 // 2. Load a font from stream according to its type.
 
@@ -194,6 +195,13 @@ void FontLoader::start_loading_next_source()
 
                 auto loader_handle = GC::make_root(GC::Ref(*loader));
                 prepare_vector_font_data_off_thread(move(bytes), [loader = move(loader_handle)](auto prepared_font_data) mutable {
+                // NB: The data comes back outside any task, so an SVG image's document isn't the one its shared window
+                //     is associated with anymore. Restore it, so the font load updates and repaints that document.
+                GC::Ptr<DOM::Document const> document;
+                if (loader->m_font_computer->has_document())
+                    document = &loader->m_font_computer->document();
+                auto svg_image_document_scope = SVG::ScopedSVGImageDocument::create_if_needed(document, SVG::ScopedSVGImageDocument::FrameRequests::RouteToCurrentImage);
+
                 if (prepared_font_data.is_error()) {
                     // NB: If we have other sources available, try the next one.
                     if (loader->m_sources.is_empty()) {
@@ -218,7 +226,7 @@ void FontLoader::start_loading_next_source()
                 }
 
                 loader->font_did_load_or_fail(maybe_typeface.release_value()); });
-            });
+            }));
 
         if (m_fetch_controller || m_has_completed)
             return;

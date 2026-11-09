@@ -30,7 +30,7 @@ impl StyleEngine {}
 
 #[test]
 fn native_declaration_publication_reuses_values_and_observes_live_mutation() {
-    use super::bridge::{BoundScopeChain, publish_rule_declarations, publish_style_rule};
+    use super::bridge::{BoundScopeChain, publish_style_rule};
     use crate::css::declaration_block::{
         DeclarationBlock, rust_declaration_block_replace, rust_declaration_block_retain,
     };
@@ -59,17 +59,19 @@ fn native_declaration_publication_reuses_values_and_observes_live_mutation() {
             .unwrap(),
     );
     let callbacks = crate::css::ffi_stats::CPP_CALLBACK_COUNT.get();
-    assert!(!publish_rule_declarations(&mut engine, rule, &first.data()));
-    assert!(!publish_rule_declarations(&mut engine, rule, &second));
+    let rule = RuleID(rule - 1);
+    engine.publish_block_declarations(rule, &first.data());
+    engine.publish_block_declarations(rule, &second);
+    let declared_before_the_mutation = engine.current_declared_properties_of(rule).to_vec();
     rust_declaration_block_replace(&mut first, &transitions);
-    assert!(publish_rule_declarations(&mut engine, rule, &retained.data()));
+    engine.publish_block_declarations(rule, &retained.data());
+    assert!(engine.current_declared_properties_of(rule) != declared_before_the_mutation);
     assert_eq!(crate::css::ffi_stats::CPP_CALLBACK_COUNT.get(), callbacks);
 }
 
 fn add_feature(engine: &mut StyleEngine, node: StyleNodeID, feature: LocalFeatureKey) {
     engine.record_input(
         InputKey::LocalFeature(node, feature),
-        InputValue::Feature(FeatureValue::Absent),
         InputValue::Feature(FeatureValue::Present),
     );
 }
@@ -77,7 +79,6 @@ fn add_feature(engine: &mut StyleEngine, node: StyleNodeID, feature: LocalFeatur
 fn set_atom_feature(engine: &mut StyleEngine, node: StyleNodeID, feature: LocalFeatureKey, atom: StyleAtomID) {
     engine.record_input(
         InputKey::LocalFeature(node, feature),
-        InputValue::Feature(FeatureValue::Absent),
         InputValue::Feature(FeatureValue::Atom(atom)),
     );
 }
@@ -603,10 +604,6 @@ fn a_departed_node_routes_from_retained_facts_without_being_published() {
     engine.record_input(
         InputKey::ElementStyleInput(nodes[3]),
         InputValue::ElementStyleInput {
-            reaction: 0,
-            inherited_style_groups: 0,
-        },
-        InputValue::ElementStyleInput {
             reaction: input_types::STYLE_REACTION_RECOMPUTE_STYLE,
             inherited_style_groups: 0,
         },
@@ -637,10 +634,6 @@ fn a_shadow_root_routes_without_being_published_as_a_style_output() {
 
     engine.record_input(
         InputKey::ElementStyleInput(shadow_root),
-        InputValue::ElementStyleInput {
-            reaction: 0,
-            inherited_style_groups: 0,
-        },
         InputValue::ElementStyleInput {
             reaction: input_types::STYLE_REACTION_RECOMPUTE_STYLE,
             inherited_style_groups: 0,
@@ -771,7 +764,6 @@ fn a_selector_edit_changes_its_rule() {
 fn rule_metadata_commits_at_the_transaction_barrier() {
     let (mut engine, _, rule) = authoring_engine();
     engine.set_rule_gated_by_container_query(rule);
-    engine.set_rule_in_a_layer(rule);
 
     assert!(!engine.rules.rule_is_gated_by_container_query(rule));
     assert!(engine.current_rule_is_gated_by_container_query(rule));
@@ -917,18 +909,6 @@ fn a_layer_order_change_reorders_its_scope() {
     assert!(engine.rules.scope_uses_document_sheets(TreeScopeID(1)));
     assert_eq!(transaction.rule_changes.reordered_scopes, vec![TreeScopeID::DOCUMENT]);
     assert_eq!(engine.counters().get(Counter::CascadeTopologyDeltas), 1);
-    engine.release_transaction(transaction);
-}
-
-#[test]
-fn disabling_a_sheet_is_an_activation_change() {
-    let (mut engine, sheet, _) = authoring_engine();
-    engine.set_sheet_enabled(sheet, false);
-    assert!(engine.rules.sheet_is_enabled(sheet));
-
-    let transaction = engine.take_transaction();
-    assert!(!engine.rules.sheet_is_enabled(sheet));
-    assert_eq!(transaction.rule_changes.sheets, vec![sheet]);
     engine.release_transaction(transaction);
 }
 

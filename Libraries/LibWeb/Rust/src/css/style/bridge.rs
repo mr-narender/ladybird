@@ -46,10 +46,13 @@ use super::pipeline::rule_store::DeclarationBlockID;
 
 use super::StyleEngine;
 use super::input_types::ElementDeclarationKind;
+#[cfg(test)]
 use super::input_types::InputKey;
+#[cfg(test)]
 use super::input_types::InputValue;
 use super::input_types::StateFact;
 use super::input_types::TreeRelations;
+use super::instrumentation::Counter;
 use super::pipeline::rule_store::RuleID;
 use super::pipeline::rule_store::SheetID;
 use super::tree::StyleNodeID;
@@ -388,6 +391,12 @@ pub enum FontSizeAdjustKind {
 pub const FONT_RESOLUTION_FEATURE_INPUT_COUNT: usize = 11;
 const _: () = assert!(FontResolutionFeatureInput::TextRendering as usize + 1 == FONT_RESOLUTION_FEATURE_INPUT_COUNT);
 
+/// The bits of `FfiFontResolutionRequest::font_synthesis`.
+pub const FONT_SYNTHESIS_NO_WEIGHT: u8 = 1;
+pub const FONT_SYNTHESIS_STYLE_SHIFT: u8 = 1;
+pub const FONT_SYNTHESIS_STYLE_NONE: u8 = 1;
+pub const FONT_SYNTHESIS_STYLE_OBLIQUE_ONLY: u8 = 2;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FfiFontResolutionRequest {
@@ -401,6 +410,11 @@ pub struct FfiFontResolutionRequest {
     pub font_weight: f64,
     pub font_width: f64,
     pub font_optical_sizing: u8,
+    /// The angle of the oblique style `font-style` asks for, in degrees: 14 for italic and for a bare `oblique`.
+    pub font_oblique_angle: f64,
+    /// Which synthesis the `font-synthesis` longhands forbid: `FONT_SYNTHESIS_NO_WEIGHT`, and the
+    /// `font-synthesis-style` value shifted by `FONT_SYNTHESIS_STYLE_SHIFT` (0 auto, 1 none, 2 oblique-only).
+    pub font_synthesis: u8,
     /// The computed `font-size-adjust`: its kind, the metric it normalizes (a
     /// `font_size_adjust_metric` value), and the number for `FontSizeAdjustKind::Number`. The
     /// metric and number are zero for `FontSizeAdjustKind::None`.
@@ -604,35 +618,8 @@ pub struct FfiElementArrival {
     pub construction_facts: u32,
 }
 
-/// The facts of `arrival` its row takes, with its run `atoms` of the shared atom column: its custom states, then its
-/// classes, then its attributes as name and value pairs.
-pub(in crate::css::style) fn element_arrival_facts<'a>(
-    arrival: &FfiElementArrival,
-    atoms: &'a [u32],
-) -> super::projection_writes::ElementArrivalFacts<'a> {
-    super::projection_writes::ElementArrivalFacts {
-        tag: StyleAtomID(arrival.tag_atom),
-        folded_tag: StyleAtomID(arrival.folded_tag_atom),
-        namespace: StyleAtomID(arrival.namespace_atom),
-        id: StyleAtomID(arrival.id_atom),
-        language: StyleAtomID(arrival.language_atom),
-        directionality: StyleAtomID(arrival.directionality_atom),
-        heading_level: arrival.heading_level,
-        backing_pseudo_kind_plus_one: arrival.associated_pseudo_kind_plus_one,
-        is_slot: arrival.is_slot,
-        has_text_content: arrival.has_text_content,
-        states: super::index::StateSet(arrival.states),
-        adjustment_facts: arrival.adjustment_facts,
-        construction_facts: arrival.construction_facts,
-        box_kind: arrival.box_kind,
-        atoms,
-        custom_state_count: arrival.custom_state_count as usize,
-        class_count: arrival.class_count as usize,
-    }
-}
-
 pub const FIRST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND: u8 = 11;
-pub const LAST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND: u8 = 16;
+pub const LAST_ELEMENT_REFERENCE_PSEUDO_ELEMENT_KIND: u8 = 18;
 
 /// The element facts the style computation's box-type transformation and element style
 /// adjustments read. Mirrors C++ `ElementStyleAdjustmentFact`.
@@ -836,6 +823,9 @@ pub enum ElementBoxKind {
     InputRadioButton = 20,
     InputRange = 21,
     InputText = 22,
+    /// A `<frame>` whose parent is a `<frameset>`.
+    Frame = 23,
+    FrameSet = 24,
 }
 
 impl ElementBoxKind {
@@ -849,6 +839,32 @@ impl ElementBoxKind {
             Self::InputButton | Self::InputCheckBox | Self::InputRadioButton | Self::InputRange | Self::InputText
         )
     }
+}
+
+/// The unit of an entry in the parsed `cols` or `rows` of a `<frameset>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FfiFrameSetDimensionUnit {
+    Percentage = 0,
+    Relative = 1,
+    Absolute = 2,
+}
+
+/// An entry in the parsed `cols` or `rows` of a `<frameset>`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct FfiFrameSetDimension {
+    pub value: f64,
+    pub unit: FfiFrameSetDimensionUnit,
+}
+
+/// The border between a track of a `<frameset>` and the next track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FfiFrameSetBorder {
+    pub is_drawn: bool,
+    /// The color of the border, as ARGB.
+    pub color: u32,
 }
 
 /// Which element the values of a replaced content input are of. See
@@ -958,7 +974,6 @@ pub enum FfiElementDeclarationKind {
 #[repr(C)]
 pub struct FfiElementDeclarationDelta {
     pub node: u32,
-    pub kind: FfiElementDeclarationKind,
     pub old_block: u32,
     pub new_block: u32,
 }
@@ -1040,7 +1055,7 @@ impl super::projection_writes::ProjectionWrites<'_> {
             return;
         };
         *atoms = rest;
-        self.record_element_arrival(node, &element_arrival_facts(arrival, arrival_atoms), None);
+        self.record_element_arrival(node, arrival, arrival_atoms, None);
     }
 
     /// Write the local fact the host published as `delta`.
@@ -1123,10 +1138,6 @@ impl StyleEngine {
             self.record_input(
                 InputKey::ElementStyleInput(node),
                 InputValue::ElementStyleInput {
-                    reaction: 0,
-                    inherited_style_groups: 0,
-                },
-                InputValue::ElementStyleInput {
                     reaction: input.reaction,
                     inherited_style_groups: input.inherited_style_groups,
                 },
@@ -1150,11 +1161,11 @@ impl StyleEngine {
             // host: the host says only that the node has one.
             let new_block =
                 (delta.new_block != 0).then(|| DeclarationBlockID::new(self.retained.next_declaration_block_version()));
-            self.record_input(
-                InputKey::ElementDeclaration(node, decode_element_declaration_kind(delta.kind)),
-                InputValue::ElementDeclaration(block(delta.old_block)),
-                InputValue::ElementDeclaration(new_block),
-            );
+            self.retained.counters.bump(Counter::RawMutationRecords);
+            self.retained.counters.bump(Counter::ElementDeclarationDeltas);
+            if block(delta.old_block) != new_block {
+                self.host.element_inputs.note_declaration(node);
+            }
         }
     }
 }
@@ -2070,7 +2081,6 @@ mod tests {
         }];
         let declarations = [FfiElementDeclarationDelta {
             node: nodes[1],
-            kind: FfiElementDeclarationKind::InlineStyle,
             old_block: 0,
             new_block: 7,
         }];

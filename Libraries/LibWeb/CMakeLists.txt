@@ -64,10 +64,7 @@ set(SOURCES
     CredentialManagement/PasswordCredential.cpp
     CredentialManagement/PasswordCredentialOperations.cpp
     Crypto/Crypto.cpp
-    Crypto/CryptoAlgorithms.cpp
-    Crypto/CryptoBindings.cpp
     Crypto/CryptoKey.cpp
-    Crypto/SubtleCrypto.cpp
     CSS/Angle.cpp
     CSS/ComputedStyleWorkingSet.cpp
     CSS/ComputedValues.cpp
@@ -634,6 +631,7 @@ set(SOURCES
     HTML/VideoPlaybackQuality.cpp
     HTML/VideoTrack.cpp
     HTML/VideoTrackList.cpp
+    HTML/VisibilityStateEntry.cpp
     HTML/WebViewHints.cpp
     HTML/Window.cpp
     HTML/WindowEventHandlers.cpp

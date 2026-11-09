@@ -433,6 +433,31 @@ predecessor, cold blocks, the verifier.
 To be written: per-op lowering, slow path calling conventions and the operand record, the call
 stub, cache probes, the allocation contract, the entry and exit stubs.
 
+### 8.1 The calling convention of JIT code
+
+JIT code uses the System V calling convention on every x86-64 target and AAPCS64 on AArch64, which
+keeps code generation the same across operating systems. Windows x86-64 is the one target where
+that is not what the platform uses, so everything that crosses into or out of JIT code says so
+explicitly:
+
+- Native code enters JIT code through `extern "sysv64"` function pointers (`JitEntry`,
+  `EntryTrampoline`). The compiler then treats RSI, RDI and XMM6-15, which are callee-saved on
+  Windows only, as clobbered by the call, and takes two-register results where System V returns
+  them.
+- Every function JIT code calls has the `#[jit_abi]` attribute, which makes it `extern "sysv64"` on
+  Windows x86-64 and leaves it `extern "C"` elsewhere. Taking the address of a function erases its
+  calling convention, so JIT code gets the addresses of these functions from
+  `jit_function_address!`, which does not build for a function that lacks the attribute.
+- The interpreter calls the runtime functions in `interpreter::runtime_functions` with the Win64
+  convention on Windows, so `runtime_function_addresses()` gives JIT code System V forwarders to
+  them there.
+- Windows commits a thread's stack as code touches its guard pages, so JIT code that moves the
+  stack pointer goes through `emit_prologue()` or `allocate_stack()`, which touch the pages on the
+  way down (with the stack probes in `asm::x86_64`, which the Wasm JIT shares). Code that moves it
+  any other way can skip the guard pages and fault. Compiled functions check the native stack limit
+  before they touch their frames, with `emit_prologue_unprobed()` and `probe_frame()`, so that a
+  frame that does not fit makes the code exit instead of touching past the end of the stack.
+
 ## 9. Speculation and exits
 
 **Values of bindings.** The snapshot records the object values of global variables, and of the
@@ -526,7 +551,7 @@ How to build without the JIT, and how to turn it off and tune it at run time.
 ### 13.1 Building without the JIT
 
 The `ENABLE_JS_JIT` CMake option builds the JIT. It is on by default on x86-64 and AArch64 Linux and
-macOS, the platforms the JIT generates code for, and off elsewhere, Windows included. To build
+macOS and on x86-64 Windows, the platforms the JIT generates code for, and off elsewhere. To build
 without it:
 
 ```bash

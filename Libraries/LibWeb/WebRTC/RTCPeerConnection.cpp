@@ -242,8 +242,8 @@ void RTCPeerConnection::close_the_connection_algorithm(bool disappear)
 // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-createoffer
 GC::Ref<WebIDL::Promise> RTCPeerConnection::create_offer(RTCOfferOptions const& options)
 {
-    return chain_operation(GC::create_function(heap(), [this, options](JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
-        return create_offer_impl(options)->promise();
+    return chain_operation(GC::create_function(heap(), GC::captures(*this, options), [](auto& self, auto& options, JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
+        return self.create_offer_impl(options)->promise();
     }));
 }
 
@@ -289,8 +289,8 @@ GC::Ref<WebIDL::Promise> RTCPeerConnection::create_an_offer()
 // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-createanswer
 GC::Ref<WebIDL::Promise> RTCPeerConnection::create_answer(RTCAnswerOptions const& options)
 {
-    return chain_operation(GC::create_function(heap(), [this, options](JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
-        return create_answer_impl(options)->promise();
+    return chain_operation(GC::create_function(heap(), GC::captures(*this, options), [](auto& self, auto& options, JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
+        return self.create_answer_impl(options)->promise();
     }));
 }
 
@@ -335,8 +335,8 @@ GC::Ref<WebIDL::Promise> RTCPeerConnection::create_an_answer()
 // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-setlocaldescription
 GC::Ref<WebIDL::Promise> RTCPeerConnection::set_local_description(RTCLocalSessionDescriptionInit const& description)
 {
-    return chain_operation(GC::create_function(heap(), [this, description](JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
-        return set_local_description_impl(description)->promise();
+    return chain_operation(GC::create_function(heap(), GC::captures(*this, description), [](auto& self, auto& description, JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
+        return self.set_local_description_impl(description)->promise();
     }));
 }
 
@@ -375,12 +375,12 @@ GC::Ref<WebIDL::Promise> RTCPeerConnection::set_local_description_impl(RTCLocalS
     }
     if (sdp.is_empty() && type != Bindings::RTCSdpType::Rollback) {
         auto generated = type == Bindings::RTCSdpType::Offer ? create_an_offer() : create_an_answer();
-        return WebIDL::react_to_promise(generated, GC::create_function(heap(), [this, type](JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
-            if (m_is_closed)
+        return WebIDL::react_to_promise(generated, GC::create_function(heap(), GC::captures(*this, type), [](auto& self, auto& type, JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
+            if (self.m_is_closed)
                 return WebIDL::InvalidStateError::create("RTCPeerConnection is closed"_utf16);
             auto sdp_value = TRY(value.as_object().get("sdp"_utf16_fly_string));
-            auto generated_sdp = TRY(sdp_value.to_utf16_string(relevant_realm().vm()));
-            return set_a_local_description(type, generated_sdp)->promise();
+            auto generated_sdp = TRY(sdp_value.to_utf16_string(self.relevant_realm().vm()));
+            return self.set_a_local_description(type, generated_sdp)->promise();
         }),
             nullptr);
     }
@@ -405,8 +405,8 @@ GC::Ref<WebIDL::Promise> RTCPeerConnection::set_a_local_description(Bindings::RT
 // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-setremotedescription
 GC::Ref<WebIDL::Promise> RTCPeerConnection::set_remote_description(RTCSessionDescriptionInit const& description)
 {
-    return chain_operation(GC::create_function(heap(), [this, description](JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
-        return set_remote_description_impl(description)->promise();
+    return chain_operation(GC::create_function(heap(), GC::captures(*this, description), [](auto& self, auto& description, JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
+        return self.set_remote_description_impl(description)->promise();
     }));
 }
 
@@ -476,8 +476,8 @@ GC::RootVector<GC::Ref<RTCRtpReceiver>> RTCPeerConnection::get_receivers() const
 // https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-addicecandidate
 GC::Ref<WebIDL::Promise> RTCPeerConnection::add_ice_candidate(RTCIceCandidateInit const& candidate)
 {
-    return chain_operation(GC::create_function(heap(), [this, candidate](JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
-        return add_ice_candidate_impl(candidate)->promise();
+    return chain_operation(GC::create_function(heap(), GC::captures(*this, candidate), [](auto& self, auto& candidate, JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
+        return self.add_ice_candidate_impl(candidate)->promise();
     }));
 }
 
@@ -800,9 +800,9 @@ void RTCPeerConnection::restart_ice()
 
 void RTCPeerConnection::update_negotiation_needed_flag()
 {
-    HTML::queue_a_task(HTML::Task::Source::Networking, nullptr, nullptr, GC::create_function(heap(), [this] {
-        if (!m_is_closed && m_signaling_state == Bindings::RTCSignalingState::Stable)
-            on_negotiation_needed_received();
+    HTML::queue_a_task(HTML::Task::Source::Networking, nullptr, nullptr, GC::create_function(heap(), GC::captures(*this), [](auto& self) {
+        if (!self.m_is_closed && self.m_signaling_state == Bindings::RTCSignalingState::Stable)
+            self.on_negotiation_needed_received();
     }));
 }
 
@@ -1016,14 +1016,28 @@ namespace {
 struct TrackEventInit {
     GC::Ref<RTCRtpReceiver> receiver;
     GC::Ref<MediaCapture::MediaStreamTrack> track;
-    GC::RootVector<GC::Ref<MediaCapture::MediaStream>> streams;
+    Vector<GC::Ref<MediaCapture::MediaStream>> streams;
     GC::Ref<RTCRtpTransceiver> transceiver;
+
+    void visit_edges(GC::Cell::Visitor& visitor)
+    {
+        visitor.visit(receiver);
+        visitor.visit(track);
+        visitor.visit(streams);
+        visitor.visit(transceiver);
+    }
 };
 
 // Spec uses "(stream, track) pairs" in addList/removeList; alias for clarity.
 struct StreamTrackPair {
     GC::Ref<MediaCapture::MediaStream> stream;
     GC::Ref<MediaCapture::MediaStreamTrack> track;
+
+    void visit_edges(GC::Cell::Visitor& visitor)
+    {
+        visitor.visit(stream);
+        visitor.visit(track);
+    }
 };
 
 constexpr bool direction_is_receive(Bindings::RTCRtpTransceiverDirection d)
@@ -1043,8 +1057,8 @@ constexpr bool direction_is_send_only_or_inactive(Bindings::RTCRtpTransceiverDir
 // https://www.w3.org/TR/webrtc/#set-associated-remote-streams
 static void set_the_associated_remote_streams(RTCPeerConnection& pc, RTCRtpReceiver& receiver,
     Vector<String> const& msids,
-    GC::ConservativeVector<StreamTrackPair>& add_list,
-    GC::ConservativeVector<StreamTrackPair>& remove_list)
+    GC::RootVector<StreamTrackPair>& add_list,
+    GC::RootVector<StreamTrackPair>& remove_list)
 {
     // 1. Let connection be the RTCPeerConnection object associated with receiver.
     auto& connection = pc;
@@ -1098,7 +1112,7 @@ static void set_the_associated_remote_streams(RTCPeerConnection& pc, RTCRtpRecei
 }
 
 // https://www.w3.org/TR/webrtc/#process-the-addition-of-a-remote-track
-static void process_addition_of_remote_track(RTCRtpTransceiver& transceiver, GC::ConservativeVector<TrackEventInit>& track_event_inits)
+static void process_addition_of_remote_track(RTCRtpTransceiver& transceiver, GC::RootVector<TrackEventInit>& track_event_inits)
 {
     // 1. Let receiver be transceiver.[[Receiver]].
     auto receiver = transceiver.receiver();
@@ -1126,9 +1140,9 @@ static void process_removal_of_remote_track(RTCRtpTransceiver& transceiver, GC::
 // https://www.w3.org/TR/webrtc/#process-remote-tracks
 static void process_remote_tracks(RTCPeerConnection& pc, RTCRtpTransceiver& transceiver,
     Bindings::RTCRtpTransceiverDirection direction, Vector<String> const& msids,
-    GC::ConservativeVector<StreamTrackPair>& add_list,
-    GC::ConservativeVector<StreamTrackPair>& remove_list,
-    GC::ConservativeVector<TrackEventInit>& track_event_inits,
+    GC::RootVector<StreamTrackPair>& add_list,
+    GC::RootVector<StreamTrackPair>& remove_list,
+    GC::RootVector<TrackEventInit>& track_event_inits,
     GC::RootVector<GC::Ref<MediaCapture::MediaStreamTrack>>& mute_tracks)
 {
     auto add_list_size_before = add_list.size();
@@ -1206,9 +1220,9 @@ void RTCPeerConnection::on_remote_track_added(u64 receiver_id, u64 transceiver_i
 
     // Drive the spec's "process remote tracks" algorithm. The IPC only signals new
     // tracks today (no removals), so direction is recvonly.
-    GC::ConservativeVector<StreamTrackPair> add_list;
-    GC::ConservativeVector<StreamTrackPair> remove_list;
-    GC::ConservativeVector<TrackEventInit> track_event_inits;
+    GC::RootVector<StreamTrackPair> add_list;
+    GC::RootVector<StreamTrackPair> remove_list;
+    GC::RootVector<TrackEventInit> track_event_inits;
     GC::RootVector<GC::Ref<MediaCapture::MediaStreamTrack>> mute_tracks;
     process_remote_tracks(*this, *transceiver, Bindings::RTCRtpTransceiverDirection::Recvonly,
         stream_ids, add_list, remove_list, track_event_inits, mute_tracks);

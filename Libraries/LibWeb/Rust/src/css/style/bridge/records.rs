@@ -166,23 +166,6 @@ pub unsafe extern "C" fn style_engine_view_has_matching_transition_entries(
     })
 }
 
-pub(crate) fn publish_rule_declarations(
-    engine: &mut StyleEngine,
-    rule: u32,
-    data: &crate::css::declaration_block::SharedDeclarationBlock,
-) -> bool {
-    if rule == 0 {
-        return false;
-    }
-    let has_transitions = data
-        .properties()
-        .entries()
-        .iter()
-        .any(|entry| crate::css::property_metadata::property_defines_a_css_transition(entry.property()));
-    engine.publish_block_declarations(RuleID(rule - 1), data);
-    has_transitions
-}
-
 /// What a read of one element's style the host makes before the next style update asks of the
 /// engine; see `StyleEngine::answer_record_demand`. A read-only demand leaves the engine as it
 /// was: its record is only for the host to read. Any other is installed and acknowledged as a
@@ -232,17 +215,19 @@ pub enum FfiDemandedPseudoElement {
     Selection = 8,
     SpellingError = 9,
     ViewTransition = 10,
-    DetailsContent = 11,
-    FileSelectorButton = 12,
-    Placeholder = 13,
-    SliderFill = 14,
-    SliderThumb = 15,
-    SliderTrack = 16,
-    Highlight = 17,
-    ViewTransitionGroup = 20,
-    ViewTransitionImagePair = 21,
-    ViewTransitionNew = 22,
-    ViewTransitionOld = 23,
+    WebkitColorSwatchWrapper = 11,
+    ColorSwatch = 12,
+    DetailsContent = 13,
+    FileSelectorButton = 14,
+    Placeholder = 15,
+    SliderFill = 16,
+    SliderThumb = 17,
+    SliderTrack = 18,
+    Highlight = 19,
+    ViewTransitionGroup = 22,
+    ViewTransitionImagePair = 23,
+    ViewTransitionNew = 24,
+    ViewTransitionOld = 25,
 }
 
 /// The answer to a record demand: the record, or that the pseudo-element read generates no box
@@ -358,7 +343,7 @@ pub unsafe extern "C" fn style_engine_declared_only_record(
             if !engine.has_live_style() {
                 return None;
             }
-            engine.declared_only_record(subject, declared).ok()
+            engine.declared_only_record(subject, declared)
         })
     });
     record.map_or(std::ptr::null(), |record| std::sync::Arc::into_raw(record).cast())

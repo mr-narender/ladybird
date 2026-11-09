@@ -468,7 +468,7 @@ pub(crate) fn parse_url_value(context: &ParseContext, value: &ComponentValue) ->
     Some(StyleValueData::Url(StyleValueBox::new(UrlPayload {
         url: RetainedString::from_utf16(url)?,
         url_type,
-        modifiers: RetainedRequestUrlModifierList::from_retained_modifiers(modifiers),
+        modifiers: RetainedRequestUrlModifierList::from_vec(modifiers),
     })))
 }
 
@@ -1727,7 +1727,7 @@ fn parse_contain_intrinsic_size_shorthand(
     ParseOutcome::Parsed(shared_style_value(StyleValueData::Shorthand(StyleValueBox::new(
         ShorthandPayload {
             shorthand_property: property,
-            sub_properties: RetainedPropertyIdList::from_property_ids(longhands.to_vec()),
+            sub_properties: RetainedPropertyIdList::from_vec(longhands.to_vec()),
             values: RetainedStyleValueDataList::from_retained_values(
                 expanded.into_iter().map(RetainedStyleValueData::from_owned).collect(),
             ),
@@ -2958,7 +2958,7 @@ fn parse_color_scheme_property(_context: &ParseContext, values: &[ComponentValue
         return ParseOutcome::Parsed(shared_style_value(StyleValueData::ColorScheme(StyleValueBox::new(
             ColorSchemePayload {
                 schemes: CssStringList::from_strings(Vec::new()),
-                scheme_codes: RetainedByteList::from_bytes(Vec::new()),
+                scheme_codes: RetainedByteList::from_vec(Vec::new()),
                 only: false,
             },
         ))));
@@ -2997,7 +2997,7 @@ fn parse_color_scheme_property(_context: &ParseContext, values: &[ComponentValue
     ParseOutcome::Parsed(shared_style_value(StyleValueData::ColorScheme(StyleValueBox::new(
         ColorSchemePayload {
             schemes: CssStringList::from_strings(schemes),
-            scheme_codes: RetainedByteList::from_bytes(scheme_codes),
+            scheme_codes: RetainedByteList::from_vec(scheme_codes),
             only,
         },
     ))))
@@ -3091,7 +3091,7 @@ fn parse_counter_definitions_property(
     }
     ParseOutcome::Parsed(shared_style_value(StyleValueData::CounterDefinitions(
         StyleValueBox::new(CounterDefinitionsPayload {
-            counter_definitions: RetainedCounterDefinitionList::from_retained_elements(definitions),
+            counter_definitions: RetainedCounterDefinitionList::from_vec(definitions),
         }),
     )))
 }
@@ -3958,6 +3958,15 @@ pub(crate) fn context_allows_random_functions(context: &ParseContext) -> bool {
 }
 
 fn parse_color_property(context: &ParseContext, property: u16, values: &[ComponentValue]) -> ParseOutcome {
+    if context.is_ua_style_sheet && property == property_id::COLOR {
+        let mut tokens = values.iter().filter(|value| !value.is_whitespace());
+        if let Some(value) = tokens.next()
+            && tokens.next().is_none()
+            && let Some(value) = parse_specific_keyword(value, &[keyword::_LIBWEB_QUIRK_INHERIT])
+        {
+            return ParseOutcome::Parsed(shared_style_value(value));
+        }
+    }
     if !(FIRST_SHORTHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID).contains(&property)
         || property_is_shorthand(property)
         || !property_accepted_value_types(property).contains(&VALUE_TYPE_COLOR)
@@ -4027,7 +4036,7 @@ fn parse_positional_value_list_shorthand(
     ParseOutcome::Parsed(shared_style_value(StyleValueData::Shorthand(StyleValueBox::new(
         ShorthandPayload {
             shorthand_property: property,
-            sub_properties: RetainedPropertyIdList::from_property_ids(longhands.to_vec()),
+            sub_properties: RetainedPropertyIdList::from_vec(longhands.to_vec()),
             values: RetainedStyleValueDataList::from_retained_values(
                 expanded.into_iter().map(RetainedStyleValueData::from_owned).collect(),
             ),
@@ -4093,7 +4102,7 @@ fn retained_shorthand_value(
 ) -> StyleValueData {
     StyleValueData::Shorthand(StyleValueBox::new(ShorthandPayload {
         shorthand_property: property,
-        sub_properties: RetainedPropertyIdList::from_property_ids(sub_properties),
+        sub_properties: RetainedPropertyIdList::from_vec(sub_properties),
         values: RetainedStyleValueDataList::from_retained_values(values),
     }))
 }
@@ -4216,9 +4225,7 @@ fn parse_unordered_shorthand(context: &ParseContext, property: u16, values: &[Co
     ParseOutcome::Parsed(shared_style_value(StyleValueData::Shorthand(StyleValueBox::new(
         ShorthandPayload {
             shorthand_property: property,
-            sub_properties: RetainedPropertyIdList::from_property_ids(
-                order.iter().map(|&index| longhands[index]).collect(),
-            ),
+            sub_properties: RetainedPropertyIdList::from_vec(order.iter().map(|&index| longhands[index]).collect()),
             values: RetainedStyleValueDataList::from_retained_values(
                 order
                     .into_iter()
@@ -6690,6 +6697,36 @@ mod tests {
         let source = utf16(source);
         let values = consume_a_list_of_component_values(tokenize_for_parser(&source)).unwrap();
         parse_css_value(context, property, &values)
+    }
+
+    #[test]
+    fn quirk_inherit_is_only_a_ua_color_value() {
+        let mut ua = context();
+        ua.is_ua_style_sheet = true;
+        assert_eq!(
+            parsed_keyword(parse_with_context(&ua, property_id::COLOR, " -LIBWEB-QUIRK-INHERIT ")),
+            keyword::_LIBWEB_QUIRK_INHERIT
+        );
+        for property in [
+            property_id::COLOR,
+            property_id::BACKGROUND_COLOR,
+            property_id::BORDER_TOP_COLOR,
+        ] {
+            assert!(matches!(
+                parse(property, "-libweb-quirk-inherit"),
+                ParseOutcome::Invalid
+            ));
+        }
+        for (property, value) in [
+            (property_id::COLOR, "-libweb-quirk-inherit red"),
+            (property_id::BACKGROUND_COLOR, "-libweb-quirk-inherit"),
+            (property_id::BORDER_COLOR, "-libweb-quirk-inherit"),
+        ] {
+            assert!(matches!(
+                parse_with_context(&ua, property, value),
+                ParseOutcome::Invalid
+            ));
+        }
     }
 
     #[test]

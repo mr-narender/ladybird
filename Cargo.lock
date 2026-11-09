@@ -1761,6 +1761,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libcrypto_rust"
+version = "0.1.0"
+dependencies = [
+ "ak",
+]
+
+[[package]]
 name = "libgfx_rust"
 version = "0.1.0"
 dependencies = [
@@ -1819,6 +1826,7 @@ dependencies = [
  "flapc",
  "iced-x86",
  "libc",
+ "libjs_runtime_macros",
 ]
 
 [[package]]
@@ -1944,6 +1952,7 @@ dependencies = [
  "fARM64",
  "iced-x86",
  "libc",
+ "libjs_runtime_macros",
  "libwasm_engine",
  "libwasm_module",
  "serde_json",
@@ -1962,6 +1971,7 @@ dependencies = [
  "ladybird_allocator",
  "libcompositing_rust",
  "libcompress_rust",
+ "libcrypto_rust",
  "libgfx_rust",
  "libhttp_rust",
  "libipc_rust",

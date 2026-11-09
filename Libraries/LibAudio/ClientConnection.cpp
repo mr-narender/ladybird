@@ -51,6 +51,18 @@ bool ClientConnection::capture_is_pending_for_testing()
     return any_of(connection->m_capture_sources, [](auto const& entry) { return !entry.value.specification.has_value(); });
 }
 
+size_t ClientConnection::capture_stream_count_for_testing()
+{
+    auto const& connection = *s_connection;
+    if (!connection)
+        return 0;
+
+    size_t stream_count = 0;
+    for (auto const& [stream_id, source] : connection->m_capture_sources)
+        stream_count += source.stream_count;
+    return stream_count;
+}
+
 ClientConnection::ClientConnection(NonnullOwnPtr<IPC::Transport> transport)
     : IPC::ConnectionToServer<AudioClientEndpoint, AudioServerEndpoint>(*this, move(transport))
     , m_event_loop(Core::EventLoop::current())
@@ -142,7 +154,7 @@ void ClientConnection::devices_changed(Vector<AudioDeviceInfo> inputs, Vector<Au
         m_on_device_list(AudioDeviceEnumeration { .inputs = move(inputs), .outputs = move(outputs) });
 }
 
-NonnullRefPtr<RecordStream::CreatePromise> ClientConnection::create_record_stream(StringView device_id, RecordStream::RecordCallback callback)
+NonnullRefPtr<RecordStream::CreatePromise> ClientConnection::create_record_stream(StringView device_id, PlaybackGroupId group, RecordStream::RecordCallback callback)
 {
     auto promise = RecordStream::CreatePromise::construct();
     if (m_is_dead) {
@@ -151,7 +163,7 @@ NonnullRefPtr<RecordStream::CreatePromise> ClientConnection::create_record_strea
     }
 
     for (auto& [stream_id, source] : m_capture_sources) {
-        if (source.device_id != device_id)
+        if (source.device_id != device_id || source.group != group)
             continue;
         if (!source.specification.has_value()) {
             source.pending.append(PendingRecordStream { .promise = promise, .callback = move(callback) });
@@ -163,10 +175,10 @@ NonnullRefPtr<RecordStream::CreatePromise> ClientConnection::create_record_strea
     }
 
     auto stream_id = m_next_stream_id++;
-    CaptureSource source { .device_id = device_id, .specification = {}, .pending = {}, .stream_count = 0 };
+    CaptureSource source { .device_id = device_id, .group = group, .specification = {}, .pending = {}, .stream_count = 0 };
     source.pending.append(PendingRecordStream { .promise = promise, .callback = move(callback) });
     m_capture_sources.set(stream_id, move(source));
-    async_create_record_stream(stream_id, device_id);
+    async_create_record_stream(stream_id, device_id, group);
     return promise;
 }
 
@@ -180,7 +192,7 @@ void ClientConnection::record_stream_created(u64 stream_id, SharedAudioFrameRing
     // FIXME: Support channel layouts beyond mono and stereo.
     if (ring.channel_count() == 0 || ring.channel_count() > 2) {
         async_destroy_record_stream(stream_id);
-        record_stream_creation_failed(stream_id);
+        record_stream_creation_failed(stream_id, RecordStreamFailure::DeviceUnavailable);
         return;
     }
     SampleSpecification specification(ring.sample_rate(), ring.channel_count() == 1 ? ChannelMap::mono() : ChannelMap::stereo());
@@ -200,13 +212,14 @@ void ClientConnection::record_stream_created(u64 stream_id, SharedAudioFrameRing
         pending_stream.promise->resolve(adopt_ref(*new RemoteRecordStream(*this, stream_id, specification, move(pending_stream.callback))));
 }
 
-void ClientConnection::record_stream_creation_failed(u64 stream_id)
+void ClientConnection::record_stream_creation_failed(u64 stream_id, RecordStreamFailure failure)
 {
     auto source = m_capture_sources.take(stream_id);
     if (!source.has_value())
         return;
+    auto error_code = failure == RecordStreamFailure::Refused ? EPERM : EIO;
     for (auto& pending_stream : source->pending)
-        pending_stream.promise->reject(Error::from_string_literal("Audio server could not open the capture device"));
+        pending_stream.promise->reject(Error::from_errno(error_code));
 }
 
 void ClientConnection::record_stream_closed(u64 stream_id)

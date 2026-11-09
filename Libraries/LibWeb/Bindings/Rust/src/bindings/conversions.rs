@@ -278,6 +278,26 @@ fn to_integer_enforcing_range(vm: &Vm, value: Value, lower_bound: f64, upper_bou
 /// [EnforceRange] or [Clamp].
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
+/// A JS value converted to an octet with [EnforceRange], https://webidl.spec.whatwg.org/#js-octet
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is an integer within the bounds of the type"
+)]
+pub(crate) fn to_octet_enforcing_range(vm: &Vm, value: Value) -> ThrowCompletionOr<u8> {
+    Ok(to_integer_enforcing_range(vm, value, 0.0, f64::from(u8::MAX))? as u8)
+}
+
+/// A JS value converted to an unsigned short with [EnforceRange], https://webidl.spec.whatwg.org/#js-unsigned-short
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is an integer within the bounds of the type"
+)]
+pub(crate) fn to_unsigned_short_enforcing_range(vm: &Vm, value: Value) -> ThrowCompletionOr<u16> {
+    Ok(to_integer_enforcing_range(vm, value, 0.0, f64::from(u16::MAX))? as u16)
+}
+
 /// A JS value converted to a long with [EnforceRange], https://webidl.spec.whatwg.org/#js-long
 #[allow(
     clippy::cast_possible_truncation,
@@ -1154,6 +1174,15 @@ impl ToJs for UsvString {
 impl ToJs for Gc<TypedArrayBase> {
     fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
         Ok(Value::from_object(self))
+    }
+}
+
+impl ToJs for ArrayBufferView {
+    fn to_js(self, _: &CallContext) -> ThrowCompletionOr<Value> {
+        Ok(match self {
+            Self::DataView(view) => Value::from_object(view),
+            Self::TypedArray(array) => Value::from_object(array),
+        })
     }
 }
 

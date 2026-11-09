@@ -15,7 +15,9 @@
 #include <AK/Queue.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
+#include <LibAudio/Forward.h>
 #include <LibCompositing/Types.h>
+#include <LibCore/Forward.h>
 #include <LibGC/Root.h>
 #include <LibGC/Weak.h>
 #include <LibGfx/Cursor.h>
@@ -47,6 +49,7 @@
 #include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
 #include <LibWeb/Geolocation/GeolocationPositionError.h>
+#include <LibWeb/HTML/DedicatedWorkerThreadLink.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
 #include <LibWeb/HTML/PreparedNavigationDescriptor.h>
@@ -322,7 +325,8 @@ public:
     void select_dropdown_closed(Optional<u32> const& selected_item_id);
 
     using ClipboardRequest = GC::Ref<GC::Function<void(Vector<Clipboard::SystemClipboardItem>)>>;
-    void request_clipboard_entries(ClipboardRequest);
+    void request_clipboard_entries_for_paste(ClipboardRequest);
+    void request_clipboard_entries(ClipboardRequest, HTML::CrossProcessId reading_document_id);
     void retrieved_clipboard_entries(u64 request_id, Vector<Clipboard::SystemClipboardItem>);
 
     using SpellCheckRequest = GC::Ref<GC::Function<void(Vector<SpellingError>)>>;
@@ -818,12 +822,13 @@ public:
     virtual void page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document&) { }
     virtual void page_did_change_active_document_in_child_navigable(Web::DOM::Document&) { }
     virtual void page_did_finish_loading(HTML::CrossProcessId, HTML::CrossProcessId) { }
-    virtual Optional<u64> page_did_start_download(HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
+    virtual Optional<u64> page_did_start_download(HTML::CrossProcessId navigable_id, Optional<Utf16String> const& navigation_id, URL::URL const&, ByteString const& suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
     {
         (void)navigable_id;
         (void)navigation_id;
         (void)suggested_filename;
         (void)total_size;
+        (void)same_site_context;
         (void)request_server_client_id;
         (void)request_server_request_id;
         (void)initial_data;
@@ -915,11 +920,15 @@ public:
     virtual bool page_did_request_has_populated_document_for_testing([[maybe_unused]] HTML::CrossProcessId navigable_id) { return false; }
     virtual bool page_did_request_tab_is_playing_audio_for_testing() { return false; }
     virtual bool page_did_request_tab_is_heard_playing_audio_for_testing() { return false; }
+    virtual bool page_did_request_tab_is_using_microphone_for_testing() { return false; }
+    virtual bool page_did_request_tab_is_capturing_audio_for_testing() { return false; }
+    virtual void page_did_report_audio_capture_for_testing([[maybe_unused]] Web::PageId labelled_page_id, [[maybe_unused]] bool capturing) { }
+    virtual void page_did_retire_picture_in_picture_window_for_testing() { }
     virtual u64 page_did_request_tab_audibility_change_count_for_testing() { return 0; }
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() { return false; }
     virtual bool page_did_request_restore_session_history_snapshot_for_testing() { return false; }
-    virtual bool page_did_request_register_session_store_tab_for_testing() { return false; }
-    virtual String page_did_request_session_store_tab_state_for_testing() { return "{}"_string; }
+    virtual bool page_did_request_record_reported_session_history_for_testing() { return false; }
+    virtual String page_did_request_reported_session_history_for_testing() { return "{}"_string; }
     virtual void page_did_request_history_operation([[maybe_unused]] HTML::CrossProcessId operation_id, [[maybe_unused]] HistoryOperationParameters parameters) { }
     virtual void page_did_revoke_history_operation([[maybe_unused]] HTML::CrossProcessId operation_id) { }
     virtual void page_did_request_child_navigable_unload([[maybe_unused]] HTML::CrossProcessId navigable_id) { }
@@ -973,8 +982,10 @@ public:
     virtual void page_did_change_theme_color(Gfx::Color) { }
     virtual void page_did_change_background_color(Gfx::Color) { }
 
-    virtual void page_did_insert_clipboard_item(Clipboard::SystemClipboardItem const&, [[maybe_unused]] StringView presentation_style) { }
-    virtual void page_did_request_clipboard_entries([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_insert_clipboard_item(Clipboard::SystemClipboardItem const&, [[maybe_unused]] StringView presentation_style, [[maybe_unused]] Optional<HTML::CrossProcessId> writing_document_id) { }
+    virtual void page_did_request_clipboard_entries_for_paste([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_request_clipboard_entries([[maybe_unused]] u64 request_id, [[maybe_unused]] HTML::CrossProcessId reading_document_id) { }
+    virtual void page_did_request_paste_from_clipboard_for_testing() { }
     virtual void page_did_request_spell_check([[maybe_unused]] u64 request_id, [[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_request_translation([[maybe_unused]] TranslationUnit const&) { }
     virtual void page_did_request_page_translation_for_testing([[maybe_unused]] String const& target_language) { }
@@ -988,6 +999,8 @@ public:
     virtual NonnullOwnPtr<MediaClient::RemotePlaybackManager> create_media_playback_manager();
     // A media element adopted from another page's document plays its sound for this page from then on.
     virtual void rebind_media_playback_manager(MediaClient::RemotePlaybackManager&);
+    // Every microphone track captures through its own, for this page.
+    virtual NonnullRefPtr<Core::Promise<NonnullRefPtr<Audio::RecordStream>>> create_audio_record_stream(StringView device_id, Function<void(ReadonlyBytes, Audio::SampleSpecification const&)>);
     virtual void page_did_change_screen_wake_lock_state(ScreenWakeLockState) { }
 
     virtual void page_did_start_using_gamepads() { }
@@ -1021,10 +1034,8 @@ public:
         bool is_hosted_in_this_process { false };
     };
     virtual StartedWorkerAgent start_worker_agent([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
+    virtual RefPtr<HTML::DedicatedWorkerThreadLink> start_dedicated_worker([[maybe_unused]] HTML::WorkerAgentStartRequest&& request) { return {}; }
     virtual void close_worker_agent([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] HTML::WorkerAgentOwnerToken owner_token) { }
-    virtual void rtc_transform_init([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] u64 transform_id, [[maybe_unused]] HTML::SerializedTransferRecord options_record) { }
-    virtual void rtc_transform_teardown([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] u64 transform_id) { }
-    virtual void rtc_transform_encoded_audio_frame([[maybe_unused]] HTML::WorkerAgentId agent_id, [[maybe_unused]] u64 transform_id, [[maybe_unused]] ByteBuffer payload, [[maybe_unused]] u32 ssrc, [[maybe_unused]] u8 payload_type, [[maybe_unused]] u32 rtp_timestamp, [[maybe_unused]] u16 sequence_number) { }
 
     virtual void page_did_mutate_dom([[maybe_unused]] Utf16FlyString const& type, [[maybe_unused]] DOM::Node const& target, [[maybe_unused]] DOM::NodeList& added_nodes, [[maybe_unused]] DOM::NodeList& removed_nodes, [[maybe_unused]] GC::Ptr<DOM::Node> previous_sibling, [[maybe_unused]] GC::Ptr<DOM::Node> next_sibling, [[maybe_unused]] Optional<Utf16FlyString> const& attribute_name) { }
     virtual void flush_pending_dom_mutations() { }

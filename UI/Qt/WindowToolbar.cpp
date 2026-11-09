@@ -11,13 +11,13 @@
 #include <AK/kmalloc.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CrashReportOutbox.h>
-#include <LibWebView/DownloadPresentation.h>
-#include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/WebCompatReport.h>
 #include <UI/Qt/Application.h>
+#include <UI/Qt/ApplicationActions.h>
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/DownloadPresentation.h>
 #include <UI/Qt/FeedbackPopover.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/LadybirdButton.h>
@@ -29,6 +29,7 @@
 #include <UI/Qt/Motion.h>
 #include <UI/Qt/PerformanceMonitorWidget.h>
 #include <UI/Qt/Popover.h>
+#include <UI/Qt/RemoteDownloads.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/SystemAppearance.h>
 #include <UI/Qt/Theme.h>
@@ -700,6 +701,9 @@ public:
     void round_corners()
     {
 #if defined(AK_OS_MACOS)
+        // Asking for the native view would create the window's native window, even while the window is still being built.
+        if (!internalWinId())
+            return;
         if (m_expanded)
             round_appkit_view_corners(*this, ChromeStyle::LOCATION_EDIT_CORNER_RADIUS, Qt::transparent);
         else
@@ -708,6 +712,13 @@ public:
     }
 
 private:
+    virtual bool event(QEvent* event) override
+    {
+        if (event->type() == QEvent::WinIdChange)
+            round_corners();
+        return QWidget::event(event);
+    }
+
     virtual void paintEvent(QPaintEvent*) override
     {
         QPainter painter(this);
@@ -916,7 +927,7 @@ public:
         m_file_name_label->setToolTip(qstring_from_ak_string(download.destination.string()));
         m_file_icon->set_extension(qstring_from_ak_string(download.destination.extension()));
 
-        auto status_text = qstring_from_ak_string(WebView::download_status_text(download));
+        auto status_text = qstring_from_ak_string(download_status_text(download));
         m_status_label->setText(status_text);
         m_status_label->setToolTip(status_text);
         auto failed = download.status == WebView::FileDownloader::DownloadStatus::Failed;
@@ -1048,7 +1059,7 @@ public:
     bool set_downloads(ReadonlySpan<WebView::FileDownloader::Download> downloads)
     {
         bool geometry_changed = false;
-        auto visible_downloads = WebView::recent_downloads_for_popover(downloads);
+        auto visible_downloads = recent_downloads_for_popover(downloads);
 
         if (!rows_match(visible_downloads)) {
             rebuild_rows(visible_downloads);
@@ -1143,9 +1154,10 @@ private:
 
 WindowToolbar::WindowToolbar(WebView::IsPrivate is_private, QWidget* parent)
     : QWidget(parent)
+    , WebView::SettingsObserver(Application::settings())
     , m_is_private(is_private)
 {
-    auto& application = WebView::Application::the();
+    auto& application = ApplicationActions::the();
 
     setObjectName("LadybirdToolbarContainer");
     // NB: The style sheet paints the toolbar's background, which a QWidget subclass only draws when asked to.
@@ -1179,11 +1191,12 @@ WindowToolbar::WindowToolbar(WebView::IsPrivate is_private, QWidget* parent)
 
     m_navigate_back_action.action().setEnabled(false);
     m_navigate_forward_action.action().setEnabled(false);
+    // NB: The application's reload actions own the shortcuts, so the window and its View menu share one action for each.
+    //     The window also stays shown while a page is full screen, which the toolbar doesn't.
     m_reload_action = create_application_action(*this, application.reload_action());
-    // NB: Reloading without the cache has no button of its own, so its shortcut belongs to what holds the toolbar,
-    //     which stays shown when the toolbar does not.
-    m_reload_bypassing_cache_action = create_application_action(*parent, application.reload_bypassing_cache_action());
-    parent->addAction(m_reload_bypassing_cache_action);
+    m_reload_action->setShortcuts({});
+    m_reload_bypassing_cache_action = create_application_action(*this, application.reload_bypassing_cache_action());
+    m_reload_bypassing_cache_action->setShortcuts({});
     m_stop_action = new QAction("Stop", this);
     m_stop_action->setToolTip("Stop loading this page");
     QObject::connect(m_stop_action, &QAction::triggered, this, [this] {
@@ -1253,7 +1266,6 @@ WindowToolbar::WindowToolbar(WebView::IsPrivate is_private, QWidget* parent)
     m_performance_monitor = new PerformanceMonitorWidget(m_performance_monitor_row);
     performance_monitor_row_layout->addWidget(m_performance_monitor);
     performance_monitor_row_layout->addStretch(1);
-    (void)WebView::TabPerformanceMonitor::the();
     update_performance_monitor_row();
 
     m_sidebar_slot = new QWidget(m_toolbar);
@@ -1876,7 +1888,7 @@ void WindowToolbar::tab_settings_changed()
 void WindowToolbar::config_variable_changed(WebView::ConfigVariableID variable)
 {
     if (variable == WebView::ConfigVariableID::ShowFeedbackButton && m_feedback_button) {
-        auto show_button = WebView::Application::settings().config_variable_as_bool(variable);
+        auto show_button = Application::settings().config_variable_as_bool(variable);
         if (!show_button && m_feedback_popover)
             m_feedback_popover->close();
         m_feedback_button->setVisible(show_button);
@@ -1887,7 +1899,7 @@ void WindowToolbar::config_variable_changed(WebView::ConfigVariableID variable)
 
 void WindowToolbar::update_performance_monitor_row()
 {
-    auto enabled = WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowTabPerformanceMonitor);
+    auto enabled = Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowTabPerformanceMonitor);
     m_performance_monitor_row->setVisible(enabled && isVisible());
 }
 
@@ -1934,8 +1946,8 @@ void WindowToolbar::recreate_icons()
 
 void WindowToolbar::update_downloads_button()
 {
-    auto downloads = WebView::Application::the().file_downloader().downloads_of_session(m_is_private);
-    auto button_state = WebView::downloads_button_state(downloads);
+    auto downloads = RemoteDownloads::the().downloads_of_session(m_is_private);
+    auto button_state = downloads_button_state(downloads);
 
     if (!button_state.has_downloads && m_downloads_popover)
         m_downloads_popover->close();
@@ -1964,7 +1976,7 @@ void WindowToolbar::update_downloads_popover()
     if (!m_downloads_popover || !m_downloads_popover->isVisible())
         return;
 
-    if (m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads_of_session(m_is_private)))
+    if (m_downloads_popover->set_downloads(RemoteDownloads::the().downloads_of_session(m_is_private)))
         position_downloads_popover();
 }
 
@@ -2028,8 +2040,8 @@ void WindowToolbar::show_feedback_popover()
 // The downloads hang from the downloads button. Without any, the downloads page opens instead.
 void WindowToolbar::show_downloads_popover()
 {
-    auto downloads = WebView::Application::the().file_downloader().downloads_of_session(m_is_private);
-    if (!WebView::downloads_button_state(downloads).has_downloads) {
+    auto downloads = RemoteDownloads::the().downloads_of_session(m_is_private);
+    if (!downloads_button_state(downloads).has_downloads) {
         m_open_downloads_page_action->trigger();
         return;
     }
@@ -2041,25 +2053,25 @@ void WindowToolbar::show_downloads_popover()
             m_downloads_button->setChecked(visible);
         };
         m_downloads_popover->on_cancel_download = [this](u64 id) {
-            auto& file_downloader = WebView::Application::the().file_downloader();
+            auto& file_downloader = RemoteDownloads::the();
             if (auto download = file_downloader.download(id); download.has_value() && WebView::FileDownloader::status_is_active(download->status))
                 file_downloader.cancel_download(id);
             update_downloads_popover();
         };
         m_downloads_popover->on_pause_download = [this](u64 id) {
-            WebView::Application::the().file_downloader().pause_download(id);
+            RemoteDownloads::the().pause_download(id);
             update_downloads_popover();
         };
         m_downloads_popover->on_resume_download = [this](u64 id) {
-            WebView::Application::the().file_downloader().resume_download(id);
+            RemoteDownloads::the().resume_download(id);
             update_downloads_popover();
         };
         m_downloads_popover->on_show_in_folder = [](u64 id) {
-            if (auto download = WebView::Application::the().file_downloader().download(id); download.has_value())
-                WebView::Application::the().show_download_in_folder(*download);
+            if (auto download = RemoteDownloads::the().download(id); download.has_value())
+                RemoteDownloads::the().show_in_folder(id);
         };
         m_downloads_popover->on_clear_finished = [this] {
-            (void)WebView::Application::the().file_downloader().prune_inactive_downloads(m_is_private);
+            RemoteDownloads::the().prune_inactive_downloads(m_is_private);
             update_downloads_popover();
         };
         m_downloads_popover->on_open_all_downloads = [this] {
@@ -2070,7 +2082,7 @@ void WindowToolbar::show_downloads_popover()
     }
 
     m_downloads_popover->update_chrome_style(palette());
-    (void)m_downloads_popover->set_downloads(WebView::Application::the().file_downloader().downloads_of_session(m_is_private));
+    (void)m_downloads_popover->set_downloads(RemoteDownloads::the().downloads_of_session(m_is_private));
     position_downloads_popover();
     m_downloads_popover->show();
     position_downloads_popover();

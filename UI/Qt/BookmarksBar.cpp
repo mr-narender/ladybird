@@ -7,11 +7,14 @@
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <LibWebView/Application.h>
-#include <LibWebView/BookmarkStore.h>
+#include <UI/Qt/Application.h>
+#include <UI/Qt/BookmarkStore.h>
+#include <UI/Qt/Bookmarks.h>
 #include <UI/Qt/BookmarksBar.h>
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/HubConnection.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/Motion.h>
@@ -331,10 +334,10 @@ void BookmarksBar::rebuild()
             slide_in(*button, layout.preferred_width);
     };
 
-    for (auto const& item : WebView::Application::the().bookmarks_menu().items()) {
+    for (auto const& item : Application::bookmarks().menu().items()) {
         item.visit(
-            [&](NonnullRefPtr<WebView::Action> const& bookmark) {
-                if (bookmark->id() != WebView::ActionID::BookmarkItem)
+            [&](NonnullRefPtr<Action> const& bookmark) {
+                if (bookmark->id() != ActionID::BookmarkItem)
                     return;
 
                 auto* action = create_application_action(*this, *bookmark);
@@ -343,7 +346,7 @@ void BookmarksBar::rebuild()
                 if (auto* button = as_if<QToolButton>(widgetForAction(action)))
                     set_button_properties(button, qstring_from_ak_string(bookmark->text()));
             },
-            [&](NonnullRefPtr<WebView::Menu> const& folder) {
+            [&](NonnullRefPtr<Menu> const& folder) {
                 if (folder->properties().get("type"sv) != "folder"sv)
                     return;
 
@@ -374,7 +377,7 @@ void BookmarksBar::rebuild()
                     QObject::connect(submenu, &QMenu::aboutToHide, button, [set_menu_open] { set_menu_open(false); });
                 }
             },
-            [](WebView::Separator) {
+            [](Separator) {
             });
     }
 
@@ -386,28 +389,34 @@ void BookmarksBar::rebuild()
     }
 }
 
-void BookmarksBar::show_context_menu(QPoint position, Optional<WebView::BookmarkItem const&> item, Optional<String const&> target_folder_id, Optional<String const&> parent_folder_id)
+void BookmarksBar::report_context_menu_item() const
 {
-    auto* view = current_view();
-    if (!view)
+    Application::bookmarks().set_context_menu_item(m_selected_bookmark_menu_item_id, m_selected_bookmark_menu_target_folder_id, m_selected_bookmark_menu_parent_folder_id);
+}
+
+void BookmarksBar::show_context_menu(QPoint position, Optional<BookmarkItem const&> item, Optional<String const&> target_folder_id, Optional<String const&> parent_folder_id)
+{
+    if (!current_view())
         return;
 
     if (item.has_value()) {
         m_selected_bookmark_menu_item_id = item->id;
         m_selected_bookmark_menu_target_folder_id = target_folder_id.copy();
         m_selected_bookmark_menu_parent_folder_id = parent_folder_id.copy();
+        report_context_menu_item();
 
         if (item->is_bookmark())
-            execute_context_menu_later(m_context_menu, *this, view->bookmark_context_menu(), position);
+            execute_context_menu_later(m_context_menu, *this, Application::bookmarks().bookmark_context_menu(), position);
         else if (item->is_folder())
-            execute_context_menu_later(m_context_menu, *this, view->bookmark_folder_context_menu(), position);
+            execute_context_menu_later(m_context_menu, *this, Application::bookmarks().bookmark_folder_context_menu(), position);
     } else {
         // NB: Empty space in a folder that about:bookmarks shows adds to that folder, and elsewhere to the bar.
         m_selected_bookmark_menu_item_id = {};
         m_selected_bookmark_menu_target_folder_id = target_folder_id.copy();
         m_selected_bookmark_menu_parent_folder_id = {};
+        report_context_menu_item();
 
-        execute_context_menu_later(m_context_menu, *this, view->bookmarks_bar_context_menu(), position);
+        execute_context_menu_later(m_context_menu, *this, Application::bookmarks().bookmarks_bar_context_menu(), position);
     }
 }
 
@@ -469,13 +478,13 @@ bool BookmarksBar::handle_middle_mouse_click(QMouseEvent* event, QObject* item)
         extract_item_properties(action);
 
         if (m_selected_bookmark_menu_item_type == "bookmark")
-            WebView::Application::the().open_bookmark_in_new_tab(m_selected_bookmark_menu_item_id, activate_tab);
+            Application::bookmarks().open_in_new_tab(m_selected_bookmark_menu_item_id, activate_tab);
     } else if (auto* menu = as_if<QMenu>(item)) {
         if (auto* action = menu->actionAt(event->pos())) {
             extract_item_properties(action);
 
             if (m_selected_bookmark_menu_item_type == "bookmark")
-                WebView::Application::the().open_bookmark_in_new_tab(m_selected_bookmark_menu_item_id, activate_tab);
+                Application::bookmarks().open_in_new_tab(m_selected_bookmark_menu_item_id, activate_tab);
         }
     }
 
@@ -487,16 +496,15 @@ bool BookmarksBar::handle_right_mouse_click(QMouseEvent* event, QObject* item)
     // FIXME: The menus below should use execute_context_menu_later() instead to use native context menus on macOS.
     //        However, more work is needed to ensure that opened bookmark folders do not disappear when the native menu
     //        is shown.
-    auto* view = current_view();
-    if (!view)
+    if (!current_view())
         return true;
 
     auto position = event->globalPosition().toPoint();
-    auto context_menu_for_selected_item = [&]() -> WebView::Menu* {
+    auto context_menu_for_selected_item = [&]() -> Menu* {
         if (m_selected_bookmark_menu_item_type == "bookmark")
-            return &view->bookmark_context_menu();
+            return &Application::bookmarks().bookmark_context_menu();
         if (m_selected_bookmark_menu_item_type == "folder")
-            return &view->bookmark_folder_context_menu();
+            return &Application::bookmarks().bookmark_folder_context_menu();
         return nullptr;
     };
 
@@ -505,7 +513,7 @@ bool BookmarksBar::handle_right_mouse_click(QMouseEvent* event, QObject* item)
         m_selected_bookmark_menu_target_folder_id = {};
         m_selected_bookmark_menu_parent_folder_id = {};
 
-        replace_context_menu(m_context_menu, *this, view->bookmarks_bar_context_menu()).popup(position);
+        replace_context_menu(m_context_menu, *this, Application::bookmarks().bookmarks_bar_context_menu()).popup(position);
     } else if (auto* button = as_if<QToolButton>(item)) {
         extract_item_properties(button->defaultAction());
         auto* menu = context_menu_for_selected_item();
@@ -644,7 +652,7 @@ void BookmarksBarContainer::set_sidebar(QWidget& sidebar)
 
 bool BookmarksBarContainer::shows_over_page() const
 {
-    return WebView::Application::settings().appearance().show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover;
+    return Application::settings().appearance().show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover;
 }
 
 bool BookmarksBarContainer::can_expand_on_hover() const
@@ -670,7 +678,9 @@ bool BookmarksBarContainer::cursor_is_over_hover_region() const
     auto contains_cursor = [&](QWidget const& widget) {
         return widget.isVisible() && QRect { widget.mapToGlobal(QPoint {}), widget.size() }.contains(cursor_position);
     };
-    return contains_cursor(m_toolbar) || contains_cursor(*this) || (m_sidebar && contains_cursor(*m_sidebar));
+
+    return contains_cursor(m_toolbar) || contains_cursor(*this)
+        || (m_sidebar && m_toolbar.arrangement() == ToolbarArrangement::Sidebar && contains_cursor(*m_sidebar));
 }
 
 void BookmarksBarContainer::update_hover()
@@ -681,7 +691,7 @@ void BookmarksBarContainer::update_hover()
     }
 
     if (!m_hover_expanded && !m_hover_expand_timer->isActive()) {
-        auto delay = WebView::Application::settings().config_variable_as_integer<int>(WebView::ConfigVariableID::VerticalTabsHoverExpandDelay);
+        auto delay = Application::settings().config_variable_as_integer<int>(WebView::ConfigVariableID::VerticalTabsHoverExpandDelay);
         m_hover_expand_timer->start(delay);
     }
 }
@@ -697,7 +707,7 @@ void BookmarksBarContainer::set_hover_expanded(bool expanded)
     m_hover_expand_animation->stop();
 
     auto duration = expanded && !SystemAppearance::prefers_reduced_motion()
-        ? WebView::Application::settings().config_variable_as_integer<int>(WebView::ConfigVariableID::VerticalTabsHoverExpandAnimationDuration)
+        ? Application::settings().config_variable_as_integer<int>(WebView::ConfigVariableID::VerticalTabsHoverExpandAnimationDuration)
         : 0;
     m_hover_expand_progress = expanded && duration == 0 ? 1.0 : 0.0;
 
@@ -716,7 +726,7 @@ void BookmarksBarContainer::set_hover_expanded(bool expanded)
 
 void BookmarksBarContainer::update_geometry()
 {
-    auto show_bookmarks_bar = WebView::Application::settings().appearance().show_bookmarks_bar;
+    auto show_bookmarks_bar = Application::settings().appearance().show_bookmarks_bar;
     auto on_hover = show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover;
     auto visible = !window()->isFullScreen()
         && (show_bookmarks_bar == WebView::ShowBookmarksBar::Always
@@ -759,7 +769,9 @@ bool BookmarksBarContainer::event(QEvent* event)
 
 bool BookmarksBarContainer::eventFilter(QObject* watched, QEvent* event)
 {
-    if (m_tab && m_tab->is_loaded() && watched == &m_tab->location_edit() && event->type() == QEvent::DynamicPropertyChange) {
+    auto watched_location_edit = m_tab && m_tab->is_loaded() && watched == &m_tab->location_edit();
+
+    if (watched_location_edit && event->type() == QEvent::DynamicPropertyChange) {
         if (static_cast<QDynamicPropertyChangeEvent*>(event)->propertyName() == "autocompleteOpen")
             update_hover();
     }
@@ -770,7 +782,7 @@ bool BookmarksBarContainer::eventFilter(QObject* watched, QEvent* event)
     if (watched == m_bar && event->type() == QEvent::LayoutRequest)
         update_geometry();
 
-    if (watched == &m_toolbar || watched == this || watched == m_sidebar) {
+    if (watched == &m_toolbar || watched == this || watched == m_sidebar || watched_location_edit) {
         if (event->type() == QEvent::Enter || event->type() == QEvent::Show) {
             update_hover();
         } else if (event->type() == QEvent::Leave) {

@@ -14,7 +14,6 @@
 #include <AK/NeverDestroyed.h>
 #include <AK/Utf16StringBuilder.h>
 #include <AK/Vector.h>
-#include <LibGC/ConservativeVector.h>
 #include <LibGC/DeferGC.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
@@ -1968,8 +1967,10 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
     struct PreviousReadWriteState {
         GC::Ptr<Element> element;
         bool value;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
     };
-    GC::ConservativeVector<PreviousReadWriteState> previous_read_write_states;
+    GC::RootVector<PreviousReadWriteState> previous_read_write_states;
     if (old_parent->in_editable_subtree() != new_parent.in_editable_subtree()) {
         for_each_in_inclusive_subtree_of_type<Element>([&](Element& element) {
             previous_read_write_states.append({ element, SelectorMatching::element_matches_state(element, CSS::PseudoClass::ReadWrite) });
@@ -3047,9 +3048,9 @@ GC::Ref<NodeList> Node::child_nodes()
 {
     auto& child_nodes = ensure_rare_data().child_nodes;
     if (!child_nodes) {
-        child_nodes = LiveNodeList::create(*this, LiveNodeList::Scope::Children, [](auto&) {
+        child_nodes = LiveNodeList::create(*this, LiveNodeList::Scope::Children, GC::create_function(heap(), [](Node const&) {
             return true;
-        });
+        }));
     }
     return *child_nodes;
 }

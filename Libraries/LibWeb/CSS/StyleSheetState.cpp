@@ -317,7 +317,7 @@ GC::Ref<WebIDL::Promise> StyleSheetState::replace(Utf16String text)
     auto& realm = HTML::relevant_realm(*constructor_document());
     auto promise = WebIDL::create_promise_for(*constructor_document());
     set_disallow_modification(true);
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(realm.heap(), [sheet = GC::Ref { cssom_sheet() }, &realm, text = move(text), promise = GC::Root(promise)] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(realm.heap(), GC::captures(GC::Ref { cssom_sheet() }, realm, move(text), GC::Root(promise)), [](auto& sheet, auto& realm, auto& text, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
         auto& state = sheet->state();
 
@@ -824,21 +824,6 @@ Parser::ParsingParams StyleSheetState::make_parsing_params() const
 
     parsing_params.declared_namespaces = declared_namespaces();
     return parsing_params;
-}
-
-StringView StyleSheetState::loading_state_name(LoadingState loading_state)
-{
-    switch (loading_state) {
-    case LoadingState::Unloaded:
-        return "Unloaded"sv;
-    case LoadingState::Loading:
-        return "Loading"sv;
-    case LoadingState::Loaded:
-        return "Loaded"sv;
-    case LoadingState::Error:
-        return "Error"sv;
-    }
-    VERIFY_NOT_REACHED();
 }
 
 CSSStyleSheet& StyleSheetState::cssom_sheet() const

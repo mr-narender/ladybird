@@ -47,6 +47,9 @@ public:
 
     void request_file(Web::FileRequest);
 
+    DedicatedWorkerThreadLink* dedicated_worker_thread_link() { return m_dedicated_worker_thread_link.ptr(); }
+    NonnullRefPtr<Web::HTML::ScriptAbortHandle> script_abort_handle() const { return m_script_abort_handle; }
+
     PageHost& page_host() { return *m_page_host; }
     PageHost const& page_host() const { return *m_page_host; }
 
@@ -57,8 +60,12 @@ public:
     // Asks the Browser to connect this worker to the ImageDecoder of its process.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_image_decoder_transport();
 
+    void rtc_transform_init(u64 transform_id, Web::HTML::SerializedTransferRecord options_record);
+    void rtc_transform_teardown(u64 transform_id);
+    void rtc_transform_encoded_audio_frame(u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number);
+
 private:
-    explicit ConnectionFromClient(NonnullOwnPtr<IPC::Transport>);
+    ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, RefPtr<DedicatedWorkerThreadLink>);
 
     Web::Page& page();
     Web::Page const& page() const;
@@ -74,15 +81,7 @@ private:
     virtual void connect_shared_worker(Web::HTML::TransferDataEncoder, Web::HTML::SerializedEnvironmentSettingsObject) override;
     virtual void handle_file_return(i32 error, Optional<IPC::File> file, i32 request_id) override;
     virtual void blob_url_entry_removed(Utf16String url) override;
-    virtual void did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) override;
-    virtual void did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
-    virtual void did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) override;
-    virtual void did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) override;
-    virtual void did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) override;
-    virtual void rtc_transform_init(u64 transform_id, Web::HTML::SerializedTransferRecord options_record) override;
-    virtual void rtc_transform_teardown(u64 transform_id) override;
-    virtual void rtc_transform_encoded_audio_frame(u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) override;
 
     GC::Root<PageHost> m_page_host;
 
@@ -96,6 +95,7 @@ private:
     HashMap<int, Web::FileRequest> m_requested_files {};
     int last_id { 0 };
 
+    RefPtr<DedicatedWorkerThreadLink> m_dedicated_worker_thread_link;
     HashMap<u64, GC::Root<Web::WebRTC::RTCRtpScriptTransformer>> m_transformers;
     HashMap<u64, Web::HTML::SerializedTransferRecord> m_pending_transform_inits;
 
@@ -107,6 +107,8 @@ private:
     RefPtr<WorkerHost> m_worker_host;
     Function<void()> m_request_server_died_callback_for_testing;
     bool m_shutdown_finished { false };
+    bool m_was_told_to_close { false };
+    bool m_lost_browser_connection { false };
     NonnullRefPtr<Web::HTML::ScriptAbortHandle> m_script_abort_handle;
 };
 

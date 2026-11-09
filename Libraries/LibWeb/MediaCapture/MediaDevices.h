@@ -46,10 +46,13 @@ public:
     // Ends every live track once the document may no longer use the microphone.
     void end_tracks_without_permission();
     void track_was_cloned(Badge<MediaStreamTrack>, MediaStreamTrack& clone);
+    void track_source_ended(Badge<MediaStreamTrack>, MediaStreamTrack&);
+    HTML::Window& window() const { return m_window; }
     // getUserMedia() waits while the page lacks system focus, and the Window sees no event when that changes.
     void system_focus_changed();
 
     [[nodiscard]] static GC::Ref<MediaDevices> create(HTML::Window&);
+    void stop_all_sources();
 
     MediaTrackSupportedConstraints get_supported_constraints();
     void enumerate_devices(GC::Ref<WebIDL::Promise>);
@@ -70,10 +73,14 @@ private:
     struct PendingGetUserMediaRequest final {
         GC::Ref<WebIDL::Promise> promise;
         Optional<DeviceIdConstraint> device_id_constraint;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
 
     struct PendingEnumerateDevicesRequest final {
         GC::Ref<WebIDL::Promise> promise;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
 
     explicit MediaDevices(HTML::Window&);
@@ -128,3 +135,5 @@ private:
 };
 
 }
+
+GC_UNTRACED_CAPTURE(Web::MediaCapture::DeviceIdConstraint);

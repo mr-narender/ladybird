@@ -5,12 +5,9 @@
  */
 
 #include <AK/AnyOf.h>
-#include <LibURL/InternalURLs.h>
 #include <LibURL/URL.h>
-#include <LibUnicode/DisplayNames.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalTraversable.h>
-#include <LibWebView/Menu.h>
 #include <LibWebView/PageTranslation.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/URL.h>
@@ -18,15 +15,6 @@
 #include <LibWebView/WebContentPage.h>
 
 namespace WebView {
-
-// The browser's own strings are English, so languages are named in English.
-static String language_display_name(StringView language)
-{
-    auto primary_language = primary_language_subtag(language);
-    if (auto name = Unicode::language_display_name("en"sv, primary_language, Unicode::LanguageDisplay::Standard); name.has_value())
-        return name->to_utf8();
-    return MUST(String::from_utf8(primary_language));
-}
 
 // The languages the user reads, most preferred first, one per language whatever its regions.
 static Vector<String> languages_the_user_reads()
@@ -42,37 +30,6 @@ static Vector<String> languages_the_user_reads()
 PageTranslation::PageTranslation(ViewImplementation& view)
     : m_view(view)
 {
-    m_translate_action = Action::create("Translate"sv, ActionID::TranslatePage, [] { });
-    m_translate_action->set_tooltip("Translate this page"sv);
-    m_translate_action->set_visible(false);
-
-    m_translation_menu = Menu::create("Translation"sv);
-    for (size_t index = 0; index < MAXIMUM_OFFERED_LANGUAGES; ++index) {
-        auto action = Action::create_checkable("Translate"sv, ActionID::TranslateTo, [this, index] {
-            if (auto target_language = ready_target_language(index); target_language.has_value())
-                translate_to(*target_language);
-            // NB: The check mark shows the language the page is in, which activating an action doesn't change by itself.
-            update_actions();
-        });
-        action->set_visible(false);
-        m_translation_menu->add_action(action);
-        m_translate_to_actions.append(move(action));
-    }
-    m_show_original_action = Action::create("Show Original"sv, ActionID::ShowOriginal, [this] { show_original(); });
-    m_translation_menu->add_action(*m_show_original_action);
-    m_translation_menu->add_separator();
-    m_download_languages_action = Action::create("Download Languages…"sv, ActionID::DownloadTranslationLanguages, [] {
-        if (auto* translator = Application::the().translator())
-            translator->open_language_download_settings();
-    });
-    m_translation_menu->add_action(*m_download_languages_action);
-    m_translation_menu->add_action(Action::create("Preferred Languages…"sv, ActionID::EditPreferredLanguages, [] {
-        auto url = URL::about_settings();
-        url.set_fragment("editLanguages"sv);
-        Application::the().activate_or_open_tab_with_url(url);
-    }));
-
-    update_actions();
 }
 
 PageTranslation::~PageTranslation()
@@ -82,9 +39,7 @@ PageTranslation::~PageTranslation()
 
 bool PageTranslation::is_offered() const
 {
-    if (is_translated())
-        return true;
-    return any_of(m_target_languages, [](auto const& target) { return !target.needs_download; });
+    return is_translated() || !m_target_languages.is_empty();
 }
 
 void PageTranslation::translate_to(String const& target_language)
@@ -92,6 +47,8 @@ void PageTranslation::translate_to(String const& target_language)
     auto* translator = Application::the().translator();
     if (!translator || !m_page_language.has_value())
         return;
+    // The translation picked now replaces the one a download was for, so the download's completion doesn't undo it.
+    m_translate_after_download.clear();
     if (m_target_language.has_value() && is_same_language(*m_target_language, target_language))
         return;
 
@@ -102,7 +59,7 @@ void PageTranslation::translate_to(String const& target_language)
         return;
     }
 
-    m_session_id = translator->create_session(*m_page_language, target_language);
+    m_session_id = translator->create_session(*m_page_language, target_language, Application::settings().translation_prefers_higher_quality());
     m_target_language = target_language;
     m_translated_site = current_site();
 
@@ -111,7 +68,7 @@ void PageTranslation::translate_to(String const& target_language)
             page.async_start_translation(*m_page_language, target_language);
     });
 
-    update_actions();
+    did_change_state();
 }
 
 void PageTranslation::show_original()
@@ -124,6 +81,48 @@ void PageTranslation::show_original()
         m_skip_continuation_for_next_document = true;
     stop_translating_pages();
     m_view.reload();
+}
+
+bool PageTranslation::translation_can_switch_models() const
+{
+    if (!m_target_language.has_value())
+        return false;
+    auto target = m_target_languages.find_if([&](auto const& target) { return is_same_language(target.language, *m_target_language); });
+    return !target.is_end() && target->higher_quality_available && !target->faster_after_download;
+}
+
+void PageTranslation::translate_again()
+{
+    if (!is_translated())
+        return;
+    m_previous_translation = PreviousTranslation { *m_page_language, *m_target_language, current_site() };
+    stop_translating_pages();
+    m_view.reload();
+}
+
+// The platform's settings download the languages, and the page is translated once they're ready, since that's what
+// the user downloads them for.
+void PageTranslation::download_languages_for(String const& target_language)
+{
+    auto* translator = Application::the().translator();
+    if (!translator || !any_of(m_target_languages, [&](auto const& target) { return is_same_language(target.language, target_language); }))
+        return;
+    m_translate_after_download = target_language;
+    translator->open_language_download_settings();
+}
+
+void PageTranslation::prefer_higher_quality_models(bool prefers_higher_quality)
+{
+    Application::settings().set_translation_prefers_higher_quality(prefers_higher_quality);
+    ViewImplementation::for_each_view([](ViewImplementation& view) {
+        view.page_translation().did_change_model_preference();
+        return IterationDecision::Continue;
+    });
+    // The text translated so far stays as it is in the other tabs, but this tab's page is shown in the other models'
+    // translation, since the user chose them for it. A translation with only one model installed stays as it is, since
+    // a reload would lose the page's state and change nothing.
+    if (translation_can_switch_models())
+        translate_again();
 }
 
 void PageTranslation::did_finish_loading()
@@ -160,10 +159,40 @@ void PageTranslation::did_change_active_document()
     if (is_translated())
         stop_translating_pages();
     close_session();
+    m_translate_after_download.clear();
     m_page_language.clear();
     m_target_languages.clear();
     m_target_language.clear();
-    update_actions();
+    did_change_state();
+}
+
+void PageTranslation::did_change_installed_languages()
+{
+    if (!m_page_language.has_value())
+        return;
+
+    update_target_languages([this] {
+        // This runs from update_target_languages()'s callback, which checks that the translation is still alive.
+        auto* translator = Application::the().translator();
+        // The units not yet translated get the faster models as soon as they're installed.
+        if (m_session_id.has_value())
+            translator->choose_session_model_again(*m_session_id, Application::settings().translation_prefers_higher_quality());
+
+        if (!m_translate_after_download.has_value())
+            return;
+        auto target = m_target_languages.find_if([&](auto const& target) { return !target.needs_download && !target.faster_after_download && is_same_language(target.language, *m_translate_after_download); });
+        if (target.is_end())
+            return;
+        m_translate_after_download.clear();
+        translate_to(target->language);
+    });
+}
+
+void PageTranslation::did_change_model_preference()
+{
+    if (auto* translator = Application::the().translator(); translator && m_session_id.has_value())
+        translator->choose_session_model_again(*m_session_id, Application::settings().translation_prefers_higher_quality());
+    did_change_state();
 }
 
 void PageTranslation::did_create_page(WebContentPage& page)
@@ -240,7 +269,16 @@ void PageTranslation::did_detect_page_language(u64 generation, Optional<String> 
 
     m_page_language = move(language);
     m_target_languages.clear();
-    update_actions();
+    did_change_state();
+
+    update_target_languages(move(on_complete));
+}
+
+void PageTranslation::update_target_languages(Function<void()> on_complete)
+{
+    auto* translator = Application::the().translator();
+    if (!translator)
+        return;
 
     // A page in a language the user reads isn't offered for translation.
     auto languages = languages_the_user_reads();
@@ -252,25 +290,20 @@ void PageTranslation::did_detect_page_language(u64 generation, Optional<String> 
     if (languages.size() > MAXIMUM_OFFERED_LANGUAGES)
         languages.shrink(MAXIMUM_OFFERED_LANGUAGES);
 
-    translator->target_languages(*m_page_language, languages, [weak_this = make_weak_ptr(), generation, on_complete = move(on_complete)](Vector<Translator::TargetLanguage> target_languages) {
+    auto request = ++m_target_languages_request;
+    translator->target_languages(*m_page_language, languages, [weak_this = make_weak_ptr(), generation = m_generation, request, on_complete = move(on_complete)](Vector<Translator::TargetLanguage> target_languages) {
         if (!weak_this || generation != weak_this->m_generation)
             return;
-        weak_this->m_target_languages = move(target_languages);
-        weak_this->update_actions();
+        // Lookups can finish out of order. A result older than the one applied already is dropped, so it can't bring
+        // back the offer of a download that's done; its callback still runs, with the newer languages.
+        if (request > weak_this->m_applied_target_languages_request) {
+            weak_this->m_applied_target_languages_request = request;
+            weak_this->m_target_languages = move(target_languages);
+            weak_this->did_change_state();
+        }
         if (on_complete)
             on_complete();
     });
-}
-
-Optional<String> PageTranslation::ready_target_language(size_t index) const
-{
-    for (auto const& target : m_target_languages) {
-        if (target.needs_download)
-            continue;
-        if (index-- == 0)
-            return target.language;
-    }
-    return {};
 }
 
 // The pages forget the translation, so a document they load next isn't translated unless it's asked for.
@@ -292,26 +325,9 @@ void PageTranslation::close_session()
     m_session_id.clear();
 }
 
-void PageTranslation::update_actions()
+void PageTranslation::did_change_state()
 {
-    m_translate_action->set_visible(is_offered());
-    m_translate_action->set_engaged(is_translated());
-    m_translate_action->set_tooltip(is_translated() ? "Showing translation"sv : "Translate this page"sv);
-
-    size_t slot = 0;
-    for (auto const& target : m_target_languages) {
-        if (target.needs_download || slot == m_translate_to_actions.size())
-            continue;
-        auto& action = m_translate_to_actions[slot++];
-        action->set_text(MUST(String::formatted("Translate to {}", language_display_name(target.language))));
-        action->set_checked(m_target_language.has_value() && is_same_language(*m_target_language, target.language));
-        action->set_visible(true);
-    }
-    for (; slot < m_translate_to_actions.size(); ++slot)
-        m_translate_to_actions[slot]->set_visible(false);
-
-    m_show_original_action->set_enabled(is_translated());
-    m_download_languages_action->set_visible(any_of(m_target_languages, [](auto const& target) { return target.needs_download; }));
+    m_view.did_change_state();
 }
 
 Optional<String> PageTranslation::current_site() const

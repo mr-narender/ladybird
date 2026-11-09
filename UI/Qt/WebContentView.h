@@ -26,9 +26,9 @@
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/AccessibilityTreeManager.h>
 #include <LibWebView/BrowsingSession.h>
-#include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebCompatReport.h>
 #include <UI/Qt/BackingStoreRelease.h>
+#include <UI/Qt/RemoteView.h>
 #include <UI/Qt/ScreenshotSelectionOverlay.h>
 
 #include <LibWebCommon/Page/QueuedInputEvent.h>
@@ -112,12 +112,13 @@ struct WebContentViewInitialState {
     WebView::IsPrivate is_private { WebView::IsPrivate::No };
     double maximum_frames_per_second { 60.0 };
     Optional<u64> display_id;
-    WebView::ViewImplementation const* owner_view { nullptr };
+    Optional<u64> owner_view_id;
+    bool is_tab { true };
 };
 
 class WebContentView final
     : public WebContentViewBase
-    , public WebView::ViewImplementation
+    , public RemoteView
 #if !defined(Q_OS_WIN)
     , public QAccessible::ActivationObserver
 #endif
@@ -126,7 +127,7 @@ class WebContentView final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable = {}, WebContentViewInitialState initial_state = {});
+    WebContentView(QWidget* window, Optional<u64> hub_view_id = {}, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
@@ -168,7 +169,6 @@ public:
     void set_viewport_rect(Gfx::IntRect);
     void push_viewport_size();
     void set_device_pixel_ratio(double);
-    void set_zoom_level(double);
     void set_vertical_tab_overlay_insets(int left, int right);
     void set_bookmarks_bar_overlay_height(int);
     // How much the page is dimmed under a page dialog, from 0 to 1, where the page is presented above anything Qt paints
@@ -218,16 +218,13 @@ signals:
     void urls_dropped(QList<QUrl> const&);
 
 private:
-    // ^WebView::ViewImplementation
-    virtual void prepare_page_for_navigable(WebView::WebContentPage&) override;
-    virtual Core::AnonymousBuffer system_theme() override;
+    // ^RemoteView
+    virtual void show_context_menu(Menu&, Gfx::IntPoint widget_position) override;
     virtual Optional<ScreenRects> screen_rects() const override;
     virtual void update_zoom() override;
-    virtual Web::DevicePixelSize viewport_size() const override;
-    virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override;
-    virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const override;
-    virtual void show_context_menu(WebView::Menu&, Gfx::IntPoint widget_position) override;
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) override;
+
+    Web::DevicePixelSize viewport_size() const;
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     // ^QRhiWidget
@@ -433,7 +430,7 @@ private:
     bool vulkan_window_update_would_only_resize() const;
     void remap_unexposed_vulkan_window();
 
-    virtual void release_backing_store(i32 bitmap_id) override;
+    virtual void release_backing_store(u64 page_id, i32 bitmap_id) override;
 
 #    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
     bool create_page_surface();
@@ -448,7 +445,6 @@ private:
     void destroy_page_surface();
     void release_retired_backing_stores_no_longer_painted();
     void release_all_retired_backing_stores();
-    Vector<Gfx::SharedImageBuffer const*> backing_stores() const;
     QRect rect_shown_in_window() const;
 
     // Shows the page's frames on Wayland by handing their dma-bufs to the compositor of the desktop. Without it, the
@@ -462,7 +458,7 @@ private:
     // The backing stores the view is done with that the compositor of the desktop may still read. The page they belong
     // to can stop displaying the tab before the compositor is done.
     struct BackingStoreWaitingForRelease {
-        NonnullRefPtr<WebView::WebContentPage> page;
+        u64 page_id { 0 };
         i32 bitmap_id { -1 };
     };
     Vector<BackingStoreWaitingForRelease> m_backing_stores_waiting_for_release;

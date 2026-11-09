@@ -17,12 +17,12 @@
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/Page/ScreenWakeLockState.h>
 #include <LibWebView/FileDownloader.h>
-#include <LibWebView/SessionStore.h>
 #include <LibWebView/Settings.h>
 #include <LibWebView/TabPerformanceStats.h>
 #include <UI/Qt/FindInPageWidget.h>
 #include <UI/Qt/LocationEdit.h>
 #include <UI/Qt/PermissionPromptPopover.h>
+#include <UI/Qt/SessionStore.h>
 #include <UI/Qt/WebContentView.h>
 
 #include <QBoxLayout>
@@ -51,30 +51,19 @@ class JavaScriptDialog;
 class MessagePopover;
 
 class HyperlinkLabel final : public QLabel {
-    Q_OBJECT
-
 public:
     AK_ALLOC_WITH_KMALLOC;
 
     explicit HyperlinkLabel(QWidget* parent = nullptr)
-        : QLabel(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
+        : QLabel(parent, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint | Qt::WindowTransparentForInput)
     {
         setAttribute(Qt::WA_ShowWithoutActivating);
-        setMouseTracking(true);
     }
-
-    virtual void enterEvent(QEnterEvent* event) override
-    {
-        emit mouse_entered(event);
-    }
-
-signals:
-    void mouse_entered(QEnterEvent*);
 };
 
 // What a restored tab shows until it's selected: It has no view, and so no WebContent process, until then.
 struct DeferredTab {
-    WebView::SessionTabId session_tab_id { 0 };
+    SessionTabId session_tab_id { 0 };
     URL::URL url;
     QString title;
     QIcon favicon;
@@ -90,7 +79,7 @@ class Tab final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> traversable = {});
+    Tab(BrowserWindow* window, Optional<u64> hub_view_id = {});
     Tab(BrowserWindow* window, DeferredTab);
     virtual ~Tab() override;
 
@@ -111,8 +100,8 @@ public:
 
     URL::URL url() const;
 
-    Optional<WebView::SessionTabId> session_tab_id() const;
-    void set_session_tab_id(WebView::SessionTabId);
+    Optional<SessionTabId> session_tab_id() const;
+    void set_session_tab_id(SessionTabId);
     void clear_session_tab_id();
 
     // A page that has never had a real size must be sized while hidden, so that it doesn't load into Qt's placeholder
@@ -189,6 +178,7 @@ signals:
     void title_changed(int id, QString const&);
     void favicon_changed(int id, QIcon const&);
     void playing_audio_indicator_changed(int id);
+    void microphone_in_use_changed();
     void loading_changed();
     void performance_stats_changed();
     void loaded();
@@ -196,7 +186,7 @@ signals:
 private:
     void create_tab_shell();
     void create_tab_context_menu();
-    void initialize(Optional<WebView::CanonicalTraversable&>);
+    void initialize(Optional<u64> hub_view_id);
 
     void location_edit_return_pressed(String, Optional<URL::URL>, WebView::OmniboxDestinationKind);
     virtual void resizeEvent(QResizeEvent*) override;
@@ -216,6 +206,7 @@ private:
     QWidget& site_settings_anchor() const;
     void update_permission_prompts();
     void hide_hover_label();
+    bool hover_text_belongs_on_right(QPoint pointer) const;
     QImage render_hover_text(QString const&) const;
     void set_loading(bool);
     void update_tab_icon();
@@ -246,8 +237,8 @@ private:
     // The address of the hovered link, which shows over the bottom corner of the page that the pointer is not over.
     QString m_hover_text;
     bool m_hover_text_is_on_right { false };
-    // Where the hover text shows over the page, in the view, when the view can stack it above the page itself.
-    QRect m_hover_text_rect_over_page;
+    // Whether the view stacks the hover text above the page itself, in place of the hover label.
+    bool m_hover_text_is_over_page { false };
     QIcon m_favicon;
     bool m_is_loading { false };
     bool m_needs_attention { false };
@@ -280,7 +271,7 @@ private:
     bool m_window_is_closing { false };
     bool m_is_pinned { false };
 
-    Optional<WebView::SessionTabId> m_session_tab_id;
+    Optional<SessionTabId> m_session_tab_id;
     Optional<DeferredTab> m_deferred_tab;
 };
 

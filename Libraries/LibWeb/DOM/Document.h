@@ -302,6 +302,8 @@ struct PendingFullscreenEvent {
     } type;
     GC::Ref<Element> element;
     Fullscreen::RequestType request_type;
+
+    void visit_edges(GC::Cell::Visitor&) const;
 };
 
 class WEB_API Document
@@ -1169,6 +1171,8 @@ public:
         GC::Ref<EventTarget> event_target;
         Utf16FlyString event_type;
         bool operator==(PendingScrollEvent const&) const = default;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
     bool append_pending_scroll_event(PendingScrollEvent);
     Vector<PendingScrollEvent>& pending_scroll_events() { return m_pending_scroll_events; }
@@ -1234,7 +1238,7 @@ public:
         Yes,
     };
     WebIDL::ExceptionOr<bool> exec_command(Utf16FlyString const& command, bool show_ui, TrustedTypes::TrustedHTMLOrString const& value);
-    WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {}, GC::Ptr<StaticRange> deletion_range = nullptr);
+    WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {}, GC::Ptr<StaticRange> deletion_range = nullptr, GC::Ptr<DocumentFragment> pasted_fragment = nullptr);
     WebIDL::ExceptionOr<bool> query_command_enabled(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_indeterm(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_state(Utf16FlyString const& command);
@@ -1413,6 +1417,8 @@ public:
         GC::Ref<Animations::Animation> animation;
         GC::Ref<DOM::EventTarget> target;
         Optional<double> scheduled_event_time;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
     void append_pending_animation_event(PendingAnimationEvent const&);
     void update_animations_and_send_events(double timestamp);
@@ -1658,6 +1664,8 @@ public:
 
     i64 cursor_blink_cycle_start_time_ns() const { return m_cursor_blink_cycle_start_time_ns; }
 
+    URL::Origin site_for_cookies() const;
+
     // Back-pointer to the navigable whose active document is this document.
     // Maintained by LocalNavigable when it sets/clears its active document.
     GC::Ptr<HTML::LocalNavigable> navigable() const;
@@ -1858,7 +1866,7 @@ public:
     void for_each_registered_custom_property(Function<void(CSS::CustomPropertyRegistration const&)> const&) const;
     size_t custom_property_registration_generation() const { return m_custom_property_registration_generation; }
     void const* rust_custom_property_registry() const { return m_rust_custom_property_registry; }
-    void did_change_custom_property_registrations(Optional<Utf16FlyString> registered_property_set_change = {});
+    void did_change_custom_property_registrations();
 
     CSS::StyleScope const& style_scope() const { return m_style_scope; }
     CSS::StyleScope& style_scope() { return m_style_scope; }
@@ -1899,6 +1907,8 @@ protected:
 private:
     bool update_is_fully_active() const;
     bool compute_is_fully_active() const;
+
+    void queue_a_new_visibility_state_entry(HTML::VisibilityState, HighResolutionTime::DOMHighResTimeStamp timestamp);
 
     // Records the document's viewport for the host to publish, or, given `committed`, commits the recording.
     Optional<Painting::DisplayListRecording> start_recording(Layout::BegunRead const&, HTML::PaintConfig, Painting::PaintCommandCacheMode, Optional<Compositor::FlightPresentation>&& committed);

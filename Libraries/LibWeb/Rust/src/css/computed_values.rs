@@ -34,20 +34,20 @@ pub use crate::css::computed_value_types::{
     ComputedGridPlacementKind, ComputedGridTrackBreadth, ComputedGridTrackEntry, ComputedGridTrackEntryKind,
     ComputedGridTrackList, ComputedLengthBox, ComputedLengthPercentageOrAuto, ComputedOverflowClipMargin,
     ComputedOverflowClipMarginSide, ComputedPositionTryFallback, ComputedResolvedTransform, ComputedSize,
-    ComputedSizeKind, ComputedStyleValueHandle, ComputedSvgDash, ComputedSvgPaint, ComputedTextIndent,
-    ComputedTextUnderlineOffset, ComputedTextUnderlinePosition, ComputedVerticalAlign, ContentValues, EffectsValues,
-    FontValues, GRID_NO_INDEX, GridValues, InheritedBits, InheritedListTableValues, InheritedSVGValues,
-    InheritedSetValues, InheritedTextValues, InheritedUIValues, MaskValues, MiscInteractionValues, MiscLayoutValues,
-    ResetBits, RetainedComputedCursorList, RetainedComputedFilterOperationList, RetainedComputedResolvedTransformList,
-    RetainedComputedShadowList, RetainedComputedSvgDashList, RetainedGridAreaList, RetainedGridNameIndexList,
-    RetainedGridTrackEntryList, RetainedPositionAreaList, RetainedPositionTryFallbackList,
-    RetainedTextDecorationLineList, RetainedWillChangePropertyList, SVGResetValues, SizingValues, StyleBits,
-    SurroundValues, TextResetValues, TransformValues,
+    ComputedSizeKind, ComputedStyleValueHandle, ComputedSvgDash, ComputedTextIndent, ComputedTextUnderlineOffset,
+    ComputedTextUnderlinePosition, ComputedVerticalAlign, ContentValues, EffectsValues, FontValues, GRID_NO_INDEX,
+    GridValues, InheritedBits, InheritedListTableValues, InheritedSVGValues, InheritedSetValues, InheritedTextValues,
+    InheritedUIValues, MaskValues, MiscInteractionValues, MiscLayoutValues, ResetBits, RetainedComputedCursorList,
+    RetainedComputedFilterOperationList, RetainedComputedResolvedTransformList, RetainedComputedShadowList,
+    RetainedComputedSvgDashList, RetainedGridAreaList, RetainedGridNameIndexList, RetainedGridTrackEntryList,
+    RetainedPositionAreaList, RetainedPositionTryFallbackList, RetainedTextDecorationLineList,
+    RetainedWillChangePropertyList, SVGResetValues, SizingValues, StyleBits, SurroundValues, TextResetValues,
+    TransformValues,
 };
 use crate::css::computed_value_views::InlineLengthPercentage;
 use crate::css::retained_fly_string::{RetainedUtf16FlyString, RetainedUtf16FlyStringList};
+use crate::css::style_value::retained_list;
 use crate::css::style_value::{RetainedStyleValueData, StyleValueData};
-use crate::css::style_value::{retained_list_drop, retained_list_partial_eq};
 use crate::css::table_group_builder::group_index;
 
 impl ComputedStyleValueHandle {
@@ -191,47 +191,6 @@ macro_rules! layout_input_equal {
     };
 }
 
-impl_computed_payload_clone_and_eq!(SizingValues {
-    width,
-    min_width,
-    max_width,
-    height,
-    min_height,
-    max_height,
-});
-impl_computed_payload_clone_and_eq!(ComputedFlexBasis { is_content, size });
-impl_computed_payload_clone_and_eq!(ComputedGap { is_normal, value });
-impl_computed_payload_clone_and_eq!(AlignmentValues {
-    webkit_box_orient,
-    flex_direction,
-    flex_wrap,
-    flex_basis,
-    flex_grow,
-    flex_shrink,
-    order,
-    align_content,
-    align_items,
-    align_self,
-    align_items_is_last_baseline,
-    align_self_is_last_baseline,
-    align_content_is_last_baseline,
-    justify_content,
-    justify_items,
-    justify_self,
-    align_items_overflow,
-    justify_items_overflow,
-    align_self_overflow,
-    justify_self_overflow,
-    align_content_overflow,
-    column_gap,
-    row_gap,
-});
-impl_computed_payload_clone_and_eq!(ComputedLengthBox {
-    top,
-    right,
-    bottom,
-    left,
-});
 impl Clone for SurroundValues {
     fn clone(&self) -> Self {
         Self {
@@ -265,150 +224,15 @@ impl PartialEq for SurroundValues {
             && self.padding == other.padding
     }
 }
-impl_computed_payload_clone_and_eq!(SVGResetValues {
-    cx,
-    cy,
-    d,
-    r,
-    rx,
-    ry,
-    x,
-    y,
-    stop_color,
-    stop_opacity,
-    flood_color,
-    flood_opacity,
-    vector_effect,
-});
-impl RetainedTextDecorationLineList {
-    pub(crate) fn from_vec(values: Vec<u8>) -> Self {
-        let slice = values.into_boxed_slice();
-        let length = slice.len();
-        let pointer = Box::into_raw(slice) as *mut u8;
-        Self { pointer, length }
-    }
-
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        if self.pointer.is_null() {
-            return &[];
-        }
-        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
-    }
-}
-
-impl Clone for RetainedTextDecorationLineList {
-    fn clone(&self) -> Self {
-        Self::from_vec(self.as_slice().to_vec())
-    }
-}
-
-impl Drop for RetainedTextDecorationLineList {
-    fn drop(&mut self) {
-        if !self.pointer.is_null() {
-            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.pointer, self.length)) });
-        }
-    }
-}
-
-impl PartialEq for RetainedTextDecorationLineList {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl_computed_payload_clone_and_eq!(TextResetValues {
-    text_decoration_lines,
-    text_decoration_thickness_kind,
-    text_decoration_thickness,
-    text_decoration_style,
-    text_decoration_color,
-    white_space_trim_discard_before,
-    white_space_trim_discard_after,
-    white_space_trim_discard_inner,
-});
-impl_computed_payload_clone_and_eq!(ComputedResolvedTransform {
-    is_translate,
-    matrix,
-    x_px,
-    y_px,
-    z_px,
-    x_percentage,
-    y_percentage,
-});
-impl_computed_payload_clone_and_eq!(ComputedFilterOperation {
-    kind,
-    color_operation,
-    amount,
-    shadow_offset_x,
-    shadow_offset_y,
-    shadow_radius,
-    shadow_color,
-    url_value,
-});
-
-macro_rules! impl_retained_computed_list {
-    ($list:ident, $element:ty) => {
-        impl $list {
-            pub(crate) fn from_vec(values: Vec<$element>) -> Self {
-                let slice = values.into_boxed_slice();
-                let length = slice.len();
-                let pointer = Box::into_raw(slice) as *mut $element;
-                Self { pointer, length }
-            }
-
-            pub(crate) fn as_slice(&self) -> &[$element] {
-                if self.pointer.is_null() {
-                    return &[];
-                }
-                unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
-            }
-        }
-
-        impl Clone for $list {
-            fn clone(&self) -> Self {
-                Self::from_vec(self.as_slice().to_vec())
-            }
-        }
-
-        retained_list_drop!($list);
-        retained_list_partial_eq!($list, $element);
-    };
-}
-
-impl_retained_computed_list!(RetainedComputedFilterOperationList, ComputedFilterOperation);
-impl_retained_computed_list!(RetainedWillChangePropertyList, u16);
-impl_retained_computed_list!(
+retained_list!(RetainedTextDecorationLineList, u8);
+retained_list!(RetainedComputedFilterOperationList, ComputedFilterOperation);
+retained_list!(RetainedWillChangePropertyList, u16);
+retained_list!(
     RetainedComputedShadowList,
     crate::css::computed_value_types::ComputedShadow
 );
-impl_computed_payload_clone_and_eq!(ComputedCursor {
-    is_cursor_value,
-    cursor,
-    predefined,
-});
-impl_retained_computed_list!(RetainedComputedCursorList, ComputedCursor);
-impl_computed_payload_clone_and_eq!(ComputedSvgPaint {
-    kind,
-    url,
-    has_color,
-    color,
-});
-impl_computed_payload_clone_and_eq!(ComputedSvgDash {
-    is_number,
-    number,
-    value,
-});
-impl_retained_computed_list!(RetainedComputedSvgDashList, ComputedSvgDash);
-impl_computed_payload_clone_and_eq!(ComputedTextIndent {
-    length_percentage,
-    each_line,
-    hanging,
-});
-impl_computed_payload_clone_and_eq!(ComputedTextUnderlineOffset {
-    used_value,
-    is_auto,
-    value,
-});
+retained_list!(RetainedComputedCursorList, ComputedCursor);
+retained_list!(RetainedComputedSvgDashList, ComputedSvgDash);
 impl_computed_payload_clone_and_eq!(InheritedTextValues {
     text_justify,
     line_break,
@@ -435,58 +259,6 @@ impl_computed_payload_clone_and_eq!(InheritedTextValues {
     letter_spacing_style_value,
     orphans,
     widows,
-});
-impl_computed_payload_clone_and_eq!(AnimationValues {
-    animation_name,
-    animation_composition,
-    animation_delay,
-    animation_direction,
-    animation_duration,
-    animation_fill_mode,
-    animation_iteration_count,
-    animation_play_state,
-    animation_range_start,
-    animation_range_end,
-    animation_timeline,
-    animation_timing_function,
-    scroll_timeline_name,
-    scroll_timeline_axis,
-    timeline_scope,
-    view_timeline_name,
-    view_timeline_axis,
-    view_timeline_inset,
-    transition_property,
-    transition_duration,
-    transition_timing_function,
-    transition_delay,
-    transition_behavior,
-    transition_delay_and_duration_are_single_zero,
-});
-impl_computed_payload_clone_and_eq!(MaskValues {
-    mask_image,
-    mask_type,
-    clip_path,
-    mask_mode,
-    mask_repeat,
-    mask_position,
-    mask_clip,
-    mask_origin,
-    mask_size,
-    mask_composite,
-});
-impl_computed_payload_clone_and_eq!(BackgroundValues {
-    background_color,
-    background_color_style_value,
-    background_color_clip,
-    background_image,
-    background_attachment,
-    background_blend_mode,
-    background_clip,
-    background_origin,
-    background_position_x,
-    background_position_y,
-    background_repeat,
-    background_size,
 });
 impl_computed_payload_clone_and_eq!(BorderValues {
     border_left => border_side_layout_inputs_equal,
@@ -516,30 +288,6 @@ impl_computed_payload_clone_and_eq!(BorderValues {
     border_image_width,
     border_image_outset,
     border_image_repeat,
-});
-impl_computed_payload_clone_and_eq!(ContentValues {
-    content,
-    counter_increment,
-    counter_reset,
-    counter_set,
-});
-impl_computed_payload_clone_and_eq!(InheritedListTableValues {
-    list_style_type,
-    list_style_image,
-    quotes,
-    border_spacing_horizontal,
-    border_spacing_vertical,
-});
-impl_computed_payload_clone_and_eq!(ComputedOverflowClipMarginSide {
-    has_visual_box,
-    visual_box,
-    offset,
-});
-impl_computed_payload_clone_and_eq!(ComputedOverflowClipMargin {
-    left,
-    top,
-    right,
-    bottom,
 });
 impl_computed_payload_clone_and_eq!(MiscLayoutValues {
     outline_offset_style_value,
@@ -608,6 +356,8 @@ impl Clone for FontValues {
             font_family: self.font_family.clone(),
             font_style: self.font_style.clone(),
             font_optical_sizing: self.font_optical_sizing.clone(),
+            font_synthesis_weight: self.font_synthesis_weight.clone(),
+            font_synthesis_style: self.font_synthesis_style.clone(),
             font_feature_settings: self.font_feature_settings.clone(),
             font_kerning: self.font_kerning.clone(),
             font_language_override: self.font_language_override.clone(),
@@ -652,6 +402,8 @@ impl PartialEq for FontValues {
             && self.font_family == other.font_family
             && self.font_style == other.font_style
             && self.font_optical_sizing == other.font_optical_sizing
+            && self.font_synthesis_weight == other.font_synthesis_weight
+            && self.font_synthesis_style == other.font_synthesis_style
             && self.font_feature_settings == other.font_feature_settings
             && self.font_kerning == other.font_kerning
             && self.font_language_override == other.font_language_override
@@ -670,42 +422,8 @@ impl PartialEq for FontValues {
             && self.font_size_value == other.font_size_value
     }
 }
-impl_computed_payload_clone_and_eq!(InheritedSVGValues {
-    fill,
-    stroke,
-    fill_rule,
-    clip_rule,
-    fill_opacity,
-    stroke_opacity,
-    stroke_linecap,
-    stroke_linejoin,
-    stroke_dasharray,
-    stroke_dashoffset,
-    stroke_miterlimit,
-    stroke_width,
-    color_interpolation,
-    color_interpolation_filters,
-    paint_order,
-    paint_order_serialization_length,
-    paint_order_is_normal,
-    text_anchor,
-    has_dominant_baseline,
-    dominant_baseline,
-    shape_rendering,
-});
-impl_retained_computed_list!(RetainedPositionAreaList, u8);
-impl_computed_payload_clone_and_eq!(ComputedPositionTryFallback {
-    name,
-    tactics,
-    tactic_count,
-    has_position_area,
-    position_area,
-});
-impl_retained_computed_list!(RetainedPositionTryFallbackList, ComputedPositionTryFallback);
-impl_computed_payload_clone_and_eq!(ComputedFilter {
-    filter_list,
-    operations
-});
+retained_list!(RetainedPositionAreaList, u8);
+retained_list!(RetainedPositionTryFallbackList, ComputedPositionTryFallback);
 impl_computed_payload_clone_and_eq!(EffectsValues {
     opacity => paint_only,
     filter,
@@ -723,21 +441,6 @@ impl_computed_payload_clone_and_eq!(EffectsValues {
     box_shadow_style_value,
     clip_style_value,
 });
-impl_computed_payload_clone_and_eq!(AnchorValues {
-    anchor_names,
-    anchor_scope_all,
-    anchor_scope_names,
-    position_anchor_type,
-    position_anchor_name,
-    position_area,
-    position_try_fallbacks,
-    has_position_try_order,
-    position_try_order,
-    position_visibility_always,
-    position_visibility_anchors_valid,
-    position_visibility_anchors_visible,
-    position_visibility_no_overflow,
-});
 impl_computed_payload_clone_and_eq!(InheritedUIValues {
     caret_color => paint_only,
     accent_color => paint_only,
@@ -751,168 +454,11 @@ impl_computed_payload_clone_and_eq!(InheritedUIValues {
     image_rendering,
 });
 
-impl RetainedComputedResolvedTransformList {
-    pub(crate) fn from_vec(values: Vec<ComputedResolvedTransform>) -> Self {
-        let slice = values.into_boxed_slice();
-        let length = slice.len();
-        let pointer = Box::into_raw(slice) as *mut ComputedResolvedTransform;
-        Self { pointer, length }
-    }
+retained_list!(RetainedComputedResolvedTransformList, ComputedResolvedTransform);
 
-    pub(crate) fn as_slice(&self) -> &[ComputedResolvedTransform] {
-        if self.pointer.is_null() {
-            return &[];
-        }
-        // SAFETY: A non-null pointer/length pair always comes from
-        // from_vec's boxed slice.
-        unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
-    }
-}
-
-impl Clone for RetainedComputedResolvedTransformList {
-    fn clone(&self) -> Self {
-        Self::from_vec(self.as_slice().to_vec())
-    }
-}
-
-retained_list_drop!(RetainedComputedResolvedTransformList);
-retained_list_partial_eq!(RetainedComputedResolvedTransformList, ComputedResolvedTransform);
-
-impl_computed_payload_clone_and_eq!(TransformValues {
-    transformations,
-    resolved_transforms,
-    transform_box,
-    transform_origin_x,
-    transform_origin_y,
-    transform_origin_z,
-    transform_style,
-    backface_visibility,
-    rotate,
-    translate,
-    scale,
-    has_perspective,
-    perspective_px,
-    perspective_origin_x,
-    perspective_origin_y,
-    has_offset_path,
-    offset_path,
-    offset_distance,
-    offset_position,
-    offset_anchor,
-    offset_rotate,
-});
-impl_computed_payload_clone_and_eq!(ComputedVerticalAlign {
-    is_keyword,
-    keyword,
-    value,
-});
-impl_computed_payload_clone_and_eq!(BoxValues {
-    display,
-    display_before_box_type_transformation,
-    field_sizing,
-    baseline_source,
-    resize,
-    text_overflow,
-    grid_auto_flow_row,
-    grid_auto_flow_dense,
-    column_width,
-    column_count_has_value,
-    column_count,
-    continue_,
-    max_lines,
-    has_z_index,
-    z_index,
-    vertical_align,
-    aspect_ratio,
-    contain_intrinsic_width,
-    contain_intrinsic_height,
-    size_containment,
-    inline_size_containment,
-    layout_containment,
-    style_containment,
-    paint_containment,
-    is_size_container,
-    is_inline_size_container,
-    is_scroll_state_container,
-    container_name,
-});
-
-impl_computed_payload_clone_and_eq!(ComputedGridTrackBreadth {
-    is_flex,
-    flex_factor,
-    size,
-});
-impl_computed_payload_clone_and_eq!(ComputedGridTrackEntry {
-    kind,
-    next_sibling,
-    name_index_start,
-    name_index_count,
-    size,
-    min_size,
-    max_size,
-    repeat_type,
-    repeat_count,
-    repeat_list,
-});
-impl_computed_payload_clone_and_eq!(GridValues {
-    names,
-    name_indices,
-    entries,
-    areas,
-    template_columns,
-    template_rows,
-    auto_columns,
-    auto_rows,
-    column_start,
-    column_end,
-    row_start,
-    row_end,
-    grid_template_columns_style_value,
-    grid_template_rows_style_value,
-    grid_auto_columns_style_value,
-    grid_auto_rows_style_value,
-    grid_template_areas_style_value,
-    grid_column_start_style_value,
-    grid_column_end_style_value,
-    grid_row_start_style_value,
-    grid_row_end_style_value,
-    fit_tolerance_style_value,
-});
-
-macro_rules! impl_retained_grid_list {
-    ($list:ident, $element:ty) => {
-        impl $list {
-            pub(crate) fn from_vec(values: Vec<$element>) -> Self {
-                let slice = values.into_boxed_slice();
-                let length = slice.len();
-                let pointer = Box::into_raw(slice) as *mut $element;
-                Self { pointer, length }
-            }
-
-            pub(crate) fn as_slice(&self) -> &[$element] {
-                if self.pointer.is_null() {
-                    return &[];
-                }
-                // SAFETY: A non-null pointer/length pair always comes from
-                // from_vec's boxed slice.
-                unsafe { ak::slice_from_raw_parts(self.pointer, self.length) }
-            }
-        }
-
-        impl Clone for $list {
-            fn clone(&self) -> Self {
-                Self::from_vec(self.as_slice().to_vec())
-            }
-        }
-
-        retained_list_drop!($list);
-        retained_list_partial_eq!($list, $element);
-    };
-}
-
-impl_retained_grid_list!(RetainedGridTrackEntryList, ComputedGridTrackEntry);
-impl_retained_grid_list!(RetainedGridNameIndexList, u32);
-impl_retained_grid_list!(RetainedGridAreaList, ComputedGridArea);
+retained_list!(RetainedGridTrackEntryList, ComputedGridTrackEntry);
+retained_list!(RetainedGridNameIndexList, u32);
+retained_list!(RetainedGridAreaList, ComputedGridArea);
 
 const EMPTY_GRID_TRACK_LIST: ComputedGridTrackList = ComputedGridTrackList {
     is_subgrid: false,
@@ -956,7 +502,7 @@ impl GridValues {
 
     fn initial() -> Self {
         Self {
-            names: RetainedUtf16FlyStringList::from_retained_strings(Vec::new()),
+            names: RetainedUtf16FlyStringList::from_vec(Vec::new()),
             name_indices: RetainedGridNameIndexList::from_vec(Vec::new()),
             entries: RetainedGridTrackEntryList::from_vec(vec![Self::auto_track_entry(), Self::auto_track_entry()]),
             areas: RetainedGridAreaList::from_vec(Vec::new()),
@@ -998,170 +544,56 @@ impl GridValues {
         let mut names: Vec<RetainedUtf16FlyString> = self.names.as_slice().to_vec();
         names.push(name.clone());
         let index = (names.len() - 1) as u32;
-        self.names = RetainedUtf16FlyStringList::from_retained_strings(names);
+        self.names = RetainedUtf16FlyStringList::from_vec(names);
         index
     }
 }
 
-/// The payload type of one computed-value style group.
-#[derive(Clone, Copy)]
-pub(crate) enum StyleGroup {
-    Font,
-    InheritedListTable,
-    Sizing,
-    Alignment,
-    SVGReset,
-    Surround,
-    Box,
-    Grid,
-    TextReset,
-    Transform,
-    Effects,
-    Anchor,
-    InheritedUI,
-    InheritedSVG,
-    InheritedText,
-    Animation,
-    Mask,
-    Background,
-    Border,
-    Content,
-    MiscLayout,
-    MiscInteraction,
-}
-
-/// Every style group, in the order of the group indices both sides use (`group_index`, and
-/// LIBWEB_ENUMERATE_COMPUTED_VALUE_STYLE_GROUPS in C++).
-const STYLE_GROUPS: [StyleGroup; group_index::COUNT] = [
-    StyleGroup::InheritedListTable,
-    StyleGroup::InheritedUI,
-    StyleGroup::InheritedSVG,
-    StyleGroup::InheritedText,
-    StyleGroup::Font,
-    StyleGroup::Animation,
-    StyleGroup::SVGReset,
-    StyleGroup::Grid,
-    StyleGroup::Anchor,
-    StyleGroup::Content,
-    StyleGroup::Alignment,
-    StyleGroup::MiscLayout,
-    StyleGroup::MiscInteraction,
-    StyleGroup::Effects,
-    StyleGroup::Mask,
-    StyleGroup::TextReset,
-    StyleGroup::Transform,
-    StyleGroup::Background,
-    StyleGroup::Border,
-    StyleGroup::Sizing,
-    StyleGroup::Surround,
-    StyleGroup::Box,
-];
-
-fn style_group(group_index: usize) -> StyleGroup {
-    STYLE_GROUPS[group_index]
-}
-
-/// Expands `$body` once per style group, with `$payload` naming that group's payload type.
+/// Expands `$body` once per style group, with `$payload` naming the payload type of the group at
+/// the index `$group`.
 macro_rules! with_style_group_type {
     ($group:expr, $payload:ident => $body:expr) => {
+        with_style_group_type!(@match $group, $payload, $body,
+            INHERITED_LIST_TABLE: InheritedListTableValues,
+            INHERITED_UI: InheritedUIValues,
+            INHERITED_SVG: InheritedSVGValues,
+            INHERITED_TEXT: InheritedTextValues,
+            FONT: FontValues,
+            ANIMATION: AnimationValues,
+            SVG_RESET: SVGResetValues,
+            GRID: GridValues,
+            ANCHOR: AnchorValues,
+            CONTENT: ContentValues,
+            ALIGNMENT: AlignmentValues,
+            MISC_LAYOUT: MiscLayoutValues,
+            MISC_INTERACTION: MiscInteractionValues,
+            EFFECTS: EffectsValues,
+            MASK: MaskValues,
+            TEXT_RESET: TextResetValues,
+            TRANSFORM: TransformValues,
+            BACKGROUND: BackgroundValues,
+            BORDER: BorderValues,
+            SIZING: SizingValues,
+            SURROUND: SurroundValues,
+            BOX: BoxValues,
+        )
+    };
+    (@match $group:expr, $payload:ident, $body:expr, $($index:ident: $values:ident,)+) => {
         match $group {
-            StyleGroup::InheritedListTable => {
-                type $payload = InheritedListTableValues;
+            $(group_index::$index => {
+                type $payload = $values;
                 $body
-            }
-            StyleGroup::Sizing => {
-                type $payload = SizingValues;
-                $body
-            }
-            StyleGroup::Alignment => {
-                type $payload = AlignmentValues;
-                $body
-            }
-            StyleGroup::SVGReset => {
-                type $payload = SVGResetValues;
-                $body
-            }
-            StyleGroup::Surround => {
-                type $payload = SurroundValues;
-                $body
-            }
-            StyleGroup::Box => {
-                type $payload = BoxValues;
-                $body
-            }
-            StyleGroup::Grid => {
-                type $payload = GridValues;
-                $body
-            }
-            StyleGroup::TextReset => {
-                type $payload = TextResetValues;
-                $body
-            }
-            StyleGroup::Transform => {
-                type $payload = TransformValues;
-                $body
-            }
-            StyleGroup::Effects => {
-                type $payload = EffectsValues;
-                $body
-            }
-            StyleGroup::Anchor => {
-                type $payload = AnchorValues;
-                $body
-            }
-            StyleGroup::InheritedUI => {
-                type $payload = InheritedUIValues;
-                $body
-            }
-            StyleGroup::InheritedSVG => {
-                type $payload = InheritedSVGValues;
-                $body
-            }
-            StyleGroup::InheritedText => {
-                type $payload = InheritedTextValues;
-                $body
-            }
-            StyleGroup::Animation => {
-                type $payload = AnimationValues;
-                $body
-            }
-            StyleGroup::Mask => {
-                type $payload = MaskValues;
-                $body
-            }
-            StyleGroup::Background => {
-                type $payload = BackgroundValues;
-                $body
-            }
-            StyleGroup::Border => {
-                type $payload = BorderValues;
-                $body
-            }
-            StyleGroup::Content => {
-                type $payload = ContentValues;
-                $body
-            }
-            StyleGroup::MiscLayout => {
-                type $payload = MiscLayoutValues;
-                $body
-            }
-            StyleGroup::MiscInteraction => {
-                type $payload = MiscInteractionValues;
-                $body
-            }
-            StyleGroup::Font => {
-                type $payload = FontValues;
-                $body
-            }
+            })+
+            _ => panic!("no style group has this index"),
         }
     };
 }
 
-fn payload_size(group: StyleGroup) -> usize {
+fn payload_size(group: usize) -> usize {
     with_style_group_type!(group, Payload => size_of::<Payload>())
 }
 
-fn payload_align(group: StyleGroup) -> usize {
+fn payload_align(group: usize) -> usize {
     with_style_group_type!(group, Payload => align_of::<Payload>())
 }
 
@@ -1174,7 +606,7 @@ unsafe fn payload_ref<'a, T>(payload: *const c_void) -> &'a T {
 }
 
 /// The payload must point to uninitialized storage laid out for the group's payload type.
-unsafe fn default_construct(group: StyleGroup, payload: *mut c_void) {
+unsafe fn default_construct(group: usize, payload: *mut c_void) {
     with_style_group_type!(group, Payload => unsafe { payload.cast::<Payload>().write(Payload::initial()) });
 }
 
@@ -1184,19 +616,19 @@ unsafe fn default_construct(group: StyleGroup, payload: *mut c_void) {
     clippy::clone_on_copy,
     reason = "some style groups are Copy, and the macro expands for every group"
 )]
-unsafe fn copy_construct(group: StyleGroup, payload: *mut c_void, source: *const c_void) {
+unsafe fn copy_construct(group: usize, payload: *mut c_void, source: *const c_void) {
     with_style_group_type!(group, Payload => unsafe {
         payload.cast::<Payload>().write(payload_ref::<Payload>(source).clone());
     });
 }
 
 /// The payload must be a live payload of the group's type that nothing uses afterwards.
-unsafe fn destruct(group: StyleGroup, payload: *mut c_void) {
+unsafe fn destruct(group: usize, payload: *mut c_void) {
     with_style_group_type!(group, Payload => unsafe { std::ptr::drop_in_place(payload.cast::<Payload>()) });
 }
 
 /// Both payloads must be live payloads of the group's type.
-unsafe fn payloads_equal(group: StyleGroup, a: *const c_void, b: *const c_void) -> bool {
+unsafe fn payloads_equal(group: usize, a: *const c_void, b: *const c_void) -> bool {
     with_style_group_type!(group, Payload => unsafe { payload_ref::<Payload>(a) == payload_ref::<Payload>(b) })
 }
 
@@ -1273,7 +705,7 @@ macro_rules! impl_style_group_unread_by_layout {
 impl_style_group_unread_by_layout!(MaskValues, TextResetValues, BackgroundValues);
 
 /// Both payloads must be live payloads of the group's type.
-unsafe fn payload_layout_inputs_equal(group: StyleGroup, a: *const c_void, b: *const c_void) -> bool {
+unsafe fn payload_layout_inputs_equal(group: usize, a: *const c_void, b: *const c_void) -> bool {
     with_style_group_type!(group, Payload => {
         // SAFETY: The caller guarantees live payloads of the group.
         let (a, b) = unsafe { (payload_ref::<Payload>(a), payload_ref::<Payload>(b)) };
@@ -1308,7 +740,7 @@ pub(crate) fn style_payloads_layout_inputs_equal(
     (0..group_index::COUNT).all(|group| {
         let (a, b) = (a[group].as_ptr(), b[group].as_ptr());
         // SAFETY: Each style holds a live payload of each group.
-        a == b || unsafe { payload_layout_inputs_equal(style_group(group), a, b) }
+        a == b || unsafe { payload_layout_inputs_equal(group, a, b) }
     })
 }
 
@@ -1380,7 +812,7 @@ pub(crate) unsafe fn style_group_payloads_equal(group_index: usize, a: *const c_
     assert!(!a.is_null());
     assert!(!b.is_null());
     // SAFETY: The caller guarantees live payloads of the group.
-    unsafe { payloads_equal(style_group(group_index), a, b) }
+    unsafe { payloads_equal(group_index, a, b) }
 }
 
 /// Whether a layered image property holds an `<image>` in any layer. The value is one layer or a
@@ -1502,7 +934,7 @@ impl_style_group_without_image_values!(
 );
 
 /// The payload must be a live payload of the group's type.
-unsafe fn payload_holds_image_values(group: StyleGroup, payload: *const c_void) -> bool {
+unsafe fn payload_holds_image_values(group: usize, payload: *const c_void) -> bool {
     with_style_group_type!(group, Payload => unsafe { payload_ref::<Payload>(payload) }.holds_image_values())
 }
 
@@ -1516,7 +948,7 @@ unsafe fn payload_holds_image_values(group: StyleGroup, payload: *const c_void) 
 pub(crate) unsafe fn style_group_payloads_hold_image_values(payloads: &[*const c_void]) -> bool {
     payloads.iter().enumerate().any(|(group_index, &payload)| {
         // SAFETY: The caller guarantees live payloads of each group.
-        !payload.is_null() && unsafe { payload_holds_image_values(style_group(group_index), payload) }
+        !payload.is_null() && unsafe { payload_holds_image_values(group_index, payload) }
     })
 }
 
@@ -1534,20 +966,19 @@ pub(crate) unsafe fn style_group_payloads_move_image_values(old: &[*const c_void
             if old_payload == new_payload {
                 return false;
             }
-            let group = style_group(group_index);
             if old_payload.is_null() || new_payload.is_null() {
                 // SAFETY: As in `style_group_payloads_hold_image_values`.
                 return [old_payload, new_payload]
                     .into_iter()
-                    .any(|payload| !payload.is_null() && unsafe { payload_holds_image_values(group, payload) });
+                    .any(|payload| !payload.is_null() && unsafe { payload_holds_image_values(group_index, payload) });
             }
             // SAFETY: As in `style_group_payloads_hold_image_values`.
-            unsafe { payload_image_values_differ(group, old_payload, new_payload) }
+            unsafe { payload_image_values_differ(group_index, old_payload, new_payload) }
         })
 }
 
 /// Whether `old` and `new`, two live payloads of `group`, hold different images, by identity.
-unsafe fn payload_image_values_differ(group: StyleGroup, old: *const c_void, new: *const c_void) -> bool {
+unsafe fn payload_image_values_differ(group: usize, old: *const c_void, new: *const c_void) -> bool {
     with_style_group_type!(group, Payload => unsafe {
         payload_ref::<Payload>(old).image_values_differ(payload_ref::<Payload>(new))
     })
@@ -1564,29 +995,18 @@ pub unsafe extern "C" fn rust_style_group_holds_default_values(group_index: usiz
     unsafe { GroupPayloadRef::new(group_index, payload) }.is_some_and(GroupPayloadRef::holds_the_defaults)
 }
 
-/// A new payload of the group at `group_index` holding the group's default values, with one
-/// reference for the caller.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_style_group_create_default(group_index: usize) -> *mut c_void {
-    let group = style_group(group_index);
-    let payload = allocate_payload(group, 1);
-    // SAFETY: The payload was just allocated with the layout of the group's type.
-    unsafe { default_construct(group, payload) };
-    payload
-}
-
 /// The bytes of the allocation of `payload`, a payload of the group at `group_index`. What the
 /// payload holds beyond its own size is not counted.
 pub(crate) fn group_payload_allocation_bytes(group_index: usize, payload: *const c_void) -> usize {
     if payload.is_null() {
         return 0;
     }
-    allocation_layout(style_group(group_index)).size()
+    allocation_layout(group_index).size()
 }
 
 /// Retains one reference to a payload, mirroring StyleStructRef::ref().
 pub(crate) fn retain_group_payload(group_index: usize, payload: *const c_void) {
-    refcount_of(payload, payload_align(style_group(group_index))).fetch_add(1, Ordering::Relaxed);
+    refcount_of(payload, payload_align(group_index)).fetch_add(1, Ordering::Relaxed);
 }
 
 fn header_size(align: usize) -> usize {
@@ -1594,20 +1014,16 @@ fn header_size(align: usize) -> usize {
 }
 
 /// Where a group's computed values start in its allocation: after its payload.
-fn values_offset(group: StyleGroup) -> usize {
+fn values_offset(group: usize) -> usize {
     (header_size(payload_align(group)) + payload_size(group)).next_multiple_of(align_of::<RetainedStyleValueData>())
 }
 
 /// How many computed values the allocation of `group` holds.
-fn value_count(group: StyleGroup) -> usize {
-    usize::from(GROUP_VALUE_LAYOUT.counts[group_index_of(group)])
+fn value_count(group: usize) -> usize {
+    usize::from(GROUP_VALUE_LAYOUT.counts[group])
 }
 
-fn group_index_of(group: StyleGroup) -> usize {
-    with_style_group_type!(group, Payload => <Payload as StyleGroupPayload>::GROUP_INDEX)
-}
-
-fn allocation_layout(group: StyleGroup) -> Layout {
+fn allocation_layout(group: usize) -> Layout {
     let payload_align = payload_align(group);
     let align = payload_align
         .max(align_of::<usize>())
@@ -1623,7 +1039,7 @@ fn allocation_layout(group: StyleGroup) -> Layout {
 ///
 /// # Safety
 /// `payload` must be a live payload of the group, allocated by `allocate_payload`.
-unsafe fn values_of<'a>(group: StyleGroup, payload: *const c_void) -> &'a [RetainedStyleValueData] {
+unsafe fn values_of<'a>(group: usize, payload: *const c_void) -> &'a [RetainedStyleValueData] {
     // SAFETY: The allocation holds `value_count` initialized values at `values_offset`.
     unsafe {
         let start = (payload as *const u8)
@@ -1639,7 +1055,7 @@ unsafe fn values_of<'a>(group: StyleGroup, payload: *const c_void) -> &'a [Retai
 /// # Safety
 /// `payload` must be a live payload of the group, allocated by `allocate_payload`, that only the
 /// caller references.
-unsafe fn values_of_mut<'a>(group: StyleGroup, payload: *mut c_void) -> &'a mut [RetainedStyleValueData] {
+unsafe fn values_of_mut<'a>(group: usize, payload: *mut c_void) -> &'a mut [RetainedStyleValueData] {
     // SAFETY: As in `values_of`, and the caller holds the only reference.
     unsafe {
         let start = (payload as *mut u8)
@@ -1655,7 +1071,7 @@ unsafe fn values_of_mut<'a>(group: StyleGroup, payload: *mut c_void) -> &'a mut 
 /// # Safety
 /// `payload` must be a payload of the group, allocated by `allocate_payload`, with no remaining
 /// references.
-unsafe fn destroy_allocation(group: StyleGroup, payload: *mut c_void) {
+unsafe fn destroy_allocation(group: usize, payload: *mut c_void) {
     unsafe {
         std::ptr::drop_in_place(values_of_mut(group, payload));
         destruct(group, payload);
@@ -1673,7 +1089,7 @@ fn refcount_of(payload: *const c_void, align: usize) -> &'static AtomicUsize {
     }
 }
 
-fn allocate_payload(group: StyleGroup, initial_refcount: usize) -> *mut c_void {
+fn allocate_payload(group: usize, initial_refcount: usize) -> *mut c_void {
     // SAFETY: The layout is never zero-sized (the header is at least a usize).
     unsafe {
         let allocation = alloc(allocation_layout(group));
@@ -2686,7 +2102,7 @@ impl<'a> GroupPayloadRef<'a> {
     /// The computed values the payload's group holds.
     pub(crate) fn group_values(self) -> &'a [RetainedStyleValueData] {
         // SAFETY: The payload is live for 'a.
-        unsafe { values_of(style_group(self.group_index), self.as_ptr()) }
+        unsafe { values_of(self.group_index, self.as_ptr()) }
     }
 
     pub(crate) fn as_ptr(self) -> *const c_void {
@@ -2709,7 +2125,7 @@ impl<'a> GroupPayloadRef<'a> {
     fn equals(self, other: GroupPayloadRef<'_>) -> bool {
         assert_eq!(self.group_index, other.group_index);
         // SAFETY: Both payloads are live payloads of the group.
-        unsafe { payloads_equal(style_group(self.group_index), self.as_ptr(), other.as_ptr()) }
+        unsafe { payloads_equal(self.group_index, self.as_ptr(), other.as_ptr()) }
     }
 
     /// The group, with one more reference to it.
@@ -2735,10 +2151,9 @@ struct ScratchPayload {
 
 impl ScratchPayload {
     fn new_default(group_index: usize) -> Self {
-        let group = style_group(group_index);
-        let pointer = allocate_payload(group, 1);
+        let pointer = allocate_payload(group_index, 1);
         // SAFETY: The payload was just allocated with the layout of the group's type.
-        unsafe { default_construct(group, pointer) };
+        unsafe { default_construct(group_index, pointer) };
         Self { group_index, pointer }
     }
 
@@ -2771,7 +2186,7 @@ impl ScratchPayload {
 impl Drop for ScratchPayload {
     fn drop(&mut self) {
         // SAFETY: The scratch payload was never published, so this guard holds its only reference.
-        unsafe { free_scratch_payload(style_group(self.group_index), self.pointer) };
+        unsafe { free_scratch_payload(self.group_index, self.pointer) };
     }
 }
 
@@ -2861,29 +2276,19 @@ pub(crate) unsafe fn patch_group_payload<T: StyleGroupPayload + PartialEq + Clon
 /// Moves a built group value into a fresh payload that carries one reference for the caller.
 fn publish_group_payload<T: StyleGroupPayload>(group_index: usize, built: T) -> *const c_void {
     assert_group_payload_type::<T>(group_index);
-    let payload = allocate_payload(style_group(group_index), 1);
+    let payload = allocate_payload(group_index, 1);
     // SAFETY: The payload was just allocated with the layout of the group's type, which is `T`.
     unsafe { payload.cast::<T>().write(built) };
     payload.cast_const()
 }
 
 /// Allocates a new payload for `group_index` with a reference count of one,
-/// copy-constructed from `source`.
-///
-/// # Safety
-/// `source` must be a valid payload of the same group type.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_style_group_clone(group_index: usize, source: *const c_void) -> *mut c_void {
-    unsafe { clone_group_payload(group_index, source) }
-}
-
-/// The source must be a live payload of the registered group type.
+/// copy-constructed from `source`, a live payload of the registered group type.
 pub(crate) unsafe fn clone_group_payload(group_index: usize, source: *const c_void) -> *mut c_void {
-    let group = style_group(group_index);
-    let payload = allocate_payload(group, 1);
+    let payload = allocate_payload(group_index, 1);
     unsafe {
-        copy_construct(group, payload, source);
-        values_of_mut(group, payload).clone_from_slice(values_of(group, source));
+        copy_construct(group_index, payload, source);
+        values_of_mut(group_index, payload).clone_from_slice(values_of(group_index, source));
     }
     payload
 }
@@ -2896,18 +2301,16 @@ pub(crate) unsafe fn clone_group_payload(group_index: usize, source: *const c_vo
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_style_group_free(group_index: usize, payload: *mut c_void) {
     unsafe {
-        let group = style_group(group_index);
-        debug_assert!(refcount_of(payload, payload_align(group)).load(Ordering::Relaxed) == 0);
-        destroy_allocation(group, payload);
+        debug_assert!(refcount_of(payload, payload_align(group_index)).load(Ordering::Relaxed) == 0);
+        destroy_allocation(group_index, payload);
     };
 }
 
 pub(crate) fn release_group_payload(group_index: usize, payload: *const c_void) {
-    let group = style_group(group_index);
-    let refcount = refcount_of(payload, payload_align(group));
+    let refcount = refcount_of(payload, payload_align(group_index));
     if refcount.fetch_sub(1, Ordering::AcqRel) == 1 {
         // SAFETY: The count reached zero, so this reference was the last one.
-        unsafe { destroy_allocation(group, payload.cast_mut()) }
+        unsafe { destroy_allocation(group_index, payload.cast_mut()) }
     }
 }
 
@@ -2926,9 +2329,8 @@ pub(crate) unsafe fn group_values<'a>(group_index: usize, payload: *const c_void
 const GROUP_VALUE_SPANS: [(usize, usize); group_index::COUNT] = {
     let mut spans = [(0, 0); group_index::COUNT];
     let mut slot = 0;
-    while slot < STYLE_GROUPS.len() {
-        let (size, align) =
-            with_style_group_type!(STYLE_GROUPS[slot], Payload => (size_of::<Payload>(), align_of::<Payload>()));
+    while slot < group_index::COUNT {
+        let (size, align) = with_style_group_type!(slot, Payload => (size_of::<Payload>(), align_of::<Payload>()));
         let header = if align > size_of::<usize>() {
             align
         } else {
@@ -3028,10 +2430,10 @@ pub(crate) fn same_group_values(first: &[RetainedStyleValueData], second: &[Reta
 /// # Safety
 /// Both must be live payloads of the group.
 pub(crate) unsafe fn groups_hold_the_same(group_index: usize, first: *const c_void, second: *const c_void) -> bool {
-    let group = style_group(group_index);
     first == second
         || unsafe {
-            payloads_equal(group, first, second) && same_group_values(values_of(group, first), values_of(group, second))
+            payloads_equal(group_index, first, second)
+                && same_group_values(values_of(group_index, first), values_of(group_index, second))
         }
 }
 
@@ -3052,12 +2454,11 @@ unsafe fn group_with_values(
     values: &[RetainedStyleValueData],
     writes: &[ValueWrite],
 ) -> *const c_void {
-    let group = style_group(group_index);
-    assert_eq!(values.len(), value_count(group));
+    assert_eq!(values.len(), value_count(group_index));
     let written = || written_values(values, writes);
     // SAFETY: The caller passes live payloads of the group.
     unsafe {
-        if values_of(group, payload)
+        if values_of(group_index, payload)
             .iter()
             .zip(written())
             .all(|(held, value)| held.pointer() == value.pointer() || held == value)
@@ -3066,8 +2467,8 @@ unsafe fn group_with_values(
         }
         if writes.is_empty()
             && seed != payload
-            && payloads_equal(group, seed, payload)
-            && values_of(group, seed)
+            && payloads_equal(group_index, seed, payload)
+            && values_of(group_index, seed)
                 .iter()
                 .zip(written())
                 .all(|(held, value)| held.pointer() == value.pointer())
@@ -3077,16 +2478,16 @@ unsafe fn group_with_values(
             return seed;
         }
         let write_into = |target: *mut c_void| {
-            for (slot, value) in values_of_mut(group, target).iter_mut().zip(written()) {
+            for (slot, value) in values_of_mut(group_index, target).iter_mut().zip(written()) {
                 *slot = value.clone();
             }
         };
-        if refcount_of(payload, payload_align(group)).load(Ordering::Acquire) == 1 {
+        if refcount_of(payload, payload_align(group_index)).load(Ordering::Acquire) == 1 {
             write_into(payload.cast_mut());
             return payload;
         }
-        let copy = allocate_payload(group, 1);
-        copy_construct(group, copy, payload);
+        let copy = allocate_payload(group_index, 1);
+        copy_construct(group_index, copy, payload);
         write_into(copy);
         release_group_payload(group_index, payload);
         copy.cast_const()
@@ -4224,7 +3625,7 @@ const PAYLOAD_TYPED_LONGHANDS: [(u16, usize, usize, u8); 18] = {
 
 /// The longhands whose computed value a handle of their group's payload holds as it is, by the
 /// handle's offset: the group's values keep no second copy of them.
-const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 51] = {
+const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 53] = {
     use crate::css::computed_value_types::{BackgroundValues, EffectsValues, FontValues, MaskValues, SVGResetValues};
     use crate::css::property_metadata::property_id as p;
     use std::mem::offset_of;
@@ -4320,6 +3721,16 @@ const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 51] = {
             p::FONT_OPTICAL_SIZING,
             font,
             offset_of!(FontValues, font_optical_sizing),
+        ),
+        (
+            p::FONT_SYNTHESIS_WEIGHT,
+            font,
+            offset_of!(FontValues, font_synthesis_weight),
+        ),
+        (
+            p::FONT_SYNTHESIS_STYLE,
+            font,
+            offset_of!(FontValues, font_synthesis_style),
         ),
         (
             p::FONT_FEATURE_SETTINGS,
@@ -4910,7 +4321,7 @@ impl Default for DefaultGroups {
         //         which the groups take over.
         Self(unsafe {
             StyleGroups::adopt(
-                STYLE_GROUPS.map(|group| {
+                std::array::from_fn(|group| {
                     let payload = allocate_payload(group, 1);
                     default_construct(group, payload);
                     payload.cast_const()
@@ -4935,13 +4346,11 @@ pub(crate) fn with_default_seed<R>(defaults: &DefaultGroups, compute: impl FnOnc
 }
 
 /// The groups an element's values start from, one of each index: its parent's or the initial
-/// style's, or those a writer holds a reference to, as one waiting on a font does. Written values
-/// stay beside these until the group's allocation takes them, as a style struct stays borrowed until
-/// it is first mutated.
+/// style's. Written values stay beside these until the group's allocation takes them, as a style
+/// struct stays borrowed until it is first mutated.
+#[derive(Clone)]
 struct SeedGroups<'a> {
     pointers: [*const c_void; group_index::COUNT],
-    /// Whether these hold a reference to each group.
-    holds_references: bool,
     styles: std::marker::PhantomData<&'a StyleGroups>,
 }
 
@@ -4981,13 +4390,12 @@ impl HeldGroup {
 
     /// A new group holding a copy of the payload of `base` and the values `values` yields.
     fn new_copy<'v>(base: GroupPayloadRef<'_>, values: impl Iterator<Item = &'v RetainedStyleValueData>) -> Self {
-        let group = style_group(base.group_index);
-        let payload = allocate_payload(group, 1);
+        let payload = allocate_payload(base.group_index, 1);
         // SAFETY: The payload was just allocated for the group, which `base` is a live payload of,
         //         and nothing else references it yet.
         unsafe {
-            copy_construct(group, payload, base.as_ptr());
-            for (slot, value) in values_of_mut(group, payload).iter_mut().zip(values) {
+            copy_construct(base.group_index, payload, base.as_ptr());
+            for (slot, value) in values_of_mut(base.group_index, payload).iter_mut().zip(values) {
                 *slot = value.clone();
             }
         }
@@ -4999,9 +4407,8 @@ impl HeldGroup {
 
     /// Puts `value` in the payload field at `place`, where this is the only reference to the group.
     fn set_payload_field(&mut self, place: LonghandPlace, value: &RetainedStyleValueData) {
-        let group = style_group(self.group);
         assert_eq!(
-            refcount_of(self.payload, payload_align(group)).load(Ordering::Acquire),
+            refcount_of(self.payload, payload_align(self.group)).load(Ordering::Acquire),
             1
         );
         // SAFETY: The group is live, and this is its only reference.
@@ -5012,27 +4419,6 @@ impl HeldGroup {
 impl Drop for HeldGroup {
     fn drop(&mut self) {
         release_group_payload(self.group, self.payload);
-    }
-}
-
-impl Clone for SeedGroups<'_> {
-    fn clone(&self) -> Self {
-        if self.holds_references {
-            for (group, &pointer) in self.pointers.iter().enumerate() {
-                retain_group_payload(group, pointer);
-            }
-        }
-        Self { ..*self }
-    }
-}
-
-impl Drop for SeedGroups<'_> {
-    fn drop(&mut self) {
-        if self.holds_references {
-            for (group, &pointer) in self.pointers.iter().enumerate() {
-                release_group_payload(group, pointer);
-            }
-        }
     }
 }
 
@@ -5052,10 +4438,6 @@ impl<'a> SeedGroups<'a> {
 
     /// These groups, but with `seed` as the group at `group`.
     fn replace(&mut self, group: usize, seed: GroupPayloadRef<'a>) {
-        if self.holds_references {
-            retain_group_payload(group, seed.as_ptr());
-            release_group_payload(group, self.pointers[group]);
-        }
         self.pointers[group] = seed.as_ptr();
     }
 
@@ -5354,7 +4736,7 @@ impl GroupValues<'_> {
             if GROUPS_OF_TYPED_LONGHANDS & (1 << group) != 0 {
                 let untold = self.typed_values_untold(group, own.as_ptr());
                 // SAFETY: The group was just made, and this is its only reference.
-                let slots = unsafe { values_of_mut(style_group(group), own.as_ptr().cast_mut()) };
+                let slots = unsafe { values_of_mut(group, own.as_ptr().cast_mut()) };
                 slots[TYPED_VALUES_SLOT] = untold;
             }
             std::mem::ManuallyDrop::new(own).payload
@@ -5452,7 +4834,6 @@ impl<'a> GroupValuesWriter<'a> {
         }
         let seeded = SeedGroups {
             pointers,
-            holds_references: false,
             styles: std::marker::PhantomData,
         };
         Self {
@@ -5504,49 +4885,6 @@ impl<'a> GroupValuesWriter<'a> {
             {
                 self.set_inheritance_dependent_value(held.property, None);
             }
-        }
-    }
-
-    /// This writer, holding a reference to each group it borrowed, so that it outlives the
-    /// groups it was seeded with, as a drive waiting on a font does.
-    pub(crate) fn detached(self) -> GroupValuesWriter<'static> {
-        let Self {
-            seeded,
-            writes,
-            written_groups,
-            written_longhands,
-            bits,
-            seeded_inheritance_dependent_values,
-            inheritance_dependent_values,
-            effective_zoom,
-            display_before_box_type_transformation,
-            effective_color_scheme,
-            flags,
-            dependency_flags,
-        } = self;
-        let seeded = std::mem::ManuallyDrop::new(seeded);
-        if !seeded.holds_references {
-            for (group, &pointer) in seeded.pointers.iter().enumerate() {
-                retain_group_payload(group, pointer);
-            }
-        }
-        GroupValuesWriter {
-            seeded: SeedGroups {
-                pointers: seeded.pointers,
-                holds_references: true,
-                styles: std::marker::PhantomData,
-            },
-            writes,
-            written_groups,
-            written_longhands,
-            bits,
-            seeded_inheritance_dependent_values,
-            inheritance_dependent_values,
-            effective_zoom,
-            display_before_box_type_transformation,
-            effective_color_scheme,
-            flags,
-            dependency_flags,
         }
     }
 
@@ -6141,7 +5479,7 @@ unsafe fn apply_group_field_pokes(scratch: *mut c_void, pokes: &[GroupFieldPoke]
 /// # Safety
 /// `scratch` must be a payload of the group, allocated by
 /// `allocate_payload` and not shared.
-unsafe fn free_scratch_payload(group: StyleGroup, scratch: *mut c_void) {
+unsafe fn free_scratch_payload(group: usize, scratch: *mut c_void) {
     unsafe { destroy_allocation(group, scratch) }
 }
 
@@ -6588,7 +5926,7 @@ impl BoxValues {
             is_size_container: false,
             is_inline_size_container: false,
             is_scroll_state_container: false,
-            container_name: RetainedUtf16FlyStringList::from_retained_strings(Vec::new()),
+            container_name: RetainedUtf16FlyStringList::from_vec(Vec::new()),
         }
     }
 }
@@ -6715,9 +6053,9 @@ impl EffectsValues {
 impl AnchorValues {
     fn initial() -> Self {
         Self {
-            anchor_names: RetainedUtf16FlyStringList::from_retained_strings(Vec::new()),
+            anchor_names: RetainedUtf16FlyStringList::from_vec(Vec::new()),
             anchor_scope_all: false,
-            anchor_scope_names: RetainedUtf16FlyStringList::from_retained_strings(Vec::new()),
+            anchor_scope_names: RetainedUtf16FlyStringList::from_vec(Vec::new()),
             // PositionAnchor::Type::Normal.
             position_anchor_type: 0,
             position_anchor_name: RetainedUtf16FlyString::none(),
@@ -6757,7 +6095,7 @@ impl InheritedUIValues {
                 is_auto: true,
             },
             color_scheme: 0,
-            color_schemes: RetainedUtf16FlyStringList::from_retained_strings(Vec::new()),
+            color_schemes: RetainedUtf16FlyStringList::from_vec(Vec::new()),
             image_rendering: crate::css::css_enums::image_rendering::AUTO,
             color_scheme_only: false,
         }
@@ -7202,6 +6540,8 @@ impl FontValues {
             font_family: initial(property_id::FONT_FAMILY),
             font_style: initial(property_id::FONT_STYLE),
             font_optical_sizing: initial(property_id::FONT_OPTICAL_SIZING),
+            font_synthesis_weight: initial(property_id::FONT_SYNTHESIS_WEIGHT),
+            font_synthesis_style: initial(property_id::FONT_SYNTHESIS_STYLE),
             font_feature_settings: initial(property_id::FONT_FEATURE_SETTINGS),
             font_kerning: initial(property_id::FONT_KERNING),
             font_language_override: initial(property_id::FONT_LANGUAGE_OVERRIDE),
@@ -7550,8 +6890,8 @@ mod tests {
 
     #[test]
     fn every_payload_type_names_the_group_it_is_dispatched_for() {
-        for (group_index, &group) in STYLE_GROUPS.iter().enumerate() {
-            with_style_group_type!(group, Payload => assert_eq!(Payload::GROUP_INDEX, group_index));
+        for group in 0..group_index::COUNT {
+            with_style_group_type!(group, Payload => assert_eq!(Payload::GROUP_INDEX, group));
         }
     }
 
@@ -7699,9 +7039,7 @@ mod tests {
             pointers
                 .iter()
                 .enumerate()
-                .map(|(group, &pointer)| {
-                    refcount_of(pointer, payload_align(style_group(group))).load(Ordering::Relaxed)
-                })
+                .map(|(group, &pointer)| refcount_of(pointer, payload_align(group)).load(Ordering::Relaxed))
                 .collect()
         };
         // SAFETY: Each default payload is a live payload of its group.
@@ -7753,28 +7091,24 @@ mod tests {
         for group_index in 0..group_index::COUNT {
             let default = defaults.groups()[group_index].as_ptr();
             // SAFETY: The default payload is a live payload of its group.
-            let clone = unsafe { rust_style_group_clone(group_index, default) };
+            let clone = unsafe { clone_group_payload(group_index, default) };
             // SAFETY: The payloads are live defaults and clones of this group.
             assert!(unsafe { style_group_payloads_equal(group_index, default, clone) });
-            refcount_of(clone, payload_align(style_group(group_index))).store(0, Ordering::Relaxed);
+            refcount_of(clone, payload_align(group_index)).store(0, Ordering::Relaxed);
             // SAFETY: The clone holds the last reference and is a payload of this group.
             unsafe { rust_style_group_free(group_index, clone) };
         }
 
         let table_default = defaults.groups()[group_index::INHERITED_LIST_TABLE].as_ptr();
         // SAFETY: The default payload is a live payload of its group.
-        let changed_payload = unsafe { rust_style_group_clone(group_index::INHERITED_LIST_TABLE, table_default) };
+        let changed_payload = unsafe { clone_group_payload(group_index::INHERITED_LIST_TABLE, table_default) };
         // SAFETY: The clone is uniquely owned and a list and table group.
         unsafe { &mut *changed_payload.cast::<InheritedListTableValues>() }.border_spacing_horizontal = 17;
         // SAFETY: The payloads are live payloads of this group.
         assert!(!unsafe {
             style_group_payloads_equal(group_index::INHERITED_LIST_TABLE, table_default, changed_payload)
         });
-        refcount_of(
-            changed_payload,
-            payload_align(style_group(group_index::INHERITED_LIST_TABLE)),
-        )
-        .store(0, Ordering::Relaxed);
+        refcount_of(changed_payload, payload_align(group_index::INHERITED_LIST_TABLE)).store(0, Ordering::Relaxed);
         // SAFETY: The clone holds the last reference and is a payload of this group.
         unsafe { rust_style_group_free(group_index::INHERITED_LIST_TABLE, changed_payload) };
     }

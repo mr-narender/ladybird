@@ -728,6 +728,8 @@ void Internals::grant_transient_activation()
 namespace {
 
 struct MouseEventsTheUIProcessHasNotHandledYet : public RefCounted<MouseEventsTheUIProcessHasNotHandledYet> {
+    GC_HOLDS_NO_CELL_EDGES;
+
     size_t count { 0 };
 };
 
@@ -756,7 +758,7 @@ void Internals::send_mouse_events_through_ui_process(Vector<Web::MouseEvent> eve
     auto unhandled_events = make_ref_counted<MouseEventsTheUIProcessHasNotHandledYet>();
     unhandled_events->count = events.size();
     for (auto& event : events) {
-        page.client().page_did_request_webdriver_mouse_event(local_root_id, move(event), GC::create_function(heap(), [&realm, promise, unhandled_events] {
+        page.client().page_did_request_webdriver_mouse_event(local_root_id, move(event), GC::create_function(heap(), GC::captures(realm, promise, unhandled_events), [](auto& realm, auto& promise, auto& unhandled_events) {
             if (--unhandled_events->count != 0)
                 return;
             HTML::TemporaryExecutionContext execution_context { realm };
@@ -819,17 +821,17 @@ void Internals::perform_actions(Utf16String const& json, GC::Ref<WebIDL::Promise
     let_compositor_take_in_every_rendered_frame(window());
     m_actions_running = true;
     auto executor = WebDriver::dispatch_actions(input_state, actions.release_value(), *window().associated_document().browsing_context(), options,
-        GC::create_function(heap(), [this, promise, realm = GC::Ref { realm }](WebDriver::Response response) {
-            HTML::TemporaryExecutionContext context { *realm };
-            m_actions_running = false;
-            m_actions_executor = {};
+        GC::create_function(heap(), GC::captures(*this, promise, realm), [](auto& self, auto& promise, auto& realm, WebDriver::Response response) {
+            HTML::TemporaryExecutionContext context { realm };
+            self.m_actions_running = false;
+            self.m_actions_executor = {};
             if (response.is_error())
-                WebIDL::reject_promise(*realm, promise, JS::PrimitiveString::create(realm->vm(), Utf16String::from_utf8(response.error().message)));
+                WebIDL::reject_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(response.error().message)));
             else
-                WebIDL::resolve_promise(*realm, promise);
-            if (m_pending_action_test_result.has_value()) {
-                auto text = m_pending_action_test_result.release_value();
-                signal_test_is_done(text);
+                WebIDL::resolve_promise(realm, promise);
+            if (self.m_pending_action_test_result.has_value()) {
+                auto text = self.m_pending_action_test_result.release_value();
+                self.signal_test_is_done(text);
             }
         }));
     if (m_actions_running)
@@ -905,8 +907,7 @@ void Internals::paste(HTML::HTMLElement& target, Utf16String const& text)
 
 void Internals::paste_from_clipboard()
 {
-    if (auto navigable = page().hosted_focused_navigable())
-        navigable->paste_from_clipboard();
+    page().client().page_did_request_paste_from_clipboard_for_testing();
 }
 
 void Internals::commit_text()
@@ -1000,11 +1001,14 @@ void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, doub
             navigable->wait_for_wheel_scrolls(scroll_promises);
     }
     auto& realm = window().principal_realm();
-    auto resolve = [&realm, promise] {
+    auto resolve = GC::create_function(GC::Heap::the(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise);
-    };
-    WebIDL::wait_for_all(realm, scroll_promises, [resolve](auto const&) { resolve(); }, [resolve](auto) { resolve(); });
+    });
+    WebIDL::wait_for_all(
+        realm, scroll_promises,
+        GC::create_function(GC::Heap::the(), GC::captures(resolve), [](auto& resolve, Vector<JS::Value> const&) { resolve->function()(); }),
+        GC::create_function(GC::Heap::the(), GC::captures(resolve), [](auto& resolve, JS::Value) { resolve->function()(); }));
 }
 
 void Internals::wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, Bindings::WheelTicks const& ticks, GC::Ref<WebIDL::Promise> promise)
@@ -1172,7 +1176,8 @@ WebIDL::ExceptionOr<void> Internals::set_clipboard_file(Utf16String const& name,
     HTML::SelectedFile file { name, MUST(ByteBuffer::copy(data_utf8.bytes())) };
     Clipboard::SystemClipboardRepresentation item { move(mime_type_utf8), move(file) };
 
-    page().client().page_did_insert_clipboard_item({ { move(item) } }, "unspecified"sv);
+    // NB: This stands in for another application writing to the clipboard, so no origin wrote it.
+    page().client().page_did_insert_clipboard_item({ { move(item) } }, "unspecified"sv, {});
     return {};
 }
 
@@ -2357,14 +2362,14 @@ bool Internals::restore_captured_session_history_snapshot()
     return window().associated_document().page().client().page_did_request_restore_session_history_snapshot_for_testing();
 }
 
-bool Internals::register_session_store_tab()
+bool Internals::record_reported_session_history()
 {
-    return window().associated_document().page().client().page_did_request_register_session_store_tab_for_testing();
+    return window().associated_document().page().client().page_did_request_record_reported_session_history_for_testing();
 }
 
-Utf16String Internals::dump_session_store_tab_state()
+Utf16String Internals::dump_reported_session_history()
 {
-    return dump_string_to_utf16(window().associated_document().page().client().page_did_request_session_store_tab_state_for_testing());
+    return dump_string_to_utf16(window().associated_document().page().client().page_did_request_reported_session_history_for_testing());
 }
 
 bool Internals::has_populated_document(HTML::HTMLIFrameElement& iframe)
@@ -2440,7 +2445,7 @@ GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()
     navigable->page().history_executor().request_history_operation(
         FlushSessionHistoryTraversalQueueOperationParameters {},
         {
-            .on_complete = GC::create_function(heap(), [&realm, promise] {
+            .on_complete = GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
                 HTML::TemporaryExecutionContext execution_context { realm };
                 WebIDL::resolve_promise(promise);
             }),
@@ -2550,7 +2555,7 @@ GC::Ref<WebIDL::Promise> Internals::request_permission(Utf16String const& name)
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
     auto& settings = window().associated_document().relevant_settings_object();
-    PermissionsAPI::request_permission_with_user_prompt({ name }, settings, GC::create_function(realm.heap(), [&realm, promise](PermissionsAPI::PermissionState state) {
+    PermissionsAPI::request_permission_with_user_prompt({ name }, settings, GC::create_function(realm.heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, PermissionsAPI::PermissionState state) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Bindings::idl_enum_to_string(state)));
     }));
@@ -2564,7 +2569,7 @@ static GC::Ref<WebIDL::Promise> apply_snapshot_then_resolve(HTML::Window& window
     auto promise = WebIDL::create_promise_for(window);
     if (snapshot.has_value())
         PermissionsAPI::PermissionStore::the().apply_snapshot(snapshot.release_value());
-    HTML::queue_global_task(HTML::Task::Source::Permissions, window.associated_document().relevant_settings_object().global_object(), GC::create_function(window.heap(), [&window, promise] {
+    HTML::queue_global_task(HTML::Task::Source::Permissions, window.associated_document().relevant_settings_object().global_object(), GC::create_function(window.heap(), GC::captures(window, promise), [](auto& window, auto& promise) {
         auto& realm = window.principal_realm();
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise);
@@ -2673,6 +2678,43 @@ bool Internals::tab_is_playing_audio()
 bool Internals::tab_is_heard_playing_audio()
 {
     return window().associated_document().page().client().page_did_request_tab_is_heard_playing_audio_for_testing();
+}
+
+bool Internals::tab_is_using_microphone()
+{
+    return window().associated_document().page().client().page_did_request_tab_is_using_microphone_for_testing();
+}
+
+bool Internals::tab_is_capturing_audio()
+{
+    return window().associated_document().page().client().page_did_request_tab_is_capturing_audio_for_testing();
+}
+
+void Internals::report_audio_capture_of_unknown_page(bool capturing)
+{
+    report_audio_capture_of_page(NumericLimits<u64>::max(), capturing);
+}
+
+WebIDL::UnsignedLongLong Internals::picture_in_picture_window_page_id()
+{
+    auto window = page().picture_in_picture_controller().open_window();
+    VERIFY(window);
+    return window->traversable().active_document()->page().client().id().value();
+}
+
+void Internals::report_audio_capture_of_page(WebIDL::UnsignedLongLong page_id, bool capturing)
+{
+    page().client().page_did_report_audio_capture_for_testing(Web::PageId { page_id }, capturing);
+}
+
+void Internals::retire_picture_in_picture_window()
+{
+    page().client().page_did_retire_picture_in_picture_window_for_testing();
+}
+
+WebIDL::UnsignedLongLong Internals::audio_capture_stream_count()
+{
+    return Audio::ClientConnection::capture_stream_count_for_testing();
 }
 
 WebIDL::UnsignedLongLong Internals::tab_audibility_change_count()
@@ -3689,6 +3731,8 @@ namespace {
 
 // The bytes of a stream from create_stream_pulling_from_bytes() that it has not pulled yet.
 struct UnpulledBytes final : public RefCounted<UnpulledBytes> {
+    GC_HOLDS_NO_CELL_EDGES;
+
     explicit UnpulledBytes(ByteBuffer bytes)
         : bytes(move(bytes))
     {
@@ -3705,7 +3749,7 @@ GC::Ref<Streams::ReadableStream> Internals::create_stream_pulling_from_bytes(Str
     auto stream = Streams::ReadableStream::create(realm);
     auto unpulled = make_ref_counted<UnpulledBytes>(MUST(ByteBuffer::copy(bytes.bytes())));
 
-    auto pull_algorithm = GC::create_function(realm.heap(), [realm = GC::Ref { realm }, stream, unpulled, pull_size] {
+    auto pull_algorithm = GC::create_function(realm.heap(), GC::captures(GC::Ref { realm }, stream, unpulled, pull_size), [](auto& realm, auto& stream, auto& unpulled, auto& pull_size) {
         auto& remaining = unpulled->bytes;
         auto size = min(remaining.size(), static_cast<size_t>(pull_size));
         if (auto view_byte_length = stream->current_byob_request_view_byte_length(); view_byte_length.has_value())
@@ -3813,7 +3857,7 @@ GC::Ref<WebIDL::Promise> Internals::check_spelling_for_testing(Utf16String const
         WebIDL::reject_promise(realm, promise, JS::PrimitiveString::create(vm(), "Spellchecking is unavailable"_utf16));
         return promise;
     }
-    page.request_spell_check(text, GC::create_function(heap(), [&realm, promise](Vector<SpellingError> errors) {
+    page.request_spell_check(text, GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, Vector<SpellingError> errors) {
         HTML::TemporaryExecutionContext execution_context { realm };
         StringBuilder builder;
         for (auto const& error : errors) {
@@ -3830,7 +3874,7 @@ GC::Ref<WebIDL::Promise> Internals::spell_check_settled()
 {
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
-    page().when_spell_checking_settled(GC::create_function(heap(), [&realm, promise] {
+    page().when_spell_checking_settled(GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));
@@ -3846,7 +3890,7 @@ GC::Ref<WebIDL::Promise> Internals::translation_settled()
 {
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
-    page().when_translation_settled(GC::create_function(heap(), [&realm, promise] {
+    page().when_translation_settled(GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));
@@ -3862,7 +3906,7 @@ GC::Ref<WebIDL::Promise> Internals::request_writing_suggestion_for_testing(Utf16
         WebIDL::reject_promise(realm, promise, JS::PrimitiveString::create(vm(), "Writing suggestions are unavailable"_utf16));
         return promise;
     }
-    page.request_writing_suggestion(text, caret_offset, GC::create_function(heap(), [&realm, promise](Optional<WritingSuggestion> suggestion) {
+    page.request_writing_suggestion(text, caret_offset, GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, Optional<WritingSuggestion> suggestion) {
         HTML::TemporaryExecutionContext execution_context { realm };
         auto result = suggestion.has_value()
             ? Utf16String::formatted("{}-{}:{}", suggestion->replacement_start, suggestion->replacement_length, suggestion->text)
@@ -3890,7 +3934,7 @@ GC::Ref<WebIDL::Promise> Internals::writing_suggestion_settled()
 {
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
-    page().when_writing_suggestions_settled(GC::create_function(heap(), [&realm, promise] {
+    page().when_writing_suggestions_settled(GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));
@@ -3901,7 +3945,7 @@ GC::Ref<WebIDL::Promise> Internals::writing_suggestion_request_sent()
 {
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
-    page().when_writing_suggestion_requested(GC::create_function(heap(), [&realm, promise] {
+    page().when_writing_suggestion_requested(GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));
@@ -3925,7 +3969,7 @@ GC::Ref<WebIDL::Promise> Internals::activate_spelling_menu_item(Bindings::Spelli
         }
         VERIFY_NOT_REACHED();
     }();
-    page().request_spelling_menu_action_for_testing(action, guess_index, GC::create_function(heap(), [&realm, promise](String menu) {
+    page().request_spelling_menu_action_for_testing(action, guess_index, GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, String menu) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(menu)));
     }));

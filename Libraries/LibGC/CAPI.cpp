@@ -13,6 +13,7 @@
 #include <LibGC/HeapRegion.h>
 #include <LibGC/PrimitiveStorage.h>
 #include <LibGC/Root.h>
+#include <LibGC/Rootable.h>
 #include <LibGC/Weak.h>
 
 namespace GC {
@@ -76,36 +77,6 @@ public:
         VERIFY(foreign_type());
         release_index();
     }
-};
-
-class RootGatheringVisitor final : public Cell::Visitor {
-public:
-    explicit RootGatheringVisitor(HashMap<Cell*, HeapRoot>& roots)
-        : m_roots(roots)
-    {
-    }
-
-    virtual void visit_possible_values(ReadonlyBytes) override
-    {
-        // NB: Roots are gathered precisely; a conservative range belongs in a ConservativeRangeProvider.
-        VERIFY_NOT_REACHED();
-    }
-
-private:
-    virtual void visit_impl(Cell& cell) override
-    {
-        m_roots.set(&cell, HeapRoot { .type = HeapRoot::Type::VM });
-    }
-
-    virtual void visit_impl(ReadonlySpan<NanBoxedValue> values) override
-    {
-        for (auto const& value : values) {
-            if (value.is_cell())
-                visit_impl(value.as_cell());
-        }
-    }
-
-    HashMap<Cell*, HeapRoot>& m_roots;
 };
 
 struct CAPI {
@@ -237,7 +208,7 @@ GCHeap* gc_heap_create(GCGatherRootsCallback gather_roots, void* context, bool b
 {
     auto* heap = new Heap(
         [gather_roots, context](HashMap<Cell*, HeapRoot>& roots) {
-            RootGatheringVisitor visitor { roots };
+            Detail::RootGatheringVisitor visitor { roots, HeapRoot::Type::VM };
             gather_roots(context, reinterpret_cast<GCVisitor*>(static_cast<Cell::Visitor*>(&visitor)));
         },
         become_thread_default ? Heap::BecomeThreadDefault::Yes : Heap::BecomeThreadDefault::No);
@@ -433,11 +404,6 @@ void gc_visitor_visit_values(GCVisitor* visitor, uint64_t const* values, size_t 
 void gc_visitor_visit_ephemeron(GCVisitor* visitor, GCCell* key, uint64_t const* value)
 {
     as_visitor(visitor).visit_ephemeron(*from_gc_cell(key), *reinterpret_cast<NanBoxedValue const*>(value));
-}
-
-void gc_visitor_visit_possible_values(GCVisitor* visitor, uint8_t const* data, size_t size)
-{
-    as_visitor(visitor).visit_possible_values(ReadonlyBytes { data, size });
 }
 
 bool gc_primitive_storage_allocate(size_t size, bool zero_fill, GCPrimitiveStorageHandle* out_handle, GCPrimitiveStorageLayout* out_layout)

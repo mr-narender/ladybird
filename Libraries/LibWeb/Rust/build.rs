@@ -889,6 +889,8 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "font-size",
         "font-size-adjust",
         "font-style",
+        "font-synthesis-style",
+        "font-synthesis-weight",
         "font-variant-alternates",
         "font-variant-caps",
         "font-variant-east-asian",
@@ -2759,6 +2761,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     style_engine_config.export.include = vec![
         // Taken only by an entry of the boundary table, which cbindgen does not see.
         "FfiAppliedAnimationDefinition".to_string(),
+        "FfiFrameSetDimension".to_string(),
+        "FfiFrameSetBorder".to_string(),
         // Named by no exported signature: a replaced content input crosses as its raw values.
         "FfiReplacedContentInputKind".to_string(),
         "FfiReplacedContentInputPresent".to_string(),

@@ -72,7 +72,6 @@ public:
     [[nodiscard]] Optional<StyleEngineRuleTarget> style_engine_rule_target(Layout::BegunRead const& read, StyleEngineRuleID rule_id) const;
 
     static CSSPixels default_user_font_size();
-    static CSSPixels absolute_size_mapping(AbsoluteSize, CSSPixels default_font_size);
 
     void set_viewport_rect(Badge<DOM::Document>, CSSPixelRect const& viewport_rect) { m_viewport_rect = viewport_rect; }
     [[nodiscard]] CSSPixelRect const& viewport_rect_for_style_environment() const { return m_viewport_rect; }
@@ -86,19 +85,10 @@ public:
     // The environment as a compositor animation request names it: the document's version and the viewport's.
     [[nodiscard]] u64 style_environment_version_for_sharing() const;
 
-    // Drop caches whose keys contain inputs that are stable only within one engine transaction.
-    // Style sharing has a self-validating key and survives ordinary transaction boundaries.
-    void prepare_for_style_engine_transaction() const;
-
     void begin_style_update() const;
     void end_style_update() const;
     void begin_inheritance_chain_read() const { ++m_inheritance_chain_read_depth; }
     void end_inheritance_chain_read() const { --m_inheritance_chain_read_depth; }
-
-    struct ComputedStyleInvalidation {
-        RequiredInvalidationAfterStyleChange invalidation;
-        bool any_computed_value_changed { false };
-    };
 
     // Has the engine compose each element's sampled overlay over the record the element installed, which it was sampled
     // on, compare it with that record and publish it, in one call of the engine, answering each at the same index of
@@ -106,6 +96,8 @@ public:
     struct SampledAnimationOverlay {
         DOM::AbstractElement element;
         ComputedStyleWorkingSet const& style;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
     void publish_sampled_animation_overlays(Layout::BegunRead const& read, ReadonlySpan<SampledAnimationOverlay>, Span<StyleEngineFFI::FfiAnimationOverlayPublication> publications) const;
     // Give a layout-only variant of an element or pseudo-element style an authoritative record
@@ -136,21 +128,20 @@ public:
     // element inherits, which must be the environment the engine resolved it over. Nothing when
     // the identity is no engine environment or was resolved over another.
     [[nodiscard]] RefPtr<CustomPropertyData const> engine_custom_property_environment(Layout::BegunRead const& read, u64 identity, RefPtr<CustomPropertyData const> const& inherited) const;
-    // The environment `environment` was built over: the one the engine resolved it over, or the node its chain lies over.
     // What a child of an element holding `environment` inherits of it, under the registrations as they are now.
     [[nodiscard]] RefPtr<CustomPropertyData const> inheritable_custom_property_environment(Layout::BegunRead const& read, CustomPropertyData const& environment) const;
     // The custom properties the engine's environment `identity` declares of its own, over `inherited` rather than the
     // environment the engine resolved them over. Nothing where `identity` is not an environment the engine resolved.
     [[nodiscard]] RefPtr<CustomPropertyData const> engine_custom_property_declarations_over(Layout::BegunRead const& read, u64 identity, RefPtr<CustomPropertyData const> const& inherited) const;
 
-    // Refreshes a previously published style outside the drive: re-runs the animated element style
-    // adjustments and leaves the non-inherited-property inheritance invalidation mark itself.
     void collect_animations_into(Layout::BegunRead const& read, DOM::AbstractElement, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, ComputedStyleWorkingSet&) const;
     // One element's animations, refreshed over the record it holds as `collect_animations_into()` refreshes them.
     struct AnimationRefreshRequest {
         DOM::AbstractElement abstract_element;
         ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects;
         ComputedStyleWorkingSet& computed_properties;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
     // Refreshes the animations of elements of this document, sampling them all in one call of the style engine.
     void refresh_animations_into_each(Layout::BegunRead const& read, ReadonlySpan<AnimationRefreshRequest>) const;
@@ -209,8 +200,6 @@ private:
     RefPtr<ComputedStyleWorkingSet> start_needed_transitions(Layout::BegunRead const& read, DOM::AbstractElement, InstalledStyle const& before_change_style) const;
     [[nodiscard]] bool has_provisional_transition_states(DOM::AbstractElement) const;
     void finalize_animated_box_type(Layout::BegunRead const& read, ComputedStyleWorkingSet&, DOM::AbstractElement) const;
-
-    [[nodiscard]] CSSPixelRect viewport_rect() const { return m_viewport_rect; }
 
 public:
     // The document's StyleEngine.
@@ -289,7 +278,6 @@ public:
 private:
     GC::Ref<DOM::Document> m_document;
 
-    Length::FontMetrics m_default_font_metrics;
     mutable Length::FontMetrics m_root_element_font_metrics;
     mutable bool m_root_element_font_metrics_depend_on_viewport_metrics { false };
     mutable double m_root_element_effective_zoom { 1 };
@@ -317,15 +305,19 @@ private:
         StyleValueFFI::FfiTransitionActionKind action {};
         bool has_decision { false };
     };
-    // Whether the animation collection of the computation in progress resolved a keyframe-borne
-    // `inherit` for a non-inherited property; folded into the explicit-inheritance bookkeeping.
     mutable Vector<ProvisionalTransitionState> m_provisional_transition_states;
     mutable HashMap<u64, size_t> m_provisional_transition_state_indices;
     mutable HashMap<u64, Vector<size_t>> m_provisional_transition_state_indices_by_target;
     // Whether the engine keeps a before-change style the current stabilization epoch recorded.
     mutable bool m_transition_baselines_recorded { false };
 
-    ComputationContext make_computation_context_for_property(PropertyID, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
+    // What a sampled element's lengths resolve against, by when in the cascade they compute.
+    enum class LengthResolutionPhase : u8 {
+        Font,
+        LineHeight,
+        Remaining,
+    };
+    Length::ResolutionContext make_length_resolution_context(LengthResolutionPhase, ComputedStyleWorkingSet const&, Optional<DOM::AbstractElement>) const;
     CSSPixelRect m_viewport_rect;
 
     mutable StyleEngine m_style_engine;

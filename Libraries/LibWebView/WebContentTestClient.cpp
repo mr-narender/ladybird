@@ -137,6 +137,34 @@ Messages::WebContentTestClient::DidRequestTabIsHeardPlayingAudioForTestingRespon
     return false;
 }
 
+Messages::WebContentTestClient::DidRequestTabIsUsingMicrophoneForTestingResponse WebContentTestClient::did_request_tab_is_using_microphone_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_tab_is_using_microphone_for_testing();
+
+    return false;
+}
+
+Messages::WebContentTestClient::DidRequestTabIsCapturingAudioForTestingResponse WebContentTestClient::did_request_tab_is_capturing_audio_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_tab_is_capturing_audio_for_testing();
+
+    return false;
+}
+
+void WebContentTestClient::report_audio_capture_for_testing(Web::PageId page_id, Web::PageId labelled_page_id, bool capturing)
+{
+    if (auto* page = m_client.page(page_id))
+        page->report_audio_capture_for_testing(labelled_page_id, capturing);
+}
+
+void WebContentTestClient::retire_picture_in_picture_window_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        page->retire_picture_in_picture_window_for_testing();
+}
+
 Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResponse WebContentTestClient::did_request_tab_audibility_change_count_for_testing(Web::PageId page_id)
 {
     if (auto* page = m_client.page(page_id))
@@ -169,18 +197,18 @@ Messages::WebContentTestClient::DidRequestRestoreSessionHistorySnapshotForTestin
     return false;
 }
 
-Messages::WebContentTestClient::DidRequestRegisterSessionStoreTabForTestingResponse WebContentTestClient::did_request_register_session_store_tab_for_testing(Web::PageId page_id)
+Messages::WebContentTestClient::DidRequestRecordReportedSessionHistoryForTestingResponse WebContentTestClient::did_request_record_reported_session_history_for_testing(Web::PageId page_id)
 {
     if (auto* page = m_client.page(page_id))
-        return page->did_request_register_session_store_tab_for_testing();
+        return page->did_request_record_reported_session_history_for_testing();
 
     return false;
 }
 
-Messages::WebContentTestClient::DidRequestSessionStoreTabStateForTestingResponse WebContentTestClient::did_request_session_store_tab_state_for_testing(Web::PageId page_id)
+Messages::WebContentTestClient::DidRequestReportedSessionHistoryForTestingResponse WebContentTestClient::did_request_reported_session_history_for_testing(Web::PageId page_id)
 {
     if (auto* page = m_client.page(page_id))
-        return page->did_request_session_store_tab_state_for_testing();
+        return page->did_request_reported_session_history_for_testing();
 
     return String {};
 }

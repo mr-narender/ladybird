@@ -88,7 +88,6 @@ pub struct GcInterface {
     pub gc_root_create: unsafe extern "C" fn(cell: *mut c_void) -> *mut c_void,
     pub gc_root_destroy: unsafe extern "C" fn(root: *mut c_void),
     pub gc_visitor_visit_cell: unsafe extern "C" fn(visitor: *mut c_void, cell: *mut c_void),
-    pub gc_visitor_visit_possible_values: unsafe extern "C" fn(visitor: *mut c_void, data: *const u8, size: usize),
     pub gc_primitive_storage_reserve: unsafe extern "C" fn(
         size: usize,
         capacity: usize,
@@ -483,17 +482,7 @@ impl Visitor {
         if reference == 0 || reference & 1 != 0 {
             return;
         }
-        if reference & 3 == 2 {
-            // An embedder's host value, which LibGC only follows if it points into a cell.
-            unsafe {
-                ((*self.interface).gc_visitor_visit_possible_values)(
-                    self.raw,
-                    (&raw const reference).cast(),
-                    size_of::<u64>(),
-                );
-            }
-            return;
-        }
-        self.visit_cell(reference as *mut u8);
+        // NB: An embedder's host value is the address of one of its cells, with bit 1 set.
+        self.visit_cell((reference & !3) as *mut u8);
     }
 }

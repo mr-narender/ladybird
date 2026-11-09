@@ -186,6 +186,13 @@ public:
             visit_impl(ReadonlySpan<NanBoxedValue>(vector.span().data(), vector.size()));
         }
 
+        template<typename T, size_t size>
+        void visit(Array<T, size> const& array)
+        requires(IsVisitable<T>::value)
+        {
+            visit(array.span());
+        }
+
         template<typename T>
         void visit(HashTable<T> const& table)
         requires(IsVisitable<T>::value)
@@ -272,8 +279,6 @@ public:
         void ignore(T const&)
         {
         }
-
-        virtual void visit_possible_values(ReadonlyBytes) = 0;
 
         // Visits a value that is reachable only while key is, such as a WeakMap entry's. Only marking tells them apart.
         // The caller must drop its entries whose key died, or the next collection reads a freed key.

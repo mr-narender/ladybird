@@ -13,20 +13,23 @@
 #include <AK/StdLibExtras.h>
 #include <AK/TypeCasts.h>
 #include <LibCore/BrowserVersion.h>
+#include <LibCore/EventLoop.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/HistoryStore.h>
-#include <LibWebView/SessionStore.h>
 #include <LibWebView/URL.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/DevToolsBanner.h>
+#include <UI/Qt/HubConnection.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/LadybirdButton.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/Motion.h>
 #include <UI/Qt/Popover.h>
+#include <UI/Qt/RemoteDownloads.h>
+#include <UI/Qt/SessionStore.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/SystemAppearance.h>
 #if defined(AK_OS_MACOS)
@@ -119,29 +122,54 @@ FullscreenMode::FullscreenMode(BrowserWindow* window, ExitFullscreenButton* exit
     });
 }
 
-void FullscreenMode::exit(ExitInitiatedBy initiated_by)
+void FullscreenMode::exit(ExitInitiatedBy initiated_by, Tab const* requesting_tab)
 {
-    if (is_api_fullscreen()) {
-        qApp->removeEventFilter(this);
-        if (initiated_by == ExitInitiatedBy::UI && m_window->tab_index(m_fullscreen_tab) != -1) {
-            m_fullscreen_tab->view().exit_fullscreen();
-        }
-        emit on_exit_fullscreen();
+    if (!is_api_fullscreen() || (requesting_tab && requesting_tab != m_fullscreen_tab))
+        return;
+
+    qApp->removeEventFilter(this);
+    // NB: The tab is let go of first, so the window leaving full screen below doesn't end it a second time.
+    auto* tab = exchange(m_fullscreen_tab, nullptr);
+    // NB: The tab that went full screen is told it left, even when another tab is current by now.
+    if (m_window->tab_index(tab) != -1) {
+        if (initiated_by == ExitInitiatedBy::UI)
+            tab->view().exit_fullscreen();
+        tab->view().set_is_fullscreen(Web::ViewportIsFullscreen::No);
     }
-    m_fullscreen_tab = nullptr;
+    emit on_exit_fullscreen();
 }
 
 void FullscreenMode::enter(Tab* tab)
 {
+    // NB: One tab holds fullscreen at a time, and the window's state is restored for it before the next one takes it.
+    if (m_fullscreen_tab && m_fullscreen_tab != tab)
+        exit(ExitInitiatedBy::UI);
+
+    // NB: Another request from the tab that holds fullscreen, such as from another of its frames, keeps the window
+    //     state saved for the first one.
+    if (m_fullscreen_tab == tab) {
+        if (m_window->isFullScreen())
+            entered_fullscreen();
+        return;
+    }
+
     qApp->installEventFilter(this);
     m_fullscreen_tab = tab;
+    auto window_was_fullscreen = m_window->isFullScreen();
     m_window->enter_fullscreen();
+    // NB: A window the user already made full screen has no state change to report, so the page gets it at once.
+    if (window_was_fullscreen)
+        entered_fullscreen();
 }
 
 void FullscreenMode::entered_fullscreen()
 {
-    if (m_fullscreen_tab && m_window->tab_index(m_fullscreen_tab) != -1)
-        m_exit_button->set_host(m_fullscreen_tab->url().host().has_value() ? qstring_from_ak_string(m_fullscreen_tab->url().serialized_host()) : QString {});
+    // NB: The toast is only for a page that went full screen: Esc and a click on it leave the page's full screen, and
+    //     neither leaves a window the user made full screen.
+    if (!m_fullscreen_tab || m_window->tab_index(m_fullscreen_tab) == -1)
+        return;
+    m_fullscreen_tab->view().set_is_fullscreen(Web::ViewportIsFullscreen::Yes);
+    m_exit_button->set_host(m_fullscreen_tab->url().host().has_value() ? qstring_from_ak_string(m_fullscreen_tab->url().serialized_host()) : QString {});
     // Let button float in place for 3 times the time it takes to animate it in place.
     m_debounce.start(*this, button_animation_time() * 3);
     m_exit_button->animate_show();
@@ -215,8 +243,11 @@ ExitFullscreenButton::ExitFullscreenButton(QWidget* parent)
     m_hide_timer = new QTimer(this);
     m_hide_timer->setSingleShot(true);
     m_hide_timer->setInterval(FULLSCREEN_TOAST_VISIBLE_MS);
+    // NB: A toast under the pointer stays until the pointer leaves it, rather than for good.
     QObject::connect(m_hide_timer, &QTimer::timeout, this, [this] {
-        if (!underMouse())
+        if (underMouse())
+            m_hide_timer->start();
+        else
             hide();
     });
 }
@@ -308,16 +339,16 @@ static QIcon const& app_icon(WebView::IsPrivate is_private)
     return cached_icon;
 }
 
-BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Tab* parent_tab, Optional<WebView::CanonicalTraversable&> traversable, Optional<WebView::SessionWindowId> restored_session_window_id)
-    : m_is_private(is_private)
-    , m_session(WebView::Application::session_for_new_view(is_private))
+BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow is_popup_window, WebView::IsPrivate is_private, Optional<u64> hub_view_id, Optional<SessionWindowId> restored_session_window_id)
+    : WebView::SettingsObserver(Application::settings())
+    , m_is_private(is_private)
     , m_tabs_container(new TabWidget(is_private, this))
     , m_is_popup_window(is_popup_window)
 {
     // NB: The toolbar is made before the rest of the window, so it learns of the session's downloads once it is all here.
     toolbar().update_downloads_button();
 
-    auto const& browser_options = WebView::Application::browser_options();
+    auto const& browser_options = Application::browser_options();
 
     // A restored window keeps the session row the store re-adopted for it.
     if (restored_session_window_id.has_value())
@@ -386,8 +417,8 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
         sync_session_tab_order();
     });
 
-    if (parent_tab) {
-        create_new_tab(Web::HTML::ActivateTab::Yes, traversable);
+    if (hub_view_id.has_value()) {
+        create_new_tab(Web::HTML::ActivateTab::Yes, hub_view_id);
     } else {
         for (size_t i = 0; i < initial_urls.size(); ++i)
             create_new_tab((i == 0) ? Web::HTML::ActivateTab::Yes : Web::HTML::ActivateTab::No, TabLocation::end());
@@ -403,11 +434,10 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
 
     m_devtools_banner = new DevToolsBanner(main_widget);
     connect(m_devtools_banner, &DevToolsBanner::launch_client_requested, this, [] {
-        if (auto result = WebView::Application::the().launch_devtools_client(); result.is_error())
-            WebView::Application::the().display_error_dialog(MUST(String::formatted("Unable to launch the DevTools client: {}", result.error())));
+        HubConnection::the().async_launch_devtools_client();
     });
     connect(m_devtools_banner, &DevToolsBanner::disable_requested, this, [] {
-        MUST(WebView::Application::the().toggle_devtools_enabled());
+        HubConnection::the().async_toggle_devtools_enabled();
     });
     m_devtools_banner->hide();
     main_layout->addWidget(m_devtools_banner);
@@ -427,6 +457,13 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
 BrowserWindow::~BrowserWindow()
 {
     qApp->removeEventFilter(this);
+
+    // NB: A window that goes away while a caller waits on its close check stands in the way of no close.
+    if (auto on_complete = AK::move(m_window_close_preflight_on_complete)) {
+        Core::deferred_invoke([on_complete = AK::move(on_complete)] {
+            on_complete(true);
+        });
+    }
 }
 
 void BrowserWindow::initialize_application_actions()
@@ -447,25 +484,17 @@ void BrowserWindow::initialize_application_actions()
     addAction(application.open_settings_action());
     addAction(application.open_downloads_action());
     addAction(application.toggle_bookmark_bar_action());
+    addAction(application.toggle_sidebar_action());
+    addAction(application.open_location_action());
+    addAction(application.reload_action());
+    addAction(application.reload_bypassing_cache_action());
     addAction(application.find_in_page_action());
+    addAction(application.find_next_action());
+    addAction(application.find_previous_action());
     addAction(application.zoom_in_action());
     addAction(application.zoom_out_action());
     addAction(application.reset_zoom_action());
     addAction(application.quit_action());
-
-    for (auto const& shortcut : QKeySequence::keyBindings(QKeySequence::StandardKey::FindPrevious)) {
-        new QShortcut(shortcut, this, [this]() {
-            if (m_current_tab)
-                m_current_tab->find_previous();
-        });
-    }
-
-    for (auto const& shortcut : QKeySequence::keyBindings(QKeySequence::StandardKey::FindNext)) {
-        new QShortcut(shortcut, this, [this]() {
-            if (m_current_tab)
-                m_current_tab->find_next();
-        });
-    }
 
     for (int i = 0; i < 8; ++i) {
         new QShortcut(QKeySequence(Qt::CTRL | static_cast<Qt::Key>(Qt::Key_1 + i)), this, [this, i]() {
@@ -662,7 +691,7 @@ void BrowserWindow::initialize_window_context_menu()
 
 void BrowserWindow::show_window_context_menu(QPoint global_position)
 {
-    m_reopen_closed_tab_action->setEnabled(m_session->session_store->has_closed_units());
+    m_reopen_closed_tab_action->setEnabled(session().has_closed_units());
     m_always_on_top_action->setChecked(windowFlags().testFlag(Qt::WindowStaysOnTopHint));
     auto current_tab_layout = to_underlying(tab_layout_choice(Application::settings().tab_settings()));
     for (auto* action : m_tab_layout_actions->actions())
@@ -689,7 +718,7 @@ void BrowserWindow::rebuild_bookmarks_menu()
 
 void BrowserWindow::on_devtools_enabled()
 {
-    m_devtools_banner->set_port(WebView::Application::browser_options().devtools_port.value_or(0));
+    m_devtools_banner->set_port(Application::browser_options().devtools_port.value_or(0));
     m_devtools_banner->show();
 }
 
@@ -710,7 +739,7 @@ void BrowserWindow::open_new_tab()
     // NB: With the focus already in the selected tab's address field, its focus ring moves to the new tab's field as it
     //     is, rather than fading in again.
     auto focus_ring_transition = focus_is_in_location_edit_of(*this) ? Tab::FocusRingTransition::Immediate : Tab::FocusRingTransition::FadeIn;
-    auto& tab = new_tab_from_url(WebView::Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::end());
+    auto& tab = new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::end());
     tab.set_url_is_hidden(true);
     tab.focus_location_editor(focus_ring_transition);
 }
@@ -722,7 +751,7 @@ void BrowserWindow::duplicate_tab(Tab& source_tab, Web::HTML::ActivateTab activa
     if (source_tab.is_loaded())
         history = source_tab.view().session_history_snapshot();
     else if (auto session_tab_id = source_tab.session_tab_id(); session_tab_id.has_value())
-        history = m_session->session_store->load_tab_history(*session_tab_id);
+        history = session().load_tab_history(*session_tab_id);
     auto fallback_url = source_tab.url();
 
     if (history.has_value() && history_step.has_value()) {
@@ -743,16 +772,11 @@ void BrowserWindow::duplicate_tab(Tab& source_tab, Web::HTML::ActivateTab activa
 
 void BrowserWindow::open_history_entry_in_new_tab(Tab& source_tab, int delta, Web::HTML::ActivateTab activate_tab)
 {
-    auto const& traversable = source_tab.view().traversable();
-    auto used_steps = traversable.session_history().used_steps();
-    auto step_index = traversable.effective_current_session_history_step_index() + delta;
-    if (step_index >= used_steps.size())
-        return;
-
-    duplicate_tab(source_tab, activate_tab, used_steps[step_index]);
+    if (auto step = source_tab.view().history_step_at_delta(delta); step.has_value())
+        duplicate_tab(source_tab, activate_tab, *step);
 }
 
-void BrowserWindow::restore_tabs(Vector<WebView::RestoredSessionTab> const& tabs, i64 active_tab_index)
+void BrowserWindow::restore_tabs(Vector<RestoredSessionTab> const& tabs, i64 active_tab_index)
 {
     if (tabs.is_empty())
         return;
@@ -767,11 +791,23 @@ void BrowserWindow::restore_tabs(Vector<WebView::RestoredSessionTab> const& tabs
     }
 }
 
-Tab& BrowserWindow::create_restored_tab(WebView::RestoredSessionTab const& restored, int index, bool defer)
+SessionStore& BrowserWindow::session() const
+{
+    return Application::session_store(m_is_private);
+}
+
+Optional<WebView::HistoryEntry> BrowserWindow::history_entry_for_url(URL::URL const& url) const
+{
+    if (m_is_private == WebView::IsPrivate::Yes)
+        return {};
+    return Application::history_store().entry_for_url(url);
+}
+
+Tab& BrowserWindow::create_restored_tab(RestoredSessionTab const& restored, int index, bool defer)
 {
     if (defer) {
         // Until the tab loads, it shows what browsing history knows about its page.
-        auto entry = m_session->history_store->entry_for_url(restored.url);
+        auto entry = history_entry_for_url(restored.url);
         DeferredTab deferred_tab {
             .session_tab_id = restored.tab_id,
             .url = restored.url,
@@ -796,19 +832,19 @@ Tab& BrowserWindow::create_restored_tab(WebView::RestoredSessionTab const& resto
     m_tabs_container->insert_tab(index, tab, "New Tab");
     initialize_tab(tab);
 
-    auto history = m_session->session_store->load_tab_history(restored.tab_id);
+    auto history = session().load_tab_history(restored.tab_id);
     if (!history.has_value() || tab->view().restore_session_history_from_snapshot(history.release_value()).is_error())
         tab->navigate(restored.url);
     return *tab;
 }
 
-Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, Optional<WebView::CanonicalTraversable&> traversable)
+Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, Optional<u64> hub_view_id)
 {
     cancel_window_close_preflight();
-    if (!traversable.has_value())
+    if (!hub_view_id.has_value())
         return create_new_tab(activate_tab, TabLocation::end());
 
-    auto* tab = new Tab(this, traversable);
+    auto* tab = new Tab(this, hub_view_id);
 
     // FIXME: Merge with other overload
     if (m_current_tab == nullptr) {
@@ -830,7 +866,7 @@ FullscreenMode& BrowserWindow::fullscreen_mode()
 
 bool BrowserWindow::uses_client_side_decorations()
 {
-    return !use_native_macos_window_controls() && WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::UseClientSideWindowDecorations);
+    return !use_native_macos_window_controls() && Application::settings().config_variable_as_bool(WebView::ConfigVariableID::UseClientSideWindowDecorations);
 }
 
 bool BrowserWindow::has_chrome_in_titlebar()
@@ -853,7 +889,12 @@ Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocat
     case TabLocation::Kind::End:
         break;
     case TabLocation::Kind::AfterCurrentTab:
-        insertion_index = m_tabs_container->current_index() + 1;
+        insertion_index = constrain_insertion_index(m_tabs_container->current_index() + 1, false);
+        // Tabs opened in the background line up after the current tab in the order they were opened.
+        if (activate_tab == Web::HTML::ActivateTab::No) {
+            while (insertion_index < m_tabs_container->count() && m_background_tabs_from_current_tab.contains([&](auto const& background_tab) { return background_tab == m_tabs_container->tab(insertion_index); }))
+                ++insertion_index;
+        }
         break;
     case TabLocation::Kind::AfterTab:
         if (auto* source_tab = location.tab(); source_tab) {
@@ -870,6 +911,8 @@ Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocat
 
     if (activate_tab == Web::HTML::ActivateTab::Yes)
         m_tabs_container->set_current_tab(tab);
+    else if (location.kind() == TabLocation::Kind::AfterCurrentTab)
+        m_background_tabs_from_current_tab.append(tab);
 
     initialize_tab(tab);
 
@@ -880,13 +923,13 @@ void BrowserWindow::initialize_tab(Tab* tab)
 {
     if (m_session_window_id.has_value() && !tab->session_tab_id().has_value()) {
         auto insertion_index = tab_index(tab);
-        WebView::SessionStore::TabOpened opened {
+        SessionStore::TabOpened opened {
             .window_id = m_session_window_id,
             .initial_url = {},
             .insertion_index = insertion_index >= 0 ? Optional<i64> { insertion_index } : Optional<i64> {},
-            .is_active = m_current_tab == tab ? WebView::SessionStore::IsActive::Yes : WebView::SessionStore::IsActive::No,
+            .is_active = m_current_tab == tab ? SessionStore::IsActive::Yes : SessionStore::IsActive::No,
         };
-        auto session_tab_id = m_session->session_store->tab_opened(AK::move(opened));
+        auto session_tab_id = session().tab_opened(AK::move(opened));
         if (session_tab_id.is_error())
             dbgln("Unable to register the new tab with the session store: {}", session_tab_id.error());
         else
@@ -896,6 +939,9 @@ void BrowserWindow::initialize_tab(Tab* tab)
     QObject::connect(tab, &Tab::title_changed, this, &BrowserWindow::tab_title_changed);
     QObject::connect(tab, &Tab::favicon_changed, this, &BrowserWindow::tab_favicon_changed);
     QObject::connect(tab, &Tab::playing_audio_indicator_changed, this, &BrowserWindow::tab_playing_audio_indicator_changed);
+    QObject::connect(tab, &Tab::microphone_in_use_changed, this, [this] {
+        m_tabs_container->tab_bar()->update_microphone_indicators();
+    });
     QObject::connect(tab, &Tab::loading_changed, this, [this] {
         m_tabs_container->tab_bar()->update_loading_ring_animation();
     });
@@ -923,7 +969,7 @@ void BrowserWindow::initialize_tab_view(Tab* tab)
         }
     });
 
-    tab->view().on_new_web_view = [this, tab](auto activate_tab, Web::HTML::WebViewHints hints, WebView::CanonicalTraversable& traversable) {
+    tab->view().on_open_new_view = [this](auto activate_tab, Web::HTML::WebViewHints hints, u64 hub_view_id) {
         if (hints.popup) {
             auto cascaded_configuration = Application::the().configuration_for_new_window();
             WindowConfiguration configuration {
@@ -932,11 +978,10 @@ void BrowserWindow::initialize_tab_view(Tab* tab)
                 .width = hints.width,
                 .height = hints.height,
             };
-            auto& window = Application::the().new_window({}, configuration, IsPopupWindow::Yes, m_is_private, tab, traversable);
-            return window.current_tab()->view().handle();
+            Application::the().new_window({}, configuration, IsPopupWindow::Yes, m_is_private, hub_view_id);
+            return;
         }
-        auto& new_tab = create_new_tab(activate_tab, traversable);
-        return new_tab.view().handle();
+        create_new_tab(activate_tab, hub_view_id);
     };
 }
 
@@ -966,17 +1011,17 @@ void BrowserWindow::adopt_tab(Tab& tab, int index)
 
     if (moved_tab_id.has_value()) {
         if (m_session_window_id.has_value()) {
-            WebView::SessionStore::TabMoved moved {
+            SessionStore::TabMoved moved {
                 .tab_id = *moved_tab_id,
                 .new_window_id = *m_session_window_id,
                 .ordinal = index,
             };
-            m_session->session_store->tab_moved(AK::move(moved));
+            session().tab_moved(AK::move(moved));
             sync_session_tab_order();
         } else {
             // The source window's reported order no longer includes this tab; it must leave
             // tracking rather than stay mapped there.
-            m_session->session_store->tab_detached(*moved_tab_id);
+            session().tab_detached(*moved_tab_id);
             tab.clear_session_tab_id();
         }
     }
@@ -1036,7 +1081,7 @@ BrowserWindow& BrowserWindow::detach_tab_to_new_window(int index, QPoint global_
         .maximized = follows_pointer == DetachedWindowFollowsPointer::No && isMaximized(),
     };
 
-    auto& window = Application::the().new_window({}, configuration, IsPopupWindow::No, m_is_private, nullptr, {}, ShowWindow::No);
+    auto& window = Application::the().new_window({}, configuration, IsPopupWindow::No, m_is_private, {}, ShowWindow::No);
     move_tab_to_window(index, window, 0);
 
     if (configuration.maximized == true)
@@ -1078,16 +1123,17 @@ void BrowserWindow::set_current_tab(Tab* tab)
     }
 
     m_current_tab = tab;
+    m_background_tabs_from_current_tab.clear();
 
     if (m_current_tab) {
         m_current_tab->clear_attention();
         m_current_tab->view().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 
         if (auto session_tab_id = m_current_tab->session_tab_id(); session_tab_id.has_value())
-            m_session->session_store->active_tab_changed(*session_tab_id);
+            session().active_tab_changed(*session_tab_id);
     }
 
-    WebView::Application::the().update_actions_for_active_web_view();
+    Application::the().report_active_view();
 }
 
 void BrowserWindow::activate_tab(int index)
@@ -1109,19 +1155,19 @@ Tab* BrowserWindow::activate_tab_with_url(URL::URL const& url, URL::ExcludeFragm
 
 bool BrowserWindow::definitely_close_tab(int index)
 {
-    return close_tab(index, WebView::SessionStore::KeepForReopening::Yes);
+    return close_tab(index, SessionStore::KeepForReopening::Yes);
 }
 
 void BrowserWindow::close_tab_without_keeping_it(int index)
 {
-    (void)close_tab(index, WebView::SessionStore::KeepForReopening::No);
+    (void)close_tab(index, SessionStore::KeepForReopening::No);
 }
 
-bool BrowserWindow::close_tab(int index, WebView::SessionStore::KeepForReopening keep_for_reopening)
+bool BrowserWindow::close_tab(int index, SessionStore::KeepForReopening keep_for_reopening)
 {
     cancel_window_close_preflight();
 
-    if (m_tabs_container->count() == 1 && Application::the().file_downloader().has_active_downloads() && visible_browser_window_count() <= 1) {
+    if (m_tabs_container->count() == 1 && RemoteDownloads::the().has_active_downloads() && visible_browser_window_count() <= 1) {
         if (!Application::the().confirm_stop_active_downloads(this))
             return false;
     }
@@ -1129,12 +1175,12 @@ bool BrowserWindow::close_tab(int index, WebView::SessionStore::KeepForReopening
     auto* tab = m_tabs_container->tab(index);
     m_tabs_container->remove_tab(index);
     if (auto session_tab_id = tab->session_tab_id(); session_tab_id.has_value()) {
-        WebView::SessionStore::TabClosed closed {
+        SessionStore::TabClosed closed {
             .tab_id = *session_tab_id,
             .closed_at = UnixDateTime::now(),
             .keep_for_reopening = keep_for_reopening,
         };
-        if (auto result = m_session->session_store->tab_closed(AK::move(closed)); result.is_error())
+        if (auto result = session().tab_closed(AK::move(closed)); result.is_error())
             dbgln("Unable to record the closed tab in the session store: {}", result.error());
     }
     Application::the().update_reopen_recently_closed_actions();
@@ -1205,7 +1251,7 @@ void BrowserWindow::pinned_state_changed(Tab& tab)
 {
     // A move already reported the new order, through the tab bar's tabMoved signal.
     if (auto session_tab_id = tab.session_tab_id(); session_tab_id.has_value()) {
-        if (auto result = m_session->session_store->tab_pinned_changed(*session_tab_id, tab.is_pinned()); result.is_error())
+        if (auto result = session().tab_pinned_changed(*session_tab_id, tab.is_pinned()); result.is_error())
             dbgln("Unable to record the tab's pin in the session store: {}", result.error());
     }
     update_tab_close_button(tab);
@@ -1220,7 +1266,7 @@ void BrowserWindow::activate_first_unpinned_tab()
 
 void BrowserWindow::register_window_with_session_store()
 {
-    if (auto session_window_id = m_session->session_store->window_opened(); session_window_id.is_error())
+    if (auto session_window_id = session().window_opened(); session_window_id.is_error())
         dbgln("Unable to register the new window with the session store: {}", session_window_id.error());
     else
         m_session_window_id = session_window_id.value();
@@ -1231,18 +1277,18 @@ void BrowserWindow::sync_session_tab_order()
     if (!m_session_window_id.has_value())
         return;
 
-    Vector<WebView::SessionTabId> tab_order;
+    Vector<SessionTabId> tab_order;
     tab_order.ensure_capacity(m_tabs_container->count());
     for (int i = 0; i < m_tabs_container->count(); ++i) {
         if (auto session_tab_id = m_tabs_container->tab(i)->session_tab_id(); session_tab_id.has_value())
             tab_order.append(*session_tab_id);
     }
 
-    WebView::SessionStore::TabOrderChanged changed {
+    SessionStore::TabOrderChanged changed {
         .window_id = *m_session_window_id,
         .ordered_tabs = AK::move(tab_order),
     };
-    m_session->session_store->tab_order_changed(AK::move(changed));
+    session().tab_order_changed(AK::move(changed));
 }
 
 void BrowserWindow::open_file()
@@ -1390,7 +1436,8 @@ void BrowserWindow::update_menu_bar_visibility()
 
     if (m_menu_bar_window_controls)
         m_menu_bar_window_controls->setVisible(show_menu_bar && uses_client_side_decorations());
-    m_tabs_container->set_window_controls_visible(!show_menu_bar && has_chrome_in_titlebar());
+    // NB: A full-screen window has no window controls of its own on display, so the chrome leaves no room for them.
+    m_tabs_container->set_window_controls_visible(!show_menu_bar && has_chrome_in_titlebar() && !isFullScreen());
 }
 
 void BrowserWindow::update_menu_bar_window_control_icons()
@@ -1589,8 +1636,10 @@ void BrowserWindow::enter_fullscreen()
 {
     m_tabs_container->set_tab_bar_visible(false);
 
-    m_restore_to_maximized = isMaximized();
-    showFullScreen();
+    // NB: Only the full-screen state changes, so the window comes back maximized if it was. And a window the user
+    //     already made full screen stays so after the page leaves full screen.
+    m_window_was_fullscreen_before_page = isFullScreen();
+    setWindowState(windowState() | Qt::WindowFullScreen);
 
     m_tabs_container->update_bookmarks_bar_visibility();
 }
@@ -1602,10 +1651,8 @@ void BrowserWindow::exit_fullscreen()
 
     m_tabs_container->set_tab_bar_visible(true);
 
-    if (m_restore_to_maximized)
-        showMaximized();
-    else
-        showNormal();
+    if (!m_window_was_fullscreen_before_page)
+        setWindowState(windowState() & ~Qt::WindowFullScreen);
 
     m_tabs_container->update_bookmarks_bar_visibility();
 }
@@ -1634,7 +1681,7 @@ bool BrowserWindow::event(QEvent* event)
 
     if (event->type() == QEvent::WindowActivate) {
         Application::the().set_active_window(*this);
-        WebView::Application::the().update_actions_for_active_web_view();
+        Application::the().report_active_view();
         // A quit raises and closes windows in its own order, so the restore order keeps how they were used before it.
         if (!Application::the().is_quit_in_progress())
             report_activation_to_session_store();
@@ -1879,11 +1926,14 @@ void BrowserWindow::resizeEvent(QResizeEvent* event)
 
 void BrowserWindow::changeEvent(QEvent* event)
 {
-    if (event->type() == QEvent::PaletteChange) {
+    // NB: The chrome's colors follow the color scheme as well as the palette, and a color scheme change can leave the
+    //     palette as it was, so that only a ThemeChange arrives.
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::ThemeChange) {
         update_chrome_style();
         update_menu_bar_window_control_icons();
         update_tab_button_icons();
     } else if (event->type() == QEvent::WindowStateChange) {
+        update_menu_bar_visibility();
         update_menu_bar_window_control_icons();
         m_tabs_container->update_window_button_icons();
         update_window_border();
@@ -1895,10 +1945,10 @@ void BrowserWindow::changeEvent(QEvent* event)
 
         if (is_fullscreen && !was_fullscreen) {
             m_fullscreen_mode->entered_fullscreen();
-            if (m_fullscreen_mode->is_api_fullscreen())
-                view().set_is_fullscreen(Web::ViewportIsFullscreen::Yes);
         } else if (!is_fullscreen && was_fullscreen) {
-            view().set_is_fullscreen(Web::ViewportIsFullscreen::No);
+            // NB: A window that leaves full screen without the page asking, such as from the window's own controls,
+            //     takes the page out of full screen too.
+            m_fullscreen_mode->exit(FullscreenMode::ExitInitiatedBy::UI);
         }
     }
     QWidget::changeEvent(event);
@@ -1906,8 +1956,8 @@ void BrowserWindow::changeEvent(QEvent* event)
 
 void BrowserWindow::appearance_changed()
 {
-    SystemAppearance::the().apply_interface_theme(WebView::Application::settings().appearance().interface_theme);
-    SystemAppearance::the().apply_color_theme(WebView::Application::settings().appearance().color_theme);
+    SystemAppearance::the().apply_interface_theme(Application::settings().appearance().interface_theme);
+    SystemAppearance::the().apply_color_theme(Application::settings().appearance().color_theme);
     update_menu_bar_visibility();
 
     m_tabs_container->update_bookmarks_bar_visibility();
@@ -1985,7 +2035,7 @@ void BrowserWindow::closeEvent(QCloseEvent* event)
             return;
         }
 
-        if (Application::the().file_downloader().has_active_downloads()) {
+        if (RemoteDownloads::the().has_active_downloads()) {
             if (visible_browser_window_count() <= 1) {
                 if (!Application::the().confirm_stop_active_downloads(this)) {
                     event->ignore();
@@ -2012,7 +2062,7 @@ void BrowserWindow::closeEvent(QCloseEvent* event)
 
     if (m_is_private == WebView::IsPrivate::No) {
         if (m_is_popup_window == IsPopupWindow::No) {
-            WebView::Application::settings().set_window_settings({
+            Application::settings().set_window_settings({
                 .position = Gfx::IntPoint { pos().x(), pos().y() },
                 .size = Gfx::IntSize { width(), height() },
                 .maximized = isMaximized(),
@@ -2025,12 +2075,12 @@ void BrowserWindow::closeEvent(QCloseEvent* event)
     QMainWindow::closeEvent(event);
 
     if (event->isAccepted() && m_session_window_id.has_value()) {
-        WebView::SessionStore::WindowClosing closing {
+        SessionStore::WindowClosing closing {
             .window_id = *m_session_window_id,
             .active_tab_index = active_tab_index,
             .closed_at = UnixDateTime::now(),
         };
-        if (auto result = m_session->session_store->window_closing(AK::move(closing)); result.is_error())
+        if (auto result = session().window_closing(AK::move(closing)); result.is_error())
             dbgln("Unable to record the closing window in the session store: {}", result.error());
         Application::the().update_reopen_recently_closed_actions();
     }
@@ -2069,7 +2119,7 @@ void BrowserWindow::bring_to_front()
     activateWindow();
 }
 
-Tab* BrowserWindow::tab_for_view(WebView::ViewImplementation const& view) const
+Tab* BrowserWindow::tab_for_view(RemoteView const& view) const
 {
     for (int index = 0; index < m_tabs_container->count(); ++index) {
         auto* tab = m_tabs_container->tab(index);
@@ -2082,7 +2132,7 @@ Tab* BrowserWindow::tab_for_view(WebView::ViewImplementation const& view) const
 void BrowserWindow::report_activation_to_session_store()
 {
     if (m_session_window_id.has_value())
-        m_session->session_store->window_activated(*m_session_window_id);
+        session().window_activated(*m_session_window_id);
 }
 
 void BrowserWindow::report_session_window_geometry()
@@ -2097,14 +2147,14 @@ void BrowserWindow::report_session_window_geometry()
 
     // A maximized window keeps the geometry it had before, for when it's restored.
     auto rect = isMaximized() ? normalGeometry() : geometry();
-    WebView::SessionWindowGeometry window_geometry {
+    SessionWindowGeometry window_geometry {
         .x = rect.x(),
         .y = rect.y(),
         .width = rect.width(),
         .height = rect.height(),
         .maximized = isMaximized(),
     };
-    m_session->session_store->window_geometry_changed(*m_session_window_id, window_geometry);
+    session().window_geometry_changed(*m_session_window_id, window_geometry);
 }
 
 void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> on_complete)
@@ -2141,10 +2191,9 @@ void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> o
             m_window_close_current_preflight_tab = tab;
             auto weak_this = QPointer<BrowserWindow>(this);
             tab->request_window_close_preflight([weak_this, tab, on_complete = AK::move(on_complete)](bool approved) mutable {
-                if (!weak_this) {
-                    on_complete(approved);
+                // NB: The coordinator that would take this answer went away with the window.
+                if (!weak_this)
                     return;
-                }
                 if (weak_this->m_window_close_current_preflight_tab == tab)
                     weak_this->m_window_close_current_preflight_tab = nullptr;
                 if (approved && tab && !weak_this->m_window_close_approved_tabs.contains([&](auto const& approved_tab) { return approved_tab == tab; }))
@@ -2224,6 +2273,13 @@ void BrowserWindow::cancel_window_close_preflight()
     for_each_tab([](auto& tab) {
         tab.cancel_window_close_preflight();
     });
+}
+
+void BrowserWindow::on_tab_navigated_by_user(Tab& tab)
+{
+    // The user is moving on from the page that the background tabs were opened from.
+    if (&tab == m_current_tab)
+        m_background_tabs_from_current_tab.clear();
 }
 
 void BrowserWindow::on_tab_load_start(Tab& tab)

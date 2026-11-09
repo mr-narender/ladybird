@@ -321,7 +321,6 @@ impl Workload {
             let tag = atom(&mut engine, tag_name(node));
             engine.record_input(
                 InputKey::LocalFeature(node, LocalFeatureKey::TagName),
-                InputValue::Feature(FeatureValue::Absent),
                 InputValue::Feature(FeatureValue::Atom(tag)),
             );
             for _ in 0..rng.under(3) {
@@ -332,7 +331,6 @@ impl Workload {
                 classes[index].push(class);
                 engine.record_input(
                     InputKey::LocalFeature(node, LocalFeatureKey::Class(class_atoms[class])),
-                    InputValue::Feature(FeatureValue::Absent),
                     InputValue::Feature(FeatureValue::Present),
                 );
             }
@@ -353,7 +351,6 @@ impl Workload {
             rules.extend(add_rules(&mut engine, sheet, &rule_source(index)));
             if index % 3 == 0 {
                 engine.set_rule_layer(rules[index], layers[index % 2]);
-                engine.set_rule_in_a_layer(rules[index]);
             }
         }
 
@@ -416,7 +413,6 @@ impl Workload {
                 };
                 self.engine.record_input(
                     InputKey::LocalFeature(node, LocalFeatureKey::Class(self.class_atoms[class])),
-                    InputValue::Feature(old),
                     InputValue::Feature(new),
                 );
                 format!("toggle {node:?} class{class}: {old:?} -> {new:?}")
@@ -1223,7 +1219,6 @@ fn a_cascade_order_change_restyles_only_the_elements_whose_rules_moved() {
     add_rules(&mut engine, third, ".y { width: 3px; }");
     for (rule, layer) in [(base[0], layers[0]), (base[1], layers[0]), (theme[0], layers[1])] {
         engine.set_rule_layer(rule, layer);
-        engine.set_rule_in_a_layer(rule);
     }
     add_class(&mut engine, nodes[1], "x");
     add_class(&mut engine, nodes[2], "unmoved");
@@ -1506,7 +1501,6 @@ fn an_input_no_rule_tests_restyles_nothing_and_one_a_rule_tests_restyles() {
     // An id is tested as the value it had and the value it has.
     engine.record_input(
         InputKey::LocalFeature(nodes[1], LocalFeatureKey::Id),
-        InputValue::Feature(FeatureValue::Atom(unnamed)),
         InputValue::Feature(FeatureValue::Atom(named)),
     );
     run_style_update(&mut engine, nodes[0]);

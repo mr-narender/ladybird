@@ -39,6 +39,7 @@
 #include <LibWeb/WebRTC/RTCRtpScriptTransformer.h>
 #include <LibWeb/WebRTC/RTCTransformEvent.h>
 #include <WebContent/Worker/ConnectionFromClient.h>
+#include <WebContent/Worker/DedicatedWorkerThreadLink.h>
 #include <WebContent/Worker/PageHost.h>
 #include <WebContent/Worker/WorkerHost.h>
 #include <WebContent/Worker/WorkerThread.h>
@@ -151,6 +152,7 @@ void ConnectionFromClient::set_preferred_languages(Vector<String> preferred_lang
 
 void ConnectionFromClient::close_worker()
 {
+    m_was_told_to_close = true;
     begin_closing();
 }
 
@@ -169,6 +171,7 @@ void ConnectionFromClient::die()
     if (m_shutdown_finished)
         return;
 
+    m_lost_browser_connection = true;
     begin_closing();
 }
 
@@ -177,6 +180,7 @@ void ConnectionFromClient::did_lose_peer_during_sync_request()
     // NB: Whatever made the request cannot be unwound from here, and a thread cannot take its process with it. So, the
     //     script stops, and the request fails. That is every caller's to handle, as the connection is shut down from the
     //     event loop the script returns to.
+    m_lost_browser_connection = true;
     m_script_abort_handle->abort_script();
     deferred_invoke([this] {
         shutdown();
@@ -211,6 +215,13 @@ void ConnectionFromClient::release_agent_state()
 {
     if (is_open())
         async_did_close_worker();
+
+    if (m_dedicated_worker_thread_link) {
+        if (m_lost_browser_connection && !m_was_told_to_close)
+            m_dedicated_worker_thread_link->report_death_to_owner();
+        else
+            m_dedicated_worker_thread_link->report_close_to_owner();
+    }
 
     if (m_worker_host)
         m_worker_host->run_closing_steps();
@@ -249,9 +260,10 @@ void ConnectionFromClient::blob_url_entry_removed(Utf16String url)
         Web::FileAPI::remove_entry_from_blob_url_store(*url_record);
 }
 
-ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport)
+ConnectionFromClient::ConnectionFromClient(NonnullOwnPtr<IPC::Transport> transport, RefPtr<DedicatedWorkerThreadLink> dedicated_worker_thread_link)
     : IPC::ConnectionFromClient<WebWorkerClientEndpoint, WebWorkerServerEndpoint>(*this, move(transport), 1)
     , m_page_host(PageHost::create(*this))
+    , m_dedicated_worker_thread_link(move(dedicated_worker_thread_link))
     , m_script_abort_handle(Web::HTML::surrounding_agent().script_abort_handle())
 {
     // The UI process started this worker agent, and die() ends it. So, once the UI process has closed the connection —
@@ -295,6 +307,11 @@ Web::Page const& ConnectionFromClient::page() const
 
 void ConnectionFromClient::start_worker(URL::URL url, Web::HTML::WorkerType type, Web::HTML::RequestCredentials credentials, String name, Web::HTML::TransferDataEncoder implicit_port, Web::HTML::SerializedEnvironmentSettingsObject outside_settings, Web::HTML::AgentType agent_type, URL::Origin origin, Web::HTML::EnvironmentId environment_id, bool has_process_to_itself)
 {
+    // Shutting down the agent drains the event queue after the agent state is released, and that can deliver a start
+    // the client sent before the worker was closed. Then there's no page to run the worker in, and nobody waits for it.
+    if (!m_page_host)
+        return;
+
     m_worker_host = make_ref_counted<WorkerHost>(move(url), type, move(name));
 
     bool const is_shared = agent_type == Web::HTML::AgentType::SharedWorker;
@@ -302,11 +319,13 @@ void ConnectionFromClient::start_worker(URL::URL url, Web::HTML::WorkerType type
 
     // FIXME: Add an assertion that the agent_type passed here is the same that was passed to initialize_agent()
 
-    m_worker_host->set_on_script_ready([this] {
-        auto pending = move(m_pending_transform_inits);
+    m_worker_host->set_on_script_ready(GC::create_function(GC::Heap::the(), GC::captures(make_weak_ptr<ConnectionFromClient>()), [](auto& connection) {
+        if (!connection)
+            return;
+        auto pending = move(connection->m_pending_transform_inits);
         for (auto& entry : pending)
-            run_transform_init(entry.key, move(entry.value));
-    });
+            connection->run_transform_init(entry.key, move(entry.value));
+    }));
 
     m_worker_host->run(page(), move(implicit_port), outside_settings, credentials, is_shared, move(origin), move(environment_id), has_process_to_itself);
 }
@@ -328,31 +347,6 @@ void ConnectionFromClient::handle_file_return(i32 error, Optional<IPC::File> fil
     file_request.value().on_file_request_finish(error != 0 ? Error::from_errno(error) : ErrorOr<i32> { file->take_fd() });
 }
 
-void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token)
-{
-    Web::HTML::WorkerAgentParent::did_fail_loading_worker_script(owner_token);
-}
-
-void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno)
-{
-    Web::HTML::WorkerAgentParent::did_report_worker_exception(owner_token, move(message), move(filename), lineno, colno);
-}
-
-void ConnectionFromClient::did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource)
-{
-    Web::HTML::WorkerAgentParent::did_report_content_security_policy_violation(owner_token, policy_index, move(effective_directive), move(resource));
-}
-
-void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token)
-{
-    Web::HTML::WorkerAgentParent::did_close_worker(owner_token);
-}
-
-void ConnectionFromClient::did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token)
-{
-    Web::HTML::WorkerAgentParent::did_worker_agent_die(owner_token);
-}
-
 void ConnectionFromClient::broadcast_channel_message(Web::HTML::BroadcastChannelMessage message)
 {
     Web::HTML::deliver_broadcast_channel_message_locally(move(message));
@@ -360,9 +354,7 @@ void ConnectionFromClient::broadcast_channel_message(Web::HTML::BroadcastChannel
 
 void ConnectionFromClient::rtc_transform_init(u64 transform_id, Web::HTML::SerializedTransferRecord options_record)
 {
-    if (!m_worker_host)
-        return;
-    if (!m_worker_host->script_has_run()) {
+    if (!m_worker_host || !m_worker_host->script_has_run()) {
         // Wait for the worker script to install onrtctransform so the event is not dropped.
         m_pending_transform_inits.set(transform_id, move(options_record));
         return;
@@ -408,9 +400,7 @@ void ConnectionFromClient::run_transform_init(u64 transform_id, Web::HTML::Seria
     auto transformer = transformer_or_err.release_value();
     m_transformers.set(transform_id, GC::make_root(transformer));
 
-    // Return transformed frames to the parent over IPC. Capturing `this` is safe because
-    // the connection outlives the heap the transformer is in.
-    auto write_encoded_data = GC::create_function(realm.heap(), [this, transform_id](JS::Value chunk) {
+    auto write_encoded_data = GC::create_function(realm.heap(), GC::captures(NonnullRefPtr { *m_dedicated_worker_thread_link }, transform_id), [](auto& link, auto& transform_id, JS::Value chunk) {
         auto* frame = chunk.is_object() ? Web::Bindings::impl_from<Web::WebRTC::RTCEncodedAudioFrame>(&chunk.as_object()) : nullptr;
         if (!frame) {
             dbgln_if(WEBRTC_DEBUG, "worker: write algorithm got non-frame value (chunk_is_object={}, class={}) for id={}",
@@ -427,7 +417,9 @@ void ConnectionFromClient::run_transform_init(u64 transform_id, Web::HTML::Seria
         u8 payload_type = metadata.payload_type.value_or(0);
         u32 rtp_timestamp = metadata.rtp_timestamp.value_or(0);
         u16 sequence_number = static_cast<u16>(metadata.sequence_number.value_or(0));
-        async_rtc_transform_encoded_audio_frame_written(transform_id, bytes.bytes(), ssrc, payload_type, rtp_timestamp, sequence_number);
+        link->post_to_owner([owner_token = link->owner_token(), transform_id, payload = move(bytes), ssrc, payload_type, rtp_timestamp, sequence_number]() mutable {
+            Web::HTML::WorkerAgentParent::did_write_rtc_transform_encoded_audio_frame(owner_token, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
+        });
     });
     transformer->set_write_encoded_data_algorithm(write_encoded_data);
 
@@ -435,7 +427,7 @@ void ConnectionFromClient::run_transform_init(u64 transform_id, Web::HTML::Seria
     // event fires on the worker's own event loop, after any pending script setup
     // (e.g. `self.onrtctransform = ...`) has had a chance to run.
     Web::HTML::queue_global_task(Web::HTML::Task::Source::DOMManipulation, Web::HTML::relevant_global_object(*global_scope),
-        GC::create_function(realm.heap(), [global_scope, transformer, &realm] {
+        GC::create_function(realm.heap(), GC::captures(global_scope, transformer, realm), [](auto& global_scope, auto& transformer, auto& realm) {
             Web::HTML::TemporaryExecutionContext context(realm, Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
             auto event = Web::WebRTC::RTCTransformEvent::create(Web::HTML::EventNames::rtctransform, transformer,
                 Web::HighResolutionTime::current_high_resolution_time(Web::HTML::relevant_global_object(*global_scope)));

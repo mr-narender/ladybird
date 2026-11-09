@@ -36,18 +36,8 @@ endpoint WebWorkerServer {
 
     close_worker() =|
 
-    did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) =|
-    did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno) =|
-    did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) =|
-    did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) =|
-    did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) =|
-
     broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) =|
 
     handle_file_return(i32 error, Optional<IPC::File> file, i32 request_id) =|
     blob_url_entry_removed(Utf16String url) =|
-
-    rtc_transform_init(u64 transform_id, Web::HTML::SerializedTransferRecord options_record) =|
-    rtc_transform_teardown(u64 transform_id) =|
-    rtc_transform_encoded_audio_frame(u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) =|
 }

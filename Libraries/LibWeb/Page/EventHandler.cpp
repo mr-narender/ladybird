@@ -12,7 +12,6 @@
 #include <AK/Debug.h>
 #include <AK/Math.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibGC/ConservativeHashTable.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootHashTable.h>
 #include <LibGC/RootVector.h>
@@ -2136,13 +2135,23 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         if (key == UIEvents::KeyCode::Key_X)
             return perform_cut_action();
         if (key == UIEvents::KeyCode::Key_V)
-            return perform_paste_action();
+            return perform_paste_action(Clipboard::PasteMode::AllMimeTypes);
         if (key == UIEvents::KeyCode::Key_Z)
             return Editing::perform_history_action(*document, Editing::HistoryAction::Undo);
 #if !defined(AK_OS_MACOS)
         // INTEROP: Chromium redoes on Ctrl+Y on Windows and Linux; on macOS Cmd+Y is not a redo shortcut.
         if (key == UIEvents::KeyCode::Key_Y)
             return Editing::perform_history_action(*document, Editing::HistoryAction::Redo);
+#endif
+    }
+    if ((modifiers & UIEvents::Mod_PlatformCtrl) != 0 && (modifiers & UIEvents::Mod_Shift) != 0 && key == UIEvents::KeyCode::Key_V) {
+#if defined(AK_OS_MACOS)
+        // INTEROP: On macOS the system-wide Paste and Match Style shortcut also holds Option. Gecko accepts it with and
+        //          without Option, and Blink accepts it with Option.
+        return perform_paste_action(Clipboard::PasteMode::PlainTextOnly);
+#else
+        if ((modifiers & UIEvents::Mod_Alt) == 0)
+            return perform_paste_action(Clipboard::PasteMode::PlainTextOnly);
 #endif
     }
     if ((modifiers & UIEvents::Mod_PlatformCtrl) != 0 && (modifiers & UIEvents::Mod_Shift) != 0 && (modifiers & UIEvents::Mod_Alt) == 0
@@ -2643,7 +2652,7 @@ static void write_data_transfer_to_clipboard(DOM::Document& document, HTML::Drag
         representations.empend(move(mime_type), item.data.to_byte_string());
     }
     if (!representations.is_empty())
-        document.page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
+        document.page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv, document.id());
 }
 
 EventResult EventHandler::perform_copy_action()
@@ -2717,7 +2726,7 @@ bool EventHandler::perform_copy_action(ClipboardActionTrigger trigger)
         if (!text.is_empty())
             representations.empend("text/plain"_string, text.to_byte_string());
         if (!representations.is_empty())
-            document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
+            document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv, document->id());
 
         // FIXME: 2. Fire a clipboard event named clipboardchange.
     }
@@ -2797,7 +2806,7 @@ bool EventHandler::perform_cut_action(ClipboardActionTrigger trigger)
             if (!text.is_empty())
                 representations.empend("text/plain"_string, text.to_byte_string());
             if (!representations.is_empty())
-                document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
+                document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv, document->id());
 
             // 2. Remove the contents of the selection from the document and collapse the selection.
             // 4. Queue tasks to fire any events that should fire due to the modification.
@@ -2837,7 +2846,7 @@ bool EventHandler::perform_cut_action(ClipboardActionTrigger trigger)
 }
 
 // https://w3c.github.io/clipboard-apis/#paste-action
-EventResult EventHandler::perform_paste_action()
+EventResult EventHandler::perform_paste_action(Clipboard::PasteMode paste_mode)
 {
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active())
@@ -2845,68 +2854,79 @@ EventResult EventHandler::perform_paste_action()
 
     // NB: The system clipboard lives in the UI process. So, retrieve its contents first — and run the rest of the paste
     //     action once the contents arrive.
-    document->page().request_clipboard_entries(GC::create_function(document->heap(), [document = GC::Ref { *document }](Vector<Clipboard::SystemClipboardItem> items) {
-        auto data_store = HTML::DragDataStore::create();
-
-        auto add_text_item = [&](Utf16FlyString type, Utf16String data) {
-            data_store->add_item({
-                .kind = HTML::DragDataStoreItem::Kind::Text,
-                .type_string = move(type),
-                .data = move(data),
-                .file_data = {},
-                .file_name = {},
-            });
-        };
-
-        auto add_file_item = [&](Utf16FlyString type, Utf16String name, ByteBuffer data) {
-            data_store->add_item({
-                .kind = HTML::DragDataStoreItem::Kind::File,
-                .type_string = move(type),
-                .data = {},
-                .file_data = move(data),
-                .file_name = move(name),
-            });
-        };
-
-        if (!items.is_empty()) {
-            for (auto& representation : items.first().system_clipboard_representations) {
-                auto mime_type = MimeSniff::MimeType::parse(representation.name);
-                if (!mime_type.has_value())
-                    continue;
-
-                auto essence = Utf16FlyString::from_utf8(mime_type->essence());
-
-                representation.data.visit(
-                    [&](ByteString const& text) {
-                        auto data = String::from_utf8_with_replacement_character(text);
-
-                        if (essence.is_one_of("text/plain"sv, "text/html"sv)) {
-                            add_text_item(move(essence), Utf16String::from_utf8_with_replacement_character(text));
-                        } else if (essence == "image/png"sv) {
-                            // AD-HOC: The spec doesn't say what to do here, but other engines add a file named
-                            //         image.png for any PNG inserted via navigator.clipboard. Note that only PNG
-                            //         images are supported via that API.
-                            add_file_item(move(essence), "image.png"_utf16, text.to_byte_buffer());
-                        }
-                    },
-                    [&](HTML::SelectedFile& file) {
-                        add_file_item(move(essence), file.name(), file.take_contents());
-                    });
-            }
-        }
+    document->page().request_clipboard_entries_for_paste(GC::create_function(document->heap(), GC::captures(GC::Ref { *document }, paste_mode), [](auto& document, auto paste_mode, Vector<Clipboard::SystemClipboardItem> system_clipboard_data) {
+        for (auto& item : system_clipboard_data)
+            Clipboard::apply_paste_mode(item, paste_mode);
 
         if (auto navigable = document->navigable())
-            navigable->event_handler().perform_paste_action(data_store);
+            navigable->event_handler().perform_paste_action(system_clipboard_data);
     }));
 
     return EventResult::Handled;
 }
 
 // https://w3c.github.io/clipboard-apis/#paste-action
-// This is the paste action from the point where the content to paste is already in hand, either because async retrieval
-// of the system clipboard's contents above finished, or because the paste arrived through LocalNavigable::paste() —
-// which the UI process hands the content to paste directly.
-EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore> const& data_store)
+// This is the paste action from the point where the system clipboard's contents are in hand, either because async
+// retrieval of them above finished, or because the UI process handed them over with its own Paste command.
+EventResult EventHandler::perform_paste_action(Vector<Clipboard::SystemClipboardItem> const& system_clipboard_data)
+{
+    auto data_store = HTML::DragDataStore::create();
+
+    auto add_text_item = [&](Utf16FlyString type, Utf16String data) {
+        data_store->add_item({
+            .kind = HTML::DragDataStoreItem::Kind::Text,
+            .type_string = move(type),
+            .data = move(data),
+            .file_data = {},
+            .file_name = {},
+        });
+    };
+
+    auto add_file_item = [&](Utf16FlyString type, Utf16String name, ByteBuffer data) {
+        data_store->add_item({
+            .kind = HTML::DragDataStoreItem::Kind::File,
+            .type_string = move(type),
+            .data = {},
+            .file_data = move(data),
+            .file_name = move(name),
+        });
+    };
+
+    if (!system_clipboard_data.is_empty()) {
+        for (auto const& representation : system_clipboard_data.first().system_clipboard_representations) {
+            auto mime_type = MimeSniff::MimeType::parse(representation.name);
+            if (!mime_type.has_value())
+                continue;
+
+            auto essence = Utf16FlyString::from_utf8(mime_type->essence());
+
+            representation.data.visit(
+                [&](ByteString const& text) {
+                    auto data = String::from_utf8_with_replacement_character(text);
+
+                    if (essence.is_one_of("text/plain"sv, "text/html"sv)) {
+                        add_text_item(move(essence), Utf16String::from_utf8_with_replacement_character(text));
+                    } else if (essence == "image/png"sv) {
+                        // AD-HOC: The spec doesn't say what to do here, but other engines add a file named
+                        //         image.png for any PNG inserted via navigator.clipboard. Note that only PNG
+                        //         images are supported via that API.
+                        add_file_item(move(essence), "image.png"_utf16, text.to_byte_buffer());
+                    }
+                },
+                [&](HTML::SelectedFile const& file) {
+                    auto contents = file;
+                    add_file_item(move(essence), file.name(), contents.take_contents());
+                });
+        }
+    }
+
+    return perform_paste_action(data_store, &system_clipboard_data);
+}
+
+// https://w3c.github.io/clipboard-apis/#paste-action
+// This is the paste action from the point where the content to paste is in a data store: the system clipboard's contents,
+// or content that the UI process hands over in their place through LocalNavigable::paste().
+EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore> const& data_store, Vector<Clipboard::SystemClipboardItem> const* system_clipboard_data)
 {
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active())
@@ -2915,8 +2935,16 @@ EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore
     data_store->set_mode(HTML::DragDataStore::Mode::ReadOnly);
     auto data_transfer = HTML::DataTransfer::create(data_store);
 
+    // NB: Pasting the system clipboard is the user's interaction with the user agent's "Paste" control, so script
+    //     running as a result of the paste event may read the data being pasted. A paste of handed-over content lets
+    //     the page see only that content.
+    GC::Ref window = *document->window();
+    auto const* data_being_pasted = window->system_clipboard_data_being_pasted();
+    window->set_system_clipboard_data_being_pasted(system_clipboard_data);
+
     // 2. Fire a clipboard event named paste.
     bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::paste, data_transfer);
+    window->set_system_clipboard_data_being_pasted(data_being_pasted);
     data_store->set_mode(HTML::DragDataStore::Mode::Protected);
 
     // 3. If the event was not canceled, then: if there is a selection or cursor in an editable context where
@@ -4433,6 +4461,32 @@ Optional<Editing::ContextMenuMisspelling> EventHandler::select_context_menu_miss
     return Editing::ContextMenuMisspelling { *text, marker->start, marker->end, move(word) };
 }
 
+// The word at `offset` in `hit_node`, whose layout node is `layout_text_node`. A word runs on through inline elements
+// into the text of other text nodes, as in super<span>cali</span>fragilistic.
+struct WordBoundaries {
+    GC::Ref<DOM::Text> start_node;
+    size_t start_offset;
+    GC::Ref<DOM::Text> end_node;
+    size_t end_offset;
+};
+
+static WordBoundaries word_boundaries_at(DOM::Document& document, DOM::Text& hit_node, Layout::TextNode const& layout_text_node, size_t offset)
+{
+    Layout::RustFFI::FfiDomTextRange range {};
+    if (Layout::RustFFI::layout_text_inline_word_range(layout_text_node.document_host(), Layout::Node::slot_id(&layout_text_node), offset, &range)) {
+        auto text_node = [&](u32 identity) {
+            return as_if<DOM::Text>(document.style_computer().node_for_style_node(CSS::StyleNodeID { identity }).ptr());
+        };
+        auto* start = text_node(range.start_text_node);
+        auto* end = text_node(range.end_text_node);
+        if (start && end && &start->root() == &end->root() && start->is_connected() && end->is_connected()
+            && range.start_offset <= start->length() && range.end_offset <= end->length() && end->is_following(*start))
+            return { *start, range.start_offset, *end, range.end_offset };
+    }
+    auto word_range = layout_text_node.word_range_at(offset);
+    return { hit_node, word_range.start, hit_node, word_range.start + word_range.length };
+}
+
 bool EventHandler::initiate_word_selection(Layout::BegunRead const& read, DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
 {
     auto* boundary_node = as_if<DOM::Text>(caret_position.boundary_node().ptr());
@@ -4445,20 +4499,18 @@ bool EventHandler::initiate_word_selection(Layout::BegunRead const& read, DOM::D
     if (!hit_layout_text_node)
         return false;
 
-    auto word_range = hit_layout_text_node->word_range_at(hit_index);
-    auto previous_boundary = word_range.start;
-    auto next_boundary = word_range.start + word_range.length;
+    auto word = word_boundaries_at(document, hit_node, *hit_layout_text_node, hit_index);
 
     m_selection_mode = SelectionMode::Word;
-    m_selection_origin = DOM::Range::create(hit_node, previous_boundary, hit_node, next_boundary);
+    m_selection_origin = DOM::Range::create(word.start_node, word.start_offset, word.end_node, word.end_offset);
 
     if (auto* target = document.active_input_events_target(&hit_node)) {
         m_mouse_selection_target = target;
-        target->set_selection_anchor(hit_node, previous_boundary);
-        target->set_selection_focus(hit_node, next_boundary);
+        target->set_selection_anchor(word.start_node, word.start_offset);
+        target->set_selection_focus(word.end_node, word.end_offset);
     } else if (auto selection = document.get_selection()) {
         m_mouse_selection_target = nullptr;
-        set_user_selection(hit_node, previous_boundary, hit_node, next_boundary, selection, user_select);
+        set_user_selection(word.start_node, word.start_offset, word.end_node, word.end_offset, selection, user_select);
     }
 
     m_selection_mode = SelectionMode::Word;
@@ -4669,9 +4721,7 @@ void EventHandler::apply_mouse_selection(Layout::BegunRead const& read, CSSPixel
         auto const* text_layout_node = as_if<Layout::TextNode>(focus_boundary.node.bound_layout_node(read, *caret_position->arena));
         if (!text_layout_node)
             return;
-        auto word_range = text_layout_node->word_range_at(focus_index);
-        auto word_start = word_range.start;
-        auto word_end = word_range.start + word_range.length;
+        auto word = word_boundaries_at(document, as<DOM::Text>(*focus_node), *text_layout_node, focus_index);
 
         // Determine cursor position relative to anchor.
         auto position = m_selection_origin->compare_point(*focus_node, focus_index);
@@ -4680,12 +4730,14 @@ void EventHandler::apply_mouse_selection(Layout::BegunRead const& read, CSSPixel
                 // Cursor is before anchor: select from anchor end to current word start.
                 anchor_node = m_selection_origin->end_container();
                 anchor_offset = m_selection_origin->end_offset();
-                focus_index = word_start;
+                focus_node = word.start_node;
+                focus_index = word.start_offset;
             } else if (position.value() > 0) {
                 // Cursor is after anchor: select from anchor start to current word end.
                 anchor_node = m_selection_origin->start_container();
                 anchor_offset = m_selection_origin->start_offset();
-                focus_index = word_end;
+                focus_node = word.end_node;
+                focus_index = word.end_offset;
             } else {
                 // Cursor is within anchor: keep original word selected.
                 anchor_node = m_selection_origin->start_container();
@@ -4837,7 +4889,7 @@ void EventHandler::update_pointer_hover(Layout::BegunRead const& read, PointerSt
     pointer.hovered_node = target;
 
     // INTEROP: Traverse the flat tree like Blink and Gecko do for mouse boundary events.
-    GC::ConservativeHashTable<DOM::Node*> previous_ancestors;
+    GC::RootHashTable<DOM::Node*> previous_ancestors;
     for (auto* node = previous.ptr(); node; node = node->flat_tree_parent())
         previous_ancestors.set(node);
     DOM::Node* common_ancestor = nullptr;
@@ -4850,6 +4902,8 @@ void EventHandler::update_pointer_hover(Layout::BegunRead const& read, PointerSt
     struct BoundaryTarget {
         GC::Ref<DOM::Node> node;
         MouseEventCoordinates coordinates;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
     };
     auto make_target = [&](DOM::Node& node) {
         auto target_coordinates = coordinates;
@@ -4857,8 +4911,8 @@ void EventHandler::update_pointer_hover(Layout::BegunRead const& read, PointerSt
             target_coordinates = compute_mouse_event_coordinates(coordinates.visual_viewport_position, coordinates.viewport_position, *layout_node);
         return BoundaryTarget { node, target_coordinates };
     };
-    GC::ConservativeVector<BoundaryTarget> left;
-    GC::ConservativeVector<BoundaryTarget> entered;
+    GC::RootVector<BoundaryTarget> left;
+    GC::RootVector<BoundaryTarget> entered;
     for (auto* node = previous.ptr(); node && node != common_ancestor; node = node->flat_tree_parent())
         left.append(make_target(*node));
     for (auto* node = target.ptr(); node && node != common_ancestor; node = node->flat_tree_parent())

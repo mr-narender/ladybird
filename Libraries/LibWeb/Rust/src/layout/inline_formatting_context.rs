@@ -1112,7 +1112,7 @@ impl<'context> InlineFormattingContext<'context> {
             placed_child
                 .facts_decided_by_parent
                 .fragment_facts
-                .is_invisible_for_line_clamp = true;
+                .hide_after_clamp_point();
             placed_child
         });
     }
@@ -2259,10 +2259,10 @@ impl<'context> InlineFormattingContext<'context> {
                         );
                         continue;
                     }
-                    let fragment_facts = run_state::FragmentFactsDecidedByParent {
-                        is_invisible_for_line_clamp: state_at_clamp_point.is_some(),
-                        ..run_state::FragmentFactsDecidedByParent::default()
-                    };
+                    let mut fragment_facts = run_state::FragmentFactsDecidedByParent::default();
+                    if state_at_clamp_point.is_some() {
+                        fragment_facts.hide_after_clamp_point();
+                    }
                     let laid_out_ahead = self.floats_laid_out_ahead_of_lines.borrow_mut().remove(&item.node);
                     let laid_out_float =
                         laid_out_ahead.unwrap_or_else(|| self.lay_out_float_ahead_of_its_position(item.node));
@@ -2841,13 +2841,13 @@ impl<'context> InlineFormattingContext<'context> {
             if entered_inline_box.is_none() && !self.laid_out_atomic_inline(child) {
                 return true;
             }
-            block_formatting_context::margins_can_collapse_through_box_itself(facts, self.style(child), || {
-                match entered_inline_box {
-                    Some(sides) => sides.border_box_block_size(false),
-                    None => {
-                        let atomic_inline = self.placed_atomic_inline(child).geometry.cells;
-                        atomic_inline.border_box_block_size(false)
-                    }
+            // NB: clear applies only to block-level boxes, so no inline-level box introduces clearance.
+            block_formatting_context::margins_can_collapse_through_box_itself(facts, false, || match entered_inline_box
+            {
+                Some(sides) => sides.border_box_block_size(false),
+                None => {
+                    let atomic_inline = self.placed_atomic_inline(child).geometry.cells;
+                    atomic_inline.border_box_block_size(false)
                 }
             }) && self.children_let_margins_collapse_through(child)
         })

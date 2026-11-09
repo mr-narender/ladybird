@@ -6,7 +6,7 @@
  */
 
 #include <AK/Utf16StringBuilder.h>
-#include <LibGC/ConservativeVector.h>
+#include <LibGC/RootVector.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibWeb/ARIA/Roles.h>
 #include <LibWeb/CSS/ComputedValues.h>
@@ -1065,8 +1065,10 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
     struct PreviousReadWriteState {
         GC::Ptr<DOM::Element> element;
         bool value;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
     };
-    GC::ConservativeVector<PreviousReadWriteState> previous_read_write_states;
+    GC::RootVector<PreviousReadWriteState> previous_read_write_states;
     if (name == HTML::AttributeNames::contenteditable && old_value != value) {
         for_each_in_inclusive_subtree_of_type<DOM::Element>([&](DOM::Element& element) {
             previous_read_write_states.append({ element, SelectorMatching::element_matches_state(element, CSS::PseudoClass::ReadWrite) });
@@ -1165,8 +1167,10 @@ void HTMLElement::set_subtree_inertness(bool is_inert)
     struct PreviousReadWriteState {
         GC::Ptr<DOM::Element> element;
         bool value;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
     };
-    GC::ConservativeVector<PreviousReadWriteState> previous_read_write_states;
+    GC::RootVector<PreviousReadWriteState> previous_read_write_states;
     for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
         if (auto* element = as_if<DOM::Element>(node))
             previous_read_write_states.append({ *element, SelectorMatching::element_matches_state(*element, CSS::PseudoClass::ReadWrite) });
@@ -1289,11 +1293,11 @@ GC::Ptr<DOM::NodeList> HTMLElement::labels()
 
     auto& labels = ensure_html_element_rare_data().labels;
     if (!labels) {
-        auto filter = [&](DOM::Node const& node) {
+        auto filter = GC::create_function(heap(), GC::captures(*this), [](HTMLElement const& element, DOM::Node const& node) {
             auto const* label_element = as_if<HTMLLabelElement>(node);
-            return label_element && label_element->control().ptr() == this;
-        };
-        labels = DOM::LiveNodeList::create(root(), DOM::LiveNodeList::Scope::Descendants, move(filter), DOM::LiveNodeList::Kind::Labels);
+            return label_element && label_element->control().ptr() == &element;
+        });
+        labels = DOM::LiveNodeList::create(root(), DOM::LiveNodeList::Scope::Descendants, filter, DOM::LiveNodeList::Kind::Labels);
     }
 
     return labels;
@@ -1915,11 +1919,11 @@ WebIDL::ExceptionOr<void> HTMLElement::show_popover(ThrowExceptions throw_except
         // NB: We simply don't add an event listener for the cancel action.
         // - closeAction being to hide a popover given element, true, true, false, and null.
         auto close_callback_function = JS::NativeFunction::create(
-            HTML::relevant_realm(*this), [this](JS::VM&) {
-                MUST(hide_popover(FocusPreviousElement::Yes, FireEvents::Yes, ThrowExceptions::No, IgnoreDomState::No, nullptr));
+            HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+                MUST(self.hide_popover(FocusPreviousElement::Yes, FireEvents::Yes, ThrowExceptions::No, IgnoreDomState::No, nullptr));
 
                 return JS::js_undefined();
-            },
+            }),
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
         auto close_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*close_callback_function, HTML::relevant_realm(*this));
         // - getEnabledState being to return true.
@@ -2429,7 +2433,7 @@ void HTMLElement::queue_a_popover_toggle_event_task(Utf16FlyString old_state, Ut
     }
 
     // 2. Queue an element task given the DOM manipulation task source and element to run the following steps:
-    auto task_id = queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, old_state, new_state = move(new_state), source]() mutable {
+    auto task_id = queue_an_element_task(HTML::Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this, old_state, move(new_state), source), [](auto& self, auto& old_state, auto& new_state, auto& source) {
         // 1. Fire an event named toggle at element, using ToggleEvent, with the oldState attribute initialized to
         //    oldState, the newState attribute initialized to newState, and the source attribute initialized to source.
         ToggleEventInit event_init {};
@@ -2437,11 +2441,11 @@ void HTMLElement::queue_a_popover_toggle_event_task(Utf16FlyString old_state, Ut
         event_init.new_state = move(new_state);
         event_init.source = GC::make_root<DOM::Element>(source.ptr());
 
-        dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+        self.dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(self))));
 
         // 2. Set element's popover toggle task tracker to null.
-        ensure_html_element_rare_data().popover_toggle_task_tracker = {};
-    });
+        self.ensure_html_element_rare_data().popover_toggle_task_tracker = {};
+    }));
 
     // 3. Set element's popover toggle task tracker to a struct with task set to the just-queued task and old state set to oldState.
     popover_toggle_task_tracker = ToggleTaskTracker {

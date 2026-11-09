@@ -8,6 +8,7 @@
 
 #include <AK/SourceLocation.h>
 #include <AK/Utf16StringBuilder.h>
+#include <LibAudio/RecordStream.h>
 #include <LibGC/Heap.h>
 #include <LibGC/HeapVector.h>
 #include <LibGfx/Bitmap.h>
@@ -1167,11 +1168,11 @@ void Page::discard()
 
     m_local_roots_left_to_discard = navigables.size();
     for (auto const& navigable : navigables) {
-        auto detach_navigable = GC::create_function(heap(), [this, navigable] {
+        auto detach_navigable = GC::create_function(heap(), GC::captures(*this, navigable), [](Page& page, GC::Ref<HTML::LocalNavigable> navigable) {
             navigable->set_has_been_destroyed();
             navigable->remove_from_all_local_navigables();
-            if (--m_local_roots_left_to_discard == 0)
-                finish_discarding();
+            if (--page.m_local_roots_left_to_discard == 0)
+                page.finish_discarding();
         });
 
         // NB: The task destroying a document only runs while the document is fully active, so its navigable can only
@@ -1244,14 +1245,16 @@ void Page::did_complete_window_rect_request(u64 completion_id)
         m_window_rect_observer->function()({ window_position(), window_size() }, completion_id);
 }
 
-template<typename ResponseType>
-static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Optional<ResponseType>& response, HTML::EventLoop* event_loop = nullptr, SourceLocation location = SourceLocation::current())
+// NB: The response is named as a member of the page, so that the function waiting for it captures only the page.
+template<auto response>
+static auto spin_event_loop_until_dialog_closed(Page& page, HTML::EventLoop* event_loop = nullptr, SourceLocation location = SourceLocation::current())
 {
+    auto& client = page.client();
     auto& responsible_event_loop = event_loop ? *event_loop : Web::HTML::current_settings_object().responsible_event_loop();
     auto pause_handle = responsible_event_loop.pause();
 
-    Web::Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), [&]() {
-        return response.has_value() || !client.is_connection_open();
+    Web::Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), GC::captures(page), [](Page& page) {
+        return (page.*response).has_value() || !page.client().is_connection_open();
     }));
 
     if (!client.is_connection_open()) {
@@ -1259,7 +1262,7 @@ static ResponseType spin_event_loop_until_dialog_closed(PageClient& client, Opti
         exit(0);
     }
 
-    return response.release_value();
+    return (page.*response).release_value();
 }
 
 void Page::did_request_alert(Utf16String const& message)
@@ -1270,7 +1273,7 @@ void Page::did_request_alert(Utf16String const& message)
     if (!message.is_empty())
         m_pending_dialog_text = message;
 
-    spin_event_loop_until_dialog_closed(*m_client, m_pending_alert_response);
+    spin_event_loop_until_dialog_closed<&Page::m_pending_alert_response>(*this);
 }
 
 void Page::alert_closed()
@@ -1286,7 +1289,7 @@ bool Page::did_request_before_unload(String const& source, HTML::EventLoop& even
     m_pending_dialog = PendingDialog::BeforeUnload;
     m_client->page_did_request_before_unload(source);
 
-    return spin_event_loop_until_dialog_closed(*m_client, m_pending_before_unload_response, &event_loop);
+    return spin_event_loop_until_dialog_closed<&Page::m_pending_before_unload_response>(*this, &event_loop);
 }
 
 void Page::before_unload_closed(bool accepted)
@@ -1305,7 +1308,7 @@ bool Page::did_request_confirm(Utf16String const& message)
     if (!message.is_empty())
         m_pending_dialog_text = message;
 
-    return spin_event_loop_until_dialog_closed(*m_client, m_pending_confirm_response);
+    return spin_event_loop_until_dialog_closed<&Page::m_pending_confirm_response>(*this);
 }
 
 void Page::confirm_closed(bool accepted)
@@ -1324,7 +1327,7 @@ Optional<Utf16String> Page::did_request_prompt(Utf16String const& message, Utf16
     if (!message.is_empty())
         m_pending_dialog_text = message;
 
-    return spin_event_loop_until_dialog_closed(*m_client, m_pending_prompt_response);
+    return spin_event_loop_until_dialog_closed<&Page::m_pending_prompt_response>(*this);
 }
 
 void Page::prompt_closed(Optional<Utf16String> response)
@@ -1499,12 +1502,20 @@ void Page::select_dropdown_closed(Optional<u32> const& selected_item_id)
     }
 }
 
-void Page::request_clipboard_entries(ClipboardRequest request)
+void Page::request_clipboard_entries_for_paste(ClipboardRequest request)
 {
     auto request_id = m_next_clipboard_request_id++;
     m_pending_clipboard_requests.set(request_id, request);
 
-    client().page_did_request_clipboard_entries(request_id);
+    client().page_did_request_clipboard_entries_for_paste(request_id);
+}
+
+void Page::request_clipboard_entries(ClipboardRequest request, HTML::CrossProcessId reading_document_id)
+{
+    auto request_id = m_next_clipboard_request_id++;
+    m_pending_clipboard_requests.set(request_id, request);
+
+    client().page_did_request_clipboard_entries(request_id, reading_document_id);
 }
 
 void Page::retrieved_clipboard_entries(u64 request_id, Vector<Clipboard::SystemClipboardItem> items)
@@ -2363,17 +2374,20 @@ void Page::update_find_in_page_active_match(Vector<GC::Root<DOM::Range>> const& 
     auto current_range = matches[m_find_in_page_match_index];
     set_find_in_page_active_match(current_range.ptr());
 
-    auto common_ancestor_container = current_range->common_ancestor_container();
-    if (!common_ancestor_container->document().window())
+    auto& document = current_range->start_container()->document();
+    if (!document.window())
         return;
 
-    if (auto element = common_ancestor_container->parent_element()) {
-        DOM::Element::ScrollIntoViewOptions scroll_options;
-        scroll_options.block = DOM::Element::ScrollLogicalPosition::Nearest;
-        scroll_options.inline_ = DOM::Element::ScrollLogicalPosition::Nearest;
-        scroll_options.behavior = DOM::Element::ScrollBehavior::Instant;
-        element->scroll_into_view(scroll_options, nullptr);
-    }
+    // NB: Scroll the matched text itself into view. An element around it can be wider than the viewport, as a <pre> of
+    //     long lines is, and then scrolling it into view leaves the match where it is.
+    document.update_layout(DOM::UpdateLayoutReason::RangeGetClientRects);
+    Layout::ForcedReadScope read { document };
+    DOM::scroll_a_target_into_view(
+        read,
+        DOM::ScrollIntoViewTarget { current_range.ptr() },
+        DOM::Element::ScrollBehavior::Instant,
+        DOM::Element::ScrollLogicalPosition::Nearest,
+        DOM::Element::ScrollLogicalPosition::Nearest);
 }
 
 void Page::update_find_in_page_highlighted_matches(Vector<GC::Root<DOM::Range>> const& matches, bool highlight_all_matches)
@@ -2426,8 +2440,8 @@ void Page::enqueue_fullscreen_enter(GC::Ref<DOM::Element> element, GC::Ref<DOM::
     m_pending_fullscreen_operations.enqueue(PendingFullscreenEnter { element, pending_doc, error, promise, request_type });
     // NOTE: Processing is deferred because the spec says "run the remaining steps in parallel",
     //       meaning the caller's synchronous JS should complete before we process the operation.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this]() {
-        process_pending_fullscreen_operations();
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this), [](Page& self) {
+        self.process_pending_fullscreen_operations();
     }));
 }
 
@@ -2436,8 +2450,8 @@ void Page::enqueue_fullscreen_exit(GC::Ref<DOM::Document> doc, bool resize, GC::
     m_pending_fullscreen_operations.enqueue(PendingFullscreenExit { doc, resize, promise, requesting_navigable_id });
     // NOTE: Processing is deferred because the spec says "run the remaining steps in parallel",
     //       meaning the caller's synchronous JS should complete before we process the operation.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this]() {
-        process_pending_fullscreen_operations();
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(*this), [](Page& self) {
+        self.process_pending_fullscreen_operations();
     }));
 }
 
@@ -2830,6 +2844,11 @@ void Page::when_translation_settled(GC::Ref<GC::Function<void()>> callback)
 {
     m_translation_settled_callbacks.append(callback);
     notify_translation_progress();
+}
+
+NonnullRefPtr<Audio::RecordStream::CreatePromise> PageClient::create_audio_record_stream(StringView, Audio::RecordStream::RecordCallback)
+{
+    VERIFY_NOT_REACHED();
 }
 
 }
