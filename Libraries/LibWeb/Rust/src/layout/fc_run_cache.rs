@@ -274,8 +274,8 @@ impl FcRunCacheEntry {
                 if std::sync::Arc::ptr_eq(committed, &root.fragment) {
                     return true;
                 }
-                committed.content_inline_size == content_inline_size
-                    && (committed.content_block_size == content_block_size
+                committed.sides.content_size.width == content_inline_size
+                    && (committed.sides.content_size.height == content_block_size
                         || self.outputs.inputs_never_observed.own_block_size
                             == formatting_context::OwnBlockSizeObservation::Unobserved)
                     && same_allocation(
@@ -476,6 +476,19 @@ impl FcRunCacheStore {
         self.slots.with_row(slot as usize, |entries| {
             entries.is_some_and(|entries| {
                 entries.latest.is_some() || entries.committed.is_some() || !entries.earlier.is_empty()
+            })
+        })
+    }
+
+    fn entry_is_the_only_one_its_box_holds(&self, slot: u32, entry: &std::sync::Arc<FcRunCacheEntry>) -> bool {
+        self.slots.with_row(slot as usize, |entries| {
+            entries.is_some_and(|entries| {
+                entries.committed.is_none()
+                    && entries.earlier.is_empty()
+                    && entries
+                        .latest
+                        .as_ref()
+                        .is_some_and(|latest| std::sync::Arc::ptr_eq(latest, entry))
             })
         })
     }
@@ -811,8 +824,11 @@ impl FcRunCacheAttempt {
             |summary| summary.may_answer_probe(validity, true),
             |entry| entry.validity == validity && entry.outputs.root.is_some() && entry.answers_probe_for(key),
         ) {
-            // NB: Once the replayed fragments are committed, the sweep keeps the entry beside later ones.
-            store.enqueue_for_sweep(box_.slot_index());
+            // NB: Once the replayed fragments are committed, the sweep keeps the entry beside later ones. A store that
+            //     replaces the latest entry checks whether its fragments were committed itself.
+            if !store.entry_is_the_only_one_its_box_holds(box_.slot_index(), &entry) {
+                store.enqueue_for_sweep(box_.slot_index());
+            }
             entry.note_used_at_layout_commit(pass.arena().layout_commit_count());
             return Err(FcRunCacheHit { entry });
         }

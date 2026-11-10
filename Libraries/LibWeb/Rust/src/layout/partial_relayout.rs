@@ -438,7 +438,7 @@ impl LayoutNodeArena {
         let committed = if node_facts::node_style_view(data).is_some_and(|style| style.is_absolutely_positioned()) {
             self.saved_abspos_layout_inputs(node)?.containing_block
         } else {
-            self.with_committed_fragment_link(node, |link| link.map(|link| link.containing_block))?
+            self.with_committed_fragment_link(node, |link| link.map(|link| link.placement.containing_block))?
         };
         (!committed.is_invalid() && committed == self.containing_block_by_walking_ancestors(node)).then_some(committed)
     }
@@ -451,7 +451,7 @@ impl LayoutNodeArena {
         if inputs.containing_block.is_invalid() || !self.slot_is_live(inputs.containing_block) {
             return false;
         }
-        if inputs.containing_block_info.derives_from_own_computed_values {
+        if inputs.containing_block_info.derives_from_own_computed_values() {
             return false;
         }
         // What the box's anchor functions resolved to last time says nothing of the style it has now.
@@ -550,8 +550,9 @@ impl LayoutNodeArena {
     /// geometry, when nothing but that geometry and the box's own style places it.
     fn abspos_layout_inputs_confined_to_parent(&self, node: NodeSlotId) -> Option<AbsposLayoutInputs> {
         use crate::css::css_enums::positioning;
+        use crate::layout::AxisEdge;
         use crate::layout::abspos_inputs::{
-            AbsposAxisMode, AbsposContainingBlockInfo, StaticPositionAlignment, StaticPositionRect,
+            AbsposAxisMode, AbsposContainingBlockInfo, AxisPlacement, StaticPositionRect,
         };
         use crate::layout::geometry::{LogicalOffset, LogicalRect, LogicalSize};
 
@@ -634,6 +635,10 @@ impl LayoutNodeArena {
             return None;
         }
 
+        let placed_by_insets = AxisPlacement {
+            mode: AbsposAxisMode::InsetFromRect,
+            alignment: None,
+        };
         let padding = crate::painting::paintable_geometry::committed_padding(self, parent);
         let content_size = crate::painting::paintable_geometry::committed_content_size(&self.paintable_rows(), parent);
         Some(AbsposLayoutInputs {
@@ -641,8 +646,8 @@ impl LayoutNodeArena {
             inline_containing_block: NodeSlotId::INVALID,
             static_position_rect: StaticPositionRect {
                 rect: LogicalRect::default(),
-                inline_alignment: StaticPositionAlignment::Start,
-                block_alignment: StaticPositionAlignment::Start,
+                inline_alignment: AxisEdge::Start,
+                block_alignment: AxisEdge::Start,
                 alignment_derives_from_own_computed_values: false,
             },
             containing_block_info: AbsposContainingBlockInfo {
@@ -656,11 +661,8 @@ impl LayoutNodeArena {
                         block_size: content_size.height + padding.top + padding.bottom,
                     },
                 },
-                inline_axis_mode: AbsposAxisMode::InsetFromRect,
-                block_axis_mode: AbsposAxisMode::InsetFromRect,
-                inline_alignment: None,
-                block_alignment: None,
-                derives_from_own_computed_values: false,
+                inline_placement: placed_by_insets,
+                block_placement: placed_by_insets,
                 is_position_area: false,
             },
             resolved_anchor_insets: None,
@@ -1064,7 +1066,7 @@ mod tests {
         arena.populate_paintable_row(svg_root.slot);
         let plan_with_committed_containing_block = |arena: &mut LayoutNodeArena, containing_block| {
             let mut link = crate::layout::fragment_tree::FragmentLink::for_test(svg_root.slot);
-            link.containing_block = containing_block;
+            link.placement.containing_block = containing_block;
             arena.set_committed_fragment_link(svg_root.slot, link, None);
             arena.collect_partial_relayout_roots(&[svg_root.slot], &[])
         };

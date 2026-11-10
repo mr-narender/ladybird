@@ -6,11 +6,12 @@
 
 #include <AK/ScopeGuard.h>
 #include <LibGfx/SharedImageBuffer.h>
+#include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/MacWindow.h>
 #include <UI/Qt/WebContentView.h>
 
 #include <QChildEvent>
 #include <QWindow>
-#include <qpa/qplatformwindow_p.h>
 
 #import <AppKit/AppKit.h>
 #import <IOSurface/IOSurface.h>
@@ -25,15 +26,13 @@ static CALayer* as_layer(void* layer)
 
 bool WebContentView::ensure_iosurface_layer_attached_to_native_view()
 {
-    auto* window_handle = windowHandle();
-    auto* cocoa_window = window_handle ? window_handle->nativeInterface<QNativeInterface::Private::QCocoaWindow>() : nullptr;
-    CALayer* content_layer = cocoa_window ? cocoa_window->contentLayer() : nil;
+    auto* content_layer = as_layer(appkit_content_layer(*this));
     if (!content_layer)
         return false;
 
     // NB: Qt restores the native view's exposed state from the content layer's display callback after it is unhidden.
     //     Presenting our own sublayer may leave that layer clean, which keeps Qt from routing mouse events to the view.
-    if (isVisible() && !window_handle->isExposed())
+    if (isVisible() && !windowHandle()->isExposed())
         [content_layer setNeedsDisplay];
 
     if (!m_iosurface_layer) {
@@ -70,9 +69,13 @@ void WebContentView::present_current_paintable_as_layer_contents()
 {
     if (!ensure_iosurface_layer_attached_to_native_view())
         return;
-    ScopeGuard update_painting_for_new_contents = [this] { update_whether_qt_paints_view(); };
-
     auto* layer = as_layer(m_iosurface_layer);
+    ScopeGuard update_for_new_contents = [this, layer, had_contents = layer.contents != nil] {
+        if ((layer.contents != nil) != had_contents)
+            update_iosurface_layer_background_color();
+        update_whether_qt_paints_view();
+    };
+
     layer.contentsScale = device_pixel_ratio();
 
     auto paintable = current_paintable();
@@ -157,9 +160,12 @@ void WebContentView::update_iosurface_layer_background_color()
 {
     if (!m_iosurface_layer)
         return;
-    auto color = page_background_color();
-    auto* background_color = CGColorCreateSRGB(color.red() / 255.0, color.green() / 255.0, color.blue() / 255.0, 1.0);
-    as_layer(m_iosurface_layer).backgroundColor = background_color;
+    auto* layer = as_layer(m_iosurface_layer);
+    // Before its first frame, the view shows the chrome's color.
+    auto page_color = page_background_color();
+    auto color = layer.contents != nil ? QColor(page_color.red(), page_color.green(), page_color.blue()) : ChromeStyle::chrome_background(window()->palette());
+    auto* background_color = CGColorCreateSRGB(color.redF(), color.greenF(), color.blueF(), 1.0);
+    layer.backgroundColor = background_color;
     CGColorRelease(background_color);
 }
 
@@ -172,12 +178,14 @@ void WebContentView::detach_iosurface_layer_from_native_view()
 
 // While the page layer covers the view, the view paints on screen, so Qt neither paints it into the window's backing
 // store nor copies it into a backing store of the view's own native view. All of that would lie under the layer, and
-// on every step of a window resize it is a fill and a copy of the whole view into freshly allocated surfaces. Qt paints
-// the view before the layer has a frame, and while an overlay, which Qt paints into the view, hides the layer.
+// on every step of a window resize it is a fill and a copy of the whole view into freshly allocated surfaces. Once made,
+// that backing store of the native view stays for as long as the view, so Qt must not paint the view before it has a
+// frame either: until then the layer shows the color Qt would paint. Qt paints the view only while the layer is not
+// attached yet, and while an overlay, which Qt paints into the view, hides the layer.
 void WebContentView::update_whether_qt_paints_view()
 {
     auto* layer = as_layer(m_iosurface_layer);
-    bool page_layer_covers_view = layer.superlayer != nil && !layer.hidden && layer.contents != nil;
+    bool page_layer_covers_view = layer.superlayer != nil && !layer.hidden;
     if (testAttribute(Qt::WA_PaintOnScreen) == page_layer_covers_view)
         return;
     setAttribute(Qt::WA_PaintOnScreen, page_layer_covers_view);

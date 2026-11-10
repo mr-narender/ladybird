@@ -2610,10 +2610,10 @@ struct FollowScratch {
 struct CompoundMemo {
     /// The stamp of the element whose answers each slot holds: starting the next element is a new
     /// stamp, not a clearing.
-    stamps: Vec<u32>,
+    stamps: Vec<u16>,
     /// The answers of each slot, two bits per kind: none yet, unknown, false or true.
     answers: Vec<u8>,
-    stamp: u32,
+    stamp: u16,
 }
 
 /// What a memo answer of a compound is: of the element on its own or from it leftwards, after or
@@ -4284,9 +4284,37 @@ impl StyleEngine {
             .is_some_and(|live| live.released_compositions.iter().any(|(released, _)| *released == node))
     }
 
+    /// The host goes on to sample the animations of `node` and run its transition step, which composes a transition and
+    /// then takes it out again where the step ends it. What they compose is told as one move, once they are over, so
+    /// that a pair that leaves the composition as it found it restyles nothing.
+    pub(in super::super) fn begin_composition_settling(&mut self, node: StyleNodeID) {
+        debug_assert!(self.host.settling_composition.is_none());
+        self.host.settling_composition = Some(SettlingComposition { node, held: None });
+    }
+
+    pub(in super::super) fn end_composition_settling(&mut self) {
+        let settling = self
+            .host
+            .settling_composition
+            .take()
+            .expect("a composition settling ends after it began");
+        if let Some(held) = settling.held {
+            self.note_composition_moved(settling.node, held);
+        }
+    }
+
     /// Restyle the children of `node` that compute from what the composition of its animations
     /// moved since `held`, in the next pass of the engine.
     pub(in super::super) fn note_composition_moved(&mut self, node: StyleNodeID, held: HeldComposition) {
+        if let Some(settling) = self
+            .host
+            .settling_composition
+            .as_mut()
+            .filter(|settling| settling.node == node)
+        {
+            settling.held.get_or_insert(held);
+            return;
+        }
         let Some(view) = DriveRecords::assigned_record_view(&self.retained, node) else {
             return;
         };
@@ -4551,6 +4579,14 @@ fn resolve_waits(
 /// What the children of an element compute from of the view it held before the composition of
 /// its animations moved: its groups, each holding a reference, and the environment its animations
 /// sampled custom properties into, where they do.
+#[derive(Clone)]
+pub(in super::super) struct SettlingComposition {
+    node: StyleNodeID,
+    /// What the element's children computed from before the first move.
+    held: Option<HeldComposition>,
+}
+
+#[derive(Clone)]
 pub(in super::super) struct HeldComposition {
     payloads: crate::css::computed_values::StyleGroups,
     custom_properties: Option<u64>,
@@ -4616,6 +4652,19 @@ mod tests {
     use std::cell::Cell;
 
     const SIBLINGS: u32 = 1000;
+
+    #[test]
+    fn compound_memo_forgets_answers_when_the_stamp_wraps() {
+        let mut memo = CompoundMemo::default();
+        let kind = MemoKind::Own { before: false };
+        memo.start(1);
+        memo.stamp = 1;
+        memo.set(0, kind, Some(true));
+
+        memo.stamp = u16::MAX;
+        memo.start(1);
+        assert!(matches!(memo.get(0, kind), MemoAnswer::Unasked));
+    }
 
     fn next_of(steps: &Cell<u32>) -> impl Fn(StyleNodeID) -> Option<StyleNodeID> + '_ {
         |node| {

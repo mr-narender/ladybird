@@ -30,6 +30,7 @@ use crate::bytecode::executable_data::PendingSharedFunctionData;
 use crate::bytecode::executable_data::PrecompiledFunction;
 use crate::bytecode::instruction::typed as op;
 use crate::bytecode::operand::*;
+use crate::bytecode::source_map::SourceOffset;
 use crate::parser::EnclosingCode;
 use crate::parser::FunctionRow;
 use crate::parser::columns::NONE;
@@ -45,6 +46,7 @@ use crate::u32_from_usize;
 use super::EnclosingEnvironmentScope;
 use super::bindings::*;
 use super::context::Generator;
+use super::environment::BindingLocation;
 use super::nodes::Identifier;
 use super::registers::ScopedOperand;
 use super::stream::Control;
@@ -461,6 +463,7 @@ impl Generator<'_> {
                 && flags & (function_flag::MIGHT_NEED_ARGUMENTS | function_flag::USES_ARGUMENTS) != 0)
             || (!is_arrow
                 && flags & function_flag::ARGUMENTS_ACCESS != 0
+                && flags & function_flag::SIMPLE_PARAMETERS != 0
                 && index.parameter_count[row.0 as usize] != 0);
         self.capture_saved_lexical_environment_with_coordinates(needs_function_environment);
         self.end_head();
@@ -775,7 +778,11 @@ impl Generator<'_> {
             Some(_) => {
                 let value = generator.temporary();
                 let identifier = generator.intern_identifier(name);
-                emit_get_binding(generator, value, identifier, false);
+                // NB: This runs where the body starts, before any scope around the `var` has an environment.
+                let location = generator
+                    .variable_environment_coordinate_for_identifier(identifier)
+                    .map(BindingLocation::Environment);
+                emit_get_binding_at(generator, value, identifier, location, false);
                 value
             }
         };
@@ -1972,9 +1979,15 @@ impl Generator<'_> {
         let context = &mut *self.context;
         let constants = link_block.slice(context.constants.values.drain(..));
         let scope = &context.scope;
-        let local_variable_metadata = block.slice(scope.locals.iter().map(|local| LocalVariableMetadata {
-            is_mutable: local.is_mutable,
-            scope_range: local.block_range.map(|(start, end)| tree.range_between(start, end)),
+        let local_variable_metadata = block.slice(scope.locals.iter().map(|local| {
+            let (start, end) = local
+                .block_range
+                .unwrap_or((SourceOffset::NONE.0, SourceOffset::NONE.0));
+            LocalVariableMetadata {
+                is_mutable: local.is_mutable,
+                scope_start: SourceOffset(start),
+                scope_end: SourceOffset(end),
+            }
         }));
         let local_names = scope.locals.iter().map(|local| (local.name, true));
         let variable_names = block.slice_of_length(

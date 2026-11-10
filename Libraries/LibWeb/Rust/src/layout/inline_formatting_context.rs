@@ -1112,6 +1112,7 @@ impl<'context> InlineFormattingContext<'context> {
             placed_child
                 .facts_decided_by_parent
                 .fragment_facts
+                .show
                 .hide_after_clamp_point();
             placed_child
         });
@@ -2261,7 +2262,7 @@ impl<'context> InlineFormattingContext<'context> {
                     }
                     let mut fragment_facts = run_state::FragmentFactsDecidedByParent::default();
                     if state_at_clamp_point.is_some() {
-                        fragment_facts.hide_after_clamp_point();
+                        fragment_facts.show.hide_after_clamp_point();
                     }
                     let laid_out_ahead = self.floats_laid_out_ahead_of_lines.borrow_mut().remove(&item.node);
                     let laid_out_float =
@@ -2740,8 +2741,8 @@ impl<'context> InlineFormattingContext<'context> {
             }
             let mut static_position = abspos_inputs::StaticPositionRect {
                 rect: Default::default(),
-                inline_alignment: StaticPositionAlignment::Start,
-                block_alignment: StaticPositionAlignment::Start,
+                inline_alignment: AxisEdge::Start,
+                block_alignment: AxisEdge::Start,
                 alignment_derives_from_own_computed_values: false,
             };
             'lines: for line in &self.line_data().line_boxes {
@@ -2768,7 +2769,7 @@ impl<'context> InlineFormattingContext<'context> {
                         static_position.rect.offset.block_offset = y;
                     }
                     if containing_style.direction() == direction::RTL {
-                        static_position.inline_alignment = StaticPositionAlignment::End;
+                        static_position.inline_alignment = AxisEdge::End;
                     }
                     break 'lines;
                 }

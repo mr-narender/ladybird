@@ -10,8 +10,7 @@
 
 namespace Web::HTML {
 
-// FIXME: This limit is a guess. It has not been measured against what real sites compile to.
-static constexpr size_t compiled_script_cache_size_limit = 128 * MiB;
+static constexpr size_t compiled_script_cache_size_limit = 16 * MiB;
 
 CompiledScriptCache& CompiledScriptCache::the()
 {
@@ -19,27 +18,29 @@ CompiledScriptCache& CompiledScriptCache::the()
     return *cache;
 }
 
-Optional<JS::CompiledProgram> CompiledScriptCache::find(CompiledScriptCacheKey const& key, Utf16String const& source_text)
+Optional<CompiledScriptCache::Hit> CompiledScriptCache::find(CompiledScriptCacheKey const& key, Utf16String const& source_text)
 {
     auto entry = m_entries.get(key);
     if (!entry.has_value() || entry->source_text != source_text)
         return {};
 
     entry->touch_serial = ++m_next_touch_serial;
-    auto program = entry->program.clone();
+    Hit hit { entry->program.clone(), entry->source_text };
 
     // NB: Entries grow as their functions compile, which no store sees.
     evict_until_within_limit();
-    return program;
+    return hit;
 }
 
 void CompiledScriptCache::store(CompiledScriptCacheKey key, Utf16String source_text, JS::CompiledProgram const& program)
 {
-    if (auto entry = m_entries.get(key); entry.has_value())
+    if (auto entry = m_entries.take(key); entry.has_value())
         release(*entry);
 
-    program.set_retains_compiled_functions(true);
-    m_entries.set(move(key), Entry { move(source_text), program.clone(), ++m_next_touch_serial });
+    if (program.memory_size() <= compiled_script_cache_size_limit) {
+        program.set_retains_compiled_functions(true);
+        m_entries.set(move(key), Entry { move(source_text), program.clone(), ++m_next_touch_serial });
+    }
     evict_until_within_limit();
 }
 

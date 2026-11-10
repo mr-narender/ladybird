@@ -9,6 +9,7 @@ pub mod queries;
 pub mod scroll_state;
 pub mod serialize;
 pub mod visual_animations;
+pub mod world_transforms;
 
 use std::collections::HashMap;
 
@@ -24,6 +25,7 @@ pub use crate::display_list::commands::{
     ClipMode, ClipNodeIndex, ContextRef, EffectNodeIndex, SpatialNodeIndex, VISUAL_VIEWPORT_NODE_INDEX,
 };
 pub use queries::{ClipBehavior, should_cull_back_face};
+pub use world_transforms::WorldTransforms;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -247,9 +249,38 @@ pub enum IncludeVisualViewportTransform {
     Yes,
 }
 
-struct LocalSpatialMatrix {
-    matrix: FloatMatrix4x4,
-    flattens_inherited_transform: bool,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LocalTransformKind {
+    Identity,
+    Translation(FloatPoint),
+    Affine2D,
+    Projective,
+}
+
+/// What one spatial node contributes to the spatial chains through it.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalTransform {
+    pub matrix: FloatMatrix4x4,
+    pub flattens_inherited_transform: bool,
+    pub kind: LocalTransformKind,
+    pub establishes_sorting_context: bool,
+    pub sorting_context_root: Option<SpatialNodeIndex>,
+    pub backface_plane_root: Option<SpatialNodeIndex>,
+}
+
+impl LocalTransform {
+    pub fn applied_to(&self, parent_matrix: FloatMatrix4x4) -> FloatMatrix4x4 {
+        let inherited = if self.flattens_inherited_transform {
+            parent_matrix.flattened()
+        } else {
+            parent_matrix
+        };
+        inherited.multiplied(self.matrix)
+    }
+
+    pub fn is_transform_or_perspective(&self) -> bool {
+        matches!(self.kind, LocalTransformKind::Affine2D | LocalTransformKind::Projective)
+    }
 }
 
 #[derive(Clone)]
@@ -1181,87 +1212,51 @@ impl VisualContextTree {
         chain
     }
 
-    fn local_spatial_matrix(&self, index: SpatialNodeIndex, scroll_offsets: &[FloatPoint]) -> LocalSpatialMatrix {
-        let translation = |offset: FloatPoint| LocalSpatialMatrix {
-            matrix: translation_matrix(offset.x, offset.y, 0.0),
+    pub fn local_transform(&self, index: SpatialNodeIndex, scroll_offsets: &[FloatPoint]) -> LocalTransform {
+        let mut local = LocalTransform {
+            matrix: FloatMatrix4x4::identity(),
             flattens_inherited_transform: false,
+            kind: LocalTransformKind::Identity,
+            establishes_sorting_context: false,
+            sorting_context_root: None,
+            backface_plane_root: None,
+        };
+        let translation = |offset: FloatPoint| {
+            (
+                translation_matrix(offset.x, offset.y, 0.0),
+                LocalTransformKind::Translation(offset),
+            )
         };
         match &self.spatial_nodes[index.0 as usize].data {
-            SpatialData::Transform(transform) => LocalSpatialMatrix {
-                matrix: transform.matrix_including_origin(),
-                flattens_inherited_transform: transform.flattens_inherited_transform,
-            },
-            SpatialData::Perspective(perspective) => LocalSpatialMatrix {
-                matrix: perspective.matrix,
-                flattens_inherited_transform: perspective.flattens_inherited_transform,
-            },
             SpatialData::Scroll(_) | SpatialData::Sticky(_) => {
-                translation(device_offset_for_index(scroll_offsets, index))
+                (local.matrix, local.kind) = translation(device_offset_for_index(scroll_offsets, index));
             }
-            SpatialData::AnchorScrollShift(shift) => translation(shift.masked_offset(scroll_offsets)),
-            SpatialData::BackfaceVisibility(backface) => LocalSpatialMatrix {
-                matrix: FloatMatrix4x4::identity(),
-                flattens_inherited_transform: backface.flattens_inherited_transform,
-            },
-            SpatialData::Dead => LocalSpatialMatrix {
-                matrix: FloatMatrix4x4::identity(),
-                flattens_inherited_transform: false,
-            },
-        }
-    }
-
-    pub fn accumulated_matrix(
-        &self,
-        index: SpatialNodeIndex,
-        scroll_offsets: &[FloatPoint],
-        include_visual_viewport_transform: IncludeVisualViewportTransform,
-    ) -> FloatMatrix4x4 {
-        let chain = self.ancestor_chain(index);
-        let mut matrix = FloatMatrix4x4::identity();
-        for node_index in chain.into_iter().rev() {
-            if node_index == VISUAL_VIEWPORT_NODE_INDEX
-                && include_visual_viewport_transform == IncludeVisualViewportTransform::No
-            {
-                continue;
+            SpatialData::AnchorScrollShift(shift) => {
+                (local.matrix, local.kind) = translation(shift.masked_offset(scroll_offsets));
             }
-            let local = self.local_spatial_matrix(node_index, scroll_offsets);
-            let inherited = if local.flattens_inherited_transform {
-                matrix.flattened()
-            } else {
-                matrix
-            };
-            matrix = inherited.multiplied(local.matrix);
+            SpatialData::Transform(transform) => {
+                local.matrix = transform.matrix_including_origin();
+                local.flattens_inherited_transform = transform.flattens_inherited_transform;
+                local.kind = if transform.matrix.is_2d_affine() {
+                    LocalTransformKind::Affine2D
+                } else {
+                    LocalTransformKind::Projective
+                };
+                local.establishes_sorting_context = transform.establishes_sorting_context;
+                local.sorting_context_root = transform.sorting_context_root_index;
+            }
+            SpatialData::Perspective(perspective) => {
+                local.matrix = perspective.matrix;
+                local.flattens_inherited_transform = perspective.flattens_inherited_transform;
+                local.kind = LocalTransformKind::Projective;
+            }
+            SpatialData::BackfaceVisibility(backface) => {
+                local.flattens_inherited_transform = backface.flattens_inherited_transform;
+                local.backface_plane_root = Some(backface.plane_root_index);
+            }
+            SpatialData::Dead => {}
         }
-        matrix
-    }
-
-    pub fn accumulated_2d_scale(
-        &self,
-        index: SpatialNodeIndex,
-        scroll_offsets: &[FloatPoint],
-        include_visual_viewport_transform: IncludeVisualViewportTransform,
-    ) -> FloatSize {
-        let affine = self
-            .accumulated_matrix(index, scroll_offsets, include_visual_viewport_transform)
-            .extract_2d_affine();
-        FloatSize {
-            width: affine.x_scale(),
-            height: affine.y_scale(),
-        }
-    }
-
-    pub fn plane_depth_at_point_for_hit_test(
-        &self,
-        plane_node_index: SpatialNodeIndex,
-        screen_point: FloatPoint,
-        scroll_offsets: &[FloatPoint],
-    ) -> Option<f32> {
-        let inverse = self
-            .accumulated_matrix(plane_node_index, scroll_offsets, IncludeVisualViewportTransform::Yes)
-            .inverse()?;
-        let matrix = &inverse.elements;
-        let depth = -(screen_point.x * matrix[2][0] + screen_point.y * matrix[2][1] + matrix[2][3]) / matrix[2][2];
-        depth.is_finite().then_some(depth)
+        local
     }
 
     pub fn spatial_dependency_order_with_back_edges(&self) -> NodeDependencyOrder {
@@ -1534,26 +1529,27 @@ mod tests {
         let child = tree.append_spatial(SpatialData::Transform(scaled(3.0)), scroll);
         let scroll_offsets = [FloatPoint::default(), FloatPoint { x: -10.0, y: -20.0 }];
 
-        let without_viewport = tree.accumulated_matrix(child, &scroll_offsets, IncludeVisualViewportTransform::No);
+        let world = WorldTransforms::new(&tree, &scroll_offsets, None);
+        let without_viewport = world.to_viewport_matrix(child, IncludeVisualViewportTransform::No);
         assert_eq!(
             without_viewport,
             translation_matrix(-10.0, -20.0, 0.0).multiplied(libgfx_rust::scale_matrix(3.0, 3.0, 1.0))
         );
-        let with_viewport = tree.accumulated_matrix(child, &scroll_offsets, IncludeVisualViewportTransform::Yes);
+        let with_viewport = world.to_viewport_matrix(child, IncludeVisualViewportTransform::Yes);
         assert_eq!(
             with_viewport,
             libgfx_rust::scale_matrix(2.0, 2.0, 1.0).multiplied(without_viewport)
         );
 
         assert_eq!(
-            tree.accumulated_2d_scale(child, &scroll_offsets, IncludeVisualViewportTransform::No),
+            world.accumulated_2d_scale(child, IncludeVisualViewportTransform::No),
             FloatSize {
                 width: 3.0,
                 height: 3.0
             }
         );
         assert_eq!(
-            tree.accumulated_2d_scale(child, &[], IncludeVisualViewportTransform::Yes),
+            world.accumulated_2d_scale(child, IncludeVisualViewportTransform::Yes),
             FloatSize {
                 width: 6.0,
                 height: 6.0
@@ -1571,11 +1567,12 @@ mod tests {
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
-        let matrix = tree.accumulated_matrix(child, &[], IncludeVisualViewportTransform::No);
+        let world = WorldTransforms::new(&tree, &[], None);
+        let matrix = world.to_viewport_matrix(child, IncludeVisualViewportTransform::No);
         assert_eq!(matrix.map_vector4([50.0, 50.0, 0.0, 1.0]), [50.0, 50.0, 0.0, 1.0]);
         assert_eq!(matrix.map_vector4([0.0, 0.0, 0.0, 1.0]), [-50.0, -50.0, 0.0, 1.0]);
         assert_eq!(
-            tree.accumulated_2d_scale(child, &[], IncludeVisualViewportTransform::No),
+            world.accumulated_2d_scale(child, IncludeVisualViewportTransform::No),
             FloatSize {
                 width: 2.0,
                 height: 2.0
@@ -1996,7 +1993,8 @@ mod tests {
     fn an_untransformed_plane_has_zero_depth() {
         let tree = tree();
         assert_eq!(
-            tree.plane_depth_at_point_for_hit_test(VISUAL_VIEWPORT_NODE_INDEX, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            WorldTransforms::new(&tree, &[], None)
+                .plane_depth_at_point_for_hit_test(VISUAL_VIEWPORT_NODE_INDEX, FloatPoint { x: 25.0, y: 50.0 }),
             Some(0.0)
         );
     }
@@ -2012,7 +2010,8 @@ mod tests {
             VISUAL_VIEWPORT_NODE_INDEX,
         );
         assert_eq!(
-            tree.plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            WorldTransforms::new(&tree, &[], None)
+                .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }),
             Some(75.0)
         );
     }
@@ -2034,8 +2033,8 @@ mod tests {
             }),
             perspective,
         );
-        let depth = tree
-            .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[])
+        let depth = WorldTransforms::new(&tree, &[], None)
+            .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 })
             .unwrap();
         assert!((depth - 1000.0 / 9.0).abs() < 0.0001);
     }
@@ -2051,7 +2050,8 @@ mod tests {
             VISUAL_VIEWPORT_NODE_INDEX,
         );
         assert_eq!(
-            tree.plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }, &[]),
+            WorldTransforms::new(&tree, &[], None)
+                .plane_depth_at_point_for_hit_test(plane, FloatPoint { x: 25.0, y: 50.0 }),
             None
         );
     }

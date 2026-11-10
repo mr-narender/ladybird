@@ -258,16 +258,24 @@ bluer, lighter lavender, and its dark surfaces carry less tint than other themes
 
 | Token | Private |
 |---|---|
-| `strip` | `#1D1430` |
+| `strip` | `#110A20` |
 | `toolbar` | `#2F2347` |
 | `text` | `#F3F0FA` |
 | `muted`, `tab-title` | `#B3AAC4` |
 | `icon` | `#E2DCEF` |
 | `disabled` | `#5E566E` |
 | `field` | White 9% |
-| `hover` | White 7% |
+| `hover` | White 7% (toolbar and sidebar) |
+| `strip-hover` | White 6% (background tabs, the + button and the All tabs button on the strip) |
 | `separator` | `#4A3D63` |
 | `divider` | `#0F0A19` |
+
+Hover strength follows the surface a control sits on, not the kind of control. On the
+toolbar's 7%, a hovered tab on the strip would land almost on the active tab, so the strip
+is darker and its hover is 6%. That makes strip, hovered tab and active tab about
+17 / 31 / 47 in red: steps of 14 and 16, slightly wider than normal dark (20 / 34 / 46),
+because violet tones are harder to tell apart than neutral grays. The Ladybird button keeps
+its own hover and press fills everywhere.
 
 The Ladybird button shows a filled domino mask (20 px, eye holes cut out) instead of the logomark. The window is titled
 "Ladybird (Private)" in the Window menu, app switcher and taskbar. There is no "Private"
@@ -609,7 +617,9 @@ never shows "about:blank".
   with version, build and platform plus a Copy button. Nothing else.
 - Welcome (`about:welcome`): the logomark at 56 px (0.85 line, so it doesn't get heavy), the title, then one centered column, in this order: search engine (optional,
   nothing preselected, engines in a new random order each time, so none is favored by its
-  place), tab layout, content blocking switch, "Start browsing" (enabled as soon as the
+  place; shown by name only in a five-column grid, never with logos or letter tiles, which
+  would mean shipping other companies' trademarks or contacting their servers before anyone
+  has chosen), Layout (all three layouts), Color, content blocking switch, "Start browsing" (enabled as soon as the
   current settings are loaded; it never waits for a choice).
 - Error pages: icon, title, one line of detail, buttons, centered like every other
   single-message page ("Report sent"). Security errors may use two lines, because the
@@ -624,13 +634,20 @@ never shows "about:blank".
   named "General" or "Other" collects settings nobody could find.
 - Appearance, top to bottom: Theme, Color theme, Website appearance, Force dark mode,
   Layout, Show bookmarks bar, Default page zoom.
+- Color theme is a row of round swatches. The first is System (a multicolor wheel, as in
+  macOS), selected by default: the browser follows the OS accent until someone picks a
+  color. Names live in tooltips and accessible names, never under the swatches. The
+  welcome page shows the same row under "Color", right after Layout, and picking a swatch
+  there recolors the real window around the page at once; that live change is the point of
+  having it on the welcome page.
 - Layout is three picture cards: Tabs on top, Tabs on the side, Everything in the sidebar.
   It is called Layout, not Tabs, because the third choice moves the toolbar too. Each
   label names what is different about it, and each picture draws the address field where
   it really is (in the toolbar row, or at the top of the sidebar). With Tabs on the side, a
   "Sidebar on: Left / Right" control appears below the cards. Everything in the sidebar
   is always on the left, where the traffic lights are. The welcome page
-  uses the same heading and labels.
+  offers the same three cards, with the same heading, labels and pictures; in its
+  three-column grid they line up with the search engine buttons above.
 - Settings that change how websites look (Website appearance, Force dark mode, zoom) live
   in Appearance, next to the browser's own look, not in a separate section.
 - Permissions: one row per permission (camera, microphone, location, notifications, …),

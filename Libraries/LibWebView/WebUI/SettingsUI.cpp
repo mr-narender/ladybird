@@ -115,6 +115,9 @@ void SettingsUI::register_interfaces()
     register_interface("setFilterListUpdatesEnabled"sv, [this](auto const& data) {
         set_filter_list_updates_enabled(data);
     });
+    register_interface("setAppearance"sv, [this](auto const& data) {
+        set_appearance(data);
+    });
 
     if (host() == "welcome"sv) {
         register_interface("completeFirstRun"sv, [this](auto const& data) {
@@ -143,9 +146,6 @@ void SettingsUI::register_interfaces()
     });
     register_interface("setLanguages"sv, [this](auto const& data) {
         set_languages(data);
-    });
-    register_interface("setAppearance"sv, [this](auto const& data) {
-        set_appearance(data);
     });
     register_interface("resetForceDarkForHost"sv, [this](auto const& data) {
         reset_force_dark_for_host(data);
@@ -427,6 +427,10 @@ void SettingsUI::set_tab_settings(JsonValue const& tab_settings)
     // Collapsed/expanded vertical tabs and their width are not controlled by the settings UI. Don't overwrite them.
     parsed_tab_settings.vertical_tabs_expanded = current_tab_settings.vertical_tabs_expanded;
     parsed_tab_settings.vertical_tabs_expanded_width = current_tab_settings.vertical_tabs_expanded_width;
+
+    // NB: A sidebar layout picked on the welcome page opens expanded, so the choice shows in the window at once.
+    if (host() == "welcome"sv && parsed_tab_settings.vertical_tabs_enabled)
+        parsed_tab_settings.vertical_tabs_expanded = true;
 
     settings.set_tab_settings(parsed_tab_settings);
 }

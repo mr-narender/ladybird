@@ -61,12 +61,24 @@ jobs:
           read -r -a requested <<< "${arguments:-}"
           branches=()
           for branch in "${requested[@]}"; do
+            branch="release/${branch#release/}"
             if ! [[ "$branch" =~ ^release/[0-9]{4}\.([1-9]|1[0-2])$ ]]; then
               echo "::error::${branch} isn't a release branch, such as release/2026.11."
               exit 1
             fi
             if ! gh api "repos/${REPO}/branches/${branch}" --silent 2> /dev/null; then
               echo "::error::${branch} doesn't exist."
+              exit 1
+            fi
+            head="backport/${PR}-to-${branch}"
+            if lookup=$(gh api "repos/${REPO}/branches/${head}" --silent 2>&1); then
+              open_prs=$(gh api "repos/${REPO}/pulls?state=open&head=${REPO%%/*}:${head}&base=${branch}" --jq length)
+              if [ "$open_prs" -eq 0 ]; then
+                echo "::error::${head} is left over from a closed backport PR. Delete it, then comment /backport again."
+                exit 1
+              fi
+            elif [[ "$lookup" != *"(HTTP 404)"* ]]; then
+              echo "::error::Couldn't check whether ${head} exists: ${lookup}"
               exit 1
             fi
             branches+=("$branch")
@@ -99,10 +111,24 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: 'Create the backport PRs'
+        id: backport
         uses: korthout/backport-action@v4.7.1
         with:
           github_token: ${{ steps.app-token.outputs.token }}
           label_pattern: ''
           target_branches: ${{ needs.prepare.outputs.branches }}
           branch_name: backport/${pull_number}-to-${target_branch}
+          pull_description: 'Backport of #${pull_number} to `${target_branch}`.'
+          auto_merge_enabled: true
+          auto_merge_method: rebase
           experimental: '{"conflict_resolution": "draft_commit_conflicts"}'
+
+      - name: 'Fail if any backport failed'
+        if: ${{ steps.backport.outputs.was_successful != 'true' }}
+        shell: bash
+        env:
+          WAS_SUCCESSFUL_BY_TARGET: ${{ steps.backport.outputs.was_successful_by_target }}
+        run: |
+          failed=$(sed -n 's/=false$//p' <<< "${WAS_SUCCESSFUL_BY_TARGET}" | paste -sd ' ' -)
+          echo "::error::Backporting to ${failed} failed. See the comment on the original PR."
+          exit 1

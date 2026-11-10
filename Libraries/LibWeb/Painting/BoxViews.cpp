@@ -714,6 +714,19 @@ CSSPixelPoint inverse_transform_point(Layout::Node const& node, CSSPixelPoint po
     return (result / pixel_ratio).to_type<CSSPixels>();
 }
 
+CSSPixelPoint presented_scroll_offset(Layout::Node const& node, CSSPixelPoint scroll_offset)
+{
+    auto const& document = node.document();
+    if (!has_committed_box(node) || !document.has_committed_viewport_box())
+        return scroll_offset;
+    auto visual_context_tree = document.visual_context_tree();
+    if (!visual_context_tree.translations_snap_to_device_pixels(accumulated_visual_context(node).spatial, document.scroll_state_snapshot()))
+        return scroll_offset;
+    auto pixel_ratio = document.page().client().device_pixels_per_css_pixel();
+    auto snap = [&](CSSPixels value) { return CSSPixels::nearest_value_for(round(value.to_double() * pixel_ratio) / pixel_ratio); };
+    return { snap(scroll_offset.x()), snap(scroll_offset.y()) };
+}
+
 CSSPixelPoint transform_to_local_coordinates(Layout::Node const& node, CSSPixelPoint position)
 {
     if (!has_committed_box(node))
@@ -851,9 +864,11 @@ Layout::RustFFI::FfiRectToViewportTransform rect_to_viewport_transform(DOM::Docu
 {
     if (!document.has_committed_viewport_box())
         return identity_rect_to_viewport_transform();
-    auto scroll_offsets = document.scroll_state_snapshot().device_offsets();
+    auto const& scroll_state = document.scroll_state_snapshot();
+    auto scroll_offsets = scroll_state.device_offsets();
     return {
         .visual_context_tree = visual_context_tree.rust_handle(),
+        .world_transforms = scroll_state.world_transforms(visual_context_tree),
         .scroll_offsets = scroll_offsets.data(),
         .scroll_offsets_len = scroll_offsets.size(),
         .device_pixels_per_css_pixel = static_cast<float>(document.page().client().device_pixels_per_css_pixel()),

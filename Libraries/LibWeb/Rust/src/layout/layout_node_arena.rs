@@ -4501,7 +4501,8 @@ impl LayoutNodeArena {
 
     /// Writes `facts` onto the box `target` names, and every row sharing its DOM node, where the box paints facts of
     /// their kind. A box that owns the provider of its image shows that provider's image, which only facts naming the
-    /// box by its row carry, and none before the host hands it the provider.
+    /// box by its row carry, and none before the host hands it the provider. A canvas whose context is an
+    /// ImageBitmapRenderingContext paints the output bitmap of the context as its image.
     pub(crate) fn set_replaced_paint_facts(
         &mut self,
         target: super::tree_update_marks::MarkedBox,
@@ -4517,6 +4518,7 @@ impl LayoutNodeArena {
             ReplacedPaintFacts::FormControl(_) => matches!(kind, NodeKind::CheckBox | NodeKind::RadioButton),
             ReplacedPaintFacts::Canvas(_) => kind == NodeKind::CanvasBox,
             ReplacedPaintFacts::NavigableContainer(_) => kind == NodeKind::NavigableContainerViewport,
+            ReplacedPaintFacts::Image(_) if kind == NodeKind::CanvasBox => true,
             ReplacedPaintFacts::Image(_) => {
                 matches!(kind, NodeKind::ImageBox | NodeKind::SVGImageBox)
                     && match self.owned_image_provider(id) {
@@ -5197,7 +5199,7 @@ impl LayoutNodeArena {
         );
         self.paintable_rows
             .with_committed_fragment_link(node.slot_index(), node.generation(), |link| {
-                link.and_then(|link| link.abspos_layout_inputs.as_deref().copied())
+                link.and_then(|link| link.placement.abspos_layout_inputs.as_deref().copied())
             })
             .or_else(|| self.confined_abspos_layout_inputs.get(&node).copied())
     }
@@ -6572,8 +6574,10 @@ const _: () = {
 #[cfg(test)]
 mod tests {
 
+    use crate::layout::AxisEdge;
     use crate::layout::abspos_inputs::{
-        AbsposAxisMode, AbsposContainingBlockInfo, AbsposLayoutInputs, StaticPositionAlignment, StaticPositionRect,
+        AbsposAxisAlignment, AbsposAxisMode, AbsposContainingBlockInfo, AbsposLayoutInputs, AxisPlacement,
+        StaticPositionRect,
     };
     use crate::layout::layout_node_arena::{
         Chunk, DerivedStyleRecord, IntrinsicBlockSizeMeasurement, IntrinsicInlineSizeMeasurement,
@@ -7613,17 +7617,20 @@ mod tests {
             inline_containing_block: NodeSlotId::INVALID,
             static_position_rect: StaticPositionRect {
                 rect: Default::default(),
-                inline_alignment: StaticPositionAlignment::Center,
-                block_alignment: StaticPositionAlignment::End,
+                inline_alignment: AxisEdge::Center,
+                block_alignment: AxisEdge::End,
                 alignment_derives_from_own_computed_values: true,
             },
             containing_block_info: AbsposContainingBlockInfo {
                 rect: Default::default(),
-                inline_axis_mode: AbsposAxisMode::StaticPosition,
-                block_axis_mode: AbsposAxisMode::InsetFromRect,
-                inline_alignment: None,
-                block_alignment: None,
-                derives_from_own_computed_values: true,
+                inline_placement: AxisPlacement {
+                    mode: AbsposAxisMode::StaticPosition,
+                    alignment: None,
+                },
+                block_placement: AxisPlacement {
+                    mode: AbsposAxisMode::InsetFromRect,
+                    alignment: Some(AbsposAxisAlignment::Stretch),
+                },
                 is_position_area: false,
             },
             resolved_anchor_insets: None,
@@ -7638,7 +7645,7 @@ mod tests {
         let allocation = arena.allocate_for_test();
         let inputs = test_abspos_layout_inputs();
         let mut link = fragment_tree::FragmentLink::for_test(allocation.slot);
-        link.abspos_layout_inputs = Some(std::sync::Arc::new(inputs));
+        link.placement.abspos_layout_inputs = Some(std::sync::Arc::new(inputs));
         arena.set_committed_fragment_link(allocation.slot, link, None);
         assert!(arena.committed_fragment_link(allocation.slot).is_some());
         assert_eq!(arena.saved_abspos_layout_inputs(allocation.slot), Some(inputs));
@@ -7664,7 +7671,7 @@ mod tests {
         let new = arena.allocate_for_test();
         let inputs = test_abspos_layout_inputs();
         let mut link = fragment_tree::FragmentLink::for_test(old.slot);
-        link.abspos_layout_inputs = Some(std::sync::Arc::new(inputs));
+        link.placement.abspos_layout_inputs = Some(std::sync::Arc::new(inputs));
         let retained_fragment = link.fragment.clone();
         arena.set_committed_fragment_link(old.slot, link, None);
 

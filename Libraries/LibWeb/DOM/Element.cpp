@@ -3038,8 +3038,6 @@ static bool style_attribute_is_blocked_by_content_security_policy(Element& eleme
     return ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(element, ContentSecurityPolicy::Directives::Directive::InlineType::StyleAttribute, value) == ContentSecurityPolicy::Directives::Directive::Result::Blocked;
 }
 
-static void prefetch_inline_style_image_resources(CSS::CSSStyleProperties const&, Document&);
-
 void Element::clone_inline_style_from(Element const& source)
 {
     // NB: A source whose style attribute still awaits its check leaves the copy to make that check once connected. So
@@ -3066,8 +3064,6 @@ void Element::inserted()
                     m_inline_style->set_declarations_from_text({});
                 else
                     CSS::Parser::ValueParserFFI::rust_declaration_block_destroy(exchange(m_inline_declarations, nullptr));
-            } else if (CSS::Parser::ValueParserFFI::rust_declaration_block_has_abstract_image_values(inline_style_declarations())) {
-                prefetch_inline_style_image_resources(*inline_style(), document());
             }
         }
     }
@@ -4354,9 +4350,12 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
             scrolling_box_rect = Painting::scroll_snapport_rect(*layout_node, scrolling_box_rect);
             scrolling_box_layout_node = as_if<Layout::NodeWithStyle>(layout_node);
         }
-        current_scroll_position = document.navigable()->viewport_scroll_offset() + visual_viewport.offset();
+        current_scroll_position = document.navigable()->viewport_scroll_offset();
+        if (auto* layout_node = document.layout_node(read))
+            current_scroll_position = Painting::presented_scroll_offset(*layout_node, current_scroll_position);
+        current_scroll_position += visual_viewport.offset();
     } else if (auto* layout_node = scrolling_box.layout_node(read); layout_node && Painting::has_committed_box(*layout_node)) {
-        current_scroll_position = Painting::scroll_offset(*layout_node);
+        current_scroll_position = Painting::presented_scroll_offset(*layout_node, Painting::scroll_offset(*layout_node));
         scrolling_box_layout_node = as_if<Layout::NodeWithStyle>(layout_node);
         scrolling_box_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::scroll_snapport_rect(*layout_node), Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
     } else {
@@ -4618,7 +4617,7 @@ void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarg
         //         the outermost scrolling box, so its own scroll cannot affect a later iteration.
         if (!scrolling_box.is_document()) {
             if (auto const* layout_node = scrolling_box.layout_node(read); layout_node && Painting::has_committed_box(*layout_node)) {
-                target_bounding_border_box.translate_by(Painting::scroll_offset(*layout_node) - Painting::clamp_scroll_offset(*layout_node, position));
+                target_bounding_border_box.translate_by(Painting::presented_scroll_offset(*layout_node, Painting::scroll_offset(*layout_node)) - Painting::clamp_scroll_offset(*layout_node, position));
                 auto scrollport_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
                 auto visible_rect = target_bounding_border_box.intersected(scrollport_rect);
                 if (!visible_rect.is_empty())
@@ -6438,22 +6437,6 @@ Element::Directionality Element::parent_directionality() const
     return Directionality::Ltr;
 }
 
-static void prefetch_inline_style_image_resources(CSS::CSSStyleProperties const& inline_style, Document& document)
-{
-    auto load_image_if_needed = [&](CSS::StyleValue const& value) {
-        if (value.is_abstract_image())
-            const_cast<CSS::AbstractImageStyleValue&>(value.as_abstract_image()).load_any_resources(document);
-    };
-    for (auto const& property : inline_style.properties()) {
-        if (property.value->is_value_list()) {
-            for (auto const& item : property.value->as_value_list().values())
-                load_image_if_needed(*item);
-        } else {
-            load_image_if_needed(*property.value);
-        }
-    }
-}
-
 // https://dom.spec.whatwg.org/#concept-element-attributes-change-ext
 void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
@@ -6608,10 +6591,6 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
             return;
         }
         set_inline_style_declarations_from_text(style_attribute_is_blocked_by_content_security_policy(*this, *value) ? Utf16View {} : *value);
-        // NB: Asked first, so a block without images does not make views of its values. The CSSOM object of a block
-        //     with images holds the values that load them.
-        if (CSS::Parser::ValueParserFFI::rust_declaration_block_has_abstract_image_values(inline_style_declarations()))
-            prefetch_inline_style_image_resources(*inline_style(), document());
     } else if (local_name == HTML::AttributeNames::dir || local_name == HTML::AttributeNames::lang) {
         bool const is_dir = local_name == HTML::AttributeNames::dir;
         if (is_dir) {

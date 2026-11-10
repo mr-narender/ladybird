@@ -1148,22 +1148,22 @@ pub(crate) fn aligns_content_in_block_axis(facts: &NodeFacts<'_>) -> bool {
 }
 
 pub(crate) fn content_alignment_offset(style: ComputedValuesView<'_>, free_space: CssPixels) -> CssPixels {
-    // https://drafts.csswg.org/css-align-3/#auto-safety
-    // UAs that have not implemented the “smart” default behavior must behave as safe for align-content on block
-    // containers and unsafe otherwise.
-    let free_space = if style.align_content_overflow() == OVERFLOW_ALIGNMENT_UNSAFE {
-        free_space
+    let (keyword, safety) = box_alignment::ContentKeyword::align_content_of(style);
+    // https://drafts.csswg.org/css-align-3/#baseline-values
+    // The fallback alignment for last baseline is safe end.
+    let keyword = if style.align_content_is_last_baseline() {
+        box_alignment::ContentKeyword::End
     } else {
-        free_space.max(CssPixels::default())
+        keyword
     };
     // https://drafts.csswg.org/css-align-3/#distribution-block
     // If a <content-distribution> is specified its fallback alignment is used instead.
-    match style.align_content() {
-        align_content::CENTER | align_content::SPACE_AROUND | align_content::SPACE_EVENLY => free_space / 2,
-        align_content::END | align_content::FLEX_END => free_space,
-        align_content::BASELINE if style.align_content_is_last_baseline() => free_space,
-        _ => CssPixels::default(),
-    }
+    // https://drafts.csswg.org/css-align-3/#auto-safety
+    // UAs that have not implemented the “smart” default behavior must behave as safe for align-content on block
+    // containers and unsafe otherwise.
+    keyword
+        .resolve(safety, box_alignment::AxisDirections::of(true, None))
+        .offset(free_space, box_alignment::OverflowSafety::Safe)
 }
 
 impl<'pass> BlockFormattingContext<'pass> {
@@ -1452,11 +1452,11 @@ impl<'pass> BlockFormattingContext<'pass> {
                 },
             },
             inline_alignment: if self.style(coordinate_space_box).direction() == direction::RTL {
-                StaticPositionAlignment::End
+                AxisEdge::End
             } else {
-                StaticPositionAlignment::Start
+                AxisEdge::Start
             },
-            block_alignment: StaticPositionAlignment::Start,
+            block_alignment: AxisEdge::Start,
             alignment_derives_from_own_computed_values: false,
         };
         formatting_context::register_contained_abspos_child(
@@ -3193,7 +3193,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             cells,
             content_baselines,
             collapses_through: laid_out.collapses_through,
-            is_invisible_for_line_clamp: laid_out.fragment_facts.is_invisible_for_line_clamp,
+            is_invisible_for_line_clamp: laid_out.fragment_facts.show.is_invisible_for_line_clamp,
             can_break_inside: self.box_can_break_inside(node, laid_out.has_unbreakable_lines),
             broken_inside: laid_out.broken_inside,
             baselines_in_containing_block,
@@ -3275,7 +3275,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             .track_percentage_block_size_dependency_while_laying_out(node);
         let mut fragment_facts = run_state::FragmentFactsDecidedByParent::default();
         if self.laying_out_invisible_line_clamp_content.get() {
-            fragment_facts.hide_after_clamp_point();
+            fragment_facts.show.hide_after_clamp_point();
         }
         if facts.is_anonymous_button_content_wrapper() {
             let only_for_button_content_alignment = block_container
@@ -3317,7 +3317,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 cells.border_top = CssPixels::default();
                 cells.padding_top = CssPixels::default();
             });
-            fragment_facts.continues_from_previous_fragment = true;
+            fragment_facts.breaks.continues_from_previous = true;
         }
 
         if facts.is_floating() {
@@ -3938,7 +3938,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                     cells.border_bottom = CssPixels::default();
                     cells.margin_bottom = CssPixels::default();
                 });
-                fragment_facts.continues_in_next_fragment = true;
+                fragment_facts.breaks.continues_in_next = true;
                 std::rc::Rc::make_mut(&mut token).consumed_block_size = continuation
                     .as_ref()
                     .map_or(CssPixels::default(), |continuation| continuation.consumed_block_size)
@@ -4102,7 +4102,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         self.collapse_margins_after_block_level_box(
             margins_left_by_contents.as_ref(),
             collapses_through,
-            fragment_facts.continues_in_next_fragment,
+            fragment_facts.breaks.continues_in_next,
             metrics.margin_bottom(),
         );
 
@@ -5904,8 +5904,8 @@ impl<'pass> BlockFormattingContext<'pass> {
             );
         }
         let multicol_layout_data = std::sync::Arc::new(fragmentation::MulticolLayoutData { geometry, rows });
-        self.run.update_fragment_payloads_of(self.run.box_, |payloads| {
-            payloads.multicol_layout_data = Some(multicol_layout_data);
+        self.run.set_fragment_payload_of(self.run.box_, || {
+            fragment_tree::FcPayload::Multicol(multicol_layout_data)
         });
         self.multicol_automatic_content_block_size.set(Some(row_block_offset));
         self.record_derived_baselines_of_root_box(baselines);
@@ -6379,10 +6379,13 @@ impl<'pass> BlockFormattingContext<'pass> {
         self.lay_out_root_contents(run, input);
         let has_line_clamp_point = self.line_clamp_point_found.get();
         if has_line_clamp_point || self.clamped_content_is_scrollable_overflow {
-            run.update_fragment_payloads_of(self.run.box_, |payloads| {
-                payloads.has_line_clamp_point = has_line_clamp_point;
-                payloads.clamped_content_is_scrollable_overflow = self.clamped_content_is_scrollable_overflow;
-            });
+            run.set_line_clamp_facts_of(
+                self.run.box_,
+                fragment_tree::LineClampFacts {
+                    has_line_clamp_point,
+                    clamped_content_is_scrollable_overflow: self.clamped_content_is_scrollable_overflow,
+                },
+            );
         }
     }
 

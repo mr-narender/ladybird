@@ -8,7 +8,7 @@
 
 use super::{
     ClipBehavior, ClipNodeIndex, ContextRef, EffectNodeData, EffectNodeIndex, EffectsData, SpatialData,
-    SpatialNodeIndex, VisualContextTree,
+    SpatialNodeIndex, VisualContextTree, WorldTransforms,
 };
 use crate::host::{FfiVisualAnimationSummary, FfiVisualAnimationTargetKind, FfiVisualAnimationTransformOperationKind};
 use crate::visual_animation::{VisualAnimation, VisualAnimationSample, VisualAnimationValue};
@@ -115,6 +115,7 @@ impl VisualContextTree {
         screen_point: FloatPoint,
         scroll_offsets: &[FloatPoint],
     ) -> bool {
+        let world = std::cell::OnceCell::new();
         self.visual_animations.iter().any(|animation| {
             animation.target_kind == FfiVisualAnimationTargetKind::Transform
                 && animation.is_active_at(sample_time_ns)
@@ -129,7 +130,8 @@ impl VisualContextTree {
                         clip: ClipNodeIndex::NONE,
                         effect: EffectNodeIndex::NONE,
                     };
-                    self.transform_point_for_hit_test(context, screen_point, scroll_offsets, ClipBehavior::Ignore)
+                    let world = world.get_or_init(|| WorldTransforms::new(self, scroll_offsets, None));
+                    self.transform_point_for_hit_test(world, context, screen_point, ClipBehavior::Ignore)
                         .is_some_and(|local_point| transform.bounds.contains_point(local_point))
                 })
         })

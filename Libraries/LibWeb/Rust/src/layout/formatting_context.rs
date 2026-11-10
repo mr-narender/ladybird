@@ -1166,6 +1166,15 @@ pub(crate) enum SizingAxis {
     Block,
 }
 
+impl SizingAxis {
+    pub(crate) fn select<T>(self, inline_value: T, block_value: T) -> T {
+        match self {
+            Self::Inline => inline_value,
+            Self::Block => block_value,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SizingProperty {
     Width,
@@ -1364,13 +1373,27 @@ impl<'pass> FormattingContextRun<'pass> {
 
     /// Hands what the layout of `node` produced besides its geometry to the box's fragment, where this run builds
     /// fragments.
-    pub(crate) fn update_fragment_payloads_of(
-        &self,
-        node: Node,
-        update: impl FnOnce(&mut fragment_tree::FragmentPayloads),
-    ) {
+    pub(crate) fn set_fragment_payload_of(&self, node: Node, payload: impl FnOnce() -> fragment_tree::FcPayload) {
         if let Some(fragments) = self.fragments {
-            fragments.update_fragment_payloads_of(node, update);
+            fragments.update_fragment_payload_of(node, |pending| pending.set(payload()));
+        }
+    }
+
+    pub(crate) fn update_grid_payload_of(&self, node: Node, update: impl FnOnce(&mut fragment_tree::GridPayload)) {
+        if let Some(fragments) = self.fragments {
+            fragments.update_fragment_payload_of(node, |pending| update(pending.grid_mut()));
+        }
+    }
+
+    pub(crate) fn update_svg_payload_of(&self, node: Node, update: impl FnOnce(&mut fragment_tree::SvgPayload)) {
+        if let Some(fragments) = self.fragments {
+            fragments.update_fragment_payload_of(node, |pending| update(pending.svg_mut()));
+        }
+    }
+
+    pub(crate) fn set_line_clamp_facts_of(&self, node: Node, facts: fragment_tree::LineClampFacts) {
+        if let Some(fragments) = self.fragments {
+            fragments.update_fragment_payload_of(node, |pending| pending.line_clamp = facts);
         }
     }
 
@@ -1547,8 +1570,8 @@ fn register_table_abspos_descendants(run: &FormattingContextRun, parent: Node) {
                     child,
                     abspos_inputs::StaticPositionRect {
                         rect: Default::default(),
-                        inline_alignment: StaticPositionAlignment::Start,
-                        block_alignment: StaticPositionAlignment::Start,
+                        inline_alignment: AxisEdge::Start,
+                        block_alignment: AxisEdge::Start,
                         alignment_derives_from_own_computed_values: false,
                     },
                     None,
@@ -3657,14 +3680,17 @@ fn table_in_wrapper_never_observes_percentage_inline_basis(run: &FormattingConte
     true
 }
 
-/// Whether the run is of an item block container whose content resolves percentages against the container itself.
+/// Whether the run is of an item block, flex or grid container whose content resolves percentages against the
+/// container itself.
 fn item_run_never_observes_percentage_inline_basis(
     run: &FormattingContextRun,
     fc_type: FormattingContextType,
     input: &LayoutInput,
 ) -> bool {
-    fc_type == FormattingContextType::Block
-        && parent_owns_root_input_cells(&run.pass, run.box_, input)
+    matches!(
+        fc_type,
+        FormattingContextType::Block | FormattingContextType::Flex | FormattingContextType::Grid
+    ) && parent_owns_root_input_cells(&run.pass, run.box_, input)
         && !run.sizing().measurement_root_observes_percentage_inline_basis(run.box_)
 }
 
@@ -4138,9 +4164,10 @@ fn compute_subtree_layout_fragments(input: LayoutStageInput<'_>, containing_bloc
 fn layout_subtree_with_frozen_root_geometry(run: &FormattingContextRun<'_>) {
     let root = run.box_;
     let pass = &run.pass;
-    let committed_root = used_values::committed_box_from_fragment_link(pass, root)
+    let committed_root_link = pass
+        .committed_fragment_link(root)
         .expect("partial relayout root must have committed geometry");
-    let root_cells = committed_root.cells;
+    let root_cells = used_values::RootInputCells::of_committed_fragment_link(&committed_root_link);
     let fragments = run.fragments.expect("partial relayout must build fragments");
     let input = LayoutInput::new(
         AvailableSpace {
@@ -4183,7 +4210,7 @@ fn layout_subtree_with_frozen_root_geometry(run: &FormattingContextRun<'_>) {
         cells: root_box.cells,
         line_data: root_box.line_data,
     };
-    let facts_decided_by_parent = committed_root.facts_decided_by_parent;
+    let facts_decided_by_parent = run_state::FactsDecidedByParent::of_committed_link(&committed_root_link);
     let placement = facts_decided_by_parent
         .placement
         .expect("the root of a partial relayout keeps the placement it committed");
