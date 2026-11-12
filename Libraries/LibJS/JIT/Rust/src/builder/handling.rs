@@ -91,6 +91,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         // Control flow, moves and frame setup.
         O::Enter
         | O::Mov
+        | O::MovWide
         | O::MovSrcUndefined
         | O::Jump
         | O::JumpIf
@@ -322,6 +323,8 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::GetMethod
         | O::GetObjectPropertyIterator
         | O::IteratorNext
+        | O::IteratorStep
+        | O::SetVariableBindingOfBlockFunction
         | O::IteratorToArray
         | O::CacheObjectShape
         | O::InitObjectLiteralProperty

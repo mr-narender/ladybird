@@ -90,25 +90,11 @@ impl ClampEdgeWalk<'_, '_> {
         let fragment = &link.fragment;
         let data = self.pass.arena().data(fragment.node);
         let style = node_facts::node_style_view(data);
-        let content_box = link
-            .placement
-            .frame
-            .rect_to_physical(
-                CssPixelRect::new(
-                    link.committed_offset.x,
-                    link.committed_offset.y,
-                    fragment.sides.content_size.width,
-                    fragment.sides.content_size.height,
-                ),
-                FfiCssPixelSize {
-                    width: containing_block.width,
-                    height: containing_block.height,
-                },
-            )
+        let content_box = CssPixelRect::from_location_and_size(link.offset.into(), fragment.sides.content_size.into())
             .translated_by(containing_block.location());
 
         if node_facts::node_is_floating(data, style) {
-            let border_box = fragment_overflow::physical_border_box_around(content_box, fragment, link.placement.frame);
+            let border_box = fragment_overflow::physical_border_box_around(content_box, fragment);
             let clip = Some(self.area_before_block_end_edge.translated(-border_box.x, -border_box.y));
             if link.placement.shown_as.facts.clip_decided_by_parent == clip {
                 return LinkOutcome::Unchanged;

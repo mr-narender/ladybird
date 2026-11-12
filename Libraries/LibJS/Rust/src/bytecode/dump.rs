@@ -290,7 +290,7 @@ impl BytecodeDumper<'_> {
     pub fn append_property_key_quoted(&mut self, index: u32) {
         let key = self
             .executable
-            .get_property_key(PropertyKeyTableIndex(index))
+            .get_property_key(PropertyKeyTableIndex::from_index(index))
             .to_utf16_string();
         self.append_quoted(Utf16View::of_string(&key));
     }
@@ -298,7 +298,7 @@ impl BytecodeDumper<'_> {
     pub fn append_property_key_plain(&mut self, index: u32) {
         let key = self
             .executable
-            .get_property_key(PropertyKeyTableIndex(index))
+            .get_property_key(PropertyKeyTableIndex::from_index(index))
             .to_utf16_string();
         Utf16View::of_string(&key).append_as_wtf8_to(self.output);
     }
@@ -341,7 +341,7 @@ impl BytecodeDumper<'_> {
             if i != 0 {
                 self.append(", ");
             }
-            self.append_operand("", Operand::from_raw(read_u32(bytes, offset + i * 4)));
+            self.append_operand("", Operand::from_raw(u32::from(bytes[offset + i])));
         }
         self.append("]");
     }
@@ -351,10 +351,11 @@ impl BytecodeDumper<'_> {
         self.append(":[");
         let mut first_elem = true;
         for i in 0..count {
-            let raw = read_u32(bytes, offset + i * 4);
-            let Some(operand) = Operand::optional_from_raw(raw) else {
+            let raw = bytes[offset + i];
+            if raw == u8::MAX {
                 continue;
-            };
+            }
+            let operand = Operand::from_raw(u32::from(raw));
             if !first_elem {
                 self.append(", ");
             }
@@ -381,7 +382,7 @@ impl BytecodeDumper<'_> {
         self.append(":[");
         let mut first_elem = true;
         for i in 0..count {
-            let element_offset = offset + i * 8;
+            let element_offset = offset + i * 5;
             if bytes[element_offset + 4] == 0 {
                 continue;
             }

@@ -114,6 +114,7 @@
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/Infra/Strings.h>
 #include <LibWebCommon/Loader/DownloadFilename.h>
+#include <LibWebCommon/WebView/Utilities.h>
 
 #include <AK/Debug.h>
 #include <AK/LexicalPath.h>
@@ -4744,7 +4745,7 @@ Optional<CSSPixelPoint> LocalNavigable::to_local_root_viewport_position(CSSPixel
 
         auto point = Painting::absolute_position(*layout_node);
         point.translate_by(position);
-        position = Painting::transform_rect_to_viewport(*layout_node, { point, { 0, 0 } }).location();
+        position = Painting::rect_to_viewport(*layout_node, { point, { 0, 0 } }, Layout::RustFFI::ViewportSpace::VisualViewport).location();
 
         auto parent = ancestor->parent();
         ancestor = parent ? &as<LocalNavigable>(*parent) : nullptr;
@@ -5942,8 +5943,9 @@ void LocalNavigable::adopt_pending_async_scroll_offsets(Compositing::AsyncScroll
     bool adopted_any_scroll_offset = false;
     for (auto const& async_scroll_offset : async_scroll_updates.scroll_offsets) {
         auto& user_input_scroll_count = m_compositor_user_input_scroll_counts.ensure(async_scroll_offset.stable_node_id);
+        bool user_input_scrolled_the_box = async_scroll_offset.user_input_scroll_count > user_input_scroll_count;
         // User input the compositor scrolled the box for keeps the box's gesture going, even where the box stayed put.
-        if (async_scroll_offset.user_input_scroll_count > user_input_scroll_count)
+        if (user_input_scrolled_the_box)
             extend_user_scroll_gesture_of(async_scroll_offset.stable_node_id);
         user_input_scroll_count = max(user_input_scroll_count, async_scroll_offset.user_input_scroll_count);
         m_compositor_context_user_input_scroll_count = max(m_compositor_context_user_input_scroll_count, async_scroll_offset.context_user_input_scroll_count);
@@ -5971,8 +5973,17 @@ void LocalNavigable::adopt_pending_async_scroll_offsets(Compositing::AsyncScroll
                     async_scroll_offset.compositor_scroll_offset.x(), async_scroll_offset.compositor_scroll_offset.y());
             }
 
-            // The input that took the scroll over goes on with the box's sequence as a gesture of its own.
-            if (user_input_took_over_the_scroll_of(async_scroll_offset.stable_node_id))
+            // The input that took the scroll over goes on with the box's sequence as a gesture of its own. So does input
+            // the compositor applied once the scroll was done, which these updates report along with the scroll's
+            // completion when they were merged while this process was busy: The box is no longer where the scroll took
+            // it, and nothing else would snap it once that input ends.
+            auto user_input_moved_the_box_after_its_scroll = user_input_scrolled_the_box && any_of(m_pending_async_scroll_operations, [&](auto const& pending_operation) {
+                return pending_operation.stable_node_id == async_scroll_offset.stable_node_id
+                    && pending_operation.destination_scroll_offset.has_value()
+                    && pending_operation.destination_scroll_offset.value() != css_scroll_offset
+                    && async_scroll_updates.completed_operation_ids.contains_slow(pending_operation.operation_id);
+            });
+            if (user_input_moved_the_box_after_its_scroll || user_input_took_over_the_scroll_of(async_scroll_offset.stable_node_id))
                 note_user_scroll_gesture_of(async_scroll_offset.stable_node_id, scroll_offset_before_scroll, UserScrollMovedBox::No);
             continue;
         }
@@ -6847,9 +6858,8 @@ void LocalNavigable::update_force_dark_for_active_document()
     if (!is_top_level_traversable())
         return;
     auto enabled = m_force_dark_default;
-    if (auto document = active_document(); document && document->url().host().has_value()) {
-        auto host = MUST(String::from_utf8(document->url().serialized_host()));
-        if (!host.is_empty())
+    if (auto document = active_document()) {
+        if (auto host = WebView::host_for_settings(document->url()); !host.is_empty())
             enabled = m_force_dark_per_host.get(host).value_or(enabled);
     }
     set_force_dark_enabled(enabled);
@@ -7100,7 +7110,6 @@ Compositor::SealedPresentation LocalNavigable::seal_presentation(DOM::Document& 
     if (records_display_list)
         visual_context_tree = paint_state.visual_context_tree(document);
     paint_state.did_update_visual_context_tree_in_compositor();
-    Compositing::ScrollStateSnapshot scroll_state_snapshot { paint_state.scroll_state_snapshot() };
     // A keyboard scroll reads the layout, which one the host knows is stale leaves to the next frame that lays it out.
     Optional<Compositing::KeyboardScrollState> keyboard_scroll_state;
     if (is_top_level_traversable() && !document.layout_is_known_stale())
@@ -7110,7 +7119,6 @@ Compositor::SealedPresentation LocalNavigable::seal_presentation(DOM::Document& 
         .visual_context_tree = move(visual_context_tree),
         .sends_visual_context_tree = sends_visual_context_tree,
         .scroll_state_changed = paint_state.take_scroll_state_change(),
-        .scroll_state_snapshot = move(scroll_state_snapshot),
         .scroll_requests = take_unsent_scroll_requests(),
         .keyboard_scroll_state = move(keyboard_scroll_state),
         .paint_command_cache_source = paint_state.display_list_used_as_paint_command_cache_source(),

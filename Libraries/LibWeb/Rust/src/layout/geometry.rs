@@ -58,6 +58,20 @@ pub(crate) struct Sides {
     pub(crate) left: CssPixels,
 }
 
+impl Sides {
+    /// The sides, which frame `from` holds, as frame `to` holds them.
+    #[inline]
+    pub(crate) fn in_frame(self, from: Frame, to: Frame) -> Self {
+        let [top, right, bottom, left] = from.sides_in([self.top, self.right, self.bottom, self.left], to);
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+}
+
 /// The frame of a writing mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Frame(u8);
@@ -182,6 +196,31 @@ impl Frame {
         other.rect_from_physical(self.rect_to_physical(rect, container_size), container_size)
     }
 
+    /// Maps an offset in this frame to the physical plane, as the corner of an empty rect at the origin of an empty box
+    /// maps.
+    pub(crate) fn offset_to_physical(self, offset: FfiCssPixelPoint) -> FfiCssPixelPoint {
+        let corner = self.rect_to_physical(
+            CssPixelRect::new(offset.x, offset.y, CssPixels::default(), CssPixels::default()),
+            FfiCssPixelSize::default(),
+        );
+        FfiCssPixelPoint {
+            x: corner.x,
+            y: corner.y,
+        }
+    }
+
+    /// Maps a physical offset to this frame.
+    pub(crate) fn offset_from_physical(self, offset: FfiCssPixelPoint) -> FfiCssPixelPoint {
+        let corner = self.rect_from_physical(
+            CssPixelRect::new(offset.x, offset.y, CssPixels::default(), CssPixels::default()),
+            FfiCssPixelSize::default(),
+        );
+        FfiCssPixelPoint {
+            x: corner.x,
+            y: corner.y,
+        }
+    }
+
     /// The physical half-plane before the block-end edge of a content box whose contents use this frame and whose
     /// physical size is `content_size`, relative to that content box.
     pub(crate) fn half_plane_before_block_end(self, content_size: FfiCssPixelSize) -> CssPixelRect {
@@ -195,6 +234,12 @@ impl Frame {
             CssPixelRect::new(-extent, -extent, extent * 2, extent + block_size),
             content_size,
         )
+    }
+
+    /// Maps a physical size to this frame.
+    #[inline]
+    pub(crate) fn size_from_physical(self, size: FfiCssPixelSize) -> FfiCssPixelSize {
+        self.size_to_physical(size.width, size.height)
     }
 
     /// Maps a size in this frame to the physical plane.
@@ -382,6 +427,9 @@ pub(crate) struct RootSizingDirectives {
     // wrapper) can be placed in wrapper coordinates.
     pub(crate) table_box_content_block_offset_in_wrapper: PackedOptionalCssPixels,
     pub(crate) content_block_size_after_run: ContentBlockSizeAfterRun,
+    // Input-only: how far the run of a table cell moves the contents of its root along the block axis, to align them
+    // in the block size the rows it spans give it after the run (see ContentBlockSizeAfterRun::Given).
+    pub(crate) table_cell_contents_block_offset: CssPixels,
     pub(crate) outer_float_intrusion_before_list_item_children: inline_formatting_context::SpaceUsedByFloats,
     pub(crate) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
     pub(crate) root_is_measured_for_its_content_block_size: bool,
@@ -398,9 +446,10 @@ pub(crate) enum ContentBlockSizeAfterRun {
     HandedOver,
     /// Its automatic content block size.
     Automatic,
-    /// A flex or grid item lays out its content against the block size transferred through its aspect ratio, then
-    /// takes this block size, which the automatic minimum size grew to fit the content.
-    GrownFromAspectRatioBlockSize(CssPixels),
+    /// This one, once its contents are laid out against the one its container handed it: a flex or grid item laid out
+    /// against the block size transferred through its aspect ratio takes the one its automatic minimum size grew to
+    /// fit the content, and a table cell takes the block size of the rows it spans.
+    Given(CssPixels),
 }
 
 /// The size that MathML layout asks the core operator of an embellished operator to stretch to cover.

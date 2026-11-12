@@ -367,12 +367,22 @@ bool WebContentPage::continue_navigation_population_in_selected_process(Web::HTM
             navigable->did_cancel_navigation(navigation_id);
             return;
         }
+        weak_loader->let_host_adopt_response_body(*host, [host, navigable_id, navigation_id, weak_loader] {
+            if (!weak_loader || !host->is_open())
+                return;
+            auto navigable = host->traversable().top_level_traversable().find(navigable_id);
+            if (!navigable.has_value())
+                return;
+            auto navigation = navigable->navigation_with_id(navigation_id);
+            if (!navigation || !navigation->state.has<CanonicalNavigation::Populating>() || navigation->loader().ptr() != weak_loader.ptr())
+                return;
 
-        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
-        // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run
-        //    these steps:
-        // NB: The page to host the document runs the task.
-        host->async_populate_navigation(weak_loader->request(), weak_loader->take_result());
+            // https://html.spec.whatwg.org/multipage/browsing-the-web.html#attempt-to-populate-the-history-entry's-document
+            // 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run
+            //    these steps:
+            // NB: The page to host the document runs the task.
+            host->async_populate_navigation(weak_loader->request(), weak_loader->take_result());
+        });
     };
     // Wait for the destination RequestServer to acknowledge the import before the host adopts it.
     weak_loader->move_response_body_to(host->client().request_server_site_bindings(), move(finish_handoff));
@@ -573,6 +583,12 @@ void WebContentPage::did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect 
     }
     dbgln_if(COMPOSITOR_DEBUG, "[Compositor] UI dropping did_paint for page {} bitmap {}: no view", m_id, bitmap_id);
     release_presented_bitmap(bitmap_id);
+}
+
+void WebContentPage::did_present_frame_in_remote_layer(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, double device_pixel_ratio)
+{
+    if (displays_tab())
+        view().server_did_present_frame_in_remote_layer({}, content_rect.size(), damage_rect, device_pixel_ratio);
 }
 
 void WebContentPage::did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores)
@@ -2644,7 +2660,7 @@ void WebContentPage::did_complete_navigation_unload_check(Web::HTML::CrossProces
         Application::the().allocate_ui_process_cross_process_id());
     population_request.target_snapshot_params.sandboxing_flags |= navigable->snapshot_target_snapshot_params().sandboxing_flags;
     ongoing_navigation->history_entry = MUST(CanonicalSessionHistoryEntry::create_from_descriptor(Web::HTML::create_session_history_entry_descriptor(population_request.history_entry, 0)));
-    ongoing_navigation->state = CanonicalNavigation::CreatingNavigationParams { NavigationLoader::create(client().is_private(), move(population_request)) };
+    ongoing_navigation->state = CanonicalNavigation::CreatingNavigationParams { NavigationLoader::create(move(population_request)) };
     async_create_navigation_params(ongoing_navigation->loader()->request());
 
     // Requesting navigation params starts the fetch, so a view's top-level population begins its recorded
@@ -2657,10 +2673,15 @@ void WebContentPage::did_complete_navigation_unload_check(Web::HTML::CrossProces
 
 void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Optional<Web::HTML::NavigationPopulationResult> result)
 {
+    if (result.has_value() && NavigationLoader::response_body_belongs_to_another_process(*result, client())) {
+        client().did_misbehave("did_finish_navigation_params_creation"sv, "response body fetched by another process"sv);
+        return;
+    }
+
     auto navigable = population_worker_navigable(navigable_id);
     if (!navigable.has_value()) {
         if (result.has_value())
-            NavigationLoader::discard(client().is_private(), *result);
+            NavigationLoader::discard(client(), *result);
         return;
     }
 
@@ -2668,7 +2689,7 @@ void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProce
     auto* creating = ongoing_navigation ? ongoing_navigation->state.get_pointer<CanonicalNavigation::CreatingNavigationParams>() : nullptr;
     if (!creating || ongoing_navigation->worker() != this) {
         if (result.has_value())
-            NavigationLoader::discard(client().is_private(), *result);
+            NavigationLoader::discard(client(), *result);
         return;
     }
 
@@ -2682,17 +2703,18 @@ void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProce
     auto loader = move(creating->loader);
     ongoing_navigation->state = CanonicalNavigation::AcquiringResponseBody { move(loader) };
     NonnullRefPtr acquiring_loader = *ongoing_navigation->loader();
+    acquiring_loader->refuse_made_up_local_file_urls(client(), *result);
     acquiring_loader->did_finish_navigation_params_creation(result.release_value());
     if (ongoing_navigation->history_entry->update_from_descriptor(Web::HTML::create_session_history_entry_descriptor(acquiring_loader->request().history_entry, 0)).is_error()) {
         auto rejected_result = acquiring_loader->take_result();
-        NavigationLoader::discard(client().is_private(), rejected_result);
+        NavigationLoader::discard(client(), rejected_result);
         navigable->did_cancel_navigation(navigation_id);
         client().did_misbehave("did_finish_navigation_params_creation"sv, "replacement document state forms a cycle"sv);
         return;
     }
     ongoing_navigation->url = ongoing_navigation->history_entry->url;
 
-    acquiring_loader->acquire_response_body([page = NonnullRefPtr<WebContentPage>(*this), navigable_id, navigation_id = move(navigation_id)](bool succeeded) {
+    acquiring_loader->acquire_response_body(client(), [page = NonnullRefPtr<WebContentPage>(*this), navigable_id, navigation_id = move(navigation_id)](bool succeeded) {
         // The page may have closed while the body was fetched; its navigation then has nothing left to finish.
         if (!page->is_open())
             return;
@@ -2705,6 +2727,11 @@ void WebContentPage::did_finish_navigation_params_creation(Web::HTML::CrossProce
 
 void WebContentPage::did_finish_history_navigation_params_creation(Web::HTML::CrossProcessId operation_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::NavigationPopulationResult result)
 {
+    if (NavigationLoader::response_body_belongs_to_another_process(result, client())) {
+        client().did_misbehave("did_finish_history_navigation_params_creation"sv, "response body fetched by another process"sv);
+        return;
+    }
+
     auto& host = this->traversable();
     host.top_level_traversable().did_finish_history_navigation_params_creation(*this, operation_id, navigable_id, move(result));
 }
@@ -2851,9 +2878,17 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
     // identifiers preserve the original RequestServer transfer lease, so only the process and navigation that
     // received that response may claim it, and only while its population is in flight.
     FileDownloader::ResponseFinished on_response_finished;
-    bool matches_in_flight_navigation = false;
+    Optional<int> owner_client_id;
     if (auto navigable = traversable().top_level_traversable().find(navigable_id); navigable.has_value()) {
         auto ongoing_navigation = navigation_id.has_value() ? navigable->navigation_with_id(*navigation_id) : nullptr;
+        bool names_in_flight_response_body = ongoing_navigation
+            && ongoing_navigation->state.has<CanonicalNavigation::Populating>()
+            && ongoing_navigation->loader()->response_body_matches(request_server_client_id, request_server_request_id);
+        if (names_in_flight_response_body && ongoing_navigation->loader()->response_body_was_handed_to_another_process(client())) {
+            client().did_misbehave("did_start_download"sv, "response body handed to another process"sv);
+            return { Optional<u64> {} };
+        }
+
         bool owns_navigation = ongoing_navigation
             && ((ongoing_navigation->state.has<CanonicalNavigation::CreatingNavigationParams>() && ongoing_navigation->worker() == this)
                 || (ongoing_navigation->state.has<CanonicalNavigation::Populating>() && ongoing_navigation->host() == this));
@@ -2874,12 +2909,12 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
                         timing, error);
             };
         }
-        if (owns_navigation && ongoing_navigation->loader()->response_body_matches(request_server_client_id, request_server_request_id)) {
-            matches_in_flight_navigation = true;
+        if (owns_navigation && names_in_flight_response_body) {
+            owner_client_id = ongoing_navigation->loader()->response_body_adopter_client_id();
             navigable->did_cancel_navigation(*navigation_id);
         }
     }
-    if (!matches_in_flight_navigation) {
+    if (!owner_client_id.has_value()) {
         if (on_response_finished)
             on_response_finished(
                 0, nullptr,
@@ -2896,7 +2931,7 @@ Messages::WebContentClient::DidStartDownloadResponse WebContentPage::did_start_d
     }
 
     auto& file_downloader = Application::the().file_downloader();
-    auto download_id = file_downloader.adopt_download(client().is_private(), url, destination.release_value(), total_size, same_site_context, request_server_client_id, request_server_request_id, initial_data.bytes(),
+    auto download_id = file_downloader.adopt_download(client().is_private(), url, destination.release_value(), total_size, same_site_context, request_server_client_id, request_server_request_id, *owner_client_id, initial_data.bytes(),
         move(on_response_finished));
     if (!is_download_in_progress(file_downloader, download_id))
         return { Optional<u64> {} };

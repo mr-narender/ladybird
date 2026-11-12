@@ -36,6 +36,12 @@ pub(crate) struct HostFindings {
     pub(crate) container_length_reads: Vec<ContainerLengthRead>,
 }
 
+/// What a run found out besides its result, which the run that takes in its result receives with it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RunResidue {
+    pub(crate) host_findings: HostFindings,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ContainerLengthRead {
     pub(crate) reader: NodeSlotId,
@@ -216,6 +222,8 @@ pub(crate) struct RunState {
     /// What the run found out for the host so far, which the pass the run is handed notes into.
     host_findings: HostFindingsSink,
     fragments: Option<fragment_tree::RunFragmentBuilder>,
+    /// For the run of a fragmentainer, what it found out so far about breaking in it.
+    fragmentainer_outcome: RefCell<super::fragmentation::FragmentainerOutcome>,
 }
 
 /// Where a box is placed: the offset of its content box in the containing block it is placed in.
@@ -245,12 +253,17 @@ pub(crate) struct FactsDecidedByParent {
 }
 
 impl FactsDecidedByParent {
-    /// What the parent decided about a box, as the committed link of the box shows it in the frame of the link.
-    pub(crate) fn of_committed_link(link: &fragment_tree::FragmentLink) -> Self {
-        let insets = link.placement.insets;
+    /// What the parent decided about a box, as the committed link of the box shows it, read in `frame`, where the
+    /// content box of the box's containing block has the physical size `containing_block_size`.
+    pub(crate) fn of_committed_link(
+        link: &fragment_tree::FragmentLink,
+        frame: geometry::Frame,
+        containing_block_size: FfiCssPixelSize,
+    ) -> Self {
+        let insets = link.placement.insets.in_frame(geometry::Frame::PHYSICAL, frame);
         Self {
             placement: Some(BoxPlacement {
-                content_offset_in_containing_block: link.committed_offset,
+                content_offset_in_containing_block: link.offset_in_frame(frame, containing_block_size),
                 containing_block: link.placement.containing_block,
             }),
             used_insets: UsedInsets {
@@ -264,31 +277,6 @@ impl FactsDecidedByParent {
                 show: link.placement.shown_as.facts,
                 breaks: fragment_tree::BreakFacts::default(),
             },
-        }
-    }
-}
-
-/// What the parent of a box laid out by a run of its own keeps of the box once that run returns: its sizes, size
-/// constraints and box sides in the parent's frame, its baselines, and the lines the run laid out in it.
-#[derive(Clone)]
-pub(crate) struct LaidOutChildBox {
-    pub(crate) cells: used_values::RootInputCells,
-    pub(crate) baselines: DerivedBaselines,
-    /// For a box that establishes an orthogonal flow, its baselines along the horizontal axis of the parent's frame.
-    pub(crate) orthogonal_flow_baselines: Option<DerivedBaselines>,
-    pub(crate) line_data: Option<std::sync::Arc<inline_content::InlineContent>>,
-}
-
-impl LaidOutChildBox {
-    /// A child as the run of its parent left it in `cells`, with the `baselines` of its contents, where that run
-    /// sizes the child itself instead of handing it to a run of its own.
-    pub(crate) fn sized_here(cells: used_values::RootInputCells, baselines: DerivedBaselines) -> Self {
-        Self {
-            cells,
-            baselines,
-            // NB: A box that establishes an orthogonal flow is laid out by a run of its own.
-            orthogonal_flow_baselines: None,
-            line_data: None,
         }
     }
 }
@@ -431,12 +419,24 @@ impl RunState {
             root_anchor_resolved_values,
             host_findings: HostFindingsSink::default(),
             fragments,
+            fragmentainer_outcome: RefCell::default(),
         };
         run(&state, pass.for_run(root, root_containing_block, &state.host_findings))
     }
 
     pub(crate) fn fragments(&self) -> Option<&fragment_tree::RunFragmentBuilder> {
         self.fragments.as_ref()
+    }
+
+    /// Where the run of a fragmentainer keeps what it found out so far about breaking in it.
+    pub(crate) fn fragmentainer_outcome(&self) -> &RefCell<super::fragmentation::FragmentainerOutcome> {
+        &self.fragmentainer_outcome
+    }
+
+    /// What this run found out besides its result, which the result carries to the run that takes it in.
+    pub(crate) fn take_residue(&self) -> Option<Box<RunResidue>> {
+        let host_findings = self.host_findings.take();
+        (!host_findings.is_empty()).then(|| Box::new(RunResidue { host_findings }))
     }
 
     /// What this run found out for the host, which its outputs carry to the run that uses its result.

@@ -150,6 +150,22 @@ impl BlockContainer {
     }
 }
 
+/// A box as its layout left it, in the cells this flow keeps of it, with the baselines of its contents.
+#[derive(Clone, Copy)]
+pub(crate) struct LaidOutBox {
+    pub(crate) cells: used_values::RootInputCells,
+    pub(crate) baselines: DerivedBaselines,
+}
+
+impl LaidOutBox {
+    fn of_layout(layout: &formatting_context::ChildLayout) -> Self {
+        Self {
+            cells: layout.cells(),
+            baselines: layout.baselines(),
+        }
+    }
+}
+
 /// What the layout of a block-level box the parent flow holds leaves for its outcome.
 struct LaidOutBlockLevelBox {
     broken_inside: Option<BrokenInside>,
@@ -157,7 +173,7 @@ struct LaidOutBlockLevelBox {
     collapses_through: bool,
     /// The box as its layout left it: as a run of its own handed it back, or as this flow laid it out in cells its
     /// layout owns.
-    laid_out_box: run_state::LaidOutChildBox,
+    laid_out_box: LaidOutBox,
     /// What this flow decided the box's fragment shows of it.
     fragment_facts: run_state::FragmentFactsDecidedByParent,
     /// The offset of the content box in the containing block, where this flow placed the box.
@@ -170,10 +186,7 @@ struct LaidOutBlockLevelBox {
 impl LaidOutBlockLevelBox {
     /// A box laid out as `laid_out_box` with `fragment_facts`, which neither broke inside nor let margins collapse
     /// through it, and which this flow did not place.
-    fn of_box(
-        laid_out_box: run_state::LaidOutChildBox,
-        fragment_facts: run_state::FragmentFactsDecidedByParent,
-    ) -> Self {
+    fn of_box(laid_out_box: LaidOutBox, fragment_facts: run_state::FragmentFactsDecidedByParent) -> Self {
         Self {
             broken_inside: None,
             has_unbreakable_lines: false,
@@ -209,7 +222,7 @@ struct UnplacedBlockLevelBox {
     fragment_arrival_of_child_with_own_formatting_context: Option<fragment_tree::RunRootFragment>,
     summary_of_children_laid_out_in_this_flow: Option<ChildrenSummary>,
     baselines_of_contents_laid_out_in_this_flow: Option<DerivedBaselines>,
-    laid_out_box_handed_back_by_its_run: Option<run_state::LaidOutChildBox>,
+    laid_out_box_handed_back_by_its_run: Option<LaidOutBox>,
     own_top_margin_group_of_contents: Option<TopMarginGroup>,
     depends_on_percentage_block_size: bool,
     has_unbreakable_lines: bool,
@@ -233,7 +246,7 @@ pub(crate) struct FloatLaidOutAheadOfItsPosition {
     node: Node,
     placed_float: formatting_context::PlacedChild,
     pub(crate) cells: used_values::RootInputCells,
-    laid_out_float_handed_back_by_its_run: Option<run_state::LaidOutChildBox>,
+    laid_out_float_handed_back_by_its_run: Option<LaidOutBox>,
     fragment_arrival: Option<fragment_tree::RunRootFragment>,
 }
 
@@ -773,16 +786,15 @@ fn lay_out_in_flow_child_ahead(pass: LayoutPass<'_>, job: InFlowChildJob) -> Opt
         None,
         Some(fragments),
         |state, pass| {
-            let run = FormattingContextRun {
+            let run = FormattingContextRun::new(
                 state,
-                box_: run_root,
+                run_root,
                 pass,
-                should_collect_devtools_layout_data: false,
+                formatting_context::RunMode::Commit { devtools: false },
                 treat_block_axis_percentage_insets_as_auto_beyond_root,
-                fragments: state.fragments(),
-                fragmentainer: None,
-            };
-            let flow = BlockFormattingContext::new(&run, root_cells, None);
+                None,
+            );
+            let flow = BlockFormattingContext::new(&run, root_cells, None, None);
             flow.block_offset_of_current_block_container
                 .set(Some(CssPixels::default()));
             let containing_block_position_in_root = FfiCssPixelPoint {
@@ -814,9 +826,11 @@ fn lay_out_in_flow_child_ahead(pass: LayoutPass<'_>, job: InFlowChildJob) -> Opt
                 outcome.content_offset,
                 containing_block_position_in_root,
             );
-            let root = fragments
-                .take_run_contents(&run.pass)
-                .into_run_root_fragment(&run.pass, outcome.geometry);
+            let root = fragments.take_run_contents(&run.pass).into_run_root_fragment(
+                &run.pass,
+                outcome.geometry,
+                fragment_tree::PendingPayload::default(),
+            );
             let entry = in_flow_block_cache::InFlowBlockEntry {
                 key,
                 validity,
@@ -991,16 +1005,15 @@ impl OutsideMarkerLine {
 /// An outside marker laid out before the contents of its list item, which is placed once they are laid out.
 struct LaidOutOutsideMarker {
     marker: Node,
-    laid_out_box: run_state::LaidOutChildBox,
-    fragment_arrival: Option<fragment_tree::RunRootFragment>,
+    layout: formatting_context::ChildLayout,
 }
 
 impl LaidOutOutsideMarker {
     fn line(&self) -> Option<OutsideMarkerLine> {
-        let baseline = self.laid_out_box.baselines.first?;
+        let baseline = self.layout.baselines().first?;
         Some(OutsideMarkerLine {
             ascent: baseline,
-            descent: self.laid_out_box.cells.content_block_size() - baseline,
+            descent: self.layout.cells().content_block_size() - baseline,
         })
     }
 }
@@ -1036,7 +1049,7 @@ pub(crate) struct BlockFormattingContext<'pass> {
     table_box_in_wrapper_border_box_block_size: Cell<Option<CssPixels>>,
     /// The inline layout of the table box inside a table wrapper child, as sizing the wrapper last found it, which the
     /// child's run can reuse.
-    table_inline_layout_of_child: Cell<Option<(Node, table_formatting_context::TableInlineLayout)>>,
+    table_inline_layout_of_child: Cell<Option<(Node, std::sync::Arc<table_formatting_context::TableInlineLayout>)>>,
     is_line_clamp_container: bool,
     clamped_content_is_scrollable_overflow: bool,
     max_lines: Cell<Option<usize>>,
@@ -1057,6 +1070,8 @@ pub(crate) struct BlockFormattingContext<'pass> {
     root_lines: RefCell<used_values::LineDataState>,
     column_early_breaks: RefCell<ColumnEarlyBreaks>,
     multicol_automatic_content_block_size: Cell<Option<CssPixels>>,
+    /// The columns of a multi-column root, which its fragment shows.
+    multicol_layout_data: Cell<Option<std::sync::Arc<fragmentation::MulticolLayoutData>>>,
     discard_block_start_margin_of_next_child: Cell<bool>,
     fragmentainer_has_content: Cell<bool>,
     propagated_break_values: RefCell<HashMap<(Node, bool), u8>>,
@@ -1148,22 +1163,61 @@ pub(crate) fn aligns_content_in_block_axis(facts: &NodeFacts<'_>) -> bool {
 }
 
 pub(crate) fn content_alignment_offset(style: ComputedValuesView<'_>, free_space: CssPixels) -> CssPixels {
-    let (keyword, safety) = box_alignment::ContentKeyword::align_content_of(style);
-    // https://drafts.csswg.org/css-align-3/#baseline-values
-    // The fallback alignment for last baseline is safe end.
-    let keyword = if style.align_content_is_last_baseline() {
-        box_alignment::ContentKeyword::End
-    } else {
-        keyword
-    };
-    // https://drafts.csswg.org/css-align-3/#distribution-block
-    // If a <content-distribution> is specified its fallback alignment is used instead.
     // https://drafts.csswg.org/css-align-3/#auto-safety
     // UAs that have not implemented the “smart” default behavior must behave as safe for align-content on block
     // containers and unsafe otherwise.
-    keyword
-        .resolve(safety, box_alignment::AxisDirections::of(true, None))
-        .offset(free_space, box_alignment::OverflowSafety::Safe)
+    box_alignment::block_container_content_alignment(style).offset(free_space, box_alignment::OverflowSafety::Safe)
+}
+
+impl<'pass> formatting_context::FormattingContextAlgorithm<'pass> for BlockFormattingContext<'pass> {
+    fn lay_out(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        input: formatting_context::AlgorithmInput<'_>,
+    ) -> formatting_context::AlgorithmOutput {
+        self.lay_out_root_contents(run, input.body_input);
+        let laid_out_content_block_size = self.block_size_of_contents(false);
+        let mut result = formatting_context::ChildLayoutResult {
+            automatic_content_block_size: self.automatic_content_block_size(),
+            automatic_line_clamp_max_lines: self
+                .automatic_line_clamp_max_lines()
+                .map(|lines| u32::try_from(lines).unwrap_or(u32::MAX)),
+            baselines: self.derived_baselines_of_root_box(),
+            table_wrapper_content_inline_size: self.table_box_in_wrapper_border_box_inline_size.get(),
+            table_box_in_wrapper_border_box_block_size: self.table_box_in_wrapper_border_box_block_size.get(),
+            ..formatting_context::ChildLayoutResult::default()
+        };
+        let mut root_cells = input.root_cells;
+        let mut root_payload = fragment_tree::PendingPayload::default();
+        if let Some(multicol_layout_data) = self.multicol_layout_data.take() {
+            root_payload.set(fragment_tree::FcPayload::Multicol(multicol_layout_data));
+        }
+        let has_line_clamp_point = self.line_clamp_point_found.get();
+        if has_line_clamp_point || self.clamped_content_is_scrollable_overflow {
+            root_payload.line_clamp = fragment_tree::LineClampFacts {
+                has_line_clamp_point,
+                clamped_content_is_scrollable_overflow: self.clamped_content_is_scrollable_overflow,
+            };
+        }
+        // https://w3c.github.io/mathml-core/#layout-of-operators
+        // NB: An operator lays out its text in a block formatting context, unless it is drawn with a stretched or large
+        //     glyph.
+        if self.facts(run.box_).display().is_math_inside()
+            && let Some(paint_data) =
+                math_formatting_context::layout_operator(run, input.root_input, &mut result, &mut root_cells)
+        {
+            root_payload.set(fragment_tree::FcPayload::Math(paint_data));
+        }
+        formatting_context::AlgorithmOutput {
+            result,
+            root_cells,
+            // NB: The lines are taken after the last read of the automatic content block size, which reads the last of
+            //     them.
+            root_lines: std::mem::take(&mut *self.root_lines.borrow_mut()),
+            laid_out_content_block_size: Some(laid_out_content_block_size),
+            root_payload,
+        }
+    }
 }
 
 impl<'pass> BlockFormattingContext<'pass> {
@@ -1171,6 +1225,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         run: &FormattingContextRun<'pass>,
         root_cells: used_values::RootInputCells,
         previous_line_data: Option<std::sync::Arc<inline_content::InlineContent>>,
+        inline_layout_of_child_table_box: Option<std::sync::Arc<table_formatting_context::TableInlineLayout>>,
     ) -> Self {
         let style = StyleValues::for_node(&run.pass, run.box_);
         let computed_continue = style.continue_();
@@ -1199,7 +1254,10 @@ impl<'pass> BlockFormattingContext<'pass> {
             trailing_collapsed_margin: Cell::new(None),
             table_box_in_wrapper_border_box_inline_size: Cell::new(None),
             table_box_in_wrapper_border_box_block_size: Cell::new(None),
-            table_inline_layout_of_child: Cell::new(None),
+            // NB: A table wrapper's run hands the inline layout of its table box on to the run of that box.
+            table_inline_layout_of_child: Cell::new(
+                inline_layout_of_child_table_box.map(|layout| (layout.table_box(), layout)),
+            ),
             is_line_clamp_container,
             clamped_content_is_scrollable_overflow,
             // NB: Measurements at a definite inline size need the clamped block size, just like committed layout.
@@ -1223,6 +1281,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             root_lines: RefCell::new(used_values::LineDataState::Empty),
             column_early_breaks: RefCell::new(ColumnEarlyBreaks::default()),
             multicol_automatic_content_block_size: Cell::new(None),
+            multicol_layout_data: Cell::new(None),
             discard_block_start_margin_of_next_child: Cell::new(false),
             fragmentainer_has_content: Cell::new(false),
             propagated_break_values: RefCell::new(HashMap::default()),
@@ -1289,10 +1348,6 @@ impl<'pass> BlockFormattingContext<'pass> {
         reached && !self.laying_out_invisible_line_clamp_content.get()
     }
 
-    pub(crate) fn table_box_in_wrapper_border_box_block_size(&self) -> Option<CssPixels> {
-        self.table_box_in_wrapper_border_box_block_size.get()
-    }
-
     #[inline]
     fn facts(&self, node: Node) -> NodeFacts<'_> {
         NodeFacts::new(&self.run.pass, node)
@@ -1304,15 +1359,16 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     /// Keeps `layout`, the inline layout of the table box inside `child`, for the run of `child`.
-    pub(crate) fn keep_table_inline_layout_of(&self, child: Node, layout: table_formatting_context::TableInlineLayout) {
-        self.table_inline_layout_of_child.set(Some((child, layout)));
+    fn keep_table_inline_layout_of(&self, child: Node, layout: table_formatting_context::TableInlineLayout) {
+        self.table_inline_layout_of_child
+            .set(Some((child, std::sync::Arc::new(layout))));
     }
 
     /// The inline layout of the table box inside `child` this formatting context keeps for the run of `child`, if any.
     pub(crate) fn take_table_inline_layout_of(
         &self,
         child: Node,
-    ) -> Option<table_formatting_context::TableInlineLayout> {
+    ) -> Option<std::sync::Arc<table_formatting_context::TableInlineLayout>> {
         take_table_inline_layout_kept_for(&self.table_inline_layout_of_child, child)
     }
 
@@ -1521,14 +1577,8 @@ impl<'pass> BlockFormattingContext<'pass> {
         self.derived_baselines_of_root_box.set(baselines);
     }
 
-    pub(crate) fn derived_baselines_of_root_box(&self) -> DerivedBaselines {
+    fn derived_baselines_of_root_box(&self) -> DerivedBaselines {
         self.derived_baselines_of_root_box.get()
-    }
-
-    /// Takes the lines laid out in the run's root, which the run finishes. Call this after the last read of
-    /// `automatic_content_block_size`, which reads the last of these lines.
-    pub(crate) fn take_root_lines(&self) -> used_values::LineDataState {
-        std::mem::take(&mut *self.root_lines.borrow_mut())
     }
 
     /// Resolves the insets of `node`, an in-flow child of `block_container`, keeps them for the box and returns them.
@@ -2994,11 +3044,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             inline_size: AvailableSize::definite(max_content_inline_size),
             block_size: AvailableSize::Indefinite,
         };
-        let formatting_context::ChildLayout {
-            outcome: marker_outcome,
-            fragment_arrival,
-            laid_out_box: marker_box,
-        } = formatting_context::layout_inside_child_with_input_cells(
+        let layout = formatting_context::layout_inside_child_with_input_cells(
             run,
             None,
             None,
@@ -3013,15 +3059,12 @@ impl<'pass> BlockFormattingContext<'pass> {
                 participation: ParticipationInParentFormattingContext::Item,
             },
             marker_cells,
+            None,
             true,
             list_item.percentage_block_insets_have_definite_basis,
         );
-        marker_outcome.report_percentage_block_size_dependency_of(run, marker);
-        Some(LaidOutOutsideMarker {
-            marker,
-            laid_out_box: marker_box,
-            fragment_arrival,
-        })
+        layout.report_percentage_block_size_dependency_of(run, marker);
+        Some(LaidOutOutsideMarker { marker, layout })
     }
 
     /// Places the outside `marker` of `list_item`, and returns the block end of the marker's border box in the list
@@ -3034,13 +3077,9 @@ impl<'pass> BlockFormattingContext<'pass> {
         list_item_first_baseline: Option<CssPixels>,
     ) -> CssPixels {
         let marker_line = marker.line();
-        let LaidOutOutsideMarker {
-            marker,
-            laid_out_box: marker_box,
-            fragment_arrival,
-        } = marker;
+        let LaidOutOutsideMarker { marker, layout } = marker;
         let marker_style = self.style(marker);
-        let marker_metrics = marker_box.cells;
+        let marker_metrics = layout.cells();
         let marker_block_size = marker_metrics.content_block_size();
         let marker_inline_size = marker_metrics.content_inline_size();
         let list_item_style = self.style(list_item.node);
@@ -3059,7 +3098,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 - inline_space_used_before_list_item_elements_formatted.right
         };
         let marker_block_offset = if let Some(list_item_first_baseline) = list_item_first_baseline
-            && let Some(marker_first_baseline) = marker_box.baselines.first
+            && let Some(marker_first_baseline) = layout.baselines().first
         {
             list_item_first_baseline - marker_first_baseline
         } else if let Some(marker_line) = marker_line {
@@ -3075,21 +3114,20 @@ impl<'pass> BlockFormattingContext<'pass> {
         formatting_context::place_child(
             &self.run,
             marker,
-            formatting_context::PlacedChild::of_laid_out_box(&marker_box),
+            layout.placed_child(),
             FfiCssPixelPoint {
                 x: round_css_pixels(marker_inline_offset),
                 y: marker_block_offset,
             },
             None,
-            fragment_arrival,
+            layout.into_fragment_arrival(&self.run),
         );
         marker_block_offset
             + marker_block_size
             + marker_metrics.border_box_bottom(marker_metrics.uses_collapsing_borders_model())
     }
 
-    /// Lays out the contents of `node`, a child with a formatting context of its own, and returns its result where a
-    /// run of its own laid it out, the fragments its placement takes, and the child's box as its layout left it.
+    /// Lays out the contents of `node`, a child with a formatting context of its own, and returns its layout.
     fn layout_inside(
         &self,
         run: &FormattingContextRun<'pass>,
@@ -3097,31 +3135,20 @@ impl<'pass> BlockFormattingContext<'pass> {
         block_container: BlockContainer,
         input: LayoutInput,
         force_independent_context_run: bool,
-    ) -> (
-        Option<formatting_context::ChildLayoutResult>,
-        Option<fragment_tree::RunRootFragment>,
-        run_state::LaidOutChildBox,
-    ) {
-        let formatting_context::ChildLayout {
-            outcome,
-            fragment_arrival,
-            laid_out_box,
-        } = formatting_context::layout_inside_child_with_input_cells(
+    ) -> formatting_context::ChildLayout {
+        let layout = formatting_context::layout_inside_child_with_input_cells(
             run,
             Some(self),
             None,
             sized_child.node,
             input,
             self.metrics_of(sized_child),
+            self.take_table_inline_layout_of(sized_child.node),
             force_independent_context_run,
             block_container.percentage_block_insets_have_definite_basis,
         );
-        outcome.report_percentage_block_size_dependency_of(run, sized_child.node);
-        let child_layout = match outcome {
-            ChildLayoutOutcome::Skipped { .. } => None,
-            ChildLayoutOutcome::Created(child_layout) => Some(child_layout),
-        };
-        (child_layout, fragment_arrival, laid_out_box)
+        layout.report_percentage_block_size_dependency_of(run, sized_child.node);
+        layout
     }
 
     fn child_layout_input(
@@ -3709,14 +3736,14 @@ impl<'pass> BlockFormattingContext<'pass> {
                 let metrics = self.metrics_of(sized_child);
                 (metrics.border_box_left(false), metrics.border_box_top(false))
             });
-            let (child_layout, fragment_arrival, laid_out_box) =
-                self.layout_inside(run, sized_child, block_container, inside_layout_input, true);
+            let layout = self.layout_inside(run, sized_child, block_container, inside_layout_input, true);
             assert!(
-                child_layout.is_some(),
+                layout.result().is_some(),
                 "a block-level box with a formatting context of its own is laid out by its run"
             );
-            fragment_arrival_of_child_with_own_formatting_context = fragment_arrival;
-            child_handed_back_by_its_run = Some(formatting_context::PlacedChild::of_laid_out_box(&laid_out_box));
+            let laid_out_box = LaidOutBox::of_layout(&layout);
+            child_handed_back_by_its_run = Some(layout.placed_child());
+            fragment_arrival_of_child_with_own_formatting_context = layout.into_fragment_arrival(run);
             let table_box = laid_out_box.cells;
             laid_out_box_handed_back_by_its_run = Some(laid_out_box);
             if container_facts.is_table_wrapper() && style.display().is_table_inside() {
@@ -3880,7 +3907,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             .as_ref()
             .is_some_and(ChildrenSummary::has_unbreakable_lines);
         let mut broken_token_of_box = None;
-        if let Some(fragmentainer) = self.run.fragmentainer.as_deref() {
+        if let Some(fragmentainer) = self.run.fragmentainer.as_ref() {
             let content_block_start_in_root = pending_position.map(|position| {
                 containing_block_position_in_root.y
                     + self.block_offset_adjustment_from_pending_ancestor_block_start_margins(node)
@@ -4230,17 +4257,14 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     /// The box `child` as this flow laid it out in cells its layout owns, with the `baselines` of its contents.
-    fn laid_out_box_of_box_laid_out_here(
-        child: ChildSizedHere<'_>,
-        baselines: DerivedBaselines,
-    ) -> run_state::LaidOutChildBox {
-        run_state::LaidOutChildBox::sized_here(
-            child
+    fn laid_out_box_of_box_laid_out_here(child: ChildSizedHere<'_>, baselines: DerivedBaselines) -> LaidOutBox {
+        LaidOutBox {
+            cells: child
                 .cells_laid_out_here()
                 .expect("a box laid out in this flow is laid out in cells its layout owns")
                 .get(),
             baselines,
-        )
+        }
     }
 
     /// Whether the layout of an in-flow child can be stored and reused by `InFlowBlockKey`, and where its position in
@@ -4285,8 +4309,7 @@ impl<'pass> BlockFormattingContext<'pass> {
     ) -> bool {
         let facts = self.facts(node);
         let container_facts = self.facts(block_container);
-        !self.run.pass.reads_no_memoized_layout()
-            && !self.run.should_collect_devtools_layout_data
+        !self.run.collects_devtools_layout_data()
             && containing_line_box_fragment.is_none()
             && !self.is_line_clamp_container
             && self.max_lines.get().is_none()
@@ -4333,12 +4356,11 @@ impl<'pass> BlockFormattingContext<'pass> {
         std::sync::Arc<fragment_tree::Fragment>,
     )> {
         let pass = &self.run.pass;
+        let store = pass.in_flow_block_cache_store()?;
         pass.arena()
             .with_current_committed_fragment(node, |fragment| fragment.clone())
             .and_then(|fragment| {
-                let entry =
-                    pass.in_flow_block_cache_store()
-                        .matching(node.slot_index(), validity, key, fragment.identity)?;
+                let entry = store.matching(node.slot_index(), validity, key, fragment.identity)?;
                 Some((entry, fragment))
             })
     }
@@ -4354,8 +4376,11 @@ impl<'pass> BlockFormattingContext<'pass> {
         containing_block_position_in_root: FfiCssPixelPoint,
         continues_from_previous_fragment: bool,
     ) -> InFlowReuse {
-        if let Some(fragmentainer) = self.run.fragmentainer.as_deref() {
-            if continues_from_previous_fragment
+        if let Some(fragmentainer) = self.run.fragmentainer.as_ref() {
+            // NB: A discarded run lays out every column afresh, so that the verification checks the column box layouts
+            //     the run reuses.
+            if self.run.pass.is_discarded_run()
+                || continues_from_previous_fragment
                 || !self.in_flow_child_reads_only_its_key_and_floats_in_any_run(
                     node,
                     block_container,
@@ -4388,7 +4413,9 @@ impl<'pass> BlockFormattingContext<'pass> {
                     fragment: layout.fragment.clone(),
                 });
         }
-        if !self.in_flow_child_may_be_reused(node, block_container, containing_line_box_fragment) {
+        if self.run.pass.in_flow_block_cache_store().is_none()
+            || !self.in_flow_child_may_be_reused(node, block_container, containing_line_box_fragment)
+        {
             return InFlowReuse::Ineligible;
         }
         let pass = &self.run.pass;
@@ -4433,7 +4460,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         &self,
         node: Node,
         block_container: Node,
-        fragmentainer: &fragmentation::FragmentainerContext,
+        fragmentainer: &fragmentation::Fragmentainer<'_>,
         layout: &fragmentation::ColumnBoxLayout,
         containing_block_position_in_root: FfiCssPixelPoint,
     ) -> bool {
@@ -4819,7 +4846,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             depends_on_percentage_block_size,
             fragment_identity: placed.fragment.identity,
         };
-        if let Some(fragmentainer) = self.run.fragmentainer.as_deref() {
+        if let Some(fragmentainer) = self.run.fragmentainer.as_ref() {
             if broke_inside || in_open_top_margin_group {
                 return;
             }
@@ -4842,11 +4869,10 @@ impl<'pass> BlockFormattingContext<'pass> {
             );
             return;
         }
-        let committed_identity = arena.with_current_committed_fragment(node, |fragment| fragment.identity);
-        self.run
-            .pass
-            .in_flow_block_cache_store()
-            .store(node.slot_index(), entry, committed_identity);
+        if let Some(store) = self.run.pass.in_flow_block_cache_store() {
+            let committed_identity = arena.with_current_committed_fragment(node, |fragment| fragment.identity);
+            store.store(node.slot_index(), entry, committed_identity);
+        }
     }
 
     /// Whether a float placed so far reaches below `block_offset` in `block_container`.
@@ -4936,11 +4962,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         );
         Some(formatting_context::ChildRunShape {
             node: child,
-            key: fc_run_cache::FcRunCacheKey {
-                fc_type: plan.fc_type,
-                input: plan.input,
-                root_cells: cells.get(),
-            },
+            key: fc_run_cache::LayoutRequest::new(&self.run.pass, plan.fc_type, plan.input, cells.get()),
             root_containing_block: plan.root_containing_block,
         })
     }
@@ -4997,7 +5019,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         let pass = self.run.pass;
         if pass.lays_out_with_position_option()
             || self.run.fragments.is_none()
-            || self.run.should_collect_devtools_layout_data
+            || self.run.collects_devtools_layout_data()
             || self.is_line_clamp_container
             || self.max_lines.get().is_some()
             || self.facts(block_container.node).is_fieldset_box()
@@ -5138,6 +5160,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             == abspos_containing_block_info_contributions_received
             && self.run.pass.host_findings_noted_so_far() == host_findings_noted_so_far
             && let Some(placed) = reused.placed.as_ref().filter(|placed| !placed.exports_payloads)
+            && let Some(store) = self.run.pass.in_flow_block_cache_store()
         {
             entry.fragment_identity = placed.fragment.identity;
             entry.floats_read_by_contents.margins_before_box = margins_before_box;
@@ -5148,10 +5171,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 .pass
                 .arena()
                 .with_current_committed_fragment(node, |fragment| fragment.identity);
-            self.run
-                .pass
-                .in_flow_block_cache_store()
-                .store(node.slot_index(), entry, committed_identity);
+            store.store(node.slot_index(), entry, committed_identity);
         }
         Some(LaidOutBlockLevelBox {
             content_offset: Some(reused.content_offset),
@@ -5183,9 +5203,8 @@ impl<'pass> BlockFormattingContext<'pass> {
         let fragmentainer = self
             .run
             .fragmentainer
-            .clone()
             .filter(|_| self.break_mode.get() != BreakMode::NoBreaks);
-        let mut fragmentation_state = fragmentainer.as_deref().map(|fragmentainer| {
+        let mut fragmentation_state = fragmentainer.as_ref().map(|fragmentainer| {
             let incoming = if block_container.node == self.run.box_ {
                 fragmentainer.incoming.clone()
             } else {
@@ -5213,7 +5232,7 @@ impl<'pass> BlockFormattingContext<'pass> {
             .siblings_from(first_child, Node::INVALID)
             .filter(|&child| self.facts(child).is_box())
         {
-            if let (Some(fragmentainer), Some(state)) = (fragmentainer.as_deref(), fragmentation_state.as_mut()) {
+            if let (Some(fragmentainer), Some(state)) = (fragmentainer.as_ref(), fragmentation_state.as_mut()) {
                 match self.fragmentation_step_before_child(fragmentainer, state, block_container.node, child) {
                     FragmentationStep::Stop => break,
                     FragmentationStep::LayOut => {}
@@ -5253,7 +5272,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 self.laying_out_invisible_line_clamp_content.set(false);
             }
             self.fold_in_child(&mut summary, block_container.node, child, outcome.as_ref());
-            if let (Some(fragmentainer), Some(state)) = (fragmentainer.as_deref(), fragmentation_state.as_mut())
+            if let (Some(fragmentainer), Some(state)) = (fragmentainer.as_ref(), fragmentation_state.as_mut())
                 && self.fragmentation_step_after_child(
                     fragmentainer,
                     state,
@@ -5272,7 +5291,7 @@ impl<'pass> BlockFormattingContext<'pass> {
 
     fn fragmentation_step_before_child(
         &self,
-        fragmentainer: &fragmentation::FragmentainerContext,
+        fragmentainer: &fragmentation::Fragmentainer<'_>,
         state: &mut FragmentationState,
         block_container: Node,
         child: Node,
@@ -5333,7 +5352,7 @@ impl<'pass> BlockFormattingContext<'pass> {
 
     fn fragmentation_step_after_child(
         &self,
-        fragmentainer: &fragmentation::FragmentainerContext,
+        fragmentainer: &fragmentation::Fragmentainer<'_>,
         state: &mut FragmentationState,
         block_container: Node,
         child: Node,
@@ -5558,7 +5577,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         if !self.allows_unforced_breaks() {
             return None;
         }
-        let fragmentainer = self.run.fragmentainer.as_deref()?;
+        let fragmentainer = self.run.fragmentainer.as_ref()?;
         let incoming = if line_root == self.run.box_ {
             fragmentainer.incoming.clone()
         } else {
@@ -5585,7 +5604,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         line_block_end_in_root: CssPixels,
         is_kept: bool,
     ) {
-        let Some(fragmentainer) = self.run.fragmentainer.as_deref() else {
+        let Some(fragmentainer) = self.run.fragmentainer.as_ref() else {
             return;
         };
         fragmentainer.note_unbreakable_block_size(line_block_size);
@@ -5598,7 +5617,7 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     pub(crate) fn note_violated_break_avoidance(&self) {
-        if let Some(fragmentainer) = self.run.fragmentainer.as_deref() {
+        if let Some(fragmentainer) = self.run.fragmentainer.as_ref() {
             fragmentainer.outcome_mut().violates_break_avoidance = true;
         }
     }
@@ -5607,7 +5626,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         if line_root != self.run.box_ {
             return;
         }
-        let Some(fragmentainer) = self.run.fragmentainer.as_deref() else {
+        let Some(fragmentainer) = self.run.fragmentainer.as_ref() else {
             return;
         };
         fragmentainer.note_unbreakable_block_size(lines_block_end_in_root);
@@ -5618,13 +5637,13 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     pub(crate) fn note_overflowing_content(&self) {
-        if let Some(fragmentainer) = self.run.fragmentainer.as_deref() {
+        if let Some(fragmentainer) = self.run.fragmentainer.as_ref() {
             fragmentainer.outcome_mut().overflows = true;
         }
     }
 
     pub(crate) fn request_early_break_before(&self, node: Node) {
-        if let Some(fragmentainer) = self.run.fragmentainer.as_deref() {
+        if let Some(fragmentainer) = self.run.fragmentainer.as_ref() {
             fragmentainer.request_early_break_before(node);
         }
     }
@@ -5637,7 +5656,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         line_root: Node,
         line_start: fragmentation::LinePosition,
     ) -> Option<std::rc::Rc<fragmentation::BlockBreakToken>> {
-        let fragmentainer = self.run.fragmentainer.as_deref()?;
+        let fragmentainer = self.run.fragmentainer.as_ref()?;
         self.stop_fragmentainer(fragmentainer, line_root, fragmentation::BlockResume::AtLine(line_start))
     }
 
@@ -5665,7 +5684,7 @@ impl<'pass> BlockFormattingContext<'pass> {
 
     fn break_before_child(
         &self,
-        fragmentainer: &fragmentation::FragmentainerContext,
+        fragmentainer: &fragmentation::Fragmentainer<'_>,
         state: &mut FragmentationState,
         block_container: Node,
         child: Node,
@@ -5694,7 +5713,7 @@ impl<'pass> BlockFormattingContext<'pass> {
     #[must_use]
     fn stop_fragmentainer(
         &self,
-        fragmentainer: &fragmentation::FragmentainerContext,
+        fragmentainer: &fragmentation::Fragmentainer<'_>,
         block_container: Node,
         resume: fragmentation::BlockResume,
     ) -> Option<std::rc::Rc<fragmentation::BlockBreakToken>> {
@@ -5903,10 +5922,11 @@ impl<'pass> BlockFormattingContext<'pass> {
                 inline_content::InlineContent::concatenate_translated(&root_line_data_of_columns),
             );
         }
-        let multicol_layout_data = std::sync::Arc::new(fragmentation::MulticolLayoutData { geometry, rows });
-        self.run.set_fragment_payload_of(self.run.box_, || {
-            fragment_tree::FcPayload::Multicol(multicol_layout_data)
-        });
+        self.multicol_layout_data
+            .set(Some(std::sync::Arc::new(fragmentation::MulticolLayoutData {
+                geometry,
+                rows,
+            })));
         self.multicol_automatic_content_block_size.set(Some(row_block_offset));
         self.record_derived_baselines_of_root_box(baselines);
     }
@@ -6129,29 +6149,33 @@ impl<'pass> BlockFormattingContext<'pass> {
         let mut column_root_cells = self.root_cells;
         column_root_cells.set_content_inline_size(column_inline_size);
         loop {
-            let fragmentainer = std::rc::Rc::new(fragmentation::FragmentainerContext::new(
+            let fragmentainer = fragmentation::FragmentainerSpace {
                 block_size,
                 honors_forced_breaks,
-                incoming.clone(),
-                inline_items.clone(),
-                box_layouts.clone(),
+                incoming: incoming.clone(),
+                inline_items: inline_items.clone(),
+                box_layouts: box_layouts.clone(),
                 keeps_box_layouts,
                 early_break_before,
                 allows_early_break_requests,
-            ));
-            let outputs = formatting_context::run_fragmentainer(
+            };
+            let fragmentation::FragmentainerRunResult {
+                layout,
+                mut outcome,
+                contents,
+                root_line_data,
+            } = formatting_context::run_fragmentainer(
                 &self.run,
                 column_root_cells,
                 builds_fragments,
                 input.clone(),
-                fragmentainer.clone(),
+                &fragmentainer,
             );
-            if outputs.result.depends_on_percentage_block_size {
+            if layout.outcome.depends_on_percentage_block_size {
                 self.run
                     .state
                     .note_descendant_depends_on_percentage_block_size(self.run.box_);
             }
-            let mut outcome = fragmentainer.take_outcome();
             outcome.minimal_space_shortage = match (
                 outcome.minimal_space_shortage,
                 minimal_space_shortage_of_discarded_attempts,
@@ -6179,13 +6203,13 @@ impl<'pass> BlockFormattingContext<'pass> {
                 );
             }
             // NB: Only the attempt that is kept tells the host what it found out.
-            self.run.pass.receive_host_findings(outputs.host_findings);
+            self.run.pass.receive_residue(layout.residue);
             return ColumnLayout {
                 outcome,
-                consumed_block_size: outputs.result.automatic_content_block_size,
-                baselines: outputs.result.baselines,
-                root_line_data: outputs.root_outcome.line_data,
-                contents: fragmentainer.take_contents(),
+                consumed_block_size: layout.outcome.automatic_content_block_size,
+                baselines: layout.outcome.baselines,
+                root_line_data,
+                contents,
             };
         }
     }
@@ -6373,20 +6397,6 @@ impl<'pass> BlockFormattingContext<'pass> {
             );
         }
         summary
-    }
-
-    pub(crate) fn run(&self, run: &FormattingContextRun<'pass>, input: LayoutInput) {
-        self.lay_out_root_contents(run, input);
-        let has_line_clamp_point = self.line_clamp_point_found.get();
-        if has_line_clamp_point || self.clamped_content_is_scrollable_overflow {
-            run.set_line_clamp_facts_of(
-                self.run.box_,
-                fragment_tree::LineClampFacts {
-                    has_line_clamp_point,
-                    clamped_content_is_scrollable_overflow: self.clamped_content_is_scrollable_overflow,
-                },
-            );
-        }
     }
 
     fn lay_out_root_contents(&self, run: &FormattingContextRun<'pass>, input: LayoutInput) {
@@ -6664,7 +6674,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         fragment_facts: run_state::FragmentFactsDecidedByParent,
     ) -> (
         abspos_engine::InFlowBoxInsets,
-        Option<run_state::LaidOutChildBox>,
+        Option<LaidOutBox>,
         Option<FfiCssPixelPoint>,
     ) {
         let laid_out_float = self.lay_out_float_ahead_of_its_position(
@@ -6736,14 +6746,13 @@ impl<'pass> BlockFormattingContext<'pass> {
         let node = sized_float.node;
         let float_input =
             self.size_float_for_its_run(sized_float, block_container, &input, containing_block_position_in_root);
-        let (float_layout, fragment_arrival, float_box) =
-            self.layout_inside(run, sized_float, block_container, float_input, false);
+        let layout = self.layout_inside(run, sized_float, block_container, float_input, false);
         FloatLaidOutAheadOfItsPosition {
             node,
-            placed_float: formatting_context::PlacedChild::of_laid_out_box(&float_box),
-            cells: float_box.cells,
-            laid_out_float_handed_back_by_its_run: float_layout.is_some().then_some(float_box),
-            fragment_arrival,
+            placed_float: layout.placed_child(),
+            cells: layout.cells(),
+            laid_out_float_handed_back_by_its_run: layout.result().is_some().then(|| LaidOutBox::of_layout(&layout)),
+            fragment_arrival: layout.into_fragment_arrival(run),
         }
     }
 
@@ -6761,7 +6770,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         fragment_facts: run_state::FragmentFactsDecidedByParent,
     ) -> (
         abspos_engine::InFlowBoxInsets,
-        Option<run_state::LaidOutChildBox>,
+        Option<LaidOutBox>,
         Option<FfiCssPixelPoint>,
     ) {
         let FloatLaidOutAheadOfItsPosition {
@@ -6801,7 +6810,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                 bottom_margin_edge + self.block_offset_adjustment_from_pending_ancestor_block_start_margins(node),
             );
         }
-        if let Some(fragmentainer) = self.run.fragmentainer.as_deref()
+        if let Some(fragmentainer) = self.run.fragmentainer.as_ref()
             && self.allows_unforced_breaks()
         {
             let bottom_margin_edge_in_column =
@@ -7146,10 +7155,6 @@ impl<'pass> BlockFormattingContext<'pass> {
         CssPixels::default()
     }
 
-    pub(crate) fn table_wrapper_content_inline_size(&self) -> Option<CssPixels> {
-        self.table_box_in_wrapper_border_box_inline_size.get()
-    }
-
     fn resolve_automatic_line_clamp_block_size(&self, input: LayoutInput) -> Option<CssPixels> {
         if self.root_cells.has_definite_block_size {
             return Some(self.root_cells.content_block_size);
@@ -7183,7 +7188,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         Some(block_size)
     }
 
-    pub(crate) fn automatic_line_clamp_max_lines(&self) -> Option<usize> {
+    fn automatic_line_clamp_max_lines(&self) -> Option<usize> {
         // https://drafts.csswg.org/css-overflow-4/#line-clamp-containers
         // The auto clamp point will be set to the last possible clamp point such that, for it and all previous
         // possible clamp points, the line-clamp container's automatic block size is not greater than the block size
@@ -7197,12 +7202,8 @@ impl<'pass> BlockFormattingContext<'pass> {
             .or_else(|| (self.line_clamp_line_count.get() == 0).then_some(0))
     }
 
-    pub(crate) fn automatic_content_block_size(&self) -> CssPixels {
+    fn automatic_content_block_size(&self) -> CssPixels {
         self.block_size_of_contents(self.run.fragmentainer.is_none())
-    }
-
-    pub(crate) fn laid_out_content_block_size(&self) -> CssPixels {
-        self.block_size_of_contents(false)
     }
 
     fn block_size_of_contents(&self, honors_size_containment: bool) -> CssPixels {
@@ -7533,9 +7534,9 @@ pub(crate) fn floor_list_item_automatic_block_size_by_marker_line_height(
 /// The inline layout of the table box inside `child` that `kept` holds for the run of `child`, which stays kept for
 /// another child.
 pub(crate) fn take_table_inline_layout_kept_for(
-    kept: &Cell<Option<(Node, table_formatting_context::TableInlineLayout)>>,
+    kept: &Cell<Option<(Node, std::sync::Arc<table_formatting_context::TableInlineLayout>)>>,
     child: Node,
-) -> Option<table_formatting_context::TableInlineLayout> {
+) -> Option<std::sync::Arc<table_formatting_context::TableInlineLayout>> {
     let (kept_for, layout) = kept.take()?;
     if kept_for != child {
         kept.set(Some((kept_for, layout)));

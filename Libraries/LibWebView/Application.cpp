@@ -51,6 +51,7 @@
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/CompositorPresentationClient.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/CrashReport.h>
 #include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/FontService.h>
@@ -138,11 +139,6 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
         Application::the().languages_changed({});
     }
 
-    virtual void browsing_data_settings_changed() override
-    {
-        Application::request_server_manager().disk_cache_settings_changed();
-    }
-
     virtual void dns_settings_changed() override
     {
         Application::request_server_manager().dns_settings_changed();
@@ -158,19 +154,15 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
         Application::the().content_blocker_settings_changed({});
     }
 
-    virtual void geolocation_settings_changed() override
+    virtual void permission_settings_changed(Web::Permissions::PermissionName) override
     {
-        Application::the().location_policy_changed({});
+        Application::the().permission_settings_changed({});
     }
 
-    virtual void microphone_settings_changed() override
+    virtual void config_variable_changed(ConfigVariableID id) override
     {
-        Application::the().microphone_policy_changed({});
-    }
-
-    virtual void notifications_settings_changed() override
-    {
-        Application::the().notifications_policy_changed({});
+        if (id == ConfigVariableID::MaximumDiskCacheSize)
+            Application::request_server_manager().disk_cache_settings_changed();
     }
 };
 
@@ -634,6 +626,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     // Reports belong to the profile they came from, whose own setting decides what happens to them. A temporary
     // profile takes nothing over, since it would take it to its grave.
+    CrashReport::set_sandbox_is_disabled(m_browser_options.disable_sandbox);
     auto& crash_report_store = CrashReportStore::the();
     crash_report_store.set_directory(LexicalPath::join(profile().paths().data, "CrashReports"sv).string());
     if (!profile().is_temporary()) {
@@ -1100,18 +1093,15 @@ void Application::open_urls_in_new_tabs(ReadonlySpan<URL::URL> urls) const
         open_url_in_new_tab(url, Web::HTML::ActivateTab::No);
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(IsPrivate is_private, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::create_web_content_client(BrowsingSession& session, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt, Optional<Web::HTML::CrossProcessId> initial_document_state_id, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
-    // The client's WebContentClient picks up this same session when it is created.
-    auto session = session_for_new_view(is_private);
-
     auto cross_process_id_allocator = allocate_cross_process_id_allocator();
     auto root_navigable_id = navigable_to_adopt.has_value() ? *navigable_to_adopt : cross_process_id_allocator.allocate();
     if (!initial_document_state_id.has_value())
         initial_document_state_id = cross_process_id_allocator.allocate();
     auto initial_document_id = cross_process_id_allocator.allocate();
 
-    auto client = TRY(WebView::launch_web_content_process(is_private, initial_page_id, root_navigable_id));
+    auto client = TRY(WebView::launch_web_content_process(session, initial_page_id, root_navigable_id));
     TRY(Application::the().connect_web_content_to_compositor(*client));
 
     // A tab's first process creates its traversable from this entry. A process hosting a navigable of an existing tab
@@ -1203,6 +1193,15 @@ void Application::did_disconnect_request_server_client(int client_id)
 {
     m_request_server_client_sessions.remove(client_id);
     m_unrestricted_request_server_clients.remove(client_id);
+
+    WebContentClient::for_each_client([&](WebContentClient& client) {
+        client.request_server_site_bindings().did_disconnect(client_id);
+        return IterationDecision::Continue;
+    });
+    WorkerAgentManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) {
+        bindings.did_disconnect(client_id);
+        return IterationDecision::Continue;
+    });
 }
 
 bool Application::request_server_client_may_use_cookies_in(int client_id, URL::URL const& url, Optional<HTTP::Cookie::PartitionContext> const& context) const
@@ -1242,11 +1241,6 @@ RefPtr<BrowsingSession> Application::session_for_request_server_client(int clien
     if (auto it = m_request_server_client_sessions.find(client_id); it != m_request_server_client_sessions.end())
         return it->value.strong_ref();
     return {};
-}
-
-RefPtr<BrowsingSession> Application::existing_session(IsPrivate is_private)
-{
-    return is_private == IsPrivate::Yes ? the().m_private_session.strong_ref() : the().m_default_session;
 }
 
 WebDriverBrowserConnection* Application::webdriver_browser_connection()
@@ -1472,6 +1466,85 @@ void Application::update_compositor_context_visibility(Web::CompositorContextId 
     m_compositor_client->async_set_context_visibility(context_id, context_visibility);
 }
 
+Optional<Application::RemoteLayer> Application::create_remote_layer()
+{
+    if (!m_compositor_presentation_client || !can_send_compositor_process_ipc(m_compositor_client))
+        return {};
+    VERIFY(m_compositor_client);
+
+    auto remote_layer_id = m_next_remote_layer_id++;
+    auto response = m_compositor_client->try_create_remote_layer(m_compositor_presentation_id, remote_layer_id);
+    if (response.is_error())
+        return {};
+    auto core_animation_context_id = response.release_value();
+    if (core_animation_context_id == 0)
+        return {};
+    return RemoteLayer { .id = remote_layer_id, .core_animation_context_id = core_animation_context_id };
+}
+
+void Application::destroy_remote_layer(u64 remote_layer_id)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_destroy_remote_layer(remote_layer_id);
+}
+
+void Application::show_context_in_remote_layer(u64 remote_layer_id, Optional<Web::CompositorContextId> context_id)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_show_context_in_remote_layer(remote_layer_id, context_id);
+}
+
+void Application::set_remote_layer_fit(u64 remote_layer_id, Optional<Gfx::IntSize> fit_within)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_set_remote_layer_fit(remote_layer_id, fit_within);
+}
+
+void Application::begin_synchronized_resize(u64 remote_layer_id, u64 token)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_begin_synchronized_resize(remote_layer_id, token);
+}
+
+void Application::await_synchronized_resize_frame(u64 remote_layer_id, u64 token, Gfx::IntSize size)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_await_synchronized_resize_frame(remote_layer_id, token, size);
+}
+
+void Application::commit_synchronized_resize(u64 remote_layer_id, u64 token)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    VERIFY(m_compositor_client);
+
+    m_compositor_client->async_commit_synchronized_resize(remote_layer_id, token);
+}
+
+void Application::take_frame_snapshot(Web::CompositorContextId context_id, Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)> callback)
+{
+    if (!m_compositor_presentation_client) {
+        callback({});
+        return;
+    }
+    m_compositor_presentation_client->take_frame_snapshot(context_id, maximum_size, move(callback));
+}
+
 void Application::update_compositor_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)
 {
     if (!can_send_compositor_process_ipc(m_compositor_client))
@@ -1540,29 +1613,32 @@ bool Application::same_origin_tabs_may_share_a_process() const
 
 ErrorOr<NonnullRefPtr<WebContentPage>> Application::open_page_for_new_tab(IsPrivate is_private)
 {
+    if (m_spare_web_content_process && !m_spare_web_content_process->is_open())
+        m_spare_web_content_process = nullptr;
+
     RefPtr<WebContentClient> web_content_client;
     if (is_private == IsPrivate::Yes) {
-        web_content_client = TRY(create_web_content_client(IsPrivate::Yes, allocate_page_id()));
+        web_content_client = TRY(create_web_content_client(session_for_new_view(IsPrivate::Yes), allocate_page_id()));
     } else if (m_spare_web_content_process) {
         web_content_client = m_spare_web_content_process.release_nonnull();
         launch_spare_web_content_process();
     } else {
         launch_spare_web_content_process();
-        web_content_client = TRY(create_web_content_client(IsPrivate::No, allocate_page_id()));
+        web_content_client = TRY(create_web_content_client(default_session(), allocate_page_id()));
     }
     return web_content_client->open_initial_page_for_new_top_level_traversable();
 }
 
-ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process_without_page(IsPrivate is_private)
+ErrorOr<NonnullRefPtr<WebContentClient>> Application::launch_web_content_process_without_page(BrowsingSession& session)
 {
-    return create_web_content_client(is_private, allocate_page_id());
+    return create_web_content_client(session, allocate_page_id());
 }
 
 ErrorOr<Application::ChildFrameWebContentProcess> Application::launch_child_frame_web_content_process(IsPrivate is_private, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state)
 {
     auto page_id = allocate_page_id();
     auto initial_document_state_id = initial_history_entry.document_state.id;
-    auto client = TRY(create_web_content_client(is_private, page_id, root_navigable_id, initial_document_state_id, move(remote_navigables), move(initial_history_entry), system_visibility_state));
+    auto client = TRY(create_web_content_client(session_for_new_view(is_private), page_id, root_navigable_id, initial_document_state_id, move(remote_navigables), move(initial_history_entry), system_visibility_state));
     return ChildFrameWebContentProcess {
         .client = move(client),
         .page_id = page_id,
@@ -1590,7 +1666,7 @@ void Application::launch_spare_web_content_process()
     Core::deferred_invoke([this]() {
         m_has_queued_task_to_launch_spare_web_content_process = false;
 
-        auto web_content_client = create_web_content_client(IsPrivate::No, allocate_page_id());
+        auto web_content_client = create_web_content_client(default_session(), allocate_page_id());
         if (web_content_client.is_error()) {
             dbgln("Unable to create spare web content client: {}", web_content_client.error());
             return;
@@ -1880,8 +1956,11 @@ void Application::notify_compositor_gpu_presentation_unavailable()
 void Application::handle_compositor_process_death()
 {
     m_compositor_client = nullptr;
-    if (m_compositor_presentation_client)
+    if (m_compositor_presentation_client) {
         m_compositor_presentation_client->on_death = nullptr;
+        // The client can go before it hears that the connection closed, and the snapshots it waits for never come.
+        m_compositor_presentation_client->fail_pending_frame_snapshots();
+    }
     m_compositor_presentation_client = nullptr;
 
     // Nothing will forward or hand back the input events the dead compositor still held.
@@ -2226,6 +2305,8 @@ void Application::process_did_exit(Process&& process, Optional<int>)
         break;
     case ProcessType::WebContent:
         if (auto client = process.client<WebContentClient>()) {
+            if (m_spare_web_content_process == client)
+                m_spare_web_content_process = nullptr;
             client->did_lose_process();
             if (!report_name.is_empty())
                 client->did_save_crash_report(report_name);
@@ -2563,7 +2644,7 @@ bool Application::sites_can_ask_for_location() const
     // NB: Tests and WebDriver sessions get their positions from emulation, so they need no provider.
     auto has_location_source = Core::GeolocationProvider::is_available() || web_content_options().is_test_mode == IsTestMode::Yes
         || browser_options().webdriver_browser_endpoint.has_value();
-    return settings().location_policy() == LocationPolicy::Ask && has_location_source;
+    return settings().permission_policy(Web::Permissions::PermissionName::Geolocation) == PermissionPolicy::Ask && has_location_source;
 }
 
 void Application::permissions_changed(Badge<ApplicationPermissionManagerObserver>, PermissionManager const& manager)
@@ -2621,27 +2702,7 @@ void Application::schedule_permission_expiry()
     m_permission_expiry_timer->restart(delay + AK::Duration::from_milliseconds(1));
 }
 
-void Application::location_policy_changed(Badge<ApplicationSettingsObserver>)
-{
-    update_permission_defaults();
-}
-
-bool Application::sites_can_ask_for_microphone() const
-{
-    return settings().microphone_policy() == MicrophonePolicy::Ask;
-}
-
-void Application::microphone_policy_changed(Badge<ApplicationSettingsObserver>)
-{
-    update_permission_defaults();
-}
-
-bool Application::sites_can_ask_for_notifications() const
-{
-    return settings().notifications_policy() == NotificationsPolicy::Ask;
-}
-
-void Application::notifications_policy_changed(Badge<ApplicationSettingsObserver>)
+void Application::permission_settings_changed(Badge<ApplicationSettingsObserver>)
 {
     update_permission_defaults();
 }
@@ -2664,11 +2725,22 @@ Core::GeolocationAuthorization Application::geolocation_authorization()
 
 void Application::update_permission_defaults()
 {
-    // NB: A private session reads its defaults from the ordinary one.
-    auto state_for = [](bool sites_can_ask) { return sites_can_ask ? Web::Permissions::EffectiveState::Prompt : Web::Permissions::EffectiveState::Denied; };
-    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Geolocation, state_for(sites_can_ask_for_location()));
-    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Microphone, state_for(sites_can_ask_for_microphone()));
-    m_default_session->permission_manager->set_global_default(Web::Permissions::PermissionName::Notifications, state_for(sites_can_ask_for_notifications()));
+    // A private session reads its defaults from the ordinary one.
+    for (auto name : Web::Permissions::PERMISSION_NAMES) {
+        auto state = [&]() {
+            switch (settings().permission_policy(name)) {
+            case PermissionPolicy::Ask:
+                return name == Web::Permissions::PermissionName::Geolocation && !sites_can_ask_for_location()
+                    ? Web::Permissions::EffectiveState::Denied
+                    : Web::Permissions::EffectiveState::Prompt;
+            case PermissionPolicy::Block:
+                return Web::Permissions::EffectiveState::Denied;
+            }
+            VERIFY_NOT_REACHED();
+        }();
+
+        m_default_session->permission_manager->set_global_default(name, state);
+    }
 }
 
 void Application::languages_changed(Badge<ApplicationSettingsObserver>)

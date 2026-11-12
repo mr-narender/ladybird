@@ -5,8 +5,8 @@
  */
 
 use super::*;
-use crate::css::style::tree::StyleNodeID;
-use libgfx_rust::{FloatPoint, FloatSize};
+use crate::layout::used_transform;
+use libgfx_rust::{FloatPoint, FloatRect, FloatSize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
@@ -179,10 +179,8 @@ pub const SVG_LENGTH_KIND_PERCENTAGE: u8 = 3;
 struct SvgElementFacts {
     is_document_element: bool,
     document_is_decoded_svg: bool,
-    element_transform: FfiAffineTransform,
     additional_element_transform: FfiAffineTransform,
     visible_stroke_width: f32,
-    viewport_percentage_basis: CssPixels,
 }
 
 /// The SVG attributes one element parses, as the document last published them under
@@ -197,8 +195,6 @@ pub struct FfiSvgAttributeFacts {
     /// properties that give `<use>` its additional transform.
     pub is_graphics_element: bool,
     pub is_use_element: bool,
-    pub is_svg_svg_element: bool,
-    pub is_symbol_element: bool,
     pub is_text_element: bool,
     pub is_fit_to_view_box: bool,
     pub has_active_view_box: bool,
@@ -315,12 +311,62 @@ fn kind_is_svg_container_element(kind: NodeKind) -> bool {
     )
 }
 
-/// What the layout of an SVG element hands its parent: the element's sizes and box sides, and the offset of its content
-/// box.
-#[derive(Clone, Copy)]
-struct LaidOutSvgElement {
-    cells: used_values::RootInputCells,
-    content_offset: FfiCssPixelPoint,
+/// The geometry layout found for an SVG element, in the user units of the SVG viewport the element is laid out in.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct SvgGeometry {
+    /// The bounding box of the element's fill: its path or glyph cells, or the union of its children's object bounding
+    /// boxes, each mapped through the child's local transform.
+    pub object_bounding_box: FloatRect,
+    /// The bounding box that covers the element's stroke too, which is the element's box.
+    pub stroke_bounding_box: FloatRect,
+    /// The element's transform about its transform origin, with a <use> element's translation.
+    pub local_transform: FfiAffineTransform,
+    /// The SVG viewport that the element's own lengths resolve against.
+    pub viewport_user_rect: FloatRect,
+    /// The SVG viewport that the element lays its contents out in, where it lays out contents of its own.
+    pub establishes_viewport: bool,
+    pub established_viewport_user_rect: FloatRect,
+}
+
+impl SvgGeometry {
+    /// What the element's stroke percentages resolve against.
+    pub(crate) fn percentage_basis(&self) -> CssPixels {
+        crate::svg::stroke_style::percentage_basis(FfiCssPixelSize {
+            width: CssPixels::nearest_value_for_f32(self.viewport_user_rect.width),
+            height: CssPixels::nearest_value_for_f32(self.viewport_user_rect.height),
+        })
+    }
+
+    /// The transform reference box that a used `transform-box` value names.
+    pub(crate) fn transform_reference_box(&self, transform_box: u8) -> CssPixelRect {
+        css_pixel_rect_of(match transform_box {
+            transform_box::FILL_BOX => self.object_bounding_box,
+            transform_box::VIEW_BOX => {
+                FloatRect::new(0.0, 0.0, self.viewport_user_rect.width, self.viewport_user_rect.height)
+            }
+            _ => self.stroke_bounding_box,
+        })
+    }
+}
+
+pub(crate) fn css_pixel_rect_of(rect: FloatRect) -> CssPixelRect {
+    CssPixelRect::new(
+        CssPixels::nearest_value_for_f32(rect.x),
+        CssPixels::nearest_value_for_f32(rect.y),
+        CssPixels::nearest_value_for_f32(rect.width),
+        CssPixels::nearest_value_for_f32(rect.height),
+    )
+}
+
+/// The union of `rect` and `other`, which keeps the extent of an empty rect too.
+fn united_even_if_empty(rect: Option<FloatRect>, other: FloatRect) -> FloatRect {
+    let Some(rect) = rect else {
+        return other;
+    };
+    let (left, top) = (rect.x.min(other.x), rect.y.min(other.y));
+    let (right, bottom) = (rect.right().max(other.right()), rect.bottom().max(other.bottom()));
+    FloatRect::new(left, top, right - left, bottom - top)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -341,6 +387,15 @@ impl SvgCssPixelRect {
 
     fn is_empty(&self) -> bool {
         self.width <= CssPixels::default() || self.height <= CssPixels::default()
+    }
+
+    fn to_float_rect(self) -> FloatRect {
+        FloatRect::new(
+            self.x.to_float(),
+            self.y.to_float(),
+            self.width.to_float(),
+            self.height.to_float(),
+        )
     }
 
     /// Grows this rect to cover `other` too. An empty rect covers nothing, so it doesn't take part.
@@ -387,24 +442,9 @@ impl FfiAffineTransform {
     pub(crate) fn scaled(self, x: f32, y: f32) -> Self {
         libgfx_rust::AffineTransform::from(self).scaled(x, y).into()
     }
-
-    pub(crate) fn map_rect(self, rect: FfiFloatRect) -> FfiFloatRect {
-        let rect = libgfx_rust::AffineTransform::from(self).map_rect(libgfx_rust::FloatRect::new(
-            rect.x,
-            rect.y,
-            rect.width,
-            rect.height,
-        ));
-        FfiFloatRect {
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-        }
-    }
 }
 
-fn float_rect_to_css_pixels(rect: FfiFloatRect) -> SvgCssPixelRect {
+fn float_rect_to_css_pixels(rect: FloatRect) -> SvgCssPixelRect {
     SvgCssPixelRect {
         x: CssPixels::nearest_value_for_f32(rect.x),
         y: CssPixels::nearest_value_for_f32(rect.y),
@@ -589,6 +629,7 @@ pub(super) struct SvgFormattingContext<'pass> {
     quirks_mode_percentage_basis_block_size: Option<CssPixels>,
     viewport_width: CssPixels,
     viewport_height: CssPixels,
+    viewport_user_rect: FloatRect,
     /// Whether this context's box is an <svg> viewport whose view box and size are the ones it was
     /// last committed with, so that a shape below it resolves against the viewport it did then.
     viewport_is_committed_viewport: bool,
@@ -596,6 +637,21 @@ pub(super) struct SvgFormattingContext<'pass> {
     /// sets it once the root is definite. A nested context takes it from the context that creates it.
     percentage_block_insets_of_run_root_children_have_definite_basis: bool,
     current_text_position: FfiFloatPoint,
+    /// What the run's root, where this is the context of the root, hands the root's fragment.
+    root_payload: RefCell<fragment_tree::PendingPayload>,
+}
+
+impl<'pass> formatting_context::FormattingContextAlgorithm<'pass> for SvgFormattingContext<'pass> {
+    fn lay_out(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        input: formatting_context::AlgorithmInput<'_>,
+    ) -> formatting_context::AlgorithmOutput {
+        let root = Cell::new(input.root_cells);
+        self.lay_out_contents(run, input.body_input, &root);
+        formatting_context::AlgorithmOutput::of_root(formatting_context::ChildLayoutResult::default(), root.get())
+            .with_root_payload(self.root_payload.take())
+    }
 }
 
 impl<'pass> SvgFormattingContext<'pass> {
@@ -614,9 +670,27 @@ impl<'pass> SvgFormattingContext<'pass> {
             quirks_mode_percentage_basis_block_size: None,
             viewport_width: CssPixels::default(),
             viewport_height: CssPixels::default(),
+            viewport_user_rect: FloatRect::default(),
             viewport_is_committed_viewport: false,
             percentage_block_insets_of_run_root_children_have_definite_basis,
             current_text_position: FfiFloatPoint::default(),
+            root_payload: RefCell::new(fragment_tree::PendingPayload::default()),
+        }
+    }
+
+    /// Hands `node` what its layout produced besides its geometry, where the run builds fragments: the run's root through
+    /// the output of this context, and any other box through the run's fragment builder.
+    fn update_svg_payload_of(&self, node: Node, update: impl FnOnce(&mut fragment_tree::SvgPayload)) {
+        if node != self.run.state.root() {
+            self.run.update_svg_payload_of(node, update);
+            return;
+        }
+        debug_assert_eq!(
+            node, self.run.box_,
+            "only the context of a run's root hands the root its payload"
+        );
+        if self.run.fragments.is_some() {
+            update(self.root_payload.borrow_mut().svg_mut());
         }
     }
 
@@ -836,7 +910,11 @@ impl SvgShapeGeometry {
         let cy = to_px(&svg_reset.cy, self.viewport_height).to_float();
         // Percentages refer to the normalized diagonal of the current SVG viewport
         // (see Units: https://svgwg.org/svg2-draft/coords.html#Units)
-        let r = to_px(&svg_reset.r, self.normalized_diagonal_length()).to_float();
+        let normalized_diagonal = crate::svg::stroke_style::percentage_basis(FfiCssPixelSize {
+            width: self.viewport_width,
+            height: self.viewport_height,
+        });
+        let r = to_px(&svg_reset.r, normalized_diagonal).to_float();
 
         // A zero radius disables rendering.
         if r == 0.0 {
@@ -855,19 +933,6 @@ impl SvgShapeGeometry {
         // 5. arc with a segment-completing close path operation.
         path.arc_to(FloatPoint { x: cx + r, y: cy }, r, large_arc, sweep);
         path
-    }
-
-    fn normalized_diagonal_length(&self) -> CssPixels {
-        if self.viewport_width == self.viewport_height {
-            return self.viewport_width;
-        }
-        let sum_of_squares = self.viewport_width * self.viewport_width + self.viewport_height * self.viewport_height;
-        CssPixels::nearest_value_for_f32(
-            sum_of_squares
-                .div_as_fraction(CssPixels::from_integer(2))
-                .to_float()
-                .sqrt(),
-        )
     }
 
     fn svg_ellipse_path(&self, style: StyleValues<'_>) -> libgfx_rust::path::Path {
@@ -1202,10 +1267,10 @@ pub unsafe extern "C" fn svg_geometry_element_stroke_contains(
     // SAFETY: Guaranteed by the caller.
     unsafe {
         shape.measure(|path, style| {
-            // The same basis that layout resolves the stroke's percentages against.
-            // FIXME: The spec formula is the normalized diagonal sqrt((width² + height²) / 2), as for layout.
-            let basis = (viewport_size.width + viewport_size.height) * CssPixels::nearest_value_for(0.5);
-            let stroke = crate::painting::record::paint::svg::svg_stroke_style_for_percentage_basis(&style, basis);
+            let stroke = crate::svg::stroke_style::svg_stroke_style_for_percentage_basis(
+                &style,
+                crate::svg::stroke_style::percentage_basis(viewport_size),
+            );
             // https://svgwg.org/svg2-draft/painting.html#PaintingVectorEffects
             // With the non-scaling-stroke vector effect, stroke outline shall be calculated in the "host" coordinate
             // space instead of user coordinate system.
@@ -1435,6 +1500,8 @@ impl<'pass> SvgFormattingContext<'pass> {
             glyph_cells: SvgCssPixelRect::default(),
             character_cells: Vec::with_capacity(text.len()),
         };
+        let letter_spacing = style.letter_spacing().to_double() as f32;
+        let word_spacing = style.word_spacing().to_double() as f32;
         Self::for_each_svg_font_run(style, text, |font, run_text| {
             let run_start_x = baseline_start.x + shaped_text.advance;
             let shaped = libgfx_rust::text_layout::shape_text(
@@ -1442,8 +1509,8 @@ impl<'pass> SvgFormattingContext<'pass> {
                 run_text,
                 libgfx_rust::text_layout::TextType::Common,
                 run_start_x,
-                0.0,
-                0.0,
+                letter_spacing,
+                word_spacing,
             );
             // https://svgwg.org/svg2-draft/coords.html#BoundingBoxes
             // The full glyph cell must have width equal to the horizontal advance and height equal to the EM box for
@@ -1455,12 +1522,12 @@ impl<'pass> SvgFormattingContext<'pass> {
             let facts = font.facts();
             let cell_top = baseline_start.y - facts.ascent;
             let cell_height = facts.ascent + facts.descent;
-            shaped_text.glyph_cells.unite(float_rect_to_css_pixels(FfiFloatRect {
-                x: run_start_x,
-                y: cell_top,
-                width: shaped.width(),
-                height: cell_height,
-            }));
+            shaped_text.glyph_cells.unite(float_rect_to_css_pixels(FloatRect::new(
+                run_start_x,
+                cell_top,
+                shaped.width(),
+                cell_height,
+            )));
             append_svg_text_character_cells(
                 &mut shaped_text.character_cells,
                 shaped.glyphs(),
@@ -1485,14 +1552,17 @@ impl<'pass> SvgFormattingContext<'pass> {
     /// The advance of the text run rendered by the given box; that is, of its direct child text.
     fn svg_text_run_advance(&self, text_box: Node, text: &[u16]) -> f32 {
         let mut advance = 0.0f32;
-        Self::for_each_svg_font_run(self.style(text_box), text, |font, run_text| {
+        let style = self.style(text_box);
+        let letter_spacing = style.letter_spacing().to_double() as f32;
+        let word_spacing = style.word_spacing().to_double() as f32;
+        Self::for_each_svg_font_run(style, text, |font, run_text| {
             advance += libgfx_rust::text_layout::shape_text(
                 font,
                 run_text,
                 libgfx_rust::text_layout::TextType::Common,
                 0.0,
-                0.0,
-                0.0,
+                letter_spacing,
+                word_spacing,
             )
             .width();
         });
@@ -1699,80 +1769,9 @@ impl<'pass> SvgFormattingContext<'pass> {
         // the defaults.
         if self.svg_attributes(node).is_graphics_element {
             facts.additional_element_transform = self.svg_additional_element_transform(node);
-            facts.element_transform = self.svg_graphics_element_transform(node, facts.additional_element_transform);
-            facts.viewport_percentage_basis = self.viewport_percentage_basis(node);
-            facts.visible_stroke_width = self.visible_stroke_width(node, facts.viewport_percentage_basis);
+            facts.visible_stroke_width = self.visible_stroke_width(node);
         }
         facts
-    }
-
-    fn svg_element_transform(&self, node: Node) -> FfiAffineTransform {
-        if !self.svg_attributes(node).is_graphics_element {
-            return FfiAffineTransform::default();
-        }
-        self.svg_graphics_element_transform(node, self.svg_additional_element_transform(node))
-    }
-
-    /// The nearest flat-tree ancestor of `node` whose published attributes `matches` accepts, named
-    /// by its style node. The flat tree is the ancestry SVG resolves a viewport against, and it is
-    /// not the layout tree: a <mask> box hangs under the element that references it, and an <svg>
-    /// inside a <foreignObject> sits under a box that establishes no SVG viewport at all. An
-    /// ancestor answers from its publication whether or not it has a box.
-    fn nearest_flat_tree_ancestor(
-        &self,
-        node: Node,
-        matches: impl Fn(FfiSvgAttributeFacts) -> bool,
-    ) -> Option<StyleNodeID> {
-        let arena = self.run.pass.arena();
-        let mut style_node = arena
-            .node_style_node(node)
-            .and_then(|style_node| arena.flat_tree_parent(style_node));
-        while let Some(current) = style_node {
-            if matches(arena.style_node_svg_attribute_facts(current)) {
-                return Some(current);
-            }
-            style_node = arena.flat_tree_parent(current);
-        }
-        None
-    }
-
-    /// The user-unit size of the viewport a viewport-establishing element sets up: its view box,
-    /// or the computed width and height of its box, with nothing for an element that has none.
-    /// Percentages resolve against nothing here, since layout has not sized the element yet when a
-    /// descendant asks.
-    fn svg_viewport_element_size(&self, element: StyleNodeID) -> FfiCssPixelSize {
-        let arena = self.run.pass.arena();
-        let attributes = arena.style_node_svg_attribute_facts(element);
-        if attributes.has_active_view_box {
-            return FfiCssPixelSize {
-                width: CssPixels::nearest_value_for(attributes.active_view_box.width),
-                height: CssPixels::nearest_value_for(attributes.active_view_box.height),
-            };
-        }
-        let row = arena.bound_row(element);
-        if row.is_invalid() {
-            return FfiCssPixelSize::default();
-        }
-        let style = self.style(row);
-        FfiCssPixelSize {
-            width: style.width().to_px(CssPixels::default()),
-            height: style.height().to_px(CssPixels::default()),
-        }
-    }
-
-    // Resolved relative to the "Scaled viewport size": https://www.w3.org/TR/2017/WD-fill-stroke-3-20170413/#scaled-viewport-size
-    // FIXME: The spec formula is the normalized diagonal sqrt((width² + height²) / 2); this keeps
-    //        the historical (width + height) / 2 approximation.
-    // <symbol> instances establish nested viewports; percentages inside one resolve against it,
-    // not the enclosing <svg>.
-    fn viewport_percentage_basis(&self, node: Node) -> CssPixels {
-        let Some(element) =
-            self.nearest_flat_tree_ancestor(node, |facts| facts.is_svg_svg_element || facts.is_symbol_element)
-        else {
-            return CssPixels::default();
-        };
-        let viewport = self.svg_viewport_element_size(element);
-        (viewport.width + viewport.height) * CssPixels::nearest_value_for(0.5)
     }
 
     // https://svgwg.org/svg2-draft/struct.html#UseElement
@@ -1783,32 +1782,11 @@ impl<'pass> SvgFormattingContext<'pass> {
         if !self.svg_attributes(node).is_use_element {
             return FfiAffineTransform::default();
         }
-        let viewport = self
-            .nearest_flat_tree_ancestor(node, |facts| facts.is_svg_svg_element)
-            .map_or_else(FfiCssPixelSize::default, |element| {
-                self.svg_viewport_element_size(element)
-            });
         let style = self.style(node);
         FfiAffineTransform::default().translated(
-            style.x().to_px(viewport.width).to_float(),
-            style.y().to_px(viewport.height).to_float(),
+            style.x().to_px(self.viewport_width).to_float(),
+            style.y().to_px(self.viewport_height).to_float(),
         )
-    }
-
-    /// The element's own CSS transform, reduced to the 2D affine SVG geometry works in, with
-    /// `additional_element_transform`, a <use> element's translation, multiplied in.
-    fn svg_graphics_element_transform(
-        &self,
-        node: Node,
-        additional_element_transform: FfiAffineTransform,
-    ) -> FfiAffineTransform {
-        let style = self.style(node);
-        let matrix = crate::painting::visual_context::node_values::multiply_transform_functions(
-            libgfx_rust::FloatMatrix4x4::identity(),
-            style.transform().resolved_transforms.as_slice(),
-            CssPixelRect::default(),
-        );
-        libgfx_rust::multiply_affine(matrix.extract_2d_affine(), additional_element_transform.into()).into()
     }
 
     /// The stroke width the path's bounding box has to grow by: an invisible stroke takes up no
@@ -1816,18 +1794,21 @@ impl<'pass> SvgFormattingContext<'pass> {
     // NB: CSS geometry-effect metadata relies on this reading only stroke color and width.
     //     If SVG bounds begin accounting for caps, joins, miter limits, or stroke opacity,
     //     mark those properties as affecting layout geometry as well.
-    fn visible_stroke_width(&self, node: Node, viewport_percentage_basis: CssPixels) -> f32 {
+    fn visible_stroke_width(&self, node: Node) -> f32 {
         let style = self.style(node);
         let svg = style.inherited_svg();
-        let stroke_is_visible =
-            crate::painting::record::paint::svg::svg_paint_color(&svg.stroke, style.current_color())
-                .is_some_and(|color| color >> 24 != 0);
+        let stroke_is_visible = crate::css::svg_paint::svg_paint_color(&svg.stroke, style.current_color())
+            .is_some_and(|color| color >> 24 != 0);
         if !stroke_is_visible {
             return 0.0;
         }
+        let percentage_basis = crate::svg::stroke_style::percentage_basis(FfiCssPixelSize {
+            width: self.viewport_width,
+            height: self.viewport_height,
+        });
         svg.stroke_width
             .length_percentage()
-            .map_or(0.0, |value| value.to_px(viewport_percentage_basis).to_double() as f32)
+            .map_or(0.0, |value| value.to_px(percentage_basis).to_double() as f32)
     }
 
     #[inline]
@@ -1848,13 +1829,7 @@ impl<'pass> SvgFormattingContext<'pass> {
     }
 
     fn set_svg_viewport_transform(&self, node: Node, transform: FfiAffineTransform) {
-        self.run
-            .update_svg_payload_of(node, |svg| svg.facts.viewport_transform = Some(transform));
-    }
-
-    fn set_svg_viewport_size(&self, node: Node, viewport_size: FfiCssPixelSize) {
-        self.run
-            .update_svg_payload_of(node, |svg| svg.facts.viewport_size = Some(viewport_size));
+        self.update_svg_payload_of(node, |svg| svg.facts.viewport_transform = Some(transform));
     }
 
     fn commit_svg_element_facts(&self, node: Node, facts: SvgElementFacts, attributes: FfiSvgAttributeFacts) {
@@ -1865,35 +1840,86 @@ impl<'pass> SvgFormattingContext<'pass> {
             width: attributes.mask_width,
             height: attributes.mask_height,
         });
-        self.run.update_svg_payload_of(node, |svg| {
+        self.update_svg_payload_of(node, |svg| {
             let svg = &mut svg.facts;
-            svg.view_box = attributes.has_active_view_box.then_some(attributes.active_view_box);
-            svg.element_transform = (!facts.element_transform.is_identity()).then_some(facts.element_transform);
             svg.additional_element_transform =
                 (!facts.additional_element_transform.is_identity()).then_some(facts.additional_element_transform);
             svg.mask_area_facts = mask_area_facts;
-            svg.viewport_percentage_basis = facts.viewport_percentage_basis;
             svg.resource_content_units_are_object_bounding_box =
                 attributes.content_units == SVG_UNITS_OBJECT_BOUNDING_BOX;
             svg.author_path_length = attributes.has_path_length.then_some(attributes.path_length);
         });
     }
 
+    /// The geometry of `node`, whose fill covers `object_bounding_box` and whose box is `stroke_bounding_box`, in this
+    /// context's user units.
+    fn geometry_of(&self, node: Node, object_bounding_box: FloatRect, stroke_bounding_box: FloatRect) -> SvgGeometry {
+        let mut geometry = SvgGeometry {
+            object_bounding_box,
+            stroke_bounding_box,
+            viewport_user_rect: self.viewport_user_rect,
+            ..Default::default()
+        };
+        geometry.local_transform = self.local_transform(node, &geometry);
+        geometry
+    }
+
+    /// The transform of `node` about its transform origin, against the boxes of `geometry`, with a <use> element's
+    /// translation.
+    fn local_transform(&self, node: Node, geometry: &SvgGeometry) -> FfiAffineTransform {
+        if !self.svg_attributes(node).is_graphics_element {
+            return FfiAffineTransform::default();
+        }
+        let style = self.style(node);
+        let additional_transform = self.svg_additional_element_transform(node);
+        if style.transform().resolved_transforms.length == 0 && additional_transform.is_identity() {
+            return FfiAffineTransform::default();
+        }
+        let transform_box =
+            used_transform::used_transform_box(*style, node_facts::kind_is_svg_box(self.node_kind(node)));
+        // FIXME: Apply the element's offset path.
+        used_transform::transform_about_origin(
+            *style,
+            geometry.transform_reference_box(transform_box),
+            |_| None,
+            Some(additional_transform.into()),
+        )
+        .to_affine()
+        .into()
+    }
+
+    /// Hands `node` its geometry, keeping the SVG viewport it establishes.
+    fn commit_svg_geometry(&self, node: Node, geometry: SvgGeometry) {
+        self.update_svg_payload_of(node, |svg| {
+            svg.geometry = SvgGeometry {
+                establishes_viewport: svg.geometry.establishes_viewport,
+                established_viewport_user_rect: svg.geometry.established_viewport_user_rect,
+                ..geometry
+            };
+        });
+    }
+
     /// Places `node`, a box this context lays out in `cells`, whose metrics are final once the box is placed, and
-    /// returns what the parent of the box reads of it.
+    /// whose fill covers `object_bounding_box`, and returns its geometry.
     fn place_child(
         &self,
         node: Node,
         cells: &Cell<used_values::RootInputCells>,
         x: CssPixels,
         y: CssPixels,
-    ) -> LaidOutSvgElement {
+        object_bounding_box: FloatRect,
+    ) -> SvgGeometry {
+        let stroke_bounding_box = SvgCssPixelRect {
+            x,
+            y,
+            width: cells.content_inline_size(),
+            height: cells.content_block_size(),
+        };
+        let geometry = self.geometry_of(node, object_bounding_box, stroke_bounding_box.to_float_rect());
+        self.commit_svg_geometry(node, geometry);
         let placed_child = formatting_context::PlacedChild::laid_out_here(cells.get(), None, &self.run);
         self.place_laid_out_child(node, placed_child, x, y, None);
-        LaidOutSvgElement {
-            cells: cells.get(),
-            content_offset: FfiCssPixelPoint { x, y },
-        }
+        geometry
     }
 
     fn place_laid_out_child(
@@ -1926,9 +1952,10 @@ impl<'pass> SvgFormattingContext<'pass> {
         node: Node,
         cells: &Cell<used_values::RootInputCells>,
         rect: SvgCssPixelRect,
-    ) -> LaidOutSvgElement {
+        object_bounding_box: FloatRect,
+    ) -> SvgGeometry {
         Self::set_definite_content_size(cells, rect.width, rect.height);
-        self.place_child(node, cells, rect.x, rect.y)
+        self.place_child(node, cells, rect.x, rect.y, object_bounding_box)
     }
 
     fn first_child_of_kind(&self, node: Node, kind: NodeKind) -> Option<Node> {
@@ -1936,19 +1963,6 @@ impl<'pass> SvgFormattingContext<'pass> {
             .pass
             .children(node)
             .find(|&child| self.node_kind(child) == kind)
-    }
-
-    /// Lays out the run's root from `root_cells`, which hold it in the frame it lays its contents out in, and returns
-    /// the root's cells after the layout.
-    pub(super) fn run(
-        &mut self,
-        run: &FormattingContextRun<'pass>,
-        input: LayoutInput,
-        root_cells: used_values::RootInputCells,
-    ) -> used_values::RootInputCells {
-        let root = Cell::new(root_cells);
-        self.lay_out_contents(run, input, &root);
-        root.get()
     }
 
     /// Lays out the contents of this context's box, which is laid out in `cells`.
@@ -1980,16 +1994,6 @@ impl<'pass> SvgFormattingContext<'pass> {
         // only needs the root sizing above; shapes, text, and foreignObject content wait for layout.
         if self.run.fragments.is_none() && kind == NodeKind::SVGSVGBox && !facts.is_document_element {
             return;
-        }
-
-        if kind == NodeKind::SVGSVGBox {
-            self.set_svg_viewport_size(
-                self.run.box_,
-                FfiCssPixelSize {
-                    width: cells.content_inline_size(),
-                    height: cells.content_block_size(),
-                },
-            );
         }
 
         // Viewport-establishing boxes publish their viewBox/preserveAspectRatio transform for the
@@ -2037,37 +2041,68 @@ impl<'pass> SvgFormattingContext<'pass> {
         self.viewport_height = active_view_box.map_or(cells.content_block_size(), |view_box| {
             CssPixels::nearest_value_for(view_box.height)
         });
+        let viewport_user_rect = FloatRect::new(
+            active_view_box.map_or(0.0, |view_box| view_box.min_x as f32),
+            active_view_box.map_or(0.0, |view_box| view_box.min_y as f32),
+            self.viewport_width.to_float(),
+            self.viewport_height.to_float(),
+        );
+        self.viewport_user_rect = viewport_user_rect;
         self.viewport_is_committed_viewport = kind == NodeKind::SVGSVGBox
             && self.run.fragments.is_some()
             && crate::painting::paint_read::GeometryRead::with_committed_fragment_link(
                 self.run.pass.arena(),
                 self.run.box_,
                 |link| {
-                    link.is_some_and(|link| {
-                        let committed = link.fragment.svg().map(|svg| svg.facts).unwrap_or_default();
-                        committed.view_box == attributes.has_active_view_box.then_some(attributes.active_view_box)
-                            && committed.viewport_size
-                                == Some(FfiCssPixelSize {
-                                    width: cells.content_inline_size(),
-                                    height: cells.content_block_size(),
-                                })
-                    })
+                    link.and_then(|link| link.fragment.svg().map(|svg| svg.geometry))
+                        .is_some_and(|committed| {
+                            committed.establishes_viewport
+                                && committed.established_viewport_user_rect == viewport_user_rect
+                        })
                 },
             );
+        self.update_svg_payload_of(self.run.box_, |svg| {
+            svg.geometry.establishes_viewport = true;
+            svg.geometry.established_viewport_user_rect = viewport_user_rect;
+        });
         self.available_space = Some(input.available_space);
         self.quirks_mode_percentage_basis_block_size = input
             .containing_block_constraints
             .quirks_mode_percentage_basis_block_size;
 
+        let mut children_bounding_box = FloatRect::default();
         for child in self.run.pass.children(self.run.box_) {
-            if NodeFacts::new(&self.run.pass, child).is_box() {
-                self.layout_svg_element(run, child);
+            if NodeFacts::new(&self.run.pass, child).is_box()
+                && let Some(geometry) = self.layout_svg_element(run, child)
+                && !node_facts::kind_is_svg_resource_box(self.node_kind(child))
+            {
+                children_bounding_box = children_bounding_box.united(
+                    libgfx_rust::AffineTransform::from(geometry.local_transform).map_rect(geometry.object_bounding_box),
+                );
             }
+        }
+        // The run's root is an <svg> that its own formatting context does not place, and its bounding box is the union
+        // of its children's in its own user units.
+        if self.run.box_ == run.box_ {
+            self.commit_svg_geometry(
+                self.run.box_,
+                SvgGeometry {
+                    object_bounding_box: children_bounding_box,
+                    stroke_bounding_box: children_bounding_box,
+                    viewport_user_rect: FloatRect::new(
+                        0.0,
+                        0.0,
+                        cells.content_inline_size().to_float(),
+                        cells.content_block_size().to_float(),
+                    ),
+                    ..Default::default()
+                },
+            );
         }
     }
 
-    /// Lays out and places `child`, and returns what its parent reads of it, if it laid it out.
-    fn layout_svg_element(&mut self, run: &FormattingContextRun<'pass>, child: Node) -> Option<LaidOutSvgElement> {
+    /// Lays out and places `child`, and returns its geometry, if it laid it out.
+    fn layout_svg_element(&mut self, run: &FormattingContextRun<'pass>, child: Node) -> Option<SvgGeometry> {
         let kind = self.node_kind(child);
         if self.svg_attributes(child).is_fit_to_view_box {
             return Some(self.layout_nested_viewport(run, child));
@@ -2092,50 +2127,46 @@ impl<'pass> SvgFormattingContext<'pass> {
                 },
                 ..self.nested_layout_input()
             };
-            let formatting_context::ChildLayout {
-                outcome,
-                fragment_arrival,
-                laid_out_box,
-            } = formatting_context::layout_inside_child_with_input_cells(
+            let laid_out = formatting_context::layout_inside_child_with_input_cells(
                 run,
                 None,
                 None,
                 child,
                 child_input,
                 child_cells,
+                None,
                 true,
                 self.percentage_block_insets_of_run_root_children_have_definite_basis,
             );
-            outcome.report_percentage_block_size_dependency_of(run, child);
+            laid_out.report_percentage_block_size_dependency_of(run, child);
             assert!(
-                matches!(outcome, ChildLayoutOutcome::Created(_)),
+                laid_out.result().is_some(),
                 "SVG foreign object did not create an independent formatting context"
             );
             // Masks and clips may use this offset for objectBoundingBox units.
             self.place_laid_out_child(
                 child,
-                formatting_context::PlacedChild::of_laid_out_box(&laid_out_box),
+                laid_out.placed_child(),
                 rect.x,
                 rect.y,
-                fragment_arrival,
+                laid_out.into_fragment_arrival(run),
             );
+            let rect = rect.to_float_rect();
             if let Some(mask) = self.first_child_of_kind(child, NodeKind::SVGMaskBox) {
-                self.layout_mask_or_clip(run, mask, &laid_out_box.cells);
+                self.layout_mask_or_clip(run, mask, rect);
             }
             if let Some(clip) = self.first_child_of_kind(child, NodeKind::SVGClipBox) {
-                self.layout_mask_or_clip(run, clip, &laid_out_box.cells);
+                self.layout_mask_or_clip(run, clip, rect);
             }
-            return Some(LaidOutSvgElement {
-                cells: laid_out_box.cells,
-                content_offset: FfiCssPixelPoint { x: rect.x, y: rect.y },
-            });
+            // NB: The foreign object's fragment arrives from its own run, so its geometry goes to its parent alone.
+            return Some(self.geometry_of(child, rect, rect));
         } else if kind_is_svg_graphics_box(kind) {
             return Some(self.layout_graphics_element(run, child));
         }
         None
     }
 
-    fn layout_nested_viewport(&mut self, run: &FormattingContextRun<'pass>, viewport: Node) -> LaidOutSvgElement {
+    fn layout_nested_viewport(&mut self, run: &FormattingContextRun<'pass>, viewport: Node) -> SvgGeometry {
         // Layout for a nested SVG viewport.
         // https://svgwg.org/svg2-draft/coords.html#EstablishingANewSVGViewport.
         let viewport_cells = self.cells_of_svg_box(viewport);
@@ -2163,22 +2194,27 @@ impl<'pass> SvgFormattingContext<'pass> {
             self.percentage_block_insets_of_run_root_children_have_definite_basis,
         );
         nested_context.lay_out_contents(run, self.nested_layout_input(), &viewport_cells);
-        self.set_svg_viewport_size(
+        let viewport_rect = SvgCssPixelRect {
+            x: nested_viewport_x,
+            y: nested_viewport_y,
+            width: nested_viewport_width,
+            height: nested_viewport_height,
+        };
+        self.place_child(
             viewport,
-            FfiCssPixelSize {
-                width: nested_viewport_width,
-                height: nested_viewport_height,
-            },
-        );
-        self.place_child(viewport, &viewport_cells, nested_viewport_x, nested_viewport_y)
+            &viewport_cells,
+            nested_viewport_x,
+            nested_viewport_y,
+            viewport_rect.to_float_rect(),
+        )
     }
 
-    fn layout_graphics_element(&mut self, run: &FormattingContextRun<'pass>, graphics_box: Node) -> LaidOutSvgElement {
+    fn layout_graphics_element(&mut self, run: &FormattingContextRun<'pass>, graphics_box: Node) -> SvgGeometry {
         let graphics_box_cells = self.cells_of_svg_box(graphics_box);
-        let facts = self.svg_facts(graphics_box);
-        if let Some(laid_out) = self.place_unchanged_committed_shape(graphics_box, &graphics_box_cells, facts) {
-            return laid_out;
+        if let Some(geometry) = self.place_unchanged_committed_shape(graphics_box, &graphics_box_cells) {
+            return geometry;
         }
+        let facts = self.svg_facts(graphics_box);
         self.commit_svg_element_facts(graphics_box, facts, self.svg_attributes(graphics_box));
         let kind = self.node_kind(graphics_box);
 
@@ -2186,7 +2222,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         // container element
         // An element which can have graphics elements and other container elements as child elements.
         // Specifically: ‘a’, ‘clipPath’, ‘defs’, ‘g’, ‘marker’, ‘mask’, ‘pattern’, ‘svg’, ‘switch’ and ‘symbol’.
-        let laid_out = if kind_is_svg_container_element(kind) {
+        let geometry = if kind_is_svg_container_element(kind) {
             // https://svgwg.org/svg2-draft/struct.html#Groups
             // 5.2. Grouping: the ‘g’ element
             // The ‘g’ element is a container element for grouping together related graphics elements.
@@ -2199,29 +2235,28 @@ impl<'pass> SvgFormattingContext<'pass> {
         };
 
         if let Some(mask) = self.first_child_of_kind(graphics_box, NodeKind::SVGMaskBox) {
-            self.layout_mask_or_clip(run, mask, &laid_out.cells);
+            self.layout_mask_or_clip(run, mask, geometry.object_bounding_box);
         }
         if let Some(clip) = self.first_child_of_kind(graphics_box, NodeKind::SVGClipBox) {
-            self.layout_mask_or_clip(run, clip, &laid_out.cells);
+            self.layout_mask_or_clip(run, clip, geometry.object_bounding_box);
         }
         for child in self.run.pass.children(graphics_box) {
             if self.node_kind(child) == NodeKind::SVGPatternBox {
-                self.layout_mask_or_clip(run, child, &laid_out.cells);
+                self.layout_mask_or_clip(run, child, geometry.object_bounding_box);
             }
         }
-        laid_out
+        geometry
     }
 
     /// Places a shape with the fragment it last committed, where laying it out again would produce that fragment: the
     /// shape has no boxes below it, nothing marked it for layout since that commit, and it resolves against the viewport
     /// it was committed in. Then neither this pass nor the commit redoes a shape that a change to a sibling did not
-    /// touch. Returns what the parent of the shape reads of it, if it placed the shape, which is laid out in `cells`.
+    /// touch. Returns the geometry of the shape, if it placed the shape, which is laid out in `cells`.
     fn place_unchanged_committed_shape(
         &self,
         shape: Node,
         cells: &Cell<used_values::RootInputCells>,
-        facts: SvgElementFacts,
-    ) -> Option<LaidOutSvgElement> {
+    ) -> Option<SvgGeometry> {
         if !self.viewport_is_committed_viewport
             || self.node_kind(shape) != NodeKind::SVGGeometryBox
             || !self.first_child(shape).is_invalid()
@@ -2242,19 +2277,22 @@ impl<'pass> SvgFormattingContext<'pass> {
             .with_current_committed_fragment_link(shape, |link| link.clone())?;
         let fragment = link.fragment.clone();
         fragment.svg()?.path.as_ref()?;
-        let committed_offset = link.committed_offset;
-        // The transforms and the stroke's percentage basis are what the shape's facts take from outside its own
-        // geometry.
-        let committed = fragment.svg().map(|svg| svg.facts).unwrap_or_default();
-        if committed.element_transform != (!facts.element_transform.is_identity()).then_some(facts.element_transform)
-            || committed.additional_element_transform
-                != (!facts.additional_element_transform.is_identity()).then_some(facts.additional_element_transform)
-            || committed.viewport_percentage_basis != facts.viewport_percentage_basis
-        {
+        let committed_offset = link.offset_in_frame(
+            self.run.pass.frame,
+            fragment_tree::committed_content_size_of(&self.run.pass, link.placement.containing_block),
+        );
+        // The transform and the viewport are what the shape's geometry takes from outside its own boxes.
+        let committed_geometry = fragment.svg()?.geometry;
+        let geometry = self.geometry_of(
+            shape,
+            committed_geometry.object_bounding_box,
+            committed_geometry.stroke_bounding_box,
+        );
+        if geometry != committed_geometry {
             return None;
         }
         cells.update_cells(|cells| {
-            cells.take_box_metrics_of_committed_link(&link);
+            cells.take_box_metrics_of_committed_link(&link, self.run.pass.frame);
             cells.has_definite_block_size = true;
         });
         self.place_laid_out_child(
@@ -2264,10 +2302,7 @@ impl<'pass> SvgFormattingContext<'pass> {
             committed_offset.y,
             Some(fragment_tree::RunRootFragment::propagating_nothing(fragment)),
         );
-        Some(LaidOutSvgElement {
-            cells: cells.get(),
-            content_offset: committed_offset,
-        })
+        Some(geometry)
     }
 
     fn layout_path_like_element(
@@ -2276,7 +2311,7 @@ impl<'pass> SvgFormattingContext<'pass> {
         graphics_box: Node,
         cells: &Cell<used_values::RootInputCells>,
         facts: SvgElementFacts,
-    ) -> LaidOutSvgElement {
+    ) -> SvgGeometry {
         // A shape's geometry is its own attributes and computed style against the viewport, and
         // text is its own character data shaped with its own font cascade, so the pass draws both.
         let kind = self.node_kind(graphics_box);
@@ -2298,8 +2333,8 @@ impl<'pass> SvgFormattingContext<'pass> {
         // cells corresponding to the text within the elements otherwise.
         // NB: A text content element's box is its bounding box: The box getBBox() and getBoundingClientRect() report.
         let is_text_content_box = matches!(kind, NodeKind::SVGTextBox | NodeKind::SVGTextPathBox);
-        let [x, y, width, height] = path.bounding_box();
-        let mut bounding_box = float_rect_to_css_pixels(FfiFloatRect { x, y, width, height });
+        let path_bounding_box = FloatRect::from_array(path.bounding_box());
+        let mut bounding_box = float_rect_to_css_pixels(path_bounding_box);
         // AD-HOC: The spec's fill-shape for text is just its glyph cells. We follow what other engines do: Cover the
         //         glyph outlines, so a glyph that overflows its cell (an italic's overhang, e.g.) stays within the box.
         // FIXME: A <textPath>'s box covers its glyph outlines, not the glyph cells laid along its path.
@@ -2316,23 +2351,22 @@ impl<'pass> SvgFormattingContext<'pass> {
             // <text> and <tspan> elements can contain more text elements, whose glyph cells count toward this box too.
             for child in self.run.pass.children(graphics_box) {
                 if matches!(self.node_kind(child), NodeKind::SVGTextBox | NodeKind::SVGTextPathBox) {
-                    let laid_out_child = self.layout_graphics_element(run, child);
-                    let offset = laid_out_child.content_offset;
-                    bounding_box.unite(SvgCssPixelRect {
-                        x: offset.x,
-                        y: offset.y,
-                        width: laid_out_child.cells.content_inline_size,
-                        height: laid_out_child.cells.content_block_size,
-                    });
+                    let child_geometry = self.layout_graphics_element(run, child);
+                    bounding_box.unite(float_rect_to_css_pixels(child_geometry.stroke_bounding_box));
                 }
             }
         }
 
-        self.run.update_svg_payload_of(graphics_box, |svg| {
+        self.update_svg_payload_of(graphics_box, |svg| {
             svg.path = Some(std::sync::Arc::new(path));
             svg.text_character_cells = character_cells.map(std::sync::Arc::new);
         });
-        self.set_content_rect(graphics_box, cells, bounding_box)
+        let object_bounding_box = if is_text_content_box {
+            bounding_box.to_float_rect()
+        } else {
+            path_bounding_box
+        };
+        self.set_content_rect(graphics_box, cells, bounding_box, object_bounding_box)
     }
 
     // https://w3c.github.io/svgwg/svg2-draft/embedded.html#Placement
@@ -2341,7 +2375,7 @@ impl<'pass> SvgFormattingContext<'pass> {
     // does not have an intrinsic size (such as image types with no defined dimensions), it is
     // assumed to have a width of 300px and a height of 150px.
     fn svg_image_bounding_box(&self, image_box: Node) -> SvgCssPixelRect {
-        use crate::painting::record::paint::replaced::{Fraction, SizeWithAspectRatio, run_default_sizing_algorithm};
+        use crate::layout::replaced_sizing::{Fraction, SizeWithAspectRatio, run_default_sizing_algorithm};
         let style = self.style(image_box);
         let specified_width = style
             .width()
@@ -2379,16 +2413,17 @@ impl<'pass> SvgFormattingContext<'pass> {
         }
     }
 
-    fn layout_image_element(&self, image_box: Node, cells: &Cell<used_values::RootInputCells>) -> LaidOutSvgElement {
-        self.set_content_rect(image_box, cells, self.svg_image_bounding_box(image_box))
+    fn layout_image_element(&self, image_box: Node, cells: &Cell<used_values::RootInputCells>) -> SvgGeometry {
+        let bounding_box = self.svg_image_bounding_box(image_box);
+        self.set_content_rect(image_box, cells, bounding_box, bounding_box.to_float_rect())
     }
 
-    /// Lays out `resource`, a mask, clip or pattern of a box whose sizes and box sides are `parent_metrics`.
+    /// Lays out `resource`, a mask, clip or pattern of an element whose object bounding box is `target_bounding_box`.
     fn layout_mask_or_clip(
         &mut self,
         run: &FormattingContextRun<'pass>,
         resource: Node,
-        parent_metrics: &used_values::RootInputCells,
+        target_bounding_box: FloatRect,
     ) {
         let kind = self.node_kind(resource);
         let facts = self.svg_facts(resource);
@@ -2416,20 +2451,16 @@ impl<'pass> SvgFormattingContext<'pass> {
                 let parent = self.parent(resource);
                 assert!(!parent.is_invalid());
                 (
-                    CssPixels::nearest_value_for(
-                        attributes.pattern_width.value as f64 * parent_metrics.content_inline_size().to_double(),
-                    ),
-                    CssPixels::nearest_value_for(
-                        attributes.pattern_height.value as f64 * parent_metrics.content_block_size().to_double(),
-                    ),
+                    CssPixels::nearest_value_for_f32(attributes.pattern_width.value * target_bounding_box.width),
+                    CssPixels::nearest_value_for_f32(attributes.pattern_height.value * target_bounding_box.height),
                 )
             }
         } else if attributes.content_units == SVG_UNITS_OBJECT_BOUNDING_BOX {
             let parent = self.parent(resource);
             assert!(!parent.is_invalid());
             (
-                parent_metrics.content_inline_size(),
-                parent_metrics.content_block_size(),
+                CssPixels::nearest_value_for_f32(target_bounding_box.width),
+                CssPixels::nearest_value_for_f32(target_bounding_box.height),
             )
         } else {
             (self.viewport_width, self.viewport_height)
@@ -2443,7 +2474,14 @@ impl<'pass> SvgFormattingContext<'pass> {
             self.percentage_block_insets_of_run_root_children_have_definite_basis,
         );
         nested_context.lay_out_contents(run, self.nested_layout_input(), &resource_cells);
-        self.place_child(resource, &resource_cells, CssPixels::default(), CssPixels::default());
+        let resource_rect = FloatRect::new(0.0, 0.0, width.to_float(), height.to_float());
+        self.place_child(
+            resource,
+            &resource_cells,
+            CssPixels::default(),
+            CssPixels::default(),
+            resource_rect,
+        );
     }
 
     fn layout_container_element(
@@ -2451,58 +2489,36 @@ impl<'pass> SvgFormattingContext<'pass> {
         run: &FormattingContextRun<'pass>,
         container: Node,
         cells: &Cell<used_values::RootInputCells>,
-    ) -> LaidOutSvgElement {
-        let mut has_points = false;
-        let mut min_x = CssPixels::default();
-        let mut min_y = CssPixels::default();
-        let mut max_x = CssPixels::default();
-        let mut max_y = CssPixels::default();
+    ) -> SvgGeometry {
+        let mut object_bounding_box = None;
+        let mut stroke_bounding_box = None;
         for child in self.run.pass.children(container) {
             // Masks/clips/patterns do not change the bounding box of their parents.
             if NodeFacts::new(&self.run.pass, child).is_box()
                 && !node_facts::kind_is_svg_resource_box(self.node_kind(child))
             {
-                let laid_out_child = self
+                let child_geometry = self
                     .layout_svg_element(run, child)
                     .expect("a box below an SVG container element is laid out");
-                let child_metrics = laid_out_child.cells;
-                // The container's bounding box includes descendants' transforms; children lay out
-                // untransformed, so each child rect maps through the child's own transform here.
-                let child_content_offset = laid_out_child.content_offset;
-                let mapped_child_rect = self.svg_element_transform(child).map_rect(FfiFloatRect {
-                    x: child_content_offset.x.raw_value() as f32 / 64.0,
-                    y: child_content_offset.y.raw_value() as f32 / 64.0,
-                    width: child_metrics.content_inline_size().raw_value() as f32 / 64.0,
-                    height: child_metrics.content_block_size().raw_value() as f32 / 64.0,
-                });
-                let left = CssPixels::nearest_value_for_f32(mapped_child_rect.x);
-                let top = CssPixels::nearest_value_for_f32(mapped_child_rect.y);
-                let right = left + CssPixels::nearest_value_for_f32(mapped_child_rect.width);
-                let bottom = top + CssPixels::nearest_value_for_f32(mapped_child_rect.height);
-                if has_points {
-                    min_x = min_x.min(left);
-                    min_y = min_y.min(top);
-                    max_x = max_x.max(right);
-                    max_y = max_y.max(bottom);
-                } else {
-                    min_x = left;
-                    min_y = top;
-                    max_x = right;
-                    max_y = bottom;
-                    has_points = true;
-                }
+                // The container's bounding boxes include descendants' transforms; children lay out
+                // untransformed, so each child's boxes map through the child's own transform here.
+                let local_transform = libgfx_rust::AffineTransform::from(child_geometry.local_transform);
+                object_bounding_box = Some(united_even_if_empty(
+                    object_bounding_box,
+                    local_transform.map_rect(child_geometry.object_bounding_box),
+                ));
+                stroke_bounding_box = Some(united_even_if_empty(
+                    stroke_bounding_box,
+                    float_rect_to_css_pixels(local_transform.map_rect(child_geometry.stroke_bounding_box))
+                        .to_float_rect(),
+                ));
             }
         }
-
         self.set_content_rect(
             container,
             cells,
-            SvgCssPixelRect {
-                x: min_x,
-                y: min_y,
-                width: max_x - min_x,
-                height: max_y - min_y,
-            },
+            float_rect_to_css_pixels(stroke_bounding_box.unwrap_or_default()),
+            object_bounding_box.unwrap_or_default(),
         )
     }
 }

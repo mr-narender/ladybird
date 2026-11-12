@@ -94,13 +94,14 @@ public:
     virtual void did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) override;
     virtual Messages::WebContentClient::DidRequestBlobUrlEntryResponse did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) override;
 
-    WebContentClient(NonnullOwnPtr<IPC::Transport>, IsPrivate, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
+    WebContentClient(NonnullOwnPtr<IPC::Transport>, BrowsingSession&, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id);
     ~WebContentClient();
 
     IsPrivate is_private() const { return m_is_private; }
     BrowsingSession& session() const { return *m_session; }
 
     RequestServerSiteBindings& request_server_site_bindings() { return m_request_server_site_bindings; }
+    RequestServerSiteBindings const& request_server_site_bindings() const { return m_request_server_site_bindings; }
     void remove_blob_url_entries();
 
     void connect_test_endpoint(NonnullOwnPtr<IPC::Transport>);
@@ -166,6 +167,8 @@ public:
     // the same reason.
     virtual bool may_act_for_storage_area(Web::StorageAPI::StorageAreaId) const override;
 
+    // The tabs with an open page in this process, each listed once.
+    Vector<u64> performance_owners() const;
     Optional<u64> exclusive_performance_owner() const;
 
     void did_lose_process();

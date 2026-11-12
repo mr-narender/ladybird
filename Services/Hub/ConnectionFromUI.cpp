@@ -544,6 +544,7 @@ Messages::HubServer::InitializeResponse ConnectionFromUI::initialize()
     state.scripting_enabled = Application::the().scripting_enabled();
     state.blocks_pop_ups = Application::the().blocks_pop_ups();
     state.devtools_enabled = Application::the().devtools_enabled();
+    state.sandbox_is_disabled = options.disable_sandbox == WebView::DisableSandbox::Yes;
     state.downloads = downloads();
     state.urls = options.urls;
     state.raw_urls = options.raw_urls;
@@ -907,6 +908,54 @@ void ConnectionFromUI::view_set_system_visibility_state(u64 view_id, Web::HTML::
         view->set_system_visibility_state(visibility_state);
         view->push_state_to_ui();
     }
+}
+
+void ConnectionFromUI::view_set_hosts_remote_layer(u64 view_id, bool hosts_remote_layer)
+{
+    if (auto* view = find_view(view_id))
+        view->set_hosts_remote_layer(hosts_remote_layer);
+}
+
+void ConnectionFromUI::view_set_wants_frame_notifications(u64 view_id, bool wants_frame_notifications)
+{
+    if (auto* view = find_view(view_id))
+        view->set_wants_frame_notifications(wants_frame_notifications);
+}
+
+void ConnectionFromUI::view_take_frame_snapshot(u64 view_id, u64 request_id, Optional<Gfx::IntSize> maximum_size)
+{
+    auto* view = find_view(view_id);
+    if (!view) {
+        async_view_did_take_frame_snapshot(view_id, request_id, {});
+        return;
+    }
+    view->take_frame_snapshot(maximum_size, [view_id, request_id](Optional<Gfx::ShareableBitmap> snapshot) {
+        if (auto* ui = ConnectionFromUI::the())
+            ui->async_view_did_take_frame_snapshot(view_id, request_id, move(snapshot));
+    });
+}
+
+void ConnectionFromUI::view_begin_synchronized_resize(u64 view_id, u64 token)
+{
+    if (auto* view = find_view(view_id))
+        view->begin_synchronized_resize(token);
+}
+
+// The UI waits for the answer on its main thread, so a view that is gone answers as well.
+void ConnectionFromUI::view_await_synchronized_resize_frame(u64 view_id, u64 token, Gfx::IntSize size)
+{
+    if (auto* view = find_view(view_id))
+        view->await_synchronized_resize_frame(token, size);
+    else
+        async_view_did_hold_synchronized_resize_frame(view_id, token);
+}
+
+void ConnectionFromUI::view_commit_synchronized_resize(u64 view_id, u64 token)
+{
+    if (auto* view = find_view(view_id))
+        view->commit_synchronized_resize(token);
+    else
+        async_view_did_commit_synchronized_resize(view_id, token);
 }
 
 void ConnectionFromUI::view_set_presents_from_cpu_memory(u64 view_id, bool presents_from_cpu_memory)

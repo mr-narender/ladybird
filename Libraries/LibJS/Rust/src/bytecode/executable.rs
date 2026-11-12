@@ -20,8 +20,9 @@ use crate::bytecode::encoding::{IdentifierTableIndex, PropertyKeyTableIndex, Str
 use crate::bytecode::executable_data::{ConstantValue, ExceptionHandler, MAXIMUM_INTERNED_CONSTANT_LENGTH};
 use crate::bytecode::executable_data::{ExecutableData, LocalVariableMetadata};
 use crate::bytecode::feedback::{ExecutableFeedback, FeedbackSlotCounts};
-use crate::bytecode::source_map::{SourceMapEntry, SourceOffset, SourceOffsetEntry};
-use crate::gc::class::{Finalize, GcCell, define_cell};
+use crate::bytecode::operand::UNCACHED_SITE;
+use crate::bytecode::source_map::{SourceMapEntries, SourceMapEntry, SourceOffset};
+use crate::gc::class::{ExternalMemorySize, Finalize, GcCell, define_cell};
 use crate::gc::defer_gc::DeferGc;
 use crate::gc::root::MarkedVec;
 use crate::gc::sweep::Sweep;
@@ -137,8 +138,20 @@ impl PropertyLookupCacheEntryData {
 unsafe impl SweptAfterCollection for PropertyLookupCacheEntry {}
 
 impl PropertyLookupCacheEntry {
-    pub fn new() -> Self {
-        Self::from_data(PropertyLookupCacheEntryData::default())
+    /// An empty entry, like the default PropertyLookupCacheEntryData.
+    pub const fn new() -> Self {
+        Self {
+            entry_type: Cell::new(PropertyLookupCacheEntryType::Empty),
+            property_offset: Cell::new(0),
+            shape_dictionary_generation: Cell::new(0),
+            writes_data_property: Cell::new(false),
+            new_shape: Cell::new(None),
+            shape: Cell::new(None),
+            prototype: Cell::new(None),
+            prototype_chain_validity: Cell::new(None),
+            key: Cell::new(0),
+            getter: Cell::new(None),
+        }
     }
 
     fn from_data(data: PropertyLookupCacheEntryData) -> Self {
@@ -240,6 +253,25 @@ struct MonomorphicData {
     entry: PropertyLookupCacheEntry,
 }
 
+/// The data of the caches of the slot that the sites past the last one share, in every thread. Its entry stays empty,
+/// so that their accesses go straight to their slow paths.
+#[repr(transparent)]
+struct UncacheableData(MonomorphicData);
+
+// SAFETY: Nothing writes the entry, so threads only ever read it: monomorphic_data() does not hand it out, so neither
+//         do first_entry_slot(), entries() and entry_slots_for_shape(), update(), forget_entries() and
+//         remove_dead_entries() skip the caches that share it, and clear() does not free it.
+unsafe impl Sync for UncacheableData {}
+
+static UNCACHEABLE_DATA: UncacheableData = UncacheableData(MonomorphicData {
+    entry: PropertyLookupCacheEntry::new(),
+});
+
+/// The data pointer of the caches that share UNCACHEABLE_DATA.
+fn uncacheable_data() -> usize {
+    core::ptr::addr_of!(UNCACHEABLE_DATA.0).expose_provenance()
+}
+
 #[repr(C)]
 struct PolymorphicData {
     entries: [PropertyLookupCacheEntry; MAX_NUMBER_OF_SHAPES_TO_REMEMBER],
@@ -324,17 +356,33 @@ impl PropertyLookupCache {
         Self { data: Cell::new(0) }
     }
 
+    /// The cache of the slot that the sites past the last one share.
+    fn new_uncacheable() -> Self {
+        Self {
+            data: Cell::new(uncacheable_data()),
+        }
+    }
+
+    fn is_uncacheable(&self) -> bool {
+        self.data.get() == uncacheable_data()
+    }
+
     fn data_pointer<T>(&self, tag: usize) -> Option<&T> {
         let data = self.data.get();
         if data == 0 || data & PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK != tag {
             return None;
         }
         let pointer = core::ptr::with_exposed_provenance::<T>(data & !PROPERTY_LOOKUP_CACHE_DATA_TAG_MASK);
-        // SAFETY: The tagged pointer came from Box::into_raw of a T with this tag, and the cache owns it until clear().
+        // SAFETY: The tagged pointer came from Box::into_raw of a T with this tag, and the cache owns it until clear(), or
+        //         it is UNCACHEABLE_DATA, which is static.
         Some(unsafe { &*pointer })
     }
 
+    /// The data of a monomorphic cache, never UNCACHEABLE_DATA, whose entry must not be lent out.
     fn monomorphic_data(&self) -> Option<&MonomorphicData> {
+        if self.is_uncacheable() {
+            return None;
+        }
         self.data_pointer(0)
     }
 
@@ -455,7 +503,7 @@ impl PropertyLookupCache {
         entry_type: PropertyLookupCacheEntryType,
         callback: impl FnOnce(&mut PropertyLookupCacheEntryData),
     ) {
-        if self.is_keyed_generic() {
+        if self.is_keyed_generic() || self.is_uncacheable() {
             return;
         }
 
@@ -575,6 +623,9 @@ impl PropertyLookupCache {
     /// Forgets the entries, but keeps the storage of a monomorphic cache, whose next entry then takes the place of the
     /// empty one.
     pub fn forget_entries(&self) {
+        if self.is_uncacheable() {
+            return;
+        }
         if let Some(data) = self.monomorphic_data() {
             data.entry.set(PropertyLookupCacheEntryData::default());
             return;
@@ -583,6 +634,12 @@ impl PropertyLookupCache {
     }
 
     pub fn clear(&self) {
+        if !self.is_uncacheable() {
+            self.free_data();
+        }
+    }
+
+    fn free_data(&self) {
         let data = self.data.get();
         if data == 0 || data == PROPERTY_LOOKUP_CACHE_KEYED_GENERIC_DATA {
             self.data.set(0);
@@ -613,6 +670,9 @@ impl PropertyLookupCache {
 
     /// Forgets the entries with a cell that died in this collection.
     pub fn remove_dead_entries(&self, sweep: &Sweep<'_>) {
+        if self.is_uncacheable() {
+            return;
+        }
         if let Some(data) = self.megamorphic_data() {
             for entry in data
                 .primary_entries
@@ -1231,7 +1291,24 @@ pub struct Executable {
 // NB: Every function that was called has these bytes.
 const _: () = assert!(size_of::<Executable>() <= 256);
 
-define_cell!(Executable, Other);
+define_cell!(Executable, Other, external_memory_size: external_memory_size);
+
+// Executable::external_memory_size(): the tables of the executable, and its code while nothing else holds the code.
+// Code that something else holds, like a program that gets linked again, is that holder's memory. A property lookup
+// cache makes its data once its access runs, so each one counts as if it had the one entry that most caches that run
+// have. The cache of the slot that the sites past the last one share has no data of its own.
+impl ExternalMemorySize for Executable {
+    fn external_memory_size(&self) -> usize {
+        let code_size = if Arc::strong_count(&self.code) == 1 {
+            self.code.memory_size()
+        } else {
+            0
+        };
+        let cache_data_size =
+            self.head.property_lookup_caches.len().min(UNCACHED_SITE as usize) * size_of::<MonomorphicData>();
+        code_size + self.tables_memory_size() + cache_data_size
+    }
+}
 
 /// Executable::LocalVariableScopeRange: the part of the source code in which a local variable is in scope.
 #[derive(Clone, Copy)]
@@ -1277,15 +1354,15 @@ impl Executable {
     }
 
     pub fn get_identifier(&self, index: IdentifierTableIndex) -> &Utf16FlyString {
-        &self.code.identifier_table[index.0 as usize]
+        &self.code.identifier_table[index.index()]
     }
 
     pub fn get_property_key(&self, index: PropertyKeyTableIndex) -> &PropertyKey {
-        &self.property_keys[index.0 as usize]
+        &self.property_keys[index.index()]
     }
 
     pub fn get_string(&self, index: StringTableIndex) -> &Utf16FlyString {
-        &self.code.string_table[index.0 as usize]
+        &self.code.string_table[index.index()]
     }
 
     /// Forgets the cells the inline caches remember that died in this collection.
@@ -1326,8 +1403,13 @@ impl Executable {
         _defer_gc: &DeferGc<'_>,
     ) -> Self {
         let cache_counts = &code.cache_counts;
-        let property_lookup_caches =
-            tables.slice((0..cache_counts.property_lookup).map(|_| PropertyLookupCache::new()));
+        let property_lookup_caches = tables.slice((0..cache_counts.property_lookup).map(|index| {
+            if index == UNCACHED_SITE {
+                PropertyLookupCache::new_uncacheable()
+            } else {
+                PropertyLookupCache::new()
+            }
+        }));
         let global_variable_caches =
             tables.slice((0..cache_counts.global_variable).map(|_| GlobalVariableCache::default()));
         let environment_coordinate_caches =
@@ -1420,12 +1502,26 @@ impl Executable {
                 .allocate(|defer_gc| Self::build(vm, data, tables, shared_function_data, source_code, defer_gc))
         });
         vm.register_executable(executable);
+        vm.heap()
+            .did_allocate_external_memory(executable.external_memory_size());
 
         if let Some(debugger) = vm.debugger() {
             debugger.register_executable(vm, executable);
         }
 
         executable
+    }
+
+    /// The bytes of the tables in `tables`.
+    fn tables_memory_size(&self) -> usize {
+        size_of_val(&*self.head.constants)
+            + size_of_val(&*self.head.property_lookup_caches)
+            + size_of_val(&*self.head.global_variable_caches)
+            + size_of_val(&*self.head.environment_coordinate_caches)
+            + size_of_val(&*self.environment_shape_caches)
+            + size_of_val(&*self.object_shape_caches)
+            + size_of_val(&*self.property_keys)
+            + size_of_val(&*self.shared_function_data)
     }
 
     /// The bytes of the tables that an executable of `code` has from the start.
@@ -1526,15 +1622,7 @@ impl Executable {
         if offset as usize >= self.bytecode().len() {
             return None;
         }
-        let source_map = self.source_map();
-        if source_map.is_empty() {
-            return None;
-        }
-        let entries_at_or_before_offset = source_map.partition_point(|entry| entry.bytecode_offset <= offset);
-        if entries_at_or_before_offset == 0 {
-            return None;
-        }
-        let entry = &source_map[entries_at_or_before_offset - 1];
+        let entry = self.source_map().entry_at(offset)?;
         let (line, column) = if entry.source_offset == SourceOffset::NONE {
             (0, 0)
         } else {
@@ -1554,11 +1642,7 @@ impl Executable {
     fn source_around(&self, offset: u32) -> Option<(Vec<u16>, usize)> {
         const LONGEST_TEXT: usize = 1024;
         let positions = &self.code.position_source;
-        let source_map = self.source_map();
-        let entries_at_or_before_offset = source_map.partition_point(|entry| entry.bytecode_offset <= offset);
-        let source_offset = source_map
-            .get(entries_at_or_before_offset.checked_sub(1)?)?
-            .source_offset;
+        let source_offset = self.source_map().entry_at(offset)?.source_offset;
         if source_offset == SourceOffset::NONE {
             return None;
         }
@@ -1632,8 +1716,8 @@ impl Executable {
         self.code.source_positions()
     }
 
-    pub fn source_map(&self) -> &[SourceOffsetEntry] {
-        &self.code.source_map
+    pub fn source_map(&self) -> SourceMapEntries<'_> {
+        SourceMapEntries::new(&self.code.source_map)
     }
 
     pub fn local_variable_metadata(&self) -> &[LocalVariableMetadata] {
@@ -1666,9 +1750,19 @@ impl Executable {
         &self.code.variable_names[self.local_variable_metadata().len()..]
     }
 
+    /// Whether the code at the bytecode offset `pc` is strict.
+    pub fn is_strict_at(&self, pc: u32) -> bool {
+        if self.is_strict_mode {
+            return true;
+        }
+        let ranges = &self.code.strict_ranges;
+        let index = ranges.partition_point(|range| range.end_offset <= pc);
+        ranges.get(index).is_some_and(|range| range.start_offset <= pc)
+    }
+
     pub fn length_identifier(&self) -> Option<PropertyKeyTableIndex> {
         self.length_identifier
-            .map(|index| PropertyKeyTableIndex(index.get() - 1))
+            .map(|index| PropertyKeyTableIndex::from_index(index.get() - 1))
     }
 
     fn rare_data_mut(&mut self) -> &mut ExecutableRareData {

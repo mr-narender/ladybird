@@ -9,7 +9,6 @@
 //! a token nor call an entry that does.
 
 use super::*;
-use crate::painting::hit_test::caret::HostNodeScopes;
 use crate::painting::host::FfiCaretAt;
 use crate::painting::host::FfiVisualContextTreeInputs;
 use crate::painting::paint_passes::{PassEffect, pending_preparation, run as run_paint_pass};
@@ -82,19 +81,150 @@ pub extern "C" fn layout_row_paintable_wheel_scrollable_axes(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn layout_row_snap_container_geometry(
+fn snap_container_geometry(
     host: &crate::render_state::DocumentHost,
     snap_container: NodeSlotId,
-    out_geometry: &mut crate::painting::host::FfiSnapContainerGeometry,
-) -> bool {
-    let geometry = read_measured_rows(host, super::node_read(), |rows| {
+) -> Option<libcompositing_rust::scrolling::scroll_snap_selection::SnapContainerGeometry> {
+    read_measured_rows(host, super::node_read(), |rows| {
         crate::painting::scroll_snap::snap_container_geometry(rows, snap_container)
-    });
-    let Some(geometry) = geometry else {
+    })
+    .map(Into::into)
+}
+
+fn snap_areas(
+    host: &crate::render_state::DocumentHost,
+    snap_container: NodeSlotId,
+) -> Vec<libcompositing_rust::scrolling::scroll_snap_selection::SnapAreaGeometry> {
+    read_arena(host, super::node_read(), snap_container, |arena, snap_container| {
+        let mut areas = Vec::new();
+        crate::painting::scroll_snap::for_each_snap_area(&arena.paintable_rows(), snap_container, |slot, mut area| {
+            // A re-snap right after layout runs ahead of the visual context tree that names the area's
+            // element, so the area is named by what the build stamped onto its row.
+            area.node_id = arena.unique_node_ids().id(slot);
+            areas.push(area.into());
+        });
+        areas
+    })
+}
+
+/// # Safety
+///
+/// `receive` must copy what it keeps of the destination synchronously.
+unsafe fn receive_snap_destination(
+    destination: libcompositing_rust::scrolling::SnapDestination,
+    receiver: *mut c_void,
+    receive: unsafe extern "C" fn(*mut c_void, &crate::painting::host::FfiSnapDestination<'_>),
+) {
+    use crate::painting::host::{FfiSnapAreaIdentity, FfiSnapDestination};
+    let x: Vec<FfiSnapAreaIdentity> = destination.snapped_areas.x.into_iter().map(Into::into).collect();
+    let y: Vec<FfiSnapAreaIdentity> = destination.snapped_areas.y.into_iter().map(Into::into).collect();
+    let destination = FfiSnapDestination {
+        position: destination.position.into(),
+        snapped_x: destination.snapped_x,
+        snapped_y: destination.snapped_y,
+        evaluated_x: destination.evaluated_x,
+        evaluated_y: destination.evaluated_y,
+        snapped_areas_x: ak::Span::new(&x),
+        snapped_areas_y: ak::Span::new(&y),
+    };
+    // SAFETY: The caller copies what it keeps of the destination synchronously.
+    unsafe { receive(receiver, &destination) };
+}
+
+/// Answers false, without calling `receive`, for a box that snaps along none of the axes the scroll selects a snap
+/// position in.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread. `receive` must copy what it keeps of the
+/// destination synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_select_snap_destination(
+    host: &crate::render_state::DocumentHost,
+    snap_container: NodeSlotId,
+    destination: FfiCssPixelPoint,
+    strategy: &crate::painting::host::FfiSnapSelectionStrategy,
+    receiver: *mut c_void,
+    receive: unsafe extern "C" fn(*mut c_void, &crate::painting::host::FfiSnapDestination<'_>),
+) -> bool {
+    use libcompositing_rust::scrolling::scroll_snap_selection::{axes_to_evaluate, select_snap_destination};
+    let Some(geometry) = snap_container_geometry(host, snap_container) else {
         return false;
     };
-    *out_geometry = geometry;
+    let strategy = strategy.into();
+    if axes_to_evaluate(geometry.axes, &strategy).is_empty() {
+        return false;
+    }
+    let destination = select_snap_destination(
+        &geometry,
+        &snap_areas(host, snap_container),
+        destination.into(),
+        &strategy,
+    );
+    // SAFETY: The caller copies what it keeps of the destination synchronously.
+    unsafe { receive_snap_destination(destination, receiver, receive) };
+    true
+}
+
+struct SnapAreaDomRelationsOfHost<'a>(&'a crate::painting::host::FfiSnapAreaDomRelations);
+
+impl crate::painting::scroll_resnap::SnapAreaDomRelations for SnapAreaDomRelationsOfHost<'_> {
+    fn area_contains_focused_node(&self, area: libcompositing_rust::scrolling::SnapAreaIdentity) -> bool {
+        // SAFETY: The entry point's caller keeps the relation callbacks live for selection.
+        unsafe { (self.0.area_contains_focused_node)(self.0.context, area.into()) }
+    }
+
+    fn area_contains_targeted_element(&self, area: libcompositing_rust::scrolling::SnapAreaIdentity) -> bool {
+        // SAFETY: The entry point's caller keeps the relation callbacks live for selection.
+        unsafe { (self.0.area_contains_targeted_element)(self.0.context, area.into()) }
+    }
+
+    fn element_of_area_is_ancestor_of_element_of(
+        &self,
+        area: libcompositing_rust::scrolling::SnapAreaIdentity,
+        other_area: libcompositing_rust::scrolling::SnapAreaIdentity,
+    ) -> bool {
+        // SAFETY: The entry point's caller keeps the relation callbacks live for selection.
+        unsafe { (self.0.element_of_area_is_ancestor_of_element_of)(self.0.context, area.into(), other_area.into()) }
+    }
+}
+
+/// Answers false, without calling `receive`, for a box that snaps along no axis.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread. The relation callbacks must stay live for
+/// selection, and `receive` must copy what it keeps of the destination synchronously.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_select_resnap_destination(
+    host: &crate::render_state::DocumentHost,
+    snap_container: NodeSlotId,
+    current_offset: FfiCssPixelPoint,
+    snapped_areas_x: ak::Span<'_, crate::painting::host::FfiSnapAreaIdentity>,
+    snapped_areas_y: ak::Span<'_, crate::painting::host::FfiSnapAreaIdentity>,
+    relations: &crate::painting::host::FfiSnapAreaDomRelations,
+    receiver: *mut c_void,
+    receive: unsafe extern "C" fn(*mut c_void, &crate::painting::host::FfiSnapDestination<'_>),
+) -> bool {
+    let Some(geometry) = snap_container_geometry(host, snap_container) else {
+        return false;
+    };
+    if geometry.axes.is_empty() {
+        return false;
+    }
+    let selection = libcompositing_rust::scrolling::SnappedAreas {
+        x: snapped_areas_x.as_slice().iter().copied().map(Into::into).collect(),
+        y: snapped_areas_y.as_slice().iter().copied().map(Into::into).collect(),
+    };
+    let destination = crate::painting::scroll_resnap::select_resnap_destination(
+        &geometry,
+        &snap_areas(host, snap_container),
+        current_offset.into(),
+        &selection,
+        &SnapAreaDomRelationsOfHost(relations),
+    );
+    // SAFETY: The caller copies what it keeps of the destination synchronously.
+    unsafe { receive_snap_destination(destination, receiver, receive) };
     true
 }
 
@@ -352,61 +482,44 @@ pub unsafe extern "C" fn render_state_sync_svg_paint_resources(
 }
 
 /// Re-reads the scroll containers' offsets when something invalidated them since the last refresh, resolves the
-/// sticky nodes' offsets on top of them, and hands the dense device-pixel snapshot to `publish`; otherwise the caller
-/// keeps its copy.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread; `publish` is called synchronously with `sink` and a
-/// view of the snapshot that is valid only for the duration of that call.
+/// sticky nodes' offsets on top of them, and has `host` keep them as its document's scroll state; otherwise the host
+/// keeps the one it has. Refreshes the compositor scroll table of the tree as well. Answers whether the offsets
+/// changed, and what refreshing the table changed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_refresh_scroll_state(
+pub extern "C" fn render_state_refresh_scroll_state(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     device_pixels_per_css_pixel: f64,
-    sink: *mut c_void,
-    publish: unsafe extern "C" fn(*mut c_void, *const libgfx_rust::FloatPoint, usize),
-) {
-    let snapshot = run_paint_pass(read, host, PassEffect::RewritesRows, |arena| {
-        crate::painting::paint_passes::refresh_scroll_state(arena, device_pixels_per_css_pixel)
+    device_viewport_size: libgfx_rust::IntSize,
+) -> crate::painting::paint_passes::FfiCompositorScrollRefreshOutcome {
+    let (device_offsets, mut outcome) = run_paint_pass(read, host, PassEffect::RewritesRows, |arena| {
+        crate::painting::paint_passes::refresh_scroll_state(arena, device_pixels_per_css_pixel, device_viewport_size)
     });
-    if let Some(snapshot) = snapshot {
-        // SAFETY: The C++ sink copies the offsets synchronously.
-        unsafe { publish(sink, snapshot.as_ptr(), snapshot.len()) };
-    }
+    outcome.scroll_state_changed =
+        device_offsets.is_some_and(|device_offsets| host.refresh_scroll_state(device_offsets));
+    outcome
 }
 
+/// Has `host` forget its document's scroll state, as the viewport's row or the document's paint state starts over.
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_forget_scroll_state(host: &crate::render_state::DocumentHost) {
+    host.forget_scroll_state();
+}
+
+/// Hands `append` the scroll state of `host`'s document as the scroll logic of the compositor reads it.
+///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread. The host callback receives each snap area's
-/// geometry, valid for the duration of the call.
+/// `append` is called synchronously with `sink`, and must copy the bytes it keeps.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_for_each_snap_area(
+pub unsafe extern "C" fn render_state_encode_scroll_state(
     host: &crate::render_state::DocumentHost,
-    snap_container: NodeSlotId,
-    context: *mut c_void,
-    push_snap_area: unsafe extern "C" fn(*mut c_void, *const crate::painting::host::FfiSnapAreaGeometry),
+    sink: *mut c_void,
+    append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
 ) {
-    let areas = {
-        read_arena(host, super::node_read(), snap_container, |arena, snap_container| {
-            let mut areas = Vec::new();
-            crate::painting::scroll_snap::for_each_snap_area(
-                &arena.paintable_rows(),
-                snap_container,
-                |slot, mut area| {
-                    // A re-snap right after layout runs ahead of the visual context tree that names the area's
-                    // element, so the area is named by what the build stamped onto its row.
-                    area.node_id = arena.unique_node_ids().id(slot);
-                    areas.push(area);
-                },
-            );
-            areas
-        })
-    };
-    for area in &areas {
-        // SAFETY: The C++ callback copies the geometry into a caller-owned collection.
-        unsafe { push_snap_area(context, area) };
-    }
+    let bytes = host.scroll_state().to_encoded_bytes();
+    // SAFETY: The C++ sink copies the bytes synchronously.
+    unsafe { append(sink, bytes.as_ptr(), bytes.len()) };
 }
 
 /// # Safety
@@ -472,40 +585,6 @@ pub unsafe extern "C" fn render_state_take_recording_trace(
     // SAFETY: the host copies the text synchronously.
     unsafe { append_text(context, text.as_ptr(), text.len()) };
     true
-}
-
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_for_each_subtree_fragment_rect(
-    host: &crate::render_state::DocumentHost,
-    root: NodeSlotId,
-    context: *mut c_void,
-    consume: unsafe extern "C" fn(*mut c_void, NodeSlotId, FfiCssPixelRect),
-) {
-    let rects = {
-        read_arena(host, super::node_read(), root, |arena, root| {
-            let paintable_rows = arena.paintable_rows();
-            let mut rects = Vec::new();
-            if !paintable_rows.paintable_row_is_populated(root) {
-                return rects;
-            }
-            crate::painting::paint_order::for_each_in_paint_subtree(&paintable_rows, root, |current| {
-                for fragment in arena.committed_side_data(current).fragments() {
-                    rects.push((
-                        fragment.layout_node,
-                        crate::painting::text_fragment::absolute_rect(&paintable_rows, fragment).into(),
-                    ));
-                }
-            });
-            rects
-        })
-    };
-    for (layout_node, rect) in rects {
-        // SAFETY: The consumer copies its plain-data arguments synchronously.
-        unsafe { consume(context, layout_node, rect) };
-    }
 }
 
 /// The recorder state of `host`'s document, for a recording to take, once the last recording was published.
@@ -596,7 +675,7 @@ unsafe fn commit_frame(
         content,
         recorder,
         // SAFETY: Guaranteed by the caller.
-        presentation: unsafe { crate::painting::presentation::Presentation::adopt(presentation) }
+        presentation: unsafe { crate::painting::presentation::Presentation::adopt(presentation, &host.scroll_state()) }
             .expect("a committed frame is presented"),
         timestamp,
         held_for_testing,
@@ -855,25 +934,9 @@ fn with_hit_test_list_items_only<R>(
     with_hit_test_list(host, read, default, |_, _| {}, |list, _, source| query(list, source))
 }
 
-fn with_hit_test_list_and_caret_lines<R>(
-    host: &crate::render_state::DocumentHost,
-    read: &crate::render_state::BegunRead,
-    default: R,
-    query: impl FnOnce(&crate::painting::hit_test::HitTestList, &crate::painting::paint_read::PaintSource<'_>) -> R,
-) -> R {
-    with_hit_test_list(
-        host,
-        read,
-        default,
-        |list, source| list.build_caret_lines_if_needed(source),
-        |list, _, source| query(list, source),
-    )
-}
-
 fn with_hit_test_list_spatial_indexes_and_visual_context_tree<R>(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
-    needs_caret_lines: bool,
     default: R,
     query: impl FnOnce(
         &crate::painting::hit_test::HitTestList,
@@ -885,12 +948,7 @@ fn with_hit_test_list_spatial_indexes_and_visual_context_tree<R>(
         host,
         read,
         None,
-        |list, source| {
-            list.build_spatial_indexes_if_needed();
-            if needs_caret_lines {
-                list.build_caret_lines_if_needed(source);
-            }
-        },
+        |list, _| list.build_spatial_indexes_if_needed(),
         |list, rows, source| {
             let tree = rows.visual_context_tree.as_deref()?;
             Some(query(list, tree, source))
@@ -983,11 +1041,9 @@ pub extern "C" fn layout_hit_test_item_facts(
             "exporting a hit-test item that names a non-live paintable"
         );
         Some(crate::painting::host::FfiHitTestItemExport {
-            can_produce_caret_position: item.can_produce_caret_position,
             paintable: item.paintable,
             hit_node: item.hit_node,
             chrome_widget_kind: item.chrome_widget_kind,
-            caret_rect: item.caret_rect.into(),
             context: item.context,
         })
     })
@@ -1013,14 +1069,16 @@ pub extern "C" fn layout_hit_test_resolve_hit(
 pub unsafe extern "C" fn layout_hit_test_find_topmost_item(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
-    callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
+    query: crate::painting::host::FfiHitTestQuery,
     point: FfiCssPixelPoint,
     out: &mut crate::painting::host::FfiTopmostItem,
 ) {
+    let scroll_state = host.scroll_state();
+    let callbacks =
+        crate::painting::host::FfiHitTestQueryCallbacks::for_host_query(&query, scroll_state.device_offsets());
     *out = with_hit_test_list_spatial_indexes_and_visual_context_tree(
         host,
         read,
-        false,
         Default::default(),
         |list, tree, arena| {
             let mut sampled = None;
@@ -1038,174 +1096,55 @@ pub unsafe extern "C" fn layout_hit_test_find_topmost_item(
 pub unsafe extern "C" fn layout_hit_test_all(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
-    callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
+    query: crate::painting::host::FfiHitTestQuery,
     point: FfiCssPixelPoint,
     push_context: *mut c_void,
-    push: unsafe extern "C" fn(*mut c_void, usize),
+    push: unsafe extern "C" fn(*mut c_void, usize, FfiCssPixelPoint),
 ) {
-    let indices = with_hit_test_list_spatial_indexes_and_visual_context_tree(
-        host,
-        read,
-        false,
-        Vec::new(),
-        |list, tree, arena| {
+    let scroll_state = host.scroll_state();
+    let callbacks =
+        crate::painting::host::FfiHitTestQueryCallbacks::for_host_query(&query, scroll_state.device_offsets());
+    let hits =
+        with_hit_test_list_spatial_indexes_and_visual_context_tree(host, read, Vec::new(), |list, tree, arena| {
             let mut sampled = None;
             let tree = tree_as_the_query_reads_it(tree, &callbacks, &mut sampled);
             let world = callbacks.build_world_transforms(tree);
             list.hit_test_all(arena, tree, &callbacks.with_world_transforms(&world), point.into())
-        },
-    );
-    for index in indices {
-        // SAFETY: The C++ sink consumes the index synchronously.
-        unsafe { push(push_context, index) };
+        });
+    for hit in hits {
+        // SAFETY: The C++ sink consumes the hit synchronously.
+        unsafe { push(push_context, hit.index, hit.local_point.into()) };
     }
 }
 
-/// The caret position at `point`, constrained to `constraint_scope` when it names a node.
+/// The caret position at `point`, or where `constraint_scope` is a box, the one that box gives it.
 ///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread; the callbacks must stay valid for this synchronous
-/// call.
+/// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn layout_hit_test_caret_position_from_point(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
-    callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
+    query: crate::painting::host::FfiHitTestQuery,
     point: FfiCssPixelPoint,
-    mode: u8,
-    constraint_scope: crate::painting::host::FfiNodeIdentity,
+    constraint_scope: NodeSlotId,
     out: &mut FfiCaretAt,
 ) {
-    // SAFETY: Guaranteed by the entry point's contract.
-    let main_thread = unsafe { main_thread(host) };
-    let mode = crate::painting::hit_test::caret::CaretPositionMode::from_u8(mode);
-    *out = with_hit_test_list_spatial_indexes_and_visual_context_tree(host, read, true, None, |list, tree, arena| {
+    let scroll_state = host.scroll_state();
+    let callbacks =
+        crate::painting::host::FfiHitTestQueryCallbacks::for_host_query(&query, scroll_state.device_offsets());
+    *out = with_hit_test_list_spatial_indexes_and_visual_context_tree(host, read, None, |list, tree, arena| {
         let world = callbacks.build_world_transforms(tree);
         list.caret_position_from_point(
-            &HostNodeScopes {
-                main_thread: &main_thread,
-                callbacks: &callbacks,
-            },
             arena,
             tree,
             &callbacks.with_world_transforms(&world),
             point.into(),
-            mode,
             constraint_scope,
         )
     })
     .unwrap_or_else(FfiCaretAt::none);
-}
-
-/// The caret position at the start (`edge` 1) or end (`edge` 2) of the painted line holding the position `query`
-/// describes.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread; the query must stay valid for this synchronous call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_hit_test_caret_at_line_edge(
-    host: &crate::render_state::DocumentHost,
-    read: &crate::render_state::BegunRead,
-    callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
-    query: crate::painting::host::FfiCaretPositionQuery,
-    offset: usize,
-    affinity_is_downstream: bool,
-    edge: u8,
-    physical: bool,
-    scope: crate::painting::host::FfiNodeIdentity,
-    out: &mut FfiCaretAt,
-) {
-    let edge = crate::painting::hit_test::caret::CaretPositionType::from_u8(edge);
-    // SAFETY: Guaranteed by the entry point's contract.
-    let main_thread = unsafe { main_thread(host) };
-    *out = with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
-        list.caret_at_line_edge(
-            &HostNodeScopes {
-                main_thread: &main_thread,
-                callbacks: &callbacks,
-            },
-            arena,
-            &query,
-            offset,
-            affinity_is_downstream,
-            edge,
-            physical,
-            scope,
-        )
-    })
-    .unwrap_or_else(FfiCaretAt::none);
-}
-
-/// The caret position on the line visually after (`direction` 1) or before (`direction` 0) the line holding the
-/// position `query` describes, among the lines inside `scope`.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread; the query and callbacks must stay valid for this
-/// synchronous call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_hit_test_caret_on_adjacent_line(
-    host: &crate::render_state::DocumentHost,
-    read: &crate::render_state::BegunRead,
-    callbacks: crate::painting::host::FfiHitTestQueryCallbacks,
-    query: crate::painting::host::FfiCaretPositionQuery,
-    offset: usize,
-    affinity_is_downstream: bool,
-    direction: u8,
-    inline_coordinate: i32,
-    scope: crate::painting::host::FfiNodeIdentity,
-    out: &mut FfiCaretAt,
-) {
-    let direction = if direction == 1 {
-        crate::painting::hit_test::caret::CaretLineDirection::Next
-    } else {
-        crate::painting::hit_test::caret::CaretLineDirection::Previous
-    };
-    // SAFETY: Guaranteed by the entry point's contract.
-    let main_thread = unsafe { main_thread(host) };
-    *out = with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
-        list.caret_on_adjacent_line(
-            &HostNodeScopes {
-                main_thread: &main_thread,
-                callbacks: &callbacks,
-            },
-            arena,
-            &query,
-            offset,
-            affinity_is_downstream,
-            direction,
-            CssPixels::from_raw(inline_coordinate),
-            scope,
-        )
-    })
-    .unwrap_or_else(FfiCaretAt::none);
-}
-
-/// The block-axis middle of the painted line holding the position `query` describes, if a line holds it.
-///
-/// # Safety
-///
-/// `host` must be a live document host, on its document's thread; the query must stay valid for this synchronous call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_hit_test_caret_line_block_coordinate(
-    host: &crate::render_state::DocumentHost,
-    read: &crate::render_state::BegunRead,
-    query: crate::painting::host::FfiCaretPositionQuery,
-    offset: usize,
-    affinity_is_downstream: bool,
-    out_coordinate: &mut i32,
-) -> bool {
-    let coordinate = with_hit_test_list_and_caret_lines(host, read, None, |list, arena| {
-        let line_index = list.caret_line_for_position(arena, &query, offset, affinity_is_downstream)?;
-        Some(list.line_block_coordinate(line_index))
-    });
-    let Some(coordinate) = coordinate else {
-        return false;
-    };
-    *out_coordinate = coordinate.raw_value();
-    true
 }
 
 /// The style-tree identity of the first `<area>` of the image's map, in tree order, whose shape

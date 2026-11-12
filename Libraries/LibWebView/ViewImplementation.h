@@ -224,6 +224,8 @@ public:
     String const& handle() const { return m_window_handle; }
 
     void server_did_paint(Badge<WebContentPage>, i32 bitmap_id, Gfx::IntSize size, Gfx::IntRect damage_rect, double device_pixel_ratio);
+    // The Compositor showed the frame itself, in the remote layer of this view.
+    void server_did_present_frame_in_remote_layer(Badge<WebContentPage>, Gfx::IntSize size, Gfx::IntRect damage_rect, double device_pixel_ratio);
 
     void set_window_position(Gfx::IntPoint);
     void set_window_size(Gfx::IntSize);
@@ -232,6 +234,22 @@ public:
     // in GPU memory that the view would have to read back for every frame.
     void set_presents_from_cpu_memory(bool);
     bool presents_from_cpu_memory() const { return m_presents_from_cpu_memory; }
+    // Whether the UI shows the view's frames in a remote layer, which the Compositor commits them into itself, rather
+    // than in backing stores the view receives.
+    void set_hosts_remote_layer(bool);
+    // What the view shows, from the Compositor, scaled down to fit within the size given.
+    void take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)>);
+    // The Compositor's remote layers went with its process, so the view asks the new one for another.
+    void recreate_remote_layer_after_compositor_reconnect(Badge<WebContentClient>);
+    static ViewImplementation* find_view_showing_remote_layer(u64 remote_layer_id);
+
+    // The UI shows a resize of the view along with the page's frame of the new size. A view without a remote layer
+    // has nothing to wait for, so it answers at once.
+    void begin_synchronized_resize(u64 token);
+    void await_synchronized_resize_frame(u64 token, Gfx::IntSize);
+    void commit_synchronized_resize(u64 token);
+    void synchronized_resize_frame_held(Badge<CompositorPresentationClient>, u64 token) { did_hold_synchronized_resize_frame(token); }
+    void synchronized_resize_committed(Badge<CompositorPresentationClient>, u64 token) { did_commit_synchronized_resize(token); }
     void set_has_system_focus(bool);
 
     void load(URL::URL const&, Web::Bindings::NavigationHistoryBehavior = Web::Bindings::NavigationHistoryBehavior::Auto);
@@ -277,10 +295,12 @@ public:
     void zoom_in();
     void zoom_out();
     void set_zoom(double zoom_level);
-    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     void reset_zoom();
     double zoom_level() const { return m_zoom_level; }
+
+    void set_device_pixel_ratio_for_testing(WebContentPage&, double device_pixel_ratio);
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
+
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
     // Sends the display metadata to every page hosting documents of the tab.
@@ -295,7 +315,7 @@ public:
     };
     // Sends the screens that screen_rects() reports to every page hosting documents of the tab.
     void update_screen_rects();
-    void set_scales_frames_to_fit(bool scales_frames_to_fit) { m_scales_frames_to_fit = scales_frames_to_fit; }
+    void set_scales_frames_to_fit(bool);
     void enable_picture_in_picture_controls();
     void enqueue_input_event(Web::InputEvent);
     // The page reporting on an event must be the one handling it.
@@ -334,7 +354,8 @@ public:
         return m_backing_stores->displayed_frame().map([](auto const& frame) { return frame.device_pixel_ratio; });
     }
 
-    String force_dark_host() const;
+    String current_host_for_settings() const;
+
     bool force_dark_enabled() const;
     bool can_set_force_dark() const;
     void set_force_dark_enabled(bool);
@@ -754,6 +775,12 @@ protected:
     virtual void insert_clipboard_item(Web::Clipboard::SystemClipboardItem);
 
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
+    // The view's remote layer was made, or made again. The ID is 0 when there is none, and frames arrive in backing
+    // stores instead.
+    virtual void did_create_remote_layer(u32 core_animation_context_id) { (void)core_animation_context_id; }
+    virtual void did_present_frame_in_remote_layer(Gfx::IntSize, double device_pixel_ratio) { (void)device_pixel_ratio; }
+    virtual void did_hold_synchronized_resize_frame(u64 token) { (void)token; }
+    virtual void did_commit_synchronized_resize(u64 token) { (void)token; }
     // Lets the Compositor paint into a backing store again. A view whose frames something else still reads may wait
     // for that to finish first.
     virtual void release_backing_store(i32 bitmap_id);
@@ -839,6 +866,7 @@ protected:
     void display_traversable(CanonicalTraversable&, Web::HTML::VisibilityState);
     void display_page_changed(RefPtr<WebContentPage> previous_page);
     void cancel_all_native_geolocation_requests();
+    void geolocation_settings_changed();
     void send_geolocation_emulated_position(WebContentPage&);
     WebContentPage& focused_navigable_host() const;
     void reset_page_media_state();
@@ -861,13 +889,11 @@ protected:
     void prepare_for_navigation_after_crash(Optional<NavigationToRetry> navigation_to_retry = {});
     void set_crash_state(Optional<CrashState>);
 
-    String current_host_for_settings() const;
-
     virtual void languages_changed() override;
     virtual void content_settings_changed() override;
     virtual void browsing_behavior_changed() override;
     virtual void autoplay_settings_changed() override;
-    virtual void geolocation_settings_changed() override;
+    virtual void permission_settings_changed(Web::Permissions::PermissionName name) override;
     virtual void global_privacy_control_changed() override;
 
     void send_context_menu_request(ContextMenuRequest, Gfx::IntPoint content_position);
@@ -884,6 +910,9 @@ protected:
     NonnullOwnPtr<PageBackingStores> m_backing_stores { make<PageBackingStores>() };
     bool m_pinch_gesture_was_canceled { false };
     bool m_presents_from_cpu_memory { false };
+    bool m_hosts_remote_layer { false };
+    Optional<u64> m_remote_layer_id;
+    void update_remote_layer_fit();
 
     // Set once an assistive technology asked for the page tree; every display page the view shows from then on gets
     // asked for its tree too.

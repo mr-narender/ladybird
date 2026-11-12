@@ -18,6 +18,7 @@
 #include <LibRequests/RequestTransferLease.h>
 #include <LibURL/Forward.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Fetch/Engine/Ids.h>
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/Scripting/FetchClient.h>
@@ -50,6 +51,8 @@ ENUMERATE_BOOL_PARAMS
 
 WEB_API GC::Ref<Infrastructure::FetchController> fetch(JS::Realm&, Infrastructure::Request&, Infrastructure::FetchAlgorithms const&, UseParallelQueue use_parallel_queue = UseParallelQueue::No, CreateResponseBodyTransferLease = CreateResponseBodyTransferLease::No);
 GC::Ptr<PendingResponse> main_fetch(JS::Realm&, Infrastructure::FetchParams const&, Recursive recursive = Recursive::No);
+// Runs the in-parallel steps that main fetch deferred under the id.
+void run_deferred_main_fetch_steps(Engine::FetchId);
 void populate_request_from_client(Infrastructure::Request&, Optional<HTML::FetchClient> const& client);
 void fetch_response_handover(JS::Realm&, Infrastructure::FetchParams const&, GC::Ref<Infrastructure::FetchController>, Infrastructure::Response&);
 GC::Ref<PendingResponse> scheme_fetch(JS::Realm&, Infrastructure::FetchParams const&);
@@ -73,6 +76,8 @@ void append_user_agent_client_hints_for_request(Infrastructure::Request&);
 WEB_API void set_http_memory_cache_enabled(bool enabled);
 WEB_API bool http_memory_cache_enabled();
 WEB_API void clear_http_memory_cache();
+bool http_memory_cache_can_hold_body_in_memory(size_t);
+void evict_http_memory_cache_entries_over_limits();
 WEB_API Optional<Utf16String> http_cache_partition(Infrastructure::Request const&);
 WEB_API void set_disk_cache_enabled_for_navigations_for_testing(bool enabled);
 WEB_API bool disk_cache_enabled_for_navigations_for_testing();

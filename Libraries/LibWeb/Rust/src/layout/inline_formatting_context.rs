@@ -1467,25 +1467,23 @@ impl<'context> InlineFormattingContext<'context> {
             self.input.containing_block_constraints,
             ParticipationInParentFormattingContext::AtomicInline,
         );
-        let formatting_context::ChildLayout {
-            outcome,
-            fragment_arrival,
-            laid_out_box,
-        } = formatting_context::layout_inside_child_with_input_cells(
+        let laid_out = formatting_context::layout_inside_child_with_input_cells(
             self.run,
             Some(self.parent),
             None,
             node,
             input,
             cells,
+            self.parent.take_table_inline_layout_of(node),
             false,
             self.block_container.percentage_block_insets_have_definite_basis,
         );
-        self.keep_atomic_inline_fragment_arrival(node, fragment_arrival);
-        outcome.report_percentage_block_size_dependency_of(self.run, node);
-        let baselines = laid_out_box.baselines;
-        self.keep_placed_atomic_inline(node, formatting_context::PlacedChild::of_laid_out_box(&laid_out_box));
-        (baselines, laid_out_box.cells)
+        laid_out.report_percentage_block_size_dependency_of(self.run, node);
+        let baselines = laid_out.baselines();
+        let cells = laid_out.cells();
+        self.keep_placed_atomic_inline(node, laid_out.placed_child());
+        self.keep_atomic_inline_fragment_arrival(node, laid_out.into_fragment_arrival(self.run));
+        (baselines, cells)
     }
 
     /// Lays out `node`, an atomic inline-level box on a line that starts out with the cells `cells`, and returns the
@@ -1761,7 +1759,7 @@ impl<'context> InlineFormattingContext<'context> {
             let line_is_empty = self.line_data().line_boxes.last().is_some_and(|line| line.is_empty());
             self.set_current_line_start_offset(item_index, item.offset_in_node);
             if line_is_empty && line_builder.current_line_has_no_space_left_by_floats() {
-                line_builder.break_line(line_builder::ForcedBreak::No, NodeSlotId::INVALID, None);
+                line_builder.break_line(line_builder::ForcedBreak::No, None, None);
                 continue;
             }
             let split_item = self.pass.with_grapheme_segmenter(item.node, |grapheme_segmenter| {
@@ -1779,16 +1777,12 @@ impl<'context> InlineFormattingContext<'context> {
                 if line_is_empty {
                     return false;
                 }
-                line_builder.break_line(
-                    line_builder::ForcedBreak::No,
-                    NodeSlotId::INVALID,
-                    Some(item.border_box_inline_size()),
-                );
+                line_builder.break_line(line_builder::ForcedBreak::No, None, Some(item.border_box_inline_size()));
                 continue;
             };
             line_builder.append_text_item(&mut prefix, prepared, style);
             self.set_current_line_start_offset(item_index, item.offset_in_node);
-            line_builder.break_line(line_builder::ForcedBreak::No, NodeSlotId::INVALID, None);
+            line_builder.break_line(line_builder::ForcedBreak::No, None, None);
         }
     }
 
@@ -2149,7 +2143,8 @@ impl<'context> InlineFormattingContext<'context> {
                         offset_in_node: 0,
                     });
                     let continuation = iterator.next_unbreakable_run_inline_size(self);
-                    line_builder.break_line(line_builder::ForcedBreak::Yes, item.node, continuation);
+                    let position = iterator.forced_break_position(&item);
+                    line_builder.break_line(line_builder::ForcedBreak::Yes, Some(position), continuation);
                     if !item.node.is_invalid() && self.clear_floating_boxes(item.node) {
                         line_builder.did_introduce_clearance(self.block_axis_float_clearance.get());
                         self.reset_parent_margin_state();
@@ -2308,7 +2303,7 @@ impl<'context> InlineFormattingContext<'context> {
                                     line_builder.break_if_needed(sequence_inline_size)
                                 };
                                 if broke_line {
-                                    line_builder.set_trailing_whitespace_on_previous_line();
+                                    line_builder.set_trailing_whitespace_on_previous_line(&item);
                                     let next_line_start = fragmentation::LinePosition {
                                         item_index: item_index + 1,
                                         offset_in_node: 0,
@@ -2790,7 +2785,7 @@ impl<'context> InlineFormattingContext<'context> {
     pub(crate) fn run(&mut self) -> block_formatting_context::ChildrenSummary {
         assert!(self.facts(self.containing_block).children_are_inline());
         let run = self.run;
-        let iterator = match run.fragmentainer.as_deref() {
+        let iterator = match run.fragmentainer.as_ref() {
             Some(fragmentainer) => {
                 inline_level_iterator::InlineLevelIterator::new_sharing_items(self, &fragmentainer.inline_items)
             }

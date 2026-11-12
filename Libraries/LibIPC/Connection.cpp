@@ -189,9 +189,9 @@ void ConnectionBase::handle_messages()
     }
 }
 
-void ConnectionBase::wait_for_transport_to_become_readable()
+void ConnectionBase::wait_for_transport_to_become_readable(Optional<MonotonicTime> deadline)
 {
-    m_transport->wait_until_readable();
+    m_transport->wait_until_readable(deadline);
 }
 
 ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
@@ -202,7 +202,7 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
     bool parse_error = false;
     auto schedule_shutdown = m_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
         auto bytes = raw_message.bytes.bytes();
-        if (auto message = try_parse_message(bytes, raw_message.attachments)) {
+        if (auto message = try_parse_message(raw_message.bytes, raw_message.attachments)) {
             m_unprocessed_messages.append(message.release_nonnull());
         } else {
             dbgln("Failed to parse IPC message {:hex-dump}", bytes);
@@ -243,7 +243,7 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
     return PeerEOF::No;
 }
 
-OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id, MayCancel may_cancel)
+OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32 endpoint_magic, int message_id, MayCancel may_cancel, Optional<MonotonicTime> deadline)
 {
     VERIFY(m_owner_thread_id.is_current_thread());
     TemporaryChange waiting_for_sync_response { m_is_waiting_for_sync_response, true };
@@ -284,8 +284,10 @@ OwnPtr<IPC::Message> ConnectionBase::wait_for_specific_endpoint_message_impl(u32
 
         if (!is_open())
             break;
+        if (deadline.has_value() && MonotonicTime::now() >= *deadline)
+            return {};
 
-        wait_for_transport_to_become_readable();
+        wait_for_transport_to_become_readable(deadline);
         if (drain_messages_from_peer() == PeerEOF::Yes) {
             peer_disconnected_during_wait = true;
             break;

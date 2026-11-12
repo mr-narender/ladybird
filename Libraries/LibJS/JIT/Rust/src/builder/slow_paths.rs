@@ -68,23 +68,23 @@ impl GraphBuilder<'_> {
             .instruction
             .opcode();
         let layout = slow_path_layout(opcode);
-        let read_u32 = |offset: u32| -> Result<u32, CompileFailure> {
+        let bytes_at = |offset: u32, size: usize| -> Result<&[u8], CompileFailure> {
             let at = (self.function.pc + offset) as usize;
-            let bytes = self
-                .function
+            self.function
                 .executable
                 .bytecode
-                .get(at..at + 4)
+                .get(at..at + size)
                 .ok_or(CompileFailure::InvalidBytecode {
                     pc: self.function.pc,
                     reason: "operand field outside the bytecode",
-                })?;
-            Ok(u32::from_ne_bytes(bytes.try_into().expect("four bytes")))
+                })
         };
+        let read_operand =
+            |offset: u32| -> Result<u32, CompileFailure> { Ok(Operand::raw_from_byte(bytes_at(offset, 1)?[0])) };
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
         for (index, field) in layout.fields.iter().enumerate() {
-            let operand = read_u32(field.instruction_offset)?;
+            let operand = read_operand(field.instruction_offset)?;
             if field.role != OperandRole::Out {
                 inputs.push(operand);
             }
@@ -93,8 +93,8 @@ impl GraphBuilder<'_> {
             }
         }
         if let Some(array) = layout.array {
-            for element in 0..read_u32(array.count_offset)? {
-                inputs.push(read_u32(array.instruction_offset + 4 * element)?);
+            for element in 0..u32::from(bytes_at(array.count_offset, 1)?[0]) {
+                inputs.push(read_operand(array.instruction_offset + element)?);
             }
         }
         Ok(SlowPathOperands { inputs, outputs })

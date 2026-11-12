@@ -921,6 +921,7 @@ class IntersectionObserverEntry;
 namespace Web::Layout::RustFFI {
 
 struct BegunRead;
+enum class FfiTextCaretMovement : u8;
 
 }
 
@@ -1299,10 +1300,7 @@ class VTTRegion;
 namespace Web::XHR {
 
 class FormData;
-class ProgressEvent;
 class XMLHttpRequest;
-class XMLHttpRequestEventTarget;
-class XMLHttpRequestUpload;
 
 struct FormDataEntry;
 

@@ -120,12 +120,8 @@ impl LineDataState {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct CommittedSvgFacts {
     pub(crate) viewport_transform: Option<svg_formatting_context::FfiAffineTransform>,
-    pub(crate) viewport_size: Option<FfiCssPixelSize>,
-    pub(crate) view_box: Option<svg_formatting_context::FfiSvgViewBox>,
-    pub(crate) element_transform: Option<svg_formatting_context::FfiAffineTransform>,
     pub(crate) additional_element_transform: Option<svg_formatting_context::FfiAffineTransform>,
     pub(crate) mask_area_facts: Option<svg_formatting_context::SvgMaskAreaFacts>,
-    pub(crate) viewport_percentage_basis: CssPixels,
     pub(crate) resource_content_units_are_object_bounding_box: bool,
     /// The `pathLength` of a geometry element, where its element has one.
     pub(crate) author_path_length: Option<f32>,
@@ -239,20 +235,28 @@ impl RootInputCells {
         }
     }
 
-    /// The sizes and box sides `link` and its fragment show, with both sizes definite.
-    pub(crate) fn of_committed_fragment_link(link: &fragment_tree::FragmentLink) -> Self {
+    /// The sizes and box sides `link` and its fragment show, read in `frame`, with both sizes definite.
+    pub(crate) fn of_committed_fragment_link(link: &fragment_tree::FragmentLink, frame: geometry::Frame) -> Self {
         let mut cells = Self {
             has_definite_block_size: true,
             ..Self::default()
         };
-        cells.take_box_metrics_of_committed_link(link);
+        cells.take_box_metrics_of_committed_link(link, frame);
         cells
     }
 
-    /// Takes the sizes and box sides `link` and its fragment show.
-    pub(crate) fn take_box_metrics_of_committed_link(&mut self, link: &fragment_tree::FragmentLink) {
-        let sides = &link.fragment.sides;
-        let margins = link.placement.shown_as.margins;
+    /// Takes the sizes and box sides `link` and its fragment show, read in `frame`.
+    pub(crate) fn take_box_metrics_of_committed_link(
+        &mut self,
+        link: &fragment_tree::FragmentLink,
+        frame: geometry::Frame,
+    ) {
+        let sides = link.fragment.sides.in_frame(geometry::Frame::PHYSICAL, frame);
+        let margins = link
+            .placement
+            .shown_as
+            .margins
+            .in_frame(geometry::Frame::PHYSICAL, frame);
         self.set_content_inline_size(sides.content_size.width);
         self.set_content_block_size(sides.content_size.height);
         self.margin_left = margins.left;

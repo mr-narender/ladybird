@@ -50,8 +50,10 @@ pub use libcompositing_rust::node_slot_id;
 pub(crate) mod frameset_formatting_context;
 mod partial_relayout;
 pub(crate) mod prepared_inline_content;
+pub(crate) mod query;
 pub(crate) mod quote_depth;
 pub(crate) mod rendered_text;
+pub(crate) mod replaced_sizing;
 mod replaced_with_children_formatting_context;
 pub(crate) mod row_reads;
 pub(crate) mod run_repeatability;
@@ -71,6 +73,7 @@ mod tree_builder;
 pub(crate) mod tree_mutation;
 pub(crate) mod tree_update_marks;
 mod update_layout;
+pub(crate) mod used_transform;
 pub mod used_values;
 pub(crate) mod viewport_propagation;
 
@@ -94,8 +97,7 @@ use crate::layout::node_data::NodeSlotId;
 pub(crate) use abspos_inputs::AbsposAxisAlignment;
 pub(crate) use box_alignment::AxisEdge;
 pub(crate) use formatting_context::{
-    ChildLayoutOutcome, DerivedBaselines, FfiLayoutHostCallbacks, FormattingContextRun, Node, SizingAxis,
-    SizingProperty,
+    DerivedBaselines, FfiLayoutHostCallbacks, FormattingContextRun, Node, SizingAxis, SizingProperty,
 };
 pub(crate) use fragment_tree::FragmentLink;
 pub(crate) use geometry::{

@@ -87,7 +87,6 @@
 #include <LibWeb/UIEvents/TextEvent.h>
 #include <LibWeb/UIEvents/TouchEvent.h>
 #include <LibWeb/UIEvents/WheelEvent.h>
-#include <LibWeb/VisualLines.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/Infra/Strings.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
@@ -321,7 +320,7 @@ static Optional<EventResult> dispatch_event_to_nested_navigable(EventHandler& pa
         return {};
 
     if (Painting::is_navigable_container_viewport_paintable(layout_node)) {
-        auto position = Painting::transform_to_local_coordinates(layout_node, viewport_position) - Painting::absolute_rect(layout_node).location();
+        auto position = Painting::point_to_local(layout_node, viewport_position, Layout::RustFFI::ViewportSpace::VisualViewport) - Painting::absolute_rect(layout_node).location();
         if (auto content_navigable = as_if<HTML::NavigableContainer>(*node)->content_navigable()) {
             if (auto* local_navigable = as_if<HTML::LocalNavigable>(*content_navigable)) {
                 // The nested navigable handles the event as the input event it is, outdated or not.
@@ -799,7 +798,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
         stop_updating_selection();
 
         if (middle_button_autoscrolled && button == UIEvents::MouseButton::Middle)
-            m_middle_button_scroll_handler = nullptr;
+            stop_middle_button_scroll();
     });
 
     if (should_ignore_device_input_event()) {
@@ -925,25 +924,6 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
     if (dispatched_pointer_up.result == PointerEventDispatchResult::CancelledByPage)
         return EventResult::Cancelled;
     return EventResult::Handled;
-}
-
-// https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsetx
-static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Layout::Node const& layout_node)
-{
-    // If the event’s dispatch flag is set,
-    // FIXME: Is this guaranteed to be dispatched?
-
-    // return the x-coordinate of the position where the event occurred,
-    // ignoring the transforms that apply to the element and its ancestors,
-    CSSPixelPoint offset_position = position;
-    offset_position = Painting::inverse_transform_point(layout_node, position);
-
-    // relative to the origin of the padding edge of the target node
-    auto const top_left_of_layout_node = Painting::box_type_agnostic_position(layout_node);
-    auto offset = offset_position - top_left_of_layout_node;
-
-    // and terminate these steps.
-    return offset;
 }
 
 struct VisualViewportPanAxes {
@@ -1306,8 +1286,7 @@ EventResult EventHandler::dispatch_wheel_event(Layout::BegunRead const& read, La
     auto viewport_position = document->visual_viewport()->map_to_layout_viewport(visual_viewport_position);
     auto page_offset = compute_mouse_event_page_offset(viewport_position);
     auto const* offset_layout_node = Painting::has_committed_box(*layout_node) ? layout_node : &hit_layout_node;
-    auto scroll_offset = document->navigable()->viewport_scroll_offset();
-    auto offset = compute_mouse_event_offset(visual_viewport_position.translated(scroll_offset), *offset_layout_node);
+    auto offset = Painting::mouse_event_offset(*offset_layout_node, viewport_position);
     auto cancelability = is_cancelable ? UIEvents::WheelEventIsCancelable::Yes : UIEvents::WheelEventIsCancelable::No;
     auto event = UIEvents::WheelEvent::create_from_platform_event(HTML::relevant_global_object(*node), m_navigable->active_window_proxy(), UIEvents::EventNames::wheel, screen_position, page_offset, viewport_position, offset, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, button, buttons, modifiers, cancelability).release_value_but_fixme_should_propagate_errors();
     return node->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
@@ -2092,7 +2071,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     if (key == UIEvents::KeyCode::Key_Escape) {
         // NB: Exit autoscroll if active before handling other close requests.
         if (m_middle_button_scroll_handler) {
-            m_middle_button_scroll_handler = nullptr;
+            stop_middle_button_scroll();
             return EventResult::Handled;
         }
 
@@ -2505,8 +2484,7 @@ EventResult EventHandler::handle_drag_and_drop_event(DragEvent::Type type, CSSPi
         return *dispath_result;
 
     auto page_offset = compute_mouse_event_page_offset(viewport_position);
-    auto scroll_offset = document.navigable()->viewport_scroll_offset();
-    auto offset = compute_mouse_event_offset(visual_viewport_position.translated(scroll_offset), *target_layout_node);
+    auto offset = Painting::mouse_event_offset(*target_layout_node, viewport_position);
 
     auto was_dragging = should_ignore_device_input_event();
     ScopeGuard update_keyboard_routing = [&] {
@@ -3438,8 +3416,7 @@ bool EventHandler::fire_click_events(GC::Ref<DOM::Node> node, MouseEventCoordina
 EventHandler::MouseEventCoordinates EventHandler::compute_mouse_event_coordinates(CSSPixelPoint visual_viewport_position, CSSPixelPoint viewport_position, Layout::Node const& layout_node) const
 {
     auto page_offset = compute_mouse_event_page_offset(viewport_position);
-    auto scroll_offset = m_navigable->active_document()->navigable()->viewport_scroll_offset();
-    auto offset = compute_mouse_event_offset(visual_viewport_position.translated(scroll_offset), layout_node);
+    auto offset = Painting::mouse_event_offset(layout_node, viewport_position);
     return { page_offset, visual_viewport_position, viewport_position, offset };
 }
 
@@ -3519,6 +3496,14 @@ Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelP
 
 GC::Ptr<DOM::Node> EventHandler::target_node_for_mouse_position(CSSPixelPoint position)
 {
+    // NB: A hit test records the document again where its display list isn't current, and recording reads layout, so
+    //     bring layout up to date first, as the mouse handlers do.
+    if (auto document = m_navigable->active_document()) {
+        document->update_layout(DOM::UpdateLayoutReason::EventHandlerTargetNodeAtPosition);
+        if (!has_committed_root_box())
+            return {};
+    }
+
     auto target = target_for_mouse_position(position);
     if (!target.has_value())
         return {};
@@ -3533,7 +3518,7 @@ GC::Ptr<DOM::Node> EventHandler::target_node_for_mouse_position(CSSPixelPoint po
     Layout::ForcedReadScope read { *document };
     if (auto* layout_node = target->layout_node(read)) {
         if (auto nested_navigable = local_nested_navigable_at(*layout_node, node)) {
-            auto nested_position = Painting::transform_to_local_coordinates(*layout_node, position) - Painting::absolute_rect(*layout_node).location();
+            auto nested_position = Painting::point_to_local(*layout_node, position, Layout::RustFFI::ViewportSpace::VisualViewport) - Painting::absolute_rect(*layout_node).location();
             if (auto nested_node = nested_navigable->event_handler().target_node_for_mouse_position(nested_position))
                 return nested_node;
         }
@@ -3570,7 +3555,7 @@ static bool is_inside_button(GC::Ptr<DOM::Node const> node)
 void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, DOM::Document& document, CSSPixelPoint visual_viewport_position, unsigned button, unsigned modifiers, int click_count)
 {
     if (m_middle_button_scroll_handler) {
-        m_middle_button_scroll_handler = nullptr;
+        stop_middle_button_scroll();
         return;
     }
 
@@ -3750,11 +3735,11 @@ Optional<Painting::CaretPosition> EventHandler::caret_position_for_mouse_selecti
         auto& text_control_element = text_control->text_control_to_html_element();
         if (text_control_element.is_shadow_including_inclusive_ancestor_of(*editable_hit_node_before_focus)) {
             if (auto selection_scope = text_control->mouse_selection_scope())
-                caret_position = document.caret_position_from_point_for_selection(read, visual_viewport_position, selection_scope);
+                caret_position = document.caret_position_from_point(read, visual_viewport_position, selection_scope);
         }
     }
     if (!caret_position.has_value())
-        caret_position = document.caret_position_from_point_for_selection_start(read, visual_viewport_position);
+        caret_position = document.caret_position_from_point(read, visual_viewport_position);
     if (editable_hit_node_before_focus && editable_hit_node_before_focus->is_connected() && editing_host_before_focus && should_use_caret_position_from_editable_hit_node(caret_position, *editable_hit_node_before_focus, *editing_host_before_focus)) {
         if (auto caret_position_from_hit_node = caret_position_from_editable_hit_node(read, *editable_hit_node_before_focus); caret_position_from_hit_node.has_value())
             caret_position = caret_position_from_hit_node;
@@ -3765,6 +3750,18 @@ Optional<Painting::CaretPosition> EventHandler::caret_position_for_mouse_selecti
     if (editable_hit_node_before_focus && editable_hit_node_before_focus->is_connected() && !editing_host_before_focus) {
         if (auto beside = caret_position_beside_block_editing_host(read, *caret_position, *editable_hit_node_before_focus); beside.has_value())
             caret_position = beside;
+    }
+
+    // INTEROP: A click outside an editing host that resolves to a position beside it, in content that is not editable,
+    //          places no selection.
+    if (caret_position->secondary_boundary.has_value()) {
+        auto boundary = caret_position->boundary_point();
+        auto secondary_boundary = caret_position->secondary_boundary->resolve(document);
+        if (boundary.has_value() && secondary_boundary.has_value() && !boundary->node->is_editable_or_editing_host()) {
+            auto* beside = boundary->node->child_at_index(min(boundary->offset, secondary_boundary->offset));
+            if (beside && beside->is_editing_host())
+                return {};
+        }
     }
 
     return caret_position;
@@ -3916,7 +3913,7 @@ void EventHandler::finish_selection_from_preserved_mousedown(DOM::Document& docu
     if (!has_committed_root_box())
         return;
 
-    auto caret_position = document.caret_position_from_point_for_selection_start(read, visual_viewport_position);
+    auto caret_position = document.caret_position_from_point(read, visual_viewport_position);
     if (!caret_position.has_value())
         return;
 
@@ -4112,9 +4109,12 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
         image_url = image_element->document().encoding_parse_url(image_element->current_src());
 
     if (image_url.has_value()) {
-        Optional<Gfx::Bitmap const*> bitmap;
+        RefPtr<Gfx::Bitmap const> bitmap_of_current_frame;
         if (auto frame = image_element->current_image_frame(); frame.has_value())
-            bitmap = &frame->bitmap();
+            bitmap_of_current_frame = frame->bitmap_sharing_pixels();
+        Optional<Gfx::Bitmap const*> bitmap;
+        if (bitmap_of_current_frame)
+            bitmap = bitmap_of_current_frame.ptr();
 
         // NB: An image inside a link, or under an image map's link, offers both the image and the link.
         Optional<HTML::PreparedNavigationDescriptor> link_navigation;
@@ -4422,7 +4422,7 @@ Optional<Editing::ContextMenuMisspelling> EventHandler::select_context_menu_miss
 {
     if (!document.has_spelling_markers())
         return {};
-    auto caret_position = document.caret_position_from_point_for_selection_start(read, coordinates.visual_viewport_position);
+    auto caret_position = document.caret_position_from_point(read, coordinates.visual_viewport_position);
     if (!caret_position.has_value())
         return {};
     auto* text = as_if<DOM::Text>(caret_position->boundary_node().ptr());
@@ -4517,6 +4517,21 @@ bool EventHandler::initiate_word_selection(Layout::BegunRead const& read, DOM::D
     return true;
 }
 
+static size_t find_line_start(Utf16View const& view, size_t offset)
+{
+    while (offset != 0 && view.code_unit_at(offset - 1) != '\n')
+        --offset;
+    return offset;
+}
+
+static size_t find_line_end(Utf16View const& view, size_t offset)
+{
+    auto length = view.length_in_code_units();
+    while (offset < length && view.code_unit_at(offset) != '\n')
+        ++offset;
+    return offset;
+}
+
 bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
 {
     auto* boundary_node = as_if<DOM::Text>(caret_position.boundary_node().ptr());
@@ -4553,7 +4568,7 @@ bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Paintin
 
 bool EventHandler::select_context_menu_text(Layout::BegunRead const& read, DOM::Document& document, MouseEventCoordinates const& coordinates)
 {
-    auto caret_position = document.caret_position_from_point_for_selection_start(read, coordinates.visual_viewport_position);
+    auto caret_position = document.caret_position_from_point(read, coordinates.visual_viewport_position);
     if (!caret_position.has_value() || selection_contains_position(document, *caret_position))
         return false;
 
@@ -4697,7 +4712,7 @@ void EventHandler::apply_mouse_selection(Layout::BegunRead const& read, CSSPixel
     if (m_mouse_selection_target)
         constraint_scope = m_mouse_selection_target->mouse_selection_scope();
 
-    auto caret_position = document.caret_position_from_point_for_selection(read, visual_viewport_position, constraint_scope);
+    auto caret_position = document.caret_position_from_point(read, visual_viewport_position, constraint_scope);
     if (!caret_position.has_value())
         return;
 
@@ -6041,6 +6056,14 @@ bool EventHandler::has_committed_root_box() const
     return document && document->has_committed_viewport_box();
 }
 
+void EventHandler::stop_middle_button_scroll()
+{
+    if (!m_middle_button_scroll_handler)
+        return;
+    m_middle_button_scroll_handler->request_indicator_repaint();
+    m_middle_button_scroll_handler = nullptr;
+}
+
 void EventHandler::release_held_scroll_key()
 {
     m_held_scroll_key.clear();
@@ -6052,8 +6075,8 @@ void EventHandler::clear_per_test_input_state(Badge<Internals::Internals>)
     clear_mousedown_tracking();
     stop_updating_selection();
     release_held_scroll_key();
+    stop_middle_button_scroll();
 
-    m_middle_button_scroll_handler = nullptr;
     m_mouse_pointer.prevent_mouse_event = false;
     m_additional_pointers.clear();
     m_captured_chrome_widget = nullptr;

@@ -294,7 +294,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
     pub(crate) fn break_line(
         &mut self,
         forced: ForcedBreak,
-        forced_break_node: NodeSlotId,
+        forced_break: Option<inline_content::ForcedBreakPosition>,
         next_size: Option<CssPixels>,
     ) {
         // FIXME: Respect inline direction.
@@ -305,7 +305,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             let mut line = self.line_mut(line_index);
             line.has_break = true;
             line.has_forced_break = forced == ForcedBreak::Yes;
-            line.forced_break_node = forced_break_node;
+            line.forced_break = forced_break;
         }
         self.last_line_needs_update = true;
         self.update_last_line(forced == ForcedBreak::No || next_size.is_some());
@@ -387,7 +387,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         if !self.should_break(next_item_inline_size) {
             return false;
         }
-        self.break_line(ForcedBreak::No, NodeSlotId::INVALID, Some(next_item_inline_size));
+        self.break_line(ForcedBreak::No, None, Some(next_item_inline_size));
         true
     }
 
@@ -398,7 +398,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         if !self.should_break(next_item_inline_size) {
             return false;
         }
-        self.break_line(ForcedBreak::No, NodeSlotId::INVALID, None);
+        self.break_line(ForcedBreak::No, None, None);
         true
     }
 
@@ -1014,7 +1014,8 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                     // line height properties.
                     should_align_strut_to_line_box_baseline |= has_line_relative_aligned_subtree
                         || ((style.display().is_inline_block()
-                            || (style.display().is_inline_outside() && style.display().is_flex_inside()))
+                            || (style.display().is_inline_outside()
+                                && (style.display().is_flex_inside() || style.display().is_grid_inside())))
                             && alignment_style.vertical_align_keyword() == vertical_align::BASELINE);
                 }
                 line_box_baseline = adjusted_baseline;
@@ -1515,13 +1516,24 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         self.current_block_offset = self.current_block_offset.max(clearance);
     }
 
-    pub(crate) fn set_trailing_whitespace_on_previous_line(&mut self) {
+    /// Gives the whitespace that a line break before it dropped from the start of the current line to the end of the
+    /// previous line, where it follows on from the same text.
+    pub(crate) fn set_trailing_whitespace_on_previous_line(&mut self, whitespace: &inline_level_iterator::Item) {
         if self.line_count() < 2 {
             return;
         }
         let previous = self.line_count() - 2;
-        if let Some(fragment) = self.line_mut(previous).fragments.last_mut() {
-            fragment.has_trailing_whitespace = true;
+        if let Some(fragment) = self.line_mut(previous).fragments.last_mut()
+            && fragment.layout_node == whitespace.node
+            && fragment.start
+                + fragment.length_in_code_units
+                + fragment.trimmed_trailing_whitespace.length_in_code_units
+                == whitespace.offset_in_node
+        {
+            fragment.record.trimmed_trailing_whitespace += line_box_fragment::TrailingWhitespace {
+                length_in_code_units: whitespace.length_in_node,
+                inline_size: whitespace.inline_size,
+            };
         }
     }
 
@@ -1599,7 +1611,7 @@ impl TextLayoutBounds {
     }
 }
 
-fn font_metric_in_whole_pixels(metric: f32) -> CssPixels {
+pub(crate) fn font_metric_in_whole_pixels(metric: f32) -> CssPixels {
     CssPixels::from_integer(metric.round_ties_even() as i64)
 }
 

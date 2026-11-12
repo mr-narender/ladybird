@@ -306,6 +306,7 @@ set(SOURCES
     Fetch/Fetching/Checks.cpp
     Fetch/Fetching/ClientContextSnapshots.cpp
     Fetch/Fetching/NetworkBodyPump.cpp
+    Fetch/Fetching/FetchEngine.cpp
     Fetch/Fetching/Fetching.cpp
     Fetch/Fetching/PendingResponse.cpp
     Fetch/Fetching/RefCountedFlag.cpp
@@ -920,7 +921,6 @@ set(SOURCES
     UserTiming/PerformanceMark.cpp
     UserTiming/PerformanceMeasure.cpp
     ViewTransition/ViewTransition.cpp
-    VisualLines.cpp
     WebLocks/AbstractOperations.cpp
     WebLocks/LockManager.cpp
     WebLocks/NavigatorLocks.cpp
@@ -1001,12 +1001,8 @@ set(SOURCES
     WebVTT/Parser.cpp
     WebVTT/VTTCue.cpp
     WebVTT/VTTRegion.cpp
-    XHR/EventNames.cpp
     XHR/FormData.cpp
-    XHR/ProgressEvent.cpp
     XHR/XMLHttpRequest.cpp
-    XHR/XMLHttpRequestEventTarget.cpp
-    XHR/XMLHttpRequestUpload.cpp
     XLink/AttributeNames.cpp
     XML/XMLDocumentBuilder.cpp
     XML/XMLFragmentParser.cpp
@@ -1096,6 +1092,7 @@ sync_rust_crate_ffi_headers(
         SelectorStateFactsGenerated.inc
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
+        Compositor/RenderClockRustFFI.h
 )
 add_dependencies(LibWeb libweb_rust-ffi-headers)
 target_link_libraries(libweb_bindings_rust INTERFACE LibGfx LibGC LibUnicode)

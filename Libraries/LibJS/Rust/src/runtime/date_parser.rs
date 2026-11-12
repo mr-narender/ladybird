@@ -572,8 +572,13 @@ impl DateParser {
                 return sign == -1;
             }
             1..=5 => {
-                // Too small to be a signed year;
                 if self.hours.is_none() {
+                    // A negative year of four or five digits is how toString() and toUTCString() write the years from
+                    // -99999 to -1, so it has to parse as that year.
+                    if sign == -1 && number.digits >= 4 && self.year.is_none() {
+                        self.year = Some(-(number.number as i64));
+                        return true;
+                    }
                     // Otherwise a candidate for timezone offset.
                     self.numbers.push(number.number); // Ignore the sign and treat it as a number.
                     return true;
@@ -1039,6 +1044,11 @@ impl DateParser {
         if !self.tz_offset_with_number(number, true) {
             // A sign and a number have been read. Continue reading a timezone offset..
             return Err("Invalid timezone offset format.");
+        }
+
+        // The hour of a UTC offset is at most 23: https://tc39.es/ecma262/#sec-date-time-string-format
+        if self.timezone_hours.is_some_and(|hours| hours > 23) {
+            return Err("Timezone offset hour out of range.");
         }
 
         Ok(())

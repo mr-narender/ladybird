@@ -1404,22 +1404,21 @@ struct OperatorGlyph {
 /// Lays out an <mo> whose text was laid out in a block formatting context with the glyph it is drawn with instead,
 /// if it is stretched or a large operator.
 // https://w3c.github.io/mathml-core/#layout-of-operators
+/// Lays out the root of `run`, an operator, where it is drawn with a stretched or large glyph, and answers what it
+/// paints where the run builds fragments.
 pub(super) fn layout_operator(
     run: &FormattingContextRun<'_>,
     input: &LayoutInput,
     result: &mut ChildLayoutResult,
     root: &mut used_values::RootInputCells,
-) {
+) -> Option<std::sync::Arc<MathPaintData>> {
     let context = MathFormattingContext::new(run, *root);
     let operator = run.box_;
     if context.kind(operator) != MathLayoutKind::Mo {
-        return;
+        return None;
     }
-    let Some(OperatorGlyph { glyph, baseline_shift }) =
-        context.operator_glyph(operator, input.sizing.math_stretch_size_constraint)
-    else {
-        return;
-    };
+    let OperatorGlyph { glyph, baseline_shift } =
+        context.operator_glyph(operator, input.sizing.math_stretch_size_constraint)?;
     let glyphs = glyph;
     let ascent = glyphs.ascent - baseline_shift;
     let descent = glyphs.descent + baseline_shift;
@@ -1434,28 +1433,24 @@ pub(super) fn layout_operator(
         first: Some(ascent),
         last: Some(ascent),
     };
-    if run.fragments.is_none() {
-        return;
-    }
-    let content = MathContent {
-        inline_size,
-        ascent,
-        descent,
-        glyph_runs: vec![PlacedGlyphRun {
-            line_left_offset: CssPixels::default(),
-            baseline_shift,
-            glyphs,
-        }],
-        ..MathContent::default()
-    };
-    let is_rtl = context.style(operator).direction() == direction::RTL;
-    let paint_data = MathPaintData {
-        replaces_text: true,
-        ..content.paint_data(CssPixels::default(), inline_size, is_rtl)
-    };
-    run.set_fragment_payload_of(operator, || {
-        fragment_tree::FcPayload::Math(std::sync::Arc::new(paint_data))
-    });
+    run.fragments.is_some().then(|| {
+        let content = MathContent {
+            inline_size,
+            ascent,
+            descent,
+            glyph_runs: vec![PlacedGlyphRun {
+                line_left_offset: CssPixels::default(),
+                baseline_shift,
+                glyphs,
+            }],
+            ..MathContent::default()
+        };
+        let is_rtl = context.style(operator).direction() == direction::RTL;
+        std::sync::Arc::new(MathPaintData {
+            replaces_text: true,
+            ..content.paint_data(CssPixels::default(), inline_size, is_rtl)
+        })
+    })
 }
 
 pub(super) struct MathFormattingContext<'pass> {
@@ -1468,6 +1463,40 @@ pub(super) struct MathFormattingContext<'pass> {
     placed_children: RefCell<HashMap<Node, formatting_context::PlacedChild>>,
     /// The cells in which this context sizes the run's root, in the frame the root lays its contents out in.
     root_cells: Cell<used_values::RootInputCells>,
+    /// What the run's root paints, where the run builds fragments.
+    root_paint_data: Option<std::sync::Arc<MathPaintData>>,
+}
+
+impl<'pass> formatting_context::FormattingContextAlgorithm<'pass> for MathFormattingContext<'pass> {
+    fn lay_out(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        input: formatting_context::AlgorithmInput<'_>,
+    ) -> formatting_context::AlgorithmOutput {
+        self.run(run, input.body_input);
+        let mut root_payload = fragment_tree::PendingPayload::default();
+        if let Some(paint_data) = self.root_paint_data.take() {
+            root_payload.set(fragment_tree::FcPayload::Math(paint_data));
+        }
+        formatting_context::AlgorithmOutput::of_root(
+            ChildLayoutResult {
+                automatic_content_block_size: self.automatic_content_block_size(),
+                baselines: self.derived_baselines_of_root_box,
+                ..ChildLayoutResult::default()
+            },
+            self.root_cells(),
+        )
+        .with_root_payload(root_payload)
+    }
+
+    fn after_root_is_dimensioned(
+        &self,
+        _run: &FormattingContextRun<'pass>,
+        root_cells_in_own_frame: used_values::RootInputCells,
+    ) -> formatting_context::AfterDimensioning {
+        self.parent_did_dimension(root_cells_in_own_frame);
+        formatting_context::AfterDimensioning::LaysOutAbsposContainedByRoot
+    }
 }
 
 impl<'pass> MathFormattingContext<'pass> {
@@ -1494,6 +1523,7 @@ impl<'pass> MathFormattingContext<'pass> {
             fragment_arrivals_of_children: RefCell::new(Vec::new()),
             placed_children: RefCell::new(HashMap::default()),
             root_cells: Cell::new(root_cells),
+            root_paint_data: None,
         }
     }
 
@@ -2169,29 +2199,24 @@ impl<'pass> MathFormattingContext<'pass> {
             ParticipationInParentFormattingContext::AtomicInline,
         );
         input.sizing.math_stretch_size_constraint = stretch_size_constraint;
-        let formatting_context::ChildLayout {
-            outcome,
-            fragment_arrival,
-            laid_out_box,
-        } = formatting_context::layout_inside_child_with_input_cells(
+        let laid_out = formatting_context::layout_inside_child_with_input_cells(
             run,
             None,
             None,
             child,
             input,
             child_cells,
+            None,
             true,
             run.percentage_block_insets_of_root_children_have_definite_basis(&self.root_cells),
         );
-        if let Some(fragment_arrival) = fragment_arrival {
+        laid_out.report_percentage_block_size_dependency_of(run, child);
+        let metrics = laid_out.cells();
+        let baselines = laid_out.baselines();
+        self.placed_children.borrow_mut().insert(child, laid_out.placed_child());
+        if let Some(fragment_arrival) = laid_out.into_fragment_arrival(run) {
             self.fragment_arrivals_of_children.borrow_mut().push(fragment_arrival);
         }
-        self.placed_children
-            .borrow_mut()
-            .insert(child, formatting_context::PlacedChild::of_laid_out_box(&laid_out_box));
-        outcome.report_percentage_block_size_dependency_of(run, child);
-        let metrics = laid_out_box.cells;
-        let baselines = laid_out_box.baselines;
         let collapsed = metrics.uses_collapsing_borders_model();
         let block_size = metrics.margin_box_block_size(collapsed);
         // NB: A box without a baseline is aligned by its line-under margin edge.
@@ -2207,7 +2232,7 @@ impl<'pass> MathFormattingContext<'pass> {
         }
     }
 
-    pub(super) fn run(&mut self, run: &FormattingContextRun<'pass>, layout_input: LayoutInput) {
+    fn run(&mut self, run: &FormattingContextRun<'pass>, layout_input: LayoutInput) {
         let root = run.box_;
         let kind = self.kind(root);
         let constraints = run.sizing().constraints_for_child_context(
@@ -2346,10 +2371,11 @@ impl<'pass> MathFormattingContext<'pass> {
             } else {
                 content.inline_size
             };
-            let paint_data = content.paint_data(math_content_line_left, bar_inline_size, is_rtl);
-            run.set_fragment_payload_of(run.box_, || {
-                fragment_tree::FcPayload::Math(std::sync::Arc::new(paint_data))
-            });
+            self.root_paint_data = Some(std::sync::Arc::new(content.paint_data(
+                math_content_line_left,
+                bar_inline_size,
+                is_rtl,
+            )));
         }
 
         self.derived_baselines_of_root_box = DerivedBaselines {
@@ -2642,7 +2668,7 @@ impl<'pass> MathFormattingContext<'pass> {
         }
     }
 
-    pub(super) fn parent_did_dimension(&self, root_after_epilogue: used_values::RootInputCells) {
+    fn parent_did_dimension(&self, root_after_epilogue: used_values::RootInputCells) {
         for child in self.run.pass.children(self.run.box_) {
             let facts = self.facts(child);
             if !facts.is_box() || !facts.is_absolutely_positioned() {
@@ -2671,11 +2697,7 @@ impl<'pass> MathFormattingContext<'pass> {
         }
     }
 
-    pub(super) fn derived_baselines_of_root_box(&self) -> DerivedBaselines {
-        self.derived_baselines_of_root_box
-    }
-
-    pub(super) fn automatic_content_block_size(&self) -> CssPixels {
+    fn automatic_content_block_size(&self) -> CssPixels {
         self.content.ascent + self.content.descent
     }
 }

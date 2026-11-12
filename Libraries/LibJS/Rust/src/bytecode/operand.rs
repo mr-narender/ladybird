@@ -9,7 +9,40 @@
 pub enum InstructionLengthError {
     UnknownOpcode,
     TruncatedInstruction,
-    InvalidLength,
+}
+
+/// The last slot of a cache table, which all the sites past it share. It never remembers anything.
+pub const UNCACHED_SITE: u32 = u16::MAX as u32;
+
+/// A cache index as an instruction holds it. `u32::MAX` means none, which stays all bits set.
+#[inline]
+pub fn narrow_index(index: u32) -> u16 {
+    if index == u32::MAX {
+        return u16::MAX;
+    }
+    u16::try_from(index).expect("cache indices fit in 16 bits")
+}
+
+/// The name table index an instruction holds. `u32::MAX` means none, which stays all bits set.
+#[inline]
+pub fn name_index_bytes(index: u32) -> [u8; 3] {
+    let [low, middle, high, top] = index.to_le_bytes();
+    assert!(
+        index == u32::MAX || (top == 0 && index != 0xff_ffff),
+        "name table indices fit in 24 bits"
+    );
+    [low, middle, high]
+}
+
+/// The name table index of a debug name as an instruction holds it, or all bits set for none.
+#[inline]
+pub fn debug_name_index(index: Option<u32>) -> u16 {
+    index.and_then(|index| u16::try_from(index).ok()).unwrap_or(u16::MAX)
+}
+
+#[inline]
+pub fn read_u24(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], 0])
 }
 
 #[inline]
@@ -55,7 +88,7 @@ impl Register {
 ///
 ///   `raw = (type << 29) | index`
 ///
-/// This encoding is ABI-compatible with the VM's operand format.
+/// The bytecode does not hold this encoding, but the frame slot that the operand ends up in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Operand(u32);
 
@@ -129,15 +162,6 @@ impl Operand {
 
     pub fn optional_from_raw(raw: u32) -> Option<Self> {
         if raw == Self::INVALID { None } else { Some(Self(raw)) }
-    }
-
-    /// Offset the index by the given amount, stripping the type tag and
-    /// leaving a flat index into the combined
-    /// [registers | locals | constants | arguments] array.
-    /// Used when the operands of finished code get their final indices.
-    pub fn offset_index_by(&mut self, offset: u32) {
-        self.0 &= Self::INDEX_MASK;
-        self.0 = self.0.checked_add(offset).expect("operand index overflow");
     }
 }
 

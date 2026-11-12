@@ -332,7 +332,7 @@ static ErrorOr<void> connect_to_font_service(ClientType& client)
     return {};
 }
 
-ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsPrivate is_private, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
+ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(BrowsingSession& session, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
 {
     auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
@@ -383,7 +383,7 @@ ErrorOr<NonnullRefPtr<WebView::WebContentClient>> launch_web_content_process(IsP
         arguments.append(server.value());
     }
 
-    auto client = TRY(launch_server_process<WebView::WebContentClient>("WebContent"sv, move(arguments), is_private, initial_page_id, root_navigable_id));
+    auto client = TRY(launch_server_process<WebView::WebContentClient>("WebContent"sv, move(arguments), session, initial_page_id, root_navigable_id));
     TRY(connect_to_font_service(*client));
 
     // The test-only messages live on their own endpoint pair, over a transport that only exists in test mode.
@@ -635,8 +635,7 @@ ErrorOr<NonnullRefPtr<Requests::RequestControlClient>> launch_request_server_pro
         return move(process);
     }));
 
-    auto const& browsing_data_settings = Application::settings().browsing_data_settings();
-    client->async_set_disk_cache_settings(browsing_data_settings.disk_cache_settings);
+    client->async_set_disk_cache_settings(Application::settings().disk_cache_settings());
     client->async_set_proxy_configuration(request_server_options.proxy_configuration);
     if (!Application::settings().dns_settings().has<SystemDNS>())
         apply_dns_settings(*client);

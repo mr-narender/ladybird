@@ -36,13 +36,52 @@ impl CollapsingBorders {
     }
 }
 
-/// The content size, borders and paddings a fragment shows of its box.
+/// The content size, borders and paddings a fragment shows of its box, in the physical plane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BoxSides {
     pub(crate) content_size: FfiCssPixelSize,
     pub(crate) border: geometry::Sides,
     pub(crate) padding: geometry::Sides,
     pub(crate) collapsing: CollapsingBorders,
+}
+
+impl BoxSides {
+    /// The sides, which frame `from` holds, as frame `to` holds them.
+    pub(crate) fn in_frame(self, from: geometry::Frame, to: geometry::Frame) -> Self {
+        if from == to {
+            return self;
+        }
+        let content_size = if from.is_orthogonal_to(to) {
+            FfiCssPixelSize {
+                width: self.content_size.height,
+                height: self.content_size.width,
+            }
+        } else {
+            self.content_size
+        };
+        Self {
+            content_size,
+            border: self.border.in_frame(from, to),
+            padding: self.padding.in_frame(from, to),
+            collapsing: self.collapsing,
+        }
+    }
+
+    /// The widths of the borders that lie within the border box. In the collapsing borders model, a collapsed border is
+    /// centered on the grid line between two boxes, so only a part of it belongs to each (see
+    /// `used_values::collapsed_border_share`).
+    pub(crate) fn border_box_edges(&self) -> geometry::Sides {
+        if !self.collapsing.uses_collapsing_borders_model() {
+            return self.border;
+        }
+        let is_table_box = self.collapsing.is_collapsed_borders_table_box();
+        geometry::Sides {
+            top: used_values::collapsed_border_share(self.border.top, true, is_table_box),
+            right: used_values::collapsed_border_share(self.border.right, false, is_table_box),
+            bottom: used_values::collapsed_border_share(self.border.bottom, false, is_table_box),
+            left: used_values::collapsed_border_share(self.border.left, true, is_table_box),
+        }
+    }
 }
 
 /// Whether fragmentation broke the box, so that its fragment continues one in an earlier fragmentainer, or continues
@@ -76,7 +115,7 @@ pub(crate) enum FcPayload {
     Flex(std::sync::Arc<formatting_context::FlexLayoutData>),
     Multicol(std::sync::Arc<fragmentation::MulticolLayoutData>),
     Math(std::sync::Arc<math_formatting_context::MathPaintData>),
-    Svg(SvgPayload),
+    Svg(std::sync::Arc<SvgPayload>),
 }
 
 #[derive(Clone, Default)]
@@ -88,6 +127,7 @@ pub(crate) struct GridPayload {
 #[derive(Clone, Default)]
 pub(crate) struct SvgPayload {
     pub(crate) facts: CommittedSvgFacts,
+    pub(crate) geometry: svg_formatting_context::SvgGeometry,
     pub(crate) path: Option<std::sync::Arc<libgfx_rust::path::Path>>,
     pub(crate) text_character_cells: Option<std::sync::Arc<Vec<svg_formatting_context::FfiSvgTextCharacterCell>>>,
 }
@@ -108,6 +148,7 @@ impl PartialEq for FcPayload {
             (Self::Math(left), Self::Math(right)) => left == right,
             (Self::Svg(left), Self::Svg(right)) => {
                 left.facts == right.facts
+                    && left.geometry == right.geometry
                     && same_allocation(left.path.as_ref(), right.path.as_ref())
                     && same_allocation(left.text_character_cells.as_ref(), right.text_character_cells.as_ref())
             }
@@ -129,6 +170,7 @@ impl FcPayload {
             (Self::Math(left), Self::Math(right)) => left == right,
             (Self::Svg(left), Self::Svg(right)) => {
                 left.facts == right.facts
+                    && left.geometry == right.geometry
                     && left.path == right.path
                     && left.text_character_cells == right.text_character_cells
             }
@@ -140,7 +182,10 @@ impl FcPayload {
         match self {
             Self::Grid(grid) => grid.layout_data.is_none() && grid.used_tracks.is_none(),
             Self::Svg(svg) => {
-                svg.facts == CommittedSvgFacts::default() && svg.path.is_none() && svg.text_character_cells.is_none()
+                svg.facts == CommittedSvgFacts::default()
+                    && svg.geometry == Default::default()
+                    && svg.path.is_none()
+                    && svg.text_character_cells.is_none()
             }
             Self::Table(_) | Self::Flex(_) | Self::Multicol(_) | Self::Math(_) => false,
         }
@@ -190,25 +235,28 @@ impl PendingPayload {
         variant(payload).expect("the payload is of the kind just made")
     }
 
-    pub(crate) fn grid_mut(&mut self) -> &mut GridPayload {
-        self.variant_mut(
-            || FcPayload::Grid(GridPayload::default()),
-            |payload| match payload {
-                FcPayload::Grid(grid) => Some(grid),
-                _ => None,
-            },
-        )
-    }
-
     pub(crate) fn svg_mut(&mut self) -> &mut SvgPayload {
         self.variant_mut(
-            || FcPayload::Svg(SvgPayload::default()),
+            || FcPayload::Svg(Default::default()),
             |payload| match payload {
-                FcPayload::Svg(svg) => Some(svg),
+                FcPayload::Svg(svg) => Some(std::sync::Arc::make_mut(svg)),
                 _ => None,
             },
         )
     }
+}
+
+/// Whether a fragment holds links whose containing block is outside its box, as a table box holds the rows and cells
+/// its wrapper contains, and whether their offsets are final.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OuterLinks {
+    #[default]
+    None,
+    /// The links of boxes whose containing block is that of the fragment's own box, offset as if that containing
+    /// block's content box had no size, until the fragment of the containing block is built. Only a frame that reverses
+    /// an axis leaves them so.
+    AwaitingContainingBlockSize,
+    Placed,
 }
 
 pub(crate) struct Fragment {
@@ -220,7 +268,7 @@ pub(crate) struct Fragment {
     pub(crate) line_clamp: LineClampFacts,
     pub(crate) breaks: BreakFacts,
     pub(crate) scrollable_overflow: fragment_overflow::FragmentScrollableOverflow,
-    pub(crate) holds_links_of_outer_containing_blocks: bool,
+    pub(crate) outer_links: OuterLinks,
     pub(crate) children: Vec<FragmentLink>,
 }
 
@@ -258,7 +306,7 @@ pub(crate) struct ShownAs {
     pub(crate) facts: ParentShowFacts,
 }
 
-/// Where and how a link places its fragment, apart from its offset.
+/// Where and how a link places its fragment, apart from its offset. Its insets and margins are physical.
 #[derive(Clone, PartialEq)]
 pub(crate) struct LinkPlacement {
     pub(crate) insets: geometry::Sides,
@@ -270,11 +318,10 @@ pub(crate) struct LinkPlacement {
     /// The default scroll shift of a box whose anchor insets its layout resolved, which commit records for the box.
     pub(crate) default_scroll_shift: Option<abspos_inputs::DefaultScrollShift>,
     pub(crate) containing_block: crate::layout::node_data::NodeSlotId,
-    /// The frame the box was laid out in, in which the link and the fragment hold its geometry.
-    pub(crate) frame: geometry::Frame,
 }
 
 impl LinkPlacement {
+    /// The placement of a box that `facts` and `cells` describe in `frame`.
     fn of_box(
         facts: &run_state::FactsDecidedByParent,
         cells: &used_values::RootInputCells,
@@ -289,9 +336,10 @@ impl LinkPlacement {
                 right: insets.right,
                 bottom: insets.bottom,
                 left: insets.left,
-            },
+            }
+            .in_frame(frame, geometry::Frame::PHYSICAL),
             shown_as: ShownAs {
-                margins: cells.margins(),
+                margins: cells.margins().in_frame(frame, geometry::Frame::PHYSICAL),
                 facts: facts.fragment_facts.show,
             },
             containing_line_box_index,
@@ -302,7 +350,6 @@ impl LinkPlacement {
                 .map_or(crate::layout::node_data::NodeSlotId::INVALID, |placement| {
                     placement.containing_block
                 }),
-            frame,
         }
     }
 }
@@ -310,8 +357,74 @@ impl LinkPlacement {
 #[derive(Clone)]
 pub(crate) struct FragmentLink {
     pub(crate) fragment: std::sync::Arc<Fragment>,
-    pub(crate) committed_offset: FfiCssPixelPoint,
+    /// The physical offset of the content box of the fragment's box in the content box of its containing block.
+    pub(crate) offset: FfiCssPixelPoint,
     pub(crate) placement: LinkPlacement,
+}
+
+/// The physical offset of a content box of physical size `content_size` that lies at `offset_in_frame` in the content
+/// box of a containing block of physical size `containing_block_size`, which lays out its contents in `frame`.
+fn physical_offset(
+    offset_in_frame: FfiCssPixelPoint,
+    frame: geometry::Frame,
+    content_size: FfiCssPixelSize,
+    containing_block_size: FfiCssPixelSize,
+) -> FfiCssPixelPoint {
+    if frame.is_physical() {
+        return offset_in_frame;
+    }
+    let size_in_frame = frame.size_from_physical(content_size);
+    frame
+        .rect_to_physical(
+            CssPixelRect::new(
+                offset_in_frame.x,
+                offset_in_frame.y,
+                size_in_frame.width,
+                size_in_frame.height,
+            ),
+            containing_block_size,
+        )
+        .location()
+        .into()
+}
+
+/// A link the builder holds until the physical size of its containing block is known, with its offset in `frame`, the
+/// frame in which the containing block lays out its contents.
+pub(crate) struct PendingLink {
+    fragment: std::sync::Arc<Fragment>,
+    offset_in_frame: FfiCssPixelPoint,
+    frame: geometry::Frame,
+    placement: LinkPlacement,
+    /// The physical content size of the containing block, once the builder knows it.
+    containing_block_size: Option<FfiCssPixelSize>,
+}
+
+impl PendingLink {
+    fn into_link(self, containing_block_size: FfiCssPixelSize) -> FragmentLink {
+        FragmentLink {
+            offset: physical_offset(
+                self.offset_in_frame,
+                self.frame,
+                self.fragment.sides.content_size,
+                containing_block_size,
+            ),
+            fragment: self.fragment,
+            placement: self.placement,
+        }
+    }
+}
+
+/// The physical content size `node` committed, or none for a box without a committed fragment.
+pub(crate) fn committed_content_size_of(
+    pass: &LayoutPass<'_>,
+    node: crate::layout::node_data::NodeSlotId,
+) -> FfiCssPixelSize {
+    if node.is_invalid() {
+        return FfiCssPixelSize::default();
+    }
+    crate::painting::paint_read::GeometryRead::with_committed_fragment_link(pass.arena(), node, |link| {
+        link.map(|link| link.fragment.sides.content_size).unwrap_or_default()
+    })
 }
 
 fn same_allocation<T>(left: Option<&std::sync::Arc<T>>, right: Option<&std::sync::Arc<T>>) -> bool {
@@ -362,7 +475,7 @@ impl Fragment {
 
     pub(crate) fn svg(&self) -> Option<&SvgPayload> {
         match self.payload.as_deref()? {
-            FcPayload::Svg(svg) => Some(svg),
+            FcPayload::Svg(svg) => Some(svg.as_ref()),
             _ => None,
         }
     }
@@ -374,7 +487,9 @@ impl Fragment {
     }
 
     fn builds_like_apart_from_overflow(&self, previous: &Fragment) -> bool {
-        self.has_same_box_properties(previous) && self.holds_same_contents_as(previous)
+        self.has_same_box_properties(previous)
+            && self.outer_links == previous.outer_links
+            && self.holds_same_contents_as(previous)
     }
 
     pub(crate) fn with_scrollable_overflow(
@@ -398,9 +513,14 @@ impl Fragment {
             line_clamp: self.line_clamp,
             breaks: self.breaks,
             scrollable_overflow,
-            holds_links_of_outer_containing_blocks: self.holds_links_of_outer_containing_blocks,
+            outer_links: self.outer_links,
             children,
         }
+    }
+
+    /// Whether the fragment holds links of boxes whose containing block is `node`.
+    fn holds_links_contained_by(&self, node: crate::layout::node_data::NodeSlotId) -> bool {
+        self.outer_links != OuterLinks::None && self.children.iter().any(|link| link.placement.containing_block == node)
     }
 
     /// Whether the fragment holds the very lines and child fragments `previous` holds, placed the same way.
@@ -483,10 +603,10 @@ impl FragmentLink {
                 line_clamp: LineClampFacts::default(),
                 breaks: BreakFacts::default(),
                 scrollable_overflow: Default::default(),
-                holds_links_of_outer_containing_blocks: false,
+                outer_links: OuterLinks::None,
                 children: Vec::new(),
             }),
-            committed_offset: Default::default(),
+            offset: Default::default(),
             placement: LinkPlacement {
                 insets: geometry::Sides::default(),
                 shown_as: ShownAs::default(),
@@ -494,9 +614,32 @@ impl FragmentLink {
                 abspos_layout_inputs: None,
                 default_scroll_shift: None,
                 containing_block: crate::layout::node_data::NodeSlotId::INVALID,
-                frame: geometry::Frame::PHYSICAL,
             },
         }
+    }
+
+    /// The offset of the link's content box in the content box of its containing block, read in `frame`, where the
+    /// containing block's content box has the physical size `containing_block_size`.
+    pub(crate) fn offset_in_frame(
+        &self,
+        frame: geometry::Frame,
+        containing_block_size: FfiCssPixelSize,
+    ) -> FfiCssPixelPoint {
+        if frame.is_physical() {
+            return self.offset;
+        }
+        frame
+            .rect_from_physical(
+                CssPixelRect::new(
+                    self.offset.x,
+                    self.offset.y,
+                    self.fragment.sides.content_size.width,
+                    self.fragment.sides.content_size.height,
+                ),
+                containing_block_size,
+            )
+            .location()
+            .into()
     }
 
     pub(crate) fn places_same_fragment_identically_to(&self, previous: &FragmentLink) -> bool {
@@ -505,7 +648,7 @@ impl FragmentLink {
 
     pub(crate) fn has_same_placement(&self, previous: &FragmentLink) -> bool {
         self.fragment.node == previous.fragment.node
-            && self.committed_offset == previous.committed_offset
+            && self.offset == previous.offset
             && self.placement == previous.placement
     }
 }
@@ -639,6 +782,20 @@ fn propagate_payload_toward_run_root_space<Payload: PropagatedPayload>(
     }
 }
 
+/// Moves by `offset` the payloads among `payloads` that are in the coordinate space of `space`.
+fn translate_payloads_in_space_of<Payload: PropagatedPayload>(
+    payloads: &mut [Payload],
+    space: crate::layout::node_data::NodeSlotId,
+    offset: FfiCssPixelPoint,
+) {
+    for payload in payloads
+        .iter_mut()
+        .filter(|payload| payload.coordinate_space_box() == space)
+    {
+        payload.translate_by(offset);
+    }
+}
+
 fn sort_in_tree_order(entries: &mut [abspos_inputs::PendingAbsposChild], pass: &LayoutPass<'_>) {
     entries.sort_by(|left, right| {
         if left.child_box == right.child_box {
@@ -670,6 +827,8 @@ pub(crate) struct PlacedBoxes {
 struct PlacedBoxSlot {
     builder: u64,
     placement: run_state::BoxPlacement,
+    /// The physical size of the box's content box, once the builder built the box's fragment.
+    physical_content_size: Option<FfiCssPixelSize>,
 }
 
 impl Default for PlacedBoxSlot {
@@ -680,6 +839,7 @@ impl Default for PlacedBoxSlot {
                 content_offset_in_containing_block: FfiCssPixelPoint::default(),
                 containing_block: crate::layout::node_data::NodeSlotId::INVALID,
             },
+            physical_content_size: None,
         }
     }
 }
@@ -719,9 +879,26 @@ impl FragmentBuilderScratch {
     ) -> bool {
         self.placed_box_slots.with_row_mut(node.slot_index() as usize, |slot| {
             let was_placed_by_builder = slot.builder == builder;
-            *slot = PlacedBoxSlot { builder, placement };
+            *slot = PlacedBoxSlot {
+                builder,
+                placement,
+                physical_content_size: None,
+            };
             was_placed_by_builder
         })
+    }
+
+    fn note_physical_content_size(
+        &self,
+        builder: u64,
+        node: crate::layout::node_data::NodeSlotId,
+        physical_content_size: FfiCssPixelSize,
+    ) {
+        self.placed_box_slots.with_row_mut(node.slot_index() as usize, |slot| {
+            if slot.builder == builder {
+                slot.physical_content_size = Some(physical_content_size);
+            }
+        });
     }
 
     fn placement_by(
@@ -763,6 +940,16 @@ impl PlacementsOfBuilder<'_> {
 
     pub(crate) fn is_placed(&self, node: crate::layout::node_data::NodeSlotId) -> bool {
         self.placement_of(node).is_some()
+    }
+
+    /// The physical size of the content box of `node`, where the builder placed the box and built its fragment.
+    fn physical_content_size_of(&self, node: crate::layout::node_data::NodeSlotId) -> Option<FfiCssPixelSize> {
+        self.scratch
+            .placed_box_slots
+            .with_row(node.slot_index() as usize, |slot| {
+                slot.filter(|slot| slot.builder == self.builder)
+                    .and_then(|slot| slot.physical_content_size)
+            })
     }
 
     /// The containing block `node` is placed in, or for a box not placed in one yet, the containing block it is laid
@@ -834,50 +1021,165 @@ pub(crate) struct FragmentGeometry {
 }
 
 impl FragmentGeometry {
-    pub(crate) fn shows_box_of_fragment(&self, fragment: &Fragment) -> bool {
-        fragment.sides == self.cells.box_sides()
+    /// Whether `fragment` shows the box as these cells, which `frame` holds, and lines do.
+    pub(crate) fn shows_box_of_fragment(&self, fragment: &Fragment, frame: geometry::Frame) -> bool {
+        fragment.sides == self.cells.box_sides().in_frame(frame, geometry::Frame::PHYSICAL)
             && same_allocation(self.line_data.as_ref(), fragment.line_data.as_ref())
     }
 }
 
+/// How the physical offsets of boxes in a content box whose contents use `frame` move as the content box goes from
+/// the physical size `from` to `to`: along each axis the frame reverses, they keep their distance from the far edge.
+fn shift_of_contents(frame: geometry::Frame, from: FfiCssPixelSize, to: FfiCssPixelSize) -> FfiCssPixelPoint {
+    FfiCssPixelPoint {
+        x: if frame.vertical_axis_is_reversed() {
+            to.width - from.width
+        } else {
+            CssPixels::default()
+        },
+        y: if frame.horizontal_axis_is_reversed() {
+            to.height - from.height
+        } else {
+            CssPixels::default()
+        },
+    }
+}
+
+/// A fragment like `fragment` whose links of boxes contained by `containing_block` are moved by `shift`, and whose
+/// outer links are then `outer_links`.
+fn fragment_with_contained_links_moved(
+    pass: &LayoutPass<'_>,
+    fragment: &Fragment,
+    containing_block: crate::layout::node_data::NodeSlotId,
+    shift: FfiCssPixelPoint,
+    outer_links: OuterLinks,
+) -> std::sync::Arc<Fragment> {
+    let children = fragment
+        .children
+        .iter()
+        .map(|link| {
+            let mut link = link.clone();
+            if link.placement.containing_block == containing_block {
+                link.offset = formatting_context::point_add(link.offset, shift);
+            }
+            link
+        })
+        .collect();
+    let mut rebuilt = fragment.with_scrollable_overflow_and_children(fragment.scrollable_overflow, children);
+    rebuilt.outer_links = outer_links;
+    rebuilt_fragment(pass, rebuilt)
+}
+
+/// The links of the fragment `arrived` of `node`, for a fragment of the box at the physical content size
+/// `content_size` whose contents its parent moves by the physical offset `contents_shift`. Beside that, the boxes the
+/// box contains keep their offsets in the frame it lays out its contents in.
+fn links_moved_to_content_size(
+    pass: &LayoutPass<'_>,
+    node: crate::layout::node_data::NodeSlotId,
+    arrived: &Fragment,
+    content_size: FfiCssPixelSize,
+    contents_shift: FfiCssPixelPoint,
+) -> Vec<FragmentLink> {
+    let shift_of_box_sides = shift_of_contents(
+        formatting_context::frame_established_by(pass, node),
+        arrived.sides.content_size,
+        content_size,
+    );
+    let shift = formatting_context::point_add(shift_of_box_sides, contents_shift);
+    if shift == FfiCssPixelPoint::default() {
+        return arrived.children.clone();
+    }
+    // NB: The rendered legend of a fieldset sits on the fieldset's border, which the contents shift leaves in place.
+    let rendered_legend = NodeFacts::new(pass, node).rendered_legend();
+    arrived
+        .children
+        .iter()
+        .map(|link| {
+            let mut link = link.clone();
+            if link.fragment.node == rendered_legend {
+                link.offset = formatting_context::point_add(link.offset, shift_of_box_sides);
+            } else if link.placement.containing_block == node {
+                link.offset = formatting_context::point_add(link.offset, shift);
+            }
+            if link.fragment.outer_links == OuterLinks::Placed && link.fragment.holds_links_contained_by(node) {
+                link.fragment =
+                    fragment_with_contained_links_moved(pass, &link.fragment, node, shift, OuterLinks::Placed);
+            }
+            link
+        })
+        .collect()
+}
+
+/// The links `children` of a fragment of `node` whose content box has the physical size `content_size`, where the
+/// fragments of the boxes it contains place the links of its other boxes that awaited its size.
+fn place_links_awaiting_size_of(
+    pass: &LayoutPass<'_>,
+    node: crate::layout::node_data::NodeSlotId,
+    content_size: FfiCssPixelSize,
+    mut children: Vec<FragmentLink>,
+) -> Vec<FragmentLink> {
+    for link in &mut children {
+        if link.placement.containing_block != node
+            || link.fragment.outer_links != OuterLinks::AwaitingContainingBlockSize
+        {
+            continue;
+        }
+        let shift = shift_of_contents(
+            formatting_context::frame_established_by(pass, node),
+            FfiCssPixelSize::default(),
+            content_size,
+        );
+        link.fragment = fragment_with_contained_links_moved(pass, &link.fragment, node, shift, OuterLinks::Placed);
+    }
+    children
+}
+
+/// Builds the fragment of `node` around `children`, whose offsets are physical. Where `awaits_containing_block_size`,
+/// the links it holds of boxes contained by its own containing block await that block's size.
 fn snapshot_fragment(
     pass: &LayoutPass<'_>,
     node: crate::layout::node_data::NodeSlotId,
-    mut children: Vec<FragmentLink>,
+    children: Vec<FragmentLink>,
     geometry: FragmentGeometry,
     breaks: BreakFacts,
     payload: PendingPayload,
+    awaits_containing_block_size: bool,
 ) -> std::sync::Arc<Fragment> {
     let FragmentGeometry { cells, line_data } = geometry;
     let PendingPayload { payload, line_clamp } = payload;
+    let sides = cells.box_sides().in_frame(pass.frame, geometry::Frame::PHYSICAL);
+    let mut children = place_links_awaiting_size_of(pass, node, sides.content_size, children);
     if line_clamp.has_line_clamp_point && !breaks.continues_in_next {
         line_clamp_edge::clip_floats_at_block_end_content_edge(
             pass,
             node,
             formatting_context::frame_established_by(pass, node),
-            pass.frame
-                .size_to_physical(cells.content_inline_size, cells.content_block_size),
+            sides.content_size,
             &mut children,
         );
     }
+    let outer_links = if !fragment_overflow::holds_links_of_outer_containing_blocks(node, &children) {
+        OuterLinks::None
+    } else if awaits_containing_block_size {
+        OuterLinks::AwaitingContainingBlockSize
+    } else {
+        OuterLinks::Placed
+    };
     let mut fragment = Fragment {
         identity: 0,
         node,
-        sides: cells.box_sides(),
+        sides,
         line_data,
         payload: payload.filter(|payload| !payload.holds_nothing()),
         line_clamp,
         breaks,
         scrollable_overflow: Default::default(),
-        holds_links_of_outer_containing_blocks: fragment_overflow::holds_links_of_outer_containing_blocks(
-            node, &children,
-        ),
+        outer_links,
         children,
     };
     fragment.scrollable_overflow = fragment_overflow::scrollable_overflow_of(
         pass.arena(),
         &fragment,
-        pass.frame,
         fragment_overflow::contained_links(&fragment),
     );
     if let Some(previous) = previously_committed_fragment_like(pass, &fragment) {
@@ -897,7 +1199,15 @@ pub(crate) fn fragment_with_children(
     fragment: &Fragment,
     children: Vec<FragmentLink>,
 ) -> std::sync::Arc<Fragment> {
-    let mut rebuilt = fragment.with_scrollable_overflow_and_children(fragment.scrollable_overflow, children);
+    rebuilt_fragment(
+        pass,
+        fragment.with_scrollable_overflow_and_children(fragment.scrollable_overflow, children),
+    )
+}
+
+/// The committed fragment of the box of `rebuilt` where that builds identically to it, or else `rebuilt` with an
+/// identity of its own.
+fn rebuilt_fragment(pass: &LayoutPass<'_>, mut rebuilt: Fragment) -> std::sync::Arc<Fragment> {
     if let Some(previous) = previously_committed_fragment_matching(pass, &rebuilt) {
         return previous;
     }
@@ -905,28 +1215,75 @@ pub(crate) fn fragment_with_children(
     std::sync::Arc::new(rebuilt)
 }
 
+/// The lines `lines` of `node` moved by `offset`: those the committed fragment of the box holds where they are the
+/// same, so that moving the lines as the last layout of the box did keeps the box's fragment.
+pub(crate) fn lines_translated_by(
+    pass: &LayoutPass<'_>,
+    node: crate::layout::node_data::NodeSlotId,
+    lines: std::sync::Arc<inline_content::InlineContent>,
+    offset: FfiCssPixelPoint,
+) -> std::sync::Arc<inline_content::InlineContent> {
+    let translated = inline_content::InlineContent::concatenate_translated(&[(lines, offset)]);
+    if !pass.has_committed_fragment_link(node) {
+        return translated;
+    }
+    pass.arena()
+        .with_committed_fragment_link(node, |link| {
+            link.and_then(|link| link.fragment.line_data.clone())
+                .filter(|committed| **committed == *translated)
+        })
+        .unwrap_or(translated)
+}
+
 /// The fragment of a placed box: `arrived`, the fragment its own run built or the committed one, where that shows the
 /// box as placed and nothing else was placed in it, or else a fragment of the box's `geometry` around the arrived
-/// fragment's children and the `children` placed in it here.
+/// fragment's children, moved by `contents_shift`, a physical offset by which the box's parent moves its contents, and
+/// the `children` placed in it here.
+#[allow(clippy::too_many_arguments)]
 fn fragment_of_placed_box(
     pass: &LayoutPass<'_>,
     node: crate::layout::node_data::NodeSlotId,
     arrived: Option<std::sync::Arc<Fragment>>,
-    children: Vec<FragmentLink>,
+    children: Vec<PendingLink>,
     geometry: FragmentGeometry,
     breaks: BreakFacts,
     payload: PendingPayload,
+    contents_shift: FfiCssPixelPoint,
 ) -> std::sync::Arc<Fragment> {
-    let Some(arrived) = arrived else {
-        return snapshot_fragment(pass, node, children, geometry, breaks, payload);
+    let content_size = geometry
+        .cells
+        .box_sides()
+        .in_frame(pass.frame, geometry::Frame::PHYSICAL)
+        .content_size;
+    let placed_children = |children: Vec<PendingLink>| {
+        children.into_iter().map(move |child| {
+            debug_assert!(
+                child.placement.containing_block == node,
+                "a box holds the pending links of the boxes it contains"
+            );
+            child.into_link(content_size)
+        })
     };
-    let shows_box_as_placed =
-        children.is_empty() && geometry.shows_box_of_fragment(&arrived) && arrived.breaks == breaks;
+    let Some(arrived) = arrived else {
+        return snapshot_fragment(
+            pass,
+            node,
+            placed_children(children).collect(),
+            geometry,
+            breaks,
+            payload,
+            false,
+        );
+    };
+    let shows_box_as_placed = children.is_empty()
+        && contents_shift == FfiCssPixelPoint::default()
+        && geometry.shows_box_of_fragment(&arrived, pass.frame)
+        && arrived.breaks == breaks;
     if shows_box_as_placed {
         return arrived;
     }
-    let mut all_children = arrived.children.clone();
-    all_children.extend(children);
+    let mut all_children = links_moved_to_content_size(pass, node, &arrived, content_size, contents_shift);
+    all_children.extend(placed_children(children));
     snapshot_fragment(
         pass,
         node,
@@ -934,6 +1291,7 @@ fn fragment_of_placed_box(
         geometry,
         breaks,
         PendingPayload::of_fragment(&arrived),
+        arrived.outer_links == OuterLinks::AwaitingContainingBlockSize,
     )
 }
 
@@ -980,47 +1338,79 @@ impl PayloadsPastRun {
 }
 
 /// What a run laid out inside its root, before the root's fragment exists: the links at the top of the run's
-/// fragments, what goes past the run, and what the run's layout of its root hands the root's fragment. A normal run
-/// turns them into its root's fragment, a fragmentainer's run hands them to the run of the box it belongs to, and a
-/// whole layout pass hands its links to commit.
+/// fragments and what goes past the run. A normal run turns them into its root's fragment, a fragmentainer's run hands
+/// them to the run of the box it belongs to, and a whole layout pass hands its links to commit.
 pub(crate) struct RunContents {
     pub(crate) node: crate::layout::node_data::NodeSlotId,
-    pub(crate) scoped_descendants: Vec<FragmentLink>,
+    pub(crate) scoped_descendants: Vec<PendingLink>,
     pub(crate) holds_links_beside_their_sealed_containing_blocks: bool,
     pub(crate) payloads_past_run: PayloadsPastRun,
-    /// What the run's layout of its root hands the root's fragment.
-    pub(crate) root_payload: PendingPayload,
 }
 
 impl RunContents {
-    /// The root's fragment around what the run laid out inside it, showing the root's own layout `geometry`.
-    pub(crate) fn into_run_root_fragment(self, pass: &LayoutPass<'_>, geometry: FragmentGeometry) -> RunRootFragment {
+    /// The root's fragment around what the run laid out inside it, showing the root's own layout `geometry` and what
+    /// the formatting context of the root handed it as `root_payload`.
+    pub(crate) fn into_run_root_fragment(
+        self,
+        pass: &LayoutPass<'_>,
+        geometry: FragmentGeometry,
+        root_payload: PendingPayload,
+    ) -> RunRootFragment {
         let Self {
             node,
-            mut scoped_descendants,
+            scoped_descendants,
             holds_links_beside_their_sealed_containing_blocks,
             payloads_past_run,
-            root_payload,
         } = self;
+        let content_size = geometry
+            .cells
+            .box_sides()
+            .in_frame(pass.frame, geometry::Frame::PHYSICAL)
+            .content_size;
+        let mut awaits_containing_block_size = false;
+        let mut links: Vec<FragmentLink> = scoped_descendants
+            .into_iter()
+            .map(|link| {
+                let containing_block_size = match link.containing_block_size {
+                    Some(size) => size,
+                    None if effective_containing_block(pass, &link) == node => content_size,
+                    None => {
+                        // NB: A table box holds the rows and cells its wrapper contains, whose fragment is built after
+                        //     the table box's.
+                        awaits_containing_block_size |= !link.placement.containing_block.is_invalid()
+                            && (link.frame.vertical_axis_is_reversed() || link.frame.horizontal_axis_is_reversed());
+                        FfiCssPixelSize::default()
+                    }
+                };
+                link.into_link(containing_block_size)
+            })
+            .collect();
         if holds_links_beside_their_sealed_containing_blocks {
-            fragment_overflow::include_links_held_beside_their_containing_blocks(
-                pass.arena(),
-                node,
-                &mut scoped_descendants,
-            );
+            fragment_overflow::include_links_held_beside_their_containing_blocks(pass.arena(), node, &mut links);
         }
         RunRootFragment::new(
             snapshot_fragment(
                 pass,
                 node,
-                scoped_descendants,
+                links,
                 geometry,
                 BreakFacts::default(),
                 root_payload,
+                awaits_containing_block_size,
             ),
             payloads_past_run,
         )
     }
+}
+
+/// The containing block of the box `link` places, or for a link without one, the containing block found among the
+/// box's ancestors, as painting finds it.
+fn effective_containing_block(pass: &LayoutPass<'_>, link: &PendingLink) -> crate::layout::node_data::NodeSlotId {
+    let containing_block = link.placement.containing_block;
+    if containing_block.is_invalid() {
+        return pass.arena().containing_block_by_walking_ancestors(link.fragment.node);
+    }
+    containing_block
 }
 
 /// What a run hands its parent of its root: the root's fragment, and what goes past the run toward boxes outside it.
@@ -1058,6 +1448,19 @@ impl RunRootFragment {
     pub(crate) fn payloads_past_run(&self) -> &PayloadsPastRun {
         self.payloads_past_run.as_deref().unwrap_or(&NO_PAYLOADS_PAST_RUN)
     }
+
+    /// The root fragment of a run whose root's contents its parent moves by `offset`, in the frame the root lays out
+    /// its contents in, where what the run hands past the root moves with them. The links and lines of the root's
+    /// fragment move as the root's placement builds its fragment (see fragment_of_placed_box()).
+    pub(crate) fn translated_by(mut self, offset: FfiCssPixelPoint) -> Self {
+        let root = self.fragment.node;
+        if let Some(payloads) = self.payloads_past_run.as_deref_mut() {
+            translate_payloads_in_space_of(&mut payloads.pending_abspos, root, offset);
+            translate_payloads_in_space_of(&mut payloads.anchor_candidates, root, offset);
+            translate_payloads_in_space_of(&mut payloads.inline_containing_block_rects, root, offset);
+        }
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1077,7 +1480,7 @@ struct PendingFragment {
     node: crate::layout::node_data::NodeSlotId,
     /// The fragment the box's layout handed its placement: the root fragment of its own run, or its committed fragment.
     arrived: Option<std::sync::Arc<Fragment>>,
-    children: Vec<FragmentLink>,
+    children: Vec<PendingLink>,
     pending_abspos: Vec<abspos_inputs::PendingAbsposChild>,
     anchor_candidates: Vec<AnchorCandidate>,
     inline_containing_block_rects: Vec<InlineContainingBlockRect>,
@@ -1115,12 +1518,10 @@ struct RunFragmentBuilderInner {
     abspos_containing_block_info_contributions: Vec<AbsposContainingBlockInfoContribution>,
     /// How many abspos containing block info contributions the run has received, whether or not they are still listed.
     abspos_containing_block_info_contributions_received: u64,
-    top_scope_links: Vec<FragmentLink>,
+    top_scope_links: Vec<PendingLink>,
     /// What the layouts of children the run laid out but never placed handed their placements, which close() links at
     /// the top of the run's fragments.
     children_left_unplaced: Vec<ChildLeftUnplaced>,
-    /// What the run's layout of its root hands the root's fragment.
-    root_payload: PendingPayload,
     /// Where the run placed each box it placed so far, from the moment it places the box, before the placement drains
     /// the absolutely positioned boxes the box contains.
     placed_boxes: PlacedBoxes,
@@ -1449,6 +1850,21 @@ impl RunFragmentBuilder {
             .any(|entry| !entry.inline_containing_block().is_invalid())
     }
 
+    pub(crate) fn any_pending_abspos_contained_by(&self, node: crate::layout::node_data::NodeSlotId) -> bool {
+        let inner = self.inner.borrow();
+        inner
+            .pending_abspos_at_root
+            .iter()
+            .chain(
+                inner
+                    .pending_fragments
+                    .get(&node.slot_index())
+                    .into_iter()
+                    .flat_map(|fragment| fragment.pending_abspos.iter()),
+            )
+            .any(|entry| entry.containing_block() == node)
+    }
+
     pub(crate) fn any_pending_abspos_names_inline_containing_block(
         &self,
         inline_box: crate::layout::node_data::NodeSlotId,
@@ -1602,7 +2018,7 @@ impl RunFragmentBuilder {
         inner.holds_links_beside_their_sealed_containing_blocks |=
             contents.holds_links_beside_their_sealed_containing_blocks;
         for mut link in contents.scoped_descendants {
-            link.committed_offset = formatting_context::point_add(link.committed_offset, offset);
+            link.offset_in_frame = formatting_context::point_add(link.offset_in_frame, offset);
             if link.placement.containing_block == self.root_node
                 && let Some(line_index) = link.placement.containing_line_box_index.as_mut()
             {
@@ -1649,7 +2065,7 @@ impl RunFragmentBuilder {
             .iter_mut()
             .filter(|link| link.placement.containing_block == root)
         {
-            link.committed_offset = formatting_context::point_add(link.committed_offset, offset);
+            link.offset_in_frame = formatting_context::point_add(link.offset_in_frame, offset);
         }
         {
             let scratch = pass.fragment_builder_scratch();
@@ -1666,27 +2082,9 @@ impl RunFragmentBuilder {
                 });
             }
         }
-        for entry in inner
-            .pending_abspos_at_root
-            .iter_mut()
-            .filter(|entry| entry.coordinate_space_box == root)
-        {
-            entry.translate_by(offset);
-        }
-        for candidate in inner
-            .anchor_candidates_at_root
-            .iter_mut()
-            .filter(|candidate| candidate.coordinate_space_box == root)
-        {
-            candidate.translate_by(offset);
-        }
-        for payload in inner
-            .inline_containing_block_rects_at_root
-            .iter_mut()
-            .filter(|payload| payload.coordinate_space_box == root)
-        {
-            payload.translate_by(offset);
-        }
+        translate_payloads_in_space_of(&mut inner.pending_abspos_at_root, root, offset);
+        translate_payloads_in_space_of(&mut inner.anchor_candidates_at_root, root, offset);
+        translate_payloads_in_space_of(&mut inner.inline_containing_block_rects_at_root, root, offset);
     }
 
     /// Takes in the root fragment of the run that laid out `node`, which is being placed, and what goes past that run.
@@ -1742,17 +2140,18 @@ impl RunFragmentBuilder {
         node: crate::layout::node_data::NodeSlotId,
         update: impl FnOnce(&mut PendingPayload),
     ) {
+        debug_assert!(
+            node != self.root_node || self.is_entry_accumulator,
+            "a run's root takes its payload from its formatting context"
+        );
         let mut inner = self.inner.borrow_mut();
-        let payload = if node == self.root_node && !self.is_entry_accumulator {
-            &mut inner.root_payload
-        } else {
+        update(
             &mut inner
                 .pending_fragments
                 .entry(node.slot_index())
                 .or_insert_with(|| PendingFragment::new(node))
-                .payload
-        };
-        update(payload);
+                .payload,
+        );
     }
 
     fn merge_child_root_into_pending_fragment(
@@ -1810,8 +2209,9 @@ impl RunFragmentBuilder {
         facts: run_state::FactsDecidedByParent,
         abspos_layout_inputs: Option<std::sync::Arc<abspos_inputs::AbsposLayoutInputs>>,
         containing_line_box_index: Option<u32>,
-        committed_offset: FfiCssPixelPoint,
+        offset_in_frame: FfiCssPixelPoint,
         own_anchor_candidate_border_box_rect: Option<CssPixelRect>,
+        physical_contents_shift: FfiCssPixelPoint,
     ) -> PlacedFragment {
         let placement = facts.placement.expect("a box is placed before its fragment is built");
         let mut inner = self.inner.borrow_mut();
@@ -1829,6 +2229,9 @@ impl RunFragmentBuilder {
             .remove(&slot)
             .unwrap_or_else(|| PendingFragment::new(node));
         let content_size = (geometry.cells.content_inline_size, geometry.cells.content_block_size);
+        let physical_content_size = pass.frame.size_to_physical(content_size.0, content_size.1);
+        pass.fragment_builder_scratch()
+            .note_physical_content_size(self.builder, node, physical_content_size);
         let link_placement = LinkPlacement::of_box(
             &facts,
             &geometry.cells,
@@ -1844,11 +2247,14 @@ impl RunFragmentBuilder {
             geometry,
             facts.fragment_facts.breaks,
             payload,
+            physical_contents_shift,
         );
-        let link = FragmentLink {
+        let link = PendingLink {
             fragment: fragment.clone(),
-            committed_offset,
+            offset_in_frame,
+            frame: pass.frame,
             placement: link_placement,
+            containing_block_size: None,
         };
         self.attach(pass, &mut inner, link, containing_block);
         let exports_payloads = !pending_abspos_from_placed_box.is_empty()
@@ -1859,10 +2265,10 @@ impl RunFragmentBuilder {
         let frames = exports_payloads
             .then(|| {
                 let own = formatting_context::frame_established_by(pass, node);
-                (own != pass.frame).then(|| PlacedBoxFrames {
+                (own != pass.frame).then_some(PlacedBoxFrames {
                     own,
                     containing_block: pass.frame,
-                    physical_content_size: pass.frame.size_to_physical(content_size.0, content_size.1),
+                    physical_content_size,
                 })
             })
             .flatten();
@@ -1932,16 +2338,16 @@ impl RunFragmentBuilder {
         &self,
         pass: &LayoutPass<'_>,
         inner: &mut RunFragmentBuilderInner,
-        link: FragmentLink,
+        link: PendingLink,
         containing_block: Option<crate::layout::node_data::NodeSlotId>,
     ) {
         let Some(containing_block) = containing_block else {
-            inner.top_scope_links.push(link);
+            self.push_to_top_scope(pass, inner, link);
             return;
         };
         if containing_block == self.root_node || Some(containing_block.slot_index()) == self.root_containing_block_slot
         {
-            inner.top_scope_links.push(link);
+            self.push_to_top_scope(pass, inner, link);
             return;
         }
         if let Some(pending_fragment) = inner.pending_fragments.get_mut(&containing_block.slot_index()) {
@@ -1952,7 +2358,7 @@ impl RunFragmentBuilder {
         if self.is_entry_accumulator || self.with_placements(pass, |placements| placements.is_placed(containing_block))
         {
             inner.holds_links_beside_their_sealed_containing_blocks |= !self.is_entry_accumulator;
-            inner.top_scope_links.push(link);
+            self.push_to_top_scope(pass, inner, link);
             return;
         }
         let mut pending_fragment = PendingFragment::new(containing_block);
@@ -1960,6 +2366,17 @@ impl RunFragmentBuilder {
         inner
             .pending_fragments
             .insert(containing_block.slot_index(), pending_fragment);
+    }
+
+    /// Puts `link` at the top of the run's fragments, with the physical content size of its containing block where the
+    /// run placed that block already.
+    fn push_to_top_scope(&self, pass: &LayoutPass<'_>, inner: &mut RunFragmentBuilderInner, mut link: PendingLink) {
+        if link.containing_block_size.is_none() {
+            let containing_block = effective_containing_block(pass, &link);
+            link.containing_block_size =
+                self.with_placements(pass, |placements| placements.physical_content_size_of(containing_block));
+        }
+        inner.top_scope_links.push(link);
     }
 
     pub(crate) fn take_run_contents(&self, pass: &LayoutPass<'_>) -> RunContents {
@@ -1976,8 +2393,19 @@ impl RunFragmentBuilder {
             "an ordinary run closes into the contents of its root"
         );
         let root = self.close(pass);
+        // NB: A link at the top of a pass whose containing block the pass did not place, such as the containing block of
+        //     a partial relayout's root, keeps the containing block it committed.
         CompletedPassFragments {
-            roots: root.scoped_descendants,
+            roots: root
+                .scoped_descendants
+                .into_iter()
+                .map(|link| {
+                    let containing_block_size = link
+                        .containing_block_size
+                        .unwrap_or_else(|| committed_content_size_of(pass, effective_containing_block(pass, &link)));
+                    link.into_link(containing_block_size)
+                })
+                .collect(),
         }
     }
 
@@ -2012,7 +2440,7 @@ impl RunFragmentBuilder {
             let node = root.fragment.node;
             let facts = unplaced_child.facts_decided_by_parent;
             let placement = LinkPlacement::of_box(&facts, &unplaced_child.geometry.cells, None, None, pass.frame);
-            inner.top_scope_links.push(FragmentLink {
+            let link = PendingLink {
                 fragment: fragment_of_placed_box(
                     pass,
                     node,
@@ -2021,10 +2449,14 @@ impl RunFragmentBuilder {
                     unplaced_child.geometry,
                     facts.fragment_facts.breaks,
                     PendingPayload::default(),
+                    FfiCssPixelPoint::default(),
                 ),
-                committed_offset: FfiCssPixelPoint::default(),
+                offset_in_frame: FfiCssPixelPoint::default(),
+                frame: pass.frame,
                 placement,
-            });
+                containing_block_size: None,
+            };
+            self.push_to_top_scope(pass, &mut inner, link);
         }
         self.with_placements(pass, |placements| {
             for entry in &mut payloads_past_run.pending_abspos {
@@ -2062,7 +2494,6 @@ impl RunFragmentBuilder {
             scoped_descendants: inner.top_scope_links,
             holds_links_beside_their_sealed_containing_blocks: inner.holds_links_beside_their_sealed_containing_blocks,
             payloads_past_run,
-            root_payload: inner.root_payload,
         }
     }
 }

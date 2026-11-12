@@ -6,7 +6,6 @@
 
 pub mod border_radii;
 pub(crate) mod border_shape;
-pub(crate) mod caret;
 pub(crate) mod chrome_geometry;
 pub(crate) mod client_rects;
 pub(crate) mod content_visibility;
@@ -40,9 +39,9 @@ pub(crate) mod presentation;
 pub(crate) mod published_frame;
 pub mod record;
 pub(crate) mod recording_slot;
-pub(crate) mod rect_to_viewport_transform;
 pub(crate) mod replaced_paint_facts;
 pub(crate) mod scroll_chain;
+pub(crate) mod scroll_resnap;
 pub(crate) mod scroll_snap;
 pub mod scrollable_overflow;
 pub mod selection;
@@ -51,10 +50,9 @@ pub mod style_queries;
 pub(crate) mod svg_filter;
 pub(crate) mod svg_masking;
 pub(crate) mod svg_paint_resources;
-pub(crate) mod svg_viewport;
 pub mod text_fragment;
+pub mod viewport_mapping;
 pub mod visual_animation_builder;
 pub mod visual_context;
-pub(crate) mod visual_lines;
 
 pub use libcompositing_rust::{filter_bytes, force_dark, visual_animation};

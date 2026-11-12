@@ -77,6 +77,14 @@ impl PreparedItem {
         }
     }
 
+    /// The forced break of a preserved newline at `offset_in_node` in the text of `node`.
+    pub(super) fn newline(node: Node, offset_in_node: usize) -> Self {
+        Self {
+            offset_in_node: u32::try_from(offset_in_node).expect("text offsets fit in 32 bits"),
+            ..Self::new(ItemType::ForcedBreak, node, 0)
+        }
+    }
+
     pub(super) fn text(
         node: Node,
         text_range: std::ops::Range<usize>,
@@ -222,10 +230,12 @@ impl PreparedInlineContent {
     }
 
     pub(crate) fn for_block_container(pass: LayoutPass<'_>, block_container: Node) -> Arc<Self> {
-        if pass.reads_no_memoized_layout() || pass.lays_out_with_position_option() {
+        let Some(memos) = pass
+            .prepared_inline_content_memos()
+            .filter(|_| !pass.lays_out_with_position_option())
+        else {
             return Arc::new(Self::prepare(pass, block_container));
-        }
-        let memos = pass.prepared_inline_content_memos();
+        };
         if let Some(kept) = memos.kept(block_container, run_root_validity(&pass, block_container)) {
             if cfg!(debug_assertions) || run_repeatability::verification_is_enabled() {
                 kept.verify_against_fresh_preparation(pass, block_container);

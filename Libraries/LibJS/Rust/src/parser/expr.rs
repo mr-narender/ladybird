@@ -371,6 +371,7 @@ impl<U: Unit> Parser<'_, U> {
             && self.potential_arrow_at == start;
         let mut optional_chained = false;
         let mut chain_pos = start;
+        let mut chain_length = 0u32;
         loop {
             // NB: All of an optional chain is where it starts.
             if optional_chained && self.marks {
@@ -405,6 +406,7 @@ impl<U: Unit> Parser<'_, U> {
                             return result;
                         }
                         base = result;
+                        chain_length += 1;
                         continue;
                     }
                     let operator_pos = self.tok_start;
@@ -484,6 +486,11 @@ impl<U: Unit> Parser<'_, U> {
                     }
                 }
                 _ => break,
+            }
+            chain_length += 1;
+            if chain_length > MAX_SUBSCRIPT_CHAIN_LENGTH {
+                self.fail(self.tok_start, RECURSION_LIMIT_MESSAGE);
+                return base;
             }
         }
         if optional_chained {
@@ -1070,8 +1077,10 @@ impl<U: Unit> Parser<'_, U> {
         match key_kind {
             T::Name => key_name == N_PROTO,
             T::Str => {
-                let start = self.ast.pos[key as usize] as usize;
-                key_end as usize - start == 11 && (0..9).all(|i| self.at(start + 1 + i) == b"__proto__"[i] as u32)
+                // NB: The name of the property is the value of the string, which escape sequences spell out as well.
+                let start = self.ast.pos[key as usize] as usize + 1;
+                let units = self.source_view(start, key_end as usize - 1);
+                super::literals::string_literal_text(units).view() == "__proto__"
             }
             _ => false,
         }
@@ -1543,6 +1552,10 @@ impl<U: Unit> Parser<'_, U> {
                 }
             }
             tag::OBJECT | tag::OBJECT_PATTERN => {
+                if self.marks && self.ast.tag[node as usize] == tag::OBJECT {
+                    let mark = self.ast.b[node as usize];
+                    self.ast.tag[mark as usize] = tag::EMPTY;
+                }
                 self.ast.tag[node as usize] = tag::OBJECT_PATTERN;
                 let list = self.ast.a[node as usize];
                 let count = self.ast.extra[list as usize];

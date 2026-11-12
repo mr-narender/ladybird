@@ -11,6 +11,7 @@
 
 #include <AK/Base64.h>
 #include <AK/Debug.h>
+#include <AK/QuickSort.h>
 #include <AK/ScopeGuard.h>
 #include <AK/kmalloc.h>
 #include <LibGC/Heap.h>
@@ -28,6 +29,7 @@
 #include <LibWeb/Fetch/BodyInit.h>
 #include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
 #include <LibWeb/Fetch/Engine/FetchByteChannel.h>
+#include <LibWeb/Fetch/Engine/FetchExecutor.h>
 #include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
 #include <LibWeb/Fetch/Engine/WholeBodyTransport.h>
 #include <LibWeb/Fetch/Fetching/BodyStreamPullSource.h>
@@ -72,7 +74,6 @@
 #include <LibWeb/MixedContent/AbstractOperations.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
-#include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ReferrerPolicy/AbstractOperations.h>
 #include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
 #include <LibWeb/SRI/IntegrityPolicy.h>
@@ -186,8 +187,10 @@ public:
 
     HTTP::MemoryCache& get(Utf16String const& key)
     {
-        return *m_cache.ensure(key, [] {
-            return HTTP::MemoryCache::create();
+        return *m_cache.ensure(key, [this] {
+            if (!m_usage)
+                m_usage = adopt_ref(*new HTTP::MemoryCacheUsage);
+            return HTTP::MemoryCache::create(*m_usage);
         });
     }
 
@@ -209,9 +212,57 @@ public:
     void clear_cache()
     {
         m_cache.clear();
+        // NB: A fetch that is still running may hold a partition that is now gone, which must not count towards the
+        //     limits of the partitions that replace it. This allocates nothing, as the cache of an agent that shuts
+        //     down is never destroyed.
+        m_usage = nullptr;
+    }
+
+    static bool can_hold_body_in_memory(size_t size) { return size <= largest_body_in_memory; }
+
+    // Evicts the least recently used responses of all partitions, once they hold more than a limit, down to three
+    // quarters of it. A response for a URL that is not fetched again would otherwise stay for as long as the agent does.
+    // NB: A response body that is a mapped file costs a mapping, while the kernel can drop its pages and read them again,
+    //     so those are limited by count. The memory of all else, which every entry has some of, is limited by size.
+    void evict_until_within_limits()
+    {
+        if (!m_usage)
+            return;
+        bool too_many_bytes = m_usage->bytes_in_memory > bytes_in_memory_limit;
+        bool too_many_mapped_bodies = m_usage->mapped_bodies > mapped_body_limit;
+        if (!too_many_bytes && !too_many_mapped_bodies)
+            return;
+
+        struct Candidate {
+            HTTP::MemoryCache* cache { nullptr };
+            HTTP::MemoryCache::EntryUse use;
+        };
+        Vector<Candidate> candidates;
+        for (auto const& it : m_cache) {
+            for (auto const& use : it.value->complete_entry_uses())
+                candidates.append({ .cache = it.value.ptr(), .use = use });
+        }
+        quick_sort(candidates, [](auto const& a, auto const& b) { return a.use.last_use < b.use.last_use; });
+
+        for (auto const& candidate : candidates) {
+            too_many_bytes = too_many_bytes && m_usage->bytes_in_memory > bytes_in_memory_limit / 4 * 3;
+            too_many_mapped_bodies = too_many_mapped_bodies && m_usage->mapped_bodies > mapped_body_limit / 4 * 3;
+            if (!too_many_bytes && !too_many_mapped_bodies)
+                break;
+            if (too_many_bytes || (candidate.use.body_is_mapped && too_many_mapped_bodies))
+                candidate.cache->evict_complete_entry(candidate.use.cache_key, candidate.use.vary_key);
+        }
+
+        // NB: A fetch that is still running may hold a partition, which must then stay the one for its key.
+        m_cache.remove_all_matching([](auto const&, auto const& cache) { return cache->is_empty() && cache->ref_count() == 1; });
     }
 
 private:
+    static constexpr size_t bytes_in_memory_limit = 16 * MiB;
+    static constexpr size_t largest_body_in_memory = bytes_in_memory_limit / 4;
+    static constexpr size_t mapped_body_limit = 1024;
+
+    RefPtr<HTTP::MemoryCacheUsage> m_usage;
     HashMap<Utf16String, NonnullRefPtr<HTTP::MemoryCache>> m_cache;
 };
 
@@ -327,8 +378,9 @@ GC::Ref<Infrastructure::FetchController> fetch(JS::Realm& realm, Infrastructure:
     //    process early hints response is processEarlyHintsResponse, process response is processResponse, process
     //    response consume body is processResponseConsumeBody, process response end-of-body is processResponseEndOfBody,
     //    task destination is taskDestination, and cross-origin isolated capability is crossOriginIsolatedCapability.
-    auto& controller_registry = HTML::relevant_agent(realm.global_object()).fetch_controller_registry;
-    auto controller = Infrastructure::FetchController::create(controller_registry);
+    auto& agent = HTML::relevant_agent(realm.global_object());
+    VERIFY(agent.fetch_executor);
+    auto controller = Infrastructure::FetchController::create(agent.fetch_controller_registry);
     auto fetch_params = Infrastructure::FetchParams::create(controller, request, algorithms, timing_info, current_loader_config());
     controller->set_task_destination(task_destination);
     controller->set_keepalive(request.keepalive());
@@ -781,7 +833,7 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
     }
 
     // 11. If recursive is false, then run the remaining steps in parallel.
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function<void()>(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, fetch_params.controller(), request, response, get_response), [](auto& realm, NonnullRefPtr<Infrastructure::FetchParams const>& fetch_params, GC::Ref<Infrastructure::FetchController>& controller, NonnullRefPtr<Infrastructure::Request>& request, RefPtr<Infrastructure::Response>& response, GC::Ref<GC::Function<GC::Ref<PendingResponse>()>>& get_response) {
+    auto in_parallel_steps = GC::create_function<void()>(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, fetch_params.controller(), request, response, get_response), [](auto& realm, NonnullRefPtr<Infrastructure::FetchParams const>& fetch_params, GC::Ref<Infrastructure::FetchController>& controller, NonnullRefPtr<Infrastructure::Request>& request, RefPtr<Infrastructure::Response>& response, GC::Ref<GC::Function<GC::Ref<PendingResponse>()>>& get_response) {
         // 12. If response is null, then set response to the result of running the steps corresponding to the first
         //     matching statement:
         auto pending_response = PendingResponse::create(controller, Infrastructure::Response::create());
@@ -943,9 +995,20 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
                 fetch_response_handover(realm, *fetch_params, controller, *response);
             }
         }));
-    }));
+    });
+    auto& agent = HTML::relevant_agent(realm.global_object());
+    auto fetch_id = agent.fetch_controller_registry.defer_main_fetch_steps(in_parallel_steps);
+    auto start_fetch_input = fetch_params.start_fetch_input(fetch_id);
+    agent.fetch_executor->post(Engine::Command::StartFetch { move(start_fetch_input) });
 
     return GC::Ptr<PendingResponse> {};
+}
+
+void run_deferred_main_fetch_steps(Engine::FetchId fetch_id)
+{
+    // An agent's fetch engine runs on the agent's thread.
+    auto steps = HTML::surrounding_agent().fetch_controller_registry.take_deferred_main_fetch_steps(fetch_id);
+    steps->function()();
 }
 
 using RequestEnvironment = Variant<Empty, NonnullRefPtr<Infrastructure::ReservedClientContextSnapshot const>, NonnullRefPtr<Infrastructure::ClientContextSnapshot const>>;
@@ -1822,7 +1885,10 @@ GC::Ref<PendingResponse> http_fetch(JS::Realm& realm, Infrastructure::FetchParam
         //       worker can have different embedder policies.
         // NB: request's policy container is a copy of its client's, or a new one when it has no client.
         auto const& client_embedder_policy = request->policy_container().get<NonnullRefPtr<HTML::PolicyContainer const>>()->embedder_policy;
-        if ((request->response_tainting() == Infrastructure::Request::ResponseTainting::Opaque || response->type() == Infrastructure::Response::Type::Opaque)
+        // AD-HOC: Skip the check for network errors. They have no URL for the check to compare origins with, and
+        //         blocking one would only replace it with another network error.
+        if (!internal_response->is_network_error()
+            && (request->response_tainting() == Infrastructure::Request::ResponseTainting::Opaque || response->type() == Infrastructure::Response::Type::Opaque)
             && cross_origin_resource_policy_check(request->origin().get<URL::Origin>(), client_embedder_policy, *internal_response) == Infrastructure::RequestOrResponseBlocking::Blocked) {
             stop_discarded_response_body(*controller, *internal_response);
             returned_pending_response->resolve(Infrastructure::Response::network_error("Response was blocked by cross-origin resource policy check"_string));
@@ -2986,7 +3052,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
         delivery_gate->attach_transport(*network_transport);
         network_transport->set_on_teardown([delivery_gate, channel, body_pump = GC::Root { body_pump }](Requests::Request::TeardownReason reason) {
             tear_down_network_body(*delivery_gate, *channel, reason);
-            body_pump->abandon_cache_entry();
+            body_pump->abandon_cache_entry(HTTP::MemoryCache::StoredResponse::Keep);
         });
         if (request->destination() == Infrastructure::Request::Destination::Font) {
             network_transport->set_on_requires_network([control_block = NonnullRefPtr { fetch_params.control_block() }] {
@@ -3089,6 +3155,16 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
             });
             HTML::TemporaryExecutionContext const execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
             request_body_reader->body->incrementally_read_loop(request_body_reader->reader, fetch_params.controller()->task_destination(), process_body_chunk_bytes, process_end_of_body, process_body_error);
+        }
+
+        // AD-HOC: A body with a source is sent from its source, but its stream has to be read all the same: A stream
+        //         teed from it (that of a clone of the Request, e.g.) can't finish, or be canceled, until it is.
+        if (auto const& request_body_reader = fetch_params.controller()->algorithms()->request_body_reader(); source.has_value() && request_body_reader.has_value()) {
+            auto ignore_chunk = GC::create_function(GC::Heap::the(), [](ByteBuffer) { });
+            auto ignore_end_of_body = GC::create_function(GC::Heap::the(), [] { });
+            auto ignore_error = GC::create_function(GC::Heap::the(), [](JS::Value) { });
+            HTML::TemporaryExecutionContext const execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+            request_body_reader->body->incrementally_read_loop(request_body_reader->reader, fetch_params.controller()->task_destination(), ignore_chunk, ignore_end_of_body, ignore_error);
         }
     }
 
@@ -3554,6 +3630,16 @@ bool disk_cache_enabled_for_navigations_for_testing()
 bool http_memory_cache_enabled()
 {
     return g_http_memory_cache_enabled;
+}
+
+bool http_memory_cache_can_hold_body_in_memory(size_t size)
+{
+    return HTTPCache::can_hold_body_in_memory(size);
+}
+
+void evict_http_memory_cache_entries_over_limits()
+{
+    HTTPCache::the().evict_until_within_limits();
 }
 
 void clear_http_memory_cache()

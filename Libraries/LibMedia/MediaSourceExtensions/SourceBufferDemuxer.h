@@ -10,7 +10,9 @@
 #include <AK/ConditionVariable.h>
 #include <AK/FixedArray.h>
 #include <AK/Mutex.h>
+#include <AK/Noncopyable.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/RefPtr.h>
 #include <AK/Vector.h>
 #include <LibCore/Forward.h>
 #include <LibMedia/Demuxer.h>
@@ -26,9 +28,15 @@ namespace Media::MediaSourceExtensions {
 // the SourceBuffer's track buffers (which write frames) and PlaybackManager (which reads them).
 class MEDIA_API SourceBufferDemuxer final : public Media::Demuxer {
 public:
-    struct RemovedFrame {
-        size_t byte_size { 0 };
+    struct EarliestEvictableGroup {
+        AK::Duration presentation_timestamp;
+        size_t bytes_freed_by_evicting_through_this_group { 0 };
+    };
+
+    struct LatestEvictableFrame {
+        AK::Duration presentation_timestamp;
         AK::Duration decode_timestamp;
+        size_t byte_count { 0 };
     };
 
     struct FrameRun {
@@ -46,12 +54,28 @@ public:
         NeedsReanchoring,
     };
 
+    // Defers internal bookkeeping until this goes out of scope to avoid unnecessary work.
+    class MEDIA_API ChangeBatch {
+        AK_MAKE_NONCOPYABLE(ChangeBatch);
+        AK_MAKE_NONMOVABLE(ChangeBatch);
+
+    public:
+        explicit ChangeBatch(RefPtr<SourceBufferDemuxer>);
+        ~ChangeBatch();
+
+    private:
+        RefPtr<SourceBufferDemuxer> m_demuxer;
+    };
+
     explicit SourceBufferDemuxer(Vector<Media::Track> const&);
     virtual ~SourceBufferDemuxer() override;
 
     Media::TimeRanges track_buffer_ranges(Media::Track const&) const;
     Vector<Media::TrackBufferedRanges> track_buffered_ranges() const;
     static constexpr Media::BufferedRangesPolicy buffered_ranges_policy() { return Media::BufferedRangesPolicy::AllTracks; }
+
+    // Every buffered frame is charged its own storage in addition to its data.
+    static constexpr size_t buffered_bytes_per_frame = 128;
     Media::TimeRanges buffered_ranges() const;
     AK::Duration highest_presentation_timestamp(Media::Track const&) const;
 
@@ -63,11 +87,13 @@ public:
     size_t total_bytes(Media::Track const&) const;
 
     size_t evictable_bytes_when_taking_all_earliest_frames(Media::Track const&, AK::Duration current_time) const;
-    Optional<AK::Duration> earliest_evictable_frame_timestamp(Media::Track const&, AK::Duration current_time) const;
-    size_t take_earliest_frame_and_dependants(Media::Track const&);
+    // The groups are listed in the order that eviction takes them, until evicting them would free the wanted bytes.
+    Vector<EarliestEvictableGroup> earliest_evictable_groups(Media::Track const&, AK::Duration current_time, size_t wanted_bytes) const;
+    size_t take_earliest_groups(Media::Track const&, size_t group_count);
 
-    Optional<AK::Duration> latest_evictable_frame_timestamp(Media::Track const&, AK::Duration current_time) const;
-    RemovedFrame take_latest_frame(Media::Track const&);
+    // The frames are listed in the order that eviction takes them, until evicting them would free the wanted bytes.
+    Vector<LatestEvictableFrame> latest_evictable_frames(Media::Track const&, AK::Duration current_time, size_t wanted_bytes) const;
+    size_t take_latest_frames(Media::Track const&, size_t frame_count);
 
     void set_reached_end_of_stream();
     void clear_reached_end_of_stream();
@@ -100,6 +126,7 @@ private:
         Media::Track track;
 
         Vector<FrameRun> runs;
+        bool runs_need_reordering { false };
         size_t current_run { 0 };
         size_t current_frame { 0 };
         CursorContinuity cursor_continuity { CursorContinuity::Continuous };
@@ -111,12 +138,15 @@ private:
         Optional<AK::Duration> highest_delivered_presentation_end;
         bool delivered_end_of_stream { false };
 
-        Optional<AK::Duration> last_appended_decode_timestamp;
+        Optional<size_t> run_ending_with_last_appended_frame;
         Optional<FixedArray<u8>> last_delivered_codec_configuration;
         Optional<FixedArray<u8>> last_appended_codec_configuration;
         Optional<FixedArray<u8>> codec_configuration_of_dropped_frame;
 
         Media::TimeRanges track_buffer_ranges;
+        AK::Duration track_buffer_ranges_maximum_gap;
+        Vector<Media::TimeRanges::Range> frame_intervals_to_add_to_ranges;
+        bool track_buffer_ranges_need_rebuild { false };
         AK::Duration maximum_frame_duration;
         size_t frames_at_maximum_duration { 0 };
         size_t total_bytes { 0 };
@@ -130,14 +160,19 @@ private:
     static bool contributes_to_buffered_ranges(TrackData const&);
     static AK::Duration maximum_time_range_gap(TrackData const&);
     static bool is_within_start_gap_allowance(AK::Duration timestamp, AK::Duration first_data_start);
-    static Media::TimeRanges coalesced_track_buffer_ranges(TrackData const&);
+    static void bring_track_buffer_ranges_up_to_date(TrackData&);
     static void count_frame_duration(TrackData&, AK::Duration);
     static void decrement_frames_with_maximum_duration(TrackData&, size_t count);
     static Optional<ReadonlyBytes> codec_configuration_at_position(TrackData const&, size_t run_index, size_t frame_index);
     static bool is_frame_evictable(TrackData const&, Media::CodedFrame const&, AK::Duration current_time);
-    static bool run_ends_at_last_appended_frame(TrackData const&, FrameRun const&);
+    template<typename Callback>
+    static void for_each_earliest_evictable_group(TrackData const&, AK::Duration current_time, Callback);
+    static bool run_ends_at_last_appended_frame(TrackData const&, size_t run_index);
     static void note_delivered_frame(TrackData&, Media::CodedFrame const&);
     static void note_cursor_jumped(TrackData&);
+    static size_t first_run_starting_at_or_after(TrackData const&, AK::Duration presentation_start);
+    static void note_run_start_changed(TrackData&, size_t run_index);
+    static void restore_run_order(TrackData&);
     static void verify_runs_are_ordered_around_index(TrackData const&, size_t run_index);
     static void split_run(TrackData&, size_t run_index, size_t split_at, FixedArray<u8> codec_configuration_before_tail);
     static bool removed_frames_overlap_group_of_pictures_being_read(FrameRun const& cursor_run, size_t cursor_frame_index, size_t first_removed_frame_index, size_t removed_frame_count);
@@ -154,6 +189,7 @@ private:
     AK::Duration highest_end_time_while_locked() const;
     bool may_read_frame_while_locked(TrackData const&, Media::CodedFrame const&) const;
     void buffered_data_changed_while_locked();
+    void publish_buffered_data_changes_while_locked();
     void queue_scan_state_change_dispatch_while_locked();
 
     Vector<NonnullOwnPtr<TrackData>> m_tracks;
@@ -165,6 +201,9 @@ private:
     // The ranges in which every audio and video track has data, which bound what reads may deliver.
     Media::TimeRanges m_buffered_ranges;
 
+    bool m_in_change_batch { false };
+    bool m_has_unpublished_changes { false };
+
     // Owned by the thread that installed the change handler; mutated only via its event loop.
     Media::DemuxerScanState m_scan_state;
     ScanStateChangeHandler m_scan_state_change_handler;
@@ -173,6 +212,7 @@ private:
     bool m_scan_state_change_dispatch_pending { false };
     // Reported, then reset, by the next scan state change dispatch.
     Media::TimeRanges m_invalidated_ranges;
+    Vector<Media::TimeRanges::Range> m_frame_intervals_to_invalidate;
 };
 
 }

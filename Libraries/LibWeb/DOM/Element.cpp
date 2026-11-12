@@ -2872,29 +2872,24 @@ static QueryResult query_client_rects_after_layout_update(Element const& element
         return QueryResult {};
 
     if (document.can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node))
-        return query(*layout_node, Painting::identity_rect_to_viewport_transform());
-
-    // NOTE: Make sure CSS transforms are resolved before they are used to calculate the rect position.
-    const_cast<Document&>(document).update_paint_and_hit_testing_properties_if_needed();
-
-    auto visual_context_tree = document.visual_context_tree();
-    return query(*layout_node, Painting::rect_to_viewport_transform(document, visual_context_tree));
+        return query(*layout_node, Layout::RustFFI::FfiViewportMapping {});
+    return query(*layout_node, Painting::viewport_mapping(document));
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
 CSSPixelRect Element::get_bounding_client_rect() const
 {
     // 1. Let list be the result of invoking getClientRects() on element.
-    return query_client_rects_after_layout_update<CSSPixelRect>(*this, [](Layout::Node const& layout_node, auto const& rect_to_viewport_transform) {
-        return Painting::bounding_client_rect(layout_node, rect_to_viewport_transform);
+    return query_client_rects_after_layout_update<CSSPixelRect>(*this, [](Layout::Node const& layout_node, auto const& viewport_mapping) {
+        return Painting::bounding_client_rect(layout_node, viewport_mapping);
     });
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
 Vector<CSSPixelRect> Element::get_client_rects() const
 {
-    return query_client_rects_after_layout_update<Vector<CSSPixelRect>>(*this, [](Layout::Node const& layout_node, auto const& rect_to_viewport_transform) {
-        return Painting::client_rects(layout_node, rect_to_viewport_transform);
+    return query_client_rects_after_layout_update<Vector<CSSPixelRect>>(*this, [](Layout::Node const& layout_node, auto const& viewport_mapping) {
+        return Painting::client_rects(layout_node, viewport_mapping);
     });
 }
 
@@ -2911,7 +2906,7 @@ CSSPixelRect Element::bounding_client_rect_assuming_layout_clean(Layout::BegunRe
     auto const* layout_node = principal_layout_node(read);
     if (!layout_node)
         return {};
-    return Painting::bounding_client_rect(*layout_node, Painting::rect_to_viewport_transform(document(), visual_context_tree));
+    return Painting::bounding_client_rect(*layout_node, Painting::viewport_mapping(document(), visual_context_tree));
 }
 
 int Element::client_top() const
@@ -3605,19 +3600,6 @@ bool Element::is_potentially_scrollable(TreatOverflowClipOnBodyParentAsOverflowH
         return false;
 
     return true;
-}
-
-bool Element::is_scroll_container() const
-{
-    // NB: We should only call this if we know that computed_properties has already been computed
-    auto reset_bits = style_reset_bits();
-    VERIFY(reset_bits.has_value());
-
-    if (is_document_element())
-        return true;
-
-    return Layout::overflow_value_makes_box_a_scroll_container(CSS::overflow_x_from_reset_bits(*reset_bits))
-        || Layout::overflow_value_makes_box_a_scroll_container(CSS::overflow_y_from_reset_bits(*reset_bits));
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
@@ -4357,7 +4339,7 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
     } else if (auto* layout_node = scrolling_box.layout_node(read); layout_node && Painting::has_committed_box(*layout_node)) {
         current_scroll_position = Painting::presented_scroll_offset(*layout_node, Painting::scroll_offset(*layout_node));
         scrolling_box_layout_node = as_if<Layout::NodeWithStyle>(layout_node);
-        scrolling_box_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::scroll_snapport_rect(*layout_node), Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+        scrolling_box_rect = Painting::rect_to_viewport(*layout_node, Painting::scroll_snapport_rect(*layout_node), Layout::RustFFI::ViewportSpace::LayoutViewport);
     } else {
         return {};
     }
@@ -4618,7 +4600,7 @@ void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarg
         if (!scrolling_box.is_document()) {
             if (auto const* layout_node = scrolling_box.layout_node(read); layout_node && Painting::has_committed_box(*layout_node)) {
                 target_bounding_border_box.translate_by(Painting::presented_scroll_offset(*layout_node, Painting::scroll_offset(*layout_node)) - Painting::clamp_scroll_offset(*layout_node, position));
-                auto scrollport_rect = Painting::transform_rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+                auto scrollport_rect = Painting::rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Layout::RustFFI::ViewportSpace::LayoutViewport);
                 auto visible_rect = target_bounding_border_box.intersected(scrollport_rect);
                 if (!visible_rect.is_empty())
                     target_bounding_border_box = visible_rect;
@@ -6947,7 +6929,10 @@ Optional<Gfx::DecodedImageFrame> Element::capture_the_image()
 {
     // FIXME: Actually implement this.
     auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, Gfx::IntSize(1, 1)));
-    return Gfx::DecodedImageFrame { *bitmap };
+    auto frame = Gfx::DecodedImageFrame::create(*bitmap);
+    if (frame.is_error())
+        return {};
+    return frame.release_value();
 }
 
 // https://w3c.github.io/pointerevents/#dfn-active-pointer

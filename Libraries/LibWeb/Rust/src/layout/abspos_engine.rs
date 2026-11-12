@@ -1909,7 +1909,109 @@ impl AbsposEngine<'_> {
     /// fill the space between them.
     /// https://drafts.csswg.org/css-position-3/#abspos-auto-size
     fn sizes_to_fit_content(&self, sized: OutOfFlowBox<'_>, equation: AxisEquation, inline_axis: bool) -> bool {
-        !equation.has_both_insets() || self.own_self_alignment_keyword(sized, inline_axis).is_some()
+        let style = *self.style_of(sized);
+        let (keyword, _) = if inline_axis {
+            SelfKeyword::justify_self_of(style, None)
+        } else {
+            SelfKeyword::align_self_of(style, None)
+        };
+        !equation.has_both_insets() || !matches!(keyword, SelfKeyword::Normal | SelfKeyword::Stretch)
+    }
+
+    // https://drafts.csswg.org/css-position-3/#abspos-auto-size
+    // Resizable form controls use non-replaced sizing here, so their intrinsic dimensions don't prevent stretching.
+    fn form_control_stretches(&self, sized: OutOfFlowBox<'_>, equation: AxisEquation, axis: SizingAxis) -> bool {
+        let style = self.style_of(sized);
+        self.facts(sized.node).is_native_form_control_box()
+            && axis.select(style.width(), style.height()).is_auto()
+            && !self.sizes_to_fit_content(sized, equation, matches!(axis, SizingAxis::Inline))
+    }
+
+    fn shrink_to_fit_available_size(
+        inputs: &abspos_inputs::AbsposLayoutInputs,
+        axis: SizingAxis,
+        mut equation: AxisEquation,
+    ) -> CssPixels {
+        let placement = axis.select(
+            inputs.containing_block_info.inline_placement,
+            inputs.containing_block_info.block_placement,
+        );
+        if equation.start.is_none()
+            && equation.end.is_none()
+            && placement.mode == abspos_inputs::AbsposAxisMode::StaticPosition
+        {
+            let static_position = static_position_rect_for_sizing(inputs);
+            let rect = static_position.rect;
+            let offset = axis.select(rect.offset.inline_offset, rect.offset.block_offset);
+            // https://drafts.csswg.org/css-position-3/#resolving-inset-auto
+            // Resolve the static-position inset before measuring the available space, without depending on the size
+            // of the box being sized. The opposite inset and any auto margins contribute zero.
+            match axis.select(static_position.inline_alignment, static_position.block_alignment) {
+                AxisEdge::Start => equation.start = Some(offset),
+                AxisEdge::End => {
+                    equation.end = Some(
+                        equation.containing_block_size
+                            - offset
+                            - axis.select(rect.size.inline_size, rect.size.block_size),
+                    );
+                }
+                AxisEdge::Center => {
+                    let center = offset + axis.select(rect.size.inline_size, rect.size.block_size) / 2;
+                    equation.start = Some((center * 2 - equation.containing_block_size).max(CssPixels::default()));
+                    equation.end = Some((equation.containing_block_size - center * 2).max(CssPixels::default()));
+                }
+            }
+        }
+        equation.stretch_fit_size()
+    }
+
+    fn stretch_block_size_for_intrinsic_inline_sizing(
+        &self,
+        sized: OutOfFlowBox<'_>,
+        inputs: &abspos_inputs::AbsposLayoutInputs,
+        available_space: AvailableSpace,
+        constraints: ContainingBlockConstraints,
+    ) -> Option<CssPixels> {
+        let style = self.style_of(sized);
+        if !style.height().is_auto() || self.sizing().establishes_orthogonal_flow(sized.node) {
+            return None;
+        }
+        let equation = self.axis_equation(
+            sized,
+            inputs,
+            SizingAxis::Block,
+            available_space.block_size.to_px_or_zero(),
+            available_space.inline_size.to_px_or_zero(),
+            self.auto_margin_overflow(inputs.containing_block, SizingAxis::Block),
+        );
+        if self.sizes_to_fit_content(sized, equation, false) {
+            return None;
+        }
+        // https://drafts.csswg.org/css-sizing-3/#definite
+        // The stretch-fit block size is definite without laying out the contents. Descendant percentages resolve
+        // against it during intrinsic inline sizing, with only definite minimum and maximum sizes applied.
+        let mut block_size = equation.stretch_fit_size();
+        if style.height().calc_size().is_some() {
+            block_size = self.sizing().resolve_calc_size(
+                sized.sized_box(),
+                SizingAxis::Block,
+                style.height(),
+                block_size,
+                constraints.percentage_basis_block_size,
+            );
+        }
+        let inner_size = |size: &ComputedSize| {
+            self.calculate_inner_size(sized, SizingAxis::Block, size, available_space, constraints, inputs)
+        };
+        if !style.max_height().is_none() && !style.max_height().is_intrinsic_sizing_constraint() {
+            block_size = block_size.min(inner_size(style.max_height()));
+        }
+        if !crate::layout::sizing_context::is_plain_auto(style.min_height())
+            && !style.min_height().is_intrinsic_sizing_constraint()
+        {
+            block_size = block_size.max(inner_size(style.min_height()));
+        }
+        Some(block_size)
     }
 
     /// The content inline size of a non-replaced box: its specified size, or the size that auto gives it in the space
@@ -1942,15 +2044,41 @@ impl AbsposEngine<'_> {
             inner_size(style.width())
         } else if !self.sizes_to_fit_content(sized, equation, true) {
             equation.stretch_fit_size()
+        } else if sizing.establishes_orthogonal_flow(node) && sized.cells.has_definite_block_size() {
+            sizing.calculate_max_content_inline_size_at_definite_block_size(
+                sized.sized_box(),
+                constraints,
+                sized.cells.content_block_size(),
+            )
         } else {
             // https://drafts.csswg.org/css-position-3/#abspos-auto-size
             // For the purpose of computing these sizes, any auto margins are treated as zero.
-            let available = equation.stretch_fit_size();
-            let preferred = sizing.calculate_max_content_inline_size(sized.sized_box(), constraints);
+            let available = Self::shrink_to_fit_available_size(inputs, SizingAxis::Inline, equation);
+            let block_size =
+                self.stretch_block_size_for_intrinsic_inline_sizing(sized, inputs, available_space, constraints);
+            let preferred = block_size.map_or_else(
+                || sizing.calculate_max_content_inline_size(sized.sized_box(), constraints),
+                |block_size| {
+                    sizing.calculate_max_content_inline_size_at_definite_block_size(
+                        sized.sized_box(),
+                        constraints,
+                        block_size,
+                    )
+                },
+            );
             if preferred <= available {
                 preferred
             } else {
-                let preferred_minimum = sizing.calculate_min_content_inline_size(sized.sized_box(), constraints);
+                let preferred_minimum = block_size.map_or_else(
+                    || sizing.calculate_min_content_inline_size(sized.sized_box(), constraints),
+                    |block_size| {
+                        sizing.calculate_min_content_inline_size_at_definite_block_size(
+                            sized.sized_box(),
+                            constraints,
+                            block_size,
+                        )
+                    },
+                );
                 preferred_minimum.max(available).min(preferred)
             }
         };
@@ -2013,7 +2141,10 @@ impl AbsposEngine<'_> {
             auto_margin_overflow,
         );
         let sizing = self.sizing();
-        let inline_size = if sizing.box_is_sized_as_replaced_element(sized.sized_box(), available_space, constraints) {
+        let uses_replaced_size =
+            sizing.box_is_sized_as_replaced_element(sized.sized_box(), available_space, constraints)
+                && !self.form_control_stretches(sized, equation, SizingAxis::Inline);
+        let inline_size = if uses_replaced_size {
             // NB: A stretch inline size fills the inset-modified containing block, which replaced element sizing does
             //     not know about.
             let width = self.style_of(sized).width();
@@ -2145,7 +2276,13 @@ impl AbsposEngine<'_> {
         } else if !self.sizes_to_fit_content(sized, equation, false) {
             Some(equation.stretch_fit_size())
         } else {
-            self.automatic_block_size(sized, available_space, constraints, pass, equation.stretch_fit_size())
+            self.automatic_block_size(
+                sized,
+                available_space,
+                constraints,
+                pass,
+                Self::shrink_to_fit_available_size(inputs, SizingAxis::Block, equation),
+            )
         };
         let minimum =
             (!crate::layout::sizing_context::is_plain_auto(style.min_height())).then(|| inner_size(style.min_height()));
@@ -2224,7 +2361,7 @@ impl AbsposEngine<'_> {
         let containing_block_block_size = available_space.block_size.to_px_or_zero();
         // NB: The margins of a non-replaced box resolve against the inline size of its containing block, and those of a
         //     replaced box against its block size.
-        let margin_basis = if is_replaced {
+        let margin_basis = if is_replaced && !self.facts(sized.node).is_native_form_control_box() {
             containing_block_block_size
         } else {
             available_space.inline_size.to_px_or_zero()
@@ -2237,6 +2374,7 @@ impl AbsposEngine<'_> {
             margin_basis,
             auto_margin_overflow,
         );
+        let is_replaced = is_replaced && !self.form_control_stretches(sized, equation, SizingAxis::Block);
         let resolved_block_size = if is_replaced {
             Ok(self.replaced_block_size(sized, inputs, available_space, constraints, pass))
         } else {
@@ -2250,12 +2388,14 @@ impl AbsposEngine<'_> {
             // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
             // A block size transferred through the preferred aspect ratio from a definite inline size is definite, so
             // the content resolves percentages against it.
-            // NB: A box that establishes an orthogonal flow is sized in this axis before its contents are laid out,
-            //     which they are at that size.
+            // NB: Stretch sizing and orthogonal-flow sizing also provide a definite height. A content-derived height
+            //     doesn't provide a percentage basis, even if it can be calculated before inside layout.
             let is_definite = if is_replaced {
                 !sizing.should_treat_block_size_as_auto(sized.sized_box(), available_space, constraints)
             } else {
-                block_size.is_some() && sizing.establishes_orthogonal_flow(sized.node)
+                resolved_block_size.is_ok()
+                    && (sizing.establishes_orthogonal_flow(sized.node)
+                        || !self.sizes_to_fit_content(sized, equation, false))
             };
             if is_definite {
                 used.update_cells(|cells| cells.has_definite_block_size = true);
@@ -2348,16 +2488,27 @@ impl<'pass> AbsposEngine<'pass> {
             self.auto_margin_overflow(inputs.containing_block, SizingAxis::Block),
         );
 
+        if self.sizing().establishes_orthogonal_flow(node)
+            && style.width().is_auto()
+            && !self
+                .sizing()
+                .box_is_sized_as_replaced_element(sized.sized_box(), available_space, constraints)
+        {
+            // The frame's block size is the orthogonal box's inline size. Its content-based block size depends on
+            // wrapping at that resolved size.
+            self.compute_inline_size(
+                sized,
+                available_space,
+                constraints,
+                inputs,
+                self.auto_margin_overflow(inputs.containing_block, SizingAxis::Inline),
+            );
+        }
+
         {
             let used = sized.cells;
             if !style.inset_left().is_auto() && !style.inset_right().is_auto() {
                 used.update_cells(|cells| cells.has_definite_inline_size = true);
-            }
-            if !style.inset_top().is_auto()
-                && !style.inset_bottom().is_auto()
-                && (style.height().is_auto() || !style.height().is_intrinsic_sizing_constraint())
-            {
-                used.update_cells(|cells| cells.has_definite_block_size = true);
             }
         }
         if !self.facts(node).creates_block_formatting_context() {
@@ -2572,8 +2723,8 @@ impl<'pass> AbsposEngine<'pass> {
         }
     }
 
-    /// The keyword and safety of the box's own self-alignment in an axis of its containing block's frame, or None where
-    /// the box fills its inset-modified containing block rather than take its fit-content size there.
+    /// The keyword and safety for ordinary self-alignment in an axis of the containing block's frame. Anchor-center falls
+    /// back to center when no anchor placement is supplied. Stretch sizing is handled separately from self-alignment.
     /// https://drafts.csswg.org/css-align-3/#justify-abspos
     /// https://drafts.csswg.org/css-align-3/#align-abspos
     fn own_self_alignment_keyword(
@@ -2587,11 +2738,7 @@ impl<'pass> AbsposEngine<'pass> {
         } else {
             SelfKeyword::align_self_of(style, None)
         };
-        (!matches!(
-            keyword,
-            SelfKeyword::Normal | SelfKeyword::Stretch | SelfKeyword::AnchorCenter
-        ))
-        .then_some((keyword, safety))
+        (!matches!(keyword, SelfKeyword::Normal | SelfKeyword::Stretch)).then_some((keyword, safety))
     }
 
     /// The box's own self-alignment in an axis of its containing block's frame, where it takes its fit-content size in
@@ -2636,11 +2783,7 @@ impl<'pass> AbsposEngine<'pass> {
         let (available_space, constraints) = out_of_flow_root_space(&inputs);
         let inputs = std::sync::Arc::new(inputs);
 
-        let formatting_context::ChildLayout {
-            outcome,
-            fragment_arrival,
-            laid_out_box,
-        } = formatting_context::layout_inside_child_with_input_cells(
+        let laid_out = formatting_context::layout_inside_child_with_input_cells(
             run,
             None,
             None,
@@ -2651,25 +2794,19 @@ impl<'pass> AbsposEngine<'pass> {
                 ParticipationInParentFormattingContext::AbsolutelyPositioned(inputs.clone()),
             ),
             cells,
+            None,
             false,
             // https://drafts.csswg.org/css-sizing-3/#definite
             // "Additionally, the size of the containing block of an absolutely positioned element is always definite
             //  with respect to that element."
             true,
         );
-        outcome.report_percentage_block_size_dependency_of(run, node);
-        let mut used_insets = match outcome {
-            ChildLayoutOutcome::Created(result) => result
-                .out_of_flow_root_used_insets
-                .expect("the run of an absolutely positioned box gives it used insets"),
-            ChildLayoutOutcome::Skipped {
-                out_of_flow_root_used_insets,
-                ..
-            } => out_of_flow_root_used_insets
-                .expect("the layout of a skipped absolutely positioned box gives it used insets"),
-        };
+        laid_out.report_percentage_block_size_dependency_of(run, node);
+        let mut used_insets = laid_out
+            .out_of_flow_root_used_insets()
+            .expect("the layout of an absolutely positioned box gives it used insets");
 
-        let metrics = laid_out_box.cells;
+        let metrics = laid_out.cells();
         let collapsed = metrics.uses_collapsing_borders_model();
         let static_offset = aligned_static_offset(
             inputs.static_position_rect,
@@ -2715,7 +2852,7 @@ impl<'pass> AbsposEngine<'pass> {
                 used_insets.bottom = style.inset_bottom().to_px(containing_block_size.block_size);
             }
         }
-        let mut placed_child = formatting_context::PlacedChild::of_laid_out_box(&laid_out_box);
+        let mut placed_child = laid_out.placed_child();
         placed_child.facts_decided_by_parent.used_insets = used_insets;
         placed_child.facts_decided_by_parent.default_scroll_shift = default_scroll_shift;
         placed_child.abspos_layout_inputs = Some(inputs);
@@ -2728,7 +2865,7 @@ impl<'pass> AbsposEngine<'pass> {
                 y: used_offset.block_offset,
             },
             None,
-            fragment_arrival,
+            laid_out.into_fragment_arrival(run),
         );
         used_offset.block_offset + metrics.content_block_size() + metrics.border_box_bottom(collapsed)
     }
@@ -3182,6 +3319,7 @@ impl<'pass> AbsposEngine<'pass> {
             resolved_anchor_insets: resolved,
             resolved_anchor_sizes,
             position_option: None,
+            frame: self.pass.frame,
         }
         .without_static_position_in_axes_placed_by_own_insets();
         (inputs, default_scroll_shift)
@@ -3326,15 +3464,16 @@ pub(crate) fn drain_abspos_with_placed_containing_blocks(
     entry_fragments: &fragment_tree::RunFragmentBuilder,
 ) {
     let accumulator_root = entry_fragments.root_node();
-    let run = FormattingContextRun {
+    let run = FormattingContextRun::new(
         state,
-        box_: accumulator_root,
+        accumulator_root,
         pass,
-        should_collect_devtools_layout_data,
-        treat_block_axis_percentage_insets_as_auto_beyond_root: false,
-        fragments: Some(entry_fragments),
-        fragmentainer: None,
-    };
+        formatting_context::RunMode::Commit {
+            devtools: should_collect_devtools_layout_data,
+        },
+        false,
+        None,
+    );
     loop {
         let batch = entry_fragments.take_drainable_abspos(accumulator_root, &pass);
         if batch.is_empty() {

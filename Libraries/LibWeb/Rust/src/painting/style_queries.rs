@@ -310,7 +310,7 @@ fn style_establishes_fixed_positioning_containing_block(
     false
 }
 
-pub(crate) fn inline_establishes_absolute_position_containing_block(style: ComputedValuesView<'_>) -> bool {
+fn inline_establishes_absolute_position_containing_block(style: ComputedValuesView<'_>) -> bool {
     let effects = style.effects();
     style.position() != positioning::STATIC
         || filter_has_filters(&effects.filter)
@@ -323,6 +323,13 @@ pub(crate) fn establishes_positioning_containing_blocks(arena: &impl PaintRead, 
         return (false, false);
     };
     let kind = row.kind();
+    if kind == NodeKind::InlineNode {
+        let absolute = !node_facts::has_flag(&row, NodeFlag::Anonymous)
+            && row
+                .style()
+                .is_some_and(inline_establishes_absolute_position_containing_block);
+        return (absolute, false);
+    }
     if !node_facts::kind_is_box(kind) {
         return (false, false);
     }
@@ -374,10 +381,6 @@ pub(crate) fn has_css_transform(arena: &impl PaintRead, node: NodeSlotId, style:
         || !transform.scale.pointer.is_null()
         || transform.has_offset_path;
     has_transform && is_transformable(arena, node)
-}
-
-pub(crate) fn is_atomic_inline(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.node(node).is_some_and(PaintRow::is_atomic_inline)
 }
 
 pub(crate) fn is_transformable(arena: &impl PaintRead, node: NodeSlotId) -> bool {

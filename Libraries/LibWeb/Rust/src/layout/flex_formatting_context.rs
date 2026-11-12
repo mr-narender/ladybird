@@ -409,6 +409,8 @@ pub(super) struct FlexFormattingContext<'pass> {
     flex_items: Vec<FlexItem>,
     flex_item_details: Vec<FlexItemDetails<'pass>>,
     derived_baselines_of_root_box: DerivedBaselines,
+    /// The lines and items the devtools show of the container, where the run collects devtools data.
+    flex_layout_data: Option<std::sync::Arc<formatting_context::FlexLayoutData>>,
     container: FlexContainerConstants<'pass>,
     available_space_for_items: Option<AxisAgnosticAvailableSpace>,
     available_space: Option<AvailableSpace>,
@@ -453,10 +455,45 @@ impl formatting_context::ChildRunShapes for FlexFormattingContext<'_> {
     }
 }
 
+impl<'pass> formatting_context::FormattingContextAlgorithm<'pass> for FlexFormattingContext<'pass> {
+    fn lay_out(
+        &mut self,
+        run: &FormattingContextRun<'pass>,
+        input: formatting_context::AlgorithmInput<'_>,
+    ) -> formatting_context::AlgorithmOutput {
+        self.run(run, input.body_input, input.flex_self_block_size_resolution_space);
+        let container_cells = self.container_cells.get();
+        let mut root_payload = fragment_tree::PendingPayload::default();
+        if let Some(flex_layout_data) = self.flex_layout_data.take() {
+            root_payload.set(fragment_tree::FcPayload::Flex(flex_layout_data));
+        }
+        formatting_context::AlgorithmOutput::of_root(
+            formatting_context::ChildLayoutResult {
+                automatic_content_block_size: container_cells.content_block_size,
+                baselines: self.derived_baselines_of_root_box,
+                in_flow_children_margin_box_block_extent: self.in_flow_items_margin_box_block_extent,
+                ..formatting_context::ChildLayoutResult::default()
+            },
+            container_cells,
+        )
+        .with_root_payload(root_payload)
+    }
+
+    fn after_root_is_dimensioned(
+        &self,
+        _run: &FormattingContextRun<'pass>,
+        root_cells_in_own_frame: used_values::RootInputCells,
+    ) -> formatting_context::AfterDimensioning {
+        self.parent_did_dimension(root_cells_in_own_frame);
+        formatting_context::AfterDimensioning::LaysOutAbsposContainedByRoot
+    }
+}
+
 impl<'pass> FlexFormattingContext<'pass> {
     pub(super) fn new(run: &FormattingContextRun<'pass>, container_cells: used_values::RootInputCells) -> Self {
         Self {
             run: run.clone(),
+            flex_layout_data: None,
             flex_lines: Vec::new(),
             flex_items: Vec::new(),
             flex_item_details: Vec::new(),
@@ -3194,15 +3231,14 @@ impl<'pass> FlexFormattingContext<'pass> {
                 .is_some()
             && let Some(cross_size) = self.flex_items[index].cross_size
         {
-            input.sizing.content_block_size_after_run =
-                geometry::ContentBlockSizeAfterRun::GrownFromAspectRatioBlockSize(cross_size);
+            input.sizing.content_block_size_after_run = geometry::ContentBlockSizeAfterRun::Given(cross_size);
         }
         input
     }
 
     fn offers_item_runs_to_block_size_measurements(&self) -> bool {
         let space = self.available_space_for_items.unwrap().space;
-        !self.run.should_collect_devtools_layout_data
+        !self.run.collects_devtools_layout_data()
             && !space.inline_size.is_intrinsic_sizing_constraint()
             && self.container.inline_axis_is_horizontal
     }
@@ -3284,11 +3320,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         debug_assert_eq!(plan.fc_type, formatting_context::FormattingContextType::Block);
         Some(formatting_context::ChildRunShape {
             node,
-            key: fc_run_cache::FcRunCacheKey {
-                fc_type: plan.fc_type,
-                input: plan.input,
-                root_cells: cells,
-            },
+            key: fc_run_cache::LayoutRequest::new(&self.run.pass, plan.fc_type, plan.input, cells),
             root_containing_block: plan.root_containing_block,
         })
     }
@@ -3328,16 +3360,12 @@ impl<'pass> FlexFormattingContext<'pass> {
         laid_out: formatting_context::ChildLayout,
     ) -> (Option<fragment_tree::RunRootFragment>, formatting_context::PlacedChild) {
         let node = self.flex_items[index].box_;
-        let formatting_context::ChildLayout {
-            outcome,
-            fragment_arrival,
-            laid_out_box,
-        } = laid_out;
-        self.flex_item_details[index].cells = laid_out_box.cells;
-        self.flex_item_details[index].orthogonal_flow_baselines = laid_out_box.orthogonal_flow_baselines;
-        outcome.report_percentage_block_size_dependency_of(run, node);
-        self.flex_item_details[index].content_baselines = laid_out_box.baselines;
-        let placed_item = formatting_context::PlacedChild::of_taken_laid_out_box(laid_out_box);
+        self.flex_item_details[index].cells = laid_out.cells();
+        self.flex_item_details[index].orthogonal_flow_baselines = laid_out.orthogonal_flow_baselines();
+        laid_out.report_percentage_block_size_dependency_of(run, node);
+        self.flex_item_details[index].content_baselines = laid_out.baselines();
+        let placed_item = laid_out.placed_child();
+        let fragment_arrival = laid_out.into_fragment_arrival(run);
 
         let container = &self.container_cells;
         let insets = abspos_engine::compute_inset_native(
@@ -3415,7 +3443,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         }
     }
 
-    fn save_flex_layout_data(&self) {
+    fn layout_data_for_devtools(&self) -> formatting_context::FlexLayoutData {
         let mut lines = Vec::with_capacity(self.flex_lines.len());
         for line in &self.flex_lines {
             let mut items = Vec::with_capacity(line.items.len());
@@ -3492,7 +3520,7 @@ impl<'pass> FlexFormattingContext<'pass> {
             });
         }
         let style = self.container.style;
-        let data = formatting_context::FlexLayoutData {
+        formatting_context::FlexLayoutData {
             align_content: style.align_content(),
             align_items: style.align_items(),
             flex_direction: style.effective_flex_direction(),
@@ -3503,10 +3531,7 @@ impl<'pass> FlexFormattingContext<'pass> {
             cross_axis_direction: Self::axis_direction(self.cross_axis_is_horizontal(), self.cross_axis_is_reverse())
                 as u8,
             lines,
-        };
-        self.run.set_fragment_payload_of(self.run.box_, || {
-            fragment_tree::FcPayload::Flex(std::sync::Arc::new(data))
-        });
+        }
     }
 
     // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
@@ -4081,7 +4106,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         }
     }
 
-    pub(super) fn run(
+    fn run(
         &mut self,
         run: &FormattingContextRun<'pass>,
         layout_input: LayoutInput,
@@ -4141,8 +4166,8 @@ impl<'pass> FlexFormattingContext<'pass> {
 
         self.layout_items_and_derive_baselines(run, container_cross_size_is_auto);
 
-        if self.run.should_collect_devtools_layout_data {
-            self.save_flex_layout_data();
+        if self.run.collects_devtools_layout_data() {
+            self.flex_layout_data = Some(std::sync::Arc::new(self.layout_data_for_devtools()));
         }
     }
 
@@ -4255,6 +4280,7 @@ impl<'pass> FlexFormattingContext<'pass> {
                             node,
                             input,
                             cells,
+                            None,
                             false,
                             percentage_block_insets_have_definite_basis,
                         )
@@ -4347,11 +4373,6 @@ impl<'pass> FlexFormattingContext<'pass> {
         Some(block_end - block_start)
     }
 
-    /// For a container with a preferred aspect ratio, the block size of the margin boxes of its in-flow children.
-    pub(super) fn in_flow_items_margin_box_block_extent(&self) -> Option<CssPixels> {
-        self.in_flow_items_margin_box_block_extent
-    }
-
     // https://drafts.csswg.org/css-flexbox-1/#flex-baselines
     fn baseline_of_line(&self, line_index: usize, baseline_set: formatting_context::BaselineSet) -> Option<CssPixels> {
         self.baseline_of_line_for_purpose(line_index, baseline_set, formatting_context::BaselinePurpose::Container)
@@ -4421,7 +4442,7 @@ impl<'pass> FlexFormattingContext<'pass> {
         }
     }
 
-    pub(super) fn parent_did_dimension(&self, root_after_epilogue: used_values::RootInputCells) {
+    fn parent_did_dimension(&self, root_after_epilogue: used_values::RootInputCells) {
         // NB: The static positions of the abspos children use the container as the run sized it.
         self.container_cells.set(root_after_epilogue);
         for child in self.run.pass.children(self.run.box_) {
@@ -4437,19 +4458,6 @@ impl<'pass> FlexFormattingContext<'pass> {
                 );
             }
         }
-    }
-
-    pub(super) fn derived_baselines_of_root_box(&self) -> DerivedBaselines {
-        self.derived_baselines_of_root_box
-    }
-
-    /// The cells of the flex container as this context left them.
-    pub(super) fn container_cells(&self) -> used_values::RootInputCells {
-        self.container_cells.get()
-    }
-
-    pub(super) fn automatic_content_block_size(&self) -> CssPixels {
-        self.container_cells.content_block_size()
     }
 }
 
@@ -4667,15 +4675,14 @@ mod stretch_cross_limit_tests {
         };
         let container_cells = used_values::cells_before_sizing(&pass, container, constraints);
         RunState::with_root(pass, container, Node::INVALID, None, |state, pass| {
-            let run = FormattingContextRun {
+            let run = FormattingContextRun::new(
                 state,
-                box_: container,
+                container,
                 pass,
-                should_collect_devtools_layout_data: false,
-                treat_block_axis_percentage_insets_as_auto_beyond_root: false,
-                fragments: None,
-                fragmentainer: None,
-            };
+                formatting_context::RunMode::Measure,
+                false,
+                None,
+            );
             let mut flex = FlexFormattingContext::new(&run, container_cells);
             let available = AvailableSpace {
                 inline_size: if column && !definite_cross_basis {

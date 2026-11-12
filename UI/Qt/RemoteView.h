@@ -46,8 +46,10 @@ public:
 
     void set_state(Hub::ViewState state)
     {
-        m_state = move(state);
+        auto previous_state = exchange(m_state, move(state));
         update_view_actions();
+        if (on_state_change)
+            on_state_change(previous_state);
     }
     void set_initial_state(Hub::ViewState state) { set_state(move(state)); }
 
@@ -90,6 +92,14 @@ public:
     void set_window_size(Gfx::IntSize size) { HubConnection::the().async_view_set_window_size(view_id(), size); }
     void set_system_visibility_state(Web::HTML::VisibilityState visibility_state) { HubConnection::the().async_view_set_system_visibility_state(view_id(), move(visibility_state)); }
     void set_presents_from_cpu_memory(bool presents_from_cpu_memory) { HubConnection::the().async_view_set_presents_from_cpu_memory(view_id(), presents_from_cpu_memory); }
+    void set_hosts_remote_layer(bool hosts_remote_layer) { HubConnection::the().async_view_set_hosts_remote_layer(view_id(), hosts_remote_layer); }
+    void set_wants_frame_notifications(bool wants_frame_notifications) { HubConnection::the().async_view_set_wants_frame_notifications(view_id(), wants_frame_notifications); }
+    // What the view shows, from the Compositor, scaled down to fit within the size given.
+    void take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)>);
+    void begin_synchronized_resize(u64 token) { HubConnection::the().async_view_begin_synchronized_resize(view_id(), token); }
+    void await_synchronized_resize_frame(u64 token, Gfx::IntSize size) { HubConnection::the().async_view_await_synchronized_resize_frame(view_id(), token, size); }
+    void commit_synchronized_resize(u64 token) { HubConnection::the().async_view_commit_synchronized_resize(view_id(), token); }
+    void did_take_frame_snapshot(u64 request_id, Optional<Gfx::ShareableBitmap>);
     void set_has_system_focus(bool has_system_focus) { HubConnection::the().async_view_set_has_system_focus(view_id(), has_system_focus); }
     void load(URL::URL const& url, Web::Bindings::NavigationHistoryBehavior navigation_history_behavior = Web::Bindings::NavigationHistoryBehavior::Auto) { HubConnection::the().async_view_load(view_id(), url, navigation_history_behavior); }
     void load_from_user_input(URL::URL const&);
@@ -151,7 +161,7 @@ public:
     }
     void enable_picture_in_picture_controls() { HubConnection::the().async_view_enable_picture_in_picture_controls(view_id()); }
     void enqueue_input_event(Web::InputEvent);
-    String force_dark_host() const { return m_state.force_dark_host; }
+    String current_host_for_settings() const { return m_state.host_for_settings; }
     void update_interface_color_scheme() { HubConnection::the().async_view_update_interface_color_scheme(view_id()); }
     void update_system_theme(Core::AnonymousBuffer const& theme) { HubConnection::the().async_view_set_system_theme(view_id(), theme); }
     NonnullRefPtr<Core::Promise<ByteString>> selected_text();
@@ -237,6 +247,8 @@ public:
     void did_keep_front_backing_store_as_backup() { m_backing_stores.keep_front_as_backup(); }
     void did_clear_backup_backing_store() { m_backing_stores.clear_backup(); }
     void did_clear_backing_stores() { m_backing_stores.clear(); }
+    void did_set_remote_layer(u32 core_animation_context_id) { remote_layer_changed(core_animation_context_id); }
+    void did_present_frame_in_remote_layer(Gfx::IntSize, double device_pixel_ratio);
 
     // Hands a backing store back to the page that presented it, which can have outlived the view.
     static void release_backing_store_to_page(u64 page_id, i32 bitmap_id);
@@ -247,6 +259,8 @@ public:
 protected:
     virtual void show_context_menu(Menu&, Gfx::IntPoint) { }
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
+    // The ID is 0 when the view has no remote layer, and goes on showing backing stores.
+    virtual void remote_layer_changed(u32 core_animation_context_id) { (void)core_animation_context_id; }
     virtual void release_backing_store(u64 page_id, i32 bitmap_id) { release_backing_store_to_page(page_id, bitmap_id); }
 
     void set_page_background_color_to_system_canvas(bool dark) { HubConnection::the().async_view_set_page_background_color_to_system_canvas(view_id(), dark); }
@@ -307,6 +321,7 @@ private:
     HashMap<u64, NonnullRefPtr<Core::Promise<ByteString>>> m_pending_selected_text;
     HashMap<u64, Function<void(bool)>> m_pending_close_preflights;
     HashMap<u64, NonnullRefPtr<Core::Promise<String>>> m_pending_page_dumps;
+    HashMap<u64, Function<void(Optional<Gfx::ShareableBitmap>)>> m_pending_frame_snapshots;
     u64 m_next_request_id { 1 };
     u64 m_next_navigation_listener_id { 1 };
     WebView::PageBackingStores m_backing_stores;
@@ -365,6 +380,7 @@ public:
     decltype(Hub::View::on_request_permission) on_request_permission;
     decltype(Hub::View::on_cancel_permission_prompt) on_cancel_permission_prompt;
     decltype(Hub::View::on_tab_indicator_change) on_tab_indicator_change;
+    Function<void(Hub::ViewState const& previous_state)> on_state_change;
     decltype(Hub::View::on_request_file_picker) on_request_file_picker;
     decltype(Hub::View::on_request_select_dropdown) on_request_select_dropdown;
     decltype(Hub::View::on_finish_handling_key_event) on_finish_handling_key_event;

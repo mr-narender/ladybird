@@ -54,6 +54,7 @@ namespace Ladybird {
 
 class AllTabsPopover;
 class LadybirdButton;
+class SandboxOffBar;
 
 class TabMicrophoneIndicator;
 class TabPreviewPopup;
@@ -185,6 +186,7 @@ private:
     void schedule_tab_preview(int index);
     void show_tab_preview();
     void hide_tab_preview();
+    void stop_following_previewed_tab_frames();
     QPoint tab_preview_position_for(int index, QSize const& popup_size) const;
 
     // Where the pinned tabs sit in vertical tabs: a grid of tiles when expanded, one icon column when collapsed, and a
@@ -293,6 +295,7 @@ private:
     int m_tab_preview_index { -1 };
     QPointer<Tab> m_previewed_tab;
     QMetaObject::Connection m_tab_preview_paint_connection;
+    QMetaObject::Connection m_tab_preview_change_connection;
 };
 
 class TabWidget final : public QWidget {
@@ -454,6 +457,7 @@ private:
     WindowControlsReveal* m_window_controls_reveal { nullptr };
     WindowToolbar* m_toolbar { nullptr };
     BookmarksBarContainer* m_bookmarks_bar { nullptr };
+    SandboxOffBar* m_sandbox_off_bar { nullptr };
     QWidget* m_page_column { nullptr };
     QWidget* m_toolbar_placeholder { nullptr };
     bool m_toolbar_follows_page_column { false };

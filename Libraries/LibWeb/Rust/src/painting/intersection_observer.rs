@@ -4,84 +4,53 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::computed_value_views::ComputedValuesView;
-use crate::css::css_enums::{overflow, positioning};
+use crate::css::css_enums::positioning;
 use crate::css::css_pixels::CssPixelRect;
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::layout::node_facts::{self, NodeShape};
 use crate::painting::paint_read::{PaintRead, PaintRow};
-use crate::painting::paintable_geometry;
-use crate::painting::rect_to_viewport_transform::{RectToViewportTransform, transform_rect_to_viewport_or_identity};
 use crate::painting::style_queries;
-
-fn content_clip_rect_in_viewport_space(
-    arena: &impl PaintRead,
-    node: NodeSlotId,
-    style: ComputedValuesView<'_>,
-    rect_to_viewport_transform: Option<&RectToViewportTransform<'_>>,
-) -> Option<CssPixelRect> {
-    let has_content_clip = style.overflow_x() != overflow::VISIBLE || style.overflow_y() != overflow::VISIBLE;
-    if !has_content_clip {
-        return None;
-    }
-    Some(transform_rect_to_viewport_or_identity(
-        rect_to_viewport_transform,
-        arena,
-        node,
-        paintable_geometry::absolute_padding_box_rect(arena, node),
-    ))
-}
+use crate::painting::viewport_mapping::{ViewportMapping, ViewportSpace};
 
 // https://www.w3.org/TR/intersection-observer/#compute-the-intersection
+// Answers none where a clip or the root intersection rectangle leaves nothing of target, not even an edge, so that the
+// caller can tell a target clipped away from one whose intersection has zero area.
 pub(crate) fn intersection_rect(
     arena: &impl PaintRead,
     target: NodeSlotId,
     target_rect: CssPixelRect,
     intersection_root: NodeSlotId,
     root_bounds: CssPixelRect,
-    rect_to_viewport_transform: Option<&RectToViewportTransform<'_>>,
+    viewport_mapping: &ViewportMapping<'_>,
     mut inflate_scroll_container_clip_rect_by_scroll_margin: impl FnMut(CssPixelRect) -> CssPixelRect,
-) -> CssPixelRect {
+) -> Option<CssPixelRect> {
     // 1. Let intersectionRect be the result of getting the bounding box for target.
-    let mut intersection_rect = target_rect;
-
     // 2. Let container be the containing block of target.
     // 3. While container is not root:
+    // FIXME: 3.1. If container is the document of a nested browsing context, update intersectionRect by clipping to
+    //             the viewport of the document, and update container to be the browsing context container of
+    //             container.
+    // NOTE: Steps 3.2 (map to container coordinate space) and 3.5 (update container) are unnecessary here because the
+    //       bounding box and every clip are mapped into the viewport.
+    // 3.3. If container is a scroll container, apply the observer’s [[scrollMargin]] to the container’s clip rect.
+    // 3.4. If container has a content clip or a css clip-path property, update intersectionRect by applying
+    //      container’s clip.
+    let mut intersection_rect = target_rect;
     if arena.paintable_row_is_populated(target) {
         let mut container = arena.node_containing_block_if_live(target);
-        while let Some(container_slot) = container {
-            // Stop when we reach the intersection root.
-            if container_slot == intersection_root {
-                break;
-            }
-            if !arena.paintable_row_is_populated(container_slot) {
-                break;
-            }
-
-            // FIXME: 3.1. If container is the document of a nested browsing context, update
-            //             intersectionRect by clipping to the viewport of the document, and update
-            //             container to be the browsing context container of container.
-
-            // NOTE: Steps 3.2 (map to container coordinate space) and 3.5 (update container) are
-            //       unnecessary here because get_bounding_client_rect() and transform_rect_to_viewport()
-            //       already produce viewport-relative coordinates.
-
-            // 3.3. If container is a scroll container, apply the observer’s [[scrollMargin]]
-            //      to the container’s clip rect.
-            // 3.4. If container has a content clip or a css clip-path property, update intersectionRect
-            //      by applying container’s clip.
-            // FIXME: Handle clip-path.
-            if let Some(style) = arena.node_style_if_live(container_slot)
-                && let Some(mut clip_rect) =
-                    content_clip_rect_in_viewport_space(arena, container_slot, style, rect_to_viewport_transform)
+        while let Some(container_slot) =
+            container.filter(|slot| *slot != intersection_root && arena.paintable_row_is_populated(*slot))
+        {
+            if let Some(mut clip) =
+                viewport_mapping.content_clip_rect(arena, container_slot, ViewportSpace::LayoutViewport)
             {
-                // Apply scroll margin to expand the scrollport for scroll containers.
-                let container_kind = arena.node_kind_if_live(container_slot).unwrap_or(NodeKind::Unset);
-                if node_facts::kind_and_style_make_scroll_container(container_kind, Some(style)) {
-                    clip_rect = inflate_scroll_container_clip_rect_by_scroll_margin(clip_rect);
+                if style_queries::is_scroll_container(arena, container_slot) {
+                    clip = inflate_scroll_container_clip_rect_by_scroll_margin(clip);
                 }
-
-                intersection_rect = intersection_rect.intersected(clip_rect);
+                if !intersection_rect.edge_adjacent_intersects(clip) {
+                    return None;
+                }
+                intersection_rect = intersection_rect.intersected(clip);
             }
             container = arena.node_containing_block_if_live(container_slot);
         }
@@ -90,19 +59,19 @@ pub(crate) fn intersection_rect(
     // FIXME: 4. Map intersectionRect to the coordinate space of root.
 
     // 5. Update intersectionRect by intersecting it with the root intersection rectangle.
-    intersection_rect = intersection_rect.intersected(root_bounds);
-
     // FIXME: 6. Map intersectionRect to the coordinate space of the viewport of the document containing target.
-
     // 7. Return intersectionRect.
-    intersection_rect
+    if !intersection_rect.edge_adjacent_intersects(root_bounds) {
+        return None;
+    }
+    Some(intersection_rect.intersected(root_bounds))
 }
 
 pub(crate) fn transform_subtree_is_clipped_outside(
     arena: &impl PaintRead,
     target: NodeSlotId,
     root_bounds: CssPixelRect,
-    rect_to_viewport_transform: Option<&RectToViewportTransform<'_>>,
+    viewport_mapping: &ViewportMapping<'_>,
 ) -> bool {
     if !arena.paintable_row_is_populated(target) || root_bounds.is_empty() {
         return false;
@@ -131,8 +100,7 @@ pub(crate) fn transform_subtree_is_clipped_outside(
                 return false;
             }
 
-            if let Some(clip_rect) =
-                content_clip_rect_in_viewport_space(arena, ancestor, style, rect_to_viewport_transform)
+            if let Some(clip_rect) = viewport_mapping.content_clip_rect(arena, ancestor, ViewportSpace::LayoutViewport)
                 && !clip_rect.edge_adjacent_intersects(root_bounds)
             {
                 has_disjoint_clip = true;

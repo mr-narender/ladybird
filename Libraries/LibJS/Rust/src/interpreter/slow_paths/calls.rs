@@ -9,7 +9,8 @@
 use ak::{ScopeGuard, Utf16FlyString};
 use libjs_abi::{ArgumentsKind, FunctionNamePrefix};
 
-use crate::bytecode::encoding::{InstructionHeader, OptionalOperand, StringTableIndex};
+use super::strict_at;
+use crate::bytecode::encoding::{OptionalOperand, StringTableIndex};
 use crate::bytecode::op;
 use crate::bytecode::property_access::Strict;
 use crate::interpreter::runtime_functions::{
@@ -62,10 +63,6 @@ fn running_execution_context(vm: &Vm) -> &ExecutionContext {
         .expect("a slow path runs in a running frame")
 }
 
-fn strict_of(header: &InstructionHeader) -> Strict {
-    if header.strict { Strict::Yes } else { Strict::No }
-}
-
 fn caller_mode_of(strict: Strict) -> CallerMode {
     if strict == Strict::Yes {
         CallerMode::Strict
@@ -76,7 +73,7 @@ fn caller_mode_of(strict: Strict) -> CallerMode {
 
 /// Executable::get_string().
 fn get_string(vm: &Vm, index: StringTableIndex) -> Utf16FlyString {
-    vm.current_executable().string_table()[index.0 as usize].clone()
+    vm.current_executable().string_table()[index.index()].clone()
 }
 
 /// Value::as_array_exotic_object(): the arguments the bytecode collected into an Array for a call.
@@ -207,6 +204,9 @@ pub fn new_class(
             *element_key = Value::UNDEFINED;
         }
     }
+    let element_keys = super::operand_list(vm, instruction.element_keys_are_in_array, element_keys);
+    let element_keys = element_keys.values();
+    let element_keys = &*element_keys;
 
     let class_environment = values.class_environment.as_environment();
     let outer_environment = running_execution_context(vm).lexical_environment.get();
@@ -409,7 +409,7 @@ pub fn call(
                 arguments,
                 argument_count_of(arguments.len()),
                 pc + instruction.length(),
-                instruction.dst.0,
+                instruction.dst.0.into(),
                 values.this_value,
             )
             .is_some()
@@ -428,7 +428,7 @@ pub fn call(
             arguments,
             &mut values.dst,
             instruction.expression_string.get(),
-            strict_of(&instruction.header),
+            strict_at(vm, pc),
         )
     );
     SlowPathControl::continue_at(pc + instruction.length())
@@ -496,7 +496,7 @@ pub fn call_direct_eval(
             arguments,
             &mut values.dst,
             instruction.expression_string.get(),
-            strict_of(&instruction.header),
+            strict_at(vm, pc),
         )
     );
     SlowPathControl::continue_at(pc + instruction.length())
@@ -593,7 +593,7 @@ pub fn call_with_argument_array(
             values.arguments,
             &mut values.dst,
             instruction.expression_string.get(),
-            strict_of(&instruction.header),
+            strict_at(vm, pc),
         )
     );
     SlowPathControl::continue_at(pc + op::CallWithArgumentArray::LENGTH)
@@ -616,7 +616,7 @@ pub fn call_direct_eval_with_argument_array(
             values.arguments,
             &mut values.dst,
             instruction.expression_string.get(),
-            strict_of(&instruction.header),
+            strict_at(vm, pc),
         )
     );
     SlowPathControl::continue_at(pc + op::CallDirectEvalWithArgumentArray::LENGTH)
@@ -653,7 +653,7 @@ pub fn call_construct(
             function.inline_call_executable(),
             arguments,
             pc + instruction.length(),
-            instruction.dst.0,
+            instruction.dst.0.into(),
             Value::from_object(this_object),
             Some(function.upcast()),
             true,
@@ -678,7 +678,7 @@ pub fn call_construct(
             arguments,
             &mut values.dst,
             instruction.expression_string.get(),
-            strict_of(&instruction.header),
+            strict_at(vm, pc),
         )
     );
     SlowPathControl::continue_at(pc + instruction.length())
@@ -701,7 +701,7 @@ pub fn call_construct_with_argument_array(
             values.arguments,
             &mut values.dst,
             instruction.expression_string.get(),
-            strict_of(&instruction.header),
+            strict_at(vm, pc),
         )
     );
     SlowPathControl::continue_at(pc + op::CallConstructWithArgumentArray::LENGTH)
@@ -858,7 +858,7 @@ pub fn try_inline_call(vm: &Vm, pc: u32, instruction: &op::Call, values: &op::Ca
         callee_function.inline_call_executable(),
         arguments,
         pc + instruction.length(),
-        instruction.dst.0,
+        instruction.dst.0.into(),
         values.this_value,
         None,
         false,

@@ -225,6 +225,8 @@ pub struct CodeScope {
     var_of_arguments_is_captured: bool,
     /// Whether a lexical declaration of the name `arguments` takes the place of the arguments object.
     has_lexical_arguments: bool,
+    /// Whether a call of the function creates an environment of its own, which the environment coordinates count.
+    has_function_environment: bool,
     /// Whether the lexical declarations of the function have an environment of their own.
     has_lexical_environment: bool,
     /// Whether the parameters have an environment of their own, for what an `eval` in them declares.
@@ -465,6 +467,7 @@ impl Generator<'_> {
                 && flags & function_flag::ARGUMENTS_ACCESS != 0
                 && flags & function_flag::SIMPLE_PARAMETERS != 0
                 && index.parameter_count[row.0 as usize] != 0);
+        self.context.scope.has_function_environment = needs_function_environment;
         self.capture_saved_lexical_environment_with_coordinates(needs_function_environment);
         self.end_head();
         self.begin_stream_temporaries();
@@ -501,6 +504,7 @@ impl Generator<'_> {
         scope.has_function_in_parameters = false;
         scope.var_of_arguments_is_captured = false;
         scope.has_lexical_arguments = false;
+        scope.has_function_environment = false;
         scope.has_mapped_parameters = false;
         scope.deferred_early_bindings = None;
         scope.has_parameter_expressions_with_eval = false;
@@ -1143,6 +1147,15 @@ impl Generator<'_> {
         });
     }
 
+    /// The arguments object of a static block, which FunctionDeclarationInstantiation gives it like any other function.
+    /// `arguments` is an early error in the block, so only an `eval` can see it.
+    pub(super) fn create_arguments_object_of_static_block(&mut self) {
+        let flags = self.context.scope.flags;
+        if flags & function_flag::CONTAINS_EVAL != 0 {
+            self.create_arguments_object(flags, false, false);
+        }
+    }
+
     fn create_arguments_object(&mut self, flags: u32, is_mapped: bool, creates_bindings: bool) {
         let name = Name(N_ARGUMENTS);
         let is_captured = flags & (function_flag::CAPTURES_ARGUMENTS | function_flag::CONTAINS_EVAL) != 0
@@ -1748,7 +1761,13 @@ impl Generator<'_> {
                 self.value_of_identifier(inner_ident);
                 let (value, _) = self.pop_operand();
                 let identifier = self.intern_identifier(name);
-                emit_set_variable_binding(self, identifier, value);
+                // NB: Whether the function gets stored is decided again when it is evaluated.
+                let program_environment_depth = self.context.scope.scope_environment_depth;
+                self.put(op::SetVariableBindingOfBlockFunction {
+                    identifier,
+                    src: value,
+                    program_environment_depth,
+                });
                 self.end_of_statement();
             }
             return;
@@ -1862,7 +1881,6 @@ impl Generator<'_> {
         let row = self.context.scope.row;
         let flags = self.context.scope.flags;
         let is_program = self.context.scope.program.is_some();
-        let is_arrow = flags & function_flag::ARROW != 0;
         let has_direct_eval = self.has_direct_eval();
         let contains_eval = flags & function_flag::CONTAINS_EVAL != 0;
 
@@ -2007,6 +2025,8 @@ impl Generator<'_> {
             .function_environment_binding_count
             .unwrap_or(environment_binding_count);
         let has_mapped_parameters = scope.has_mapped_parameters;
+        let has_function_environment = scope.has_function_environment;
+        assert!(has_function_environment || environment_binding_count == 0 || is_program);
         let parameter_names: Box<[ak::Utf16FlyString]> = if has_mapped_parameters {
             let names = &context.scope.simple_parameters;
             names
@@ -2019,6 +2039,7 @@ impl Generator<'_> {
         let executable = ExecutableData {
             bytecode: assembled.bytecode,
             exception_handlers: assembled.exception_handlers,
+            strict_ranges: assembled.strict_ranges,
             source_map: assembled.source_map,
             number_of_registers: assembled.number_of_registers,
             number_of_arguments: assembled.number_of_arguments,
@@ -2049,9 +2070,7 @@ impl Generator<'_> {
                 uses_this: this_from_environment
                     || flags & (function_flag::SCOPE_USES_THIS | function_flag::INSIGHT_USES_THIS) != 0,
                 this_value_needs_environment_resolution: this_from_environment,
-                function_environment_needed: environment_binding_count > 0
-                    || (!is_arrow && this_from_environment)
-                    || contains_eval,
+                function_environment_needed: has_function_environment,
                 creates_environment: self.creates_environment,
                 function_environment_bindings_count: function_environment_binding_count as usize,
                 var_environment_bindings_count: (environment_binding_count - function_environment_binding_count)

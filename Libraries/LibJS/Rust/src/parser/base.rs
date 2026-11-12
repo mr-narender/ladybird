@@ -346,6 +346,10 @@ pub const DEFAULT_STACK_BUDGET: usize = 4 << 20;
 /// How deeply statements and expressions may nest.
 const MAX_RECURSION_DEPTH: u32 = 2000;
 
+/// How many member accesses, calls and tagged templates one chain like `a.b[c](d)` may have. The parser goes through a
+/// chain in a loop, so the recursion limit does not apply to it.
+pub(crate) const MAX_SUBSCRIPT_CHAIN_LENGTH: u32 = 10000;
+
 pub(crate) const RECURSION_LIMIT_MESSAGE: &str = "Maximum parser recursion depth exceeded";
 
 impl<'a, U: Unit> Parser<'a, U> {
@@ -1248,21 +1252,24 @@ impl<'a, U: Unit> Parser<'a, U> {
                     let d = self.decls.len() - 1;
                     self.decls[d].summary_slot = SUMMARY_SLOT_EARLY;
                 }
+            } else if flags & !decl::FUNCTION_NAME == 0 {
+                // NB: The name of a function expression is bound outside of the function, which gets a `var` of its own.
+                self.decls[row as usize].flags |= decl::ANNEX_B;
+                if self.records_summaries {
+                    self.decls[row as usize].summary_slot = SUMMARY_SLOT_EARLY;
+                }
             } else {
                 self.decls[row as usize].flags |= decl::ANNEX_B;
+                if !is_parameter {
+                    // NB: Evaluating the function stores into the binding, which may come before its declaration.
+                    self.make_binding_early(row, top);
+                }
             }
             let row = self.find_declaration(hoist.name, scope.id);
             if is_parameter {
                 continue;
             }
-            let reads_arguments = hoist.name == N_ARGUMENTS
-                && (scope.arguments_access
-                    || (scope.flags & scope_flag::FUNCTION != 0
-                        && scope.flags & scope_flag::ARROW == 0
-                        && scope.eval_in_function));
-            if !reads_arguments {
-                self.decls[row as usize].flags |= decl::ANNEX_B_NAME;
-            }
+            self.decls[row as usize].flags |= decl::ANNEX_B_NAME;
             let binding = if hoist.declaration == NONE {
                 NONE
             } else {
@@ -1273,6 +1280,28 @@ impl<'a, U: Unit> Parser<'a, U> {
             }
         }
         self.hoists.truncate(kept);
+    }
+
+    /// Makes declaration `d` of the scope at `top` one that the code of its function knows from the start, and not only
+    /// from where it comes up. The declarations after it in the order of the summary move up into its place.
+    fn make_binding_early(&mut self, d: u32, top: usize) {
+        if !self.records_summaries {
+            return;
+        }
+        let slot = self.decls[d as usize].summary_slot;
+        if slot & (SUMMARY_SLOT_EARLY | SUMMARY_SLOT_INNER) != 0 {
+            return;
+        }
+        let mut other = self.scopes[top].decl_head;
+        while other != NONE {
+            let declaration = &mut self.decls[other as usize];
+            let other_slot = declaration.summary_slot;
+            if other_slot & (SUMMARY_SLOT_EARLY | SUMMARY_SLOT_INNER) == 0 && other_slot > slot {
+                declaration.summary_slot = other_slot - 1;
+            }
+            other = declaration.next_in_scope;
+        }
+        self.decls[d as usize].summary_slot = SUMMARY_SLOT_EARLY;
     }
 
     /// Resolves the bindings of the innermost scope against the uses in its subtree, and returns its row in the tree.

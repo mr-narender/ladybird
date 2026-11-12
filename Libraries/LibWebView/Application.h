@@ -178,12 +178,9 @@ public:
 
     // True unless the user has turned location off, or there's no way to find it.
     bool sites_can_ask_for_location() const;
-    bool sites_can_ask_for_microphone() const;
-    bool sites_can_ask_for_notifications() const;
     Core::GeolocationAuthorization geolocation_authorization();
-    void location_policy_changed(Badge<ApplicationSettingsObserver>);
-    void microphone_policy_changed(Badge<ApplicationSettingsObserver>);
-    void notifications_policy_changed(Badge<ApplicationSettingsObserver>);
+
+    void permission_settings_changed(Badge<ApplicationSettingsObserver>);
     void permissions_changed(Badge<ApplicationPermissionManagerObserver>, PermissionManager const&);
 
     bool content_blocking_enabled() const;
@@ -201,8 +198,6 @@ public:
     static BrowsingSession& default_session() { return *the().m_default_session; }
 
     static NonnullRefPtr<BrowsingSession> session_for_new_view(IsPrivate);
-
-    static RefPtr<BrowsingSession> existing_session(IsPrivate);
 
     // Whether the windows and tabs of this run are kept for the next one. A headless run, a browser that WebDriver drives,
     // and one that logs process statistics never join a browser already running on their profile, so they keep none.
@@ -241,7 +236,7 @@ public:
         Web::PageId page_id { 0 };
     };
     // For what may share a process with no page. It ends once nothing keeps it.
-    ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process_without_page(IsPrivate);
+    ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process_without_page(BrowsingSession&);
     ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state);
     Web::PageId allocate_page_id();
     Web::HTML::CrossProcessIdAllocator allocate_cross_process_id_allocator();
@@ -271,6 +266,20 @@ public:
     void update_compositor_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void update_compositor_context_visibility(Web::CompositorContextId, Web::HTML::VisibilityState);
     void update_compositor_context_presents_from_cpu_memory(Web::CompositorContextId, bool);
+
+    struct RemoteLayer {
+        u64 id { 0 };
+        u32 core_animation_context_id { 0 };
+    };
+    // None where the Compositor offers no remote layers, or is gone.
+    Optional<RemoteLayer> create_remote_layer();
+    void destroy_remote_layer(u64 remote_layer_id);
+    void show_context_in_remote_layer(u64 remote_layer_id, Optional<Web::CompositorContextId>);
+    void set_remote_layer_fit(u64 remote_layer_id, Optional<Gfx::IntSize> fit_within);
+    void begin_synchronized_resize(u64 remote_layer_id, u64 token);
+    void await_synchronized_resize_frame(u64 remote_layer_id, u64 token, Gfx::IntSize);
+    void commit_synchronized_resize(u64 remote_layer_id, u64 token);
+    void take_frame_snapshot(Web::CompositorContextId, Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)>);
     bool handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&, bool allow_keyboard_scroll);
     bool handle_and_dispatch_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
     bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
@@ -422,7 +431,7 @@ private:
     ErrorOr<void> create_profile(Optional<StringView> profile_name, Optional<StringView> profile_path, bool force_new_process, bool temporary_profile);
     void create_mach_port_server(ByteString const& profile_identity);
     void update_website_color_scheme();
-    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(IsPrivate, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
+    ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(BrowsingSession&, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
 
     ErrorOr<void> launch_services();
     void launch_spare_web_content_process();
@@ -599,6 +608,8 @@ private:
     RefPtr<CompositorClient> m_compositor_client;
     RefPtr<CompositorPresentationClient> m_compositor_presentation_client;
     u64 m_compositor_presentation_id { 0 };
+    // IDs are never reused, so one from before a Compositor restart names no layer of the new process.
+    u64 m_next_remote_layer_id { 1 };
     bool m_reported_compositor_gpu_presentation_unavailable { false };
     // The last identity a Compositor reported, which outlives that Compositor until its replacement reports.
     Optional<Optional<Gfx::GpuDeviceIdentity>> m_compositor_gpu_device_identity;

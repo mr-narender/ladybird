@@ -14,6 +14,7 @@
 #include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/Time.h>
+#include <LibCompositing/FrameFitting.h>
 #include <LibCompositing/PausedDebuggerOverlay.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/StandardPaths.h>
@@ -28,6 +29,7 @@
 #include <LibWebCommon/WebDriver/Error.h>
 #include <LibWebCommon/WebDriver/Input.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
+#include <LibWebCommon/WebView/Utilities.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalSessionHistoryEntry.h>
 #include <LibWebView/CrashReportOutbox.h>
@@ -146,6 +148,9 @@ ViewImplementation::~ViewImplementation()
         Application::the().notify_webdriver_window_closed(m_window_handle);
 
     reset_spell_checking();
+
+    if (m_remote_layer_id.has_value())
+        Application::the().destroy_remote_layer(*m_remote_layer_id);
 
     // NB: WebDriver BiDi may activate another top-level traversable, which must not be this one that is going away.
     if (!m_window_handle.is_empty() && !m_owner_view_id.has_value()) {
@@ -439,6 +444,104 @@ void ViewImplementation::server_did_paint(Badge<WebContentPage>, i32 bitmap_id, 
 
     if (did_swap_bitmap && on_ready_to_paint)
         on_ready_to_paint();
+}
+
+void ViewImplementation::server_did_present_frame_in_remote_layer(Badge<WebContentPage>, Gfx::IntSize size, Gfx::IntRect, double device_pixel_ratio)
+{
+    m_backing_stores->present_frame_shown_in_remote_layer(size, device_pixel_ratio);
+    if (m_crash_state.has_value() && m_crash_state->recovery_started)
+        set_crash_state({});
+    TabPerformanceMonitor::did_present(view_id());
+    did_present_frame_in_remote_layer(size, device_pixel_ratio);
+}
+
+void ViewImplementation::set_hosts_remote_layer(bool hosts_remote_layer)
+{
+    if (m_hosts_remote_layer == hosts_remote_layer)
+        return;
+    m_hosts_remote_layer = hosts_remote_layer;
+
+    if (!hosts_remote_layer) {
+        if (auto remote_layer_id = exchange(m_remote_layer_id, {}); remote_layer_id.has_value()) {
+            Application::the().destroy_remote_layer(*remote_layer_id);
+            did_create_remote_layer(0);
+        }
+        return;
+    }
+
+    auto remote_layer = Application::the().create_remote_layer();
+    if (!remote_layer.has_value()) {
+        did_create_remote_layer(0);
+        return;
+    }
+    m_remote_layer_id = remote_layer->id;
+    update_remote_layer_fit();
+    Application::the().show_context_in_remote_layer(remote_layer->id, page().compositor_context_id());
+    did_create_remote_layer(remote_layer->core_animation_context_id);
+}
+
+void ViewImplementation::take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)> callback)
+{
+    Application::the().take_frame_snapshot(page().compositor_context_id(), maximum_size, move(callback));
+}
+
+ViewImplementation* ViewImplementation::find_view_showing_remote_layer(u64 remote_layer_id)
+{
+    for (auto& [_, view] : all_views()) {
+        if (view->m_remote_layer_id == remote_layer_id)
+            return view;
+    }
+    return nullptr;
+}
+
+void ViewImplementation::begin_synchronized_resize(u64 token)
+{
+    if (m_remote_layer_id.has_value())
+        Application::the().begin_synchronized_resize(*m_remote_layer_id, token);
+}
+
+void ViewImplementation::await_synchronized_resize_frame(u64 token, Gfx::IntSize size)
+{
+    if (!m_remote_layer_id.has_value()) {
+        did_hold_synchronized_resize_frame(token);
+        return;
+    }
+    Application::the().await_synchronized_resize_frame(*m_remote_layer_id, token, size);
+}
+
+void ViewImplementation::commit_synchronized_resize(u64 token)
+{
+    if (!m_remote_layer_id.has_value()) {
+        did_commit_synchronized_resize(token);
+        return;
+    }
+    Application::the().commit_synchronized_resize(*m_remote_layer_id, token);
+}
+
+void ViewImplementation::set_scales_frames_to_fit(bool scales_frames_to_fit)
+{
+    m_scales_frames_to_fit = scales_frames_to_fit;
+    update_remote_layer_fit();
+}
+
+// The Compositor fits the frames into the view itself, for a view that scales them to fit.
+void ViewImplementation::update_remote_layer_fit()
+{
+    if (!m_remote_layer_id.has_value())
+        return;
+    Optional<Gfx::IntSize> fit_within;
+    if (m_scales_frames_to_fit && !viewport_size().is_empty())
+        fit_within = viewport_size().to_type<int>();
+    Application::the().set_remote_layer_fit(*m_remote_layer_id, fit_within);
+}
+
+void ViewImplementation::recreate_remote_layer_after_compositor_reconnect(Badge<WebContentClient>)
+{
+    if (!m_hosts_remote_layer)
+        return;
+    m_hosts_remote_layer = false;
+    m_remote_layer_id = {};
+    set_hosts_remote_layer(true);
 }
 
 void ViewImplementation::release_backing_store(i32 bitmap_id)
@@ -794,6 +897,15 @@ void ViewImplementation::set_zoom(double zoom_level)
     update_zoom();
 }
 
+void ViewImplementation::reset_zoom()
+{
+    set_zoom(1.0);
+    page().async_reset_zoom();
+
+    if (m_is_private == IsPrivate::No)
+        Application::settings().set_zoom_for_host(current_host_for_settings(), m_zoom_level);
+}
+
 void ViewImplementation::set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second)
 {
     m_display_id = display_id;
@@ -845,16 +957,6 @@ void ViewImplementation::send_system_theme_to_page(WebContentPage& page)
 {
     if (auto theme = system_theme(); theme.is_valid())
         page.async_update_system_theme(theme);
-}
-
-void ViewImplementation::reset_zoom()
-{
-    m_zoom_level = 1.0;
-    update_zoom();
-    page().async_reset_zoom();
-
-    if (m_is_private == IsPrivate::No)
-        Application::settings().set_zoom_for_host(current_host_for_settings(), m_zoom_level);
 }
 
 // NB: The event is handled once it leaves the queue of pending input events, or when it never enters it.
@@ -1505,19 +1607,14 @@ static void send_browsing_behavior(WebContentPage const& page)
 
 static void send_autoplay_settings(WebContentPage const& page)
 {
-    auto const& autoplay_settings = Application::settings().autoplay_settings();
     auto const& web_content_options = Application::web_content_options();
 
-    auto policy = autoplay_settings.policy;
-    if (web_content_options.enable_autoplay == EnableAutoplay::Yes)
-        policy = Web::HTML::AutoplayPolicy::AllowAudioAndVideo;
-
-    Vector<Utf16String> allowlist;
-    allowlist.ensure_capacity(autoplay_settings.site_filters.size());
-    for (auto const& site_filter : autoplay_settings.site_filters)
-        allowlist.unchecked_append(Utf16String::from_utf8(site_filter));
-
-    page.async_set_autoplay_settings(policy, move(allowlist));
+    if (web_content_options.enable_autoplay == EnableAutoplay::Yes) {
+        page.async_set_autoplay_settings(Web::HTML::AutoplayPolicy::AllowAudioAndVideo, {});
+    } else {
+        auto const& autoplay_settings = Application::settings().autoplay_settings();
+        page.async_set_autoplay_settings(autoplay_settings.policy, autoplay_settings.site_filters);
+    }
 }
 
 static void send_global_privacy_control(WebContentPage const& page)
@@ -3059,14 +3156,13 @@ void ViewImplementation::set_device_pixel_ratio_for_testing(WebContentPage& page
 
 Gfx::IntRect ViewImplementation::rect_fitting_frame(Gfx::IntSize frame_size, Gfx::IntSize target_size)
 {
-    auto scale = min(static_cast<float>(target_size.width()) / frame_size.width(), static_cast<float>(target_size.height()) / frame_size.height());
-    auto fitted_size = frame_size.to_type<float>().scaled(scale).to_rounded<int>();
-    return Gfx::IntRect { {}, fitted_size }.centered_within({ {}, target_size });
+    return Compositing::rect_fitting_frame(frame_size, target_size);
 }
 
 void ViewImplementation::handle_resize()
 {
     page().async_set_viewport(viewport_size(), m_device_pixel_ratio, m_is_fullscreen);
+    update_remote_layer_fit();
 
     // The page forwards its new size to the compositor once it has laid it out. Until then, scaling frames to fit needs
     // the compositor to keep presenting them whole at the size they were laid out for.
@@ -3578,6 +3674,9 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
         install_backing_stores(move(backing_stores->bitmap_ids), move(backing_stores->backing_stores));
 
     auto compositor_context_id = page.compositor_context_id();
+    // The remote layer goes on showing the outgoing page's last frame until the page presents its first one.
+    if (m_remote_layer_id.has_value())
+        Application::the().show_context_in_remote_layer(*m_remote_layer_id, compositor_context_id);
     Application::the().update_compositor_viewport(compositor_context_id, viewport_size().to_type<int>(), m_device_pixel_ratio);
     Application::the().update_compositor_context_visibility(compositor_context_id, traversable().system_visibility_state());
     Application::the().update_compositor_context_presents_from_cpu_memory(compositor_context_id, m_presents_from_cpu_memory);
@@ -4371,38 +4470,25 @@ Optional<String> ViewImplementation::crash_report_website() const
     return CrashReportReview::website_from_url(m_crash_state->failed_url);
 }
 
-String ViewImplementation::force_dark_host() const
-{
-    auto url = this->url();
-    if (!url.host().has_value())
-        return {};
-    return current_host_for_settings();
-}
-
 bool ViewImplementation::force_dark_enabled() const
 {
-    return Application::settings().force_dark_for_host(force_dark_host());
+    return Application::settings().force_dark_for_host(current_host_for_settings());
 }
 
 bool ViewImplementation::can_set_force_dark() const
 {
-    return m_is_private == IsPrivate::No && !force_dark_host().is_empty();
+    return m_is_private == IsPrivate::No && !current_host_for_settings().is_empty();
 }
 
 void ViewImplementation::set_force_dark_enabled(bool enabled)
 {
     if (can_set_force_dark())
-        Application::settings().set_force_dark_for_host(force_dark_host(), enabled);
+        Application::settings().set_force_dark_for_host(current_host_for_settings(), enabled);
 }
 
 String ViewImplementation::current_host_for_settings() const
 {
-    auto url = this->url();
-    if (url.host().has_value())
-        return MUST(String::from_utf8(url.serialized_host()));
-    if (url.scheme() == "about"sv)
-        return MUST(String::from_utf8(url.serialize_path()));
-    return {};
+    return host_for_settings(url());
 }
 
 void ViewImplementation::languages_changed()
@@ -4431,6 +4517,12 @@ void ViewImplementation::browsing_behavior_changed()
 void ViewImplementation::autoplay_settings_changed()
 {
     traversable().for_each_hosting_page(send_autoplay_settings);
+}
+
+void ViewImplementation::permission_settings_changed(Web::Permissions::PermissionName name)
+{
+    if (name == Web::Permissions::PermissionName::Geolocation)
+        geolocation_settings_changed();
 }
 
 void ViewImplementation::global_privacy_control_changed()

@@ -4,9 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect};
-use crate::layout::geometry::Frame;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::{
     formatting_context, grid_formatting_context, svg_formatting_context, table_formatting_context, used_values,
@@ -15,40 +13,6 @@ use crate::painting::node_painting;
 use crate::painting::paint_read::GeometryRead;
 use crate::painting::paintable_data::*;
 
-/// The frame the box was laid out in, in which its committed fragment holds its geometry.
-pub(crate) fn committed_frame(arena: &impl GeometryRead, slot: NodeSlotId) -> Frame {
-    arena.paintable_data(slot).frame()
-}
-
-/// The physical rect of a box's content box within its containing block's content box, from the rect its fragment
-/// link holds in the frame the box was laid out in.
-pub(crate) fn physical_content_rect_in_containing_block(
-    arena: &impl GeometryRead,
-    frame: Frame,
-    containing_block: NodeSlotId,
-    rect_in_frame: CssPixelRect,
-) -> CssPixelRect {
-    if frame.is_physical() {
-        return rect_in_frame;
-    }
-    let containing_block_size = if containing_block.is_invalid() || !arena.paintable_row_is_populated(containing_block)
-    {
-        used_values::FfiCssPixelSize::default()
-    } else {
-        committed_content_size(arena, containing_block)
-    };
-    frame.rect_to_physical(rect_in_frame, containing_block_size)
-}
-
-fn link_content_rect(link: &crate::layout::fragment_tree::FragmentLink) -> CssPixelRect {
-    CssPixelRect::new(
-        link.committed_offset.x,
-        link.committed_offset.y,
-        link.fragment.sides.content_size.width,
-        link.fragment.sides.content_size.height,
-    )
-}
-
 pub(crate) fn committed_offset(arena: &impl GeometryRead, slot: NodeSlotId) -> used_values::FfiCssPixelPoint {
     // NB: An inline box without pieces keeps the geometry its link gives it.
     if node_painting::is_fragmented_inline(arena, slot)
@@ -56,20 +20,8 @@ pub(crate) fn committed_offset(arena: &impl GeometryRead, slot: NodeSlotId) -> u
     {
         return unions.content.location().into();
     }
-    let data = arena.paintable_data(slot);
-    let frame = data.frame();
-    if !frame.is_physical() {
-        let containing_block = data.containing_block;
-        return arena
-            .with_committed_fragment_link(slot, |link| link.map(link_content_rect))
-            .map_or_else(used_values::FfiCssPixelPoint::default, |rect| {
-                physical_content_rect_in_containing_block(arena, frame, containing_block, rect)
-                    .location()
-                    .into()
-            });
-    }
     arena.with_committed_fragment_link(slot, |link| {
-        link.map_or_else(used_values::FfiCssPixelPoint::default, |link| link.committed_offset)
+        link.map_or_else(used_values::FfiCssPixelPoint::default, |link| link.offset)
     })
 }
 
@@ -79,67 +31,34 @@ pub(crate) fn committed_content_size(arena: &impl GeometryRead, slot: NodeSlotId
     {
         return unions.content.size().into();
     }
-    let data = arena.paintable_data(slot);
-    let frame = data.frame();
     arena.with_committed_fragment_link(slot, |link| {
         link.map_or_else(used_values::FfiCssPixelSize::default, |link| {
-            let size = link.fragment.sides.content_size;
-            frame.size_to_physical(size.width, size.height)
+            link.fragment.sides.content_size
         })
     })
-}
-
-pub(crate) fn sides_to_physical(frame: Frame, sides: FfiPixelBox) -> FfiPixelBox {
-    if frame.is_physical() {
-        return sides;
-    }
-    let [top, right, bottom, left] =
-        frame.sides_in([sides.top, sides.right, sides.bottom, sides.left], Frame::PHYSICAL);
-    FfiPixelBox {
-        top,
-        right,
-        bottom,
-        left,
-    }
 }
 
 pub(crate) fn committed_margin(arena: &impl GeometryRead, slot: NodeSlotId) -> FfiPixelBox {
-    let frame = committed_frame(arena, slot);
     arena.with_committed_fragment_link(slot, |link| {
-        link.map_or_else(FfiPixelBox::default, |link| {
-            sides_to_physical(frame, link.placement.shown_as.margins.into())
-        })
+        link.map_or_else(FfiPixelBox::default, |link| link.placement.shown_as.margins.into())
     })
 }
 
-fn border_of(fragment: &crate::layout::fragment_tree::Fragment, frame: Frame) -> FfiPixelBox {
-    sides_to_physical(frame, fragment.sides.border.into())
-}
-
-fn padding_of(fragment: &crate::layout::fragment_tree::Fragment, frame: Frame) -> FfiPixelBox {
-    sides_to_physical(frame, fragment.sides.padding.into())
-}
-
 pub(crate) fn committed_border(arena: &impl GeometryRead, slot: NodeSlotId) -> FfiPixelBox {
-    let frame = committed_frame(arena, slot);
     arena.with_committed_fragment_link(slot, |link| {
-        link.map_or_else(FfiPixelBox::default, |link| border_of(&link.fragment, frame))
+        link.map_or_else(FfiPixelBox::default, |link| link.fragment.sides.border.into())
     })
 }
 
 pub(crate) fn committed_padding(arena: &impl GeometryRead, slot: NodeSlotId) -> FfiPixelBox {
-    let frame = committed_frame(arena, slot);
     arena.with_committed_fragment_link(slot, |link| {
-        link.map_or_else(FfiPixelBox::default, |link| padding_of(&link.fragment, frame))
+        link.map_or_else(FfiPixelBox::default, |link| link.fragment.sides.padding.into())
     })
 }
 
 pub(crate) fn committed_inset(arena: &impl GeometryRead, slot: NodeSlotId) -> FfiPixelBox {
-    let frame = committed_frame(arena, slot);
     arena.with_committed_fragment_link(slot, |link| {
-        link.map_or_else(FfiPixelBox::default, |link| {
-            sides_to_physical(frame, link.placement.insets.into())
-        })
+        link.map_or_else(FfiPixelBox::default, |link| link.placement.insets.into())
     })
 }
 
@@ -251,38 +170,12 @@ pub(crate) fn committed_svg_text_character_cells(
     })
 }
 
-pub(crate) fn committed_containing_line_box_index(arena: &impl GeometryRead, slot: NodeSlotId) -> Option<usize> {
-    arena.with_committed_fragment_link(slot, |link| {
-        link.and_then(|link| link.placement.containing_line_box_index)
-            .map(|index| index as usize)
-    })
-}
-
 pub(crate) fn committed_svg_viewport_transform(
     arena: &impl GeometryRead,
     slot: NodeSlotId,
 ) -> Option<svg_formatting_context::FfiAffineTransform> {
     arena.with_committed_fragment_link(slot, |link| {
         link.and_then(|link| link.fragment.svg()?.facts.viewport_transform)
-    })
-}
-
-pub(crate) fn committed_svg_viewport_size(arena: &impl GeometryRead, slot: NodeSlotId) -> used_values::FfiCssPixelSize {
-    if arena.node_kind_if_live(slot) != Some(crate::layout::node_data::NodeKind::SVGSVGBox) {
-        return used_values::FfiCssPixelSize::default();
-    }
-    arena.with_committed_fragment_link(slot, |link| {
-        link.and_then(|link| link.fragment.svg()?.facts.viewport_size)
-            .unwrap_or_default()
-    })
-}
-
-pub(crate) fn committed_svg_element_transform(
-    arena: &impl GeometryRead,
-    slot: NodeSlotId,
-) -> Option<svg_formatting_context::FfiAffineTransform> {
-    arena.with_committed_fragment_link(slot, |link| {
-        link.and_then(|link| link.fragment.svg()?.facts.element_transform)
     })
 }
 
@@ -304,13 +197,6 @@ pub(crate) fn committed_svg_mask_area_facts(
     })
 }
 
-pub(crate) fn committed_svg_view_box(
-    arena: &impl GeometryRead,
-    slot: NodeSlotId,
-) -> Option<svg_formatting_context::FfiSvgViewBox> {
-    arena.with_committed_fragment_link(slot, |link| link.and_then(|link| link.fragment.svg()?.facts.view_box))
-}
-
 pub(crate) fn committed_svg_resource_content_units_are_object_bounding_box(
     arena: &impl GeometryRead,
     slot: NodeSlotId,
@@ -324,11 +210,12 @@ pub(crate) fn committed_svg_resource_content_units_are_object_bounding_box(
     })
 }
 
-pub(crate) fn committed_svg_viewport_percentage_basis(arena: &impl GeometryRead, slot: NodeSlotId) -> CssPixels {
-    arena.with_committed_fragment_link(slot, |link| {
-        link.and_then(|link| link.fragment.svg())
-            .map_or_else(CssPixels::default, |svg| svg.facts.viewport_percentage_basis)
-    })
+/// The geometry the box of an SVG element committed.
+pub(crate) fn committed_svg_geometry(
+    arena: &impl GeometryRead,
+    slot: NodeSlotId,
+) -> Option<svg_formatting_context::SvgGeometry> {
+    arena.with_committed_fragment_link(slot, |link| link.and_then(|link| Some(link.fragment.svg()?.geometry)))
 }
 
 /// The `pathLength` the box of a geometry element committed, where its element has one.
@@ -417,12 +304,7 @@ pub(crate) fn absolute_fragment_rect(arena: &impl GeometryRead, slot: NodeSlotId
     let Some((rect, containing_block_fragment)) = with_later_box_fragment(arena, slot, index, |fragment| {
         let link = &fragment.link;
         (
-            CssPixelRect::new(
-                link.committed_offset.x,
-                link.committed_offset.y,
-                link.fragment.sides.content_size.width,
-                link.fragment.sides.content_size.height,
-            ),
+            CssPixelRect::from_location_and_size(link.offset.into(), link.fragment.sides.content_size.into()),
             fragment.containing_block_fragment,
         )
     }) else {
@@ -491,7 +373,7 @@ pub(crate) fn committed_fragment_padding(arena: &impl GeometryRead, slot: NodeSl
         return committed_padding(arena, slot);
     }
     with_later_box_fragment(arena, slot, index, |fragment| {
-        padding_of(&fragment.link.fragment, committed_frame(arena, slot))
+        fragment.link.fragment.sides.padding.into()
     })
     .unwrap_or_default()
 }
@@ -501,7 +383,7 @@ pub(crate) fn committed_fragment_border(arena: &impl GeometryRead, slot: NodeSlo
         return committed_border_box_edges(arena, slot);
     }
     with_later_box_fragment(arena, slot, index, |fragment| {
-        border_of(&fragment.link.fragment, committed_frame(arena, slot))
+        fragment.link.fragment.sides.border.into()
     })
     .unwrap_or_default()
 }
@@ -650,21 +532,11 @@ pub(crate) fn first_fragment_padding_box_rect(arena: &impl GeometryRead, slot: N
 /// The border is split the same way layout splits it when placing the boxes (`BoxMetricCells::border_left_collapsed`):
 /// the part before the grid line goes to the box before the line, the part after it to the box after the line.
 pub(crate) fn committed_border_box_edges(arena: &impl GeometryRead, slot: NodeSlotId) -> FfiPixelBox {
-    let border = committed_border(arena, slot);
-    let Some(is_table_box) = arena.with_committed_fragment_link(slot, |link| {
-        let collapsing = link?.fragment.sides.collapsing;
-        collapsing
-            .uses_collapsing_borders_model()
-            .then(|| collapsing.is_collapsed_borders_table_box())
-    }) else {
-        return border;
-    };
-    FfiPixelBox {
-        top: used_values::collapsed_border_share(border.top, true, is_table_box),
-        right: used_values::collapsed_border_share(border.right, false, is_table_box),
-        bottom: used_values::collapsed_border_share(border.bottom, false, is_table_box),
-        left: used_values::collapsed_border_share(border.left, true, is_table_box),
-    }
+    arena.with_committed_fragment_link(slot, |link| {
+        link.map_or_else(FfiPixelBox::default, |link| {
+            link.fragment.sides.border_box_edges().into()
+        })
+    })
 }
 
 pub(crate) fn absolute_border_box_rect(arena: &impl GeometryRead, slot: NodeSlotId) -> CssPixelRect {
