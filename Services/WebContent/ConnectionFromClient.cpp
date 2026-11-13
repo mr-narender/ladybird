@@ -1176,7 +1176,6 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
             Web::Layout::ForcedReadScope read { *doc };
             if (doc->layout_node(read)) {
                 VERIFY(doc->has_committed_viewport_box());
-                doc->update_paint_and_hit_testing_properties_if_needed();
                 StringBuilder builder;
                 Web::Painting::dump_stacking_context_tree(read, builder, *doc);
                 dbgln("{}", builder.string_view());
@@ -2741,7 +2740,6 @@ static void append_stacking_context_tree(Web::Page& page, StringBuilder& builder
         return;
     }
 
-    document->update_paint_and_hit_testing_properties_if_needed();
     Web::Painting::dump_stacking_context_tree(read, builder, *document);
 }
 
@@ -3446,6 +3444,12 @@ void ConnectionFromClient::set_maximum_frames_per_second(Web::PageId page_id, do
 {
     if (auto page = this->page(page_id); page.has_value())
         page->set_maximum_frames_per_second(maximum_frames_per_second);
+}
+
+void ConnectionFromClient::set_screen_shows_high_dynamic_range(Web::PageId page_id, bool screen_shows_high_dynamic_range)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->set_screen_shows_high_dynamic_range(screen_shows_high_dynamic_range);
 }
 
 void ConnectionFromClient::set_frame_rate_capped(Web::PageId page_id, bool capped)

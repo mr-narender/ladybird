@@ -6,6 +6,7 @@
 
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/HostObject.h>
+#include <LibJS/Runtime/Promise.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibURL/RustIntegration.h>
 #include <LibWeb/Bindings/DOMException.h>
@@ -20,6 +21,7 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
@@ -88,6 +90,7 @@ void web_bindings_queue_a_task(void* realm, u8 task_source, void* cell, void (*s
 u64 web_bindings_queue_a_global_task(JSObject* global_object, u8 task_source, void* cell, void (*steps)(JSVM*, void*));
 void web_bindings_remove_tasks(void* realm, ReadonlySpan<u64> task_ids);
 u64 web_bindings_currently_running_task(void* realm);
+void web_bindings_spin_until_promise_is_settled(JSObject* promise);
 void* web_bindings_create_callback_function(JSObject* callable, bool returns_promise);
 JSCompletion web_bindings_invoke_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
 void* web_bindings_invoke_promise_callback_function(void* callback, bool has_this_value, JSValue this_value, ReadonlySpan<JSValue> arguments);
@@ -95,18 +98,22 @@ void web_bindings_push_element_queue();
 void web_bindings_pop_element_queue_and_invoke_reactions();
 bool web_bindings_realm_is_window(void* realm);
 bool web_bindings_realm_is_secure_context(void* realm);
+void web_bindings_report_an_exception(void* realm, JSValue exception);
 HTML::Window* web_bindings_window_from_global_object(JSObject* global_object);
 void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTML::Window*));
 DOM::Document* web_bindings_window_associated_document(HTML::Window*);
 u64 web_bindings_window_page_id(HTML::Window*);
+bool web_bindings_window_has_transient_activation(HTML::Window*);
 DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window*);
 bool web_bindings_document_has_navigable(DOM::Document*);
 bool web_bindings_document_is_fully_active(DOM::Document*);
+bool web_bindings_document_has_focus(DOM::Document*);
 bool web_bindings_document_has_been_destroyed(DOM::Document*);
 URL::FFI::RustUrl web_bindings_document_url(DOM::Document*);
 HTML::WorkerGlobalScope* web_bindings_worker_global_scope_from_global_object(JSObject* global_object);
 HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object);
 JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject*);
+JS::Realm* web_bindings_environment_settings_object_realm(HTML::EnvironmentSettingsObject*);
 void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject*, void* ctx, void (*on_id)(void*, ReadonlyBytes));
 bool web_bindings_worker_global_scope_is_closing(HTML::WorkerGlobalScope*);
 void web_bindings_set_has_pending_activity(void* realm, DOM::EventTarget*, bool has_pending_activity);
@@ -158,6 +165,11 @@ bool web_bindings_realm_is_secure_context(void* realm)
     return HTML::is_secure_context(principal_host_defined_environment_settings_object(*static_cast<JS::Realm*>(realm)));
 }
 
+void web_bindings_report_an_exception(void* realm, JSValue exception)
+{
+    HTML::report_exception(JS::throw_completion(JS::HostABI::value_from_abi(exception)), *static_cast<JS::Realm*>(realm));
+}
+
 void web_bindings_push_element_queue()
 {
     main_thread_similar_origin_window_agent().custom_element_reactions_stack.element_queue_stack.append({});
@@ -197,6 +209,11 @@ u64 web_bindings_window_page_id(HTML::Window* window)
     return window->page().client().id().value();
 }
 
+bool web_bindings_window_has_transient_activation(HTML::Window* window)
+{
+    return window->has_transient_activation();
+}
+
 DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window* window)
 {
     return window;
@@ -210,6 +227,11 @@ bool web_bindings_document_has_navigable(DOM::Document* document)
 bool web_bindings_document_is_fully_active(DOM::Document* document)
 {
     return document->is_fully_active();
+}
+
+bool web_bindings_document_has_focus(DOM::Document* document)
+{
+    return document->has_focus();
 }
 
 bool web_bindings_document_has_been_destroyed(DOM::Document* document)
@@ -230,6 +252,11 @@ HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject*
 JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject* settings_object)
 {
     return JS::HostABI::object_to_abi(&settings_object->global_object());
+}
+
+JS::Realm* web_bindings_environment_settings_object_realm(HTML::EnvironmentSettingsObject* settings_object)
+{
+    return &settings_object->realm();
 }
 
 void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject* settings_object, void* ctx, void (*on_id)(void*, ReadonlyBytes))
@@ -342,10 +369,21 @@ void web_bindings_run_in_parallel(void* realm, void* cell, void (*steps)(JSVM*, 
     }));
 }
 
+void web_bindings_spin_until_promise_is_settled(JSObject* promise)
+{
+    auto& js_promise = as<JS::Promise>(*JS::HostABI::object_from_abi(promise));
+    HTML::main_thread_event_loop().spin_until(GC::create_function(GC::Heap::the(), GC::captures(js_promise), [](auto& js_promise) {
+        return js_promise.state() != JS::Promise::State::Pending;
+    }));
+}
+
 // NB: The task sources of the Rust bindings' TaskSource.
 static_assert(to_underlying(HTML::Task::Source::Unspecified) == 0);
 static_assert(to_underlying(HTML::Task::Source::Networking) == 3);
 static_assert(to_underlying(HTML::Task::Source::FileReading) == 13);
+static_assert(to_underlying(HTML::Task::Source::PerformanceTimeline) == 15);
+static_assert(to_underlying(HTML::Task::Source::Clipboard) == 17);
+static_assert(to_underlying(HTML::Task::Source::Permissions) == 18);
 static_assert(to_underlying(HTML::Task::Source::Crypto) == 27);
 static_assert(to_underlying(HTML::Task::Source::Storage) == 29);
 

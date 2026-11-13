@@ -8,9 +8,7 @@ use super::abspos_inputs::AbsposLayoutInputs;
 use super::layout_changes::{LayoutChange, queue};
 use super::rendered_text::{FfiTextSourceRange, PublishedTextSlot, RenderedTextBoundary, TextContent, TextFragments};
 use super::shell_reads::read_arena;
-use super::tree_builder::FfiLayoutTreeBuildOutcome;
 use super::tree_shape::{Chunk, PUBLISHED_ROWS_PER_CHUNK, ShapeWriter, ShapeWrites, TreeShape};
-use super::update_layout::FfiLayoutTreeBuildStats;
 use crate::cow_column::{ColumnSnapshot, CowColumn, CowVec};
 use crate::cow_map::{CowMap, CowSet};
 use crate::css::css_pixels::{CssPixelPoint, FfiCssPixelPoint};
@@ -971,6 +969,9 @@ struct StyleNodeTables {
     /// The elements carrying each anchor name, in tree order. The DOM's registry republishes a
     /// name's list whenever it changes.
     anchor_name_elements: CowMap<ScopedAnchorName, Vec<StyleNodeID>>,
+    implicit_anchor_elements: CowMap<StyleNodeID, StyleNodeID>,
+    /// Elements that have served as implicit anchors retain their geometry until their identity is retired.
+    implicit_anchor_candidates: CowSet<StyleNodeID>,
     /// The nodes sitting in the user agent shadow tree of the focused text control, which is what
     /// a caret is painted inside. At most one control is focused, so this holds one control's
     /// shadow tree and is empty the rest of the time.
@@ -1134,8 +1135,6 @@ pub(crate) struct LayoutNodeArena {
     /// Every box must be recreated by the next layout tree build; set when the tree is torn down
     /// or a build finds a box it cannot place among rebuilt roots, cleared by the full pass.
     needs_full_layout_tree_update: bool,
-    partial_layout_count: u64,
-    full_layout_count: u64,
     /// How many layouts were committed, full and partial.
     layout_commit_count: u64,
     /// Per slot, which fragment held the box's committed link when a commit last met it.
@@ -1143,9 +1142,7 @@ pub(crate) struct LayoutNodeArena {
     /// The boxes whose committed links a full commit met at the top of its pass, which no fragment holds.
     pass_level_committed_links: Vec<NodeSlotId>,
     pub(crate) links_held_apart_from_their_containing_blocks: CowSet<NodeSlotId>,
-    layout_tree_build_stats: FfiLayoutTreeBuildStats,
     pre_order_labels: ForkVec<u64>,
-    pre_order_relabel_count: u64,
     free_list: ForkVec<u32>,
     live_count: u32,
     default_scroll_shift_anchors: Vec<DefaultScrollShiftAnchorSlot>,
@@ -1166,6 +1163,8 @@ pub(crate) struct LayoutNodeArena {
     /// What writes since the layout stage last looked did to the boxes its run memos hold entries of.
     memo_invalidations: super::memo_invalidations::MemoInvalidations,
     pub(super) layout_trace: super::trace::TraceRecord,
+    /// The rows allocated while a traced layout tree build runs.
+    tree_build_allocations: Option<Vec<NodeSlotId>>,
     pub(crate) paintable_rows: crate::painting::paintable_rows::PaintableRowStore,
     paint_state: crate::painting::paint_state::PaintState,
     // Hit testing can measure overflow and invalidate painting state while querying this list.
@@ -1274,15 +1273,11 @@ impl LayoutNodeArena {
             pending_rebuilt_subtree_roots: Vec::new(),
             pending_layout_tree_update_escaped_rebuild_roots: false,
             needs_full_layout_tree_update: (false),
-            partial_layout_count: (0),
-            full_layout_count: (0),
             layout_commit_count: 0,
             committed_link_holders: ForkVec::default(),
             pass_level_committed_links: Vec::new(),
             links_held_apart_from_their_containing_blocks: Default::default(),
-            layout_tree_build_stats: (FfiLayoutTreeBuildStats::default()),
             pre_order_labels: ForkVec::default(),
-            pre_order_relabel_count: 0,
             free_list: ForkVec::default(),
             live_count: 0,
             default_scroll_shift_anchors: Vec::new(),
@@ -1297,6 +1292,7 @@ impl LayoutNodeArena {
             next_rows_built_for_same_node: ForkVec::default(),
             memo_invalidations: Default::default(),
             layout_trace: super::trace::TraceRecord::default(),
+            tree_build_allocations: None,
             paintable_rows: crate::painting::paintable_rows::PaintableRowStore::default(),
             paint_state: crate::painting::paint_state::PaintState::default(),
             scrollable_overflow: Default::default(),
@@ -1538,7 +1534,25 @@ impl LayoutNodeArena {
         let generation = metadata.generation;
         *self.data_mut(index).slot_generation.get_mut() = generation;
 
-        NodeSlotId::new(index, generation)
+        let slot = NodeSlotId::new(index, generation);
+        if let Some(allocations) = &mut self.tree_build_allocations {
+            allocations.push(slot);
+        }
+        slot
+    }
+
+    /// Starts noting the rows allocated from now on, for a traced layout tree build.
+    pub(super) fn begin_noting_tree_build_allocations(&mut self) {
+        self.tree_build_allocations = Some(Vec::new());
+    }
+
+    /// The rows allocated since noting began that are still live, in the order they were allocated.
+    pub(super) fn take_live_tree_build_allocations(&mut self) -> Vec<NodeSlotId> {
+        let allocations = self.tree_build_allocations.take().unwrap_or_default();
+        allocations
+            .into_iter()
+            .filter(|&slot| self.slot_is_live(slot))
+            .collect()
     }
 
     pub(crate) fn free_subtree(&mut self, root: NodeSlotId) -> FreedSubtree {
@@ -2048,6 +2062,40 @@ impl LayoutNodeArena {
         }
     }
 
+    pub(crate) fn set_implicit_anchor_element(&mut self, element: StyleNodeID, anchor: Option<StyleNodeID>) {
+        if let Some(anchor) = anchor {
+            self.style_node_tables.implicit_anchor_elements.insert(element, anchor);
+            self.style_node_tables.implicit_anchor_candidates.insert(anchor);
+        } else {
+            self.style_node_tables.implicit_anchor_elements.remove(&element);
+        }
+    }
+
+    pub(crate) fn implicit_anchor_element(&self, node: NodeSlotId) -> Option<StyleNodeID> {
+        if self.node_is_generated_for_pseudo_element(node) {
+            return self.node_style_node(node);
+        }
+        let element = self.dom_node_style_node(node)?;
+        self.style_node_tables.implicit_anchor_elements.get(&element).copied()
+    }
+
+    pub(crate) fn node_is_anchor_candidate(&self, node: NodeSlotId) -> bool {
+        super::node_facts::has_flag(self.data(node), NodeFlag::HasAnchorNames)
+            || self.dom_node_style_node(node).is_some_and(|element| {
+                self.style_node_tables.implicit_anchor_candidates.contains(&element)
+                    || self.bound_rows.pseudo_elements.get(&element).is_some_and(|rows| {
+                        rows.0.iter().any(|&row| {
+                            self.node_style_if_live(row).is_some_and(|style| {
+                                style.is_absolutely_positioned()
+                                    && (style.anchor().position_anchor_type == 2
+                                        || (style.anchor().position_anchor_type == 0
+                                            && !style.anchor().position_area.as_slice().is_empty()))
+                            })
+                        })
+                    })
+            })
+    }
+
     /// Replaces the elements registered under `anchor_name` in the tree scope hosted by
     /// `scope_host`, in tree order. An empty list forgets the name.
     pub(crate) fn set_anchor_name_elements(
@@ -2261,6 +2309,8 @@ impl LayoutNodeArena {
             math_attribute_facts,
             svg_points,
             anchor_name_elements,
+            implicit_anchor_elements,
+            implicit_anchor_candidates,
             identities_in_focused_text_control,
             element_scroll_offsets,
             pseudo_element_scroll_offsets,
@@ -2271,6 +2321,8 @@ impl LayoutNodeArena {
         let removed_svg_attribute_facts = svg_attribute_facts.remove(&style_node);
         svg_points.remove(&style_node);
         math_attribute_facts.remove(&style_node);
+        implicit_anchor_elements.retain(|element, anchor| *element != style_node && *anchor != style_node);
+        let removed_implicit_anchor = implicit_anchor_candidates.remove(&style_node);
         identities_in_focused_text_control.remove(&style_node);
         element_scroll_offsets.remove(&style_node);
         pseudo_element_scroll_offsets.remove(&style_node);
@@ -2283,6 +2335,9 @@ impl LayoutNodeArena {
         // A retired shadow host takes its tree scope with it. The registry withdraws no names from a
         // scope it can no longer name.
         anchor_name_elements.retain(|name, _| name.scope_host != Some(style_node));
+        if removed_implicit_anchor {
+            self.record_partial_relayout_escape();
+        }
         // The SVG facts let go of the reference atoms they hold as they leave.
         if let Some(removed) = removed_svg_attribute_facts {
             self.retain_published_reference_atoms(
@@ -3195,35 +3250,6 @@ impl LayoutNodeArena {
     pub(crate) fn clear_pending_rebuilt_subtree_roots(&mut self) {
         self.pending_rebuilt_subtree_roots.clear();
         self.pending_layout_tree_update_escaped_rebuild_roots = false;
-    }
-
-    pub(crate) fn note_partial_layout(&mut self) {
-        self.partial_layout_count += 1;
-    }
-
-    pub(crate) fn note_full_layout(&mut self) {
-        self.full_layout_count += 1;
-    }
-
-    pub(crate) fn partial_layout_count(&self) -> u64 {
-        self.partial_layout_count
-    }
-
-    pub(crate) fn full_layout_count(&self) -> u64 {
-        self.full_layout_count
-    }
-
-    pub(crate) fn record_layout_tree_build(&mut self, outcome: &FfiLayoutTreeBuildOutcome) {
-        let stats = self.layout_tree_build_stats;
-        self.layout_tree_build_stats = FfiLayoutTreeBuildStats {
-            builds: stats.builds + 1,
-            last_build_rebuilt_subtree_roots: outcome.rebuilt_subtree_root_count as u64,
-            last_build_escaped_rebuild_roots: outcome.layout_tree_update_escaped_rebuild_roots,
-        };
-    }
-
-    pub(crate) fn layout_tree_build_stats(&self) -> FfiLayoutTreeBuildStats {
-        self.layout_tree_build_stats
     }
 
     pub(crate) fn needs_full_layout_tree_update(&self) -> bool {
@@ -4868,7 +4894,12 @@ impl LayoutNodeArena {
                 facts |= AncestorFact::ParentIsUnfloatedFlowContainer as u8;
             }
             if super::node_facts::has_flag(data, NodeFlag::Anonymous) {
-                if super::node_facts::has_flag(parent_data, NodeFlag::UsesButtonLayout) {
+                // The contents of a box that uses button layout are wrapped only when its display is neither flex nor grid,
+                // as wrap_button_contents_if_needed() does it. A flex or grid button's anonymous child is a flex or grid item.
+                if super::node_facts::has_flag(parent_data, NodeFlag::UsesButtonLayout)
+                    && !parent_style
+                        .is_some_and(|style| style.display().is_grid_inside() || style.display().is_flex_inside())
+                {
                     facts |= AncestorFact::IsAnonymousButtonContentWrapper as u8;
                 }
                 if super::node_facts::has_ancestor_fact(parent_data, AncestorFact::IsAnonymousButtonContentWrapper) {
@@ -5006,10 +5037,6 @@ impl LayoutNodeArena {
         self.pre_order_labels[id.slot_index() as usize] = label;
     }
 
-    pub(crate) fn pre_order_relabel_count(&self) -> u64 {
-        self.pre_order_relabel_count
-    }
-
     pub(crate) fn count_nodes_in_layout_subtree(&self, root: NodeSlotId) -> u64 {
         let mut count = 0u64;
         self.for_each_node_in_layout_subtree_in_pre_order(root, |_| count += 1);
@@ -5120,7 +5147,6 @@ impl LayoutNodeArena {
             self.set_node_pre_order_label(node, lower + step * position_in_subtree);
             cursor = self.next_node_in_layout_subtree_in_pre_order(subtree_root, node);
         }
-        self.pre_order_relabel_count += 1;
         true
     }
 

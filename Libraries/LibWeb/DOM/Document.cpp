@@ -252,6 +252,7 @@
 #include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
+#include <LibWeb/Painting/SvgPaintResources.h>
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
@@ -413,32 +414,14 @@ Document::HTMLCollectionAttributeInvalidationTypes Document::html_collection_att
 
 GC_DEFINE_ALLOCATOR(Document);
 
-// https://html.spec.whatwg.org/multipage/browsers.html#obtain-browsing-context-navigation
-// NB: The UI process performed this algorithm and selected this process. It names the group of the new top-level
-//     browsing context when it switched browsing context groups.
-static GC::Ref<HTML::BrowsingContext> obtain_a_browsing_context_to_use_for_a_navigation_response(HTML::NavigationParams const& navigation_params)
-{
-    // 1. Let browsingContext be navigationParams's navigable's active browsing context.
-    auto& navigable = *navigation_params.navigable;
-    auto browsing_context = navigable.active_browsing_context();
-
-    // NB: Steps 2 to 9 decide whether to switch browsing context groups, and return browsingContext otherwise.
-    if (!navigation_params.new_browsing_context_group_id.has_value())
-        return *browsing_context;
-
-    // 10. Let newBrowsingContext be the first return value of creating a new top-level browsing context and document.
-    auto new_browsing_context = HTML::BrowsingContext::create_a_new_browsing_context_and_document(navigable.page(), nullptr, nullptr).browsing_context;
-    new_browsing_context->set_browsing_context_group_id(*navigation_params.new_browsing_context_group_id);
-
-    // 15. Return newBrowsingContext.
-    return new_browsing_context;
-}
-
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
 WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type, Utf16FlyString content_type, HTML::NavigationParams const& navigation_params)
 {
     // 1. Let browsingContext be the result of obtaining a browsing context to use for a navigation response given navigationParams.
-    auto browsing_context = obtain_a_browsing_context_to_use_for_a_navigation_response(navigation_params);
+    // AD-HOC: The navigation obtained it when its response arrived. The document is created once navigable's active
+    //         document is unloaded, which destroys that document, and the document's link to its browsing context
+    //         with it.
+    GC::Ref browsing_context = *navigation_params.browsing_context;
 
     // 2. Let permissionsPolicy be the result of creating a permissions policy from a response given navigationParams's
     //    navigable's container, navigationParams's origin, and navigationParams's response.
@@ -515,7 +498,8 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
             top_level_creation_url.value(),
             top_level_origin,
             agent_cluster_id,
-            agent_cluster_cross_origin_isolation_mode);
+            agent_cluster_cross_origin_isolation_mode,
+            navigation_params.environment_id);
     }
 
     // NB: The UI process selects the window's agent even when an initial about:blank Window is reused.
@@ -899,6 +883,7 @@ Layout::NodeArena& Document::layout_node_arena()
         m_layout_node_arena->set_document({}, this);
         Layout::register_layout_host(*m_layout_node_arena, *this);
         Layout::RustFFI::document_host_set_layout_update_host_callbacks(m_layout_node_arena->host(), layout_update_host_callbacks());
+        Layout::RustFFI::document_host_set_paint_preparation_host(m_layout_node_arena->host(), paint_preparation_host_callbacks());
         Layout::RustFFI::FfiStyleRecordHostCallbacks style_record_host_callbacks {
             .context = this,
             .shell_style_changed = [](void*, void* shell, u64 record, void const* payloads, bool derived, bool attach_resources) { as<Layout::NodeWithStyle>(*static_cast<Layout::Node*>(shell)).refresh_style_from_arena(CSS::StyleRecordID { record }, payloads, derived, attach_resources); },
@@ -942,16 +927,10 @@ Layout::NodeArena& Document::layout_node_arena()
     return *m_layout_node_arena;
 }
 
-void Document::reset_style_invalidation_counters(Layout::BegunRead const& read) const
+void Document::bump_style_environment_version()
 {
-    m_style_invalidation_counters = {};
-    (void)CSS::StyleEngineFFI::style_engine_size_query_container_scan_visits(style_computer().style_engine().host(), &read, true);
-    (void)CSS::StyleEngineFFI::style_engine_animated_style_samples(style_computer().style_engine().host(), &read, false, true);
-    (void)CSS::StyleEngineFFI::style_engine_animated_style_samples(style_computer().style_engine().host(), &read, true, true);
-    if (m_layout_node_arena) {
-        Layout::RustFFI::render_state_scrollable_overflow_recalculation_count(m_layout_node_arena->host(), true);
-    }
-    CSS::reset_longhand_wrappers_minted();
+    ++m_style_environment_version;
+    HTML::note_rendering_trace_event("style environment changed"sv);
 }
 
 bool Document::needs_full_layout_tree_update(Layout::BegunRead const& read) const
@@ -971,21 +950,6 @@ bool Document::is_running_update_layout() const
     return m_layout_node_arena && Layout::RustFFI::document_host_update_layout_is_running(m_layout_node_arena->host());
 }
 
-u64 Document::partial_layout_count() const
-{
-    return m_layout_node_arena ? Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()).partial_layouts : 0;
-}
-
-u64 Document::full_layout_count() const
-{
-    return m_layout_node_arena ? Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()).full_layouts : 0;
-}
-
-Layout::RustFFI::FfiLayoutCounts Document::layout_counts() const
-{
-    return m_layout_node_arena ? Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()) : Layout::RustFFI::FfiLayoutCounts {};
-}
-
 void Document::finalize()
 {
     stop_compositor_animation_timers();
@@ -994,7 +958,7 @@ void Document::finalize()
     tear_down_layout_tree();
     if (m_layout_node_arena) {
         Layout::RustFFI::document_host_clear_callbacks(m_layout_node_arena->host());
-        VERIFY(Layout::RustFFI::render_state_layout_counts(m_layout_node_arena->host()).live_slots == 0);
+        VERIFY(Layout::RustFFI::render_state_live_slot_count(m_layout_node_arena->host()) == 0);
         m_layout_node_arena->set_document({}, nullptr);
     }
     CSS::ComputedValuesFFI::rust_custom_property_registry_destroy(m_rust_custom_property_registry);
@@ -2424,25 +2388,25 @@ void Document::begin_style_stabilization_epoch()
     m_style_stabilization_has_style_reactions = false;
     m_animated_custom_property_changes_in_stabilization_epoch.clear();
     m_animated_custom_property_moves_in_stabilization_epoch = 0;
-    ++m_style_invalidation_counters.style_stabilization_epochs;
+    HTML::note_rendering_trace_event("style stabilization epoch"sv);
     ++m_transition_generation;
 }
 
 void Document::record_style_stabilization_pass(Layout::BegunRead const& read)
 {
     VERIFY(m_style_stabilization_epoch_depth > 0);
-    ++m_style_invalidation_counters.provisional_style_passes;
+    HTML::note_rendering_trace_event("provisional style pass"sv);
     ++m_style_stabilization_pass_count;
     if (m_style_stabilization_pass_count == 2)
-        ++m_style_invalidation_counters.style_stabilization_feedback_epochs;
+        HTML::note_rendering_trace_event("style stabilization feedback epoch"sv);
 
     constexpr u64 ordinary_stabilization_round_limit = 8;
     if (m_style_stabilization_pass_count == ordinary_stabilization_round_limit + 1)
-        ++m_style_invalidation_counters.style_stabilization_round_guard_hits;
+        HTML::note_rendering_trace_event("style stabilization round guard"sv);
     // The exact bound is never reached within the ordinary rounds, so they need not ask the engine for it.
     if (m_style_stabilization_pass_count <= ordinary_stabilization_round_limit)
         return;
-    ++m_style_invalidation_counters.exact_stabilization_passes;
+    HTML::note_rendering_trace_event("exact stabilization pass"sv);
 
     // Size-query and style-reaction dependencies are acyclic, so a coherent pass settles at
     // least one more connected element, or moves the animated custom properties of one that reads
@@ -2450,10 +2414,8 @@ void Document::record_style_stabilization_pass(Layout::BegunRead const& read)
     // StyleEngine transactions in the same exact bound as layout feedback so neither feedback path
     // can spin independently of the epoch.
     auto const exact_stabilization_round_limit = static_cast<u64>(CSS::StyleEngineFFI::style_engine_connected_element_count(style_computer().style_engine().host(), &read)) + m_animated_custom_property_moves_in_stabilization_epoch + 1;
-    if (m_style_stabilization_pass_count > ordinary_stabilization_round_limit + exact_stabilization_round_limit) {
-        ++m_style_invalidation_counters.style_stabilization_bound_failures;
+    if (m_style_stabilization_pass_count > ordinary_stabilization_round_limit + exact_stabilization_round_limit)
         VERIFY_NOT_REACHED();
-    }
 }
 
 u64 Document::note_animated_custom_properties_moved_in_stabilization_epoch(CSS::StyleNodeID style_node)
@@ -2489,7 +2451,7 @@ void Document::end_style_stabilization_epoch()
         if (m_animations_created_in_stabilization_epoch.contains(event.animation) && event.animation->is_idle())
             continue;
         m_pending_animation_event_queue.append(event);
-        ++m_style_invalidation_counters.committed_animation_events;
+        HTML::note_rendering_trace_event("animation events committed"sv);
     }
     m_provisional_animation_event_queue.clear();
     m_animations_created_in_stabilization_epoch.clear();
@@ -2514,7 +2476,7 @@ void Document::after_layout_commit(Layout::BegunRead const& read, LayoutTreeChan
     set_needs_to_record_display_list();
 
     // The round that committed the layout prepared it for rendering, but for the visual contexts, which update next.
-    set_needs_accumulated_visual_contexts_update(true);
+    set_needs_accumulated_visual_contexts_update();
 
     // A tree update can replace layout nodes referenced by selection state.
     if (auto range = get_selection()->range())
@@ -3145,58 +3107,30 @@ void Document::finish_animated_style_update()
         effect->request_observation_sample();
 }
 
-void Document::prepare_for_rendering(Layout::BegunRead const& read)
+// What preparing the paint and hit testing properties, which the render state does as they are read, asks of the
+// document and tells it.
+Layout::RustFFI::FfiPaintPreparationHostCallbacks Document::paint_preparation_host_callbacks()
 {
-    if (!m_layout_node_arena)
-        return;
-
-    auto outcome = Painting::rust_prepare_for_rendering(read, *this, m_needs_accumulated_visual_contexts_update);
-    if (outcome.requires_visual_context_update)
-        set_needs_accumulated_visual_contexts_update(true);
-    if (outcome.visual_context_values_changed)
-        paint_state().did_update_visual_context_values();
-    if (outcome.requires_display_list_recording) {
-        set_needs_to_record_display_list();
-        m_document->set_needs_repaint();
-    }
-}
-
-void Document::update_paint_and_hit_testing_properties_if_needed()
-{
-    Layout::ForcedReadScope read { *this };
-    // NB: Called during paint property resolution.
-    // Everything that reads paint state comes through here, so the states it holds stale are written first.
-    update_highlight_states_if_needed(read);
-
-    // Nothing was written to the render state since the properties were prepared from it: every pass below would find
-    // nothing to do, so none is sent to the render owner.
-    auto* host = m_layout_node_arena ? m_layout_node_arena->host() : nullptr;
-    if (host && Layout::RustFFI::document_host_paint_preparation_is_current(host) && !m_needs_accumulated_visual_contexts_update && !m_image_map_areas_need_publication)
-        return;
-
-    // What the passes prepare stays current until something is written to the render state, from here on as well.
-    if (host)
-        Layout::RustFFI::document_host_note_paint_preparation_is_current(host);
-
-    prepare_for_rendering(read);
-    Painting::publish_image_map_area_facts_if_needed(read, *this);
-    if (m_needs_accumulated_visual_contexts_update) {
-        m_needs_accumulated_visual_contexts_update = false;
-        if (has_committed_viewport_box())
-            paint_state().update_accumulated_visual_contexts(read, *this);
-    }
-
-    // Scroll nodes are (re)created by the visual context tree build above, so scroll offsets and
-    // the snapshot must be derived only after structure work is done.
-    if (has_committed_viewport_box() && paint_state().refresh_scroll_state(read, *this) == Painting::RequiresDisplayListRecording::Yes) {
-        set_needs_to_record_display_list();
-        m_document->set_needs_repaint();
-    }
+    return {
+        .context = this,
+        .viewport = [](void* context, Layout::RustFFI::FfiPaintPreparationViewport* viewport) {
+            auto& document = *static_cast<Document*>(context);
+            viewport->visual_context_tree_inputs = Painting::visual_context_tree_inputs(document);
+            viewport->device_viewport_size = document.page().css_to_device_rect(document.viewport_rect()).size().to_type<int>(); },
+        .resolve_svg_filter = [](void* context, Layout::BegunRead const* read, Compositing::RustFFI::NodeSlotId slot, void const* url_value, void* sink) { return Painting::push_svg_filter_reference(*read, *static_cast<Document*>(context), slot, url_value, sink); },
+        .resolve_svg_paint_server = [](void* context, Layout::BegunRead const* read, Compositing::RustFFI::NodeSlotId slot, bool is_stroke, void* sink) { Painting::push_svg_paint_server_description(*read, *static_cast<Document*>(context), slot, is_stroke, sink); },
+        .require_display_list_recording = [](void* context, bool request_frame) {
+            auto& document = *static_cast<Document*>(context);
+            if (request_frame)
+                document.set_needs_repaint();
+            else
+                document.set_needs_to_record_display_list(); },
+    };
 }
 
 bool Document::can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const& layout_node) const
 {
-    if (!m_needs_accumulated_visual_contexts_update || !has_layout_root())
+    if (!has_layout_root() || !Layout::RustFFI::document_host_visual_contexts_need_update(layout_node.document_host()))
         return false;
 
     auto navigable = this->navigable();
@@ -6260,18 +6194,6 @@ void Document::decrement_number_of_pending_style_sheet_requests(Badge<DocumentLo
     page().client().request_frame_for(*this);
 }
 
-// AD-HOC: A navigation can drop the document it created before activating it. Its parser and fetch go on queueing
-//         tasks for it that can never run, and keep it alive. A document reusing an initial about:blank's window
-//         shares that window with the active document, so it is left alone.
-void Document::destroy_if_dropped_before_activation()
-{
-    if (m_has_been_destroyed || is_active())
-        return;
-    if (m_browsing_context && m_browsing_context->active_window() == window().ptr())
-        return;
-    destroy();
-}
-
 void Document::set_html_parser_end_state(GC::Ptr<HTML::HTMLParserEndState> state)
 {
     m_html_parser_end_state = state;
@@ -6814,9 +6736,9 @@ void Document::destroy()
 
     // AD-HOC: Disentangle the ports of the window's realm, which closes the transports of the channels that document
     //         took part in, so that the ports at their other ends learn that nothing arrives any more. A window that
-    //         was reused for another document keeps its ports. The specification once did this here, as steps of
-    //         destroying a document, and no longer does.
-    if (auto window = this->window(); window && &window->associated_document() == this)
+    //         was reused for another document, or that the document created once this one is unloaded takes over, keeps
+    //         its ports. The specification once did this here, as steps of destroying a document, and no longer does.
+    if (auto window = this->window(); window && &window->associated_document() == this && !m_window_is_taken_over_after_unload)
         HTML::MessagePort::disentangle_ports_of_realm(HTML::relevant_realm(*window));
 
     // 4. Run any unloading document cleanup steps for document that are defined by this specification and other applicable specifications.
@@ -7026,8 +6948,14 @@ void Document::abort()
     // AD-HOC: The fetch group belongs to the document's Window. Once the Window is associated with another document,
     //         as when the initial about:blank document is replaced, its fetches are not in the context of this document.
     if (auto window = this->window(); window && window->associated_document_if_any().ptr() == this) {
-        for (auto& fetch_record : relevant_settings_object().fetch_group())
-            cancel_fetch(fetch_record.fetch_controller());
+        for (auto& fetch_record : relevant_settings_object().fetch_group()) {
+            auto controller = fetch_record.fetch_controller();
+            // AD-HOC: A keepalive fetch outlives the document, as terminating a fetch group leaves its keepalive
+            //         fetches running.
+            if (controller && controller->is_keepalive())
+                continue;
+            cancel_fetch(controller);
+        }
 
         for (auto& controller : HTML::relevant_agent(*this).fetch_controller_registry.controllers()) {
             if (!controller->task_destination().is_for_document(*this))
@@ -7160,7 +7088,9 @@ void Document::ensure_style_engine_tracks_tree()
 }
 
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document
-void Document::unload(GC::Ptr<Document> new_document)
+// AD-HOC: A navigation's document is created once the document it replaces is unloaded. unload_of_replaced_document
+//         then stands in for newDocument, and keeps the unload's times until newDocument exists.
+void Document::unload(GC::Ptr<Document> new_document, Optional<UnloadOfReplacedDocument>* unload_of_replaced_document)
 {
     // FIXME: 1. Assert: this is running as part of a task queued on oldDocument's event loop.
 
@@ -7168,8 +7098,9 @@ void Document::unload(GC::Ptr<Document> new_document)
     Optional<DocumentUnloadTimingInfo> unload_timing_info { DocumentUnloadTimingInfo {} };
 
     // 3. If newDocument is not given, then set unloadTimingInfo to null.
-    if (!new_document)
+    if (!new_document && !unload_of_replaced_document)
         unload_timing_info.clear();
+    HighResolutionTime::DOMHighResTimeStamp unload_event_start_shared_time = 0;
 
     // 4. Otherwise, if newDocument's event loop is not oldDocument's event loop, then the user agent may be unloading
     //    oldDocument in parallel. In that case, the user agent should set unloadTimingInfo to null.
@@ -7215,10 +7146,11 @@ void Document::unload(GC::Ptr<Document> new_document)
     // 11. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event start time to the current high
     //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings
     //     object's cross-origin isolated capability.
-    if (unload_timing_info.has_value()) {
-        VERIFY(new_document);
+    if (unload_timing_info.has_value() && new_document) {
         auto current_high_resolution_time = HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*new_document));
         unload_timing_info->unload_event_start_time = HighResolutionTime::coarsen_time(current_high_resolution_time, HTML::relevant_settings_object(*this).cross_origin_isolated_capability());
+    } else if (unload_timing_info.has_value()) {
+        unload_event_start_shared_time = HighResolutionTime::unsafe_shared_current_time();
     }
 
     // 12. If oldDocument's salvageable state is false, then fire an event named unload at oldDocument's relevant global
@@ -7233,10 +7165,16 @@ void Document::unload(GC::Ptr<Document> new_document)
     // 13. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event end time to the current high
     //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings
     //     object's cross-origin isolated capability.
-    if (unload_timing_info.has_value()) {
-        VERIFY(new_document);
+    if (unload_timing_info.has_value() && new_document) {
         auto current_high_resolution_time = HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*new_document));
         unload_timing_info->unload_event_end_time = HighResolutionTime::coarsen_time(current_high_resolution_time, HTML::relevant_settings_object(*this).cross_origin_isolated_capability());
+    } else if (unload_timing_info.has_value()) {
+        *unload_of_replaced_document = UnloadOfReplacedDocument {
+            .origin = origin(),
+            .cross_origin_isolated_capability = HTML::relevant_settings_object(*this).cross_origin_isolated_capability(),
+            .unload_event_start_time = unload_event_start_shared_time,
+            .unload_event_end_time = HighResolutionTime::unsafe_shared_current_time(),
+        };
     }
 
     // 14. Decrease eventLoop's termination nesting level by 1.
@@ -7272,6 +7210,28 @@ void Document::unload(GC::Ptr<Document> new_document)
     }
 
     did_stop_being_active_document_in_navigable();
+}
+
+// https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document
+void Document::take_unload_timing_of_replaced_document(UnloadOfReplacedDocument const& unload)
+{
+    // 11. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event start time to the current high
+    //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings
+    //     object's cross-origin isolated capability.
+    // 13. If unloadTimingInfo is not null, then set unloadTimingInfo's unload event end time to the current high
+    //     resolution time given newDocument's relevant global object, coarsened given oldDocument's relevant settings
+    //     object's cross-origin isolated capability.
+    auto& global = HTML::relevant_global_object(*this);
+    DocumentUnloadTimingInfo unload_timing_info {
+        .unload_event_start_time = HighResolutionTime::coarsen_time(HighResolutionTime::relative_high_resolution_time(unload.unload_event_start_time, global), unload.cross_origin_isolated_capability),
+        .unload_event_end_time = HighResolutionTime::coarsen_time(HighResolutionTime::relative_high_resolution_time(unload.unload_event_end_time, global), unload.cross_origin_isolated_capability),
+    };
+
+    // 22. If newDocument is given, newDocument's was created via cross-origin redirects is false, and newDocument's
+    //     origin is the same as oldDocument's origin, then set newDocument's previous document unload timing to
+    //     unloadTimingInfo.
+    if (!m_was_created_via_cross_origin_redirects && origin().is_same_origin(unload.origin))
+        set_previous_document_unload_timing(unload_timing_info);
 }
 
 // https://w3c.github.io/webappsec-permissions-policy/#algo-is-feature-enabled
@@ -8074,8 +8034,6 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
     GC::RootVector<GC::Ref<IntersectionObserver::IntersectionObserver>> intersection_observers;
     for (auto& observer : m_intersection_observers)
         intersection_observers.append(observer);
-
-    update_paint_and_hit_testing_properties_if_needed();
 
     GC::RootHashMap<Document*, Compositing::AccumulatedVisualContextTree> observation_visual_context_trees;
     auto sample_time_ns = MonotonicTime::now().nanoseconds();
@@ -8915,7 +8873,7 @@ int Document::compare_elements_in_tree_order_for_composite_order(Element& first,
     auto compares_before_tree_positions = max(minimum_compares_before_tree_positions, m_element_count_at_last_tree_positions_walk / 8);
 
     auto compare_in_tree = [&] {
-        ++style_invalidation_counters().composite_order_document_position_compares;
+        HTML::note_rendering_trace_event("composite order compared by tree position"sv);
         auto position = first.compare_document_position(second);
         if (position & Node::DOCUMENT_POSITION_FOLLOWING)
             return -1;
@@ -9275,9 +9233,9 @@ void Document::service_compositor_animation_wakeup(double timestamp)
     if (reached_wakeup) {
         if (reached_compositor_active_start) {
             Layout::ForcedReadScope read { *this };
-            paint_state().republish_visual_animations(read, *this);
+            paint_state().republish_visual_animations(read);
         }
-        ++m_style_invalidation_counters.animation_frame_pump_requests;
+        HTML::note_rendering_trace_event("animation frame pump request"sv);
         set_rendering_pending(*this, RenderingPendingReason::NeedsRenderingUpdate, 1);
         page().client().request_frame_for(*this);
     }
@@ -9321,7 +9279,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
     };
 
     Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree = paint_state().visual_context_tree(*this);
-    paint_state().begin_compositor_animation_update(*this);
+    paint_state().begin_compositor_animation_update();
     GC::RootHashMap<GC::Ref<Layout::Node>, bool> previous_content_retention;
     GC::RootHashTable<GC::Ref<Layout::Node>> retained_this_pass;
     GC::RootHashTable<GC::Ref<Animations::KeyframeEffect>> previously_compositor_driven_effects;
@@ -10022,13 +9980,13 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
 
     // A descriptor must target the tree it is published with. The selection pass above can force
     // or release animation-only visual context nodes, so redo it after applying those updates.
-    if (m_needs_accumulated_visual_contexts_update) {
-        paint_state().publish_compositor_animations(read, *this, Painting::DocumentPaintState::PublishPendingCompositorAnimations::No);
+    if (Layout::RustFFI::document_host_visual_contexts_need_update(layout_node_arena().host())) {
+        paint_state().publish_compositor_animations(read, Painting::DocumentPaintState::PublishPendingCompositorAnimations::No);
         update_compositor_animations(read);
         return;
     }
 
-    paint_state().publish_compositor_animations(read, *this, Painting::DocumentPaintState::PublishPendingCompositorAnimations::Yes);
+    paint_state().publish_compositor_animations(read, Painting::DocumentPaintState::PublishPendingCompositorAnimations::Yes);
 
     if (compositor_animation_wakeup_delay_ms.has_value())
         schedule_compositor_animation_wakeup(*compositor_animation_wakeup_delay_ms);
@@ -10039,7 +9997,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
     } else {
         if (!m_compositor_animation_observation_timer) {
             m_compositor_animation_observation_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(100), GC::weak_callback(*this, [](auto& document) {
-                ++document.m_style_invalidation_counters.animation_frame_pump_requests;
+                HTML::note_rendering_trace_event("animation frame pump request"sv);
                 set_rendering_pending(document, RenderingPendingReason::NeedsRenderingUpdate, 1);
                 document.page().client().request_frame_for(document);
                 document.m_compositor_animation_observation_timer->start();
@@ -10050,20 +10008,19 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         }
     }
 
-    if (requested_withdrawn_effect_sample) {
-        ++m_style_invalidation_counters.animation_frame_pump_requests;
-    }
+    if (requested_withdrawn_effect_sample)
+        HTML::note_rendering_trace_event("animation frame pump request"sv);
 }
 
 void Document::append_pending_animation_event(Web::DOM::Document::PendingAnimationEvent const& event)
 {
     if (m_style_stabilization_epoch_depth > 0) {
         m_provisional_animation_event_queue.append(event);
-        ++m_style_invalidation_counters.provisional_animation_events;
+        HTML::note_rendering_trace_event("provisional animation events"sv);
         return;
     }
     m_pending_animation_event_queue.append(event);
-    ++m_style_invalidation_counters.committed_animation_events;
+    HTML::note_rendering_trace_event("animation events committed"sv);
 }
 
 void Document::prepare_to_observe_css_animation_events()
@@ -10211,7 +10168,7 @@ void Document::update_animations_and_send_events(double timestamp)
                 }
             }
         }
-        ++m_style_invalidation_counters.animation_frame_pump_requests;
+        HTML::note_rendering_trace_event("animation frame pump request"sv);
         set_rendering_pending(*this, RenderingPendingReason::NeedsRenderingUpdate, 1);
         page().client().request_frame_for(*this);
         break;
@@ -12028,11 +11985,11 @@ void Document::request_frame_for_pending_repaint()
         container->document().request_frame_for_pending_repaint();
 }
 
-void Document::set_needs_accumulated_visual_contexts_update(bool value)
+void Document::set_needs_accumulated_visual_contexts_update()
 {
-    m_needs_accumulated_visual_contexts_update = value;
-    if (value)
-        set_needs_repaint(InvalidateDisplayList::No);
+    if (m_layout_node_arena)
+        Layout::RustFFI::document_host_note_visual_contexts_need_update(m_layout_node_arena->host());
+    set_needs_repaint(InvalidateDisplayList::No);
 }
 
 // A pattern connecting or disconnecting needs no republication of its own here: one that can be named has an id, and
@@ -12073,14 +12030,14 @@ void Document::note_svg_paint_resources_changed()
     if (!m_layout_node_arena)
         return;
     if (Layout::RustFFI::render_state_note_svg_paint_resources_changed(m_layout_node_arena->host()))
-        set_needs_accumulated_visual_contexts_update(true);
+        set_needs_accumulated_visual_contexts_update();
 }
 
 void Document::schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope scope)
 {
     if (m_layout_node_arena)
         Layout::RustFFI::render_state_visual_context_request_full_rebuild(m_layout_node_arena->host(), scope);
-    set_needs_accumulated_visual_contexts_update(true);
+    set_needs_accumulated_visual_contexts_update();
 }
 
 void Document::schedule_accumulated_visual_context_update(Layout::Node const& layout_node, AccumulatedVisualContextUpdateScope scope)
@@ -12100,7 +12057,7 @@ void Document::schedule_accumulated_visual_context_update(Layout::Node const& la
         && Painting::display(layout_node).is_table_inside() && Painting::has_committed_box(*wrapper))
         note_style_change(*wrapper);
 
-    set_needs_accumulated_visual_contexts_update(true);
+    set_needs_accumulated_visual_contexts_update();
 }
 
 void Document::schedule_accumulated_visual_context_update(Layout::BegunRead const& read, Element& element, AccumulatedVisualContextUpdateScope scope)
@@ -12213,7 +12170,8 @@ Painting::DisplayListRecording Document::commit_display_list_recording(Layout::B
 
 Optional<Painting::DisplayListRecording> Document::start_recording(Layout::BegunRead const& read, HTML::PaintConfig config, Painting::PaintCommandCacheMode cache_mode, Optional<Compositor::FlightPresentation>&& committed)
 {
-    update_paint_and_hit_testing_properties_if_needed();
+    update_highlight_states_if_needed(read);
+    Painting::publish_image_map_area_facts_if_needed(read, *this);
     VERIFY(has_committed_viewport_box());
 
     bool const line_box_border_overlays_replace_cacheable_content = config.should_show_line_box_borders;
@@ -12283,10 +12241,12 @@ Painting::HitTestListAdoption Document::adopt_published_recording(Optional<Layou
 
 bool Document::hit_test_display_list_is_current(Layout::BegunRead const& read)
 {
-    update_paint_and_hit_testing_properties_if_needed();
+    Painting::publish_image_map_area_facts_if_needed(read, *this);
     if (!has_committed_viewport_box())
         return false;
-    return m_hit_test_display_list && m_hit_test_display_list->is_current() && m_hit_test_display_list->visual_context_tree_structural_epoch() == paint_state().visual_context_tree_structural_epoch_without_update(read);
+    // Reading the epoch prepares the paint properties, which can drop the hit-test list.
+    auto structural_epoch = paint_state().visual_context_tree_structural_epoch(read);
+    return m_hit_test_display_list && m_hit_test_display_list->is_current() && m_hit_test_display_list->visual_context_tree_structural_epoch() == structural_epoch;
 }
 
 void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
@@ -12302,8 +12262,6 @@ void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
 
 Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunRead const& read, Optional<i64> visual_animation_sample_time_nanoseconds)
 {
-    update_paint_and_hit_testing_properties_if_needed();
-
     if (!has_committed_viewport_box())
         return {};
 
@@ -12791,8 +12749,6 @@ Utf16String Document::dump_stacking_context_tree()
     if (!has_committed_viewport_box())
         return "No paintable"_utf16;
 
-    update_paint_and_hit_testing_properties_if_needed();
-
     StringBuilder builder;
     Painting::dump_stacking_context_tree(read, builder, *this);
     if (builder.is_empty())
@@ -12925,7 +12881,7 @@ void Document::build_registered_properties_cache()
         return;
     m_needs_registered_properties_cache_update = false;
 
-    ++m_style_invalidation_counters.registered_properties_cache_rebuilds;
+    HTML::note_rendering_trace_event("registered properties cache rebuilt"sv);
 
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration> cached_registered_properties_from_css_property_rules;
     for_each_active_css_style_sheet([&](CSS::StyleSheetState const& style_sheet) {

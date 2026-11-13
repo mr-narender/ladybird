@@ -165,13 +165,9 @@ fn bytecode_field_type_matches(field: &crate::metadata::Field, parameter_type: &
     match field.ty.as_str() {
         "bool" => *parameter_type == Type::Bool || *parameter_type == Type::U8,
         "u8" => *parameter_type == Type::U8,
+        "u16" => *parameter_type == Type::U16,
         "u32"
-        | "Completion::Type"
-        | "IteratorHint"
-        | "EnvironmentMode"
         | "EnvironmentShapeCacheIndex"
-        | "ArgumentsKind"
-        | "FunctionNamePrefix"
         | "IdentifierTableIndex"
         | "ObjectPropertyIteratorCacheIndex"
         | "ObjectShapeCacheIndex"
@@ -179,9 +175,7 @@ fn bytecode_field_type_matches(field: &crate::metadata::Field, parameter_type: &
         | "StringTableIndex"
         | "TemplateObjectCacheIndex"
         | "Optional<IdentifierTableIndex>"
-        | "Optional<StringTableIndex>"
-        | "Optional<DebugIdentifierIndex>"
-        | "Optional<DebugStringIndex>" => *parameter_type == Type::U32,
+        | "Optional<StringTableIndex>" => *parameter_type == Type::U32,
         "ArithFeedbackIndex" => *parameter_type == Type::ArithFeedbackIndex,
         "ValueFeedbackIndex" => *parameter_type == Type::ValueFeedbackIndex,
         "CallFeedbackIndex" => *parameter_type == Type::CallFeedbackIndex,
@@ -194,7 +188,9 @@ fn bytecode_field_type_matches(field: &crate::metadata::Field, parameter_type: &
         "EnvironmentCoordinateCacheIndex" => *parameter_type == Type::EnvironmentCoordinateCacheIndex,
         "GlobalVariableCacheIndex" => *parameter_type == Type::GlobalVariableCacheIndex,
         "PropertyLookupCacheIndex" => *parameter_type == Type::PropertyLookupCacheIndex,
-        "PutKind" => *parameter_type == Type::U8,
+        "ProfiledPropertyLookupCacheIndex" => *parameter_type == Type::ProfiledPropertyLookupCacheIndex,
+        "Completion::Type" | "IteratorHint" | "EnvironmentMode" | "PutKind" | "ArgumentsKind"
+        | "FunctionNamePrefix" => *parameter_type == Type::U8,
         _ => false,
     }
 }

@@ -73,6 +73,8 @@ public:
     virtual void placeholder_canvas_committed(Compositing::CanvasId, Gfx::IntSize, bool origin_clean) = 0;
     // The owner of this client's canvases, which are the only ones its contexts may draw.
     virtual Compositing::CanvasSurfaceOwnerId canvas_surface_owner_id() const = 0;
+    virtual void ask_to_paint_contexts_for_screenshot(u64 preparation_id, Vector<Web::CompositorContextId> const&) = 0;
+    virtual void tell_remote_descendants_prepared_for_screenshot(u64 request_id) = 0;
 };
 
 class CompositorState final
@@ -147,6 +149,7 @@ public:
     void set_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
     void set_context_visibility(Web::CompositorContextId, Compositing::ContextVisibility);
     void set_context_presents_from_cpu_memory(Web::CompositorContextId, bool);
+    void set_window_server_may_show_high_dynamic_range(bool);
     void present_frame(Web::CompositorContextId, Gfx::IntRect viewport_rect);
     // Delivers the rendering opportunity a context requested now rather than at the next display tick: a
     // viewport change that arrived while an animation's opportunity was outstanding starts its update at once.
@@ -154,6 +157,10 @@ public:
     // Asks for the next display tick the context's maximum rate lets through, for its render clock.
     void request_clock_tick(Web::CompositorContextId, double maximum_frames_per_second);
     bool request_screenshot(Web::CompositorContextId, Gfx::ShareableBitmap&);
+    // Has each process that owns a descendant of the context in another process paint it, along with whatever lies below
+    // it, and tells the requester once every one of them has handed over its frames, or gone away.
+    void prepare_remote_descendants_for_screenshot(CompositorStateWebContentClient& requester, Web::CompositorContextId, u64 request_id);
+    void did_paint_contexts_for_screenshot(CompositorStateWebContentClient& painter, u64 preparation_id);
     Optional<Gfx::ShareableBitmap> take_frame_snapshot(Web::CompositorContextId, Optional<Gfx::IntSize> maximum_size);
     void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
     void set_client_gpu_presentation_capability(CompositorStateClient&, bool supported, u64 adapter_luid);
@@ -246,6 +253,9 @@ private:
         // A frame that started rendering before its context was bound has no published buffer to present to.
         bool publish_to_presentation { true };
         bool shows_in_remote_layer { false };
+        // A frame that changes only what the window server shows above the frame on screen.
+        bool keeps_shown_store { false };
+        Vector<RemoteSublayer> sublayers;
     };
 
 public:
@@ -302,7 +312,7 @@ private:
     void unbind_presentation(Web::CompositorContextId);
     void stop_showing_context_in_remote_layer(Web::CompositorContextId, PresentedContext&);
     void stop_delivering_in_flight_frames_to_their_viewer(Web::CompositorContextId);
-    void show_frame_in_remote_layer(Web::CompositorContextId, PresentedContext&, PendingAsyncPresent const&);
+    void show_frame_in_remote_layer(Web::CompositorContextId, PresentedContext&, PendingAsyncPresent&);
     void update_scroll_capabilities();
     void did_finish_async_present(PendingAsyncPresent&);
     void deliver_rendered_frame(PendingAsyncPresent&);
@@ -311,6 +321,18 @@ private:
     void check_gpu_completions();
 
     HashMap<Web::CompositorContextId, NonnullOwnPtr<PresentedContext>> m_presented_contexts;
+
+    // A screenshot whose context has descendants in other processes, which waits for those processes to paint them.
+    struct ScreenshotPreparation {
+        WebContentClientId requester;
+        u64 request_id { 0 };
+        HashTable<WebContentClientId> awaited_painters;
+        RefPtr<Core::Timer> deadline;
+    };
+    void finish_screenshot_preparation_if_done(u64 preparation_id);
+    void finish_screenshot_preparation(u64 preparation_id);
+    HashMap<u64, ScreenshotPreparation> m_screenshot_preparations;
+    u64 m_next_screenshot_preparation_id { 1 };
     u64 m_next_web_content_client_id { 1 };
     HashMap<WebContentClientId, CompositorStateWebContentClient*> m_web_content_clients;
     HashMap<Web::CompositorContextId, HashMap<ContextTimer, NonnullRefPtr<Core::Timer>>> m_context_timers;
@@ -346,6 +368,7 @@ private:
     void release_synchronized_resize_hold();
     Vector<SynchronizedResize> m_synchronized_resizes;
     bool m_remote_layer_changes_are_held { false };
+    bool m_window_server_may_show_high_dynamic_range { true };
     RefPtr<Core::Timer> m_synchronized_resize_hold_timeout;
     HashMap<u64, RemoteLayerState> m_remote_layers;
 
@@ -375,6 +398,7 @@ private:
     struct PlaceholderCanvas {
         CompositorStateWebContentClient* owner { nullptr };
         u64 secret { 0 };
+        PresentableSurfacePool presented_surfaces;
         RefPtr<Gfx::PaintingSurface> surface;
         Optional<Gfx::IntSize> size;
         bool origin_clean { true };

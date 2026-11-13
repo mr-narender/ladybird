@@ -4,12 +4,46 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::display_list::commands::{DisplayListCommandType, EffectNodeIndex, ReplayClip, ReplayLayer, ReplayMask};
-use crate::display_list::replay::ReplayPainter;
+use crate::display_list::commands::{
+    ClipMode, DisplayListCommandType, EffectNodeIndex, ReplayClip, ReplayLayer, ReplayMask,
+};
+use crate::display_list::replay::{ReplayPainter, ReplaySelection};
 use libgfx_rust::path::Path;
 use libgfx_rust::path::ffi::PathGeometryData;
 use libgfx_rust::{AffineTransform, FloatMatrix4x4, FloatVector3, IntRect, WindingRule};
 use std::ffi::c_void;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct RecordSpan {
+    pub begin_offset: u32,
+    pub end_offset: u32,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiReplaySelection {
+    pub record_spans: *const RecordSpan,
+    pub record_span_count: usize,
+    pub replays_only_record_spans: bool,
+    pub skip_root_isolation_layer: bool,
+}
+
+impl FfiReplaySelection {
+    /// # Safety
+    ///
+    /// When the selection replays only record spans, `record_spans` must point at `record_span_count` spans that stay
+    /// live for the returned lifetime.
+    pub unsafe fn as_selection<'a>(&self) -> ReplaySelection<'a> {
+        ReplaySelection {
+            // SAFETY: The caller guarantees the spans are live.
+            record_spans: self
+                .replays_only_record_spans
+                .then(|| unsafe { ak::slice_from_raw_parts(self.record_spans, self.record_span_count) }),
+            skip_root_isolation_layer: self.skip_root_isolation_layer,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -28,7 +62,7 @@ pub struct FfiDisplayListReplayCallbacks {
     pub pop: unsafe extern "C" fn(*mut c_void),
     pub push_device_space_plane_clip: unsafe extern "C" fn(*mut c_void, *const FloatVector3, usize),
     pub push_transform: unsafe extern "C" fn(*mut c_void, *const AffineTransform),
-    pub push_clip_path_bytes: unsafe extern "C" fn(*mut c_void, *const u8, usize, WindingRule),
+    pub push_clip_path_bytes: unsafe extern "C" fn(*mut c_void, *const u8, usize, WindingRule, ClipMode),
     // Arguments: the command type, the command struct, and the payload its spans point into, with its size.
     pub play_command: unsafe extern "C" fn(*mut c_void, DisplayListCommandType, *const u8, *const u8, usize),
 }
@@ -92,9 +126,9 @@ impl ReplayPainter for FfiDisplayListReplayCallbacks {
         unsafe { (self.push_transform)(self.context, transform) };
     }
 
-    fn push_clip_path_bytes(&mut self, path_bytes: &[u8], winding_rule: WindingRule) {
+    fn push_clip_path_bytes(&mut self, path_bytes: &[u8], winding_rule: WindingRule, mode: ClipMode) {
         // SAFETY: The C++ painter reads the serialized path synchronously.
-        unsafe { (self.push_clip_path_bytes)(self.context, path_bytes.as_ptr(), path_bytes.len(), winding_rule) };
+        unsafe { (self.push_clip_path_bytes)(self.context, path_bytes.as_ptr(), path_bytes.len(), winding_rule, mode) };
     }
 
     fn play_command(&mut self, command_type: DisplayListCommandType, command: &[u8], payload: &[u8]) {

@@ -86,13 +86,11 @@ fn values_live_across_calls_are_spilled_at_their_definition() {
         vec![
             Instruction::Mov { dst: r(6), src: a(0) },
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(7),
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                expression_string: None,
                 arguments: vec![r(6)],
             },
             Instruction::Return { value: r(6) },
@@ -404,13 +402,11 @@ fn loops_leave_the_values_they_only_carry_through_in_their_stack_slots() {
             xor(4, r(9), r(8), argument),
             xor(14, r(11), r(9), argument),
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(14),
                 callee: r(15),
                 this_value: r(15),
                 argument_count: 0,
-                expression_string: None,
                 arguments: vec![],
             },
             xor(5, r(10), r(5), r(6)),
@@ -578,13 +574,11 @@ fn the_verifier_finds_values_in_the_wrong_place() {
         vec![
             Instruction::Mov { dst: r(6), src: a(0) },
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(7),
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                expression_string: None,
                 arguments: vec![r(6)],
             },
             Instruction::Return { value: r(6) },
@@ -692,11 +686,9 @@ impl ProgramGenerator {
             let cache = u32::try_from(self.random.below(2)).unwrap();
             return if self.random.chance(60) {
                 Instruction::GetById {
-                    value_feedback: 0,
                     dst: self.writable(),
                     base: self.object_operand(),
                     property: crate::bytecode::PropertyKeyTableIndex(0),
-                    base_identifier: None,
                     cache,
                 }
             } else {
@@ -706,7 +698,6 @@ impl ProgramGenerator {
                     src: self.readable(),
                     kind: 0,
                     cache: 2 + cache,
-                    base_identifier: None,
                 }
             };
         }
@@ -741,13 +732,11 @@ impl ProgramGenerator {
             11 => {
                 let argument_count = self.random.below(3);
                 Instruction::Call {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: self.writable(),
                     callee: self.readable(),
                     this_value: self.readable(),
                     argument_count: u32::try_from(argument_count).unwrap(),
-                    expression_string: None,
                     arguments: (0..argument_count).map(|_| self.readable()).collect(),
                 }
             }
@@ -989,13 +978,11 @@ fn float64_values_get_floating_point_registers() {
         vec![
             Instruction::Enter,
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(5),
                 callee: r(6),
                 this_value: r(7),
                 argument_count: 1,
-                expression_string: None,
                 arguments: vec![a(0)],
             },
             Instruction::Return { value: r(5) },

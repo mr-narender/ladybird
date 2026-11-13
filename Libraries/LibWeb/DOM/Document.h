@@ -296,6 +296,14 @@ struct DocumentUnloadTimingInfo {
     HighResolutionTime::DOMHighResTimeStamp unload_event_end_time { 0 };
 };
 
+// The times are unsafe shared current times, as the document they are relative to is created after the unload.
+struct UnloadOfReplacedDocument {
+    URL::Origin origin;
+    HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability { HTML::CanUseCrossOriginIsolatedAPIs::No };
+    HighResolutionTime::DOMHighResTimeStamp unload_event_start_time { 0 };
+    HighResolutionTime::DOMHighResTimeStamp unload_event_end_time { 0 };
+};
+
 using PolicyControlledFeature = PermissionsPolicy::PolicyControlledFeature;
 
 struct PendingFullscreenEvent {
@@ -350,7 +358,7 @@ public:
     // a counter style arriving, or another untracked environment input changing. A record taken under one version
     // answers for nothing once it moves.
     u64 style_environment_version() const { return m_style_environment_version; }
-    void bump_style_environment_version() { ++m_style_environment_version; }
+    void bump_style_environment_version();
     u64 next_counter_style_environment_identity()
     {
         auto identity = m_next_counter_style_environment_identity++;
@@ -641,13 +649,9 @@ public:
     void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void update_style_and_layout_once(Layout::BegunRead const&, UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
-    [[nodiscard]] u64 partial_layout_count() const;
-    [[nodiscard]] u64 full_layout_count() const;
     [[nodiscard]] bool layout_is_up_to_date() const;
     [[nodiscard]] bool layout_is_known_stale() const;
     void clear_devtools_layout_inspection_data();
-    void prepare_for_rendering(Layout::BegunRead const& read);
-    void update_paint_and_hit_testing_properties_if_needed();
     void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
     bool needs_animated_style_update() const { return m_needs_animated_style_update; }
@@ -662,8 +666,8 @@ public:
     [[nodiscard]] bool is_running_update_layout() const;
 
     // The selection changed, or lost its range, so the selection states of the boxes it paints through are stale. They
-    // are found again at the next read of the paint state: the selection may change beside a frame in flight, which
-    // holds the boxes.
+    // are found again before the next recording: the selection may change beside a frame in flight, which holds the
+    // boxes.
     void note_selection_changed();
     // Writes the selection and find-in-page match states left stale to the paint state.
     void update_highlight_states_if_needed(Layout::BegunRead const&);
@@ -1205,7 +1209,6 @@ public:
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
     void destroy();
-    void destroy_if_dropped_before_activation();
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document-and-its-descendants
     void destroy_a_document_and_its_descendants(GC::Ptr<GC::Function<void()>> after_all_destruction = {});
 
@@ -1215,7 +1218,9 @@ public:
     void abort_a_document_and_its_descendants();
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document
-    void unload(GC::Ptr<Document> new_document = nullptr);
+    void unload(GC::Ptr<Document> new_document = nullptr, Optional<UnloadOfReplacedDocument>* unload_of_replaced_document = nullptr);
+    void take_unload_timing_of_replaced_document(UnloadOfReplacedDocument const&);
+    void set_window_is_taken_over_after_unload() { m_window_is_taken_over_after_unload = true; }
 
     // https://html.spec.whatwg.org/multipage/dom.html#active-parser
     GC::Ptr<HTML::HTMLParser> active_parser() const;
@@ -1468,43 +1473,16 @@ public:
 
     void set_needs_animated_style_update(Animations::KeyframeEffect&);
 
-    // Test-only counters for observing style invalidation and recomputation work. See Internals.idl.
-    struct StyleInvalidationCounters {
+    // What the style updates of the document measured, for the style update capture tools, and how often a style
+    // update stopped at its pass guard.
+    struct StyleUpdateStatistics {
         // A run consumes one non-empty semantic reaction batch. The element count includes derived
         // inheritance reactions; the published count names reactions emitted at the transaction
         // boundary before that propagation.
         u64 style_engine_reaction_batch_runs { 0 };
         u64 style_engine_reaction_elements { 0 };
         u64 style_engine_published_reactions { 0 };
-        u64 layout_style_record_publications { 0 };
-        // Animation frames that rebuilt only the groups the animated properties write, against
-        // frames that had to rebuild the whole style.
-        u64 animation_frame_pump_requests { 0 };
-        u64 animation_style_skip_cache_hits { 0 };
-        u64 animation_style_skip_cache_misses { 0 };
-        u64 animation_timeline_synchronizations { 0 };
-        u64 animation_timeline_associated_animation_updates { 0 };
-        u64 compositor_visual_animation_updates { 0 };
-        u64 compositor_visual_animation_timing_anchor_updates { 0 };
-        u64 compositor_keyframe_value_resolutions { 0 };
-        u64 style_stabilization_epochs { 0 };
-        u64 style_stabilization_feedback_epochs { 0 };
-        u64 provisional_style_passes { 0 };
-        u64 style_stabilization_round_guard_hits { 0 };
         u64 style_update_pass_guard_hits { 0 };
-        // What sorting animations in tree order asked of the tree itself, rather than of the document's tree positions.
-        u64 composite_order_document_position_compares { 0 };
-        u64 exact_stabilization_passes { 0 };
-        u64 style_stabilization_bound_failures { 0 };
-        u64 provisional_animation_events { 0 };
-        u64 committed_animation_events { 0 };
-        u64 provisional_transition_decisions { 0 };
-        u64 superseded_provisional_transition_decisions { 0 };
-        u64 committed_transition_actions { 0 };
-        u64 committed_transitions_started { 0 };
-        u64 media_rule_evaluations { 0 };
-        u64 registered_properties_cache_rebuilds { 0 };
-        u64 style_query_container_scans { 0 };
         u64 style_engine_transaction_setups { 0 };
         u64 style_engine_transaction_setup_microseconds { 0 };
         // Exclusive intervals within style_update_microseconds. Rust phases subdivide bridge.
@@ -1512,21 +1490,15 @@ public:
         u64 style_update_bridge_microseconds { 0 };
         u64 style_update_apply_microseconds { 0 };
         u64 style_update_remainder_microseconds { 0 };
-        u64 relayouts_performed { 0 };
         u64 style_update_microseconds { 0 };
     };
-    StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
-    void reset_style_invalidation_counters(Layout::BegunRead const& read) const;
-
-    // Confinement report of the most recent layout tree build, for tests observing whether a
-    // partial rebuild stayed inside its rebuilt subtrees.
-    [[nodiscard]] Layout::RustFFI::FfiLayoutCounts layout_counts() const;
+    StyleUpdateStatistics& style_update_statistics() const { return m_style_update_statistics; }
 
     enum class AccumulatedVisualContextUpdateScope : u8 {
         Values,
         Structure,
     };
-    void set_needs_accumulated_visual_contexts_update(bool);
+    void set_needs_accumulated_visual_contexts_update();
     void set_image_map_areas_need_publication() { m_image_map_areas_need_publication = true; }
     [[nodiscard]] bool take_image_map_areas_need_publication() { return exchange(m_image_map_areas_need_publication, false); }
     void note_svg_paint_resources_changed();
@@ -1949,6 +1921,7 @@ private:
     void collect_boxes_with_auto_content_visibility(Layout::BegunRead const& read);
     bool needs_style_update_after_layout(Layout::BegunRead const& read);
     Layout::RustFFI::FfiLayoutUpdateHostCallbacks layout_update_host_callbacks();
+    Layout::RustFFI::FfiPaintPreparationHostCallbacks paint_preparation_host_callbacks();
 
     void process_pending_list_item_renumbers();
     bool reconcile_stale_list_item_counters_after_tree_build(ReadonlySpan<Layout::RustFFI::FfiNodeIdentity> rebuilt_roots);
@@ -2194,6 +2167,8 @@ private:
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#concept-document-salvageable
     bool m_salvageable { true };
+
+    bool m_window_is_taken_over_after_unload { false };
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#page-showing
     bool m_page_showing { false };
@@ -2482,7 +2457,6 @@ private:
 
     bool m_design_mode_enabled { false };
 
-    bool m_needs_accumulated_visual_contexts_update { false };
     bool m_image_map_areas_need_publication { false };
 
     HashMap<Web::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
@@ -2506,7 +2480,7 @@ private:
     // the next recording. Rotated only by cache-read-write recordings; survives display list invalidation.
     Optional<CSSPixelRect> m_caret_hit_test_debug_rect;
 
-    mutable StyleInvalidationCounters m_style_invalidation_counters;
+    mutable StyleUpdateStatistics m_style_update_statistics;
 
     mutable GC::Ptr<WebIDL::ObservableArray> m_adopted_style_sheets;
 

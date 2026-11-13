@@ -672,6 +672,7 @@ fn try_field_type_info(ty: &str) -> Option<FieldType> {
         match ty {
             "bool" => ("bool", 1, "bool"),
             "u8" => ("u32", 1, "byte_count"),
+            "u16" => ("u16", 2, "u16"),
             "i32" => ("i32", 4, "i32"),
             "u32" => ("u32", 4, "u32"),
             "u64" => ("u64", 8, "u64"),
@@ -679,24 +680,17 @@ fn try_field_type_info(ty: &str) -> Option<FieldType> {
             "Optional<Operand>" => ("Option<Operand>", OPERAND_SIZE, "optional_operand"),
             "Label" => ("Label", 4, "label"),
             "Optional<Label>" => ("Option<Label>", 5, "optional_label"),
-            "IdentifierTableIndex" => ("IdentifierTableIndex", 3, "u32_newtype"),
-            "Optional<IdentifierTableIndex>" => ("Option<IdentifierTableIndex>", 3, "optional_u32_newtype"),
-            "PropertyKeyTableIndex" => ("PropertyKeyTableIndex", 3, "u32_newtype"),
-            "StringTableIndex" => ("StringTableIndex", 3, "u32_newtype"),
-            "Optional<StringTableIndex>" => ("Option<StringTableIndex>", 3, "optional_u32_newtype"),
-            // NB: These only make error messages better, so a site past 65534 names can go without.
-            "Optional<DebugIdentifierIndex>" => ("Option<IdentifierTableIndex>", 2, "optional_debug_name"),
-            "Optional<DebugStringIndex>" => ("Option<StringTableIndex>", 2, "optional_debug_name"),
-            "EnvironmentCoordinate" => ("EnvironmentCoordinate", 8, "env_coord"),
-            "Builtin" => ("u8", 1, "u8"),
-            "Completion::Type" => ("u32", 4, "u32"),
-            "IteratorHint" => ("u32", 4, "u32"),
-            "EnvironmentMode" => ("u32", 4, "u32"),
-            "PutKind" => ("u32", 4, "u32"),
-            "ArgumentsKind" => ("u32", 4, "u32"),
-            "FunctionNamePrefix" => ("u32", 4, "u32"),
+            "IdentifierTableIndex" => ("IdentifierTableIndex", 2, "u32_newtype"),
+            "Optional<IdentifierTableIndex>" => ("Option<IdentifierTableIndex>", 2, "optional_u32_newtype"),
+            "PropertyKeyTableIndex" => ("PropertyKeyTableIndex", 2, "u32_newtype"),
+            "StringTableIndex" => ("StringTableIndex", 2, "u32_newtype"),
+            "Optional<StringTableIndex>" => ("Option<StringTableIndex>", 2, "optional_u32_newtype"),
+            "EnvironmentCoordinate" => ("EnvironmentCoordinate", 3, "env_coord"),
+            "Builtin" | "Completion::Type" | "IteratorHint" | "EnvironmentMode" | "PutKind" | "ArgumentsKind"
+            | "FunctionNamePrefix" => ("u8", 1, "u8"),
             "Value" => ("u64", 8, "u64"),
             "PropertyLookupCacheIndex"
+            | "ProfiledPropertyLookupCacheIndex"
             | "GlobalVariableCacheIndex"
             | "EnvironmentCoordinateCacheIndex"
             | "ObjectShapeCacheIndex" => ("u32", 2, "cache_index"),

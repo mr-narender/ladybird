@@ -653,7 +653,8 @@ static constexpr int FIELD_PANEL_WINDOW_MARGIN = 8;
 // A line inset this far from the surface's sides sets the suggestions apart from the field, and the list has this much
 // room around it.
 static constexpr int FIELD_PANEL_DIVIDER_INSET = 8;
-static constexpr int FIELD_PANEL_LIST_PADDING = 6;
+static constexpr int FIELD_PANEL_LIST_VERTICAL_PADDING = 6;
+static constexpr int FIELD_PANEL_LIST_HORIZONTAL_PADDING = 3;
 
 // The address field floats over its place in the toolbar, in a panel that is a native child of the window wherever the
 // page stays native under it. So the panel stacks above the native views of the sidebar and the page, and can grow over
@@ -751,6 +752,11 @@ private:
 
 // NB: Window controls run to the window's edge. Without them, the address field ends the toolbar, and the room for its
 //     focus ring takes the place of some of the toolbar's margin.
+static int toolbar_left_margin(bool has_custom_window_controls)
+{
+    return has_custom_window_controls && window_controls_on_left() ? 0 : TOOLBAR_HORIZONTAL_MARGIN;
+}
+
 static constexpr int toolbar_right_margin(bool has_custom_window_controls)
 {
     return has_custom_window_controls ? 0 : TOOLBAR_HORIZONTAL_MARGIN - TOOLBAR_LOCATION_FOCUS_RING_ROOM;
@@ -1351,8 +1357,11 @@ void WindowToolbar::lay_out_as_row()
     toolbar_layout->setSpacing(TOOLBAR_SPACING);
     toolbar_layout->setContentsMargins(TOOLBAR_HORIZONTAL_MARGIN, 0, toolbar_right_margin(false), 0);
 
-    if constexpr (use_native_macos_window_controls())
+    if (window_controls_on_left()) {
         toolbar_layout->addWidget(m_window_controls, 0, Qt::AlignVCenter);
+        if constexpr (!use_native_macos_window_controls())
+            toolbar_layout->addWidget(m_window_controls_separator, 0, Qt::AlignVCenter);
+    }
     toolbar_layout->addWidget(m_sidebar_slot, 0, Qt::AlignVCenter);
     toolbar_layout->addWidget(m_navigation_buttons, 0, Qt::AlignVCenter);
     m_navigation_buttons->show();
@@ -1360,7 +1369,7 @@ void WindowToolbar::lay_out_as_row()
     toolbar_layout->addWidget(m_downloads_button, 0, Qt::AlignVCenter);
     if (m_feedback_button)
         toolbar_layout->addWidget(m_feedback_button, 0, Qt::AlignVCenter);
-    if constexpr (!use_native_macos_window_controls()) {
+    if (!window_controls_on_left()) {
         toolbar_layout->addWidget(m_window_controls_separator, 0, Qt::AlignVCenter);
         toolbar_layout->addWidget(m_window_controls, 0, Qt::AlignVCenter);
     }
@@ -1441,8 +1450,9 @@ void WindowToolbar::create_field_panel()
     // The suggestions are below the line under the field.
     m_suggestions_area = new QWidget(m_field_panel);
     auto* suggestions_layout = new QVBoxLayout(m_suggestions_area);
-    auto padding = FIELD_PANEL_LIST_PADDING;
-    suggestions_layout->setContentsMargins(padding, 1 + padding, padding, padding);
+    auto vertical_padding = FIELD_PANEL_LIST_VERTICAL_PADDING;
+    auto horizontal_padding = FIELD_PANEL_LIST_HORIZONTAL_PADDING;
+    suggestions_layout->setContentsMargins(horizontal_padding, 1 + vertical_padding, horizontal_padding, vertical_padding);
     suggestions_layout->setSpacing(0);
     panel_layout->addWidget(m_suggestions_area);
     m_suggestions_area->hide();
@@ -1471,6 +1481,10 @@ void WindowToolbar::raise_field_panel()
         QEvent z_order_change(QEvent::ZOrderChange);
         QCoreApplication::sendEvent(m_field_panel, &z_order_change);
     }
+
+#if defined(AK_OS_MACOS)
+    ensure_appkit_window_is_exposed(*m_field_panel);
+#endif
 }
 
 void WindowToolbar::update_field_panel()
@@ -1791,7 +1805,8 @@ void WindowToolbar::set_window_controls_visible(bool visible)
     m_window_controls_separator->setVisible(has_custom_window_controls);
     m_window_controls->setVisible(has_native_window_controls || has_custom_window_controls);
     m_toolbar->setFixedHeight(toolbar_height(visible));
-    m_toolbar->layout()->setContentsMargins(TOOLBAR_HORIZONTAL_MARGIN, 0, toolbar_right_margin(has_custom_window_controls), 0);
+    auto on_left = window_controls_on_left();
+    m_toolbar->layout()->setContentsMargins(toolbar_left_margin(has_custom_window_controls), 0, toolbar_right_margin(has_custom_window_controls && !on_left), 0);
     m_toolbar->layout()->invalidate();
 }
 
@@ -1801,8 +1816,11 @@ int WindowToolbar::lead_beside_collapsed_sidebar(QWidget const& ladybird_buttons
 {
     auto toolbar_spacing = m_toolbar->layout()->spacing();
     auto lead = 0;
-    if constexpr (use_native_macos_window_controls())
+    if (window_controls_on_left() && !m_window_controls->isHidden()) {
         lead += m_window_controls->width() + toolbar_spacing;
+        if constexpr (!use_native_macos_window_controls())
+            lead += m_window_controls_separator->width() + toolbar_spacing;
+    }
 
     auto slot_width = m_sidebar_slot->layout()->sizeHint().width();
     auto slot_spacing = m_sidebar_slot->layout()->spacing();
@@ -1818,10 +1836,12 @@ void WindowToolbar::set_leading_room(int room)
 {
     if (m_arrangement == ToolbarArrangement::Sidebar)
         return;
+    auto has_custom_window_controls = !use_native_macos_window_controls() && m_window_controls_visible;
+    auto left_margin = toolbar_left_margin(has_custom_window_controls) + room;
     auto margins = m_toolbar->layout()->contentsMargins();
-    if (margins.left() == TOOLBAR_HORIZONTAL_MARGIN + room)
+    if (margins.left() == left_margin)
         return;
-    margins.setLeft(TOOLBAR_HORIZONTAL_MARGIN + room);
+    margins.setLeft(left_margin);
     m_toolbar->layout()->setContentsMargins(margins);
     // NB: The toolbar moves along with the sidebar's edge at once, so its contents must too, or they lag a frame behind.
     m_toolbar->layout()->activate();

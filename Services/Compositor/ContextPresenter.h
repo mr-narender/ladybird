@@ -17,10 +17,13 @@
 #include <Compositor/CanvasSurfaceRegistry.h>
 #include <Compositor/CompositedContext.h>
 #include <Compositor/CompositorCoreHost.h>
+#include <Compositor/ContextLayers.h>
 #include <Compositor/DisplayListRasterCache.h>
 #include <Compositor/Forward.h>
 #include <Compositor/FrameInputs.h>
 #include <Compositor/PaintingSurface.h>
+#include <Compositor/PresentableSurface.h>
+#include <Compositor/RemoteLayer.h>
 #include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
@@ -43,10 +46,13 @@ class SkiaBackendContext;
 namespace Compositor {
 
 struct PreparedFrame {
+    // Null for a frame that changes only what the window server shows above the frame.
     Gfx::PaintingSurface* rendered_surface { nullptr };
     i32 bitmap_id { 0 };
     Gfx::IntRect damage_rect;
     double device_pixel_ratio { 1.0 };
+    // What the window server shows above the frame, bottom to top.
+    Vector<RemoteSublayer> sublayers;
 };
 
 // Rasterizes the scene of a context into its backing stores and keeps track of the frames it presents.
@@ -66,6 +72,13 @@ public:
 
     bool presents_to_client() const { return m_presents_to_client; }
     void stop_presenting_to_client() { m_presents_to_client = false; }
+
+    // Whether the window server may show the canvases and videos of the frames above them, instead of the frames
+    // holding them.
+    void set_window_server_may_show_media(bool may_show_media) { m_window_server_may_show_media = may_show_media; }
+    // Otherwise, the frame draws HDR content tone-mapped to SDR.
+    void set_window_server_may_show_high_dynamic_range(bool may_show) { m_window_server_may_show_high_dynamic_range = may_show; }
+    void did_deliver_frame_without_store() { m_frame_without_store_in_flight = false; }
 
     Gfx::IntSize viewport_size() const { return m_viewport_size; }
     double device_pixel_ratio() const { return m_device_pixel_ratio; }
@@ -114,7 +127,7 @@ public:
     bool present_synchronously(DisplayListPlayerSkia&, Optional<FrameInputs>&&, CompositedContextResolver const*);
     void paint_screenshot(DisplayListPlayerSkia&, Gfx::ShareableBitmap&, FrameInputs const&, CompositedContextResolver const*);
     // The frame on screen, read back from the store that holds it, and scaled down to fit within the size given.
-    Optional<Gfx::ShareableBitmap> snapshot_of_presented_frame(Optional<Gfx::IntSize> maximum_size) const;
+    Optional<Gfx::ShareableBitmap> snapshot_of_presented_frame(DisplayListPlayerSkia&, Optional<Gfx::IntSize> maximum_size);
 
 private:
     struct RasterizedFrame {
@@ -131,17 +144,76 @@ private:
         Yes,
     };
 
+    struct LiveContentChangesSinceLastRaster {
+        Vector<Compositing::CanvasId> canvases;
+        Vector<Compositing::VideoSinkResourceId> video_sinks;
+        Vector<Compositing::ImageFrameResourceId> image_frames;
+        Vector<MediaActivity::Update> media_updates;
+        bool repaints_everything { false };
+    };
+
+    struct LayerSurface {
+        RefPtr<Gfx::PaintingSurface> surface;
+        Gfx::IntRect rect;
+        // Changes whenever anything is drawn into the surface.
+        u64 content_version { 0 };
+    };
+
+    // The surface that the window server shows a painted layer from.
+    struct PaintedLayerPresentation {
+        PresentableSurfacePool surfaces;
+        RefPtr<PresentableSurface> latest_surface;
+        Gfx::IntRect rect;
+        u64 content_version { 0 };
+    };
+
+    struct LayerUpdate {
+        OwnPtr<LayerPlan> new_plan;
+        bool keeps_plan { false };
+        Vector<LiveMedia> active_media;
+        Gfx::IntRect painted_damage;
+        Vector<Gfx::IntRect> damage_of_layers;
+        u32 fully_repainted_layer_bits { 0 };
+        bool repaints_everything { false };
+        bool shown_by_window_server { false };
+
+        bool has_plan() const { return new_plan || keeps_plan; }
+    };
+
+    struct FrameDamage {
+        Gfx::IntRect rect;
+        LayerUpdate layers;
+        bool live_media_changed { false };
+    };
+
     bool is_present_blocked() const;
     bool can_render_frame() const;
+    // Returns the rect it painted, which grows to the whole frame when the frame has to hold media that the window
+    // server was to show.
+    [[nodiscard]] Gfx::IntRect paint_frame(DisplayListPlayerSkia&, Gfx::PaintingSurface&, FrameInputs const&, CompositedContextResolver const*, Gfx::IntRect damage_rect, LayerUpdate&);
     void paint_current_display_list(DisplayListPlayerSkia&, Gfx::PaintingSurface&, FrameInputs const&, CompositedContextResolver const*, Optional<Gfx::IntRect> damage_rect = {}, PaintUIOverlay = PaintUIOverlay::Yes, bool apply_raster_transform = true);
+    bool paint_layered_frame(DisplayListPlayerSkia&, Gfx::PaintingSurface&, FrameInputs const&, CompositedContextResolver const*, Gfx::IntRect damage_rect, LayerUpdate const&);
+    void composite_layers_above_base(DisplayListPlayerSkia&, Gfx::PaintingSurface&, FrameInputs const&, CompositedContextResolver const*, LayerPlan const&, Gfx::IntRect damage_rect);
+    bool window_server_can_show_media_layers_of(LayerPlan const&);
+    bool present_painted_layers_to_window_server(LayerPlan const&, RefPtr<Gfx::SkiaBackendContext> const&);
+    bool present_compositor_overlays_to_window_server(DisplayListPlayerSkia&, FrameInputs const&, RefPtr<Gfx::SkiaBackendContext> const&);
+    Gfx::IntRect compositor_overlay_bounds(FrameInputs const&) const;
+    Vector<RemoteSublayer> sublayers_shown_by_window_server();
+    RefPtr<Media::VideoFrame> current_video_frame(Compositing::VideoSinkResourceId);
+    void paint_compositor_overlays(DisplayListPlayerSkia&, Gfx::PaintingSurface&, FrameInputs const&, PaintUIOverlay);
     Gfx::IntSize raster_size() const;
     Gfx::IntRect raster_damage_rect(Gfx::IntRect) const;
-    Gfx::IntRect frame_damage_for(PendingFrame const&, FrameInputs const&);
-    Gfx::IntRect damage_since_last_raster(Gfx::IntSize viewport_size, FrameInputs const&, Gfx::IntRect forced_damage_rect);
+    FrameDamage frame_damage_for(PendingFrame const&, FrameInputs const&);
+    LiveContentChangesSinceLastRaster live_content_changes_since_last_raster(Gfx::IntSize viewport_size);
+    DisplayListDamage damage_since_last_raster(Gfx::IntSize viewport_size, FrameInputs const&, Gfx::IntRect forced_damage_rect, LiveContentChangesSinceLastRaster const&, ReadonlySpan<u32> offsets_of_records_composited_as_media_layers, LayerPlan const* last_layer_plan, LayerPlan const* layer_plan);
+    LayerUpdate layer_update_for(FrameInputs const&, Gfx::IntRect viewport_rect, MonotonicTime now);
+    void commit_layer_update(LayerUpdate&&);
+    void drop_layers();
     void remember_rasterized_frame(Gfx::IntSize viewport_size, FrameInputs&&);
     Optional<u64> current_video_frame_id(Compositing::VideoSinkResourceId);
     void stop_backing_store_shrink_timer();
     void stop_surplus_backing_store_retirement_timer();
+    void stop_layer_drop_timer();
 
     RefPtr<Compositing::DisplayList const> m_display_list;
     Compositing::DisplayListResourceStorage m_resource_storage;
@@ -167,6 +239,24 @@ private:
     Gfx::FloatPoint m_raster_translation;
     RefPtr<Core::Timer> m_backing_store_shrink_timer;
     RefPtr<Core::Timer> m_surplus_backing_store_retirement_timer;
+
+    MediaActivity m_media_activity;
+    OwnPtr<LayerPlan> m_layer_plan;
+    Vector<LiveMedia> m_layer_plan_active_media;
+    Vector<LayerSurface> m_layer_surfaces;
+    u64 m_last_layer_content_version { 0 };
+    bool m_repaint_everything_after_dropping_layers { false };
+
+    bool m_window_server_may_show_media { false };
+    bool m_window_server_may_show_high_dynamic_range { true };
+    // Whether the window server shows the canvases and videos of the latest frame above it.
+    bool m_window_server_shows_media { false };
+    bool m_frame_without_store_in_flight { false };
+    Vector<PaintedLayerPresentation> m_painted_layer_presentations;
+    PresentableSurfacePool m_compositor_overlay_surfaces;
+    RefPtr<PresentableSurface> m_latest_compositor_overlay_surface;
+    Gfx::IntRect m_compositor_overlay_rect;
+    RefPtr<Core::Timer> m_layer_drop_timer;
 
     Optional<PendingFrame> m_pending_present_frame;
     bool m_pending_present_frame_scheduled { false };

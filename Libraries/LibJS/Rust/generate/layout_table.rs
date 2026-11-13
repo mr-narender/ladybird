@@ -262,6 +262,7 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     field!(w, "EXECUTABLE_REGISTERS_AND_LOCALS_AND_CONSTANTS_COUNT", "Executable.registers_and_locals_and_constants_count", "u32", ExecutableHead, registers_and_locals_and_constants_count, 4, "nullable", "scalar", "slot_counts");
     field!(w, "EXECUTABLE_CONSTANTS_DATA", "Executable.constants_data", "Sequence<Value>", ExecutableHead, constants, 8, "nullable", "scalar");
     field!(w, "EXECUTABLE_TIER_UP_BUDGET", "Executable.tier_up_budget", "i32", ExecutableHead, tier_up_budget, 4, "nullable", "scalar");
+    field!(w, "EXECUTABLE_IDLE_COLLECTION_COUNT", "Executable.idle_collection_count", "u8", ExecutableHead, idle_collection_count, 1, "nullable", "scalar");
     field!(w, "EXECUTABLE_JIT_COMPILE_STATE", "Executable.jit_compile_state", "u8", ExecutableHead, jit_compile_state, 1, "nullable", "scalar");
     w.constant("JIT_COMPILE_STATE_INSTALLED", JIT_COMPILE_STATE_INSTALLED);
     w.constant("TIER_UP_FUNCTION_ENTRY_COST", tier_up_costs::FUNCTION_ENTRY);
@@ -289,6 +290,9 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
         size_of::<CallFeedback>()
     ));
     w.line("field CallFeedback.flags u8 CALL_FEEDBACK_FLAGS nullable scalar");
+    offset!(w, "CALL_FEEDBACK_VALUE_BUCKET", CallFeedback, value_bucket);
+    assert_eq!(size_of_field(|feedback: &CallFeedback| &feedback.value_bucket), 2);
+    w.line("field CallFeedback.value_bucket u16 CALL_FEEDBACK_VALUE_BUCKET nullable scalar");
     w.constant("CALL_FEEDBACK_SIZE", size_of::<CallFeedback>());
     w.constant("CALL_FEEDBACK_POLYMORPHIC", call_feedback_flags::POLYMORPHIC);
     w.constant("CALL_FEEDBACK_SAW_NATIVE", call_feedback_flags::SAW_NATIVE);
@@ -573,6 +577,8 @@ pub fn generate(configuration: &LayoutConfiguration) -> LayoutWriter {
     let environment_coordinate_size = size!(w, "ENVIRONMENT_COORDINATE_SIZE", EnvironmentCoordinate);
     w.line(&format!("field EnvironmentCoordinateEntry.hops u32 ENVIRONMENT_COORDINATE_HOPS nullable scalar environment_coordinate stride {environment_coordinate_size}"));
     w.line("field EnvironmentCoordinateEntry.binding_index u32 ENVIRONMENT_COORDINATE_INDEX nullable scalar environment_coordinate");
+    w.line("field BytecodeEnvironmentCoordinate.hops u8 0 nullable scalar");
+    w.line("field BytecodeEnvironmentCoordinate.binding_index u16 1 nullable scalar");
 
     w.section("TypedArrayBase layout");
     offset!(w, "TYPED_ARRAY_ELEMENT_SIZE", TypedArrayBase, element_size);

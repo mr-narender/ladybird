@@ -8,10 +8,13 @@
 #include <AK/CharacterTypes.h>
 #include <AK/Debug.h>
 #include <AK/Find.h>
+#include <AK/HashTable.h>
 #include <AK/QuickSort.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Timer.h>
 #include <LibTextCodec/Decoder.h>
+#include <LibURL/Parser.h>
+#include <LibURL/PublicSuffixData.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
 #include <LibWebView/Autocomplete.h>
@@ -59,8 +62,10 @@ void Autocomplete::cancel_pending_query()
     m_query_id = {};
     m_query = {};
     m_trimmed_query = {};
+    m_classified_query = {};
     m_local_suggestions.clear();
     m_remote_suggestions.clear();
+    m_visited_host_families.clear();
     m_external_url.clear();
     m_external_url_handler_query_complete = true;
     m_external_url_has_handler = false;
@@ -131,12 +136,9 @@ Vector<AutocompleteMatchRange> autocomplete_match_ranges(StringView input, Strin
     return merged_ranges;
 }
 
-Vector<String> filter_remote_autocomplete_suggestions(StringView input, Vector<String> suggestions)
+bool remote_autocomplete_suggestion_matches_input(StringView suggestion, StringView input)
 {
-    suggestions.remove_all_matching([input](auto const& suggestion) {
-        return !suggestion.bytes_as_string_view().starts_with(input, CaseSensitivity::CaseInsensitive);
-    });
-    return suggestions;
+    return suggestion.starts_with(input, CaseSensitivity::CaseInsensitive);
 }
 
 Vector<AutocompleteSuggestion> web_ui_autocomplete_suggestions(StringView input)
@@ -234,38 +236,151 @@ static AutocompleteSuggestion make_literal_url_suggestion(StringView query)
     };
 }
 
-static Optional<AutocompleteSuggestion> literal_url_suggestion(StringView query)
+// Whether the text starts with a scheme for the web, rather than one being guessed for it.
+static bool starts_with_web_scheme(StringView text)
 {
-    if (query.is_empty() || classify_user_input(query).classification != UserInputClassification::InternalURL)
-        return {};
-
-    return make_literal_url_suggestion(query);
+    text = text.trim_whitespace();
+    return text.starts_with("http://"sv, CaseSensitivity::CaseInsensitive) || text.starts_with("https://"sv, CaseSensitivity::CaseInsensitive);
 }
 
-static Vector<AutocompleteSuggestion> make_remote_suggestions(Vector<String> remote_suggestions)
+Optional<AutocompleteSuggestion> make_verbatim_autocomplete_suggestion(StringView query, ClassifiedUserInput const& classified_query, Optional<SearchEngine> const& search_engine)
+{
+    if (!query.is_empty() && classified_query.classification == UserInputClassification::InternalURL)
+        return make_literal_url_suggestion(query);
+    return search_for_query_suggestion(search_engine, query);
+}
+
+// A search for the text as typed, offered below the address that the text is, which is where Return goes. It is not
+// the row for the text as typed, so it never becomes the default, even when it would outrank the address.
+static Optional<AutocompleteSuggestion> search_below_address_for_query_suggestion(Optional<SearchEngine> const& search_engine, StringView query)
+{
+    auto suggestion = search_for_query_suggestion(search_engine, query);
+    if (!suggestion.has_value())
+        return {};
+    suggestion->relevance = 850;
+    suggestion->is_verbatim = false;
+    suggestion->can_be_automatically_selected = false;
+    return suggestion;
+}
+
+Optional<AutocompleteSuggestion> make_search_suggestion_for_address_like_text(StringView query, ClassifiedUserInput const& classified_query, Optional<SearchEngine> const& search_engine)
+{
+    if (!search_engine.has_value() || starts_with_web_scheme(query))
+        return {};
+    if (classified_query.classification != UserInputClassification::InternalURL || !classified_query.url.has_value())
+        return {};
+    if (!classified_query.url->scheme().is_one_of("http"sv, "https"sv))
+        return {};
+
+    return search_below_address_for_query_suggestion(search_engine, query);
+}
+
+// A remote suggestion that is a web address goes to that address rather than to a search for it. Only a public site
+// counts: the search engine must not name the user's own machine or network. Text without a scheme, such as
+// "google.com", may well be a phrase like "setup.py" instead, so it counts only for a site the user has been to.
+static RemoteAutocompleteSuggestion classify_remote_autocomplete_suggestion(String suggestion)
+{
+    auto as_search = [&] { return RemoteAutocompleteSuggestion { .text = move(suggestion), .url = {}, .host_family_the_user_must_have_visited = {} }; };
+
+    auto classified_suggestion = classify_user_input_ignoring_local_files(suggestion);
+    if (classified_suggestion.classification != UserInputClassification::InternalURL || !classified_suggestion.url.has_value())
+        return as_search();
+
+    // NB: Rows do not show the scheme, so an http address would look like the https one for the same site. An address
+    //     with a user name, such as "https://bank.example@evil.example/", names one site and goes to another.
+    auto const& url = *classified_suggestion.url;
+    if (url.scheme() != "https"sv || url.port().has_value() || !url.username().is_empty() || !url.password().is_empty())
+        return as_search();
+
+    auto const& host = url.host();
+    if (!host.has_value() || !host->is_domain() || host->is_loopback_or_localhost())
+        return as_search();
+
+    auto const& domain = host->get<String>();
+    auto public_suffix = URL::PublicSuffixData::find_matching_public_suffix(domain, URL::PublicSuffixData::IncludeStarRule::No);
+    if (!public_suffix.has_value() || *public_suffix == domain)
+        return as_search();
+
+    Optional<String> host_family_the_user_must_have_visited;
+    if (!starts_with_web_scheme(suggestion)) {
+        host_family_the_user_must_have_visited = autocomplete_host_family(url);
+        if (!host_family_the_user_must_have_visited.has_value())
+            return as_search();
+    }
+
+    return { .text = move(suggestion), .url = url.serialize(), .host_family_the_user_must_have_visited = move(host_family_the_user_must_have_visited) };
+}
+
+static Vector<RemoteAutocompleteSuggestion> classify_remote_autocomplete_suggestions(Vector<String> suggestions)
 {
     static constexpr auto maximum_remote_candidates = 50uz;
-    Vector<AutocompleteSuggestion> suggestions;
-    suggestions.ensure_capacity(min(remote_suggestions.size(), maximum_remote_candidates));
+    Vector<RemoteAutocompleteSuggestion> classified_suggestions;
+    classified_suggestions.ensure_capacity(min(suggestions.size(), maximum_remote_candidates));
+    for (size_t index = 0; index < suggestions.size() && index < maximum_remote_candidates; ++index)
+        classified_suggestions.unchecked_append(classify_remote_autocomplete_suggestion(move(suggestions[index])));
+    return classified_suggestions;
+}
 
-    i32 relevance = 700;
-    for (size_t index = 0; index < remote_suggestions.size() && index < maximum_remote_candidates; ++index) {
+static void add_visited_host_families(HashTable<String>& visited_host_families, ReadonlySpan<AutocompleteSuggestion> local_suggestions)
+{
+    for (auto const& suggestion : local_suggestions) {
+        if (suggestion.source == AutocompleteSuggestionSource::Search || suggestion.source == AutocompleteSuggestionSource::ChooseSearchEngine)
+            continue;
+        auto url = URL::Parser::basic_parse(suggestion.text);
+        // NB: A learned row holds the address the user went to as they typed it, such as "google.com" or
+        //     "google.com:8443", which the URL parser takes for a scheme and a path. Such text is classified as Return
+        //     would take it.
+        if (suggestion.source == AutocompleteSuggestionSource::Adaptive && (!url.has_value() || url->has_an_opaque_path()))
+            url = classify_user_input(suggestion.text).url;
+        if (!url.has_value())
+            continue;
+        if (auto family = autocomplete_host_family(*url); family.has_value())
+            visited_host_families.set(family.release_value());
+    }
+}
+
+static Vector<AutocompleteSuggestion> make_remote_autocomplete_suggestions(ReadonlySpan<RemoteAutocompleteSuggestion> remote_suggestions, HashTable<String> const& visited_host_families, LocalSuggestionsAreComplete local_suggestions_are_complete)
+{
+    if (remote_suggestions.is_empty())
+        return {};
+
+    Vector<AutocompleteSuggestion> suggestions;
+    suggestions.ensure_capacity(remote_suggestions.size());
+
+    for (size_t index = 0; index < remote_suggestions.size(); ++index) {
+        auto const& remote_suggestion = remote_suggestions[index];
+
+        auto is_url = false;
+        if (remote_suggestion.url.has_value()) {
+            auto const& required_host_family = remote_suggestion.host_family_the_user_must_have_visited;
+            is_url = !required_host_family.has_value() || visited_host_families.contains(*required_host_family);
+            // NB: Shown as a search now, it could turn into a page under the user once the local rows arrive.
+            if (!is_url && local_suggestions_are_complete == LocalSuggestionsAreComplete::No)
+                continue;
+        }
+
         suggestions.unchecked_append({
-            .source = AutocompleteSuggestionSource::Search,
-            .text = move(remote_suggestions[index]),
+            .source = is_url ? AutocompleteSuggestionSource::RemoteURL : AutocompleteSuggestionSource::Search,
+            .text = is_url ? *remote_suggestion.url : remote_suggestion.text,
             .title = {},
             .subtitle = {},
             .favicon_png = {},
             .highlight_input = {},
-            .relevance = relevance,
+            .relevance = 700 - static_cast<i32>(index),
             .is_verbatim = false,
             .can_be_automatically_selected = false,
             .can_be_inline_completed = false,
         });
-        --relevance;
     }
 
     return suggestions;
+}
+
+Vector<AutocompleteSuggestion> make_remote_autocomplete_suggestions(Vector<String> remote_suggestions, ReadonlySpan<AutocompleteSuggestion> local_suggestions, LocalSuggestionsAreComplete local_suggestions_are_complete)
+{
+    HashTable<String> visited_host_families;
+    add_visited_host_families(visited_host_families, local_suggestions);
+    return make_remote_autocomplete_suggestions(classify_remote_autocomplete_suggestions(move(remote_suggestions)).span(), visited_host_families, local_suggestions_are_complete);
 }
 
 void Autocomplete::search_engine_settings_changed()
@@ -287,14 +402,19 @@ void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, Strin
     m_query_id = query_id;
 
     auto trimmed_query = MUST(String::from_utf8(query.bytes_as_string_view().trim_whitespace()));
-    m_remote_suggestions = filter_remote_autocomplete_suggestions(trimmed_query, move(m_remote_suggestions));
+    m_remote_suggestions.remove_all_matching([&](auto const& suggestion) {
+        return !remote_autocomplete_suggestion_matches_input(suggestion.text, trimmed_query);
+    });
+    // NB: The sites the user visited only matter for remote rows that carry over to this query.
+    if (m_remote_suggestions.is_empty())
+        m_visited_host_families.clear();
     m_trimmed_query = move(trimmed_query);
     m_query = move(query);
     m_local_query_complete = false;
     m_remote_query_complete = false;
-    auto classified_input = classify_user_input(m_trimmed_query);
-    m_external_url = classified_input.classification == UserInputClassification::ExternalURL
-        ? move(classified_input.url)
+    m_classified_query = classify_user_input(m_trimmed_query);
+    m_external_url = m_classified_query.classification == UserInputClassification::ExternalURL
+        ? m_classified_query.url
         : Optional<URL::URL> {};
     m_external_url_handler_query_complete = !m_external_url.has_value();
     m_external_url_has_handler = false;
@@ -395,9 +515,9 @@ void Autocomplete::start_remote_query(AutocompleteQueryID query_id, SearchEngine
             warnln("Unable to handle autocomplete response: {}", result.error());
             deliver_current_result();
         } else {
-            m_remote_suggestions = result.release_value();
+            dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Remote autocomplete suggestions for '{}': {}", query, history_log_suggestions(result.value()));
+            m_remote_suggestions = classify_remote_autocomplete_suggestions(result.release_value());
 
-            dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Remote autocomplete suggestions for '{}': {}", query, history_log_suggestions(m_remote_suggestions));
             deliver_current_result();
         }
     });
@@ -409,6 +529,8 @@ void Autocomplete::local_query_complete(AutocompleteQueryID query_id, Vector<Aut
         return;
 
     m_local_suggestions = move(suggestions);
+    show_search_results_pages_as_searches(m_trimmed_query, m_local_suggestions, m_host.autocomplete_settings().search_engine_settings().engine);
+    add_visited_host_families(m_visited_host_families, m_local_suggestions);
     m_local_query_complete = true;
 
     dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Local autocomplete suggestions for '{}': {}", m_trimmed_query, log_autocomplete_suggestions(m_local_suggestions));
@@ -435,20 +557,25 @@ void Autocomplete::deliver_current_result()
     if (additional_suggestions.is_empty() && m_external_url_handler_query_complete) {
         if (m_external_url_has_handler) {
             verbatim_suggestion = make_literal_url_suggestion(m_query);
-            if (auto search_suggestion = search_for_query_suggestion(m_host.autocomplete_settings().search_engine_settings().engine, m_query); search_suggestion.has_value())
+            // NB: The app that handles the address is where Return goes, so a search for text with a space, such as
+            //     "tel:+1 555 1234", must not outrank it.
+            if (auto search_suggestion = search_below_address_for_query_suggestion(m_host.autocomplete_settings().search_engine_settings().engine, m_query); search_suggestion.has_value())
                 additional_suggestions.append(search_suggestion.release_value());
-        } else if (auto url_suggestion = literal_url_suggestion(m_query); url_suggestion.has_value()) {
-            verbatim_suggestion = url_suggestion.release_value();
         } else {
-            verbatim_suggestion = search_for_query_suggestion(m_host.autocomplete_settings().search_engine_settings().engine, m_query);
+            auto const& search_engine = m_host.autocomplete_settings().search_engine_settings().engine;
+            verbatim_suggestion = make_verbatim_autocomplete_suggestion(m_query, m_classified_query, search_engine);
+            if (auto search_suggestion = make_search_suggestion_for_address_like_text(m_query, m_classified_query, search_engine); search_suggestion.has_value())
+                additional_suggestions.append(search_suggestion.release_value());
         }
     }
     additional_suggestions.extend(m_local_suggestions);
+    auto remote_suggestions = make_remote_autocomplete_suggestions(m_remote_suggestions.span(), m_visited_host_families,
+        m_local_query_complete ? LocalSuggestionsAreComplete::Yes : LocalSuggestionsAreComplete::No);
     auto merged_suggestions = mux_autocomplete_suggestions(
         m_trimmed_query,
         move(verbatim_suggestion),
         move(additional_suggestions),
-        make_remote_suggestions(m_remote_suggestions),
+        move(remote_suggestions),
         m_max_suggestions);
     for (auto& suggestion : merged_suggestions)
         suggestion.highlight_input = m_trimmed_query;

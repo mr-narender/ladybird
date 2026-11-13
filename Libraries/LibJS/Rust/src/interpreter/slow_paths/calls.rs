@@ -6,11 +6,11 @@
 
 //! The slow paths for calls, function and class creation, and their helpers.
 
-use ak::{ScopeGuard, Utf16FlyString};
+use ak::ScopeGuard;
 use libjs_abi::{ArgumentsKind, FunctionNamePrefix};
 
 use super::strict_at;
-use crate::bytecode::encoding::{OptionalOperand, StringTableIndex};
+use crate::bytecode::encoding::OptionalOperand;
 use crate::bytecode::op;
 use crate::bytecode::property_access::Strict;
 use crate::interpreter::runtime_functions::{
@@ -69,11 +69,6 @@ fn caller_mode_of(strict: Strict) -> CallerMode {
     } else {
         CallerMode::NonStrict
     }
-}
-
-/// Executable::get_string().
-fn get_string(vm: &Vm, index: StringTableIndex) -> Utf16FlyString {
-    vm.current_executable().string_table()[index.index()].clone()
 }
 
 /// Value::as_array_exotic_object(): the arguments the bytecode collected into an Array for a call.
@@ -217,9 +212,9 @@ pub fn new_class(
     let mut binding_name = None;
     let class_name;
     if !blueprint.has_name
-        && let Some(lhs_name) = instruction.lhs_name.get()
+        && let Some(lhs_name) = instruction.lhs_name.index_in(executable.bytecode())
     {
-        class_name = ClassElementName::PropertyKey(PropertyKey::from(executable.get_identifier(lhs_name).clone()));
+        class_name = ClassElementName::PropertyKey(PropertyKey::from(executable.identifier(lhs_name).clone()));
     } else if !blueprint.has_name && instruction.computed_name.get().is_some() {
         class_name = ClassElementName::PropertyKey(asm_try!(vm, pc, values.computed_name.to_property_key(vm)));
     } else {
@@ -247,20 +242,7 @@ pub fn new_class(
 }
 
 #[cold]
-fn throw_type_error_for_asm_callee(
-    vm: &Vm,
-    callee: Value,
-    callee_type: &str,
-    expression_string: Option<StringTableIndex>,
-) -> ThrowCompletionOr<()> {
-    if let Some(expression_string) = expression_string {
-        return vm.throw_completion(
-            ErrorKind::TypeError,
-            ErrorType::IsNotAEvaluatedFrom,
-            &[&callee, &callee_type, &get_string(vm, expression_string)],
-        );
-    }
-
+fn throw_type_error_for_asm_callee(vm: &Vm, callee: Value, callee_type: &str) -> ThrowCompletionOr<()> {
     let program_counter = vm.running_execution_context_ref().program_counter.get();
     if let Some(text) = vm.current_executable().callee_text_at(program_counter) {
         return vm.throw_completion(
@@ -272,17 +254,12 @@ fn throw_type_error_for_asm_callee(
     vm.throw_completion(ErrorKind::TypeError, ErrorType::IsNotA, &[&callee, &callee_type])
 }
 
-pub(crate) fn throw_if_needed_for_asm_call(
-    vm: &Vm,
-    callee: Value,
-    call_type: CallType,
-    expression_string: Option<StringTableIndex>,
-) -> ThrowCompletionOr<()> {
+pub(crate) fn throw_if_needed_for_asm_call(vm: &Vm, callee: Value, call_type: CallType) -> ThrowCompletionOr<()> {
     if (call_type == CallType::Call || call_type == CallType::DirectEval) && !callee.is_function() {
-        return throw_type_error_for_asm_callee(vm, callee, "function", expression_string);
+        return throw_type_error_for_asm_callee(vm, callee, "function");
     }
     if call_type == CallType::Construct && !callee.is_constructor() {
-        return throw_type_error_for_asm_callee(vm, callee, "constructor", expression_string);
+        return throw_type_error_for_asm_callee(vm, callee, "constructor");
     }
     Ok(())
 }
@@ -325,10 +302,9 @@ pub(crate) fn execute_asm_call(
     this_value: Value,
     arguments: &[Value],
     dst: &mut Value,
-    expression_string: Option<StringTableIndex>,
     strict: Strict,
 ) -> ThrowCompletionOr<()> {
-    throw_if_needed_for_asm_call(vm, callee, call_type, expression_string)?;
+    throw_if_needed_for_asm_call(vm, callee, call_type)?;
 
     let function = callee.as_function();
 
@@ -427,7 +403,6 @@ pub fn call(
             values.this_value,
             arguments,
             &mut values.dst,
-            instruction.expression_string.get(),
             strict_at(vm, pc),
         )
     );
@@ -440,10 +415,9 @@ fn call_direct_eval_impl(
     this_value: Value,
     arguments: &[Value],
     dst: &mut Value,
-    expression_string: Option<StringTableIndex>,
     strict: Strict,
 ) -> ThrowCompletionOr<()> {
-    throw_if_needed_for_asm_call(vm, callee, CallType::DirectEval, expression_string)?;
+    throw_if_needed_for_asm_call(vm, callee, CallType::DirectEval)?;
 
     let function = callee.as_function();
 
@@ -495,7 +469,6 @@ pub fn call_direct_eval(
             values.this_value,
             arguments,
             &mut values.dst,
-            instruction.expression_string.get(),
             strict_at(vm, pc),
         )
     );
@@ -510,10 +483,9 @@ fn call_with_argument_array_impl(
     this_value: Value,
     arguments: Value,
     dst: &mut Value,
-    expression_string: Option<StringTableIndex>,
     strict: Strict,
 ) -> ThrowCompletionOr<()> {
-    throw_if_needed_for_asm_call(vm, callee, call_type, expression_string)?;
+    throw_if_needed_for_asm_call(vm, callee, call_type)?;
 
     let function = callee.as_function();
 
@@ -579,7 +551,7 @@ fn call_with_argument_array_impl(
 pub fn call_with_argument_array(
     vm: &Vm,
     pc: u32,
-    instruction: &op::CallWithArgumentArray,
+    _instruction: &op::CallWithArgumentArray,
     values: &mut op::CallWithArgumentArrayValues,
 ) -> SlowPathControl {
     asm_try!(
@@ -592,7 +564,6 @@ pub fn call_with_argument_array(
             values.this_value,
             values.arguments,
             &mut values.dst,
-            instruction.expression_string.get(),
             strict_at(vm, pc),
         )
     );
@@ -602,7 +573,7 @@ pub fn call_with_argument_array(
 pub fn call_direct_eval_with_argument_array(
     vm: &Vm,
     pc: u32,
-    instruction: &op::CallDirectEvalWithArgumentArray,
+    _instruction: &op::CallDirectEvalWithArgumentArray,
     values: &mut op::CallDirectEvalWithArgumentArrayValues,
 ) -> SlowPathControl {
     asm_try!(
@@ -615,7 +586,6 @@ pub fn call_direct_eval_with_argument_array(
             values.this_value,
             values.arguments,
             &mut values.dst,
-            instruction.expression_string.get(),
             strict_at(vm, pc),
         )
     );
@@ -636,6 +606,9 @@ pub fn call_construct(
         && function.constructor_kind() == ConstructorKind::Base
         && !function.has_class_data()
     {
+        // NB: Taken before anything allocates: a collection could flush the code of the function otherwise, which this
+        //     local keeps from happening (see `bytecode::flushing`).
+        let executable = function.inline_call_executable();
         let prototype = asm_try!(
             vm,
             pc,
@@ -650,7 +623,7 @@ pub fn call_construct(
         );
         let Some(context) = vm.push_inline_frame(
             function,
-            function.inline_call_executable(),
+            executable,
             arguments,
             pc + instruction.length(),
             instruction.dst.0.into(),
@@ -677,7 +650,6 @@ pub fn call_construct(
             Value::UNDEFINED,
             arguments,
             &mut values.dst,
-            instruction.expression_string.get(),
             strict_at(vm, pc),
         )
     );
@@ -687,7 +659,7 @@ pub fn call_construct(
 pub fn call_construct_with_argument_array(
     vm: &Vm,
     pc: u32,
-    instruction: &op::CallConstructWithArgumentArray,
+    _instruction: &op::CallConstructWithArgumentArray,
     values: &mut op::CallConstructWithArgumentArrayValues,
 ) -> SlowPathControl {
     asm_try!(
@@ -700,7 +672,6 @@ pub fn call_construct_with_argument_array(
             Value::UNDEFINED,
             values.arguments,
             &mut values.dst,
-            instruction.expression_string.get(),
             strict_at(vm, pc),
         )
     );
@@ -866,11 +837,11 @@ pub fn try_inline_call(vm: &Vm, pc: u32, instruction: &op::Call, values: &op::Ca
     .is_some()
 }
 
-fn function_name_prefix_of(raw_prefix: u32) -> FunctionNamePrefix {
+fn function_name_prefix_of(raw_prefix: u8) -> FunctionNamePrefix {
     match raw_prefix {
-        prefix if prefix == FunctionNamePrefix::None as u32 => FunctionNamePrefix::None,
-        prefix if prefix == FunctionNamePrefix::Get as u32 => FunctionNamePrefix::Get,
-        prefix if prefix == FunctionNamePrefix::Set as u32 => FunctionNamePrefix::Set,
+        prefix if prefix == FunctionNamePrefix::None as u8 => FunctionNamePrefix::None,
+        prefix if prefix == FunctionNamePrefix::Get as u8 => FunctionNamePrefix::Get,
+        prefix if prefix == FunctionNamePrefix::Set as u8 => FunctionNamePrefix::Set,
         _ => unreachable!("{raw_prefix} is not a function name prefix"),
     }
 }
@@ -943,7 +914,7 @@ pub fn create_arguments(
         .expect("a function runs in an environment");
 
     let passed_arguments = &arguments[..context.passed_argument_count.get() as usize];
-    let arguments_object = if instruction.kind == ArgumentsKind::Mapped as u32 {
+    let arguments_object = if instruction.kind == ArgumentsKind::Mapped as u8 {
         let ecmascript_function =
             as_ecmascript_function_object(function).expect("only ECMAScript functions have mapped arguments objects");
         // NB: The bytecode leaves creating the bindings of the parameters that a mapped arguments object aliases to it,
@@ -992,9 +963,25 @@ pub fn new_function(
     instruction: &op::NewFunction,
     values: &mut op::NewFunctionValues,
 ) -> SlowPathControl {
-    let shared_data = vm
-        .current_executable()
-        .shared_function_data(instruction.shared_function_data_index);
+    let home_object = instruction.home_object.get().map(|_| values.home_object);
+    values.dst = new_function_object(vm, instruction.shared_function_data_index.into(), home_object);
+    SlowPathControl::continue_at(pc + op::NewFunction::LENGTH)
+}
+
+pub fn new_function_wide(
+    vm: &Vm,
+    pc: u32,
+    instruction: &op::NewFunctionWide,
+    values: &mut op::NewFunctionWideValues,
+) -> SlowPathControl {
+    let home_object = instruction.home_object.get().map(|_| values.home_object);
+    values.dst = new_function_object(vm, instruction.shared_function_data_index, home_object);
+    SlowPathControl::continue_at(pc + op::NewFunctionWide::LENGTH)
+}
+
+/// The function object of a NewFunction, for the function at `shared_function_data_index` of the running executable.
+fn new_function_object(vm: &Vm, shared_function_data_index: u32, home_object: Option<Value>) -> Value {
+    let shared_data = vm.current_executable().shared_function_data(shared_function_data_index);
     let realm = vm.current_realm().expect("there is a current realm");
 
     let prototype = match shared_data.kind() {
@@ -1004,14 +991,14 @@ pub fn new_function(
         FunctionKind::AsyncGenerator => realm.async_generator_function_prototype(),
     };
 
-    let function = if instruction.home_object.get().is_some() {
+    let function = if let Some(home_object) = home_object {
         EcmascriptFunctionObject::create_method(
             vm,
             realm,
             shared_data,
             vm.lexical_environment(),
             running_execution_context(vm).private_environment.get(),
-            values.home_object.as_object(),
+            home_object.as_object(),
             prototype,
         )
     } else {
@@ -1025,8 +1012,7 @@ pub fn new_function(
         )
     };
 
-    values.dst = Value::from_object(function);
-    SlowPathControl::continue_at(pc + op::NewFunction::LENGTH)
+    Value::from_object(function)
 }
 
 /// Handles an exception a raw native function the interpreter called threw.

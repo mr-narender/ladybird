@@ -26,7 +26,7 @@ public:
     virtual ~DisplayListPlayer() = default;
 
     // The frame inputs say where the frame presents what scrolls. Without them, nothing is scrolled.
-    void execute(Compositing::DisplayList const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayListResourceStorage const&, FrameInputs const*, RefPtr<Gfx::PaintingSurface>, OwnedCanvasSurfaces const* = nullptr);
+    void execute(Compositing::DisplayList const&, Compositing::AccumulatedVisualContextTree const&, Compositing::DisplayListResourceStorage const&, FrameInputs const*, RefPtr<Gfx::PaintingSurface>, OwnedCanvasSurfaces const* = nullptr, ReplaySelection const& = replaying_everything());
     virtual void flush(Gfx::PaintingSurface&) = 0;
 
 protected:
@@ -73,7 +73,7 @@ private:
     virtual void push_clip(Compositing::ReplayClip const&) = 0;
     // A path stays the same for as long as it has its identity.
     virtual void push_clip_path(Gfx::PathData const&, u64 path_identity, Gfx::WindingRule) = 0;
-    virtual void push_clip_path_bytes(ReadonlyBytes, Gfx::WindingRule) = 0;
+    virtual void push_clip_path_bytes(ReadonlyBytes, Gfx::WindingRule, Compositing::ClipMode) = 0;
     virtual void push_transform(Gfx::AffineTransform const&) = 0;
     virtual void push_layer(Compositing::ReplayLayer const&) = 0;
     virtual void push_mask(Compositing::ReplayMask const&, Compositing::ReplayLayer const* backdrop) = 0;
@@ -88,6 +88,7 @@ private:
     RefPtr<Gfx::PaintingSurface> m_surface;
     ReadonlyBytes m_current_command_payload;
     FrameInputs const* m_active_frame_inputs { nullptr };
+    ReplaySelection m_replay_selection { replaying_everything() };
     HashMap<u32, ReadonlyBytes> m_declared_mask_contents;
 };
 

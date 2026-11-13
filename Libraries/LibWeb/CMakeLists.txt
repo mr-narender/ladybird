@@ -35,7 +35,6 @@ set(SOURCES
     Bindings/WrapperWorld.cpp
     Clipboard/Clipboard.cpp
     Clipboard/ClipboardEvent.cpp
-    Clipboard/ClipboardItem.cpp
     Compositor/CompositorConnection.cpp
     Compositor/CompositorHost.cpp
     Compositor/NavigablePresenter.cpp
@@ -307,6 +306,7 @@ set(SOURCES
     Fetch/Fetching/ClientContextSnapshots.cpp
     Fetch/Fetching/NetworkBodyPump.cpp
     Fetch/Fetching/FetchEngine.cpp
+    Fetch/Fetching/FetchEventSink.cpp
     Fetch/Fetching/Fetching.cpp
     Fetch/Fetching/PendingResponse.cpp
     Fetch/Fetching/RefCountedFlag.cpp
@@ -359,7 +359,6 @@ set(SOURCES
     Geometry/DOMRectList.cpp
     Geometry/DOMRectReadOnly.cpp
     GPC/GlobalPrivacyControl.cpp
-    HighResolutionTime/Performance.cpp
     HighResolutionTime/TimeOrigin.cpp
     HTML/AbstractWorker.cpp
     HTML/BitmapDecodedImageData.cpp
@@ -733,10 +732,7 @@ set(SOURCES
     Painting/ScrollSnap.cpp
     Painting/SvgPaintResources.cpp
     PerformanceTimeline/EntryTypes.cpp
-    PerformanceTimeline/EventNames.cpp
     PerformanceTimeline/PerformanceEntry.cpp
-    PerformanceTimeline/PerformanceObserver.cpp
-    PerformanceTimeline/PerformanceObserverEntryList.cpp
     PermissionsAPI/Permissions.cpp
     PermissionsAPI/PermissionStore.cpp
     PermissionsAPI/PermissionStatus.cpp

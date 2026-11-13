@@ -7,6 +7,7 @@ set(SOURCES
     ColorSpaceSkia.cpp
     CompositorCore.cpp
     CompositorState.cpp
+    ContextLayers.cpp
     ContextPresenter.cpp
     DisplayListPlayer.cpp
     DisplayListPlayerSkia.cpp
@@ -20,6 +21,7 @@ set(SOURCES
     HostWebGLContext.cpp
     OpenGLContext.cpp
     PaintingSurface.cpp
+    PresentableSurface.cpp
     PausedDebuggerOverlay.cpp
     PictureInPictureControls.cpp
     RasterizeDisplayList.cpp
@@ -99,8 +101,8 @@ if (USE_VULKAN_DMABUF_IMAGES)
 endif()
 
 if (APPLE)
-    target_sources(compositorservice PRIVATE RemoteLayer.mm VideoFrameSkia.mm)
-    target_link_libraries(compositorservice PUBLIC "-framework CoreGraphics" "-framework CoreVideo" "-framework QuartzCore")
+    target_sources(compositorservice PRIVATE MainDispatchQueue.mm RemoteLayer.mm VideoFrameSkia.mm)
+    target_link_libraries(compositorservice PUBLIC "-framework AVFoundation" "-framework CoreGraphics" "-framework CoreMedia" "-framework CoreVideo" "-framework QuartzCore")
 endif()
 
 if (WIN32)

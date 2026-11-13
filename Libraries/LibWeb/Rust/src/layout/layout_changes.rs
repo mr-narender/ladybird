@@ -66,6 +66,10 @@ pub(crate) enum LayoutChange {
         anchor_name: usize,
         elements: Box<[StyleNodeID]>,
     },
+    SetImplicitAnchorElement {
+        element: StyleNodeID,
+        anchor: Option<StyleNodeID>,
+    },
     /// What the element has scrolled to.
     SetElementScrollOffset {
         element: StyleNodeID,
@@ -159,8 +163,10 @@ pub(crate) enum LayoutChange {
     },
     /// How the host learns what boxes a DOM node has, or none.
     SetBoxPresenceHost(Option<super::layout_node_arena::BoxPresenceHost>),
-    /// The document's layout passes are traced from now on.
-    BeginLayoutTrace,
+    /// The document's layout passes, and its layout tree builds where asked, are traced from now on.
+    BeginLayoutTrace {
+        tree_builds: bool,
+    },
     /// The boxes of the traced events at these lines are named so.
     NameLayoutTraceOwners(Vec<(usize, String)>),
     /// The tree scope registers these counter styles now.
@@ -189,6 +195,7 @@ impl LayoutChange {
             | Self::ApplyLayoutTreeUpdateMark { .. }
             | Self::RecordPartialRelayoutEscape
             | Self::SetAnchorNameElements { .. }
+            | Self::SetImplicitAnchorElement { .. }
             | Self::SetElementScrollOffset { .. }
             | Self::SetWritingSuggestion(_)
             | Self::SetPseudoElementScrollOffset { .. }
@@ -207,7 +214,7 @@ impl LayoutChange {
             | Self::PinNodeStyleRecordForHost { .. }
             | Self::ReleaseNodeStyleRecordPinForHost { .. }
             | Self::SetBoxPresenceHost(_)
-            | Self::BeginLayoutTrace
+            | Self::BeginLayoutTrace { .. }
             | Self::NameLayoutTraceOwners(_)
             | Self::CounterStyles { .. } => RowWrite::Rows,
         }
@@ -225,7 +232,7 @@ impl LayoutChange {
             | Self::PinBoundBoxStyleRecordForDetachment { .. }
             | Self::PinNodeStyleRecordForHost { .. }
             | Self::ReleaseNodeStyleRecordPinForHost { .. }
-            | Self::BeginLayoutTrace
+            | Self::BeginLayoutTrace { .. }
             | Self::NameLayoutTraceOwners(_) => false,
             _ => true,
         }
@@ -279,6 +286,7 @@ impl LayoutChange {
                 anchor_name,
                 elements,
             } => arena.set_anchor_name_elements(scope_host, anchor_name, elements.iter().copied()),
+            Self::SetImplicitAnchorElement { element, anchor } => arena.set_implicit_anchor_element(element, anchor),
             Self::SetElementScrollOffset { element, offset } => arena.set_element_scroll_offset(element, offset),
             Self::SetWritingSuggestion(suggestion) => arena.set_writing_suggestion(suggestion),
             Self::SetPseudoElementScrollOffset {
@@ -346,7 +354,7 @@ impl LayoutChange {
             Self::PinNodeStyleRecordForHost { node, record } => arena.pin_node_style_record_for_host(node, record),
             Self::ReleaseNodeStyleRecordPinForHost { node } => arena.release_node_style_record_pin_for_host(node),
             Self::SetBoxPresenceHost(host) => arena.set_box_presence_host(host),
-            Self::BeginLayoutTrace => arena.layout_trace.begin(),
+            Self::BeginLayoutTrace { tree_builds } => arena.layout_trace.begin(tree_builds),
             Self::NameLayoutTraceOwners(names) => arena.name_layout_trace_owners(names),
             Self::CounterStyles { tree_scope, scope } => arena.publish_counter_styles(tree_scope, scope),
         }
@@ -588,6 +596,19 @@ pub extern "C" fn render_state_set_anchor_name_elements(
             .collect(),
     };
     queue(host, change);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_set_implicit_anchor_element(host: &DocumentHost, element: u32, anchor: u32) {
+    if let Some(element) = StyleNodeID::from_raw(element) {
+        queue(
+            host,
+            LayoutChange::SetImplicitAnchorElement {
+                element,
+                anchor: StyleNodeID::from_raw(anchor),
+            },
+        );
+    }
 }
 
 #[unsafe(no_mangle)]

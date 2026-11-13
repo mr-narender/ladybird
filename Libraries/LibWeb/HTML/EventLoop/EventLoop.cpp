@@ -81,11 +81,33 @@ EventLoop::EventLoop(Type type)
 
 EventLoop::~EventLoop() = default;
 
-void EventLoop::reset_rendering_scheduler_counters()
+String EventLoop::take_rendering_trace()
 {
-    m_rendering_scheduler_counters = {};
-    m_rendering_scheduler_counters_at_last_update = {};
-    m_last_rendering_update_end_time = 0;
+    StringBuilder builder;
+    for (auto const& line : m_rendering_trace.value_or({})) {
+        builder.append(line.text);
+        if (line.repeats > 1)
+            builder.appendff(" x{}", line.repeats);
+        builder.append('\n');
+    }
+    m_rendering_trace.clear();
+    return builder.to_string_without_validation();
+}
+
+void EventLoop::note_rendering_trace_event(StringView event)
+{
+    if (!m_rendering_trace.has_value())
+        return;
+    if (!m_rendering_trace->is_empty() && m_rendering_trace->last().text == event) {
+        ++m_rendering_trace->last().repeats;
+        return;
+    }
+    m_rendering_trace->append({ MUST(String::from_utf8(event)) });
+}
+
+void note_rendering_trace_event(StringView event)
+{
+    main_thread_event_loop().note_rendering_trace_event(event);
 }
 
 void EventLoop::visit_edges(Visitor& visitor)
@@ -292,6 +314,8 @@ bool EventLoop::run_one_turn_of_the_processing_model()
 
         // 5. Set the event loop's currently running task to oldestTask.
         m_currently_running_task = oldest_task.ptr();
+        // NB: A task that spins the event loop runs other tasks in the middle of its own, so each restores what it found.
+        TemporaryChange timer_nesting_level_for_microtasks { m_timer_nesting_level_for_microtasks, oldest_task->timer_nesting_level() };
 
         // 6. Perform oldestTask's steps.
         oldest_task->execute();
@@ -410,8 +434,10 @@ void EventLoop::request_rendering_update()
 
     if (m_rendering_update_requested || m_rendering_task_queued) {
         ++m_rendering_scheduler_counters.coalesced_update_requests;
+        note_rendering_trace_event(m_running_rendering_task ? "request while rendering, coalesced"sv : "request, coalesced"sv);
         return;
     }
+    note_rendering_trace_event(m_running_rendering_task ? "request while rendering"sv : "request"sv);
 
     m_rendering_update_requested = true;
 }
@@ -422,6 +448,7 @@ bool EventLoop::rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp fr
     ++m_rendering_scheduler_counters.opportunities_received;
     if (source == RenderingOpportunitySource::Watchdog)
         ++m_rendering_scheduler_counters.watchdog_opportunities;
+    note_rendering_trace_event(source == RenderingOpportunitySource::Watchdog ? "opportunity (watchdog)"sv : "opportunity"sv);
 
     // FIXME: 1. Wait until at least one navigable whose active document's relevant agent's event loop is eventLoop might have a rendering opportunity.
 
@@ -774,6 +801,8 @@ enum class LayoutHeldForTesting : bool {
 // observations the last doc's layout answers, and the animations it samples and transitions it starts, whose timing
 // script sees follow the update. Once the transaction is taken in, those are the ones its style began, and the ones
 // running on the compositor, which the update's frame publishes.
+// The Event Timing entries pending for any doc count too: The update sets their durations from the time it reaches them,
+// and queues those that lasted 16ms or more for observers to see.
 // AD-HOC: The render clock's lanes of the docs the update took in present nothing until its frame: a task beside the
 //         update would leave the pointer unhovered and the animations still for as long as it runs, where the lanes
 //         would hover or animate beside it. A test that holds the layout that flies runs the doc's tasks beside it.
@@ -782,8 +811,9 @@ static HeldTasks tasks_rendering_update_holds(Vector<GC::Root<DOM::Document>> co
 {
     if (any_of(docs, [](auto const& document) { return document->has_intersection_observation_targets(); }))
         return HeldTasks::All;
-    // The focus fixup of every doc whose focused area is not its viewport reads that area as the update leaves it.
-    if (any_of(docs.span().slice(0, docs.size() - 1), [](auto const& document) { return focus_fixup_rule_may_apply(*document); }))
+    // The focus fixup of every doc whose focused area is not its viewport reads that area as the update leaves it, and
+    // the Event Timing entries pending for a doc are reported as the update reaches them.
+    if (any_of(docs.span().slice(0, docs.size() - 1), [](auto const& document) { return focus_fixup_rule_may_apply(*document) || EventTiming::has_pending_event_timing_entries(*document); }))
         return HeldTasks::All;
     // The lanes of a doc the update took in present nothing until it seals their plan, which its tasks would hold up.
     auto lanes_wait = [&](DOM::Document const& document) {
@@ -793,7 +823,7 @@ static HeldTasks tasks_rendering_update_holds(Vector<GC::Root<DOM::Document>> co
     if (any_of(docs.span().slice(0, docs.size() - 1), [&](auto const& document) { return lanes_wait(*document); }))
         return HeldTasks::All;
     auto& document = *docs.last();
-    if (document.has_resize_observers() || focus_fixup_rule_may_apply(document))
+    if (document.has_resize_observers() || focus_fixup_rule_may_apply(document) || EventTiming::has_pending_event_timing_entries(document))
         return HeldTasks::OfLastDocument;
     if (lanes_wait(document))
         return HeldTasks::OfLastDocument;
@@ -985,6 +1015,7 @@ void EventLoop::update_the_rendering()
         page->client().will_begin_rendering_update();
     auto update_start_time = HighResolutionTime::unsafe_shared_current_time();
     ++m_rendering_scheduler_counters.updates_run;
+    note_rendering_trace_event("update"sv);
     ++m_rendering_update_serial;
 
     // AD-HOC: The last rendering update may have ended as its style update flew. Its layout runs beside this
@@ -1402,7 +1433,7 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         if (synced_pages.contains_slow(GC::Ref { document->page() }))
             continue;
         synced_pages.append(document->page());
-        document->page().sync_media_element_video_sink_ticking();
+        document->page().sync_media_element_video_sink_ticking(docs);
     }
 
     // FIXME: 20. For each doc of docs, record rendering time for doc given unsafeStyleAndLayoutStartTime.
@@ -1440,6 +1471,7 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         if (!navigable || !navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate, lay_out_first))
             continue;
         ++m_rendering_scheduler_counters.paints;
+        note_rendering_trace_event("paint"sv);
         if (navigable->is_local_root())
             navigable->page().process_screenshot_requests();
     }
@@ -1855,6 +1887,12 @@ void EventLoop::perform_a_microtask_checkpoint()
 
         // 2. Set the event loop's currently running task to oldestMicrotask.
         m_currently_running_task = oldest_microtask;
+
+        // AD-HOC: The spec gives a microtask no timer nesting level, so a timer it schedules starts over at 0 — even
+        //         in the checkpoint that ends a deeply-nested timer callback. A page that re-arms a 0ms timer from a
+        //         promise reaction then never reaches the 4ms clamp, and spins. Instead, a microtask carries the
+        //         nesting level of the task whose checkpoint runs it, just as the timer callback itself would have.
+        oldest_microtask->set_timer_nesting_level(m_timer_nesting_level_for_microtasks);
 
         // 3. Run oldestMicrotask.
         oldest_microtask->execute();

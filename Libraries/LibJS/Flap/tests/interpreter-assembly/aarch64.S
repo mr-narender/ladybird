@@ -16,6 +16,7 @@ asm_dispatch_table:
     .quad asm_handler_Enter
     .quad asm_handler_Mov
     .quad asm_handler_MovWide
+    .quad asm_handler_WideNameIndices
     .quad asm_handler_Add
     .quad asm_handler_Sub
     .quad asm_handler_Mul
@@ -195,6 +196,7 @@ asm_dispatch_table:
     .quad asm_handler_SetCompletionType
     .quad asm_handler_GetTemplateObject
     .quad asm_handler_NewFunction
+    .quad asm_handler_NewFunctionWide
     .quad asm_handler_Typeof
     .quad asm_handler_LeavePrivateEnvironment
     .quad asm_handler_ResolveThisBinding
@@ -238,8 +240,6 @@ asm_dispatch_table:
     .quad asm_handler_JumpStrictlyInequalsLoopRhsInt32
     .quad asm_handler_JumpLooselyEqualsLoopRhsInt32
     .quad asm_handler_JumpLooselyInequalsLoopRhsInt32
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
@@ -545,6 +545,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_MovWide_hot_end
     .quad asm_handler_MovWide_cold
     .quad asm_handler_MovWide_cold_end
+    .quad asm_handler_WideNameIndices
+    .quad asm_handler_WideNameIndices_hot_end
+    .quad asm_handler_WideNameIndices_cold
+    .quad asm_handler_WideNameIndices_cold_end
     .quad asm_handler_Add
     .quad asm_handler_Add_hot_end
     .quad asm_handler_Add_cold
@@ -1261,6 +1265,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_NewFunction_hot_end
     .quad asm_handler_NewFunction_cold
     .quad asm_handler_NewFunction_cold_end
+    .quad asm_handler_NewFunctionWide
+    .quad asm_handler_NewFunctionWide_hot_end
+    .quad asm_handler_NewFunctionWide_cold
+    .quad asm_handler_NewFunctionWide_cold_end
     .quad asm_handler_Typeof
     .quad asm_handler_Typeof_hot_end
     .quad asm_handler_Typeof_cold
@@ -1549,14 +1557,6 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_fallback_hot_end
     .quad asm_handler_fallback_cold
     .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
 
 .text
 
@@ -1654,38 +1654,42 @@ asm_handler_fallback_cold_end:
 
 .p2align 4
 asm_handler_Enter:
-    ldr x2, [x28, #88]
-    cbz x2, .Lasm_Enter.assert_predicate_failure_3
-    ldr w1, [x2, #12]
-    movz x3, #0x7ffb, lsl #48
-    mov w0, #5
-.Lasm_Enter.ssa_block_3:
-    add x4, x0, #1
-    cmp x4, x1
-    b.hs .Lasm_Enter.ssa_block_2
-    add x10, x27, x0, lsl #3
-    stp x3, x3, [x10]
-    add x0, x0, #2
-    b .Lasm_Enter.ssa_block_3
+    ldr x0, [x28, #88]
+    cbz x0, .Lasm_Enter.assert_predicate_failure_3
+    ldrb w9, [x0, #109]
+    cbz w9, .Lasm_Enter.ssa_block_2
+    strb wzr, [x0, #109]
 .Lasm_Enter.ssa_block_2:
-    cmp x0, x1
-    b.hs .Lasm_Enter.ssa_block_5
-    str x3, [x27, x0, lsl #3]
+    ldr w2, [x0, #12]
+    movz x3, #0x7ffb, lsl #48
+    mov w1, #5
 .Lasm_Enter.ssa_block_5:
-    ldr w3, [x2, #16]
-    ldr x2, [x2, #32]
-    subs x3, x3, x1
-    mov x0, #0
-.Lasm_Enter.ssa_block_8:
-    cmp x0, x3
+    add x4, x1, #1
+    cmp x4, x2
+    b.hs .Lasm_Enter.ssa_block_4
+    add x10, x27, x1, lsl #3
+    stp x3, x3, [x10]
+    add x1, x1, #2
+    b .Lasm_Enter.ssa_block_5
+.Lasm_Enter.ssa_block_4:
+    cmp x1, x2
     b.hs .Lasm_Enter.ssa_block_7
-    cbz x2, .Lasm_Enter.assert_predicate_failure_25
-    ldr x4, [x2, x0, lsl #3]
-    str x4, [x27, x1, lsl #3]
-    add x0, x0, #1
-    add x1, x1, #1
-    b .Lasm_Enter.ssa_block_8
+    str x3, [x27, x1, lsl #3]
 .Lasm_Enter.ssa_block_7:
+    ldr w3, [x0, #16]
+    ldr x1, [x0, #32]
+    subs x3, x3, x2
+    mov x0, #0
+.Lasm_Enter.ssa_block_10:
+    cmp x0, x3
+    b.hs .Lasm_Enter.ssa_block_9
+    cbz x1, .Lasm_Enter.assert_predicate_failure_29
+    ldr x4, [x1, x0, lsl #3]
+    str x4, [x27, x2, lsl #3]
+    add x0, x0, #1
+    add x2, x2, #1
+    b .Lasm_Enter.ssa_block_10
+.Lasm_Enter.ssa_block_9:
     mov w9, #1
     strb w9, [x28, #79]
     ldrb w9, [x21, #1]
@@ -1717,6 +1721,14 @@ asm_handler_MovWide:
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_MovWide_hot_end:
+
+.p2align 4
+asm_handler_WideNameIndices:
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+asm_handler_WideNameIndices_hot_end:
 
 .p2align 4
 asm_handler_Add:
@@ -3386,20 +3398,21 @@ asm_handler_SetLexicalEnvironment_hot_end:
 .p2align 4
 asm_handler_GetBinding:
     ldr x0, [x28, #32]
-    add x1, x21, #7
-    ldp w1, w2, [x1, #0]
-    cbz x0, .Lasm_GetBinding.assert_predicate_failure_9
+    add x2, x21, #6
+    ldrb w1, [x2]
+    ldurh w2, [x2, #1]
+    cbz x0, .Lasm_GetBinding.assert_predicate_failure_11
     cbz w1, .Lasm_GetBinding.ssa_block_3
 .Lasm_GetBinding.ssa_block_4:
     ldr w0, [x0, #16]
     add x9, x24, w0, uxtw #3
     cmp w0, #0
     csel x0, x9, xzr, ne
-    cbz x0, .Lasm_GetBinding.assert_predicate_failure_25
+    cbz x0, .Lasm_GetBinding.assert_predicate_failure_27
     subs x1, x1, #1
     cbnz w1, .Lasm_GetBinding.ssa_block_4
 .Lasm_GetBinding.ssa_block_3:
-    cbz x0, .Lasm_GetBinding.assert_predicate_failure_13
+    cbz x0, .Lasm_GetBinding.assert_predicate_failure_15
     ldr x0, [x0, #24]
     cbz x0, .Lasm_GetBinding.assert_failure_0
     ldr x0, [x0, x2, lsl #3]
@@ -3408,8 +3421,8 @@ asm_handler_GetBinding:
     b.eq .Lasm_GetBinding.ssa_block_1
     ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #15]
-    add x21, x21, #15
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_GetBinding_hot_end:
@@ -3418,7 +3431,7 @@ asm_handler_GetBinding_hot_end:
 asm_handler_DynamicGetBinding:
     ldr x0, [x28, #88]
     ldr x0, [x0, #200]
-    ldurh w1, [x21, #7]
+    ldrh w1, [x21, #6]
     add x0, x0, x1, lsl #3
     ldp w1, w2, [x0, #0]
     movn w9, #1
@@ -3453,8 +3466,8 @@ asm_handler_DynamicGetBinding:
     b.eq .Lasm_DynamicGetBinding.ssa_block_1
     ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #9]
-    add x21, x21, #9
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_DynamicGetBinding_hot_end:
@@ -3462,27 +3475,28 @@ asm_handler_DynamicGetBinding_hot_end:
 .p2align 4
 asm_handler_GetInitializedBinding:
     ldr x0, [x28, #32]
-    add x1, x21, #7
-    ldp w1, w2, [x1, #0]
-    cbz x0, .Lasm_GetInitializedBinding.assert_predicate_failure_9
+    add x2, x21, #6
+    ldrb w1, [x2]
+    ldurh w2, [x2, #1]
+    cbz x0, .Lasm_GetInitializedBinding.assert_predicate_failure_11
     cbz w1, .Lasm_GetInitializedBinding.ssa_block_2
 .Lasm_GetInitializedBinding.ssa_block_3:
     ldr w0, [x0, #16]
     add x9, x24, w0, uxtw #3
     cmp w0, #0
     csel x0, x9, xzr, ne
-    cbz x0, .Lasm_GetInitializedBinding.assert_predicate_failure_25
+    cbz x0, .Lasm_GetInitializedBinding.assert_predicate_failure_27
     subs x1, x1, #1
     cbnz w1, .Lasm_GetInitializedBinding.ssa_block_3
 .Lasm_GetInitializedBinding.ssa_block_2:
-    cbz x0, .Lasm_GetInitializedBinding.assert_predicate_failure_12
+    cbz x0, .Lasm_GetInitializedBinding.assert_predicate_failure_14
     ldr x0, [x0, #24]
     cbz x0, .Lasm_GetInitializedBinding.assert_failure_0
     ldr x0, [x0, x2, lsl #3]
     ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #15]
-    add x21, x21, #15
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_GetInitializedBinding_hot_end:
@@ -3491,7 +3505,7 @@ asm_handler_GetInitializedBinding_hot_end:
 asm_handler_DynamicGetInitializedBinding:
     ldr x0, [x28, #88]
     ldr x0, [x0, #200]
-    ldurh w1, [x21, #7]
+    ldrh w1, [x21, #6]
     add x0, x0, x1, lsl #3
     ldp w1, w2, [x0, #0]
     movn w9, #1
@@ -3523,8 +3537,8 @@ asm_handler_DynamicGetInitializedBinding:
     ldr x0, [x0, x2, lsl #3]
     ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #9]
-    add x21, x21, #9
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_DynamicGetInitializedBinding_hot_end:
@@ -3532,27 +3546,28 @@ asm_handler_DynamicGetInitializedBinding_hot_end:
 .p2align 4
 asm_handler_InitializeLexicalBinding:
     ldr x0, [x28, #32]
-    add x1, x21, #5
-    ldp w1, w2, [x1, #0]
-    cbz x0, .Lasm_InitializeLexicalBinding.assert_predicate_failure_9
+    add x2, x21, #4
+    ldrb w1, [x2]
+    ldurh w2, [x2, #1]
+    cbz x0, .Lasm_InitializeLexicalBinding.assert_predicate_failure_11
     cbz w1, .Lasm_InitializeLexicalBinding.ssa_block_2
 .Lasm_InitializeLexicalBinding.ssa_block_3:
     ldr w0, [x0, #16]
     add x9, x24, w0, uxtw #3
     cmp w0, #0
     csel x0, x9, xzr, ne
-    cbz x0, .Lasm_InitializeLexicalBinding.assert_predicate_failure_25
+    cbz x0, .Lasm_InitializeLexicalBinding.assert_predicate_failure_27
     subs x1, x1, #1
     cbnz w1, .Lasm_InitializeLexicalBinding.ssa_block_3
 .Lasm_InitializeLexicalBinding.ssa_block_2:
-    cbz x0, .Lasm_InitializeLexicalBinding.assert_predicate_failure_12
+    cbz x0, .Lasm_InitializeLexicalBinding.assert_predicate_failure_14
     ldr x0, [x0, #24]
     cbz x0, .Lasm_InitializeLexicalBinding.assert_failure_0
-    ldrb w1, [x21, #4]
+    ldrb w1, [x21, #3]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x0, x2, lsl #3]
-    ldrb w9, [x21, #13]
-    add x21, x21, #13
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_InitializeLexicalBinding_hot_end:
@@ -3560,27 +3575,28 @@ asm_handler_InitializeLexicalBinding_hot_end:
 .p2align 4
 asm_handler_InitializeVariableBinding:
     ldr x0, [x28, #40]
-    add x1, x21, #5
-    ldp w1, w2, [x1, #0]
-    cbz x0, .Lasm_InitializeVariableBinding.assert_predicate_failure_9
+    add x2, x21, #4
+    ldrb w1, [x2]
+    ldurh w2, [x2, #1]
+    cbz x0, .Lasm_InitializeVariableBinding.assert_predicate_failure_11
     cbz w1, .Lasm_InitializeVariableBinding.ssa_block_2
 .Lasm_InitializeVariableBinding.ssa_block_3:
     ldr w0, [x0, #16]
     add x9, x24, w0, uxtw #3
     cmp w0, #0
     csel x0, x9, xzr, ne
-    cbz x0, .Lasm_InitializeVariableBinding.assert_predicate_failure_25
+    cbz x0, .Lasm_InitializeVariableBinding.assert_predicate_failure_27
     subs x1, x1, #1
     cbnz w1, .Lasm_InitializeVariableBinding.ssa_block_3
 .Lasm_InitializeVariableBinding.ssa_block_2:
-    cbz x0, .Lasm_InitializeVariableBinding.assert_predicate_failure_12
+    cbz x0, .Lasm_InitializeVariableBinding.assert_predicate_failure_14
     ldr x0, [x0, #24]
     cbz x0, .Lasm_InitializeVariableBinding.assert_failure_0
-    ldrb w1, [x21, #4]
+    ldrb w1, [x21, #3]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x0, x2, lsl #3]
-    ldrb w9, [x21, #13]
-    add x21, x21, #13
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_InitializeVariableBinding_hot_end:
@@ -3589,7 +3605,7 @@ asm_handler_InitializeVariableBinding_hot_end:
 asm_handler_DynamicInitializeLexicalBinding:
     ldr x0, [x28, #88]
     ldr x0, [x0, #200]
-    ldurh w1, [x21, #5]
+    ldrh w1, [x21, #4]
     add x0, x0, x1, lsl #3
     ldp w1, w2, [x0, #0]
     movn w9, #1
@@ -3618,11 +3634,11 @@ asm_handler_DynamicInitializeLexicalBinding:
     cbnz w9, .Lasm_DynamicInitializeLexicalBinding.ssa_block_1
     ldr x0, [x0, #24]
     cbz x0, .Lasm_DynamicInitializeLexicalBinding.assert_failure_0
-    ldrb w1, [x21, #4]
+    ldrb w1, [x21, #3]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x0, x2, lsl #3]
-    ldrb w9, [x21, #7]
-    add x21, x21, #7
+    ldrb w9, [x21, #6]
+    add x21, x21, #6
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_DynamicInitializeLexicalBinding_hot_end:
@@ -3631,7 +3647,7 @@ asm_handler_DynamicInitializeLexicalBinding_hot_end:
 asm_handler_DynamicInitializeVariableBinding:
     ldr x0, [x28, #88]
     ldr x0, [x0, #200]
-    ldurh w1, [x21, #5]
+    ldrh w1, [x21, #4]
     add x0, x0, x1, lsl #3
     ldp w1, w2, [x0, #0]
     movn w9, #1
@@ -3660,11 +3676,11 @@ asm_handler_DynamicInitializeVariableBinding:
     cbnz w9, .Lasm_DynamicInitializeVariableBinding.ssa_block_1
     ldr x0, [x0, #24]
     cbz x0, .Lasm_DynamicInitializeVariableBinding.assert_failure_0
-    ldrb w1, [x21, #4]
+    ldrb w1, [x21, #3]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x0, x2, lsl #3]
-    ldrb w9, [x21, #7]
-    add x21, x21, #7
+    ldrb w9, [x21, #6]
+    add x21, x21, #6
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_DynamicInitializeVariableBinding_hot_end:
@@ -3672,20 +3688,21 @@ asm_handler_DynamicInitializeVariableBinding_hot_end:
 .p2align 4
 asm_handler_SetLexicalBinding:
     ldr x1, [x28, #32]
-    add x0, x21, #5
-    ldp w2, w0, [x0, #0]
-    cbz x1, .Lasm_SetLexicalBinding.assert_predicate_failure_9
+    add x0, x21, #4
+    ldrb w2, [x0]
+    ldurh w0, [x0, #1]
+    cbz x1, .Lasm_SetLexicalBinding.assert_predicate_failure_11
     cbz w2, .Lasm_SetLexicalBinding.ssa_block_5
 .Lasm_SetLexicalBinding.ssa_block_6:
     ldr w1, [x1, #16]
     add x9, x24, w1, uxtw #3
     cmp w1, #0
     csel x1, x9, xzr, ne
-    cbz x1, .Lasm_SetLexicalBinding.assert_predicate_failure_31
+    cbz x1, .Lasm_SetLexicalBinding.assert_predicate_failure_33
     subs x2, x2, #1
     cbnz w2, .Lasm_SetLexicalBinding.ssa_block_6
 .Lasm_SetLexicalBinding.ssa_block_5:
-    cbz x1, .Lasm_SetLexicalBinding.assert_predicate_failure_19
+    cbz x1, .Lasm_SetLexicalBinding.assert_predicate_failure_21
     ldr x3, [x1, #24]
     cbz x3, .Lasm_SetLexicalBinding.assert_failure_0
     ldr x2, [x3, x0, lsl #3]
@@ -3727,11 +3744,11 @@ asm_handler_SetLexicalBinding:
     tbnz x1, #1, 1f
     b .Lasm_SetLexicalBinding.ssa_block_1
 1:
-    ldrb w1, [x21, #4]
+    ldrb w1, [x21, #3]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x3, x0, lsl #3]
-    ldrb w9, [x21, #13]
-    add x21, x21, #13
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_SetLexicalBinding_hot_end:
@@ -3739,20 +3756,21 @@ asm_handler_SetLexicalBinding_hot_end:
 .p2align 4
 asm_handler_SetVariableBinding:
     ldr x1, [x28, #40]
-    add x0, x21, #5
-    ldp w2, w0, [x0, #0]
-    cbz x1, .Lasm_SetVariableBinding.assert_predicate_failure_9
+    add x0, x21, #4
+    ldrb w2, [x0]
+    ldurh w0, [x0, #1]
+    cbz x1, .Lasm_SetVariableBinding.assert_predicate_failure_11
     cbz w2, .Lasm_SetVariableBinding.ssa_block_5
 .Lasm_SetVariableBinding.ssa_block_6:
     ldr w1, [x1, #16]
     add x9, x24, w1, uxtw #3
     cmp w1, #0
     csel x1, x9, xzr, ne
-    cbz x1, .Lasm_SetVariableBinding.assert_predicate_failure_31
+    cbz x1, .Lasm_SetVariableBinding.assert_predicate_failure_33
     subs x2, x2, #1
     cbnz w2, .Lasm_SetVariableBinding.ssa_block_6
 .Lasm_SetVariableBinding.ssa_block_5:
-    cbz x1, .Lasm_SetVariableBinding.assert_predicate_failure_19
+    cbz x1, .Lasm_SetVariableBinding.assert_predicate_failure_21
     ldr x3, [x1, #24]
     cbz x3, .Lasm_SetVariableBinding.assert_failure_0
     ldr x2, [x3, x0, lsl #3]
@@ -3794,11 +3812,11 @@ asm_handler_SetVariableBinding:
     tbnz x1, #1, 1f
     b .Lasm_SetVariableBinding.ssa_block_1
 1:
-    ldrb w1, [x21, #4]
+    ldrb w1, [x21, #3]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x3, x0, lsl #3]
-    ldrb w9, [x21, #13]
-    add x21, x21, #13
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_SetVariableBinding_hot_end:
@@ -3807,7 +3825,7 @@ asm_handler_SetVariableBinding_hot_end:
 asm_handler_DynamicSetLexicalBinding:
     ldr x0, [x28, #88]
     ldr x0, [x0, #200]
-    ldurh w1, [x21, #5]
+    ldrh w1, [x21, #4]
     add x0, x0, x1, lsl #3
     ldp w2, w1, [x0, #0]
     movn w9, #1
@@ -3875,11 +3893,11 @@ asm_handler_DynamicSetLexicalBinding:
     tbnz x0, #1, 1f
     b .Lasm_DynamicSetLexicalBinding.ssa_block_1
 1:
-    ldrb w0, [x21, #4]
+    ldrb w0, [x21, #3]
     ldr x0, [x27, x0, lsl #3]
     str x0, [x3, x1, lsl #3]
-    ldrb w9, [x21, #7]
-    add x21, x21, #7
+    ldrb w9, [x21, #6]
+    add x21, x21, #6
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_DynamicSetLexicalBinding_hot_end:
@@ -3888,7 +3906,7 @@ asm_handler_DynamicSetLexicalBinding_hot_end:
 asm_handler_DynamicSetVariableBinding:
     ldr x0, [x28, #88]
     ldr x0, [x0, #200]
-    ldurh w1, [x21, #5]
+    ldrh w1, [x21, #4]
     add x0, x0, x1, lsl #3
     ldp w2, w1, [x0, #0]
     movn w9, #1
@@ -3956,11 +3974,11 @@ asm_handler_DynamicSetVariableBinding:
     tbnz x0, #1, 1f
     b .Lasm_DynamicSetVariableBinding.ssa_block_1
 1:
-    ldrb w0, [x21, #4]
+    ldrb w0, [x21, #3]
     ldr x0, [x27, x0, lsl #3]
     str x0, [x3, x1, lsl #3]
-    ldrb w9, [x21, #7]
-    add x21, x21, #7
+    ldrb w9, [x21, #6]
+    add x21, x21, #6
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_DynamicSetVariableBinding_hot_end:
@@ -4641,20 +4659,21 @@ asm_handler_StrictlyInequals_hot_end:
 .p2align 4
 asm_handler_GetCalleeAndThisFromEnvironment:
     ldr x0, [x28, #32]
-    add x1, x21, #8
-    ldp w1, w2, [x1, #0]
-    cbz x0, .Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_9
+    add x2, x21, #7
+    ldrb w1, [x2]
+    ldurh w2, [x2, #1]
+    cbz x0, .Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_11
     cbz w1, .Lasm_GetCalleeAndThisFromEnvironment.ssa_block_3
 .Lasm_GetCalleeAndThisFromEnvironment.ssa_block_4:
     ldr w0, [x0, #16]
     add x9, x24, w0, uxtw #3
     cmp w0, #0
     csel x0, x9, xzr, ne
-    cbz x0, .Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_25
+    cbz x0, .Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_27
     subs x1, x1, #1
     cbnz w1, .Lasm_GetCalleeAndThisFromEnvironment.ssa_block_4
 .Lasm_GetCalleeAndThisFromEnvironment.ssa_block_3:
-    cbz x0, .Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_13
+    cbz x0, .Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_15
     ldr x0, [x0, #24]
     cbz x0, .Lasm_GetCalleeAndThisFromEnvironment.assert_failure_0
     ldr x0, [x0, x2, lsl #3]
@@ -4666,8 +4685,8 @@ asm_handler_GetCalleeAndThisFromEnvironment:
     ldrb w9, [x21, #4]
     movz x10, #0x7ffe, lsl #48
     str x10, [x27, x9, lsl #3]
-    ldrb w9, [x21, #16]
-    add x21, x21, #16
+    ldrb w9, [x21, #10]
+    add x21, x21, #10
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_GetCalleeAndThisFromEnvironment_hot_end:
@@ -4676,7 +4695,7 @@ asm_handler_GetCalleeAndThisFromEnvironment_hot_end:
 asm_handler_DynamicGetCalleeAndThisFromEnvironment:
     ldr x0, [x28, #88]
     ldr x0, [x0, #200]
-    ldrh w1, [x21, #8]
+    ldurh w1, [x21, #7]
     add x0, x0, x1, lsl #3
     ldp w1, w2, [x0, #0]
     movn w9, #1
@@ -4714,8 +4733,8 @@ asm_handler_DynamicGetCalleeAndThisFromEnvironment:
     ldrb w9, [x21, #4]
     movz x10, #0x7ffe, lsl #48
     str x10, [x27, x9, lsl #3]
-    ldrb w9, [x21, #10]
-    add x21, x21, #10
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_DynamicGetCalleeAndThisFromEnvironment_hot_end:
@@ -5012,8 +5031,8 @@ asm_handler_PutByValue:
     ldrb w2, [x21, #5]
     ldr x2, [x27, x2, lsl #3]
     str x2, [x1, x0, lsl #3]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_switch_10_after_preferred:
@@ -5034,8 +5053,8 @@ asm_handler_PutByValue:
     ldrb w2, [x21, #5]
     ldr x2, [x27, x2, lsl #3]
     str x2, [x1, x0, lsl #3]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_11:
@@ -5079,8 +5098,8 @@ asm_handler_PutByValue:
     and x0, x0, #0x3ffffffffff
     adds x0, x0, x1
     strb w4, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_16:
@@ -5088,8 +5107,8 @@ asm_handler_PutByValue:
     and x0, x0, #0x3ffffffffff
     adds x0, x0, x1
     strh w4, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_17:
@@ -5100,8 +5119,8 @@ asm_handler_PutByValue:
     mov x4, #0
 .Lasm_PutByValue.ssa_block_23:
     strb w4, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_22:
@@ -5114,8 +5133,8 @@ asm_handler_PutByValue:
     and x0, x0, #0x3ffffffffff
     adds x0, x0, x1
     str w4, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_19:
@@ -5125,8 +5144,8 @@ asm_handler_PutByValue:
     scvtf d0, w4
     fcvt s0, d0
     str s0, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_20:
@@ -5136,8 +5155,8 @@ asm_handler_PutByValue:
     scvtf d0, w4
     fmov x1, d0
     str x1, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_7:
@@ -5153,8 +5172,8 @@ asm_handler_PutByValue:
     fmov d0, x4
     fcvt s0, d0
     str s0, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_switch_7_after_preferred:
@@ -5179,8 +5198,8 @@ asm_handler_PutByValue:
     and x0, x0, #0x3ffffffffff
     adds x0, x0, x1
     str x4, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_29:
@@ -5199,8 +5218,8 @@ asm_handler_PutByValue:
     and x0, x0, #0x3ffffffffff
     adds x0, x0, x1
     strb w3, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_30:
@@ -5219,8 +5238,8 @@ asm_handler_PutByValue:
     and x0, x0, #0x3ffffffffff
     adds x0, x0, x1
     strh w3, [x0]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_31:
@@ -5239,8 +5258,8 @@ asm_handler_PutByValue:
     and x0, x0, #0x3ffffffffff
     adds x1, x1, x0
     str w3, [x1]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_4:
@@ -5248,7 +5267,7 @@ asm_handler_PutByValue:
     cbz x0, .Lasm_PutByValue.assert_predicate_failure_15
     ldr x0, [x0, #152]
     cbz x0, .Lasm_PutByValue.assert_failure_1
-    ldrh w1, [x21, #12]
+    ldurh w1, [x21, #7]
     ldr x0, [x0, x1, lsl #3]
     cbz x0, .Lasm_PutByValue.ssa_block_1
     cmp x0, #3
@@ -5288,15 +5307,15 @@ asm_handler_PutByValue:
     ldrb w1, [x21, #5]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x0, x3, lsl #3]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_PutByValue_hot_end:
 
 .p2align 4
 asm_handler_GetById:
-    ldrb w0, [x21, #4]
+    ldrb w0, [x21, #2]
     ldr x3, [x27, x0, lsl #3]
     lsr x9, x3, #48
     mov w10, #65529
@@ -5308,14 +5327,14 @@ asm_handler_GetById:
     cbz x0, .Lasm_GetById.assert_failure_0
     add x0, x24, w0, uxtw #3
     ldr x1, [x28, #88]
-    cbz x1, .Lasm_GetById.assert_predicate_failure_123
+    cbz x1, .Lasm_GetById.assert_predicate_failure_124
     ldr x2, [x1, #152]
     cbz x2, .Lasm_GetById.assert_failure_1
-    ldrh w4, [x21, #10]
+    ldurh w4, [x21, #5]
     ldr x2, [x2, x4, lsl #3]
     cbz x2, .Lasm_GetById.ssa_block_1
     and x2, x2, #0xfffffffffffffffc
-    cbz x2, .Lasm_GetById.assert_predicate_failure_337
+    cbz x2, .Lasm_GetById.assert_predicate_failure_338
     ldr x9, [x2, #24]
     cmp x9, x0
     b.ne .Lasm_GetById.ssa_block_15
@@ -5337,16 +5356,16 @@ asm_handler_GetById:
     mov w10, #65532
     cmp x9, x10
     b.eq .Lasm_GetById.ssa_block_17
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetById.ssa_block_15:
     ldr x1, [x1, #152]
     cbz x1, .Lasm_GetById.assert_failure_3
-    ldrh w2, [x21, #10]
+    ldurh w2, [x21, #5]
     ldr x1, [x1, x2, lsl #3]
     mov x2, x1
     and x2, x2, #0x3
@@ -5384,10 +5403,10 @@ asm_handler_GetById:
     mov w10, #65532
     cmp x9, x10
     b.eq .Lasm_GetById.ssa_block_1
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_GetById_hot_end:
@@ -5409,7 +5428,7 @@ asm_handler_PutById:
     cbz x0, .Lasm_PutById.assert_predicate_failure_14
     ldr x0, [x0, #152]
     cbz x0, .Lasm_PutById.assert_failure_1
-    ldrh w3, [x21, #10]
+    ldrh w3, [x21, #6]
     ldr x0, [x0, x3, lsl #3]
     cbz x0, .Lasm_PutById.ssa_block_2
     and x0, x0, #0xfffffffffffffffc
@@ -5431,23 +5450,23 @@ asm_handler_PutById:
     mov w10, #65532
     cmp x9, x10
     b.eq .Lasm_PutById.ssa_block_2
-    ldrb w1, [x21, #5]
+    ldrb w1, [x21, #4]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x0, x3, lsl #3]
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_PutById_hot_end:
 
 .p2align 4
 asm_handler_GetByValue:
-    ldrb w0, [x21, #7]
+    ldrb w0, [x21, #5]
     ldr x4, [x27, x0, lsl #3]
     lsr x9, x4, #48
     cmp x9, x22
     b.ne .Lasm_GetByValue.ssa_block_5
-    ldrb w0, [x21, #6]
+    ldrb w0, [x21, #4]
     ldr x3, [x27, x0, lsl #3]
     lsr x0, x3, #48
     mov w9, #65529
@@ -5473,10 +5492,10 @@ asm_handler_GetByValue:
     cmp x0, x2
     b.hs .Lasm_GetByValue.ssa_block_1
     ldr x0, [x1, x0, lsl #3]
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_switch_21_after_preferred:
@@ -5494,10 +5513,10 @@ asm_handler_GetByValue:
     movz x9, #0x7ffb, lsl #48
     cmp x0, x9
     b.eq .Lasm_GetByValue.ssa_block_1
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_20:
@@ -5521,10 +5540,10 @@ asm_handler_GetByValue:
     adds x0, x0, x1
     ldrb w0, [x0]
     movk x0, #0x7ffa, lsl #48
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_switch_20_after_preferred:
@@ -5577,10 +5596,10 @@ asm_handler_GetByValue:
 1:
 .Lasm_GetByValue.ssa_block_11:
     movk x0, #0x7ffa, lsl #48
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_30:
@@ -5613,10 +5632,10 @@ asm_handler_GetByValue:
     b.ne .Lasm_GetByValue.ssa_block_10
 .Lasm_GetByValue.ssa_block_9:
     movk x0, #0x7ffa, lsl #48
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_10:
@@ -5624,10 +5643,10 @@ asm_handler_GetByValue:
     fcmp d0, d0
     b.vs .Lasm_GetByValue.canon_nan_1
 .Lasm_GetByValue.canon_nan_1_ret:
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_8:
@@ -5683,15 +5702,15 @@ asm_handler_GetByValue:
     lsr x9, x0, #48
     mov w10, #65530
     cmp x9, x10
-    b.ne .Lasm_GetByValue.assert_predicate_failure_297
-    ldrb w9, [x21, #5]
+    b.ne .Lasm_GetByValue.assert_predicate_failure_298
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_5:
-    ldrb w0, [x21, #6]
+    ldrb w0, [x21, #4]
     ldr x2, [x27, x0, lsl #3]
     lsr x9, x2, #48
     mov w10, #65529
@@ -5700,16 +5719,16 @@ asm_handler_GetByValue:
     ldr x0, [x28, #88]
     ldr x1, [x0, #152]
     cbz x1, .Lasm_GetByValue.assert_failure_2
-    ldrh w3, [x21, #10]
+    ldrh w3, [x21, #6]
     ldr x1, [x1, x3, lsl #3]
     and x2, x2, #0x7ffffffff
     add x2, x2, x24
     cmp x1, #3
     b.eq .Lasm_GetByValue.ssa_block_6
-    cbz x0, .Lasm_GetByValue.assert_predicate_failure_231
+    cbz x0, .Lasm_GetByValue.assert_predicate_failure_232
     ldr x0, [x0, #152]
     cbz x0, .Lasm_GetByValue.assert_failure_3
-    ldrh w1, [x21, #10]
+    ldrh w1, [x21, #6]
     ldr x0, [x0, x1, lsl #3]
     cbz x0, .Lasm_GetByValue.ssa_block_1
     cmp x0, #3
@@ -5740,17 +5759,17 @@ asm_handler_GetByValue:
     mov w10, #65532
     cmp x9, x10
     b.eq .Lasm_GetByValue.ssa_block_1
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_GetByValue_hot_end:
 
 .p2align 4
 asm_handler_GetLength:
-    ldrb w0, [x21, #6]
+    ldrb w0, [x21, #4]
     ldr x2, [x27, x0, lsl #3]
     lsr x0, x2, #48
     mov w9, #65529
@@ -5765,10 +5784,10 @@ asm_handler_GetLength:
     b .Lasm_GetLength.ssa_block_3
 1:
     movk x0, #0x7ffa, lsl #48
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #11]
-    add x21, x21, #11
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetLength.ssa_block_6:
@@ -5776,14 +5795,14 @@ asm_handler_GetLength:
     cbz x1, .Lasm_GetLength.assert_failure_0
     add x1, x24, w1, uxtw #3
     ldr x0, [x28, #88]
-    cbz x0, .Lasm_GetLength.assert_predicate_failure_21
+    cbz x0, .Lasm_GetLength.assert_predicate_failure_22
     ldr x0, [x0, #152]
     cbz x0, .Lasm_GetLength.assert_failure_1
-    ldurh w3, [x21, #9]
+    ldurh w3, [x21, #5]
     ldr x0, [x0, x3, lsl #3]
     cbz x0, .Lasm_GetLength.ssa_block_1
     and x0, x0, #0xfffffffffffffffc
-    cbz x0, .Lasm_GetLength.assert_predicate_failure_43
+    cbz x0, .Lasm_GetLength.assert_predicate_failure_44
     ldp x4, x3, [x0, #24]
     cmp x4, x1
     b.ne .Lasm_GetLength.ssa_block_1
@@ -5802,10 +5821,10 @@ asm_handler_GetLength:
     mov w10, #65532
     cmp x9, x10
     b.eq .Lasm_GetLength.ssa_block_1
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #11]
-    add x21, x21, #11
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetLength.ssa_block_2:
@@ -5819,10 +5838,10 @@ asm_handler_GetLength:
     b .Lasm_GetLength.ssa_block_1
 1:
     movk x0, #0x7ffa, lsl #48
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #11]
-    add x21, x21, #11
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_GetLength_hot_end:
@@ -5835,7 +5854,7 @@ asm_handler_GetGlobal:
     cbz x0, .Lasm_GetGlobal.assert_predicate_failure_9
     ldr x1, [x0, #176]
     cbz x1, .Lasm_GetGlobal.assert_failure_0
-    ldurh w0, [x21, #7]
+    ldrh w0, [x21, #6]
     mov w9, #80
     mul x0, x0, x9
     adds x0, x0, x1
@@ -5863,8 +5882,8 @@ asm_handler_GetGlobal:
     b.eq .Lasm_GetGlobal.ssa_block_1
     ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #9]
-    add x21, x21, #9
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetGlobal.ssa_block_2:
@@ -5879,8 +5898,8 @@ asm_handler_GetGlobal:
     b.eq .Lasm_GetGlobal.ssa_block_1
     ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #9]
-    add x21, x21, #9
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_GetGlobal_hot_end:
@@ -5893,7 +5912,7 @@ asm_handler_ResolveGlobalBinding:
     cbz x0, .Lasm_ResolveGlobalBinding.assert_predicate_failure_9
     ldr x1, [x0, #176]
     cbz x1, .Lasm_ResolveGlobalBinding.assert_failure_0
-    ldurh w0, [x21, #5]
+    ldrh w0, [x21, #4]
     mov w9, #80
     mul x0, x0, x9
     adds x0, x0, x1
@@ -5916,8 +5935,8 @@ asm_handler_ResolveGlobalBinding:
     movz x10, #0x1, lsl #0
     movk x10, #0x7ff9, lsl #48
     str x10, [x27, x9, lsl #3]
-    ldrb w9, [x21, #7]
-    add x21, x21, #7
+    ldrb w9, [x21, #6]
+    add x21, x21, #6
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_ResolveGlobalBinding.ssa_block_2:
@@ -5927,8 +5946,8 @@ asm_handler_ResolveGlobalBinding:
     movz x10, #0x1, lsl #0
     movk x10, #0x7ff9, lsl #48
     str x10, [x27, x9, lsl #3]
-    ldrb w9, [x21, #7]
-    add x21, x21, #7
+    ldrb w9, [x21, #6]
+    add x21, x21, #6
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_ResolveGlobalBinding_hot_end:
@@ -5941,7 +5960,7 @@ asm_handler_SetGlobal:
     cbz x0, .Lasm_SetGlobal.assert_predicate_failure_9
     ldr x2, [x0, #176]
     cbz x2, .Lasm_SetGlobal.assert_failure_0
-    ldurh w0, [x21, #5]
+    ldrh w0, [x21, #4]
     mov w9, #80
     mul x0, x0, x9
     adds x0, x0, x2
@@ -5969,11 +5988,11 @@ asm_handler_SetGlobal:
     b.eq .Lasm_SetGlobal.ssa_block_1
     ldrb w9, [x0, #13]
     cbz w9, .Lasm_SetGlobal.ssa_block_1
-    ldrb w0, [x21, #4]
+    ldrb w0, [x21, #3]
     ldr x0, [x27, x0, lsl #3]
     str x0, [x1, x4, lsl #3]
-    ldrb w9, [x21, #7]
-    add x21, x21, #7
+    ldrb w9, [x21, #6]
+    add x21, x21, #6
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_SetGlobal.ssa_block_2:
@@ -6021,18 +6040,18 @@ asm_handler_SetGlobal:
     tbnz x1, #1, 1f
     b .Lasm_SetGlobal.ssa_block_1
 1:
-    ldrb w1, [x21, #4]
+    ldrb w1, [x21, #3]
     ldr x1, [x27, x1, lsl #3]
     str x1, [x3, x0, lsl #3]
-    ldrb w9, [x21, #7]
-    add x21, x21, #7
+    ldrb w9, [x21, #6]
+    add x21, x21, #6
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_SetGlobal_hot_end:
 
 .p2align 4
 asm_handler_Call:
-    ldrb w0, [x21, #6]
+    ldrb w0, [x21, #4]
     ldr x1, [x27, x0, lsl #3]
     lsr x9, x1, #48
     mov w10, #65529
@@ -6059,7 +6078,7 @@ asm_handler_Call:
     tbnz x0, #33, .Lasm_Call.ssa_block_2
     movz x6, #0x7ffb, lsl #48
     tbz x0, #34, .Lasm_Call.ssa_block_9
-    ldrb w3, [x21, #7]
+    ldrb w3, [x21, #5]
     ldr x6, [x27, x3, lsl #3]
     tbnz x0, #35, .Lasm_Call.ssa_block_9
     lsr x3, x6, #48
@@ -6086,7 +6105,7 @@ asm_handler_Call:
     cmp w3, w9
     b.ne .Lasm_Call.ssa_block_2
 .Lasm_Call.ssa_block_9:
-    ldrb w4, [x21, #8]
+    ldrb w4, [x21, #6]
     mov w3, w0
     cmp x3, x4
     b.hs .Lasm_Call.ssa_block_29
@@ -6116,7 +6135,7 @@ asm_handler_Call:
     mov x8, x20
     str x5, [x8, #16]
     stp w7, w3, [x0, #116]
-    ldrb w5, [x21, #8]
+    ldrb w5, [x21, #6]
     str w5, [x0, #104]
     ldr w5, [x1, #20]
     cbz x5, .Lasm_Call.assert_failure_6
@@ -6169,19 +6188,19 @@ asm_handler_Call:
     strb wzr, [x0, #124]
     strb wzr, [x0, #125]
     str x28, [x0, #96]
-    ldrb w2, [x21, #8]
-    mov w1, #11
+    ldrb w2, [x21, #6]
+    mov w1, #7
     adds x1, x1, x2
-    ldrb w5, [x21, #5]
+    ldrb w5, [x21, #3]
     sub w2, w21, w26
     adds x1, x1, x2
     str w2, [x28, #64]
     stp w1, w5, [x0, #108]
-    ldrb w2, [x21, #8]
+    ldrb w2, [x21, #6]
     cmp x3, x2
     b.lo .Lasm_Call.assert_predicate_failure_275
     add x6, x28, #128
-    add x7, x21, #11
+    add x7, x21, #7
     add x5, x0, #128
     mov x1, #0
 .Lasm_Call.ssa_block_19:
@@ -6221,7 +6240,7 @@ asm_handler_Call:
     tbnz x0, #1, 1f
     b .Lasm_Call.ssa_block_1
 1:
-    ldrb w3, [x21, #8]
+    ldrb w3, [x21, #6]
     mov x0, x20
     ldp x0, x4, [x0, #16]
     cbz x0, .Lasm_Call.assert_failure_11
@@ -6258,7 +6277,7 @@ asm_handler_Call:
     stp x2, x4, [x0, #32]
     ldr x2, [x28, #48]
     str x2, [x0, #48]
-    ldrb w2, [x21, #7]
+    ldrb w2, [x21, #5]
     ldr x2, [x27, x2, lsl #3]
     str x2, [x0, #80]
     str xzr, [x0, #16]
@@ -6279,17 +6298,17 @@ asm_handler_Call:
     strb wzr, [x0, #79]
     strb wzr, [x0, #124]
     strb wzr, [x0, #125]
-    ldrb w4, [x21, #8]
-    mov w2, #11
+    ldrb w4, [x21, #6]
+    mov w2, #7
     adds x2, x2, x4
-    ldrb w5, [x21, #5]
+    ldrb w5, [x21, #3]
     sub w4, w21, w26
     adds x2, x2, x4
     str w4, [x28, #64]
     str x28, [x0, #96]
     stp w2, w5, [x0, #108]
     add x4, x28, #128
-    add x5, x21, #11
+    add x5, x21, #7
     add x6, x0, #128
     mov x2, #0
 .Lasm_Call.ssa_block_25:
@@ -6330,10 +6349,10 @@ asm_handler_Call:
     str x28, [x2, #16]
     mov x28, x1
     add x27, x28, #128
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w1, [x21, #8]
-    mov w0, #11
+    ldrb w1, [x21, #6]
+    mov w0, #7
     adds x0, x0, x1
     add x21, x21, w0, uxtw
     ldrb w9, [x21]
@@ -6341,7 +6360,7 @@ asm_handler_Call:
     br x10
 .Lasm_Call.ssa_block_2:
     add x9, sp, #0
-    ldrb w10, [x21, #8]
+    ldrb w10, [x21, #6]
     lsl x10, x10, #3
     add x10, x10, #55
     and x10, x10, #0xfffffffffffffff0
@@ -6364,18 +6383,18 @@ asm_handler_Call:
 .Lasm_Call.values_allocated_21:
     add sp, x14, #0
     str x9, [sp]
-    ldrb w12, [x21, #6]
+    ldrb w12, [x21, #4]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_Call.value_ready_22:
     str x11, [sp, #24]
-    ldrb w12, [x21, #7]
+    ldrb w12, [x21, #5]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_Call.value_ready_23:
     str x11, [sp, #32]
     mov w9, #0
-    ldrb w10, [x21, #8]
+    ldrb w10, [x21, #6]
     add x14, sp, #40
-    add x3, x21, #11
+    add x3, x21, #7
 .Lasm_Call.array_value_next_24:
     cmp x9, x10
     b.hs .Lasm_Call.array_values_end_26
@@ -6395,7 +6414,7 @@ asm_handler_Call:
     cmp x9, x28
     b.ne .Lasm_Call.values_restore_stack_27
     cbnz x0, .Lasm_Call.values_exceptional_outputs_28
-    ldrb w12, [x21, #5]
+    ldrb w12, [x21, #3]
     ldr x11, [sp, #16]
     str x11, [x27, x12, lsl #3]
 .Lasm_Call.skip_output_value_29:
@@ -6530,15 +6549,15 @@ asm_handler_IteratorClose:
     cbz x0, .Lasm_IteratorClose.ssa_block_1
     ldrb w9, [x0, #11]
     cbz w9, .Lasm_IteratorClose.ssa_block_1
-    ldrb w9, [x21, #11]
-    add x21, x21, #11
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_IteratorClose.ssa_block_3:
     ldr x1, [x28, #88]
     ldr x1, [x1, #152]
     cbz x1, .Lasm_IteratorClose.assert_failure_0
-    ldurh w2, [x21, #9]
+    ldrh w2, [x21, #6]
     lsl x2, x2, #3
     adds x1, x1, x2
     bl CSYM(asm_try_get_by_id_cache)
@@ -6547,8 +6566,8 @@ asm_handler_IteratorClose:
     mov w9, #32766
     cmp w0, w9
     b.ne .Lasm_IteratorClose.ssa_block_1
-    ldrb w9, [x21, #11]
-    add x21, x21, #11
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_IteratorClose_hot_end:
@@ -8431,6 +8450,8 @@ asm_handler_Mov_cold:
 asm_handler_Mov_cold_end:
 asm_handler_MovWide_cold:
 asm_handler_MovWide_cold_end:
+asm_handler_WideNameIndices_cold:
+asm_handler_WideNameIndices_cold_end:
 asm_handler_Add_cold:
 // Cold paths for Add
 .Lasm_Add.ssa_checked_6_failure:
@@ -9149,7 +9170,7 @@ asm_handler_NewClass:
     sub w1, w21, w26
     str w1, [x28, #64]
     add x9, sp, #0
-    ldrb w10, [x21, #14]
+    ldrb w10, [x21, #13]
     lsl x10, x10, #3
     add x10, x10, #71
     and x10, x10, #0xfffffffffffffff0
@@ -9195,7 +9216,7 @@ asm_handler_NewClass:
 .Lasm_NewClass.value_ready_6:
     str x11, [sp, #40]
     movz x11, #0x7ffb, lsl #48
-    ldrb w12, [x21, #12]
+    ldrb w12, [x21, #11]
     mov w13, #255
     cmp w12, w13
     b.eq .Lasm_NewClass.value_ready_7
@@ -9203,9 +9224,9 @@ asm_handler_NewClass:
 .Lasm_NewClass.value_ready_7:
     str x11, [sp, #48]
     mov w9, #0
-    ldrb w10, [x21, #14]
+    ldrb w10, [x21, #13]
     add x14, sp, #56
-    add x3, x21, #15
+    add x3, x21, #14
 .Lasm_NewClass.array_value_next_8:
     cmp x9, x10
     b.hs .Lasm_NewClass.array_values_end_10
@@ -10746,7 +10767,7 @@ asm_handler_DynamicInitializeLexicalBinding_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_DynamicInitializeLexicalBinding.scalar_value_ready_1:
     mov x3, x10
@@ -10791,7 +10812,7 @@ asm_handler_DynamicInitializeVariableBinding_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_DynamicInitializeVariableBinding.scalar_value_ready_1:
     mov x3, x10
@@ -10836,7 +10857,7 @@ asm_handler_SetLexicalBinding_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_SetLexicalBinding.scalar_value_ready_4:
     mov x3, x10
@@ -10881,7 +10902,7 @@ asm_handler_SetVariableBinding_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_SetVariableBinding.scalar_value_ready_4:
     mov x3, x10
@@ -10926,7 +10947,7 @@ asm_handler_DynamicSetLexicalBinding_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_DynamicSetLexicalBinding.scalar_value_ready_4:
     mov x3, x10
@@ -10970,7 +10991,7 @@ asm_handler_SetVariableBindingOfBlockFunction:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_SetVariableBindingOfBlockFunction.scalar_value_ready_0:
     mov x3, x10
@@ -11012,7 +11033,7 @@ asm_handler_DynamicSetVariableBinding_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_DynamicSetVariableBinding.scalar_value_ready_4:
     mov x3, x10
@@ -11181,7 +11202,7 @@ asm_handler_SetResolvedBinding:
     ldr x10, [x27, x9, lsl #3]
 .Lasm_SetResolvedBinding.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_SetResolvedBinding.scalar_value_ready_1:
     mov x4, x10
@@ -14094,8 +14115,8 @@ asm_handler_PutByValue_cold:
     add sp, sp, #32
 .Lasm_PutByValue.values_call_done_4:
     cbnz w0, .Lasm_PutByValue.ssa_block_1
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_2:
@@ -14221,8 +14242,8 @@ asm_handler_PutByValue_cold:
     add sp, sp, #32
 .Lasm_PutByValue.values_call_done_19:
     cbnz w0, .Lasm_PutByValue.ssa_block_1
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutByValue.ssa_block_5:
@@ -14248,8 +14269,8 @@ asm_handler_PutByValue_cold:
     add sp, sp, #32
 .Lasm_PutByValue.values_call_done_24:
     cbnz w0, .Lasm_PutByValue.ssa_block_1
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #9]
+    add x21, x21, #9
     ldr x10, [x19, x9, lsl #3]
     br x10
 asm_handler_PutByValue_cold_end:
@@ -14301,10 +14322,10 @@ asm_handler_GetById_cold:
     movz x1, #0xfff9, lsl #48
     orr x0, x0, x1
 .Lasm_GetById.ssa_block_51:
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetById.ssa_block_25:
@@ -14317,14 +14338,14 @@ asm_handler_GetById_cold:
     adds x4, x4, x0
     ldr w2, [x4, #8]
     cmp x2, #1
-    b.hs .Lasm_GetById.assert_predicate_failure_160
+    b.hs .Lasm_GetById.assert_predicate_failure_161
     mov x0, x20
     ldp x0, x6, [x0, #16]
     cbz x0, .Lasm_GetById.assert_failure_6
     cbz x6, .Lasm_GetById.assert_failure_7
     add x5, x0, #128
     cmp x5, x0
-    b.lo .Lasm_GetById.assert_predicate_failure_169
+    b.lo .Lasm_GetById.assert_predicate_failure_170
     cmp x5, x6
     b.hi .Lasm_GetById.ssa_block_3
     mov x6, x20
@@ -14332,7 +14353,7 @@ asm_handler_GetById_cold:
     mov x6, x7
     add x6, x6, #8, lsl #12
     cmp x6, x7
-    b.lo .Lasm_GetById.assert_predicate_failure_177
+    b.lo .Lasm_GetById.assert_predicate_failure_178
     cmp x6, x29
     b.hi .Lasm_GetById.ssa_block_3
     mov x6, x20
@@ -14347,8 +14368,8 @@ asm_handler_GetById_cold:
     add x2, x24, w2, uxtw #3
     stp x1, x2, [x0, #0]
     ldp x1, x2, [x28, #32]
-    cbz x1, .Lasm_GetById.assert_predicate_failure_202
-    cbz x2, .Lasm_GetById.assert_predicate_failure_204
+    cbz x1, .Lasm_GetById.assert_predicate_failure_203
+    cbz x2, .Lasm_GetById.assert_predicate_failure_205
     stp x1, x2, [x0, #32]
     ldr x1, [x28, #48]
     str x1, [x0, #48]
@@ -14369,7 +14390,7 @@ asm_handler_GetById_cold:
     strb wzr, [x0, #124]
     strb wzr, [x0, #125]
     sub w1, w21, w26
-    ldrb w2, [x21, #3]
+    ldrb w2, [x21, #1]
     str w1, [x28, #64]
     str x28, [x0, #96]
     add x1, x1, #1
@@ -14385,34 +14406,34 @@ asm_handler_GetById_cold:
     blr x9
     and x1, x1, #0xff
     cmp x1, #2
-    b.hs .Lasm_GetById.assert_predicate_failure_267
+    b.hs .Lasm_GetById.assert_predicate_failure_268
     cbnz x1, .Lasm_GetById.ssa_block_6
     ldr x1, [x28, #96]
-    cbz x1, .Lasm_GetById.assert_predicate_failure_276
+    cbz x1, .Lasm_GetById.assert_predicate_failure_277
     mov x2, x20
     str x1, [x2]
     str x28, [x2, #16]
     mov x28, x1
     add x27, x28, #128
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetById.ssa_block_5:
     movz x0, #0x7ffe, lsl #48
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetById.ssa_block_4:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #2]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetById.scalar_value_ready_11:
     mov x3, x10
@@ -14426,7 +14447,7 @@ asm_handler_GetById_cold:
     tbnz x0, #32, 1f
     b .Lasm_GetById.scalar_result_done_12
 1:
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -14476,7 +14497,7 @@ asm_handler_GetById_cold:
     b .Lasm_GetById.ssa_block_24
 .Lasm_GetById.ssa_block_3:
     sub sp, sp, #16
-    ldrb w12, [x21, #4]
+    ldrb w12, [x21, #2]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_GetById.value_ready_15:
     str x11, [sp, #8]
@@ -14489,7 +14510,7 @@ asm_handler_GetById_cold:
     cmp x9, x28
     b.ne .Lasm_GetById.values_restore_stack_16
     cbnz x0, .Lasm_GetById.values_exceptional_outputs_17
-    ldrb w12, [x21, #3]
+    ldrb w12, [x21, #1]
     ldr x11, [sp]
     str x11, [x27, x12, lsl #3]
 .Lasm_GetById.skip_output_value_18:
@@ -14543,8 +14564,8 @@ asm_handler_GetById_cold:
     ldr x0, [x28, #88]
     ldr x1, [x0, #152]
     cbz x1, .Lasm_GetById.assert_failure_21
-    ldrh w2, [x21, #10]
-    ldrb w0, [x21, #4]
+    ldurh w2, [x21, #5]
+    ldrb w0, [x21, #2]
     ldr x0, [x27, x0, lsl #3]
     lsl x2, x2, #3
     adds x1, x1, x2
@@ -14552,15 +14573,15 @@ asm_handler_GetById_cold:
     movz x9, #0x7ffb, lsl #48
     cmp x0, x9
     b.eq .Lasm_GetById.ssa_block_2
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetById.ssa_block_14:
     sub sp, sp, #16
-    ldrb w12, [x21, #4]
+    ldrb w12, [x21, #2]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_GetById.value_ready_23:
     str x11, [sp, #8]
@@ -14573,7 +14594,7 @@ asm_handler_GetById_cold:
     cmp x9, x28
     b.ne .Lasm_GetById.values_restore_stack_24
     cbnz x0, .Lasm_GetById.values_exceptional_outputs_25
-    ldrb w12, [x21, #3]
+    ldrb w12, [x21, #1]
     ldr x11, [sp]
     str x11, [x27, x12, lsl #3]
 .Lasm_GetById.skip_output_value_26:
@@ -14583,15 +14604,15 @@ asm_handler_GetById_cold:
     add sp, sp, #16
 .Lasm_GetById.values_call_done_22:
     cbnz w0, .Lasm_GetById.ssa_block_2
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetById.ssa_block_2:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #2]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetById.scalar_value_ready_27:
     mov x3, x10
@@ -14605,7 +14626,7 @@ asm_handler_GetById_cold:
     tbnz x0, #32, 1f
     b .Lasm_GetById.scalar_result_done_28
 1:
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -14639,11 +14660,11 @@ asm_handler_GetByIdWithThis:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #2]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetByIdWithThis.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #8]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetByIdWithThis.scalar_value_ready_1:
     mov x4, x10
@@ -14653,7 +14674,7 @@ asm_handler_GetByIdWithThis:
     bl CSYM(asm_slow_path_get_by_id_with_this)
     tbnz x0, #63, .Lasm_GetByIdWithThis.scalar_result_done_2
     tbz x0, #32, .Lasm_GetByIdWithThis.scalar_result_done_2
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -14689,7 +14710,7 @@ asm_handler_PutById_cold:
     ldr x11, [x27, x12, lsl #3]
 .Lasm_PutById.value_ready_4:
     str x11, [sp]
-    ldrb w12, [x21, #5]
+    ldrb w12, [x21, #4]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_PutById.value_ready_5:
     str x11, [sp, #8]
@@ -14702,8 +14723,8 @@ asm_handler_PutById_cold:
     add sp, sp, #16
 .Lasm_PutById.values_call_done_3:
     cbnz w0, .Lasm_PutById.ssa_block_1
-    ldrb w9, [x21, #14]
-    add x21, x21, #14
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_PutById.ssa_block_1:
@@ -14714,7 +14735,7 @@ asm_handler_PutById_cold:
     ldr x10, [x27, x9, lsl #3]
 .Lasm_PutById.scalar_value_ready_7:
     mov x3, x10
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_PutById.scalar_value_ready_8:
     mov x4, x10
@@ -14766,7 +14787,7 @@ asm_handler_PutByIdWithThis:
     ldr x10, [x27, x9, lsl #3]
 .Lasm_PutByIdWithThis.scalar_value_ready_1:
     mov x4, x10
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_PutByIdWithThis.scalar_value_ready_2:
     mov x5, x10
@@ -14846,28 +14867,28 @@ asm_handler_GetByValue_cold:
     mov w10, #65532
     cmp x9, x10
     b.eq .Lasm_GetByValue.ssa_block_2
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_12:
     scvtf d0, x0
     fmov x0, d0
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_4:
     sub sp, sp, #32
-    ldrb w12, [x21, #6]
+    ldrb w12, [x21, #4]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_GetByValue.value_ready_10:
     str x11, [sp, #8]
-    ldrb w12, [x21, #7]
+    ldrb w12, [x21, #5]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_GetByValue.value_ready_11:
     str x11, [sp, #16]
@@ -14880,7 +14901,7 @@ asm_handler_GetByValue_cold:
     cmp x9, x28
     b.ne .Lasm_GetByValue.values_restore_stack_12
     cbnz x0, .Lasm_GetByValue.values_exceptional_outputs_13
-    ldrb w12, [x21, #5]
+    ldrb w12, [x21, #3]
     ldr x11, [sp]
     str x11, [x27, x12, lsl #3]
 .Lasm_GetByValue.skip_output_value_14:
@@ -14890,19 +14911,19 @@ asm_handler_GetByValue_cold:
     add sp, sp, #32
 .Lasm_GetByValue.values_call_done_9:
     cbnz w0, .Lasm_GetByValue.ssa_block_1
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_7:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetByValue.scalar_value_ready_15:
     mov x3, x10
-    ldrb w9, [x21, #7]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetByValue.scalar_value_ready_16:
     mov x4, x10
@@ -14916,7 +14937,7 @@ asm_handler_GetByValue_cold:
     tbnz x0, #32, 1f
     b .Lasm_GetByValue.scalar_result_done_17
 1:
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -14943,7 +14964,7 @@ asm_handler_GetByValue_cold:
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.ssa_block_6:
-    ldrb w0, [x21, #7]
+    ldrb w0, [x21, #5]
     ldr x0, [x27, x0, lsl #3]
     lsr x9, x0, #48
     mov w10, #65530
@@ -14953,11 +14974,11 @@ asm_handler_GetByValue_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetByValue.scalar_value_ready_19:
     mov x3, x10
-    ldrb w9, [x21, #7]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetByValue.scalar_value_ready_20:
     mov x4, x10
@@ -14971,7 +14992,7 @@ asm_handler_GetByValue_cold:
     tbnz x0, #32, 1f
     b .Lasm_GetByValue.scalar_result_done_21
 1:
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -15001,11 +15022,11 @@ asm_handler_GetByValue_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetByValue.scalar_value_ready_23:
     mov x3, x10
-    ldrb w9, [x21, #7]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetByValue.scalar_value_ready_24:
     mov x4, x10
@@ -15019,7 +15040,7 @@ asm_handler_GetByValue_cold:
     tbnz x0, #32, 1f
     b .Lasm_GetByValue.scalar_result_done_25
 1:
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -15047,11 +15068,11 @@ asm_handler_GetByValue_cold:
     br x10
 .Lasm_GetByValue.ssa_block_3:
     sub sp, sp, #32
-    ldrb w12, [x21, #6]
+    ldrb w12, [x21, #4]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_GetByValue.value_ready_28:
     str x11, [sp, #8]
-    ldrb w12, [x21, #7]
+    ldrb w12, [x21, #5]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_GetByValue.value_ready_29:
     str x11, [sp, #16]
@@ -15064,7 +15085,7 @@ asm_handler_GetByValue_cold:
     cmp x9, x28
     b.ne .Lasm_GetByValue.values_restore_stack_30
     cbnz x0, .Lasm_GetByValue.values_exceptional_outputs_31
-    ldrb w12, [x21, #5]
+    ldrb w12, [x21, #3]
     ldr x11, [sp]
     str x11, [x27, x12, lsl #3]
 .Lasm_GetByValue.skip_output_value_32:
@@ -15074,8 +15095,8 @@ asm_handler_GetByValue_cold:
     add sp, sp, #32
 .Lasm_GetByValue.values_call_done_27:
     cbnz w0, .Lasm_GetByValue.ssa_block_1
-    ldrb w9, [x21, #12]
-    add x21, x21, #12
+    ldrb w9, [x21, #8]
+    add x21, x21, #8
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetByValue.canon_nan_1:
@@ -15236,17 +15257,17 @@ asm_handler_GetLength_cold:
 .Lasm_GetLength.ssa_block_3:
     scvtf d0, x0
     fmov x0, d0
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x0, [x27, x9, lsl #3]
-    ldrb w9, [x21, #11]
-    add x21, x21, #11
+    ldrb w9, [x21, #7]
+    add x21, x21, #7
     ldr x10, [x19, x9, lsl #3]
     br x10
 .Lasm_GetLength.ssa_block_1:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetLength.scalar_value_ready_3:
     mov x3, x10
@@ -15260,7 +15281,7 @@ asm_handler_GetLength_cold:
     tbnz x0, #32, 1f
     b .Lasm_GetLength.scalar_result_done_4
 1:
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -15292,11 +15313,11 @@ asm_handler_GetLengthWithThis:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #2]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetLengthWithThis.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_GetLengthWithThis.scalar_value_ready_1:
     mov x4, x10
@@ -15306,7 +15327,7 @@ asm_handler_GetLengthWithThis:
     bl CSYM(asm_slow_path_get_length_with_this)
     tbnz x0, #63, .Lasm_GetLengthWithThis.scalar_result_done_2
     tbz x0, #32, .Lasm_GetLengthWithThis.scalar_result_done_2
-    ldrb w9, [x21, #3]
+    ldrb w9, [x21, #1]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -15528,7 +15549,7 @@ asm_handler_SetGlobal_cold:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #4]
+    ldrb w9, [x21, #3]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_SetGlobal.scalar_value_ready_7:
     mov x3, x10
@@ -15594,7 +15615,7 @@ asm_handler_Call_cold:
     sub w1, w21, w26
     str w1, [x28, #64]
     add x9, sp, #0
-    ldrb w10, [x21, #8]
+    ldrb w10, [x21, #6]
     lsl x10, x10, #3
     add x10, x10, #55
     and x10, x10, #0xfffffffffffffff0
@@ -15619,18 +15640,18 @@ asm_handler_Call_cold:
 .Lasm_Call.values_allocated_35:
     add sp, x14, #0
     str x9, [sp]
-    ldrb w12, [x21, #6]
+    ldrb w12, [x21, #4]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_Call.value_ready_36:
     str x11, [sp, #24]
-    ldrb w12, [x21, #7]
+    ldrb w12, [x21, #5]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_Call.value_ready_37:
     str x11, [sp, #32]
     mov w9, #0
-    ldrb w10, [x21, #8]
+    ldrb w10, [x21, #6]
     add x14, sp, #40
-    add x3, x21, #11
+    add x3, x21, #7
 .Lasm_Call.array_value_next_38:
     cmp x9, x10
     b.hs .Lasm_Call.array_values_end_40
@@ -15652,7 +15673,7 @@ asm_handler_Call_cold:
     tbnz x0, #32, 1f
     b .Lasm_Call.values_exceptional_outputs_42
 1:
-    ldrb w12, [x21, #5]
+    ldrb w12, [x21, #3]
     ldr x11, [sp, #16]
     str x11, [x27, x12, lsl #3]
 .Lasm_Call.skip_output_value_43:
@@ -15840,7 +15861,7 @@ asm_handler_IteratorClose_cold:
     ldr x10, [x27, x9, lsl #3]
 .Lasm_IteratorClose.scalar_value_ready_3:
     mov x5, x10
-    ldrb w9, [x21, #8]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_IteratorClose.scalar_value_ready_4:
     mov x6, x10
@@ -16189,7 +16210,7 @@ asm_handler_CallConstruct:
     sub w1, w21, w26
     str w1, [x28, #64]
     add x9, sp, #0
-    ldrb w10, [x21, #7]
+    ldrb w10, [x21, #5]
     lsl x10, x10, #3
     add x10, x10, #47
     and x10, x10, #0xfffffffffffffff0
@@ -16214,14 +16235,14 @@ asm_handler_CallConstruct:
 .Lasm_CallConstruct.values_allocated_3:
     add sp, x14, #0
     str x9, [sp]
-    ldrb w12, [x21, #6]
+    ldrb w12, [x21, #4]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_CallConstruct.value_ready_4:
     str x11, [sp, #24]
     mov w9, #0
-    ldrb w10, [x21, #7]
+    ldrb w10, [x21, #5]
     add x14, sp, #32
-    add x3, x21, #10
+    add x3, x21, #6
 .Lasm_CallConstruct.array_value_next_5:
     cmp x9, x10
     b.hs .Lasm_CallConstruct.array_values_end_7
@@ -16239,7 +16260,7 @@ asm_handler_CallConstruct:
     bl CSYM(asm_slow_path_call_construct)
     tbnz x0, #63, .Lasm_CallConstruct.values_exceptional_outputs_9
     tbz x0, #32, .Lasm_CallConstruct.values_exceptional_outputs_9
-    ldrb w12, [x21, #5]
+    ldrb w12, [x21, #3]
     ldr x11, [sp, #16]
     str x11, [x27, x12, lsl #3]
 .Lasm_CallConstruct.skip_output_value_10:
@@ -16281,7 +16302,7 @@ asm_handler_CallDirectEval:
     sub w1, w21, w26
     str w1, [x28, #64]
     add x9, sp, #0
-    ldrb w10, [x21, #8]
+    ldrb w10, [x21, #6]
     lsl x10, x10, #3
     add x10, x10, #55
     and x10, x10, #0xfffffffffffffff0
@@ -16306,18 +16327,18 @@ asm_handler_CallDirectEval:
 .Lasm_CallDirectEval.values_allocated_3:
     add sp, x14, #0
     str x9, [sp]
-    ldrb w12, [x21, #6]
+    ldrb w12, [x21, #4]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_CallDirectEval.value_ready_4:
     str x11, [sp, #24]
-    ldrb w12, [x21, #7]
+    ldrb w12, [x21, #5]
     ldr x11, [x27, x12, lsl #3]
 .Lasm_CallDirectEval.value_ready_5:
     str x11, [sp, #32]
     mov w9, #0
-    ldrb w10, [x21, #8]
+    ldrb w10, [x21, #6]
     add x14, sp, #40
-    add x3, x21, #11
+    add x3, x21, #7
 .Lasm_CallDirectEval.array_value_next_6:
     cmp x9, x10
     b.hs .Lasm_CallDirectEval.array_values_end_8
@@ -16335,7 +16356,7 @@ asm_handler_CallDirectEval:
     bl CSYM(asm_slow_path_call_direct_eval)
     tbnz x0, #63, .Lasm_CallDirectEval.values_exceptional_outputs_10
     tbz x0, #32, .Lasm_CallDirectEval.values_exceptional_outputs_10
-    ldrb w12, [x21, #5]
+    ldrb w12, [x21, #3]
     ldr x11, [sp, #16]
     str x11, [x27, x12, lsl #3]
 .Lasm_CallDirectEval.skip_output_value_11:
@@ -16376,15 +16397,15 @@ asm_handler_CallWithArgumentArray:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallWithArgumentArray.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #7]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallWithArgumentArray.scalar_value_ready_1:
     mov x4, x10
-    ldrb w9, [x21, #8]
+    ldrb w9, [x21, #6]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallWithArgumentArray.scalar_value_ready_2:
     mov x5, x10
@@ -16394,7 +16415,7 @@ asm_handler_CallWithArgumentArray:
     bl CSYM(asm_slow_path_call_with_argument_array)
     tbnz x0, #63, .Lasm_CallWithArgumentArray.scalar_result_done_3
     tbz x0, #32, .Lasm_CallWithArgumentArray.scalar_result_done_3
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -16427,15 +16448,15 @@ asm_handler_CallDirectEvalWithArgumentArray:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallDirectEvalWithArgumentArray.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #7]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallDirectEvalWithArgumentArray.scalar_value_ready_1:
     mov x4, x10
-    ldrb w9, [x21, #8]
+    ldrb w9, [x21, #6]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallDirectEvalWithArgumentArray.scalar_value_ready_2:
     mov x5, x10
@@ -16445,7 +16466,7 @@ asm_handler_CallDirectEvalWithArgumentArray:
     bl CSYM(asm_slow_path_call_direct_eval_with_argument_array)
     tbnz x0, #63, .Lasm_CallDirectEvalWithArgumentArray.scalar_result_done_3
     tbz x0, #32, .Lasm_CallDirectEvalWithArgumentArray.scalar_result_done_3
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -16478,15 +16499,15 @@ asm_handler_CallConstructWithArgumentArray:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallConstructWithArgumentArray.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #7]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallConstructWithArgumentArray.scalar_value_ready_1:
     mov x4, x10
-    ldrb w9, [x21, #8]
+    ldrb w9, [x21, #6]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_CallConstructWithArgumentArray.scalar_value_ready_2:
     mov x5, x10
@@ -16496,7 +16517,7 @@ asm_handler_CallConstructWithArgumentArray:
     bl CSYM(asm_slow_path_call_construct_with_argument_array)
     tbnz x0, #63, .Lasm_CallConstructWithArgumentArray.scalar_result_done_3
     tbz x0, #32, .Lasm_CallConstructWithArgumentArray.scalar_result_done_3
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -16529,11 +16550,11 @@ asm_handler_SuperCallWithArgumentArray:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #6]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_SuperCallWithArgumentArray.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #7]
+    ldrb w9, [x21, #5]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_SuperCallWithArgumentArray.scalar_value_ready_1:
     mov x4, x10
@@ -16543,7 +16564,7 @@ asm_handler_SuperCallWithArgumentArray:
     bl CSYM(asm_slow_path_super_call_with_argument_array)
     tbnz x0, #63, .Lasm_SuperCallWithArgumentArray.scalar_result_done_2
     tbz x0, #32, .Lasm_SuperCallWithArgumentArray.scalar_result_done_2
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #3]
     str x1, [x27, x9, lsl #3]
     add x21, x26, w0, uxtw
     ldrb w9, [x21]
@@ -16699,7 +16720,7 @@ asm_handler_InitObjectLiteralProperty:
     ldr x10, [x27, x9, lsl #3]
 .Lasm_InitObjectLiteralProperty.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_InitObjectLiteralProperty.scalar_value_ready_1:
     mov x4, x10
@@ -18065,7 +18086,7 @@ asm_handler_NewFunction:
     mov x0, x20
     sub w1, w21, w26
     str w1, [x28, #64]
-    ldrb w9, [x21, #9]
+    ldrb w9, [x21, #6]
     movz x10, #0x7ffb, lsl #48
     mov w11, #255
     cmp w9, w11
@@ -18106,6 +18127,53 @@ asm_handler_NewFunction:
 asm_handler_NewFunction_hot_end:
 asm_handler_NewFunction_cold:
 asm_handler_NewFunction_cold_end:
+
+.p2align 4
+asm_handler_NewFunctionWide:
+    mov x0, x20
+    sub w1, w21, w26
+    str w1, [x28, #64]
+    ldrb w9, [x21, #8]
+    movz x10, #0x7ffb, lsl #48
+    mov w11, #255
+    cmp w9, w11
+    b.eq .Lasm_NewFunctionWide.scalar_value_ready_0
+    ldr x10, [x27, x9, lsl #3]
+.Lasm_NewFunctionWide.scalar_value_ready_0:
+    mov x3, x10
+    mov x0, x20
+    sub w1, w21, w26
+    mov x2, x21
+    bl CSYM(asm_slow_path_new_function_wide)
+    tbnz x0, #63, .Lasm_NewFunctionWide.scalar_result_done_1
+    tbz x0, #32, .Lasm_NewFunctionWide.scalar_result_done_1
+    ldrb w9, [x21, #1]
+    str x1, [x27, x9, lsl #3]
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+.Lasm_NewFunctionWide.scalar_result_done_1:
+    tbz x0, #63, 1f
+    b .Lexit
+1:
+    tbz x0, #32, .Lasm_NewFunctionWide.slow_path_transfer_2
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+.Lasm_NewFunctionWide.slow_path_transfer_2:
+    ldr x28, [x20]
+    ldr x9, [x28, #88]
+    ldr x26, [x9, #40]
+    add x27, x28, #128
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+asm_handler_NewFunctionWide_hot_end:
+asm_handler_NewFunctionWide_cold:
+asm_handler_NewFunctionWide_cold_end:
 
 .p2align 4
 asm_handler_Typeof:
@@ -18245,7 +18313,7 @@ asm_handler_PutPrivateById:
     ldr x10, [x27, x9, lsl #3]
 .Lasm_PutPrivateById.scalar_value_ready_0:
     mov x3, x10
-    ldrb w9, [x21, #5]
+    ldrb w9, [x21, #4]
     ldr x10, [x27, x9, lsl #3]
 .Lasm_PutPrivateById.scalar_value_ready_1:
     mov x4, x10
@@ -20852,7 +20920,7 @@ asm_handler_JumpLooselyInequalsLoopRhsInt32_cold_end:
 asm_assertion_failure_traps:
 .Lasm_Enter.assert_predicate_failure_3:
     brk #0
-.Lasm_Enter.assert_predicate_failure_25:
+.Lasm_Enter.assert_predicate_failure_29:
     brk #0
 .Lasm_JumpIf.assert_predicate_failure_7:
     brk #0
@@ -20884,11 +20952,11 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_SetLexicalEnvironment.assert_predicate_failure_3:
     brk #0
-.Lasm_GetBinding.assert_predicate_failure_9:
+.Lasm_GetBinding.assert_predicate_failure_11:
     brk #0
-.Lasm_GetBinding.assert_predicate_failure_25:
+.Lasm_GetBinding.assert_predicate_failure_27:
     brk #0
-.Lasm_GetBinding.assert_predicate_failure_13:
+.Lasm_GetBinding.assert_predicate_failure_15:
     brk #0
 .Lasm_GetBinding.assert_failure_0:
     brk #0
@@ -20898,11 +20966,11 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_DynamicGetBinding.assert_failure_0:
     brk #0
-.Lasm_GetInitializedBinding.assert_predicate_failure_9:
+.Lasm_GetInitializedBinding.assert_predicate_failure_11:
     brk #0
-.Lasm_GetInitializedBinding.assert_predicate_failure_25:
+.Lasm_GetInitializedBinding.assert_predicate_failure_27:
     brk #0
-.Lasm_GetInitializedBinding.assert_predicate_failure_12:
+.Lasm_GetInitializedBinding.assert_predicate_failure_14:
     brk #0
 .Lasm_GetInitializedBinding.assert_failure_0:
     brk #0
@@ -20912,19 +20980,19 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_DynamicGetInitializedBinding.assert_failure_0:
     brk #0
-.Lasm_InitializeLexicalBinding.assert_predicate_failure_9:
+.Lasm_InitializeLexicalBinding.assert_predicate_failure_11:
     brk #0
-.Lasm_InitializeLexicalBinding.assert_predicate_failure_25:
+.Lasm_InitializeLexicalBinding.assert_predicate_failure_27:
     brk #0
-.Lasm_InitializeLexicalBinding.assert_predicate_failure_12:
+.Lasm_InitializeLexicalBinding.assert_predicate_failure_14:
     brk #0
 .Lasm_InitializeLexicalBinding.assert_failure_0:
     brk #0
-.Lasm_InitializeVariableBinding.assert_predicate_failure_9:
+.Lasm_InitializeVariableBinding.assert_predicate_failure_11:
     brk #0
-.Lasm_InitializeVariableBinding.assert_predicate_failure_25:
+.Lasm_InitializeVariableBinding.assert_predicate_failure_27:
     brk #0
-.Lasm_InitializeVariableBinding.assert_predicate_failure_12:
+.Lasm_InitializeVariableBinding.assert_predicate_failure_14:
     brk #0
 .Lasm_InitializeVariableBinding.assert_failure_0:
     brk #0
@@ -20940,11 +21008,11 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_DynamicInitializeVariableBinding.assert_failure_0:
     brk #0
-.Lasm_SetLexicalBinding.assert_predicate_failure_9:
+.Lasm_SetLexicalBinding.assert_predicate_failure_11:
     brk #0
-.Lasm_SetLexicalBinding.assert_predicate_failure_31:
+.Lasm_SetLexicalBinding.assert_predicate_failure_33:
     brk #0
-.Lasm_SetLexicalBinding.assert_predicate_failure_19:
+.Lasm_SetLexicalBinding.assert_predicate_failure_21:
     brk #0
 .Lasm_SetLexicalBinding.assert_failure_0:
     brk #0
@@ -20954,11 +21022,11 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_SetLexicalBinding.assert_failure_3:
     brk #0
-.Lasm_SetVariableBinding.assert_predicate_failure_9:
+.Lasm_SetVariableBinding.assert_predicate_failure_11:
     brk #0
-.Lasm_SetVariableBinding.assert_predicate_failure_31:
+.Lasm_SetVariableBinding.assert_predicate_failure_33:
     brk #0
-.Lasm_SetVariableBinding.assert_predicate_failure_19:
+.Lasm_SetVariableBinding.assert_predicate_failure_21:
     brk #0
 .Lasm_SetVariableBinding.assert_failure_0:
     brk #0
@@ -20992,11 +21060,11 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_DynamicSetVariableBinding.assert_failure_3:
     brk #0
-.Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_9:
+.Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_11:
     brk #0
-.Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_25:
+.Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_27:
     brk #0
-.Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_13:
+.Lasm_GetCalleeAndThisFromEnvironment.assert_predicate_failure_15:
     brk #0
 .Lasm_GetCalleeAndThisFromEnvironment.assert_failure_0:
     brk #0
@@ -21020,11 +21088,11 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_GetById.assert_failure_0:
     brk #0
-.Lasm_GetById.assert_predicate_failure_123:
+.Lasm_GetById.assert_predicate_failure_124:
     brk #0
 .Lasm_GetById.assert_failure_1:
     brk #0
-.Lasm_GetById.assert_predicate_failure_337:
+.Lasm_GetById.assert_predicate_failure_338:
     brk #0
 .Lasm_GetById.assert_failure_2:
     brk #0
@@ -21034,29 +21102,29 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_GetById.assert_failure_5:
     brk #0
-.Lasm_GetById.assert_predicate_failure_160:
+.Lasm_GetById.assert_predicate_failure_161:
     brk #0
 .Lasm_GetById.assert_failure_6:
     brk #0
 .Lasm_GetById.assert_failure_7:
     brk #0
-.Lasm_GetById.assert_predicate_failure_169:
+.Lasm_GetById.assert_predicate_failure_170:
     brk #0
-.Lasm_GetById.assert_predicate_failure_177:
+.Lasm_GetById.assert_predicate_failure_178:
     brk #0
 .Lasm_GetById.assert_failure_8:
     brk #0
 .Lasm_GetById.assert_failure_9:
     brk #0
-.Lasm_GetById.assert_predicate_failure_202:
+.Lasm_GetById.assert_predicate_failure_203:
     brk #0
-.Lasm_GetById.assert_predicate_failure_204:
+.Lasm_GetById.assert_predicate_failure_205:
     brk #0
 .Lasm_GetById.assert_failure_10:
     brk #0
-.Lasm_GetById.assert_predicate_failure_267:
+.Lasm_GetById.assert_predicate_failure_268:
     brk #0
-.Lasm_GetById.assert_predicate_failure_276:
+.Lasm_GetById.assert_predicate_failure_277:
     brk #0
 .Lasm_GetById.assert_predicate_failure_26:
     brk #0
@@ -21086,11 +21154,11 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_GetByValue.assert_failure_0:
     brk #0
-.Lasm_GetByValue.assert_predicate_failure_297:
+.Lasm_GetByValue.assert_predicate_failure_298:
     brk #0
 .Lasm_GetByValue.assert_failure_2:
     brk #0
-.Lasm_GetByValue.assert_predicate_failure_231:
+.Lasm_GetByValue.assert_predicate_failure_232:
     brk #0
 .Lasm_GetByValue.assert_failure_3:
     brk #0
@@ -21106,11 +21174,11 @@ asm_assertion_failure_traps:
     brk #0
 .Lasm_GetLength.assert_failure_0:
     brk #0
-.Lasm_GetLength.assert_predicate_failure_21:
+.Lasm_GetLength.assert_predicate_failure_22:
     brk #0
 .Lasm_GetLength.assert_failure_1:
     brk #0
-.Lasm_GetLength.assert_predicate_failure_43:
+.Lasm_GetLength.assert_predicate_failure_44:
     brk #0
 .Lasm_GetLength.assert_failure_2:
     brk #0

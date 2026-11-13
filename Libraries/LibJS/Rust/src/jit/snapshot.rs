@@ -654,7 +654,7 @@ impl SnapshotBuilder<'_> {
         InlinedFunctionSnapshot {
             function: self.cell(function),
             formal_parameter_count: function.formal_parameter_count(),
-            strict: executable.is_strict_mode,
+            strict: executable.is_strict_mode(),
             // NB: Arrow functions resolve `this` through their environments.
             uses_this: function.uses_this() && function.this_mode() != ThisMode::Lexical,
             global_this: self.cell(realm.global_environment().global_this_value()),
@@ -900,6 +900,7 @@ impl SnapshotBuilder<'_> {
         let mut snapshot = CallFeedbackSnapshot {
             target: self.optional_cell(target),
             flags,
+            value: call.value.get(),
             target_intrinsic: intrinsic_of(self.vm, target),
             target_builtin: target
                 .and_then(|target| target.downcast::<RawNativeFunction>()?.builtin())
@@ -997,7 +998,8 @@ impl SnapshotBuilder<'_> {
             .collect();
         let feedback = FeedbackSnapshot {
             arith: feedback.arith().iter().map(core::cell::Cell::get).collect(),
-            value: feedback.value.iter().map(core::cell::Cell::get).collect(),
+            value: feedback.value().iter().map(core::cell::Cell::get).collect(),
+            cache_value: feedback.cache_value().iter().map(core::cell::Cell::get).collect(),
             call,
             keyed,
             bound_arguments: core::mem::take(&mut self.bound_arguments),
@@ -1030,11 +1032,11 @@ impl SnapshotBuilder<'_> {
             bytecode: bytecode.to_vec(),
             bytecode_address: bytecode.as_ptr() as u64,
             layout: FrameLayout {
-                number_of_registers: executable.number_of_registers,
+                number_of_registers: executable.number_of_registers(),
                 registers_and_locals_count: executable.registers_and_locals_count(),
                 number_of_constants: u32::try_from(executable.constants().len())
                     .expect("the constant count fits in u32"),
-                number_of_arguments: executable.number_of_arguments,
+                number_of_arguments: executable.number_of_arguments(),
             },
             constants: executable.constants().iter().map(|constant| constant.0).collect(),
             exception_handlers: executable

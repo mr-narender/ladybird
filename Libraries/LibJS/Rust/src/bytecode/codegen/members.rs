@@ -24,30 +24,23 @@ pub(super) fn emit_get_by_key(
     dst: &ScopedOperand,
     base: &ScopedOperand,
     key: PropertyKeyTableIndex,
-    base_identifier: Option<IdentifierTableIndex>,
 ) {
     if generator.context.names.is_length_property_key(key) {
         generator.length_identifier = Some(key);
         let cache = generator.next_property_lookup_cache();
-        let value_feedback = generator.next_value_feedback();
         let keyed_feedback = generator.next_keyed_feedback();
         generator.emit(op::GetLength {
-            value_feedback,
             keyed_feedback,
             dst: dst.operand(),
             base: base.operand(),
-            base_identifier,
             cache,
         });
     } else {
         let cache = generator.next_property_lookup_cache();
-        let value_feedback = generator.next_value_feedback();
         generator.emit(op::GetById {
-            value_feedback,
             dst: dst.operand(),
             base: base.operand(),
             property: key,
-            base_identifier,
             cache,
         });
     }
@@ -66,9 +59,7 @@ pub(super) fn emit_get_by_id_with_this(
     if generator.context.names.is_length_property_key(key) {
         generator.length_identifier = Some(key);
         let cache = generator.next_property_lookup_cache();
-        let value_feedback = generator.next_value_feedback();
         generator.emit(op::GetLengthWithThis {
-            value_feedback,
             dst: dst.operand(),
             base: base.operand(),
             this_value: this_value.operand(),
@@ -76,9 +67,7 @@ pub(super) fn emit_get_by_id_with_this(
         });
     } else {
         let cache = generator.next_property_lookup_cache();
-        let value_feedback = generator.next_value_feedback();
         generator.emit(op::GetByIdWithThis {
-            value_feedback,
             dst: dst.operand(),
             base: base.operand(),
             property: key,
@@ -94,46 +83,36 @@ pub(super) fn emit_get_by_value(
     dst: &ScopedOperand,
     base: &ScopedOperand,
     property: &ScopedOperand,
-    base_identifier: Option<IdentifierTableIndex>,
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
         if generator.context.names.is_length_property_key(key) {
             generator.length_identifier = Some(key);
             let cache = generator.next_property_lookup_cache();
-            let value_feedback = generator.next_value_feedback();
             let keyed_feedback = generator.next_keyed_feedback();
             generator.emit(op::GetLength {
-                value_feedback,
                 keyed_feedback,
                 dst: dst.operand(),
                 base: base.operand(),
-                base_identifier,
                 cache,
             });
         } else {
             let cache = generator.next_property_lookup_cache();
-            let value_feedback = generator.next_value_feedback();
             generator.emit(op::GetById {
-                value_feedback,
                 dst: dst.operand(),
                 base: base.operand(),
                 property: key,
-                base_identifier,
                 cache,
             });
         }
         return;
     }
-    let value_feedback = generator.next_value_feedback();
     let keyed_feedback = generator.next_keyed_feedback();
     let cache = generator.next_property_lookup_cache();
     generator.emit(op::GetByValue {
-        value_feedback,
         keyed_feedback,
         dst: dst.operand(),
         base: base.operand(),
         property: property.operand(),
-        base_identifier,
         cache,
     });
 }
@@ -150,9 +129,7 @@ pub(super) fn emit_get_by_value_with_this(
         if generator.context.names.is_length_property_key(key) {
             generator.length_identifier = Some(key);
             let cache = generator.next_property_lookup_cache();
-            let value_feedback = generator.next_value_feedback();
             generator.emit(op::GetLengthWithThis {
-                value_feedback,
                 dst: dst.operand(),
                 base: base.operand(),
                 this_value: this_value.operand(),
@@ -160,9 +137,7 @@ pub(super) fn emit_get_by_value_with_this(
             });
         } else {
             let cache = generator.next_property_lookup_cache();
-            let value_feedback = generator.next_value_feedback();
             generator.emit(op::GetByIdWithThis {
-                value_feedback,
                 dst: dst.operand(),
                 base: base.operand(),
                 property: key,
@@ -188,7 +163,6 @@ pub(super) fn emit_put_normal_by_value(
     base: &ScopedOperand,
     property: &ScopedOperand,
     src: &ScopedOperand,
-    base_identifier: Option<IdentifierTableIndex>,
 ) {
     if let Some(key) = generator.try_constant_string_to_property_key(property) {
         let cache = generator.next_property_lookup_cache();
@@ -197,8 +171,7 @@ pub(super) fn emit_put_normal_by_value(
             property: key,
             src: src.operand(),
             cache,
-            base_identifier,
-            kind: PutKind::Normal as u32,
+            kind: PutKind::Normal as u8,
         });
         return;
     }
@@ -209,8 +182,7 @@ pub(super) fn emit_put_normal_by_value(
         base: base.operand(),
         property: property.operand(),
         src: src.operand(),
-        base_identifier,
-        kind: PutKind::Normal as u32,
+        kind: PutKind::Normal as u8,
         cache,
     });
 }
@@ -231,7 +203,7 @@ pub(super) fn emit_put_normal_by_value_with_this(
             property: key,
             src: src.operand(),
             cache,
-            kind: PutKind::Normal as u32,
+            kind: PutKind::Normal as u8,
         });
         return;
     }
@@ -240,7 +212,7 @@ pub(super) fn emit_put_normal_by_value_with_this(
         property: property.operand(),
         this_value: this_value.operand(),
         src: src.operand(),
-        kind: PutKind::Normal as u32,
+        kind: PutKind::Normal as u8,
     });
 }
 
@@ -259,8 +231,7 @@ pub(super) fn emit_put_by_value(
             property: key,
             src: src.operand(),
             cache,
-            base_identifier: None,
-            kind: kind as u32,
+            kind: kind as u8,
         });
         return;
     }
@@ -271,8 +242,7 @@ pub(super) fn emit_put_by_value(
         base: base.operand(),
         property: property.operand(),
         src: src.operand(),
-        base_identifier: None,
-        kind: kind as u32,
+        kind: kind as u8,
         cache,
     });
 }

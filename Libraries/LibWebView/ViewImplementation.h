@@ -304,7 +304,7 @@ public:
     Optional<u64> display_id() const { return m_display_id; }
     double maximum_frames_per_second() const { return m_maximum_frames_per_second; }
     // Sends the display metadata to every page hosting documents of the tab.
-    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second);
+    void set_display_metadata(Optional<u64> display_id, double maximum_frames_per_second, bool screen_shows_high_dynamic_range);
     void set_frame_rate_capped(bool);
 
     struct ScreenRects {
@@ -541,7 +541,7 @@ public:
     bool is_capturing_audio() const { return m_tab_indicators.is_active(TabIndicator::UsingMicrophone); }
 
     bool tab_indicator_visible(TabIndicator indicator) const { return m_tab_indicators.is_visible(indicator); }
-    u64 playing_audio_indicator_change_count() const { return m_playing_audio_indicator_change_count; }
+    Vector<bool> const& playing_audio_indicator_transitions() const { return m_playing_audio_indicator_transitions; }
     void did_change_screen_wake_lock_state(Badge<WebContentPage>, Web::ScreenWakeLockState);
 
     void did_reset_state_for_testing(Badge<WebContentPage>, Web::HTML::SessionHistoryEntryDescriptor);
@@ -943,6 +943,7 @@ protected:
     double m_device_pixel_ratio { 1.0 };
     Optional<u64> m_display_id;
     double m_maximum_frames_per_second { 60.0 };
+    bool m_screen_shows_high_dynamic_range { false };
     bool m_frame_rate_capped { false };
     bool m_scales_frames_to_fit { false };
 
@@ -1134,7 +1135,7 @@ protected:
     Optional<Web::HTML::CrossProcessId> m_webdriver_current_parent_navigable_id;
 
     TabIndicators m_tab_indicators;
-    u64 m_playing_audio_indicator_change_count { 0 };
+    Vector<bool> m_playing_audio_indicator_transitions;
     Web::ScreenWakeLockState m_screen_wake_lock_state { Web::ScreenWakeLockState::Released };
 
     Web::HTML::MuteState m_mute_state { Web::HTML::MuteState::Unmuted };

@@ -700,7 +700,7 @@ impl Generator<'_> {
             let is_const = binding.kind == BindingKind::Const;
             generator.emit(op::CreateVariable {
                 identifier,
-                mode: libjs_abi::EnvironmentMode::Lexical as u32,
+                mode: libjs_abi::EnvironmentMode::Lexical as u8,
                 is_immutable: is_const,
                 is_global: false,
                 is_strict: is_const,
@@ -797,7 +797,7 @@ impl Generator<'_> {
                 let value = initial_value(generator);
                 generator.emit(op::CreateVariable {
                     identifier,
-                    mode: libjs_abi::EnvironmentMode::Var as u32,
+                    mode: libjs_abi::EnvironmentMode::Var as u8,
                     is_immutable: false,
                     is_global: false,
                     is_strict: false,
@@ -856,7 +856,7 @@ impl Generator<'_> {
                 let identifier = generator.intern_identifier(name);
                 generator.emit(op::CreateVariable {
                     identifier,
-                    mode: libjs_abi::EnvironmentMode::Lexical as u32,
+                    mode: libjs_abi::EnvironmentMode::Lexical as u8,
                     is_immutable: is_const,
                     is_global: false,
                     is_strict: is_const,
@@ -983,7 +983,7 @@ impl Generator<'_> {
                     } else {
                         generator.emit(op::CreateVariable {
                             identifier,
-                            mode: libjs_abi::EnvironmentMode::Lexical as u32,
+                            mode: libjs_abi::EnvironmentMode::Lexical as u8,
                             is_immutable: false,
                             is_global: false,
                             is_strict: false,
@@ -1062,7 +1062,7 @@ impl Generator<'_> {
                 }
                 generator.emit(op::CreateVariable {
                     identifier,
-                    mode: libjs_abi::EnvironmentMode::Lexical as u32,
+                    mode: libjs_abi::EnvironmentMode::Lexical as u8,
                     is_immutable: false,
                     is_global: false,
                     is_strict: false,
@@ -1110,7 +1110,7 @@ impl Generator<'_> {
                 let identifier = generator.intern_identifier(name);
                 generator.emit(op::CreateVariable {
                     identifier,
-                    mode: libjs_abi::EnvironmentMode::Lexical as u32,
+                    mode: libjs_abi::EnvironmentMode::Lexical as u8,
                     is_immutable: false,
                     is_global: false,
                     is_strict: false,
@@ -1186,7 +1186,7 @@ impl Generator<'_> {
         self.in_head(|generator| {
             generator.emit(op::CreateArguments {
                 dst,
-                kind: kind as u32,
+                kind: kind as u8,
                 is_immutable: is_strict,
                 creates_parameter_bindings: creates_bindings,
             });
@@ -1313,7 +1313,7 @@ impl Generator<'_> {
                 let identifier = generator.intern_identifier(name);
                 generator.emit(op::CreateVariable {
                     identifier,
-                    mode: libjs_abi::EnvironmentMode::Lexical as u32,
+                    mode: libjs_abi::EnvironmentMode::Lexical as u8,
                     is_immutable: is_const,
                     is_global: false,
                     is_strict: is_const,
@@ -1512,27 +1512,12 @@ impl Generator<'_> {
         let index = self.register_nested_function(row, NestedFunctionName::None);
         self.in_head(|generator| {
             if ident.local_type == Some(LocalType::Variable) {
-                generator.put(op::NewFunction {
-                    dst: Operand::local(ident.local_index),
-                    shared_function_data_index: index,
-                    home_object: None,
-                    lhs_name: None,
-                });
+                generator.put_new_function(Operand::local(ident.local_index), index);
             } else if ident.local_type == Some(LocalType::Argument) {
-                generator.put(op::NewFunction {
-                    dst: Operand::argument(ident.local_index),
-                    shared_function_data_index: index,
-                    home_object: None,
-                    lhs_name: None,
-                });
+                generator.put_new_function(Operand::argument(ident.local_index), index);
             } else {
                 let function = generator.temporary();
-                generator.put(op::NewFunction {
-                    dst: function,
-                    shared_function_data_index: index,
-                    home_object: None,
-                    lhs_name: None,
-                });
+                generator.put_new_function(function, index);
                 let identifier = generator.intern_identifier(name);
                 emit_set_variable_binding(generator, identifier, function);
             }
@@ -1646,18 +1631,13 @@ impl Generator<'_> {
         let identifier = self.intern_identifier(name);
         self.emit(op::CreateVariable {
             identifier,
-            mode: libjs_abi::EnvironmentMode::Lexical as u32,
+            mode: libjs_abi::EnvironmentMode::Lexical as u8,
             is_immutable: true,
             is_global: false,
             is_strict: false,
         });
         let shared_function_data_index = self.register_nested_function(row, NestedFunctionName::None);
-        self.put(op::NewFunction {
-            dst,
-            shared_function_data_index,
-            lhs_name: None,
-            home_object: None,
-        });
+        self.put_new_function(dst, shared_function_data_index);
         emit_initialize_lexical_binding(self, identifier, dst);
         self.leave_scope_environment(ScopeEnvironment {
             register,
@@ -1707,21 +1687,11 @@ impl Generator<'_> {
         let ident = self.identifier_of_binding(binding);
         let index = self.register_nested_function(row, NestedFunctionName::None);
         if ident.is_local() {
-            self.put(op::NewFunction {
-                dst: Operand::local(ident.local_index),
-                shared_function_data_index: index,
-                lhs_name: None,
-                home_object: None,
-            });
+            self.put_new_function(Operand::local(ident.local_index), index);
             self.mark_local_initialized(ident.local_index);
         } else {
             let dst = self.temporary();
-            self.put(op::NewFunction {
-                dst,
-                shared_function_data_index: index,
-                lhs_name: None,
-                home_object: None,
-            });
+            self.put_new_function(dst, index);
             let identifier = self.intern_identifier(name);
             if is_first_of_name {
                 emit_initialize_lexical_binding(self, identifier, dst);
@@ -1833,7 +1803,7 @@ impl Generator<'_> {
             let identifier = self.intern_identifier(name);
             self.emit(op::CreateVariable {
                 identifier,
-                mode: libjs_abi::EnvironmentMode::Lexical as u32,
+                mode: libjs_abi::EnvironmentMode::Lexical as u8,
                 is_immutable: true,
                 is_global: false,
                 is_strict: true,
@@ -1971,7 +1941,7 @@ impl Generator<'_> {
                 NestedFunctionName::None => None,
                 NestedFunctionName::Identifier(name) => Some(self.context.names.identifier_fly_string(tree, name)),
                 NestedFunctionName::Field(name, is_private) => {
-                    field_name = name.map(|name| (name, is_private));
+                    field_name = name.map(|name| Box::new((name, is_private)));
                     Some(ak::Utf16FlyString::from_utf8("field"))
                 }
             };
@@ -2036,28 +2006,29 @@ impl Generator<'_> {
         } else {
             Box::default()
         };
-        let executable = ExecutableData {
-            bytecode: assembled.bytecode,
-            exception_handlers: assembled.exception_handlers,
-            strict_ranges: assembled.strict_ranges,
-            source_map: assembled.source_map,
-            number_of_registers: assembled.number_of_registers,
-            number_of_arguments: assembled.number_of_arguments,
-            is_strict: self.strict,
-            cache_counts: self.cache_counts(),
+        let class_blueprints = link_block.slice(std::mem::take(&mut self.class_blueprints).into_iter());
+        let executable = ExecutableData::new(
+            assembled.bytecode,
+            assembled.source_map,
+            assembled.exception_handlers,
+            assembled.strict_ranges,
+            assembled.number_of_registers,
+            assembled.number_of_arguments,
+            self.strict,
+            self.cache_counts(),
             identifier_table,
             string_table,
             variable_names,
             local_variable_metadata,
-            length_identifier: self.length_identifier,
+            self.length_identifier,
             property_key_table,
             constants,
             shared_function_data,
-            class_blueprints: link_block.slice(std::mem::take(&mut self.class_blueprints).into_iter()),
-            position_source: script.positions.clone(),
-            tables: block.finish(),
-            link_tables: link_block.finish(),
-        };
+            class_blueprints,
+            script.positions.clone(),
+            block.finish(),
+            link_block.finish(),
+        );
         let this_from_environment = this_comes_from_environment(flags);
         PrecompiledFunction {
             executable: Arc::new(executable),

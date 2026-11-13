@@ -30,27 +30,6 @@ impl VisualContextUpdateScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
-#[expect(clippy::enum_variant_names, reason = "C++ names the variants")]
-pub enum FfiVisualContextBoxNodeList {
-    SpatialNodes,
-    ClipNodes,
-    EffectNodes,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiVisualContextUpdateOutcome {
-    pub performed_full_build: bool,
-    pub structural_epoch_changed: bool,
-    pub requires_display_list_recording: bool,
-    /// Whether the update may have given a node of the tree other values: it visited a dirty box, or every box.
-    pub values_may_have_changed: bool,
-    pub structural_epoch: u64,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 #[expect(dead_code, reason = "C++ constructs the variants")]

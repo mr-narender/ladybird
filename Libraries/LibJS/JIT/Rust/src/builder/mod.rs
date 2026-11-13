@@ -133,9 +133,12 @@ pub fn has_run(executable: &ExecutableSnapshot, pc: u32) -> bool {
         slot(slots.value)
             .and_then(|slot| feedback.value.get(slot))
             .map(|bits| *bits != 0),
+        slot(slots.cache_value)
+            .and_then(|cache| feedback.cache_value.get(cache))
+            .map(|bits| *bits != 0),
         slot(slots.call)
             .and_then(|slot| feedback.call.get(slot))
-            .map(|call| call.target.is_some() || call.flags != 0),
+            .map(|call| call.target.is_some() || call.flags != 0 || call.value != 0),
         slot(slots.keyed)
             .and_then(|slot| feedback.keyed.get(slot))
             .map(|keyed| keyed.bits != 0),
@@ -1437,6 +1440,8 @@ impl<'a> GraphBuilder<'a> {
                 let value = self.read(src)?;
                 self.write(dst, value)?;
             }
+            // NB: Only what decodes the next instruction reads its operands.
+            Instruction::WideNameIndices { .. } => {}
             Instruction::MovSrcUndefined { dst } => {
                 let undefined = self.constant(value::UNDEFINED);
                 self.write(dst, undefined)?;
@@ -1596,7 +1601,7 @@ impl<'a> GraphBuilder<'a> {
                 home_object,
                 ..
             } => {
-                if !self.try_build_new_function(dst, shared_function_data_index, home_object.is_some())? {
+                if !self.try_build_new_function(dst, shared_function_data_index.into(), home_object.is_some())? {
                     return Ok(None);
                 }
             }
@@ -1633,7 +1638,7 @@ impl<'a> GraphBuilder<'a> {
                 property_slot,
                 ..
             } => {
-                if !self.try_build_init_object_literal_property(object, src, shape_cache_index, property_slot)? {
+                if !self.try_build_init_object_literal_property(object, src, shape_cache_index, property_slot.into())? {
                     return Ok(None);
                 }
             }

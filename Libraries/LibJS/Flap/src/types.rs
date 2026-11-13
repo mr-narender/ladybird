@@ -240,6 +240,7 @@ define_named_types! {
         EnvironmentCoordinateCacheIndex => "EnvironmentCoordinateCacheIndex", Some(2), false;
         GlobalVariableCacheIndex => "GlobalVariableCacheIndex", Some(2), false;
         PropertyLookupCacheIndex => "PropertyLookupCacheIndex", Some(2), false;
+        ProfiledPropertyLookupCacheIndex => "ProfiledPropertyLookupCacheIndex", Some(2), false;
         ArithFeedbackIndex => "ArithFeedbackIndex", Some(2), false;
         ValueFeedbackIndex => "ValueFeedbackIndex", Some(2), false;
         CallFeedbackIndex => "CallFeedbackIndex", Some(2), false;
@@ -254,6 +255,7 @@ define_named_types! {
     layout {
         Value => "Value", Some(8), false;
         EnvironmentCoordinateEntry => "EnvironmentCoordinateEntry", Some(4), false;
+        BytecodeEnvironmentCoordinate => "BytecodeEnvironmentCoordinate", Some(1), false;
         NativeFunctionTableEntry => "NativeFunctionTableEntry", Some(8), false;
     }
     internal {

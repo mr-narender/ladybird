@@ -1052,8 +1052,7 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
         if (!display_list || !root_document || !root_document->has_paint_state())
             return false;
         Layout::ForcedReadScope root_read { *root_document };
-        root_document->update_paint_and_hit_testing_properties_if_needed();
-        return display_list->compatible_visual_context_tree_structural_epoch() != root_document->paint_state().visual_context_tree_structural_epoch_without_update(root_read);
+        return display_list->compatible_visual_context_tree_structural_epoch() != root_document->paint_state().visual_context_tree_structural_epoch(root_read);
     };
 
     // An event that no compositor has seen, such as one a test makes, goes there first, as the UI's events do. The
@@ -2606,13 +2605,12 @@ static bool fire_clipboard_event(DOM::Document& document, Utf16FlyString const& 
     if (!target)
         return true;
 
-    Bindings::ClipboardEventInit event_init {};
+    DOM::EventInit event_init {};
     event_init.bubbles = true;
     event_init.cancelable = true;
     event_init.composed = true;
-    event_init.clipboard_data = data_transfer;
 
-    auto event = Clipboard::ClipboardEvent::create(event_name, event_init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(document)));
+    auto event = Clipboard::create_clipboard_event(HTML::relevant_realm(document), event_name, event_init, data_transfer);
     event->set_is_trusted(true);
     return target->dispatch_event(event);
 }

@@ -1,4 +1,4 @@
-$0c33eb99 async-generator-yield-await.js:6:1
+$7b56b044 async-generator-yield-await.js:6:1
   Registers: 7
   Blocks:    1
   Constants:
@@ -9,11 +9,11 @@ block0:
   [   0] Enter
   [   1] Mov dst:reg5, src:Undefined
   [   4] GetGlobal value_feedback:0, dst:reg6, `f`
-  [   d] Call value_feedback:1, call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined, arguments:[Int32(1)]
-  [  19] End value:reg5
+  [   c] Call call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined, arguments:[Int32(1)]
+  [  14] End value:reg5
 
 
-f$a950b829 async-generator-yield-await.js:4:5
+f$f97cf73a async-generator-yield-await.js:4:5
   Registers: 15
   Blocks:    19
   Constants:
@@ -76,24 +76,24 @@ block12:
 
 block13:
   [  a8] SetCompletionType completion:reg6
-  [  ae] Jump target:block14
+  [  ab] Jump target:block14
 
 block14:
-  [  b3] Mov dst:reg6, src:reg0
-  [  b6] GetCompletionFields type_dst:reg7, value_dst:reg8, completion:reg6
-  [  ba] StrictlyEqualsRhsInt32 arith_feedback:5, dst:reg13, lhs:reg7, rhs:1
-  [  c3] JumpIf condition:reg13, true_target:block18, false_target:block15
+  [  b0] Mov dst:reg6, src:reg0
+  [  b3] GetCompletionFields type_dst:reg7, value_dst:reg8, completion:reg6
+  [  b7] StrictlyEqualsRhsInt32 arith_feedback:5, dst:reg13, lhs:reg7, rhs:1
+  [  c0] JumpIf condition:reg13, true_target:block18, false_target:block15
 
 block15:
-  [  cd] StrictlyEqualsRhsInt32 arith_feedback:6, dst:reg14, lhs:reg7, rhs:5
-  [  d6] JumpIf condition:reg14, true_target:block16, false_target:block17
+  [  ca] StrictlyEqualsRhsInt32 arith_feedback:6, dst:reg14, lhs:reg7, rhs:5
+  [  d3] JumpIf condition:reg14, true_target:block16, false_target:block17
 
 block16:
-  [  e0] Throw src:reg8
+  [  dd] Throw src:reg8
 
 block17:
-  [  e2] Yield value:reg8
+  [  df] Yield value:reg8
 
 block18:
-  [  e9] Mov dst:reg5, src:reg8
-  [  ec] Yield value:Undefined
+  [  e6] Mov dst:reg5, src:reg8
+  [  e9] Yield value:Undefined

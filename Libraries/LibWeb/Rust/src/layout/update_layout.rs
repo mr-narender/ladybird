@@ -76,7 +76,6 @@ pub struct FfiLayoutUpdateHostCallbacks {
     /// that may take the partial relayout path asks.
     container_query_evaluation_is_pending: extern "C" fn(*mut c_void, &BegunRead) -> bool,
     needs_style_update_after_layout: extern "C" fn(*mut c_void, &BegunRead) -> bool,
-    prepare_for_rendering: extern "C" fn(*mut c_void, &BegunRead),
     /// Readies the document for a layout tree build, and answers the document's style, interned as a
     /// record, where the flag says the build may build the viewport, and 0 otherwise.
     prepare_layout_tree_build: extern "C" fn(*mut c_void, &BegunRead, bool) -> u64,
@@ -89,7 +88,6 @@ pub struct FfiLayoutUpdateHostCallbacks {
         extern "C" fn(*mut c_void, *const FfiNodeIdentity, usize) -> bool,
     /// Refreshes what derives from committed layout; the flag says whether the tree changed.
     after_layout_commit: extern "C" fn(*mut c_void, &BegunRead, bool),
-    note_full_layout_performed: extern "C" fn(*mut c_void),
     evaluate_pending_container_queries: extern "C" fn(*mut c_void, &BegunRead),
     /// Records that a layout update ran out of its exact bound, and answers what the document still has pending, for
     /// the panic that reports the failure, describing the elements the last unstyled-element report and the last
@@ -161,16 +159,6 @@ pub struct FfiLayoutUpdateInputs {
     pub is_template_contents_document: bool,
 }
 
-/// Confinement report of the most recent layout tree build, for tests observing whether a
-/// partial rebuild stayed inside its rebuilt subtrees.
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct FfiLayoutTreeBuildStats {
-    pub builds: u64,
-    pub last_build_rebuilt_subtree_roots: u64,
-    pub last_build_escaped_rebuild_roots: bool,
-}
-
 impl FfiLayoutUpdateHostCallbacks {
     fn connected_element_count(&self, _: &MainThread, read: &BegunRead) -> u32 {
         (self.connected_element_count)(self.context, read)
@@ -198,10 +186,6 @@ impl FfiLayoutUpdateHostCallbacks {
 
     fn needs_style_update_after_layout(&self, _: &MainThread, read: &BegunRead) -> bool {
         (self.needs_style_update_after_layout)(self.context, read)
-    }
-
-    fn prepare_for_rendering(&self, _: &MainThread, read: &BegunRead) {
-        (self.prepare_for_rendering)(self.context, read);
     }
 
     fn prepare_layout_tree_build(&self, _: &MainThread, read: &BegunRead, may_create_viewport: bool) -> Option<u64> {
@@ -233,10 +217,6 @@ impl FfiLayoutUpdateHostCallbacks {
 
     fn after_layout_commit(&self, _: &MainThread, read: &BegunRead, layout_tree_changed: bool) {
         (self.after_layout_commit)(self.context, read, layout_tree_changed);
-    }
-
-    fn note_full_layout_performed(&self, _: &MainThread) {
-        (self.note_full_layout_performed)(self.context);
     }
 
     fn evaluate_pending_container_queries(&self, _: &MainThread, read: &BegunRead) {
@@ -845,7 +825,6 @@ impl LayoutRoundJob {
                 for boundary in planned {
                     answer.commits.push(lay_out_boundary(state, boundary, stage));
                 }
-                state.arena_mut().note_partial_layout();
                 answer.end = LayoutRoundEnd::PartialLayout;
                 return answer;
             }
@@ -882,7 +861,6 @@ impl LayoutRoundJob {
             facts.should_collect_devtools_layout_data,
         );
         answer.commits.push(commit);
-        state.arena_mut().note_full_layout();
         answer
     }
 
@@ -898,7 +876,6 @@ impl LayoutRoundJob {
     ) -> BuildEnd {
         let replaced_viewport = state.arena().layout_root();
         let built = build.run(state, work);
-        state.arena_mut().record_layout_tree_build(&built.outcome);
         // A build of the whole tree resolves every counter again, so no counter it shows is stale, and the document
         // is the root it rebuilt.
         if has_stale_list_item_counters {
@@ -972,6 +949,7 @@ impl LayoutRoundAnswer {
             host.finish_layout_tree_build(main_thread, read, replaced_viewport, built.outcome.viewport);
         }
         if self.commits.is_empty() {
+            super::trace::name_layout_trace_owners(main_thread, read);
             return;
         }
         for commit in self.commits.drain(..) {
@@ -1091,7 +1069,6 @@ fn take_flown_layout_in(main_thread: &MainThread, document_host: &DocumentHost, 
         LayoutRoundEnd::Built { .. } | LayoutRoundEnd::NeedsDocumentStyle => return false,
         LayoutRoundEnd::PartialLayout => host.after_layout_commit(main_thread, read, rebuilds_tree),
         LayoutRoundEnd::FullLayout => {
-            host.note_full_layout_performed(main_thread);
             host.after_layout_commit(main_thread, read, true);
             host.evaluate_pending_container_queries(main_thread, read);
         }
@@ -1151,7 +1128,7 @@ fn update_layout(
                     inspection_round_pending && facts.should_collect_devtools_layout_data;
                 inspection_round_pending = false;
                 if host_layout_is_up_to_date(document_host, read, &facts) && !force_devtools_layout_data_collection {
-                    host.prepare_for_rendering(main_thread, read);
+                    crate::painting::paint_passes::prepare_for_rendering_if_pending(main_thread, document_host, read);
                     return;
                 }
 
@@ -1233,7 +1210,6 @@ fn update_layout(
             Some(LayoutRoundEnd::FullLayout) => {}
         }
 
-        host.note_full_layout_performed(main_thread);
         host.after_layout_commit(main_thread, read, true);
 
         host.evaluate_pending_container_queries(main_thread, read);
@@ -1303,7 +1279,6 @@ pub extern "C" fn document_host_update_layout_is_running(host: &DocumentHost) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::tree_builder::FfiLayoutTreeBuildOutcome;
 
     fn facts_for() -> FfiLayoutUpdateDocumentFacts {
         FfiLayoutUpdateDocumentFacts {
@@ -1381,28 +1356,5 @@ mod tests {
         arena
             .free_subtree(viewport)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
-    }
-
-    #[test]
-    fn the_layout_counters_start_at_zero_and_count_each_pass() {
-        let mut arena = LayoutNodeArena::new();
-        assert_eq!(arena.partial_layout_count(), 0);
-        assert_eq!(arena.full_layout_count(), 0);
-        assert_eq!(arena.layout_tree_build_stats().builds, 0);
-        arena.note_partial_layout();
-        arena.note_full_layout();
-        arena.note_full_layout();
-        arena.record_layout_tree_build(&FfiLayoutTreeBuildOutcome {
-            viewport: NodeSlotId::INVALID,
-            rebuilt_subtree_root_count: 3,
-            layout_tree_update_escaped_rebuild_roots: true,
-            needs_another_build_pass: false,
-        });
-        assert_eq!(arena.partial_layout_count(), 1);
-        assert_eq!(arena.full_layout_count(), 2);
-        let stats = arena.layout_tree_build_stats();
-        assert_eq!(stats.builds, 1);
-        assert_eq!(stats.last_build_rebuilt_subtree_roots, 3);
-        assert!(stats.last_build_escaped_rebuild_roots);
     }
 }

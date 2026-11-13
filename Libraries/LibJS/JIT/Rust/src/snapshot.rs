@@ -403,6 +403,8 @@ pub struct FeedbackSnapshot {
     pub arith: Vec<u8>,
     /// `ValueFeedback` bits.
     pub value: Vec<u16>,
+    /// The `ValueFeedback` bits of the sites of the property lookup caches, indexed like the caches.
+    pub cache_value: Vec<u16>,
     pub call: Vec<CallFeedbackSnapshot>,
     pub keyed: Vec<KeyedFeedbackSnapshot>,
     /// The bound arguments of the bound functions that call sites forwarded
@@ -416,6 +418,8 @@ pub struct CallFeedbackSnapshot {
     pub target: Option<CellId>,
     /// `CallFeedback::Flags` bits.
     pub flags: u8,
+    /// `value_feedback` bits: the types of the values the calls returned.
+    pub value: u16,
     /// The index in `Snapshot::executables` of `target`'s executable, if it is
     /// an inlining candidate.
     pub inline_executable: Option<u32>,
@@ -1478,6 +1482,9 @@ pub struct RuntimeOffsets {
     pub execution_context_frame_initialized: u32,
     /// `ExecutionContext::executable` (cell pointer).
     pub execution_context_executable: u32,
+    /// `Executable::idle_collection_count` (u8), which JIT code clears at its entry like the interpreter's Enter, or 0
+    /// for code that does not.
+    pub executable_idle_collection_count: u32,
     /// `sizeof(ExecutionContext)`: where the slots start.
     pub execution_context_slots: u32,
     /// `VmHead::running_execution_context`.

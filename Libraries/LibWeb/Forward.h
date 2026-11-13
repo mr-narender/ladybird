@@ -215,7 +215,6 @@ class SFrameTransformErrorEvent;
 namespace Web::Clipboard {
 
 class Clipboard;
-class ClipboardItem;
 
 }
 
@@ -1008,8 +1007,6 @@ class DocumentPaintState;
 namespace Web::PerformanceTimeline {
 
 class PerformanceEntry;
-class PerformanceObserver;
-class PerformanceObserverEntryList;
 
 }
 

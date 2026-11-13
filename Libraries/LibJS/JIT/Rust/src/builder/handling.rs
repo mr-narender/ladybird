@@ -92,6 +92,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         O::Enter
         | O::Mov
         | O::MovWide
+        | O::WideNameIndices
         | O::MovSrcUndefined
         | O::Jump
         | O::JumpIf
@@ -140,6 +141,7 @@ pub fn handling(opcode: OpCode) -> Handling {
         | O::NewArray
         | O::NewPrimitiveArray
         | O::NewFunction
+        | O::NewFunctionWide
         | O::NewReferenceError
         | O::NewTypeError
         | O::CreateLexicalEnvironment

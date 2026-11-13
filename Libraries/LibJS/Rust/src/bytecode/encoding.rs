@@ -6,6 +6,8 @@
 
 use core::marker::PhantomData;
 
+use crate::layout::property_lookup_cache::EnvironmentCoordinate;
+
 /// The bytes every instruction starts with.
 #[repr(C)]
 pub struct InstructionHeader {
@@ -53,27 +55,44 @@ impl OptionalLabel {
     }
 }
 
+/// The coordinate of a binding as an instruction holds it: a byte of hops and two bytes of binding index. The generator
+/// looks bindings up by name where a coordinate does not fit.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct BytecodeEnvironmentCoordinate {
+    hops: u8,
+    index: [u8; 2],
+}
+
+impl BytecodeEnvironmentCoordinate {
+    pub fn get(self) -> EnvironmentCoordinate {
+        EnvironmentCoordinate {
+            hops: u32::from(self.hops),
+            index: u32::from(u16::from_ne_bytes(self.index)),
+        }
+    }
+}
+
+/// The name table index that the field `field` of an instruction in `bytecode` holds, if it holds one. An index too
+/// large for the field is in the WideNameIndices before the instruction, which only the bytecode can reach.
+fn name_index_in(field: &[u8; 2], bytecode: &[u8]) -> Option<usize> {
+    let at = field.as_ptr().addr().wrapping_sub(bytecode.as_ptr().addr());
+    assert!(at < bytecode.len(), "the name table index is a field of the bytecode");
+    super::operand::read_optional_name_index(bytecode, at).map(|index| index as usize)
+}
+
 macro_rules! define_table_index {
     ($($name:ident),*) => {
         $(
-            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            /// The field of an instruction that holds an index into a name table of its executable.
+            #[derive(Debug)]
             #[repr(C, packed)]
-            pub struct $name(pub [u8; 3]);
+            pub struct $name([u8; 2]);
 
             impl $name {
-                pub fn from_index(index: u32) -> Self {
-                    Self(super::operand::name_index_bytes(index))
-                }
-
-                pub fn index(self) -> usize {
-                    let [low, middle, high] = self.0;
-                    u32::from_le_bytes([low, middle, high, 0]) as usize
-                }
-            }
-
-            impl From<[u8; 3]> for $name {
-                fn from(bytes: [u8; 3]) -> Self {
-                    Self(bytes)
+                /// The index the field holds, which is a field of an instruction in `bytecode`.
+                pub fn index_in(&self, bytecode: &[u8]) -> usize {
+                    name_index_in(&self.0, bytecode).expect("the field holds a name table index")
                 }
             }
         )*
@@ -82,24 +101,13 @@ macro_rules! define_table_index {
 
 define_table_index!(IdentifierTableIndex, PropertyKeyTableIndex, StringTableIndex);
 
-/// A table index that may be absent, encoded with all bits set.
+/// The field of an instruction that holds an index into a name table of its executable, if it holds one.
 #[repr(C, packed)]
-pub struct OptionalIndex<T>(pub [u8; 3], PhantomData<T>);
+pub struct OptionalIndex<T>([u8; 2], PhantomData<T>);
 
-/// A name that only makes error messages better, which instructions hold in two bytes.
-#[repr(C, packed)]
-pub struct OptionalDebugIndex<T>(pub u16, PhantomData<T>);
-
-impl<T: From<[u8; 3]>> OptionalDebugIndex<T> {
-    pub fn get(&self) -> Option<T> {
-        let raw = self.0;
-        (raw != u16::MAX).then(|| T::from(super::operand::name_index_bytes(u32::from(raw))))
-    }
-}
-
-impl<T: From<[u8; 3]>> OptionalIndex<T> {
-    pub fn get(&self) -> Option<T> {
-        let raw = self.0;
-        (raw != [u8::MAX; 3]).then(|| T::from(raw))
+impl<T> OptionalIndex<T> {
+    /// The index the field holds, which is a field of an instruction in `bytecode`.
+    pub fn index_in(&self, bytecode: &[u8]) -> Option<usize> {
+        name_index_in(&self.0, bytecode)
     }
 }

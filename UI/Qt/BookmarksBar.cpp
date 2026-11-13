@@ -32,6 +32,7 @@
 #include <QCursor>
 #include <QDynamicPropertyChangeEvent>
 #include <QEvent>
+#include <QFontMetricsF>
 #include <QIcon>
 #include <QLabel>
 #include <QMenu>
@@ -43,19 +44,18 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QVariantAnimation>
+#include <QtMath>
 
 namespace Ladybird {
 
-// Bookmarks are 24 px buttons with 6 px corners, their favicon padded less than their title.
+// Bookmarks are 24 px buttons with 6 px corners, padded as much after their title as before their favicon.
 static constexpr int BOOKMARK_BUTTON_MAX_WIDTH = 168;
 static constexpr int BOOKMARK_BUTTON_ICON_SIZE = 16;
 static constexpr int BOOKMARK_BUTTON_HEIGHT = 24;
 static constexpr int BOOKMARK_BUTTON_CORNER_RADIUS = 6;
-static constexpr int BOOKMARK_BUTTON_LEFT_PADDING = 6;
-static constexpr int BOOKMARK_BUTTON_RIGHT_PADDING = 8;
+static constexpr int BOOKMARK_BUTTON_HORIZONTAL_PADDING = 6;
 static constexpr int BOOKMARK_TITLE_PIXEL_SIZE = 12;
 static constexpr int BOOKMARK_BUTTON_ICON_TEXT_SPACING = 6;
-static constexpr int BOOKMARK_BUTTON_TEXT_ELISION_PADDING = 2;
 
 static constexpr char const* BOOKMARK_ITEM_PROPERTY = "bookmark_item";
 static constexpr char const* BOOKMARK_CONTEXT_MENU_OPEN_PROPERTY = "bookmark_context_menu_open";
@@ -131,7 +131,7 @@ static BookmarkButtonLayout bookmark_button_layout(QToolButton const& button, QS
     layout.icon_text_spacing = layout.icon_width > 0 && !text.isEmpty() ? BOOKMARK_BUTTON_ICON_TEXT_SPACING : 0;
 
     layout.content_rect = button_rect;
-    layout.content_rect.adjust(BOOKMARK_BUTTON_LEFT_PADDING, 0, -BOOKMARK_BUTTON_RIGHT_PADDING, 0);
+    layout.content_rect.adjust(BOOKMARK_BUTTON_HORIZONTAL_PADDING, 0, -BOOKMARK_BUTTON_HORIZONTAL_PADDING, 0);
     layout.content_rect.adjust(0, 0, -layout.menu_indicator_width, 0);
 
     auto text_left = layout.content_rect.left() + layout.icon_width + layout.icon_text_spacing;
@@ -148,11 +148,10 @@ static BookmarkButtonLayout bookmark_button_layout(QToolButton const& button, QS
         };
     }
 
-    auto preferred_width = BOOKMARK_BUTTON_LEFT_PADDING + BOOKMARK_BUTTON_RIGHT_PADDING
+    auto preferred_width = BOOKMARK_BUTTON_HORIZONTAL_PADDING * 2
         + layout.icon_width
         + layout.icon_text_spacing
-        + QFontMetrics(bookmark_title_font(button)).horizontalAdvance(text)
-        + BOOKMARK_BUTTON_TEXT_ELISION_PADDING
+        + qCeil(QFontMetricsF(bookmark_title_font(button)).horizontalAdvance(text))
         + layout.menu_indicator_width;
     layout.preferred_width = min(preferred_width, button_rect.width());
 
@@ -212,16 +211,21 @@ BookmarksBar::BookmarksBar(QWidget* parent)
     setFloatable(false);
     setProperty(WINDOW_DRAG_REGION_PROPERTY, true);
     setContextMenuPolicy(Qt::PreventContextMenu);
-    update_chrome_style();
 
     installEventFilter(this);
+
+    m_overflow_button = findChild<QToolButton*>(QStringLiteral("qt_toolbar_ext_button"), Qt::FindDirectChildrenOnly);
+    update_chrome_style();
 
     rebuild();
 }
 
 void BookmarksBar::update_chrome_style()
 {
-    setStyleSheet(ChromeStyle::bookmarks_bar_style_sheet(Theme::chrome_palette(*this), BOOKMARK_BUTTON_CORNER_RADIUS));
+    auto palette = Theme::chrome_palette(*this);
+    setStyleSheet(ChromeStyle::bookmarks_bar_style_sheet(palette, BOOKMARK_BUTTON_CORNER_RADIUS));
+    if (m_overflow_button)
+        m_overflow_button->setIcon(create_chrome_icon(ChromeIcon::DoubleChevronRight, palette));
 }
 
 // A bookmark that is added slides into the bar, and the items after it move to make room. One that is removed slides
@@ -316,14 +320,12 @@ void BookmarksBar::rebuild()
 
         auto layout = bookmark_button_layout(*button, option, title, max_size_rect);
 
-        auto available_title_width = max(layout.available_text_width - BOOKMARK_BUTTON_TEXT_ELISION_PADDING, 0);
-        auto text = title_font_metrics.elidedText(title, Qt::ElideRight, available_title_width);
+        auto text = title_font_metrics.elidedText(title, Qt::ElideRight, layout.available_text_width);
         button->setText(text);
 
         layout = bookmark_button_layout(*button, option, text, max_size_rect);
 
         button->setFixedWidth(layout.preferred_width);
-        button->setMaximumWidth(BOOKMARK_BUTTON_MAX_WIDTH);
         button->setFixedHeight(height);
 
         button->installEventFilter(this);

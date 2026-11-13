@@ -388,14 +388,26 @@ void CompositorState::destroy_contexts_for_web_content_client(CompositorStateWeb
         m_canvas_surface_registry.remove_canvas_surface(canvas_id);
         return true;
     });
+
+    // A process that goes away paints nothing more, and is told of nothing.
+    m_screenshot_preparations.remove_all_matching([&](auto, auto const& preparation) {
+        return preparation.requester == client.web_content_client_id();
+    });
+    Vector<u64> preparations_awaiting_client;
+    for (auto& [preparation_id, preparation] : m_screenshot_preparations) {
+        if (preparation.awaited_painters.remove(client.web_content_client_id()))
+            preparations_awaiting_client.append(preparation_id);
+    }
     m_web_content_clients.remove(client.web_content_client_id());
+    for (auto preparation_id : preparations_awaiting_client)
+        finish_screenshot_preparation_if_done(preparation_id);
 }
 
 CompositorState::PlaceholderCanvasAllocation CompositorState::allocate_placeholder_canvas(CompositorStateWebContentClient& client)
 {
     auto canvas_id = m_canvas_surface_registry.allocate_canvas_id();
     auto secret = get_random<u64>();
-    m_placeholder_canvases.set(canvas_id, { .owner = &client, .secret = secret, .surface = nullptr, .size = {}, .origin_clean = true });
+    m_placeholder_canvases.set(canvas_id, { .owner = &client, .secret = secret, .presented_surfaces = {}, .surface = nullptr, .size = {}, .origin_clean = true });
     return { canvas_id, secret };
 }
 
@@ -416,10 +428,15 @@ void CompositorState::commit_placeholder_canvas(Compositing::CanvasId canvas_id,
 
     auto& placeholder = it->value;
     if (source_surface) {
-        if (!placeholder.surface || placeholder.surface->size() != source_surface->size())
-            placeholder.surface = Gfx::PaintingSurface::create_with_size(source_surface->size(), Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, m_skia_backend_context);
-        placeholder.surface->copy_from_surface(*source_surface);
-        m_canvas_surface_registry.set_canvas_surface(placeholder.owner->canvas_surface_owner_id(), canvas_id, *placeholder.surface);
+        auto presented_surface_or_error = placeholder.presented_surfaces.surface_for_next_content(source_surface->size(), m_skia_backend_context);
+        if (presented_surface_or_error.is_error()) {
+            dbgln("Unable to commit a placeholder canvas: {}", presented_surface_or_error.error());
+            return;
+        }
+        auto presented_surface = presented_surface_or_error.release_value();
+        presented_surface->painting_surface().copy_from_surface(*source_surface);
+        placeholder.surface = presented_surface->painting_surface();
+        m_canvas_surface_registry.set_canvas_surface(placeholder.owner->canvas_surface_owner_id(), canvas_id, *presented_surface);
     } else {
         placeholder.surface = nullptr;
         m_canvas_surface_registry.remove_canvas_surface(canvas_id);
@@ -450,6 +467,7 @@ void CompositorState::create_context(Web::CompositorContextId context_id, Option
     auto& context = *m_presented_contexts.ensure(context_id, [&] {
         return make<PresentedContext>(page_id, web_content_client, OwnedCanvasSurfaces { m_canvas_surface_registry, web_content_client.canvas_surface_owner_id() });
     });
+    context.presenter.set_window_server_may_show_high_dynamic_range(m_window_server_may_show_high_dynamic_range);
     resize_backing_stores_if_needed(context_id, context);
 }
 
@@ -1107,6 +1125,17 @@ void CompositorState::set_context_visibility(Web::CompositorContextId context_id
         resume_presentation_after_becoming_visible(context_id, *context);
 }
 
+void CompositorState::set_window_server_may_show_high_dynamic_range(bool may_show)
+{
+    if (m_window_server_may_show_high_dynamic_range == may_show)
+        return;
+    m_window_server_may_show_high_dynamic_range = may_show;
+    for (auto& context_entry : m_presented_contexts) {
+        context_entry.value->presenter.set_window_server_may_show_high_dynamic_range(may_show);
+        present_current_frame(context_entry.key, *context_entry.value);
+    }
+}
+
 void CompositorState::set_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)
 {
     auto* context = presented_context_if_present(context_id);
@@ -1209,14 +1238,22 @@ void CompositorState::present_frame(Web::CompositorContextId context_id, Present
     auto* pending_present = &m_pending_async_presents.last();
     pending_present->shows_in_remote_layer = context.presenter.backing_store_publication_mode() == BackingStoreManager::PublicationMode::ShownInRemoteLayer;
     pending_present->publish_to_presentation = !pending_present->shows_in_remote_layer && presentation_for_context(context_id) != nullptr;
+    pending_present->keeps_shown_store = !prepared_frame->rendered_surface;
+    pending_present->sublayers = move(prepared_frame->sublayers);
 
     auto& event_loop = Core::EventLoop::current();
     auto self = NonnullRefPtr { *this };
-    m_display_list_player->flush_async(*prepared_frame->rendered_surface, [self = move(self), &event_loop, pending_present] {
+    auto did_finish = [self = move(self), &event_loop, pending_present] {
         event_loop.deferred_invoke([self = move(self), pending_present] {
             self->did_finish_async_present(*pending_present);
         });
-    });
+    };
+    // A frame without a store still waits for what was drawn into the surfaces that the window server shows above the
+    // store, such as a canvas that presented.
+    if (prepared_frame->rendered_surface)
+        m_display_list_player->flush_async(*prepared_frame->rendered_surface, move(did_finish));
+    else
+        m_skia_backend_context->flush_and_submit_async(move(did_finish));
     context.presenter.did_submit_prepared_frame(pending_frame.viewport_rect);
 #ifdef AK_OS_MACOS
     // The window server's reads of an IOSurface wait for GPU work that is already scheduled to write it. Handing the
@@ -1439,12 +1476,98 @@ bool CompositorState::request_screenshot(Web::CompositorContextId context_id, Gf
     return true;
 }
 
+// How long a screenshot waits for the processes that paint its context's descendants. One whose script never yields
+// keeps its connection open without answering, and the screenshot then goes ahead with the frames it last handed over.
+static constexpr auto SCREENSHOT_PREPARATION_LIMIT = AK::Duration::from_seconds(10);
+
+void CompositorState::prepare_remote_descendants_for_screenshot(CompositorStateWebContentClient& requester, Web::CompositorContextId context_id, u64 request_id)
+{
+    HashMap<Web::CompositorContextId, Vector<Web::CompositorContextId>> children;
+    for (auto const& [child_id, child] : m_presented_contexts) {
+        if (child->parent_context_id.has_value())
+            children.ensure(*child->parent_context_id).append(child_id);
+    }
+
+    // From the first context of a branch that another process owns on down, each process paints the contexts it owns
+    // there, the requester's included. Above that point, the requester paints its own as it takes the screenshot.
+    HashMap<WebContentClientId, Vector<Web::CompositorContextId>> contexts_by_painter;
+    HashTable<Web::CompositorContextId> visited;
+    Vector<Web::CompositorContextId> to_visit { context_id };
+    HashTable<Web::CompositorContextId> below_another_process;
+    while (!to_visit.is_empty()) {
+        auto id = to_visit.take_last();
+        if (visited.set(id) != HashSetResult::InsertedNewEntry)
+            continue;
+        auto context = m_presented_contexts.get(id);
+        if (!context.has_value())
+            continue;
+        auto owner = (*context)->web_content_client.web_content_client_id();
+        bool painted_by_owner = below_another_process.contains(id) || owner != requester.web_content_client_id();
+        if (painted_by_owner)
+            contexts_by_painter.ensure(owner).append(id);
+        auto child_ids = children.find(id);
+        if (child_ids == children.end())
+            continue;
+        for (auto child_id : child_ids->value) {
+            if (painted_by_owner)
+                below_another_process.set(child_id);
+            to_visit.append(child_id);
+        }
+    }
+
+    if (contexts_by_painter.is_empty()) {
+        requester.tell_remote_descendants_prepared_for_screenshot(request_id);
+        return;
+    }
+
+    auto preparation_id = m_next_screenshot_preparation_id++;
+    ScreenshotPreparation preparation { requester.web_content_client_id(), request_id, {}, {} };
+    for (auto const& [painter, _] : contexts_by_painter)
+        preparation.awaited_painters.set(painter);
+    preparation.deadline = Core::Timer::create_single_shot(SCREENSHOT_PREPARATION_LIMIT, [this, preparation_id] {
+        finish_screenshot_preparation(preparation_id);
+    });
+    preparation.deadline->start();
+    m_screenshot_preparations.set(preparation_id, move(preparation));
+    for (auto const& [painter, context_ids] : contexts_by_painter) {
+        if (auto* client = web_content_client_if_present(painter))
+            client->ask_to_paint_contexts_for_screenshot(preparation_id, context_ids);
+    }
+}
+
+void CompositorState::did_paint_contexts_for_screenshot(CompositorStateWebContentClient& painter, u64 preparation_id)
+{
+    auto preparation = m_screenshot_preparations.get(preparation_id);
+    if (!preparation.has_value() || !preparation->awaited_painters.remove(painter.web_content_client_id()))
+        return;
+    finish_screenshot_preparation_if_done(preparation_id);
+}
+
+void CompositorState::finish_screenshot_preparation_if_done(u64 preparation_id)
+{
+    auto preparation = m_screenshot_preparations.get(preparation_id);
+    if (!preparation.has_value() || !preparation->awaited_painters.is_empty())
+        return;
+    finish_screenshot_preparation(preparation_id);
+}
+
+void CompositorState::finish_screenshot_preparation(u64 preparation_id)
+{
+    auto finished = m_screenshot_preparations.take(preparation_id);
+    if (!finished.has_value())
+        return;
+    if (finished->deadline)
+        finished->deadline->stop();
+    if (auto* requester = web_content_client_if_present(finished->requester))
+        requester->tell_remote_descendants_prepared_for_screenshot(finished->request_id);
+}
+
 Optional<Gfx::ShareableBitmap> CompositorState::take_frame_snapshot(Web::CompositorContextId context_id, Optional<Gfx::IntSize> maximum_size)
 {
     auto* context = presented_context_if_present(context_id);
     if (!context || !context->presenter.presents_to_client())
         return {};
-    return context->presenter.snapshot_of_presented_frame(maximum_size);
+    return context->presenter.snapshot_of_presented_frame(*m_display_list_player, maximum_size);
 }
 
 void CompositorState::presented_bitmap_ready_to_paint(Web::CompositorContextId context_id, i32 bitmap_id)
@@ -1491,16 +1614,16 @@ static void log_presented_frame(Optional<u64> page_id, Gfx::IntRect damage)
     log->event("frame"sv, move(data));
 }
 
-void CompositorState::show_frame_in_remote_layer(Web::CompositorContextId context_id, PresentedContext& context, PendingAsyncPresent const& pending_present)
+void CompositorState::show_frame_in_remote_layer(Web::CompositorContextId context_id, PresentedContext& context, PendingAsyncPresent& pending_present)
 {
     VERIFY(context.remote_layer_id.has_value());
     auto remote_layer = m_remote_layers.find(*context.remote_layer_id);
     VERIFY(remote_layer != m_remote_layers.end());
-    auto const* shared_image_buffer = context.presenter.shared_image_buffer_of_latest_rendered_store();
-    VERIFY(shared_image_buffer);
+    auto const* shared_image_buffer = pending_present.keeps_shown_store ? nullptr : context.presenter.shared_image_buffer_of_latest_rendered_store();
+    VERIFY(shared_image_buffer || pending_present.keeps_shown_store);
 
     auto frame_size = pending_present.viewport_rect.size();
-    remote_layer->value.layer->show_frame(*shared_image_buffer, frame_size, pending_present.device_pixel_ratio, remote_layer->value.fit_within);
+    remote_layer->value.layer->show_frame(shared_image_buffer, frame_size, pending_present.device_pixel_ratio, remote_layer->value.fit_within, move(pending_present.sublayers));
     remote_layer->value.size_of_shown_frame_laid_out_by_page = frame_size == context.size_laid_out_by_page ? Optional<Gfx::IntSize> { frame_size } : OptionalNone {};
     report_held_synchronized_resize_frames(remote_layer->key);
     remote_layer->value.presentation->did_present_frame_in_remote_layer(context_id, pending_present.viewport_rect, pending_present.damage_rect, pending_present.device_pixel_ratio);
@@ -1508,6 +1631,10 @@ void CompositorState::show_frame_in_remote_layer(Web::CompositorContextId contex
 
 void CompositorState::deliver_rendered_frame(PendingAsyncPresent& pending_present)
 {
+    if (pending_present.was_cancelled && pending_present.keeps_shown_store && !pending_present.was_delivered) {
+        if (auto* context = presented_context_if_present(pending_present.context_id))
+            context->presenter.did_deliver_frame_without_store();
+    }
     if (pending_present.was_cancelled || exchange(pending_present.was_delivered, true))
         return;
 
@@ -1515,7 +1642,10 @@ void CompositorState::deliver_rendered_frame(PendingAsyncPresent& pending_presen
     auto* context = presented_context_if_present(context_id);
     VERIFY(context);
 
-    context->presenter.did_finish_gpu_present(pending_present.bitmap_id, pending_present.viewport_rect.size());
+    if (pending_present.keeps_shown_store)
+        context->presenter.did_deliver_frame_without_store();
+    else
+        context->presenter.did_finish_gpu_present(pending_present.bitmap_id, pending_present.viewport_rect.size());
     auto* presentation = pending_present.publish_to_presentation ? presentation_for_context(context_id) : nullptr;
     if (pending_present.shows_in_remote_layer) {
         log_presented_frame(context->page_id, pending_present.damage_rect);
@@ -1645,6 +1775,8 @@ void CompositorState::resize_backing_stores_if_needed(Web::CompositorContextId c
     else if (presentation_for_context(context_id))
         publication_mode = BackingStoreManager::PublicationMode::Published;
 
+    // The window server reads what it shows above the store straight from GPU memory.
+    context.presenter.set_window_server_may_show_media(publication_mode == BackingStoreManager::PublicationMode::ShownInRemoteLayer && m_skia_backend_context && !context.presents_from_cpu_memory);
     if (auto publication = context.presenter.resize_backing_stores_if_needed(m_skia_backend_context, gpu_sharing_for_context(context_id), publication_mode); publication.has_value()) {
         if (publication_mode == BackingStoreManager::PublicationMode::Published)
             publish_backing_stores(context_id, context, publication.release_value());

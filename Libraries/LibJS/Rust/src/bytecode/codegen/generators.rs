@@ -39,13 +39,10 @@ fn emit_get_by_known_name(
 ) {
     let key = generator.intern_property_key_text(name);
     let cache = generator.next_property_lookup_cache();
-    let value_feedback = generator.next_value_feedback();
     generator.emit(op::GetById {
-        value_feedback,
         dst: dst.operand(),
         base: base.operand(),
         property: key,
-        base_identifier: None,
         cache,
     });
 }
@@ -119,7 +116,7 @@ pub(super) fn generate_yield_of_value(
     let normal_block = generator.new_label();
     let throw_cont = generator.new_label();
     let type_is_normal = generator.allocate_register();
-    let normal_type = generator.add_constant_number(f64::from(CompletionType::Normal as u32));
+    let normal_type = generator.add_constant_number(f64::from(CompletionType::Normal as u8));
     let arith_feedback = generator.next_arith_feedback();
     generator.emit(op::StrictlyEquals {
         arith_feedback,
@@ -134,7 +131,7 @@ pub(super) fn generate_yield_of_value(
 
     generator.bind_reachable_label(throw_cont);
     let type_is_throw = generator.allocate_register();
-    let throw_type = generator.add_constant_number(f64::from(CompletionType::Throw as u32));
+    let throw_type = generator.add_constant_number(f64::from(CompletionType::Throw as u8));
     let arith_feedback = generator.next_arith_feedback();
     generator.emit(op::StrictlyEquals {
         arith_feedback,
@@ -185,7 +182,7 @@ pub(super) fn generate_await_with_completions(
     let normal_block = generator.new_label();
     let throw_block = generator.new_label();
     let is_normal = generator.allocate_register();
-    let normal_type = generator.add_constant_number(f64::from(CompletionType::Normal as u32));
+    let normal_type = generator.add_constant_number(f64::from(CompletionType::Normal as u8));
     let arith_feedback = generator.next_arith_feedback();
     generator.emit(op::StrictlyEquals {
         arith_feedback,
@@ -227,7 +224,7 @@ fn generate_yield_from(
         IteratorHint::Async
     } else {
         IteratorHint::Sync
-    } as u32;
+    } as u8;
     let cache = generator.next_property_lookup_cache();
     generator.emit(op::GetIterator {
         dst_iterator_object: iterator.operand(),
@@ -241,7 +238,7 @@ fn generate_yield_from(
     });
 
     // 6. Let received be NormalCompletion(undefined).
-    let normal_const = generator.add_constant_number(f64::from(CompletionType::Normal as u32));
+    let normal_const = generator.add_constant_number(f64::from(CompletionType::Normal as u8));
     generator.emit_mov(received_completion_type, &normal_const);
     let undef = generator.add_constant_undefined();
     generator.emit_mov(received_completion_value, &undef);
@@ -273,16 +270,13 @@ fn generate_yield_from(
 
     // i. Let _innerResult_ be ? Call(_next_, _iterator_, « _received_.[[Value]] »).
     let inner_result = generator.allocate_register();
-    let value_feedback = generator.next_value_feedback();
     let call_feedback = generator.next_call_feedback();
     generator.emit(op::Call {
-        value_feedback,
         call_feedback,
         dst: inner_result.operand(),
         callee: next_method.operand(),
         this_value: iterator.operand(),
         argument_count: 1,
-        expression_string: None,
         arguments: &[received_completion_value.operand()],
     });
 
@@ -346,7 +340,7 @@ fn generate_yield_from(
     generator.bind_reachable_label(is_type_throw_block);
     let type_is_throw_block = generator.new_label();
     let type_is_return_block = generator.new_label();
-    let throw_const = generator.add_constant_number(f64::from(CompletionType::Throw as u32));
+    let throw_const = generator.add_constant_number(f64::from(CompletionType::Throw as u8));
     let is_throw = generator.allocate_register();
     let arith_feedback = generator.next_arith_feedback();
     generator.emit(op::StrictlyEquals {
@@ -382,16 +376,13 @@ fn generate_yield_from(
     generator.bind_reachable_label(throw_method_defined_block);
 
     // 1. Let _innerResult_ be ? Call(_throw_, _iterator_, « _received_.[[Value]] »).
-    let value_feedback = generator.next_value_feedback();
     let call_feedback = generator.next_call_feedback();
     generator.emit(op::Call {
-        value_feedback,
         call_feedback,
         dst: inner_result.operand(),
         callee: throw_method.operand(),
         this_value: iterator.operand(),
         argument_count: 1,
-        expression_string: None,
         arguments: &[received_completion_value.operand()],
     });
 
@@ -471,16 +462,13 @@ fn generate_yield_from(
         generator.bind_reachable_label(call_return_block);
 
         let close_result = generator.allocate_register();
-        let value_feedback = generator.next_value_feedback();
         let call_feedback = generator.next_call_feedback();
         generator.emit(op::Call {
-            value_feedback,
             call_feedback,
             dst: close_result.operand(),
             callee: return_method.operand(),
             this_value: iterator.operand(),
             argument_count: 0,
-            expression_string: None,
             arguments: &[],
         });
 
@@ -503,7 +491,7 @@ fn generate_yield_from(
             iterator_object: iterator.operand(),
             iterator_next: next_method.operand(),
             iterator_done: iterator_done_property.operand(),
-            completion_type: CompletionType::Normal as u32,
+            completion_type: CompletionType::Normal as u8,
             completion_value: undef.operand(),
             cache,
         });
@@ -564,16 +552,13 @@ fn generate_yield_from(
 
     // iv. Let _innerReturnResult_ be ? Call(_return_, _iterator_, « _received_.[[Value]] »).
     let inner_return_result = generator.allocate_register();
-    let value_feedback = generator.next_value_feedback();
     let call_feedback = generator.next_call_feedback();
     generator.emit(op::Call {
-        value_feedback,
         call_feedback,
         dst: inner_return_result.operand(),
         callee: return_method.operand(),
         this_value: iterator.operand(),
         argument_count: 1,
-        expression_string: None,
         arguments: &[received_completion_value.operand()],
     });
 
@@ -714,7 +699,7 @@ fn generate_yield(
     // If resumptionValue.[[Type]] is not return, jump to continuation.
     let return_block = generator.new_label();
     let is_not_return = generator.allocate_register();
-    let return_type = generator.add_constant_number(f64::from(CompletionType::Return as u32));
+    let return_type = generator.add_constant_number(f64::from(CompletionType::Return as u8));
     let arith_feedback = generator.next_arith_feedback();
     generator.emit(op::StrictlyInequals {
         arith_feedback,
@@ -737,7 +722,7 @@ fn generate_yield(
     // If awaited.[[Type]] is throw, jump to continuation.
     let awaited_normal_block = generator.new_label();
     let is_throw = generator.allocate_register();
-    let throw_type = generator.add_constant_number(f64::from(CompletionType::Throw as u32));
+    let throw_type = generator.add_constant_number(f64::from(CompletionType::Throw as u8));
     let arith_feedback = generator.next_arith_feedback();
     generator.emit(op::StrictlyEquals {
         arith_feedback,
@@ -751,7 +736,7 @@ fn generate_yield(
     generator.bind_reachable_label(awaited_normal_block);
     generator.emit(op::SetCompletionType {
         completion: received_completion.operand(),
-        completion_type: CompletionType::Return as u32,
+        completion_type: CompletionType::Return as u8,
     });
     generator.emit(op::Jump {
         target: continuation_label,
@@ -790,7 +775,7 @@ pub(super) fn emit_dispose_resources(
             let await_completion_value = generator.allocate_register();
             let done = generator.allocate_register();
             let awaited_value = generator.allocate_register();
-            let normal_type = generator.add_constant_number(f64::from(CompletionType::Normal as u32));
+            let normal_type = generator.add_constant_number(f64::from(CompletionType::Normal as u8));
             let undefined = generator.add_constant_undefined();
             generator.emit_mov(&await_completion_type, &normal_type);
             generator.emit_mov(&await_completion_value, &undefined);

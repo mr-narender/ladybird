@@ -95,19 +95,21 @@ fn generate_instruction_feedback_slots_from_bytes(
     mut w: impl Write,
     ops: &[InstructionDefinition],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const KINDS: [&str; 4] = [
+    const KINDS: [&str; 5] = [
         "ArithFeedbackIndex",
         "ValueFeedbackIndex",
         "CallFeedbackIndex",
         "KeyedFeedbackIndex",
+        "ProfiledPropertyLookupCacheIndex",
     ];
     writeln!(
         w,
-        "/// The feedback slot indices of the instruction at `bytes[at..]`: arith, value, call and keyed."
+        "/// The feedback slot indices of the instruction at `bytes[at..]`: arith, value, call, keyed and the property"
     )?;
+    writeln!(w, "/// lookup cache whose site's value feedback it records.")?;
     writeln!(
         w,
-        "pub fn instruction_feedback_slots_from_bytes(opcode: u8, bytes: &[u8], at: usize) -> [Option<u16>; 4] {{"
+        "pub fn instruction_feedback_slots_from_bytes(opcode: u8, bytes: &[u8], at: usize) -> [Option<u16>; 5] {{"
     )?;
     writeln!(w, "    match opcode {{")?;
     for (i, op) in ops.iter().enumerate() {
@@ -128,7 +130,7 @@ fn generate_instruction_feedback_slots_from_bytes(
         }
         writeln!(w, "        {i} => [{}], // {}", slots.join(", "), op.name)?;
     }
-    writeln!(w, "        _ => [None; 4],")?;
+    writeln!(w, "        _ => [None; 5],")?;
     writeln!(w, "    }}")?;
     writeln!(w, "}}")?;
     writeln!(w)?;
@@ -399,7 +401,7 @@ fn generate_instruction_dump_from_bytes(
                         "            dumper.append_piece(|dumper| dumper.append_identifier_quoted({rname}.0));"
                     )?;
                 }
-                "Optional<IdentifierTableIndex>" | "Optional<DebugIdentifierIndex>" => {
+                "Optional<IdentifierTableIndex>" => {
                     let mut property_key_field = None;
                     let mut property_operand_field = None;
                     for other in &op.fields {
@@ -447,7 +449,7 @@ fn generate_instruction_dump_from_bytes(
                     w,
                     "            dumper.append_piece(|dumper| dumper.append_string({rname}.0));"
                 )?,
-                "Optional<StringTableIndex>" | "Optional<DebugStringIndex>" => {
+                "Optional<StringTableIndex>" => {
                     writeln!(w, "            if let Some({rname}) = {rname} {{")?;
                     writeln!(
                         w,
@@ -463,11 +465,19 @@ fn generate_instruction_dump_from_bytes(
                     w,
                     "            dumper.append_piece(|dumper| dumper.append_put_kind(\"{label}\", {rname}));"
                 )?,
-                "ArithFeedbackIndex" | "ValueFeedbackIndex" | "CallFeedbackIndex" | "KeyedFeedbackIndex" => writeln!(
+                "ArithFeedbackIndex"
+                | "ValueFeedbackIndex"
+                | "CallFeedbackIndex"
+                | "KeyedFeedbackIndex"
+                | "PropertyLookupCacheIndex"
+                | "ProfiledPropertyLookupCacheIndex"
+                | "GlobalVariableCacheIndex"
+                | "EnvironmentCoordinateCacheIndex"
+                | "ObjectShapeCacheIndex" => writeln!(
                     w,
                     "            dumper.append_piece(|dumper| dumper.append_number(\"{label}\", {rname}));"
                 )?,
-                _ if (ty == "i32" || ty == "u32" || ty == "u64" || ty == "u8")
+                _ if (ty == "i32" || ty == "u32" || ty == "u64" || ty == "u8" || ty == "u16")
                     && !count_fields.contains(f.name.as_str()) =>
                 {
                     writeln!(

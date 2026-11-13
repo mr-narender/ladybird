@@ -35,6 +35,7 @@
 #include <LibWeb/Fetch/Fetching/BodyStreamPullSource.h>
 #include <LibWeb/Fetch/Fetching/Checks.h>
 #include <LibWeb/Fetch/Fetching/ClientContextSnapshots.h>
+#include <LibWeb/Fetch/Fetching/FetchEventSink.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Fetching/NetworkBodyPump.h>
 #include <LibWeb/Fetch/Fetching/PendingResponse.h>
@@ -83,7 +84,6 @@
 #include <LibWeb/Streams/TransformStream.h>
 #include <LibWeb/UpgradeInsecureRequests/AbstractOperations.h>
 #include <LibWeb/WebDriver/BiDi/Network.h>
-#include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOrUtils.h>
 #include <LibWebCommon/Fetch/Infrastructure/DataURL.h>
 #include <LibWebCommon/Fetch/Infrastructure/HTTP/Statuses.h>
@@ -629,7 +629,7 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
     auto request = fetch_params.request();
 
     if (WebDriver::BiDi::network_events_enabled())
-        WebDriver::BiDi::initialize_network_request(*request);
+        WebDriver::BiDi::initialize_network_request(fetch_params);
 
     // 2. Let response be null.
     RefPtr<Infrastructure::Response> response;
@@ -833,7 +833,9 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
     }
 
     // 11. If recursive is false, then run the remaining steps in parallel.
-    auto in_parallel_steps = GC::create_function<void()>(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, fetch_params.controller(), request, response, get_response), [](auto& realm, NonnullRefPtr<Infrastructure::FetchParams const>& fetch_params, GC::Ref<Infrastructure::FetchController>& controller, NonnullRefPtr<Infrastructure::Request>& request, RefPtr<Infrastructure::Response>& response, GC::Ref<GC::Function<GC::Ref<PendingResponse>()>>& get_response) {
+    auto in_parallel_steps = GC::create_function<void(NonnullRefPtr<Engine::FetchEngineRecord>)>(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, fetch_params.controller(), request, response, get_response), [](auto& realm, NonnullRefPtr<Infrastructure::FetchParams const>& fetch_params, GC::Ref<Infrastructure::FetchController>& controller, NonnullRefPtr<Infrastructure::Request>& request, RefPtr<Infrastructure::Response>& response, GC::Ref<GC::Function<GC::Ref<PendingResponse>()>>& get_response, NonnullRefPtr<Engine::FetchEngineRecord> engine_record) {
+        fetch_params->set_engine_record(move(engine_record));
+
         // 12. If response is null, then set response to the result of running the steps corresponding to the first
         //     matching statement:
         auto pending_response = PendingResponse::create(controller, Infrastructure::Response::create());
@@ -998,17 +1000,18 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
     });
     auto& agent = HTML::relevant_agent(realm.global_object());
     auto fetch_id = agent.fetch_controller_registry.defer_main_fetch_steps(in_parallel_steps);
-    auto start_fetch_input = fetch_params.start_fetch_input(fetch_id);
+    auto event_sink = make<FetchEventSink>(*fetch_params.controller());
+    auto start_fetch_input = fetch_params.start_fetch_input(fetch_id, move(event_sink));
     agent.fetch_executor->post(Engine::Command::StartFetch { move(start_fetch_input) });
 
     return GC::Ptr<PendingResponse> {};
 }
 
-void run_deferred_main_fetch_steps(Engine::FetchId fetch_id)
+void run_deferred_main_fetch_steps(Engine::FetchId fetch_id, NonnullRefPtr<Engine::FetchEngineRecord> engine_record)
 {
     // An agent's fetch engine runs on the agent's thread.
     auto steps = HTML::surrounding_agent().fetch_controller_registry.take_deferred_main_fetch_steps(fetch_id);
-    steps->function()();
+    steps->function()(move(engine_record));
 }
 
 using RequestEnvironment = Variant<Empty, NonnullRefPtr<Infrastructure::ReservedClientContextSnapshot const>, NonnullRefPtr<Infrastructure::ClientContextSnapshot const>>;
@@ -1736,8 +1739,6 @@ GC::Ref<PendingResponse> http_fetch(JS::Realm& realm, Infrastructure::FetchParam
     if (request->service_workers_mode() == Infrastructure::Request::ServiceWorkersMode::All) {
         // 1. Let requestForServiceWorker be a clone of request.
         auto request_for_service_worker = request->clone();
-        if (WebDriver::BiDi::network_events_enabled() || WebDriver::BiDi::network_configuration_enabled())
-            request_for_service_worker->set_webdriver_bidi_network_request(request->webdriver_bidi_network_request());
 
         // 2. If requestForServiceWorker’s body is non-null, then:
         if (!request_for_service_worker->body().has<Empty>()) {
@@ -2033,10 +2034,7 @@ GC::Ptr<PendingResponse> http_redirect_fetch(JS::Realm& realm, Infrastructure::F
         // 1. Set request’s method to `GET` and request’s body to null.
         request->set_method("GET"sv);
         request->set_body({});
-        if (auto state = request->webdriver_bidi_network_request(); state && state->request_header_overrides) {
-            request->header_list()->delete_("Content-Length"sv);
-            state->request_header_overrides->delete_("Content-Length"sv);
-        }
+        WebDriver::BiDi::remove_network_request_content_length_override(fetch_params);
 
         static constexpr Array request_body_header_names {
             "Content-Encoding"sv,
@@ -2343,9 +2341,8 @@ static GC::Ref<PendingResponse> continue_http_network_or_cache_fetch(JS::Object&
         response->set_url_list(http_request->url_list());
 
         if (WebDriver::BiDi::network_events_enabled()) {
-            // NB: Instrumentation may have been enabled after httpRequest was cloned. The controller's original
-            //     request must share the identity reported by the prepared request, including on cancellation.
-            WebDriver::BiDi::synchronize_network_request(*fetch_params->request(), *http_request);
+            // NB: Instrumentation may have been enabled after httpRequest was cloned.
+            WebDriver::BiDi::initialize_network_request_with_its_navigable(*http_fetch_params);
             auto intercepts = WebDriver::BiDi::get_network_intercepts(*http_fetch_params, "responseStarted"sv);
             if (!response->is_network_error() && !intercepts.is_empty()) {
                 WebDriver::BiDi::block_network_request(*http_fetch_params, response, "responseStarted"_string, move(intercepts), WebDriver::BiDi::NetworkContinuation::create(realm.heap(), GC::create_function(realm.heap(), GC::captures(realm, fetch_params, http_request, returned_pending_response, is_authentication_fetch, is_new_connection_fetch, include_credentials), [](auto& realm, auto& fetch_params, auto& http_request, auto& returned_pending_response, auto& is_authentication_fetch, auto& is_new_connection_fetch, auto& include_credentials, WebDriver::BiDi::NetworkContinuationAction, RefPtr<Infrastructure::Response> continued_response) {
@@ -2373,10 +2370,10 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
     auto request = fetch_params.request();
 
     if (WebDriver::BiDi::network_events_enabled())
-        WebDriver::BiDi::initialize_network_request(*request);
+        WebDriver::BiDi::initialize_network_request(fetch_params);
 
     if (WebDriver::BiDi::network_configuration_enabled())
-        WebDriver::BiDi::apply_network_cache_behavior(*request);
+        WebDriver::BiDi::apply_network_cache_behavior(fetch_params);
 
     // 2. Let httpFetchParams be null.
     RefPtr<Infrastructure::FetchParams const> http_fetch_params;
@@ -2422,8 +2419,6 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
             //       source is null as only a single body is needed in that case. E.g., when request’s body’s source
             //       is null, redirects and authentication will end up failing the fetch.
             http_request = request->clone();
-            // NB: Existing interception overrides still apply after subscriptions or intercepts are removed.
-            http_request->set_webdriver_bidi_network_request(request->webdriver_bidi_network_request());
 
             // 2. Set httpFetchParams to a copy of fetchParams.
             auto new_http_fetch_params = Infrastructure::FetchParams::copy(fetch_params);
@@ -2629,9 +2624,10 @@ GC::Ref<PendingResponse> http_network_or_cache_fetch(JS::Realm& realm, Infrastru
         // FIXME: 22. If there’s a proxy-authentication entry, use it as appropriate.
         // NOTE: This intentionally does not depend on httpRequest’s credentials mode.
 
-        WebDriver::BiDi::apply_network_request_header_overrides(*http_request);
+        // NB: Existing interception overrides still apply after subscriptions or intercepts are removed.
+        WebDriver::BiDi::apply_network_request_header_overrides(*http_fetch_params);
         if (WebDriver::BiDi::network_configuration_enabled())
-            WebDriver::BiDi::apply_network_extra_headers(*http_request);
+            WebDriver::BiDi::apply_network_extra_headers(*http_fetch_params);
 
         // 23. Set httpCache to the result of determining the HTTP cache partition, given httpRequest.
         http_cache = determine_the_http_cache_partition(*http_request);
@@ -3065,106 +3061,50 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     }
 
     // To transmit request’s body body, run these steps:
-    // 1. If body is null and fetchParams’s process request end-of-body is non-null, then queue a fetch task given
-    //    fetchParams’s process request end-of-body and fetchParams’s task destination.
-    if (request->body().has<Empty>()) {
-        if (fetch_params.controller()->algorithms()->process_request_end_of_body()) {
-            Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.controller()->task_destination(), GC::create_function(GC::Heap::the(), GC::captures(NonnullRefPtr { fetch_params }), [](auto& fetch_params) {
-                fetch_params->controller()->algorithms()->process_request_end_of_body()->function()();
-            }));
+    // NB: Only a CORS preflight's fetch params lack an engine record, and a preflight has no request body algorithms.
+    if (auto* engine_record = fetch_params.engine_record()) {
+        auto& event_sink = engine_record->event_sink();
+
+        // 1. If body is null and fetchParams’s process request end-of-body is non-null, then queue a fetch task given
+        //    fetchParams’s process request end-of-body and fetchParams’s task destination.
+        // NB: The fetch's event sink checks for process request end-of-body and queues the task, on the fetch's agent.
+        if (request->body().has<Empty>()) {
+            event_sink.handle_event(Engine::Event::RequestBodyEndOfBody { .body_is_null = true });
         }
-    }
-    // 2. Otherwise, if body is non-null:
-    else if (auto const* body = request->body().get_pointer<Infrastructure::FetchBody>()) {
-        // 1. Let processBodyChunk given bytes be these steps:
-        // NB: The steps read only bytes's length, so they are given it.
-        auto process_body_chunk = GC::create_function(GC::Heap::the(), GC::captures(NonnullRefPtr { fetch_params }, fetch_params.controller()), [](auto& fetch_params, auto& controller, u64 length) {
-            // 1. If fetchParams is canceled, then abort these steps.
-            if (fetch_params->is_canceled())
-                return;
+        // 2. Otherwise, if body is non-null:
+        // NB: The fetch's event sink defines processBodyChunk, processEndOfBody and processBodyError (steps 1 to 3),
+        //     and runs them on the fetch's agent.
+        else if (auto const* body = request->body().get_pointer<Infrastructure::FetchBody>()) {
+            // 4. Incrementally read request’s body given processBodyChunk, processEndOfBody, processBodyError, and
+            //    fetchParams’s task destination.
+            // AD-HOC: A request holds its body's source and length but not its stream. A body with a source is read in
+            //         the chunks RequestServer reports sending it in, when it goes over the network, and otherwise as
+            //         one chunk of the whole source. A body without a source is read through the reader fetch()
+            //         acquired for its stream. If fetch() also acquired a reader for the stream of a body with a
+            //         source, the stream is read to its end through it, and what is read is ignored.
+            auto const& source = body->source();
+            if (source.has_value() && source->size() > 0 && network_transport) {
+                network_transport->set_on_upload_progress([engine_record = NonnullRefPtr { *engine_record }, length = source->size(), bytes_read = u64 { 0 }](u64 bytes_sent) mutable {
+                    bytes_sent = min(bytes_sent, length);
+                    if (bytes_sent <= bytes_read)
+                        return;
+                    auto chunk_length = bytes_sent - bytes_read;
+                    bytes_read = bytes_sent;
 
-            // 2. Run this step in parallel: transmit bytes.
-            // NB: A body's source was handed to RequestServer above.
-
-            // 3. If fetchParams’s process request body chunk length is non-null, then run fetchParams’s process
-            //    request body chunk length given bytes’s length.
-            if (controller->algorithms()->process_request_body_chunk_length())
-                controller->algorithms()->process_request_body_chunk_length()->function()(length);
-        });
-
-        // 2. Let processEndOfBody be these steps:
-        auto process_end_of_body = GC::create_function(GC::Heap::the(), GC::captures(NonnullRefPtr { fetch_params }, fetch_params.controller()), [](auto& fetch_params, auto& controller) {
-            // 1. If fetchParams is canceled, then abort these steps.
-            if (fetch_params->is_canceled())
-                return;
-
-            // 2. If fetchParams’s process request end-of-body is non-null, then run fetchParams’s process request
-            //    end-of-body.
-            if (controller->algorithms()->process_request_end_of_body())
-                controller->algorithms()->process_request_end_of_body()->function()();
-        });
-
-        // 3. Let processBodyError given e be these steps:
-        auto process_body_error = GC::create_function(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, fetch_params.controller()), [](auto& realm, auto& fetch_params, auto& controller, JS::Value error) {
-            // 1. If fetchParams is canceled, then abort these steps.
-            if (fetch_params->is_canceled())
-                return;
-
-            // 2. If e is an "AbortError" DOMException, then abort fetchParams’s controller.
-            auto const* exception = error.is_object() ? Bindings::dom_exception_from_object(error.as_object()) : nullptr;
-            if (exception && exception->name() == "AbortError"_utf16_fly_string)
-                controller->abort(realm, {});
-            // 3. Otherwise, terminate fetchParams’s controller.
-            else
-                controller->terminate();
-        });
-
-        // 4. Incrementally read request’s body given processBodyChunk, processEndOfBody, processBodyError, and
-        //    fetchParams’s task destination.
-        // AD-HOC: A request holds its body's source and length but not its stream. A body with a source is read in the
-        //         chunks RequestServer reports sending it in, when it goes over the network, and otherwise as one
-        //         chunk of the whole source. A body without a source is read through the reader fetch() acquired for
-        //         its stream.
-        auto const& source = body->source();
-        if (source.has_value() && source->size() > 0 && network_transport) {
-            network_transport->set_on_upload_progress([fetch_params = NonnullRefPtr { fetch_params }, process_body_chunk = GC::Root { process_body_chunk }, process_end_of_body = GC::Root { process_end_of_body }, length = source->size(), bytes_read = u64 { 0 }](u64 bytes_sent) mutable {
-                bytes_sent = min(bytes_sent, length);
-                if (bytes_sent <= bytes_read)
-                    return;
-                auto chunk_length = bytes_sent - bytes_read;
-                bytes_read = bytes_sent;
-
-                auto controller = fetch_params->controller();
-                Infrastructure::queue_fetch_task(controller, controller->task_destination(), GC::create_function(GC::Heap::the(), GC::captures(process_body_chunk, chunk_length), [](auto& process_body_chunk, auto& chunk_length) {
-                    process_body_chunk->function()(chunk_length);
-                }));
-                if (bytes_read == length)
-                    Infrastructure::queue_fetch_task(controller, controller->task_destination(), GC::Ref { *process_end_of_body });
-            });
-        } else if (source.has_value()) {
-            if (auto length = source->size(); length > 0) {
-                Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.controller()->task_destination(), GC::create_function(GC::Heap::the(), GC::captures(process_body_chunk, length), [](auto& process_body_chunk, auto& length) {
-                    process_body_chunk->function()(length);
-                }));
+                    engine_record->event_sink().handle_event(Engine::Event::RequestBodyProgress { chunk_length });
+                    if (bytes_read == length)
+                        engine_record->event_sink().handle_event(Engine::Event::RequestBodyEndOfBody {});
+                });
+            } else if (source.has_value()) {
+                if (auto length = source->size(); length > 0)
+                    event_sink.handle_event(Engine::Event::RequestBodyProgress { length });
+                event_sink.handle_event(Engine::Event::RequestBodyEndOfBody {});
+            } else {
+                event_sink.handle_event(Engine::Event::ReadRequestBodyStream {});
             }
-            Infrastructure::queue_fetch_task(fetch_params.controller(), fetch_params.controller()->task_destination(), process_end_of_body);
-        } else if (auto const& request_body_reader = fetch_params.controller()->algorithms()->request_body_reader(); request_body_reader.has_value()) {
-            // FIXME: Send the bytes read here to RequestServer, which only receives a body's source.
-            auto process_body_chunk_bytes = GC::create_function(GC::Heap::the(), GC::captures(process_body_chunk), [](auto& process_body_chunk, ByteBuffer bytes) {
-                process_body_chunk->function()(bytes.size());
-            });
-            HTML::TemporaryExecutionContext const execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-            request_body_reader->body->incrementally_read_loop(request_body_reader->reader, fetch_params.controller()->task_destination(), process_body_chunk_bytes, process_end_of_body, process_body_error);
-        }
 
-        // AD-HOC: A body with a source is sent from its source, but its stream has to be read all the same: A stream
-        //         teed from it (that of a clone of the Request, e.g.) can't finish, or be canceled, until it is.
-        if (auto const& request_body_reader = fetch_params.controller()->algorithms()->request_body_reader(); source.has_value() && request_body_reader.has_value()) {
-            auto ignore_chunk = GC::create_function(GC::Heap::the(), [](ByteBuffer) { });
-            auto ignore_end_of_body = GC::create_function(GC::Heap::the(), [] { });
-            auto ignore_error = GC::create_function(GC::Heap::the(), [](JS::Value) { });
-            HTML::TemporaryExecutionContext const execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
-            request_body_reader->body->incrementally_read_loop(request_body_reader->reader, fetch_params.controller()->task_destination(), ignore_chunk, ignore_end_of_body, ignore_error);
+            if (source.has_value())
+                event_sink.handle_event(Engine::Event::RequestBodySentFromSource {});
         }
     }
 

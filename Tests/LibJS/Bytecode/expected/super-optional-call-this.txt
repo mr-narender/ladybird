@@ -1,4 +1,4 @@
-$6076637b super-optional-call-this.js:1:1
+$d25d1936 super-optional-call-this.js:1:1
   Registers: 11
   Blocks:    1
   Constants:
@@ -11,24 +11,24 @@ block0:
   [   3] Mov dst:reg5, src:Undefined
   [   6] CreateLexicalEnvironment dst:reg7, parent:reg4, capacity:1, is_catch_environment:false
   [  12] CreateVariable `Base`, is_immutable:true, is_global:false, is_strict:true
-  [  1d] SetLexicalEnvironment environment:reg4
-  [  1f] NewClass dst:reg6, class_environment:reg7, class_blueprint_index:0, element_keys_are_in_array:false, element_keys:[element_keys:String("method")]
-  [  2f] DynamicInitializeLexicalBinding `Base`, src:reg6
-  [  36] CreateLexicalEnvironment dst:reg7, parent:reg4, capacity:1, is_catch_environment:false
-  [  42] CreateVariable `Foo`, is_immutable:true, is_global:false, is_strict:true
-  [  4d] GetGlobal value_feedback:0, dst:reg9, `Base`
-  [  56] GetClassProtoParent dst:reg10, super_class:reg9
-  [  59] SetLexicalEnvironment environment:reg4
-  [  5b] NewClass dst:reg6, super_class:reg9, proto_parent:reg10, class_environment:reg7, class_blueprint_index:1, element_keys_are_in_array:false, element_keys:[element_keys:String("method")]
-  [  6b] DynamicInitializeLexicalBinding `Foo`, src:reg6
-  [  72] GetGlobal value_feedback:1, dst:reg6, `Foo`
-  [  7b] CallConstruct value_feedback:2, call_feedback:0, dst:reg6, callee:reg6
-  [  85] GetById value_feedback:3, dst:reg7, base:reg6, `method`
-  [  91] Call value_feedback:4, call_feedback:1, dst:reg5, callee:reg7, this_value:reg6
-  [  9c] End value:reg5
+  [  19] SetLexicalEnvironment environment:reg4
+  [  1b] NewClass dst:reg6, class_environment:reg7, class_blueprint_index:0, element_keys_are_in_array:false, element_keys:[element_keys:String("method")]
+  [  2a] DynamicInitializeLexicalBinding `Base`, src:reg6
+  [  30] CreateLexicalEnvironment dst:reg7, parent:reg4, capacity:1, is_catch_environment:false
+  [  3c] CreateVariable `Foo`, is_immutable:true, is_global:false, is_strict:true
+  [  43] GetGlobal value_feedback:0, dst:reg9, `Base`
+  [  4b] GetClassProtoParent dst:reg10, super_class:reg9
+  [  4e] SetLexicalEnvironment environment:reg4
+  [  50] NewClass dst:reg6, super_class:reg9, proto_parent:reg10, class_environment:reg7, class_blueprint_index:1, element_keys_are_in_array:false, element_keys:[element_keys:String("method")]
+  [  5f] DynamicInitializeLexicalBinding `Foo`, src:reg6
+  [  65] GetGlobal value_feedback:1, dst:reg6, `Foo`
+  [  6d] CallConstruct call_feedback:0, dst:reg6, callee:reg6
+  [  73] GetById dst:reg7, base:reg6, `method`
+  [  7a] Call call_feedback:1, dst:reg5, callee:reg7, this_value:reg6
+  [  81] End value:reg5
 
 
-Foo$4a348592 super-optional-call-this.js:4:1
+Foo$ea8d03b4 super-optional-call-this.js:4:1
   Registers: 8
   Blocks:    1
 
@@ -36,8 +36,8 @@ block0:
   [   0] Enter
   [   1] CreateRestParams dst:reg5, rest_index:0
   [   7] GetSuperConstructor dst:reg6
-  [   9] SuperCallWithArgumentArray value_feedback:0, call_feedback:0, dst:reg7, super_constructor:reg6, arguments:reg5, is_synthetic:true
-  [  12] Return value:reg7
+  [   9] SuperCallWithArgumentArray call_feedback:0, dst:reg7, super_constructor:reg6, arguments:reg5, is_synthetic:true
+  [  10] Return value:reg7
 
 
 Base$138475b3
@@ -51,7 +51,7 @@ block0:
   [   1] End value:Undefined
 
 
-method$9e4af423 super-optional-call-this.js:6:9
+method$cf80ad9a super-optional-call-this.js:6:9
   Registers: 7
   Blocks:    4
   Constants:
@@ -61,18 +61,18 @@ block0:
   [   0] Enter
   [   1] ResolveThisBinding
   [   2] ResolveSuperBase dst:reg5
-  [   4] GetByIdWithThis value_feedback:0, dst:reg6, base:reg5, `method`, this_value:this
-  [   f] JumpNullish condition:reg6, true_target:block2, false_target:block1
+  [   4] GetByIdWithThis dst:reg6, base:reg5, `method`, this_value:this
+  [   c] JumpNullish condition:reg6, true_target:block2, false_target:block1
 
 block1:
-  [  19] Call value_feedback:1, call_feedback:0, dst:reg5, callee:reg6, this_value:this
-  [  24] Jump target:block3
+  [  16] Call call_feedback:0, dst:reg5, callee:reg6, this_value:this
+  [  1d] Jump target:block3
 
 block2:
-  [  29] Mov dst:reg5, src:Undefined
+  [  22] Mov dst:reg5, src:Undefined
 
 block3:
-  [  2c] Return value:reg5
+  [  25] Return value:reg5
 
 
 method$9a9476d1

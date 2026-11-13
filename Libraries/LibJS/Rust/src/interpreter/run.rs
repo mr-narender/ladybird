@@ -246,6 +246,8 @@ impl Vm {
         unsafe { context.as_ref() }
             .register(register::ACCUMULATOR)
             .set(initial_accumulator_value);
+        // NB: A resumed frame continues after its Enter, so the resume counts as entering the executable.
+        executable.head.idle_collection_count.set(0);
         self.run_executable(context, executable, entry_point)
     }
 
@@ -263,7 +265,9 @@ impl Vm {
         // NOTE: Spec steps are rearranged in order to compute number of registers+constants+locals before construction of the execution context.
 
         // 11. Let script be scriptRecord.[[ECMAScriptCode]].
-        let executable = script_record.cached_executable();
+        let executable = script_record.cached_executable().expect("a script is evaluated once");
+        // NB: The top-level code runs once, so the script lets it go when this returns, on every path.
+        let _forget_executable_guard = ScopeGuard::new(|| script_record.forget_executable());
         if should_dump_bytecode() {
             executable.dump();
         }

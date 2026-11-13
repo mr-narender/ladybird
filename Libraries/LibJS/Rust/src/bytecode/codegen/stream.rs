@@ -407,9 +407,16 @@ fn spilled_instructions(
     let mut fields = Vec::new();
     let mut next_noted = 0;
     let mut at = 0;
+    let mut wide_name_indices_at = None;
     while at < bytes.len() {
         let opcode = bytes[at];
         let length = instruction_length_from_bytes(opcode, bytes, at).expect("a valid instruction");
+        // NB: The moves go around the WideNameIndices of an instruction too, which has to stay right before it.
+        if opcode == OpCode::WideNameIndices as u8 {
+            wide_name_indices_at = Some(at);
+            at += length;
+            continue;
+        }
         let first_field = fields.len();
         visit_operands_from_bytes(opcode, bytes, at, &mut |field_at, reads, writes, optional| {
             let field_at = u32_from_usize(field_at);
@@ -437,9 +444,10 @@ fn spilled_instructions(
                 index,
             });
         });
+        let start = wide_name_indices_at.take().unwrap_or(at);
         instructions.push(SpilledInstruction {
-            at: u32_from_usize(at),
-            length: u32_from_usize(length),
+            at: u32_from_usize(start),
+            length: u32_from_usize(at + length - start),
             fields: first_field..fields.len(),
         });
         at += length;
@@ -1384,16 +1392,13 @@ impl Generator<'_> {
         });
         self.bind_label(call);
         let result = self.allocate_register().operand();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put(op::Call {
-            value_feedback,
             call_feedback,
             dst: result,
             callee: method,
             this_value: iterator.object,
             argument_count: 0,
-            expression_string: None,
             arguments: &[],
         });
         generate_await_of_value(self, &ScopedOperand::plain(result)).operand()
@@ -1424,7 +1429,7 @@ impl Generator<'_> {
             iterator_object: iterator.object,
             iterator_next: iterator.next,
             iterator_done: iterator.done,
-            completion_type: libjs_abi::CompletionType::Normal as u32,
+            completion_type: libjs_abi::CompletionType::Normal as u8,
             completion_value: undefined,
             cache,
         });
@@ -1914,29 +1919,23 @@ impl Generator<'_> {
         if self.context.names.is_length_property_key(key) {
             self.length_identifier = Some(key);
             let cache = self.next_property_lookup_cache();
-            let value_feedback = self.next_value_feedback();
             let keyed_feedback = self.next_keyed_feedback();
             self.put_with_destination(
                 op::GetLength {
-                    value_feedback,
                     keyed_feedback,
                     dst,
                     base,
-                    base_identifier: None,
                     cache,
                 },
                 dst,
             );
         } else {
             let cache = self.next_property_lookup_cache();
-            let value_feedback = self.next_value_feedback();
             self.put_with_destination(
                 op::GetById {
-                    value_feedback,
                     dst,
                     base,
                     property: key,
-                    base_identifier: None,
                     cache,
                 },
                 dst,
@@ -1960,7 +1959,6 @@ impl Generator<'_> {
             &ScopedOperand::plain(dst),
             &ScopedOperand::plain(base),
             &ScopedOperand::plain(key),
-            None,
         );
     }
 
@@ -2046,11 +2044,9 @@ impl Generator<'_> {
         let (super_constructor, first_temporary) = self.pop_operand();
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::SuperCallWithArgumentArray {
-                value_feedback,
                 call_feedback,
                 dst,
                 super_constructor,
@@ -2258,17 +2254,14 @@ impl Generator<'_> {
         };
         self.release_temporaries_from(callee.first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::Call {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee: callee_operand,
                 this_value,
                 argument_count: operand_list_count(arguments.len()),
-                expression_string: None,
                 arguments: &arguments,
             },
             dst,
@@ -2287,16 +2280,13 @@ impl Generator<'_> {
         let (callee, first_temporary) = self.pop_operand();
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallConstruct {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee,
                 argument_count: operand_list_count(arguments.len()),
-                expression_string: None,
                 arguments: &arguments,
             },
             dst,
@@ -2322,17 +2312,14 @@ impl Generator<'_> {
         };
         self.release_temporaries_from(callee.first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallDirectEval {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee: callee_operand,
                 this_value,
                 argument_count: operand_list_count(arguments.len()),
-                expression_string: None,
                 arguments: &arguments,
             },
             dst,
@@ -2351,17 +2338,14 @@ impl Generator<'_> {
         };
         self.release_temporaries_from(callee.first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallDirectEvalWithArgumentArray {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee: callee_operand,
                 this_value,
                 arguments,
-                expression_string: None,
             },
             dst,
         );
@@ -2378,17 +2362,14 @@ impl Generator<'_> {
         };
         self.release_temporaries_from(callee.first_temporary);
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallWithArgumentArray {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee: callee_operand,
                 this_value,
                 arguments,
-                expression_string: None,
             },
             dst,
         );
@@ -2401,17 +2382,14 @@ impl Generator<'_> {
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
         let this_value = self.context.constants.add_undefined();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
         self.put_with_destination(
             op::CallConstructWithArgumentArray {
-                value_feedback,
                 call_feedback,
                 dst,
                 callee,
                 this_value,
                 arguments,
-                expression_string: None,
             },
             dst,
         );
@@ -3097,8 +3075,7 @@ impl Generator<'_> {
                     property: key,
                     src: value,
                     cache,
-                    base_identifier: None,
-                    kind: libjs_abi::PutKind::Normal as u32,
+                    kind: libjs_abi::PutKind::Normal as u8,
                 });
             }
             ValKind::IndexTarget => {
@@ -3107,7 +3084,6 @@ impl Generator<'_> {
                     &ScopedOperand::plain(target.a),
                     &ScopedOperand::plain(target.b),
                     &ScopedOperand::plain(value),
-                    None,
                 );
             }
             ValKind::SuperTarget => {
@@ -3126,7 +3102,7 @@ impl Generator<'_> {
                         property: key,
                         src: value.operand(),
                         cache,
-                        kind: libjs_abi::PutKind::Normal as u32,
+                        kind: libjs_abi::PutKind::Normal as u8,
                     });
                 }
             }
@@ -3534,7 +3510,10 @@ impl Generator<'_> {
         let object = self.context.stream.values.last_mut().expect("an object is being built");
         let (dst, cache, slot) = (object.a, object.cache, object.name);
         object.name += 1;
-        if cache != u32::MAX {
+        // NB: The properties of a literal past the first 65536 are put like those of a literal that is not simple.
+        if let Ok(slot) = u16::try_from(slot)
+            && cache != u32::MAX
+        {
             self.put(op::InitObjectLiteralProperty {
                 object: dst,
                 property: key,
@@ -3549,8 +3528,7 @@ impl Generator<'_> {
                 property: key,
                 src: value,
                 cache,
-                base_identifier: None,
-                kind: libjs_abi::PutKind::Own as u32,
+                kind: libjs_abi::PutKind::Own as u8,
             });
         }
         self.release_temporaries_from(dst.index() + 1);
@@ -3572,8 +3550,7 @@ impl Generator<'_> {
             property: key,
             src: value,
             cache,
-            base_identifier: None,
-            kind: kind as u32,
+            kind: kind as u8,
         });
         self.release_temporaries_from(object.index() + 1);
     }
@@ -3609,7 +3586,7 @@ impl Generator<'_> {
         self.put(op::SetFunctionName {
             function: value,
             name: key,
-            prefix: prefix as u32,
+            prefix: prefix as u8,
         });
         emit_put_by_value(
             self,
@@ -3636,7 +3613,7 @@ impl Generator<'_> {
             self.put(op::SetFunctionName {
                 function: value,
                 name: key,
-                prefix: FunctionNamePrefix::None as u32,
+                prefix: FunctionNamePrefix::None as u8,
             });
         }
         let object = *self.context.stream.values.last().expect("an object is being built");
@@ -3702,16 +3679,47 @@ impl Generator<'_> {
     ) {
         let first_temporary = self.next_temporary();
         let dst = self.temporary();
-        self.put_with_destination(
-            op::NewFunction {
+        if let Ok(index) = u16::try_from(shared_function_data_index) {
+            self.put_with_destination(
+                op::NewFunction {
+                    dst,
+                    shared_function_data_index: index,
+                    lhs_name,
+                    home_object,
+                },
+                dst,
+            );
+        } else {
+            self.put_with_destination(
+                op::NewFunctionWide {
+                    dst,
+                    shared_function_data_index,
+                    lhs_name,
+                    home_object,
+                },
+                dst,
+            );
+        }
+        self.push_value(dst, first_temporary);
+    }
+
+    /// A function object for the function at index `shared_function_data_index`, in `dst`.
+    pub(super) fn put_new_function(&mut self, dst: Operand, shared_function_data_index: u32) {
+        if let Ok(index) = u16::try_from(shared_function_data_index) {
+            self.put(op::NewFunction {
+                dst,
+                shared_function_data_index: index,
+                lhs_name: None,
+                home_object: None,
+            });
+        } else {
+            self.put(op::NewFunctionWide {
                 dst,
                 shared_function_data_index,
-                lhs_name,
-                home_object,
-            },
-            dst,
-        );
-        self.push_value(dst, first_temporary);
+                lhs_name: None,
+                home_object: None,
+            });
+        }
     }
 
     // --- Statements ---
@@ -4208,7 +4216,6 @@ impl Generator<'_> {
             SliceBlock::builder(
                 SliceBlock::room_for::<u8>(head.bytes.len() + segment.bytes.len())
                     + SliceBlock::room_for::<u8>(source_map_bytes.len())
-                    + SliceBlock::room_for::<ExceptionHandler>(exception_handlers.len())
                     + other_tables_size,
             )
         };
@@ -4246,7 +4253,7 @@ impl Generator<'_> {
             bytecode,
             strict_ranges,
             source_map,
-            exception_handlers: block.slice(exception_handlers.into_iter()),
+            exception_handlers: exception_handlers.into_boxed_slice(),
             number_of_registers: frame.register_count,
             number_of_arguments: stream.number_of_arguments,
         };

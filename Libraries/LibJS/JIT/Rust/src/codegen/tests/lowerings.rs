@@ -1461,12 +1461,10 @@ fn object_value(object: &[u64]) -> u64 {
 fn get_by_value(base: u64, index: u64) -> u64 {
     run_instruction(
         Instruction::GetByValue {
-            value_feedback: 0,
             keyed_feedback: 0,
             dst: r(5),
             base: argument(0),
             property: argument(1),
-            base_identifier: None,
             cache: 0,
         },
         &[base, index],
@@ -1485,7 +1483,6 @@ fn put_by_value(base: u64, index: u64, src: u64) -> u64 {
                 property: argument(1),
                 src: argument(2),
                 kind: 0,
-                base_identifier: None,
                 cache: 0,
             },
             Instruction::Return { value: c(0) },
@@ -1609,16 +1606,13 @@ fn typed_array_accesses_with_constant_indices() {
                         property: c(1),
                         src: argument(1),
                         kind: 0,
-                        base_identifier: None,
                         cache: 0,
                     },
                     Instruction::GetByValue {
-                        value_feedback: 0,
                         keyed_feedback: 0,
                         dst: r(5),
                         base: argument(0),
                         property: c(1),
-                        base_identifier: None,
                         cache: 0,
                     },
                     Instruction::Return { value: r(5) },
@@ -1755,11 +1749,9 @@ fn get_length() {
     let get_length = |base: u64| {
         run_instruction(
             Instruction::GetLength {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst: r(5),
                 base: argument(0),
-                base_identifier: None,
                 cache: 0,
             },
             &[base],
@@ -2151,7 +2143,7 @@ fn create_variable() {
     // bindings, a mutable one and a strict immutable one.
     const NAMES: [u64; 2] = [0x100, 0x200];
     let flags = [BINDING_MUTABLE, 1];
-    let create = |environment: &FakeEnvironment, identifier: u32, mode: u32, is_immutable: bool, is_strict: bool| {
+    let create = |environment: &FakeEnvironment, identifier: u32, mode: u8, is_immutable: bool, is_strict: bool| {
         let program = assemble(|_| {
             vec![
                 Instruction::Enter,
@@ -2808,12 +2800,10 @@ fn every_fast_path_compiles_for_both_architectures() {
                 src: dst,
             },
             Instruction::GetByValue {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst,
                 base: argument(0),
                 property: argument(1),
-                base_identifier: None,
                 cache: 0,
             },
             Instruction::PutByValue {
@@ -2822,15 +2812,12 @@ fn every_fast_path_compiles_for_both_architectures() {
                 property: argument(1),
                 src,
                 kind: 0,
-                base_identifier: None,
                 cache: 0,
             },
             Instruction::GetLength {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst,
                 base: argument(0),
-                base_identifier: None,
                 cache: 0,
             },
             Instruction::GetBinding {
@@ -3018,11 +3005,9 @@ impl FakeCachedObject {
     fn get(&self, base: u64) -> u64 {
         let (result, _) = self.run(
             Instruction::GetById {
-                value_feedback: 0,
                 dst: r(5),
                 base: argument(0),
                 property: crate::bytecode::PropertyKeyTableIndex(0),
-                base_identifier: None,
                 cache: 1,
             },
             &[base],
@@ -3040,7 +3025,6 @@ impl FakeCachedObject {
                 src: argument(1),
                 kind: 0,
                 cache: 1,
-                base_identifier: None,
             },
             &[base, value],
         );
@@ -3051,11 +3035,9 @@ impl FakeCachedObject {
     fn get_length(&self) -> u64 {
         let (result, _) = self.run(
             Instruction::GetLength {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst: r(5),
                 base: argument(0),
-                base_identifier: None,
                 cache: 1,
             },
             &[self.value()],
@@ -3186,11 +3168,9 @@ fn get_by_id_reads_direct_getter_wrappers_inline_from(compressed_field: bool) {
         vec![
             Instruction::Enter,
             Instruction::GetById {
-                value_feedback: 0,
                 dst: r(5),
                 base: argument(0),
                 property: crate::bytecode::PropertyKeyTableIndex(0),
-                base_identifier: None,
                 cache: 1,
             },
             Instruction::Return { value: r(5) },
@@ -3291,7 +3271,6 @@ fn put_by_id_calls_native_setters_of_prototypes() {
                 src: argument(1),
                 kind: 0,
                 cache: 1,
-                base_identifier: None,
             },
             Instruction::Return { value: c(0) },
         ]
@@ -3470,12 +3449,10 @@ fn get_by_value_of_string_characters() {
             vec![
                 Instruction::Enter,
                 Instruction::GetByValue {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(5),
                     base: argument(0),
                     property: argument(1),
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: r(5) },
@@ -3542,13 +3519,11 @@ fn get_by_value_of_string_characters() {
 /// `arguments`, into `r(5)`.
 fn builtin_call(this_value: Operand, arguments: Vec<Operand>) -> Instruction {
     Instruction::Call {
-        value_feedback: 0,
         call_feedback: 0,
         dst: r(5),
         callee: argument(0),
         this_value,
         argument_count: arguments.len() as u32,
-        expression_string: None,
         arguments,
     }
 }
@@ -4103,12 +4078,10 @@ fn get_by_value_through_the_vm_keyed_lookup_cache() {
     let get = |fake: &FakeCachedObject, key: u64| {
         let (result, _) = fake.run(
             Instruction::GetByValue {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst: r(5),
                 base: argument(0),
                 property: argument(1),
-                base_identifier: None,
                 cache: 1,
             },
             &[fake.value(), key],
@@ -4157,7 +4130,6 @@ fn put_by_value_through_the_vm_keyed_store_cache() {
                 property: argument(1),
                 src: argument(2),
                 kind: 0,
-                base_identifier: None,
                 cache: 1,
             },
             &[fake.value(), key, value],
@@ -4217,12 +4189,10 @@ fn get_by_value_through_megamorphic_property_caches() {
         let get = |fake: &FakeCachedObject, key: u64| {
             let (result, _) = fake.run(
                 Instruction::GetByValue {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(5),
                     base: argument(0),
                     property: argument(1),
-                    base_identifier: None,
                     cache: 1,
                 },
                 &[fake.value(), key],
@@ -4282,11 +4252,9 @@ fn get_by_id_of_strings_through_property_caches() {
     let get = |base: u64, with_string_prototype: bool| {
         let (result, _) = string_prototype.run_with_prototypes(
             Instruction::GetById {
-                value_feedback: 0,
                 dst: r(5),
                 base: argument(0),
                 property: crate::bytecode::PropertyKeyTableIndex(0),
-                base_identifier: None,
                 cache: 1,
             },
             &[base],
@@ -4314,11 +4282,9 @@ fn get_by_id_of_numbers_and_booleans_through_property_caches() {
     let get = |base: u64, prototypes: PrimitivePrototypes| {
         let (result, _) = prototype.run_with_prototypes(
             Instruction::GetById {
-                value_feedback: 0,
                 dst: r(5),
                 base: argument(0),
                 property: crate::bytecode::PropertyKeyTableIndex(0),
-                base_identifier: None,
                 cache: 1,
             },
             &[base],
@@ -4362,11 +4328,9 @@ fn get_by_id_of_strings_through_megamorphic_property_caches() {
     string_prototype.caches[1] = data.as_ptr() as u64 | 2;
     let (result, _) = string_prototype.run_with_prototypes(
         Instruction::GetById {
-            value_feedback: 0,
             dst: r(5),
             base: argument(0),
             property: crate::bytecode::PropertyKeyTableIndex(0),
-            base_identifier: None,
             cache: 1,
         },
         &[fake_string(true)],
@@ -4403,12 +4367,10 @@ fn keyed_accesses_of_missing_and_added_properties_through_property_caches() {
     let get = |fake: &FakeCachedObject, key: u64| {
         let (result, _) = fake.run(
             Instruction::GetByValue {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst: r(5),
                 base: argument(0),
                 property: argument(1),
-                base_identifier: None,
                 cache: 1,
             },
             &[fake.value(), key],
@@ -4424,7 +4386,6 @@ fn keyed_accesses_of_missing_and_added_properties_through_property_caches() {
                 property: argument(1),
                 src: argument(2),
                 kind: 0,
-                base_identifier: None,
                 cache: 1,
             },
             &[fake.value(), key, value],

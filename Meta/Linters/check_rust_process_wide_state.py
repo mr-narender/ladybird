@@ -37,6 +37,7 @@ ALLOWED = {
     "Libraries/LibJS/JIT/Rust/src/asm/x86_64/sse.rs:FEATURES": "immutable CPU/OS feature cache; each copy computes the same supported instructions",
     "Libraries/LibJS/JIT/Rust/src/codegen/tests.rs:REGION": "the fake heap region of JIT unit tests, in the cargo test binary that has no runtime",
     "Libraries/LibRegex/Rust/src/vm.rs:INTERRUPT_FLAG": "per-thread, and only libjs_rust's copy sets it; the copy of LibURL's crate has no VM to interrupt, so it only ever sees null",
+    "Libraries/LibWeb/HTML/Parser/Rust/src/parser/test_host.rs:FAKE_DOM": "the fake DOM of tree builder unit tests, in the cargo test binary that has no C++ side",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_LISTS": "per-thread allocation pool; a second copy costs memory, never an answer",
     "Libraries/LibWeb/HTML/Parser/Rust/src/token.rs:SPARE_ATTRIBUTE_VALUES": "per-thread allocation pool; a second copy costs memory, never an answer",
 }
@@ -89,8 +90,6 @@ RENDER_STATE_ALLOWED = {
         DIAGNOSTIC,
         [
             "css/ffi_stats.rs:COMPLETE_STYLE_UPDATE_STATE",
-            "css/ffi_stats.rs:COUNTERS_ENABLED",
-            "css/ffi_stats.rs:COUNTS",
             "css/ffi_stats.rs:CPP_CALLBACK_COUNT",
             "css/ffi_stats.rs:THREAD_UNSAFE_CPP_CALLBACK_COUNT",
         ],
@@ -102,6 +101,7 @@ RENDER_STATE_ALLOWED = {
             "layout/parallel_layout.rs:SUBTREE_LEASES_ARE_VERIFIED",
             "layout/run_repeatability.rs:ENABLED",
             "layout/run_repeatability.rs:VERIFICATION",
+            "painting/paint_passes.rs:PAINTING_TIMING_ENABLED",
             "render_state/clock/hover.rs:LOGS",
         ],
     ),

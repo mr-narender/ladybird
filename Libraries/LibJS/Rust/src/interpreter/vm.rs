@@ -26,6 +26,7 @@ use crate::bytecode::executable::{
     Executable, KeyedPropertyLookupCache, PropertyLookupCache, StaticPropertyLookupCacheSite,
     StaticPropertyLookupCaches,
 };
+use crate::bytecode::flushing::{CodeFlushing, CodeFlushingOptions};
 use crate::bytecode::property_access::Strict;
 use crate::debugger::Debugger;
 use crate::embedding::hooks::Embedder;
@@ -635,6 +636,7 @@ pub struct Vm {
     saved_execution_context_stacks: RefCell<Vec<SavedExecutionContextStack>>,
     host_classes: RefCell<HostClassRegistry>,
     pub jit: JitState,
+    pub code_flushing: CodeFlushing,
 }
 
 const _: () = assert!(core::mem::offset_of!(Vm, head) == 0);
@@ -777,6 +779,7 @@ impl Vm {
             saved_execution_context_stacks: RefCell::new(Vec::new()),
             host_classes: RefCell::new(HashMap::default()),
             jit: JitState::new(JitOptions::from_environment()),
+            code_flushing: CodeFlushing::new(CodeFlushingOptions::from_environment()),
         };
         // SAFETY: The caller provides storage for a Vm.
         unsafe { storage.write(vm) };
@@ -1175,6 +1178,7 @@ impl Vm {
     }
 
     fn gather_roots(&self, visitor: &mut Visitor) {
+        self.code_flushing.begin_pass(self);
         self.jit.trace(visitor);
         self.for_each_execution_context_top_to_bottom(|context| {
             context.trace(visitor);
@@ -1522,6 +1526,17 @@ impl Vm {
         });
     }
 
+    /// Clears the idle count of the executables that frames still run: they are not idle, even when no frame entered
+    /// them for many collections (as in a long loop).
+    fn clear_idle_collection_counts_of_running_executables(&self) {
+        self.for_each_live_execution_context(|frame| {
+            if let Some(head) = frame.executable.get() {
+                Executable::from_head(head).head.idle_collection_count.set(0);
+            }
+            ControlFlow::Continue(())
+        });
+    }
+
     /// Drops the weak cache entries of strings that died in this collection.
     fn remove_dead_strings_from_weak_caches(&self, sweep: &Sweep<'_>) {
         let is_dead = |string: Gc<PrimitiveString>| sweep.is_dead(string);
@@ -1546,6 +1561,8 @@ impl Vm {
                 return false;
             }
             executable.remove_dead_cells(sweep);
+            let idle_collection_count = &executable.head.idle_collection_count;
+            idle_collection_count.set(idle_collection_count.get().saturating_add(1));
             true
         });
         self.static_property_lookup_caches.remove_dead_entries(sweep);
@@ -1553,6 +1570,15 @@ impl Vm {
         self.prototype_transition_cache.remove_dead_entries(sweep);
         self.keyed_property_store_cache.remove_dead_entries(sweep);
         self.jit.dependents.remove_dead_entries(sweep);
+    }
+
+    /// Has the JIT code that idled long enough in this collection flushed once the collection is over.
+    pub(crate) fn enqueue_code_flushing_task(&self) {
+        // SAFETY: The VM outlives its heap, whose collections run the task.
+        unsafe {
+            self.heap()
+                .enqueue_post_gc_task(flush_idle_jit_code, core::ptr::from_ref(self).cast_mut().cast());
+        }
     }
 
     pub fn register_executable(&self, executable: Gc<Executable>) {
@@ -2220,13 +2246,21 @@ unsafe extern "C" fn sweep(context: *mut c_void) {
     let vm = unsafe { &*context.cast::<Vm>() };
     // SAFETY: LibGC runs sweep callbacks once the marks are final, before it sweeps the cells that died.
     let sweep = unsafe { Sweep::new(vm) };
+    vm.code_flushing.finish_pass(vm, &sweep);
     vm.remove_dead_cells_from_weak_containers(&sweep);
     vm.remove_dead_strings_from_weak_caches(&sweep);
     vm.remove_dead_cells_from_property_lookup_caches(&sweep);
+    vm.clear_idle_collection_counts_of_running_executables();
     vm.remove_dead_objects_from_intrinsic_accessors_and_unimplemented_properties(&sweep);
     if let Some(debugger) = vm.debugger() {
         debugger.remove_dead_executables(&sweep);
     }
+}
+
+unsafe extern "C" fn flush_idle_jit_code(context: *mut c_void) {
+    // SAFETY: The task was enqueued with the VM as its context.
+    let vm = unsafe { &*context.cast::<Vm>() };
+    vm.code_flushing.flush_idle_jit_code(vm);
 }
 
 unsafe extern "C" fn enqueue_cleanup_jobs_of_finalization_registries_with_dead_cells(context: *mut c_void) {

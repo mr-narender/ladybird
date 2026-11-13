@@ -717,13 +717,11 @@ fn calls_write_back_their_arguments_and_values_survive_them() {
         vec![
             Instruction::Mov { dst: r(6), src: a(0) },
             Instruction::Call {
-                value_feedback: 0,
                 call_feedback: 0,
                 dst: r(7),
                 callee: r(5),
                 this_value: r(5),
                 argument_count: 1,
-                expression_string: None,
                 arguments: vec![r(6)],
             },
             Instruction::Mov { dst: l(0), src: r(7) },
@@ -794,11 +792,9 @@ pub(crate) mod property_access {
 
     pub(crate) fn get_by_id(dst: Operand, base: Operand, cache: u32) -> Instruction {
         Instruction::GetById {
-            value_feedback: 0,
             dst,
             base,
             property: PropertyKeyTableIndex(0),
-            base_identifier: None,
             cache,
         }
     }
@@ -810,7 +806,6 @@ pub(crate) mod property_access {
             src,
             kind: 0,
             cache,
-            base_identifier: None,
         }
     }
 
@@ -898,7 +893,7 @@ pub(crate) mod property_access {
               Return ([[V17]])
             frame states:
               [[FS0]]: pc 0 at {} frame [a0]
-              [[FS1]]: pc 24 at {r5=[[V6]], r6=[[V6]]} frame [a0]
+              [[FS1]]: pc 14 at {r5=[[V6]], r6=[[V6]]} frame [a0]
             ",
         );
     }
@@ -941,7 +936,7 @@ pub(crate) mod property_access {
               Return ([[V19]])
             frame states:
               [[FS0]]: pc 0 at {} frame [a0]
-              [[FS1]]: pc 12 at {r5=[[V6]]} frame [a0]
+              [[FS1]]: pc 7 at {r5=[[V6]]} frame [a0]
             ",
         );
     }
@@ -1087,11 +1082,9 @@ pub(crate) mod property_access {
         let get_length = assemble(|_| {
             vec![
                 Instruction::GetLength {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(5),
                     base: a(0),
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: r(5) },
@@ -1276,12 +1269,10 @@ pub(crate) mod property_access {
 
     fn get_by_value(dst: Operand, base: Operand, property: Operand) -> Instruction {
         Instruction::GetByValue {
-            value_feedback: 0,
             keyed_feedback: 0,
             dst,
             base,
             property,
-            base_identifier: None,
             cache: 0,
         }
     }
@@ -1351,7 +1342,7 @@ pub(crate) mod property_access {
             (1 | (1 << 5) | (1 << 9), Vec::new()),
             (
                 1 | (1 << 5),
-                vec![(0, ExitKind::BadElements), (12, ExitKind::OutOfBounds)],
+                vec![(0, ExitKind::BadElements), (8, ExitKind::OutOfBounds)],
             ),
         ] {
             let text = dump_element_loads(bits, exit_sites);
@@ -1444,7 +1435,6 @@ pub(crate) mod property_access {
                     property: c(1),
                     src: c(0),
                     kind: 0,
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: a(0) },
@@ -1466,7 +1456,6 @@ pub(crate) mod property_access {
                     property: c(1),
                     src: r(6),
                     kind: 0,
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: a(0) },
@@ -1554,15 +1543,15 @@ pub(crate) mod property_access {
               CheckShape [0x100] ([[V1]], [[V4]]) [[[FS0]]]
               StoreNamed +2 ([[V1]], #10, [[V4]]) [[[FS0]]]
               [[V13]] = LoadSlot l1
-              [[V14]] = CallSlowPath Exp @26 ([[V13]], #10) [[[FS1]]]
+              [[V14]] = CallSlowPath Exp @15 ([[V13]], #10) [[[FS1]]]
               CheckShape [0x100] ([[V1]], [[V4]]) [[[FS2]]]
               [[V19]] = LoadNamed +2 ([[V1]], [[V4]]) [[[FS2]]]
               [[V20]] = EmptyToUndefined ([[V19]])
               Return ([[V20]])
             frame states:
               [[FS0]]: pc 0 at {} frame [l1, a0]
-              [[FS1]]: pc 26 after -> l1 {r5=#10} frame [a0]
-              [[FS2]]: pc 32 at {r5=#10} frame [a0]
+              [[FS1]]: pc 15 after -> l1 {r5=#10} frame [a0]
+              [[FS2]]: pc 21 at {r5=#10} frame [a0]
             ",
         );
     }
@@ -1627,13 +1616,11 @@ pub(crate) mod inlining {
 
     pub(crate) fn call(dst: Operand, callee: Operand, this_value: Operand, arguments: Vec<Operand>) -> Instruction {
         Instruction::Call {
-            value_feedback: 0,
             call_feedback: 0,
             dst,
             callee,
             this_value,
             argument_count: u32::try_from(arguments.len()).unwrap(),
-            expression_string: None,
             arguments,
         }
     }
@@ -1953,7 +1940,7 @@ pub(crate) mod inlining {
             [[B3]] <- [[B2]], [[B7]]:
               [[V15]] = Phi ([[V9]], [[V12]])
               EnsureFrameInitialized
-              [[V16]] = CallSlowPath Add @25 ([[V6]], [[V15]]) [[[FS1]]]
+              [[V16]] = CallSlowPath Add @18 ([[V6]], [[V15]]) [[[FS1]]]
               BranchBindingMutable 2 ([[V5]]) -> [[B4]], [[B8]]
             [[B4]] <- [[B3]]:
               [[V20]] = LoadEnvironmentBinding 2 ([[V5]])
@@ -1965,19 +1952,19 @@ pub(crate) mod inlining {
               [[V29]] = EmptyToUndefined ([[V16]])
               Return ([[V29]])
             [[B7]] <- [[B1]] cold:
-              [[V12]] = CallSlowPath GetGlobal @16 [[[FS0]]]
+              [[V12]] = CallSlowPath GetGlobal @10 [[[FS0]]]
               Jump [[B3]]
             [[B8]] <- [[B3]] cold:
               Jump [[B10]]
             [[B9]] <- [[B4]] cold:
               Jump [[B10]]
             [[B10]] <- [[B8]], [[B9]] cold:
-              CallSlowPath SetLexicalBinding @31 ([[V16]]) [[[FS2]]]
+              CallSlowPath SetLexicalBinding @24 ([[V16]]) [[[FS2]]]
               Jump [[B6]]
             frame states:
-              [[FS0]]: pc 16 at {r5=[[V6]]}
-              [[FS1]]: pc 25 after -> r7 {} frame [r7]
-              [[FS2]]: pc 31 at {r7=[[V16]]}
+              [[FS0]]: pc 10 at {r5=[[V6]]}
+              [[FS1]]: pc 18 after -> r7 {} frame [r7]
+              [[FS2]]: pc 24 at {r7=[[V16]]}
             ",
         );
         // Inlined callees have constant ones: those of their function.
@@ -2000,7 +1987,7 @@ pub(crate) mod inlining {
             [[B4]] <- [[B3]], [[B9]]:
               [[V20]] = Phi ([[V14]], [[V17]])
               PublishFrame
-              [[V21]] = CallSlowPath Add @e1:25 ([[V11]], [[V20]]) [[[FS3]]]
+              [[V21]] = CallSlowPath Add @e1:18 ([[V11]], [[V20]]) [[[FS3]]]
               BranchBindingMutable 2 ([[V10]]) -> [[B5]], [[B10]]
             [[B5]] <- [[B4]]:
               [[V25]] = LoadEnvironmentBinding 2 ([[V10]])
@@ -2015,21 +2002,21 @@ pub(crate) mod inlining {
               Return ([[V34]])
             [[B9]] <- [[B2]] cold:
               PublishFrame
-              [[V17]] = CallSlowPath GetGlobal @e1:16 [[[FS2]]]
+              [[V17]] = CallSlowPath GetGlobal @e1:10 [[[FS2]]]
               Jump [[B4]]
             [[B10]] <- [[B4]] cold:
               Jump [[B12]]
             [[B11]] <- [[B5]] cold:
               Jump [[B12]]
             [[B12]] <- [[B10]], [[B11]] cold:
-              CallSlowPath SetLexicalBinding @e1:31 ([[V21]]) [[[FS4]]]
+              CallSlowPath SetLexicalBinding @e1:24 ([[V21]]) [[[FS4]]]
               Jump [[B7]]
             frame states:
               [[FS0]]: pc 1 at {} frame [a0]
               [[FS1]]: pc 1 after -> r5 {}
-              [[FS2]]: e1 pc 16 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r5=[[V11]]} in [[FS1]]
-              [[FS3]]: e1 pc 25 after -> r7 {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r7=#empty} in [[FS1]]
-              [[FS4]]: e1 pc 31 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r7=[[V21]]} in [[FS1]]
+              [[FS2]]: e1 pc 10 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r5=[[V11]]} in [[FS1]]
+              [[FS3]]: e1 pc 18 after -> r7 {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r7=#empty} in [[FS1]]
+              [[FS4]]: e1 pc 24 at {r0=#empty, r2=#empty, r3=#empty, r4=#empty, r7=[[V21]]} in [[FS1]]
             ",
         );
     }
@@ -2490,7 +2477,7 @@ mod arguments {
     fn create_arguments(mapped: bool) -> Instruction {
         Instruction::CreateArguments {
             dst: Some(l(0)),
-            kind: u32::from(!mapped),
+            kind: u8::from(!mapped),
             is_immutable: false,
             creates_parameter_bindings: false,
         }
@@ -2559,13 +2546,11 @@ mod arguments {
                     is_spread: true,
                 },
                 Instruction::CallWithArgumentArray {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: r(5),
                     callee: a(0),
                     this_value: c(0),
                     arguments: r(7),
-                    expression_string: None,
                 },
                 Instruction::Return { value: r(5) },
             ]
@@ -2598,11 +2583,9 @@ mod arguments {
                 create_arguments(false),
                 Instruction::Mov { dst: a(0), src: c(1) },
                 Instruction::GetLength {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(5),
                     base: l(0),
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::Return { value: r(5) },
@@ -2615,11 +2598,9 @@ mod arguments {
                     Instruction::Enter,
                     create_arguments(mapped),
                     Instruction::GetLength {
-                        value_feedback: 0,
                         keyed_feedback: 0,
                         dst: r(5),
                         base: l(0),
-                        base_identifier: None,
                         cache: 0,
                     },
                     Instruction::Return { value: r(5) },
@@ -2752,12 +2733,10 @@ fn captured_typed_arrays_use_guarded_fixed_lengths() {
                 cache: coordinate,
             },
             Instruction::GetByValue {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst: r(6),
                 base: r(5),
                 property: c(0),
-                base_identifier: None,
                 cache: 0,
             },
             Instruction::Return { value: r(6) },
@@ -2817,18 +2796,16 @@ fn array_length_specialization_requires_monomorphic_receivers_and_exit_gates() {
     let program = assemble(|_| {
         vec![
             Instruction::GetLength {
-                value_feedback: 0,
                 keyed_feedback: 0,
                 dst: r(5),
                 base: a(0),
-                base_identifier: None,
                 cache: 0,
             },
             Instruction::Return { value: r(5) },
         ]
     });
     let mut snapshot = snapshot_for(&program, test_layout());
-    snapshot.executables[0].feedback.value = vec![crate::snapshot::value_feedback::INT32];
+    snapshot.executables[0].feedback.cache_value = vec![crate::snapshot::value_feedback::INT32];
     for bits in [
         0,
         keyed_feedback_bits::OTHER_ELEMENTS,

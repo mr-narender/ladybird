@@ -420,7 +420,7 @@ public:
     bool has_media_element_playing_audio(DOM::Document const&) const;
     Vector<GC::Root<HTML::HTMLVideoElement>> video_elements_of(DOM::Document const&);
 
-    void sync_media_element_video_sink_ticking();
+    void sync_media_element_video_sink_ticking(ReadonlySpan<GC::Root<DOM::Document>> laid_out_documents);
     void restore_all_media_element_video_sinks();
     void detach_all_media_element_video_sinks_after_compositor_lost();
 
@@ -776,6 +776,8 @@ public:
     virtual double device_pixels_per_css_pixel() const = 0;
     virtual double maximum_frames_per_second() const { return 60.0; }
     virtual CSS::PreferredColorScheme preferred_color_scheme() const = 0;
+    // Whether the screen the page is shown on can show colors brighter than SDR white.
+    virtual bool screen_shows_high_dynamic_range() const { return false; }
     virtual CSS::PreferredContrast preferred_contrast() const = 0;
     virtual CSS::PreferredMotion preferred_motion() const = 0;
     virtual size_t screen_count() const = 0;
@@ -924,7 +926,7 @@ public:
     virtual bool page_did_request_tab_is_capturing_audio_for_testing() { return false; }
     virtual void page_did_report_audio_capture_for_testing([[maybe_unused]] Web::PageId labelled_page_id, [[maybe_unused]] bool capturing) { }
     virtual void page_did_retire_picture_in_picture_window_for_testing() { }
-    virtual u64 page_did_request_tab_audibility_change_count_for_testing() { return 0; }
+    virtual Vector<bool> page_did_request_tab_audibility_transitions_for_testing() { return {}; }
     virtual bool page_did_request_capture_session_history_snapshot_for_testing() { return false; }
     virtual bool page_did_request_restore_session_history_snapshot_for_testing() { return false; }
     virtual bool page_did_request_record_reported_session_history_for_testing() { return false; }

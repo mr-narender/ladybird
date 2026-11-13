@@ -20,9 +20,12 @@ void DisplayListPlayer::execute(
     DisplayListResourceStorage const& resource_storage,
     FrameInputs const* frame_inputs,
     RefPtr<Gfx::PaintingSurface> surface,
-    OwnedCanvasSurfaces const* canvas_surfaces)
+    OwnedCanvasSurfaces const* canvas_surfaces,
+    ReplaySelection const& selection)
 {
     VERIFY(display_list.compatible_visual_context_tree_structural_epoch() == visual_context_tree.structural_epoch());
+    VERIFY(frame_inputs || !selection.replays_only_record_spans);
+    TemporaryChange replay_selection_change { m_replay_selection, selection };
     m_surface = surface;
     m_active_display_list = &display_list;
     m_active_visual_context_tree = &visual_context_tree;
@@ -76,7 +79,7 @@ struct DisplayListPlayer::ReplayCallbacks {
             .pop = [](void* context) { static_cast<DisplayListPlayer*>(context)->pop(); },
             .push_device_space_plane_clip = [](void* context, Gfx::FloatVector3 const* vertices, size_t vertex_count) { static_cast<DisplayListPlayer*>(context)->push_device_space_plane_clip({ vertices, vertex_count }); },
             .push_transform = [](void* context, Gfx::AffineTransform const* transform) { static_cast<DisplayListPlayer*>(context)->push_transform(*transform); },
-            .push_clip_path_bytes = [](void* context, u8 const* path_bytes, size_t path_bytes_size, Gfx::WindingRule winding_rule) { static_cast<DisplayListPlayer*>(context)->push_clip_path_bytes({ path_bytes, path_bytes_size }, winding_rule); },
+            .push_clip_path_bytes = [](void* context, u8 const* path_bytes, size_t path_bytes_size, Gfx::WindingRule winding_rule, Compositing::ClipMode mode) { static_cast<DisplayListPlayer*>(context)->push_clip_path_bytes({ path_bytes, path_bytes_size }, winding_rule, mode); },
             .play_command = [](void* context, DisplayListCommandType command_type, u8 const* command, u8 const* payload, size_t payload_size) { static_cast<DisplayListPlayer*>(context)->play_command_bytes(command_type, command, { payload, payload_size }); },
         };
     }
@@ -136,7 +139,7 @@ void DisplayListPlayer::execute_impl(DisplayList const& display_list, FrameInput
     auto callbacks = ReplayCallbacks::for_player(*this);
     if (frame_inputs) {
         VERIFY(frame_inputs->visual_context_tree().rust_handle() == visual_context_tree.rust_handle());
-        frame_inputs->replay(display_list, callbacks);
+        frame_inputs->replay(display_list, callbacks, exchange(m_replay_selection, replaying_everything()));
     } else {
         display_list.replay(visual_context_tree, callbacks);
     }

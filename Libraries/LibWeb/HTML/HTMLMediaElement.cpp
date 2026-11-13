@@ -1976,6 +1976,9 @@ Optional<Utf16String> HTMLMediaElement::verify_response_or_get_failure_reason(GC
     if (internal_response->status() == 200) {
         m_remote_fetch_data->offset = 0;
         set_expected_size_from_content_length();
+        // NB: The server sent the entire resource for a range request, whatever its Accept-Ranges header says. So
+        //     later requests for data wait for this fetch to reach it, rather than starting it over from the beginning.
+        m_remote_fetch_data->accepts_byte_ranges = false;
         return {};
     }
 
@@ -3017,7 +3020,7 @@ void HTMLMediaElement::update_ready_state()
     }
 }
 
-bool HTMLMediaElement::video_sink_should_tick() const
+bool HTMLMediaElement::video_sink_should_tick(DocumentWasLaidOut document_was_laid_out) const
 {
     Layout::ForcedReadScope read { document() };
     if (m_video_frame_was_recently_captured)
@@ -3029,17 +3032,22 @@ bool HTMLMediaElement::video_sink_should_tick() const
         return true;
     if (document().visibility_state() != VisibilityState::Visible)
         return false;
+    // A document that the rendering update didn't lay out isn't rendered (one in a display: none iframe, e.g.), so
+    // nothing of it is painted. Its layout isn't read either: A style update may be flying for it, which can make that
+    // layout stale at any moment.
+    if (document_was_laid_out == DocumentWasLaidOut::No)
+        return false;
     auto const* layout_node = this->layout_node(read);
     return layout_node && Painting::has_committed_box(*layout_node) && Painting::is_visible(*layout_node);
 }
 
-void HTMLMediaElement::sync_video_sink_ticking() const
+void HTMLMediaElement::sync_video_sink_ticking(DocumentWasLaidOut document_was_laid_out) const
 {
     auto handle = video_sink_handle();
     if (!handle.has_value())
         return;
 
-    auto should_tick = video_sink_should_tick();
+    auto should_tick = video_sink_should_tick(document_was_laid_out);
     if (m_video_sink_is_ticking == should_tick)
         return;
     m_video_sink_is_ticking = should_tick;

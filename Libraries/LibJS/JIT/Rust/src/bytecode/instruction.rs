@@ -171,6 +171,8 @@ pub struct FeedbackSlots {
     pub value: Option<u16>,
     pub call: Option<u16>,
     pub keyed: Option<u16>,
+    /// The property lookup cache whose site's value feedback the instruction records.
+    pub cache_value: Option<u16>,
 }
 
 /// One decoded instruction and where it lives in the bytecode.
@@ -231,19 +233,36 @@ fn narrow_index(index: u32) -> u16 {
     u16::try_from(index).expect("bytecode indices fit in 16 bits")
 }
 
+/// See `WIDE_NAME_INDEX_MARK` of the bytecode generator.
+const WIDE_NAME_INDEX_MARK: u16 = 0xff00;
+const NO_NAME_INDEX: u16 = u16::MAX;
+
 #[cfg(test)]
-fn name_index_bytes(index: u32) -> [u8; 3] {
-    let [low, middle, high, _] = index.to_le_bytes();
-    [low, middle, high]
+fn is_wide_name_index(index: u32) -> bool {
+    index != u32::MAX && index >= u32::from(WIDE_NAME_INDEX_MARK)
 }
 
 #[cfg(test)]
-fn debug_name_index(index: Option<u32>) -> u16 {
-    index.and_then(|index| u16::try_from(index).ok()).unwrap_or(u16::MAX)
+fn name_index_field(index: u32, distance: usize) -> u16 {
+    if index == u32::MAX {
+        return NO_NAME_INDEX;
+    }
+    if !is_wide_name_index(index) {
+        return index as u16;
+    }
+    WIDE_NAME_INDEX_MARK + u16::try_from(distance).unwrap()
 }
 
-fn read_u24(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], 0])
+fn read_optional_name_index(bytes: &[u8], at: usize) -> Option<u32> {
+    match read_u16(bytes, at) {
+        NO_NAME_INDEX => None,
+        raw if raw >= WIDE_NAME_INDEX_MARK => Some(read_u32(bytes, at - usize::from(raw - WIDE_NAME_INDEX_MARK))),
+        raw => Some(u32::from(raw)),
+    }
+}
+
+fn read_name_index(bytes: &[u8], at: usize) -> u32 {
+    read_optional_name_index(bytes, at).expect("the field holds a name table index")
 }
 
 fn read_u16(bytes: &[u8], at: usize) -> u16 {
@@ -381,13 +400,11 @@ mod tests {
     #[test]
     fn decodes_variable_length_call() {
         let call = Instruction::Call {
-            value_feedback: 0,
             call_feedback: 0,
             dst: operand(5),
             callee: operand(6),
             this_value: operand(7),
             argument_count: 3,
-            expression_string: Some(StringTableIndex(9)),
             arguments: vec![operand(8), operand(20), operand(21)],
         };
         let mut bytes = Vec::new();
@@ -522,19 +539,17 @@ mod tests {
 
         let mut call = Vec::new();
         Instruction::Call {
-            value_feedback: 0,
             call_feedback: 0,
             dst: operand(5),
             callee: operand(6),
             this_value: operand(7),
             argument_count: 1,
-            expression_string: None,
             arguments: vec![operand(8)],
         }
         .encode(&mut call);
-        // Call's layout: header, value and call feedback slots, dst, callee, this_value, argument_count at 8.
+        // Call's layout: header, call feedback slot, dst, callee, this_value, argument_count at 6.
         let mut too_many_arguments = call.clone();
-        too_many_arguments[8] = 100;
+        too_many_arguments[6] = 100;
         assert_eq!(error(&too_many_arguments), DecodeErrorKind::TruncatedInstruction);
         assert_eq!(error(&call[..call.len() - 1]), DecodeErrorKind::TruncatedInstruction);
 
