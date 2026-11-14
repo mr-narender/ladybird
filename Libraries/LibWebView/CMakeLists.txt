@@ -1,13 +1,15 @@
 set(SOURCES
+    AccessibilityTreeManager.cpp
     Application.cpp
     ApplyHistoryStep.cpp
+    AudioServerActivity.cpp
+    AudioServerControlClient.cpp
     Autocomplete.cpp
     AutocompleteMuxer.cpp
     AutocompleteRanker.cpp
     AutocompleteService.cpp
     BlobURLStore.cpp
     BrowsingSession.cpp
-    BookmarkStore.cpp
     CanonicalBrowsingContext.cpp
     CanonicalBrowsingContextGroup.cpp
     CanonicalDocument.cpp
@@ -18,66 +20,107 @@ set(SOURCES
     CanonicalWindow.cpp
     BrowserProcess.cpp
     CompositorClient.cpp
-    CompositorFontServiceConnection.cpp
+    CompositorPresentationClient.cpp
     CookieJar.cpp
     CrashReport.cpp
-    DownloadPresentation.cpp
+    CrashReportDiagnostics.cpp
+    CrashReportOutbox.cpp
+    CrashReportReview.cpp
+    CrashReportStore.cpp
+    CrashReportSubmission.cpp
     DownloadSegmentation.cpp
     DownloadStore.cpp
     ExternalURLHandler.cpp
     FaviconStore.cpp
     FileDownloader.cpp
     FontService.cpp
+    FontServiceHost.cpp
+    GamepadManager.cpp
     HeadlessWebView.cpp
     HelperProcess.cpp
     HistoryDebug.cpp
     HistoryStore.cpp
     HSTSStore.cpp
-    Menu.cpp
+    ImageDecoderControlClient.cpp
+    ImageDecoderManager.cpp
+    LingeringIndicator.cpp
     NavigationLoader.cpp
     Omnibox.cpp
     OmniboxEngagement.cpp
+    NotificationAttribution.cpp
+    NotificationFreedesktopArguments.cpp
+    NotificationManager.cpp
+    PageBackingStores.cpp
+    PageTranslation.cpp
+    PictureInPictureManager.cpp
+    PictureInPictureWindow.cpp
+    PermissionManager.cpp
+    PlatformFeatureDecisions.cpp
     Process.cpp
     ProcessManager.cpp
+    ProcessSnapshot.cpp
+    TabIndicators.cpp
     TabPerformanceStats.cpp
     TabPerformanceMonitor.cpp
     ProcessMonitor.cpp
     Profile.cpp
+    ReportSubmission.cpp
+    RecordingNotificationBackend.cpp
+    RequestServerManager.cpp
+    RequestServerSiteBindings.cpp
     SearchEngine.cpp
     SessionHistory.cpp
-    SessionHistorySnapshotStorage.cpp
     SessionHistoryTraversalQueue.cpp
-    SessionStore.cpp
     Settings.cpp
     SiteCompatibility.cpp
+    StorageAreaRegistry.cpp
     StorageJar.cpp
+    SystemProbeClient.cpp
+    TestSpellChecker.cpp
+    TestTranslator.cpp
+    Translator.cpp
     URL.cpp
     UserAgent.cpp
     Utilities.cpp
+    VideoDecoderServerControlClient.cpp
     ViewImplementation.cpp
+    WebCompatReport.cpp
     WebContentClient.cpp
     WebContentPage.cpp
     WebContentTestClient.cpp
+    WebDriverBiDi.cpp
+    WebDriverBiDiNetwork.cpp
     WebDriverBrowserConnection.cpp
     WebUI.cpp
-    WebUI/BookmarksUI.cpp
-    WebUI/DownloadsUI.cpp
-    WebUI/HistoryUI.cpp
+    WebUI/ApplicationWebUI.cpp
+    WebUI/CrashReportsUI.cpp
+    WebUI/SupportUI.cpp
     WebUI/SettingsUI.cpp
-    WebUI/VersionUI.cpp
     WebWorkerClient.cpp
-    WorkerProcessManager.cpp
+    WorkerAgentManager.cpp
 )
 
 if (APPLE)
     list(APPEND SOURCES
         CrashReportPOSIX.cpp
-        LaunchURLsMacOS.cpp
-        PlatformColorsMacOS.cpp
+        NotificationBackendMacOS.mm
         ProcessReaper.cpp
+        QuarantineMacOS.mm
+        StringConversionsMacOS.mm
     )
+    set_source_files_properties(NotificationBackendMacOS.mm QuarantineMacOS.mm StringConversionsMacOS.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 elseif (LINUX)
-    list(APPEND SOURCES CrashReportPOSIX.cpp)
+    list(APPEND SOURCES AudioDaemonSocket.cpp CrashReportPOSIX.cpp)
+endif()
+
+if (NOT WIN32)
+    list(APPEND SOURCES TerminalInputParser.cpp TerminalWebView.cpp)
+endif()
+
+if (LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    # Web notifications reach the desktop's notification daemon over the session bus.
+    pkg_check_modules(DBUS REQUIRED IMPORTED_TARGET dbus-1)
+    list(APPEND SOURCES NotificationBackendFreedesktop.cpp)
 endif()
 
 set(GENERATED_SOURCES ${CURRENT_LIB_GENERATED})
@@ -87,8 +130,14 @@ compile_ipc(UIProcessClient.ipc UIProcessClientEndpoint.h)
 
 set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
+    ../../Services/AudioServer/AudioServerControlClientEndpoint.h
+    ../../Services/AudioServer/AudioServerControlEndpoint.h
+    ../../Services/ImageDecoder/ImageDecoderControlClientEndpoint.h
+    ../../Services/ImageDecoder/ImageDecoderControlEndpoint.h
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
+    ../../Services/VideoDecoderServer/VideoDecoderServerControlClientEndpoint.h
+    ../../Services/VideoDecoderServer/VideoDecoderServerControlEndpoint.h
     UIProcessClientEndpoint.h
     UIProcessServerEndpoint.h
 )
@@ -122,16 +171,24 @@ add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
 
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWebView generate_build_information)
-target_link_libraries(LibWebView PUBLIC LibCompositing LibSandbox LibWebCommon)
+target_link_libraries(LibWebView PUBLIC LibCompositing LibPlatformFeatures LibSandbox LibWebCommon)
 target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading)
 
-if (ENABLE_CRANELIFT_JIT)
-    target_link_libraries(LibWebView PRIVATE LibWasmCompilerClient)
-    target_compile_definitions(LibWebView PUBLIC HAVE_WASM_COMPILER_SERVICE=1)
+if (LINUX)
+    # The connect broker asks the audio library where the daemon is before connecting a helper to it.
+    include(audio)
+    if (LADYBIRD_AUDIO_BACKEND STREQUAL "PULSE")
+        target_compile_definitions(LibWebView PRIVATE HAVE_PULSEAUDIO=1)
+        target_link_libraries(LibWebView PRIVATE PkgConfig::PULSEAUDIO)
+    endif()
 endif()
 
 if (APPLE)
-    target_link_libraries(LibWebView PRIVATE "-framework Carbon")
+    target_link_libraries(LibWebView PRIVATE "-framework CoreServices" "-framework Foundation" "-framework UserNotifications")
+endif()
+
+if (LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    target_link_libraries(LibWebView PRIVATE PkgConfig::DBUS)
 endif()
 
 # Third-party

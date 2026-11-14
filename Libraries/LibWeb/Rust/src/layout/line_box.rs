@@ -39,11 +39,37 @@ pub(crate) struct InlineBoxBaseline {
     pub(crate) accumulated_vertical_shift: CssPixels,
 }
 
+/// What text-overflow elided from the end of a line.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct TextOverflowElision {
+    /// The inline length of the line before the ellipsis.
+    pub(crate) inline_length: CssPixels,
+    /// Where in the line the fragment that ends in the ellipsis starts.
+    pub(crate) ellipsis_fragment_start: CssPixels,
+    /// The inline length of the fragment that ends in the ellipsis before it was shortened.
+    pub(crate) ellipsis_fragment_inline_length: CssPixels,
+}
+
+/// What a line its block container interrupted for a block-level box keeps of the box, as the layout of the box left it.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct BlockLevelBoxOnLine {
+    /// The offset of the content box of the box in its containing block.
+    pub(crate) content_offset: FfiCssPixelPoint,
+    /// The sizes and box sides of the box.
+    pub(crate) cells: used_values::RootInputCells,
+    /// The baselines the box gives the line.
+    pub(crate) baselines: formatting_context::LineBaselines,
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) struct LineBoxData {
+    pub(crate) start: super::fragmentation::LinePosition,
     pub(crate) fragments: Vec<line_box_fragment::LineBoxFragmentData>,
     pub(crate) static_position_markers: Vec<StaticPositionMarker>,
     pub(crate) inline_box_baselines: Vec<InlineBoxBaseline>,
+    pub(crate) text_overflow_elision: Option<TextOverflowElision>,
+    /// The block-level box the line holds, where the line is interrupted for one.
+    pub(crate) block_level_box: Option<BlockLevelBoxOnLine>,
     pub(crate) record: inline_content::LineRecord,
 }
 
@@ -61,11 +87,14 @@ impl std::ops::DerefMut for LineBoxData {
 }
 
 impl LineBoxData {
-    pub(crate) fn new(direction: u8, writing_mode: u8) -> Self {
+    pub(crate) fn new(direction: u8, writing_mode: u8, start: super::fragmentation::LinePosition) -> Self {
         Self {
+            start,
             fragments: Vec::new(),
             static_position_markers: Vec::new(),
             inline_box_baselines: Vec::new(),
+            text_overflow_elision: None,
+            block_level_box: None,
             record: inline_content::LineRecord {
                 direction,
                 writing_mode,
@@ -77,8 +106,6 @@ impl LineBoxData {
 
     pub(crate) fn retained_metrics(&self) -> inline_content::LineRecord {
         inline_content::LineRecord {
-            layout_fragment_count: self.fragments.len(),
-            first_fragment_node: self.fragments.first().map(|fragment| fragment.layout_node),
             is_empty: self.is_empty(),
             horizontal_extent: inline_formatting_context::line_physical_horizontal_extent(self),
             ..self.record
@@ -107,7 +134,7 @@ impl LineBoxData {
         content_block_size: CssPixels,
         border_box_block_start: CssPixels,
         border_box_block_end: CssPixels,
-        glyphs: Option<line_box_fragment::GlyphData>,
+        glyphs: Option<line_box_fragment::ItemGlyphRun<'_>>,
         facts: line_box_fragment::FragmentBuildFacts,
         text_align_is_justify: bool,
         trailing_whitespace: line_box_fragment::TrailingWhitespace,
@@ -117,20 +144,18 @@ impl LineBoxData {
                 && self.fragments.last().is_some_and(|last| {
                     !last.has_soft_wrap_opportunity_after
                         && last.layout_node == layout_node
-                        && last
-                            .glyphs
-                            .as_ref()
-                            .is_some_and(|last_glyphs| last_glyphs.font == glyphs.font)
+                        && last.glyphs.as_ref().is_some_and(|last_glyphs| {
+                            last_glyphs.font == *glyphs.font && last_glyphs.is_upright == glyphs.is_upright
+                        })
                         && last.start + last.length_in_code_units == start
                 })
         });
         if can_merge {
             let last = self.fragments.last_mut().unwrap();
             last.length_in_code_units += length;
-            last.append_glyph_run(glyphs.unwrap(), content_inline_size);
+            last.append_glyph_run(&glyphs.unwrap(), content_inline_size, start - last.start);
             if trailing_whitespace.length_in_code_units == length {
-                last.trailing_whitespace.length_in_code_units += trailing_whitespace.length_in_code_units;
-                last.trailing_whitespace.inline_size += trailing_whitespace.inline_size;
+                last.trailing_whitespace += trailing_whitespace;
             } else {
                 last.trailing_whitespace = trailing_whitespace;
             }
@@ -147,7 +172,7 @@ impl LineBoxData {
                 border_box_block_start,
                 self.direction,
                 self.writing_mode,
-                glyphs,
+                glyphs.map(line_box_fragment::ItemGlyphRun::into_glyph_data),
                 facts,
             );
             fragment.trailing_whitespace = trailing_whitespace;
@@ -163,6 +188,10 @@ impl LineBoxData {
         self.block_length = self
             .block_length
             .max(content_block_size + border_box_block_start + border_box_block_end);
+    }
+
+    pub(crate) fn advance_inline_length(&mut self, inline_size: CssPixels) {
+        self.record.inline_length += inline_size;
     }
 
     pub(crate) fn add_static_position_marker(&mut self, box_: Node, preceded_by_inline_box_start_edges: bool) {
@@ -209,7 +238,8 @@ impl LineBoxData {
 
     fn calculate_or_trim_trailing_whitespace(&mut self, should_remove: bool) -> CssPixels {
         let mut whitespace_inline_size = CssPixels::default();
-        let mut trailing_whitespace_inline_size = CssPixels::default();
+        // The whitespace fragments removed so far that follow on from the same node.
+        let mut removed_whitespace: Option<(Node, line_box_fragment::TrailingWhitespace)> = None;
         let mut fragment_index = self.fragments.len();
 
         let last_fragment_index = loop {
@@ -229,8 +259,18 @@ impl LineBoxData {
             }
 
             whitespace_inline_size += fragment.inline_length;
-            trailing_whitespace_inline_size += fragment.inline_length;
             if should_remove {
+                let removed = line_box_fragment::TrailingWhitespace {
+                    length_in_code_units: fragment.length_in_code_units,
+                    inline_size: fragment.inline_length,
+                };
+                removed_whitespace = match removed_whitespace {
+                    Some((node, mut sum)) if node == fragment.layout_node => {
+                        sum += removed;
+                        Some((node, sum))
+                    }
+                    _ => Some((fragment.layout_node, removed)),
+                };
                 self.record.inline_length -= fragment.inline_length;
                 self.fragments.remove(fragment_index);
                 self.clamp_static_position_markers_to_inline_length();
@@ -239,31 +279,25 @@ impl LineBoxData {
 
         let last_fragment = &self.fragments[last_fragment_index];
         if last_fragment.text().is_empty() {
-            if should_remove && trailing_whitespace_inline_size > CssPixels::default() {
-                self.fragments[last_fragment_index].has_trailing_whitespace = true;
-            }
             return whitespace_inline_size;
         }
 
         // Trim the last fragment's trailing whitespace by the advance recorded when it was shaped.
         let fragment_trailing_whitespace = last_fragment.trailing_whitespace;
         whitespace_inline_size += fragment_trailing_whitespace.inline_size;
-        trailing_whitespace_inline_size += fragment_trailing_whitespace.inline_size;
         if should_remove {
             let fragment = &mut self.fragments[last_fragment_index];
             fragment.length_in_code_units -= fragment_trailing_whitespace.length_in_code_units;
             fragment.inline_length -= fragment_trailing_whitespace.inline_size;
             fragment.trailing_whitespace = line_box_fragment::TrailingWhitespace::default();
+            fragment.record.trimmed_trailing_whitespace += fragment_trailing_whitespace;
+            if let Some((node, removed)) = removed_whitespace
+                && node == fragment.layout_node
+            {
+                fragment.record.trimmed_trailing_whitespace += removed;
+            }
             self.record.inline_length -= fragment_trailing_whitespace.inline_size;
             self.clamp_static_position_markers_to_inline_length();
-        }
-
-        if should_remove
-            && (trailing_whitespace_inline_size > CssPixels::default()
-                || !self.fragments[last_fragment_index].has_trailing_whitespace)
-        {
-            self.fragments[last_fragment_index].has_trailing_whitespace =
-                trailing_whitespace_inline_size > CssPixels::default();
         }
         whitespace_inline_size
     }
@@ -289,7 +323,7 @@ impl LineBoxData {
             }
             fragment.length_in_code_units -= whitespace.length_in_code_units;
             fragment.inline_length -= whitespace.inline_size;
-            fragment.has_trailing_whitespace = true;
+            fragment.record.trimmed_trailing_whitespace += whitespace;
             break;
         }
         self.clamp_static_position_markers_to_inline_length();

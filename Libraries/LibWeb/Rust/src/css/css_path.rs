@@ -40,6 +40,10 @@ impl CssPath {
         unsafe { &*(self.raw as *const PathData) }
     }
 
+    pub(crate) fn parsed(&self) -> Option<&crate::svg::ParsedPath> {
+        (self.raw != 0).then(|| &self.data().parsed)
+    }
+
     pub(crate) fn units(&self) -> &[u16] {
         if self.raw == 0 {
             return &[];
@@ -58,7 +62,7 @@ impl CssPath {
         self.data().parsed.write_content_hash(hasher);
     }
 
-    pub(crate) fn to_gfx_path(&self) -> libgfx_rust::path::OwnedPath {
+    pub(crate) fn to_gfx_path(&self) -> libgfx_rust::path::Path {
         self.data().parsed.to_gfx_path()
     }
 }
@@ -90,13 +94,6 @@ impl std::fmt::Debug for CssPath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.units().fmt(formatter)
     }
-}
-
-/// # Safety
-/// `path` must be a live, nonempty CSS path. The caller owns the returned Gfx::Path.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_css_path_to_gfx_path(path: &CssPath) -> *mut std::ffi::c_void {
-    path.to_gfx_path().into_raw()
 }
 
 #[cfg(test)]

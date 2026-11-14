@@ -1,8 +1,13 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <script src="structural-matrix.js"></script>
 <script>
+    // A mutation that cannot change what a :has() argument matches should style nothing but what it
+    // inserts, and one that can should style only that and the anchor with what its rules reach. Each
+    // case names what the read after the mutation restyled beyond what the mutation inserted.
+
     function settle(anchor) {
         readProbe(anchor);
         document.documentElement.classList.add("__settle__");
@@ -128,12 +133,14 @@
             settle(anchor);
 
             const existing = mutationCase.before?.({ fixture, anchor, unrelated });
-            flushPendingStyleWork();
-            const cleanup = mutationCase.mutate({ fixture, anchor, unrelated, existing });
-            assertEqual(`${featureCase.name} / ${mutationCase.name} after mutation`, readProbe(anchor), BASE);
-            printPassWithCounters(`unrelated structural mutation skips :has walk: ${featureCase.name} / ${mutationCase.name}`);
-            if (typeof cleanup === "function")
-                cleanup();
+            const work = styleWorkBeyondInsertion(() => {
+                const cleanup = mutationCase.mutate({ fixture, anchor, unrelated, existing });
+                assertEqual(`${featureCase.name} / ${mutationCase.name} after mutation`, readProbe(anchor), BASE);
+                return cleanup;
+            }, { flush: false });
+            printPassWithStyleWorkBeyondInsertion(`unrelated structural mutation skips :has walk: ${featureCase.name} / ${mutationCase.name}`, work);
+            if (typeof work.returned === "function")
+                work.returned();
         } finally {
             style.remove();
             fixture.remove();
@@ -193,10 +200,11 @@
         try {
             assertEqual(`${featureCase.name} / ${mutationCase.name} initial`, readProbe(anchor), BASE);
             const existing = mutationCase.before?.({ fixture, anchor, featureCase });
-            resetStyleCounters();
-            mutationCase.mutate({ fixture, anchor, existing, featureCase });
-            assertEqual(`${featureCase.name} / ${mutationCase.name} after mutation`, readProbe(anchor), MATCH);
-            printPassWithCounters(`related structural mutation keeps :has walk: ${featureCase.name} / ${mutationCase.name}`);
+            const work = styleWorkBeyondInsertion(() => {
+                mutationCase.mutate({ fixture, anchor, existing, featureCase });
+                assertEqual(`${featureCase.name} / ${mutationCase.name} after mutation`, readProbe(anchor), MATCH);
+            }, { flush: false });
+            printPassWithStyleWorkBeyondInsertion(`related structural mutation keeps :has walk: ${featureCase.name} / ${mutationCase.name}`, work);
         } finally {
             style.remove();
             fixture.remove();
@@ -256,10 +264,11 @@
         try {
             assertEqual(`${selectorCase.name} / ${mutationCase.name} initial`, readProbe(anchor), BASE);
             const existing = mutationCase.before?.({ fixture, anchor });
-            resetStyleCounters();
-            mutationCase.mutate({ fixture, anchor, existing });
-            assertEqual(`${selectorCase.name} / ${mutationCase.name} after mutation`, readProbe(anchor), BASE);
-            printPassWithCounters(`concrete :has argument keeps featureless mutation filtered: ${selectorCase.name} / ${mutationCase.name}`);
+            const work = styleWorkBeyondInsertion(() => {
+                mutationCase.mutate({ fixture, anchor, existing });
+                assertEqual(`${selectorCase.name} / ${mutationCase.name} after mutation`, readProbe(anchor), BASE);
+            }, { flush: false });
+            printPassWithStyleWorkBeyondInsertion(`concrete :has argument keeps featureless mutation filtered: ${selectorCase.name} / ${mutationCase.name}`, work);
         } finally {
             style.remove();
             fixture.remove();
@@ -480,16 +489,18 @@
         try {
             const context = caseData.setup({ fixture, anchor });
             assertEqual(`${caseData.name} initial`, readProbe(anchor), caseData.expectedInitial);
-            resetStyleCounters();
-            caseData.mutate({ fixture, anchor, ...context });
-            assertEqual(`${caseData.name} after mutation`, readProbe(anchor), caseData.expectedAfter);
-            printPassWithCounters(`featureless-sensitive structural mutation keeps :has walk: ${caseData.name}`);
+            const work = styleWorkBeyondInsertion(() => {
+                caseData.mutate({ fixture, anchor, ...context });
+                assertEqual(`${caseData.name} after mutation`, readProbe(anchor), caseData.expectedAfter);
+            }, { flush: false });
+            printPassWithStyleWorkBeyondInsertion(`featureless-sensitive structural mutation keeps :has walk: ${caseData.name}`, work);
         } finally {
             style.remove();
             fixture.remove();
         }
     }
 
+    // Reparent focused controls with moveBefore; appendChild removes them and clears their focus.
     const unprobeablePseudoCases = [
         {
             name: "child :focus insertion with unrelated metadata",
@@ -500,7 +511,7 @@
                 input.focus({ preventScroll: true });
                 return { input };
             },
-            mutate: ({ anchor, input }) => anchor.appendChild(input),
+            mutate: ({ anchor, input }) => anchor.moveBefore(input, null),
         },
         {
             name: "descendant :focus insertion through wrapper with unrelated metadata",
@@ -513,7 +524,7 @@
                 input.focus({ preventScroll: true });
                 return { wrapper };
             },
-            mutate: ({ anchor, wrapper }) => anchor.appendChild(wrapper),
+            mutate: ({ anchor, wrapper }) => anchor.moveBefore(wrapper, null),
         },
         {
             name: "child :focus-within insertion with unrelated metadata",
@@ -526,7 +537,7 @@
                 input.focus({ preventScroll: true });
                 return { wrapper };
             },
-            mutate: ({ anchor, wrapper }) => anchor.appendChild(wrapper),
+            mutate: ({ anchor, wrapper }) => anchor.moveBefore(wrapper, null),
         },
         {
             name: "child :focus-visible insertion with unrelated metadata",
@@ -537,7 +548,7 @@
                 input.focus({ preventScroll: true });
                 return { input };
             },
-            mutate: ({ anchor, input }) => anchor.appendChild(input),
+            mutate: ({ anchor, input }) => anchor.moveBefore(input, null),
         },
         {
             name: "child :default checkbox insertion with unrelated metadata",
@@ -594,7 +605,7 @@
                 input.focus({ preventScroll: true });
                 return { input };
             },
-            mutate: ({ anchor, input }) => anchor.appendChild(input),
+            mutate: ({ anchor, input }) => anchor.moveBefore(input, null),
         },
         {
             name: "child :where(:invalid) insertion with unrelated metadata",
@@ -617,10 +628,11 @@
         try {
             const context = caseData.setup({ fixture, anchor });
             assertEqual(`${caseData.name} initial`, readProbe(anchor), BASE);
-            resetStyleCounters();
-            caseData.mutate({ fixture, anchor, ...context });
-            assertEqual(`${caseData.name} after mutation`, readProbe(anchor), MATCH);
-            printPassWithCounters(`unprobeable pseudo structural mutation keeps :has walk: ${caseData.name}`);
+            const work = styleWorkBeyondInsertion(() => {
+                caseData.mutate({ fixture, anchor, ...context });
+                assertEqual(`${caseData.name} after mutation`, readProbe(anchor), MATCH);
+            }, { flush: false });
+            printPassWithStyleWorkBeyondInsertion(`unprobeable pseudo structural mutation keeps :has walk: ${caseData.name}`, work);
         } finally {
             if (document.activeElement instanceof HTMLElement)
                 document.activeElement.blur();
@@ -695,10 +707,11 @@
 
         try {
             assertEqual(`${caseData.name} initial`, readProbe(anchor), BASE);
-            resetStyleCounters();
-            caseData.mutate({ fixture, anchor });
-            assertEqual(`${caseData.name} after mutation`, readProbe(anchor), caseData.expectedAfter);
-            printPassWithCounters(`case-sensitive name structural mutation keeps :has walk: ${caseData.name}`);
+            const work = styleWorkBeyondInsertion(() => {
+                caseData.mutate({ fixture, anchor });
+                assertEqual(`${caseData.name} after mutation`, readProbe(anchor), caseData.expectedAfter);
+            }, { flush: false });
+            printPassWithStyleWorkBeyondInsertion(`case-sensitive name structural mutation keeps :has walk: ${caseData.name}`, work);
         } finally {
             style.remove();
             fixture.remove();
@@ -804,10 +817,11 @@
         try {
             const context = caseData.setup({ fixture, anchor });
             assertEqual(`${caseData.name} initial`, readProbe(context.target), caseData.expectedInitial);
-            resetStyleCounters();
-            caseData.mutate({ fixture, anchor, ...context });
-            assertEqual(`${caseData.name} after mutation`, readProbe(context.target), caseData.expectedAfter);
-            printPassWithCounters(`sibling relationship mutation keeps sibling-aware :has updates: ${caseData.name}`);
+            const work = styleWorkBeyondInsertion(() => {
+                caseData.mutate({ fixture, anchor, ...context });
+                assertEqual(`${caseData.name} after mutation`, readProbe(context.target), caseData.expectedAfter);
+            }, { flush: false });
+            printPassWithStyleWorkBeyondInsertion(`sibling relationship mutation keeps sibling-aware :has updates: ${caseData.name}`, work);
         } finally {
             style.remove();
             fixture.remove();
@@ -815,6 +829,7 @@
     }
 
     test(() => {
+        internals.updateStyle();
         for (const featureCase of positiveFeatureSelectors) {
             for (const mutationCase of unrelatedMutations)
                 runUnrelatedStructuralCase(featureCase, mutationCase);

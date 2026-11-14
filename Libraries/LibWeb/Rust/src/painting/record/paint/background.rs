@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::record::trace::{Observer, Operation};
 
 use crate::css::css_enums;
@@ -12,6 +13,7 @@ use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::border_radii::BorderRadii;
+use crate::painting::corner_shape::{CornerShapes, Insets, border_contour_path};
 use crate::painting::display_list::builder::PendingInlineClip;
 use crate::painting::display_list::commands::Repeat;
 use crate::painting::display_list::commands::{ContextRef, VISUAL_VIEWPORT_NODE_INDEX};
@@ -25,7 +27,10 @@ use crate::painting::record::paint::background_resolution::{
 };
 use crate::painting::record::paint::gradient_resolution::{gradient_paint_value, record_gradient_fill};
 use crate::painting::record::paint::table_backgrounds;
-use libgfx_rust::{CompositingAndBlendingOperator, FloatRect, FloatSize, IntRect, IntSize, MaskKind, ScalingMode};
+use crate::painting::visual_context::SpatialData;
+use libgfx_rust::{
+    CompositingAndBlendingOperator, FloatRect, FloatSize, IntRect, IntSize, MaskKind, ScalingMode, WindingRule,
+};
 
 const MAX_DIRECT_GRADIENT_TILES: f64 = 1000.0;
 
@@ -78,8 +83,10 @@ pub(crate) fn paint_background_within<O: Observer>(
     paintable: NodeSlotId,
     background_rect: CssPixelRect,
     border_radii: BorderRadii,
+    edges: Option<(FfiPixelBox, FfiPixelBox)>,
+    visible_rect: Option<CssPixelRect>,
 ) {
-    let layout_arena = recorder.layout_arena;
+    let layout_arena = recorder.source;
     let Some(style) = layout_arena.node_style_if_live(paintable) else {
         return;
     };
@@ -88,16 +95,18 @@ pub(crate) fn paint_background_within<O: Observer>(
         paintable,
         style,
         paintable,
-        libgfx_rust::Color(style.background().background_color),
+        libgfx_rust::Color(style.background_color()),
         style.background().background_color_clip,
         background_rect,
         border_radii,
+        edges,
     );
     let inputs = BackgroundPaintInputs {
         resolved,
         border_radii,
         image_rendering: style.image_rendering(),
         is_root_element: false,
+        visible_device_rect: visible_rect.map(|rect| recorder.converter.rounded_device_rect(rect)),
     };
     paint_resolved_background(recorder, paintable, &inputs);
 }
@@ -130,8 +139,21 @@ pub(crate) fn paint_resolved_background<O: Observer>(
 
     // https://drafts.csswg.org/css-backgrounds-4/#valdef-background-clip-text
     let needs_text_clip = resolved.needs_text_clip && !inputs.is_root_element;
+    let text_clip_fragments = if needs_text_clip {
+        text_clip_fragments(recorder, paintable)
+    } else {
+        Vec::new()
+    };
+    // With no text, nothing clipped to it shows: Paint just the layers clipped to some other box, without a mask.
+    let omit_text_clipped = needs_text_clip && text_clip_fragments.is_empty();
+    let needs_text_clip = needs_text_clip && !omit_text_clipped;
+    // A blending layer can't blend with the color under it when the color is left out.
+    let backdrop = match backdrop {
+        LayerBackdrop::OpaqueColorUnderLoneLayer(_) if omit_text_clipped => LayerBackdrop::IsolatedGroup,
+        backdrop => backdrop,
+    };
     if !backdrop.is_isolated_group() && !needs_text_clip {
-        paint_background_layers(recorder, paintable, inputs, backdrop);
+        paint_background_layers(recorder, paintable, inputs, backdrop, omit_text_clipped);
         return;
     }
 
@@ -148,12 +170,12 @@ pub(crate) fn paint_resolved_background<O: Observer>(
     };
     let mut group = recorder.recorder.begin_isolated_group();
     recorder.trace_paint(Operation::Named(Some(paintable), "background-group"), |recorder| {
-        paint_background_layers(recorder, paintable, inputs, backdrop);
+        paint_background_layers(recorder, paintable, inputs, backdrop, omit_text_clipped);
     });
     if needs_text_clip {
         recorder.recorder.begin_group_mask(&mut group);
         recorder.trace_paint(Operation::Named(Some(paintable), "background-text-mask"), |recorder| {
-            append_text_clip_paths(recorder, paintable);
+            append_text_clip_paths(recorder, &text_clip_fragments);
         });
     }
     recorder.recorder.finish_isolated_group(
@@ -169,6 +191,8 @@ fn paint_background_layers<O: Observer>(
     paintable: NodeSlotId,
     inputs: &BackgroundPaintInputs<'_>,
     backdrop: LayerBackdrop,
+    // Leaves out the color and the layers clipped to the text, which the caller found none of.
+    omit_text_clipped: bool,
 ) {
     let converter = recorder.converter;
     let resolved = &inputs.resolved;
@@ -178,7 +202,7 @@ fn paint_background_layers<O: Observer>(
     let color_box = resolved.color_box;
     let layers = &resolved.layers;
     let background_color_animation_effect = recorder
-        .layout_arena
+        .source
         .node_has_compositor_animation_frame(
             paintable,
             crate::layout::node_data::CompositorAnimationFrameKind::BackgroundColor,
@@ -190,10 +214,47 @@ fn paint_background_layers<O: Observer>(
         rect: background_rect,
         radii: inputs.border_radii,
     };
-    let padding = crate::painting::paintable_geometry::committed_padding(recorder.layout_arena, paintable);
-    let border = crate::painting::paintable_geometry::committed_border_box_edges(recorder.layout_arena, paintable);
+    let padding = resolved.padding;
+    let border = resolved.border;
 
-    if is_root_element {
+    // https://drafts.csswg.org/css-borders-4/#corner-shape-rendering
+    // Shaped corners clip each background box to the border contour path inset to that box.
+    let border_box_device_rect = converter.rounded_device_rect(border_box.rect).to_float();
+    let border_box_corner_radii = border_box.radii.as_corners(&converter);
+    let corner_shapes = recorder
+        .source
+        .node_style_if_live(paintable)
+        .map(CornerShapes::of)
+        .filter(|shapes| !is_root_element && shapes.needs_contour(border_box_corner_radii));
+    // https://drafts.csswg.org/css-borders-4/#border-shape-radius-interaction
+    // The inner border shape clips the background, and the border radii are ignored.
+    let border_shape_clip = (!is_root_element)
+        .then(|| crate::painting::border_shape::BorderShape::for_paintable(recorder.source, paintable, &converter))
+        .flatten()
+        .map(|border_shape| {
+            let (path, fill_rule) = border_shape.background_clip_path();
+            PendingInlineClip::intersecting_path(path, fill_rule)
+        });
+    let contour_clip = |css_rect: CssPixelRect| {
+        if let Some(clip) = &border_shape_clip {
+            return Some(clip.clone());
+        }
+        corner_shapes.map(|shapes| {
+            let rect = converter.rounded_device_rect(css_rect).to_float();
+            let insets = Insets {
+                top: f64::from(rect.y - border_box_device_rect.y),
+                right: f64::from((border_box_device_rect.x + border_box_device_rect.width) - (rect.x + rect.width)),
+                bottom: f64::from((border_box_device_rect.y + border_box_device_rect.height) - (rect.y + rect.height)),
+                left: f64::from(rect.x - border_box_device_rect.x),
+            };
+            let contour = border_contour_path(border_box_device_rect, border_box_corner_radii, shapes, insets);
+            PendingInlineClip::intersecting_path(&contour, WindingRule::Nonzero)
+        })
+    };
+
+    if omit_text_clipped {
+        // The color is clipped to the text.
+    } else if is_root_element {
         recorder.recorder.fill_animated_background_color(
             converter.enclosing_device_rect(color_box.rect),
             color,
@@ -201,6 +262,16 @@ fn paint_background_layers<O: Observer>(
             background_color_animation_effect,
             ForceDarkRole::Background,
         );
+    } else if let Some(clip) = contour_clip(color_box.rect) {
+        recorder.recorder.record_with_inline_clips(&[clip], |painter| {
+            painter.fill_animated_background_color(
+                converter.rounded_device_rect(color_box.rect),
+                color,
+                libgfx_rust::CornerRadii::default(),
+                background_color_animation_effect,
+                ForceDarkRole::Background,
+            );
+        });
     } else {
         recorder.recorder.fill_animated_background_color(
             converter.rounded_device_rect(color_box.rect),
@@ -214,7 +285,7 @@ fn paint_background_layers<O: Observer>(
     // Shrink the effective clip rect to account for the bits the borders will definitely paint
     // over (if they all have alpha == 255).
     let (border_widths, borders_opaque) = {
-        let style = recorder.layout_arena.node_style_if_live(paintable);
+        let style = recorder.source.node_style_if_live(paintable);
         match style {
             Some(style) => {
                 let opaque = libgfx_rust::Color(style.border_top_color()).alpha() == 255
@@ -257,6 +328,9 @@ fn paint_background_layers<O: Observer>(
 
     // Background layers are ordered front-to-back, so we paint them in reverse.
     for layer in layers.iter().rev() {
+        if omit_text_clipped && layer.clip == css_enums::background_box::TEXT {
+            continue;
+        }
         let clip_box = background_box_for(layer.clip, border_box, padding, border);
         let css_clip_rect = clip_box.rect;
         let unshrunken_clip_rect = converter.rounded_device_rect(css_clip_rect);
@@ -275,34 +349,55 @@ fn paint_background_layers<O: Observer>(
             painted_mask_layer = true;
         }
 
+        let mut layer_inline_clips = Vec::new();
+        if !is_root_element {
+            let unshrunken_clip_float_rect = unshrunken_clip_rect.to_float();
+            if layer.clip_follows_corners {
+                let corner_radii = clip_box.radii.corners_unconditionally(&converter);
+                if let Some(clip) = contour_clip(css_clip_rect) {
+                    layer_inline_clips.push(clip);
+                } else if corner_radii.has_any_radius() {
+                    layer_inline_clips.push(PendingInlineClip::intersecting_rounded_rect(
+                        unshrunken_clip_float_rect,
+                        corner_radii,
+                    ));
+                }
+            }
+            layer_inline_clips.push(PendingInlineClip::intersecting_float_rect(unshrunken_clip_float_rect));
+        }
+
         let layer_erases_uncovered_destination =
             operator_erases_destination_outside_the_drawn_geometry(compositing_and_blending_operator);
         if layer_erases_uncovered_destination {
             // https://drafts.fxtf.org/css-masking-1/#the-mask-composite
             // The composite must erase the accumulated mask outside the drawn geometry, but only
             // within the layer's clip: the layer plays as an isolated group composited with the
-            // operator, and the command's own clip bounds the erase.
-            let group = recorder.recorder.begin_isolated_group();
-            recorder.trace_paint(Operation::Named(Some(paintable), "mask-layer"), |recorder| {
-                if layer.image.is_some() {
-                    paint_image_layer(
-                        recorder,
-                        paintable,
-                        layer,
-                        inputs.image_rendering,
-                        css_clip_rect,
-                        clip_rect,
-                        CompositingAndBlendingOperator::Normal,
-                        backdrop,
-                    );
-                }
+            // operator, and the command's own clip bounds the erase. The group takes the layer's
+            // inline clips as its own, so a rounded clip bounds the erase to the box's curve.
+            recorder.record_with_inline_clips(&layer_inline_clips, |recorder| {
+                let group = recorder.recorder.begin_isolated_group();
+                recorder.trace_paint(Operation::Named(Some(paintable), "mask-layer"), |recorder| {
+                    if layer.image.is_some() {
+                        paint_image_layer(
+                            recorder,
+                            paintable,
+                            layer,
+                            inputs.image_rendering,
+                            css_clip_rect,
+                            clip_rect,
+                            CompositingAndBlendingOperator::Normal,
+                            backdrop,
+                            inputs.visible_device_rect,
+                        );
+                    }
+                });
+                recorder.recorder.finish_isolated_group(
+                    group,
+                    unshrunken_clip_rect.to_float(),
+                    compositing_and_blending_operator,
+                    MaskKind::Alpha,
+                );
             });
-            recorder.recorder.finish_isolated_group(
-                group,
-                unshrunken_clip_rect.to_float(),
-                compositing_and_blending_operator,
-                MaskKind::Alpha,
-            );
             continue;
         }
 
@@ -317,25 +412,12 @@ fn paint_background_layers<O: Observer>(
                     clip_rect,
                     compositing_and_blending_operator,
                     backdrop,
+                    inputs.visible_device_rect,
                 );
             }
         };
 
-        if is_root_element {
-            paint_layer(recorder);
-        } else {
-            let unshrunken_clip_float_rect = unshrunken_clip_rect.to_float();
-            let corner_radii = clip_box.radii.corners_unconditionally(&converter);
-            let mut layer_inline_clips = Vec::new();
-            if corner_radii.has_any_radius() {
-                layer_inline_clips.push(PendingInlineClip::intersecting_rounded_rect(
-                    unshrunken_clip_float_rect,
-                    corner_radii,
-                ));
-            }
-            layer_inline_clips.push(PendingInlineClip::intersecting_float_rect(unshrunken_clip_float_rect));
-            recorder.record_with_inline_clips(&layer_inline_clips, paint_layer);
-        }
+        recorder.record_with_inline_clips(&layer_inline_clips, paint_layer);
     }
 }
 
@@ -424,9 +506,11 @@ pub(crate) fn paint_image_content<O: Observer>(
             ForceDarkRole::Background,
         ),
         ImageContent::Vector {
-            has_active_view_box, ..
+            content_identity,
+            has_active_view_box,
         } => recorder.paint_vector_image(
             source,
+            *content_identity,
             *has_active_view_box,
             dest_rect,
             accumulated_scale,
@@ -446,6 +530,99 @@ fn paint_image_layer<O: Observer>(
     clip_rect: IntRect,
     compositing_and_blending_operator: CompositingAndBlendingOperator,
     backdrop: LayerBackdrop,
+    visible_device_rect: Option<IntRect>,
+) {
+    let paint_in_current_space = |recorder: &mut PaintRecorder<'_, O>,
+                                  css_clip_rect: CssPixelRect,
+                                  clip_rect: IntRect,
+                                  visible_device_rect: Option<IntRect>| {
+        paint_image_layer_in_current_space(
+            recorder,
+            paintable,
+            layer,
+            image_rendering,
+            css_clip_rect,
+            clip_rect,
+            compositing_and_blending_operator,
+            backdrop,
+            visible_device_rect,
+        );
+    };
+
+    if layer.attachment != css_enums::background_attachment::FIXED
+        || recorder.recorder.is_recording_inside_group()
+        || !background_has_fixed_attachment(
+            recorder.source,
+            recorder.inputs.uncaptured.root_background_source,
+            paintable,
+        )
+    {
+        paint_in_current_space(recorder, css_clip_rect, clip_rect, visible_device_rect);
+        return;
+    }
+
+    // Select an existing space above scrolling, retaining the clips and effects of the background paint.
+    // Background attachment doesn't add AVC nodes.
+    let tree = recorder.paint_state.visual_context_tree.as_ref().unwrap();
+    let mut spatial = recorder.data(paintable).accumulated_visual_context.spatial;
+    let mut index = spatial;
+    while index != VISUAL_VIEWPORT_NODE_INDEX {
+        let node = &tree.spatial_nodes[index.0 as usize];
+        if node.data.is_scroll_like() {
+            spatial = node.parent;
+        }
+        index = node.parent;
+    }
+    let previous_context = recorder.recorder.accumulated_visual_context();
+    if spatial == previous_context.spatial {
+        paint_in_current_space(recorder, css_clip_rect, clip_rect, visible_device_rect);
+        return;
+    }
+    // NB: Tiling over the viewport would record draws that the empty clip of the layer then hides.
+    if clip_rect.is_empty() || visible_device_rect.is_some_and(|rect| rect.is_empty()) {
+        return;
+    }
+
+    // NB: The layer's clips stay in the space of the box, so the compositor keeps clipping the background to the box
+    //     as it scrolls the box without a new recording. As the box can then be anywhere in the viewport, the tiles
+    //     cover all of it, and the clip and visible rects of the layer, which are in the space of the box, become clips
+    //     in that space too.
+    let viewport_rect = CssPixelRect {
+        x: CssPixels::from_raw(0),
+        y: CssPixels::from_raw(0),
+        ..recorder.inputs.css_viewport_rect
+    };
+    let viewport_device_rect = recorder.converter.rounded_device_rect(viewport_rect);
+
+    let box_space_clips: Vec<PendingInlineClip> = std::iter::once(clip_rect)
+        .chain(visible_device_rect)
+        .filter(|rect| !recorder.recorder.has_ambient_inline_clip_within(rect.to_float()))
+        .map(|rect| PendingInlineClip::intersecting_device_rect(rect).in_space(previous_context.spatial))
+        .collect();
+    let previous_inline_clips = recorder
+        .recorder
+        .move_ambient_inline_clips_to_space(previous_context.spatial);
+    recorder.recorder.push_ambient_inline_clips(&box_space_clips);
+    recorder.recorder.set_accumulated_visual_context(ContextRef {
+        spatial,
+        ..previous_context
+    });
+    paint_in_current_space(recorder, viewport_rect, viewport_device_rect, None);
+    recorder.recorder.set_accumulated_visual_context(previous_context);
+    recorder.recorder.replace_ambient_inline_clips(previous_inline_clips);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_image_layer_in_current_space<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    layer: &ResolvedBackgroundLayer<'_>,
+    image_rendering: u8,
+    css_clip_rect: CssPixelRect,
+    clip_rect: IntRect,
+    compositing_and_blending_operator: CompositingAndBlendingOperator,
+    backdrop: LayerBackdrop,
+    visible_device_rect: Option<IntRect>,
 ) {
     let converter = recorder.converter;
     let image = layer.image.expect("an imageless layer never reaches the image paint");
@@ -460,34 +637,8 @@ fn paint_image_layer<O: Observer>(
     let mut background_positioning_area = layer.background_positioning_area;
 
     match layer.attachment {
-        css_enums::background_attachment::FIXED => {
-            if !recorder.recorder.is_recording_inside_group()
-                && background_has_fixed_attachment(
-                    recorder.layout_arena,
-                    recorder.inputs.uncaptured.root_background_source,
-                    paintable,
-                )
-            {
-                // Select an existing space above scrolling, retaining the clips and effects
-                // of the background paint. Background attachment doesn't add AVC nodes.
-                let tree = recorder.paint_state.visual_context.tree.as_ref().unwrap();
-                let mut spatial = recorder.data(paintable).accumulated_visual_context.spatial;
-                let mut index = spatial;
-                while index != VISUAL_VIEWPORT_NODE_INDEX {
-                    let node = &tree.spatial_nodes[index.0 as usize];
-                    if node.data.is_scroll_like() {
-                        spatial = node.parent;
-                    }
-                    index = node.parent;
-                }
-                let context = recorder.recorder.accumulated_visual_context();
-                recorder
-                    .recorder
-                    .set_accumulated_visual_context(ContextRef { spatial, ..context });
-            }
-        }
         css_enums::background_attachment::LOCAL
-            if recorder.layout_arena.node_kind_if_live(paintable) != Some(NodeKind::Viewport) =>
+            if recorder.source.node_kind_if_live(paintable) != Some(NodeKind::Viewport) =>
         {
             let scroll_offset = recorder.own_scroll_container_offset(paintable);
             background_positioning_area = background_positioning_area.translated(-scroll_offset.x, -scroll_offset.y);
@@ -497,6 +648,7 @@ fn paint_image_layer<O: Observer>(
 
     image_rect.x = background_positioning_area.left() + layer.position_x;
     image_rect.y = background_positioning_area.top() + layer.position_y;
+    let anchor_tile_rect = image_rect;
 
     // Repetition
     let repeat_x;
@@ -531,9 +683,8 @@ fn paint_image_layer<O: Observer>(
         _ => repeat_x = false,
     }
     // Move image_rect to the left-most tile position that is still visible
-    if repeat_x && image_rect.x > css_clip_rect.x {
-        let x_delta = floor_css(x_step * ceil_fraction(image_rect.x - css_clip_rect.x, x_step));
-        image_rect.x -= x_delta;
+    if repeat_x {
+        image_rect.x = first_css_tile_start(image_rect.x, css_clip_rect.x, x_step);
     }
 
     match layer.repeat_y {
@@ -547,7 +698,7 @@ fn paint_image_layer<O: Observer>(
                 y_step = image_rect.height;
                 repeat_y = false;
             } else {
-                let space = (background_positioning_area.height.to_float() % image_rect.height.to_float()) as f64;
+                let space = background_positioning_area.height.to_double() % image_rect.height.to_double();
                 y_step = image_rect.height + CssPixels::nearest_value_for(space / (whole_images - 1) as f64);
                 repeat_y = true;
                 repeat_y_has_gap = true;
@@ -560,9 +711,8 @@ fn paint_image_layer<O: Observer>(
         _ => repeat_y = false,
     }
     // Move image_rect to the top-most tile position that is still visible
-    if repeat_y && image_rect.y > css_clip_rect.y {
-        let y_delta = floor_css(y_step * ceil_fraction(image_rect.y - css_clip_rect.y, y_step));
-        image_rect.y -= y_delta;
+    if repeat_y {
+        image_rect.y = first_css_tile_start(image_rect.y, css_clip_rect.y, y_step);
     }
 
     let initial_image_x = image_rect.x;
@@ -570,7 +720,7 @@ fn paint_image_layer<O: Observer>(
 
     let resolved_gradient = gradient_paint_value(&image).map(|gradient_value| {
         let style = recorder
-            .layout_arena
+            .source
             .node_style_if_live(paintable)
             .expect("a painted layer's layout node is live");
         crate::painting::record::paint::gradient_resolution::resolve_gradient_paint(
@@ -597,7 +747,9 @@ fn paint_image_layer<O: Observer>(
                 if image_device_rect.height == 0 {
                     image_device_rect.height = 1;
                 }
-                rects.push(image_device_rect);
+                if visible_device_rect.is_none_or(|visible| !visible.intersected(image_device_rect).is_empty()) {
+                    rects.push(image_device_rect);
+                }
                 if !repeat_x {
                     break;
                 }
@@ -659,7 +811,14 @@ fn paint_image_layer<O: Observer>(
         // Use a dedicated painting command for repeated images instead of recording a separate command for each
         // instance of a repeated background, so the painter has the opportunity to optimize the painting of
         // repeated images.
-        let mut dest_rect = converter.rounded_device_rect(image_rect);
+        // NB: Tiles repeat in all directions at a whole device pixel size. Round the tile at the background position to
+        //     get that size, as a tile any number of steps away can round to a different one. A lone tile has to stay
+        //     where it is: only the tile that tile_count found covers the clip, and it is the only one that we paint.
+        let mut dest_rect = converter.rounded_device_rect(if tile_count == 1.0 {
+            image_rect
+        } else {
+            anchor_tile_rect
+        });
         // If the image's dimensions were rounded to zero then they need to be restored to avoid a crash.
         if dest_rect.width == 0 {
             dest_rect.width = 1;
@@ -667,7 +826,17 @@ fn paint_image_layer<O: Observer>(
         if dest_rect.height == 0 {
             dest_rect.height = 1;
         }
-        if let crate::painting::image_content::ImageContent::Vector { .. } = &facts.content {
+        // NB: Whole tile steps don't change what repeats, but the painter works in floats, which can't hold the phase
+        //     of a distant tile. Keep the origin next to the clip.
+        if tile_count != 1.0 {
+            if repeat_x {
+                dest_rect.x = first_tile_start(dest_rect.x, clip_rect.x, dest_rect.width);
+            }
+            if repeat_y {
+                dest_rect.y = first_tile_start(dest_rect.y, clip_rect.y, dest_rect.height);
+            }
+        }
+        if let crate::painting::image_content::ImageContent::Vector { content_identity, .. } = &facts.content {
             if clip_rect.is_empty() {
                 return;
             }
@@ -682,25 +851,42 @@ fn paint_image_layer<O: Observer>(
                     CssPixels::from_integer(i64::from(dest_rect.width)),
                     CssPixels::from_integer(i64::from(dest_rect.height)),
                     1.0,
+                    *content_identity,
+                    recorder.vector_image_color_scheme(vector_image_source.owner()),
+                    recorder.vector_image_force_dark(),
                 ),
             );
+            let tile_size = IntSize {
+                width: dest_rect.width,
+                height: dest_rect.height,
+            };
+            let tree = recorder.paint_state.visual_context_tree.as_ref().unwrap();
+            let mut spatial = recorder.recorder.accumulated_visual_context().spatial;
+            let mut is_untransformed = recorder.recorder.ambient_inline_transform().is_none();
+            while is_untransformed && spatial != VISUAL_VIEWPORT_NODE_INDEX {
+                let node = &tree.spatial_nodes[spatial.0 as usize];
+                is_untransformed = !matches!(node.data, SpatialData::Transform(_) | SpatialData::Perspective(_));
+                spatial = node.parent;
+            }
+            // OPTIMIZATION: Paint a single untransformed SVG tile directly to keep filters clipped to the background.
+            //               Rasterize other tiles to preserve placement, subpixel opacity and seamless boundaries.
+            if inline_operator == CompositingAndBlendingOperator::Normal && tile_count == 1.0 && is_untransformed {
+                recorder
+                    .recorder
+                    .paint_nested_display_list(display_list_id, dest_rect.to_float(), tile_size);
+                return;
+            }
             let group = recorder.recorder.begin_repeated_tile();
             recorder.recorder.paint_nested_display_list(
                 display_list_id,
                 FloatRect::new(0.0, 0.0, dest_rect.width as f32, dest_rect.height as f32),
-                IntSize {
-                    width: dest_rect.width,
-                    height: dest_rect.height,
-                },
+                tile_size,
             );
             recorder.recorder.finish_repeated_tile(
                 group,
                 dest_rect.to_float(),
                 clip_rect,
-                IntSize {
-                    width: dest_rect.width,
-                    height: dest_rect.height,
-                },
+                tile_size,
                 FloatSize {
                     width: dest_rect.width as f32,
                     height: dest_rect.height as f32,
@@ -887,15 +1073,24 @@ fn fraction_to_int(numerator: CssPixels, denominator: CssPixels) -> i32 {
     numerator.div_as_fraction(denominator).to_int()
 }
 
-fn ceil_fraction(numerator: CssPixels, denominator: CssPixels) -> CssPixels {
-    if denominator.raw_value() == 0 {
-        return CssPixels::from_raw(0);
+/// Moves a tile start by whole steps to the last position at or before the clip start. Integer math keeps this exact: a
+/// fixed point quotient truncates a gap below 1/64 of a step to zero steps.
+fn first_tile_start(tile_start: i32, clip_start: i32, step: i32) -> i32 {
+    if step <= 0 {
+        return tile_start;
     }
-    numerator.div_as_fraction(denominator).ceil()
+    let clip_start = i64::from(clip_start);
+    let clip_offset_from_tile = clip_start - i64::from(tile_start);
+    let first_start = clip_start - clip_offset_from_tile.rem_euclid(i64::from(step));
+    first_start.max(i64::from(i32::MIN)) as i32
 }
 
-fn floor_css(value: CssPixels) -> CssPixels {
-    value.floor()
+fn first_css_tile_start(tile_start: CssPixels, clip_start: CssPixels, step: CssPixels) -> CssPixels {
+    CssPixels::from_raw(first_tile_start(
+        tile_start.raw_value(),
+        clip_start.raw_value(),
+        step.raw_value(),
+    ))
 }
 
 fn source_rect_for_visible_image_part(
@@ -913,27 +1108,17 @@ fn source_rect_for_visible_image_part(
     )
 }
 
-fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId) {
+fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, fragments: &[(NodeSlotId, usize)]) {
     let converter = recorder.converter;
     let scale = recorder.inputs.device_pixels_per_css_pixel;
 
-    let append_fragment = |recorder: &mut PaintRecorder<'_, O>, owner: NodeSlotId, fragment_index: usize| {
-        let side = recorder.layout_arena.paintable_side_data(owner);
+    for &(owner, fragment_index) in fragments {
+        let side = recorder.source.committed_side_data(owner);
         let fragment = &side.fragments()[fragment_index];
-        let is_text = recorder
-            .layout_arena
-            .node_kind_if_live(fragment.layout_node)
-            .is_some_and(node_facts::kind_is_text);
-        if !is_text {
-            return;
-        }
         let Some(run) = &fragment.glyph_run else {
-            return;
+            continue;
         };
-        if run.glyphs.is_empty() {
-            return;
-        }
-        let fragment_absolute_rect = crate::painting::text_fragment::absolute_rect(recorder.layout_arena, fragment);
+        let fragment_absolute_rect = crate::painting::text_fragment::absolute_rect(recorder.source, fragment);
         let fragment_absolute_device_rect = converter.enclosing_device_rect(fragment_absolute_rect);
         let font_id = recorder.register_font(&run.font);
         let emission = crate::painting::record::paint::text::glyph_run_emission(
@@ -943,40 +1128,77 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pain
             fragment_absolute_device_rect,
             scale,
         );
-        recorder.recorder.draw_glyph_run(
-            emission.baseline_start,
-            crate::painting::display_list::recorder::GlyphRunForRecording {
-                font_smoothing: recorder
-                    .layout_arena
-                    .node_style_if_live(fragment.style_source)
-                    .unwrap()
-                    .inherited_text()
-                    .font_smoothing,
-                font_id: crate::painting::display_list::commands::FontResourceId(font_id),
-                glyphs: &emission.glyphs,
-            },
-            libgfx_rust::Color::from_rgb(0, 0, 0),
-            fragment_absolute_device_rect,
-            scale,
-            emission.orientation,
-            emission.glyph_bounding_rect,
-            ForceDarkRole::None,
-        );
+        let stroke_width = recorder
+            .source
+            .node_style_if_live(fragment.style_source)
+            .unwrap()
+            .inherited_text()
+            .webkit_text_stroke_width
+            * scale;
+        for width in [0.0, stroke_width as f32]
+            .into_iter()
+            .take(if stroke_width > 0.0 { 2 } else { 1 })
+        {
+            recorder.recorder.draw_glyph_run(
+                emission.baseline_start,
+                crate::painting::display_list::recorder::GlyphRunForRecording {
+                    font_smoothing: recorder
+                        .source
+                        .node_style_if_live(fragment.style_source)
+                        .unwrap()
+                        .inherited_text()
+                        .font_smoothing,
+                    font_id: crate::painting::display_list::commands::FontResourceId(font_id),
+                    glyphs: run
+                        .glyphs
+                        .placed()
+                        .filter(|placed| placed.glyph.should_paint())
+                        .map(crate::painting::display_list::commands::DisplayListGlyph::from),
+                },
+                libgfx_rust::Color::from_rgb(0, 0, 0),
+                width,
+                fragment_absolute_device_rect,
+                scale,
+                emission.orientation,
+                emission.glyph_bounding_rect,
+                ForceDarkRole::None,
+            );
+        }
+    }
+}
+
+/// The text fragments, in the paintable and its in-flow and floated descendants, whose glyphs the background is clipped
+/// to: each one as its owner and its index among the owner's fragments.
+fn text_clip_fragments<O: Observer>(
+    recorder: &PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+) -> Vec<(NodeSlotId, usize)> {
+    let mut fragments = Vec::new();
+    let mut append_fragment = |owner: NodeSlotId, fragment_index: usize| {
+        let side = recorder.source.committed_side_data(owner);
+        let fragment = &side.fragments()[fragment_index];
+        let is_text = recorder
+            .source
+            .node_kind_if_live(fragment.layout_node)
+            .is_some_and(node_facts::kind_is_text);
+        if is_text && fragment.glyph_run.as_ref().is_some_and(|run| !run.glyphs.is_empty()) {
+            fragments.push((owner, fragment_index));
+        }
     };
 
     let data = recorder.data(paintable);
-    if node_painting::is_inline(recorder.layout_arena, paintable) {
+    if node_painting::is_fragmented_inline(recorder.source, paintable) {
         let root = data.containing_block;
         if !root.is_invalid()
-            && recorder.layout_arena.paintable_row_is_populated(root)
-            && node_painting::has_lines(recorder.layout_arena, root)
+            && recorder.source.paintable_row_is_populated(root)
+            && node_painting::has_lines(recorder.source, root)
         {
-            let layout_arena = recorder.layout_arena;
-            for piece_index in &layout_arena.paintable_side_data(paintable).piece_indices {
-                let side = layout_arena.paintable_side_data(root);
+            let layout_arena = recorder.source;
+            let side = layout_arena.committed_side_data(root);
+            for piece_index in side.inline_box_piece_indices(paintable) {
                 let piece = &side.inline_box_pieces()[*piece_index as usize];
                 for fragment_index in piece.first_fragment_index..piece.first_fragment_index + piece.fragment_count {
-                    append_fragment(recorder, root, fragment_index as usize);
+                    append_fragment(root, fragment_index as usize);
                 }
             }
         }
@@ -985,26 +1207,26 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, pain
     let mut stack = vec![paintable];
     while let Some(current) = stack.pop() {
         if current != paintable {
-            let out_of_flow_not_floating =
-                matches!(
-                    crate::painting::style_queries::position(recorder.layout_arena, current),
-                    crate::css::css_enums::positioning::ABSOLUTE | crate::css::css_enums::positioning::FIXED
-                ) && !crate::painting::style_queries::is_floating(recorder.layout_arena, current);
-            if let Some(next) = crate::painting::paint_order::next_paint_sibling(recorder.layout_arena, current) {
+            let out_of_flow_not_floating = matches!(
+                crate::painting::style_queries::position(recorder.source, current),
+                crate::css::css_enums::positioning::ABSOLUTE | crate::css::css_enums::positioning::FIXED
+            ) && !crate::painting::style_queries::is_floating(recorder.source, current);
+            if let Some(next) = crate::painting::paint_order::next_paint_sibling(recorder.source, current) {
                 stack.push(next);
             }
             if out_of_flow_not_floating {
                 continue;
             }
         }
-        if let Some(first_child) = crate::painting::paint_order::first_paint_child(recorder.layout_arena, current) {
+        if let Some(first_child) = crate::painting::paint_order::first_paint_child(recorder.source, current) {
             stack.push(first_child);
         }
-        if node_painting::has_lines(recorder.layout_arena, current) {
-            let count = recorder.layout_arena.paintable_side_data(current).fragments().len();
+        if node_painting::has_lines(recorder.source, current) {
+            let count = recorder.source.committed_side_data(current).fragments().len();
             for fragment_index in 0..count {
-                append_fragment(recorder, current, fragment_index);
+                append_fragment(current, fragment_index);
             }
         }
     }
+    fragments
 }

@@ -7,33 +7,75 @@ function assertEqual(testName, actual, expected) {
     if (actual !== expected) throw new Error(`${testName}: expected ${expected}, got ${actual}`);
 }
 
-function resetStyleCounters() {
-    internals.resetStyleInvalidationCounters();
-}
-
 function flushPendingStyleWork() {
     internals.updateStyle();
-    resetStyleCounters();
 }
 
-function styleCounterSummary() {
-    const counters = internals.getStyleInvalidationCounters();
-    return (
-        `elementStyleRecomputations=${counters.elementStyleRecomputations}, ` +
-        `elementStyleNoopRecomputations=${counters.elementStyleNoopRecomputations}`
-    );
-}
-
-function styleCounters() {
-    return internals.getStyleInvalidationCounters();
-}
-
-function printPassWithCounters(testName) {
-    println(`PASS: ${testName} | ${styleCounterSummary()}`);
-}
-
-function printPassWithoutRecomputeCounters(testName) {
+function printPass(testName) {
     println(`PASS: ${testName}`);
+}
+
+// Like printPass(), but also names the elements the style passes of `work`, from styleWork() in work-test.js,
+// restyled. A full pass names only the elements it changed.
+function printPassWithStyleWork(testName, work) {
+    const restyled = `restyled: [${work.restyled().map(shortStyleName).join(", ")}]`;
+    println(`PASS: ${testName} (${work.passes().includes("FULL") ? `full pass, ${restyled}` : restyled})`);
+}
+
+function styleTraceName(element) {
+    const id = element.id ? `#${element.id}` : "";
+    return `${element.nodeName.toLowerCase()}${id}${[...element.classList].map(name => `.${name}`).join("")}`;
+}
+
+function subtreeElementsWithShadowTrees(element) {
+    return [element, ...element.querySelectorAll("*")].flatMap(inner => {
+        const shadowRoot = internals.getShadowRoot(inner);
+        if (!shadowRoot) return [inner];
+        return [inner, ...[...shadowRoot.children].flatMap(subtreeElementsWithShadowTrees)];
+    });
+}
+
+// Runs `mutate` under styleWork() and answers the work with `beyondInsertion`: what its passes restyled, less one
+// element of the same name for each element the mutation inserted or moved, user agent shadow trees included.
+function styleWorkBeyondInsertion(mutate, options = {}) {
+    const observer = new MutationObserver(() => {});
+    observer.observe(document, { childList: true, subtree: true });
+    let returned;
+    let work;
+    let records;
+    try {
+        work = styleWork(
+            () => {
+                returned = mutate();
+            },
+            internals,
+            options
+        );
+    } finally {
+        records = observer.takeRecords();
+        observer.disconnect();
+    }
+    const insertedCounts = new Map();
+    for (const node of records.flatMap(record => [...record.addedNodes])) {
+        if (node.nodeType !== Node.ELEMENT_NODE) continue;
+        for (const element of subtreeElementsWithShadowTrees(node)) {
+            const name = styleTraceName(element);
+            insertedCounts.set(name, (insertedCounts.get(name) ?? 0) + 1);
+        }
+    }
+    const beyondInsertion = work.restyled().filter(name => {
+        const unnumbered = name.replace(/@\d+$/, "");
+        const inserted = insertedCounts.get(unnumbered) ?? 0;
+        if (!inserted) return true;
+        insertedCounts.set(unnumbered, inserted - 1);
+        return false;
+    });
+    return { ...work, returned, beyondInsertion };
+}
+
+function printPassWithStyleWorkBeyondInsertion(testName, work) {
+    const beyond = `restyled beyond the insertion: [${work.beyondInsertion.map(shortStyleName).join(", ")}]`;
+    println(`PASS: ${testName} (${work.passes().includes("FULL") ? `full pass, ${beyond}` : beyond})`);
 }
 
 function makeElement(tagName, options = {}) {
@@ -267,7 +309,6 @@ function runCase({
     after,
     pseudoElement = "",
     skipInitialRead = false,
-    omitRecomputeCounters = false,
     fixtureOptions = {},
 }) {
     if (
@@ -290,11 +331,9 @@ function runCase({
         setup?.(subject, fixture);
         if (!skipInitialRead)
             assertEqual(`${testName} initial`, readProbe(target, pseudoElement), initial ? MATCH : BASE);
-        resetStyleCounters();
         mutate(subject, fixture);
         assertEqual(`${testName} after mutation`, readProbe(target, pseudoElement), after ? MATCH : BASE);
-        if (omitRecomputeCounters) printPassWithoutRecomputeCounters(testName);
-        else printPassWithCounters(testName);
+        printPass(testName);
     } finally {
         cleanup();
         flushPendingStyleWork();
@@ -340,10 +379,9 @@ function runDuplicateDescendantInvalidationRuleCase(scope) {
 
     try {
         assertEqual(`duplicate descendant invalidation rule ${scope} initial`, readProbe(target), BASE);
-        resetStyleCounters();
         ancestor.classList.add("active");
         assertEqual(`duplicate descendant invalidation rule ${scope} after mutation`, readProbe(target), MATCH);
-        printPassWithCounters(`duplicate descendant invalidation rules merge: ${scope}`);
+        printPass(`duplicate descendant invalidation rules merge: ${scope}`);
     } finally {
         scoped.cleanup();
         flushPendingStyleWork();
@@ -362,10 +400,9 @@ function runDuplicateSiblingInvalidationRuleCase(scope) {
 
     try {
         assertEqual(`duplicate sibling invalidation rule ${scope} initial`, readProbe(target), BASE);
-        resetStyleCounters();
         trigger.classList.add("active");
         assertEqual(`duplicate sibling invalidation rule ${scope} after mutation`, readProbe(target), MATCH);
-        printPassWithCounters(`duplicate sibling invalidation rules merge: ${scope}`);
+        printPass(`duplicate sibling invalidation rules merge: ${scope}`);
     } finally {
         scoped.cleanup();
         flushPendingStyleWork();
@@ -398,11 +435,10 @@ function runBatchedHasMutationCase({
     assertEqual(`${name} initial`, readProbe(subgrid), BASE);
     document.body.offsetWidth;
 
-    resetStyleCounters();
     unrelatedMutation(parts);
     relatedMutation(parts);
     assertEqual(`${name} after batched mutations`, readProbe(subgrid), expectedAfter ? MATCH : BASE);
-    printPassWithCounters(`batched :has mutation invalidates after earlier unrelated mutation: ${name}`);
+    printPass(`batched :has mutation invalidates after earlier unrelated mutation: ${name}`);
 
     style.remove();
     fixture.remove();
@@ -432,7 +468,6 @@ const childMutationCases = [
         selector: ":empty",
         initial: true,
         after: false,
-        omitRecomputeCounters: true,
         mutate: subject => subject.appendChild(makeElement("span")),
     },
     {
@@ -1633,10 +1668,6 @@ const partChildMutationCases = [
         selector: ":empty",
         initial: true,
         after: false,
-        // This is the first case to run in this test. whichever scope runs first triggers some lazy style-system
-        // initialization whose recomputation counters differ depending on non-deterministic state — so the counters
-        // here aren't a stable thing to assert on. childMutationCases sets the same flag on its equivalent first case.
-        omitRecomputeCounters: true,
         mutate: subject => subject.appendChild(makeElement("span")),
     },
     {
@@ -2042,14 +2073,13 @@ const descendantStateMutationCases = [
     },
 ];
 
-function runDetachedReconnectCase(scope, selectorCase, pseudoElement = "", options = {}) {
+function runDetachedReconnectCase(scope, selectorCase, pseudoElement = "") {
     runCase({
         suite: pseudoElement ? "detached pseudo-element child mutation" : "detached child mutation",
         scope,
         initial: selectorCase.initial,
         after: selectorCase.after,
         pseudoElement,
-        omitRecomputeCounters: options.omitRecomputeCounters,
         ...selectorCase,
         mutate: (subject, fixture) => {
             fixture.remove();
@@ -2069,10 +2099,9 @@ function runInheritedLanguageCase(scope, selectorCase, pseudoElement = "") {
         subject.appendChild(makeElement("span"));
         selectorCase.setup?.(subject, fixture);
         assertEqual(`${testName} initial`, readProbe(target, pseudoElement), selectorCase.initial ? MATCH : BASE);
-        resetStyleCounters();
         selectorCase.mutate(subject, fixture);
         assertEqual(`${testName} after mutation`, readProbe(target, pseudoElement), selectorCase.after ? MATCH : BASE);
-        printPassWithCounters(testName);
+        printPass(testName);
     } finally {
         cleanup();
         flushPendingStyleWork();
@@ -2139,10 +2168,9 @@ function runPrecomputedDetachedInsertionCase(selectorCase) {
 
         assertEqual(`${selectorCase.name} precomputed initial`, readProbe(target), BASE);
         subtree.remove();
-        resetStyleCounters();
         container.appendChild(subtree);
         assertEqual(`${selectorCase.name} after insertion`, readProbe(target), selectorCase.after ?? MATCH);
-        printPassWithCounters(`precomputed detached insertion: ${selectorCase.name}`);
+        printPass(`precomputed detached insertion: ${selectorCase.name}`);
     } finally {
         style.remove();
         fixture.remove();
@@ -2400,12 +2428,11 @@ function runInheritedLanguageStressCase(scope, selectorCase, mode) {
         selectorCase.setup?.(subject, fixture);
         if (!mode.includes("cold"))
             assertEqual(`${testName} initial`, readProbe(target, pseudoElement), selectorCase.initial ? MATCH : BASE);
-        resetStyleCounters();
         if (mode.includes("detached")) fixture.remove();
         selectorCase.mutate(subject, fixture);
         if (mode.includes("detached")) document.body.appendChild(fixture);
         assertEqual(`${testName} after mutation`, readProbe(target, pseudoElement), selectorCase.after ? MATCH : BASE);
-        printPassWithCounters(testName);
+        printPass(testName);
     } finally {
         cleanup();
         flushPendingStyleWork();
@@ -2433,7 +2460,6 @@ function runPrecomputedDetachedInsertionStressCase(selectorCase, mode) {
         fixture.appendChild(container);
         if (mode === "append") {
             const { subtree, target } = cloneSubtreeForPrecomputedStress(fixture, selectorCase);
-            resetStyleCounters();
             container.appendChild(subtree);
             assertEqual(
                 `${selectorCase.name} append stress after insertion`,
@@ -2443,7 +2469,6 @@ function runPrecomputedDetachedInsertionStressCase(selectorCase, mode) {
         } else if (mode === "prepend") {
             container.appendChild(makeElement("span"));
             const { subtree, target } = cloneSubtreeForPrecomputedStress(fixture, selectorCase);
-            resetStyleCounters();
             container.prepend(subtree);
             assertEqual(
                 `${selectorCase.name} prepend stress after insertion`,
@@ -2453,7 +2478,6 @@ function runPrecomputedDetachedInsertionStressCase(selectorCase, mode) {
         } else if (mode === "replaceChildren") {
             container.appendChild(makeElement("span"));
             const { subtree, target } = cloneSubtreeForPrecomputedStress(fixture, selectorCase);
-            resetStyleCounters();
             container.replaceChildren(subtree);
             assertEqual(
                 `${selectorCase.name} replaceChildren stress after insertion`,
@@ -2464,7 +2488,6 @@ function runPrecomputedDetachedInsertionStressCase(selectorCase, mode) {
             const { subtree, target } = cloneSubtreeForPrecomputedStress(fixture, selectorCase);
             const fragment = document.createDocumentFragment();
             fragment.appendChild(subtree);
-            resetStyleCounters();
             container.appendChild(fragment);
             assertEqual(
                 `${selectorCase.name} fragment stress after insertion`,
@@ -2474,7 +2497,7 @@ function runPrecomputedDetachedInsertionStressCase(selectorCase, mode) {
         } else {
             throw new Error(`Unknown precomputed detached insertion stress mode ${mode}`);
         }
-        printPassWithCounters(`precomputed detached insertion stress ${mode}: ${selectorCase.name}`);
+        printPass(`precomputed detached insertion stress ${mode}: ${selectorCase.name}`);
     } finally {
         style.remove();
         fixture.remove();
@@ -2501,12 +2524,11 @@ function runSlotMoveCase() {
         plainShadowRoot.appendChild(document.createElement("slot"));
 
         assertEqual("slot move out initial", readProbe(subject), MATCH);
-        resetStyleCounters();
         plainHost.appendChild(subject);
         assertEqual("slot move out after mutation", readProbe(subject), BASE);
         styledHost.appendChild(subject);
         assertEqual("slot move in after mutation", readProbe(subject), MATCH);
-        printPassWithCounters("scope move: slotted shadow-host target moves between slot scopes");
+        printPass("scope move: slotted shadow-host target moves between slot scopes");
     } finally {
         fixture.remove();
         flushPendingStyleWork();
@@ -2530,10 +2552,9 @@ function runNestedSlotPartCase() {
         innerShadowRoot.appendChild(partSlot);
 
         assertEqual("nested slot part initial", readProbe(partSlot, "::before"), BASE);
-        resetStyleCounters();
         partSlot.appendChild(makeElement("span"));
         assertEqual("nested slot part after mutation", readProbe(partSlot, "::before"), MATCH);
-        printPassWithCounters("combined topology: ancestor shadow exposes part slot with generated pseudo-element");
+        printPass("combined topology: ancestor shadow exposes part slot with generated pseudo-element");
     } finally {
         fixture.remove();
         flushPendingStyleWork();

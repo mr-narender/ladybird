@@ -1,8 +1,4 @@
-@property recomputations: 2
-@property environment deltas: 0
-@property environment version unchanged: true
+@property restyled: [div.declarer, div.reference], passes: PARTIAL
 unrelated registered initial value: 0px
-CSS.registerProperty() recomputations: 2
-CSS.registerProperty() environment deltas: 0
-CSS.registerProperty() environment version unchanged: true
+CSS.registerProperty() restyled: [div, div@2], passes: PARTIAL
 unrelated API initial value: 0px

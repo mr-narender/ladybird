@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::layout::replaced_sizing::SizeWithAspectRatio;
 use crate::painting::host::{FfiLayerImageList, FfiLayerImagePaintFacts};
 use crate::painting::image_content::ImageContent;
-use crate::painting::record::paint::replaced::SizeWithAspectRatio;
 use libgfx_rust::Color;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -36,6 +36,25 @@ impl LayerImagePaintFacts {
                 .then_some(facts.single_pixel_color.value),
         }
     }
+}
+
+/// Each row's layer image paint facts. A publication shares the table, so a write copies it only
+/// while a publication still holds it.
+pub(crate) type LayerImagePaintFactsTable =
+    crate::cow_map::CowMap<crate::layout::node_data::NodeSlotId, Vec<LayerImagePaintFactsEntry>>;
+
+/// The layer image paint facts of one image layer of a row of `table`.
+pub(crate) fn layer_image_paint_facts_in(
+    table: &LayerImagePaintFactsTable,
+    id: crate::layout::node_data::NodeSlotId,
+    list: FfiLayerImageList,
+    computed_index: u32,
+) -> Option<LayerImagePaintFacts> {
+    table
+        .get(&id)?
+        .iter()
+        .find(|entry| entry.list == list && entry.computed_index == computed_index)
+        .map(|entry| entry.facts.clone())
 }
 
 #[derive(Clone, Debug, PartialEq)]

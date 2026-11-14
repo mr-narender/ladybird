@@ -17,6 +17,7 @@ const DISPLAY_INSIDE_FLOW_ROOT: u8 = display_inside::FLOW_ROOT;
 const DISPLAY_INSIDE_TABLE: u8 = display_inside::TABLE;
 const DISPLAY_INSIDE_FLEX: u8 = display_inside::FLEX;
 const DISPLAY_INSIDE_GRID: u8 = display_inside::GRID;
+const DISPLAY_INSIDE_GRID_LANES: u8 = display_inside::GRID_LANES;
 const DISPLAY_INSIDE_RUBY: u8 = display_inside::RUBY;
 const DISPLAY_INSIDE_MATH: u8 = display_inside::MATH;
 const DISPLAY_INSIDE_WEBKIT_BOX: u8 = display_inside::_WEBKIT_BOX;
@@ -164,6 +165,10 @@ impl FfiDisplay {
             }
             keyword::GRID => Self::outside_and_inside(display_outside::BLOCK, display_inside::GRID, false),
             keyword::INLINE_GRID => Self::outside_and_inside(display_outside::INLINE, display_inside::GRID, false),
+            keyword::GRID_LANES => Self::outside_and_inside(display_outside::BLOCK, display_inside::GRID_LANES, false),
+            keyword::INLINE_GRID_LANES => {
+                Self::outside_and_inside(display_outside::INLINE, display_inside::GRID_LANES, false)
+            }
             keyword::RUBY => Self::outside_and_inside(display_outside::INLINE, display_inside::RUBY, false),
             keyword::TABLE => Self::table(),
             keyword::INLINE_TABLE => Self::inline_table(),
@@ -200,7 +205,7 @@ impl FfiDisplay {
     }
 
     pub fn is_inline_outside(&self) -> bool {
-        self.is_outside_and_inside() && self.outside == DISPLAY_OUTSIDE_INLINE
+        (self.is_outside_and_inside() && self.outside == DISPLAY_OUTSIDE_INLINE) || self.is_internal_ruby()
     }
 
     pub fn is_inline_block(&self) -> bool {
@@ -211,8 +216,11 @@ impl FfiDisplay {
         self.is_outside_and_inside() && self.list_item
     }
 
+    // FIXME: Implement ruby layout. Until then a ruby container and the boxes inside it hold their contents as inline
+    //        boxes do, so bases and annotations stay in the line, one after the other.
     pub fn is_flow_inside(&self) -> bool {
-        self.is_outside_and_inside() && self.inside == DISPLAY_INSIDE_FLOW
+        (self.is_outside_and_inside() && (self.inside == DISPLAY_INSIDE_FLOW || self.inside == DISPLAY_INSIDE_RUBY))
+            || self.is_internal_ruby()
     }
 
     pub fn is_flow_root_inside(&self) -> bool {
@@ -231,8 +239,24 @@ impl FfiDisplay {
         self.is_outside_and_inside() && self.inside == DISPLAY_INSIDE_WEBKIT_BOX
     }
 
+    /// Whether this is a grid container, including a grid lanes container.
+    // https://drafts.csswg.org/css-grid-3/#grid-lanes-model
+    // A grid lanes container is a grid container whose contents participate in grid lanes layout.
     pub fn is_grid_inside(&self) -> bool {
-        self.is_outside_and_inside() && self.inside == DISPLAY_INSIDE_GRID
+        self.is_outside_and_inside() && (self.inside == DISPLAY_INSIDE_GRID || self.inside == DISPLAY_INSIDE_GRID_LANES)
+    }
+
+    pub fn is_grid_lanes_inside(&self) -> bool {
+        self.is_outside_and_inside() && self.inside == DISPLAY_INSIDE_GRID_LANES
+    }
+
+    // https://drafts.csswg.org/css-ruby-1/#ruby-display
+    pub fn is_internal_ruby(&self) -> bool {
+        self.is_internal()
+            && (self.internal == display_internal::RUBY_BASE
+                || self.internal == display_internal::RUBY_TEXT
+                || self.internal == display_internal::RUBY_BASE_CONTAINER
+                || self.internal == display_internal::RUBY_TEXT_CONTAINER)
     }
 
     pub fn is_ruby_inside(&self) -> bool {

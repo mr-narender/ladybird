@@ -1,0 +1,9 @@
+@property nobody uses: restyled [caller]
+@property a parent declares: restyled [parent, inheritor, reader, caller]
+parent: 10px
+inheritor: 3px
+CSS.registerProperty() one element reads: restyled [reader, caller]
+reader: rgb(0, 128, 0)
+@counter-style nobody uses: restyled []
+@function one element calls: restyled [caller]
+caller: 10px

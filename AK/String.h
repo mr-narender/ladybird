@@ -52,6 +52,7 @@ public:
 
     // Creates a new String using the replacement character for invalid bytes
     [[nodiscard]] static String from_utf8_with_replacement_character(StringView, WithBOMHandling = WithBOMHandling::Yes);
+    [[nodiscard]] static String from_wtf8_with_replacement_character(StringView);
 
     template<typename T>
     requires(IsOneOf<RemoveCVReference<T>, ByteString, FlyString, String>)
@@ -130,7 +131,6 @@ public:
         Lower,
     };
     [[nodiscard]] static String bijective_base_from(size_t value, Case, unsigned base = 26, Optional<StringView> map = {});
-    [[nodiscard]] static String greek_letter_from(size_t value);
     [[nodiscard]] static String roman_number_from(size_t value, Case);
 
     // Creates a new String by case-transforming this String. Using these methods require linking LibUnicode into your application.

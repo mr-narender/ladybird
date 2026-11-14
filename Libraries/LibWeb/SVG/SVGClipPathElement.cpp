@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibWeb/Layout/Node.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
+#include <LibWeb/SVG/SVGUnitTypes.h>
 
 namespace Web::SVG {
 
@@ -31,10 +32,16 @@ void SVGClipPathElement::attribute_changed(Utf16FlyString const& name, Optional<
     }
 }
 
-Layout::Node* SVGClipPathElement::create_layout_node(CSS::LayoutStyle)
+CSS::ElementBoxKind SVGClipPathElement::box_kind() const
 {
     // Clip paths are handled as a special case in the TreeBuilder.
-    return nullptr;
+    return CSS::ElementBoxKind::NoBox;
+}
+
+// https://drafts.fxtf.org/css-masking/#dom-svgclippathelement-clippathunits
+GC::Ref<SVGAnimatedEnumeration> SVGClipPathElement::clip_path_units_for_bindings()
+{
+    return svg_animated_enumeration_for_attribute(AttributeNames::clipPathUnits, svg_unit_type_keywords, to_underlying(SVGUnitType::UserSpaceOnUse));
 }
 
 }

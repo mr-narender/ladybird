@@ -5,7 +5,7 @@
  */
 
 #include <LibMedia/DemuxerRegistry.h>
-#include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
+#include <LibMediaCodecs/FFmpeg/FFmpegVideoDecoder.h>
 
 #include "TestMediaCommon.h"
 
@@ -22,16 +22,6 @@ TEST_CASE(webm_in_vp9)
 TEST_CASE(vp9_oob_blocks)
 {
     decode_video("./vp9_oob_blocks.webm"sv, 240, make_decoder);
-}
-
-BENCHMARK_CASE(vp9_4k)
-{
-    decode_video("./vp9_4k.webm"sv, 2, make_decoder);
-}
-
-BENCHMARK_CASE(vp9_clamp_reference_mvs)
-{
-    decode_video("./vp9_clamp_reference_mvs.webm"sv, 92, make_decoder);
 }
 
 TEST_CASE(input_after_the_end_of_stream_is_rejected_until_flushed)

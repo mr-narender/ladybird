@@ -4,18 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibMedia/Containers/ISOBMFF/ISOBMFFDemuxer.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/DemuxerRegistry.h>
-#include <LibMedia/FFmpeg/FFmpegDemuxer.h>
-#include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
-#include <LibMedia/FFmpeg/SystemFFmpeg.h>
 #include <LibMedia/IncrementallyPopulatedStream.h>
+#include <LibMediaCodecs/FFmpeg/FFmpegVideoDecoder.h>
+#include <LibMediaCodecs/FFmpeg/SystemFFmpeg.h>
 
 #include "TestMediaCommon.h"
 
 // H.264 is left out of the bundled FFmpeg, so these run against whatever system libavcodec decodes it.
 static Media::FFmpeg::SystemFFmpeg const* h264_library()
 {
+    Media::FFmpeg::SystemFFmpeg::load();
     auto const* library = Media::FFmpeg::SystemFFmpeg::the();
     if (library == nullptr || !library->has_decoder(Media::CodecID::H264)) {
         warnln("No system FFmpeg decodes H.264, skipping");
@@ -87,7 +88,7 @@ TEST_CASE(avc_in_mp4_with_reordered_frames)
 
     auto file = MUST(Core::File::open("./avc.mp4"sv, Core::File::OpenMode::Read));
     auto stream = Media::IncrementallyPopulatedStream::create_from_buffer(MUST(file->read_until_eof()));
-    auto demuxer = MUST(Media::FFmpeg::FFmpegDemuxer::from_stream(stream));
+    auto demuxer = MUST(Media::ISOBMFF::ISOBMFFDemuxer::from_stream(stream));
     auto optional_track = MUST(demuxer->get_preferred_track_for_type(Media::TrackType::Video));
     VERIFY(optional_track.has_value());
     auto track = optional_track.release_value();

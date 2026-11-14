@@ -9,10 +9,13 @@
 #include <AK/Optional.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCore/Promise.h>
 #include <LibGC/Heap.h>
+#include <LibGC/WeakHashSet.h>
 #include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/HTML/DecodedImageData.h>
+#include <LibWeb/HTML/PaintConfig.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/Page/QueuedInputEvent.h>
@@ -25,7 +28,8 @@ class SVGDecodedImageData final : public HTML::DecodedImageData {
 
 public:
     class SVGPageClient;
-    static ErrorOr<GC::Ref<SVGDecodedImageData>> create(GC::Ref<Page>, URL::URL const&, ReadonlyBytes encoded_svg);
+    using DecodePromise = Core::Promise<GC::Root<SVGDecodedImageData>>;
+    static NonnullRefPtr<DecodePromise> decode(GC::Ref<Page>, URL::URL const&, ReadonlyBytes encoded_svg);
     virtual ~SVGDecodedImageData() override;
 
     virtual Optional<Gfx::DecodedImageFrame> default_frame(Gfx::IntSize = {}) const override;
@@ -38,7 +42,7 @@ public:
 
     virtual Optional<Compositing::DisplayListResource> record_display_list(Gfx::IntSize, CSS::PreferredColorScheme, Compositing::DisplayListResourceStorage&) const override;
     // Lays the inner document out at the CSS size and records at css × raster_scale resolution.
-    Optional<Compositing::DisplayListResource> record_display_list_at_scale(CSSPixelSize css_size, float raster_scale, CSS::PreferredColorScheme, Compositing::DisplayListResourceStorage&) const;
+    Optional<Compositing::DisplayListResource> record_display_list_at_scale(CSSPixelSize css_size, float raster_scale, CSS::PreferredColorScheme, HTML::PaintConfig const&, Compositing::DisplayListResourceStorage&) const;
 
     // FIXME: Support SVG animations. :^)
     DOM::Document const& svg_document() const { return *m_document; }
@@ -55,10 +59,12 @@ public:
     CSS::PreferredColorScheme color_scheme() const { return m_color_scheme; }
 
 private:
+    static GC::Ref<SVGDecodedImageData> create(GC::Ref<Page>, GC::Ref<SVGPageClient>, GC::Ref<DOM::Document>, GC::Ref<SVG::SVGSVGElement>);
     SVGDecodedImageData(GC::Ref<Page>, GC::Ref<SVGPageClient>, GC::Ref<DOM::Document>, GC::Ref<SVG::SVGSVGElement>);
 
     CSS::SizeWithAspectRatio const& natural_size() const;
-    RefPtr<Gfx::PaintingSurface> render_to_surface(Gfx::IntSize) const;
+    Compositor::CompositorHost* host_compositor() const;
+    RefPtr<Gfx::Bitmap> render_frame(Gfx::IntSize) const;
     void prune_cached_display_list_resources() const;
     void append_cached_display_list_resources(Compositing::DisplayListResourceSet&) const;
     void append_paint_command_cache_source_resources(Compositing::DisplayListResourceSet&) const;
@@ -66,11 +72,9 @@ private:
     void invalidate_cached_rendering();
     static u64 next_vector_content_identity();
 
-    // FIXME: Remove this once everything is using surfaces instead.
     mutable HashMap<Gfx::IntSize, Gfx::DecodedImageFrame> m_cached_rendered_frames;
 
     mutable CSS::PreferredColorScheme m_color_scheme { CSS::PreferredColorScheme::Auto };
-    mutable HashMap<Gfx::IntSize, NonnullRefPtr<Gfx::PaintingSurface>> m_cached_rendered_surfaces;
 
     struct CachedDisplayList {
         NonnullRefPtr<Compositing::DisplayList> display_list;
@@ -85,13 +89,17 @@ private:
         CSSPixelSize css_size;
         float raster_scale { 1 };
         CSS::PreferredColorScheme color_scheme;
+        HTML::PaintConfig paint_config;
         bool operator==(RenderKey const&) const = default;
     };
     struct RenderKeyTraits : public Traits<RenderKey> {
         static unsigned hash(RenderKey const& key)
         {
             auto size_hash = pair_int_hash(key.css_size.width().raw_value(), key.css_size.height().raw_value());
-            return pair_int_hash(pair_int_hash(size_hash, bit_cast<u32>(key.raster_scale)), to_underlying(key.color_scheme));
+            auto hash = pair_int_hash(pair_int_hash(size_hash, bit_cast<u32>(key.raster_scale)), to_underlying(key.color_scheme));
+            if (!key.paint_config.force_dark_enabled)
+                return hash;
+            return pair_int_hash(hash, pair_int_hash(key.paint_config.force_dark_foreground_threshold, key.paint_config.force_dark_background_threshold));
         }
         static bool equals(RenderKey const& a, RenderKey const& b) { return a == b; }
     };
@@ -112,6 +120,8 @@ private:
 class SVGDecodedImageData::SVGPageClient final : public PageClient {
     GC_CELL(SVGDecodedImageData::SVGPageClient, PageClient);
     GC_DECLARE_ALLOCATOR(SVGDecodedImageData::SVGPageClient);
+
+    friend class ScopedSVGImageDocument;
 
 public:
     static GC::Ref<SVGPageClient> create(Page& page)
@@ -144,8 +154,13 @@ public:
     virtual Queue<QueuedInputEvent>& input_event_queue() override { VERIFY_NOT_REACHED(); }
     virtual void report_finished_handling_input_event([[maybe_unused]] Web::PageId page_id, [[maybe_unused]] u64 event_id, [[maybe_unused]] EventResult event_was_handled) override { }
     virtual void request_frame() override;
+    virtual void request_frame_for(DOM::Document const&) override;
 
     virtual bool is_headless() const override { return m_host_page->client().is_headless(); }
+    virtual NonnullRefPtr<Media::AudioOutputFactory> create_audio_output_factory() override;
+    virtual NonnullOwnPtr<MediaClient::RemotePlaybackManager> create_media_playback_manager() override;
+    virtual void rebind_media_playback_manager(MediaClient::RemotePlaybackManager&) override;
+    virtual NonnullRefPtr<Core::Promise<NonnullRefPtr<Audio::RecordStream>>> create_audio_record_stream(StringView device_id, Function<void(ReadonlyBytes, Audio::SampleSpecification const&)>) override;
 
     void register_svg_image_data(SVGDecodedImageData&);
     void prune_cached_display_list_resources() const;
@@ -181,4 +196,32 @@ private:
     mutable bool m_has_pending_display_list_resource_prune { false };
 };
 
+class WEB_API ScopedSVGImageDocument {
+    AK_MAKE_NONCOPYABLE(ScopedSVGImageDocument);
+
+public:
+    enum class FrameRequests : u8 {
+        Suppress,
+        RouteToCurrentImage
+    };
+
+    ScopedSVGImageDocument(DOM::Document&, FrameRequests);
+    ScopedSVGImageDocument(ScopedSVGImageDocument&&);
+    ~ScopedSVGImageDocument();
+
+    [[nodiscard]] static Optional<ScopedSVGImageDocument> create_if_needed(GC::Ptr<DOM::Document const>, FrameRequests);
+
+private:
+    GC::Ref<SVGDecodedImageData::SVGPageClient> m_page_client;
+    GC::Ref<HTML::LocalNavigable> m_navigable;
+    GC::Ref<HTML::Window> m_window;
+    GC::Ref<DOM::Document> m_previous_document;
+    GC::Weak<SVGDecodedImageData> m_previous_current_image_data;
+    bool m_should_unsuppress_frame_requests { false };
+    bool m_is_active { true };
+};
+
 }
+
+// NB: The promise resolves to a root, and keeps the callbacks of whoever waits for it.
+GC_UNTRACED_CAPTURE_WITH_ROOTED_CALLBACKS(Web::SVG::SVGDecodedImageData::DecodePromise);

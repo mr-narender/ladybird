@@ -7,9 +7,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibGfx/Matrix4x4.h>
+#include <AK/AllOf.h>
 #include <LibWeb/Bindings/SVGGraphicsElement.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/Geometry/DOMMatrix.h>
@@ -17,18 +18,15 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Loader/LoaderConfig.h>
+#include <LibWeb/Namespace.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/AttributeParsing.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
-#include <LibWeb/SVG/SVGClipPathElement.h>
-#include <LibWeb/SVG/SVGGradientElement.h>
 #include <LibWeb/SVG/SVGGraphicsElement.h>
-#include <LibWeb/SVG/SVGMaskElement.h>
-#include <LibWeb/SVG/SVGPatternElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
-#include <LibWeb/SVG/SVGSymbolElement.h>
 #include <LibWeb/WebIDL/DOMException.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
@@ -39,11 +37,116 @@ SVGGraphicsElement::SVGGraphicsElement(DOM::Document& document, DOM::QualifiedNa
 {
 }
 
-GC::Ptr<DOM::Element> SVGGraphicsElement::paint_server_element(Optional<CSS::SVGPaint> const& paint_value) const
+void SVGGraphicsElement::visit_edges(Cell::Visitor& visitor)
 {
-    if (!paint_value.has_value() || !paint_value->is_url())
-        return {};
-    return resolve_url_to_element(paint_value->as_url());
+    Base::visit_edges(visitor);
+    visitor.visit(m_required_extensions);
+    visitor.visit(m_system_language);
+    visitor.visit(m_transform);
+}
+
+void SVGGraphicsElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
+{
+    Base::attribute_changed(name, old_value, value, namespace_);
+
+    // https://svgwg.org/svg2-draft/types.html#SynchronizingReflectedValues
+    // Whenever a reflected content attribute's base value changes, then the reflecting object must be synchronized,
+    // immediately after the value changed.
+    if (namespace_.has_value())
+        return;
+    if (name == AttributeNames::requiredExtensions || name == AttributeNames::systemLanguage) {
+        if (name == AttributeNames::requiredExtensions && m_required_extensions)
+            m_required_extensions->synchronize();
+        else if (name == AttributeNames::systemLanguage && m_system_language)
+            m_system_language->synchronize();
+
+        // NB: Whether the conditional processing attributes evaluate to true decides whether the element has a box.
+        CSS::record_element_box_kind(*this);
+        set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::StyleChange);
+        return;
+    }
+    if (name == AttributeNames::transform && m_transform)
+        m_transform->synchronize();
+}
+
+// https://svgwg.org/svg2-draft/struct.html#ConditionalProcessingRequiredExtensionsAttribute
+static bool required_extensions_evaluate_to_true(Utf16View value)
+{
+    // The value is a list of URL references which identify the required extensions, with the individual values
+    // separated by white space. Determines whether all of the named extensions are supported by the user agent. If all
+    // of the given extensions are supported, then the attribute evaluates to true; otherwise, the current element and
+    // its children are skipped and thus will not be rendered.
+    // If a null string or empty string value is given to attribute ‘requiredExtensions’, the attribute evaluates to
+    // "false".
+    auto extensions = SVGStringList::parse(value, SVGStringList::Separator::Whitespace);
+    if (extensions.is_empty())
+        return false;
+
+    // INTEROP: Other browsers treat the HTML and MathML namespaces as supported extensions, since their content can be
+    //          embedded with foreignObject.
+    return all_of(extensions, [](auto const& extension) {
+        return extension == Namespace::HTML || extension == Namespace::MathML;
+    });
+}
+
+// https://svgwg.org/svg2-draft/struct.html#ConditionalProcessingSystemLanguageAttribute
+static bool system_language_evaluates_to_true(Utf16View value)
+{
+    // If a null string or empty string value is given to attribute ‘systemLanguage’, the attribute evaluates to
+    // "false".
+    if (value.is_empty())
+        return false;
+
+    // Evaluates to "true" if one of the language tags indicated by user preferences is a case-insensitive match of one
+    // of the language tags given in the value of this parameter, or if one of the language tags indicated by user
+    // preferences is a case-insensitive prefix of one of the language tags given in the value of this parameter such
+    // that the first tag character following the prefix is "-".
+    auto language_tags = SVGStringList::parse(value, SVGStringList::Separator::Comma);
+    auto loader_config = current_loader_config();
+    for (auto const& preferred_language : loader_config->config.preferred_languages) {
+        auto preferred_tag = Utf16String::from_utf8(preferred_language);
+        for (auto const& language_tag : language_tags) {
+            if (language_tag.equals_ignoring_ascii_case(preferred_tag))
+                return true;
+            if (language_tag.length_in_code_units() > preferred_tag.length_in_code_units()
+                && language_tag.code_unit_at(preferred_tag.length_in_code_units()) == '-'
+                && language_tag.utf16_view().substring_view(0, preferred_tag.length_in_code_units()).equals_ignoring_ascii_case(preferred_tag))
+                return true;
+        }
+    }
+
+    // Evaluates to "false" otherwise.
+    return false;
+}
+
+bool SVGGraphicsElement::conditional_processing_attributes_evaluate_to_true() const
+{
+    // If the attribute is not present, then it implicitly evaluates to "true".
+    if (auto required_extensions = attribute(AttributeNames::requiredExtensions); required_extensions.has_value() && !required_extensions_evaluate_to_true(*required_extensions))
+        return false;
+    if (auto system_language = attribute(AttributeNames::systemLanguage); system_language.has_value() && !system_language_evaluates_to_true(*system_language))
+        return false;
+    return true;
+}
+
+// https://svgwg.org/svg2-draft/types.html#__svg__SVGTests__requiredExtensions
+GC::Ref<SVGStringList> SVGGraphicsElement::required_extensions_for_bindings()
+{
+    // The requiredExtensions IDL attribute reflects the ‘requiredExtensions’ content attribute.
+    // NB: The attribute's value is a set of space-separated tokens.
+    if (!m_required_extensions)
+        m_required_extensions = SVGStringList::create(*this, AttributeNames::requiredExtensions, SVGStringList::Separator::Whitespace);
+    return *m_required_extensions;
+}
+
+// https://svgwg.org/svg2-draft/types.html#__svg__SVGTests__systemLanguage
+GC::Ref<SVGStringList> SVGGraphicsElement::system_language_for_bindings()
+{
+    // The systemLanguage IDL attribute reflects the ‘systemLanguage’ content attribute.
+    // NB: The attribute's value is a set of comma-separated tokens.
+    if (!m_system_language)
+        m_system_language = SVGStringList::create(*this, AttributeNames::systemLanguage, SVGStringList::Separator::Comma);
+    return *m_system_language;
 }
 
 GC::Ptr<DOM::Element> SVGGraphicsElement::resolve_url_to_element(CSS::URL const& url) const
@@ -55,14 +158,6 @@ GC::Ptr<DOM::Element> SVGGraphicsElement::resolve_url_to_element(CSS::URL const&
     }
 
     return {};
-}
-
-GC::Ptr<DOM::Element> SVGGraphicsElement::resolve_url_to_element(Utf16String const& url_string) const
-{
-    auto url = document().encoding_parse_url(url_string);
-    if (!url.has_value() || !url->fragment().has_value())
-        return {};
-    return resolve_fragment_identifier_to_element(decode_fragment_identifier(*url->fragment()));
 }
 
 GC::Ptr<DOM::Element> SVGGraphicsElement::resolve_fragment_identifier_to_element(Utf16String const& fragment) const
@@ -77,38 +172,6 @@ GC::Ptr<DOM::Element> SVGGraphicsElement::resolve_fragment_identifier_to_element
     }
 
     return {};
-}
-
-GC::Ptr<SVG::SVGMaskElement const> SVGGraphicsElement::mask(Layout::NodeWithStyle const& layout_node) const
-{
-    auto const& mask_reference = layout_node.mask();
-    if (!mask_reference.has_value())
-        return {};
-    return try_resolve_url_to<SVG::SVGMaskElement const>(mask_reference->url());
-}
-
-GC::Ptr<SVG::SVGClipPathElement const> SVGGraphicsElement::clip_path(Layout::NodeWithStyle const& layout_node) const
-{
-    auto const& clip_path = layout_node.clip_path();
-    if (!clip_path.has_value())
-        return {};
-    return try_resolve_url_to<SVG::SVGClipPathElement const>(*clip_path);
-}
-
-GC::Ptr<SVG::SVGPatternElement const> SVGGraphicsElement::fill_pattern(Layout::NodeWithStyle const& layout_node) const
-{
-    auto fill = layout_node.fill();
-    if (!fill.has_value() || !fill->is_url())
-        return {};
-    return try_resolve_url_to<SVG::SVGPatternElement const>(fill->as_url());
-}
-
-GC::Ptr<SVG::SVGPatternElement const> SVGGraphicsElement::stroke_pattern(Layout::NodeWithStyle const& layout_node) const
-{
-    auto stroke = layout_node.stroke();
-    if (!stroke.has_value() || !stroke->is_url())
-        return {};
-    return try_resolve_url_to<SVG::SVGPatternElement const>(stroke->as_url());
 }
 
 Gfx::AffineTransform transform_from_transform_list(ReadonlySpan<Transform> transform_list)
@@ -144,71 +207,6 @@ Gfx::AffineTransform transform_from_transform_list(ReadonlySpan<Transform> trans
     return affine_transform;
 }
 
-Optional<Gfx::Color> SVGGraphicsElement::stroke_color(Layout::NodeWithStyle const& layout_node) const
-{
-    auto paint = layout_node.stroke();
-    if (!paint.has_value())
-        return {};
-
-    if (paint->is_url())
-        return paint->fallback_color();
-
-    return paint->as_color();
-}
-
-float SVGGraphicsElement::visible_stroke_width(Layout::NodeWithStyle const& layout_node) const
-{
-    // NB: CSS geometry-effect metadata relies on this reading only stroke color and width.
-    //     If SVG bounds begin accounting for caps, joins, miter limits, or stroke opacity,
-    //     mark those properties as affecting layout geometry as well.
-    if (auto color = stroke_color(layout_node); color.has_value() && color->alpha() > 0)
-        return stroke_width(layout_node).value_or(0);
-    return 0;
-}
-
-CSSPixels SVGGraphicsElement::viewport_percentage_basis() const
-{
-    // Resolved relative to the "Scaled viewport size": https://www.w3.org/TR/2017/WD-fill-stroke-3-20170413/#scaled-viewport-size
-    // FIXME: The spec formula is the normalized diagonal sqrt((width² + height²) / 2); this keeps
-    //        the historical (width + height) / 2 approximation.
-    // NB: Resolution happens during layout, so only the viewBox and computed style are available,
-    //     not committed viewport geometry.
-    CSSPixels viewport_width = 0;
-    CSSPixels viewport_height = 0;
-    auto resolve_viewport_size_from = [&](SVGElement const& viewport_element, Optional<ViewBox> const& view_box) {
-        if (view_box.has_value()) {
-            viewport_width = CSSPixels::nearest_value_for(view_box->width);
-            viewport_height = CSSPixels::nearest_value_for(view_box->height);
-        } else if (auto viewport_layout_node = viewport_element.unsafe_layout_node()) {
-            viewport_width = viewport_layout_node->width().to_px(0);
-            viewport_height = viewport_layout_node->height().to_px(0);
-        }
-    };
-    // <symbol> instances establish nested viewports; percentages inside one resolve against it,
-    // not the enclosing <svg>.
-    for (auto* ancestor = first_flat_tree_ancestor_of_type<SVGElement>(); ancestor; ancestor = ancestor->first_flat_tree_ancestor_of_type<SVGElement>()) {
-        if (auto* svg_svg_element = as_if<SVGSVGElement>(*ancestor)) {
-            resolve_viewport_size_from(*svg_svg_element, svg_svg_element->active_view_box());
-            break;
-        }
-        if (auto* symbol_element = as_if<SVGSymbolElement>(*ancestor)) {
-            resolve_viewport_size_from(*symbol_element, symbol_element->view_box());
-            break;
-        }
-    }
-    return (viewport_width + viewport_height) * CSSPixels(0.5);
-}
-
-float SVGGraphicsElement::resolve_relative_to_viewport_size(CSS::LengthPercentage const& length_percentage) const
-{
-    return length_percentage.to_px(viewport_percentage_basis()).to_double();
-}
-
-Optional<float> SVGGraphicsElement::stroke_width(Layout::NodeWithStyle const& layout_node) const
-{
-    return resolve_relative_to_viewport_size(layout_node.stroke_width());
-}
-
 // https://svgwg.org/svg2-draft/types.html#__svg__SVGGraphicsElement__getBBox
 WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGGraphicsElement::get_b_box(Bindings::SVGBoundingBoxOptions const&)
 {
@@ -224,71 +222,54 @@ WebIDL::ExceptionOr<GC::Ref<Geometry::DOMRect>> SVGGraphicsElement::get_b_box(Bi
     //        SVG coordinate space (before any viewbox or other transformations), so it should be possible to
     //        calculate this from SVG geometry without a full layout tree (at least for simple cases).
     //        See: https://svgwg.org/svg2-draft/coords.html#BoundingBoxes
+    Layout::ForcedReadScope read { document() };
     document().update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::SVGGraphicsElementGetBBox);
-    auto const* self_layout_node = layout_node();
+    auto const* self_layout_node = layout_node(read);
     if (!self_layout_node)
         return Geometry::DOMRect::create();
+
     auto owner_svg_element = this->owner_svg_element();
-
-    // The outermost svg element has no ancestor svg element to measure against; per the bounding box
-    // algorithm its bounding box is the union of its children's bounding boxes in its own user
-    // coordinate system, with each child's own transforms kept.
-    if (!owner_svg_element) {
-        if (!is<SVGSVGElement>(*this))
-            return Geometry::DOMRect::create();
-        if (!Painting::has_committed_box(*self_layout_node))
-            return Geometry::DOMRect::create();
-        Gfx::FloatRect united_rect;
-        for (auto const* child = self_layout_node->first_child_ptr(); child; child = child->next_sibling_ptr()) {
-            switch (child->kind()) {
-            case Layout::RustFFI::NodeKind::SVGMaskBox:
-            case Layout::RustFFI::NodeKind::SVGClipBox:
-            case Layout::RustFFI::NodeKind::SVGPatternBox:
-                continue;
-            default:
-                break;
-            }
-            if (!Painting::has_committed_box(*child))
-                continue;
-            auto child_rect = as<Layout::NodeWithStyle>(*child).used_svg_element_transform().map(Painting::absolute_rect(*child).to_type<float>());
-            united_rect.unite(child_rect);
+    if (owner_svg_element) {
+        auto const* owner_layout_node = owner_svg_element->layout_node(read);
+        if (!owner_layout_node || !Painting::has_committed_box(*owner_layout_node) || !Painting::has_committed_box(*self_layout_node)) {
+            // Throw only for non-rendered *graphics* elements where geometry isn't computable
+            // (e.g. elements inside <marker>, <pattern>, etc.).
+            if (is<SVGSVGElement>(*this))
+                return Geometry::DOMRect::create();
+            return WebIDL::InvalidStateError::create(
+                HTML::relevant_realm(*this),
+                "Element is not rendered and geometry is not computable"_utf16);
         }
-        if (united_rect.is_empty())
-            return Geometry::DOMRect::create();
-        return Geometry::DOMRect::create(united_rect);
-    }
-
-    auto const* owner_layout_node = owner_svg_element->layout_node();
-    if (!owner_layout_node || !Painting::has_committed_box(*owner_layout_node) || !Painting::has_committed_box(*self_layout_node)) {
-        // Throw only for non-rendered *graphics* elements where geometry isn't computable
-        // (e.g. elements inside <marker>, <pattern>, etc.).
-        if (is<SVGSVGElement>(*this))
-            return Geometry::DOMRect::create();
-        return WebIDL::InvalidStateError::create(
-            HTML::relevant_realm(*this),
-            "Element is not rendered and geometry is not computable"_utf16);
-    }
-
-    // A path-like element's bounding box covers its geometry alone; the committed content rect is
-    // inflated by the visible stroke width, so take the unstroked path bounds directly.
-    if (auto const* committed_path = Painting::committed_svg_path(*self_layout_node))
-        return Geometry::DOMRect::create(committed_path->bounding_box());
-
-    auto rect = Painting::absolute_rect(*self_layout_node).to_type<float>();
-    // An element with a non-positive geometry dimension is not rendered and
-    // therefore contributes an empty bounding box, regardless of its
-    // positioning rectangle's origin.
-    if (rect.width() <= 0 || rect.height() <= 0)
+    } else if (!is<SVGSVGElement>(*this)) {
         return Geometry::DOMRect::create();
-    return Geometry::DOMRect::create(rect);
+    }
+
+    // https://svgwg.org/svg2-draft/coords.html#BoundingBoxes
+    // NB: Layout commits each element's object bounding box in its user coordinate system: a shape's path, the glyph
+    //     cells of text, and for a container, including the outermost svg element, the union of its children's, each
+    //     through the child's own transform. A foreign object's box comes from a layout of its own, which commits no SVG
+    //     geometry; the box is its bounding box.
+    auto geometry = Painting::svg_geometry(*self_layout_node);
+    if (!geometry.has_value() && !owner_svg_element)
+        return Geometry::DOMRect::create();
+    auto bounding_box = geometry.has_value() ? geometry->object_bounding_box : Painting::absolute_rect(*self_layout_node).to_type<float>();
+    // An element other than a shape or a container with a non-positive geometry dimension is not rendered and
+    // therefore contributes an empty bounding box, regardless of its positioning rectangle's origin.
+    auto kind = self_layout_node->kind();
+    if (kind != Layout::RustFFI::NodeKind::SVGGeometryBox && kind != Layout::RustFFI::NodeKind::SVGGraphicsBox && bounding_box.is_empty())
+        return Geometry::DOMRect::create();
+    return Geometry::DOMRect::create(bounding_box);
 }
 
-GC::Ref<SVGAnimatedTransformList> SVGGraphicsElement::transform() const
+// https://svgwg.org/svg2-draft/types.html#__svg__SVGGraphicsElement__transform
+GC::Ref<SVGAnimatedTransformList> SVGGraphicsElement::transform()
 {
-    dbgln("(STUBBED) SVGGraphicsElement::transform(). Called on: {}", debug_description());
-    auto base_val = SVGTransformList::create(ReadOnlyList::Yes);
-    auto anim_val = SVGTransformList::create(ReadOnlyList::Yes);
-    return SVGAnimatedTransformList::create(base_val, anim_val);
+    // The transform IDL attribute reflects the computed value of the transform property and its corresponding
+    // ‘transform’ presentation attribute.
+    // FIXME: Reflect the computed value of the transform property rather than only the presentation attribute.
+    if (!m_transform)
+        m_transform = SVGAnimatedTransformList::create(*this, AttributeNames::transform);
+    return *m_transform;
 }
 
 // https://svgwg.org/svg2-draft/types.html#__svg__SVGGraphicsElement__getScreenCTM
@@ -298,6 +279,7 @@ GC::Ptr<Geometry::DOMMatrix> SVGGraphicsElement::get_screen_ctm()
     if (!is_connected())
         return {};
 
+    Layout::ForcedReadScope read { document() };
     document().update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::SVGGraphicsElementGetScreenCTM);
 
     // 2. If the current element is a non-rendered element, and the UA is not able to resolve the style of the element,
@@ -305,7 +287,7 @@ GC::Ptr<Geometry::DOMMatrix> SVGGraphicsElement::get_screen_ctm()
     //
     // NB: We currently require committed box data connected to the document's visual-context tree to compute this matrix.
     //     This also excludes geometry in resource-only subtrees such as masks, clip paths, and patterns.
-    auto const* layout_node = this->layout_node();
+    auto const* layout_node = this->layout_node(read);
     if (!layout_node || !Painting::has_committed_box(*layout_node) || !document().has_committed_viewport_box())
         return {};
 
@@ -322,10 +304,8 @@ GC::Ptr<Geometry::DOMMatrix> SVGGraphicsElement::get_screen_ctm()
     auto visual_context = Painting::svg_viewport_transform(*layout_node).has_value()
         ? Painting::accumulated_visual_context_for_descendants(*layout_node)
         : Painting::accumulated_visual_context(*layout_node);
-    auto ctm = visual_context_tree.accumulated_matrix(
-        visual_context.spatial,
-        document().scroll_state_snapshot(),
-        Compositing::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No);
+    Gfx::FloatMatrix4x4 ctm;
+    Layout::RustFFI::viewport_mapping_matrix_to_viewport(Painting::viewport_mapping(document(), visual_context_tree), visual_context.spatial, Layout::RustFFI::ViewportSpace::LayoutViewport, &ctm);
 
     // NB: Accumulated visual-context matrices operate in device-pixel space. Conjugate the matrix by the device scale
     //     to expose CSS-pixel coordinates through the DOM API, then project any 3D transform onto the SVG plane.
@@ -339,10 +319,69 @@ GC::Ptr<Geometry::DOMMatrix> SVGGraphicsElement::get_screen_ctm()
     return Geometry::DOMMatrix::create(ctm);
 }
 
+// https://svgwg.org/svg2-draft/types.html#__svg__SVGGraphicsElement__getCTM
 GC::Ptr<Geometry::DOMMatrix> SVGGraphicsElement::get_ctm()
 {
-    dbgln("(STUBBED) SVGGraphicsElement::get_ctm(). Called on: {}", debug_description());
-    return Geometry::DOMMatrix::create();
+    // 1. If the current element is not in the document, then return null.
+    if (!is_connected())
+        return {};
+
+    Layout::ForcedReadScope read { document() };
+    document().update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::SVGGraphicsElementGetCTM);
+
+    // 2. If the current element is a non-rendered element, and the UA is not able to resolve the style of the element,
+    //    then return null.
+    // NB: We require committed box data for the current element and each of its ancestors up to the element ctm
+    //     transforms to, which also excludes geometry in resource-only subtrees such as masks, clip paths, and patterns.
+    auto const* layout_node = this->layout_node(read);
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
+        return {};
+
+    // 3. Let ctm be a matrix determined based on what the current element is:
+    // -> the current element is the outermost svg element
+    //    ctm is a matrix that transforms the coordinate space of the ‘svg’ (including its transform property) to the
+    //    coordinate space of the document's viewport. The matrix includes the transforms produced by the ‘viewBox’ and
+    //    ‘preserveAspectRatio’ attributes, the transform property, and any transform due to currentScale and
+    //    currentTranslate properties on the SVGSVGElement.
+    // AD-HOC: Like Blink and WebKit, transform to the coordinate space of the svg element's SVG viewport instead, which
+    //         leaves only the transform produced by the viewBox and preserveAspectRatio attributes. Gecko returns null.
+    // -> any other element
+    //    ctm is a matrix that transforms the coordinate space of the current element (including its transform property)
+    //    to the coordinate space of its closest ancestor viewport-establishing element (also including its transform
+    //    property).
+    // NB: Like Blink and WebKit, the coordinate space of an svg element includes the transforms produced by its position
+    //     and its viewBox attribute.
+    auto outermost_svg_element = this->outermost_svg_element();
+    GC::Ptr<DOM::Node const> target = this;
+    if (outermost_svg_element.ptr() != this)
+        target = viewport_element();
+    if (!target)
+        return {};
+
+    Gfx::AffineTransform ctm;
+    for (auto const* node = layout_node;; node = node->parent()) {
+        if (!node || !Painting::has_committed_box(*node))
+            return {};
+
+        Gfx::AffineTransform local_transform;
+        auto viewport_transform = Painting::svg_viewport_transform(*node);
+        if (node->dom_node() == outermost_svg_element.ptr()) {
+            local_transform = viewport_transform.value_or({});
+        } else {
+            local_transform = Painting::svg_element_transform(*node);
+            if (viewport_transform.has_value()) {
+                local_transform.translate(Painting::absolute_rect(*node).location().to_type<float>());
+                local_transform.multiply(*viewport_transform);
+            }
+        }
+        ctm = local_transform.multiply(ctm);
+
+        if (node->dom_node() == target.ptr())
+            break;
+    }
+
+    // 4. Return a newly created, detached DOMMatrix object that represents the same matrix as ctm.
+    return Geometry::DOMMatrix::create(ctm.to_matrix());
 }
 
 }

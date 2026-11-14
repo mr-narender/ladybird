@@ -6,45 +6,59 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Platform.h>
+#include <AK/AnyOf.h>
+#include <AK/GenericShorthands.h>
 #include <AK/kmalloc.h>
 #include <LibWebView/Autocomplete.h>
 #include <UI/Qt/Autocomplete.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/StringUtils.h>
+#include <UI/Qt/Theme.h>
 
 #include <QAbstractListModel>
 #include <QApplication>
+#include <QColor>
 #include <QEvent>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QIcon>
 #include <QKeyEvent>
+#include <QLayout>
 #include <QLineEdit>
 #include <QListView>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
-#include <QPixmap>
 #include <QPoint>
+#include <QStyle>
+#include <QStyleOption>
 #include <QStyledItemDelegate>
 #include <QTextLayout>
 #include <QTimer>
-#include <QVBoxLayout>
-#include <QWindow>
 
 namespace Ladybird {
 
-static constexpr int POPUP_PADDING = 8;
-static constexpr int CELL_HORIZONTAL_PADDING = 12;
-static constexpr int CELL_VERTICAL_PADDING = 8;
-static constexpr int CELL_ICON_SIZE = 20;
-static constexpr int CELL_ICON_TEXT_SPACING = 10;
-static constexpr int CELL_LABEL_VERTICAL_SPACING = 4;
-static constexpr int MINIMUM_POPUP_WIDTH = 100;
-static constexpr size_t MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS = 6;
-static constexpr u32 WAYLAND_POPUP_CONSTRAINT_ADJUSTMENT_NONE = 0;
+// The suggestions are listed in the address field's surface, below the field, with this much room around them. The
+// surface also draws the line between the field and the list, which is this tall.
+static constexpr int LIST_PADDING = 6;
+static constexpr int FIELD_DIVIDER_HEIGHT = 1;
+static constexpr int ROW_HEIGHT = 34;
+// NB: The radius nests in the corner of the surface the rows are listed in.
+static constexpr int ROW_CORNER_RADIUS = 4;
+// NB: With the list's 3 px inset, a row's icon and title start 10 px and 36 px in from the surface's edge, on the same
+//     columns as the address field's icon and text.
+static constexpr int CELL_LEADING_PADDING = 7;
+static constexpr int CELL_ICON_TITLE_SPACING = 10;
+static constexpr int CELL_TRAILING_PADDING = 12;
+static constexpr int CELL_ICON_SIZE = 16;
+static constexpr int CELL_SPACING = 12;
+// Search suggestions are set apart from pages by a line, with this much room above and below it.
+static constexpr int GROUP_SEPARATOR_MARGIN = 5;
+static constexpr int GROUP_SEPARATOR_INSET = 8;
+static constexpr int GROUP_SEPARATOR_HEIGHT = (2 * GROUP_SEPARATOR_MARGIN) + 1;
+
+static constexpr size_t MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS = 8;
 
 enum AutocompleteRole {
     TitleRole = Qt::UserRole + 1,
@@ -54,38 +68,50 @@ enum AutocompleteRole {
     SourceRole,
     SuggestionIndexRole,
     HighlightInputRole,
+    StartsGroupRole,
 };
 
-static QFont autocomplete_primary_font()
+static QFont autocomplete_title_font()
 {
     QFont font = QApplication::font();
-    if (font.pointSizeF() > 0)
-        font.setPointSizeF(font.pointSizeF() + 1.5);
+    font.setPixelSize(13);
     font.setWeight(QFont::Normal);
     return font;
 }
 
-static void draw_autocomplete_text(QPainter& painter, QRect const& rect, QString const& text, QString const& highlight_input, QFont font, QColor color, QColor match_color, bool emphasize_origin = false)
+static QFont autocomplete_detail_font()
+{
+    QFont font = QApplication::font();
+    font.setPixelSize(12);
+    return font;
+}
+
+static void draw_autocomplete_text(QPainter& painter, QRect const& rect, QString const& text, QString const& highlight_input, QFont font, QColor color)
 {
     QFontMetrics font_metrics(font);
-    auto elided_text = font_metrics.elidedText(text, Qt::ElideRight, rect.width());
     auto input = ak_string_from_qstring(highlight_input);
+    // NB: Most of a matching suggestion is drawn in demibold. Elide at the heavier weight, or the end of the text and
+    //     its ellipsis would not fit in the rect.
+    auto elision_font = font;
+    if (!WebView::autocomplete_match_ranges(input, ak_string_from_qstring(text)).is_empty())
+        elision_font.setWeight(QFont::DemiBold);
+    auto elided_text = QFontMetrics(elision_font).elidedText(text, Qt::ElideRight, rect.width());
     auto displayed_text = ak_string_from_qstring(elided_text);
 
     QList<QTextLayout::FormatRange> formats;
-    if (emphasize_origin) {
-        auto slash = elided_text.indexOf('/');
+    // The text you typed is drawn at the regular weight, and the rest of the suggestion stands out in demibold.
+    auto match_ranges = WebView::autocomplete_match_ranges(input, displayed_text);
+    if (!match_ranges.is_empty()) {
         QTextCharFormat format;
-        format.setFontWeight(QFont::Medium);
-        formats.append({ 0, static_cast<int>(slash < 0 ? elided_text.length() : slash), move(format) });
+        format.setFontWeight(QFont::DemiBold);
+        formats.append({ 0, static_cast<int>(elided_text.length()), move(format) });
     }
-    for (auto const& range : WebView::autocomplete_match_ranges(input, displayed_text)) {
+    for (auto const& range : match_ranges) {
         auto bytes = displayed_text.bytes_as_string_view();
         auto prefix = qstring_from_ak_string(MUST(String::from_utf8(bytes.substring_view(0, range.start))));
         auto match = qstring_from_ak_string(MUST(String::from_utf8(bytes.substring_view(range.start, range.length))));
         QTextCharFormat format;
-        format.setFontWeight(QFont::Bold);
-        format.setForeground(match_color);
+        format.setFontWeight(QFont::Normal);
         formats.append({ static_cast<int>(prefix.length()), static_cast<int>(match.length()), move(format) });
     }
 
@@ -97,30 +123,6 @@ static void draw_autocomplete_text(QPainter& painter, QRect const& rect, QString
     layout.endLayout();
     painter.setPen(color);
     layout.draw(&painter, QPointF(rect.left(), rect.top() + (rect.height() - font_metrics.height()) / 2), {}, rect);
-}
-
-static QFont autocomplete_secondary_font()
-{
-    return QApplication::font();
-}
-
-static bool autocomplete_color_is_dark(QColor const& color)
-{
-    return color.lightness() < 128;
-}
-
-static QColor autocomplete_selection_fill(QPalette const& palette)
-{
-    auto text = ChromeStyle::chrome_text(palette);
-    if (!autocomplete_color_is_dark(text))
-        return ChromeStyle::mix(ChromeStyle::chrome_surface_pressed(palette), text, 0.06);
-
-    auto surface = palette.color(QPalette::Base);
-    if (autocomplete_color_is_dark(surface))
-        surface = palette.color(QPalette::Window);
-    if (autocomplete_color_is_dark(surface))
-        surface = QColor(255, 255, 255);
-    return ChromeStyle::mix(surface, QColor(0, 0, 0), 0.08);
 }
 
 class AutocompleteModel final : public QAbstractListModel {
@@ -142,10 +144,10 @@ public:
             auto const& suggestion = m_suggestions[index];
             if (!suggestion.favicon_png.has_value())
                 continue;
-            QPixmap pixmap;
-            if (!pixmap.loadFromData(suggestion.favicon_png->data(), static_cast<uint>(suggestion.favicon_png->size())))
+            auto icon = icon_from_png(suggestion.favicon_png->bytes(), CELL_ICON_SIZE);
+            if (icon.isNull())
                 continue;
-            m_favicon_cache.append({ index, QIcon(pixmap) });
+            m_favicon_cache.append({ index, move(icon) });
         }
 
         endResetModel();
@@ -190,6 +192,16 @@ public:
             return index.row();
         case HighlightInputRole:
             return qstring_from_ak_string(suggestion.highlight_input);
+        case StartsGroupRole: {
+            // Pages that follow search suggestions start a group of their own. An address the search engine suggested
+            // stays among its other suggestions.
+            if (suggestion_index == 0)
+                return false;
+            auto is_from_search = [](auto const& suggestion) {
+                return suggestion.source == WebView::AutocompleteSuggestionSource::Search || suggestion.source == WebView::AutocompleteSuggestionSource::RemoteURL;
+            };
+            return is_from_search(m_suggestions[suggestion_index - 1]) != is_from_search(suggestion);
+        }
         default:
             return {};
         }
@@ -234,33 +246,35 @@ public:
     {
         if (!index.isValid())
             return {};
-        QFontMetrics primary_fm(autocomplete_primary_font());
-        if (index.data(TitleRole).toString().isEmpty())
-            return QSize(0, std::max(CELL_ICON_SIZE, primary_fm.height()) + CELL_VERTICAL_PADDING * 2);
-        QFontMetrics secondary_fm(autocomplete_secondary_font());
-        int content_height = std::max(CELL_ICON_SIZE,
-            primary_fm.height() + CELL_LABEL_VERTICAL_SPACING + secondary_fm.height());
-        return QSize(0, content_height + CELL_VERTICAL_PADDING * 2);
+        auto height = ROW_HEIGHT;
+        if (index.data(StartsGroupRole).toBool())
+            height += GROUP_SEPARATOR_HEIGHT;
+        return QSize(0, height);
     }
 
     void paint(QPainter* painter, QStyleOptionViewItem const& option, QModelIndex const& index) const override
     {
         painter->save();
+        painter->setRenderHint(QPainter::Antialiasing, true);
+        auto const& panel = Theme::panel();
+
+        auto row_rect = option.rect;
+        if (index.data(StartsGroupRole).toBool()) {
+            auto separator_y = row_rect.top() + GROUP_SEPARATOR_MARGIN;
+            painter->fillRect(QRect(row_rect.left() + GROUP_SEPARATOR_INSET, separator_y, row_rect.width() - (2 * GROUP_SEPARATOR_INSET), 1), panel.separator);
+            row_rect.setTop(row_rect.top() + GROUP_SEPARATOR_HEIGHT);
+        }
+
         bool selected = option.state & QStyle::State_Selected;
         bool hovered = option.state & QStyle::State_MouseOver;
-        if (selected) {
-            auto rect = option.rect.adjusted(4, 2, -4, -2);
-            painter->setRenderHint(QPainter::Antialiasing, true);
+        if (selected || hovered) {
             painter->setPen(Qt::NoPen);
-            painter->setBrush(autocomplete_selection_fill(option.palette));
-            painter->drawRoundedRect(rect, 7, 7);
-        } else if (hovered) {
-            auto rect = option.rect.adjusted(4, 2, -4, -2);
-            painter->setRenderHint(QPainter::Antialiasing, true);
-            painter->setPen(Qt::NoPen);
-            painter->setBrush(ChromeStyle::chrome_surface_hover(option.palette));
-            painter->drawRoundedRect(rect, 7, 7);
+            painter->setBrush(selected ? Theme::selected_row() : panel.control);
+            painter->drawRoundedRect(QRectF(row_rect), ROW_CORNER_RADIUS, ROW_CORNER_RADIUS);
         }
+
+        auto text_color = selected ? QColor(Qt::white) : panel.text;
+        auto detail_color = selected ? QColor(255, 255, 255, 224) : panel.muted;
 
         auto favicon = index.data(FaviconRole).value<QIcon>();
         auto source = static_cast<WebView::AutocompleteSuggestionSource>(index.data(SourceRole).toInt());
@@ -269,58 +283,50 @@ public:
         auto title_text = index.data(TitleRole).toString();
         auto subtitle_text = index.data(SubtitleRole).toString();
         auto highlight_input = index.data(HighlightInputRole).toString();
-        auto secondary_text = subtitle_text.isEmpty() ? url_text : subtitle_text;
-        auto emphasize_origin = source != WebView::AutocompleteSuggestionSource::Search && subtitle_text.isEmpty();
 
-        int icon_x = option.rect.left() + CELL_HORIZONTAL_PADDING;
-        int icon_y = option.rect.top() + (option.rect.height() - CELL_ICON_SIZE) / 2;
-        QRect icon_rect(icon_x, icon_y, CELL_ICON_SIZE, CELL_ICON_SIZE);
+        // A row shows what it is in full, then a muted detail: where a search goes, or the address of a page.
+        auto primary_text = title_text.isEmpty() ? url_text : title_text;
+        QString detail_text;
+        if (source == WebView::AutocompleteSuggestionSource::Search || source == WebView::AutocompleteSuggestionSource::ChooseSearchEngine)
+            detail_text = subtitle_text;
+        else if (source == WebView::AutocompleteSuggestionSource::Bookmark)
+            detail_text = title_text.isEmpty() ? QStringLiteral("Bookmark") : QStringLiteral("Bookmark · %1").arg(url_text);
+        else if (!title_text.isEmpty())
+            detail_text = url_text;
 
-        if (source == WebView::AutocompleteSuggestionSource::Search) {
-            create_chrome_icon(ChromeIcon::Search, option.palette).paint(painter, icon_rect);
-        } else if ((source == WebView::AutocompleteSuggestionSource::History || source == WebView::AutocompleteSuggestionSource::Bookmark || source == WebView::AutocompleteSuggestionSource::Adaptive) && !favicon.isNull()) {
+        int x = row_rect.left() + CELL_LEADING_PADDING;
+        QRect icon_rect(x, row_rect.top() + (row_rect.height() - CELL_ICON_SIZE) / 2, CELL_ICON_SIZE, CELL_ICON_SIZE);
+        auto icon_color = selected ? QColor(Qt::white) : panel.muted;
+        if (source == WebView::AutocompleteSuggestionSource::Search || source == WebView::AutocompleteSuggestionSource::ChooseSearchEngine)
+            create_chrome_icon(ChromeIcon::Search, icon_color).paint(painter, icon_rect);
+        else if (!favicon.isNull())
             favicon.paint(painter, icon_rect);
-        } else {
-            create_chrome_icon(ChromeIcon::Globe, option.palette).paint(painter, icon_rect);
-        }
+        else
+            create_chrome_icon(ChromeIcon::Globe, icon_color).paint(painter, icon_rect);
+        x = icon_rect.right() + 1 + CELL_ICON_TITLE_SPACING;
 
-        if (source == WebView::AutocompleteSuggestionSource::Bookmark) {
-            static constexpr int badge_size = 9;
-            QRect badge_rect(icon_rect.right() - badge_size + 2, icon_rect.bottom() - badge_size + 2, badge_size, badge_size);
-            painter->setPen(Qt::NoPen);
-            painter->setBrush(ChromeStyle::chrome_surface(option.palette));
-            painter->drawEllipse(badge_rect.adjusted(-1, -1, 1, 1));
-            create_chrome_icon(ChromeIcon::StarFilled, option.palette).paint(painter, badge_rect);
-        }
+        auto right = row_rect.right() - CELL_TRAILING_PADDING;
 
-        int text_x = icon_x + CELL_ICON_SIZE + CELL_ICON_TEXT_SPACING;
-        int text_width = option.rect.right() - text_x - CELL_HORIZONTAL_PADDING;
-        if (text_width < 0)
-            text_width = 0;
+        auto title_font = autocomplete_title_font();
+        auto detail_font = autocomplete_detail_font();
+        auto available = max(0, right - x + 1);
+        // NB: Measure the title at the heavier weight that most of a matching title is drawn in.
+        auto measuring_font = title_font;
+        measuring_font.setWeight(QFont::DemiBold);
+        auto title_width = min(available, QFontMetrics(measuring_font).horizontalAdvance(primary_text) + 2);
+        // NB: The offer to choose a search engine does not show the query, so nothing in it is highlighted.
+        auto title_highlight = source == WebView::AutocompleteSuggestionSource::ChooseSearchEngine ? QString {} : highlight_input;
+        draw_autocomplete_text(*painter, QRect(x, row_rect.top(), title_width, row_rect.height()), primary_text, title_highlight, title_font, text_color);
 
-        QFontMetrics primary_fm(autocomplete_primary_font());
-        QFontMetrics secondary_fm(autocomplete_secondary_font());
-
-        if (!title_text.isEmpty()) {
-            int block_height = primary_fm.height() + CELL_LABEL_VERTICAL_SPACING + secondary_fm.height();
-            int block_y = option.rect.top() + (option.rect.height() - block_height) / 2;
-
-            auto primary_color = ChromeStyle::chrome_text(option.palette);
-            draw_autocomplete_text(*painter, QRect(text_x, block_y, text_width, primary_fm.height()), title_text, highlight_input, autocomplete_primary_font(), primary_color, primary_color);
-
-            painter->setFont(autocomplete_secondary_font());
-            auto secondary_color = ChromeStyle::chrome_muted_text(option.palette);
-            secondary_color.setAlpha(180);
-            painter->setPen(secondary_color);
-            draw_autocomplete_text(*painter,
-                QRect(text_x, block_y + primary_fm.height() + CELL_LABEL_VERTICAL_SPACING, text_width, secondary_fm.height()),
-                secondary_text, highlight_input, autocomplete_secondary_font(), secondary_color, ChromeStyle::chrome_text(option.palette), emphasize_origin);
-        } else {
-            painter->setFont(QApplication::font());
-            auto text_color = source == WebView::AutocompleteSuggestionSource::Search
-                ? ChromeStyle::chrome_muted_text(option.palette)
-                : ChromeStyle::chrome_text(option.palette);
-            draw_autocomplete_text(*painter, QRect(text_x, option.rect.top(), text_width, option.rect.height()), url_text, highlight_input, autocomplete_primary_font(), text_color, ChromeStyle::chrome_text(option.palette), emphasize_origin);
+        if (!detail_text.isEmpty()) {
+            auto detail_x = x + title_width + CELL_SPACING;
+            auto detail_width = right - detail_x + 1;
+            if (detail_width > 24) {
+                painter->setFont(detail_font);
+                painter->setPen(detail_color);
+                auto elided = QFontMetrics(detail_font).elidedText(detail_text, Qt::ElideRight, detail_width);
+                painter->drawText(QRect(detail_x, row_rect.top(), detail_width, row_rect.height()), Qt::AlignVCenter | Qt::AlignLeft, elided);
+            }
         }
 
         painter->restore();
@@ -333,77 +339,65 @@ Autocomplete::Autocomplete(QLineEdit* anchor)
 {
     m_model = new AutocompleteModel(this);
     m_delegate = new AutocompleteDelegate(this);
-    create_popup();
     qApp->installEventFilter(this);
 }
 
-void Autocomplete::create_popup()
+QListView* Autocomplete::create_list_view(QWidget& parent)
 {
-    // Use a non-activating top-level window so it can stack above native web
-    // content windows without moving keyboard focus away from the address bar.
-    m_popup = new QFrame(m_anchor->window(), Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
-    connect(m_popup, &QObject::destroyed, this, [this] {
-        // The popup dies with its parent window, which can go away while this object lives on (for
-        // example when the tab is moved to another window); it is recreated on the next show.
-        m_popup = nullptr;
-        m_list_view = nullptr;
-    });
-    m_popup->setObjectName("LadybirdAutocompletePopup");
-#if defined(AK_OS_MACOS)
-    // The web content view is a native QRhiWidget on macOS, so the popup must
-    // also be native to receive mouse events while overlapping it.
-    m_popup->setAttribute(Qt::WA_NativeWindow);
-#endif
-    m_popup->setAttribute(Qt::WA_ShowWithoutActivating);
-    m_popup->setAttribute(Qt::WA_X11DoNotAcceptFocus);
-    m_popup->setFocusPolicy(Qt::NoFocus);
-    m_popup->setFrameShape(QFrame::StyledPanel);
-    m_popup->setFrameShadow(QFrame::Raised);
-    m_popup->setAutoFillBackground(true);
-    m_popup->hide();
+    auto* list_view = new QListView(&parent);
+    list_view->setObjectName("LadybirdAutocompleteList");
+    list_view->setFocusPolicy(Qt::NoFocus);
+    list_view->setSelectionMode(QAbstractItemView::SingleSelection);
+    list_view->setMouseTracking(true);
+    list_view->setFrameShape(QFrame::NoFrame);
+    list_view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    list_view->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    list_view->setModel(m_model);
+    list_view->setItemDelegate(m_delegate);
+    list_view->installEventFilter(this);
 
-    m_list_view = new QListView(m_popup);
-    m_list_view->setObjectName("LadybirdAutocompleteList");
-    m_list_view->setFocusPolicy(Qt::NoFocus);
-    m_list_view->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_list_view->setMouseTracking(true);
-    m_list_view->setFrameShape(QFrame::NoFrame);
-    m_list_view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_list_view->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-    m_list_view->setModel(m_model);
-    m_list_view->setItemDelegate(m_delegate);
-    update_chrome_style();
-
-    auto* layout = new QVBoxLayout(m_popup);
-    layout->setContentsMargins(0, POPUP_PADDING, 0, POPUP_PADDING);
-    layout->setSpacing(0);
-    layout->addWidget(m_list_view);
-
-    connect(m_list_view, &QAbstractItemView::clicked, this, [this](QModelIndex const& index) {
+    connect(list_view, &QAbstractItemView::clicked, this, [this](QModelIndex const& index) {
         if (!is_selectable_row(index.row()))
             return;
         emit suggestion_clicked(index.data(SuggestionIndexRole).toInt());
     });
+    return list_view;
+}
+
+void Autocomplete::set_host(QWidget* host)
+{
+    if (m_host == host)
+        return;
+
+    auto was_visible = close();
+    delete m_list_view.data();
+
+    m_host = host;
+    if (host) {
+        m_list_view = create_list_view(*host);
+        m_list_view->hide();
+        host->layout()->addWidget(m_list_view);
+        update_chrome_style();
+    }
+    if (was_visible)
+        show_current_suggestions();
 }
 
 Autocomplete::~Autocomplete()
 {
     qApp->removeEventFilter(this);
-    if (m_popup)
-        delete m_popup;
+    delete m_list_view.data();
 }
 
 void Autocomplete::update_chrome_style()
 {
-    if (!m_popup || m_is_updating_chrome_style)
+    if (!m_list_view || m_is_updating_chrome_style)
         return;
 
     m_is_updating_chrome_style = true;
     auto palette = QApplication::palette();
-    m_popup->setPalette(palette);
     m_list_view->setPalette(palette);
-    m_popup->setStyleSheet(ChromeStyle::autocomplete_popup_style_sheet(palette));
-    m_popup->update();
+    m_list_view->setStyleSheet(ChromeStyle::autocomplete_popup_style_sheet(palette));
     m_list_view->viewport()->update();
     m_is_updating_chrome_style = false;
 }
@@ -422,29 +416,29 @@ void Autocomplete::schedule_chrome_style_update()
 
 void Autocomplete::show_with_suggestions(Vector<WebView::AutocompleteSuggestion> suggestions, Optional<size_t> selected_suggestion_index)
 {
-    if (!m_popup)
-        create_popup();
-
     m_model->set_suggestions(move(suggestions));
-    if (m_model->rowCount() == 0) {
+    show_current_suggestions();
+    set_selected_suggestion(selected_suggestion_index);
+}
+
+void Autocomplete::show_current_suggestions()
+{
+    // NB: Only a field with a host, which is the field that is shown, lists suggestions.
+    if (m_model->rowCount() == 0 || !m_list_view) {
         close();
         return;
     }
 
     update_chrome_style();
-    position_popup();
-    if (!m_popup->isVisible()) {
-        m_popup->show();
-        position_popup();
-    }
-    m_popup->raise();
-
-    set_selected_suggestion(selected_suggestion_index);
+    // NB: The host may be hidden until it sees the list is open, so the list's own visibility isn't watched.
+    m_list_view->setFixedHeight(list_height());
+    m_list_view->show();
+    set_anchor_popup_open(true);
 }
 
 void Autocomplete::set_selected_suggestion(Optional<size_t> suggestion_index)
 {
-    if (!m_popup)
+    if (!m_list_view)
         return;
 
     int table_row = suggestion_index.has_value()
@@ -463,30 +457,46 @@ void Autocomplete::set_selected_suggestion(Optional<size_t> suggestion_index)
 
 bool Autocomplete::close()
 {
-    if (!m_popup || !m_popup->isVisible())
+    if (!is_visible())
         return false;
-    m_popup->hide();
+    m_list_view->hide();
+    set_anchor_popup_open(false);
     return true;
+}
+
+void Autocomplete::set_anchor_popup_open(bool open)
+{
+    if (m_anchor->property("autocompleteOpen").toBool() == open)
+        return;
+    m_anchor->setProperty("autocompleteOpen", open);
+    m_anchor->style()->unpolish(m_anchor);
+    m_anchor->style()->polish(m_anchor);
+    m_anchor->update();
 }
 
 bool Autocomplete::is_visible() const
 {
-    return m_popup && m_popup->isVisible();
+    return m_list_view && !m_list_view->isHidden();
 }
 
 bool Autocomplete::eventFilter(QObject* watched, QEvent* event)
 {
     auto type = event->type();
+    if ((watched == m_anchor->window() && first_is_one_of(type, QEvent::Hide, QEvent::Resize)) || (watched == qApp && type == QEvent::Quit)) {
+        if (close())
+            emit dismissed();
+    }
+
     if (type == QEvent::ApplicationPaletteChange || type == QEvent::ThemeChange
-        || (type == QEvent::PaletteChange && (watched == m_anchor || watched == m_popup || watched == m_list_view)))
+        || (type == QEvent::PaletteChange && (watched == m_anchor || watched == m_list_view)))
         schedule_chrome_style_update();
 
     if (event->type() == QEvent::MouseButtonPress && is_visible()) {
         auto* mouse_event = static_cast<QMouseEvent*>(event);
         auto global = mouse_event->globalPosition().toPoint();
-        auto popup_global = QRect(m_popup->mapToGlobal(QPoint(0, 0)), m_popup->size());
+        auto host_global = QRect(m_host->mapToGlobal(QPoint(0, 0)), m_host->size());
         auto anchor_global = QRect(m_anchor->mapToGlobal(QPoint(0, 0)), m_anchor->size());
-        if (!popup_global.contains(global) && !anchor_global.contains(global)) {
+        if (!host_global.contains(global) && !anchor_global.contains(global)) {
             if (close())
                 emit dismissed();
         }
@@ -494,51 +504,21 @@ bool Autocomplete::eventFilter(QObject* watched, QEvent* event)
     return QObject::eventFilter(watched, event);
 }
 
-void Autocomplete::position_popup()
+int Autocomplete::list_height() const
 {
-    int visible_count = static_cast<int>(std::min(m_model->visible_suggestion_count(), MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS));
-    if (visible_count == 0)
-        return;
-
+    int visible_count = static_cast<int>(min(m_model->visible_suggestion_count(), MAXIMUM_VISIBLE_AUTOCOMPLETE_SUGGESTIONS));
     int total_height = 0;
-    int seen_suggestions = 0;
-    int row_count = m_model->rowCount();
-    for (int i = 0; i < row_count; ++i) {
-        auto index = m_model->index(i, 0);
+    for (int i = 0; i < visible_count; ++i) {
         QStyleOptionViewItem option;
         option.initFrom(m_list_view);
-        int h = m_delegate->sizeHint(option, index).height();
-        total_height += h;
-        ++seen_suggestions;
-        if (seen_suggestions >= visible_count)
-            break;
+        total_height += m_delegate->sizeHint(option, m_model->index(i, 0)).height();
     }
 
+    // The list ends a little above the window's bottom edge.
     auto* top_window = m_anchor->window();
-    if (!top_window)
-        return;
-    if (m_popup->parentWidget() != top_window) {
-        m_popup->setParent(top_window, Qt::ToolTip | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
-        m_popup->setAttribute(Qt::WA_ShowWithoutActivating);
-        m_popup->setAttribute(Qt::WA_X11DoNotAcceptFocus);
-    }
-
-    if (QGuiApplication::platformName() == "wayland") {
-        // FIXME: Replace this with a public popup positioning API once Qt provides one.
-        (void)m_popup->winId();
-        m_popup->windowHandle()->setProperty("_q_waylandPopupConstraintAdjustment", WAYLAND_POPUP_CONSTRAINT_ADJUSTMENT_NONE);
-    }
-
-    int width = std::max(m_anchor->width(), MINIMUM_POPUP_WIDTH);
-    int frame_overhead = m_popup->frameWidth() * 2;
-    int popup_height = total_height + POPUP_PADDING * 2 + frame_overhead;
-
-    m_list_view->setFixedHeight(total_height);
-    m_popup->setFixedSize(width, popup_height);
-
-    auto popup_position = m_anchor->mapToGlobal(QPoint(0, m_anchor->height()));
-    m_popup->move(popup_position);
-    m_popup->raise();
+    auto list_top = m_anchor->mapTo(top_window, QPoint(0, m_anchor->height() + FIELD_DIVIDER_HEIGHT + LIST_PADDING)).y();
+    int available_height = max(0, top_window->height() - list_top - LIST_PADDING);
+    return min(total_height, available_height);
 }
 
 bool Autocomplete::is_selectable_row(int row) const

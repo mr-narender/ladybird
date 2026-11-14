@@ -4,10 +4,12 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/OwnPtr.h>
 #include <LibUnicode/Collator.h>
 #include <LibUnicode/ICU.h>
 
 #include <unicode/coll.h>
+#include <unicode/stsearch.h>
 
 namespace Unicode {
 
@@ -38,7 +40,7 @@ static NonnullOwnPtr<icu::Locale> apply_usage_to_locale(icu::Locale const& local
 
     switch (usage) {
     case Usage::Sort:
-        result->setUnicodeKeywordValue("co", icu_string_piece(StringView { collation.bytes() }), status);
+        result->setUnicodeKeywordValue("co", icu_string_piece(StringView { collation.ascii_bytes() }), status);
         break;
     case Usage::Search:
         result->setUnicodeKeywordValue("co", "search", status);
@@ -161,6 +163,67 @@ static bool ignore_punctuation_for_collator(icu::Collator const& collator)
     return attribute == UCOL_SHIFTED;
 }
 
+class SubstringSearcherImpl final : public Collator::SubstringSearcher {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    SubstringSearcherImpl(icu::RuleBasedCollator const& collator, Utf16View const& haystack, Utf16View const& needle)
+    {
+        auto to_unicode_string = [](Utf16View const& string) {
+            if (string.has_latin1_storage()) {
+                auto utf8 = MUST(string.to_utf8());
+                return icu::UnicodeString::fromUTF8(icu_string_piece(utf8.bytes_as_string_view()));
+            }
+            return icu::UnicodeString { string.utf16_span().data(), static_cast<i32>(string.length_in_code_units()) };
+        };
+
+        auto* cloned_collator = dynamic_cast<icu::RuleBasedCollator*>(collator.clone());
+        VERIFY(cloned_collator);
+        m_collator = adopt_own(*cloned_collator);
+        m_pattern = to_unicode_string(needle);
+        m_text = to_unicode_string(haystack);
+
+        UErrorCode status = U_ZERO_ERROR;
+        m_search = make<icu::StringSearch>(m_pattern, m_text, m_collator.ptr(), nullptr, status);
+        verify_icu_success(status);
+    }
+
+    virtual Optional<Collator::Match> find_from(size_t start_offset) override
+    {
+        if (m_pattern.isEmpty() || start_offset > static_cast<size_t>(m_text.length()))
+            return {};
+
+        // ICU snaps offsets inside a surrogate pair or contraction backwards, so step forward until a match doesn't.
+        auto search_offset = static_cast<i32>(start_offset);
+        while (search_offset < m_text.length()) {
+            UErrorCode status = U_ZERO_ERROR;
+            m_search->setOffset(search_offset, status);
+            verify_icu_success(status);
+
+            auto const match_start = m_search->next(status);
+            verify_icu_success(status);
+            if (match_start == USEARCH_DONE)
+                return {};
+
+            if (static_cast<size_t>(match_start) >= start_offset) {
+                return Collator::Match {
+                    .start = static_cast<size_t>(match_start),
+                    .end = static_cast<size_t>(match_start + m_search->getMatchedLength()),
+                };
+            }
+
+            search_offset = m_text.moveIndex32(search_offset, 1);
+        }
+        return {};
+    }
+
+private:
+    OwnPtr<icu::RuleBasedCollator> m_collator;
+    icu::UnicodeString m_pattern;
+    icu::UnicodeString m_text;
+    OwnPtr<icu::StringSearch> m_search;
+};
+
 class CollatorImpl : public Collator {
 public:
     explicit CollatorImpl(NonnullOwnPtr<icu::Collator> collator)
@@ -171,11 +234,17 @@ public:
     virtual Collator::Order compare(Utf16View const& lhs, Utf16View const& rhs) const override
     {
         UErrorCode status = U_ZERO_ERROR;
+        UCollationResult result;
 
-        auto lhs_it = icu_string_iterator(lhs);
-        auto rhs_it = icu_string_iterator(rhs);
-
-        auto result = m_collator->compare(lhs_it, rhs_it, status);
+        // NB: ICU has no iterator over Latin-1, so a string with Latin-1 storage that is not ASCII is compared as UTF-16.
+        auto has_non_ascii_latin1_storage = [](Utf16View const& string) { return string.has_latin1_storage() && !string.has_ascii_storage(); };
+        if (has_non_ascii_latin1_storage(lhs) || has_non_ascii_latin1_storage(rhs)) {
+            result = m_collator->compare(icu_string(lhs), icu_string(rhs), status);
+        } else {
+            auto lhs_it = icu_string_iterator(lhs);
+            auto rhs_it = icu_string_iterator(rhs);
+            result = m_collator->compare(lhs_it, rhs_it, status);
+        }
         verify_icu_success(status);
 
         switch (result) {
@@ -188,6 +257,13 @@ public:
         }
 
         VERIFY_NOT_REACHED();
+    }
+
+    virtual NonnullOwnPtr<SubstringSearcher> create_substring_searcher(Utf16View const& haystack, Utf16View const& needle) const override
+    {
+        auto* rule_based_collator = dynamic_cast<icu::RuleBasedCollator*>(m_collator.ptr());
+        VERIFY(rule_based_collator);
+        return make<SubstringSearcherImpl>(*rule_based_collator, haystack, needle);
     }
 
     virtual Sensitivity sensitivity() const override
@@ -215,7 +291,7 @@ NonnullOwnPtr<Collator> Collator::create(
 {
     UErrorCode status = U_ZERO_ERROR;
 
-    auto locale_data = LocaleData::for_locale(locale.bytes());
+    auto locale_data = LocaleData::for_locale(locale.ascii_bytes());
     VERIFY(locale_data.has_value());
 
     auto locale_with_usage = apply_usage_to_locale(locale_data->locale(), usage, collation);

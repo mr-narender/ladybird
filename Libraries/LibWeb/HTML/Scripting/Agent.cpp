@@ -4,10 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibJS/Runtime/VM.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/Platform/EventLoopPlugin.h>
 
 namespace Web::HTML {
 
@@ -25,7 +26,25 @@ Bindings::WrapperWorld const& Agent::main_world() const
 
 void Agent::spin_event_loop_until(GC::Root<GC::Function<bool()>> goal_condition)
 {
-    Platform::EventLoopPlugin::the().spin_until(move(goal_condition));
+    event_loop->spin_until(*goal_condition);
+}
+
+NonnullRefPtr<ScriptAbortHandle> Agent::script_abort_handle()
+{
+    if (!m_script_abort_handle)
+        m_script_abort_handle = ScriptAbortHandle::create(JS::VM::the());
+    return *m_script_abort_handle;
+}
+
+void Agent::detach_script_abort_handle()
+{
+    if (m_script_abort_handle)
+        m_script_abort_handle->detach();
+}
+
+Agent& surrounding_agent()
+{
+    return *static_cast<Agent*>(JS::VM::the().agent());
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#relevant-agent

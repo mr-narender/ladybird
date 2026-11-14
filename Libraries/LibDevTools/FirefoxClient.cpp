@@ -109,7 +109,7 @@ static bool flatpak_firefox_is_installed(LexicalPath const& flatpak)
         .name = "find-firefox-flatpak"sv,
         .executable = flatpak.string(),
         .die_with_parent = true,
-        .arguments = {
+        .arguments = Vector<ByteString> {
             "info"sv,
             "org.mozilla.firefox"sv,
         },
@@ -123,6 +123,23 @@ static bool flatpak_firefox_is_installed(LexicalPath const& flatpak)
 
     auto exit_code = process.value().wait_for_termination();
     return !exit_code.is_error() && exit_code.value() == 0;
+}
+
+static bool is_snap_firefox_wrapper(StringView path)
+{
+    if (auto snap = FileSystem::real_path("/usr/bin/snap"sv); !snap.is_error() && snap.value() == path)
+        return true;
+
+    auto file = Core::File::open(path, Core::File::OpenMode::Read);
+    if (file.is_error())
+        return false;
+
+    Array<u8, 2> header;
+    if (file.value()->read_until_filled(header).is_error() || StringView { header.span() } != "#!"sv)
+        return false;
+
+    auto contents = file.value()->read_until_eof();
+    return !contents.is_error() && StringView { contents.value() }.contains("\nexec /snap/bin/firefox "sv);
 }
 
 static ErrorOr<Optional<LexicalPath>> find_firefox_profile(LexicalPath const& profiles_ini, StringView profile_name)
@@ -208,7 +225,7 @@ static Optional<FirefoxInstallation> firefox_installation_from_binary(StringView
         };
     }
 
-    if (canonical_path.value() == "/usr/bin/snap"sv) {
+    if (is_snap_firefox_wrapper(canonical_path.value())) {
         return FirefoxInstallation {
             .executable = LexicalPath { candidate },
             .arguments = {},
@@ -234,16 +251,24 @@ static Optional<FirefoxInstallation> firefox_installation_from_binary(StringView
 static Optional<FirefoxInstallation> find_firefox_in_path()
 {
     static constexpr auto EXECUTABLE_NAMES = to_array<StringView>({
+#if defined(AK_OS_WINDOWS)
+        "firefox.exe"sv,
+#else
         "firefox"sv,
+#endif
 #if defined(AK_OS_LINUX)
         "flatpak"sv,
 #endif
     });
 
-    auto search_path = Core::Environment::get("PATH"sv).value_or(DEFAULT_PATH_SV);
+    auto search_path = Core::Environment::get("PATH"sv);
+    if (!search_path.has_value())
+        return {};
+
+    auto search_paths = search_path->split_view(Core::Environment::PATH_SEPARATOR);
 
     for (auto executable_name : EXECUTABLE_NAMES) {
-        for (auto directory : search_path.split_view(':')) {
+        for (auto directory : search_paths) {
             auto candidate = LexicalPath::join(directory, executable_name);
 
             if (auto installation = firefox_installation_from_binary(candidate.string()); installation.has_value())
@@ -262,11 +287,26 @@ static Optional<FirefoxInstallation> find_firefox_installation()
     auto candidate = LexicalPath::join("/Applications"sv, APPLICATION_NAME, "Contents"sv, "MacOS"sv, "firefox"sv);
     if (auto installation = firefox_installation_from_binary(candidate.string()); installation.has_value())
         return installation;
+#elif defined(AK_OS_WINDOWS)
+    static constexpr auto INSTALLATION_ROOTS = to_array<StringView>({
+        "ProgramW6432"sv,
+        "ProgramFiles"sv,
+        "ProgramFiles(x86)"sv,
+        "LOCALAPPDATA"sv,
+    });
+
+    for (auto variable : INSTALLATION_ROOTS) {
+        auto directory = Core::Environment::get(variable);
+        if (!directory.has_value())
+            continue;
+
+        auto candidate = LexicalPath::join(*directory, "Mozilla Firefox"sv, "firefox.exe"sv);
+        if (auto installation = firefox_installation_from_binary(candidate.string()); installation.has_value())
+            return installation;
+    }
+#endif
 
     return find_firefox_in_path();
-#else
-    return find_firefox_in_path();
-#endif
 }
 
 NonnullOwnPtr<FirefoxClient> FirefoxClient::create()

@@ -9,6 +9,7 @@
 #include <AK/Optional.h>
 #include <AK/Span.h>
 #include <AK/Vector.h>
+#include <LibGC/RootVector.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/WebIDL/OverloadTypes.h>
@@ -17,11 +18,13 @@ namespace Web::WebIDL {
 
 struct ResolvedOverload {
     // Corresponds to "the special value “missing”" in the overload resolution algorithm.
-    struct Missing { };
+    struct Missing {
+        GC_HOLDS_NO_CELL_EDGES;
+    };
     using Argument = Variant<JS::Value, Missing>;
 
     int callable_id;
-    Vector<Argument> arguments;
+    GC::RootVector<Argument> arguments;
 };
 
 // https://webidl.spec.whatwg.org/#es-overloads

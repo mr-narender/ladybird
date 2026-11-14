@@ -1,4 +1,6 @@
-shared initial style: true
-longhand evaluations: 0
+initial records:
+  span#first record 2
+  span#second record 2
+restyled: [second]
 first background: rgba(0, 0, 0, 0)
 second background: rgb(0, 0, 255)

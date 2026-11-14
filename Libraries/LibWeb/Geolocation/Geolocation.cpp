@@ -34,6 +34,8 @@ static WebIDL::UnsignedLong s_next_watch_id = 0;
 
 class GeolocationRequestState : public RefCounted<GeolocationRequestState> {
 public:
+    GC_HOLDS_NO_CELL_EDGES;
+
     u64 request_id { 0 };
     bool completed { false };
     bool timeout_stopped { false };
@@ -57,14 +59,14 @@ static void invoke_position_error_callback(GC::Ref<WebIDL::CallbackType> callbac
 
 static void queue_success_callback(GC::Ref<WebIDL::CallbackType> callback, GC::Ref<GeolocationPosition> position)
 {
-    HTML::queue_a_task(HTML::Task::Source::Geolocation, nullptr, nullptr, GC::create_function(GC::Heap::the(), [callback, position] {
+    HTML::queue_a_task(HTML::Task::Source::Geolocation, nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(callback, position), [](auto& callback, auto& position) {
         invoke_position_callback(callback, position);
     }));
 }
 
 static void queue_error_callback(GC::Ref<WebIDL::CallbackType> callback, GC::Ref<GeolocationPositionError> error)
 {
-    HTML::queue_a_task(HTML::Task::Source::Geolocation, nullptr, nullptr, GC::create_function(GC::Heap::the(), [callback, error] {
+    HTML::queue_a_task(HTML::Task::Source::Geolocation, nullptr, nullptr, GC::create_function(GC::Heap::the(), GC::captures(callback, error), [](auto& callback, auto& error) {
         invoke_position_error_callback(callback, error);
     }));
 }
@@ -181,10 +183,10 @@ void Geolocation::request_a_position(GC::Ref<WebIDL::CallbackType> success_callb
     // 1. Let watchIDs be geolocation's [[watchIDs]].
 
     // 2. Let document be the geolocation's relevant global object's associated Document.
-    [[maybe_unused]] auto& document = window().associated_document();
+    auto& document = window().associated_document();
 
-    // FIXME: 3. If document is not allowed to use the "geolocation" feature:
-    if (false) {
+    // 3. If document is not allowed to use the "geolocation" feature:
+    if (!document.is_allowed_to_use_feature(DOM::PolicyControlledFeature::Geolocation)) {
         // 1. If watchId was passed, remove watchId from watchIDs.
         if (watch_id.has_value())
             remove_watch_id(watch_id.value());
@@ -210,7 +212,7 @@ void Geolocation::request_a_position(GC::Ref<WebIDL::CallbackType> success_callb
     }
 
     // 5. If document's visibility state is "hidden", wait for the following page visibility change steps to run:
-    run_in_parallel_when_document_is_visible(document, GC::create_function(GC::Heap::the(), [this, watch_id, success_callback, error_callback, options] {
+    run_in_parallel_when_document_is_visible(document, GC::create_function(GC::Heap::the(), GC::captures(*this, watch_id, success_callback, error_callback, options), [](auto& self, auto& watch_id, auto& success_callback, auto& error_callback, auto& options) {
         // 1. Assert: document's visibility state is "visible".
         // 2. Continue to the next steps below.
         // AD-HOC: This is implemented by run_in_parallel_when_document_is_visible().
@@ -219,61 +221,63 @@ void Geolocation::request_a_position(GC::Ref<WebIDL::CallbackType> success_callb
         auto descriptor = PermissionsAPI::PermissionDescriptor { "geolocation"_utf16 };
 
         // 7. In parallel:
-        // AD-HOC: run_in_parallel_when_document_is_visible() already runs this in parallel.
+        // NB: The round trip to the UI process that asks the user for permission stands in for the parallel steps: the
+        //     request goes out as an async IPC, and the rest of the steps run on the main thread once it answers.
         {
             // 1. Set permission to request permission to use descriptor.
-            auto permission = Web::PermissionsAPI::request_permission(descriptor);
+            auto& settings = self.window().associated_document().relevant_settings_object();
+            PermissionsAPI::request_permission_with_user_prompt(descriptor, settings, GC::create_function(self.heap(), GC::captures(self, watch_id, success_callback, error_callback, options), [](auto& self, auto& watch_id, auto& success_callback, auto& error_callback, auto& options, PermissionsAPI::PermissionState permission) {
+                // 2. If permission is "denied", then:
+                if (permission == PermissionsAPI::PermissionState::Denied) {
+                    // 1. If watchId was passed, remove watchId from watchIDs.
+                    if (watch_id.has_value())
+                        self.remove_watch_id(watch_id.value());
 
-            // 2. If permission is "denied", then:
-            if (permission == PermissionsAPI::PermissionState::Denied) {
-                // 1. If watchId was passed, remove watchId from watchIDs.
-                if (watch_id.has_value())
-                    remove_watch_id(watch_id.value());
+                    // 2. Call back with error passing errorCallback and PERMISSION_DENIED.
+                    self.call_back_with_error(error_callback, GeolocationPositionError::ErrorCode::PermissionDenied);
 
-                // 2. Call back with error passing errorCallback and PERMISSION_DENIED.
-                call_back_with_error(error_callback, GeolocationPositionError::ErrorCode::PermissionDenied);
+                    // 3. Terminate this algorithm.
+                    return;
+                }
 
-                // 3. Terminate this algorithm.
-                return;
-            }
+                // FIXME: 3. Wait to acquire a position passing successCallback, errorCallback, options, and watchId.
+                self.acquire_a_position(success_callback, error_callback, options, watch_id);
 
-            // FIXME: 3. Wait to acquire a position passing successCallback, errorCallback, options, and watchId.
-            acquire_a_position(success_callback, error_callback, options, watch_id);
-
-            // 4. If watchId was not passed, terminate this algorithm.
-            if (!watch_id.has_value())
-                return;
-
-            if (!m_watch_ids.contains(*watch_id))
-                return;
-
-            // 5. While watchIDs contains watchId:
-            // AD-HOC: The spec expresses this as a loop; register callbacks for significant position changes and
-            // re-enter request a position from those callbacks.
-            auto watch_position_data = m_watch_position_data.get(*watch_id);
-            if (!watch_position_data.has_value() || watch_position_data->emulated_position_data_observer_id.has_value())
-                return;
-
-            auto weak_document = GC::Weak<DOM::Document> { window().associated_document() };
-            auto observer_id = window().page().register_emulated_position_data_observer(GC::create_function(heap(), [this, watch_id = *watch_id, weak_document] {
-                if (!m_watch_ids.contains(watch_id))
+                // 4. If watchId was not passed, terminate this algorithm.
+                if (!watch_id.has_value())
                     return;
 
-                auto document = weak_document.ptr();
-                if (!document || !document->is_fully_active())
+                if (!self.m_watch_ids.contains(*watch_id))
                     return;
 
-                if (m_pending_watch_position_request_ids.contains(watch_id))
+                // 5. While watchIDs contains watchId:
+                // AD-HOC: The spec expresses this as a loop; register callbacks for significant position changes and
+                // re-enter request a position from those callbacks.
+                auto watch_position_data = self.m_watch_position_data.get(*watch_id);
+                if (!watch_position_data.has_value() || watch_position_data->emulated_position_data_observer_id.has_value())
                     return;
 
-                auto watch_position_data = m_watch_position_data.get(watch_id);
-                if (!watch_position_data.has_value())
-                    return;
+                auto weak_document = GC::Weak<DOM::Document> { self.window().associated_document() };
+                auto observer_id = self.window().page().register_emulated_position_data_observer(GC::create_function(self.heap(), GC::captures(self, *watch_id, weak_document), [](auto& self, auto& watch_id, auto& weak_document) {
+                    if (!self.m_watch_ids.contains(watch_id))
+                        return;
 
-                // FIXME: If document is not fully active or visibility state is not "visible", wait for visibility.
-                request_a_position(watch_position_data->success_callback, watch_position_data->error_callback, watch_position_data->options, watch_id);
+                    auto document = weak_document.ptr();
+                    if (!document || !document->is_fully_active())
+                        return;
+
+                    if (self.m_pending_watch_position_request_ids.contains(watch_id))
+                        return;
+
+                    auto watch_position_data = self.m_watch_position_data.get(watch_id);
+                    if (!watch_position_data.has_value())
+                        return;
+
+                    // FIXME: If document is not fully active or visibility state is not "visible", wait for visibility.
+                    self.request_a_position(watch_position_data->success_callback, watch_position_data->error_callback, watch_position_data->options, watch_id);
+                }));
+                watch_position_data->emulated_position_data_observer_id = observer_id;
             }));
-            watch_position_data->emulated_position_data_observer_id = observer_id;
         }
     }));
 }
@@ -299,7 +303,8 @@ void Geolocation::acquire_a_position(GC::Ref<WebIDL::CallbackType> success_callb
     //    the device's position by running the following steps:
     {
         // 1. Let permission be get the current permission state of "geolocation".
-        auto permission = Web::PermissionsAPI::permission_state(Bindings::PermissionDescriptor { "geolocation"_utf16 });
+        // NB: This can run outside any script (when the user's answer arrives, e.g.), so the settings object is passed.
+        auto permission = Web::PermissionsAPI::permission_state(Bindings::PermissionDescriptor { "geolocation"_utf16 }, window().associated_document().relevant_settings_object());
 
         // 2. If permission is "denied":
         if (permission == Bindings::PermissionState::Denied) {
@@ -372,8 +377,31 @@ void Geolocation::acquire_a_position(GC::Ref<WebIDL::CallbackType> success_callb
             // 4. Otherwise, if position is not cachedPosition, try to acquire position data from the underlying system,
             //    optionally taking into consideration the value of options.enableHighAccuracy during acquisition.
             acquire_position_from_page(success_callback, error_callback, options, watch_id, acquisition_time);
+            return;
         }
+
+        // NB: While the permission is "prompt" (a one-time grant just ended, e.g.), neither step above applies, and the
+        //     timeout task elapses without a position.
+        call_back_with_timeout_error(error_callback, options.timeout, watch_id);
     }
+}
+
+// A watch cleared, or a document left, before the timeout elapses hears nothing of it, as with a timeout that elapses
+// while a position is being acquired.
+void Geolocation::call_back_with_timeout_error(GC::Ptr<WebIDL::CallbackType> error_callback, WebIDL::UnsignedLong timeout, Optional<WebIDL::UnsignedLong> watch_id)
+{
+    auto weak_document = GC::Weak<DOM::Document> { window().associated_document() };
+    auto timer = Platform::Timer::create_single_shot(heap(), AK::Duration::from_milliseconds(min(timeout, NumericLimits<int>::max())), {});
+    m_timeout_timers.append(timer);
+    timer->on_timeout = GC::create_function(heap(), GC::captures(*this, timer, error_callback, watch_id, weak_document), [](auto& self, auto& timer, auto& error_callback, auto& watch_id, auto& weak_document) {
+        self.m_timeout_timers.remove_first_matching([&](auto candidate) { return candidate == timer; });
+        if (watch_id.has_value() && !self.m_watch_ids.contains(*watch_id))
+            return;
+        if (!weak_document || !weak_document->is_fully_active())
+            return;
+        self.call_back_with_error(error_callback, GeolocationPositionError::ErrorCode::Timeout);
+    });
+    timer->start();
 }
 
 void Geolocation::acquire_position_from_page(GC::Ref<WebIDL::CallbackType> success_callback,
@@ -385,26 +413,27 @@ void Geolocation::acquire_position_from_page(GC::Ref<WebIDL::CallbackType> succe
     auto request_state = make_ref_counted<GeolocationRequestState>();
     auto weak_document = GC::Weak<DOM::Document> { document };
     auto weak_page = GC::Weak<Page> { page };
-    auto timeout_timer = Platform::Timer::create_single_shot(heap(), min(options.timeout, NumericLimits<int>::max()), {});
+    auto timeout_timer = Platform::Timer::create_single_shot(heap(), AK::Duration::from_milliseconds(min(options.timeout, NumericLimits<int>::max())), {});
     m_timeout_timers.append(timeout_timer);
 
-    auto stop_timeout_timer = [this, timeout_timer, request_state] {
+    auto stop_timeout_timer = GC::create_function(heap(), GC::captures(*this, timeout_timer, request_state), [](auto& self, auto& timeout_timer, auto& request_state) {
         if (request_state->timeout_stopped)
             return;
         request_state->timeout_stopped = true;
         timeout_timer->stop();
         timeout_timer->on_timeout = nullptr;
-        m_timeout_timers.remove_first_matching([&](auto timer) { return timer == timeout_timer; });
-    };
+        self.m_timeout_timers.remove_first_matching([&](auto timer) { return timer == timeout_timer; });
+    });
 
     auto position_callback = GC::create_function(heap(),
-        [this, success_callback, error_callback, options, watch_id, acquisition_time, request_state, weak_document, stop_timeout_timer](Page::GeolocationPositionResult result) {
+        GC::captures(*this, success_callback, error_callback, options, watch_id, acquisition_time, request_state, weak_document, stop_timeout_timer),
+        [](auto& self, auto& success_callback, auto& error_callback, auto& options, auto& watch_id, auto& acquisition_time, auto& request_state, auto& weak_document, auto& stop_timeout_timer, Page::GeolocationPositionResult result) {
             if (request_state->completed)
                 return;
 
-            if (watch_id.has_value() && !m_watch_ids.contains(*watch_id)) {
+            if (watch_id.has_value() && !self.m_watch_ids.contains(*watch_id)) {
                 // NB: The position response arrived after the watch was cleared; stop the timeout before ignoring it.
-                stop_timeout_timer();
+                stop_timeout_timer->function()();
                 return;
             }
             if (!watch_id.has_value())
@@ -413,7 +442,7 @@ void Geolocation::acquire_position_from_page(GC::Ref<WebIDL::CallbackType> succe
             auto document = weak_document.ptr();
             if (!document || !document->is_fully_active()) {
                 // NB: The position response is no longer observable; stop the timeout before ignoring it.
-                stop_timeout_timer();
+                stop_timeout_timer->function()();
                 return;
             }
 
@@ -422,74 +451,79 @@ void Geolocation::acquire_position_from_page(GC::Ref<WebIDL::CallbackType> succe
                 auto error_code = result.get<GeolocationPositionError::ErrorCode>();
 
                 // 1. Stop the timeout.
-                stop_timeout_timer();
+                stop_timeout_timer->function()();
 
                 if (watch_id.has_value() && error_code == GeolocationPositionError::ErrorCode::PermissionDenied) {
                     request_state->completed = true;
-                    m_pending_watch_position_request_ids.remove(*watch_id);
+                    self.m_pending_watch_position_request_ids.remove(*watch_id);
                 }
 
                 // 2. Go to dealing with failures.
-                call_back_with_error(error_callback, error_code);
+                self.call_back_with_error(error_callback, error_code);
 
                 // 3. Terminate this algorithm.
                 return;
             }
 
-            // FIXME: 6. If acquiring the position data from the system succeeds:
-            {
-                // FIXME: 1. Let positionData be a map with the following name/value pairs based on the acquired position data:
-                //    * longitude:
-                //        A double that represents the longitude coordinates on the Earth's surface in degrees, using
-                //        the [WGS84] coordinate system. Longitude measures how far east or west a point is from the
-                //        Prime Meridian.
-                //    * altitude:
-                //        A double? that represents the altitude in meters above the [WGS84] ellipsoid, or null if not
-                //        available. Altitude measures the height above sea level.
-                //    * accuracy:
-                //        A non-negative double that represents the accuracy value indicating the 95% confidence level
-                //        in meters. Accuracy measures how close the measured coordinates are to the true position.
-                //    * altitudeAccuracy:
-                //        A non-negative double? that represents the altitude accuracy, or null if not available,
-                //        indicating the 95% confidence level in meters. Altitude accuracy measures how close the
-                //        measured altitude is to the true altitude.
-                //    * speed:
-                //        A non-negative double? that represents the speed in meters per second, or null if not
-                //        available. Speed measures how fast the device is moving.
-                //    * heading:
-                //        A double? that represents the heading in degrees, or null if not available or the device is
-                //        stationary. Heading measures the direction in which the device is moving relative to true
-                //        north.
-                auto position_data = GC::Heap::the().allocate<GeolocationCoordinates>();
-                auto position = GC::Heap::the().allocate<GeolocationPosition>(position_data, acquisition_time, options.enable_high_accuracy);
+            // 6. If acquiring the position data from the system succeeds:
+            // 6.1. Let positionData be a map with the following name/value pairs based on the acquired position data:
+            //      * latitude:
+            //          A double that represents the latitude coordinates on the Earth's surface in degrees, using the
+            //          [WGS84] coordinate system. Latitude measures how far north or south a point is from the Equator.
+            //      * longitude:
+            //          A double that represents the longitude coordinates on the Earth's surface in degrees, using the
+            //          [WGS84] coordinate system. Longitude measures how far east or west a point is from the Prime
+            //          Meridian.
+            //      * altitude:
+            //          A double? that represents the altitude in meters above the [WGS84] ellipsoid, or null if not
+            //          available. Altitude measures the height above sea level.
+            //      * accuracy:
+            //          A non-negative double that represents the accuracy value indicating the 95% confidence level in
+            //          meters. Accuracy measures how close the measured coordinates are to the true position.
+            //      * altitudeAccuracy:
+            //          A non-negative double? that represents the altitude accuracy, or null if not available,
+            //          indicating the 95% confidence level in meters. Altitude accuracy measures how close the measured
+            //          altitude is to the true altitude.
+            //      * speed:
+            //          A non-negative double? that represents the speed in meters per second, or null if not available.
+            //          Speed measures how fast the device is moving.
+            //      * heading:
+            //          A double? that represents the heading in degrees, or null if not available or the device is
+            //          stationary. Heading measures the direction in which the device is moving relative to true north.
+            auto position_data = GC::Heap::the().allocate<GeolocationCoordinates>(result.get<CoordinatesData>());
 
-                // 3. Set this's [[cachedPosition]] to position.
-                m_cached_position = *position;
+            // 6.2. Set position to a new GeolocationPosition passing positionData, acquisitionTime and
+            //      options.enableHighAccuracy.
+            auto position = GC::Heap::the().allocate<GeolocationPosition>(position_data, acquisition_time, options.enable_high_accuracy);
 
-                // 8. Queue a task on the geolocation task source with a step that invokes successCallback with « position »
-                //    and "report".
-                queue_success_callback(success_callback, position);
-                stop_timeout_timer();
-            }
+            // 6.3. Set this's [[cachedPosition]] to position.
+            self.m_cached_position = *position;
+
+            // 7. Stop the timeout.
+            stop_timeout_timer->function()();
+
+            // 8. Queue a task on the geolocation task source with a step that invokes successCallback with « position »
+            //    and "report".
+            queue_success_callback(success_callback, position);
         });
 
-    request_state->request_id = page.request_geolocation_position(position_callback, watch_id.has_value() ? Page::GeolocationRequestType::Watch : Page::GeolocationRequestType::OneShot);
+    request_state->request_id = page.request_geolocation_position(document.id(), position_callback, watch_id.has_value() ? Page::GeolocationRequestType::Watch : Page::GeolocationRequestType::OneShot);
     if (watch_id.has_value())
         m_pending_watch_position_request_ids.set(*watch_id, request_state->request_id);
 
-    timeout_timer->on_timeout = GC::create_function(heap(), [this, error_callback, watch_id, request_state, weak_document, weak_page, stop_timeout_timer] {
+    timeout_timer->on_timeout = GC::create_function(heap(), GC::captures(*this, error_callback, watch_id, request_state, weak_document, weak_page, stop_timeout_timer), [](auto& self, auto& error_callback, auto& watch_id, auto& request_state, auto& weak_document, auto& weak_page, auto& stop_timeout_timer) {
         if (request_state->completed)
             return;
         request_state->completed = true;
-        stop_timeout_timer();
-        if (watch_id.has_value() && !m_pending_watch_position_request_ids.remove(*watch_id))
+        stop_timeout_timer->function()();
+        if (watch_id.has_value() && !self.m_pending_watch_position_request_ids.remove(*watch_id))
             return;
         if (auto page = weak_page.ptr())
             page->cancel_geolocation_position_request(request_state->request_id);
         auto document = weak_document.ptr();
         if (!document || !document->is_fully_active())
             return;
-        call_back_with_error(error_callback, GeolocationPositionError::ErrorCode::Timeout);
+        self.call_back_with_error(error_callback, GeolocationPositionError::ErrorCode::Timeout);
     });
     timeout_timer->start();
 }
@@ -512,8 +546,8 @@ void Geolocation::run_in_parallel_when_document_is_visible(DOM::Document& docume
 {
     // Run callback in parallel if the document is already visible.
     if (document.visibility_state() == HTML::VisibilityState::Visible) {
-        auto callback_with_context = GC::create_function(GC::Heap::the(), [this, callback] {
-            HTML::TemporaryExecutionContext execution_context { window().relevant_settings_object() };
+        auto callback_with_context = GC::create_function(GC::Heap::the(), GC::captures(*this, callback), [](auto& self, auto& callback) {
+            HTML::TemporaryExecutionContext execution_context { self.window().relevant_settings_object() };
             callback->function()();
         });
         Platform::EventLoopPlugin::the().deferred_invoke(callback_with_context);
@@ -522,25 +556,25 @@ void Geolocation::run_in_parallel_when_document_is_visible(DOM::Document& docume
 
     // Run the callback as soon as the document becomes visible. If we time out, do not run the callback at all.
     auto document_observer = DOM::DocumentObserver::create(document);
-    auto timeout_timer = Platform::Timer::create_single_shot(GC::Heap::the(), VISIBILITY_STATE_TIMEOUT_MS, {});
+    auto timeout_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(VISIBILITY_STATE_TIMEOUT_MS), {});
     m_timeout_timers.append(timeout_timer);
-    auto clear_observer_and_timer = [this, document_observer, timeout_timer] {
+    auto clear_observer_and_timer = GC::create_function(GC::Heap::the(), GC::captures(*this, document_observer, timeout_timer), [](auto& self, auto& document_observer, auto& timeout_timer) {
         document_observer->set_document_visibility_state_observer({});
         timeout_timer->stop();
-        m_timeout_timers.remove_first_matching([&](auto timer) { return timer == timeout_timer; });
-    };
-    timeout_timer->on_timeout = GC::create_function(GC::Heap::the(), [clear_observer_and_timer] {
+        self.m_timeout_timers.remove_first_matching([&](auto timer) { return timer == timeout_timer; });
+    });
+    timeout_timer->on_timeout = GC::create_function(GC::Heap::the(), GC::captures(clear_observer_and_timer), [](auto& clear_observer_and_timer) {
         dbgln("Geolocation: Waiting for visibility state update timed out");
-        clear_observer_and_timer();
+        clear_observer_and_timer->function()();
     });
 
-    document_observer->set_document_visibility_state_observer([this, clear_observer_and_timer, callback](HTML::VisibilityState state) {
+    document_observer->set_document_visibility_state_observer(GC::create_function(GC::Heap::the(), GC::captures(*this, clear_observer_and_timer, callback), [](auto& self, auto& clear_observer_and_timer, auto& callback, HTML::VisibilityState state) {
         if (state == HTML::VisibilityState::Visible) {
-            clear_observer_and_timer();
-            HTML::TemporaryExecutionContext execution_context { window().relevant_settings_object() };
+            clear_observer_and_timer->function()();
+            HTML::TemporaryExecutionContext execution_context { self.window().relevant_settings_object() };
             callback->function()();
         }
-    });
+    }));
     timeout_timer->start();
 }
 

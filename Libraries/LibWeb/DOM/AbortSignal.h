@@ -28,7 +28,7 @@ public:
     virtual ~AbortSignal() override = default;
 
     using AbortAlgorithmID = u64;
-    Optional<AbortAlgorithmID> add_abort_algorithm(Function<void()>);
+    Optional<AbortAlgorithmID> add_abort_algorithm(GC::Ref<GC::Function<void()>>);
     void remove_abort_algorithm(AbortAlgorithmID);
 
     // https://dom.spec.whatwg.org/#dom-abortsignal-aborted
@@ -61,7 +61,7 @@ private:
     bool dependent() const { return m_dependent; }
     void set_dependent(bool dependent) { m_dependent = dependent; }
 
-    Vector<GC::Ptr<AbortSignal>> source_signals() const { return m_source_signals; }
+    ReadonlySpan<GC::Ptr<AbortSignal>> source_signals() const { return m_source_signals; }
 
     void append_source_signal(GC::Ptr<AbortSignal> source_signal) { m_source_signals.append(source_signal); }
     void append_dependent_signal(GC::Ptr<AbortSignal> dependent_signal) { m_dependent_signals.append(dependent_signal); }

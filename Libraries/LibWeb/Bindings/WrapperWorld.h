@@ -15,6 +15,7 @@
 #include <LibGC/WeakHashSet.h>
 #include <LibGC/WeakInlines.h>
 #include <LibWeb/Bindings/PlatformObject.h>
+#include <LibWeb/Bindings/RustInterface.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -43,10 +44,15 @@ public:
     // world. Main worlds are agent-lifetime objects and must not detach.
     void detach();
 
-    [[nodiscard]] GC::Ptr<PlatformObject> wrapper_for(Wrappable const&, JS::Realm&) const;
-    void set_wrapper(Wrappable&, PlatformObject&);
-    void clear_wrapper(Wrappable&, PlatformObject const&);
+    [[nodiscard]] GC::Ptr<JS::HostObject> wrapper_for(Wrappable const&, JS::Realm&) const;
+    void set_wrapper(Wrappable&, JS::HostObject&);
+    void clear_wrapper(Wrappable&, JS::HostObject const&);
     void register_preserved_wrappable(GCAllocatedWrappable&);
+
+    // The wrappers of the objects of the interfaces implemented in Rust. An object keeps its wrapper in the main
+    // world itself, so only non-main worlds hold them here.
+    [[nodiscard]] GC::Ptr<JS::HostObject> rust_wrapper_for(RustInterfaceCell const&, JS::Realm&) const;
+    void set_rust_wrapper(RustInterfaceCell&, JS::HostObject&);
 
 private:
     virtual void finalize() override;
@@ -57,7 +63,8 @@ private:
     // Non-main cache cells are realm-local; a logical isolated world that spans
     // multiple realms must allocate one WrapperWorld cell per realm. Both sides
     // are weak; the cache cannot keep either implementation or wrapper alive.
-    GC::WeakHashMap<Wrappable, PlatformObject> m_wrappers;
+    GC::WeakHashMap<Wrappable, JS::HostObject> m_wrappers;
+    GC::WeakHashMap<RustInterfaceCell, JS::HostObject> m_rust_wrappers;
     GC::WeakHashSet<GCAllocatedWrappable> m_preserved_wrappables;
 };
 
@@ -118,6 +125,8 @@ public:
         // for_each(); pruning or insertion would invalidate this iteration.
         m_entries.for_each_live_value([&](auto& cache) { callback(*cache); });
     }
+
+    void clear() { m_entries.clear(); }
 
 private:
     // The per-key cache is held behind an OwnPtr so this map can be embedded as a

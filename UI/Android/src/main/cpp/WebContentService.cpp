@@ -16,6 +16,8 @@
 #include <LibMedia/Audio/Loader.h>
 #include <LibRequests/RequestClient.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/Fetch/Fetching/FetchEngine.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Loader/GeneratedPagesLoader.h>
 #include <LibWeb/Loader/ResourceLoader.h>
@@ -44,13 +46,15 @@ ErrorOr<int> service_main(int ipc_socket)
 
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
 
-    auto image_decoder_client = TRY(bind_image_decoder_service());
-    Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(move(image_decoder_client)));
+    Web::Platform::ImageCodecPlugin::install(*new Web::Platform::RemoteImageCodecPlugin(bind_image_decoder_service));
 
-    Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
+    Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
+    auto& agent = Web::HTML::surrounding_agent();
+    agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
 
     auto request_server_client = TRY(bind_request_server_service());
-    Web::ResourceLoader::initialize(Web::Bindings::main_thread_vm().heap(), move(request_server_client));
+    Web::ResourceLoader::initialize(Web::Bindings::main_thread_vm().heap());
+    Web::ResourceLoader::the().set_client({}, move(request_server_client));
 
     bool is_test_mode = false;
 

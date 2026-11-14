@@ -1,0 +1,9 @@
+Harness status: OK
+
+Found 4 tests
+
+4 Pass
+Pass	Checking intermediate min-content width for span 2 (1)
+Pass	Checking intermediate min-content width for span 2 (2)
+Pass	Checking intermediate min-content width for span 2 (3)
+Pass	Checking intermediate min-content width for span 2 (4)

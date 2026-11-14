@@ -6,9 +6,11 @@
 
 #include <LibGC/Heap.h>
 #include <LibGfx/DecodedImageFrame.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/Invalidation/EmbeddedContentInvalidator.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
@@ -21,6 +23,7 @@
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
@@ -35,17 +38,12 @@
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/MimeSniff/Resource.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
+#include <LibWebCommon/MimeSniff/Resource.h>
 
 namespace Web::HTML {
 
 GC_DEFINE_ALLOCATOR(HTMLObjectElement);
-
-Layout::Node const* HTMLObjectElement::image_provider_layout_node() const
-{
-    return unsafe_layout_node();
-}
 
 static GC::Ref<DOM::Event> create_event_for_element(HTMLElement& element, Utf16FlyString const& event_name)
 {
@@ -77,12 +75,12 @@ void HTMLObjectElement::initialize_element()
     // - the element's node document changes whether it is fully active,
     // ...the user agent must queue an element task on the DOM manipulation task source given the object element to run
     // the following steps to (re)determine what the object element represents.
-    m_document_observer->set_document_became_active([this]() {
-        queue_element_task_to_run_object_representation_steps();
-    });
-    m_document_observer->set_document_became_inactive([this]() {
-        queue_element_task_to_run_object_representation_steps();
-    });
+    m_document_observer->set_document_became_active(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.queue_element_task_to_run_object_representation_steps();
+    }));
+    m_document_observer->set_document_became_inactive(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.queue_element_task_to_run_object_representation_steps();
+    }));
 }
 
 void HTMLObjectElement::visit_edges(Cell::Visitor& visitor)
@@ -148,10 +146,8 @@ void HTMLObjectElement::apply_presentational_hints(Vector<CSS::StyleProperty>& p
             // has an align attribute whose value is an ASCII case-insensitive match for the string "center" or the string "middle",
             // the user agent is expected to act as if the element's 'vertical-align' property was set to a value that aligns the
             // vertical middle of the element with the parent element's baseline.
-            // FIXME: This should use legacy baseline-middle alignment instead of CSS vertical-align: middle,
-            //        as Firefox and Chrome do with engine-specific legacy values.
             if (value.equals_ignoring_ascii_case(u"center"sv) || value.equals_ignoring_ascii_case(u"middle"sv))
-                properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Middle) });
+                properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::LibwebBaselineMiddle) });
         } else if (name == HTML::AttributeNames::border) {
             if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
                 auto width_style_value = CSS::LengthStyleValue::create(CSS::Length::make_px(*parsed_value));
@@ -192,22 +188,18 @@ void HTMLObjectElement::apply_presentational_hints(Vector<CSS::StyleProperty>& p
     });
 }
 
-Layout::Node* HTMLObjectElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLObjectElement::box_kind() const
 {
     switch (m_representation) {
     case Representation::Children:
-        return NavigableContainer::create_layout_node(style);
+        return NavigableContainer::box_kind();
     case Representation::ContentNavigable:
-        return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::NavigableContainerViewport);
+        return CSS::ElementBoxKind::NavigableContainerViewport;
     case Representation::Image:
-        if (image_data())
-            return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::ImageBox);
-        break;
+        return image_data() ? CSS::ElementBoxKind::Image : CSS::ElementBoxKind::NoBox;
     default:
-        break;
+        return CSS::ElementBoxKind::NoBox;
     }
-
-    return nullptr;
 }
 
 bool HTMLObjectElement::has_ancestor_media_element_or_object_element_not_showing_fallback_content() const
@@ -235,11 +227,14 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
 
     // This task being queued or actively running must delay the load event of the element's node document.
     m_document_load_event_delayer_for_object_representation_task.empend(document());
+    auto release_load_event_delay = GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+        self.m_document_load_event_delayer_for_object_representation_task.take_last();
+    });
 
-    queue_an_element_task(HTML::Task::Source::DOMManipulation, [this]() {
-        ScopeGuard guard { [&]() { m_document_load_event_delayer_for_object_representation_task.take_last(); } };
+    auto steps = GC::create_function(GC::Heap::the(), GC::captures(*this, release_load_event_delay), [](auto& self, auto& release_load_event_delay) {
+        ScopeGuard guard { [&] { release_load_event_delay->function()(); } };
 
-        auto& realm = HTML::relevant_realm(*this);
+        auto& realm = HTML::relevant_realm(self);
         // FIXME: 1. If the user has indicated a preference that this object element's fallback content be shown instead of the
         //           element's usual behavior, then jump to the step below labeled fallback.
 
@@ -250,27 +245,27 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
         //    fallback.
         // FIXME: Handle the element being in the stack of open elements.
         // FIXME: Handle the element not being rendered.
-        if (!document().browsing_context() || !document().is_fully_active()) {
-            run_object_representation_fallback_steps();
+        if (!self.document().browsing_context() || !self.document().is_fully_active()) {
+            self.run_object_representation_fallback_steps();
             return;
         }
-        if (has_ancestor_media_element_or_object_element_not_showing_fallback_content()) {
-            run_object_representation_fallback_steps();
+        if (self.has_ancestor_media_element_or_object_element_not_showing_fallback_content()) {
+            self.run_object_representation_fallback_steps();
             return;
         }
 
         // 3. If the data attribute is present and its value is not the empty string, then:
-        if (auto data = get_attribute(HTML::AttributeNames::data); data.has_value() && !data->is_empty()) {
+        if (auto data = self.get_attribute(HTML::AttributeNames::data); data.has_value() && !data->is_empty()) {
             // 1. If the type attribute is present and its value is not a type that the user agent supports, then the user
             //    agent may jump to the step below labeled fallback without fetching the content to examine its real type.
 
             // 2. Let url be the result of encoding-parsing a URL given the data attribute's value, relative to the element's node document.
-            auto url = document().encoding_parse_url(*data);
+            auto url = self.document().encoding_parse_url(*data);
 
             // 3. If url is failure, then fire an event named error at the element and jump to the step below labeled fallback.
             if (!url.has_value()) {
-                dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
-                run_object_representation_fallback_steps();
+                self.dispatch_event(create_event_for_element(self, HTML::EventNames::error));
+                self.run_object_representation_fallback_steps();
                 return;
             }
 
@@ -279,45 +274,60 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             //    "object", and whose use-URL-credentials flag is set.
             auto request = Fetch::Infrastructure::Request::create();
             request->set_url(url.release_value());
-            request->set_client(&document().relevant_settings_object());
+            request->set_client(self.document().relevant_settings_object().address());
             request->set_destination(Fetch::Infrastructure::Request::Destination::Object);
             request->set_credentials_mode(Fetch::Infrastructure::Request::CredentialsMode::Include);
             request->set_mode(Fetch::Infrastructure::Request::Mode::Navigate);
             request->set_initiator_type(Fetch::Infrastructure::Request::InitiatorType::Object);
             request->set_use_url_credentials(true);
 
-            Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
-            fetch_algorithms_input.process_response = [this](GC::Ref<Fetch::Infrastructure::Response> response) {
-                auto& realm = HTML::relevant_realm(*this);
-                auto& global = document().relevant_settings_object().realm().global_object();
+            Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
+            fetch_algorithms_input.process_response = GC::create_function(GC::Heap::the(), GC::captures(self), [](auto& self, GC::Ref<Fetch::Infrastructure::ResponseView> response) {
+                auto& realm = HTML::relevant_realm(self);
+                auto& global = self.document().relevant_settings_object().realm().global_object();
 
-                if (response->is_network_error() || !Fetch::Infrastructure::is_ok_status(response->status())) {
-                    resource_did_fail();
+                if (response->is_network_error()) {
+                    self.resource_did_fail();
                     return;
                 }
 
-                if (response->type() == Fetch::Infrastructure::Response::Type::Opaque || response->type() == Fetch::Infrastructure::Response::Type::OpaqueRedirect) {
-                    auto& filtered_response = static_cast<Fetch::Infrastructure::FilteredResponse&>(*response);
-                    response = filtered_response.internal_response();
+                if (!Fetch::Infrastructure::is_ok_status(response->status())) {
+                    // NB: Fetch only reports the response's timing once its body has been fully read, so read it without
+                    //     holding back the failure.
+                    if (auto body = response->body()) {
+                        auto ignore_chunk = GC::create_function(GC::Heap::the(), [](ByteBuffer) { });
+                        auto ignore_end_of_body = GC::create_function(GC::Heap::the(), [] { });
+                        auto ignore_body_error = GC::create_function(GC::Heap::the(), [](JS::Value) { });
+                        (void)body->incrementally_read(realm, ignore_chunk, ignore_end_of_body, ignore_body_error, GC::Ref { global });
+                    }
+                    self.resource_did_fail();
+                    return;
                 }
 
-                auto on_data_read = GC::create_function(GC::Heap::the(), [this, response](ByteBuffer data) {
-                    resource_did_load(response, data);
+                if (response->type() == Fetch::Infrastructure::Response::Type::Opaque || response->type() == Fetch::Infrastructure::Response::Type::OpaqueRedirect)
+                    response = response->unsafe_response();
+
+                auto on_data_read = GC::create_function(GC::Heap::the(), GC::captures(self, response), [](auto& self, auto& response, ByteBuffer data) {
+                    self.resource_did_load(response, data);
                 });
-                auto on_error = GC::create_function(GC::Heap::the(), [this](JS::Value) {
-                    resource_did_fail();
+                auto on_error = GC::create_function(GC::Heap::the(), GC::captures(self), [](auto& self, JS::Value) {
+                    self.resource_did_fail();
                 });
 
-                VERIFY(response->body());
+                // NB: A response without a body, such as a 204, has nothing to read: Its data is empty.
+                if (!response->body()) {
+                    self.resource_did_load(response, {});
+                    return;
+                }
                 response->body()->fully_read(realm, on_data_read, on_error, GC::Ref { global });
-            };
+            });
 
             // 5. Fetch request.
             (void)Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
 
             //    Fetching the resource must delay the load event of the element's node document until the task that is
             //    queued by the networking task source once the resource has been fetched (defined next) has been run.
-            m_document_load_event_delayer_for_resource_load.empend(document());
+            self.m_document_load_event_delayer_for_resource_load.empend(self.document());
 
             // 6. If the resource is not yet available (e.g. because the resource was not available in the cache, so that
             //    loading the resource required making a request over the network), then jump to the step below labeled
@@ -330,6 +340,8 @@ void HTMLObjectElement::queue_element_task_to_run_object_representation_steps()
             //       briefly between here and the resource loading.
         }
     });
+
+    queue_an_element_task(HTML::Task::Source::DOMManipulation, move(steps), release_load_event_delay);
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:concept-event-fire-2
@@ -344,7 +356,7 @@ void HTMLObjectElement::resource_did_fail()
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#object-type-detection
-void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::Response const& response, ReadonlyBytes data)
+void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::ResponseView const& response, ReadonlyBytes data)
 {
     ScopeGuard guard { [&]() { m_document_load_event_delayer_for_resource_load.take_last(); } };
 
@@ -428,12 +440,27 @@ void HTMLObjectElement::resource_did_load(Fetch::Infrastructure::Response const&
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:plugin-11
-void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastructure::Response const& response, MimeSniff::MimeType const& resource_type, ReadonlyBytes data)
+void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastructure::ResponseView const& response, MimeSniff::MimeType const& resource_type, ReadonlyBytes data)
 {
     // 3.9. Handler: Handle the content as given by the first of the following cases that matches:
 
     // -> If the resource type is an XML MIME type, or if the resource type does not start with "image/"
     if (can_load_document_with_type(resource_type) && (resource_type.is_xml() || !resource_type.is_image())) {
+        // AD-HOC: The spec does not stop an object from embedding the document that contains it, so the nesting never
+        //         ends and the load event never fires. Matching other engines, allow one level of self-reference and
+        //         show the fallback content at the second.
+        if (response.url().has_value() && !url_matches_about_blank(*response.url())) {
+            size_t navigables_with_same_url = 0;
+            for (auto const& navigable : document().inclusive_ancestor_navigables()) {
+                if (auto url = navigable->active_document_url(); url.has_value() && url->equals(*response.url(), URL::ExcludeFragment::Yes))
+                    ++navigables_with_same_url;
+            }
+            if (navigables_with_same_url >= 2) {
+                run_object_representation_fallback_steps();
+                return;
+            }
+        }
+
         // If the object element's content navigable is null, then create a new child navigable for the element.
         if (!m_content_navigable && in_a_document_tree()) {
             create_new_child_navigable();
@@ -469,7 +496,10 @@ void HTMLObjectElement::run_object_representation_handler_steps(Fetch::Infrastru
         // The object element represents the specified image.
         // If the image cannot be rendered, e.g. because it is malformed or in an unsupported format, jump to the step
         // below labeled fallback.
+        // AD-HOC: The spec only jumps to fallback here. But an empty image is a resource that failed to load, so fire
+        //         error first, as for any other.
         if (data.is_empty()) {
+            dispatch_event(create_event_for_element(*this, HTML::EventNames::error));
             run_object_representation_fallback_steps();
             return;
         }
@@ -493,9 +523,9 @@ void HTMLObjectElement::run_object_representation_completed_steps(Representation
     //       queue an element task on the DOM manipulation task source given the object element to fire an event named
     //       load at the element.
     if (representation != Representation::ContentNavigable) {
-        queue_an_element_task(HTML::Task::Source::DOMManipulation, [&]() {
-            dispatch_event(create_event_for_element(*this, HTML::EventNames::load));
-        });
+        queue_an_element_task(HTML::Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            self.dispatch_event(create_event_for_element(self, HTML::EventNames::load));
+        }));
     }
 
     update_layout_and_child_objects(representation);
@@ -526,20 +556,27 @@ void HTMLObjectElement::load_image()
 
     m_document_load_event_delayer_for_resource_load.empend(document());
 
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *url);
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *url, HTML::CORSSettingAttribute::NoCORS);
+    // An image representation has a box only once the new request has image data.
+    CSS::record_element_box_kind(*this);
+    CSS::record_element_replaced_content_input(*this);
     m_resource_request->add_callbacks(
-        [this] {
-            run_object_representation_completed_steps(Representation::Image);
-            m_document_load_event_delayer_for_resource_load.take_last();
-        },
-        [this] {
-            run_object_representation_fallback_steps();
-            m_document_load_event_delayer_for_resource_load.take_last();
-        });
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            CSS::record_element_replaced_content_input(self);
+            self.run_object_representation_completed_steps(Representation::Image);
+            self.m_document_load_event_delayer_for_resource_load.take_last();
+        }),
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            self.run_object_representation_fallback_steps();
+            self.m_document_load_event_delayer_for_resource_load.take_last();
+        }),
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& self) {
+            self.m_document_load_event_delayer_for_resource_load.take_last();
+        }));
 
     if (m_resource_request->needs_fetching()) {
         auto request = HTML::create_potential_CORS_request(*url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
-        request->set_client(&document().relevant_settings_object());
+        request->set_client(document().relevant_settings_object().address());
         m_resource_request->fetch_resource(request);
     }
 }
@@ -554,6 +591,9 @@ void HTMLObjectElement::update_layout_and_child_objects(Representation represent
     }
 
     m_representation = representation;
+    // The representation decides which box the element asks for, and what that box is sized from.
+    CSS::record_element_box_kind(*this);
+    CSS::record_element_replaced_content_input(*this);
 
     if (auto parent_element = this->parent_element())
         parent_element->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLObjectElementUpdateLayoutAndChildObjects);
@@ -564,6 +604,13 @@ i32 HTMLObjectElement::default_tab_index_value() const
 {
     // See the base function for the spec comments.
     return 0;
+}
+
+void HTMLObjectElement::set_natural_size_of_content_document(CSS::SizeWithAspectRatio const& natural_size)
+{
+    m_natural_size_of_content_document = natural_size;
+    CSS::record_element_replaced_content_input(*this);
+    set_needs_layout_update(DOM::SetNeedsLayoutReason::HTMLObjectElementContentDocumentResized);
 }
 
 GC::Ptr<DecodedImageData> HTMLObjectElement::image_data() const

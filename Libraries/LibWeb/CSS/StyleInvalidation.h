@@ -83,14 +83,17 @@ struct RequiredInvalidationAfterStyleChange {
     // exact set to avoid reading unrelated inherited groups.
     static constexpr u8 all_inherited_style_groups = (1 << 7) - 1;
     [[nodiscard]] bool inherited_style_changed() const { return m_inherited_style_groups_changed != 0; }
-    [[nodiscard]] u8 inherited_style_groups_changed() const { return m_inherited_style_groups_changed; }
     void mark_inherited_style_group_changed(size_t group) { m_inherited_style_groups_changed |= 1 << group; }
     // A property controlling decorations originated by this box changed. Descendant boxes paint
     // the propagated decorations from these values, so their cached paint commands are stale.
     bool repaint_propagated_text_decorations : 1 { false };
-    // Selection highlights are painted by text descendants, even when the element has no box.
-    bool repaint_selection : 1 { false };
+    // Highlight pseudo-elements are painted by text descendants, even when the element has no box.
+    bool repaint_highlights : 1 { false };
+    // The white space of the element's text children collapses where it did not, or the other way round, so the white
+    // space text among them may gain or lose its box.
+    bool white_space_collapse_changed : 1 { false };
     bool affects_hit_testing : 1 { false };
+    bool cursor_changed : 1 { false };
     // A non-inherited property changed without any other invalidation, which happens when a running
     // animation covers the property. Descendants that explicitly inherit non-inherited properties
     // still observe the change.
@@ -111,8 +114,10 @@ struct RequiredInvalidationAfterStyleChange {
         recompute_descendant_styles |= other.recompute_descendant_styles;
         m_inherited_style_groups_changed |= other.m_inherited_style_groups_changed;
         repaint_propagated_text_decorations |= other.repaint_propagated_text_decorations;
-        repaint_selection |= other.repaint_selection;
+        repaint_highlights |= other.repaint_highlights;
+        white_space_collapse_changed |= other.white_space_collapse_changed;
         affects_hit_testing |= other.affects_hit_testing;
+        cursor_changed |= other.cursor_changed;
         non_inherited_property_inheritance_sources_changed |= other.non_inherited_property_inheritance_sources_changed;
     }
 
@@ -123,7 +128,8 @@ struct RequiredInvalidationAfterStyleChange {
             && !needs_scroll_container_resnap
             && !recompute_descendant_styles
             && !inherited_style_changed()
-            && !repaint_selection
+            && !repaint_highlights
+            && !white_space_collapse_changed
             && !affects_hit_testing
             && !repaint_propagated_text_decorations
             && !non_inherited_property_inheritance_sources_changed;
@@ -133,15 +139,6 @@ struct RequiredInvalidationAfterStyleChange {
     {
         RequiredInvalidationAfterStyleChange invalidation;
         invalidation.ensure_at_least(InvalidationLevel::RebuildLayoutTree);
-        invalidation.set_needs_stacking_context_tree_rebuild();
-        return invalidation;
-    }
-
-    static RequiredInvalidationAfterStyleChange rebuild_layout_tree_from(LayoutTreeRebuildRoot rebuild_root)
-    {
-        RequiredInvalidationAfterStyleChange invalidation;
-        invalidation.m_level = InvalidationLevel::RebuildLayoutTree;
-        invalidation.m_layout_tree_rebuild_root = rebuild_root;
         invalidation.set_needs_stacking_context_tree_rebuild();
         return invalidation;
     }

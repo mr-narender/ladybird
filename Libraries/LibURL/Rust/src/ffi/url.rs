@@ -8,6 +8,7 @@ use crate::rust_panic::abort_on_panic;
 use std::ffi::c_void;
 
 use crate::url::BasicParseOptions;
+use crate::url::BlobUrlEntry;
 use crate::url::HostKind;
 use crate::url::State;
 use crate::url::Url;
@@ -21,21 +22,24 @@ use crate::url::{UrlInput, parse_host_into};
 #[derive(Clone, Copy)]
 pub struct RustUrlInput {
     pub utf8: *const u8,
+    pub latin1: *const u8,
     pub utf16: *const u16,
     pub length: usize,
 }
 
 impl RustUrlInput {
     /// # Safety
-    /// The selected pointer must borrow length storage units. Byte input must be valid UTF-8.
-    unsafe fn borrow<'a>(self) -> UrlInput<'a> {
+    /// The selected pointer must borrow length storage units. UTF-8 input must be valid UTF-8.
+    pub(crate) unsafe fn borrow<'a>(self) -> UrlInput<'a> {
         if self.length == 0 {
             return UrlInput::Utf8("");
         }
         if !self.utf16.is_null() {
-            UrlInput::Utf16(unsafe { std::slice::from_raw_parts(self.utf16, self.length) })
+            UrlInput::Utf16(unsafe { ak::slice_from_raw_parts(self.utf16, self.length) })
+        } else if !self.latin1.is_null() {
+            UrlInput::Latin1(unsafe { ak::slice_from_raw_parts(self.latin1, self.length) })
         } else {
-            UrlInput::Utf8(unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.utf8, self.length)) })
+            UrlInput::Utf8(unsafe { std::str::from_utf8_unchecked(ak::slice_from_raw_parts(self.utf8, self.length)) })
         }
     }
 }
@@ -48,7 +52,7 @@ pub struct RustUrlByteSlice {
 }
 
 impl RustUrlByteSlice {
-    fn from_str(string: &str) -> Self {
+    pub(crate) fn from_str(string: &str) -> Self {
         Self {
             data: string.as_ptr(),
             length: string.len(),
@@ -57,11 +61,11 @@ impl RustUrlByteSlice {
 
     /// # Safety
     /// A non-null data pointer must borrow length bytes of valid UTF-8.
-    unsafe fn borrow<'a>(self) -> Option<&'a str> {
+    pub(crate) unsafe fn borrow<'a>(self) -> Option<&'a str> {
         if self.data.is_null() {
             return None;
         }
-        let bytes = unsafe { std::slice::from_raw_parts(self.data, self.length) };
+        let bytes = unsafe { ak::slice_from_raw_parts(self.data, self.length) };
         Some(std::str::from_utf8(bytes).expect("URL strings should be valid UTF-8"))
     }
 }
@@ -72,13 +76,15 @@ impl RustUrlByteSlice {
 pub struct RustUrl {
     pub serialization: RustUrlByteSlice,
     pub components: UrlComponents,
+    pub blob_url_entry: *const c_void,
 }
 
 impl RustUrl {
-    fn from_url(url: &Url) -> Self {
+    pub fn from_url(url: &Url) -> Self {
         Self {
             serialization: RustUrlByteSlice::from_str(url.as_str()),
             components: url.components(),
+            blob_url_entry: url.blob_url_entry().map_or(std::ptr::null(), BlobUrlEntry::as_ptr),
         }
     }
 
@@ -88,6 +94,17 @@ impl RustUrl {
         Url {
             serialization: unsafe { self.serialization.borrow() }.unwrap_or(""),
             components: self.components,
+            blob_url_entry: (),
+        }
+    }
+
+    /// # Safety
+    /// The serialization must be valid UTF-8 for the duration of this call, the components must describe it, and the
+    /// blob URL entry must be null or live.
+    pub unsafe fn to_url(&self) -> Url {
+        Url {
+            blob_url_entry: unsafe { BlobUrlEntry::from_borrowed(self.blob_url_entry) },
+            ..Url::from(unsafe { self.borrow() })
         }
     }
 }
@@ -103,7 +120,7 @@ pub struct FfiUrlHost {
 }
 
 impl FfiUrlHost {
-    fn new(kind: HostKind, serialized_host: &str) -> Self {
+    pub(crate) fn new(kind: HostKind, serialized_host: &str) -> Self {
         let mut host = Self {
             kind,
             ipv4: [0; 4],
@@ -142,7 +159,7 @@ unsafe fn modify_url(
     on_complete: FfiUrlResultFn,
     modify: impl FnOnce(&mut Url),
 ) {
-    let mut url = Url::from(unsafe { (*url).borrow() });
+    let mut url = unsafe { (*url).to_url() };
     modify(&mut url);
     let result = RustUrl::from_url(&url);
     // SAFETY: result borrows from url, which lives until the callback returns.
@@ -241,10 +258,13 @@ pub unsafe extern "C" fn rust_url_set_password(
 pub unsafe extern "C" fn rust_url_set_port(
     url: *const RustUrl,
     has_port: bool,
-    port: u16,
+    port: u32,
     ctx: *mut c_void,
     on_complete: FfiUrlResultFn,
 ) {
+    // NB: A port travels in 32 bits. rustc takes the upper bits of a narrower parameter to be zero, which GCC 16 does not
+    //     hold to: it sign-extends a u16 of 32768 or above.
+    let port = port as u16;
     abort_on_panic(|| unsafe {
         modify_url(url, ctx, on_complete, |url| url.set_port(has_port.then_some(port)));
     })
@@ -329,7 +349,7 @@ pub unsafe extern "C" fn rust_url_set_path(
         let segments = if segment_count == 0 {
             &[]
         } else {
-            std::slice::from_raw_parts(segments, segment_count)
+            ak::slice_from_raw_parts(segments, segment_count)
         };
         modify_url(url, ctx, on_complete, |url| {
             url.set_path(segments.iter().map(|segment| segment.borrow().unwrap_or("")))

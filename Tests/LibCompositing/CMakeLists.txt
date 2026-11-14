@@ -1,21 +1,15 @@
+ladybird_test_suite(LibCompositing)
+
 set(TEST_SOURCES
-    BenchmarkForceDarkImageFilter.cpp
-    TestAsyncScrollingStateScrollbarMetadata.cpp
-    TestAsyncScrollingStateSnapMetadata.cpp
-    TestDisplayListCommandRuns.cpp
-    TestForceDarkImageFilter.cpp
+    TestOverlayFade.cpp
+    TestOverlayGeometry.cpp
     TestPausedDebuggerOverlay.cpp
-    TestScrollSnapSelection.cpp
-    TestScrollState.cpp
-    TestSmoothScrollAnimation.cpp
+    TestPictureInPictureControls.cpp
+    TestScrollRequest.cpp
     TestTextureUpload.cpp
+    TestUIOverlays.cpp
+    TestVideoFrameHold.cpp
 )
 
-foreach(source IN LISTS TEST_SOURCES)
-    set(test_libraries LibCompositing LibGfx LibIPC)
-    if (source STREQUAL "BenchmarkForceDarkImageFilter.cpp" OR source STREQUAL "TestForceDarkImageFilter.cpp")
-        # These two drive Skia directly, and LibGfx keeps its Skia dependency private.
-        list(APPEND test_libraries skia)
-    endif()
-    ladybird_test("${source}" LibCompositing LIBS ${test_libraries})
-endforeach()
+target_sources(TestLibCompositing PRIVATE ${TEST_SOURCES})
+target_link_libraries(TestLibCompositing PRIVATE LibCompositing LibGfx LibIPC)

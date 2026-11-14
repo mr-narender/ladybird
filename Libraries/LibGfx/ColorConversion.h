@@ -207,9 +207,9 @@ constexpr ColorComponents linear_srgb_to_oklab(ColorComponents const& rgb)
     float g = rgb[1];
     float b = rgb[2];
 
-    float l = cbrtf(0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b);
-    float m = cbrtf(0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b);
-    float s = cbrtf(0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b);
+    float l = AK::cbrt<float>(0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b);
+    float m = AK::cbrt<float>(0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b);
+    float s = AK::cbrt<float>(0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b);
 
     return {
         0.2104542553f * l + 0.7936177850f * m - 0.0040720468f * s,
@@ -239,35 +239,22 @@ ColorComponents xyz50_to_xyz65(ColorComponents const&);
 ColorComponents xyz65_to_oklab(ColorComponents const&);
 ColorComponents oklab_to_xyz65(ColorComponents const&);
 
-ColorComponents oklab_to_oklch(ColorComponents const&);
-ColorComponents oklch_to_oklab(ColorComponents const&);
-
 ColorComponents xyz50_to_lab(ColorComponents const&);
-
-ColorComponents lab_to_lch(ColorComponents const&);
-ColorComponents lch_to_lab(ColorComponents const&);
 
 ColorComponents srgb_to_hsl(ColorComponents const&);
 
 ColorComponents srgb_to_hwb(ColorComponents const&);
 ColorComponents hwb_to_srgb(ColorComponents const&);
 
-ColorComponents linear_display_p3_to_display_p3(ColorComponents const&);
 ColorComponents xyz65_to_linear_display_p3(ColorComponents const&);
 
-ColorComponents a98_rgb_to_linear_a98_rgb(ColorComponents const&);
 ColorComponents linear_a98_rgb_to_a98_rgb(ColorComponents const&);
-ColorComponents linear_a98_rgb_to_xyz65(ColorComponents const&);
 ColorComponents xyz65_to_linear_a98_rgb(ColorComponents const&);
 
-ColorComponents prophoto_rgb_to_linear_prophoto_rgb(ColorComponents const&);
 ColorComponents linear_prophoto_rgb_to_prophoto_rgb(ColorComponents const&);
-ColorComponents linear_prophoto_rgb_to_xyz50(ColorComponents const&);
 ColorComponents xyz50_to_linear_prophoto_rgb(ColorComponents const&);
 
-ColorComponents rec2020_to_linear_rec2020(ColorComponents const&);
 ColorComponents linear_rec2020_to_rec2020(ColorComponents const&);
-ColorComponents linear_rec2020_to_xyz65(ColorComponents const&);
 ColorComponents xyz65_to_linear_rec2020(ColorComponents const&);
 
 }

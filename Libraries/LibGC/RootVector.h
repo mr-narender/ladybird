@@ -18,6 +18,8 @@
 namespace GC {
 
 class GC_API RootVectorBase {
+    AK_MAKE_NONCOPYABLE(RootVectorBase);
+
 public:
     virtual void gather_roots(HashMap<Cell*, GC::HeapRoot>&) const = 0;
 
@@ -56,6 +58,20 @@ public:
     {
     }
 
+    RootVector(VectorBase&& other)
+        : RootVectorBase()
+        , VectorBase(move(other))
+    {
+    }
+
+    // The element type is named through VectorBase so that class template argument deduction never picks this
+    // constructor, which would deduce a RootVector of Vectors from GC::RootVector { move(vector) }.
+    RootVector(std::initializer_list<typename VectorBase::ValueType> list)
+        : RootVectorBase()
+        , VectorBase(list)
+    {
+    }
+
     RootVector(RootVector const& other)
         : RootVectorBase(*other.m_heap)
         , Vector<T, inline_capacity>(other)
@@ -87,8 +103,8 @@ public:
 
     virtual void gather_roots(HashMap<Cell*, GC::HeapRoot>& roots) const override
     {
-        static_assert(Detail::RootableValueTraits<T>::is_rootable,
-            "RootVector element type must be convertible to Cell const* or derive from NanBoxedValue");
+        static_assert(Detail::IsRootableValue<T>,
+            "RootVector element type must be a cell, derive from NanBoxedValue, or be a traced value");
         for (auto& value : *this)
             Detail::gather_root(roots, value, HeapRoot::Type::RootVector);
     }

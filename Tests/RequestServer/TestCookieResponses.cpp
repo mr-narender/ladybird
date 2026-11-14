@@ -6,10 +6,13 @@
 
 #include <LibCore/EventLoop.h>
 #include <LibCore/Socket.h>
+#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 #include <LibCore/TCPServer.h>
 #include <LibCore/Timer.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibHTTP/Cache/DiskCache.h>
+#include <LibHTTP/Cache/Utilities.h>
 #include <LibIPC/Transport.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
@@ -18,11 +21,9 @@
 #include <RequestServer/ControlConnectionFromClient.h>
 #include <RequestServer/ResourceSubstitutionMap.h>
 
-namespace RequestServer {
-
-OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
-
-}
+#ifdef AK_OS_WINDOWS
+#    include <AK/Windows.h>
+#endif
 
 namespace {
 
@@ -41,6 +42,24 @@ static void initialize_libcurl()
     (void)libcurl_initialized;
 }
 
+// Waits for the next message on a transport, which must be the only one waiting.
+template<typename Endpoint, typename MessageType>
+static NonnullOwnPtr<MessageType> take_message(IPC::Transport& transport)
+{
+    transport.wait_until_readable();
+
+    OwnPtr<MessageType> taken_message;
+    auto should_shutdown = transport.read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
+        auto message = MUST(Endpoint::decode_message(raw_message.bytes.bytes(), raw_message.attachments));
+        VERIFY(message->message_id() == MessageType::static_message_id());
+        VERIFY(!taken_message);
+        taken_message = message.template release_nonnull<MessageType>();
+    });
+    VERIFY(should_shutdown == IPC::Transport::ShouldShutdown::No);
+    VERIFY(taken_message);
+    return taken_message.release_nonnull();
+}
+
 // The initial socket: the only connection that may answer cookie lookups.
 class TestControlConnection {
 public:
@@ -52,12 +71,7 @@ public:
         m_remote_transport = MUST(pair.remote_handle.create_transport());
         m_connection = RequestServer::ControlConnectionFromClient::construct(
             move(pair.local), server.connections, server.request_transfer_leases,
-            Optional<HTTP::DiskCache&> {}, ByteString {});
-#ifdef AK_OS_WINDOWS
-        auto pid = Core::System::getpid();
-        m_connection->transport().set_peer_pid(pid);
-        m_remote_transport->set_peer_pid(pid);
-#endif
+            Optional<HTTP::DiskCache&> {});
     }
 
     ~TestControlConnection()
@@ -82,11 +96,22 @@ public:
         VERIFY(!response);
     }
 
+    void designate_request_adopter(int source_client_id, u64 source_request_id, int adopter_client_id)
+    {
+        auto designation_id = m_next_designation_id++;
+        auto message = make<Messages::RequestServerControl::DesignateRequestAdopter>(designation_id, source_client_id, source_request_id, adopter_client_id);
+        auto response = MUST(static_cast<RequestServerControlEndpoint::Stub&>(*m_connection).handle(move(message)));
+        VERIFY(!response);
+
+        auto reply = take_message<RequestServerControlClientEndpoint, Messages::RequestServerControlClient::RequestAdopterDesignated>(*m_remote_transport);
+        VERIFY(reply->designation_id() == designation_id);
+    }
+
     // Runs the event loop until RequestServer asks the UI process to store a response's cookies and HSTS policy.
     NonnullOwnPtr<Messages::RequestServerControlClient::StoreResponseCookiesAndHstsPolicy> wait_for_storage_request(Core::EventLoop& event_loop)
     {
         // The control transport is not part of the event loop here, so keep the loop from sleeping until it has news.
-        auto wake_timer = Core::Timer::create_repeating(10, [] { });
+        auto wake_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(10), [] { });
         wake_timer->start();
 
         OwnPtr<Messages::RequestServerControlClient::StoreResponseCookiesAndHstsPolicy> storage_request;
@@ -101,44 +126,46 @@ public:
         return storage_request.release_nonnull();
     }
 
-    NonnullOwnPtr<Messages::RequestServerControlClient::RetrieveHttpCookie> take_cookie_request()
+    NonnullOwnPtr<Messages::RequestServerControlClient::RetrieveHttpCookie> wait_for_cookie_request(Core::EventLoop& event_loop)
     {
-        m_remote_transport->wait_until_readable();
+        auto wake_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(10), [] { });
+        wake_timer->start();
 
         OwnPtr<Messages::RequestServerControlClient::RetrieveHttpCookie> cookie_request;
-        auto should_shutdown = m_remote_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
-            auto message = MUST(RequestServerControlClientEndpoint::decode_message(raw_message.bytes.bytes(), raw_message.attachments));
-            VERIFY(message->message_id() == Messages::RequestServerControlClient::RetrieveHttpCookie::static_message_id());
-            VERIFY(!cookie_request);
-            cookie_request = message.template release_nonnull<Messages::RequestServerControlClient::RetrieveHttpCookie>();
+        event_loop.spin_until([&] {
+            (void)m_remote_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
+                auto message = MUST(RequestServerControlClientEndpoint::decode_message(raw_message.bytes.bytes(), raw_message.attachments));
+                if (!cookie_request && message->message_id() == Messages::RequestServerControlClient::RetrieveHttpCookie::static_message_id())
+                    cookie_request = message.template release_nonnull<Messages::RequestServerControlClient::RetrieveHttpCookie>();
+            });
+            return cookie_request != nullptr;
         });
-        VERIFY(should_shutdown == IPC::Transport::ShouldShutdown::No);
-        VERIFY(cookie_request);
         return cookie_request.release_nonnull();
+    }
+
+    NonnullOwnPtr<Messages::RequestServerControlClient::RetrieveHttpCookie> take_cookie_request()
+    {
+        return take_message<RequestServerControlClientEndpoint, Messages::RequestServerControlClient::RetrieveHttpCookie>(*m_remote_transport);
     }
 
 private:
     OwnPtr<IPC::Transport> m_remote_transport;
     RefPtr<RequestServer::ControlConnectionFromClient> m_connection;
+    u64 m_next_designation_id { 0 };
 };
 
 // A data connection, as handed out by the control connection to each helper process.
 class TestConnection {
 public:
-    explicit TestConnection(TestServer& server)
+    explicit TestConnection(TestServer& server, RequestServer::SiteBinding site_binding = RequestServer::SiteBinding::Bound, Optional<HTTP::DiskCache&> disk_cache = {})
     {
         initialize_libcurl();
 
         auto pair = MUST(IPC::Transport::create_paired());
         m_remote_transport = MUST(pair.remote_handle.create_transport());
         m_connection = RequestServer::ConnectionFromClient::construct(
-            move(pair.local), RequestServer::IsPrivate::No,
-            server.connections, server.request_transfer_leases, Optional<HTTP::DiskCache&> {}, ByteString {});
-#ifdef AK_OS_WINDOWS
-        auto pid = Core::System::getpid();
-        m_connection->transport().set_peer_pid(pid);
-        m_remote_transport->set_peer_pid(pid);
-#endif
+            move(pair.local), RequestServer::IsPrivate::No, site_binding,
+            server.connections, server.request_transfer_leases, disk_cache);
     }
 
     ~TestConnection()
@@ -149,13 +176,7 @@ public:
 
     int client_id() const { return m_connection->client_id(); }
     bool is_open() const { return m_connection->is_open(); }
-
-    void set_certificate(u64 request_id)
-    {
-        auto message = make<Messages::RequestServer::SetCertificate>(request_id, ByteString { "certificate" }, ByteString { "key" });
-        auto response = dispatch(move(message));
-        VERIFY(response);
-    }
+    void shutdown() { m_connection->shutdown(); }
 
     void stop_request(u64 request_id)
     {
@@ -164,22 +185,80 @@ public:
         VERIFY(response);
     }
 
-    void start_request(u64 request_id, Optional<URL::URL> target_url = {})
+    void start_request(u64 request_id, Optional<URL::URL> target_url = {}, ByteString method = "GET"sv, Vector<HTTP::Header> headers = {}, Optional<HTTP::NetworkIsolationKey> network_isolation_key = {})
     {
         auto url = target_url.value_or(URL::Parser::basic_parse("http://localhost"sv).release_value());
-        auto message = make<Messages::RequestServer::StartRequest>(request_id, ByteString { "GET" }, move(url), Vector<HTTP::Header> {}, ByteBuffer {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, true, Optional<u32> {}, false, 0, 0);
+        auto message = make<Messages::RequestServer::StartRequest>(request_id, move(method), move(url), move(headers), ByteBuffer {}, HTTP::CacheMode::Default, move(network_isolation_key), HTTP::Cookie::IncludeCredentials::Yes, true, Optional<u32> {}, false, 0, 0, HTTP::Cookie::SameSiteContext {});
         auto response = dispatch(move(message));
         VERIFY(!response);
     }
 
-    void adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease = false)
+    void websocket_connect(u64 websocket_id, URL::URL url, ByteString origin = "http://localhost"sv, Vector<ByteString> protocols = {}, Vector<HTTP::Header> headers = {})
     {
-        auto message = make<Messages::RequestServer::AdoptRequest>(source_client_id, source_request_id, target_request_id, preserve_transfer_lease);
+        auto message = make<Messages::RequestServer::WebsocketConnect>(websocket_id, move(url), Optional<HTTP::NetworkIsolationKey> {}, move(origin), move(protocols), Vector<ByteString> {}, move(headers), HTTP::Cookie::SameSiteContext {});
+        auto response = dispatch(move(message));
+        VERIFY(!response);
+    }
+
+    template<typename MessageType>
+    NonnullOwnPtr<MessageType> take_client_message()
+    {
+        OwnPtr<MessageType> result;
+        while (!result) {
+            m_remote_transport->wait_until_readable();
+            read_client_messages(result);
+        }
+        return result.release_nonnull();
+    }
+
+    // Keep the event loop running for requests that reach the network.
+    template<typename MessageType>
+    NonnullOwnPtr<MessageType> take_client_message(Core::EventLoop& event_loop)
+    {
+        // The client transport is outside the event loop, so prevent the loop from sleeping.
+        auto wake_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(10), [] { });
+        wake_timer->start();
+
+        OwnPtr<MessageType> result;
+        event_loop.spin_until([&] {
+            read_client_messages(result);
+            return result != nullptr;
+        });
+        return result.release_nonnull();
+    }
+
+    Optional<Requests::NetworkError> take_request_finished_error(u64 request_id)
+    {
+        auto request_finished = take_client_message<Messages::RequestClient::RequestFinished>();
+        VERIFY(request_finished->request_id() == request_id);
+        return request_finished->network_error();
+    }
+
+    void ensure_connection(u64 request_id, URL::URL url)
+    {
+        auto message = make<Messages::RequestServer::EnsureConnection>(request_id, move(url), RequestServer::CacheLevel::CreateConnection);
+        auto response = dispatch(move(message));
+        VERIFY(!response);
+    }
+
+    void adopt_request(int source_client_id, u64 source_request_id, u64 target_request_id, bool preserve_transfer_lease = false, Optional<int> owner_client_id = {})
+    {
+        auto message = make<Messages::RequestServer::AdoptRequest>(source_client_id, source_request_id, target_request_id, preserve_transfer_lease, owner_client_id);
         auto response = dispatch(move(message));
         VERIFY(!response);
     }
 
 private:
+    template<typename MessageType>
+    void read_client_messages(OwnPtr<MessageType>& result)
+    {
+        (void)m_remote_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
+            auto message = MUST(RequestClientEndpoint::decode_message(raw_message.bytes.bytes(), raw_message.attachments));
+            if (!result && message->message_id() == MessageType::static_message_id())
+                result = message.template release_nonnull<MessageType>();
+        });
+    }
+
     OwnPtr<IPC::MessageBuffer> dispatch(NonnullOwnPtr<IPC::Message> message)
     {
         return MUST(static_cast<RequestServerEndpoint::Stub&>(*m_connection).handle(move(message)));
@@ -196,23 +275,72 @@ namespace {
 // A local HTTP server that answers every request with a response that sets a cookie.
 class SetCookieServer {
 public:
-    SetCookieServer()
+    explicit SetCookieServer(StringView response = "HTTP/1.1 200 OK\r\nSet-Cookie: session=fresh\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"sv)
+    {
+        m_server = MUST(Core::TCPServer::try_create());
+        MUST(m_server->listen(IPv4Address { 127, 0, 0, 1 }, 0));
+        m_server->on_ready_to_accept = [this, response] {
+            auto socket = MUST(m_server->accept());
+            MUST(socket->set_blocking(false));
+            m_sockets.append(move(socket));
+            auto& connection = *m_sockets.last();
+            connection.on_ready_to_read = [this, &connection, response] {
+                auto buffer = MUST(ByteBuffer::create_uninitialized(4096));
+                auto request = MUST(connection.read_some(buffer));
+                if (request.is_empty())
+                    return;
+                m_received_request = ByteString { request };
+                connection.on_ready_to_read = nullptr;
+                MUST(connection.set_blocking(true));
+                MUST(connection.write_until_depleted(response.bytes()));
+            };
+        };
+    }
+
+    URL::URL url() const
+    {
+        return URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/", *m_server->local_port())).release_value();
+    }
+
+    ByteString const& received_request() const { return m_received_request; }
+
+private:
+    ByteString m_received_request;
+    RefPtr<Core::TCPServer> m_server;
+    Vector<NonnullOwnPtr<Core::TCPSocket>> m_sockets;
+};
+
+}
+
+namespace {
+
+// Serves a stale response, then revalidates with a 304 that deletes a cookie.
+class RevalidatingServer {
+public:
+    RevalidatingServer()
     {
         m_server = MUST(Core::TCPServer::try_create());
         MUST(m_server->listen(IPv4Address { 127, 0, 0, 1 }, 0));
         m_server->on_ready_to_accept = [this] {
             auto socket = MUST(m_server->accept());
             MUST(socket->set_blocking(false));
+            auto is_first_connection = m_sockets.is_empty();
             m_sockets.append(move(socket));
             auto& connection = *m_sockets.last();
-            connection.on_ready_to_read = [&connection] {
+            connection.on_ready_to_read = [&connection, is_first_connection] {
                 auto buffer = MUST(ByteBuffer::create_uninitialized(4096));
                 if (MUST(connection.read_some(buffer)).is_empty())
                     return;
                 connection.on_ready_to_read = nullptr;
                 MUST(connection.set_blocking(true));
-                MUST(connection.write_until_depleted(
-                    "HTTP/1.1 200 OK\r\nSet-Cookie: session=fresh\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"sv.bytes()));
+                if (is_first_connection) {
+                    MUST(connection.write_until_depleted(
+                        "HTTP/1.1 200 OK\r\nCache-Control: max-age=0, stale-while-revalidate=600\r\nETag: \"v1\"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"sv.bytes()));
+                } else {
+                    MUST(connection.write_until_depleted(
+                        "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nSet-Cookie: session=; Max-Age=0\r\nConnection: close\r\n\r\n"sv.bytes()));
+                }
+                connection.close();
             };
         };
     }
@@ -229,13 +357,110 @@ private:
 
 }
 
-TEST_CASE(unsolicited_certificate_is_rejected)
+TEST_CASE(requests_for_unsupported_urls_are_refused)
 {
     TestServer server;
+    TestControlConnection control { server };
     TestConnection connection { server };
 
-    connection.set_certificate(0xc3c4c5c6c7c8c9ca);
+    for (auto url : { "gopher://localhost/"sv, "ftp://localhost/"sv, "http://localhost:6667/"sv, "https://localhost:25/"sv }) {
+        connection.start_request(0, URL::Parser::basic_parse(url).release_value());
+        EXPECT(connection.take_request_finished_error(0) == Requests::NetworkError::MalformedUrl);
+        EXPECT(connection.is_open());
+    }
 
+    connection.start_request(0, URL::Parser::basic_parse("http://localhost:8080/"sv).release_value());
+    auto cookie_request = control.take_cookie_request();
+    EXPECT_EQ(cookie_request->request_id(), 0u);
+    EXPECT(connection.is_open());
+}
+
+TEST_CASE(invalid_and_forbidden_request_methods_are_rejected)
+{
+    for (auto method : { "CONNECT"sv, "TRACE"sv, "track"sv, "Trace"sv, ""sv, "GET /"sv, "GET\r\nX:"sv }) {
+        TestServer server;
+        TestConnection connection { server };
+
+        connection.start_request(0, {}, method);
+        EXPECT(!connection.is_open());
+    }
+
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+
+    connection.start_request(0, {}, "PATCH"sv);
+    EXPECT_EQ(control.take_cookie_request()->request_id(), 0u);
+    EXPECT(connection.is_open());
+}
+
+TEST_CASE(invalid_request_headers_are_rejected)
+{
+    Vector<HTTP::Header> const invalid_headers[] = {
+        { { "X-Injected"sv, "a\r\nCookie: b"sv } },
+        { { "X-Injected"sv, "a\nb"sv } },
+        { { "X-Injected"sv, "a\0b"sv } },
+        { { "X-Injected"sv, " a"sv } },
+        { { "X Injected"sv, "a"sv } },
+        { { "X-Injected\r\n"sv, "a"sv } },
+        { { ""sv, "a"sv } },
+    };
+
+    for (auto const& headers : invalid_headers) {
+        TestServer server;
+        TestConnection connection { server };
+
+        connection.start_request(0, {}, "GET"sv, headers);
+        EXPECT(!connection.is_open());
+    }
+
+    for (auto const& headers : invalid_headers) {
+        TestServer server;
+        TestConnection connection { server };
+
+        connection.websocket_connect(0, URL::Parser::basic_parse("ws://localhost"sv).release_value(), "http://localhost"sv, {}, headers);
+        EXPECT(!connection.is_open());
+    }
+
+    {
+        TestServer server;
+        TestConnection connection { server };
+
+        connection.websocket_connect(0, URL::Parser::basic_parse("ws://localhost"sv).release_value(), "http://localhost\r\nX: y"sv);
+        EXPECT(!connection.is_open());
+    }
+
+    {
+        TestServer server;
+        TestConnection connection { server };
+
+        connection.websocket_connect(0, URL::Parser::basic_parse("ws://localhost"sv).release_value(), "http://localhost"sv, { "chat\r\nX: y"sv });
+        EXPECT(!connection.is_open());
+    }
+
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+
+    connection.start_request(0, {}, "GET"sv, { { "X-Valid"sv, "a b"sv }, { "X-Empty"sv, ""sv } });
+    EXPECT_EQ(control.take_cookie_request()->request_id(), 0u);
+    EXPECT(connection.is_open());
+}
+
+TEST_CASE(websockets_to_unsupported_urls_are_refused)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+
+    for (auto url : { "http://localhost/"sv, "gopher://localhost/"sv, "ws://localhost:6667/"sv, "wss://localhost:25/"sv }) {
+        connection.websocket_connect(0, URL::Parser::basic_parse(url).release_value());
+        EXPECT_EQ(connection.take_client_message<Messages::RequestClient::WebsocketClosed>()->websocket_id(), 0u);
+        EXPECT(connection.is_open());
+    }
+
+    connection.websocket_connect(0, URL::Parser::basic_parse("ws://localhost:8080/"sv).release_value());
+    EXPECT_EQ(control.take_cookie_request()->request_id(), 0u);
     EXPECT(connection.is_open());
 }
 
@@ -304,12 +529,319 @@ TEST_CASE(live_transfer_lease_request_id_cannot_be_reused)
     source_connection.start_request(0);
     auto original_cookie_request = control.take_cookie_request();
     EXPECT_EQ(original_cookie_request->client_id(), source_connection.client_id());
+    control.designate_request_adopter(source_connection.client_id(), 0, target_connection.client_id());
     target_connection.adopt_request(source_connection.client_id(), 0, 1, true);
     auto transferred_cookie_request = control.take_cookie_request();
     EXPECT_EQ(transferred_cookie_request->client_id(), target_connection.client_id());
 
     source_connection.start_request(0);
     EXPECT(!source_connection.is_open());
+}
+
+// A helper process's client may adopt a leased request only as the UI process designated, once per designation. Any
+// other adoption fails and leaves the request with its owner.
+TEST_CASE(only_designated_client_adopts_leased_request)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection designated_connection { server };
+    TestConnection other_connection { server };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+    Requests::RequestTransferLeaseKey lease_key { source_connection.client_id(), 0 };
+    auto lease = [&] { return server.request_transfer_leases.get(lease_key).value(); };
+
+    other_connection.adopt_request(source_connection.client_id(), 0, 1, true);
+    EXPECT(other_connection.take_request_finished_error(1) == Requests::NetworkError::Unknown);
+    other_connection.adopt_request(source_connection.client_id(), 0, 1, true, source_connection.client_id());
+    EXPECT(other_connection.take_request_finished_error(1) == Requests::NetworkError::Unknown);
+    EXPECT_EQ(lease().owner->client_id(), source_connection.client_id());
+
+    control.designate_request_adopter(source_connection.client_id(), 0, designated_connection.client_id());
+    other_connection.adopt_request(source_connection.client_id(), 0, 2, true);
+    EXPECT(other_connection.take_request_finished_error(2) == Requests::NetworkError::Unknown);
+    EXPECT_EQ(lease().owner->client_id(), source_connection.client_id());
+
+    designated_connection.adopt_request(source_connection.client_id(), 0, 1, true);
+    EXPECT_EQ(control.take_cookie_request()->client_id(), designated_connection.client_id());
+    EXPECT_EQ(lease().owner->client_id(), designated_connection.client_id());
+    EXPECT_EQ(lease().request_id, 1u);
+
+    designated_connection.adopt_request(source_connection.client_id(), 0, 2, true);
+    EXPECT_EQ(lease().owner->client_id(), designated_connection.client_id());
+    EXPECT_EQ(lease().request_id, 1u);
+
+    // A refused adoption is not misbehavior.
+    EXPECT(other_connection.is_open());
+    EXPECT(designated_connection.is_open());
+}
+
+// A client's designations lapse when it disconnects, and other clients' designations stay. A designation naming a
+// client that is not connected is dropped.
+TEST_CASE(designation_needs_a_connected_client)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection designated_connection { server };
+    TestConnection other_designated_connection { server };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+    source_connection.start_request(1);
+    (void)control.take_cookie_request();
+    auto adopter_client_id = [&](u64 request_id) {
+        return server.request_transfer_leases.get(Requests::RequestTransferLeaseKey { source_connection.client_id(), request_id })->adopter_client_id;
+    };
+
+    control.designate_request_adopter(source_connection.client_id(), 0, designated_connection.client_id());
+    control.designate_request_adopter(source_connection.client_id(), 1, other_designated_connection.client_id());
+    EXPECT(adopter_client_id(0) == designated_connection.client_id());
+
+    designated_connection.shutdown();
+    EXPECT(!adopter_client_id(0).has_value());
+    EXPECT(adopter_client_id(1) == other_designated_connection.client_id());
+
+    control.designate_request_adopter(source_connection.client_id(), 0, designated_connection.client_id());
+    EXPECT(!adopter_client_id(0).has_value());
+}
+
+// RequestServer answers a designation for a lease that does not exist, and records nothing.
+TEST_CASE(designation_of_missing_lease_is_answered)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+
+    control.designate_request_adopter(connection.client_id(), 0, connection.client_id());
+    EXPECT(control.is_open());
+}
+
+// The UI process's own client adopts a leased request without a designation, but only from the owner it names.
+TEST_CASE(ui_process_client_adopts_only_from_named_owner)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection host_connection { server };
+    TestConnection ui_connection { server, RequestServer::SiteBinding::Unrestricted };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+    Requests::RequestTransferLeaseKey lease_key { source_connection.client_id(), 0 };
+    auto lease = [&] { return server.request_transfer_leases.get(lease_key).value(); };
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 1, true);
+    EXPECT(ui_connection.take_request_finished_error(1) == Requests::NetworkError::Unknown);
+    ui_connection.adopt_request(source_connection.client_id(), 0, 2, true, host_connection.client_id());
+    EXPECT(ui_connection.take_request_finished_error(2) == Requests::NetworkError::Unknown);
+    EXPECT_EQ(lease().owner->client_id(), source_connection.client_id());
+
+    // Once the host holds the request, naming the client that created the lease does not take it from the host.
+    control.designate_request_adopter(source_connection.client_id(), 0, host_connection.client_id());
+    host_connection.adopt_request(source_connection.client_id(), 0, 1, true);
+    (void)control.take_cookie_request();
+    ui_connection.adopt_request(source_connection.client_id(), 0, 3, true, source_connection.client_id());
+    EXPECT(ui_connection.take_request_finished_error(3) == Requests::NetworkError::Unknown);
+    EXPECT_EQ(lease().owner->client_id(), host_connection.client_id());
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 4, true, host_connection.client_id());
+    EXPECT_EQ(control.take_cookie_request()->client_id(), ui_connection.client_id());
+    EXPECT_EQ(lease().owner->client_id(), ui_connection.client_id());
+    EXPECT(ui_connection.is_open());
+}
+
+// An adoption that does not keep the lease ends it.
+TEST_CASE(ui_process_client_adoption_can_end_the_lease)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection ui_connection { server, RequestServer::SiteBinding::Unrestricted };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 1, false, source_connection.client_id());
+    EXPECT_EQ(control.take_cookie_request()->client_id(), ui_connection.client_id());
+    EXPECT(!server.request_transfer_leases.contains(Requests::RequestTransferLeaseKey { source_connection.client_id(), 0 }));
+}
+
+// While the UI process holds a leased request, it may take it back by naming the client it designated to adopt it,
+// whose adoption then fails.
+TEST_CASE(ui_process_client_takes_back_lease_by_naming_its_designated_adopter)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection host_connection { server };
+    TestConnection ui_connection { server, RequestServer::SiteBinding::Unrestricted };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+    Requests::RequestTransferLeaseKey lease_key { source_connection.client_id(), 0 };
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 1, true, source_connection.client_id());
+    (void)control.take_cookie_request();
+    EXPECT_EQ(server.request_transfer_leases.get(lease_key)->owner->client_id(), ui_connection.client_id());
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 2, false, host_connection.client_id());
+    EXPECT(server.request_transfer_leases.contains(lease_key));
+
+    control.designate_request_adopter(source_connection.client_id(), 0, host_connection.client_id());
+    ui_connection.adopt_request(source_connection.client_id(), 0, 3, false, host_connection.client_id());
+    EXPECT_EQ(control.take_cookie_request()->client_id(), ui_connection.client_id());
+    EXPECT(!server.request_transfer_leases.contains(lease_key));
+
+    host_connection.adopt_request(source_connection.client_id(), 0, 1, true);
+    EXPECT(host_connection.take_request_finished_error(1) == Requests::NetworkError::Unknown);
+    EXPECT(host_connection.is_open());
+}
+
+// The client that adopted a leased request owns it while it stays open, whichever client its process has since been
+// given, and only its name lets the UI process take the request.
+TEST_CASE(ui_process_client_adopts_from_the_client_that_adopted_a_lease)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection host_connection { server };
+    TestConnection later_host_connection { server };
+    TestConnection ui_connection { server, RequestServer::SiteBinding::Unrestricted };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+    Requests::RequestTransferLeaseKey lease_key { source_connection.client_id(), 0 };
+
+    control.designate_request_adopter(source_connection.client_id(), 0, host_connection.client_id());
+    host_connection.adopt_request(source_connection.client_id(), 0, 1, true);
+    (void)control.take_cookie_request();
+    EXPECT_EQ(server.request_transfer_leases.get(lease_key)->owner->client_id(), host_connection.client_id());
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 1, false, later_host_connection.client_id());
+    EXPECT(ui_connection.take_request_finished_error(1) == Requests::NetworkError::Unknown);
+    EXPECT_EQ(server.request_transfer_leases.get(lease_key)->owner->client_id(), host_connection.client_id());
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 2, false, host_connection.client_id());
+    EXPECT_EQ(control.take_cookie_request()->client_id(), ui_connection.client_id());
+    EXPECT(!server.request_transfer_leases.contains(lease_key));
+    EXPECT(ui_connection.is_open());
+}
+
+// A designated client that disconnects before it adopts takes its designation with it, and the UI process keeps the
+// lease it holds.
+TEST_CASE(designated_client_disconnecting_before_adopting_ends_the_designation)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection host_connection { server };
+    TestConnection ui_connection { server, RequestServer::SiteBinding::Unrestricted };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+    Requests::RequestTransferLeaseKey lease_key { source_connection.client_id(), 0 };
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 1, true, source_connection.client_id());
+    (void)control.take_cookie_request();
+
+    control.designate_request_adopter(source_connection.client_id(), 0, host_connection.client_id());
+    auto host_client_id = host_connection.client_id();
+    host_connection.shutdown();
+    EXPECT(!server.request_transfer_leases.get(lease_key)->adopter_client_id.has_value());
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 2, false, host_client_id);
+    EXPECT(ui_connection.take_request_finished_error(2) == Requests::NetworkError::Unknown);
+    EXPECT_EQ(server.request_transfer_leases.get(lease_key)->owner->client_id(), ui_connection.client_id());
+    EXPECT(ui_connection.is_open());
+}
+
+// A client that disconnects after it adopted a leased request takes the lease with it, and naming it fails the
+// adoption as any lease that is gone does.
+TEST_CASE(owning_client_disconnecting_after_adopting_ends_the_lease)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection host_connection { server };
+    TestConnection ui_connection { server, RequestServer::SiteBinding::Unrestricted };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+    Requests::RequestTransferLeaseKey lease_key { source_connection.client_id(), 0 };
+
+    control.designate_request_adopter(source_connection.client_id(), 0, host_connection.client_id());
+    host_connection.adopt_request(source_connection.client_id(), 0, 1, true);
+    (void)control.take_cookie_request();
+
+    auto host_client_id = host_connection.client_id();
+    host_connection.shutdown();
+    EXPECT(!server.request_transfer_leases.contains(lease_key));
+
+    ui_connection.adopt_request(source_connection.client_id(), 0, 1, false, host_client_id);
+    EXPECT(ui_connection.take_request_finished_error(1) == Requests::NetworkError::Unknown);
+    EXPECT(ui_connection.is_open());
+}
+
+TEST_CASE(live_request_id_cannot_be_reused_for_a_connection)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+
+    connection.start_request(0);
+    (void)control.take_cookie_request();
+
+    connection.ensure_connection(0, URL::Parser::basic_parse("http://localhost"sv).release_value());
+    EXPECT(!connection.is_open());
+}
+
+TEST_CASE(live_request_id_cannot_be_reused_for_an_adopted_request)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection source_connection { server };
+    TestConnection target_connection { server };
+
+    source_connection.start_request(0);
+    (void)control.take_cookie_request();
+    target_connection.start_request(1);
+    (void)control.take_cookie_request();
+
+    target_connection.adopt_request(source_connection.client_id(), 0, 1);
+    EXPECT(!target_connection.is_open());
+}
+
+TEST_CASE(live_websocket_id_cannot_be_reused)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+
+    connection.websocket_connect(0, URL::Parser::basic_parse("ws://localhost:8080/"sv).release_value());
+    (void)control.take_cookie_request();
+    EXPECT(connection.is_open());
+
+    connection.websocket_connect(0, URL::Parser::basic_parse("ws://localhost:8080/"sv).release_value());
+    EXPECT(!connection.is_open());
+}
+
+TEST_CASE(websockets_per_client_are_limited)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+    auto url = URL::Parser::basic_parse("ws://localhost:8080/"sv).release_value();
+
+    // Pending WebSockets count towards the limit too.
+    for (u64 websocket_id = 0; websocket_id < 256; ++websocket_id)
+        connection.websocket_connect(websocket_id, url);
+
+    connection.websocket_connect(256, url);
+    EXPECT_EQ(connection.take_client_message<Messages::RequestClient::WebsocketClosed>()->websocket_id(), 256u);
+    EXPECT(connection.is_open());
 }
 
 TEST_CASE(duplicate_cookie_response_is_rejected)
@@ -339,6 +871,7 @@ TEST_CASE(transferring_request_reissues_cookie_lookup_for_new_owner)
     EXPECT_EQ(initial_cookie_request->client_id(), source_connection.client_id());
     EXPECT_EQ(initial_cookie_request->request_id(), 0u);
 
+    control.designate_request_adopter(source_connection.client_id(), 0, target_connection.client_id());
     target_connection.adopt_request(source_connection.client_id(), 0, 1);
     auto transferred_cookie_request = control.take_cookie_request();
     EXPECT_EQ(transferred_cookie_request->client_id(), target_connection.client_id());
@@ -370,6 +903,7 @@ TEST_CASE(transferring_request_reissues_response_storage_for_new_owner)
     EXPECT_EQ(initial_storage_request->request_id(), 0u);
     EXPECT_EQ(initial_storage_request->cookies().size(), 1u);
 
+    control.designate_request_adopter(source_connection.client_id(), 0, target_connection.client_id());
     target_connection.adopt_request(source_connection.client_id(), 0, 1);
     auto transferred_storage_request = control.wait_for_storage_request(server.event_loop);
     EXPECT_EQ(transferred_storage_request->client_id(), target_connection.client_id());
@@ -381,5 +915,244 @@ TEST_CASE(transferring_request_reissues_response_storage_for_new_owner)
     // the response through.
     control.stored_response_cookies_and_hsts_policy(source_connection.client_id(), 0, initial_storage_request->store_request_id());
     control.stored_response_cookies_and_hsts_policy(target_connection.client_id(), 1, transferred_storage_request->store_request_id());
+    EXPECT(control.is_open());
+}
+
+TEST_CASE(url_credentials_are_not_sent)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+    SetCookieServer http_server;
+
+    auto url = http_server.url();
+    url.set_username("user"sv);
+    url.set_password("secret"sv);
+
+    connection.start_request(0, url);
+    auto cookie_request = control.take_cookie_request();
+    control.retrieve_http_cookie(connection.client_id(), 0, RequestServer::RequestType::Fetch, cookie_request->cookie_request_id());
+    (void)control.wait_for_storage_request(server.event_loop);
+
+    EXPECT(http_server.received_request().starts_with("GET / HTTP/1.1\r\n"sv));
+    EXPECT(!http_server.received_request().contains("Authorization"sv, CaseSensitivity::CaseInsensitive));
+    EXPECT(!http_server.received_request().contains("user"sv));
+}
+
+namespace {
+
+class SilentServer {
+public:
+    SilentServer()
+    {
+        m_server = MUST(Core::TCPServer::try_create());
+        MUST(m_server->listen(IPv4Address { 127, 0, 0, 1 }, 0));
+        m_server->on_ready_to_accept = [this] {
+            auto accepted_socket = m_server->accept();
+            if (accepted_socket.is_error()) {
+                auto const& error = accepted_socket.error();
+                if (error.is_errno() && (error.code() == EAGAIN || error.code() == EWOULDBLOCK))
+                    return;
+#ifdef AK_OS_WINDOWS
+                if (error.is_windows_error() && error.code() == WSAEWOULDBLOCK)
+                    return;
+#endif
+            }
+            auto socket = MUST(move(accepted_socket));
+            MUST(socket->set_blocking(false));
+            m_sockets.append(move(socket));
+            auto& connection = *m_sockets.last();
+            connection.on_ready_to_read = [this, &connection, received_request = false]() mutable {
+                auto buffer = MUST(ByteBuffer::create_uninitialized(4096));
+                auto result = connection.read_some(buffer);
+                if (result.is_error() && result.error().is_errno() && (result.error().code() == EAGAIN || result.error().code() == EWOULDBLOCK))
+                    return;
+                if (result.is_error() || result.value().is_empty()) {
+                    connection.on_ready_to_read = nullptr;
+                    ++m_closed_connections;
+                    return;
+                }
+                if (!exchange(received_request, true))
+                    ++m_received_requests;
+            };
+        };
+    }
+
+    URL::URL url() const
+    {
+        return URL::Parser::basic_parse(ByteString::formatted("http://127.0.0.1:{}/", *m_server->local_port())).release_value();
+    }
+
+    size_t received_requests() const { return m_received_requests; }
+    size_t closed_connections() const { return m_closed_connections; }
+
+private:
+    RefPtr<Core::TCPServer> m_server;
+    Vector<NonnullOwnPtr<Core::TCPSocket>> m_sockets;
+    size_t m_received_requests { 0 };
+    size_t m_closed_connections { 0 };
+};
+
+}
+
+TEST_CASE(split_request_is_counted_once_per_connection)
+{
+    Core::EventLoop event_loop;
+    SilentServer server;
+    auto socket = TRY_OR_FAIL(Core::TCPSocket::connect(Core::SocketAddress { IPv4Address { 127, 0, 0, 1 }, server.url().port_or_default() }));
+    TRY_OR_FAIL(socket->write_until_depleted("GET / HTTP/1.1\r\n"sv.bytes()));
+    event_loop.spin_until([&] { return server.received_requests() == 1; });
+    TRY_OR_FAIL(socket->write_until_depleted("Host: localhost\r\n\r\n"sv.bytes()));
+    socket->close();
+    event_loop.spin_until([&] { return server.closed_connections() == 1; });
+    EXPECT_EQ(server.received_requests(), 1u);
+}
+
+// Transferred requests retain the original connection object, but must not retain its other work.
+TEST_CASE(disconnected_client_requests_stop_while_a_transferred_request_lives_on)
+{
+    TestServer server;
+    {
+        TestControlConnection control { server };
+        TestConnection source_connection { server };
+        TestConnection target_connection { server };
+        SilentServer transferred_server;
+        SilentServer websocket_server;
+
+        source_connection.start_request(0, transferred_server.url());
+        auto cookie_request = control.take_cookie_request();
+        control.retrieve_http_cookie(source_connection.client_id(), 0, RequestServer::RequestType::Fetch, cookie_request->cookie_request_id());
+
+        auto websocket_url = websocket_server.url();
+        websocket_url.set_scheme("ws"_string);
+        source_connection.websocket_connect(0, websocket_url);
+        cookie_request = control.take_cookie_request();
+        control.retrieve_http_cookie(source_connection.client_id(), 0, RequestServer::RequestType::WebSocket, cookie_request->cookie_request_id());
+
+        auto wake_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(10), [] { });
+        wake_timer->start();
+        server.event_loop.spin_until([&] { return transferred_server.received_requests() == 1 && websocket_server.received_requests() == 1; });
+
+        control.designate_request_adopter(source_connection.client_id(), 0, target_connection.client_id());
+        target_connection.adopt_request(source_connection.client_id(), 0, 0);
+        source_connection.shutdown();
+
+        server.event_loop.spin_until([&] { return websocket_server.closed_connections() == 1; });
+        EXPECT_EQ(transferred_server.closed_connections(), 0u);
+        EXPECT(target_connection.is_open());
+    }
+
+    // Finish shutdown before destroying the maps used by the connections.
+    server.event_loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+}
+
+TEST_CASE(interim_response_fields_are_not_part_of_the_response)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+    SetCookieServer http_server {
+        "HTTP/1.1 103 Early Hints\r\nSet-Cookie: interim=evil\r\nLink: </style.css>; rel=preload\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nSet-Cookie: session=fresh\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"sv
+    };
+
+    connection.start_request(0, http_server.url());
+    auto cookie_request = control.take_cookie_request();
+    control.retrieve_http_cookie(connection.client_id(), 0, RequestServer::RequestType::Fetch, cookie_request->cookie_request_id());
+
+    auto storage_request = control.wait_for_storage_request(server.event_loop);
+    EXPECT_EQ(storage_request->cookies().size(), 1u);
+    EXPECT_EQ(storage_request->cookies().first().name, "session"sv);
+}
+
+static ByteString response_with_header_fields(size_t count)
+{
+    StringBuilder builder;
+    builder.append("HTTP/1.1 200 OK\r\n"sv);
+    for (size_t i = 0; i < count; ++i)
+        builder.appendff("X-Field-{}: {}\r\n", i, i);
+    builder.append("Content-Length: 2\r\nConnection: close\r\n\r\nok"sv);
+    return builder.to_byte_string();
+}
+
+TEST_CASE(response_header_names_use_the_first_casing)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    TestConnection connection { server };
+    SetCookieServer http_server { "HTTP/1.1 200 OK\r\nX-Field: a\r\nx-FIELD: b\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"sv };
+
+    connection.start_request(0, http_server.url());
+    auto cookie_request = control.take_cookie_request();
+    control.retrieve_http_cookie(connection.client_id(), 0, RequestServer::RequestType::Fetch, cookie_request->cookie_request_id());
+
+    auto headers = connection.take_client_message<Messages::RequestClient::HeadersBecameAvailable>(server.event_loop);
+    Vector<ByteString> names;
+    for (auto const& header : headers->response_headers()) {
+        if (header.name.equals_ignoring_ascii_case("X-Field"sv))
+            names.append(header.name);
+    }
+    EXPECT_EQ(names, (Vector<ByteString> { "X-Field"sv, "X-Field"sv }));
+}
+
+TEST_CASE(responses_with_too_many_header_fields_fail)
+{
+    auto many_fields = response_with_header_fields(900);
+    auto too_many_fields = response_with_header_fields(1001);
+
+    struct TestResponse {
+        StringView response;
+        bool should_fail { false };
+    };
+
+    for (auto const& [response, should_fail] : Array { TestResponse { many_fields, false }, TestResponse { too_many_fields, true } }) {
+        TestServer server;
+        TestControlConnection control { server };
+        TestConnection connection { server };
+        SetCookieServer http_server { response };
+
+        connection.start_request(0, http_server.url());
+        auto cookie_request = control.take_cookie_request();
+        control.retrieve_http_cookie(connection.client_id(), 0, RequestServer::RequestType::Fetch, cookie_request->cookie_request_id());
+
+        auto request_finished = connection.take_client_message<Messages::RequestClient::RequestFinished>(server.event_loop);
+        EXPECT_EQ(request_finished->network_error().has_value(), should_fail);
+    }
+}
+
+TEST_CASE(background_revalidation_stores_response_cookies)
+{
+    TestServer server;
+    TestControlConnection control { server };
+    // Isolate the cache from tests running concurrently.
+    auto cache_root = LexicalPath::join(Core::StandardPaths::tempfile_directory(), ByteString::formatted("Ladybird-TestCookieResponses-{}", Core::System::getpid()));
+    ScopeGuard remove_cache_root = [&] { (void)FileSystem::remove(cache_root.string(), FileSystem::RecursionMode::Allowed); };
+    auto disk_cache = MUST(HTTP::DiskCache::create(HTTP::DiskCache::Mode::Testing, cache_root)).release_value();
+    TestConnection connection { server, RequestServer::SiteBinding::Unrestricted, disk_cache };
+    RevalidatingServer http_server;
+
+    Vector<HTTP::Header> request_headers { { ByteString { HTTP::TEST_CACHE_ENABLED_HEADER }, "1"sv } };
+    // Only requests made for a site reach the cache.
+    HTTP::NetworkIsolationKey network_isolation_key { .top_level_site = "http://localhost"_utf16, .frame_site = "http://localhost"_utf16 };
+
+    connection.start_request(0, http_server.url(), "GET"sv, request_headers, network_isolation_key);
+    auto cookie_request = control.wait_for_cookie_request(server.event_loop);
+    control.retrieve_http_cookie(connection.client_id(), 0, RequestServer::RequestType::Fetch, cookie_request->cookie_request_id());
+
+    // The entry is released once the response has been delivered; a request for it then starts the background
+    // revalidation.
+    EXPECT(!connection.take_client_message<Messages::RequestClient::RequestFinished>(server.event_loop)->network_error().has_value());
+    connection.start_request(1, http_server.url(), "GET"sv, request_headers, network_isolation_key);
+
+    auto revalidation_cookie_request = control.wait_for_cookie_request(server.event_loop);
+    EXPECT_EQ(revalidation_cookie_request->request_type(), RequestServer::RequestType::BackgroundRevalidation);
+    control.retrieve_http_cookie(connection.client_id(), revalidation_cookie_request->request_id(), RequestServer::RequestType::BackgroundRevalidation, revalidation_cookie_request->cookie_request_id());
+
+    auto storage_request = control.wait_for_storage_request(server.event_loop);
+    EXPECT_EQ(storage_request->client_id(), connection.client_id());
+    EXPECT_EQ(storage_request->request_id(), revalidation_cookie_request->request_id());
+    EXPECT_EQ(storage_request->cookies().size(), 1u);
+
+    control.stored_response_cookies_and_hsts_policy(connection.client_id(), storage_request->request_id(), storage_request->store_request_id());
     EXPECT(control.is_open());
 }

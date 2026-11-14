@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<div id="container"></div>
+<script src="../include.js"></script>
+<script src="../work-test.js"></script>
+<script>
+test(() => {
+    const container = document.getElementById("container");
+    const addShadowTree = () => {
+        const host = document.createElement("div");
+        host.attachShadow({ mode: "open" }).innerHTML = "<style>:host { display: block; font-size: 13px; } p { font-weight: bold; } span { color: green; }</style><p><span>a</span><span>b</span></p>";
+        container.appendChild(host);
+    };
+
+    // Every shadow tree gives its host the same font, which the paragraph and spans below inherit and build on. The
+    // trees added after the first one is styled can take their styles from it.
+    addShadowTree();
+    document.body.offsetWidth;
+    internals.updateStyle();
+    const work = styleWork(() => {
+        for (let i = 0; i < 20; ++i)
+            addShadowTree();
+    });
+    println(`passes for 20 more shadow trees: ${work.passes().join(", ")}`);
+    // FIXME: The paragraphs and spans of the 20 trees added after the first should take their records
+    //     from the first tree's, but the style engine shares records only within a shadow tree, whose rules come
+    //     from a sheet of its own.
+    for (const outcome of ["computed", "shared", "reused"]) {
+        const counts = new Map();
+        for (const event of work.events.filter(event => event.event === "restyle" && event.outcome === outcome)) {
+            const name = event.element.replace(/@\d+$/, "");
+            counts.set(name, (counts.get(name) ?? 0) + 1);
+        }
+        println(`${outcome}: ${[...counts].map(([name, count]) => `${name} x${count}`).join(", ")}`);
+    }
+
+    const spans = [...container.children].map(host => host.shadowRoot.querySelector("span"));
+    println(`span font: ${getComputedStyle(spans[0]).fontSize} ${getComputedStyle(spans[0]).fontWeight}`);
+    println(`all spans alike: ${spans.every(span => getComputedStyle(span).font === getComputedStyle(spans[0]).font)}`);
+});
+</script>

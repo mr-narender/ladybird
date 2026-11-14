@@ -56,8 +56,11 @@ void HeapGroup::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, boo
         }
     }
 
-    for (auto* heap : m_heaps) {
+    for (auto* heap : m_heaps)
         heap->finish_pending_incremental_sweep();
+    for (auto* heap : m_heaps) {
+        VERIFY(!heap->is_incremental_sweep_active());
+        heap->give_back_local_free_lists();
         heap->m_collecting_garbage = true;
     }
     ScopeGuard unset_collecting = [&] {
@@ -71,8 +74,13 @@ void HeapGroup::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, boo
 
     Heap::mark_live_cells_across(m_heaps, roots);
 
+    // Weak pointers may point across heaps, so clear them in every heap before any heap runs its finalizers.
+    for (auto* heap : m_heaps)
+        heap->clear_weak_pointers_to_dead_cells(print_report);
     for (auto* heap : m_heaps)
         heap->run_post_mark_phases(print_report);
+    for (auto* heap : m_heaps)
+        heap->m_weak_pointers_to_dead_cells_are_cleared = false;
 
     for (auto* heap : m_heaps) {
         Core::ElapsedTimer measurement_timer { Core::TimerType::Precise };

@@ -31,6 +31,10 @@ describe("errors", () => {
         expect(() => {
             Iterator.prototype.take(-1);
         }).toThrowWithMessage(RangeError, "limit must not be negative");
+
+        expect(() => {
+            Iterator.prototype.take(Number.MAX_SAFE_INTEGER + 1);
+        }).toThrowWithMessage(RangeError, "limit must be less than 2^53");
     });
 
     test("iterator's next method throws", () => {
@@ -84,16 +88,27 @@ describe("errors", () => {
             }
         }
 
-        expect(() => {
+        for (const started of [false, true]) {
             const iterator = new TestIterator().take(1);
-            iterator.return();
-        }).toThrow(TestError);
+            if (started) iterator.next();
+            expect(() => iterator.return()).toThrow(TestError);
+            expect(iterator.next()).toEqual({ value: undefined, done: true });
+            expect(iterator.return()).toEqual({ value: undefined, done: true });
+        }
     });
 });
 
 describe("normal behavior", () => {
     test("length is 1", () => {
         expect(Iterator.prototype.take).toHaveLength(1);
+    });
+
+    test("valid limits do not throw", () => {
+        for (const test of [0, -0.5, null, Infinity, Number.MAX_SAFE_INTEGER]) {
+            expect(() => {
+                Iterator.prototype.take(test);
+            }).not.toThrow();
+        }
     });
 
     test("limited to zero", () => {

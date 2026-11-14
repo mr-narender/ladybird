@@ -25,10 +25,12 @@ void handle_any_user_prompts(Page& page, GC::Ref<GC::Function<void(Optional<Erro
     // 3. If the current user prompt is an alert dialog, set type to "alert". Otherwise, if the current user prompt is a
     //    beforeunload dialog, set type to "beforeUnload". Otherwise, if the current user prompt is a confirm dialog,
     //    set type to "confirm". Otherwise, if the current user prompt is a prompt dialog, set type to "prompt".
-    // FIXME: Handle beforeunload dialogs when they are implemented.
     switch (page.pending_dialog()) {
     case Page::PendingDialog::Alert:
         type = PromptType::Alert;
+        break;
+    case Page::PendingDialog::BeforeUnload:
+        type = PromptType::BeforeUnload;
         break;
     case Page::PendingDialog::Confirm:
         type = PromptType::Confirm;
@@ -43,7 +45,7 @@ void handle_any_user_prompts(Page& page, GC::Ref<GC::Function<void(Optional<Erro
     // 4. Let handler be get the prompt handler with type.
     auto handler = get_the_prompt_handler(type);
 
-    auto on_dialog_closed = GC::create_function(page.heap(), [notify = handler.notify, pending_dialog_text = page.pending_dialog_text(), on_complete]() {
+    auto on_dialog_closed = GC::create_function(page.heap(), GC::captures(handler.notify, page.pending_dialog_text(), on_complete), [](auto& notify, auto& pending_dialog_text, auto& on_complete) {
         // 5. If handler's notify is true, return annotated unexpected alert open error.
         if (notify == PromptHandlerConfiguration::Notify::Yes) {
             on_complete->function()(create_annotated_unexpected_alert_open_error(pending_dialog_text));

@@ -22,9 +22,19 @@ void RequestControlClient::die()
         promise->reject(Error::from_string_literal("RequestServer process died"));
     for (auto& [id, promise] : m_pending_clear_cache_requests)
         promise->reject(Error::from_string_literal("RequestServer process died"));
+    for (auto& [id, promise] : m_pending_cache_access_profile_requests)
+        promise->reject(Error::from_string_literal("RequestServer process died"));
 
     m_pending_cache_size_estimations.clear();
     m_pending_clear_cache_requests.clear();
+    m_pending_cache_access_profile_requests.clear();
+
+    if (!m_pending_adopter_designations.is_empty()) {
+        Core::deferred_invoke([pending_adopter_designations = move(m_pending_adopter_designations)] {
+            for (auto& [id, promise] : pending_adopter_designations)
+                promise->reject(Error::from_string_literal("RequestServer process died"));
+        });
+    }
 
     if (auto request_server_died_callback = move(on_request_server_died)) {
         Core::deferred_invoke([request_server_died_callback = move(request_server_died_callback)]() mutable {
@@ -45,20 +55,20 @@ void RequestControlClient::client_disconnected(int client_id)
         on_client_disconnected(client_id);
 }
 
-void RequestControlClient::retrieve_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url)
+void RequestControlClient::retrieve_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context, HTTP::Cookie::SameSiteContext same_site_context)
 {
     String cookie;
 
     if (on_retrieve_http_cookie)
-        cookie = on_retrieve_http_cookie(client_id, url);
+        cookie = on_retrieve_http_cookie(client_id, url, partition_context, same_site_context);
 
     async_retrieved_http_cookie(client_id, request_id, request_type, cookie_request_id, cookie);
 }
 
-void RequestControlClient::store_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id, URL::URL url, Vector<HTTP::Cookie::ParsedCookie> cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> hsts_policy)
+void RequestControlClient::store_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context, HTTP::Cookie::SameSiteContext same_site_context, Vector<HTTP::Cookie::ParsedCookie> cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> hsts_policy)
 {
     if (on_store_response_cookies_and_hsts_policy)
-        on_store_response_cookies_and_hsts_policy(client_id, url, cookies, hsts_policy);
+        on_store_response_cookies_and_hsts_policy(client_id, url, partition_context, same_site_context, cookies, hsts_policy);
 
     async_stored_response_cookies_and_hsts_policy(client_id, request_id, store_request_id);
 }
@@ -96,6 +106,52 @@ NonnullRefPtr<Core::Promise<Empty>> RequestControlClient::clear_cache(UnixDateTi
 void RequestControlClient::removed_cache_entries(u64 clear_cache_request_id)
 {
     if (auto promise = m_pending_clear_cache_requests.take(clear_cache_request_id); promise.has_value())
+        (*promise)->resolve({});
+}
+
+NonnullRefPtr<Core::Promise<Vector<CacheAccessBucket>>> RequestControlClient::retrieve_cache_access_profile(AK::Duration granularity)
+{
+    auto promise = Core::Promise<Vector<CacheAccessBucket>>::construct();
+
+    auto access_profile_request_id = m_next_cache_access_profile_request_id++;
+    m_pending_cache_access_profile_requests.set(access_profile_request_id, promise);
+
+    async_retrieve_cache_access_profile(access_profile_request_id, granularity);
+
+    return promise;
+}
+
+void RequestControlClient::retrieved_cache_access_profile(u64 access_profile_request_id, Vector<CacheAccessBucket> buckets)
+{
+    if (auto promise = m_pending_cache_access_profile_requests.take(access_profile_request_id); promise.has_value())
+        (*promise)->resolve(move(buckets));
+}
+
+void RequestControlClient::disk_cache_size_changed(u64 size)
+{
+    if (on_disk_cache_size_changed)
+        on_disk_cache_size_changed(size);
+}
+
+NonnullRefPtr<Core::Promise<Empty>> RequestControlClient::designate_request_adopter(RequestTransferLeaseKey transfer_lease, int adopter_client_id)
+{
+    auto promise = Core::Promise<Empty>::construct();
+    if (!is_open()) {
+        promise->reject(Error::from_string_literal("RequestServer process died"));
+        return promise;
+    }
+
+    auto designation_id = m_next_adopter_designation_id++;
+    m_pending_adopter_designations.set(designation_id, promise);
+
+    async_designate_request_adopter(designation_id, transfer_lease.source_client_id, transfer_lease.source_request_id, adopter_client_id);
+
+    return promise;
+}
+
+void RequestControlClient::request_adopter_designated(u64 designation_id)
+{
+    if (auto promise = m_pending_adopter_designations.take(designation_id); promise.has_value())
         (*promise)->resolve({});
 }
 

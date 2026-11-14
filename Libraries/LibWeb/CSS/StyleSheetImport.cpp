@@ -10,8 +10,12 @@
 
 #include <AK/Debug.h>
 #include <AK/ScopeGuard.h>
+#include <LibGC/Heap.h>
 #include <LibGC/Root.h>
+#include <LibJS/HostClassBuilder.h>
+#include <LibJS/Runtime/VM.h>
 #include <LibWeb/CSS/CSSImportRule.h>
+#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/Fetch.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
@@ -21,10 +25,85 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/ReferrerPolicy/AbstractOperations.h>
 
 namespace Web::CSS {
+
+using Parser::ValueParserFFI::NativeRule;
+
+// NB: Implemented in Libraries/LibWeb/Bindings/Rust/src/css/exports.rs.
+extern "C" void* web_css_import_rule_create(void* vm, NativeRule const* rule, void* import, void* sheet);
+
+// NB: What the implementation of CSSImportRule in Rust asks of the C++ code of LibWeb.
+extern "C" {
+void* web_css_import_create(NativeRule const* rule, void* document);
+void web_css_import_set_rule(void* import, void* rule);
+void web_css_import_set_parent_style_sheet(void* import, void* sheet);
+FlatPtr web_css_import_href(void* import);
+FlatPtr web_css_import_url_text(void* import);
+void* web_css_import_media(void* import);
+void* web_css_import_style_sheet(void* import);
+}
+
+GC_DEFINE_ALLOCATOR(StyleSheetImportCell);
+
+GC::Ref<StyleSheetImportCell> StyleSheetImportCell::create(NonnullRefPtr<StyleSheetImport> import)
+{
+    return GC::Heap::the().allocate<StyleSheetImportCell>(move(import));
+}
+
+void StyleSheetImportCell::visit_edges(GC::Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    m_import->visit_edges(visitor);
+}
+
+static StyleSheetImport& import_from_cell(void* import)
+{
+    return static_cast<StyleSheetImportCell*>(static_cast<GC::Cell*>(import))->import();
+}
+
+void* web_css_import_create(NativeRule const* rule, void* document)
+{
+    auto* document_object = static_cast<DOM::Document*>(static_cast<GC::Cell*>(document));
+    return static_cast<GC::Cell*>(StyleSheetImportCell::create(StyleSheetImport::create(RustRule { rule }, document_object)).ptr());
+}
+
+void web_css_import_set_rule(void* import, void* rule)
+{
+    import_from_cell(import).set_cssom_rule(*static_cast<CSSImportRule*>(rule));
+}
+
+void web_css_import_set_parent_style_sheet(void* import_cell, void* sheet)
+{
+    auto& import = import_from_cell(import_cell);
+    auto* state = sheet ? &static_cast<CSSStyleSheet*>(sheet)->state() : nullptr;
+    if (import.parent_style_sheet() != state)
+        import.set_parent_style_sheet(state);
+}
+
+FlatPtr web_css_import_href(void* import)
+{
+    return Utf16String { import_from_cell(import).href() }.into_raw();
+}
+
+FlatPtr web_css_import_url_text(void* import)
+{
+    return import_from_cell(import).url().to_utf16_string().into_raw();
+}
+
+void* web_css_import_media(void* import)
+{
+    return import_from_cell(import).media().ptr();
+}
+
+void* web_css_import_style_sheet(void* import)
+{
+    auto* sheet = import_from_cell(import).loaded_style_sheet();
+    return sheet ? &sheet->cssom_sheet() : nullptr;
+}
 
 NonnullRefPtr<StyleSheetImport> StyleSheetImport::create(RustRule rule, GC::Ptr<DOM::Document> document)
 {
@@ -77,8 +156,12 @@ void StyleSheetImport::visit_edges(GC::Cell::Visitor& visitor)
 
 CSSImportRule& StyleSheetImport::cssom_rule() const
 {
-    if (!m_cssom_rule)
-        m_cssom_rule = CSSImportRule::create(const_cast<StyleSheetImport&>(*this));
+    if (!m_cssom_rule) {
+        auto import = StyleSheetImportCell::create(const_cast<StyleSheetImport&>(*this));
+        auto* sheet = parent_style_sheet();
+        // NB: The new object tells this import that it is its rule.
+        web_css_import_rule_create(JS::HostABI::vm_to_abi(JS::VM::the()), native_rule().handle(), static_cast<GC::Cell*>(import.ptr()), sheet ? &sheet->cssom_sheet() : nullptr);
+    }
     return *m_cssom_rule;
 }
 
@@ -145,12 +228,6 @@ void StyleSheetImport::fetch()
         return;
     }
 
-    // AD-HOC: Track pending import rules to block rendering until they are done.
-    m_document->add_pending_css_import_rule({}, *this);
-    set_loading_state(StyleSheetState::LoadingState::Loading);
-
-    // 3. Fetch a style resource from rule’s URL, with ruleOrDeclaration rule, destination "style", CORS mode "no-cors", and
-    //    processResponse being the following steps given response response and byte stream, null or failure byteStream:
     RuleOrDeclaration rule_or_declaration {
         .environment_settings_object = HTML::relevant_settings_object(*m_document),
         .value = RuleOrDeclaration::Rule {
@@ -159,8 +236,31 @@ void StyleSheetImport::fetch()
         .style_resource_base_url = {},
         .parent_style_sheet_origin_clean = {},
     };
+
+    // AD-HOC: An import of the style sheet the rule is in, or of a sheet that imports that one, would fetch and import
+    //         that sheet again, and again without end. So it imports nothing, as an unmet supports condition does. A
+    //         sheet is matched by the URL it was requested from as well as the one a redirect ended at.
+    m_requested_url = resolve_a_style_resource_url(URL { href() }, rule_or_declaration);
+    if (m_requested_url.has_value()) {
+        auto is_import_url = [&](Optional<::URL::URL> const& url) {
+            return url.has_value() && url->equals(*m_requested_url, ::URL::ExcludeFragment::Yes);
+        };
+        for (auto* sheet = &parent_style_sheet; sheet; sheet = sheet->parent_style_sheet()) {
+            if (is_import_url(sheet->location()) || is_import_url(sheet->base_url()) || is_import_url(sheet->requested_url())) {
+                set_loading_state(StyleSheetState::LoadingState::Loaded);
+                return;
+            }
+        }
+    }
+
+    // NB: Track pending import rules for stylesheet load accounting.
+    m_document->add_pending_css_import_rule({}, *this);
+    set_loading_state(StyleSheetState::LoadingState::Loading);
+
+    // 3. Fetch a style resource from rule’s URL, with ruleOrDeclaration rule, destination "style", CORS mode "no-cors", and
+    //    processResponse being the following steps given response response and byte stream, null or failure byteStream:
     (void)fetch_a_style_resource(URL { href() }, rule_or_declaration, Fetch::Infrastructure::Request::Destination::Style, CorsMode::NoCors,
-        [strong_this = NonnullRefPtr { *this }, parent_style_sheet = NonnullRefPtr { parent_style_sheet }, document = m_document, load_event_delayer = DOM::DocumentLoadEventDelayer(*m_document, DOM::DocumentLoadEventDelayerReason::StyleSheetRequest)](auto response, auto maybe_byte_stream) mutable {
+        GC::create_function(GC::Heap::the(), GC::captures(NonnullRefPtr { *this }, NonnullRefPtr { parent_style_sheet }, m_document, DOM::DocumentLoadEventDelayer(*m_document, DOM::DocumentLoadEventDelayerReason::StyleSheetRequest)), [](auto& strong_this, auto& parent_style_sheet, auto& document, auto& load_event_delayer, GC::Ref<Fetch::Infrastructure::ResponseView> response, Fetch::Infrastructure::FetchAlgorithms::BodyBytes maybe_byte_stream) {
             // AD-HOC: Stop delaying the load event.
             auto finish_loading = [strong_this, document, load_event_delayer = move(load_event_delayer)] {
                 auto imported_sheet = strong_this->m_style_sheet;
@@ -187,12 +287,19 @@ void StyleSheetImport::fetch()
                 return;
             }
 
-            // FIXME: 2. If parentStylesheet is in quirks mode and response is CORS-same-origin, let content type be "text/css".
-            //           Otherwise, let content type be the Content Type metadata of response.
-            auto content_type = "text/css"sv;
+            // 2. If parentStylesheet is in quirks mode and response is CORS-same-origin, let content type be "text/css".
+            //    Otherwise, let content type be the Content Type metadata of response.
+            // NB: The Content Type metadata is read from the internal response, as an opaque response has no headers.
+            auto extracted_mime_type = Fetch::Infrastructure::extract_mime_type(response->unsafe_response()->header_list());
+            Optional<String> content_type;
+            if (document->in_quirks_mode() && response->is_cors_same_origin())
+                content_type = "text/css"_string;
+            else if (extracted_mime_type.has_value())
+                content_type = extracted_mime_type->essence();
 
             // 3. If content type is not "text/css", return.
-            if (content_type != "text/css"sv) {
+            // AD-HOC: A response without a valid Content-Type is used as CSS, as for a <link> style sheet.
+            if (content_type.has_value() && content_type != "text/css"sv) {
                 dbgln_if(CSS_LOADER_DEBUG, "StyleSheetImport: Rejecting loaded style sheet; content type isn't text/css; is: '{}'", content_type);
                 return;
             }
@@ -204,7 +311,6 @@ void StyleSheetImport::fetch()
             auto url = response->unsafe_response()->url().value();
 
             Optional<StringView> mime_type_charset;
-            auto extracted_mime_type = Fetch::Infrastructure::extract_mime_type(response->header_list());
             if (extracted_mime_type.has_value()) {
                 if (auto charset = extracted_mime_type->parameters().get("charset"sv); charset.has_value())
                     mime_type_charset = charset->bytes_as_string_view();
@@ -219,10 +325,11 @@ void StyleSheetImport::fetch()
             }
             Parser::Parser::parse_stylesheet_off_thread(
                 Parser::ParsingParams { *document }, decoded_or_error.release_value(),
-                [strong_this, parent_style_sheet, document = GC::make_root(document), url = move(url), is_cors_same_origin = response->is_cors_same_origin(), finish_loading = move(finish_loading)](Parser::RustStyleSheetParse parsed) mutable {
+                [strong_this, parent_style_sheet, document = GC::make_root(document), url = move(url), is_cors_same_origin = response->is_cors_same_origin(), referrer_policy = ReferrerPolicy::parse_a_referrer_policy_from_a_referrer_policy_header(*response->unsafe_response()->record()), finish_loading = move(finish_loading)](Parser::RustStyleSheetParse parsed) mutable {
                     ScopeGuard guard = move(finish_loading);
-                    Parser::Parser parser { Parser::ParsingParams { *document } };
-                    auto imported_style_sheet = parser.create_css_stylesheet(parsed, move(url), strong_this->m_media_list.retain());
+                    // NB: The sheet records its referrer policy, its parent and its requested URL as it is created, before its
+                    //     own imports start to load, which read them.
+                    auto imported_style_sheet = StyleSheetState::create(parsed.native_rules(), document.ptr(), strong_this->m_media_list.retain(), move(url), referrer_policy, strong_this.ptr());
 
                     // 5. Set importedStylesheet’s origin-clean flag to parentStylesheet’s origin-clean flag.
                     imported_style_sheet->set_origin_clean(parent_style_sheet->is_origin_clean());
@@ -235,7 +342,7 @@ void StyleSheetImport::fetch()
                     strong_this->set_style_sheet(imported_style_sheet);
                 });
             guard.disarm();
-        });
+        }));
 }
 
 void StyleSheetImport::set_style_sheet(NonnullRefPtr<StyleSheetState> style_sheet)
@@ -254,12 +361,6 @@ void StyleSheetImport::set_style_sheet(NonnullRefPtr<StyleSheetState> style_shee
             m_style_sheet->add_owning_document_or_shadow_root(*owning_document_or_shadow_root);
     }
 
-    auto document = m_style_sheet->owning_document();
-    if (!document && m_parent_style_sheet)
-        document = m_parent_style_sheet->owning_document();
-    if (document)
-        m_style_sheet->load_pending_image_resources(*document);
-
     // The rules the import brings in arrive now, at the position the import already holds.
     if (m_parent_style_sheet)
         record_imported_style_sheet_loaded(m_identity, *m_parent_style_sheet);
@@ -273,7 +374,7 @@ GC::Ref<MediaList> StyleSheetImport::media() const
     // AD-HOC: Return our own MediaList.
     //         https://github.com/w3c/csswg-drafts/issues/12063
     if (!m_media) {
-        m_media = MediaList::create(m_media_list.retain());
+        m_media = MediaList::create(m_media_list);
         if (m_style_sheet)
             m_media->set_associated_style_sheet(*m_style_sheet);
         else

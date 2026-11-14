@@ -36,7 +36,7 @@ void WindowEnvironmentSettingsObject::visit_edges(JS::Cell::Visitor& visitor)
 }
 
 // https://html.spec.whatwg.org/multipage/window-object.html#set-up-a-window-environment-settings-object
-void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation_url, NonnullOwnPtr<JS::ExecutionContext> execution_context, GC::Ptr<Environment> reserved_environment, URL::URL top_level_creation_url, URL::Origin top_level_origin, Optional<u64> agent_cluster_id)
+void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation_url, NonnullOwnPtr<JS::ExecutionContext> execution_context, GC::Ptr<Environment> reserved_environment, URL::URL top_level_creation_url, URL::Origin top_level_origin, Optional<u64> agent_cluster_id, CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode, Optional<EnvironmentId> environment_id)
 {
     // 1. Let realm be the value of execution context's Realm component.
     auto realm = execution_context->realm;
@@ -50,6 +50,7 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
     // NOTE: See the functions defined for this class.
     auto settings_object = realm->create<WindowEnvironmentSettingsObject>(*window, move(execution_context));
     settings_object->m_agent_cluster_id = agent_cluster_id;
+    settings_object->m_agent_cluster_cross_origin_isolation_mode = agent_cluster_cross_origin_isolation_mode;
 
     // 4. If reservedEnvironment is non-null, then:
     if (reserved_environment) {
@@ -66,7 +67,8 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
     // 5. Otherwise, set settings object's id to a new unique opaque string, settings object's target browsing context to
     //    null, and settings object's active service worker to null.
     else {
-        settings_object->id = EnvironmentId::generate();
+        // AD-HOC: An id the UI process already learned stands in for the new unique opaque string.
+        settings_object->id = environment_id.has_value() ? environment_id.release_value() : EnvironmentId::generate();
         settings_object->target_browsing_context = nullptr;
         // FIXME: Set settings object's active service worker to null.
     }
@@ -93,7 +95,7 @@ void WindowEnvironmentSettingsObject::setup(Page& page, URL::URL const& creation
 GC::Ptr<DOM::Document> WindowEnvironmentSettingsObject::responsible_document()
 {
     // Return window's associated Document.
-    return m_window->associated_document();
+    return m_window->associated_document_if_any();
 }
 
 // https://html.spec.whatwg.org/multipage/window-object.html#script-settings-for-window-objects:api-base-url
@@ -113,8 +115,21 @@ URL::Origin WindowEnvironmentSettingsObject::origin() const
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#script-settings-for-window-objects:concept-settings-object-has-cross-site-ancestor
 bool WindowEnvironmentSettingsObject::has_cross_site_ancestor() const
 {
+    auto navigable = m_window->navigable();
+
+    // AD-HOC: A document created for a navigation is not its navigable's active document yet when it processes the
+    //         preloads of its Link headers, so its window has no navigable. Answer for the navigable it is created in,
+    //         as its own fetches are answered once it is active.
+    if (!navigable)
+        navigable = m_window->associated_document().navigable_awaiting_activation();
+
+    // NB: A fetch can outlive its document's navigable, for example when following a redirect after an iframe is
+    //     removed. Without its ancestors, conservatively treat the environment as a third-party context.
+    if (!navigable)
+        return true;
+
     // 1. If window's navigable's parent is null, then return false.
-    auto parent = m_window->navigable()->parent();
+    auto parent = navigable->parent();
     if (!parent)
         return false;
 
@@ -132,7 +147,7 @@ bool WindowEnvironmentSettingsObject::has_cross_site_ancestor() const
 }
 
 // https://html.spec.whatwg.org/multipage/window-object.html#script-settings-for-window-objects:concept-settings-object-policy-container
-GC::Ref<PolicyContainer> WindowEnvironmentSettingsObject::policy_container() const
+NonnullRefPtr<PolicyContainer> WindowEnvironmentSettingsObject::policy_container() const
 {
     // Return the policy container of window's associated Document.
     return m_window->associated_document().policy_container();
@@ -148,18 +163,16 @@ double WindowEnvironmentSettingsObject::time_origin() const
 // https://html.spec.whatwg.org/multipage/window-object.html#script-settings-for-window-objects:concept-settings-object-cross-origin-isolated-capability
 CanUseCrossOriginIsolatedAPIs WindowEnvironmentSettingsObject::cross_origin_isolated_capability() const
 {
-    // FIXME: Return true if both of the following hold, and false otherwise:
-    //          1. realm's agent cluster's cross-origin-isolation mode is "concrete", and
-    //          2. window's associated Document is allowed to use the "cross-origin-isolated" feature.
-    // AD-HOC: Until we track an agent cluster's cross-origin-isolation mode (point 1) or the "cross-origin-isolated"
-    //         feature (point 2), we approximate this from the associated Document's cross-origin opener policy: It is
-    //         "same-origin-plus-COEP" exactly when the document was served (in a secure context) with COOP:same-origin
-    //         and COEP:require-corp — the condition for cross-origin isolation.
+    // Return true if both of the following hold, and false otherwise:
+    // - realm's agent cluster's cross-origin-isolation mode is "concrete", and
+    // - window's associated Document is allowed to use the "cross-origin-isolated" feature.
     // NB: This can be called before the window's document is associated (e.g., via time coarsening during setup) — so,
     //     we guard against a null document here.
     auto document = m_window ? m_window->associated_document_if_any() : nullptr;
-    if (document && document->opener_policy().value == OpenerPolicyValue::SameOriginPlusCOEP)
+    if (m_agent_cluster_cross_origin_isolation_mode == CrossOriginIsolationMode::Concrete
+        && document && document->is_allowed_to_use_feature(DOM::PolicyControlledFeature::CrossOriginIsolated)) {
         return CanUseCrossOriginIsolatedAPIs::Yes;
+    }
     return CanUseCrossOriginIsolatedAPIs::No;
 }
 

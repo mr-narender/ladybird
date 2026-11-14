@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <style>
     body {
         margin: 0;
@@ -50,12 +51,10 @@
         internals.updateStyle();
     }
 
-    function dumpCounters(label) {
-        const c = internals.getStyleInvalidationCounters();
-        println(
-            `${label}: elementStyleRecomputations=${c.elementStyleRecomputations}, ` +
-            `elementStyleNoopRecomputations=${c.elementStyleNoopRecomputations}`
-        );
+    function dumpWork(label, mutate) {
+        const work = styleWork(mutate);
+        const fullPass = work.passes().includes("FULL") ? " (full pass)" : "";
+        println(`${label}: restyled [${work.restyled().map(shortStyleName).join(", ")}]${fullPass}`);
     }
 
     function appendUnaffectedSubtree(parent, count) {
@@ -79,26 +78,18 @@
         const activeTarget = document.getElementById("active-target");
 
         getComputedStyle(plain).color;
-        internals.updateStyle();
-        internals.resetStyleInvalidationCounters();
-        moveTo(plain);
-        dumpCounters("plain text hover");
+        dumpWork("plain text hover", () => moveTo(plain));
 
-        internals.resetStyleInvalidationCounters();
-        moveTo(link);
-        dumpCounters("link hover");
+        dumpWork("link hover", () => moveTo(link));
         println(`link color: ${getComputedStyle(link).color}`);
 
         appendUnaffectedSubtree(activeContainer, 100);
         getComputedStyle(activeContainer).color;
-        internals.updateStyle();
-        internals.resetStyleInvalidationCounters();
-        clickAndHold(activeTarget);
-
-        const counters = internals.getStyleInvalidationCounters();
-        println(
-            `active state: elementStyleRecomputations=${counters.elementStyleRecomputations}`
-        );
+        // The target, the two elements its :active rules reach and the link the pointer left, not the
+        // 100 unaffected leaves.
+        dumpWork("active state", () => clickAndHold(activeTarget));
+        for (const id of ["active-target", "active-sibling", "active-ancestor-descendant"])
+            println(`${id} color: ${getComputedStyle(document.getElementById(id)).color}`);
         internals.mouseUp(0, 0);
     });
 </script>

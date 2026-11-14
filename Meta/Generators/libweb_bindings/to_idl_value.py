@@ -168,6 +168,18 @@ def write_dictionary_declaration(
             out.write(f"    {member_cpp_type} {cpp_name(member)};\n")
         else:
             out.write(f"    {member_cpp_type} {cpp_name(member)} {{{default_value}}};\n")
+
+    # NB: A dictionary is traced through its members, so that a GC::Function can capture it.
+    includes.add("LibGC/CaptureTraits.h")
+    if dictionary.members or dictionary.parent_name:
+        out.write("\n    void visit_edges(auto& visitor) const\n    {\n")
+        if dictionary.parent_name:
+            out.write(f"        {dictionary.parent_name}::visit_edges(visitor);\n")
+        for member in dictionary.members:
+            out.write(f"        GC::visit_capture_member(visitor, {cpp_name(member)});\n")
+        out.write("    }\n")
+    else:
+        out.write("\n    void visit_edges(auto&) const { }\n")
     out.write("};\n\n")
     out.write(
         f"JS::ThrowCompletionOr<{dictionary.name}> {converter_function_name(dictionary)}(JS::VM&, JS::Value);\n\n"
@@ -607,12 +619,11 @@ def interface_to_idl_value(
     includes.add("LibJS/Runtime/ValueInlines.h")
     includes.add(interface_like_type.implementation_header)
     if interface_like_type.name == "WindowProxy":
-        includes.add("AK/TypeCasts.h")
         return f"""[&]() -> JS::ThrowCompletionOr<GC::Ref<{interface_like_type.fully_qualified_name}>> {{
         if (!{value_name}.is_object())
             return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObjectOfType, "{interface_like_type.name}");
 
-        if (auto* window_proxy = as_if<{interface_like_type.fully_qualified_name}>({value_name}.as_object()))
+        if (auto* window_proxy = {interface_like_type.fully_qualified_name}::from_object({value_name}.as_object()))
             return GC::Ref {{ *window_proxy }};
         return vm.throw_completion<JS::TypeError>(JS::ErrorType::NotAnObjectOfType, "{interface_like_type.name}");
     }}()"""
@@ -1046,7 +1057,7 @@ def union_to_idl_value(
         includes.add("LibWeb/Bindings/PlatformObject.h")
         includes.add("LibWeb/Bindings/Wrappable.h")
         append("""
-            if (is<PlatformObject>(object)) {
+            if (object.is_platform_object()) {
 """)
         for interface_type in types.interface_types:
             interface_like_type = interface_like_type_for_idl_type(interface_type, context)
@@ -1055,7 +1066,7 @@ def union_to_idl_value(
             includes.add(interface_like_type.implementation_header)
             if interface_like_type.name == "WindowProxy":
                 append(f"""
-                if (auto* window_proxy = as_if<{platform_object_cpp_type}>(object))
+                if (auto* window_proxy = {platform_object_cpp_type}::from_object(object))
                     return {variant_type} {{ GC::Ref {{ *window_proxy }} }};
 """)
                 continue

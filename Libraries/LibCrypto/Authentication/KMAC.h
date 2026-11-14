@@ -26,8 +26,8 @@ public:
 
     ~KMAC() = default;
 
-    static Optional<KMACKind> kind_from_algorithm_name(StringView);
     static u32 default_key_length(KMACKind);
+    static ErrorOr<void> validate_parameters(u32 output_length_bits, Optional<ReadonlyBytes> customization);
 
     ErrorOr<ByteBuffer> sign(
         ReadonlyBytes key,

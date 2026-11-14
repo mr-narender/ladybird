@@ -27,7 +27,7 @@ GC::Ref<WebIDL::ObservableArray> create_adopted_style_sheets_list(Node& document
 {
     auto& realm = document_or_shadow_root.document().relevant_settings_object().realm();
     auto adopted_style_sheets = WebIDL::ObservableArray::create(realm);
-    adopted_style_sheets->set_on_set_an_indexed_value_callback([&document_or_shadow_root, adopted_style_sheets](u32 index, JS::Value& value) -> WebIDL::ExceptionOr<void> {
+    adopted_style_sheets->set_on_set_an_indexed_value_callback(GC::create_function(realm.heap(), GC::captures(document_or_shadow_root, adopted_style_sheets), [](Node& document_or_shadow_root, GC::Ref<WebIDL::ObservableArray>& adopted_style_sheets, u32 index, JS::Value& value) -> WebIDL::ExceptionOr<void> {
         auto& vm = document_or_shadow_root.vm();
         auto style_sheet = CSS::css_style_sheet_from_value(value);
         if (!style_sheet)
@@ -46,33 +46,29 @@ GC::Ref<WebIDL::ObservableArray> create_adopted_style_sheets_list(Node& document
         // point, so preserve their final order by attaching before the entry currently following
         // this index.
         CSS::StyleSheetState* before = nullptr;
-        if (auto successor = adopted_style_sheets->indexed_get(index + 1); successor.has_value())
-            before = CSS::css_style_sheet_from_value(successor->value);
+        if (auto successor = adopted_style_sheets->element_value(index + 1); successor.has_value())
+            before = CSS::css_style_sheet_from_value(*successor);
         CSS::record_stylesheet_attached(*style_sheet, document_or_shadow_root, before);
         CSS::Invalidation::invalidate_style_after_adopting_style_sheet(document_or_shadow_root, *style_sheet);
         return {};
-    });
-    adopted_style_sheets->set_on_delete_an_indexed_value_callback([&document_or_shadow_root](JS::Value value) -> WebIDL::ExceptionOr<void> {
+    }));
+    adopted_style_sheets->set_on_delete_an_indexed_value_callback(GC::create_function(realm.heap(), GC::captures(document_or_shadow_root), [](Node& document_or_shadow_root, JS::Value value) -> WebIDL::ExceptionOr<void> {
         auto* style_sheet = CSS::css_style_sheet_from_value(value);
         VERIFY(style_sheet);
         CSS::record_stylesheet_detached(*style_sheet, document_or_shadow_root);
         CSS::Invalidation::invalidate_style_after_removing_adopted_style_sheet(document_or_shadow_root, *style_sheet);
         return {};
-    });
+    }));
 
     return adopted_style_sheets;
 }
 
 void for_each_adopted_style_sheet(WebIDL::ObservableArray& adopted_style_sheets, Function<void(CSS::StyleSheetState&)> const& callback)
 {
-    for (u32 i = 0; i < adopted_style_sheets.indexed_array_like_size(); ++i) {
-        auto value_and_attributes = adopted_style_sheets.indexed_get(i);
-        if (!value_and_attributes.has_value())
-            continue;
-
-        if (auto style_sheet = CSS::css_style_sheet_from_value(value_and_attributes->value))
+    adopted_style_sheets.for_each_element_value([&](JS::Value value) {
+        if (auto style_sheet = CSS::css_style_sheet_from_value(value))
             callback(*style_sheet);
-    }
+    });
 }
 
 }

@@ -1,0 +1,3 @@
+over another animation:
+alone:
+  opacity div#target

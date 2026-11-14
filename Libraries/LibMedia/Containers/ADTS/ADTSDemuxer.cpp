@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibMedia/Codecs/AAC.h>
-#include <LibMedia/CodedFrame.h>
 #include <LibMedia/Containers/ADTS/ADTSDemuxer.h>
 #include <LibMedia/Containers/FrameScanTimeline.h>
 #include <LibMedia/SeekMode.h>
+#include <LibMediaCodecs/Codecs/AAC.h>
+#include <LibMediaCodecs/CodedFrame.h>
 
 namespace Media::ADTS {
 
@@ -16,12 +16,12 @@ namespace {
 
 class FrameScanSource final : public Media::FrameScanSource {
 public:
-    virtual Optional<Frame> next_frame(MediaStreamCursor& cursor, size_t position) const override
+    virtual DecoderErrorOr<Optional<Frame>> next_frame(MediaStreamCursor& cursor, size_t position) const override
     {
         FrameIterator iterator { NonnullRefPtr { cursor }, position, FrameIterator::Resynchronize::Yes };
-        auto frame = iterator.next();
+        auto frame = TRY(absorb_data_errors(iterator.next()));
         if (!frame.has_value())
-            return {};
+            return Optional<Frame> {};
 
         return Frame {
             .position = frame->position,
@@ -30,14 +30,14 @@ public:
         };
     }
 
-    virtual Optional<size_t> find_boundary_at_or_after(MediaStreamCursor& cursor, size_t start_byte, size_t upper_bound) const override
+    virtual DecoderErrorOr<Optional<size_t>> find_boundary_at_or_after(MediaStreamCursor& cursor, size_t start_byte, size_t upper_bound) const override
     {
-        return Reader::find_frame_boundary_at_or_after(NonnullRefPtr { cursor }, start_byte, upper_bound);
+        return absorb_data_errors(Reader::find_frame_boundary_at_or_after(NonnullRefPtr { cursor }, start_byte, upper_bound));
     }
 
-    virtual Optional<size_t> find_boundary_at_or_before(MediaStreamCursor& cursor, size_t target_byte, size_t lower_bound, size_t upper_bound) const override
+    virtual DecoderErrorOr<Optional<size_t>> find_boundary_at_or_before(MediaStreamCursor& cursor, size_t target_byte, size_t lower_bound, size_t upper_bound) const override
     {
-        return Reader::find_frame_boundary_at_or_before(NonnullRefPtr { cursor }, target_byte, lower_bound, upper_bound);
+        return absorb_data_errors(Reader::find_frame_boundary_at_or_before(NonnullRefPtr { cursor }, target_byte, lower_bound, upper_bound));
     }
 };
 
@@ -88,7 +88,7 @@ static DecoderErrorOr<Track> create_track(Reader const& reader, ReadonlyBytes co
 
 DecoderErrorOr<NonnullRefPtr<Demuxer>> ADTSDemuxer::from_stream(NonnullRefPtr<MediaStream> const& stream)
 {
-    auto reader = Reader::from_stream(stream->create_cursor());
+    auto reader = TRY(Reader::from_stream(stream->create_cursor()));
     if (!reader.has_value())
         return DecoderError::with_description(DecoderErrorCategory::UnrecognizedFormat, "Found no ADTS frames in the stream"sv);
 
@@ -127,9 +127,6 @@ void ADTSDemuxer::start_buffered_scan_thread()
     auto scan_cursor = m_stream->create_cursor();
     scan_cursor->set_is_blocking(false);
 
-    Vector<Track> tracks;
-    tracks.append(m_track);
-
     DemuxerScanState initial_state;
     initial_state.duration = m_reader.duration();
 
@@ -137,14 +134,13 @@ void ADTSDemuxer::start_buffered_scan_thread()
         BufferedScanPayload {
             .timeline = make<FrameScanTimeline>(make<FrameScanSource>(), m_reader.first_frame_position(), m_reader.duration(), DurationSource::Estimated, OptionalNone {}),
             .scan_cursor = move(scan_cursor),
-            .tracks = move(tracks),
         },
-        [](MediaStream& stream, BufferedScanPayload& payload) {
-            auto byte_ranges = stream.available_byte_ranges();
-            HashMap<u64, BufferedRangesScan> scans_by_track_identifier;
+        [](MediaStream::Availability const& availability, BufferedScanPayload& payload) {
+            auto const& byte_ranges = availability.byte_ranges;
+            BufferedRangesScan scan;
             if (!byte_ranges.is_empty())
-                scans_by_track_identifier.set(payload.tracks[0].identifier(), payload.timeline->buffered_time_ranges(payload.scan_cursor, byte_ranges, stream.expected_size()));
-            return DemuxerScanState::create_from_track_scans(payload.tracks, move(scans_by_track_identifier), payload.timeline->duration(), stream.closing_bytes_are_available());
+                scan = payload.timeline->buffered_time_ranges(payload.scan_cursor, byte_ranges, availability.expected_size);
+            return DemuxerScanState::create_from_track_scans({ move(scan) }, payload.timeline->duration(), availability.closing_bytes_are_available());
         });
 }
 
@@ -188,14 +184,10 @@ DecoderErrorOr<CodedFrame> ADTSDemuxer::get_next_sample_for_track(Track const& t
     VERIFY(track == m_track);
     auto& status = track_status();
 
-    auto frame = status.iterator.next();
-    if (!frame.has_value()) {
-        if (status.iterator.cursor().is_aborted())
-            return DecoderError::with_description(DecoderErrorCategory::Aborted, "Read aborted"sv);
+    auto frame = TRY(status.iterator.read_next_frame());
+    if (!frame.has_value())
         return DecoderError::with_description(DecoderErrorCategory::EndOfStream, "End of stream"sv);
-    }
 
-    auto data = TRY(status.iterator.read_frame_data(*frame));
     auto duration = AK::Duration::from_time_units(frame->header.sample_count, 1, frame->header.sample_rate);
     auto timestamp = status.next_timestamp;
     status.next_timestamp += duration;
@@ -207,7 +199,7 @@ DecoderErrorOr<CodedFrame> ADTSDemuxer::get_next_sample_for_track(Track const& t
     }
 
     // Every frame can begin decoding, so every frame is a keyframe to seek to.
-    return CodedFrame(CodecID::AAC, timestamp, timestamp, duration, FrameFlags::Keyframe, move(data), move(codec_configuration));
+    return CodedFrame(CodecID::AAC, timestamp, timestamp, duration, FrameFlags::Keyframe, move(frame->data), move(codec_configuration));
 }
 
 AK::Duration ADTSDemuxer::select_fast_seek_target_for_track(Track const&, AK::Duration target, SeekMode)
@@ -220,10 +212,10 @@ DecoderErrorOr<DemuxerSeekResult> ADTSDemuxer::seek_to_most_recent_keyframe(Trac
     VERIFY(track == m_track);
     auto& status = track_status();
 
+    auto seek_result = TRY(m_buffered_scan_thread->payload().timeline->seek_to_timestamp(m_seek_scanning_cursor, m_seek_cursor, *m_stream, timestamp));
     if (has_flag(options, DemuxerSeekOptions::NeedCodecConfiguration))
         status.needs_codec_configuration = true;
 
-    auto seek_result = TRY(m_buffered_scan_thread->payload().timeline->seek_to_timestamp(m_seek_scanning_cursor, m_seek_cursor, *m_stream, timestamp));
     auto const* seeked = seek_result.get_pointer<SeekedPosition>();
     if (seeked == nullptr)
         return DemuxerSeekResult::KeptCurrentPosition;
@@ -248,19 +240,24 @@ DemuxerScanState const& ADTSDemuxer::scan_state() const
     return m_buffered_scan_thread->main_thread_state();
 }
 
-void ADTSDemuxer::set_scan_state_change_handler(Function<void()> handler)
+void ADTSDemuxer::set_scan_state_change_handler(ScanStateChangeHandler handler)
 {
-    m_buffered_scan_thread->set_change_handler(move(handler));
+    m_buffered_scan_thread->set_change_handler([handler = move(handler)] {
+        if (handler)
+            handler(TimeRanges {});
+    });
 }
 
 void ADTSDemuxer::set_blocking_reads_aborted_for_track(Track const&)
 {
     track_status().iterator.cursor().abort();
+    m_seek_cursor->abort();
 }
 
 void ADTSDemuxer::reset_blocking_reads_aborted_for_track(Track const&)
 {
     track_status().iterator.cursor().reset_abort();
+    m_seek_cursor->reset_abort();
 }
 
 void ADTSDemuxer::set_read_blocked_change_handler_for_track(Track const&, ReadBlockedChangeHandler handler)

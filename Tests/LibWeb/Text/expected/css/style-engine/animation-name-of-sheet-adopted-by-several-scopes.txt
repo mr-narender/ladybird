@@ -1,0 +1,2 @@
+normal: 10px
+important: 20px

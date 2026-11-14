@@ -4,33 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Math.h>
 #include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibGfx/Bitmap.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Font/Typeface.h>
-#include <LibGfx/ShareableBitmap.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
-
-namespace Compositing {
-
-static ErrorOr<Gfx::ShareableBitmap> shareable_bitmap_from_image_frame(Gfx::DecodedImageFrame const& frame)
-{
-    auto bitmap = frame.bitmap().to_shareable_bitmap();
-    if (!bitmap.is_valid())
-        return Error::from_string_literal("Display-list resource transaction failed to create image-frame bitmap");
-    return bitmap;
-}
-
-static ErrorOr<Gfx::DecodedImageFrame> create_image_frame_from_ipc(Gfx::ShareableBitmap bitmap, Gfx::ColorSpace color_space)
-{
-    if (!bitmap.is_valid() || !bitmap.bitmap())
-        return Error::from_string_literal("Display-list resource transaction contained invalid image-frame bitmap");
-    return Gfx::DecodedImageFrame { *bitmap.bitmap(), move(color_space) };
-}
-
-}
 
 namespace IPC {
 
@@ -43,6 +23,8 @@ ErrorOr<void> encode(Encoder& encoder, Compositing::DisplayListFontResource cons
     TRY(encoder.encode(font.point_size()));
     TRY(encoder.encode(font.variation_settings()));
     TRY(encoder.encode(font.features()));
+    TRY(encoder.encode(font.synthesis().bold));
+    TRY(encoder.encode(font.synthesis().oblique_angle));
     TRY(encoder.encode(font.is_invisible()));
     return {};
 }
@@ -55,10 +37,13 @@ ErrorOr<Compositing::DisplayListFontResource> decode(Decoder& decoder)
     auto point_size = TRY(decoder.decode<float>());
     auto variations = TRY(decoder.decode<Gfx::FontVariationSettings>());
     auto features = TRY(decoder.decode<Gfx::ShapeFeatures>());
+    Gfx::FontSynthesis synthesis;
+    synthesis.bold = TRY(decoder.decode<bool>());
+    synthesis.oblique_angle = TRY(decoder.decode<float>());
+    if (!__builtin_isfinite(synthesis.oblique_angle) || AK::fabs(synthesis.oblique_angle) > 90)
+        return Error::from_string_literal("Invalid synthetic oblique angle");
     auto invisible = TRY(decoder.decode<bool>());
-    auto font = typeface->font(point_size, move(variations), move(features));
-    if (invisible)
-        font = font->invisible_variant();
+    auto font = invisible ? typeface->invisible_font(point_size, variations, features, synthesis) : typeface->font(point_size, variations, features, synthesis);
 
     return Compositing::DisplayListFontResource {
         .id = id,
@@ -70,8 +55,7 @@ template<>
 ErrorOr<void> encode(Encoder& encoder, Compositing::DisplayListImageFrameResource const& resource)
 {
     TRY(encoder.encode(resource.id));
-    TRY(encoder.encode(TRY(Compositing::shareable_bitmap_from_image_frame(resource.frame))));
-    TRY(encoder.encode(resource.frame.color_space()));
+    TRY(encoder.encode(resource.frame));
     return {};
 }
 
@@ -79,12 +63,11 @@ template<>
 ErrorOr<Compositing::DisplayListImageFrameResource> decode(Decoder& decoder)
 {
     auto id = TRY(decoder.decode<Compositing::ImageFrameResourceId>());
-    auto bitmap = TRY(decoder.decode<Gfx::ShareableBitmap>());
-    auto color_space = TRY(decoder.decode<Gfx::ColorSpace>());
+    auto frame = TRY(decoder.decode<Gfx::DecodedImageFrame>());
 
     return Compositing::DisplayListImageFrameResource {
         .id = id,
-        .frame = TRY(Compositing::create_image_frame_from_ipc(move(bitmap), move(color_space))),
+        .frame = move(frame),
     };
 }
 
@@ -135,6 +118,9 @@ ErrorOr<Compositing::DisplayListResourceTransaction> decode(Decoder& decoder)
     for (size_t i = 0; i < display_list_count; ++i) {
         auto display_list = TRY(decoder.decode<NonnullRefPtr<Compositing::DisplayList>>());
         auto visual_context_tree = TRY(decoder.decode<Compositing::AccumulatedVisualContextTree>());
+        if (display_list->compatible_visual_context_tree_structural_epoch() != visual_context_tree.structural_epoch())
+            return Error::from_string_literal("Display list resource does not match its visual context tree");
+        TRY(Compositing::validate_display_list_references_live_visual_context_nodes(*display_list, visual_context_tree));
         display_lists.unchecked_append({ move(display_list), move(visual_context_tree) });
     }
 

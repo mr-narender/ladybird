@@ -7,12 +7,10 @@
 
 #include <LibGC/Heap.h>
 #include <LibGC/Timer.h>
-#include <LibJS/Runtime/ECMAScriptFunctionObject.h>
 #include <LibJS/Runtime/GlobalEnvironment.h>
 #include <LibJS/Runtime/ObjectEnvironment.h>
 #include <LibJS/Runtime/PromiseConstructor.h>
-#include <LibJS/Runtime/SharedFunctionInstanceData.h>
-#include <LibJS/RustIntegration.h>
+#include <LibJS/ScriptCompilation.h>
 #include <LibWeb/Bindings/Window.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/Document.h>
@@ -55,16 +53,15 @@ static JS::ThrowCompletionOr<JS::Value> execute_a_function_body(HTML::BrowsingCo
     //        function async, unfortunately. See: https://github.com/w3c/webdriver/issues/1436
     auto body_utf16 = Utf16String::from_utf8(body);
     auto source_text = Utf16String::formatted(
-        R"~~~(function() {{
+        R"~~~((function() {{
             {}
-        }})~~~",
+        }}))~~~",
         body_utf16);
 
-    auto rust_compilation = JS::RustIntegration::compile_dynamic_function(
-        realm.vm(), source_text, Utf16String {}, body_utf16, JS::FunctionKind::Normal);
+    auto compiled_function = JS::CompiledDynamicFunction::compile(realm.vm(), source_text, Utf16String {}, body_utf16, JS::FunctionKind::Normal);
 
     // 4. If body is not parsable as a FunctionBody or if parsing detects an early error, return Completion { [[Type]]: normal, [[Value]]: null, [[Target]]: empty }.
-    if (!rust_compilation.has_value() || rust_compilation->is_error())
+    if (compiled_function.is_error())
         return JS::js_null();
 
     // 6. Prepare to run script with environment settings.
@@ -74,11 +71,7 @@ static JS::ThrowCompletionOr<JS::Value> execute_a_function_body(HTML::BrowsingCo
     HTML::prepare_to_run_callback(environment_settings);
 
     // 8. Let function be the result of calling FunctionCreate.
-    auto function = JS::ECMAScriptFunctionObject::create_from_function_data(
-        realm,
-        rust_compilation->value(),
-        &global_scope,
-        nullptr);
+    auto function = compiled_function.value().instantiate(realm, global_scope, nullptr, realm.vm().get_active_script_or_module());
 
     // 9. Let completion be Function.[[Call]](window, parameters) with function as the this value.
     // NOTE: This is not entirely clear, but I don't think they mean actually passing `function` as
@@ -101,7 +94,7 @@ static JS::ThrowCompletionOr<JS::Value> execute_a_function_body(HTML::BrowsingCo
 
 static void fire_completion_when_resolved(GC::Ref<WebIDL::Promise> promise, GC::Ref<GC::Timer> timer, GC::Ref<OnScriptComplete> on_complete)
 {
-    auto reaction_steps = GC::create_function(GC::Heap::the(), [promise, timer, on_complete](JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
+    auto reaction_steps = GC::create_function(GC::Heap::the(), GC::captures(promise, timer, on_complete), [](auto& promise, auto& timer, auto& on_complete, JS::Value) -> WebIDL::ExceptionOr<JS::Value> {
         if (timer->is_timed_out())
             return JS::js_undefined();
         timer->stop();
@@ -115,7 +108,7 @@ static void fire_completion_when_resolved(GC::Ref<WebIDL::Promise> promise, GC::
     WebIDL::react_to_promise(promise, reaction_steps, reaction_steps);
 }
 
-void execute_script(HTML::BrowsingContext const& browsing_context, String body, GC::RootVector<JS::Value> arguments, Optional<u64> const& timeout_ms, GC::Ref<OnScriptComplete> on_complete)
+GC::Ref<GC::Timer> execute_script(HTML::BrowsingContext const& browsing_context, String body, GC::RootVector<JS::Value> arguments, Optional<u64> const& timeout_ms, GC::Ref<OnScriptComplete> on_complete)
 {
     auto const* document = browsing_context.active_document();
     auto& realm = document->relevant_settings_object().realm();
@@ -126,7 +119,7 @@ void execute_script(HTML::BrowsingContext const& browsing_context, String body, 
     // 6. If timeout is not null:
     if (timeout_ms.has_value()) {
         // 1. Start the timer with timer and timeout.
-        timer->start(timeout_ms.value(), GC::create_function(GC::Heap::the(), [on_complete]() {
+        timer->start(timeout_ms.value(), GC::create_function(GC::Heap::the(), GC::captures(on_complete), [](auto& on_complete) {
             on_complete->function()({ .state = JS::Promise::State::Pending });
         }));
     }
@@ -138,7 +131,7 @@ void execute_script(HTML::BrowsingContext const& browsing_context, String body, 
     auto promise = WebIDL::create_promise(realm);
 
     // 8. Run the following substeps in parallel:
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [&realm, &browsing_context, promise, body = move(body), arguments = move(arguments)]() mutable {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(realm, browsing_context, promise, move(body), move(arguments)), [](auto& realm, auto& browsing_context, auto& promise, auto& body, auto& arguments) {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         // 1. Let scriptPromise be the result of promise-calling execute a function body, with arguments body and arguments.
@@ -146,14 +139,14 @@ void execute_script(HTML::BrowsingContext const& browsing_context, String body, 
 
         WebIDL::react_to_promise(script_promise,
             // 2. Upon fulfillment of scriptPromise with value v, resolve promise with value v.
-            GC::create_function(GC::Heap::the(), [&realm, promise](JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
+            GC::create_function(GC::Heap::the(), GC::captures(realm, promise), [](auto& realm, auto& promise, JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
                 HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
                 WebIDL::resolve_promise(promise, value);
                 return JS::js_undefined();
             }),
 
             // 3. Upon rejection of scriptPromise with value r, reject promise with value r.
-            GC::create_function(GC::Heap::the(), [&realm, promise](JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
+            GC::create_function(GC::Heap::the(), GC::captures(realm, promise), [](auto& realm, auto& promise, JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
                 HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
                 WebIDL::reject_promise(promise, reason);
                 return JS::js_undefined();
@@ -162,14 +155,15 @@ void execute_script(HTML::BrowsingContext const& browsing_context, String body, 
 
     // 9. Wait until promise is resolved, or timer's timeout fired flag is set, whichever occurs first.
     fire_completion_when_resolved(promise, timer, on_complete);
+
+    return timer;
 }
 
 // https://w3c.github.io/webdriver/#execute-async-script
-void execute_async_script(HTML::BrowsingContext const& browsing_context, String body, GC::RootVector<JS::Value> arguments, Optional<u64> const& timeout_ms, GC::Ref<OnScriptComplete> on_complete)
+GC::Ref<GC::Timer> execute_async_script(HTML::BrowsingContext const& browsing_context, String body, GC::RootVector<JS::Value> arguments, Optional<u64> const& timeout_ms, GC::Ref<OnScriptComplete> on_complete)
 {
     auto const* document = browsing_context.active_document();
     auto& realm = document->relevant_settings_object().realm();
-    auto& vm = document->vm();
 
     // 5. Let timer be a new timer.
     auto timer = GC::Heap::the().allocate<GC::Timer>();
@@ -177,7 +171,7 @@ void execute_async_script(HTML::BrowsingContext const& browsing_context, String 
     // 6. If timeout is not null:
     if (timeout_ms.has_value()) {
         // 1. Start the timer with timer and timeout.
-        timer->start(timeout_ms.value(), GC::create_function(GC::Heap::the(), [on_complete]() {
+        timer->start(timeout_ms.value(), GC::create_function(GC::Heap::the(), GC::captures(on_complete), [](auto& on_complete) {
             on_complete->function()({ .state = JS::Promise::State::Pending });
         }));
     }
@@ -189,7 +183,7 @@ void execute_async_script(HTML::BrowsingContext const& browsing_context, String 
     auto promise = WebIDL::create_promise(realm);
 
     // 8. Run the following substeps in parallel:
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [&vm, &realm, &browsing_context, promise, body = move(body), arguments = move(arguments)]() mutable {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), GC::captures(realm, browsing_context, promise, move(body), move(arguments)), [](auto& realm, auto& browsing_context, auto& promise, auto& body, auto& arguments) {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         // 1. Let resolvingFunctions be CreateResolvingFunctions(promise).
@@ -199,7 +193,7 @@ void execute_async_script(HTML::BrowsingContext const& browsing_context, String 
         arguments.append(resolving_functions.resolve);
 
         // 3. Let scriptResult be the result of calling execute a function body, with arguments body and arguments.
-        auto script_result = execute_a_function_body(browsing_context, body, move(arguments));
+        auto script_result = execute_a_function_body(browsing_context, body, arguments);
 
         // 4. If scriptResult.[[Type]] is not normal, then reject promise with value scriptResult.[[Value]], and abort these steps.
         // NOTE: Prior revisions of this specification did not recognize the return value of the provided script.
@@ -215,7 +209,7 @@ void execute_async_script(HTML::BrowsingContext const& browsing_context, String 
             return;
 
         // 6. Let then be Get(scriptResult.[[Value]], "then").
-        auto then = script_result.value().as_object().get(vm.names.then);
+        auto then = script_result.value().as_object().get(realm.vm().names.then);
 
         // 7. If then.[[Type]] is not normal, then reject promise with value then.[[Value]], and abort these steps.
         if (then.is_throw_completion()) {
@@ -232,14 +226,14 @@ void execute_async_script(HTML::BrowsingContext const& browsing_context, String 
 
         WebIDL::react_to_promise(script_promise,
             // 10. Upon fulfillment of scriptPromise with value v, resolve promise with value v.
-            GC::create_function(GC::Heap::the(), [&realm, promise](JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
+            GC::create_function(GC::Heap::the(), GC::captures(realm, promise), [](auto& realm, auto& promise, JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
                 HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
                 WebIDL::resolve_promise(promise, value);
                 return JS::js_undefined();
             }),
 
             // 11. Upon rejection of scriptPromise with value r, reject promise with value r.
-            GC::create_function(GC::Heap::the(), [&realm, promise](JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
+            GC::create_function(GC::Heap::the(), GC::captures(realm, promise), [](auto& realm, auto& promise, JS::Value reason) -> WebIDL::ExceptionOr<JS::Value> {
                 HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
                 WebIDL::reject_promise(promise, reason);
                 return JS::js_undefined();
@@ -248,6 +242,8 @@ void execute_async_script(HTML::BrowsingContext const& browsing_context, String 
 
     // 9. Wait until promise is resolved, or timer's timeout fired flag is set, whichever occurs first.
     fire_completion_when_resolved(promise, timer, on_complete);
+
+    return timer;
 }
 
 }

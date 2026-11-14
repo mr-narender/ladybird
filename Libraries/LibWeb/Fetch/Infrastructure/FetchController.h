@@ -14,9 +14,15 @@
 #include <LibJS/Forward.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibRequests/Forward.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/Fetch/Engine/FetchByteChannel.h>
+#include <LibWeb/Fetch/Engine/FetchExecutor.h>
+#include <LibWeb/Fetch/Engine/Ids.h>
+#include <LibWeb/Fetch/Infrastructure/FetchControlBlock.h>
+#include <LibWeb/Fetch/Infrastructure/FetchControllerRegistry.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
+#include <LibWeb/Fetch/Infrastructure/NetworkObservation.h>
+#include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
@@ -35,72 +41,107 @@ class WEB_API FetchController : public JS::Cell {
     GC_DECLARE_ALLOCATOR(FetchController);
 
 public:
-    enum class State : u8 {
-        Ongoing,
-        Terminated,
-        Aborted,
-        Stopped,
-    };
+    using State = FetchControlBlock::State;
 
-    [[nodiscard]] static GC::Ref<FetchController> create();
+    [[nodiscard]] static GC::Ref<FetchController> create(FetchControllerRegistry&);
 
-    void set_full_timing_info(NonnullRefPtr<FetchTimingInfo> full_timing_info) { m_full_timing_info = move(full_timing_info); }
-    void set_report_timing_steps(Function<void(JS::Object&)> report_timing_steps);
-    void set_next_manual_redirect_steps(Function<void()> next_manual_redirect_steps);
+    [[nodiscard]] FetchControllerToken token() const { return m_token; }
+    [[nodiscard]] WeakPtr<FetchControllerRegistry> const& registry() const { return m_registry; }
+    [[nodiscard]] FetchControlBlock& control_block() const { return *m_control_block; }
 
-    [[nodiscard]] State state() const { return m_state; }
-    [[nodiscard]] RefPtr<FetchTimingInfo> timing_info() const;
+    void set_report_timing_steps(GC::Ref<GC::Function<void(JS::Object&)>> report_timing_steps);
+    void set_next_manual_redirect_steps(GC::Ref<GC::Function<void()>> next_manual_redirect_steps);
 
+    [[nodiscard]] State state() const { return m_control_block->state(); }
+    [[nodiscard]] RefPtr<FetchTimingInfo> full_timing_info() const { return m_control_block->full_timing_info(); }
+
+    [[nodiscard]] bool has_report_timing_steps() const { return m_report_timing_steps != nullptr; }
     void report_timing(JS::Object&) const;
     void process_next_manual_redirect() const;
+
+    // Runs the steps once the network has delivered all of the body whose bytes arrive through the channel, unless the
+    // fetch is aborted, terminated or stopped first. A later call replaces them.
+    void when_network_completes_body(Engine::FetchByteChannel const&, GC::Ref<GC::Function<void()>> steps);
+    void did_complete_network_body(Engine::FetchByteChannel const&);
     [[nodiscard]] NonnullRefPtr<FetchTimingInfo> extract_full_timing_info() const;
     void abort(JS::Realm&, Optional<JS::Value>);
     Optional<HTML::IPCSerializationRecord> const& serialized_abort_reason() const { return m_serialized_abort_reason; }
     void terminate();
 
-    void set_fetch_params(Badge<FetchParams>, GC::Ref<FetchParams> fetch_params) { m_fetch_params = fetch_params; }
-    [[nodiscard]] GC::Ptr<FetchParams> fetch_params() const { return m_fetch_params; }
+    void set_algorithms(Badge<FetchParams>, GC::Ref<FetchAlgorithms const>);
+    [[nodiscard]] GC::Ref<FetchAlgorithms const> algorithms() const;
 
-    // AD-HOC: Whether this fetch's response has arrived: as headers from the network, or at main fetch. From then on,
-    //         its body delivery is queued as event-loop tasks, and its response processing captures its task
-    //         destination as it was then — so re-targeting the fetch no longer reaches either.
-    //         consume_a_preloaded_resource() checks this before re-targeting an in-flight preload's fetch.
-    void set_response_arrived() { m_response_arrived = true; }
-    [[nodiscard]] bool response_arrived() const { return m_response_arrived; }
+    // The fetch params created with the controller, for which WebDriver BiDi reports errors and intercepts requests.
+    void set_original_fetch_params(Badge<FetchParams>, FetchParams const&);
+    [[nodiscard]] RefPtr<FetchParams> original_fetch_params() const;
+
+    // The network observation of the request the controller's fetch params were created with.
+    void set_network_observation(Badge<FetchParams>, NonnullRefPtr<NetworkObservation>);
+    [[nodiscard]] RefPtr<NetworkObservation> const& network_observation() const { return m_network_observation; }
+
+    [[nodiscard]] TaskDestination const& task_destination() const { return m_task_destination; }
+    void set_task_destination(TaskDestination task_destination) { m_task_destination = move(task_destination); }
+
+    // The page of the realm that started the fetch.
+    [[nodiscard]] GC::Ref<Page> page() const;
+    void set_page(Page& page) { m_page = page; }
+
+    void set_preflighted_fetch_controller(FetchController& controller) { m_preflighted_fetch_controller = controller; }
+
+    // Moves the fetch, before its response has arrived, to another task destination and body intent.
+    void retarget(TaskDestination, Engine::BodyIntent);
+
+    [[nodiscard]] bool is_keepalive() const { return m_is_keepalive; }
+    void set_keepalive(bool is_keepalive) { m_is_keepalive = is_keepalive; }
+
+    [[nodiscard]] bool response_arrived() const { return m_control_block->response_arrived(); }
     [[nodiscard]] GC::Ptr<Fetching::PendingResponse> pending_preloaded_response() const { return m_pending_preloaded_response; }
     void set_pending_preloaded_response(GC::Ptr<Fetching::PendingResponse> pending_preloaded_response) { m_pending_preloaded_response = pending_preloaded_response; }
 
-    void set_pending_request(RefPtr<Requests::Request> const&);
-    bool requires_network() const { return m_requires_network; }
-    bool has_started_request() const { return m_has_started_request; }
+    bool requires_network() const { return m_control_block->requires_network(); }
+    bool has_started_request() const { return m_control_block->has_started_request(); }
     void set_inner_fetch_controller(GC::Ref<FetchController>);
 
+    // The fetch this controller's fetch params started last, and the executor its start was posted to. The controller's
+    // stops are posted there, for that fetch.
+    void set_started_fetch(Engine::FetchId, Engine::FetchExecutor&);
+
     void stop_fetch();
-    void stop_request();
+    void set_stop_steps(GC::Ref<GC::Function<void()>> stop_steps) { m_stop_steps = stop_steps; }
 
     u64 next_fetch_task_id() { return m_next_fetch_task_id++; }
     void fetch_task_queued(u64 fetch_task_id, HTML::TaskID event_id);
     void fetch_task_complete(u64 fetch_task_id);
 
+    void add_pending_response(Badge<Fetching::PendingResponse>, GC::Ref<Fetching::PendingResponse>);
+    void remove_pending_response(Badge<Fetching::PendingResponse>, GC::Ref<Fetching::PendingResponse>);
+
 private:
-    FetchController();
+    explicit FetchController(FetchControllerRegistry&);
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
+    virtual void finalize() override;
 
-    // https://fetch.spec.whatwg.org/#fetch-controller-state
-    // state (default "ongoing")
-    //    "ongoing", "terminated", or "aborted"
-    State m_state { State::Ongoing };
+    void report_webdriver_bidi_fetch_error(StringView error_text) const;
+    void cancel_webdriver_bidi_network_interception() const;
+    void stop_request();
 
-    // https://fetch.spec.whatwg.org/#fetch-controller-full-timing-info
-    // full timing info (default null)
-    //    Null or a fetch timing info.
-    RefPtr<FetchTimingInfo> m_full_timing_info;
+    WeakPtr<FetchControllerRegistry> m_registry;
+    FetchControllerToken m_token;
+    NonnullRefPtr<FetchControlBlock> m_control_block;
+    WeakPtr<FetchParams> m_original_fetch_params;
+    RefPtr<NetworkObservation> m_network_observation;
 
     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
     // report timing steps (default null)
     //    Null or an algorithm accepting a global object.
     GC::Ptr<GC::Function<void(JS::Object&)>> m_report_timing_steps;
+
+    struct AwaitedNetworkCompletion {
+        NonnullRefPtr<Engine::FetchByteChannel const> body;
+        GC::Ref<GC::Function<void()>> steps;
+    };
+    Optional<AwaitedNetworkCompletion> m_awaited_network_completion;
 
     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
     // serialized abort reason (default null)
@@ -112,18 +153,54 @@ private:
     //     Null or an algorithm accepting nothing.
     GC::Ptr<GC::Function<void()>> m_next_manual_redirect_steps;
 
-    GC::Ptr<FetchParams> m_fetch_params;
-    bool m_response_arrived { false };
+    // AD-HOC: The fetch params' algorithms are kept on their controller, which every copy of the fetch params shares.
+    // https://fetch.spec.whatwg.org/#fetch-params-process-request-body
+    // process request body chunk length (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-request-end-of-body
+    // process request end-of-body (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-early-hints-response
+    // process early hints response (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-response
+    // process response (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-response-end-of-body
+    // process response end-of-body (default null)
+    // https://fetch.spec.whatwg.org/#fetch-params-process-response-consume-body
+    // process response consume body (default null)
+    //     Null or an algorithm.
+    GC::Ptr<FetchAlgorithms const> m_algorithms;
+
+    // AD-HOC: The fetch params' task destination is kept on their controller, which every copy of the fetch params
+    //         shares.
+    // https://fetch.spec.whatwg.org/#fetch-params-task-destination
+    // task destination (default null)
+    //     Null, a global object, or a parallel queue.
+    TaskDestination m_task_destination;
+    GC::Ptr<Page> m_page;
+
+    // A CORS preflight's controller keeps alive the controller of the fetch the preflight is for, which the
+    // preflight's requests report to.
+    GC::Ptr<FetchController> m_preflighted_fetch_controller;
+
+    bool m_is_keepalive { false };
+
     // NB: Assumes one waiting consumer for a pending preloaded response.
     // Widen this if preload handoff ever supports multiple consumers.
     GC::Ptr<Fetching::PendingResponse> m_pending_preloaded_response;
 
-    WeakPtr<Requests::Request> m_pending_request;
-    bool m_requires_network { false };
-    bool m_has_started_request { false };
+    struct StartedFetch {
+        Engine::FetchId fetch_id;
+        NonnullRefPtr<Engine::FetchExecutor> fetch_executor;
+    };
+    Optional<StartedFetch> m_started_fetch;
 
     HashMap<u64, HTML::TaskID> m_ongoing_fetch_tasks;
     u64 m_next_fetch_task_id { 0 };
+
+    // AD-HOC: Run when the fetch is stopped, for whatever was waiting on its response.
+    GC::Ptr<GC::Function<void()>> m_stop_steps;
+
+    // The pending responses of this fetch whose callbacks have yet to run.
+    Vector<GC::Ref<Fetching::PendingResponse>> m_pending_responses;
 };
 
 class FetchControllerHolder : public JS::Cell {

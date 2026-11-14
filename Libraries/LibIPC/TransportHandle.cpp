@@ -4,14 +4,40 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCore/Socket.h>
+#include <LibCore/System.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibIPC/Transport.h>
 #include <LibIPC/TransportHandle.h>
 
+#if !defined(AK_OS_WINDOWS)
+#    include <sys/socket.h>
+#endif
+
 namespace IPC {
+
+static ErrorOr<void> encode_unprocessed(Encoder& encoder, ByteBuffer const& bytes, Vector<Attachment>& attachments)
+{
+    TRY(encoder.encode(bytes));
+    TRY(encoder.encode_size(attachments.size()));
+    for (auto& attachment : attachments)
+        TRY(encoder.append_attachment(move(attachment)));
+    attachments.clear();
+    return {};
+}
+
+static ErrorOr<void> decode_unprocessed(Decoder& decoder, ByteBuffer& bytes, Vector<Attachment>& attachments)
+{
+    bytes = TRY(decoder.decode<ByteBuffer>());
+    auto attachment_count = TRY(decoder.decode_size());
+    if (attachment_count > decoder.attachments().size())
+        return Error::from_string_literal("TransportHandle::decode: Missing attachments");
+    TRY(attachments.try_ensure_capacity(attachment_count));
+    for (size_t i = 0; i < attachment_count; ++i)
+        attachments.unchecked_append(decoder.attachments().dequeue());
+    return {};
+}
 
 #if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
 
@@ -34,6 +60,23 @@ ErrorOr<NonnullOwnPtr<Transport>> TransportHandle::create_transport() const
     return make<Transport>(move(m_receive_right), move(m_send_right));
 }
 
+ErrorOr<TransportHandlePair> TransportHandle::create_pair()
+{
+    auto port_a_receive_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+    auto port_a_send_right = TRY(port_a_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
+    auto port_b_receive_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
+    auto port_b_send_right = TRY(port_b_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
+
+    // Either end may be written to before the other has constructed its transport.
+    TransportMachPort::raise_receive_queue_limit(port_a_receive_right);
+    TransportMachPort::raise_receive_queue_limit(port_b_receive_right);
+
+    return TransportHandlePair {
+        TransportHandle { move(port_a_receive_right), move(port_b_send_right) },
+        TransportHandle { move(port_b_receive_right), move(port_a_send_right) },
+    };
+}
+
 template<>
 ErrorOr<void> encode(Encoder& encoder, TransportHandle const& handle)
 {
@@ -45,7 +88,7 @@ ErrorOr<void> encode(Encoder& encoder, TransportHandle const& handle)
 
     TRY(encoder.append_attachment(Attachment::from_mach_port(move(handle.m_receive_right), Core::MachPort::MessageRight::MoveReceive)));
     TRY(encoder.append_attachment(Attachment::from_mach_port(move(handle.m_send_right), Core::MachPort::MessageRight::MoveSend)));
-    return {};
+    return encode_unprocessed(encoder, handle.m_unprocessed_bytes, handle.m_unprocessed_attachments);
 }
 
 template<>
@@ -59,7 +102,9 @@ ErrorOr<TransportHandle> decode(Decoder& decoder)
     VERIFY(send_attachment.message_right() == Core::MachPort::MessageRight::MoveSend);
     auto receive_right = recv_attachment.release_mach_port();
     auto send_right = send_attachment.release_mach_port();
-    return TransportHandle { move(receive_right), move(send_right) };
+    TransportHandle handle { move(receive_right), move(send_right) };
+    TRY(decode_unprocessed(decoder, handle.m_unprocessed_bytes, handle.m_unprocessed_attachments));
+    return handle;
 }
 
 #else
@@ -69,24 +114,47 @@ TransportHandle::TransportHandle(File file)
 {
 }
 
+TransportHandle::TransportHandle(File file, ByteBuffer unprocessed_bytes, Vector<Attachment> unprocessed_attachments)
+    : m_file(move(file))
+    , m_unprocessed_bytes(move(unprocessed_bytes))
+    , m_unprocessed_attachments(move(unprocessed_attachments))
+{
+}
+
 ErrorOr<NonnullOwnPtr<Transport>> TransportHandle::create_transport() const
 {
-    auto socket = TRY(Core::LocalSocket::adopt_fd(m_file.take_fd()));
-    TRY(socket->set_blocking(false));
-    return make<Transport>(move(socket));
+#    if defined(AK_OS_WINDOWS)
+    return Transport::adopt_fd(m_file.take_fd());
+#    else
+    return Transport::adopt_fd(m_file.take_fd(), move(m_unprocessed_bytes), move(m_unprocessed_attachments));
+#    endif
+}
+
+ErrorOr<TransportHandlePair> TransportHandle::create_pair()
+{
+#    if defined(AK_OS_WINDOWS)
+    auto handles = TRY(Core::System::duplex_pipe());
+    return TransportHandlePair { TransportHandle { File::adopt_fd(handles[0]) }, TransportHandle { File::adopt_fd(handles[1]) } };
+#    else
+    int fds[2] {};
+    TRY(Core::System::socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, fds));
+    return TransportHandlePair { TransportHandle { File::adopt_fd(fds[0]) }, TransportHandle { File::adopt_fd(fds[1]) } };
+#    endif
 }
 
 template<>
 ErrorOr<void> encode(Encoder& encoder, TransportHandle const& handle)
 {
-    return encoder.encode(handle.m_file);
+    TRY(encoder.encode(handle.m_file));
+    return encode_unprocessed(encoder, handle.m_unprocessed_bytes, handle.m_unprocessed_attachments);
 }
 
 template<>
 ErrorOr<TransportHandle> decode(Decoder& decoder)
 {
-    auto file = TRY(decoder.decode<File>());
-    return TransportHandle { move(file) };
+    TransportHandle handle { TRY(decoder.decode<File>()) };
+    TRY(decode_unprocessed(decoder, handle.m_unprocessed_bytes, handle.m_unprocessed_attachments));
+    return handle;
 }
 
 #endif

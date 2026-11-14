@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <script src="structural-matrix.js"></script>
 <style>
     body {
@@ -48,6 +49,7 @@
     }
 
     test(() => {
+        internals.updateStyle();
         {
             const wrapper = makeElement("section", { className: "wrapper" });
             const flag = makeElement("span", { className: "flag" });
@@ -62,12 +64,9 @@
             assertEqual("subject :has() rule matches", getComputedStyle(wrapper).color, "rgb(1, 2, 3)");
             assertEqual("descendant :has() rule does not match", readProbe(wrapper.querySelector(".target")), BASE);
 
-            resetStyleCounters();
-            hover(hoverSource);
-
-            const counters = styleCounters();
-            assertEqual("hover unrelated to descendant :has() fanout is bounded", counters.elementStyleNoopRecomputations < 20, true);
-            printPassWithCounters("subject :has() hover skips descendant fanout");
+            const work = styleWork(() => hover(hoverSource));
+            assertEqual("hover source after hover", getComputedStyle(hoverSource).backgroundColor, "rgb(4, 5, 6)");
+            printPassWithStyleWork("subject :has() hover skips descendant fanout", work);
         }
 
         {
@@ -83,16 +82,18 @@
             assertEqual("subject :has() rule matches before batched mutations", getComputedStyle(wrapper).color, "rgb(1, 2, 3)");
             assertEqual("descendant :has() rule does not match before batched mutations", readProbe(target), BASE);
 
-            resetStyleCounters();
-            unrelated.classList.add("unrelated");
-            needle.classList.add("needle");
-
             // Reading the target's style resolves the pending :has() fanout for the inheritance chain that leads
             // to it, so the descendant rule matches without recomputing every dirty element in the document.
-            assertEqual("descendant :has() rule matches after batched mutations", readProbe(target), MATCH);
-            const counters = styleCounters();
-            assertEqual("batched mutation applies descendant :has() fanout", counters.elementStyleRecomputations >= 1, true);
-            printPassWithCounters("batched subject-only :has() invalidation upgrades to descendant fanout");
+            const work = styleWork(
+                () => {
+                    unrelated.classList.add("unrelated");
+                    needle.classList.add("needle");
+                    assertEqual("descendant :has() rule matches after batched mutations", readProbe(target), MATCH);
+                },
+                internals,
+                { flush: false }
+            );
+            printPassWithStyleWork("batched subject-only :has() invalidation upgrades to descendant fanout", work);
         }
 
         {
@@ -105,12 +106,11 @@
             internals.updateStyle();
             assertEqual("descendant :has(:focus) rule does not match before focus", readProbe(target), BASE);
 
-            resetStyleCounters();
             input.focus();
             internals.updateStyle();
 
             assertEqual("descendant :has(:focus) rule matches after focus", readProbe(target), MATCH);
-            printPassWithCounters("descendant :has(:focus) fanout uses pseudo-class metadata");
+            printPass("descendant :has(:focus) fanout uses pseudo-class metadata");
             input.blur();
         }
     });

@@ -1,0 +1,4 @@
+start: self-check: []
+third moved: self-check: []
+first moved: self-check: []
+third back: self-check: []

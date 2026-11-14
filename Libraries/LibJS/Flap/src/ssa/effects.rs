@@ -8,8 +8,8 @@
 
 use super::analysis::{ControlFlowGraph, DominatorTree, InstructionLayout};
 use super::{
-    AggregateOperation, BlockId, Effects, Function, InstructionId, Intrinsic, MemoryEffect, OperandOperation,
-    Operation, Terminator, ValueDefinition, ValueId,
+    BlockId, Effects, Function, InstructionId, Intrinsic, MemoryEffect, OperandOperation, Operation, Terminator,
+    ValueDefinition, ValueId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,9 +260,18 @@ fn operation_memory_locations(
         return access;
     }
 
-    if *operation == Operation::Intrinsic(Intrinsic::LowLevel(super::LowLevelOperation::Increment32Memory)) {
+    let updated_memory_width = match operation {
+        Operation::Intrinsic(Intrinsic::LowLevel(
+            super::LowLevelOperation::Increment32Memory
+            | super::LowLevelOperation::Or32Memory
+            | super::LowLevelOperation::Subtract32Memory,
+        )) => Some(4),
+        Operation::Intrinsic(Intrinsic::LowLevel(super::LowLevelOperation::Or8Memory)) => Some(1),
+        _ => None,
+    };
+    if let Some(width) = updated_memory_width {
         if let Some(value) = inputs.first()
-            && let Some(location) = address_location(function, *value, 4)
+            && let Some(location) = address_location(function, *value, width)
         {
             access.reads.push(location.clone());
             access.writes.push(location);
@@ -281,25 +290,6 @@ fn operation_memory_locations(
             identity: MemoryLocationIdentity::BytecodeField(*field),
             bytes: operation.access_width(),
         });
-        return access;
-    }
-
-    if let Operation::Intrinsic(Intrinsic::Aggregate(operation)) = operation {
-        match operation {
-            AggregateOperation::Copy16 => {
-                if !add_location(0, 16, true) {
-                    access.unknown_write = true;
-                }
-                if !add_location(1, 16, false) {
-                    access.unknown_read = true;
-                }
-            }
-            AggregateOperation::Zero16 => {
-                if !add_location(0, 16, true) {
-                    access.unknown_write = true;
-                }
-            }
-        }
         return access;
     }
 

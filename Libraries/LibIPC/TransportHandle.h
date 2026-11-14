@@ -6,10 +6,13 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/Error.h>
 #include <AK/Noncopyable.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Platform.h>
+#include <AK/Vector.h>
+#include <LibIPC/Attachment.h>
 #include <LibIPC/File.h>
 #include <LibIPC/Forward.h>
 
@@ -19,10 +22,14 @@
 
 namespace IPC {
 
+struct TransportHandlePair;
+
 class TransportHandle {
     AK_MAKE_NONCOPYABLE(TransportHandle);
 
 public:
+    AK_ALLOC_WITH_KMALLOC;
+
     TransportHandle() = default;
     TransportHandle(TransportHandle&&) = default;
     TransportHandle& operator=(TransportHandle&&) = default;
@@ -31,9 +38,16 @@ public:
     TransportHandle(Core::MachPort receive_right, Core::MachPort send_right);
 #else
     explicit TransportHandle(File);
+
+    // For a transport that hands over the start of a message that it has read off the socket. The rest of the message
+    // is still on the socket, so the next owner has to go on from here.
+    TransportHandle(File, ByteBuffer unprocessed_bytes, Vector<Attachment> unprocessed_attachments);
 #endif
 
     ErrorOr<NonnullOwnPtr<Transport>> create_transport() const;
+
+    // Both ends of a new channel, for a process that connects two others without touching the channel itself.
+    static ErrorOr<TransportHandlePair> create_pair();
 
 private:
 #if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
@@ -42,12 +56,19 @@ private:
 #else
     mutable File m_file;
 #endif
+    mutable ByteBuffer m_unprocessed_bytes;
+    mutable Vector<Attachment> m_unprocessed_attachments;
 
     template<typename U>
     friend ErrorOr<void> encode(Encoder&, U const&);
 
     template<typename U>
     friend ErrorOr<U> decode(Decoder&);
+};
+
+struct TransportHandlePair {
+    TransportHandle first;
+    TransportHandle second;
 };
 
 }

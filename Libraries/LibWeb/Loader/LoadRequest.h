@@ -10,8 +10,10 @@
 #include <AK/Time.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibHTTP/Cache/CacheMode.h>
+#include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Cookie/IncludeCredentials.h>
 #include <LibHTTP/HeaderList.h>
+#include <LibHTTP/NetworkIsolationKey.h>
 #include <LibURL/URL.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
@@ -21,8 +23,11 @@
 
 namespace Web {
 
+// NB: A load request keeps its page in a GC::Root, and holds no other cell.
 class WEB_API LoadRequest {
 public:
+    GC_HOLDS_NO_CELL_EDGES;
+
     explicit LoadRequest(NonnullRefPtr<HTTP::HeaderList> headers)
         : m_headers(move(headers))
     {
@@ -61,8 +66,17 @@ public:
     Fetch::Infrastructure::Request::Priority priority() const { return m_priority; }
     void set_priority(Fetch::Infrastructure::Request::Priority priority) { m_priority = priority; }
 
+    HTTP::Cookie::SameSiteContext same_site_context() const { return m_same_site_context; }
+    void set_same_site_context(HTTP::Cookie::SameSiteContext context) { m_same_site_context = context; }
+
+    Optional<HTTP::NetworkIsolationKey> const& network_isolation_key() const { return m_network_isolation_key; }
+    void set_network_isolation_key(Optional<HTTP::NetworkIsolationKey> network_isolation_key) { m_network_isolation_key = move(network_isolation_key); }
+
     Optional<URL::URL> const& source_url() const { return m_source_url; }
     void set_source_url(URL::URL source_url) { m_source_url = move(source_url); }
+
+    Optional<URL::URL> const& top_level_creation_url() const { return m_top_level_creation_url; }
+    void set_top_level_creation_url(Optional<URL::URL> url) { m_top_level_creation_url = move(url); }
 
     void start_timer() { m_load_timer.start(); }
     AK::Duration load_time() const { return m_load_timer.elapsed_time(); }
@@ -88,6 +102,9 @@ private:
     bool m_is_navigation_request { false };
     Fetch::Infrastructure::Request::Priority m_priority { Fetch::Infrastructure::Request::Priority::Auto };
     Optional<URL::URL> m_source_url;
+    Optional<URL::URL> m_top_level_creation_url;
+    HTTP::Cookie::SameSiteContext m_same_site_context;
+    Optional<HTTP::NetworkIsolationKey> m_network_isolation_key;
 };
 
 }

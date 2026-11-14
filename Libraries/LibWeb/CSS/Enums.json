@@ -10,6 +10,7 @@
     "xxx-large"
   ],
   "align-content": [
+    "baseline",
     "normal",
     "start",
     "flex-start",
@@ -48,7 +49,8 @@
     "self-start",
     "start",
     "stretch",
-    "unsafe"
+    "unsafe",
+    "anchor-center"
   ],
   "anchor-side": [
     "inside",
@@ -140,6 +142,11 @@
     "mathematical",
     "hanging",
     "text-top"
+  ],
+  "baseline-source": [
+    "auto",
+    "first",
+    "last"
   ],
   "border-collapse": [
     "separate",
@@ -521,6 +528,7 @@
     "table",
     "flex",
     "grid",
+    "grid-lanes",
     "ruby",
     "math",
     "-webkit-box"
@@ -544,6 +552,7 @@
     "inline-table",
     "inline-flex",
     "inline-grid",
+    "inline-grid-lanes",
     "-webkit-flex",
     "-webkit-inline-box",
     "-webkit-inline-flex"
@@ -575,6 +584,10 @@
   "empty-cells": [
     "show",
     "hide"
+  ],
+  "field-sizing": [
+    "fixed",
+    "content"
   ],
   "fill-rule": [
     "nonzero",
@@ -613,6 +626,13 @@
   "font-optical-sizing": [
     "auto",
     "none"
+  ],
+  "font-size-adjust-metric": [
+    "ex-height",
+    "cap-height",
+    "ch-width",
+    "ic-width",
+    "ic-height"
   ],
   "font-smoothing": [
     "auto",
@@ -672,6 +692,11 @@
     "extra-expanded",
     "ultra-expanded"
   ],
+  "forced-color-adjust": [
+    "auto",
+    "none",
+    "preserve-parent-color"
+  ],
   "generic-font-family": [
     "serif",
     "sans-serif",
@@ -703,6 +728,10 @@
     "smooth",
     "optimizespeed",
     "optimizequality"
+  ],
+  "interpolate-size": [
+    "numeric-only",
+    "allow-keywords"
   ],
   "isolation": [
     "auto",
@@ -754,7 +783,14 @@
     "stretch",
     "unsafe",
     "left",
-    "right"
+    "right",
+    "anchor-center"
+  ],
+  "line-break": [
+    "auto",
+    "loose",
+    "normal",
+    "strict"
   ],
   "line-style": [
     "none",
@@ -857,6 +893,12 @@
     "break-word",
     "anywhere"
   ],
+  "overscroll-behavior": [
+    "auto",
+    "chain",
+    "contain",
+    "none"
+  ],
   "page-size": [
     "a5",
     "a4",
@@ -876,6 +918,14 @@
   ],
   "pointer-events": [
     "auto",
+    "bounding-box",
+    "visiblepainted",
+    "visiblefill",
+    "visiblestroke",
+    "visible",
+    "painted",
+    "fill",
+    "stroke",
     "all",
     "none"
   ],
@@ -1132,6 +1182,11 @@
     "inter-word",
     "inter-character"
   ],
+  "text-orientation": [
+    "mixed",
+    "upright",
+    "sideways"
+  ],
   "text-overflow": [
     "clip",
     "ellipsis"
@@ -1207,7 +1262,9 @@
   "try-tactic": [
     "flip-block",
     "flip-inline",
-    "flip-start"
+    "flip-start",
+    "flip-x",
+    "flip-y"
   ],
   "unicode-bidi": [
     "bidi-override",
@@ -1236,7 +1293,8 @@
     "super",
     "text-bottom",
     "text-top",
-    "top"
+    "top",
+    "-libweb-baseline-middle"
   ],
   "visibility": [
     "collapse",

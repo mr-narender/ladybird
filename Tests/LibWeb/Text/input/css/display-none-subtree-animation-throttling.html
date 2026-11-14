@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<script src="../include.js"></script>
+<script src="../work-test.js"></script>
+<div id="custom-display" style="--display: none; display: var(--display)"></div>
+<div id="hidden" style="display: none">
+    <svg id="plain"><circle></circle></svg>
+    <svg><linearGradient><stop id="stop"></stop></linearGradient></svg>
+    <svg><circle id="named-circle"></circle></svg>
+</div>
+<script>
+    function nextFrame() {
+        return new Promise(resolve => requestAnimationFrame(resolve));
+    }
+
+    async function traceFrames(frameCount) {
+        for (let i = 0; i < 2; ++i)
+            await nextFrame();
+        internals.beginStyleTrace();
+        internals.beginRenderingTrace();
+        for (let i = 0; i < frameCount; ++i)
+            await nextFrame();
+        const sampled = parseStyleTrace(internals.takeStyleTrace()).filter(event => event.outcome?.startsWith("sampled"));
+        const pumpRequests = internals.takeRenderingTrace().split("\n").filter(line => line.startsWith("animation frame pump request"));
+        return {
+            sampled: `[${[...new Set(sampled.map(event => shortStyleName(event.element)))].join(", ")}]`,
+            pumpRequests: `[${[...new Set(pumpRequests.map(line => line.replace(/ x\d+$/, "")))].join(", ")}]`,
+        };
+    }
+
+    function animate(element, keyframes) {
+        return element.animate(keyframes, { duration: 100000, iterations: Infinity });
+    }
+
+    asyncTest(async done => {
+        const plainCircle = document.querySelector("#plain circle");
+        const dashes = { strokeDashoffset: ["0px", "100px"] };
+        const animation = animate(plainCircle, dashes);
+        const noBox = await traceFrames(2);
+        println(`animation with no box samples: ${noBox.sampled}`);
+        println(`animation with no box frame requests: ${noBox.pumpRequests}`);
+
+        animation.currentTime = 50000;
+        println(`computed style samples animation: ${getComputedStyle(plainCircle).strokeDashoffset}`);
+
+        document.getElementById("named-circle").id = "referenced-circle";
+        const referenceable = animate(document.getElementById("referenced-circle"), dashes);
+        println(`referenceable geometry samples: ${(await traceFrames(2)).sampled}`);
+        referenceable.cancel();
+
+        const resource = animate(document.getElementById("stop"), { stopOpacity: [0, 1] });
+        println(`SVG resource samples: ${(await traceFrames(2)).sampled}`);
+        resource.cancel();
+
+        const customDisplay = animate(document.getElementById("custom-display"), { "--display": ["none", "block"] });
+        println(`custom property animation frame requests: ${(await traceFrames(2)).pumpRequests}`);
+        customDisplay.cancel();
+
+        const reversed = animate(plainCircle, dashes);
+        reversed.currentTime = 5;
+        reversed.playbackRate = -1;
+        await reversed.finished;
+        println("reverse playback finishes");
+        reversed.cancel();
+
+        const finiteEnd = plainCircle.animate(dashes, { duration: 0, iterations: Infinity, endDelay: 5 });
+        await finiteEnd.finished;
+        println("zero duration infinite iterations finishes");
+        finiteEnd.cancel();
+
+        document.getElementById("hidden").style.display = "block";
+        println(`revealed animation samples: ${(await traceFrames(2)).sampled}`);
+        println(`revealed computed style: ${getComputedStyle(plainCircle).strokeDashoffset === "50px" ? "stale" : "advanced"}`);
+        done();
+    });
+</script>

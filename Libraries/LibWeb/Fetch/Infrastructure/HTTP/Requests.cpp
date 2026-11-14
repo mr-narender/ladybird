@@ -6,30 +6,28 @@
 
 #include <AK/Array.h>
 #include <AK/CharacterTypes.h>
-#include <LibGC/Heap.h>
-#include <LibJS/Runtime/Realm.h>
 #include <LibTextCodec/Encoder.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Names.h>
 #include <LibWeb/ContentSecurityPolicy/PolicyList.h>
 #include <LibWeb/ContentSecurityPolicy/Violation.h>
 #include <LibWeb/DOMURL/DOMURL.h>
-#include <LibWeb/Fetch/Fetching/PendingResponse.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/PolicyContainers.h>
 
 namespace Web::Fetch::Infrastructure {
 
-GC_DEFINE_ALLOCATOR(Request);
+extern "C" {
 
-GC::Ref<Request> Request::create()
-{
-    return GC::Heap::the().allocate<Request>(HTTP::HeaderList::create());
+// Called by Bindings/Rust/src/fetch/infrastructure/http/requests.rs.
+bool web_fetch_request_done(Request*);
+void web_fetch_request_unref(Request*);
 }
 
-GC::Ref<Request> Request::create(JS::VM&)
+NonnullRefPtr<Request> Request::create()
 {
-    return create();
+    return adopt_ref(*new Request(HTTP::HeaderList::create()));
 }
 
 Request::Request(NonnullRefPtr<HTTP::HeaderList> header_list)
@@ -38,15 +36,13 @@ Request::Request(NonnullRefPtr<HTTP::HeaderList> header_list)
 {
 }
 
-void Request::visit_edges(JS::Cell::Visitor& visitor)
+Request::~Request() = default;
+
+NonnullRefPtr<NetworkObservation> Request::ensure_network_observation()
 {
-    Base::visit_edges(visitor);
-    visitor.visit(m_client);
-    visitor.visit(m_body);
-    visitor.visit(m_reserved_client);
-    visitor.visit(m_traversable_for_user_prompts);
-    visitor.visit(m_pending_responses);
-    visitor.visit(m_policy_container);
+    if (!m_network_observation)
+        m_network_observation = NetworkObservation::create();
+    return *m_network_observation;
 }
 
 // https://fetch.spec.whatwg.org/#concept-request-url
@@ -88,6 +84,54 @@ void Request::set_url(URL::URL url)
     m_url_list.append(move(url));
 }
 
+void Request::set_policy_container(PolicyContainerType policy_container)
+{
+    m_policy_container = move(policy_container);
+}
+
+void Request::set_policy_container(NonnullRefPtr<HTML::PolicyContainer const> policy_container)
+{
+    m_policy_container = move(policy_container);
+}
+
+// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.2
+HTTP::Cookie::SameSiteStatus Request::same_site_status() const
+{
+    using HTTP::Cookie::SameSiteStatus;
+
+    // 1. The request is not the result of a reload navigation triggered through a user interface element (as defined by
+    //    the user agent; e.g., a request triggered by the user clicking a refresh button on a toolbar).
+    if (m_reloaded_document_same_site_status.has_value()) {
+        // Requests which are the result of a reload navigation triggered through a user interface element are same-site
+        // if the reloaded document was originally navigated to via a same-site request. A request that is not "same-site"
+        // is instead "cross-site".
+        return *m_reloaded_document_same_site_status;
+    }
+
+    // 2. The request's current url's origin is same-site with the request's client's "site for cookies" (which is an
+    //    origin), or if the request has no client or the request's client is null.
+    if (!m_client_snapshot)
+        return SameSiteStatus::SameSite;
+
+    // AD-HOC: Check every URL of the redirect chain, not only the current one, as tested by cookies/samesite.
+    auto const& site_for_cookies = m_client_snapshot->site_for_cookies;
+    for (auto const& url : url_list()) {
+        if (!url.origin().is_same_site(site_for_cookies))
+            return SameSiteStatus::CrossSite;
+    }
+
+    return SameSiteStatus::SameSite;
+}
+
+HTTP::Cookie::SameSiteContext Request::same_site_context() const
+{
+    return {
+        .status = same_site_status(),
+        .is_top_level_navigation = m_mode == Mode::Navigate && m_destination == Destination::Document,
+        .is_safe_method = m_method.is_one_of("GET"sv, "HEAD"sv, "OPTIONS"sv, "TRACE"sv),
+    };
+}
+
 // https://fetch.spec.whatwg.org/#request-destination-script-like
 bool Request::destination_is_script_like() const
 {
@@ -116,26 +160,6 @@ bool Request::is_subresource_request() const
     return any_of(subresource_request_destinations, [this](auto destination) {
         return m_destination == destination;
     }) || !m_destination.has_value();
-}
-
-// https://fetch.spec.whatwg.org/#non-subresource-request
-bool Request::is_non_subresource_request() const
-{
-    // A non-subresource request is a request whose destination is "document", "embed", "frame", "iframe", "object", "report", "serviceworker", "sharedworker", or "worker".
-    static constexpr Array non_subresource_request_destinations = {
-        Destination::Document,
-        Destination::Embed,
-        Destination::Frame,
-        Destination::IFrame,
-        Destination::Object,
-        Destination::Report,
-        Destination::ServiceWorker,
-        Destination::SharedWorker,
-        Destination::Worker,
-    };
-    return any_of(non_subresource_request_destinations, [this](auto destination) {
-        return m_destination == destination;
-    });
 }
 
 // https://fetch.spec.whatwg.org/#navigation-request
@@ -222,7 +246,7 @@ ByteString Request::byte_serialize_origin() const
 }
 
 // https://fetch.spec.whatwg.org/#concept-request-clone
-GC::Ref<Request> Request::clone(JS::Realm& realm) const
+NonnullRefPtr<Request> Request::clone() const
 {
     // To clone a request request, run these steps:
     // 1. Let newRequest be a copy of request, except for its body.
@@ -233,7 +257,9 @@ GC::Ref<Request> Request::clone(JS::Realm& realm) const
         new_request->header_list()->append(header);
     new_request->set_unsafe_request(m_unsafe_request);
     new_request->set_client(m_client);
-    new_request->set_reserved_client(m_reserved_client);
+    new_request->set_client_snapshot(m_client_snapshot);
+    new_request->set_remote_client_navigation(m_remote_client_navigation);
+    new_request->set_reserved_client_snapshot(m_reserved_client_snapshot);
     new_request->set_replaces_client_id(m_replaces_client_id);
     new_request->set_traversable_for_user_prompts(m_traversable_for_user_prompts);
     new_request->set_keepalive(m_keepalive);
@@ -256,8 +282,13 @@ GC::Ref<Request> Request::clone(JS::Realm& realm) const
     new_request->set_cryptographic_nonce_metadata(m_cryptographic_nonce_metadata);
     new_request->set_parser_metadata(m_parser_metadata);
     new_request->set_reload_navigation(m_reload_navigation);
+    new_request->m_reloaded_document_same_site_status = m_reloaded_document_same_site_status;
     new_request->set_history_navigation(m_history_navigation);
     new_request->set_user_activation(m_user_activation);
+    new_request->set_text_directive_user_activation(m_text_directive_user_activation);
+    new_request->set_browsing_context_group_has_multiple_contexts(m_browsing_context_group_has_multiple_contexts);
+    new_request->set_user_agent_initiated(m_user_agent_initiated);
+    new_request->set_form_submission(m_form_submission);
     new_request->set_render_blocking(m_render_blocking);
     new_request->set_url_list(m_url_list);
     new_request->set_redirect_count(m_redirect_count);
@@ -268,8 +299,8 @@ GC::Ref<Request> Request::clone(JS::Realm& realm) const
     new_request->m_navigation_timing_allow_values_list = m_navigation_timing_allow_values_list;
 
     // 2. If request’s body is non-null, set newRequest’s body to the result of cloning request’s body.
-    if (auto const* body = m_body.get_pointer<GC::Ref<Body>>())
-        new_request->set_body((*body)->clone(realm));
+    // AD-HOC: A request's body has no stream; whatever holds its stream tees that stream itself.
+    new_request->set_body(m_body);
 
     // 3. Return newRequest.
     return new_request;
@@ -374,11 +405,11 @@ bool Request::cross_origin_embedder_policy_allows_credentials() const
         return true;
 
     // 3. If request’s client is null, then return true.
-    if (m_client == nullptr)
+    if (!m_client.has_value())
         return true;
 
     // 4. If request’s client’s policy container’s embedder policy’s value is not "credentialless", then return true.
-    if (m_policy_container.has<GC::Ref<HTML::PolicyContainer>>() && m_policy_container.get<GC::Ref<HTML::PolicyContainer>>()->embedder_policy.value != HTML::EmbedderPolicyValue::Credentialless)
+    if (m_policy_container.has<NonnullRefPtr<HTML::PolicyContainer const>>() && m_policy_container.get<NonnullRefPtr<HTML::PolicyContainer const>>()->embedder_policy.value != HTML::EmbedderPolicyValue::Credentialless)
         return true;
 
     // 5. If request’s origin is same origin with request’s current URL’s origin and request’s redirect-taint is not
@@ -614,6 +645,16 @@ Optional<Request::Priority> request_priority_from_string(Utf16View string)
 Optional<Request::Priority> request_priority_from_string(Utf16String const& string)
 {
     return request_priority_from_string(string.utf16_view());
+}
+
+bool web_fetch_request_done(Request* request)
+{
+    return request->done();
+}
+
+void web_fetch_request_unref(Request* request)
+{
+    request->unref();
 }
 
 }

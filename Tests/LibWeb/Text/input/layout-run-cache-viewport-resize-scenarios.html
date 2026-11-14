@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
 <script src="layout-optimization-test-matrix.js"></script>
-<script src="layout-test.js"></script>
+<script src="work-test.js"></script>
 <iframe id="frame" width="300" height="240" srcdoc="<style>html, body { margin: 0 }</style>"></iframe>
 <script>
     const viewportFormattingContexts = {
@@ -54,7 +54,7 @@
             const kind = context === "block" ? "BlockContainer" : "Box";
             const escaped = testCase.dependency === "absolute" || testCase.dependency === "fixed";
             const work = escaped
-                ? "REPLAY FRAGMENTS\n  BlockContainer<DIV>#target/block RUN (cache=miss)"
+                ? "REPLAY FRAGMENTS\n    BlockContainer<DIV>#target/block RUN (cache=miss)"
                 : "REUSE SUBTREE";
             return `layout FULL
   @viewport/block RUN (cache=bypass)

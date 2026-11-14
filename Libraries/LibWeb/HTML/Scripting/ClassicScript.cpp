@@ -7,6 +7,7 @@
 #include <AK/Debug.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibGC/Heap.h>
+#include <LibJS/ScriptCompilation.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/ExceptionReporter.h>
@@ -20,17 +21,20 @@ GC_DEFINE_ALLOCATOR(ClassicScript);
 static void register_source(ClassicScript& script, ScriptRegistry::IsInlineSource is_inline_source, size_t source_line_number)
 {
     auto script_record = script.script_record();
-    if (!script_record || !script_record->cached_executable())
+    if (!script_record)
         return;
 
-    auto const& source_code = script_record->cached_executable()->source_code;
-    register_javascript_source(script, source_code, ScriptRegistry::JavaScriptSource::Type::Script, is_inline_source, source_line_number);
+    auto source_code = JS::top_level_source_code(*script_record);
+    if (!source_code)
+        return;
+
+    register_javascript_source(script, source_code.release_nonnull(), ScriptRegistry::JavaScriptSource::Type::Script, is_inline_source, source_line_number);
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#creating-a-classic-script
-GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, Utf16View source, EnvironmentSettingsObject& settings, URL::URL base_url, size_t source_line_number, MutedErrors muted_errors, ScriptRegistry::IsInlineSource is_inline_source)
+GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, Utf16String source, EnvironmentSettingsObject& settings, URL::URL base_url, size_t source_line_number, MutedErrors muted_errors, ScriptRegistry::IsInlineSource is_inline_source)
 {
-    // 1. If muted errors is true, then set baseURL to about:blank.
+    // 1. If mutedErrors is true, then set baseURL to about:blank.
     if (muted_errors == MutedErrors::Yes)
         base_url = URL::about_blank();
 
@@ -43,29 +47,33 @@ GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, Utf16View sour
     // 5. Set script's base URL to baseURL.
     auto script = GC::Heap::the().allocate<ClassicScript>(move(base_url), move(filename), settings);
 
-    // FIXME: 6. Set script's fetch options to options.
+    // 6. Set script's fetch options to options.
+    // NB: Callers set the script's fetch options once it has been created.
 
-    // 7. Set script's muted errors to muted errors.
+    // 7. Set script's muted errors to mutedErrors.
     script->m_muted_errors = muted_errors;
 
     // 8. Set script's parse error and error to rethrow to null.
     script->set_parse_error(JS::js_null());
     script->set_error_to_rethrow(JS::js_null());
 
-    // FIXME: 9. Record classic script creation time given script and sourceURLForWindowScripts .
+    // FIXME: 9. Record classic script creation time given script and sourceURLForWindowScripts.
 
     // 10. Let result be ParseScript(source, settings's realm, script).
+    // Note: Passing script as the last parameter here ensures result.[[HostDefined]] will be script.
     auto parse_timer = Core::ElapsedTimer::start_new();
-    auto result = JS::Script::parse(source, settings.realm(), script->filename(), script->display_filename(), script.ptr(), source_line_number);
+    auto source_code = JS::SourceCode::create(script->display_filename(), source);
+    auto parsed = JS::ParsedProgram::parse(move(source), JS::ProgramType::Script, source_line_number);
+    auto result = JS::create_script(move(parsed), move(source_code), settings.realm(), script->filename(), script.ptr());
     dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Parsed {} in {}ms", script->filename(), parse_timer.elapsed_milliseconds());
 
-    // 11. If result is a list of errors, then:
+    // 11. If result is a list of errors:
     if (result.is_error()) {
         auto& parse_error = result.error().first();
         dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Failed to parse: {}", parse_error.to_utf16_string());
 
         // 1. Set script's parse error and its error to rethrow to result[0].
-        script->set_parse_error(JS::SyntaxError::create(settings.realm(), parse_error.to_utf16_string()));
+        script->set_parse_error(JS::SyntaxError::create(settings.realm(), parse_error.to_utf16_string()), parse_error.position);
         script->set_error_to_rethrow(script->parse_error());
 
         // 2. Return script.
@@ -80,7 +88,7 @@ GC::Ref<ClassicScript> ClassicScript::create(ByteString filename, Utf16View sour
     return script;
 }
 
-GC::Ref<ClassicScript> ClassicScript::create_from_pre_parsed(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject& settings, URL::URL base_url, JS::FFI::ParsedProgram* parsed, MutedErrors muted_errors)
+GC::Ref<ClassicScript> ClassicScript::create_from_pre_parsed(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject& settings, URL::URL base_url, JS::ParsedProgram parsed, MutedErrors muted_errors)
 {
     auto& realm = settings.realm();
 
@@ -94,14 +102,14 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_parsed(ByteString filename
     script->set_error_to_rethrow(JS::js_null());
 
     auto parse_timer = Core::ElapsedTimer::start_new();
-    auto result = JS::Script::create_from_parsed(parsed, move(source_code), realm, script->filename(), script.ptr());
+    auto result = JS::create_script(move(parsed), move(source_code), realm, script->filename(), script.ptr());
     dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Compiled pre-parsed {} in {}ms", script->filename(), parse_timer.elapsed_milliseconds());
 
     if (result.is_error()) {
         auto& parse_error = result.error().first();
         dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Failed to compile: {}", parse_error.to_utf16_string());
 
-        script->set_parse_error(JS::SyntaxError::create(realm, parse_error.to_utf16_string()));
+        script->set_parse_error(JS::SyntaxError::create(realm, parse_error.to_utf16_string()), parse_error.position);
         script->set_error_to_rethrow(script->parse_error());
 
         return script;
@@ -113,7 +121,7 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_parsed(ByteString filename
     return script;
 }
 
-GC::Ref<ClassicScript> ClassicScript::create_from_pre_compiled(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject& settings, URL::URL base_url, JS::FFI::CompiledProgram* compiled, MutedErrors muted_errors)
+GC::Ref<ClassicScript> ClassicScript::create_from_pre_compiled(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject& settings, URL::URL base_url, JS::CompiledProgram compiled, MutedErrors muted_errors)
 {
     auto& realm = settings.realm();
 
@@ -127,47 +135,14 @@ GC::Ref<ClassicScript> ClassicScript::create_from_pre_compiled(ByteString filena
     script->set_error_to_rethrow(JS::js_null());
 
     auto parse_timer = Core::ElapsedTimer::start_new();
-    auto result = JS::Script::create_from_compiled(compiled, move(source_code), realm, script->filename(), script.ptr());
+    auto result = JS::create_script(move(compiled), move(source_code), realm, script->filename(), script.ptr());
     dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Materialized pre-compiled {} in {}ms", script->filename(), parse_timer.elapsed_milliseconds());
 
     if (result.is_error()) {
         auto& parse_error = result.error().first();
         dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Failed to materialize: {}", parse_error.to_utf16_string());
 
-        script->set_parse_error(JS::SyntaxError::create(realm, parse_error.to_utf16_string()));
-        script->set_error_to_rethrow(script->parse_error());
-
-        return script;
-    }
-
-    script->m_script_record = *result.release_value();
-    register_source(*script, ScriptRegistry::IsInlineSource::No, 1);
-
-    return script;
-}
-
-GC::Ref<ClassicScript> ClassicScript::create_from_bytecode_cache(ByteString filename, NonnullRefPtr<JS::SourceCode const> source_code, EnvironmentSettingsObject& settings, URL::URL base_url, NonnullRefPtr<JS::RustIntegration::DecodedBytecodeCache> bytecode_cache, MutedErrors muted_errors)
-{
-    auto& realm = settings.realm();
-
-    if (muted_errors == MutedErrors::Yes)
-        base_url = URL::about_blank();
-
-    auto script = GC::Heap::the().allocate<ClassicScript>(move(base_url), move(filename), settings);
-
-    script->m_muted_errors = muted_errors;
-    script->set_parse_error(JS::js_null());
-    script->set_error_to_rethrow(JS::js_null());
-
-    auto parse_timer = Core::ElapsedTimer::start_new();
-    auto result = JS::Script::create_from_bytecode_cache(bytecode_cache, move(source_code), realm, script->filename(), script.ptr());
-    dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Materialized cached bytecode {} in {}ms", script->filename(), parse_timer.elapsed_milliseconds());
-
-    if (result.is_error()) {
-        auto& parse_error = result.error().first();
-        dbgln_if(HTML_SCRIPT_DEBUG, "ClassicScript: Failed to materialize bytecode cache: {}", parse_error.to_utf16_string());
-
-        script->set_parse_error(JS::SyntaxError::create(realm, parse_error.to_utf16_string()));
+        script->set_parse_error(JS::SyntaxError::create(realm, parse_error.to_utf16_string()), parse_error.position);
         script->set_error_to_rethrow(script->parse_error());
 
         return script;
@@ -237,9 +212,7 @@ JS::Completion ClassicScript::run(RethrowErrors rethrow_errors, GC::Ptr<JS::Envi
         VERIFY(rethrow_errors == RethrowErrors::No);
 
         // 1. Report an exception given by evaluationStatus.[[Value]] for script's settings object's global object.
-        auto* window_or_worker = window_or_worker_global_scope_from_global_object(settings.global_object());
-        VERIFY(window_or_worker);
-        window_or_worker->report_an_exception(evaluation_status.value());
+        report_an_exception(settings.global_object(), evaluation_status.value(), OmitError::No, this);
 
         // 2. Clean up after running script with settings.
         clean_up_after_running_script(settings);

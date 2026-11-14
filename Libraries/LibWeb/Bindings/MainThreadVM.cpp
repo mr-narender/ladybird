@@ -8,12 +8,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
+#include <AK/FFIHelpers.h>
+#include <AK/Math.h>
 #include <AK/NeverDestroyed.h>
 #include <LibCore/AnonymousBuffer.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/Platform/ThreadQoS.h>
+#include <LibCore/ThreadEventQueue.h>
 #include <LibGC/CellAllocator.h>
 #include <LibGC/DeferGC.h>
 #include <LibGC/Heap.h>
 #include <LibGfx/SystemTheme.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Module.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
@@ -42,11 +49,15 @@
 #include <LibWeb/ContentSecurityPolicy/Directives/Names.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/Fetch/Fetching/BodyStreamPullSource.h>
+#include <LibWeb/Fetch/Fetching/Fetching.h>
+#include <LibWeb/FileAPI/BlobURLStore.h>
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/HTMLFormElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Location.h>
+#include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/PromiseRejectionEvent.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -62,22 +73,42 @@
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/WorkletGlobalScope.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/PermissionsAPI/PermissionStore.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
+#include <LibWeb/Platform/ImageCodecPlugin.h>
+#include <LibWeb/Platform/ThreadPoolWork.h>
+#include <LibWeb/ServiceWorker/Job.h>
+#include <LibWeb/ServiceWorker/Registration.h>
+#include <LibWeb/ServiceWorker/ServiceWorkerContainer.h>
 #include <LibWeb/TrustedTypes/TrustedScript.h>
 #include <LibWeb/WebAssembly/WebAssembly.h>
-#include <LibWeb/WebAssembly/WebAssemblyModule.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/ExceptionOrUtils.h>
 #include <LibWebCommon/Page/QueuedInputEvent.h>
 
 namespace Web::Bindings {
 
+GC_DEFINE_ALLOCATOR(WebEngineCustomJobCallbackData);
+
+void WebEngineCustomJobCallbackData::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(incumbent_settings);
+    if (active_script_context)
+        active_script_context->visit_edges(visitor);
+}
+
+// The VM of the window agent. A process that hosts only workers has none.
 static auto& main_thread_vm_ptr()
 {
     static NeverDestroyed<RefPtr<JS::VM>> vm;
     return *vm;
 }
+
+static Atomic<bool, AK::MemoryOrder::memory_order_relaxed> s_collect_garbage_on_every_allocation { false };
+static Atomic<size_t, AK::MemoryOrder::memory_order_relaxed> s_worker_agent_count { 0 };
 
 static HTML::SimilarOriginWindowAgent*& main_thread_similar_origin_window_agent_ptr()
 {
@@ -89,16 +120,16 @@ static HTML::SimilarOriginWindowAgent*& main_thread_similar_origin_window_agent_
 HTML::Script* active_script()
 {
     // 1. Let record be GetActiveScriptOrModule().
-    auto record = main_thread_vm().get_active_script_or_module();
+    auto record = JS::VM::the().get_active_script_or_module();
 
     // 2. If record is null, return null.
     // 3. Return record.[[HostDefined]].
     return record.visit(
         [](GC::Ref<JS::Script>& js_script) -> HTML::Script* {
-            return as<HTML::ClassicScript>(js_script->host_defined());
+            return as<HTML::ClassicScript>(HTML::script_from_host_defined(js_script->host_defined()));
         },
         [](GC::Ref<JS::Module>& js_module) -> HTML::Script* {
-            return as<HTML::ModuleScript>(js_module->host_defined());
+            return as<HTML::ModuleScript>(HTML::script_from_host_defined(js_module->host_defined()));
         },
         [](Empty) -> HTML::Script* {
             return nullptr;
@@ -126,43 +157,135 @@ static NonnullOwnPtr<HTML::Agent> create_agent(GC::Heap& heap, HTML::AgentType t
 
 HTML::SimilarOriginWindowAgent& main_thread_similar_origin_window_agent()
 {
-    VERIFY(main_thread_similar_origin_window_agent_ptr());
-    return *main_thread_similar_origin_window_agent_ptr();
+    auto* agent = main_thread_similar_origin_window_agent_ptr();
+    VERIFY(agent);
+    VERIFY(JS::VM::the().agent() == agent);
+    return *agent;
 }
 
-void initialize_main_thread_vm(HTML::AgentType type)
+void set_collect_garbage_on_every_allocation_in_new_agents(bool enabled)
 {
-    VERIFY(!main_thread_vm_ptr());
+    s_collect_garbage_on_every_allocation = enabled;
+}
 
-    main_thread_vm_ptr() = JS::VM::create();
-    main_thread_vm_ptr()->set_agent(create_agent(main_thread_vm_ptr()->heap(), type));
+struct AsyncWaitQueueReference {
+    AK_ALLOC_WITH_KMALLOC;
+    JS::AsyncWaitQueue const* queue;
+    ~AsyncWaitQueueReference() { JS::VM::release_async_wait_queue(queue); }
+};
 
-    main_thread_vm_ptr()->on_unimplemented_property_access = [](auto const& object, auto const& property_key) {
+struct AsyncWaitEventLoop {
+    AK_ALLOC_WITH_KMALLOC;
+    NonnullRefPtr<Core::WeakEventLoopReference> loop;
+};
+
+static void install_async_wait_hooks(JS::VM& vm)
+{
+    auto* event_loop = new AsyncWaitEventLoop { Core::EventLoop::current_weak() };
+    JS::AsyncWaitHooks hooks {};
+    hooks.data = event_loop;
+    hooks.wake = [](void* context, JS::AsyncWaitQueue const* queue) {
+        auto reference = make<AsyncWaitQueueReference>(queue);
+        auto& weak_loop = static_cast<AsyncWaitEventLoop*>(context)->loop;
+        if (auto loop = weak_loop->take()) {
+            loop->deferred_invoke([reference = move(reference)] {
+                JS::VM::dispatch_async_wait_queue(reference->queue);
+            });
+        }
+    };
+    hooks.destroy = [](void* context) {
+        delete static_cast<AsyncWaitEventLoop*>(context);
+    };
+    hooks.enqueue_resolution = [](void*, u64 id, JS::Realm& realm) {
+        // https://html.spec.whatwg.org/multipage/webappapis.html#hostenqueuegenericjob
+        // 1. Let global be realm's global object.
+        auto& global = realm.global_object();
+        // 2. Queue a global task on the JavaScript engine task source given global to perform job().
+        HTML::queue_global_task(HTML::Task::Source::JavaScriptEngine, global, GC::create_function(realm.heap(), GC::captures(realm, id), [](auto& realm, auto& id) {
+            HTML::TemporaryExecutionContext context { realm };
+            realm.vm().resolve_async_wait(id);
+        }));
+    };
+    hooks.schedule_timeout = [](void*, u64 id, JS::Realm& realm, double milliseconds) {
+        // https://html.spec.whatwg.org/multipage/webappapis.html#hostenqueuetimeoutjob
+        // 1. Let global be realm's global object.
+        auto& global = realm.global_object();
+        // 2. Let timeoutStep be an algorithm step which queues a global task on the JavaScript engine task source
+        //    given global to perform job().
+        auto timeout_step = GC::create_function(realm.heap(), GC::captures(realm, id), [](auto& realm, auto& id) {
+            realm.vm().async_wait_timer_fired(id);
+            HTML::queue_global_task(HTML::Task::Source::JavaScriptEngine, realm.global_object(), GC::create_function(realm.heap(), GC::captures(realm, id), [](auto& realm, auto& id) {
+                HTML::TemporaryExecutionContext context { realm };
+                realm.vm().timeout_async_wait(id);
+            }));
+        });
+        // AD-HOC: The timer interface takes signed 32-bit milliseconds. Round up fractional waits, and split longer
+        //         waits into chunks; the runtime checks the deadline before timing out the waiter.
+        auto delay = static_cast<i32>(min(ceil(milliseconds), static_cast<double>(NumericLimits<i32>::max())));
+        // 3. Run steps after a timeout given global, "JavaScript", milliseconds, and timeoutStep.
+        if (auto* worklet = impl_from<HTML::WorkletGlobalScope>(&global))
+            return worklet->run_steps_after_a_timeout(delay, timeout_step);
+        return HTML::relevant_window_or_worker_global_scope(global).run_steps_after_a_timeout(delay, timeout_step);
+    };
+    hooks.cancel_timeout = [](void*, JS::Realm& realm, i32 timer) {
+        if (auto* worklet = impl_from<HTML::WorkletGlobalScope>(&realm.global_object()))
+            worklet->cancel_timeout_steps(timer);
+        else
+            HTML::relevant_window_or_worker_global_scope(realm.global_object()).cancel_timeout_steps(timer);
+    };
+    vm.set_async_wait_hooks(hooks);
+}
+
+void initialize_agent(HTML::AgentType type)
+{
+    auto new_vm = JS::VM::create();
+    auto& vm = *new_vm;
+    if (type == HTML::AgentType::SimilarOriginWindow) {
+        VERIFY(!main_thread_vm_ptr());
+        main_thread_vm_ptr() = new_vm;
+    } else {
+        ++s_worker_agent_count;
+        ladybird_did_start_short_lived_thread();
+    }
+    vm.set_agent(create_agent(vm.heap(), type));
+    if (Core::EventLoop::is_running())
+        install_async_wait_hooks(vm);
+
+    vm.heap().set_should_collect_on_every_allocation(s_collect_garbage_on_every_allocation);
+
+    // A window agent has the main thread, whose priority its process sets. Workers run below it, at what a worker
+    // process would give its own main thread.
+    if (type != HTML::AgentType::SimilarOriginWindow) {
+        if (auto result = Core::Platform::set_current_thread_qos(Core::Platform::ThreadQoS::UserInitiated); result.is_error())
+            warnln("Could not set the QoS of an agent's thread: {}", result.error());
+    }
+
+    vm.on_unimplemented_property_access = [](auto const& object, auto const& property_key) {
         dbgln("FIXME: Unimplemented IDL interface: '{}.{}'", object.class_name(), property_key.to_utf16_string());
     };
 
-    // NOTE: We intentionally leak the main thread JavaScript VM.
+    // NOTE: We intentionally leak the JavaScript VM, unless the agent is shut down.
     //       This avoids doing an exhaustive garbage collection on process exit.
-    main_thread_vm_ptr()->ref();
+    vm.ref();
 
     // 8.1.6.1 HostEnsureCanAddPrivateElement(O), https://html.spec.whatwg.org/multipage/webappapis.html#the-hostensurecanaddprivateelement-implementation
-    main_thread_vm_ptr()->host_ensure_can_add_private_element = [](JS::Object const& object) -> JS::ThrowCompletionOr<void> {
+    vm.host_ensure_can_add_private_element = [](JS::Object const& object) -> JS::ThrowCompletionOr<void> {
         // 1. If O is a WindowProxy object, or implements Location, then return ThrowCompletion(a new TypeError).
-        if (is<HTML::WindowProxy>(object) || impl_from<HTML::Location>(&object))
-            return main_thread_vm_ptr()->throw_completion<JS::TypeError>("Cannot add private elements to window or location object"sv);
+        if (HTML::WindowProxy::from_object(object) || impl_from<HTML::Location>(&object))
+            return JS::VM::the().throw_completion<JS::TypeError>(u"Cannot add private elements to window or location object"sv);
 
         // 2. Return NormalCompletion(unused).
         return {};
     };
 
     // 8.1.6.2 HostEnsureCanCompileStrings(realm, parameterStrings, bodyString, codeString, compilationType, parameterArgs, bodyArg), https://html.spec.whatwg.org/multipage/webappapis.html#hostensurecancompilestrings(realm,-parameterstrings,-bodystring,-codestring,-compilationtype,-parameterargs,-bodyarg)
-    main_thread_vm_ptr()->host_ensure_can_compile_strings = [](JS::Realm& realm, ReadonlySpan<Utf16String> parameter_strings, Utf16View body_string, Utf16View code_string, JS::CompilationType compilation_type, ReadonlySpan<JS::Value> parameter_args, JS::Value body_arg) -> JS::ThrowCompletionOr<void> {
+    vm.host_ensure_can_compile_strings = [](JS::Realm& realm, ReadonlySpan<Utf16String> parameter_strings, Utf16View body_string, Utf16View code_string, JS::CompilationType compilation_type, ReadonlySpan<JS::Value> parameter_args, JS::Value body_arg) -> JS::ThrowCompletionOr<void> {
         // 1. Perform ? EnsureCSPDoesNotBlockStringCompilation(realm, parameterStrings, bodyString, codeString, compilationType, parameterArgs, bodyArg). [CSP]
         return ContentSecurityPolicy::ensure_csp_does_not_block_string_compilation(realm, parameter_strings, body_string, code_string, compilation_type, parameter_args, body_arg);
     };
 
     // 8.1.6.3 HostGetCodeForEval(argument), https://html.spec.whatwg.org/multipage/webappapis.html#hostgetcodeforeval(argument)
-    main_thread_vm_ptr()->host_get_code_for_eval = [](JS::Object const& argument) -> GC::Ptr<JS::PrimitiveString> {
+    vm.host_get_code_for_eval = [](JS::Object const& argument) -> GC::Ptr<JS::PrimitiveString> {
         // 1. If argument is a TrustedScript object, then return argument's data.
         if (auto const* trusted_script = impl_from<TrustedTypes::TrustedScript>(&argument))
             return JS::PrimitiveString::create(argument.vm(), trusted_script->to_string());
@@ -172,18 +295,22 @@ void initialize_main_thread_vm(HTML::AgentType type)
     };
 
     // 8.1.5.3 HostPromiseRejectionTracker(promise, operation), https://html.spec.whatwg.org/multipage/webappapis.html#the-hostpromiserejectiontracker-implementation
-    main_thread_vm_ptr()->host_promise_rejection_tracker = [](JS::Promise& promise, JS::Promise::RejectionOperation operation) {
-        auto& vm = *main_thread_vm_ptr();
+    vm.host_promise_rejection_tracker = [](JS::Promise& promise, JS::Promise::RejectionOperation operation) {
+        auto& vm = JS::VM::the();
+
+        // NB: Nothing reports what an aborted script left behind.
+        if (vm.interrupt_requested())
+            return;
 
         // 1. Let script be the running script.
         //    The running script is the script in the [[HostDefined]] field in the ScriptOrModule component of the running JavaScript execution context.
         HTML::Script* script { nullptr };
         vm.running_execution_context().script_or_module.visit(
             [&script](GC::Ref<JS::Script>& js_script) {
-                script = as<HTML::ClassicScript>(js_script->host_defined());
+                script = as<HTML::ClassicScript>(HTML::script_from_host_defined(js_script->host_defined()));
             },
             [&script](GC::Ref<JS::Module>& js_module) {
-                script = as<HTML::ModuleScript>(js_module->host_defined());
+                script = as<HTML::ModuleScript>(HTML::script_from_host_defined(js_module->host_defined()));
             },
             [](Empty) {
             });
@@ -209,6 +336,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
             case JS::Promise::RejectionOperation::Reject:
                 // 1. Append promise to global's about-to-be-notified rejected promises list.
                 global_mixin.push_onto_about_to_be_notified_rejected_promises_list(promise);
+                HTML::current_event_loop().did_reject_promise_without_handler();
                 break;
             // 7. If operation is "handle",
             case JS::Promise::RejectionOperation::Handle: {
@@ -229,7 +357,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
                 //    with the promise attribute initialized to promise, and the reason attribute initialized to the value of promise's [[PromiseResult]] internal slot.
                 auto& global_object = settings_object.global_object();
                 auto& realm = settings_object.realm();
-                HTML::queue_global_task(HTML::Task::Source::DOMManipulation, global_object, GC::create_function(GC::Heap::the(), [&global, &promise, &realm] {
+                HTML::queue_global_task(HTML::Task::Source::DOMManipulation, global_object, GC::create_function(GC::Heap::the(), GC::captures(global, promise, realm), [](auto& global, auto& promise, auto& realm) {
                     HTML::PromiseRejectionEventInit event_init {
                         {}, // Initialize the inherited EventInit
                         /* .promise = */ promise,
@@ -252,7 +380,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
     };
 
     // 8.1.5.4.1 HostCallJobCallback(callback, V, argumentsList), https://html.spec.whatwg.org/multipage/webappapis.html#hostcalljobcallback
-    main_thread_vm_ptr()->host_call_job_callback = [](JS::JobCallback& callback, JS::Value this_value, ReadonlySpan<JS::Value> arguments_list) {
+    vm.host_call_job_callback = [](JS::JobCallback& callback, JS::Value this_value, ReadonlySpan<JS::Value> arguments_list) {
         auto& callback_host_defined = as<WebEngineCustomJobCallbackData>(*callback.custom_data());
 
         // 1. Let incumbent settings be callback.[[HostDefined]].[[IncumbentSettings]].
@@ -265,16 +393,17 @@ void initialize_main_thread_vm(HTML::AgentType type)
         HTML::prepare_to_run_callback(incumbent_settings);
 
         // 4. If script execution context is not null, then push script execution context onto the JavaScript execution context stack.
+        auto& vm = JS::VM::the();
         if (script_execution_context)
-            main_thread_vm_ptr()->push_execution_context(*script_execution_context);
+            vm.push_execution_context(*script_execution_context);
 
         // 5. Let result be Call(callback.[[Callback]], V, argumentsList).
-        auto result = JS::call(*main_thread_vm_ptr(), callback.callback(), this_value, arguments_list);
+        auto result = JS::call(vm, callback.callback(), this_value, arguments_list);
 
         // 6. If script execution context is not null, then pop script execution context from the JavaScript execution context stack.
         if (script_execution_context) {
-            VERIFY(&main_thread_vm_ptr()->running_execution_context() == script_execution_context);
-            main_thread_vm_ptr()->pop_execution_context();
+            VERIFY(&vm.running_execution_context() == script_execution_context);
+            vm.pop_execution_context();
         }
 
         // 7. Clean up after running a callback with incumbent settings.
@@ -285,12 +414,12 @@ void initialize_main_thread_vm(HTML::AgentType type)
     };
 
     // 8.1.5.4.2 HostEnqueueFinalizationRegistryCleanupJob(finalizationRegistry), https://html.spec.whatwg.org/multipage/webappapis.html#hostenqueuefinalizationregistrycleanupjob
-    main_thread_vm_ptr()->host_enqueue_finalization_registry_cleanup_job = [](JS::FinalizationRegistry& finalization_registry) {
+    vm.host_enqueue_finalization_registry_cleanup_job = [](JS::FinalizationRegistry& finalization_registry) {
         // 1. Let global be finalizationRegistry.[[Realm]]'s global object.
         auto& global = finalization_registry.realm().global_object();
 
         // 2. Queue a global task on the JavaScript engine task source given global to perform the following steps:
-        HTML::queue_global_task(HTML::Task::Source::JavaScriptEngine, global, GC::create_function(GC::Heap::the(), [&finalization_registry] {
+        HTML::queue_global_task(HTML::Task::Source::JavaScriptEngine, global, GC::create_function(GC::Heap::the(), GC::captures(finalization_registry), [](auto& finalization_registry) {
             // 1. Let entry be finalizationRegistry.[[CleanupCallback]].[[Callback]].[[Realm]]'s environment settings object.
             // AD-HOC: The spec assumes [[Callback]] has a [[Realm]] internal slot, but Proxy and BoundFunction
             //         exotic objects do not. Use GetFunctionRealm to unwrap these exotic objects, falling back to
@@ -318,8 +447,8 @@ void initialize_main_thread_vm(HTML::AgentType type)
     };
 
     // 8.1.5.4.3 HostEnqueuePromiseJob(job, realm), https://html.spec.whatwg.org/multipage/webappapis.html#hostenqueuepromisejob
-    main_thread_vm_ptr()->host_enqueue_promise_job = [](GC::Ref<GC::Function<JS::ThrowCompletionOr<JS::Value>()>> job, GC::Ptr<JS::Realm> realm) {
-        auto& vm = *main_thread_vm_ptr();
+    vm.host_enqueue_promise_job = [](JS::PromiseJob job, GC::Ptr<JS::Realm> realm) {
+        auto& vm = JS::VM::the();
 
         // IMPLEMENTATION DEFINED: The JS spec says we must take implementation defined steps to make the currently active script or module at the time of HostEnqueuePromiseJob being invoked
         //                         also be the active script or module of the job at the time of its invocation.
@@ -336,7 +465,9 @@ void initialize_main_thread_vm(HTML::AgentType type)
         // Do note that "implied document" from the spec is handwavy and the spec authors are trying to get rid of it: https://github.com/whatwg/html/issues/4980
         auto* script = active_script();
 
-        HTML::queue_a_microtask(script ? script->settings_object().responsible_document().ptr() : nullptr, GC::create_function(GC::Heap::the(), [&vm, job_settings, job = move(job), script_or_module = move(script_or_module)] {
+        HTML::queue_a_microtask(script ? script->settings_object().responsible_document().ptr() : nullptr, GC::create_function(GC::Heap::the(), GC::captures(job_settings, move(job), move(script_or_module)), [](auto& job_settings, auto& job, auto& script_or_module) {
+            auto& vm = JS::VM::the();
+
             // The dummy execution context has to be kept up here to keep it alive for the duration of the function.
             OwnPtr<JS::ExecutionContext> dummy_execution_context;
 
@@ -362,7 +493,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
             }
 
             // 2. Let result be job().
-            auto result = job->function()();
+            auto result = job.run();
 
             // 3. If job settings is not null, then clean up after running script with job settings.
             if (job_settings) {
@@ -384,12 +515,12 @@ void initialize_main_thread_vm(HTML::AgentType type)
         }));
     };
 
-    main_thread_vm_ptr()->host_promise_job_queue_is_empty = []() -> bool {
-        return HTML::main_thread_event_loop().microtask_queue_empty();
+    vm.host_promise_job_queue_is_empty = []() -> bool {
+        return HTML::current_event_loop().microtask_queue_empty();
     };
 
     // 8.1.5.4.4 HostMakeJobCallback(callable), https://html.spec.whatwg.org/multipage/webappapis.html#hostmakejobcallback
-    main_thread_vm_ptr()->host_make_job_callback = [](JS::FunctionObject& callable) -> GC::Ref<JS::JobCallback> {
+    vm.host_make_job_callback = [](JS::FunctionObject& callable) -> GC::Ref<JS::JobCallback> {
         // 1. Let incumbent settings be the incumbent settings object.
         auto& incumbent_settings = HTML::incumbent_settings_object();
 
@@ -417,17 +548,18 @@ void initialize_main_thread_vm(HTML::AgentType type)
         }
 
         // 5. Return the JobCallback Record { [[Callback]]: callable, [[HostDefined]]: { [[IncumbentSettings]]: incumbent settings, [[ActiveScriptContext]]: script execution context } }.
-        auto host_defined = adopt_own(*new WebEngineCustomJobCallbackData(incumbent_settings, move(script_execution_context)));
-        return JS::JobCallback::create(*main_thread_vm_ptr(), callable, move(host_defined));
+        auto& vm = JS::VM::the();
+        auto host_defined = vm.heap().allocate<WebEngineCustomJobCallbackData>(incumbent_settings, move(script_execution_context));
+        return JS::JobCallback::create(vm, callable, host_defined);
     };
 
     // 8.1.6.7.1 HostGetImportMetaProperties(moduleRecord), https://html.spec.whatwg.org/multipage/webappapis.html#hostgetimportmetaproperties
-    main_thread_vm_ptr()->host_get_import_meta_properties = [](JS::SourceTextModule& module_record) {
+    vm.host_get_import_meta_properties = [](JS::SourceTextModule& module_record) {
         auto& realm = module_record.realm();
         auto& vm = realm.vm();
 
         // 1. Let moduleScript be moduleRecord.[[HostDefined]].
-        auto& module_script = *as<HTML::Script>(module_record.host_defined());
+        auto& module_script = *HTML::script_from_host_defined(module_record.host_defined());
 
         // 2. Assert: moduleScript's base URL is not null, as moduleScript is a JavaScript module script.
         VERIFY(module_script.base_url().has_value());
@@ -436,7 +568,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
         auto url_string = module_script.base_url()->serialize();
 
         // 4. Let steps be the following steps, given the argument specifier:
-        auto steps = [&realm, module_script = GC::Ref { module_script }](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
+        auto steps = GC::create_function(GC::Heap::the(), GC::captures(realm, GC::Ref { module_script }), [](auto& realm, auto& module_script, JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
             auto specifier = vm.argument(0);
 
             // 1. Set specifier to ? ToString(specifier).
@@ -449,13 +581,13 @@ void initialize_main_thread_vm(HTML::AgentType type)
 
             // 3. Return the serialization of url.
             return JS::PrimitiveString::create(vm, Utf16String::from_utf8(url.serialize()));
-        };
+        });
 
         // 4. Let resolveFunction be ! CreateBuiltinFunction(steps, 1, "resolve", « »).
-        auto resolve_function = JS::NativeFunction::create(realm, move(steps), 1, vm.names.resolve);
+        auto resolve_function = JS::NativeFunction::create(realm, steps, 1, vm.names.resolve);
 
         // 5. Return « Record { [[Key]]: "url", [[Value]]: urlString }, Record { [[Key]]: "resolve", [[Value]]: resolveFunction } ».
-        HashMap<JS::PropertyKey, JS::Value> meta;
+        GC::RootHashMap<JS::PropertyKey, JS::Value> meta;
         meta.set("url"_utf16_fly_string, JS::PrimitiveString::create(vm, Utf16String::from_utf8(url_string)));
         meta.set("resolve"_utf16_fly_string, resolve_function);
 
@@ -463,20 +595,20 @@ void initialize_main_thread_vm(HTML::AgentType type)
     };
 
     // 8.1.6.7.2 HostGetSupportedImportAttributes(), https://html.spec.whatwg.org/multipage/webappapis.html#hostgetsupportedimportassertions
-    main_thread_vm_ptr()->host_get_supported_import_attributes = []() -> Vector<Utf16String> {
+    vm.host_get_supported_import_attributes = []() -> Vector<Utf16String> {
         // 1. Return « "type" ».
         return { "type"_utf16 };
     };
 
     // 8.1.6.7.3 HostLoadImportedModule(referrer, moduleRequest, loadState, payload), https://html.spec.whatwg.org/multipage/webappapis.html#hostloadimportedmodule
-    main_thread_vm_ptr()->host_load_imported_module = [](JS::ImportedModuleReferrer referrer, JS::ModuleRequest const& module_request, GC::Ptr<JS::GraphLoadingState::HostDefined> load_state, JS::ImportedModulePayload payload) -> void {
-        auto& vm = *main_thread_vm_ptr();
+    vm.host_load_imported_module = [](JS::ImportedModuleReferrer referrer, JS::ModuleRequest const& module_request, GC::Ptr<GC::Cell> load_state, JS::ImportedModulePayload payload) -> void {
+        auto& vm = JS::VM::the();
 
         // 1. Let settingsObject be the current settings object.
         GC::Ref<HTML::EnvironmentSettingsObject> settings_object = HTML::current_settings_object();
 
         // 2. If settingsObject's global object implements WorkletGlobalScope or ServiceWorkerGlobalScope and loadState is undefined, then:
-        auto const* global_object = as_if<PlatformObject>(settings_object->global_object());
+        auto const* global_object = wrappable_impl_from(&settings_object->global_object());
         if (global_object && (global_object->implements_interface("WorkletGlobalScope"_string) || global_object->implements_interface("ServiceWorkerGlobalScope"_string)) && !load_state) {
             // 1. Perform FinishLoadingImportedModule(referrer, moduleRequest, payload, ThrowCompletion(a new TypeError)).
             auto completion = JS::throw_completion(JS::TypeError::create(settings_object->realm(), "Dynamic Import not available for Worklets or ServiceWorkers"_utf16));
@@ -498,7 +630,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
         // 6. If referrer is a Script Record or a Cyclic Module Record, then:
         if (referrer.has<GC::Ref<JS::Script>>() || referrer.has<GC::Ref<JS::CyclicModule>>()) {
             // 1. Set referencingScript to referrer.[[HostDefined]].
-            referencing_script = as<HTML::Script>(referrer.has<GC::Ref<JS::Script>>() ? *referrer.get<GC::Ref<JS::Script>>()->host_defined() : *referrer.get<GC::Ref<JS::CyclicModule>>()->host_defined());
+            referencing_script = *HTML::script_from_host_defined(referrer.has<GC::Ref<JS::Script>>() ? referrer.get<GC::Ref<JS::Script>>()->host_defined() : referrer.get<GC::Ref<JS::CyclicModule>>()->host_defined());
 
             // 2. Set settingsObject to referencingScript's settings object.
             settings_object = referencing_script->settings_object();
@@ -506,14 +638,15 @@ void initialize_main_thread_vm(HTML::AgentType type)
             // 3. Set fetchReferrer to referencingScript's base URL.
             fetch_referrer = referencing_script->base_url().value();
 
-            // FIXME: 4. Set originalFetchOptions to referencingScript's fetch options.
+            // 4. Set originalFetchOptions to referencingScript's fetch options.
+            original_fetch_options = referencing_script->fetch_options();
         }
 
         // 7. If referrer is a Cyclic Module Record and moduleRequest is equal to the first element of referrer.[[RequestedModules]], then:
         if (referrer.has<GC::Ref<JS::CyclicModule>>()) {
-            if (auto const& requested_modules = referrer.get<GC::Ref<JS::CyclicModule>>()->requested_modules(); !requested_modules.is_empty() && module_request == requested_modules.first()) {
+            if (auto requested_modules = referrer.get<GC::Ref<JS::CyclicModule>>()->requested_modules(); !requested_modules.is_empty() && module_request == requested_modules.first()) {
                 // 1. For each ModuleRequest record requested of referrer.[[RequestedModules]]:
-                for (auto const& module_request : referrer.get<GC::Ref<JS::CyclicModule>>()->requested_modules()) {
+                for (auto const& module_request : requested_modules) {
                     // 1. If moduleRequest.[[Attributes]] contains a Record entry such that entry.[[Key]] is not "type", then:
                     for (auto const& attribute : module_request.attributes) {
                         if (attribute.key == "type"sv)
@@ -549,7 +682,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
                     }
 
                     // 2. Perform FinishLoadingImportedModule(referrer, moduleRequest, payload, ThrowCompletion(resolutionError)).
-                    auto completion = WebIDL::exception_to_throw_completion(main_thread_vm(), settings_object->realm(), maybe_exception.exception());
+                    auto completion = WebIDL::exception_to_throw_completion(JS::VM::the(), settings_object->realm(), maybe_exception.exception());
                     JS::finish_loading_imported_module(referrer, module_request, payload, completion);
 
                     // 3. Return.
@@ -599,7 +732,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
             }
 
             // 2. Perform FinishLoadingImportedModule(referrer, moduleRequest, payload, ThrowCompletion(resolutionError)).
-            auto completion = WebIDL::exception_to_throw_completion(main_thread_vm(), settings_object->realm(), url.exception());
+            auto completion = WebIDL::exception_to_throw_completion(JS::VM::the(), settings_object->realm(), url.exception());
             HTML::TemporaryExecutionContext context { *settings_object };
             JS::finish_loading_imported_module(referrer, module_request, payload, completion);
 
@@ -614,7 +747,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
         auto destination = Fetch::Infrastructure::Request::Destination::Script;
 
         // 12. Let fetchClient be settingsObject.
-        GC::Ref fetch_client { settings_object };
+        HTML::FetchClient fetch_client { settings_object };
 
         // 15. If loadState is not undefined, then:
         HTML::PerformTheFetchHook perform_fetch;
@@ -631,7 +764,7 @@ void initialize_main_thread_vm(HTML::AgentType type)
             perform_fetch = fetch_context.perform_fetch;
         }
 
-        auto on_single_fetch_complete = HTML::create_on_fetch_script_complete(settings_object->heap(), [referrer, settings_object, load_state, module_request, payload](GC::Ptr<HTML::Script> const& module_script) -> void {
+        auto on_single_fetch_complete = HTML::create_on_fetch_script_complete(settings_object->heap(), GC::captures(referrer, settings_object, load_state, module_request, payload), [](auto& referrer, auto& settings_object, auto& load_state, auto& module_request, auto& payload, GC::Ptr<HTML::Script> const& module_script) -> void {
             auto& realm = settings_object->realm();
             // onSingleFetchComplete given moduleScript is the following algorithm:
             // 1. Let completion be null.
@@ -690,23 +823,27 @@ void initialize_main_thread_vm(HTML::AgentType type)
         // 16. Fetch a single imported module script given url, fetchClient, destination, fetchOptions, settingsObject, fetchReferrer,
         //     moduleRequest, and onSingleFetchComplete as defined below.
         //     If loadState is not undefined and loadState.[[PerformFetch]] is not null, pass loadState.[[PerformFetch]] along as well.
-        HTML::fetch_single_imported_module_script(settings_object->realm(), url.release_value(), *fetch_client, destination, fetch_options, settings_object, fetch_referrer, module_request, perform_fetch, on_single_fetch_complete);
+        HTML::fetch_single_imported_module_script(settings_object->realm(), url.release_value(), fetch_client, destination, fetch_options, settings_object, fetch_referrer, module_request, perform_fetch, on_single_fetch_complete);
     };
 
-    main_thread_vm_ptr()->host_unrecognized_date_string = [](Utf16View date) {
+    vm.host_unrecognized_date_string = [](Utf16View date) {
+        // NB: Sites routinely construct dates from empty strings on purpose, so those would only drown out strings our
+        //     date parser fails to understand.
+        if (date.is_empty())
+            return;
         dbgln("Unable to parse date string: \"{}\"", date);
     };
 
-    main_thread_vm_ptr()->host_resize_array_buffer = [default_host_resize_array_buffer = move(main_thread_vm_ptr()->host_resize_array_buffer)](JS::ArrayBuffer& buffer, size_t new_byte_length) -> JS::ThrowCompletionOr<JS::HandledByHost> {
-        auto wasm_handled = TRY(WebAssembly::Detail::host_resize_array_buffer(*main_thread_vm_ptr(), buffer, new_byte_length));
+    vm.host_resize_array_buffer = [default_host_resize_array_buffer = move(vm.host_resize_array_buffer)](JS::ArrayBuffer& buffer, size_t new_byte_length) -> JS::ThrowCompletionOr<JS::HandledByHost> {
+        auto wasm_handled = TRY(WebAssembly::host_resize_array_buffer(JS::VM::the(), buffer, new_byte_length));
         if (wasm_handled == JS::HandledByHost::Handled)
             return JS::HandledByHost::Handled;
 
         return default_host_resize_array_buffer(buffer, new_byte_length);
     };
 
-    main_thread_vm_ptr()->host_grow_shared_array_buffer = [default_host_grow_shared_array_buffer = move(main_thread_vm_ptr()->host_grow_shared_array_buffer)](JS::ArrayBuffer& buffer, size_t new_byte_length) -> JS::ThrowCompletionOr<JS::HandledByHost> {
-        auto wasm_handled = TRY(WebAssembly::Detail::host_grow_shared_array_buffer(*main_thread_vm_ptr(), buffer, new_byte_length));
+    vm.host_grow_shared_array_buffer = [default_host_grow_shared_array_buffer = move(vm.host_grow_shared_array_buffer)](JS::ArrayBuffer& buffer, size_t new_byte_length) -> JS::ThrowCompletionOr<JS::HandledByHost> {
+        auto wasm_handled = TRY(WebAssembly::host_grow_shared_array_buffer(JS::VM::the(), buffer, new_byte_length));
         if (wasm_handled == JS::HandledByHost::Handled)
             return JS::HandledByHost::Handled;
 
@@ -714,14 +851,76 @@ void initialize_main_thread_vm(HTML::AgentType type)
     };
 }
 
+extern "C" void web_rust_shut_down_agent(JSVM*);
+
+void shut_down_agent()
+{
+    auto& vm = JS::VM::the();
+
+    // NB: A window agent lives as long as its process does.
+    VERIFY(&vm != main_thread_vm_ptr().ptr());
+
+    auto& agent = static_cast<HTML::Agent&>(*vm.agent());
+    agent.detach_script_abort_handle();
+
+    // What the agent keeps outside its heap refers to cells in it, so that goes while the heap is alive.
+    Platform::discard_thread_pool_completions();
+    Fetch::Fetching::disarm_all_body_stream_wakes();
+    HTML::clear_message_event_ports_caches();
+    ServiceWorker::clear_service_worker_container_ready_promise_caches();
+    PermissionsAPI::PermissionStore::forget_statuses_of_this_agent();
+    FileAPI::forget_blob_url_store_of_this_agent();
+    Fetch::Fetching::clear_http_memory_cache();
+    ServiceWorker::forget_job_queues_of_this_agent();
+    ServiceWorker::Registration::forget_registrations_of_this_agent();
+
+    // An event that is still queued can hold roots as well, and a stopped request only lets go of its roots in one. As
+    // the task queues discard everything by now, no script runs from these. What a deferred invocation of LibWeb or a
+    // command to the agent's fetch executor is for has to go undone, as the worker that it was for has run its closing
+    // steps.
+    agent.fetch_executor->shutdown();
+    Platform::EventLoopPlugin::set_discard_deferred_invocations_on_this_thread(true);
+    auto& event_queue = Core::ThreadEventQueue::current();
+    for (;;) {
+        if (ResourceLoader::is_initialized())
+            ResourceLoader::the().stop_all_requests();
+        if (!event_queue.has_pending_events())
+            break;
+        event_queue.process();
+    }
+    Platform::EventLoopPlugin::set_discard_deferred_invocations_on_this_thread(false);
+
+    web_rust_shut_down_agent(JS::HostABI::vm_to_abi(vm));
+    ResourceLoader::shut_down();
+    Platform::ImageCodecPlugin::shut_down();
+
+    // NB: The VM stays reachable while it is destroyed, as the finalizers of the cells in its heap use it.
+    vm.unref();
+
+    // NB: What this agent used is of no use to this process unless another worker comes along, which may be never. What
+    //     this thread's allocator still holds goes back when the thread exits.
+    ak_kmalloc_collect();
+    ladybird_did_end_short_lived_thread();
+
+    --s_worker_agent_count;
+}
+
+size_t worker_agent_count()
+{
+    return s_worker_agent_count;
+}
+
 JS::VM& main_thread_vm()
 {
-    VERIFY(main_thread_vm_ptr());
-    return *main_thread_vm_ptr();
+    auto* vm = main_thread_vm_ptr().ptr();
+    VERIFY(vm);
+    VERIFY(&JS::VM::the() == vm);
+    return *vm;
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#creating-a-new-javascript-realm
-NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM& vm, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_object, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_this_value)
+// NB: agent is given as its agent cluster's cross-origin isolation mode, which is all these steps read of it.
+NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM& vm, HTML::CrossOriginIsolationMode agent_cluster_cross_origin_isolation_mode, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_object, Function<GC::Ref<JS::Object>(JS::Realm&)> create_global_this_value)
 {
     // 1. Perform InitializeHostDefinedRealm() with the provided customizations for creating the global object and the global this binding.
     // 2. Let realm execution context be the running JavaScript execution context.
@@ -731,15 +930,22 @@ NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM& vm, Fu
     auto* popped_execution_context = vm.pop_execution_context();
     VERIFY(popped_execution_context == realm_execution_context.ptr());
 
-    // NO-OP: 4. Let realm be realm execution context's Realm component.
-    // NO-OP: 5. Set realm's agent to agent.
+    // 4. Let realm be realm execution context's Realm component.
+    auto& realm = *realm_execution_context->realm;
 
-    // FIXME: 6. If agent's agent cluster's cross-origin isolation mode is "none", then:
-    //          1. Let global be realm's global object.
-    //          2. Let status be ! global.[[Delete]]("SharedArrayBuffer").
-    //          3. Assert: status is true.
+    // 5. If agent's agent cluster's cross-origin isolation mode is "none":
+    if (agent_cluster_cross_origin_isolation_mode == HTML::CrossOriginIsolationMode::None) {
+        // 1. Let global be realm's global object.
+        auto& global = realm.global_object();
 
-    // 7. Return realm execution context.
+        // 2. Let status be ! global.[[Delete]]("SharedArrayBuffer").
+        auto status = MUST(global.internal_delete(vm.names.SharedArrayBuffer));
+
+        // 3. Assert: status is true.
+        VERIFY(status);
+    }
+
+    // 6. Return realm execution context.
     return realm_execution_context;
 }
 
@@ -751,7 +957,7 @@ static void ensure_main_thread_vm_initialized()
         return;
 
     Platform::EventLoopPlugin::install(*new Platform::EventLoopPlugin);
-    initialize_main_thread_vm(HTML::AgentType::SimilarOriginWindow);
+    initialize_agent(HTML::AgentType::SimilarOriginWindow);
 }
 
 GC::Ref<JS::Realm> create_a_simple_javascript_realm()
@@ -768,9 +974,10 @@ GC::Ref<JS::Realm> create_a_simple_javascript_realm()
 
     auto& vm = main_thread_vm();
     GC::Ptr<HTML::Window> window;
-    GC::Ptr<PlatformObject> global_this;
+    GC::Ptr<JS::HostObject> global_this;
     auto execution_context = create_a_new_javascript_realm(
         vm,
+        HTML::CrossOriginIsolationMode::None,
         [&](JS::Realm& realm) -> GC::Ref<JS::Object> {
             window = HTML::Window::create();
             global_this = create_global_object_wrapper(realm, GC::Ref { *window });
@@ -783,7 +990,7 @@ GC::Ref<JS::Realm> create_a_simple_javascript_realm()
     auto& realm = *execution_context->realm;
     auto intrinsics = realm.create<Intrinsics>(realm);
     auto wrapper_world = GC::Heap::the().allocate<WrapperWorld>(WrapperWorld::Type::Internal);
-    realm.set_host_defined(make<HostDefined>(intrinsics, *wrapper_world, *principal_realm));
+    realm.set_host_defined(realm.heap().allocate<HostDefined>(intrinsics, *wrapper_world, *principal_realm));
     cache_global_object_wrapper(realm);
 
     // Keep the test realm alive and current for the lifetime of this VM.
@@ -857,9 +1064,10 @@ GC::Ref<JS::Realm> create_a_principal_javascript_realm()
     page_client->m_page = page;
 
     GC::Ptr<HTML::Window> window;
-    GC::Ptr<PlatformObject> global_this;
+    GC::Ptr<JS::HostObject> global_this;
     auto execution_context = create_a_new_javascript_realm(
         main_thread_vm(),
+        HTML::CrossOriginIsolationMode::None,
         [&](JS::Realm& realm) -> GC::Ref<JS::Object> {
             window = HTML::Window::create();
             global_this = create_global_object_wrapper(realm, GC::Ref { *window });
@@ -877,7 +1085,8 @@ GC::Ref<JS::Realm> create_a_principal_javascript_realm()
         nullptr,
         URL::about_blank(),
         URL::Origin::create_opaque(),
-        {});
+        {},
+        HTML::CrossOriginIsolationMode::None);
 
     auto& settings = principal_host_defined_environment_settings_object(*realm);
     main_thread_vm().push_execution_context(settings.realm_execution_context());

@@ -8,10 +8,13 @@ crate-type = ["staticlib", "rlib"]
 
 [features]
 default = []
-allocator = []
+allocator = ["dep:ladybird_allocator"]
 
 [dependencies]
-jxl = "0.6"
+ak = { path = "../../../AK/Rust" }
+jxl = "0.7.4"
+ladybird_allocator = { path = "../../RustAllocator", optional = true }
+rustc-demangle = "0.1"
 
 [build-dependencies]
 cbindgen = "0.29"

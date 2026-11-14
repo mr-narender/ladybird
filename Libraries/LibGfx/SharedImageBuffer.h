@@ -25,6 +25,7 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     static SharedImageBuffer create(IntSize);
+    static ErrorOr<SharedImageBuffer> try_create(IntSize);
     static SharedImageBuffer import_from_shared_image(SharedImage);
 
     SharedImageBuffer(SharedImageBuffer&&);
@@ -55,7 +56,7 @@ private:
 #else
     explicit SharedImageBuffer(NonnullRefPtr<Bitmap>);
 #    ifdef USE_VULKAN_DMABUF_IMAGES
-    SharedImageBuffer(NonnullRefPtr<Bitmap>, LinuxDmaBufHandle&&);
+    SharedImageBuffer(RefPtr<Bitmap>, LinuxDmaBufHandle&&);
     Optional<LinuxDmaBufHandle> m_linux_dmabuf_handle;
 #    endif
 #    ifdef USE_DIRECTX

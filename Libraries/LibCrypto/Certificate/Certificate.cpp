@@ -325,7 +325,7 @@ ErrorOr<PrivateKey> parse_private_key_info(ASN1::Decoder& decoder, Vector<String
         return private_key;
     }
     if (private_key.algorithm.identifier.span() == ASN1::ml_dsa_44_oid.span()) {
-        auto maybe_key = Crypto::PK::MLDSA::parse_mldsa_key(PK::MLDSA44, value.bytes(), current_scope);
+        auto maybe_key = Crypto::PK::MLDSA::parse_mldsa_key(PK::MLDSA44, value.bytes());
         if (maybe_key.is_error()) {
             ERROR_WITH_SCOPE(maybe_key.release_error());
         }
@@ -335,7 +335,7 @@ ErrorOr<PrivateKey> parse_private_key_info(ASN1::Decoder& decoder, Vector<String
         return private_key;
     }
     if (private_key.algorithm.identifier.span() == ASN1::ml_dsa_65_oid.span()) {
-        auto maybe_key = Crypto::PK::MLDSA::parse_mldsa_key(PK::MLDSA65, value.bytes(), current_scope);
+        auto maybe_key = Crypto::PK::MLDSA::parse_mldsa_key(PK::MLDSA65, value.bytes());
         if (maybe_key.is_error()) {
             ERROR_WITH_SCOPE(maybe_key.release_error());
         }
@@ -345,7 +345,7 @@ ErrorOr<PrivateKey> parse_private_key_info(ASN1::Decoder& decoder, Vector<String
         return private_key;
     }
     if (private_key.algorithm.identifier.span() == ASN1::ml_dsa_87_oid.span()) {
-        auto maybe_key = Crypto::PK::MLDSA::parse_mldsa_key(PK::MLDSA87, value.bytes(), current_scope);
+        auto maybe_key = Crypto::PK::MLDSA::parse_mldsa_key(PK::MLDSA87, value.bytes());
         if (maybe_key.is_error()) {
             ERROR_WITH_SCOPE(maybe_key.release_error());
         }
@@ -355,7 +355,7 @@ ErrorOr<PrivateKey> parse_private_key_info(ASN1::Decoder& decoder, Vector<String
         return private_key;
     }
     if (private_key.algorithm.identifier.span() == ASN1::ml_kem_512_oid.span()) {
-        auto maybe_key = Crypto::PK::MLKEM::parse_mlkem_key(PK::MLKEMSize::MLKEM512, value.bytes(), current_scope);
+        auto maybe_key = Crypto::PK::MLKEM::parse_mlkem_key(PK::MLKEMSize::MLKEM512, value.bytes());
         if (maybe_key.is_error()) {
             ERROR_WITH_SCOPE(maybe_key.release_error());
         }
@@ -365,7 +365,7 @@ ErrorOr<PrivateKey> parse_private_key_info(ASN1::Decoder& decoder, Vector<String
         return private_key;
     }
     if (private_key.algorithm.identifier.span() == ASN1::ml_kem_768_oid.span()) {
-        auto maybe_key = Crypto::PK::MLKEM::parse_mlkem_key(PK::MLKEMSize::MLKEM768, value.bytes(), current_scope);
+        auto maybe_key = Crypto::PK::MLKEM::parse_mlkem_key(PK::MLKEMSize::MLKEM768, value.bytes());
         if (maybe_key.is_error()) {
             ERROR_WITH_SCOPE(maybe_key.release_error());
         }
@@ -375,7 +375,7 @@ ErrorOr<PrivateKey> parse_private_key_info(ASN1::Decoder& decoder, Vector<String
         return private_key;
     }
     if (private_key.algorithm.identifier.span() == ASN1::ml_kem_1024_oid.span()) {
-        auto maybe_key = Crypto::PK::MLKEM::parse_mlkem_key(PK::MLKEMSize::MLKEM1024, value.bytes(), current_scope);
+        auto maybe_key = Crypto::PK::MLKEM::parse_mlkem_key(PK::MLKEMSize::MLKEM1024, value.bytes());
         if (maybe_key.is_error()) {
             ERROR_WITH_SCOPE(maybe_key.release_error());
         }
@@ -383,6 +383,13 @@ ErrorOr<PrivateKey> parse_private_key_info(ASN1::Decoder& decoder, Vector<String
         private_key.mlkem = move(maybe_key.release_value().private_key);
         EXIT_SCOPE();
         return private_key;
+    }
+
+    if (private_key.algorithm.identifier.span() == ASN1::ed25519_oid.span()) {
+        ASN1::Decoder private_key_decoder(value.bytes());
+        auto curve_private_key = TRY(private_key_decoder.read<StringView>(ASN1::Class::Universal, ASN1::Kind::OctetString));
+        if (!private_key_decoder.eof() || curve_private_key.length() != 32)
+            ERROR_WITH_SCOPE(TRY(String::formatted("Invalid Ed25519 private key at {}", current_scope)));
     }
 
     // https://datatracker.ietf.org/doc/html/rfc8410#section-9

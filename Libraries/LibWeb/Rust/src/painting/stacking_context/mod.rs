@@ -8,12 +8,13 @@ pub mod dump;
 pub mod entries;
 pub mod verify;
 
-use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
+use crate::painting::paint_read::PaintRead;
 use crate::painting::style_queries::{self, effective_z_index};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StackingContextFacts {
+    pub order: i32,
     pub establishes_stacking_context: bool,
     pub effective_z_index: Option<i32>,
     pub is_positioned: bool,
@@ -24,12 +25,13 @@ pub(crate) struct StackingContextFacts {
 }
 
 impl StackingContextFacts {
-    pub(crate) fn gather(arena: &LayoutNodeArena, slot: NodeSlotId, enclosing: NodeSlotId) -> Self {
+    pub(crate) fn gather(arena: &impl PaintRead, slot: NodeSlotId, enclosing: NodeSlotId) -> Self {
         let establishes_stacking_context = style_queries::establishes_stacking_context(arena, slot);
         let is_positioned = style_queries::is_positioned(arena, slot);
         let is_inline_or_replaced =
             style_queries::is_inline(arena, slot) || style_queries::is_replaced_box(arena, slot);
         Self {
+            order: crate::painting::paint_order::order_for_painting(arena, slot),
             establishes_stacking_context,
             effective_z_index: effective_z_index(arena, slot),
             is_positioned,
@@ -42,6 +44,7 @@ impl StackingContextFacts {
 
     pub(crate) fn for_viewport() -> Self {
         Self {
+            order: 0,
             establishes_stacking_context: true,
             effective_z_index: None,
             is_positioned: false,

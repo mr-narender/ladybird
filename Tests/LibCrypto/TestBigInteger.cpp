@@ -46,10 +46,15 @@ TEST_CASE(test_bigint_fib500)
     EXPECT_EQ(bigint_fibonacci(500).words(), result);
 }
 
-BENCHMARK_CASE(bench_bigint_fib100000)
+TEST_CASE(test_unsigned_bigint_clear_sensitive_data)
 {
-    auto res = bigint_fibonacci(100000);
-    (void)res;
+    auto value = MUST(Crypto::UnsignedBigInteger::from_base(16, "fedcba98765432100123456789abcdef"sv));
+    (void)value.hash();
+
+    value.clear_sensitive_data();
+
+    EXPECT(value.is_zero());
+    EXPECT_EQ(value.hash(), Crypto::UnsignedBigInteger(0).hash());
 }
 
 TEST_CASE(test_unsigned_bigint_addition_initialization)
@@ -457,12 +462,6 @@ TEST_CASE(test_signed_bigint_fibo500)
     };
     auto result = bigint_signed_fibonacci(500);
     EXPECT_EQ(result.unsigned_value().words(), expected_result);
-}
-
-BENCHMARK_CASE(bench_signed_bigint_fib100000)
-{
-    auto res = bigint_signed_fibonacci(100000);
-    (void)res;
 }
 
 TEST_CASE(test_signed_addition_edgecase_borrow_with_zero)

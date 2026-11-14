@@ -7,16 +7,17 @@
 #include <LibWebView/BlobURLStore.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CookieJar.h>
-#include <LibWebView/FaviconStore.h>
 #include <LibWebView/HSTSStore.h>
-#include <LibWebView/HistoryStore.h>
-#include <LibWebView/SessionStore.h>
+#include <LibWebView/PermissionManager.h>
 #include <LibWebView/StorageJar.h>
 
 namespace WebView {
 
+static u64 s_next_id { 1 };
+
 BrowsingSession::BrowsingSession(IsPrivate is_private)
-    : m_is_private(is_private)
+    : m_id(s_next_id++)
+    , m_is_private(is_private)
 {
 }
 
@@ -31,9 +32,6 @@ NonnullRefPtr<BrowsingSession> BrowsingSession::create(IsPrivate is_private)
         session->storage_jar = StorageJar::create();
         session->blob_url_store = make<BlobURLStore>();
         session->hsts_store = HSTSStore::create();
-        session->favicon_store = FaviconStore::create();
-        session->history_store = HistoryStore::create_disabled();
-        session->session_store = SessionStore::create();
     }
 
     return session;

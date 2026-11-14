@@ -1,8 +1,9 @@
+ladybird_test_suite(LibCrypto)
+
 set(TEST_SOURCES
     TestAES.cpp
     TestArgon2.cpp
     TestASN1.cpp
-    TestBigFraction.cpp
     TestBigInteger.cpp
     TestCurves.cpp
     TestEd25519.cpp
@@ -11,12 +12,12 @@ set(TEST_SOURCES
     TestHKDF.cpp
     TestHMAC.cpp
     TestMLDSA.cpp
+    TestMLKEM.cpp
     TestOAEP.cpp
     TestPBKDF2.cpp
     TestPSS.cpp
     TestRSA.cpp
 )
 
-foreach(source IN LISTS TEST_SOURCES)
-    ladybird_test("${source}" LibCrypto LIBS LibCrypto)
-endforeach()
+target_sources(TestLibCrypto PRIVATE ${TEST_SOURCES})
+target_link_libraries(TestLibCrypto PRIVATE LibCrypto)

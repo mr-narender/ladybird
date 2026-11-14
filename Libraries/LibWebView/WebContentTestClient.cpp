@@ -5,6 +5,7 @@
  */
 
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/GamepadManager.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebContentPage.h>
@@ -13,7 +14,7 @@
 namespace WebView {
 
 WebContentTestClient::WebContentTestClient(NonnullOwnPtr<IPC::Transport> transport, WebContentClient& client)
-    : WebContentTestClientPageRoutingStub(*this, move(transport))
+    : IPC::ConnectionToServer<WebContentTestClientEndpoint, WebContentTestServerEndpoint, WebContentTestClientPageRoutingStub>(*this, move(transport))
     , m_client(client)
 {
 }
@@ -42,10 +43,61 @@ void WebContentTestClient::did_expire_cookies_with_time_offset(AK::Duration offs
     m_client.session().cookie_jar->expire_cookies_with_time_offset(offset);
 }
 
+Messages::WebContentTestClient::SetPermissionForTestingResponse WebContentTestClient::set_permission_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId document_id, String name, String state)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->set_permission_for_testing(document_id, name, state);
+    return Web::Permissions::PermissionSnapshot {};
+}
+
+void WebContentTestClient::set_next_permission_prompt_outcome_for_testing(Web::PageId page_id, String name, String outcome, bool held)
+{
+    if (auto* page = m_client.page(page_id))
+        page->set_next_permission_prompt_outcome_for_testing(name, outcome, held);
+}
+
+void WebContentTestClient::set_system_microphone_authorization_for_testing(Web::PageId page_id, String authorization, String answer, bool held)
+{
+    if (auto* page = m_client.page(page_id))
+        page->set_system_microphone_authorization_for_testing(authorization, answer, held);
+}
+
+void WebContentTestClient::release_system_microphone_answer_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        page->release_system_microphone_answer_for_testing();
+}
+
+Messages::WebContentTestClient::DidRequestMicrophoneStateForTestingResponse WebContentTestClient::did_request_microphone_state_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->microphone_state_for_testing();
+    return "{}"_string;
+}
+
+void WebContentTestClient::release_held_permission_prompt_for_testing(Web::PageId page_id, u32 waiters)
+{
+    if (auto* page = m_client.page(page_id))
+        page->release_held_permission_prompt_for_testing(waiters);
+}
+
+Messages::WebContentTestClient::AdvancePermissionClockForTestingResponse WebContentTestClient::advance_permission_clock_for_testing(Web::PageId page_id, u64 milliseconds)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->advance_permission_clock_for_testing(milliseconds);
+    return Web::Permissions::PermissionSnapshot {};
+}
+
 void WebContentTestClient::did_spoof_document_origin_for_testing(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, URL::Origin origin)
 {
     if (auto* page = m_client.page(page_id))
         page->spoof_document_origin_for_testing(environment_id, move(origin));
+}
+
+void WebContentTestClient::did_request_clear_storage_for_testing(Web::PageId page_id, Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id)
+{
+    if (auto* page = m_client.page(page_id))
+        page->clear_storage_for_testing(storage_endpoint, environment_id);
 }
 
 void WebContentTestClient::did_store_hsts_policy_for_testing(String domain, HTTP::HSTS::ParsedHSTSPolicy policy)
@@ -69,6 +121,66 @@ Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResp
     return String {};
 }
 
+Messages::WebContentTestClient::DidRequestTabIsPlayingAudioForTestingResponse WebContentTestClient::did_request_tab_is_playing_audio_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_tab_is_playing_audio_for_testing();
+
+    return false;
+}
+
+Messages::WebContentTestClient::DidRequestTabIsHeardPlayingAudioForTestingResponse WebContentTestClient::did_request_tab_is_heard_playing_audio_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_tab_is_heard_playing_audio_for_testing();
+
+    return false;
+}
+
+Messages::WebContentTestClient::DidRequestTabIsUsingMicrophoneForTestingResponse WebContentTestClient::did_request_tab_is_using_microphone_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_tab_is_using_microphone_for_testing();
+
+    return false;
+}
+
+Messages::WebContentTestClient::DidRequestTabIsCapturingAudioForTestingResponse WebContentTestClient::did_request_tab_is_capturing_audio_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_tab_is_capturing_audio_for_testing();
+
+    return false;
+}
+
+void WebContentTestClient::report_audio_capture_for_testing(Web::PageId page_id, Web::PageId labelled_page_id, bool capturing)
+{
+    if (auto* page = m_client.page(page_id))
+        page->report_audio_capture_for_testing(labelled_page_id, capturing);
+}
+
+void WebContentTestClient::retire_picture_in_picture_window_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        page->retire_picture_in_picture_window_for_testing();
+}
+
+Messages::WebContentTestClient::DidRequestTabAudibilityTransitionsForTestingResponse WebContentTestClient::did_request_tab_audibility_transitions_for_testing(Web::PageId page_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_tab_audibility_transitions_for_testing();
+
+    return Vector<bool> {};
+}
+
+Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse WebContentTestClient::did_request_has_populated_document_for_testing(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id)
+{
+    if (auto* page = m_client.page(page_id))
+        return page->did_request_has_populated_document_for_testing(navigable_id);
+
+    return false;
+}
+
 Messages::WebContentTestClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse WebContentTestClient::did_request_capture_session_history_snapshot_for_testing(Web::PageId page_id)
 {
     if (auto* page = m_client.page(page_id))
@@ -85,20 +197,51 @@ Messages::WebContentTestClient::DidRequestRestoreSessionHistorySnapshotForTestin
     return false;
 }
 
-Messages::WebContentTestClient::DidRequestRegisterSessionStoreTabForTestingResponse WebContentTestClient::did_request_register_session_store_tab_for_testing(Web::PageId page_id)
+Messages::WebContentTestClient::DidRequestRecordReportedSessionHistoryForTestingResponse WebContentTestClient::did_request_record_reported_session_history_for_testing(Web::PageId page_id)
 {
     if (auto* page = m_client.page(page_id))
-        return page->did_request_register_session_store_tab_for_testing();
+        return page->did_request_record_reported_session_history_for_testing();
 
     return false;
 }
 
-Messages::WebContentTestClient::DidRequestSessionStoreTabStateForTestingResponse WebContentTestClient::did_request_session_store_tab_state_for_testing(Web::PageId page_id)
+Messages::WebContentTestClient::DidRequestReportedSessionHistoryForTestingResponse WebContentTestClient::did_request_reported_session_history_for_testing(Web::PageId page_id)
 {
     if (auto* page = m_client.page(page_id))
-        return page->did_request_session_store_tab_state_for_testing();
+        return page->did_request_reported_session_history_for_testing();
 
     return String {};
+}
+
+Messages::WebContentTestClient::CreateVirtualGamepadResponse WebContentTestClient::create_virtual_gamepad()
+{
+    return GamepadManager::the().create_virtual_gamepad(m_client);
+}
+
+void WebContentTestClient::set_virtual_gamepad_button(Web::Gamepad::GamepadHandle handle, i32 button, bool down)
+{
+    GamepadManager::the().set_virtual_gamepad_button(m_client, handle, button, down);
+}
+
+void WebContentTestClient::set_virtual_gamepad_axis(Web::Gamepad::GamepadHandle handle, i32 axis, i16 value)
+{
+    GamepadManager::the().set_virtual_gamepad_axis(m_client, handle, axis, value);
+}
+
+void WebContentTestClient::disconnect_virtual_gamepad(Web::Gamepad::GamepadHandle handle)
+{
+    GamepadManager::the().disconnect_virtual_gamepad(m_client, handle);
+}
+
+Messages::WebContentTestClient::PumpGamepadEventsResponse WebContentTestClient::pump_gamepad_events()
+{
+    return GamepadManager::the().pump_gamepad_events(m_client);
+}
+
+Messages::WebContentTestClient::GetVirtualGamepadReceivedRumbleEffectsResponse WebContentTestClient::get_virtual_gamepad_received_rumble_effects(Web::Gamepad::GamepadHandle handle)
+{
+    auto& gamepad_manager = GamepadManager::the();
+    return { gamepad_manager.virtual_gamepad_received_rumble_effects(m_client, handle), gamepad_manager.virtual_gamepad_received_trigger_rumble_effects(m_client, handle) };
 }
 
 }

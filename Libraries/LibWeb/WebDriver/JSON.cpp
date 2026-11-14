@@ -158,6 +158,7 @@ static ErrorOr<ResultType, WebDriver::Error> clone_an_object(HTML::BrowsingConte
     seen.set(value);
 
     // 3. Let result be the value of the first matching statement, matching on value:
+    Optional<u32> collection_length;
     auto result = TRY(([&]() -> ErrorOr<ResultType, WebDriver::Error> {
         // -> a collection
         if (is_collection(value)) {
@@ -167,6 +168,7 @@ static ErrorOr<ResultType, WebDriver::Error> clone_an_object(HTML::BrowsingConte
             auto length = TRY_OR_JS_ERROR(length_property.to_length(vm));
             if (length > NumericLimits<u32>::max())
                 return WebDriver::Error::from_code(ErrorCode::JavascriptError, "Length of Object too large"sv);
+            collection_length = static_cast<u32>(length);
 
             if constexpr (is_json_value)
                 return JsonArray { length };
@@ -186,7 +188,7 @@ static ErrorOr<ResultType, WebDriver::Error> clone_an_object(HTML::BrowsingConte
     Optional<WebDriver::Error> error;
 
     // 4. For each enumerable property in value, run the following substeps:
-    (void)value.enumerate_object_properties([&](auto property) -> Optional<JS::Completion> {
+    auto clone_property = [&](auto property) -> Optional<JS::Completion> {
         // 1. Let name be the name of the property.
         auto name = MUST(JS::PropertyKey::from_value(vm, property));
 
@@ -221,7 +223,19 @@ static ErrorOr<ResultType, WebDriver::Error> clone_an_object(HTML::BrowsingConte
         }
 
         return {};
-    });
+    };
+
+    if (collection_length.has_value()) {
+        // INTEROP: Chromium and Firefox clone collection entries rather than arbitrary enumerable properties.
+        //          Both visit every index, including holes, without a separate limit for sparse lengths.
+        //          This also preserves non-enumerable indexed properties, like JSON array serialization.
+        for (u32 index = 0; index < *collection_length; ++index) {
+            if (clone_property(JS::Value(index)).has_value())
+                break;
+        }
+    } else {
+        (void)value.enumerate_object_properties(move(clone_property));
+    }
 
     if (error.has_value())
         return error.release_value();
@@ -302,19 +316,17 @@ static Response internal_json_clone(HTML::BrowsingContext const& browsing_contex
     }
 
     // -> a WindowProxy object
-    if (is<HTML::WindowProxy>(object)) {
-        auto const& window_proxy = static_cast<HTML::WindowProxy const&>(object);
-
+    if (auto const* window_proxy = HTML::WindowProxy::from_object(object)) {
         // If the associated browsing context of the WindowProxy object in value has been destroyed, return error
         // with error code stale element reference.
-        auto browsing_context = window_proxy.associated_browsing_context();
+        auto browsing_context = window_proxy->associated_browsing_context();
         if (!browsing_context || browsing_context->has_navigable_been_destroyed()) {
             return WebDriver::Error::from_code(ErrorCode::StaleElementReference, "Browsing context has been discarded"sv);
         }
         // Otherwise:
         else {
             // 1. Let reference be the WindowProxy reference object for value.
-            auto reference = window_proxy_reference_object(window_proxy);
+            auto reference = window_proxy_reference_object(*window_proxy);
 
             // 2. Return success with data reference.
             return JsonValue { move(reference) };
@@ -383,13 +395,13 @@ static ErrorOr<JS::Value, WebDriver::Error> internal_json_deserialize(HTML::Brow
     // -> Object that represents a web frame
     if (represents_a_web_frame(value)) {
         // Return the deserialized web frame of value.
-        return deserialize_web_frame(value.as_object());
+        return &TRY(deserialize_web_frame(value.as_object()))->object();
     }
 
     // -> Object that represents a web window
     if (represents_a_web_window(value)) {
         // Return the deserialized web window of value.
-        return deserialize_web_window(value.as_object());
+        return &TRY(deserialize_web_window(value.as_object()))->object();
     }
 
     // -> instance of Array

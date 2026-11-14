@@ -7,8 +7,8 @@
 #include <LibHTTP/HeaderList.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/URL.h>
-#include <LibWebView/DownloadPresentation.h>
 #include <LibWebView/DownloadSegmentation.h>
+#include <LibWebView/FileDownloader.h>
 
 static NonnullRefPtr<HTTP::HeaderList> headers(Vector<HTTP::Header> headers)
 {
@@ -24,9 +24,9 @@ static Vector<HTTP::Header> ok_headers()
     };
 }
 
-static WebView::DownloadRangeSupport evaluate(Vector<HTTP::Header> header_list, Optional<u32> response_code = 200u, Requests::CameFromCache came_from_cache = Requests::CameFromCache::No)
+static WebView::DownloadRangeSupport evaluate(Vector<HTTP::Header> header_list, Optional<u32> response_code = 200u, Requests::CacheState cache_state = Requests::CacheState::NotCached)
 {
-    return WebView::evaluate_range_support(headers(move(header_list)), response_code, came_from_cache);
+    return WebView::evaluate_range_support(headers(move(header_list)), response_code, cache_state);
 }
 
 TEST_CASE(range_support_for_a_well_behaved_response)
@@ -72,7 +72,8 @@ TEST_CASE(range_support_requires_a_fresh_complete_response)
     EXPECT(!evaluate(ok_headers(), 206u).supports_ranges);
     EXPECT(!evaluate(ok_headers(), 302u).supports_ranges);
     EXPECT(!evaluate(ok_headers(), {}).supports_ranges);
-    EXPECT(!evaluate(ok_headers(), 200u, Requests::CameFromCache::Yes).supports_ranges);
+    EXPECT(!evaluate(ok_headers(), 200u, Requests::CacheState::Local).supports_ranges);
+    EXPECT(!evaluate(ok_headers(), 200u, Requests::CacheState::Validated).supports_ranges);
 }
 
 TEST_CASE(range_validators)
@@ -236,31 +237,4 @@ TEST_CASE(estimated_time_remaining)
     download.total_size = 1000;
     download.bytes_per_second = 0;
     EXPECT(!download.estimated_time_remaining().has_value());
-}
-
-TEST_CASE(time_remaining_text)
-{
-    auto text = [](i64 seconds) {
-        return WebView::download_time_remaining_text(AK::Duration::from_seconds(seconds));
-    };
-
-    EXPECT_EQ(text(0), "1 sec left"_string);
-    EXPECT_EQ(text(45), "45 sec left"_string);
-    EXPECT_EQ(text(59), "59 sec left"_string);
-
-    EXPECT_EQ(text(60), "1 min left"_string);
-    EXPECT_EQ(text(61), "2 min left"_string);
-    EXPECT_EQ(text(59 * 60), "59 min left"_string);
-
-    EXPECT_EQ(text(60 * 60), "1 hr 0 min left"_string);
-    EXPECT_EQ(text(90 * 60), "1 hr 30 min left"_string);
-    EXPECT_EQ(text(7199), "2 hr 0 min left"_string);
-    EXPECT_EQ(text(25 * 60 * 60), "25 hr 0 min left"_string);
-}
-
-TEST_CASE(rate_text)
-{
-    EXPECT_EQ(WebView::download_rate_text(512), "512 B/s"_string);
-    EXPECT_EQ(WebView::download_rate_text(1536), "1.5 KiB/s"_string);
-    EXPECT_EQ(WebView::download_rate_text(3 * MiB), "3.0 MiB/s"_string);
 }

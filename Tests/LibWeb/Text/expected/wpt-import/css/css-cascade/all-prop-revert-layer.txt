@@ -1,8 +1,8 @@
 Harness status: OK
 
-Found 324 tests
+Found 354 tests
 
-320 Pass
+350 Pass
 4 Fail
 Pass	accent-color
 Pass	border-collapse
@@ -26,8 +26,14 @@ Pass	font-feature-settings
 Pass	font-kerning
 Pass	font-language-override
 Pass	font-optical-sizing
+Pass	font-palette
 Pass	font-size
+Pass	font-size-adjust
 Pass	font-style
+Pass	font-synthesis-position
+Pass	font-synthesis-small-caps
+Pass	font-synthesis-style
+Pass	font-synthesis-weight
 Pass	font-variant-alternates
 Pass	font-variant-caps
 Pass	font-variant-east-asian
@@ -38,9 +44,12 @@ Pass	font-variant-position
 Pass	font-variation-settings
 Pass	font-weight
 Pass	font-width
+Pass	forced-color-adjust
+Pass	hyphenate-character
 Pass	image-rendering
 Pass	letter-spacing
 Pass	line-height
+Pass	list-style-image
 Pass	list-style-position
 Pass	list-style-type
 Pass	math-depth
@@ -63,10 +72,13 @@ Pass	stroke-opacity
 Pass	stroke-width
 Pass	tab-size
 Pass	text-align
+Pass	text-align-last
 Pass	text-anchor
 Pass	text-decoration-skip-ink
+Pass	text-emphasis-position
 Pass	text-indent
 Pass	text-justify
+Pass	text-orientation
 Pass	text-rendering
 Pass	text-shadow
 Pass	text-transform
@@ -80,8 +92,10 @@ Pass	widows
 Pass	word-break
 Pass	word-spacing
 Pass	writing-mode
+Pass	align-content
 Pass	align-items
 Pass	align-self
+Pass	alignment-baseline
 Pass	animation-composition
 Pass	animation-delay
 Pass	animation-direction
@@ -90,6 +104,8 @@ Pass	animation-fill-mode
 Pass	animation-iteration-count
 Pass	animation-name
 Pass	animation-play-state
+Pass	animation-range-end
+Pass	animation-range-start
 Pass	animation-timeline
 Pass	animation-timing-function
 Pass	appearance
@@ -100,11 +116,14 @@ Pass	background-attachment
 Pass	background-blend-mode
 Pass	background-clip
 Pass	background-color
+Pass	background-image
 Pass	background-origin
 Pass	background-position-x
 Pass	background-position-y
 Pass	background-repeat
 Pass	background-size
+Pass	baseline-shift
+Pass	baseline-source
 Fail	block-size
 Pass	border-block-end-color
 Pass	border-block-end-style
@@ -122,6 +141,7 @@ Pass	border-end-start-radius
 Pass	border-image-outset
 Pass	border-image-repeat
 Pass	border-image-slice
+Pass	border-image-source
 Pass	border-image-width
 Pass	border-inline-end-color
 Pass	border-inline-end-style
@@ -233,6 +253,11 @@ Pass	min-width
 Pass	mix-blend-mode
 Pass	object-fit
 Pass	object-position
+Pass	offset-anchor
+Pass	offset-distance
+Pass	offset-path
+Pass	offset-position
+Pass	offset-rotate
 Pass	opacity
 Pass	order
 Pass	outline-color
@@ -247,6 +272,10 @@ Pass	overflow-clip-margin-top
 Pass	overflow-inline
 Pass	overflow-x
 Pass	overflow-y
+Pass	overscroll-behavior-block
+Pass	overscroll-behavior-inline
+Pass	overscroll-behavior-x
+Pass	overscroll-behavior-y
 Pass	padding-block-end
 Pass	padding-block-start
 Pass	padding-bottom
@@ -328,3 +357,4 @@ Pass	will-change
 Pass	x
 Pass	y
 Pass	z-index
+Pass	zoom

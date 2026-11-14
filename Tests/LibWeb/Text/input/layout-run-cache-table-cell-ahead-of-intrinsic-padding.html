@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <script src="include.js"></script>
-<script src="layout-test.js"></script>
+<script src="work-test.js"></script>
 <style>
     body { margin: 0; }
     table { border-spacing: 0; width: 200px; }
@@ -56,11 +56,17 @@
                     layout FULL
                       @viewport/block RUN (cache=bypass)
                         BlockContainer<HTML>/block RUN (cache=miss)
+                          BlockContainer<TD>#text-cell MEASURE min-content inline (cache=hit)
+                          BlockContainer<TD>#markup-cell MEASURE min-content inline (cache=hit)
                           TableWrapper(anonymous)/block RUN (cache=miss)
                             Box<TABLE>#table/table RUN (cache=miss)
-                              BlockContainer<TD>#text-cell/block RUN AHEAD OF INTRINSIC BLOCK PADDING
-                              BlockContainer<TD>#markup-cell/block (measurement) RUN (cache=bypass)
-                              BlockContainer<TD>#text-cell/block REPLAY FRAGMENTS
+                              BlockContainer<TD>#text-cell MEASURE min-content inline (cache=hit)
+                              BlockContainer<TD>#text-cell MEASURE max-content block (cache=hit)
+                              BlockContainer<TD>#text-cell MEASURE max-content block (cache=hit)
+                              BlockContainer<TD>#markup-cell MEASURE min-content inline (cache=hit)
+                              BlockContainer<TD>#markup-cell MEASURE max-content block (cache=hit)
+                              BlockContainer<TD>#markup-cell MEASURE max-content block (cache=hit)
+                              BlockContainer<TD>#text-cell/block RUN (cache=miss)
                               BlockContainer<TD>#markup-cell/block RUN (cache=miss)
                 `,
                 check: equal => {
@@ -78,13 +84,19 @@
                     layout FULL
                       @viewport/block RUN (cache=bypass)
                         BlockContainer<HTML>/block RUN (cache=miss)
-                          BlockContainer<TD>#markup-cell/block (measurement, intrinsic) RUN (cache=bypass)
+                          BlockContainer<TD>#text-cell MEASURE min-content inline (cache=hit)
+                          BlockContainer<TD>#markup-cell MEASURE min-content inline (cache=miss) FROM ITEMS
                           TableWrapper(anonymous)/block RUN (cache=miss)
                             Box<TABLE>#table/table RUN (cache=miss)
-                              BlockContainer<TD>#markup-cell/block (measurement, intrinsic) RUN (cache=bypass)
-                              BlockContainer<TD>#markup-cell/block (measurement, intrinsic) RUN (cache=bypass)
-                              BlockContainer<TD>#markup-cell/block (measurement) RUN (cache=bypass)
-                              BlockContainer<TD>#text-cell/block REUSE SUBTREE
+                              BlockContainer<TD>#text-cell MEASURE min-content inline (cache=hit)
+                              BlockContainer<TD>#text-cell MEASURE max-content block (cache=hit)
+                              BlockContainer<TD>#text-cell MEASURE max-content block (cache=hit)
+                              BlockContainer<TD>#markup-cell MEASURE min-content inline (cache=hit)
+                              BlockContainer<TD>#markup-cell MEASURE max-content block (cache=miss)
+                                BlockContainer<TD>#markup-cell/block RUN (cache=miss)
+                              BlockContainer<TD>#markup-cell MEASURE max-content block (cache=miss)
+                                BlockContainer<TD>#markup-cell/block RUN (cache=miss)
+                              BlockContainer<TD>#text-cell/block REPLAY FRAGMENTS
                               BlockContainer<TD>#markup-cell/block RUN (cache=miss)
                 `,
                 check: equal => {
@@ -102,17 +114,21 @@
                     layout FULL
                       @viewport/block RUN (cache=bypass)
                         BlockContainer<HTML>/block RUN (cache=miss)
-                          BlockContainer<TD>#text-cell/block (measurement, intrinsic) RUN (cache=bypass)
-                          BlockContainer<TD>#markup-cell/block (measurement, intrinsic) RUN (cache=bypass)
+                          BlockContainer<TD>#text-cell MEASURE min-content inline (cache=miss) FROM ITEMS
+                          BlockContainer<TD>#markup-cell MEASURE min-content inline (cache=miss) FROM ITEMS
                           TableWrapper(anonymous)/block RUN (cache=miss)
                             Box<TABLE>#table/table RUN (cache=miss)
-                              BlockContainer<TD>#text-cell/block (measurement, intrinsic) RUN (cache=bypass)
-                              BlockContainer<TD>#text-cell/block (measurement, intrinsic) RUN (cache=bypass)
-                              BlockContainer<TD>#markup-cell/block (measurement, intrinsic) RUN (cache=bypass)
-                              BlockContainer<TD>#markup-cell/block (measurement, intrinsic) RUN (cache=bypass)
-                              BlockContainer<TD>#text-cell/block RUN AHEAD OF INTRINSIC BLOCK PADDING
-                              BlockContainer<TD>#markup-cell/block (measurement) RUN (cache=bypass)
-                              BlockContainer<TD>#text-cell/block REPLAY FRAGMENTS
+                              BlockContainer<TD>#text-cell MEASURE min-content inline (cache=hit)
+                              BlockContainer<TD>#text-cell MEASURE max-content block (cache=miss)
+                                BlockContainer<TD>#text-cell/block RUN (cache=miss)
+                              BlockContainer<TD>#text-cell MEASURE max-content block (cache=miss)
+                                BlockContainer<TD>#text-cell/block RUN (cache=miss)
+                              BlockContainer<TD>#markup-cell MEASURE min-content inline (cache=hit)
+                              BlockContainer<TD>#markup-cell MEASURE max-content block (cache=miss)
+                                BlockContainer<TD>#markup-cell/block RUN (cache=miss)
+                              BlockContainer<TD>#markup-cell MEASURE max-content block (cache=miss)
+                                BlockContainer<TD>#markup-cell/block RUN (cache=miss)
+                              BlockContainer<TD>#text-cell/block RUN (cache=miss)
                               BlockContainer<TD>#markup-cell/block RUN (cache=miss)
                 `,
                 check: equal => { checkPlacement(equal, 1); },

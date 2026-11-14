@@ -4,6 +4,7 @@ import argparse
 import base64
 import hashlib
 import http.server
+import ipaddress
 import itertools
 import json
 import logging
@@ -16,6 +17,8 @@ import threading
 import time
 import urllib.parse
 
+from collections import defaultdict
+from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any
 from typing import Callable
@@ -30,11 +33,23 @@ Description:
 
 Endpoints:
     - POST /echo <json body>, Creates an echo response for later use. See "Echo" class below for body properties.
+    - Echo responses accept chunks=<byte-counts> and chunk_unblock_tokens=<tokens> query parameters.
+    - Echo responses accept request_body_read_size=<bytes> and request_body_read_delay_ms=<ms> query parameters,
+      which read the request's body that many bytes at a time, waiting that long before each read.
+      Each named token holds the response after the corresponding chunk until GET /unblock/<token>.
+    - An echo response's body may contain $BODY, which the server replaces with the request's body.
+    - An echo answers a Range request with the requested part of its body, unless it was created with
+      "ignore_range": true. Then it sends the entire body, as a server that doesn't support ranges does.
     - GET <any path> with an "Upgrade: websocket" header: Performs a WebSocket handshake and then echoes
       every text/binary frame back to the client verbatim. With a "send-binary=<size>" query parameter, the
       server first sends a binary frame of that many bytes: a 1, zeros, and then a 2.
     - GET /reflect-websocket-cookie with an "Upgrade: websocket" header: As above, but first sends the
       handshake's Cookie header (or an empty string) as a text frame.
+    - GET /recorded-request-count/<echo path>: Responds with the number of requests the server has seen at <echo path>,
+      with any query ignored.
+    - GET /downloads/<name>: Reports the browser's download of <name> into the --downloads-directory: 404 while
+      there is none, 202 while it is in progress, and the downloaded file once it has finished. A <name> longer
+      than 188 bytes in UTF-8 gets a 400.
 """
 
 
@@ -49,6 +64,7 @@ class Echo:
     reason_phrase: Optional[str]
     reflect_headers_in_body: bool
     close_connection: bool
+    ignore_range: bool
     wait_for_unblock: Optional[str]
 
     def __eq__(self, other):
@@ -66,6 +82,7 @@ class Echo:
             and self.reason_phrase == other.reason_phrase
             and self.reflect_headers_in_body == other.reflect_headers_in_body
             and self.close_connection == other.close_connection
+            and self.ignore_range == other.ignore_range
             and self.wait_for_unblock == other.wait_for_unblock
         )
 
@@ -76,11 +93,54 @@ echo_store: Dict[str, Echo] = {}
 # Headers from the most recent request at each echo path, queryable via GET /recorded-request-headers<echo-path>.
 recorded_request_headers: Dict[str, Dict[str, list]] = {}
 
+# Number of requests seen at each echo path, query excluded, queryable via GET /recorded-request-count<echo-path>.
+recorded_request_counts: Dict[str, int] = {}
+recorded_request_counts_lock = threading.Lock()
+
 # Named events used by tests that need deterministic delayed responses.
 unblock_events: Dict[str, threading.Event] = {}
+stalled_tls_port = 0
+stalled_tls_connection_count = 0
 
 # Per RFC 6455: appended to Sec-WebSocket-Key before hashing to compute the Sec-WebSocket-Accept value.
 WEBSOCKET_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def websocket_handshake_response(key):
+    accept = base64.b64encode(hashlib.sha1((key + WEBSOCKET_ACCEPT_GUID).encode("utf-8")).digest()).decode("ascii")
+    return (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n"
+        "\r\n"
+    ).encode("ascii")
+
+
+# The browser saves a download as <name>.<id>.<uuid>.download until it finishes. That suffix takes at most 67 of the
+# 255 bytes a filename may have, so a name of up to 188 bytes is never cut short.
+MAXIMUM_REPORTED_DOWNLOAD_NAME_LENGTH = 188
+
+
+def name_of_download_in_progress(filename: str) -> Optional[str]:
+    if not filename.endswith(".download"):
+        return None
+    parts = filename[: -len(".download")].rsplit(".", 2)
+    if len(parts) != 3:
+        return None
+    name, download_id, uuid = parts
+    if not (download_id.isascii() and download_id.isdigit()) or len(uuid) != 36:
+        return None
+    return name
+
+
+def test_web_host_for(hostname):
+    # A test's subdomains and its -alt host belong to the test-web-*.localhost or test-web-*.test host of the test.
+    rest, _, top_level_domain = hostname.rpartition(".")
+    host = rest.rpartition(".")[2].removesuffix("-alt")
+    if top_level_domain not in ("localhost", "test") or not host.startswith("test-web-"):
+        return None
+    return f"{host}.{top_level_domain}"
 
 
 class WPTContext:
@@ -102,6 +162,7 @@ class WPTContext:
         localpaths.repo_root = os.path.abspath(wpt_directory)
 
         from wptserve.config import ConfigBuilder
+        from wptserve.handlers import AsIsHandler
         from wptserve.handlers import FileHandler
         from wptserve.handlers import python_script_handler
         from wptserve.request import Request
@@ -111,18 +172,44 @@ class WPTContext:
         from wptserve.stash import start_server as start_stash_server
         from wptserve.utils import HTTPException
 
-        self.config_builder_class = ConfigBuilder
+        class TestWebConfigBuilder(ConfigBuilder):
+            # Our own servers serve HTTPS, not wptserve's, so keep the HTTPS ports that wptserve drops when its own TLS
+            # support is not configured.
+            def _get_ports(self, data):
+                return defaultdict(list, {scheme: list(ports) for scheme, ports in data["ports"].items()})
+
+        self.config_builder_class = TestWebConfigBuilder
         self.server_class = Server
 
         self.request_class = Request
         self.response_class = Response
         self.file_handler_class = FileHandler
+        self.as_is_handler_class = AsIsHandler
         self.python_script_handler = python_script_handler
         self.http_exception = HTTPException
         self.stash_class = Stash
         self.stash_manager, self.stash_address, self.stash_authkey = start_stash_server()
 
-    def configure_server(self, port):
+    def create_file_handler(self, base_path, url_base="/"):
+        file_handler = self.file_handler_class(base_path=base_path, url_base=url_base)
+        as_is_handler = self.as_is_handler_class(base_path=base_path, url_base=url_base)
+
+        def handler(request, response):
+            # Like upstream wptserve, send .asis files without generating any response headers.
+            if request.url_parts.path.endswith(".asis"):
+                return as_is_handler(request, response)
+            return file_handler(request, response)
+
+        return handler
+
+    def configure_server(self, http_ports, https_ports):
+        # The HTTP(S) servers also accept WebSocket connections.
+        self.ports = {"http": http_ports, "https": https_ports, "ws": http_ports[:1], "wss": https_ports}
+        self.configs_by_host = {}
+        self.configs_by_host_lock = threading.Lock()
+        cast(Any, self.server_class).config = self._build_config("web-platform.localhost")
+
+    def _build_config(self, browser_host, alternate_host="not-localhost.localhost"):
         def make_subdomains_product(subdomains, depth=2):
             return {
                 ".".join(labels)
@@ -135,14 +222,37 @@ class WPTContext:
         logger = logging.getLogger("test-web-wptserve")
         with self.config_builder_class(
             logger,
-            browser_host="web-platform.localhost",
-            alternate_hosts={"alt": "not-localhost.localhost"},
-            ports={"http": [port]},
+            browser_host=browser_host,
+            alternate_hosts={"alt": alternate_host},
+            ports=self.ports,
             subdomains=subdomains,
             not_subdomains=not_subdomains,
             check_subdomains=False,
         ) as config:
-            cast(Any, self.server_class).config = config
+            return config
+
+    def apply_config_for_request(self, request):
+        # test-web uses unique test-web-*.localhost hosts, or test-web-*.test for insecure-origin tests.
+        # Substitutions like {{host}} and {{domains[www1]}} must name that test host and its subdomains.
+        hostname = request.url_parts.hostname or ""
+        test_host = test_web_host_for(hostname)
+        if not test_host:
+            return
+
+        is_https = request.url_parts.scheme == "https"
+        key = (test_host, is_https)
+        with self.configs_by_host_lock:
+            config = self.configs_by_host.get(key)
+            if config is None:
+                # Each test has its own host, so only keep the configs of the most recent ones.
+                if len(self.configs_by_host) >= 64:
+                    self.configs_by_host.pop(next(iter(self.configs_by_host)))
+                if is_https:
+                    config = self._build_config(test_host, test_host.removesuffix(".localhost") + "-alt.localhost")
+                else:
+                    config = self._build_config(test_host)
+                self.configs_by_host[key] = config
+        request.server.config = config
 
     def close(self):
         self.stash_manager.shutdown()
@@ -158,9 +268,27 @@ class TestHTTPServer(socketserver.ThreadingTCPServer):
     static_file_handler: Callable[[Any, Any], Any]
 
 
+class TestHTTPServerIPv6(TestHTTPServer):
+    address_family = socket.AF_INET6
+
+
+class TestHTTPSServer(TestHTTPServer):
+    ssl_context: ssl.SSLContext
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        # Leave the handshake to the first read, which happens on the request's own thread.
+        return self.ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+
+
+class TestHTTPSServerIPv6(TestHTTPSServer):
+    address_family = socket.AF_INET6
+
+
 class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     static_directory: str
     wpt_directory: str
+    downloads_directory: Optional[str] = None
     aia_artifacts: dict
     aia_config: Optional[dict]
 
@@ -224,6 +352,7 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def _create_wpt_request_response(self):
         server = self._test_server()
         request = server.wpt.request_class(self)
+        server.wpt.apply_config_for_request(request)
         request.server._stash = server.wpt.stash_class(
             request.url_parts.path,
             server.wpt.stash_address,
@@ -275,6 +404,18 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_stalled_tls_config(self):
+        # Lets the test page discover a port that accepts connections and never answers a TLS handshake, and how many
+        # connections it has accepted so far.
+        body = json.dumps({"port": stalled_tls_port, "connections": stalled_tls_connection_count}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _serve_aia_config(self):
         # Lets the test page discover the per-scenario HTTPS ports (each an OS-assigned port).
         config = getattr(TestHTTPRequestHandler, "aia_config", None)
@@ -299,12 +440,18 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_echo()
         elif request_path.startswith("/recorded-request-headers/"):
             self._serve_recorded_request_headers()
+        elif request_path.startswith("/recorded-request-count/"):
+            self._serve_recorded_request_count()
+        elif request_path.startswith("/downloads/"):
+            self._serve_download()
         elif request_path.endswith(".py"):
             self._serve_wpt_python_script()
         elif request_path.startswith("/aia/"):
             self._serve_aia_artifact(request_path)
         elif request_path == "/aia-test/config":
             self._serve_aia_config()
+        elif request_path == "/stalled-tls/config":
+            self._serve_stalled_tls_config()
         else:
             self._serve_static_request()
 
@@ -348,6 +495,12 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_DELETE(self):
         self.do_other()
 
+    def do_PROPFIND(self):
+        self.do_other()
+
+    def do_REPORT(self):
+        self.do_other()
+
     def do_SAFE(self):
         self.do_other()
 
@@ -371,6 +524,7 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         echo.reason_phrase = data.get("reason_phrase", None)
         echo.reflect_headers_in_body = data.get("reflect_headers_in_body", False)
         echo.close_connection = data.get("close_connection", False)
+        echo.ignore_range = data.get("ignore_range", False)
         echo.wait_for_unblock = data.get("wait_for_unblock", None)
 
         is_invalid_echo_path = echo.path is None or not echo.path.startswith("/echo/")
@@ -443,6 +597,37 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(headers).encode("utf-8"))
 
+    def _serve_recorded_request_count(self):
+        echo_path = self.path.partition("?")[0][len("/recorded-request-count") :]
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(recorded_request_counts.get(echo_path, 0)).encode("utf-8"))
+
+    def _serve_download(self):
+        name = urllib.parse.unquote(self.path.partition("?")[0][len("/downloads/") :])
+        directory = TestHTTPRequestHandler.downloads_directory
+        body = b""
+        status = 404
+        if len(name.encode("utf-8")) > MAXIMUM_REPORTED_DOWNLOAD_NAME_LENGTH:
+            status = 400
+        elif directory is not None and name not in ("", ".", "..") and os.path.basename(name) == name:
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                with open(path, "rb") as file:
+                    body = file.read()
+                status = 200
+            elif any(name_of_download_in_progress(entry) == name for entry in os.listdir(directory)):
+                status = 202
+
+        self.send_response(status)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def handle_echo(self):
         method = self.command.upper()
         parsed_url = urllib.parse.urlparse(self.path)
@@ -455,9 +640,28 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         for header, value in self.headers.items():
             headers_for_path.setdefault(header, []).append(value)
         recorded_request_headers[self.path] = headers_for_path
+        with recorded_request_counts_lock:
+            recorded_request_counts[parsed_url.path] = recorded_request_counts.get(parsed_url.path, 0) + 1
 
         if parsed_url.path != self.path:
             recorded_request_headers[parsed_url.path] = recorded_request_headers[self.path]
+
+        # The request's body is read before responding, so closing the connection does not reset it.
+        content_length = int(self.headers.get("Content-Length", 0))
+        request_body = bytearray()
+        if content_length:
+            read_size = int(query.get("request_body_read_size", [content_length])[0])
+            read_delay_ms = int(query.get("request_body_read_delay_ms", [0])[0])
+            remaining = content_length
+            while remaining > 0:
+                if read_delay_ms:
+                    time.sleep(read_delay_ms / 1000)
+                data = self.rfile.read(min(read_size, remaining))
+                # The client closed the connection before sending the whole body.
+                if not data:
+                    break
+                request_body += data
+                remaining -= len(data)
 
         is_revalidation_request = "If-Modified-Since" in self.headers
         send_not_modified = is_revalidation_request and "X-Ladybird-Respond-With-Not-Modified" in self.headers
@@ -526,10 +730,11 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             response_body = echo.body.replace("$HEADERS", headers) if echo.body else headers
         else:
             response_body = echo.body or ""
+        response_body = response_body.replace("$BODY", request_body.decode("utf-8", "replace"))
 
         # FIXME: This only supports "Range: bytes=start-end" and "Range: bytes=start-". There are other formats to
         #        support if needed: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Range#syntax
-        if "Range" in self.headers:
+        if "Range" in self.headers and not echo.ignore_range:
             range_value = self.headers["Range"].strip()
             assert range_value.startswith("bytes=")
             assert range_value.count("-") == 1
@@ -552,10 +757,14 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if chunks:
             chunk_sizes = [int(chunk_size) for chunk_size in chunks[0].split(",") if chunk_size]
             offset = 0
-            for chunk_size in chunk_sizes:
+            chunk_unblock_tokens = query.get("chunk_unblock_tokens", [""])[0].split(",")
+            for chunk_index, chunk_size in enumerate(chunk_sizes):
                 self.wfile.write(response_body_bytes[offset : offset + chunk_size])
                 self.wfile.flush()
                 offset += chunk_size
+                if chunk_index < len(chunk_unblock_tokens) and chunk_unblock_tokens[chunk_index]:
+                    token = chunk_unblock_tokens[chunk_index]
+                    unblock_events.setdefault(token, threading.Event()).wait()
                 if chunk_delay_ms > 0:
                     time.sleep(chunk_delay_ms / 1000)
             if offset < len(response_body_bytes):
@@ -585,17 +794,9 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(400, "Missing Sec-WebSocket-Key")
             return
 
-        accept = base64.b64encode(hashlib.sha1((key + WEBSOCKET_ACCEPT_GUID).encode("utf-8")).digest()).decode("ascii")
-        handshake = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept}\r\n"
-            "\r\n"
-        )
         # We now own the raw socket; stop the HTTP handler from parsing another request on it.
         self.close_connection = True
-        self.connection.sendall(handshake.encode("ascii"))
+        self.connection.sendall(websocket_handshake_response(key))
 
         if self.path == "/reflect-websocket-cookie":
             self._send_websocket_frame(self.headers.get("Cookie", "").encode("utf-8"))
@@ -692,6 +893,12 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 class AIALeafHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            # Accept the handshake and hang up, so a test can tell whether a wss:// connection got past TLS.
+            self.wfile.write(websocket_handshake_response(self.headers.get("Sec-WebSocket-Key", "")))
+            self.close_connection = True
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", "2")
@@ -719,24 +926,20 @@ class AIATLSServer(socketserver.ThreadingTCPServer):
             raise
 
 
-def _setup_aia_test_servers(http_port, ca_cert_output):
-    try:
-        from cryptography import x509  # type: ignore[import-not-found]
-        from cryptography.hazmat.primitives import hashes  # type: ignore[import-not-found]
-        from cryptography.hazmat.primitives.asymmetric import ec  # type: ignore[import-not-found]
-        from cryptography.hazmat.primitives.serialization import Encoding  # type: ignore[import-not-found]
-        from cryptography.hazmat.primitives.serialization import NoEncryption  # type: ignore[import-not-found]
-        from cryptography.hazmat.primitives.serialization import PrivateFormat  # type: ignore[import-not-found]
-        from cryptography.hazmat.primitives.serialization import pkcs7  # type: ignore[import-not-found]
-        from cryptography.x509.oid import AuthorityInformationAccessOID  # type: ignore[import-not-found]
-        from cryptography.x509.oid import ExtendedKeyUsageOID  # type: ignore[import-not-found]
-        from cryptography.x509.oid import NameOID  # type: ignore[import-not-found]
-    except ImportError as error:
-        logging.warning("AIA test setup skipped: python 'cryptography' unavailable (%s)", error)
-        return
-
+def _setup_tls_test_servers(http_port, ca_cert_output):
     import datetime
     import tempfile
+
+    from cryptography import x509  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives import hashes  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.asymmetric import ec  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.serialization import Encoding  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.serialization import NoEncryption  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.serialization import PrivateFormat  # type: ignore[import-not-found]
+    from cryptography.hazmat.primitives.serialization import pkcs7  # type: ignore[import-not-found]
+    from cryptography.x509.oid import AuthorityInformationAccessOID  # type: ignore[import-not-found]
+    from cryptography.x509.oid import ExtendedKeyUsageOID  # type: ignore[import-not-found]
+    from cryptography.x509.oid import NameOID  # type: ignore[import-not-found]
 
     def new_key():
         return ec.generate_private_key(ec.SECP256R1())
@@ -867,14 +1070,66 @@ def _setup_aia_test_servers(http_port, ca_cert_output):
     )
     scenarios["untrusted"] = (untrusted_leaf, untrusted_leaf_key)
 
+    # Leaves issued by the root itself, naming localhost either only in the Common Name or also in a subjectAltName.
+    def add_root_issued_scenario(name, subject_alt_names):
+        leaf_key = new_key()
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(dn("localhost"))
+            .issuer_name(root.subject)
+            .public_key(leaf_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        )
+        if subject_alt_names:
+            builder = builder.add_extension(x509.SubjectAlternativeName(subject_alt_names), critical=False)
+        scenarios[name] = (builder.sign(root_key, hashes.SHA256()), leaf_key)
+
+    add_root_issued_scenario("common_name_only", [])
+    add_root_issued_scenario("subject_alt_name", [x509.DNSName("localhost")])
+
     TestHTTPRequestHandler.aia_artifacts = artifacts
 
     # Write the root CA so RequestServer (via --certificate/CAINFO) trusts the completed chains.
     with open(ca_cert_output, "wb") as ca_file:
         ca_file.write(root.public_bytes(Encoding.PEM))
 
+    # WPT tests reach HTTPS origins on localhost and 127.0.0.1, and cross-origin ones on the alternate host and its
+    # subdomains ({{hosts[alt][]}} and {{hosts[alt][www]}}), so the WPT HTTPS server presents a leaf for all of them,
+    # issued by the root itself.
+    wpt_leaf_key = new_key()
+
+    def make_wpt_leaf(names):
+        return (
+            x509.CertificateBuilder()
+            .subject_name(dn("localhost"))
+            .issuer_name(root.subject)
+            .public_key(wpt_leaf_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+            .add_extension(x509.SubjectAlternativeName(names), critical=False)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .sign(root_key, hashes.SHA256())
+        )
+
+    wpt_leaf = make_wpt_leaf(
+        [
+            x509.DNSName("localhost"),
+            # NB: curl ignores a wildcard with fewer than two dots, so the alternate host is named outright.
+            x509.DNSName("not-localhost.localhost"),
+            x509.DNSName("*.not-localhost.localhost"),
+            x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+            x509.IPAddress(ipaddress.ip_address("::1")),
+        ]
+    )
+    scenarios["wpt"] = (wpt_leaf, wpt_leaf_key)
+
     scratch = tempfile.mkdtemp(prefix="ladybird-aia-")
     config = {}
+    wpt_ssl_context = None
     for name, (leaf, leaf_key) in scenarios.items():
         # The cert file holds *only* the leaf — so, each HTTPS host presents a broken chain (the intermediate is omitted
         # and must be fetched via AIA).
@@ -886,47 +1141,118 @@ def _setup_aia_test_servers(http_port, ca_cert_output):
             f.write(leaf_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()))
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        if name == "wpt":
+            wpt_ssl_context = context
+            continue
         server = AIATLSServer(("127.0.0.1", 0), AIALeafHandler, context)
         config[name] = server.socket.getsockname()[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
+    # Tests reach HTTPS origins on unique *.localhost hosts, which no wildcard can cover, so each host gets a leaf.
+    @lru_cache(maxsize=128)
+    def context_for_host(host):
+        leaf = make_wpt_leaf([x509.DNSName(host)])
+        with tempfile.TemporaryDirectory(dir=scratch) as certificate_directory:
+            certificate_path = os.path.join(certificate_directory, "leaf.pem")
+            with open(certificate_path, "wb") as certificate:
+                certificate.write(leaf.public_bytes(Encoding.PEM))
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=certificate_path, keyfile=os.path.join(scratch, "wpt.key"))
+        return context
+
+    def use_host_certificate(socket, server_name, _context):
+        if server_name and server_name.endswith(".localhost"):
+            socket.context = context_for_host(server_name)
+
+    assert wpt_ssl_context is not None
+    wpt_ssl_context.sni_callback = use_host_certificate
+
     TestHTTPRequestHandler.aia_config = config
     logging.info("AIA test servers ready: %s (root CA at %s)", config, ca_cert_output)
+    return wpt_ssl_context
 
 
-def start_server(port, static_directory, ca_cert_output=None):
+def start_mirror_server(server, server_class, address, ssl_context=None):
+    mirror = server_class(address, TestHTTPRequestHandler)
+    mirror.daemon_threads = True
+    mirror.scheme = server.scheme
+    if ssl_context:
+        mirror.ssl_context = ssl_context
+        mirror.scheme = "https"
+    mirror.router = server.router
+    mirror.wpt = server.wpt
+    mirror.wpt_file_handler = server.wpt_file_handler
+    mirror.static_file_handler = server.static_file_handler
+    threading.Thread(target=mirror.serve_forever, daemon=True).start()
+    return mirror
+
+
+def start_server(port, static_directory, ca_cert_output=None, exit_when_stdin_closes=False, downloads_directory=None):
     TestHTTPRequestHandler.static_directory = os.path.abspath(static_directory)
     TestHTTPRequestHandler.wpt_directory = os.path.join(
         TestHTTPRequestHandler.static_directory, "Text", "input", "wpt-import"
     )
+    TestHTTPRequestHandler.downloads_directory = downloads_directory
     httpd = TestHTTPServer(("127.0.0.1", port), TestHTTPRequestHandler)
     httpd.daemon_threads = True
     httpd.scheme = "http"
     httpd.router = SimpleNamespace(doc_root=TestHTTPRequestHandler.wpt_directory)
     httpd.wpt = WPTContext(TestHTTPRequestHandler.wpt_directory)
-    httpd.wpt.configure_server(httpd.socket.getsockname()[1])
-    httpd.wpt_file_handler = httpd.wpt.file_handler_class(base_path=TestHTTPRequestHandler.wpt_directory)
-    httpd.static_file_handler = httpd.wpt.file_handler_class(
+    httpd.wpt_file_handler = httpd.wpt.create_file_handler(base_path=TestHTTPRequestHandler.wpt_directory)
+    httpd.static_file_handler = httpd.wpt.create_file_handler(
         base_path=TestHTTPRequestHandler.static_directory,
         url_base="/static/",
     )
 
+    # WPT tests reach a second HTTP origin through {{ports[http][1]}}, so serve the same content on another port.
+    alternate_httpd = start_mirror_server(httpd, TestHTTPServer, ("127.0.0.1", 0))
+
+    https_httpd = None
     if ca_cert_output:
-        # Setup below can fail or be skipped (no 'cryptography'), and it is the only writer of this fixed path. A PEM
-        # left by an earlier run would then still be trusted, with a root key matching none of the servers now
-        # running - surfacing as a confusing TLS failure rather than the setup error it is.
-        try:
-            os.remove(ca_cert_output)
-        except FileNotFoundError:
-            pass
+        # Avoid trusting a stale CA if setup fails. Preserve the inode granted by the sandbox.
+        open(ca_cert_output, "wb").close()
 
         try:
-            _setup_aia_test_servers(httpd.socket.getsockname()[1], ca_cert_output)
+            wpt_ssl_context = _setup_tls_test_servers(httpd.socket.getsockname()[1], ca_cert_output)
+            if wpt_ssl_context:
+                # WPT tests reach HTTPS origins through {{ports[https][0]}}, so serve the same content over TLS too.
+                https_httpd = start_mirror_server(httpd, TestHTTPSServer, ("127.0.0.1", 0), wpt_ssl_context)
         except Exception as error:
-            logging.exception("AIA test setup failed: %s", error)
+            logging.exception("TLS test setup failed: %s", error)
 
-    print(httpd.socket.getsockname()[1])
+    # A localhost name resolves to ::1 first, which Windows is slow to refuse, so serve there too.
+    ipv6_servers = []
+    for server in (httpd, alternate_httpd):
+        try:
+            ipv6_servers.append(start_mirror_server(server, TestHTTPServerIPv6, ("::1", server.server_address[1])))
+        except OSError as error:
+            logging.warning("Not serving on ::1: %s", error)
+    if https_httpd:
+        try:
+            ipv6_servers.append(
+                start_mirror_server(
+                    https_httpd, TestHTTPSServerIPv6, ("::1", https_httpd.server_address[1]), https_httpd.ssl_context
+                )
+            )
+        except OSError as error:
+            logging.warning("Not serving HTTPS on ::1: %s", error)
+
+    https_ports = [https_httpd.socket.getsockname()[1]] if https_httpd else []
+    httpd.wpt.configure_server([httpd.socket.getsockname()[1], alternate_httpd.socket.getsockname()[1]], https_ports)
+
+    start_stalled_tls_listener()
+
+    # The first line holds the HTTP port, followed by the HTTPS port if there is one.
+    print(" ".join(str(port) for port in [httpd.socket.getsockname()[1], *https_ports]))
     sys.stdout.flush()
+
+    if exit_when_stdin_closes:
+
+        def shut_down_when_stdin_closes():
+            sys.stdin.buffer.read()
+            httpd.shutdown()
+
+        threading.Thread(target=shut_down_when_stdin_closes, daemon=True).start()
 
     try:
         httpd.serve_forever()
@@ -934,7 +1260,37 @@ def start_server(port, static_directory, ca_cert_output=None):
         pass
     finally:
         httpd.wpt.close()
+        for server in ipv6_servers:
+            server.server_close()
+        alternate_httpd.server_close()
+        if https_httpd:
+            https_httpd.server_close()
         httpd.server_close()
+
+
+def start_stalled_tls_listener():
+    global stalled_tls_port
+
+    listener = socket.create_server(("127.0.0.1", 0))
+    stalled_tls_port = listener.getsockname()[1]
+
+    def hold_until_closed(connection):
+        with connection:
+            try:
+                while connection.recv(4096):
+                    pass
+            except OSError:
+                pass
+
+    def accept_connections():
+        global stalled_tls_connection_count
+
+        while True:
+            connection = listener.accept()[0]
+            stalled_tls_connection_count += 1
+            threading.Thread(target=hold_until_closed, args=(connection,), daemon=True).start()
+
+    threading.Thread(target=accept_connections, daemon=True).start()
 
 
 if __name__ == "__main__":
@@ -954,11 +1310,28 @@ if __name__ == "__main__":
         help="Port to run the server on",
     )
     parser.add_argument(
+        "--exit-when-stdin-closes",
+        action="store_true",
+        help="Shut down once stdin reaches end-of-file, as when the process that started the server closes it or exits",
+    )
+    parser.add_argument(
         "--ca-cert-output",
         type=str,
         default=None,
         help="Path to write the AIA test root CA (PEM) to; enables the AIA broken-chain HTTPS servers",
     )
+    parser.add_argument(
+        "--downloads-directory",
+        type=str,
+        default=None,
+        help="Directory the browser saves downloads to, as reported by GET /downloads/<name>",
+    )
     args = parser.parse_args()
 
-    start_server(port=args.port, static_directory=args.directory, ca_cert_output=args.ca_cert_output)
+    start_server(
+        port=args.port,
+        static_directory=args.directory,
+        ca_cert_output=args.ca_cert_output,
+        exit_when_stdin_closes=args.exit_when_stdin_closes,
+        downloads_directory=args.downloads_directory,
+    )

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="../include.js"></script>
+<script src="../work-test.js"></script>
 <style>
     .underline { text-decoration-line: underline; }
     .overline { text-decoration-line: overline; }
@@ -7,24 +8,19 @@
 </style>
 <script>
     test(() => {
-        internals.updateStyle();
-        // Spans under differently decorated parents share one style, whether C++'s style sharing or
-        // the style engine's first-record cache provides it.
-        const sharedComputations = () => internals.getStyleInvalidationCounters().elementStyleSharedComputations
-            + (internals.styleEngineCounters().engineComputedRecordSharedHits ?? 0)
-            + (internals.styleEngineCounters().engineComputedRecordCohortHits ?? 0);
-        const before = sharedComputations();
-        for (const decoration of ["underline", "overline", "line-through"]) {
-            const parent = document.createElement("div");
-            parent.className = decoration;
-            parent.append(document.createElement("span"));
-            document.body.append(parent);
-        }
-        internals.updateStyle();
-        const after = sharedComputations();
+        const work = styleWork(() => {
+            for (const decoration of ["underline", "overline", "line-through"]) {
+                const parent = document.createElement("div");
+                parent.className = decoration;
+                parent.append(document.createElement("span"));
+                document.body.append(parent);
+            }
+        });
 
         for (const child of document.querySelectorAll("span"))
             println(getComputedStyle(child).textDecorationLine);
-        println(`shared computations: ${after - before}`);
+        // Spans under differently decorated parents have the same style, so all but the first take
+        // the record of another, shared without matching or reused after matching.
+        println(work.text.trimEnd());
     });
 </script>

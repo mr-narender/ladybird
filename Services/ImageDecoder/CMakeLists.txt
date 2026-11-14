@@ -4,6 +4,7 @@ set(CMAKE_AUTOUIC OFF)
 
 set(SOURCES
     ConnectionFromClient.cpp
+    ControlConnection.cpp
 )
 
 if (ANDROID)
@@ -21,9 +22,6 @@ add_executable(ImageDecoder main.cpp)
 
 if (LINUX)
     target_sources(ImageDecoder PRIVATE SandboxLinux.cpp)
-    if (ENABLE_ADDRESS_SANITIZER)
-        target_sources(ImageDecoder PRIVATE LeakSanitizer.cpp)
-    endif()
 elseif (APPLE)
     target_sources(ImageDecoder PRIVATE SandboxMacOS.cpp)
 else()

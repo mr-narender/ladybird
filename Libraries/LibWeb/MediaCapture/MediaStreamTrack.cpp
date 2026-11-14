@@ -5,15 +5,19 @@
  */
 
 #include <AK/ByteString.h>
+#include <LibAudio/RecordStream.h>
+#include <LibAudio/SampleSpecification.h>
 #include <LibGC/Heap.h>
+#include <LibGC/Weak.h>
 #include <LibJS/Runtime/Value.h>
-#include <LibMedia/Audio/RecordStream.h>
-#include <LibMedia/Audio/SampleSpecification.h>
 #include <LibWeb/Crypto/Crypto.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/MediaCapture/MediaDevices.h>
 #include <LibWeb/MediaCapture/MediaStreamTrack.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/WebIDL/Promise.h>
 
 namespace Web::MediaCapture {
@@ -27,19 +31,17 @@ Atomic<u64> MediaStreamTrack::s_next_provider_id { 1 };
 //        negotiate it; until then the track source applies unity gain.
 static constexpr float TRACK_SOURCE_GAIN = 1.0f;
 
-bool AudioFrameFanout::add_sink(NonnullRefPtr<AudioFrameSink> sink)
+void AudioFrameFanout::add_sink(NonnullRefPtr<AudioFrameSink> sink)
 {
     MutexLocker locker(m_mutex);
     m_sinks.append(move(sink));
-    return m_sinks.size() == 1;
 }
 
-bool AudioFrameFanout::remove_sink(AudioFrameSink const& sink)
+void AudioFrameFanout::remove_sink(AudioFrameSink const& sink)
 {
     sink.deactivate();
     MutexLocker locker(m_mutex);
     m_sinks.remove_first_matching([&](auto const& existing) { return existing.ptr() == &sink; });
-    return m_sinks.is_empty();
 }
 
 void AudioFrameFanout::deliver(float const* samples, size_t frame_count, u8 channel_count, u32 sample_rate)
@@ -153,8 +155,7 @@ void MediaStreamTrack::stop()
         return;
 
     // 3. Notify track's source that track is ended.
-    // For device-backed audio tracks this releases the capture stream.
-    // FIXME: Model track sources properly so tracks sharing a source keep it alive.
+    // NB: Every track of a device holds a stream of it, and the process keeps the device's capture open while any does.
     stop_audio_capture();
 
     // 4. Set track's [[ReadyState]] to "ended".
@@ -197,10 +198,23 @@ GC::Ref<MediaStreamTrack> MediaStreamTrack::clone() const
     track_clone->update_audio_silence_state();
     track_clone->m_provider_id = s_next_provider_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed);
 
-    // FIXME: 8. Run source MediaStreamTrack source-specific clone steps with track and trackClone as parameters.
+    // 8. Run source MediaStreamTrack source-specific clone steps with track and trackClone as parameters.
+    // NB: The one source Ladybird captures from is the microphone, whose tracks end when the permission is taken away;
+    //     the clone of such a track ends with it.
+    if (auto media_devices = m_media_devices.ptr()) {
+        media_devices->track_was_cloned({}, track_clone);
+        track_clone->m_media_devices = m_media_devices;
+    }
+    if (track_clone->m_state == MediaStreamTrackState::Live && device_id().has_value())
+        track_clone->start_audio_capture();
 
     // 9. Return trackClone.
     return track_clone;
+}
+
+void MediaStreamTrack::set_media_devices(Badge<MediaDevices>, MediaDevices& media_devices)
+{
+    m_media_devices = media_devices;
 }
 
 bool MediaStreamTrack::is_audio() const
@@ -262,17 +276,12 @@ void MediaStreamTrack::apply_constraints_impl(Optional<MediaTrackConstraints> co
 
 void MediaStreamTrack::add_audio_sink(NonnullRefPtr<AudioFrameSink> sink)
 {
-    auto was_first_sink = m_audio_fanout->add_sink(move(sink));
-
-    // Synthetic tracks have no deviceId and are fed through deliver_audio_frames().
-    if (was_first_sink && is_audio() && m_state == MediaStreamTrackState::Live && device_id().has_value())
-        ensure_audio_capture_started();
+    m_audio_fanout->add_sink(move(sink));
 }
 
 void MediaStreamTrack::remove_audio_sink(AudioFrameSink const& sink)
 {
-    if (m_audio_fanout->remove_sink(sink))
-        stop_audio_capture();
+    m_audio_fanout->remove_sink(sink);
 }
 
 void MediaStreamTrack::deliver_audio_frames(float const* samples, size_t frame_count, u8 channel_count, u32 sample_rate)
@@ -280,28 +289,30 @@ void MediaStreamTrack::deliver_audio_frames(float const* samples, size_t frame_c
     m_audio_fanout->deliver(samples, frame_count, channel_count, sample_rate);
 }
 
-void MediaStreamTrack::ensure_audio_capture_started()
+void MediaStreamTrack::start_audio_capture(GC::Ptr<GC::Function<void(ErrorOr<void>)>> on_started)
 {
     if (m_audio_capture_stream || m_audio_capture_start_pending)
         return;
 
+    // A device-backed track is tied to the mediaDevices that made it, and captures for its window's page. Another realm
+    // can keep the track once that window is gone, as after its iframe is removed, and then it has no page to capture for.
+    auto media_devices = m_media_devices.ptr();
+    if (!media_devices) {
+        if (on_started)
+            on_started->function()(Error::from_errno(EIO));
+        else
+            stop();
+        return;
+    }
+
     m_audio_capture_start_pending = true;
     auto capture_request_id = ++m_audio_capture_request_id;
-
-    // FIXME: Support channel layouts beyond mono and stereo.
-    auto sample_rate = sample_rate_hz() != 0 ? sample_rate_hz() : 48000;
-    auto channel_map = channel_count() == 1 ? Audio::ChannelMap::mono() : Audio::ChannelMap::stereo();
-    Audio::SampleSpecification specification(sample_rate, channel_map);
-
-    // Use 20 ms fragments to balance latency and callback overhead.
-    auto fragment_frames = sample_rate / 50;
-    auto fragment_size_bytes = static_cast<u32>(fragment_frames * channel_map.channel_count() * sizeof(float));
 
     ByteString device_id_string;
     if (auto id = device_id(); id.has_value())
         device_id_string = id->to_byte_string();
 
-    auto stream_promise = Audio::RecordStream::create(specification, fragment_size_bytes, device_id_string,
+    auto stream_promise = media_devices->window().page().client().create_audio_record_stream(device_id_string,
         [fanout = m_audio_fanout](ReadonlyBytes data, Audio::SampleSpecification const& stream_specification) {
             // Runs on the audio backend's capture thread. Only the ref-counted fan-out is
             // captured here: the GC may reap the track while a callback is in flight, so the
@@ -320,20 +331,51 @@ void MediaStreamTrack::ensure_audio_capture_started()
                 return;
             fanout->deliver(reinterpret_cast<float const*>(data.data()), frame_count, channel_count, stream_specification.sample_rate());
         });
-    stream_promise->when_resolved([track = GC::Ref(*this), capture_request_id](NonnullRefPtr<Audio::RecordStream>& stream) {
-        if (track->m_audio_capture_request_id != capture_request_id)
+    // The promise's callbacks don't keep the track alive, so a track nothing else holds can be collected while its
+    // capture start is pending, and then there's nothing left to start.
+    stream_promise->when_resolved([weak_track = GC::Weak<MediaStreamTrack>(*this), capture_request_id, on_started = GC::Root(on_started)](NonnullRefPtr<Audio::RecordStream>& stream) {
+        auto track = weak_track.ptr();
+        if (!track || track->m_audio_capture_request_id != capture_request_id)
             return;
         track->m_audio_capture_start_pending = false;
         if (track->m_state != MediaStreamTrackState::Live)
             return;
         track->m_audio_capture_stream = stream;
+        // The backend behind the stream is gone for good; a fresh stream picks the capture up again.
+        stream->on_capture_lost = [weak_track = GC::Weak<MediaStreamTrack>(*track), capture_request_id] {
+            auto track = weak_track.ptr();
+            if (!track || track->m_audio_capture_request_id != capture_request_id)
+                return;
+            track->m_audio_capture_stream = nullptr;
+            track->start_audio_capture();
+        };
+        stream->on_capture_revoked = [weak_track = GC::Weak<MediaStreamTrack>(*track), capture_request_id] {
+            auto track = weak_track.ptr();
+            if (!track || track->m_audio_capture_request_id != capture_request_id)
+                return;
+            track->audio_source_ended();
+        };
+        if (on_started)
+            on_started->function()({});
     });
-    stream_promise->when_rejected([track = GC::Ref(*this), capture_request_id](Error& error) {
-        if (track->m_audio_capture_request_id != capture_request_id)
+    stream_promise->when_rejected([weak_track = GC::Weak<MediaStreamTrack>(*this), capture_request_id, on_started = GC::Root(on_started)](Error& error) {
+        auto track = weak_track.ptr();
+        if (!track || track->m_audio_capture_request_id != capture_request_id)
             return;
         track->m_audio_capture_start_pending = false;
-        dbgln("MediaStreamTrack: Unable to open a capture stream: {}", error);
+        if (on_started) {
+            on_started->function()(Error::copy(error));
+            return;
+        }
+        // A device the track can't capture from again has permanently ended production of live samples.
+        track->audio_source_ended();
     });
+}
+
+void MediaStreamTrack::audio_source_ended()
+{
+    if (auto media_devices = m_media_devices.ptr())
+        media_devices->track_source_ended({}, *this);
 }
 
 void MediaStreamTrack::stop_audio_capture()

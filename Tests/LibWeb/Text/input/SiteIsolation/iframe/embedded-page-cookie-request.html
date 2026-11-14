@@ -3,14 +3,13 @@
 <script>
     promiseTest(async () => {
         const server = httpTestServer();
-        const runId = crypto.randomUUID();
-        const childUrl = new URL(await server.createEcho("GET", `/embedded-page-cookie-${runId}`, {
+        const childUrl = new URL(await server.createEcho("GET", "/embedded-page-cookie", {
             status: 200,
             headers: { "Content-Type": "text/html" },
             body: `<!doctype html><script>
-                document.cookie = "embedded-page-cookie=allowed";
+                document.cookie = "embedded-page-cookie=allowed; SameSite=None; Secure";
                 const result = document.cookie.includes("embedded-page-cookie=allowed") ? "allowed" : "unavailable";
-                document.cookie = "embedded-page-cookie-result=" + result;
+                document.cookie = "embedded-page-cookie-result=" + result + "; SameSite=None; Secure";
             <\/script>`,
         }));
         childUrl.hostname = uniqueLocalhostHostname("embedded-page-cookie");

@@ -12,6 +12,8 @@ namespace Web::SVG::TagNames {
 
 #define ENUMERATE_SVG_TAGS                                          \
     __ENUMERATE_SVG_TAG(a, "a")                                     \
+    __ENUMERATE_SVG_TAG(animate, "animate")                         \
+    __ENUMERATE_SVG_TAG(animateMotion, "animateMotion")             \
     __ENUMERATE_SVG_TAG(circle, "circle")                           \
     __ENUMERATE_SVG_TAG(clipPath, "clipPath")                       \
     __ENUMERATE_SVG_TAG(defs, "defs")                               \
@@ -21,7 +23,10 @@ namespace Web::SVG::TagNames {
     __ENUMERATE_SVG_TAG(feColorMatrix, "feColorMatrix")             \
     __ENUMERATE_SVG_TAG(feComponentTransfer, "feComponentTransfer") \
     __ENUMERATE_SVG_TAG(feComposite, "feComposite")                 \
+    __ENUMERATE_SVG_TAG(feConvolveMatrix, "feConvolveMatrix")       \
+    __ENUMERATE_SVG_TAG(feDiffuseLighting, "feDiffuseLighting")     \
     __ENUMERATE_SVG_TAG(feDisplacementMap, "feDisplacementMap")     \
+    __ENUMERATE_SVG_TAG(feDistantLight, "feDistantLight")           \
     __ENUMERATE_SVG_TAG(feDropShadow, "feDropShadow")               \
     __ENUMERATE_SVG_TAG(feFlood, "feFlood")                         \
     __ENUMERATE_SVG_TAG(feFuncA, "feFuncA")                         \
@@ -34,6 +39,9 @@ namespace Web::SVG::TagNames {
     __ENUMERATE_SVG_TAG(feMergeNode, "feMergeNode")                 \
     __ENUMERATE_SVG_TAG(feMorphology, "feMorphology")               \
     __ENUMERATE_SVG_TAG(feOffset, "feOffset")                       \
+    __ENUMERATE_SVG_TAG(fePointLight, "fePointLight")               \
+    __ENUMERATE_SVG_TAG(feSpecularLighting, "feSpecularLighting")   \
+    __ENUMERATE_SVG_TAG(feSpotLight, "feSpotLight")                 \
     __ENUMERATE_SVG_TAG(feTurbulence, "feTurbulence")               \
     __ENUMERATE_SVG_TAG(filter, "filter")                           \
     __ENUMERATE_SVG_TAG(foreignObject, "foreignObject")             \
@@ -41,8 +49,10 @@ namespace Web::SVG::TagNames {
     __ENUMERATE_SVG_TAG(image, "image")                             \
     __ENUMERATE_SVG_TAG(line, "line")                               \
     __ENUMERATE_SVG_TAG(linearGradient, "linearGradient")           \
+    __ENUMERATE_SVG_TAG(marker, "marker")                           \
     __ENUMERATE_SVG_TAG(mask, "mask")                               \
     __ENUMERATE_SVG_TAG(metadata, "metadata")                       \
+    __ENUMERATE_SVG_TAG(mpath, "mpath")                             \
     __ENUMERATE_SVG_TAG(path, "path")                               \
     __ENUMERATE_SVG_TAG(pattern, "pattern")                         \
     __ENUMERATE_SVG_TAG(polygon, "polygon")                         \
@@ -50,6 +60,7 @@ namespace Web::SVG::TagNames {
     __ENUMERATE_SVG_TAG(radialGradient, "radialGradient")           \
     __ENUMERATE_SVG_TAG(rect, "rect")                               \
     __ENUMERATE_SVG_TAG(script, "script")                           \
+    __ENUMERATE_SVG_TAG(set, "set")                                 \
     __ENUMERATE_SVG_TAG(stop, "stop")                               \
     __ENUMERATE_SVG_TAG(style, "style")                             \
     __ENUMERATE_SVG_TAG(svg, "svg")                                 \

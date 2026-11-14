@@ -10,10 +10,12 @@
 #pragma once
 
 #include <AK/IntrusiveList.h>
+#include <LibGfx/Rect.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/DOM/AbstractRange.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/Export.h>
+#include <LibWeb/HTML/Parser/ParserScriptingMode.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/TrustedTypes/TrustedHTML.h>
 #include <LibWebCommon/WebIDL/Types.h>
@@ -34,6 +36,7 @@ enum class RelativeBoundaryPointPosition {
 
 // https://dom.spec.whatwg.org/#concept-range-bp-position
 RelativeBoundaryPointPosition position_of_boundary_point_relative_to_other_boundary_point(BoundaryPoint a, BoundaryPoint b);
+Optional<RelativeBoundaryPointPosition> position_of_boundary_point_relative_to_other_boundary_point_in_flat_tree(BoundaryPoint a, BoundaryPoint b);
 
 class WEB_API Range final : public AbstractRange {
     WEB_WRAPPABLE(Range, AbstractRange);
@@ -95,12 +98,16 @@ public:
     GC::Ref<Geometry::DOMRectList> get_client_rects();
     GC::Ref<Geometry::DOMRect> get_bounding_client_rect();
 
+    // The rectangles of getClientRects() and getBoundingClientRect().
+    Vector<Gfx::DoubleRect> client_rects();
+    Gfx::DoubleRect bounding_client_rect();
+
     bool contains_node(GC::Ref<Node>) const;
 
     void set_associated_selection(Badge<Selection::Selection>, GC::Ptr<Selection::Selection>);
 
     WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const&);
-    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(StringView fragment);
+    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(StringView fragment, HTML::ParserScriptingMode = HTML::ParserScriptingMode::Fragment);
 
     template<typename Callback>
     void for_each_contained(Callback callback) const
@@ -139,6 +146,7 @@ private:
     GC::Ref<Node> root() const;
 
     void update_associated_selection();
+    void update_associated_highlights(GC::Ptr<Document> previous_owner_document);
 
     enum class StartOrEnd {
         Start,
@@ -174,8 +182,8 @@ private:
 
     void update_owner_document();
 
-    GC::Ptr<Selection::Selection> m_associated_selection;
-    GC::Ptr<Document> m_owner_document;
+    GC::Member<Selection::Selection> m_associated_selection;
+    GC::Member<Document> m_owner_document;
 
     IntrusiveListNode<Range> m_live_range_list_node;
 

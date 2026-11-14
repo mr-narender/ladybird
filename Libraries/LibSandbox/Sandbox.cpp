@@ -10,9 +10,11 @@
 #    include <AK/LexicalPath.h>
 #    include <AK/ScopeGuard.h>
 #    include <AK/Vector.h>
+#    include <LibSandbox/FileBroker.h>
 #    include <dirent.h>
 #    include <errno.h>
 #    include <fcntl.h>
+#    include <link.h>
 #    include <linux/landlock.h>
 #    include <stdlib.h>
 #    include <string.h>
@@ -25,6 +27,8 @@
 #if defined(AK_OS_MACOS)
 #    include <AK/LexicalPath.h>
 #    include <AK/StringBuilder.h>
+#    include <LibCore/IOSurface.h>
+#    include <LibCore/StatsLog.h>
 #    include <errno.h>
 #    include <limits.h>
 #    include <sandbox.h>
@@ -41,6 +45,10 @@ int sandbox_init_with_parameters(char const* profile, u64 flags, char const* con
 #    include <malloc.h>
 #endif
 
+#if defined(AK_OS_LINUX) && defined(HAS_ADDRESS_SANITIZER)
+#    include <sanitizer/common_interface_defs.h>
+#endif
+
 namespace Sandbox {
 
 ErrorOr<void> install_no_new_privileges()
@@ -55,14 +63,22 @@ ErrorOr<void> install_no_new_privileges()
 ErrorOr<void> configure_runtime()
 {
 #if defined(AK_OS_LINUX) && defined(__GLIBC__) && defined(M_ARENA_MAX) && !defined(HAS_ADDRESS_SANITIZER)
-    if (mallopt(M_ARENA_MAX, 4) == 0)
-        return Error::from_string_literal("mallopt(M_ARENA_MAX) failed");
+    // NB: This only limits memory use. Other allocators, such as hardened_malloc, do not know this option and return 0,
+    //     so we ignore a failure.
+    (void)mallopt(M_ARENA_MAX, 4);
+#endif
+#if defined(AK_OS_LINUX) && defined(HAS_ADDRESS_SANITIZER)
+    // The sanitizers symbolize a report through an llvm-symbolizer process they start the first time they need one, but
+    // the seccomp filter kills the fork and Landlock refuses the exec once the sandbox is in place, so a report would be
+    // lost with its stack. Symbolize one address now so that process is already running when a report needs it.
+    char symbolized_pc[64];
+    __sanitizer_symbolize_pc(__builtin_return_address(0), "%p %F", symbolized_pc, sizeof(symbolized_pc));
 #endif
     return {};
 }
 
 #if defined(AK_OS_LINUX)
-ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access access)
+ErrorOr<void> add_path_if_exists(Vector<PathRule>& paths, StringView path, PathRule::Access access)
 {
     auto path_bytes = path.to_byte_string();
 
@@ -81,6 +97,28 @@ ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringVie
     }
 
     TRY(paths.try_append({ move(path_bytes), access, is_directory }));
+    return {};
+}
+
+ErrorOr<void> add_loaded_library_directories(Vector<PathRule>& paths, Optional<StringView> root)
+{
+    Vector<ByteString> directories;
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void* data) {
+        auto& directories = *static_cast<Vector<ByteString>*>(data);
+        StringView name { info->dlpi_name, strlen(info->dlpi_name) };
+        if (name.starts_with('/')) {
+            auto directory = LexicalPath::dirname(name);
+            if (!directories.contains_slow(directory))
+                directories.append(move(directory));
+        }
+        return 0;
+    },
+        &directories);
+
+    for (auto const& directory : directories) {
+        if (!root.has_value() || LexicalPath { directory }.is_child_of(LexicalPath { root->to_byte_string() }))
+            TRY(add_path_if_exists(paths, directory, PathRule::Access::ReadOnly));
+    }
     return {};
 }
 #endif
@@ -249,6 +287,7 @@ static ErrorOr<void> append_allowed_executables(StringBuilder& builder, Readonly
     if (executable_paths.is_empty())
         return {};
 
+    builder.append("(allow syscall-unix (syscall-number SYS_posix_spawn SYS_wait4))\n"sv);
     builder.append("(allow process-fork)\n(allow process-exec"sv);
     for (auto const& path : executable_paths) {
         builder.append(" (literal "sv);
@@ -256,6 +295,9 @@ static ErrorOr<void> append_allowed_executables(StringBuilder& builder, Readonly
         builder.append(')');
     }
     builder.append(")\n"sv);
+
+    // NB: Child processes inherit the sandbox, and dyld needs F_GETPATH to find the shared library cache during startup.
+    builder.append("(allow system-fcntl (fcntl-command F_GETPATH))\n"sv);
 
     return {};
 }
@@ -308,11 +350,12 @@ static ErrorOr<void> append_allowed_mach_services(StringBuilder& builder, Seatbe
     (global-name "com.apple.audio.audiohald")
     (global-name "com.apple.audio.AudioSession")
     (xpc-service-name "com.apple.audio.SandboxHelper"))
+(allow device-microphone)
 )~~~"sv);
     }
 
     // Audio output units and audio decoders alike go through the component registrar.
-    if (has_flag(options.system_services, SystemService::Audio)) {
+    if (has_flag(options.system_services, SystemService::Audio) || has_flag(options.system_services, SystemService::AudioDecoding)) {
         builder.append(R"~~~(
 (allow mach-lookup
     (global-name "com.apple.audio.AudioComponentRegistrar"))
@@ -536,7 +579,6 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
         SYS_persona
         SYS_pipe
         SYS_poll
-        SYS_posix_spawn
         SYS_proc_info
         SYS_readlink
         SYS_removexattr
@@ -556,7 +598,6 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
         SYS_umask
         SYS_unlink
         SYS_unlinkat
-        SYS_wait4
         SYS_work_interval_ctl
         SYS_workq_kernreturn
         SYS_workq_open))
@@ -645,6 +686,10 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
 
 )~~~"sv));
 
+    // Core::System::pipe2() uses the native syscall on macOS 27. Older Seatbelt versions do not know this syscall.
+    if (__builtin_available(macOS 27.0, *))
+        TRY(profile.try_append("(allow syscall-unix (syscall-number SYS_pipe2))\n"sv));
+
     if (options.network_access == NetworkAccess::Allowed) {
         TRY(profile.try_append(R"~~~(
 ; Connect to hosts on the network and to the system's network daemons, but not to local sockets of other processes.
@@ -652,6 +697,10 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
     (remote ip)
     (control-name "com.apple.netsrc")
     (literal "/private/var/run/mDNSResponder"))
+
+; SecTrust evaluates TLS certificates through the per-user trust daemon.
+(allow mach-lookup
+    (global-name "com.apple.trustd.agent"))
 
 ; Sharing a port with another socket would let a helper receive traffic that is meant for another process.
 (deny socket-option-set
@@ -677,10 +726,35 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
 )~~~"sv));
     }
 
+    if (options.network_access == NetworkAccess::Datagrams) {
+        TRY(profile.try_append(R"~~~(
+; Exchange datagrams with peers from UDP sockets that the helper binds itself, at the addresses of the local interfaces
+; that getifaddrs() lists. The mDNS responder shares its port with the system's.
+(allow network-outbound
+    (remote udp))
+(allow network-bind
+    (local udp))
+(allow network-inbound
+    (local udp))
+(allow syscall-unix
+    (syscall-number SYS_bind))
+(allow system-info
+    (info-type "net.link.addr"))
+(allow sysctl-read
+    (sysctl-name-prefix "net.routetable."))
+)~~~"sv));
+    }
+
     TRY(append_allowed_paths(profile, "file-read* file-test-existence"sv, options.paths, SeatbeltPath::Access::ReadOnly));
     TRY(append_allowed_ancestor_directories(profile, options.paths));
     TRY(append_allowed_paths(profile, "file-map-executable"sv, options.paths, SeatbeltPath::Access::ReadAndExecute));
     TRY(append_allowed_paths(profile, "file-write*"sv, options.paths, SeatbeltPath::Access::ReadWrite));
+    if (auto* log = Core::StatsLog::the()) {
+        Vector<SeatbeltPath> log_paths;
+        TRY(add_seatbelt_path_if_exists(log_paths, log->path(), SeatbeltPath::Access::ReadWrite));
+        // Only append to this process's already-open log, without granting access to the statistics directory.
+        TRY(append_allowed_paths(profile, "file-write-data"sv, log_paths, SeatbeltPath::Access::ReadWrite));
+    }
     TRY(append_allowed_paths(profile, "file-lock"sv, options.paths, SeatbeltPath::Access::ReadWrite));
     TRY(append_allowed_path_extensions(profile, options.paths, SeatbeltPath::Access::ReadOnly));
     TRY(append_allowed_path_extensions(profile, options.paths, SeatbeltPath::Access::ReadWrite));
@@ -689,6 +763,11 @@ ErrorOr<void> apply_macos_sandbox(SeatbeltProfile const& options)
     TRY(append_allowed_mach_services(profile, options));
 
     auto profile_string = profile.to_byte_string();
+
+    // IOSurface loads Launch Services preferences on first use. Do this before sandboxing, since a denied read
+    // makes Launch Services log errors whose formatting produces CoreFoundation warnings about URLs without schemes.
+    if (has_flag(options.system_services, SystemService::IOSurface))
+        Core::IOSurfaceHandle::initialize();
 
     char* errorbuf = nullptr;
 #    pragma clang diagnostic push
@@ -724,28 +803,21 @@ static ErrorOr<size_t> count_threads()
     return thread_count;
 }
 
-ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths)
+static bool s_signals_stay_within_the_process_tree = false;
+
+bool sandbox_debugging_is_enabled()
 {
-    // Landlock confines only the calling thread and the threads that it starts later. A thread that already runs would
-    // keep full access to the file system.
-    if (TRY(count_threads()) != 1)
-        return Error::from_string_literal("Landlock must be applied before the process starts a second thread");
+    auto const* value = getenv("LADYBIRD_SANDBOX_DEBUG");
+    return value && *value && StringView { value, strlen(value) } != "0"sv;
+}
 
-    // Without Landlock, nothing limits the files a helper can open, so we refuse to go on. Running without it has to
-    // be a choice that the user makes with --disable-sandbox.
-    auto landlock_abi = syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
-    if (landlock_abi < 0 && errno != ENOSYS && errno != EOPNOTSUPP)
-        return Error::from_syscall("landlock_create_ruleset(LANDLOCK_CREATE_RULESET_VERSION)"sv, errno);
-    if (landlock_abi <= 0) {
-        // NB: Only for machines that cannot run Landlock at all, such as our CI runners. The rest of the sandbox still
-        //     applies. On a kernel that has Landlock, this changes nothing.
-        if (auto const* allow = getenv("LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK"); allow && StringView { allow, strlen(allow) } == "1"sv) {
-            warnln("Landlock is not available in this kernel. This helper runs without file system confinement, because LADYBIRD_UNSAFE_ALLOW_MISSING_LANDLOCK is set.");
-            return {};
-        }
-        return Error::from_string_literal("Landlock is not available in this kernel, so the helper cannot be sandboxed (--disable-sandbox runs helpers without a sandbox)");
-    }
+bool signals_stay_within_the_process_tree()
+{
+    return s_signals_stay_within_the_process_tree;
+}
 
+static ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<PathRule> paths, long landlock_abi)
+{
     // Before ABI 3, Landlock does not handle truncation, so a helper can truncate any file that it can open.
     static bool s_warned_about_truncation = false;
     if (landlock_abi < 3 && !s_warned_about_truncation) {
@@ -809,21 +881,21 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
 
         landlock_path_beneath_attr path_beneath {};
         switch (landlock_path.access) {
-        case LandlockPath::Access::ReadOnly: {
+        case PathRule::Access::ReadOnly: {
             path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE;
 
             if (landlock_path.is_directory)
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_READ_DIR;
             break;
         }
-        case LandlockPath::Access::ReadAndExecute: {
+        case PathRule::Access::ReadAndExecute: {
             path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE;
 
             if (landlock_path.is_directory)
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_READ_DIR;
             break;
         }
-        case LandlockPath::Access::ReadWrite: {
+        case PathRule::Access::ReadWrite: {
             path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE;
 
 #    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
@@ -855,8 +927,27 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
 
     if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) < 0)
         return Error::from_syscall("landlock_restrict_self"sv, errno);
+#    if defined(LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET) && defined(LANDLOCK_SCOPE_SIGNAL)
+    s_signals_stay_within_the_process_tree = landlock_abi >= 6;
+#    endif
 
     return {};
+}
+
+ErrorOr<void> restrict_filesystem(ReadonlySpan<PathRule> paths)
+{
+    // Landlock confines only the calling thread and the threads that it starts later, and forking the broker is only
+    // safe with one thread. A thread that already runs would keep full access to the file system.
+    if (TRY(count_threads()) != 1)
+        return Error::from_string_literal("The file system must be restricted before the process starts a second thread");
+
+    // Any failure means we can't have Landlock here: a kernel without it says ENOSYS or EOPNOTSUPP, and a container's
+    // own seccomp filter can say anything.
+    auto landlock_abi = syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (landlock_abi > 0 && !sandbox_debugging_is_enabled())
+        return restrict_filesystem_with_landlock(paths, landlock_abi);
+
+    return start_file_broker(paths);
 }
 #endif
 

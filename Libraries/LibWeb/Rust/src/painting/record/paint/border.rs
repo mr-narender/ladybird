@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::painting::corner_shape::{CornerShapes, Insets, append_border_contour_path};
+use crate::painting::paint_read::PaintRead;
 use crate::painting::record::trace::Observer;
 
 use crate::css::computed_value_views::ComputedValuesView;
@@ -20,7 +22,7 @@ use crate::painting::paintable_data::{
     FfiPixelBox, PIECE_EDGE_BOTTOM, PIECE_EDGE_LEFT, PIECE_EDGE_RIGHT, PIECE_EDGE_TOP,
 };
 use crate::painting::record::{BasePaintFacts, PaintRecorder};
-use libgfx_rust::path::{OwnedPath, PathBuilder};
+use libgfx_rust::path::Path;
 use libgfx_rust::{
     CapStyle, Color, CornerRadii, CornerRadius, FloatPoint, FloatSize, IntPoint, IntRect, JoinStyle, LineStyle,
     ShouldAntiAlias, WindingRule,
@@ -28,9 +30,11 @@ use libgfx_rust::{
 
 pub use crate::painting::paintable_data::BorderEdge;
 
+const NATIVE_APPEARANCE_BORDER_WIDTH_PX: i64 = 1;
+
 pub(crate) const ALL_PIECE_EDGES: u8 = PIECE_EDGE_TOP | PIECE_EDGE_RIGHT | PIECE_EDGE_BOTTOM | PIECE_EDGE_LEFT;
 
-fn border_side(
+pub(crate) fn border_side(
     converter: &DevicePixelConverter,
     present: bool,
     color: u32,
@@ -151,12 +155,6 @@ impl BordersDataDevicePixels {
     pub fn all_are_equal(&self) -> bool {
         self.top == self.right && self.top == self.bottom && self.top == self.left
     }
-
-    pub fn has_patterned_edge(&self) -> bool {
-        [self.top, self.right, self.bottom, self.left]
-            .iter()
-            .any(|edge| edge.width > 0 && matches!(edge.line_style, line_style::DASHED | line_style::DOTTED))
-    }
 }
 
 const DARK_LIGHT_ABSOLUTE_VALUE_DIFFERENCE: f64 = 1.0 / 3.0;
@@ -253,7 +251,7 @@ fn is_long_enough_for_pattern(length: f32, width: f32, dotted: bool) -> bool {
 // path, and the seam of a closed one, in a gap.
 fn stroke_patterned_path(
     painter: &mut DisplayListRecorder,
-    path: &libgfx_rust::path::OwnedPath,
+    path: &Path,
     style: LineStyle,
     width: f32,
     color: Color,
@@ -303,7 +301,7 @@ struct Corner {
 // Dashes and dots run along the middle of the border, so instead of filling the exact region covered by the edge -
 // which is what the solid border painting below does - they are stroked along a centerline path: the half of the
 // corner arc leading into the edge, the straight run, and the half of the corner arc leading out of it.
-fn patterned_border_centerline(geometry: EdgeGeometry, borders_data: &BordersDataDevicePixels) -> PathBuilder {
+fn patterned_border_centerline(geometry: EdgeGeometry, borders_data: &BordersDataDevicePixels) -> Path {
     let EdgeGeometry {
         edge,
         rect,
@@ -424,26 +422,18 @@ fn patterned_border_centerline(geometry: EdgeGeometry, borders_data: &BordersDat
     // A corner whose centerline radii have collapsed leaves the dashes meeting at a sharp angle instead of curving.
     let has_arc = |corner: &Corner| corner.radii.width > 0.0 && corner.radii.height > 0.0;
 
-    let mut centerline = PathBuilder::new();
+    let mut centerline = Path::new();
     if has_arc(&start) {
         let split = split_point(&start, joined_border_width);
-        centerline.move_to(split.x, split.y);
-        centerline.elliptical_arc_to(
-            straight_start.x,
-            straight_start.y,
-            start.radii.width,
-            start.radii.height,
-            0.0,
-            false,
-            true,
-        );
+        centerline.move_to(split);
+        centerline.elliptical_arc_to(straight_start, start.radii, 0.0, false, true);
     } else {
-        centerline.move_to(straight_start.x, straight_start.y);
+        centerline.move_to(straight_start);
     }
-    centerline.line_to(straight_end.x, straight_end.y);
+    centerline.line_to(straight_end);
     if has_arc(&end) {
         let split = split_point(&end, opposite_joined_border_width);
-        centerline.elliptical_arc_to(split.x, split.y, end.radii.width, end.radii.height, 0.0, false, true);
+        centerline.elliptical_arc_to(split, end.radii, 0.0, false, true);
     }
     centerline
 }
@@ -708,68 +698,72 @@ impl SolidEdgeRegion {
         }
     }
 
-    pub(crate) fn append_to(&self, target: &mut PathBuilder) {
+    pub(crate) fn append_to(&self, target: &mut Path) {
         let points = &self.points;
         let radius = self.radius;
         let opposite_radius = self.opposite_radius;
         let mut current = 0;
-        target.move_to(points[current].x, points[current].y);
+        target.move_to(points[current]);
         current += 1;
         target.elliptical_arc_to(
-            points[current].x,
-            points[current].y,
-            radius.horizontal_radius as f32,
-            radius.vertical_radius as f32,
+            points[current],
+            FloatSize {
+                width: radius.horizontal_radius as f32,
+                height: radius.vertical_radius as f32,
+            },
             0.0,
             false,
             false,
         );
         current += 1;
-        target.line_to(points[current].x, points[current].y);
+        target.line_to(points[current]);
         current += 1;
         if self.joined_corner_has_inner_corner {
             target.elliptical_arc_to(
-                points[current].x,
-                points[current].y,
-                radius.horizontal_radius as f32 - self.joined_inner_corner_offset.width,
-                radius.vertical_radius as f32 - self.joined_inner_corner_offset.height,
+                points[current],
+                FloatSize {
+                    width: radius.horizontal_radius as f32 - self.joined_inner_corner_offset.width,
+                    height: radius.vertical_radius as f32 - self.joined_inner_corner_offset.height,
+                },
                 0.0,
                 false,
                 true,
             );
             current += 1;
         }
-        target.line_to(points[current].x, points[current].y);
+        target.line_to(points[current]);
         current += 1;
         if self.opposite_joined_corner_has_inner_corner {
             target.elliptical_arc_to(
-                points[current].x,
-                points[current].y,
-                opposite_radius.horizontal_radius as f32 - self.opposite_joined_inner_corner_offset.width,
-                opposite_radius.vertical_radius as f32 - self.opposite_joined_inner_corner_offset.height,
+                points[current],
+                FloatSize {
+                    width: opposite_radius.horizontal_radius as f32 - self.opposite_joined_inner_corner_offset.width,
+                    height: opposite_radius.vertical_radius as f32 - self.opposite_joined_inner_corner_offset.height,
+                },
                 0.0,
                 false,
                 true,
             );
             current += 1;
         }
-        target.line_to(points[current].x, points[current].y);
+        target.line_to(points[current]);
         current += 1;
         target.elliptical_arc_to(
-            points[current].x,
-            points[current].y,
-            opposite_radius.horizontal_radius as f32,
-            opposite_radius.vertical_radius as f32,
+            points[current],
+            FloatSize {
+                width: opposite_radius.horizontal_radius as f32,
+                height: opposite_radius.vertical_radius as f32,
+            },
             0.0,
             false,
             false,
         );
     }
 
-    pub(crate) fn path(&self) -> OwnedPath {
-        let mut builder = PathBuilder::new();
+    pub(crate) fn path(&self) -> Path {
+        let mut builder = Path::new();
         self.append_to(&mut builder);
-        builder.build()
+        builder
     }
 }
 
@@ -777,7 +771,7 @@ pub(crate) fn paint_border(
     painter: &mut DisplayListRecorder,
     geometry: EdgeGeometry,
     borders_data: &BordersDataDevicePixels,
-    path: &mut PathBuilder,
+    path: &mut Path,
     last: bool,
 ) {
     let EdgeGeometry {
@@ -795,27 +789,26 @@ pub(crate) fn paint_border(
 
     // Edges sharing a color are collected into one path and only filled once the color changes or
     // the last edge is reached.
-    let flush_queued_edges = |painter: &mut DisplayListRecorder, path: &mut PathBuilder| {
+    let flush_queued_edges = |painter: &mut DisplayListRecorder, path: &mut Path| {
         if path.is_empty() {
             return;
         }
-        let built = path.build();
+        let queued_edges = std::mem::take(path);
         painter.fill_path(FillPathParams {
             force_dark_role: borders_data.force_dark_role,
-            path: &built,
+            path: &queued_edges,
             opacity: 1.0,
             paint_style_or_color: PaintStyleOrColor::Color(color),
             winding_rule: WindingRule::EvenOdd,
             should_anti_alias: ShouldAntiAlias::Yes,
         });
-        *path = PathBuilder::new();
     };
 
     let is_horizontal_edge = matches!(edge, BorderEdge::Top | BorderEdge::Bottom);
     let frame = edge_frame(edge, rect);
 
     let paint_double_border = |painter: &mut DisplayListRecorder,
-                               path: &mut PathBuilder,
+                               path: &mut Path,
                                proportional_line_thickness: f32,
                                outer_style: u8,
                                inner_style: u8| {
@@ -980,7 +973,7 @@ pub(crate) fn paint_border(
 
     // Fails for an edge too short to hold the pattern, which is painted solid instead.
     if gfx_line_style != LineStyle::Solid {
-        let centerline = patterned_border_centerline(geometry, borders_data).build();
+        let centerline = patterned_border_centerline(geometry, borders_data);
         if is_long_enough_for_pattern(centerline.length(), width_into, gfx_line_style == LineStyle::Dotted) {
             flush_queued_edges(painter, path);
             // The stroke is as wide as the border, so at a shared corner it would spill across the
@@ -1089,8 +1082,14 @@ fn paint_uniform_solid_border(
 
     // Two lines of a third of the width each, as paint_border splits a double edge. The inner ring is pulled in
     // by the gap between the lines, which also takes that much off each radius, and its inner outline is the
-    // padding box either way.
-    let line_widths = widths.map(|width| split_line_width(width, 1.0 / 3.0));
+    // padding box either way. An absent edge stays absent rather than being clamped up to a 1px line.
+    let line_widths = widths.map(|width| {
+        if width > 0 {
+            split_line_width(width, 1.0 / 3.0)
+        } else {
+            0
+        }
+    });
     painter.fill_rounded_rect_ring(
         border_rect,
         corner_radii,
@@ -1187,57 +1186,73 @@ fn paint_uniform_patterned_border(
     // Starting halfway along the top edge puts the seam on an axis of symmetry.
     let start_x = ((left + right) / 2.0).clamp(left + top_left.width, right - top_right.width);
 
-    let mut centerline = PathBuilder::new();
-    centerline.move_to(start_x, top);
-    centerline.line_to(right - top_right.width, top);
+    let mut centerline = Path::new();
+    centerline.move_to(FloatPoint { x: start_x, y: top });
+    centerline.line_to(FloatPoint {
+        x: right - top_right.width,
+        y: top,
+    });
     if !is_empty(top_right) {
         centerline.elliptical_arc_to(
-            right,
-            top + top_right.height,
-            top_right.width,
-            top_right.height,
+            FloatPoint {
+                x: right,
+                y: top + top_right.height,
+            },
+            top_right,
             0.0,
             false,
             true,
         );
     }
-    centerline.line_to(right, bottom - bottom_right.height);
+    centerline.line_to(FloatPoint {
+        x: right,
+        y: bottom - bottom_right.height,
+    });
     if !is_empty(bottom_right) {
         centerline.elliptical_arc_to(
-            right - bottom_right.width,
-            bottom,
-            bottom_right.width,
-            bottom_right.height,
+            FloatPoint {
+                x: right - bottom_right.width,
+                y: bottom,
+            },
+            bottom_right,
             0.0,
             false,
             true,
         );
     }
-    centerline.line_to(left + bottom_left.width, bottom);
+    centerline.line_to(FloatPoint {
+        x: left + bottom_left.width,
+        y: bottom,
+    });
     if !is_empty(bottom_left) {
         centerline.elliptical_arc_to(
-            left,
-            bottom - bottom_left.height,
-            bottom_left.width,
-            bottom_left.height,
+            FloatPoint {
+                x: left,
+                y: bottom - bottom_left.height,
+            },
+            bottom_left,
             0.0,
             false,
             true,
         );
     }
-    centerline.line_to(left, top + top_left.height);
+    centerline.line_to(FloatPoint {
+        x: left,
+        y: top + top_left.height,
+    });
     if !is_empty(top_left) {
         centerline.elliptical_arc_to(
-            left + top_left.width,
-            top,
-            top_left.width,
-            top_left.height,
+            FloatPoint {
+                x: left + top_left.width,
+                y: top,
+            },
+            top_left,
             0.0,
             false,
             true,
         );
     }
-    centerline.line_to(start_x, top);
+    centerline.line_to(FloatPoint { x: start_x, y: top });
     centerline.close();
 
     let style = if borders_data.top.line_style == line_style::DOTTED {
@@ -1247,7 +1262,7 @@ fn paint_uniform_patterned_border(
     };
     stroke_patterned_path(
         painter,
-        &centerline.build(),
+        &centerline,
         style,
         width,
         borders_data.top.color,
@@ -1318,7 +1333,7 @@ pub fn paint_all_borders(
         }
     }
 
-    let mut path = PathBuilder::new();
+    let mut path = Path::new();
     for i in 0..edges.len() {
         let last = i == edges.len() - 1;
         let geometry = geometries[(start_index + i) % edges.len()];
@@ -1412,33 +1427,76 @@ pub(crate) fn paint_box_borders_from_style<O: Observer>(
     paintable: NodeSlotId,
     facts: &BasePaintFacts,
 ) {
+    let border = crate::painting::paintable_geometry::committed_border(recorder.source, paintable);
+    let border_box_rect = crate::painting::paintable_geometry::absolute_border_box_rect(recorder.source, paintable);
+    let border_radii = recorder.border_radii(paintable);
+    paint_borders_from_style(
+        recorder,
+        paintable,
+        facts,
+        border,
+        border_box_rect,
+        border_radii,
+        ALL_PIECE_EDGES,
+    );
+}
+
+pub(crate) fn paint_borders_from_style<O: Observer>(
+    recorder: &mut PaintRecorder<'_, O>,
+    paintable: NodeSlotId,
+    facts: &BasePaintFacts,
+    border: FfiPixelBox,
+    border_box_rect: CssPixelRect,
+    border_radii: crate::painting::border_radii::BorderRadii,
+    present_edges: u8,
+) {
     let converter = recorder.converter;
-    let Some(style) = recorder.layout_arena.node_style_if_live(paintable) else {
+    let Some(style) = recorder.source.node_style_if_live(paintable) else {
         return;
     };
-    let border = crate::painting::paintable_geometry::committed_border(recorder.layout_arena, paintable);
-    let borders_data = style_borders_data(style, border, ALL_PIECE_EDGES, &converter);
-    let css_border_widths = present_css_border_widths(style, border, ALL_PIECE_EDGES);
-    let border_box_rect =
-        crate::painting::paintable_geometry::absolute_border_box_rect(recorder.layout_arena, paintable);
-    let border_radii = recorder.border_radii(paintable);
+    let mut borders_data = style_borders_data(style, border, ALL_PIECE_EDGES, &converter);
+    let mut css_border_widths = present_css_border_widths(style, border, ALL_PIECE_EDGES);
+    // NB: The native appearance of a devolvable widget draws a thin solid line along the outer edge of whatever border
+    //     its style gives it, which is the inset or outset border it shows once devolved.
+    if crate::painting::visual_context::node_values::has_native_appearance(style, recorder.source, paintable) {
+        let native_width = CssPixels::from_integer(NATIVE_APPEARANCE_BORDER_WIDTH_PX);
+        for (side, css_width) in [
+            &mut borders_data.top,
+            &mut borders_data.right,
+            &mut borders_data.bottom,
+            &mut borders_data.left,
+        ]
+        .into_iter()
+        .zip(css_border_widths.iter_mut())
+        {
+            if side.width == 0 {
+                continue;
+            }
+            side.width = converter.enclosing_device_pixels(native_width);
+            side.line_style = line_style::SOLID;
+            *css_width = native_width;
+        }
+    }
     paint_box_borders(
         recorder,
         paintable,
         facts,
         border_box_rect,
         css_border_widths,
+        present_edges,
         &borders_data,
         border_radii,
     );
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn paint_box_borders<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
     facts: &BasePaintFacts,
     border_box_rect: CssPixelRect,
     css_border_widths: [CssPixels; 4],
+    present_edges: u8,
     borders_data: &BordersDataDevicePixels,
     border_radii: crate::painting::border_radii::BorderRadii,
 ) {
@@ -1447,16 +1505,182 @@ pub(crate) fn paint_box_borders<O: Observer>(
             recorder,
             paintable,
             css_border_widths,
+            present_edges,
             border_box_rect,
         )
     {
         return;
     }
     let converter = recorder.converter;
-    paint_all_borders(
-        &mut recorder.recorder,
-        converter.rounded_device_rect(border_box_rect),
-        border_radii.as_corners(&converter),
+    if let Some(border_shape) = crate::painting::border_shape::BorderShape::of(
+        recorder.source,
+        paintable,
         borders_data,
-    );
+        converter.device_pixels_per_css_pixel(),
+    ) {
+        paint_border_shape(&mut recorder.recorder, &border_shape, borders_data.force_dark_role);
+        return;
+    }
+    let device_border_rect = converter.rounded_device_rect(border_box_rect);
+    let corner_radii = border_radii.as_corners(&converter);
+    if let Some(style) = recorder.source.node_style_if_live(paintable) {
+        let shapes = CornerShapes::of(style);
+        if shapes.needs_contour(corner_radii) {
+            paint_shaped_borders(
+                &mut recorder.recorder,
+                device_border_rect,
+                corner_radii,
+                shapes,
+                borders_data,
+            );
+            return;
+        }
+    }
+    paint_all_borders(&mut recorder.recorder, device_border_rect, corner_radii, borders_data);
+}
+
+// https://drafts.csswg.org/css-borders-4/#border-shape-syntax
+// FIXME: Draw the border's line style along the shape. Every style is drawn solid for now.
+fn paint_border_shape(
+    painter: &mut DisplayListRecorder,
+    border_shape: &crate::painting::border_shape::BorderShape,
+    force_dark_role: ForceDarkRole,
+) {
+    use crate::painting::border_shape::BorderShape;
+    match border_shape {
+        // Single shape: the border is rendered as a stroke along the shape's path, with the stroke width determined by
+        // the relevant side's computed border width.
+        BorderShape::Stroke {
+            path,
+            width,
+            color: Some(color),
+            ..
+        } => painter.stroke_path(StrokePathParams {
+            force_dark_role,
+            cap_style: CapStyle::Butt,
+            join_style: JoinStyle::Miter,
+            // INTEROP: Corners of the shape stay sharp however acute they are, as in other engines.
+            miter_limit: 1000.0,
+            dash_array: Vec::new(),
+            dash_offset: 0.0,
+            path,
+            opacity: 1.0,
+            paint_style_or_color: PaintStyleOrColor::Color(*color),
+            thickness: *width,
+            should_anti_alias: ShouldAntiAlias::Yes,
+        }),
+        // Two shapes: the border is rendered as the area between the two paths.
+        BorderShape::Fill { color: Some(color), .. } => {
+            let Some(area) = border_shape.fill_area() else {
+                return;
+            };
+            painter.fill_path(FillPathParams {
+                force_dark_role,
+                path: &area,
+                opacity: 1.0,
+                paint_style_or_color: PaintStyleOrColor::Color(*color),
+                winding_rule: WindingRule::EvenOdd,
+                should_anti_alias: ShouldAntiAlias::Yes,
+            });
+        }
+        _ => {}
+    }
+}
+
+// https://drafts.csswg.org/css-borders-4/#corner-shape-rendering
+// An element's border is rendered in the area between its outer contour and its inner contour.
+// FIXME: Draw the dashed, dotted, double, groove, ridge, inset and outset styles along the contour. Every
+//        style is drawn solid for now.
+fn paint_shaped_borders(
+    painter: &mut DisplayListRecorder,
+    border_rect: IntRect,
+    corner_radii: CornerRadii,
+    shapes: CornerShapes,
+    borders_data: &BordersDataDevicePixels,
+) {
+    if has_no_border(borders_data) {
+        return;
+    }
+    let border_rect = border_rect.to_float();
+    let widths = Insets {
+        top: f64::from(borders_data.top.width.max(0)),
+        right: f64::from(borders_data.right.width.max(0)),
+        bottom: f64::from(borders_data.bottom.width.max(0)),
+        left: f64::from(borders_data.left.width.max(0)),
+    };
+    let mut ring = Path::new();
+    append_border_contour_path(&mut ring, border_rect, corner_radii, shapes, Insets::default());
+    append_border_contour_path(&mut ring, border_rect, corner_radii, shapes, widths);
+    let fill_ring = |painter: &mut DisplayListRecorder, color: Color| {
+        painter.fill_path(FillPathParams {
+            force_dark_role: borders_data.force_dark_role,
+            path: &ring,
+            opacity: 1.0,
+            paint_style_or_color: PaintStyleOrColor::Color(color),
+            winding_rule: WindingRule::EvenOdd,
+            should_anti_alias: ShouldAntiAlias::Yes,
+        });
+    };
+
+    let colors =
+        BorderEdge::ALL.map(|edge| (borders_data.for_edge(edge).width > 0).then(|| border_color(edge, borders_data)));
+    let present_colors = colors.iter().flatten().copied().collect::<Vec<_>>();
+    if present_colors.windows(2).all(|pair| pair[0] == pair[1]) {
+        fill_ring(painter, present_colors[0]);
+        return;
+    }
+
+    // Each edge owns the part of the ring between the miter lines that run from the outer corners of the border box
+    // in the direction of the adjacent border widths, up to the center lines of the box, as rounded and square
+    // corners split their edges.
+    let (left, top) = (f64::from(border_rect.x), f64::from(border_rect.y));
+    let (right, bottom) = (left + f64::from(border_rect.width), top + f64::from(border_rect.height));
+    let (center_x, center_y) = ((left + right) / 2.0, (top + bottom) / 2.0);
+    let miter = |corner: (f64, f64), horizontal_width: f64, vertical_width: f64| {
+        let toward = ((center_x - corner.0).signum(), (center_y - corner.1).signum());
+        let (mut x, mut y) = (horizontal_width * toward.0, vertical_width * toward.1);
+        if x == 0.0 && y == 0.0 {
+            (x, y) = toward;
+        }
+        let distance_to = |delta: f64, step: f64| {
+            if step == 0.0 {
+                f64::INFINITY
+            } else {
+                (delta / step).abs()
+            }
+        };
+        let scale = distance_to(center_x - corner.0, x).min(distance_to(center_y - corner.1, y));
+        (corner.0 + x * scale, corner.1 + y * scale)
+    };
+    let top_left = miter((left, top), widths.left, widths.top);
+    let top_right = miter((right, top), widths.right, widths.top);
+    let bottom_right = miter((right, bottom), widths.right, widths.bottom);
+    let bottom_left = miter((left, bottom), widths.left, widths.bottom);
+    let wedges = [
+        [(left, top), (right, top), top_right, top_left],
+        [(right, top), (right, bottom), bottom_right, top_right],
+        [(right, bottom), (left, bottom), bottom_left, bottom_right],
+        [(left, bottom), (left, top), top_left, bottom_left],
+    ];
+    for (color, wedge) in colors.into_iter().zip(wedges) {
+        let Some(color) = color else {
+            continue;
+        };
+        let mut wedge_path = Path::new();
+        wedge_path.move_to(FloatPoint {
+            x: wedge[0].0 as f32,
+            y: wedge[0].1 as f32,
+        });
+        for &(x, y) in &wedge[1..] {
+            wedge_path.line_to(FloatPoint {
+                x: x as f32,
+                y: y as f32,
+            });
+        }
+        wedge_path.close();
+        painter.record_with_inline_clips(
+            &[PendingInlineClip::intersecting_path(&wedge_path, WindingRule::Nonzero)],
+            |painter| fill_ring(painter, color),
+        );
+    }
 }

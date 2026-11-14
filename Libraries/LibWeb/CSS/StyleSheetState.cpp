@@ -7,11 +7,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Utf16StringBuilder.h>
 #include <LibJS/Runtime/ExternalMemory.h>
 #include <LibWeb/CSS/CSSImportRule.h>
 #include <LibWeb/CSS/CSSNestedDeclarations.h>
-#include <LibWeb/CSS/CSSScopeRule.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/FontComputer.h>
@@ -31,20 +29,21 @@
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Infra/SerializedURL.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::CSS {
 
-NonnullRefPtr<StyleSheetState> StyleSheetState::create(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location)
+NonnullRefPtr<StyleSheetState> StyleSheetState::create(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy, StyleSheetImport const* import)
 {
-    return adopt_ref(*new StyleSheetState(move(rules), document, move(media), move(location)));
+    return adopt_ref(*new StyleSheetState(move(rules), document, move(media), move(location), fetched_referrer_policy, import));
 }
 
 WebIDL::ExceptionOr<NonnullRefPtr<StyleSheetState>> StyleSheetState::create_constructed(DOM::Document const& associated_document, CSSStyleSheetOptions const& options)
 {
     // 1. Construct a new CSSStyleSheet object sheet.
-    auto media = options.media.has<GC::Ref<MediaList>>() ? options.media.get<GC::Ref<MediaList>>()->native_list().share() : RustMediaList {};
+    auto media = options.media.has<GC::Ref<MediaList>>() ? options.media.get<GC::Ref<MediaList>>()->share_native_list() : RustMediaList {};
     auto sheet = create(RustRuleList {}, const_cast<DOM::Document*>(&associated_document), move(media), {});
 
     // 2. Set sheet’s location to the base URL of the associated Document for the current principal global object.
@@ -102,11 +101,17 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleSheetState>> StyleSheetState::create_cons
     return sheet;
 }
 
-StyleSheetState::StyleSheetState(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location)
+StyleSheetState::StyleSheetState(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy, StyleSheetImport const* import)
     : m_native_sheet(move(rules), move(media))
     , m_style_engine_occurrence_id(m_native_sheet.identity())
+    , m_parent_style_sheet(import ? import->parent_style_sheet() : nullptr)
+    , m_fetched_referrer_policy(fetched_referrer_policy)
     , m_parsing_document(document)
 {
+    // The sheet takes its import's requested URL, but not the import itself: It would report its loading state to the
+    // import while its own imports are still being attached.
+    if (import)
+        m_requested_url = import->requested_url();
     if (location.has_value())
         set_location(move(location));
 
@@ -126,6 +131,9 @@ void StyleSheetState::disconnect_font_faces_in_rule(RustRule const& rule)
         if (auto face = css_connected_font_face(rule.identity()))
             face->disconnect_from_css_rule();
     }
+    // NB: A rule is disconnected before it leaves this sheet, so the sheet still declares its feature values.
+    if (rule.type() == RustRule::Type::FontFeatureValues)
+        forget_font_feature_values();
     if (auto* children = Parser::ValueParserFFI::rust_rule_children(rule.handle()))
         disconnect_font_faces_in_rules(children);
 }
@@ -133,12 +141,26 @@ void StyleSheetState::disconnect_font_faces_in_rule(RustRule const& rule)
 void StyleSheetState::disconnect_font_faces_in_rules(Parser::ValueParserFFI::NativeRuleList const* rules)
 {
     Parser::ValueParserFFI::rust_rule_list_visit_font_rules(rules, this, [](void const* context, Parser::ValueParserFFI::NativeRuleView const* view) {
+        auto const& sheet = *static_cast<StyleSheetState const*>(context);
         RustRuleView rule { *view };
         if (rule.type() == RustRule::Type::FontFace) {
-            if (auto face = static_cast<StyleSheetState const*>(context)->css_connected_font_face(rule.identity()))
+            if (auto face = sheet.css_connected_font_face(rule.identity()))
                 face->disconnect_from_css_rule();
         }
+        if (rule.type() == RustRule::Type::FontFeatureValues) {
+            if (auto document = sheet.owning_document())
+                document->font_computer().forget_font_feature_values_declared_by(rule);
+        }
     });
+}
+
+// An @font-feature-values rule reaches the elements of every tree scope that owns its sheet, where an @font-face rule
+// only reaches the document's font source. So whoever owns the sheet, what was built from its feature values is
+// forgotten when the sheet comes, goes or changes.
+void StyleSheetState::forget_font_feature_values()
+{
+    if (auto document = owning_document())
+        document->font_computer().forget_font_feature_values_declared_in(*this);
 }
 
 void StyleSheetState::set_rules(RustRuleList rules)
@@ -149,18 +171,26 @@ void StyleSheetState::set_rules(RustRuleList rules)
     // brand new FontFace object which is CSS-connected).
     disconnect_font_faces_in_rules(m_native_sheet.rules().handle());
     if (m_rules)
-        m_rules->set_rules({}, move(rules), m_parsing_document);
+        m_rules->set_rules({}, rules, m_parsing_document);
     else
         m_native_sheet.rules().replace(rules);
+}
+
+Optional<Utf16String> StyleSheetState::source_text() const
+{
+    bool has_text = false;
+    auto text = Utf16String::adopt_raw(Parser::ValueParserFFI::rust_rule_list_source_text(m_native_sheet.rules().handle(), &has_text));
+    if (!has_text)
+        return {};
+    return text;
 }
 
 CSSRuleList const& StyleSheetState::rules() const
 {
     if (!m_rules) {
         auto& sheet = const_cast<StyleSheetState&>(*this);
-        m_rules = CSSRuleList::create(RustRuleList { Parser::ValueParserFFI::rust_rule_list_retain(m_native_sheet.rules().handle()) }, m_parsing_document);
+        m_rules = CSSRuleList::create(m_native_sheet.rules(), m_parsing_document);
         m_rules->set_parent_style_sheet(&sheet);
-        m_rules->on_change = [&sheet]() { sheet.recalculate_rule_caches(); };
     }
     return *m_rules;
 }
@@ -221,71 +251,50 @@ size_t StyleSheetState::external_memory_size() const
     size = JS::saturating_add_external_memory_size(size, JS::utf16_string_external_memory_size(m_title));
     if (!m_rules)
         size = JS::saturating_add_external_memory_size(size, m_native_sheet.rules().external_memory_size());
-    if (m_source_text.has_value())
-        size = JS::saturating_add_external_memory_size(size, JS::utf16_string_external_memory_size(*m_source_text));
     size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_css_connected_font_faces));
     size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_import_rules));
     size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_imports));
     size = JS::saturating_add_external_memory_size(size, JS::hash_table_external_memory_size(m_owning_documents_or_shadow_roots));
     size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_critical_subresources));
-    size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_pending_image_values));
     return size;
 }
 
 // https://www.w3.org/TR/cssom/#dom-cssstylesheet-insertrule
 WebIDL::ExceptionOr<unsigned> StyleSheetState::insert_rule(Utf16View rule, unsigned index)
 {
-    // FIXME: 1. If the origin-clean flag is unset, throw a SecurityError exception.
-
-    // If the disallow modification flag is set, throw a NotAllowedError DOMException.
-    if (disallow_modification())
-        return WebIDL::NotAllowedError::create("Can't call insert_rule() on non-modifiable stylesheets."_utf16);
-
-    // 3. Let parsed rule be the return value of invoking parse a rule with rule.
-    auto parsed_rule = parse_css_rule(make_parsing_params(), rule);
-
-    // 4. If parsed rule is a syntax error, return parsed rule.
+    auto parsed_rule = parse_rule(rule);
     if (!parsed_rule.has_value())
         return WebIDL::SyntaxError::create("Unable to parse CSS rule."_utf16);
-
-    // 5. If parsed rule is an @import rule, and the constructed flag is set, throw a SyntaxError DOMException.
-    if (constructed() && parsed_rule->type() == CSSRule::Type::Import)
-        return WebIDL::SyntaxError::create("Can't insert @import rules into a constructed stylesheet."_utf16);
-
-    // 6. Return the result of invoking insert a CSS rule rule in the CSS rules at index.
-    auto result = CSSRuleList::insert_a_css_rule(m_native_sheet.rules(), *parsed_rule, index, CSSRuleList::Nested::No);
-
-    if (!result.is_exception()) {
-        recalculate_rule_caches();
-        record_style_rule_inserted(*parsed_rule, *this);
-
-        // OPTIMIZATION: A style rule or a keyframes rule arriving in a style element's own sheet changes only which
-        //               rules the scope holds, so dropping the rule cache is enough. Anything else can change what
-        //               the sheet as a whole contributes, which is what invalidate_owners() re-reads.
-        auto style_element_sheet = !constructed() && owner_node() && owner_node()->is_html_style_element();
-        auto rule_type = parsed_rule->type();
-        if (style_element_sheet && (rule_type == CSSRule::Type::Keyframes || rule_type == CSSRule::Type::Style))
-            invalidate_rule_cache_for_style_sheet_owners(*this);
-        else
-            invalidate_owners();
-
-        synchronize_fonts_after_rule_change();
-    }
-
+    auto result = TRY(CSSRuleList::insert_a_css_rule(m_native_sheet.rules(), *parsed_rule, index, CSSRuleList::Nested::No));
+    rule_inserted(*parsed_rule);
     return result;
 }
 
-// https://www.w3.org/TR/cssom/#dom-cssstylesheet-deleterule
-WebIDL::ExceptionOr<void> StyleSheetState::delete_rule(unsigned index)
+Optional<RustRule> StyleSheetState::parse_rule(Utf16View rule) const
 {
-    // FIXME: 1. If the origin-clean flag is unset, throw a SecurityError exception.
+    return parse_css_rule(make_parsing_params(), rule);
+}
 
-    // 2. If the disallow modification flag is set, throw a NotAllowedError DOMException.
-    if (disallow_modification())
-        return WebIDL::NotAllowedError::create("Can't call delete_rule() on non-modifiable stylesheets."_utf16);
+void StyleSheetState::rule_inserted(RustRule const& rule)
+{
+    recalculate_rule_caches();
+    record_style_rule_inserted(rule, *this);
 
-    // 3. Remove a CSS rule in the CSS rules at index.
-    TRY(CSSRuleList::validate_rule_removal(native_rules(), index));
+    // OPTIMIZATION: A style rule or a keyframes rule arriving in a style element's own sheet changes only which
+    //               rules the scope holds, so dropping the rule cache is enough. Anything else can change what
+    //               the sheet as a whole contributes, which is what invalidate_owners() re-reads.
+    auto style_element_sheet = !constructed() && owner_node() && owner_node()->is_html_style_element();
+    auto rule_type = rule.type();
+    if (style_element_sheet && (rule_type == CSSRule::Type::Keyframes || rule_type == CSSRule::Type::Style))
+        invalidate_rule_cache_for_style_sheet_owners(*this);
+    else
+        invalidate_owners();
+
+    synchronize_fonts_after_rule_change();
+}
+
+void StyleSheetState::remove_rule(u32 index)
+{
     auto removed_rule = native_rules().at(index);
     RefPtr<StyleSheetState> detached_import;
     if (auto* import = import_for_rule(removed_rule.identity()))
@@ -300,30 +309,19 @@ WebIDL::ExceptionOr<void> StyleSheetState::delete_rule(unsigned index)
     record_style_rule_removed(*this, removed_rule, detached_import.ptr());
     invalidate_owners();
     synchronize_fonts_after_rule_change();
-    return {};
 }
 
 // https://drafts.csswg.org/cssom/#dom-cssstylesheet-replace
 GC::Ref<WebIDL::Promise> StyleSheetState::replace(Utf16String text)
 {
-    // Constructed sheets remember the document whose realm created them. A stylesheet attached to a
-    // <style> element has no constructor document, so use its owner node's document instead.
-    auto& realm = constructed()
-        ? HTML::relevant_realm(*constructor_document())
-        : HTML::relevant_realm(owner_node()->document());
-    auto promise = constructed()
-        ? WebIDL::create_promise_for(*constructor_document())
-        : WebIDL::create_promise_for(owner_node()->document());
-    if (!constructed()) {
-        WebIDL::reject_promise(promise, WebIDL::NotAllowedError::create("Can't call replace() on non-constructed stylesheets"_utf16));
-        return promise;
-    }
-    if (disallow_modification()) {
-        WebIDL::reject_promise(promise, WebIDL::NotAllowedError::create("Can't call replace() on non-modifiable stylesheets"_utf16));
-        return promise;
-    }
+    // NB: The bindings rejected a sheet that is not constructed, or whose modification is disallowed. A constructed
+    //     sheet remembers the document whose realm created it.
+    VERIFY(constructed());
+    VERIFY(!disallow_modification());
+    auto& realm = HTML::relevant_realm(*constructor_document());
+    auto promise = WebIDL::create_promise_for(*constructor_document());
     set_disallow_modification(true);
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(realm.heap(), [sheet = GC::Ref { cssom_sheet() }, &realm, text = move(text), promise = GC::Root(promise)] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(realm.heap(), GC::captures(GC::Ref { cssom_sheet() }, realm, move(text), GC::Root(promise)), [](auto& sheet, auto& realm, auto& text, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
         auto& state = sheet->state();
 
@@ -331,7 +329,6 @@ GC::Ref<WebIDL::Promise> StyleSheetState::replace(Utf16String text)
         auto rules = CSS::Parser::Parser { state.make_parsing_params() }.parse_as_stylesheet_contents(text);
         rules.remove_imports();
         state.set_rules(move(rules));
-        state.invalidate_image_resource_registration();
         record_stylesheet_rules_replaced(state);
         state.invalidate_owners();
         state.synchronize_fonts_after_rule_change();
@@ -343,15 +340,9 @@ GC::Ref<WebIDL::Promise> StyleSheetState::replace(Utf16String text)
     return promise;
 }
 
-// https://drafts.csswg.org/cssom/#dom-cssstylesheet-replacesync
-WebIDL::ExceptionOr<void> StyleSheetState::replace_sync(Utf16View text)
+// https://drafts.csswg.org/cssom/#synchronously-replace-the-rules-of-a-cssstylesheet
+void StyleSheetState::replace_rules(Utf16View text)
 {
-    // 1. If the constructed flag is not set, or the disallow modification flag is set, throw a NotAllowedError DOMException.
-    if (!constructed())
-        return WebIDL::NotAllowedError::create("Can't call replaceSync() on non-constructed stylesheets"_utf16);
-    if (disallow_modification())
-        return WebIDL::NotAllowedError::create("Can't call replaceSync() on non-modifiable stylesheets"_utf16);
-
     // 2. Let rules be the result of running parse a stylesheet’s contents from text.
     auto rules = CSS::Parser::Parser { make_parsing_params() }.parse_as_stylesheet_contents(text);
 
@@ -360,51 +351,10 @@ WebIDL::ExceptionOr<void> StyleSheetState::replace_sync(Utf16View text)
 
     // 4. Set sheet’s CSS rules to rules.
     set_rules(move(rules));
-    invalidate_image_resource_registration();
 
     record_stylesheet_rules_replaced(*this);
     invalidate_owners();
     synchronize_fonts_after_rule_change();
-
-    return {};
-}
-
-// https://drafts.csswg.org/cssom/#dom-cssstylesheet-addrule
-WebIDL::ExceptionOr<WebIDL::Long> StyleSheetState::add_rule(Optional<Utf16String> selector, Optional<Utf16String> style, Optional<WebIDL::UnsignedLong> index)
-{
-    // 1. Let rule be an empty string.
-    Utf16StringBuilder rule;
-
-    // 2. Append selector to rule.
-    if (selector.has_value())
-        rule.append(selector.release_value());
-
-    // 3. Append " { " to rule.
-    rule.append_code_unit(u'{');
-
-    // 4. If block is not empty, append block, followed by a space, to rule.
-    if (style.has_value() && !style->is_empty()) {
-        rule.append(style.release_value());
-        rule.append_code_unit(u' ');
-    }
-
-    // 5. Append "}" to rule.
-    rule.append_code_unit(u'}');
-
-    // 6. Let index be optionalIndex if provided, or the number of CSS rules in the stylesheet otherwise.
-    // 7. Call insertRule(), with rule and index as arguments.
-    auto rule_text = rule.to_string();
-    TRY(insert_rule(rule_text, index.value_or(m_native_sheet.rules().size())));
-
-    // 8. Return -1.
-    return -1;
-}
-
-// https://www.w3.org/TR/cssom/#dom-cssstylesheet-removerule
-WebIDL::ExceptionOr<void> StyleSheetState::remove_rule(Optional<WebIDL::UnsignedLong> index)
-{
-    // The removeRule(index) method must run the same steps as deleteRule().
-    return delete_rule(index.value_or(0));
 }
 
 void StyleSheetState::for_each_effective_rule_data(TraversalOrder order, Function<void(RustRuleView const&, Utf16View)> const& callback) const
@@ -424,6 +374,7 @@ void StyleSheetState::add_owning_document_or_shadow_root(DOM::Node& document_or_
     VERIFY(document_or_shadow_root.is_document() || document_or_shadow_root.is_shadow_root());
     auto had_document_owner = has_document_owner();
     m_owning_documents_or_shadow_roots.set(document_or_shadow_root);
+    document_or_shadow_root.document().note_style_sheet_set_change();
 
     // CSSOM's "add a CSS style sheet" steps bail out once the disabled flag is set, so ownership alone should not
     // make a disabled sheet observable in the destination document. Delay its media-query evaluation and
@@ -433,6 +384,8 @@ void StyleSheetState::add_owning_document_or_shadow_root(DOM::Node& document_or_
 
     if (!disabled() && document_or_shadow_root.is_document() && !had_document_owner)
         document_or_shadow_root.document().font_computer().load_fonts_from_sheet(*this);
+    if (!disabled())
+        forget_font_feature_values();
 
     for (auto const& import_rule : m_import_rules) {
         if (import_rule->loaded_style_sheet())
@@ -457,8 +410,11 @@ void StyleSheetState::remove_owning_document_or_shadow_root(DOM::Node& document_
     // still style their tree, but match other browsers by not contributing shadow-scoped @font-face rules there.
     if (!disabled() && is_removing_last_document_owner)
         document_or_shadow_root.document().font_computer().unload_fonts_from_sheet(*this);
+    if (!disabled())
+        forget_font_feature_values();
 
     m_owning_documents_or_shadow_roots.remove(document_or_shadow_root);
+    document_or_shadow_root.document().note_style_sheet_set_change();
 
     for (auto const& import_rule : m_import_rules) {
         if (import_rule->loaded_style_sheet())
@@ -491,11 +447,11 @@ void StyleSheetState::set_disabled(bool disabled)
         if (document) {
             if (has_document_owner())
                 document->font_computer().load_fonts_from_sheet(*this);
-            load_pending_image_resources(*document);
         }
     } else if (document && has_document_owner()) {
         document->font_computer().unload_fonts_from_sheet(*this);
     }
+    forget_font_feature_values();
 
     invalidate_owners();
 }
@@ -511,31 +467,21 @@ void StyleSheetState::for_each_owning_style_scope(Function<void(StyleScope&)> co
     }
 }
 
-NonnullRefPtr<StyleCache> StyleSheetState::shared_single_constructed_sheet_style_cache()
+StyleRuleCache const& StyleSheetState::rule_cache()
 {
-    VERIFY(constructed());
-    if (!m_shared_single_constructed_sheet_style_cache)
-        m_shared_single_constructed_sheet_style_cache = StyleCache::create();
-    return *m_shared_single_constructed_sheet_style_cache;
-}
-
-void StyleSheetState::invalidate_shared_style_cache()
-{
-    m_shared_single_constructed_sheet_style_cache = nullptr;
-    ++m_shared_style_cache_generation;
-
-    // Imported rules contribute to their parent sheet's effective rules.
-    if (auto* import_rule = owner_import()) {
-        if (auto* parent_style_sheet = import_rule->parent_style_sheet())
-            parent_style_sheet->invalidate_shared_style_cache();
+    if (!m_rule_cache) {
+        m_rule_cache = make<StyleRuleCache>();
+        // NB: Only a constructed sheet and a user-agent sheet are asked for this.
+        m_rule_cache->add_rules_from_sheet(*this, constructed() ? CascadeOrigin::Author : CascadeOrigin::UserAgent);
     }
+    return *m_rule_cache;
 }
 
 void StyleSheetState::invalidate_owners()
 {
     auto previously_matched = m_native_sheet.media_state();
     m_native_sheet.reset_media_state();
-    invalidate_shared_style_cache();
+    m_rule_cache = nullptr;
 
     // The MediaList may have been mutated (e.g. via MediaList::set_media_text), so refresh the media state before
     // reporting what the sheet now says.
@@ -567,6 +513,7 @@ void StyleSheetState::reload_fonts_after_media_query_change()
 // and maintain this ordering.
 void StyleSheetState::synchronize_fonts_after_rule_change()
 {
+    forget_font_feature_values();
     if (!has_document_owner())
         return;
 
@@ -578,6 +525,18 @@ bool StyleSheetState::has_document_owner() const
 {
     for (auto& document_or_shadow_root : m_owning_documents_or_shadow_roots) {
         if (document_or_shadow_root->is_document())
+            return true;
+    }
+    return false;
+}
+
+bool StyleSheetState::has_counter_style_rules() const
+{
+    if (native_rules().has_counter_style_rules())
+        return true;
+    for (auto const& import_rule : m_import_rules) {
+        auto const* imported_sheet = import_rule->loaded_style_sheet();
+        if (imported_sheet && imported_sheet->has_counter_style_rules())
             return true;
     }
     return false;
@@ -603,37 +562,6 @@ Optional<::URL::URL> StyleSheetState::style_resource_base_url() const
     if (auto document = owning_document())
         return HTML::relevant_settings_object(*document).api_base_url();
     return {};
-}
-
-void StyleSheetState::load_pending_image_resources(DOM::Document& document)
-{
-    if (disabled())
-        return;
-
-    // Keep image-bearing values alive only until the pending requests below have been started.
-    // Their parsed data stays in the native rules; CSSOM wrappers do not own resource bindings.
-    struct Context {
-        StyleSheetState& sheet;
-        Vector<NonnullRefPtr<StyleValue const>> images;
-    } context { *this, {} };
-    // A constructed sheet can be adopted by many shadow roots in the same document. Discover
-    // its images once, unless a rule-list mutation gives it new resources to register.
-    if (exchange(m_needs_image_resource_registration, false)) {
-        Parser::ValueParserFFI::rust_rule_list_visit_images(m_native_sheet.rules().handle(), &context, [](void* data, void const* value) {
-            auto& context = *static_cast<Context*>(data);
-            auto image = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(value)));
-            const_cast<StyleValue&>(*image).set_style_sheet(&context.sheet);
-            context.images.append(move(image));
-        });
-    }
-
-    auto pending = move(m_pending_image_values);
-    for (auto const& weak_image_value : pending) {
-        if (auto* image_value = weak_image_value.ptr()) {
-            image_value->update_style_sheet_resource_context(*this);
-            image_value->load_any_resources(document);
-        }
-    }
 }
 
 // A sheet whose media stopped matching contributes nothing, so its declarations have to be taken
@@ -675,11 +603,11 @@ bool StyleSheetState::evaluate_media_queries(DOM::Document const& document, Pars
         state = m_document_media_states.end() - 1;
     }
     MediaEnvironmentSnapshot environment { document };
-    result = Parser::ValueParserFFI::rust_style_sheet_evaluate_media_queries(m_native_sheet.handle(), environment.ffi_environment(), (*state)->state, mutable_document.style_computer().style_engine().rust_handle());
+    result = Parser::ValueParserFFI::rust_style_sheet_evaluate_media_queries(m_native_sheet.handle(), environment.ffi_environment(), (*state)->state, mutable_document.style_computer().style_engine().host());
     if (result.sheet_changed)
         record_conditions_for_owners();
     if (result.any_changed) {
-        invalidate_shared_style_cache();
+        m_rule_cache = nullptr;
         if (owner_import())
             record_stylesheet_rule_conditions(*this, mutable_document);
     }
@@ -734,8 +662,7 @@ void StyleSheetState::remove_css_connected_font_face(u64 rule_identity)
 
 void StyleSheetState::recalculate_rule_caches()
 {
-    invalidate_image_resource_registration();
-    invalidate_shared_style_cache();
+    m_rule_cache = nullptr;
 
     m_import_rules.clear();
     auto previous_imports = move(m_imports);
@@ -863,21 +790,6 @@ Parser::ParsingParams StyleSheetState::make_parsing_params() const
     return parsing_params;
 }
 
-StringView StyleSheetState::loading_state_name(LoadingState loading_state)
-{
-    switch (loading_state) {
-    case LoadingState::Unloaded:
-        return "Unloaded"sv;
-    case LoadingState::Loading:
-        return "Loading"sv;
-    case LoadingState::Loaded:
-        return "Loaded"sv;
-    case LoadingState::Error:
-        return "Error"sv;
-    }
-    VERIFY_NOT_REACHED();
-}
-
 CSSStyleSheet& StyleSheetState::cssom_sheet() const
 {
     if (!m_cssom_sheet)
@@ -890,7 +802,7 @@ GC::Ref<MediaList> StyleSheetState::media() const
     if (auto* import = owner_import())
         return import->media();
     if (!m_media) {
-        m_media = MediaList::create(native_media_list().retain());
+        m_media = MediaList::create(native_media_list());
         m_media->set_associated_style_sheet(const_cast<StyleSheetState&>(*this));
     }
     return *m_media;
@@ -926,16 +838,6 @@ void StyleSheetState::set_parent_css_style_sheet(StyleSheetState* parent)
     m_parent_style_sheet = parent;
     if (m_cssom_sheet)
         m_cssom_sheet->update_owner_chain();
-}
-
-// https://drafts.csswg.org/cssom/#dom-stylesheet-title
-Optional<Utf16String> StyleSheetState::title_for_bindings() const
-{
-    // The title attribute must return the title or null if title is the empty string.
-    if (m_title.is_empty())
-        return {};
-
-    return m_title;
 }
 
 }
