@@ -464,20 +464,20 @@ void ViewImplementation::set_hosts_remote_layer(bool hosts_remote_layer)
     if (!hosts_remote_layer) {
         if (auto remote_layer_id = exchange(m_remote_layer_id, {}); remote_layer_id.has_value()) {
             Application::the().destroy_remote_layer(*remote_layer_id);
-            did_create_remote_layer(0);
+            did_create_remote_layer({});
         }
         return;
     }
 
     auto remote_layer = Application::the().create_remote_layer();
     if (!remote_layer.has_value()) {
-        did_create_remote_layer(0);
+        did_create_remote_layer({});
         return;
     }
     m_remote_layer_id = remote_layer->id;
     update_remote_layer_fit();
     Application::the().show_context_in_remote_layer(remote_layer->id, page().compositor_context_id());
-    did_create_remote_layer(remote_layer->core_animation_context_id);
+    did_create_remote_layer(remote_layer->host_handle);
 }
 
 void ViewImplementation::take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)> callback)
@@ -4511,6 +4511,22 @@ void ViewImplementation::content_settings_changed()
     // The page displaying the tab, and any page chosen to host its next document, host the tab's traversable.
     send_force_dark(page());
     traversable().for_each_pending_host(send_force_dark);
+    send_force_dark_to_embedded_pages();
+}
+
+// A page embedding out-of-process iframes of the tab has no local traversable to resolve force-dark for, so it takes the
+// tab's own: what applies to the host of the tab's top-level document.
+void ViewImplementation::send_force_dark_to_embedded_page(WebContentPage& page) const
+{
+    page.async_set_force_dark_for_local_roots(Application::settings().force_dark_for_host(current_host_for_settings()));
+}
+
+void ViewImplementation::send_force_dark_to_embedded_pages() const
+{
+    traversable().for_each_hosting_page([&](WebContentPage& page) {
+        if (&page != &this->page())
+            send_force_dark_to_embedded_page(page);
+    });
 }
 
 void ViewImplementation::browsing_behavior_changed()

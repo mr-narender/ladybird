@@ -33,6 +33,7 @@ namespace Web::Fetch::Engine {
 
 class FetchBodyDeliveryGate;
 class FetchByteChannel;
+class FetchEngineRecord;
 class WholeBodyTransport;
 
 }
@@ -41,6 +42,7 @@ class WholeBodyTransport;
 //     that fetch gives it, which hold the cells they use in roots.
 GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchBodyDeliveryGate);
 GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchByteChannel);
+GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchEngineRecord);
 GC_UNTRACED_CAPTURE_WITH_ROOTED_CALLBACKS(Web::Fetch::Engine::WholeBodyTransport);
 GC_UNTRACED_CAPTURE(Gfx::Typeface);
 GC_UNTRACED_CAPTURE(HTTP::HeaderList);
@@ -242,10 +244,7 @@ class CookieStore;
 
 namespace Web::CredentialManagement {
 
-class Credential;
 class CredentialsContainer;
-class FederatedCredential;
-class PasswordCredential;
 
 }
 
@@ -564,9 +563,7 @@ class FileSystemEntry;
 
 namespace Web::EventTiming {
 
-class EventCounts;
 class PerformanceEventTiming;
-struct WindowEventTimingState;
 
 }
 
@@ -586,6 +583,12 @@ class FetchBodyDeliveryGate;
 class FetchByteChannel;
 class NetworkTransportHandle;
 class WholeBodyTransport;
+
+}
+
+namespace Web::Fetch::Engine::Event {
+
+struct NetworkActivity;
 
 }
 
@@ -972,9 +975,7 @@ namespace Web::MimeSniff {
 
 namespace Web::NavigationTiming {
 
-class PerformanceNavigation;
 class PerformanceNavigationTiming;
-class PerformanceTiming;
 
 }
 
@@ -1077,16 +1078,7 @@ using WorkerType = Bindings::WorkerType;
 
 namespace Web::Speech {
 
-class SpeechGrammar;
-class SpeechGrammarList;
-class SpeechRecognition;
-class SpeechRecognitionAlternative;
-class SpeechRecognitionEvent;
-class SpeechRecognitionResult;
-class SpeechRecognitionResultList;
 class SpeechSynthesis;
-class SpeechSynthesisUtterance;
-class SpeechSynthesisVoice;
 
 }
 
@@ -1195,13 +1187,6 @@ class UIEvent;
 namespace Web::DOMURL {
 
 class URLSearchParams;
-
-}
-
-namespace Web::UserTiming {
-
-class PerformanceMark;
-class PerformanceMeasure;
 
 }
 

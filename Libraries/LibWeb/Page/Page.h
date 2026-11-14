@@ -289,6 +289,8 @@ public:
     void did_complete_window_rect_request(u64 completion_id);
     void set_window_rect_observer(GC::Ptr<GC::Function<void(DevicePixelRect, u64)>> window_rect_observer) { m_window_rect_observer = window_rect_observer; }
 
+    void did_receive_network_activity(Fetch::Engine::Event::NetworkActivity const&);
+
     void did_request_alert(Utf16String const& message);
     void alert_closed();
 
@@ -475,6 +477,11 @@ public:
     void set_user_style(Utf16String source);
     void invalidate_user_style();
     void invalidate_style_for_preference_change();
+
+    // Whether force-dark applies to the local roots of a page that embeds out-of-process iframes of a tab, which takes it
+    // from the UI process rather than from a local traversable of its own.
+    bool force_dark_for_local_roots() const { return m_force_dark_for_local_roots; }
+    void set_force_dark_for_local_roots(bool);
 
     bool content_blocking_enabled_for_url(Optional<URL::URL> const&) const;
     void set_content_blocking_policy(bool enabled, ReadonlySpan<String> disabled_sites);
@@ -691,6 +698,7 @@ private:
     bool m_listen_for_dom_mutations { false };
     bool m_accessibility_interested { false };
     Optional<CSS::PreferredColorScheme> m_preferred_color_scheme_override_for_testing;
+    bool m_force_dark_for_local_roots { false };
 
     // The chain of containers above a document leaves this process at a hosted root, and the process holding the
     // container above runs the steps for the rest of it.

@@ -26,7 +26,6 @@ use crate::bytecode::executable_data::PendingClassBlueprint;
 use crate::bytecode::instruction::Instruction;
 use crate::bytecode::instruction::OpCode;
 use crate::bytecode::instruction::typed as op;
-use crate::bytecode::instruction::typed::TypedInstruction;
 use crate::bytecode::operand::*;
 use crate::bytecode::source_map::SourceOffset;
 use crate::parser::EnclosingCode;
@@ -38,7 +37,6 @@ use super::environment::EnclosingEnvironmentScope;
 use super::environment::EnvironmentCoordinateScope;
 use super::names::NameClass;
 use super::names::NameTables;
-use super::registers::ScopedOperand;
 
 /// The most entries that a table keeps its memory for when the next compile takes over.
 pub(super) const MAXIMUM_SPARE_CAPACITY: usize = 1024;
@@ -58,7 +56,7 @@ pub struct CodegenContext {
     pub(super) constants: ConstantTable,
     pub(super) names: NameTables,
 
-    pub(super) lexical_environment_register_stack: Vec<ScopedOperand>,
+    pub(super) lexical_environment_register_stack: Vec<Operand>,
     pub(super) environment_coordinate_scope_stack: Vec<EnvironmentCoordinateScope>,
     pub(super) initialized_locals: Vec<bool>,
     pub(super) initialized_arguments: Vec<bool>,
@@ -104,7 +102,7 @@ pub struct Generator<'t> {
     pub(super) creates_environment: bool,
     pub(super) stack_limit: usize,
 
-    pub(super) this_value_needs_environment_resolution: bool,
+    pub(super) this_value_needs_resolution: bool,
     pub(super) enclosing_function_kind: FunctionKind,
     pub(super) builtin_abstract_operations_enabled: bool,
     pub(super) eager_compile_direct_iifes: bool,
@@ -182,7 +180,7 @@ impl<'t> Generator<'t> {
             strict: false,
             creates_environment: true,
             stack_limit,
-            this_value_needs_environment_resolution: true,
+            this_value_needs_resolution: true,
             enclosing_function_kind: FunctionKind::Normal,
             builtin_abstract_operations_enabled: false,
             eager_compile_direct_iifes: false,
@@ -223,50 +221,36 @@ impl<'t> Generator<'t> {
         self.enclosing_function_kind != FunctionKind::Normal
     }
 
-    // --- Register management ---
-
-    /// Allocate a new register (or reuse a freed one).
-    #[inline(always)]
-    pub(super) fn allocate_register(&mut self) -> ScopedOperand {
-        ScopedOperand::plain(self.held_register())
-    }
-
-    /// An operand that is not an allocated register, which stays valid for as long as the code runs.
-    #[inline(always)]
-    pub(super) fn scoped_operand(&mut self, operand: Operand) -> ScopedOperand {
-        ScopedOperand::plain(operand)
-    }
-
     // --- Constant pool ---
 
     #[inline(always)]
-    pub(super) fn add_constant_number(&mut self, value: f64) -> ScopedOperand {
-        ScopedOperand::plain(self.context.constants.add_number(value))
+    pub(super) fn add_constant_number(&mut self, value: f64) -> Operand {
+        self.context.constants.add_number(value)
     }
 
     #[inline(always)]
-    pub(super) fn add_constant_i32(&mut self, value: i32) -> ScopedOperand {
+    pub(super) fn add_constant_i32(&mut self, value: i32) -> Operand {
         self.add_constant_number(f64::from(value))
     }
 
     #[inline(always)]
-    pub(super) fn add_constant_boolean(&mut self, value: bool) -> ScopedOperand {
-        ScopedOperand::plain(self.context.constants.add_boolean(value))
+    pub(super) fn add_constant_boolean(&mut self, value: bool) -> Operand {
+        self.context.constants.add_boolean(value)
     }
 
     #[inline(always)]
-    pub(super) fn add_constant_null(&mut self) -> ScopedOperand {
-        ScopedOperand::plain(self.context.constants.add_null())
+    pub(super) fn add_constant_null(&mut self) -> Operand {
+        self.context.constants.add_null()
     }
 
     #[inline(always)]
-    pub(super) fn add_constant_undefined(&mut self) -> ScopedOperand {
-        ScopedOperand::plain(self.context.constants.add_undefined())
+    pub(super) fn add_constant_undefined(&mut self) -> Operand {
+        self.context.constants.add_undefined()
     }
 
     #[inline(always)]
-    pub(super) fn add_constant_string(&mut self, value: Utf16String) -> ScopedOperand {
-        ScopedOperand::plain(self.context.constants.add_string(value))
+    pub(super) fn add_constant_string(&mut self, value: Utf16String) -> Operand {
+        self.context.constants.add_string(value)
     }
 
     /// A constant of the string `text`.
@@ -276,22 +260,22 @@ impl<'t> Generator<'t> {
         context.constants.add_string_view(text, &mut context.names)
     }
 
-    pub(super) fn add_constant_bigint(&mut self, value: String) -> ScopedOperand {
-        ScopedOperand::plain(self.context.constants.add_bigint(value))
+    pub(super) fn add_constant_bigint(&mut self, value: String) -> Operand {
+        self.context.constants.add_bigint(value)
     }
 
-    pub(super) fn add_constant_well_known_symbol(&mut self, symbol: WellKnownSymbolKind) -> ScopedOperand {
-        ScopedOperand::plain(self.context.constants.add_well_known_symbol(symbol))
+    pub(super) fn add_constant_well_known_symbol(&mut self, symbol: WellKnownSymbolKind) -> Operand {
+        self.context.constants.add_well_known_symbol(symbol)
     }
 
-    pub(super) fn add_constant_abstract_operation(&mut self, operation: AbstractOperationKind) -> ScopedOperand {
-        ScopedOperand::plain(self.context.constants.add_abstract_operation(operation))
+    pub(super) fn add_constant_abstract_operation(&mut self, operation: AbstractOperationKind) -> Operand {
+        self.context.constants.add_abstract_operation(operation)
     }
 
     /// Get the constant value for a constant operand.
     #[inline(always)]
-    pub(super) fn get_constant(&self, operand: &ScopedOperand) -> Option<&ConstantValue> {
-        self.context.constants.get(operand.operand())
+    pub(super) fn get_constant(&self, operand: Operand) -> Option<&ConstantValue> {
+        self.context.constants.get(operand)
     }
 
     // --- Table interning ---
@@ -332,12 +316,9 @@ impl<'t> Generator<'t> {
     }
 
     /// If `operand` is a constant string that is not an array index, intern it as a property key and return the index.
-    pub(super) fn try_constant_string_to_property_key(
-        &mut self,
-        operand: &ScopedOperand,
-    ) -> Option<PropertyKeyTableIndex> {
+    pub(super) fn try_constant_string_to_property_key(&mut self, operand: Operand) -> Option<PropertyKeyTableIndex> {
         let context = &mut *self.context;
-        let ConstantValue::String(string) = context.constants.get(operand.operand())? else {
+        let ConstantValue::String(string) = context.constants.get(operand)? else {
             return None;
         };
         if crate::bytecode::constant_fold::is_array_index(&string.to_utf16()) {
@@ -352,19 +333,10 @@ impl<'t> Generator<'t> {
 
     // --- Instruction emission ---
 
-    /// Emits an instruction.
-    #[inline(always)]
-    pub(super) fn emit<I: TypedInstruction>(&mut self, instruction: I) {
-        if changes_environment_state(I::OPCODE) {
-            self.note_environment_change(&instruction.to_instruction());
-        }
-        self.put(instruction);
-    }
-
     /// Keep coordinate scopes in lockstep with the actual declarative environment shape. Most bindings are created
     /// explicitly, while CreateArguments can implicitly create an `arguments` binding.
     #[cold]
-    fn note_environment_change(&mut self, instruction: &Instruction) {
+    pub(super) fn note_environment_change(&mut self, instruction: &Instruction) {
         match instruction {
             Instruction::CreateVariable {
                 identifier,
@@ -399,19 +371,16 @@ impl<'t> Generator<'t> {
 
     /// Emit a Mov instruction (optimized away if src == dst).
     #[inline(always)]
-    pub(super) fn emit_mov(&mut self, dst: &ScopedOperand, src: &ScopedOperand) {
+    pub(super) fn emit_mov(&mut self, dst: Operand, src: Operand) {
         if dst != src {
-            self.emit(op::Mov {
-                dst: dst.operand(),
-                src: src.operand(),
-            });
+            self.put(op::Mov { dst, src });
         }
     }
 
     /// Emit a conditional jump, with comparison fusion and constant folding.
-    pub(super) fn emit_jump_if(&mut self, condition: &ScopedOperand, true_target: Label, false_target: Label) {
-        self.emit(op::JumpIf {
-            condition: condition.operand(),
+    pub(super) fn emit_jump_if(&mut self, condition: Operand, true_target: Label, false_target: Label) {
+        self.put(op::JumpIf {
+            condition,
             true_target,
             false_target,
         });
@@ -492,32 +461,30 @@ impl<'t> Generator<'t> {
 }
 
 impl ConstantPool for Generator<'_> {
-    type Operand = ScopedOperand;
-
-    fn get_constant(&self, operand: &ScopedOperand) -> Option<&ConstantValue> {
+    fn get_constant(&self, operand: Operand) -> Option<&ConstantValue> {
         Generator::get_constant(self, operand)
     }
 
-    fn add_constant_number(&mut self, value: f64) -> ScopedOperand {
+    fn add_constant_number(&mut self, value: f64) -> Operand {
         Generator::add_constant_number(self, value)
     }
 
-    fn add_constant_boolean(&mut self, value: bool) -> ScopedOperand {
+    fn add_constant_boolean(&mut self, value: bool) -> Operand {
         Generator::add_constant_boolean(self, value)
     }
 
-    fn add_constant_string(&mut self, value: Utf16String) -> ScopedOperand {
+    fn add_constant_string(&mut self, value: Utf16String) -> Operand {
         Generator::add_constant_string(self, value)
     }
 
-    fn add_constant_bigint(&mut self, value: String) -> ScopedOperand {
+    fn add_constant_bigint(&mut self, value: String) -> Operand {
         Generator::add_constant_bigint(self, value)
     }
 }
 
 /// Whether an instruction changes which environments there are, or which bindings they have.
 #[inline(always)]
-const fn changes_environment_state(opcode: OpCode) -> bool {
+pub(super) const fn changes_environment_state(opcode: OpCode) -> bool {
     matches!(
         opcode,
         OpCode::CreateVariable

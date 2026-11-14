@@ -15,6 +15,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/EventTiming/EventTiming.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
@@ -32,6 +33,10 @@
 #include <LibWeb/Painting/BoxViews.h>
 
 namespace Web::PaintTiming {
+
+extern "C" {
+bool web_paint_timing_is_exposed_for_paint_timing(DOM::Node const*);
+}
 
 void PendingImageRecord::visit_edges(GC::Cell::Visitor& visitor) const
 {
@@ -390,7 +395,7 @@ static bool tracks_painted_images_and_text(DOM::Document& document)
     auto window = document.window();
     if (!window)
         return false;
-    return !window->has_dispatched_scroll_event() && !window->event_timing_state().has_dispatched_input_event;
+    return !window->has_dispatched_scroll_event() && !EventTiming::has_dispatched_input_event(*window);
 }
 
 // https://w3c.github.io/paint-timing/#process-an-image-that-finished-loading
@@ -663,6 +668,15 @@ void DocumentPaintTimingState::visit_edges(GC::Cell::Visitor& visitor)
     for (auto& record : images_pending_rendering)
         visitor.visit(record.element);
     visitor.visit(text_nodes_pending_first_paint);
+}
+
+extern "C" {
+
+bool web_paint_timing_is_exposed_for_paint_timing(DOM::Node const* node)
+{
+    auto const* element = as_if<DOM::Element>(node);
+    return element && is_exposed_for_paint_timing(*element, nullptr);
+}
 }
 
 }

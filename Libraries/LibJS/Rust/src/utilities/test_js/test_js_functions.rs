@@ -54,6 +54,7 @@ pub const EXPOSED_GLOBAL_FUNCTIONS: &[(&str, RawNativeFunctionPointer)] = &[
     ("gc", raw_native!(collect_garbage)),
     ("flushCode", raw_native!(flush_code)),
     ("isCodeFlushed", raw_native!(is_code_flushed)),
+    ("parkSourceTexts", raw_native!(park_source_texts)),
     (
         "collectGarbageOnEveryAllocation",
         raw_native!(collect_garbage_on_every_allocation),
@@ -62,6 +63,7 @@ pub const EXPOSED_GLOBAL_FUNCTIONS: &[(&str, RawNativeFunctionPointer)] = &[
     ("evaluateSource", raw_native!(evaluate_source)),
     ("evaluateModule", raw_native!(evaluate_module)),
     ("runQueuedPromiseJobs", raw_native!(run_queued_promise_jobs)),
+    ("runAsyncWaitJobs", raw_native!(run_async_wait_jobs)),
     ("clearKeptObjects", raw_native!(clear_kept_objects)),
     (
         "runQueuedFinalizationRegistryCleanupJobs",
@@ -148,6 +150,12 @@ fn flush_code(vm: &Vm) -> ThrowCompletionOr<Value> {
     Ok(Value::UNDEFINED)
 }
 
+/// Compresses every source text that is large enough for that, whatever its age, and returns how many there are.
+#[allow(clippy::unnecessary_wraps, reason = "native functions return a completion")]
+fn park_source_texts(_vm: &Vm) -> ThrowCompletionOr<Value> {
+    Ok(Value::from_f64(crate::source_text::park_all_source_texts_now() as f64))
+}
+
 /// Whether the code of a function was flushed, and not compiled again yet.
 fn is_code_flushed(vm: &Vm) -> ThrowCompletionOr<Value> {
     let Some(function) = as_if::<EcmascriptFunctionObject>(vm.argument(0)) else {
@@ -198,12 +206,23 @@ fn evaluate_module(vm: &Vm) -> ThrowCompletionOr<Value> {
         Err(error) => return vm.throw_completion_with_message(ErrorKind::SyntaxError, error.error.to_string()),
     };
 
-    vm.run_module(module)
+    vm.run_module(module).map(Value::from_object)
 }
 
 #[allow(clippy::unnecessary_wraps, reason = "native functions return a completion")]
 fn run_queued_promise_jobs(vm: &Vm) -> ThrowCompletionOr<Value> {
     vm.run_queued_promise_jobs();
+    Ok(Value::UNDEFINED)
+}
+
+fn run_async_wait_jobs(vm: &Vm) -> ThrowCompletionOr<Value> {
+    if vm.is_running_promise_jobs() {
+        return vm.throw_completion_with_message(
+            ErrorKind::Error,
+            "runAsyncWaitJobs cannot run inside a promise job".to_owned(),
+        );
+    }
+    vm.run_async_wait_jobs_until(|| false)?;
     Ok(Value::UNDEFINED)
 }
 

@@ -169,6 +169,20 @@ static ErrorOr<CPUProfiler> launch_cpu_profiler(StringView server_name, pid_t pi
 #endif
 }
 
+#if defined(AK_OS_MACOS) || defined(AK_OS_LINUX)
+static Optional<PlatformFeatures::FeatureProcess> feature_process_for(ProcessType process_type)
+{
+    switch (process_type) {
+    case ProcessType::Compositor:
+        return PlatformFeatures::FeatureProcess::Compositor;
+    case ProcessType::VideoDecoderServer:
+        return PlatformFeatures::FeatureProcess::VideoDecoderServer;
+    default:
+        return {};
+    }
+}
+#endif
+
 // Spawns the helper with the given function, which returns the Process to keep track of, and returns the helper's
 // identity.
 template<typename SpawnFunction>
@@ -211,6 +225,8 @@ static ErrorOr<ChildIdentity> launch_helper_process(StringView server_name, Vect
                 warnln("Could not prepare {} crash reporting: {}", server_name, report.error());
             } else {
                 crash_report = report.release_value();
+                if (auto feature_process = feature_process_for(process_type); feature_process.has_value())
+                    crash_report->set_platform_features_description(WebView::Application::the().describe_platform_features_for_report(*feature_process));
                 // Reserve a distinct destination so dup2 clears close-on-exec
                 // in the child, including on the Linux fork/exec path.
                 auto child_fd = TRY(Core::System::fcntl(crash_report->fd(), F_DUPFD_CLOEXEC, 0));
@@ -500,6 +516,7 @@ ErrorOr<NonnullRefPtr<VideoDecoderServerControlClient>> launch_video_decoder_ser
         arguments.append("--gpu-device"sv);
         arguments.append(gpu_device_identity->to_byte_string());
     }
+    arguments.append(ByteString::formatted("--platform-features={}", WebView::Application::the().platform_features_for(PlatformFeatures::FeatureProcess::VideoDecoderServer).to_byte_string()));
     if (auto server = mach_server_name(); server.has_value()) {
         arguments.append("--mach-server-name"sv);
         arguments.append(server.value());
@@ -520,7 +537,7 @@ void shut_down_video_decoder_servers()
     s_video_decoder_servers->clear();
 }
 
-ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process()
+ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process(ByteString const& platform_features)
 {
     auto const& browser_options = WebView::Application::browser_options();
     auto const& web_content_options = WebView::Application::web_content_options();
@@ -537,8 +554,7 @@ ErrorOr<NonnullRefPtr<WebView::CompositorClient>> launch_compositor_process()
         arguments.append("--disable-sandbox"sv);
     if (web_content_options.is_test_mode == WebView::IsTestMode::Yes)
         arguments.append("--test-mode"sv);
-    if (web_content_options.force_cpu_painting == WebView::ForceCPUPainting::Yes)
-        arguments.append("--force-cpu-painting"sv);
+    arguments.append(ByteString::formatted("--platform-features={}", platform_features));
     if (web_content_options.force_fontconfig == WebView::ForceFontconfig::Yes)
         arguments.append("--force-fontconfig"sv);
     if (auto gpu_device = WebView::Application::the().platform_presentation_gpu_device(); gpu_device.has_value()) {
@@ -698,10 +714,13 @@ ErrorOr<MediaServerClientConnection> connect_new_media_server_client(RefPtr<Medi
         controller = TRY(launch_media_server_process(owner_child_id));
         controller->on_request_audio_server_connection = move(connect_audio_server);
         // Each MediaServer has a VideoDecoderServer of its own, which lives as long as the controller holding it. The
-        // server is launched once the Compositor has named the GPU that hardware decoders must output to.
+        // server is launched once the Compositor has named the GPU that hardware decoders must output to, and once this
+        // launch's probe has decided what the server may use there.
         controller->on_request_video_decoder_server_connection = [video_decoder_server = make_ref_counted<VideoDecoderServerHolder>(), owner_child_id](auto answer) {
-            Application::the().when_compositor_gpu_device_identity_is_known([video_decoder_server, owner_child_id, answer = move(answer)](auto const& gpu_device_identity) {
-                answer(connect_new_video_decoder_server_client(video_decoder_server->controller, owner_child_id, gpu_device_identity));
+            Application::the().when_compositor_gpu_device_identity_is_known([video_decoder_server, owner_child_id, answer = move(answer)](auto const& gpu_device_identity) mutable {
+                Application::the().when_platform_features_are_current([video_decoder_server, owner_child_id, gpu_device_identity, answer = move(answer)] {
+                    answer(connect_new_video_decoder_server_client(video_decoder_server->controller, owner_child_id, gpu_device_identity));
+                });
             });
         };
     }

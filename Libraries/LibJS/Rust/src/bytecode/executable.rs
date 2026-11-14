@@ -1692,7 +1692,8 @@ impl Executable {
             return None;
         }
         let source_offset = source_offset.0 as usize;
-        let view = crate::utf16::Utf16View::of_string(&positions.source);
+        let source = positions.source.get();
+        let view = crate::utf16::Utf16View::of_string(&source);
         let start = source_offset.saturating_sub(LONGEST_TEXT);
         let end = (source_offset + LONGEST_TEXT).min(view.length_in_code_units());
         let units = view.substring_view(start, end - start).code_units().collect();
@@ -1931,9 +1932,11 @@ impl Executable {
     pub fn set_interpreter_tier(&self, tier: InterpreterTier) {
         match tier {
             InterpreterTier::Plain => {}
+            #[cfg(feature = "jit")]
             InterpreterTier::Profiling => {
                 self.ensure_feedback();
             }
+            #[cfg(feature = "jit")]
             _ => {
                 self.ensure_feedback_without_value_buckets();
             }

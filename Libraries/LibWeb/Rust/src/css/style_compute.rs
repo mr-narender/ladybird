@@ -6646,6 +6646,7 @@ impl<'a> HostSampledEffects<'a> {
 /// What a sample reads of the element it samples and of the working set it samples over.
 pub(crate) struct AnimationSampleInput<'a> {
     pub(crate) style_node: u32,
+    pub(crate) record_dependencies: bool,
     /// The pseudo-element sampled, or `NO_PSEUDO_ELEMENT` for the element itself.
     pub(crate) pseudo_kind: u8,
     pub(crate) effects: HostSampledEffects<'a>,
@@ -6766,6 +6767,7 @@ impl FfiHostAnimationSample {
         };
         let input = AnimationSampleInput {
             style_node: self.style_node,
+            record_dependencies: true,
             pseudo_kind: self.pseudo_kind,
             effects,
             longhands,
@@ -6818,6 +6820,63 @@ pub unsafe extern "C" fn rust_sample_animation_effects(
     }
     let step = with_engine_and_arena(read, host, |engine, arena| {
         sample_in_engine(&sample, &mut callbacks, engine, arena)
+    });
+    finish_sample_with_host(&sample, &mut callbacks, host, read, step)
+}
+
+/// Sample an isolated effect list at the endpoint-inclusive keys supplied by the host.
+///
+/// # Safety
+/// The inputs and every value in the descriptions must remain live for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_sample_animation_effects_for_commit_styles(
+    input: &FfiHostAnimationSample,
+    descriptions: &crate::css::style::bridge::FfiAnimationEffectDescriptions,
+    read: &crate::render_state::BegunRead,
+) -> FfiHostAnimationSampleResult {
+    use crate::css::animation as anim;
+    use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
+
+    // SAFETY: Guaranteed by the caller.
+    let (host, (mut sample, mut callbacks), descriptions) =
+        unsafe { (document_host(input.host), input.adopt(), descriptions.effects()) };
+    sample.record_dependencies = false;
+    let composed = sample
+        .effects
+        .as_slice()
+        .iter()
+        .filter_map(|effect| {
+            let description = descriptions
+                .iter()
+                .find(|description| description.identity == effect.identity)?;
+            if description.keyframes().len() < 2 {
+                return None;
+            }
+            Some(anim::FfiSampledAnimationEffect {
+                effect: anim::FfiAnimationPreparationEffect {
+                    identity: effect.identity,
+                    generation: effect.generation,
+                },
+                current_key: Option::<f64>::from(effect.current_key)?,
+            })
+        })
+        .collect();
+    let step = with_engine_and_arena(read, host, |engine, arena| {
+        let element_box = crate::layout::node_data::NodeSlotId {
+            index: sample.element_box_slot,
+        };
+        let reference_box =
+            crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
+        let step = begin_animation_sample(
+            &sample,
+            &mut callbacks,
+            engine,
+            &descriptions,
+            composed,
+            reference_box,
+            Default::default(),
+        );
+        finish_sample_in_engine(&sample, &mut callbacks, engine, reference_box, step)
     });
     finish_sample_with_host(&sample, &mut callbacks, host, read, step)
 }
@@ -6878,7 +6937,7 @@ fn sample_in_engine(
     };
     let reference_box = crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
     let composed = host_sampled_effects(input, engine);
-    match begin_animation_sample(
+    let step = begin_animation_sample(
         input,
         host,
         engine,
@@ -6886,7 +6945,18 @@ fn sample_in_engine(
         composed,
         reference_box,
         Default::default(),
-    ) {
+    );
+    finish_sample_in_engine(input, host, engine, reference_box, step)
+}
+
+fn finish_sample_in_engine(
+    input: &AnimationSampleInput,
+    host: &mut dyn AnimationSampleHost,
+    engine: &mut crate::css::style::StyleEngine,
+    reference_box: Option<CssPixelRect>,
+    step: AnimationSampleStep,
+) -> AnimationSampleStep {
+    match step {
         AnimationSampleStep::Resolved(sample) => match engine_length_contexts(input, engine, &sample) {
             Some(length_contexts) => AnimationSampleStep::Sampled(finish_animation_sample(
                 input,
@@ -7200,11 +7270,11 @@ fn finish_animation_sample(
         node,
         composed,
         resolved,
-        custom_properties,
+        mut custom_properties,
         mut result,
     } = sample;
     let table = input.longhands;
-    if input.pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
+    if input.record_dependencies && input.pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
         engine
             .note_keyframes_read_parent_reset_values(node, result.keyframes_inherited_non_inherited_style_groups != 0);
     }
@@ -7280,7 +7350,7 @@ fn finish_animation_sample(
 
     let has_non_custom_property_animation = resolved.properties.iter().any(|property| property.custom_name_id == 0);
 
-    let custom_results = anim::evaluate_animations(anim::ComputedAnimationBatch {
+    let mut batch = anim::ComputedAnimationBatch {
         context: input.animation_context(Some(&length_contexts.remaining), reference_box),
         device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
         sampled_effects: &composed,
@@ -7295,7 +7365,9 @@ fn finish_animation_sample(
         overlay: host.overlay_for_mutation(),
         custom_underlying_values: &underlying_values,
         custom_initial_values: &initial_values,
-    });
+    };
+    let mut preparation = anim::prepare_animations(&mut batch);
+    let custom_results = anim::evaluate_prepared_animations(&preparation, &mut batch);
     result.outcome = FfiHostAnimationSampleOutcome::Evaluated;
     if !custom_results.is_empty() {
         let mut retained = custom_results
@@ -7316,19 +7388,33 @@ fn finish_animation_sample(
                 .cast::<crate::css::custom_properties::CustomPropertyStore>()
                 .as_ref()
         };
-        let names_in_a_cycle = engine.custom_properties_in_an_animated_cycle(
+        let cyclic_declarations = engine.check_custom_property_animation_cycles(
             node,
             cycle_pseudo,
             input.stores.base,
             input.stores.inheritance,
             &retained,
+            &mut custom_properties.intervals,
         );
-        for name in names_in_a_cycle {
-            let value = registry.invalid_at_computed_value_time(&name, inherited);
-            match retained.iter_mut().find(|(animated, _)| *animated == name) {
-                Some((_, animated)) => *animated = value,
-                None => retained.push((name, value)),
+        // NB: Preparations containing custom properties are not cached, so this sample owns its preparation.
+        let preparation =
+            std::sync::Arc::get_mut(&mut preparation).expect("custom-property preparations are not shared");
+        if preparation.replace_cyclic_custom_property_endpoints(&custom_properties.intervals, registry, inherited) {
+            retained = anim::evaluate_prepared_animations(preparation, &mut batch)
+                .into_iter()
+                .map(|(custom_name_id, value)| (custom_properties.name(custom_name_id).clone(), value))
+                .collect();
+            // NB: Resolve surviving unset markers to the inherited or initial value. See the AD-HOC comment
+            //     in PreparedAnimationBatch::replace_cyclic_custom_property_endpoints for why this is deferred.
+            for (name, value) in &mut retained {
+                if matches!(value.data(), StyleValueData::Keyword { keyword } if *keyword == keyword::UNSET) {
+                    *value = registry.invalid_at_computed_value_time(name, inherited);
+                }
             }
+        }
+        for name in cyclic_declarations {
+            let value = registry.invalid_at_computed_value_time(&name, inherited);
+            retained.push((name, value));
         }
         // The element's own custom properties that read an animated one move with it, whether or
         // not they resolved to what it inherits.
@@ -7358,6 +7444,23 @@ fn finish_animation_sample(
                 uncached_interval_values_may_need_substitution,
                 input.custom_property_registration_generation,
             );
+        }
+        assert_eq!(
+            custom_properties.registration_generation,
+            engine.custom_property_registration_generation(),
+            "animation sampling preserves custom property registrations"
+        );
+        let registry = engine.custom_property_registry();
+        let current_effects = described_effects(input, engine);
+        for interval in custom_properties.intervals {
+            let sampled_effect = composed[interval.effect_index].effect;
+            let effect = current_effects
+                .iter()
+                .find(|effect| {
+                    effect.identity == sampled_effect.identity && effect.generation == sampled_effect.generation
+                })
+                .expect("a sampled effect remains published with the same generation");
+            effect.update_retained_custom_property_interval_values(interval, registry);
         }
         let rows = retained
             .iter()

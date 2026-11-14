@@ -84,6 +84,9 @@ RENDER_STATE_ALLOWED = {
         SCRATCH,
         [
             "css/cascaded_properties.rs:STORE_POOL",
+            "css/parser/syntax_parser/structure.rs:CHILDREN",
+            "css/parser/value_parser.rs:UNRESOLVED_SOURCE",
+            "css/serialize.rs:SERIALIZATION_SINK",
         ],
     ),
     **render_state_entries(
@@ -128,6 +131,7 @@ RENDER_STATE_ALLOWED = {
         "per-thread list of what the thread let go of in its hold of the render owner's slot, dropped as the hold ends",
         ["render_state/owner.rs:DROPPED_AFTER_HOLD"],
     ),
+    f"{RENDER_STATE_CRATE}/src/css/parser/value_parser.rs:INITIAL_VALUES": "per-thread cache of the initial values of longhands, parsed outside any document; every thread parses the same values",
     f"{RENDER_STATE_CRATE}/src/render_state.rs:STACK_BASE": "per-thread cache of the thread's own stack bounds",
     f"{RENDER_STATE_CRATE}/src/layout/parallel_layout.rs:SUBTREE_LEASE_OF_THIS_THREAD": "per-thread lease of the subtree the layout task running on the thread may write, held only while LIBWEB_VERIFY_LAYOUT_FORK_SCOPE checks it and only for that task",
     f"{RENDER_STATE_CRATE}/src/layout/layout_pass.rs:WORKER_SCRATCH_OF_THIS_THREAD": "per-thread spare layout buffers and the fragment identities the thread reserved; a thread without one only allocates more and reserves another range",
@@ -157,6 +161,7 @@ RENDER_STATE_ALLOWED = {
     **render_state_entries(
         LOCKED,
         [
+            "css/parser/sheet_source_text.rs:QUEUE",
             "css/parser/stylesheet_cache.rs:CACHE",
         ],
     ),
@@ -187,6 +192,7 @@ RENDER_STATE_ALLOWED = {
     f"{RENDER_STATE_CRATE}/src/css/parser/value_parser.rs:LISTS": "built-once immutable lists of initial background values",
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD": "a test's hold on the next recording that flies, behind a mutex; only internals arms it",
     f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:RECORDING_HOLD_RELEASED": "wakes the recording a test held once it lets it go",
+    f"{RENDER_STATE_CRATE}/src/painting/recording_slot.rs:CLAIM_HOLD_BLOCKS_RENDER_THREAD": "whether a test's claim hold blocks the Render thread, which a thread about to wait for that thread reads without the hold's mutex",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:THREAD_SETUP": "set once before the first stage thread starts, which runs it; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:FLIGHT_FINISHED": "set once before the first job is submitted, which a stage thread calls when one finishes; read-only after",
     f"{RENDER_STATE_CRATE}/src/stage_thread.rs:RENDER_THREAD": "the process's one Render thread, which every thread hands its jobs to",

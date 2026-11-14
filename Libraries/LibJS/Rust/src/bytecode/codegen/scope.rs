@@ -48,7 +48,6 @@ use super::bindings::*;
 use super::context::Generator;
 use super::environment::BindingLocation;
 use super::nodes::Identifier;
-use super::registers::ScopedOperand;
 use super::stream::Control;
 use super::stream::HeldRegisters;
 use super::stream::ScopeEnvironment;
@@ -163,6 +162,13 @@ impl ScopeBinding {
     }
 }
 
+/// A simple parameter, including repeated occurrences of the same binding.
+struct SimpleParameter {
+    name: Name,
+    is_captured: bool,
+    is_first: bool,
+}
+
 /// What `declare_parameters()` has to know of a parameter that is more than a name.
 #[derive(Clone, Copy)]
 pub(super) struct ParameterShape {
@@ -210,8 +216,8 @@ pub struct CodeScope {
     bitmap_end: usize,
     next_bit: usize,
     environment_binding_count: u32,
-    /// The names of simple parameters, and whether each is in the environment.
-    simple_parameters: Vec<(Name, bool)>,
+    /// Simple parameters in source order, including duplicates for mapped arguments.
+    simple_parameters: Vec<SimpleParameter>,
     /// Whether the body has a scope of its own, apart from the parameters.
     has_parameter_scope: bool,
     /// Whether a name can still be in the dead zone of a parameter.
@@ -375,16 +381,11 @@ impl CodeScope {
     }
 }
 
-/// Whether the function at a row with `flags` gets `this` from its environment, which the code of a class always does.
+/// Whether the function at a row with `flags` gets `this` from its environment, which the initializers of a class
+/// always do.
 fn this_comes_from_environment(flags: u32) -> bool {
     use function_flag::*;
-    flags
-        & (SCOPE_THIS_FROM_ENVIRONMENT
-            | INSIGHT_THIS_FROM_ENVIRONMENT
-            | FIELD_INITIALIZER
-            | STATIC_BLOCK
-            | DEFAULT_CONSTRUCTOR)
-        != 0
+    flags & (SCOPE_THIS_FROM_ENVIRONMENT | INSIGHT_THIS_FROM_ENVIRONMENT | FIELD_INITIALIZER | STATIC_BLOCK) != 0
 }
 
 /// Reads a variable length integer of a summary.
@@ -412,7 +413,10 @@ impl Generator<'_> {
         let (summary_start, summary_end) = index.summary_range(row.0);
         let summary = &index.summaries[summary_start..summary_end];
         self.strict = flags & function_flag::STRICT != 0;
-        self.this_value_needs_environment_resolution = this_comes_from_environment(flags);
+        let this_from_environment = this_comes_from_environment(flags);
+        // NB: The this value of a derived constructor is not initialized until it calls super(), which its frame keeps
+        //     track of if it has no environment for it.
+        self.this_value_needs_resolution = this_from_environment || flags & function_flag::DERIVED_CONSTRUCTOR != 0;
         self.enclosing_function_kind = FunctionKind::from_async_generator(
             flags & function_flag::ASYNC != 0,
             flags & function_flag::GENERATOR != 0,
@@ -459,7 +463,7 @@ impl Generator<'_> {
         self.put(op::Enter {});
         let needs_function_environment = has_captures
             || flags & function_flag::CONTAINS_EVAL != 0
-            || (!is_arrow && self.this_value_needs_environment_resolution)
+            || (!is_arrow && this_from_environment)
             || (!is_arrow
                 && flags & function_flag::CAPTURES_ARGUMENTS != 0
                 && flags & (function_flag::MIGHT_NEED_ARGUMENTS | function_flag::USES_ARGUMENTS) != 0)
@@ -651,10 +655,7 @@ impl Generator<'_> {
             });
             if let Location::Local(index) = location {
                 let empty = generator.context.constants.add_empty();
-                generator.put(op::Mov {
-                    dst: Operand::local(index),
-                    src: empty,
-                });
+                generator.emit_mov(Operand::local(index), empty);
             }
         });
     }
@@ -664,7 +665,7 @@ impl Generator<'_> {
         if !self.creates_environment {
             self.creates_environment = true;
             self.in_function_head(|generator| {
-                generator.emit(op::GetLexicalEnvironment {
+                generator.put(op::GetLexicalEnvironment {
                     dst: Operand::register(Register::SAVED_LEXICAL_ENVIRONMENT),
                 });
             });
@@ -679,18 +680,18 @@ impl Generator<'_> {
         register: Option<Operand>,
     ) -> ScopeEnvironment {
         self.note_creates_environment();
-        let parent = self.current_lexical_environment().operand();
+        let parent = self.current_lexical_environment();
         let held = self.hold_registers();
         let register = register.unwrap_or_else(|| self.held_register());
         let shape_cache = self.next_environment_shape_cache();
-        self.emit(op::CreateLexicalEnvironment {
+        self.put(op::CreateLexicalEnvironment {
             dst: register,
             parent,
             capacity: bindings.captured_count,
             shape_cache,
             is_catch_environment: is_catch,
         });
-        self.push_static_lexical_environment(ScopedOperand::plain(register));
+        self.push_static_lexical_environment(register);
         self.context.scope.scope_environment_depth += 1;
         self.for_each_scope_binding(bindings, |generator, binding| {
             if !binding.is_captured {
@@ -698,7 +699,7 @@ impl Generator<'_> {
             }
             let identifier = generator.intern_identifier(binding.name);
             let is_const = binding.kind == BindingKind::Const;
-            generator.emit(op::CreateVariable {
+            generator.put(op::CreateVariable {
                 identifier,
                 mode: libjs_abi::EnvironmentMode::Lexical as u8,
                 is_immutable: is_const,
@@ -713,8 +714,8 @@ impl Generator<'_> {
         self.pop_tracked_lexical_environment();
         self.context.scope.scope_environment_depth -= 1;
         if !self.is_stream_dead() {
-            let parent = self.scoped_operand(environment.parent);
-            self.restore_lexical_environment(&parent);
+            let parent = environment.parent;
+            self.restore_lexical_environment(parent);
         }
         self.release_held_registers(environment.held);
     }
@@ -722,10 +723,10 @@ impl Generator<'_> {
     /// The body of a `with` starts, whose environment is `object`.
     pub(super) fn enter_object_environment(&mut self, object: Operand, held: HeldRegisters) -> ScopeEnvironment {
         self.note_creates_environment();
-        let parent = self.current_lexical_environment().operand();
+        let parent = self.current_lexical_environment();
         let register = self.held_register();
-        self.emit(op::EnterObjectEnvironment { dst: register, object });
-        self.push_dynamic_lexical_environment(ScopedOperand::plain(register));
+        self.put(op::EnterObjectEnvironment { dst: register, object });
+        self.push_dynamic_lexical_environment(register);
         let scope = &mut self.context.scope;
         scope.scope_environment_depth += 1;
         scope.with_depth += 1;
@@ -750,8 +751,8 @@ impl Generator<'_> {
         });
         self.pop_tracked_lexical_environment();
         self.context.scope.scope_environment_depth -= 1;
-        let parent = self.scoped_operand(environment.parent);
-        self.restore_lexical_environment(&parent);
+        let parent = environment.parent;
+        self.restore_lexical_environment(parent);
         self.enter_scope_environment(bindings, false, Some(environment.register));
         for (identifier, value) in names {
             emit_initialize_lexical_binding(self, identifier, value);
@@ -795,7 +796,7 @@ impl Generator<'_> {
                 let first_temporary = generator.next_temporary();
                 let identifier = generator.intern_identifier(name);
                 let value = initial_value(generator);
-                generator.emit(op::CreateVariable {
+                generator.put(op::CreateVariable {
                     identifier,
                     mode: libjs_abi::EnvironmentMode::Var as u8,
                     is_immutable: false,
@@ -818,10 +819,7 @@ impl Generator<'_> {
             self.in_head(|generator| {
                 let first_temporary = generator.next_temporary();
                 let value = initial_value(generator);
-                generator.put(op::Mov {
-                    dst: Operand::local(index),
-                    src: value,
-                });
+                generator.emit_mov(Operand::local(index), value);
                 generator.release_temporaries_from(first_temporary);
             });
             Location::Local(index)
@@ -854,7 +852,7 @@ impl Generator<'_> {
         let location = if binding.is_captured {
             self.in_head(|generator| {
                 let identifier = generator.intern_identifier(name);
-                generator.emit(op::CreateVariable {
+                generator.put(op::CreateVariable {
                     identifier,
                     mode: libjs_abi::EnvironmentMode::Lexical as u8,
                     is_immutable: is_const,
@@ -958,30 +956,51 @@ impl Generator<'_> {
         let mut names = std::mem::take(&mut self.context.scope.simple_parameters);
         names.clear();
         let mut has_duplicates = false;
-        for &name in parameter_names {
+        for (index, &name) in parameter_names.iter().enumerate() {
+            let first = self.context.scope.binding_of(name);
             // NB: A name that comes up again is the one binding, of which the summary knows once.
-            let first = names.iter().find(|&&(known, _)| known == name).copied();
-            has_duplicates |= first.is_some();
             let is_captured = match first {
-                Some((_, is_captured)) => is_captured,
+                Some(first) => self.context.scope.binding(first).location == Location::Environment,
                 None => self.next_binding_is_captured() || forces_environment,
             };
-            names.push((name, is_captured));
+            has_duplicates |= first.is_some();
+            names.push(SimpleParameter {
+                name,
+                is_captured,
+                is_first: first.is_none(),
+            });
+            let location = if is_captured {
+                Location::Environment
+            } else {
+                Location::Argument(u32_from_usize(index))
+            };
+            let scope = &mut self.context.scope;
+            scope.parameters.push((name, !is_captured));
+            scope.add_binding(Binding {
+                name,
+                location,
+                kind: None,
+                is_global: false,
+                block: BlockId::default(),
+                shadowed: None,
+                is_catch_parameter: false,
+                in_parameters: false,
+                is_parameter: false,
+            });
         }
-        let creates_bindings = is_mapped && !names.is_empty() && names.iter().all(|&(_, is_captured)| is_captured);
-        let has_environment_parameters = names.iter().any(|&(_, is_captured)| is_captured);
+        let creates_bindings = is_mapped && !names.is_empty() && names.iter().all(|parameter| parameter.is_captured);
+        let has_environment_parameters = names.iter().any(|parameter| parameter.is_captured);
         if has_environment_parameters || needs_arguments_object {
             self.in_head(|generator| {
-                for (index, &(name, is_captured)) in names.iter().enumerate() {
-                    let is_first = !names[..index].iter().any(|&(known, _)| known == name);
-                    if !is_captured || !is_first {
+                for parameter in &names {
+                    if !parameter.is_captured || !parameter.is_first {
                         continue;
                     }
-                    let identifier = generator.intern_identifier(name);
+                    let identifier = generator.intern_identifier(parameter.name);
                     if creates_bindings {
                         generator.record_environment_binding_created_elsewhere(identifier);
                     } else {
-                        generator.emit(op::CreateVariable {
+                        generator.put(op::CreateVariable {
                             identifier,
                             mode: libjs_abi::EnvironmentMode::Lexical as u8,
                             is_immutable: false,
@@ -999,14 +1018,13 @@ impl Generator<'_> {
         if has_environment_parameters {
             self.in_head(|generator| {
                 let undefined = generator.context.constants.add_undefined();
-                for (index, &(name, is_captured)) in names.iter().enumerate() {
-                    if !is_captured {
+                for (index, parameter) in names.iter().enumerate() {
+                    if !parameter.is_captured {
                         continue;
                     }
-                    let identifier = generator.intern_identifier(name);
-                    let is_first = !names[..index].iter().any(|&(known, _)| known == name);
+                    let identifier = generator.intern_identifier(parameter.name);
                     if has_duplicates {
-                        if is_first {
+                        if parameter.is_first {
                             emit_initialize_lexical_binding(generator, identifier, undefined);
                         }
                         emit_set_lexical_binding(generator, identifier, Operand::argument(u32_from_usize(index)));
@@ -1021,25 +1039,6 @@ impl Generator<'_> {
             });
         }
         let scope = &mut self.context.scope;
-        for (index, &(name, is_captured)) in names.iter().enumerate() {
-            let location = if is_captured {
-                Location::Environment
-            } else {
-                Location::Argument(u32_from_usize(index))
-            };
-            scope.parameters.push((name, !is_captured));
-            scope.add_binding(Binding {
-                name,
-                location,
-                kind: None,
-                is_global: false,
-                block: BlockId::default(),
-                shadowed: None,
-                is_catch_parameter: false,
-                in_parameters: false,
-                is_parameter: false,
-            });
-        }
         scope.has_mapped_parameters = is_mapped;
         scope.simple_parameters = names;
     }
@@ -1060,7 +1059,7 @@ impl Generator<'_> {
                     emit_set_lexical_binding(generator, identifier, Operand::argument(index));
                     return;
                 }
-                generator.emit(op::CreateVariable {
+                generator.put(op::CreateVariable {
                     identifier,
                     mode: libjs_abi::EnvironmentMode::Lexical as u8,
                     is_immutable: false,
@@ -1108,7 +1107,7 @@ impl Generator<'_> {
         let location = if is_captured {
             self.in_head(|generator| {
                 let identifier = generator.intern_identifier(name);
-                generator.emit(op::CreateVariable {
+                generator.put(op::CreateVariable {
                     identifier,
                     mode: libjs_abi::EnvironmentMode::Lexical as u8,
                     is_immutable: false,
@@ -1184,7 +1183,7 @@ impl Generator<'_> {
             _ => None,
         };
         self.in_head(|generator| {
-            generator.emit(op::CreateArguments {
+            generator.put(op::CreateArguments {
                 dst,
                 kind: kind as u8,
                 is_immutable: is_strict,
@@ -1227,14 +1226,12 @@ impl Generator<'_> {
                 && (scope.has_function_in_parameters || parameters_have_environment));
         if needs_variable_environment {
             self.note_creates_environment();
-            let environment = ScopedOperand::plain(self.held_register());
+            let environment = self.held_register();
             self.in_head(|generator| {
-                generator.emit(op::CreateVariableEnvironment {
+                generator.put(op::CreateVariableEnvironment {
                     capacity: captured_count,
                 });
-                generator.emit(op::GetLexicalEnvironment {
-                    dst: environment.operand(),
-                });
+                generator.put(op::GetLexicalEnvironment { dst: environment });
             });
             self.push_static_variable_environment(environment);
             let scope = &mut self.context.scope;
@@ -1311,7 +1308,7 @@ impl Generator<'_> {
         let location = if is_captured {
             self.in_head(|generator| {
                 let identifier = generator.intern_identifier(name);
-                generator.emit(op::CreateVariable {
+                generator.put(op::CreateVariable {
                     identifier,
                     mode: libjs_abi::EnvironmentMode::Lexical as u8,
                     is_immutable: is_const,
@@ -1619,17 +1616,17 @@ impl Generator<'_> {
         let held = self.hold_registers();
         let register = self.held_register();
         let shape_cache = self.next_environment_shape_cache();
-        self.emit(op::CreateLexicalEnvironment {
+        self.put(op::CreateLexicalEnvironment {
             dst: register,
-            parent: parent.operand(),
+            parent,
             capacity: 1,
             shape_cache,
             is_catch_environment: false,
         });
-        self.push_static_lexical_environment(ScopedOperand::plain(register));
+        self.push_static_lexical_environment(register);
         self.context.scope.scope_environment_depth += 1;
         let identifier = self.intern_identifier(name);
-        self.emit(op::CreateVariable {
+        self.put(op::CreateVariable {
             identifier,
             mode: libjs_abi::EnvironmentMode::Lexical as u8,
             is_immutable: true,
@@ -1639,11 +1636,7 @@ impl Generator<'_> {
         let shared_function_data_index = self.register_nested_function(row, NestedFunctionName::None);
         self.put_new_function(dst, shared_function_data_index);
         emit_initialize_lexical_binding(self, identifier, dst);
-        self.leave_scope_environment(ScopeEnvironment {
-            register,
-            parent: parent.operand(),
-            held,
-        });
+        self.leave_scope_environment(ScopeEnvironment { register, parent, held });
         self.push_value(dst, first_temporary);
     }
 
@@ -1784,24 +1777,24 @@ impl Generator<'_> {
     /// The scope of a class starts, whose name is a binding of its own that everything in the class sees.
     pub(super) fn begin_class_scope(&mut self, name: Option<Name>) -> ScopeEnvironment {
         self.note_creates_environment();
-        let parent = self.current_lexical_environment().operand();
+        let parent = self.current_lexical_environment();
         let held = self.hold_registers();
         let register = self.held_register();
         let shape_cache = self.next_environment_shape_cache();
-        self.emit(op::CreateLexicalEnvironment {
+        self.put(op::CreateLexicalEnvironment {
             dst: register,
             parent,
             capacity: u32::from(name.is_some()),
             shape_cache,
             is_catch_environment: false,
         });
-        self.push_static_lexical_environment(ScopedOperand::plain(register));
+        self.push_static_lexical_environment(register);
         let scope = &mut self.context.scope;
         scope.scope_environment_depth += 1;
         scope.block_begin();
         if let Some(name) = name {
             let identifier = self.intern_identifier(name);
-            self.emit(op::CreateVariable {
+            self.put(op::CreateVariable {
                 identifier,
                 mode: libjs_abi::EnvironmentMode::Lexical as u8,
                 is_immutable: true,
@@ -1839,8 +1832,8 @@ impl Generator<'_> {
         let scope = &mut self.context.scope;
         scope.scope_environment_depth -= 1;
         scope.block_end();
-        let parent = self.scoped_operand(environment.parent);
-        self.restore_lexical_environment(&parent);
+        let parent = environment.parent;
+        self.restore_lexical_environment(parent);
     }
 
     /// Finishes the function: what the functions nested in it need, what the function object needs, and the code.
@@ -2001,7 +1994,7 @@ impl Generator<'_> {
             let names = &context.scope.simple_parameters;
             names
                 .iter()
-                .map(|&(name, _)| context.names.fly_string_of(tree, name))
+                .map(|parameter| context.names.fly_string_of(tree, parameter.name))
                 .collect()
         } else {
             Box::default()

@@ -777,7 +777,7 @@ protected:
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) { }
     // The view's remote layer was made, or made again. The ID is 0 when there is none, and frames arrive in backing
     // stores instead.
-    virtual void did_create_remote_layer(u32 core_animation_context_id) { (void)core_animation_context_id; }
+    virtual void did_create_remote_layer(Compositing::RemoteLayerHostHandle) { }
     virtual void did_present_frame_in_remote_layer(Gfx::IntSize, double device_pixel_ratio) { (void)device_pixel_ratio; }
     virtual void did_hold_synchronized_resize_frame(u64 token) { (void)token; }
     virtual void did_commit_synchronized_resize(u64 token) { (void)token; }
@@ -838,6 +838,8 @@ protected:
     // The view to show a tab or window opened from this view in, or null for the application to open one of its own.
     virtual ViewImplementation* create_view_for_new_tab_or_window(IsPrivate) { return nullptr; }
     void apply_zoom_for_current_host();
+    void send_force_dark_to_embedded_page(WebContentPage&) const;
+    void send_force_dark_to_embedded_pages() const;
 
     void handle_resize();
     void fail_pending_debugger_requests();

@@ -20,7 +20,7 @@ use super::bridge::{
 };
 use super::tree::StyleNodeID;
 use super::weak_pool::WeakPool;
-use crate::css::animation::FfiCompositeOperation;
+use crate::css::animation::{CustomPropertyInterval, FfiCompositeOperation};
 use crate::css::custom_properties::CustomPropertyRegistry;
 use crate::css::easing::{Easing, FfiEasingDescriptor, FfiEasingKind, FfiLinearEasingPoint};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
@@ -420,20 +420,18 @@ impl PublishedEffect {
         &self.keyframes.custom_declarations[index]
     }
 
-    /// Resolve interval values afresh for interpolable syntaxes or neutral keyframes; retain them otherwise.
-    /// Also report whether the values are retained across samples.
-    pub(crate) fn resolve_custom_property_interval_values(
+    /// Look up retained interval values, also reporting whether the interval retains its values across samples.
+    pub(crate) fn retained_custom_property_interval_values(
         &self,
         declaration_indices: [usize; 2],
         has_interpolable_syntax: bool,
-        resolve_values: impl FnOnce() -> [RetainedStyleValueData; 2],
-    ) -> ([RetainedStyleValueData; 2], bool) {
+    ) -> (Option<[RetainedStyleValueData; 2]>, bool) {
         let has_neutral_endpoint = declaration_indices
             .iter()
             .any(|&index| matches!(self.custom_declaration_at(index).value, PublishedValue::ElementValue));
 
         if has_interpolable_syntax || has_neutral_endpoint {
-            return (resolve_values(), false);
+            return (None, false);
         }
 
         // AD-HOC: Match Chromium's retention of substituted interval values for discrete interpolations
@@ -445,10 +443,54 @@ impl PublishedEffect {
             .expect("an effect interpolating custom properties keeps their interval values")
             .lock()
             .unwrap()
-            .entry(declaration_indices)
-            .or_insert_with(resolve_values)
-            .clone();
+            .get(&declaration_indices)
+            .cloned();
         (values, true)
+    }
+
+    /// Retain fresh interval values, or discard cached values for a cyclic registered interval.
+    pub(crate) fn update_retained_custom_property_interval_values(
+        &self,
+        interval: CustomPropertyInterval,
+        registry: &CustomPropertyRegistry,
+    ) {
+        let declaration_indices = interval.declaration_indices();
+
+        let is_cyclic_registered_interval = interval.cyclic.contains(&true) && {
+            // SAFETY: The interval retains the name while it is borrowed for the lookup.
+            let name = unsafe { ak::Utf16FlyString::from_raw_borrowed(interval.name.raw()) };
+            registry.is_registered(&name)
+        };
+
+        let interval_cache = self
+            .custom_property_interval_values
+            .as_ref()
+            .expect("an effect interpolating custom properties keeps their interval values");
+
+        // NB: Discard cached values for a cyclic registered interval so breaking the cycle converts its current declarations.
+        if is_cyclic_registered_interval {
+            interval_cache.lock().unwrap().remove(&declaration_indices);
+            return;
+        }
+
+        let Some(mut values) = interval.values_to_retain else {
+            return;
+        };
+
+        for (value, cyclic) in values.iter_mut().zip(interval.cyclic) {
+            if !cyclic {
+                continue;
+            }
+            // AD-HOC: Retain a cyclic conversion as unset so its inherited or initial value is resolved when applied.
+            //         Caching the fallback's value would freeze it across later style changes.
+            *value = RetainedStyleValueData::shared_keyword(crate::css::css_enums::keyword::UNSET).clone();
+        }
+
+        interval_cache
+            .lock()
+            .unwrap()
+            .entry(declaration_indices)
+            .or_insert(values);
     }
 }
 

@@ -29,6 +29,7 @@
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/WorkerGlobalScope.h>
+#include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -102,21 +103,28 @@ void web_bindings_report_an_exception(void* realm, JSValue exception);
 HTML::Window* web_bindings_window_from_global_object(JSObject* global_object);
 void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTML::Window*));
 DOM::Document* web_bindings_window_associated_document(HTML::Window*);
+JS::Realm* web_bindings_window_realm(HTML::Window*);
 u64 web_bindings_window_page_id(HTML::Window*);
 bool web_bindings_window_has_transient_activation(HTML::Window*);
 DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window*);
-bool web_bindings_document_has_navigable(DOM::Document*);
+HTML::LocalNavigable* web_bindings_document_navigable(DOM::Document*);
 bool web_bindings_document_is_fully_active(DOM::Document*);
 bool web_bindings_document_has_focus(DOM::Document*);
 bool web_bindings_document_has_been_destroyed(DOM::Document*);
 URL::FFI::RustUrl web_bindings_document_url(DOM::Document*);
+void web_bindings_document_load_timing_info(DOM::Document const*, DOM::DocumentLoadTimingInfo*);
+void web_bindings_document_previous_document_unload_timing(DOM::Document const*, DOM::DocumentUnloadTimingInfo*);
+NavigationTiming::PerformanceNavigationTiming* web_bindings_document_navigation_timing_entry(DOM::Document const*);
+void web_bindings_document_set_navigation_timing_entry(DOM::Document*, NavigationTiming::PerformanceNavigationTiming*);
 HTML::WorkerGlobalScope* web_bindings_worker_global_scope_from_global_object(JSObject* global_object);
 HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object);
 JSObject* web_bindings_environment_settings_object_global_object(HTML::EnvironmentSettingsObject*);
 JS::Realm* web_bindings_environment_settings_object_realm(HTML::EnvironmentSettingsObject*);
+double web_bindings_environment_settings_object_time_origin(HTML::EnvironmentSettingsObject*);
 void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject*, void* ctx, void (*on_id)(void*, ReadonlyBytes));
 bool web_bindings_worker_global_scope_is_closing(HTML::WorkerGlobalScope*);
 void web_bindings_set_has_pending_activity(void* realm, DOM::EventTarget*, bool has_pending_activity);
+void web_bindings_environment_settings_object_origin(HTML::EnvironmentSettingsObject*, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
 void web_bindings_environment_settings_object_encoding_parse_url(HTML::EnvironmentSettingsObject*, FlatPtr url, void* parsed_url, void (*on_url)(void*, URL::FFI::RustUrl const*));
 void web_bindings_with_temporary_execution_context(void* realm, bool callbacks_enabled, void* context, void (*steps)(void*));
 bool web_bindings_object_implements_interface(JSObject* object, u16 interface_name);
@@ -199,6 +207,11 @@ void web_bindings_for_each_active_window(void* ctx, void (*on_window)(void*, HTM
     });
 }
 
+JS::Realm* web_bindings_window_realm(HTML::Window* window)
+{
+    return &HTML::relevant_realm(*window);
+}
+
 DOM::Document* web_bindings_window_associated_document(HTML::Window* window)
 {
     return &window->associated_document();
@@ -219,9 +232,9 @@ DOM::EventTarget* web_bindings_window_as_event_target(HTML::Window* window)
     return window;
 }
 
-bool web_bindings_document_has_navigable(DOM::Document* document)
+HTML::LocalNavigable* web_bindings_document_navigable(DOM::Document* document)
 {
-    return document->navigable() != nullptr;
+    return document->navigable().ptr();
 }
 
 bool web_bindings_document_is_fully_active(DOM::Document* document)
@@ -244,6 +257,26 @@ URL::FFI::RustUrl web_bindings_document_url(DOM::Document* document)
     return document->url().to_rust();
 }
 
+void web_bindings_document_load_timing_info(DOM::Document const* document, DOM::DocumentLoadTimingInfo* load_timing_info)
+{
+    *load_timing_info = document->load_timing_info();
+}
+
+void web_bindings_document_previous_document_unload_timing(DOM::Document const* document, DOM::DocumentUnloadTimingInfo* unload_timing)
+{
+    *unload_timing = document->previous_document_unload_timing();
+}
+
+NavigationTiming::PerformanceNavigationTiming* web_bindings_document_navigation_timing_entry(DOM::Document const* document)
+{
+    return document->navigation_timing_entry().ptr();
+}
+
+void web_bindings_document_set_navigation_timing_entry(DOM::Document* document, NavigationTiming::PerformanceNavigationTiming* entry)
+{
+    document->set_navigation_timing_entry(*entry);
+}
+
 HTML::EnvironmentSettingsObject* web_bindings_relevant_settings_object(JSObject* global_object)
 {
     return &HTML::relevant_settings_object(*JS::HostABI::object_from_abi(global_object));
@@ -259,6 +292,11 @@ JS::Realm* web_bindings_environment_settings_object_realm(HTML::EnvironmentSetti
     return &settings_object->realm();
 }
 
+double web_bindings_environment_settings_object_time_origin(HTML::EnvironmentSettingsObject* settings_object)
+{
+    return settings_object->time_origin();
+}
+
 void web_bindings_environment_settings_object_id(HTML::EnvironmentSettingsObject* settings_object, void* ctx, void (*on_id)(void*, ReadonlyBytes))
 {
     on_id(ctx, settings_object->id.to_string().bytes());
@@ -272,6 +310,13 @@ HTML::WorkerGlobalScope* web_bindings_worker_global_scope_from_global_object(JSO
 bool web_bindings_worker_global_scope_is_closing(HTML::WorkerGlobalScope* worker_global_scope)
 {
     return worker_global_scope->is_closing();
+}
+
+void web_bindings_environment_settings_object_origin(HTML::EnvironmentSettingsObject* settings_object, void* origin, void (*on_origin)(void*, URL::FFI::FfiOrigin const*))
+{
+    URL::RustIntegration::lend_origin_to_ffi(settings_object->origin(), [&](URL::FFI::FfiOrigin const& ffi_origin) {
+        on_origin(origin, &ffi_origin);
+    });
 }
 
 void web_bindings_environment_settings_object_encoding_parse_url(HTML::EnvironmentSettingsObject* settings_object, FlatPtr url, void* parsed_url, void (*on_url)(void*, URL::FFI::RustUrl const*))

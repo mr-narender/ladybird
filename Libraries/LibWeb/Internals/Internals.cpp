@@ -2384,6 +2384,19 @@ Vector<String> Internals::documents_in_this_process()
     return urls;
 }
 
+bool Internals::is_in_realm_of_destroyed_document(JS::Object& object)
+{
+    // An object in the empty realm, such as the WindowProxy of a navigable that another process hosts, is in the realm
+    // of no document.
+    if (&HTML::relevant_realm(object) == &object.vm().empty_realm())
+        return false;
+
+    auto* window = HTML::window_from_global_object(HTML::relevant_global_object(object));
+    if (!window)
+        return false;
+    return window->associated_document().has_been_destroyed();
+}
+
 void Internals::close_tab_through_ui_process()
 {
     window().associated_document().page().client().close_tab_for_testing();
@@ -3531,6 +3544,18 @@ WebIDL::UnsignedLongLong Internals::active_timer_count(JS::Object& object)
     if (auto* window = HTML::window_from_global_object(object))
         return window->active_timer_count({});
     return 0;
+}
+
+Vector<WebIDL::Long> Internals::active_timer_ids(JS::Object& object)
+{
+    if (auto* window_proxy = HTML::WindowProxy::from_object(object)) {
+        if (auto window = window_proxy->window())
+            return window->active_timer_ids({});
+        return {};
+    }
+    if (auto* window = HTML::window_from_global_object(object))
+        return window->active_timer_ids({});
+    return {};
 }
 
 WebIDL::UnsignedLongLong Internals::task_queue_length()

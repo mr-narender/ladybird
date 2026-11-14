@@ -129,10 +129,10 @@ Optional<Gfx::IntRect> ContextPresenter::viewport_rect_for_ui_overlay() const
     return viewport_rect;
 }
 
-Optional<BackingStoreManager::Publication> ContextPresenter::resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, BackingStoreManager::GpuSharing gpu_sharing, BackingStoreManager::PublicationMode publication_mode)
+ErrorOr<Optional<BackingStoreManager::Publication>> ContextPresenter::resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, BackingStoreManager::GpuSharing gpu_sharing, BackingStoreManager::PublicationMode publication_mode, RefPtr<WindowServer> window_server_showing_stores)
 {
     if (m_backing_store_manager.is_rendering())
-        return {};
+        return Optional<BackingStoreManager::Publication> {};
     if (!presents_to_client()) {
         // A resize can arrive before the parent's next replay supplies the new embedding transform.
         // Bound the existing embedding's scale for the new viewport before allocating backing stores. Bounding the
@@ -148,10 +148,10 @@ Optional<BackingStoreManager::Publication> ContextPresenter::resize_backing_stor
         publication_mode = BackingStoreManager::PublicationMode::Unpublished;
     auto allocation = m_backing_store_manager.resize_backing_stores_if_needed(raster_size(), m_window_resize_in_progress, publication_mode);
     if (!allocation.has_value())
-        return {};
+        return Optional<BackingStoreManager::Publication> {};
     m_latest_rendered_surface = nullptr;
     m_last_rasterized_frame.clear();
-    return m_backing_store_manager.allocate_backing_stores(*allocation, skia_backend_context, publication_mode, gpu_sharing);
+    return m_backing_store_manager.allocate_backing_stores(*allocation, skia_backend_context, publication_mode, gpu_sharing, move(window_server_showing_stores));
 }
 
 void ContextPresenter::invalidate_backing_stores()
@@ -660,7 +660,7 @@ ContextPresenter::LayerUpdate ContextPresenter::layer_update_for(FrameInputs con
     layers.active_media = m_media_activity.active_media(now);
     // An HDR video is a layer from its first frame for as long as it is drawn, even while paused, so that the window
     // server keeps showing it brighter than SDR white instead of it going back into the frame, which holds SDR.
-    if (m_window_server_may_show_media && m_window_server_may_show_high_dynamic_range) {
+    if (m_remote_layer_that_may_show_media && m_remote_layer_that_may_show_media->can_show_high_dynamic_range() && m_window_server_may_show_high_dynamic_range) {
         for (auto id : m_display_list->referenced_resource_ids().video_sinks) {
             LiveMedia media { RustFFI::FfiLiveMediaKind::Video, id };
             auto is_active = any_of(layers.active_media, [&](auto const& active) { return active.kind == media.kind && active.id == media.id; });
@@ -882,32 +882,26 @@ void ContextPresenter::composite_layers_above_base(DisplayListPlayerSkia& displa
 
 bool ContextPresenter::window_server_can_show_media_layers_of(LayerPlan const& plan)
 {
-#ifdef AK_OS_MACOS
-    if (!m_window_server_may_show_media)
+    if (!m_remote_layer_that_may_show_media)
         return false;
     for (auto const& layer : plan.layers()) {
         if (layer.kind != LayerKind::Media)
             continue;
         if (!layer.window_server_placement.has_value())
             return false;
+        Optional<RemoteLayer::Content> content;
         if (layer.media.kind == RustFFI::FfiLiveMediaKind::Canvas) {
-            auto surface = m_canvas_surfaces.presentable_canvas_surface(Compositing::CanvasId { layer.media.id });
-            if (!surface || !surface->iosurface())
-                return false;
-        } else {
-            // A frame that a decoder left in memory has no surface that the window server could read.
-            auto frame = current_video_frame(Compositing::VideoSinkResourceId { layer.media.id });
-            if (!frame || !frame->surface())
-                return false;
+            if (auto surface = m_canvas_surfaces.presentable_canvas_surface(Compositing::CanvasId { layer.media.id }))
+                content = surface.release_nonnull();
+        } else if (auto frame = current_video_frame(Compositing::VideoSinkResourceId { layer.media.id })) {
             if (!m_window_server_may_show_high_dynamic_range && video_frame_holds_high_dynamic_range(*frame))
                 return false;
+            content = frame.release_nonnull();
         }
+        if (!content.has_value() || !m_remote_layer_that_may_show_media->can_show(*layer.window_server_placement, *content, m_device_pixel_ratio))
+            return false;
     }
     return true;
-#else
-    (void)plan;
-    return false;
-#endif
 }
 
 // Each painted layer goes to the window server as its own surface, which is copied from its raster when the raster

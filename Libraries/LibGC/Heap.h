@@ -87,8 +87,10 @@ public:
     NEVER_INLINE void collect_garbage(CollectionType = CollectionType::CollectGarbage, bool print_report = false);
     NEVER_INLINE AK::JsonObject dump_graph();
 
-    // A cell on a retaining path, which reaches the next one through a field it visits.
+    // A cell on a retaining path, which reaches the next one through a field it visits. The cell is live until the next
+    // garbage collection at least.
     struct RetainingPathStep {
+        RawPtr<Cell> cell;
         StringView class_name;
     };
     struct RetainingPath {
@@ -312,6 +314,7 @@ private:
     void idle_gc_on_timer();
     void on_abandoned_object_graph_timer();
     void schedule_release_of_abandoned_object_graph_memory();
+    void schedule_release_of_allocator_memory();
 
     struct Stats {
         AK_ALLOC_WITH_KMALLOC;
@@ -383,6 +386,7 @@ private:
     };
     AbandonedObjectGraphState m_abandoned_object_graph_state { AbandonedObjectGraphState::None };
     RefPtr<Core::Timer> m_abandoned_object_graph_timer;
+    RefPtr<Core::Timer> m_allocator_memory_release_timer;
     u64 m_total_allocated_bytes { 0 };
     // The context a heap created through LibGC/CAPI.h was created with.
     void* m_foreign_context { nullptr };

@@ -38,7 +38,6 @@ use super::generators::generate_await_of_value;
 use super::members::*;
 use super::nodes::*;
 use super::operators::emit_to_primitive_property_key;
-use super::registers::ScopedOperand;
 use super::scope::ParameterShape;
 use super::scope::ScopeBindings;
 use super::stream::ClassPrivateEnvironment;
@@ -49,7 +48,7 @@ use super::stream::OpenIterator;
 use super::stream::ScopeEnvironment;
 use super::stream::TargetBinding;
 use super::stream::ValKind;
-use super::stream::{MAX_OPERAND_LIST_LENGTH, operand_list_count};
+use super::stream::operand_list_count;
 use super::sweep::declaration_kind_of_mark;
 use super::sweep::is_anonymous_function_definition;
 use super::sweep::next_tag;
@@ -245,7 +244,7 @@ impl Generator<'_> {
         if data.name.is_none() && lhs_name.is_none() && computed_name.is_none() {
             // NB: An anonymous class binds an empty name, which an environment shape cannot hold.
             let identifier = self.intern_identifier_text(crate::utf16::Utf16View::Ascii(b""));
-            self.emit(op::CreateVariable {
+            self.put(op::CreateVariable {
                 identifier,
                 mode: libjs_abi::EnvironmentMode::Lexical as u8,
                 is_immutable: true,
@@ -422,7 +421,7 @@ impl Generator<'_> {
         let first_temporary = self.next_temporary();
         let is_prototype = self.temporary();
         let arith_feedback = self.next_arith_feedback();
-        self.emit(op::StrictlyEquals {
+        self.put(op::StrictlyEquals {
             arith_feedback,
             dst: is_prototype,
             lhs: key,
@@ -461,7 +460,7 @@ impl Generator<'_> {
             _ => {
                 let value = self.sweep_value(first_row, key)?;
                 // NB: A key is what it is by the time the next one gets evaluated.
-                Ok(emit_to_primitive_property_key(self, &ScopedOperand::plain(value)).operand())
+                Ok(emit_to_primitive_property_key(self, value))
             }
         }
     }
@@ -599,22 +598,18 @@ impl Generator<'_> {
         if !is_derived {
             return;
         }
-        let arguments = self.temporary();
-        self.put(op::CreateRestParams {
-            dst: arguments,
-            rest_index: 0,
-        });
+        // NB: The arguments go to the super constructor as they are, without the array iterator that
+        //     `super(...args)` would use.
         let super_constructor = self.temporary();
         self.put(op::GetSuperConstructor { dst: super_constructor });
         let dst = self.temporary();
         let call_feedback = self.next_call_feedback();
-        self.put(op::SuperCallWithArgumentArray {
+        self.put(op::SuperCallWithForwardedArguments {
             call_feedback,
             dst,
             super_constructor,
-            arguments,
-            is_synthetic: true,
         });
+        self.put(op::BindThisFromSuperCall { result: dst });
         self.put(op::Return { value: dst });
     }
 
@@ -704,7 +699,7 @@ impl Generator<'_> {
             if !is_first {
                 self.put(op::ConcatString { dst, src: value });
             } else if is_string {
-                self.put(op::Mov { dst, src: value });
+                self.emit_mov(dst, value);
             } else {
                 self.put(op::ToString { dst, value });
             }
@@ -880,6 +875,15 @@ impl Generator<'_> {
             row = case.index() + 1;
         }
         self.jump(default_label.unwrap_or(end_label));
+        // NB: Every test comes before the code of the cases, so nothing reads the discriminant from here on. The
+        //     environment of the cases comes after it in the registers, though, so that it stays held if there is one.
+        let held = match environment {
+            Some(_) => Some(held),
+            None => {
+                self.release_held_registers(held);
+                None
+            }
+        };
 
         self.push_control(Control::Switch { break_label: end_label });
         let initialized_locals = self.context.initialized_locals.clone();
@@ -899,7 +903,9 @@ impl Generator<'_> {
 
         self.pop_control();
         self.end_scope(environment);
-        self.release_held_registers(held);
+        if let Some(held) = held {
+            self.release_held_registers(held);
+        }
         self.end_of_statement();
         Ok(())
     }
@@ -953,7 +959,7 @@ impl Generator<'_> {
                 body,
                 row,
                 catch_position,
-                &entry_environment,
+                entry_environment,
                 first_function,
             )?;
             self.leave_try_part(finally, end_label);
@@ -964,7 +970,7 @@ impl Generator<'_> {
             self.pop_control();
             self.set_handler(outer_handler);
             let finally = finally as usize;
-            let body = self.bind_finally_handler(finally, handler, &entry_environment);
+            let body = self.bind_finally_handler(finally, handler, entry_environment);
             self.bind_label(body);
             let saved_completion = self.save_completion();
             self.sweep_rows(row, finalizer.index() + 1)?;
@@ -986,7 +992,7 @@ impl Generator<'_> {
         body: NodeId,
         first_row: usize,
         position: u32,
-        entry_environment: &ScopedOperand,
+        entry_environment: Operand,
         first_function: u32,
     ) -> Result<(), OutOfStack> {
         let tree = self.tree;
@@ -1013,6 +1019,15 @@ impl Generator<'_> {
             self.bind_target(parameter, first_row, value, PatternMode::Declares(DeclarationKind::Let))?;
             row = parameter.index() + 1;
         }
+        // NB: Nothing reads the caught value once it is bound. The environment of the parameter comes after it in the
+        //     registers, though, so that it stays held until the end if there is one.
+        let held = match environment {
+            Some(_) => Some(held),
+            None => {
+                self.release_held_registers(held);
+                None
+            }
+        };
 
         let body_environment = self.begin_scope(tree.node_pos(body), false);
         self.push_control(Control::Block {
@@ -1031,7 +1046,9 @@ impl Generator<'_> {
 
         self.pop_control();
         self.end_scope(environment);
-        self.release_held_registers(held);
+        if let Some(held) = held {
+            self.release_held_registers(held);
+        }
         Ok(())
     }
 
@@ -1182,7 +1199,8 @@ impl Generator<'_> {
         let receiver = self.held_register();
         let keys = self.held_register();
         let cursor = self.held_register();
-        let value = self.held_register();
+        // NB: Nothing reads the source once the iterator has it.
+        let value = source;
         let done = self.held_register();
         let end_label = self.new_label();
         let update_label = self.new_label();
@@ -1203,10 +1221,7 @@ impl Generator<'_> {
             cache,
         });
         let zero = self.add_constant_i32(0);
-        self.put(op::Mov {
-            dst: cursor,
-            src: zero.operand(),
-        });
+        self.emit_mov(cursor, zero);
 
         self.bind_reachable_label(update_label);
         self.put(op::ObjectPropertyIteratorNext {
@@ -1252,7 +1267,8 @@ impl Generator<'_> {
         let object = self.held_register();
         let next = self.held_register();
         let iterator_done = self.held_register();
-        let value = self.held_register();
+        // NB: Nothing reads the source once the iterator has it.
+        let value = source;
         let done = self.held_register();
         let cache = self.next_property_lookup_cache();
         self.put(op::GetIterator {
@@ -1297,24 +1313,24 @@ impl Generator<'_> {
         self.bind_reachable_label(update_label);
         if is_await {
             let held = self.hold_registers();
-            let result = self.allocate_register();
+            let result = self.held_register();
             // NB: A result that is not an object only throws once it is awaited.
             let call_feedback = self.next_call_feedback();
-            self.emit(op::Call {
+            self.put(op::Call {
                 call_feedback,
-                dst: result.operand(),
+                dst: result,
                 callee: next,
                 this_value: object,
                 argument_count: 0,
                 arguments: &[],
             });
-            let awaited = generate_await_of_value(self, &result);
-            self.put(op::ThrowIfNotObject { src: awaited.operand() });
+            let awaited = generate_await_of_value(self, result);
+            self.put(op::ThrowIfNotObject { src: awaited });
             let done_key = self.intern_property_key_text(crate::utf16::Utf16View::Ascii(b"done"));
-            emit_get_by_key(self, &ScopedOperand::plain(done), &awaited, done_key);
+            emit_get_by_key(self, done, awaited, done_key);
             self.jump_if(done, end_label);
             let value_key = self.intern_property_key_text(crate::utf16::Utf16View::Ascii(b"value"));
-            emit_get_by_key(self, &ScopedOperand::plain(value), &awaited, value_key);
+            emit_get_by_key(self, value, awaited, value_key);
             self.release_held_registers(held);
         } else {
             self.put(op::IteratorNextUnpack {
@@ -1336,7 +1352,7 @@ impl Generator<'_> {
         self.set_handler(outer_handler);
 
         self.bind_reachable_label(close_handler.label);
-        self.close_iterator_after_exception(iterator, &entry_environment);
+        self.close_iterator_after_exception(iterator, entry_environment);
 
         self.bind_label(end_label);
         self.context.scope.block_end();
@@ -1346,7 +1362,7 @@ impl Generator<'_> {
     }
 
     /// Closes an iterator on the way to whoever handles an exception, which stays what gets thrown.
-    fn close_iterator_after_exception(&mut self, iterator: OpenIterator, entry_environment: &ScopedOperand) {
+    fn close_iterator_after_exception(&mut self, iterator: OpenIterator, entry_environment: Operand) {
         let error = self.temporary();
         let value_feedback = self.next_value_feedback();
         self.put(op::Catch {
@@ -1636,10 +1652,7 @@ impl Generator<'_> {
     fn put_in_dead_zone(&mut self, ident: Identifier) {
         if ident.local_type == Some(LocalType::Variable) {
             let empty = self.context.constants.add_empty();
-            self.put(op::Mov {
-                dst: Operand::local(ident.local_index),
-                src: empty,
-            });
+            self.emit_mov(Operand::local(ident.local_index), empty);
         }
     }
 
@@ -1752,7 +1765,7 @@ impl Generator<'_> {
         // NB: Every property comes from the value that the pattern started with, whatever gets written along the way.
         let object = if value.is_local() || value.is_argument() {
             let copy = self.held_register();
-            self.put(op::Mov { dst: copy, src: value });
+            self.emit_mov(copy, value);
             copy
         } else {
             value
@@ -1781,6 +1794,7 @@ impl Generator<'_> {
             }
             let (element, element_first_row);
             let property_value;
+            let element_registers = (item_tag == tag::COMPUTED_PROPERTY && !has_rest).then(|| self.hold_registers());
             match item_tag {
                 tag::SHORTHAND => {
                     let name = Name(tree.node_a(item));
@@ -1800,11 +1814,12 @@ impl Generator<'_> {
                     let position = self.current_source_offset;
                     let key_value = self.sweep_value(row, key)?;
                     self.current_source_offset = position;
-                    let converted = emit_to_primitive_property_key(self, &ScopedOperand::plain(key_value)).operand();
+                    let converted = emit_to_primitive_property_key(self, key_value);
                     if has_rest {
                         excluded_names.push(converted);
+                        // NB: Rest needs this key after the other properties have been bound.
+                        first_temporary = self.next_temporary();
                     }
-                    first_temporary = self.next_temporary();
                     element = NodeId(tree.node_b(item));
                     // NB: A mark comes after a computed key.
                     element_first_row = key.index() + 2;
@@ -1824,12 +1839,7 @@ impl Generator<'_> {
                         self.put_get_by_id(property_value, object, Name(tree.node_a(key)));
                     } else {
                         let property_key = self.intern_property_key_text(text.view());
-                        emit_get_by_key(
-                            self,
-                            &ScopedOperand::plain(property_value),
-                            &ScopedOperand::plain(object),
-                            property_key,
-                        );
+                        emit_get_by_key(self, property_value, object, property_key);
                     }
                     if has_rest {
                         let name = match &text {
@@ -1841,6 +1851,9 @@ impl Generator<'_> {
                 }
             }
             self.bind_pattern_element(element, element_first_row, property_value, mode)?;
+            if let Some(registers) = element_registers {
+                self.release_held_registers(registers);
+            }
             self.release_temporaries_from(first_temporary);
             row = item.index() + 1;
         }
@@ -1859,10 +1872,7 @@ impl Generator<'_> {
         let held = self.hold_registers();
         let is_exhausted = self.held_register();
         let no = self.context.constants.add_boolean(false);
-        self.put(op::Mov {
-            dst: is_exhausted,
-            src: no,
-        });
+        self.emit_mov(is_exhausted, no);
         let object = self.held_register();
         let next = self.held_register();
         let done = self.held_register();
@@ -1900,7 +1910,7 @@ impl Generator<'_> {
             let first_temporary = self.next_temporary();
             let is_rest = tree.node_tag(item) == tag::REST;
             // NB: A rest element started out as a spread element, whose mark means nothing here.
-            row += usize::from(tree.ast.tag[row] == tag::MARK_SPREAD_START);
+            row += usize::from(tree.ast.tag[row] == tag::MARK_ARRAY_START);
             if tree.node_tag(item) == tag::HOLE {
                 let after_step = self.new_label();
                 if index != 0 {
@@ -1965,10 +1975,7 @@ impl Generator<'_> {
             self.jump_unless(is_exhausted, have_value);
             self.bind_label(exhausted);
             let undefined = self.context.constants.add_undefined();
-            self.put(op::Mov {
-                dst: element_value,
-                src: undefined,
-            });
+            self.emit_mov(element_value, undefined);
             self.reference_label(have_value);
             self.bind_label(have_value);
             self.bind_pattern_element(item, row, element_value, mode)?;
@@ -1992,7 +1999,7 @@ impl Generator<'_> {
         });
         self.jump(end_label);
         self.bind_reachable_label(close_handler.label);
-        self.close_iterator_after_exception(iterator, &entry_environment);
+        self.close_iterator_after_exception(iterator, entry_environment);
         self.bind_label(end_label);
         self.release_held_registers(held);
         Ok(())

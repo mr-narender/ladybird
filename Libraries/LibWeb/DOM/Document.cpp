@@ -666,7 +666,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
 
         // 4. Create the navigation timing entry for document, given fullTimingInfo, redirectCount, navigationTimingType,
         //    navigationParams's response's service worker timing info, and navigationParams's response's body info.
-        NavigationTiming::PerformanceNavigationTiming::create_navigation_timing_entry(
+        NavigationTiming::create_the_navigation_timing_entry(
             *document,
             full_timing_info,
             redirect_count,
@@ -679,7 +679,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     // 16. Create the navigation timing entry for document, with navigationParams's response's timing info,
     //     redirectCount, navigationParams's navigation timing type, and navigationParams's response's service worker timing info.
     else {
-        NavigationTiming::PerformanceNavigationTiming::create_navigation_timing_entry(
+        NavigationTiming::create_the_navigation_timing_entry(
             *document,
             timing_info,
             redirect_count,
@@ -13305,9 +13305,9 @@ static WebIDL::ExceptionOr<Utf16String> document_write_compliant_string(DOM::Doc
     for (auto const& value : text) {
         string.append(value.visit(
             // 1. If value is a TrustedHTML object, then append value's associated data to string.
-            [](GC::Root<TrustedTypes::TrustedHTML> const& value) -> Utf16String const& { return value->to_string(); },
+            [](GC::Root<TrustedTypes::TrustedHTML> const& value) { return value->to_string(); },
             // 2. Otherwise, append value to string.
-            [](Utf16String const& value) -> Utf16String const& { return value; }));
+            [](Utf16String const& value) { return value; }));
     }
 
     // 4. If isTrusted is false, set string to the result of invoking the Get Trusted Type compliant string algorithm

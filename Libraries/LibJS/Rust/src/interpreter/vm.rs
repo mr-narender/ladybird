@@ -37,7 +37,7 @@ use crate::gc::foreign::ForeignCellSlot;
 use crate::gc::gc_ref_cell::GcRefCell;
 use crate::gc::heap::Heap;
 use crate::gc::heap_function::HeapFunction;
-use crate::gc::root::{MarkedVec, RootSet};
+use crate::gc::root::{MarkedVec, Root, RootSet};
 use crate::gc::sweep::Sweep;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::gc::weak_container::WeakContainer;
@@ -57,6 +57,7 @@ use crate::layout::value::Value;
 use crate::layout::vm::{DISPATCH_TABLE_COUNT, ExecutionContextStackEntry, InterpreterStack, VmHead};
 use crate::layout_forward::RawNativeFunctionPointer;
 use crate::lexical_path;
+use crate::runtime::abstract_operations::function_with_frame_as_this_environment;
 use crate::runtime::abstract_operations::get_this_environment;
 use crate::runtime::agent::AgentRecord;
 use crate::runtime::array_buffer::{ArrayBuffer, ZeroFillNewBytes};
@@ -85,7 +86,7 @@ use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::reference::{BaseType, Reference};
-use crate::runtime::shape::PrototypeTransitionCache;
+use crate::runtime::shape::{ConstructShapeCache, PrototypeTransitionCache};
 use crate::runtime::shared_function_instance_data::SharedFunctionInstanceData;
 use crate::runtime::source_text_module::SourceTextModule;
 use crate::runtime::symbol::{self, GlobalSymbolRegistry, Symbol, enumerate_well_known_symbols};
@@ -271,13 +272,16 @@ pub(crate) fn default_host_system_utc_epoch_nanoseconds(_: &Vm, _: &Object) -> S
     nanoseconds.clamp(NANOSECONDS_MIN_INSTANT.clone(), NANOSECONDS_MAX_INSTANT.clone())
 }
 
-/// The VM's queues of promise jobs and finalization registry cleanup jobs, in a cell the VM roots.
+/// The VM's promise jobs, cleanup jobs, standalone timer tasks, and pending async waits, in a cell the VM roots.
 #[repr(C)]
 #[derive(Trace)]
 pub struct JobQueues {
     header: CellHeader,
     promise_jobs: GcRefCell<VecDeque<Gc<HeapFunction>>>,
     finalization_registry_cleanup_jobs: GcRefCell<Vec<Gc<FinalizationRegistry>>>,
+    // Ephemerons must be visited during marking, not by the VM's root-gathering visitor.
+    async_waits: GcRefCell<Vec<crate::runtime::async_wait::PendingWait>>,
+    timeout_jobs: GcRefCell<Vec<crate::runtime::async_wait::TimeoutJob>>,
 }
 
 define_cell!(JobQueues, Other);
@@ -522,6 +526,8 @@ pub struct Vm {
     interrupt_requested: AtomicBool,
     /// This agent's node in the WaiterLists, which Atomics.wait() and memory.atomic.wait sleep on.
     agent_waiter: Arc<AgentWaiter>,
+    pub(crate) async_wait_agent: std::sync::OnceLock<Arc<crate::runtime::async_wait::AsyncWaitAgent>>,
+    pub(crate) next_async_wait_id: Cell<u64>,
     /// The tables `VmHead::dispatch_tables` points to.
     pub(crate) own_dispatch_tables: VmDispatchTables,
     /// The word that stops the WebAssembly code of this VM's agent (see set_wasm_stack_limit_word()), if it has any.
@@ -559,6 +565,7 @@ pub struct Vm {
     json_parse_cache: JsonParseCache,
     json_stringify_cache: JsonStringifyCache,
     empty_string: OnceCell<Gc<PrimitiveString>>,
+    empty_realm: OnceCell<Gc<Realm>>,
     cached_strings: OnceCell<CachedStrings>,
     single_ascii_character_strings: OnceCell<[Gc<PrimitiveString>; SINGLE_ASCII_CHARACTER_STRING_COUNT]>,
     well_known_symbols: OnceCell<WellKnownSymbols>,
@@ -573,6 +580,7 @@ pub struct Vm {
     static_property_lookup_caches: StaticPropertyLookupCaches,
     keyed_property_lookup_cache: KeyedPropertyLookupCache,
     prototype_transition_cache: Box<PrototypeTransitionCache>,
+    construct_shape_cache: Box<ConstructShapeCache>,
     /// Like the keyed property lookup cache, how string-keyed PutByValue instructions whose own caches gave up put
     /// properties: the writable own data properties they change and the properties they add, by shape and name (see
     /// put_by_value_with_keyed_store_cache()).
@@ -700,6 +708,8 @@ impl Vm {
             jit_native_stack_limit: AtomicUsize::new(0),
             interrupt_requested: AtomicBool::new(false),
             agent_waiter: AgentWaiter::new(),
+            async_wait_agent: std::sync::OnceLock::new(),
+            next_async_wait_id: Cell::new(1),
             own_dispatch_tables: VmDispatchTables::new(),
             wasm_stack_limit_word: Mutex::new(core::ptr::null()),
             heap: OnceCell::new(),
@@ -727,6 +737,7 @@ impl Vm {
             json_parse_cache: JsonParseCache::default(),
             json_stringify_cache: JsonStringifyCache::new(),
             empty_string: OnceCell::new(),
+            empty_realm: OnceCell::new(),
             cached_strings: OnceCell::new(),
             single_ascii_character_strings: OnceCell::new(),
             well_known_symbols: OnceCell::new(),
@@ -736,6 +747,7 @@ impl Vm {
             static_property_lookup_caches: StaticPropertyLookupCaches::new(),
             keyed_property_lookup_cache: KeyedPropertyLookupCache::new(),
             prototype_transition_cache: Box::new(PrototypeTransitionCache::new()),
+            construct_shape_cache: Box::new(ConstructShapeCache::new()),
             keyed_property_store_cache: KeyedPropertyLookupCache::new(),
             keyed_property_store_scratch_cache: PropertyLookupCache::new(),
             host_ensure_can_add_private_element: Cell::new(default_host_ensure_can_add_private_element),
@@ -855,6 +867,8 @@ impl Vm {
             header: CellHeader::for_class(JobQueues::CLASS),
             promise_jobs: GcRefCell::new(VecDeque::new()),
             finalization_registry_cleanup_jobs: GcRefCell::new(Vec::new()),
+            async_waits: GcRefCell::new(Vec::new()),
+            timeout_jobs: GcRefCell::new(Vec::new()),
         }));
         let _ = self.loaded_modules.set(self.heap().allocate(|_| LoadedModules {
             header: CellHeader::for_class(LoadedModules::CLASS),
@@ -917,6 +931,9 @@ impl Vm {
             word.store(u64::MAX, Ordering::Relaxed);
         }
         self.agent_waiter.interrupt();
+        if let Some(agent) = self.async_wait_agent.get() {
+            agent.wake();
+        }
     }
 
     /// This agent's node in the WaiterLists.
@@ -971,6 +988,7 @@ impl Vm {
         context_ref.caller_return_pc.set(0);
         context_ref.caller_dst_raw.set(0);
         context_ref.caller_is_construct.set(false);
+        context_ref.caller_is_derived_construct.set(false);
         let length = self.head.execution_context_stack_length.get();
         if length == self.head.execution_context_stack_capacity.get() {
             self.grow_execution_context_stack();
@@ -1204,6 +1222,7 @@ impl Vm {
         }
         self.roots.trace(visitor);
         self.empty_string.trace(visitor);
+        self.empty_realm.trace(visitor);
         self.single_ascii_character_strings.trace(visitor);
         self.numeric_string_cache.trace(visitor);
         self.large_numeric_string_cache.trace(visitor);
@@ -1568,6 +1587,7 @@ impl Vm {
         self.static_property_lookup_caches.remove_dead_entries(sweep);
         self.keyed_property_lookup_cache.remove_dead_entries(sweep);
         self.prototype_transition_cache.remove_dead_entries(sweep);
+        self.construct_shape_cache.remove_dead_entries(sweep);
         self.keyed_property_store_cache.remove_dead_entries(sweep);
         self.jit.dependents.remove_dead_entries(sweep);
     }
@@ -1603,6 +1623,10 @@ impl Vm {
 
     pub fn prototype_transition_cache(&self) -> &PrototypeTransitionCache {
         &self.prototype_transition_cache
+    }
+
+    pub fn construct_shape_cache(&self) -> &ConstructShapeCache {
+        &self.construct_shape_cache
     }
 
     pub fn keyed_property_store_cache(&self) -> &KeyedPropertyLookupCache {
@@ -1730,6 +1754,26 @@ impl Vm {
 
     fn job_queues(&self) -> Gc<JobQueues> {
         *self.job_queues.get().expect("the VM allocates its job queues")
+    }
+
+    pub(crate) fn async_waits(&self) -> &GcRefCell<Vec<crate::runtime::async_wait::PendingWait>> {
+        &self
+            .job_queues
+            .get()
+            .expect("the VM allocates its job queues")
+            .async_waits
+    }
+
+    pub(crate) fn timeout_jobs(&self) -> &GcRefCell<Vec<crate::runtime::async_wait::TimeoutJob>> {
+        &self
+            .job_queues
+            .get()
+            .expect("the VM allocates its job queues")
+            .timeout_jobs
+    }
+
+    pub(crate) fn is_running_promise_jobs(&self) -> bool {
+        self.running_promise_jobs.get()
     }
 
     pub fn run_executable_depth(&self) -> &Cell<u32> {
@@ -1921,6 +1965,12 @@ impl Vm {
 
     pub fn empty_string(&self) -> Gc<PrimitiveString> {
         *self.empty_string.get().expect("the VM allocates the empty string")
+    }
+
+    /// A realm with no intrinsics, global object, global environment or host-defined data, which nothing can give it.
+    /// An object that belongs to no realm lives in it, and whatever asks that realm for one of those panics.
+    pub fn empty_realm(&self) -> Gc<Realm> {
+        *self.empty_realm.get_or_init(|| Realm::create_empty(self))
     }
 
     pub fn single_ascii_character_string(&self, character: u8) -> Gc<PrimitiveString> {
@@ -2180,6 +2230,16 @@ impl Vm {
 
     // 9.4.4 ResolveThisBinding ( ), https://tc39.es/ecma262/#sec-resolvethisbinding
     pub fn resolve_this_binding(&self) -> ThrowCompletionOr<Value> {
+        // OPTIMIZATION: A frame that answers for the environment has the this value, which is empty while it is not
+        //               initialized.
+        if function_with_frame_as_this_environment(self).is_some() {
+            let this_value = self.running_execution_context_ref().this_value.get();
+            if this_value.is_empty() {
+                return self.throw_completion(ErrorKind::ReferenceError, ErrorType::ThisHasNotBeenInitialized, &[]);
+            }
+            return Ok(this_value);
+        }
+
         // 1. Let envRec be GetThisEnvironment().
         let environment = get_this_environment(self);
 
@@ -2189,6 +2249,11 @@ impl Vm {
 
     // 9.4.5 GetNewTarget ( ), https://tc39.es/ecma262/#sec-getnewtarget
     pub fn get_new_target(&self) -> Value {
+        // OPTIMIZATION: A frame that answers for the environment has the new target.
+        if function_with_frame_as_this_environment(self).is_some() {
+            return self.running_execution_context_ref().new_target.get();
+        }
+
         // 1. Let envRec be GetThisEnvironment().
         let environment = get_this_environment(self);
 
@@ -2212,6 +2277,13 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        if let Some(agent) = self.async_wait_agent.get() {
+            agent.close();
+        }
+        for wait in self.async_waits().borrow().iter() {
+            ak::waiter_list::cancel_async_waiter(&wait.waiter);
+        }
+        self.async_waits().borrow_mut(self).clear();
         if self.options.become_thread_default_heap {
             libregex_rust::vm::set_interrupt_flag_of_this_thread(core::ptr::null());
         }
@@ -2247,6 +2319,9 @@ unsafe extern "C" fn sweep(context: *mut c_void) {
     // SAFETY: LibGC runs sweep callbacks once the marks are final, before it sweeps the cells that died.
     let sweep = unsafe { Sweep::new(vm) };
     vm.code_flushing.finish_pass(vm, &sweep);
+    crate::parser::release_idle_reparse_contexts();
+    crate::source_text::park_idle_source_texts();
+    vm.remove_dead_async_waits(&sweep);
     vm.remove_dead_cells_from_weak_containers(&sweep);
     vm.remove_dead_strings_from_weak_caches(&sweep);
     vm.remove_dead_cells_from_property_lookup_caches(&sweep);
@@ -2465,7 +2540,7 @@ impl Vm {
             });
     }
 
-    pub fn link_and_eval_module(&self, module: Gc<CyclicModule>) -> ThrowCompletionOr<()> {
+    pub fn link_and_eval_module(&self, module: Gc<CyclicModule>) -> ThrowCompletionOr<Gc<Promise>> {
         let filename = module.filename().to_string();
         if !filename.is_empty() {
             let absolute_filename = resolve_module_filename(&lexical_path::absolute_path(".", &filename), "");
@@ -2490,20 +2565,17 @@ impl Vm {
 
         module.link(self)?;
 
-        let evaluated_value = promise_of(module.evaluate(self)?);
+        let evaluated_value = Root::new(self, promise_of(module.evaluate(self)?));
 
         self.run_queued_promise_jobs();
-        assert!(self.job_queues().promise_jobs.borrow().is_empty());
 
-        // FIXME: This will break if we start doing promises actually asynchronously.
-        assert!(evaluated_value.state() != PromiseState::Pending);
-
-        if evaluated_value.state() == PromiseState::Rejected {
-            crate::embedding::completion::log_exception_if_enabled(self, evaluated_value.result());
-            return Err(Throw::new(evaluated_value.result()));
+        if evaluated_value.get().state() == PromiseState::Rejected {
+            crate::embedding::completion::log_exception_if_enabled(self, evaluated_value.get().result());
+            return Err(Throw::new(evaluated_value.get().result()));
         }
 
-        Ok(())
+        // The host owns the tasks that can resume a suspended module, so it also observes the evaluation promise.
+        Ok(evaluated_value.value())
     }
 
     // 16.2.1.8 HostLoadImportedModule ( referrer, specifier, hostDefined, payload ), https://tc39.es/ecma262/#sec-HostLoadImportedModule

@@ -19,6 +19,20 @@ namespace Web::Fetch::Fetching {
 
 GC_DEFINE_ALLOCATOR(NetworkBodyPump);
 
+// https://fetch.spec.whatwg.org/#concept-http-network-fetch
+// NB: Step 9 of HTTP-network fetch. Steps 10 to 13 run in create_body_from_channel(), when the body's view is made.
+GC::Ref<NetworkBodyPump> NetworkBodyPump::create(RefPtr<Infrastructure::FetchParams const> fetch_params, Engine::FetchBodyDeliveryGate::NavigationHold navigation_hold, RefPtr<HTTP::MemoryCache> http_cache)
+{
+    // 9. Let buffer be an empty byte sequence.
+    // NB: The buffer is the FetchByteChannel; its watermarks are the user-agent-chosen lower and upper limits.
+    static constexpr Engine::FetchByteChannel::Watermarks network_body_watermarks { .low = 256 * KiB, .high = 1 * MiB };
+    auto delivery_gate = Engine::FetchBodyDeliveryGate::create(navigation_hold);
+    auto channel = Engine::FetchByteChannel::create(network_body_watermarks, delivery_gate->create_channel_sink());
+    delivery_gate->grant_credit(channel->initial_credit());
+
+    return GC::Heap::the().allocate<NetworkBodyPump>(move(fetch_params), move(channel), move(delivery_gate), move(http_cache));
+}
+
 NetworkBodyPump::NetworkBodyPump(RefPtr<Infrastructure::FetchParams const> fetch_params, NonnullRefPtr<Engine::FetchByteChannel> channel, NonnullRefPtr<Engine::FetchBodyDeliveryGate> delivery_gate, RefPtr<HTTP::MemoryCache> http_cache)
     : m_fetch_params(move(fetch_params))
     , m_fetch_controller(m_fetch_params ? m_fetch_params->controller().ptr() : nullptr)
@@ -56,7 +70,8 @@ void NetworkBodyPump::visit_edges(Visitor& visitor)
 void NetworkBodyPump::handle_network_data(Requests::ResponseData data)
 {
     // 1. Run these steps, but abort when fetchParams is canceled:
-    if (m_fetch_params && m_fetch_params->is_canceled()) {
+    // AD-HOC: A stopped fetch is not canceled, but takes no more of its body either.
+    if (m_fetch_params && !m_fetch_params->control_block().is_ongoing()) {
         m_channel->cancel();
         return;
     }
@@ -115,12 +130,16 @@ void NetworkBodyPump::handle_network_data(Requests::ResponseData data)
     }
 }
 
-void NetworkBodyPump::handle_network_complete(Optional<u64> encoded_body_size)
+void NetworkBodyPump::handle_network_complete(Optional<i64> request_server_encoded_body_size)
 {
+    m_delivery_gate->detach_transport();
     m_network_complete = true;
     // AD-HOC: RequestServer reports the encoded size of an HTTP body once it has been received. Other schemes have no
     //         content coding, so their encoded size is their decoded size.
-    m_encoded_body_size = encoded_body_size.value_or(m_decoded_body_size);
+    if (request_server_encoded_body_size.has_value())
+        m_encoded_body_size = static_cast<u64>(max<i64>(*request_server_encoded_body_size, 0));
+    else
+        m_encoded_body_size = m_decoded_body_size;
     if (m_response)
         update_response_body_info();
     finalize_cache_entry();
@@ -131,10 +150,25 @@ void NetworkBodyPump::handle_network_complete(Optional<u64> encoded_body_size)
 
 void NetworkBodyPump::handle_network_error(StringView error_message)
 {
+    m_delivery_gate->detach_transport();
     if (WebDriver::BiDi::network_events_enabled() && m_fetch_params)
         WebDriver::BiDi::network_fetch_error(*m_fetch_params, error_message);
     abandon_cache_entry(HTTP::MemoryCache::StoredResponse::Keep);
     m_channel->error({ .message = MUST(ByteBuffer::copy(error_message.bytes())) });
+}
+
+void NetworkBodyPump::handle_network_teardown(Requests::Request::TeardownReason reason)
+{
+    m_delivery_gate->detach_transport();
+    switch (reason) {
+    case Requests::Request::TeardownReason::Stopped:
+        (void)m_channel->cancel();
+        break;
+    case Requests::Request::TeardownReason::Transferred:
+        (void)m_channel->transfer_out();
+        break;
+    }
+    abandon_cache_entry(HTTP::MemoryCache::StoredResponse::Keep);
 }
 
 void NetworkBodyPump::set_cached_response_body(Core::ImmutableBytes body)

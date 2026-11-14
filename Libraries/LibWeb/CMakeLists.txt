@@ -56,12 +56,7 @@ set(SOURCES
     ContentSecurityPolicy/Violation.cpp
     CookieStore/CookieChangeEvent.cpp
     CookieStore/CookieStore.cpp
-    CredentialManagement/Credential.cpp
     CredentialManagement/CredentialsContainer.cpp
-    CredentialManagement/FederatedCredential.cpp
-    CredentialManagement/FederatedCredentialOperations.cpp
-    CredentialManagement/PasswordCredential.cpp
-    CredentialManagement/PasswordCredentialOperations.cpp
     Crypto/Crypto.cpp
     Crypto/CryptoKey.cpp
     CSS/Angle.cpp
@@ -290,13 +285,12 @@ set(SOURCES
     EncryptedMediaExtensions/Algorithms.cpp
     EncryptedMediaExtensions/MediaKeySystemAccess.cpp
     EntriesAPI/FileSystemEntry.cpp
-    EventTiming/EventCounts.cpp
     EventTiming/EventTiming.cpp
-    EventTiming/PerformanceEventTiming.cpp
     Fetch/Body.cpp
     Fetch/BodyInit.cpp
     Fetch/Engine/FetchBodyDeliveryGate.cpp
     Fetch/Engine/FetchByteChannel.cpp
+    Fetch/Engine/FetchEngineRecord.cpp
     Fetch/Engine/FetchExecutor.cpp
     Fetch/Engine/InlineFetchExecutor.cpp
     Fetch/Engine/NetworkTransportHandle.cpp
@@ -699,10 +693,7 @@ set(SOURCES
     MediaSourceExtensions/SourceBufferList.cpp
     MixedContent/AbstractOperations.cpp
     Namespace.cpp
-    NavigationTiming/EntryNames.cpp
-    NavigationTiming/PerformanceNavigation.cpp
     NavigationTiming/PerformanceNavigationTiming.cpp
-    NavigationTiming/PerformanceTiming.cpp
     NotificationsAPI/Notification.cpp
     NotificationsAPI/NotificationPermission.cpp
     Page/AutoScrollHandler.cpp
@@ -731,8 +722,6 @@ set(SOURCES
     Painting/Scrolling.cpp
     Painting/ScrollSnap.cpp
     Painting/SvgPaintResources.cpp
-    PerformanceTimeline/EntryTypes.cpp
-    PerformanceTimeline/PerformanceEntry.cpp
     PermissionsAPI/Permissions.cpp
     PermissionsAPI/PermissionStore.cpp
     PermissionsAPI/PermissionStatus.cpp
@@ -755,7 +744,6 @@ set(SOURCES
     Selection/Selection.cpp
     Selection/CaretNavigation.cpp
     Selection/SelectionModifier.cpp
-    ServerTiming/PerformanceServerTiming.cpp
     ServiceWorker/Cache.cpp
     ServiceWorker/CacheStorage.cpp
     ServiceWorker/EventNames.cpp
@@ -767,16 +755,7 @@ set(SOURCES
     ServiceWorker/ServiceWorkerGlobalScope.cpp
     ServiceWorker/ServiceWorkerRecord.cpp
     ServiceWorker/ServiceWorkerRegistration.cpp
-    Speech/SpeechGrammar.cpp
-    Speech/SpeechGrammarList.cpp
-    Speech/SpeechRecognition.cpp
-    Speech/SpeechRecognitionAlternative.cpp
-    Speech/SpeechRecognitionEvent.cpp
-    Speech/SpeechRecognitionResult.cpp
-    Speech/SpeechRecognitionResultList.cpp
     Speech/SpeechSynthesis.cpp
-    Speech/SpeechSynthesisUtterance.cpp
-    Speech/SpeechSynthesisVoice.cpp
     SRI/IntegrityPolicy.cpp
     SRI/SRI.cpp
     StorageAPI/NavigatorStorage.cpp
@@ -914,8 +893,6 @@ set(SOURCES
     UIEvents/TouchList.cpp
     UIEvents/UIEvent.cpp
     UIEvents/WheelEvent.cpp
-    UserTiming/PerformanceMark.cpp
-    UserTiming/PerformanceMeasure.cpp
     ViewTransition/ViewTransition.cpp
     WebLocks/AbstractOperations.cpp
     WebLocks/LockManager.cpp

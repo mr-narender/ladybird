@@ -50,6 +50,7 @@
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/RemoteEnvironmentSettings.h>
@@ -152,6 +153,7 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
     , m_page(Web::Page::create(*this))
     , m_id(id)
     , m_pending_root_navigable_id(pending_root_navigable_id)
+    , m_network_activity_observers(Web::HTML::surrounding_agent().network_activity_observers)
 {
     setup_palette();
 
@@ -176,13 +178,19 @@ PageClient::PageClient(PageHost& owner, Web::PageId id, Optional<Web::HTML::Cros
 
 PageClient::~PageClient() = default;
 
+void PageClient::finalize()
+{
+    Base::finalize();
+    if (m_has_devtools_client)
+        m_network_activity_observers->page_did_lose_devtools_client();
+}
+
 void PageClient::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_page);
     for (auto& command : m_webdriver_input_commands)
         visitor.visit(command.value);
-    visitor.visit(m_top_level_document_console_client);
     for (auto& range : m_pending_text_fragment_generation_ranges)
         visitor.visit(range.value);
     for (auto& promise : m_pending_delete_all_cookies_promises)
@@ -1033,7 +1041,7 @@ void PageClient::page_did_change_active_document_in_top_level_browsing_context(W
         m_web_ui.clear();
 
     // The output that DevTools gets once it asks belongs to the document that the tab shows.
-    if (m_top_level_document_console_client && document.console_client() != m_top_level_document_console_client)
+    if (!document.console_client() || document.console_client().ptr() != m_top_level_document_console_client.ptr().ptr())
         m_console_output_buffer = {};
 
     if (auto console_client = attach_js_console(document))
@@ -1797,6 +1805,10 @@ void PageClient::page_did_close()
     // The heap sweeps a closed page in slices, so its timers can still fire once the cells they would use are gone.
     m_is_closed = true;
 
+    // A closed page has no DevTools client.
+    if (exchange(m_has_devtools_client, false))
+        m_network_activity_observers->page_did_lose_devtools_client();
+
     // NOTE: This only removes the strong reference the PageHost has for this PageClient.
     //       It will be GC'd 'later'.
     m_owner.remove_page({}, m_id);
@@ -2547,6 +2559,10 @@ void PageClient::set_has_devtools_client(bool has_devtools_client)
     if (m_has_devtools_client == has_devtools_client)
         return;
     m_has_devtools_client = has_devtools_client;
+    if (has_devtools_client)
+        m_network_activity_observers->page_did_gain_devtools_client();
+    else
+        m_network_activity_observers->page_did_lose_devtools_client();
 
     for (auto& navigable : Web::HTML::all_local_navigables()) {
         if (&navigable->page() != &page())
@@ -2643,15 +2659,16 @@ ErrorOr<WebView::DebuggerObjectProperties> PageClient::console_object_properties
 
 void PageClient::js_console_input(StringView js_source)
 {
-    if (m_top_level_document_console_client)
-        m_top_level_document_console_client->handle_input(js_source);
+    if (auto console_client = m_top_level_document_console_client.ptr())
+        console_client->handle_input(js_source);
 }
 
 Optional<Web::HTML::ConsoleInputCompletion> PageClient::complete_js_console_input(StringView input)
 {
-    if (!m_top_level_document_console_client)
+    auto console_client = m_top_level_document_console_client.ptr();
+    if (!console_client)
         return {};
-    return m_top_level_document_console_client->complete_input(input);
+    return console_client->complete_input(input);
 }
 
 void PageClient::run_javascript(StringView js_source)

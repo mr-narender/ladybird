@@ -47,21 +47,23 @@ use libjs_abi::FunctionNamePrefix;
 
 use super::bindings::*;
 use super::context::Generator;
+use super::context::changes_environment_state;
 use super::emitter::AssembledBytecode;
 use super::emitter::BlockEncoder;
 use super::emitter::BlockPosition;
 use super::emitter::FIRST_WIDE_SLOT;
 use super::emitter::FrameLayout;
 use super::emitter::OperandPosition;
+use super::generators::CompletionRegisters;
 use super::generators::DisposalKind;
 use super::generators::emit_dispose_resources;
 use super::generators::generate_await_of_value;
+use super::generators::generate_await_with_completions;
 use super::generators::generate_yield_of_value;
 use super::members::*;
 use super::names::NameClass;
 use super::nodes::Identifier;
 use super::operators::emit_binary_op;
-use super::registers::ScopedOperand;
 
 const UNBOUND: u32 = u32::MAX;
 
@@ -192,17 +194,23 @@ struct LastJump {
     label_position_count: u32,
 }
 
+/// A comparison that a conditional jump can make itself.
+#[derive(Clone, Copy)]
+struct Comparison {
+    operator: BinaryOp,
+    arith_feedback: u16,
+    lhs: Operand,
+    rhs: Operand,
+}
+
 /// A comparison that was just emitted, in case it turns out to feed a conditional jump.
 #[derive(Clone, Copy)]
 struct LastComparison {
     start: u32,
     end: u32,
     operand_position_count: u32,
-    operator: BinaryOp,
-    arith_feedback: u16,
     dst: Operand,
-    lhs: Operand,
-    rhs: Operand,
+    comparison: Comparison,
 }
 
 impl Stream {
@@ -454,10 +462,6 @@ fn spilled_instructions(
     }
     (instructions, fields)
 }
-
-/// How many operands an instruction with a list of them can hold. Every one of them can need a temporary with a
-/// slot that operands can name, so that this leaves room for those and the other operands of the instruction.
-pub(super) const MAX_OPERAND_LIST_LENGTH: usize = 200;
 
 pub(super) fn operand_list_count(length: usize) -> u32 {
     assert!(
@@ -739,6 +743,8 @@ pub struct Stream {
     has_left_entry: bool,
     /// The operands of a call or an array literal being put together.
     operands: Vec<Operand>,
+    /// The copies that copy_locals_on_stack() made, kept so that it does not allocate each time.
+    spare_local_copies: Vec<(Operand, Operand)>,
     handler: Option<Handler>,
     /// Where the handler changes, in order, as offsets of the main segment.
     handler_changes: Vec<(u32, Option<Handler>)>,
@@ -972,6 +978,9 @@ impl Generator<'_> {
 
     #[inline(always)]
     fn put_watching<I: TypedInstruction>(&mut self, instruction: I, watched: Operand) -> u32 {
+        if changes_environment_state(I::OPCODE) {
+            self.note_environment_change(&instruction.to_instruction());
+        }
         if self.context.stream.current.dead {
             return UNBOUND;
         }
@@ -1037,7 +1046,8 @@ impl Generator<'_> {
         }
     }
 
-    /// A register that nothing else gets until the registers go back.
+    /// Allocates a register that stays held until its owner's checkpoint is released.
+    /// Rust variable scope does not release it; use temporary() for short-lived expression scratch.
     pub(super) fn held_register(&mut self) -> Operand {
         let register = self.temporary();
         let stream = &mut self.context.stream;
@@ -1126,8 +1136,8 @@ impl Generator<'_> {
                 Control::Block {
                     environment: Some(environment),
                 } => {
-                    let parent = self.scoped_operand(environment.parent);
-                    self.restore_lexical_environment(&parent);
+                    let parent = environment.parent;
+                    self.restore_lexical_environment(parent);
                 }
                 Control::Iterator(iterator) => {
                     self.set_handler(iterator.outer_handler);
@@ -1179,17 +1189,11 @@ impl Generator<'_> {
         let (completion_type, completion_value, body) =
             (finally.completion_type, finally.completion_value, finally.body);
         if exit == Exit::Return {
-            self.put(op::Mov {
-                dst: completion_value,
-                src: value,
-            });
+            self.emit_mov(completion_value, value);
         }
         let kind =
             self.add_constant_i32(Finally::FIRST_EXIT + i32::try_from(position).expect("a function has few exits"));
-        self.put(op::Mov {
-            dst: completion_type,
-            src: kind.operand(),
-        });
+        self.emit_mov(completion_type, kind);
         self.jump(body);
     }
 
@@ -1217,10 +1221,7 @@ impl Generator<'_> {
         let finally = &self.context.stream.finallies[finally as usize];
         let (completion_type, body) = (finally.completion_type, finally.body);
         let normal = self.add_constant_i32(Finally::NORMAL);
-        self.put(op::Mov {
-            dst: completion_type,
-            src: normal.operand(),
-        });
+        self.emit_mov(completion_type, normal);
         self.jump(body);
     }
 
@@ -1229,7 +1230,7 @@ impl Generator<'_> {
         &mut self,
         finally: usize,
         handler: Handler,
-        entry_environment: &ScopedOperand,
+        entry_environment: Operand,
     ) -> Label {
         let finally = &self.context.stream.finallies[finally];
         let (completion_type, completion_value, body) =
@@ -1242,10 +1243,7 @@ impl Generator<'_> {
         });
         self.restore_lexical_environment(entry_environment);
         let throw = self.add_constant_i32(Finally::THROW);
-        self.put(op::Mov {
-            dst: completion_type,
-            src: throw.operand(),
-        });
+        self.emit_mov(completion_type, throw);
         body
     }
 
@@ -1266,7 +1264,7 @@ impl Generator<'_> {
             generator.put(op::JumpStrictlyEquals {
                 arith_feedback,
                 lhs: completion_type,
-                rhs: kind.operand(),
+                rhs: kind,
                 true_target: target,
                 false_target: next,
             });
@@ -1303,7 +1301,7 @@ impl Generator<'_> {
             label: self.new_label(),
             catches: false,
         };
-        let entry_environment = self.current_lexical_environment().operand();
+        let entry_environment = self.current_lexical_environment();
         let stream = &mut self.context.stream;
         let index = u32_from_usize(stream.disposals.len());
         stream.disposals.push(Disposal {
@@ -1347,13 +1345,15 @@ impl Generator<'_> {
         let finally = disposal.finally;
         self.leave_finally_part(finally);
         self.set_handler(disposal.outer_handler);
-        let entry_environment = self.scoped_operand(disposal.entry_environment);
-        let body = self.bind_finally_handler(finally as usize, disposal.handler, &entry_environment);
+        let entry_environment = disposal.entry_environment;
+        let body = self.bind_finally_handler(finally as usize, disposal.handler, entry_environment);
         self.bind_label(body);
         let (completion_type, completion_value) = {
             let finally = &self.context.stream.finallies[finally as usize];
             (finally.completion_type, finally.completion_value)
         };
+        // NB: What disposing takes is dead by the time the pending exit runs, which can need registers of its own.
+        let disposal_registers = self.hold_registers();
         emit_dispose_resources(
             self,
             if disposal.is_async {
@@ -1361,10 +1361,11 @@ impl Generator<'_> {
             } else {
                 DisposalKind::Sync
             },
-            &ScopedOperand::plain(disposal.stack),
-            &ScopedOperand::plain(completion_type),
-            &ScopedOperand::plain(completion_value),
+            disposal.stack,
+            completion_type,
+            completion_value,
         );
+        self.release_held_registers(disposal_registers);
         let end_label = self.new_label();
         self.finally_dispatch(finally as usize, end_label);
         self.bind_label(end_label);
@@ -1373,7 +1374,7 @@ impl Generator<'_> {
 
     /// Calls the `return` method of an async iterator and awaits what that gives, if it has one, and returns what it gave.
     pub(super) fn put_async_iterator_return(&mut self, iterator: OpenIterator, after_return: Label) -> Operand {
-        let method = self.allocate_register().operand();
+        let method = self.held_register();
         let key = self.intern_property_key_text(crate::utf16::Utf16View::Ascii(b"return"));
         let cache = self.next_property_lookup_cache();
         self.put(op::GetMethod {
@@ -1391,7 +1392,7 @@ impl Generator<'_> {
             false_target: call,
         });
         self.bind_label(call);
-        let result = self.allocate_register().operand();
+        let result = self.held_register();
         let call_feedback = self.next_call_feedback();
         self.put(op::Call {
             call_feedback,
@@ -1401,7 +1402,13 @@ impl Generator<'_> {
             argument_count: 0,
             arguments: &[],
         });
-        generate_await_of_value(self, &ScopedOperand::plain(result)).operand()
+        // NB: The method is dead after the call, and the result once the await takes it.
+        let received = CompletionRegisters {
+            completion: method,
+            completion_type: result,
+            value: self.held_register(),
+        };
+        generate_await_with_completions(self, result, received)
     }
 
     fn put_iterator_close(&mut self, iterator: OpenIterator) {
@@ -1488,28 +1495,27 @@ impl Generator<'_> {
     }
 
     fn copy_local_on_stack(&mut self, local: Operand) {
+        let mut copy = None;
         for index in 0..self.context.stream.values.len() {
             let value = self.context.stream.values[index];
             if value.kind == ValKind::LocalTarget {
                 continue;
             }
-            if value.a == local {
-                let copy = self.copy_to_kept_temporary(local);
-                self.context.stream.values[index].a = copy;
-            }
-            if value.b == local {
-                let copy = self.copy_to_kept_temporary(local);
-                self.context.stream.values[index].b = copy;
+            if value.a == local || value.b == local {
+                let copy = *copy.get_or_insert_with(|| self.copy_to_kept_temporary(local));
+                if value.a == local {
+                    self.context.stream.values[index].a = copy;
+                }
+                if value.b == local {
+                    self.context.stream.values[index].b = copy;
+                }
             }
         }
     }
 
     fn copy_to_kept_temporary(&mut self, operand: Operand) -> Operand {
         let copy = self.temporary();
-        self.put(op::Mov {
-            dst: copy,
-            src: operand,
-        });
+        self.emit_mov(copy, operand);
         let stream = &mut self.context.stream;
         stream.floor = stream.next_temporary;
         copy
@@ -1517,20 +1523,32 @@ impl Generator<'_> {
 
     /// Whatever is about to happen happens in only some of the ways through the code, so copies have to come first.
     pub(super) fn copy_locals_on_stack(&mut self) {
+        let mut copies = core::mem::take(&mut self.context.stream.spare_local_copies);
+        copies.clear();
         for index in 0..self.context.stream.values.len() {
             let value = self.context.stream.values[index];
             if value.kind == ValKind::LocalTarget {
                 continue;
             }
-            if value.a.is_local() || value.a.is_argument() {
-                let copy = self.copy_to_kept_temporary(value.a);
-                self.context.stream.values[index].a = copy;
-            }
-            if value.b.is_local() || value.b.is_argument() {
-                let copy = self.copy_to_kept_temporary(value.b);
-                self.context.stream.values[index].b = copy;
-            }
+            let a = self.copy_local_before_branch(value.a, &mut copies);
+            let b = self.copy_local_before_branch(value.b, &mut copies);
+            let value = &mut self.context.stream.values[index];
+            value.a = a;
+            value.b = b;
         }
+        self.context.stream.spare_local_copies = copies;
+    }
+
+    fn copy_local_before_branch(&mut self, operand: Operand, copies: &mut Vec<(Operand, Operand)>) -> Operand {
+        if !operand.is_local() && !operand.is_argument() {
+            return operand;
+        }
+        if let Some(&(_, copy)) = copies.iter().find(|&&(local, _)| local == operand) {
+            return copy;
+        }
+        let copy = self.copy_to_kept_temporary(operand);
+        copies.push((operand, copy));
+        copy
     }
 
     /// Makes `dst` hold `value`, which is either in a temporary that the last instruction wrote or takes a move.
@@ -1566,7 +1584,7 @@ impl Generator<'_> {
             }
             return;
         }
-        self.put(op::Mov { dst, src: value });
+        self.emit_mov(dst, value);
     }
 
     // --- Labels and jumps ---
@@ -1640,7 +1658,7 @@ impl Generator<'_> {
 
     /// Takes the comparison that made `condition` back, if that is what the code just did.
     #[inline(always)]
-    fn take_last_comparison(&mut self, condition: Operand) -> Option<LastComparison> {
+    fn take_last_comparison(&mut self, condition: Operand) -> Option<Comparison> {
         let stream = &mut self.context.stream;
         let comparison = stream.last_comparison?;
         if comparison.dst != condition || comparison.end as usize != stream.current.bytes.len() {
@@ -1654,7 +1672,7 @@ impl Generator<'_> {
             .truncate(comparison.operand_position_count as usize);
         stream.last_comparison = None;
         stream.last_destination = None;
-        Some(comparison)
+        Some(comparison.comparison)
     }
 
     fn constant_truthiness(&self, condition: Operand) -> Option<bool> {
@@ -1729,13 +1747,36 @@ impl Generator<'_> {
         self.context.stream.current.dead = was_dead;
     }
 
-    fn put_fused_jump(&mut self, comparison: LastComparison, true_target: Label, false_target: Label, back_edge: bool) {
-        let LastComparison {
+    /// Branches on a comparison without materializing its boolean result.
+    pub(super) fn emit_comparison_jump(
+        &mut self,
+        operator: BinaryOp,
+        lhs: Operand,
+        rhs: Operand,
+        true_target: Label,
+        false_target: Label,
+    ) {
+        if self.is_stream_dead() {
+            return;
+        }
+        self.reference_label(true_target);
+        self.reference_label(false_target);
+        let arith_feedback = self.next_arith_feedback();
+        let comparison = Comparison {
             operator,
             arith_feedback,
             lhs,
             rhs,
-            ..
+        };
+        self.put_fused_jump(comparison, true_target, false_target, false);
+    }
+
+    fn put_fused_jump(&mut self, comparison: Comparison, true_target: Label, false_target: Label, back_edge: bool) {
+        let Comparison {
+            operator,
+            arith_feedback,
+            lhs,
+            rhs,
         } = comparison;
         macro_rules! fused {
             ($($operator:ident => $jump:ident, $jump_loop:ident;)*) => {
@@ -1777,7 +1818,7 @@ impl Generator<'_> {
     }
 
     pub(super) fn value_of_this(&mut self) {
-        if self.this_value_needs_environment_resolution && !self.context.stream.has_resolved_this {
+        if self.this_value_needs_resolution && !self.context.stream.has_resolved_this {
             self.put(op::ResolveThisBinding {});
             let stream = &mut self.context.stream;
             stream.has_resolved_this = true;
@@ -1799,7 +1840,7 @@ impl Generator<'_> {
         if ident.local_type == Some(LocalType::Argument) {
             if self.checks_parameters() && !self.is_argument_initialized(ident.local_index) {
                 let empty = self.context.constants.add_empty();
-                self.put(op::Mov { dst: local, src: empty });
+                self.emit_mov(local, empty);
                 self.put(op::ThrowIfTDZ { src: local });
             }
         } else if self.local_has_temporal_dead_zone(ident.local_index) && !self.is_local_initialized(ident.local_index)
@@ -1813,7 +1854,7 @@ impl Generator<'_> {
                 .any(|value| value.kind == ValKind::LocalTarget && value.initializes && value.a == local);
             if is_being_initialized {
                 let empty = self.context.constants.add_empty();
-                self.put(op::Mov { dst: local, src: empty });
+                self.emit_mov(local, empty);
             }
             self.put(op::ThrowIfTDZ { src: local });
         }
@@ -1848,7 +1889,7 @@ impl Generator<'_> {
                 }
                 _ => {
                     if let Some(constant) = self.builtin_constant(ident.name) {
-                        self.push_value(constant.operand(), first_temporary);
+                        self.push_value(constant, first_temporary);
                         return;
                     }
                 }
@@ -1954,12 +1995,7 @@ impl Generator<'_> {
     }
 
     pub(super) fn put_get_by_value(&mut self, dst: Operand, base: Operand, key: Operand) {
-        emit_get_by_value(
-            self,
-            &ScopedOperand::plain(dst),
-            &ScopedOperand::plain(base),
-            &ScopedOperand::plain(key),
-        );
+        emit_get_by_value(self, dst, base, key);
     }
 
     // --- Properties of `super` and private names ---
@@ -1979,14 +2015,11 @@ impl Generator<'_> {
     }
 
     fn put_get_of_super(&mut self, dst: Operand, base: Operand, key: Result<Name, Operand>) {
-        let this_value = ScopedOperand::plain(Operand::register(Register::THIS_VALUE));
-        let dst = ScopedOperand::plain(dst);
-        let base = ScopedOperand::plain(base);
+        let this_value = Operand::register(Register::THIS_VALUE);
         match key {
-            Ok(name) => emit_get_by_id_with_this(self, &dst, &base, name, &this_value),
+            Ok(name) => emit_get_by_id_with_this(self, dst, base, name, this_value),
             Err(key) => {
-                let key = ScopedOperand::plain(key);
-                emit_get_by_value_with_this(self, &dst, &base, &key, &this_value);
+                emit_get_by_value_with_this(self, dst, base, key, this_value);
             }
         }
     }
@@ -2051,10 +2084,36 @@ impl Generator<'_> {
                 dst,
                 super_constructor,
                 arguments,
-                is_synthetic: false,
             },
             dst,
         );
+        self.push_value(dst, first_temporary);
+    }
+
+    /// `super(...)` without spread arguments, whose arguments are on top of the stack above the super constructor.
+    pub(super) fn super_call_with_operands(&mut self, argument_count: usize) {
+        if argument_count > MAX_OPERAND_LIST_LENGTH {
+            self.array(argument_count);
+            self.super_call();
+            return;
+        }
+        let arguments = self.take_operands(argument_count);
+        let (super_constructor, first_temporary) = self.pop_operand();
+        self.release_temporaries_from(first_temporary);
+        let dst = self.temporary();
+        let call_feedback = self.next_call_feedback();
+        self.put_with_destination(
+            op::SuperCall {
+                call_feedback,
+                dst,
+                super_constructor,
+                argument_count: operand_list_count(arguments.len()),
+                arguments: &arguments,
+            },
+            dst,
+        );
+        self.put(op::BindThisFromSuperCall { result: dst });
+        self.context.stream.operands = arguments;
         self.push_value(dst, first_temporary);
     }
 
@@ -2223,7 +2282,7 @@ impl Generator<'_> {
         self.context.stream.operands = operands;
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
-        self.put(op::Mov { dst, src: array });
+        self.emit_mov(dst, array);
         self.push_value(dst, first_temporary);
     }
 
@@ -2396,9 +2455,9 @@ impl Generator<'_> {
         self.push_value(dst, first_temporary);
     }
 
-    /// A spread element comes up in a list, so that the `count` elements before it go into an array, and the ones after
-    /// it get appended to that as they come.
-    pub(super) fn spread_begin(&mut self, count: usize) {
+    /// A list starts to be built as an array, so that the `count` elements before this go into an array, and the ones
+    /// after it get appended to that as they come.
+    pub(super) fn array_begin(&mut self, count: usize) {
         let first_temporary = if count == 0 {
             self.next_temporary()
         } else {
@@ -2490,20 +2549,14 @@ impl Generator<'_> {
         };
         let callee = self.pop_value();
         let this_value = self.temporary();
-        self.put(op::Mov {
-            dst: this_value,
-            src: callee.b,
-        });
-        self.put(op::Mov { dst, src: callee.a });
+        self.emit_mov(this_value, callee.b);
+        self.emit_mov(dst, callee.a);
         let end = self.new_label();
         self.jump(end);
         self.bind_label(short_circuit);
         let undefined = self.context.constants.add_undefined();
-        self.put(op::Mov { dst, src: undefined });
-        self.put(op::Mov {
-            dst: this_value,
-            src: undefined,
-        });
+        self.emit_mov(dst, undefined);
+        self.emit_mov(this_value, undefined);
         self.bind_label(end);
         self.push_callee(dst, this_value, first_temporary);
     }
@@ -2529,7 +2582,7 @@ impl Generator<'_> {
         } else {
             self.context.constants.add_undefined()
         };
-        self.put(op::Mov { dst, src });
+        self.emit_mov(dst, src);
         self.bind_label(end);
         self.release_temporaries_from(dst.index() + 1);
         self.push_value(dst, first_temporary);
@@ -2542,11 +2595,10 @@ impl Generator<'_> {
         let (rhs, _) = self.pop_operand();
         let (lhs, first_temporary) = self.pop_operand();
         if lhs.is_constant() && rhs.is_constant() {
-            let folded =
-                try_constant_fold_binary(self, operator, &ScopedOperand::plain(lhs), &ScopedOperand::plain(rhs));
+            let folded = try_constant_fold_binary(self, operator, lhs, rhs);
             if let Some(folded) = folded {
                 self.release_temporaries_from(first_temporary);
-                self.push_value(folded.operand(), first_temporary);
+                self.push_value(folded, first_temporary);
                 return;
             }
         }
@@ -2569,13 +2621,7 @@ impl Generator<'_> {
         let start = u32_from_usize(stream.current.bytes.len());
         let operand_position_count = u32_from_usize(stream.current.operand_positions.len());
         let arith_feedback_before = self.next_arith_feedback;
-        emit_binary_op(
-            self,
-            operator,
-            &ScopedOperand::plain(dst),
-            &ScopedOperand::plain(lhs),
-            &ScopedOperand::plain(rhs),
-        );
+        emit_binary_op(self, operator, dst, lhs, rhs);
         let stream = &mut self.context.stream;
         let end = u32_from_usize(stream.current.bytes.len());
         if !stream.current.dead {
@@ -2591,11 +2637,13 @@ impl Generator<'_> {
                 start,
                 end,
                 operand_position_count,
-                operator,
-                arith_feedback: u16::try_from(arith_feedback_before).unwrap_or(u16::MAX),
                 dst,
-                lhs,
-                rhs,
+                comparison: Comparison {
+                    operator,
+                    arith_feedback: u16::try_from(arith_feedback_before).unwrap_or(u16::MAX),
+                    lhs,
+                    rhs,
+                },
             });
         }
         self.push_value(dst, first_temporary);
@@ -2625,10 +2673,10 @@ impl Generator<'_> {
     pub(super) fn unary(&mut self, operator: UnaryOp) {
         let (value, first_temporary) = self.pop_operand();
         if value.is_constant()
-            && let Some(folded) = try_constant_fold_unary(self, operator, &ScopedOperand::plain(value))
+            && let Some(folded) = try_constant_fold_unary(self, operator, value)
         {
             self.release_temporaries_from(first_temporary);
-            self.push_value(folded.operand(), first_temporary);
+            self.push_value(folded, first_temporary);
             return;
         }
         if operator == UnaryOp::Void {
@@ -2690,7 +2738,7 @@ impl Generator<'_> {
         }
         let dst = self.temporary();
         let identifier = self.intern_identifier(ident.name);
-        self.emit(op::DeleteVariable { dst, identifier });
+        self.put(op::DeleteVariable { dst, identifier });
         self.push_value(dst, first_temporary);
     }
 
@@ -2703,7 +2751,7 @@ impl Generator<'_> {
     }
 
     pub(super) fn value_of_bigint(&mut self, digits: String) {
-        let operand = self.add_constant_bigint(digits).operand();
+        let operand = self.add_constant_bigint(digits);
         self.value_of_constant(operand);
     }
 
@@ -2805,8 +2853,8 @@ impl Generator<'_> {
     pub(super) fn await_value(&mut self) {
         let (value, first_temporary) = self.pop_operand();
         let held = self.hold_registers();
-        let result = generate_await_of_value(self, &ScopedOperand::plain(value));
-        self.take_result_of_held_registers(result.operand(), held, first_temporary);
+        let result = generate_await_of_value(self, value);
+        self.take_result_of_held_registers(result, held, first_temporary);
     }
 
     /// Yields the value on top of the stack if there is one, or what it iterates over if `is_yield_from`.
@@ -2817,18 +2865,9 @@ impl Generator<'_> {
             (self.context.constants.add_undefined(), self.next_temporary())
         };
         let held = self.hold_registers();
-        let received_completion = self.allocate_register();
-        let received_completion_type = self.allocate_register();
-        let received_completion_value = self.allocate_register();
-        let result = generate_yield_of_value(
-            self,
-            ScopedOperand::plain(value),
-            is_yield_from,
-            &received_completion,
-            &received_completion_type,
-            &received_completion_value,
-        );
-        self.take_result_of_held_registers(result.operand(), held, first_temporary);
+        let received = CompletionRegisters::allocate(self);
+        let result = generate_yield_of_value(self, value, is_yield_from, received);
+        self.take_result_of_held_registers(result, held, first_temporary);
     }
 
     /// Makes `result` the value of an expression whose code took the registers since `held`.
@@ -2836,7 +2875,7 @@ impl Generator<'_> {
         self.release_held_registers(held);
         self.release_temporaries_from(first_temporary);
         let dst = self.temporary();
-        self.put(op::Mov { dst, src: result });
+        self.emit_mov(dst, result);
         self.push_value(dst, first_temporary);
     }
 
@@ -3043,17 +3082,17 @@ impl Generator<'_> {
                 if target.a != Operand::invalid() {
                     let resolved_binding = if target.is_global {
                         ResolvedBinding::Global {
-                            is_resolvable: ScopedOperand::plain(target.a),
+                            is_resolvable: target.a,
                             identifier,
                             cache: target.cache,
                         }
                     } else {
                         ResolvedBinding::Environment {
-                            environment: ScopedOperand::plain(target.a),
+                            environment: target.a,
                             identifier,
                         }
                     };
-                    emit_set_resolved_binding(self, &resolved_binding, &ScopedOperand::plain(value));
+                    emit_set_resolved_binding(self, &resolved_binding, value);
                 } else if target.is_global {
                     let cache = self.next_global_variable_cache();
                     self.put(op::SetGlobal {
@@ -3079,28 +3118,22 @@ impl Generator<'_> {
                 });
             }
             ValKind::IndexTarget => {
-                emit_put_normal_by_value(
-                    self,
-                    &ScopedOperand::plain(target.a),
-                    &ScopedOperand::plain(target.b),
-                    &ScopedOperand::plain(value),
-                );
+                emit_put_by_value(self, target.a, target.b, value, libjs_abi::PutKind::Normal);
             }
             ValKind::SuperTarget => {
-                let this_value = ScopedOperand::plain(Operand::register(Register::THIS_VALUE));
-                let base = ScopedOperand::plain(target.a);
-                let value = ScopedOperand::plain(value);
+                let this_value = Operand::register(Register::THIS_VALUE);
+                let base = target.a;
                 if target.b != Operand::invalid() {
-                    let key = ScopedOperand::plain(target.b);
-                    emit_put_normal_by_value_with_this(self, &base, &key, &this_value, &value);
+                    let key = target.b;
+                    emit_put_normal_by_value_with_this(self, base, key, this_value, value);
                 } else {
                     let key = self.intern_property_key(Name(target.name));
                     let cache = self.next_property_lookup_cache();
                     self.put(op::PutByIdWithThis {
-                        base: base.operand(),
-                        this_value: this_value.operand(),
+                        base,
+                        this_value,
                         property: key,
-                        src: value.operand(),
+                        src: value,
                         cache,
                         kind: libjs_abi::PutKind::Normal as u8,
                     });
@@ -3221,15 +3254,14 @@ impl Generator<'_> {
             }
             ValKind::SuperTarget => {
                 let dst = self.temporary();
-                let this_value = ScopedOperand::plain(Operand::register(Register::THIS_VALUE));
-                let base = ScopedOperand::plain(target.a);
+                let this_value = Operand::register(Register::THIS_VALUE);
+                let base = target.a;
                 if target.b != Operand::invalid() {
                     let key = self.read_modify_write_key(target.a, target.b);
                     self.context.stream.values.last_mut().expect("a target was evaluated").b = key;
-                    let key = ScopedOperand::plain(key);
-                    emit_get_by_value_with_this(self, &ScopedOperand::plain(dst), &base, &key, &this_value);
+                    emit_get_by_value_with_this(self, dst, base, key, this_value);
                 } else {
-                    emit_get_by_id_with_this(self, &ScopedOperand::plain(dst), &base, Name(target.name), &this_value);
+                    emit_get_by_id_with_this(self, dst, base, Name(target.name), this_value);
                 }
                 self.push_value(dst, first_temporary);
             }
@@ -3271,7 +3303,7 @@ impl Generator<'_> {
         let dst = self.temporary();
         let stream = &mut self.context.stream;
         stream.floor = stream.next_temporary;
-        self.put(op::Mov { dst, src: old_value });
+        self.emit_mov(dst, old_value);
         let end_label = self.new_label();
         match operator {
             LogicalOp::And => self.jump_unless(dst, end_label),
@@ -3320,13 +3352,7 @@ impl Generator<'_> {
         } else {
             self.temporary()
         };
-        emit_binary_op(
-            self,
-            operator,
-            &ScopedOperand::plain(dst),
-            &ScopedOperand::plain(lhs),
-            &ScopedOperand::plain(rhs),
-        );
+        emit_binary_op(self, operator, dst, lhs, rhs);
         let target = self.pop_value();
         if target.kind != ValKind::LocalTarget || target.is_const {
             self.store_to_target(target, dst, false);
@@ -3349,7 +3375,7 @@ impl Generator<'_> {
             if target.is_const {
                 // NB: The value gets converted to a number before the write fails, and stays what it is.
                 let copy = self.temporary();
-                self.put(op::Mov { dst: copy, src: local });
+                self.emit_mov(copy, local);
                 let old_value = self.temporary();
                 self.put_postfix_update(operator, old_value, copy);
                 self.put(op::ThrowConstAssignment {});
@@ -3380,7 +3406,7 @@ impl Generator<'_> {
         }
         // NB: The old value is in a temporary of its own by now.
         let value = old_value;
-        let result = if prefixed {
+        let result = if prefixed || !value_is_used {
             let arith_feedback = self.next_arith_feedback();
             match operator {
                 UpdateOp::Increment => self.put(op::Increment {
@@ -3560,13 +3586,7 @@ impl Generator<'_> {
         let (value, _) = self.pop_operand();
         let key = self.context.constants.add_number(key);
         let object = self.context.stream.values.last().expect("an object is being built").a;
-        emit_put_by_value(
-            self,
-            &ScopedOperand::plain(object),
-            &ScopedOperand::plain(key),
-            &ScopedOperand::plain(value),
-            kind,
-        );
+        emit_put_by_value(self, object, key, value, kind);
         self.release_temporaries_from(object.index() + 1);
     }
 
@@ -3588,13 +3608,7 @@ impl Generator<'_> {
             name: key,
             prefix: prefix as u8,
         });
-        emit_put_by_value(
-            self,
-            &ScopedOperand::plain(object),
-            &ScopedOperand::plain(key),
-            &ScopedOperand::plain(value),
-            kind,
-        );
+        emit_put_by_value(self, object, key, value, kind);
         self.release_temporaries_from(object.index() + 1);
     }
 
@@ -3617,13 +3631,7 @@ impl Generator<'_> {
             });
         }
         let object = *self.context.stream.values.last().expect("an object is being built");
-        emit_put_by_value(
-            self,
-            &ScopedOperand::plain(object.a),
-            &ScopedOperand::plain(key),
-            &ScopedOperand::plain(value),
-            libjs_abi::PutKind::Own,
-        );
+        emit_put_by_value(self, object.a, key, value, libjs_abi::PutKind::Own);
         self.release_temporaries_from(object.a.index() + 1);
     }
 
@@ -3751,10 +3759,7 @@ impl Generator<'_> {
     pub(super) fn reset_completion(&mut self) {
         if let Some(completion) = self.context.stream.completion {
             let undefined = self.context.constants.add_undefined();
-            self.put(op::Mov {
-                dst: completion,
-                src: undefined,
-            });
+            self.emit_mov(completion, undefined);
         }
     }
 
@@ -3762,20 +3767,14 @@ impl Generator<'_> {
     pub(super) fn save_completion(&mut self) -> Option<Operand> {
         let completion = self.context.stream.completion?;
         let saved = self.held_register();
-        self.put(op::Mov {
-            dst: saved,
-            src: completion,
-        });
+        self.emit_mov(saved, completion);
         self.reset_completion();
         Some(saved)
     }
 
     pub(super) fn restore_completion(&mut self, saved: Option<Operand>) {
         if let (Some(completion), Some(saved)) = (self.context.stream.completion, saved) {
-            self.put(op::Mov {
-                dst: completion,
-                src: saved,
-            });
+            self.emit_mov(completion, saved);
         }
     }
 
@@ -4168,7 +4167,10 @@ impl Generator<'_> {
             constant_count: used_constant_count,
         };
         if frame.start_of(OperandType::Argument) + self.context.stream.number_of_arguments > FIRST_WIDE_SLOT {
-            self.order_constants_by_use(&constant_uses, &mut new_constant_indices);
+            // NB: Constants that come after the slots that operands can name are wide whatever their order.
+            if frame.start_of(OperandType::Constant) < FIRST_WIDE_SLOT {
+                self.order_constants_by_use(&constant_uses, &mut new_constant_indices);
+            }
             frame = self.context.stream.spill_wide_slots(frame, &new_constant_indices);
         }
         let stream = &mut self.context.stream;

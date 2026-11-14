@@ -64,7 +64,6 @@
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/LargestContentfulPaint/LargestContentfulPaint.h>
 #include <LibWeb/Loader/LoaderConfig.h>
-#include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/PaintTiming/PerformancePaintTiming.h>
@@ -72,7 +71,6 @@
 #include <LibWeb/PermissionsAPI/PermissionStatus.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
-#include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/ServiceWorker/CacheStorage.h>
@@ -233,7 +231,6 @@ JSCompletion web_rust_structured_clone(JSVM*, void* realm, JSValue, JSObject* co
 HighResolutionTime::Performance* web_rust_performance_timeline_performance(JSVM*, void* realm);
 void web_rust_performance_timeline_queue_performance_entry(JSVM*, void* realm, PerformanceTimeline::PerformanceEntry*);
 void web_rust_performance_timeline_add_performance_entry(JSVM*, void* realm, PerformanceTimeline::PerformanceEntry*, bool check_if_performance_buffer_is_full);
-void web_rust_performance_timeline_add_resource_timing_entry(JSVM*, void* realm, PerformanceTimeline::PerformanceEntry*);
 }
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#dom-structuredclone
@@ -839,17 +836,24 @@ WebIDL::ExceptionOr<i32> WindowOrWorkerGlobalScopeMixin::set_interval(TimerHandl
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-cleartimeout
 void WindowOrWorkerGlobalScopeMixin::clear_timeout(i32 id)
 {
-    if (auto timer = m_timers.get(id); timer.has_value())
-        timer.value()->stop();
-    m_timers.remove(id);
+    // The clearTimeout(id) and clearInterval(id) method steps are to remove this's map of setTimeout and setInterval IDs[id].
+    if (m_internal_timer_ids.contains(id))
+        return;
+    cancel_timeout_steps(id);
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-clearinterval
 void WindowOrWorkerGlobalScopeMixin::clear_interval(i32 id)
 {
-    if (auto timer = m_timers.get(id); timer.has_value())
+    clear_timeout(id);
+}
+
+void WindowOrWorkerGlobalScopeMixin::cancel_timeout_steps(i32 timer_key)
+{
+    if (auto timer = m_timers.get(timer_key); timer.has_value())
         timer.value()->stop();
-    m_timers.remove(id);
+    m_timers.remove(timer_key);
+    m_internal_timer_ids.remove(timer_key);
 }
 
 void WindowOrWorkerGlobalScopeMixin::clear_map_of_active_timers()
@@ -857,6 +861,7 @@ void WindowOrWorkerGlobalScopeMixin::clear_map_of_active_timers()
     for (auto& it : m_timers)
         it.value->stop();
     m_timers.clear();
+    m_internal_timer_ids.clear();
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timer-initialisation-steps
@@ -1070,12 +1075,6 @@ void WindowOrWorkerGlobalScopeMixin::add_performance_entry(GC::Ref<PerformanceTi
     web_rust_performance_timeline_add_performance_entry(JS::HostABI::vm_to_abi(realm.vm()), &realm, new_entry.ptr(), check_if_performance_buffer_is_full == CheckIfPerformanceBufferIsFull::Yes);
 }
 
-void WindowOrWorkerGlobalScopeMixin::add_resource_timing_entry(Badge<ResourceTiming::PerformanceResourceTiming>, GC::Ref<ResourceTiming::PerformanceResourceTiming> entry)
-{
-    auto& realm = relevant_realm(*this);
-    web_rust_performance_timeline_add_resource_timing_entry(JS::HostABI::vm_to_abi(realm.vm()), &realm, entry.ptr());
-}
-
 void WindowOrWorkerGlobalScopeMixin::register_event_source(Badge<EventSource>, GC::Ref<EventSource> event_source)
 {
     m_registered_event_sources.set(event_source);
@@ -1146,8 +1145,11 @@ WindowOrWorkerGlobalScopeMixin::AffectedAnyWebSockets WindowOrWorkerGlobalScopeM
 i32 WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout(i32 timeout, GC::Ref<GC::Function<void()>> completion_step)
 {
     auto timer_key = m_timer_id_allocator.allocate();
+    m_internal_timer_ids.set(timer_key);
     auto remove_timer_and_complete = GC::create_function(GC::Heap::the(), GC::captures(this_impl(), timer_key, completion_step), [](auto& this_object, auto& timer_key, auto& completion_step) {
-        as<WindowOrWorkerGlobalScopeMixin>(this_object).m_timers.remove(timer_key);
+        auto& global_scope = as<WindowOrWorkerGlobalScopeMixin>(this_object);
+        global_scope.m_timers.remove(timer_key);
+        global_scope.m_internal_timer_ids.remove(timer_key);
         completion_step->function()();
     });
     // NB: A timeout another specification waits on — an idle callback's, an AbortSignal's — isn't one of the page's
@@ -1497,8 +1499,21 @@ GC::Ref<ServiceWorker::CacheStorage> WindowOrWorkerGlobalScopeMixin::caches()
 GC::Ref<TrustedTypes::TrustedTypePolicyFactory> WindowOrWorkerGlobalScopeMixin::trusted_types()
 {
     if (!m_trusted_type_policy_factory)
-        m_trusted_type_policy_factory = GC::Heap::the().allocate<TrustedTypes::TrustedTypePolicyFactory>(this_impl());
+        m_trusted_type_policy_factory = TrustedTypes::TrustedTypePolicyFactory::create(relevant_realm(*this));
     return *m_trusted_type_policy_factory;
+}
+
+extern "C" {
+
+// Called by Bindings/Rust/src/html/window_or_worker_global_scope.rs.
+TrustedTypes::TrustedTypePolicyFactory* web_html_window_or_worker_global_scope_trusted_types(JSObject* global_object);
+
+TrustedTypes::TrustedTypePolicyFactory* web_html_window_or_worker_global_scope_trusted_types(JSObject* global_object)
+{
+    auto* global = window_or_worker_global_scope_from_global_object(*JS::HostABI::object_from_abi(global_object));
+    VERIFY(global);
+    return global->trusted_types().ptr();
+}
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#windoworworkerglobalscope-mixin:extract-an-origin
@@ -1527,14 +1542,17 @@ bool WindowOrWorkerGlobalScopeMixin::expose_experimental_interfaces()
 }
 
 // A site-compatibility rule can expose a gated interface or member to the documents and workers it matches, without
-// exposing it to the web at large. The rule is keyed by the URL the environment was created with, so it holds for the
-// lifetime of that global, the same way the global switch does.
+// exposing it to the web at large. The rule is keyed by the environment's top-level site and its own, so it holds for
+// the lifetime of that global, the same way the global switch does.
 bool WindowOrWorkerGlobalScopeMixin::expose_experimental_interface(EnvironmentSettingsObject const& settings, StringView name)
 {
     if (s_experimental_interfaces_exposed)
         return true;
 
-    return current_loader_config()->config.exposes_experimental_interface(settings.creation_url, name);
+    // NB: A Window's interfaces are set up before it has a document to take the origin of.
+    auto origin = settings.creation_url.origin();
+    auto top_level_origin = settings.top_level_origin.value_or(origin);
+    return current_loader_config()->config.exposes_experimental_interface(top_level_origin, origin, name);
 }
 
 }

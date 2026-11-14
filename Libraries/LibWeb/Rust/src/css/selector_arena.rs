@@ -1544,9 +1544,9 @@ pub(crate) struct SheetSelectorsBuilder {
 impl SheetSelectorsBuilder {
     /// Packs `list`, whose names `names` keeps live and whose `&` names `nesting`, and answers its
     /// handle.
-    pub(crate) fn push(
+    pub(crate) fn push<S: std::borrow::Borrow<tree::CompiledSelector>>(
         &mut self,
-        list: &[Arc<tree::CompiledSelector>],
+        list: &[S],
         names: Vec<crate::css::style::AtomLease>,
         nesting: NestingTarget,
     ) -> SelectorListRef {
@@ -1586,9 +1586,9 @@ impl SheetSelectorsBuilder {
 
     /// Packs the selectors of a style rule as [`Self::push`] does, and answers too the ordinal a
     /// `&` in a rule nested in it names it by, which an empty list has none of.
-    pub(crate) fn push_rule(
+    pub(crate) fn push_rule<S: std::borrow::Borrow<tree::CompiledSelector>>(
         &mut self,
-        list: &[Arc<tree::CompiledSelector>],
+        list: &[S],
         names: Vec<crate::css::style::AtomLease>,
         nesting: NestingTarget,
     ) -> (SelectorListRef, Option<RuleOrdinal>) {
@@ -1606,6 +1606,9 @@ pub(crate) enum NestingContext<'a> {
     Rule(&'a SelectorListRef),
 }
 
+/// What the tests of a compound read, by which compounds have one shape. In place for a short compound.
+type CompoundShapeKey = smallvec::SmallVec<[(u32, u32); 6]>;
+
 impl Drop for SheetSelectorsBuilder {
     fn drop(&mut self) {
         let arena = std::mem::take(&mut self.builder).finish();
@@ -1622,7 +1625,7 @@ pub struct SelectorListRef {
 
 impl SelectorListRef {
     /// Packs the parsed list `list`, which names no style rule with a `&`, into an arena of its own.
-    pub(crate) fn pack(list: &[Arc<tree::CompiledSelector>]) -> Self {
+    pub(crate) fn pack<S: std::borrow::Borrow<tree::CompiledSelector>>(list: &[S]) -> Self {
         SheetSelectorsBuilder::default().push(list, Vec::new(), NestingTarget::Root)
     }
 
@@ -1864,40 +1867,56 @@ impl Builder {
     }
 
     /// Pushes `list`, nested lists first, and answers where it starts, or none for an empty list.
-    fn push_list(&mut self, list: &[Arc<tree::CompiledSelector>], nesting: NestingTarget) -> Option<ListStart> {
+    fn push_list<S: std::borrow::Borrow<tree::CompiledSelector>>(
+        &mut self,
+        list: &[S],
+        nesting: NestingTarget,
+    ) -> Option<ListStart> {
         if list.is_empty() {
             return None;
         }
         self.nesting = nesting;
-        // NB: The parser finished every nested list before the list naming it; they go first.
-        let selectors: Vec<Vec<(Combinator, bool, Vec<Component>)>> = list
-            .iter()
-            .map(|selector| {
-                selector
-                    .compound_selectors()
-                    .iter()
-                    .map(|compound| {
-                        let components = compound
-                            .simple_selectors
-                            .iter()
-                            .map(|simple| self.component(simple))
-                            .collect::<Vec<_>>();
-                        (compound.combinator, compound.is_implicit_universal_anchor, components)
-                    })
-                    .collect()
-            })
-            .collect();
-        let start = ListStart(index_u32(self.components.len()));
-        let count = selectors.len();
-        for (index, compounds) in selectors.into_iter().enumerate() {
-            let leading = compounds.first().map_or(Combinator::None, |compound| compound.0);
-            let compound_count = compounds.len();
-            for (position, (combinator, implicit_anchor, mut components)) in compounds.into_iter().rev().enumerate() {
-                assert!(!components.is_empty(), "a compound holds a simple selector");
-                if implicit_anchor {
-                    components[0].bits = components[0].bits.with(IMPLICIT, true);
+        // NB: The parser finished every nested list before the list naming it; they go first. The components of the
+        //     list wait here until each nested list is in the arena.
+        let mut components = SmallVec::<[Component; 16]>::new();
+        // Where each compound ends in `components`, with its combinator, and how many compounds each selector has.
+        let mut compounds = SmallVec::<[(Combinator, u32); 8]>::new();
+        let mut compound_counts = SmallVec::<[u32; 4]>::new();
+        for selector in list {
+            let selector_compounds = selector.borrow().compound_selectors();
+            for compound in &selector_compounds {
+                assert!(
+                    !compound.simple_selectors.is_empty(),
+                    "a compound holds a simple selector"
+                );
+                let first = components.len();
+                for simple in compound.simple_selectors {
+                    let component = self.component(simple);
+                    components.push(component);
                 }
-                let leftmost = position + 1 == compound_count;
+                if compound.is_implicit_universal_anchor {
+                    components[first].bits = components[first].bits.with(IMPLICIT, true);
+                }
+                compounds.push((compound.combinator, index_u32(components.len())));
+            }
+            compound_counts.push(index_u32(selector_compounds.len()));
+        }
+        let start = ListStart(index_u32(self.components.len()));
+        let count = compound_counts.len();
+        let mut first_compound = 0;
+        for (index, &compound_count) in compound_counts.iter().enumerate() {
+            let compound_count = compound_count as usize;
+            let selector_compounds = &compounds[first_compound..first_compound + compound_count];
+            let leading = selector_compounds
+                .first()
+                .map_or(Combinator::None, |compound| compound.0);
+            for position in (0..compound_count).rev() {
+                let (combinator, end) = selector_compounds[position];
+                let compound_start = match first_compound + position {
+                    0 => 0,
+                    previous => compounds[previous - 1].1 as usize,
+                };
+                let leftmost = position == 0;
                 let relation = match leftmost {
                     true if leading != Combinator::None => Relation::of(leading),
                     true => Relation::Leftmost,
@@ -1910,12 +1929,13 @@ impl Builder {
                         Relation::of(combinator)
                     }
                 };
-                let last = components.len() - 1;
+                let last = end as usize - 1;
                 components[last].bits = components[last].bits.with_relation(relation);
                 if relation == Relation::Leftmost && index + 1 == count {
                     components[last].bits = components[last].bits.with(LAST_IN_LIST, true);
                 }
-                self.components.extend(components);
+                self.components
+                    .extend_from_slice(&components[compound_start..end as usize]);
             }
             if leading != Combinator::None {
                 let bits = ComponentBits::new(ComponentKind::RelativeAnchor)
@@ -1924,6 +1944,7 @@ impl Builder {
                     .with(LAST_IN_LIST, index + 1 == count);
                 self.components.push(Component { bits, data: 0 });
             }
+            first_compound += compound_count;
         }
         Some(start)
     }
@@ -2275,8 +2296,18 @@ impl SelectorArena {
                 .unwrap_or(index);
             let describes_its_subject =
                 !(start..=subject_end).any(|at| self.components[at].bits.kind() == ComponentKind::PseudoElement);
-            let flags = (u32::from(names_the_scope(selector)) * NAMES_THE_SCOPE)
-                | (u32::from(escapes_its_namespace(selector)) * ESCAPES_ITS_NAMESPACE)
+            // NB: Only a pseudo-class or a `&` can name the scope, and only a pseudo-element can escape the namespace.
+            //     Most selectors have none of them, and are then not read as selectors here.
+            let (mut may_name_the_scope, mut may_escape_its_namespace) = (false, false);
+            for component in &self.components[start..=index] {
+                match component.bits.kind() {
+                    ComponentKind::PseudoClass | ComponentKind::Nesting => may_name_the_scope = true,
+                    ComponentKind::PseudoElement => may_escape_its_namespace = true,
+                    _ => {}
+                }
+            }
+            let flags = (u32::from(may_name_the_scope && names_the_scope(selector)) * NAMES_THE_SCOPE)
+                | (u32::from(may_escape_its_namespace && escapes_its_namespace(selector)) * ESCAPES_ITS_NAMESPACE)
                 | (u32::from(describes_its_subject) * DESCRIBES_ITS_SUBJECT);
             if flags != 0 {
                 facts.push((start, flags));
@@ -2309,7 +2340,7 @@ impl SelectorArena {
     /// Note what matching asks of each compound as a whole, and where each compound starts.
     fn note_compound_facts(&mut self) {
         let mut compounds = Vec::new();
-        let mut shapes: crate::css::style::fast_hash::FastMap<Vec<(u32, u32)>, u32> = Default::default();
+        let mut shapes: crate::css::style::fast_hash::FastMap<CompoundShapeKey, u32> = Default::default();
         let words = self.components.len().div_ceil(64);
         let mut starts = vec![0u64; words];
         let mut start = 0;
@@ -2373,7 +2404,7 @@ impl SelectorArena {
     fn compound_shape(
         &self,
         components: std::ops::Range<usize>,
-        shapes: &mut crate::css::style::fast_hash::FastMap<Vec<(u32, u32)>, u32>,
+        shapes: &mut crate::css::style::fast_hash::FastMap<CompoundShapeKey, u32>,
     ) -> u32 {
         // NB: Only what a compound's own tests read counts toward its shape: not the combinator its last component
         //     carries, nor the facts the arena notes of a selector or a compound.
@@ -2399,7 +2430,7 @@ impl SelectorArena {
         if reads_its_selector {
             return CompoundFacts::NO_SHAPE;
         }
-        let key: Vec<(u32, u32)> = self.components[components]
+        let key: CompoundShapeKey = self.components[components]
             .iter()
             .map(|component| (component.bits.0 & SHAPE_BITS, component.data))
             .collect();
@@ -2411,7 +2442,7 @@ impl SelectorArena {
 impl Selector<'_> {
     /// The selector as a parse tree again, for a transformation that builds another selector from
     /// it. The tree names the arena's atoms, which the arena keeps live while it is packed again.
-    pub(crate) fn to_tree(self) -> Arc<tree::CompiledSelector> {
+    pub(crate) fn to_tree(self) -> tree::CompiledSelector {
         let compounds: Box<[tree::CompoundSelector]> = self
             .compound_selectors()
             .iter()
@@ -2476,7 +2507,7 @@ fn simple_to_tree(simple: &SimpleSelector<'_>) -> tree::SimpleSelector {
                 value: match pseudo_element.value {
                     PseudoElementValue::None => tree::PseudoElementValue::None,
                     PseudoElementValue::CompoundSelector(selector) => {
-                        tree::PseudoElementValue::CompoundSelector(selector.to_tree())
+                        tree::PseudoElementValue::CompoundSelector(Arc::new(selector.to_tree()))
                     }
                     PseudoElementValue::Identifiers(identifiers) => {
                         tree::PseudoElementValue::Identifiers(identifiers.iter().map(SelectorString::from).collect())
@@ -2567,6 +2598,14 @@ impl PartialEq for SelectorArena {
             && self.text_ranges == other.text_ranges
             && self.text == other.text
             && self.rule_lists == other.rule_lists
+    }
+}
+
+impl SelectorListRef {
+    /// Whether both are the same list of the same arena, not only equal ones.
+    #[cfg(test)]
+    pub(crate) fn is_same_list(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.arena, &other.arena) && self.start == other.start
     }
 }
 

@@ -71,6 +71,8 @@ fn offsets() -> RuntimeOffsets {
         execution_context_argument_count: 152,
         execution_context_returns_to_native_caller: 156,
         execution_context_runs_jit_code: 157,
+        execution_context_caller_is_derived_construct: 158,
+        execution_context_new_target: 160,
         ecmascript_function_environment: 0,
         ecmascript_function_private_environment: 8,
         shared_function_script_or_module: 24,
@@ -531,6 +533,8 @@ fn write_frame_states(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *con
                                 value::boxed_constant(*((frame_pointer as i64 + i64::from(offset)) as *const u64), repr)
                             }
                             ValueLocation::Constant(bits) => bits,
+                            // NB: Exit stubs pass the compiled function's frame.
+                            ValueLocation::Frame(slot) => *frame.add(FRAME_HEADER_WORDS + slot as usize),
                             ValueLocation::ArgumentsObject { mapped } => fake_arguments_object(mapped),
                             ValueLocation::VirtualObject(_) => unreachable!("tests make no virtual objects"),
                         };
@@ -1579,7 +1583,7 @@ mod execution {
         let program = assemble(|_| {
             vec![
                 Instruction::Enter,
-                Instruction::Mov { dst: r(6), src: a(0) },
+                add(r(6), a(0), c(1)),
                 Instruction::ConcatString { dst: r(5), src: c(1) },
                 Instruction::Mov { dst: l(0), src: r(6) },
                 Instruction::Mov { dst: l(1), src: r(5) },
@@ -1589,8 +1593,35 @@ mod execution {
         });
         let (result, machine) = run_with(&program, test_layout(), &[value::int32(5)], &[5], |_| {});
         assert_eq!(result.status, RESUME);
-        assert_eq!(machine.slot(l(0)), value::int32(5));
+        assert_eq!(machine.slot(l(0)), value::int32(15));
         // Enter emptied r5, which the fake ConcatString treats as 0.
+        assert_eq!(machine.slot(l(1)), value::int32(10));
+    }
+
+    #[test]
+    fn exit_values_survive_in_frame_slots_that_nothing_writes_across_calls() {
+        // r6 holds the argument across a call, and its frame slot holds it for the exit after the call.
+        let program = assemble(|_| {
+            vec![
+                Instruction::Enter,
+                Instruction::Mov { dst: r(6), src: a(0) },
+                Instruction::ConcatString { dst: r(5), src: c(1) },
+                Instruction::Mov { dst: l(0), src: r(6) },
+                Instruction::Mov { dst: l(1), src: r(5) },
+                add(r(7), l(0), l(1)),
+                Instruction::Return { value: r(7) },
+            ]
+        });
+        let (_, compiled) = compile_program(&program, test_layout(), &[5]);
+        assert!(compiled.sites.iter().any(|site| {
+            site.frames[0]
+                .values
+                .iter()
+                .any(|(slot, location)| *slot == l(0).raw() && *location == ValueLocation::Frame(a(0).raw()))
+        }));
+        let (result, machine) = run_with(&program, test_layout(), &[value::int32(5)], &[5], |_| {});
+        assert_eq!(result.status, RESUME);
+        assert_eq!(machine.slot(l(0)), value::int32(5));
         assert_eq!(machine.slot(l(1)), value::int32(10));
     }
 
@@ -2442,6 +2473,36 @@ fn slow_paths_save_no_more_registers_than_the_saves_area_holds() {
     }
     check::<crate::asm::x86_64::MacroAssembler>();
     check::<crate::asm::aarch64::MacroAssembler>();
+}
+
+#[test]
+fn x86_64_shifts_find_their_amount_in_cl() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::BitwiseXorRhsInt32 {
+                arith_feedback: 1,
+                dst: r(4),
+                lhs: a(0),
+                rhs: 5,
+            },
+            Instruction::LeftShift {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: r(4),
+            },
+            Instruction::Return { value: r(5) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
+    snapshot.runtime = runtime();
+    snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::INT32; 2];
+    let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    let text = crate::asm::disassembler::x86_64(&compiled.code[..compiled.data_offset as usize]).join("\n");
+    // NB: The macro assembler shifts amounts in other registers in a scratch register, saving RCX in another.
+    assert!(text.contains(", cl"), "{text}");
+    assert!(!text.contains("r11d, cl") && !text.contains("mov r10, rcx"), "{text}");
 }
 
 #[test]
@@ -3512,6 +3573,8 @@ mod direct_calls {
         fn target(&self, strict: bool, uses_this: bool) -> DirectCallTarget {
             DirectCallTarget {
                 function: InlinedFunctionSnapshot {
+                    super_base: None,
+                    has_own_new_target: true,
                     function: CellId(self.function.as_ptr() as u64),
                     formal_parameter_count: 3,
                     strict,
@@ -4528,6 +4591,8 @@ fn aarch64_direct_calls_disassemble() {
     snapshot.runtime = runtime();
     let target = DirectCallTarget {
         function: InlinedFunctionSnapshot {
+            super_base: None,
+            has_own_new_target: true,
             function: CellId(0x5000),
             formal_parameter_count: 2,
             strict: false,

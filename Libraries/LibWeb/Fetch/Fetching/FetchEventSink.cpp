@@ -13,6 +13,7 @@
 #include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/WebIDL/DOMException.h>
 
 namespace Web::Fetch::Fetching {
@@ -31,21 +32,13 @@ GC::Ref<Infrastructure::FetchController> FetchEventSink::controller() const
     return *controller;
 }
 
-// https://fetch.spec.whatwg.org/#fetch-params-canceled
-static bool is_canceled(Infrastructure::FetchController const& controller)
-{
-    // A fetch params fetchParams is canceled if its controller’s state is "aborted" or "terminated".
-    auto state = controller.state();
-    return state == Infrastructure::FetchController::State::Aborted || state == Infrastructure::FetchController::State::Terminated;
-}
-
 // https://fetch.spec.whatwg.org/#concept-http-network-fetch
 // The processBodyChunk steps of transmitting request's body.
 // NB: The steps read only bytes's length, so they are given it.
 static void process_body_chunk(Infrastructure::FetchController& controller, u64 length)
 {
     // 1. If fetchParams is canceled, then abort these steps.
-    if (is_canceled(controller))
+    if (controller.control_block().is_canceled())
         return;
 
     // 2. Run this step in parallel: transmit bytes.
@@ -62,7 +55,7 @@ static void process_body_chunk(Infrastructure::FetchController& controller, u64 
 static void process_end_of_body(Infrastructure::FetchController& controller)
 {
     // 1. If fetchParams is canceled, then abort these steps.
-    if (is_canceled(controller))
+    if (controller.control_block().is_canceled())
         return;
 
     // 2. If fetchParams’s process request end-of-body is non-null, then run fetchParams’s process request
@@ -98,7 +91,7 @@ static void read_request_body_stream(GC::Ref<Infrastructure::FetchController> co
     // 3. Let processBodyError given e be these steps:
     auto process_body_error = GC::create_function(GC::Heap::the(), GC::captures(realm, controller), [](auto& realm, auto& controller, JS::Value error) {
         // 1. If fetchParams is canceled, then abort these steps.
-        if (is_canceled(controller))
+        if (controller->control_block().is_canceled())
             return;
 
         // 2. If e is an "AbortError" DOMException, then abort fetchParams’s controller.
@@ -165,6 +158,9 @@ void FetchEventSink::handle_event(Engine::EngineEvent event)
         },
         [&](Engine::Event::RequestBodySentFromSource const&) {
             drain_request_body_stream(controller);
+        },
+        [&](Engine::Event::NetworkActivity const& network_activity) {
+            controller->page()->did_receive_network_activity(network_activity);
         },
         [](Engine::Event::ResponseDelivery const&) { VERIFY_NOT_REACHED(); },
         [](Engine::Event::EndOfBody const&) { VERIFY_NOT_REACHED(); },

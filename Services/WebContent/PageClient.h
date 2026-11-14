@@ -12,11 +12,13 @@
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/Utf16String.h>
+#include <LibGC/Weak.h>
 #include <LibGfx/Rect.h>
 #include <LibJS/Forward.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/DOM/AccessibilityChangeTracker.h>
+#include <LibWeb/Fetch/Engine/NetworkActivityObservers.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/SameDocumentNavigationEntry.h>
 #include <LibWeb/HTML/Scripting/ConsoleInputCompletion.h>
@@ -183,6 +185,7 @@ private:
     PageClient(PageHost&, Web::PageId id, Optional<Web::HTML::CrossProcessId>);
 
     virtual void visit_edges(JS::Cell::Visitor&) override;
+    virtual void finalize() override;
 
     enum class FrameTimerPurpose {
         Inactive,
@@ -481,7 +484,9 @@ private:
     u64 m_next_webdriver_mouse_event_request_id { 0 };
     RefPtr<WebUIConnection> m_web_ui;
 
-    GC::Ptr<WebContentConsoleClient> m_top_level_document_console_client;
+    // Weak, since the page can stop showing a document here without showing another, when another process hosts the
+    // tab's next document.
+    GC::Weak<WebContentConsoleClient> m_top_level_document_console_client;
 
     RefPtr<Core::Timer> m_frame_timer;
     FrameTimerPurpose m_frame_timer_purpose { FrameTimerPurpose::Inactive };
@@ -507,6 +512,7 @@ private:
     Optional<i64> m_pending_accessibility_focus;
 
     bool m_has_devtools_client { false };
+    NonnullRefPtr<Web::Fetch::Engine::NetworkActivityObservers> m_network_activity_observers;
     bool m_devtools_takes_console_messages { false };
     bool m_devtools_takes_console_errors { false };
 

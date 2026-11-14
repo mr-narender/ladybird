@@ -3701,12 +3701,8 @@ void LocalNavigable::deliver_posted_message_from_another_process(MessageDescript
     //     posting to its opener's tab, or the other way round, posts from a tab another page of this process holds.
     GC::Ptr<WindowProxy> source;
     if (message.source_navigable_id.has_value()) {
-        if (auto source_navigable = navigable_with_id_in_any_page(page(), *message.source_navigable_id)) {
-            if (auto* remote_source_navigable = as_if<RemoteNavigable>(*source_navigable))
-                source = remote_source_navigable->active_window_proxy_in_realm_of(*window);
-            else
-                source = source_navigable->active_window_proxy();
-        }
+        if (auto source_navigable = navigable_with_id_in_any_page(page(), *message.source_navigable_id))
+            source = source_navigable->active_window_proxy();
     }
 
     // 8. Queue a global task on the posted message task source given targetWindow to run the following steps:
@@ -4779,6 +4775,7 @@ GC::Ref<LocalNavigable> LocalNavigable::create_stand_in(Badge<Page> badge, Remot
     } else {
         navigable->m_root_container_state = remote_navigable.replicated_state().container;
         navigable->set_parent_compositor_context(as<RemoteNavigable>(*parent_navigable).compositor_context_id());
+        navigable->m_force_dark_enabled = page.force_dark_for_local_roots();
     }
 
     // The UI process orders any history step for the navigable after the update for its creation.

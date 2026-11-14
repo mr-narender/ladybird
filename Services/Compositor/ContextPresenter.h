@@ -73,9 +73,9 @@ public:
     bool presents_to_client() const { return m_presents_to_client; }
     void stop_presenting_to_client() { m_presents_to_client = false; }
 
-    // Whether the window server may show the canvases and videos of the frames above them, instead of the frames
-    // holding them.
-    void set_window_server_may_show_media(bool may_show_media) { m_window_server_may_show_media = may_show_media; }
+    // The remote layer that may show the canvases and videos of the frames above them, instead of the frames holding
+    // them.
+    void set_remote_layer_that_may_show_media(RemoteLayer const* remote_layer) { m_remote_layer_that_may_show_media = remote_layer; }
     // Otherwise, the frame draws HDR content tone-mapped to SDR.
     void set_window_server_may_show_high_dynamic_range(bool may_show) { m_window_server_may_show_high_dynamic_range = may_show; }
     void did_deliver_frame_without_store() { m_frame_without_store_in_flight = false; }
@@ -94,7 +94,7 @@ public:
     bool ui_overlay_fades_need_frame() const { return m_picture_in_picture_controls_fade.is_fading(); }
     Optional<PendingFrame> advance_ui_overlay_fades(MonotonicTime frame_time);
 
-    Optional<BackingStoreManager::Publication> resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const&, BackingStoreManager::GpuSharing, BackingStoreManager::PublicationMode);
+    ErrorOr<Optional<BackingStoreManager::Publication>> resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const&, BackingStoreManager::GpuSharing, BackingStoreManager::PublicationMode, RefPtr<WindowServer> window_server_showing_stores = {});
     void invalidate_backing_stores();
     Optional<BackingStoreManager::Publication> add_backing_store_for_pending_frame_if_needed(RefPtr<Gfx::SkiaBackendContext> const&);
     bool has_surplus_backing_stores() const { return m_backing_store_manager.has_surplus_backing_stores(); }
@@ -104,7 +104,7 @@ public:
     void acknowledge_all_presented_bitmaps() { m_backing_store_manager.release_all_presented_buffers(); }
     void did_finish_gpu_present(i32 bitmap_id, Gfx::IntSize frame_size);
     RefPtr<Gfx::PaintingSurface> latest_rendered_surface() const { return m_latest_rendered_surface; }
-    Gfx::SharedImageBuffer const* shared_image_buffer_of_latest_rendered_store() const { return m_backing_store_manager.shared_image_buffer_of_latest_rendered_store(); }
+    PresentableSurface* window_server_surface_of_latest_rendered_store() const { return m_backing_store_manager.window_server_surface_of_latest_rendered_store(); }
     BackingStoreManager::PublicationMode backing_store_publication_mode() const { return m_backing_store_manager.publication_mode(); }
 
     bool update_composited_raster_transform(Gfx::FloatRect destination_rect, Gfx::FloatMatrix4x4 const& canvas_transform);
@@ -247,7 +247,7 @@ private:
     u64 m_last_layer_content_version { 0 };
     bool m_repaint_everything_after_dropping_layers { false };
 
-    bool m_window_server_may_show_media { false };
+    RemoteLayer const* m_remote_layer_that_may_show_media { nullptr };
     bool m_window_server_may_show_high_dynamic_range { true };
     // Whether the window server shows the canvases and videos of the latest frame above it.
     bool m_window_server_shows_media { false };

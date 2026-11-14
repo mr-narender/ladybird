@@ -403,7 +403,7 @@ private:
 
     // The Compositor commits the page's frames into a remote layer, which this layer shows by the ID of its context.
     static bool can_host_remote_layers();
-    virtual void remote_layer_changed(u32 core_animation_context_id) override;
+    virtual void remote_layer_changed(Compositing::RemoteLayerHostHandle) override;
     void update_remote_layer_host();
     void synchronize_resize_with_remote_layer();
     void await_resized_frame_before_commit(u64 token);
@@ -437,6 +437,16 @@ private:
     void release_imported_d3d_textures();
 
     Vector<ImportedD3DTexture> m_imported_d3d_textures;
+
+    virtual void remote_layer_changed(Compositing::RemoteLayerHostHandle) override;
+    virtual void childEvent(QChildEvent*) override;
+    virtual bool eventFilter(QObject*, QEvent*) override;
+    bool has_visible_child_over_page() const;
+    void update_whether_view_hosts_remote_layer();
+    void native_window_changed();
+    bool m_hosts_remote_layer { false };
+    bool m_vertical_tabs_overlay_page { false };
+    bool m_bookmarks_bar_overlays_page { false };
 #endif
 
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW

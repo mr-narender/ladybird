@@ -115,13 +115,7 @@ impl ParsedProgram {
     /// first use.
     pub fn ast_dump(&mut self) -> &str {
         self.ast_dump.get_or_insert_with(|| {
-            let source = &self
-                .tree
-                .as_ref()
-                .expect("the program has a tree")
-                .script
-                .positions
-                .source;
+            let source = &self.tree.as_ref().expect("the program has a tree").source;
             let mut options = self.options;
             options.keep_whole_tree = true;
             let tree = parse_to_tree(source, &options)
@@ -1771,6 +1765,20 @@ mod tests {
         let script = Arc::downgrade(&parsed.tree.script);
         let _compiled = compile_eval(parsed);
         assert!(script.upgrade().is_none());
+    }
+
+    #[test]
+    fn a_source_that_stops_compiling_lets_go_of_its_reparse_context() {
+        let program = compile(SOURCE);
+        let payload = first_payload(&program);
+        compile_with_enough_stack(&payload, false);
+        assert!(payload.script.has_reparse_context());
+        crate::parser::release_idle_reparse_contexts();
+        assert!(payload.script.has_reparse_context());
+        crate::parser::release_idle_reparse_contexts();
+        assert!(!payload.script.has_reparse_context());
+        compile_with_enough_stack(&payload, false);
+        assert!(payload.script.has_reparse_context());
     }
 
     #[test]

@@ -2,6 +2,7 @@ if (BUILD_TESTING AND NOT WIN32)
     if (APPLE OR LINUX)
         ladybird_python_test(test-devtools-catch-up-layout.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-devtools-client-follows-the-tab.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-devtools-network-events.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-iframe-console.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-console-previews.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-message-port-collection.py ARGS $<TARGET_FILE:WebDriver>)
@@ -25,6 +26,7 @@ if (BUILD_TESTING AND NOT WIN32)
     ladybird_python_test(test-webdriver-bidi.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-content-blockers.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
     ladybird_python_test(test-webdriver-delete-session.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-element-screenshot.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-error-keep-alive.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-force-dark.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-permissions-settings.py ARGS $<TARGET_FILE:WebDriver>)
@@ -73,6 +75,7 @@ set(TEST_SOURCES
     TestOmnibox.cpp
     TestPermissionManager.cpp
     TestPictureInPictureWindow.cpp
+    TestPlatformFeatures.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
     TestSessionHistoryTraversalQueue.cpp
@@ -129,6 +132,7 @@ if (NOT WIN32)
         TestAutocomplete.cpp
         TestBeforeUnload.cpp
         TestBrowserHistoryTraversal.cpp
+        TestCompositorStartup.cpp
         TestCrashOverlay.cpp
         TestCrashReportSubmission.cpp
         TestFavicon.cpp

@@ -28,6 +28,7 @@ mod allocation;
 mod call;
 mod call_stub;
 mod entry;
+pub mod lowering_info;
 pub use call::DIRECT_CALL_MAX_INPUTS;
 pub use call::DIRECT_CALL_TEMPS;
 
@@ -38,6 +39,7 @@ enum InputValue {
     Constant(u64),
 }
 pub use call_stub::generate_call_stub;
+pub use call_stub::generate_construct_stub;
 pub use entry::generate_entry_trampoline;
 mod array_iterators;
 mod arrays;
@@ -158,6 +160,7 @@ pub fn target_registers<M: PortableMacroAssembler>() -> (RegisterSet, PinnedRegi
         caller_saved_fprs: RegisterMask(u64::from(M::CALLER_SAVED_FPRS.0)),
         argument_gprs: M::ARGUMENT_GPRS.iter().map(|register| register.0).collect(),
         return_gpr: M::RETURN_GPRS[0].0,
+        shift_amount_gpr: M::SHIFT_AMOUNT_GPR.map(|register| register.0),
         scratch_gpr: pinned.scratch.0,
     };
     (registers, pinned)
@@ -329,6 +332,14 @@ struct Codegen<'a, M: PortableMacroAssembler> {
     /// The no-ops of `AssumeValid` nodes, with the exits that the jumps
     /// replacing them go to once the code is invalidated.
     invalidation_points: Vec<(usize, Label)>,
+    /// Whether to check that the lowerings match what they declare (see `verify_lowerings()`).
+    verify: bool,
+    /// The node whose code (inline or out of line) is being emitted, if any.
+    emitting: Option<NodeId>,
+    /// How many temps each node's lowering took (see `temp()`).
+    requested_temps: Vec<std::cell::Cell<u8>>,
+    /// The nodes whose code used the saves area without declaring it.
+    undeclared_saves_area_uses: std::cell::RefCell<Vec<NodeId>>,
 }
 
 /// The operands of the slow path of a `CallSlowPath` node that is a call,
@@ -403,13 +414,15 @@ struct LeaveStub {
 }
 
 /// Generates code for `graph` with `allocation`, whose registers came from
-/// `target_registers::<M>()`.
+/// `target_registers::<M>()`. With `verify` (and in debug builds), checks
+/// that every lowering matches its `lowering_info()`.
 pub fn generate<M: PortableMacroAssembler>(
     graph: &Graph,
     allocation: &Allocation,
     executables: &[ExecutableSnapshot],
     runtime: &RuntimeInfo,
     stress: StressOptions,
+    verify: bool,
 ) -> Result<GeneratedCode, CompileFailure> {
     let (_, pinned) = target_registers::<M>();
     let (gpr_dump_count, fpr_dump_count) = register_dump_counts::<M>();
@@ -459,6 +472,10 @@ pub fn generate<M: PortableMacroAssembler>(
         slow_path_values: None,
         invalidation_points: Vec::new(),
         fused_probe_failure: None,
+        verify: verify || cfg!(debug_assertions),
+        emitting: None,
+        requested_temps: vec![std::cell::Cell::new(0); graph.nodes.len()],
+        undeclared_saves_area_uses: std::cell::RefCell::new(Vec::new()),
     };
     codegen.lay_out_frame()?;
     codegen.emit_prologue();
@@ -473,6 +490,11 @@ pub fn generate<M: PortableMacroAssembler>(
     codegen.emit_tails();
     codegen.emit_frame_initialization_stub()?;
     let osr_entries = codegen.emit_osr_entries();
+    if codegen.verify
+        && let Err(errors) = codegen.verify_lowerings()
+    {
+        panic!("lowerings that do not match their declarations:\n{errors}");
+    }
 
     let sites = codegen
         .sites
@@ -701,23 +723,19 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let needs_saves_area = (0..self.graph.blocks.len())
             .flat_map(|block| self.graph.block_nodes(BlockId::from_index(block)))
             .any(|node| self.uses_saves_area(node));
+        // NB: This sizes the record for the nodes that are no longer in any block too.
         for node in &self.graph.nodes {
-            // NB: The runtime's PutById cache probe takes a record.
-            if let Op::ProbePropertyStore { .. } = node.op {
-                record_bytes = record_bytes.max(probes::PUT_BY_ID_RECORD_BYTES);
-            }
-            // NB: Binary slow paths called on values write their result into
-            //     the record.
-            if let Op::CallSlowPath { opcode, .. } = node.op
-                && slow_path_call(opcode) == Some(SlowPathCall::BinaryValues)
-            {
-                record_bytes = record_bytes.max(8);
-            }
-            match node.op {
-                Op::Generic { opcode, executable, pc }
-                | Op::CallSlowPath {
-                    opcode, executable, pc, ..
-                } if slow_path_call(opcode) == Some(SlowPathCall::Record) => {
+            match lowering_info::lowering_info(node).record {
+                lowering_info::Record::None => {}
+                lowering_info::Record::Bytes(bytes) => record_bytes = record_bytes.max(bytes),
+                lowering_info::Record::SlowPathOperands => {
+                    let (Op::Generic { opcode, executable, pc }
+                    | Op::CallSlowPath {
+                        opcode, executable, pc, ..
+                    }) = node.op
+                    else {
+                        unreachable!("only slow path calls take their operands in the record");
+                    };
                     let layout = slow_path_layout(opcode);
                     let (inputs, fixed_registers) = match layout.abi {
                         SlowPathAbi::Scalar => (
@@ -750,7 +768,6 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                     };
                     record_bytes = record_bytes.max(8 * record);
                 }
-                _ => {}
             }
         }
         let record = outgoing_bytes.next_multiple_of(16);
@@ -900,6 +917,23 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         Ok(Address::new(self.pinned.frame, checked_i32(offset)?))
     }
 
+    /// The address of the slot `slot` of the frame at `frame` that is the home of a value (see
+    /// `regalloc::frame_home()`), which the value's `LoadSlot` addressed already.
+    fn frame_home_address(&self, frame: Gpr, slot: u32) -> Address {
+        let offset = u64::from(self.runtime.offsets.execution_context_slots) + 8 * u64::from(slot);
+        Address::new(frame, i32::try_from(offset).expect("the load of the slot addressed it"))
+    }
+
+    /// Loads the value that the compiled function's frame slot `slot` holds (see `regalloc::frame_home()`) into `dst`
+    /// inside the code of a node, where the frame register may hold the innermost frame of the inlined calls the node
+    /// published: reads the compiled function's frame from where the entry saved it.
+    fn emit_load_frame_home(&mut self, dst: Gpr, slot: u32) {
+        let root_frame = self.local_address(self.locals.root_frame);
+        self.masm.load64(dst, &root_frame);
+        let address = self.frame_home_address(dst, slot);
+        self.masm.load64(dst, &address);
+    }
+
     fn frame_field(&self, offset: u32) -> Address {
         Address::new(self.pinned.frame, offset as i32)
     }
@@ -948,6 +982,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn annotate(&mut self, annotation: CodeAnnotation) {
         let offset = u32::try_from(self.masm.offset()).expect("code fits in 4 GiB");
         self.annotations.push((offset, annotation));
+        self.emitting = match annotation {
+            CodeAnnotation::Node(node) | CodeAnnotation::Deferred(node) => Some(node),
+            _ => None,
+        };
     }
 
     fn emit_prologue(&mut self) {
@@ -1289,7 +1327,23 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 let address = self.spill_address(to);
                 self.masm.store_imm64(&address, bits);
             }
-            (_, Location::Constant(_)) => unreachable!("moves never write constants"),
+            // NB: Between nodes, the frame register holds the compiled function's frame.
+            (Location::Frame(slot), Location::Register(to)) => {
+                let Register::General(to) = register_of(to) else {
+                    unreachable!("values loaded from frame slots are tagged");
+                };
+                let address = self.frame_home_address(self.pinned.frame, slot);
+                self.masm.load64(to, &address);
+            }
+            (Location::Frame(slot), Location::Stack(to)) => {
+                let from = self.frame_home_address(self.pinned.frame, slot);
+                let to = self.spill_address(to);
+                self.masm.load64(self.pinned.scratch, &from);
+                self.masm.store64(&to, self.pinned.scratch);
+            }
+            (_, Location::Constant(_) | Location::Frame(_)) => {
+                unreachable!("moves never write constants or frame slots")
+            }
         }
     }
 
@@ -1334,7 +1388,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 Register::Float(_) => unreachable!("float64 inputs are read with `float_input()`"),
             },
             Location::Constant(bits) => InputValue::Constant(bits),
-            Location::Stack(_) => unreachable!("inputs are in registers or constants"),
+            Location::Stack(_) | Location::Frame(_) => unreachable!("inputs are in registers or constants"),
         }
     }
 
@@ -1371,9 +1425,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.masm.load64(self.output(node_id), &address);
             }
             Op::StoreSlot { slot } => self.emit_store_slot(node_id, *slot)?,
-            Op::InitializeFrame { clobbers_floats } => self.emit_initialize_frame(node_id, *clobbers_floats)?,
-            Op::EnsureFrameInitialized { clobbers_floats } => {
-                self.emit_ensure_frame_initialized(node_id, *clobbers_floats)?;
+            Op::InitializeFrame => self.emit_initialize_frame(node_id)?,
+            Op::EnsureFrameInitialized => {
+                self.emit_ensure_frame_initialized(node_id)?;
             }
             Op::PublishFrame => self.emit_publish_frame(),
             Op::LoadOuterEnvironment => {
@@ -1706,7 +1760,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::StoreGlobalBinding { environment, index } => {
                 let exit = self.exit_site(node_id);
-                let values = Gpr(self.allocation.node(node_id).temps[0]);
+                let values = self.temp(node_id, 0);
                 let slot = self.global_binding_slot(values, *environment, *index)?;
                 self.masm
                     .branch64_memory_imm(Condition::Equal, &slot, value::EMPTY as i64, exit);
@@ -1721,7 +1775,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::CheckAccessorFunction { offset, part, function } => {
                 let exit = self.exit_site(node_id);
-                let accessor = Gpr(self.allocation.node(node_id).temps[0]);
+                let accessor = self.temp(node_id, 0);
                 let field = self.emit_load_accessor(node_id, accessor, *offset, *part, exit)?;
                 self.masm
                     .branch32_memory_imm(Condition::NotEqual, &field, function.compressed() as i32, exit);
@@ -1740,7 +1794,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             }
             Op::StoreNamed { offset, holds_data } => {
                 let exit = (!holds_data).then(|| self.exit_site(node_id));
-                let storage = Gpr(self.allocation.node(node_id).temps[0]);
+                let storage = self.temp(node_id, 0);
                 let slot = self.named_property_address(storage, *offset)?;
                 let cell = self.cell_address_of(node_id, storage, 2);
                 let storage_field = Address::new(cell, self.runtime.offsets.object_named_properties as i32);
@@ -1922,7 +1976,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let exit = self.exit_site(node);
         let (value, prototype) = (self.input(node, 0), self.input(node, 1));
         let output = self.output(node);
-        let object = Gpr(self.allocation.node(node).temps[0]);
+        let object = self.temp(node, 0);
         let scratch = self.pinned.scratch;
         let layout = self.runtime.layout;
         let offsets = self.runtime.offsets;
@@ -2102,7 +2156,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
     fn emit_add_named(&mut self, node_id: NodeId, offset: u32, shape: CellId) -> Result<(), CompileFailure> {
         // NB: Nothing can collect garbage between giving the object
         //     the shape with the property and storing its value.
-        let storage = Gpr(self.allocation.node(node_id).temps[0]);
+        let storage = self.temp(node_id, 0);
         let cell = self.cell_address_of(node_id, storage, 2);
         let offsets = self.runtime.offsets;
         self.masm
@@ -2260,19 +2314,17 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     /// The `Enter` bytecode: empty registers and locals, constants copied
     /// into the frame, and the frame marked initialized (and published).
-    fn emit_initialize_frame(&mut self, node: NodeId, clobbers_floats: bool) -> Result<(), CompileFailure> {
-        let temps = &self.allocation.node(node).temps;
-        let (value, cursor) = (Gpr(temps[0]), Gpr(temps[1]));
-        self.emit_frame_initialization(value, cursor, clobbers_floats.then_some(M::ARGUMENT_FPRS[0]))
+    fn emit_initialize_frame(&mut self, node: NodeId) -> Result<(), CompileFailure> {
+        let (value, cursor) = (self.temp(node, 0), self.temp(node, 1));
+        self.emit_frame_initialization(value, cursor, Self::lowering_fpr(0))
     }
 
     /// `EnsureFrameInitialized`: initializes the frame unless it is.
-    fn emit_ensure_frame_initialized(&mut self, node: NodeId, clobbers_floats: bool) -> Result<(), CompileFailure> {
-        let temps = &self.allocation.node(node).temps;
-        let (value, cursor) = (Gpr(temps[0]), Gpr(temps[1]));
+    fn emit_ensure_frame_initialized(&mut self, node: NodeId) -> Result<(), CompileFailure> {
+        let (value, cursor) = (self.temp(node, 0), self.temp(node, 1));
         let done = self.masm.new_label();
         self.branch_if_frame_initialized(done);
-        self.emit_frame_initialization(value, cursor, clobbers_floats.then_some(M::ARGUMENT_FPRS[0]))?;
+        self.emit_frame_initialization(value, cursor, Self::lowering_fpr(0))?;
         self.masm.bind(done);
         Ok(())
     }
@@ -2298,23 +2350,18 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
 
     /// Publishes the frame and initializes it like `Enter`, with `value` for
     /// the stored values, and with a loop using `cursor` for large frames.
-    /// With a `vector` register, which it clobbers, it stores two slots at
-    /// a time. Clobbers the scratch register.
-    fn emit_frame_initialization(
-        &mut self,
-        value: Gpr,
-        cursor: Gpr,
-        vector: Option<Fpr>,
-    ) -> Result<(), CompileFailure> {
+    /// Stores two slots at a time through `vector`, which it clobbers (and
+    /// which therefore holds no values: a lowering register, or any register
+    /// in the out of line stub). Clobbers the scratch register.
+    fn emit_frame_initialization(&mut self, value: Gpr, cursor: Gpr, vector: Fpr) -> Result<(), CompileFailure> {
         self.emit_publish_frame();
-        // Up to this many registers and locals are emptied with one store
-        // each (or per two slots through a vector register), more in a loop.
-        let unrolled_slots: u32 = if vector.is_some() { 64 } else { 32 };
+        // Up to this many registers and locals are emptied with one store per two slots, more in a loop.
+        const UNROLLED_SLOTS: u32 = 64;
         let layout = self.executables[0].layout;
         let slots = self.runtime.offsets.execution_context_slots;
         let first = crate::bytecode::RESERVED_REGISTER_COUNT;
         let mut fields: Vec<call::ConstantField> = Vec::new();
-        let unrolled = layout.registers_and_locals_count.saturating_sub(first) <= unrolled_slots;
+        let unrolled = layout.registers_and_locals_count.saturating_sub(first) <= UNROLLED_SLOTS;
         if !unrolled {
             self.masm.move_imm64(value, value::EMPTY);
             let start = self.slot_address(first)?;
@@ -2335,7 +2382,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             fields.push((slots + 8 * (layout.constants_base() + index), 8, *constant));
         }
         fields.push((self.runtime.offsets.execution_context_frame_initialized, 1, 1));
-        self.emit_constant_fields_with_vector(self.pinned.frame, value, &mut fields, vector, &[])
+        self.emit_constant_fields_with_vector(self.pinned.frame, value, &mut fields, Some(vector), &[])
     }
 
     /// Initializes the frame for slow paths, whose caller-saved general
@@ -2349,7 +2396,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         };
         self.annotate(CodeAnnotation::Tail("frame initialization (shared by slow paths)"));
         self.masm.bind(label);
-        self.emit_frame_initialization(M::ARGUMENT_GPRS[0], M::ARGUMENT_GPRS[1], Some(M::ARGUMENT_FPRS[0]))?;
+        self.emit_frame_initialization(M::ARGUMENT_GPRS[0], M::ARGUMENT_GPRS[1], M::ARGUMENT_FPRS[0])?;
         self.masm.ret();
         Ok(())
     }
@@ -2604,6 +2651,16 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             self.emit_generic_js_call(executable, pc)?;
             return Ok(Vec::new());
         }
+        if matches!(
+            opcode,
+            crate::bytecode::OpCode::CallConstruct
+                | crate::bytecode::OpCode::SuperCall
+                | crate::bytecode::OpCode::SuperCallWithForwardedArguments
+        ) && self.runtime.construct_stub != 0
+        {
+            self.emit_generic_construct(executable, pc)?;
+            return Ok(Vec::new());
+        }
         let decoded = self.decoded(executable, pc)?;
         let next_pc = decoded.next_pc();
         let call = slow_path_call(opcode).expect("generic nodes have a slow path");
@@ -2702,11 +2759,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
         let ssa_outputs = outputs
             .into_iter()
             .filter(|operand| {
-                crate::builder::is_ssa_slow_path_output(
-                    &frame_layout,
-                    crate::bytecode::Operand::from_raw(*operand),
-                    executable != 0,
-                )
+                crate::builder::is_ssa_slow_path_output(&frame_layout, crate::bytecode::Operand::from_raw(*operand))
             })
             .collect::<Vec<_>>();
         Ok((operands, ssa_outputs))
@@ -2915,6 +2968,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 self.emit_box(dst, dst, repr);
             }
             Location::Constant(bits) => self.masm.move_imm64(dst, value::boxed_constant(bits, repr)),
+            // NB: Nodes that publish no frames run in the compiled function's frame.
+            Location::Frame(slot) if !self.publishes_frames(node) => {
+                let address = self.frame_home_address(self.pinned.frame, slot);
+                self.masm.load64(dst, &address);
+            }
+            Location::Frame(slot) => self.emit_load_frame_home(dst, slot),
         }
     }
 
@@ -3137,15 +3196,9 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             //     published frames, and an exception they throw may be caught
             //     further out, where the interpreter reads the frames. (The
             //     slow paths of fast paths run in frames written in full.)
-            return matches!(
-                self.graph.node(node).op,
-                Op::Generic { .. }
-                    | Op::CallSlowPath { .. }
-                    | Op::CallDirect { .. }
-                    | Op::CallNative { .. }
-                    | Op::CallForwardingArguments { .. }
-            )
-            .then_some(node);
+            return lowering_info::lowering_info(self.graph.node(node))
+                .may_leave_from_inlined_callee
+                .then_some(node);
         }
         (frame_state.executable == 0 && !frame_state.values.is_empty()).then_some(node)
     }
@@ -3281,6 +3334,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 ValueLocation::Stack(offset, repr) => {
                     self.masm.load64(value, &Address::new(M::FRAME_POINTER, offset));
                     self.emit_box(value, value, repr);
+                }
+                ValueLocation::Frame(slot) => {
+                    let address = self.slot_address(slot)?;
+                    self.masm.load64(value, &address);
                 }
                 ValueLocation::ArgumentsObject { .. } | ValueLocation::VirtualObject(_) => {
                     unreachable!("frame states with objects to create leave through the runtime")
