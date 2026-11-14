@@ -15,6 +15,7 @@
 #include <LibURL/URL.h>
 #include <LibWebView/HistoryDebug.h>
 #include <LibWebView/HistoryStore.h>
+#include <LibWebView/URL.h>
 
 namespace WebView {
 
@@ -329,6 +330,7 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
                         END
                     END AS searchable_url
                 FROM History
+                WHERE url LIKE 'http://%' OR url LIKE 'https://%' OR url LIKE 'file:%'
             )
             WHERE ((?1 != '' AND LOWER(searchable_url) LIKE LOWER(?1) || '%')
                 OR (?2 != '' AND INSTR(LOWER(searchable_url), LOWER(?2)) > 0)
@@ -407,6 +409,7 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
                         END
                     END AS searchable_url
                 FROM History
+                WHERE url LIKE 'http://%' OR url LIKE 'https://%' OR url LIKE 'file:%'
             )
             WHERE ((?1 = '' AND ?2 = '')
                 OR (?1 != '' AND INSTR(LOWER(title), LOWER(?1)) > 0)
@@ -466,7 +469,8 @@ ErrorOr<NonnullOwnPtr<HistoryStore>> HistoryStore::create(Database::Database& da
     )#"sv));
     statements.delete_omnibox_engagements_for_url = TRY(database.prepare_statement(R"#(
         DELETE FROM OmniboxEngagements
-        WHERE destination_kind = 0 AND destination_key = ?;
+        WHERE destination_kind = 0
+          AND (destination_key = ?1 OR substr(destination_key, 1, length(?1) + 1) = ?1 || '#');
     )#"sv));
     statements.delete_omnibox_engagements_used_since = TRY(database.prepare_statement(R"#(
         DELETE FROM OmniboxEngagements
@@ -495,27 +499,6 @@ HistoryStore::HistoryStore(NonnullOwnPtr<StorageImpl>&& storage, bool is_disable
 }
 
 HistoryStore::~HistoryStore() = default;
-
-Optional<String> HistoryStore::normalize_url(URL::URL const& url)
-{
-    if (url.scheme().is_empty()) {
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping history entry without a scheme: {}", url);
-        return {};
-    }
-
-    if (url.scheme().is_one_of("about"sv, "data"sv)) {
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping non-browsable history URL: {}", url);
-        return {};
-    }
-
-    auto normalized_url = url.serialize(URL::ExcludeFragment::Yes);
-    if (normalized_url.is_empty()) {
-        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping history entry with an empty normalized URL: {}", url);
-        return {};
-    }
-
-    return normalized_url;
-}
 
 static bool transition_updates_general_score(HistoryVisitTransition transition)
 {
@@ -576,7 +559,7 @@ void HistoryStore::record_visit(URL::URL const& url, Optional<String> title, Uni
     if (m_is_disabled)
         return;
 
-    auto normalized_url = normalize_url(url);
+    auto normalized_url = normalize_url_for_history(url);
     if (!normalized_url.has_value())
         return;
 
@@ -599,7 +582,7 @@ void HistoryStore::update_title(URL::URL const& url, String const& title)
         return;
     }
 
-    auto normalized_url = normalize_url(url);
+    auto normalized_url = normalize_url_for_history(url);
     if (!normalized_url.has_value())
         return;
 
@@ -618,7 +601,7 @@ void HistoryStore::update_favicon(URL::URL const& url, String const& favicon_has
         return;
     }
 
-    auto normalized_url = normalize_url(url);
+    auto normalized_url = normalize_url_for_history(url);
     if (!normalized_url.has_value())
         return;
 
@@ -635,7 +618,7 @@ Optional<HistoryEntry> HistoryStore::entry_for_url(URL::URL const& url)
     if (m_is_disabled)
         return {};
 
-    auto normalized_url = normalize_url(url);
+    auto normalized_url = normalize_url_for_history(url);
     if (!normalized_url.has_value())
         return {};
 
@@ -731,7 +714,7 @@ void HistoryStore::remove_entry_for_url(URL::URL const& url, RemoveHistoryEntryE
     if (m_is_disabled)
         return;
 
-    auto normalized_url = normalize_url(url);
+    auto normalized_url = normalize_url_for_history(url);
     if (!normalized_url.has_value())
         return;
 
@@ -968,8 +951,11 @@ void HistoryStore::TransientStorage::remove_entry_for_url(String const& url, Rem
     if (remove_engagements == RemoveHistoryEntryEngagements::No)
         return;
     m_omnibox_engagements.remove_all_matching([&](auto const& engagement) {
-        return engagement.destination_kind == OmniboxDestinationKind::URL
-            && normalize_omnibox_destination(engagement.destination, engagement.destination_kind) == url;
+        if (engagement.destination_kind != OmniboxDestinationKind::URL)
+            return false;
+        auto destination = normalize_omnibox_destination(engagement.destination, engagement.destination_kind);
+        return destination == url
+            || (destination.bytes_as_string_view().starts_with(url) && destination.bytes_as_string_view()[url.bytes_as_string_view().length()] == '#');
     });
 }
 

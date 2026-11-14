@@ -85,34 +85,61 @@ GC::Ref<HTMLCollection> ParentNode::children()
     // The children getter steps are to return an HTMLCollection collection rooted at this matching only element children.
     auto& children = ensure_rare_data().children;
     if (!children) {
-        children = HTMLCollection::create(*this, HTMLCollection::Scope::Children, [](Element const&) { return true; }, HTMLCollection::AttributeInvalidationType::None);
+        children = HTMLCollection::create(*this, HTMLCollection::Scope::Children, GC::create_function(heap(), [](Element const&) { return true; }), HTMLCollection::AttributeInvalidationType::None);
     }
     return *children;
 }
 
+// https://dom.spec.whatwg.org/#dom-document-getelementsbytagname
+// https://dom.spec.whatwg.org/#dom-element-getelementsbytagname
+GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name(Utf16FlyString const& qualified_name)
+{
+    // https://dom.spec.whatwg.org/#concept-getelementsbytagname
+    // When invoked with the same argument, and as long as root’s node document’s type has not changed, the same
+    // HTMLCollection object may be returned as returned by an earlier call.
+    auto for_html_document = document().document_type() == Document::Type::HTML;
+    auto& rare_data = ensure_rare_data();
+    auto& collections = rare_data.collections_by_tag_name;
+    if (!collections) {
+        collections = make<HashMap<Utf16FlyString, RareData::CollectionByTagName>>();
+    } else if (auto it = collections->find(qualified_name); it != collections->end() && it->value.for_html_document == for_html_document) {
+        if (auto collection = it->value.collection.ptr())
+            return *collection;
+    }
+    // Forget the collections that were collected, so that calls with ever new arguments do not grow the map. The sweep
+    // waits for the map to double in size, so that it costs each call a constant amount of work.
+    if (collections->size() >= rare_data.collections_by_tag_name_sweep_size) {
+        collections->remove_all_matching([](auto const&, auto const& cached) { return !cached.collection; });
+        rare_data.collections_by_tag_name_sweep_size = max<size_t>(8, collections->size() * 2);
+    }
+    auto collection = create_elements_by_tag_name_collection(qualified_name);
+    collections->set(qualified_name, { collection, for_html_document });
+    return collection;
+}
+
 // https://dom.spec.whatwg.org/#concept-getelementsbytagname
 // NOTE: This method is only exposed on Document and Element, but is in ParentNode to prevent code duplication.
-GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name(Utf16FlyString const& qualified_name)
+GC::Ref<HTMLCollection> ParentNode::create_elements_by_tag_name_collection(Utf16FlyString const& qualified_name)
 {
     // 1. If qualifiedName is "*" (U+002A), return a HTMLCollection rooted at root, whose filter matches only descendant elements.
     if (qualified_name == u"*"sv) {
-        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [](Element const&) { return true; }, HTMLCollection::AttributeInvalidationType::None);
+        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, GC::create_function(heap(), [](Element const&) { return true; }), HTMLCollection::AttributeInvalidationType::None);
     }
 
     // 2. Otherwise, if root’s node document is an HTML document, return a HTMLCollection rooted at root, whose filter matches the following descendant elements:
     if (root().document().document_type() == Document::Type::HTML) {
         auto lowercase_qualified_name = qualified_name.to_ascii_lowercase();
-        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [qualified_name, lowercase_qualified_name = move(lowercase_qualified_name)](Element const& element) {
+        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, GC::create_function(heap(), GC::captures(qualified_name, move(lowercase_qualified_name)), [](auto const& qualified_name, auto const& lowercase_qualified_name, Element const& element) {
             // - Whose namespace is the HTML namespace and whose qualified name is qualifiedName, in ASCII lowercase.
             if (element.namespace_uri() == Namespace::HTML)
                 return element.qualified_name() == lowercase_qualified_name;
 
             // - Whose namespace is not the HTML namespace and whose qualified name is qualifiedName.
-            return element.qualified_name() == qualified_name; }, HTMLCollection::AttributeInvalidationType::None);
+            return element.qualified_name() == qualified_name; }), HTMLCollection::AttributeInvalidationType::None);
     }
 
     // 3. Otherwise, return a HTMLCollection rooted at root, whose filter matches descendant elements whose qualified name is qualifiedName.
-    return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [qualified_name](Element const& element) { return element.qualified_name() == qualified_name; }, HTMLCollection::AttributeInvalidationType::None);
+    return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, GC::create_function(heap(), GC::captures(qualified_name), [](auto const& qualified_name, Element const& element) { return element.qualified_name() == qualified_name; }), HTMLCollection::AttributeInvalidationType::None);
 }
 
 // https://dom.spec.whatwg.org/#concept-getelementsbytagnamens
@@ -125,30 +152,30 @@ GC::Ref<HTMLCollection> ParentNode::get_elements_by_tag_name_ns(Optional<Utf16Fl
 
     // 2. If both namespace and localName are "*" (U+002A), return a HTMLCollection rooted at root, whose filter matches descendant elements.
     if (namespace_ == u"*"sv && local_name == u"*"sv) {
-        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [](Element const&) { return true; }, HTMLCollection::AttributeInvalidationType::None);
+        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, GC::create_function(heap(), [](Element const&) { return true; }), HTMLCollection::AttributeInvalidationType::None);
     }
 
     // 3. Otherwise, if namespace is "*" (U+002A), return a HTMLCollection rooted at root, whose filter matches descendant elements whose local name is localName.
     if (namespace_ == u"*"sv) {
-        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [local_name](Element const& element) { return element.local_name().view() == local_name.view(); }, HTMLCollection::AttributeInvalidationType::None);
+        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, GC::create_function(heap(), GC::captures(local_name), [](auto const& local_name, Element const& element) { return element.local_name().view() == local_name.view(); }), HTMLCollection::AttributeInvalidationType::None);
     }
 
     // 4. Otherwise, if localName is "*" (U+002A), return a HTMLCollection rooted at root, whose filter matches descendant elements whose namespace is namespace.
     if (local_name == u"*"sv) {
-        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [namespace_](Element const& element) {
+        return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, GC::create_function(heap(), GC::captures(namespace_), [](auto const& namespace_, Element const& element) {
             auto element_namespace = element.namespace_uri();
             if (element_namespace.has_value() != namespace_.has_value())
                 return false;
-            return !namespace_.has_value() || element_namespace->view() == namespace_->view(); }, HTMLCollection::AttributeInvalidationType::None);
+            return !namespace_.has_value() || element_namespace->view() == namespace_->view(); }), HTMLCollection::AttributeInvalidationType::None);
     }
 
     // 5. Otherwise, return a HTMLCollection rooted at root, whose filter matches descendant elements whose namespace is namespace and local name is localName.
-    return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [namespace_, local_name](Element const& element) {
+    return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, GC::create_function(heap(), GC::captures(namespace_, local_name), [](auto const& namespace_, auto const& local_name, Element const& element) {
         auto element_namespace = element.namespace_uri();
         if (element_namespace.has_value() != namespace_.has_value())
             return false;
         return (!namespace_.has_value() || element_namespace->view() == namespace_->view())
-            && element.local_name().view() == local_name.view(); }, HTMLCollection::AttributeInvalidationType::None);
+            && element.local_name().view() == local_name.view(); }), HTMLCollection::AttributeInvalidationType::None);
 }
 
 // https://dom.spec.whatwg.org/#dom-parentnode-prepend
@@ -254,12 +281,12 @@ GC::Ref<HTMLCollection> ParentNode::get_elements_by_class_name(Utf16View class_n
     if (token_start.has_value())
         append_class_name(class_names.substring_view(*token_start));
 
-    return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, [list_of_class_names = move(list_of_class_names), quirks_mode = document().in_quirks_mode()](Element const& element) {
+    return HTMLCollection::create(*this, HTMLCollection::Scope::Descendants, GC::create_function(heap(), GC::captures(move(list_of_class_names), document().in_quirks_mode()), [](auto const& list_of_class_names, auto quirks_mode, Element const& element) {
         for (auto& name : list_of_class_names) {
             if (!element.has_class(name.utf16_view(), quirks_mode ? CaseSensitivity::CaseInsensitive : CaseSensitivity::CaseSensitive))
                 return false;
         }
-        return !list_of_class_names.is_empty(); }, HTMLCollection::AttributeInvalidationType::Class);
+        return !list_of_class_names.is_empty(); }), HTMLCollection::AttributeInvalidationType::Class);
 }
 
 GC::Ptr<Element> ParentNode::get_element_by_id(Utf16View id) const

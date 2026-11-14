@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/RefCounted.h>
+#include <LibGC/Cell.h>
 #include <LibWeb/CSS/RustImportRule.h>
 #include <LibWeb/CSS/StyleSheetState.h>
 #include <LibWeb/CSS/URL.h>
@@ -31,6 +32,7 @@ public:
     GC::Ref<MediaList> media() const;
 
     StyleSheetState* parent_style_sheet() const { return m_parent_style_sheet.ptr(); }
+    Optional<::URL::URL> const& requested_url() const { return m_requested_url; }
     StyleSheetState* loaded_style_sheet() const { return m_style_sheet.ptr(); }
     void set_parent_style_sheet(StyleSheetState*);
 
@@ -51,12 +53,34 @@ private:
     mutable Optional<RustRule> m_native_rule;
     RustImportRule m_rule;
     mutable Optional<URL> m_cached_url;
+    Optional<::URL::URL> m_requested_url;
     GC::Ptr<DOM::Document> m_document;
     WeakPtr<StyleSheetState> m_parent_style_sheet;
     RustMediaList m_media_list;
     mutable GC::Weak<MediaList> m_media;
     RefPtr<StyleSheetState> m_style_sheet;
     mutable GC::Weak<CSSImportRule> m_cssom_rule;
+};
+
+// What the CSSImportRule of an import holds it by, as the object is a cell that keeps it alive and traces its edges.
+class StyleSheetImportCell final : public GC::Cell {
+    GC_CELL(StyleSheetImportCell, GC::Cell);
+    GC_DECLARE_ALLOCATOR(StyleSheetImportCell);
+
+public:
+    [[nodiscard]] static GC::Ref<StyleSheetImportCell> create(NonnullRefPtr<StyleSheetImport>);
+
+    StyleSheetImport& import() const { return *m_import; }
+
+private:
+    explicit StyleSheetImportCell(NonnullRefPtr<StyleSheetImport> import)
+        : m_import(move(import))
+    {
+    }
+
+    virtual void visit_edges(GC::Cell::Visitor&) override;
+
+    NonnullRefPtr<StyleSheetImport> m_import;
 };
 
 }

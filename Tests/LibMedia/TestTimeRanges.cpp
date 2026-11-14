@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
+#include <LibMedia/DemuxerScanState.h>
 #include <LibMedia/TimeRanges.h>
 #include <LibTest/TestCase.h>
 
@@ -12,6 +14,132 @@ using Media::TimeRanges;
 static AK::Duration ms(i64 milliseconds)
 {
     return AK::Duration::from_milliseconds(milliseconds);
+}
+
+// Frames at 60 fps whose timestamps are rounded to whole milliseconds while their duration isn't, as in a WebM stream,
+// so that most of them don't quite reach the next frame.
+static AK::Duration rounded_frame_start(i64 index)
+{
+    return ms((index * 1000 + 30) / 60);
+}
+
+static constexpr auto rounded_frame_duration = AK::Duration::from_nanoseconds(16'666'667);
+
+TEST_CASE(buffered_sources_without_sources_are_not_complete)
+{
+    auto report = Media::DemuxerScanState::buffered_ranges_of_sources({});
+    EXPECT(report.time_ranges.is_empty());
+    EXPECT(!report.resource_is_complete);
+}
+
+TEST_CASE(buffered_sources_intersect_ranges_and_completeness)
+{
+    Array<Media::CombinedScanState, 2> sources;
+    sources[0].time_ranges = TimeRanges { { ms(0), ms(800) } };
+    sources[0].duration = ms(1000);
+    sources[0].resource_is_complete = true;
+    sources[1].time_ranges = TimeRanges { { ms(200), ms(1000) } };
+    sources[1].duration = ms(1000);
+
+    auto report = Media::DemuxerScanState::buffered_ranges_of_sources(sources);
+    EXPECT_EQ(report.time_ranges, (TimeRanges { { ms(200), ms(800) } }));
+    EXPECT(!report.resource_is_complete);
+
+    sources[1].resource_is_complete = true;
+    report = Media::DemuxerScanState::buffered_ranges_of_sources(sources);
+    EXPECT_EQ(report.time_ranges, (TimeRanges { { ms(200), ms(800) } }));
+    EXPECT(report.resource_is_complete);
+
+    // Completeness is not inferred from EOF or time coverage, and must include every source.
+    sources[0].resource_is_complete = false;
+    sources[0].reached_end_of_stream = true;
+    report = Media::DemuxerScanState::buffered_ranges_of_sources(sources);
+    EXPECT_EQ(report.time_ranges, (TimeRanges { { ms(200), ms(1000) } }));
+    EXPECT(!report.resource_is_complete);
+}
+
+TEST_CASE(buffered_sources_with_disjoint_ranges_can_still_be_complete)
+{
+    Array<Media::CombinedScanState, 2> sources;
+    sources[0].time_ranges = TimeRanges { { ms(0), ms(100) } };
+    sources[1].time_ranges = TimeRanges { { ms(200), ms(300) } };
+    for (auto& source : sources) {
+        source.duration = ms(300);
+        source.resource_is_complete = true;
+    }
+    auto report = Media::DemuxerScanState::buffered_ranges_of_sources(sources);
+    EXPECT(report.time_ranges.is_empty());
+    EXPECT(report.resource_is_complete);
+}
+
+TEST_CASE(file_buffering_uses_enabled_track_identifiers)
+{
+    Media::DemuxerScanState state;
+    state.duration = ms(1000);
+    state.track_buffered_ranges = {
+        { 41, TimeRanges { { ms(100), ms(1000) } }, false },
+        { 7, TimeRanges { { ms(200), ms(1000) } }, false },
+        { 99, TimeRanges { { ms(0), ms(1000) } }, false },
+    };
+    EXPECT_EQ(state.combined_scan_state([](u64 id) { return id == 99 || id == 41; }).time_ranges, (TimeRanges { { ms(100), ms(1000) } }));
+    EXPECT_EQ(state.combined_scan_state([](u64 id) { return id == 7 || id == 99; }).time_ranges, (TimeRanges { { ms(200), ms(1000) } }));
+    EXPECT_EQ(state.track_buffered_ranges.size(), 3u);
+}
+
+TEST_CASE(file_buffering_includes_empty_tracks)
+{
+    Vector<Media::BufferedRangesScan> scans {
+        { TimeRanges { { ms(0), ms(1000) } }, true, 4 },
+        { {}, false, 8 },
+    };
+    auto state = Media::DemuxerScanState::create_from_track_scans(move(scans), ms(1000), true);
+    EXPECT_EQ(state.track_buffered_ranges.size(), 2u);
+    state.resource_is_complete = true;
+    auto filtered = state.combined_scan_state();
+    EXPECT(filtered.time_ranges.is_empty());
+    EXPECT(!filtered.reached_end_of_stream);
+    EXPECT(filtered.resource_is_complete);
+    auto none = state.combined_scan_state([](u64) { return false; });
+    EXPECT(none.time_ranges.is_empty());
+    EXPECT(!none.reached_end_of_stream);
+    EXPECT(none.resource_is_complete);
+    EXPECT_EQ(state.combined_scan_state([](u64 id) { return id == 4; }).time_ranges, (TimeRanges { { ms(0), ms(1000) } }));
+}
+
+TEST_CASE(inactive_file_tracks_do_not_limit_the_playback_endpoint)
+{
+    Media::DemuxerScanState state;
+    state.duration = ms(1000);
+    state.resource_is_complete = false;
+    state.track_buffered_ranges = {
+        { 1, TimeRanges { { ms(0), ms(900) } }, true },
+        { 2, TimeRanges { { ms(200), ms(500) } }, false },
+    };
+    auto filtered = state.combined_scan_state([](u64 id) { return id == 1; });
+    EXPECT(filtered.reached_end_of_stream);
+    EXPECT(!filtered.resource_is_complete);
+    Array<Media::CombinedScanState, 1> sources { filtered };
+    EXPECT_EQ(Media::DemuxerScanState::buffered_ranges_of_sources(sources).time_ranges, (TimeRanges { { ms(0), ms(1000) } }));
+}
+
+TEST_CASE(file_tracks_extend_independently_but_mse_tracks_do_not)
+{
+    Media::DemuxerScanState state;
+    state.track_buffered_ranges = {
+        { 1, TimeRanges { { ms(0), ms(500) } }, true },
+        { 2, TimeRanges { { ms(100), ms(900) } }, false },
+    };
+    EXPECT_EQ(state.combined_scan_state().time_ranges, (TimeRanges { { ms(100), ms(900) } }));
+
+    state.buffered_ranges_policy = Media::BufferedRangesPolicy::AllTracks;
+    Function<bool(u64)> reject_all = [](u64) -> bool { VERIFY_NOT_REACHED(); };
+    auto mse = state.combined_scan_state(reject_all);
+    EXPECT(!mse.reached_end_of_stream);
+    EXPECT_EQ(mse.time_ranges, (TimeRanges { { ms(100), ms(500) } }));
+    state.reached_end_of_stream = true;
+    mse = state.combined_scan_state(reject_all);
+    EXPECT(mse.reached_end_of_stream);
+    EXPECT_EQ(mse.time_ranges, (TimeRanges { { ms(100), ms(900) } }));
 }
 
 // add_range()
@@ -191,6 +319,115 @@ TEST_CASE(remove_range_across_multiple_ranges)
     EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(100) }, { ms(900), ms(1000) } }));
 }
 
+// add_range() with a maximum gap
+
+TEST_CASE(add_range_bridges_gaps_up_to_the_maximum)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(300), ms(400));
+    ranges.add_range(ms(150), ms(250), ms(50));
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(400) } }));
+}
+
+TEST_CASE(add_range_keeps_gaps_over_the_maximum)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(160), ms(200), ms(50));
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(100) }, { ms(160), ms(200) } }));
+}
+
+TEST_CASE(adding_with_a_maximum_gap_matches_coalescing_afterwards)
+{
+    auto maximum_gap = rounded_frame_duration + rounded_frame_duration;
+    TimeRanges exact;
+    TimeRanges bridged;
+    for (i64 index = 0; index < 6000; index++) {
+        // A real gap, which nothing bridges.
+        if (index >= 3000 && index < 3010)
+            continue;
+        auto start = rounded_frame_start(index);
+        exact.add_range(start, start + rounded_frame_duration);
+        bridged.add_range(start, start + rounded_frame_duration, maximum_gap);
+    }
+    EXPECT(exact.size() > 3000);
+    EXPECT_EQ(bridged.size(), 2u);
+    EXPECT_EQ(bridged, exact.coalesced(maximum_gap));
+}
+
+// add_ranges()
+
+TEST_CASE(add_ranges_to_empty_in_descending_order)
+{
+    TimeRanges ranges;
+    ranges.add_ranges({ { ms(500), ms(600) }, { ms(300), ms(400) }, { ms(100), ms(200) } });
+    EXPECT_EQ(ranges, (TimeRanges { { ms(100), ms(200) }, { ms(300), ms(400) }, { ms(500), ms(600) } }));
+}
+
+TEST_CASE(add_ranges_merges_with_existing_ranges)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(400), ms(500));
+    ranges.add_ranges({ { ms(450), ms(700) }, { ms(100), ms(200) }, { ms(800), ms(900) }, { ms(150), ms(250) } });
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(250) }, { ms(400), ms(700) }, { ms(800), ms(900) } }));
+}
+
+TEST_CASE(add_ranges_bridges_existing_ranges)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(200), ms(300));
+    ranges.add_ranges({ { ms(150), ms(250) }, { ms(50), ms(150) } });
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(300) } }));
+}
+
+TEST_CASE(add_ranges_ignores_invalid_ranges)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(100), ms(200));
+    ranges.add_ranges({ { ms(300), ms(300) }, { ms(500), ms(400) } });
+    EXPECT_EQ(ranges, (TimeRanges { { ms(100), ms(200) } }));
+}
+
+TEST_CASE(add_ranges_bridges_gaps_up_to_the_maximum)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_range(ms(300), ms(400));
+    ranges.add_ranges({ { ms(150), ms(250) } }, ms(50));
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(400) } }));
+}
+
+TEST_CASE(add_ranges_keeps_gaps_over_the_maximum)
+{
+    TimeRanges ranges;
+    ranges.add_range(ms(0), ms(100));
+    ranges.add_ranges({ { ms(160), ms(200) } }, ms(50));
+    EXPECT_EQ(ranges, (TimeRanges { { ms(0), ms(100) }, { ms(160), ms(200) } }));
+}
+
+TEST_CASE(adding_ranges_with_a_maximum_gap_matches_coalescing_afterwards)
+{
+    auto maximum_gap = rounded_frame_duration + rounded_frame_duration;
+    TimeRanges exact;
+    Vector<TimeRanges::Range> frame_intervals;
+    for (i64 index = 6000; index-- > 0;) {
+        // A real gap, which nothing bridges.
+        if (index >= 3000 && index < 3010)
+            continue;
+        auto start = rounded_frame_start(index);
+        exact.add_range(start, start + rounded_frame_duration);
+        frame_intervals.append({ start, start + rounded_frame_duration });
+    }
+    TimeRanges bridged;
+    bridged.add_ranges(move(frame_intervals), maximum_gap);
+    EXPECT(exact.size() > 3000);
+    EXPECT_EQ(bridged.size(), 2u);
+    EXPECT_EQ(bridged, exact.coalesced(maximum_gap));
+}
+
 // highest_end_time()
 
 TEST_CASE(highest_end_time_empty)
@@ -323,5 +560,6 @@ TEST_CASE(range_at_or_after_at_range_boundary)
     ranges.add_range(ms(0), ms(500));
     ranges.add_range(ms(700), ms(1000));
     EXPECT_EQ(ranges.range_at_or_after(ms(0)), (TimeRanges::Range { ms(0), ms(500) }));
-    EXPECT_EQ(ranges.range_at_or_after(ms(500)), (TimeRanges::Range { ms(700), ms(1000) }));
+    EXPECT_EQ(ranges.range_at_or_after(ms(500)), (TimeRanges::Range { ms(0), ms(500) }));
+    EXPECT_EQ(ranges.range_at_or_after(ms(501)), (TimeRanges::Range { ms(700), ms(1000) }));
 }

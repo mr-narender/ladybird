@@ -1,0 +1,5 @@
+descendants of the guard: 12
+passes: PARTIAL
+changed: [guard, deep]
+restyled but unchanged: []
+unguarded focus: passes PARTIAL, changed [outer], restyled [outer]

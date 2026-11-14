@@ -9,12 +9,13 @@
 #include <AK/NeverDestroyed.h>
 #include <LibGC/Heap.h>
 #include <LibGfx/Bitmap.h>
-#include <LibGfx/CanvasCommandList.h>
 #include <LibGfx/SharedImage.h>
 #include <LibWeb/Bindings/CanvasRenderingContext2DSettings.h>
+#include <LibWeb/Bindings/ImageBitmapRenderingContextSettings.h>
 #include <LibWeb/Bindings/WebGLRenderingContextBase.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
@@ -27,6 +28,7 @@
 #include <LibWeb/HTML/Canvas/SerializeBitmap.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
+#include <LibWeb/HTML/ImageBitmapRenderingContext.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
@@ -40,7 +42,6 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/WebGL/WebGL2RenderingContext.h>
-#include <LibWeb/WebGL/WebGLContextProxy.h>
 #include <LibWeb/WebGL/WebGLRenderingContext.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
 #include <LibWeb/WebIDL/DOMException.h>
@@ -168,6 +169,9 @@ void HTMLCanvasElement::reset_context_to_default_state()
         [](GC::Ref<WebGL::WebGL2RenderingContext>& context) {
             context->reset_to_default_state();
         },
+        [](GC::Ref<ImageBitmapRenderingContext>&) {
+            // NB: An ImageBitmapRenderingContext has no state to reset.
+        },
         [](Empty) {
             // Do nothing.
         });
@@ -176,6 +180,13 @@ void HTMLCanvasElement::reset_context_to_default_state()
 Canvas2DContextBase* HTMLCanvasElement::canvas_2d_context() const
 {
     return canvas_rendering_context_2d().ptr();
+}
+
+ImageBitmapRenderingContext* HTMLCanvasElement::canvas_bitmap_renderer_context() const
+{
+    if (auto const* context = m_context.get_pointer<GC::Ref<ImageBitmapRenderingContext>>())
+        return context->ptr();
+    return nullptr;
 }
 
 WebGL::WebGLRenderingContextBase* HTMLCanvasElement::canvas_webgl_context() const
@@ -205,14 +216,23 @@ void HTMLCanvasElement::did_change_canvas_content()
 {
     set_canvas_content_dirty();
 
+    // NB: The output bitmap of an ImageBitmapRenderingContext reaches the Compositor in the paint facts of the canvas,
+    //     so the display list has to record the canvas again.
+    if (canvas_bitmap_renderer_context()) {
+        Painting::push_canvas_paint_facts(*this);
+        set_needs_repaint(InvalidateDisplayList::PaintCommands);
+        return;
+    }
+
     // NB: Don't request a display list recording here: the new content reaches the compositor through the canvas
-    // surface registry when the canvas is presented, and the cached DrawCanvas command is invalidated when the
-    // content generation moves in prepare_for_compositing.
+    // surface registry when the canvas is presented.
     set_needs_repaint(InvalidateDisplayList::No);
 }
 
 void HTMLCanvasElement::did_create_canvas_backing_storage()
 {
+    // The canvas has content to paint from now on, which a layout that reached it before has to hear of.
+    Painting::push_canvas_paint_facts(*this);
     set_needs_repaint(InvalidateDisplayList::PaintCommands);
 }
 
@@ -223,12 +243,10 @@ CSS::FontComputer& HTMLCanvasElement::canvas_font_computer()
     return document().font_computer();
 }
 
-CSS::ColorResolutionContext HTMLCanvasElement::canvas_color_resolution_context()
+CSS::ColorResolutionStyle HTMLCanvasElement::canvas_color_resolution_style()
 {
     document().update_style_for_element(*this, DOM::Document::StyleUpdateMode::OnlyIfNeeded);
-    if (has_style())
-        return CSS::ColorResolutionContext::for_element(*this);
-    return {};
+    return CSS::ColorResolutionStyle::for_element(*this);
 }
 
 CSSPixelRect HTMLCanvasElement::canvas_viewport_rect() const
@@ -284,6 +302,10 @@ void HTMLCanvasElement::notify_context_about_canvas_size_change()
         [&](GC::Ref<WebGL::WebGL2RenderingContext>& context) {
             context->set_size(bitmap_size_for_canvas());
         },
+        [](GC::Ref<ImageBitmapRenderingContext>&) {
+            // NB: A blank output bitmap takes the size of the canvas when something reads it, and a valid one keeps
+            //     the size of its bitmap data.
+        },
         [](Empty) {
             // Do nothing.
         });
@@ -329,9 +351,9 @@ void HTMLCanvasElement::attribute_changed(Utf16FlyString const& local_name, Opti
     }
 }
 
-Layout::Node* HTMLCanvasElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind HTMLCanvasElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::CanvasBox);
+    return CSS::ElementBoxKind::Canvas;
 }
 
 HTMLCanvasElement::HasOrCreatedContext HTMLCanvasElement::create_2d_context(CanvasRenderingContext2DSettings context_attributes)
@@ -340,6 +362,16 @@ HTMLCanvasElement::HasOrCreatedContext HTMLCanvasElement::create_2d_context(Canv
         return m_context.has<GC::Ref<CanvasRenderingContext2D>>() ? HasOrCreatedContext::Yes : HasOrCreatedContext::No;
 
     m_context = CanvasRenderingContext2D::create(*this, context_attributes);
+    return HasOrCreatedContext::Yes;
+}
+
+HTMLCanvasElement::HasOrCreatedContext HTMLCanvasElement::create_bitmap_renderer_context(bool alpha)
+{
+    if (!m_context.has<Empty>())
+        return m_context.has<GC::Ref<ImageBitmapRenderingContext>>() ? HasOrCreatedContext::Yes : HasOrCreatedContext::No;
+
+    m_context = ImageBitmapRenderingContext::create(*this, alpha);
+    Painting::push_canvas_paint_facts(*this);
     return HasOrCreatedContext::Yes;
 }
 
@@ -392,11 +424,25 @@ JS::ThrowCompletionOr<HTMLCanvasElement::RenderingContext> HTMLCanvasElement::ge
         return Empty {};
     }
 
+    if (type == u"bitmaprenderer"sv) {
+        auto settings = TRY(Bindings::convert_to_idl_value_for_image_bitmap_rendering_context_settings(vm(), options));
+        if (create_bitmap_renderer_context(settings.alpha) == HasOrCreatedContext::Yes)
+            return m_context.get<GC::Ref<ImageBitmapRenderingContext>>();
+
+        return Empty {};
+    }
+
     return Empty {};
 }
 
 Gfx::IntSize HTMLCanvasElement::bitmap_size_for_canvas() const
 {
+    // NB: A valid output bitmap of an ImageBitmapRenderingContext keeps the size of its bitmap data.
+    if (auto* context = canvas_bitmap_renderer_context(); context && !context->is_blank()) {
+        if (auto const* frame = context->frame())
+            return { frame->width(), frame->height() };
+        return {};
+    }
     return bitmap_size_for_dimensions(width(), height());
 }
 
@@ -409,10 +455,10 @@ WebIDL::ExceptionOr<Utf16String> HTMLCanvasElement::to_data_url(Utf16View type, 
 
     // 2. If this canvas element's bitmap has no pixels (i.e. either its horizontal dimension or its vertical dimension is zero),
     //    then return the string "data:,". (This is the shortest data: URL; it represents the empty string in a text/plain resource.)
-    auto bitmap = get_bitmap_from_surface();
+    auto bitmap = get_frame_for_serialization(type);
     if (!is_origin_clean())
         return WebIDL::SecurityError::create(HTML::relevant_realm(*this), "Canvas is not origin-clean"_utf16);
-    if (!bitmap)
+    if (!bitmap.has_value())
         return "data:,"_utf16;
 
     // 3. Let file be a serialization of this canvas element's bitmap as a file, passing type and quality if given.
@@ -444,25 +490,25 @@ WebIDL::ExceptionOr<void> HTMLCanvasElement::to_blob(GC::Ref<WebIDL::CallbackTyp
     // 2. Let result be null.
     // 3. If this canvas element's bitmap has pixels (i.e., neither its horizontal dimension nor its vertical dimension is zero),
     //    then set result to a copy of this canvas element's bitmap.
-    auto bitmap_result = get_bitmap_from_surface();
+    auto bitmap_result = get_frame_for_serialization(type);
     if (!is_origin_clean())
         return WebIDL::SecurityError::create(HTML::relevant_realm(*this), "Canvas is not origin-clean"_utf16);
 
     // 4. Run these steps in parallel:
     auto type_string = Utf16String::from_utf16(type);
     Optional<double> quality = js_quality.has_value() && js_quality->is_number() ? js_quality->as_double() : Optional<double>();
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [this, callback, bitmap_result, type = move(type_string), quality] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), GC::captures(*this, callback, bitmap_result, move(type_string), quality), [](auto& self, auto& callback, auto& bitmap_result, auto& type, auto& quality) {
         // 1. If result is non-null, then set result to a serialization of result as a file with type and quality if given.
         Optional<SerializeBitmapResult> file_result;
-        if (bitmap_result) {
+        if (bitmap_result.has_value()) {
             if (auto result = serialize_bitmap(*bitmap_result, type, quality); !result.is_error())
                 file_result = result.release_value();
         }
 
         // 2. Queue an element task on the canvas blob serialization task source given the canvas element to run these steps:
-        queue_an_element_task(Task::Source::CanvasBlobSerializationTask, [this, callback, file_result = move(file_result)] {
-            auto& realm = HTML::relevant_realm(*this);
-            auto maybe_error = WebIDL::throw_dom_exception_if_needed(vm(), realm, [&]() -> WebIDL::ExceptionOr<void> {
+        self.queue_an_element_task(Task::Source::CanvasBlobSerializationTask, GC::create_function(self.heap(), GC::captures(self, callback, move(file_result)), [](auto& self, auto& callback, auto& file_result) {
+            auto& realm = HTML::relevant_realm(self);
+            auto maybe_error = WebIDL::throw_dom_exception_if_needed(self.vm(), realm, [&]() -> WebIDL::ExceptionOr<void> {
                 // 1. If result is non-null, then set result to a new Blob object, created in the relevant realm of this canvas element, representing result. [FILEAPI]
                 GC::Ptr<FileAPI::Blob> blob_result;
                 if (file_result.has_value())
@@ -474,8 +520,8 @@ WebIDL::ExceptionOr<void> HTMLCanvasElement::to_blob(GC::Ref<WebIDL::CallbackTyp
                 return {};
             });
             if (maybe_error.is_throw_completion())
-                report_exception(maybe_error.throw_completion(), HTML::relevant_realm(*this));
-        });
+                report_exception(maybe_error.throw_completion(), HTML::relevant_realm(self));
+        }));
     }));
     return {};
 }
@@ -487,7 +533,7 @@ Optional<Compositing::CanvasId> HTMLCanvasElement::canvas_id() const
     if (auto context = canvas_rendering_context_2d())
         return context->canvas_id();
     if (auto* webgl_context = canvas_webgl_context(); webgl_context && !webgl_context->is_context_lost())
-        return webgl_context->context().canvas_id();
+        return webgl_context->canvas_id();
     return {};
 }
 
@@ -504,13 +550,15 @@ void HTMLCanvasElement::set_canvas_content_dirty()
 
 void HTMLCanvasElement::prepare_for_compositing()
 {
+    // OPTIMIZATION: Nothing shows a 2D canvas that has no box, and its readbacks read what it drew rather than what it
+    //               presented, so what it draws stays unpresented until it has a box. That spares the Compositor a
+    //               copy of every frame it draws, which for a canvas that draws in memory is an upload. The rendering
+    //               update lays out before it prepares canvases, so a canvas presents in the update that gives it a box.
+    if (canvas_rendering_context_2d() && !has_layout_box())
+        return;
+
     if (m_canvas_content_dirty) {
         m_canvas_content_dirty = false;
-
-        // NB: The content generation is recorded into DrawCanvas display list commands, letting display list damage
-        //     computation see that the canvas content changed. Canvases are prepared for compositing before painting
-        //     in the rendering update, so display lists recorded in the same update pick up the new generation.
-        ++m_content_generation;
 
         m_context.visit(
             [](GC::Ref<CanvasRenderingContext2D>& context) {
@@ -521,6 +569,9 @@ void HTMLCanvasElement::prepare_for_compositing()
             },
             [](GC::Ref<WebGL::WebGL2RenderingContext>& context) {
                 context->prepare_for_compositing();
+            },
+            [](GC::Ref<ImageBitmapRenderingContext>&) {
+                // NB: The output bitmap reaches the Compositor with the display list, as the paint facts of the canvas.
             },
             [](Empty) {
                 // Do nothing.
@@ -598,30 +649,32 @@ void HTMLCanvasElement::did_commit_placeholder_frame(Gfx::IntSize size, bool ori
 {
     m_placeholder_frame_is_origin_clean = origin_clean;
 
-    queue_an_element_task(Task::Source::DOMManipulation, [this, size] {
-        if (width() != static_cast<WebIDL::UnsignedLong>(size.width()))
-            set_attribute_value(HTML::AttributeNames::width, Utf16String::number(size.width()));
-        if (height() != static_cast<WebIDL::UnsignedLong>(size.height()))
-            set_attribute_value(HTML::AttributeNames::height, Utf16String::number(size.height()));
-    });
+    queue_an_element_task(Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this, size.width(), size.height()), [](auto& self, auto& width, auto& height) {
+        if (self.width() != static_cast<WebIDL::UnsignedLong>(width))
+            self.set_attribute_value(HTML::AttributeNames::width, Utf16String::number(width));
+        if (self.height() != static_cast<WebIDL::UnsignedLong>(height))
+            self.set_attribute_value(HTML::AttributeNames::height, Utf16String::number(height));
+    }));
 }
 
-RefPtr<Gfx::Bitmap> HTMLCanvasElement::get_bitmap_from_surface()
+Optional<Gfx::DecodedImageFrame> HTMLCanvasElement::get_srgb_frame_from_surface()
 {
     if (!m_is_placeholder)
-        return CanvasHost::get_bitmap_from_surface();
+        return CanvasHost::get_srgb_frame_from_surface();
 
     auto size = bitmap_size_for_canvas();
     if (size.is_empty())
-        return nullptr;
+        return {};
 
     if (m_placeholder_canvas_id.has_value() && document().page().has_compositor_host()) {
-        auto frame = document().page().compositor_host().read_placeholder_canvas_pixels(*m_placeholder_canvas_id, { {}, size });
-        m_placeholder_frame_is_origin_clean = frame.origin_clean;
-        if (frame.bitmap && frame.bitmap->size() == size)
-            return frame.bitmap;
+        auto placeholder_pixels = document().page().compositor_host().read_placeholder_canvas_pixels(*m_placeholder_canvas_id, { {}, size });
+        m_placeholder_frame_is_origin_clean = placeholder_pixels.origin_clean;
+        if (placeholder_pixels.bitmap && placeholder_pixels.bitmap->size() == size) {
+            if (auto frame = Gfx::DecodedImageFrame::create(*placeholder_pixels.bitmap); !frame.is_error())
+                return frame.release_value();
+        }
     }
-    return CanvasHost::get_bitmap_from_surface();
+    return CanvasHost::get_srgb_frame_from_surface();
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean

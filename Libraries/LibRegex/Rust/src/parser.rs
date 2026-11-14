@@ -69,6 +69,7 @@ pub enum Error {
     QuantifierWithoutAtom,
     NothingToRepeat,
     NumberOverflow,
+    TooDeeplyNested,
 }
 
 impl std::fmt::Display for Error {
@@ -100,6 +101,7 @@ impl std::fmt::Display for Error {
             Self::QuantifierWithoutAtom => write!(f, "quantifier without atom"),
             Self::NothingToRepeat => write!(f, "nothing to repeat"),
             Self::NumberOverflow => write!(f, "number overflow"),
+            Self::TooDeeplyNested => write!(f, "pattern is nested too deeply"),
         }
     }
 }
@@ -215,6 +217,9 @@ impl Parser {
     /// been collected.
     /// <https://tc39.es/ecma262/#sec-patterns-static-semantics-early-errors>
     fn validate_backrefs(disj: &Disjunction, group_names: &std::collections::HashSet<&str>) -> Result<(), Error> {
+        if crate::stack::is_exhausted() {
+            return Err(Error::TooDeeplyNested);
+        }
         for alt in &disj.alternatives {
             for term in &alt.terms {
                 match &term.atom {
@@ -286,6 +291,9 @@ impl Parser {
     /// Parse `Disjunction`.
     /// <https://tc39.es/ecma262/#sec-patterns>
     fn parse_disjunction(&mut self) -> Result<Disjunction, Error> {
+        if crate::stack::is_exhausted() {
+            return Err(Error::TooDeeplyNested);
+        }
         let inherited = self.alternative_name_stack.last().cloned().unwrap_or_default();
         self.alternative_name_stack.push(inherited.clone());
         let mut alternatives = vec![self.parse_alternative()?];
@@ -1174,6 +1182,9 @@ impl Parser {
     /// Parse `CharacterClass`.
     /// <https://tc39.es/ecma262/#sec-compilecharacterclass>
     fn parse_character_class(&mut self) -> Result<CharacterClass, Error> {
+        if crate::stack::is_exhausted() {
+            return Err(Error::TooDeeplyNested);
+        }
         self.expect('[')?;
         let negated = self.eat('^');
 
@@ -1189,7 +1200,7 @@ impl Parser {
                 self.parse_class_set_expression()?
             };
             self.in_negated_class = saved_negated;
-            if negated && Self::class_set_expression_may_contain_strings(&expr) {
+            if negated && Self::class_set_expression_may_contain_strings(&expr)? {
                 return Err(Error::InvalidCharacterClass);
             }
             self.expect(']')?;
@@ -1468,27 +1479,43 @@ impl Parser {
     /// - Intersection: may contain strings if ALL operands may contain strings
     ///   (i.e., no operand is "purely characters")
     /// - Subtraction: may contain strings if the leftmost operand may contain strings
-    fn class_set_expression_may_contain_strings(expr: &ClassSetExpression) -> bool {
+    fn class_set_expression_may_contain_strings(expr: &ClassSetExpression) -> Result<bool, Error> {
+        if crate::stack::is_exhausted() {
+            return Err(Error::TooDeeplyNested);
+        }
         match expr {
-            ClassSetExpression::Union(operands) => operands.iter().any(Self::class_set_operand_may_contain_strings),
-            ClassSetExpression::Intersection(operands) => {
-                operands.iter().all(Self::class_set_operand_may_contain_strings)
+            ClassSetExpression::Union(operands) => {
+                for operand in operands {
+                    if Self::class_set_operand_may_contain_strings(operand)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
-            ClassSetExpression::Subtraction(operands) => operands
-                .first()
-                .is_some_and(Self::class_set_operand_may_contain_strings),
+            ClassSetExpression::Intersection(operands) => {
+                for operand in operands {
+                    if !Self::class_set_operand_may_contain_strings(operand)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            ClassSetExpression::Subtraction(operands) => match operands.first() {
+                Some(operand) => Self::class_set_operand_may_contain_strings(operand),
+                None => Ok(false),
+            },
         }
     }
 
-    fn class_set_operand_may_contain_strings(operand: &ClassSetOperand) -> bool {
-        match operand {
+    fn class_set_operand_may_contain_strings(operand: &ClassSetOperand) -> Result<bool, Error> {
+        Ok(match operand {
             ClassSetOperand::NestedClass(class) => {
                 if class.negated {
-                    return false;
+                    return Ok(false);
                 }
                 match &class.body {
                     CharacterClassBody::Ranges(_) => false,
-                    CharacterClassBody::UnicodeSet(expr) => Self::class_set_expression_may_contain_strings(expr),
+                    CharacterClassBody::UnicodeSet(expr) => Self::class_set_expression_may_contain_strings(expr)?,
                 }
             }
             ClassSetOperand::UnicodeProperty(property) => {
@@ -1496,7 +1523,7 @@ impl Parser {
             }
             ClassSetOperand::StringLiteral(chars) => chars.len() != 1,
             ClassSetOperand::Char(_) | ClassSetOperand::Range(_, _) | ClassSetOperand::BuiltinClass(_) => false,
-        }
+        })
     }
 
     /// Parse one `/v` `ClassSetOperand`.
@@ -1525,56 +1552,9 @@ impl Parser {
                             } else if matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '/' | '-') {
                                 return Err(Error::InvalidCharacterClass);
                             } else if c == '\\' {
-                                let escaped = self.advance().ok_or(Error::LoneTrailingBackslash)?;
-                                current.push(match escaped {
-                                    'n' => '\n',
-                                    'r' => '\r',
-                                    't' => '\t',
-                                    'f' => '\u{0C}',
-                                    'v' => '\u{0B}',
-                                    '|' => '|',
-                                    '\\' => '\\',
-                                    '0' => '\0',
-                                    'b' => '\u{08}',
-                                    'x' => {
-                                        let val = self.parse_hex_escape(2)?;
-                                        char::from_u32(val).ok_or(Error::InvalidUnicodeEscape)?
-                                    }
-                                    'u' => {
-                                        let is_braced = self.peek() == Some('{');
-                                        let val = self.parse_unicode_escape()?;
-                                        // Handle surrogate pairs: \uD800\uDC00
-                                        if !is_braced && (0xD800..=0xDBFF).contains(&val) {
-                                            let saved = self.pos;
-                                            if self.eat('\\') && self.eat('u') && self.peek() != Some('{') {
-                                                let low = self.parse_unicode_escape()?;
-                                                if (0xDC00..=0xDFFF).contains(&low) {
-                                                    let combined = 0x10000 + ((val - 0xD800) << 10) + (low - 0xDC00);
-                                                    char::from_u32(combined).ok_or(Error::InvalidUnicodeEscape)?
-                                                } else {
-                                                    self.pos = saved;
-                                                    char::from_u32(val).ok_or(Error::InvalidUnicodeEscape)?
-                                                }
-                                            } else {
-                                                self.pos = saved;
-                                                char::from_u32(val).ok_or(Error::InvalidUnicodeEscape)?
-                                            }
-                                        } else {
-                                            char::from_u32(val).ok_or(Error::InvalidUnicodeEscape)?
-                                        }
-                                    }
-                                    'c' => {
-                                        let ctrl = self.advance().ok_or(Error::UnexpectedEnd)?;
-                                        if ctrl.is_ascii_alphabetic() {
-                                            char::from_u32((ctrl as u32) & 0x1F).unwrap()
-                                        } else {
-                                            return Err(Error::InvalidEscape(ctrl));
-                                        }
-                                    }
-                                    // Only syntax characters and `-` may be escaped in \q{}.
-                                    _ if is_syntax_character(escaped) || escaped == '-' => escaped,
-                                    _ => return Err(Error::InvalidEscape(escaped)),
-                                });
+                                // ClassString :: ClassSetCharacter — so \q{} takes the same escapes as a class set operand.
+                                let value = self.parse_class_set_char_escape()?;
+                                current.push(char::from_u32(value).ok_or(Error::InvalidUnicodeEscape)?);
                             } else {
                                 current.push(c);
                             }
@@ -1701,7 +1681,14 @@ impl Parser {
                 }
                 Ok(val)
             }
-            _ if is_syntax_character(ch) || ch == '/' || ch == '-' => Ok(ch as u32),
+            'c' => match self.peek() {
+                Some(letter) if letter.is_ascii_alphabetic() => {
+                    self.advance();
+                    Ok((letter as u32) & 0x1F)
+                }
+                _ => Err(Error::InvalidEscape(ch)),
+            },
+            _ if is_syntax_character(ch) || ch == '/' || is_class_set_reserved_punctuator(ch) => Ok(ch as u32),
             _ => Err(Error::InvalidEscape(ch)),
         }
     }
@@ -1752,6 +1739,14 @@ fn is_syntax_character(ch: char) -> bool {
 /// ClassSetSyntaxCharacter :: one of ( ) [ ] { } / - \ |
 fn is_class_set_syntax_character(ch: char) -> bool {
     matches!(ch, '(' | ')' | '{' | '}' | '/' | '-' | '|')
+}
+
+/// ClassSetReservedPunctuator :: one of & - ! # % , : ; < = > @ ` ~
+fn is_class_set_reserved_punctuator(ch: char) -> bool {
+    matches!(
+        ch,
+        '&' | '-' | '!' | '#' | '%' | ',' | ':' | ';' | '<' | '=' | '>' | '@' | '`' | '~'
+    )
 }
 
 /// Characters that form ClassSetReservedDoublePunctuator when doubled.

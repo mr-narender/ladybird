@@ -108,6 +108,9 @@ describe("correct behavior", () => {
         expect(1n == "0b10").toBeFalse();
         expect(1n == "0o2").toBeFalse();
         expect(1n == "0x2").toBeFalse();
+
+        expect(1n == "﻿1﻿").toBeTrue();
+        expect(1n == "\u00851").toBeFalse();
     });
 
     test("strong equality operators", () => {
@@ -192,6 +195,30 @@ describe("correct behavior", () => {
         expect("0x1" <= 1n).toBeTrue();
         expect("0X2" <= 2n).toBeTrue();
     });
+});
+
+test("constant right shift by a huge count", () => {
+    expect(~4n >> 18446744073709551615n).toBe(-1n);
+    expect(~0n >> 18446744073709551615n).toBe(-1n);
+    expect(5n >> 18446744073709551615n).toBe(0n);
+});
+
+test("shifts and powers with huge counts at runtime", () => {
+    const value = x => x;
+    expect(value(5n) >> value(2147483648n)).toBe(0n);
+    expect(value(-5n) >> value(2147483648n)).toBe(-1n);
+    expect(value(5n) << value(-2147483648n)).toBe(0n);
+    expect(value(5n) >> value(4294967296n)).toBe(0n);
+    expect(value(-5n) >> value(2n ** 70n)).toBe(-1n);
+    expect(value(0n) << value(2n ** 40n)).toBe(0n);
+    expect(value(-9n) >> value(1n)).toBe(-5n);
+    expect(value(-1n) ** value(2147483649n)).toBe(-1n);
+    expect(value(-1n) ** value(2n ** 70n)).toBe(1n);
+    expect(value(1n) ** value(4294967296n)).toBe(1n);
+    expect(value(0n) ** value(2147483648n)).toBe(0n);
+    expect(value(0n) ** value(0n)).toBe(1n);
+    expect(() => value(1n) << value(2n ** 33n)).toThrow(RangeError);
+    expect(() => value(2n) ** value(2n ** 33n)).toThrow(RangeError);
 });
 
 describe("errors", () => {

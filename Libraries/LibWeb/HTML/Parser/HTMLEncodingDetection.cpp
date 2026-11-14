@@ -17,9 +17,16 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWeb/HTML/Parser/HTMLEncodingDetection.h>
 #include <LibWeb/HTML/Parser/RustFFI.h>
+#include <LibWeb/HTMLTokenizerRustFFI.h>
 #include <LibWebCommon/Infra/CharacterTypes.h>
 
 namespace Web::HTML {
+
+extern "C" {
+
+// Called by Bindings/Rust/src/xhr/xml_http_request.rs.
+void web_html_get_an_xml_encoding(ReadonlyBytes input, void* label, void (*on_label)(void*, ReadonlyBytes));
+}
 
 static Utf16FlyString prescan_attribute_name(Utf16StringBuilder const& attribute_name)
 {
@@ -273,7 +280,7 @@ value:
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#concept-get-xml-encoding-when-sniffing
-static Optional<ByteString> get_an_xml_encoding(ReadonlyBytes input)
+Optional<ByteString> get_an_xml_encoding(ReadonlyBytes input)
 {
     // 1. Let encodingPosition be a pointer to the start of the stream.
     size_t encoding_position = 0;
@@ -367,26 +374,37 @@ static Optional<ByteString> get_an_xml_encoding(ReadonlyBytes input)
 }
 
 // https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding
+// Step 2 of the prescan algorithm.
+Optional<ByteString> prescan_for_utf16_xml_declaration(ReadonlyBytes input)
+{
+    // 2. Prescan for UTF-16 XML declarations: If position points to:
+    if (input.size() < 6)
+        return {};
+
+    // * A sequence of bytes starting with: 0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0 (case-sensitive UTF-16 little-endian '<?x')
+    //       Return UTF-16LE.
+    if (input.slice(0, 6) == Array<u8, 6> { 0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0 })
+        return "utf-16le";
+
+    // * A sequence of bytes starting with: 0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78 (case-sensitive UTF-16 big-endian '<?x')
+    //       Return UTF-16BE.
+    if (input.slice(0, 6) == Array<u8, 6> { 0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78 })
+        return "utf-16be";
+
+    // NOTE: For historical reasons, the prefix is two bytes longer than in Appendix F of XML and the encoding name is
+    //       not checked.
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding
 static Optional<ByteString> run_prescan_byte_stream_algorithm_steps(DOM::Document& document, ReadonlyBytes input)
 {
     // 1. Let position be a pointer to a byte in the input byte stream, initially pointing at the first byte.
     size_t position = 0;
 
     // 2. Prescan for UTF-16 XML declarations: If position points to:
-    if (!prescan_should_abort(input, position + 5)) {
-        // * A sequence of bytes starting with: 0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0 (case-sensitive UTF-16 little-endian '<?x')
-        //       Return UTF-16LE.
-        if (input.slice(position, 6) == Array<u8, 6> { 0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0 })
-            return "utf-16le";
-
-        // * A sequence of bytes starting with: 0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78 (case-sensitive UTF-16 big-endian '<?x')
-        //       Return UTF-16BE.
-        if (input.slice(position, 6) == Array<u8, 6> { 0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78 })
-            return "utf-16be";
-    }
-
-    // NOTE: For historical reasons, the prefix is two bytes longer than in Appendix F of XML and the encoding name is
-    //       not checked.
+    if (auto encoding = prescan_for_utf16_xml_declaration(input); encoding.has_value())
+        return encoding;
 
     // 3. Loop: If position points to:
     while (!prescan_should_abort(input, position)) {
@@ -595,13 +613,50 @@ ByteString extract_tld_hint(URL::URL const& url)
     return tld_label.is_empty() ? ByteString {} : ByteString { tld_label };
 }
 
-// https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
-EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type)
+EncodingDeclarationPrescan::EncodingDeclarationPrescan(bool scripting_enabled)
+    : m_scanner(rust_html_meta_charset_scanner_create(scripting_enabled))
+{
+}
+
+EncodingDeclarationPrescan::~EncodingDeclarationPrescan()
+{
+    rust_html_meta_charset_scanner_destroy(m_scanner);
+}
+
+EncodingDeclarationPrescan::Result EncodingDeclarationPrescan::scan(ReadonlyBytes bytes, bool input_complete)
+{
+    auto result = rust_html_meta_charset_scanner_scan(m_scanner, bytes, input_complete, &m_encoding,
+        [](void* context, u8 const* value, size_t value_length, bool is_content) {
+            StringView value_view { value, value_length };
+            auto& encoding = *static_cast<Optional<StringView>*>(context);
+            encoding = is_content ? extract_character_encoding_from_meta_element(ByteString { value_view }) : TextCodec::get_standardized_encoding(value_view);
+            return encoding.has_value();
+        });
+
+    switch (result) {
+    case RustFfiMetaCharsetScanResult::NeedMoreInput:
+        return Result::NeedMoreInput;
+    case RustFfiMetaCharsetScanResult::Found:
+        // https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding
+        // If charset is UTF-16BE/LE, then set charset to UTF-8.
+        // If charset is x-user-defined, then set charset to windows-1252.
+        if (m_encoding->is_one_of("UTF-16BE"sv, "UTF-16LE"sv))
+            m_encoding = "UTF-8"sv;
+        else if (*m_encoding == "x-user-defined"sv)
+            m_encoding = "windows-1252"sv;
+        return Result::Found;
+    case RustFfiMetaCharsetScanResult::NotFound:
+        return Result::NotFound;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+Optional<EncodingSniffingResult> sniff_encoding_before_prescan(ReadonlyBytes input, Optional<MimeSniff::MimeType> const& maybe_mime_type)
 {
     // 1. If the result of BOM sniffing is an encoding, return that encoding with confidence certain.
     auto bom = run_bom_sniff(input);
     if (bom.has_value())
-        return { bom.release_value(), EncodingConfidence::Certain };
+        return EncodingSniffingResult { bom.release_value(), EncodingConfidence::Certain };
     // 2. FIXME: If the user has explicitly instructed the user agent to override the document's character encoding with a specific encoding,
     //    optionally return that encoding with the confidence certain.
 
@@ -615,21 +670,55 @@ EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, 
         // FIXME: This is awkward because lecacy_extract_an_encoding can not fail
         auto maybe_transport_encoding = Fetch::Infrastructure::legacy_extract_an_encoding(maybe_mime_type, "invalid"sv);
         if (maybe_transport_encoding != "invalid"sv)
-            return { maybe_transport_encoding, EncodingConfidence::Certain };
+            return EncodingSniffingResult { maybe_transport_encoding, EncodingConfidence::Certain };
     }
+
+    // 5. Optionally, prescan the byte stream to determine its encoding, ...
+    //    AD-HOC: Of the prescan algorithm, only its check for a UTF-16 XML declaration runs here. See
+    //            EncodingDeclarationPrescan for the rest.
+    if (auto encoding = prescan_for_utf16_xml_declaration(input); encoding.has_value())
+        return EncodingSniffingResult { encoding.release_value(), EncodingConfidence::Tentative };
+
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
+EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, ReadonlyBytes input, Optional<MimeSniff::MimeType> maybe_mime_type, GC::Ptr<DOM::Document> loading_container_document)
+{
+    if (auto result = sniff_encoding_before_prescan(input, maybe_mime_type); result.has_value())
+        return result.release_value();
 
     // 5. Optionally, prescan the byte stream to determine its encoding, with the end condition being when the user agent decides that scanning further bytes would not
     //    be efficient. User agents are encouraged to only prescan the first 1024 bytes. User agents may decide that scanning any bytes is not efficient, in which case
     //    these substeps are entirely skipped.
     //    The aforementioned algorithm returns either a character encoding or failure. If it returns a character encoding, then return the same encoding, with confidence tentative.
-    auto prescan = run_prescan_byte_stream_algorithm(document, input);
-    if (prescan.has_value())
-        return { prescan.release_value(), EncodingConfidence::Tentative };
+    //    AD-HOC: Find the declaration by tokenizing the bytes as the HTML parser will, as proposed in
+    //            https://github.com/whatwg/html/issues/6962, rather than with the prescan algorithm.
+    EncodingDeclarationPrescan prescan { document.is_scripting_enabled() };
+    if (prescan.scan(input, true) == EncodingDeclarationPrescan::Result::Found)
+        return { ByteString { prescan.encoding() }, EncodingConfidence::Tentative };
 
-    // 6. FIXME: If the HTML parser for which this algorithm is being run is associated with a Document d whose container document is non-null, then:
-    // 1. Let parentDocument be d's container document.
-    // 2. If parentDocument's origin is same origin with d's origin and parentDocument's character encoding is not UTF-16BE/LE, then return parentDocument's character
-    //    encoding, with the confidence tentative.
+    return sniff_encoding_after_prescan(document, input, loading_container_document);
+}
+
+EncodingSniffingResult sniff_encoding_after_prescan(DOM::Document& document, ReadonlyBytes input, GC::Ptr<DOM::Document> loading_container_document)
+{
+    // AD-HOC: The prescan algorithm gets an XML encoding when it finds no declaration, so do that here.
+    if (auto xml_encoding = get_an_xml_encoding(input); xml_encoding.has_value())
+        return { xml_encoding.release_value(), EncodingConfidence::Tentative };
+
+    // 6. If the HTML parser for which this algorithm is being run is associated with a Document d whose container document is non-null, then:
+    auto parent_document = loading_container_document ? loading_container_document : document.container_document();
+    if (parent_document) {
+        // 1. Let parentDocument be d's container document.
+        // 2. If parentDocument's origin is same origin with d's origin and parentDocument's character encoding is not UTF-16BE/LE, then return parentDocument's character
+        //    encoding, with the confidence tentative.
+        if (parent_document->origin().is_same_origin(document.origin())) {
+            auto parent_encoding = parent_document->character_set().to_byte_string();
+            if (!parent_encoding.is_one_of_ignoring_ascii_case("UTF-16BE"sv, "UTF-16LE"sv))
+                return { move(parent_encoding), EncodingConfidence::Tentative };
+        }
+    }
 
     // 7. Otherwise, if the user agent has information on the likely encoding for this page, e.g. based on the encoding of the page when it was last visited, then return
     //    that encoding, with the confidence tentative.
@@ -641,29 +730,28 @@ EncodingSniffingResult run_encoding_sniffing_algorithm(DOM::Document& document, 
     //    then return that encoding, with the confidence tentative. [UNIVCHARDET]
 
     auto tld_hint = extract_tld_hint(document.url());
-    u8 const* tld_data = tld_hint.is_empty() ? nullptr : reinterpret_cast<u8 const*>(tld_hint.characters());
-    size_t tld_size = tld_hint.length();
 
     u8 const* encoding_name_ptr = nullptr;
     size_t encoding_name_len = 0;
 
     bool allow_utf8_detection = document.url().scheme() == "file"sv;
 
-    if (Parser::rust_detect_encoding(
-            input.data(), input.size(),
-            tld_data, tld_size,
-            allow_utf8_detection,
-            &encoding_name_ptr, &encoding_name_len)) {
-        auto detected = StringView { reinterpret_cast<char const*>(encoding_name_ptr), encoding_name_len };
-        auto standardized = TextCodec::get_standardized_encoding(detected);
-        if (standardized.has_value())
-            return { ByteString { standardized.value() }, EncodingConfidence::Tentative };
-    }
+    Parser::rust_detect_encoding(input, tld_hint.bytes(), allow_utf8_detection, &encoding_name_ptr, &encoding_name_len);
+    auto detected = StringView { reinterpret_cast<char const*>(encoding_name_ptr), encoding_name_len };
+    auto standardized = TextCodec::get_standardized_encoding(detected);
+    if (standardized.has_value())
+        return { ByteString { standardized.value() }, EncodingConfidence::Tentative };
 
     // 9. Otherwise, return an implementation-defined or user-specified default character encoding, with the confidence tentative.
     //    In controlled environments or in environments where the encoding of documents can be prescribed (for example, for user agents intended for dedicated use in new
     //    networks), the comprehensive UTF-8 encoding is suggested.
     return { "UTF-8", EncodingConfidence::Tentative };
+}
+
+void web_html_get_an_xml_encoding(ReadonlyBytes input, void* label, void (*on_label)(void*, ReadonlyBytes))
+{
+    if (auto encoding = get_an_xml_encoding(input); encoding.has_value())
+        on_label(label, encoding->bytes());
 }
 
 }

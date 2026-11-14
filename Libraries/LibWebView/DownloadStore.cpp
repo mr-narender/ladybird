@@ -15,6 +15,8 @@ namespace WebView {
 
 static constexpr u32 DOWNLOAD_SCHEMA_BASELINE_VERSION = 1u;
 static constexpr u32 DOWNLOAD_SCHEMA_RESTARTABILITY_VERSION = 2u;
+static constexpr u32 DOWNLOAD_SCHEMA_REPLACEMENT_VERSION = 3u;
+static constexpr u32 DOWNLOAD_SCHEMA_SAME_SITE_CONTEXT_VERSION = 4u;
 
 static String serialize_segments(Vector<DownloadSegmentRecord> const& segments)
 {
@@ -96,6 +98,20 @@ ErrorOr<Database::MigrationOutcome> DownloadStore::migrate_schema(Database::Data
                 ALTER TABLE Downloads ADD COLUMN can_restart_from_zero INTEGER NOT NULL DEFAULT 0;
             )#"sv,
         },
+        {
+            .version = DOWNLOAD_SCHEMA_REPLACEMENT_VERSION,
+            .sql = R"#(
+                ALTER TABLE Downloads ADD COLUMN may_replace_destination INTEGER NOT NULL DEFAULT 0;
+            )#"sv,
+        },
+        {
+            .version = DOWNLOAD_SCHEMA_SAME_SITE_CONTEXT_VERSION,
+            .sql = R"#(
+                ALTER TABLE Downloads ADD COLUMN same_site INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE Downloads ADD COLUMN top_level_navigation INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE Downloads ADD COLUMN safe_method INTEGER NOT NULL DEFAULT 0;
+            )#"sv,
+        },
     });
 
     return database.migrate("Downloads"sv, migrations, mode);
@@ -117,10 +133,14 @@ ErrorOr<NonnullOwnPtr<DownloadStore>> DownloadStore::create(Database::Database& 
             last_modified,
             segments,
             can_restart_from_zero,
+            may_replace_destination,
+            same_site,
+            top_level_navigation,
+            safe_method,
             created_time,
             updated_time
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             url = excluded.url,
             display_url = excluded.display_url,
@@ -131,6 +151,10 @@ ErrorOr<NonnullOwnPtr<DownloadStore>> DownloadStore::create(Database::Database& 
             last_modified = excluded.last_modified,
             segments = excluded.segments,
             can_restart_from_zero = excluded.can_restart_from_zero,
+            may_replace_destination = excluded.may_replace_destination,
+            same_site = excluded.same_site,
+            top_level_navigation = excluded.top_level_navigation,
+            safe_method = excluded.safe_method,
             updated_time = excluded.updated_time;
     )#"sv));
 
@@ -140,7 +164,7 @@ ErrorOr<NonnullOwnPtr<DownloadStore>> DownloadStore::create(Database::Database& 
     )#"sv));
 
     statements.list_downloads = TRY(database.prepare_statement(R"#(
-        SELECT id, url, display_url, destination, temporary_destination, total_size, etag, last_modified, segments, can_restart_from_zero, created_time
+        SELECT id, url, display_url, destination, temporary_destination, total_size, etag, last_modified, segments, can_restart_from_zero, created_time, may_replace_destination, same_site, top_level_navigation, safe_method
         FROM Downloads
         ORDER BY id ASC;
     )#"sv));
@@ -186,6 +210,10 @@ void DownloadStore::save_download(DownloadRecord const& download, UnixDateTime u
         download.last_modified.value_or(String {}),
         serialize_segments(download.segments),
         download.can_restart_from_zero,
+        download.may_replace_destination,
+        download.same_site_context.status == HTTP::Cookie::SameSiteStatus::SameSite,
+        download.same_site_context.is_top_level_navigation,
+        download.same_site_context.is_safe_method,
         download.created_time,
         updated_at);
 }
@@ -232,6 +260,12 @@ Vector<DownloadRecord> DownloadStore::resumable_downloads()
                 .segments = segments.release_value(),
                 .created_time = m_database->result_column<UnixDateTime>(statement_id, 10),
                 .can_restart_from_zero = m_database->result_column<bool>(statement_id, 9),
+                .may_replace_destination = m_database->result_column<bool>(statement_id, 11),
+                .same_site_context = {
+                    .status = m_database->result_column<bool>(statement_id, 12) ? HTTP::Cookie::SameSiteStatus::SameSite : HTTP::Cookie::SameSiteStatus::CrossSite,
+                    .is_top_level_navigation = m_database->result_column<bool>(statement_id, 13),
+                    .is_safe_method = m_database->result_column<bool>(statement_id, 14),
+                },
             });
 
             return {};

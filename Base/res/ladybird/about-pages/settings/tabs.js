@@ -1,25 +1,43 @@
-const enableVerticalTabs = document.querySelector("#enable-vertical-tabs");
+const tabLayoutGroup = document.querySelector("#tab-layout-group");
+const tabLayoutInputs = tabLayoutGroup.querySelectorAll('input[name="tab-layout"]');
 const verticalTabsExpandOnHover = document.querySelector("#vertical-tabs-expand-on-hover");
 const verticalTabsPosition = document.querySelector("#vertical-tabs-position");
 
 let TAB_SETTINGS = {};
 
 const loadFeatures = features => {
-    // When more tab settings are added, we will need to be more selective here.
-    const tabSettingsCard = enableVerticalTabs.closest(".card");
-    tabSettingsCard.previousElementSibling.classList.toggle("hidden", !features?.verticalTabs);
-    tabSettingsCard.classList.toggle("hidden", !features?.verticalTabs);
+    // Without vertical tabs, there is no choice of tab layout to make.
+    tabLayoutGroup.classList.toggle("hidden", !features?.verticalTabs);
+    if (!features?.verticalTabs) {
+        verticalTabsExpandOnHover.parentElement.classList.add("hidden");
+        verticalTabsPosition.parentElement.classList.add("hidden");
+    }
 };
 
 const updateVerticalTabsDependentSettings = () => {
-    verticalTabsExpandOnHover.parentElement.classList.toggle("hidden", !enableVerticalTabs.checked);
-    verticalTabsPosition.parentElement.classList.toggle("hidden", !enableVerticalTabs.checked);
+    const verticalTabsEnabled = !!TAB_SETTINGS.verticalTabsEnabled && !tabLayoutGroup.classList.contains("hidden");
+    verticalTabsExpandOnHover.parentElement.classList.toggle("hidden", !verticalTabsEnabled);
+    // With everything in the sidebar, the sidebar is always on the left.
+    verticalTabsPosition.parentElement.classList.toggle(
+        "hidden",
+        !verticalTabsEnabled || !!TAB_SETTINGS.everythingInSidebar
+    );
+};
+
+const tabLayout = () => {
+    if (!TAB_SETTINGS.verticalTabsEnabled) return "horizontal";
+    return TAB_SETTINGS.everythingInSidebar ? "sidebar" : "vertical";
 };
 
 const loadSettings = settings => {
+    if (!Object.hasOwn(settings, "tabs")) {
+        return;
+    }
+
     TAB_SETTINGS = settings.tabs || {};
 
-    enableVerticalTabs.checked = !!TAB_SETTINGS.verticalTabsEnabled;
+    const layout = tabLayout();
+    for (const input of tabLayoutInputs) input.checked = input.value === layout;
     verticalTabsExpandOnHover.checked = !!TAB_SETTINGS.verticalTabsExpandOnHover;
     verticalTabsPosition.value = TAB_SETTINGS.verticalTabsPosition || "left";
     updateVerticalTabsDependentSettings();
@@ -29,24 +47,25 @@ function saveTabSettings() {
     ladybird.sendMessage("setTabSettings", TAB_SETTINGS);
 }
 
-function addCheckboxChangeHandler(input, name) {
+for (const input of tabLayoutInputs) {
     input.addEventListener("change", () => {
-        TAB_SETTINGS[name] = input.checked;
+        if (!input.checked) return;
+        TAB_SETTINGS.verticalTabsEnabled = input.value !== "horizontal";
+        TAB_SETTINGS.everythingInSidebar = input.value === "sidebar";
         updateVerticalTabsDependentSettings();
         saveTabSettings();
     });
 }
 
-function addSelectChangeHandler(input, name) {
-    input.addEventListener("change", () => {
-        TAB_SETTINGS[name] = input.value;
-        saveTabSettings();
-    });
-}
+verticalTabsExpandOnHover.addEventListener("change", () => {
+    TAB_SETTINGS.verticalTabsExpandOnHover = verticalTabsExpandOnHover.checked;
+    saveTabSettings();
+});
 
-addCheckboxChangeHandler(enableVerticalTabs, "verticalTabsEnabled");
-addCheckboxChangeHandler(verticalTabsExpandOnHover, "verticalTabsExpandOnHover");
-addSelectChangeHandler(verticalTabsPosition, "verticalTabsPosition");
+verticalTabsPosition.addEventListener("change", () => {
+    TAB_SETTINGS.verticalTabsPosition = verticalTabsPosition.value;
+    saveTabSettings();
+});
 
 document.addEventListener("WebUIMessage", event => {
     if (event.detail.name === "loadFeatures") {

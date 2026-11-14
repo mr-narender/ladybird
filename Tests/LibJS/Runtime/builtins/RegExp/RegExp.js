@@ -207,17 +207,14 @@ test("complex v-mode lookbehind with negated emoji class finds the V8 match", ()
     expect(subject.match(new RegExp(regex.source, "gv"))).toEqual([expected]);
 });
 
-test("unicode lastIndex retries the original low-surrogate position after a failed snap-back", () => {
+test("unicode lastIndex does not retry a failed lookbehind inside a surrogate pair", () => {
     const regex = /\p{Script=Cyrillic}?(?<!\D)/vy;
     regex.lastIndex = 2;
 
-    const result = regex.exec("A😘");
-    expect(result).not.toBeNull();
-    expect(result.index).toBe(2);
-    expect(result[0]).toBe("");
-    expect(regex.lastIndex).toBe(2);
+    expect(regex.exec("A😘")).toBeNull();
+    expect(regex.lastIndex).toBe(0);
 
-    expect("A😘".match(/\p{Script=Cyrillic}?(?<!\D)/gv)).toEqual(["", ""]);
+    expect("A😘".match(/\p{Script=Cyrillic}?(?<!\D)/gv)).toEqual([""]);
 });
 
 test("unicode lastIndex still snaps to the start of a surrogate pair when that matches", () => {
@@ -242,15 +239,15 @@ test("unicode lastIndex does not retry consuming matches at low surrogates", () 
     expect("😀".replace(regex, "x")).toBe("😀");
 });
 
-test("global unicode matches keep low-surrogate empty matches that V8 finds", () => {
+test("negative non-digit lookbehind matches only at the start or after digits", () => {
     const subject =
         "سلام 카차가≠ -YA😘🙂🤔 ذذذ/8️⃣ бшгА884 жЕ 🌟🎀🎀🎈✨🚀\n✨тест( \n\t \t },{ `:कगवचचजय mmmmm\t999\n⚡💢💥❤️💧;人बई÷{{😊😊🔢🔢🔢_";
-    expect(subject.match(/\p{Script=Cyrillic}?(?<!\D)/gv)).toEqual(new Array(24).fill(""));
+    expect(subject.match(/\p{Script=Cyrillic}?(?<!\D)/gv)).toEqual(new Array(8).fill(""));
 });
 
-test("lookahead inside surrogate pair does not match paired low surrogate as a character", () => {
-    expect("💦💦".match(/(?!\W)/gv)).toEqual(["", "", ""]);
-    expect("💦💦".match(/\p{Emoji_Presentation}?(?!\W)/gv)).toEqual(["", "💦", ""]);
+test("negative non-word lookahead does not match inside surrogate pairs", () => {
+    expect("💦💦".match(/(?!\W)/gv)).toEqual([""]);
+    expect("💦💦".match(/\p{Emoji_Presentation}?(?!\W)/gv)).toEqual(["💦", ""]);
 });
 
 test("backward v-mode class-set operations inspect the consumed code point", () => {
@@ -868,6 +865,26 @@ test("Unicode case-insensitive matching", () => {
     testMatch(/[ω]/iv, "\u2126", ["\u2126"]);
     testMatch(/[\u03A9]/i, "\u2126", null);
     testMatch(/[\u03A9]/iv, "\u2126", ["\u2126"]);
+
+    // ASCII characters against classes that only contain their non-ASCII case equivalents
+    testMatch(/[\u2100-\u212A]/i, "k", null);
+    testMatch(/[\u2100-\u212A]/i, "K", null);
+    testMatch(/[\u2100-\u212A]/iu, "k", ["k"]);
+    testMatch(/[\u2100-\u212A]/iu, "K", ["K"]);
+    testMatch(/[\u0100-\u017F]/i, "s", null);
+    testMatch(/[\u0100-\u017F]/i, "S", null);
+    testMatch(/[\u0100-\u017F]/iu, "s", ["s"]);
+    testMatch(/[\u0100-\u017F]/iu, "S", ["S"]);
+    testMatch(/[\u0100-\u017F]/iu, "t", null);
+
+    // ASCII characters against ASCII classes
+    testMatch(/[0-9]/i, "a", null);
+    testMatch(/[0-9]/iu, "7", ["7"]);
+    testMatch(/[a-f]/i, "D", ["D"]);
+    testMatch(/[A-F]/iu, "d", ["d"]);
+    testMatch(/[A-F]/i, "g", null);
+    testMatch(/[@]/i, "`", null);
+    testMatch(/[[]/i, "{", null);
 });
 
 test("surrogate pairs", () => {
@@ -943,4 +960,43 @@ test("string properties allowed as set operation operands in negated /v mode cla
     expect(() => {
         RegExp("[^\\p{Emoji_Keycap_Sequence}]", "v");
     }).toThrowWithMessage(SyntaxError, "RegExp compile error: invalid Unicode property 'Emoji_Keycap_Sequence'");
+});
+
+test("deeply nested patterns throw instead of overflowing the stack", () => {
+    const message = "RegExp compile error: pattern is nested too deeply";
+    expect(() => {
+        RegExp("(".repeat(100_000) + ")".repeat(100_000));
+    }).toThrowWithMessage(SyntaxError, message);
+    expect(() => {
+        RegExp("(?:".repeat(100_000) + ")".repeat(100_000));
+    }).toThrowWithMessage(SyntaxError, message);
+    expect(() => {
+        RegExp("[".repeat(100_000) + "]".repeat(100_000), "v");
+    }).toThrowWithMessage(SyntaxError, message);
+});
+
+test("the most deeply nested pattern that compiles also runs", () => {
+    // Each pass over a pattern recurses into its nested groups and classes, so each must stop before the stack does.
+    for (const [pattern, flags] of [
+        [depth => "(".repeat(depth) + "a" + ")".repeat(depth), ""],
+        [depth => "(?<=".repeat(depth) + "a" + ")".repeat(depth), ""],
+        [depth => "(?:" + "(".repeat(depth) + "a|" + ")".repeat(depth) + ")*", ""],
+        [depth => "[".repeat(depth) + "a" + "]".repeat(depth), "v"],
+        [depth => "[^".repeat(depth) + "a" + "]".repeat(depth), "v"],
+    ]) {
+        let deepest;
+        let low = 1;
+        let high = 100_000;
+        while (low + 1 < high) {
+            const middle = Math.floor((low + high) / 2);
+            try {
+                deepest = RegExp(pattern(middle), flags);
+                low = middle;
+            } catch (error) {
+                expect(error.message).toBe("RegExp compile error: pattern is nested too deeply");
+                high = middle;
+            }
+        }
+        expect(() => deepest.exec("a")).not.toThrow();
+    }
 });

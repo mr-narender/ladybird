@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibURL/RustIntegration.h>
 #include <LibWeb/DOMURL/DOMURL.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/StorageAPI/StorageKey.h>
@@ -16,18 +17,8 @@ Optional<StorageKey> obtain_a_storage_key(HTML::Environment const& environment)
     // 1. Let key be the result of running obtain a storage key for non-storage purposes with environment.
     auto key = obtain_a_storage_key_for_non_storage_purposes(environment);
 
-    // AD-HOC: file:// URLs are opaque, but other browsers support storage on file:// URLs.
-    if (key.origin.is_opaque_file_origin())
-        key.origin = URL::Origin { "file"_string, String {}, {} };
-
-    // 2. If key’s origin is an opaque origin, then return failure.
-    if (key.origin.is_opaque())
-        return {};
-
-    // FIXME: 3. If the user has disabled storage, then return failure.
-
-    // 4. Return key.
-    return key;
+    // 2-4. The rest is the same for every origin; see the overload taking one.
+    return obtain_a_storage_key(key.origin);
 }
 
 // https://storage.spec.whatwg.org/#obtain-a-storage-key-for-non-storage-purposes
@@ -42,6 +33,32 @@ StorageKey obtain_a_storage_key_for_non_storage_purposes(HTML::Environment const
 
     // 2. Return a tuple consisting of origin.
     return { move(origin) };
+}
+
+// Declared on the Rust side in Libraries/LibWeb/Bindings/Rust/src/storage_api/storage_key.rs.
+extern "C" {
+
+bool web_storage_api_obtain_a_storage_key(HTML::EnvironmentSettingsObject* environment, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
+void web_storage_api_obtain_a_storage_key_for_non_storage_purposes(HTML::EnvironmentSettingsObject* environment, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*));
+}
+
+bool web_storage_api_obtain_a_storage_key(HTML::EnvironmentSettingsObject* environment, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*))
+{
+    auto storage_key = StorageAPI::obtain_a_storage_key(*environment);
+    if (!storage_key.has_value())
+        return false;
+    URL::RustIntegration::lend_origin_to_ffi(storage_key->origin, [&](URL::FFI::FfiOrigin const& origin) {
+        on_origin(ctx, &origin);
+    });
+    return true;
+}
+
+void web_storage_api_obtain_a_storage_key_for_non_storage_purposes(HTML::EnvironmentSettingsObject* environment, void* ctx, void (*on_origin)(void*, URL::FFI::FfiOrigin const*))
+{
+    auto storage_key = StorageAPI::obtain_a_storage_key_for_non_storage_purposes(*environment);
+    URL::RustIntegration::lend_origin_to_ffi(storage_key.origin, [&](URL::FFI::FfiOrigin const& origin) {
+        on_origin(ctx, &origin);
+    });
 }
 
 }

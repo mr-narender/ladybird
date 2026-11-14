@@ -1,0 +1,3 @@
+opacity-pulse: opacity div#target
+color-pulse: background-color div#target
+filter-pulse: filter div#target

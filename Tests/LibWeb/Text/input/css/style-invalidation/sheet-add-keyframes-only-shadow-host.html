@@ -1,13 +1,13 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <div id="host"></div>
 <script>
-    function settleAndReset(triggerElement) {
+    function settle(triggerElement) {
         getComputedStyle(triggerElement).animationName;
         getComputedStyle(triggerElement).animationName;
         internals.updateStyle();
-        internals.resetStyleInvalidationCounters();
     }
 
     function addBystanders(parent, count) {
@@ -18,9 +18,10 @@
         }
     }
 
-    function dumpCounters(label) {
-        const c = internals.getStyleInvalidationCounters();
-        println(`${label}: elementStyleRecomputations=${c.elementStyleRecomputations}, elementStyleNoopRecomputations=${c.elementStyleNoopRecomputations}`);
+    function dumpWork(label, mutate) {
+        const work = styleWork(mutate);
+        const fullPass = work.passes().includes("FULL") ? " (full pass)" : "";
+        println(`${label}: restyled [${work.restyled().map(shortStyleName).join(", ")}]${fullPass}`);
     }
 
     test(() => {
@@ -36,16 +37,19 @@
         // (which lives outside the shadow subtree, but matches via :host)
         // actually depends on the new keyframes.
         addBystanders(shadowRoot, 25);
-        settleAndReset(host);
+        settle(host);
 
         // Adding a sheet whose only effect is declaring @keyframes fade should
         // dirty just the host, whose computed animation-name is "fade" via
         // the earlier :host rule.
-        const keyframesStyle = document.createElement("style");
-        keyframesStyle.textContent = "@keyframes fade { from { opacity: 0.25; } to { opacity: 0.25; } }";
-        shadowRoot.appendChild(keyframesStyle);
-        getComputedStyle(host).animationName;
-
-        dumpCounters("@keyframes only sheet add (host animation-name via :host)");
+        // Nothing but the arriving style element: the host's animation is planned again without a
+        // restyle.
+        dumpWork("@keyframes only sheet add (host animation-name via :host)", () => {
+            const keyframesStyle = document.createElement("style");
+            keyframesStyle.textContent = "@keyframes fade { from { opacity: 0.25; } to { opacity: 0.25; } }";
+            shadowRoot.appendChild(keyframesStyle);
+            getComputedStyle(host).animationName;
+        });
+        println(`host opacity: ${getComputedStyle(host).opacity}`);
     });
 </script>

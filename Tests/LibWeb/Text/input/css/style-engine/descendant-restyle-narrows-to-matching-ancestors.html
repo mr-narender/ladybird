@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
+<style>
+    #guard:focus [class] span { color: green }
+</style>
+<div id="guard" tabindex="0">
+    <div>
+        <span id="bare-1"></span>
+        <span id="bare-2"></span>
+    </div>
+    <div class="holder">
+        <span id="qualified"></span>
+    </div>
+</div>
+<script>
+    test(() => {
+        // A region says where a change can reach; it does not say what the selector required on the
+        // way. Focusing the guard reaches every span under it, but only a span with a `[class]`
+        // ancestor can match, and the plan names that one alone.
+        const work = styleWork(() => document.getElementById("guard").focus({ preventScroll: true }));
+        println(`spans under the guard: ${document.querySelectorAll("#guard span").length}`);
+        println(`passes: ${work.passes().join(" | ") || "(no pass)"}`);
+        println(`changed: [${work.changed().map(shortStyleName).join(", ")}]`);
+        println(`restyled but unchanged: [${work.restyled().filter(element => !work.changed().includes(element)).map(shortStyleName).join(", ")}]`);
+    });
+</script>

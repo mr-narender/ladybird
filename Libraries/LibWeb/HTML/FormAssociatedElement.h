@@ -11,7 +11,7 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
-#include <LibGC/ConservativeVector.h>
+#include <LibGC/RootVector.h>
 #include <LibGC/Weak.h>
 #include <LibWeb/Bindings/ElementInternals.h>
 #include <LibWeb/Bindings/HTMLFormElement.h>
@@ -20,6 +20,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/XHR/FormDataEntry.h>
+#include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
@@ -38,7 +39,7 @@ using ValidityStateFlags = Bindings::ValidityStateFlags;
 class WEB_API FormAssociatedElement {
 public:
     // NB: FACE stands for form-associated custom element.
-    using FACESubmissionValue = Variant<GC::Ref<FileAPI::File>, Utf16String, GC::ConservativeVector<XHR::FormDataEntry>, Empty>;
+    using FACESubmissionValue = Variant<GC::Ref<FileAPI::File>, Utf16String, GC::RootVector<XHR::FormDataEntry>, Empty>;
 
     virtual bool is_form_associated_element() const;
 
@@ -151,7 +152,6 @@ public:
     FACESubmissionValue const& face_submission_value() const;
     void set_face_submission_value(Badge<ElementInternals>, FACESubmissionValue const& value);
 
-    FACESubmissionValue const& face_state() const;
     void set_face_state(Badge<ElementInternals>, FACESubmissionValue const& value);
 
     void set_custom_validity_error_message(Badge<ElementInternals>, Utf16View value);
@@ -228,6 +228,8 @@ private:
 enum class SelectionSource {
     UI,
     DOM,
+    // The selection moved because the value changed, as when an edit or the value setter moves the cursor.
+    ValueChange,
 };
 
 class WEB_API FormAssociatedTextControlElement
@@ -264,7 +266,7 @@ public:
     WebIDL::ExceptionOr<void> set_range_text_binding(Utf16View replacement);
     WebIDL::ExceptionOr<void> set_range_text_binding(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve);
     WebIDL::ExceptionOr<void> set_range_text(Utf16String const& replacement);
-    WebIDL::ExceptionOr<void> set_range_text(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve);
+    WebIDL::ExceptionOr<void> set_range_text(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve, SelectionSource = SelectionSource::DOM);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setselectionrange
     void set_the_selection_range(Optional<WebIDL::UnsignedLong> start, Optional<WebIDL::UnsignedLong> end, SelectionDirection direction = SelectionDirection::None, SelectionSource source = SelectionSource::DOM);
@@ -279,7 +281,7 @@ public:
     virtual HTMLElement& text_control_to_html_element() = 0;
     HTMLElement const& text_control_to_html_element() const { return const_cast<FormAssociatedTextControlElement&>(*this).text_control_to_html_element(); }
 
-    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) = 0;
+    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data, Utf16View previous_value) = 0;
 
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() = 0;
     virtual GC::Ptr<DOM::Text const> form_associated_element_to_text_node() const { return const_cast<FormAssociatedTextControlElement&>(*this).form_associated_element_to_text_node(); }
@@ -287,6 +289,7 @@ public:
     virtual GC::Ptr<DOM::Element> text_control_scroll_container() = 0;
 
     virtual void handle_insert(Utf16FlyString const& input_type, Utf16View) override;
+    virtual GC::Ptr<DOM::StaticRange> deletion_target_range(Utf16FlyString const& input_type) override;
     virtual void handle_delete(Utf16FlyString const& input_type, DispatchInputEvent = DispatchInputEvent::Yes) override;
     virtual GC::Ptr<DOM::Node> mouse_selection_scope() override;
     virtual void select_all() override;
@@ -294,8 +297,13 @@ public:
     virtual void set_selection_focus(GC::Ref<DOM::Node>, size_t offset, TextAffinity = TextAffinity::Downstream) override;
     virtual void move_cursor_to_start(CollapseSelection) override;
     virtual void move_cursor_to_end(CollapseSelection) override;
-    void move_cursor_to_start_of_current_line(CollapseSelection);
-    void move_cursor_to_end_of_current_line(CollapseSelection);
+    virtual void move_cursor_to_start_of_current_line(CollapseSelection) override;
+    virtual void move_cursor_to_end_of_current_line(CollapseSelection) override;
+    virtual void move_cursor_to_start_of_paragraph(CollapseSelection) override;
+    virtual void move_cursor_to_end_of_paragraph(CollapseSelection) override;
+    virtual void move_cursor_to_physical_line_boundary(bool left, CollapseSelection) override;
+    virtual void move_cursor_to_previous_page(CollapseSelection collapse) override { move_cursor_by_page(false, collapse); }
+    virtual void move_cursor_to_next_page(CollapseSelection collapse) override { move_cursor_by_page(true, collapse); }
     virtual void increment_cursor_position_offset(CollapseSelection) override;
     virtual void decrement_cursor_position_offset(CollapseSelection) override;
     virtual void increment_cursor_position_to_next_word(CollapseSelection) override;
@@ -305,18 +313,29 @@ public:
 
     GC::Ptr<DOM::Position> cursor_position() const;
 
+    // NB: Edits that script makes with execCommand() reveal the cursor in the next rendering update instead of right
+    //     away, so that a run of them lays out the text control once instead of after each edit. A pending reveal is
+    //     made right away if the control loses focus or script moves its selection before that rendering update.
+    enum class CursorRevealAfterEdit : u8 {
+        Immediately,
+        InNextRenderingUpdate,
+    };
+    void set_cursor_reveal_after_edit(CursorRevealAfterEdit reveal) { m_cursor_reveal_after_edit = reveal; }
+    void reveal_cursor_if_pending();
+
 protected:
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
     void relevant_value_was_changed();
-
-    static void set_own_inline_style(DOM::Element&, CSS::CSSStyleProperties const& defaults);
 
 private:
     virtual GC::Ref<JS::Cell> as_cell() override;
 
     void collapse_selection_to_offset(size_t, TextAffinity = TextAffinity::Downstream);
     void move_selection_end_to(size_t offset, TextAffinity, CollapseSelection);
+    void move_cursor_by_page(bool forward, CollapseSelection);
+    void move_cursor_on_lines(Layout::RustFFI::FfiTextCaretMovement, CollapseSelection, CSSPixels page_distance = 0);
     void scroll_cursor_into_view();
+    void reveal_cursor_after_edit();
     void selection_was_changed(SelectionSource);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-selection
@@ -327,8 +346,15 @@ private:
     // Disambiguates which visual line the selection end renders on when it sits at a soft wrap boundary.
     TextAffinity m_selection_end_affinity { TextAffinity::Downstream };
 
+    // The inline coordinate that consecutive moves of the selection end to other lines keep, until the selection changes
+    // another way.
+    Optional<CSSPixels> m_line_move_inline_coordinate;
+
     // https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event
     bool m_has_scheduled_selectionchange_event { false };
+
+    CursorRevealAfterEdit m_cursor_reveal_after_edit { CursorRevealAfterEdit::Immediately };
+    bool m_has_pending_cursor_reveal { false };
 };
 
 }

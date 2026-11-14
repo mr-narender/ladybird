@@ -8,14 +8,17 @@
 #include <LibWebView/TabPerformanceStats.h>
 #include <QPainter>
 #include <QPainterPath>
+#include <UI/Qt/BrandColors.h>
+#include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/PerformanceMonitorWidget.h>
 #include <UI/Qt/StringUtils.h>
 
 namespace Ladybird {
 
-static constexpr Array<char const*, 5> s_labels { "CPU ", "MEM ", "↓ ", "↑ ", "FPS " };
-static constexpr Array<char const*, 5> s_value_templates { "9999%", "999.9 MB", "999.9 MB/s", "999.9 MB/s", "999" };
-static constexpr int metric_spacing = 8;
+static constexpr Array<char const*, 6> s_labels { "CPU ", "MEM ", "PEAK ", "↓ ", "↑ ", "FPS " };
+static constexpr Array<char const*, 6> s_shared_labels { "CPU* ", "MEM* ", "PEAK* ", "↓ ", "↑ ", "FPS " };
+static constexpr Array<char const*, 6> s_value_templates { "9999%", "999.9 MB", "999.9 MB", "999.9 MB/s", "999.9 MB/s", "999" };
+static constexpr int metric_spacing = 12;
 static constexpr int text_start = 48;
 static constexpr int trailing_padding = 4;
 
@@ -29,17 +32,29 @@ PerformanceMonitorWidget::PerformanceMonitorWidget(QWidget* parent)
     setFixedSize(sizeHint());
 }
 
+// NB: A label column fits its widest form, so marking shared values does not move anything.
+int PerformanceMonitorWidget::label_width(size_t index) const
+{
+    return max(fontMetrics().horizontalAdvance(s_labels[index]), fontMetrics().horizontalAdvance(s_shared_labels[index]));
+}
+
 QSize PerformanceMonitorWidget::sizeHint() const
 {
     auto width = text_start + trailing_padding + metric_spacing * (s_labels.size() - 1);
     for (size_t i = 0; i < s_labels.size(); ++i)
-        width += fontMetrics().horizontalAdvance(s_labels[i]) + fontMetrics().horizontalAdvance(s_value_templates[i]);
+        width += label_width(i) + fontMetrics().horizontalAdvance(s_value_templates[i]);
     return { static_cast<int>(width), 24 };
 }
 
 void PerformanceMonitorWidget::set_stats(WebView::TabPerformanceStats const& stats)
 {
     m_stats = stats;
+    if (m_stats.other_tabs_sharing_processes == 0)
+        setToolTip({});
+    else if (m_stats.other_tabs_sharing_processes == 1)
+        setToolTip("* CPU and memory are for processes this tab shares with 1 other tab.");
+    else
+        setToolTip(QString("* CPU and memory are for processes this tab shares with %1 other tabs.").arg(m_stats.other_tabs_sharing_processes));
     update();
 }
 
@@ -48,6 +63,7 @@ QStringList PerformanceMonitorWidget::text_segments() const
     return {
         m_stats.cpu_percent.has_value() ? QString("%1%").arg(*m_stats.cpu_percent, 0, 'f', 0) : QString("—"),
         m_stats.memory_bytes.has_value() ? qstring_from_ak_string(WebView::format_performance_bytes(*m_stats.memory_bytes)) : QString("—"),
+        m_stats.peak_memory_bytes.has_value() ? qstring_from_ak_string(WebView::format_performance_bytes(*m_stats.peak_memory_bytes)) : QString("—"),
         QString("%1/s").arg(qstring_from_ak_string(WebView::format_performance_bytes(m_stats.download_bytes_per_second))),
         QString("%1/s").arg(qstring_from_ak_string(WebView::format_performance_bytes(m_stats.upload_bytes_per_second))),
         m_stats.frames_per_second.has_value() ? QString("%1").arg(*m_stats.frames_per_second, 0, 'f', 0) : QString("—"),
@@ -65,28 +81,32 @@ void PerformanceMonitorWidget::paintEvent(QPaintEvent*)
     auto x = text_start;
     QString accessible_text;
     auto segments = text_segments();
-    Array<QColor, 5> colors { neutral, neutral, QColor(40, 135, 220), QColor(210, 130, 35), neutral };
+    auto dark = ChromeStyle::is_dark(palette());
+    Array<QColor, 6> colors { neutral, neutral, neutral, QColor(dark ? BrandColors::SlateBlue100 : BrandColors::SlateBlue900), QColor(dark ? BrandColors::Violet50 : BrandColors::Violet900), neutral };
     for (size_t i = 0; i < s_labels.size(); ++i) {
-        QString label = s_labels[i];
-        auto label_width = fontMetrics().horizontalAdvance(label);
+        QString label = m_stats.other_tabs_sharing_processes > 0 ? s_shared_labels[i] : s_labels[i];
+        auto label_width = this->label_width(i);
         auto value_width = fontMetrics().horizontalAdvance(s_value_templates[i]);
-        painter.setPen(i == 2 || i == 3 ? colors[i] : label_color);
+        painter.setPen(i == 3 || i == 4 ? colors[i] : label_color);
         painter.drawText(QRect(x, 0, label_width, height()), Qt::AlignVCenter | Qt::AlignLeft, label);
         painter.setPen(colors[i]);
         painter.save();
         painter.translate(x + label_width, 0);
         auto actual_width = fontMetrics().horizontalAdvance(segments[i]);
-        // NB: Very large counters fit inside their column without moving neighboring metrics.
+        // NB: Values sit against the end of their column, as numbers in a table do, so the gaps between metrics stay
+        //     even and nothing moves as values change. Very large counters fit inside their column.
         if (actual_width > value_width) {
             painter.scale(static_cast<double>(value_width) / actual_width, 1);
-            painter.drawText(QRect(0, 0, actual_width, height()), Qt::AlignVCenter | Qt::AlignLeft, segments[i]);
+            painter.drawText(QRect(0, 0, actual_width, height()), Qt::AlignVCenter | Qt::AlignRight, segments[i]);
         } else {
-            painter.drawText(QRect(0, 0, value_width, height()), Qt::AlignVCenter | Qt::AlignLeft, segments[i]);
+            painter.drawText(QRect(0, 0, value_width, height()), Qt::AlignVCenter | Qt::AlignRight, segments[i]);
         }
         painter.restore();
         x += label_width + value_width + metric_spacing;
         accessible_text += label + segments[i] + ' ';
     }
+    if (!toolTip().isEmpty())
+        accessible_text += toolTip();
     setAccessibleName(accessible_text);
     if (m_stats.cpu_history.size() < 2)
         return;

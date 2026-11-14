@@ -107,14 +107,6 @@ async function runAsyncLayoutTreeFullRebuildComparisonCases(cases) {
     );
 }
 
-function layoutTreeIdentityTransition(before, after) {
-    if (before === 0 && after === 0) return "ABSENT";
-    if (before === 0) return "CREATED";
-    if (after === 0) return "REMOVED";
-    if (before === after) return "PRESERVED";
-    return "RECREATED";
-}
-
 function runLayoutTreeInvalidationScopeCases(cases) {
     const fixture = document.getElementById("fixture");
     const results = [];
@@ -125,40 +117,29 @@ function runLayoutTreeInvalidationScopeCases(cases) {
         fixture.removeAttribute("style");
 
         const { mutate, trackedNodes } = case_.setup(fixture);
-        document.body.offsetHeight;
-        const identitiesBefore = trackedNodes.map(({ node }) => internals.layoutNodeIdentity(node));
-        const buildsBefore = internals.layoutTreeBuildStats().builds;
-
-        mutate();
-        document.body.offsetHeight;
-        const identitiesAfter = trackedNodes.map(({ node }) => internals.layoutNodeIdentity(node));
-        const stats = internals.layoutTreeBuildStats();
-        const didBuildLayoutTree = stats.builds !== buildsBefore;
+        for (const { label, node } of trackedNodes) {
+            if (!node.id) node.id = label.replace(/\W+/g, "-");
+        }
+        const work = layoutTreeBuildWork(mutate, { tracked: trackedNodes.map(({ node }) => node) });
+        const transitions = work.transitions();
         const comparison = internals.compareLayoutTreeWithFullRebuild();
         if (!comparison.matches) ++mismatchCount;
 
+        let build = "no layout tree build";
+        if (work.rebuiltWholeTree()) build = "rebuilt the whole tree";
+        else if (work.builds())
+            build = `rebuilt [${work.rebuiltRoots().join(", ")}]${work.escaped() ? ", escaped" : ""}`;
         results.push({
             name: case_.name,
-            identities: trackedNodes.map(({ label }, index) => ({
-                label,
-                transition: layoutTreeIdentityTransition(identitiesBefore[index], identitiesAfter[index]),
-            })),
-            didBuildLayoutTree,
-            rebuiltSubtreeRoots: stats.lastBuildRebuiltSubtreeRoots,
-            escapedRebuildRoots: stats.lastBuildEscapedRebuildRoots,
+            identities: trackedNodes.map(({ label }, index) => ({ label, transition: transitions[index] })),
+            build,
             matches: comparison.matches,
         });
     }
 
     for (const result of results) {
         for (const identity of result.identities) println(`${identity.transition}: ${result.name} | ${identity.label}`);
-        if (result.didBuildLayoutTree) {
-            println(
-                `STATS: ${result.name} | rebuilt subtree roots=${result.rebuiltSubtreeRoots}, escaped=${result.escapedRebuildRoots}`
-            );
-        } else {
-            println(`STATS: ${result.name} | no layout tree build`);
-        }
+        println(`STATS: ${result.name} | ${result.build}`);
         println(`${result.matches ? "PASS" : "FAIL"}: ${result.name} | incremental tree matches full rebuild`);
     }
     println(`${cases.length} cases; ${cases.length - mismatchCount} matched; ${mismatchCount} mismatched`);
@@ -1406,6 +1387,36 @@ function firstLetterPseudoElementCases() {
             },
         });
     }
+    cases.push({
+        name: "::first-letter text data change under display: contents",
+        setup(fixture) {
+            const style = document.createElement("style");
+            style.textContent = "#first-letter-target::first-letter { color: red; }";
+            const target = document.createElement("div");
+            target.id = "first-letter-target";
+            const wrapper = document.createElement("span");
+            wrapper.style.display = "contents";
+            wrapper.textContent = "Hello";
+            target.append(wrapper);
+            fixture.append(style, target);
+            return () => {
+                wrapper.firstChild.data = "Hi";
+            };
+        },
+    });
+    cases.push({
+        name: "::first-letter slotted text data change",
+        setup(fixture) {
+            const host = document.createElement("div");
+            host.textContent = "Hello";
+            host.attachShadow({ mode: "open" }).innerHTML =
+                "<style>p::first-letter { color: red; }</style><p><slot></slot></p>";
+            fixture.append(host);
+            return () => {
+                host.firstChild.data = "World";
+            };
+        },
+    });
     return cases;
 }
 

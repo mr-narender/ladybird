@@ -1,0 +1,41 @@
+$7604b252 strict-global-assignment.js:1:1
+  Registers: 8
+  Blocks:    7
+  Constants:
+    [0] = Undefined
+    [1] = String("use strict")
+    [2] = Int32(0)
+    [3] = Null
+
+block0:
+  [   0] Enter
+  [   1] Mov dst:reg5, src:Undefined
+  [   4] Mov dst:reg5, src:String("use strict")
+  [   7] ResolveGlobalBinding dst:reg6, `counter`
+  [   d] JumpIf condition:reg6, true_target:block1, false_target:block2
+
+block1:
+  [  17] SetGlobal `counter`, src:Int32(0)
+  [  1d] Jump target:block3
+
+block2:
+  [  22] SetResolvedBinding environment:Null, `counter`, src:Int32(0)
+  [  27] Jump target:block3
+
+block3:
+  [  2c] ResolveGlobalBinding dst:reg6, `counter`
+  [  32] GetGlobal value_feedback:0, dst:reg7, `counter`
+  [  3a] AddRhsInt32 arith_feedback:0, dst:reg7, lhs:reg7, rhs:1
+  [  43] JumpIf condition:reg6, true_target:block4, false_target:block5
+
+block4:
+  [  4d] SetGlobal `counter`, src:reg7
+  [  53] Jump target:block6
+
+block5:
+  [  58] SetResolvedBinding environment:Null, `counter`, src:reg7
+  [  5d] Jump target:block6
+
+block6:
+  [  62] Mov dst:reg5, src:reg7
+  [  65] End value:reg5

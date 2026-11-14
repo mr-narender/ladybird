@@ -23,20 +23,19 @@ NonnullRefPtr<CSS::StyleSheetState> parse_css_stylesheet(CSS::Parser::ParsingPar
 NonnullRefPtr<CSS::StyleSheetState> parse_css_stylesheet(CSS::Parser::ParsingParams const& context, Utf16View css, Optional<::URL::URL> location, CSS::RustMediaList media_list)
 {
     if (css.is_empty()) {
-        auto style_sheet = CSS::StyleSheetState::create(CSS::RustRuleList {}, nullptr, move(media_list), location);
-        style_sheet->set_source_text({});
-        return style_sheet;
+        return CSS::StyleSheetState::create(CSS::RustRuleList {}, nullptr, move(media_list), location);
     }
-    auto style_sheet = CSS::Parser::Parser { context }.parse_as_css_stylesheet(css, location, move(media_list));
-    style_sheet->set_source_text(Utf16String::from_utf16(css));
-    return style_sheet;
+    return CSS::Parser::Parser { context }.parse_as_css_stylesheet(css, location, move(media_list));
 }
 
-CSS::RustDeclarationBlock parse_css_property_declaration_block(CSS::Parser::ParsingParams const& context, Utf16View css)
+CSS::RustDeclarationBlock parse_css_property_declaration_block(CSS::Parser::ParsingParams const& context, Utf16View css, bool* parsed_cleanly)
 {
-    if (css.is_empty())
+    if (css.is_empty()) {
+        if (parsed_cleanly)
+            *parsed_cleanly = true;
         return { {}, {} };
-    return CSS::Parser::Parser { context }.parse_as_property_declaration_block(css);
+    }
+    return CSS::Parser::Parser { context }.parse_as_property_declaration_block(css, parsed_cleanly);
 }
 
 CSS::RustDescriptorBlock parse_css_descriptor_declaration_block(CSS::Parser::ParsingParams const& parsing_params, CSS::AtRuleID at_rule_id, Utf16View css)
@@ -91,9 +90,9 @@ Optional<CSS::SelectorList> parse_selector(CSS::Parser::ParsingParams const& con
     return CSS::Parser::Parser { context }.parse_as_selector(selector_text);
 }
 
-Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const& context, Utf16View selector_text)
+Optional<CSS::Selector::PseudoElementSelector> parse_pseudo_element_selector(CSS::Parser::ParsingParams const& context, Utf16View selector_text, CSS::Parser::PseudoElementParsingMode mode)
 {
-    return CSS::Parser::Parser { context }.parse_as_pseudo_element_selector(selector_text);
+    return CSS::Parser::Parser { context }.parse_as_pseudo_element_selector(selector_text, mode);
 }
 
 Optional<CSS::RustQueryHandle> parse_css_supports(CSS::Parser::ParsingParams const& context, Utf16View string)
@@ -171,7 +170,7 @@ ErrorOr<Utf16String> css_decode_bytes(Optional<StringView> const& environment_en
         return Error::from_string_literal("No Decoder found");
     }
     // 2. Decode stylesheet’s stream of bytes with fallback encoding fallback, and return the result.
-    return TextCodec::convert_input_to_utf16_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, encoded_string);
+    return TextCodec::decode_to_utf16(encoded_string, *decoder);
 }
 
 bool is_valid_animation_name_custom_ident(Utf16View ident)

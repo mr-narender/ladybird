@@ -11,7 +11,6 @@
 #include <LibGfx/Matrix.h>
 #include <LibGfx/Vector3.h>
 #include <LibGfx/Vector4.h>
-#include <LibIPC/Forward.h>
 
 namespace Gfx {
 
@@ -26,17 +25,6 @@ constexpr static Vector4<T> operator*(Matrix4x4<T> const& m, Vector4<T> const& v
         v.x() * m[1, 0] + v.y() * m[1, 1] + v.z() * m[1, 2] + v.w() * m[1, 3],
         v.x() * m[2, 0] + v.y() * m[2, 1] + v.z() * m[2, 2] + v.w() * m[2, 3],
         v.x() * m[3, 0] + v.y() * m[3, 1] + v.z() * m[3, 2] + v.w() * m[3, 3]);
-}
-
-// FIXME: this is a specific Matrix4x4 * Vector3 interaction that implies W=1; maybe move this out of LibGfx
-//        or replace a Matrix4x4 * Vector4 operation?
-template<typename T>
-constexpr static Vector3<T> transform_point(Matrix4x4<T> const& m, Vector3<T> const& p)
-{
-    return Vector3<T>(
-        p.x() * m[0, 0] + p.y() * m[0, 1] + p.z() * m[0, 2] + m[0, 3],
-        p.x() * m[1, 0] + p.y() * m[1, 1] + p.z() * m[1, 2] + m[1, 3],
-        p.x() * m[2, 0] + p.y() * m[2, 1] + p.z() * m[2, 2] + m[2, 3]);
 }
 
 template<typename T>
@@ -150,13 +138,3 @@ typedef Matrix4x4<double> DoubleMatrix4x4;
 using Gfx::DoubleMatrix4x4;
 using Gfx::FloatMatrix4x4;
 using Gfx::Matrix4x4;
-
-namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder&, Gfx::FloatMatrix4x4 const&);
-
-template<>
-ErrorOr<Gfx::FloatMatrix4x4> decode(Decoder&);
-
-}

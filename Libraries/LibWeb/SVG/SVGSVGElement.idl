@@ -18,12 +18,12 @@ interface SVGSVGElement : SVGGraphicsElement {
 
     [NewObject] SVGNumber createSVGNumber();
     [NewObject] SVGLength createSVGLength();
-    [FIXME, NewObject] SVGAngle createSVGAngle();
+    [NewObject] SVGAngle createSVGAngle();
     [NewObject] DOMPoint createSVGPoint();
     [NewObject] DOMMatrix createSVGMatrix();
     [NewObject] DOMRect createSVGRect();
     [NewObject] SVGTransform createSVGTransform();
-    [FIXME, NewObject] SVGTransform createSVGTransformFromMatrix(optional DOMMatrix2DInit matrix = {});
+    [NewObject] SVGTransform createSVGTransformFromMatrix(optional DOMMatrix2DInit matrix = {});
 
     Element? getElementById(DOMString elementId);
 
@@ -36,3 +36,12 @@ interface SVGSVGElement : SVGGraphicsElement {
 };
 
 SVGSVGElement includes SVGFitToViewBox;
+
+// https://svgwg.org/specs/animations/#InterfaceSVGSVGElement
+partial interface SVGSVGElement {
+    undefined pauseAnimations();
+    undefined unpauseAnimations();
+    boolean animationsPaused();
+    float getCurrentTime();
+    undefined setCurrentTime(float seconds);
+};

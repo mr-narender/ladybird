@@ -6,12 +6,9 @@
 
 //! Counters for StyleEngine's own decisions.
 //!
-//! The engine chooses between selective and batch plans, between resident state and cold
-//! evaluation, and between narrow and widened impact regions. Those choices are only defensible if
-//! they are visible, so each one bumps a counter.
-//!
-//! Counters are per document and read from one thread, so they are plain integers rather than
-//! atomics.
+//! Each decision is only defensible if it is visible, so each one bumps a counter.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! define_counters {
     ($($variant:ident => $name:literal,)+) => {
@@ -28,6 +25,7 @@ macro_rules! define_counters {
 
         impl Counter {
             #[must_use]
+            #[cfg(test)]
             pub fn name(self) -> &'static str {
                 COUNTER_NAMES[self as usize]
             }
@@ -44,315 +42,66 @@ define_counters! {
     LocalFeatureDeltas => "localFeatureDeltas",
     StateDeltas => "stateDeltas",
     ElementDeclarationDeltas => "elementDeclarationDeltas",
-    ElementDeclarationRepairMatches => "elementDeclarationRepairMatches",
     ProgramDeltas => "programDeltas",
     CascadeTopologyDeltas => "cascadeTopologyDeltas",
     EnvironmentDeltas => "environmentDeltas",
-    InitialBulkLoads => "initialBulkLoads",
-    InitialBulkTreeRows => "initialBulkTreeRows",
-    InitialBulkMatchLoads => "initialBulkMatchLoads",
-    InitialBulkMatchRows => "initialBulkMatchRows",
-    // Normalization journal. Raw mutation count is not the default work multiplier, and the gap
-    // between these two numbers is the evidence for that.
+    // Raw input records against the unique keys transactions take. Raw mutation count is not the
+    // default work multiplier, and the gap between these two numbers is the evidence for that.
     RawMutationRecords => "rawMutationRecords",
     NormalizedUniqueKeys => "normalizedUniqueKeys",
-    JournalCancellations => "journalCancellations",
-    CoarsenedScopeMarkers => "coarsenedScopeMarkers",
     AtomSweeps => "atomSweeps",
-    AtomSweepsDeferredForActiveTraversal => "atomSweepsDeferredForActiveTraversal",
     AtomSweepRootSlotsVisited => "atomSweepRootSlotsVisited",
-    AtomSweepPinReleasesSkipped => "atomSweepPinReleasesSkipped",
     StyleAtomsReclaimed => "styleAtomsReclaimed",
     LanguageTextsPublished => "languageTextsPublished",
     CustomPropertyNamesPublished => "customPropertyNamesPublished",
+    SlotAssignedNodeListsPublished => "slotAssignedNodeListsPublished",
 
     // Exclusive transaction intervals. Fused stages retain one name until execution splits.
     TransactionMicroseconds => "transactionMicroseconds",
     CommitMicroseconds => "commitMicroseconds",
-    RoutingPlanningMicroseconds => "routingPlanningMicroseconds",
-    PrepareMicroseconds => "prepareMicroseconds",
-    MatchingCascadeMicroseconds => "matchingCascadeMicroseconds",
-    ComputationPublicationMicroseconds => "computationPublicationMicroseconds",
-    EmitMicroseconds => "emitMicroseconds",
     TransactionRemainderMicroseconds => "transactionRemainderMicroseconds",
-    // The passes inside those phases, clocked only when `LIBWEB_STYLE_PASS_CLOCKS` is set. The
-    // phase clocks say which quarter of the transaction a millisecond is in; these say which
-    // pass, which is what decides whether a pass is per-node work or bookkeeping around it.
-    RoutingSetupMicroseconds => "routingSetupMicroseconds",
-    RoutingInputsMicroseconds => "routingInputsMicroseconds",
-    SequenceRoutingMicroseconds => "sequenceRoutingMicroseconds",
-    PendingRouteFlushMicroseconds => "pendingRouteFlushMicroseconds",
-    BatchCompilationMicroseconds => "batchCompilationMicroseconds",
-    WinnerVersionAdvanceMicroseconds => "winnerVersionAdvanceMicroseconds",
-    RetainedAnswerPatchLoopMicroseconds => "retainedAnswerPatchLoopMicroseconds",
-    CompletionBatchBeginMicroseconds => "completionBatchBeginMicroseconds",
-    CompletionBatchMaterializeMicroseconds => "completionBatchMaterializeMicroseconds",
-    CompletionBatchRelationMicroseconds => "completionBatchRelationMicroseconds",
-    CompletionPassMicroseconds => "completionPassMicroseconds",
-    ComputationLoopMicroseconds => "computationLoopMicroseconds",
+
     // Physical work, including drives whose output is later abandoned.
-    RootFontInputsPrepared => "rootFontInputsPrepared",
-    RootFontInputsUnprovenFallbacks => "rootFontInputsUnprovenFallbacks",
     FontRefillRounds => "fontRefillRounds",
     FontResolutionRequests => "fontResolutionRequests",
-    FontRefillResumedDrives => "fontRefillResumedDrives",
-    FontRefillPreservedLonghands => "fontRefillPreservedLonghands",
     FontRefillBlockedDepth => "fontRefillBlockedDepth",
     EngineFullDrivesStarted => "engineFullDrivesStarted",
-    EnginePartialDrivesStarted => "enginePartialDrivesStarted",
     EnginePhysicalLonghandEvaluations => "enginePhysicalLonghandEvaluations",
-    EnginePartialLonghandEvaluations => "enginePartialLonghandEvaluations",
-    EngineDriveCopiedTableSlots => "engineDriveCopiedTableSlots",
-    ReachedStyleNodes => "reachedStyleNodes",
 
     // Stylesheet program.
     StyleRulesCompiled => "styleRulesCompiled",
-    ExactSelectorEntries => "exactSelectorEntries",
-    // Why an entry had to be conservative, so the remaining gap is a list rather than a feeling.
-    UnsupportedPseudoClass => "unsupportedPseudoClass",
-    UnsupportedUninternedName => "unsupportedUninternedName",
-    UnsupportedMalformed => "unsupportedMalformed",
-    UnsupportedCombinator => "unsupportedCombinator",
-    UnsupportedPseudoElement => "unsupportedPseudoElement",
 
-    // Executed selector primitives, by category.
-    LocalFeatureTests => "localFeatureTests",
-    StateTests => "stateTests",
-    CombinatorSteps => "combinatorSteps",
-    StructuralTests => "structuralTests",
-    RelationalTests => "relationalTests",
-
-    // DOM selector queries. Candidate rows are the elements admitted by the query plan, while
-    // evaluations are the rows that reached the exact matcher after selector-list deduplication.
-    SelectorQueryCandidateRows => "selectorQueryCandidateRows",
-    SelectorQueryEvaluations => "selectorQueryEvaluations",
-    SelectorQueryAttributeValuePlanHits => "selectorQueryAttributeValuePlanHits",
-    SelectorQueryAttributeValueCatalogScans => "selectorQueryAttributeValueCatalogScans",
-
-    // Candidate enumeration and cold evaluation.
-    ColdMatchingBatchMissingRows => "coldMatchingBatchMissingRows",
-    ColdMatchingBatchRows => "coldMatchingBatchRows",
-    PreparedMatchingBatchCompletenessRowsInspected => "preparedMatchingBatchCompletenessRowsInspected",
-    PreparedMatchingBatchRowsCloned => "preparedMatchingBatchRowsCloned",
-    ColdNodesEvaluated => "coldNodesEvaluated",
-    CandidateChecks => "candidateChecks",
-    RuleMatchesEmitted => "ruleMatchesEmitted",
-    PrefixCompoundsEvaluated => "prefixCompoundsEvaluated",
-    PrefixRelationUpdates => "prefixRelationUpdates",
-    PrefixRelationStops => "prefixRelationStops",
-    PrefixRelationCascadeStops => "prefixRelationCascadeStops",
-    PrefixRelationBuilds => "prefixRelationBuilds",
-    PrefixConvergencePasses => "prefixConvergencePasses",
-    PrefixConvergenceNodes => "prefixConvergenceNodes",
-    PrefixConvergenceStops => "prefixConvergenceStops",
-    PrefixConvergenceBypasses => "prefixConvergenceBypasses",
-    PrefixConvergenceUpqueries => "prefixConvergenceUpqueries",
-    PrefixDeadDeltaTransitions => "prefixDeadDeltaTransitions",
-    EngineComputedRecordDeltas => "engineComputedRecordDeltas",
-    EngineComputedRecordCohortHits => "engineComputedRecordCohortHits",
-    EngineComputedRecordSharedHits => "engineComputedRecordSharedHits",
-    EngineComputedRecordGateReaction => "engineComputedRecordGateReaction",
-    EngineComputedRecordGateDeclarations => "engineComputedRecordGateDeclarations",
-    EngineComputedRecordGateIncompleteAnswer => "engineComputedRecordGateIncompleteAnswer",
-    EngineComputedPseudoRecords => "engineComputedPseudoRecords",
-    EngineComputedRecordUnchangedWinners => "engineComputedRecordUnchangedWinners",
-    EngineComputedRecordsAbandoned => "engineComputedRecordsAbandoned",
-    RetryAfterAncestorCalls => "retryAfterAncestorCalls",
-    RetryAfterAncestorSettled => "retryAfterAncestorSettled",
-    RetryAfterAncestorPseudoAbandons => "retryAfterAncestorPseudoAbandons",
-    RetryAfterAncestorColdHits => "retryAfterAncestorColdHits",
-    RetryAfterAncestorMicroseconds => "retryAfterAncestorMicroseconds",
-    EngineComputedRecordBailPseudoStale => "engineComputedRecordBailPseudoStale",
-    EngineComputedRecordBailPseudoBackdrop => "engineComputedRecordBailPseudoBackdrop",
-    EngineComputedRecordBailPseudoMask => "engineComputedRecordBailPseudoMask",
-    EngineComputedRecordBailPseudoRow => "engineComputedRecordBailPseudoRow",
-    EngineComputedRecordBailPseudoFlip => "engineComputedRecordBailPseudoFlip",
-    EngineComputedRecordGateAncestors => "engineComputedRecordGateAncestors",
-    EngineComputedLonghandEvaluations => "engineComputedLonghandEvaluations",
-    EngineComputedRecordBailNoCascadeState => "engineComputedRecordBailNoCascadeState",
-    EngineComputedRecordBailStaleCascadeState => "engineComputedRecordBailStaleCascadeState",
-    EngineComputedRecordBailWinnerMissingNode => "engineComputedRecordBailWinnerMissingNode",
-    EngineComputedRecordBailWinnerStaleProgram => "engineComputedRecordBailWinnerStaleProgram",
-    EngineComputedRecordBailWinnerStalePriority => "engineComputedRecordBailWinnerStalePriority",
-    EngineComputedRecordBailUnchangedWinners => "engineComputedRecordBailUnchangedWinners",
-    EngineComputedRecordBailIncompleteWinners => "engineComputedRecordBailIncompleteWinners",
-    EngineComputedRecordBailRecord => "engineComputedRecordBailRecord",
-    EngineComputedRecordBailProperty => "engineComputedRecordBailProperty",
-    EngineComputedRecordBailWinner => "engineComputedRecordBailWinner",
-    EngineComputedRecordBailWinnerOperator => "engineComputedRecordBailWinnerOperator",
-    EngineComputedRecordBailWinnerSpelling => "engineComputedRecordBailWinnerSpelling",
-    EngineComputedRecordBailWinnerElement => "engineComputedRecordBailWinnerElement",
-    EngineComputedRecordBailWinnerAnimated => "engineComputedRecordBailWinnerAnimated",
-    EngineComputedRecordBailNoEnvironment => "engineComputedRecordBailNoEnvironment",
-    EngineComputedRecordBailCustomProperties => "engineComputedRecordBailCustomProperties",
-    EngineComputedRecordBailSubstitution => "engineComputedRecordBailSubstitution",
-    EngineComputedRecordSubstitutions => "engineComputedRecordSubstitutions",
-    EngineComputedRecordSubstitutionMemoHits => "engineComputedRecordSubstitutionMemoHits",
-    EngineCustomPropertyEnvironmentsResolved => "engineCustomPropertyEnvironmentsResolved",
-    EngineCustomPropertyEnvironmentMemoHits => "engineCustomPropertyEnvironmentMemoHits",
-    EngineCustomPropertyEnvironmentBails => "engineCustomPropertyEnvironmentBails",
-    EngineComputedRecordBailFontPhase => "engineComputedRecordBailFontPhase",
-    EngineComputedRecordBailRecordParent => "engineComputedRecordBailRecordParent",
-    EngineComputedRecordBailDrive => "engineComputedRecordBailDrive",
-    EngineComputedRecordBailValue => "engineComputedRecordBailValue",
-    EngineComputedRecordBailAssemble => "engineComputedRecordBailAssemble",
-    EngineComputedRecordBailRecordOverlay => "engineComputedRecordBailRecordOverlay",
-    EngineComputedRecordBailRecordTable => "engineComputedRecordBailRecordTable",
-    PrefixDeadDeltaBailMatched => "prefixDeadDeltaBailMatched",
-    PrefixDeadDeltaBailOwnAdditions => "prefixDeadDeltaBailOwnAdditions",
-    PrefixDeadDeltaBailEndpoints => "prefixDeadDeltaBailEndpoints",
-    PendingSelectorRoutes => "pendingSelectorRoutes",
-    PrefixEligibleRoutes => "prefixEligibleRoutes",
-    GroupedExactSelectorRoutes => "groupedExactSelectorRoutes",
-    PrefixTransitionCacheHits => "prefixTransitionCacheHits",
-    PrefixTransitionCacheMatchHits => "prefixTransitionCacheMatchHits",
-    PrefixTransitionCacheMatchMisses => "prefixTransitionCacheMatchMisses",
-    PrefixTransitionInputAsks => "prefixTransitionInputAsks",
-    PrefixTransitionInputsReady => "prefixTransitionInputsReady",
-    PrefixTransitionMemoHits => "prefixTransitionMemoHits",
-    PrefixTransitionMemoMisses => "prefixTransitionMemoMisses",
-    PrefixLocalFactIdentityHits => "prefixLocalFactIdentityHits",
-    PrefixLocalFactIdentityMisses => "prefixLocalFactIdentityMisses",
-    PrefixAnswerCacheHits => "prefixAnswerCacheHits",
-    PrefixAnswerCacheMisses => "prefixAnswerCacheMisses",
-    Tier3BenefitEvictions => "tier3BenefitEvictions",
-    Tier3RefusalRetainedMatchAnswerBytes => "tier3RefusalRetainedMatchAnswerBytes",
-    MatchAnswerSignatures => "matchAnswerSignatures",
-    MatchAnswerSignatureReuses => "matchAnswerSignatureReuses",
-    SelectorTruthSetMisses => "selectorTruthSetMisses",
-    SelectorTruthSetHits => "selectorTruthSetHits",
-    SelectorTruthSetRows => "selectorTruthSetRows",
-    SelectorTruthDerivedAnswerMisses => "selectorTruthDerivedAnswerMisses",
-    SelectorTruthDerivedAnswerHits => "selectorTruthDerivedAnswerHits",
-    RetainedMatchAnswerReuses => "retainedMatchAnswerReuses",
-    RetainedSelectorIncidenceBatchPrograms => "retainedSelectorIncidenceBatchPrograms",
-    RetainedSelectorIncidenceBatchRows => "retainedSelectorIncidenceBatchRows",
-    RetainedSelectorIncidenceBatchMissingRows => "retainedSelectorIncidenceBatchMissingRows",
-    PublishedMatchAnswerConsumptions => "publishedMatchAnswerConsumptions",
-    PublishedMatchAnswerIdentityReads => "publishedMatchAnswerIdentityReads",
-    PublishedMatchAnswerRecords => "publishedMatchAnswerRecords",
-    PublishedMatchAnswerSharedPayloads => "publishedMatchAnswerSharedPayloads",
-    PublishedMatchAnswerSharedPayloadReuses => "publishedMatchAnswerSharedPayloadReuses",
-    PublishedMatchAnswerContextualPayloads => "publishedMatchAnswerContextualPayloads",
-    PublishedMatchAnswerIdentityRepairs => "publishedMatchAnswerIdentityRepairs",
-    PublishedMatchAnswerIdentityRepairStops => "publishedMatchAnswerIdentityRepairStops",
-    PublishedMatchAnswerRetainedIdentityComparisons => "publishedMatchAnswerRetainedIdentityComparisons",
-    PublishedMatchAnswerRetainedIdentityMatches => "publishedMatchAnswerRetainedIdentityMatches",
-    PublishedExactCascadeStops => "publishedExactCascadeStops",
-    PublishedMatchAnswerClosureCompletions => "publishedMatchAnswerClosureCompletions",
-    PublishedClosureRetainedIdentityStops => "publishedClosureRetainedIdentityStops",
-    MatchElementCallsDuringPublishedStyleTransaction => "matchElementCallsDuringPublishedStyleTransaction",
-    RetainedMatchAnswerRefusals => "retainedMatchAnswerRefusals",
-    RetainedMatchAnswerPatches => "retainedMatchAnswerPatches",
-    RetainedMatchAnswerDeltaPatches => "retainedMatchAnswerDeltaPatches",
-    RetainedMatchAnswerDeltaMemoHits => "retainedMatchAnswerDeltaMemoHits",
-    RetainedMatchAnswerDeltaEntries => "retainedMatchAnswerDeltaEntries",
-    RetainedMatchAnswerFilteredPatches => "retainedMatchAnswerFilteredPatches",
-    RetainedPatchesUnattributed => "retainedPatchesUnattributed",
-    RetainedPatchesPoisoned => "retainedPatchesPoisoned",
-    RetainedPatchesCoarseCovered => "retainedPatchesCoarseCovered",
-    RetainedMatchAnswerPatchMisses => "retainedMatchAnswerPatchMisses",
-    RetainedMatchAnswerPatchStops => "retainedMatchAnswerPatchStops",
-    // Consolidated semantic reactions and typed exact repair asks. These count the rows which
-    // cross operator boundaries, not the routes or evaluator work which produced them.
-    SelectorTruthAdditions => "selectorTruthAdditions",
-    SelectorTruthRemovals => "selectorTruthRemovals",
-    SelectorTruthCancellations => "selectorTruthCancellations",
-    SelectorTruthRefreshes => "selectorTruthRefreshes",
-    SelectorTruthRepairUpqueries => "selectorTruthRepairUpqueries",
-    SelectorTruthRepairAdditions => "selectorTruthRepairAdditions",
-    SelectorTruthRepairRemovals => "selectorTruthRepairRemovals",
-    MatchAnswerChanges => "matchAnswerChanges",
-    MatchAnswerUpqueries => "matchAnswerUpqueries",
-    CascadeMatchesBeforeCompaction => "cascadeMatchesBeforeCompaction",
-    CascadeNodeHandlesPublished => "cascadeNodeHandlesPublished",
-    CascadeStatesInterned => "cascadeStatesInterned",
-    CascadeWinnerGroupsInterned => "cascadeWinnerGroupsInterned",
-    CascadeWinnerEntriesInterned => "cascadeWinnerEntriesInterned",
-    CascadeWinnerDeltaProperties => "cascadeWinnerDeltaProperties",
-    CascadeWinnerDeltaStops => "cascadeWinnerDeltaStops",
-    ComputedWinnerDeltaPropertiesConsumed => "computedWinnerDeltaPropertiesConsumed",
-    ComputedOutputGroupsCanonicalized => "computedOutputGroupsCanonicalized",
-    ComputedWinnerPropagationStops => "computedWinnerPropagationStops",
-    SpecifiedValuesReused => "specifiedValuesReused",
-    ComputedGroupNodeHandlesPublished => "computedGroupNodeHandlesPublished",
-    ComputedGroupsReused => "computedGroupsReused",
-    // The identities each catalog mints. Unlike the reuse counters above, which credit the
-    // publication that happened to intern an identity first, these count the identities a
-    // run creates, which is a property of the content and not of the execution order.
-    ComputedGroupIdentitiesMinted => "computedGroupIdentitiesMinted",
-    ComputedGroupSetIdentitiesMinted => "computedGroupSetIdentitiesMinted",
-    InheritedGroupSetIdentitiesMinted => "inheritedGroupSetIdentitiesMinted",
-    StyleRecordIdentitiesMinted => "styleRecordIdentitiesMinted",
-    ComputedGroupsRetained => "computedGroupsRetained",
-    ComputedGroupsReachable => "computedGroupsReachable",
-    ComputedGroupSetsReused => "computedGroupSetsReused",
-    InheritedGroupNodeHandlesPublished => "inheritedGroupNodeHandlesPublished",
-    InheritedGroupSetsReused => "inheritedGroupSetsReused",
-    CustomPropertyEnvironmentNodeHandlesPublished => "customPropertyEnvironmentNodeHandlesPublished",
-    CustomPropertyEnvironmentsReused => "customPropertyEnvironmentsReused",
-    ComputedFixedMetadataNodeHandlesPublished => "computedFixedMetadataNodeHandlesPublished",
-    ComputedFixedMetadataInterned => "computedFixedMetadataInterned",
-    ComputedFixedMetadataReused => "computedFixedMetadataReused",
+    // Computation and publication.
+    // The user agent declaration blocks the document's rules declare: those the process interned
+    // for this document, which no document of the process interned before, and those it shared.
+    // The declaration blocks of the document's own sheets its rules declare, which the process
+    // interns as it does the user agent's: those it interned for this document, and those it
+    // shared with a document reaching the same blocks before.
+    SheetDeclarationsInterned => "sheetDeclarationsInterned",
+    SheetDeclarationsShared => "sheetDeclarationsShared",
     StyleRecordNodeHandlesPublished => "styleRecordNodeHandlesPublished",
-    StyleRecordsInterned => "styleRecordsInterned",
-    StyleRecordsReused => "styleRecordsReused",
-    StyleRecordsReaffirmed => "styleRecordsReaffirmed",
     AnimationOverlaySlotsAllocated => "animationOverlaySlotsAllocated",
     AnimationOverlaySlotsReleased => "animationOverlaySlotsReleased",
     AnimationOverlayRecordsUpdated => "animationOverlayRecordsUpdated",
     LiveAnimationOverlayRecords => "liveAnimationOverlayRecords",
-    ComputedPseudoAssignmentsPublished => "computedPseudoAssignmentsPublished",
+    // Read when counters are read: the reclaimed overlay records a published frame's lease still keeps.
+    RetiredAnimationOverlayRecords => "retiredAnimationOverlayRecords",
     ComputedPseudoAssignmentsRemoved => "computedPseudoAssignmentsRemoved",
-    ProgramCandidatesRejectedByCascade => "programCandidatesRejectedByCascade",
-    SelectorRoutesRejectedByCascade => "selectorRoutesRejectedByCascade",
-    CascadeCandidatesRejectedByWinner => "cascadeCandidatesRejectedByWinner",
 
-    // Impact regions and plan selection.
-    RemainingPostingBuilds => "remainingPostingBuilds",
-    RemainingPostingReuses => "remainingPostingReuses",
-    RemainingPostingRowsCopied => "remainingPostingRowsCopied",
-    RemainingPostingRowsInspected => "remainingPostingRowsInspected",
-    // How much logical membership the compiled exact-region representation covers, and how much
-    // interval storage it needs to do so.
-    ExactRegionBatchIntervals => "exactRegionBatchIntervals",
-    ExactRegionBatchNodes => "exactRegionBatchNodes",
-    RoutedEntryPoints => "routedEntryPoints",
-    OriginTruthRoutesFired => "originTruthRoutesFired",
-    OriginTruthRoutesSkipped => "originTruthRoutesSkipped",
+    // Input intake.
     ArrivingNodeFactsFolded => "arrivingNodeFactsFolded",
-    SheetChangeCandidatesRejected => "sheetChangeCandidatesRejected",
-    RelationalAnchorsConsidered => "relationalAnchorsConsidered",
-    RelationalAnchorsSkippedByWitness => "relationalAnchorsSkippedByWitness",
-    InvalidatedStyleNodes => "invalidatedStyleNodes",
-    PlannedNodesWithDirectAction => "plannedNodesWithDirectAction",
-    PlannedNodesWithSignedDelta => "plannedNodesWithSignedDelta",
-    PlannedNodesWithOutputChange => "plannedNodesWithOutputChange",
-    PlannedNodesWithUpquery => "plannedNodesWithUpquery",
-    PlannedNodesUnattributed => "plannedNodesUnattributed",
 
     // Style node identity lifecycle.
     StyleNodesAllocated => "styleNodesAllocated",
-    DocumentWidenings => "documentWidenings",
-    TransitionProofConfirmed => "transitionProofConfirmed",
-    TransitionProofNoPreviousState => "transitionProofNoPreviousState",
-    TransitionProofGenerationGap => "transitionProofGenerationGap",
-    TransitionProofMissingAnswer => "transitionProofMissingAnswer",
-    TransitionProofElementDeclarations => "transitionProofElementDeclarations",
-    TransitionProofRemoval => "transitionProofRemoval",
-    TransitionProofUnsafeRule => "transitionProofUnsafeRule",
-    TransitionProofPseudoOrScope => "transitionProofPseudoOrScope",
-    TransitionProofElementWinnerGap => "transitionProofElementWinnerGap",
-    TransitionProofOperatorOrContinuation => "transitionProofOperatorOrContinuation",
-    TransitionProofWinnerGap => "transitionProofWinnerGap",
-    TransitionProofPriorityWin => "transitionProofPriorityWin",
-    SharedStyleRecordHits => "sharedStyleRecordHits",
 }
 
 /// The counter set for one document.
-#[derive(Clone, Debug)]
+///
+/// NB: Counters are bumped through shared references from wherever the engine runs, so each is an atomic. Only one
+///     thread runs the engine at a time, so a relaxed load and store is enough, and costs what a plain add does.
+#[derive(Debug)]
 pub struct Counters {
-    values: [u64; COUNTER_COUNT],
+    values: [AtomicU64; COUNTER_COUNT],
 }
 
 impl Default for Counters {
@@ -361,33 +110,52 @@ impl Default for Counters {
     }
 }
 
+impl Clone for Counters {
+    fn clone(&self) -> Self {
+        let clone = Self::new();
+        clone.restore(self);
+        clone
+    }
+}
+
 impl Counters {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            values: [0; COUNTER_COUNT],
+            values: [const { AtomicU64::new(0) }; COUNTER_COUNT],
         }
     }
 
-    pub fn bump(&mut self, counter: Counter) {
-        self.values[counter as usize] += 1;
+    pub fn bump(&self, counter: Counter) {
+        self.add(counter, 1);
     }
 
-    pub fn add(&mut self, counter: Counter, amount: u64) {
-        self.values[counter as usize] += amount;
+    pub fn add(&self, counter: Counter, amount: u64) {
+        let value = &self.values[counter as usize];
+        value.store(value.load(Ordering::Relaxed) + amount, Ordering::Relaxed);
     }
 
-    pub fn set(&mut self, counter: Counter, value: u64) {
-        self.values[counter as usize] = value;
+    pub fn set(&self, counter: Counter, value: u64) {
+        self.values[counter as usize].store(value, Ordering::Relaxed);
     }
 
     #[must_use]
     pub fn get(&self, counter: Counter) -> u64 {
-        self.values[counter as usize]
+        self.values[counter as usize].load(Ordering::Relaxed)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> {
-        COUNTER_NAMES.iter().copied().zip(self.values)
+    /// Puts every counter back to what `other` holds.
+    pub fn restore(&self, other: &Self) {
+        for (value, other) in self.values.iter().zip(&other.values) {
+            value.store(other.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        COUNTER_NAMES
+            .iter()
+            .copied()
+            .zip(self.values.iter().map(|value| value.load(Ordering::Relaxed)))
     }
 }
 
@@ -397,7 +165,7 @@ mod tests {
 
     #[test]
     fn peaks_and_totals_accumulate_differently() {
-        let mut counters = Counters::new();
+        let counters = Counters::new();
         counters.add(Counter::RawMutationRecords, 3);
         counters.add(Counter::RawMutationRecords, 4);
         assert_eq!(counters.get(Counter::RawMutationRecords), 7);

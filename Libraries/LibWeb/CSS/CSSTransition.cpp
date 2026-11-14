@@ -6,21 +6,43 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
+#include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/CSSStyleDeclaration.h>
 #include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/Event.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/Layout/NodeArena.h>
+#include <LibWeb/StyleEngineRustFFI.h>
+#include <LibWeb/StyleValueRustFFI.h>
 
 namespace Web::CSS {
 
+extern "C" {
+
+// Defined in Bindings/Rust/src/css/exports.rs.
+void* web_transition_event_create(JSVM*, void* realm, FlatPtr event_name, FlatPtr name, double elapsed_time, FlatPtr pseudo_element, void* animation);
+}
+
+GC::Ref<DOM::Event> CSSTransition::create_event(DOM::Document const& document, Utf16FlyString const& type, double elapsed_time, Utf16String pseudo_element)
+{
+    auto& realm = HTML::relevant_realm(document);
+    auto wrapper = Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, GC::Ref<CSSTransition> { *this });
+    auto* event = web_transition_event_create(JS::HostABI::vm_to_abi(realm.vm()), &realm, type.to_utf16_string().into_raw(), transition_property().to_utf16_string().into_raw(), elapsed_time, move(pseudo_element).into_raw(), JS::HostABI::object_to_abi(wrapper.ptr()));
+    return GC::Ref { *static_cast<DOM::Event*>(static_cast<GC::Cell*>(event)) };
+}
+
 GC_DEFINE_ALLOCATOR(CSSTransition);
 
-GC::Ref<CSSTransition> CSSTransition::start_a_transition(
+GC::Ref<CSSTransition> CSSTransition::start_a_provisional_transition(
     DOM::AbstractElement abstract_element,
-    PropertyID property_id,
+    PropertyNameAndID property,
     size_t transition_generation,
     double delay,
     double start_time,
@@ -29,15 +51,15 @@ GC::Ref<CSSTransition> CSSTransition::start_a_transition(
     NonnullRefPtr<StyleValue const> end_value,
     NonnullRefPtr<StyleValue const> reversing_adjusted_start_value,
     double reversing_shortening_factor,
-    Publication publication)
+    EasingFunction timing_function)
 {
     auto& environment = abstract_element.document().relevant_settings_object();
-    return GC::Heap::the().allocate<CSSTransition>(environment, abstract_element, property_id, transition_generation, delay, start_time, end_time, start_value, end_value, reversing_adjusted_start_value, reversing_shortening_factor, publication);
+    return GC::Heap::the().allocate<CSSTransition>(environment, abstract_element, move(property), transition_generation, delay, start_time, end_time, start_value, end_value, reversing_adjusted_start_value, reversing_shortening_factor, move(timing_function));
 }
 
 Utf16FlyString const& CSSTransition::transition_property() const
 {
-    return string_from_property_id(m_transition_property);
+    return m_transition_property.name();
 }
 
 Animations::AnimationClass CSSTransition::animation_class() const
@@ -90,7 +112,7 @@ int CSSTransition::class_specific_composite_order(GC::Ref<Animations::Animation>
 CSSTransition::CSSTransition(
     HTML::EnvironmentSettingsObject& environment,
     DOM::AbstractElement abstract_element,
-    PropertyID property_id,
+    PropertyNameAndID property,
     size_t transition_generation,
     double delay,
     double start_time,
@@ -99,9 +121,9 @@ CSSTransition::CSSTransition(
     NonnullRefPtr<StyleValue const> end_value,
     NonnullRefPtr<StyleValue const> reversing_adjusted_start_value,
     double reversing_shortening_factor,
-    Publication publication)
+    EasingFunction timing_function)
     : Animations::Animation(environment)
-    , m_transition_property(property_id)
+    , m_transition_property(move(property))
     , m_transition_generation(transition_generation)
     , m_start_time(start_time + delay)
     , m_end_time(end_time + delay)
@@ -110,7 +132,6 @@ CSSTransition::CSSTransition(
     , m_reversing_adjusted_start_value(move(reversing_adjusted_start_value))
     , m_reversing_shortening_factor(reversing_shortening_factor)
     , m_keyframe_effect(Animations::KeyframeEffect::create())
-    , m_is_provisional(publication == Publication::Provisional)
 {
     // FIXME:
     // Transitions generated using the markup defined in this specification are not added to the global animation list
@@ -132,14 +153,14 @@ CSSTransition::CSSTransition(
     // Timing properties may also be updated due to a style change. Any change to a CSS animation property that affects
     // timing requires rerunning the procedure to normalize specified timing.
     m_keyframe_effect->normalize_specified_timing();
-    m_keyframe_effect->set_timing_function(abstract_element.element().property_transition_attributes(abstract_element.pseudo_element(), property_id)->timing_function);
+    m_keyframe_effect->set_timing_function(move(timing_function));
 
     auto key_frame_set = adopt_ref(*new Animations::KeyframeEffect::KeyFrameSet);
     Animations::KeyframeEffect::KeyFrameSet::ResolvedKeyFrame initial_keyframe;
-    initial_keyframe.properties.set(PropertyNameAndID::from_id(property_id), RustStyleValueHandle::retained(m_start_value->rust_style_value_data()));
+    initial_keyframe.properties.set(m_transition_property, RustStyleValueHandle::retained(m_start_value->rust_style_value_data()));
 
     Animations::KeyframeEffect::KeyFrameSet::ResolvedKeyFrame final_keyframe;
-    final_keyframe.properties.set(PropertyNameAndID::from_id(property_id), RustStyleValueHandle::retained(m_end_value->rust_style_value_data()));
+    final_keyframe.properties.set(m_transition_property, RustStyleValueHandle::retained(m_end_value->rust_style_value_data()));
 
     key_frame_set->keyframes_by_key.insert(0, initial_keyframe);
     key_frame_set->keyframes_by_key.insert(100 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor, final_keyframe);
@@ -147,12 +168,7 @@ CSSTransition::CSSTransition(
     m_keyframe_effect->set_key_frame_set(key_frame_set);
     set_timeline(abstract_element.document().timeline());
     set_owning_element(abstract_element);
-    if (m_is_provisional) {
-        set_provisional_effect(m_keyframe_effect);
-    } else {
-        set_effect(m_keyframe_effect, Animations::Animation::ShouldInvalidate::No);
-        abstract_element.element().set_transition(abstract_element.pseudo_element(), m_transition_property, *this);
-    }
+    set_provisional_effect(m_keyframe_effect);
 
     HTML::TemporaryExecutionContext context(environment);
     play(Animations::Animation::ShouldInvalidate::No).release_value_but_fixme_should_propagate_errors();
@@ -178,11 +194,117 @@ void CSSTransition::discard_provisional_transition()
     m_is_provisional = false;
 }
 
+// The identity the style engine describes the effect of `transition` by, or 0.
+static u64 effect_identity(CSSTransition const& transition)
+{
+    auto effect = transition.effect();
+    if (!effect || !effect->is_keyframe_effect())
+        return 0;
+    return static_cast<Animations::KeyframeEffect const&>(*effect).animation_preparation_identity();
+}
+
+void CSSTransition::adopt_lane_transitions(DOM::Document& document)
+{
+    auto* arena = document.layout_node_arena_if_created();
+    if (!arena)
+        return;
+    auto& style_computer = document.style_computer();
+    auto adopt_value = [](StyleValueFFI::StyleValueData const* value) {
+        return StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(value));
+    };
+    auto adopt = [&](u32 style_node, ReadonlySpan<u64> cancelled, ReadonlySpan<u64> seen, ReadonlySpan<StyleValueFFI::FfiLaneTransition> lane_transitions) {
+        auto element = style_computer.element_for_lane_style_node(StyleNodeID { style_node });
+        if (!element || !element->is_connected())
+            return;
+        // A transition the lane started that the host took in already runs from when the lane started it.
+        auto runs_as_lane_does = [&](CSSTransition const& transition, PropertyNameAndID const& property) {
+            return any_of(lane_transitions, [&](auto const& lane_transition) {
+                if (lane_transition.property_id != to_underlying(property.id()))
+                    return false;
+                if (lane_transition.host_identity != 0)
+                    return lane_transition.host_identity == effect_identity(transition);
+                return transition.m_adopted_from_lane && transition.transition_start_time() == lane_transition.start_time + lane_transition.delay;
+            });
+        };
+        // The transitions of the host's the lane's steps ended as they ran end as they did, and so does one the lane
+        // started that the host took in and the lane no longer runs. One the steps saw end by itself ends as it does,
+        // with its events. One the host started since the lane forked is its own: the lane decided nothing over it, and
+        // the host decides what becomes of it, and of its property, in its turn. So does one script finished meanwhile.
+        GC::RootVector<GC::Ref<CSSTransition>> ended;
+        Vector<PropertyNameAndID> host_decides;
+        if (auto const* existing = element->existing_transitions({})) {
+            for (auto const& [property, transition] : *existing) {
+                if (transition->is_idle() || transition->is_finished() || runs_as_lane_does(transition, property))
+                    continue;
+                auto identity = effect_identity(transition);
+                if (cancelled.contains_slow(identity)) {
+                    ended.append(transition);
+                } else if (seen.contains_slow(identity)) {
+                    continue;
+                } else if (transition->m_adopted_from_lane) {
+                    ended.append(transition);
+                } else {
+                    host_decides.append(property);
+                }
+            }
+        }
+        for (auto& transition : ended) {
+            transition->cancel();
+            element->remove_transition({}, transition->m_transition_property);
+        }
+        // A transition of the host's whose play is still pending runs from when the lane took it to start.
+        for (auto const& lane_transition : lane_transitions) {
+            if (lane_transition.host_identity == 0)
+                continue;
+            auto transition = element->property_transition({}, PropertyNameAndID::from_id(static_cast<PropertyID>(lane_transition.property_id)));
+            if (transition && effect_identity(*transition) == lane_transition.host_identity && !transition->start_time().has_value()
+                && transition->pending() && transition->play_state() != Bindings::AnimationPlayState::Paused)
+                (void)transition->set_start_time_for_bindings(Animations::NullableCSSNumberish { lane_transition.start_time });
+        }
+        for (auto const& lane_transition : lane_transitions) {
+            if (lane_transition.host_identity != 0)
+                continue;
+            auto property = PropertyNameAndID::from_id(static_cast<PropertyID>(lane_transition.property_id));
+            if (host_decides.contains_slow(property))
+                continue;
+            if (auto current = element->property_transition({}, property)) {
+                if (runs_as_lane_does(*current, property))
+                    continue;
+                // A completed transition of the property gives way to the one the lane started. One the lane saw end,
+                // which the host's timeline has yet to reach, ends now.
+                if (!current->is_idle() && !current->is_finished())
+                    (void)current->finish();
+                element->remove_transition({}, property);
+            }
+            auto transition = start_a_provisional_transition(*element, property, document.transition_generation(),
+                lane_transition.delay, lane_transition.start_time, lane_transition.start_time + lane_transition.duration,
+                adopt_value(lane_transition.start_value), adopt_value(lane_transition.end_value), adopt_value(lane_transition.reversing_adjusted_start_value),
+                lane_transition.reversing_shortening_factor, EasingFunction::from_style_value(adopt_value(lane_transition.timing_function)));
+            transition->commit_provisional_transition();
+            transition->m_adopted_from_lane = true;
+            (void)transition->set_start_time_for_bindings(Animations::NullableCSSNumberish { lane_transition.start_time });
+        }
+    };
+    // Starting and cancelling transitions settles their promises in the document's realm. The rendering update runs
+    // their reactions once every document took in what its lanes did.
+    HTML::TemporaryExecutionContext execution_context { document.relevant_settings_object() };
+    StyleEngineFFI::style_engine_adopt_lane_transitions(
+        arena->host(), &adopt,
+        [](void* context, u32 style_node, u64 const* cancelled, size_t cancelled_count, u64 const* seen, size_t seen_count, StyleValueFFI::FfiLaneTransition const* transitions, size_t transition_count) {
+            (*static_cast<decltype(adopt)*>(context))(style_node, { cancelled, cancelled_count }, { seen, seen_count }, { transitions, transition_count });
+        });
+}
+
 void CSSTransition::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_cached_declaration);
     visitor.visit(m_keyframe_effect);
+}
+
+double CSSTransition::style_change_event_time() const
+{
+    return m_start_time - m_keyframe_effect->start_delay().value;
 }
 
 double CSSTransition::timing_function_output_at_time(double t) const

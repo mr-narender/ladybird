@@ -25,7 +25,9 @@ static u64 s_server_count = 0;
 
 ErrorOr<NonnullOwnPtr<DevToolsServer>> DevToolsServer::create(DevToolsDelegate& delegate, u16 port)
 {
-    auto address = IPv4Address::from_string("0.0.0.0"sv).release_value();
+    // NB: A DevTools client can run script in any tab, and the protocol has no authentication, so only the local
+    //     machine may connect.
+    auto address = IPv4Address { 127, 0, 0, 1 };
 
     auto server = TRY(Core::TCPServer::try_create());
     TRY(server->listen(address, port, Core::TCPServer::AllowAddressReuse::Yes));
@@ -98,9 +100,7 @@ ErrorOr<void> DevToolsServer::on_new_client()
 
     m_did_notify_actors_connection_closed = false;
     m_is_closing_connection = false;
-    auto buffered_socket = TRY(Core::BufferedTCPSocket::create(move(client)));
-
-    m_connection = Connection::create(move(buffered_socket));
+    m_connection = Connection::create(move(client));
 
     m_connection->on_connection_closed = [weak_self = make_weak_ptr<DevToolsServer>()] {
         if (weak_self)

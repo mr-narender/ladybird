@@ -1,4 +1,3 @@
-
 include(${CMAKE_CURRENT_LIST_DIR}/code_generators.cmake)
 
 function(ladybird_generated_sources target_name)
@@ -12,12 +11,23 @@ function(ladybird_generated_sources target_name)
     endif()
 endfunction()
 
+function(ladybird_codesign_command output name entitlements_file)
+    set(${output}
+        "${CMAKE_COMMAND}"
+        "-DLOG=${CMAKE_CURRENT_BINARY_DIR}/${name}-codesign.log"
+        -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/run_quiet.cmake"
+        --
+        codesign -s - -f --entitlements "${entitlements_file}" ${ARGN}
+        PARENT_SCOPE
+    )
+endfunction()
+
 function(ladybird_testjs_test test_src sub_dir)
     cmake_parse_arguments(PARSE_ARGV 2 LADYBIRD_TEST "NO_TEST" "CUSTOM_MAIN;NAME" "LIBS")
     if ("${LADYBIRD_TEST_CUSTOM_MAIN}" STREQUAL "")
         set(LADYBIRD_TEST_CUSTOM_MAIN "$<TARGET_OBJECTS:JavaScriptTestRunnerMain>")
     endif()
-    list(APPEND LADYBIRD_TEST_LIBS LibJS LibCore LibFileSystem)
+    list(APPEND LADYBIRD_TEST_LIBS LibJSStandalone LibCore LibFileSystem)
     set(test_options)
     if (LADYBIRD_TEST_NO_TEST)
         list(APPEND test_options NO_TEST)
@@ -162,26 +172,22 @@ function(invoke_idl_generator cpp_name idl_name generator primary_source header 
     set(CURRENT_LIB_GENERATED ${CURRENT_LIB_GENERATED} PARENT_SCOPE)
 endfunction()
 
-function(invoke_py_idl_generator cpp_name idl_name script primary_source header implementation idl)
+function(invoke_py_idl_generator idl_name script primary_source idl)
     cmake_parse_arguments(invoke_py_idl_generator "" "" "arguments;dependencies" ${ARGN})
 
     set(script_path "${LADYBIRD_SOURCE_DIR}/Meta/Generators/${script}")
     add_custom_command(
-        OUTPUT "${header}" "${implementation}" "${idl}"
-        COMMAND ${Python3_EXECUTABLE} "${script_path}" -h "${header}.tmp" -c "${implementation}.tmp" -i "${idl}.tmp" ${invoke_py_idl_generator_arguments}
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${header}.tmp" "${header}"
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${implementation}.tmp" "${implementation}"
+        OUTPUT "${idl}"
+        COMMAND ${Python3_EXECUTABLE} "${script_path}" -i "${idl}.tmp" ${invoke_py_idl_generator_arguments}
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${idl}.tmp" "${idl}"
-        COMMAND "${CMAKE_COMMAND}" -E remove "${header}.tmp" "${implementation}.tmp" "${idl}.tmp"
+        COMMAND "${CMAKE_COMMAND}" -E remove "${idl}.tmp"
         VERBATIM
         DEPENDS "${script_path}" ${invoke_py_idl_generator_dependencies} "${primary_source}"
     )
 
-    add_custom_target("generate_${cpp_name}" DEPENDS "${header}" "${implementation}" "${idl}")
-    add_custom_target("generate_${idl_name}" DEPENDS "generate_${cpp_name}")
-    add_dependencies(ladybird_codegen_accumulator "generate_${cpp_name}")
+    add_custom_target("generate_${idl_name}" DEPENDS "${idl}")
     add_dependencies(ladybird_codegen_accumulator "generate_${idl_name}")
-    list(APPEND CURRENT_LIB_GENERATED "${name}")
+    list(APPEND CURRENT_LIB_GENERATED "${idl_name}")
     set(CURRENT_LIB_GENERATED ${CURRENT_LIB_GENERATED} PARENT_SCOPE)
 endfunction()
 
@@ -263,4 +269,19 @@ function(add_lagom_library_install_rules target_name)
         ARCHIVE COMPONENT Lagom_Development
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
+endfunction()
+
+function(ladybird_import_qt_plugin target_name plugin_name)
+    # Some Qt installations (such as Ubuntu's) do not automatically load plugin CMake targets. Find the plugin
+    # explicitly so qt_import_plugins can recognize it.
+    if (NOT TARGET Qt6::${plugin_name})
+        find_package(Qt6${plugin_name} QUIET
+            PATHS "${Qt6Gui_DIR}"
+            NO_DEFAULT_PATH
+        )
+    endif()
+
+    if (TARGET Qt6::${plugin_name})
+        qt_import_plugins(${target_name} INCLUDE Qt6::${plugin_name})
+    endif()
 endfunction()

@@ -30,9 +30,9 @@
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/HTML/WindowEventHandlers.h>
 #include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
-#include <LibWeb/HTML/WindowType.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWebCommon/HTML/UserActivationConsumption.h>
+#include <LibWebCommon/HTML/WindowType.h>
 #include <LibWebCommon/WebIDL/Types.h>
 
 namespace Web::HTML {
@@ -41,9 +41,14 @@ class Window;
 
 }
 
+namespace JS {
+
+class HostObject;
+
+}
+
 namespace Web::Bindings {
 
-class PlatformObject;
 class WrapperWorld;
 
 struct IdleRequestOptions;
@@ -51,8 +56,8 @@ struct WindowPostMessageOptions;
 
 WEB_API HTML::Window* window_from_global_object(JS::Object&);
 WEB_API HTML::Window const* window_from_global_object(JS::Object const&);
-WEB_API PlatformObject& platform_object_for_window(HTML::Window&);
-WEB_API PlatformObject& platform_object_for_window(HTML::Window&, JS::Realm&);
+WEB_API JS::HostObject& platform_object_for_window(HTML::Window&);
+WEB_API JS::HostObject& platform_object_for_window(HTML::Window&, JS::Realm&);
 WEB_API WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window&);
 WEB_API WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window&, JS::Realm&);
 WEB_API WebIDL::ExceptionOr<void> post_message(JS::Realm&, HTML::Window&, JS::Value, WindowPostMessageOptions const&);
@@ -68,8 +73,8 @@ WEB_API JS::Value window_named_item_value(WrapperWorld&, JS::Realm&, HTML::Windo
 namespace Web::HTML {
 
 class IdleCallback;
-using AnimationFrameCallbackHandler = Function<void(double)>;
-using IdleCallbackHandler = Function<JS::Completion(GC::Ref<RequestIdleCallback::IdleDeadline>)>;
+using AnimationFrameCallbackHandler = GC::Ref<GC::Function<void(double)>>;
+using IdleCallbackHandler = GC::Ref<GC::Function<JS::Completion(GC::Ref<RequestIdleCallback::IdleDeadline>)>>;
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#specifier-resolution-record
 // A specifier resolution record is a struct. It has the following items:
@@ -169,8 +174,8 @@ public:
     // https://html.spec.whatwg.org/multipage/interaction.html#history-action-activation
     bool has_history_action_activation() const;
 
-    Vector<GC::Ref<Plugin>> pdf_viewer_plugin_objects();
-    Vector<GC::Ref<MimeType>> pdf_viewer_mime_type_objects();
+    ReadonlySpan<GC::Ref<Plugin>> pdf_viewer_plugin_objects();
+    ReadonlySpan<GC::Ref<MimeType>> pdf_viewer_mime_type_objects();
 
     // JS API functions
     GC::Ref<WindowProxy> window() const;
@@ -185,6 +190,7 @@ public:
     [[nodiscard]] GC::Ref<Location> location();
     GC::Ref<History> history() const;
     GC::Ref<Navigation> navigation();
+    bool origin_agent_cluster() const;
     void stop();
     void focus();
     void blur();
@@ -201,18 +207,20 @@ public:
     GC::Ref<WindowProxy> frames() const;
     u32 length();
     GC::Ptr<WindowProxy const> top() const;
-    GC::Ptr<WindowProxy const> opener() const;
+    JS::Value opener() const;
     WebIDL::ExceptionOr<void> set_opener(JS::Value);
     GC::Ptr<WindowProxy const> parent() const;
     GC::Ptr<DOM::Element const> frame_element() const;
     WebIDL::ExceptionOr<GC::Ptr<WindowProxy>> open(Optional<Utf16String> const& url, Optional<Utf16String> const& target, Optional<Utf16String> const& features);
 
     [[nodiscard]] GC::Ref<Navigator> navigator();
+    GC::Ptr<Navigator> navigator_if_created() const { return m_navigator; }
     [[nodiscard]] GC::Ref<CloseWatcherManager> close_watcher_manager();
     [[nodiscard]] GC::Ref<CookieStore::CookieStore> cookie_store();
     [[nodiscard]] GC::Ref<Speech::SpeechSynthesis> speech_synthesis();
 
     void alert(Utf16String const& message = {});
+    void print();
     bool confirm(Optional<Utf16String> const& message);
     Optional<Utf16String> prompt(Optional<Utf16String> const& message, Optional<Utf16String> const& default_);
 
@@ -222,14 +230,8 @@ public:
         Utf16String target_origin;
     };
     WebIDL::ExceptionOr<void> post_message(JS::Realm&, JS::Value message, PostMessageOptions const&);
-    struct PreparedPostMessage {
-        SerializedTransferRecord serialize_with_transfer_result;
-        Variant<Utf16String, URL::Origin> target_origin;
-        URL::Origin source_origin;
-        GC::Ref<WindowProxy> source;
-    };
-    static WebIDL::ExceptionOr<PreparedPostMessage> prepare_post_message(JS::Realm&, JS::Value message, PostMessageOptions const&);
-    void deliver_posted_message(SerializedTransferRecord, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& source_origin, GC::Ptr<WindowProxy> source);
+    static WebIDL::ExceptionOr<void> window_post_message_steps(JS::Realm&, Variant<GC::Ref<Window>, GC::Ref<RemoteNavigable>> target_window, JS::Value, PostMessageOptions const&);
+    void queue_posted_message(SerializedTransferRecord, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& source_origin, GC::Ptr<WindowProxy> source);
 
     Variant<GC::Ref<DOM::Event>, Empty> event() const;
 
@@ -284,12 +286,17 @@ public:
     void set_last_activation_timestamp(HighResolutionTime::DOMHighResTimeStamp timestamp) { m_last_activation_timestamp = timestamp; }
 
     void notify_about_user_activation();
+    static void run_activation_notification_steps(DOM::Document&);
     void consume_user_activation();
 
     HighResolutionTime::DOMHighResTimeStamp last_history_action_activation_timestamp() const { return m_last_history_action_activation_timestamp; }
     void set_last_history_action_activation_timestamp(HighResolutionTime::DOMHighResTimeStamp timestamp) { m_last_history_action_activation_timestamp = timestamp; }
 
     void consume_history_action_user_activation();
+
+    // The system clipboard data that the paste event this window is dispatching pastes, if it pastes the clipboard.
+    Vector<Clipboard::SystemClipboardItem> const* system_clipboard_data_being_pasted() const { return m_system_clipboard_data_being_pasted; }
+    void set_system_clipboard_data_being_pasted(Vector<Clipboard::SystemClipboardItem> const* data) { m_system_clipboard_data_being_pasted = data; }
 
     // Steps 4 and 5 of both consumptions for the windows a page hosts. The UI process runs this in every page of the
     // tab, since the navigables of top's active document span its pages.
@@ -300,7 +307,7 @@ public:
     static void set_internals_object_exposed(bool);
     static bool is_internals_object_exposed();
 
-    [[nodiscard]] OrderedHashMap<Utf16FlyString, GC::Ref<Navigable>> document_tree_child_navigable_target_name_property_set();
+    [[nodiscard]] GC::OrderedRootHashMap<Utf16FlyString, GC::Ref<Navigable>> document_tree_child_navigable_target_name_property_set();
 
     [[nodiscard]] Variant<Empty, GC::Ref<WindowProxy>, GC::Ref<DOM::Element>, GC::Ref<DOM::HTMLCollection>> named_item(Utf16FlyString const&) const;
     [[nodiscard]] Vector<Utf16FlyString> supported_property_names() const override;
@@ -309,6 +316,10 @@ public:
     bool find(Utf16View string);
 
     static void for_each_active(Function<IterationDecision(Window&)> callback);
+
+    // https://w3c.github.io/largest-contentful-paint/#has-dispatched-scroll-event
+    bool has_dispatched_scroll_event() const { return m_has_dispatched_scroll_event; }
+    void set_has_dispatched_scroll_event() { m_has_dispatched_scroll_event = true; }
 
 private:
     Window();
@@ -325,13 +336,13 @@ private:
     void invoke_idle_callbacks();
     void invoke_idle_callback_timeout(u32 handle);
 
+    bool cannot_show_simple_dialogs() const;
+
     struct [[nodiscard]] NamedObjects {
-        Vector<GC::Ref<Navigable>> navigables;
-        Vector<GC::Ref<DOM::Element>> elements;
+        GC::RootVector<GC::Ref<Navigable>> navigables;
+        GC::RootVector<GC::Ref<DOM::Element>> elements;
     };
     NamedObjects named_objects(Utf16View name);
-
-    WebIDL::ExceptionOr<void> window_post_message_steps(JS::Realm&, JS::Value, PostMessageOptions const&);
 
     // https://html.spec.whatwg.org/multipage/window-object.html#concept-document-window
     GC::Ptr<DOM::Document> m_associated_document;
@@ -381,6 +392,8 @@ private:
     // https://html.spec.whatwg.org/multipage/interaction.html#last-history-action-activation-timestamp
     HighResolutionTime::DOMHighResTimeStamp m_last_history_action_activation_timestamp { AK::Infinity<double> };
 
+    Vector<Clipboard::SystemClipboardItem> const* m_system_clipboard_data_being_pasted { nullptr };
+
     // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-status
     // When the Window object is created, the attribute must be set to the empty string. It does not do anything else.
     Utf16String m_status;
@@ -394,6 +407,10 @@ private:
 
     // https://html.spec.whatwg.org/multipage/obsolete.html#dom-external
     GC::Ptr<External> m_external;
+
+    // https://w3c.github.io/largest-contentful-paint/#has-dispatched-scroll-event
+    // Each Window has has dispatched scroll event, a boolean which is initially set to false.
+    bool m_has_dispatched_scroll_event { false };
 };
 
 void run_animation_frame_callbacks(DOM::Document&, double now);

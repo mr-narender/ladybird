@@ -7,6 +7,7 @@
 use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::DisplayListResourceId;
+use crate::painting::force_dark::ForceDarkSettings;
 use crate::painting::host::{FfiLayerImageList, FfiVectorImageRenderRequest};
 use libgfx_rust::{FloatRect, FloatSize, IntSize};
 
@@ -32,12 +33,30 @@ pub(crate) enum VectorImageSource {
     },
 }
 
+impl VectorImageSource {
+    /// The box whose style the image is drawn with.
+    pub(crate) fn owner(&self) -> NodeSlotId {
+        match *self {
+            Self::Layer { owner, .. } | Self::ReplacedContent { owner } => owner,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct VectorImageRenderRequest {
     pub source: VectorImageSource,
     css_width_raw: i32,
     css_height_raw: i32,
     raster_scale_bits: u32,
+    /// What the SVG image shows, which the host renders it from: a request with the same identity, size, scale, color
+    /// scheme and force-dark settings renders the same display list.
+    content_identity: u64,
+    /// The color scheme the host renders the SVG image in.
+    color_scheme: u8,
+    /// The force-dark settings of the page that draws the image, which the host renders the image's content with.
+    force_dark_enabled: bool,
+    force_dark_foreground_threshold: i32,
+    force_dark_background_threshold: i32,
 }
 
 impl VectorImageRenderRequest {
@@ -46,12 +65,21 @@ impl VectorImageRenderRequest {
         css_width: CssPixels,
         css_height: CssPixels,
         raster_scale: f32,
+        content_identity: u64,
+        color_scheme: u8,
+        force_dark: Option<ForceDarkSettings>,
     ) -> Self {
+        let force_dark_settings = force_dark.unwrap_or_default();
         Self {
             source,
             css_width_raw: css_width.raw_value(),
             css_height_raw: css_height.raw_value(),
             raster_scale_bits: raster_scale.to_bits(),
+            content_identity,
+            color_scheme,
+            force_dark_enabled: force_dark.is_some(),
+            force_dark_foreground_threshold: force_dark_settings.foreground_brightness_threshold,
+            force_dark_background_threshold: force_dark_settings.background_brightness_threshold,
         }
     }
 
@@ -76,6 +104,10 @@ impl VectorImageRenderRequest {
             css_width: CssPixels::from_raw(self.css_width_raw),
             css_height: CssPixels::from_raw(self.css_height_raw),
             raster_scale: self.raster_scale(),
+            color_scheme: self.color_scheme,
+            force_dark_enabled: self.force_dark_enabled,
+            force_dark_foreground_threshold: self.force_dark_foreground_threshold,
+            force_dark_background_threshold: self.force_dark_background_threshold,
         }
     }
 }

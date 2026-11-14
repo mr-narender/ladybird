@@ -6,32 +6,157 @@
  */
 
 #include <AK/TemporaryChange.h>
+#include <AK/Utf16StringBuilder.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Realm.h>
 #include <LibWeb/Animations/Animation.h>
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Animations/AnimationPlaybackEvent.h>
+#include <LibWeb/Animations/AnimationTimeline.h>
 #include <LibWeb/Animations/BindingsGlue.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/CSSAnimation.h>
+#include <LibWeb/CSS/CSSKeywordValue.h>
 #include <LibWeb/CSS/CSSNumericValue.h>
+#include <LibWeb/CSS/CSSStyleProperties.h>
+#include <LibWeb/CSS/CSSTransition.h>
+#include <LibWeb/CSS/CSSUnitValue.h>
+#include <LibWeb/CSS/ComputedStyleWorkingSet.h>
+#include <LibWeb/CSS/CustomPropertyData.h>
+#include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/Length.h>
+#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
+#include <LibWeb/CSS/Zoom.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HighResolutionTime/Performance.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
+#include <LibWeb/Layout/NodeArena.h>
+#include <LibWeb/Layout/RenderDocument.h>
+#include <LibWeb/Namespace.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/Promise.h>
 
 namespace Web::Animations {
 
 GC_DEFINE_ALLOCATOR(Animation);
+
+// https://drafts.csswg.org/web-animations-1/#commit-computed-styles
+WebIDL::ExceptionOr<void> Animation::commit_styles()
+{
+    // 1. Let targets be the set of all effect targets for animation effects associated with animation.
+    auto* effect = as_if<KeyframeEffect>(m_effect.ptr());
+    if (!effect || !effect->target())
+        return {};
+    GC::Ref<DOM::Element> target = *effect->target();
+
+    // 2. For each target in targets:
+    //    1. If target is not an element capable of having a style attribute (for example, it is a pseudo-element or is
+    //       an element in a document format for which style attributes are not defined) throw a
+    //       "NoModificationAllowedError" DOMException and abort these steps.
+    auto const& namespace_uri = target->namespace_uri();
+    if (effect->pseudo_element().has_value() || (namespace_uri != Namespace::HTML && namespace_uri != Namespace::SVG && namespace_uri != Namespace::MathML))
+        return WebIDL::NoModificationAllowedError::create("The animation target cannot have an inline style"_utf16);
+
+    OrderedHashMap<CSS::PropertyNameAndID, NonnullRefPtr<CSS::StyleValue const>> declarations;
+    {
+        // 2. If, after applying any pending style changes, target is not being rendered, throw an "InvalidStateError"
+        //    DOMException and abort these steps.
+        auto& document = target->document();
+        Layout::ForcedReadScope read { document };
+        document.update_layout(DOM::UpdateLayoutReason::AnimationCommitStyles);
+        if (!target->is_connected() || !target->has_style())
+            return WebIDL::InvalidStateError::create("The animation target is not being rendered"_utf16);
+        auto computed_style = target->computed_style();
+        if (!target->unsafe_layout_node(read) && (!computed_style->display().is_contents() || computed_style->in_display_none_subtree()))
+            return WebIDL::InvalidStateError::create("The animation target is not being rendered"_utf16);
+
+        // 4. Let targeted properties be the set of physical longhand properties that are a target property for at
+        //    least one animation effect associated with animation whose effect target is target.
+        HashTable<CSS::PropertyNameAndID> targeted_properties;
+        auto add_longhand = [&](CSS::PropertyID property) {
+            auto physical_property = CSS::map_logical_alias_to_physical_property(property, { computed_style->writing_mode(), computed_style->direction() });
+            targeted_properties.set(CSS::PropertyNameAndID::from_id(physical_property));
+        };
+        for (auto const& property : effect->target_properties()) {
+            if (property.is_custom_property())
+                targeted_properties.set(property);
+            else if (CSS::property_is_shorthand(property.id())) {
+                for (auto longhand : CSS::expanded_longhands_for_shorthand(property.id()))
+                    add_longhand(longhand);
+            } else {
+                add_longhand(property.id());
+            }
+        }
+
+        // 5. For each property, property, in targeted properties:
+        //    1. Let partialEffectStack be a copy of the effect stack for property on target.
+        //    2. If animation's replace state is removed, add all animation effects associated with animation whose
+        //       effect target is target and that include property as a target property to partialEffectStack.
+        //    3. Remove from partialEffectStack any animation effects whose associated animation has a higher composite
+        //       order than animation.
+        GC::RootVector<GC::Ref<KeyframeEffect>> effects;
+        for (auto animation : target->associated_animations_in_composite_order()) {
+            auto* other_effect = as_if<KeyframeEffect>(animation->effect().ptr());
+            if (other_effect && !other_effect->pseudo_element().has_value() && KeyframeEffect::composite_order(*other_effect, *effect) < 0)
+                effects.append(*other_effect);
+        }
+        effects.append(*effect);
+
+        // 4. Let effect value be the result of calculating the result of partialEffectStack for property using
+        //    target's computed style (see §5.4.3 Calculating the result of an effect stack) and setting the
+        //    endpoint-inclusive active interval flag to true when calculating the animation effect phase
+        //    (see §4.6.6 Animation effect phases and states).
+        DOM::AbstractElement element { target, {} };
+        // NB: A timeline script observed ahead of its current time in this task is sampled at that time, as the style
+        //     update above was, so the committed values are those of the time script read.
+        RefPtr<CSS::ComputedStyleWorkingSet> committed_style;
+        AnimationTimeline::at_times_observed_ahead(document.associated_animation_timelines().begin(), document.associated_animation_timelines().end(), [&] {
+            committed_style = document.style_computer().compute_style_for_animation_commit(read, element, effects.span());
+        });
+        auto style = committed_style.release_nonnull();
+        auto custom_properties = element.custom_property_data();
+        if (custom_properties && element.custom_property_data_is_animation_overlay())
+            custom_properties = custom_properties->parent();
+        for (auto const& property : targeted_properties) {
+            if (property.is_custom_property()) {
+                RefPtr<CSS::StyleValue const> value;
+                if (auto animated_value = style->animated_custom_properties().get(property.name()); animated_value.has_value())
+                    value = **animated_value;
+                else if (custom_properties) {
+                    if (auto base_value = custom_properties->get(property.name()); base_value.has_value())
+                        value = base_value->value;
+                }
+                if (!value) {
+                    if (auto registration = document.get_registered_custom_property(property.name()); registration.has_value() && registration->initial_value)
+                        value = CSS::compute_registered_custom_property_initial_value(document, *registration);
+                }
+                if (value)
+                    declarations.set(property, value.release_nonnull());
+            } else {
+                declarations.set(property, CSS::unscaled_by_zoom(property.id(), style->property(property.id()), computed_style->effective_zoom()));
+            }
+        }
+    }
+
+    // 3. Let inline style be the result of getting the CSS declaration block corresponding to target's style
+    //    attribute. If target does not have a style attribute, let inline style be a new empty CSS declaration block
+    //    with the owner node set to target.
+    auto inline_style = target->style();
+    // 5.5. Set a CSS declaration of property for effect value in inline style.
+    // 6. Update style attribute for inline style.
+    inline_style->set_computed_properties(declarations);
+    return {};
+}
 
 // https://www.w3.org/TR/web-animations-1/#dom-animation-animation
 GC::Ref<Animation> Animation::create(HTML::EnvironmentSettingsObject& environment, GC::Ptr<AnimationEffect> effect, GC::Ptr<AnimationTimeline> timeline)
@@ -166,6 +291,7 @@ void Animation::set_timeline(GC::Ptr<AnimationTimeline> new_timeline)
 
     // AD-HOC: The normalization of the specified timing of the associated effect depends on the associated timeline.
     //         This must be done before calling set_current_time_for_bindings() to ensure consistent units
+    m_normalized_attachment_interval = attachment_interval();
     if (m_effect)
         m_effect->normalize_specified_timing();
 
@@ -200,13 +326,22 @@ void Animation::set_timeline(GC::Ptr<AnimationTimeline> new_timeline)
     // If from finite timeline and previous progress is resolved,
     else if (from_finite_timeline && previous_progress.has_value()) {
         // Run the procedure to set the current time to previous progress * end time.
-        // NB: We know that the time we are passing is valid so we can wrap this in a MUST() to avoid error handling
-        MUST(set_current_time_for_bindings(previous_progress_multiplied_by_end_time().as_css_numberish()));
+        // NB: We know that the time we are passing is valid so we can wrap this in a MUST() to avoid error handling.
+        //     This is the procedure itself, not script setting the current time of a CSS animation. Until it is done,
+        //     the start time is still in the units of the old timeline.
+        MUST(Animation::set_current_time_for_bindings(previous_progress_multiplied_by_end_time().as_css_numberish()));
     }
 
     // 10. If the start time of animation is resolved, make animation’s hold time unresolved.
-    if (m_start_time.has_value())
+    if (m_start_time.has_value()) {
+        // AD-HOC: A finished animation holds a time beside its start time, and setting its current time as it leaves a
+        //         finite timeline sets the hold time alone, which leaves the start time in the units of the old
+        //         timeline. See https://github.com/w3c/csswg-drafts/issues/11761. Like WebKit, the start time takes
+        //         the hold time.
+        if (m_hold_time.has_value() && m_hold_time->type != m_start_time->type)
+            m_start_time = m_hold_time;
         m_hold_time = {};
+    }
 
     // 11. Run the procedure to update an animation’s finished state for animation with the did seek flag set to false,
     //    and the synchronously notify flag set to false.
@@ -341,6 +476,19 @@ WebIDL::ExceptionOr<void> Animation::set_start_time_for_bindings(NullableCSSNumb
 }
 
 // https://drafts.csswg.org/web-animations-2/#auto-aligning-start-time
+// NB: The effect's timing is normalized against the attachment interval, which moves with the timeline's scroll
+//     container and subject. That holds whether or not the start time is auto-aligned, e.g. for a paused animation.
+void Animation::normalize_timing_against_attachment_interval()
+{
+    auto interval = attachment_interval();
+    if (!interval.has_value() || m_normalized_attachment_interval == *interval)
+        return;
+    m_normalized_attachment_interval = *interval;
+    if (m_effect)
+        m_effect->normalize_specified_timing();
+    invalidate_effect();
+}
+
 void Animation::calculate_auto_aligned_start_time()
 {
     VERIFY(m_timeline && m_timeline->is_progress_based());
@@ -361,15 +509,16 @@ void Animation::calculate_auto_aligned_start_time()
     if (play_state() == AnimationPlayState::Paused && m_hold_time.has_value())
         return;
 
-    // 5. FIXME: Let start offset be the resolved timeline time corresponding to the start of the animation attachment
-    //           range. In the case of view timelines, it requires a calculation based on the proportion of the cover
-    //           range.
-    auto start_offset = TimeValue { TimeValue::Type::Percentage, 0 };
+    normalize_timing_against_attachment_interval();
+    auto interval = attachment_interval().value();
 
-    // 6. FIXME: Let end offset be the resolved timeline time corresponding to the end of the animation attachment
-    //           range. In the case of view timelines, it requires a calculation based on the proportion of the cover
-    //           range.
-    auto end_offset = TimeValue { TimeValue::Type::Percentage, 100 };
+    // 5. Let start offset be the resolved timeline time corresponding to the start of the animation attachment range.
+    //    In the case of view timelines, it requires a calculation based on the proportion of the cover range.
+    auto start_offset = interval.start;
+
+    // 6. Let end offset be the resolved timeline time corresponding to the end of the animation attachment range. In
+    //    the case of view timelines, it requires a calculation based on the proportion of the cover range.
+    auto end_offset = interval.end;
 
     // 7. Set start time to start offset if effective playback rate ≥ 0, and end offset otherwise.
     if (effective_playback_rate() >= 0.0)
@@ -379,6 +528,120 @@ void Animation::calculate_auto_aligned_start_time()
 
     // 8. Clear hold time.
     m_hold_time = {};
+}
+
+// https://drafts.csswg.org/web-animations-2/#dom-keyframeanimationoptions-rangestart
+WebIDL::ExceptionOr<TimelineRangeEdge> parse_timeline_range_edge(DOM::Document& document, TimelineRangeBindingValue const& value, TimelineRangeEdgeSide side)
+{
+    auto property = side == TimelineRangeEdgeSide::Start ? CSS::PropertyID::AnimationRangeStart : CSS::PropertyID::AnimationRangeEnd;
+    // A DOMString value is parsed as an 'animation-range-start' (or 'animation-range-end') value to yield a
+    // TimelineRangeOffset rangeName and offset or alternatively a CSSKeywordValue with the value of "normal"; a
+    // CSSNumericValue is interpreted as a TimelineRangeOffset with that offset and a null rangeName.
+    auto parse = [&](Utf16String const& string) -> WebIDL::ExceptionOr<TimelineRangeEdge> {
+        auto parsed = parse_css_value(CSS::Parser::ParsingParams { document }, string, property);
+        // NB: Arbitrary substitution functions and CSS-wide keywords have nothing to substitute or inherit from here.
+        if (!parsed || parsed->is_css_wide_keyword() || parsed->is_unresolved() || parsed->is_pending_substitution())
+            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid timeline range"_utf16 };
+        auto computed = parsed->absolutized(CSS::ComputationContext { .length_resolution_context = CSS::Length::ResolutionContext::for_document(document) });
+        CSS::ComputedValuesFFI::FfiAnimationRangeEdge edge {};
+        if (!CSS::ComputedValuesFFI::rust_animation_range_edge(computed->rust_style_value_data(), side == TimelineRangeEdgeSide::End, &edge))
+            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid timeline range"_utf16 };
+        return TimelineRangeEdge { static_cast<TimelineRangeName>(edge.name), edge.offset_px, edge.offset_percentage, retain_calculated_offset(edge.offset_calculated) };
+    };
+    return value.visit(
+        [&](Bindings::TimelineRangeOffset const& offset) -> WebIDL::ExceptionOr<TimelineRangeEdge> {
+            Utf16StringBuilder builder;
+            if (offset.range_name.has_value() && offset.range_name->has_value())
+                builder.append(**offset.range_name);
+            if (offset.offset) {
+                builder.append_ascii(' ');
+                builder.append(offset.offset->to_string());
+            }
+            // NB: A TimelineRangeOffset that gives neither a range name nor an offset is the default edge.
+            if (builder.is_empty())
+                return parse("normal"_utf16);
+            return parse(builder.to_string());
+        },
+        [&](GC::Ref<CSS::CSSNumericValue> const& offset) { return parse(offset->to_string()); },
+        // Passing a CSSKeywordValue with a value other than "normal" as the rangeStart or rangeEnd value to any API
+        // defined to accept KeyframeAnimationOptions throws a TypeError.
+        [&](GC::Ref<CSS::CSSKeywordValue> const& keyword) -> WebIDL::ExceptionOr<TimelineRangeEdge> {
+            if (!keyword->value().equals_ignoring_ascii_case("normal"sv))
+                return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid timeline range"_utf16 };
+            return parse("normal"_utf16);
+        },
+        [&](Utf16String const& string) { return parse(string); });
+}
+
+// When reading the attribute, the returned value is either a TimelineRangeOffset or the DOMString "normal".
+static TimelineRangeBindingValue timeline_range_edge_to_bindings(TimelineRangeEdge const& edge, TimelineRangeEdge const& normal)
+{
+    if (edge == normal)
+        return "normal"_utf16;
+
+    auto px = CSS::CSSUnitValue::create(edge.offset_px, "px"_utf16_fly_string);
+    auto percentage = CSS::CSSUnitValue::create(edge.offset_percentage, "percent"_utf16_fly_string);
+    GC::Ref<CSS::CSSNumericValue> offset = edge.offset_px == 0 ? GC::Ref<CSS::CSSNumericValue> { percentage } : GC::Ref<CSS::CSSNumericValue> { px };
+    if (edge.offset_px != 0 && edge.offset_percentage != 0)
+        offset = CSS::CSSNumericValue::create_sum(px, percentage);
+    if (edge.calculated_offset) {
+        auto calculated = CSS::StyleValue::adopt_rust_style_value_data(CSS::StyleValueFFI::rust_style_value_retain(edge.calculated_offset.data()));
+        offset = as<CSS::CSSNumericValue>(*CSS::CSSStyleValue::reify(*calculated, {}));
+    }
+
+    Bindings::TimelineRangeOffset range_offset {};
+    range_offset.range_name = edge.name == TimelineRangeName::None ? Optional<Utf16String> {} : Utf16String::from_utf8_without_validation(timeline_range_name_to_string(edge.name).bytes());
+    range_offset.offset = offset;
+    return range_offset;
+}
+
+TimelineRangeBindingValue Animation::range_start_for_bindings() const
+{
+    update_style_if_needed();
+    return timeline_range_edge_to_bindings(m_range.start, AnimationAttachmentRange {}.start);
+}
+
+TimelineRangeBindingValue Animation::range_end_for_bindings() const
+{
+    update_style_if_needed();
+    return timeline_range_edge_to_bindings(m_range.end, AnimationAttachmentRange {}.end);
+}
+
+WebIDL::ExceptionOr<void> Animation::set_range_start_for_bindings(TimelineRangeBindingValue const& value)
+{
+    auto range = m_range;
+    range.start = TRY(parse_timeline_range_edge(HTML::relevant_window(relevant_global_object()).associated_document(), value, TimelineRangeEdgeSide::Start));
+    set_range(range);
+    return {};
+}
+
+WebIDL::ExceptionOr<void> Animation::set_range_end_for_bindings(TimelineRangeBindingValue const& value)
+{
+    auto range = m_range;
+    range.end = TRY(parse_timeline_range_edge(HTML::relevant_window(relevant_global_object()).associated_document(), value, TimelineRangeEdgeSide::End));
+    set_range(range);
+    return {};
+}
+
+void Animation::set_range(AnimationAttachmentRange const& range)
+{
+    if (m_range == range)
+        return;
+    m_range = range;
+    if (!m_timeline || !m_timeline->is_progress_based())
+        return;
+    m_normalized_attachment_interval = attachment_interval();
+    if (m_effect)
+        m_effect->normalize_specified_timing();
+    calculate_auto_aligned_start_time();
+    invalidate_effect();
+}
+
+Optional<AttachmentInterval> Animation::attachment_interval() const
+{
+    if (!m_timeline || !m_timeline->is_progress_based())
+        return {};
+    return m_timeline->interval_for_attachment_range(m_range);
 }
 
 // https://www.w3.org/TR/web-animations-1/#animation-current-time
@@ -597,6 +860,9 @@ bool Animation::is_replaceable() const
     //   element, nor a CSS transition with an owning element.
     if ((is_css_animation() || is_css_transition()) && owning_element().has_value())
         return false;
+    // AD-HOC: Like a CSS animation with an owning element, an SVG animation element prescribes its animation in markup.
+    if (is_smil_animation())
+        return false;
 
     // - The animation's play state is finished.
     if (play_state() != AnimationPlayState::Finished)
@@ -698,15 +964,19 @@ void Animation::cancel(ShouldInvalidate should_invalidate)
         // 1. Run the procedure to reset an animation’s pending tasks on animation.
         reset_an_animations_pending_tasks();
 
-        // 2. Reject the current finished promise with a DOMException named "AbortError".
-        auto dom_exception = WebIDL::AbortError::create("Animation was cancelled"_utf16);
-        WebIDL::reject_promise(current_finished_promise(), dom_exception);
+        // OPTIMIZATION: A current finished promise that was never created is a pending promise nothing can observe,
+        //               and the new promise of step 4 is just like it, so steps 2 to 4 only matter for a created one.
+        if (m_current_finished_promise) {
+            // 2. Reject the current finished promise with a DOMException named "AbortError".
+            auto dom_exception = WebIDL::AbortError::create("Animation was cancelled"_utf16);
+            WebIDL::reject_promise(*m_current_finished_promise, dom_exception);
 
-        // 3. Set the [[PromiseIsHandled]] internal slot of the current finished promise to true.
-        WebIDL::mark_promise_as_handled(current_finished_promise());
+            // 3. Set the [[PromiseIsHandled]] internal slot of the current finished promise to true.
+            WebIDL::mark_promise_as_handled(*m_current_finished_promise);
 
-        // 4. Let current finished promise be a new promise in the relevant Realm of animation.
-        m_current_finished_promise = WebIDL::create_promise_for(relevant_global_object());
+            // 4. Let current finished promise be a new promise in the relevant Realm of animation.
+            m_current_finished_promise = nullptr;
+        }
         m_is_finished = false;
 
         // 5. Create an AnimationPlaybackEvent, cancelEvent.
@@ -732,8 +1002,8 @@ void Animation::cancel(ShouldInvalidate should_invalidate)
                 scheduled_event_time = m_timeline->convert_a_timeline_time_to_an_origin_relative_time(m_timeline->current_time());
             document->append_pending_animation_event({ cancel_event, *this, *this, scheduled_event_time });
         } else {
-            HTML::queue_global_task(HTML::Task::Source::DOMManipulation, realm.global_object(), GC::create_function(GC::Heap::the(), [this, cancel_event]() {
-                dispatch_event(cancel_event);
+            HTML::queue_global_task(HTML::Task::Source::DOMManipulation, realm.global_object(), GC::create_function(GC::Heap::the(), GC::captures(*this, cancel_event), [](auto& self, auto& cancel_event) {
+                self.dispatch_event(cancel_event);
             }));
         }
     }
@@ -1208,8 +1478,10 @@ void Animation::update()
     // https://drafts.csswg.org/scroll-animations-1/#event-loop
     // When updating timeline current time, the start time of any attached animation is conditionally updated. For each
     // attached animation, run the procedure for calculating an auto-aligned start time.
-    if (m_timeline && m_timeline->is_progress_based())
+    if (m_timeline && m_timeline->is_progress_based()) {
+        normalize_timing_against_attachment_interval();
         calculate_auto_aligned_start_time();
+    }
 
     // Prevent unnecessary work if the animation is already finished and can't exit the finished state due to timeline
     // changes
@@ -1227,18 +1499,15 @@ void Animation::update()
                 if (auto target = effect.target())
                     target->document().note_throttled_animation_style_update();
             } else if (!pending() && !output_is_constant_before_active_start) {
-                invalidate_effect();
+                invalidate_effect(ChangesPlan::No);
             }
         } else if (m_is_finished != was_finished) {
-            invalidate_effect();
+            invalidate_effect(ChangesPlan::No);
         }
     }
 
     // Act on the pending play or pause task
-    if (m_pending_play_task == TaskState::Scheduled && is_ready()) {
-        m_pending_play_task = TaskState::None;
-        run_pending_play_task();
-    }
+    run_pending_play_task_if_ready();
 
     if (m_pending_pause_task == TaskState::Scheduled && is_ready_to_run_pending_pause_task()) {
         m_pending_pause_task = TaskState::None;
@@ -1263,9 +1532,22 @@ void Animation::update()
     }
 }
 
+void Animation::run_pending_play_task_if_ready()
+{
+    if (m_pending_play_task != TaskState::Scheduled || !is_ready())
+        return;
+    m_pending_play_task = TaskState::None;
+    run_pending_play_task();
+}
+
 void Animation::effect_timing_changed(Badge<AnimationEffect>)
 {
     update_finished_state(DidSeek::No, SynchronouslyNotify::Yes);
+}
+
+void Animation::effect_timing_changed_by_style()
+{
+    update_finished_state(DidSeek::No, SynchronouslyNotify::No);
 }
 
 // https://www.w3.org/TR/web-animations-1/#associated-effect-end
@@ -1431,14 +1713,14 @@ void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify sync
     //    steps:
     if (current_finished_state && !m_is_finished) {
         // 1. Let finish notification steps refer to the following procedure:
-        auto finish_notification_steps = GC::create_function(GC::Heap::the(), [this, &realm]() {
+        auto finish_notification_steps = GC::create_function<void()>(GC::Heap::the(), GC::captures(*this, realm), [](Animation& self, auto& realm) {
             // 1. If animation’s play state is not equal to finished, abort these steps.
-            if (play_state() != AnimationPlayState::Finished)
+            if (self.play_state() != AnimationPlayState::Finished)
                 return;
 
             // 2. Resolve animation’s current finished promise object with animation.
-            Bindings::resolve_animation_promise(current_finished_promise(), *this);
-            m_is_finished = true;
+            Bindings::resolve_animation_promise(self.current_finished_promise(), self);
+            self.m_is_finished = true;
 
             // 3. Create an AnimationPlaybackEvent, finishEvent.
             // 4. Set finishEvent’s type attribute to finish.
@@ -1447,21 +1729,21 @@ void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify sync
             //    associated. If animation is not associated with a timeline, or the timeline is inactive, let
             //    timelineTime be null.
             AnimationPlaybackEventInit init;
-            init.current_time = current_time()->as_css_numberish();
-            if (m_timeline && !m_timeline->is_inactive())
-                init.timeline_time = m_timeline->current_time()->as_css_numberish();
+            init.current_time = self.current_time()->as_css_numberish();
+            if (self.m_timeline && !self.m_timeline->is_inactive())
+                init.timeline_time = self.m_timeline->current_time()->as_css_numberish();
 
             auto finish_event = AnimationPlaybackEvent::create(HTML::EventNames::finish, init, HighResolutionTime::current_high_resolution_time(realm.global_object()));
 
             // 7. If animation has a document for timing, then append finishEvent to its document for timing's pending
             //    animation event queue along with its target, animation. For the scheduled event time, use the result
             //    of converting animation’s associated effect end to an origin-relative time.
-            if (auto document_for_timing = this->document_for_timing()) {
+            if (auto document_for_timing = self.document_for_timing()) {
                 document_for_timing->append_pending_animation_event({
                     .event = finish_event,
-                    .animation = *this,
-                    .target = *this,
-                    .scheduled_event_time = convert_a_timeline_time_to_an_origin_relative_time(associated_effect_end()),
+                    .animation = self,
+                    .target = self,
+                    .scheduled_event_time = self.convert_a_timeline_time_to_an_origin_relative_time(self.associated_effect_end()),
                 });
             }
             //    Otherwise, queue a task to dispatch finishEvent at animation. The task source for this task is the DOM
@@ -1470,10 +1752,10 @@ void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify sync
                 // Manually create a task so its ID can be saved
                 auto& document = HTML::relevant_window(realm.global_object()).associated_document();
                 auto task = HTML::Task::create(HTML::Task::Source::DOMManipulation, &document,
-                    GC::create_function(GC::Heap::the(), [this, finish_event]() {
-                        dispatch_event(finish_event);
+                    GC::create_function(GC::Heap::the(), GC::captures(self, finish_event), [](auto& self, auto& finish_event) {
+                        self.dispatch_event(finish_event);
                     }));
-                m_pending_finish_microtask_id = task->id();
+                self.m_pending_finish_microtask_id = task->id();
                 (void)HTML::main_thread_event_loop().task_queue().add(task);
             }
         });
@@ -1493,7 +1775,7 @@ void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify sync
         else if (!m_pending_finish_microtask_id.has_value()) {
             auto& document = HTML::relevant_window(realm.global_object()).associated_document();
 
-            auto task = HTML::Task::create(HTML::Task::Source::DOMManipulation, &document, GC::create_function(GC::Heap::the(), [finish_notification_steps, &realm]() {
+            auto task = HTML::Task::create(HTML::Task::Source::DOMManipulation, &document, GC::create_function(GC::Heap::the(), GC::captures(finish_notification_steps, realm), [](auto& finish_notification_steps, auto& realm) {
                 HTML::TemporaryExecutionContext context { realm };
                 finish_notification_steps->function()();
             }));
@@ -1541,16 +1823,22 @@ void Animation::reset_an_animations_pending_tasks()
     // 4. Apply any pending playback rate on animation.
     apply_any_pending_playback_rate();
 
+    // OPTIMIZATION: A current ready promise that was never created is a resolved promise nothing can observe. Rejecting
+    //               it does nothing, and the new resolved promise of step 7 is just like it, so steps 5 to 7 only
+    //               matter for a created one.
+    if (!m_current_ready_promise)
+        return;
+
     // 5. Reject animation’s current ready promise with a DOMException named "AbortError".
     auto dom_exception = WebIDL::AbortError::create("Animation was cancelled"_utf16);
-    WebIDL::reject_promise(current_ready_promise(), dom_exception);
+    WebIDL::reject_promise(*m_current_ready_promise, dom_exception);
 
     // 6. Set the [[PromiseIsHandled]] internal slot of animation’s current ready promise to true.
-    WebIDL::mark_promise_as_handled(current_ready_promise());
+    WebIDL::mark_promise_as_handled(*m_current_ready_promise);
 
     // 7. Let animation’s current ready promise be the result of creating a new resolved Promise object with value
     //    animation in the relevant Realm of animation.
-    m_current_ready_promise = Bindings::create_resolved_animation_promise(*this);
+    m_current_ready_promise = nullptr;
 }
 
 // https://drafts.csswg.org/web-animations-2/#ready
@@ -1584,6 +1872,14 @@ void Animation::run_pending_play_task()
     // FIXME: We can get a more accurate time here if we record the actual instant we became ready rather than waiting
     //        to try and run this task
     auto ready_time = m_timeline->current_time().value();
+    // AD-HOC: A new CSS transition of properties the compositor may run stays pending past the rendering update of its
+    //         style change event, which already rendered it, on the compositor or here. It became ready at the time of
+    //         its style change event, from which the compositor runs it, so that a style change a frame later starts
+    //         the next transition from the value on the screen rather than from this transition's start value.
+    if (auto const* keyframe_effect = as_if<KeyframeEffect>(m_effect.ptr());
+        is_css_transition() && keyframe_effect && keyframe_effect->may_run_on_the_compositor()
+        && as<CSS::CSSTransition>(*this).previous_phase() == CSS::CSSTransition::Phase::Idle)
+        ready_time = { TimeValue::Type::Milliseconds, as<CSS::CSSTransition>(*this).style_change_event_time() };
 
     // 3. Perform the steps corresponding to the first matching condition below, if any:
 
@@ -1719,7 +2015,7 @@ GC::Ref<WebIDL::Promise> Animation::current_finished_promise() const
     return *m_current_finished_promise;
 }
 
-void Animation::invalidate_effect()
+void Animation::invalidate_effect(ChangesPlan changes_plan)
 {
     if (!m_effect)
         return;
@@ -1728,6 +2024,9 @@ void Animation::invalidate_effect()
         return;
 
     auto& effect = static_cast<KeyframeEffect&>(*m_effect);
+    // The render clock's lanes tick the document's animations as the last rendering update planned them.
+    if (auto target = effect.target(); changes_plan == ChangesPlan::Yes && target && target->document().layout_node_arena_if_created())
+        Layout::RustFFI::document_host_note_animation_change(target->document().layout_node_arena_if_created()->host());
     effect.invalidate_effect();
 }
 

@@ -7,15 +7,17 @@
 
 #include <LibGC/Heap.h>
 #include <LibGC/HeapHashTable.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/SVG/AttributeNames.h>
 #include <LibWeb/SVG/FragmentIdentifier.h>
@@ -45,14 +47,16 @@ void SVGUseElement::initialize_element()
     set_shadow_root(shadow_root);
 
     m_document_observer = DOM::DocumentObserver::create(document());
-    m_document_observer->set_document_completely_loaded([this]() {
-        // The href processing path already populated the shadow tree for resolved references,
-        // unless the referenced subtree changed while the document was still loading.
-        if (instance_root() && !m_needs_document_complete_reclone)
+    m_document_observer->set_document_readiness_observer(GC::create_function(GC::Heap::the(), GC::captures(*this), [](SVGUseElement& self, HTML::DocumentReadyState readiness) {
+        if (readiness != HTML::DocumentReadyState::Interactive)
             return;
-        m_needs_document_complete_reclone = false;
-        clone_element_tree_as_our_shadow_tree(referenced_element());
-    });
+        // The href processing path already populated the shadow tree for resolved references,
+        // unless the referenced subtree changed while the document was still being parsed.
+        if (self.instance_root() && !self.m_needs_parsing_complete_reclone)
+            return;
+        self.m_needs_parsing_complete_reclone = false;
+        self.clone_element_tree_as_our_shadow_tree(self.referenced_element());
+    }));
 }
 
 void SVGUseElement::visit_edges(Cell::Visitor& visitor)
@@ -67,26 +71,13 @@ void SVGUseElement::adopted_from(DOM::Document& old_document)
 {
     Base::adopted_from(old_document);
 
-    if (m_load_event_delayer.has_value())
-        m_load_event_delayer.emplace(document());
-
     m_document_observer->retarget_for_adoption(document());
 
-    auto href = href_value();
-    if (!href.has_value())
-        return;
-
-    m_href = document().encoding_parse_url(*href);
-    if (!m_href.has_value())
-        return;
-
-    if (!is_referenced_element_same_document()) {
-        fetch_the_document(*m_href);
-        return;
-    }
-
-    if (auto to_clone = referenced_element())
-        clone_element_tree_as_our_shadow_tree(to_clone);
+    // Adoption removed us from our tree, so nothing of ours renders, and our shadow tree is a clone made for the old
+    // document; our href may resolve to something else in this one. Drop it, and leave the new clone to inserted(),
+    // once we're in a document tree again. A clone made here would join the tree being adopted — so a nested use
+    // element in it would then run the adopting steps as if it had come from the old document.
+    discard_the_url();
 }
 
 void SVGUseElement::inserted()
@@ -94,19 +85,30 @@ void SVGUseElement::inserted()
     Base::inserted();
 
     // Only use elements in the document's node tree react to changes of the elements they reference, mirroring the
-    // document-wide traversal this registry replaced. A use element inside a shadow tree is itself part of a clone.
-    if (!root().is_document())
-        return;
-
-    register_for_referenced_element_changes();
+    // document-wide traversal this registry replaced.
+    if (root().is_document())
+        register_for_referenced_element_changes();
 
     // The insertion that connected us may have inserted our referenced element along with us, with its insertion
-    // steps running before ours, i.e. before we were registered to be notified about changes to it. If our shadow
-    // tree has not been populated yet, try resolving the reference again.
-    if (!instance_root()
-        && m_href.has_value() && m_href->fragment().has_value() && is_referenced_element_same_document()) {
-        clone_element_tree_as_our_shadow_tree(referenced_element());
+    // steps running before ours, i.e. before we were registered to be notified about changes to it. Adoption also
+    // drops our shadow tree (see adopted_from()), we may now be in an author's shadow tree, and an external document
+    // may have finished loading while we were disconnected. If our shadow tree has not been populated yet, or was
+    // copied from an element our reference no longer resolves to, try resolving the reference again.
+    if (!is_connected())
+        return;
+    if (auto instance_root = this->instance_root()) {
+        if (instance_root->corresponding_element().ptr() != referenced_element().ptr())
+            request_reclone();
+        return;
     }
+
+    if (!m_href.has_value()) {
+        process_the_url(href_value());
+        return;
+    }
+
+    if (auto to_clone = referenced_element())
+        clone_element_tree_as_our_shadow_tree(to_clone);
 }
 
 void SVGUseElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, Node& old_root)
@@ -115,6 +117,13 @@ void SVGUseElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancest
 
     if (old_root.is_document())
         unregister_for_referenced_element_changes();
+
+    // NB: The request of a disconnected use element must not delay the load event, which matters for an instance in a
+    //     shadow tree that is being discarded. inserted() processes the URL again.
+    if (!is_connected() && m_load_event_delayer.has_value()) {
+        stop_using_resource_request();
+        m_href = {};
+    }
 }
 
 void SVGUseElement::moved_from(IsSubtreeRoot is_subtree_root, GC::Ptr<Node> old_ancestor)
@@ -170,6 +179,12 @@ void SVGUseElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16
     Base::attribute_changed(name, old_value, value, namespace_);
 
     if (name == SVG::AttributeNames::href || name == SVG::AttributeNames::xlink_href) {
+        // AD-HOC: A disconnected use element processes the URL once it is inserted. By then, an instance is linked to
+        //         its corresponding element, and cycle checks can see its enclosing instances.
+        if (!is_connected()) {
+            discard_the_url();
+            return;
+        }
         // When the ‘href’ attribute is set (or, in the absence of an ‘href’ attribute, an ‘xlink:href’ attribute), the user agent must process the URL.
         process_the_url(value);
     }
@@ -182,65 +197,86 @@ Optional<Utf16String> SVGUseElement::href_value() const
     return get_attribute_ns(Namespace::XLink, AttributeNames::href);
 }
 
+DOM::Document const& SVGUseElement::document_containing_reference() const
+{
+    if (auto source = corresponding_element())
+        return source->document();
+    return document();
+}
+
 // https://www.w3.org/TR/SVG2/linking.html#processingURL
 void SVGUseElement::process_the_url(Optional<Utf16String> const& href)
 {
+    // NB: A request for a document that is no longer referenced must neither update the shadow tree nor delay the load
+    //     event.
+    stop_using_resource_request();
+
     // In all other cases, the URL is for a resource to be used in this SVG document. The user agent
     // must parse the URL to separate out the target fragment from the rest of the URL, and compare
     // it with the document base URL. If all parts other than the target fragment are equal, this is
     // a same-document URL reference, and processing the URL must continue as indicated in Identifying
     // the target element with the current document as the referenced document.
-    m_href = document().encoding_parse_url(href.value_or({}));
-    if (!m_href.has_value())
-        return;
-
-    if (is_referenced_element_same_document()) {
+    m_href = document_containing_reference().encoding_parse_url(href.value_or({}));
+    if (m_href.has_value() && is_referenced_element_same_document()) {
         clone_element_tree_as_our_shadow_tree(referenced_element());
-    } else {
-        fetch_the_document(*m_href);
+        return;
     }
+
+    // If either the ‘use’ element or the referenced element is altered in a way that causes the ‘use’ element’s URL
+    // reference to become unresolved again, then the entire shadow tree for that use element is discarded.
+    clone_element_tree_as_our_shadow_tree(nullptr);
+
+    if (m_href.has_value())
+        fetch_the_document(*m_href);
 }
 
 bool SVGUseElement::is_referenced_element_same_document() const
 {
-    return m_href->equals(document().base_url(), URL::ExcludeFragment::Yes);
-}
-
-Gfx::AffineTransform SVGUseElement::additional_element_transform() const
-{
-    CSSPixelSize viewport_size;
-    if (auto* svg_svg_element = first_flat_tree_ancestor_of_type<SVGSVGElement>()) {
-        if (auto view_box = svg_svg_element->active_view_box(); view_box.has_value())
-            viewport_size = { CSSPixels::nearest_value_for(view_box->width), CSSPixels::nearest_value_for(view_box->height) };
-        else if (auto svg_svg_layout_node = svg_svg_element->unsafe_layout_node())
-            viewport_size = { svg_svg_layout_node->width().to_px(0), svg_svg_layout_node->height().to_px(0) };
-    }
-
-    auto computed_values = this->computed_style();
-    VERIFY(computed_values);
-
-    auto x = computed_values->x().to_px(viewport_size.width()).to_float();
-    auto y = computed_values->y().to_px(viewport_size.height()).to_float();
-
-    // The x and y properties define an additional transformation (translate(x,y), where x and y represent the computed value of the corresponding property)
-    // to be applied to the ‘use’ element, after any transformations specified with other properties
-    return Gfx::AffineTransform {}.translate(x, y);
+    return m_href->equals(document_containing_reference().base_url(), URL::ExcludeFragment::Yes);
 }
 
 void SVGUseElement::svg_element_changed(SVGElement& svg_element)
 {
+    if (m_reclone_pending)
+        return;
+
     auto to_clone = referenced_element();
     if (!to_clone) {
         return;
     }
 
     // NOTE: We need to check the ancestor because attribute_changed of a child doesn't call children_changed on the parent(s)
-    if (to_clone == GC::Ref { svg_element } || to_clone->is_ancestor_of(svg_element)) {
-        clone_element_tree_as_our_shadow_tree(to_clone);
-    }
+    if (to_clone == GC::Ref { svg_element } || to_clone->is_ancestor_of(svg_element))
+        request_reclone();
 }
 
-void SVGUseElement::svg_element_changed_before_document_complete(SVGElement& svg_element)
+void SVGUseElement::element_instance_changed(Badge<SVGElement>)
+{
+    if (is_connected() && document().readiness() == HTML::DocumentReadyState::Loading) {
+        m_needs_parsing_complete_reclone = true;
+        return;
+    }
+
+    if (!m_reclone_pending)
+        request_reclone();
+}
+
+void SVGUseElement::request_reclone()
+{
+    m_reclone_pending = true;
+    if (!is_connected())
+        return;
+    document().style_computer().style_engine().note_element_awaiting_preparation_for_style_computation(*this);
+    set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::SVGUseElementShadowTreeRebuild);
+}
+
+void SVGUseElement::prepare_for_style_computation()
+{
+    if (m_reclone_pending)
+        clone_element_tree_as_our_shadow_tree(referenced_element());
+}
+
+void SVGUseElement::svg_element_changed_before_parsing_complete(SVGElement& svg_element)
 {
     auto to_clone = referenced_element();
     if (!to_clone)
@@ -248,7 +284,7 @@ void SVGUseElement::svg_element_changed_before_document_complete(SVGElement& svg
 
     // NOTE: We need to check the ancestor because attribute_changed of a child doesn't call children_changed on the parent(s)
     if (to_clone == GC::Ref { svg_element } || to_clone->is_ancestor_of(svg_element))
-        m_needs_document_complete_reclone = true;
+        m_needs_parsing_complete_reclone = true;
 }
 
 void SVGUseElement::svg_element_removed(SVGElement& svg_element)
@@ -274,7 +310,7 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
 
     if (is_referenced_element_same_document()) {
         auto id = decode_fragment_identifier(*m_href->fragment());
-        return document().get_element_by_id(id);
+        return document_containing_reference().get_element_by_id(id);
     }
 
     if (!m_resource_request)
@@ -287,40 +323,91 @@ GC::Ptr<DOM::Element> SVGUseElement::referenced_element() const
     return as<SVG::SVGDecodedImageData>(*data).svg_document().get_element_by_id(decode_fragment_identifier(*m_href->fragment()));
 }
 
+void SVGUseElement::discard_the_url()
+{
+    clone_element_tree_as_our_shadow_tree(nullptr);
+    stop_using_resource_request();
+    m_href = {};
+}
+
+void SVGUseElement::stop_using_resource_request()
+{
+    if (m_resource_request && m_resource_request_callbacks_id.has_value())
+        m_resource_request->remove_callbacks(*m_resource_request_callbacks_id);
+    m_resource_request_callbacks_id = {};
+    m_resource_request = nullptr;
+    m_load_event_delayer.clear();
+}
+
 // https://svgwg.org/svg2-draft/linking.html#processingURL-fetch
 void SVGUseElement::fetch_the_document(URL::URL const& url)
 {
-    m_load_event_delayer.emplace(document());
-    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), url);
-    m_resource_request->add_callbacks(
-        [this] {
-            clone_element_tree_as_our_shadow_tree(referenced_element());
-            m_load_event_delayer.clear();
-        },
-        [this] {
-            m_load_event_delayer.clear();
-        });
+    // AD-HOC: An element in a temporary document for fragment parsing does not fetch anything, so that markup parsed
+    //         into such a document, for example by the Sanitizer API, causes no network requests for elements that
+    //         are never inserted anywhere. The document is fetched once the element is inserted into another document.
+    if (document().is_temporary_document_for_fragment_parsing())
+        return;
 
-    if (m_resource_request->needs_fetching()) {
-        auto request = HTML::create_potential_CORS_request(url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS);
-        request->set_client(&document().relevant_settings_object());
+    // NB: The fragment only identifies the target element within the fetched document, so every reference to the same
+    //     external document shares one fetch and one parsed document. The spec allows this re-use under "Processing
+    //     the subresource document".
+    auto document_url = url;
+    document_url.set_fragment({});
+
+    stop_using_resource_request();
+
+    // https://svgwg.org/svg2-draft/struct.html#UseElement
+    // User agents may restrict external resource documents for security reasons. In particular, this specification
+    // does not allow cross-origin and data URL resource requests in ‘use’.
+    if (document_url.scheme() == "data"sv)
+        return;
+
+    // For all other references, the "no-cors" state.
+    // AD-HOC: Set the same-origin fallback flag, as HTML does for track elements, so that Fetch enforces the ‘use’
+    //         origin restriction before sending a request and across redirects.
+    auto request = HTML::create_potential_CORS_request(document_url, Fetch::Infrastructure::Request::Destination::Image, HTML::CORSSettingAttribute::NoCORS, HTML::SameOriginFallbackFlag::Yes);
+    request->set_client(document().relevant_settings_object().address());
+
+    m_load_event_delayer.emplace(document());
+    m_resource_request = HTML::SharedResourceRequest::get_or_create(document(), *request);
+    m_resource_request_callbacks_id = m_resource_request->add_removable_callbacks(
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](SVGUseElement& self) {
+            // Only a connected use element builds its shadow tree; inserted() builds it otherwise.
+            if (self.is_connected())
+                self.clone_element_tree_as_our_shadow_tree(self.referenced_element());
+            self.m_load_event_delayer.clear();
+        }),
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](SVGUseElement& self) {
+            self.m_load_event_delayer.clear();
+        }),
+        GC::create_function(GC::Heap::the(), GC::captures(*this), [](SVGUseElement& self) {
+            self.m_load_event_delayer.clear();
+        }));
+
+    if (m_resource_request->needs_fetching())
         m_resource_request->fetch_resource(request);
-    }
 }
 
 // https://svgwg.org/svg2-draft/struct.html#UseShadowTree
 void SVGUseElement::clone_element_tree_as_our_shadow_tree(GC::Ptr<Element> to_clone)
 {
+    m_reclone_pending = false;
     shadow_root()->remove_all_children();
 
     // https://svgwg.org/svg2-draft/struct.html#UseStyleInheritance
     // When the referenced element is from the same document as the ‘use’ element, the same document stylesheets will
     // apply in both the original document and the shadow tree document fragment.
-    shadow_root()->set_uses_document_style_sheets(to_clone && is_referenced_element_same_document());
+    shadow_root()->set_uses_document_style_sheets(to_clone && &to_clone->document() == &document());
 
     if (to_clone && is_valid_reference_element(*to_clone)) {
         // The ‘use’ element references another element, a copy of which is rendered in place of the ‘use’ in the document.
-        auto cloned_reference_node = MUST(to_clone->clone_node(nullptr, true));
+        // Each node in the shadow tree is an instance of a corresponding node from the referenced document subtree.
+        // FIXME: If the referenced element is in an external file, then all URL references in attributes and style
+        //        properties must be made absolute as described in Generating the absolute URL, before copying the value
+        //        to the element instances. The shadow tree itself uses the same document base URL as the document that
+        //        includes it.
+        auto cloned_reference_node = MUST(to_clone->clone_node(&document(), true));
+        link_to_corresponding_elements(as<SVGElement>(*cloned_reference_node), as<SVGElement>(*to_clone));
         if (is<SVGSVGElement>(cloned_reference_node.ptr()) || is<SVGSymbolElement>(cloned_reference_node.ptr())) {
             auto& cloned_element = as<SVGElement>(*cloned_reference_node);
 
@@ -336,6 +423,20 @@ void SVGUseElement::clone_element_tree_as_our_shadow_tree(GC::Ptr<Element> to_cl
             }
         }
         shadow_root()->append_child(cloned_reference_node).release_value_but_fixme_should_propagate_errors();
+    }
+}
+
+// https://svgwg.org/svg2-draft/struct.html#TermCorrespondingElement
+void SVGUseElement::link_to_corresponding_elements(SVGElement& instance, SVGElement& original)
+{
+    instance.set_corresponding_element({}, original);
+
+    // NB: Only SVG children are paired up. Inserting a clone's HTML content can change it, for example when an option
+    //     element updates a selectedcontent element.
+    auto* instance_child = instance.first_child_of_type<SVGElement>();
+    for (auto* original_child = original.first_child_of_type<SVGElement>(); original_child && instance_child; original_child = original_child->next_sibling_of_type<SVGElement>()) {
+        link_to_corresponding_elements(*instance_child, *original_child);
+        instance_child = instance_child->next_sibling_of_type<SVGElement>();
     }
 }
 
@@ -357,6 +458,14 @@ bool SVGUseElement::is_valid_reference_element(Element const& reference_element)
 bool SVGUseElement::would_create_circular_reference(Element const& target) const
 {
     auto visited = GC::Heap::the().allocate<GC::HeapHashTable<GC::Ref<Element const>>>();
+    for (auto* shadow_root = as_if<DOM::ShadowRoot>(root()); shadow_root && shadow_root->host(); shadow_root = as_if<DOM::ShadowRoot>(shadow_root->host()->root())) {
+        if (auto const* use = as_if<SVGUseElement>(*shadow_root->host())) {
+            if (auto instance = use->instance_root()) {
+                if (auto source = instance->corresponding_element())
+                    visited->table().set(*source);
+            }
+        }
+    }
     return would_create_circular_reference_impl(target, visited);
 }
 
@@ -395,9 +504,9 @@ GC::Ptr<SVGElement> SVGUseElement::instance_root() const
     return const_cast<DOM::ShadowRoot&>(*shadow_root()).first_child_of_type<SVGElement>();
 }
 
-Layout::Node* SVGUseElement::create_layout_node(CSS::LayoutStyle style)
+CSS::ElementBoxKind SVGUseElement::box_kind() const
 {
-    return &Layout::allocate_layout_node<Layout::Box>(document(), *this, style, Layout::RustFFI::NodeKind::SVGGraphicsBox);
+    return CSS::ElementBoxKind::SvgGraphics;
 }
 
 }

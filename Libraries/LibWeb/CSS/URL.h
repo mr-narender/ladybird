@@ -31,13 +31,12 @@ public:
     static RequestURLModifier create_referrer_policy(ReferrerPolicyModifierValue);
 
     ~RequestURLModifier() = default;
-    void modify_request(GC::Ref<Fetch::Infrastructure::Request>) const;
+    void modify_request(NonnullRefPtr<Fetch::Infrastructure::Request>) const;
     Type type() const { return m_type; }
     using Value = Variant<CrossOriginModifierValue, ReferrerPolicyModifierValue, Utf16FlyString>;
     Value const& value() const { return m_value; }
     String to_string() const;
     Utf16String to_utf16_string() const;
-    bool operator==(RequestURLModifier const&) const;
 
 private:
     RequestURLModifier(Type, Value);
@@ -64,7 +63,6 @@ public:
 
     String to_string() const;
     Utf16String to_utf16_string() const;
-    bool operator==(URL const&) const;
 
 private:
     Type m_type;

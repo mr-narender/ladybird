@@ -18,7 +18,7 @@
 namespace Sandbox {
 
 #if defined(AK_OS_LINUX)
-struct LandlockPath {
+struct PathRule {
     enum class Access {
         ReadOnly,
         ReadAndExecute,
@@ -47,6 +47,8 @@ struct SeatbeltPath {
 enum class NetworkAccess {
     Denied,
     Allowed,
+    // Only UDP datagrams, sent to any host and received on sockets the helper binds itself, as ICE and mDNS need.
+    Datagrams,
 };
 
 // System services that a helper may use, in addition to its own Browser endpoint.
@@ -57,7 +59,7 @@ enum class SystemService : u8 {
     VideoDecoding = 1 << 2,
     GPU = 1 << 3,
     IOSurface = 1 << 4,
-    // Mapping MAP_JIT memory, for WebAssembly code compiled by Cranelift.
+    // Mapping MAP_JIT memory, for the code that JIT compilers generate.
     JIT = 1 << 5,
     // Enumerating displays and following their refresh, which CoreGraphics and CoreVideo do through the window server.
     Display = 1 << 6,
@@ -82,8 +84,15 @@ struct SeatbeltProfile {
 [[nodiscard]] ErrorOr<void> configure_runtime();
 
 #if defined(AK_OS_LINUX)
-[[nodiscard]] ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access);
-[[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> = {});
+[[nodiscard]] ErrorOr<void> add_path_if_exists(Vector<PathRule>& paths, StringView path, PathRule::Access);
+[[nodiscard]] ErrorOr<void> add_loaded_library_directories(Vector<PathRule>& paths, Optional<StringView> root = {});
+[[nodiscard]] ErrorOr<void> restrict_filesystem(ReadonlySpan<PathRule> = {});
+// Whether restrict_filesystem() also kept this process from signalling any process outside its own tree.
+[[nodiscard]] bool signals_stay_within_the_process_tree();
+// Whether LADYBIRD_SANDBOX_DEBUG asks the sandbox to log what it refuses. The file broker then confines the file system
+// even where Landlock exists, because Landlock refuses a path without telling the process, and the broker can log it.
+[[nodiscard]] bool sandbox_debugging_is_enabled();
+[[nodiscard]] ErrorOr<void> add_gpu_driver_paths(Vector<PathRule>& paths);
 #endif
 
 #if defined(AK_OS_MACOS)

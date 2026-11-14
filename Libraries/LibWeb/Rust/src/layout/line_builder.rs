@@ -50,18 +50,41 @@ struct LineRelativeAlignedSubtree {
     shift: CssPixels,
 }
 
+struct LineAlignment {
+    earliest: CssPixels,
+    latest: CssPixels,
+    line_box_baseline: CssPixels,
+    should_advance_to_line_box_block_end: bool,
+    has_line_relative_aligned_subtree: bool,
+    aligned_subtrees: Vec<LineRelativeAlignedSubtree>,
+    first_unshifted_text_baseline: Option<CssPixels>,
+}
+
+#[derive(Clone)]
 pub(crate) struct LineBuilder<'builder, 'context> {
     context: &'builder inline_formatting_context::InlineFormattingContext<'context>,
     available_inline_size_for_current_line: AvailableSize,
+    /// The inline size that text-wrap-style: balance takes off the available inline size of each line of each group
+    /// between forced breaks, for the lines to break at.
+    balancing_reductions: Vec<Option<CssPixels>>,
+    forced_break_count: usize,
+    /// Whether this builder finds line breaks without placing the boxes on the lines.
+    only_finds_line_breaks: bool,
+    /// Heights retained across retries, indexed by content lines rather than empty lines skipped to clear floats.
+    float_fit_heights: Option<Vec<CssPixels>>,
+    float_fit_line_index: usize,
+    float_fit_trial: bool,
+    float_refit: Option<(usize, CssPixels)>,
     current_block_offset: CssPixels,
     max_block_size_on_current_line: CssPixels,
+    nodes_with_edges_of_collapsed_whitespace: Vec<(Node, CssPixels)>,
+    /// The outside markers that the first line box this builder lays out contributes to.
+    outside_marker_line: Option<block_formatting_context::OutsideMarkerLine>,
     unbreakable_run_inline_size_interrupted_by_float: CssPixels,
-    text_indent: CssPixels,
-    text_indent_hanging: bool,
-    text_indent_each_line: bool,
+    text_indentation: inline_formatting_context::TextIndentation,
     direction: u8,
-    writing_mode: u8,
     last_line_needs_update: bool,
+    is_continuation: bool,
     should_advance_to_last_line_box_block_end: bool,
     current_line_committed_pending_margin: bool,
     pending_margin_follows_block_level_box: bool,
@@ -70,7 +93,7 @@ pub(crate) struct LineBuilder<'builder, 'context> {
     style_cache: Cell<Option<(Node, StyleValues<'context>)>>,
     /// The lookups behind the facts last asked for. Keeping the facts themselves copied the pass they
     /// hold into the cell and back, and the copy of the pass's padded tail stalled the loads after it.
-    facts_cache: Cell<Option<(Node, &'builder NodeData, Option<&'builder FfiStylePayloads>)>>,
+    facts_cache: Cell<Option<(Node, &'builder NodeData, Option<ComputedValuesView<'builder>>)>>,
 }
 
 impl<'builder, 'context> LineBuilder<'builder, 'context> {
@@ -80,21 +103,83 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         builder
     }
 
+    /// A builder that only finds where the lines break, to balance them.
+    pub(crate) fn new_for_finding_balanced_line_breaks(
+        context: &'builder inline_formatting_context::InlineFormattingContext<'context>,
+    ) -> Self {
+        let mut builder = Self::initialized(context);
+        builder.only_finds_line_breaks = true;
+        builder.begin_new_line(false, true, ForcedBreak::No);
+        builder
+    }
+
+    pub(crate) fn set_float_fit_heights(&mut self, heights: Vec<CssPixels>, trial: bool) {
+        self.float_fit_heights = Some(heights);
+        self.float_fit_line_index = 0;
+        self.float_fit_trial = trial;
+        self.float_refit = None;
+        if trial {
+            self.only_finds_line_breaks = true;
+        }
+        self.recalculate_available_space();
+    }
+
+    fn float_fit_height(&self) -> CssPixels {
+        self.float_fit_heights
+            .as_ref()
+            .and_then(|heights| heights.get(self.float_fit_line_index))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn float_refit(&self) -> Option<(usize, CssPixels)> {
+        self.float_refit
+    }
+
+    pub(crate) fn set_balancing_reductions(&mut self, balancing_reductions: Vec<Option<CssPixels>>) {
+        self.balancing_reductions = balancing_reductions;
+    }
+
+    pub(crate) fn new_for_continuation(
+        context: &'builder inline_formatting_context::InlineFormattingContext<'context>,
+        after_forced_break: bool,
+    ) -> Self {
+        let mut builder = Self::initialized(context);
+        builder.is_continuation = true;
+        builder.begin_new_line(
+            false,
+            true,
+            if after_forced_break {
+                ForcedBreak::Yes
+            } else {
+                ForcedBreak::No
+            },
+        );
+        builder
+    }
+
     fn initialized(context: &'builder inline_formatting_context::InlineFormattingContext<'context>) -> Self {
         let style = context.style(context.containing_block);
         let containing_inline_size = context.input.containing_block_constraints.inline_basis();
         Self {
             context,
             available_inline_size_for_current_line: AvailableSize::Indefinite,
+            balancing_reductions: Vec::new(),
+            forced_break_count: 0,
+            only_finds_line_breaks: false,
+            float_fit_heights: None,
+            float_fit_line_index: 0,
+            float_fit_trial: false,
+            float_refit: None,
             current_block_offset: CssPixels::default(),
             max_block_size_on_current_line: CssPixels::default(),
+            nodes_with_edges_of_collapsed_whitespace: Vec::new(),
+            outside_marker_line: context.parent.pending_outside_marker_line(),
             unbreakable_run_inline_size_interrupted_by_float: CssPixels::default(),
-            text_indent: style.text_indent().to_px(containing_inline_size),
-            text_indent_hanging: style.text_indent_hanging(),
-            text_indent_each_line: style.text_indent_each_line(),
+            text_indentation: inline_formatting_context::TextIndentation::of(style, containing_inline_size),
             direction: style.direction(),
-            writing_mode: style.writing_mode(),
             last_line_needs_update: false,
+            is_continuation: false,
             should_advance_to_last_line_box_block_end: false,
             current_line_committed_pending_margin: false,
             pending_margin_follows_block_level_box: false,
@@ -112,10 +197,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         let current_block_offset = context.line_data().line_boxes.last().unwrap().next_line_block_offset;
         let mut builder = Self::initialized(context);
         builder.current_block_offset = current_block_offset;
-        context
-            .line_data_mut()
-            .line_boxes
-            .push(line_box::LineBoxData::new(builder.direction, builder.writing_mode));
+        builder.push_line_box();
         builder.begin_new_line(false, true, ForcedBreak::No);
         builder.current_line_committed_pending_margin = true;
         builder
@@ -129,14 +211,21 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         self.context().line_data().line_boxes.len()
     }
 
+    fn push_line_box(&self) {
+        self.context()
+            .line_data_mut()
+            .line_boxes
+            .push(line_box::LineBoxData::new(
+                self.direction,
+                // NB: Lines are laid out in the frame of their formatting context, where they run horizontally.
+                writing_mode::HORIZONTAL_TB,
+                self.context().current_line_start.get(),
+            ));
+    }
+
     fn ensure_last_line_index(&mut self) -> usize {
         if self.line_count() == 0 {
-            let direction = self.direction;
-            let writing_mode = self.writing_mode;
-            self.context()
-                .line_data_mut()
-                .line_boxes
-                .push(line_box::LineBoxData::new(direction, writing_mode));
+            self.push_line_box();
         }
         self.line_count() - 1
     }
@@ -168,10 +257,10 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         if let Some((cached_node, data, style_payloads)) = self.facts_cache.get()
             && cached_node == node
         {
-            return NodeFacts::from_lookups(&self.context.callbacks, node, data, style_payloads);
+            return NodeFacts::from_lookups(&self.context.pass, node, data, style_payloads);
         }
-        let facts = NodeFacts::new(&self.context.callbacks, node);
-        self.facts_cache.set(Some((node, facts.data(), facts.style_payloads())));
+        let facts = NodeFacts::new(&self.context.pass, node);
+        self.facts_cache.set(Some((node, facts.data(), facts.style_view())));
         facts
     }
 
@@ -185,7 +274,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         let style = self.style(style_source);
         let facts = self.facts(node);
         let (text_utf16, text_length) = if facts.is_text_node() {
-            let text = &self.context().callbacks.text_content(node).text;
+            let text = &self.context().pass.text_content(node).text;
             (text.as_ptr(), text.len())
         } else {
             (std::ptr::null(), 0)
@@ -220,51 +309,58 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 self.current_block_offset += self.max_block_size_on_current_line.max(line_height);
             }
         }
+        if self.float_fit_heights.is_some() {
+            self.max_block_size_on_current_line = CssPixels::default();
+        }
         self.recalculate_available_space();
         let line_index = self.ensure_last_line_index();
         self.line_mut(line_index).original_available_inline_size = self.available_inline_size_for_current_line;
         self.max_block_size_on_current_line = CssPixels::default();
         self.last_line_needs_update = true;
         self.should_advance_to_last_line_box_block_end = false;
-        let mut should_indent = self.line_count() <= 1 || (self.text_indent_each_line && forced == ForcedBreak::Yes);
-        if self.text_indent_hanging {
-            should_indent = !should_indent;
-        }
-        if should_indent {
-            let indent = self.text_indent;
-            self.line_mut(line_index).inline_length += indent;
-        }
+        let indent = self.text_indentation.indent_of_line(
+            self.line_count() <= 1 && !self.is_continuation,
+            forced == ForcedBreak::Yes,
+        );
+        self.line_mut(line_index).inline_length += indent;
         self.current_line_committed_pending_margin = false;
     }
 
     pub(crate) fn break_line(
         &mut self,
         forced: ForcedBreak,
-        forced_break_node: NodeSlotId,
+        forced_break: Option<inline_content::ForcedBreakPosition>,
         next_size: Option<CssPixels>,
     ) {
         // FIXME: Respect inline direction.
 
+        self.keep_line_of_collapsed_whitespace_edges();
         let line_index = self.ensure_last_line_index();
         {
             let mut line = self.line_mut(line_index);
             line.has_break = true;
             line.has_forced_break = forced == ForcedBreak::Yes;
-            line.forced_break_node = forced_break_node;
+            line.forced_break = forced_break;
         }
         self.last_line_needs_update = true;
         self.update_last_line(forced == ForcedBreak::No || next_size.is_some());
+        if forced == ForcedBreak::Yes || !self.line(line_index).fragments.is_empty() {
+            self.float_fit_line_index += 1;
+        }
+        if forced == ForcedBreak::Yes {
+            self.forced_break_count += 1;
+        }
 
         let mut break_count = 0usize;
         loop {
-            self.context()
-                .line_data_mut()
-                .line_boxes
-                .push(line_box::LineBoxData::new(self.direction, self.writing_mode));
+            self.push_line_box();
             self.begin_new_line(true, break_count == 0, forced);
             break_count += 1;
             let line_height = self.containing_style().line_height();
-            let current_line_block_size = self.max_block_size_on_current_line.max(line_height);
+            let current_line_block_size = self
+                .max_block_size_on_current_line
+                .max(line_height)
+                .max(self.float_fit_height());
             let floats_intrude = self.context().any_floats_intrude_in_block_range(
                 self.current_block_offset,
                 self.current_block_offset + current_line_block_size,
@@ -274,7 +370,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             if !floats_intrude
                 || (self
                     .context()
-                    .can_fit_new_line_at_block_offset(self.current_block_offset, line_height)
+                    .can_fit_new_line_at_block_offset(self.current_block_offset, current_line_block_size)
                     && !next_too_wide)
             {
                 break;
@@ -286,27 +382,53 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         self.line_count() == 0 || self.line(self.line_count() - 1).is_empty()
     }
 
-    fn remaining_inline_size_on_current_line(&mut self) -> Option<CssPixels> {
-        let AvailableSize::Definite(available) = self.available_inline_size_for_current_line else {
+    pub(crate) fn can_break_before_next_item(&mut self) -> bool {
+        !self.current_line_is_empty() || self.floats_intrude_at_current_line_start()
+    }
+
+    fn floats_intrude_at_current_line_start(&self) -> bool {
+        let line_height = self.containing_style().line_height().max(self.float_fit_height());
+        self.context()
+            .any_floats_intrude_in_block_range(self.current_block_offset, self.current_block_offset + line_height)
+    }
+
+    /// The inline size the current line breaks at. Balancing breaks lines before they fill the available inline size,
+    /// but they still align within it.
+    fn inline_size_to_break_current_line_at(&self) -> AvailableSize {
+        let balancing_reduction = self
+            .balancing_reductions
+            .get(self.forced_break_count)
+            .copied()
+            .flatten();
+        match (self.available_inline_size_for_current_line, balancing_reduction) {
+            (AvailableSize::Definite(available), Some(reduction)) => AvailableSize::Definite(available - reduction),
+            (available, _) => available,
+        }
+    }
+
+    fn remaining_inline_size_on_current_line_within(&mut self, inline_size: AvailableSize) -> Option<CssPixels> {
+        let AvailableSize::Definite(available) = inline_size else {
             return None;
         };
         let line_index = self.ensure_last_line_index();
         Some(available - self.line(line_index).physical_horizontal_extent())
     }
 
+    /// NB: Balancing does not break words that fit the available inline size, so they overflow the inline size the
+    ///     line breaks at instead.
     pub(crate) fn remaining_inline_size_for_overflow_break(&mut self) -> Option<CssPixels> {
-        match self.available_inline_size_for_current_line {
-            AvailableSize::Definite(_) => self.remaining_inline_size_on_current_line(),
-            AvailableSize::MinContent => Some(CssPixels::default()),
-            AvailableSize::MaxContent | AvailableSize::Indefinite => None,
-        }
+        self.remaining_inline_size_on_current_line_within(self.available_inline_size_for_current_line)
+    }
+
+    pub(crate) fn only_finds_line_breaks(&self) -> bool {
+        self.only_finds_line_breaks
     }
 
     pub(crate) fn break_if_needed(&mut self, next_item_inline_size: CssPixels) -> bool {
         if !self.should_break(next_item_inline_size) {
             return false;
         }
-        self.break_line(ForcedBreak::No, NodeSlotId::INVALID, Some(next_item_inline_size));
+        self.break_line(ForcedBreak::No, None, Some(next_item_inline_size));
         true
     }
 
@@ -317,7 +439,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         if !self.should_break(next_item_inline_size) {
             return false;
         }
-        self.break_line(ForcedBreak::No, NodeSlotId::INVALID, None);
+        self.break_line(ForcedBreak::No, None, None);
         true
     }
 
@@ -334,7 +456,9 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         }
     }
     pub(crate) fn current_line_has_no_space_left_by_floats(&mut self) -> bool {
-        let Some(remaining) = self.remaining_inline_size_on_current_line() else {
+        let Some(remaining) =
+            self.remaining_inline_size_on_current_line_within(self.available_inline_size_for_current_line)
+        else {
             return false;
         };
         if remaining > CssPixels::default() {
@@ -342,26 +466,26 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         }
         let line_height = self.containing_style().line_height();
         let block_start = self.current_block_offset;
-        let block_end = block_start + self.max_block_size_on_current_line.max(line_height);
+        let block_end = block_start
+            + self
+                .max_block_size_on_current_line
+                .max(line_height)
+                .max(self.float_fit_height());
         self.context().any_floats_intrude_in_block_range(block_start, block_end)
     }
 
-    pub(crate) fn append_box(
-        &mut self,
-        node: Node,
-        leading_size: CssPixels,
-        trailing_size: CssPixels,
-        leading_margin: CssPixels,
-        trailing_margin: CssPixels,
-        content_baselines: DerivedBaselines,
-    ) {
+    /// Appends the box of `item`, an element item, to the current line.
+    pub(crate) fn append_box(&mut self, item: &inline_level_iterator::Item) {
+        let node = item.node;
+        let leading_size = item.border_start + item.padding_start;
+        let trailing_size = item.padding_end + item.border_end;
+        let box_cells = item.box_cells();
         self.prepare_to_append_inline_content();
-        let used = self.context().used(node);
-        let content_inline = used.content_inline_size.get();
-        let content_block = used.content_block_size.get();
-        let border_start = used.border_box_top(false);
-        let border_end = used.border_box_bottom(false);
-        let margin_block_size = used.margin_box_block_size(false);
+        let content_inline = box_cells.content_inline_size;
+        let content_block = box_cells.content_block_size;
+        let border_start = box_cells.border_box_top(false);
+        let border_end = box_cells.border_box_bottom(false);
+        let margin_block_size = box_cells.margin_box_block_size(false);
         let line_index = self.ensure_last_line_index();
         let fragment_index = self.line(line_index).fragments.len();
         let fragment_facts = self.fragment_facts(node);
@@ -372,8 +496,8 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             0,
             leading_size,
             trailing_size,
-            leading_margin,
-            trailing_margin,
+            item.margin_start,
+            item.margin_end,
             content_inline,
             content_block,
             border_start,
@@ -383,11 +507,133 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             text_align_is_justify,
             line_box_fragment::TrailingWhitespace::default(),
         );
-        self.line_mut(line_index).fragments[fragment_index].content_baselines = Some(content_baselines);
+        {
+            let mut line = self.line_mut(line_index);
+            let fragment = &mut line.fragments[fragment_index];
+            fragment.content_baselines = Some(item.content_baselines());
+            fragment.box_cells = Some(box_cells);
+        }
         self.max_block_size_on_current_line = self.max_block_size_on_current_line.max(margin_block_size);
     }
 
-    pub(crate) fn append_text_item(&mut self, item: &mut inline_level_iterator::Item, content_block_size: CssPixels) {
+    pub(crate) fn append_inline_edge(&mut self, item: &inline_level_iterator::Item) {
+        self.append_empty_fragment(
+            item.node,
+            item.border_start + item.padding_start,
+            item.border_end + item.padding_end,
+            item.margin_start,
+            item.margin_end,
+        );
+    }
+
+    fn append_empty_fragment(
+        &mut self,
+        node: Node,
+        leading_size: CssPixels,
+        trailing_size: CssPixels,
+        leading_margin: CssPixels,
+        trailing_margin: CssPixels,
+    ) {
+        self.prepare_to_append_inline_content();
+        let line_index = self.ensure_last_line_index();
+        let facts = self.fragment_facts(node);
+        let block_size = TextLayoutBounds::new(self.style(facts.style_source), None).block_size();
+        self.line_mut(line_index).add_fragment(
+            node,
+            0,
+            0,
+            leading_size,
+            trailing_size,
+            leading_margin,
+            trailing_margin,
+            CssPixels::default(),
+            block_size,
+            CssPixels::default(),
+            CssPixels::default(),
+            None,
+            facts,
+            false,
+            line_box_fragment::TrailingWhitespace::default(),
+        );
+        self.max_block_size_on_current_line = self.max_block_size_on_current_line.max(block_size);
+    }
+
+    /// Collapsed whitespace adds no fragment, so that whitespace after it keeps collapsing too.
+    fn append_edges_of_collapsed_whitespace(
+        &mut self,
+        margin: CssPixels,
+        border: CssPixels,
+        padding: CssPixels,
+    ) -> bool {
+        let none = CssPixels::default();
+        if margin == none && border == none && padding == none {
+            return false;
+        }
+        self.prepare_to_append_inline_content();
+        let line_index = self.ensure_last_line_index();
+        self.line_mut(line_index)
+            .advance_inline_length(margin + border + padding);
+        true
+    }
+
+    pub(crate) fn append_start_edges_of_collapsed_whitespace(
+        &mut self,
+        node: Node,
+        margin: CssPixels,
+        border: CssPixels,
+        padding: CssPixels,
+    ) {
+        if self.append_edges_of_collapsed_whitespace(margin, border, padding) {
+            let inline_offset = self.line(self.line_count() - 1).inline_length;
+            self.note_edges_of_collapsed_whitespace(node, inline_offset);
+        }
+    }
+
+    fn note_edges_of_collapsed_whitespace(&mut self, node: Node, inline_offset: CssPixels) {
+        match self.nodes_with_edges_of_collapsed_whitespace.last_mut() {
+            Some(last) if last.0 == node => last.1 = inline_offset,
+            _ => self
+                .nodes_with_edges_of_collapsed_whitespace
+                .push((node, inline_offset)),
+        }
+    }
+
+    pub(crate) fn append_end_edges_of_collapsed_whitespace(
+        &mut self,
+        node: Node,
+        margin: CssPixels,
+        border: CssPixels,
+        padding: CssPixels,
+    ) {
+        if self.append_edges_of_collapsed_whitespace(margin, border, padding) {
+            let inline_offset = self.line(self.line_count() - 1).inline_length - (margin + border + padding);
+            self.note_edges_of_collapsed_whitespace(node, inline_offset);
+        }
+    }
+
+    /// Nonzero inline-axis edges keep a line box even when it contains no text.
+    /// https://drafts.csswg.org/css-inline-3/#invisible-line-boxes
+    pub(crate) fn keep_line_of_collapsed_whitespace_edges(&mut self) {
+        let nodes = std::mem::take(&mut self.nodes_with_edges_of_collapsed_whitespace);
+        if nodes.is_empty() || !self.current_line_is_empty() {
+            return;
+        }
+        let none = CssPixels::default();
+        for (node, inline_offset) in nodes {
+            // NB: The line has already advanced past these edges, so each fragment goes back to where its node was.
+            let distance = self.line(self.line_count() - 1).inline_length - inline_offset;
+            self.append_empty_fragment(node, none, none, none - distance, distance);
+        }
+    }
+
+    pub(crate) fn append_text_item(
+        &mut self,
+        item: &mut inline_level_iterator::Item,
+        prepared: &prepared_inline_content::PreparedInlineContent,
+        style: StyleValues,
+    ) {
+        let glyphs = item.take_glyph_run(prepared);
+        let content_block_size = TextLayoutBounds::new(style, Some(glyphs.font)).block_size();
         self.append_text_chunk(
             item.node,
             item.offset_in_node,
@@ -398,7 +644,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             item.margin_end,
             item.inline_size,
             content_block_size,
-            item.glyphs.take().unwrap(),
+            glyphs,
             item.trailing_whitespace,
         );
     }
@@ -415,7 +661,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         trailing_margin: CssPixels,
         content_inline_size: CssPixels,
         content_block_size: CssPixels,
-        glyphs: line_box_fragment::GlyphData,
+        glyphs: line_box_fragment::ItemGlyphRun<'_>,
         trailing_whitespace: line_box_fragment::TrailingWhitespace,
     ) {
         self.prepare_to_append_inline_content();
@@ -489,6 +735,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
     }
 
     pub(crate) fn finish_current_line_before_block_level_box(&mut self) {
+        self.keep_line_of_collapsed_whitespace_edges();
         if self.line_count() == 0 || self.line(self.line_count() - 1).is_empty() {
             return;
         }
@@ -497,10 +744,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         self.line_mut(line_index).has_forced_break = true;
         self.last_line_needs_update = true;
         self.update_last_line(false);
-        self.context()
-            .line_data_mut()
-            .line_boxes
-            .push(line_box::LineBoxData::new(self.direction, self.writing_mode));
+        self.push_line_box();
         self.begin_new_line(true, true, ForcedBreak::No);
     }
 
@@ -516,26 +760,15 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         line_index: usize,
         block_end: CssPixels,
         block_end_margin: CssPixels,
+        block_level_box: line_box::BlockLevelBoxOnLine,
     ) {
-        let used = self.context().used(node);
-        assert!(used.has_content_offset.get());
-        let (inline_offset, block_offset) = geometry::to_logical(
-            self.writing_mode,
-            used.content_offset.get().x,
-            used.content_offset.get().y,
-        );
-        let (inline_length, block_length) = geometry::to_logical(
-            self.writing_mode,
-            used.content_inline_size.get(),
-            used.content_block_size.get(),
-        );
-        let border_start = used.border_box_top(false);
-        let line_inline_length = geometry::to_logical(
-            self.writing_mode,
-            used.margin_box_inline_size(false),
-            used.margin_box_block_size(false),
-        )
-        .0;
+        let block = block_level_box.cells;
+        let inline_offset = block_level_box.content_offset.x;
+        let block_offset = block_level_box.content_offset.y;
+        let inline_length = block.content_inline_size;
+        let block_length = block.content_block_size;
+        let border_start = block.border_box_top(false);
+        let line_inline_length = block.margin_box_inline_size(false);
         let ensured_line_index = self.ensure_last_line_index();
         assert_eq!(line_index, ensured_line_index);
         assert!(self.line(line_index).fragments.is_empty());
@@ -549,7 +782,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             block_length,
             border_start,
             self.direction,
-            self.writing_mode,
+            writing_mode::HORIZONTAL_TB,
             None,
             self.fragment_facts(node),
         );
@@ -563,6 +796,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             line.block_end = block_end;
             line.baseline = CssPixels::default();
             line.has_block_level_box = true;
+            line.block_level_box = Some(block_level_box);
             line.block_level_box_block_end_margin = block_end_margin;
             line.has_break = true;
             line.has_forced_break = true;
@@ -575,15 +809,13 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         self.max_block_size_on_current_line = CssPixels::default();
         self.last_line_needs_update = false;
         self.should_advance_to_last_line_box_block_end = false;
-        self.context()
-            .line_data_mut()
-            .line_boxes
-            .push(line_box::LineBoxData::new(self.direction, self.writing_mode));
+        self.push_line_box();
         self.begin_new_line(false, true, ForcedBreak::No);
     }
 
-    pub(crate) fn ceiling_for_float_to_be_inserted_here(&mut self, node: Node) -> CssPixels {
-        let float_inline_size = self.context().used(node).margin_box_inline_size(false);
+    /// The block offset a float whose margin box is `float_inline_size` wide is placed at: beside the content of the
+    /// current line where the float fits there, and below that line otherwise.
+    pub(crate) fn ceiling_for_float_to_be_inserted_here(&mut self, float_inline_size: CssPixels) -> CssPixels {
         let mut candidate = self.current_block_offset;
         let line_index = self.ensure_last_line_index();
         let mut line = self.line_mut(line_index);
@@ -600,35 +832,38 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 .available_inline_size_for_current_line
                 .pixels_greater_than(needed + float_inline_size)
         {
-            // This intentionally mixes physical horizontal and inline axes in
-            // vertical writing modes, matching the old implementation.
-            candidate += self.line(line_index).physical_vertical_extent();
+            // NB: Align the content so far within the line box, as finishing the line does, to find how far that
+            //     line box reaches. Aligning moves the fragments of the line, so put them back afterwards; the line is
+            //     aligned again once it is finished.
+            let line_before_alignment = self.line(line_index).clone();
+            let alignment = self.align_fragments_of_line(line_index, CssPixels::default(), CssPixels::default());
+            *self.line_mut(line_index) = line_before_alignment;
+            let line_height = self.containing_style().line_height();
+            candidate += self
+                .max_block_size_on_current_line
+                .max(line_height)
+                .max(alignment.latest - alignment.earliest);
         }
         candidate.max(self.context().block_axis_float_clearance())
     }
 
     fn should_break(&mut self, next_item_inline_size: CssPixels) -> bool {
-        if self.available_inline_size_for_current_line == AvailableSize::MaxContent {
-            return false;
-        }
-        if self.current_line_is_empty() {
-            let line_height = self.containing_style().line_height();
-            if !self
-                .context()
-                .any_floats_intrude_in_block_range(self.current_block_offset, self.current_block_offset + line_height)
-            {
+        let inline_size_to_break_at = if self.current_line_is_empty() {
+            if !self.floats_intrude_at_current_line_start() {
                 return false;
             }
-        }
+            // NB: Balancing moves breaks between the content of lines, not lines past floats.
+            self.available_inline_size_for_current_line
+        } else {
+            self.inline_size_to_break_current_line_at()
+        };
         let line_index = self.ensure_last_line_index();
         let current_inline_size = self.line(line_index).physical_horizontal_extent();
-        self.available_inline_size_for_current_line
-            .pixels_greater_than(current_inline_size + next_item_inline_size)
+        inline_size_to_break_at.pixels_greater_than(current_inline_size + next_item_inline_size)
     }
 
-    fn baseline_for_style(style: StyleValues, line_height: CssPixels) -> CssPixels {
-        let typographic = CssPixels::nearest_value_for_f32(style.font_ascent() + style.font_descent());
-        CssPixels::nearest_value_for_f32(style.font_ascent()) + (line_height - typographic) / 2
+    pub(super) fn baseline_for_style(style: StyleValues, line_height: CssPixels) -> CssPixels {
+        TextLayoutBounds::with_leading(style.font_ascent(), style.font_descent(), line_height).ascent
     }
 
     // The style of the box that an inline-level box is aligned against, which is its parent inline box, or the block
@@ -685,16 +920,21 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                         - metrics.block_size)
                         / 2
             }
+            vertical_align::_LIBWEB_BASELINE_MIDDLE => {
+                self.current_block_offset
+                    + line_box_baseline
+                    + (metrics.effective_box_block_start_offset
+                        - metrics.effective_box_block_end_offset
+                        - metrics.block_size)
+                        / 2
+            }
             vertical_align::SUB => alphabetic + self.containing_style().font_size() / 5,
             vertical_align::SUPER => alphabetic - self.containing_style().font_size() / 3,
             // A top- or bottom-aligned box is the root of an aligned subtree, laid out on the baseline here and
             // shifted into place once the final line box size is known. These arms therefore only see boxes that
             // form no aligned subtree: the containing block itself, whose alignment does not apply to the line box
-            // it establishes, and every box in a writing mode below.
-            // FIXME: Line box alignment still uses physical vertical metrics in non-horizontal writing modes.
-            vertical_align::TOP if self.writing_mode == writing_mode::HORIZONTAL_TB => alphabetic,
-            vertical_align::TOP => self.current_block_offset + metrics.effective_box_block_start_offset,
-            vertical_align::BOTTOM => alphabetic,
+            // it establishes.
+            vertical_align::TOP | vertical_align::BOTTOM => alphabetic,
             vertical_align::TEXT_TOP => {
                 self.current_block_offset + line_box_baseline
                     - CssPixels::nearest_value_for_f32(parent_style.font_ascent())
@@ -713,12 +953,6 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
 
     // https://drafts.csswg.org/css2/#line-height
     fn line_relative_aligned_subtree_root(&self, style_source: Node) -> Option<(Node, u8)> {
-        // FIXME: Line box alignment still uses physical vertical metrics in non-horizontal writing modes, where
-        //        top and bottom are approximated without forming aligned subtrees.
-        if self.writing_mode != writing_mode::HORIZONTAL_TB {
-            return None;
-        }
-
         // An aligned subtree contains its inline-level box and the aligned subtrees of all children except any
         // descendant subtree whose root is itself aligned to the line box. Walking outwards therefore stops at the
         // nearest ancestor aligned to the line box, and at the first ancestor that is not an inline box of this
@@ -749,16 +983,139 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             .unwrap_or(normal_subtree_shift)
     }
 
+    fn text_fragment_layout_bounds(
+        &self,
+        line_index: usize,
+        fragment_index: usize,
+        style: StyleValues,
+    ) -> TextLayoutBounds {
+        let fragment = &self.line(line_index).fragments[fragment_index];
+        TextLayoutBounds::new(style, fragment.glyphs.as_ref().map(|glyphs| &glyphs.font))
+    }
+
     fn inline_box_alignment_metrics(&self, node: Node) -> VerticalAlignMetrics {
         let style = self.style(node);
-        let used = self.context().used(node);
+        let sides = self.context().sides_of_entered_inline_box(node);
         VerticalAlignMetrics {
             baseline: Self::baseline_for_style(style, style.line_height()),
             block_size: style.line_height(),
-            effective_box_block_start_offset: used.border_box_top(false),
-            effective_box_block_end_offset: used.border_box_bottom(false),
+            effective_box_block_start_offset: sides.border_box_top(false),
+            effective_box_block_end_offset: sides.border_box_bottom(false),
             line_height: style.line_height(),
         }
+    }
+
+    /// The baseline of the line box at `line_index` from its block start, and whether the strut of the block
+    /// container is aligned to that baseline rather than to the block start of the line box.
+    fn line_box_baseline(&self, line_index: usize, has_line_relative_aligned_subtree: bool) -> (CssPixels, bool) {
+        let containing_style = self.containing_style();
+        let mut should_align_strut_to_line_box_baseline = false;
+        let mut line_box_baseline = Self::baseline_for_style(containing_style, containing_style.line_height());
+        let fragment_count = self.line(line_index).fragments.len();
+        for fragment_index in 0..fragment_count {
+            if self.line(line_index).fragments[fragment_index].is_fully_truncated {
+                continue;
+            }
+            let (node, style_source, content_baselines, box_cells, is_block_ellipsis) = {
+                let fragment = &self.line(line_index).fragments[fragment_index];
+                (
+                    fragment.layout_node,
+                    fragment.style_source,
+                    fragment.content_baselines,
+                    fragment.box_cells,
+                    fragment.is_block_ellipsis,
+                )
+            };
+            let style = self.style(style_source);
+            let fragment_baseline =
+                if is_block_ellipsis || self.facts(node).is_text_node() || self.facts(node).is_fragmented_inline() {
+                    self.text_fragment_layout_bounds(line_index, fragment_index, style)
+                        .ascent
+                } else {
+                    let box_cells = box_cells.expect("the fragment of an element item carries the cells of its box");
+                    formatting_context::inline_box_baseline(
+                        &self.context().pass,
+                        node,
+                        &box_cells,
+                        content_baselines
+                            .expect("the fragment of an element item carries the content baselines of its box"),
+                    )
+                };
+            self.line_mut(line_index).fragments[fragment_index].baseline = fragment_baseline;
+            if has_line_relative_aligned_subtree && self.line_relative_aligned_subtree_root(style_source).is_some() {
+                continue;
+            }
+            let alignment_style = self.alignment_style(style_source, style);
+            let adjusted_baseline = if alignment_style.vertical_align_is_keyword() {
+                fragment_baseline
+            } else {
+                fragment_baseline + alignment_style.vertical_align_value().to_px(style.line_height())
+            };
+            if adjusted_baseline > line_box_baseline {
+                if !self.facts(node).is_text_node() && alignment_style.vertical_align_is_keyword() {
+                    // https://drafts.csswg.org/css2/#line-height
+                    // The minimum height consists of a minimum height above the baseline and a minimum depth below
+                    // it, exactly as if each line box starts with a zero-width inline box with the element's font and
+                    // line height properties.
+                    should_align_strut_to_line_box_baseline |= has_line_relative_aligned_subtree
+                        || ((style.display().is_inline_block()
+                            || (style.display().is_inline_outside()
+                                && (style.display().is_flex_inside() || style.display().is_grid_inside())))
+                            && alignment_style.vertical_align_keyword() == vertical_align::BASELINE);
+                }
+                line_box_baseline = adjusted_baseline;
+            }
+            // https://drafts.csswg.org/css2/#line-height
+            // The inline-level boxes are aligned vertically according to their 'vertical-align' property.
+            // NB: An inline box around the fragment that sits on the baseline holds its own layout bounds above it, which
+            //     a box whose content is only other inline boxes has no text fragment of its own to bring in.
+            let containing_block = self.context().containing_block;
+            let mut ancestor = if style_source == containing_block {
+                NodeSlotId::INVALID
+            } else {
+                self.context().parent_node(style_source)
+            };
+            while !ancestor.is_invalid() && ancestor != containing_block && self.facts(ancestor).is_fragmented_inline()
+            {
+                let ancestor_style = self.style(ancestor);
+                if !ancestor_style.vertical_align_is_keyword()
+                    || ancestor_style.vertical_align_keyword() != vertical_align::BASELINE
+                {
+                    break;
+                }
+                let ascent = TextLayoutBounds::new(ancestor_style, None).ascent;
+                if ascent > line_box_baseline {
+                    should_align_strut_to_line_box_baseline = true;
+                    line_box_baseline = ascent;
+                }
+                ancestor = self.context().parent_node(ancestor);
+            }
+        }
+        if let Some(marker_line) = self.outside_marker_line(line_index)
+            && marker_line.ascent > line_box_baseline
+        {
+            should_align_strut_to_line_box_baseline = true;
+            line_box_baseline = marker_line.ascent;
+        }
+        (line_box_baseline, should_align_strut_to_line_box_baseline)
+    }
+
+    /// The outside markers whose list items have the line at `line_index` as their first line box.
+    fn outside_marker_line(&self, line_index: usize) -> Option<block_formatting_context::OutsideMarkerLine> {
+        let line = self.line(line_index);
+        if line.is_empty() || line.has_block_level_box || self.has_line_box_before(line_index) {
+            return None;
+        }
+        self.outside_marker_line
+    }
+
+    /// Whether a line before the line at `line_index` holds content.
+    pub(crate) fn has_line_box_before(&self, line_index: usize) -> bool {
+        (0..line_index).any(|index| !self.line(index).is_empty())
+    }
+
+    pub(crate) fn set_outside_marker_line(&mut self, marker_line: Option<block_formatting_context::OutsideMarkerLine>) {
+        self.outside_marker_line = marker_line;
     }
 
     // https://drafts.csswg.org/css2/#line-height
@@ -779,9 +1136,9 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         if has_fragments {
             self.prepare_to_append_inline_content();
         }
-        let containing_style = self.containing_style();
+        let containing_style = self.containing_style;
         let unclamped_line_block_size = self.max_block_size_on_current_line.max(containing_style.line_height());
-        if has_fragments || self.line(line_index).has_forced_break {
+        if !self.only_finds_line_breaks && (has_fragments || self.line(line_index).has_forced_break) {
             self.context().prepare_line_for_line_clamp(
                 line_index,
                 has_immediate_continuation,
@@ -789,12 +1146,19 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             );
         }
 
+        // Mirroring must use the retained line width, so discarded trailing spaces don't become leading gaps.
+        if self.context().atomic_items_are_right_to_left
+            && self.line(line_index).inline_length_before_block_ellipsis.is_none()
+        {
+            self.line_mut(line_index).trim_trailing_whitespace();
+        }
+
         let current_line_block_size = if self.line(line_index).inline_length_before_block_ellipsis.is_some() {
             self.line(line_index)
                 .visible_fragments()
                 .map(|fragment| {
                     if fragment.is_atomic_inline {
-                        self.context().used(fragment.layout_node).margin_box_block_size(false)
+                        fragment.box_cells().margin_box_block_size(false)
                     } else {
                         fragment.block_length
                     }
@@ -805,9 +1169,30 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         } else {
             unclamped_line_block_size
         };
+        let fitted_height = current_line_block_size.max(self.float_fit_height());
+        if self.float_fit_trial && has_fragments {
+            let line_before_alignment = self.line(line_index).clone();
+            let alignment = self.align_fragments_of_line(line_index, CssPixels::default(), CssPixels::default());
+            *self.line_mut(line_index) = line_before_alignment;
+            let height = alignment.latest - alignment.earliest;
+            let available = self
+                .context()
+                .available_space_for_line(self.current_block_offset, height);
+            if height > self.float_fit_height()
+                && (available != self.available_inline_size_for_current_line
+                    || self
+                        .context()
+                        .leftmost_inline_offset_at(self.current_block_offset, height)
+                        != self
+                            .context()
+                            .leftmost_inline_offset_at(self.current_block_offset, fitted_height))
+            {
+                self.float_refit.get_or_insert((self.float_fit_line_index, height));
+            }
+        }
         let start_inline_offset = self
             .context()
-            .leftmost_inline_offset_at(self.current_block_offset, current_line_block_size);
+            .leftmost_inline_offset_at(self.current_block_offset, fitted_height);
         let aligned_inline_offset = |inline_length| {
             let excess = self.available_inline_size_for_current_line.to_px_or_zero() - inline_length;
             if excess < CssPixels::default() {
@@ -830,76 +1215,123 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 }
         };
         let inline_offset = aligned_inline_offset(self.line(line_index).inline_length);
-        let mut block_offset = CssPixels::default();
-        if self.writing_mode != writing_mode::HORIZONTAL_TB {
-            block_offset =
-                self.available_inline_size_for_current_line.to_px_or_zero() - self.line(line_index).block_length;
+        let block_offset = CssPixels::default();
+
+        let LineAlignment {
+            earliest,
+            latest,
+            line_box_baseline,
+            mut should_advance_to_line_box_block_end,
+            has_line_relative_aligned_subtree,
+            mut aligned_subtrees,
+            first_unshifted_text_baseline,
+        } = self.align_fragments_of_line(line_index, inline_offset, block_offset);
+        let fragment_count = self.line(line_index).fragments.len();
+        let current_block_offset = self.current_block_offset;
+
+        let refitted = self.float_fit_height() > CssPixels::default();
+        should_advance_to_line_box_block_end |= refitted;
+        let normal_subtree_shift = if has_line_relative_aligned_subtree || refitted {
+            self.current_block_offset - earliest
+        } else {
+            CssPixels::default()
+        };
+        for subtree in &mut aligned_subtrees {
+            subtree.shift = if subtree.alignment == vertical_align::TOP {
+                self.current_block_offset - subtree.block_start
+            } else {
+                self.current_block_offset + latest - earliest - subtree.block_end
+            };
         }
 
+        if has_line_relative_aligned_subtree || refitted {
+            for fragment_index in 0..fragment_count {
+                let style_source = self.line(line_index).fragments[fragment_index].style_source;
+                let shift = self.subtree_shift_for_box(style_source, &aligned_subtrees, normal_subtree_shift);
+                let mut line = self.line_mut(line_index);
+                let fragment = &mut line.fragments[fragment_index];
+                fragment.block_offset += shift;
+                // The line baseline moves by the normal subtree shift, so only displacement beyond
+                // it keeps a fragment away from its baseline-aligned position.
+                fragment.accumulated_vertical_shift += shift - normal_subtree_shift;
+            }
+            // Inline box baselines were recorded before the subtree shifts, so move them into the
+            // shifted frame.
+            let baseline_count = self.line(line_index).inline_box_baselines.len();
+            for baseline_index in 0..baseline_count {
+                let box_ = self.line(line_index).inline_box_baselines[baseline_index].box_;
+                let shift = self.subtree_shift_for_box(box_, &aligned_subtrees, normal_subtree_shift);
+                let mut line = self.line_mut(line_index);
+                let entry = &mut line.inline_box_baselines[baseline_index];
+                entry.baseline += shift;
+                entry.accumulated_vertical_shift += shift - normal_subtree_shift;
+            }
+        }
+
+        let marker_count = self.line(line_index).static_position_markers.len();
+        let marker_inline_offset = self
+            .line(line_index)
+            .inline_length_before_block_ellipsis
+            .map_or(inline_offset, aligned_inline_offset);
+        for marker_index in 0..marker_count {
+            // Static position markers are resolved against the inline box that contains them, so they move with that
+            // box's aligned subtree.
+            let box_ = self.line(line_index).static_position_markers[marker_index].box_;
+            let shift = self.subtree_shift_for_box(
+                self.context().parent_node(box_),
+                &aligned_subtrees,
+                normal_subtree_shift,
+            );
+            let mut line = self.line_mut(line_index);
+            // NB: A marker records where its box would have been in the logical order of the line's content, which a
+            //     right-to-left line lays out from its right end.
+            // FIXME: Resolve the marker's position within the visual order of the line's bidi runs.
+            if line.direction == direction::RTL {
+                let content_inline_length = line.inline_length;
+                let marker = &mut line.static_position_markers[marker_index];
+                marker.inline_offset = content_inline_length - marker.inline_offset;
+            }
+            let marker = &mut line.static_position_markers[marker_index];
+            marker.inline_offset += marker_inline_offset;
+            marker.block_offset += block_offset + current_block_offset + shift;
+        }
+        {
+            let mut line = self.line_mut(line_index);
+            line.block_length = latest - earliest;
+            line.block_start = current_block_offset;
+            line.block_end = current_block_offset + line.block_length;
+            // The painted extent can differ from the advance used by begin_new_line.
+            // Retain that exact advance so a reused prefix resumes at the same position.
+            line.next_line_block_offset = if should_advance_to_line_box_block_end {
+                line.block_end
+            } else {
+                current_block_offset + self.max_block_size_on_current_line.max(containing_style.line_height())
+            };
+            // Fragment block offsets include the reversed-writing-mode shim, so the alignment
+            // baseline fallback must include it as well to share their coordinate space.
+            line.baseline =
+                first_unshifted_text_baseline.unwrap_or(line_box_baseline + block_offset) + normal_subtree_shift;
+        }
+        self.should_advance_to_last_line_box_block_end = should_advance_to_line_box_block_end;
+    }
+
+    /// Aligns the fragments of the line at `line_index` within its line box, and finds the extent of that line box.
+    fn align_fragments_of_line(
+        &self,
+        line_index: usize,
+        inline_offset: CssPixels,
+        block_offset: CssPixels,
+    ) -> LineAlignment {
+        let containing_style = self.containing_style();
         let strut_baseline = Self::baseline_for_style(containing_style, containing_style.line_height());
-        let mut should_align_strut_to_line_box_baseline = false;
-        let mut line_box_baseline = strut_baseline;
         let fragment_count = self.line(line_index).fragments.len();
         let has_line_relative_aligned_subtree = self
             .line(line_index)
             .visible_fragments()
             .any(|fragment| self.line_relative_aligned_subtree_root(fragment.style_source).is_some());
-        for fragment_index in 0..fragment_count {
-            if self.line(line_index).fragments[fragment_index].is_fully_truncated {
-                continue;
-            }
-            let (node, style_source, content_baselines, is_block_ellipsis) = {
-                let fragment = &self.line(line_index).fragments[fragment_index];
-                (
-                    fragment.layout_node,
-                    fragment.style_source,
-                    fragment.content_baselines,
-                    fragment.is_block_ellipsis,
-                )
-            };
-            let style = self.style(style_source);
-            let fragment_baseline = if is_block_ellipsis || self.facts(node).is_text_node() {
-                Self::baseline_for_style(style, style.line_height())
-            } else if let Some(content_baselines) = content_baselines {
-                formatting_context::box_baseline_with_content_baselines(
-                    &self.context().callbacks,
-                    node,
-                    self.context().used(node),
-                    formatting_context::BaselineSet::Last,
-                    content_baselines,
-                )
-            } else {
-                formatting_context::box_baseline(
-                    &self.context().callbacks,
-                    node,
-                    self.context().used(node),
-                    formatting_context::BaselineSet::Last,
-                )
-            };
-            self.line_mut(line_index).fragments[fragment_index].baseline = fragment_baseline;
-            if has_line_relative_aligned_subtree && self.line_relative_aligned_subtree_root(style_source).is_some() {
-                continue;
-            }
-            let alignment_style = self.alignment_style(style_source, style);
-            let adjusted_baseline = if alignment_style.vertical_align_is_keyword() {
-                fragment_baseline
-            } else {
-                fragment_baseline + alignment_style.vertical_align_value().to_px(style.line_height())
-            };
-            if adjusted_baseline > line_box_baseline {
-                if !self.facts(node).is_text_node() && alignment_style.vertical_align_is_keyword() {
-                    // https://drafts.csswg.org/css2/#line-height
-                    // The minimum height consists of a minimum height above the baseline and a minimum depth below
-                    // it, exactly as if each line box starts with a zero-width inline box with the element's font and
-                    // line height properties.
-                    should_align_strut_to_line_box_baseline |= has_line_relative_aligned_subtree
-                        || ((style.display().is_inline_block()
-                            || (style.display().is_inline_outside() && style.display().is_flex_inside()))
-                            && alignment_style.vertical_align_keyword() == vertical_align::BASELINE);
-                }
-                line_box_baseline = adjusted_baseline;
-            }
-        }
+        let (line_box_baseline, should_align_strut_to_line_box_baseline) =
+            self.line_box_baseline(line_index, has_line_relative_aligned_subtree);
+        let mut should_advance_to_line_box_block_end = should_align_strut_to_line_box_baseline;
 
         let strut_start = self.current_block_offset;
         let strut_end = if should_align_strut_to_line_box_baseline {
@@ -909,6 +1341,10 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         };
         let mut earliest = strut_start;
         let mut latest = strut_end;
+        if let Some(marker_line) = self.outside_marker_line(line_index) {
+            earliest = earliest.min(self.current_block_offset + line_box_baseline - marker_line.ascent);
+            latest = latest.max(self.current_block_offset + line_box_baseline + marker_line.descent);
+        }
         let mut aligned_subtrees: Vec<LineRelativeAlignedSubtree> = Vec::new();
         let mut first_unshifted_text_baseline: Option<CssPixels> = None;
         let current_block_offset = self.current_block_offset;
@@ -942,12 +1378,21 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 line_height: style.line_height(),
             };
             if snapshot.is_atomic_inline {
-                let used = self.context().used(snapshot.layout_node);
-                metrics.effective_box_block_start_offset = used.margin_top.get() + used.border_box_top(false);
-                metrics.effective_box_block_end_offset = used.margin_bottom.get() + used.border_box_bottom(false);
+                let atomic_inline = self.line(line_index).fragments[fragment_index].box_cells();
+                metrics.effective_box_block_start_offset =
+                    atomic_inline.margin_top + atomic_inline.border_box_top(false);
+                metrics.effective_box_block_end_offset =
+                    atomic_inline.margin_bottom + atomic_inline.border_box_bottom(false);
             }
             let containing_block = self.context().containing_block;
-            let new_inline_offset = inline_offset + snapshot.inline_offset;
+            let fragment_inline_offset = if self.context().atomic_items_are_right_to_left {
+                self.line(line_index).inline_length
+                    - snapshot.inline_offset
+                    - self.line(line_index).fragments[fragment_index].inline_length
+            } else {
+                snapshot.inline_offset
+            };
+            let new_inline_offset = inline_offset + fragment_inline_offset;
             let own_alignment_is_line_relative = line_relative_alignment(style).is_some();
             let aligned_subtree = has_line_relative_aligned_subtree
                 .then(|| self.line_relative_aligned_subtree_root(snapshot.style_source))
@@ -975,6 +1420,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                     line_box_baseline,
                 )
             };
+            let own_vertical_shift = new_block_offset - baseline_aligned_block_offset;
             if snapshot.style_source != containing_block && self.facts(snapshot.style_source).is_fragmented_inline() {
                 inline_box_alignments.push(InlineBoxAlignment {
                     box_: snapshot.style_source,
@@ -993,6 +1439,10 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             {
                 let ancestor_style = self.style(ancestor);
                 if line_relative_alignment(ancestor_style).is_some() {
+                    inline_box_alignments.push(InlineBoxAlignment {
+                        box_: ancestor,
+                        vertical_shift: CssPixels::default(),
+                    });
                     break;
                 }
                 if ancestor_style.vertical_align_is_keyword()
@@ -1035,31 +1485,22 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 snapshot.block_offset = fragment.block_offset;
             }
 
-            let (inline_box_start, mut inline_box_end) = if snapshot.is_atomic_inline {
-                let used = self.context().used(snapshot.layout_node);
+            let (inline_box_start, inline_box_end) = if snapshot.is_atomic_inline {
+                let atomic_inline = self.line(line_index).fragments[fragment_index].box_cells();
                 (
-                    snapshot.block_offset - (used.margin_top.get() + used.border_box_top(false)),
+                    snapshot.block_offset - (atomic_inline.margin_top + atomic_inline.border_box_top(false)),
                     snapshot.block_offset
-                        + used.content_block_size.get()
-                        + used.margin_bottom.get()
-                        + used.border_box_bottom(false),
+                        + atomic_inline.content_block_size
+                        + atomic_inline.margin_bottom
+                        + atomic_inline.border_box_bottom(false),
                 )
             } else {
-                let typographic = CssPixels::nearest_value_for_f32(style.font_ascent() + style.font_descent());
-                let half_leading = (style.line_height() - typographic) / 2;
+                let bounds = self.text_fragment_layout_bounds(line_index, fragment_index, style);
                 (
-                    snapshot.block_offset + snapshot.baseline
-                        - CssPixels::nearest_value_for_f32(style.font_ascent())
-                        - half_leading,
-                    snapshot.block_offset
-                        + snapshot.baseline
-                        + CssPixels::nearest_value_for_f32(style.font_descent())
-                        + half_leading,
+                    snapshot.block_offset + snapshot.baseline - bounds.ascent,
+                    snapshot.block_offset + snapshot.baseline + bounds.descent,
                 )
             };
-            if !alignment_style.vertical_align_is_keyword() {
-                inline_box_end += alignment_style.vertical_align_value().to_px(style.line_height());
-            }
             if let Some((root, alignment)) = aligned_subtree {
                 if let Some(subtree) = aligned_subtrees.iter_mut().find(|subtree| subtree.root == root) {
                     subtree.block_start = subtree.block_start.min(inline_box_start);
@@ -1079,8 +1520,9 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             }
 
             let is_text_node = self.line(line_index).fragments[fragment_index].is_block_ellipsis
-                || self.facts(snapshot.layout_node).is_text_node();
-            if is_text_node && self.writing_mode == writing_mode::HORIZONTAL_TB {
+                || self.facts(snapshot.layout_node).is_text_node()
+                || self.facts(snapshot.layout_node).is_fragmented_inline();
+            if is_text_node {
                 let font_box_size = normal_line_height(style);
                 let font_baseline = Self::baseline_for_style(style, font_box_size);
                 let fragment_mut = &mut self.line_mut(line_index).fragments[fragment_index];
@@ -1101,24 +1543,58 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 if first_unshifted_text_baseline.is_none() && fragment_is_unshifted {
                     first_unshifted_text_baseline = Some(fragment_baseline - current_block_offset);
                 }
+            }
 
+            let inline_box_layout_baseline = text_fragment_baseline.or_else(|| {
+                snapshot.is_atomic_inline.then_some(
+                    current_block_offset + line_box_baseline + accumulated_vertical_shift - own_vertical_shift,
+                )
+            });
+            if let Some(mut inline_box_baseline) = inline_box_layout_baseline {
                 // https://drafts.csswg.org/css-text-decor-4/#text-line-constancy
                 // UAs must adjust line positions to match the shifted metrics of decorating boxes shifted with
                 // vertical-align values other than baseline [CSS2] or subscripted/superscripted via
                 // font-variant-position [CSS-FONTS-3], but must not adjust the line position or thickness in
                 // response to descendants of a decorating box that are so styled.
-                let mut inline_box_baseline = fragment_baseline;
                 let mut remaining_vertical_shift = accumulated_vertical_shift;
                 for alignment in &inline_box_alignments {
-                    let inserted = self.line_mut(line_index).set_inline_box_baseline(
-                        alignment.box_,
-                        inline_box_baseline,
-                        remaining_vertical_shift,
+                    if is_text_node {
+                        let inserted = self.line_mut(line_index).set_inline_box_baseline(
+                            alignment.box_,
+                            inline_box_baseline,
+                            remaining_vertical_shift,
+                        );
+                        // An already recorded box implies its ancestors are recorded as well, since the
+                        // walk that recorded it continued through them.
+                        if !inserted {
+                            break;
+                        }
+                    }
+                    // https://drafts.csswg.org/css2/#line-height
+                    // The height of each inline-level box in the line box is calculated. For replaced elements,
+                    // inline-block elements, and inline-table elements, this is the height of their margin box; for
+                    // inline boxes, this is their 'line-height'.
+                    // NB: An inline box without direct text contributes its layout bounds around its own baseline,
+                    //     independently of the size and vertical alignment of its descendants.
+                    let bounds = TextLayoutBounds::new(self.style(alignment.box_), None);
+                    let (box_start, box_end) = (
+                        inline_box_baseline - bounds.ascent,
+                        inline_box_baseline + bounds.descent,
                     );
-                    // An already recorded box implies its ancestors are recorded as well, since the
-                    // walk that recorded it continued through them.
-                    if !inserted {
-                        break;
+                    if let Some((root, _)) = aligned_subtree {
+                        if let Some(subtree) = aligned_subtrees.iter_mut().find(|subtree| subtree.root == root) {
+                            should_advance_to_line_box_block_end |=
+                                box_start < subtree.block_start || box_end > subtree.block_end;
+                            subtree.block_start = subtree.block_start.min(box_start);
+                            subtree.block_end = subtree.block_end.max(box_end);
+                        }
+                    } else {
+                        should_advance_to_line_box_block_end |= box_start < current_block_offset
+                            || box_end
+                                > current_block_offset
+                                    + self.max_block_size_on_current_line.max(containing_style.line_height());
+                        earliest = earliest.min(box_start);
+                        latest = latest.max(box_end);
                     }
                     inline_box_baseline -= alignment.vertical_shift;
                     remaining_vertical_shift -= alignment.vertical_shift;
@@ -1138,81 +1614,15 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         };
         latest = latest.max(earliest + maximum_block_size(vertical_align::TOP));
         earliest = earliest.min(latest - maximum_block_size(vertical_align::BOTTOM));
-
-        let normal_subtree_shift = if has_line_relative_aligned_subtree {
-            self.current_block_offset - earliest
-        } else {
-            CssPixels::default()
-        };
-        for subtree in &mut aligned_subtrees {
-            subtree.shift = if subtree.alignment == vertical_align::TOP {
-                self.current_block_offset - subtree.block_start
-            } else {
-                self.current_block_offset + latest - earliest - subtree.block_end
-            };
+        LineAlignment {
+            earliest,
+            latest,
+            line_box_baseline,
+            should_advance_to_line_box_block_end,
+            has_line_relative_aligned_subtree,
+            aligned_subtrees,
+            first_unshifted_text_baseline,
         }
-
-        if has_line_relative_aligned_subtree {
-            for fragment_index in 0..fragment_count {
-                let style_source = self.line(line_index).fragments[fragment_index].style_source;
-                let shift = self.subtree_shift_for_box(style_source, &aligned_subtrees, normal_subtree_shift);
-                let mut line = self.line_mut(line_index);
-                let fragment = &mut line.fragments[fragment_index];
-                fragment.block_offset += shift;
-                // The line baseline moves by the normal subtree shift, so only displacement beyond
-                // it keeps a fragment away from its baseline-aligned position.
-                fragment.accumulated_vertical_shift += shift - normal_subtree_shift;
-            }
-            // Inline box baselines were recorded before the subtree shifts, so move them into the
-            // shifted frame.
-            let baseline_count = self.line(line_index).inline_box_baselines.len();
-            for baseline_index in 0..baseline_count {
-                let box_ = self.line(line_index).inline_box_baselines[baseline_index].box_;
-                let shift = self.subtree_shift_for_box(box_, &aligned_subtrees, normal_subtree_shift);
-                let mut line = self.line_mut(line_index);
-                let entry = &mut line.inline_box_baselines[baseline_index];
-                entry.baseline += shift;
-                entry.accumulated_vertical_shift += shift - normal_subtree_shift;
-            }
-        }
-
-        let marker_count = self.line(line_index).static_position_markers.len();
-        let marker_inline_offset = self
-            .line(line_index)
-            .inline_length_before_block_ellipsis
-            .map_or(inline_offset, aligned_inline_offset);
-        for marker_index in 0..marker_count {
-            // Static position markers are resolved against the inline box that contains them, so they move with that
-            // box's aligned subtree.
-            let box_ = self.line(line_index).static_position_markers[marker_index].box_;
-            let shift = self.subtree_shift_for_box(
-                self.context().parent_node(box_),
-                &aligned_subtrees,
-                normal_subtree_shift,
-            );
-            let mut line = self.line_mut(line_index);
-            let marker = &mut line.static_position_markers[marker_index];
-            marker.inline_offset += marker_inline_offset;
-            marker.block_offset += block_offset + current_block_offset + shift;
-        }
-        {
-            let mut line = self.line_mut(line_index);
-            line.block_length = latest - earliest;
-            line.block_start = current_block_offset;
-            line.block_end = current_block_offset + line.block_length;
-            // The painted extent can differ from the advance used by begin_new_line.
-            // Retain that exact advance so a reused prefix resumes at the same position.
-            line.next_line_block_offset = if should_align_strut_to_line_box_baseline {
-                line.block_end
-            } else {
-                current_block_offset + self.max_block_size_on_current_line.max(containing_style.line_height())
-            };
-            // Fragment block offsets include the reversed-writing-mode shim, so the alignment
-            // baseline fallback must include it as well to share their coordinate space.
-            line.baseline =
-                first_unshifted_text_baseline.unwrap_or(line_box_baseline + block_offset) + normal_subtree_shift;
-        }
-        self.should_advance_to_last_line_box_block_end = should_align_strut_to_line_box_baseline;
     }
 
     pub(crate) fn remove_last_line_if_empty(&mut self) {
@@ -1225,7 +1635,8 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
     pub(crate) fn recalculate_available_space(&mut self) {
         let current_line_block_size = self
             .max_block_size_on_current_line
-            .max(self.containing_style().line_height());
+            .max(self.containing_style().line_height())
+            .max(self.float_fit_height());
         self.available_inline_size_for_current_line = self
             .context()
             .available_space_for_line(self.current_block_offset, current_line_block_size);
@@ -1236,23 +1647,41 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
     }
 
     pub(crate) fn did_introduce_clearance(&mut self, clearance: CssPixels) {
-        if clearance <= self.current_block_offset {
-            return;
+        // NB: The line the clearing break ends reaches down to the clearance, so that its block container does even
+        //     when no line follows. That's the last line before the current one that holds anything: Moving past a
+        //     float that left no room beside the break can leave empty lines between them. The line grows rather
+        //     than moves, so it keeps its start and its baseline.
+        let current = self.line_count() - 1;
+        if let Some(ended) = (0..current).rev().find(|&index| !self.line(index).is_empty()) {
+            let mut line = self.line_mut(ended);
+            let block_end = line.block_end;
+            if clearance > block_end {
+                line.block_length += clearance - block_end;
+                line.clearance_block_length += clearance - block_end;
+                line.block_end = clearance;
+            }
         }
-        if self.line_count() > 1 {
-            let previous = self.line_count() - 2;
-            self.line_mut(previous).block_end = clearance;
-        }
-        self.current_block_offset = clearance;
+        self.current_block_offset = self.current_block_offset.max(clearance);
     }
 
-    pub(crate) fn set_trailing_whitespace_on_previous_line(&mut self) {
+    /// Gives the whitespace that a line break before it dropped from the start of the current line to the end of the
+    /// previous line, where it follows on from the same text.
+    pub(crate) fn set_trailing_whitespace_on_previous_line(&mut self, whitespace: &inline_level_iterator::Item) {
         if self.line_count() < 2 {
             return;
         }
         let previous = self.line_count() - 2;
-        if let Some(fragment) = self.line_mut(previous).fragments.last_mut() {
-            fragment.has_trailing_whitespace = true;
+        if let Some(fragment) = self.line_mut(previous).fragments.last_mut()
+            && fragment.layout_node == whitespace.node
+            && fragment.start
+                + fragment.length_in_code_units
+                + fragment.trimmed_trailing_whitespace.length_in_code_units
+                == whitespace.offset_in_node
+        {
+            fragment.record.trimmed_trailing_whitespace += line_box_fragment::TrailingWhitespace {
+                length_in_code_units: whitespace.length_in_node,
+                inline_size: whitespace.inline_size,
+            };
         }
     }
 
@@ -1282,8 +1711,58 @@ fn aligned_subtree_shift(subtrees: &[LineRelativeAlignedSubtree], root: Node) ->
         .map(|subtree| subtree.shift)
 }
 
+// https://drafts.csswg.org/css-inline-3/#inline-height
+/// The extent of the layout bounds of a text fragment above and below its baseline.
+#[derive(Clone, Copy)]
+pub(crate) struct TextLayoutBounds {
+    pub(crate) ascent: CssPixels,
+    pub(crate) descent: CssPixels,
+}
+
+impl TextLayoutBounds {
+    /// The bounds of text in a font with `ascent` and `descent`, with the line height's leading split above and
+    /// below it. A font's ascent and descent count in whole pixels, as they do for 'line-height: normal', and the
+    /// leading above the text is a whole number of pixels too. So the baseline of text whose line height is a whole
+    /// number of pixels lands on a pixel, wherever the text is.
+    fn with_leading(ascent: f32, descent: f32, line_height: CssPixels) -> Self {
+        let ascent = font_metric_in_whole_pixels(ascent);
+        let descent = font_metric_in_whole_pixels(descent);
+        let leading = line_height - (ascent + descent);
+        let leading_above = (leading / 2).floor();
+        Self {
+            ascent: ascent + leading_above,
+            descent: descent + (leading - leading_above),
+        }
+    }
+
+    pub(crate) fn new(style: StyleValues, font: Option<&libgfx_rust::font::FontHandle>) -> Self {
+        let mut bounds = Self::with_leading(style.font_ascent(), style.font_descent(), style.line_height());
+        // When its computed line-height is normal, the layout bounds of an inline box encloses all its glyphs, going
+        // from the highest A to the deepest D. (Note that glyphs in a single box can come from different fonts and
+        // thus might not all have the same A and D.)
+        // NB: The bounds above already enclose the glyphs of the first available font.
+        if let Some(font) = font
+            && style.line_height_is_normal()
+            && style
+                .font()
+                .first_available_font()
+                .is_none_or(|first_available| font.as_raw() != first_available.as_raw())
+        {
+            bounds.ascent = bounds.ascent.max(font_metric_in_whole_pixels(font.facts().ascent));
+            bounds.descent = bounds.descent.max(font_metric_in_whole_pixels(font.facts().descent));
+        }
+        bounds
+    }
+
+    pub(crate) fn block_size(self) -> CssPixels {
+        self.ascent + self.descent
+    }
+}
+
+pub(crate) fn font_metric_in_whole_pixels(metric: f32) -> CssPixels {
+    CssPixels::from_integer(metric.round_ties_even() as i64)
+}
+
 pub(crate) fn normal_line_height(style: StyleValues) -> CssPixels {
-    let ascent = style.font_ascent().round_ties_even() as i64;
-    let descent = style.font_descent().round_ties_even() as i64;
-    CssPixels::from_integer(ascent.saturating_add(descent))
+    font_metric_in_whole_pixels(style.font_ascent()) + font_metric_in_whole_pixels(style.font_descent())
 }

@@ -4,10 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+allocator = ["dep:ladybird_allocator"]
 
 [dependencies]
-encoding_rs = "0.8.40"
+ak = { path = "../../../AK/Rust" }
+encoding_rs = "0.8.42"
+ladybird_allocator = { path = "../../RustAllocator", optional = true }
+rustc-demangle = "0.1"
 
 [build-dependencies]
 cbindgen = "0.29"

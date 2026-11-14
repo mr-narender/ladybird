@@ -1,0 +1,10 @@
+hidden grandchild color: rgb(255, 0, 0)
+after read:
+div#hidden record 1
+  div#child record 2
+    span#grandchild record 3
+after move:
+div#hidden record 1
+  div#child no record
+    span#grandchild no record
+hidden grandchild color after move: rgb(0, 128, 0)

@@ -10,13 +10,14 @@
 #include <AK/Optional.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
-#include <LibGC/ConservativeVector.h>
+#include <LibGC/RootHashMap.h>
+#include <LibGC/RootVector.h>
 #include <LibWeb/Animations/TimeValue.h>
 #include <LibWeb/Bindings/AnimationEffect.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/CSS/EasingFunction.h>
+#include <LibWeb/CSS/InstalledStyle.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
-#include <LibWeb/CSS/StyleRecordID.h>
 
 namespace Web::Animations {
 
@@ -40,21 +41,29 @@ Bindings::OptionalEffectTiming to_optional_effect_timing(Bindings::EffectTiming 
 struct AnimationUpdateContext {
     struct ElementData {
         ElementData();
-        ElementData(CSS::StyleRecordID, RefPtr<CSS::ComputedStyleWorkingSet>);
+        ElementData(CSS::InstalledStyle, RefPtr<CSS::ComputedStyleWorkingSet>);
         ElementData(ElementData&&);
         ElementData& operator=(ElementData&&);
         ~ElementData();
 
-        CSS::StyleRecordID style_record_before_update;
+        CSS::InstalledStyle style_before_update;
         RefPtr<CSS::ComputedStyleWorkingSet> target_style;
-        GC::ConservativeVector<GC::Ref<KeyframeEffect>> effects;
+        GC::RootVector<GC::Ref<KeyframeEffect>> effects;
+        // Whether the record the update samples over was computed by this style update, so that the base
+        // adjustments the sampled values feed into were made over the values the element holds now.
+        bool base_is_current { false };
     };
 
     AnimationUpdateContext();
+    // Publishes what is left unpublished.
     ~AnimationUpdateContext();
 
+    // Samples each element's effects over the style it holds and publishes what they compose, which the destructor
+    // otherwise does.
+    void publish();
+
     // NOTE: This is lazily populated by KeyframeEffects as their respective animations are applied to an element.
-    HashMap<DOM::AbstractElement, ElementData> elements;
+    GC::RootHashMap<DOM::AbstractElement, ElementData> elements;
 };
 
 // https://www.w3.org/TR/web-animations-1/#the-animationeffect-interface
@@ -106,6 +115,7 @@ public:
 
     bool is_current() const;
     bool is_in_effect() const;
+    bool has_local_time_override_for_observation() const { return m_has_local_time_override_for_observation; }
 
     TimeValue before_active_boundary_time() const;
     TimeValue after_active_boundary_time() const;
@@ -126,7 +136,11 @@ public:
         Optional<TimeValue> active_time;
         Optional<double> overall_progress;
     };
-    ResolvedTiming resolve_timing() const;
+    enum class EndpointInclusiveActiveInterval {
+        No,
+        Yes,
+    };
+    ResolvedTiming resolve_timing(EndpointInclusiveActiveInterval = EndpointInclusiveActiveInterval::No) const;
 
     Phase previous_phase() const { return m_previous_phase; }
     void set_previous_phase(Phase value) { m_previous_phase = value; }
@@ -135,7 +149,7 @@ public:
 
     Optional<double> current_iteration() const;
     Optional<double> current_iteration(ResolvedTiming const&) const;
-    Optional<double> transformed_progress() const;
+    Optional<double> transformed_progress(EndpointInclusiveActiveInterval = EndpointInclusiveActiveInterval::No) const;
 
     void normalize_specified_timing();
 
@@ -163,7 +177,8 @@ protected:
     GC::Ptr<AnimationTimeline> associated_timeline() const;
     Optional<TimeValue> timeline_duration() const;
 
-    Phase phase(Optional<TimeValue> const& local_time) const;
+    Phase phase(Optional<TimeValue> const& local_time, EndpointInclusiveActiveInterval = EndpointInclusiveActiveInterval::No) const;
+    bool is_at_timeline_boundary() const;
     Optional<TimeValue> active_time_for_phase(Phase, Optional<TimeValue> const& local_time, Bindings::FillMode) const;
     Optional<double> overall_progress_for_phase(Phase, Optional<TimeValue> const& active_time) const;
     Optional<double> simple_iteration_progress(ResolvedTiming const&) const;

@@ -24,7 +24,7 @@ Optional<ModuleMap::Entry const&> ModuleMap::get(URL::URL const& url, Utf16View 
     return m_values.get({ url, type });
 }
 
-void ModuleMap::set(URL::URL const& url, Utf16View type, CallbackList callbacks)
+void ModuleMap::set(URL::URL const& url, Utf16View type, CallbackList&& callbacks)
 {
     VERIFY(!m_values.contains({ url, type }));
     m_values.set({ url, type }, move(callbacks));
@@ -39,15 +39,10 @@ void ModuleMap::append(URL::URL const& url, Utf16View type, CallbackFunction cal
 
 void ModuleMap::complete_fetch(URL::URL const& url, Utf16View type, GC::Ptr<ModuleScript> module_script)
 {
-    auto entry = m_values.take({ url, type });
-    VERIFY(entry.has_value());
-    auto value = entry.release_value();
-    auto callbacks_to_invoke = move(value.get<CallbackList>());
-
-    Vector<GC::Root<GC::Function<void(GC::Ptr<ModuleScript>)>>> callbacks;
-    callbacks.ensure_capacity(callbacks_to_invoke.size());
-    for (auto const& callback : callbacks_to_invoke)
-        callbacks.unchecked_append(GC::make_root(callback));
+    auto entry = m_values.find({ url, type });
+    VERIFY(entry != m_values.end());
+    GC::RootVector callbacks { move(entry->value.get<CallbackList>()) };
+    m_values.remove(entry);
 
     if (module_script)
         m_values.set({ url, type }, GC::Ref { *module_script });

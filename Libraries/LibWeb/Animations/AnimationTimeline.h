@@ -36,6 +36,13 @@ public:
     NullableCSSNumberish current_time_for_bindings();
     Optional<TimeValue> current_time() const;
     Optional<TimeValue> current_time_for_observation();
+    // Whether script observed the timeline in the current task at a time ahead of its current time.
+    bool was_observed_ahead_in_current_task() const;
+
+    // Runs the callback with every timeline in [timelines, end) that script observed ahead of its current time in the
+    // current task sampled at the time script observed, so that what the callback samples agrees with what script read.
+    template<typename Iterator, typename Callback>
+    static void at_times_observed_ahead(Iterator timelines, Iterator end, Callback const& callback);
 
     virtual void update_current_time(double timestamp) = 0;
 
@@ -47,6 +54,20 @@ public:
     virtual bool is_inactive() const;
     bool is_monotonically_increasing() const { return m_is_monotonically_increasing; }
     virtual bool is_progress_based() const { return false; }
+
+    // https://drafts.csswg.org/web-animations-2/#minimum-timeline-time
+    // NB: Empty for a monotonically increasing timeline, whose minimum timeline time is -infinity.
+    virtual Optional<TimeValue> minimum_timeline_time() const { return {}; }
+    // https://drafts.csswg.org/web-animations-2/#maximum-timeline-time
+    // NB: Empty for a monotonically increasing timeline, whose maximum timeline time is +infinity.
+    virtual Optional<TimeValue> maximum_timeline_time() const { return {}; }
+
+    // The timeline times of the start and the end of an attachment range on a progress-based timeline.
+    // https://drafts.csswg.org/scroll-animations-1/#animation-attachment-range
+    virtual AttachmentInterval interval_for_attachment_range(AnimationAttachmentRange const&) const
+    {
+        return { { TimeValue::Type::Percentage, 0 }, { TimeValue::Type::Percentage, 100 } };
+    }
 
     // https://www.w3.org/TR/web-animations-1/#timeline-time-to-origin-relative-time
     virtual Optional<double> convert_a_timeline_time_to_an_origin_relative_time(Optional<TimeValue>) { VERIFY_NOT_REACHED(); }
@@ -95,5 +116,18 @@ private:
     Optional<TimeValue> m_current_time_override_for_style_sampling;
     bool m_has_current_time_override_for_style_sampling { false };
 };
+
+template<typename Iterator, typename Callback>
+void AnimationTimeline::at_times_observed_ahead(Iterator timelines, Iterator end, Callback const& callback)
+{
+    if (timelines == end)
+        return callback();
+    auto& timeline = **timelines;
+    ++timelines;
+    if (!timeline.was_observed_ahead_in_current_task())
+        return at_times_observed_ahead(timelines, end, callback);
+    CurrentTimeOverrideScope override { timeline, timeline.current_time_for_observation() };
+    at_times_observed_ahead(timelines, end, callback);
+}
 
 }

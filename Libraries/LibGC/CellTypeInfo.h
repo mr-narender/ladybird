@@ -12,6 +12,9 @@
 
 namespace GC {
 
+// NB: Cells defined outside C++ keep 16-byte values in them, which some platforms align to less than 16 bytes.
+constexpr size_t max_cell_alignment = max<size_t>(16, __BIGGEST_ALIGNMENT__);
+
 struct CellTypeInfo {
     u32 cell_size { 0 };
     u32 alignment { 0 };
@@ -70,7 +73,10 @@ struct CellTypeThunks {
     template<typename T>
     static constexpr CellTypeInfo info()
     {
-        static_assert(alignof(T) <= __BIGGEST_ALIGNMENT__);
+        static_assert(alignof(T) <= max_cell_alignment);
+        // A free cell holds a link to the next one, so a cell that can be allocated must have room for that after its
+        // header.
+        static_assert(__is_abstract(T) || sizeof(T) >= sizeof(Cell) + sizeof(FlatPtr), "A cell must be at least as large as a free cell");
         return {
             .cell_size = static_cast<u32>(sizeof(T)),
             .alignment = static_cast<u32>(alignof(T)),

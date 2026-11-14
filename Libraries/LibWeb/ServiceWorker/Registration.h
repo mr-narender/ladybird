@@ -7,6 +7,7 @@
 #pragma once
 
 #include <AK/Optional.h>
+#include <AK/RefCounted.h>
 #include <AK/Time.h>
 #include <AK/Traits.h>
 #include <AK/Vector.h>
@@ -22,11 +23,10 @@ namespace Web::ServiceWorker {
 // This class corresponds to "service worker registration", not "ServiceWorkerRegistration"
 // FIXME: This object needs to live at the user-agent level, in LibWebView, not in LibWeb
 //        .. And it will need some way to synchronize updates to each 'client' (aka process aka ESO)
-class Registration {
-    AK_MAKE_NONCOPYABLE(Registration);
-    AK_MAKE_DEFAULT_MOVABLE(Registration);
-
+class Registration : public RefCounted<Registration> {
 public:
+    static void forget_registrations_of_this_agent();
+
     // https://w3c.github.io/ServiceWorker/#get-registration-algorithm
     static Optional<Registration&> get(StorageAPI::StorageKey const&, Optional<URL::URL> scope);
 
@@ -39,8 +39,6 @@ public:
     static Vector<Registration*> for_storage_key(StorageAPI::StorageKey const&);
 
     static void remove(StorageAPI::StorageKey const&, URL::URL const&);
-
-    bool is_unregistered();
 
     StorageAPI::StorageKey const& storage_key() const { return m_storage_key; }
     URL::URL const& scope_url() const { return m_scope_url; }

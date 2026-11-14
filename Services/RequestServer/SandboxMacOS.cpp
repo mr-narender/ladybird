@@ -4,9 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/LexicalPath.h>
 #include <AK/String.h>
-#include <LibCore/Directory.h>
 #include <LibCore/System.h>
 #include <LibSandbox/Sandbox.h>
 #include <RequestServer/ResourceSubstitutionMap.h>
@@ -14,12 +12,11 @@
 
 namespace RequestServer {
 
-ErrorOr<void> apply_sandbox(StringView mach_server_name, Vector<ByteString> const& certificates, StringView cache_path)
+ErrorOr<void> apply_sandbox(StringView mach_server_name, Vector<ByteString> const& certificates, Optional<StringView> disk_cache_directory)
 {
     TRY(Sandbox::configure_runtime());
 
     Vector<Sandbox::SeatbeltPath> paths;
-    TRY(Core::Directory::create(cache_path, Core::Directory::CreateDirectories::Yes));
 
     auto executable_path = TRY(Core::System::current_executable_path());
 
@@ -36,13 +33,8 @@ ErrorOr<void> apply_sandbox(StringView mach_server_name, Vector<ByteString> cons
     TRY(Sandbox::add_seatbelt_path_if_exists(paths, "/private/etc/ssl"sv, Sandbox::SeatbeltPath::Access::ReadOnly));
     TRY(Sandbox::add_seatbelt_path_if_exists(paths, "/Library/Preferences/com.apple.networkd.plist"sv, Sandbox::SeatbeltPath::Access::ReadOnly));
 
-    for (auto const& certificate : certificates) {
-        auto certificate_path = LexicalPath::dirname(certificate);
-        if (certificate_path.is_empty())
-            certificate_path = ".";
-
-        TRY(Sandbox::add_seatbelt_path_if_exists(paths, certificate_path, Sandbox::SeatbeltPath::Access::ReadOnly));
-    }
+    for (auto const& certificate : certificates)
+        TRY(Sandbox::add_seatbelt_path_if_exists(paths, certificate, Sandbox::SeatbeltPath::Access::ReadOnly));
 
     if (g_resource_substitution_map) {
         TRY(g_resource_substitution_map->for_each_substitution([&](auto const& substitution) -> ErrorOr<void> {
@@ -51,7 +43,8 @@ ErrorOr<void> apply_sandbox(StringView mach_server_name, Vector<ByteString> cons
         }));
     }
 
-    TRY(Sandbox::add_seatbelt_path_if_exists(paths, cache_path, Sandbox::SeatbeltPath::Access::ReadWrite));
+    if (disk_cache_directory.has_value())
+        TRY(Sandbox::add_seatbelt_path_if_exists(paths, *disk_cache_directory, Sandbox::SeatbeltPath::Access::ReadWrite));
 
     return Sandbox::apply_macos_sandbox({
         .paths = paths.span(),

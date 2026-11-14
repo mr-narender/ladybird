@@ -8,14 +8,15 @@ use crate::css::css_pixels::CssPixels;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::used_values;
 use crate::painting::display_list::commands::{ContextRef, SpatialNodeIndex};
-use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum PaintableFlag {
     HasNonInvertibleCssTransform = 1 << 0,
-    HorizontalScrollbarEnlarged = 1 << 1,
-    VerticalScrollbarEnlarged = 1 << 2,
+    HorizontalScrollbarHidden = 1 << 1,
+    VerticalScrollbarHidden = 1 << 2,
+    InLaterContainingBlockFragment = 1 << 3,
+    HasLaterBoxFragments = 1 << 4,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -25,6 +26,17 @@ pub struct FfiPixelBox {
     pub right: CssPixels,
     pub bottom: CssPixels,
     pub left: CssPixels,
+}
+
+impl From<crate::layout::geometry::Sides> for FfiPixelBox {
+    fn from(sides: crate::layout::geometry::Sides) -> Self {
+        Self {
+            top: sides.top,
+            right: sides.right,
+            bottom: sides.bottom,
+            left: sides.left,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,14 +54,8 @@ pub struct PaintableData {
     pub slot_generation: u8,
     pub flags: u32,
 
-    pub offset: used_values::FfiCssPixelPoint,
-    pub content_size: used_values::FfiCssPixelSize,
-    pub local_padding_box_union: used_values::FfiCssPixelRect,
-    pub local_border_box_union: used_values::FfiCssPixelRect,
-
     pub establishes_stacking_context: bool,
 
-    pub enclosing_scroll_node_index: SpatialNodeIndex,
     pub own_scroll_node_index: SpatialNodeIndex,
     pub node_identity: i64,
     pub has_accumulated_visual_context: bool,
@@ -64,12 +70,7 @@ impl Default for PaintableData {
             selection_state: 0,
             slot_generation: 0,
             flags: 0,
-            offset: used_values::FfiCssPixelPoint::default(),
-            content_size: used_values::FfiCssPixelSize::default(),
-            local_padding_box_union: used_values::FfiCssPixelRect::default(),
-            local_border_box_union: used_values::FfiCssPixelRect::default(),
             establishes_stacking_context: false,
-            enclosing_scroll_node_index: SpatialNodeIndex::default(),
             own_scroll_node_index: SpatialNodeIndex::default(),
             node_identity: 0,
             has_accumulated_visual_context: false,
@@ -102,6 +103,41 @@ pub struct FfiSelectionEntry {
     pub state: u8,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiSearchTextRange {
+    pub first_entry: usize,
+    pub entry_count: usize,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub is_current: bool,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiSpellingError {
+    /// The DOM text's primary layout node; Rust expands its slices.
+    pub layout_node: NodeSlotId,
+    pub start_offset: usize,
+    pub end_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiCustomHighlightTextEntry {
+    pub layer: u32,
+    pub layout_node: NodeSlotId,
+    pub start_offset: usize,
+    pub end_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiCustomHighlightReplacedEntry {
+    pub layer: u32,
+    pub layout_node: NodeSlotId,
+}
+
 pub const SELECTION_STATE_NONE: u8 = 0;
 pub const SELECTION_STATE_START: u8 = 1;
 pub const SELECTION_STATE_END: u8 = 2;
@@ -114,6 +150,8 @@ pub enum PaintableRowResetKind {
     Recommitted = 0,
     Cleared = 1,
     Freed = 2,
+    /// The viewport's row, which the document is bound to, was recommitted.
+    ViewportRecommitted = 3,
 }
 
 pub use crate::layout::inline_content::{FragmentRecord, GlyphRunRecord, InlineBoxPieceRecord};
@@ -128,10 +166,6 @@ pub enum BorderEdge {
 
 impl BorderEdge {
     pub const ALL: [BorderEdge; 4] = [BorderEdge::Top, BorderEdge::Right, BorderEdge::Bottom, BorderEdge::Left];
-
-    pub const fn index(self) -> usize {
-        self as usize
-    }
 }
 
 pub const PIECE_EDGE_TOP: u8 = 1 << 0;
@@ -156,32 +190,74 @@ impl InlineBoxPieceRecord {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PaintableSideData {
     // Invalidation also runs while paint geometry is borrowed. Keep this
     // mutable cache state out of the plain-data row shared with C++.
     pub(crate) overflow_style: Option<crate::painting::scrollable_overflow::OverflowStyle>,
-    pub(crate) overflow_valid_across_recommits: Cell<bool>,
-    pub(crate) overflow_relative_to_padding_box: Cell<FfiOverflowData>,
-    pub(crate) overflow_measured_this_commit: Cell<bool>,
-    pub(crate) inline_content: Option<std::rc::Rc<crate::layout::inline_content::InlineContent>>,
-    pub(crate) piece_indices: Vec<u32>,
-    pub(crate) svg_filter_bounds: Cell<Option<used_values::FfiCssPixelRect>>,
-    // Only meaningful while is_self_painting(); assigned by the containing block's
-    // assign_fragment_ownership().
-    pub(crate) fragment_ownership: Option<crate::painting::fragment_ownership::FragmentOwnershipFilter>,
     // The filter a recommit cleared, kept so the next assignment can tell whether the box
     // paints a different selection of fragments than before.
-    pub(crate) fragment_ownership_before_recommit: Option<crate::painting::fragment_ownership::FragmentOwnershipFilter>,
+    pub(crate) fragment_ownership_before_recommit:
+        Option<std::sync::Arc<crate::painting::fragment_ownership::FragmentOwnershipFilter>>,
 }
 
-impl PaintableSideData {
-    pub(crate) fn clear_committed_records(&mut self) {
-        self.inline_content = None;
-        self.piece_indices.clear();
-        if let Some(filter) = self.fragment_ownership.take() {
-            self.fragment_ownership_before_recommit = Some(filter);
-        }
+#[derive(Clone)]
+pub(crate) struct CommittedBoxFragment {
+    pub(crate) link: crate::layout::fragment_tree::FragmentLink,
+    pub(crate) containing_block_fragment: u32,
+}
+
+/// What a row committed beside its geometry that painting reads with it: its inline content and what paint
+/// preparation adds for the recording. Shared records are held by `Arc`, so copying a row
+/// copies reference counts.
+#[derive(Clone, Default)]
+pub(crate) struct CommittedSideData {
+    pub(crate) inline_content: Option<std::sync::Arc<crate::layout::inline_content::InlineContent>>,
+    /// The bounds of the SVG filter the box references, as the visual context update resolved
+    /// them.
+    pub(crate) svg_filter_bounds: Option<used_values::FfiCssPixelRect>,
+    // Only meaningful while is_self_painting(); assigned by the containing block's
+    // assign_fragment_ownership().
+    pub(crate) fragment_ownership: Option<std::sync::Arc<crate::painting::fragment_ownership::FragmentOwnershipFilter>>,
+    /// The paint-order decisions paint preparation gathered for the row, if it gathered them.
+    pub(crate) order_inputs: crate::painting::paint_order_plan::PaintOrderInputs,
+    pub(crate) containing_block_fragment: u32,
+    pub(crate) box_fragments: Option<std::sync::Arc<Vec<CommittedBoxFragment>>>,
+}
+
+/// Rows are the same when they hold equal records; a shared record is compared only when the rows
+/// hold different allocations of it.
+impl PartialEq for CommittedSideData {
+    fn eq(&self, other: &Self) -> bool {
+        use crate::cow_column::same_payload;
+        self.svg_filter_bounds == other.svg_filter_bounds
+            && self.order_inputs == other.order_inputs
+            && same_payload(
+                self.fragment_ownership.as_ref(),
+                other.fragment_ownership.as_ref(),
+                |a, b| a == b,
+            )
+            && same_payload(self.inline_content.as_ref(), other.inline_content.as_ref(), |a, b| {
+                a == b
+            })
+            && self.containing_block_fragment == other.containing_block_fragment
+            && same_payload(self.box_fragments.as_ref(), other.box_fragments.as_ref(), |a, b| {
+                a.len() == b.len()
+                    && a.iter().zip(b.iter()).all(|(left, right)| {
+                        left.containing_block_fragment == right.containing_block_fragment
+                            && left.link.places_same_fragment_identically_to(&right.link)
+                    })
+            })
+    }
+}
+
+impl CommittedSideData {
+    pub(crate) fn prepared_order_inputs(&self) -> Option<crate::painting::paint_order_plan::PaintOrderInputs> {
+        self.order_inputs.is_initialized().then_some(self.order_inputs)
+    }
+
+    pub(crate) fn box_fragments(&self) -> &[CommittedBoxFragment] {
+        self.box_fragments.as_deref().map_or(&[], Vec::as_slice)
     }
 
     pub(crate) fn lines(&self) -> &[crate::layout::inline_content::LineRecord] {
@@ -190,9 +266,21 @@ impl PaintableSideData {
     pub(crate) fn fragments(&self) -> &[FragmentRecord] {
         self.inline_content.as_ref().map_or(&[], |content| &content.fragments)
     }
+    /// For a line root, the indices of the fragments of `node` among its fragments, in fragment order.
+    pub(crate) fn fragment_indices_of(&self, node: NodeSlotId) -> &[u32] {
+        self.inline_content
+            .as_ref()
+            .map_or(&[], |content| content.fragment_indices_of(node))
+    }
     pub(crate) fn inline_box_pieces(&self) -> &[InlineBoxPieceRecord] {
         self.inline_content
             .as_ref()
             .map_or(&[], |content| &content.inline_box_pieces)
+    }
+    /// For a line root, the indices of the pieces of the inline box `node` among its inline box pieces, in line order.
+    pub(crate) fn inline_box_piece_indices(&self, node: NodeSlotId) -> &[u32] {
+        self.inline_content
+            .as_ref()
+            .map_or(&[], |content| content.inline_boxes.piece_indices_of(node))
     }
 }

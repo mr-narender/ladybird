@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use crate::css::style_value::{BackgroundSizePayload, ImageSetPayload, PositionPayload};
 use crate::painting::record::trace::Observer;
 
 use crate::css::computed_value_views::{ComputedValuesView, LengthPercentageRef};
@@ -12,16 +13,17 @@ use crate::css::css_pixels::CssPixels;
 use crate::css::css_pixels::{CssPixelRect, CssPixelSize};
 use crate::css::style_value::StyleValueData;
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
+use crate::layout::replaced_sizing::{SizeWithAspectRatio, run_default_sizing_algorithm};
 use crate::painting::border_radii::BorderRadii;
-use crate::painting::host::{FfiLayerImageList, FfiRootBackgroundSource};
+use crate::painting::host::{FfiLayerImageList, RootBackgroundSource};
+use crate::painting::paint_read::{GeometryRead, PaintRead};
+use crate::painting::paintable_data::FfiPixelBox;
 use crate::painting::paintable_geometry::{
     absolute_border_box_rect, absolute_padding_box_rect, committed_border_box_edges, committed_padding,
     committed_uses_collapsing_borders_model,
 };
-use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::record::PaintRecorder;
 use crate::painting::record::paint::background::{BackgroundBox, background_box_for};
-use crate::painting::record::paint::replaced::{SizeWithAspectRatio, run_default_sizing_algorithm};
 use crate::painting::style_queries;
 use crate::painting::visual_context::node_values::{
     border_radii_data, mix_blend_mode_to_compositing_and_blending_operator,
@@ -50,6 +52,8 @@ struct ComputedLayer<'a> {
     image: Option<LayerImageSource<'a>>,
     attachment: u8,
     clip: u8,
+    // False for a mask layer with mask-clip: no-clip, which isn't clipped to its box's curve.
+    clip_follows_corners: bool,
     origin: u8,
     position_x: LengthPercentageRef<'a>,
     position_y: LengthPercentageRef<'a>,
@@ -64,6 +68,7 @@ pub(crate) struct ResolvedBackgroundLayer<'a> {
     pub image: Option<LayerImageSource<'a>>,
     pub attachment: u8,
     pub clip: u8,
+    pub clip_follows_corners: bool,
     pub position_x: CssPixels,
     pub position_y: CssPixels,
     pub background_positioning_area: CssPixelRect,
@@ -76,6 +81,8 @@ pub(crate) struct ResolvedBackgroundLayer<'a> {
 
 pub(crate) struct ResolvedBackground<'a> {
     pub color_box: BackgroundBox,
+    pub padding: FfiPixelBox,
+    pub border: FfiPixelBox,
     pub layers: Vec<ResolvedBackgroundLayer<'a>>,
     pub paintable_layer_count: usize,
     pub needs_text_clip: bool,
@@ -88,6 +95,7 @@ pub(crate) struct BackgroundPaintInputs<'a> {
     pub border_radii: crate::painting::border_radii::BorderRadii,
     pub image_rendering: u8,
     pub is_root_element: bool,
+    pub visible_device_rect: Option<libgfx_rust::IntRect>,
 }
 
 fn mask_composite_to_compositing_and_blending_operator(compositing_operator: u8) -> CompositingAndBlendingOperator {
@@ -114,17 +122,17 @@ pub(crate) fn operator_erases_destination_outside_the_drawn_geometry(operator: C
 }
 
 pub(crate) fn body_background_is_propagated_to_root(
-    layout_arena: &impl PaintableRowsRead,
+    layout_arena: &impl PaintRead,
     slot: NodeSlotId,
-    root_background_source: FfiRootBackgroundSource,
+    root_background_source: RootBackgroundSource,
 ) -> bool {
     root_background_source.use_body_background_properties
         && layout_arena.node_flags_if_live(slot) & NodeFlag::IsBody as u32 != 0
 }
 
 fn background_layers_style(
-    layout_arena: &impl PaintableRowsRead,
-    root_background_source: FfiRootBackgroundSource,
+    layout_arena: &impl PaintRead,
+    root_background_source: RootBackgroundSource,
     node: NodeSlotId,
 ) -> Option<ComputedValuesView<'_>> {
     if body_background_is_propagated_to_root(layout_arena, node, root_background_source) {
@@ -165,8 +173,8 @@ fn any_background_layer_has_a_fixed_attachment_image(style: ComputedValuesView<'
 }
 
 pub(crate) fn background_depends_on_live_scroll_offset(
-    layout_arena: &impl PaintableRowsRead,
-    root_background_source: crate::painting::host::FfiRootBackgroundSource,
+    layout_arena: &impl PaintRead,
+    root_background_source: crate::painting::host::RootBackgroundSource,
     node: NodeSlotId,
 ) -> bool {
     let Some(background_style) = background_layers_style(layout_arena, root_background_source, node) else {
@@ -176,8 +184,8 @@ pub(crate) fn background_depends_on_live_scroll_offset(
 }
 
 pub(crate) fn background_has_fixed_attachment(
-    layout_arena: &impl PaintableRowsRead,
-    root_background_source: crate::painting::host::FfiRootBackgroundSource,
+    layout_arena: &impl PaintRead,
+    root_background_source: crate::painting::host::RootBackgroundSource,
     node: NodeSlotId,
 ) -> bool {
     let is_root_element = style_queries::node_is_root_element(layout_arena, node);
@@ -221,9 +229,9 @@ pub(crate) struct BackgroundPaintSource<'a> {
 }
 
 pub(crate) fn background_paint_source_from_style_and_geometry(
-    layout_arena: &impl PaintableRowsRead,
+    layout_arena: &impl PaintRead,
     slot: NodeSlotId,
-    root_background_source: FfiRootBackgroundSource,
+    root_background_source: RootBackgroundSource,
 ) -> Option<BackgroundPaintSource<'_>> {
     let style = layout_arena.node_style_if_live(slot)?;
     if body_background_is_propagated_to_root(layout_arena, slot, root_background_source) {
@@ -231,7 +239,7 @@ pub(crate) fn background_paint_source_from_style_and_geometry(
     }
     let border_radii = border_radii_data(style, layout_arena, slot);
     let background_color_clip = style.background().background_color_clip;
-    let own_color = libgfx_rust::Color(style.background().background_color);
+    let own_color = libgfx_rust::Color(style.background_color());
 
     // https://drafts.csswg.org/css-backgrounds/#root-background
     if style_queries::node_is_root_element(layout_arena, slot) {
@@ -253,7 +261,7 @@ pub(crate) fn background_paint_source_from_style_and_geometry(
             own_color
         } else {
             body_style.map_or(libgfx_rust::Color(0), |body_style| {
-                libgfx_rust::Color(body_style.background().background_color)
+                libgfx_rust::Color(body_style.background_color())
             })
         };
         // If the body's background was propagated to the root element, use the body's image-rendering value.
@@ -324,10 +332,13 @@ fn computed_layer_size(size_item: &StyleValueData) -> ComputedLayerSize<'_> {
     match size_item {
         StyleValueData::Keyword { keyword } if *keyword == CONTAIN => ComputedLayerSize::Contain,
         StyleValueData::Keyword { keyword } if *keyword == COVER => ComputedLayerSize::Cover,
-        StyleValueData::BackgroundSize { size_x, size_y } => ComputedLayerSize::LengthPercentage {
-            x: length_percentage_or_auto(size_x.data()),
-            y: length_percentage_or_auto(size_y.data()),
-        },
+        StyleValueData::BackgroundSize(background_size_payload) => {
+            let BackgroundSizePayload { size_x, size_y } = &**background_size_payload;
+            ComputedLayerSize::LengthPercentage {
+                x: length_percentage_or_auto(size_x.data()),
+                y: length_percentage_or_auto(size_y.data()),
+            }
+        }
         _ => unreachable!("computed background-size holds an unknown value"),
     }
 }
@@ -382,6 +393,7 @@ fn computed_background_layers(style: ComputedValuesView<'_>, facts_owner: NodeSl
                 .expect("computed background-blend-mode holds a blend keyword"),
             clip: css_enums::keyword_to_background_box(keyword_of(cycled(&clip_items, index)))
                 .expect("computed background-clip holds a box keyword"),
+            clip_follows_corners: true,
             origin: css_enums::keyword_to_background_box(keyword_of(cycled(&origin_items, index)))
                 .expect("computed background-origin holds a box keyword"),
             position_x: edge_offset(cycled(&position_x_items, index)),
@@ -396,9 +408,9 @@ fn computed_background_layers(style: ComputedValuesView<'_>, facts_owner: NodeSl
 }
 
 pub(crate) fn background_color_can_be_compositor_animated(
-    layout_arena: &impl PaintableRowsRead,
+    layout_arena: &impl PaintRead,
     slot: NodeSlotId,
-    root_background_source: FfiRootBackgroundSource,
+    root_background_source: RootBackgroundSource,
 ) -> bool {
     if style_queries::node_is_root_element(layout_arena, slot)
         || body_background_is_propagated_to_root(layout_arena, slot, root_background_source)
@@ -440,11 +452,12 @@ fn computed_mask_layers(style: ComputedValuesView<'_>, facts_owner: NodeSlotId) 
         let StyleValueData::RepeatStyle { repeat_x, repeat_y } = cycled(&repeat_items, index) else {
             unreachable!("computed mask-repeat holds a repeat-style value");
         };
-        let StyleValueData::Position { edge_x, edge_y } = cycled(&position_items, index) else {
+        let StyleValueData::Position(position_payload) = cycled(&position_items, index) else {
             unreachable!("computed mask-position holds a position value");
         };
-        let clip = css_enums::keyword_to_background_box(keyword_of(cycled(&clip_items, index)))
-            .unwrap_or(css_enums::background_box::BORDER_BOX);
+        let PositionPayload { edge_x, edge_y } = &**position_payload;
+        let clip_keyword = keyword_of(cycled(&clip_items, index));
+        let clip = css_enums::keyword_to_background_box(clip_keyword).unwrap_or(css_enums::background_box::BORDER_BOX);
         let origin = css_enums::keyword_to_background_box(keyword_of(cycled(&origin_items, index)))
             .unwrap_or(css_enums::background_box::BORDER_BOX);
         layers.push(ComputedLayer {
@@ -452,6 +465,9 @@ fn computed_mask_layers(style: ComputedValuesView<'_>, facts_owner: NodeSlotId) 
             attachment: css_enums::background_attachment::SCROLL,
             blend_mode: mix_blend_mode::NORMAL,
             clip,
+            // FIXME: A mask layer with mask-clip: no-clip shouldn't be clipped at all, but it's still clipped to the
+            //        border box's rectangle.
+            clip_follows_corners: clip_keyword != css_enums::keyword::NO_CLIP,
             origin,
             position_x: edge_offset(edge_x.data()),
             position_y: edge_offset(edge_y.data()),
@@ -482,17 +498,23 @@ fn resolve_layers<'a, O: Observer>(
     background_color_clip: u8,
     border_rect: CssPixelRect,
     border_radii: crate::painting::border_radii::BorderRadii,
+    edges: Option<(FfiPixelBox, FfiPixelBox)>,
     layer_type: LayerType,
+    zoom: f32,
 ) -> ResolvedBackground<'a> {
     use css_enums::{background_attachment, repetition};
     let border_box = BackgroundBox {
         rect: border_rect,
         radii: border_radii,
     };
-    let padding = committed_padding(recorder.layout_arena, paintable);
     // The padding box and content box are inset from the border box by the border widths that the border box
     // includes: half of each collapsed border in the collapsing borders model.
-    let border = committed_border_box_edges(recorder.layout_arena, paintable);
+    let (padding, border) = edges.unwrap_or_else(|| {
+        (
+            committed_padding(recorder.source, paintable),
+            committed_border_box_edges(recorder.source, paintable),
+        )
+    });
     let color_box = background_box_for(background_color_clip, border_box, padding, border);
     let layer_may_be_painted =
         |layer: &ComputedLayer<'_>| matches!(layer_type, LayerType::Mask) || layer.image.is_some();
@@ -515,6 +537,7 @@ fn resolve_layers<'a, O: Observer>(
                 image: None,
                 attachment: 0,
                 clip: layer.clip,
+                clip_follows_corners: layer.clip_follows_corners,
                 position_x: CssPixels::from_raw(0),
                 position_y: CssPixels::from_raw(0),
                 background_positioning_area: CssPixelRect::default(),
@@ -530,7 +553,14 @@ fn resolve_layers<'a, O: Observer>(
             transparent_mask_layer(&mut resolved_layers);
             continue;
         };
-        let intrinsics = layer_image_intrinsics(recorder, &image);
+        let mut intrinsics = layer_image_intrinsics(recorder, &image);
+        // https://drafts.csswg.org/css-viewport/#zoom-property
+        // It also multiplies the natural size of [...] background images [...] by the used value of 'zoom'.
+        if zoom != 1.0 {
+            let zoomed = |size: Option<CssPixels>| size.map(|size| size.scaled(f64::from(zoom)));
+            intrinsics.natural.width = zoomed(intrinsics.natural.width);
+            intrinsics.natural.height = zoomed(intrinsics.natural.height);
+        }
         image.selected_image_value = intrinsics.selected_image_value;
         if !intrinsics.is_paintable {
             transparent_mask_layer(&mut resolved_layers);
@@ -539,12 +569,33 @@ fn resolve_layers<'a, O: Observer>(
 
         let mut background_positioning_area = background_box_for(layer.origin, border_box, padding, border).rect;
 
+        // https://drafts.csswg.org/css-backgrounds-3/#valdef-background-attachment-local
+        // If the element has a scrolling mechanism, the background scrolls with the element's contents, and the
+        // background painting area and background positioning area are relative to the scrollable area of the element
+        // rather than to the border framing them.
+        // NB: The origin box keeps its insets from the padding box, which the scrollable area extends.
+        if layer.attachment == background_attachment::LOCAL
+            && recorder.source.node_kind_if_live(paintable) != Some(crate::layout::node_data::NodeKind::Viewport)
+            && crate::painting::style_queries::is_scroll_container(recorder.source, paintable)
+            && let Some(scrollable_area) =
+                crate::painting::paintable_geometry::scrollable_overflow_rect(recorder.source, paintable)
+        {
+            let padding_box =
+                background_box_for(css_enums::background_box::PADDING_BOX, border_box, padding, border).rect;
+            background_positioning_area = CssPixelRect::new(
+                scrollable_area.x + (background_positioning_area.x - padding_box.x),
+                scrollable_area.y + (background_positioning_area.y - padding_box.y),
+                scrollable_area.width + (background_positioning_area.width - padding_box.width),
+                scrollable_area.height + (background_positioning_area.height - padding_box.height),
+            );
+        }
+
         // https://drafts.csswg.org/css-backgrounds-3/#background-origin
         // If the background-attachment value for this layer is fixed, then this property has no effect: in this case
         // the background positioning area is the initial containing block.
         if layer.attachment == background_attachment::FIXED
             && background_has_fixed_attachment(
-                recorder.layout_arena,
+                recorder.source,
                 recorder.inputs.uncaptured.root_background_source,
                 paintable,
             )
@@ -685,6 +736,7 @@ fn resolve_layers<'a, O: Observer>(
             image: Some(image),
             attachment: layer.attachment,
             clip: layer.clip,
+            clip_follows_corners: layer.clip_follows_corners,
             position_x,
             position_y,
             background_positioning_area,
@@ -701,6 +753,8 @@ fn resolve_layers<'a, O: Observer>(
 
     ResolvedBackground {
         color_box,
+        padding,
+        border,
         layers: resolved_layers,
         paintable_layer_count,
         needs_text_clip: background_color_clip == css_enums::background_box::TEXT,
@@ -720,7 +774,7 @@ pub(crate) fn committed_layer_image_paint_facts<O: Observer>(
     image: &LayerImageSource<'_>,
 ) -> crate::painting::layer_image_paint_facts::LayerImagePaintFacts {
     recorder
-        .layout_arena
+        .source
         .layer_image_paint_facts(image.facts_owner, image.list, image.computed_index)
         .unwrap_or_default()
 }
@@ -744,10 +798,13 @@ fn layer_image_intrinsics<'a, O: Observer>(
         _ => {
             let facts = committed_layer_image_paint_facts(recorder, image);
             let selected_image_value = match (image.value, facts.image_set_selected_option_index) {
-                (StyleValueData::ImageSet { options }, Some(option_index)) => options
-                    .as_slice()
-                    .get(option_index as usize)
-                    .map(|option| option.values()[0].data()),
+                (StyleValueData::ImageSet(image_set_payload_1), Some(option_index)) => {
+                    let ImageSetPayload { options } = &**image_set_payload_1;
+                    options
+                        .as_slice()
+                        .get(option_index as usize)
+                        .map(|option| option.values()[0].data())
+                }
                 _ => None,
             };
             LayerImageIntrinsics {
@@ -769,6 +826,7 @@ pub(crate) fn resolve_background_layers<'a, O: Observer>(
     background_color_clip: u8,
     border_rect: CssPixelRect,
     border_radii: crate::painting::border_radii::BorderRadii,
+    edges: Option<(FfiPixelBox, FfiPixelBox)>,
 ) -> ResolvedBackground<'a> {
     let layers = computed_background_layers(style, layer_image_facts_owner);
     resolve_layers(
@@ -779,7 +837,9 @@ pub(crate) fn resolve_background_layers<'a, O: Observer>(
         background_color_clip,
         border_rect,
         border_radii,
+        edges,
         LayerType::Background,
+        style.effective_zoom(),
     )
 }
 
@@ -798,14 +858,16 @@ pub(crate) fn resolve_mask_layers<'a, O: Observer>(
         css_enums::background_box::BORDER_BOX,
         border_rect,
         crate::painting::border_radii::BorderRadii::default(),
+        None,
         LayerType::Mask,
+        style.effective_zoom(),
     )
 }
 
 pub(crate) fn has_background_to_paint(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     paintable: NodeSlotId,
-    root_background_source: FfiRootBackgroundSource,
+    root_background_source: RootBackgroundSource,
 ) -> bool {
     if body_background_is_propagated_to_root(arena, paintable, root_background_source) {
         return false;
@@ -814,7 +876,7 @@ pub(crate) fn has_background_to_paint(
         return true;
     }
     arena.node_style_if_live(paintable).is_some_and(|style| {
-        libgfx_rust::Color(style.background().background_color).alpha() != 0
+        libgfx_rust::Color(style.background_color()).alpha() != 0
             || arena.node_has_compositor_animation_frame(
                 paintable,
                 crate::layout::node_data::CompositorAnimationFrameKind::BackgroundColor,
@@ -823,15 +885,18 @@ pub(crate) fn has_background_to_paint(
     })
 }
 
-/// The root background covers the viewport and the root's scrollable overflow. Moving the
-/// viewport inside that area does not change the recorded background; growing it does.
+/// The root background covers the viewport and everything it can scroll to. Moving the viewport
+/// inside that area does not change the recorded background; growing it does.
 pub(crate) fn root_background_canvas_rect(
-    arena: &impl PaintableRowsRead,
+    arena: &impl PaintRead,
     root: NodeSlotId,
     viewport_rect: CssPixelRect,
 ) -> CssPixelRect {
     let mut rect = viewport_rect;
-    if let Some(overflow_rect) = crate::painting::paintable_geometry::scrollable_overflow_rect(arena, root) {
+    // NB: The overflow of the viewport box, not of the root: a box positioned against the initial containing block
+    //     is overflow of the viewport alone, and the compositor scrolls to it without a new recording.
+    let viewport = arena.node_parent_if_live(root).unwrap_or(root);
+    if let Some(overflow_rect) = crate::painting::paintable_geometry::scrollable_overflow_rect(arena, viewport) {
         rect.unite(overflow_rect);
     }
     rect
@@ -842,14 +907,14 @@ pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
     paintable: NodeSlotId,
 ) -> Option<BackgroundPaintInputs<'a>> {
     if !has_background_to_paint(
-        recorder.layout_arena,
+        recorder.source,
         paintable,
         recorder.inputs.uncaptured.root_background_source,
     ) {
         return None;
     }
     let source = background_paint_source_from_style_and_geometry(
-        recorder.layout_arena,
+        recorder.source,
         paintable,
         recorder.inputs.uncaptured.root_background_source,
     )?;
@@ -863,12 +928,15 @@ pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
             source.background_color_clip,
             source.background_rect,
             source.border_radii,
+            None,
         ),
         None => ResolvedBackground {
             color_box: BackgroundBox {
                 rect: CssPixelRect::default(),
                 radii: BorderRadii::default(),
             },
+            padding: FfiPixelBox::default(),
+            border: FfiPixelBox::default(),
             layers: Vec::new(),
             paintable_layer_count: 0,
             needs_text_clip: false,
@@ -877,8 +945,7 @@ pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
         },
     };
     if source.is_root_element {
-        let canvas_rect =
-            root_background_canvas_rect(recorder.layout_arena, paintable, recorder.inputs.css_viewport_rect);
+        let canvas_rect = root_background_canvas_rect(recorder.source, paintable, recorder.inputs.css_viewport_rect);
         resolved.background_rect.unite(canvas_rect);
         resolved.color_box.rect.unite(canvas_rect);
     }
@@ -887,5 +954,6 @@ pub(crate) fn resolve_background_for_paint<'a, O: Observer>(
         border_radii: source.border_radii,
         image_rendering: source.image_rendering,
         is_root_element: source.is_root_element,
+        visible_device_rect: None,
     })
 }

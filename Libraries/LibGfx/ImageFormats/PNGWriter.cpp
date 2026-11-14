@@ -10,6 +10,7 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImageFormats/PNGWriter.h>
 #include <png.h>
+#include <zlib.h>
 
 namespace Gfx {
 
@@ -46,6 +47,11 @@ ErrorOr<ByteBuffer> PNGWriter::encode(Gfx::Bitmap const& bitmap, Options options
         png_set_iCCP(png_ptr, info_ptr, "embedded profile", 0, options.icc_data->data(), options.icc_data->size());
     }
 
+    if (options.cicp.has_value()) {
+        auto const& cicp = *options.cicp;
+        png_set_cICP(png_ptr, info_ptr, to_underlying(cicp.color_primaries()), to_underlying(cicp.transfer_characteristics()), to_underlying(cicp.matrix_coefficients()), to_underlying(cicp.video_full_range_flag()));
+    }
+
     if (bitmap.format() == BitmapFormat::BGRA8888 || bitmap.format() == BitmapFormat::BGRx8888) {
         png_set_bgr(png_ptr);
     }
@@ -55,6 +61,13 @@ ErrorOr<ByteBuffer> PNGWriter::encode(Gfx::Bitmap const& bitmap, Options options
         buffer->append(data, length); }, nullptr);
 
     png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+
+    if (options.compression == PNGCompression::Fast) {
+        // NB: Trying every filter on each row and compressing with zlib's default level dominate the encoding time.
+        png_set_filter(png_ptr, PNG_FILTER_TYPE_BASE, PNG_FILTER_SUB);
+        png_set_compression_level(png_ptr, Z_BEST_SPEED);
+        png_set_compression_strategy(png_ptr, Z_RLE);
+    }
 
     context->row_pointers.resize(height);
     for (int y = 0; y < height; ++y) {

@@ -5,30 +5,37 @@
  */
 
 use super::effect_clip_plan::EffectClipPlan;
-use crate::display_list::builder::{for_each_command, inline_transform_entry_offset, read_command};
+use super::effect_geometry::{Extent, changed_extent_through_filters, nearest_spreading_effects};
+use super::layers::{LayerKind, LayerPlan};
+use super::replay::{OwnSpaceClipExtent, own_space_clip_extent};
+use super::summary::{DisplayListSummary, LiveContent};
+use crate::display_list::builder::{
+    HEADER_SIZE, for_each_command, has_inline_clip_in_its_own_space, inline_clips_of, inline_transform_entry_offset,
+    read_command, read_header,
+};
 use crate::display_list::commands::{
-    ClipMode, ClipNodeIndex, CompositorScrollbar, ContextRef, DeclareMaskContent, DisplayListCommandHeader,
+    CanvasId, ClipMode, ClipNodeIndex, CompositorScrollbar, ContextRef, DeclareMaskContent, DisplayListCommandHeader,
     DisplayListCommandRun, DisplayListCommandType, DisplayListDataSpan, DisplayListInlineClip,
     DisplayListPaintStyleType, DrawGlyphRun, DrawScaledDecodedImageFrame, EffectNodeIndex, FillPath, FillRect,
-    INLINE_CLIP_ENTRY_SIZE, OptionalColor, OptionalFloatRect, PaintScrollBar, PaintTextShadow, PathPaintKind,
-    SpatialNodeIndex, StrokePath, VISUAL_VIEWPORT_NODE_INDEX,
+    INLINE_CLIP_ENTRY_SIZE, ImageFrameResourceId, OptionalColor, OptionalFloatRect, PaintScrollBar, PaintTextShadow,
+    PathPaintKind, SpatialNodeIndex, StrokePath, VISUAL_VIEWPORT_NODE_INDEX, VideoSinkResourceId,
 };
 use crate::fast_hash::FastMap;
 use crate::host::FfiAnimatedContentViewportEffect;
 use crate::visual_context::queries::TreeCullingScratch;
 use crate::visual_context::{
-    ClipNodeData, EffectNodeData, IncludeVisualViewportTransform, SpatialData, VisualContextTree,
-    device_offset_for_index,
+    ClipNodeData, EffectNodeData, SpatialData, VisualContextTree, WorldTransforms, device_offset_for_index,
 };
-use libgfx_rust::{AffineTransform, FloatPoint, FloatRect, IntRect, enclosing_int_rect};
+use libgfx_rust::{AffineTransform, FloatMatrix4x4, FloatPoint, FloatRect, IntRect, enclosing_int_rect};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::mem::offset_of;
-use std::rc::Rc;
 
 struct CommandReference<'a> {
     header: DisplayListCommandHeader,
     payload: &'a [u8],
     context: ContextRef,
+    // The offset on its tape of the record that holds the command: its own, or that of the command it is nested in.
+    record_offset: u32,
 }
 
 // A tape and its run table. The runs are the only place a command's visual context is read from.
@@ -45,11 +52,12 @@ impl<'a> Tape<'a> {
 
     fn collect_commands_of_runs(&self, runs: &[DisplayListCommandRun], commands: &mut Vec<CommandReference<'a>>) {
         for run in runs {
-            for_each_command(self.run_bytes(run), |header, _, payload| {
+            for_each_command(self.run_bytes(run), |header, offset, payload| {
                 commands.push(CommandReference {
                     header: *header,
                     payload,
                     context: run.context,
+                    record_offset: run.offset + offset as u32,
                 });
             });
         }
@@ -57,13 +65,18 @@ impl<'a> Tape<'a> {
 }
 
 // Records nested in a group inherit the visual context of the enclosing run.
-fn collect_nested_command_references(bytes: &[u8], context: ContextRef) -> Vec<CommandReference<'_>> {
+fn collect_nested_command_references(
+    bytes: &[u8],
+    context: ContextRef,
+    record_offset: u32,
+) -> Vec<CommandReference<'_>> {
     let mut commands = Vec::new();
     for_each_command(bytes, |header, _, payload| {
         commands.push(CommandReference {
             header: *header,
             payload,
             context,
+            record_offset,
         });
     });
     commands
@@ -78,7 +91,7 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
     let mut masks: Vec<_> = (0..effect_count).map(|_| None).collect();
     let mut seen = vec![false; effect_count];
     for run in tape.runs {
-        for_each_command(tape.run_bytes(run), |header, _, payload| {
+        for_each_command(tape.run_bytes(run), |header, offset, payload| {
             if header.command_type != DisplayListCommandType::DeclareMaskContent {
                 return;
             }
@@ -91,9 +104,12 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
             }
             seen[index] = true;
             let content = super::nested_records::span_bytes(payload, declaration.content);
-            let nested = collect_nested_command_references(content, run.context);
+            let nested = collect_nested_command_references(content, run.context, run.offset + offset as u32);
             // Mask groups use their declaration's visual context. Only compare drawing commands whose
-            // complete appearance is encoded in the payload, without canvas, video, or nested scenes.
+            // complete appearance is encoded in the payload, without canvas or video. The id of a nested
+            // display list, such as that of an SVG mask image, names one recording whose commands never
+            // change. The video and animated image frames drawn only inside it can, and for those
+            // ContextPresenter damages the whole viewport.
             if nested.iter().all(|nested| match nested.header.command_type {
                 DisplayListCommandType::FillRect => read_command::<FillRect>(nested.payload)
                     .background_color_animation_effect
@@ -111,6 +127,7 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
                 DisplayListCommandType::PaintLinearGradient
                 | DisplayListCommandType::PaintRadialGradient
                 | DisplayListCommandType::PaintConicGradient
+                | DisplayListCommandType::PaintNestedDisplayList
                 | DisplayListCommandType::DrawEllipse
                 | DisplayListCommandType::DrawLine
                 | DisplayListCommandType::DrawRect => true,
@@ -221,6 +238,8 @@ fn inline_clip_lists_are_equal(a: &CommandReference<'_>, b: &CommandReference<'_
             && same_entry_field(offset_of!(DisplayListInlineClip, path_winding_rule), 4)
             && same_entry_field(offset_of!(DisplayListInlineClip, kind), 1)
             && same_entry_field(offset_of!(DisplayListInlineClip, mode), 1)
+            && same_entry_field(offset_of!(DisplayListInlineClip, has_own_space), 1)
+            && same_entry_field(offset_of!(DisplayListInlineClip, space), 4)
             && first.span_bytes_at(a_entry + offset_of!(DisplayListInlineClip, path_data))
                 == second.span_bytes_at(b_entry + offset_of!(DisplayListInlineClip, path_data))
     })
@@ -281,7 +300,8 @@ fn display_list_commands_are_equal(a: &CommandReference<'_>, b: &CommandReferenc
     }
 
     if a.header.command_type == DisplayListCommandType::DrawGlyphRun {
-        return same_field(offset_of!(DrawGlyphRun, font_smoothing), 1)
+        return same_field(offset_of!(DrawGlyphRun, stroke_width), 4)
+            && same_field(offset_of!(DrawGlyphRun, font_smoothing), 1)
             && first.u64_at(offset_of!(DrawGlyphRun, font_id)) == second.u64_at(offset_of!(DrawGlyphRun, font_id))
             && first.span_bytes_at(offset_of!(DrawGlyphRun, glyphs))
                 == second.span_bytes_at(offset_of!(DrawGlyphRun, glyphs))
@@ -301,16 +321,15 @@ fn display_list_commands_are_equal(a: &CommandReference<'_>, b: &CommandReferenc
                 == second.u64_at(offset_of!(PaintTextShadow, font_id))
             && first.span_bytes_at(offset_of!(PaintTextShadow, glyphs))
                 == second.span_bytes_at(offset_of!(PaintTextShadow, glyphs))
-            && first.int_rect_at(offset_of!(PaintTextShadow, shadow_bounding_rect))
-                == second.int_rect_at(offset_of!(PaintTextShadow, shadow_bounding_rect))
+            && first.span_bytes_at(offset_of!(PaintTextShadow, layers))
+                == second.span_bytes_at(offset_of!(PaintTextShadow, layers))
+            && first.int_rect_at(offset_of!(PaintTextShadow, shadows_bounding_rect))
+                == second.int_rect_at(offset_of!(PaintTextShadow, shadows_bounding_rect))
             && first.int_rect_at(offset_of!(PaintTextShadow, rect))
                 == second.int_rect_at(offset_of!(PaintTextShadow, rect))
             && first.float_point_at(offset_of!(PaintTextShadow, translation))
                 == second.float_point_at(offset_of!(PaintTextShadow, translation))
             && first.f32_at(offset_of!(PaintTextShadow, scale)) == second.f32_at(offset_of!(PaintTextShadow, scale))
-            && first.i32_at(offset_of!(PaintTextShadow, blur_radius))
-                == second.i32_at(offset_of!(PaintTextShadow, blur_radius))
-            && same_field(offset_of!(PaintTextShadow, color), 4)
             && same_field(offset_of!(PaintTextShadow, orientation), 4);
     }
 
@@ -350,7 +369,7 @@ fn clip_data_is_equal(a: &ClipNodeData, b: &ClipNodeData) -> bool {
         (ClipNodeData::Path(data), ClipNodeData::Path(other)) => {
             data.bounding_rect == other.bounding_rect
                 && data.fill_rule == other.fill_rule
-                && (Rc::ptr_eq(&data.path, &other.path) || *data.path == *other.path)
+                && (std::sync::Arc::ptr_eq(&data.path, &other.path) || *data.path == *other.path)
         }
         _ => false,
     }
@@ -360,7 +379,8 @@ fn effect_data_is_equal(a: &EffectNodeData, b: &EffectNodeData) -> bool {
     match (a, b) {
         (EffectNodeData::BackgroundColorAnimation, EffectNodeData::BackgroundColorAnimation) => true,
         (EffectNodeData::Effects(data), EffectNodeData::Effects(other)) => {
-            data.opacity == other.opacity
+            data.isolation == other.isolation
+                && data.opacity == other.opacity
                 && data.blend_mode == other.blend_mode
                 && data.filter == other.filter
                 && data.backdrop_filter == other.backdrop_filter
@@ -388,8 +408,6 @@ struct ChainVerdict {
     compatible: bool,
     // Compatible, and every paired node holds equal values.
     equal: bool,
-    // Some paired effects differ in a filter that can push ink outside the command bounds.
-    filter_change_may_affect_output_bounds: bool,
 }
 
 impl ChainVerdict {
@@ -397,7 +415,6 @@ impl ChainVerdict {
         Self {
             compatible: both_ended,
             equal: both_ended,
-            filter_change_may_affect_output_bounds: false,
         }
     }
 }
@@ -417,7 +434,6 @@ impl ChainMemoEntry {
         verdict: ChainVerdict {
             compatible: false,
             equal: false,
-            filter_change_may_affect_output_bounds: false,
         },
     };
 }
@@ -462,10 +478,50 @@ struct ContextPairVerdict {
     compatible: bool,
     // Compatible chains whose node values are equal too, so replay draws the content in the same place.
     equal: bool,
-    // Compatible, unequal chains differ in a filter that can push ink outside the command bounds.
-    filter_change_may_affect_output_bounds: bool,
-    // Such a filter's output is clipped away outside the viewport on both sides, so it cannot show.
-    filter_output_is_clipped_outside_viewport: bool,
+}
+
+// Where one tree draws its commands and how its filters spread them, worked out on first use.
+#[derive(Default)]
+struct LazySideGeometry {
+    nearest_spreading_effects: OnceCell<Vec<EffectNodeIndex>>,
+    world_transforms: OnceCell<WorldTransforms>,
+}
+
+// Where a command's inline clips in spaces of their own let it draw on one side of the comparison.
+fn own_space_clip_extent_on(command: &CommandReference<'_>, side: TreeSide<'_>) -> Option<OwnSpaceClipExtent> {
+    if command.header.inline_clip_count == 0
+        || !command.header.has_bounding_rect
+        || !has_inline_clip_in_its_own_space(&command.header, command.payload)
+    {
+        return None;
+    }
+    let world = side.world();
+    own_space_clip_extent(
+        &command.header,
+        command.payload,
+        command.header.bounding_rect.to_float(),
+        world.draw_matrix_if_known(command.context.spatial)?,
+        |space| world.draw_matrix_if_known(space),
+    )
+}
+
+// One side of the comparison, as command damage needs it.
+#[derive(Clone, Copy)]
+struct TreeSide<'b> {
+    tree: &'b VisualContextTree,
+    scroll_offsets: &'b [FloatPoint],
+    culling: &'b TreeCullingScratch,
+    effect_clips: &'b EffectClipPlan,
+    lazy_geometry: &'b LazySideGeometry,
+}
+
+impl<'b> TreeSide<'b> {
+    // Damage maps commands with the matrices replay draws them with.
+    fn world(&self) -> &'b WorldTransforms {
+        self.lazy_geometry
+            .world_transforms
+            .get_or_init(|| WorldTransforms::new(self.tree, self.scroll_offsets, Some(FloatMatrix4x4::identity())))
+    }
 }
 
 struct TreeChainComparison<'a> {
@@ -483,18 +539,38 @@ struct TreeChainComparison<'a> {
     new_scroll_offsets: &'a [FloatPoint],
     new_spatial_depths: Vec<u32>,
     new_culling: TreeCullingScratch,
-    viewport_rect: IntRect,
     // Consecutive commands almost always share a context pair, so the last verdict comes first.
     last_context_pair_verdict: Cell<Option<(ContextRef, ContextRef, ContextPairVerdict)>>,
     spatial_chain_memo: RefCell<Vec<ChainMemoEntry>>,
     clip_chain_memo: RefCell<Vec<ChainMemoEntry>>,
     effect_chain_memo: RefCell<Vec<ChainMemoEntry>>,
     chain_walk_path: RefCell<Vec<(u32, u32)>>,
-    filter_output_clipping: RefCell<FastMap<(ContextRef, ContextRef), bool>>,
     mask_comparisons: RefCell<FastMap<(u32, u32), bool>>,
+    old_lazy_geometry: LazySideGeometry,
+    new_lazy_geometry: LazySideGeometry,
 }
 
 impl<'a> TreeChainComparison<'a> {
+    fn old_side(&self) -> TreeSide<'_> {
+        TreeSide {
+            tree: self.old_tree,
+            scroll_offsets: self.old_scroll_offsets,
+            culling: &self.old_culling,
+            effect_clips: &self.old_effect_clips,
+            lazy_geometry: &self.old_lazy_geometry,
+        }
+    }
+
+    fn new_side(&self) -> TreeSide<'_> {
+        TreeSide {
+            tree: self.new_tree,
+            scroll_offsets: self.new_scroll_offsets,
+            culling: &self.new_culling,
+            effect_clips: &self.new_effect_clips,
+            lazy_geometry: &self.new_lazy_geometry,
+        }
+    }
+
     fn old_mask_contents(&self) -> &[Option<StaticMaskContent<'a>>] {
         self.old_mask_contents
             .get_or_init(|| static_mask_contents(self.old_tape, self.old_tree.effect_nodes.len()))
@@ -537,21 +613,9 @@ impl<'a> TreeChainComparison<'a> {
         if !effect.compatible {
             return ContextPairVerdict::default();
         }
-        if spatial.equal && clip.equal && effect.equal {
-            return ContextPairVerdict {
-                compatible: true,
-                equal: true,
-                ..ContextPairVerdict::default()
-            };
-        }
-        let filter_change_may_affect_output_bounds = effect.filter_change_may_affect_output_bounds;
-        let filter_output_is_clipped_outside_viewport = filter_change_may_affect_output_bounds
-            && self.filter_output_is_clipped_outside_viewport(old_context, new_context);
         ContextPairVerdict {
             compatible: true,
-            equal: false,
-            filter_change_may_affect_output_bounds,
-            filter_output_is_clipped_outside_viewport,
+            equal: spatial.equal && clip.equal && effect.equal,
         }
     }
 
@@ -594,11 +658,7 @@ impl<'a> TreeChainComparison<'a> {
                         &new_node.data,
                         self.new_scroll_offsets,
                     );
-                ChainVerdict {
-                    compatible,
-                    equal,
-                    filter_change_may_affect_output_bounds: false,
-                }
+                ChainVerdict { compatible, equal }
             },
         )
     }
@@ -618,11 +678,7 @@ impl<'a> TreeChainComparison<'a> {
                     && std::mem::discriminant(&old_node.data) == std::mem::discriminant(&new_node.data)
                     && self.same_spatial_depth(old_node.spatial, new_node.spatial);
                 let equal = compatible && above.equal && clip_data_is_equal(&old_node.data, &new_node.data);
-                ChainVerdict {
-                    compatible,
-                    equal,
-                    filter_change_may_affect_output_bounds: false,
-                }
+                ChainVerdict { compatible, equal }
             },
         )
     }
@@ -661,24 +717,7 @@ impl<'a> TreeChainComparison<'a> {
                                 .new_culling
                                 .clip_depth(self.new_effect_clips.output_clip(EffectNodeIndex(new)))
                 };
-                let filter_change_may_affect_output_bounds = above.filter_change_may_affect_output_bounds
-                    || (compatible
-                        && match (&old_node.data, &new_node.data) {
-                            (EffectNodeData::Effects(old_effects), EffectNodeData::Effects(new_effects)) => {
-                                old_effects.filter != new_effects.filter
-                                    && old_effects
-                                        .filter
-                                        .iter()
-                                        .chain(new_effects.filter.iter())
-                                        .any(|filter| crate::filter_bytes::may_affect_output_bounds(filter))
-                            }
-                            _ => false,
-                        });
-                ChainVerdict {
-                    compatible,
-                    equal,
-                    filter_change_may_affect_output_bounds,
-                }
+                ChainVerdict { compatible, equal }
             },
         )
     }
@@ -693,28 +732,6 @@ impl<'a> TreeChainComparison<'a> {
         );
         self.mask_comparisons.borrow_mut().insert(effect_pair, equal);
         equal
-    }
-
-    fn filter_output_is_clipped_outside_viewport(&self, old_context: ContextRef, new_context: ContextRef) -> bool {
-        let key = (old_context, new_context);
-        if let Some(clipped) = self.filter_output_clipping.borrow().get(&key) {
-            return *clipped;
-        }
-        let clipped = filter_output_is_clipped_outside_viewport(
-            old_context,
-            self.old_tree,
-            &self.old_effect_clips,
-            self.old_scroll_offsets,
-            self.viewport_rect,
-        ) && filter_output_is_clipped_outside_viewport(
-            new_context,
-            self.new_tree,
-            &self.new_effect_clips,
-            self.new_scroll_offsets,
-            self.viewport_rect,
-        );
-        self.filter_output_clipping.borrow_mut().insert(key, clipped);
-        clipped
     }
 
     // Whether two commands with the given contexts match for diffing purposes: equal drawing, under
@@ -764,15 +781,11 @@ impl<'a> TreeChainComparison<'a> {
     }
 }
 
-fn filter_output_is_clipped_outside_viewport(
-    context: ContextRef,
-    tree: &VisualContextTree,
-    effect_clips: &EffectClipPlan,
-    scroll_offsets: &[FloatPoint],
-    viewport: IntRect,
-) -> bool {
-    // Only clips outside every filter bound the final output. Replay can widen an effect's
-    // output clip for escaping descendants, so use the complete display list's layer plan.
+// The viewport bounds that the clips outside every filter on a context's effect chain put on the
+// filtered output, or None when no rect clip bounds it. Replay can widen an effect's output clip
+// for escaping descendants, so the complete display list's layer plan says which clips are outside.
+fn filter_output_clip_bounds(context: ContextRef, side: TreeSide<'_>) -> Option<FloatRect> {
+    let (tree, effect_clips) = (side.tree, side.effect_clips);
     let mut clip = context.clip;
     let mut effect = context.effect;
     while !effect.is_none() {
@@ -784,45 +797,23 @@ fn filter_output_is_clipped_outside_viewport(
         }
         effect = node.parent;
     }
+    let mut output_bounds: Option<FloatRect> = None;
     while !clip.is_none() {
         let node = &tree.clip_nodes[clip.0 as usize];
         if let ClipNodeData::Rect(data) = &node.data
             && data.mode == ClipMode::Intersect
         {
-            let bounds = tree
-                .transform_rect_to_viewport(
-                    node.spatial,
-                    data.rect,
-                    scroll_offsets,
-                    IncludeVisualViewportTransform::Yes,
-                )
+            let bounds = side
+                .world()
+                .map_rect_to_root(node.spatial, data.rect)
                 .inflated(1.0, 1.0);
-            if bounds.x.is_finite()
-                && bounds.y.is_finite()
-                && bounds.width.is_finite()
-                && bounds.height.is_finite()
-                && (bounds.right() < viewport.x as f32
-                    || bounds.x > viewport.right() as f32
-                    || bounds.bottom() < viewport.y as f32
-                    || bounds.y > viewport.bottom() as f32)
-            {
-                return true;
+            if bounds.x.is_finite() && bounds.y.is_finite() && bounds.width.is_finite() && bounds.height.is_finite() {
+                output_bounds = Some(output_bounds.map_or(bounds, |output_bounds| output_bounds.intersected(bounds)));
             }
         }
         clip = node.parent;
     }
-    false
-}
-
-fn intersect_like_gfx_rect(rect: FloatRect, other: FloatRect) -> FloatRect {
-    let left = rect.x.max(other.x);
-    let right = rect.right().min(other.right());
-    let top = rect.y.max(other.y);
-    let bottom = rect.bottom().min(other.bottom());
-    if left > right || top > bottom {
-        return FloatRect::default();
-    }
-    FloatRect::new(left, top, right - left, bottom - top)
+    output_bounds
 }
 
 fn intersect_like_gfx_int_rect(rect: IntRect, other: IntRect) -> IntRect {
@@ -836,51 +827,149 @@ fn intersect_like_gfx_int_rect(rect: IntRect, other: IntRect) -> IntRect {
     IntRect::new(left, top, right - left, bottom - top)
 }
 
-struct DamageAccumulator {
+/// The layer plans of the old and the new frame, which have the same layers. A layer keeps its raster between the
+/// frames, so damage is attributed to the layers that draw the content it comes from.
+#[derive(Clone, Copy)]
+pub struct LayerPlans<'a> {
+    pub old: &'a LayerPlan,
+    pub new: &'a LayerPlan,
+}
+
+#[derive(Clone, Copy)]
+enum FrameSide {
+    Old,
+    New,
+}
+
+#[derive(Clone, Copy)]
+enum DamagedLayers {
+    OfRecord(FrameSide, u32),
+    All,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LayerDamage {
+    rect: Option<IntRect>,
+    is_unbounded: bool,
+}
+
+struct DamageAccumulator<'a> {
     damage_rect: Option<IntRect>,
     changed_unbounded_command: bool,
     viewport_rect: IntRect,
+    layer_plans: Option<LayerPlans<'a>>,
+    damage_of_layers: Vec<LayerDamage>,
 }
 
-impl DamageAccumulator {
-    // Once the damage covers the viewport, no further command can change the outcome.
+impl DamageAccumulator<'_> {
+    // Once the damage covers the viewport in every raster it reaches, no further command can change the outcome.
     fn covers_viewport(&self) -> bool {
-        self.changed_unbounded_command
-            || self
-                .damage_rect
-                .is_some_and(|damage_rect| damage_rect.contains_rect(self.viewport_rect))
+        let covers = |is_unbounded: bool, rect: Option<IntRect>| {
+            is_unbounded || rect.is_some_and(|rect| rect.contains_rect(self.viewport_rect))
+        };
+        covers(self.changed_unbounded_command, self.damage_rect)
+            && self.layer_plans.is_none_or(|plans| {
+                plans
+                    .new
+                    .layers
+                    .iter()
+                    .zip(&self.damage_of_layers)
+                    .all(|(layer, damage)| {
+                        matches!(layer.kind, LayerKind::Media { .. }) || covers(damage.is_unbounded, damage.rect)
+                    })
+            })
     }
 
-    fn add_command_damage(
-        &mut self,
-        command: &CommandReference<'_>,
-        visual_context_tree: &VisualContextTree,
-        scroll_offsets: &[FloatPoint],
-        culling: &TreeCullingScratch,
-    ) {
-        let context = command.context;
-        if culling.context_culls_everything(context) {
+    fn for_each_damaged_layer(&mut self, layers: DamagedLayers, mut f: impl FnMut(&mut LayerDamage)) {
+        let Some(plans) = self.layer_plans else {
             return;
-        }
-        if !command.header.has_bounding_rect {
-            if command.header.command_type.is_compositor_metadata() {
+        };
+        let layer = match layers {
+            DamagedLayers::OfRecord(FrameSide::Old, record_offset) => plans.old.layer_of_record(record_offset),
+            DamagedLayers::OfRecord(FrameSide::New, record_offset) => plans.new.layer_of_record(record_offset),
+            DamagedLayers::All => {
+                self.damage_of_layers.iter_mut().for_each(f);
                 return;
             }
-            self.changed_unbounded_command = true;
+        };
+        f(&mut self.damage_of_layers[layer]);
+    }
+
+    fn add_unbounded_damage(&mut self, layers: DamagedLayers) {
+        self.changed_unbounded_command = true;
+        self.for_each_damaged_layer(layers, |damage| damage.is_unbounded = true);
+    }
+
+    fn add_damage_rect(&mut self, rect: IntRect, layers: DamagedLayers) {
+        let united =
+            |damage_rect: Option<IntRect>| Some(damage_rect.map_or(rect, |damage_rect| damage_rect.united(rect)));
+        self.damage_rect = united(self.damage_rect);
+        self.for_each_damaged_layer(layers, |damage| damage.rect = united(damage.rect));
+    }
+
+    fn add_command_damage(&mut self, command: &CommandReference<'_>, side: TreeSide<'_>, frame: FrameSide) {
+        let context = command.context;
+        if side.culling.context_culls_everything(context) {
             return;
         }
-        let bounding_rect = command.header.bounding_rect;
-        let mut transformed_rect = visual_context_tree.transform_rect_to_viewport(
-            context.spatial,
-            FloatRect::new(
-                bounding_rect.x as f32,
-                bounding_rect.y as f32,
-                bounding_rect.width as f32,
-                bounding_rect.height as f32,
-            ),
-            scroll_offsets,
-            IncludeVisualViewportTransform::Yes,
+        // Only compositor metadata, which draws nothing, has no bounding rect.
+        if !command.header.has_bounding_rect {
+            return;
+        }
+        // The bounds of a command leave out its inline clips in spaces of their own, so they limit it here.
+        let rect = match own_space_clip_extent_on(command, side) {
+            Some(OwnSpaceClipExtent::Within(rect)) => rect,
+            _ => command.header.bounding_rect.to_float(),
+        };
+        if rect.is_empty() {
+            return;
+        }
+        self.add_changed_content_damage(
+            rect,
+            context,
+            side,
+            DamagedLayers::OfRecord(frame, command.record_offset),
         );
+    }
+
+    // Damage for content drawn within `rect` in `context` that changed, wherever the filters above
+    // it spread the change.
+    fn add_changed_content_damage(
+        &mut self,
+        rect: FloatRect,
+        context: ContextRef,
+        side: TreeSide<'_>,
+        layers: DamagedLayers,
+    ) {
+        let nearest_spreading_effects = side
+            .lazy_geometry
+            .nearest_spreading_effects
+            .get_or_init(|| nearest_spreading_effects(side.tree));
+        let spread_by_filters =
+            !context.effect.is_none() && !nearest_spreading_effects[context.effect.0 as usize].is_none();
+        let (space, extent) = changed_extent_through_filters(
+            side.tree,
+            nearest_spreading_effects,
+            context.spatial,
+            rect,
+            context.effect,
+            side.world(),
+        );
+        // Spread content can reach far past the clips it was drawn in, but not past those outside
+        // the filters.
+        let output_clip_bounds = if spread_by_filters {
+            filter_output_clip_bounds(context, side)
+        } else {
+            None
+        };
+        let mut transformed_rect = match (extent, output_clip_bounds) {
+            (Extent::Within(rect), _) => side.world().map_rect_to_root(space, rect),
+            (_, Some(output_clip_bounds)) => output_clip_bounds,
+            _ => {
+                self.add_unbounded_damage(layers);
+                return;
+            }
+        };
         // Transform matrices with entries near float max can overflow the projection to non-finite values.
         // NaN survives both intersect() and is_empty(), so treat such rects as unbounded damage instead of
         // feeding them to enclosing_int_rect(), where the float-to-int conversion would be undefined.
@@ -889,37 +978,131 @@ impl DamageAccumulator {
             || !transformed_rect.width.is_finite()
             || !transformed_rect.height.is_finite()
         {
-            self.changed_unbounded_command = true;
+            self.add_unbounded_damage(layers);
             return;
+        }
+        if let Some(output_clip_bounds) = output_clip_bounds {
+            transformed_rect = transformed_rect.intersected(output_clip_bounds);
         }
         // Eye-plane clamping in the projection can produce coordinates beyond integer range, and converting
         // such a float to int is undefined.
         const DAMAGE_COORDINATE_LIMIT: f32 = 16777216.0;
-        transformed_rect = intersect_like_gfx_rect(
-            transformed_rect,
-            FloatRect::new(
-                -DAMAGE_COORDINATE_LIMIT,
-                -DAMAGE_COORDINATE_LIMIT,
-                2.0 * DAMAGE_COORDINATE_LIMIT,
-                2.0 * DAMAGE_COORDINATE_LIMIT,
-            ),
-        );
+        transformed_rect = transformed_rect.intersected(FloatRect::new(
+            -DAMAGE_COORDINATE_LIMIT,
+            -DAMAGE_COORDINATE_LIMIT,
+            2.0 * DAMAGE_COORDINATE_LIMIT,
+            2.0 * DAMAGE_COORDINATE_LIMIT,
+        ));
         if transformed_rect.is_empty() {
             return;
         }
-        let command_damage = enclosing_int_rect(transformed_rect);
-        self.damage_rect = Some(match self.damage_rect {
-            Some(damage_rect) => damage_rect.united(command_damage),
-            None => command_damage,
-        });
+        self.add_damage_rect(enclosing_int_rect(transformed_rect), layers);
     }
 
     fn add_old_command_damage(&mut self, chains: &TreeChainComparison<'_>, command: &CommandReference<'_>) {
-        self.add_command_damage(command, chains.old_tree, chains.old_scroll_offsets, &chains.old_culling);
+        self.add_command_damage(command, chains.old_side(), FrameSide::Old);
     }
 
     fn add_new_command_damage(&mut self, chains: &TreeChainComparison<'_>, command: &CommandReference<'_>) {
-        self.add_command_damage(command, chains.new_tree, chains.new_scroll_offsets, &chains.new_culling);
+        self.add_command_damage(command, chains.new_side(), FrameSide::New);
+    }
+
+    // A command that the new plan draws into another layer than the old plan leaves the raster of one layer and
+    // enters that of the other, even where it draws the same pixels.
+    fn add_layer_change_damage(
+        &mut self,
+        chains: &TreeChainComparison<'_>,
+        old_command: &CommandReference<'_>,
+        new_command: &CommandReference<'_>,
+    ) {
+        let Some(plans) = self.layer_plans else {
+            return;
+        };
+        if plans.old.layer_of_record(old_command.record_offset) == plans.new.layer_of_record(new_command.record_offset)
+        {
+            return;
+        }
+        self.add_old_command_damage(chains, old_command);
+        self.add_new_command_damage(chains, new_command);
+    }
+
+    // A backdrop filter can read the pixels around its region, so damage beneath the region changes it
+    // wherever the filter carries that damage in. The whole region then changes as content of the
+    // backdrop's effect: that effect's own filter and the filters above it spread it further, and it
+    // can carry the damage on to the backdrop filters above it.
+    fn add_backdrop_filter_damage(&mut self, side: TreeSide<'_>, command_runs: &[DisplayListCommandRun]) {
+        let tree = side.tree;
+        let backdrop_of = |effect: EffectNodeIndex| match &tree.effect_nodes[effect.0 as usize].data {
+            EffectNodeData::Effects(effects) => effects.backdrop_filter.as_ref(),
+            _ => None,
+        };
+        if self.damage_rect.is_none()
+            || !(0..tree.effect_nodes.len()).any(|index| backdrop_of(EffectNodeIndex(index as u32)).is_some())
+        {
+            return;
+        }
+        let mut seen_effects = vec![false; tree.effect_nodes.len()];
+        // Each effect with a backdrop filter, with the offset of its first record.
+        let mut backdrop_effects = Vec::new();
+        for run in command_runs {
+            let mut effect = run.context.effect;
+            while !effect.is_none() && !seen_effects[effect.0 as usize] {
+                seen_effects[effect.0 as usize] = true;
+                if backdrop_of(effect).is_some() {
+                    backdrop_effects.push((effect, run.offset));
+                }
+                effect = tree.effect_nodes[effect.0 as usize].parent;
+            }
+        }
+
+        let mut region_is_damaged = vec![false; backdrop_effects.len()];
+        loop {
+            if self.covers_viewport() {
+                return;
+            }
+            let Some(damage_rect) = self.damage_rect else {
+                return;
+            };
+            let damage = damage_rect.to_float();
+            let mut damage_grew = false;
+            for (index, &(effect, first_record_offset)) in backdrop_effects.iter().enumerate() {
+                if region_is_damaged[index] {
+                    continue;
+                }
+                let node = &tree.effect_nodes[effect.0 as usize];
+                let backdrop = backdrop_of(effect).expect("only effects with a backdrop filter are collected");
+                let region = backdrop.region.to_float();
+                let to_root_matrix = side.world().draw_matrix(node.spatial);
+                let reads_damage = (|| {
+                    if !to_root_matrix.is_2d_affine() {
+                        return None;
+                    }
+                    let damage_in_effect_space = to_root_matrix.extract_2d_affine().inverse()?.map_rect(damage);
+                    let reached = crate::filter_bytes::changed_output_bounds(&backdrop.filter, damage_in_effect_space)?;
+                    Some(!reached.intersected(region).is_empty())
+                })()
+                .unwrap_or(true);
+                if !reads_damage {
+                    continue;
+                }
+                region_is_damaged[index] = true;
+                damage_grew = true;
+                let backdrop_context = ContextRef {
+                    spatial: node.spatial,
+                    clip: side.effect_clips.output_clip(effect),
+                    effect,
+                };
+                self.add_changed_content_damage(
+                    region,
+                    backdrop_context,
+                    side,
+                    DamagedLayers::OfRecord(FrameSide::New, first_record_offset),
+                );
+            }
+            if !damage_grew {
+                return;
+            }
+        }
     }
 
     // Damage for a command whose drawing is unchanged but whose chains moved or restyled it.
@@ -948,17 +1131,38 @@ impl DamageAccumulator {
         old_command: &CommandReference<'_>,
         new_command: &CommandReference<'_>,
     ) {
-        let verdict = chains.verdict(old_command.context, new_command.context);
-        if verdict.equal {
-            return;
-        }
-        if verdict.filter_change_may_affect_output_bounds {
-            if !verdict.filter_output_is_clipped_outside_viewport {
-                self.changed_unbounded_command = true;
-            }
+        if chains.verdict(old_command.context, new_command.context).equal {
             return;
         }
         self.add_moved_command_damage(chains, old_command, new_command);
+    }
+
+    // A command that draws in a different space than one of its inline clips shows another part of
+    // itself whenever one of the two spaces moves, though neither the command nor its context changed.
+    // Where the clips can be mapped into the command's space, command damage covers only what they let it draw.
+    fn add_inline_clip_scroll_damage(
+        &mut self,
+        chains: &TreeChainComparison<'_>,
+        old_command: &CommandReference<'_>,
+        new_command: &CommandReference<'_>,
+    ) {
+        if old_command.header.inline_clip_count == 0 && new_command.header.inline_clip_count == 0 {
+            return;
+        }
+        let old_extent = own_space_clip_extent_on(old_command, chains.old_side());
+        let new_extent = own_space_clip_extent_on(new_command, chains.new_side());
+        let clips_did_not_move = match (old_extent, new_extent) {
+            (None, None) => true,
+            (Some(OwnSpaceClipExtent::Within(old_rect)), Some(OwnSpaceClipExtent::Within(new_rect))) => {
+                old_rect == new_rect
+            }
+            _ => false,
+        };
+        if clips_did_not_move {
+            return;
+        }
+        self.add_old_command_damage(chains, old_command);
+        self.add_new_command_damage(chains, new_command);
     }
 
     fn add_scrollbar_scroll_damage(
@@ -1000,21 +1204,20 @@ impl DamageAccumulator {
         new_run: &DisplayListCommandRun,
         verdict: ContextPairVerdict,
         scroll_offsets_differ: bool,
+        inline_clip_spaces_may_have_moved: bool,
     ) {
-        let mut commands_moved = false;
-        if !verdict.equal {
-            if verdict.filter_change_may_affect_output_bounds {
-                if !verdict.filter_output_is_clipped_outside_viewport {
-                    self.changed_unbounded_command = true;
-                }
-            } else {
-                commands_moved = true;
-            }
-        }
-        if !commands_moved && !scroll_offsets_differ {
+        let commands_moved = !verdict.equal;
+        let commands_may_change_layers = self
+            .layer_plans
+            .is_some_and(|plans| !plans.old.places_run_like(old_run, plans.new, new_run));
+        if !commands_moved
+            && !scroll_offsets_differ
+            && !inline_clip_spaces_may_have_moved
+            && !commands_may_change_layers
+        {
             return;
         }
-        for_each_command(chains.old_tape.run_bytes(old_run), |header, _, payload| {
+        for_each_command(chains.old_tape.run_bytes(old_run), |header, offset, payload| {
             if self.covers_viewport() {
                 return;
             }
@@ -1022,17 +1225,25 @@ impl DamageAccumulator {
                 header: *header,
                 payload,
                 context: old_run.context,
+                record_offset: old_run.offset + offset as u32,
             };
             let new_command = CommandReference {
                 header: *header,
                 payload,
                 context: new_run.context,
+                record_offset: new_run.offset + offset as u32,
             };
+            if commands_may_change_layers {
+                self.add_layer_change_damage(chains, &old_command, &new_command);
+            }
             if commands_moved {
                 self.add_moved_command_damage(chains, &old_command, &new_command);
             }
             if scroll_offsets_differ {
                 self.add_scrollbar_scroll_damage(chains, &old_command, &new_command);
+            }
+            if inline_clip_spaces_may_have_moved {
+                self.add_inline_clip_scroll_damage(chains, &old_command, &new_command);
             }
         });
     }
@@ -1044,6 +1255,7 @@ impl DamageAccumulator {
         old_commands: &[CommandReference<'_>],
         new_commands: &[CommandReference<'_>],
         scroll_offsets_differ: bool,
+        inline_clip_spaces_may_have_moved: bool,
     ) {
         let common_length = old_commands.len().min(new_commands.len());
         let mut common_prefix_length = 0;
@@ -1065,9 +1277,13 @@ impl DamageAccumulator {
 
         let add_matched_pair_damage =
             |damage: &mut Self, old_command: &CommandReference<'_>, new_command: &CommandReference<'_>| {
+                damage.add_layer_change_damage(chains, old_command, new_command);
                 damage.add_visual_context_damage(chains, old_command, new_command);
                 if scroll_offsets_differ {
                     damage.add_scrollbar_scroll_damage(chains, old_command, new_command);
+                }
+                if inline_clip_spaces_may_have_moved {
+                    damage.add_inline_clip_scroll_damage(chains, old_command, new_command);
                 }
             };
 
@@ -1228,17 +1444,32 @@ pub fn animated_content_may_affect_viewport(
         };
         *flag = true;
     }
+    let world = OnceCell::new();
     let mut may_affect_viewport = false;
     let tape = Tape {
         bytes: command_bytes,
         runs: command_runs,
     };
     for run in command_runs {
-        for_each_command(tape.run_bytes(run), |header, _, _| {
+        for_each_command(tape.run_bytes(run), |header, _, payload| {
             if may_affect_viewport || header.command_type.is_compositor_metadata() {
                 return;
             }
             let spatial_is_animated = in_rotating_subtree[run.context.spatial.0 as usize];
+            let has_inline_clip_in_its_own_space =
+                header.inline_clip_count != 0 && has_inline_clip_in_its_own_space(header, payload);
+            if has_inline_clip_in_its_own_space
+                && !spatial_is_animated
+                && inline_clips_of(header, payload).any(|inline_clip| {
+                    inline_clip.has_own_space
+                        && in_rotating_subtree
+                            .get(inline_clip.space.0 as usize)
+                            .is_none_or(|is_animated| *is_animated)
+                })
+            {
+                may_affect_viewport = true;
+                return;
+            }
             let mut clip = run.context.clip;
             while !clip.is_none() {
                 let node = &tree.clip_nodes[clip.0 as usize];
@@ -1273,17 +1504,25 @@ pub fn animated_content_may_affect_viewport(
                 may_affect_viewport = true;
                 return;
             }
-            if !header.has_bounding_rect {
-                may_affect_viewport = true;
-                return;
+            let mut rect = header.bounding_rect.to_float();
+            if has_inline_clip_in_its_own_space && header.has_bounding_rect {
+                let world =
+                    world.get_or_init(|| WorldTransforms::new(tree, scroll_offsets, Some(FloatMatrix4x4::identity())));
+                if let Some(command_to_root) = world.draw_matrix_if_known(run.context.spatial)
+                    && let Some(OwnSpaceClipExtent::Within(clipped_rect)) =
+                        own_space_clip_extent(header, payload, rect, command_to_root, |space| {
+                            world.draw_matrix_if_known(space)
+                        })
+                {
+                    if clipped_rect.is_empty() {
+                        return;
+                    }
+                    rect = clipped_rect;
+                }
             }
-            let rect = header.bounding_rect;
-            let Some(bounds) = tree.rect_with_rotation_bounds_to_viewport(
-                run.context.spatial,
-                FloatRect::new(rect.x as f32, rect.y as f32, rect.width as f32, rect.height as f32),
-                &rotating_nodes,
-                scroll_offsets,
-            ) else {
+            let Some(bounds) =
+                tree.rect_with_rotation_bounds_to_viewport(run.context.spatial, rect, &rotating_nodes, scroll_offsets)
+            else {
                 may_affect_viewport = true;
                 return;
             };
@@ -1302,20 +1541,68 @@ pub fn animated_content_may_affect_viewport(
 pub struct DisplayListFrame<'a> {
     pub command_bytes: &'a [u8],
     pub command_runs: &'a [DisplayListCommandRun],
+    pub summary: &'a DisplayListSummary,
     pub visual_context_tree: &'a VisualContextTree,
     pub scroll_offsets: &'a [FloatPoint],
 }
 
+// The canvases, video sinks and image frames whose pixels changed since the old frame. The lists draw
+// them with commands that stay the same, so the diff cannot see the change.
+#[derive(Clone, Copy, Default)]
+pub struct LiveContentChanges<'a> {
+    pub canvases: &'a [CanvasId],
+    pub video_sinks: &'a [VideoSinkResourceId],
+    pub image_frames: &'a [ImageFrameResourceId],
+    /// What the compositor repaints whatever the lists hold, such as a blinking caret.
+    pub forced_damage_rect: IntRect,
+    pub offsets_of_records_composited_as_media_layers: &'a [u32],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayListDamage {
+    pub rect: Option<IntRect>,
+    /// With the frames' layer plans, the damage of each layer, none where that has no bounds.
+    pub layer_rects: Vec<Option<IntRect>>,
+}
+
+impl DisplayListDamage {
+    pub fn unbounded(layer_count: usize) -> Self {
+        Self {
+            rect: None,
+            layer_rects: vec![None; layer_count],
+        }
+    }
+}
+
+impl LiveContentChanges<'_> {
+    fn is_empty(&self) -> bool {
+        self.canvases.is_empty() && self.video_sinks.is_empty() && self.image_frames.is_empty()
+    }
+
+    fn includes(&self, content: LiveContent) -> bool {
+        match content {
+            LiveContent::Canvas(canvas_id) => self.canvases.contains(&canvas_id),
+            LiveContent::VideoFrame(video_sink_id) => self.video_sinks.contains(&video_sink_id),
+            LiveContent::ImageFrame(image_frame_id) => self.image_frames.contains(&image_frame_id),
+        }
+    }
+}
+
 // The viewport-space damage between two frames, or None when a change without bounds needs a
 // full repaint. The diff pairs the run tables first: runs that are byte-identical under chains of
-// the same shape are never decoded unless their chains or scroll offsets changed. Only the runs
-// in between are diffed command by command, and the diff stops as soon as the damage covers the
-// viewport, so a later unbounded change may then be reported as the viewport rect instead of None.
+// the same shape are never decoded unless their chains, scroll offsets or layers changed. Only the
+// runs in between are diffed command by command, and the diff stops as soon as the damage covers
+// the viewport, so a later unbounded change may then be reported as the viewport rect instead of
+// None. Given the frames' layer plans, the damage of each layer is reported too.
 pub fn compute_display_list_damage(
     old_frame: DisplayListFrame<'_>,
     new_frame: DisplayListFrame<'_>,
     viewport_rect: IntRect,
-) -> Option<IntRect> {
+    live_content_changes: LiveContentChanges<'_>,
+    layer_plans: Option<LayerPlans<'_>>,
+) -> DisplayListDamage {
+    let layer_count = layer_plans.map_or(0, |plans| plans.new.layers.len());
+    let unbounded_damage = DisplayListDamage::unbounded(layer_count);
     let old_tape = Tape {
         bytes: old_frame.command_bytes,
         runs: old_frame.command_runs,
@@ -1335,14 +1622,20 @@ pub fn compute_display_list_damage(
     let chains = TreeChainComparison {
         old_tape,
         new_tape,
-        old_effect_clips: EffectClipPlan::from_contexts(
+        old_effect_clips: match EffectClipPlan::from_contexts(
             old_visual_context_tree,
             old_command_runs.iter().map(|run| run.context),
-        )?,
-        new_effect_clips: EffectClipPlan::from_contexts(
+        ) {
+            Some(plan) => plan,
+            None => return unbounded_damage,
+        },
+        new_effect_clips: match EffectClipPlan::from_contexts(
             new_visual_context_tree,
             new_command_runs.iter().map(|run| run.context),
-        )?,
+        ) {
+            Some(plan) => plan,
+            None => return unbounded_damage,
+        },
         old_mask_contents: OnceCell::new(),
         new_mask_contents: OnceCell::new(),
         old_tree: old_visual_context_tree,
@@ -1353,7 +1646,6 @@ pub fn compute_display_list_damage(
         new_scroll_offsets,
         new_spatial_depths: spatial_depths(new_visual_context_tree),
         new_culling,
-        viewport_rect,
         last_context_pair_verdict: Cell::new(None),
         spatial_chain_memo: RefCell::new(vec![
             ChainMemoEntry::UNPAIRED;
@@ -1365,10 +1657,15 @@ pub fn compute_display_list_damage(
             old_visual_context_tree.effect_nodes.len()
         ]),
         chain_walk_path: RefCell::new(Vec::new()),
-        filter_output_clipping: RefCell::new(FastMap::default()),
         mask_comparisons: RefCell::new(FastMap::default()),
+        old_lazy_geometry: LazySideGeometry::default(),
+        new_lazy_geometry: LazySideGeometry::default(),
     };
     let scroll_offsets_differ = old_scroll_offsets != new_scroll_offsets;
+    // NB: An inline clip in a space of its own names its space by index, which a new tree can give to another node,
+    //     so a new tree can move the clip as much as a scroll can.
+    let inline_clip_spaces_may_have_moved =
+        scroll_offsets_differ || !std::ptr::eq(old_visual_context_tree, new_visual_context_tree);
 
     let max_common_run_count = old_command_runs.len().min(new_command_runs.len());
     let mut identical_prefix_verdicts = Vec::with_capacity(max_common_run_count);
@@ -1397,6 +1694,8 @@ pub fn compute_display_list_damage(
         damage_rect: None,
         changed_unbounded_command: false,
         viewport_rect,
+        layer_plans,
+        damage_of_layers: vec![LayerDamage::default(); layer_count],
     };
     let identical_run_pairs = old_command_runs[..identical_prefix_run_count]
         .iter()
@@ -1412,7 +1711,14 @@ pub fn compute_display_list_damage(
         if damage.covers_viewport() {
             break;
         }
-        damage.add_identical_run_damage(&chains, old_run, new_run, *verdict, scroll_offsets_differ);
+        damage.add_identical_run_damage(
+            &chains,
+            old_run,
+            new_run,
+            *verdict,
+            scroll_offsets_differ,
+            inline_clip_spaces_may_have_moved,
+        );
     }
 
     if !damage.covers_viewport() {
@@ -1425,25 +1731,73 @@ pub fn compute_display_list_damage(
             old_tape.collect_commands_of_runs(old_middle_runs, &mut old_commands);
             let mut new_commands = Vec::new();
             new_tape.collect_commands_of_runs(new_middle_runs, &mut new_commands);
-            damage.add_command_diff_damage(&chains, &old_commands, &new_commands, scroll_offsets_differ);
+            damage.add_command_diff_damage(
+                &chains,
+                &old_commands,
+                &new_commands,
+                scroll_offsets_differ,
+                inline_clip_spaces_may_have_moved,
+            );
         }
     }
 
-    if damage.changed_unbounded_command {
-        return None;
+    // A record that draws changed live content inside a group is damaged as the whole group.
+    if !live_content_changes.is_empty() {
+        for live_content_record in &new_frame.summary.live_content_records {
+            if damage.covers_viewport() {
+                break;
+            }
+            if !live_content_changes.includes(live_content_record.content)
+                || live_content_changes
+                    .offsets_of_records_composited_as_media_layers
+                    .contains(&live_content_record.record.record_offset)
+            {
+                continue;
+            }
+            let offset = live_content_record.record.record_offset as usize;
+            let header = read_header(&new_frame.command_bytes[offset..]);
+            let payload_start = offset + HEADER_SIZE;
+            damage.add_new_command_damage(
+                &chains,
+                &CommandReference {
+                    header,
+                    payload: &new_frame.command_bytes[payload_start..payload_start + header.payload_size as usize],
+                    context: new_command_runs[live_content_record.record.run_index as usize].context,
+                    record_offset: live_content_record.record.record_offset,
+                },
+            );
+        }
     }
-    let Some(damage_rect) = damage.damage_rect else {
-        return Some(IntRect::default());
+
+    // NB: A backdrop filter reads more than the part of its region that is repainted, so forced damage goes through it too.
+    let forced_damage_rect = live_content_changes.forced_damage_rect;
+    if !forced_damage_rect.is_empty() {
+        damage.add_damage_rect(forced_damage_rect, DamagedLayers::All);
+    }
+    damage.add_backdrop_filter_damage(chains.new_side(), new_command_runs);
+
+    let bounded_damage_rect = |is_unbounded: bool, damage_rect: Option<IntRect>| {
+        if is_unbounded {
+            return None;
+        }
+        Some(damage_rect.map_or(IntRect::default(), |damage_rect| {
+            intersect_like_gfx_int_rect(damage_rect.inflated_edges(1, 1, 1, 1), viewport_rect)
+        }))
     };
-    Some(intersect_like_gfx_int_rect(
-        damage_rect.inflated_edges(1, 1, 1, 1),
-        viewport_rect,
-    ))
+    DisplayListDamage {
+        rect: bounded_damage_rect(damage.changed_unbounded_command, damage.damage_rect),
+        layer_rects: damage
+            .damage_of_layers
+            .iter()
+            .map(|layer_damage| bounded_damage_rect(layer_damage.is_unbounded, layer_damage.rect))
+            .collect(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display_list::summary::summarize;
 
     // Values of the CSS font-smoothing enum, as the recorder writes them.
     const FONT_SMOOTHING_AUTO: u8 = 0;
@@ -1451,7 +1805,8 @@ mod tests {
     use crate::display_list::builder::{HEADER_SIZE, note_command};
     use crate::display_list::commands::{
         BackdropFilterRegion, CanvasId, CompositorMainThreadWheelEventRegion, DisplayListCommand, DisplayListGlyph,
-        DrawCanvas, FillRect, FontResourceId, ImageFrameResourceId, InlineClipKind, UniqueNodeId,
+        DisplayListResourceId, DrawCanvas, DrawIsolatedGroup, DrawVideoFrame, FillRect, FontResourceId, InlineClipKind,
+        PaintNestedDisplayList, TextShadowLayer,
     };
     use crate::display_list::ffi_bytes::FfiBytes;
     use crate::node_slot_id::NodeSlotId;
@@ -1462,10 +1817,10 @@ mod tests {
         TransformDataRole,
     };
     use libgfx_rust::filter::Filter;
-    use libgfx_rust::path::OwnedPath;
+    use libgfx_rust::path::Path;
     use libgfx_rust::{
-        Color, ColorFilterType, CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, MaskKind, Orientation,
-        ScalingMode, WindingRule, translation_matrix,
+        Color, ColorFilterType, CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, IntPoint,
+        IntSize, MaskKind, Orientation, ScalingMode, WindingRule, translation_matrix,
     };
 
     const RED: Color = Color(0xffff0000);
@@ -1568,12 +1923,13 @@ mod tests {
         )
     }
 
-    fn glyph_run_command_bytes(inline_padding: usize, font_smoothing: u8) -> TestDisplayList {
+    fn glyph_run_command_bytes(inline_padding: usize, font_smoothing: u8, stroke_width: f32) -> TestDisplayList {
         let glyph = DisplayListGlyph {
             position: FloatPoint { x: 1.0, y: 2.0 },
             glyph_id: 3,
         };
         let command = DrawGlyphRun {
+            stroke_width,
             font_smoothing,
             font_id: FontResourceId(1),
             glyphs: DisplayListDataSpan {
@@ -1601,6 +1957,61 @@ mod tests {
         bytes
     }
 
+    fn text_shadow_command_bytes(inline_padding: usize, top_layer_color: Color) -> TestDisplayList {
+        let glyph = DisplayListGlyph {
+            position: FloatPoint { x: 1.0, y: 2.0 },
+            glyph_id: 3,
+        };
+        let layers = [
+            TextShadowLayer {
+                offset: FloatPoint { x: 2.0, y: 2.0 },
+                rounded_offset: IntPoint { x: 2, y: 2 },
+                blur_radius: 0,
+                color: RED,
+            },
+            TextShadowLayer {
+                offset: FloatPoint { x: -2.0, y: -2.0 },
+                rounded_offset: IntPoint { x: -2, y: -2 },
+                blur_radius: 0,
+                color: top_layer_color,
+            },
+        ];
+        let glyphs_offset = std::mem::size_of::<PaintTextShadow>() + inline_padding;
+        let layers_offset = glyphs_offset + std::mem::size_of::<DisplayListGlyph>();
+        let command = PaintTextShadow {
+            font_smoothing: FONT_SMOOTHING_AUTO,
+            font_id: FontResourceId(1),
+            glyphs: DisplayListDataSpan {
+                offset: glyphs_offset as u32,
+                size: std::mem::size_of::<DisplayListGlyph>() as u32,
+            },
+            layers: DisplayListDataSpan {
+                offset: layers_offset as u32,
+                size: std::mem::size_of_val(&layers) as u32,
+            },
+            shadows_bounding_rect: IntRect::new(8, 8, 24, 24),
+            rect: IntRect::new(10, 10, 20, 20),
+            translation: FloatPoint { x: 10.0, y: 10.0 },
+            scale: 1.0,
+            orientation: Orientation::Horizontal,
+        };
+        let mut inline_data = vec![0u8; inline_padding];
+        inline_data.extend_from_slice(&glyph.to_ffi_bytes());
+        for layer in &layers {
+            inline_data.extend_from_slice(&layer.to_ffi_bytes());
+        }
+        let mut bytes = TestDisplayList::default();
+        append_record(
+            &mut bytes,
+            &command,
+            &inline_data,
+            Some(command.shadows_bounding_rect),
+            ContextRef::default(),
+            &[],
+        );
+        bytes
+    }
+
     fn rect_inline_clip(rect: IntRect) -> DisplayListInlineClip {
         DisplayListInlineClip {
             clip_rect_or_path_device_bounds: rect.to_float(),
@@ -1609,14 +2020,16 @@ mod tests {
             path_winding_rule: WindingRule::Nonzero,
             kind: InlineClipKind::Rect,
             mode: ClipMode::Intersect,
+            has_own_space: false,
+            space: SpatialNodeIndex::default(),
+            padding: 0,
         }
     }
 
-    fn canvas_command_bytes(rect: IntRect, content_generation: u64) -> TestDisplayList {
+    fn canvas_command_bytes(rect: IntRect) -> TestDisplayList {
         let command = DrawCanvas {
             dst_rect: rect,
             canvas_id: CanvasId(1),
-            content_generation,
             scaling_mode: ScalingMode::NearestNeighbor,
         };
         command_bytes(&command, Some(rect), ContextRef::default())
@@ -1631,6 +2044,7 @@ mod tests {
             role: TransformDataRole::CssTransform,
             synthetic_plane: false,
             establishes_sorting_context: false,
+            bounds: FloatRect::default(),
         }
     }
 
@@ -1651,14 +2065,16 @@ mod tests {
             rect,
             kind: MaskKind::Alpha,
             origin: MaskLayerOrigin::CssMaskLayers,
+            masks_backdrop: false,
         })
     }
 
     fn effects(filter: Vec<u8>) -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode: CompositingAndBlendingOperator::Normal,
-            filter: Some(Rc::new(filter)),
+            filter: Some(std::sync::Arc::new(filter)),
             backdrop_filter: None,
         })
     }
@@ -1746,21 +2162,194 @@ mod tests {
             DisplayListFrame {
                 command_bytes: old_bytes,
                 command_runs: &old_bytes.runs,
+                summary: &summarize(old_bytes, &old_bytes.runs),
                 visual_context_tree: old_tree,
                 scroll_offsets: old_scroll_offsets,
             },
             DisplayListFrame {
                 command_bytes: new_bytes,
                 command_runs: &new_bytes.runs,
+                summary: &summarize(new_bytes, &new_bytes.runs),
                 visual_context_tree: new_tree,
                 scroll_offsets: new_scroll_offsets,
             },
             viewport_rect,
+            LiveContentChanges::default(),
+            None,
         )
+        .rect
     }
 
     fn context_in(spatial: SpatialNodeIndex, context: ContextRef) -> ContextRef {
         ContextRef { spatial, ..context }
+    }
+
+    fn damage_for_live_content_changes(
+        bytes: &TestDisplayList,
+        tree: &VisualContextTree,
+        live_content_changes: LiveContentChanges<'_>,
+    ) -> Option<IntRect> {
+        let summary = summarize(bytes, &bytes.runs);
+        let frame = DisplayListFrame {
+            command_bytes: bytes,
+            command_runs: &bytes.runs,
+            summary: &summary,
+            visual_context_tree: tree,
+            scroll_offsets: &[],
+        };
+        compute_display_list_damage(frame, frame, IntRect::new(0, 0, 100, 100), live_content_changes, None).rect
+    }
+
+    #[test]
+    fn a_record_composited_as_a_media_layer_is_not_damaged_by_its_live_content() {
+        let tree = identity_tree();
+        let mut list = canvas_command_bytes(IntRect::new(10, 10, 20, 20));
+        let media_layer_record_offset = 0;
+        list.extend_from_slice(&fill_command_bytes(IntRect::new(50, 50, 10, 10), RED));
+        list.extend_from_slice(&canvas_command_bytes(IntRect::new(60, 60, 10, 10)));
+        let changed_canvas = LiveContentChanges {
+            canvases: &[CanvasId(1)],
+            offsets_of_records_composited_as_media_layers: &[media_layer_record_offset],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&list, &tree, changed_canvas),
+            Some(IntRect::new(59, 59, 12, 12))
+        );
+    }
+
+    #[test]
+    fn changed_live_content_damages_where_it_is_drawn() {
+        let tree = identity_tree();
+        let rect = IntRect::new(10, 10, 20, 20);
+        let canvas = canvas_command_bytes(rect);
+        let changed_canvas = LiveContentChanges {
+            canvases: &[CanvasId(1)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&canvas, &tree, changed_canvas),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        let other_canvas = LiveContentChanges {
+            canvases: &[CanvasId(2)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&canvas, &tree, other_canvas),
+            Some(IntRect::default())
+        );
+
+        let video = command_bytes(
+            &DrawVideoFrame {
+                dst_rect: rect,
+                video_sink_id: VideoSinkResourceId(1),
+                scaling_mode: ScalingMode::NearestNeighbor,
+            },
+            Some(rect),
+            ContextRef::default(),
+        );
+        let changed_video = LiveContentChanges {
+            video_sinks: &[VideoSinkResourceId(1)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&video, &tree, changed_video),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        assert_eq!(
+            damage_for_live_content_changes(&video, &tree, changed_canvas),
+            Some(IntRect::default())
+        );
+
+        let image = command_bytes(
+            &DrawScaledDecodedImageFrame {
+                dst_rect: FloatRect::new(10.0, 10.0, 20.0, 20.0),
+                src_rect: OptionalFloatRect::default(),
+                frame_id: ImageFrameResourceId(1),
+                scaling_mode: ScalingMode::NearestNeighbor,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                isolated_backdrop_color: OptionalColor::default(),
+                apply_force_dark: false,
+            },
+            Some(rect),
+            ContextRef::default(),
+        );
+        let changed_image = LiveContentChanges {
+            image_frames: &[ImageFrameResourceId(1)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&image, &tree, changed_image),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        assert_eq!(
+            damage_for_live_content_changes(&image, &tree, changed_video),
+            Some(IntRect::default())
+        );
+    }
+
+    #[test]
+    fn changed_live_content_under_a_blur_damages_its_blurred_footprint() {
+        let mut tree = identity_tree();
+        let context = context_in(
+            VISUAL_VIEWPORT_NODE_INDEX,
+            effect_context(&mut tree, effects(blur_filter(2.0))),
+        );
+        let rect = IntRect::new(10, 10, 20, 20);
+        let canvas = command_bytes(
+            &DrawCanvas {
+                dst_rect: rect,
+                canvas_id: CanvasId(1),
+                scaling_mode: ScalingMode::NearestNeighbor,
+            },
+            Some(rect),
+            context,
+        );
+        let changed_canvas = LiveContentChanges {
+            canvases: &[CanvasId(1)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&canvas, &tree, changed_canvas),
+            Some(IntRect::new(3, 3, 34, 34))
+        );
+    }
+
+    #[test]
+    fn changed_live_content_inside_a_group_damages_the_whole_group() {
+        let tree = identity_tree();
+        let group_rect = IntRect::new(5, 5, 40, 40);
+        let content = canvas_command_bytes(IntRect::new(10, 10, 20, 20));
+        let no_data = DisplayListDataSpan { offset: 0, size: 0 };
+        let mut group = TestDisplayList::default();
+        append_record(
+            &mut group,
+            &DrawIsolatedGroup {
+                clip_rect: group_rect.to_float(),
+                content: DisplayListDataSpan {
+                    offset: std::mem::size_of::<DrawIsolatedGroup>() as u32,
+                    size: content.len() as u32,
+                },
+                mask: no_data,
+                filter: no_data,
+                opacity: 1.0,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                mask_kind: MaskKind::Alpha,
+            },
+            &content,
+            Some(group_rect),
+            ContextRef::default(),
+            &[],
+        );
+        let changed_canvas = LiveContentChanges {
+            canvases: &[CanvasId(1)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&group, &tree, changed_canvas),
+            Some(IntRect::new(4, 4, 42, 42))
+        );
     }
 
     #[test]
@@ -1770,7 +2359,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -1788,7 +2376,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -1822,6 +2409,47 @@ mod tests {
     }
 
     #[test]
+    fn content_under_nested_fractional_scrolls_is_damaged_where_replay_draws_it() {
+        let mut tree = identity_tree();
+        let mut scroll_node = VISUAL_VIEWPORT_NODE_INDEX;
+        for _ in 0..3 {
+            scroll_node = tree.append_spatial(
+                SpatialData::Scroll(ScrollData {
+                    state_slot: NO_SCROLL_STATE_SLOT,
+                    owner_paintable: NodeSlotId::INVALID,
+                }),
+                scroll_node,
+            );
+        }
+        let mut scroll_offsets = vec![FloatPoint { x: 0.0, y: -0.9 }; 4];
+        scroll_offsets[0] = FloatPoint::default();
+        let rect = IntRect::new(10, 10, 20, 20);
+        let new_commands = command_bytes(
+            &FillRect {
+                rect,
+                color: RED,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_effect: EffectNodeIndex::NONE,
+            },
+            Some(rect),
+            context_in(scroll_node, ContextRef::default()),
+        );
+        // Each of the three offsets rounds to a whole pixel, so the rect is drawn 3px above where it was recorded.
+        assert_eq!(
+            damage_with_scroll_offsets(
+                &TestDisplayList::default(),
+                &tree,
+                &scroll_offsets,
+                &new_commands,
+                &tree,
+                &scroll_offsets,
+                IntRect::new(0, 0, 100, 100),
+            ),
+            Some(IntRect::new(9, 6, 22, 22))
+        );
+    }
+
+    #[test]
     fn identical_display_lists_have_no_damage() {
         let tree = identity_tree();
         let display_list = fill_command_bytes(IntRect::new(10, 10, 20, 20), RED);
@@ -1841,6 +2469,7 @@ mod tests {
         );
         let effect = tree.append_effect(
             EffectNodeData::Effects(EffectsData {
+                isolation: false,
                 opacity: 0.5,
                 blend_mode: CompositingAndBlendingOperator::Normal,
                 filter: None,
@@ -1898,8 +2527,10 @@ mod tests {
             gutter_rect: IntRect::default(),
             thumb_rect: IntRect::new(10, 12, 20, 8),
             track_rect: IntRect::new(10, 10, 80, 12),
+            expanded_gutter_rect: IntRect::default(),
             scroll_size: 0.75,
             thumb_color: RED,
+            thumb_outline_color: Color::TRANSPARENT,
             track_color: Color::TRANSPARENT,
             vertical: false,
         };
@@ -1918,6 +2549,284 @@ mod tests {
             ),
             Some(IntRect::new(9, 9, 82, 14))
         );
+    }
+
+    #[test]
+    fn changed_scroll_offset_damages_a_draw_with_an_inline_clip_in_another_space() {
+        let mut tree = identity_tree();
+        let scroll = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: 1,
+                owner_paintable: NodeSlotId::INVALID,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let rect = IntRect::new(10, 10, 20, 20);
+        let draw_with_clip = |clip: DisplayListInlineClip| {
+            let mut display_list = TestDisplayList::default();
+            append_record(
+                &mut display_list,
+                &FillRect {
+                    rect,
+                    color: RED,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    background_color_animation_effect: EffectNodeIndex::NONE,
+                },
+                &[],
+                Some(rect),
+                ContextRef::default(),
+                &[clip],
+            );
+            display_list
+        };
+        let damage_after_scroll = |display_list: &TestDisplayList| {
+            damage_with_scroll_offsets(
+                display_list,
+                &tree,
+                &[FloatPoint::default(), FloatPoint::default()],
+                display_list,
+                &tree,
+                &[FloatPoint::default(), FloatPoint { x: 0.0, y: -40.0 }],
+                IntRect::new(0, 0, 100, 100),
+            )
+        };
+
+        let clip_in_space = |space: SpatialNodeIndex| DisplayListInlineClip {
+            has_own_space: true,
+            space,
+            ..rect_inline_clip(rect)
+        };
+
+        assert!(damage_after_scroll(&draw_with_clip(rect_inline_clip(rect))).is_none_or(|damage| damage.is_empty()));
+        // A clip whose space does not move with the scroll leaves the draw as it was.
+        assert!(
+            damage_after_scroll(&draw_with_clip(clip_in_space(VISUAL_VIEWPORT_NODE_INDEX)))
+                .is_none_or(|damage| damage.is_empty())
+        );
+        // The scroll moves the clip off the draw, so only where it was changes.
+        assert_eq!(
+            damage_after_scroll(&draw_with_clip(clip_in_space(scroll))),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        // A partial move changes only the part of the draw that the clip uncovers or covers.
+        let damage_after_small_scroll = |display_list: &TestDisplayList| {
+            damage_with_scroll_offsets(
+                display_list,
+                &tree,
+                &[FloatPoint::default(), FloatPoint::default()],
+                display_list,
+                &tree,
+                &[FloatPoint::default(), FloatPoint { x: 0.0, y: -5.0 }],
+                IntRect::new(0, 0, 100, 100),
+            )
+        };
+        let small_scroll_damage = damage_after_small_scroll(&draw_with_clip(DisplayListInlineClip {
+            has_own_space: true,
+            space: scroll,
+            ..rect_inline_clip(IntRect::new(10, 10, 20, 5))
+        }));
+        assert!(small_scroll_damage.is_some_and(|damage| damage.height < 22 && !damage.is_empty()));
+    }
+
+    #[test]
+    fn moving_an_inline_clip_to_another_space_damages_its_draw() {
+        let mut tree = identity_tree();
+        let scroll = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: 1,
+                owner_paintable: NodeSlotId::INVALID,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let rect = IntRect::new(10, 10, 20, 20);
+        let draw_with_clip_in = |space: SpatialNodeIndex, color: Color| {
+            let mut display_list = TestDisplayList::default();
+            append_record(
+                &mut display_list,
+                &FillRect {
+                    rect,
+                    color,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    background_color_animation_effect: EffectNodeIndex::NONE,
+                },
+                &[],
+                Some(rect),
+                ContextRef::default(),
+                &[DisplayListInlineClip {
+                    has_own_space: true,
+                    space,
+                    ..rect_inline_clip(rect)
+                }],
+            );
+            display_list
+        };
+        let scrolled = [FloatPoint::default(), FloatPoint { x: 0.0, y: -40.0 }];
+        let damage_between = |old: &TestDisplayList, new: &TestDisplayList| {
+            damage_with_scroll_offsets(
+                old,
+                &tree,
+                &scrolled,
+                new,
+                &tree,
+                &scrolled,
+                IntRect::new(0, 0, 100, 100),
+            )
+        };
+        assert!(
+            damage_between(
+                &draw_with_clip_in(VISUAL_VIEWPORT_NODE_INDEX, RED),
+                &draw_with_clip_in(VISUAL_VIEWPORT_NODE_INDEX, RED)
+            )
+            .is_none_or(|damage| damage.is_empty())
+        );
+        assert_eq!(
+            damage_between(
+                &draw_with_clip_in(VISUAL_VIEWPORT_NODE_INDEX, RED),
+                &draw_with_clip_in(scroll, RED)
+            ),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+    }
+
+    #[test]
+    fn a_new_tree_that_moves_the_space_of_an_inline_clip_damages_its_draw() {
+        let mut old_tree = identity_tree();
+        let old_space = old_tree.append_spatial(
+            SpatialData::Transform(transform(FloatMatrix4x4::identity())),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        // The new tree gives the index of the clip's space to a node that sits elsewhere.
+        let mut new_tree = identity_tree();
+        let new_space = new_tree.append_spatial(
+            SpatialData::Transform(transform(translation_matrix(0.0, 40.0, 0.0))),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        assert_eq!(old_space, new_space);
+        let rect = IntRect::new(10, 10, 20, 20);
+        let mut display_list = TestDisplayList::default();
+        append_record(
+            &mut display_list,
+            &FillRect {
+                rect,
+                color: RED,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_effect: EffectNodeIndex::NONE,
+            },
+            &[],
+            Some(rect),
+            ContextRef::default(),
+            &[DisplayListInlineClip {
+                has_own_space: true,
+                space: old_space,
+                ..rect_inline_clip(rect)
+            }],
+        );
+        let offsets = [FloatPoint::default()];
+        let viewport = IntRect::new(0, 0, 100, 100);
+        assert!(
+            damage_with_scroll_offsets(
+                &display_list,
+                &old_tree,
+                &offsets,
+                &display_list,
+                &old_tree,
+                &offsets,
+                viewport
+            )
+            .is_none_or(|damage| damage.is_empty())
+        );
+        assert_eq!(
+            damage_with_scroll_offsets(
+                &display_list,
+                &old_tree,
+                &offsets,
+                &display_list,
+                &new_tree,
+                &offsets,
+                viewport
+            ),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+    }
+
+    #[test]
+    fn animated_content_follows_inline_clips_in_spaces_of_their_own() {
+        let mut tree = identity_tree();
+        let scroll = tree.append_spatial(
+            SpatialData::Scroll(ScrollData {
+                state_slot: 1,
+                owner_paintable: NodeSlotId::INVALID,
+            }),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let rotating = tree.append_spatial(
+            SpatialData::Transform(transform(FloatMatrix4x4::identity())),
+            VISUAL_VIEWPORT_NODE_INDEX,
+        );
+        let effect = tree.append_effect(
+            EffectNodeData::Effects(EffectsData {
+                isolation: false,
+                opacity: 0.5,
+                blend_mode: CompositingAndBlendingOperator::Normal,
+                filter: None,
+                backdrop_filter: None,
+            }),
+            EffectNodeIndex::NONE,
+            VISUAL_VIEWPORT_NODE_INDEX,
+            ClipNodeIndex::NONE,
+        );
+        let viewport = IntRect::new(0, 0, 800, 600);
+        let draw_clipped_to = |clip_space: SpatialNodeIndex, clip_rect: IntRect, context: ContextRef| {
+            let mut display_list = TestDisplayList::default();
+            append_record(
+                &mut display_list,
+                &FillRect {
+                    rect: viewport,
+                    color: RED,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    background_color_animation_effect: EffectNodeIndex::NONE,
+                },
+                &[],
+                Some(viewport),
+                context,
+                &[DisplayListInlineClip {
+                    has_own_space: true,
+                    space: clip_space,
+                    ..rect_inline_clip(clip_rect)
+                }],
+            );
+            display_list
+        };
+        let may_affect_viewport = |display_list: &TestDisplayList, rotation_nodes: &[SpatialNodeIndex]| {
+            animated_content_may_affect_viewport(
+                display_list,
+                &display_list.runs,
+                &tree,
+                &[FloatPoint::default(), FloatPoint::default()],
+                rotation_nodes,
+                &[effect],
+                viewport,
+            )
+        };
+        let faded = ContextRef {
+            effect,
+            ..ContextRef::default()
+        };
+
+        // An animated opacity only affects the viewport where the clip lets the draw show.
+        let box_on_screen = IntRect::new(0, 10, 10, 10);
+        let box_off_screen = IntRect::new(0, 2000, 10, 10);
+        assert!(may_affect_viewport(&draw_clipped_to(scroll, box_on_screen, faded), &[]));
+        assert!(!may_affect_viewport(
+            &draw_clipped_to(scroll, box_off_screen, faded),
+            &[]
+        ));
+
+        // A clip in a rotating space moves the draw it clips, though the draw's own space stands still.
+        assert!(may_affect_viewport(
+            &draw_clipped_to(rotating, box_on_screen, ContextRef::default()),
+            &[rotating]
+        ));
     }
 
     #[test]
@@ -1969,8 +2878,8 @@ mod tests {
     #[test]
     fn inline_payload_alignment_does_not_damage_glyph_runs() {
         let tree = identity_tree();
-        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO);
-        let new_display_list = glyph_run_command_bytes(4, FONT_SMOOTHING_AUTO);
+        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO, 0.0);
+        let new_display_list = glyph_run_command_bytes(4, FONT_SMOOTHING_AUTO, 0.0);
         assert_eq!(
             damage(&old_display_list, &tree, &new_display_list, &tree),
             Some(IntRect::default())
@@ -1980,11 +2889,44 @@ mod tests {
     #[test]
     fn changing_font_smoothing_damages_glyph_runs() {
         let tree = identity_tree();
-        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO);
-        let new_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_ANTIALIASED);
+        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO, 0.0);
+        let new_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_ANTIALIASED, 0.0);
         assert_eq!(
             damage(&old_display_list, &tree, &new_display_list, &tree),
             Some(IntRect::new(9, 9, 22, 22))
+        );
+    }
+
+    #[test]
+    fn changing_text_stroke_width_damages_glyph_runs() {
+        let tree = identity_tree();
+        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO, 1.0);
+        let new_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO, 2.0);
+        assert_eq!(
+            damage(&old_display_list, &tree, &new_display_list, &tree),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+    }
+
+    #[test]
+    fn inline_payload_alignment_does_not_damage_text_shadows() {
+        let tree = identity_tree();
+        let old_display_list = text_shadow_command_bytes(0, BLUE);
+        let new_display_list = text_shadow_command_bytes(4, BLUE);
+        assert_eq!(
+            damage(&old_display_list, &tree, &new_display_list, &tree),
+            Some(IntRect::default())
+        );
+    }
+
+    #[test]
+    fn changing_one_text_shadow_layer_damages_the_shadows() {
+        let tree = identity_tree();
+        let old_display_list = text_shadow_command_bytes(0, BLUE);
+        let new_display_list = text_shadow_command_bytes(0, GREEN);
+        assert_eq!(
+            damage(&old_display_list, &tree, &new_display_list, &tree),
+            Some(IntRect::new(7, 7, 26, 26))
         );
     }
 
@@ -2032,6 +2974,7 @@ mod tests {
             append_record(
                 &mut bytes,
                 &DrawGlyphRun {
+                    stroke_width: 0.0,
                     font_smoothing: FONT_SMOOTHING_AUTO,
                     font_id: FontResourceId(1),
                     glyphs: DisplayListDataSpan::default(),
@@ -2063,32 +3006,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_unbounded_commands_require_full_repaint() {
-        let tree = identity_tree();
-        let old_display_list = command_bytes(
-            &FillRect {
-                rect: IntRect::new(0, 0, 10, 10),
-                color: RED,
-                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
-                background_color_animation_effect: EffectNodeIndex::NONE,
-            },
-            None,
-            ContextRef::default(),
-        );
-        let new_display_list = command_bytes(
-            &FillRect {
-                rect: IntRect::new(0, 0, 10, 10),
-                color: BLUE,
-                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
-                background_color_animation_effect: EffectNodeIndex::NONE,
-            },
-            None,
-            ContextRef::default(),
-        );
-        assert_eq!(damage(&old_display_list, &tree, &new_display_list, &tree), None);
-    }
-
-    #[test]
     fn changed_compositor_metadata_has_no_raster_damage() {
         let tree = identity_tree();
         let old_display_list = command_bytes(
@@ -2114,7 +3031,6 @@ mod tests {
     fn compositor_scrollbar_bytes(is_painted_by_compositor: bool) -> TestDisplayList {
         command_bytes(
             &CompositorScrollbar {
-                document_id: UniqueNodeId(1),
                 scroll_node_index: SpatialNodeIndex(1),
                 gutter_rect: IntRect::default(),
                 thumb_rect: IntRect::new(98, 0, 2, 20),
@@ -2126,10 +3042,10 @@ mod tests {
                 min_scroll_offset: 0.0,
                 max_scroll_offset: 100.0,
                 thumb_color: RED,
+                thumb_outline_color: Color::TRANSPARENT,
                 track_color: Color::TRANSPARENT,
                 vertical: true,
                 is_painted_by_compositor,
-                display_list_paints_enlarged_scrollbar: false,
             },
             None,
             ContextRef::default(),
@@ -2166,12 +3082,21 @@ mod tests {
     }
 
     #[test]
-    fn changed_extent_affecting_filter_has_unbounded_damage() {
-        assert_eq!(damage_for_filter_change(blur_filter(1.0), blur_filter(10.0)), None);
+    fn changed_extent_affecting_filter_damages_its_old_and_new_output() {
+        assert_eq!(
+            damage_for_filter_change(blur_filter(1.0), blur_filter(10.0)),
+            Some(IntRect::new(0, 0, 61, 61))
+        );
         assert_eq!(
             damage_for_filter_change(drop_shadow_filter(1.0, 1.0), drop_shadow_filter(10.0, 10.0)),
-            None
+            Some(IntRect::new(0, 0, 71, 71))
         );
+        let flood = Filter::Flood {
+            color: RED,
+            opacity: 1.0,
+        }
+        .serialize();
+        assert_eq!(damage_for_filter_change(blur_filter(1.0), flood), None);
     }
 
     #[test]
@@ -2214,21 +3139,23 @@ mod tests {
             Some(IntRect::default())
         );
 
+        let whole_viewport = Some(IntRect::new(0, 0, 100, 100));
+
         // The filter can expand an inner clip's output back into view.
         let (old_bytes, old_tree) = make_scene(1.0, 200.0, ClipMode::Intersect, false);
         let (new_bytes, new_tree) = make_scene(200.0, 200.0, ClipMode::Intersect, false);
-        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), None);
+        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), whole_viewport);
 
         // Difference clips exclude their rect rather than bounding the effect's output.
         let (old_bytes, old_tree) = make_scene(1.0, 200.0, ClipMode::Difference, true);
         let (new_bytes, new_tree) = make_scene(200.0, 200.0, ClipMode::Difference, true);
-        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), None);
+        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), whole_viewport);
 
-        // Both the old and new output must be outside the viewport.
-        let (old_bytes, old_tree) = make_scene(1.0, 0.0, ClipMode::Intersect, true);
+        // Output inside the viewport on either side is damaged.
+        let (old_bytes, old_tree) = make_scene(100.0, 0.0, ClipMode::Intersect, true);
         let (new_bytes, new_tree) = make_scene(200.0, 200.0, ClipMode::Intersect, true);
-        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), None);
-        assert_eq!(damage(&new_bytes, &new_tree, &old_bytes, &old_tree), None);
+        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), whole_viewport);
+        assert_eq!(damage(&new_bytes, &new_tree, &old_bytes, &old_tree), whole_viewport);
 
         // An outer filter can expand the clipped inner filter back into the viewport.
         let (old_bytes, mut old_tree) = make_scene(1.0, 200.0, ClipMode::Intersect, true);
@@ -2242,7 +3169,7 @@ mod tests {
             );
             tree.effect_nodes[0].parent = parent;
         }
-        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), None);
+        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), whole_viewport);
 
         // A descendant escaping the clip widens the effect's output clip in the replay plan.
         let (mut old_bytes, old_tree) = make_scene(1.0, 200.0, ClipMode::Intersect, true);
@@ -2263,7 +3190,252 @@ mod tests {
         );
         old_bytes.extend_from_slice(&escaped);
         new_bytes.extend_from_slice(&escaped);
-        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), None);
+        assert_eq!(damage(&old_bytes, &old_tree, &new_bytes, &new_tree), whole_viewport);
+    }
+
+    fn damage_for_fill_color_change_under(
+        context_of: impl Fn(&mut VisualContextTree) -> ContextRef,
+    ) -> Option<IntRect> {
+        let mut tree = identity_tree();
+        let context = context_of(&mut tree);
+        let rect = IntRect::new(10, 10, 20, 20);
+        let fill = |color| FillRect {
+            rect,
+            color,
+            compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+            background_color_animation_effect: EffectNodeIndex::NONE,
+        };
+        let old_bytes = command_bytes(&fill(RED), Some(rect), context);
+        let new_bytes = command_bytes(&fill(BLUE), Some(rect), context);
+        damage(&old_bytes, &tree, &new_bytes, &tree)
+    }
+
+    #[test]
+    fn a_changed_command_damages_where_the_filters_above_it_spread_it() {
+        let under_filter = |filter: Vec<u8>| {
+            move |tree: &mut VisualContextTree| {
+                context_in(
+                    VISUAL_VIEWPORT_NODE_INDEX,
+                    effect_context(tree, effects(filter.clone())),
+                )
+            }
+        };
+        assert_eq!(
+            damage_for_fill_color_change_under(under_filter(blur_filter(2.0))),
+            Some(IntRect::new(3, 3, 34, 34))
+        );
+        assert_eq!(
+            damage_for_fill_color_change_under(under_filter(drop_shadow_filter(30.0, 0.0))),
+            Some(IntRect::new(9, 9, 52, 52))
+        );
+        assert_eq!(
+            damage_for_fill_color_change_under(under_filter(color_filter(0.5))),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        let flood = Filter::Flood {
+            color: RED,
+            opacity: 1.0,
+        }
+        .serialize();
+        assert_eq!(damage_for_fill_color_change_under(under_filter(flood.clone())), None);
+
+        // Spread content cannot show past the clips outside its filters.
+        let under_clipped_filter = |filter: Vec<u8>, clip_rect: FloatRect| {
+            move |tree: &mut VisualContextTree| {
+                let clip = tree.append_clip(
+                    ClipNodeData::rect_clip(clip_rect),
+                    ClipNodeIndex::NONE,
+                    VISUAL_VIEWPORT_NODE_INDEX,
+                );
+                let effect = tree.append_effect(
+                    effects(filter.clone()),
+                    EffectNodeIndex::NONE,
+                    VISUAL_VIEWPORT_NODE_INDEX,
+                    clip,
+                );
+                ContextRef {
+                    clip,
+                    effect,
+                    ..ContextRef::default()
+                }
+            }
+        };
+        assert_eq!(
+            damage_for_fill_color_change_under(under_clipped_filter(
+                blur_filter(200.0),
+                FloatRect::new(0.0, 0.0, 50.0, 50.0)
+            )),
+            Some(IntRect::new(0, 0, 52, 52))
+        );
+        assert_eq!(
+            damage_for_fill_color_change_under(under_clipped_filter(
+                flood.clone(),
+                FloatRect::new(20.0, 20.0, 30.0, 30.0)
+            )),
+            Some(IntRect::new(18, 18, 34, 34))
+        );
+        assert_eq!(
+            damage_for_fill_color_change_under(under_clipped_filter(flood, FloatRect::new(0.0, 200.0, 100.0, 100.0))),
+            Some(IntRect::default())
+        );
+    }
+
+    // A filter that keeps only where its source overlaps a shifted copy of itself shows a change to
+    // one part of the source wherever the copy of an unchanged part overlaps it.
+    #[test]
+    fn a_change_masked_by_a_shifted_copy_of_the_source_damages_both_copies() {
+        let mut tree = identity_tree();
+        let masked_by_shifted_copy = Filter::Blend {
+            background: Some(Box::new(Filter::Offset {
+                dx: 40.0,
+                dy: 0.0,
+                input: None,
+            })),
+            foreground: None,
+            mode: CompositingAndBlendingOperator::SourceIn,
+        }
+        .serialize();
+        let context = context_in(
+            VISUAL_VIEWPORT_NODE_INDEX,
+            effect_context(&mut tree, effects(masked_by_shifted_copy)),
+        );
+        let scene = |right_color| {
+            let fill = |x, color| {
+                let rect = IntRect::new(x, 10, 20, 20);
+                command_bytes(
+                    &FillRect {
+                        rect,
+                        color,
+                        compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                        background_color_animation_effect: EffectNodeIndex::NONE,
+                    },
+                    Some(rect),
+                    context,
+                )
+            };
+            let mut bytes = fill(10, RED);
+            bytes.extend_from_slice(&fill(50, right_color));
+            bytes
+        };
+        assert_eq!(
+            damage(&scene(RED), &tree, &scene(BLUE), &tree),
+            Some(IntRect::new(49, 9, 51, 22))
+        );
+    }
+
+    #[test]
+    fn damage_beneath_a_backdrop_filter_spreads_into_its_region() {
+        let region = IntRect::new(25, 0, 50, 50);
+        let mut tree = identity_tree();
+        let backdrop_context = context_in(
+            VISUAL_VIEWPORT_NODE_INDEX,
+            effect_context(&mut tree, backdrop_effects(blur_filter(4.0), region)),
+        );
+        let scene = |fill_rect, color| {
+            let mut bytes = command_bytes(
+                &FillRect {
+                    rect: fill_rect,
+                    color,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    background_color_animation_effect: EffectNodeIndex::NONE,
+                },
+                Some(fill_rect),
+                ContextRef::default(),
+            );
+            bytes.extend_from_slice(&command_bytes(
+                &BackdropFilterRegion { rect: region },
+                Some(region),
+                backdrop_context,
+            ));
+            bytes
+        };
+        let within_reach = IntRect::new(0, 10, 30, 20);
+        assert_eq!(
+            damage(&scene(within_reach, RED), &tree, &scene(within_reach, BLUE), &tree),
+            Some(IntRect::new(0, 0, 76, 51))
+        );
+        let out_of_reach = IntRect::new(0, 10, 10, 20);
+        assert_eq!(
+            damage(&scene(out_of_reach, RED), &tree, &scene(out_of_reach, BLUE), &tree),
+            Some(IntRect::new(0, 9, 11, 22))
+        );
+    }
+
+    #[test]
+    fn forced_damage_at_a_backdrop_filter_repaints_its_whole_region() {
+        let region = IntRect::new(25, 0, 50, 50);
+        let mut tree = identity_tree();
+        let backdrop_context = context_in(
+            VISUAL_VIEWPORT_NODE_INDEX,
+            effect_context(&mut tree, backdrop_effects(blur_filter(4.0), region)),
+        );
+        let bytes = command_bytes(&BackdropFilterRegion { rect: region }, Some(region), backdrop_context);
+        let forced_damage = |forced_damage_rect| {
+            damage_for_live_content_changes(
+                &bytes,
+                &tree,
+                LiveContentChanges {
+                    forced_damage_rect,
+                    ..LiveContentChanges::default()
+                },
+            )
+        };
+        assert_eq!(forced_damage(IntRect::default()), Some(IntRect::default()));
+        assert_eq!(
+            forced_damage(IntRect::new(40, 10, 3, 20)),
+            Some(IntRect::new(24, 0, 52, 51))
+        );
+        assert_eq!(
+            forced_damage(IntRect::new(0, 10, 3, 20)),
+            Some(IntRect::new(0, 9, 4, 22))
+        );
+    }
+
+    #[test]
+    fn a_damaged_backdrop_region_is_spread_by_the_filters_of_its_effect() {
+        let region = IntRect::new(25, 0, 50, 50);
+        let mut tree = identity_tree();
+        let shadowed_backdrop_context = context_in(
+            VISUAL_VIEWPORT_NODE_INDEX,
+            effect_context(
+                &mut tree,
+                EffectNodeData::Effects(EffectsData {
+                    isolation: false,
+                    opacity: 1.0,
+                    blend_mode: CompositingAndBlendingOperator::Normal,
+                    filter: Some(std::sync::Arc::new(drop_shadow_filter(20.0, 0.0))),
+                    backdrop_filter: Some(BackdropFilterData {
+                        filter: std::sync::Arc::new(blur_filter(4.0)),
+                        region,
+                        corner_radii: CornerRadii::default(),
+                    }),
+                }),
+            ),
+        );
+        let fill_rect = IntRect::new(0, 10, 30, 20);
+        let scene = |color| {
+            let mut bytes = command_bytes(
+                &FillRect {
+                    rect: fill_rect,
+                    color,
+                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                    background_color_animation_effect: EffectNodeIndex::NONE,
+                },
+                Some(fill_rect),
+                ContextRef::default(),
+            );
+            bytes.extend_from_slice(&command_bytes(
+                &BackdropFilterRegion { rect: region },
+                Some(region),
+                shadowed_backdrop_context,
+            ));
+            bytes
+        };
+        // The region and its shadow, 20 pixels down and right.
+        assert_eq!(
+            damage(&scene(RED), &tree, &scene(BLUE), &tree),
+            Some(IntRect::new(0, 0, 96, 71))
+        );
     }
 
     #[test]
@@ -2276,11 +3448,12 @@ mod tests {
 
     fn backdrop_effects(filter: Vec<u8>, region: IntRect) -> EffectNodeData {
         EffectNodeData::Effects(EffectsData {
+            isolation: false,
             opacity: 1.0,
             blend_mode: CompositingAndBlendingOperator::Normal,
             filter: None,
             backdrop_filter: Some(BackdropFilterData {
-                filter: Rc::new(filter),
+                filter: std::sync::Arc::new(filter),
                 region,
                 corner_radii: CornerRadii::default(),
             }),
@@ -2349,7 +3522,12 @@ mod tests {
     #[test]
     fn unchanged_static_mask_content_does_not_damage() {
         let rect = IntRect::new(10, 10, 20, 20);
-        let make_scene = |color, insert_effect, dynamic| {
+        enum MaskContent {
+            Fill,
+            Canvas,
+            NestedDisplayList(u64),
+        }
+        let make_scene = |color, insert_effect, mask_content| {
             let mut tree = identity_tree();
             if insert_effect {
                 effect_context(&mut tree, mask(rect));
@@ -2361,19 +3539,26 @@ mod tests {
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
                 background_color_animation_effect: EffectNodeIndex::NONE,
             };
-            let content = if dynamic {
-                command_bytes(
+            let content = match mask_content {
+                MaskContent::Fill => command_bytes(&fill, Some(rect), context),
+                MaskContent::Canvas => command_bytes(
                     &DrawCanvas {
                         dst_rect: rect,
                         canvas_id: CanvasId(1),
-                        content_generation: 1,
                         scaling_mode: ScalingMode::NearestNeighbor,
                     },
                     Some(rect),
                     context,
-                )
-            } else {
-                command_bytes(&fill, Some(rect), context)
+                ),
+                MaskContent::NestedDisplayList(id) => command_bytes(
+                    &PaintNestedDisplayList {
+                        display_list_id: DisplayListResourceId(id),
+                        rect: rect.to_float(),
+                        list_size: IntSize { width: 20, height: 20 },
+                    },
+                    Some(rect),
+                    context,
+                ),
             };
             let mut bytes = TestDisplayList::default();
             append_record(
@@ -2394,8 +3579,8 @@ mod tests {
             bytes.extend_from_slice(&command_bytes(&FillRect { color: BLUE, ..fill }, Some(rect), context));
             (bytes, tree)
         };
-        let (old_bytes, old_tree) = make_scene(RED, false, false);
-        let (new_bytes, new_tree) = make_scene(RED, true, false);
+        let (old_bytes, old_tree) = make_scene(RED, false, MaskContent::Fill);
+        let (new_bytes, new_tree) = make_scene(RED, true, MaskContent::Fill);
         assert_eq!(
             damage(&old_bytes, &old_tree, &old_bytes, &old_tree),
             Some(IntRect::default())
@@ -2405,15 +3590,27 @@ mod tests {
             damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(IntRect::default())
         );
-        let (new_bytes, new_tree) = make_scene(GREEN, true, false);
+        let (new_bytes, new_tree) = make_scene(GREEN, true, MaskContent::Fill);
         assert_eq!(
             damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(rect.inflated_edges(1, 1, 1, 1))
         );
         // External content retains conservative damage.
-        let (bytes, tree) = make_scene(RED, false, true);
+        let (bytes, tree) = make_scene(RED, false, MaskContent::Canvas);
         assert_eq!(
             damage(&bytes, &tree, &bytes, &tree),
+            Some(rect.inflated_edges(1, 1, 1, 1))
+        );
+        // A nested display list is the same content for as long as its id is.
+        let (old_bytes, old_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(1));
+        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(1));
+        assert_eq!(
+            damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
+            Some(IntRect::default())
+        );
+        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(2));
+        assert_eq!(
+            damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(rect.inflated_edges(1, 1, 1, 1))
         );
     }
@@ -2489,6 +3686,7 @@ mod tests {
         effect_context(
             &mut new_tree,
             EffectNodeData::Effects(EffectsData {
+                isolation: false,
                 opacity: 0.5,
                 blend_mode: CompositingAndBlendingOperator::Normal,
                 filter: None,
@@ -2522,20 +3720,9 @@ mod tests {
     }
 
     #[test]
-    fn changed_canvas_content_generation_damages_canvas_rect() {
+    fn canvas_without_new_content_is_not_damaged() {
         let tree = identity_tree();
-        let old_display_list = canvas_command_bytes(IntRect::new(10, 10, 20, 20), 1);
-        let new_display_list = canvas_command_bytes(IntRect::new(10, 10, 20, 20), 2);
-        assert_eq!(
-            damage(&old_display_list, &tree, &new_display_list, &tree),
-            Some(IntRect::new(9, 9, 22, 22))
-        );
-    }
-
-    #[test]
-    fn unchanged_canvas_content_generation_does_not_damage_canvas() {
-        let tree = identity_tree();
-        let canvas = canvas_command_bytes(IntRect::new(10, 10, 20, 20), 1);
+        let canvas = canvas_command_bytes(IntRect::new(10, 10, 20, 20));
         let old_fill = fill_command_bytes(IntRect::new(50, 50, 10, 10), RED);
         let new_fill = fill_command_bytes(IntRect::new(50, 50, 10, 10), BLUE);
         let mut old_display_list = canvas.clone();
@@ -2620,12 +3807,17 @@ mod tests {
     #[test]
     fn clip_paths_are_compared_by_content_across_allocations() {
         let rect = IntRect::new(10, 10, 20, 20);
-        let scene = |path_bytes: &[u8]| {
+        let scene = |apex_x: f32| {
+            let mut path = Path::new();
+            path.move_to(FloatPoint { x: 10.0, y: 30.0 });
+            path.line_to(FloatPoint { x: apex_x, y: 10.0 });
+            path.line_to(FloatPoint { x: 30.0, y: 30.0 });
+            path.close();
             let mut tree = identity_tree();
             let context = clip_context(
                 &mut tree,
                 ClipNodeData::Path(ClipPathData {
-                    path: Rc::new(OwnedPath::from_serialized_bytes(path_bytes)),
+                    path: std::sync::Arc::new(path),
                     bounding_rect: rect,
                     fill_rule: WindingRule::Nonzero,
                 }),
@@ -2641,13 +3833,13 @@ mod tests {
                 tree,
             )
         };
-        let (old_display_list, old_tree) = scene(&[1]);
-        let (same_display_list, same_tree) = scene(&[1]);
+        let (old_display_list, old_tree) = scene(20.0);
+        let (same_display_list, same_tree) = scene(20.0);
         assert_eq!(
             damage(&old_display_list, &old_tree, &same_display_list, &same_tree),
             Some(IntRect::default())
         );
-        let (changed_display_list, changed_tree) = scene(&[2]);
+        let (changed_display_list, changed_tree) = scene(25.0);
         assert_eq!(
             damage(&old_display_list, &old_tree, &changed_display_list, &changed_tree),
             Some(IntRect::new(9, 9, 22, 22))
@@ -2657,26 +3849,53 @@ mod tests {
     #[test]
     fn damage_covering_the_viewport_ends_the_diff() {
         let viewport = IntRect::new(0, 0, 100, 100);
-        let scene = |cover_color, unbounded_color| {
-            let mut bytes = fill_command_bytes(viewport, cover_color);
+        // The cover's run comes first, and moving it damages the whole viewport.
+        let scene = |cover_offset, filter| {
+            let mut tree = identity_tree();
+            let cover_spatial = tree.append_spatial(
+                SpatialData::Transform(transform(translation_matrix(cover_offset, 0.0, 0.0))),
+                VISUAL_VIEWPORT_NODE_INDEX,
+            );
+            let filtered_context = context_in(VISUAL_VIEWPORT_NODE_INDEX, effect_context(&mut tree, effects(filter)));
+            let fill = |rect| FillRect {
+                rect,
+                color: BLUE,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_effect: EffectNodeIndex::NONE,
+            };
+            let filtered_rect = IntRect::new(10, 10, 20, 20);
+            let mut bytes = command_bytes(
+                &fill(viewport),
+                Some(viewport),
+                context_in(cover_spatial, ContextRef::default()),
+            );
             bytes.extend_from_slice(&command_bytes(
-                &FillRect {
-                    rect: IntRect::new(10, 10, 20, 20),
-                    color: unbounded_color,
-                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
-                    background_color_animation_effect: EffectNodeIndex::NONE,
-                },
-                None,
-                ContextRef::default(),
+                &fill(filtered_rect),
+                Some(filtered_rect),
+                filtered_context,
             ));
-            bytes
+            (bytes, tree)
         };
-        let tree = identity_tree();
-        // The unbounded change alone requires a full repaint; a covering change reported first
-        // means the same thing.
-        assert_eq!(damage(&scene(RED, BLUE), &tree, &scene(RED, GREEN), &tree), None);
+        let flood = || {
+            Filter::Flood {
+                color: RED,
+                opacity: 1.0,
+            }
+            .serialize()
+        };
+        let (old_bytes, old_tree) = scene(0.0, blur_filter(1.0));
+        let (flood_bytes, flood_tree) = scene(0.0, flood());
+        let (flood_and_moved_cover_bytes, flood_and_moved_cover_tree) = scene(1.0, flood());
+        // A flood alone requires a full repaint; a covering change reported first means the same
+        // thing.
+        assert_eq!(damage(&old_bytes, &old_tree, &flood_bytes, &flood_tree), None);
         assert_eq!(
-            damage(&scene(RED, BLUE), &tree, &scene(GREEN, YELLOW), &tree),
+            damage(
+                &old_bytes,
+                &old_tree,
+                &flood_and_moved_cover_bytes,
+                &flood_and_moved_cover_tree
+            ),
             Some(viewport)
         );
     }

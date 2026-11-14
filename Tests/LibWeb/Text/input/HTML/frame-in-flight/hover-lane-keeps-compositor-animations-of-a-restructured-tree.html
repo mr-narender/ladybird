@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="frame-in-flight.js"></script>
+<style>
+    body { margin: 0; }
+    div { width: 100px; height: 50px; }
+    #b:hover { transform: translateX(10px); }
+    #a { transition: transform 100s linear; }
+    #a.moved { transform: translateX(100px); }
+</style>
+<div id="b"></div>
+<div id="a"></div>
+<script>
+    // The compositor runs a transition of transform for the host, and a hover beside a task gives an element before it
+    // a transform of its own, which builds the visual context tree with a new structure. The frame the render clock
+    // presents keeps the compositor animation, driving the nodes of its own box.
+    asyncTest(async done => {
+        if (document.readyState !== "complete")
+            await new Promise(resolve => window.addEventListener("load", resolve, { once: true }));
+        await twoFrames();
+        a.classList.add("moved");
+        await twoFrames();
+        const result = await whileLaneHovers(frameTime => {
+            internals.injectHoverPointer(50, 25, frameTime + 16, 1);
+            return {
+                presentedBy: internals.lastFramePresentedBy(document),
+                animationsOfB: internals.presentedCompositorAnimations(b),
+            };
+        });
+        println(`last frame presented by: ${result.presentedBy}`);
+        println(`compositor animations of #b: ${JSON.stringify(result.animationsOfB)}`);
+        await twoFrames();
+        println(`nodes of #b once the host took the hover in: ${internals.dumpVisualContextNodes(b).replace(/^\[s\d+\] /gm, "").trimEnd()}`);
+        const compositorAnimations = internals.dumpCompositorAnimations().split("\n").filter(line => line && !line.endsWith("timer armed"));
+        println(`compositor animations once the host restructured the tree: ${compositorAnimations.join(", ")}`);
+        done();
+    });
+</script>

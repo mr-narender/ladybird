@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <script src="structural-matrix.js"></script>
 <script>
     test(() => {
@@ -12,18 +13,18 @@
         const slotted = makeElement("div");
         host.appendChild(slotted);
         document.body.offsetWidth;
+        internals.updateStyle();
 
-        resetStyleCounters();
-        assertEqual("slot matches ::slotted", slot.matches("::slotted(:has(.hit))"), false);
-        printPassWithCounters("matching ::slotted() against a shadow tree slot");
+        // Matching a selector answers from the styles the elements have and styles nothing.
+        const matchWork = (name, element, selector) =>
+            styleWork(() => assertEqual(name, element.matches(selector), false), internals, { flush: false });
 
-        resetStyleCounters();
-        assertEqual("slotted element matches ::slotted", slotted.matches("::slotted(:has(.hit))"), false);
-        printPassWithCounters("matching ::slotted() against a slotted element");
-
-        resetStyleCounters();
-        assertEqual("slotted element matches simple ::slotted", slotted.matches("::slotted(div)"), false);
-        printPassWithCounters("matching simple ::slotted() against a slotted element");
+        printPassWithStyleWork("matching ::slotted() against a shadow tree slot",
+            matchWork("slot matches ::slotted", slot, "::slotted(:has(.hit))"));
+        printPassWithStyleWork("matching ::slotted() against a slotted element",
+            matchWork("slotted element matches ::slotted", slotted, "::slotted(:has(.hit))"));
+        printPassWithStyleWork("matching simple ::slotted() against a slotted element",
+            matchWork("slotted element matches simple ::slotted", slotted, "::slotted(div)"));
 
         host.remove();
     });

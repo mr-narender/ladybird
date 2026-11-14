@@ -13,7 +13,6 @@
 #include <LibGfx/Color.h>
 #include <LibWeb/CSS/StyleValues/RustStyleValueHandle.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
-#include <LibWeb/ComputedValuesRustFFI.h>
 
 namespace Web::CSS {
 
@@ -21,9 +20,6 @@ enum class ColorSyntax : u8 {
     Legacy,
     Modern,
 };
-
-// Marshals the plain-data parts of a ColorResolutionContext for the Rust resolver.
-StyleValueFFI::FfiColorResolutionInput make_rust_color_resolution_input(ColorResolutionContext const&, Optional<ComputedValuesFFI::FfiLengthResolutionContext>&);
 
 class ColorStyleValue : public StyleValue {
 public:
@@ -47,30 +43,21 @@ public:
         Rec2020,
         XYZD50,
         XYZD65,
+        Alpha, // This is used for alpha(from ...), whose result is in the color space of its origin color.
     };
-    // AD-HOC: Every color variant payload starts with the same ColorBase prefix, so the base
-    //         class reads it through one arm without knowing which color variant it has. The
-    //         static_asserts in ColorStyleValue.cpp keep the prefixes in place.
     Optional<ColorType> color_type() const
     {
-        auto const& color_base = m_value->color_function.color_base;
-        if (!color_base.has_color_type)
+        auto const& base = color_base();
+        if (!base.has_color_type)
             return {};
-        return static_cast<ColorType>(color_base.color_type);
+        return static_cast<ColorType>(base.color_type);
     }
-    ColorSyntax color_syntax() const { return static_cast<ColorSyntax>(m_value->color_function.color_base.color_syntax); }
-
-    Optional<Color> to_color(ColorResolutionContext) const;
-    ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
-
-    static Optional<double> resolve_hue(StyleValue const&, CalculationResolutionContext const&);
-    static Optional<double> resolve_with_reference_value(StyleValue const&, float one_hundred_percent_value, CalculationResolutionContext const&);
-    static Optional<double> resolve_alpha(StyleValue const&, CalculationResolutionContext const&);
-
-    static Optional<RelativeColorContext> extract_channels_in_color_space(StyleValue const& origin_color, ColorType target_color_type, ColorResolutionContext const&);
+    ColorSyntax color_syntax() const { return static_cast<ColorSyntax>(color_base().color_syntax); }
 
 protected:
     friend class StyleValue;
+
+    StyleValueFFI::ColorBase const& color_base() const;
 
     explicit ColorStyleValue(StyleValueFFI::StyleValueData const* value)
         : StyleValue(Type::Color, value)

@@ -10,6 +10,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
 #include <AK/Vector.h>
+#include <LibHTTP/Cookie/Cookie.h>
 #include <LibIPC/Forward.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Export.h>
@@ -20,6 +21,7 @@
 #include <LibWebCommon/HTML/SerializationRecords.h>
 #include <LibWebCommon/HTML/SerializedPolicyContainer.h>
 #include <LibWebCommon/HTML/SessionHistoryEntryIdentity.h>
+#include <LibWebCommon/HTML/UserAgentInitiated.h>
 #include <LibWebCommon/PixelUnits.h>
 #include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
 
@@ -54,8 +56,12 @@ struct SessionHistoryDocumentStateDescriptor {
     Optional<URL::Origin> origin;
     Optional<URL::URL> about_base_url;
     DocumentResource resource;
+    HTTP::Cookie::SameSiteStatus navigation_same_site_status { HTTP::Cookie::SameSiteStatus::CrossSite };
     bool reload_pending { false };
+    // AD-HOC: Whether the pending reload bypasses the HTTP cache.
+    bool reload_bypasses_cache { false };
     bool ever_populated { false };
+    UserAgentInitiated user_agent_initiated { UserAgentInitiated::No };
     Utf16String navigable_target_name;
     // AD-HOC: Only the UI process uses nested histories, so they are not encoded.
     Vector<SessionHistoryNestedHistoryDescriptor> nested_histories;
@@ -85,6 +91,8 @@ struct SessionHistoryEntryDescriptor {
     Utf16String navigation_api_id;
     ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
     SessionHistoryEntryScrollPositionData scroll_position_data;
+    CrossProcessId directive_state_id;
+    Optional<String> directive_state_value;
 };
 
 struct PendingSessionHistoryEntryDescriptor {
@@ -96,6 +104,8 @@ struct PendingSessionHistoryEntryDescriptor {
     Utf16String navigation_api_id;
     ScrollRestorationMode scroll_restoration_mode { ScrollRestorationMode::Auto };
     SessionHistoryEntryScrollPositionData scroll_position_data;
+    CrossProcessId directive_state_id;
+    Optional<String> directive_state_value;
 };
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#nested-history

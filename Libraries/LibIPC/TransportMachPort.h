@@ -15,8 +15,10 @@
 #include <AK/Atomic.h>
 #include <AK/ConditionVariable.h>
 #include <AK/Mutex.h>
+#include <AK/Optional.h>
 #include <AK/Queue.h>
 #include <AK/RefPtr.h>
+#include <AK/Time.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
 #include <LibCore/MachPort.h>
@@ -49,12 +51,23 @@ public:
     ~TransportMachPort();
 
     void set_up_read_hook(Function<void()>);
+
+    // Sets what the IO thread shows every message that arrives, before the transport's owner gets to see it, and empty
+    // bytes once the peer is gone. This is for a thread that does not get back to its event loop on its own, like one
+    // stuck in script. It runs while the IO thread holds a lock, so it should only have a look.
+    void set_incoming_message_observer(Function<void(ReadonlyBytes)>);
+
     bool is_open() const;
 
     void close();
     void close_after_sending_all_pending_messages();
 
-    void wait_until_readable();
+    // Returns at the deadline as well, if one is given.
+    void wait_until_readable(Optional<MonotonicTime> deadline = {});
+
+    // Makes wait_until_readable() return, even with nothing to read, now or if none is under way, the next time. Any
+    // thread may call this.
+    void interrupt_wait_until_readable();
 
     // Wait until everything posted so far has been handed to the kernel.
     void flush();
@@ -102,8 +115,15 @@ private:
     bool schedule_read_notification_if_needed_locked();
     void write_read_notification_byte();
     void mark_peer_eof();
+    void notify_incoming_message_observer(ReadonlyBytes);
     void release_send_waiters();
-    void send_mach_message(PendingMessage&);
+    enum class SendOutcome {
+        Sent,
+        // The peer's queue is full. Only a message with no port rights is ever left unsent, because a send the
+        // kernel has already copied in comes back pseudo-received, with its rights changed under it.
+        WouldBlock,
+    };
+    SendOutcome send_mach_message(PendingMessage&);
     void process_received_message(u8* buffer);
 
     Core::MachPort m_receive_port;
@@ -131,7 +151,11 @@ private:
 
     Mutex m_incoming_mutex;
     ConditionVariable m_incoming_cv { m_incoming_mutex };
+    bool m_wait_until_readable_interrupted { false };
     Vector<NonnullOwnPtr<Message>> m_incoming_messages;
+    // NB: This has a lock of its own, as the observer may interrupt a wait, which takes m_incoming_mutex.
+    Mutex m_incoming_message_observer_mutex;
+    Function<void(ReadonlyBytes)> m_incoming_message_observer;
     u64 m_receive_barriers_sent { 0 };
     u64 m_receive_barriers_received { 0 };
     bool m_read_notification_pending { false };

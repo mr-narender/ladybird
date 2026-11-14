@@ -18,7 +18,6 @@
 #include <LibGfx/Font/FontCatalog.h>
 #include <LibGfx/Font/PathFontProvider.h>
 #include <LibGfx/Font/SharedFontProvider.h>
-#include <LibGfx/Font/TypefaceSkia.h>
 #include <LibTest/TestCase.h>
 
 namespace {
@@ -28,7 +27,12 @@ struct Global {
     {
         Core::ResourceImplementation::install(make<Core::ResourceImplementationFile>(MUST(String::formatted("{}/Base/res", LADYBIRD_SOURCE_DIR))));
     }
-} global;
+};
+
+TEST_SETUP
+{
+    static Global global;
+}
 
 static IPC::File copy_bytes_to_file(ReadonlyBytes bytes)
 {
@@ -72,16 +76,11 @@ static Gfx::BrokeredFont open_test_font(u64 face_id)
     };
 }
 
-static Gfx::BrokeredFont reference_test_font(u64 face_id, String family)
+static Gfx::BrokeredFont platform_test_font(u64 face_id, String postscript_name)
 {
     return {
         .face_id = face_id,
-        .source = Gfx::SystemFontReference {
-            .family = move(family),
-            .weight = 400,
-            .width = Gfx::FontWidth::Normal,
-            .slope = 0,
-        },
+        .source = Gfx::PlatformFontName { move(postscript_name) },
     };
 }
 
@@ -215,25 +214,6 @@ TEST_CASE(catalog_file_factory_handles_mapping_failure)
     EXPECT_EQ(match_count, 1u);
 }
 
-TEST_CASE(rejecting_replacement_preserves_current_catalog)
-{
-    auto catalog = make_catalog();
-    size_t open_count = 0;
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.open_font = [&](u64, u64 face_id) {
-        ++open_count;
-        return open_test_font(face_id);
-    };
-
-    auto provider = MUST(Gfx::SharedFontProvider::create(map_bytes(catalog), 9, move(callbacks)));
-    auto malformed = MUST(ByteBuffer::copy("not a font catalog"sv.bytes()));
-    auto file = copy_bytes_to_file(malformed);
-    EXPECT(provider->replace_catalog(move(file), malformed.size(), 9).is_error());
-
-    EXPECT(provider->get_font("Brokered Test"_fly_string, 12, 400, Gfx::FontWidth::Normal, 0));
-    EXPECT_EQ(open_count, 1u);
-}
-
 TEST_CASE(unknown_width_uses_normal_variation_width)
 {
     Gfx::SharedFontProviderCallbacks callbacks;
@@ -275,45 +255,21 @@ TEST_CASE(caches_code_point_fallback_matches_and_misses)
     EXPECT_EQ(match_count, 4u);
 }
 
-TEST_CASE(replacing_catalog_clears_code_point_fallback_cache)
+#ifdef AK_OS_MACOS
+TEST_CASE(opens_platform_fonts_by_name_in_process)
 {
+    // A platform font is opened by its PostScript name in the client, and every Mac has Helvetica.
     size_t match_count = 0;
     Gfx::SharedFontProviderCallbacks callbacks;
     callbacks.match_font_for_code_point = [&](u32, u16, u16, u8, bool) {
         ++match_count;
-        return open_test_font(95);
-    };
-
-    auto provider = MUST(Gfx::SharedFontProvider::create_empty(9, move(callbacks)));
-    EXPECT(provider->get_font_for_code_point('A', 12, 400, Gfx::FontWidth::Normal, 0, false));
-    EXPECT_EQ(match_count, 1u);
-
-    auto replacement = make_catalog();
-    MUST(provider->replace_catalog(map_bytes(replacement), 9));
-    EXPECT(provider->get_font_for_code_point('A', 12, 400, Gfx::FontWidth::Normal, 0, false));
-    EXPECT_EQ(match_count, 2u);
-}
-
-TEST_CASE(matches_referenced_system_fonts_in_process)
-{
-    // Referenced fonts are re-matched locally, so this needs a family the platform can resolve: whichever one it
-    // would pick for a plain letter.
-    auto platform_typeface = Gfx::TypefaceSkia::find_typeface_for_code_point('A', 400, Gfx::FontWidth::Normal, 0, false);
-    if (platform_typeface.is_error() || !platform_typeface.value())
-        return;
-    auto family = platform_typeface.value()->family();
-
-    size_t match_count = 0;
-    Gfx::SharedFontProviderCallbacks callbacks;
-    callbacks.match_font_for_code_point = [&](u32, u16, u16, u8, bool) {
-        ++match_count;
-        return reference_test_font(96, family.to_string());
+        return platform_test_font(96, "Helvetica"_string);
     };
 
     auto provider = MUST(Gfx::SharedFontProvider::create_empty(9, move(callbacks)));
     auto font = provider->get_font_for_code_point('A', 12, 400, Gfx::FontWidth::Normal, 0, false);
     EXPECT(font);
-    EXPECT_EQ(font->typeface().family(), family);
+    EXPECT_EQ(font->typeface().postscript_name(), "Helvetica"_string);
     auto identifier = font->typeface().system_font_identifier();
     EXPECT(identifier.has_value());
     EXPECT_EQ(identifier->face_id, 96u);
@@ -322,14 +278,15 @@ TEST_CASE(matches_referenced_system_fonts_in_process)
     EXPECT(provider->get_typeface_by_id(9, 96));
     EXPECT_EQ(match_count, 1u);
 }
+#endif
 
-TEST_CASE(negatively_caches_unresolvable_system_font_references)
+TEST_CASE(negatively_caches_platform_fonts_that_do_not_open)
 {
     size_t match_count = 0;
     Gfx::SharedFontProviderCallbacks callbacks;
     callbacks.match_font_for_code_point = [&](u32, u16, u16, u8, bool) {
         ++match_count;
-        return reference_test_font(97, "Ladybird No Such Family"_string);
+        return platform_test_font(97, "Ladybird-NoSuchFont"_string);
     };
 
     auto provider = MUST(Gfx::SharedFontProvider::create_empty(9, move(callbacks)));
@@ -366,3 +323,20 @@ TEST_CASE(path_provider_deduplicates_canonical_paths)
     EXPECT_EQ(face_count, original_face_count);
 }
 #endif
+
+TEST_CASE(file_collection_faces_share_the_same_mapping)
+{
+    HashTable<String> loaded_paths;
+    Vector<NonnullRefPtr<Gfx::Typeface>> faces;
+    auto uri = MUST(String::formatted("file://{}/Tests/LibGfx/test-inputs/fonts", LADYBIRD_SOURCE_DIR));
+    Gfx::PathFontProvider::for_each_typeface_in_uri(uri, loaded_paths, [&](String const&, u32 index, Gfx::FontFileFormat, NonnullRefPtr<Gfx::Typeface> typeface) {
+        if (typeface->family() != "Collection Test"sv)
+            return;
+        EXPECT_EQ(index, faces.size());
+        EXPECT_EQ(typeface->weight(), index == 1 ? 700u : 400u);
+        EXPECT_EQ(typeface->slope(), index == 2 ? 1u : 0u);
+        if (!faces.is_empty())
+            EXPECT_EQ(typeface->font_data().data(), faces.first()->font_data().data());
+        faces.append(move(typeface)); });
+    EXPECT_EQ(faces.size(), 3u);
+}

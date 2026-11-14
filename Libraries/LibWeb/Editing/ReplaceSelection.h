@@ -7,10 +7,9 @@
 #pragma once
 
 #include <LibWeb/Forward.h>
-#include <LibWeb/TrustedTypes/TrustedHTML.h>
 
 namespace Web::Editing {
 
-void replace_selection_with_fragment(DOM::Document&, TrustedTypes::TrustedHTMLOrString const&);
+void replace_selection_with_fragment(DOM::Document&, DOM::DocumentFragment&);
 
 }

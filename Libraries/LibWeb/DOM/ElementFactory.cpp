@@ -87,7 +87,7 @@
 #include <LibWeb/HTML/HTMLUnknownElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
+#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
 #include <LibWeb/MathML/MathMLAnchorElement.h>
 #include <LibWeb/MathML/MathMLElement.h>
 #include <LibWeb/MathML/MathMLMiElement.h>
@@ -95,6 +95,8 @@
 #include <LibWeb/MathML/TagNames.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/SVG/SVGAElement.h>
+#include <LibWeb/SVG/SVGAnimateElement.h>
+#include <LibWeb/SVG/SVGAnimateMotionElement.h>
 #include <LibWeb/SVG/SVGCircleElement.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGDefsElement.h>
@@ -104,7 +106,10 @@
 #include <LibWeb/SVG/SVGFEColorMatrixElement.h>
 #include <LibWeb/SVG/SVGFEComponentTransferElement.h>
 #include <LibWeb/SVG/SVGFECompositeElement.h>
+#include <LibWeb/SVG/SVGFEConvolveMatrixElement.h>
+#include <LibWeb/SVG/SVGFEDiffuseLightingElement.h>
 #include <LibWeb/SVG/SVGFEDisplacementMapElement.h>
+#include <LibWeb/SVG/SVGFEDistantLightElement.h>
 #include <LibWeb/SVG/SVGFEDropShadowElement.h>
 #include <LibWeb/SVG/SVGFEFloodElement.h>
 #include <LibWeb/SVG/SVGFEFuncAElement.h>
@@ -117,6 +122,9 @@
 #include <LibWeb/SVG/SVGFEMergeNodeElement.h>
 #include <LibWeb/SVG/SVGFEMorphologyElement.h>
 #include <LibWeb/SVG/SVGFEOffsetElement.h>
+#include <LibWeb/SVG/SVGFEPointLightElement.h>
+#include <LibWeb/SVG/SVGFESpecularLightingElement.h>
+#include <LibWeb/SVG/SVGFESpotLightElement.h>
 #include <LibWeb/SVG/SVGFETurbulenceElement.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
@@ -124,6 +132,8 @@
 #include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/SVG/SVGLineElement.h>
 #include <LibWeb/SVG/SVGLinearGradientElement.h>
+#include <LibWeb/SVG/SVGMPathElement.h>
+#include <LibWeb/SVG/SVGMarkerElement.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGMetadataElement.h>
 #include <LibWeb/SVG/SVGPathElement.h>
@@ -134,6 +144,7 @@
 #include <LibWeb/SVG/SVGRectElement.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
+#include <LibWeb/SVG/SVGSetElement.h>
 #include <LibWeb/SVG/SVGStopElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
 #include <LibWeb/SVG/SVGSwitchElement.h>
@@ -511,6 +522,10 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
 
     if (local_name == SVG::TagNames::svg)
         return create_element_on_heap<SVG::SVGSVGElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::animate)
+        return create_element_on_heap<SVG::SVGAnimateElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::animateMotion)
+        return create_element_on_heap<SVG::SVGAnimateMotionElement>(document, move(qualified_name));
     // FIXME: Support SVG's mixedCase tag names properly.
     if (local_name.equals_ignoring_ascii_case(SVG::TagNames::clipPath))
         return create_element_on_heap<SVG::SVGClipPathElement>(document, move(qualified_name));
@@ -530,8 +545,14 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
         return create_element_on_heap<SVG::SVGFEComponentTransferElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feComposite)
         return create_element_on_heap<SVG::SVGFECompositeElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feConvolveMatrix)
+        return create_element_on_heap<SVG::SVGFEConvolveMatrixElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feDiffuseLighting)
+        return create_element_on_heap<SVG::SVGFEDiffuseLightingElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feDisplacementMap)
         return create_element_on_heap<SVG::SVGFEDisplacementMapElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feDistantLight)
+        return create_element_on_heap<SVG::SVGFEDistantLightElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feDropShadow)
         return create_element_on_heap<SVG::SVGFEDropShadowElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feFlood)
@@ -556,6 +577,12 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
         return create_element_on_heap<SVG::SVGFEMorphologyElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feOffset)
         return create_element_on_heap<SVG::SVGFEOffsetElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::fePointLight)
+        return create_element_on_heap<SVG::SVGFEPointLightElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feSpecularLighting)
+        return create_element_on_heap<SVG::SVGFESpecularLightingElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::feSpotLight)
+        return create_element_on_heap<SVG::SVGFESpotLightElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::feTurbulence)
         return create_element_on_heap<SVG::SVGFETurbulenceElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::filter)
@@ -566,10 +593,14 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
         return create_element_on_heap<SVG::SVGLineElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::linearGradient)
         return create_element_on_heap<SVG::SVGLinearGradientElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::marker)
+        return create_element_on_heap<SVG::SVGMarkerElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::mask)
         return create_element_on_heap<SVG::SVGMaskElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::metadata)
         return create_element_on_heap<SVG::SVGMetadataElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::mpath)
+        return create_element_on_heap<SVG::SVGMPathElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::path)
         return create_element_on_heap<SVG::SVGPathElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::pattern)
@@ -584,6 +615,8 @@ static GC::Ref<SVG::SVGElement> create_svg_element(Document& document, Qualified
         return create_element_on_heap<SVG::SVGRectElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::g)
         return create_element_on_heap<SVG::SVGGElement>(document, move(qualified_name));
+    if (local_name == SVG::TagNames::set)
+        return create_element_on_heap<SVG::SVGSetElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::stop)
         return create_element_on_heap<SVG::SVGStopElement>(document, move(qualified_name));
     if (local_name == SVG::TagNames::style)
@@ -700,8 +733,7 @@ WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, Utf16Fl
             if (upgrade_result.is_throw_completion()) {
                 // 1. Report exception for definition’s constructor’s corresponding JavaScript object’s associated
                 //    realm’s global object.
-                auto& window_or_worker = HTML::relevant_window_or_worker_global_scope(definition->constructor().callback);
-                window_or_worker.report_an_exception(upgrade_result.error_value());
+                HTML::report_an_exception(HTML::relevant_global_object(definition->constructor().callback), upgrade_result.error_value());
 
                 // 2. Set result’s custom element state to "failed".
                 result->set_custom_element_state(CustomElementState::Failed);
@@ -730,8 +762,7 @@ WebIDL::ExceptionOr<GC::Ref<Element>> create_element(Document& document, Utf16Fl
             if (constructed_element.is_throw_completion()) {
                 // 1. Report exception for definition’s constructor’s corresponding JavaScript object’s associated
                 //    realm’s global object.
-                auto& window_or_worker = HTML::relevant_window_or_worker_global_scope(definition->constructor().callback);
-                window_or_worker.report_an_exception(constructed_element.error_value());
+                HTML::report_an_exception(HTML::relevant_global_object(definition->constructor().callback), constructed_element.error_value());
 
                 // 2. Set result to the result of creating an element internal given document, HTMLUnknownElement,
                 //    localName, the HTML namespace, prefix, "failed", null, and registry.

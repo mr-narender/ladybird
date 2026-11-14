@@ -9,6 +9,7 @@
 #include <AK/Function.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefCounted.h>
+#include <AK/Vector.h>
 
 namespace {
 

@@ -8,13 +8,16 @@
 #include <LibTest/TestCase.h>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QDialogButtonBox>
+#include <QFrame>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QShortcut>
 #include <QStackedWidget>
 #include <QVBoxLayout>
@@ -93,10 +96,12 @@ void send_key(QWidget& widget, int key)
 TEST_CASE(alert_and_confirm_report_the_expected_results)
 {
     QWidget web_view;
+    web_view.setCursor(Qt::PointingHandCursor);
     web_view.resize(800, 600);
     web_view.show();
 
     Ladybird::JavaScriptDialog dialog(&web_view);
+    EXPECT_EQ(dialog.cursor().shape(), Qt::ArrowCursor);
     Completion completion;
     record_completions(dialog, completion);
 
@@ -143,6 +148,31 @@ TEST_CASE(alert_and_confirm_report_the_expected_results)
     EXPECT(completion.accepted);
 }
 
+TEST_CASE(only_offered_dialogs_can_block_further_dialogs)
+{
+    QWidget web_view;
+    web_view.resize(800, 600);
+    web_view.show();
+
+    Ladybird::JavaScriptDialog dialog(&web_view);
+    auto* checkbox = dialog.findChild<QCheckBox*>("LadybirdJavaScriptDialogBlockFurtherDialogs");
+    VERIFY(checkbox);
+
+    dialog.show_alert("https://example.com", "First alert");
+    EXPECT(checkbox->isHidden());
+    checkbox->setChecked(true);
+    dialog.accept();
+    EXPECT(!dialog.blocks_further_dialogs());
+
+    dialog.show_confirm("https://example.com", "Second dialog", Ladybird::JavaScriptDialog::OfferToBlockFurtherDialogs::Yes);
+    EXPECT(checkbox->isVisible());
+    EXPECT(!checkbox->isChecked());
+    EXPECT(!dialog.blocks_further_dialogs());
+    checkbox->setChecked(true);
+    dialog.dismiss();
+    EXPECT(dialog.blocks_further_dialogs());
+}
+
 TEST_CASE(prompt_supports_defaults_updates_and_keyboard_completion)
 {
     QWidget web_view;
@@ -177,6 +207,62 @@ TEST_CASE(prompt_supports_defaults_updates_and_keyboard_completion)
     dialog.show_prompt("https://example.com", "Prompt message", "ignored");
     trigger_shortcut(dialog, Qt::Key_Escape);
     EXPECT(completion.type == Ladybird::JavaScriptDialog::Type::Prompt);
+    EXPECT(!completion.accepted);
+}
+
+TEST_CASE(beforeunload_uses_fixed_copy_and_navigation_button_roles)
+{
+    QWidget web_view;
+    web_view.resize(800, 600);
+    web_view.show();
+
+    Ladybird::JavaScriptDialog dialog(&web_view);
+    Completion completion;
+    record_completions(dialog, completion);
+
+    dialog.show_before_unload("https://example.com");
+    EXPECT(dialog.type() == Ladybird::JavaScriptDialog::Type::BeforeUnload);
+    QApplication::processEvents();
+    auto* title_label = dialog.findChild<QLabel*>("LadybirdJavaScriptDialogTitle");
+    auto* message_label = dialog.findChild<QLabel*>("LadybirdJavaScriptDialogMessage");
+    auto* message_area = dialog.findChild<QScrollArea*>("LadybirdJavaScriptDialogMessageArea");
+    auto* button_box = dialog.findChild<QDialogButtonBox*>("LadybirdJavaScriptDialogButtons");
+    VERIFY(title_label);
+    VERIFY(message_label);
+    VERIFY(message_area);
+    VERIFY(button_box);
+    auto* leave_button = button_box->button(QDialogButtonBox::Ok);
+    auto* stay_button = button_box->button(QDialogButtonBox::Cancel);
+    VERIFY(leave_button);
+    VERIFY(stay_button);
+    EXPECT(title_label->text() == "https://example.com");
+    EXPECT(message_label->text() == "Leave this page? Your changes may not be saved.");
+    EXPECT(leave_button->text() == "Leave");
+    EXPECT(stay_button->text() == "Stay");
+    EXPECT(leave_button->isDefault());
+    EXPECT(dialog.focusWidget() == leave_button);
+    EXPECT(!message_area->verticalScrollBar()->isVisible());
+    EXPECT(message_area->viewport()->height() >= message_label->heightForWidth(message_area->viewport()->width()));
+
+    send_key(*leave_button, Qt::Key_Return);
+    EXPECT(!dialog.type().has_value());
+    EXPECT(completion.type == Ladybird::JavaScriptDialog::Type::BeforeUnload);
+    EXPECT(completion.accepted);
+
+    completion = {};
+    dialog.show_before_unload("https://example.com");
+    EXPECT(dialog.type() == Ladybird::JavaScriptDialog::Type::BeforeUnload);
+    trigger_shortcut(dialog, Qt::Key_Escape);
+    EXPECT(completion.type == Ladybird::JavaScriptDialog::Type::BeforeUnload);
+    EXPECT(!completion.accepted);
+
+    completion = {};
+    dialog.show_before_unload("https://example.com");
+    stay_button = button_box->button(QDialogButtonBox::Cancel);
+    VERIFY(stay_button);
+    stay_button->setFocus();
+    send_key(*stay_button, Qt::Key_Return);
+    EXPECT(completion.type == Ladybird::JavaScriptDialog::Type::BeforeUnload);
     EXPECT(!completion.accepted);
 }
 
@@ -282,6 +368,27 @@ TEST_CASE(dialog_resizes_with_and_blocks_only_its_parent_view)
     web_view->resize(640, 480);
     QApplication::processEvents();
     EXPECT_EQ(dialog.geometry(), web_view->rect());
+}
+
+TEST_CASE(dialog_takes_its_views_size_when_it_opens)
+{
+    QWidget web_view;
+    web_view.resize(800, 600);
+    web_view.show();
+
+    Ladybird::JavaScriptDialog dialog(&web_view);
+    EXPECT_EQ(dialog.geometry(), web_view.rect());
+
+    // A hidden native dialog's platform window can report the size it was created with back as a resize, after the
+    // dialog took its view's size; that's Qt's default 100x30 when the dialog was made before its view was laid out.
+    dialog.setGeometry(0, 0, 100, 30);
+
+    dialog.show_confirm("https://example.com", "Confirm message");
+    EXPECT_EQ(dialog.geometry(), web_view.rect());
+    auto* panel = dialog.findChild<QFrame*>("LadybirdJavaScriptDialogPanel");
+    VERIFY(panel);
+    EXPECT_EQ(panel->width(), 440);
+    dialog.dismiss();
 }
 
 TEST_CASE(dialog_visibility_and_state_follow_the_owning_tab)

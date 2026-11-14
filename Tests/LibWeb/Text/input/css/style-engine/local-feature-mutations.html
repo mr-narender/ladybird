@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
 <script src="plan.js"></script>
 <style>
     .theme .item { color: green }
@@ -68,11 +69,9 @@
         // beside an unclassed anchor is not named.
         plan("an attribute above a sibling combinator", () => document.getElementById("sib-guard").setAttribute("data-mode", "light"));
 
-        // Setting an attribute to the value it already has moves nothing, so the journal cancels it.
+        // Setting an attribute to the value it already has moves nothing, so nothing is restyled.
         guard.setAttribute("data-mode", "dark");
-        planSetup();
-        guard.setAttribute("data-mode", "dark");
-        const repeat = internals.styleEngineTransactionReactions();
-        println(`rewrite with the same value: [${repeat.elements.join(", ")}]`);
+        const repeat = styleWork(() => guard.setAttribute("data-mode", "dark"));
+        println(`rewrite with the same value: [${repeat.restyled().map(shortStyleName).join(", ")}]`);
     });
 </script>

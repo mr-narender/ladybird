@@ -7,12 +7,15 @@
 #include "ScrollTimeline.h"
 #include <LibGC/Heap.h>
 #include <LibWeb/Animations/Animation.h>
+#include <LibWeb/Animations/ViewTimeline.h>
 #include <LibWeb/Bindings/ScrollTimeline.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Window.h>
+#include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/Scrolling.h>
 
 namespace Web::Animations {
 
@@ -52,8 +55,15 @@ GC::Ptr<DOM::Element const> ScrollTimeline::source() const
             case CSS::Scroller::Nearest: {
                 GC::Ptr<DOM::Element const> ancestor = anonymous_source.target.parent_element();
 
-                while (ancestor && !ancestor->is_scroll_container())
+                // Whether a box is a scroll container depends on its used overflow, which is visible for a body whose
+                // overflow is propagated to the viewport. The document element stands for the viewport.
+                Layout::ForcedReadScope read { anonymous_source.target.document() };
+                while (ancestor && !ancestor->is_document_element()) {
+                    auto const* layout_node = ancestor->unsafe_layout_node(read);
+                    if (layout_node && layout_node->is_scroll_container())
+                        break;
                     ancestor = ancestor->parent_element();
+                }
 
                 return ancestor;
             }
@@ -62,6 +72,14 @@ GC::Ptr<DOM::Element const> ScrollTimeline::source() const
             }
             VERIFY_NOT_REACHED();
         });
+}
+
+GC::Ptr<DOM::Element const> ScrollTimeline::source_for_bindings() const
+{
+    // The nearest scroll container is the nearest one by used overflow, which layout decides.
+    if (auto const* anonymous_source = m_source.get_pointer<AnonymousSource>(); anonymous_source && anonymous_source->scroller == CSS::Scroller::Nearest)
+        anonymous_source->target.document().update_layout(DOM::UpdateLayoutReason::ScrollTimelineSource);
+    return source();
 }
 
 struct ComputedScrollAxis {
@@ -110,16 +128,15 @@ static ComputedScrollAxis computed_scroll_axis(ScrollAxis axis, CSS::WritingMode
     VERIFY_NOT_REACHED();
 }
 
-struct ScrollOffsetData {
-    double scroll_offset;
-    double max_scroll_offset;
-};
-static Optional<ScrollOffsetData> compute_scroll_offset_data(Variant<GC::Ptr<DOM::Element const>, GC::Ptr<DOM::Document>> propagated_source, ScrollAxis axis)
+Optional<ScrollTimeline::ScrollerMetrics> ScrollTimeline::scroller_metrics() const
 {
+    auto propagated_source = get_propagated_source();
     if (propagated_source.visit([](auto const& source) { return source == nullptr; }))
         return {};
 
-    auto const& layout_node = propagated_source.visit([](auto const& source) -> Layout::NodeWithStyle const* { return source->unsafe_layout_node(); });
+    Layout::ForcedReadScope read { propagated_source.visit([](auto const& source) -> DOM::Document const& { return source->document(); }) };
+
+    auto const& layout_node = propagated_source.visit([&read](auto const& source) -> Layout::NodeWithStyle const* { return source->unsafe_layout_node(read); });
 
     if (!layout_node || !layout_node->is_scroll_container())
         return {};
@@ -128,21 +145,53 @@ static Optional<ScrollOffsetData> compute_scroll_offset_data(Variant<GC::Ptr<DOM
         return {};
 
     auto const& scrollable_overflow_rect = Painting::scrollable_overflow_rect(*layout_node).value();
-    auto const& computed_axis = computed_scroll_axis(axis, layout_node->writing_mode(), layout_node->direction());
+    auto const& computed_axis = computed_scroll_axis(m_axis, layout_node->writing_mode(), layout_node->direction());
+    auto scrollport = Painting::absolute_padding_box_rect(*layout_node);
+    // NB: Only a view progress timeline measures its subject against the scroll padding, so a scroll progress timeline
+    //     does not resolve it on every update.
+    auto snapport = is<ViewTimeline>(*this) ? Painting::scroll_snapport_rect(*layout_node, scrollport) : scrollport;
 
     // FIXME: Scroll offset is currently incorrect as it is always relative to the top left of the scrollable overflow
     //        rect when it should instead be relative to the scroll origin.
 
     // FIXME: Support the case where the computed scroll axis is reversed
 
-    return ScrollOffsetData {
+    return ScrollerMetrics {
+        .scroll_node = Painting::async_scroll_node_stable_id(*layout_node),
+        .scroller_style_node = propagated_source.visit(
+            [](GC::Ptr<DOM::Element const> const& element) { return element->style_node_id().value(); },
+            [](GC::Ptr<DOM::Document> const&) -> u32 { return 0; }),
+        .is_vertical = computed_axis.is_vertical,
         .scroll_offset = computed_axis.is_vertical
             ? Painting::scroll_offset(*layout_node).y().to_double()
             : Painting::scroll_offset(*layout_node).x().to_double(),
         .max_scroll_offset = computed_axis.is_vertical
             ? scrollable_overflow_rect.height().to_double() - Painting::content_height(*layout_node).to_double()
             : scrollable_overflow_rect.width().to_double() - Painting::content_width(*layout_node).to_double(),
+        .scrollport_start = (computed_axis.is_vertical ? scrollport.y() : scrollport.x()).to_double(),
+        .scrollport_size = (computed_axis.is_vertical ? scrollport.height() : scrollport.width()).to_double(),
+        .scroll_padding_start = computed_axis.is_vertical
+            ? (snapport.y() - scrollport.y()).to_double()
+            : (snapport.x() - scrollport.x()).to_double(),
+        .scroll_padding_end = computed_axis.is_vertical
+            ? (scrollport.bottom() - snapport.bottom()).to_double()
+            : (scrollport.right() - snapport.right()).to_double(),
     };
+}
+
+Optional<ScrollTimeline::FollowedScroller> ScrollTimeline::followed_scroller_from(ScrollerMetrics const& metrics)
+{
+    if (!metrics.scroll_node.has_value())
+        return {};
+    return FollowedScroller { *metrics.scroll_node, metrics.scroller_style_node, metrics.is_vertical, metrics.scroll_offset, metrics.max_scroll_offset };
+}
+
+void ScrollTimeline::set_axis(ScrollAxis axis)
+{
+    if (m_axis == axis)
+        return;
+    m_axis = axis;
+    update_current_time(0);
 }
 
 bool ScrollTimeline::is_stale() const
@@ -158,7 +207,7 @@ bool ScrollTimeline::is_stale() const
     //         narrow) tests in WPT and is the same behavior as is implemented by WebKit.
 
     // FIXME: Account for the named timeline ranges of view progress timelines once they are implemented.
-    auto scroll_offset_data = compute_scroll_offset_data(get_propagated_source(), m_axis);
+    auto scroll_offset_data = scroller_metrics();
 
     return scroll_offset_data.map([](auto const& data) { return data.max_scroll_offset; }) != m_last_max_scroll_offset;
 }
@@ -170,9 +219,10 @@ void ScrollTimeline::update_current_time(double)
     // representing its startmost scroll position (in the writing mode of the scroll container). Null when the timeline
     // is inactive.
 
-    auto scroll_offset_data = compute_scroll_offset_data(get_propagated_source(), m_axis);
+    auto scroll_offset_data = scroller_metrics();
 
     m_last_max_scroll_offset = scroll_offset_data.map([](auto const& data) { return data.max_scroll_offset; });
+    m_followed_scroller.clear();
 
     // If the source of a ScrollTimeline is an element whose principal box does not exist or is not a scroll container,
     // or if there is no scrollable overflow, then the ScrollTimeline is inactive.
@@ -197,7 +247,22 @@ void ScrollTimeline::update_current_time(double)
     //     scroll offset ÷ (scrollable overflow size − scroll container size)
     auto progress = scroll_offset_data->scroll_offset / scroll_offset_data->max_scroll_offset;
 
+    m_followed_scroller = followed_scroller_from(*scroll_offset_data);
+
     set_current_time(TimeValue { TimeValue::Type::Percentage, progress * 100 });
+}
+
+AttachmentInterval ScrollTimeline::interval_for_attachment_range(AnimationAttachmentRange const& range) const
+{
+    // NB: A scroll progress timeline has no named timeline ranges, so each edge is measured along the entire timeline,
+    //     whose length is the maximum scroll offset. This matches WebKit.
+    auto max_scroll_offset = m_last_max_scroll_offset.value_or(0);
+    auto time_of = [&](TimelineRangeEdge const& edge) {
+        if (max_scroll_offset == 0)
+            return TimeValue { TimeValue::Type::Percentage, edge.offset_percentage };
+        return TimeValue { TimeValue::Type::Percentage, edge.offset_along(max_scroll_offset) / max_scroll_offset * 100 };
+    };
+    return { time_of(range.start), time_of(range.end) };
 }
 
 ScrollTimeline::ScrollTimeline(DOM::Document& document, Source source, ScrollAxis axis)
@@ -205,6 +270,8 @@ ScrollTimeline::ScrollTimeline(DOM::Document& document, Source source, ScrollAxi
     , m_source(source)
     , m_axis(axis)
 {
+    static u64 s_next_clock_identity = 1;
+    m_clock_identity = s_next_clock_identity++;
 }
 
 void ScrollTimeline::visit_edges(GC::Cell::Visitor& visitor)

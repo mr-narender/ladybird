@@ -10,13 +10,7 @@
 #include <AK/Checked.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ShareableBitmap.h>
-#include <LibGfx/SkiaUtils.h>
 
-#include <core/SkBitmap.h>
-#include <core/SkColorSpace.h>
-#include <core/SkImage.h>
-#include <core/SkImageInfo.h>
-#include <core/SkPixmap.h>
 #include <errno.h>
 
 #ifdef AK_OS_MACOS
@@ -97,6 +91,86 @@ ErrorOr<NonnullRefPtr<Bitmap>> Bitmap::create_shareable(BitmapFormat format, Alp
     return bitmap;
 }
 
+#ifdef AK_OS_MACOS
+static u32 iosurface_pixel_format_of(BitmapFormat format)
+{
+    switch (format) {
+    case BitmapFormat::BGRx8888:
+    case BitmapFormat::BGRA8888:
+        return 'BGRA';
+    case BitmapFormat::RGBx8888:
+    case BitmapFormat::RGBA8888:
+        return 'RGBA';
+    case BitmapFormat::Invalid:
+        break;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+ErrorOr<void> Bitmap::validate_iosurface_holds_pixels_of(Core::IOSurfaceHandle const& iosurface, BitmapFormat format, IntSize size)
+{
+    if (!is_valid_bitmap_format(to_underlying(format)))
+        return Error::from_string_literal("Gfx::Bitmap IOSurface format is invalid");
+    if (size.is_empty() || size_would_overflow(format, size))
+        return Error::from_string_literal("Gfx::Bitmap IOSurface size is invalid");
+    if (iosurface.plane_count() != 0 || iosurface.bytes_per_element() != 4 || iosurface.pixel_format() != iosurface_pixel_format_of(format))
+        return Error::from_string_literal("Gfx::Bitmap IOSurface does not hold pixels of its format");
+    if (iosurface.width() != static_cast<size_t>(size.width()) || iosurface.height() != static_cast<size_t>(size.height()))
+        return Error::from_string_literal("Gfx::Bitmap IOSurface is not of its size");
+
+    auto bytes_per_row = iosurface.bytes_per_row();
+    if (bytes_per_row < minimum_pitch(size.width(), format) || bytes_per_row % alignof(RawPixel) != 0)
+        return Error::from_string_literal("Gfx::Bitmap IOSurface rows are invalid");
+    Checked<size_t> size_of_pixels = bytes_per_row;
+    size_of_pixels *= static_cast<size_t>(size.height());
+    if (size_of_pixels.has_overflow() || size_of_pixels.value() > iosurface.alloc_size())
+        return Error::from_string_literal("Gfx::Bitmap IOSurface rows are outside of its memory");
+    if (!iosurface.data())
+        return Error::from_string_literal("Gfx::Bitmap IOSurface is not mapped");
+    return {};
+}
+
+ErrorOr<NonnullRefPtr<Bitmap>> Bitmap::create_with_iosurface(BitmapFormat format, AlphaType alpha_type, IntSize size, Core::IOSurfaceHandle iosurface)
+{
+    TRY(validate_iosurface_holds_pixels_of(iosurface, format, size));
+    return adopt_nonnull_ref_or_enomem(new (nothrow) Bitmap(format, alpha_type, size, move(iosurface)));
+}
+
+Bitmap::Bitmap(BitmapFormat format, AlphaType alpha_type, IntSize size, Core::IOSurfaceHandle iosurface)
+    : m_size(size)
+    , m_data(iosurface.data())
+    , m_pitch(iosurface.bytes_per_row())
+    , m_format(format)
+    , m_alpha_type(alpha_type)
+    , m_iosurface(move(iosurface))
+{
+}
+
+static ErrorOr<NonnullRefPtr<Bitmap>> create_over_new_iosurface(BitmapFormat format, AlphaType alpha_type, IntSize size)
+{
+    if (size.is_empty() || Bitmap::size_would_overflow(format, size))
+        return Error::from_string_literal("Gfx::Bitmap IOSurface size is invalid");
+
+    // NB: The rows of a surface only a few pixels wide are mostly padding, which would take more memory than shared
+    //     memory and a copy of it on the GPU take together.
+    auto minimum_pitch = Bitmap::minimum_pitch(size.width(), format);
+    if (Core::IOSurfaceHandle::bytes_per_row_aligned_as_the_system_aligns_it(minimum_pitch) > 2 * minimum_pitch)
+        return Error::from_string_literal("Gfx::Bitmap IOSurface rows would be mostly padding");
+
+    auto iosurface = TRY(Core::IOSurfaceHandle::try_create_with_four_bytes_per_pixel(size.width(), size.height(), iosurface_pixel_format_of(format)));
+    return Bitmap::create_with_iosurface(format, alpha_type, size, move(iosurface));
+}
+#endif
+
+ErrorOr<NonnullRefPtr<Bitmap>> Bitmap::create_shareable_with_gpu_access(BitmapFormat format, AlphaType alpha_type, IntSize size)
+{
+#ifdef AK_OS_MACOS
+    if (auto bitmap = create_over_new_iosurface(format, alpha_type, size); !bitmap.is_error())
+        return bitmap.release_value();
+#endif
+    return create_shareable(format, alpha_type, size);
+}
+
 Bitmap::Bitmap(BitmapFormat format, AlphaType alpha_type, IntSize size, BackingStore const& backing_store)
     : m_size(size)
     , m_data(backing_store.data)
@@ -172,8 +246,8 @@ ErrorOr<NonnullRefPtr<Gfx::Bitmap>> Bitmap::clone() const
 {
     auto new_bitmap = TRY(Bitmap::create(format(), alpha_type(), size()));
 
-    VERIFY(size_in_bytes() == new_bitmap->size_in_bytes());
-    memcpy(new_bitmap->scanline(0), scanline(0), size_in_bytes());
+    for (int y = 0; y < height(); ++y)
+        memcpy(new_bitmap->scanline_u8(y), scanline_u8(y), new_bitmap->pitch());
 
     return new_bitmap;
 }
@@ -200,33 +274,28 @@ ErrorOr<NonnullRefPtr<Gfx::Bitmap>> Bitmap::cropped(Gfx::IntRect crop, Gfx::Colo
     return new_bitmap;
 }
 
-ErrorOr<NonnullRefPtr<Bitmap>> Bitmap::scaled(int const width, int const height, ScalingMode const scaling_mode) const
-{
-    auto const source_info = SkImageInfo::Make(this->width(), this->height(), to_skia_color_type(format()), to_skia_alpha_type(format(), alpha_type()), nullptr);
-    SkPixmap const source_sk_pixmap(source_info, begin(), pitch());
-    SkBitmap source_sk_bitmap;
-    source_sk_bitmap.installPixels(source_sk_pixmap);
-    source_sk_bitmap.setImmutable();
-
-    auto scaled_bitmap = TRY(Gfx::Bitmap::create(format(), alpha_type(), { width, height }));
-    auto const scaled_info = SkImageInfo::Make(scaled_bitmap->width(), scaled_bitmap->height(), to_skia_color_type(scaled_bitmap->format()), to_skia_alpha_type(scaled_bitmap->format(), scaled_bitmap->alpha_type()), nullptr);
-    SkPixmap const scaled_sk_pixmap(scaled_info, scaled_bitmap->begin(), scaled_bitmap->pitch());
-
-    sk_sp<SkImage> source_sk_image = source_sk_bitmap.asImage();
-    if (!source_sk_image->scalePixels(scaled_sk_pixmap, to_skia_sampling_options(scaling_mode)))
-        return Error::from_string_literal("Unable to scale pixels for bitmap");
-    return scaled_bitmap;
-}
-
 ErrorOr<NonnullRefPtr<Bitmap>> Bitmap::to_bitmap_backed_by_anonymous_buffer() const
 {
     if (m_buffer.is_valid()) {
         // FIXME: The const_cast here is awkward.
         return NonnullRefPtr { const_cast<Bitmap&>(*this) };
     }
-    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(round_up_to_power_of_two(size_in_bytes(), PAGE_SIZE)));
-    auto bitmap = TRY(Bitmap::create_with_anonymous_buffer(format(), alpha_type(), move(buffer), size()));
-    memcpy(bitmap->scanline(0), scanline(0), size_in_bytes());
+    auto bitmap = TRY(Bitmap::create_shareable(format(), alpha_type(), size()));
+    for (int y = 0; y < height(); ++y)
+        memcpy(bitmap->scanline(y), scanline(y), bitmap->pitch());
+    return bitmap;
+}
+
+ErrorOr<NonnullRefPtr<Bitmap>> Bitmap::to_bitmap_shareable_with_gpu_access() const
+{
+    if (is_in_shareable_memory()) {
+        // FIXME: The const_cast here is awkward.
+        return NonnullRefPtr { const_cast<Bitmap&>(*this) };
+    }
+    auto bitmap = TRY(Bitmap::create_shareable_with_gpu_access(format(), alpha_type(), size()));
+    auto const row_size = minimum_pitch(width(), format());
+    for (int y = 0; y < height(); ++y)
+        memcpy(bitmap->scanline_u8(y), scanline_u8(y), row_size);
     return bitmap;
 }
 
@@ -235,14 +304,6 @@ Bitmap::~Bitmap()
     if (m_destruction_callback)
         m_destruction_callback();
     m_data = nullptr;
-}
-
-void Bitmap::strip_alpha_channel()
-{
-    VERIFY(m_format == BitmapFormat::BGRA8888 || m_format == BitmapFormat::BGRx8888);
-    for (BGRA8888& pixel : *this)
-        pixel = 0xff000000 | (pixel & 0xffffff);
-    m_format = BitmapFormat::BGRx8888;
 }
 
 Gfx::ShareableBitmap Bitmap::to_shareable_bitmap() const
@@ -355,20 +416,27 @@ void Bitmap::set_alpha_type_destructive(AlphaType alpha_type)
     }
     VERIFY(err == kvImageNoError);
 #else
-    auto color_type = to_skia_color_type(m_format);
-    auto source_alpha = to_skia_alpha_type(m_format, m_alpha_type);
-    auto destination_alpha = to_skia_alpha_type(m_format, alpha_type);
-
-    auto color_space = SkColorSpace::MakeSRGB();
-
-    auto source_info = SkImageInfo::Make(width(), height(), color_type, source_alpha, color_space);
-    auto destination_info = SkImageInfo::Make(width(), height(), color_type, destination_alpha, color_space);
-
-    SkPixmap src_pixmap(source_info, m_data, pitch());
-    SkPixmap dst_pixmap(destination_info, m_data, pitch());
-
-    bool ok = src_pixmap.readPixels(dst_pixmap);
-    VERIFY(ok);
+    VERIFY(m_format == BitmapFormat::BGRA8888 || m_format == BitmapFormat::RGBA8888);
+    // Both formats keep alpha in the last byte, and their color channels convert the same way. The arithmetic is the
+    // same as Skia's, so a bitmap converted here matches one that Skia converts.
+    for (int y = 0; y < height(); ++y) {
+        auto* pixel = scanline_u8(y);
+        for (int x = 0; x < width(); ++x, pixel += 4) {
+            auto alpha = pixel[3];
+            if (alpha == 255)
+                continue;
+            if (alpha_type == AlphaType::Premultiplied) {
+                for (int channel = 0; channel < 3; ++channel)
+                    pixel[channel] = (pixel[channel] * alpha + 127) / 255;
+                continue;
+            }
+            float scale = alpha == 0 ? 0.0f : 1.0f / (alpha * (1 / 255.0f));
+            for (int channel = 0; channel < 3; ++channel) {
+                float value = pixel[channel] * (1 / 255.0f) * scale;
+                pixel[channel] = static_cast<u8>(__builtin_rintf(clamp(value * 255.0f, 0.0f, 255.0f)));
+            }
+        }
+    }
 #endif
     m_alpha_type = alpha_type;
 }

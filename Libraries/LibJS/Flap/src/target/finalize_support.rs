@@ -33,6 +33,14 @@ pub(crate) struct Emit<'a> {
     pub(crate) object_format: ObjectFormat,
     pub(crate) enable_assertions: bool,
     pub(crate) has_jscvt: bool,
+    pub(crate) has_lzcnt: bool,
+    pub(crate) has_bmi1: bool,
+    /// Whether this is the profiling build of the interpreter. Only its
+    /// handlers switch to the dispatch table of the frame they continue in
+    /// (see `VmDispatchTables`).
+    pub(crate) profiling: bool,
+    /// The virtual machine the handlers are compiled for.
+    pub(crate) profile: crate::Profile,
     /// Distinguishes the local labels a single function generates.
     unique_counter: u64,
     /// The operands of the most recent floating-point comparison, so that a
@@ -57,6 +65,10 @@ impl<'a> Emit<'a> {
             object_format: options.target.object_format,
             enable_assertions: options.enable_assertions,
             has_jscvt: options.has_jscvt,
+            has_lzcnt: options.has_lzcnt,
+            has_bmi1: options.has_bmi1,
+            profiling: options.profiling,
+            profile: options.profile,
             unique_counter: 0,
             last_fp_compare: None,
         }
@@ -70,6 +82,14 @@ impl<'a> Emit<'a> {
 
     pub(crate) fn error<T>(&self, message: impl Into<String>) -> Result<T, CompileError> {
         finalize_error(self.handler, message)
+    }
+
+    /// The length of the instruction of a handler that calls a binary slow path, which the slow path continues after.
+    pub(crate) fn binary_slow_path_instruction_length(&self) -> Result<i64, CompileError> {
+        match self.handler_size {
+            Some(size) => Ok(i64::from(size)),
+            None => self.error("a variable-length handler cannot call a binary slow path"),
+        }
     }
 
     /// A layout constant the handler cannot be finalized without.

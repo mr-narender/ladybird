@@ -1,0 +1,3 @@
+flagged: 4-8
+focused: area
+selection: 0-0

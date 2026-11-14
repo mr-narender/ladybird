@@ -1,0 +1,8 @@
+Harness status: OK
+
+Found 3 tests
+
+3 Pass
+Pass	Starts rendering with flip-block
+Pass	No successful position, keep flip-block
+Pass	No successful position, last successful invalidated by position-try-fallbacks change

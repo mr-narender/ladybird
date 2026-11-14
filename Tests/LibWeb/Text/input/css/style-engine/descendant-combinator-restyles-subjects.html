@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<script src="../../work-test.js"></script>
+<style>
+    .theme:focus .item { color: green }
+</style>
+<div id="outer" tabindex="0">
+    <div id="guard" class="theme" tabindex="0">
+        <div><div><div><span class="item" id="deep"></span></div></div></div>
+        <div><div><div><span></span></div></div></div>
+        <div><div><div><span></span></div></div></div>
+    </div>
+</div>
+<script>
+    test(() => {
+        // A descendant combinator reaches a whole subtree, but only the elements carrying the
+        // subject's own feature inside it can change. The pass restyles those, not the subtree: the
+        // guard has twelve descendants and exactly one of them is an .item. The guard itself is
+        // restyled because the user-agent sheet styles whatever is focused.
+        const guard = document.getElementById("guard");
+        println(`descendants of the guard: ${guard.querySelectorAll("*").length}`);
+        let work = styleWork(() => guard.focus({ preventScroll: true }));
+        println(`passes: ${work.passes().join(" | ") || "(no pass)"}`);
+        println(`changed: [${work.changed().map(shortStyleName).join(", ")}]`);
+        println(`restyled but unchanged: [${work.restyled().filter(element => !work.changed().includes(element)).map(shortStyleName).join(", ")}]`);
+
+        // The element an input happened to has to satisfy the rest of the compound that input
+        // occurs in. Focusing an element that is not a .theme reaches the elements the user-agent
+        // sheet styles by focus, and no .item at all. Blur the guard first, so the focus change
+        // takes nothing away from it.
+        guard.blur();
+        work = styleWork(() => document.getElementById("outer").focus({ preventScroll: true }));
+        println(`unguarded focus: passes ${work.passes().join(" | ") || "(no pass)"}, changed [${work.changed().map(shortStyleName).join(", ")}], restyled [${work.restyled().map(shortStyleName).join(", ")}]`);
+    });
+</script>

@@ -171,6 +171,7 @@ Media::DecoderErrorOr<void> WebMByteStreamParser::parse_initialization_segment(M
     m_video_tracks.clear();
     m_audio_tracks.clear();
     m_text_tracks.clear();
+    m_track_block_contexts.clear();
 
     for (auto const& [track_number, track_entry] : m_track_entries) {
         auto* maybe_tracks_for_type = [&] -> Vector<Media::Track>* {
@@ -251,7 +252,10 @@ Media::DecoderErrorOr<ParseMediaSegmentResult> WebMByteStreamParser::parse_media
                     return Reader::parse_block_group(streamer, timecode, m_segment_information->timestamp_scale(), m_track_block_contexts);
                 }());
 
-                VERIFY(block.timestamp().has_value());
+                // NB: The parser calculates the timestamp from the context selected by the block's track identifier.
+                //     Produce an error if one is not found.
+                if (!block.timestamp().has_value())
+                    return Media::DecoderError::corrupted("Block belongs to an unknown track"sv);
 
                 // - Block & SimpleBlock elements are in time increasing order consistent with [WEBM].
                 if (block.timestamp().value() < last_block_timestamp)
@@ -265,6 +269,9 @@ Media::DecoderErrorOr<ParseMediaSegmentResult> WebMByteStreamParser::parse_media
 
                 auto data_position = block.data_position();
                 auto data_size = block.data_size();
+                // AD-HOC: Skip blocks that contain no data, as they are invalid for any codec we support.
+                if (data_size == 0)
+                    return IterationDecision::Continue;
                 auto current_position = streamer.position();
                 TRY(cursor.seek(data_position, AK::SeekMode::SetPosition));
 
@@ -298,6 +305,7 @@ Media::DecoderErrorOr<ParseMediaSegmentResult> WebMByteStreamParser::parse_media
             //   reached when another Cluster header or an element header that indicates the start of a WebM
             //   initialization segment is encountered.
             if (!remaining_bytes.has_value() && first_is_one_of(element_id, EBML_MASTER_ELEMENT_ID, CLUSTER_ELEMENT_ID)) {
+                TRY(cursor.seek(block_position, AK::SeekMode::SetPosition));
                 return IterationDecision::Break;
             }
 
@@ -335,6 +343,8 @@ Media::DecoderErrorOr<ParseMediaSegmentResult> WebMByteStreamParser::parse_media
 void WebMByteStreamParser::reset_parser_state()
 {
     m_current_media_segment_data.clear();
+    for (auto& [track_number, context] : m_track_block_contexts)
+        context.packet_duration_parser.reset();
 }
 
 }

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<div id="hidden" style="display: none"></div>
+<div style="display: none"><svg><path id="hiddenPath" d="M 0 20 L 200 20" /></svg></div>
+<svg width="200" height="40"><text id="textOnHiddenPath"><textPath href="#hiddenPath">Text</textPath></text></svg>
+<div id="hiddenLater"></div>
+<script>
+    test(() => {
+        document.body.offsetWidth;
+
+        hidden.innerHTML = `<svg id="icon"><g id="group"><path d="M 0 0 L 24 24" /></g></svg>`;
+        internals.updateStyle();
+        println(`hidden icon:\n${internals.dumpStyleRecords(hidden).trimEnd()}`);
+
+        hidden.innerHTML = `<svg><defs>
+            <linearGradient id="gradient"><stop /></linearGradient>
+            <pattern id="pattern"><rect /></pattern>
+            <clipPath id="clip"><rect /></clipPath>
+            <mask id="mask"><rect /></mask>
+            <filter id="filter"><feFlood /></filter>
+        </defs></svg>`;
+        internals.updateStyle();
+        println(`hidden resources:\n${internals.dumpStyleRecords(hidden).trimEnd()}`);
+
+        println(`text on the hidden path is laid out: ${textOnHiddenPath.getBBox().width > 0}`);
+
+        hidden.innerHTML = `<svg><path d="M 0 20 L 200 20" /></svg>`;
+        internals.updateStyle();
+        const pathGivenIdLater = hidden.querySelector("path");
+        pathGivenIdLater.id = "pathGivenIdLater";
+        internals.updateStyle();
+        println(`hidden path given an id later:\n${internals.dumpStyleRecords(hidden).trimEnd()}`);
+
+        hiddenLater.innerHTML = `<svg id="iconHiddenLater"><path d="M 0 0 L 24 24" /></svg>`;
+        internals.updateStyle();
+        hiddenLater.style.display = "none";
+        internals.updateStyle();
+        println(`icon hidden later:\n${internals.dumpStyleRecords(hiddenLater).trimEnd()}`);
+    });
+</script>

@@ -9,6 +9,7 @@
 
 #include <AK/Forward.h>
 #include <AK/HashMap.h>
+#include <AK/HashTable.h>
 #include <AK/IDAllocator.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
@@ -22,13 +23,12 @@
 #include <LibWeb/HTML/Scripting/ImportMap.h>
 #include <LibWeb/HTML/Timer.h>
 #include <LibWeb/PerformanceTimeline/PerformanceEntry.h>
-#include <LibWeb/PerformanceTimeline/PerformanceEntryTuple.h>
 #include <LibWeb/WebSockets/WebSocket.h>
 
 namespace Web::HTML {
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#timerhandler
-using TimerHandler = Variant<GC::Ref<WebIDL::CallbackType>, Utf16String>;
+using TimerHandler = Variant<Utf16String, GC::Ref<WebIDL::CallbackType>, GC::Ref<TrustedTypes::TrustedScript>>;
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#windoworworkerglobalscope
 class WEB_API WindowOrWorkerGlobalScopeMixin {
@@ -46,12 +46,13 @@ public:
     WebIDL::ExceptionOr<Utf16String> btoa(Utf16View data) const;
     WebIDL::ExceptionOr<Utf16String> atob(Utf16View data) const;
 
-    i32 set_timeout(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
-    i32 set_interval(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
+    WebIDL::ExceptionOr<i32> set_timeout(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
+    WebIDL::ExceptionOr<i32> set_interval(TimerHandler, i32 timeout, GC::RootVector<JS::Value> arguments);
     void clear_timeout(i32);
     void clear_interval(i32);
     void clear_map_of_active_timers();
     size_t active_timer_count(Badge<Internals::Internals>) const { return m_timers.size(); }
+    Vector<i32> active_timer_ids(Badge<Internals::Internals>) const { return m_timers.keys(); }
 
     void queue_microtask(WebIDL::CallbackType&);
 
@@ -65,29 +66,16 @@ public:
         Yes,
     };
 
-    PerformanceTimeline::PerformanceEntryTuple& relevant_performance_entry_tuple(Utf16FlyString const& entry_type);
     void queue_performance_entry(GC::Ref<PerformanceTimeline::PerformanceEntry> new_entry);
     void add_performance_entry(GC::Ref<PerformanceTimeline::PerformanceEntry> new_entry, CheckIfPerformanceBufferIsFull check_if_performance_buffer_is_full = CheckIfPerformanceBufferIsFull::No);
-    void clear_performance_entry_buffer(Badge<HighResolutionTime::Performance>, Utf16FlyString const& entry_type);
-    void remove_entries_from_performance_entry_buffer(Badge<HighResolutionTime::Performance>, Utf16FlyString const& entry_type, Utf16View entry_name);
-
-    ErrorOr<Vector<GC::Root<PerformanceTimeline::PerformanceEntry>>> filter_buffer_map_by_name_and_type(Optional<Utf16String> const& name, Optional<Utf16FlyString> type) const;
-
-    void register_performance_observer(Badge<PerformanceTimeline::PerformanceObserver>, GC::Ref<PerformanceTimeline::PerformanceObserver>);
-    void unregister_performance_observer(Badge<PerformanceTimeline::PerformanceObserver>, GC::Ref<PerformanceTimeline::PerformanceObserver>);
-    bool has_registered_performance_observer(GC::Ref<PerformanceTimeline::PerformanceObserver>);
-
-    void queue_the_performance_observer_task();
-
-    void set_resource_timing_buffer_size_limit(Badge<HighResolutionTime::Performance>, u32 value) { m_resource_timing_buffer_size_limit = value; }
-    void add_resource_timing_entry(Badge<ResourceTiming::PerformanceResourceTiming>, GC::Ref<ResourceTiming::PerformanceResourceTiming> entry);
 
     void register_event_source(Badge<EventSource>, GC::Ref<EventSource>);
+    void register_permission_status(PermissionsAPI::PermissionStatus&);
     void unregister_event_source(Badge<EventSource>, GC::Ref<EventSource>);
     void forcibly_close_all_event_sources();
 
-    void add_strong_reference_to_broadcast_channel(Badge<BroadcastChannel>, GC::Ref<BroadcastChannel>);
-    void remove_strong_reference_to_broadcast_channel(Badge<BroadcastChannel>, GC::Ref<BroadcastChannel>);
+    void add_strong_reference_to_broadcast_channel(GC::Ref<DOM::EventTarget>);
+    void remove_strong_reference_to_broadcast_channel(GC::Ref<DOM::EventTarget>);
 
     void close_all_idb_connections();
 
@@ -100,7 +88,12 @@ public:
     };
     AffectedAnyWebSockets make_disappear_all_web_sockets();
 
-    i32 run_steps_after_a_timeout(i32 timeout, Function<void()> completion_step);
+    void set_has_pending_activity(DOM::EventTarget&, bool);
+    bool has_pending_activity(DOM::EventTarget const&) const;
+    void clear_objects_with_pending_activity() { m_objects_with_pending_activity.clear(); }
+
+    i32 run_steps_after_a_timeout(u64 timeout, GC::Ref<GC::Function<void()>> completion_step);
+    void cancel_timeout_steps(i32 timer_key);
 
     void document_visibility_state_changed(Badge<DOM::Document>);
     void document_audio_play_state_changed(Badge<DOM::Document>);
@@ -119,14 +112,8 @@ public:
 
     void report_error(JS::Value e);
 
-    enum class OmitError {
-        Yes,
-        No,
-    };
-    void report_an_exception(JS::Value exception, OmitError = OmitError::No);
-
-    GC::Ref<WebIDL::CallbackType> count_queuing_strategy_size_function();
-    GC::Ref<WebIDL::CallbackType> byte_length_queuing_strategy_size_function();
+    bool is_in_error_reporting_mode() const { return m_in_error_reporting_mode; }
+    void set_in_error_reporting_mode(bool value) { m_in_error_reporting_mode = value; }
 
     void push_onto_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise>);
     bool remove_from_outstanding_rejected_promises_weak_set(GC::Ptr<JS::Promise>);
@@ -142,7 +129,7 @@ public:
 
     static void set_experimental_interfaces_exposed(bool);
     static bool expose_experimental_interfaces();
-    static bool expose_experimental_interface(EnvironmentSettingsObject&, StringView name);
+    static bool expose_experimental_interface(EnvironmentSettingsObject const&, StringView name);
 
     [[nodiscard]] GC::Ref<Crypto::Crypto> crypto();
     [[nodiscard]] GC::Ref<ServiceWorker::CacheStorage> caches();
@@ -151,7 +138,6 @@ public:
     [[nodiscard]] GC::Ref<TrustedTypes::TrustedTypePolicyFactory> trusted_types();
 
 protected:
-    void initialize();
     void visit_edges(JS::Cell::Visitor&);
     void finalize();
 
@@ -162,8 +148,10 @@ private:
         Yes,
         No,
     };
-    i32 run_timer_initialization_steps(TimerHandler handler, i32 timeout, GC::RootVector<JS::Value> arguments, Repeat repeat, Optional<i32> previous_id = {});
-    void run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass, Function<void()> completion_step, Optional<i32> timer_key, Repeat repeat = Repeat::No);
+    WebIDL::ExceptionOr<i32> run_timer_initialization_steps(TimerHandler handler, i32 timeout, GC::RootVector<JS::Value> arguments, Repeat repeat, Optional<i32> previous_id = {});
+    bool has_expired_timer_yet_to_fire(double now);
+    void run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass, GC::Ref<GC::Function<void()>> completion_step, Optional<i32> timer_key, Repeat repeat = Repeat::No);
+    void run_internal_timer(i32 timer_key, u64 timeout, GC::Ref<GC::Function<void()>> completion_step);
     bool document_is_hidden() const;
     bool timers_are_throttled() const;
     Optional<i32> throttled_timer_delay(TimerThrottlingClass, double deadline) const;
@@ -171,13 +159,10 @@ private:
 
     void create_image_bitmap_impl(JS::Realm&, GC::Ref<WebIDL::Promise>, ImageBitmapSource& image, Optional<WebIDL::Long> sx, Optional<WebIDL::Long> sy, Optional<WebIDL::Long> sw, Optional<WebIDL::Long> sh, ImageBitmapOptions options) const;
 
-    size_t resource_timing_buffer_current_size();
-    bool can_add_resource_timing_entry();
-    void fire_resource_timing_buffer_full_event();
-    void copy_resource_timing_secondary_buffer();
-
     IDAllocator m_timer_id_allocator;
     HashMap<int, GC::Ref<Timer>> m_timers;
+    HashTable<int> m_internal_timer_ids;
+    double m_earliest_timer_deadline { NumericLimits<double>::max() };
 
     // The interval between the wake-ups a hidden document holds its delayed timers back to; a test can shorten it.
     double m_hidden_document_timer_wake_up_interval { 1000 };
@@ -192,27 +177,13 @@ private:
     // When a chained timer last ran while the document was hidden (see throttled_timer_delay()).
     Optional<double> m_last_chained_timer_wake_up;
 
-    // https://www.w3.org/TR/performance-timeline/#performance-timeline
-    // Each global object has:
-    // - a performance observer task queued flag
-    bool m_performance_observer_task_queued { false };
-
-    // - a list of registered performance observer objects that is initially empty
-    OrderedHashTable<GC::Ref<PerformanceTimeline::PerformanceObserver>> m_registered_performance_observer_objects;
-
-    // https://www.w3.org/TR/performance-timeline/#dfn-performance-entry-buffer-map
-    // a performance entry buffer map map, keyed on a DOMString, representing the entry type to which the buffer belongs. The map's value is the following tuple:
-    // NOTE: See the PerformanceEntryTuple struct above for the map's value tuple.
-    OrderedHashMap<Utf16FlyString, PerformanceTimeline::PerformanceEntryTuple> m_performance_entry_buffer_map;
-
     HashTable<GC::Ref<EventSource>> m_registered_event_sources;
 
     // https://html.spec.whatwg.org/multipage/web-messaging.html#broadcasting-to-other-browsing-contexts
     // The open BroadcastChannel objects with a message or messageerror listener, which this global keeps alive. They're
     // held here rather than rooted — so a channel that's never closed can't keep its global alive.
-    HashTable<GC::Ref<BroadcastChannel>> m_strongly_referenced_broadcast_channels;
-
-    GC::Ptr<HighResolutionTime::Performance> m_performance;
+    HashTable<GC::Ref<DOM::EventTarget>> m_strongly_referenced_broadcast_channels;
+    Vector<GC::Weak<PermissionsAPI::PermissionStatus>> m_permission_statuses;
 
     GC::Ptr<IndexedDB::IDBFactory> m_indexed_db;
 
@@ -222,33 +193,13 @@ private:
 
     GC::Ptr<TrustedTypes::TrustedTypePolicyFactory> m_trusted_type_policy_factory;
 
-    bool m_error_reporting_mode { false };
+    bool m_in_error_reporting_mode { false };
 
     WebSockets::WebSocket::List m_registered_web_sockets;
 
-    // https://w3c.github.io/resource-timing/#sec-extensions-performance-interface
-    // Each ECMAScript global environment has:
-    // https://w3c.github.io/resource-timing/#dfn-resource-timing-buffer-size-limit
-    // A resource timing buffer size limit which should initially be 250 or greater.
-    // The recommended minimum number of PerformanceResourceTiming objects is 250, though this may be changed by the
-    // user agent. setResourceTimingBufferSize can be called to request a change to this limit.
-    u32 m_resource_timing_buffer_size_limit { 250 };
-
-    // https://w3c.github.io/resource-timing/#dfn-resource-timing-buffer-full-event-pending-flag
-    // A resource timing buffer full event pending flag which is initially false.
-    bool m_resource_timing_buffer_full_event_pending { false };
-
-    // https://w3c.github.io/resource-timing/#dfn-resource-timing-secondary-buffer-current-size
-    // A resource timing secondary buffer current size which is initially 0.
-    // https://w3c.github.io/resource-timing/#dfn-resource-timing-secondary-buffer
-    // A resource timing secondary buffer to store PerformanceResourceTiming objects that is initially empty.
-    Vector<GC::Ref<ResourceTiming::PerformanceResourceTiming>> m_resource_timing_secondary_buffer;
-
-    // https://streams.spec.whatwg.org/#count-queuing-strategy-size-function
-    GC::Ptr<WebIDL::CallbackType> m_count_queuing_strategy_size_function;
-
-    // https://streams.spec.whatwg.org/#byte-length-queuing-strategy-size-function
-    GC::Ptr<WebIDL::CallbackType> m_byte_length_queuing_strategy_size_function;
+    // Objects with pending activity, such as a WebSocket with a listener for events still to come, which this global
+    // keeps alive. They're held here rather than rooted, so they can't keep their global alive.
+    HashTable<GC::Ref<DOM::EventTarget>> m_objects_with_pending_activity;
 
     // https://html.spec.whatwg.org/multipage/webappapis.html#about-to-be-notified-rejected-promises-list
     GC::Ptr<GC::HeapVector<GC::Ref<JS::Promise>>> m_about_to_be_notified_rejected_promises_list;

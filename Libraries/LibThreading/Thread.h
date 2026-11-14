@@ -58,7 +58,6 @@ public:
     ~Thread();
 
     ErrorOr<void> set_priority(int priority);
-    ErrorOr<int> get_priority() const;
 
     void set_stack_size(size_t size) { m_stack_size = size; }
     // Only takes effect for threads that have not been started yet.
@@ -66,6 +65,8 @@ public:
 
     // Only callable in the Startable state.
     void start();
+    // For a thread that is not essential: the system may be out of threads. The thread stays Startable then.
+    ErrorOr<void> try_start();
     // Only callable in the Running state.
     void detach();
 

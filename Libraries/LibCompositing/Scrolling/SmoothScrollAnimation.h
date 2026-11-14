@@ -13,6 +13,12 @@
 
 namespace Compositing {
 
+namespace RustFFI {
+
+struct SmoothScrollAnimation;
+
+}
+
 class COMPOSITING_API SmoothScrollAnimation {
 public:
     struct Sample {
@@ -22,15 +28,18 @@ public:
 
     SmoothScrollAnimation(Gfx::FloatPoint start_offset, Gfx::FloatPoint destination_offset, double pixels_per_css_pixel, ScrollAnimationKind = ScrollAnimationKind::SmoothScroll);
 
-    AK::Duration duration() const { return m_duration; }
-    Gfx::FloatPoint destination_offset() const { return m_destination_offset; }
+    ~SmoothScrollAnimation();
+    SmoothScrollAnimation(SmoothScrollAnimation&&);
+    SmoothScrollAnimation& operator=(SmoothScrollAnimation&&);
+    SmoothScrollAnimation(SmoothScrollAnimation const&) = delete;
+    SmoothScrollAnimation& operator=(SmoothScrollAnimation const&) = delete;
+
+    ScrollAnimationKind kind() const;
     Sample sample(AK::Duration elapsed) const;
+    void retarget(Gfx::FloatPoint destination_offset, AK::Duration elapsed);
 
 private:
-    Gfx::FloatPoint m_start_offset;
-    Gfx::FloatPoint m_destination_offset;
-    AK::Duration m_duration;
-    ScrollAnimationKind m_kind { ScrollAnimationKind::SmoothScroll };
+    RustFFI::SmoothScrollAnimation* m_animation;
 };
 
 }

@@ -1,2 +1,0 @@
-[add .match to direct child]
-[add .match to grandchild (should not style anchor)]

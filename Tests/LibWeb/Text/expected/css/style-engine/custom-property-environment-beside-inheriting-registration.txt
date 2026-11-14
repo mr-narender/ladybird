@@ -1,0 +1,2 @@
+inherited value: 10px
+registered value: 20px

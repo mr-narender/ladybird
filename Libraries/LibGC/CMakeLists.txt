@@ -1,17 +1,14 @@
 set(SOURCES
     BlockAllocator.cpp
+    CAPI.cpp
     Cell.cpp
     CellAllocator.cpp
-    ConservativeHashMap.cpp
-    ConservativeHashTable.cpp
-    ConservativeRangeProvider.cpp
-    ConservativeVector.cpp
     CrossHeapMember.cpp
-    ExternalEntityTable.cpp
     Root.cpp
     RootHashMap.cpp
     RootHashTable.cpp
     RootVector.cpp
+    Rootable.cpp
     Heap.cpp
     HeapGroup.cpp
     HeapBlock.cpp
@@ -24,6 +21,12 @@ set(SOURCES
 ladybird_lib(LibGC gc EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibGC PRIVATE LibCore)
 target_link_libraries(LibGC PUBLIC LibThreading)
+
+# The first word of a GC::ForeignCell belongs to its foreign implementation rather than holding a vtable pointer, so
+# UBSan's vptr checks misfire whenever LibGC handles such a cell as a GC::Cell.
+if (ENABLE_UNDEFINED_SANITIZER)
+    target_compile_options(LibGC PRIVATE -fno-sanitize=vptr)
+endif()
 
 if(cpptrace_FOUND AND LADYBIRD_ENABLE_CPPTRACE)
     target_link_libraries(LibGC PRIVATE cpptrace::cpptrace)

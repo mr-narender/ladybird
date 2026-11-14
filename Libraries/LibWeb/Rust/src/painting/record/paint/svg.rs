@@ -6,8 +6,10 @@
 
 use crate::painting::record::trace::Observer;
 
-use crate::css::computed_value_types::{ComputedSvgPaint, SVG_PAINT_COLOR, SVG_PAINT_NONE, SVG_PAINT_URL};
+use crate::css::computed_value_types::SVG_PAINT_URL;
+use crate::css::computed_value_views::ComputedValuesView;
 use crate::css::css_enums::paint_order;
+use crate::css::svg_paint::svg_paint_color;
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::display_list::builder::PendingInlineClip;
 use crate::painting::display_list::commands::DisplayListGradientSpreadMethod;
@@ -16,13 +18,13 @@ use crate::painting::display_list::recorder::{
 };
 use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::{FfiSvgGradientKind, FfiSvgGradientSpreadMethod};
-use crate::painting::node_painting;
+use crate::painting::paint_read::{GeometryRead, PaintRead};
 use crate::painting::paintable_geometry::absolute_rect;
-use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::record::{PaintPhase, PaintRecorder};
 use crate::painting::svg_paint_resources::{
     PublishedSvgGradient, PublishedSvgPaintServer, PublishedSvgPattern, SvgPaintResourceKind,
 };
+use crate::svg::stroke_style::{SvgStrokeStyle, svg_stroke_style_for_percentage_basis};
 use libgfx_rust::{AffineTransform, CapStyle, Color, FloatRect, JoinStyle, ShouldAntiAlias, WindingRule};
 
 #[derive(Clone, Copy, Default)]
@@ -43,35 +45,16 @@ struct SvgPaintFacts {
     non_scaling_stroke: bool,
     paint_order: [u8; 3],
     paint_order_count: u32,
-    has_viewport: bool,
-    viewport: [f32; 4],
     references_paint_server: bool,
-}
-
-pub(crate) fn svg_paint_color(paint: &ComputedSvgPaint) -> Option<u32> {
-    match paint.kind {
-        SVG_PAINT_NONE => None,
-        SVG_PAINT_COLOR => Some(paint.color),
-        _ => paint.has_color.then_some(paint.color),
-    }
 }
 
 fn svg_paint_facts<O: Observer>(
     recorder: &mut PaintRecorder<'_, O>,
     paintable: NodeSlotId,
 ) -> (SvgPaintFacts, Vec<f32>) {
-    use crate::css::css_enums::{fill_rule, stroke_linecap, stroke_linejoin, vector_effect};
-    let layout_arena = recorder.layout_arena;
-    let viewport = layout_arena
-        .node_kind_if_live(paintable)
-        .is_some_and(node_painting::is_svg_path)
-        .then(|| crate::painting::svg_viewport::nearest_svg_viewport_user_rect(layout_arena, paintable))
-        .flatten();
-    let mut facts = SvgPaintFacts {
-        has_viewport: viewport.is_some(),
-        viewport: viewport.map_or([0.0; 4], |rect| [rect.x, rect.y, rect.width, rect.height]),
-        ..SvgPaintFacts::default()
-    };
+    use crate::css::css_enums::fill_rule;
+    let layout_arena = recorder.source;
+    let mut facts = SvgPaintFacts::default();
     let Some(style) = layout_arena.node_style_if_live(paintable) else {
         return (facts, Vec::new());
     };
@@ -95,52 +78,55 @@ fn svg_paint_facts<O: Observer>(
     facts.fill_winding = to_winding(svg.fill_rule);
     facts.fill_opacity = svg.fill_opacity;
     facts.stroke_opacity = svg.stroke_opacity;
-    facts.fill_color = svg_paint_color(&svg.fill);
-    facts.stroke_color = svg_paint_color(&svg.stroke);
+    facts.fill_color = svg_paint_color(&svg.fill, style.current_color());
+    facts.stroke_color = svg_paint_color(&svg.stroke, style.current_color());
     facts.references_paint_server = svg.fill.kind == SVG_PAINT_URL || svg.stroke.kind == SVG_PAINT_URL;
-    facts.cap_style = match svg.stroke_linecap {
-        stroke_linecap::ROUND => CapStyle::Round,
-        stroke_linecap::SQUARE => CapStyle::Square,
-        _ => CapStyle::Butt,
-    };
-    facts.join_style = match svg.stroke_linejoin {
-        stroke_linejoin::ROUND => JoinStyle::Round,
-        stroke_linejoin::BEVEL => JoinStyle::Bevel,
-        _ => JoinStyle::Miter,
-    };
-    facts.miter_limit = svg.stroke_miterlimit as f32;
-    facts.non_scaling_stroke = style.svg_reset().vector_effect == vector_effect::NON_SCALING_STROKE;
+    let stroke = svg_stroke_style(layout_arena, paintable, &style);
+    facts.cap_style = stroke.cap_style;
+    facts.join_style = stroke.join_style;
+    facts.miter_limit = stroke.miter_limit;
+    facts.non_scaling_stroke = stroke.non_scaling_stroke;
     facts.paint_order = svg.paint_order;
     facts.paint_order_count = 3;
+    facts.stroke_width = stroke.width;
+    facts.stroke_dashoffset = stroke.dash_offset;
+    (facts, stroke.dash_array)
+}
 
-    let basis = crate::painting::paintable_geometry::committed_svg_viewport_percentage_basis(layout_arena, paintable);
-    let resolve = |handle: &crate::css::computed_value_types::ComputedStyleValueHandle, default: f32| {
-        handle
-            .length_percentage()
-            .map_or(default, |value| value.to_px(basis).to_double() as f32)
-    };
-    facts.stroke_width = resolve(&svg.stroke_width, 1.0);
-    facts.stroke_dashoffset = resolve(&svg.stroke_dashoffset, 0.0);
-
-    let mut dash_array: Vec<f32> = svg
-        .stroke_dasharray
-        .as_slice()
-        .iter()
-        .map(|dash| {
-            if dash.is_number {
-                dash.number as f32
-            } else {
-                resolve(&dash.value, 0.0)
-            }
-        })
-        .collect();
-    if dash_array.len() % 2 == 1 {
-        dash_array.extend_from_within(..);
+pub(crate) fn svg_stroke_style(
+    layout_arena: &impl GeometryRead,
+    paintable: NodeSlotId,
+    style: &ComputedValuesView<'_>,
+) -> SvgStrokeStyle {
+    let basis = crate::painting::paintable_geometry::committed_svg_geometry(layout_arena, paintable)
+        .map_or_else(Default::default, |geometry| geometry.percentage_basis());
+    let mut stroke = svg_stroke_style_for_percentage_basis(style, basis);
+    if !stroke.dash_array.is_empty()
+        && let Some(path_length) =
+            crate::painting::paintable_geometry::committed_svg_author_path_length(layout_arena, paintable)
+    {
+        // https://svgwg.org/svg2-draft/paths.html#PathLengthAttribute
+        // The user agent will scale all distance-along-a-path computations by the ratio of 'pathLength' to the user
+        // agent's own computed value for total path length.
+        // AD-HOC: The spec says "'pathLength' has no effect on percentage distance-along-a-path calculations", but a
+        //         percentage in the dash array or offset is resolved first and then scaled like any other length, for
+        //         web compatibility.
+        if path_length == 0.0 {
+            // A value of zero is valid and must be treated as a scaling factor of infinity. A value of zero scaled
+            // infinitely must remain zero, while any non-percentage value greater than zero must become +Infinity.
+            // AD-HOC: The stroke draws solid, for web compatibility, rather than keeping each zero-length dash or
+            //         gap at zero; that's the same stroke for any dash array without a zero in it.
+            stroke.dash_array.clear();
+            stroke.dash_offset = 0.0;
+        } else if path_length > 0.0
+            && let Some(path) = crate::painting::paintable_geometry::committed_svg_path(layout_arena, paintable)
+        {
+            let scale = path.length() / path_length;
+            stroke.dash_array.iter_mut().for_each(|dash| *dash *= scale);
+            stroke.dash_offset *= scale;
+        }
     }
-    if dash_array.iter().any(|value| *value < 0.0) || dash_array.iter().all(|value| *value == 0.0) {
-        dash_array.clear();
-    }
-    (facts, dash_array)
+    stroke
 }
 
 fn should_anti_alias(value: bool) -> ShouldAntiAlias {
@@ -184,7 +170,7 @@ fn gradient_paint_transform(
 
 fn gradient_paint_style(gradient: &PublishedSvgGradient, paint_context: &SvgPaintContext) -> PaintStyle {
     let description = &gradient.description;
-    let bounding_box = paint_context.path_bounding_box;
+    let bounding_box = paint_context.object_bounding_box;
     let viewport = paint_context.viewport;
     let point_in_bounding_box = |x: f32, y: f32| libgfx_rust::FloatPoint {
         x: bounding_box.x + x * bounding_box.width,
@@ -260,7 +246,9 @@ fn gradient_paint_style(gradient: &PublishedSvgGradient, paint_context: &SvgPain
 
 pub(crate) struct SvgPaintContext {
     pub viewport: FloatRect,
+    /// The bounds of the path as recorded, from which a gradient is positioned when it is drawn.
     pub path_bounding_box: FloatRect,
+    pub object_bounding_box: FloatRect,
     pub paint_transform: AffineTransform,
     pub content_scale: libgfx_rust::FloatSize,
 }
@@ -273,10 +261,10 @@ fn pattern_paint_style<O: Observer>(
     use libgfx_rust::matrix::{affine_to_matrix, multiply_affine};
     let description = &pattern.description;
     let pattern_box = description.pattern_box;
-    if !recorder.layout_arena.paintable_row_is_populated(pattern_box) {
+    if !recorder.source.paintable_row_is_populated(pattern_box) {
         return None;
     }
-    let bounding_box = paint_context.path_bounding_box;
+    let bounding_box = paint_context.object_bounding_box;
     let viewport = paint_context.viewport;
     let (tile_x, tile_y, tile_width, tile_height) = if description.units_are_object_bounding_box {
         (
@@ -331,14 +319,14 @@ fn pattern_paint_style<O: Observer>(
             .has_value
             .then_some(description.pattern_transform_attribute.value)
     } else {
-        let pattern_box_style = recorder.layout_arena.node_style_if_live(pattern_box)?;
+        let pattern_box_style = recorder.source.node_style_if_live(pattern_box)?;
         let reference_box = crate::painting::visual_context::node_values::transform_reference_box(
             pattern_box_style,
-            recorder.layout_arena,
+            recorder.source,
             pattern_box,
         );
         Some(
-            crate::painting::visual_context::node_values::multiply_transform_functions(
+            crate::css::transform_functions::multiply_transform_functions(
                 libgfx_rust::FloatMatrix4x4::identity(),
                 &pattern.css_transform,
                 reference_box,
@@ -358,8 +346,15 @@ fn pattern_paint_style<O: Observer>(
             };
         }
     }
+    // The player rasterizes the tile records into a surface of this size.
+    let tile_surface_rect = FloatRect::new(
+        0.0,
+        0.0,
+        (tile_rect.width * content_scale.width).ceil(),
+        (tile_rect.height * content_scale.height).ceil(),
+    );
     Some(PaintStyle::Pattern {
-        tile_records: recorder.pattern_tile_records(pattern_box, tile_content_transform),
+        tile_records: recorder.pattern_tile_records(pattern_box, tile_content_transform, tile_surface_rect),
         tile_rect,
         content_scale,
         pattern_transform,
@@ -377,10 +372,7 @@ fn paint_server_style<O: Observer>(
     } else {
         SvgPaintResourceKind::Fill
     };
-    let published = recorder
-        .layout_arena
-        .svg_paint_resources()
-        .published_paint_server(paintable, kind)?;
+    let published = recorder.source.published_svg_paint_server(paintable, kind)?;
     match &*published {
         PublishedSvgPaintServer::Gradient(gradient) => Some(gradient_paint_style(gradient, paint_context)),
         PublishedSvgPaintServer::Pattern(pattern) => pattern_paint_style(recorder, pattern, paint_context),
@@ -389,18 +381,18 @@ fn paint_server_style<O: Observer>(
 }
 
 fn references_pattern<O: Observer>(recorder: &PaintRecorder<'_, O>, paintable: NodeSlotId) -> bool {
-    let resources = recorder.layout_arena.svg_paint_resources();
     [SvgPaintResourceKind::Fill, SvgPaintResourceKind::Stroke]
         .iter()
         .any(|kind| {
-            resources
-                .published_paint_server(paintable, *kind)
+            recorder
+                .source
+                .published_svg_paint_server(paintable, *kind)
                 .is_some_and(|published| matches!(&*published, PublishedSvgPaintServer::Pattern(_)))
         })
 }
 
 pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paintable: NodeSlotId, phase: PaintPhase) {
-    let Some(computed_path) = crate::painting::paintable_geometry::committed_svg_path(recorder.layout_arena, paintable)
+    let Some(computed_path) = crate::painting::paintable_geometry::committed_svg_path(recorder.source, paintable)
     else {
         return;
     };
@@ -410,7 +402,7 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
     // published by the paint resource sync, which pushes damage on the shapes using it.
     let output_is_resolved_through_another_element = (facts.references_paint_server
         && references_pattern(recorder, paintable))
-        || recorder.layout_arena.node_kind_if_live(paintable) == Some(NodeKind::SVGTextPathBox);
+        || recorder.source.node_kind_if_live(paintable) == Some(NodeKind::SVGTextPathBox);
     if output_is_resolved_through_another_element {
         recorder.mark_live_producer();
     }
@@ -449,13 +441,12 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
         return;
     }
 
+    let geometry =
+        crate::painting::paintable_geometry::committed_svg_geometry(recorder.source, paintable).unwrap_or_default();
     let paint_context = SvgPaintContext {
-        viewport: if facts.has_viewport {
-            FloatRect::from_array(facts.viewport)
-        } else {
-            FloatRect::default()
-        },
+        viewport: geometry.viewport_user_rect,
         path_bounding_box: FloatRect::from_array(computed_path.bounding_box()),
+        object_bounding_box: geometry.object_bounding_box,
         paint_transform: affine(paint_transform),
         content_scale: recorder.own_accumulated_2d_scale(paintable),
     };
@@ -541,7 +532,7 @@ pub(crate) fn paint_path<O: Observer>(recorder: &mut PaintRecorder<'_, O>, paint
 }
 
 pub(crate) fn svg_image_unquantized_device_rect(
-    layout_arena: &impl PaintableRowsRead,
+    layout_arena: &impl PaintRead,
     paintable: NodeSlotId,
     pixel_ratio: f64,
 ) -> FloatRect {
@@ -552,6 +543,43 @@ pub(crate) fn svg_image_unquantized_device_rect(
         css_rect.y.to_float() * device_scale,
         css_rect.width.to_float() * device_scale,
         css_rect.height.to_float() * device_scale,
+    )
+}
+
+// https://svgwg.org/svg2-draft/coords.html#PreserveAspectRatioAttribute
+// Where an image of `natural_size` is drawn to fit `image_rect` as its preserveAspectRatio says, taking its own size as
+// its view box.
+fn image_draw_rect(image_rect: FloatRect, natural_size: (f32, f32), align: u8, meet_or_slice: u8) -> FloatRect {
+    use crate::layout::svg_formatting_context::{
+        MEET_OR_SLICE_SLICE, PRESERVE_ASPECT_RATIO_NONE, PRESERVE_ASPECT_RATIO_X_MIN_Y_MIN,
+    };
+    // NB: With "none", the image is scaled non-uniformly to fill the rectangle exactly.
+    if natural_size.0 <= 0.0 || natural_size.1 <= 0.0 || align == PRESERVE_ASPECT_RATIO_NONE {
+        return image_rect;
+    }
+    let scale_x = image_rect.width / natural_size.0;
+    let scale_y = image_rect.height / natural_size.1;
+    // "meet" shows all of the image within the rectangle; "slice" covers all of the rectangle with the image.
+    let scale = if meet_or_slice == MEET_OR_SLICE_SLICE {
+        scale_x.max(scale_y)
+    } else {
+        scale_x.min(scale_y)
+    };
+    let width = natural_size.0 * scale;
+    let height = natural_size.1 * scale;
+    // NB: The alignments count up from xMinYMin through min, mid and max along x, then through min, mid and max along
+    //     y, each putting none, half or all of the space left over before the image.
+    let alignment = align.saturating_sub(PRESERVE_ASPECT_RATIO_X_MIN_Y_MIN);
+    let offset = |alignment_in_axis: u8, free_space: f32| match alignment_in_axis {
+        0 => 0.0,
+        1 => free_space / 2.0,
+        _ => free_space,
+    };
+    FloatRect::new(
+        image_rect.x + offset(alignment % 3, image_rect.width - width),
+        image_rect.y + offset(alignment / 3, image_rect.height - height),
+        width,
+        height,
     )
 }
 
@@ -575,7 +603,7 @@ pub(crate) fn paint_image_element<O: Observer>(
     }
 
     let image = recorder
-        .layout_arena
+        .source
         .replaced_paint_facts(paintable)
         .and_then(|facts| facts.image())
         .unwrap_or_default();
@@ -583,28 +611,18 @@ pub(crate) fn paint_image_element<O: Observer>(
         return;
     }
 
-    let image_rect = svg_image_unquantized_device_rect(
-        recorder.layout_arena,
-        paintable,
-        recorder.inputs.device_pixels_per_css_pixel,
-    );
+    let image_rect =
+        svg_image_unquantized_device_rect(recorder.source, paintable, recorder.inputs.device_pixels_per_css_pixel);
     let natural_size = match (image.natural.width, image.natural.height) {
         (Some(width), Some(height)) => (width.to_float(), height.to_float()),
         _ => (image_rect.width, image_rect.height),
     };
-    // FIXME: Respect the preserveAspectRatio attribute instead of assuming its default value.
-    let mut draw_rect = image_rect;
-    if natural_size.0 > 0.0 && natural_size.1 > 0.0 {
-        let contain_scale = (image_rect.width / natural_size.0).min(image_rect.height / natural_size.1);
-        let width = natural_size.0 * contain_scale;
-        let height = natural_size.1 * contain_scale;
-        draw_rect = FloatRect::new(
-            image_rect.x + image_rect.width / 2.0 - width / 2.0,
-            image_rect.y + image_rect.height / 2.0 - height / 2.0,
-            width,
-            height,
-        );
-    }
+    let draw_rect = image_draw_rect(
+        image_rect,
+        natural_size,
+        image.preserve_aspect_ratio_align,
+        image.preserve_aspect_ratio_meet_or_slice,
+    );
     if draw_rect.is_empty() {
         return;
     }
@@ -614,13 +632,12 @@ pub(crate) fn paint_image_element<O: Observer>(
     // rectangle defined by the geometry properties.
     let (overflow_is_visible, image_rendering) =
         recorder
-            .layout_arena
+            .source
             .node_style_if_live(paintable)
             .map_or((false, 0), |style| {
                 use crate::css::css_enums::overflow;
                 (
-                    style.box_values().overflow_x == overflow::VISIBLE
-                        && style.box_values().overflow_y == overflow::VISIBLE,
+                    style.overflow_x() == overflow::VISIBLE && style.overflow_y() == overflow::VISIBLE,
                     style.image_rendering(),
                 )
             });

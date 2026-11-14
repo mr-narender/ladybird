@@ -1,0 +1,3 @@
+@font-feature-values nobody uses: restyled []
+@font-feature-values one element uses: restyled [fancy]
+@font-feature-values removed: restyled [fancy]

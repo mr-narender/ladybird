@@ -7,12 +7,19 @@
 #include <AK/JsonArray.h>
 #include <AK/Platform.h>
 #include <AK/Utf16String.h>
+#include <LibCore/BrowserVersion.h>
+#include <LibCore/EventLoop.h>
 #include <LibCore/GeolocationProvider.h>
+#include <LibCore/Promise.h>
 #include <LibURL/Parser.h>
 #include <LibWebCommon/HTML/AutoplayPolicy.h>
 #include <LibWebView/Application.h>
+#include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CrashReport.h>
+#include <LibWebView/CrashReportStore.h>
+#include <LibWebView/PermissionManager.h>
 #include <LibWebView/SearchEngine.h>
+#include <LibWebView/WebContentClient.h>
 #include <LibWebView/WebUI/SettingsUI.h>
 
 namespace WebView {
@@ -39,42 +46,109 @@ static StringView config_variable_type_to_string(JsonValue::Type type)
 
 static bool should_show_config_variable(ConfigVariableID id)
 {
+    // NB: The Debug menu has the toggle for this one.
+    if (id == ConfigVariableID::ShowTabPerformanceMonitor)
+        return false;
+    if (id == ConfigVariableID::ShowFeedbackButton)
+        return !BROWSER_IS_FINAL_RELEASE;
     if (id == ConfigVariableID::UseClientSideWindowDecorations)
         return Application::the().supports_client_side_window_decorations();
+    if (id == ConfigVariableID::VerticalTabsHoverExpandDelay || id == ConfigVariableID::VerticalTabsHoverExpandAnimationDuration)
+        return Application::the().supports_vertical_tabs();
     return true;
+}
+
+SettingsUISitePermissionsObserver::SettingsUISitePermissionsObserver(SettingsUI& settings_ui)
+    : m_settings_ui(settings_ui)
+    , m_manager(*Application::default_session().permission_manager)
+{
+    m_manager->register_observer(*this);
+}
+
+// The settings page can outlive the browsing session at shutdown.
+SettingsUISitePermissionsObserver::~SettingsUISitePermissionsObserver()
+{
+    if (auto* manager = m_manager.ptr())
+        manager->unregister_observer(*this);
+}
+
+void SettingsUISitePermissionsObserver::permissions_changed(PermissionManager const&)
+{
+    m_settings_ui.broadcast_settings_change();
 }
 
 void SettingsUI::register_interfaces()
 {
-    register_interface("showCrashReports"sv, [this](auto const&) {
-        if (!CrashReport::is_supported()) {
-            async_send_message("crashReportsStatus"sv, "Crash reporting is not available on this platform yet."_string);
-            return;
-        }
-        auto result = CrashReport::show_directory();
-        async_send_message("crashReportsStatus"sv, result.is_error() ? "Could not open the crash reports folder."_string : String {});
-    });
+    m_site_permissions_observer = make<SettingsUISitePermissionsObserver>(*this);
+
     register_interface("loadFeatures"sv, [this](auto const&) {
         load_features();
     });
     register_interface("loadCurrentSettings"sv, [this](auto const&) {
         load_current_settings();
     });
-
-    register_interface("setNewTabPageURL"sv, [this](auto const& data) {
-        set_new_tab_page_url(data);
+    register_interface("refreshSettings"sv, [this](auto const&) {
+        broadcast_settings_change();
     });
-    register_interface("setLanguages"sv, [this](auto const& data) {
-        set_languages(data);
+    register_interface("loadAvailableEngines"sv, [this](auto const&) {
+        load_available_engines();
+    });
+
+    register_interface("setTabSettings"sv, [this](auto const& data) {
+        set_tab_settings(data);
+    });
+    register_interface("setSearchEngineSettings"sv, [this](auto const& data) {
+        set_search_engine_settings(data);
+    });
+    register_interface("setContentBlockerEnabled"sv, [this](auto const& data) {
+        set_content_blocker_enabled(data);
+    });
+    register_interface("setContentBlockerEnabledForSite"sv, [this](auto const& data) {
+        set_content_blocker_enabled_for_site(data);
+    });
+    register_interface("setContentBlockerListEnabled"sv, [this](auto const& data) {
+        set_content_blocker_list_enabled(data);
+    });
+    register_interface("setFilterListUpdatesEnabled"sv, [this](auto const& data) {
+        set_filter_list_updates_enabled(data);
     });
     register_interface("setAppearance"sv, [this](auto const& data) {
         set_appearance(data);
     });
+
+    if (host() == "welcome"sv) {
+        register_interface("completeFirstRun"sv, [this](auto const& data) {
+            complete_first_run(data);
+        });
+        return;
+    }
+
+    register_interface("loadCrashReportsWaiting"sv, [this](auto const&) {
+        crash_reports_changed();
+    });
+    register_interface("showCrashReports"sv, [this](auto const&) {
+        if (!CrashReport::is_supported()) {
+            async_send_message("crashReportsStatus"sv, "Crash reporting is not available on this platform yet."_string);
+            return;
+        }
+        auto result = CrashReportStore::the().show_directory();
+        async_send_message("crashReportsStatus"sv, result.is_error() ? "Could not open the crash reports folder."_string : String {});
+    });
+
+    register_interface("setNewTabPageURL"sv, [this](auto const& data) {
+        set_new_tab_page_url(data);
+    });
+    register_interface("setRestorePreviousSession"sv, [this](auto const& data) {
+        set_restore_previous_session(data);
+    });
+    register_interface("setLanguages"sv, [this](auto const& data) {
+        set_languages(data);
+    });
+    register_interface("resetHostSetting"sv, [this](auto const& data) {
+        reset_host_setting(data);
+    });
     register_interface("setContentSettings"sv, [this](auto const& data) {
         set_content_settings(data);
-    });
-    register_interface("setTabSettings"sv, [this](auto const& data) {
-        set_tab_settings(data);
     });
     register_interface("setBrowsingBehavior"sv, [this](auto const& data) {
         set_browsing_behavior(data);
@@ -83,20 +157,11 @@ void SettingsUI::register_interfaces()
         set_config_variable(data);
     });
 
-    register_interface("loadAvailableEngines"sv, [this](auto const&) {
-        load_available_engines();
-    });
-    register_interface("setSearchEngine"sv, [this](auto const& data) {
-        set_search_engine(data);
-    });
     register_interface("addCustomSearchEngine"sv, [this](auto const& data) {
         add_custom_search_engine(data);
     });
     register_interface("removeCustomSearchEngine"sv, [this](auto const& data) {
         remove_custom_search_engine(data);
-    });
-    register_interface("setAutocompleteEngine"sv, [this](auto const& data) {
-        set_autocomplete_engine(data);
     });
 
     register_interface("loadForciblyEnabledSiteSettings"sv, [this](auto const&) {
@@ -114,15 +179,9 @@ void SettingsUI::register_interfaces()
     register_interface("removeAllSiteSettingFilters"sv, [this](auto const& data) {
         remove_all_site_setting_filters(data);
     });
-    register_interface("setGeolocationEnabled"sv, [this](auto const& data) {
-        set_geolocation_enabled(data);
-    });
 
     register_interface("estimateBrowsingDataSizes"sv, [this](auto const& data) {
         estimate_browsing_data_sizes(data);
-    });
-    register_interface("setBrowsingDataSettings"sv, [this](auto const& data) {
-        set_browsing_data_settings(data);
     });
     register_interface("clearBrowsingData"sv, [this](auto const& data) {
         clear_browsing_data(data);
@@ -130,18 +189,15 @@ void SettingsUI::register_interfaces()
     register_interface("setGlobalPrivacyControl"sv, [this](auto const& data) {
         set_global_privacy_control(data);
     });
+    register_interface("setCrashReportSending"sv, [this](auto const& data) {
+        set_crash_report_sending(data);
+    });
 
     register_interface("setServicesNetworkAccessEnabled"sv, [this](auto const& data) {
         set_services_network_access_enabled(data);
     });
-    register_interface("setFilterListUpdatesEnabled"sv, [this](auto const& data) {
-        set_filter_list_updates_enabled(data);
-    });
     register_interface("updateContentBlockerLists"sv, [this](auto const& data) {
         update_content_blocker_lists(data);
-    });
-    register_interface("setContentBlockerListEnabled"sv, [this](auto const& data) {
-        set_content_blocker_list_enabled(data);
     });
     register_interface("addCustomContentBlockerSubscription"sv, [this](auto const& data) {
         add_custom_content_blocker_subscription(data);
@@ -174,9 +230,42 @@ void SettingsUI::load_features()
     async_send_message("loadFeatures"sv, move(features));
 }
 
-void SettingsUI::load_current_settings()
+JsonObject SettingsUI::serialize_settings() const
 {
-    auto settings = Application::settings().serialize_json();
+    auto settings_json = Application::settings().serialize_json();
+    auto settings = move(settings_json.as_object());
+
+    settings.set("defaultNewTabPageURL"sv, Settings::default_new_tab_page_url().serialize());
+
+    // The sites the user allowed or blocked, for each permission.
+    JsonObject site_settings;
+    site_settings.set("autoplay"sv, settings.get("autoplay"sv).value());
+    for (auto name : Web::Permissions::PERMISSION_NAMES) {
+        JsonArray sites;
+        for (auto const& site : Application::default_session().permission_manager->site_decisions(name)) {
+            JsonObject entry;
+            entry.set("filter"sv, site.origin.serialize());
+            switch (site.decision) {
+            case PermissionDecision::Allow:
+                entry.set("policy"sv, "allow"_string);
+                break;
+            case PermissionDecision::AllowOnce:
+                entry.set("policy"sv, "allow-once"_string);
+                break;
+            case PermissionDecision::Block:
+                entry.set("policy"sv, "block"_string);
+                break;
+            }
+            sites.must_append(move(entry));
+        }
+
+        JsonObject setting;
+        setting.set("policy"sv, Application::settings().permission_policy(name) == PermissionPolicy::Block ? "block"sv : "ask"sv);
+        setting.set("siteFilters"sv, move(sites));
+        site_settings.set(Web::Permissions::to_string(name), move(setting));
+    }
+
+    settings.set("siteSettings"sv, move(site_settings));
 
     JsonArray config_variables;
     for (auto const& variable : config_variable_definitions()) {
@@ -196,7 +285,7 @@ void SettingsUI::load_current_settings()
         config_variables.must_append(move(variable_object));
     }
 
-    settings.as_object().set("configVariableDefinitions"sv, move(config_variables));
+    settings.set("configVariableDefinitions"sv, move(config_variables));
 
     JsonArray lists;
     for (auto const& list : Application::settings().content_blocker_lists()) {
@@ -212,10 +301,61 @@ void SettingsUI::load_current_settings()
         object.set("lastUpdatedAt"sv, updated.has_value() ? JsonValue(updated->milliseconds_since_epoch()) : JsonValue {});
         lists.must_append(move(object));
     }
-    settings.as_object().set("contentBlockerLists"sv, move(lists));
-    settings.as_object().set("contentBlockerListUpdateInProgress"sv, Application::the().content_blocker_list_update_in_progress());
+    settings.set("contentBlockerLists"sv, move(lists));
+    settings.set("contentBlockerListUpdateInProgress"sv, Application::the().content_blocker_list_update_in_progress());
 
-    async_send_message("loadSettings"sv, settings);
+    return settings;
+}
+
+void SettingsUI::load_current_settings()
+{
+    m_current_settings = serialize_settings();
+    async_send_message("loadSettings"sv, *m_current_settings);
+}
+
+void SettingsUI::broadcast_settings_change()
+{
+    if (!m_current_settings.has_value() || m_settings_change_scheduled)
+        return;
+    m_settings_change_scheduled = true;
+
+    // Defer to allow the current handler to finish, including any downloads started after changing a setting.
+    Core::deferred_invoke([weak_this = make_weak_ptr<SettingsUI>()] {
+        auto* self = weak_this.ptr();
+        if (!self)
+            return;
+
+        auto settings = self->serialize_settings();
+        JsonObject changes;
+
+        settings.for_each_member([&](auto const& name, auto const& value) {
+            auto previous = self->m_current_settings->get(name);
+            if (!previous.has_value() || !previous->equals(value))
+                changes.set(name, value);
+        });
+
+        self->m_current_settings->for_each_member([&](auto const& name, auto const&) {
+            if (!settings.has(name))
+                changes.set(name, JsonValue {});
+        });
+        self->m_current_settings = move(settings);
+        self->m_settings_change_scheduled = false;
+
+        if (!changes.is_empty())
+            self->async_send_message("loadSettings"sv, changes);
+    });
+}
+
+void SettingsUI::complete_first_run(JsonValue const&)
+{
+    auto& settings = Application::settings();
+
+    if (auto result = settings.complete_first_run(); result.is_error()) {
+        async_send_message("firstRunError"sv, "Could not save your settings. Please try again."_string);
+        return;
+    }
+
+    async_send_message("firstRunCompleted"sv, settings.new_tab_page_url().serialize());
 }
 
 void SettingsUI::set_new_tab_page_url(JsonValue const& new_tab_page_url)
@@ -230,20 +370,24 @@ void SettingsUI::set_new_tab_page_url(JsonValue const& new_tab_page_url)
     Application::settings().set_new_tab_page_url(parsed_new_tab_page_url.release_value());
 }
 
+void SettingsUI::set_restore_previous_session(JsonValue const& restore_previous_session)
+{
+    if (!restore_previous_session.is_bool())
+        return;
+
+    Application::settings().set_restore_previous_session(restore_previous_session.as_bool());
+}
+
 void SettingsUI::set_languages(JsonValue const& languages)
 {
     auto parsed_languages = Settings::parse_json_languages(languages);
     Application::settings().set_languages(move(parsed_languages));
-
-    load_current_settings();
 }
 
 void SettingsUI::set_appearance(JsonValue const& appearance)
 {
     auto parsed_appearance = Settings::parse_appearance(appearance);
     Application::settings().set_appearance(parsed_appearance);
-
-    load_current_settings();
 }
 
 void SettingsUI::set_content_settings(JsonValue const& content_settings)
@@ -252,11 +396,29 @@ void SettingsUI::set_content_settings(JsonValue const& content_settings)
     auto parsed_content_settings = Settings::parse_content_settings(content_settings);
     auto const& current_content_settings = settings.content_settings();
 
-    // Zoom-per-host is not controlled by the settings UI. Don't overwrite it.
+    // Host choices change through their own controls, independently of edits to the default.
     parsed_content_settings.zoom_per_host = current_content_settings.zoom_per_host;
+    parsed_content_settings.force_dark_per_host = current_content_settings.force_dark_per_host;
 
     Application::settings().set_content_settings(move(parsed_content_settings));
-    load_current_settings();
+}
+
+void SettingsUI::reset_host_setting(JsonValue const& data)
+{
+    if (!data.is_object())
+        return;
+
+    auto setting = data.as_object().get_string("setting"sv);
+    auto host = data.as_object().get_string("host"sv);
+    if (data.as_object().has("host"sv) && !host.has_value())
+        return;
+
+    auto host_view = host.map([](auto const& value) { return value.bytes_as_string_view(); });
+
+    if (setting == "zoom"sv)
+        Application::settings().reset_host_setting(HostSetting::Zoom, host_view);
+    else if (setting == "force-dark"sv)
+        Application::settings().reset_host_setting(HostSetting::ForceDark, host_view);
 }
 
 void SettingsUI::set_tab_settings(JsonValue const& tab_settings)
@@ -269,16 +431,17 @@ void SettingsUI::set_tab_settings(JsonValue const& tab_settings)
     parsed_tab_settings.vertical_tabs_expanded = current_tab_settings.vertical_tabs_expanded;
     parsed_tab_settings.vertical_tabs_expanded_width = current_tab_settings.vertical_tabs_expanded_width;
 
+    // NB: A sidebar layout picked on the welcome page opens expanded, so the choice shows in the window at once.
+    if (host() == "welcome"sv && parsed_tab_settings.vertical_tabs_enabled)
+        parsed_tab_settings.vertical_tabs_expanded = true;
+
     settings.set_tab_settings(parsed_tab_settings);
-    load_current_settings();
 }
 
 void SettingsUI::set_browsing_behavior(JsonValue const& browsing_behavior)
 {
     auto parsed_browsing_behavior = Settings::parse_browsing_behavior(browsing_behavior);
     Application::settings().set_browsing_behavior(parsed_browsing_behavior);
-
-    load_current_settings();
 }
 
 void SettingsUI::set_config_variable(JsonValue const& variable)
@@ -292,88 +455,52 @@ void SettingsUI::set_config_variable(JsonValue const& variable)
         return;
 
     Application::settings().set_config_variable(*name, *value);
-
-    load_current_settings();
 }
 
 void SettingsUI::load_available_engines()
 {
     JsonArray search_engines;
-    for (auto const& engine : WebView::builtin_search_engines())
-        search_engines.must_append(engine.name);
-
-    JsonArray autocomplete_engines;
-    for (auto const& engine : WebView::autocomplete_engines())
-        autocomplete_engines.must_append(engine.name);
+    for (auto const& engine : WebView::builtin_search_engines()) {
+        JsonObject object;
+        object.set("name"sv, engine.name);
+        object.set("supportsSuggestions"sv, engine.suggestions.has_value());
+        search_engines.must_append(move(object));
+    }
 
     JsonObject engines;
     engines.set("search"sv, move(search_engines));
-    engines.set("autocomplete"sv, move(autocomplete_engines));
 
     async_send_message("loadEngines"sv, move(engines));
 }
 
-void SettingsUI::set_search_engine(JsonValue const& search_engine)
+void SettingsUI::set_search_engine_settings(JsonValue const& data)
 {
-    if (search_engine.is_null()) {
-        Application::settings().set_search_engine({});
-        Application::settings().set_autocomplete_engine(OptionalNone {});
-    } else if (search_engine.is_string()) {
-        Application::settings().set_search_engine(search_engine.as_string());
-    }
+    if (!data.is_object())
+        return;
 
-    load_current_settings();
+    auto engine = data.as_object().get("engine"sv);
+    auto suggestions = data.as_object().get_bool("suggestions"sv);
+    if (!engine.has_value() || (!engine->is_null() && !engine->is_string()) || !suggestions.has_value())
+        return;
+
+    auto& settings = Application::settings();
+    SearchEngineSettings search_engine_settings;
+    if (engine->is_string())
+        search_engine_settings.engine = settings.find_search_engine_by_name(engine->as_string());
+    search_engine_settings.suggestions = *suggestions;
+    settings.set_search_engine_settings(move(search_engine_settings));
 }
 
 void SettingsUI::add_custom_search_engine(JsonValue const& search_engine)
 {
     if (auto custom_engine = Settings::parse_custom_search_engine(search_engine); custom_engine.has_value())
         Application::settings().add_custom_search_engine(custom_engine.release_value());
-
-    load_current_settings();
 }
 
 void SettingsUI::remove_custom_search_engine(JsonValue const& search_engine)
 {
     if (auto custom_engine = Settings::parse_custom_search_engine(search_engine); custom_engine.has_value())
         Application::settings().remove_custom_search_engine(*custom_engine);
-
-    load_current_settings();
-}
-
-void SettingsUI::set_autocomplete_engine(JsonValue const& autocomplete_engine)
-{
-    if (autocomplete_engine.is_null())
-        Application::settings().set_autocomplete_engine(OptionalNone {});
-    else if (autocomplete_engine.is_string())
-        Application::settings().set_autocomplete_engine(autocomplete_engine.as_string());
-}
-
-enum class SiteSettingType {
-    Autoplay,
-};
-
-static constexpr StringView site_setting_type_to_string(SiteSettingType setting)
-{
-    switch (setting) {
-    case SiteSettingType::Autoplay:
-        return "autoplay"sv;
-    }
-    VERIFY_NOT_REACHED();
-}
-
-static Optional<SiteSettingType> site_setting_type(JsonValue const& settings)
-{
-    if (!settings.is_object())
-        return {};
-
-    auto setting_type = settings.as_object().get_string("setting"sv);
-    if (!setting_type.has_value())
-        return {};
-
-    if (*setting_type == "autoplay"sv)
-        return SiteSettingType::Autoplay;
-    return {};
 }
 
 void SettingsUI::load_forcibly_enabled_site_settings()
@@ -381,92 +508,111 @@ void SettingsUI::load_forcibly_enabled_site_settings()
     JsonArray site_settings;
 
     if (Application::web_content_options().enable_autoplay == EnableAutoplay::Yes)
-        site_settings.must_append(site_setting_type_to_string(SiteSettingType::Autoplay));
+        site_settings.must_append("autoplay"sv);
 
     async_send_message("forciblyEnableSiteSettings"sv, move(site_settings));
 }
 
 void SettingsUI::set_site_setting_policy(JsonValue const& site_setting)
 {
-    auto setting = site_setting_type(site_setting);
-    if (!setting.has_value())
+    if (!site_setting.is_object())
         return;
 
+    auto setting = site_setting.as_object().get_string("setting"sv);
     auto policy = site_setting.as_object().get_string("policy"sv);
-    if (!policy.has_value())
+    if (!setting.has_value() || !policy.has_value() || !policy->is_ascii())
         return;
 
-    switch (*setting) {
-    case SiteSettingType::Autoplay:
-        auto policy_utf16 = Utf16String::from_utf8_without_validation(*policy);
-        if (auto parsed = Web::HTML::autoplay_policy_from_string(policy_utf16.utf16_view()); parsed.has_value())
+    if (*setting == "autoplay"sv) {
+        auto policy_utf16 = Utf16View::from_ascii(*policy);
+        if (auto parsed = Web::HTML::autoplay_policy_from_string(policy_utf16); parsed.has_value())
             Application::settings().set_autoplay_policy(*parsed);
-        break;
+    } else if (auto name = Web::Permissions::permission_name_from_string(*setting); name.has_value()) {
+        if (*policy == "ask"sv)
+            Application::settings().set_permission_policy(*name, PermissionPolicy::Ask);
+        else if (*policy == "block"sv)
+            Application::settings().set_permission_policy(*name, PermissionPolicy::Block);
     }
+}
 
-    load_current_settings();
+static Optional<URL::Origin> site_setting_origin(String const& filter)
+{
+    auto url = URL::Parser::basic_parse(filter.bytes_as_string_view().trim_whitespace());
+    if (!url.has_value() || url->origin().is_opaque())
+        return {};
+    return url->origin();
 }
 
 void SettingsUI::add_site_setting_filter(JsonValue const& site_setting)
 {
-    auto setting = site_setting_type(site_setting);
-    if (!setting.has_value())
+    if (!site_setting.is_object())
         return;
 
+    auto setting = site_setting.as_object().get_string("setting"sv);
     auto filter = site_setting.as_object().get_string("filter"sv);
-    if (!filter.has_value())
+    auto policy = site_setting.as_object().get_string("policy"sv);
+    if (!setting.has_value() || !filter.has_value() || !policy.has_value() || !policy->is_ascii())
         return;
 
-    switch (*setting) {
-    case SiteSettingType::Autoplay:
-        Application::settings().add_autoplay_site_filter(*filter);
-        break;
-    }
+    auto origin = site_setting_origin(*filter);
+    if (!origin.has_value())
+        return;
 
-    load_current_settings();
+    if (*setting == "autoplay"sv) {
+        auto policy_utf16 = Utf16String::from_utf8_without_validation(*policy);
+        if (auto parsed = Web::HTML::autoplay_policy_from_string(policy_utf16.utf16_view()); parsed.has_value())
+            Application::settings().add_autoplay_site_filter(origin->serialize(), *parsed);
+    } else if (auto name = Web::Permissions::permission_name_from_string(*setting); name.has_value()) {
+        PermissionDecision decision;
+        if (*policy == "allow"sv)
+            decision = PermissionDecision::Allow;
+        else if (*policy == "block"sv)
+            decision = PermissionDecision::Block;
+        else
+            return;
+
+        Application::default_session().permission_manager->set_decision(*name, *origin, decision);
+    }
 }
 
 void SettingsUI::remove_site_setting_filter(JsonValue const& site_setting)
 {
-    auto setting = site_setting_type(site_setting);
-    if (!setting.has_value())
+    if (!site_setting.is_object())
         return;
 
+    auto setting = site_setting.as_object().get_string("setting"sv);
     auto filter = site_setting.as_object().get_string("filter"sv);
-    if (!filter.has_value())
+    if (!setting.has_value() || !filter.has_value())
         return;
 
-    switch (*setting) {
-    case SiteSettingType::Autoplay:
-        Application::settings().remove_autoplay_site_filter(*filter);
-        break;
-    }
+    auto origin = site_setting_origin(*filter);
+    if (!origin.has_value())
+        return;
 
-    load_current_settings();
+    if (*setting == "autoplay"sv) {
+        Application::settings().remove_autoplay_site_filter(origin->serialize());
+    } else if (auto name = Web::Permissions::permission_name_from_string(*setting); name.has_value()) {
+        Application::default_session().permission_manager->set_decision(*name, *origin, {});
+    }
 }
 
 void SettingsUI::remove_all_site_setting_filters(JsonValue const& site_setting)
 {
-    auto setting = site_setting_type(site_setting);
+    if (!site_setting.is_object())
+        return;
+
+    auto setting = site_setting.as_object().get_string("setting"sv);
     if (!setting.has_value())
         return;
 
-    switch (*setting) {
-    case SiteSettingType::Autoplay:
+    if (*setting == "autoplay"sv) {
         Application::settings().remove_all_autoplay_site_filters();
-        break;
+    } else if (auto name = Web::Permissions::permission_name_from_string(*setting); name.has_value()) {
+        auto& manager = *Application::default_session().permission_manager;
+
+        for (auto const& site : manager.site_decisions(*name))
+            manager.set_decision(*name, site.origin, {});
     }
-
-    load_current_settings();
-}
-
-void SettingsUI::set_geolocation_enabled(JsonValue const& enabled)
-{
-    if (!enabled.is_bool())
-        return;
-
-    Application::settings().set_geolocation_enabled(enabled.as_bool());
-    load_current_settings();
 }
 
 void SettingsUI::estimate_browsing_data_sizes(JsonValue const& options)
@@ -498,12 +644,6 @@ void SettingsUI::estimate_browsing_data_sizes(JsonValue const& options)
         .when_rejected([](Error const& error) {
             dbgln("Failed to estimate browsing data sizes: {}", error);
         });
-}
-
-void SettingsUI::set_browsing_data_settings(JsonValue const& settings)
-{
-    Application::settings().set_browsing_data_settings(Settings::parse_browsing_data_settings(settings));
-    load_current_settings();
 }
 
 void SettingsUI::clear_browsing_data(JsonValue const& options)
@@ -552,13 +692,30 @@ void SettingsUI::set_global_privacy_control(JsonValue const& global_privacy_cont
     Application::settings().set_global_privacy_control(global_privacy_control.as_bool() ? GlobalPrivacyControl::Yes : GlobalPrivacyControl::No);
 }
 
+void SettingsUI::crash_reports_changed()
+{
+    if (has_client())
+        async_send_message("crashReportsWaiting"sv, CrashReportOutbox::the().waiting_report_count());
+}
+
+void SettingsUI::set_crash_report_sending(JsonValue const& crash_report_sending)
+{
+    if (!crash_report_sending.is_string())
+        return;
+
+    auto sending = crash_report_sending_from_string(crash_report_sending.as_string());
+    Application::settings().set_crash_report_sending(sending);
+
+    if (sending == CrashReportSending::NeverSend)
+        CrashReportOutbox::the().discard_all();
+}
+
 void SettingsUI::set_services_network_access_enabled(JsonValue const& enabled)
 {
     if (!enabled.is_bool())
         return;
 
     Application::settings().set_background_networking_enabled(enabled.as_bool());
-    load_current_settings();
 }
 
 void SettingsUI::set_filter_list_updates_enabled(JsonValue const& enabled)
@@ -567,13 +724,41 @@ void SettingsUI::set_filter_list_updates_enabled(JsonValue const& enabled)
         return;
 
     Application::settings().set_filter_list_updates_enabled(enabled.as_bool());
-    load_current_settings();
 }
 
 void SettingsUI::update_content_blocker_lists(JsonValue const&)
 {
     Application::the().update_content_blocker_lists({});
-    load_current_settings();
+    broadcast_settings_change();
+}
+
+void SettingsUI::set_content_blocker_enabled(JsonValue const& enabled)
+{
+    if (!enabled.is_bool())
+        return;
+
+    Application::settings().set_content_blocker_enabled(enabled.as_bool());
+
+    if (enabled.as_bool()) {
+        for (auto const& list : Application::settings().content_blocker_lists()) {
+            if (list.enabled)
+                Application::the().download_content_blocker_list_if_needed({}, list.identifier);
+        }
+    }
+}
+
+void SettingsUI::set_content_blocker_enabled_for_site(JsonValue const& value)
+{
+    if (!value.is_object())
+        return;
+
+    auto site = value.as_object().get_string("site"sv);
+    auto enabled = value.as_object().get_bool("enabled"sv);
+    if (!site.has_value() || !enabled.has_value())
+        return;
+
+    if (auto result = Application::settings().set_content_blocker_enabled_for_site(*site, *enabled); result.is_error())
+        dbgln("Unable to change content blocking for {}: {}", *site, result.error());
 }
 
 void SettingsUI::set_content_blocker_list_enabled(JsonValue const& value)
@@ -587,9 +772,8 @@ void SettingsUI::set_content_blocker_list_enabled(JsonValue const& value)
         return;
 
     Application::settings().set_content_blocker_list_enabled(*identifier, *enabled);
-    if (*enabled)
+    if (*enabled && Application::settings().content_blocker_enabled())
         Application::the().download_content_blocker_list_if_needed({}, *identifier);
-    load_current_settings();
 }
 
 void SettingsUI::add_custom_content_blocker_subscription(JsonValue const& value)
@@ -606,7 +790,6 @@ void SettingsUI::add_custom_content_blocker_subscription(JsonValue const& value)
     for (auto const& subscription : Application::settings().content_blocker_lists()) {
         if (!subscription.built_in && subscription.url == url) {
             report_content_blocker_result("subscription"_string, "Subscription already added."_string);
-            load_current_settings();
             return;
         }
     }
@@ -614,7 +797,6 @@ void SettingsUI::add_custom_content_blocker_subscription(JsonValue const& value)
     auto identifier = Application::settings().add_content_blocker_list(url->serialize(), url);
     Application::the().download_content_blocker_list_if_needed({}, identifier);
     report_content_blocker_result("subscription"_string, "Subscription added."_string);
-    load_current_settings();
 }
 
 void SettingsUI::remove_content_blocker_list(JsonValue const& value)
@@ -623,7 +805,6 @@ void SettingsUI::remove_content_blocker_list(JsonValue const& value)
         return;
 
     Application::the().remove_content_blocker_list({}, value.as_string());
-    load_current_settings();
 }
 
 void SettingsUI::import_local_content_blocker_list(JsonValue const& value)
@@ -640,8 +821,6 @@ void SettingsUI::import_local_content_blocker_list(JsonValue const& value)
         report_content_blocker_result("import"_string, MUST(String::formatted("Unable to import list: {}", result.error())));
     else
         report_content_blocker_result("import"_string, MUST(String::formatted("{} imported.", *name)));
-
-    load_current_settings();
 }
 
 void SettingsUI::set_custom_content_blocker_filters(JsonValue const& value)
@@ -650,7 +829,6 @@ void SettingsUI::set_custom_content_blocker_filters(JsonValue const& value)
         return;
 
     Application::settings().set_custom_content_blocker_filters(value.as_string());
-    load_current_settings();
 }
 
 void SettingsUI::report_content_blocker_result(String operation, String message)
@@ -664,7 +842,6 @@ void SettingsUI::report_content_blocker_result(String operation, String message)
 void SettingsUI::set_dns_settings(JsonValue const& dns_settings)
 {
     Application::settings().set_dns_settings(Settings::parse_dns_settings(dns_settings));
-    load_current_settings();
 }
 
 }
