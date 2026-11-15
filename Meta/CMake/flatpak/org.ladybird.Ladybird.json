@@ -635,6 +635,10 @@
         {
           "type": "patch",
           "path": "../vcpkg/overlay-ports/ffmpeg/0101-vulkan-decode-dpb-distinct-no-drm-modifiers.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../vcpkg/overlay-ports/ffmpeg/0102-vulkan-av1-clear-unused-ref-frame-mvs.patch"
         }
       ]
     },
@@ -799,6 +803,10 @@
         {
           "type": "patch",
           "path": "../vcpkg/overlay-ports/curl/wake-all-pending-transfers.patch"
+        },
+        {
+          "type": "patch",
+          "path": "../vcpkg/overlay-ports/curl/poll-idle-connection-input.patch"
         }
       ],
       "config-opts": [

@@ -9,6 +9,7 @@ use super::commands::*;
 use super::effect_clip_plan::EffectClipPlan;
 use super::layers::{LayerPlan, LayerPlanInputs, build_layer_plan};
 use super::nested_records::{NestedRecordsRole, for_each_nested_record_span, span_bytes};
+use super::storage::DisplayListStorage;
 use super::summary::{LiveContent, summarize};
 use crate::css::color_resolution::format_to_8bit_compatible;
 use crate::layout::LayoutNodeArena;
@@ -45,8 +46,6 @@ pub struct FfiPaintingDumpCallbacks {
     context: *mut c_void,
     /// Describes the row in the slot, as its layout node describes itself.
     debug_description: extern "C" fn(context: *mut c_void, slot: NodeSlotId, description_sink: *mut c_void),
-    /// Answers the storage handle of a nested display list.
-    nested_display_list: extern "C" fn(context: *mut c_void, display_list_id: u64) -> *const c_void,
     append_text: extern "C" fn(context: *mut c_void, bytes: *const u8, byte_count: usize),
 }
 
@@ -59,16 +58,21 @@ impl FfiPaintingDumpCallbacks {
         String::from_utf8_lossy(&description).into_owned()
     }
 
-    fn nested_display_list(&self, _: &MainThread, display_list_id: DisplayListResourceId) -> *const c_void {
-        // Nested ids come from records the host produced, so they resolve in its storage.
-        let display_list = (self.nested_display_list)(self.context, display_list_id.0);
-        assert!(!display_list.is_null());
-        display_list
-    }
-
     fn append_text(&self, _: &MainThread, text: &str) {
         // The C++ sink copies the completed dump synchronously.
         (self.append_text)(self.context, text.as_ptr(), text.len());
+    }
+}
+
+/// The display lists the dumped one nests, at any depth.
+struct DumpCallbacks<'a> {
+    nested_display_lists: &'a HashMap<u64, std::sync::Arc<crate::painting::display_list_resources::NestedDisplayList>>,
+}
+
+impl DumpCallbacks<'_> {
+    fn nested_display_list(&self, display_list_id: DisplayListResourceId) -> &DisplayListStorage {
+        // Nested ids come from records the recording produced, so they resolve in what it draws.
+        &self.nested_display_lists[&display_list_id.0].resource.storage
     }
 }
 
@@ -176,25 +180,42 @@ pub unsafe extern "C" fn render_state_dump_compositor_animations(
 
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread, and `visual_context_tree` a live retained tree
-/// handle built from its render state; `display_list` is the storage handle of the display list, and it and every
-/// storage handle `callbacks` returns must remain live for this call. `debug_description` is called synchronously
-/// with a `Vec<u8>` sink the host fills through `layout_arena_paint_push_bytes`.
+/// Dumps `display_list` with the nodes it names of the visual context tree of `host`'s document, prepared up to date.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread; `display_list` is the storage handle of the display
+/// list, and it and every storage handle `callbacks` returns must remain live for this call. `debug_description` is
+/// called synchronously with a `Vec<u8>` sink the host fills through `layout_arena_paint_push_bytes`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn painting_dump(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
-    visual_context_tree: *const c_void,
-    display_list: *const c_void,
     device_viewport_rect: IntRect,
     callbacks: FfiPaintingDumpCallbacks,
 ) {
-    assert!(!display_list.is_null());
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { main_thread(host) };
-    let visual_context_tree = unsafe { libcompositing_rust::ffi::tree_from_handle(visual_context_tree) };
-    let (tape, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
+    // SAFETY: As above.
+    let visual_context_tree = unsafe { crate::painting::ffi::main_visual_context_tree(host, read) }
+        .expect("a document with a committed viewport box has a visual context tree");
+    let visual_context_tree = visual_context_tree.as_ref();
+    let recording =
+        crate::painting::ffi::read_arena(host, read, (), |arena, ()| arena.paint_state().last_recording.clone())
+            .expect("the dump records the document first");
+    let display_list = DisplayListStorage::recorded(
+        recording.display_list.clone(),
+        recording
+            .visual_context_tree
+            .clone()
+            .expect("a recording was recorded against a tree"),
+    );
+    let nested_display_lists = recording.resources.with_nested_resources().nested_display_lists;
+    let dump_callbacks = DumpCallbacks {
+        nested_display_lists: &nested_display_lists,
+    };
+    let (tape, command_runs) = (display_list.bytes(), display_list.command_runs());
     let owners = {
         crate::painting::ffi::read_arena(host, read, viewport, |arena, viewport| {
             let mut owners = VisualContextNodeOwners::collect(arena, viewport);
@@ -220,9 +241,15 @@ pub unsafe extern "C" fn painting_dump(
     output.push_str("\nDisplayList:\n");
     match layer_plan {
         Some(layer_plan) => {
-            dump_top_level_commands_with_their_layers(&main_thread, &mut output, &callbacks, display_list, &layer_plan);
+            dump_top_level_commands_with_their_layers(
+                &main_thread,
+                &mut output,
+                &dump_callbacks,
+                &display_list,
+                &layer_plan,
+            );
         }
-        None => dump_commands(&main_thread, &mut output, &callbacks, display_list, 0),
+        None => dump_commands(&main_thread, &mut output, &dump_callbacks, &display_list, 0),
     }
     callbacks.append_text(&main_thread, &output);
 }
@@ -282,12 +309,11 @@ fn dump_compositor_scroll_table(output: &mut String, table: &CompositorScrollTab
 fn dump_commands(
     main_thread: &MainThread,
     output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
-    display_list: *const c_void,
+    callbacks: &DumpCallbacks,
+    display_list: &DisplayListStorage,
     base_indent: usize,
 ) {
-    // SAFETY: The caller keeps the storage live for the dump.
-    let (bytes, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
+    let (bytes, command_runs) = (display_list.bytes(), display_list.command_runs());
     for run in command_runs {
         let run_bytes = &bytes[run.offset as usize..(run.offset + run.size) as usize];
         dump_command_bytes(main_thread, output, callbacks, run_bytes, run.context, base_indent);
@@ -345,12 +371,11 @@ fn dump_layers_if_every_canvas_and_video_kept_updating(
 fn dump_top_level_commands_with_their_layers(
     main_thread: &MainThread,
     output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
-    display_list: *const c_void,
+    callbacks: &DumpCallbacks,
+    display_list: &DisplayListStorage,
     layer_plan: &LayerPlan,
 ) {
-    // SAFETY: The caller keeps the storage live for the dump.
-    let (bytes, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
+    let (bytes, command_runs) = (display_list.bytes(), display_list.command_runs());
     for run in command_runs {
         let run_bytes = &bytes[run.offset as usize..(run.offset + run.size) as usize];
         for_each_command(run_bytes, |_, offset_in_run, payload| {
@@ -374,7 +399,7 @@ fn dump_top_level_commands_with_their_layers(
 fn dump_command_bytes(
     main_thread: &MainThread,
     output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
+    callbacks: &DumpCallbacks,
     command_bytes: &[u8],
     context: ContextRef,
     base_indent: usize,
@@ -409,7 +434,7 @@ fn dump_command_bytes(
             main_thread,
             output,
             callbacks,
-            callbacks.nested_display_list(main_thread, nested.display_list),
+            callbacks.nested_display_list(nested.display_list),
             base_indent + 1,
         );
     });
@@ -431,7 +456,7 @@ fn nested_display_lists(command_type: DisplayListCommandType, payload: &[u8]) ->
 fn dump_records_inside(
     main_thread: &MainThread,
     output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
+    callbacks: &DumpCallbacks,
     command_type: DisplayListCommandType,
     payload: &[u8],
     context: ContextRef,

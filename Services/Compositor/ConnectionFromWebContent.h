@@ -14,7 +14,7 @@
 #include <Compositor/CompositorWebContentServerEndpoint.h>
 #include <Compositor/RenderClockConnection.h>
 #include <Compositor/VideoFrameHolds.h>
-#include <LibCompositing/DisplayList/DisplayList.h>
+#include <LibCompositing/DisplayList/DisplayListCommand.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibCompositing/WebGL/Types.h>
 #include <LibCore/AnonymousBuffer.h>
@@ -57,8 +57,6 @@ private:
     virtual void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>) override;
     virtual void stop_presenting_to_client(Web::CompositorContextId) override;
     virtual void destroy_context(Web::CompositorContextId) override;
-    virtual void update_display_list(Web::CompositorContextId, Core::AnonymousBuffer display_list_buffer, u64 tape_size, u64 run_count, Compositing::DisplayList::Properties, IPC::Encoded<Optional<Compositing::DisplayList::AsyncScrollingMetadata>>, Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction, ByteBuffer scroll_state) override;
-    virtual void update_visual_context_tree(Web::CompositorContextId, Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction, ByteBuffer scroll_state, IPC::Encoded<Compositing::KeyboardScrollState>) override;
     virtual void update_display_list_resources(Web::CompositorContextId, Compositing::DisplayListResourceTransaction) override;
     virtual Messages::CompositorWebContentServer::ReserveCanvasIdsResponse reserve_canvas_ids() override;
     virtual void create_canvas_2d_context(Compositing::CanvasId, Gfx::IntSize, bool alpha, bool will_read_frequently, Gfx::ColorSpace) override;
@@ -69,7 +67,7 @@ private:
     virtual void release_placeholder_canvas(Compositing::CanvasId) override;
     virtual void commit_placeholder_canvas(Compositing::CanvasId, u64 secret, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize, bool origin_clean) override;
     virtual Messages::CompositorWebContentServer::GetPlaceholderCanvasPixelsResponse get_placeholder_canvas_pixels(Compositing::CanvasId, Gfx::IntRect) override;
-    virtual Messages::CompositorWebContentServer::RasterizeDisplayListResponse rasterize_display_list(Core::AnonymousBuffer display_list_buffer, u64 tape_size, u64 run_count, Compositing::DisplayList::Properties, Compositing::AccumulatedVisualContextTree, Compositing::DisplayListResourceTransaction, Gfx::ShareableBitmap target_bitmap) override;
+    virtual void stage_rasterization(u64 token, Compositing::DisplayListResourceTransaction, Gfx::ShareableBitmap target_bitmap) override;
 
     virtual Messages::CompositorWebContentServer::CreateWebglContextResponse create_webgl_context(Compositing::WebGL::WebGLVersion webgl_version, Gfx::IntSize size, bool depth, bool stencil, bool antialias) override;
     virtual void webgl_set_command_buffer(Compositing::CanvasId canvas_id, Core::AnonymousBuffer command_buffer) override;
@@ -94,7 +92,6 @@ private:
     virtual WebContentClientId web_content_client_id() const override { return m_web_content_client_id; }
     virtual void post_message_to_web_content(IPC::MessageBuffer&) override;
     virtual void post_message_to_render_clock(IPC::MessageBuffer&) override;
-    virtual void rendering_opportunity(Web::CompositorContextId, i64 frame_time_nanoseconds, double frame_interval_milliseconds) override;
     virtual void create_video_edge(Media::VideoSinkHandle) override;
     virtual void release_video_edge(Media::VideoSinkHandle) override;
     virtual void request_animated_image_frames(AnimatedImage::FrameRequest const&) override;

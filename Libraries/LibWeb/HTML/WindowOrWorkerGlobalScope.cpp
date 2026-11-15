@@ -260,9 +260,7 @@ static ErrorOr<NonnullRefPtr<Gfx::Bitmap>> scale_bitmap(Compositor::CompositorHo
         return Error::from_string_literal("No compositor to scale the bitmap");
 
     auto output = TRY(Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, size));
-    Compositing::DisplayListResourceStorage resource_storage;
-    auto display_list = Painting::record_image_frame_display_list(TRY(Gfx::DecodedImageFrame::create(input)), output->rect().to_type<float>(), scaling_mode, resource_storage);
-    if (!compositor_host->rasterize_display_list(display_list, resource_storage, output))
+    if (!Painting::rasterize_image_frame(*compositor_host, TRY(Gfx::DecodedImageFrame::create(input)), output->rect().to_type<float>(), scaling_mode, output))
         return Error::from_string_literal("Unable to scale the bitmap");
     return output;
 }
@@ -1142,20 +1140,33 @@ WindowOrWorkerGlobalScopeMixin::AffectedAnyWebSockets WindowOrWorkerGlobalScopeM
 }
 
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#run-steps-after-a-timeout
-i32 WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout(i32 timeout, GC::Ref<GC::Function<void()>> completion_step)
+i32 WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout(u64 timeout, GC::Ref<GC::Function<void()>> completion_step)
 {
     auto timer_key = m_timer_id_allocator.allocate();
     m_internal_timer_ids.set(timer_key);
-    auto remove_timer_and_complete = GC::create_function(GC::Heap::the(), GC::captures(this_impl(), timer_key, completion_step), [](auto& this_object, auto& timer_key, auto& completion_step) {
+    run_internal_timer(timer_key, timeout, completion_step);
+    return timer_key;
+}
+
+void WindowOrWorkerGlobalScopeMixin::run_internal_timer(i32 timer_key, u64 timeout, GC::Ref<GC::Function<void()>> completion_step)
+{
+    // AD-HOC: A timer waits at most NumericLimits<i32>::max() milliseconds, so a longer timeout waits in parts under
+    //         the same timer key.
+    auto part = min(timeout, static_cast<u64>(NumericLimits<i32>::max()));
+    auto remaining = timeout - part;
+    auto complete_part = GC::create_function(GC::Heap::the(), GC::captures(this_impl(), timer_key, remaining, completion_step), [](auto& this_object, auto& timer_key, auto& remaining, auto& completion_step) {
         auto& global_scope = as<WindowOrWorkerGlobalScopeMixin>(this_object);
         global_scope.m_timers.remove(timer_key);
+        if (remaining > 0) {
+            global_scope.run_internal_timer(timer_key, remaining, completion_step);
+            return;
+        }
         global_scope.m_internal_timer_ids.remove(timer_key);
         completion_step->function()();
     });
     // NB: A timeout another specification waits on — an idle callback's, an AbortSignal's — isn't one of the page's
     //     own yield points, so a hidden document holds it back like a chained timer, however short it is.
-    run_steps_after_a_timeout_impl(timeout, TimerThrottlingClass::Chained, remove_timer_and_complete, timer_key);
-    return timer_key;
+    run_steps_after_a_timeout_impl(static_cast<i32>(part), TimerThrottlingClass::Chained, complete_part, timer_key);
 }
 
 void WindowOrWorkerGlobalScopeMixin::run_steps_after_a_timeout_impl(i32 timeout, TimerThrottlingClass throttling_class, GC::Ref<GC::Function<void()>> completion_step, Optional<i32> timer_key, Repeat repeat)
@@ -1563,6 +1574,22 @@ WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> fetch(JS::Realm& realm, HTML::Wind
 {
     (void)global_scope;
     return Fetch::fetch(realm, input, init);
+}
+
+}
+
+namespace Web::HTML {
+
+extern "C" void web_html_window_or_worker_global_scope_run_steps_after_a_timeout(JSObject* global_object, u64 milliseconds, void* cell, void (*steps)(JSVM*, void*));
+
+void web_html_window_or_worker_global_scope_run_steps_after_a_timeout(JSObject* global_object, u64 milliseconds, void* cell, void (*steps)(JSVM*, void*))
+{
+    auto& global = *JS::HostABI::object_from_abi(global_object);
+    auto* scope = window_or_worker_global_scope_from_global_object(global);
+    VERIFY(scope);
+    scope->run_steps_after_a_timeout(milliseconds, GC::create_function(GC::Heap::the(), GC::captures(global, GC::Ref { *static_cast<GC::Cell*>(cell) }, steps), [](auto& global, auto& cell, auto& steps) {
+        steps(JS::HostABI::vm_to_abi(global.vm()), cell.ptr());
+    }));
 }
 
 }

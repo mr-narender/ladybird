@@ -24,8 +24,6 @@
 #include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
-#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
-#include <LibCompositing/DisplayList/DisplayList.h>
 #include <LibCore/Timer.h>
 #include <LibGC/Heap.h>
 #include <LibGC/HeapVector.h>
@@ -265,6 +263,7 @@
 #include <LibWeb/SVG/SVGElement.h>
 #include <LibWeb/SVG/SVGMaskElement.h>
 #include <LibWeb/SVG/SVGPatternElement.h>
+#include <LibWeb/SVG/SVGResourceDocument.h>
 #include <LibWeb/SVG/SVGSVGElement.h>
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
@@ -1076,6 +1075,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_list_owners_with_stale_item_counters);
 
     visitor.visit(m_shared_resource_requests);
+    visitor.visit(m_svg_resource_documents);
+    visitor.visit(m_svg_resource_document_owner);
     for (auto& resource : m_css_image_resources)
         resource.value->visit_edges(visitor);
     for (auto& resource : m_css_image_resources_with_request_url_modifiers)
@@ -2508,8 +2509,7 @@ bool Document::is_clean_for_layout_geometry_read(Layout::BegunRead const& read) 
         && !m_needs_media_rule_evaluation
         && !m_needs_animated_style_update
         && !has_size_containers_needing_evaluation_after_layout(read)
-        && m_elements_with_pending_top_layer_membership_change.is_empty()
-        && !m_top_layer_needs_layout_zone_rebuild;
+        && m_elements_with_pending_top_layer_membership_change.is_empty();
 }
 
 void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutReason reason)
@@ -2558,7 +2558,6 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         && !m_needs_animated_style_update
         && !has_size_containers_needing_evaluation_after_layout(read)
         && m_elements_with_pending_top_layer_membership_change.is_empty()
-        && !m_top_layer_needs_layout_zone_rebuild
         && !has_pending_scroll_container_resnap()
         && !style_computer().style_engine().css_transitions_may_observe_style_changes()
         && !may_have_style_query_dependencies) {
@@ -2719,7 +2718,7 @@ bool Document::layout_is_up_to_date() const
     // Without an arena there is no layout root either, so there is a tree to build.
     if (!m_layout_node_arena)
         return false;
-    return Layout::RustFFI::render_state_layout_is_up_to_date(m_layout_node_arena->host(), style_node_id().value());
+    return Layout::RustFFI::render_state_layout_is_up_to_date(m_layout_node_arena->host());
 }
 
 // Whether the document's layout is not up to date, as far as the host knows without reading the render state.
@@ -2733,7 +2732,7 @@ bool Document::layout_is_known_stale() const
         return true;
     if (!m_layout_node_arena)
         return true;
-    return Layout::RustFFI::render_state_layout_is_known_stale(m_layout_node_arena->host(), style_node_id().value());
+    return Layout::RustFFI::render_state_layout_is_known_stale(m_layout_node_arena->host());
 }
 
 void Document::update_style_computer_viewport_rect()
@@ -2806,6 +2805,12 @@ void Document::invalidate_style_for_viewport_change(CSSPixelSize previous_viewpo
 
     Layout::ForcedReadScope read { *this };
     auto& style_engine = style_computer().style_engine();
+
+    // NB: The render clock's lanes tick the document's animations in the layout of the last rendering update, which
+    //     was made for the previous viewport. Frames of that size are of no use any more, and animated values that
+    //     depend on the viewport no longer stand, so the lanes stop until the next rendering update plans them again.
+    if (auto* arena = layout_node_arena_if_created())
+        Layout::RustFFI::document_host_note_animation_change(arena->host());
 
     if (any_registration_read_viewport) {
         // The custom-property registry holds the initial values just dropped, so the next style
@@ -7992,7 +7997,7 @@ void Document::queue_an_intersection_observer_entry(IntersectionObserver::Inters
 }
 
 // https://www.w3.org/TR/intersection-observer/#compute-the-intersection
-static Optional<CSSPixelRect> compute_intersection(Layout::BegunRead const& read, GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, Layout::Box const* root_layout_box, CSSPixelRect const& root_bounds, Compositing::AccumulatedVisualContextTree const& visual_context_tree)
+static Optional<CSSPixelRect> compute_intersection(Layout::BegunRead const& read, GC::Ref<Element> target, CSSPixelRect target_rect, IntersectionObserver::IntersectionObserver const& observer, Layout::Box const* root_layout_box, CSSPixelRect const& root_bounds, MonotonicTime visual_animation_sample_time)
 {
     auto& document = target->document();
     auto const& scroll_margin = observer.scroll_margin_values();
@@ -8011,7 +8016,7 @@ static Optional<CSSPixelRect> compute_intersection(Layout::BegunRead const& read
     auto intersects = Layout::RustFFI::layout_script_intersection_observer_intersection_rect(
         document.layout_node_arena().host(), Layout::Node::slot_id(target->layout_node(read)), target_rect,
         Layout::Node::slot_id(root_layout_box), root_bounds,
-        Painting::viewport_mapping(document, visual_context_tree),
+        Painting::viewport_mapping_with_visual_animations_sampled_at(document, visual_animation_sample_time),
         const_cast<Vector<CSS::LengthPercentage>*>(&scroll_margin), inflate_scroll_container_clip_rect_by_scroll_margin, &rect);
     if (!intersects)
         return {};
@@ -8035,20 +8040,9 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
     for (auto& observer : m_intersection_observers)
         intersection_observers.append(observer);
 
-    GC::RootHashMap<Document*, Compositing::AccumulatedVisualContextTree> observation_visual_context_trees;
-    auto sample_time_ns = MonotonicTime::now().nanoseconds();
-    auto sampled_visual_context_tree = [&](Document& document) -> Optional<Compositing::AccumulatedVisualContextTree> {
-        if (!document.m_paint_state)
-            return {};
-        if (auto cached_tree = observation_visual_context_trees.get(&document); cached_tree.has_value())
-            return *cached_tree;
-        auto committed_tree = document.paint_state().visual_context_tree(document);
-        auto sampled_tree = committed_tree.has_visual_animations()
-            ? committed_tree.with_visual_animation_samples(sample_time_ns)
-            : committed_tree;
-        observation_visual_context_trees.set(&document, sampled_tree);
-        return sampled_tree;
-    };
+    // Every document the observers read is mapped with the compositor's animations sampled at one time, as the screen
+    // shows them then.
+    auto const visual_animation_sample_time = MonotonicTime::now();
 
     for (auto& observer : intersection_observers) {
         observer->remove_dead_observation_targets();
@@ -8059,10 +8053,9 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
         Layout::ForcedReadScope root_read { intersection_root_node->document() };
 
         // 1. Let rootBounds be observer’s root intersection rectangle.
-        auto root_visual_context_tree = sampled_visual_context_tree(intersection_root_node->document());
-        if (!root_visual_context_tree.has_value())
+        if (!intersection_root_node->document().has_paint_state())
             continue;
-        auto root_bounds = observer->root_intersection_rectangle(root_read, &*root_visual_context_tree);
+        auto root_bounds = observer->root_intersection_rectangle(root_read, visual_animation_sample_time);
 
         // Pre-compute per-observer values to avoid repeated work in the per-target loop.
         // An inline element root has a committed box but no Layout::Box. No containing block chain passes
@@ -8121,16 +8114,15 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
                 }
             }
             if (!root_is_hidden && target_layout_node && (is_implicit_root || &target->document() == &intersection_root_node->document()) && root_contains_target) {
-                auto target_visual_context_tree = sampled_visual_context_tree(target->document());
-                if (!target_visual_context_tree.has_value())
+                if (!target->document().has_paint_state())
                     continue;
 
                 // 4. Set targetRect to the DOMRectReadOnly obtained by getting the bounding box for target.
-                target_rect = target->bounding_client_rect_assuming_layout_clean(target_read, *target_visual_context_tree);
+                target_rect = target->bounding_client_rect_assuming_layout_clean(target_read, visual_animation_sample_time);
 
                 // 5. Let intersectionRect be the result of running the compute the intersection algorithm on target and
                 //    observer’s intersection root.
-                auto maybe_intersection_rect = compute_intersection(target_read, target, target_rect, *observer, root_layout_box, root_bounds, *target_visual_context_tree);
+                auto maybe_intersection_rect = compute_intersection(target_read, target, target_rect, *observer, root_layout_box, root_bounds, visual_animation_sample_time);
                 if (maybe_intersection_rect.has_value())
                     intersection_rect = *maybe_intersection_rect;
 
@@ -8461,11 +8453,6 @@ Painting::DocumentPaintState const& Document::paint_state() const
 {
     VERIFY(m_paint_state);
     return *m_paint_state;
-}
-
-Compositing::AccumulatedVisualContextTree Document::visual_context_tree() const
-{
-    return paint_state().visual_context_tree(*this);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#restore-the-history-object-state
@@ -9278,7 +9265,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         }
     };
 
-    Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree = paint_state().visual_context_tree(*this);
+    auto animation_pass_viewport_mapping = Painting::viewport_mapping(*this);
     paint_state().begin_compositor_animation_update();
     GC::RootHashMap<GC::Ref<Layout::Node>, bool> previous_content_retention;
     GC::RootHashTable<GC::Ref<Layout::Node>> retained_this_pass;
@@ -9369,13 +9356,13 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         return false;
     };
 
-    auto transform_subtree_is_clipped_outside = [this, &visual_context_tree, &read](Element const& animated_target, CSSPixelRect const& root_bounds) {
+    auto transform_subtree_is_clipped_outside = [&animation_pass_viewport_mapping, &read](Element const& animated_target, CSSPixelRect const& root_bounds) {
         auto const* layout_node = animated_target.unsafe_layout_node(read);
         if (!layout_node)
             return false;
         return Layout::RustFFI::layout_script_transform_subtree_is_clipped_outside(
             layout_node->document_host(), Layout::Node::slot_id(layout_node), root_bounds,
-            Painting::viewport_mapping(*this, *visual_context_tree));
+            animation_pass_viewport_mapping);
     };
 
     auto paint_only_effect_is_offscreen = [&](Animations::KeyframeEffect const& effect, AbstractElement abstract_target) {
@@ -9476,7 +9463,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
             return false;
 
         auto viewport_bounds = CSSPixelRect { { 0, 0 }, viewport_rect().size() };
-        auto viewport_mapping = Painting::viewport_mapping(*this, *visual_context_tree);
+        auto const& viewport_mapping = animation_pass_viewport_mapping;
         auto bounds_in_viewport = [&](Layout::Node const& node) -> CSSPixelRect {
             CSSPixelRect rect;
             Layout::RustFFI::layout_script_bounding_client_rect(
@@ -9709,7 +9696,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         });
     }
     if (forced_opacity_effects_layer)
-        visual_context_tree = paint_state().visual_context_tree(*this);
+        animation_pass_viewport_mapping = Painting::viewport_mapping(*this);
 
     bool has_observation_relevant_compositor_animation = false;
     bool requested_withdrawn_effect_sample = false;
@@ -9974,9 +9961,6 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         m_force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing = false;
         schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
     }
-
-    // Publishing gives the animations to the tree in place unless something else still holds it.
-    visual_context_tree.clear();
 
     // A descriptor must target the tree it is published with. The selection pass above can force
     // or release animation-only visual context nodes, so redo it after applying those updates.
@@ -11191,65 +11175,22 @@ void Document::process_top_layer_removals()
         CSS::record_top_layer_changed(*this);
 }
 
-// The top layer is treated as a single rebuild zone: any membership change detaches the box
-// subtree of every rendered member and re-marks the members, after which the top layer pass of
-// the tree builder recreates all their boxes in top layer order. Runs after style update so
-// that elements that left the top layer are classified by their up-to-date computed display.
-void Document::process_pending_top_layer_layout_changes(Layout::BegunRead const& read)
+// A membership change builds the element's box again: the layout tree build plans the child list of the viewport, where
+// the boxes of the top layer members are, and the list the element's box was in before. Runs after style update so
+// that the build sees the elements' up-to-date computed display.
+void Document::process_pending_top_layer_layout_changes(Layout::BegunRead const&)
 {
-    if (m_elements_with_pending_top_layer_membership_change.is_empty() && !m_top_layer_needs_layout_zone_rebuild)
+    if (m_elements_with_pending_top_layer_membership_change.is_empty())
         return;
 
     GC::RootVector<GC::Ref<Element>> elements_with_membership_change { move(m_elements_with_pending_top_layer_membership_change) };
-    m_top_layer_needs_layout_zone_rebuild = false;
-
-    // An already pending full build recreates every box anyway.
-    if (!has_layout_root() || needs_full_layout_tree_update(read))
-        return;
-
-    // Marks are applied only after every detach has run: detaching clears the flags across the
-    // detached subtree and would wipe the fresh mark of a member nested inside another member.
-    GC::RootVector<GC::Ref<Element>> elements_to_mark_for_layout_tree_update;
-
     for (auto const& element : elements_with_membership_change) {
-        // NB: Elements that changed membership more than once are processed by their final state.
-        if (element->rendered_in_top_layer()) {
-            // An entering element whose box is still attached at its normal position leaves
-            // anonymous wrappers and inline fragments behind; the parent subtree rebuild heals
-            // that structure, while the top layer pass rebuilds the element itself.
-            // NB: Called during top layer processing, outside layout tree construction.
-            auto* element_layout_node = element->unsafe_layout_node(read);
-            bool element_has_box_at_normal_position = element_layout_node && element_layout_node->parent() && !element_layout_node->topmost_layout_node_of_top_layer_placement();
-            if (element_has_box_at_normal_position) {
-                if (auto* flat_tree_parent = element->flat_tree_parent(); flat_tree_parent && !flat_tree_parent->is_document())
-                    flat_tree_parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange);
-            }
-        } else {
-            // A leaving element that is still rendered (fullscreen exit, mostly) needs a box
-            // back among already-built sibling boxes, which only a full rebuild can order.
-            auto const* box_values = element->style_group<CSS::ComputedValues::BoxValues>();
-            bool element_is_still_rendered = element->is_connected()
-                && box_values
-                && !CSS::display_from_ffi_display(box_values->display).is_none();
-            if (element_is_still_rendered) {
-                invalidate_layout_tree(InvalidateLayoutTreeReason::TopLayerElementStillRenderedAfterRemoval);
-                return;
-            }
-            Layout::detach_top_layer_element_layout_subtree(read, element);
-            if (element->is_connected())
-                elements_to_mark_for_layout_tree_update.append(element);
-        }
+        if (element->is_connected())
+            element->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange);
     }
-
-    for (auto const& member : m_top_layer_elements) {
-        if (!member->rendered_in_top_layer())
-            continue;
-        Layout::detach_top_layer_element_layout_subtree(read, member);
-        elements_to_mark_for_layout_tree_update.append(member);
-    }
-
-    for (auto const& element : elements_to_mark_for_layout_tree_update)
-        element->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange);
+    // NB: The box an element that left the top layer had in the viewport's list may no longer be bound to the element,
+    //     so the viewport's list is planned again whatever the elements' marks find.
+    set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange);
 }
 
 // https://html.spec.whatwg.org/multipage/popover.html#topmost-auto-popover
@@ -12134,28 +12075,17 @@ void Document::set_needs_to_record_display_list_keeping_hit_test_display_list()
         navigable->set_needs_to_record_display_list();
 }
 
-RefPtr<Compositing::DisplayList> Document::record_display_list(Layout::BegunRead const& read, HTML::PaintConfig config, Compositing::DisplayListResourceStorage& resource_storage, Painting::PaintCommandCacheMode cache_mode)
+bool Document::record_display_list(Layout::BegunRead const& read, HTML::PaintConfig config, Painting::PaintCommandCacheMode cache_mode)
 {
     // The host reads this recording right after it, so a recording in flight is taken in first: it has the recorder
     // state.
-    // The navigable's resource storage is the Paint thread's while the document's clock lane presents: a recording
-    // that adds to it holds the lane meanwhile.
-    auto* host = layout_node_arena().host();
-    bool holds_clock_lane = false;
-    if (auto navigable = this->navigable()) {
+    if (auto navigable = this->navigable())
         navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
-        holds_clock_lane = &resource_storage == &navigable->display_list_resource_storage();
-    }
-    if (holds_clock_lane)
-        Layout::RustFFI::document_host_hold_clock_lane(host);
-    ScopeGuard release_clock_lane = [&] {
-        if (holds_clock_lane)
-            Layout::RustFFI::document_host_release_clock_lane(host);
-    };
     auto recording = start_display_list_recording(read, config, cache_mode);
     if (!recording.has_value())
-        return nullptr;
-    return finish_display_list_recording(read, *recording, resource_storage);
+        return false;
+    finish_display_list_recording(read, *recording);
+    return true;
 }
 
 Optional<Painting::DisplayListRecording> Document::start_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig config, Painting::PaintCommandCacheMode cache_mode)
@@ -12179,7 +12109,9 @@ Optional<Painting::DisplayListRecording> Document::start_recording(Layout::Begun
         cache_mode = Painting::PaintCommandCacheMode::ReadOnly;
 
     auto& document_paint_state = paint_state();
-    auto visual_context_tree = document_paint_state.visual_context_tree(*this);
+    // NB: Reading the epoch brings the visual context tree up to date, which the recording freezes. It does so before
+    //     the inputs are gathered, as bringing the tree up to date can clamp scroll offsets.
+    auto visual_context_tree_structural_epoch = document_paint_state.visual_context_tree_structural_epoch(read);
 
     Optional<Gfx::Color> surface_clear_color;
 
@@ -12209,33 +12141,25 @@ Optional<Painting::DisplayListRecording> Document::start_recording(Layout::Begun
     if (config.should_show_caret_hit_test_debug_overlay)
         overlay_inputs.caret_debug_rect = m_caret_hit_test_debug_rect;
 
-    return Painting::start_rust_display_list_recording(read, *this, move(visual_context_tree), surface_clear_color, cache_mode, config, overlay_inputs, move(committed));
+    return Painting::start_rust_display_list_recording(read, *this, visual_context_tree_structural_epoch, surface_clear_color, cache_mode, config, overlay_inputs, move(committed));
 }
 
-RefPtr<Compositing::DisplayList> Document::finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const& recording, Compositing::DisplayListResourceStorage& resource_storage, Painting::HitTestListStands hit_test_list_stands)
+void Document::finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const& recording, Painting::HitTestListStands hit_test_list_stands)
 {
-    auto display_list = Painting::finish_rust_display_list_recording(read, *this, recording, resource_storage);
-    if (!display_list)
-        return nullptr;
-    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording, *display_list, [&] { return resource_storage.collect_referenced_resources(*display_list); });
-    return display_list;
+    Painting::publish_rust_display_list_recording(read, *this);
+    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording);
 }
 
-Painting::HitTestListAdoption Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording, NonnullRefPtr<Compositing::DisplayList> display_list, Function<Compositing::DisplayListResourceSet()> const& referenced_resources)
+Painting::HitTestListAdoption Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording)
 {
-    auto& document_paint_state = paint_state();
-    bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
     auto adoption = Painting::HitTestListAdoption::Kept;
     if (!hit_test_list_read.has_value()) {
         m_hit_test_display_list = nullptr;
         adoption = Painting::HitTestListAdoption::Dropped;
     } else if (!m_hit_test_display_list || !m_hit_test_display_list->is_current()) {
-        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(*hit_test_list_read, recording.visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
+        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(*hit_test_list_read, recording.visual_context_tree_structural_epoch, layout_node_arena(), *m_chrome_widget_registry);
         adoption = Painting::HitTestListAdoption::TookNew;
     }
-
-    if (recording.cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source)
-        document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, referenced_resources(), recording.visual_context_tree);
     return adoption;
 }
 
@@ -12273,8 +12197,7 @@ Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunR
         HTML::PaintConfig paint_config { .paint_overlay = true };
         if (auto navigable = this->navigable())
             paint_config = navigable->stamp_paint_config(paint_config);
-        Compositing::DisplayListResourceStorage throwaway_resource_storage_for_hit_test_only_recording;
-        (void)record_display_list(read, paint_config, throwaway_resource_storage_for_hit_test_only_recording, Painting::PaintCommandCacheMode::ReadOnly);
+        (void)record_display_list(read, paint_config, Painting::PaintCommandCacheMode::ReadOnly);
     };
 
     // The recording in flight replaces the hit-test list once it lands, so a list that is not current waits for it
@@ -12727,18 +12650,10 @@ Utf16String Document::dump_display_list()
     if (paint_state().has_visual_context_tree(read))
         schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
 
-    // The dump reads the navigable's resource storage after the recording adds to it, which the Paint thread owns while
-    // the document's clock lane presents: the dump holds the lane until it is done.
-    auto* host = layout_node_arena().host();
-    Layout::RustFFI::document_host_hold_clock_lane(host);
-    ScopeGuard release_clock_lane = [&] { Layout::RustFFI::document_host_release_clock_lane(host); };
-    auto& resource_storage = navigable()->display_list_resource_storage();
-    auto display_list = record_display_list(read, HTML::PaintConfig {}, resource_storage, Painting::PaintCommandCacheMode::ReadOnly);
-    if (!display_list)
+    if (!record_display_list(read, HTML::PaintConfig {}, Painting::PaintCommandCacheMode::ReadOnly))
         return "No display list"_utf16;
 
-    auto visual_context_tree = paint_state().visual_context_tree(*this);
-    return Painting::serialize_painting_dump(read, *this, visual_context_tree, *display_list, resource_storage);
+    return Painting::serialize_painting_dump(read, *this);
 }
 
 Utf16String Document::dump_stacking_context_tree()

@@ -8,6 +8,7 @@
 
 #include <AK/Array.h>
 #include <AK/Function.h>
+#include <AK/QuickSort.h>
 #include <AK/ScopeGuard.h>
 #include <AK/StdLibExtras.h>
 #include <AK/kmalloc.h>
@@ -226,15 +227,19 @@ static constexpr QSize TAB_CLOSE_BUTTON_HIT_SIZE { 20, 28 };
 static constexpr int TAB_AUDIO_BUTTON_SIZE = 20;
 static constexpr int TAB_BUTTON_ICON_SIZE = 14;
 static constexpr qreal TAB_BUTTON_RADIUS = 4;
+// A tab's favicon or title ends this far before its speaker, microphone, or close button.
+static constexpr int TAB_CONTENT_BUTTON_GAP = 6;
+// A horizontal tab's speaker, or its microphone without one, ends this far before the close button's slot.
+static constexpr int HORIZONTAL_TAB_CLOSE_BUTTON_GAP = 2;
 static constexpr int DROP_PREVIEW_DURATION_MS = 150;
 static constexpr int TAB_TITLE_FADE_WIDTH = 24;
 // In the sidebar's rows, the speaker is a larger button with a larger icon, so that it matches the close button's weight.
 static constexpr int SIDEBAR_ROW_AUDIO_BUTTON_SIZE = 22;
 static constexpr int SIDEBAR_ROW_AUDIO_ICON_SIZE = 16;
 static constexpr int SIDEBAR_ROW_BUTTON_GAP = 4;
-// A sidebar row's close button is lighter than the muted color at rest.
-static constexpr QRgb SIDEBAR_ROW_QUIET_CLOSE_ICON_LIGHT = 0x9C9CA3;
-static constexpr QRgb SIDEBAR_ROW_QUIET_CLOSE_ICON_DARK = 0x7A7A81;
+// The close button of a tab that is neither selected nor hovered is dimmed, so that a row of them steps back.
+static constexpr qreal QUIET_TAB_CLOSE_BUTTON_OPACITY_LIGHT = 0.75;
+static constexpr qreal QUIET_TAB_CLOSE_BUTTON_OPACITY_DARK = 0.55;
 // In the collapsed sidebar, the close button and the speaker are round badges on opposite corners of the favicon,
 // reaching a little past them.
 static constexpr int RAIL_BADGE_SIZE = 18;
@@ -407,6 +412,37 @@ static bool horizontal_tab_has_room_for_favicon_before(qreal close_button_left, 
 {
     return close_button_left - HORIZONTAL_TAB_CONTENT_GAP >= content_left + TAB_ICON_SIZE;
 }
+
+// The narrowest a horizontal tab with a speaker or a microphone gets, so that its favicon still fits beside them and the
+// close button, and the tab can be told apart. At this width the tab keeps all of its padding and its close button's
+// slot, and update_tab_button_geometry() puts the buttons at the end of its content: the close button, then the speaker,
+// then the microphone. The microphone of a tab without a speaker sits in the middle of the speaker's slot.
+// NB: paintEvent() ends the favicon's QRect TAB_CONTENT_BUTTON_GAP before the first button, and a QRect's right edge is
+//     its last pixel, so one pixel less than that gap is empty.
+static constexpr int horizontal_tab_min_width_with_media_indicators(bool has_speaker, bool has_microphone)
+{
+    auto microphone_in_speaker_slot_width = TAB_AUDIO_BUTTON_SIZE - ((TAB_AUDIO_BUTTON_SIZE - TAB_BUTTON_ICON_SIZE) / 2);
+    auto indicators_width = has_speaker ? TAB_AUDIO_BUTTON_SIZE + (has_microphone ? TAB_BUTTON_ICON_SIZE : 0) : microphone_in_speaker_slot_width;
+    return static_cast<int>(2 * HORIZONTAL_TAB_CARD_SHAPE_HORIZONTAL_INSET) + HORIZONTAL_TAB_CONTENT_LEFT_PADDING
+        + TAB_ICON_SIZE + (TAB_CONTENT_BUTTON_GAP - 1) + indicators_width + HORIZONTAL_TAB_CLOSE_BUTTON_GAP
+        + TAB_CLOSE_BUTTON_HIT_SIZE.width() + HORIZONTAL_TAB_CONTENT_RIGHT_PADDING;
+}
+static_assert(horizontal_tab_min_width_with_media_indicators(true, false) == 75);
+static_assert(horizontal_tab_min_width_with_media_indicators(false, true) == 72);
+static_assert(horizontal_tab_min_width_with_media_indicators(true, true) == 89);
+// NB: At each of those widths the tab is padded, and its close button has room beside its favicon, so it shows.
+static_assert(horizontal_tab_min_width_with_media_indicators(false, true) >= HORIZONTAL_TAB_PADDED_MIN_WIDTH);
+static_assert(horizontal_tab_min_width_with_media_indicators(false, true) - static_cast<int>(2 * HORIZONTAL_TAB_CARD_SHAPE_HORIZONTAL_INSET)
+        - HORIZONTAL_TAB_CONTENT_LEFT_PADDING - HORIZONTAL_TAB_CONTENT_RIGHT_PADDING
+    >= TAB_ICON_SIZE + HORIZONTAL_TAB_CONTENT_GAP + TAB_CLOSE_BUTTON_HIT_SIZE.width());
+
+// The narrowest the selected horizontal tab gets, so that it shows its favicon beside its close button.
+static constexpr int HORIZONTAL_SELECTED_TAB_MIN_WIDTH = static_cast<int>(2 * HORIZONTAL_TAB_CARD_SHAPE_HORIZONTAL_INSET)
+    + HORIZONTAL_TAB_CONTENT_LEFT_PADDING + TAB_ICON_SIZE + HORIZONTAL_TAB_CONTENT_GAP + TAB_CLOSE_BUTTON_HIT_SIZE.width()
+    + HORIZONTAL_TAB_CONTENT_RIGHT_PADDING;
+static_assert(HORIZONTAL_SELECTED_TAB_MIN_WIDTH == 56);
+static_assert(HORIZONTAL_SELECTED_TAB_MIN_WIDTH >= HORIZONTAL_TAB_PADDED_MIN_WIDTH);
+static_assert(HORIZONTAL_SELECTED_TAB_MIN_WIDTH <= horizontal_tab_min_width_with_media_indicators(false, true));
 
 // The selected tab, once it is too narrow for its favicon beside its close button, shows the close button in its
 // favicon's place, so that it can still be closed with a click. A tab playing audio or using the microphone shows that
@@ -983,6 +1019,9 @@ TabBar::TabBar(TabWidget* tab_widget)
 
     connect(this, &QTabBar::currentChanged, this, [this](int index) {
         hide_tab_preview();
+        // NB: The selected horizontal tab has a larger minimum width (see tabSizeHint()).
+        if (tab_layout() == TabLayout::Horizontal)
+            refresh_tab_layout();
         ensure_tab_visible(index);
         update_tab_button_geometry();
     });
@@ -1052,9 +1091,7 @@ void TabBar::lock_tab_widths()
     if (pinned_count >= count())
         return;
 
-    // NB: Only an unpinned tab between the first and the last has no room for a foot.
-    auto end_room = (pinned_count == 0 ? HORIZONTAL_TAB_END_ROOM : 0) + (pinned_count == count() - 1 ? HORIZONTAL_TAB_END_ROOM : 0);
-    m_locked_tab_width = tabRect(pinned_count).width() - end_room;
+    m_locked_tab_width = m_locked_tab_width.value_or(horizontal_tab_share());
     m_tab_width_unlock_timer->stop();
 }
 
@@ -1127,23 +1164,52 @@ QSize TabBar::tabSizeHint(int index) const
             return hint;
         }
 
-        if (m_locked_tab_width.has_value()) {
-            hint.setWidth(*m_locked_tab_width + end_room);
-            hint.setHeight(HORIZONTAL_TAB_HEIGHT);
-            return hint;
-        }
-
-        // The unpinned tabs share whatever width the pinned tiles and the room at the ends leave.
-        auto available_width = (m_available_width > 0 ? m_available_width : this->width()) - (pinned_count * HORIZONTAL_PINNED_TAB_WIDTH) - (2 * HORIZONTAL_TAB_END_ROOM);
-        auto width = available_width / max(1, count - pinned_count);
-        width = min(HORIZONTAL_TAB_MAX_WIDTH, width);
-        width = max(HORIZONTAL_TAB_MIN_WIDTH, width);
-
+        // NB: While the widths are locked, the tabs keep the share they had.
+        auto width = max(horizontal_tab_min_width(index), m_locked_tab_width.value_or(horizontal_tab_share()));
         hint.setWidth(width + end_room);
     }
 
     hint.setHeight(HORIZONTAL_TAB_HEIGHT);
     return hint;
+}
+
+int TabBar::horizontal_tab_min_width(int index) const
+{
+    auto has_speaker = tabButton(index, QTabBar::LeftSide) != nullptr;
+    auto has_microphone = microphone_indicator(index) != nullptr;
+    if (has_speaker || has_microphone)
+        return horizontal_tab_min_width_with_media_indicators(has_speaker, has_microphone);
+    if (index == currentIndex())
+        return HORIZONTAL_SELECTED_TAB_MIN_WIDTH;
+    return HORIZONTAL_TAB_MIN_WIDTH;
+}
+
+// The width of each unpinned horizontal tab that is wider than its own minimum. The unpinned tabs share whatever width
+// the pinned tiles and the room at the ends leave, and a tab whose minimum is larger than its share keeps its minimum,
+// so that the others share what it leaves.
+int TabBar::horizontal_tab_share() const
+{
+    auto pinned_count = pinned_tab_count();
+    auto remaining_width = (m_available_width > 0 ? m_available_width : this->width()) - (pinned_count * HORIZONTAL_PINNED_TAB_WIDTH) - (2 * HORIZONTAL_TAB_END_ROOM);
+    auto sharing_count = count() - pinned_count;
+    if (sharing_count <= 0)
+        return HORIZONTAL_TAB_MIN_WIDTH;
+
+    Vector<int, 8> larger_min_widths;
+    for (int index = pinned_count; index < count(); ++index) {
+        if (auto min_width = horizontal_tab_min_width(index); min_width > HORIZONTAL_TAB_MIN_WIDTH)
+            larger_min_widths.append(min_width);
+    }
+    quick_sort(larger_min_widths, [](int a, int b) { return a > b; });
+    for (auto min_width : larger_min_widths) {
+        if (min_width <= remaining_width / sharing_count)
+            break;
+        remaining_width -= min_width;
+        --sharing_count;
+    }
+
+    auto share = sharing_count > 0 ? remaining_width / sharing_count : 0;
+    return clamp(share, HORIZONTAL_TAB_MIN_WIDTH, HORIZONTAL_TAB_MAX_WIDTH);
 }
 
 void TabBar::resizeEvent(QResizeEvent* event)
@@ -1476,14 +1542,14 @@ void TabBar::paintEvent(QPaintEvent*)
         // The microphone and the speaker sit after the title, with the close button.
         for (auto* indicator : { static_cast<QWidget*>(microphone_indicator(index)), tabButton(index, QTabBar::LeftSide) }) {
             if (indicator && indicator->isVisible())
-                contents_rect.setRight(min(contents_rect.right(), indicator->geometry().left() - 6));
+                contents_rect.setRight(min(contents_rect.right(), indicator->geometry().left() - TAB_CONTENT_BUTTON_GAP));
         }
         // NB: A horizontal tab keeps its close button's slot whether the button shows or not, so that the title ends at
         //     the same place either way.
         if (auto* right_button = tabButton(index, QTabBar::RightSide)) {
             auto keeps_slot = !is_vertical && horizontal_tab_has_room_for_favicon_before(right_button->x(), contents_rect.left());
             if (right_button->isVisible() || keeps_slot)
-                contents_rect.setRight(min(contents_rect.right(), right_button->geometry().left() - 6));
+                contents_rect.setRight(min(contents_rect.right(), right_button->geometry().left() - TAB_CONTENT_BUTTON_GAP));
         }
 
         if (!is_vertical && contents_rect.width() < HORIZONTAL_TAB_MIN_CONTENT_WIDTH_FOR_TITLE) {
@@ -1516,8 +1582,17 @@ void TabBar::paintEvent(QPaintEvent*)
 
         auto title = tabText(index);
         // In an inactive window, the tabs' titles drop to the muted color.
+        // NB: An unselected horizontal tab's title can be quieter than the muted color already, as in dark windows. It
+        //     takes the quieter of the two, so that it never grows louder as its window becomes inactive.
+        auto const& chrome = Theme::chrome(*this);
         auto is_inactive = ChromeStyle::window_activity(*this) == ChromeStyle::WindowActivity::Inactive;
-        auto unselected_text_color = is_inactive ? Theme::chrome(*this).muted : (is_vertical ? Theme::chrome(*this).row_title : Theme::chrome(*this).tab_title);
+        auto quieter_on_strip = [&](QColor const& a, QColor const& b) {
+            auto strip_lightness = chrome.strip.lightnessF();
+            return abs(a.lightnessF() - strip_lightness) <= abs(b.lightnessF() - strip_lightness) ? a : b;
+        };
+        auto unselected_text_color = is_vertical
+            ? (is_inactive ? chrome.muted : chrome.row_title)
+            : (is_inactive ? quieter_on_strip(chrome.tab_title, chrome.muted) : chrome.tab_title);
         auto selected_text_color = is_inactive ? Theme::chrome(*this).muted : Theme::chrome(*this).text;
         auto tab_text_color = ChromeStyle::mix(unselected_text_color, selected_text_color, selection);
 
@@ -2625,19 +2700,28 @@ void TabBar::update_microphone_indicators()
             capturing_tabs.set(tab);
     }
 
+    auto indicators_changed = false;
     m_microphone_indicators.remove_all_matching([&](Tab const* tab, TabMicrophoneIndicator* indicator) {
         if (capturing_tabs.contains(tab))
             return false;
         indicator->hide();
         indicator->deleteLater();
+        indicators_changed = true;
         return true;
     });
 
     for (auto const* tab : capturing_tabs) {
-        if (!m_microphone_indicators.contains(tab))
+        if (!m_microphone_indicators.contains(tab)) {
             m_microphone_indicators.set(tab, new TabMicrophoneIndicator(this));
+            indicators_changed = true;
+        }
     }
 
+    // NB: A horizontal tab with a microphone has a larger minimum width (see tabSizeHint()).
+    if (indicators_changed && tab_layout() == TabLayout::Horizontal) {
+        refresh_tab_layout();
+        return;
+    }
     update_tab_button_geometry();
     update();
 }
@@ -3107,12 +3191,14 @@ void TabBar::update_tab_button_geometry()
                 //     than fading out over the favicon.
                 if (!show_close_button && !has_room && close_button->isVisible())
                     close_button->hide();
-                if (auto* tab_bar_button = qobject_cast<TabBarButton*>(close_button))
+                if (auto* tab_bar_button = qobject_cast<TabBarButton*>(close_button)) {
+                    tab_bar_button->set_tab_emphasized(is_selected || index == m_hovered_tab_index);
                     tab_bar_button->set_revealed(show_close_button);
-                else if (close_button->isVisible() != show_close_button)
+                } else if (close_button->isVisible() != show_close_button) {
                     close_button->setVisible(show_close_button);
+                }
                 if (has_room)
-                    trailing_edge = close_button_position.x() - 2;
+                    trailing_edge = close_button_position.x() - HORIZONTAL_TAB_CLOSE_BUTTON_GAP;
             }
 
             // The speaker of a tab playing audio sits left of the close button's slot, and the microphone of a tab using
@@ -3148,7 +3234,7 @@ void TabBar::update_tab_button_geometry()
             return;
         prepare_button(button, TabBarButton::Placement::SidebarRow);
         if (auto* tab_bar_button = qobject_cast<TabBarButton*>(button))
-            tab_bar_button->set_row_emphasized(index == m_hovered_tab_index || index == currentIndex());
+            tab_bar_button->set_tab_emphasized(index == m_hovered_tab_index || index == currentIndex());
 
         auto button_size = button->size();
         if (button_size.isEmpty())
@@ -5624,11 +5710,11 @@ void TabBarButton::set_revealed(bool revealed)
     m_reveal_animation->start();
 }
 
-void TabBarButton::set_row_emphasized(bool emphasized)
+void TabBarButton::set_tab_emphasized(bool emphasized)
 {
-    if (m_row_emphasized == emphasized)
+    if (m_tab_emphasized == emphasized)
         return;
-    m_row_emphasized = emphasized;
+    m_tab_emphasized = emphasized;
     update();
 }
 
@@ -5659,20 +5745,16 @@ void TabBarButton::paintEvent(QPaintEvent*)
     auto icon_pixmap = icon().pixmap(iconSize(), devicePixelRatioF(), icon_mode);
     option.icon = {};
 
-    // A full sidebar would draw a dark stripe of close buttons down its side, so they are lighter but on the hovered and
-    // the selected rows, and on the button under the pointer.
+    // Every tab shows its close button, so the ones on the other tabs are dimmed, but on the hovered and the selected
+    // tabs, and on the button under the pointer. With increased contrast, none are.
+    // NB: The icon is dimmed as a whole, rather than drawn in a lighter color, so that it steps back as far on every
+    //     surface it sits on.
     auto is_hovered = isDown() || (underMouse() && rect().contains(mapFromGlobal(QCursor::pos())));
-    if (m_placement == Placement::SidebarRow && m_role == Role::Close && !m_row_emphasized && !is_hovered && isEnabled() && !Theme::has_increased_contrast()) {
-        auto dark = Theme::is_dark(*this);
-        if (m_quiet_close_icon.isNull() || m_quiet_close_icon_is_dark != dark) {
-            m_quiet_close_icon = create_chrome_icon(ChromeIcon::TabClose, QColor::fromRgb(dark ? SIDEBAR_ROW_QUIET_CLOSE_ICON_DARK : SIDEBAR_ROW_QUIET_CLOSE_ICON_LIGHT));
-            m_quiet_close_icon_is_dark = dark;
-        }
-        icon_pixmap = m_quiet_close_icon.pixmap(iconSize(), devicePixelRatioF());
-    }
+    auto is_quiet = m_placement != Placement::RailBadge && m_role == Role::Close && !m_tab_emphasized && !is_hovered && isEnabled() && !Theme::has_increased_contrast();
+    auto quiet_opacity = Theme::is_dark(*this) ? QUIET_TAB_CLOSE_BUTTON_OPACITY_DARK : QUIET_TAB_CLOSE_BUTTON_OPACITY_LIGHT;
 
     QStylePainter painter(this);
-    painter.setOpacity(m_opacity);
+    painter.setOpacity(is_quiet ? m_opacity * quiet_opacity : m_opacity);
 
     if (m_placement == Placement::RailBadge) {
         ChromeStyle::paint_control_frame(painter, *this, ChromeStyle::ControlFrameStyle::ActiveTabOverlay);

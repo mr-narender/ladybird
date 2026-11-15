@@ -84,6 +84,10 @@ pub struct DocumentHost {
     /// Where the document's boxes are scrolled to, as the host refreshed it last: what its queries map through, and its
     /// frames take to the compositor. It is handed out by reference count, as the rows are.
     scroll_state: RefCell<Rc<ScrollStateSnapshot>>,
+    /// The visual context trees the viewport mappings the host hands C++ map through.
+    viewport_mapping_trees: RefCell<crate::painting::viewport_mapping::ViewportMappingTrees>,
+    /// The display lists the document was rendered as where it is an SVG image's.
+    vector_images: RefCell<crate::painting::vector_image_cache::VectorImageCache>,
     /// What the host's scopes of a read lend the entries they call.
     begun_read: BegunRead,
     /// The writes the host queued that the render state has not applied yet, in the order the host made them.
@@ -208,6 +212,8 @@ impl DocumentHost {
             absolute_rects: RefCell::default(),
             compositor_animations: RefCell::default(),
             scroll_state: RefCell::default(),
+            viewport_mapping_trees: RefCell::default(),
+            vector_images: RefCell::default(),
             begun_read: BegunRead::of_host(),
             changes: ChangeQueue::default(),
             flown_style: RefCell::default(),
@@ -1063,13 +1069,16 @@ impl DocumentHost {
         self.changes.set_aside();
     }
 
-    /// Queues the writes the host set aside behind those it queued meanwhile.
-    pub(crate) fn queue_writes_set_aside(&self) {
+    /// Queues the writes the host set aside behind those it queued meanwhile. Returns whether any of them stales the
+    /// paint and hit testing properties.
+    pub(crate) fn queue_writes_set_aside(&self) -> bool {
         // The paint and hit testing properties prepared while they were set aside read the render state as it was
         // before them.
-        if self.changes.queue_set_aside() {
+        let stales_paint_preparation = self.changes.queue_set_aside();
+        if stales_paint_preparation {
             self.note_render_state_write();
         }
+        stales_paint_preparation
     }
 
     /// Ends the drain of the style update that flew: the writes the host queued beside it are queued again, behind
@@ -1116,6 +1125,13 @@ impl DocumentHost {
 
     pub(crate) fn first_letter_styles_may_be_derived(&self) -> bool {
         self.shared.first_letter_styles_derived.load(Ordering::Relaxed)
+    }
+
+    /// Whether some text row may wait for paint timing to look at it, where no frame flies whose layout may give a row
+    /// new rendered text.
+    pub(crate) fn text_rows_may_await_first_paint(&self) -> bool {
+        self.layout_waits_for_no_frame().is_none()
+            || self.shared.text_rows_noted_for_first_paint.load(Ordering::Relaxed)
     }
 
     /// Whether some element may have random base values to keep, which only then is worth asking the render state.
@@ -1527,6 +1543,16 @@ impl DocumentHost {
         self.scroll_state.borrow().clone()
     }
 
+    /// The visual context trees the viewport mappings the host hands C++ map through.
+    pub(crate) fn viewport_mapping_trees(&self) -> RefMut<'_, crate::painting::viewport_mapping::ViewportMappingTrees> {
+        self.viewport_mapping_trees.borrow_mut()
+    }
+
+    /// The display lists the document was rendered as where it is an SVG image's.
+    pub(crate) fn vector_images(&self) -> RefMut<'_, crate::painting::vector_image_cache::VectorImageCache> {
+        self.vector_images.borrow_mut()
+    }
+
     /// Takes `device_offsets`, the offsets the render state refreshed, as the document's scroll state.
     pub(crate) fn refresh_scroll_state(&self, device_offsets: Vec<FloatPoint>) {
         self.scroll_state
@@ -1644,10 +1670,11 @@ pub extern "C" fn document_host_set_writes_aside(host: &DocumentHost) {
     host.set_writes_aside();
 }
 
-/// Queues the writes `host` set aside behind the writes it queued meanwhile.
+/// Queues the writes `host` set aside behind the writes it queued meanwhile. Returns whether any of them stales the
+/// paint and hit testing properties, which a recording made while they were set aside did not see.
 #[unsafe(no_mangle)]
-pub extern "C" fn document_host_queue_writes_set_aside(host: &DocumentHost) {
-    host.queue_writes_set_aside();
+pub extern "C" fn document_host_queue_writes_set_aside(host: &DocumentHost) -> bool {
+    host.queue_writes_set_aside()
 }
 
 /// Destroys `host`, and has the render owner drop the render state of its document, where a job made one, without

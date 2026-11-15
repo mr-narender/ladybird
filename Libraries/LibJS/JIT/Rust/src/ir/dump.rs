@@ -13,6 +13,7 @@ use super::NodeId;
 use super::Op;
 use super::ShapeCheck;
 use super::SuspendKind;
+use super::VirtualObjectKind;
 use super::value;
 use crate::bytecode::FrameLayout;
 use crate::bytecode::Operand;
@@ -230,13 +231,22 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         }
         Op::InitializeNamed { offset } => with_inputs(&format!("InitializeNamed +{offset}")),
         Op::AllocateArray { count } => format!("AllocateArray with {count} elements"),
-        Op::VirtualObject { shape, .. } => with_inputs(&format!("VirtualObject {:#x}", shape.0)),
+        Op::VirtualObject {
+            kind: VirtualObjectKind::Object { shape },
+            ..
+        } => with_inputs(&format!("VirtualObject {:#x}", shape.0)),
+        Op::VirtualObject {
+            kind: VirtualObjectKind::Closure { sample },
+            ..
+        } => with_inputs(&format!("VirtualObject closure {:#x}", sample.0)),
         Op::AllocateEnvironment { shape_cache, capacity } => {
             with_inputs(&format!("AllocateEnvironment {shape_cache} capacity {capacity}"))
         }
         Op::AllocateFunction {
+            executable,
             shared_function_data_index,
-        } => with_inputs(&format!("AllocateFunction {shared_function_data_index}")),
+            ..
+        } => with_inputs(&format!("AllocateFunction e{executable}:{shared_function_data_index}")),
         Op::InitializeElement { index } => with_inputs(&format!("InitializeElement [{index}]")),
         Op::CheckObject => with_inputs("CheckObject"),
         Op::CheckValue { expected, .. } => with_inputs(&format!("CheckValue {expected:#x}")),
@@ -317,7 +327,6 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::Uint32ShiftRight
         | Op::Uint32ToFloat64
         | Op::StringsEqual
-        | Op::ConcatenateStrings
         | Op::IntegerToString
         | Op::CheckAppendableArray
         | Op::LoadElementsLength
@@ -345,6 +354,8 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::LoadTypedArrayDataOffset
         | Op::TypedArrayDataAddress
         | Op::CheckTypedArrayStorage => with_inputs(op.name()),
+        Op::ConcatenateStrings { key: false } => with_inputs("ConcatenateStrings"),
+        Op::ConcatenateStrings { key: true } => with_inputs("ConcatenateKeyStrings"),
         Op::ProbeHasProperty { own: true } => with_inputs("ProbeHasOwnProperty"),
         Op::ProbeHasProperty { own: false } => with_inputs("ProbeHasProperty"),
         Op::ProbeGlobalCache { cache } | Op::ProbeGlobalStore { cache } => {

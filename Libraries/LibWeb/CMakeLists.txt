@@ -564,7 +564,6 @@ set(SOURCES
     HTML/RadioNodeList.cpp
     HTML/RemoteNavigable.cpp
     HTML/RemoteWindow.cpp
-    HTML/Sanitizer.cpp
     HTML/SanitizerConfiguration.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
@@ -848,6 +847,7 @@ set(SOURCES
     SVG/SVGPreserveAspectRatio.cpp
     SVG/SVGRadialGradientElement.cpp
     SVG/SVGRectElement.cpp
+    SVG/SVGResourceDocument.cpp
     SVG/SVGScriptElement.cpp
     SVG/SVGSetElement.cpp
     SVG/SVGStopElement.cpp

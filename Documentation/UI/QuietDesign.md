@@ -97,8 +97,8 @@ All sizes are in logical pixels.
 | Active tab | 30 px tall | 8 px top radius plus an 8 px inverted "foot" on each side where it joins the toolbar. 5 px of strip shows above it. Its contents are vertically centered in it, which puts them on the shared center line. |
 | End insets | Favicon 7 px from the left edge; × glyph 11 px from the right edge | Rule: each end item is as far from the tab's side as it is from the tab's top (the 16 px favicon sits 7 px down, the 8 px × glyph 11 px down). Padding: active 0 6 px 0 7 px; inactive 3 px inset + 0 3 px 0 4 px, so favicons and × never move when a tab becomes active. |
 | Favicon to title | 8 px | |
-| Close button | 18 px hover square, 7 px × (14 px glyph box); click area extends to the full tab height | The × is always visible on every tab except pinned tabs, in `muted`; its hover square appears on hover. Indicators like the speaker and the microphone sit to its left. |
-| Tab width | 20 to 232 px | Tabs shrink until only the favicon is left, giving up their padding below 32 px, then the strip scrolls. A tab too narrow for its favicon beside its × shows only the favicon; the active one shows its × in the favicon's place. |
+| Close button | 18 px hover square, 7 px × (14 px glyph box); click area extends to the full tab height | The × is always visible on every tab except pinned tabs, in `muted`. On tabs that are neither active nor hovered it is dimmed as a whole, to 75% opacity in light and 55% in dark and private, and it is at full opacity on the active tab, on a hovered tab and with increased contrast. Its hover square appears on hover. Indicators like the speaker and the microphone sit to its left. |
+| Tab width | 20 to 232 px | Tabs shrink until only the favicon is left, giving up their padding below 32 px, then the strip scrolls. A tab with a speaker or a microphone stops shrinking where its favicon still fits beside them and its ×: 75 px with a speaker, 72 px with a microphone, 89 px with both. The other tabs share what is left. The active tab stops shrinking at 56 px, where its favicon and × still fit side by side. Any other tab too narrow for its favicon beside its × shows only the favicon. |
 | Pinned tab | 44 px wide | Favicon only, always first. While the tab plays audio or uses the microphone, those indicators take the favicon's place. |
 | New tab (+) | 26 px button, 14 px glyph | Follows the last tab directly, 8 px after it (just clear of the active tab's foot), centered on the tab row; with few tabs it does not move to the end of the strip. Click area at least 32 px. |
 | Separators | 1 × 16 px | Between inactive tabs only, hidden next to hovered or active tabs |
@@ -130,7 +130,7 @@ All sizes are in logical pixels.
 | Element | Size |
 |---|---|
 | Sidebar width | 236 px |
-| Tab rows | 30 px, 6 px radius. Selected: toolbar color with a soft shadow in light; white 15% fill only in dark and private, with no ring: on the dark sidebar the fill is enough, and stacked outlines (Ladybird button, focused field, row) make the column busy. The × on each row is lighter at rest (`#9C9CA3` light, `#7A7A81` dark) and takes the `muted` color on the hovered and selected rows, so a full list does not draw a dark stripe down the sidebar. It is always there; only its tone changes. |
+| Tab rows | 30 px, 6 px radius. Selected: toolbar color with a soft shadow in light; white 15% fill only in dark and private, with no ring: on the dark sidebar the fill is enough, and stacked outlines (Ladybird button, focused field, row) make the column busy. The × on each row is dimmed at rest, as on a horizontal tab (75% opacity in light, 55% in dark and private), and is at full opacity on the hovered and selected rows, so a full list does not draw a dark stripe down the sidebar. It is always there; only its tone changes. |
 | Collapsed rail | 52 px. Tiles are 36 × 32 with the favicon centered. Badges sit on the favicon's corners, 18 px round on a toolbar-colored backing with a hairline ring: × top left (on hover only), speaker bottom right (while playing or muted), microphone bottom left (while in use). The × and the speaker are buttons, and opposite corners keep them apart. The microphone is not a button; it sits 2 px from the speaker and touches the × while that shows on hover. |
 | Header | Traffic lights, Ladybird button, all tabs, then empty space, then the hide-sidebar toggle at the sidebar's right edge. With the sidebar collapsed, the toolbar starts the same way: traffic lights, Ladybird button, all tabs, show-sidebar toggle. |
 | Background | `sidebar` token: the strip color in light, the toolbar color in dark and private. The page must never sit directly against near-black chrome. |
@@ -181,7 +181,7 @@ Numbers that change in place (zoom, counts, sizes, times) use tabular figures.
 | `sidebar` | Vertical tabs sidebar and rail | `#DCDCE0` | `#2E2E31` | `#CFCFD4` |
 | `field` | Address field fill | Black 8% | White 8% | White + 1 px `#6E6E73` border |
 | `text` | Titles, URL domain | `#1D1D1F` | `#F2F2F5` | `#000000` |
-| `tab-title` | Inactive tab titles | `#3A3A40` | `#ACACB4` | `#3A3A40` |
+| `tab-title` | Inactive tab titles | `#55555C` | `#8F8F97` | `#3A3A40` |
 | `muted` | URL path, secondary text | `#5D5D64` | `#ACACB4` | `#3A3A40` |
 | `icon` | Toolbar icons | `#3A3A40` | `#DCDCE1` | `#1D1D1F` |
 | `disabled` | Disabled controls | `#B3B3B9` | `#5B5B61` | `#8E8E93` |
@@ -261,7 +261,8 @@ bluer, lighter lavender, and its dark surfaces carry less tint than other themes
 | `strip` | `#110A20` |
 | `toolbar` | `#2F2347` |
 | `text` | `#F3F0FA` |
-| `muted`, `tab-title` | `#B3AAC4` |
+| `muted` | `#B3AAC4` |
+| `tab-title` | `#958CA8` |
 | `icon` | `#E2DCEF` |
 | `disabled` | `#5E566E` |
 | `field` | White 9% |
@@ -333,9 +334,11 @@ Don't invent new shadows. Pick a level.
 
 - Drawn on a 16 px grid with a 1.5 px stroke, round caps and round joins. Outline only.
   The only filled glyphs are state fills (a bookmarked star).
-- Rendered at 16 px inside the address field, menus and panels.
-- Rendered at 18 px in toolbar buttons, with a 1.4 stroke on the 16 px grid, so they read
-  as slightly bolder next to the 28 px field.
+- Rendered at 16 px inside the address field, menus and panels, at 18 px in toolbar buttons,
+  and at 14 px on tabs.
+- Every icon from 14 to 18 px keeps the same 1.5 px line, whatever its size: 1.33 on the
+  16 px grid at 18 px, 1.5 at 16 px and 1.71 at 14 px. The Ladybird button and the native
+  window controls are drawn on their own terms.
 - Icon color is the `icon` token in the toolbar and `body` in panels. Never accent-colored.
 - Icon colors are always opaque. Never draw an icon with a translucent stroke: where its lines overlap, the color adds up and the crossings show as brighter spots. To dim an icon (disabled, inactive window), apply opacity to the whole icon at once.
 - Render icons from the vector at the screen's device pixel ratio, positioned on whole pixels. Never scale a pre-rendered bitmap.
@@ -503,7 +506,8 @@ settings.
 
 ### Site settings
 
-- Opened from the icon at the left of the field.
+- Opened from the icon at the left of the field, which shows its pressed fill for as long as the
+  panel is open. The "Not secure" pill in its place does the same.
 - Header: favicon, domain, "Certificate" link.
 - Permissions (location, camera, microphone, notifications) with Ask / Allow / Block menus.
 - "Content blocking" switch, then "Blocked on this page" with a count, which drills in to
@@ -769,7 +773,7 @@ zoom chip, drag and drop) is on the canvas's motion spec board.
 | Situation | Behavior |
 |---|---|
 | Tooltips | After 500 ms of hover. Once one has shown, neighbouring tooltips appear at once for the next 1.5 s. |
-| Tab close | Every tab except pinned tabs always shows its ×. A tab too narrow for both its favicon and its × shows only its favicon, and once selected, its × in the favicon's place. Nothing appears or moves on hover. Middle-click anywhere on a tab closes it. In the collapsed sidebar rail the × stays a hover badge, so favicons aren't covered. |
+| Tab close | Every tab except pinned tabs always shows its ×. A tab too narrow for both its favicon and its × shows only its favicon, and once selected, its × in the favicon's place. Nothing appears or moves on hover; the × of an inactive tab only goes from dimmed to full opacity. Middle-click anywhere on a tab closes it. In the collapsed sidebar rail the × stays a hover badge, so favicons aren't covered. |
 | Width lock | After closing a tab by clicking, tab widths stay fixed until the pointer leaves the strip, plus 300 ms, so the next × lands under the cursor. |
 | Dragging tabs | Starts after 4 px. The tab stays in the strip and slides along it until pulled 40 px away (up or down; sideways out of the sidebar in vertical mode), then comes loose as a window preview. Esc cancels. |
 | Dropping | A link, URL or file dropped on the strip opens a new tab at the marker; on the bookmarks bar it becomes a bookmark; on the page, the page decides. |

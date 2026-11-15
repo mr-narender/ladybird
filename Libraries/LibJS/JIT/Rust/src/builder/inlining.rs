@@ -56,6 +56,7 @@ use crate::ir::NodeId;
 use crate::ir::Op;
 use crate::ir::ShapeCheck;
 use crate::ir::value;
+use crate::snapshot::CallFeedbackSnapshot;
 use crate::snapshot::CellId;
 use crate::snapshot::ConstructTarget;
 use crate::snapshot::Forwarding;
@@ -139,6 +140,10 @@ fn can_inline(callee: &Function<'_>, virtual_arguments: bool, derived_construct:
         //     runtime). A handler that caught before would make the code leave again and again.
         if opcode == OpCode::Catch {
             return !super::has_run(callee.executable, instruction.pc);
+        }
+        // NB: An inlined callee reads what its call passed for constant indices (see `try_build_argument()`).
+        if opcode == OpCode::GetArgument {
+            return virtual_arguments && arguments::has_constant_index(callee, &instruction.instruction);
         }
         let reads_frame_fields = matches!(
             opcode,
@@ -653,14 +658,21 @@ impl<'a> GraphBuilder<'a> {
         };
         let slots_offset = u64::from(self.runtime.offsets.execution_context_slots);
         if let Some(native) = feedback.native_call.filter(|native| native.entry.is_some()) {
-            self.reserve_call_frame(slots_offset + 8 * u64::from(*argument_count));
-            self.embed(native.function);
-            self.embed(native.realm);
             // NB: Native calls take the callee, the `this` value and the
             //     arguments as inputs like direct calls do.
             let mut inputs = vec![*callee, *this_value];
             inputs.extend(arguments.iter().copied());
-            if let Some(inlined_frame_bytes) = self.inlined_frame_bytes_of_call(&inputs) {
+            // NB: Calls without the frames of the inlined calls they are in check their callee (see
+            //     `check_call_without_frames_target()`), and are generic where those checks exited before.
+            let without_frames = self.inlined_frame_bytes_of_call(&inputs);
+            if without_frames.is_some() && !self.may_speculate(ExitKind::BadCallTarget) {
+                return Ok(None);
+            }
+            self.reserve_call_frame(slots_offset + 8 * u64::from(*argument_count));
+            self.embed(native.function);
+            self.embed(native.realm);
+            if let Some(inlined_frame_bytes) = without_frames {
+                self.check_callee(*callee, native.function)?;
                 let op = Op::CallNative {
                     executable: self.function.index,
                     pc: self.function.pc,
@@ -748,6 +760,21 @@ impl<'a> GraphBuilder<'a> {
         let Handling::Generic(info) = handling(OpCode::Call) else {
             unreachable!("calls are generic instructions");
         };
+        // NB: Direct calls take the callee, the `this` value if the callee
+        //     reads it, and the arguments as inputs (see
+        //     `codegen::DIRECT_CALL_MAX_INPUTS`), and store them straight
+        //     into the callee's frame, except in inlined callees whose frames
+        //     are written whole, and for the virtual arguments object.
+        // NB: Calls without the frames of the inlined calls they are in
+        //     always take `this`, for their slow paths.
+        let mut inputs = vec![*callee, *this_value];
+        inputs.extend(arguments.iter().copied());
+        // NB: Calls without those frames check their callee, unless it is constant (see
+        //     `check_call_without_frames_target()`), and are generic where those checks exited before.
+        let without_frames = self.inlined_frame_bytes_of_call(&inputs);
+        if without_frames.is_some() && constant_target.is_none() && !self.may_speculate(ExitKind::BadCallTarget) {
+            return Ok(None);
+        }
         let slots_offset = u64::from(self.runtime.offsets.execution_context_slots);
         let slot_count = u64::from(target.registers_and_locals_and_constants_count)
             + u64::from((*argument_count).max(target.function.formal_parameter_count));
@@ -773,16 +800,10 @@ impl<'a> GraphBuilder<'a> {
                 self.embed(cell);
             }
         }
-        // NB: Direct calls take the callee, the `this` value if the callee
-        //     reads it, and the arguments as inputs (see
-        //     `codegen::DIRECT_CALL_MAX_INPUTS`), and store them straight
-        //     into the callee's frame, except in inlined callees whose frames
-        //     are written whole, and for the virtual arguments object.
-        // NB: Calls without the frames of the inlined calls they are in
-        //     always take `this`, for their slow paths.
-        let mut inputs = vec![*callee, *this_value];
-        inputs.extend(arguments.iter().copied());
-        if let Some(inlined_frame_bytes) = self.inlined_frame_bytes_of_call(&inputs) {
+        if let Some(inlined_frame_bytes) = without_frames {
+            if constant_target.is_none() {
+                self.check_call_without_frames_target(*callee, target)?;
+            }
             let op = Op::CallDirect {
                 executable: self.function.index,
                 pc: self.function.pc,
@@ -807,6 +828,34 @@ impl<'a> GraphBuilder<'a> {
         };
         self.build_generic_node_with_inputs(instruction, info, op, &inputs, None)
             .map(Some)
+    }
+
+    /// Checks that the callee of a direct call of `target` that runs without
+    /// the frames of the inlined calls it is in is the target (or a closure
+    /// of its function, if the site called those), exiting otherwise.
+    /// Where such checks exited before, the call is generic instead.
+    ///
+    /// OPTIMIZATION: Calling another callee there takes the frames of the
+    ///               inlined calls created by the runtime first, every time,
+    ///               which costs more than a generic call. Its exit lets
+    ///               the next compilation make one.
+    fn check_call_without_frames_target(
+        &mut self,
+        callee: Operand,
+        target: crate::snapshot::DirectCallTarget,
+    ) -> Result<(), CompileFailure> {
+        if target.closures {
+            let value = self.read(callee)?;
+            self.emit_checked(
+                Op::CheckClosure {
+                    shared_data: target.function.shared_data,
+                },
+                vec![value],
+                None,
+            );
+            return Ok(());
+        }
+        self.check_callee(callee, target.function.function)
     }
 
     /// For a direct or native call in an inlined callee that can run
@@ -872,7 +921,7 @@ impl<'a> GraphBuilder<'a> {
         Ok(Flow::Continue)
     }
 
-    /// Inlines a `Call`, if its feedback saw a single callee that qualifies,
+    /// Inlines a `Call`, if its callee is a function the code knows, or its feedback saw a single callee that qualifies,
     /// or a single function its callee forwarded every call to: through
     /// `Function.prototype.call` (`f.call(this_arg, ...)`), through
     /// `Function.prototype.apply` with the arguments object the code never
@@ -893,6 +942,26 @@ impl<'a> GraphBuilder<'a> {
         };
         if let Some(flow) = self.try_inline_closure_call(instruction)? {
             return Ok(Some(flow));
+        }
+        // NB: A callee the code knows exactly is what the call calls, whatever callees its feedback saw.
+        if let Some(index) = self.constant_inlinable_function(*callee) {
+            let callback = self
+                .call_feedback(*call_feedback)
+                .filter(|feedback| feedback.inline_executable == Some(index))
+                .and_then(|feedback| forwarded_callback(&feedback));
+            let call = InlinedCallSite {
+                callback,
+                ..InlinedCallSite::new(
+                    index,
+                    InlineValue::Operand(*this_value),
+                    arguments.iter().copied().map(InlineValue::Operand).collect(),
+                    *argument_count,
+                    *dst,
+                )
+            };
+            if let Some(flow) = self.inline_call(call)? {
+                return Ok(Some(flow));
+            }
         }
         // NB: The feedback of a builtin's calls comes from all its callers,
         //     whose callbacks it calls, so it says nothing about this one.
@@ -929,16 +998,7 @@ impl<'a> GraphBuilder<'a> {
             return Ok(None);
         };
         if let Some(index) = feedback.inline_executable {
-            // NB: Builtins that take callbacks record them as forwarded calls.
-            let callback = feedback
-                .forwarded
-                .filter(|forwarded| forwarded.forwarding == Forwarding::Callback)
-                .and_then(|forwarded| {
-                    Some(CallbackTarget {
-                        index: forwarded.inline_executable?,
-                        closures: feedback.flags & call_feedback_flags::FORWARDED_CLOSURES != 0,
-                    })
-                });
+            let callback = forwarded_callback(&feedback);
             let call = InlinedCallSite {
                 callee: Some(*callee),
                 callback,
@@ -1417,12 +1477,14 @@ impl<'a> GraphBuilder<'a> {
             return Ok(None);
         };
         let Op::AllocateFunction {
+            executable,
             shared_function_data_index,
+            ..
         } = self.graph.node(closure).op
         else {
             return Ok(None);
         };
-        let Some(index) = self.snapshot.executables[0]
+        let Some(index) = self.snapshot.executables[executable as usize]
             .closure_templates
             .get(shared_function_data_index as usize)
             .and_then(Option::as_ref)
@@ -1509,7 +1571,7 @@ impl<'a> GraphBuilder<'a> {
                 InlinedCallKind::Construct
             };
             let Some(InlinableCallee { executable, .. }) =
-                self.inlinable_callee(target.executable, kind, false, &inlined_above)
+                self.inlinable_callee(target.executable, kind, false, true, &inlined_above)
             else {
                 return false;
             };
@@ -2010,6 +2072,19 @@ impl<'a> GraphBuilder<'a> {
         callee_executable: &crate::snapshot::ExecutableSnapshot,
         inlined_above: &[CellId],
     ) -> bool {
+        self.may_inline_unchecked_calls_of_below(callee_executable, inlined_above)
+            && self.may_speculate(ExitKind::BadCallTarget)
+    }
+
+    /// Like `may_inline_calls_of_below()`, for a call that inlines its
+    /// callee without checking it, since the code knows exactly what it is:
+    /// such a call cannot exit for another callee, even where checks of
+    /// the callee exited before.
+    fn may_inline_unchecked_calls_of_below(
+        &self,
+        callee_executable: &crate::snapshot::ExecutableSnapshot,
+        inlined_above: &[CellId],
+    ) -> bool {
         const MAX_RECURSION_DEPTH: usize = 2;
         let recursion_depth = core::iter::once(&self.function)
             .chain(&self.callers)
@@ -2019,7 +2094,6 @@ impl<'a> GraphBuilder<'a> {
             .count();
         recursion_depth <= MAX_RECURSION_DEPTH
             && self.callers.len() + inlined_above.len() < self.snapshot.options.inlining.max_depth as usize
-            && self.may_speculate(ExitKind::BadCallTarget)
     }
 
     /// Whether a call with a few callees (see `try_inline_callee_cases()`)
@@ -2047,7 +2121,8 @@ impl<'a> GraphBuilder<'a> {
     }
 
     /// The snapshot executable `index`, if a call of the
-    /// kind `kind` (a closure call if `closure`) may inline it here once the
+    /// kind `kind` (a closure call if `closure`, which checks its callee if
+    /// `checks_callee`) may inline it here once the
     /// executables `inlined_above` (their cells) are inlined here, one in the
     /// other: the checks of `inline_call()` that do not depend on the values
     /// at the call site, which `may_inline_super_constructor()` makes ahead
@@ -2057,12 +2132,18 @@ impl<'a> GraphBuilder<'a> {
         index: u32,
         kind: InlinedCallKind,
         closure: bool,
+        checks_callee: bool,
         inlined_above: &[CellId],
     ) -> Option<InlinableCallee<'a>> {
         let snapshot = self.snapshot;
         let callee_executable = snapshot.executables.get(index as usize)?;
         callee_executable.function?;
-        if !self.may_inline_calls_of_below(callee_executable, inlined_above) {
+        let may_inline = if checks_callee {
+            self.may_inline_calls_of_below(callee_executable, inlined_above)
+        } else {
+            self.may_inline_unchecked_calls_of_below(callee_executable, inlined_above)
+        };
+        if !may_inline {
             return None;
         }
         let decoded = super::decoded_function(callee_executable, &self.decoded[index as usize]).ok()?;
@@ -2083,10 +2164,12 @@ impl<'a> GraphBuilder<'a> {
         //     create the object from.
         let virtual_arguments =
             self.virtualize_arguments.compiled_function && self.virtualize_arguments.inlined_callees;
-        let creates_arguments = decoded
-            .instructions
-            .iter()
-            .any(|instruction| instruction.instruction.opcode() == OpCode::CreateArguments);
+        let uses_passed_arguments = decoded.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.instruction.opcode(),
+                OpCode::CreateArguments | OpCode::GetArgument
+            )
+        });
         // NB: A derived constructor that passes its arguments on to super() keeps them all, like legacy `arguments`.
         let derived_construct = kind == InlinedCallKind::DerivedConstruct;
         let forwards_arguments_to_super = derived_construct
@@ -2096,7 +2179,7 @@ impl<'a> GraphBuilder<'a> {
                 .any(|instruction| instruction.instruction.opcode() == OpCode::SuperCallWithForwardedArguments);
         let has_legacy_arguments = callee_executable.supports_legacy_arguments
             || (closure && callee_executable.is_non_strict_function())
-            || (virtual_arguments && creates_arguments)
+            || (virtual_arguments && uses_passed_arguments)
             || forwards_arguments_to_super;
         let callee_function = Function::new(index, callee_executable, decoded, has_legacy_arguments).ok()?;
         if !can_inline(&callee_function, virtual_arguments, derived_construct) {
@@ -2164,11 +2247,16 @@ impl<'a> GraphBuilder<'a> {
                 (Some(_), Some(_)) => InlinedCallKind::DerivedConstruct,
             },
             closure.is_some(),
+            callee.is_some() || check_closure || construct.is_some(),
             &[],
         )
         else {
             return Ok(None);
         };
+        // NB: What a real frame would read for an argument that the call did not pass depends on %Object.prototype%.
+        if arguments::reads_argument_not_passed(&callee_function, passed_argument_count) {
+            return Ok(None);
+        }
         let function = callee_executable.function.expect("inlined callees have a function");
         let instruction_count = callee_function.instructions.len();
 
@@ -2401,4 +2489,15 @@ impl<'a> GraphBuilder<'a> {
         self.graph.blocks[continuation.index()].predecessors.push(self.block);
         Ok(Flow::Ended)
     }
+}
+
+/// The callback a call of a builtin that takes callbacks passed it, which such builtins record as forwarded calls.
+fn forwarded_callback(feedback: &CallFeedbackSnapshot) -> Option<CallbackTarget> {
+    let forwarded = feedback
+        .forwarded
+        .filter(|forwarded| forwarded.forwarding == Forwarding::Callback)?;
+    Some(CallbackTarget {
+        index: forwarded.inline_executable?,
+        closures: feedback.flags & call_feedback_flags::FORWARDED_CLOSURES != 0,
+    })
 }

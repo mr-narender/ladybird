@@ -9,8 +9,8 @@
 #include <AK/ByteBuffer.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/Time.h>
 #include <AK/Vector.h>
-#include <LibCompositing/DisplayList/AccumulatedVisualContext.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibGC/Ptr.h>
 #include <LibWeb/Export.h>
@@ -35,10 +35,14 @@ public:
 
     BlockingWheelEventRegionState collect_root_blocking_wheel_event_regions(DOM::Document&);
 
-    // The mapping reads the tree and the scroll state where it is used, so the tree has to outlive it.
-    Layout::RustFFI::FfiViewportMapping viewport_mapping(Compositing::AccumulatedVisualContextTree const&, double device_pixels_per_css_pixel) const;
+    // The mapping through the document's visual context tree, brought up to date, with the compositor's animations
+    // sampled at the time where one is given. It reads the scroll state, and the tree the host keeps for its mappings,
+    // where it is used.
+    Layout::RustFFI::FfiViewportMapping viewport_mapping(DOM::Document const&, Optional<MonotonicTime> visual_animation_sample_time, double device_pixels_per_css_pixel) const;
+    // Whether the scroll translations of the space the box is painted in, and the origins drawn in it, round to whole
+    // device pixels: no transform but identities lies above it in the visual context tree, brought up to date.
+    bool translations_snap_to_device_pixels(DOM::Document const&, Compositing::RustFFI::NodeSlotId box) const;
     // Only the scroll logic of the compositor, which is Rust, decodes it.
-    ByteBuffer encoded_scroll_state() const;
     void did_update_visual_context_values();
 
     void update_visual_viewport_accumulated_visual_context(Layout::BegunRead const& read, DOM::Document&);
@@ -69,21 +73,7 @@ public:
     void set_boxes_with_auto_content_visibility(Vector<Compositing::RustFFI::NodeSlotId> boxes) { m_boxes_with_auto_content_visibility = move(boxes); }
     Vector<Compositing::RustFFI::NodeSlotId> const& boxes_with_auto_content_visibility() const { return m_boxes_with_auto_content_visibility; }
 
-    Compositing::AccumulatedVisualContextTree visual_context_tree(DOM::Document const&) const;
     u64 visual_context_tree_structural_epoch(Layout::BegunRead const& read) const;
-
-    void set_display_list_used_as_paint_command_cache_source(RefPtr<Compositing::DisplayList> display_list, Compositing::DisplayListResourceSet referenced_resources, Compositing::AccumulatedVisualContextTree visual_context_tree)
-    {
-        m_display_list_used_as_paint_command_cache_source = move(display_list);
-        m_paint_command_cache_source_visual_context_tree = move(visual_context_tree);
-        m_paint_command_cache_source_referenced_resources = move(referenced_resources);
-    }
-    Compositing::DisplayList* display_list_used_as_paint_command_cache_source() const { return m_display_list_used_as_paint_command_cache_source.ptr(); }
-    Compositing::DisplayListResourceSet const& paint_command_cache_source_referenced_resources() const { return m_paint_command_cache_source_referenced_resources; }
-
-    Optional<Compositing::AccumulatedVisualContextTree> const& paint_command_cache_source_visual_context_tree() const { return m_paint_command_cache_source_visual_context_tree; }
-
-    void append_paint_command_cache_source_resources(Compositing::DisplayListResourceSet&) const;
 
 private:
     Vector<String> m_recording_traces;
@@ -91,10 +81,6 @@ private:
     NonnullRefPtr<Layout::NodeArena> m_layout_node_arena;
 
     Vector<Compositing::RustFFI::NodeSlotId> m_boxes_with_auto_content_visibility;
-
-    RefPtr<Compositing::DisplayList> m_display_list_used_as_paint_command_cache_source;
-    Optional<Compositing::AccumulatedVisualContextTree> m_paint_command_cache_source_visual_context_tree;
-    Compositing::DisplayListResourceSet m_paint_command_cache_source_referenced_resources;
 };
 
 }

@@ -180,6 +180,7 @@ fn record_display_list_impl<O: Observer>(
     hit_test_list.recorded_structural_epoch = structural_epoch;
     let output = RecordingOutput {
         recorded_structural_epoch: structural_epoch,
+        visual_context_tree: paint_state.visual_context_tree.clone(),
         frame_inputs,
         root_background_canvas_rect,
         prologue_bytes,
@@ -192,6 +193,10 @@ fn record_display_list_impl<O: Observer>(
         window_is_focused: inputs.window_is_focused,
         capture_log: recorder.observer.finish(),
         vector_image_display_lists: Vec::new(),
+        resources: Default::default(),
+        display_list_id: 0,
+        surface_clear_color: None,
+        async_scrolling_metadata: None,
     };
     RecordingResult {
         output,

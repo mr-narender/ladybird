@@ -414,29 +414,48 @@ pub unsafe extern "C" fn render_state_publish_compositor_animations(
     outcome
 }
 
-/// The visual context tree of `host`'s document, prepared up to date, retained for the caller.
+/// The visual context tree of `host`'s document, prepared up to date.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread.
+pub(crate) unsafe fn main_visual_context_tree(
+    host: &crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
+) -> Option<std::sync::Arc<crate::painting::visual_context::VisualContextTree>> {
+    // SAFETY: Guaranteed by the caller.
+    unsafe { prepare_paint_properties(host, read) };
+    if let Some(tree) = host.read_known_rows(|rows, _| rows.visual_context_tree.clone()) {
+        return tree;
+    }
+    read_arena(host, read, (), |arena, ()| {
+        arena.paint_state().visual_context.tree.clone()
+    })
+}
+
+/// Whether the scroll translations of the space `slot`'s box is painted in, in the visual context tree of `host`'s
+/// document, prepared up to date, and the origins drawn in that space round to whole device pixels: no transform but
+/// identities lies above it.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_main_visual_context_tree_retain(
+pub unsafe extern "C" fn render_state_translations_snap_to_device_pixels(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
-) -> *const c_void {
-    fn retain(tree: Option<&std::sync::Arc<crate::painting::visual_context::VisualContextTree>>) -> *const c_void {
-        tree.map_or(std::ptr::null(), |tree| {
-            std::sync::Arc::into_raw(std::sync::Arc::clone(tree)).cast()
-        })
-    }
+    slot: NodeSlotId,
+) -> bool {
+    // NB: Preparing the tree can move the box's visual context to other nodes, so the box's space is read after.
     // SAFETY: Guaranteed by the caller.
-    unsafe { prepare_paint_properties(host, read) };
-    if let Some(tree) = host.read_known_rows(|rows, _| retain(rows.visual_context_tree.as_ref())) {
-        return tree;
-    }
-    read_arena(host, read, (), |arena, ()| {
-        retain(arena.paint_state().visual_context.tree.as_ref())
-    })
+    let Some(tree) = (unsafe { main_visual_context_tree(host, read) }) else {
+        return false;
+    };
+    let spatial = host.read_rows(node_read(), false, |rows| {
+        rows.paintable_row_is_populated(slot)
+            .then(|| rows.paintable_data(slot).accumulated_visual_context.spatial)
+    });
+    spatial.is_some_and(|spatial| tree.translations_snap_to_device_pixels(spatial))
 }
 
 /// The structural epoch of the visual context tree of `host`'s document, prepared up to date.
@@ -576,22 +595,6 @@ pub unsafe extern "C" fn render_state_stacking_context_structure_verification_re
     }
 }
 
-/// Hands `append` the scroll state of `host`'s document as the scroll logic of the compositor reads it.
-///
-/// # Safety
-///
-/// `append` is called synchronously with `sink`, and must copy the bytes it keeps.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_state_encode_scroll_state(
-    host: &crate::render_state::DocumentHost,
-    sink: *mut c_void,
-    append: unsafe extern "C" fn(*mut c_void, *const u8, usize),
-) {
-    let bytes = host.scroll_state().to_encoded_bytes();
-    // SAFETY: The C++ sink copies the bytes synchronously.
-    unsafe { append(sink, bytes.as_ptr(), bytes.len()) };
-}
-
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread; the callbacks in `publish` are called
@@ -599,9 +602,7 @@ pub unsafe extern "C" fn render_state_encode_scroll_state(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_publish_recording(
     host: &crate::render_state::DocumentHost,
-    read: &crate::render_state::BegunRead,
     publish: crate::painting::host::FfiRecordingPublishCallbacks,
-    out: &mut crate::painting::ffi::FfiPresentedRecording,
 ) {
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { main_thread(host) };
@@ -609,11 +610,6 @@ pub unsafe extern "C" fn render_state_publish_recording(
     if let Some(publication) = recording.take_publication() {
         crate::painting::record::publish::publish_recording(host, publication, &main_thread, &publish);
     }
-    drop(recording);
-    let presented = read_arena(host, read, (), |arena, ()| {
-        crate::painting::ffi::FfiPresentedRecording::of_last_recording(arena)
-    });
-    *out = presented;
 }
 
 /// # Safety
@@ -726,12 +722,12 @@ pub unsafe extern "C" fn render_state_record_display_list(
 
 /// Commits the frame of `host`'s document as the rendering update leaves it to the render owner, with `recorder`, which
 /// samples it beside the event loop at `timestamp`, the time of the document's timeline the update sampled its
-/// animations at, and hands it to the Paint thread, which presents it with `presentation`. The frame flies until the
+/// animations at, and hands it to the Paint thread, which presents it as `seal` sealed it. The frame flies until the
 /// host takes it in.
 ///
 /// # Safety
 ///
-/// `presentation` must name a presentation the host gives up.
+/// `seal` must name a live presenter, and buffers of the sizes it gives.
 unsafe fn commit_frame(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
@@ -739,14 +735,25 @@ unsafe fn commit_frame(
     content: crate::render_state::CommittedContent,
     held_for_testing: bool,
     timestamp: f64,
-    presentation: crate::painting::ffi::FfiPresentation,
+    seal: &crate::painting::presentation::FfiSeal,
 ) {
+    let publishes_recording = match &content {
+        crate::render_state::CommittedContent::Recording { frame_inputs, .. } => frame_inputs.publishes_recording,
+        crate::render_state::CommittedContent::Unrecorded { .. } => false,
+    };
+    // SAFETY: Guaranteed by the caller.
+    let presentation = unsafe {
+        crate::painting::presentation::Presentation::adopt(
+            seal,
+            &host.scroll_state(),
+            recorder.published_recording.clone(),
+            publishes_recording,
+        )
+    };
     let commit = crate::render_state::CommittedFrame {
         content,
         recorder,
-        // SAFETY: Guaranteed by the caller.
-        presentation: unsafe { crate::painting::presentation::Presentation::adopt(presentation, &host.scroll_state()) }
-            .expect("a committed frame is presented"),
+        presentation,
         timestamp,
         held_for_testing,
     };
@@ -758,7 +765,7 @@ unsafe fn commit_frame(
 ///
 /// # Safety
 ///
-/// As for [`render_state_record_display_list`]. `presentation` must name a presentation the host gives up.
+/// As for [`render_state_record_display_list`], and `seal` must be as [`commit_frame`] takes it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_commit_recorded_frame(
     host: &crate::render_state::DocumentHost,
@@ -766,7 +773,7 @@ pub unsafe extern "C" fn render_state_commit_recorded_frame(
     viewport: NodeSlotId,
     inputs: crate::painting::host::FfiRecordingInputs,
     timestamp: f64,
-    presentation: crate::painting::ffi::FfiPresentation,
+    seal: &crate::painting::presentation::FfiSeal,
 ) {
     let recorder = take_recorder_for_recording(host, read);
     let content = crate::render_state::CommittedContent::Recording {
@@ -776,7 +783,7 @@ pub unsafe extern "C" fn render_state_commit_recorded_frame(
     };
     let held_for_testing = crate::painting::recording_slot::take_recording_hold_for_testing();
     // SAFETY: Guaranteed by the caller.
-    unsafe { commit_frame(host, read, recorder, content, held_for_testing, timestamp, presentation) };
+    unsafe { commit_frame(host, read, recorder, content, held_for_testing, timestamp, seal) };
 }
 
 /// Commits the frame of `host`'s document as one that keeps the display list the compositor has, and sends the render
@@ -784,53 +791,46 @@ pub unsafe extern "C" fn render_state_commit_recorded_frame(
 ///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread. `presentation` must name a presentation the host
-/// gives up.
+/// `host` must be a live document host, on its document's thread, and `seal` must be as [`commit_frame`] takes it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_commit_unrecorded_frame(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     sends_visual_context_tree: bool,
     timestamp: f64,
-    presentation: crate::painting::ffi::FfiPresentation,
+    seal: &crate::painting::presentation::FfiSeal,
 ) {
     let recorder = take_recorder_for_recording(host, read);
     let content = crate::render_state::CommittedContent::Unrecorded {
         sends_visual_context_tree,
     };
     // SAFETY: Guaranteed by the caller.
-    unsafe { commit_frame(host, read, recorder, content, false, timestamp, presentation) };
+    unsafe { commit_frame(host, read, recorder, content, false, timestamp, seal) };
 }
 
 /// Renders the SVG images of the committed frame of `host`'s document that waits for them, with the callbacks in
-/// `publish`, into `resources`, and hands the frame back to the Paint thread, which presents it with them. The frame
-/// flies again until the host takes it in.
+/// `publish`, and hands the frame back to the Paint thread, which presents it with them. The frame flies again until the
+/// host takes it in.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread, whose committed frame landed as
-/// [`FfiRecordingLanding::NeedsVectorImages`]; the callbacks in `publish` are called synchronously with their context,
-/// which adds what they render to `resources`, a `Web::Compositor::VectorImageResources` the host gives up.
+/// [`FfiRecordingLanding::NeedsVectorImages`]; the callbacks in `publish` are called synchronously with their context.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_render_vector_images(
     host: &crate::render_state::DocumentHost,
     publish: crate::painting::host::FfiRecordingPublishCallbacks,
-    resources: std::ptr::NonNull<c_void>,
 ) {
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { main_thread(host) };
-    // SAFETY: Guaranteed by the caller.
-    let resources = unsafe { crate::painting::presentation::VectorImageResources::adopt(resources) };
     let (frame, recorder) = host
         .recording()
         .take_vector_image_frame()
         .expect("a committed frame waits for its SVG images");
-    let display_list_ids =
+    let display_lists =
         crate::painting::record::publish::render_vector_images(frame.get().requests(), &main_thread, &publish);
     let flight = crate::paint_stage::submit_presenting(frame, move |frame, presenting| {
-        frame
-            .into_inner()
-            .present(recorder, &display_list_ids, resources, presenting)
+        frame.into_inner().present(recorder, &display_lists, presenting)
     });
     host.recording().fly(flight);
 }
@@ -862,17 +862,16 @@ pub extern "C" fn render_state_release_held_recording_for_testing() {
 }
 
 /// Takes the recording in flight of `host`'s document in where it has finished, and answers how it landed. The event
-/// loop calls it between two tasks, so it never waits. A recording that landed gives back the presentation it took, if
-/// any, through `presentation`.
+/// loop calls it between two tasks, so it never waits. A recording that landed writes whether presenting its frame sent
+/// the compositor other scroll offsets than the frame before to `presented_other_scroll_offsets`.
 ///
 /// # Safety
 ///
 /// `host` must be a live document host, on its document's thread, and the event loop must call this between two tasks.
-/// The host takes over what `presentation` names.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render_state_take_finished_recording_in(
     host: &crate::render_state::DocumentHost,
-    presentation: &mut crate::painting::ffi::FfiPresentation,
+    presented_other_scroll_offsets: &mut bool,
 ) -> FfiRecordingLanding {
     let boundary = crate::render_state::TaskBoundary::at_event_loop_entry(&TAKES_FINISHED_RECORDING_IN);
     let landing = host.recording().take_finished_recording_in(
@@ -882,15 +881,15 @@ pub unsafe extern "C" fn render_state_take_finished_recording_in(
             take_in_presented_recording(host, output, hit_test_list_changed, publishes_recording);
         },
     );
-    recording_landing(landing, presentation)
+    recording_landing(landing, presented_other_scroll_offsets)
 }
 
 /// Waits for the recording in flight of `host`'s document and takes it in, and answers how it landed (see
-/// [`render_state_take_finished_recording_in`]). The host takes over what `presentation` names.
+/// [`render_state_take_finished_recording_in`]).
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_join_recording_in_flight(
     host: &crate::render_state::DocumentHost,
-    presentation: &mut crate::painting::ffi::FfiPresentation,
+    presented_other_scroll_offsets: &mut bool,
 ) -> FfiRecordingLanding {
     let landing = host.recording().join_recording_in_flight(
         |rows_version| landed_recording_stands(host, rows_version),
@@ -898,7 +897,7 @@ pub extern "C" fn render_state_join_recording_in_flight(
             take_in_presented_recording(host, output, hit_test_list_changed, publishes_recording);
         },
     );
-    recording_landing(landing, presentation)
+    recording_landing(landing, presented_other_scroll_offsets)
 }
 
 /// Takes the output of a recording that presented itself in as the document's last.
@@ -917,10 +916,11 @@ fn take_in_presented_recording(
     ));
 }
 
-/// Answers how a recording landed, and writes the presentation it gave back to `presentation`.
+/// Answers how a recording landed, and writes what the presentation it gave back presented to
+/// `presented_other_scroll_offsets`.
 fn recording_landing(
     landing: crate::painting::recording_slot::RecordingLanding,
-    presentation: &mut crate::painting::ffi::FfiPresentation,
+    presentation: &mut bool,
 ) -> FfiRecordingLanding {
     use crate::painting::recording_slot::RecordingLanding;
     match landing {
@@ -946,12 +946,14 @@ fn recording_landing(
     }
 }
 
-/// Writes the presentation a recording gave back, if any, to `presentation`.
+/// Writes whether the presentation a recording gave back, if any, sent the compositor other scroll offsets than the
+/// frame before to `presented_other_scroll_offsets`.
 fn give_back(
     given_back: Option<crate::painting::presentation::Presentation>,
-    presentation: &mut crate::painting::ffi::FfiPresentation,
+    presented_other_scroll_offsets: &mut bool,
 ) {
-    *presentation = given_back.map_or_else(Default::default, crate::painting::presentation::Presentation::into_ffi);
+    *presented_other_scroll_offsets =
+        given_back.is_some_and(|presentation| presentation.presented_other_scroll_offsets());
 }
 
 /// Whether the rows of `host`'s document are still at `version`, so that the hit-test list of a recording that landed

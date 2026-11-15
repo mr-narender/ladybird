@@ -79,7 +79,6 @@ class CompositorConnection;
 class CompositorContextHandle;
 class CompositorHost;
 class NavigablePresenter;
-struct CompositorFrame;
 
 }
 
@@ -826,7 +825,7 @@ class RadioNodeList;
 class RemoteNavigable;
 class RemoteWindow;
 class Sanitizer;
-struct SanitizerConfiguration;
+class SanitizerConfiguration;
 class ScriptRegistry;
 class SessionHistoryEntry;
 class SharedResourceRequest;
@@ -1156,6 +1155,7 @@ class SVGPatternElement;
 class SVGPolygonElement;
 class SVGPolylineElement;
 class SVGRectElement;
+class SVGResourceDocument;
 class SVGScriptElement;
 class SVGSetElement;
 class SVGSVGElement;

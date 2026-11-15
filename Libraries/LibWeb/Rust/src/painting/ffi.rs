@@ -13,8 +13,6 @@ use crate::layout::script_entries::FfiCaretPosition;
 use crate::layout::svg_formatting_context;
 use crate::layout::used_values::FfiCssPixelPoint;
 use crate::layout::used_values::FfiCssPixelRect;
-use crate::layout::used_values::FfiCssPixelSize;
-use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::host::visual_context::FfiSvgFilterPrimitive;
 use crate::painting::paint_changes::{PaintChange, queue};
 use crate::painting::paint_read::{GeometryRead, PaintRead};
@@ -27,7 +25,7 @@ use std::ffi::c_void;
 
 mod main_thread_entries;
 
-pub(crate) use main_thread_entries::MainThreadFfiEntry;
+pub(crate) use main_thread_entries::{MainThreadFfiEntry, main_visual_context_tree};
 
 crate::render_state::held_node_entries!();
 
@@ -55,6 +53,16 @@ pub(crate) fn paintable_cleared_from_node(
     if arena.slot_is_live(layout_node) {
         arena.invalidate_committed_geometry_of_ancestors(layout_node);
     }
+    paintable_cleared_from_node_leaving_ancestors(host_calls, arena, layout_node);
+}
+
+/// As [`paintable_cleared_from_node`], for a box whose ancestors the build that takes it out of the tree invalidates as
+/// far as its leaving changes them.
+pub(crate) fn paintable_cleared_from_node_leaving_ancestors(
+    host_calls: crate::layout::tree_mutation::HostCalls<'_>,
+    arena: &mut LayoutNodeArena,
+    layout_node: NodeSlotId,
+) {
     arena.clear_committed_fragment_link(layout_node);
     if let Some(reset) = arena.prepare_paintable_row_cleared_reset(layout_node) {
         host_calls.paintable_row_reset(reset);
@@ -445,66 +453,6 @@ pub enum FfiRecordingLanding {
     NeedsVectorImages,
 }
 
-/// A navigable's presenter and the seal of the frame it presents next (`Web::Compositor::NavigablePresenter` and
-/// `Web::Compositor::SealedPresentation`), which pass between the host and what presents a frame beside it. Both or
-/// neither are null.
-#[repr(C)]
-pub struct FfiPresentation {
-    pub presenter: *mut c_void,
-    pub sealed: *mut c_void,
-}
-
-impl Default for FfiPresentation {
-    /// Names no presentation.
-    fn default() -> Self {
-        Self {
-            presenter: std::ptr::null_mut(),
-            sealed: std::ptr::null_mut(),
-        }
-    }
-}
-
-/// What the host reads of a published recording, to build its display list from.
-#[repr(C)]
-pub struct FfiPresentedRecording {
-    pub is_identical_to_published_recording: bool,
-    pub has_blocking_wheel_event_listeners: bool,
-    /// The recorded display list, which the document's last recording holds until the next
-    /// recording replaces it. The host takes a reference of its own to keep it longer.
-    pub display_list: *const c_void,
-    /// The color the canvas holds below the recording's layers.
-    pub root_group_color: libgfx_rust::Color,
-}
-
-impl FfiPresentedRecording {
-    /// What the host reads of a recording published with `output`, whose display list `output` holds for as long as
-    /// the host reads it.
-    pub(crate) fn of_output(output: &crate::painting::record::RecordingOutput) -> Self {
-        Self {
-            is_identical_to_published_recording: output.is_identical_to_published_recording,
-            has_blocking_wheel_event_listeners: output.has_blocking_wheel_event_listeners,
-            display_list: std::sync::Arc::as_ptr(&output.display_list).cast(),
-            root_group_color: output.root_group_color,
-        }
-    }
-
-    /// What the host reads of the last recording the document took in.
-    pub(crate) fn of_last_recording(arena: &LayoutNodeArena) -> Self {
-        let paint_state = arena.paint_state();
-        let recording = paint_state.last_recording.as_deref();
-        Self {
-            is_identical_to_published_recording: recording
-                .is_some_and(|recording| recording.is_identical_to_published_recording),
-            has_blocking_wheel_event_listeners: recording
-                .is_some_and(|recording| recording.has_blocking_wheel_event_listeners),
-            display_list: recording.map_or(std::ptr::null(), |recording| {
-                std::sync::Arc::as_ptr(&recording.display_list).cast()
-            }),
-            root_group_color: recording.map_or(libgfx_rust::Color::TRANSPARENT, |recording| recording.root_group_color),
-        }
-    }
-}
-
 /// One `<area>` of an image map, as the document hands it over: the style-tree identity to name as
 /// the hit target, the state of its `shape` attribute, and where its parsed `coords` sit in the
 /// flat array published beside it.
@@ -568,113 +516,6 @@ pub unsafe extern "C" fn layout_arena_svg_paint_resources_push_pattern(
             .to_vec(),
         },
     );
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-#[expect(dead_code, reason = "C++ constructs the variants")]
-pub enum FfiImagePaintRecordKind {
-    DecodedFrame,
-    NestedDisplayList,
-    Gradient,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiImagePaintRecordInputs {
-    pub kind: FfiImagePaintRecordKind,
-    pub device_pixels_per_css_pixel: f64,
-    pub dest_rect: libgfx_rust::FloatRect,
-    pub frame_id: u64,
-    pub scaling_mode: libgfx_rust::ScalingMode,
-    pub nested_display_list_id: u64,
-    pub nested_display_list_size: libgfx_rust::IntSize,
-    pub gradient_style_value: *const c_void,
-    pub gradient_tile_size: FfiCssPixelSize,
-    /// The `FfiColorResolutionStyle` the gradient's color stops resolve against.
-    pub gradient_stop_color_resolution_style: *const c_void,
-}
-
-/// # Safety
-///
-/// `inputs`, and the gradient style value and color resolution style it points at, must be
-/// live for the call. `consume` is called synchronously and takes ownership of the command
-/// storage and visual context tree handles.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
-    inputs: &FfiImagePaintRecordInputs,
-    context: *mut c_void,
-    consume: unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void),
-) {
-    use crate::css::color_resolution::ColorResolutionInput;
-    use crate::painting::display_list::commands::{DisplayListResourceId, ImageFrameResourceId};
-    use crate::painting::display_list::device_pixels::DevicePixelConverter;
-    use crate::painting::display_list::recorder::DisplayListRecorder;
-    use crate::painting::record::paint::gradient_resolution::{
-        record_resolved_gradient_fill, resolve_gradient_paint_with_input,
-    };
-    use crate::painting::visual_context::{TransformData, TransformDataRole, VisualContextTree};
-    use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint};
-    let tree = VisualContextTree::create(TransformData {
-        matrix: FloatMatrix4x4::identity(),
-        origin: FloatPoint::default(),
-        sorting_context_root_index: None,
-        flattens_inherited_transform: false,
-        role: TransformDataRole::CssTransform,
-        synthetic_plane: false,
-        establishes_sorting_context: false,
-        bounds: libgfx_rust::FloatRect::default(),
-    });
-    // Force-dark never reaches here: an image is darkened by classifying the image itself — not by inverting the
-    // fills that raster it.
-    let mut recorder = DisplayListRecorder::new(None);
-    let dest_rect = inputs.dest_rect;
-    match inputs.kind {
-        FfiImagePaintRecordKind::DecodedFrame => recorder.draw_scaled_decoded_image_frame(
-            dest_rect,
-            None,
-            ImageFrameResourceId(inputs.frame_id),
-            inputs.scaling_mode,
-            CompositingAndBlendingOperator::Normal,
-            None,
-            ForceDarkRole::None,
-        ),
-        FfiImagePaintRecordKind::NestedDisplayList => recorder.paint_nested_display_list(
-            DisplayListResourceId(inputs.nested_display_list_id),
-            dest_rect,
-            inputs.nested_display_list_size,
-        ),
-        FfiImagePaintRecordKind::Gradient => {
-            // SAFETY: the host keeps the gradient style value and the style its color stops
-            // resolve against live for the duration of the call.
-            let (gradient_style_value, color_input) = unsafe {
-                (
-                    &*inputs
-                        .gradient_style_value
-                        .cast::<crate::css::style_value::StyleValueData>(),
-                    ColorResolutionInput::for_ffi_style(inputs.gradient_stop_color_resolution_style.cast()),
-                )
-            };
-            let resolved =
-                resolve_gradient_paint_with_input(gradient_style_value, inputs.gradient_tile_size.into(), &color_input);
-            record_resolved_gradient_fill(
-                &mut recorder,
-                DevicePixelConverter::new(inputs.device_pixels_per_css_pixel),
-                &resolved,
-                dest_rect,
-                CompositingAndBlendingOperator::Normal,
-                ForceDarkRole::None,
-            );
-        }
-    }
-    let recorded = recorder.into_builder().finish();
-    unsafe {
-        consume(
-            context,
-            std::sync::Arc::into_raw(std::sync::Arc::new(recorded)).cast(),
-            std::sync::Arc::into_raw(std::sync::Arc::new(tree)).cast(),
-        );
-    }
 }
 
 /// The glyph cells a text content element's box committed for its own characters, one per code

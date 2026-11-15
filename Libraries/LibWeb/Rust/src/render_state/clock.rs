@@ -37,7 +37,7 @@ use crate::css::transition::HoverTransitions;
 use crate::layout::node_data::{GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE, GENERATED_FOR_MARKER, NodeSlotId};
 use crate::layout::tree_update_marks::{FfiLayoutTreeUpdateMark, layout_tree_update_reuse_reason};
 use crate::layout::used_values::FfiCssPixelRect;
-use crate::layout::{ClockRound, ClockRoundDeclined, HostStyle, LayoutNodeArena, build_keeps_box};
+use crate::layout::{ClockRound, ClockRoundDeclined, HostStyle, LayoutNodeArena};
 use crate::paint_stage::Presenting;
 use crate::painting::paint_passes::{ClockTickVisualContexts, VisualContextsNeedHost, prepare_for_clock_tick};
 use crate::painting::paintable_geometry::{
@@ -47,7 +47,7 @@ use crate::painting::presentation::Presentation;
 use crate::painting::record::damage::PaintDamage;
 use crate::painting::record::inputs::UnframedRecordingInputs;
 use crate::painting::record::publish::{
-    PresentedOutput, published_vector_image_display_lists, renders_vector_images, take_in_recording,
+    published_vector_image_display_lists, renders_vector_images, take_in_recording,
 };
 use crate::painting::record::recorder_state::RecorderState;
 use crate::painting::record::{PublishedHitTestItems, RecordingInputs, RecordingOutput};
@@ -58,7 +58,7 @@ use crate::painting::recording_slot::{
 use crate::painting::visual_context::VisualContextTree;
 use crate::stage_thread::{Relay, Riding};
 use smallvec::SmallVec;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod effects;
@@ -709,9 +709,6 @@ pub struct ClockTicks {
     /// How many times script changed the document's animations, after which the animations a plan sealed before no
     /// longer stand.
     animation_changes: AtomicU64,
-    /// How many recordings of the host's own add to the resource storage the lanes present with: none presents
-    /// meanwhile.
-    holds: AtomicU32,
     /// Where the render clock heard the pointer went, until a tick hovers what is there.
     pointer: Mutex<hover::PointerState>,
     /// The border boxes of the elements the lane sampled or its hover restyled in the last frame a tick presented, and
@@ -767,7 +764,6 @@ impl ClockTicks {
             animations_held: AtomicBool::new(true),
             plan_animates: AtomicBool::new(false),
             animation_changes: AtomicU64::new(0),
-            holds: AtomicU32::new(0),
             pointer: Mutex::new(hover::PointerState::default()),
             presented_boxes: Mutex::default(),
         })
@@ -920,26 +916,6 @@ impl ClockTicks {
     /// How many times script changed the document's animations so far.
     pub(super) fn animation_changes(&self) -> u64 {
         self.animation_changes.load(Ordering::Relaxed)
-    }
-
-    /// Holds the lanes for a recording of the host's own that adds to the resource storage they present with, waiting
-    /// for what they present meanwhile: they present nothing until [`Self::release`].
-    pub(super) fn hold(&self) {
-        self.holds.fetch_add(1, Ordering::AcqRel);
-        if cfg!(test) {
-            return;
-        }
-        super::wait_for_render_side();
-        crate::paint_stage::paint_thread().run(|| ());
-    }
-
-    pub(super) fn release(&self) {
-        let previous = self.holds.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "a hold of the lanes is released once");
-    }
-
-    fn is_held(&self) -> bool {
-        self.holds.load(Ordering::Acquire) > 0
     }
 
     /// The border box of `element` in the last frame a tick presented, if it presented one.
@@ -1129,13 +1105,15 @@ impl Lane {
         node: StyleNodeID,
         rebuild: TickRebuild,
     ) -> Result<(), Park> {
-        use layout_tree_update_reuse_reason::{CHILD_LIST_INSERTION, PSEUDO_ELEMENT_CHANGE};
+        use layout_tree_update_reuse_reason::PSEUDO_ELEMENT_CHANGE;
         let resampled: SmallVec<[StyleNodeID; 8]> = self.resampled_elements().collect();
         let (ticked, restyles) = (&mut self.ticked, &mut self.restyles_built_again);
         let arena = state.arena.arena_mut();
         let in_place = match rebuild {
             TickRebuild::PseudoElements => {
-                let in_place = build_keeps_box(arena, node, PSEUDO_ELEMENT_CHANGE);
+                // NB: The build plans the child list of a box that keeps its box again, with its pseudo-elements.
+                let row = arena.bound_row(node);
+                let in_place = !row.is_invalid() && !arena.data(row).parent.get().is_invalid();
                 if in_place {
                     arena.mark_layout_tree_update(
                         Some(node),
@@ -1147,8 +1125,9 @@ impl Lane {
             TickRebuild::Insert { parent } => {
                 // The build reads which children of the parent it inserts boxes for from their marks.
                 arena.mark_layout_tree_update(Some(node), FfiLayoutTreeUpdateMark::NODE_INSERT);
+                // NB: The build plans the child list of a box that keeps its box again, whatever the list holds.
                 let parent_row = arena.bound_row(parent);
-                let in_place = !parent_row.is_invalid() && build_keeps_box(arena, parent, CHILD_LIST_INSERTION);
+                let in_place = !parent_row.is_invalid() && !arena.data(parent_row).parent.get().is_invalid();
                 if in_place {
                     // The anonymous boxes the build makes in the parent's box inherit what it shows.
                     restore_samples_for_build(arena, ticked, Some(&resampled), restyles, |arena, row, host_style| {
@@ -1160,13 +1139,24 @@ impl Lane {
                 in_place
             }
             TickRebuild::TakeAway { parent } => {
-                let in_place = arena.can_take_box_away_in_place(parent, node);
+                // NB: The build plans the child list of the parent's box again without the box.
+                let (parent_row, row) = (arena.bound_row(parent), arena.bound_row(node));
+                let in_place =
+                    !parent_row.is_invalid() && !row.is_invalid() && !arena.data(parent_row).parent.get().is_invalid();
                 if in_place {
-                    // The boxes the build takes away show nothing more.
-                    let row = arena.bound_row(node);
-                    restore_samples_for_build(arena, ticked, None, restyles, |arena, inner, _| {
-                        box_holds(arena, row, inner)
-                    })?;
+                    // The boxes the build takes away show nothing more, and the anonymous boxes it makes in the
+                    // parent's box inherit what it shows.
+                    restore_samples_for_build(
+                        arena,
+                        ticked,
+                        Some(&resampled),
+                        restyles,
+                        |arena, inner, host_style| {
+                            box_holds(arena, row, inner)
+                                || (nearest_element_box(arena, inner) == Some(parent_row)
+                                    && arena.shows_other_inherited_style_than(inner, host_style.record()))
+                        },
+                    )?;
                     arena.mark_layout_tree_update(Some(node), FfiLayoutTreeUpdateMark::style_change(0));
                 }
                 in_place
@@ -1857,7 +1847,7 @@ impl ClockRecorder {
         let (pending, _) = record_frame(frozen.frame, &mut self.recorder, viewport, false, inputs);
         let vector_image_display_lists = match renders_vector_images(&pending) {
             true => match published_vector_image_display_lists(&pending, &self.recorder) {
-                Some(display_list_ids) => Some(display_list_ids),
+                Some(display_lists) => Some(display_lists),
                 None => {
                     self.leave_frame_to_host();
                     return self;
@@ -1869,16 +1859,15 @@ impl ClockRecorder {
             self.presentation.take_visual_context_tree(visual_contexts);
         }
         let output = match vector_image_display_lists {
-            Some(display_list_ids) => present_with_vector_images(
+            Some(display_lists) => present_with_vector_images(
                 &mut self.presentation,
                 pending,
                 &self.recorder,
                 presenting,
-                &display_list_ids,
+                &display_lists,
             ),
             None => present(&mut self.presentation, pending, &self.recorder, presenting),
         };
-        let output = PresentedOutput::of(output);
         self.presented_hit_test_items = Some(output.published_hit_test_items());
         self.presented = TickPresented::Frame {
             output: output.output,
@@ -1916,8 +1905,8 @@ pub extern "C" fn document_host_drop_clock_plan(host: &DocumentHost, update: u64
     host.seal_clock_plan(None, update);
 }
 
-/// Notes that script changed an animation of `host`'s document: the animations of the plans sealed before no longer
-/// stand, and the lanes' hover goes on.
+/// Notes that script changed an animation of `host`'s document, or that its viewport changed: the animations of the
+/// plans sealed before no longer stand, and the lanes' hover goes on.
 #[unsafe(no_mangle)]
 pub extern "C" fn document_host_note_animation_change(host: &DocumentHost) {
     host.note_animation_change();
@@ -2021,19 +2010,6 @@ pub extern "C" fn document_host_lane_hover_target_for(
     };
     *target = hovered.map_or(0, StyleNodeID::raw);
     true
-}
-
-/// Holds the lanes of `host`'s document for a recording of the host's own that adds to the resource storage they
-/// present with, until `document_host_release_clock_lane`: they present nothing meanwhile.
-#[unsafe(no_mangle)]
-pub extern "C" fn document_host_hold_clock_lane(host: &DocumentHost) {
-    host.clock_ticks().hold();
-}
-
-/// Releases a hold of `document_host_hold_clock_lane`.
-#[unsafe(no_mangle)]
-pub extern "C" fn document_host_release_clock_lane(host: &DocumentHost) {
-    host.clock_ticks().release();
 }
 
 /// What the lane of the frame `host`'s document presented last does, once the lane of a frame presented by then has

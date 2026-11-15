@@ -227,6 +227,8 @@ private:
     void ensure_tab_visible(int index);
     void update_tab_button_geometry();
     TabMicrophoneIndicator* microphone_indicator(int index) const;
+    int horizontal_tab_min_width(int index) const;
+    int horizontal_tab_share() const;
 
     QPointer<TabWidget> m_tab_widget;
 
@@ -234,6 +236,7 @@ private:
     bool m_pinned_tabs_in_rows { false };
     WebView::VerticalTabsPosition m_vertical_tabs_position { WebView::VerticalTabsPosition::Left };
     int m_available_width { 0 };
+    // NB: While locked, the unpinned tabs keep the share of the strip that they had (see horizontal_tab_share()).
     Optional<int> m_locked_tab_width;
     QTimer* m_tab_width_unlock_timer { nullptr };
     int m_hovered_tab_index { -1 };
@@ -533,8 +536,8 @@ public:
     void set_placement(Placement);
     // Shows the button by fading it in, or fades it out and hides it.
     void set_revealed(bool);
-    // A sidebar row's close button is quieter, but on the hovered and the selected rows.
-    void set_row_emphasized(bool);
+    // A close button is dimmed, but on the hovered and the selected tabs.
+    void set_tab_emphasized(bool);
 
 protected:
     virtual bool event(QEvent* event) override;
@@ -546,9 +549,7 @@ private:
     Role m_role { Role::Close };
     Placement m_placement { Placement::Tab };
     bool m_revealed { false };
-    bool m_row_emphasized { false };
-    QIcon m_quiet_close_icon;
-    bool m_quiet_close_icon_is_dark { false };
+    bool m_tab_emphasized { false };
     qreal m_opacity { 1 };
     QVariantAnimation* m_reveal_animation { nullptr };
 };

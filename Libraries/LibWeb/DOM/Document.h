@@ -139,8 +139,7 @@ enum class StyleEnvironmentChange : u8 {
 AK_ENUM_BITWISE_OPERATORS(StyleEnvironmentChange);
 
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASONS(X) \
-    X(InternalsFullRebuildComparison)               \
-    X(TopLayerElementStillRenderedAfterRemoval)
+    X(InternalsFullRebuildComparison)
 
 enum class InvalidateLayoutTreeReason {
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASON(e) e,
@@ -694,7 +693,6 @@ public:
     Painting::DocumentPaintState const& paint_state() const;
     // Whether the last layout committed a box whose `content-visibility` is `auto`.
     bool has_boxes_with_auto_content_visibility() const;
-    Compositing::AccumulatedVisualContextTree visual_context_tree() const;
 
     PaintTiming::DocumentPaintTimingState& paint_timing_state() { return m_paint_timing_state; }
 
@@ -1387,6 +1385,9 @@ public:
 
     HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
     HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>> const& shared_resource_requests() const;
+    HashMap<URL::URL, GC::Ref<SVG::SVGResourceDocument>>& svg_resource_documents() { return m_svg_resource_documents; }
+    GC::Ptr<Document> svg_resource_document_owner() const { return m_svg_resource_document_owner; }
+    void set_svg_resource_document_owner(GC::Ref<Document> owner) { m_svg_resource_document_owner = owner; }
     CSS::ImageStyleValueResource* css_image_resource(URL::URL const&);
     CSS::ImageStyleValueResource& create_css_image_resource(CSS::ImageStyleValueResourceKey, GC::Ref<HTML::SharedResourceRequest>);
     void remove_css_image_resource_if_unused(CSS::ImageStyleValueResourceKey const&);
@@ -1580,12 +1581,7 @@ public:
     void remove_an_element_from_the_top_layer_immediately(GC::Ref<Element>);
     void process_top_layer_removals();
 
-    void set_top_layer_needs_layout_zone_rebuild() { m_top_layer_needs_layout_zone_rebuild = true; }
-
     OrderedHashTable<GC::Ref<Element>> const& top_layer_elements() const { return m_top_layer_elements; }
-    // Only a member of the top layer, or an element whose membership changed since the top layer boxes were built, can
-    // have a box placed in the top layer.
-    bool may_have_boxes_placed_in_top_layer() const { return !m_top_layer_elements.is_empty() || !m_elements_with_pending_top_layer_membership_change.is_empty(); }
     bool top_layer_pending_removals_contains(GC::Ref<Element> element) const { return m_top_layer_pending_removals.contains(element); }
 
     // AD-HOC: These lists are managed dynamically instead of being generated as needed.
@@ -1653,8 +1649,9 @@ public:
         set_needs_repaint(should_invalidate_display_list);
     }
 
-    // Records the document's display list in step with the host, once a recording in flight has been taken in.
-    RefPtr<Compositing::DisplayList> record_display_list(Layout::BegunRead const& read, HTML::PaintConfig, Compositing::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
+    // Records the document's display list in step with the host, once a recording in flight has been taken in, and
+    // answers whether it had a box to record.
+    bool record_display_list(Layout::BegunRead const& read, HTML::PaintConfig, Painting::PaintCommandCacheMode);
     // Starts recording the document's display list as the document is now, beside the event loop where `blocker` is
     // none, taking `flight`, if any, to present its frame with, and makes the display list of a recording that has
     // landed.
@@ -1662,10 +1659,10 @@ public:
     // Commits the navigable's next frame, a recording of the document, to the render owner, which presents it with
     // `presentation` beside the event loop.
     Painting::DisplayListRecording commit_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig, Compositor::FlightPresentation&& presentation);
-    RefPtr<Compositing::DisplayList> finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const&, Compositing::DisplayListResourceStorage&, Painting::HitTestListStands = Painting::HitTestListStands::Yes);
-    // Takes in `display_list`, which `recording` published: the paint command cache source, and the hit-test list it made,
-    // read in `hit_test_list_read`, where that still stands for the document's boxes. Where none does, nothing is read.
-    Painting::HitTestListAdoption adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&, NonnullRefPtr<Compositing::DisplayList>, Function<Compositing::DisplayListResourceSet()> const& referenced_resources);
+    void finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const&, Painting::HitTestListStands = Painting::HitTestListStands::Yes);
+    // Takes in the hit-test list `recording` made, read in `hit_test_list_read`, where that still stands for the
+    // document's boxes. Where none does, nothing is read.
+    Painting::HitTestListAdoption adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&);
     // Indicates whether a query of the hit test list would require a synchronous update to it.
     [[nodiscard]] bool hit_test_display_list_is_current(Layout::BegunRead const& read);
     // Where a visual animation sample time is given, the hit test reads the compositor's animations at that time, as a
@@ -2399,6 +2396,12 @@ private:
     RefPtr<HTML::SessionHistoryEntry> m_latest_entry;
 
     HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>> m_shared_resource_requests;
+
+    // The documents that use elements of this document refer to, by URL.
+    HashMap<URL::URL, GC::Ref<SVG::SVGResourceDocument>> m_svg_resource_documents;
+
+    // For a document that a use element's reference loaded, the document whose resource documents it shares.
+    GC::Ptr<Document> m_svg_resource_document_owner;
     HashMap<URL::URL, OwnPtr<CSS::ImageStyleValueResource>> m_css_image_resources;
     // NB: The resources of url() values with request modifiers. m_css_image_resources holds those without any, which
     //     most url() values are.
@@ -2526,7 +2529,6 @@ private:
     OrderedHashTable<GC::Ref<Element>> m_top_layer_elements;
     OrderedHashTable<GC::Ref<Element>> m_top_layer_pending_removals;
     Vector<GC::Ref<Element>> m_elements_with_pending_top_layer_membership_change;
-    bool m_top_layer_needs_layout_zone_rebuild { false };
 
     Vector<GC::Ref<HTML::HTMLElement>> m_showing_auto_popover_list;
     Vector<GC::Ref<HTML::HTMLElement>> m_showing_hint_popover_list;

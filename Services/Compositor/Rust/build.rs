@@ -30,11 +30,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("RawAttachment", "IPC::RawAttachment"),
         ("RawMessage", "IPC::FfiRawMessage"),
         ("EncodedValue", "AK::ReadonlyBytes"),
-        ("FfiDisplayList", "Compositing::RustFFI::FfiDisplayList"),
-        (
-            "FfiDisplayListReplayCallbacks",
-            "Compositing::RustFFI::FfiDisplayListReplayCallbacks",
-        ),
+        ("FfiRasterPainter", "Compositing::RustFFI::FfiRasterPainter"),
         ("FfiReplaySelection", "Compositing::RustFFI::FfiReplaySelection"),
         ("RecordSpan", "Compositing::RustFFI::RecordSpan"),
         ("CanvasId", "Compositing::CanvasId"),
@@ -65,7 +61,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "src/ffi.rs",
         "src/host.rs",
         "src/frame_inputs.rs",
-        "src/layers.rs",
+        "src/raster_host.rs",
+        "src/core/presenting.rs",
         "src/core/mod.rs",
     ] {
         println!("cargo:rerun-if-changed={source}");

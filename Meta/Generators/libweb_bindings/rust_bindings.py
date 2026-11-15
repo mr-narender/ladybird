@@ -25,7 +25,6 @@ from typing import TextIO
 from typing import Tuple
 
 from Generators.libweb_bindings.context import GenerationContext
-from Generators.libweb_bindings.cpp_types import converter_function_name
 from Generators.libweb_bindings.includes import GeneratedIncludes
 from Generators.libweb_bindings.json_conversions import write_rust_dictionary_json_conversions
 from Generators.libweb_bindings.operations import idl_type_is_json_type
@@ -58,7 +57,6 @@ from Generators.libweb_bindings.rust_to_js_value import write_union_to_js
 from Generators.libweb_bindings.rust_types import CPP_PARENT_INTERFACES
 from Generators.libweb_bindings.rust_types import UnsupportedByRustBindings
 from Generators.libweb_bindings.rust_types import cpp_ancestor
-from Generators.libweb_bindings.rust_types import cpp_dictionary_converter_symbol
 from Generators.libweb_bindings.rust_types import cpp_interface_name_constant
 from Generators.libweb_bindings.rust_types import holds_cells
 from Generators.libweb_bindings.rust_types import inheriting_interfaces
@@ -71,7 +69,6 @@ from Generators.libweb_bindings.rust_usage import DefinitionUsage
 from Generators.libweb_bindings.wrappers import wrapper_host_class_name
 from Generators.libweb_bindings.wrappers import wrapper_name
 from Utils.utils import title_case_to_snake_case
-from Utils.webidl_parser import Dictionary
 from Utils.webidl_parser import Interface
 from Utils.webidl_parser import Module
 from Utils.webidl_parser import OperationParameter
@@ -316,28 +313,6 @@ static constexpr LegacyPlatformObjectInfo {legacy_info} {{
 constexpr JSHostClass {wrapper_host_class_symbol(interface)} = JS::make_host_class(JS_HOST_CLASS_OBJECT, "{interface.name}"sv,
     &{parent_host_class}, &legacy_platform_object_hooks, &{legacy_info},
     platform_object_host_class_flags | JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE);
-"""
-    )
-
-
-def write_cpp_dictionary_converter(out: TextIO, includes: GeneratedIncludes, dictionary: Dictionary) -> None:
-    """The C ABI function that converts a JS value to the dictionary for the interfaces implemented in Rust, which
-    is_converted_by_cpp(), and hands them the C++ value."""
-    includes.add("LibJS/HostClassBuilder.h")
-    includes.add("LibWeb/Bindings/CppDictionary.h")
-    out.write(
-        f"""extern "C" JSCompletion {cpp_dictionary_converter_symbol(dictionary)}(JSVM*, JSValue, void** dictionary);
-
-JSCompletion {cpp_dictionary_converter_symbol(dictionary)}(JSVM* vm, JSValue value, void** dictionary)
-{{
-    auto& js_vm = JS::HostABI::vm_from_abi(vm);
-    auto converted = {converter_function_name(dictionary)}(js_vm, JS::HostABI::value_from_abi(value));
-    if (converted.is_error())
-        return JS::HostABI::throw_completion_to_abi(converted.error_value());
-    *dictionary = js_vm.heap().allocate<CppDictionary<{dictionary.name}>>(converted.release_value()).ptr();
-    return JS::HostABI::normal_completion_to_abi(0);
-}}
-
 """
     )
 
@@ -1162,8 +1137,7 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
     };
 
     use crate::bindings::conversions::{
-        ArrayBufferView, BufferSource, BufferSourceRules, ByteString, CppDictionary, CppInterface, EmptyDictionary, FromJs, ToJs,
-        UsvString, to_cpp_dictionary,
+        ArrayBufferView, BufferSource, BufferSourceRules, ByteString, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
         frozen_array_to_js, implements_cpp_interface, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js,
         sequence_from_js, sequence_to_js, to_array_buffer_view, to_boolean, to_buffer_source, to_byte_string, to_cpp_interface,
         to_cpp_interface_in_union, to_dom_string,
@@ -1190,6 +1164,7 @@ RUST_BINDINGS_IMPORTS = """    #![allow(unused_imports)]
     };
     use crate::bindings::callback::{CallbackFunction, CallbackInterface, PromiseCallbackFunction};
     use crate::bindings::event_target::{event_handler_attribute, set_event_handler_attribute};
+    use crate::bindings::global_object::window_or_worker_global_scope_from_global_object;
     use crate::bindings::promise::{WebIdlPromise, create_rejected_promise};
     use crate::bindings::{CallContext, WebIdlResult, with_custom_element_reactions};
 """
@@ -1423,7 +1398,9 @@ def write_rust_interface(
             definition = f'define_cached_attribute(vm, realm, prototype, "{name}", {getter});'
             out.write(
                 member_exposure_definition(
-                    definition, secure_context_only=is_secure_context_only, window_only=attribute.is_window_only
+                    definition,
+                    secure_context_only=is_secure_context_only,
+                    exposure_condition=attribute.exposure_condition,
                 )
             )
             defined_property_names.append(name)
@@ -1433,7 +1410,7 @@ def write_rust_interface(
         definition = f'define_attribute(vm, realm, prototype, "{name}", {getter}, {setter});'
         out.write(
             member_exposure_definition(
-                definition, secure_context_only=is_secure_context_only, window_only=attribute.is_window_only
+                definition, secure_context_only=is_secure_context_only, exposure_condition=attribute.exposure_condition
             )
         )
         defined_property_names.append(name)
@@ -1450,7 +1427,7 @@ def write_rust_interface(
             member_exposure_definition(
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
-                window_only=operation_set.is_window_only,
+                exposure_condition=operation_set.exposure_condition,
             )
         )
         defined_property_names.append(name)
@@ -1460,7 +1437,7 @@ def write_rust_interface(
     if members.stringifier is not None:
         function = members.stringifier.function
         definition = f'define_operation(vm, realm, prototype, "toString", raw_native!({function}), 0);'
-        out.write(member_exposure_definition(definition, window_only=members.stringifier.is_window_only))
+        out.write(member_exposure_definition(definition, exposure_condition=members.stringifier.exposure_condition))
         defined_property_names.append("toString")
     if members.indexed_property_getter is not None:
         getter = members.indexed_property_getter.operation
@@ -1541,7 +1518,7 @@ def write_rust_interface(
             member_exposure_definition(
                 definition,
                 secure_context_only="SecureContext" in attribute.attribute.extended_attributes,
-                window_only=attribute.is_window_only,
+                exposure_condition=attribute.exposure_condition,
             )
         )
     for operation_set in members.static_operation_sets:
@@ -1554,7 +1531,7 @@ def write_rust_interface(
             member_exposure_definition(
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
-                window_only=operation_set.is_window_only,
+                exposure_condition=operation_set.exposure_condition,
             )
         )
     out.write("    }\n")
@@ -1699,7 +1676,7 @@ def write_rust_namespace(out: TextIO, context: GenerationContext, interface: Int
             member_exposure_definition(
                 definition,
                 secure_context_only=operation_set.is_secure_context_only,
-                window_only=operation_set.is_window_only,
+                exposure_condition=operation_set.exposure_condition,
             )
         )
     if "WithInitializer" in interface.extended_attributes:
@@ -1707,13 +1684,15 @@ def write_rust_namespace(out: TextIO, context: GenerationContext, interface: Int
     out.write("    }\n}\n")
 
 
-def member_exposure_definition(definition: str, *, secure_context_only: bool = False, window_only: bool = False) -> str:
+def member_exposure_definition(
+    definition: str, *, secure_context_only: bool = False, exposure_condition: Optional[str] = None
+) -> str:
     """Defines a member on the interface or prototype object when it is exposed in the realm."""
     conditions = []
     if secure_context_only:
         conditions.append("realm_is_secure_context(realm)")
-    if window_only:
-        conditions.append("realm_is_window(realm)")
+    if exposure_condition is not None:
+        conditions.append(exposure_condition)
     if not conditions:
         return f"        {definition}\n"
     return f"""        if {" && ".join(conditions)} {{
@@ -1750,7 +1729,7 @@ def write_default_to_json(out: TextIO, context: GenerationContext, interface: In
                 member_exposure_definition(
                     definition,
                     secure_context_only="SecureContext" in attribute.attribute.extended_attributes,
-                    window_only=attribute.is_window_only,
+                    exposure_condition=attribute.exposure_condition,
                 )
             )
     out.write(
@@ -2551,7 +2530,6 @@ def write_rust_definitions(out: TextIO, context: GenerationContext, usage: Defin
         and not usage.rust_unions
         and not usage.rust_enumerations
         and not usage.rust_any_interfaces
-        and not usage.cpp_dictionaries_named_by_rust
     ):
         return
     out.write(
@@ -2561,20 +2539,19 @@ def write_rust_definitions(out: TextIO, context: GenerationContext, usage: Defin
 pub(crate) mod definitions {
     #![allow(unused_imports)]
 
-    use core::ffi::c_void;
     use std::sync::LazyLock;
 
     use ak::Utf16String;
     use libjs_rust::api::{
-        ErrorKind, ErrorType, Gc, JSONObject, MarkedVec, Object, PropertyKey, RawNativeFunctionResult, ThrowCompletionOr,
-        TypedArrayBase, TypedArrayKind, Utf16View, Value, Vm, is_host_instance_of,
+        ErrorKind, ErrorType, Gc, JSONObject, MarkedVec, Object, PropertyKey, ThrowCompletionOr, TypedArrayBase, TypedArrayKind, Utf16View,
+        Value, Vm, is_host_instance_of,
     };
 
     use crate::bindings::CallContext;
     use crate::bindings::callback::{CallbackFunction, CallbackInterface, PromiseCallbackFunction};
     use crate::bindings::conversions::{
-        ArrayBufferView, BufferSource, BufferSourceRules, ByteString, CppDictionary, CppInterface, EmptyDictionary, FromJs, ToJs,
-        UsvString, buffer_source_if, to_cpp_dictionary, dictionary_member, dictionary_object, enumeration_value_to_js, implements_cpp_interface,
+        ArrayBufferView, BufferSource, BufferSourceRules, ByteString, CppInterface, EmptyDictionary, FromJs, ToJs, UsvString,
+        buffer_source_if, dictionary_member, dictionary_object, enumeration_value_to_js, implements_cpp_interface,
         frozen_array_to_js, iterator_method, record_from_js, record_to_js, rooted_sequence_to_js, sequence_from_iterable, sequence_from_js,
         sequence_to_js, throw_no_union_types_matched, to_array_buffer_view, to_boolean, to_buffer_source,
         to_byte_string, to_cpp_interface,
@@ -2592,10 +2569,6 @@ pub(crate) mod definitions {
     )
     for name, directions in usage.rust_dictionaries.items():
         dictionary = context.dictionaries[name]
-        if dictionary.parent_name and directions.to_js:
-            raise UnsupportedByRustBindings(
-                f"The Rust bindings convert the dictionary {name}, which inherits from another dictionary, to a JS value"
-            )
         if directions.from_js:
             write_dictionary_from_js(out, context, dictionary)
         if directions.to_js:
@@ -2614,20 +2587,6 @@ pub(crate) mod definitions {
             write_union_from_js(out, context, union_type)
         if directions.to_js:
             write_union_to_js(out, context, union_type)
-    if usage.cpp_dictionaries_named_by_rust:
-        out.write('\n    unsafe extern "C" {\n')
-        for dictionary in usage.cpp_dictionaries_named_by_rust.values():
-            out.write(
-                f"""        /// The conversion of a JS value to the dictionary {dictionary.name}, which the C++ bindings write to
-        /// `dictionary` as a Web::Bindings::CppDictionary.
-        pub(crate) fn {cpp_dictionary_converter_symbol(dictionary)}(
-            vm: *mut c_void,
-            value: u64,
-            dictionary: *mut *mut c_void,
-        ) -> RawNativeFunctionResult;
-"""
-            )
-        out.write("    }\n")
     out.write("}\n")
 
 

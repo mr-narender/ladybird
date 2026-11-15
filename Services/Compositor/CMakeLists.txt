@@ -7,24 +7,17 @@ set(SOURCES
     ColorSpaceSkia.cpp
     CompositorCore.cpp
     CompositorState.cpp
-    ContextLayers.cpp
-    ContextPresenter.cpp
-    DisplayListPlayer.cpp
+    ContextRasterTargets.cpp
     DisplayListPlayerSkia.cpp
     DisplayListRasterCache.cpp
     FontSkia.cpp
-    FrameInputs.cpp
     ConnectionFromClient.cpp
     ConnectionFromPresentation.cpp
     ConnectionFromWebContent.cpp
-    FramePacer.cpp
     HostWebGLContext.cpp
     OpenGLContext.cpp
     PaintingSurface.cpp
     PresentableSurface.cpp
-    PausedDebuggerOverlay.cpp
-    PictureInPictureControls.cpp
-    RasterizeDisplayList.cpp
     RenderClockConnection.cpp
     SkiaBackendContext.cpp
     SkiaUtils.cpp

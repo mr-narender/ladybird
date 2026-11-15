@@ -457,6 +457,8 @@ pub(crate) fn default_host_enqueue_finalization_registry_cleanup_job(
 }
 
 pub const STRING_TO_ATOM_CACHE_SIZE: usize = 256;
+pub const CHARACTERS_TO_ATOM_CACHE_SIZE: usize = 256;
+pub const KEY_CONCATENATION_CACHE_SIZE: usize = 256;
 pub const FLY_STRING_CACHE_SIZE: usize = 1024;
 pub const NUMERIC_STRING_CACHE_SIZE: usize = 1000;
 pub const LARGE_NUMERIC_STRING_CACHE_SIZE: usize = 1024;
@@ -467,6 +469,37 @@ const SINGLE_ASCII_CHARACTER_STRING_COUNT: usize = 128;
 pub struct StringToAtomCacheEntry {
     pub string: Option<Gc<PrimitiveString>>,
     pub atom: Option<Utf16FlyString>,
+}
+
+/// Remembers the fly string of a short ASCII string that became a property key before it had storage, for the next
+/// string with the same characters (see PrimitiveString::property_key()).
+#[derive(Default)]
+pub struct CharactersToAtomCacheEntry {
+    /// The hash of the characters that were looked up here without being found, if no lookup since then found
+    /// `fly_string`. Characters only replace `fly_string` with theirs the second time in a row, so that keys that are
+    /// only used once leave it alone.
+    pub missed_hash: u64,
+    pub fly_string: Option<Utf16FlyString>,
+}
+
+/// Remembers the string that the concatenation of the strings `lhs` and `rhs` made when it became a property key, so
+/// that JIT code takes that string for a later concatenation of the same two strings (see
+/// RopeString::remember_key_concatenations()). The three are string values, or 0 in an entry that remembers nothing.
+/// JIT code reads the entries, which it finds by a shift, so their size is a power of two (see
+/// RuntimeLayout::key_concatenation_cache).
+#[repr(align(32))]
+pub struct KeyConcatenationCacheEntry {
+    pub lhs: Cell<u64>,
+    pub rhs: Cell<u64>,
+    pub string: Cell<u64>,
+}
+
+const _: () = assert!(size_of::<KeyConcatenationCacheEntry>().is_power_of_two());
+
+/// Where the VM's cache of the concatenations that became property keys has the concatenation of the string values
+/// `lhs` and `rhs`, if it has it. JIT code computes the same index.
+fn key_concatenation_cache_index(lhs: u64, rhs: u64) -> usize {
+    (((lhs >> 4) ^ (rhs >> 4).wrapping_mul(33)) as usize) & (KEY_CONCATENATION_CACHE_SIZE - 1)
 }
 
 #[derive(Trace)]
@@ -554,6 +587,11 @@ pub struct Vm {
     pub names: CommonPropertyNames,
     /// What functions without parameter names share, since an empty Rc slice is an allocation of its own.
     pub(crate) no_parameter_names: Rc<[Utf16FlyString]>,
+    /// The fly strings of short ASCII strings that became property keys before they had storage, found by a hash of
+    /// their characters. Every collection empties this cache, so that it keeps no fly string alive for long.
+    characters_to_atom_cache: RefCell<Box<[CharactersToAtomCacheEntry; CHARACTERS_TO_ATOM_CACHE_SIZE]>>,
+    /// The strings in this cache are weak: every collection empties it.
+    key_concatenation_cache: Box<[KeyConcatenationCacheEntry; KEY_CONCATENATION_CACHE_SIZE]>,
     /// The strings in these two caches are weak: the sweep callback drops the ones that die.
     string_to_atom_cache: RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>>,
     fly_string_cache: Box<[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE]>,
@@ -723,6 +761,18 @@ impl Vm {
             names: CommonPropertyNames::new(),
             no_parameter_names: Rc::from([]),
             string_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| StringToAtomCacheEntry::default()))),
+            characters_to_atom_cache: RefCell::new(Box::new(core::array::from_fn(|_| {
+                CharactersToAtomCacheEntry::default()
+            }))),
+            key_concatenation_cache: Box::new(
+                [const {
+                    KeyConcatenationCacheEntry {
+                        lhs: Cell::new(0),
+                        rhs: Cell::new(0),
+                        string: Cell::new(0),
+                    }
+                }; KEY_CONCATENATION_CACHE_SIZE],
+            ),
             fly_string_cache: Box::new([const { Cell::new(None) }; FLY_STRING_CACHE_SIZE]),
             numeric_string_cache: Box::new([const { Cell::new(None) }; NUMERIC_STRING_CACHE_SIZE]),
             large_numeric_string_cache: Box::new(
@@ -1556,7 +1606,8 @@ impl Vm {
         });
     }
 
-    /// Drops the weak cache entries of strings that died in this collection.
+    /// Drops the weak cache entries of strings that died in this collection, and every entry of the caches that each
+    /// collection empties.
     fn remove_dead_strings_from_weak_caches(&self, sweep: &Sweep<'_>) {
         let is_dead = |string: Gc<PrimitiveString>| sweep.is_dead(string);
         for cache_slot in self.fly_string_cache.iter() {
@@ -1570,6 +1621,14 @@ impl Vm {
             }
         }
         self.interned_strings.borrow_mut().retain(|_, string| !is_dead(*string));
+        self.characters_to_atom_cache
+            .borrow_mut()
+            .fill_with(CharactersToAtomCacheEntry::default);
+        for entry in self.key_concatenation_cache.iter() {
+            entry.lhs.set(0);
+            entry.rhs.set(0);
+            entry.string.set(0);
+        }
     }
 
     /// Forgets the cells that died in this collection from the inline caches of executables and static call sites.
@@ -1945,6 +2004,30 @@ impl Vm {
 
     pub fn string_to_atom_cache(&self) -> &RefCell<Box<[StringToAtomCacheEntry; STRING_TO_ATOM_CACHE_SIZE]>> {
         &self.string_to_atom_cache
+    }
+
+    pub fn characters_to_atom_cache(
+        &self,
+    ) -> &RefCell<Box<[CharactersToAtomCacheEntry; CHARACTERS_TO_ATOM_CACHE_SIZE]>> {
+        &self.characters_to_atom_cache
+    }
+
+    pub fn key_concatenation_cache(&self) -> &[KeyConcatenationCacheEntry; KEY_CONCATENATION_CACHE_SIZE] {
+        &self.key_concatenation_cache
+    }
+
+    /// Remembers that `string` is the concatenation of `lhs` and `rhs`, see KeyConcatenationCacheEntry.
+    pub fn remember_key_concatenation(
+        &self,
+        lhs: Gc<PrimitiveString>,
+        rhs: Gc<PrimitiveString>,
+        string: Gc<PrimitiveString>,
+    ) {
+        let (lhs, rhs) = (Value::from_string(lhs).0, Value::from_string(rhs).0);
+        let entry = &self.key_concatenation_cache[key_concatenation_cache_index(lhs, rhs)];
+        entry.lhs.set(lhs);
+        entry.rhs.set(rhs);
+        entry.string.set(Value::from_string(string).0);
     }
 
     pub fn fly_string_cache(&self) -> &[Cell<Option<Gc<PrimitiveString>>>; FLY_STRING_CACHE_SIZE] {
