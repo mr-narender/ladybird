@@ -496,17 +496,6 @@ DevicePixelRect Page::enclosing_device_rect(CSSPixelRect rect) const
         ceil(rect.height().to_double() * scale));
 }
 
-DevicePixelRect Page::rounded_device_rect(CSSPixelRect rect) const
-{
-    auto scale = client().device_pixels_per_css_pixel();
-    return {
-        roundf(rect.x().to_double() * scale),
-        roundf(rect.y().to_double() * scale),
-        roundf(rect.width().to_double() * scale),
-        roundf(rect.height().to_double() * scale)
-    };
-}
-
 ChromeMetrics Page::chrome_metrics() const
 {
     return ChromeMetrics { m_client->zoom_level() };
@@ -1719,7 +1708,7 @@ void Page::set_emulated_position_data(Geolocation::EmulatedPositionData data)
 
 void Page::set_emulated_position_data(Geolocation::CoordinatesData coordinates_data)
 {
-    set_emulated_position_data(heap().allocate<Geolocation::GeolocationCoordinates>(move(coordinates_data)));
+    set_emulated_position_data(Geolocation::GeolocationCoordinates::create(coordinates_data));
 }
 
 u64 Page::register_emulated_position_data_observer(GC::Ref<GC::Function<void()>> observer)
@@ -1859,8 +1848,8 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
 
     if (request->type == GeolocationRequestType::Watch) {
         auto callback = request->callback;
-        if (result.has<Geolocation::GeolocationPositionError::ErrorCode>()
-            && result.get<Geolocation::GeolocationPositionError::ErrorCode>() == Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied)
+        if (result.has<Geolocation::GeolocationPositionErrorCode>()
+            && result.get<Geolocation::GeolocationPositionErrorCode>() == Geolocation::GeolocationPositionErrorCode::PermissionDenied)
             m_pending_geolocation_requests.remove(request_id);
         callback->function()(result);
         return;
@@ -1874,8 +1863,8 @@ void Page::receive_geolocation_position(u64 request_id, GeolocationPositionResul
     // A position, or a failure to get one, is the same answer for every document on the page, so the queued requests
     // complete with it too. A denial is the answer for the requesting document alone, so the others stay queued, and
     // the next of them is sent.
-    auto denied = result.has<Geolocation::GeolocationPositionError::ErrorCode>()
-        && result.get<Geolocation::GeolocationPositionError::ErrorCode>() == Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied;
+    auto denied = result.has<Geolocation::GeolocationPositionErrorCode>()
+        && result.get<Geolocation::GeolocationPositionErrorCode>() == Geolocation::GeolocationPositionErrorCode::PermissionDenied;
 
     GC::RootVector<GeolocationPositionCallback> callbacks;
     Vector<u64> completed_request_ids;

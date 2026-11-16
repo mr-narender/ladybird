@@ -349,6 +349,7 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         | Op::CheckInitialized
         | Op::CheckTypedArray
         | Op::CheckArray
+        | Op::CheckPropertyAbsenceCacheable
         | Op::CheckNonNegativeInt32
         | Op::LoadTypedArrayLength
         | Op::LoadTypedArrayDataOffset
@@ -361,10 +362,10 @@ fn op_text(layout: &FrameLayout, op: &Op, inputs: &str) -> String {
         Op::ProbeGlobalCache { cache } | Op::ProbeGlobalStore { cache } => {
             with_inputs(&format!("{} cache {cache}", op.name()))
         }
-        Op::ProbePropertyCache { executable, cache }
+        Op::ProbePropertyCache { executable, cache, .. }
         | Op::ProbeKeyedCache { executable, cache }
         | Op::ProbeKeyedStore { executable, cache }
-        | Op::ProbePropertyStore { executable, cache } => {
+        | Op::ProbePropertyStore { executable, cache, .. } => {
             let cache = if *executable == 0 {
                 format!("cache {cache}")
             } else {

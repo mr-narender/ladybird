@@ -54,7 +54,6 @@ set(SOURCES
     ContentSecurityPolicy/PolicyList.cpp
     ContentSecurityPolicy/SecurityPolicyViolationEvent.cpp
     ContentSecurityPolicy/Violation.cpp
-    CookieStore/CookieChangeEvent.cpp
     CookieStore/CookieStore.cpp
     CredentialManagement/CredentialsContainer.cpp
     Crypto/Crypto.cpp
@@ -343,8 +342,6 @@ set(SOURCES
     Gamepad/NavigatorGamepad.cpp
     Geolocation/Geolocation.cpp
     Geolocation/GeolocationCoordinates.cpp
-    Geolocation/GeolocationPosition.cpp
-    Geolocation/GeolocationPositionError.cpp
     Geometry/DOMMatrix.cpp
     Geometry/DOMMatrixReadOnly.cpp
     Geometry/DOMPoint.cpp
@@ -694,7 +691,6 @@ set(SOURCES
     Namespace.cpp
     NavigationTiming/PerformanceNavigationTiming.cpp
     NotificationsAPI/Notification.cpp
-    NotificationsAPI/NotificationPermission.cpp
     Page/AutoScrollHandler.cpp
     Page/DragAndDropEventHandler.cpp
     Page/ElementResizeAction.cpp
@@ -723,7 +719,6 @@ set(SOURCES
     Painting/SvgPaintResources.cpp
     PermissionsAPI/Permissions.cpp
     PermissionsAPI/PermissionStore.cpp
-    PermissionsAPI/PermissionStatus.cpp
     PictureInPicture/PictureInPictureController.cpp
     PictureInPicture/PictureInPictureEvent.cpp
     PictureInPicture/PictureInPictureWindow.cpp

@@ -12,6 +12,7 @@
 #include <Compositor/CompositorState.h>
 #include <Compositor/SkiaUtils.h>
 #include <LibCompositing/DisplayList/DisplayListCommand.h>
+#include <LibCompositing/DisplayList/RegisteredImageFrames.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/StatsLog.h>
@@ -483,11 +484,9 @@ void CompositorState::stop_presenting_to_client(Web::CompositorContextId context
     m_core.stop_presenting_to_client(context_id);
 }
 
-void CompositorState::update_display_list_resources(Web::CompositorContextId context_id, Compositing::DisplayListResourceTransaction&& resource_transaction)
+bool CompositorState::describe_display_list_fonts(Web::CompositorContextId context_id, ReadonlySpan<Compositing::DisplayListFontDescription> fonts, Compositing::RegisteredTypefaces const& registered_typefaces)
 {
-    auto& context = presented_context(context_id);
-    context.raster_targets.apply_resource_transaction(move(resource_transaction));
-    show_animated_image_frames_in(context);
+    return presented_context(context_id).raster_targets.fonts().add_described_fonts_made_of_registered_typefaces(fonts, registered_typefaces);
 }
 
 CompositorState::VideoSinkState* CompositorState::video_sink_state(CompositorStateWebContentClient& client, Media::VideoSinkHandle handle)
@@ -499,6 +498,14 @@ CompositorState::VideoSinkState* CompositorState::video_sink_state(CompositorSta
     if (!sink_state.has_value())
         return nullptr;
     return &sink_state.value();
+}
+
+RefPtr<Media::VideoFrame> CompositorState::current_video_frame(CompositorStateWebContentClient& client, Media::VideoSinkHandle handle)
+{
+    auto* sink_state = video_sink_state(client, handle);
+    if (!sink_state || !sink_state->sink)
+        return nullptr;
+    return sink_state->sink->current_frame();
 }
 
 void CompositorState::add_video_sink(CompositorStateWebContentClient& client, Media::VideoSinkHandle handle)
@@ -560,10 +567,6 @@ void CompositorState::on_video_sink_ready(CompositorStateWebContentClient& clien
         present_contexts_drawing_video_sink(client, handle);
         update_unpainted_video_update_scheduling();
     });
-    for (auto& [_, context] : m_presented_contexts) {
-        if (context->web_content_client.web_content_client_id() == client.web_content_client_id())
-            resolve_video_sinks(*context);
-    }
     present_contexts_drawing_video_sink(client, handle);
     update_unpainted_video_update_scheduling();
 }
@@ -658,7 +661,7 @@ void CompositorState::animated_image_decoder_lost(CompositorStateWebContentClien
 bool CompositorState::animated_image_is_drawn(CompositorStateWebContentClient* client, Compositing::ImageFrameResourceId id)
 {
     for (auto& [context_id, context] : m_presented_contexts) {
-        if (context->web_content_client.web_content_client_id() == client->web_content_client_id() && context->raster_targets.resource_storage().has_image_frame(id) && m_core.context_is_effectively_visible(context_id))
+        if (context->web_content_client.web_content_client_id() == client->web_content_client_id() && context->raster_targets.image_frames().contains(id) && m_core.context_is_effectively_visible(context_id))
             return true;
     }
     return false;
@@ -667,10 +670,13 @@ bool CompositorState::animated_image_is_drawn(CompositorStateWebContentClient* c
 void CompositorState::show_animated_image_frame(CompositorStateWebContentClient* client, Compositing::ImageFrameResourceId id, Gfx::DecodedImageFrame const& frame)
 {
     for (auto& [context_id, context] : m_presented_contexts) {
-        auto& resource_storage = context->raster_targets.resource_storage();
-        if (context->web_content_client.web_content_client_id() != client->web_content_client_id() || !resource_storage.has_image_frame(id))
+        auto& image_frames = context->raster_targets.image_frames();
+        if (context->web_content_client.web_content_client_id() != client->web_content_client_id() || !image_frames.contains(id))
             continue;
-        resource_storage.replace_image_frame_pixels(id, frame);
+        // NB: Contexts that draw the image frame hold the same one, unless it was registered anew since one took it.
+        auto& image_frame = image_frames.image_frame(id);
+        if (!image_frame.frame().has_same_pixels_as(frame))
+            image_frame.replace_pixels(frame);
         m_core.context_content_changed(context_id);
     }
 }
@@ -683,8 +689,9 @@ void CompositorState::show_animated_image_frames_in(PresentedContext& context)
     for (auto& image_entry : images->value) {
         Compositing::ImageFrameResourceId id { image_entry.key };
         auto const& frame = image_entry.value->shown_frame();
-        if (frame.has_value() && context.raster_targets.resource_storage().has_image_frame(id) && !context.raster_targets.resource_storage().image_frame(id).has_same_pixels_as(*frame))
-            context.raster_targets.resource_storage().replace_image_frame_pixels(id, *frame);
+        auto& image_frames = context.raster_targets.image_frames();
+        if (frame.has_value() && image_frames.contains(id) && !image_frames.image_frame(id).frame().has_same_pixels_as(*frame))
+            image_frames.image_frame(id).replace_pixels(*frame);
     }
     // An image that nothing drew has been waiting for a context to draw it.
     if (!images->value.is_empty())
@@ -744,16 +751,6 @@ void CompositorState::present_contexts_drawing_video_sink(CompositorStateWebCont
             m_contexts_with_new_video_frames->append(context_id.value());
         else
             m_core.context_content_changed(context_id);
-    }
-}
-
-void CompositorState::resolve_video_sinks(PresentedContext& context)
-{
-    auto& client = context.web_content_client;
-    auto& resource_storage = context.raster_targets.resource_storage();
-    for (auto const& [id, handle] : resource_storage.video_sink_handles()) {
-        auto* sink_state = video_sink_state(client, handle);
-        resource_storage.set_video_sink(Compositing::VideoSinkResourceId { id }, sink_state ? sink_state->sink : nullptr);
     }
 }
 
@@ -824,7 +821,7 @@ bool CompositorState::context_video_sinks_require_updates(Web::CompositorContext
     auto* context = presented_context_if_present(context_id);
     if (!context)
         return false;
-    for (auto const& [_, handle] : context->raster_targets.resource_storage().video_sink_handles()) {
+    for (auto handle : context->raster_targets.drawn_video_sinks()) {
         if (auto* sink_state = video_sink_state(context->web_content_client, handle); sink_state && sink_state->requires_updates)
             return true;
     }
@@ -1108,15 +1105,18 @@ CompositorState::PresentedContext& CompositorState::presented_context(Web::Compo
 
 Compositing::RustFFI::FfiRasterPainter CompositorState::begin_painting(Web::CompositorContextId context_id, Gfx::PaintingSurface& surface, RustFFI::PaintingResources resources)
 {
-    auto& raster_targets = presented_context(context_id).raster_targets;
+    auto& context = presented_context(context_id);
+    auto& raster_targets = context.raster_targets;
     if (m_painting_depth == m_display_list_players.size())
         m_display_list_players.append(make<DisplayListPlayerSkia>(m_skia_backend_context));
     auto& player = *m_display_list_players[m_painting_depth++];
     switch (resources) {
     case RustFFI::PaintingResources::Page:
-        return player.begin_painting(surface, raster_targets.resource_storage(), raster_targets.raster_cache(), &raster_targets.canvas_surfaces());
+        return player.begin_painting(surface, raster_targets.fonts(), &raster_targets.image_frames(), raster_targets.raster_cache(), &raster_targets.canvas_surfaces(), [this, &client = context.web_content_client](Media::VideoSinkHandle handle) {
+            return current_video_frame(client, handle);
+        });
     case RustFFI::PaintingResources::Overlays:
-        return player.begin_painting(surface, raster_targets.overlay_resource_storage(), raster_targets.overlay_raster_cache(), nullptr);
+        return player.begin_painting(surface, raster_targets.overlay_fonts(), nullptr, raster_targets.overlay_raster_cache(), nullptr, nullptr);
     }
     VERIFY_NOT_REACHED();
 }
@@ -1195,41 +1195,64 @@ bool CompositorState::retire_idle_surplus_stores(Web::CompositorContextId contex
     return backing_stores.has_surplus_backing_stores();
 }
 
-void CompositorState::apply_resource_changes(Web::CompositorContextId context_id, RustFFI::FfiResourceChanges const& changes)
+bool CompositorState::take_registered_image_frames(Web::CompositorContextId context_id, ReadonlySpan<u64> image_frame_ids)
 {
     auto& context = presented_context(context_id);
-    Compositing::DisplayListResourceTransaction transaction;
-    for (auto const& video_sink : changes.video_sinks)
-        transaction.video_sinks.append({ .id = Compositing::VideoSinkResourceId { video_sink.id }, .sink_handle = Media::VideoSinkHandle { video_sink.sink_handle } });
-    for (auto id : changes.font_ids_to_remove)
-        transaction.font_ids_to_remove.append(Compositing::FontResourceId { id });
-    for (auto id : changes.image_frame_ids_to_remove)
-        transaction.image_frame_ids_to_remove.append(Compositing::ImageFrameResourceId { id });
-    for (auto id : changes.video_sink_ids_to_remove)
-        transaction.video_sink_ids_to_remove.append(Compositing::VideoSinkResourceId { id });
-    auto& raster_targets = context.raster_targets;
-    raster_targets.apply_resource_transaction(move(transaction));
-    // The display lists that the context's lists nest are held by the logic in Rust, and only their rasters here.
-    Compositing::DisplayListResourceSet removed_display_lists;
-    for (auto id : changes.display_list_ids_to_remove)
-        removed_display_lists.display_lists.set(Compositing::DisplayListResourceId { id });
-    raster_targets.raster_cache().evict(removed_display_lists);
-    resolve_video_sinks(context);
-    show_animated_image_frames_in(context);
-    update_unpainted_video_update_scheduling();
+    auto& image_frames = context.raster_targets.image_frames();
+    auto image_frame_count_before = image_frames.size();
+    bool holds_every_image_frame = image_frames.take_registered(image_frame_ids, context.web_content_client.registered_image_frames());
+    if (image_frames.size() != image_frame_count_before)
+        show_animated_image_frames_in(context);
+    return holds_every_image_frame;
 }
 
-bool CompositorState::stage_rasterization(CompositorStateWebContentClient& client, u64 token, Compositing::DisplayListResourceTransaction&& resources, Gfx::ShareableBitmap target_bitmap)
+void CompositorState::set_drawn_image_frames(Web::CompositorContextId context_id, ReadonlySpan<u64> image_frame_ids)
 {
-    if (!resources.font_ids_to_remove.is_empty() || !resources.image_frame_ids_to_remove.is_empty() || !resources.video_sink_ids_to_remove.is_empty() || !resources.display_list_ids_to_remove.is_empty())
-        return false;
+    presented_context(context_id).raster_targets.retain_only_image_frames(image_frame_ids);
+}
+
+void CompositorState::set_drawn_video_sinks(Web::CompositorContextId context_id, ReadonlySpan<u64> handles)
+{
+    if (presented_context(context_id).raster_targets.set_drawn_video_sinks(handles))
+        update_unpainted_video_update_scheduling();
+}
+
+void CompositorState::set_drawn_vector_images(Web::CompositorContextId context_id, ReadonlySpan<u64> vector_image_ids)
+{
+    presented_context(context_id).raster_targets.raster_cache().forget_vector_images_other_than(vector_image_ids);
+}
+
+void CompositorState::set_drawn_fonts(Web::CompositorContextId context_id, ReadonlySpan<u64> font_ids)
+{
+    presented_context(context_id).raster_targets.retain_only_fonts(font_ids);
+}
+
+bool CompositorState::context_holds_fonts(Web::CompositorContextId context_id, ReadonlySpan<u64> font_ids)
+{
+    auto const& fonts = presented_context(context_id).raster_targets.fonts();
+    for (auto id : font_ids) {
+        if (!fonts.contains(Compositing::FontResourceId { id }))
+            return false;
+    }
+    return true;
+}
+
+bool CompositorState::stage_rasterization(CompositorStateWebContentClient& client, u64 token, ReadonlySpan<Compositing::DisplayListFontDescription> fonts, ReadonlySpan<Compositing::ImageFrameResourceId> image_frame_ids, Compositing::RegisteredTypefaces const& registered_typefaces, Gfx::ShareableBitmap target_bitmap)
+{
     // WebContent waits for each rasterization it stages, so it has only the one in flight per thread that rasterizes.
     static constexpr size_t maximum_staged_rasterizations_per_client = 16;
     auto& staged = m_staged_rasterizations.ensure(client.web_content_client_id());
     if (staged.contains(token) || staged.size() >= maximum_staged_rasterizations_per_client)
         return false;
     auto rasterization = make<StagedRasterization>();
-    rasterization->resource_storage.apply_transaction(move(resources));
+    if (!rasterization->fonts.add_described_fonts_made_of_registered_typefaces(fonts, registered_typefaces))
+        return false;
+    Vector<u64> ids_of_image_frames;
+    ids_of_image_frames.ensure_capacity(image_frame_ids.size());
+    for (auto image_frame_id : image_frame_ids)
+        ids_of_image_frames.unchecked_append(image_frame_id.value());
+    if (!rasterization->image_frames.take_registered(ids_of_image_frames, client.registered_image_frames()))
+        return false;
     rasterization->target_bitmap = move(target_bitmap);
     staged.set(token, move(rasterization));
     return true;
@@ -1251,13 +1274,12 @@ bool CompositorState::staged_rasterization_has_resources(WebContentClientId clie
     auto* rasterization = staged_rasterization(client, token);
     if (!rasterization)
         return false;
-    auto const& resource_storage = rasterization->resource_storage;
     for (auto id : font_ids) {
-        if (!resource_storage.has_font(Compositing::FontResourceId { id }))
+        if (!rasterization->fonts.contains(Compositing::FontResourceId { id }))
             return false;
     }
     for (auto id : image_frame_ids) {
-        if (!resource_storage.has_image_frame(Compositing::ImageFrameResourceId { id }))
+        if (!rasterization->image_frames.contains(Compositing::ImageFrameResourceId { id }))
             return false;
     }
     return true;
@@ -1283,7 +1305,7 @@ bool CompositorState::begin_staged_rasterization(WebContentClientId client, u64 
     __builtin_memset(target.scanline_u8(0), 0, target.size_in_bytes());
     rasterization->target_surface = Gfx::PaintingSurface::wrap_bitmap(target);
     rasterization->player = make<DisplayListPlayerSkia>(RefPtr<Gfx::SkiaBackendContext> {});
-    painter = rasterization->player->begin_painting(*rasterization->target_surface, rasterization->resource_storage, rasterization->raster_cache, nullptr);
+    painter = rasterization->player->begin_painting(*rasterization->target_surface, rasterization->fonts, &rasterization->image_frames, rasterization->raster_cache, nullptr, nullptr);
     return true;
 }
 
@@ -1309,8 +1331,8 @@ static bool video_frame_holds_high_dynamic_range(Media::VideoFrame const& frame)
 
 void CompositorState::report_live_content(Web::CompositorContextId context_id, ReadonlySpan<u64> canvas_ids, void* receiver, void (*receive)(void*, RustFFI::FfiLiveContent const*))
 {
-    auto& raster_targets = presented_context(context_id).raster_targets;
-    auto const& resource_storage = raster_targets.resource_storage();
+    auto& context = presented_context(context_id);
+    auto& raster_targets = context.raster_targets;
 
     Vector<RustFFI::FfiCanvasContent> canvases;
     canvases.ensure_capacity(canvas_ids.size());
@@ -1323,11 +1345,11 @@ void CompositorState::report_live_content(Web::CompositorContextId context_id, R
         });
     }
     Vector<RustFFI::FfiVideoSinkContent> video_sinks;
-    video_sinks.ensure_capacity(resource_storage.video_sink_handles().size());
-    for (auto const& [id, handle] : resource_storage.video_sink_handles()) {
-        auto frame = raster_targets.current_video_frame(Compositing::VideoSinkResourceId { id });
+    video_sinks.ensure_capacity(raster_targets.drawn_video_sinks().size());
+    for (auto handle : raster_targets.drawn_video_sinks()) {
+        auto frame = current_video_frame(context.web_content_client, handle);
         video_sinks.unchecked_append({
-            .id = id,
+            .handle = handle.value(),
             .has_frame = frame != nullptr,
             .frame_id = frame ? frame->id() : 0,
             .frame_holds_high_dynamic_range = frame && video_frame_holds_high_dynamic_range(*frame),
@@ -1335,9 +1357,10 @@ void CompositorState::report_live_content(Web::CompositorContextId context_id, R
         });
     }
     Vector<RustFFI::FfiImageFrameContent> image_frames;
-    image_frames.ensure_capacity(resource_storage.image_frame_pixel_generations().size());
-    for (auto const& [id, pixel_generation] : resource_storage.image_frame_pixel_generations())
-        image_frames.unchecked_append({ .id = id, .pixel_generation = pixel_generation });
+    raster_targets.image_frames().for_each([&](auto id, auto const& image_frame) {
+        if (auto pixel_generation = image_frame.generation_of_replaced_pixels(); pixel_generation.has_value())
+            image_frames.append({ .id = id.value(), .pixel_generation = *pixel_generation });
+    });
 
     RustFFI::FfiLiveContent content {
         .canvases = canvases.span(),
@@ -1366,7 +1389,7 @@ Optional<RemoteLayer::Content> CompositorState::remote_layer_content(PresentedCo
             return RemoteLayer::Content { surface.release_nonnull() };
         return {};
     case RustFFI::MediaKind::Video:
-        if (auto frame = context.raster_targets.current_video_frame(Compositing::VideoSinkResourceId { media_id }))
+        if (auto frame = current_video_frame(context.web_content_client, Media::VideoSinkHandle { media_id }))
             return RemoteLayer::Content { frame.release_nonnull() };
         return {};
     }
@@ -1414,7 +1437,8 @@ bool CompositorState::remote_layer_can_show(Web::CompositorContextId context_id,
 Vector<RemoteSublayer>* CompositorState::build_sublayers(Web::CompositorContextId context_id, ReadonlySpan<RustFFI::FfiSublayer> sublayers_to_build)
 {
     auto sublayers = make<Vector<RemoteSublayer>>();
-    auto& raster_targets = presented_context(context_id).raster_targets;
+    auto& context = presented_context(context_id);
+    auto& raster_targets = context.raster_targets;
     for (auto const& sublayer : sublayers_to_build) {
         Optional<Variant<NonnullRefPtr<Media::VideoFrame>, PresentableSurface::Lease>> content;
         switch (sublayer.content_kind) {
@@ -1423,7 +1447,7 @@ Vector<RemoteSublayer>* CompositorState::build_sublayers(Web::CompositorContextI
                 content = surface->lease();
             break;
         case RustFFI::SublayerContentKind::Video:
-            if (auto frame = raster_targets.current_video_frame(Compositing::VideoSinkResourceId { sublayer.media_id }); frame && frame->surface())
+            if (auto frame = current_video_frame(context.web_content_client, Media::VideoSinkHandle { sublayer.media_id }); frame && frame->surface())
                 content = frame.release_nonnull();
             break;
         case RustFFI::SublayerContentKind::PresentableSurface:
@@ -1767,7 +1791,12 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
             return mapping.leak_ptr();
         },
         .unmap_shared_memory = [](void* mapping) { delete static_cast<SharedMemoryMapping*>(mapping); },
-        .apply_resource_changes = [](void* host, u64 context_id, RustFFI::FfiResourceChanges const* changes) { state_of(host).apply_resource_changes(Context { context_id }, *changes); },
+        .take_registered_image_frames = [](void* host, u64 context_id, ReadonlySpan<u64> image_frame_ids) { return state_of(host).take_registered_image_frames(Context { context_id }, image_frame_ids); },
+        .set_drawn_image_frames = [](void* host, u64 context_id, ReadonlySpan<u64> image_frame_ids) { state_of(host).set_drawn_image_frames(Context { context_id }, image_frame_ids); },
+        .set_drawn_video_sinks = [](void* host, u64 context_id, ReadonlySpan<u64> handles) { state_of(host).set_drawn_video_sinks(Context { context_id }, handles); },
+        .set_drawn_vector_images = [](void* host, u64 context_id, ReadonlySpan<u64> vector_image_ids) { state_of(host).set_drawn_vector_images(Context { context_id }, vector_image_ids); },
+        .set_drawn_fonts = [](void* host, u64 context_id, ReadonlySpan<u64> font_ids) { state_of(host).set_drawn_fonts(Context { context_id }, font_ids); },
+        .context_holds_fonts = [](void* host, u64 context_id, ReadonlySpan<u64> font_ids) { return state_of(host).context_holds_fonts(Context { context_id }, font_ids); },
         .staged_rasterization_has_resources = [](void* host, u64 client, u64 token, ReadonlySpan<u64> font_ids, ReadonlySpan<u64> image_frame_ids) { return state_of(host).staged_rasterization_has_resources(WebContentClientId { client }, token, font_ids, image_frame_ids); },
         .begin_staged_rasterization = [](void* host, u64 client, u64 token, Compositing::RustFFI::FfiRasterPainter* painter) { return state_of(host).begin_staged_rasterization(WebContentClientId { client }, token, *painter); },
         .finish_staged_rasterization = [](void* host, u64 client, u64 token) { state_of(host).finish_staged_rasterization(WebContentClientId { client }, token); },

@@ -769,6 +769,11 @@ public:
     Optional<CSS::PreferredColorScheme> svg_image_color_scheme() const { return m_svg_image_color_scheme; }
     void set_svg_image_color_scheme(CSS::PreferredColorScheme color_scheme) { m_svg_image_color_scheme = color_scheme; }
 
+    // Whether this document of an SVG image holds content that is not SVG, which only paints in full through the
+    // document's visual contexts. Such an image is drawn from a raster of the document instead of from its records.
+    bool decoded_svg_holds_foreign_content() const { return m_decoded_svg_holds_foreign_content; }
+    void set_decoded_svg_holds_foreign_content(bool holds_foreign_content) { m_decoded_svg_holds_foreign_content = holds_foreign_content; }
+
     bool needs_mathml_and_svg_user_agent_style_sheets() const { return m_needs_mathml_and_svg_user_agent_style_sheets; }
     void set_needs_mathml_and_svg_user_agent_style_sheets();
 
@@ -1115,7 +1120,6 @@ public:
     void set_needs_container_query_evaluation_after_layout(Element const& query_container);
     [[nodiscard]] bool has_size_containers_needing_evaluation_after_layout(Layout::BegunRead const& read) const;
 
-    [[nodiscard]] bool needs_full_layout_tree_update(Layout::BegunRead const& read) const;
     void set_needs_full_layout_tree_update();
 
     CSS::ScrollStateQueryContainers& scroll_state_query_containers() { return m_scroll_state_query_containers; }
@@ -1279,9 +1283,6 @@ public:
     void cache_accessible_text(Element const&, CachedAccessibleText) const;
     void invalidate_cached_accessibility_data(Node const&, Optional<Utf16FlyString> const& attribute_name = {}, ReadonlySpan<GC::Ref<Node>> added_nodes = {}, ReadonlySpan<GC::Ref<Node>> removed_nodes = {});
 
-    // What a build of the accessibility tree keeps of each node's data for the next build, while an assistive
-    // technology consumes the tree; see AccessibilityTreeNode::serialize_tree_as_node_data().
-    WebView::AccessibilityNodeData const* cached_accessibility_record(Node const&) const;
     // A kept record, with the version it got when it was kept: Every record and geometry kept gets a new version, so
     // the same version means the same data.
     struct KeptAccessibilityRecord {
@@ -1410,7 +1411,6 @@ public:
     void disassociate_with_timeline(GC::Ref<Animations::AnimationTimeline>);
     void associate_with_animation(GC::Ref<Animations::Animation>);
     void disassociate_with_animation(GC::Ref<Animations::Animation>);
-    size_t associated_animation_count() const;
     bool has_associated_animations() const { return !m_associated_animations.is_empty(); }
     // Negative where `first` comes before `second` in tree order and positive where it comes after, for sorting
     // animations by composite order. Two distinct elements of this document take no walk of their siblings once a tree
@@ -1844,7 +1844,7 @@ public:
 
     void exit_pointer_lock();
 
-    RefPtr<SelectorQuery const> selector_query_for(Utf16View) const;
+    RefPtr<SelectorQuery const> selector_query_for(Utf16String const&) const;
     QuerySelectorResultCache& query_selector_result_cache();
 
     // Whether the aria-labelledby or aria-describedby of an element in the tree of root references id.
@@ -2055,6 +2055,7 @@ private:
     // of those namespaces, so they are attached the first time one arrives. Once attached they stay:
     // a document that held one is likely to again, and every element pays for the flip.
     Optional<CSS::PreferredColorScheme> m_svg_image_color_scheme;
+    bool m_decoded_svg_holds_foreign_content { false };
 
     bool m_needs_mathml_and_svg_user_agent_style_sheets { false };
     bool m_has_element_with_auto_directionality { false };
@@ -2626,8 +2627,9 @@ private:
     // Cache of parsed selector queries for querySelectorAll/querySelector/matches/closest.
     // A null value means the selector string failed to parse.
     mutable OrderedHashMap<Utf16String, RefPtr<SelectorQuery const>> m_selector_query_cache;
-    mutable Optional<Utf16String> m_last_selector_query_text;
-    mutable RefPtr<SelectorQuery const> m_last_selector_query;
+    // The text and the query of the cache entry that the last lookup found, until the cache next changes.
+    mutable Utf16String const* m_last_selector_query_text { nullptr };
+    mutable SelectorQuery const* m_last_selector_query { nullptr };
 
     // Cache of querySelectorAll results, validated lazily against the query root's dom_tree_version/character_data_version.
     OwnPtr<QuerySelectorResultCache> m_query_selector_result_cache;

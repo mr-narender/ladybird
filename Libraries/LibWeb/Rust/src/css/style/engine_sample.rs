@@ -350,6 +350,7 @@ fn push_longhands(property: u16, keeps: &impl Fn(u16) -> bool, properties: &mut 
 fn post_compute_adjusts(property: u16, facts: u32) -> bool {
     use element_adjustment_fact::{CHECK_INPUT_LINE_HEIGHT, FORCE_LINE_HEIGHT_NORMAL};
     match property {
+        prop::APPEARANCE => facts & FORCE_LINE_HEIGHT_NORMAL != 0,
         prop::LINE_HEIGHT => facts & (FORCE_LINE_HEIGHT_NORMAL | CHECK_INPUT_LINE_HEIGHT) != 0,
         _ => POST_COMPUTE_ADJUSTED_LONGHANDS.contains(&property),
     }
@@ -1444,7 +1445,11 @@ const _: () = {
 
 /// The line height `normal` uses for a resolved font.
 pub(super) fn normal_line_height(resolved: &bridge::FfiResolvedFont) -> f64 {
-    f64::from(resolved.ascent.round() as i32 + resolved.descent.round() as i32)
+    f64::from(
+        resolved.ascent.round_ties_even() as i32
+            + resolved.descent.round_ties_even() as i32
+            + resolved.line_gap.round_ties_even() as i32,
+    )
 }
 
 /// The used line height, as the C++ working set reads it from the computed value in `values`

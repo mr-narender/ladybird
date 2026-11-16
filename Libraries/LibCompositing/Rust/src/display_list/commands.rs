@@ -40,7 +40,7 @@ pub enum DisplayListCommandType {
     DrawLine,
     BackdropFilterRegion,
     DrawRect,
-    PaintNestedDisplayList,
+    PaintVectorImage,
     DrawIsolatedGroup,
     DeclareMaskContent,
     CompositorWheelHitTestTarget,
@@ -142,7 +142,7 @@ impl DisplayListCommandType {
             Self::DrawLine => "DrawLine",
             Self::BackdropFilterRegion => "BackdropFilterRegion",
             Self::DrawRect => "DrawRect",
-            Self::PaintNestedDisplayList => "PaintNestedDisplayList",
+            Self::PaintVectorImage => "PaintVectorImage",
             Self::DrawIsolatedGroup => "DrawIsolatedGroup",
             Self::DeclareMaskContent => "DeclareMaskContent",
             Self::CompositorWheelHitTestTarget => "CompositorWheelHitTestTarget",
@@ -302,9 +302,9 @@ impl FfiBytes for ImageFrameResourceId {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct VideoSinkResourceId(pub u64);
+pub struct VideoSinkHandle(pub u64);
 
-impl FfiBytes for VideoSinkResourceId {
+impl FfiBytes for VideoSinkHandle {
     #[inline]
     fn write_ffi_bytes(&self, out: &mut [u8]) {
         self.0.write_ffi_bytes(out);
@@ -939,12 +939,12 @@ impl DisplayListCommand for DrawCanvas {
 #[repr(C)]
 pub struct DrawVideoFrame {
     pub dst_rect: IntRect,
-    pub video_sink_id: VideoSinkResourceId,
+    pub video_sink_handle: VideoSinkHandle,
     pub scaling_mode: ScalingMode,
 }
 ffi_bytes_fields!(DrawVideoFrame {
     dst_rect,
-    video_sink_id,
+    video_sink_handle,
     scaling_mode
 });
 
@@ -1400,22 +1400,31 @@ impl DisplayListCommand for PaintConicGradient {
     }
 }
 
+// Paints the records an SVG image's document was recorded as, scaled from the size they were recorded at into `rect`.
+// The records name no visual context of their own and sit in this command's payload. The process that records a tape
+// leaves them out and names them by `vector_image_id` until it sends the tape, so that a tape it keeps does not hold a
+// copy of the image for each place that draws it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
-pub struct PaintNestedDisplayList {
-    pub display_list_id: DisplayListResourceId,
+pub struct PaintVectorImage {
+    pub vector_image_id: DisplayListResourceId,
     pub rect: FloatRect,
-    // The size the nested list was recorded at; replay scales it into the destination rect.
-    pub list_size: IntSize,
+    pub recorded_size: IntSize,
+    pub records: DisplayListDataSpan,
+    // Whether a raster of the records can differ from replaying them in place: they read what was painted before them,
+    // or draw content that changes under them.
+    pub requires_direct_replay: bool,
 }
-ffi_bytes_fields!(PaintNestedDisplayList {
-    display_list_id,
+ffi_bytes_fields!(PaintVectorImage {
+    vector_image_id,
     rect,
-    list_size
+    recorded_size,
+    records,
+    requires_direct_replay
 });
 
-impl DisplayListCommand for PaintNestedDisplayList {
-    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintNestedDisplayList;
+impl DisplayListCommand for PaintVectorImage {
+    const COMMAND_TYPE: DisplayListCommandType = DisplayListCommandType::PaintVectorImage;
     fn bounding_rect(&self) -> Option<IntRect> {
         Some(enclosing_int_rect(self.rect))
     }

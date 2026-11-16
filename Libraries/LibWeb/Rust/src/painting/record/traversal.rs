@@ -8,8 +8,7 @@ use crate::painting::record::trace::Observer;
 
 use super::{PaintPhase, PaintRecorder};
 use crate::css::style::fast_hash::FastSet;
-use crate::layout::node_data::{NodeKind, NodeSlotId};
-use crate::layout::node_facts;
+use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::display_list::recorder::DisplayListRecorder;
@@ -154,6 +153,12 @@ fn record_display_list_impl<O: Observer>(
             recorder.blocking_wheel_event_region_count = tree.read().root_entry().output().blocking_wheel_event_regions;
             display_list
         }
+        None if inputs.records_without_visual_contexts => {
+            recorder.trace_paint(Operation::Named(None, "svg-image-document"), |recorder| {
+                recorder.record_svg_image_document(viewport);
+            });
+            Arc::new(recorder.recorder.into_builder().finish())
+        }
         None => {
             let source_prologue_bytes = recorder.source_recording.as_ref().map(|frame| frame.prologue_bytes);
             let mut marks = std::mem::take(&mut recorder.scratch.scope_marks);
@@ -192,7 +197,7 @@ fn record_display_list_impl<O: Observer>(
         is_identical_to_published_recording: false,
         window_is_focused: inputs.window_is_focused,
         capture_log: recorder.observer.finish(),
-        vector_image_display_lists: Vec::new(),
+        vector_image_ids_by_request: Vec::new(),
         resources: Default::default(),
         display_list_id: 0,
         surface_clear_color: None,
@@ -214,14 +219,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
     }
 
     pub(crate) fn paint_svg_box_impl(&mut self, svg_box: NodeSlotId) {
-        if self.is_recording_svg_resource_content() {
-            let parent_to_enclosing_space = self
-                .recorder
-                .ambient_inline_transform()
-                .unwrap_or_else(libgfx_rust::AffineTransform::identity);
-            self.paint_svg_box_inside_resource(svg_box, parent_to_enclosing_space, true);
-            return;
-        }
         let context = self.own_context(svg_box);
         self.recorder.set_accumulated_visual_context(context);
 
@@ -246,18 +243,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 self.list.items.len() == before,
             );
         });
-        if self.layout_kind(svg_box) == Some(NodeKind::SVGForeignObjectBox) {
-            self.record_foreign_object_descendant_hit_test_items(svg_box);
-        }
-        let kind = self.layout_kind(svg_box);
-        if kind != Some(NodeKind::SVGSVGBox)
-            && !kind.is_some_and(node_painting::is_svg)
-            && kind.is_some_and(node_facts::kind_is_replaced_box)
-        {
-            self.trace_paint(Operation::Producer(svg_box, ProducerKind::DrawBackground), |this| {
-                crate::painting::record::paint::paint(this, svg_box, PaintPhase::Background);
-            });
-        }
         self.trace_paint(Operation::Producer(svg_box, ProducerKind::DrawForeground), |this| {
             crate::painting::record::paint::paint(this, svg_box, PaintPhase::Foreground);
         });
@@ -277,9 +262,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
     }
 
     pub(crate) fn for_descendants_context(&self, paintable: NodeSlotId) -> ContextRef {
-        if let Some(walk) = &self.svg_resource_walk {
-            return walk.enclosing_context;
-        }
         self.data(paintable).accumulated_visual_context_for_descendants
     }
 

@@ -1341,6 +1341,9 @@ impl RetainedState {
         defaulting: &WinnerDefaulting<'_>,
         quirks_color: Option<&RetainedStyleValueData>,
     ) {
+        use crate::css::property_metadata::property_id as prop;
+        use crate::css::style_compute::{initial_value_handle, keyword, writing_mode_and_direction_of};
+
         decided.easy.clear();
         decided.hard.clear();
         decided.native_font.clear();
@@ -1353,14 +1356,45 @@ impl RetainedState {
         // back below a revert, the place of that declaration and of the revert.
         let mut resolved: Vec<(_, _, Option<RolledBack>)> = Vec::with_capacity(winners.len());
         let mut rolled_below = false;
-        for (position, &winner) in winners.iter().enumerate() {
+        let initial_flow = writing_mode_and_direction_of(
+            Some(initial_value_handle(prop::WRITING_MODE)),
+            Some(initial_value_handle(prop::DIRECTION)),
+        );
+        let inherited_flow = writing_mode_and_direction_of(
+            Some(
+                defaulting
+                    .parent
+                    .value(prop::WRITING_MODE)
+                    .unwrap_or_else(|| initial_value_handle(prop::WRITING_MODE)),
+            ),
+            Some(
+                defaulting
+                    .parent
+                    .value(prop::DIRECTION)
+                    .unwrap_or_else(|| initial_value_handle(prop::DIRECTION)),
+            ),
+        );
+        let mut flow = inherited_flow;
+        // Resolve the mapping before searching the lower cascade for either half of a logical pair.
+        let is_flow = |property| matches!(property, prop::WRITING_MODE | prop::DIRECTION);
+        let flow_winners = winners
+            .iter()
+            .enumerate()
+            .filter(|(_, winner)| is_flow(winner.property));
+        let other_winners = winners
+            .iter()
+            .enumerate()
+            .filter(|(_, winner)| !is_flow(winner.property));
+        for (position, &winner) in flow_winners.chain(other_winners) {
+            let target_property = winner.property;
+            let counterpart = logical_counterpart(target_property, flow.0, flow.1);
             // https://drafts.csswg.org/css-cascade-5/#default
             // `revert` and `revert-layer`, declared or substituted, roll the property back below
             // the declaration that held them, to a lower declaration that is substituted in turn.
             // The declarations it rolled back, with the keyword of each.
             let mut reverted: smallvec::SmallVec<[(CascadePriority, CascadeOperator); 2]> = smallvec::SmallVec::new();
             let (mut priority, mut winner) = (None, winner);
-            let classified = loop {
+            let mut classified = loop {
                 let Winner {
                     property,
                     important,
@@ -1393,7 +1427,7 @@ impl RetainedState {
                 ));
                 // What the property rolls back to is decided by declarations the winners do not name.
                 decided.reads.element_dependent = true;
-                match cascade.winner_below(property, &reverted) {
+                match cascade.winner_below(target_property, counterpart, &reverted) {
                     Some((lower_priority, lower)) => (priority, winner) = (Some(lower_priority), lower),
                     // Nothing below declares the property, which is undeclared and computes as the
                     // element's seed holds it.
@@ -1408,7 +1442,7 @@ impl RetainedState {
                              source: other_source,
                              ..
                          }| {
-                            is_logical_counterpart(property, other)
+                            counterpart == Some(other)
                                 && reverted[0]
                                     .0
                                     .reverts_past(reverted[0].1, &cascade.priority_of(other_source, other_important))
@@ -1440,6 +1474,46 @@ impl RetainedState {
                     }
                 }
             };
+            let flow_keyword = classified
+                .as_ref()
+                .filter(|_| is_flow(target_property))
+                .map(|classified| classified.value.value())
+                .and_then(RetainedStyleValueData::optional_data)
+                .and_then(|value| match value {
+                    StyleValueData::Keyword { keyword } => Some(*keyword),
+                    _ => None,
+                });
+            match target_property {
+                prop::WRITING_MODE => {
+                    flow.0 = match flow_keyword {
+                        Some(keyword::INITIAL) => initial_flow.0,
+                        Some(keyword) => {
+                            crate::css::style_compute::keyword_to_writing_mode(keyword).unwrap_or(inherited_flow.0)
+                        }
+                        None => inherited_flow.0,
+                    };
+                }
+                prop::DIRECTION => {
+                    flow.1 = match flow_keyword {
+                        Some(keyword::INITIAL) => initial_flow.1,
+                        Some(keyword) => {
+                            crate::css::style_compute::keyword_to_direction(keyword).unwrap_or(inherited_flow.1)
+                        }
+                        None => inherited_flow.1,
+                    };
+                }
+                _ => {}
+            }
+            if winner.property != target_property {
+                // A shorthand's value was extracted for the lower declaration's longhand, not for its counterpart.
+                if let Some(classified) = &mut classified {
+                    if let ResolvedWinnerValue::Written(value) = &classified.value {
+                        classified.value = ResolvedWinnerValue::Substituted((*value).clone());
+                    }
+                    classified.computation = WinnerComputation::Full;
+                }
+                winner.property = target_property;
+            }
             let rolled_back = priority.map(|priority| RolledBack {
                 place: (priority, winner.index),
                 revert: (reverted[0].0, winners[position].index),
@@ -1473,7 +1547,7 @@ impl RetainedState {
                 Some(rolled_back)
                     if places.iter().any(|&(property, counterpart, rolled)| {
                         !rolled
-                            && is_logical_counterpart(places[position].0, property)
+                            && logical_counterpart(places[position].0, flow.0, flow.1) == Some(property)
                             && rolled_back.revert > counterpart
                             && rolled_back.revert.0.reverts_past(rolled_back.operator, &counterpart.0)
                     }) =>
@@ -1554,9 +1628,6 @@ impl RetainedState {
                 }
                 _ => self.substitute_value(custom_properties, property, written),
             };
-            // https://drafts.csswg.org/css-variables-2/#invalid-at-computed-value-time
-            // A declaration invalid at computed-value time computes as if `unset`, which the
-            // element's seed already holds for every longhand it does not decide.
             // What `attr()`, `if()`, `inherit()` or a custom function substitutes is the element's
             // alone.
             let reads_subject = super::custom_property_cascade::value_reads_substitution_subject(written.data())
@@ -1567,19 +1638,15 @@ impl RetainedState {
                 written.data(),
                 &mut custom_properties,
             );
-            if matches!(value.optional_data(), Some(StyleValueData::GuaranteedInvalid)) {
-                return ClassifiedWinner {
-                    value: ResolvedWinnerValue::Unset,
-                    computation: WinnerComputation::Full,
-                    reads: WinnerReads {
-                        element: reads_subject,
-                        substitution,
-                        custom_properties,
-                        unnamed_custom_properties,
-                        ..WinnerReads::default()
-                    },
-                };
-            }
+            // https://drafts.csswg.org/css-variables-2/#invalid-at-computed-value-time
+            // A declaration invalid at computed-value time computes as if `unset`.
+            // NB: That's what a declaration of the `unset` keyword computes to, rather than to a user-agent declaration
+            //     the element's seed may hold for the longhand.
+            let value = if matches!(value.optional_data(), Some(StyleValueData::GuaranteedInvalid)) {
+                RetainedStyleValueData::shared_keyword(crate::css::css_enums::keyword::UNSET).clone()
+            } else {
+                value
+            };
             // https://drafts.csswg.org/css-cascade-5/#defaulting-keywords
             // A substitution that produces a CSS-wide keyword takes the keyword's value, as a
             // declaration of the keyword itself does.
@@ -2346,9 +2413,7 @@ impl<'a> DecidedWinners<'_, 'a> {
         self.reads.reads_root_font = self.reads.reads_root_font.max(reads.root_font);
         self.reads.reads_font_metric_lengths |= reads.font_metrics;
         self.reads.environment_reads |= reads.environment | property_environment_reads(property);
-        let Some(written) = value.value() else {
-            return;
-        };
+        let written = value.value();
         // https://drafts.csswg.org/css-cascade-5/#defaulting-keywords
         // A CSS-wide keyword's computed value is the initial value or the parent's computed
         // value, which computes directly as any computed value does.
@@ -2602,11 +2667,12 @@ pub(in crate::css::style) trait CascadeBelow {
     /// The priority of the block a winner of the cascade came from.
     fn priority_of(&self, source: WinnerSource, important: bool) -> CascadePriority;
 
-    /// The highest declaration of `property` in the cascade that none of the reverting declarations,
+    /// The highest declaration of `property` or its mapped counterpart that none of the reverting declarations,
     /// at their priorities with the keywords they substituted to, roll back past, with its priority.
     fn winner_below(
         &self,
         property: u16,
+        counterpart: Option<u16>,
         reverted: &[(CascadePriority, CascadeOperator)],
     ) -> Option<(CascadePriority, Winner)>;
 
@@ -2618,22 +2684,19 @@ pub(in crate::css::style) trait CascadeBelow {
 pub(in crate::css::style) enum ResolvedWinnerValue<'a> {
     Written(&'a RetainedStyleValueData),
     Substituted(RetainedStyleValueData),
-    /// The declaration is invalid at computed-value time.
-    Unset,
 }
 
 impl ResolvedWinnerValue<'_> {
-    fn value(&self) -> Option<&RetainedStyleValueData> {
+    fn value(&self) -> &RetainedStyleValueData {
         match self {
-            Self::Written(value) => Some(value),
-            Self::Substituted(value) => Some(value),
-            Self::Unset => None,
+            Self::Written(value) => value,
+            Self::Substituted(value) => value,
         }
     }
 
     fn into_substituted(self) -> Option<RetainedStyleValueData> {
         match self {
-            Self::Written(_) | Self::Unset => None,
+            Self::Written(_) => None,
             Self::Substituted(value) => Some(value),
         }
     }
@@ -2648,25 +2711,19 @@ struct RolledBack {
     operator: CascadeOperator,
 }
 
-/// Whether `other` is the logical or physical counterpart of `property` in some writing mode and
-/// direction.
-fn is_logical_counterpart(property: u16, other: u16) -> bool {
+/// The logical or physical counterpart of `property` in the element's resolved writing mode and direction.
+fn logical_counterpart(property: u16, writing_mode: u8, direction: u8) -> Option<u16> {
     use crate::css::style_compute::{
-        DIRECTION_COUNT, LOGICAL_ALIAS_BIT, PHYSICAL_TO_LOGICAL_BIT, WRITING_MODE_COUNT, map_logical_alias_to_physical,
-        map_physical_to_logical_alias, table_row_bits,
+        LOGICAL_ALIAS_BIT, PHYSICAL_TO_LOGICAL_BIT, map_logical_alias_to_physical, map_physical_to_logical_alias,
+        table_row_bits,
     };
     let bits = table_row_bits(property);
     if bits & (LOGICAL_ALIAS_BIT | PHYSICAL_TO_LOGICAL_BIT) == 0 {
-        return false;
+        return None;
     }
-    (0..WRITING_MODE_COUNT as u8).any(|writing_mode| {
-        (0..DIRECTION_COUNT as u8).any(|direction| {
-            other
-                == match bits & LOGICAL_ALIAS_BIT != 0 {
-                    true => map_logical_alias_to_physical(property, writing_mode, direction),
-                    false => map_physical_to_logical_alias(property, writing_mode, direction),
-                }
-        })
+    Some(match bits & LOGICAL_ALIAS_BIT != 0 {
+        true => map_logical_alias_to_physical(property, writing_mode, direction),
+        false => map_physical_to_logical_alias(property, writing_mode, direction),
     })
 }
 

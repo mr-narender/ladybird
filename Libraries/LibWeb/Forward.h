@@ -236,7 +236,6 @@ class Directive;
 
 namespace Web::CookieStore {
 
-class CookieChangeEvent;
 class CookieStore;
 
 }
@@ -640,8 +639,6 @@ namespace Web::Geolocation {
 
 class Geolocation;
 class GeolocationCoordinates;
-class GeolocationPosition;
-class GeolocationPositionError;
 
 }
 
@@ -1013,7 +1010,6 @@ class PerformanceEntry;
 namespace Web::PermissionsAPI {
 
 class Permissions;
-class PermissionStatus;
 
 }
 

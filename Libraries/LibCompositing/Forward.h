@@ -22,8 +22,9 @@ struct UIOverlays;
 class Canvas2DCommandStream;
 struct Canvas2DCommandStreamSegment;
 struct DisplayListGlyph;
-class DisplayListResourceStorage;
-struct DisplayListResourceSet;
+class RegisteredImageFrame;
+class RegisteredImageFrames;
+class RegisteredTypefaces;
 enum class CompositorScrollNodeKind : u8;
 
 }

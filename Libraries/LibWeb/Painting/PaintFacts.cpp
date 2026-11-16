@@ -66,6 +66,8 @@ static void queue_canvas_paint_facts(HTML::HTMLCanvasElement const& canvas)
     // NB: The output bitmap of an ImageBitmapRenderingContext is painted as the image of the canvas.
     if (auto const* bitmap_renderer = canvas.canvas_bitmap_renderer_context()) {
         Layout::RustFFI::FfiReplacedImagePaintFacts image_facts {};
+        image_facts.natural.width = CSSPixels(canvas.width());
+        image_facts.natural.height = CSSPixels(canvas.height());
         if (auto const* frame = bitmap_renderer->frame()) {
             image_facts.content.kind = Layout::RustFFI::FfiImageContentKind::Raster;
             image_facts.content.frame = frame;
@@ -261,7 +263,6 @@ static void queue_video_paint_facts(HTML::HTMLVideoElement const& element)
             auto src_size = video_element.natural_media_size()->to_type<int>();
             facts.video_src_width = src_size.width();
             facts.video_src_height = src_size.height();
-            facts.video_sink_resource_id = video_element.video_sink_resource_id().value().value();
             facts.video_sink_handle = sink_handle->value();
         }
         break;

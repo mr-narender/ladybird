@@ -79,9 +79,8 @@ class HTMLMediaElement::ActiveVideoSink {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    ActiveVideoSink(Media::VideoSinkHandle handle, Compositing::VideoSinkResourceId resource_id)
+    explicit ActiveVideoSink(Media::VideoSinkHandle handle)
         : m_handle(handle)
-        , m_resource_id(resource_id)
     {
     }
 
@@ -91,7 +90,6 @@ public:
     }
 
     Media::VideoSinkHandle handle() const { return m_handle; }
-    Compositing::VideoSinkResourceId resource_id() const { return m_resource_id; }
 
     void register_with(Compositor::CompositorHost& compositor_host)
     {
@@ -174,7 +172,6 @@ public:
 
 private:
     Media::VideoSinkHandle m_handle;
-    Compositing::VideoSinkResourceId m_resource_id;
     Compositor::CompositorHost* m_compositor_host { nullptr };
     RefPtr<Compositing::VideoFramePresentationPage> m_presentation_page;
     WeakPtr<Compositing::VideoFrameHold> m_latest_hold;
@@ -1076,9 +1073,16 @@ public:
             return;
         }
 
-        // FIXME: 6. ⌛ If candidate has a type attribute whose value, when parsed as a MIME type (including any codecs described
-        //           by the codecs parameter, for types that define that parameter), represents a type that the user agent knows
-        //           it cannot render, then end the synchronous section, and jump down to the failed with elements step below.
+        // 6. ⌛ If candidate has a type attribute whose value, when parsed as a MIME type (including any codecs described by
+        //    the codecs parameter, for types that define that parameter), represents a type that the user agent knows it
+        //    cannot render, then end the synchronous section, and jump down to the failed with elements step below.
+        // NB: An empty type attribute names no type, so unlike an unparseable one, it doesn't rule the source out.
+        if (auto type = m_candidate->get_attribute(HTML::AttributeNames::type); type.has_value() && !type->is_empty()) {
+            if (m_media_element->can_play_type(*type) == Bindings::CanPlayTypeResult::Empty) {
+                failed_with_elements();
+                return;
+            }
+        }
 
         // 7. ⌛ Set the currentSrc attribute to the result of applying the URL serializer to urlRecord.
         m_media_element->m_current_src = utf16_string_from_url_ascii(url_record->serialize());
@@ -2090,13 +2094,6 @@ Optional<Media::VideoSinkHandle> HTMLMediaElement::video_sink_handle() const
     return m_active_video_sink->handle();
 }
 
-Optional<Compositing::VideoSinkResourceId> HTMLMediaElement::video_sink_resource_id() const
-{
-    if (!m_active_video_sink)
-        return {};
-    return m_active_video_sink->resource_id();
-}
-
 // https://html.spec.whatwg.org/multipage/media.html#media-data
 bool HTMLMediaElement::media_data_is_cors_cross_origin() const
 {
@@ -2145,7 +2142,7 @@ void HTMLMediaElement::attach_selected_video_track_sink(Media::Track const& trac
         if (auto* video_element = as_if<HTMLVideoElement>(&self))
             video_element->set_intrinsic_video_dimensions(size);
     }));
-    m_active_video_sink = make<ActiveVideoSink>(handle, Compositing::allocate_video_sink_resource_id());
+    m_active_video_sink = make<ActiveVideoSink>(handle);
     m_video_sink_is_ticking = true;
     add_current_video_sink(handle);
     video_sink_ticking_inputs_changed();

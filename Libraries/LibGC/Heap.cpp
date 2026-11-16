@@ -61,6 +61,11 @@ static constexpr double GC_TARGET_TIME_FRACTION { 0.1 };
 static constexpr double GC_MIN_GROWTH_FACTOR { 2 };
 static constexpr double GC_MAX_GROWTH_FACTOR { 8 };
 
+// The maximum factor goes down to the minimum as the live heap, counting the memory its cells own outside it, grows
+// from the first size to the second. Letting a large heap grow by the maximum factor would add gigabytes of garbage.
+static constexpr size_t GC_LARGE_HEAP_START_BYTES { 128 * 1024 * 1024 };
+static constexpr size_t GC_LARGE_HEAP_END_BYTES { 512 * 1024 * 1024 };
+
 // OPTIMIZATION: A program that allocates fast and keeps little alive gains from a budget far above the maximum factor,
 //               so the maximum never limits a budget below this.
 static constexpr size_t GC_MAX_BUDGET_FLOOR_BYTES { 256 * 1024 * 1024 };
@@ -70,6 +75,11 @@ static constexpr size_t GC_MAX_BUDGET_FLOOR_BYTES { 256 * 1024 * 1024 };
 //     1 GiB of such memory allocate gigabytes of cells between collections, so it only grows the threshold by a tenth.
 static constexpr size_t GC_EXTERNAL_GROWTH_FACTOR_NUMERATOR { 1 };
 static constexpr size_t GC_EXTERNAL_GROWTH_FACTOR_DENOMINATOR { 10 };
+
+// The share of the threshold that may be allocated before the sweep that follows a collection has to be done. Until a
+// block is swept, its dead cells keep their slots and whatever memory they own outside the heap, and a program that
+// keeps the event loop busy gives the sweep timer no chance to run, so allocation pays for the sweep as it goes.
+static constexpr size_t GC_SWEEP_ALLOCATION_SHARE_DENOMINATOR { 4 };
 
 static constexpr int GC_INCREMENTAL_SWEEP_INTERVAL_MS = 16;
 static constexpr int GC_INCREMENTAL_SWEEP_SLICE_MS = 5;
@@ -446,6 +456,9 @@ void Heap::will_allocate(size_t size, TriggersCollection triggers_collection)
     m_allocated_bytes_since_last_gc += size;
     m_total_allocated_bytes += size;
 
+    if (m_block_sweeps_in_progress == 0 && triggers_collection == TriggersCollection::Yes)
+        sweep_in_step_with_allocation();
+
     // Keep the idle GC timer armed while allocation is happening, so a proactive collection runs once the mutator's
     // allocation rate drops.
     if (!m_idle_gc_timer || !m_idle_gc_timer->is_active())
@@ -481,7 +494,10 @@ double Heap::next_growth_factor(size_t live_cell_bytes)
         ? (wanted_budget / live + m_wanted_growth_factor.value()) / 2
         : wanted_budget / live;
 
-    auto max_growth_factor = max(GC_MAX_GROWTH_FACTOR, static_cast<double>(GC_MAX_BUDGET_FLOOR_BYTES) / live);
+    auto heap_size = static_cast<double>(live_cell_bytes) + static_cast<double>(m_marked_external_bytes);
+    auto large_heap_share = clamp((heap_size - GC_LARGE_HEAP_START_BYTES) / (GC_LARGE_HEAP_END_BYTES - GC_LARGE_HEAP_START_BYTES), 0.0, 1.0);
+    auto max_growth_factor = GC_MAX_GROWTH_FACTOR - (GC_MAX_GROWTH_FACTOR - GC_MIN_GROWTH_FACTOR) * large_heap_share;
+    max_growth_factor = max(max_growth_factor, static_cast<double>(GC_MAX_BUDGET_FLOOR_BYTES) / live);
     return clamp(m_wanted_growth_factor.value(), GC_MIN_GROWTH_FACTOR, max_growth_factor);
 }
 
@@ -1714,6 +1730,7 @@ void Heap::sweep_block(HeapBlock& block)
 
     // Remove from the allocator's pending sweep list.
     block.m_sweep_list_node.remove();
+    ++m_blocks_swept;
 
     block.set_being_swept(true);
     bool block_has_live_cells = false;
@@ -1801,6 +1818,8 @@ void Heap::start_incremental_sweep()
             m_allocators_to_sweep.append(allocator);
     }
     incremental_sweep_stats().total_blocks = total_blocks;
+    m_blocks_to_sweep = total_blocks;
+    m_blocks_swept = 0;
 
     dbgln_if(INCREMENTAL_SWEEP_DEBUG, "[sweep] {} blocks to sweep", total_blocks);
 
@@ -1858,6 +1877,37 @@ void Heap::finish_pending_incremental_sweep()
         }
         ++blocks_swept;
     }
+}
+
+void Heap::sweep_in_step_with_allocation()
+{
+    if (!m_incremental_sweep_active || is_gc_deferred())
+        return;
+
+    // Keep the share of blocks swept ahead of the share of the allocation allowance used since the collection. The
+    // allowance comes from the smallest threshold that the cells this collection found alive can give, since the
+    // threshold itself is only updated once the sweep is done. A collection that something asked for does not reset
+    // the bytes allocated towards the threshold, so this counts from the end of the collection instead.
+    auto smallest_threshold = max(static_cast<size_t>(static_cast<double>(m_marked_cell_bytes) * GC_MIN_GROWTH_FACTOR), GC_MIN_BYTES_THRESHOLD);
+    auto allowance = max(smallest_threshold / GC_SWEEP_ALLOCATION_SHARE_DENOMINATOR, static_cast<size_t>(1));
+    auto allocated = min(static_cast<size_t>(m_total_allocated_bytes - m_total_allocated_bytes_at_last_collection), allowance);
+    auto blocks_due = static_cast<size_t>(static_cast<double>(m_blocks_to_sweep) * static_cast<double>(allocated) / static_cast<double>(allowance));
+    // NB: Once every block is due, the sweep goes on until it finds nothing left to sweep, which finishes it.
+    auto is_ahead = [&] { return m_blocks_swept >= blocks_due && blocks_due < m_blocks_to_sweep; };
+    if (is_ahead())
+        return;
+
+    size_t blocks_swept = 0;
+    auto start_time = MonotonicTime::now();
+    while (!is_ahead()) {
+        if (sweep_next_block()) {
+            record_incremental_sweep_batch(blocks_swept, (MonotonicTime::now() - start_time).to_microseconds(), false);
+            finish_incremental_sweep();
+            return;
+        }
+        ++blocks_swept;
+    }
+    record_incremental_sweep_batch(blocks_swept, (MonotonicTime::now() - start_time).to_microseconds(), false);
 }
 
 void Heap::start_incremental_sweep_timer()

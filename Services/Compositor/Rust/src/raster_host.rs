@@ -106,31 +106,12 @@ pub struct FfiCanvasContent {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct FfiVideoSinkContent {
-    pub id: u64,
+    pub handle: u64,
     pub has_frame: bool,
     pub frame_id: u64,
     pub frame_holds_high_dynamic_range: bool,
     // Whether the window server can show the frame as it is.
     pub frame_has_surface: bool,
-}
-
-/// A video sink that a display list draws: its resource ID, and the handle of the sink.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct FfiVideoSinkResource {
-    pub id: u64,
-    pub sink_handle: u64,
-}
-
-/// The resources of a context that a display list or a visual context tree it accepted adds or removes, apart from the
-/// fonts and image frames that went ahead of it.
-#[repr(C)]
-pub struct FfiResourceChanges<'a> {
-    pub video_sinks: ak::Span<'a, FfiVideoSinkResource>,
-    pub font_ids_to_remove: ak::Span<'a, u64>,
-    pub image_frame_ids_to_remove: ak::Span<'a, u64>,
-    pub video_sink_ids_to_remove: ak::Span<'a, u64>,
-    pub display_list_ids_to_remove: ak::Span<'a, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -140,8 +121,8 @@ pub struct FfiImageFrameContent {
     pub pixel_generation: u64,
 }
 
-/// The live content of a context as it is now: the canvases asked about, every video sink and every image frame the
-/// context's resources hold.
+/// The live content of a context as it is now: the canvases asked about, every video sink the context draws and every
+/// image frame its resources hold.
 #[repr(C)]
 pub struct FfiLiveContent<'a> {
     pub canvases: ak::Span<'a, FfiCanvasContent>,
@@ -149,8 +130,8 @@ pub struct FfiLiveContent<'a> {
     pub image_frames: ak::Span<'a, FfiImageFrameContent>,
 }
 
-/// The live content of a context as it is now, by ID: the canvases asked about, every video sink, and the pixel
-/// generation of every image frame.
+/// The live content of a context as it is now: the canvases asked about by ID, every video sink the context draws by
+/// its handle, and the pixel generation of every image frame by ID.
 #[derive(Clone, Default, Debug)]
 pub struct LiveContent {
     pub canvases: HashMap<u64, FfiCanvasContent>,
@@ -191,7 +172,8 @@ pub enum SublayerContentKind {
     PresentableSurface,
 }
 
-/// A sublayer the window server shows above a frame: a canvas or video of the context by its id, or a surface.
+/// A sublayer the window server shows above a frame: a canvas of the context by its id, a video by the handle of its
+/// sink, or a surface.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FfiSublayer {
@@ -316,10 +298,26 @@ pub struct FfiRasterHost {
     /// drops, or null where the descriptor does not hold that much. Writes where the memory is and its size.
     pub map_shared_memory: unsafe extern "C" fn(*mut c_void, i32, u64, *mut *const u8, *mut usize) -> *mut c_void,
     pub unmap_shared_memory: unsafe extern "C" fn(*mut c_void),
-    pub apply_resource_changes: unsafe extern "C" fn(*mut c_void, u64, *const FfiResourceChanges<'_>),
+    /// Arguments: the context, and the ids of the image frames that a display list or a visual context tree draws.
+    /// Has the context hold those it lacks of the image frames its client registered, and answers whether it then
+    /// holds all of them.
+    pub take_registered_image_frames: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>) -> bool,
+    /// Arguments: the context, and the ids of the image frames that its display list and its visual context tree
+    /// draw, which are the image frames the host keeps for it.
+    pub set_drawn_image_frames: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>),
+    /// Arguments: the context, and the handles of the video sinks that its display list draws.
+    pub set_drawn_video_sinks: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>),
+    /// Arguments: the context, and the ids of the SVG images that its display list draws, whose rasters the host keeps.
+    pub set_drawn_vector_images: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>),
+    /// Arguments: the context, and the ids of the fonts that its display list draws, which are the fonts the host
+    /// keeps for it.
+    pub set_drawn_fonts: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>),
+    /// Arguments: the context, and the ids of the fonts that a display list draws. Answers whether the host holds all
+    /// of them for the context.
+    pub context_holds_fonts: unsafe extern "C" fn(*mut c_void, u64, ak::Span<'_, u64>) -> bool,
     /// Arguments: the client, the token it staged the rasterization under, and the fonts and image frames the display
-    /// list draws. Answers whether the rasterization is staged with all of them. A video sink drawn without a handle
-    /// draws nothing, so the sinks are not asked about.
+    /// list draws. Answers whether the rasterization is staged with all of them. A staged rasterization draws no video
+    /// frames, so the sinks are not asked about.
     pub staged_rasterization_has_resources:
         unsafe extern "C" fn(*mut c_void, u64, u64, ak::Span<'_, u64>, ak::Span<'_, u64>) -> bool,
     /// Writes the painter that paints into the target of the staged rasterization, with its resources, until
@@ -659,7 +657,7 @@ impl RasterHost {
                 .video_sinks
                 .as_slice()
                 .iter()
-                .map(|sink| (sink.id, *sink))
+                .map(|sink| (sink.handle, *sink))
                 .collect();
             receiver.image_frames = content
                 .image_frames
@@ -849,9 +847,34 @@ impl RasterHost {
         storage
     }
 
-    pub fn apply_resource_changes(&self, context_id: CompositorContextId, changes: &FfiResourceChanges<'_>) {
-        // SAFETY: The host outlives this, and reads the changes during the call.
-        unsafe { (self.0.apply_resource_changes)(self.host(), context_id.0, changes) };
+    pub fn take_registered_image_frames(&self, context_id: CompositorContextId, image_frame_ids: &[u64]) -> bool {
+        // SAFETY: The host outlives this, and reads the ids during the call.
+        unsafe { (self.0.take_registered_image_frames)(self.host(), context_id.0, ak::Span::new(image_frame_ids)) }
+    }
+
+    pub fn set_drawn_image_frames(&self, context_id: CompositorContextId, image_frame_ids: &[u64]) {
+        // SAFETY: The host outlives this, and reads the ids during the call.
+        unsafe { (self.0.set_drawn_image_frames)(self.host(), context_id.0, ak::Span::new(image_frame_ids)) };
+    }
+
+    pub fn set_drawn_video_sinks(&self, context_id: CompositorContextId, video_sink_handles: &[u64]) {
+        // SAFETY: The host outlives this, and reads the handles during the call.
+        unsafe { (self.0.set_drawn_video_sinks)(self.host(), context_id.0, ak::Span::new(video_sink_handles)) };
+    }
+
+    pub fn set_drawn_vector_images(&self, context_id: CompositorContextId, vector_image_ids: &[u64]) {
+        // SAFETY: The host outlives this, and reads the ids during the call.
+        unsafe { (self.0.set_drawn_vector_images)(self.host(), context_id.0, ak::Span::new(vector_image_ids)) };
+    }
+
+    pub fn set_drawn_fonts(&self, context_id: CompositorContextId, font_ids: &[u64]) {
+        // SAFETY: The host outlives this, and reads the ids during the call.
+        unsafe { (self.0.set_drawn_fonts)(self.host(), context_id.0, ak::Span::new(font_ids)) };
+    }
+
+    pub fn context_holds_fonts(&self, context_id: CompositorContextId, font_ids: &[u64]) -> bool {
+        // SAFETY: The host outlives this, and reads the ids during the call.
+        unsafe { (self.0.context_holds_fonts)(self.host(), context_id.0, ak::Span::new(font_ids)) }
     }
 
     pub fn staged_rasterization_has_resources(

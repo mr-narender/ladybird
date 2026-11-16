@@ -17,6 +17,9 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-${{ matrix.os_name }}-${{ matrix.arch }}
       cancel-in-progress: false
+    # A run takes a quarter of an hour, and half an hour at the most. A job that hangs holds its platform's runner, and
+    # each push meanwhile replaces the job waiting behind it, so the history skips every push until the job ends.
+    timeout-minutes: 60
     runs-on: ${{ fromJSON(matrix.runner_labels) }}
     if: ${{ github.repository == 'LadybirdBrowser/ladybird' }}
     name: ${{ matrix.os_name }}, ${{ matrix.arch }}
@@ -137,7 +140,7 @@ jobs:
             executable="${GITHUB_WORKSPACE}/Build/bin/Ladybird"
           fi
 
-          ./run.py --iterations=5 --executable="${executable}"
+          ./run.py --iterations=3 --executable="${executable}"
 
       - name: 'Save results as an artifact'
         uses: actions/upload-artifact@v7

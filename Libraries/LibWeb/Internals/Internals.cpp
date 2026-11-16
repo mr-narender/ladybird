@@ -13,7 +13,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16StringBuilder.h>
 #include <LibAudio/ClientConnection.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
+#include <LibCompositing/DisplayList/DisplayListResources.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/System.h>
 #include <LibCore/TimeZone.h>
@@ -369,7 +369,7 @@ WebIDL::ExceptionOr<void> Internals::load_reference_test_metadata()
 
     // Collect all <meta name="fuzzy" content=".."> values.
     JsonArray fuzzy_configurations;
-    auto fuzzy_nodes = TRY(document->query_selector_all("meta[name=fuzzy]"sv));
+    auto fuzzy_nodes = TRY(document->query_selector_all("meta[name=fuzzy]"_utf16));
     for (size_t i = 0; i < fuzzy_nodes->length(); ++i) {
         auto const* fuzzy_node = fuzzy_nodes->item(i);
         auto content = as<DOM::Element>(fuzzy_node)->get_attribute_value(HTML::AttributeNames::content);
@@ -2499,7 +2499,7 @@ void Internals::perform_per_test_cleanup()
 
     // Clear any input state
     if (auto local_root = local_root_of(window())) {
-        local_root->event_handler().clear_per_test_input_state({});
+        local_root->event_handler().clear_per_test_input_state();
         WebDriver::reset_input_state(*local_root->top_level_traversable());
     }
     if (auto* compositor_context = compositor_context_routing_input_for(window()))
@@ -2543,15 +2543,19 @@ void Internals::set_geolocation_emulated_position(double latitude, double longit
 // Every position request then fails with POSITION_UNAVAILABLE, as it does when no position can be found.
 void Internals::set_geolocation_emulated_position_unavailable()
 {
-    page().set_emulated_position_data(Geolocation::GeolocationPositionError::ErrorCode::PositionUnavailable);
+    page().set_emulated_position_data(Geolocation::GeolocationPositionErrorCode::PositionUnavailable);
 }
 
-GC::Ref<WebIDL::Promise> Internals::request_permission(Utf16String const& name)
+WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> Internals::request_permission(Utf16String const& name)
 {
+    auto permission_name = PermissionsAPI::permission_name_from(name);
+    if (!permission_name.has_value())
+        return WebIDL::SimpleException { .type = WebIDL::SimpleExceptionType::TypeError, .message = Utf16String::formatted("Unknown permission: '{}'", name) };
+
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
     auto& settings = window().associated_document().relevant_settings_object();
-    PermissionsAPI::request_permission_with_user_prompt({ name }, settings, GC::create_function(realm.heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, PermissionsAPI::PermissionState state) {
+    PermissionsAPI::request_permission_with_user_prompt(*permission_name, settings, GC::create_function(realm.heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, PermissionsAPI::PermissionState state) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Bindings::idl_enum_to_string(state)));
     }));
@@ -2638,6 +2642,16 @@ void Internals::click_notification_by_id_for_testing(WebIDL::UnsignedLongLong br
 void Internals::dismiss_notification_for_testing(NotificationsAPI::Notification& notification)
 {
     page().client().page_did_request_dismiss_notification_for_testing(notification.id_for_testing());
+}
+
+void Internals::hold_next_notification_show_for_testing()
+{
+    page().client().page_did_request_hold_next_notification_show_for_testing();
+}
+
+void Internals::fail_held_notification_show_for_testing()
+{
+    page().client().page_did_request_fail_held_notification_show_for_testing();
 }
 
 bool Internals::html_parser_body_is_exhausted(DOM::Document& document)

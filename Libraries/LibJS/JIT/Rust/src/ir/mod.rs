@@ -472,7 +472,8 @@ define_ops! {
     /// `CheckShape`, `CheckValue`, `CheckClosure`, `CheckAccessorFunction`,
     /// `CheckElements`, `CheckTypedArray`, `CheckArray`, `CheckNonNegativeInt32`,
     /// `CheckIdentityComparable`, `CheckAppendableArray`, `CheckBounds`,
-    /// `CheckTypedArrayStorage`, `CheckNotHole`, `CheckInitialized`), and a
+    /// `CheckTypedArrayStorage`, `CheckNotHole`, `CheckInitialized`,
+    /// `CheckPropertyAbsenceCacheable`), and a
     /// `Refine` on the edge of a branch, has that input as its value, refined:
     /// known to pass. Nodes that rely on the check take the refined value as their
     /// input instead of the input itself, so that the check is a data dependency
@@ -714,6 +715,12 @@ define_ops! {
         /// Exits with `ExitKind::BadType` unless input 0 is an object with
         /// the magical length property of an array.
         CheckArray,
+        /// Exits with `ExitKind::BadShape` unless the object in input 0 has no
+        /// other properties than those of its shape, for the names a
+        /// `GetMissingProperty` cache entry can be for, like the interpreter
+        /// checks before it relies on such an entry (see
+        /// `Object::is_cacheable_for_property_absence()` in the runtime).
+        CheckPropertyAbsenceCacheable,
         /// The `Repr::Int32` input 0, checked to be nonnegative. Exits with
         /// `ExitKind::Overflow` for unsigned counts above i32::MAX.
         CheckNonNegativeInt32,
@@ -1251,16 +1258,23 @@ define_ops! {
         /// shape, and for strings, numbers and booleans, for the shape of their
         /// prototype. The empty value if the cache has none, or for other
         /// values. Probing the cache is one step: its entries change as the
-        /// interpreter runs.
+        /// interpreter runs. `property` is the index of the property's name in
+        /// the executable's property key table, or `u32::MAX` if the access
+        /// has none there: megamorphic caches with one also look in the VM's
+        /// keyed property lookup cache, which the runtime fills for them.
         ProbePropertyCache {
             executable: u32,
             cache: u32,
+            property: u32,
         },
         /// The value of the own data property (or, for a missing property,
         /// `undefined`) that the string or symbol input 1 names on the object in
         /// input 0, where keyed property lookup cache `cache` of executable
         /// `executable` or the VM's keyed lookup cache has it, or the empty
-        /// value.
+        /// value. Where the key is a for-in loop's key at an index (see
+        /// `LoadPropertyIteratorKey`), inputs 2 and 3 are its property
+        /// iterator cache and that index, and objects of the shape the cache
+        /// has read the property at the offset it has for the key first.
         ProbeKeyedCache {
             executable: u32,
             cache: u32,
@@ -1269,10 +1283,15 @@ define_ops! {
         /// input 0 (or adds it) that an entry of property lookup cache `cache`
         /// of executable `executable` has for the object's shape, like the
         /// interpreter's `PutById` handler, as a `Repr::Bool` telling whether it
-        /// did. Other values than objects are not stored to.
+        /// did. Other values than objects are not stored to. `property` is the
+        /// index of the property's name in the executable's property key table,
+        /// or `u32::MAX` for puts of another kind than a normal one:
+        /// megamorphic caches with one also look in the VM's keyed store cache,
+        /// which the runtime fills for them.
         ProbePropertyStore {
             executable: u32,
             cache: u32,
+            property: u32,
         },
         /// Stores input 2 into the writable own data property that the string or
         /// symbol input 1 names on the object in input 0 (or adds it), where
@@ -1308,6 +1327,9 @@ define_ops! {
         /// the VM can tell without running code (from its keyed lookup cache,
         /// the elements, or the runtime's lookup of objects whose lookups run no
         /// code). The empty value otherwise, and for other values than objects.
+        /// Like `ProbeKeyedCache`, it may have a for-in loop's property
+        /// iterator cache and index as inputs 2 and 3, which tell for own
+        /// properties of objects of the cache's shape.
         ProbeHasProperty {
             own: bool,
         },

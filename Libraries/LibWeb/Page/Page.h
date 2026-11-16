@@ -48,7 +48,6 @@
 #include <LibWeb/Forward.h>
 #include <LibWeb/Geolocation/Geolocation.h>
 #include <LibWeb/Geolocation/GeolocationCoordinates.h>
-#include <LibWeb/Geolocation/GeolocationPositionError.h>
 #include <LibWeb/HTML/DedicatedWorkerThreadLink.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/NavigationSourceSnapshot.h>
@@ -201,7 +200,6 @@ public:
     CSSPixelRect device_to_css_rect(DevicePixelRect) const;
     CSSPixelSize device_to_css_size(DevicePixelSize) const;
     DevicePixelRect enclosing_device_rect(CSSPixelRect) const;
-    DevicePixelRect rounded_device_rect(CSSPixelRect) const;
     ChromeMetrics chrome_metrics() const;
 
     EventResult handle_mouseup(HTML::LocalNavigable& root, DevicePixelPoint, DevicePixelPoint screen_position, unsigned button, unsigned buttons, unsigned modifiers, Optional<RemoteInputEventTarget>* remote_target);
@@ -372,7 +370,7 @@ public:
     // For tests: Calls the callback when the next writing suggestion request goes to the UI process.
     void when_writing_suggestion_requested(GC::Ref<GC::Function<void()>>);
 
-    using GeolocationPositionResult = Variant<Geolocation::CoordinatesData, Geolocation::GeolocationPositionError::ErrorCode>;
+    using GeolocationPositionResult = Variant<Geolocation::CoordinatesData, Geolocation::GeolocationPositionErrorCode>;
     using GeolocationPositionCallback = GC::Ref<GC::Function<void(GeolocationPositionResult)>>;
     enum class GeolocationRequestType : u8 {
         OneShot,
@@ -662,7 +660,7 @@ private:
 
     // AD-HOC: Denied until the UI process sends the browser-wide setting, so a request cannot observe the test
     //         position in the short window before that arrives.
-    Geolocation::EmulatedPositionData m_emulated_position_data { Geolocation::GeolocationPositionError::ErrorCode::PermissionDenied };
+    Geolocation::EmulatedPositionData m_emulated_position_data { Geolocation::GeolocationPositionErrorCode::PermissionDenied };
     HashMap<u64, GC::Ref<GC::Function<void()>>> m_emulated_position_data_observers;
     u64 m_next_emulated_position_data_observer_id { 0 };
 
@@ -981,6 +979,8 @@ public:
     virtual void page_did_request_click_notification_for_testing([[maybe_unused]] u64 notification_id) { }
     virtual void page_did_request_click_notification_by_id_for_testing([[maybe_unused]] u64 browser_notification_id) { }
     virtual void page_did_request_dismiss_notification_for_testing([[maybe_unused]] u64 notification_id) { }
+    virtual void page_did_request_hold_next_notification_show_for_testing() { }
+    virtual void page_did_request_fail_held_notification_show_for_testing() { }
 
     virtual void page_did_finish_test([[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_set_test_timeout([[maybe_unused]] double milliseconds) { }

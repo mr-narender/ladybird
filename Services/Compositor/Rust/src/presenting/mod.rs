@@ -14,7 +14,6 @@ pub mod pacing;
 
 use crate::frame_inputs::FrameInputs;
 use crate::host::{ContextTimer, Host, PendingFrame};
-use crate::nested_display_lists::NestedDisplayListStore;
 use crate::raster_host::{
     FfiStoreResize, FfiSublayer, PaintingResources, RasterHost, StorePublication, StoreResizeOutcome, SurfaceBlend,
     SurfaceHandle,
@@ -23,7 +22,8 @@ use damage::{PaintedFrame, StoreDamage};
 use layers::ContextLayers;
 use libcompositing_rust::display_list::commands::CompositorContextId;
 use libcompositing_rust::display_list::replay::{
-    CompositedContexts, ReplayFrame, ReplaySelection, ResolvedCompositedContext, replay_display_list,
+    CompositedContexts, NoCompositedContexts, ReplayFrame, ReplaySelection, ResolvedCompositedContext,
+    replay_display_list,
 };
 use libcompositing_rust::host::RecordSpan;
 use libcompositing_rust::scrolling::DisplayList;
@@ -35,6 +35,16 @@ use std::rc::Rc;
 const BACKING_STORE_SHRINK_DELAY: Duration = Duration::from_milliseconds(3000);
 const SURPLUS_STORE_RETIREMENT_DELAY: Duration = Duration::from_milliseconds(3000);
 
+pub trait NestedContexts: CompositedContexts {
+    fn frame_generation_of(&self, child_context_id: CompositorContextId) -> Option<u64>;
+}
+
+impl NestedContexts for NoCompositedContexts {
+    fn frame_generation_of(&self, _child_context_id: CompositorContextId) -> Option<u64> {
+        None
+    }
+}
+
 /// What presenting a frame of a context works with besides the context's own state.
 pub struct PresentingEnvironment<'a> {
     pub context_id: CompositorContextId,
@@ -43,7 +53,7 @@ pub struct PresentingEnvironment<'a> {
     pub now: MonotonicTime,
     pub has_gpu: bool,
     pub window_server_may_show_high_dynamic_range: bool,
-    pub composited_contexts: &'a dyn CompositedContexts,
+    pub nested_contexts: &'a dyn NestedContexts,
 }
 
 /// A frame drawn into a store, or for a frame that changes only what the window server shows above the frame on
@@ -57,15 +67,14 @@ pub struct PreparedFrame {
     pub sublayers: Vec<FfiSublayer>,
 }
 
-// The display list, the display lists it nests and the frame inputs a frame is painted with.
+// The display list and the frame inputs a frame is painted with.
 pub(crate) struct FrameToPaint<'a> {
     pub display_list: &'a Rc<DisplayList>,
-    pub nested_display_lists: &'a Rc<NestedDisplayListStore>,
     pub frame_inputs: &'a FrameInputs,
 }
 
-// Bounds the embedding scale of a nested context's raster, so that the two backing stores together use at most 128 MiB,
-// even when an embedding transform magnifies a large iframe.
+// Bounds the embedding scale of a nested context's raster, so that its surface uses at most 64 MiB, even when an
+// embedding transform magnifies a large iframe.
 fn bounded_composited_raster_scale(mut scale: FloatSize, viewport_size: IntSize) -> FloatSize {
     if viewport_size.width <= 0 || viewport_size.height <= 0 {
         return FloatSize {
@@ -117,6 +126,7 @@ pub struct ContextPresenting {
     pending_present_frame: Option<PendingFrame>,
     pending_present_frame_scheduled: bool,
     presented_frame: Option<IntRect>,
+    frame_generation: u64,
 
     store_publication: StorePublication,
     frame_without_store_in_flight: bool,
@@ -128,6 +138,7 @@ pub struct ContextPresenting {
     damage_surface: Option<SurfaceHandle>,
     surplus_store_retirement_is_scheduled: bool,
 
+    surface_drawn_by_parent: Option<SurfaceHandle>,
     unbounded_raster_scale_of_embedding: FloatSize,
     raster_scale: FloatSize,
     raster_translation: FloatPoint,
@@ -153,6 +164,7 @@ impl ContextPresenting {
             pending_present_frame: None,
             pending_present_frame_scheduled: false,
             presented_frame: None,
+            frame_generation: 0,
             store_publication: StorePublication::Unpublished,
             frame_without_store_in_flight: false,
             latest_rendered_surface: None,
@@ -160,6 +172,7 @@ impl ContextPresenting {
             store_damage: StoreDamage::default(),
             damage_surface: None,
             surplus_store_retirement_is_scheduled: false,
+            surface_drawn_by_parent: None,
             unbounded_raster_scale_of_embedding: FloatSize {
                 width: 1.0,
                 height: 1.0,
@@ -224,24 +237,16 @@ impl ContextPresenting {
     pub fn resize_backing_stores_if_needed(
         &mut self,
         env: &PresentingEnvironment<'_>,
-        mut publication: StorePublication,
+        publication: StorePublication,
         gpu_sharing_allowed: bool,
         presentation_id: Option<u64>,
     ) -> StoreResizeOutcome {
-        if env.raster.store_state(env.context_id).is_rendering {
+        if !self.presents_to_client {
+            self.fit_surface_drawn_by_parent_to_viewport(env);
             return StoreResizeOutcome::Unchanged;
         }
-        if !self.presents_to_client {
-            // A resize can arrive before the parent's next replay supplies the new embedding transform. Bound the
-            // existing embedding's scale for the new viewport before allocating backing stores. Bounding the already
-            // bounded scale instead can round it differently, which would discard the raster on every replay.
-            let scale = bounded_composited_raster_scale(self.unbounded_raster_scale_of_embedding, self.viewport_size);
-            if self.raster_scale != scale {
-                self.raster_scale = scale;
-                self.latest_rendered_surface = None;
-                self.painted_frame = None;
-            }
-            publication = StorePublication::Unpublished;
+        if env.raster.store_state(env.context_id).is_rendering {
+            return StoreResizeOutcome::Unchanged;
         }
         let outcome = env.raster.resize_stores(
             env.context_id,
@@ -261,6 +266,25 @@ impl ContextPresenting {
             self.store_damage.forget_every_store();
         }
         outcome
+    }
+
+    // A resize can arrive before the parent's next replay supplies the new embedding transform, so the existing
+    // embedding's scale is bounded for the new viewport. Bounding the already bounded scale instead can round it
+    // differently, which would discard the raster on every replay.
+    fn fit_surface_drawn_by_parent_to_viewport(&mut self, env: &PresentingEnvironment<'_>) {
+        let scale = bounded_composited_raster_scale(self.unbounded_raster_scale_of_embedding, self.viewport_size);
+        if self.raster_scale != scale {
+            self.raster_scale = scale;
+            self.painted_frame = None;
+        }
+        let raster_size = self.raster_size();
+        if self
+            .surface_drawn_by_parent
+            .as_ref()
+            .is_some_and(|surface| env.raster.surface_size(surface) != raster_size)
+        {
+            self.surface_drawn_by_parent = None;
+        }
     }
 
     pub fn invalidate_backing_stores(&mut self, env: &PresentingEnvironment<'_>) {
@@ -306,19 +330,14 @@ impl ContextPresenting {
         self.frame_without_store_in_flight = false;
     }
 
-    pub fn has_latest_rendered_surface(&self) -> bool {
-        self.latest_rendered_surface.is_some()
+    pub fn has_surface_drawn_by_parent(&self) -> bool {
+        self.surface_drawn_by_parent.is_some()
     }
 
-    /// Answers whether the raster has to be made again, at the scale and phase the embedding now draws it at.
-    pub fn update_composited_raster_transform(
-        &mut self,
-        is_rendering: bool,
-        destination_rect: FloatRect,
-        transform: &FloatMatrix4x4,
-    ) -> bool {
-        if self.presents_to_client || is_rendering || self.viewport_size.is_empty() || destination_rect.is_empty() {
-            return false;
+    /// Makes the next paint redo the raster where the embedding now draws it at another scale or phase.
+    pub fn update_composited_raster_transform(&mut self, destination_rect: FloatRect, transform: &FloatMatrix4x4) {
+        if self.presents_to_client || self.viewport_size.is_empty() || destination_rect.is_empty() {
+            return;
         }
         let m = &transform.elements;
         // Display list coordinates already include device scale and page zoom. Only the embedding transform and
@@ -331,7 +350,7 @@ impl ContextPresenting {
             scale_y = ak::math::hypot(m[0][1], m[1][1]) * destination_rect.height / self.viewport_size.height as f32;
         }
         if !scale_x.is_finite() || !scale_y.is_finite() {
-            return false;
+            return;
         }
         self.unbounded_raster_scale_of_embedding = FloatSize {
             width: scale_x,
@@ -346,7 +365,7 @@ impl ContextPresenting {
             let mut x = m[0][0] * destination_rect.x + m[0][3];
             let mut y = m[1][1] * destination_rect.y + m[1][3];
             if !x.is_finite() || !y.is_finite() {
-                return false;
+                return;
             }
             // Mirrored placements need the opposite fractional phase so the remaining image transform still
             // lands on integer device pixels.
@@ -363,17 +382,15 @@ impl ContextPresenting {
         }
 
         if self.raster_scale == scale && self.raster_translation == translation {
-            return false;
+            return;
         }
         self.raster_scale = scale;
         self.raster_translation = translation;
-        self.latest_rendered_surface = None;
         self.painted_frame = None;
-        true
     }
 
     pub fn composited_surface(&self) -> Option<ResolvedCompositedContext> {
-        let surface = self.latest_rendered_surface.as_ref()?;
+        let surface = self.surface_drawn_by_parent.as_ref()?;
         let painted_frame = self.painted_frame.as_ref()?;
         Some(ResolvedCompositedContext {
             surface: surface.as_ptr(),
@@ -386,7 +403,12 @@ impl ContextPresenting {
         })
     }
 
+    pub fn frame_generation(&self) -> u64 {
+        self.frame_generation
+    }
+
     pub fn queue_present_frame(&mut self, pending_frame: PendingFrame) {
+        self.frame_generation += 1;
         let Some(queued) = &mut self.pending_present_frame else {
             self.pending_present_frame = Some(pending_frame);
             return;
@@ -435,9 +457,14 @@ impl ContextPresenting {
         self.pending_present_frame.take()
     }
 
+    pub fn has_pending_present_frame(&self) -> bool {
+        self.pending_present_frame.is_some()
+    }
+
     pub fn needs_rasterization(&self) -> bool {
         self.pending_present_frame.is_some()
-            || (self.latest_rendered_surface.is_none() && self.presented_frame.is_some())
+            || (self.presented_frame.is_some()
+                && (self.surface_drawn_by_parent.is_none() || self.painted_frame.is_none()))
     }
 
     pub fn frame_rect_to_repaint(&self) -> Option<IntRect> {
@@ -493,15 +520,15 @@ impl ContextPresenting {
         }
     }
 
-    fn raster_damage_rect(&self, damage_rect: IntRect) -> IntRect {
-        if damage_rect.is_empty() {
+    fn raster_rect_of(&self, rect: IntRect) -> IntRect {
+        if rect.is_empty() {
             return IntRect::default();
         }
         let raster_rect = rect_of_size(self.raster_size());
-        if damage_rect.contains_rect(rect_of_size(self.viewport_size)) {
+        if rect.contains_rect(rect_of_size(self.viewport_size)) {
             return raster_rect;
         }
-        let rect = damage_rect.to_float();
+        let rect = rect.to_float();
         let scaled = FloatRect::new(
             rect.x * self.raster_scale.width + self.raster_translation.x,
             rect.y * self.raster_scale.height + self.raster_translation.y,
@@ -517,7 +544,6 @@ impl ContextPresenting {
         env: &PresentingEnvironment<'_>,
         pending_frame: PendingFrame,
         display_list: Option<&Rc<DisplayList>>,
-        nested_display_lists: &Rc<NestedDisplayListStore>,
         frame_inputs: Option<FrameInputs>,
     ) -> Option<PreparedFrame> {
         if self.is_present_blocked(env.raster, env.context_id) {
@@ -530,10 +556,9 @@ impl ContextPresenting {
         }
         let display_list = display_list.expect("a frame that can render has a display list");
         let frame_inputs = frame_inputs.expect("a context with a display list has frame inputs");
-        let live_content = self.live_content(env, display_list, nested_display_lists);
+        let live_content = self.live_content(env, display_list);
         let frame = FrameToPaint {
             display_list,
-            nested_display_lists,
             frame_inputs: &frame_inputs,
         };
         let mut frame_damage = self.frame_damage_for(env, &pending_frame, &frame, &live_content);
@@ -544,9 +569,9 @@ impl ContextPresenting {
                 frame_damage.layers.shown_by_window_server && frame_damage.live_media_changed;
             self.commit_layer_update(env, frame_damage.layers);
             self.remember_painted_frame(
+                env,
                 pending_frame.viewport_rect,
                 display_list,
-                nested_display_lists,
                 frame_inputs,
                 &live_content,
             );
@@ -562,7 +587,7 @@ impl ContextPresenting {
                 sublayers: self.sublayers_shown_by_window_server(&live_content),
             });
         }
-        let raster_damage_rect = self.raster_damage_rect(damage_rect);
+        let raster_damage_rect = self.raster_rect_of(damage_rect);
         let Some((bitmap_id, store)) = env.raster.acquire_store(env.context_id) else {
             self.queue_present_frame(pending_frame);
             return None;
@@ -578,9 +603,9 @@ impl ContextPresenting {
         }
         self.commit_layer_update(env, frame_damage.layers);
         self.remember_painted_frame(
+            env,
             pending_frame.viewport_rect,
             display_list,
-            nested_display_lists,
             frame_inputs,
             &live_content,
         );
@@ -593,63 +618,56 @@ impl ContextPresenting {
         })
     }
 
-    /// Paints the pending frame, or the frame presented last, into a store at once, for a context that its parent draws.
-    pub fn present_synchronously(
+    /// Paints the pending frame, or the frame presented last, into the surface of a context that its parent draws.
+    pub fn paint_frame_drawn_by_parent(
         &mut self,
         env: &PresentingEnvironment<'_>,
         display_list: Option<&Rc<DisplayList>>,
-        nested_display_lists: &Rc<NestedDisplayListStore>,
         frame_inputs: Option<FrameInputs>,
-    ) -> bool {
-        if !self.can_render_frame(display_list, env.raster, env.context_id) {
-            return false;
-        }
-        let display_list = display_list.expect("a frame that can render has a display list");
+    ) {
+        let Some(display_list) = display_list else {
+            return;
+        };
         let frame_inputs = frame_inputs.expect("a context with a display list has frame inputs");
-        // Don't race an async present already in flight for this context; its own completion will update the output.
-        if self.is_present_blocked(env.raster, env.context_id) {
-            return false;
-        }
         let pending_frame = match self.pending_present_frame {
             Some(pending_frame) => pending_frame,
             None => match self.presented_frame {
                 Some(presented_frame) => PendingFrame::repainting_everything(presented_frame),
-                None => return false,
+                None => return,
             },
         };
-        let live_content = self.live_content(env, display_list, nested_display_lists);
+        let live_content = self.live_content(env, display_list);
         let frame = FrameToPaint {
             display_list,
-            nested_display_lists,
             frame_inputs: &frame_inputs,
         };
         let mut frame_damage = self.frame_damage_for(env, &pending_frame, &frame, &live_content);
-        let raster_damage_rect = self.raster_damage_rect(frame_damage.rect);
-        let Some((bitmap_id, store)) = env.raster.acquire_store(env.context_id) else {
-            return false;
+        let raster_size = self.raster_size();
+        let (surface, repaint_rect) = match self.surface_drawn_by_parent.take() {
+            Some(surface) if env.raster.surface_size(&surface) == raster_size => {
+                (surface, self.raster_rect_of(frame_damage.rect))
+            }
+            _ => {
+                let Some(surface) = env.raster.create_surface(raster_size, None) else {
+                    return;
+                };
+                (surface, rect_of_size(raster_size))
+            }
         };
-        let store_rect = rect_of_size(env.raster.surface_size(&store));
-        let repaint_rect = self.store_damage.take(bitmap_id, raster_damage_rect, store_rect);
-        let _ = self.paint_frame(env, &store, &frame, repaint_rect, &mut frame_damage.layers);
+        let _ = self.paint_frame(env, &surface, &frame, repaint_rect, &mut frame_damage.layers);
         self.commit_layer_update(env, frame_damage.layers);
         self.remember_painted_frame(
+            env,
             pending_frame.viewport_rect,
             display_list,
-            nested_display_lists,
             frame_inputs,
             &live_content,
         );
-        env.raster.flush(&store);
-        env.raster.complete_rendering(env.context_id, bitmap_id);
-        self.latest_rendered_surface = env.raster.latest_rendered_store_surface(env.context_id);
-        self.size_of_latest_rendered_frame = IntSize {
-            width: pending_frame.viewport_rect.width,
-            height: pending_frame.viewport_rect.height,
-        };
+        env.raster.flush(&surface);
+        self.surface_drawn_by_parent = Some(surface);
         self.presented_frame = Some(pending_frame.viewport_rect);
         self.pending_present_frame = None;
         self.pending_present_frame_scheduled = false;
-        true
     }
 
     /// Paints a screenshot into the target, without the overlays of the browser and at the raster's own scale.
@@ -658,12 +676,10 @@ impl ContextPresenting {
         env: &PresentingEnvironment<'_>,
         target: &SurfaceHandle,
         display_list: &Rc<DisplayList>,
-        nested_display_lists: &Rc<NestedDisplayListStore>,
         frame_inputs: &FrameInputs,
     ) {
         let frame = FrameToPaint {
             display_list,
-            nested_display_lists,
             frame_inputs,
         };
         self.paint_current_display_list(env, target, &frame, None, false, false);
@@ -691,11 +707,10 @@ impl ContextPresenting {
                     .draw_surface(&composited, &source, source_rect, source_rect, SurfaceBlend::Source);
                 let frame = FrameToPaint {
                     display_list: &painted_frame.display_list,
-                    nested_display_lists: &painted_frame.nested_display_lists,
                     frame_inputs: &painted_frame.frame_inputs,
                 };
                 let snapshot_env = PresentingEnvironment {
-                    composited_contexts: &libcompositing_rust::display_list::replay::NoCompositedContexts,
+                    nested_contexts: &NoCompositedContexts,
                     ..*env
                 };
                 self.composite_layers_above_base(&snapshot_env, &composited, &frame, source_rect);
@@ -809,11 +824,15 @@ impl ContextPresenting {
             raster.clear(surface, surface_clear_color);
         }
         if applies_raster_transform {
-            raster.translate(surface, self.raster_translation.x, self.raster_translation.y);
-            raster.scale(surface, self.raster_scale.width, self.raster_scale.height);
+            self.apply_raster_transform(raster, surface);
         }
         paint_display_list(surface);
         raster.restore_to_count(surface, save_count);
+    }
+
+    fn apply_raster_transform(&self, raster: &RasterHost, surface: &SurfaceHandle) {
+        raster.translate(surface, self.raster_translation.x, self.raster_translation.y);
+        raster.scale(surface, self.raster_scale.width, self.raster_scale.height);
     }
 }
 
@@ -837,8 +856,7 @@ pub(crate) fn replay_into(
                 scroll_offsets: frame_inputs.presented_scroll_state_snapshot.device_offsets(),
                 scrollbars: &scrollbars,
                 time_ns: frame_inputs.painted_at.nanoseconds(),
-                nested_display_lists: frame.nested_display_lists.as_ref(),
-                composited_contexts: env.composited_contexts,
+                composited_contexts: env.nested_contexts,
             };
             let storage = display_list.storage();
             let tree = frame_inputs.visual_context_tree.as_arc();

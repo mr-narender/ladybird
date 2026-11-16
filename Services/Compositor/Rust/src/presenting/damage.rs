@@ -10,9 +10,10 @@ use super::layers::{LayerUpdate, MediaUpdate};
 use super::{ContextPresenting, FrameToPaint, PresentingEnvironment, rect_of_size};
 use crate::frame_inputs::FrameInputs;
 use crate::host::PendingFrame;
-use crate::nested_display_lists::NestedDisplayListStore;
 use crate::raster_host::LiveContent;
-use libcompositing_rust::display_list::commands::{CanvasId, ImageFrameResourceId, VideoSinkResourceId};
+use libcompositing_rust::display_list::commands::{
+    CanvasId, CompositorContextId, ImageFrameResourceId, VideoSinkHandle,
+};
 use libcompositing_rust::display_list::damage::{DisplayListDamage, LayerPlans, LiveContentChanges};
 use libcompositing_rust::display_list::summary::LiveContent as LiveMedia;
 use libcompositing_rust::scrolling::DisplayList;
@@ -24,12 +25,12 @@ use std::rc::Rc;
 /// lists cannot see change.
 pub struct PaintedFrame {
     pub display_list: Rc<DisplayList>,
-    pub nested_display_lists: Rc<NestedDisplayListStore>,
     pub frame_inputs: FrameInputs,
     pub viewport_size: IntSize,
     canvas_content_generations: HashMap<u64, u64>,
     video_frame_ids: HashMap<u64, Option<u64>>,
     image_frame_pixel_generations: HashMap<u64, u64>,
+    nested_context_frame_generations: HashMap<u64, Option<u64>>,
 }
 
 impl PaintedFrame {
@@ -74,14 +75,26 @@ impl StoreDamage {
     }
 }
 
-// The canvases, video sinks and image frames whose pixels changed since the frame painted last.
+// The canvases, video sinks, image frames and nested contexts whose pixels changed since the frame painted last.
 #[derive(Default)]
 pub struct LiveContentChangesSinceLastPaint {
     pub canvases: Vec<CanvasId>,
-    pub video_sinks: Vec<VideoSinkResourceId>,
+    pub video_sinks: Vec<VideoSinkHandle>,
     pub image_frames: Vec<ImageFrameResourceId>,
+    pub nested_contexts: Vec<CompositorContextId>,
     pub media_updates: Vec<MediaUpdate>,
     pub repaints_everything: bool,
+}
+
+impl LiveContentChangesSinceLastPaint {
+    pub fn changed(&self, content: LiveMedia) -> bool {
+        match content {
+            LiveMedia::Canvas(id) => self.canvases.contains(&id),
+            LiveMedia::VideoFrame(id) => self.video_sinks.contains(&id),
+            LiveMedia::ImageFrame(id) => self.image_frames.contains(&id),
+            LiveMedia::CompositedContext(id) => self.nested_contexts.contains(&id),
+        }
+    }
 }
 
 pub struct FrameDamage {
@@ -90,29 +103,10 @@ pub struct FrameDamage {
     pub live_media_changed: bool,
 }
 
-// The canvases that the list draws, and those that the lists it nests draw.
-fn canvases_drawn_by(display_list: &DisplayList, nested_display_lists: &NestedDisplayListStore) -> Vec<u64> {
-    let mut canvas_ids = display_list.storage().summary().canvas_ids.clone();
-    let canvas_ids_of_list: HashSet<u64> = canvas_ids.iter().copied().collect();
-    canvas_ids.extend(
-        nested_display_lists
-            .canvas_ids_of_nested_display_lists(display_list.storage())
-            .into_iter()
-            .filter(|id| !canvas_ids_of_list.contains(id)),
-    );
-    canvas_ids
-}
-
 impl ContextPresenting {
-    /// The live content of the context as it is now, with the canvases that the list, the lists it nests and the frame
-    /// painted last draw.
-    pub(super) fn live_content(
-        &self,
-        env: &PresentingEnvironment<'_>,
-        display_list: &DisplayList,
-        nested_display_lists: &NestedDisplayListStore,
-    ) -> LiveContent {
-        let mut canvas_ids = canvases_drawn_by(display_list, nested_display_lists);
+    /// The live content of the context as it is now, with the canvases that the list and the frame painted last draw.
+    pub(super) fn live_content(&self, env: &PresentingEnvironment<'_>, display_list: &DisplayList) -> LiveContent {
+        let mut canvas_ids = display_list.storage().summary().canvas_ids.clone();
         if let Some(painted_frame) = &self.painted_frame {
             let canvas_ids_of_list: HashSet<u64> = canvas_ids.iter().copied().collect();
             canvas_ids.extend(
@@ -127,9 +121,9 @@ impl ContextPresenting {
 
     pub(super) fn remember_painted_frame(
         &mut self,
+        env: &PresentingEnvironment<'_>,
         viewport_rect: IntRect,
         display_list: &Rc<DisplayList>,
-        nested_display_lists: &Rc<NestedDisplayListStore>,
         frame_inputs: FrameInputs,
         live_content: &LiveContent,
     ) {
@@ -139,20 +133,26 @@ impl ContextPresenting {
                 .get(&id)
                 .map_or(0, |canvas| canvas.content_generation)
         };
-        let canvas_content_generations = canvases_drawn_by(display_list, nested_display_lists)
-            .into_iter()
-            .map(|id| (id, canvas_generation(id)))
+        let summary = display_list.storage().summary();
+        let canvas_content_generations = summary
+            .canvas_ids
+            .iter()
+            .map(|&id| (id, canvas_generation(id)))
             .collect();
-        // Every video the context holds is drawn by the list or by a display list it nests.
+        // The host reports the video sinks that the list draws.
         let video_frame_ids = live_content
             .video_sinks
             .values()
-            .map(|sink| (sink.id, sink.has_frame.then_some(sink.frame_id)))
+            .map(|sink| (sink.handle, sink.has_frame.then_some(sink.frame_id)))
             .collect();
         let image_frame_pixel_generations = live_content.image_frames.clone();
+        let nested_context_frame_generations = summary
+            .composited_context_ids
+            .iter()
+            .map(|&id| (id, env.nested_contexts.frame_generation_of(CompositorContextId(id))))
+            .collect();
         self.painted_frame = Some(PaintedFrame {
             display_list: display_list.clone(),
-            nested_display_lists: nested_display_lists.clone(),
             frame_inputs,
             viewport_size: IntSize {
                 width: viewport_rect.width,
@@ -161,11 +161,13 @@ impl ContextPresenting {
             canvas_content_generations,
             video_frame_ids,
             image_frame_pixel_generations,
+            nested_context_frame_generations,
         });
     }
 
     fn live_content_changes_since_last_paint(
         &self,
+        env: &PresentingEnvironment<'_>,
         viewport_size: IntSize,
         display_list: &DisplayList,
         live_content: &LiveContent,
@@ -190,7 +192,7 @@ impl ContextPresenting {
             if current_content_generation == *content_generation {
                 continue;
             }
-            // A canvas drawn only by a nested display list has no command in this list to damage.
+            // A canvas that no command of this list draws has no command in this list to damage.
             if !canvas_ids_of_list.contains(canvas_id) {
                 changes.repaints_everything = true;
             }
@@ -202,36 +204,46 @@ impl ContextPresenting {
         }
         let summary = display_list.storage().summary();
         let image_frame_ids_of_list: HashSet<u64> = summary.image_frame_ids.iter().copied().collect();
-        let video_sink_ids_of_list: HashSet<u64> = summary.video_sink_ids.iter().copied().collect();
-        for (video_sink_id, frame_id) in &painted_frame.video_frame_ids {
+        let video_sink_handles_of_list: HashSet<u64> = summary.video_sink_handles.iter().copied().collect();
+        for (video_sink_handle, frame_id) in &painted_frame.video_frame_ids {
             let current_frame_id = live_content
                 .video_sinks
-                .get(video_sink_id)
+                .get(video_sink_handle)
                 .and_then(|sink| sink.has_frame.then_some(sink.frame_id));
             if current_frame_id == *frame_id {
                 continue;
             }
             changes.media_updates.push(MediaUpdate {
-                media: LiveMedia::VideoFrame(VideoSinkResourceId(*video_sink_id)),
+                media: LiveMedia::VideoFrame(VideoSinkHandle(*video_sink_handle)),
                 content_version: current_frame_id.unwrap_or(0),
             });
-            // A video drawn only by a nested display list, such as an SVG image's, has no command in this list to
-            // damage.
-            if !video_sink_ids_of_list.contains(video_sink_id) {
+            // A video that no command of this list draws has no command in this list to damage.
+            if !video_sink_handles_of_list.contains(video_sink_handle) {
                 changes.repaints_everything = true;
             }
-            changes.video_sinks.push(VideoSinkResourceId(*video_sink_id));
+            changes.video_sinks.push(VideoSinkHandle(*video_sink_handle));
         }
         for (&image_frame_id, &pixel_generation) in &live_content.image_frames {
             if painted_frame.image_frame_pixel_generations.get(&image_frame_id) == Some(&pixel_generation) {
                 continue;
             }
-            // An image drawn only by a nested display list, such as an SVG image's, has no command in this list to
-            // damage.
+            // An image that no command of this list draws, such as one that a filter of the visual context tree
+            // draws, has no command in this list to damage.
             if !image_frame_ids_of_list.contains(&image_frame_id) {
                 changes.repaints_everything = true;
             }
             changes.image_frames.push(ImageFrameResourceId(image_frame_id));
+        }
+        let nested_context_ids_of_list: HashSet<u64> = summary.composited_context_ids.iter().copied().collect();
+        for (&nested_context_id, &frame_generation) in &painted_frame.nested_context_frame_generations {
+            let nested_context = CompositorContextId(nested_context_id);
+            if env.nested_contexts.frame_generation_of(nested_context) == frame_generation {
+                continue;
+            }
+            if !nested_context_ids_of_list.contains(&nested_context_id) {
+                changes.repaints_everything = true;
+            }
+            changes.nested_contexts.push(nested_context);
         }
         changes
     }
@@ -249,7 +261,7 @@ impl ContextPresenting {
         };
         let viewport_rect = rect_of_size(viewport_size);
         let forced_damage_rect = pending_frame.forced_damage_rect.intersected(viewport_rect);
-        let changes = self.live_content_changes_since_last_paint(viewport_size, frame.display_list, live_content);
+        let changes = self.live_content_changes_since_last_paint(env, viewport_size, frame.display_list, live_content);
         self.layers.media_activity.note_updates(&changes.media_updates, env.now);
 
         let mut layers = self.layer_update_for(env, frame, viewport_rect, live_content);
@@ -327,10 +339,8 @@ impl ContextPresenting {
         if let Some(plan) = layers.plan(&self.layers)
             && !layers.shown_by_window_server
         {
-            damage_rect = damage_rect.united(
-                super::layers::rect_of_media_layers_showing(plan, &changes.canvases, &changes.video_sinks)
-                    .intersected(viewport_rect),
-            );
+            damage_rect = damage_rect
+                .united(super::layers::rect_of_media_layers_showing_changes(plan, &changes).intersected(viewport_rect));
         }
         FrameDamage {
             rect: damage_rect,
@@ -370,6 +380,7 @@ impl ContextPresenting {
                 canvases: &changes.canvases,
                 video_sinks: &changes.video_sinks,
                 image_frames: &changes.image_frames,
+                composited_contexts: &changes.nested_contexts,
                 forced_damage_rect,
                 offsets_of_records_composited_as_media_layers: &media_record_offsets,
             },

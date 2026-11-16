@@ -414,6 +414,10 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         Some(available - self.line(line_index).physical_horizontal_extent())
     }
 
+    pub(crate) fn remaining_inline_size_for_soft_wrap(&mut self) -> Option<CssPixels> {
+        self.remaining_inline_size_on_current_line_within(self.inline_size_to_break_current_line_at())
+    }
+
     /// NB: Balancing does not break words that fit the available inline size, so they overflow the inline size the
     ///     line breaks at instead.
     pub(crate) fn remaining_inline_size_for_overflow_break(&mut self) -> Option<CssPixels> {
@@ -633,6 +637,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
         style: StyleValues,
     ) {
         let glyphs = item.take_glyph_run(prepared);
+        let text_type = glyphs.text_type;
         let content_block_size = TextLayoutBounds::new(style, Some(glyphs.font)).block_size();
         self.append_text_chunk(
             item.node,
@@ -647,6 +652,19 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             glyphs,
             item.trailing_whitespace,
         );
+        // https://drafts.csswg.org/css-overflow-4/#block-ellipsis
+        // AD-HOC: Block ellipses displace content at soft wraps. Legacy clamping preserves glyph-based truncation
+        //         inside shaped runs, so only standard clamping keeps these internal opportunities.
+        if self.context().parent.has_line_clamp() && !self.context().parent.clamped_content_is_scrollable_overflow() {
+            let line_index = self.line_count() - 1;
+            let mut line = self.line_mut(line_index);
+            let fragment = line.fragments.last_mut().unwrap();
+            let text = fragment.block_ellipsis_text.get_or_insert_default();
+            text.runs.push((item.offset_in_node + item.length_in_node, text_type));
+            if item.has_soft_wraps(prepared) {
+                text.soft_wrap_offsets.extend(item.soft_wrap_offsets(prepared));
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1051,8 +1069,13 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             } else {
                 fragment_baseline + alignment_style.vertical_align_value().to_px(style.line_height())
             };
+            // NB: A vertical-align length or percentage shifts the box relative to the baseline, which leaves the
+            //     strut on the baseline, whichever box ends up setting the baseline of the line box.
+            if !alignment_style.vertical_align_is_keyword() {
+                should_align_strut_to_line_box_baseline = true;
+            }
             if adjusted_baseline > line_box_baseline {
-                if !self.facts(node).is_text_node() && alignment_style.vertical_align_is_keyword() {
+                if alignment_style.vertical_align_is_keyword() && !self.facts(node).is_text_node() {
                     // https://drafts.csswg.org/css2/#line-height
                     // The minimum height consists of a minimum height above the baseline and a minimum depth below
                     // it, exactly as if each line box starts with a zero-width inline box with the element's font and
@@ -1528,7 +1551,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 || self.facts(snapshot.layout_node).is_text_node()
                 || self.facts(snapshot.layout_node).is_fragmented_inline();
             if is_text_node {
-                let font_box_size = normal_line_height(style);
+                let font_box_size = content_area_block_size(style);
                 let font_baseline = Self::baseline_for_style(style, font_box_size);
                 let fragment_mut = &mut self.line_mut(line_index).fragments[fragment_index];
                 fragment_mut.record.block_offset += fragment_mut.baseline - font_baseline;
@@ -1756,7 +1779,8 @@ impl TextLayoutBounds {
         // When its computed line-height is normal, the layout bounds of an inline box encloses all its glyphs, going
         // from the highest A to the deepest D. (Note that glyphs in a single box can come from different fonts and
         // thus might not all have the same A and D.)
-        // NB: The bounds above already enclose the glyphs of the first available font.
+        // NB: The bounds above already enclose the glyphs of the first available font. Each other font brings in the
+        //     leading of its own normal line height, which includes its line gap.
         if let Some(font) = font
             && style.line_height_is_normal()
             && style
@@ -1764,8 +1788,13 @@ impl TextLayoutBounds {
                 .first_available_font()
                 .is_none_or(|first_available| font.as_raw() != first_available.as_raw())
         {
-            bounds.ascent = bounds.ascent.max(font_metric_in_whole_pixels(font.facts().ascent));
-            bounds.descent = bounds.descent.max(font_metric_in_whole_pixels(font.facts().descent));
+            let facts = font.facts();
+            let normal_line_height = font_metric_in_whole_pixels(facts.ascent)
+                + font_metric_in_whole_pixels(facts.descent)
+                + font_metric_in_whole_pixels(facts.line_gap);
+            let font_bounds = Self::with_leading(facts.ascent, facts.descent, normal_line_height);
+            bounds.ascent = bounds.ascent.max(font_bounds.ascent);
+            bounds.descent = bounds.descent.max(font_bounds.descent);
         }
         bounds
     }
@@ -1779,6 +1808,8 @@ pub(crate) fn font_metric_in_whole_pixels(metric: f32) -> CssPixels {
     CssPixels::from_integer(metric.round_ties_even() as i64)
 }
 
-pub(crate) fn normal_line_height(style: StyleValues) -> CssPixels {
+/// The block size of the content area of an inline box: its font's ascent plus descent. Unlike a normal line-height,
+/// it leaves out the font's line gap.
+pub(crate) fn content_area_block_size(style: StyleValues) -> CssPixels {
     font_metric_in_whole_pixels(style.font_ascent()) + font_metric_in_whole_pixels(style.font_descent())
 }

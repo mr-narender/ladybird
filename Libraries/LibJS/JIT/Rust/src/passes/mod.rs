@@ -15,10 +15,12 @@
 
 mod bounds_check_elimination;
 mod branch_fusion;
+mod branch_splitting;
 mod check_elimination;
 mod dce;
 pub mod dominators;
 pub mod edit;
+mod enumerated_keys;
 mod escape_analysis;
 mod exit_unboxing;
 mod facts;
@@ -72,6 +74,10 @@ const PASSES: &[Pass] = &[
         run: simplify::run,
     },
     Pass {
+        name: "branch splitting",
+        run: branch_splitting::run,
+    },
+    Pass {
         name: "global value numbering",
         run: gvn::run,
     },
@@ -114,6 +120,10 @@ const PASSES: &[Pass] = &[
     Pass {
         name: "dead code elimination",
         run: dce::run,
+    },
+    Pass {
+        name: "enumerated keys",
+        run: enumerated_keys::run,
     },
     Pass {
         name: "branch fusion",

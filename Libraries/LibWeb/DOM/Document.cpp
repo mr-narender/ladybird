@@ -11,7 +11,6 @@
  */
 
 #include <AK/AnyOf.h>
-#include <AK/Bitmap.h>
 #include <AK/CharacterTypes.h>
 #include <AK/Debug.h>
 #include <AK/GenericLexer.h>
@@ -930,11 +929,6 @@ void Document::bump_style_environment_version()
 {
     ++m_style_environment_version;
     HTML::note_rendering_trace_event("style environment changed"sv);
-}
-
-bool Document::needs_full_layout_tree_update(Layout::BegunRead const& read) const
-{
-    return m_layout_node_arena && Layout::RustFFI::render_state_needs_full_layout_tree_update(m_layout_node_arena->host(), &read);
 }
 
 // A document without an arena has no layout nodes, so its next build creates every box anyway.
@@ -7439,14 +7433,6 @@ void Document::cache_accessible_text(Element const& element, CachedAccessibleTex
         m_cached_accessible_text_depending_on_any_node.set(id);
 }
 
-WebView::AccessibilityNodeData const* Document::cached_accessibility_record(Node const& node) const
-{
-    if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
-        return nullptr;
-    auto it = m_accessibility_record_cache->records.find(node.unique_id());
-    return it == m_accessibility_record_cache->records.end() ? nullptr : &it->value.data;
-}
-
 Document::KeptAccessibilityRecord Document::kept_accessibility_record(Node const& node) const
 {
     if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
@@ -8914,14 +8900,6 @@ void Document::disassociate_with_animation(GC::Ref<Animations::Animation> animat
         m_effects_needing_animated_style_update_after_current_update.remove(effect);
     }
     m_associated_animations.remove(animation);
-}
-
-size_t Document::associated_animation_count() const
-{
-    size_t count = 0;
-    for ([[maybe_unused]] auto& animation : m_associated_animations)
-        ++count;
-    return count;
 }
 
 static bool is_transform_family_property(CSS::PropertyID property_id)
@@ -13011,26 +12989,33 @@ static bool contains_named_namespace(CSS::SelectorList const& selectors)
     return selectors.contains([](auto const& selector) { return selector->contains_named_namespace(); });
 }
 
-RefPtr<SelectorQuery const> Document::selector_query_for(Utf16View selector_text) const
+RefPtr<SelectorQuery const> Document::selector_query_for(Utf16String const& selector_text) const
 {
     static constexpr size_t MAX_SELECTOR_QUERY_CACHE_SIZE = 512;
 
-    auto mark_used = [](RefPtr<SelectorQuery const> const& query) {
+    auto mark_used = [](SelectorQuery const* query) {
         if (query)
             query->mark_used();
     };
 
-    if (m_last_selector_query_text.has_value() && selector_text == *m_last_selector_query_text) {
+    // NB: A script that builds the same selector text again for each call asks with a string that has no hash yet,
+    //     which this answers without hashing it.
+    if (m_last_selector_query_text && selector_text == *m_last_selector_query_text) {
         mark_used(m_last_selector_query);
         return m_last_selector_query;
     }
 
+    // NB: A string remembers its hash, so a script asking with the same string again does not hash its text again.
     if (auto it = m_selector_query_cache.find(selector_text); it != m_selector_query_cache.end()) {
-        m_last_selector_query_text = it->key;
+        m_last_selector_query_text = &it->key;
         m_last_selector_query = it->value;
         mark_used(it->value);
         return it->value;
     }
+
+    // NB: The cache changes below, which moves its entries.
+    m_last_selector_query_text = nullptr;
+    m_last_selector_query = nullptr;
 
     auto maybe_selectors = parse_selector(CSS::Parser::ParsingParams { *this }, selector_text);
 
@@ -13060,10 +13045,7 @@ RefPtr<SelectorQuery const> Document::selector_query_for(Utf16View selector_text
         }
     }
 
-    auto selector_text_copy = Utf16String::from_utf16(selector_text);
-    m_last_selector_query_text = selector_text_copy;
-    m_last_selector_query = query;
-    m_selector_query_cache.set(move(selector_text_copy), query);
+    m_selector_query_cache.set(selector_text, query);
     return query;
 }
 

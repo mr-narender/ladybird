@@ -9,8 +9,7 @@ use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::painting::display_list::builder::PendingInlineClip;
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::display_list::recorder::{IsolatedGroupEffects, OpenRecorderGroup};
-use crate::painting::node_painting;
-use crate::painting::paint_read::{GeometryRead, PaintRead};
+use crate::painting::paint_read::PaintRead;
 use crate::painting::record::order_tree::ProducerKind;
 use crate::painting::record::trace::{Action, Observer, Operation};
 use crate::painting::record::{PaintPhase, PaintRecorder};
@@ -281,7 +280,32 @@ impl<O: Observer> PaintRecorder<'_, O> {
         self.recorder.set_accumulated_visual_context(walk.enclosing_context);
     }
 
-    pub(crate) fn paint_svg_box_inside_resource(
+    /// Records the document of an SVG image, whose viewport is `viewport`, as the content of an SVG resource is
+    /// recorded: under no visual context, with the transforms, clips and effects of its boxes in the records.
+    pub(crate) fn record_svg_image_document(&mut self, viewport: NodeSlotId) {
+        let consumer_clip_rect = self.inputs.bitmap_rect.to_float();
+        let walk = SvgResourceWalk {
+            enclosing_context: self.recorder.accumulated_visual_context(),
+            draws_clip_path_geometry: false,
+            consumer_clip_rect,
+        };
+        // The viewport paints the background its root propagates to it.
+        let enclosing_walk = self.svg_resource_walk.replace(walk);
+        let enclosing_transform = self
+            .recorder
+            .set_ambient_inline_transform(Some(AffineTransform::identity()));
+        self.record_box_phase_inside_resource(viewport, PaintPhase::Background);
+        self.recorder.set_ambient_inline_transform(enclosing_transform);
+        self.svg_resource_walk = enclosing_walk;
+        self.recorder.set_accumulated_visual_context(walk.enclosing_context);
+        let mut child = crate::painting::paint_order::first_paint_child(self.source, viewport);
+        while let Some(current) = child {
+            child = crate::painting::paint_order::next_paint_sibling(self.source, current);
+            self.walk_svg_resource(current, AffineTransform::identity(), true, false, consumer_clip_rect);
+        }
+    }
+
+    fn paint_svg_box_inside_resource(
         &mut self,
         svg_box: NodeSlotId,
         parent_to_enclosing_space: AffineTransform,
@@ -416,23 +440,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 .enclosing_device_rect(crate::css::css_pixels::CssPixelRect::from(svg_filter_bounds));
             self.recorder.fill_rect_transparent(device_rect);
         }
-        let kind = self.source.node_kind_if_live(svg_box);
-        if kind != Some(NodeKind::SVGSVGBox)
-            && !kind.is_some_and(node_painting::is_svg)
-            && kind.is_some_and(crate::layout::node_facts::kind_is_replaced_box)
-        {
-            self.paint_svg_box_phase_inside_resource(svg_box, PaintPhase::Background);
-        }
-        self.paint_svg_box_phase_inside_resource(svg_box, PaintPhase::Foreground);
-    }
-
-    fn paint_svg_box_phase_inside_resource(&mut self, svg_box: NodeSlotId, phase: PaintPhase) {
-        let kind = match phase {
-            PaintPhase::Background => ProducerKind::DrawBackground,
-            _ => ProducerKind::DrawForeground,
-        };
-        self.trace_paint(Operation::Producer(svg_box, kind), |this| {
-            crate::painting::record::paint::paint(this, svg_box, phase);
+        self.trace_paint(Operation::Producer(svg_box, ProducerKind::DrawForeground), |this| {
+            crate::painting::record::paint::paint(this, svg_box, PaintPhase::Foreground);
         });
     }
 }

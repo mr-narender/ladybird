@@ -1411,6 +1411,7 @@ fn fake_object_layout() -> RuntimeLayout {
         property_iterator_prototype_chain_validity: 32,
         property_iterator_property_values: 40,
         property_iterator_property_value_count: 48,
+        property_iterator_property_offsets: 56,
         property_iterator_fast_path_none: 0,
         property_iterator_fast_path_packed_indexed: 2,
         executable_property_lookup_caches: 24,
@@ -1426,6 +1427,7 @@ fn fake_object_layout() -> RuntimeLayout {
         property_lookup_cache_entry_type_add_own_property: 1,
         property_lookup_cache_entry_type_get_own_property: 3,
         property_lookup_cache_entry_type_change_own_property: 2,
+        property_lookup_cache_entry_type_get_property_in_prototype_chain: 5,
         // NB: Fake cells keep their class in their first word: the mask
         //     keeps every bit, so the block of a fake cell is the cell.
         cell_block_mask: u64::MAX,
@@ -1446,6 +1448,7 @@ fn fake_object_layout() -> RuntimeLayout {
         keyed_lookup_cache_dictionary_generation: 8,
         keyed_lookup_cache_shape: 16,
         keyed_lookup_cache_name: 40,
+        keyed_lookup_cache_prototype: 0,
         keyed_lookup_cache_prototype_chain_validity: 0,
         keyed_lookup_cache_new_shape: 0,
         property_lookup_cache_polymorphic_tag: 1,
@@ -1457,6 +1460,8 @@ fn fake_object_layout() -> RuntimeLayout {
         property_lookup_cache_megamorphic_tag: 2,
         property_lookup_cache_megamorphic_primary_entries: 64,
         property_lookup_cache_megamorphic_secondary_entries: 64 + 16 * 64,
+        property_lookup_cache_megamorphic_vm_cache_lessons: 64 + 32 * 64 + 4,
+        property_lookup_cache_megamorphic_max_vm_cache_lessons: 16,
         property_lookup_cache_megamorphic_index_bits: 4,
         property_lookup_cache_megamorphic_hash_multiplier: 0x9e37_79b9,
         try_get_by_id_cache: fake_try_get_by_id_cache as *const () as u64,
@@ -1866,31 +1871,55 @@ impl FakeKeySnapshot {
     }
 }
 
-/// Runs ObjectPropertyIteratorNext with `receiver`, `keys` and `cursor`;
-/// returns the value, done flag and cursor it wrote, and how often the slow
-/// path ran.
+/// The program running ObjectPropertyIteratorNext with the arguments, which ends with `written`.
+fn property_iterator_next_program(written: Operand) -> Program {
+    assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::ObjectPropertyIteratorNext {
+                dst_value: r(5),
+                dst_done: r(6),
+                receiver: argument(0),
+                keys: argument(1),
+                cursor: argument(2),
+            },
+            // NB: Unlike Return, End returns the empty value as is.
+            Instruction::End { value: written },
+        ]
+    })
+}
+
+/// Runs ObjectPropertyIteratorNext with `receiver`, `keys` and `cursor`,
+/// built with its slow path (as after an exit there); returns the value,
+/// done flag and cursor it wrote, and how often the slow path ran.
 fn property_iterator_next(receiver: u64, keys: u64, cursor: u64) -> (u64, u64, u64, u64) {
     let run = |written: Operand| {
-        let program = assemble(|_| {
-            vec![
-                Instruction::Enter,
-                Instruction::ObjectPropertyIteratorNext {
-                    dst_value: r(5),
-                    dst_done: r(6),
-                    receiver: argument(0),
-                    keys: argument(1),
-                    cursor: argument(2),
-                },
-                // NB: Unlike Return, End returns the empty value as is.
-                Instruction::End { value: written },
-            ]
-        });
-        let (result, machine) = run_program(&program, &[receiver, keys, cursor], |_| {});
+        let program = property_iterator_next_program(written);
+        let pc = program.offsets[1];
+        let (result, machine) = run_program_with_snapshot(
+            &program,
+            &[receiver, keys, cursor],
+            |snapshot| snapshot.executables[0].exit_sites = vec![(pc, ExitKind::SlowPath)],
+            |_| {},
+        );
         assert_eq!(result.status, RETURNED);
         (result.value, machine.vm[VM_SLOW_PUTS_WORD])
     };
     let (value, slow_paths) = run(r(5));
     (value, run(r(6)).0, run(argument(2)).0, slow_paths)
+}
+
+/// Whether ObjectPropertyIteratorNext with `receiver`, `keys` and `cursor`,
+/// built before any exit there, exits instead of running its slow path.
+fn property_iterator_next_exits(receiver: u64, keys: u64, cursor: u64) -> bool {
+    let program = property_iterator_next_program(r(5));
+    let (result, machine) = run_program(&program, &[receiver, keys, cursor], |_| {});
+    assert_eq!(machine.vm[VM_SLOW_PUTS_WORD], 0);
+    if result.status == crate::code::JitStatus::Resume as u64 {
+        return true;
+    }
+    assert_eq!(result.status, RETURNED);
+    false
 }
 
 #[test]
@@ -1915,9 +1944,24 @@ fn property_iterator_next_reads_key_snapshots() {
         property_iterator_next(object.value(), named.value(), value::int32(2)),
         (empty, value::TRUE, value::int32(2), 0)
     );
-    // Other shapes, cursors and receivers are slow.
+    // Other shapes, cursors and receivers are slow, and exit until an exit was taken there.
     let other_shape = low_cell(&[0; 12]);
     let other = FakeKeySnapshot::new(1, other_shape, &keys);
+    assert!(!property_iterator_next_exits(
+        object.value(),
+        named.value(),
+        value::int32(0)
+    ));
+    assert!(property_iterator_next_exits(
+        object.value(),
+        other.value(),
+        value::int32(0)
+    ));
+    assert!(property_iterator_next_exits(
+        value::int32(1),
+        named.value(),
+        value::int32(0)
+    ));
     assert_eq!(
         property_iterator_next(object.value(), other.value(), value::int32(0)).3,
         1

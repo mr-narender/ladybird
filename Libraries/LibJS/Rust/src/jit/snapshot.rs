@@ -467,6 +467,15 @@ impl SnapshotBuilder<'_> {
                 PropertyLookupCacheEntryType::GetPropertyInPrototypeChain => {
                     PropertyCacheEntryType::GetPropertyInPrototypeChain
                 }
+                // NB: Like the interpreter, compiled code relies on an entry for a missing property only where the
+                //     property is also missing from an unchanged prototype chain, which an entry without a prototype
+                //     chain validity can only tell for shapes without a prototype.
+                PropertyLookupCacheEntryType::GetMissingProperty
+                    if entry.prototype_chain_validity.is_none()
+                        && shape.is_some_and(|shape| shape.prototype().is_some()) =>
+                {
+                    continue;
+                }
                 PropertyLookupCacheEntryType::GetMissingProperty => PropertyCacheEntryType::GetMissingProperty,
             };
             let prototype_property = prototype_property_object(&entry);
@@ -1349,6 +1358,17 @@ impl SnapshotBuilder<'_> {
             } else {
                 Vec::new()
             },
+            property_key_names: executable
+                .property_keys()
+                .iter()
+                .map(|key| {
+                    if key.is_string() {
+                        key.as_string().raw_identity() as u64
+                    } else {
+                        0
+                    }
+                })
+                .collect(),
         }
     }
 

@@ -7,18 +7,20 @@
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/HashTable.h>
 #include <AK/Noncopyable.h>
 #include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/Span.h>
 #include <AK/StringView.h>
 #include <Compositor/BackingStoreManager.h>
 #include <Compositor/CanvasSurfaceRegistry.h>
 #include <Compositor/CompositorCoreHost.h>
 #include <Compositor/DisplayListRasterCache.h>
+#include <Compositor/DrawnResources.h>
 #include <Compositor/PresentableSurface.h>
-#include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
 #include <LibGfx/Size.h>
-#include <LibMediaCodecs/VideoFrame.h>
+#include <LibMedia/VideoSinkHandle.h>
 
 namespace Gfx {
 
@@ -38,16 +40,19 @@ class ContextRasterTargets {
 public:
     explicit ContextRasterTargets(OwnedCanvasSurfaces);
 
-    Compositing::DisplayListResourceStorage& resource_storage() { return m_resource_storage; }
-    Compositing::DisplayListResourceStorage const& resource_storage() const { return m_resource_storage; }
-    void apply_resource_transaction(Compositing::DisplayListResourceTransaction&&);
+    DrawnFonts& fonts() { return m_fonts; }
+    DrawnFonts const& fonts() const { return m_fonts; }
+    DrawnImageFrames& image_frames() { return m_image_frames; }
+    DrawnImageFrames const& image_frames() const { return m_image_frames; }
+    void retain_only_fonts(ReadonlySpan<u64> font_ids);
+    void retain_only_image_frames(ReadonlySpan<u64> image_frame_ids);
     DisplayListRasterCache& raster_cache() { return m_raster_cache; }
     OwnedCanvasSurfaces const& canvas_surfaces() const { return m_canvas_surfaces; }
 
-    // The resources that the overlays draw with, apart from those of the page.
-    Compositing::DisplayListResourceStorage& overlay_resource_storage() { return m_overlay_resource_storage; }
+    // The fonts that the overlays draw with, apart from those of the page.
+    DrawnFonts const& overlay_fonts() const { return m_overlay_fonts; }
     DisplayListRasterCache& overlay_raster_cache() { return m_overlay_raster_cache; }
-    // Shapes a label of the overlays, in a font that the overlays' resources then hold.
+    // Shapes a label of the overlays, in a font that the overlays' fonts then hold.
     Optional<OverlayLabel> shape_overlay_label(Optional<StringView> font_family, double device_pixel_ratio, StringView text);
 
     BackingStoreManager& backing_stores() { return m_backing_stores; }
@@ -57,17 +62,21 @@ public:
     RefPtr<PresentableSurface> next_presentable_surface(u32 pool, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&);
     void drop_presentable_surface_pool(u32 pool) { m_presentable_surface_pools.remove(pool); }
 
-    RefPtr<Media::VideoFrame> current_video_frame(Compositing::VideoSinkResourceId) const;
-    bool draws_video_sink(Media::VideoSinkHandle) const;
+    // The video sinks that the display list of the context draws. Answers whether these are other sinks than before.
+    bool set_drawn_video_sinks(ReadonlySpan<u64> handles);
+    HashTable<Media::VideoSinkHandle> const& drawn_video_sinks() const { return m_drawn_video_sinks; }
+    bool draws_video_sink(Media::VideoSinkHandle handle) const { return m_drawn_video_sinks.contains(handle); }
 
 private:
-    Compositing::DisplayListResourceStorage m_resource_storage;
+    DrawnFonts m_fonts;
+    DrawnImageFrames m_image_frames;
     DisplayListRasterCache m_raster_cache;
     OwnedCanvasSurfaces m_canvas_surfaces;
-    Compositing::DisplayListResourceStorage m_overlay_resource_storage;
+    DrawnFonts m_overlay_fonts;
     DisplayListRasterCache m_overlay_raster_cache;
     BackingStoreManager m_backing_stores;
     HashMap<u32, PresentableSurfacePool> m_presentable_surface_pools;
+    HashTable<Media::VideoSinkHandle> m_drawn_video_sinks;
 };
 
 }

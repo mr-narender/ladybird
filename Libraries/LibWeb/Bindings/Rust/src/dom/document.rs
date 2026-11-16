@@ -6,17 +6,32 @@
 
 use core::ffi::c_void;
 
-use libjs_rust::api::Trace;
-use liburl_rust::Url;
+use ak::Utf16String;
+use libjs_rust::api::{Trace, Vm};
+use liburl_rust::origin::{Host, Origin};
+use liburl_rust::{FfiOrigin, FfiUrlHost, Url};
 
-use crate::bindings::cpp_cell::CppCell;
+use crate::bindings::cpp_cell::{CppCell, WeakCppCell};
 use crate::bindings::interface::{Ref, cell_from_abi, cell_into_abi};
 use crate::html::navigable::CppNavigable;
+use crate::html::visibility_state::VisibilityState;
 use crate::navigation_timing::performance_navigation_timing::PerformanceNavigationTiming;
+use crate::permissions_policy::permissions_policy::PolicyControlledFeature;
 
 unsafe extern "C" {
+    fn web_bindings_is_a_registrable_domain_suffix_of_or_is_equal_to(
+        host_suffix_string: usize,
+        original_host: *const FfiUrlHost,
+    ) -> bool;
     fn web_bindings_document_navigable(document: *mut c_void) -> *mut c_void;
     fn web_bindings_document_is_fully_active(document: *mut c_void) -> bool;
+    fn web_bindings_document_is_allowed_to_use_feature(document: *mut c_void, feature: u8) -> bool;
+    fn web_bindings_document_visibility_state(document: *mut c_void) -> u8;
+    fn web_bindings_document_origin(
+        document: *mut c_void,
+        origin: *mut c_void,
+        on_origin: unsafe extern "C" fn(*mut c_void, *const FfiOrigin),
+    );
     fn web_bindings_document_has_focus(document: *mut c_void) -> bool;
     fn web_bindings_document_has_been_destroyed(document: *mut c_void) -> bool;
     fn web_bindings_document_url(document: *mut c_void) -> liburl_rust::RustUrl;
@@ -33,6 +48,16 @@ unsafe extern "C" {
 #[derive(Clone, Trace)]
 #[gc(crate = libjs_rust)]
 pub(crate) struct CppDocument(CppCell);
+
+#[derive(Clone, Trace)]
+#[gc(crate = libjs_rust)]
+pub(crate) struct WeakCppDocument(WeakCppCell);
+
+impl WeakCppDocument {
+    pub(crate) fn get(&self) -> Option<CppDocument> {
+        self.0.get().map(CppDocument)
+    }
+}
 
 /// https://html.spec.whatwg.org/multipage/dom.html#document-load-timing-info
 #[derive(Clone, Copy, Default)]
@@ -65,10 +90,47 @@ impl CppDocument {
         Self(unsafe { CppCell::from_raw(document) })
     }
 
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        self.0.as_ptr()
+    }
+
+    pub(crate) fn downgrade(&self, vm: &Vm) -> WeakCppDocument {
+        WeakCppDocument(WeakCppCell::new(vm, &self.0))
+    }
+
     /// https://html.spec.whatwg.org/multipage/document-sequences.html#fully-active
     pub(crate) fn is_fully_active(&self) -> bool {
         // SAFETY: The Document is live.
         unsafe { web_bindings_document_is_fully_active(self.0.as_ptr()) }
+    }
+
+    /// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#allowed-to-use
+    pub(crate) fn is_allowed_to_use_feature(&self, feature: PolicyControlledFeature) -> bool {
+        // SAFETY: The Document is live.
+        unsafe { web_bindings_document_is_allowed_to_use_feature(self.0.as_ptr(), feature as u8) }
+    }
+
+    /// https://dom.spec.whatwg.org/#concept-document-origin
+    pub(crate) fn origin(&self) -> Origin {
+        unsafe extern "C" fn on_origin(origin: *mut c_void, ffi_origin: *const FfiOrigin) {
+            // SAFETY: origin is the origin below, and LibWeb lends the origin for the call.
+            unsafe { *origin.cast::<Option<Origin>>() = Some((*ffi_origin).to_origin()) };
+        }
+
+        let mut origin = None;
+        // SAFETY: The Document is live, and the origin outlives the call.
+        unsafe { web_bindings_document_origin(self.0.as_ptr(), (&raw mut origin).cast(), on_origin) };
+        origin.expect("LibWeb lends the origin")
+    }
+
+    /// https://html.spec.whatwg.org/multipage/interaction.html#visibility-state
+    pub(crate) fn visibility_state(&self) -> VisibilityState {
+        // SAFETY: The Document is live.
+        match unsafe { web_bindings_document_visibility_state(self.0.as_ptr()) } {
+            0 => VisibilityState::Visible,
+            1 => VisibilityState::Hidden,
+            _ => unreachable!("LibWeb returns a VisibilityState"),
+        }
     }
 
     /// https://html.spec.whatwg.org/multipage/interaction.html#has-focus-steps
@@ -124,5 +186,20 @@ impl CppDocument {
     pub(crate) fn set_navigation_timing_entry(&self, entry: Ref<PerformanceNavigationTiming>) {
         // SAFETY: The Document and the entry are live.
         unsafe { web_bindings_document_set_navigation_timing_entry(self.0.as_ptr(), cell_into_abi(entry)) };
+    }
+}
+
+/// https://html.spec.whatwg.org/multipage/browsers.html#is-a-registrable-domain-suffix-of-or-is-equal-to
+pub(crate) fn is_a_registrable_domain_suffix_of_or_is_equal_to(
+    host_suffix_string: &Utf16String,
+    original_host: &Host,
+) -> bool {
+    let original_host = FfiUrlHost::new(original_host.kind, &original_host.serialization);
+    // SAFETY: The host suffix string and the host are lent for the call.
+    unsafe {
+        web_bindings_is_a_registrable_domain_suffix_of_or_is_equal_to(
+            host_suffix_string.raw_identity(),
+            &raw const original_host,
+        )
     }
 }

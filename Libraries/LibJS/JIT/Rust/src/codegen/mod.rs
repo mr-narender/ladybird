@@ -299,6 +299,7 @@ struct Codegen<'a, M: PortableMacroAssembler> {
     /// The block being emitted.
     block: BlockId,
     deferred_cache_probes: Vec<probes::DeferredCacheProbe>,
+    deferred_vm_cache_probes: Vec<probes::DeferredVmCacheProbe>,
     deferred_allocations: Vec<allocation::DeferredAllocation>,
     deferred_storage_growths: Vec<named_storage::DeferredStorageGrowth>,
     /// `InitializeNamed` nodes whose constant the allocation of their object
@@ -460,6 +461,7 @@ pub fn generate<M: PortableMacroAssembler>(
         annotations: Vec::new(),
         block: BlockId(0),
         deferred_cache_probes: Vec::new(),
+        deferred_vm_cache_probes: Vec::new(),
         deferred_allocations: Vec::new(),
         deferred_storage_growths: Vec::new(),
         absorbed_initializations: Vec::new(),
@@ -1541,6 +1543,14 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
             Op::CheckElements { kind } => self.emit_check_elements(node_id, *kind),
             Op::CheckTypedArray => self.emit_check_typed_array(node_id),
             Op::CheckArray => self.emit_check_array(node_id),
+            Op::CheckPropertyAbsenceCacheable => {
+                let exit = self.exit_site(node_id);
+                let (value, object, class) = (self.input(node_id, 0), self.temp(node_id, 0), self.temp(node_id, 1));
+                let scratch = self.pinned.scratch;
+                self.branch_on_tag(Condition::NotEqual, value, value::OBJECT_TAG, scratch, exit);
+                self.emit_unbox_cell(object, value);
+                self.branch_unless_cacheable_for_property_absence(object, class, exit);
+            }
             Op::CheckNonNegativeInt32 => {
                 let exit = self.exit_site(node_id);
                 self.masm
@@ -1816,16 +1826,24 @@ impl<M: PortableMacroAssembler> Codegen<'_, M> {
                 }
                 self.masm.jump(exit);
             }
-            Op::ProbePropertyCache { executable, cache } => {
-                self.emit_probe_property_cache(node_id, *executable, *cache)?;
+            Op::ProbePropertyCache {
+                executable,
+                cache,
+                property,
+            } => {
+                self.emit_probe_property_cache(node_id, *executable, *cache, *property)?;
             }
             Op::ProbeKeyedCache { executable, cache } => self.emit_probe_keyed_cache(node_id, *executable, *cache)?,
             Op::ProbeKeyedStore { executable, cache } => self.emit_probe_keyed_store(node_id, *executable, *cache)?,
             Op::ProbeGlobalCache { cache } => self.emit_probe_global_cache(node_id, *cache)?,
             Op::ProbeHasProperty { own } => self.emit_probe_has_property(node_id, *own),
             Op::ProbeGlobalStore { cache } => self.emit_probe_global_store(node_id, *cache)?,
-            Op::ProbePropertyStore { executable, cache } => {
-                self.emit_probe_property_store(node_id, *executable, *cache)?;
+            Op::ProbePropertyStore {
+                executable,
+                cache,
+                property,
+            } => {
+                self.emit_probe_property_store(node_id, *executable, *cache, *property)?;
             }
             Op::CallSlowPath {
                 opcode,

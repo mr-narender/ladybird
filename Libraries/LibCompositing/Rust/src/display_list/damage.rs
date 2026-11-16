@@ -14,11 +14,11 @@ use crate::display_list::builder::{
     read_command, read_header,
 };
 use crate::display_list::commands::{
-    CanvasId, ClipMode, ClipNodeIndex, CompositorScrollbar, ContextRef, DeclareMaskContent, DisplayListCommandHeader,
-    DisplayListCommandRun, DisplayListCommandType, DisplayListDataSpan, DisplayListInlineClip,
-    DisplayListPaintStyleType, DrawGlyphRun, DrawScaledDecodedImageFrame, EffectNodeIndex, FillPath, FillRect,
-    INLINE_CLIP_ENTRY_SIZE, ImageFrameResourceId, OptionalColor, OptionalFloatRect, PaintScrollBar, PaintTextShadow,
-    PathPaintKind, SpatialNodeIndex, StrokePath, VISUAL_VIEWPORT_NODE_INDEX, VideoSinkResourceId,
+    CanvasId, ClipMode, ClipNodeIndex, CompositorContextId, CompositorScrollbar, ContextRef, DeclareMaskContent,
+    DisplayListCommandHeader, DisplayListCommandRun, DisplayListCommandType, DisplayListDataSpan,
+    DisplayListInlineClip, DisplayListPaintStyleType, DrawGlyphRun, DrawScaledDecodedImageFrame, EffectNodeIndex,
+    FillPath, FillRect, INLINE_CLIP_ENTRY_SIZE, ImageFrameResourceId, OptionalColor, OptionalFloatRect, PaintScrollBar,
+    PaintTextShadow, PathPaintKind, SpatialNodeIndex, StrokePath, VISUAL_VIEWPORT_NODE_INDEX, VideoSinkHandle,
 };
 use crate::fast_hash::FastMap;
 use crate::host::FfiAnimatedContentViewportEffect;
@@ -106,10 +106,9 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
             let content = super::nested_records::span_bytes(payload, declaration.content);
             let nested = collect_nested_command_references(content, run.context, run.offset + offset as u32);
             // Mask groups use their declaration's visual context. Only compare drawing commands whose
-            // complete appearance is encoded in the payload, without canvas or video. The id of a nested
-            // display list, such as that of an SVG mask image, names one recording whose commands never
-            // change. The video and animated image frames drawn only inside it can, and for those
-            // ContextPresenter damages the whole viewport.
+            // complete appearance is encoded in the payload, without canvas or video. The records of an SVG
+            // image, such as a mask image, are in its payload. The video and animated image frames drawn only
+            // inside them can change, and for those ContextPresenter damages the whole viewport.
             if nested.iter().all(|nested| match nested.header.command_type {
                 DisplayListCommandType::FillRect => read_command::<FillRect>(nested.payload)
                     .background_color_animation_effect
@@ -127,7 +126,7 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
                 DisplayListCommandType::PaintLinearGradient
                 | DisplayListCommandType::PaintRadialGradient
                 | DisplayListCommandType::PaintConicGradient
-                | DisplayListCommandType::PaintNestedDisplayList
+                | DisplayListCommandType::PaintVectorImage
                 | DisplayListCommandType::DrawEllipse
                 | DisplayListCommandType::DrawLine
                 | DisplayListCommandType::DrawRect => true,
@@ -1546,13 +1545,14 @@ pub struct DisplayListFrame<'a> {
     pub scroll_offsets: &'a [FloatPoint],
 }
 
-// The canvases, video sinks and image frames whose pixels changed since the old frame. The lists draw
-// them with commands that stay the same, so the diff cannot see the change.
+// The canvases, video sinks, image frames and frames of nested contexts whose pixels changed since the old frame.
+// The lists draw them with commands that stay the same, so the diff cannot see the change.
 #[derive(Clone, Copy, Default)]
 pub struct LiveContentChanges<'a> {
     pub canvases: &'a [CanvasId],
-    pub video_sinks: &'a [VideoSinkResourceId],
+    pub video_sinks: &'a [VideoSinkHandle],
     pub image_frames: &'a [ImageFrameResourceId],
+    pub composited_contexts: &'a [CompositorContextId],
     /// What the compositor repaints whatever the lists hold, such as a blinking caret.
     pub forced_damage_rect: IntRect,
     pub offsets_of_records_composited_as_media_layers: &'a [u32],
@@ -1576,14 +1576,18 @@ impl DisplayListDamage {
 
 impl LiveContentChanges<'_> {
     fn is_empty(&self) -> bool {
-        self.canvases.is_empty() && self.video_sinks.is_empty() && self.image_frames.is_empty()
+        self.canvases.is_empty()
+            && self.video_sinks.is_empty()
+            && self.image_frames.is_empty()
+            && self.composited_contexts.is_empty()
     }
 
     fn includes(&self, content: LiveContent) -> bool {
         match content {
             LiveContent::Canvas(canvas_id) => self.canvases.contains(&canvas_id),
-            LiveContent::VideoFrame(video_sink_id) => self.video_sinks.contains(&video_sink_id),
+            LiveContent::VideoFrame(video_sink_handle) => self.video_sinks.contains(&video_sink_handle),
             LiveContent::ImageFrame(image_frame_id) => self.image_frames.contains(&image_frame_id),
+            LiveContent::CompositedContext(context_id) => self.composited_contexts.contains(&context_id),
         }
     }
 }
@@ -1805,8 +1809,8 @@ mod tests {
     use crate::display_list::builder::{HEADER_SIZE, note_command};
     use crate::display_list::commands::{
         BackdropFilterRegion, CanvasId, CompositorMainThreadWheelEventRegion, DisplayListCommand, DisplayListGlyph,
-        DisplayListResourceId, DrawCanvas, DrawIsolatedGroup, DrawVideoFrame, FillRect, FontResourceId, InlineClipKind,
-        PaintNestedDisplayList, TextShadowLayer,
+        DisplayListResourceId, DrawCanvas, DrawCompositedContext, DrawIsolatedGroup, DrawVideoFrame, FillRect,
+        FontResourceId, InlineClipKind, PaintVectorImage, TextShadowLayer,
     };
     use crate::display_list::ffi_bytes::FfiBytes;
     use crate::node_slot_id::NodeSlotId;
@@ -2243,14 +2247,14 @@ mod tests {
         let video = command_bytes(
             &DrawVideoFrame {
                 dst_rect: rect,
-                video_sink_id: VideoSinkResourceId(1),
+                video_sink_handle: VideoSinkHandle(1),
                 scaling_mode: ScalingMode::NearestNeighbor,
             },
             Some(rect),
             ContextRef::default(),
         );
         let changed_video = LiveContentChanges {
-            video_sinks: &[VideoSinkResourceId(1)],
+            video_sinks: &[VideoSinkHandle(1)],
             ..LiveContentChanges::default()
         };
         assert_eq!(
@@ -2285,6 +2289,34 @@ mod tests {
         );
         assert_eq!(
             damage_for_live_content_changes(&image, &tree, changed_video),
+            Some(IntRect::default())
+        );
+
+        let nested_context = command_bytes(
+            &DrawCompositedContext {
+                dst_rect: FloatRect::new(10.0, 10.0, 20.0, 20.0),
+                child_context_id: CompositorContextId(7),
+                scaling_mode: ScalingMode::NearestNeighbor,
+                spatial_node_index: VISUAL_VIEWPORT_NODE_INDEX,
+                snap_origin_if_untransformed: true,
+            },
+            Some(rect),
+            ContextRef::default(),
+        );
+        let changed_nested_context = LiveContentChanges {
+            composited_contexts: &[CompositorContextId(7)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&nested_context, &tree, changed_nested_context),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+        let other_nested_context = LiveContentChanges {
+            composited_contexts: &[CompositorContextId(8)],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&nested_context, &tree, other_nested_context),
             Some(IntRect::default())
         );
     }
@@ -3525,7 +3557,7 @@ mod tests {
         enum MaskContent {
             Fill,
             Canvas,
-            NestedDisplayList(u64),
+            VectorImage(u64),
         }
         let make_scene = |color, insert_effect, mask_content| {
             let mut tree = identity_tree();
@@ -3550,11 +3582,13 @@ mod tests {
                     Some(rect),
                     context,
                 ),
-                MaskContent::NestedDisplayList(id) => command_bytes(
-                    &PaintNestedDisplayList {
-                        display_list_id: DisplayListResourceId(id),
+                MaskContent::VectorImage(id) => command_bytes(
+                    &PaintVectorImage {
+                        vector_image_id: DisplayListResourceId(id),
                         rect: rect.to_float(),
-                        list_size: IntSize { width: 20, height: 20 },
+                        recorded_size: IntSize { width: 20, height: 20 },
+                        records: DisplayListDataSpan::default(),
+                        requires_direct_replay: false,
                     },
                     Some(rect),
                     context,
@@ -3601,14 +3635,14 @@ mod tests {
             damage(&bytes, &tree, &bytes, &tree),
             Some(rect.inflated_edges(1, 1, 1, 1))
         );
-        // A nested display list is the same content for as long as its id is.
-        let (old_bytes, old_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(1));
-        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(1));
+        // The records of an SVG image are the same for as long as its id is.
+        let (old_bytes, old_tree) = make_scene(RED, false, MaskContent::VectorImage(1));
+        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::VectorImage(1));
         assert_eq!(
             damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(IntRect::default())
         );
-        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(2));
+        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::VectorImage(2));
         assert_eq!(
             damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(rect.inflated_edges(1, 1, 1, 1))

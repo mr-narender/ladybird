@@ -46,9 +46,7 @@ use crate::painting::paintable_geometry::{
 use crate::painting::presentation::Presentation;
 use crate::painting::record::damage::PaintDamage;
 use crate::painting::record::inputs::UnframedRecordingInputs;
-use crate::painting::record::publish::{
-    published_vector_image_display_lists, renders_vector_images, take_in_recording,
-};
+use crate::painting::record::publish::{published_vector_image_records, renders_vector_images, take_in_recording};
 use crate::painting::record::recorder_state::RecorderState;
 use crate::painting::record::{PublishedHitTestItems, RecordingInputs, RecordingOutput};
 use crate::painting::recording_slot::{
@@ -1845,9 +1843,9 @@ impl ClockRecorder {
             visual_contexts,
         }) = frame;
         let (pending, _) = record_frame(frozen.frame, &mut self.recorder, viewport, false, inputs);
-        let vector_image_display_lists = match renders_vector_images(&pending) {
-            true => match published_vector_image_display_lists(&pending, &self.recorder) {
-                Some(display_lists) => Some(display_lists),
+        let rendered_vector_images = match renders_vector_images(&pending) {
+            true => match published_vector_image_records(&pending, &self.recorder) {
+                Some(vector_images) => Some(vector_images),
                 None => {
                     self.leave_frame_to_host();
                     return self;
@@ -1858,13 +1856,13 @@ impl ClockRecorder {
         if let Some(visual_contexts) = visual_contexts {
             self.presentation.take_visual_context_tree(visual_contexts);
         }
-        let output = match vector_image_display_lists {
-            Some(display_lists) => present_with_vector_images(
+        let output = match rendered_vector_images {
+            Some(vector_images) => present_with_vector_images(
                 &mut self.presentation,
                 pending,
                 &self.recorder,
                 presenting,
-                &display_lists,
+                &vector_images,
             ),
             None => present(&mut self.presentation, pending, &self.recorder, presenting),
         };
@@ -1928,7 +1926,13 @@ pub extern "C" fn document_host_take_clock_lanes_in(host: &DocumentHost, update:
 /// move before one of its own. For a test, whose documents follow each other with the pointer where the last left it.
 #[unsafe(no_mangle)]
 pub extern "C" fn document_host_forget_pointer_for_testing(host: &DocumentHost) {
-    host.clock_ticks().pointer_state().forget();
+    let ticks = Arc::clone(host.clock_ticks());
+    // Wait for a tick already running before discarding its report and the pointer it could hover again.
+    super::on_render_side(0, move || {
+        ticks.pointer_state().forget();
+        let _ = take_lane_report(&ticks);
+    });
+    host.clear_lane_hover_for_testing();
 }
 
 /// Takes in what the lanes of `host`'s document did, as a task between two rendering updates handles a press, and

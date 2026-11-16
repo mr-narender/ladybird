@@ -28,8 +28,7 @@ pub(crate) mod vector_images;
 use crate::css::css_enums;
 use crate::css::css_pixels::CssPixelRect;
 use crate::css::style::fast_hash::FastSet;
-use crate::layout::node_data::NodeSlotId;
-use crate::layout::node_data::{NodeFlag, NodeKind};
+use crate::layout::node_data::{NodeFlag, NodeSlotId};
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::builder::{PendingInlineClip, RecordedDisplayList};
 use crate::painting::display_list::commands::{ContextRef, SpatialNodeIndex};
@@ -65,8 +64,8 @@ pub struct RecordingOutput {
     // Whether the window was focused, which the output of the producers that read it reflects.
     pub(crate) window_is_focused: bool,
     pub(crate) capture_log: Option<trace::CaptureLog>,
-    /// The SVG images whose display lists, which the host rendered, the recording draws, and the ids of those lists.
-    pub(crate) vector_image_display_lists: Vec<(vector_images::VectorImageRenderRequest, u64)>,
+    /// The SVG images the recording draws, which the host rendered, and the ids of their records.
+    pub(crate) vector_image_ids_by_request: Vec<(vector_images::VectorImageRenderRequest, u64)>,
     /// What the display list draws besides its tape.
     pub(crate) resources: crate::painting::display_list_resources::DisplayListResources,
     /// The display list's id, which a recording that repeats the one published last shares with it.
@@ -207,14 +206,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
         self.resources.note_image_frame(frame)
     }
 
-    pub(crate) fn register_video_sink(
-        &mut self,
-        resource_id: u64,
-        sink_handle: u64,
-    ) -> crate::painting::display_list::commands::VideoSinkResourceId {
-        self.resources.note_video_sink(resource_id, sink_handle)
-    }
-
     /// The color scheme an SVG image the box `owner` draws renders in: the box's own where it or its document opts into
     /// `light` or `dark`, and otherwise the preferred one.
     pub(crate) fn vector_image_color_scheme(&self, owner: crate::layout::node_data::NodeSlotId) -> u8 {
@@ -270,7 +261,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 return;
             }
             let group = self.recorder.begin_repeated_tile();
-            self.recorder.paint_nested_display_list(
+            self.recorder.paint_vector_image_records(
                 display_list_id,
                 libgfx_rust::FloatRect::new(0.0, 0.0, dest_device_rect.width as f32, dest_device_rect.height as f32),
                 geometry.list_size,
@@ -294,7 +285,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             return;
         }
         self.recorder
-            .paint_nested_display_list(display_list_id, dest_rect, geometry.list_size);
+            .paint_vector_image_records(display_list_id, dest_rect, geometry.list_size);
     }
 
     pub(crate) fn own_scroll_container_offset(&self, paintable: NodeSlotId) -> crate::css::css_pixels::CssPixelPoint {
@@ -668,7 +659,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             && crate::painting::paint_order::first_paint_child(self.source, paintable).is_none();
         let has_backdrop_filter = effects.backdrop_filter.operations.length != 0;
         let paints_border_image = crate::painting::style_queries::handle_value(&style.border().border_image_source)
-            .is_some_and(|source| matches!(source, crate::css::style_value::StyleValueData::Image { .. }));
+            .is_some_and(|source| source.is_image());
         let mut facts = BasePaintFacts {
             is_visible,
             empty_cells_property_applies,
@@ -696,10 +687,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
     fn has_stacking_context(&self, paintable: NodeSlotId) -> bool {
         self.data(paintable).establishes_stacking_context
-    }
-
-    fn layout_kind(&self, paintable: NodeSlotId) -> Option<NodeKind> {
-        self.source.node_kind_if_live(paintable)
     }
 
     fn display(&self, paintable: NodeSlotId) -> crate::css::display::FfiDisplay {
