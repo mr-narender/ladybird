@@ -4,126 +4,32 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <LibCrypto/Authentication/HMAC.h>
-#include <LibCrypto/Hash/BLAKE2b.h>
-#include <LibCrypto/Hash/MD5.h>
-#include <LibCrypto/Hash/SHA1.h>
-#include <LibCrypto/Hash/SHA2.h>
+#include <LibCrypto/Hash/Hash.h>
+#include <LibCrypto/Hash/SHAKE.h>
 #include <LibTest/TestCase.h>
 #include <cstring>
-
-TEST_CASE(test_BLAKE2b_hash_string)
-{
-    u8 result[] {
-        0x9d, 0xaa, 0x2e, 0x57, 0xc4, 0x94, 0xb6, 0xfd, 0x61, 0x6e, 0x39, 0x0b, 0x71, 0xf4, 0x19, 0x03, 0x41, 0x5c, 0x5c, 0x61, 0x7e, 0x30, 0x0a, 0xf0, 0x0b, 0x3e, 0x9c, 0x77, 0x23, 0x1f, 0x11, 0x4d, 0x83, 0x9d, 0xd6, 0xe0, 0x4a, 0x92, 0x19, 0xae, 0xec, 0xc9, 0x13, 0x57, 0xc6, 0xf1, 0x06, 0x92, 0xb9, 0xf9, 0x97, 0x3e, 0xfd, 0xb3, 0x6f, 0xc8, 0xe1, 0x94, 0xad, 0x8e, 0x33, 0xc2, 0x66, 0x3f
-    };
-    auto digest = Crypto::Hash::BLAKE2b::hash("Well hello friends"sv);
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::BLAKE2b::digest_size()) == 0);
-}
-
-TEST_CASE(test_BLAKE2b_hash_empty_string)
-{
-    u8 result[] {
-        0x78, 0x6a, 0x02, 0xf7, 0x42, 0x01, 0x59, 0x03, 0xc6, 0xc6, 0xfd, 0x85, 0x25, 0x52, 0xd2, 0x72, 0x91, 0x2f, 0x47, 0x40, 0xe1, 0x58, 0x47, 0x61, 0x8a, 0x86, 0xe2, 0x17, 0xf7, 0x1f, 0x54, 0x19, 0xd2, 0x5e, 0x10, 0x31, 0xaf, 0xee, 0x58, 0x53, 0x13, 0x89, 0x64, 0x44, 0x93, 0x4e, 0xb0, 0x4b, 0x90, 0x3a, 0x68, 0x5b, 0x14, 0x48, 0xb7, 0x55, 0xd5, 0x6f, 0x70, 0x1a, 0xfe, 0x9b, 0xe2, 0xce
-    };
-    auto digest = Crypto::Hash::BLAKE2b::hash(""sv);
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::BLAKE2b::digest_size()) == 0);
-}
-
-TEST_CASE(test_BLAKE2b_consecutive_multiple_updates)
-{
-    u8 result[] {
-        0x9d, 0xaa, 0x2e, 0x57, 0xc4, 0x94, 0xb6, 0xfd, 0x61, 0x6e, 0x39, 0x0b, 0x71, 0xf4, 0x19, 0x03, 0x41, 0x5c, 0x5c, 0x61, 0x7e, 0x30, 0x0a, 0xf0, 0x0b, 0x3e, 0x9c, 0x77, 0x23, 0x1f, 0x11, 0x4d, 0x83, 0x9d, 0xd6, 0xe0, 0x4a, 0x92, 0x19, 0xae, 0xec, 0xc9, 0x13, 0x57, 0xc6, 0xf1, 0x06, 0x92, 0xb9, 0xf9, 0x97, 0x3e, 0xfd, 0xb3, 0x6f, 0xc8, 0xe1, 0x94, 0xad, 0x8e, 0x33, 0xc2, 0x66, 0x3f
-    };
-    auto blake2b = Crypto::Hash::BLAKE2b::create();
-
-    blake2b->update("Well"sv);
-    blake2b->update(" hello "sv);
-    blake2b->update("friends"sv);
-    auto digest = blake2b->digest();
-
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::BLAKE2b::digest_size()) == 0);
-}
-
-TEST_CASE(test_BLAKE2b_consecutive_updates_reuse)
-{
-    auto blake2b = Crypto::Hash::BLAKE2b::create();
-
-    blake2b->update("Well"sv);
-    blake2b->update(" hello "sv);
-    blake2b->update("friends"sv);
-    auto digest0 = blake2b->digest();
-
-    blake2b->update("Well"sv);
-    blake2b->update(" hello "sv);
-    blake2b->update("friends"sv);
-    auto digest1 = blake2b->digest();
-
-    EXPECT(memcmp(digest0.data, digest1.data, Crypto::Hash::BLAKE2b::digest_size()) == 0);
-}
-
-TEST_CASE(test_MD5_hash_string)
-{
-    u8 result[] {
-        0xaf, 0x04, 0x3a, 0x08, 0x94, 0x38, 0x6e, 0x7f, 0xbf, 0x73, 0xe4, 0xaa, 0xf0, 0x8e, 0xee, 0x4c
-    };
-    auto digest = Crypto::Hash::MD5::hash("Well hello friends"sv);
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::MD5::digest_size()) == 0);
-}
-
-TEST_CASE(test_MD5_consecutive_multiple_updates)
-{
-    u8 result[] {
-        0xaf, 0x04, 0x3a, 0x08, 0x94, 0x38, 0x6e, 0x7f, 0xbf, 0x73, 0xe4, 0xaa, 0xf0, 0x8e, 0xee, 0x4c
-    };
-    auto md5 = Crypto::Hash::MD5::create();
-
-    md5->update("Well"sv);
-    md5->update(" hello "sv);
-    md5->update("friends"sv);
-    auto digest = md5->digest();
-
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::MD5::digest_size()) == 0);
-}
-
-TEST_CASE(test_MD5_consecutive_updates_reuse)
-{
-    auto md5 = Crypto::Hash::MD5::create();
-
-    md5->update("Well"sv);
-    md5->update(" hello "sv);
-    md5->update("friends"sv);
-    auto digest0 = md5->digest();
-
-    md5->update("Well"sv);
-    md5->update(" hello "sv);
-    md5->update("friends"sv);
-    auto digest1 = md5->digest();
-
-    EXPECT(memcmp(digest0.data, digest1.data, Crypto::Hash::MD5::digest_size()) == 0);
-}
 
 TEST_CASE(test_SHA1_hash_successive_updates)
 {
     u8 result[] {
         0xd6, 0x6e, 0xce, 0xd1, 0xf4, 0x08, 0xc6, 0xd8, 0x35, 0xab, 0xf0, 0xc9, 0x05, 0x26, 0xa4, 0xb2, 0xb8, 0xa3, 0x7c, 0xd3
     };
-    auto hasher = Crypto::Hash::SHA1::create();
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaaaaaaaa"sv);
-    hasher->update("aaaaaaaaa"sv);
-    auto digest = hasher->digest();
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::SHA1::digest_size()) == 0);
+    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA1 };
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaaaaaaaa"sv);
+    hasher.update("aaaaaaaaa"sv);
+    auto digest = hasher.finish();
+    EXPECT_EQ(digest.bytes(), ReadonlyBytes { result });
 }
 
 TEST_CASE(test_SHA256_hash_string)
@@ -131,8 +37,8 @@ TEST_CASE(test_SHA256_hash_string)
     u8 result[] {
         0x9a, 0xcd, 0x50, 0xf9, 0xa2, 0xaf, 0x37, 0xe4, 0x71, 0xf7, 0x61, 0xc3, 0xfe, 0x7b, 0x8d, 0xea, 0x56, 0x17, 0xe5, 0x1d, 0xac, 0x80, 0x2f, 0xe6, 0xc1, 0x77, 0xb7, 0x4a, 0xbf, 0x0a, 0xbb, 0x5a
     };
-    auto digest = Crypto::Hash::SHA256::hash("Well hello friends"sv);
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::SHA256::digest_size()) == 0);
+    auto digest = Crypto::Hash::digest(Crypto::Hash::HashKind::SHA256, "Well hello friends"sv.bytes());
+    EXPECT_EQ(digest.bytes(), ReadonlyBytes { result });
 }
 
 TEST_CASE(test_SHA256_hash_split_into_blocks)
@@ -140,8 +46,8 @@ TEST_CASE(test_SHA256_hash_split_into_blocks)
     u8 result[] {
         0x1b, 0x90, 0x74, 0xf9, 0x9b, 0xf3, 0x56, 0x20, 0xd3, 0xf6, 0xbf, 0x7d, 0x72, 0x53, 0xb3, 0x3c, 0xd1, 0x1b, 0x7d, 0xd8, 0xa9, 0xa0, 0x4e, 0x55, 0xf5, 0x72, 0x43, 0x94, 0xaf, 0x27, 0x6c, 0x5c
     };
-    auto digest = Crypto::Hash::SHA256::hash("0123456789012345678901234567890123456789012345678901234567890123abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcd"sv);
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::SHA256::digest_size()) == 0);
+    auto digest = Crypto::Hash::digest(Crypto::Hash::HashKind::SHA256, "0123456789012345678901234567890123456789012345678901234567890123abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcd"sv.bytes());
+    EXPECT_EQ(digest.bytes(), ReadonlyBytes { result });
 }
 
 TEST_CASE(test_SHA3_256_hash_split_into_blocks)
@@ -149,6 +55,52 @@ TEST_CASE(test_SHA3_256_hash_split_into_blocks)
     u8 result[] {
         0x0c, 0x4e, 0x02, 0xfb, 0x73, 0x31, 0xe9, 0xe7, 0x25, 0x8c, 0xcf, 0xc6, 0x25, 0x03, 0xe9, 0x2c, 0xa5, 0x7f, 0xaa, 0x91, 0x4a, 0x21, 0xde, 0x00, 0x03, 0x72, 0x9a, 0xa0, 0xaa, 0x0d, 0x9e, 0x76
     };
-    auto digest = Crypto::Hash::SHA3_256::hash("0123456789012345678901234567890123456789012345678901234567890123abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcd"sv);
-    EXPECT(memcmp(result, digest.data, Crypto::Hash::SHA3_256::digest_size()) == 0);
+    auto digest = Crypto::Hash::digest(Crypto::Hash::HashKind::SHA3_256, "0123456789012345678901234567890123456789012345678901234567890123abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcd"sv.bytes());
+    EXPECT_EQ(digest.bytes(), ReadonlyBytes { result });
+}
+
+TEST_CASE(test_cSHAKE128_without_function_name_or_customization)
+{
+    u8 result[] {
+        0x58, 0x81, 0x09, 0x2d, 0xd8, 0x18, 0xbf, 0x5c, 0xf8, 0xa3, 0xdd, 0xb7, 0x93, 0xfb, 0xcb, 0xa7,
+        0x40, 0x97, 0xd5, 0xc5, 0x26, 0xa6, 0xd3, 0x5f, 0x97, 0xb8, 0x33, 0x51, 0x94, 0x0f, 0x2c, 0xc8
+    };
+    auto digest = TRY_OR_FAIL(Crypto::Hash::SHAKE(Crypto::Hash::SHAKEKind::CSHAKE128).digest("abc"sv.bytes(), 256, {}, {}));
+    EXPECT_EQ(digest.bytes(), ReadonlyBytes { result });
+}
+
+// NIST SP 800-185 cSHAKE sample #1
+TEST_CASE(test_cSHAKE128_with_customization)
+{
+    u8 const data[] { 0x00, 0x01, 0x02, 0x03 };
+    u8 result[] {
+        0xc1, 0xc3, 0x69, 0x25, 0xb6, 0x40, 0x9a, 0x04, 0xf1, 0xb5, 0x04, 0xfc, 0xbc, 0xa9, 0xd8, 0x2b,
+        0x40, 0x17, 0x27, 0x7c, 0xb5, 0xed, 0x2b, 0x20, 0x65, 0xfc, 0x1d, 0x38, 0x14, 0xd5, 0xaa, 0xf5
+    };
+    auto digest = TRY_OR_FAIL(Crypto::Hash::SHAKE(Crypto::Hash::SHAKEKind::CSHAKE128).digest(data, 256, "Email Signature"sv.bytes(), {}));
+    EXPECT_EQ(digest.bytes(), ReadonlyBytes { result });
+}
+
+// NIST SP 800-185 cSHAKE sample #3
+TEST_CASE(test_cSHAKE256_with_customization)
+{
+    u8 const data[] { 0x00, 0x01, 0x02, 0x03 };
+    u8 result[] {
+        0xd0, 0x08, 0x82, 0x8e, 0x2b, 0x80, 0xac, 0x9d, 0x22, 0x18, 0xff, 0xee, 0x1d, 0x07, 0x0c, 0x48,
+        0xb8, 0xe4, 0xc8, 0x7b, 0xff, 0x32, 0xc9, 0x69, 0x9d, 0x5b, 0x68, 0x96, 0xee, 0xe0, 0xed, 0xd1,
+        0x64, 0x02, 0x0e, 0x2b, 0xe0, 0x56, 0x08, 0x58, 0xd9, 0xc0, 0x0c, 0x03, 0x7e, 0x34, 0xa9, 0x69,
+        0x37, 0xc5, 0x61, 0xa7, 0x4c, 0x41, 0x2b, 0xb4, 0xc7, 0x46, 0x46, 0x95, 0x27, 0x28, 0x1c, 0x8c
+    };
+    auto digest = TRY_OR_FAIL(Crypto::Hash::SHAKE(Crypto::Hash::SHAKEKind::CSHAKE256).digest(data, 512, "Email Signature"sv.bytes(), {}));
+    EXPECT_EQ(digest.bytes(), ReadonlyBytes { result });
+}
+
+TEST_CASE(test_cSHAKE128_with_function_name)
+{
+    u8 result[] {
+        0xd8, 0x02, 0x43, 0xb8, 0x42, 0x23, 0x2b, 0xe0, 0xbd, 0x24, 0x26, 0x7d, 0x41, 0x81, 0xc2, 0x5d,
+        0x69, 0xb2, 0x86, 0xf4, 0x3a, 0x85, 0xe1, 0xc6, 0xf3, 0x24, 0xdb, 0x04, 0x86, 0xae, 0x19, 0x26
+    };
+    auto digest = TRY_OR_FAIL(Crypto::Hash::SHAKE(Crypto::Hash::SHAKEKind::CSHAKE128).digest("hello"sv.bytes(), 256, {}, "KMAC"sv.bytes()));
+    EXPECT_EQ(digest.bytes(), ReadonlyBytes { result });
 }

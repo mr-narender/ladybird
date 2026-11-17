@@ -1381,7 +1381,8 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         //
         // 2. If element has a computed value of the display property that is table-cell, then return a
         //    UA-defined value.
-        // FIXME: Likely UA-defined value should not be 0.
+        // INTEROP: Like other engines, the UA-defined value is the block size of the cell when it is definite (see
+        //          TableFormattingContext::cell_block_size_is_definite_after_row_sizing), and 0 otherwise.
         //
         // 3. If element has a computed value of the height property that is not auto, then return element.
         //
@@ -1396,7 +1397,11 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         } else if facts.is_viewport() {
             Some(metrics.content_block_size())
         } else if facts.is_table_cell() {
-            Some(CssPixels::default())
+            Some(if metrics.has_definite_block_size() {
+                metrics.content_block_size()
+            } else {
+                CssPixels::default()
+            })
         } else if quirks_body_block.is_some() {
             quirks_body_block
         } else if !style.height().is_auto()
@@ -3992,8 +3997,10 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 let table_used_inline_size =
                     table_used.border_box_inline_size(table_used.uses_collapsing_borders_model());
                 let inline_size = if table_wrapper_inline_size_mode
-                    == formatting_context::TableWrapperInlineSizeMode::UseTableUsedInlineSizeIfNotAuto
-                    && !self.style(table_run.box_).width().is_auto()
+                    == formatting_context::TableWrapperInlineSizeMode::UseTableUsedInlineSize
+                    || (table_wrapper_inline_size_mode
+                        == formatting_context::TableWrapperInlineSizeMode::UseTableUsedInlineSizeIfNotAuto
+                        && !self.style(table_run.box_).width().is_auto())
                 {
                     table_used_inline_size
                 } else if matches!(available_space.inline_size, AvailableSize::Definite(_)) {
@@ -4052,16 +4059,6 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
 
     // 17.5.3 Table height algorithms
     // https://www.w3.org/TR/CSS22/tables.html#height-layout
-    pub(crate) fn compute_table_box_block_size_inside_wrapper(
-        &self,
-        sized: SizedBox<'_>,
-        available_space: AvailableSpace,
-        table_wrapper_constraints: ContainingBlockConstraints,
-    ) -> CssPixels {
-        self.measure_table_box_block_size_inside_wrapper(sized, available_space, table_wrapper_constraints)
-            .table_box_border_box_block_size
-    }
-
     pub(crate) fn measure_table_box_block_size_inside_wrapper(
         &self,
         sized: SizedBox<'_>,

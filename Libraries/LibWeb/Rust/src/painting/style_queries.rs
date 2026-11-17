@@ -195,6 +195,16 @@ pub(crate) fn has_layout_containment(arena: &impl PaintRead, node: NodeSlotId, s
     contained && containment_applies_to_display(arena, node, style)
 }
 
+/// Whether the box itself shows: it is visible, and not fully transparent unless an animation of its opacity or
+/// transform keeps its content for the compositor to reveal.
+pub(crate) fn is_visible(arena: &impl PaintRead, node: NodeSlotId) -> bool {
+    arena.node_style_if_live(node).is_some_and(|style| {
+        style.visibility() == crate::css::css_enums::visibility::VISIBLE
+            && (style.effects().opacity != 0.0
+                || arena.node_flags_if_live(node) & NodeFlag::HasAnimatedOpacityOrTransform as u32 != 0)
+    })
+}
+
 pub(crate) fn is_scroll_container(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     arena
         .node(node)
@@ -234,7 +244,11 @@ pub(crate) fn document_element_box_under(arena: &impl PaintRead, parent: NodeSlo
 
 pub(crate) fn node_is_root_element(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     let flags = arena.node_flags_if_live(node);
-    flags & NodeFlag::Anonymous as u32 == 0 && flags & NodeFlag::IsHtmlHtmlElement as u32 != 0
+    // NB: Only the document element is the root: An html element anywhere else, e.g. in a shadow tree, is an
+    //     ordinary element.
+    flags & NodeFlag::Anonymous as u32 == 0
+        && flags & NodeFlag::IsHtmlHtmlElement as u32 != 0
+        && flags & NodeFlag::IsDocumentElement as u32 != 0
 }
 
 fn style_establishes_fixed_positioning_containing_block(
@@ -442,6 +456,10 @@ pub(crate) fn is_transformable(arena: &impl PaintRead, node: NodeSlotId) -> bool
         && !node_facts::kind_is_text(kind)
         && kind != NodeKind::Viewport;
     let is_element_or_pseudo_element = is_dom_element || row.generated_for() != 0;
+    // NB: A table's wrapper box takes the transform of the table (see LayoutStyle::copy_table_properties).
+    if kind == NodeKind::TableWrapper {
+        return true;
+    }
     if is_element_or_pseudo_element && node_facts::kind_is_box(kind) {
         let Some(style) = row.style() else {
             return false;

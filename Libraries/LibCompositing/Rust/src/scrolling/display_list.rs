@@ -7,10 +7,11 @@
 //! Everything about a list that travels alongside its tape when it is sent to the Compositor.
 
 use super::ContextRef;
-use crate::display_list::builder::read_command;
+use crate::display_list::builder::{bounding_rect_computed_from_payload, read_command};
 use crate::display_list::commands::{DisplayListCommandType, PaintCaret};
 use crate::display_list::storage::DisplayListStorage;
 use crate::display_list::summary::{for_each_compositor_metadata, for_each_indexed_record};
+use crate::display_list::window::RecordedWindow;
 use libgfx_rust::{Color, IntRect};
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ pub struct DisplayList {
     async_scrolling_metadata: Option<AsyncScrollingMetadata>,
     surface_clear_color: Option<Color>,
     root_group_color: Color,
+    window: Option<RecordedWindow>,
 }
 
 impl DisplayList {
@@ -42,7 +44,17 @@ impl DisplayList {
             async_scrolling_metadata,
             surface_clear_color,
             root_group_color,
+            window: None,
         }
+    }
+
+    /// The list, which holds what shows in `window` rather than the whole document where it has one.
+    pub fn with_window(self, window: Option<RecordedWindow>) -> Self {
+        Self { window, ..self }
+    }
+
+    pub fn window(&self) -> Option<&RecordedWindow> {
+        self.window.as_ref()
     }
 
     pub fn storage(&self) -> &Arc<DisplayListStorage> {
@@ -84,7 +96,11 @@ impl DisplayList {
             &self.storage.summary().carets,
             |context, header, payload| {
                 let command = read_command::<PaintCaret>(payload);
-                visit(context, header.bounding_rect, &command);
+                visit(
+                    context,
+                    bounding_rect_computed_from_payload(header, payload).unwrap_or_default(),
+                    &command,
+                );
             },
         );
     }

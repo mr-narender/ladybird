@@ -608,6 +608,27 @@ static bool is_request_from_an_svg_image(Infrastructure::Request const& request)
 }
 
 // https://fetch.spec.whatwg.org/#concept-main-fetch
+// NB: This is step 10 of main fetch. The WebSocket opening handshake does not go through main fetch yet, so it runs this
+//     step on its own.
+void upgrade_request_to_https_for_known_hsts_host_if_appropriate(Page& page, Infrastructure::Request& request)
+{
+    // 10. Set request’s current URL’s scheme to "https" if all of the following conditions are true:
+    if (
+        // - request’s current URL’s scheme is "http"
+        request.current_url().scheme() == "http"sv
+        // - request’s current URL’s host is a domain
+        && request.current_url().host().has_value() && request.current_url().host()->is_domain()
+        // - Matching request’s current URL’s host per Known HSTS Host Domain Name Matching results in either a
+        //   superdomain match with an asserted includeSubDomains directive or a congruent match (with or without an
+        //   asserted includeSubDomains directive) [HSTS]
+        && ResourceLoader::is_known_hsts_host(page, request.current_url().host()->get<String>())
+        // FIXME: or DNS resolution for the request finds a matching HTTPS RR per section 9.5 of [SVCB].
+    ) {
+        request.current_url().set_scheme("https"sv);
+    }
+}
+
+// https://fetch.spec.whatwg.org/#concept-main-fetch
 GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParams const& fetch_params, Recursive recursive)
 {
     dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' with: fetch_params @ {}", &fetch_params);
@@ -672,19 +693,7 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
     }
 
     // 10. Set request’s current URL’s scheme to "https" if all of the following conditions are true:
-    if (
-        // - request’s current URL’s scheme is "http"
-        request->current_url().scheme() == "http"sv
-        // - request’s current URL’s host is a domain
-        && request->current_url().host().has_value() && request->current_url().host()->is_domain()
-        // - Matching request’s current URL’s host per Known HSTS Host Domain Name Matching results in either a
-        //   superdomain match with an asserted includeSubDomains directive or a congruent match (with or without an
-        //   asserted includeSubDomains directive) [HSTS]
-        && ResourceLoader::is_known_hsts_host(Bindings::principal_host_defined_page(realm), request->current_url().host()->get<String>())
-        // FIXME: or DNS resolution for the request finds a matching HTTPS RR per section 9.5 of [SVCB].
-    ) {
-        request->current_url().set_scheme("https"sv);
-    }
+    upgrade_request_to_https_for_known_hsts_host_if_appropriate(Bindings::principal_host_defined_page(realm), *request);
 
     auto get_response = GC::create_function<GC::Ref<PendingResponse>()>(GC::Heap::the(), GC::captures(realm, NonnullRefPtr { fetch_params }, fetch_params.controller(), request), [](auto& realm, NonnullRefPtr<Infrastructure::FetchParams const>& fetch_params, GC::Ref<Infrastructure::FetchController>& controller, NonnullRefPtr<Infrastructure::Request>& request) -> GC::Ref<PendingResponse> {
         dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' get_response() function");
@@ -2752,25 +2761,56 @@ GC::Ptr<Infrastructure::Body> adopt_navigation_response_body(JS::Realm& realm, I
 
     auto network_transport = Engine::NetworkTransportHandle::create(*request);
     body_pump->delivery_gate()->attach_transport(network_transport);
-    // The observer hears the body's end at most once.
+    auto& fetch_executor = *HTML::relevant_agent(realm.global_object()).fetch_executor;
+    Engine::Command::NavigationBodyAdopted adopted { network_transport, body_pump->delivery_gate() };
+    fetch_executor.post(move(adopted));
+
+    // The observer hears the body's end at most once. A stop the agent requests is reported in the call, unless the
+    // body ended first.
     auto network_settled = GC::make_root(on_network_settled);
-    network_transport->set_on_teardown([body_pump, network_settled](Requests::Request::TeardownReason reason) {
-        body_pump->handle_network_teardown(reason);
-        // A body that moves to another owner is reported there.
-        if (reason == Requests::Request::TeardownReason::Stopped)
-            network_settled->function()("Transferred navigation response was stopped"sv);
+    network_transport->set_on_stop_requested([network_settled] {
+        network_settled->function()("Transferred navigation response was stopped"sv);
     });
+    auto weak_network_transport = network_transport->make_weak_ptr<Engine::NetworkTransportHandle>();
+    auto take_stopped_report = [weak_network_transport]() -> Function<void()> {
+        auto handle = weak_network_transport.strong_ref();
+        if (!handle)
+            return {};
+        return handle->take_on_stop_requested();
+    };
+    network_transport->set_on_teardown([body_pump, take_stopped_report](Requests::Request::TeardownReason reason) {
+        body_pump->handle_network_teardown(reason);
+        auto report_stopped = take_stopped_report();
+        // A body that moves to another owner is reported there.
+        if (reason == Requests::Request::TeardownReason::Stopped && report_stopped)
+            report_stopped();
+    });
+
+    // Until a stop the agent requested reaches the request, the body takes none of its data, and ends as stopped if the
+    // request finishes first.
+    auto is_stop_requested = [weak_network_transport] {
+        auto handle = weak_network_transport.strong_ref();
+        return handle && handle->is_stop_requested();
+    };
 
     auto cross_origin_isolated_capability = Bindings::principal_host_defined_environment_settings_object(realm).cross_origin_isolated_capability();
     request->set_unbuffered_request_callbacks(
         [](NonnullRefPtr<HTTP::HeaderList>, Optional<u32>, Optional<String> const&, Requests::CacheState) { },
-        [body_pump](Requests::ResponseData data) {
+        [body_pump, is_stop_requested](Requests::ResponseData data) {
+            if (is_stop_requested())
+                return;
             body_pump->handle_network_data(move(data));
         },
         [body_pump](Core::ImmutableBytes data) {
             body_pump->set_cached_response_body(move(data));
         },
-        [body_pump, timing_info, cross_origin_isolated_capability, network_settled](u64, Requests::RequestTimingInfo const& request_timing_info, Optional<Requests::NetworkError> network_error) {
+        [body_pump, timing_info, cross_origin_isolated_capability, network_settled, is_stop_requested, take_stopped_report](u64, Requests::RequestTimingInfo const& request_timing_info, Optional<Requests::NetworkError> network_error) {
+            // A stop requested after the body ended reports nothing.
+            (void)take_stopped_report();
+            if (is_stop_requested()) {
+                body_pump->handle_network_teardown(Requests::Request::TeardownReason::Stopped);
+                return;
+            }
             if (network_error.has_value()) {
                 network_settled->function()("Transferred navigation response failed"sv);
                 body_pump->handle_network_error("Transferred navigation response failed"sv);
@@ -3057,6 +3097,7 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
     if (network_transport) {
         engine_record->report_network_activity(network_transport->request_id(), network_request_started(load_request, *request));
         body_pump->delivery_gate()->attach_transport(*network_transport);
+        engine_record->add_network_transport(*network_transport, *body_pump->delivery_gate());
         network_transport->set_on_teardown([body_pump = GC::Root { body_pump }](Requests::Request::TeardownReason reason) {
             body_pump->handle_network_teardown(reason);
         });

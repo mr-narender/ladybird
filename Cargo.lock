@@ -1871,6 +1871,7 @@ name = "libcrypto_rust"
 version = "0.1.0"
 dependencies = [
  "ak",
+ "subtle",
 ]
 
 [[package]]
@@ -2147,6 +2148,16 @@ dependencies = [
  "ladybird_allocator",
  "libhttp_rust",
  "liburl_rust",
+ "rustc-demangle",
+]
+
+[[package]]
+name = "libxml_rust"
+version = "0.1.0"
+dependencies = [
+ "ak",
+ "cbindgen",
+ "ladybird_allocator",
  "rustc-demangle",
 ]
 

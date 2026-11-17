@@ -351,8 +351,6 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     // NB: The toolbar is made before the rest of the window, so it learns of the session's downloads once it is all here.
     toolbar().update_downloads_button();
 
-    auto const& browser_options = Application::browser_options();
-
     // A restored window keeps the session row the store re-adopted for it.
     if (restored_session_window_id.has_value())
         m_session_window_id = restored_session_window_id;
@@ -470,7 +468,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     if (m_current_tab)
         focus_widget_for_tab(*m_current_tab).setFocus();
 
-    if (browser_options.devtools_port.has_value())
+    if (Application::the().devtools_port().has_value())
         on_devtools_enabled();
 }
 
@@ -738,7 +736,7 @@ void BrowserWindow::rebuild_bookmarks_menu()
 
 void BrowserWindow::on_devtools_enabled()
 {
-    m_devtools_banner->set_port(Application::browser_options().devtools_port.value_or(0));
+    m_devtools_banner->set_port(*Application::the().devtools_port());
     m_devtools_banner->show();
 }
 
@@ -832,7 +830,7 @@ Tab& BrowserWindow::create_restored_tab(RestoredSessionTab const& restored, int 
             .session_tab_id = restored.tab_id,
             .url = restored.url,
             .title = entry.has_value() && entry->title.has_value() ? qstring_from_ak_string(*entry->title) : qstring_from_ak_string(restored.url.serialize()),
-            .favicon = entry.has_value() && entry->favicon_png.has_value() ? icon_from_png(entry->favicon_png->bytes(), TAB_ICON_SIZE) : QIcon {},
+            .favicon = entry.has_value() && entry->favicon_png.has_value() ? favicon_from_png(entry->favicon_png->bytes(), TAB_ICON_SIZE) : QIcon {},
         };
         auto* tab = new Tab(this, AK::move(deferred_tab));
         tab->set_pinned(restored.pinned);
@@ -1472,6 +1470,16 @@ void BrowserWindow::update_menu_bar_window_control_icons()
     m_menu_bar_maximize_window_button->setIcon(create_chrome_icon(is_maximized ? ChromeIcon::WindowRestore : ChromeIcon::WindowMaximize, Theme::chrome_palette(*this)));
     m_menu_bar_maximize_window_button->setToolTip(is_maximized ? "Restore" : "Maximize");
     m_menu_bar_close_window_button->setIcon(create_chrome_icon(ChromeIcon::WindowClose, Theme::chrome_palette(*this)));
+}
+
+void BrowserWindow::window_control_buttons_changed()
+{
+    // A menu bar measures its corner widgets only when they are set, shown or hidden.
+    if (m_menu_bar_window_controls) {
+        for (auto corner : { Qt::TopLeftCorner, Qt::TopRightCorner })
+            menuBar()->setCornerWidget(menuBar()->cornerWidget(corner), corner);
+    }
+    m_tabs_container->window_control_buttons_changed();
 }
 
 void BrowserWindow::update_window_decoration_state()

@@ -96,15 +96,11 @@ struct PatternPaintStyle;
 namespace Web::Animations {
 
 class Animatable;
-class Animation;
-class AnimationEffect;
-class AnimationPlaybackEvent;
-class AnimationTimeline;
-class DocumentTimeline;
-class KeyframeEffect;
+class AnimationRef;
+class EffectRef;
+class KeyframeSetView;
 class NamedTimelines;
-class ScrollTimeline;
-class ViewTimeline;
+class TimelineView;
 
 }
 
@@ -279,7 +275,6 @@ class ContainerQuery;
 class ContentStyleValue;
 class CounterDefinitionsStyleValue;
 class CounterStyleStyleValue;
-class CSSAnimation;
 class CSSDescriptors;
 class CSSFontFaceRule;
 class CSSFontFeatureValuesRule;
@@ -287,9 +282,7 @@ class CSSFunctionRule;
 class CSSGroupingRule;
 class CSSImportRule;
 class CSSKeyframesRule;
-class CSSKeywordValue;
 class CSSNestedDeclarations;
-class CSSNumericValue;
 class CSSPositionTryDescriptors;
 class CSSRule;
 class CSSRuleList;
@@ -298,8 +291,6 @@ class CSSStyleProperties;
 class CSSStyleRule;
 class CSSStyleSheet;
 class StyleSheetState;
-class CSSStyleValue;
-class CSSUnitValue;
 class CursorStyleValue;
 class CustomIdentStyleValue;
 class DimensionStyleValue;
@@ -435,8 +426,6 @@ struct CustomPropertyRegistration;
 struct LogicalAliasMappingContext;
 struct RequiredInvalidationAfterStyleChange;
 
-// https://drafts.css-houdini.org/css-typed-om-1/#typedefdef-cssnumberish
-using CSSNumberish = Variant<double, GC::Ref<CSSNumericValue>>;
 using PaintOrderList = Array<PaintOrder, 3>;
 using StyleValueVector = Vector<ValueComparingNonnullRefPtr<StyleValue const>>;
 
@@ -1097,7 +1086,6 @@ class StorageManager;
 namespace Web::SVG {
 
 class Path;
-class SMILAnimation;
 class SMILTimeContainer;
 class SVGAnimatedEnumeration;
 class SVGAnimatedInteger;

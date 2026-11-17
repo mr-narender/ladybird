@@ -47,7 +47,6 @@
 namespace Web::Animations {
 
 struct AnimationUpdateContext;
-class KeyframeEffect;
 
 }
 
@@ -108,7 +107,12 @@ namespace Web::DOM {
 
 using ScrollIntoViewTarget = Variant<Element*, Range*>;
 
-void scroll_a_target_into_view(Layout::BegunRead const&, ScrollIntoViewTarget, Bindings::ScrollBehavior, Bindings::ScrollLogicalPosition block, Bindings::ScrollLogicalPosition inline_, GC::Ptr<Element> container = nullptr, GC::Ptr<WebIDL::Promise> promise = nullptr);
+enum class ScrollIntoViewMode {
+    Always,
+    IfNeeded,
+};
+
+void scroll_a_target_into_view(Layout::BegunRead const&, ScrollIntoViewTarget, Bindings::ScrollBehavior, Bindings::ScrollLogicalPosition block, Bindings::ScrollLogicalPosition inline_, GC::Ptr<Element> container = nullptr, GC::Ptr<WebIDL::Promise> promise = nullptr, ScrollIntoViewMode = ScrollIntoViewMode::Always);
 
 // https://html.spec.whatwg.org/multipage/custom-elements.html#upgrade-reaction
 // An upgrade reaction, which will upgrade the custom element and contains a custom element definition; or
@@ -486,8 +490,8 @@ public:
     void refresh_computed_style(Layout::BegunRead const&, Optional<CSS::PseudoElement>, CSS::InstalledStyle);
     // Install the custom properties beside a pseudo-element record the style engine derived.
     void install_engine_pseudo_element_custom_property_data(Layout::BegunRead const& read, CSS::PseudoElement, u64 environment);
-    void update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, Optional<CSS::PseudoElement>, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
-    void update_animated_properties_for_abstract_element(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement, Web::Animations::KeyframeEffect&, Web::Animations::AnimationUpdateContext&);
+    void update_animated_properties(Badge<Web::Animations::EffectRef> const&, Optional<CSS::PseudoElement>, Web::Animations::EffectRef const&, Web::Animations::AnimationUpdateContext&);
+    void update_animated_properties_for_abstract_element(Badge<Web::Animations::EffectRef> const&, DOM::AbstractElement, Web::Animations::EffectRef const&, Web::Animations::AnimationUpdateContext&);
 
     Optional<SyntheticPseudoElement&> get_synthetic_pseudo_element(CSS::PseudoElement) const;
     Optional<PseudoElement&> get_pseudo_element(CSS::PseudoElement) const;
@@ -747,7 +751,7 @@ public:
 
     // https://w3c.github.io/csswg-drafts/cssom-view-1/#dom-element-scrollintoview
     void scroll_into_view(Variant<bool, ScrollIntoViewOptions> const&, GC::Ptr<WebIDL::Promise>);
-    void scroll_into_view(ScrollIntoViewOptions const&, GC::Ptr<WebIDL::Promise>);
+    void scroll_into_view(ScrollIntoViewOptions const&, GC::Ptr<WebIDL::Promise>, ScrollIntoViewMode = ScrollIntoViewMode::Always);
 
     // https://www.w3.org/TR/wai-aria-1.2/#ARIAMixin
 #define __ENUMERATE_ARIA_ATTRIBUTE(name, attribute)      \
@@ -1205,7 +1209,7 @@ enum class ValidateAndExtractError : u8 {
     XMLNSNamespaceWithoutXMLNSPrefix,
 };
 
-ErrorOr<QualifiedName, ValidateAndExtractError> validate_and_extract(Optional<FlyString> namespace_, FlyString const& qualified_name, ValidationContext context);
+ErrorOr<QualifiedName, ValidateAndExtractError> validate_and_extract(Optional<Utf16FlyString> namespace_, Utf16FlyString const& qualified_name, ValidationContext context);
 GC::Ref<WebIDL::DOMException> validate_and_extract_error_to_dom_exception(ValidateAndExtractError);
 
 }

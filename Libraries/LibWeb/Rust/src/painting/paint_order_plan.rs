@@ -11,7 +11,8 @@
 //! are explicit references, so a consumer can record them, reuse them, or collect their order.
 
 use crate::layout::node_data::{NodeKind, NodeSlotId};
-use crate::painting::paint_read::PaintRead;
+use crate::layout::node_facts::{self, NodeShape};
+use crate::painting::paint_read::{PaintRead, PaintRow};
 use crate::painting::record::PaintPhase;
 use crate::painting::{node_painting, paint_order, style_queries};
 use smallvec::SmallVec;
@@ -23,10 +24,6 @@ pub(crate) enum StackingContextPaintPhase {
     Floats = 1,
     BackgroundAndBordersForInlineLevelAndReplaced = 2,
     Foreground = 3,
-}
-
-impl StackingContextPaintPhase {
-    pub(crate) const COUNT: usize = Self::Foreground as usize + 1;
 }
 
 const _: () = assert!(
@@ -56,6 +53,26 @@ impl PaintScope {
             kind: PaintScopeKind::PaintedAsStackingContext,
         }
     }
+
+    /// Whether every box the scope paints has the owner on its containing block chain, so that what the owner
+    /// gathers along that chain covers the whole scope. A walk below the owner only meets boxes laid out against it
+    /// when the owner forms the containing block of its children: an inline box or a table row does not. A stacking
+    /// context also paints the positioned descendants hoisted to it, and those are laid out against it only when
+    /// it establishes both positioning containing blocks.
+    pub(crate) fn paints_only_what_its_owner_contains(self, arena: &impl PaintRead) -> bool {
+        let Some(row) = arena.node(self.owner) else {
+            return false;
+        };
+        if row.kind() == NodeKind::Viewport {
+            return true;
+        }
+        if !node_facts::node_forms_containing_block_for_children(&row, row.style()) {
+            return false;
+        }
+        self.kind != PaintScopeKind::PaintedAsStackingContext
+            || !arena.paintable_data(self.owner).establishes_stacking_context
+            || style_queries::establishes_positioning_containing_blocks(arena, self.owner) == (true, true)
+    }
 }
 
 /// A producer of the scope's owner in paint order. A box phase is up to three producers of the
@@ -74,10 +91,54 @@ pub(crate) enum PaintProducer {
     ScopePreamble,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PaintOrderItem {
     Producer(PaintProducer),
     Scope(PaintScope),
+}
+
+/// A line root whose plain text is taller than this, in CSS pixels, has its text fragments planned one at a time, so
+/// that a recording of a window can leave out the lines far from it.
+const TALLEST_TEXT_PLANNED_IN_ONE_PIECE: i64 = 512;
+
+/// Whether the foreground of a box with lines of `content` is planned with a producer for each of its text fragments:
+/// where its lines interleave text with boxes, or where its lines of text reach further than may be painted in one
+/// piece.
+pub(crate) fn text_fragments_of_content_are_producers(content: &crate::layout::inline_content::InlineContent) -> bool {
+    if !content.items.is_empty() {
+        return true;
+    }
+    let (Some(first), Some(last)) = (content.lines.first(), content.lines.last()) else {
+        return false;
+    };
+    let top = first.rect.y.min(last.rect.y);
+    let bottom = (first.rect.y + first.rect.height).max(last.rect.y + last.rect.height);
+    !content.fragments.is_empty()
+        && bottom - top > crate::css::css_pixels::CssPixels::from_integer(TALLEST_TEXT_PLANNED_IN_ONE_PIECE)
+}
+
+/// Whether the foreground of a box with lines is planned the same for `content` as it was for `previous`, both as the
+/// box's row holds them: the same producers, in the same order.
+pub(crate) fn content_plans_same_foreground(
+    previous: &crate::layout::inline_content::InlineContent,
+    content: &crate::layout::inline_content::InlineContent,
+) -> bool {
+    let text_fragments_are_producers = text_fragments_of_content_are_producers(content);
+    if text_fragments_are_producers != text_fragments_of_content_are_producers(previous) {
+        return false;
+    }
+    // NB: Plain text has no items. Where its text fragments are producers, the plan lists every one of them.
+    if text_fragments_are_producers && content.items.is_empty() && content.fragments.len() != previous.fragments.len() {
+        return false;
+    }
+    previous.has_same_item_order(content)
+}
+
+pub(crate) fn text_fragments_are_producers(rows: &impl PaintRead, root: NodeSlotId) -> bool {
+    rows.committed_side_data(root)
+        .inline_content
+        .as_ref()
+        .is_some_and(|content| text_fragments_of_content_are_producers(content))
 }
 
 pub(crate) struct PaintScopePlan {
@@ -274,17 +335,29 @@ impl<R: PaintRead> PaintOrderBuilder<'_, R> {
             self.append_box_phase(PaintPhase::Foreground);
             return;
         }
-        let side = arena.committed_side_data(root);
-        let Some(content) = side.inline_content.as_ref().filter(|content| !content.items.is_empty()) else {
+        if !text_fragments_are_producers(arena, root) {
             self.append_box_phase(PaintPhase::Foreground);
             return;
-        };
+        }
+        let side = arena.committed_side_data(root);
+        let content = side
+            .inline_content
+            .as_ref()
+            .expect("text fragments are producers of a root with lines");
         self.items
             .push(PaintOrderItem::Producer(PaintProducer::ForegroundHitTest));
 
+        let filter = crate::painting::fragment_ownership::effective_filter(arena, paintable);
+        if content.items.is_empty() {
+            for index in 0..content.fragments.len() as u32 {
+                if filter.owns_fragment(index) {
+                    self.items
+                        .push(PaintOrderItem::Producer(PaintProducer::TextFragment(index)));
+                }
+            }
+        }
         // CSS 2.2 Appendix E, step 7.2: backgrounds, borders and text are
         // interleaved in each line. Layout retains that order alongside geometry.
-        let filter = crate::painting::fragment_ownership::effective_filter(arena, paintable);
         for item in &content.items {
             use crate::layout::inline_content::InlineItem;
             match *item {

@@ -35,7 +35,12 @@ CHECKED_SUFFIXES = {
 # This is intentionally exact. If a component goes down, tighten the baseline in
 # the same change. If it goes up, justify the architecture change here.
 ALLOWED_REALM_MENTIONS = {
-    "Animations": (5, 14, "animation callbacks/events and CSS value materialization still pass spec-selected realms"),
+    "Animations": (
+        2,
+        4,
+        "host callbacks of the Rust animation code take the realm it selects to read the current high resolution time, "
+        "find an animation's relevant global object and wrap elements",
+    ),
     "CSS": (
         7,
         11,

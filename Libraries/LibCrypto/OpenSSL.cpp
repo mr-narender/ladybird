@@ -22,6 +22,42 @@ ErrorOr<OpenSSL_PKEY> OpenSSL_PKEY::create()
     return OpenSSL_PKEY(OPENSSL_TRY_PTR(EVP_PKEY_new()));
 }
 
+OpenSSL_SharedPKEY::OpenSSL_SharedPKEY(OpenSSL_PKEY&& key)
+    : m_ptr(key.leak_ptr())
+{
+}
+
+OpenSSL_SharedPKEY::OpenSSL_SharedPKEY(OpenSSL_SharedPKEY const& other)
+    : m_ptr(other.m_ptr)
+{
+    if (m_ptr)
+        VERIFY(EVP_PKEY_up_ref(m_ptr) == 1);
+}
+
+OpenSSL_SharedPKEY::OpenSSL_SharedPKEY(OpenSSL_SharedPKEY&& other)
+    : m_ptr(exchange(other.m_ptr, nullptr))
+{
+}
+
+OpenSSL_SharedPKEY& OpenSSL_SharedPKEY::operator=(OpenSSL_SharedPKEY const& other)
+{
+    OpenSSL_SharedPKEY copy(other);
+    swap(m_ptr, copy.m_ptr);
+    return *this;
+}
+
+OpenSSL_SharedPKEY& OpenSSL_SharedPKEY::operator=(OpenSSL_SharedPKEY&& other)
+{
+    OpenSSL_SharedPKEY moved(move(other));
+    swap(m_ptr, moved.m_ptr);
+    return *this;
+}
+
+OpenSSL_SharedPKEY::~OpenSSL_SharedPKEY()
+{
+    EVP_PKEY_free(m_ptr);
+}
+
 ErrorOr<OpenSSL_MD_CTX> OpenSSL_MD_CTX::create()
 {
     return OpenSSL_MD_CTX(OPENSSL_TRY_PTR(EVP_MD_CTX_new()));
@@ -49,32 +85,14 @@ ErrorOr<UnsignedBigInteger> openssl_bignum_to_unsigned_big_integer(OpenSSL_BN co
     return UnsignedBigInteger::import_data(buf);
 }
 
-ErrorOr<StringView> hash_kind_to_openssl_digest_name(Hash::HashKind hash)
-{
-    switch (hash) {
-    case Hash::HashKind::MD5:
-        return "MD5"sv;
-    case Hash::HashKind::SHA1:
-        return "SHA1"sv;
-    case Hash::HashKind::SHA256:
-        return "SHA256"sv;
-    case Hash::HashKind::SHA384:
-        return "SHA384"sv;
-    case Hash::HashKind::SHA512:
-        return "SHA512"sv;
-    default:
-        return Error::from_string_literal("Unsupported hash kind");
-    }
-}
-
-ErrorOr<ByteBuffer> get_byte_buffer_param_from_key(OpenSSL_PKEY& key, char const* key_name)
+ErrorOr<ByteBuffer> get_byte_buffer_param_from_key(EVP_PKEY* key, char const* key_name)
 {
     size_t size;
-    OPENSSL_TRY(EVP_PKEY_get_octet_string_param(key.ptr(), key_name, nullptr, 0, &size));
+    OPENSSL_TRY(EVP_PKEY_get_octet_string_param(key, key_name, nullptr, 0, &size));
 
     auto buffer = TRY(ByteBuffer::create_uninitialized(size));
 
-    OPENSSL_TRY(EVP_PKEY_get_octet_string_param(key.ptr(), key_name, buffer.data(), buffer.size(), &size));
+    OPENSSL_TRY(EVP_PKEY_get_octet_string_param(key, key_name, buffer.data(), buffer.size(), &size));
     return buffer;
 }
 

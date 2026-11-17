@@ -17,6 +17,8 @@
 #include <AK/String.h>
 #include <AK/Utf16String.h>
 #include <AK/Vector.h>
+#include <LibCrypto/PK/MLDSA.h>
+#include <LibCrypto/PK/MLKEM.h>
 #include <LibGC/Root.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Color.h>
@@ -640,12 +642,23 @@ inline Vector<u8> ec_coordinate(u8 fill)
     return bytes;
 }
 
+// The base point of P-256, which EC key handles must hold a point on.
+inline Vector<u8> p256_base_point_x()
+{
+    return { 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98, 0xc2, 0x96 };
+}
+
+inline Vector<u8> p256_base_point_y()
+{
+    return { 0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f, 0x9e, 0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5 };
+}
+
 inline Vector<CryptoAlgorithmGolden> crypto_algorithm_goldens()
 {
     using Web::Crypto::KeyAlgorithmTag;
     auto secret_handle = handle_byte_buffer("0123456789abcdef"sv.bytes());
-    auto x = ec_coordinate(0x11);
-    auto y = ec_coordinate(0x22);
+    auto x = p256_base_point_x();
+    auto y = p256_base_point_y();
     Array<u8, 3> exponent { 0x01, 0x00, 0x01 }; // 65537
     Array<u8, 4> modulus { 0xC0, 0x00, 0x00, 0x01 };
 
@@ -660,18 +673,45 @@ inline Vector<CryptoAlgorithmGolden> crypto_algorithm_goldens()
     return goldens;
 }
 
+// ML-DSA and ML-KEM key handles must hold real keys, so these come from fixed seeds.
+inline ::Crypto::PK::MLDSA::KeyPairType mldsa_44_key_pair()
+{
+    Array<u8, 32> seed;
+    for (size_t i = 0; i < seed.size(); ++i)
+        seed[i] = i;
+    return MUST(::Crypto::PK::MLDSA::generate_key_pair(::Crypto::PK::MLDSA44, seed));
+}
+
+inline ::Crypto::PK::MLKEM::KeyPairType mlkem_512_key_pair()
+{
+    Array<u8, 64> seed;
+    for (size_t i = 0; i < seed.size(); ++i)
+        seed[i] = i;
+    return MUST(::Crypto::PK::MLKEM::generate_key_pair(::Crypto::PK::MLKEMSize::MLKEM512, seed));
+}
+
+template<typename PrivateKey>
+inline ByteBuffer seed_of(PrivateKey const& key)
+{
+    Array<u8, PrivateKey::seed_size> buffer;
+    return MUST(ByteBuffer::copy(MUST(key.seed(buffer))));
+}
+
 inline Vector<CryptoHandleGolden> crypto_handle_goldens()
 {
     using Web::Crypto::HandleTag;
     auto buffer = "0123456789abcdef"sv.bytes();
     Array<u8, 3> exponent { 0x01, 0x00, 0x01 };
     Array<u8, 4> modulus { 0xC0, 0x00, 0x00, 0x01 };
-    auto x = ec_coordinate(0x11);
-    auto y = ec_coordinate(0x22);
+    auto x = p256_base_point_x();
+    auto y = p256_base_point_y();
     auto d = ec_coordinate(0x33);
-    auto seed = "seedseedseedseed"sv.bytes();
-    auto pub = "publicpublicpubl"sv.bytes();
-    auto priv = "privprivprivpriv"sv.bytes();
+    auto mldsa = mldsa_44_key_pair();
+    auto mldsa_expanded_key = MUST(mldsa.private_key.expanded_key());
+    auto mlkem = mlkem_512_key_pair();
+    auto mlkem_expanded_key = MUST(mlkem.private_key.expanded_key());
+    auto mldsa_seed = seed_of(mldsa.private_key);
+    auto mlkem_seed = seed_of(mlkem.private_key);
     auto okp = "okpokpokpokpokpo"sv.bytes();
     Array<ReadonlyBytes, 8> rsa_components { modulus, exponent, exponent, modulus, modulus, exponent, exponent, modulus };
 
@@ -683,10 +723,10 @@ inline Vector<CryptoHandleGolden> crypto_handle_goldens()
         alg_rsa_hashed_key_algorithm("RSASSA-PKCS1-v1_5"sv, 2048, exponent, "SHA-256"sv), handle_rsa_private_key(rsa_components) });
     goldens.append({ HandleTag::ECPublicKey, "public"sv, "verify"sv, alg_ec_key_algorithm("ECDSA"sv, "P-256"sv), handle_ec_public_key(x, y) });
     goldens.append({ HandleTag::ECPrivateKey, "private"sv, "sign"sv, alg_ec_key_algorithm("ECDSA"sv, "P-256"sv), handle_ec_private_key(d, {}, {}) });
-    goldens.append({ HandleTag::MLDSAPublicKey, "public"sv, "verify"sv, alg_key_algorithm("ML-DSA-44"sv), handle_single_buffer(5, pub) });
-    goldens.append({ HandleTag::MLDSAPrivateKey, "private"sv, "sign"sv, alg_key_algorithm("ML-DSA-44"sv), handle_triple_buffer(6, seed, pub, priv) });
-    goldens.append({ HandleTag::MLKEMPublicKey, "public"sv, "encapsulateKey"sv, alg_key_algorithm("ML-KEM-512"sv), handle_single_buffer(7, pub) });
-    goldens.append({ HandleTag::MLKEMPrivateKey, "private"sv, "decapsulateKey"sv, alg_key_algorithm("ML-KEM-512"sv), handle_triple_buffer(8, seed, pub, priv) });
+    goldens.append({ HandleTag::MLDSAPublicKey, "public"sv, "verify"sv, alg_key_algorithm("ML-DSA-44"sv), handle_single_buffer(5, mldsa.public_key.public_key()) });
+    goldens.append({ HandleTag::MLDSAPrivateKey, "private"sv, "sign"sv, alg_key_algorithm("ML-DSA-44"sv), handle_triple_buffer(6, mldsa_seed, mldsa.private_key.public_key(), mldsa_expanded_key) });
+    goldens.append({ HandleTag::MLKEMPublicKey, "public"sv, "encapsulateKey"sv, alg_key_algorithm("ML-KEM-512"sv), handle_single_buffer(7, mlkem.public_key.public_key()) });
+    goldens.append({ HandleTag::MLKEMPrivateKey, "private"sv, "decapsulateKey"sv, alg_key_algorithm("ML-KEM-512"sv), handle_triple_buffer(8, mlkem_seed, mlkem.private_key.public_key(), mlkem_expanded_key) });
     goldens.append({ HandleTag::OKPPublicKey, "public"sv, "verify"sv, alg_key_algorithm("Ed25519"sv), handle_single_buffer(9, okp) });
     goldens.append({ HandleTag::OKPPrivateKey, "private"sv, "sign"sv, alg_key_algorithm("Ed25519"sv), handle_single_buffer(10, okp) });
     return goldens;
@@ -702,10 +742,7 @@ inline GC::Ref<Web::Crypto::CryptoKey> build_live_crypto_key(StringView type, St
 // Fabricate RsaKeyAlgorithm directly to pin the encode-only tag-1 branch.
 inline GC::Ref<Web::Crypto::CryptoKey> build_live_crypto_key_with_rsa_key_algorithm(StringView type, StringView usage, StringView name, u32 modulus_length, ReadonlyBytes public_exponent, ReadonlyBytes modulus)
 {
-    auto exponent = ::Crypto::UnsignedBigInteger::import_data(public_exponent);
-    auto modulus_value = ::Crypto::UnsignedBigInteger::import_data(modulus);
-
-    auto key = Web::Crypto::CryptoKey::create(::Crypto::PK::RSAPublicKey { modulus_value, exponent });
+    auto key = Web::Crypto::CryptoKey::create(MUST(::Crypto::PK::RSAPublicKey::from_components(modulus, public_exponent)));
     key->set_type(type == "public"sv ? Web::Crypto::KeyType::Public : (type == "private"sv ? Web::Crypto::KeyType::Private : Web::Crypto::KeyType::Secret));
     key->set_extractable(false);
     key->set_usages({ usage == "verify"sv ? Web::Bindings::KeyUsage::Verify : Web::Bindings::KeyUsage::Sign });

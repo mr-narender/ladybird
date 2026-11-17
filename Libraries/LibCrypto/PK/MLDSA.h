@@ -6,8 +6,9 @@
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/Error.h>
-#include <LibCrypto/PK/PK.h>
+#include <LibCrypto/OpenSSL.h>
 
 namespace Crypto::PK {
 
@@ -19,82 +20,80 @@ enum MLDSASize {
 
 class MLDSAPublicKey {
 public:
-    MLDSAPublicKey(ByteBuffer m_public_key)
-        : m_public_key(move(m_public_key))
+    MLDSAPublicKey() = default;
+
+    static ErrorOr<MLDSAPublicKey> from_bytes(ReadonlyBytes);
+
+    MLDSASize size() const { return m_size; }
+    ByteBuffer const& public_key() const { return m_public_key; }
+
+    EVP_PKEY* openssl_key() const { return m_key.ptr(); }
+
+private:
+    MLDSAPublicKey(OpenSSL_SharedPKEY key, ByteBuffer public_key, MLDSASize size)
+        : m_key(move(key))
+        , m_public_key(move(public_key))
+        , m_size(size)
     {
     }
 
-    MLDSAPublicKey() = default;
-
-    ByteBuffer const& public_key() const { return m_public_key; }
-
-private:
+    OpenSSL_SharedPKEY m_key;
     ByteBuffer m_public_key;
+    MLDSASize m_size { MLDSA44 };
 };
 
 class MLDSAPrivateKey {
 public:
-    MLDSAPrivateKey(ByteBuffer seed, ByteBuffer public_key, ByteBuffer private_key)
-        : m_seed(move(seed))
-        , m_public_key(move(public_key))
-        , m_private_key(move(private_key))
-    {
-    }
-
     MLDSAPrivateKey() = default;
 
-    void clear_sensitive_data();
+    // An empty seed generates a new key.
+    static ErrorOr<MLDSAPrivateKey> generate(MLDSASize, ReadonlyBytes seed);
 
-    ByteBuffer const& seed() const { return m_seed; }
+    // A key that was given in the expandedKey form, which Web Crypto rejects once it has parsed it. It has no seed,
+    // public key or OpenSSL key, since OpenSSL would refuse an expanded key that is not valid.
+    static MLDSAPrivateKey in_expanded_key_form(MLDSASize);
+
+    MLDSASize size() const { return m_size; }
+    static constexpr size_t seed_size = 32;
+
+    bool has_seed() const { return m_key.ptr(); }
+    // NB: OpenSSL keeps the seed, so that no copy of it is left behind when a key is moved or replaced. It is written
+    //     into the caller's buffer, which the caller clears.
+    ErrorOr<ReadonlyBytes> seed(Bytes buffer) const;
     ByteBuffer const& public_key() const { return m_public_key; }
-    ByteBuffer const& private_key() const { return m_private_key; }
+    ErrorOr<ByteBuffer> expanded_key() const;
 
     ErrorOr<ByteBuffer> export_as_der() const;
 
+    EVP_PKEY* openssl_key() const { return m_key.ptr(); }
+
 private:
-    ByteBuffer m_seed;
+    MLDSAPrivateKey(OpenSSL_SharedPKEY key, ByteBuffer public_key, MLDSASize size)
+        : m_key(move(key))
+        , m_public_key(move(public_key))
+        , m_size(size)
+    {
+    }
+
+    OpenSSL_SharedPKEY m_key;
     ByteBuffer m_public_key;
-    ByteBuffer m_private_key;
+    MLDSASize m_size { MLDSA44 };
 };
 
-template<typename PubKey, typename PrivKey>
 struct MLDSAKeyPair {
-    PubKey public_key;
-    PrivKey private_key;
+    MLDSAPublicKey public_key;
+    MLDSAPrivateKey private_key;
 };
 
-class MLDSA : public PKSystem<MLDSAPrivateKey, MLDSAPublicKey> {
+class MLDSA {
 public:
-    using KeyPairType = MLDSAKeyPair<PublicKeyType, PrivateKeyType>;
+    using KeyPairType = MLDSAKeyPair;
 
     static ErrorOr<KeyPairType> parse_mldsa_key(MLDSASize, ReadonlyBytes der);
-    static ErrorOr<KeyPairType> generate_key_pair(MLDSASize, ByteBuffer seed = {});
-
-    MLDSA(MLDSASize size, PrivateKeyType const& priv_key, ByteBuffer context)
-        : m_size(size)
-        , m_context(move(context))
-    {
-        m_private_key = priv_key;
-        m_public_key = { priv_key.public_key() };
-    }
-
-    MLDSA(MLDSASize size, PublicKeyType const& pub_key, ByteBuffer context)
-        : m_size(size)
-        , m_context(move(context))
-    {
-        m_public_key = pub_key;
-    }
-
-    ErrorOr<ByteBuffer> sign(ReadonlyBytes message) override;
-
-    ErrorOr<ByteBuffer> encrypt(ReadonlyBytes) override { return Error::from_string_literal("Operation not supported"); }
-    ErrorOr<ByteBuffer> decrypt(ReadonlyBytes) override { return Error::from_string_literal("Operation not supported"); }
-    ErrorOr<bool> verify(ReadonlyBytes, ReadonlyBytes) override;
-    ByteString class_name() const override { return "ML-DSA"; }
-
-private:
-    MLDSASize m_size;
-    ByteBuffer m_context;
+    static ErrorOr<KeyPairType> generate_key_pair(MLDSASize, ReadonlyBytes seed = {});
 };
+
+ErrorOr<ByteBuffer> mldsa_sign(MLDSASize, MLDSAPrivateKey const&, ReadonlyBytes context, ReadonlyBytes message);
+ErrorOr<bool> mldsa_verify(MLDSASize, MLDSAPublicKey const&, ReadonlyBytes context, ReadonlyBytes message, ReadonlyBytes signature);
 
 }

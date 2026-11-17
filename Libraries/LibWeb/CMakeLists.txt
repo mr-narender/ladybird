@@ -2,18 +2,9 @@ include(libweb_generators)
 
 set(SOURCES
     Animations/Animatable.cpp
-    Animations/Animation.cpp
     Animations/AnimationEffect.cpp
-    Animations/AnimationPlaybackEvent.cpp
-    Animations/AnimationTimeline.cpp
-    Animations/TimeValue.cpp
-    Animations/DocumentTimeline.cpp
-    Animations/KeyframeEffect.cpp
     Animations/NamedTimelines.cpp
-    Animations/PseudoElementParsing.cpp
-    Animations/ScrollTimeline.cpp
-    Animations/TimelineRange.cpp
-    Animations/ViewTimeline.cpp
+    Animations/RecordHandles.cpp
     ARIA/AriaData.cpp
     ARIA/ARIAMixin.cpp
     ARIA/AttributeNames.cpp
@@ -66,9 +57,7 @@ set(SOURCES
     CSS/ContainerQuery.cpp
     CSS/CountersSet.cpp
     CSS/CustomPropertyRegistration.cpp
-    CSS/GeneratedContent.cpp
     CSS/CSS.cpp
-    CSS/CSSAnimation.cpp
     CSS/CSSDescriptors.cpp
     CSS/CSSFontFaceRule.cpp
     CSS/CSSFontFeatureValuesRule.cpp
@@ -83,7 +72,6 @@ set(SOURCES
     CSS/CSSStyleProperties.cpp
     CSS/CSSStyleRule.cpp
     CSS/CSSStyleSheet.cpp
-    CSS/CSSTransition.cpp
     CSS/ColorFunctionDescriptor.cpp
     CSS/CustomPropertyData.cpp
     CSS/Descriptor.cpp
@@ -178,7 +166,6 @@ set(SOURCES
     CSS/Supports.cpp
     CSS/SyntaxHighlighter/SyntaxHighlighter.cpp
     CSS/Time.cpp
-    CSS/TypedOM.cpp
     CSS/URL.cpp
     CSS/UpdateStyle.cpp
     CSS/ValueType.cpp
@@ -642,7 +629,6 @@ set(SOURCES
     IndexedDB/RustIntegration.cpp
     Infra/ByteSequences.cpp
     Infra/JSON.cpp
-    Internals/InternalAnimationTimeline.cpp
     Internals/InternalGamepad.cpp
     Internals/Internals.cpp
     Internals/InternalsBase.cpp
@@ -709,9 +695,8 @@ set(SOURCES
     Painting/PaintFacts.cpp
     Painting/ChromeWidget.cpp
     Painting/DocumentPaintState.cpp
-    Painting/HitTestDisplayList.cpp
+    Painting/HitTestQuery.cpp
     Painting/HitTestResult.cpp
-    Painting/CompositorAnimationEffectState.cpp
     Painting/PaintingRustBridge.cpp
     Painting/ResizeHandle.cpp
     Painting/Scrolling.cpp
@@ -762,7 +747,6 @@ set(SOURCES
     SVG/AttributeNames.cpp
     SVG/AttributeParsing.cpp
     SVG/Path.cpp
-    SVG/SMILAnimation.cpp
     SVG/SMILTimeContainer.cpp
     SVG/SVGAElement.cpp
     SVG/SVGAngle.cpp
@@ -1016,7 +1000,7 @@ target_sources(LibWeb PRIVATE $<TARGET_OBJECTS:LibJSObjects>)
 target_compile_definitions(LibWeb PRIVATE LibJS_EXPORTS)
 target_link_libraries(LibWeb PUBLIC LibCompositing LibWebCommon LibJSHeaders)
 
-target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibWebRTCClient LibXml2::LibXml2)
+target_link_libraries(LibWeb PRIVATE LibCore LibCrypto LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibAudio LibMedia LibMediaClient LibXML LibURL LibTLS LibRequests LibGC LibImageDecoderClient LibThreading LibWebRTCClient)
 
 # LibWeb still includes ANGLE's GLES headers for WebGL constants and types, but
 # the actual GL entry points live in the Compositor. Copy only ANGLE's compile
@@ -1061,6 +1045,7 @@ sync_rust_crate_ffi_headers(
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
         Compositor/RenderClockRustFFI.h
+        Animations/RustFFI.h
 )
 add_dependencies(LibWeb libweb_rust-ffi-headers)
 target_link_libraries(libweb_bindings_rust INTERFACE LibGfx LibGC LibUnicode)

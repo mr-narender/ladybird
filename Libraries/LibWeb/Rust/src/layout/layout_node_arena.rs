@@ -31,6 +31,7 @@ use crate::layout::node_data::{
 use crate::layout::node_facts::ReplacedContentFacts;
 use crate::layout::tree_mutation::HostCalls;
 use crate::painting::paint_read::{GeometryRead, PaintRead};
+use crate::painting::record::change_ticks::RowPaintChange;
 use crate::render_state::DocumentHost;
 use crate::stage::MainThread;
 use std::ffi::c_void;
@@ -1173,6 +1174,12 @@ pub(crate) struct LayoutNodeArena {
     style_records: ForkVec<u64>,
     /// How many of `style_records` name a record other than one the engine installed.
     rows_naming_uninstalled_records: u32,
+    /// The rows whose style positions them against an implicit anchor element: absolutely positioned, with
+    /// position-anchor auto, or normal and a position-area. refresh_style_flags() keeps it, which every pseudo-element
+    /// row's style passes through; a row a planned build stamps whole can be missing, but anchor candidate discovery
+    /// only asks about pseudo-element rows. Almost every document has none, so an empty set lets that discovery skip
+    /// the pseudo-elements of every box it places.
+    rows_positioned_against_implicit_anchor: CowSet<NodeSlotId>,
     /// The style record whose image resources the host was last owed for each row, or zero. A row whose record has not
     /// changed since holds those resources still, so a build that visits it again owes it nothing.
     image_resources_owed_records: ForkVec<u64>,
@@ -1230,7 +1237,11 @@ pub(crate) struct LayoutNodeArena {
     committed_link_holders: ForkVec<CommittedLinkHolder>,
     /// The boxes whose committed links a full commit met at the top of its pass, which no fragment holds.
     pass_level_committed_links: Vec<NodeSlotId>,
-    pub(crate) links_held_apart_from_their_containing_blocks: CowSet<NodeSlotId>,
+    pub(crate) links_held_apart_from_their_containing_blocks:
+        super::fragment_overflow::LinksHeldApartFromTheirContainingBlocks,
+    /// Whether a node left the document since a layout round last left layout up to date. Its boxes leave the rows at
+    /// once, while the committed layout of the boxes around them names them until that round lays those out again.
+    boxes_removed_ahead_of_layout: bool,
     pre_order_labels: ForkVec<u64>,
     free_list: ForkVec<u32>,
     /// A row a tree build made already, which the next allocation hands out: see [`Self::allocate_preallocated_row`].
@@ -1354,6 +1365,7 @@ impl LayoutNodeArena {
             slot_metadata: ForkVec::default(),
             style_records: ForkVec::default(),
             rows_naming_uninstalled_records: 0,
+            rows_positioned_against_implicit_anchor: Default::default(),
             image_resources_owed_records: ForkVec::default(),
             style_record_pins: ForkVec::default(),
             style_records_pinned_by_host: ForkVec::default(),
@@ -1378,6 +1390,7 @@ impl LayoutNodeArena {
             committed_link_holders: ForkVec::default(),
             pass_level_committed_links: Vec::new(),
             links_held_apart_from_their_containing_blocks: Default::default(),
+            boxes_removed_ahead_of_layout: false,
             pre_order_labels: ForkVec::default(),
             free_list: ForkVec::default(),
             preallocated_row: None,
@@ -1798,6 +1811,9 @@ impl LayoutNodeArena {
         }
         self.inline_boxes_lifted_out_of.remove(&id);
         self.out_of_flow_positioning_contained.remove(&id);
+        if !self.rows_positioned_against_implicit_anchor.is_empty() {
+            self.rows_positioned_against_implicit_anchor.remove(&id);
+        }
         self.pre_order_labels[index as usize] = 0;
         self.partial_relayout_boundary_roots.note_freed(id);
         self.metadata_mut(index).set_occupied(false);
@@ -2241,20 +2257,23 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn node_is_anchor_candidate(&self, node: NodeSlotId) -> bool {
-        super::node_facts::has_flag(self.data(node), NodeFlag::HasAnchorNames)
-            || self.dom_node_style_node(node).is_some_and(|element| {
-                self.style_node_tables.implicit_anchor_candidates.contains(&element)
-                    || self.bound_rows.pseudo_elements.get(&element).is_some_and(|rows| {
-                        rows.0.iter().any(|&row| {
-                            self.node_style_if_live(row).is_some_and(|style| {
-                                style.is_absolutely_positioned()
-                                    && (style.anchor().position_anchor_type == 2
-                                        || (style.anchor().position_anchor_type == 0
-                                            && !style.anchor().position_area.as_slice().is_empty()))
-                            })
-                        })
-                    })
-            })
+        if super::node_facts::has_flag(self.data(node), NodeFlag::HasAnchorNames) {
+            return true;
+        }
+        let implicit_anchors = &self.style_node_tables.implicit_anchor_candidates;
+        let implicitly_anchored_rows = &self.rows_positioned_against_implicit_anchor;
+        if implicit_anchors.is_empty() && implicitly_anchored_rows.is_empty() {
+            return false;
+        }
+        self.dom_node_style_node(node).is_some_and(|element| {
+            implicit_anchors.contains(&element)
+                || (!implicitly_anchored_rows.is_empty()
+                    && self
+                        .bound_rows
+                        .pseudo_elements
+                        .get(&element)
+                        .is_some_and(|rows| rows.0.iter().any(|row| implicitly_anchored_rows.contains(row))))
+        })
     }
 
     /// Replaces the elements registered under `anchor_name` in the tree scope hosted by
@@ -2790,7 +2809,7 @@ impl LayoutNodeArena {
             self.mark_row_for_relayout_after_style_change(style_node, slot);
         }
         self.note_style_visual_context_moves(slot, row.record_damage);
-        self.push_paint_damage_for_repaint(slot, crate::painting::record::damage::PaintDamage::ALL_PRODUCERS);
+        self.note_paint_change_for_repaint(slot, RowPaintChange::EVERYTHING_IT_PAINTS);
     }
 
     /// Notes the visual contexts a style move with `damage`, an `FfiStyleInvalidationField` word, moves for `slot`'s
@@ -3389,6 +3408,24 @@ impl LayoutNodeArena {
             && !self.layout_tree_update_marks_need_build()
             && !self.needs_full_layout_tree_update()
             && !self.has_partial_relayout_boundary_roots()
+    }
+
+    /// Whether the rows may hold boxes of nodes that left the document, which the committed layout of the boxes around
+    /// them still names: only a layout round that leaves layout up to date takes them out of it.
+    pub(crate) fn has_boxes_removed_ahead_of_layout(&self) -> bool {
+        self.boxes_removed_ahead_of_layout
+    }
+
+    pub(crate) fn note_boxes_removed_ahead_of_layout(&mut self) {
+        self.boxes_removed_ahead_of_layout = true;
+    }
+
+    /// Notes that a layout round ended, which took the boxes of the nodes that left the document out of the committed
+    /// layout where it left layout up to date.
+    pub(crate) fn note_layout_round_ended(&mut self) {
+        if self.layout_is_up_to_date(false) {
+            self.boxes_removed_ahead_of_layout = false;
+        }
     }
 
     pub(crate) fn layout_tree_update_marks_need_build(&self) -> bool {
@@ -4351,7 +4388,18 @@ impl LayoutNodeArena {
             style.transform().transform_style == crate::css::css_enums::transform_style::PRESERVE_3D;
         let had_preserve_3d_transform_style =
             super::node_facts::has_flag(self.data(slot), NodeFlag::HasPreserve3dTransformStyle);
+        // https://drafts.csswg.org/css-anchor-position-1/#default-anchor
+        let positioned_against_implicit_anchor = style.is_absolutely_positioned()
+            && (style.anchor().position_anchor_type == 2
+                || (style.anchor().position_anchor_type == 0 && !style.anchor().position_area.as_slice().is_empty()));
         self.set_node_flag(slot, NodeFlag::HasAnchorNames, has_anchor_names);
+        if positioned_against_implicit_anchor != self.rows_positioned_against_implicit_anchor.contains(&slot) {
+            if positioned_against_implicit_anchor {
+                self.rows_positioned_against_implicit_anchor.insert(slot);
+            } else {
+                self.rows_positioned_against_implicit_anchor.remove(&slot);
+            }
+        }
         self.refresh_insets_use_anchor_functions_flag(slot);
         self.set_node_flag(slot, NodeFlag::HasAnimatedOpacityOrTransform, false);
         self.set_node_flag(
@@ -4708,11 +4756,8 @@ impl LayoutNodeArena {
         };
         if changed {
             self.paint_fact_writes += 1;
-            use crate::painting::record::damage::PaintDamage;
-            self.push_paint_damage_for_repaint(
-                id,
-                PaintDamage::DRAW_BACKGROUND | PaintDamage::DRAW_BORDER | PaintDamage::SCOPE_PREAMBLE,
-            );
+            use crate::painting::record::change_ticks::RowPaintChange;
+            self.note_paint_change_for_repaint(id, RowPaintChange::DRAWING);
         }
         changed
     }
@@ -4751,7 +4796,7 @@ impl LayoutNodeArena {
         if !shows {
             return;
         }
-        let damage = facts.damage_when_changed();
+        let paint_change = facts.paint_change_when_changed();
         let rows: Vec<NodeSlotId> = self.rows_sharing_dom_node_with(id).collect();
         for row in rows {
             if self.replaced_paint_facts.get(&row) == Some(&facts) {
@@ -4759,7 +4804,7 @@ impl LayoutNodeArena {
             }
             Arc::make_mut(&mut self.replaced_paint_facts).insert(row, facts.clone());
             self.paint_fact_writes += 1;
-            self.push_paint_damage_for_repaint(row, damage);
+            self.note_paint_change_for_repaint(row, paint_change);
         }
     }
 
@@ -4818,8 +4863,8 @@ impl LayoutNodeArena {
             }
             self.write_shape(row).set_dom_paint_facts(facts);
             any_changed = true;
-            use crate::painting::record::damage::PaintDamage;
-            self.push_paint_damage_for_repaint(row, PaintDamage::ALL_HIT | PaintDamage::SCROLL_METADATA);
+            use crate::painting::record::change_ticks::RowPaintChange;
+            self.note_paint_change_for_repaint(row, RowPaintChange::HIT_TESTING | RowPaintChange::SCROLL_METADATA);
         }
         any_changed
     }
@@ -4933,7 +4978,7 @@ impl LayoutNodeArena {
         // Retaining compositor-animated content decides whether a non-invertible transform
         // still records its stacking context.
         if flag == NodeFlag::HasAnimatedOpacityOrTransform && updated != previous {
-            self.push_paint_damage(id, crate::painting::record::damage::PaintDamage::ELIGIBILITY);
+            self.note_paint_change(id, RowPaintChange::ORDER);
         }
     }
 
@@ -5481,6 +5526,7 @@ impl LayoutNodeArena {
             compensates_for_vertical_scroll,
         );
         if scroll_shift_inputs_changed {
+            self.request_ink_overflow_recalculation(id);
             self.note_visual_context_box_dirty(
                 id,
                 crate::painting::visual_context::dirty::VisualContextBoxDirtyKind::DefaultScrollShiftInputsChanged,
@@ -6370,7 +6416,7 @@ impl LayoutNodeArena {
 
     pub(crate) fn remove_child(&mut self, parent: NodeSlotId, child: NodeSlotId) {
         if self.paintable_row_count() > 0 {
-            self.push_enclosing_paint_order_damage(child);
+            self.note_enclosing_paint_order_change(child);
         }
         self.unlink_child(parent, child);
         self.invalidate_self_and_ancestors(
@@ -6711,10 +6757,7 @@ pub unsafe extern "C" fn render_state_set_node_style(
 /// observers the row holds are dropped, and the image provider it owns is told.
 pub(crate) fn prepare_row_for_detach(host_calls: HostCalls<'_>, arena: &mut LayoutNodeArena, row: NodeSlotId) {
     arena.pin_style_record_for_detachment(row);
-    arena.push_paint_damage(
-        row,
-        crate::painting::record::damage::PaintDamage::ALL_DRAW | crate::painting::record::damage::PaintDamage::ALL_HIT,
-    );
+    arena.note_paint_change(row, RowPaintChange::DRAWING | RowPaintChange::HIT_TESTING);
     host_calls.row_detached(row, arena.data(row).kind.get());
 }
 
@@ -7560,6 +7603,58 @@ mod tests {
         arena
             .free_subtree(cell)
             .destroy_shells_and_invoke_callbacks(&main_thread);
+        arena.set_style_engine(crate::css::style::StyleEngineHandle::null());
+    }
+
+    #[test]
+    fn an_element_is_an_anchor_candidate_while_a_pseudo_element_is_positioned_against_it() {
+        use crate::css::css_enums::positioning;
+        use crate::css::style::StyleEngine;
+        use crate::css::style::layout_style::LayoutScratchStyle;
+        use crate::css::style::tree::StyleNodeID;
+        use crate::layout::node_data::GENERATED_FOR_BEFORE;
+
+        let mut engine = StyleEngine::new();
+        let mut element = [0_u32];
+        engine.allocate_style_nodes(&mut element);
+        let element = StyleNodeID::from_raw(element[0]).unwrap();
+        let mut arena = LayoutNodeArena::new();
+        arena.set_style_engine(crate::css::style::StyleEngineHandle::from_raw(&raw mut engine));
+
+        let in_flow = LayoutScratchStyle::over_defaults(|_| {});
+        let positioned_against_implicit_anchor = LayoutScratchStyle::over_defaults(|style| {
+            style.set_position(positioning::ABSOLUTE);
+            // position-anchor: auto
+            style.anchor_mut().position_anchor_type = 2;
+        });
+        let principal = arena.allocate_unbound();
+        arena.stamp_dom_row(principal, NodeKind::BlockContainer, Some(element));
+        arena.set_node_style(principal, 0, Some(in_flow.style()));
+        arena.refresh_style_flags(principal);
+        let pseudo_element = arena.allocate_unbound();
+        arena.write_shape(pseudo_element).set_kind(NodeKind::BlockContainer);
+        arena.stamp_pseudo_element_box(pseudo_element, element, GENERATED_FOR_BEFORE);
+        arena.insert_child(principal, pseudo_element, NodeSlotId::INVALID);
+        let give_pseudo_element = |arena: &mut LayoutNodeArena, style: &LayoutScratchStyle| {
+            arena.set_node_style(pseudo_element, 0, Some(style.style()));
+            arena.refresh_style_flags(pseudo_element);
+        };
+
+        give_pseudo_element(&mut arena, &in_flow);
+        assert!(!arena.node_is_anchor_candidate(principal));
+        give_pseudo_element(&mut arena, &positioned_against_implicit_anchor);
+        assert!(arena.node_is_anchor_candidate(principal));
+        give_pseudo_element(&mut arena, &in_flow);
+        assert!(!arena.node_is_anchor_candidate(principal));
+        assert!(arena.rows_positioned_against_implicit_anchor.is_empty());
+
+        // A freed row stops counting.
+        give_pseudo_element(&mut arena, &positioned_against_implicit_anchor);
+        assert!(!arena.rows_positioned_against_implicit_anchor.is_empty());
+        arena
+            .free_subtree(principal)
+            .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
+        assert!(arena.rows_positioned_against_implicit_anchor.is_empty());
         arena.set_style_engine(crate::css::style::StyleEngineHandle::null());
     }
 

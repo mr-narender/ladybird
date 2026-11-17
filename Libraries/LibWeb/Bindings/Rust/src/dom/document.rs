@@ -4,21 +4,32 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+//! The members of Document that are implemented in Rust, https://dom.spec.whatwg.org/#interface-document
+
 use core::ffi::c_void;
+use core::ptr::NonNull;
 
 use ak::Utf16String;
-use libjs_rust::api::{Trace, Vm};
+use libjs_rust::api::{MarkedVec, Trace, Vm};
 use liburl_rust::origin::{Host, Origin};
 use liburl_rust::{FfiOrigin, FfiUrlHost, Url};
+use libweb_rust::web_animations::TimelineRecordRef;
 
+use crate::animations::animation::AnyAnimation;
+use crate::animations::animation_timeline::{AnyAnimationTimeline, timeline_object_of_record};
+use crate::animations::document_or_shadow_root;
+use crate::animations::document_timeline::DocumentTimeline;
+use crate::bindings::conversions::CppInterface;
 use crate::bindings::cpp_cell::{CppCell, WeakCppCell};
 use crate::bindings::interface::{Ref, cell_from_abi, cell_into_abi};
+use crate::bindings::{CallContext, WebIdlResult};
 use crate::html::navigable::CppNavigable;
 use crate::html::visibility_state::VisibilityState;
 use crate::navigation_timing::performance_navigation_timing::PerformanceNavigationTiming;
 use crate::permissions_policy::permissions_policy::PolicyControlledFeature;
 
 unsafe extern "C" {
+    fn web_animation_document_of_wrapper(document_wrapper: *mut c_void) -> *mut c_void;
     fn web_bindings_is_a_registrable_domain_suffix_of_or_is_equal_to(
         host_suffix_string: usize,
         original_host: *const FfiUrlHost,
@@ -202,4 +213,25 @@ pub(crate) fn is_a_registrable_domain_suffix_of_or_is_equal_to(
             &raw const original_host,
         )
     }
+}
+
+/// https://drafts.csswg.org/web-animations-1/#dom-document-timeline
+pub(crate) fn timeline(this: &CppInterface, cx: &mut CallContext) -> WebIdlResult<Ref<DocumentTimeline>> {
+    // The DocumentTimeline object representing the default document timeline.
+    // SAFETY: The wrapper is live, and LibWeb returns the document it wraps.
+    let document = NonNull::new(unsafe { web_animation_document_of_wrapper(this.wrapper().as_ptr().cast()) })
+        .expect("a wrapper of a Document wraps a document");
+    let record = TimelineRecordRef::default_of_document(document);
+    let AnyAnimationTimeline::DocumentTimeline(timeline) = timeline_object_of_record(cx.vm(), &record) else {
+        unreachable!("the default document timeline is a document timeline");
+    };
+    Ok(timeline)
+}
+
+/// https://drafts.csswg.org/web-animations-1/#dom-documentorshadowroot-getanimations
+pub(crate) fn get_animations<'vm>(
+    this: &CppInterface,
+    cx: &mut CallContext<'vm>,
+) -> WebIdlResult<MarkedVec<'vm, AnyAnimation>> {
+    document_or_shadow_root::get_animations(this, cx)
 }

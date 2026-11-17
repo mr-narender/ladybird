@@ -46,7 +46,6 @@ WEB_API CSSPixels content_height(Layout::Node const&);
 WEB_API CSSPixels border_box_width(Layout::Node const&);
 WEB_API CSSPixels border_box_height(Layout::Node const&);
 WEB_API BoxModelMetrics box_model(Layout::Node const&);
-WEB_API Optional<CSSPixels> anchor_resolved_size(Layout::Node const&, CSS::PropertyID);
 WEB_API CSSPixelRect transform_reference_box(Layout::Node const&);
 WEB_API Optional<CSSPixelRect> scrollable_overflow_rect(Layout::Node const&);
 WEB_API bool has_scrollable_overflow(Layout::Node const&);
@@ -115,8 +114,8 @@ WEB_API InvalidateDisplayList display_list_invalidation_of(Layout::RustFFI::FfiB
 
 WEB_API void set_needs_repaint(Layout::Node const&, InvalidateDisplayList = InvalidateDisplayList::PaintCommandsAndHitTestList);
 WEB_API void set_needs_repaint_in_subtree(Layout::Node const&);
-// Records the document's display list again without damaging any row, for a change that pushes the damage of the rows it
-// changes itself.
+// Records the document's display list again without stamping any row, for a change that stamps the rows it changes
+// itself.
 WEB_API void request_document_repaint(DOM::Document const&, InvalidateDisplayList);
 
 WEB_API void repaint_after_style_change(Layout::Node const&, CSS::RequiredInvalidationAfterStyleChange const&);

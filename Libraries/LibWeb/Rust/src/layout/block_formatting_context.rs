@@ -685,6 +685,10 @@ impl BlockMarginState {
 }
 
 /// What the probe for a stored in-flow layout found, and what storing the fresh layout needs.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a probe result lives on the stack for one child's layout, which boxing would give an allocation"
+)]
 enum InFlowReuse {
     Ineligible,
     Hit {
@@ -2899,12 +2903,17 @@ impl<'pass> BlockFormattingContext<'pass> {
         let mut available_inline_size_within_containing_block = available_space.inline_size.to_px_or_zero();
         if self.box_should_avoid_floats_because_it_establishes_fc(node) {
             // NB: The floats the box avoids are the ones beside its border box, as the check that moves it below them
-            //     measures them. And a box placed from the right has the floats on the right measured across the whole
-            //     line, not just over its own inline size from the left.
+            //     measures them. And a box placed from the right, or centered or right-aligned by a legacy alignment
+            //     value of its containing block, has the floats measured across the whole line, not just over its own
+            //     inline size from the left.
+            let legacy_alignment_uses_whole_line = matches!(
+                self.style(self.containing_block(node)).text_align(),
+                text_align::_LIBWEB_CENTER | text_align::_LIBWEB_RIGHT
+            );
             let border_box_rect = CssPixelRect {
                 x: content_position_in_root.x,
                 y: content_position_in_root.y - metrics.border_box_top(false),
-                width: if self.box_avoiding_floats_is_placed_from_right(node) {
+                width: if self.box_avoiding_floats_is_placed_from_right(node) || legacy_alignment_uses_whole_line {
                     available_inline_size_within_containing_block
                 } else {
                     content_inline_size
@@ -3620,6 +3629,16 @@ impl<'pass> BlockFormattingContext<'pass> {
             containing_block_rect_in_root_now,
             &mut probe,
         );
+        if let Some(forced) = input.sizing.forced_table_box_border_box_inline_size.get()
+            && container_facts.is_table_wrapper()
+            && style.display().is_table_inside()
+        {
+            // NB: A flex container sized the wrapper of this table box along its inline axis, and the table box takes
+            //     that size (see TableFormattingContext::used_table_inline_size).
+            let metrics = self.metrics_of(sized_child);
+            let offsets = metrics.border_box_left(false) + metrics.border_box_right(false);
+            probe.content_inline_size = Some((forced - offsets).max(CssPixels::default()));
+        }
         if let Some(content_inline_size) = probe.content_inline_size {
             self.update_cells_of(sized_child, |cells| cells.set_content_inline_size(content_inline_size));
         } else {
@@ -3758,6 +3777,11 @@ impl<'pass> BlockFormattingContext<'pass> {
                     ),
                     forced_min_border_box_block_size: if is_table_formatting_context {
                         input.sizing.forced_min_border_box_block_size
+                    } else {
+                        geometry::PackedOptionalCssPixels::from(None)
+                    },
+                    forced_table_box_border_box_inline_size: if is_table_formatting_context {
+                        input.sizing.forced_table_box_border_box_inline_size
                     } else {
                         geometry::PackedOptionalCssPixels::from(None)
                     },

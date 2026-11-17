@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::display_list::builder::{HEADER_SIZE, for_each_command, read_command, read_header};
+use crate::display_list::builder::{
+    HEADER_SIZE, bounding_rect_computed_from_payload, for_each_command, read_command, read_header,
+};
 use crate::display_list::commands::{
     ClipMode, ClipNodeIndex, DeclareMaskContent, DisplayListCommandRun, DisplayListCommandType, EffectNodeIndex,
 };
@@ -184,6 +186,14 @@ impl LayerPlan {
             .partition_point(|range| range.begin_offset <= record_offset)
             .saturating_sub(1);
         self.record_ranges_in_tape_order[range_index].layer as usize
+    }
+
+    pub fn layers_drawing_records_of(&self, run: &DisplayListCommandRun) -> impl Iterator<Item = usize> + '_ {
+        self.layers_of_records_in(run).map(|(_, layer)| usize::from(layer))
+    }
+
+    pub fn places_records_like(&self, other: &LayerPlan) -> bool {
+        self.record_ranges_in_tape_order == other.record_ranges_in_tape_order
     }
 
     /// Whether the records of `run` go into the same layers as those of `other_run`, an identical run of the list
@@ -594,7 +604,10 @@ fn media_layer_rejection(
     if !bounds.world.draw_matrix(run.context.spatial).is_2d_affine() {
         return Some(MediaLayerRejection::UnderTransformThatIsNot2DAffine);
     }
-    if bounds.ink_device_rect(run, header.bounding_rect).is_empty() {
+    let payload_start = record_offset as usize + HEADER_SIZE;
+    let payload = &inputs.tape[payload_start..payload_start + header.payload_size as usize];
+    let bounding_rect = bounding_rect_computed_from_payload(&header, payload).unwrap_or_default();
+    if bounds.ink_device_rect(run, bounding_rect).is_empty() {
         return Some(MediaLayerRejection::DrawsNothingVisible);
     }
     if !run_is_a_chunk_of_its_own(run_index) {
@@ -752,17 +765,19 @@ fn place_records_in_layers(
             if let Some((media_index, candidate)) =
                 media_iter.next_if(|(_, candidate)| candidate.record_offset == begin_offset)
             {
-                let media_bounds = bounds.ink_device_rect(run, header.bounding_rect);
+                let bounding_rect = bounding_rect_computed_from_payload(header, payload).unwrap_or_default();
+                let media_bounds = bounds.ink_device_rect(run, bounding_rect);
                 let window_server_shows_content = !matches!(candidate.content, LiveContent::CompositedContext(_));
                 let placement = window_server_shows_content.then(|| {
                     window_server_placement(inputs.tree, &bounds.world, inputs.viewport_rect, run, header, payload)
                 });
                 planned.add_media_layer(media_index, candidate.content, span, media_bounds, placement);
                 layer_of_previous_painted_record = LayersBeingPlanned::BASE_LAYER_INDEX;
-            } else if !header.has_bounding_rect {
+            } else if header.command_type.is_compositor_metadata() {
                 planned.append_records_to_layer(layer_of_previous_painted_record, span);
             } else {
-                let record_bounds = bounds.ink_device_rect(run, header.bounding_rect);
+                let bounding_rect = bounding_rect_computed_from_payload(header, payload).unwrap_or_default();
+                let record_bounds = bounds.ink_device_rect(run, bounding_rect);
                 layer_of_previous_painted_record = planned.place_painted_records(span, record_bounds);
             }
         });
@@ -923,6 +938,7 @@ pub fn build_layer_plan(inputs: &LayerPlanInputs<'_>) -> Result<LayerPlan, Unlay
 mod tests {
     use super::*;
     use crate::display_list::builder::{DisplayListBuilder, PendingInlineClip};
+    use crate::display_list::chunks::TapeChunks;
     use crate::display_list::commands::{
         CanvasId, CompositorBlockingWheelEventRegion, CompositorContextId, ContextRef, DisplayListCommand, DrawCanvas,
         DrawCompositedContext, FillRect, SpatialNodeIndex, VISUAL_VIEWPORT_NODE_INDEX,
@@ -1074,19 +1090,28 @@ mod tests {
         (old_list, old_plan, old_scroll_offsets): (&TestList, &LayerPlan, &[FloatPoint]),
         (new_list, new_plan, new_scroll_offsets): (&TestList, &LayerPlan, &[FloatPoint]),
     ) -> DisplayListDamage {
-        let old_summary = summarize(old_list.builder.bytes(), old_list.builder.command_runs());
-        let new_summary = summarize(new_list.builder.bytes(), new_list.builder.command_runs());
+        let (old_tape, old_runs) = (old_list.builder.bytes(), old_list.builder.command_runs());
+        let (new_tape, new_runs) = (new_list.builder.bytes(), new_list.builder.command_runs());
+        let (old_summary, new_summary) = (summarize(old_tape, old_runs), summarize(new_tape, new_runs));
+        let old_chunks = TapeChunks::with_a_chunk_per_run(old_tape, old_runs);
+        let new_chunks = TapeChunks::with_a_chunk_per_run(new_tape, new_runs);
+        let old_effect_clips = EffectClipPlan::new(tree, old_runs).unwrap();
+        let new_effect_clips = EffectClipPlan::new(tree, new_runs).unwrap();
         compute_display_list_damage(
             DisplayListFrame {
-                command_bytes: old_list.builder.bytes(),
-                command_runs: old_list.builder.command_runs(),
+                command_bytes: old_tape,
+                command_runs: old_runs,
+                chunks: &old_chunks,
+                effect_clip_plan: &old_effect_clips,
                 summary: &old_summary,
                 visual_context_tree: tree,
                 scroll_offsets: old_scroll_offsets,
             },
             DisplayListFrame {
-                command_bytes: new_list.builder.bytes(),
-                command_runs: new_list.builder.command_runs(),
+                command_bytes: new_tape,
+                command_runs: new_runs,
+                chunks: &new_chunks,
+                effect_clip_plan: &new_effect_clips,
                 summary: &new_summary,
                 visual_context_tree: tree,
                 scroll_offsets: new_scroll_offsets,

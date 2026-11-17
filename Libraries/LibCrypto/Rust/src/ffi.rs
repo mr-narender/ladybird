@@ -20,16 +20,6 @@ use super::{
 
 pub(super) type ReceiveBytes = unsafe extern "C" fn(*mut c_void, Span<'_, u8>);
 
-#[repr(u8)]
-#[derive(PartialEq, Eq)]
-#[allow(dead_code, reason = "constructed by the native decoder")]
-pub(super) enum Base64Status {
-    Success,
-    OutOfMemory,
-    InvalidBase64,
-    NonAscii,
-}
-
 #[repr(C)]
 pub(super) struct OptionalBytes<'a> {
     has_value: bool,
@@ -46,32 +36,20 @@ impl<'a> From<Option<&'a [u8]>> for OptionalBytes<'a> {
 }
 
 unsafe extern "C" {
-    pub(super) fn crypto_encode_base64url(bytes: Span<'_, u8>, receive: ReceiveBytes, state: *mut c_void) -> i32;
-    pub(super) fn crypto_decode_base64url(
-        raw: usize,
-        state: *mut c_void,
-        receive: ReceiveBytes,
-        error_message: &mut usize,
-    ) -> Base64Status;
     pub(super) fn crypto_decode_asn1_structure(
         data: Span<'_, u8>,
         structure: Asn1Structure,
         out: *mut c_void,
         all_consumed: &mut bool,
     ) -> usize;
-    pub(super) fn crypto_public_key_for_private_key(key: *const c_void, name: usize, named_curve: usize)
-    -> *mut c_void;
+    pub(super) fn crypto_public_key_for_private_key(key: *const c_void, name: usize) -> *mut c_void;
     pub(super) fn crypto_sha_digest(
         kind: ShaHashKind,
         data: Span<'_, u8>,
         state: *mut c_void,
         receive: ReceiveBytes,
     ) -> bool;
-    pub(super) fn crypto_cshake_validate_parameters(
-        output_length: u32,
-        customization: OptionalBytes<'_>,
-        function_name: OptionalBytes<'_>,
-    ) -> usize;
+    pub(super) fn crypto_cshake_validate_parameters(output_length: u32) -> usize;
     pub(super) fn crypto_cshake_digest(
         kind: CShakeKind,
         data: Span<'_, u8>,
@@ -87,8 +65,7 @@ unsafe extern "C" {
         message: Span<'_, u8>,
         state: *mut c_void,
         receive: ReceiveBytes,
-    ) -> ();
-    pub(super) fn crypto_timing_safe_compare(left: Span<'_, u8>, right: Span<'_, u8>) -> bool;
+    ) -> bool;
     pub(super) fn crypto_kmac_default_key_length(kind: KmacKind) -> u32;
     pub(super) fn crypto_kmac_validate_parameters(output_length: u32, customization: OptionalBytes<'_>) -> bool;
     pub(super) fn crypto_kmac_sign(
@@ -275,11 +252,10 @@ unsafe extern "C" {
         curve: EcCurve,
         key: *const c_void,
         digest: Span<'_, u8>,
-        error: &mut usize,
         r: *mut c_void,
         s: *mut c_void,
         receive: ReceiveBytes,
-    ) -> u8;
+    ) -> usize;
     pub(super) fn crypto_ec_verify(
         curve: EcCurve,
         key: *const c_void,
@@ -293,10 +269,9 @@ unsafe extern "C" {
         curve: EcCurve,
         key: *const c_void,
         public_key: *const c_void,
-        error: &mut usize,
         state: *mut c_void,
         receive: ReceiveBytes,
-    ) -> u8;
+    ) -> usize;
     pub(super) fn crypto_ec_key_info_has_public_key_oid(structure: Asn1Structure, key_info: *const c_void) -> bool;
     pub(super) fn crypto_ec_key_info_parameters(
         structure: Asn1Structure,
@@ -305,12 +280,8 @@ unsafe extern "C" {
     ) -> bool;
     pub(super) fn crypto_ec_private_key_info_parameters_match(key_info: *const c_void) -> bool;
     pub(super) fn crypto_ec_key_info_read_key(structure: Asn1Structure, key_info: *const c_void) -> *mut c_void;
-    pub(super) fn crypto_ec_key_from_coordinates(
-        x: Span<'_, u8>,
-        y: Span<'_, u8>,
-        coord_size: usize,
-        d: OptionalBytes<'_>,
-    ) -> *mut c_void;
+    pub(super) fn crypto_ec_key_from_coordinates(x: Span<'_, u8>, y: Span<'_, u8>, d: OptionalBytes<'_>)
+    -> *mut c_void;
     pub(super) fn crypto_ec_parse_raw_public_key(bytes: Span<'_, u8>) -> *mut c_void;
     pub(super) fn crypto_ec_key_is_valid(curve: EcCurve, key: *const c_void, valid: &mut bool) -> bool;
     pub(super) fn crypto_ec_export_der(
@@ -322,7 +293,6 @@ unsafe extern "C" {
     ) -> bool;
     pub(super) fn crypto_ec_export_uncompressed(key: *const c_void, state: *mut c_void, receive: ReceiveBytes) -> bool;
     pub(super) fn crypto_ec_export_public_coordinates(
-        curve: EcCurve,
         key: *const c_void,
         x: *mut c_void,
         y: *mut c_void,
@@ -409,9 +379,9 @@ unsafe extern "C" {
         oid: &mut Span<'_, u32>,
     ) -> ();
     pub(super) fn crypto_mldsa_key_info_read_private_key(key_info: *const c_void) -> *mut c_void;
-    pub(super) fn crypto_mldsa_read_public_key(bytes: Span<'_, u8>) -> *mut c_void;
+    pub(super) fn crypto_mldsa_read_public_key(size: MlDsaSize, bytes: Span<'_, u8>) -> *mut c_void;
     pub(super) fn crypto_mldsa_public_bytes(key: *const c_void, bytes: &mut Span<'_, u8>) -> ();
-    pub(super) fn crypto_mldsa_seed_bytes(key: *const c_void, bytes: &mut Span<'_, u8>) -> ();
+    pub(super) fn crypto_mldsa_seed_bytes(key: *const c_void, state: *mut c_void, receive: ReceiveBytes) -> bool;
     pub(super) fn crypto_mldsa_export_der(
         key: *const c_void,
         is_public: bool,
@@ -428,7 +398,8 @@ unsafe extern "C" {
     pub(super) fn crypto_mlkem_key_info_read_private_key(key_info: *const c_void) -> *mut c_void;
     pub(super) fn crypto_mlkem_read_public_key(bytes: Span<'_, u8>) -> *mut c_void;
     pub(super) fn crypto_mlkem_public_bytes(key: *const c_void, state: *mut c_void, receive: ReceiveBytes) -> ();
-    pub(super) fn crypto_mlkem_seed_bytes(key: *const c_void, bytes: &mut Span<'_, u8>) -> ();
+    pub(super) fn crypto_mlkem_seed_bytes(key: *const c_void, state: *mut c_void, receive: ReceiveBytes) -> bool;
+    pub(super) fn crypto_ml_private_key_has_seed(key: *const c_void) -> bool;
     pub(super) fn crypto_mlkem_export_der(
         key: *const c_void,
         is_public: bool,

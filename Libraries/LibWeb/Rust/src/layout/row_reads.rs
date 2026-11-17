@@ -35,9 +35,11 @@ pub(crate) struct RowSnapshot {
     image_maps: Arc<ImageMaps>,
     /// The visual context tree hit testing maps points through.
     pub(crate) visual_context_tree: Option<Arc<VisualContextTree>>,
+    /// The row the document's paint order starts at.
+    pub(crate) viewport: NodeSlotId,
     /// How far the arena's rows had been written when they were published.
     version: RowsVersion,
-    /// Whether every row's scrollable overflow was measured when the rows were published.
+    /// Whether every row's scrollable overflow and ink overflow were measured when the rows were published.
     overflow_is_settled: bool,
     /// The text rows that waited for their text to be rendered again when the rows were published, by slot index:
     /// every other text row carries the text it renders.
@@ -286,6 +288,7 @@ impl LayoutNodeArena {
     pub(crate) fn publish_row_snapshot(&mut self, settle_overflow: bool) -> RowSnapshot {
         if settle_overflow {
             self.settle_scrollable_overflow();
+            self.settle_ink_overflow();
         }
         let paintable = self.publish_rows();
         let bound = self.bound_rows_mut().publish();
@@ -294,8 +297,9 @@ impl LayoutNodeArena {
             bound,
             image_maps: self.image_map_areas().snapshot(),
             visual_context_tree: self.paint_state().visual_context.tree.clone(),
+            viewport: self.layout_root(),
             version: self.rows_version(),
-            overflow_is_settled: self.scrollable_overflow_is_settled(),
+            overflow_is_settled: self.scrollable_overflow_is_settled() && self.ink_overflow_is_settled(),
             text_awaiting_render: self.text_rows_awaiting_sync(),
         }
     }

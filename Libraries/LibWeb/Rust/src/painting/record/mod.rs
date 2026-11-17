@@ -9,9 +9,10 @@ use crate::painting::record::trace::{Observer, Operation};
 
 pub(crate) mod assemble;
 pub mod async_scroll_metadata;
-pub(crate) mod damage;
+pub(crate) mod change_ticks;
 pub(crate) mod frame_inputs;
 pub mod hit_test_items;
+pub(crate) mod ink_bounds;
 pub(crate) mod inputs;
 pub(crate) mod order_tree;
 pub mod paint;
@@ -24,18 +25,16 @@ pub mod svg_resources;
 pub mod trace;
 pub mod traversal;
 pub(crate) mod vector_images;
+pub(crate) mod window;
 
 use crate::css::css_enums;
 use crate::css::css_pixels::CssPixelRect;
-use crate::css::style::fast_hash::FastSet;
 use crate::layout::node_data::{NodeFlag, NodeSlotId};
 use crate::painting::border_radii::BorderRadii;
 use crate::painting::display_list::builder::{PendingInlineClip, RecordedDisplayList};
 use crate::painting::display_list::commands::{ContextRef, SpatialNodeIndex};
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
 use crate::painting::display_list::recorder::DisplayListRecorder;
-use crate::painting::hit_test::HitTestItem;
-use crate::painting::hit_test::HitTestList;
 use crate::painting::paintable_data::{InlineBoxPieceRecord, PaintableData};
 use crate::painting::record::frame_inputs::FrameInputs;
 use crate::painting::record::svg_resources::SvgResourceWalk;
@@ -47,17 +46,29 @@ pub(crate) use inputs::RecordingInputs;
 #[derive(Default)]
 pub struct RecordingOutput {
     pub recorded_structural_epoch: u64,
+    pub(crate) recorded_as_of: change_ticks::PaintGeneration,
     /// The visual context tree the recording was recorded against: the frozen frame's.
     pub visual_context_tree: Option<Arc<crate::painting::visual_context::VisualContextTree>>,
     pub(crate) frame_inputs: FrameInputs,
     // The area the root background painted: the viewport united with the root's overflow. Only
-    // the root's background reads it, so a change pushes that producer instead of a new frame.
+    // the root's background reads it, so a change stamps the root instead of asking for everything anew.
     pub(crate) root_background_canvas_rect: CssPixelRect,
-    // The bytes before the viewport's scope: the canvas, recorded outside the tree.
-    pub(crate) prologue_bytes: u32,
+    /// The name of the chunk the canvas was recorded into, outside the walked scopes, or none where it drew nothing.
+    pub(crate) prologue_id: Option<crate::painting::display_list::chunks::ChunkId>,
     pub root_group_color: libgfx_rust::Color,
-    pub hit_test_list: HitTestList,
+    /// The rows' hit-test items stamp of the frame the recording recorded: hit testing walks its rows, which place
+    /// other items in a frame with another stamp or another visual context tree.
+    pub hit_test_items_stamp: u64,
+    /// The chunks of the display list in paint order: the canvas, recorded outside the walked scopes, the chunks of
+    /// those, and the inspector's overlays.
+    pub(crate) chunks: Arc<[Arc<order_tree::RecordedChunk>]>,
+    /// The display list's tape: its chunks one after another.
     pub display_list: Arc<RecordedDisplayList>,
+    /// The scopes the recording walked, with what each part of them recorded, which the next recording reuses its
+    /// clean output by.
+    pub(crate) recorded_root: Option<Arc<order_tree::RecordedScope>>,
+    /// The part of the document the recording holds, or none where it holds all of it.
+    pub(crate) window: Option<Arc<window::RecordedWindow>>,
     pub has_blocking_wheel_event_listeners: bool,
     pub wheel_event_listener_state_generation: u64,
     pub is_identical_to_published_recording: bool,
@@ -82,17 +93,10 @@ pub(crate) struct RecordingResult {
     pub(crate) resources: resources::RecordingResourceManifest,
 }
 
-/// The hit-test items of the published recording, shared with the list that hit testing reads.
-pub struct PublishedHitTestItems {
-    pub items: Arc<Vec<HitTestItem>>,
-    /// The structural epoch of the visual context tree the items were recorded against, whose nodes they name.
-    pub structural_epoch: u64,
-}
-
-// What a recording shares with hit testing and with later recordings.
+// What a recording shares with later recordings.
 const _: () = {
     const fn assert_send_and_sync<T: Send + Sync>() {}
-    assert_send_and_sync::<PublishedHitTestItems>();
+    assert_send_and_sync::<order_tree::RecordedChunk>();
     assert_send_and_sync::<paint::text::SelectionStyleAnswer>();
 };
 
@@ -122,22 +126,26 @@ pub struct PaintRecorder<'a, O: Observer> {
     pub(crate) converter: DevicePixelConverter,
     pub(crate) svg_resource_walk: Option<SvgResourceWalk>,
     pub(crate) viewport: NodeSlotId,
-    // The published recording whose clean output this recording copies, when its inputs match.
+    ink_bounds_audit: ink_bounds::InkBoundsAudit,
+    // The published recording whose clean output this recording reuses, when its inputs match.
     pub(crate) source_recording: Option<Arc<RecordingOutput>>,
-    pub(crate) source_items: Option<Arc<PublishedHitTestItems>>,
+    // Set while a run records a placeholder for the records of an SVG image, which its chunk holds until the
+    // publication of the recording finishes it.
+    run_draws_vector_image_placeholders: bool,
     // Set while a producer records output that must record again every frame.
     live_producer: bool,
     // Set while a producer records output that depends on whether the window is focused.
     producer_reads_window_focus: std::cell::Cell<bool>,
     // Rows of the layout subtrees whose root moved: every producer of theirs records again.
-    pub(crate) moved_expansion: FastSet<NodeSlotId>,
     pub(crate) blocking_wheel_event_region_count: u32,
     pub(crate) records_per_box_wheel_hit_test_targets: bool,
     pub(crate) observer: O,
-    list: HitTestList,
     pub(crate) scratch: &'a mut scratch::RecordingScratch,
     pub(crate) resources: resources::RecordingResourceManifest,
     line_root_positions: Option<(NodeSlotId, crate::painting::paintable_geometry::LineRootPositions)>,
+    // The spaces of the frame's tree against the window of the recording, for one that does not hold the whole
+    // document.
+    pub(crate) window_spaces: Option<window::WindowSpaces<'a>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -233,6 +241,16 @@ impl<O: Observer> PaintRecorder<'_, O> {
         self.recorder.force_dark_settings()
     }
 
+    /// The placeholder a command that paints the SVG image of `request` names until publication patches in the id of
+    /// the records the host rendered the image as.
+    pub(crate) fn vector_image_placeholder(
+        &mut self,
+        request: vector_images::VectorImageRenderRequest,
+    ) -> crate::painting::display_list::commands::DisplayListResourceId {
+        self.run_draws_vector_image_placeholders = true;
+        self.resources.vector_image_placeholder(request)
+    }
+
     pub(crate) fn paint_vector_image(
         &mut self,
         source: vector_images::VectorImageSource,
@@ -244,17 +262,15 @@ impl<O: Observer> PaintRecorder<'_, O> {
     ) {
         use libgfx_rust::CompositingAndBlendingOperator;
         let geometry = vector_images::vector_image_render_geometry(dest_rect, accumulated_scale, has_active_view_box);
-        let display_list_id = self
-            .resources
-            .vector_image_placeholder(vector_images::VectorImageRenderRequest::new(
-                source,
-                geometry.css_width,
-                geometry.css_height,
-                geometry.raster_scale,
-                content_identity,
-                self.vector_image_color_scheme(source.owner()),
-                self.vector_image_force_dark(),
-            ));
+        let display_list_id = self.vector_image_placeholder(vector_images::VectorImageRenderRequest::new(
+            source,
+            geometry.css_width,
+            geometry.css_height,
+            geometry.raster_scale,
+            content_identity,
+            self.vector_image_color_scheme(source.owner()),
+            self.vector_image_force_dark(),
+        ));
         if compositing_and_blending_operator != CompositingAndBlendingOperator::Normal {
             let dest_device_rect = libgfx_rust::enclosing_int_rect(dest_rect);
             if dest_device_rect.is_empty() {
@@ -587,22 +603,11 @@ impl<O: Observer> PaintRecorder<'_, O> {
     }
 
     pub(crate) fn border_radii(&mut self, paintable: NodeSlotId) -> BorderRadii {
-        let Some(style) = self.source.node_style_if_live(paintable) else {
-            return BorderRadii::default();
-        };
-        crate::painting::visual_context::node_values::border_radii_data(style, self.source, paintable)
+        crate::painting::border_radii::border_radii(self.source, paintable)
     }
 
     pub(crate) fn piece_border_radii(&mut self, paintable: NodeSlotId, piece: &InlineBoxPieceRecord) -> BorderRadii {
-        let Some(style) = self.source.node_style_if_live(paintable) else {
-            return BorderRadii::default();
-        };
-        crate::painting::visual_context::node_values::piece_border_radii_data(
-            style,
-            piece.border_box_rect.width,
-            piece.border_box_rect.height,
-            piece.present_edges,
-        )
+        crate::painting::border_radii::piece_border_radii(self.source, paintable, piece)
     }
 
     pub(crate) fn fragment_border_box(
@@ -610,34 +615,14 @@ impl<O: Observer> PaintRecorder<'_, O> {
         paintable: NodeSlotId,
         index: usize,
     ) -> (crate::css::css_pixels::CssPixelRect, BorderRadii) {
-        let rect =
-            crate::painting::paintable_geometry::absolute_fragment_border_box_rect(self.source, paintable, index);
-        let Some(style) = self.source.node_style_if_live(paintable) else {
-            return (rect, BorderRadii::default());
-        };
-        let radii = crate::painting::visual_context::node_values::piece_border_radii_data(
-            style,
-            rect.width,
-            rect.height,
-            crate::painting::paintable_geometry::committed_fragment_present_edges(self.source, paintable, index),
-        );
-        (rect, radii)
+        crate::painting::border_radii::fragment_border_box_and_radii(self.source, paintable, index)
     }
 
     pub(crate) fn border_boxes_of_fragments(
         &mut self,
         paintable: NodeSlotId,
     ) -> smallvec::SmallVec<[(CssPixelRect, BorderRadii); 1]> {
-        let fragment_count = crate::painting::paintable_geometry::fragment_count(self.source, paintable);
-        if fragment_count > 1 && !crate::painting::node_painting::is_fragmented_inline(self.source, paintable) {
-            return (0..fragment_count)
-                .map(|index| self.fragment_border_box(paintable, index))
-                .collect();
-        }
-        smallvec::smallvec![(
-            crate::painting::paintable_geometry::absolute_border_box_rect(self.source, paintable),
-            self.border_radii(paintable),
-        )]
+        crate::painting::border_radii::border_boxes_and_radii_of_fragments(self.source, paintable)
     }
 
     pub(crate) fn base_paint_facts(&mut self, paintable: NodeSlotId) -> BasePaintFacts {
@@ -650,10 +635,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             return facts;
         };
         let effects = style.effects();
-        let retains_animated_content =
-            self.source.node_flags_if_live(paintable) & NodeFlag::HasAnimatedOpacityOrTransform as u32 != 0;
-        let is_visible = style.visibility() == crate::css::css_enums::visibility::VISIBLE
-            && (effects.opacity != 0.0 || retains_animated_content);
+        let is_visible = crate::painting::style_queries::is_visible(self.source, paintable);
         let empty_cells_property_applies = self.display(paintable).is_internal_table()
             && style.empty_cells() == crate::css::css_enums::empty_cells::HIDE
             && crate::painting::paint_order::first_paint_child(self.source, paintable).is_none();
@@ -776,9 +758,11 @@ impl<O: Observer> PaintRecorder<'_, O> {
             tile_surface_size_bits: [tile_surface_rect.width.to_bits(), tile_surface_rect.height.to_bits()],
             force_dark: self.recorder.force_dark_settings().is_some(),
         };
-        if let Some(records) = self.scratch.pattern_tile_records.get(&key) {
+        if let Some((records, draws_vector_image_placeholders)) = self.scratch.pattern_tile_records.get(&key) {
+            self.run_draws_vector_image_placeholders |= *draws_vector_image_placeholders;
             return records.clone();
         }
+        let run_draws_vector_image_placeholders = std::mem::take(&mut self.run_draws_vector_image_placeholders);
         let detached = self.recorder.begin_detached_records();
         // Pattern tiles exclude the root's own transform: patternTransform reaches the replay-side
         // tile shader instead, so the tiling grid repeats under it rather than the content scaling
@@ -787,7 +771,11 @@ impl<O: Observer> PaintRecorder<'_, O> {
             this.walk_svg_resource(pattern, root_transform, false, false, tile_surface_rect);
         });
         let records = Arc::new(self.recorder.finish_detached_records(detached));
-        self.scratch.pattern_tile_records.insert(key, records.clone());
+        let tile_draws_vector_image_placeholders = self.run_draws_vector_image_placeholders;
+        self.run_draws_vector_image_placeholders |= run_draws_vector_image_placeholders;
+        self.scratch
+            .pattern_tile_records
+            .insert(key, (records.clone(), tile_draws_vector_image_placeholders));
         records
     }
 }

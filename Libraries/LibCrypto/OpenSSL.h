@@ -9,7 +9,7 @@
 #include <AK/Error.h>
 #include <AK/Format.h>
 #include <LibCrypto/BigInt/UnsignedBigInteger.h>
-#include <LibCrypto/Hash/HashManager.h>
+#include <LibCrypto/Hash/Hash.h>
 #include <LibCrypto/OpenSSLForward.h>
 
 inline int openssl_print_errors(char const* str, size_t len, [[maybe_unused]] void* u)
@@ -98,6 +98,27 @@ class OpenSSL_PKEY {
 
 public:
     static ErrorOr<OpenSSL_PKEY> create();
+
+    friend class OpenSSL_SharedPKEY;
+};
+
+// OpenSSL never changes a key once it is built, so copies share one key.
+class OpenSSL_SharedPKEY {
+public:
+    OpenSSL_SharedPKEY() = default;
+    explicit OpenSSL_SharedPKEY(OpenSSL_PKEY&&);
+
+    OpenSSL_SharedPKEY(OpenSSL_SharedPKEY const&);
+    OpenSSL_SharedPKEY(OpenSSL_SharedPKEY&&);
+    OpenSSL_SharedPKEY& operator=(OpenSSL_SharedPKEY const&);
+    OpenSSL_SharedPKEY& operator=(OpenSSL_SharedPKEY&&);
+    ~OpenSSL_SharedPKEY();
+
+    // NB: OpenSSL takes a non-const key even to read from it.
+    EVP_PKEY* ptr() const { return m_ptr; }
+
+private:
+    EVP_PKEY* m_ptr { nullptr };
 };
 
 class OpenSSL_PKEY_CTX {
@@ -135,8 +156,6 @@ public:
 ErrorOr<OpenSSL_BN> unsigned_big_integer_to_openssl_bignum(UnsignedBigInteger const& integer);
 ErrorOr<UnsignedBigInteger> openssl_bignum_to_unsigned_big_integer(OpenSSL_BN const& bn);
 
-ErrorOr<StringView> hash_kind_to_openssl_digest_name(Hash::HashKind hash);
-
-ErrorOr<ByteBuffer> get_byte_buffer_param_from_key(OpenSSL_PKEY& key, char const* key_name);
+ErrorOr<ByteBuffer> get_byte_buffer_param_from_key(EVP_PKEY* key, char const* key_name);
 
 }

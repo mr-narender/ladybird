@@ -32,26 +32,21 @@
 #include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibJS/Console.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Iterator.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/Origin.h>
 #include <LibURL/Parser.h>
 #include <LibUnicode/Segmenter.h>
 #include <LibWeb/ARIA/AttributeNames.h>
-#include <LibWeb/Animations/Animation.h>
-#include <LibWeb/Animations/AnimationPlaybackEvent.h>
-#include <LibWeb/Animations/AnimationTimeline.h>
-#include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Animations/NamedTimelines.h>
-#include <LibWeb/Animations/TimeValue.h>
+#include <LibWeb/Animations/RecordHandles.h>
 #include <LibWeb/Bindings/CSS.h>
 #include <LibWeb/Bindings/Document.h>
 #include <LibWeb/Bindings/Sanitizer.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/Angle.h>
-#include <LibWeb/CSS/CSSAnimation.h>
-#include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
@@ -82,6 +77,7 @@
 #include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/OpacityValueStyleValue.h>
+#include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/TransformationStyleValue.h>
 #include <LibWeb/CSS/VisualViewport.h>
@@ -230,6 +226,7 @@
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
+#include <LibWeb/Layout/LayoutRustFFI.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Layout/TextNode.h>
@@ -243,9 +240,8 @@
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/ChromeWidget.h>
-#include <LibWeb/Painting/CompositorAnimationEffectState.h>
 #include <LibWeb/Painting/DocumentPaintState.h>
-#include <LibWeb/Painting/HitTestDisplayList.h>
+#include <LibWeb/Painting/HitTestQuery.h>
 #include <LibWeb/Painting/PaintFacts.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Painting/PaintingRustBridge.h>
@@ -254,9 +250,9 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
 #include <LibWeb/ResizeObserver/ResizeObserverEntry.h>
-#include <LibWeb/SVG/SMILAnimation.h>
 #include <LibWeb/SVG/SMILTimeContainer.h>
 #include <LibWeb/SVG/SVGAnimateMotionElement.h>
+#include <LibWeb/SVG/SVGAnimationElement.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 #include <LibWeb/SVG/SVGElement.h>
@@ -301,6 +297,20 @@
 
 namespace Web::DOM {
 
+// What dispatching the events of the pending animation event queue of a document asks of the document.
+struct PendingAnimationEventHost {
+    void* context;
+    void (*keep_alive)(void* context, Animations::RustFFI::AnimationCell const*);
+    void (*dispatch_at_element)(void* context, void* element, void* event);
+    void (*dispatch_time_event)(void* context, Animations::RustFFI::AnimationCell const*, Animations::RustFFI::FfiPendingAnimationEvent const*);
+};
+
+extern "C" {
+
+// Defined in Bindings/Rust/src/animations/animation.rs.
+void web_animation_dispatch_pending_animation_events(JSVM*, Document*, Animations::RustFFI::DocumentAnimations*, Animations::RustFFI::FfiTreeOrder, PendingAnimationEventHost const*);
+}
+
 void PendingFullscreenEvent::visit_edges(GC::Cell::Visitor& visitor) const
 {
     visitor.visit(element);
@@ -309,13 +319,6 @@ void PendingFullscreenEvent::visit_edges(GC::Cell::Visitor& visitor) const
 void Document::PendingScrollEvent::visit_edges(GC::Cell::Visitor& visitor) const
 {
     visitor.visit(event_target);
-}
-
-void Document::PendingAnimationEvent::visit_edges(GC::Cell::Visitor& visitor) const
-{
-    visitor.visit(event);
-    visitor.visit(animation);
-    visitor.visit(target);
 }
 
 struct Document::AccessibilityRecordCache {
@@ -816,13 +819,17 @@ Document::Document(Page& page, GC::Ref<EventTarget> relevant_global_event_target
     , m_style_scope(*this)
 {
     m_rust_custom_property_registry = CSS::ComputedValuesFFI::rust_custom_property_registry_create();
+    m_animations = Animations::RustFFI::animations_document_animations_create();
 
     m_is_decoded_svg = m_page->client().is_svg_page_client();
 
     HTML::main_thread_event_loop().register_document({}, *this);
 }
 
-Document::~Document() = default;
+Document::~Document()
+{
+    Animations::RustFFI::animations_document_animations_destroy(m_animations);
+}
 
 void Document::create_style_computer()
 {
@@ -1051,7 +1058,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_parser);
     visitor.visit(m_lazy_load_intersection_observer);
     visitor.visit(m_visual_viewport);
-    visitor.visit(m_default_timeline);
     visitor.visit(m_named_timelines);
     visitor.visit(m_scripts_to_execute_when_parsing_has_finished);
     visitor.visit(m_scripts_to_execute_in_order_as_soon_as_possible);
@@ -1076,7 +1082,6 @@ void Document::visit_edges(Cell::Visitor& visitor)
     for (auto& resource : m_css_image_resources_with_request_url_modifiers)
         resource.value->visit_edges(visitor);
 
-    visitor.visit(m_associated_animation_timelines);
     visitor.visit(m_smil_time_containers_to_begin);
     visitor.visit(m_animate_motion_elements_to_update);
     visitor.visit(m_list_of_available_images);
@@ -1101,16 +1106,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     if (m_writing_suggestion_controller)
         m_writing_suggestion_controller->visit_edges(visitor);
 
-    for (auto& event : m_pending_animation_event_queue) {
-        visitor.visit(event.event);
-        visitor.visit(event.animation);
-        visitor.visit(event.target);
-    }
-    for (auto& event : m_provisional_animation_event_queue) {
-        visitor.visit(event.event);
-        visitor.visit(event.animation);
-        visitor.visit(event.target);
-    }
+    Animations::RustFFI::animations_document_animations_visit_edges(m_animations, &visitor, Animations::visit_host_cell);
 
     for (auto& event : m_pending_fullscreen_events) {
         visitor.visit(event.element);
@@ -2042,7 +2038,7 @@ void Document::tear_down_layout_tree()
     auto* layout_root = layout_root_if_live(read);
     if (layout_root)
         layout_root->prepare_subtree_for_detach_from_layout_tree();
-    m_hit_test_display_list = nullptr;
+    m_hit_test_items_on_screen = {};
     m_chrome_widget_registry->clear();
     if (layout_root)
         layout_node_arena().free_subtree(read, Layout::Node::slot_id(layout_root));
@@ -2376,9 +2372,7 @@ void Document::begin_style_stabilization_epoch()
         return;
 
     HTML::main_thread_event_loop().defer_microtask_checkpoints();
-    VERIFY(m_provisional_animation_event_queue.is_empty());
-    VERIFY(m_animations_created_in_stabilization_epoch.is_empty());
-    style_computer().begin_transition_stabilization_epoch();
+    Animations::RustFFI::animations_document_animations_begin_style_stabilization_epoch(m_animations);
     m_style_stabilization_pass_count = 0;
     m_style_stabilization_has_style_reactions = false;
     m_animated_custom_property_changes_in_stabilization_epoch.clear();
@@ -2440,16 +2434,8 @@ void Document::end_style_stabilization_epoch()
     style_computer().commit_transition_stabilization_epoch();
     --m_style_stabilization_epoch_depth;
 
-    for (auto const& event : m_provisional_animation_event_queue) {
-        // An animation created and cancelled inside this epoch was never part of an externally
-        // committed style. Its cancellation is provisional too, so no observer may receive it.
-        if (m_animations_created_in_stabilization_epoch.contains(event.animation) && event.animation->is_idle())
-            continue;
-        m_pending_animation_event_queue.append(event);
+    for (auto committed = Animations::RustFFI::animations_document_animations_commit_provisional_events(m_animations); committed > 0; --committed)
         HTML::note_rendering_trace_event("animation events committed"sv);
-    }
-    m_provisional_animation_event_queue.clear();
-    m_animations_created_in_stabilization_epoch.clear();
     HTML::main_thread_event_loop().resume_microtask_checkpoints();
 }
 
@@ -2846,6 +2832,13 @@ void Document::invalidate_style_for_viewport_change(CSSPixelSize previous_viewpo
     }
 }
 
+// What sampling the effects that need an animated style update of a document holds.
+struct AnimatedStyleSample {
+    // NB: The animations of the effects stay alive for as long as the update holds them.
+    GC::RootVector<Animations::AnimationRef> animations;
+    Optional<Animations::AnimationUpdateContext> context;
+};
+
 void Document::sample_animation_effects_needing_style_update()
 {
     if (!m_needs_animated_style_update)
@@ -2857,77 +2850,24 @@ void Document::sample_animation_effects_needing_style_update()
     ScopeGuard clear_is_updating_animated_style = [&] {
         finish_animated_style_update();
     };
-
-    GC::RootVector<GC::Ref<Animations::Animation>> animations;
-    if (m_force_throttled_animation_style_update) {
-        for (auto& animation : m_associated_animations) {
-            if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
-                continue;
-            auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
-            // NB: Dirty idle effects still need to remove their last sampled values after cancellation.
-            if (animation.is_idle() && !m_effects_needing_animated_style_update.contains(effect))
-                continue;
-            animations.append(animation);
-        }
-    } else {
-        for (auto& effect : m_effects_needing_animated_style_update) {
-            auto animation = effect.associated_animation();
-            // NB: A canceled animation still needs to remove its last sampled values.
-            if (!animation)
-                continue;
-            animations.append(*animation);
-        }
-    }
-    m_effects_needing_animated_style_update.clear();
     m_needs_animated_style_update = false;
 
-    if (animations.is_empty()) {
+    AnimatedStyleSample sample { {}, {} };
+    Animations::RustFFI::FfiAnimatedStyleSampleHost host {
+        .context = &sample,
+        .keep_alive = [](void* context, Animations::RustFFI::AnimationCell const* animation) { Animations::keep_animation_alive_in(&static_cast<AnimatedStyleSample*>(context)->animations, animation); },
+        .begin = [](void* context) { static_cast<AnimatedStyleSample*>(context)->context.emplace(); },
+        .update = [](void* context, Animations::RustFFI::AnimationEffectCell const* effect) { Animations::EffectRef { *effect }.update_computed_properties(*static_cast<AnimatedStyleSample*>(context)->context); },
+        .end = [](void* context) { static_cast<AnimatedStyleSample*>(context)->context.clear(); },
+    };
+    auto outcome = Animations::RustFFI::animations_document_animations_sample_effects_needing_style_update(m_animations, m_force_throttled_animation_style_update, m_has_throttled_animation_style_update, &host);
+
+    if (!outcome.sampled) {
         m_force_throttled_animation_style_update = false;
-        // A compositor-driven effect can remain throttled when every dirty effect was cancelled before this sample.
-        // Preserve the flag so a later style or geometry read can still request a current main-thread sample.
         return;
     }
 
-    bool has_requested_observation_sample = any_of(animations, [](auto const& animation) {
-        return static_cast<Animations::KeyframeEffect&>(*animation->effect()).observation_sample_requested();
-    });
-
-    // A timeline script observed ahead of its current time in this task is sampled at that time too, so that a style
-    // read agrees with the time script read, however many reads the task makes.
-    GC::RootVector<GC::Ref<Animations::AnimationTimeline>> timelines_with_current_time_override;
-    bool const samples_at_observed_time = m_force_throttled_animation_style_update || has_requested_observation_sample;
-    for (auto& timeline : m_associated_animation_timelines) {
-        if (samples_at_observed_time || timeline->was_observed_ahead_in_current_task())
-            timelines_with_current_time_override.append(timeline);
-    }
-    for (auto& timeline : timelines_with_current_time_override)
-        timeline->set_current_time_override_for_style_sampling(timeline->current_time_for_observation());
-    ScopeGuard clear_current_time_overrides = [&] {
-        for (auto& timeline : timelines_with_current_time_override)
-            timeline->clear_current_time_override_for_style_sampling();
-    };
-
-    Animations::AnimationUpdateContext context;
-
-    quick_sort(animations, [](GC::Ref<Animations::Animation>& a, GC::Ref<Animations::Animation>& b) {
-        auto& a_effect = as<Animations::KeyframeEffect>(*a->effect());
-        auto& b_effect = as<Animations::KeyframeEffect>(*b->effect());
-        return Animations::KeyframeEffect::composite_order(a_effect, b_effect) < 0;
-    });
-
-    bool has_throttled_animation_style_update = m_force_throttled_animation_style_update ? false : m_has_throttled_animation_style_update;
-    for (auto& animation : animations) {
-        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation->effect());
-        bool observation_sample_requested = effect.consume_observation_sample_request();
-        if (effect.can_skip_per_frame_style_update()) {
-            has_throttled_animation_style_update = true;
-            if (!m_force_throttled_animation_style_update && !observation_sample_requested)
-                continue;
-        }
-        animation->effect()->update_computed_properties(context);
-    }
-
-    m_has_throttled_animation_style_update = has_throttled_animation_style_update;
+    m_has_throttled_animation_style_update = outcome.has_throttled_animation_style_update;
     if (m_force_throttled_animation_style_update)
         m_last_forced_throttled_animation_style_update_task_generation = relevant_settings_object().responsible_event_loop().task_generation();
     m_force_throttled_animation_style_update = false;
@@ -2938,13 +2878,8 @@ void Document::note_animations_that_can_skip_per_frame_style_updates()
     if (!m_needs_throttled_animation_style_update_check || m_has_throttled_animation_style_update || !layout_is_up_to_date())
         return;
     m_needs_throttled_animation_style_update_check = false;
-    for (auto& animation : m_associated_animations) {
-        auto* effect = as_if<Animations::KeyframeEffect>(animation.effect().ptr());
-        if (effect && effect->can_skip_per_frame_style_update()) {
-            note_throttled_animation_style_update();
-            return;
-        }
-    }
+    if (Animations::RustFFI::animations_document_animations_query(m_animations, Animations::RustFFI::DocumentAnimationsQuery::AnyCanSkipPerFrameStyleUpdate))
+        note_throttled_animation_style_update();
 }
 
 void Document::flush_throttled_animation_style_update()
@@ -2978,25 +2913,8 @@ void Document::flush_throttled_animation_style_update_for_node(Node const& node)
         auto const* element = as_if<Element>(target);
         if (!element)
             return;
-        for (auto const& animation : element->associated_animations_unordered()) {
-            if (!animation->effect() || !is<Animations::KeyframeEffect>(*animation->effect()))
-                continue;
-            auto& effect = static_cast<Animations::KeyframeEffect&>(*animation->effect());
-            // NB: An effect that changed since it was last sampled, such as one script seeked after an earlier read in
-            //     this task, is sampled for the read whether or not it can skip per-frame style updates now: the sample
-            //     decides that again, from a layout that may have moved since.
-            if (!m_is_updating_animated_style && m_effects_needing_animated_style_update.contains(effect)) {
-                effect.request_observation_sample();
-                continue;
-            }
-            if (!effect.can_skip_per_frame_style_update())
-                continue;
-            if (m_is_updating_animated_style) {
-                m_effects_needing_animated_style_update_after_current_update.set(effect);
-            } else {
-                effect.request_element_scoped_observation_sample(task_generation);
-            }
-        }
+        if (auto const* animations = element->element_animations_if_created())
+            Animations::RustFFI::animations_element_animations_request_observation_samples(animations, m_animations, m_is_updating_animated_style, task_generation);
     };
 
     // An animation changes what this read sees only if its target is the node itself, one of its
@@ -3032,7 +2950,7 @@ bool Document::run_empty_animation_style_update_for_testing(Badge<Internals::Int
 {
     VERIFY(!m_is_updating_animated_style);
     m_needs_animated_style_update = true;
-    m_effects_needing_animated_style_update.clear();
+    Animations::RustFFI::animations_document_animations_change_effect_sets(m_animations, Animations::RustFFI::EffectSetsChange::Clear);
     sample_animation_effects_needing_style_update();
     return m_has_throttled_animation_style_update;
 }
@@ -3076,9 +2994,25 @@ void Document::throttled_animation_visibility_changed()
     page().client().request_frame_for(*this);
 }
 
-void Document::set_needs_animated_style_update(Animations::KeyframeEffect& effect)
+void Document::set_aside_effects_needing_animated_style_update()
 {
-    m_effects_needing_animated_style_update.set(effect);
+    Animations::RustFFI::animations_document_animations_change_effect_sets(m_animations, Animations::RustFFI::EffectSetsChange::SetAside);
+}
+
+void Document::restore_effects_needing_animated_style_update()
+{
+    Animations::RustFFI::animations_document_animations_change_effect_sets(m_animations, Animations::RustFFI::EffectSetsChange::Restore);
+}
+
+void Document::clear_needs_animated_style_update()
+{
+    m_needs_animated_style_update = false;
+    Animations::RustFFI::animations_document_animations_change_effect_sets(m_animations, Animations::RustFFI::EffectSetsChange::Clear);
+}
+
+void Document::set_needs_animated_style_update(Animations::EffectRef const& effect)
+{
+    Animations::RustFFI::animations_document_effect_set_insert(m_animations, Animations::RustFFI::DocumentEffectSetKind::NeedingAnimatedStyleUpdate, &effect.record());
     if (m_needs_animated_style_update)
         return;
 
@@ -3096,14 +3030,7 @@ void Document::finish_animated_style_update()
 {
     VERIFY(m_is_updating_animated_style);
     m_is_updating_animated_style = false;
-
-    GC::RootVector<GC::Ref<Animations::KeyframeEffect>> effects;
-    for (auto& effect : m_effects_needing_animated_style_update_after_current_update)
-        effects.append(effect);
-    m_effects_needing_animated_style_update_after_current_update.clear();
-
-    for (auto& effect : effects)
-        effect->request_observation_sample();
+    Animations::RustFFI::animations_document_animations_change_effect_sets(m_animations, Animations::RustFFI::EffectSetsChange::FinishUpdate);
 }
 
 // What preparing the paint and hit testing properties, which the render state does as they are read, asks of the
@@ -3873,13 +3800,8 @@ WebIDL::ExceptionOr<GC::Ref<Element>> Document::create_element_ns(Optional<Utf16
 {
     // 1. Let (namespace, prefix, localName) be the result of validating and extracting namespace and qualifiedName
     //    given "element".
-    auto utf8_qualified_name = qualified_name.to_utf8();
-    auto fly_qualified_name = MUST(FlyString::from_utf8(utf8_qualified_name.bytes_as_string_view()));
-    auto fly_namespace = namespace_.map([](auto const& value) {
-        auto utf8 = value.to_utf8();
-        return MUST(FlyString::from_utf8(utf8.bytes_as_string_view()));
-    });
-    auto extracted_qualified_name_or_error = validate_and_extract(fly_namespace, fly_qualified_name, ValidationContext::Element);
+    auto fly_namespace = namespace_.map([](auto const& value) { return Utf16FlyString::from_utf16(value.utf16_view()); });
+    auto extracted_qualified_name_or_error = validate_and_extract(move(fly_namespace), Utf16FlyString::from_utf16(qualified_name.utf16_view()), ValidationContext::Element);
     if (extracted_qualified_name_or_error.is_error())
         return validate_and_extract_error_to_dom_exception(extracted_qualified_name_or_error.release_error());
     auto extracted_qualified_name = extracted_qualified_name_or_error.release_value();
@@ -4691,278 +4613,7 @@ Element* Document::find_a_potential_indicated_element(Utf16View fragment) const
 }
 
 // https://drafts.csswg.org/css-transitions-2/#event-dispatch
-void Document::dispatch_events_for_transition(GC::Ref<CSS::CSSTransition> transition)
-{
-    auto previous_phase = transition->previous_phase();
-
-    using Phase = CSS::CSSTransition::Phase;
-    // The transition phase of a transition is initially ‘idle’ and is updated on each
-    // animation frame according to the first matching condition from below:
-    auto transition_phase = Phase::Idle;
-
-    if (!transition->effect()) {
-        // If the transition has no associated effect,
-        if (!transition->current_time().has_value()) {
-            // If the transition has an unresolved current time,
-            //   The transition phase is ‘idle’.
-        } else if (transition->current_time()->value < 0) {
-            // If the transition has a current time < 0,
-            //   The transition phase is ‘before’.
-            transition_phase = Phase::Before;
-        } else {
-            // Otherwise,
-            //   The transition phase is ‘after’.
-            transition_phase = Phase::After;
-        }
-    } else if (transition->pending() && (previous_phase == Phase::Idle || previous_phase == Phase::Pending)) {
-        // If the transition has a pending play task or a pending pause task
-        // and its phase was previously ‘idle’ or ‘pending’,
-        //   The transition phase is ‘pending’.
-        transition_phase = Phase::Pending;
-    } else {
-        // Otherwise,
-        //   The transition phase is the phase of its associated effect.
-        transition_phase = Phase(to_underlying(transition->effect()->phase()));
-    }
-
-    enum class Interval : u8 {
-        Start,
-        End,
-        ActiveTime,
-    };
-
-    auto dispatch_event = [&](Utf16FlyString const& type, Interval interval) {
-        // The target for a transition event is the transition’s owning element. If there is no owning element,
-        // no transition events are dispatched.
-        if (!transition->effect() || !transition->owning_element().has_value())
-            return;
-
-        auto effect = transition->effect();
-
-        Animations::TimeValue elapsed_time = [&]() {
-            if (interval == Interval::Start)
-                return max(min(-effect->start_delay(), effect->active_duration()), Animations::TimeValue::create_zero(transition->timeline()));
-            if (interval == Interval::End)
-                return max(min(transition->associated_effect_end() - effect->start_delay(), effect->active_duration()), Animations::TimeValue::create_zero(transition->timeline()));
-            if (interval == Interval::ActiveTime) {
-                // The active time of the animation at the moment it was canceled calculated using a fill mode of both.
-                // FIXME: Compute this properly.
-                return Animations::TimeValue::create_zero(transition->timeline());
-            }
-            VERIFY_NOT_REACHED();
-        }();
-
-        double elapsed_time_output;
-
-        switch (elapsed_time.type) {
-        case Animations::TimeValue::Type::Milliseconds:
-            elapsed_time_output = elapsed_time.value / 1000;
-            break;
-        case Animations::TimeValue::Type::Percentage:
-            // FIXME: The spec doesn't specify how to handle this case
-            elapsed_time_output = 0;
-            break;
-        }
-
-        auto timeline = transition->timeline();
-
-        auto owning_element = transition->owning_element().value();
-        auto& global = HTML::relevant_global_object(owning_element.element().document());
-        auto pseudo_element = owning_element.pseudo_element().map([](auto it) {
-                                                                 return Utf16String::formatted("::{}", CSS::pseudo_element_name(it));
-                                                             })
-                                  .value_or({});
-        auto event = transition->create_event(owning_element.element().document(), type, elapsed_time_output, move(pseudo_element));
-        event->set_time_stamp(HighResolutionTime::current_high_resolution_time(global));
-        event->set_is_trusted(true);
-
-        append_pending_animation_event({
-            .event = event,
-            .animation = transition,
-            .target = transition->owning_element()->element(),
-            .scheduled_event_time = timeline && timeline->can_convert_a_timeline_time_to_an_origin_relative_time()
-                ? timeline->convert_a_timeline_time_to_an_origin_relative_time(timeline->current_time())
-                : Optional<double> {},
-        });
-    };
-
-    if (previous_phase == Phase::Idle) {
-        if (transition_phase == Phase::Pending || transition_phase == Phase::Before)
-            dispatch_event(HTML::EventNames::transitionrun, Interval::Start);
-
-        if (transition_phase == Phase::Active) {
-            dispatch_event(HTML::EventNames::transitionrun, Interval::Start);
-            dispatch_event(HTML::EventNames::transitionstart, Interval::Start);
-        }
-
-        if (transition_phase == Phase::After) {
-            dispatch_event(HTML::EventNames::transitionrun, Interval::Start);
-            dispatch_event(HTML::EventNames::transitionstart, Interval::Start);
-            dispatch_event(HTML::EventNames::transitionend, Interval::End);
-        }
-    } else if (previous_phase == Phase::Pending || previous_phase == Phase::Before) {
-        if (transition_phase == Phase::Active)
-            dispatch_event(HTML::EventNames::transitionstart, Interval::Start);
-
-        if (transition_phase == Phase::After) {
-            dispatch_event(HTML::EventNames::transitionstart, Interval::Start);
-            dispatch_event(HTML::EventNames::transitionend, Interval::End);
-        }
-    } else if (previous_phase == Phase::Active) {
-        if (transition_phase == Phase::After)
-            dispatch_event(HTML::EventNames::transitionend, Interval::End);
-
-        if (transition_phase == Phase::Before)
-            dispatch_event(HTML::EventNames::transitionend, Interval::Start);
-    } else if (previous_phase == Phase::After) {
-        if (transition_phase == Phase::Active)
-            dispatch_event(HTML::EventNames::transitionstart, Interval::End);
-
-        if (transition_phase == Phase::Before) {
-            dispatch_event(HTML::EventNames::transitionstart, Interval::End);
-            dispatch_event(HTML::EventNames::transitionend, Interval::Start);
-        }
-    }
-
-    if (transition_phase == Phase::Idle) {
-        if (previous_phase != Phase::Idle && previous_phase != Phase::After)
-            dispatch_event(HTML::EventNames::transitioncancel, Interval::ActiveTime);
-    }
-
-    transition->set_previous_phase(transition_phase);
-}
-
 // https://www.w3.org/TR/css-animations-2/#event-dispatch
-void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::Animation> animation)
-{
-    if (animation->is_smil_animation()) {
-        as<SVG::SMILAnimation>(*animation).animation_element().queue_time_events_if_necessary();
-        return;
-    }
-
-    if (animation->is_css_transition()) {
-        dispatch_events_for_transition(as<CSS::CSSTransition>(*animation));
-        return;
-    }
-
-    // Each time a new animation frame is established and the animation does not have a pending play task or pending
-    // pause task, the events to dispatch are determined by comparing the animation’s phase before and after
-    // establishing the new animation frame as follows:
-    auto effect = animation->effect();
-    if (!effect || !effect->is_keyframe_effect() || !animation->is_css_animation() || animation->pending())
-        return;
-
-    auto& css_animation = as<CSS::CSSAnimation>(*animation);
-
-    auto previous_phase = effect->previous_phase();
-    auto resolved_timing = effect->resolve_timing();
-    auto current_phase = resolved_timing.phase;
-    auto current_iteration = effect->current_iteration(resolved_timing).value_or(0.0);
-
-    auto owning_element = css_animation.owning_element();
-
-    if (!owning_element.has_value())
-        return;
-
-    auto dispatch_event = [&](Utf16FlyString const& name, Animations::TimeValue elapsed_time) {
-        double elapsed_time_output;
-        switch (elapsed_time.type) {
-        case Animations::TimeValue::Type::Milliseconds:
-            elapsed_time_output = elapsed_time.value / 1000;
-            break;
-        case Animations::TimeValue::Type::Percentage:
-            // FIXME: The spec doesn't specify how to handle this case
-            elapsed_time_output = 0;
-            break;
-        }
-
-        auto timeline = animation->timeline();
-
-        auto pseudo_element = owning_element->pseudo_element().map([](auto it) {
-                                                                  return Utf16String::formatted("::{}", CSS::pseudo_element_name(it));
-                                                              })
-                                  .value_or({});
-        auto& global = HTML::relevant_global_object(owning_element->element());
-        auto event = css_animation.create_event(owning_element->element().document(), name, elapsed_time_output, move(pseudo_element));
-        event->set_time_stamp(HighResolutionTime::current_high_resolution_time(global));
-        event->set_is_trusted(true);
-
-        append_pending_animation_event({
-            .event = event,
-            .animation = css_animation,
-            .target = owning_element->element(),
-            .scheduled_event_time = timeline && timeline->can_convert_a_timeline_time_to_an_origin_relative_time()
-                ? timeline->convert_a_timeline_time_to_an_origin_relative_time(timeline->current_time())
-                : Optional<double> {},
-        });
-    };
-
-    // For calculating the elapsedTime of each event, the following definitions are used:
-
-    // - interval start = max(min(-start delay, active duration), 0)
-    auto interval_start = [&]() {
-        return max(min(-effect->start_delay(), effect->active_duration()), Animations::TimeValue::create_zero(animation->timeline()));
-    };
-
-    // - interval end = max(min(associated effect end - start delay, active duration), 0)
-    auto interval_end = [&]() {
-        return max(min(effect->end_time() - effect->start_delay(), effect->active_duration()), Animations::TimeValue::create_zero(animation->timeline()));
-    };
-
-    switch (previous_phase) {
-    case Animations::AnimationEffect::Phase::Before:
-        [[fallthrough]];
-    case Animations::AnimationEffect::Phase::Idle:
-        if (current_phase == Animations::AnimationEffect::Phase::Active) {
-            dispatch_event(HTML::EventNames::animationstart, interval_start());
-        } else if (current_phase == Animations::AnimationEffect::Phase::After) {
-            dispatch_event(HTML::EventNames::animationstart, interval_start());
-            dispatch_event(HTML::EventNames::animationend, interval_end());
-        }
-        break;
-    case Animations::AnimationEffect::Phase::Active:
-        if (current_phase == Animations::AnimationEffect::Phase::Before) {
-            dispatch_event(HTML::EventNames::animationend, interval_start());
-        } else if (current_phase == Animations::AnimationEffect::Phase::Active) {
-            auto previous_current_iteration = effect->previous_current_iteration();
-            if (previous_current_iteration != current_iteration) {
-                // The elapsed time for an animationiteration event is defined as follows:
-
-                // 1. Let previous current iteration be the current iteration from the previous animation frame.
-
-                // 2. If previous current iteration is greater than current iteration, let iteration boundary be current iteration + 1,
-                //    otherwise let it be current iteration.
-                auto iteration_boundary = previous_current_iteration > current_iteration ? current_iteration + 1 : current_iteration;
-
-                // 3. The elapsed time is the result of evaluating (iteration boundary - iteration start) × iteration duration).
-                auto elapsed_time = effect->iteration_duration() * (iteration_boundary - effect->iteration_start());
-
-                dispatch_event(HTML::EventNames::animationiteration, elapsed_time);
-            }
-        } else if (current_phase == Animations::AnimationEffect::Phase::After) {
-            dispatch_event(HTML::EventNames::animationend, interval_end());
-        }
-        break;
-    case Animations::AnimationEffect::Phase::After:
-        if (current_phase == Animations::AnimationEffect::Phase::Active) {
-            dispatch_event(HTML::EventNames::animationstart, interval_end());
-        } else if (current_phase == Animations::AnimationEffect::Phase::Before) {
-            dispatch_event(HTML::EventNames::animationstart, interval_end());
-            dispatch_event(HTML::EventNames::animationend, interval_start());
-        }
-        break;
-    }
-
-    if (current_phase == Animations::AnimationEffect::Phase::Idle && previous_phase != Animations::AnimationEffect::Phase::Idle && previous_phase != Animations::AnimationEffect::Phase::After) {
-        // FIXME: Calculate a non-zero time when the animation is cancelled by means other than calling cancel()
-        auto cancel_time = animation->release_saved_cancel_time().value_or(Animations::TimeValue::create_zero(animation->timeline()));
-        dispatch_event(HTML::EventNames::animationcancel, cancel_time);
-    }
-
-    effect->set_previous_phase(current_phase);
-    effect->set_previous_current_iteration(current_iteration);
-}
-
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#scroll-to-the-fragment-identifier
 void Document::scroll_to_the_fragment(bool allow_text_directive_scroll)
 {
@@ -7759,11 +7410,7 @@ WebIDL::ExceptionOr<GC::Ref<Attr>> Document::create_attribute(Utf16FlyString con
 WebIDL::ExceptionOr<GC::Ref<Attr>> Document::create_attribute_ns(Optional<Utf16FlyString> namespace_, Utf16FlyString const& qualified_name)
 {
     // 1. Let (namespace, prefix, localName) be the result of validating and extracting namespace and qualifiedName given "attribute".
-    auto fly_namespace = namespace_.map([](auto const& value) {
-        return FlyString { value.view().to_utf8_but_should_be_ported_to_utf16() };
-    });
-    auto fly_qualified_name = FlyString { qualified_name.view().to_utf8_but_should_be_ported_to_utf16() };
-    auto extracted_qualified_name_or_error = validate_and_extract(move(fly_namespace), fly_qualified_name, ValidationContext::Attribute);
+    auto extracted_qualified_name_or_error = validate_and_extract(move(namespace_), qualified_name, ValidationContext::Attribute);
     if (extracted_qualified_name_or_error.is_error())
         return validate_and_extract_error_to_dom_exception(extracted_qualified_name_or_error.release_error());
     auto extracted_qualified_name = extracted_qualified_name_or_error.release_value();
@@ -8505,6 +8152,7 @@ void Document::update_for_history_step_application(NonnullRefPtr<HTML::SessionHi
             auto const& fragment_directive = entry->directive_state()->value();
 
             // 2. Set document's pending text directives to the result of parsing fragment directive.
+            invalidate_text_fragment_range_paint(m_text_fragment_ranges);
             m_text_fragment_ranges.clear();
             m_pending_text_directives = fragment_directive.has_value()
                 ? Optional<Vector<HTML::TextDirective>> { HTML::parse_the_fragment_directive(*fragment_directive) }
@@ -8812,13 +8460,26 @@ void Document::prune_image_resource_caches()
 }
 
 // https://www.w3.org/TR/web-animations-1/#dom-document-timeline
-GC::Ref<Animations::DocumentTimeline> Document::timeline()
+Animations::TimelineView Document::timeline()
 {
-    // The DocumentTimeline object representing the default document timeline. The default document timeline has an
-    // origin time of zero.
-    if (!m_default_timeline)
-        m_default_timeline = Animations::DocumentTimeline::create(*this, 0.0);
-    return *m_default_timeline;
+    return Animations::TimelineView { *Animations::RustFFI::animations_document_timeline(this) };
+}
+
+// https://www.w3.org/TR/web-animations-1/#timeline-associated-with-a-document
+Vector<Animations::TimelineView> Document::associated_animation_timelines() const
+{
+    Vector<Animations::TimelineView> timelines;
+    for (size_t index = 0;; ++index) {
+        auto const* timeline = Animations::RustFFI::animations_document_animations_timeline_at(m_animations, index);
+        if (!timeline)
+            return timelines;
+        timelines.append(Animations::TimelineView { *timeline });
+    }
+}
+
+bool Document::update_named_timelines_of_animations(Animations::RustFFI::FfiNamedTimelinesHost const& host)
+{
+    return Animations::RustFFI::animations_document_animations_update_named_timelines(m_animations, &host);
 }
 
 Animations::NamedTimelines& Document::named_timelines()
@@ -8826,16 +8487,6 @@ Animations::NamedTimelines& Document::named_timelines()
     if (!m_named_timelines)
         m_named_timelines = Animations::NamedTimelines::create(*this);
     return *m_named_timelines;
-}
-
-void Document::associate_with_timeline(GC::Ref<Animations::AnimationTimeline> timeline)
-{
-    m_associated_animation_timelines.set(timeline);
-}
-
-void Document::disassociate_with_timeline(GC::Ref<Animations::AnimationTimeline> timeline)
-{
-    m_associated_animation_timelines.remove(timeline);
 }
 
 int Document::compare_elements_in_tree_order_for_composite_order(Element& first, Element& second)
@@ -8847,6 +8498,21 @@ int Document::compare_elements_in_tree_order_for_composite_order(Element& first,
 
     auto compare_in_tree = [&] {
         HTML::note_rendering_trace_event("composite order compared by tree position"sv);
+        // NB: compare_document_position() orders elements of different trees by their addresses, which can disagree
+        //     with the order of elements within a tree. Elements of other trees than the document's, as of shadow trees
+        //     and removed subtrees, sort after the document's instead, by their trees, so that the order is total.
+        //     Elements of different documents sort by their documents, whichever document compares them.
+        auto& first_root = first.root();
+        auto& second_root = second.root();
+        if (&first_root != &second_root) {
+            if (&first.document() != &second.document())
+                return &first.document() < &second.document() ? -1 : 1;
+            if (&first_root == this)
+                return -1;
+            if (&second_root == this)
+                return 1;
+            return &first_root < &second_root ? -1 : 1;
+        }
         auto position = first.compare_document_position(second);
         if (position & Node::DOCUMENT_POSITION_FOLLOWING)
             return -1;
@@ -8885,41 +8551,9 @@ void Document::keep_element_tree_positions_across_attribute_change(u64 version_b
         m_element_tree_positions_dom_tree_version = dom_tree_version();
 }
 
-void Document::associate_with_animation(GC::Ref<Animations::Animation> animation)
+bool Document::has_associated_animations() const
 {
-    m_associated_animations.set(animation);
-    if (m_style_stabilization_epoch_depth > 0)
-        m_animations_created_in_stabilization_epoch.set(animation);
-}
-
-void Document::disassociate_with_animation(GC::Ref<Animations::Animation> animation)
-{
-    if (animation->effect() && is<Animations::KeyframeEffect>(*animation->effect())) {
-        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation->effect());
-        m_effects_needing_animated_style_update.remove(effect);
-        m_effects_needing_animated_style_update_after_current_update.remove(effect);
-    }
-    m_associated_animations.remove(animation);
-}
-
-static bool is_transform_family_property(CSS::PropertyID property_id)
-{
-    return first_is_one_of(property_id,
-        CSS::PropertyID::Translate,
-        CSS::PropertyID::Rotate,
-        CSS::PropertyID::Scale,
-        CSS::PropertyID::Transform);
-}
-
-using CompositorAnimationKeyframesByEffect = GC::RootHashMap<Animations::KeyframeEffect const*, NonnullOwnPtr<Painting::CompositorAnimationKeyframes>>;
-
-// The keyframes of an effect as the compositor animation builder reads them, built once for the
-// update pass however many animations and questions the pass takes from them.
-static Painting::CompositorAnimationKeyframes const& compositor_animation_keyframes(CompositorAnimationKeyframesByEffect& keyframes_by_effect, Animations::KeyframeEffect const& effect, Animations::Animation const& animation, DOM::AbstractElement target)
-{
-    return *keyframes_by_effect.ensure(&effect, [&] {
-        return make<Painting::CompositorAnimationKeyframes>(effect, animation, target);
-    });
+    return Animations::RustFFI::animations_document_animations_query(m_animations, Animations::RustFFI::DocumentAnimationsQuery::AssociatedCount) != 0;
 }
 
 // Whether a box inside an SVG paints or places itself by its bounding box, which includes the transforms of the boxes
@@ -8993,128 +8627,449 @@ static bool svg_transform_may_run_on_the_compositor(Element const& target, Layou
     return !has_non_scaling_stroke;
 }
 
-// Builds the compositor animation of one target kind for an effect the compositor could drive, and
-// keeps it pending with the effect. The checks here are the ones that read the animation objects; the
-// builder in Rust lowers and validates the keyframes.
-static Painting::CompositorAnimationEffectState::BuildOutcome build_compositor_animation(Layout::BegunRead const& read, Animations::KeyframeEffect& effect, Compositing::RustFFI::FfiVisualAnimationTargetKind target_kind, CompositorAnimationKeyframesByEffect& keyframes_by_effect)
-{
-    auto animation = effect.associated_animation();
-    if (!animation || animation->play_state() != Bindings::AnimationPlayState::Running)
-        return {};
-    bool is_initial_pending_css_transition = animation->pending()
-        && animation->has_pending_play_task()
-        && animation->is_css_transition()
-        && as<CSS::CSSTransition>(*animation).previous_phase() == CSS::CSSTransition::Phase::Idle;
-    if (animation->pending() && !is_initial_pending_css_transition)
-        return {};
-    auto timeline = animation->timeline();
-    if (!timeline || !timeline->is_monotonically_increasing())
-        return {};
-    auto phase = effect.phase();
-    if (phase != Animations::AnimationEffect::Phase::Before && phase != Animations::AnimationEffect::Phase::Active)
-        return {};
-    if ((!isinf(effect.iteration_count()) && effect.iteration_count() != 1) || effect.composite() != Bindings::CompositeOperation::Replace)
-        return {};
-    if (animation->playback_rate() <= 0 || !isfinite(animation->playback_rate()))
-        return {};
-    if (effect.start_delay().type != Animations::TimeValue::Type::Milliseconds
-        || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
-        || effect.iteration_duration().value <= 0)
-        return {};
-    if (phase == Animations::AnimationEffect::Phase::Before && effect.before_active_boundary_time() != effect.start_delay())
-        return {};
-    auto current_time = animation->current_time();
-    if (!current_time.has_value() || current_time->type != Animations::TimeValue::Type::Milliseconds)
-        return {};
-    if (effect.target_properties().is_empty())
-        return {};
-
-    bool targets_opacity = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::Opacity && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
-    bool targets_background_color = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::BackgroundColor && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor));
-    bool targets_filter = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::Filter && effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter));
-    bool targets_transform = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::Transform && any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); });
-    if (!targets_opacity && !targets_background_color && !targets_filter && !targets_transform)
-        return {};
-    if (any_of(effect.target_properties(), [&](auto const& property) { return !first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor, CSS::PropertyID::Filter) && !is_transform_family_property(property.id()); }))
-        return {};
-    auto target = effect.target_abstract_element();
-    if (!target.has_value())
-        return {};
-    if (target->element().namespace_uri() == Namespace::SVG) {
-        auto const* layout_node = target->unsafe_layout_node(read);
-        // NB: The compositor has no animations for the documents of SVG images.
-        if (!layout_node || (!targets_transform && !targets_opacity && !targets_filter) || target->document().is_decoded_svg())
-            return {};
-        if (targets_transform && !svg_transform_may_run_on_the_compositor(target->element(), *layout_node))
-            return {};
+// What the document answers and keeps for one compositor animation update, which the animation records in Rust ask it
+// of through their host.
+struct CompositorAnimationUpdatePass {
+    CompositorAnimationUpdatePass(Document& document, Layout::BegunRead const& read)
+        : document(document)
+        , read(read)
+    {
     }
-    auto monotonic_time_at_anchor_ms = [&]() -> Optional<double> {
-        if (!is_initial_pending_css_transition) {
-            auto frame_timestamp = target->document().last_animation_frame_timestamp();
-            if (!frame_timestamp.has_value())
-                return {};
-            return *frame_timestamp + target->document().relevant_settings_object().time_origin();
-        }
 
-        // OPTIMIZATION: A new CSS transition is play-pending until the next animation update. Start its compositor
-        //               descriptor at the style change event time without resolving the Animation's pending task.
-        auto style_change_event_time = Animations::TimeValue {
-            Animations::TimeValue::Type::Milliseconds,
-            as<CSS::CSSTransition>(*animation).style_change_event_time(),
+    GC::Ref<Document> document;
+    Layout::BegunRead const& read;
+    Layout::RustFFI::FfiViewportMapping viewport_mapping {};
+    GC::RootVector<Animations::AnimationRef> animations;
+    GC::RootHashMap<GC::Ref<Layout::Node>, bool> previous_content_retention;
+    GC::RootHashTable<GC::Ref<Layout::Node>> retained_this_pass;
+    GC::RootHashMap<GC::Ptr<Element>, CSSPixelRect> observation_target_rect_cache;
+    GC::RootHashTable<GC::Ref<Element>> elements_with_intersection_observation_descendants;
+    GC::RootHashTable<GC::Ref<Element>> elements_with_visibility_observation_descendants;
+    Vector<Compositing::RustFFI::NodeSlotId> layout_nodes_with_stale_forced_effects_layer;
+    Vector<Compositing::RustFFI::NodeSlotId> layout_nodes_with_stale_forced_background_color_frame;
+    // The target the keyframes of the compositor animation being built resolve their values against.
+    Optional<AbstractElement> keyframe_target;
+
+    static CompositorAnimationUpdatePass& of(void* context) { return *static_cast<CompositorAnimationUpdatePass*>(context); }
+
+    static AbstractElement target_of(Animations::RustFFI::FfiCompositorTarget const& target)
+    {
+        return AbstractElement {
+            *static_cast<Element*>(target.element),
+            target.has_pseudo_element ? Optional<CSS::PseudoElement> { static_cast<CSS::PseudoElement>(target.pseudo_element) } : Optional<CSS::PseudoElement> {},
         };
-        if (!timeline->can_convert_a_timeline_time_to_an_origin_relative_time())
-            return {};
-        auto origin_relative_time = timeline->convert_a_timeline_time_to_an_origin_relative_time(style_change_event_time);
-        if (!origin_relative_time.has_value())
-            return {};
-        return *origin_relative_time + target->document().relevant_settings_object().time_origin();
-    }();
-    if (!monotonic_time_at_anchor_ms.has_value())
-        return {};
-    auto const* layout_node = target->unsafe_layout_node(read);
-    if (!layout_node)
-        return {};
-    if (targets_transform) {
-        if ((!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Translate)) && layout_node->has_translate())
-            || (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Rotate)) && layout_node->has_rotate())
-            || (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Scale)) && layout_node->has_scale())
-            || (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Transform)) && layout_node->has_transformations())
-            || layout_node->transform_origin().z.to_px(CSSPixels { 0 }) != CSSPixels { 0 })
-            return {};
     }
-    auto row = Painting::committed_row(*layout_node);
-    if (!row.has_value())
-        return {};
 
-    auto const* key_frame_set = effect.key_frame_set();
-    if (!key_frame_set || key_frame_set->keyframes_by_key.size() < 2)
-        return {};
+    Layout::Node* node(Compositing::RustFFI::NodeSlotId slot) const { return document->layout_node_arena().node_if_live(read, slot); }
 
-    auto const& keyframes = compositor_animation_keyframes(keyframes_by_effect, effect, *animation, *target);
-    Painting::CompositorAnimationEffectState::TimingAnchor timing_anchor {
-        .monotonic_time_ms = *monotonic_time_at_anchor_ms,
-        .local_time_ms = current_time->value,
+    Vector<Compositing::RustFFI::NodeSlotId>& forced_frames(Animations::RustFFI::FfiCompositorFrameKind kind) const
+    {
+        return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? document->m_layout_nodes_with_forced_compositor_effects_layer : document->m_layout_nodes_with_forced_compositor_background_color_frame;
+    }
+
+    Vector<Compositing::RustFFI::NodeSlotId>& stale_forced_frames(Animations::RustFFI::FfiCompositorFrameKind kind)
+    {
+        return kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer ? layout_nodes_with_stale_forced_effects_layer : layout_nodes_with_stale_forced_background_color_frame;
+    }
+
+    bool transform_subtree_is_clipped_outside(Element const& animated_target, CSSPixelRect const& root_bounds) const
+    {
+        auto const* layout_node = animated_target.unsafe_layout_node(read);
+        if (!layout_node)
+            return false;
+        return Layout::RustFFI::layout_script_transform_subtree_is_clipped_outside(
+            layout_node->document_host(), Layout::Node::slot_id(layout_node), root_bounds,
+            viewport_mapping);
+    }
+
+    static Compositing::RustFFI::NodeSlotId layout_node(void* context, Animations::RustFFI::FfiCompositorTarget target)
+    {
+        return Layout::Node::slot_id(target_of(target).unsafe_layout_node(of(context).read));
+    }
+
+    static void note_target_layout_node(void* context, Compositing::RustFFI::NodeSlotId slot)
+    {
+        auto& pass = of(context);
+        if (auto* layout_node = pass.node(slot))
+            pass.previous_content_retention.ensure(*layout_node, [&] { return layout_node->retains_compositor_animated_content(); });
+    }
+
+    static void note_retained_layout_node(void* context, Compositing::RustFFI::NodeSlotId slot)
+    {
+        auto& pass = of(context);
+        if (auto* layout_node = pass.node(slot))
+            pass.retained_this_pass.set(*layout_node);
+    }
+
+    static bool visibility_is_observed(void* context, void* element)
+    {
+        return of(context).elements_with_visibility_observation_descendants.contains(*static_cast<Element*>(element));
+    }
+
+    static void const* resolved_keyframe_value(void* context, u16 property_id, void const* declared_value);
+    static bool prepare_compositor_animation(void* context, Animations::RustFFI::FfiCompositorAnimationPreparation const* preparation, void* request, void* keyframe_host);
+    static bool paint_is_offscreen(void* context, Animations::RustFFI::FfiCompositorTarget target, Animations::RustFFI::FfiOffscreenPaintQuery const* query);
+    static bool transform_affects_intersection_observation(void* context, void* animated_target, Animations::RustFFI::FfiTransformObservationQuery const* query, bool* requires_main_thread_sampling);
+
+    static bool transform_subtree_is_clipped_outside_viewport(void* context, void* element)
+    {
+        auto& pass = of(context);
+        auto viewport_bounds = CSSPixelRect { { 0, 0 }, pass.document->viewport_rect().size() };
+        return pass.transform_subtree_is_clipped_outside(*static_cast<Element*>(element), viewport_bounds);
+    }
+
+    static bool background_color_can_be_compositor_animated(void* context, Compositing::RustFFI::NodeSlotId slot)
+    {
+        auto* layout_node = of(context).node(slot);
+        return layout_node && Painting::rust_background_color_can_be_compositor_animated(*layout_node);
+    }
+
+    static bool request_frame(void* context, Compositing::RustFFI::NodeSlotId slot, Animations::RustFFI::FfiCompositorFrameKind kind)
+    {
+        auto& pass = of(context);
+        auto* layout_node = pass.node(slot);
+        if (!layout_node)
+            return false;
+        if (kind == Animations::RustFFI::FfiCompositorFrameKind::EffectsLayer) {
+            if (layout_node->needs_compositor_effects_layer())
+                return false;
+            layout_node->set_needs_compositor_effects_layer(true);
+        } else {
+            if (layout_node->needs_compositor_background_color_frame())
+                return false;
+            layout_node->set_needs_compositor_background_color_frame(true);
+        }
+        pass.document->schedule_accumulated_visual_context_update(*layout_node, Document::AccumulatedVisualContextUpdateScope::Structure);
+        CSS::RequiredInvalidationAfterStyleChange invalidation;
+        invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
+        Painting::repaint_after_style_change(*layout_node, invalidation);
+        return true;
+    }
+
+    static void keep_frame(void* context, Compositing::RustFFI::NodeSlotId slot, Animations::RustFFI::FfiCompositorFrameKind kind)
+    {
+        auto& pass = of(context);
+        auto& forced = pass.forced_frames(kind);
+        if (!any_of(forced, [&](auto forced_slot) { return forced_slot.index == slot.index; }))
+            forced.append(slot);
+        pass.stale_forced_frames(kind).remove_first_matching([&](auto stale_slot) {
+            return stale_slot.index == slot.index;
+        });
+    }
+
+    static bool frame_was_kept(void* context, Compositing::RustFFI::NodeSlotId slot, Animations::RustFFI::FfiCompositorFrameKind kind)
+    {
+        return any_of(of(context).stale_forced_frames(kind), [&](auto stale_slot) {
+            return stale_slot.index == slot.index;
+        });
+    }
+
+    static void refresh_viewport_mapping(void* context)
+    {
+        auto& pass = of(context);
+        pass.viewport_mapping = Painting::viewport_mapping(pass.document);
+    }
+
+    static void note_throttled_animation_style_update(void* context)
+    {
+        of(context).document->note_throttled_animation_style_update();
+    }
+
+    static void keep_alive(void* context, Animations::RustFFI::AnimationCell const* animation)
+    {
+        Animations::keep_animation_alive_in(&of(context).animations, animation);
+    }
+};
+
+static RefPtr<CSS::StyleValue const> resolved_compositor_animation_style_value(Layout::BegunRead const& read, CSS::PropertyID property_id, CSS::StyleValueFFI::StyleValueData const* value, AbstractElement target)
+{
+    HTML::note_rendering_trace_event("compositor keyframe values resolved"sv);
+    auto style_value = CSS::StyleValue::adopt_rust_style_value_data(CSS::StyleValueFFI::rust_style_value_retain(value));
+    if (style_value->is_unresolved()) {
+        // The engine substitutes the value as a sample on the main thread would, against the custom properties the
+        // element holds and inherits.
+        auto custom_property_data = target.custom_property_data();
+        auto inheritance_parent = target.element_to_inherit_style_from();
+        auto inheritance_custom_property_data = inheritance_parent.has_value() ? inheritance_parent->custom_property_data() : nullptr;
+        auto const* substituted = CSS::StyleValueFFI::rust_substitute_compositor_keyframe_value(
+            target.document().style_computer().style_engine().host(),
+            &read, target.element().style_node_id().value(),
+            CSS::pseudo_element_to_ffi(target.pseudo_element()),
+            custom_property_data ? custom_property_data->rust_store() : nullptr,
+            inheritance_custom_property_data ? inheritance_custom_property_data->rust_store() : nullptr,
+            to_underlying(property_id),
+            value);
+        if (!substituted)
+            return nullptr;
+        style_value = CSS::StyleValue::adopt_rust_style_value_data(substituted);
+    }
+    if (style_value->is_guaranteed_invalid() || style_value->is_unresolved() || style_value->is_pending_substitution())
+        return nullptr;
+    // Absolutizing against the target's used color-scheme collapses light-dark() as computing the value would, so
+    // the color the builder resolves needs no length context.
+    auto const* inherited_ui_values = target.style_group<CSS::ComputedValues::InheritedUIValues>();
+    CSS::ComputationContext computation_context {
+        .length_resolution_context = CSS::Length::ResolutionContext::for_element(target),
+        .abstract_element = target,
+        .color_scheme = inherited_ui_values ? inherited_ui_values->color_scheme_value() : Optional<CSS::PreferredColorScheme> {},
     };
-    return effect.compositor_animation_state().build(read, keyframes, *layout_node, target_kind, timing_anchor);
+    return style_value->absolutized(computation_context);
 }
 
-static Optional<double> next_throttled_animation_iteration_event_time(Animations::Animation const& animation, Animations::KeyframeEffect const& effect)
+void const* CompositorAnimationUpdatePass::resolved_keyframe_value(void* context, u16 property_id, void const* declared_value)
 {
-    if (!animation.is_css_animation() || animation.pending()
-        || animation.play_state() != Bindings::AnimationPlayState::Running
-        || animation.playback_rate() <= 0 || !isfinite(animation.playback_rate())
-        || !animation.timeline() || !animation.timeline()->is_monotonically_increasing()
-        || effect.start_delay().type != Animations::TimeValue::Type::Milliseconds
-        || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
-        || effect.iteration_duration().value <= 0 || !isfinite(effect.iteration_duration().value)
-        || !effect.can_skip_per_frame_style_update()
-        || effect.phase() != Animations::AnimationEffect::Phase::Active)
-        return {};
+    auto& pass = of(context);
+    auto target = *pass.keyframe_target;
+    auto property = static_cast<CSS::PropertyID>(property_id);
+    RefPtr<CSS::StyleValue const> style_value;
+    if (!declared_value) {
+        // NB: Synthesized endpoints use the underlying style, just as main-thread keyframe sampling does.
+        auto computed_style = target.computed_style();
+        if (!computed_style)
+            return nullptr;
+        style_value = computed_style->computed_style_value(property, CSS::ComputedValues::WithAnimationsApplied::No);
+    } else {
+        style_value = resolved_compositor_animation_style_value(pass.read, property, static_cast<CSS::StyleValueFFI::StyleValueData const*>(declared_value), target);
+    }
+    if (!style_value)
+        return nullptr;
+    return CSS::StyleValueFFI::rust_style_value_retain(style_value->rust_style_value_data());
+}
 
-    // NB: Observable throttled animations need a rendering update at the next iteration boundary,
-    //     not at every display refresh. Seeking and cancellation already request their own updates.
-    return effect.start_delay().value
-        + (effect.previous_current_iteration() + 1 - effect.iteration_start()) * effect.iteration_duration().value;
+bool CompositorAnimationUpdatePass::prepare_compositor_animation(void* context, Animations::RustFFI::FfiCompositorAnimationPreparation const* preparation, void* request_pointer, void* keyframe_host)
+{
+    auto& pass = of(context);
+    auto target = target_of(preparation->target);
+    auto* layout_node = as_if<Layout::NodeWithStyle>(pass.node(preparation->layout_node));
+    if (!layout_node)
+        return false;
+    auto target_kind = static_cast<Compositing::RustFFI::FfiVisualAnimationTargetKind>(preparation->target_kind);
+    bool targets_transform = target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::Transform;
+    if (preparation->checked) {
+        if (target.element().namespace_uri() == Namespace::SVG) {
+            // NB: The compositor has no animations for the documents of SVG images.
+            if (target_kind == Compositing::RustFFI::FfiVisualAnimationTargetKind::BackgroundColor || target.document().is_decoded_svg())
+                return false;
+            if (targets_transform && !svg_transform_may_run_on_the_compositor(target.element(), *layout_node))
+                return false;
+        }
+        if (targets_transform) {
+            auto targets = [&](u8 property) { return (preparation->targeted_transform_properties & property) != 0; };
+            if ((!targets(Layout::RustFFI::TARGETED_TRANSFORM_PROPERTY_TRANSLATE) && layout_node->has_translate())
+                || (!targets(Layout::RustFFI::TARGETED_TRANSFORM_PROPERTY_ROTATE) && layout_node->has_rotate())
+                || (!targets(Layout::RustFFI::TARGETED_TRANSFORM_PROPERTY_SCALE) && layout_node->has_scale())
+                || (!targets(Layout::RustFFI::TARGETED_TRANSFORM_PROPERTY_TRANSFORM) && layout_node->has_transformations())
+                || layout_node->transform_origin().z.to_px(CSSPixels { 0 }) != CSSPixels { 0 })
+                return false;
+        }
+        if (!Painting::committed_row(*layout_node).has_value())
+            return false;
+    }
+
+    auto& request = *static_cast<Layout::RustFFI::FfiCompositorAnimationRequest*>(request_pointer);
+    auto target_color_resolution_style = CSS::ColorResolutionStyle::for_element(target);
+    request.target_inherited_ui_values = target_color_resolution_style.inherited_ui_values;
+    request.target_inherited_text_values = target_color_resolution_style.inherited_text_values;
+    request.target_style_generation = target.element().animation_style_generation();
+    request.style_environment_version = target.document().style_computer().style_environment_version_for_sharing();
+    if (targets_transform) {
+        auto reference_box_size = Painting::transform_reference_box(*layout_node).size();
+        request.reference_box_width = reference_box_size.width().to_float();
+        request.reference_box_height = reference_box_size.height().to_float();
+    }
+    request.device_pixels_per_css_pixel = static_cast<float>(target.document().page().client().device_pixels_per_css_pixel());
+    pass.keyframe_target = target;
+    *static_cast<Layout::RustFFI::FfiCompositorAnimationHost*>(keyframe_host) = {
+        .context = &pass,
+        .resolved_keyframe_value = resolved_keyframe_value,
+    };
+    return true;
+}
+
+bool CompositorAnimationUpdatePass::paint_is_offscreen(void* context, Animations::RustFFI::FfiCompositorTarget ffi_target, Animations::RustFFI::FfiOffscreenPaintQuery const* query)
+{
+    auto& pass = of(context);
+    auto& document = *pass.document;
+    auto abstract_target = target_of(ffi_target);
+    auto& target = abstract_target.element();
+    bool is_svg_target = target.namespace_uri() == Namespace::SVG;
+    if (abstract_target.pseudo_element().has_value()
+        && !first_is_one_of(*abstract_target.pseudo_element(), CSS::PseudoElement::Before, CSS::PseudoElement::After))
+        return false;
+    if ((!is_svg_target && target.namespace_uri() != Namespace::HTML)
+        || target.is_document_element() || &target == document.body())
+        return false;
+    if (is_svg_target && !query->targets_only_opacity)
+        return false;
+    if (query->targets_opacity && pass.elements_with_visibility_observation_descendants.contains(target))
+        return false;
+    bool paint_stays_within_border_box = query->paint_stays_within_border_box;
+
+    auto const* layout_node = abstract_target.unsafe_layout_node(pass.read);
+    if (!layout_node || !layout_node->is_box())
+        return false;
+
+    // NB: SVG resources and referenced subtrees can be painted outside their own ancestor clips.
+    //     Restrict this proof to unreferenced graphics in an ordinary SVG tree.
+    auto svg_element_can_be_painted_elsewhere = [](SVG::SVGElement const& element) {
+        return element.id().has_value()
+            || !element.local_name().is_one_of(SVG::TagNames::svg, SVG::TagNames::g,
+                SVG::TagNames::circle, SVG::TagNames::ellipse, SVG::TagNames::rect,
+                SVG::TagNames::path, SVG::TagNames::line, SVG::TagNames::polygon, SVG::TagNames::polyline);
+    };
+    for (auto const* ancestor = static_cast<Node const*>(&target); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+        auto const* element = as_if<SVG::SVGElement>(ancestor);
+        if (element && svg_element_can_be_painted_elsewhere(*element))
+            return false;
+    }
+    if (is_svg_target && layout_node->has_children())
+        return false;
+
+    // NB: A descendant can explicitly inherit even a normally non-inherited paint property. Reject
+    //     content that can escape ancestor clips or be rendered elsewhere through SVG references.
+    bool subtree_can_escape = false;
+    layout_node->for_each_in_inclusive_subtree_of_type<Layout::NodeWithStyle>([&](auto const& descendant) {
+        if (descendant.is_svg_box()) {
+            auto const* element = as_if<SVG::SVGElement>(descendant.dom_node());
+            if (!query->can_include_svg_descendants || !element || svg_element_can_be_painted_elsewhere(*element)) {
+                subtree_can_escape = true;
+                return TraversalDecision::Break;
+            }
+        }
+        if (descendant.is_fixed_position()
+            || (&descendant != layout_node && descendant.is_absolutely_positioned())) {
+            subtree_can_escape = true;
+            return TraversalDecision::Break;
+        }
+        return TraversalDecision::Continue;
+    });
+    if (subtree_can_escape)
+        return false;
+
+    auto viewport_bounds = CSSPixelRect { { 0, 0 }, document.viewport_rect().size() };
+    auto const& viewport_mapping = pass.viewport_mapping;
+    auto bounds_in_viewport = [&](Layout::Node const& node) -> CSSPixelRect {
+        CSSPixelRect rect;
+        Layout::RustFFI::layout_script_bounding_client_rect(
+            node.document_host(), Layout::Node::slot_id(&node), viewport_mapping, &rect);
+        return rect;
+    };
+    HashTable<Layout::Node const*> containing_blocks;
+    for (auto const* container = layout_node->containing_block(); container; container = container->containing_block())
+        containing_blocks.set(container);
+
+    auto visible_bounds = viewport_bounds;
+    for (auto const* ancestor = layout_node; ancestor; ancestor = ancestor->parent()) {
+        bool can_move_or_expand_paint = ancestor->has_css_transform() || ancestor->perspective().has_value()
+            || ancestor->is_sticky_position() || ancestor->filter().has_filters()
+            || query->ancestor_animation_moves_paint(query->context, Layout::Node::slot_id(ancestor), const_cast<Element*>(as_if<Element>(ancestor->dom_node())));
+        if (can_move_or_expand_paint) {
+            // NB: A transform or filter outside a clip can bring its paint into view. A later, outer clip
+            //     can still prove that the entire transformed or filtered subtree remains offscreen.
+            visible_bounds = viewport_bounds;
+            paint_stays_within_border_box = false;
+            continue;
+        }
+        if (!containing_blocks.contains(ancestor) || ancestor->is_svg_box())
+            continue;
+        if (ancestor->overflow_x() == CSS::Overflow::Visible || ancestor->overflow_y() == CSS::Overflow::Visible)
+            continue;
+        if (ancestor->overflow_x() == CSS::Overflow::Clip || ancestor->overflow_y() == CSS::Overflow::Clip) {
+            auto const& margin = ancestor->style_group<CSS::ComputedValues::MiscLayoutValues>().overflow_clip_margin;
+            if (margin.top.offset != 0 || margin.right.offset != 0 || margin.bottom.offset != 0 || margin.left.offset != 0)
+                continue;
+        }
+        visible_bounds = visible_bounds.intersected(bounds_in_viewport(*ancestor));
+    }
+    if (visible_bounds.is_empty())
+        return true;
+
+    // NB: Otherwise, only a leaf box with bounded paint can be proven invisible from its own bounds.
+    return paint_stays_within_border_box && !layout_node->has_children()
+        && !bounds_in_viewport(*layout_node).intersects(visible_bounds);
+}
+
+static bool transform_preserves_horizontal_axis(Layout::NodeWithStyle const& layout_node)
+{
+    if (layout_node.perspective().has_value())
+        return false;
+
+    auto matrix = Gfx::FloatMatrix4x4::identity();
+    auto reference_box = Painting::transform_reference_box(layout_node);
+    layout_node.for_each_resolved_transform([&](auto const& transform) {
+        matrix = matrix * transform.to_matrix(reference_box.width(), reference_box.height());
+    });
+
+    constexpr auto epsilon = AK::NumericLimits<float>::epsilon();
+    return abs(matrix[1, 0]) <= epsilon
+        && abs(matrix[2, 0]) <= epsilon
+        && abs(matrix[3, 0]) <= epsilon;
+}
+
+bool CompositorAnimationUpdatePass::transform_affects_intersection_observation(void* context, void* animated_target_pointer, Animations::RustFFI::FfiTransformObservationQuery const* query, bool* requires_main_thread_sampling)
+{
+    auto& pass = of(context);
+    auto& animated_target = *static_cast<Element*>(animated_target_pointer);
+    if (!pass.elements_with_intersection_observation_descendants.contains(animated_target))
+        return false;
+
+    auto ancestor_transform_can_map_horizontal_motion_to_vertical = [&](Node const& observation_root) {
+        auto const* layout_node = animated_target.unsafe_layout_node(pass.read);
+        if (!layout_node)
+            return true;
+        for (auto const* ancestor = layout_node->parent(); ancestor; ancestor = ancestor->parent()) {
+            if (ancestor->has_css_transform() && !transform_preserves_horizontal_axis(*ancestor))
+                return true;
+            if (!query->transform_animations_preserve_axes(query->context, Layout::Node::slot_id(ancestor)))
+                return true;
+            if (ancestor->dom_node() == &observation_root)
+                break;
+        }
+        return false;
+    };
+    auto observation_has_another_transform_animation = [&](Element const& observation_target) {
+        for (size_t index = 0; index < query->transform_target_count; ++index) {
+            auto const& transform_target = query->transform_targets[index];
+            if (transform_target.effect == query->effect)
+                continue;
+            auto& effect_target = *static_cast<Element*>(transform_target.element);
+            if (animated_target.is_shadow_including_inclusive_ancestor_of(effect_target)
+                && effect_target.is_shadow_including_inclusive_ancestor_of(observation_target))
+                return true;
+        }
+        return false;
+    };
+
+    for (auto const& observer : pass.document->m_intersection_observers) {
+        if (observer.observation_targets().is_empty())
+            continue;
+        auto root = observer.intersection_root_node();
+        if (root->is_element() && animated_target.is_shadow_including_inclusive_ancestor_of(*root))
+            return true;
+        bool subtree_is_clipped_outside_root = pass.transform_subtree_is_clipped_outside(animated_target, observer.root_intersection_rectangle(pass.read));
+        for (auto const& observation : observer.observation_targets()) {
+            auto target = observation.target.ptr();
+            if (!target)
+                continue;
+            if (!animated_target.is_shadow_including_inclusive_ancestor_of(*target) || subtree_is_clipped_outside_root)
+                continue;
+            if (query->only_translates_horizontally && ancestor_transform_can_map_horizontal_motion_to_vertical(*root)) {
+                *requires_main_thread_sampling = true;
+                return true;
+            }
+            if (query->only_translates_horizontally && !observation_has_another_transform_animation(*target)) {
+                auto const& target_rect = pass.observation_target_rect_cache.ensure(target, [&] {
+                    return target->bounding_client_rect_assuming_layout_clean();
+                });
+                auto root_rect = observer.root_intersection_rectangle(pass.read);
+                bool vertical_bands_are_disjoint = target_rect.bottom() < root_rect.top() || target_rect.top() > root_rect.bottom();
+                if (vertical_bands_are_disjoint)
+                    continue;
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 void Document::schedule_compositor_animation_wakeup(double delay_ms)
@@ -9128,7 +9083,7 @@ void Document::schedule_compositor_animation_wakeup(double delay_ms)
     m_compositor_animation_wakeup_deadline = deadline;
     if (!m_compositor_animation_wakeup_timer) {
         m_compositor_animation_wakeup_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(static_cast<int>(timer_delay_ms)), GC::weak_callback(*this, [](auto& document) {
-            // Cancelling a finite effect can leave this deadline armed. The single wake-up is harmless: it finds
+            // Canceling a finite effect can leave this deadline armed. The single wake-up is harmless: it finds
             // nothing due and leaves the timer idle unless another effect supplies a deadline.
             document.m_compositor_animation_wakeup_deadline.clear();
             auto timestamp = HighResolutionTime::relative_high_resolution_time(
@@ -9141,62 +9096,11 @@ void Document::schedule_compositor_animation_wakeup(double delay_ms)
 
 void Document::service_compositor_animation_wakeup(double timestamp)
 {
-    Optional<double> next_wakeup_delay_ms;
-    bool reached_wakeup = false;
-    bool reached_compositor_active_start = false;
-    for (auto& animation : m_associated_animations) {
-        if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
-            continue;
-        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
-        auto timeline_time = animation.timeline() ? animation.timeline()->current_time_at_timestamp(timestamp) : Optional<Animations::TimeValue> {};
-        auto current_time = animation.current_time_at(timeline_time);
-        if (!current_time.has_value() || current_time->type != Animations::TimeValue::Type::Milliseconds)
-            continue;
-        bool is_compositor_handled = effect.is_compositor_driven()
-            || effect.is_compositor_replaced()
-            || effect.has_retained_compositor_animations();
-        if (!animation.pending()
-            && animation.playback_rate() > 0
-            && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds
-            && effect.phase() == Animations::AnimationEffect::Phase::Before) {
-            if (current_time->value < effect.start_delay().value) {
-                auto delay = (effect.start_delay().value - current_time->value) / animation.playback_rate();
-                if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
-                    next_wakeup_delay_ms = delay;
-            } else {
-                effect.request_observation_sample();
-                reached_wakeup = true;
-                if (is_compositor_handled)
-                    reached_compositor_active_start = true;
-            }
-        }
-        if (auto iteration_event_time = next_throttled_animation_iteration_event_time(animation, effect);
-            iteration_event_time.has_value() && !effect.can_skip_per_frame_animation_tick()) {
-            if (current_time->value < *iteration_event_time) {
-                auto delay = (*iteration_event_time - current_time->value) / animation.playback_rate();
-                if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
-                    next_wakeup_delay_ms = delay;
-            } else {
-                reached_wakeup = true;
-            }
-        }
-        bool is_offscreen_handled = effect.is_offscreen_throttled() && effect.can_skip_per_frame_style_update();
-        if ((!is_compositor_handled && !is_offscreen_handled) || isinf(effect.iteration_count()))
-            continue;
-        auto active_end = effect.start_delay().value + effect.iteration_duration().value * effect.iteration_count();
-        if (current_time->value < active_end) {
-            auto delay = (active_end - current_time->value) / animation.playback_rate();
-            if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
-                next_wakeup_delay_ms = delay;
-            continue;
-        }
-        effect.request_observation_sample();
-        reached_wakeup = true;
-    }
-    if (next_wakeup_delay_ms.has_value())
-        schedule_compositor_animation_wakeup(*next_wakeup_delay_ms);
-    if (reached_wakeup) {
-        if (reached_compositor_active_start) {
+    auto outcome = Animations::RustFFI::animations_document_service_compositor_animation_wakeup(m_animations, timestamp);
+    if (outcome.has_next_wakeup_delay)
+        schedule_compositor_animation_wakeup(outcome.next_wakeup_delay);
+    if (outcome.reached_wakeup) {
+        if (outcome.reached_compositor_active_start) {
             Layout::ForcedReadScope read { *this };
             paint_state().republish_visual_animations(read);
         }
@@ -9211,7 +9115,7 @@ void Document::fire_compositor_animation_wakeup_for_testing(Badge<Internals::Int
     if (m_compositor_animation_wakeup_timer)
         m_compositor_animation_wakeup_timer->stop();
     m_compositor_animation_wakeup_deadline.clear();
-    service_compositor_animation_wakeup(relevant_settings_object().time_origin() + frame_time_ms);
+    service_compositor_animation_wakeup(frame_time_ms);
 }
 
 void Document::force_visual_context_tree_rebuild_on_next_compositor_animation_update_for_testing(Badge<Internals::Internals>)
@@ -9221,47 +9125,11 @@ void Document::force_visual_context_tree_rebuild_on_next_compositor_animation_up
 
 void Document::update_compositor_animations(Layout::BegunRead const& read)
 {
-    struct CompetingPropertyEffects {
-        GC::Ptr<Animations::KeyframeEffect> winner;
-        bool all_effects_use_replace { true };
-        u32 effect_count { 0 };
-
-        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(winner); }
-    };
-    struct CompetingEffects {
-        CompetingPropertyEffects opacity;
-        CompetingPropertyEffects background_color;
-        CompetingPropertyEffects filter;
-        CompetingPropertyEffects transform;
-
-        void visit_edges(GC::Cell::Visitor& visitor)
-        {
-            opacity.visit_edges(visitor);
-            background_color.visit_edges(visitor);
-            filter.visit_edges(visitor);
-            transform.visit_edges(visitor);
-        }
-    };
-
-    auto animation_pass_viewport_mapping = Painting::viewport_mapping(*this);
+    CompositorAnimationUpdatePass pass { *this, read };
+    pass.viewport_mapping = Painting::viewport_mapping(*this);
     paint_state().begin_compositor_animation_update();
-    GC::RootHashMap<GC::Ref<Layout::Node>, bool> previous_content_retention;
-    GC::RootHashTable<GC::Ref<Layout::Node>> retained_this_pass;
-    GC::RootHashTable<GC::Ref<Animations::KeyframeEffect>> previously_compositor_driven_effects;
-    GC::RootHashTable<GC::Ref<Animations::KeyframeEffect>> previously_compositor_replaced_effects;
-    GC::RootHashTable<GC::Ref<Animations::KeyframeEffect>> previously_published_effects;
-    GC::RootHashTable<GC::Ref<Animations::KeyframeEffect>> previously_offscreen_throttled_effects;
-    GC::RootHashMap<DOM::AbstractElement, CompetingEffects> competing_effects;
-    CompositorAnimationKeyframesByEffect keyframes_by_effect;
-    GC::RootHashMap<GC::Ptr<Animations::KeyframeEffect>, bool> only_translates_horizontally_cache;
-    GC::RootHashMap<GC::Ptr<Animations::KeyframeEffect>, bool> animated_transform_preserves_axes_cache;
-    HashMap<Layout::Node const*, GC::RootVector<GC::Ptr<Animations::KeyframeEffect>>> in_effect_transform_effects_by_layout_node;
-    GC::RootHashMap<GC::Ptr<Element>, CSSPixelRect> observation_target_rect_cache;
-    GC::RootHashTable<GC::Ref<Element>> elements_with_intersection_observation_descendants;
-    GC::RootHashTable<GC::Ref<Element>> elements_with_visibility_observation_descendants;
-    auto layout_nodes_with_stale_forced_effects_layer = move(m_layout_nodes_with_forced_compositor_effects_layer);
-    auto layout_nodes_with_stale_forced_background_color_frame = move(m_layout_nodes_with_forced_compositor_background_color_frame);
-    Optional<double> compositor_animation_wakeup_delay_ms;
+    pass.layout_nodes_with_stale_forced_effects_layer = move(m_layout_nodes_with_forced_compositor_effects_layer);
+    pass.layout_nodes_with_stale_forced_background_color_frame = move(m_layout_nodes_with_forced_compositor_background_color_frame);
 
     auto index_shadow_including_element_ancestors = [](Node& node, GC::RootHashTable<GC::Ref<Element>>& index) {
         for (auto* ancestor = &node; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
@@ -9274,647 +9142,61 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
             continue;
         auto root = observer.intersection_root_node();
         if (root->is_element())
-            index_shadow_including_element_ancestors(*root, elements_with_intersection_observation_descendants);
+            index_shadow_including_element_ancestors(*root, pass.elements_with_intersection_observation_descendants);
         for (auto const& observation : observer.observation_targets()) {
             auto target = observation.target.ptr();
             if (!target)
                 continue;
-            index_shadow_including_element_ancestors(*target, elements_with_intersection_observation_descendants);
+            index_shadow_including_element_ancestors(*target, pass.elements_with_intersection_observation_descendants);
             if (observer.track_visibility())
-                index_shadow_including_element_ancestors(*target, elements_with_visibility_observation_descendants);
+                index_shadow_including_element_ancestors(*target, pass.elements_with_visibility_observation_descendants);
         }
     }
 
-    auto transform_preserves_horizontal_axis = [](Layout::NodeWithStyle const& layout_node) {
-        if (layout_node.perspective().has_value())
-            return false;
-
-        auto matrix = Gfx::FloatMatrix4x4::identity();
-        auto reference_box = Painting::transform_reference_box(layout_node);
-        layout_node.for_each_resolved_transform([&](auto const& transform) {
-            matrix = matrix * transform.to_matrix(reference_box.width(), reference_box.height());
-        });
-
-        constexpr auto epsilon = AK::NumericLimits<float>::epsilon();
-        return abs(matrix[1, 0]) <= epsilon
-            && abs(matrix[2, 0]) <= epsilon
-            && abs(matrix[3, 0]) <= epsilon;
-    };
-
-    auto animated_transform_preserves_axes = [&](Animations::KeyframeEffect& effect, Layout::Node const& layout_node) {
-        return animated_transform_preserves_axes_cache.ensure(effect, [&] {
-            if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Rotate)))
-                return false;
-            if (!effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Transform)))
-                return true;
-            auto animation = effect.associated_animation();
-            auto target = effect.target_abstract_element();
-            if (!animation || !target.has_value() || !effect.key_frame_set())
-                return false;
-            return compositor_animation_keyframes(keyframes_by_effect, effect, *animation, *target).transform_preserves_axes(layout_node);
-        });
-    };
-
-    auto ancestor_transform_can_map_horizontal_motion_to_vertical = [&](Element const& animated_target, Node const& observation_root) {
-        auto const* layout_node = animated_target.unsafe_layout_node(read);
-        if (!layout_node)
-            return true;
-        for (auto const* ancestor = layout_node->parent(); ancestor; ancestor = ancestor->parent()) {
-            if (ancestor->has_css_transform() && !transform_preserves_horizontal_axis(*ancestor))
-                return true;
-            if (auto effects = in_effect_transform_effects_by_layout_node.find(ancestor); effects != in_effect_transform_effects_by_layout_node.end()) {
-                for (auto effect : effects->value) {
-                    if (!animated_transform_preserves_axes(*effect, *ancestor))
-                        return true;
-                }
-            }
-            if (ancestor->dom_node() == &observation_root)
-                break;
-        }
-        return false;
-    };
-
-    auto transform_subtree_is_clipped_outside = [&animation_pass_viewport_mapping, &read](Element const& animated_target, CSSPixelRect const& root_bounds) {
-        auto const* layout_node = animated_target.unsafe_layout_node(read);
-        if (!layout_node)
-            return false;
-        return Layout::RustFFI::layout_script_transform_subtree_is_clipped_outside(
-            layout_node->document_host(), Layout::Node::slot_id(layout_node), root_bounds,
-            animation_pass_viewport_mapping);
-    };
-
-    auto paint_only_effect_is_offscreen = [&](Animations::KeyframeEffect const& effect, AbstractElement abstract_target) {
-        auto& target = abstract_target.element();
-        bool is_svg_target = target.namespace_uri() == Namespace::SVG;
-        if (abstract_target.pseudo_element().has_value()
-            && !first_is_one_of(*abstract_target.pseudo_element(), CSS::PseudoElement::Before, CSS::PseudoElement::After))
-            return false;
-        if ((!is_svg_target && target.namespace_uri() != Namespace::HTML)
-            || target.is_document_element() || &target == body())
-            return false;
-
-        // NB: Only properties whose changes are confined to painting are eligible. In particular, color can
-        //     affect SVG stroke geometry, and transforms can affect layout. Filters require an ancestor clip.
-        bool paint_stays_within_border_box = true;
-        for (auto const& property : effect.target_properties()) {
-            if (is_svg_target && property.id() != CSS::PropertyID::Opacity)
-                return false;
-            switch (property.id()) {
-            case CSS::PropertyID::BackgroundColor:
-            // NB: Keyframes containing var() retain the shorthand until substitution.
-            case CSS::PropertyID::BackgroundPosition:
-            case CSS::PropertyID::BackgroundPositionX:
-            case CSS::PropertyID::BackgroundPositionY:
-            case CSS::PropertyID::BackgroundSize:
-            case CSS::PropertyID::BackgroundRepeat:
-            case CSS::PropertyID::BackgroundOrigin:
-            case CSS::PropertyID::BackgroundClip:
-            case CSS::PropertyID::BackgroundBlendMode:
-            case CSS::PropertyID::BorderTopColor:
-            case CSS::PropertyID::BorderRightColor:
-            case CSS::PropertyID::BorderBottomColor:
-            case CSS::PropertyID::BorderLeftColor:
-                break;
-            case CSS::PropertyID::Opacity:
-                if (elements_with_visibility_observation_descendants.contains(target))
-                    return false;
-                paint_stays_within_border_box = false;
-                break;
-            case CSS::PropertyID::Filter:
-            case CSS::PropertyID::BoxShadow:
-            case CSS::PropertyID::OutlineColor:
-            case CSS::PropertyID::OutlineOffset:
-            case CSS::PropertyID::OutlineStyle:
-            case CSS::PropertyID::OutlineWidth:
-            case CSS::PropertyID::TextDecorationColor:
-            case CSS::PropertyID::TextDecorationStyle:
-            case CSS::PropertyID::TextDecorationThickness:
-                paint_stays_within_border_box = false;
-                break;
-            default:
-                return false;
-            }
-        }
-
-        auto const* layout_node = abstract_target.unsafe_layout_node(read);
-        if (!layout_node || !layout_node->is_box())
-            return false;
-
-        // NB: SVG resources and referenced subtrees can be painted outside their own ancestor clips.
-        //     Restrict this proof to unreferenced graphics in an ordinary SVG tree.
-        auto svg_element_can_be_painted_elsewhere = [](SVG::SVGElement const& element) {
-            return element.id().has_value()
-                || !element.local_name().is_one_of(SVG::TagNames::svg, SVG::TagNames::g,
-                    SVG::TagNames::circle, SVG::TagNames::ellipse, SVG::TagNames::rect,
-                    SVG::TagNames::path, SVG::TagNames::line, SVG::TagNames::polygon, SVG::TagNames::polyline);
-        };
-        for (auto const* ancestor = static_cast<Node const*>(&target); ancestor; ancestor = ancestor->parent_or_shadow_host()) {
-            auto const* element = as_if<SVG::SVGElement>(ancestor);
-            if (element && svg_element_can_be_painted_elsewhere(*element))
-                return false;
-        }
-        if (is_svg_target && layout_node->has_children())
-            return false;
-
-        // NB: A descendant can explicitly inherit even a normally non-inherited paint property. Reject
-        //     content that can escape ancestor clips or be rendered elsewhere through SVG references.
-        bool can_include_svg_descendants = all_of(effect.target_properties(), [](auto const& property) {
-            return first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::Filter);
-        });
-        bool subtree_can_escape = false;
-        layout_node->for_each_in_inclusive_subtree_of_type<Layout::NodeWithStyle>([&](auto const& descendant) {
-            if (descendant.is_svg_box()) {
-                auto const* element = as_if<SVG::SVGElement>(descendant.dom_node());
-                if (!can_include_svg_descendants || !element || svg_element_can_be_painted_elsewhere(*element)) {
-                    subtree_can_escape = true;
-                    return TraversalDecision::Break;
-                }
-            }
-            if (descendant.is_fixed_position()
-                || (&descendant != layout_node && descendant.is_absolutely_positioned())) {
-                subtree_can_escape = true;
-                return TraversalDecision::Break;
-            }
-            return TraversalDecision::Continue;
-        });
-        if (subtree_can_escape)
-            return false;
-
-        auto viewport_bounds = CSSPixelRect { { 0, 0 }, viewport_rect().size() };
-        auto const& viewport_mapping = animation_pass_viewport_mapping;
-        auto bounds_in_viewport = [&](Layout::Node const& node) -> CSSPixelRect {
-            CSSPixelRect rect;
-            Layout::RustFFI::layout_script_bounding_client_rect(
-                node.document_host(), Layout::Node::slot_id(&node), viewport_mapping, &rect);
-            return rect;
-        };
-        HashTable<Layout::Node const*> containing_blocks;
-        for (auto const* container = layout_node->containing_block(); container; container = container->containing_block())
-            containing_blocks.set(container);
-
-        auto visible_bounds = viewport_bounds;
-        for (auto const* ancestor = layout_node; ancestor; ancestor = ancestor->parent()) {
-            bool can_move_or_expand_paint = ancestor->has_css_transform() || ancestor->perspective().has_value()
-                || ancestor->is_sticky_position() || ancestor->filter().has_filters()
-                || in_effect_transform_effects_by_layout_node.contains(ancestor);
-            if (auto const* element = as_if<Element>(ancestor->dom_node())) {
-                if (auto effects = competing_effects.get(*element); effects.has_value() && effects->filter.winner)
-                    can_move_or_expand_paint = true;
-            }
-            if (can_move_or_expand_paint) {
-                // NB: A transform or filter outside a clip can bring its paint into view. A later, outer clip
-                //     can still prove that the entire transformed or filtered subtree remains offscreen.
-                visible_bounds = viewport_bounds;
-                paint_stays_within_border_box = false;
-                continue;
-            }
-            if (!containing_blocks.contains(ancestor) || ancestor->is_svg_box())
-                continue;
-            if (ancestor->overflow_x() == CSS::Overflow::Visible || ancestor->overflow_y() == CSS::Overflow::Visible)
-                continue;
-            if (ancestor->overflow_x() == CSS::Overflow::Clip || ancestor->overflow_y() == CSS::Overflow::Clip) {
-                auto const& margin = ancestor->style_group<CSS::ComputedValues::MiscLayoutValues>().overflow_clip_margin;
-                if (margin.top.offset != 0 || margin.right.offset != 0 || margin.bottom.offset != 0 || margin.left.offset != 0)
-                    continue;
-            }
-            visible_bounds = visible_bounds.intersected(bounds_in_viewport(*ancestor));
-        }
-        if (visible_bounds.is_empty())
-            return true;
-
-        // NB: Otherwise, only a leaf box with bounded paint can be proven invisible from its own bounds.
-        return paint_stays_within_border_box && !layout_node->has_children()
-            && !bounds_in_viewport(*layout_node).intersects(visible_bounds);
-    };
-
-    auto observation_has_another_transform_animation = [&](Element const& animated_target, Element const& observation_target, Animations::KeyframeEffect const& current_effect) {
-        for (auto& animation : m_associated_animations) {
-            if (animation.is_idle() || !animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
-                continue;
-            auto const& effect = static_cast<Animations::KeyframeEffect const&>(*animation.effect());
-            if (&effect == &current_effect || !effect.is_in_effect())
-                continue;
-            auto effect_target = effect.target();
-            if (!effect_target || !animated_target.is_shadow_including_inclusive_ancestor_of(*effect_target)
-                || !effect_target->is_shadow_including_inclusive_ancestor_of(observation_target))
-                continue;
-            if (any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); }))
-                return true;
-        }
-        return false;
-    };
-
-    auto transform_affects_intersection_observation = [&](Element& animated_target, Animations::KeyframeEffect const& effect, bool only_translates_horizontally, bool& requires_main_thread_sampling) {
-        if (!elements_with_intersection_observation_descendants.contains(animated_target))
-            return false;
-        for (auto const& observer : m_intersection_observers) {
-            if (observer.observation_targets().is_empty())
-                continue;
-            auto root = observer.intersection_root_node();
-            if (root->is_element() && animated_target.is_shadow_including_inclusive_ancestor_of(*root))
-                return true;
-            bool subtree_is_clipped_outside_root = transform_subtree_is_clipped_outside(animated_target, observer.root_intersection_rectangle(read));
-            for (auto const& observation : observer.observation_targets()) {
-                auto target = observation.target.ptr();
-                if (!target)
-                    continue;
-                if (!animated_target.is_shadow_including_inclusive_ancestor_of(*target) || subtree_is_clipped_outside_root)
-                    continue;
-                if (only_translates_horizontally && ancestor_transform_can_map_horizontal_motion_to_vertical(animated_target, *root)) {
-                    requires_main_thread_sampling = true;
-                    return true;
-                }
-                if (only_translates_horizontally && !observation_has_another_transform_animation(animated_target, *target, effect)) {
-                    auto const& target_rect = observation_target_rect_cache.ensure(target, [&] {
-                        return target->bounding_client_rect_assuming_layout_clean();
-                    });
-                    auto root_rect = observer.root_intersection_rectangle(read);
-                    bool vertical_bands_are_disjoint = target_rect.bottom() < root_rect.top() || target_rect.top() > root_rect.bottom();
-                    if (vertical_bands_are_disjoint)
-                        continue;
-                }
-                return true;
-            }
-        }
-        return false;
-    };
-
-    auto opacity_affects_visibility_observation = [&](Element& animated_target) {
-        return elements_with_visibility_observation_descendants.contains(animated_target);
-    };
-
-    for (auto& animation : m_associated_animations) {
-        if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
-            continue;
-        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
-        if (effect.is_compositor_driven())
-            previously_compositor_driven_effects.set(effect);
-        if (effect.is_compositor_replaced())
-            previously_compositor_replaced_effects.set(effect);
-        if (effect.has_retained_compositor_animations())
-            previously_published_effects.set(effect);
-        if (effect.is_offscreen_throttled())
-            previously_offscreen_throttled_effects.set(effect);
-        if (auto target = effect.target_abstract_element(); target.has_value()) {
-            if (auto* layout_node = target->unsafe_layout_node(read)) {
-                previous_content_retention.ensure(*layout_node, [&] { return layout_node->retains_compositor_animated_content(); });
-            }
-        }
-        effect.set_is_compositor_driven(false);
-        effect.set_is_compositor_replaced(false);
-        effect.set_is_offscreen_throttled(false);
-        effect.set_is_observation_relevant_compositor_animation(false);
-
-        if (animation.is_idle() || (!effect.is_in_effect() && effect.phase() != Animations::AnimationEffect::Phase::Before))
-            continue;
-        auto target = effect.target_abstract_element();
-        if (!target.has_value())
-            continue;
-        auto& effects = competing_effects.ensure(*target);
-        auto add_competing_effect = [&](CompetingPropertyEffects& property_effects) {
-            ++property_effects.effect_count;
-            bool effect_produces_output = effect.is_in_effect();
-            if (effect_produces_output && effect.composite() != Bindings::CompositeOperation::Replace)
-                property_effects.all_effects_use_replace = false;
-            bool winner_produces_output = property_effects.winner && property_effects.winner->is_in_effect();
-            if (!property_effects.winner
-                || (effect_produces_output && !winner_produces_output)
-                || (effect_produces_output == winner_produces_output && Animations::KeyframeEffect::composite_order(*property_effects.winner, effect) < 0))
-                property_effects.winner = effect;
-        };
-        if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity)))
-            add_competing_effect(effects.opacity);
-        if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor)))
-            add_competing_effect(effects.background_color);
-        if (effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter)))
-            add_competing_effect(effects.filter);
-        if (any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); })) {
-            add_competing_effect(effects.transform);
-            if (auto const* layout_node = target->unsafe_layout_node(read))
-                in_effect_transform_effects_by_layout_node.ensure(layout_node).append(effect);
-        }
-    }
-
-    auto winner_uses_replace_keyframes = [](Animations::KeyframeEffect& effect) {
-        auto const* key_frame_set = effect.key_frame_set();
-        if (!key_frame_set)
-            return false;
-        return all_of(key_frame_set->keyframes_by_key, [](auto const& entry) {
-            return first_is_one_of(entry.composite,
-                Bindings::CompositeOperationOrAuto::Auto,
-                Bindings::CompositeOperationOrAuto::Replace);
-        });
-    };
-    // A keyframe that leaves a property out takes the underlying value, which is the output of the effects beneath the
-    // winner where there are any. The compositor only knows the element's own style.
-    auto winner_takes_the_underlying_value = [](Animations::KeyframeEffect& effect, auto is_property) {
-        auto const* key_frame_set = effect.key_frame_set();
-        if (!key_frame_set)
-            return false;
-        return any_of(key_frame_set->keyframes_by_key, [&](auto const& entry) {
-            return any_of(entry.properties, [&](auto const& property) {
-                return is_property(property.key.id()) && property.value.template has<Animations::KeyframeEffect::KeyFrameSet::UseInitial>();
-            });
-        });
-    };
-    for (auto& [target, effects] : competing_effects) {
-        (void)target;
-        auto validate_winner = [&](CompetingPropertyEffects& property_effects, auto is_property) {
-            if (!property_effects.all_effects_use_replace
-                || (property_effects.winner && !winner_uses_replace_keyframes(*property_effects.winner))
-                || (property_effects.winner && property_effects.effect_count > 1 && winner_takes_the_underlying_value(*property_effects.winner, is_property)))
-                property_effects.winner = nullptr;
-        };
-        auto is = [](CSS::PropertyID property_id) {
-            return [property_id](CSS::PropertyID id) { return id == property_id; };
-        };
-        validate_winner(effects.opacity, is(CSS::PropertyID::Opacity));
-        validate_winner(effects.background_color, is(CSS::PropertyID::BackgroundColor));
-        validate_winner(effects.filter, is(CSS::PropertyID::Filter));
-        validate_winner(effects.transform, is_transform_family_property);
-    }
-
-    // An opacity of 1 does not otherwise create an effects frame. Give an otherwise publishable opacity
-    // animation a target before the normal handoff loop, and retain that target while the effect remains live.
-    auto can_force_opacity_effects_layer = [](Animations::KeyframeEffect const& effect) {
-        return all_of(effect.target_properties(), [](auto const& property) {
-            return first_is_one_of(property.id(), CSS::PropertyID::Opacity, CSS::PropertyID::BackgroundColor)
-                || is_transform_family_property(property.id());
-        });
-    };
-    bool forced_opacity_effects_layer = false;
-    for (auto& [target, effects] : competing_effects) {
-        auto effect = effects.opacity.winner;
-        if (!effect || opacity_affects_visibility_observation(target.element()) || !can_force_opacity_effects_layer(*effect))
-            continue;
-
-        bool missing_visual_context_node = build_compositor_animation(read, *effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::Opacity, keyframes_by_effect).missing_visual_context_node;
-        auto* layout_node = target.unsafe_layout_node(read);
-        if (!layout_node)
-            continue;
-        auto layout_node_slot = Layout::Node::slot_id(layout_node);
-        bool already_forced_effects_layer = any_of(layout_nodes_with_stale_forced_effects_layer, [&](auto stale_slot) {
-            return stale_slot.index == layout_node_slot.index;
-        });
-        if (!missing_visual_context_node && !already_forced_effects_layer)
-            continue;
-
-        if (missing_visual_context_node && !layout_node->needs_compositor_effects_layer()) {
-            layout_node->set_needs_compositor_effects_layer(true);
-            schedule_accumulated_visual_context_update(*layout_node, AccumulatedVisualContextUpdateScope::Structure);
-            CSS::RequiredInvalidationAfterStyleChange invalidation;
-            invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
-            Painting::repaint_after_style_change(*layout_node, invalidation);
-            forced_opacity_effects_layer = true;
-        }
-        if (!any_of(m_layout_nodes_with_forced_compositor_effects_layer, [&](auto forced_slot) { return forced_slot.index == layout_node_slot.index; }))
-            m_layout_nodes_with_forced_compositor_effects_layer.append(layout_node_slot);
-        layout_nodes_with_stale_forced_effects_layer.remove_first_matching([&](auto stale_slot) {
-            return stale_slot.index == layout_node_slot.index;
-        });
-    }
-    if (forced_opacity_effects_layer)
-        animation_pass_viewport_mapping = Painting::viewport_mapping(*this);
-
-    bool has_observation_relevant_compositor_animation = false;
-    bool requested_withdrawn_effect_sample = false;
-    auto schedule_next_phase_wakeup = [&](Animations::KeyframeEffect const& effect, Animations::Animation const& animation) {
-        if (effect.start_delay().type != Animations::TimeValue::Type::Milliseconds
-            || effect.iteration_duration().type != Animations::TimeValue::Type::Milliseconds
-            || !animation.current_time().has_value()
-            || animation.current_time()->type != Animations::TimeValue::Type::Milliseconds
-            || animation.playback_rate() <= 0)
-            return;
-        auto next_phase_boundary = effect.start_delay().value;
-        if (animation.current_time()->value >= next_phase_boundary) {
-            if (isinf(effect.iteration_count()))
-                return;
-            next_phase_boundary += effect.iteration_duration().value * effect.iteration_count();
-        }
-        auto delay = (next_phase_boundary - animation.current_time()->value) / animation.playback_rate();
-        if (delay > 0 && (!compositor_animation_wakeup_delay_ms.has_value() || delay < *compositor_animation_wakeup_delay_ms))
-            compositor_animation_wakeup_delay_ms = delay;
-    };
     // Force-dark resolves colors when the display list is recorded, on the main thread. A compositor-driven
-    // background color is sampled at play time instead, and would paint as authored — so while force-dark applies,
+    // background color is sampled at play time instead, and would paint as authored. While force-dark applies,
     // background-color animations stay on the main thread, where every tick re-records the darkened color.
     auto navigable = this->navigable();
-    bool force_dark_applies = navigable && navigable->force_dark_applies_to_active_document();
-    for (auto& animation : m_associated_animations) {
-        if (!animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
-            continue;
-        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
-        effect.clear_pending_compositor_animations();
-        bool published_compositor_animation = false;
-        ScopeGuard collect_effect_bookkeeping = [&] {
-            if (!published_compositor_animation)
-                effect.clear_retained_compositor_animations();
-            effect.clear_pending_compositor_animations();
-            if (effect.is_observation_relevant_compositor_animation())
-                has_observation_relevant_compositor_animation = true;
-            bool was_throttled = previously_compositor_driven_effects.contains(GC::Ref { effect })
-                || previously_compositor_replaced_effects.contains(GC::Ref { effect })
-                || previously_offscreen_throttled_effects.contains(GC::Ref { effect });
-            if (was_throttled && !effect.is_compositor_driven() && !effect.is_compositor_replaced() && !effect.is_offscreen_throttled()) {
-                effect.request_observation_sample();
-                requested_withdrawn_effect_sample = true;
-            }
-            if (!m_has_throttled_animation_style_update && effect.can_skip_per_frame_style_update())
-                note_throttled_animation_style_update();
-        };
-        auto abstract_target = effect.target_abstract_element();
-        if (!abstract_target.has_value() || effect.target_properties().is_empty())
-            continue;
-        if (animation.is_idle() || (!effect.is_in_effect() && effect.phase() != Animations::AnimationEffect::Phase::Before))
-            continue;
-        auto& target = abstract_target->element();
-
-        bool can_throttle_paint_only_effect = animation.play_state() == Bindings::AnimationPlayState::Running
-            && !animation.pending() && animation.playback_rate() > 0 && isfinite(animation.playback_rate())
-            && animation.timeline() && animation.timeline()->is_monotonically_increasing()
-            && effect.phase() == Animations::AnimationEffect::Phase::Active
-            && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds
-            && effect.iteration_duration().type == Animations::TimeValue::Type::Milliseconds
-            && effect.iteration_duration().value > 0 && isfinite(effect.iteration_duration().value)
-            && effect.end_delay().value == 0;
-        if (can_throttle_paint_only_effect && paint_only_effect_is_offscreen(effect, *abstract_target)) {
-            effect.set_is_offscreen_throttled(true);
-            schedule_next_phase_wakeup(effect, animation);
-            continue;
-        }
-
-        bool targets_opacity = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Opacity));
-        bool targets_background_color = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::BackgroundColor));
-        bool targets_filter = effect.target_properties().contains(CSS::PropertyNameAndID::from_id(CSS::PropertyID::Filter));
-        bool targets_transform = any_of(effect.target_properties(), [](auto const& property) { return is_transform_family_property(property.id()); });
-        if (!effect.may_run_on_the_compositor())
-            continue;
-        auto target_effects = competing_effects.get(*abstract_target);
-        VERIFY(target_effects.has_value());
-        bool opacity_has_replace_winner = !targets_opacity || target_effects->opacity.winner;
-        bool background_color_has_replace_winner = !targets_background_color || target_effects->background_color.winner;
-        bool filter_has_replace_winner = !targets_filter || target_effects->filter.winner;
-        bool transform_has_replace_winner = !targets_transform || target_effects->transform.winner;
-        bool selected_for_opacity = targets_opacity && target_effects->opacity.winner.ptr() == &effect;
-        bool selected_for_background_color = targets_background_color && target_effects->background_color.winner.ptr() == &effect;
-        bool selected_for_filter = targets_filter && target_effects->filter.winner.ptr() == &effect;
-        bool selected_for_transform = targets_transform && target_effects->transform.winner.ptr() == &effect;
-        bool all_targeted_properties_have_replace_winners = opacity_has_replace_winner && background_color_has_replace_winner && filter_has_replace_winner && transform_has_replace_winner;
-
-        // Background colors are display-list content, so associate their fill commands with a dedicated metadata
-        // frame. Validate the descriptor before forcing that frame, which requires one repaint before the animation
-        // can move to the compositor.
-        Layout::Node* background_color_layout_node = nullptr;
-        bool background_color_animation_was_built = false;
-        bool background_color_animation_is_valid = false;
-        if (selected_for_background_color) {
-            if (auto* layout_node = abstract_target->unsafe_layout_node(read)) {
-                if (!force_dark_applies && Painting::rust_background_color_can_be_compositor_animated(*layout_node)) {
-                    background_color_layout_node = layout_node;
-                    auto build = build_compositor_animation(read, effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::BackgroundColor, keyframes_by_effect);
-                    background_color_animation_was_built = build.built;
-                    background_color_animation_is_valid = build.built || build.missing_visual_context_node;
-                    if (!background_color_animation_is_valid) {
-                        background_color_layout_node = nullptr;
-                    } else if (build.missing_visual_context_node && !layout_node->needs_compositor_background_color_frame()) {
-                        layout_node->set_needs_compositor_background_color_frame(true);
-                        schedule_accumulated_visual_context_update(*layout_node, AccumulatedVisualContextUpdateScope::Structure);
-                        CSS::RequiredInvalidationAfterStyleChange invalidation;
-                        invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
-                        Painting::repaint_after_style_change(*layout_node, invalidation);
-                    }
-                }
-            }
-        }
-
-        // Filters need an effects frame whose filter payload can be replaced. Validate the descriptor before forcing
-        // that frame, which requires one repaint before the animation can move to the compositor.
-        Layout::Node* filter_layout_node = nullptr;
-        bool filter_animation_was_built = false;
-        bool filter_animation_is_valid = false;
-        if (selected_for_filter) {
-            if (auto* layout_node = abstract_target->unsafe_layout_node(read)) {
-                filter_layout_node = layout_node;
-                auto build = build_compositor_animation(read, effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::Filter, keyframes_by_effect);
-                filter_animation_was_built = build.built;
-                filter_animation_is_valid = build.built || build.missing_visual_context_node;
-                if (!filter_animation_is_valid) {
-                    filter_layout_node = nullptr;
-                } else if (build.missing_visual_context_node && !layout_node->needs_compositor_effects_layer()) {
-                    layout_node->set_needs_compositor_effects_layer(true);
-                    schedule_accumulated_visual_context_update(*layout_node, AccumulatedVisualContextUpdateScope::Structure);
-                    CSS::RequiredInvalidationAfterStyleChange invalidation;
-                    invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
-                    Painting::repaint_after_style_change(*layout_node, invalidation);
-                }
-            }
-        }
-
-        if (!selected_for_opacity && !selected_for_background_color && !selected_for_filter && !selected_for_transform) {
-            bool can_throttle_replaced_effect = animation.play_state() == Bindings::AnimationPlayState::Running
-                && !animation.pending()
-                && animation.playback_rate() > 0
-                && animation.timeline() && animation.timeline()->is_monotonically_increasing()
-                && effect.phase() == Animations::AnimationEffect::Phase::Active
-                && (isinf(effect.iteration_count()) || effect.iteration_count() == 1)
-                && effect.start_delay().type == Animations::TimeValue::Type::Milliseconds
-                && effect.iteration_duration().type == Animations::TimeValue::Type::Milliseconds;
-            if (all_targeted_properties_have_replace_winners && can_throttle_replaced_effect) {
-                effect.set_is_compositor_replaced(true);
-                schedule_next_phase_wakeup(effect, animation);
-            }
-            continue;
-        }
-
-        auto& compositor_animation_state = effect.compositor_animation_state();
-        bool opacity_was_handed_off = !selected_for_opacity;
-        if (selected_for_opacity && build_compositor_animation(read, effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::Opacity, keyframes_by_effect).built)
-            opacity_was_handed_off = true;
-        bool background_color_was_handed_off = !selected_for_background_color;
-        if (background_color_animation_was_built)
-            background_color_was_handed_off = true;
-        if (background_color_layout_node && background_color_animation_is_valid) {
-            auto background_color_layout_node_slot = Layout::Node::slot_id(background_color_layout_node);
-            if (!any_of(m_layout_nodes_with_forced_compositor_background_color_frame, [&](auto forced_slot) { return forced_slot.index == background_color_layout_node_slot.index; }))
-                m_layout_nodes_with_forced_compositor_background_color_frame.append(background_color_layout_node_slot);
-            layout_nodes_with_stale_forced_background_color_frame.remove_first_matching([&](auto stale_slot) {
-                return stale_slot.index == background_color_layout_node_slot.index;
-            });
-        }
-        bool filter_was_handed_off = !selected_for_filter;
-        if (filter_animation_was_built)
-            filter_was_handed_off = true;
-        if (filter_layout_node && filter_animation_is_valid) {
-            auto filter_layout_node_slot = Layout::Node::slot_id(filter_layout_node);
-            if (!any_of(m_layout_nodes_with_forced_compositor_effects_layer, [&](auto forced_slot) { return forced_slot.index == filter_layout_node_slot.index; }))
-                m_layout_nodes_with_forced_compositor_effects_layer.append(filter_layout_node_slot);
-            layout_nodes_with_stale_forced_effects_layer.remove_first_matching([&](auto stale_slot) {
-                return stale_slot.index == filter_layout_node_slot.index;
-            });
-        }
-        bool transform_was_handed_off = !selected_for_transform;
-        if (selected_for_transform) {
-            auto build = build_compositor_animation(read, effect, Compositing::RustFFI::FfiVisualAnimationTargetKind::Transform, keyframes_by_effect);
-            transform_was_handed_off = build.built;
-            if (build.only_translates_horizontally.has_value())
-                only_translates_horizontally_cache.set(effect, *build.only_translates_horizontally);
-        }
-
-        if (selected_for_opacity && opacity_affects_visibility_observation(target)) {
-            compositor_animation_state.discard_pending(Compositing::RustFFI::FfiVisualAnimationTargetKind::Opacity);
-            opacity_was_handed_off = false;
-        }
-
-        bool transform_affects_observation = false;
-        bool requires_main_thread_observation_sampling = false;
-        if (selected_for_transform) {
-            auto only_translates_horizontally = only_translates_horizontally_cache.ensure(effect, [&] {
-                auto const* layout_node = abstract_target->unsafe_layout_node(read);
-                if (!layout_node || !effect.key_frame_set())
-                    return false;
-                return compositor_animation_keyframes(keyframes_by_effect, effect, animation, *abstract_target).only_translates_horizontally(*layout_node);
-            });
-            transform_affects_observation = transform_affects_intersection_observation(target, effect, only_translates_horizontally, requires_main_thread_observation_sampling);
-        }
-        if (requires_main_thread_observation_sampling) {
-            compositor_animation_state.discard_pending(Compositing::RustFFI::FfiVisualAnimationTargetKind::Transform);
-            transform_was_handed_off = false;
-        }
-
-        if (!compositor_animation_state.has_pending()) {
-            auto viewport_bounds = CSSPixelRect { { 0, 0 }, viewport_rect().size() };
-            if (selected_for_transform && !transform_affects_observation && transform_subtree_is_clipped_outside(target, viewport_bounds))
-                effect.set_is_offscreen_throttled(true);
-            continue;
-        }
-        if (all_targeted_properties_have_replace_winners && opacity_was_handed_off && background_color_was_handed_off && filter_was_handed_off && transform_was_handed_off)
-            effect.set_is_compositor_driven(true);
-        effect.set_is_observation_relevant_compositor_animation(transform_affects_observation);
-        schedule_next_phase_wakeup(effect, animation);
-        // OPTIMIZATION: Ordinary rendering updates advance the WebContent timeline without changing compositor
-        //               playback. An effect published before keeps the anchors of the animations whose parameters
-        //               did not change.
-        compositor_animation_state.publish_pending(*this,
-            previously_published_effects.contains(GC::Ref { effect })
-                ? Painting::CompositorAnimationEffectState::ReuseRetainedTimingAnchors::Yes
-                : Painting::CompositorAnimationEffectState::ReuseRetainedTimingAnchors::No);
-        if (auto* layout_node = abstract_target->unsafe_layout_node(read))
-            retained_this_pass.set(*layout_node);
-        published_compositor_animation = true;
-    }
+    auto last_animation_frame_timestamp = this->last_animation_frame_timestamp();
+    Animations::RustFFI::FfiCompositorUpdateHost host {
+        .context = &pass,
+        .document_host = layout_node_arena().host(),
+        .force_dark_applies = navigable && navigable->force_dark_applies_to_active_document(),
+        .has_throttled_animation_style_update = m_has_throttled_animation_style_update,
+        .time_origin = relevant_settings_object().time_origin(),
+        .has_last_animation_frame_timestamp = last_animation_frame_timestamp.has_value(),
+        .last_animation_frame_timestamp = last_animation_frame_timestamp.value_or(0),
+        .keep_alive = CompositorAnimationUpdatePass::keep_alive,
+        .tree_order = Animations::compare_elements_in_tree_order_for_composite_order,
+        .layout_node = CompositorAnimationUpdatePass::layout_node,
+        .note_target_layout_node = CompositorAnimationUpdatePass::note_target_layout_node,
+        .note_retained_layout_node = CompositorAnimationUpdatePass::note_retained_layout_node,
+        .visibility_is_observed = CompositorAnimationUpdatePass::visibility_is_observed,
+        .prepare_compositor_animation = CompositorAnimationUpdatePass::prepare_compositor_animation,
+        .paint_is_offscreen = CompositorAnimationUpdatePass::paint_is_offscreen,
+        .transform_affects_intersection_observation = CompositorAnimationUpdatePass::transform_affects_intersection_observation,
+        .transform_subtree_is_clipped_outside_viewport = CompositorAnimationUpdatePass::transform_subtree_is_clipped_outside_viewport,
+        .background_color_can_be_compositor_animated = CompositorAnimationUpdatePass::background_color_can_be_compositor_animated,
+        .request_frame = CompositorAnimationUpdatePass::request_frame,
+        .keep_frame = CompositorAnimationUpdatePass::keep_frame,
+        .frame_was_kept = CompositorAnimationUpdatePass::frame_was_kept,
+        .refresh_viewport_mapping = CompositorAnimationUpdatePass::refresh_viewport_mapping,
+        .note_throttled_animation_style_update = CompositorAnimationUpdatePass::note_throttled_animation_style_update,
+    };
+    auto outcome = Animations::RustFFI::animations_document_update_compositor_animations(m_animations, &host);
 
     // Retention changes whether zero-opacity or singular-transform content is recorded. The
     // flag is written once the pass is complete, so an animation that stays on the compositor
     // changes nothing.
-    for (auto const& [layout_node, retained_before] : previous_content_retention) {
-        bool const retained_now = retained_this_pass.contains(layout_node);
+    for (auto const& [layout_node, retained_before] : pass.previous_content_retention) {
+        bool const retained_now = pass.retained_this_pass.contains(layout_node);
         if (retained_now == retained_before)
             continue;
         layout_node->set_retains_compositor_animated_content(retained_now);
         Painting::set_needs_repaint(*layout_node, InvalidateDisplayList::PaintCommandsAndHitTestList);
     }
 
-    for (auto stale_slot : layout_nodes_with_stale_forced_effects_layer) {
+    for (auto stale_slot : pass.layout_nodes_with_stale_forced_effects_layer) {
         auto* layout_node = layout_node_arena().node_if_live(read, stale_slot);
         if (!layout_node)
             continue;
@@ -9924,7 +9206,7 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         invalidation.ensure_at_least(CSS::InvalidationLevel::Repaint);
         Painting::repaint_after_style_change(*layout_node, invalidation);
     }
-    for (auto stale_slot : layout_nodes_with_stale_forced_background_color_frame) {
+    for (auto stale_slot : pass.layout_nodes_with_stale_forced_background_color_frame) {
         auto* layout_node = layout_node_arena().node_if_live(read, stale_slot);
         if (!layout_node)
             continue;
@@ -9950,10 +9232,10 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
 
     paint_state().publish_compositor_animations(read, Painting::DocumentPaintState::PublishPendingCompositorAnimations::Yes);
 
-    if (compositor_animation_wakeup_delay_ms.has_value())
-        schedule_compositor_animation_wakeup(*compositor_animation_wakeup_delay_ms);
+    if (outcome.has_wakeup_delay)
+        schedule_compositor_animation_wakeup(outcome.wakeup_delay);
 
-    if (!has_observation_relevant_compositor_animation) {
+    if (!outcome.has_observation_relevant_compositor_animation) {
         if (m_compositor_animation_observation_timer)
             m_compositor_animation_observation_timer->stop();
     } else {
@@ -9970,48 +9252,38 @@ void Document::update_compositor_animations(Layout::BegunRead const& read)
         }
     }
 
-    if (requested_withdrawn_effect_sample)
+    if (outcome.requested_withdrawn_effect_sample)
         HTML::note_rendering_trace_event("animation frame pump request"sv);
 }
 
-void Document::append_pending_animation_event(Web::DOM::Document::PendingAnimationEvent const& event)
+void Document::append_pending_animation_event(Animations::AnimationRef const& animation, Animations::RustFFI::FfiPendingAnimationEvent const& event)
 {
-    if (m_style_stabilization_epoch_depth > 0) {
-        m_provisional_animation_event_queue.append(event);
-        HTML::note_rendering_trace_event("provisional animation events"sv);
-        return;
-    }
-    m_pending_animation_event_queue.append(event);
-    HTML::note_rendering_trace_event("animation events committed"sv);
+    auto provisional = m_style_stabilization_epoch_depth > 0;
+    Animations::RustFFI::animations_document_animations_append_event(m_animations, &animation.record(), &event, provisional);
+    HTML::note_rendering_trace_event(provisional ? "provisional animation events"sv : "animation events committed"sv);
+}
+
+// What preparing to observe the CSS animation events of a document asks of it.
+struct PrepareToObserveCssAnimationEventsContext {
+    GC::Ref<Document> document;
+    // NB: The animations stay alive while the timelines update, which can run script.
+    GC::RootVector<Animations::AnimationRef> animations;
+};
+
+static void keep_animation_alive_to_prepare_to_observe_css_animation_events(void* context, Animations::RustFFI::AnimationCell const* animation)
+{
+    Animations::keep_animation_alive_in(&static_cast<PrepareToObserveCssAnimationEventsContext*>(context)->animations, animation);
 }
 
 void Document::prepare_to_observe_css_animation_events()
 {
-    GC::RootVector<GC::Ref<Animations::KeyframeEffect>> effects_to_synchronize;
-    for (auto& animation : m_associated_animations) {
-        if (!animation.is_css_animation() || !animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
-            continue;
-        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
-        if (effect.per_frame_animation_tick_was_skipped())
-            effects_to_synchronize.append(effect);
-    }
-    if (effects_to_synchronize.is_empty())
-        return;
-
-    auto timestamp = HighResolutionTime::relative_high_resolution_time(
-        HighResolutionTime::unsafe_shared_current_time(), relevant_settings_object().global_object());
-    auto timelines_to_update = GC::RootVector { m_associated_animation_timelines.values() };
-    for (auto const& timeline : timelines_to_update)
-        timeline->update_current_time(timestamp);
-
-    // OPTIMIZATION: Events which occurred while there were no listeners were intentionally not sampled. Establish
-    //               the current phase as the baseline so a newly added listener only observes future events.
-    for (auto& effect : effects_to_synchronize) {
-        auto resolved_timing = effect->resolve_timing();
-        effect->set_previous_phase(resolved_timing.phase);
-        effect->set_previous_current_iteration(effect->current_iteration(resolved_timing).value_or(0.0));
-        effect->clear_per_frame_animation_tick_was_skipped();
-    }
+    PrepareToObserveCssAnimationEventsContext context { *this, {} };
+    Animations::RustFFI::FfiObserveCssAnimationEventsHost host {
+        .context = &context,
+        .keep_alive = keep_animation_alive_to_prepare_to_observe_css_animation_events,
+        .perform = Animations::web_animation_perform_host_effect,
+    };
+    Animations::RustFFI::animations_document_animations_prepare_to_observe_css_animation_events(m_animations, &host);
 }
 
 // https://www.w3.org/TR/web-animations-1/#update-animations-and-send-events
@@ -10025,24 +9297,35 @@ void Document::update_animations_and_send_events(double timestamp)
     for (auto& element : animate_motion_elements_to_update)
         element->update_referenced_motion_path();
 
-    GC::RootVector timelines_to_update = { m_associated_animation_timelines.values() };
-
     {
         HTML::TemporaryExecutionContext temporary_execution_context { relevant_settings_object() };
         // 1. Update the current time of all timelines associated with doc passing now as the timestamp.
-        for (auto const& timeline : timelines_to_update)
-            timeline->update_current_time(timestamp);
-
-        // NB: We dispatch events for all animations regardless of whether they have a timeline
-        GC::RootVector<GC::Ref<Animations::Animation>> animations;
-        for (auto& animation : m_associated_animations)
-            animations.append(animation);
-
-        for (auto& animation : animations) {
-            dispatch_events_for_animation_if_necessary(animation);
-            if (animation->disassociation_from_target_pending())
-                animation->disassociate_from_target_if_inert();
+        {
+            // NB: The animations the timelines update stay alive through it, which can run script.
+            GC::RootVector<Animations::AnimationRef> updated_animations;
+            Animations::RustFFI::FfiTimelineAnimationsHost timelines_host {
+                .context = &updated_animations,
+                .keep_alive = Animations::keep_animation_alive_in,
+                .perform = Animations::web_animation_perform_host_effect,
+            };
+            Animations::RustFFI::animations_document_update_timelines(m_animations, Animations::RustFFI::FfiTimelinesUpdate::All, timestamp, &timelines_host);
         }
+
+        // NB: We dispatch events for all animations regardless of whether they have a timeline. The core queues the events
+        //     the animation frame established for each CSS animation or transition, each with the time stamp of when it is
+        //     queued.
+        GC::RootVector<Animations::AnimationRef> animations;
+        Animations::RustFFI::FfiQueueAnimationEventsHost host {
+            .context = &animations,
+            .keep_alive = Animations::keep_animation_alive_in,
+            .time_stamp = [](void*, void* element) { return HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*static_cast<DOM::Element*>(element))); },
+            .queue_time_events = [](void*, void* animation_element) { static_cast<SVG::SVGAnimationElement*>(animation_element)->queue_time_events_if_necessary(); },
+            .perform = Animations::web_animation_perform_host_effect,
+        };
+        auto provisional = m_style_stabilization_epoch_depth > 0;
+        auto queued = Animations::RustFFI::animations_document_animations_queue_events(m_animations, provisional, &host);
+        for (; queued > 0; --queued)
+            HTML::note_rendering_trace_event(provisional ? "provisional animation events"sv : "animation events committed"sv);
 
         // 2. Remove replaced animations for doc.
         remove_replaced_animations();
@@ -10052,53 +9335,20 @@ void Document::update_animations_and_send_events(double timestamp)
     }
 
     // 4. Let events to dispatch be a copy of doc’s pending animation event queue.
-    GC::RootVector<PendingAnimationEvent> events_to_dispatch;
-    events_to_dispatch.extend(m_pending_animation_event_queue);
-
     // 5. Clear doc’s pending animation event queue.
-    m_pending_animation_event_queue.clear();
-
     // 6. Perform a stable sort of the animation events in events to dispatch as follows:
-    auto compare_events_by_composite_order = [](auto const& a, auto const& b) -> int {
-        if (!a.animation->effect() || !b.animation->effect())
-            return static_cast<int>(static_cast<bool>(a.animation->effect())) - static_cast<int>(static_cast<bool>(b.animation->effect()));
-        auto& a_effect = as<Animations::KeyframeEffect>(*a.animation->effect());
-        auto& b_effect = as<Animations::KeyframeEffect>(*b.animation->effect());
-        return Animations::KeyframeEffect::composite_order(a_effect, b_effect);
-    };
-    auto compare_events = [&](auto const& a, auto const& b) -> int {
-        // Sort the events by their scheduled event time such that events that were scheduled to occur earlier, sort
-        // before events scheduled to occur later and events whose scheduled event time is unresolved sort before events
-        // with a resolved scheduled event time.
-        //
-        // Within events with equal scheduled event times, sort by their composite order.
-        if (a.scheduled_event_time.has_value() != b.scheduled_event_time.has_value())
-            return a.scheduled_event_time.has_value() ? 1 : -1;
-        if (a.scheduled_event_time != b.scheduled_event_time)
-            return a.scheduled_event_time.value() < b.scheduled_event_time.value() ? -1 : 1;
-        return compare_events_by_composite_order(a, b);
-    };
-
-    // NB: The events of a frame come in the unspecified order of the document's animations, so sorting them is not
-    //     close to a no-op. Their positions in the queue keep the sort stable.
-    Vector<u32> event_order;
-    event_order.ensure_capacity(events_to_dispatch.size());
-    for (u32 index = 0; index < events_to_dispatch.size(); ++index)
-        event_order.unchecked_append(index);
-    quick_sort(event_order, [&](u32 a, u32 b) {
-        if (auto order = compare_events(events_to_dispatch[a], events_to_dispatch[b]); order != 0)
-            return order < 0;
-        return a < b;
-    });
-    GC::RootVector<PendingAnimationEvent> sorted_events;
-    sorted_events.ensure_capacity(events_to_dispatch.size());
-    for (auto index : event_order)
-        sorted_events.unchecked_append(events_to_dispatch[index]);
-
     // 7. Dispatch each of the events in events to dispatch at their corresponding target using the order established in
     //    the previous step.
-    for (auto const& event : sorted_events)
-        event.target->dispatch_event(event.event);
+    // NB: Bindings/Rust runs these steps over the queue the core holds, creating each event as it dispatches it. The
+    //     animation of each event stays rooted until all are dispatched.
+    GC::RootVector<Animations::AnimationRef> animations_of_events;
+    PendingAnimationEventHost host {
+        .context = &animations_of_events,
+        .keep_alive = [](void* context, Animations::RustFFI::AnimationCell const* animation) { Animations::keep_animation_alive_in(context, animation); },
+        .dispatch_at_element = [](void*, void* element, void* event) { static_cast<Element*>(element)->dispatch_event(*static_cast<Event*>(event)); },
+        .dispatch_time_event = [](void*, Animations::RustFFI::AnimationCell const* animation, Animations::RustFFI::FfiPendingAnimationEvent const* event) { static_cast<SVG::SVGAnimationElement*>(Animations::RustFFI::animations_smil_animation_element(animation))->dispatch_pending_time_event(*event); },
+    };
+    web_animation_dispatch_pending_animation_events(JS::HostABI::vm_to_abi(JS::VM::the()), this, m_animations, Animations::compare_elements_in_tree_order_for_composite_order, &host);
 
     // AD-HOC: Nothing else re-requests a rendering update while time-driven animations are running, since
     //         Document::set_needs_animated_style_update() only requests a frame when its flag flips from
@@ -10106,134 +9356,24 @@ void Document::update_animations_and_send_events(double timestamp)
     //         Without this, animations only advance when unrelated tasks happen to schedule rendering
     //         updates. Keep the frame pump going as long as some animation attached to a monotonically
     //         increasing timeline needs main-thread painting or observable animation events.
-    for (auto const& animation : m_associated_animations) {
-        if (animation.play_state() != Bindings::AnimationPlayState::Running)
-            continue;
-        auto timeline = animation.timeline();
-        if (!timeline || !timeline->is_monotonically_increasing())
-            continue;
-        if (animation.effect() && is<Animations::KeyframeEffect>(*animation.effect())) {
-            auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
-            if (effect.can_skip_per_frame_animation_tick()) {
-                effect.note_per_frame_animation_tick_was_skipped();
-                continue;
-            }
-            effect.clear_per_frame_animation_tick_was_skipped();
-            if (auto iteration_event_time = next_throttled_animation_iteration_event_time(animation, effect); iteration_event_time.has_value()) {
-                auto current_time = animation.current_time();
-                if (current_time.has_value() && current_time->type == Animations::TimeValue::Type::Milliseconds) {
-                    auto delay = (*iteration_event_time - current_time->value) / animation.playback_rate();
-                    if (delay > 0) {
-                        schedule_compositor_animation_wakeup(delay);
-                        continue;
-                    }
-                }
-            }
-        }
-        HTML::note_rendering_trace_event("animation frame pump request"sv);
-        set_rendering_pending(*this, RenderingPendingReason::NeedsRenderingUpdate, 1);
-        page().client().request_frame_for(*this);
-        break;
-    }
+    auto pump = Animations::RustFFI::animations_document_animations_frame_pump(m_animations);
+    if (pump.wakeup_delay.has_value)
+        schedule_compositor_animation_wakeup(pump.wakeup_delay.value);
+    if (!pump.request_frame)
+        return;
+    HTML::note_rendering_trace_event("animation frame pump request"sv);
+    set_rendering_pending(*this, RenderingPendingReason::NeedsRenderingUpdate, 1);
+    page().client().request_frame_for(*this);
 }
 
 // https://www.w3.org/TR/web-animations-1/#remove-replaced-animations
 void Document::remove_replaced_animations()
 {
-    // When asked to remove replaced animations for a Document, doc, then for every animation, animation, that:
-    // - has an associated animation effect whose effect target is a descendant of doc, and
-    // - is replaceable, and
-    // - has a replace state of active, and
-    // - for which there exists for each target property of every animation effect associated with animation, an
-    //   animation effect associated with a replaceable animation with a higher composite order than animation that
-    //   includes the same target property
-
-    GC::RootVector<GC::Ref<Animations::Animation>> replaceable_animations;
-    for (auto const& timeline : m_associated_animation_timelines) {
-        for (auto& animation : timeline->associated_animations()) {
-            if (!animation.effect() || !animation.effect()->target() || &animation.effect()->target()->document() != this)
-                continue;
-
-            if (!animation.is_replaceable())
-                continue;
-
-            if (animation.replace_state() != Animations::AnimationReplaceState::Active)
-                continue;
-
-            // Composite order is only defined for KeyframeEffects
-            if (!animation.effect()->is_keyframe_effect())
-                continue;
-
-            replaceable_animations.append(animation);
-        }
-    }
-
-    quick_sort(replaceable_animations, [](GC::Ref<Animations::Animation>& a, GC::Ref<Animations::Animation>& b) {
-        VERIFY(a->effect()->is_keyframe_effect());
-        VERIFY(b->effect()->is_keyframe_effect());
-        auto& a_effect = *static_cast<Animations::KeyframeEffect*>(a->effect().ptr());
-        auto& b_effect = *static_cast<Animations::KeyframeEffect*>(b->effect().ptr());
-        return Animations::KeyframeEffect::composite_order(a_effect, b_effect) < 0;
-    });
-
-    // Lower value = higher priority
-    HashMap<CSS::PropertyNameAndID, size_t> highest_property_composite_orders;
-    for (int i = replaceable_animations.size() - 1; i >= 0; i--) {
-        auto animation = replaceable_animations[i];
-        bool has_any_highest_priority_property = false;
-
-        for (auto const& property : animation->effect()->target_properties()) {
-            if (!highest_property_composite_orders.contains(property)) {
-                has_any_highest_priority_property = true;
-                highest_property_composite_orders.set(property, i);
-            }
-        }
-
-        if (!has_any_highest_priority_property) {
-            // perform the following steps:
-
-            // - Set animation’s replace state to removed.
-            animation->set_replace_state(Animations::AnimationReplaceState::Removed);
-
-            // - Create an AnimationPlaybackEvent, removeEvent.
-            // - Set removeEvent’s type attribute to remove.
-            // - Set removeEvent’s currentTime attribute to the current time of animation.
-            // - Set removeEvent’s timelineTime attribute to the current time of the timeline with which animation is
-            //   associated.
-            auto remove_event = Animations::AnimationPlaybackEvent::create(
-                HTML::EventNames::remove,
-                animation->current_time().has_value() ? Animations::NullableCSSNumberish { animation->current_time()->as_css_numberish() } : Animations::NullableCSSNumberish { Empty {} },
-                animation->timeline()->current_time().has_value() ? Animations::NullableCSSNumberish { animation->timeline()->current_time()->as_css_numberish() } : Animations::NullableCSSNumberish { Empty {} },
-                HighResolutionTime::current_high_resolution_time(relevant_global_object(*this)));
-
-            // - If animation has a document for timing, then append removeEvent to its document for timing's pending
-            //   animation event queue along with its target, animation. For the scheduled event time, use the result of
-            //   applying the procedure to convert timeline time to origin-relative time to the current time of the
-            //   timeline with which animation is associated.
-            if (auto document = animation->document_for_timing()) {
-                PendingAnimationEvent pending_animation_event {
-                    .event = remove_event,
-                    .animation = animation,
-                    .target = animation,
-                    .scheduled_event_time = animation->timeline()->convert_a_timeline_time_to_an_origin_relative_time(animation->timeline()->current_time()),
-                };
-                document->append_pending_animation_event(pending_animation_event);
-            }
-            //   Otherwise, queue a task to dispatch removeEvent at animation. The task source for this task is the DOM
-            //   manipulation task source.
-            else {
-                HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_settings_object().realm().global_object(), GC::create_function(GC::Heap::the(), GC::captures(animation, remove_event), [](auto& animation, auto& remove_event) {
-                    animation->dispatch_event(remove_event);
-                }));
-            }
-        }
-    }
-}
-
-WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animations::Animation>>> Document::get_animations()
-{
-    update_style();
-    return calculate_get_animations(*this);
+    // NB: What the procedure performs for an animation it removes can run the GC, which must not collect the animation.
+    GC::RootVector<Animations::AnimationRef> removed_animations;
+    Animations::RustFFI::animations_remove_replaced_animations(
+        m_animations, this, Animations::compare_elements_in_tree_order_for_composite_order,
+        Animations::keep_animation_alive_in, &removed_animations, Animations::web_animation_perform_host_effect);
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#dom-document-nameditem-filter
@@ -11043,9 +10183,8 @@ void Document::unregister_shadow_root(Badge<DOM::ShadowRoot>, DOM::ShadowRoot& s
     m_shadow_roots.remove(shadow_root);
     m_shadow_roots_with_counter_styles_to_settle.remove(shadow_root);
     note_style_sheet_set_change();
-    // The style engine names the keyframe sets of the root's `@keyframes` by pointer. The root may be leaving from a
-    // garbage collection's finalizer, which must not reach into the engine, so its row is given up before the next
-    // style update, and the sets stay alive until then.
+    // The root may be leaving from a garbage collection's finalizer, which must not reach into the engine, so the rows
+    // its scope published are given up before the next style update.
     if (auto departed = shadow_root.style_scope().take_published_animation_keyframes(); departed.has_value())
         m_departed_animation_keyframes.append(departed.release_value());
 }
@@ -11062,7 +10201,8 @@ void Document::publish_animation_keyframes_for_style_update()
     m_animation_keyframes_published_generation = m_style_sheet_set_generation;
     auto* host = style_computer().style_engine().host();
     for (auto const& departed : m_departed_animation_keyframes) {
-        CSS::StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(host, departed.tree_scope.value(), {}, {}, {});
+        if (departed.has_animation_keyframes)
+            CSS::StyleEngineFFI::style_engine_set_tree_scope_animation_keyframes(host, departed.tree_scope.value(), {}, {}, {});
         if (departed.has_position_try_rules)
             CSS::StyleEngineFFI::style_engine_set_tree_scope_position_try_rules(host, departed.tree_scope.value(), {}, {}, {});
     }
@@ -11861,7 +11001,7 @@ void Document::set_needs_repaint(InvalidateDisplayList should_invalidate_display
     case InvalidateDisplayList::No:
         break;
     case InvalidateDisplayList::PaintCommands:
-        set_needs_to_record_display_list_keeping_hit_test_display_list();
+        set_needs_to_record_display_list_keeping_hit_test_items_on_screen();
         break;
     case InvalidateDisplayList::PaintCommandsAndHitTestList:
         set_needs_to_record_display_list();
@@ -12043,11 +11183,11 @@ Vector<Compositing::RustFFI::NodeSlotId> Document::collect_scroll_snap_container
 
 void Document::set_needs_to_record_display_list()
 {
-    m_hit_test_display_list = nullptr;
-    set_needs_to_record_display_list_keeping_hit_test_display_list();
+    m_hit_test_items_on_screen = {};
+    set_needs_to_record_display_list_keeping_hit_test_items_on_screen();
 }
 
-void Document::set_needs_to_record_display_list_keeping_hit_test_display_list()
+void Document::set_needs_to_record_display_list_keeping_hit_test_items_on_screen()
 {
     if (auto navigable = this->navigable())
         navigable->set_needs_to_record_display_list();
@@ -12122,33 +11262,42 @@ Optional<Painting::DisplayListRecording> Document::start_recording(Layout::Begun
     return Painting::start_rust_display_list_recording(read, *this, visual_context_tree_structural_epoch, surface_clear_color, cache_mode, config, overlay_inputs, move(committed));
 }
 
-void Document::finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const& recording, Painting::HitTestListStands hit_test_list_stands)
+void Document::finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const& recording, Painting::HitTestItemsStand hit_test_items_stand)
 {
     Painting::publish_rust_display_list_recording(read, *this);
-    adopt_published_recording(hit_test_list_read(read, hit_test_list_stands), recording);
+    adopt_published_recording(hit_test_items_stand, recording);
 }
 
-Painting::HitTestListAdoption Document::adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const& recording)
+bool Document::hit_test_items_on_screen_are_as_adopted() const
 {
-    auto adoption = Painting::HitTestListAdoption::Kept;
-    if (!hit_test_list_read.has_value()) {
-        m_hit_test_display_list = nullptr;
-        adoption = Painting::HitTestListAdoption::Dropped;
-    } else if (!m_hit_test_display_list || !m_hit_test_display_list->is_current()) {
-        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(*hit_test_list_read, recording.visual_context_tree_structural_epoch, layout_node_arena(), *m_chrome_widget_registry);
-        adoption = Painting::HitTestListAdoption::TookNew;
-    }
-    return adoption;
+    if (!m_hit_test_items_on_screen.has_value() || m_hit_test_items_on_screen->generation == 0)
+        return false;
+    return Layout::RustFFI::layout_hit_test_items_on_screen_generation(m_layout_node_arena->host()) == m_hit_test_items_on_screen->generation;
 }
 
-bool Document::hit_test_display_list_is_current(Layout::BegunRead const& read)
+Painting::HitTestItemsAdoption Document::adopt_published_recording(Painting::HitTestItemsStand hit_test_items_stand, Painting::DisplayListRecording const& recording)
+{
+    if (hit_test_items_stand == Painting::HitTestItemsStand::No) {
+        m_hit_test_items_on_screen = {};
+        return Painting::HitTestItemsAdoption::Dropped;
+    }
+    if (hit_test_items_on_screen_are_as_adopted())
+        return Painting::HitTestItemsAdoption::Kept;
+    m_hit_test_items_on_screen = HitTestItemsOnScreen {
+        .generation = Layout::RustFFI::layout_hit_test_items_on_screen_generation(layout_node_arena().host()),
+        .visual_context_tree_structural_epoch = recording.visual_context_tree_structural_epoch,
+    };
+    return Painting::HitTestItemsAdoption::TookNew;
+}
+
+bool Document::hit_test_items_on_screen_are_current(Layout::BegunRead const& read)
 {
     Painting::publish_image_map_area_facts_if_needed(read, *this);
     if (!has_committed_viewport_box())
         return false;
-    // Reading the epoch prepares the paint properties, which can drop the hit-test list.
+    // Reading the epoch prepares the paint properties, which can change what the rows say can be hit.
     auto structural_epoch = paint_state().visual_context_tree_structural_epoch(read);
-    return m_hit_test_display_list && m_hit_test_display_list->is_current() && m_hit_test_display_list->visual_context_tree_structural_epoch() == structural_epoch;
+    return hit_test_items_on_screen_are_as_adopted() && m_hit_test_items_on_screen->visual_context_tree_structural_epoch == structural_epoch;
 }
 
 void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
@@ -12164,34 +11313,16 @@ void Document::set_caret_hit_test_debug_rect(Optional<CSSPixelRect> rect)
 
 Optional<Painting::HitTestQuery> Document::prepare_hit_test_query(Layout::BegunRead const& read, Optional<i64> visual_animation_sample_time_nanoseconds)
 {
+    Painting::publish_image_map_area_facts_if_needed(read, *this);
     if (!has_committed_viewport_box())
         return {};
 
-    // A hit test only reads a recording of the document as it is now: it presents nothing, so the compositor never
-    // shows a frame a hit test made in place of one the render clock sampled later. The next frame records again.
-    // It copies from the published recording only where it records with the paint config the frames record with.
-    auto rebuild_hit_test_display_list = [&] {
-        set_needs_to_record_display_list();
-        HTML::PaintConfig paint_config { .paint_overlay = true };
-        if (auto navigable = this->navigable())
-            paint_config = navigable->stamp_paint_config(paint_config);
-        (void)record_display_list(read, paint_config, Painting::PaintCommandCacheMode::ReadOnly);
-    };
-
-    // The recording in flight replaces the hit-test list once it lands, so a list that is not current waits for it
-    // first.
-    if (!hit_test_display_list_is_current(read)) {
-        if (auto navigable = this->navigable())
-            navigable->take_recording_in_flight_in(HTML::LocalNavigable::TakeIn::Wait);
-    }
-    if (!hit_test_display_list_is_current(read)) {
-        rebuild_hit_test_display_list();
-        if (!hit_test_display_list_is_current(read))
-            return {};
-    }
+    // A hit test reads the document's rows as they are now, so it waits for no recording and makes none.
+    Layout::RustFFI::render_state_prepare_paint_properties_before_hit_test(layout_node_arena().host(), &read);
 
     return Painting::HitTestQuery {
-        *m_hit_test_display_list,
+        layout_node_arena(),
+        *m_chrome_widget_registry,
         page().client().device_pixels_per_css_pixel(),
         page().chrome_metrics(),
         visual_animation_sample_time_nanoseconds,
@@ -12215,7 +11346,7 @@ Optional<Painting::HitTestResult> Document::hit_test(Layout::BegunRead const& re
     // 2. If there is a box in the viewport that would be a target for hit testing at coordinates x,y, when applying
     //    the transforms that apply to the descendants of the viewport, return the associated element and terminate
     //    these steps.
-    auto result = query->list().hit_test(read, position, *query);
+    auto result = query->hit_test(read, position);
     if (result.has_value() && (result->chrome_widget || result->is_scrollbar || result->dom_node()))
         return result;
 
@@ -12231,7 +11362,7 @@ Optional<Painting::CaretPosition> Document::caret_position_from_point(Layout::Be
     auto query = prepare_hit_test_query(read);
     if (!query.has_value())
         return {};
-    return query->list().caret_position_from_point(read, position, *query, constraint_scope);
+    return query->caret_position_from_point(read, position, constraint_scope);
 }
 
 TraversalDecision Document::hit_test_all(Layout::BegunRead const& read, CSSPixelPoint position, Function<TraversalDecision(Painting::HitTestResult)> const& callback)
@@ -12239,7 +11370,7 @@ TraversalDecision Document::hit_test_all(Layout::BegunRead const& read, CSSPixel
     auto query = prepare_hit_test_query(read);
     if (!query.has_value())
         return TraversalDecision::Continue;
-    return query->list().hit_test_all(read, position, *query, callback);
+    return query->hit_test_all(read, position, callback);
 }
 
 Unicode::Segmenter& Document::grapheme_segmenter() const
@@ -12628,7 +11759,7 @@ Utf16String Document::dump_display_list()
     if (paint_state().has_visual_context_tree(read))
         schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
 
-    if (!record_display_list(read, HTML::PaintConfig {}, Painting::PaintCommandCacheMode::ReadOnly))
+    if (!record_display_list(read, HTML::PaintConfig { .records_whole_document = true }, Painting::PaintCommandCacheMode::ReadOnly))
         return "No display list"_utf16;
 
     return Painting::serialize_painting_dump(read, *this);
@@ -12661,7 +11792,7 @@ WebIDL::ExceptionOr<GC::Ref<XPath::XPathExpression>> Document::create_expression
 
 WebIDL::ExceptionOr<GC::Ref<XPath::XPathResult>> Document::evaluate(Utf16String const& expression, DOM::Node const& context_node, GC::Ptr<XPath::XPathNSResolver> resolver, WebIDL::UnsignedShort type, GC::Ptr<XPath::XPathResult> result)
 {
-    return XPath::throw_evaluation_error_if_needed(XPath::evaluate(expression, context_node, resolver, type, result));
+    return XPath::evaluate(expression, context_node, resolver, type, result);
 }
 
 GC::Ref<DOM::Node> Document::create_ns_resolver(GC::Ref<DOM::Node> node_resolver)

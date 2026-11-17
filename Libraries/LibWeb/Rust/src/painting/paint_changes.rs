@@ -19,7 +19,7 @@ use super::paintable_data::{
     FfiCustomHighlightReplacedEntry, FfiCustomHighlightTextEntry, FfiSearchTextRange, FfiSelectionEntry,
     FfiSpellingError, PaintableFlag,
 };
-use super::record::damage::PaintDamage;
+use super::record::change_ticks::RowPaintChange;
 use super::replaced_paint_facts::{ImagePaintFacts, ReplacedPaintFacts, VideoPaintFacts};
 use super::selection::HighlightStyleRecords;
 use super::visual_context::dirty::VisualContextBoxDirtyKind;
@@ -124,7 +124,6 @@ pub(crate) enum PaintChange {
     /// The host published the recording `output` and takes it in as the document's last.
     TakeInRecording {
         output: Arc<super::record::RecordingOutput>,
-        hit_test_list_changed: bool,
         publishes_recording: bool,
     },
 }
@@ -221,7 +220,7 @@ impl PaintChange {
                     return;
                 }
                 rows.paintable_data_mut(node).set_flag(flag, hidden);
-                rows.push_paint_damage(node, PaintDamage::HIT_OVERLAY);
+                rows.note_paint_change(node, RowPaintChange::HIT_TESTING);
             }
             Self::SetLayerImagePaintFacts { node, entries } => {
                 arena.set_layer_image_paint_facts(node, entries);
@@ -244,10 +243,9 @@ impl PaintChange {
             }
             Self::TakeInRecording {
                 output,
-                hit_test_list_changed,
                 publishes_recording,
             } => {
-                super::record::publish::take_in_recording(arena, output, hit_test_list_changed, publishes_recording);
+                super::record::publish::take_in_recording(arena, output, publishes_recording);
             }
         }
     }

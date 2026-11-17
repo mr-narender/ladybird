@@ -8,8 +8,11 @@
 //! sender may ask for, and the answer a synchronous one gets.
 
 use super::{CompositorCore, ContextOwnerCheckResult};
+use crate::display_list_chunk_stores::chunks_of_list_sent_whole;
 use crate::host::{PresentationId, WebContentClientId};
 use libcompositing_rust::display_list::replay::{ReplayFrame, ReplaySelection, replay_display_list};
+use libcompositing_rust::display_list::storage::DisplayListStorage;
+use libcompositing_rust::display_list::window::RecordedWindow;
 use libcompositing_rust::ipc_types::compositor_presentation_client::messages::DidNotDispatchInputEvent;
 use libcompositing_rust::ipc_types::compositor_presentation_server::messages::{
     HandleAndDispatchKeyEvent, HandleAndDispatchMouseEvent, HandleAndDispatchPinchEvent,
@@ -214,13 +217,17 @@ impl MessagesFromWebContent<'_> {
             Ok(false)
         };
         let SharedDisplayList {
-            packed_tape,
-            tape_size,
-            run_count,
+            chunks_in_paint_order,
+            packed_chunks,
+            packed_chunk_sizes,
             properties,
             ..
         } = message.display_list;
-        let storage = match raster.receive_display_list_storage(packed_tape, tape_size, run_count) {
+        let storage = match raster
+            .receive_display_list_chunks(packed_chunks, &packed_chunk_sizes)
+            .and_then(|sent| chunks_of_list_sent_whole(sent, &chunks_in_paint_order))
+            .and_then(|chunks| DisplayListStorage::of_received_chunks(&chunks))
+        {
             Ok(storage) => storage,
             Err(error) => {
                 let _ = writeln!(
@@ -267,18 +274,18 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
     fn update_display_list(&mut self, message: UpdateDisplayList) -> Result<(), Misbehavior> {
         let started_at = std::time::Instant::now();
         let SharedDisplayList {
-            packed_tape,
-            tape_size,
-            run_count,
+            chunks_in_paint_order,
+            packed_chunks,
+            packed_chunk_sizes,
             properties,
             async_scrolling_metadata,
         } = message.display_list;
-        let storage = match self
+        let sent = match self
             .core
             .raster()
-            .receive_display_list_storage(packed_tape, tape_size, run_count)
+            .receive_display_list_chunks(packed_chunks, &packed_chunk_sizes)
         {
-            Ok(storage) => storage,
+            Ok(sent) => sent,
             Err(error) => {
                 let _ = writeln!(
                     std::io::stderr(),
@@ -287,6 +294,29 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
                 return Err(Misbehavior(
                     "WebContent published a display list its shared buffer does not hold",
                 ));
+            }
+        };
+        let sent_chunk_count = sent.len();
+        // The chunks are taken in before anything else is checked: the list counts as one of the latest of the context
+        // on both ends whether it is installed or not.
+        let chunks = match self.core.take_in_display_list_chunks(
+            self.client_id,
+            message.context_id,
+            sent,
+            &chunks_in_paint_order,
+        ) {
+            Ok(Some(chunks)) => chunks,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(Misbehavior(error)),
+        };
+        let storage = match DisplayListStorage::of_received_chunks(&chunks) {
+            Ok(storage) => storage,
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Compositor: Dropping display list update from WebContent: {error}"
+                );
+                return Ok(());
             }
         };
         let adopt_time = started_at.elapsed();
@@ -334,7 +364,18 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
             );
             return Ok(());
         }
+        let window = match properties.window.as_ref().map(RecordedWindow::from_ipc) {
+            Some(None) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Compositor: Dropping display list update whose window no recording could have placed"
+                );
+                return Ok(());
+            }
+            window => window.flatten(),
+        };
         let scroll_state_snapshot = message.scroll_state;
+        let storage_size = storage.bytes().len();
         let display_list = DisplayList::new(
             storage,
             properties.id,
@@ -342,7 +383,8 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
             async_scrolling_metadata,
             properties.surface_clear_color,
             properties.root_group_color,
-        );
+        )
+        .with_window(window);
         if !self.core.install_display_list_update(
             message.context_id,
             Rc::new(display_list),
@@ -356,7 +398,9 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
         if display_list_timing_enabled() {
             let _ = writeln!(
                 std::io::stderr(),
-                "DISPLAY_LIST_RECEIVE bytes={tape_size} adopt={} µs install={} µs",
+                "DISPLAY_LIST_RECEIVE bytes={} chunks={} sent={sent_chunk_count} adopt={} µs install={} µs",
+                storage_size,
+                chunks.len(),
                 adopt_time.as_micros(),
                 (started_at.elapsed() - adopt_time).as_micros()
             );

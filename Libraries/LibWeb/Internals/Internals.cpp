@@ -22,6 +22,7 @@
 #include <LibGfx/Cursor.h>
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/Date.h>
@@ -33,7 +34,7 @@
 #include <LibURL/Parser.h>
 #include <LibWeb/ARIA/AriaData.h>
 #include <LibWeb/ARIA/StateAndProperties.h>
-#include <LibWeb/Animations/DocumentTimeline.h>
+#include <LibWeb/Animations/RecordHandles.h>
 #include <LibWeb/Bindings/Internals.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
@@ -442,6 +443,11 @@ WebIDL::ExceptionOr<void> Internals::mark_as_garbage(Utf16String const& variable
     TRY(environment->set_mutable_binding(vm, variable_name_fly, JS::js_undefined(), false));
     (void)TRY(environment->delete_binding(vm, variable_name_fly));
     vm.heap().uproot_cell(&value.as_cell());
+    // A wrapper's wrappable is a cell of its own, so a stale stack word that points at it could still keep it alive.
+    if (value.is_object()) {
+        if (auto* platform_object = Bindings::as_platform_object(value.as_object()); platform_object && platform_object->wrappable())
+            vm.heap().uproot_cell(platform_object->wrappable().ptr());
+    }
     return {};
 }
 
@@ -1340,9 +1346,13 @@ void Internals::load_url(Utf16String const& url_string)
     });
 }
 
+// Defined in Bindings/Rust/src/internals/internal_animation_timeline.rs.
+extern "C" void* web_internal_animation_timeline_create(JSVM*, DOM::Document*);
+
 GC::Ref<InternalAnimationTimeline> Internals::create_internal_animation_timeline()
 {
-    return InternalAnimationTimeline::create(window().associated_document());
+    auto* cell = web_internal_animation_timeline_create(JS::HostABI::vm_to_abi(JS::VM::the()), &window().associated_document());
+    return static_cast<InternalAnimationTimeline&>(*static_cast<Bindings::RustInterfaceCell*>(cell));
 }
 
 WebIDL::ExceptionOr<void> Internals::simulate_drag_start(double x, double y, Utf16String const& name, Utf16String const& contents)
@@ -1736,7 +1746,7 @@ bool Internals::recorded_display_list_blocks_wheel_event_at(double x, double y)
     return Layout::RustFFI::render_state_recorded_blocks_wheel_event_at(document.layout_node_arena().host(), position);
 }
 
-void Internals::record_display_list_for_testing(bool paint_overlay, bool cold)
+void Internals::record_display_list_for_testing(bool paint_overlay, bool cold, bool finest_runs)
 {
     auto& document = window().associated_document();
     Layout::ForcedReadScope read { document };
@@ -1746,7 +1756,7 @@ void Internals::record_display_list_for_testing(bool paint_overlay, bool cold)
     // A recording against a visual context tree built fresh copies nothing from the published one.
     if (cold)
         document.schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
-    (void)document.record_display_list(read, HTML::PaintConfig { .paint_overlay = paint_overlay }, Painting::PaintCommandCacheMode::ReadWrite);
+    (void)document.record_display_list(read, HTML::PaintConfig { .paint_overlay = paint_overlay, .records_in_finest_runs = finest_runs }, Painting::PaintCommandCacheMode::ReadWrite);
 }
 
 void Internals::set_autoplay_policy(Utf16String const& policy)
@@ -3118,6 +3128,39 @@ void Internals::force_parallel_layout()
     Layout::RustFFI::render_state_force_parallel_layout(window().associated_document().layout_node_arena().host());
 }
 
+// The bytes of the objects script sees of an animation and of its associated effect, beside their records. Defined in
+// Bindings/Rust/src/animations/animation.rs.
+extern "C" size_t web_animation_object_memory_size(Animations::RustFFI::AnimationCell const*);
+
+// NB: The Animation objects of the animations associated with the document's elements, which a CSS animation or
+//     transition only has once script asks for it.
+static u64 animation_object_bytes(DOM::Document& document)
+{
+    u64 bytes = 0;
+    document.for_each_in_inclusive_subtree_of_type<DOM::Element>([&](DOM::Element& element) {
+        for (auto const& animation : element.associated_animations_unordered())
+            bytes += web_animation_object_memory_size(&animation.record());
+        return TraversalDecision::Continue;
+    });
+    return bytes;
+}
+
+// NB: The records animations and their effects keep their state in, the keyframe sets they run, each counted once
+//     however many effects share it, and each element's lists of its animations and transitions.
+static u64 animation_record_bytes(DOM::Document& document)
+{
+    u64 bytes = 0;
+    HashTable<Animations::RustFFI::KeyframeSet const*> counted_keyframe_sets;
+    document.for_each_in_inclusive_subtree_of_type<DOM::Element>([&](DOM::Element& element) {
+        bytes += element.animation_record_memory_size([](void* context, Animations::RustFFI::KeyframeSet const* keyframe_set) {
+            return static_cast<HashTable<Animations::RustFFI::KeyframeSet const*>*>(context)->set(keyframe_set) == HashSetResult::InsertedNewEntry;
+        },
+            &counted_keyframe_sets);
+        return TraversalDecision::Continue;
+    });
+    return bytes;
+}
+
 GC::Ref<JS::Object> Internals::style_memory_report()
 {
     auto& document = window().associated_document();
@@ -3156,6 +3199,8 @@ GC::Ref<JS::Object> Internals::style_memory_report()
     });
     define(*owners, "cppInstalledStyles"sv, installed_style_bytes);
     define(*owners, "cppHintProperties"sv, hint_bytes);
+    define(*owners, "animationObjects"sv, animation_object_bytes(document));
+    define(*owners, "animationRecords"sv, animation_record_bytes(document));
 
     auto object = JS::Object::create(realm, nullptr);
     object->define_direct_property("owners"_utf16_fly_string, owners, JS::default_attributes);

@@ -6,10 +6,34 @@
 
 #pragma once
 
+#include <AK/Array.h>
+#include <AK/String.h>
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <LibCrypto/ASN1/ASN1.h>
 #include <LibCrypto/BigInt/UnsignedBigInteger.h>
+
+namespace {
+
+// Used by ASN1 macros, whose errors are views of it. It keeps the text of the last error of a thread, cut to fit.
+// NB: Not a String, so that it needs no destructor and a thread that ends leaves nothing behind.
+struct ASN1ErrorString {
+    ASN1ErrorString& operator=(String const& text)
+    {
+        m_length = min(text.bytes().size(), m_buffer.size());
+        text.bytes().trim(m_length).copy_to(m_buffer);
+        return *this;
+    }
+
+    StringView bytes_as_string_view() const { return StringView { m_buffer.span().trim(m_length) }; }
+
+    Array<u8, 512> m_buffer {};
+    size_t m_length { 0 };
+};
+
+static thread_local ASN1ErrorString s_error_string;
+
+}
 
 namespace Crypto::ASN1 {
 
@@ -65,13 +89,6 @@ using ObjectIdentifier = Vector<u32, 12>;
         ERROR_WITH_SCOPE(TRY(String::formatted("Rewrite of kind " #kind_name " failed: {}", value_name##_result.error()))); \
     }
 
-#define DROP_OBJECT()                                                                   \
-    do {                                                                                \
-        if (auto error = decoder.drop(); error.is_error()) {                            \
-            ERROR_WITH_SCOPE(TRY(String::formatted("Drop failed: {}", error.error()))); \
-        }                                                                               \
-    } while (0)
-
 class BitStringView {
 public:
     BitStringView(ReadonlyBytes data, size_t unused_bits)
@@ -87,27 +104,10 @@ public:
         return m_data;
     }
 
-    bool get(size_t index) const
-    {
-        if (index >= 8 * m_data.size() - m_unused_bits)
-            return false;
-        return 0 != (m_data[index / 8] & (1u << (7 - (index % 8))));
-    }
-
     size_t unused_bits() const { return m_unused_bits; }
     size_t byte_length() const { return m_data.size(); }
 
     ReadonlyBytes underlying_bytes() const { return m_data; }
-
-    // FIXME: Improve me! I am naive!
-    bool operator==(BitStringView const& other) const
-    {
-        for (size_t bit_index = 0; bit_index < 8 * m_data.size() - m_unused_bits; ++bit_index) {
-            if (get(bit_index) != other.get(bit_index))
-                return false;
-        }
-        return true;
-    }
 
 private:
     ReadonlyBytes m_data;
@@ -255,13 +255,9 @@ private:
         if (value_or_error.is_error())
             return value_or_error.release_error();
 
-        if constexpr (IsSame<ValueType, bool> && !IsSame<DecodedType, bool>) {
-            return Error::from_string_literal("ASN1::Decoder: Trying to decode a boolean from a non-boolean type");
-        } else {
-            auto&& value = value_or_error.value();
-            if constexpr (requires { ValueType { value }; })
-                return ValueType { value };
-        }
+        auto&& value = value_or_error.value();
+        if constexpr (requires { ValueType { value }; })
+            return ValueType { value };
 
         return Error::from_string_literal("ASN1::Decoder: Trying to decode a value from an incompatible type");
     }
@@ -277,9 +273,6 @@ private:
             if (klass != Class::Universal)
                 return with_type_check<ValueType>(data);
 
-            if (kind == Kind::Boolean)
-                return with_type_check<ValueType>(decode_boolean(data));
-
             if (kind == Kind::Integer)
                 return with_type_check<ValueType>(decode_arbitrary_sized_integer(data));
 
@@ -291,12 +284,6 @@ private:
 
             if (kind == Kind::ObjectIdentifier)
                 return with_type_check<ValueType>(decode_object_identifier(data));
-
-            if (kind == Kind::PrintableString || kind == Kind::IA5String || kind == Kind::UTCTime)
-                return with_type_check<ValueType>(decode_printable_string(data));
-
-            if (kind == Kind::Utf8String)
-                return with_type_check<ValueType>(StringView { data.data(), data.size() });
 
             if (kind == Kind::BitString)
                 return with_type_check<ValueType>(decode_bit_string(data));
@@ -310,12 +297,10 @@ private:
     ErrorOr<u8> read_byte();
     ErrorOr<ReadonlyBytes> read_bytes(size_t length);
 
-    static ErrorOr<bool> decode_boolean(ReadonlyBytes);
     static ErrorOr<UnsignedBigInteger> decode_arbitrary_sized_integer(ReadonlyBytes);
     static ErrorOr<StringView> decode_octet_string(ReadonlyBytes);
     static ErrorOr<nullptr_t> decode_null(ReadonlyBytes);
     static ErrorOr<ObjectIdentifier> decode_object_identifier(ReadonlyBytes);
-    static ErrorOr<StringView> decode_printable_string(ReadonlyBytes);
     static ErrorOr<BitStringView> decode_bit_string(ReadonlyBytes);
 
     Vector<ReadonlyBytes> m_stack;
@@ -339,12 +324,8 @@ public:
     template<typename ValueType>
     ErrorOr<void> write(ValueType const& value, Optional<Class> class_override = {}, Optional<Kind> kind_override = {})
     {
-        if constexpr (IsSame<ValueType, bool>) {
-            return write_boolean(value, class_override, kind_override);
-        } else if constexpr (IsSame<ValueType, UnsignedBigInteger> || (IsIntegral<ValueType> && IsUnsigned<ValueType>)) {
+        if constexpr (IsSame<ValueType, UnsignedBigInteger> || (IsIntegral<ValueType> && IsUnsigned<ValueType> && !IsSame<ValueType, bool>)) {
             return write_arbitrary_sized_integer(value, class_override, kind_override);
-        } else if constexpr (IsOneOf<ValueType, StringView, String, ByteString>) {
-            return write_printable_string(value, class_override, kind_override);
         } else if constexpr (IsOneOf<ValueType, ReadonlyBytes, ByteBuffer>) {
             return write_octet_string(value, class_override, kind_override);
         } else if constexpr (IsSame<ValueType, nullptr_t>) {
@@ -390,9 +371,7 @@ private:
     ErrorOr<void> write_bytes(ReadonlyBytes);
     ErrorOr<void> write_byte(u8);
 
-    ErrorOr<void> write_boolean(bool, Optional<Class>, Optional<Kind>);
     ErrorOr<void> write_arbitrary_sized_integer(UnsignedBigInteger const&, Optional<Class>, Optional<Kind>);
-    ErrorOr<void> write_printable_string(StringView, Optional<Class>, Optional<Kind>);
     ErrorOr<void> write_octet_string(ReadonlyBytes, Optional<Class>, Optional<Kind>);
     ErrorOr<void> write_null(Optional<Class>, Optional<Kind>);
     ErrorOr<void> write_object_identifier(Span<u32 const>, Optional<Class>, Optional<Kind>);

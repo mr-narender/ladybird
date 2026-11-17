@@ -31,14 +31,12 @@
 #include <LibWeb/Bindings/Window.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
-#include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/CountersSet.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/ElementBoxKind.h>
-#include <LibWeb/CSS/GeneratedContent.h>
 #include <LibWeb/CSS/Invalidation/AttributeInvalidator.h>
 #include <LibWeb/CSS/Invalidation/CustomElementInvalidator.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
@@ -389,6 +387,7 @@ void Element::finalize()
 {
     Base::finalize();
     CSS::Parser::ValueParserFFI::rust_declaration_block_destroy(exchange(m_inline_declarations, nullptr));
+    finalize_animations();
 }
 
 void Element::append_to_attribute_list(QualifiedName name, Utf16String value)
@@ -975,7 +974,7 @@ bool is_valid_element_local_name(Utf16View const& name)
 }
 
 // https://dom.spec.whatwg.org/#validate-and-extract
-ErrorOr<QualifiedName, ValidateAndExtractError> validate_and_extract(Optional<FlyString> namespace_, FlyString const& qualified_name, ValidationContext context)
+ErrorOr<QualifiedName, ValidateAndExtractError> validate_and_extract(Optional<Utf16FlyString> namespace_, Utf16FlyString const& qualified_name, ValidationContext context)
 {
     // To validate and extract a namespace and qualifiedName, run these steps:
 
@@ -987,9 +986,7 @@ ErrorOr<QualifiedName, ValidateAndExtractError> validate_and_extract(Optional<Fl
     Optional<Utf16View> prefix_view = {};
 
     // 3. Let localName be qualifiedName.
-    auto utf16_qualified_name = Utf16FlyString::from_fly_string(qualified_name);
-    auto utf16_qualified_name_string = utf16_qualified_name.to_utf16_string();
-    auto qualified_name_view = utf16_qualified_name_string.utf16_view();
+    auto qualified_name_view = qualified_name.view();
     auto local_name_view = qualified_name_view;
 
     // 4. If qualifiedName contains a U+003A (:):
@@ -1022,24 +1019,23 @@ ErrorOr<QualifiedName, ValidateAndExtractError> validate_and_extract(Optional<Fl
         return ValidateAndExtractError::PrefixWithNullNamespace;
 
     // 9. If prefix is "xml" and namespace is not the XML namespace, then throw a "NamespaceError" DOMException.
-    auto utf16_namespace = namespace_.map([](auto const& value) { return Utf16FlyString::from_fly_string(value); });
-    if (prefix_view.has_value() && *prefix_view == u"xml"sv && utf16_namespace != Namespace::XML)
+    if (prefix_view.has_value() && *prefix_view == u"xml"sv && namespace_ != Namespace::XML)
         return ValidateAndExtractError::XMLPrefixWithNonXMLNamespace;
 
     // 10. If either qualifiedName or prefix is "xmlns" and namespace is not the XMLNS namespace, then throw a "NamespaceError" DOMException.
-    if ((qualified_name_view == u"xmlns"sv || (prefix_view.has_value() && *prefix_view == u"xmlns"sv)) && utf16_namespace != Namespace::XMLNS)
+    if ((qualified_name_view == u"xmlns"sv || (prefix_view.has_value() && *prefix_view == u"xmlns"sv)) && namespace_ != Namespace::XMLNS)
         return ValidateAndExtractError::XMLNSPrefixWithNonXMLNSNamespace;
 
     // 11. If namespace is the XMLNS namespace and neither qualifiedName nor prefix is "xmlns", then throw a "NamespaceError" DOMException.
-    if (utf16_namespace == Namespace::XMLNS && !(qualified_name_view == u"xmlns"sv || (prefix_view.has_value() && *prefix_view == u"xmlns"sv)))
+    if (namespace_ == Namespace::XMLNS && !(qualified_name_view == u"xmlns"sv || (prefix_view.has_value() && *prefix_view == u"xmlns"sv)))
         return ValidateAndExtractError::XMLNSNamespaceWithoutXMLNSPrefix;
 
     // 12. Return (namespace, prefix, localName).
-    auto local_name = colon_position.has_value() ? Utf16FlyString::from_utf16(local_name_view) : utf16_qualified_name;
+    auto local_name = colon_position.has_value() ? Utf16FlyString::from_utf16(local_name_view) : qualified_name;
     Optional<Utf16FlyString> prefix;
     if (prefix_view.has_value())
         prefix = Utf16FlyString::from_utf16(*prefix_view);
-    return QualifiedName { local_name, prefix, utf16_namespace };
+    return QualifiedName { local_name, prefix, namespace_ };
 }
 
 GC::Ref<WebIDL::DOMException> validate_and_extract_error_to_dom_exception(ValidateAndExtractError error)
@@ -3029,6 +3025,7 @@ void Element::set_style_node_id(CSS::StyleNodeID style_node_id)
     if (m_style_node_id == style_node_id)
         return;
     m_published_presentational_hint_properties.clear();
+    forget_published_effect_descriptions();
     auto old_style_node_id = m_style_node_id;
     m_style_node_id = style_node_id;
     Layout::Node::dom_node_style_node_changed(*this, old_style_node_id);
@@ -4165,13 +4162,14 @@ WebIDL::ExceptionOr<void> Element::insert_adjacent_text(Utf16View where, Utf16Vi
 }
 
 // https://drafts.csswg.org/cssom-view-1/#determine-the-scroll-into-view-position
-static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead const& read, ScrollIntoViewTarget target, CSSPixelRect target_bounding_border_box, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, Node& scrolling_box)
+static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead const& read, ScrollIntoViewTarget target, CSSPixelRect target_bounding_border_box, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, Node& scrolling_box, ScrollIntoViewMode scroll_mode)
 {
     // To determine the scroll-into-view position of a target, which is an Element, pseudo-element, or Range, with a
     // block flow direction position block, an inline base direction position inline, and a scrolling box scrolling box,
     // run the following steps:
 
     CSSPixelRect scrolling_box_rect;
+    CSSPixelRect visible_scrollport_rect;
     CSSPixelPoint current_scroll_position;
     Layout::NodeWithStyle const* scrolling_box_layout_node = nullptr;
     if (scrolling_box.is_document()) {
@@ -4184,6 +4182,7 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
             CSSPixels::nearest_value_for(visual_viewport.height()),
         };
         scrolling_box_rect = { visual_viewport.offset(), visible_size };
+        visible_scrollport_rect = scrolling_box_rect;
         if (auto* layout_node = document.layout_node(read)) {
             scrolling_box_rect = Painting::scroll_snapport_rect(*layout_node, scrolling_box_rect);
             scrolling_box_layout_node = as_if<Layout::NodeWithStyle>(layout_node);
@@ -4196,6 +4195,8 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
         current_scroll_position = Painting::presented_scroll_offset(*layout_node, Painting::scroll_offset(*layout_node));
         scrolling_box_layout_node = as_if<Layout::NodeWithStyle>(layout_node);
         scrolling_box_rect = Painting::rect_to_viewport(*layout_node, Painting::scroll_snapport_rect(*layout_node), Layout::RustFFI::ViewportSpace::LayoutViewport);
+        if (scroll_mode == ScrollIntoViewMode::IfNeeded)
+            visible_scrollport_rect = Painting::rect_to_viewport(*layout_node, Painting::absolute_padding_box_rect(*layout_node), Layout::RustFFI::ViewportSpace::LayoutViewport);
     } else {
         return {};
     }
@@ -4224,6 +4225,19 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
     //    if target is a Range.
     // AD-HOC: The caller performs this step once and passes the result in, moving it outward as each scrolling box is
     //         scrolled, so that an outer scrolling box sees where the target is going to be.
+
+    // AD-HOC: focus() requires centered alignment, but for interoperability, leave each axis unchanged if the target is
+    //         fully visible or covers the scrollport. Compare the border box without scroll-margin or scroll-padding.
+    bool preserve_x = scroll_mode == ScrollIntoViewMode::IfNeeded
+        && ((target_bounding_border_box.left() >= visible_scrollport_rect.left()
+                && target_bounding_border_box.right() <= visible_scrollport_rect.right())
+            || (target_bounding_border_box.left() <= visible_scrollport_rect.left()
+                && target_bounding_border_box.right() >= visible_scrollport_rect.right()));
+    bool preserve_y = scroll_mode == ScrollIntoViewMode::IfNeeded
+        && ((target_bounding_border_box.top() >= visible_scrollport_rect.top()
+                && target_bounding_border_box.bottom() <= visible_scrollport_rect.bottom())
+            || (target_bounding_border_box.top() <= visible_scrollport_rect.top()
+                && target_bounding_border_box.bottom() >= visible_scrollport_rect.bottom()));
 
     // AD-HOC: The spec doesn't specify when to do this, but we need to apply scroll-margin and scroll-margin to target
     //         bounding border box (https://drafts.csswg.org/cssom-view-1/#example-51af1565).
@@ -4358,7 +4372,7 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
             inline_delta = -inline_delta;
         auto x = current_scroll_position.x() + (block_axis_is_horizontal ? block_delta : inline_delta);
         auto y = current_scroll_position.y() + (block_axis_is_horizontal ? inline_delta : block_delta);
-        return CSSPixelPoint { x, y };
+        return CSSPixelPoint { preserve_x ? current_scroll_position.x() : x, preserve_y ? current_scroll_position.y() : y };
     }();
 
     // 11. Return position.
@@ -4366,7 +4380,7 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Layout::BegunRead c
 }
 
 // https://drafts.csswg.org/cssom-view-1/#scroll-a-target-into-view
-void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarget target, Element::ScrollBehavior behavior, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, GC::Ptr<Element> container, GC::Ptr<WebIDL::Promise> promise)
+void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarget target, Element::ScrollBehavior behavior, Element::ScrollLogicalPosition block, Element::ScrollLogicalPosition inline_, GC::Ptr<Element> container, GC::Ptr<WebIDL::Promise> promise, ScrollIntoViewMode scroll_mode)
 {
     auto target_document = [](ScrollIntoViewTarget current_target) -> Document& {
         return current_target.visit(
@@ -4448,7 +4462,7 @@ void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarg
         // 2. Let position be the scroll position resulting from running the steps to determine the scroll-into-view
         //    position of target with behavior as the scroll behavior, block as the block flow position, inline as the
         //    inline base direction position and scrolling box as the scrolling box.
-        auto position = determine_the_scroll_into_view_position(read, current_target, target_bounding_border_box, block, inline_, scrolling_box);
+        auto position = determine_the_scroll_into_view_position(read, current_target, target_bounding_border_box, block, inline_, scrolling_box, scroll_mode);
 
         // AD-HOC: A smooth scroll leaves the scrolling box at its old scroll position while the outer scrolling boxes
         //         are considered, so move the target to where this scroll is going to leave it. The viewport is always
@@ -4553,7 +4567,7 @@ void scroll_a_target_into_view(Layout::BegunRead const& read, ScrollIntoViewTarg
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview
-void Element::scroll_into_view(Element::ScrollIntoViewOptions const& options, GC::Ptr<WebIDL::Promise> promise)
+void Element::scroll_into_view(Element::ScrollIntoViewOptions const& options, GC::Ptr<WebIDL::Promise> promise, ScrollIntoViewMode scroll_mode)
 {
     // 1. Let behavior be "auto".
     auto behavior = options.behavior;
@@ -4584,7 +4598,7 @@ void Element::scroll_into_view(Element::ScrollIntoViewOptions const& options, GC
 
     // 8. Scroll the element into view with behavior, block, inline, and container. Let scrollPromise be the Promise
     //    returned from this step.
-    scroll_a_target_into_view(read, ScrollIntoViewTarget { this }, behavior, block, inline_, container, promise);
+    scroll_a_target_into_view(read, ScrollIntoViewTarget { this }, behavior, block, inline_, container, promise, scroll_mode);
 
     // FIXME: 9. Optionally perform some other action that brings the element to the user’s attention.
 }
@@ -5185,7 +5199,7 @@ CSS::InstalledStyle const& Element::installed_style(Optional<CSS::PseudoElement>
     return m_installed_style;
 }
 
-void Element::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const& badge, Optional<CSS::PseudoElement> pseudo_element_type, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
+void Element::update_animated_properties(Badge<Web::Animations::EffectRef> const& badge, Optional<CSS::PseudoElement> pseudo_element_type, Web::Animations::EffectRef const& effect, Web::Animations::AnimationUpdateContext& context)
 {
     DOM::AbstractElement abstract_element { *this, pseudo_element_type };
     if (pseudo_element_type.has_value()) {
@@ -5197,11 +5211,11 @@ void Element::update_animated_properties(Badge<Web::Animations::KeyframeEffect> 
     update_animated_properties_for_abstract_element(badge, abstract_element, effect, context);
 }
 
-void Element::update_animated_properties_for_abstract_element(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
+void Element::update_animated_properties_for_abstract_element(Badge<Web::Animations::EffectRef> const&, DOM::AbstractElement abstract_element, Web::Animations::EffectRef const& effect, Web::Animations::AnimationUpdateContext& context)
 {
     if (!has_style())
         return;
-    effect.update_computed_properties_for_style(context, abstract_element);
+    context.add_effect(abstract_element, effect);
 }
 
 // The animation style group of an installed style, which holds the timelines it declares by name.
@@ -6918,27 +6932,7 @@ void Element::play_or_cancel_animations_after_display_property_change()
         return;
     }
 
-    auto play_or_cancel_depending_on_display = [&](Vector<GC::Ref<CSS::CSSAnimation>> const& animations) {
-        for (auto& animation : animations) {
-            // NOTE: It is safe to assume this has a value as it is set when creating a CSS defined animation
-            auto play_state = animation->last_css_animation_play_state().value();
-
-            if (play_state == CSS::AnimationPlayState::Running) {
-                HTML::TemporaryExecutionContext context(document().relevant_settings_object());
-                animation->play_from_css();
-            } else if (play_state == CSS::AnimationPlayState::Paused) {
-                HTML::TemporaryExecutionContext context(document().relevant_settings_object());
-                animation->pause_from_css();
-            }
-        }
-    };
-
-    play_or_cancel_depending_on_display(*css_defined_animations({}));
-
-    for (auto i = 0; i < to_underlying(CSS::PseudoElement::KnownPseudoElementCount); i++) {
-        auto pseudo_element = static_cast<CSS::PseudoElement>(i);
-        play_or_cancel_depending_on_display(*css_defined_animations(pseudo_element));
-    }
+    play_or_pause_css_animations_as_their_play_state_asks();
 }
 
 // https://drafts.csswg.org/selectors/#indicate-focus
@@ -7378,9 +7372,7 @@ WebIDL::ExceptionOr<void> set_attribute(DOM::Element& element, Utf16String const
 
 WebIDL::ExceptionOr<void> set_attribute_ns(DOM::Element& element, Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& qualified_name, Variant<GC::Ref<TrustedTypes::TrustedHTML>, GC::Ref<TrustedTypes::TrustedScript>, GC::Ref<TrustedTypes::TrustedScriptURL>, Utf16String> const& value)
 {
-    auto namespace_utf8 = namespace_.map([](auto const& value) { return FlyString { value.to_utf16_string().to_utf8() }; });
-    auto qualified_name_utf8 = FlyString { qualified_name.to_utf16_string().to_utf8() };
-    auto extracted_qualified_name_or_error = DOM::validate_and_extract(namespace_utf8, qualified_name_utf8, DOM::ValidationContext::Attribute);
+    auto extracted_qualified_name_or_error = DOM::validate_and_extract(namespace_, qualified_name, DOM::ValidationContext::Attribute);
     if (extracted_qualified_name_or_error.is_error())
         return DOM::validate_and_extract_error_to_dom_exception(extracted_qualified_name_or_error.release_error());
     auto extracted_qualified_name = extracted_qualified_name_or_error.release_value();

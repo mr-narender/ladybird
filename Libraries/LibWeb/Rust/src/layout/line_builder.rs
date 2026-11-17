@@ -1064,14 +1064,26 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 continue;
             }
             let alignment_style = self.alignment_style(style_source, style);
-            let adjusted_baseline = if alignment_style.vertical_align_is_keyword() {
-                fragment_baseline
-            } else {
+            // NB: The box reaches as far above the baseline of the line box as it is shifted up from it (see
+            //     block_offset_for_alignment).
+            let shifted_by_keyword = alignment_style.vertical_align_is_keyword()
+                && matches!(
+                    alignment_style.vertical_align_keyword(),
+                    vertical_align::SUPER | vertical_align::SUB
+                );
+            let adjusted_baseline = if !alignment_style.vertical_align_is_keyword() {
                 fragment_baseline + alignment_style.vertical_align_value().to_px(style.line_height())
+            } else if alignment_style.vertical_align_keyword() == vertical_align::SUPER {
+                fragment_baseline + self.containing_style().font_size() / 3
+            } else if alignment_style.vertical_align_keyword() == vertical_align::SUB {
+                fragment_baseline - self.containing_style().font_size() / 5
+            } else {
+                fragment_baseline
             };
-            // NB: A vertical-align length or percentage shifts the box relative to the baseline, which leaves the
-            //     strut on the baseline, whichever box ends up setting the baseline of the line box.
-            if !alignment_style.vertical_align_is_keyword() {
+            // NB: A vertical-align length or percentage, like 'sub' and 'super', shifts the box relative to the
+            //     baseline, which leaves the strut on the baseline, whichever box ends up setting the baseline of the
+            //     line box.
+            if !alignment_style.vertical_align_is_keyword() || shifted_by_keyword {
                 should_align_strut_to_line_box_baseline = true;
             }
             if adjusted_baseline > line_box_baseline {
@@ -1080,8 +1092,17 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                     // The minimum height consists of a minimum height above the baseline and a minimum depth below
                     // it, exactly as if each line box starts with a zero-width inline box with the element's font and
                     // line height properties.
+                    // NB: That holds for a replaced element too, which leaves the depth of the strut below the
+                    //     baseline it sits on, except in quirks mode, where a line box with no text gets no strut:
+                    //     https://quirks.spec.whatwg.org/#the-line-height-calculation-quirk
+                    //     In a vertical line, the replaced element sits on the central baseline, so the strut fits
+                    //     within it.
+                    let is_replaced_box_with_strut = self.facts(node).is_replaced_box()
+                        && !self.facts(node).document_in_quirks_mode()
+                        && containing_style.writing_mode() == writing_mode::HORIZONTAL_TB;
                     should_align_strut_to_line_box_baseline |= has_line_relative_aligned_subtree
                         || ((style.display().is_inline_block()
+                            || is_replaced_box_with_strut
                             || (style.display().is_inline_outside()
                                 && (style.display().is_flex_inside() || style.display().is_grid_inside())))
                             && alignment_style.vertical_align_keyword() == vertical_align::BASELINE);
@@ -1720,6 +1741,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             fragment.record.trimmed_trailing_whitespace += line_box_fragment::TrailingWhitespace {
                 length_in_code_units: whitespace.length_in_node,
                 inline_size: whitespace.inline_size,
+                ascii_inline_size: whitespace.inline_size,
             };
         }
     }

@@ -72,6 +72,7 @@
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
@@ -526,7 +527,8 @@ void LocalNavigable::start_download_for_response(GC::Ref<Fetch::Infrastructure::
     // https://fetch.spec.whatwg.org/#body-incrementally-read
     auto reader = response->body()->incrementally_read(process_body_chunk, process_end_of_body, process_body_error, GC::Ref { realm.global_object() });
     page().client().page_did_register_download_reader(*download_id, reader);
-    response->resume_body_delivery();
+    if (response->network_transport().has_value())
+        response->resume_body_delivery(*surrounding_agent().fetch_executor);
 }
 
 // https://html.spec.whatwg.org/multipage/links.html#handle-as-a-download
@@ -3145,7 +3147,8 @@ GC::Ref<DOM::Document> DocumentToCreate::create_document()
     auto document = m_load_steps->function()(*m_navigation_params);
     if (m_origin.has_value())
         document->set_origin(*m_origin);
-    m_navigation_params->response->resume_body_delivery();
+    if (m_navigation_params->response->network_transport().has_value())
+        m_navigation_params->response->resume_body_delivery(*surrounding_agent().fetch_executor);
     m_navigation_params = nullptr;
     m_load_steps = nullptr;
     return document;
@@ -3405,7 +3408,7 @@ void LocalNavigable::queue_navigation_and_traversal_task_for_session_history_ent
             auto sniff_bytes = body ? body->sniff_bytes_if_available() : Optional<Fetch::Infrastructure::Body::SniffBytes> { Fetch::Infrastructure::Body::SniffBytes {} };
             if (!sniff_bytes.has_value()) {
                 // Async path: bytes not yet available, wait for them
-                nav_params->response->resume_body_delivery_up_to(Fetch::Infrastructure::MAX_SNIFF_BYTES);
+                nav_params->response->release_navigation_hold_up_to(*surrounding_agent().fetch_executor, Fetch::Infrastructure::MAX_SNIFF_BYTES);
                 body->wait_for_sniff_bytes(GC::create_function(self.heap(), GC::captures(output, nav_params, navigation_params, completion_steps, source_allows_downloading, source_interface_origin, url, navigation_id, is_reload_traversal), [](auto& output, auto& nav_params, auto& navigation_params, auto& completion_steps, auto& source_allows_downloading, auto& source_interface_origin, auto& url, auto& navigation_id, auto& is_reload_traversal, Fetch::Infrastructure::Body::SniffBytes sniff_bytes) {
                     // AD-HOC: The document may have been destroyed between when the fetch started and when the
                     //         bytes arrived. A response that failed mid-sniff must not be loaded as a document
@@ -7318,22 +7321,22 @@ void LocalNavigable::finish_recording_in_flight(RecordingInFlight& in_flight, La
     // What the recording made goes to a document this navigable still presents, which still has the boxes it recorded.
     if (has_been_destroyed() || !has_compositor_context() || active_document().ptr() != document.ptr() || !document->has_committed_viewport_box())
         return;
-    // A frame presented without a recording keeps the hit-test list.
-    auto hit_test_list_adoption = Painting::HitTestListAdoption::Kept;
+    // A frame presented without a recording keeps the hit-test items on screen.
+    auto hit_test_items_adoption = Painting::HitTestItemsAdoption::Kept;
     if (landing != Layout::RustFFI::FfiRecordingLanding::PresentedUnrecorded) {
         // What the recording made stands as the compositor's frame. One that landed after the host wrote the document's
-        // rows leaves no hit-test list, as the boxes it names may be gone.
-        auto const hit_test_list_stands = landing == Layout::RustFFI::FfiRecordingLanding::LandedBehindRows ? Painting::HitTestListStands::No : Painting::HitTestListStands::Yes;
+        // rows leaves no hit-test items standing, as the boxes it shows may be gone.
+        auto const hit_test_items_stand = landing == Layout::RustFFI::FfiRecordingLanding::LandedBehindRows ? Painting::HitTestItemsStand::No : Painting::HitTestItemsStand::Yes;
         Painting::take_recording_trace_if_pending(read, *document);
-        hit_test_list_adoption = document->adopt_published_recording(Painting::hit_test_list_read(read, hit_test_list_stands), *in_flight.recording);
+        hit_test_items_adoption = document->adopt_published_recording(hit_test_items_stand, *in_flight.recording);
     }
     // A frame that kept its hit-test items, and sent no visual context tree, placed them as the frame before it did,
     // unless it sent other scroll offsets. The hover waits for a scroll of the user's to stop instead (see
     // schedule_hover_update_after_async_scroll).
     auto const frame_placement = [&] {
-        if (hit_test_list_adoption == Painting::HitTestListAdoption::TookNew)
+        if (hit_test_items_adoption == Painting::HitTestItemsAdoption::TookNew)
             return Web::EventHandler::FramePlacement::Changed;
-        if (hit_test_list_adoption != Painting::HitTestListAdoption::Kept)
+        if (hit_test_items_adoption != Painting::HitTestItemsAdoption::Kept)
             return Web::EventHandler::FramePlacement::Unchanged;
         if (in_flight.sends_visual_context_tree)
             return Web::EventHandler::FramePlacement::Changed;
@@ -7442,6 +7445,7 @@ void LocalNavigable::render_screenshot_of_painted_subtree(NonnullRefPtr<Gfx::Bit
             navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::ProcessScreenshot);
     }
 
+    paint_config.records_whole_document = true;
     if (!commit_frame(paint_config)) {
         callback(Compositor::ScreenshotResult::Failed);
         return;
