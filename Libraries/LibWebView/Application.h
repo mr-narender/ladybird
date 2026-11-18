@@ -53,6 +53,7 @@
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/MediaSessionCoordinator.h>
 #include <LibWebView/Options.h>
 #include <LibWebView/PlatformFeatureDecisions.h>
 #include <LibWebView/Process.h>
@@ -239,6 +240,11 @@ public:
     // For what may share a process with no page. It ends once nothing keeps it.
     ErrorOr<NonnullRefPtr<WebContentClient>> launch_web_content_process_without_page(BrowsingSession&);
     ErrorOr<ChildFrameWebContentProcess> launch_child_frame_web_content_process(IsPrivate, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables, Web::HTML::CrossProcessId root_navigable_id, Web::HTML::SessionHistoryEntryDescriptor initial_history_entry, Web::HTML::VisibilityState system_visibility_state);
+
+    MediaSessionCoordinator& media_session_coordinator() { return m_media_session_coordinator; }
+    virtual OwnPtr<MediaSessionPlatformBackend> create_media_session_platform_backend();
+    void set_media_session_platform_backend(OwnPtr<MediaSessionPlatformBackend>);
+
     Web::PageId allocate_page_id();
     Web::HTML::CrossProcessIdAllocator allocate_cross_process_id_allocator();
     Web::HTML::CrossProcessId allocate_ui_process_cross_process_id();
@@ -317,6 +323,9 @@ public:
 
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const;
     virtual void display_error_dialog(StringView error_message) const;
+    virtual void display_update_check_result(UpdateCheckResult const&, UpdateCheckTrigger) { }
+
+    UpdateChecker* update_checker() { return m_update_checker.ptr(); }
 
     // FIXME: We should implement UI-agnostic platform APIs to interact with the system clipboard.
     enum class ClipboardType : u8 {
@@ -438,7 +447,7 @@ protected:
     bool has_spare_web_content_process() const { return m_spare_web_content_process; }
 
 private:
-    ErrorOr<void> create_profile(Optional<StringView> profile_name, Optional<StringView> profile_path, bool force_new_process, bool temporary_profile);
+    ErrorOr<void> create_profile(Optional<StringView> profile_name, Optional<StringView> profile_path, bool temporary_profile);
     void create_mach_port_server(ByteString const& profile_identity);
     void update_website_color_scheme();
     ErrorOr<NonnullRefPtr<WebContentClient>> create_web_content_client(BrowsingSession&, Web::PageId initial_page_id, Optional<Web::HTML::CrossProcessId> navigable_to_adopt = {}, Optional<Web::HTML::CrossProcessId> initial_document_state_id = {}, Vector<Web::HTML::RemoteNavigableDescriptor> remote_navigables = {}, Optional<Web::HTML::SessionHistoryEntryDescriptor> canonical_initial_history_entry = {}, Web::HTML::VisibilityState system_visibility_state = Web::HTML::VisibilityState::Hidden);
@@ -588,6 +597,8 @@ private:
     OwnPtr<ApplicationPermissionManagerObserver> m_permission_manager_observer;
     RefPtr<Core::Timer> m_permission_expiry_timer;
 
+    MediaSessionCoordinator m_media_session_coordinator;
+
     Main::Arguments m_arguments;
     OwnPtr<Core::StatsLog> m_stats_log;
     BrowserOptions m_browser_options;
@@ -604,6 +615,8 @@ private:
     JsonValue m_site_compatibility_data;
     Optional<Core::AnonymousBuffer> m_content_blocker_list_buffer;
     RefPtr<Core::Timer> m_content_blocker_list_update_timer;
+    ByteString m_instance_data_directory;
+    OwnPtr<UpdateChecker> m_update_checker;
     struct PendingContentBlockerListUpdate {
         String identifier;
         String name;

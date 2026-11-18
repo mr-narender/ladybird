@@ -68,6 +68,8 @@ private:
     void start_request(u64 request_id, ByteString const& method, URL::URL const&, HTTP::HeaderList const& headers, ByteString const& body, HTTP::CacheMode, HTTP::Cookie::IncludeCredentials, WebView::IsPrivate, ReadonlySpan<StringView> response_header_names);
     virtual void stop_request(u64 request_id) override;
     virtual void toggle_devtools_enabled() override;
+    virtual void check_for_updates(WebView::UpdateCheckTrigger) override;
+    virtual void skip_update_version(String) override;
     virtual void set_preferred_contrast(Web::CSS::PreferredContrast) override;
     virtual void set_preferred_motion(Web::CSS::PreferredMotion) override;
     virtual void set_user_agent_string(String user_agent) override;
@@ -113,6 +115,7 @@ private:
     virtual void notification_failed(u64 id) override;
     virtual void notification_clicked(u64 id) override;
     virtual void notification_closed(u64 id, bool by_user) override;
+    virtual void media_session_action(Web::Bindings::MediaSessionAction, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) override;
     virtual void geolocation_position(u64 id, Core::GeolocationCoordinates coordinates) override;
     virtual void geolocation_error(u64 id, Core::GeolocationError error) override;
     virtual void geolocation_authorization_changed(Core::GeolocationAuthorization authorization) override;

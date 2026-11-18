@@ -208,7 +208,8 @@ def rust_module_path(idl_path: Path) -> str:
     Encoding/TextEncoder.idl names crate::encoding::text_encoder."""
     parts = idl_path.parts
     namespace = parts[parts.index("LibWeb") + 1]
-    return f"crate::{title_case_to_snake_case(namespace)}::{title_case_to_snake_case(idl_path.stem)}"
+    module = "webidl" if namespace == "WebIDL" else title_case_to_snake_case(namespace)
+    return f"crate::{module}::{title_case_to_snake_case(idl_path.stem)}"
 
 
 def cpp_interface(idl_type: IDLType, context: GenerationContext) -> Optional[Interface]:
@@ -492,7 +493,7 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return "Gc<Object>"
     if name in TYPED_ARRAY_NAMES:
         return "Gc<TypedArrayBase>"
-    if name == "ArrayBuffer":
+    if name in ("ArrayBuffer", "SharedArrayBuffer"):
         return "Gc<ArrayBuffer>"
     callback_function = context.callback_function(idl_type)
     if callback_function is not None:

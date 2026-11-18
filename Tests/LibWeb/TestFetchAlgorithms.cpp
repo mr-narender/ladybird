@@ -41,12 +41,14 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/ResponseView.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/NavigationParams.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Streams/ReadableStream.h>
@@ -61,17 +63,20 @@ using Web::Fetch::Engine::FetchByteChannel;
 using Web::Fetch::Engine::NetworkTransportHandle;
 using Web::Fetch::Engine::WholeBodyTransport;
 using Web::Fetch::Engine::Command::TransportControl;
+using Web::Fetch::Engine::Event::EndOfBody;
 using Web::Fetch::Engine::Event::NetworkActivity;
 using Web::Fetch::Engine::Event::ReadRequestBodyStream;
 using Web::Fetch::Engine::Event::RequestBodyEndOfBody;
 using Web::Fetch::Engine::Event::RequestBodyProgress;
 using Web::Fetch::Engine::Event::RequestBodySentFromSource;
+using Web::Fetch::Engine::Event::RequestTransmissionEnded;
 using Web::Fetch::Fetching::FetchEventSink;
 using Web::Fetch::Fetching::NetworkBodyPump;
 using Web::Fetch::Infrastructure::FetchAlgorithms;
 using Web::Fetch::Infrastructure::FetchController;
 using Web::Fetch::Infrastructure::FetchParams;
 using Web::Fetch::Infrastructure::Request;
+using Web::Fetch::Infrastructure::Response;
 using Web::Fetch::Infrastructure::ResponseView;
 
 namespace {
@@ -684,26 +689,96 @@ struct ResourceLoaderWithoutRequestServer {
     }
 };
 
-// A RequestServer client of the agent's resource loader, whose RequestServer end of the connection the test holds.
-struct ResourceLoaderWithStandInRequestServer {
-    explicit ResourceLoaderWithStandInRequestServer(GC::Heap& heap)
+// What a RequestServer the test stands in for has been asked to start.
+struct StartedRequests : RefCounted<StartedRequests> {
+    GC_HOLDS_NO_CELL_EDGES;
+
+    IPC::Transport* request_server { nullptr };
+    Vector<u64> ids;
+    Vector<ByteString> methods;
+};
+
+// A RequestServer client of the agent's resource loader, whose RequestServer end of the connection the test holds and
+// answers for.
+class StandInRequestServer {
+public:
+    explicit StandInRequestServer(FetchHarness const& harness)
+        : m_harness(harness)
     {
-        Web::ResourceLoader::initialize(heap);
+        Web::ResourceLoader::initialize(harness.realm->heap());
         auto pair = MUST(IPC::Transport::create_paired());
-        client = make_ref_counted<Requests::RequestClient>(move(pair.local), 1);
-        Web::ResourceLoader::the().set_client({}, *client);
-        request_server = MUST(pair.remote_handle.create_transport());
+        m_client = make_ref_counted<Requests::RequestClient>(move(pair.local), 1);
+        Web::ResourceLoader::the().set_client({}, *m_client);
+        m_request_server = MUST(pair.remote_handle.create_transport());
+        m_started->request_server = m_request_server.ptr();
     }
 
-    ~ResourceLoaderWithStandInRequestServer()
+    ~StandInRequestServer()
     {
         // The client can hear of its RequestServer's death after the resource loader is gone.
-        client->on_request_server_died = nullptr;
+        m_client->on_request_server_died = nullptr;
         Web::ResourceLoader::shut_down();
     }
 
-    RefPtr<Requests::RequestClient> client;
-    OwnPtr<IPC::Transport> request_server;
+    // Runs the agent's tasks until another request with the method has started, and returns its id.
+    u64 wait_for_request(StringView method)
+    {
+        // The RequestServer end is not part of the event loop, so keep the loop from sleeping until it has news.
+        auto wake_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(10), [] { });
+        wake_timer->start();
+
+        auto expected = ByteString { method };
+        m_harness.run_tasks_until(GC::create_function(m_harness.realm->heap(), GC::captures(m_started, m_taken_count, expected), [](auto& started, auto& taken_count, auto& expected) {
+            (void)started->request_server->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
+                auto message = MUST(RequestServerEndpoint::decode_message(raw_message.bytes.bytes(), raw_message.attachments));
+                if (message->message_id() != Messages::RequestServer::StartRequest::static_message_id())
+                    return;
+                auto const& start = static_cast<Messages::RequestServer::StartRequest&>(*message);
+                started->ids.append(start.request_id());
+                started->methods.append(start.method());
+            });
+            for (size_t index = taken_count; index < started->methods.size(); ++index) {
+                if (started->methods[index] == expected)
+                    return true;
+            }
+            return false;
+        }));
+        for (size_t index = m_taken_count; index < m_started->methods.size(); ++index) {
+            if (m_started->methods[index] == method) {
+                m_taken_count = index + 1;
+                return m_started->ids[index];
+            }
+        }
+        VERIFY_NOT_REACHED();
+    }
+
+    void send(IPC::MessageBuffer message)
+    {
+        MUST(message.transfer_message(*m_request_server));
+    }
+
+    void send_headers(u64 request_id, u32 status_code, Vector<HTTP::Header> headers = {})
+    {
+        send(MUST(Messages::RequestClient::HeadersBecameAvailable::static_encode(request_id, URL::about_blank(), move(headers), status_code, Optional<String> {}, Requests::CacheState::NotCached, ByteString {})));
+    }
+
+    void send_finished(u64 request_id, Requests::RequestTimingInfo timing_info, Optional<Requests::NetworkError> network_error = {})
+    {
+        send(MUST(Messages::RequestClient::RequestFinished::static_encode(request_id, 0, timing_info, network_error)));
+    }
+
+    void send_transferred(u64 request_id)
+    {
+        send(MUST(Messages::RequestClient::RequestTransferred::static_encode(request_id)));
+    }
+
+private:
+    FetchHarness const& m_harness;
+    RefPtr<Requests::RequestClient> m_client;
+    OwnPtr<IPC::Transport> m_request_server;
+    NonnullRefPtr<StartedRequests> m_started { make_ref_counted<StartedRequests>() };
+    // The started requests a wait has already returned or passed over.
+    size_t m_taken_count { 0 };
 };
 
 }
@@ -789,7 +864,7 @@ class AdoptedNavigationBody {
 public:
     explicit AdoptedNavigationBody(FetchHarness const& harness)
         : m_harness(harness)
-        , m_resource_loader(harness.realm->heap())
+        , m_request_server(harness)
     {
         auto& agent = Web::HTML::surrounding_agent();
         Web::Fetch::Engine::FetchExecutorServices services { .event_loop = Core::EventLoop::current_weak() };
@@ -813,11 +888,11 @@ public:
     // Sends the message as RequestServer, and runs the agent's tasks until the body's request has received it.
     void receive(IPC::MessageBuffer message)
     {
-        MUST(message.transfer_message(*m_resource_loader.request_server));
+        m_request_server.send(move(message));
         auto marker = ByteString::formatted("received {}", ++m_received_count);
         auto request_id = handle().request_id().value();
-        auto marker_message = MUST(Messages::RequestClient::HeadersBecameAvailable::static_encode(request_id, Vector<HTTP::Header> {}, Optional<u32> {}, Optional<String> {}, Requests::CacheState::NotCached, marker));
-        MUST(marker_message.transfer_message(*m_resource_loader.request_server));
+        auto marker_message = MUST(Messages::RequestClient::HeadersBecameAvailable::static_encode(request_id, URL::about_blank(), Vector<HTTP::Header> {}, Optional<u32> {}, Optional<String> {}, Requests::CacheState::NotCached, marker));
+        m_request_server.send(move(marker_message));
 
         auto weak_handle = handle().make_weak_ptr<NetworkTransportHandle>();
         m_harness.run_tasks_until(GC::create_function(m_harness.realm->heap(), GC::captures(weak_handle, marker), [](auto& weak_handle, auto& marker) {
@@ -853,7 +928,7 @@ public:
 
 private:
     FetchHarness const& m_harness;
-    ResourceLoaderWithStandInRequestServer m_resource_loader;
+    StandInRequestServer m_request_server;
     NonnullRefPtr<PostedCommands> m_posted_commands { make_ref_counted<PostedCommands>() };
     RefPtr<Web::Fetch::Engine::FetchExecutor> m_engine_executor;
     GC::Root<Web::Fetch::Infrastructure::Body> m_body;
@@ -975,6 +1050,182 @@ TEST_CASE(the_holders_of_an_adopted_navigation_body_post_its_controls_to_the_age
     EXPECT_EQ(adopted.commands->steps, (Vector<ByteString> { "navigation body adopted", release, release_up_to, stop }));
 }
 
+static Requests::RequestTimingInfo finished_timing_info(i64 microseconds)
+{
+    return {
+        .domain_lookup_start_microseconds = microseconds,
+        .domain_lookup_end_microseconds = microseconds + 1000,
+        .connect_start_microseconds = microseconds + 2000,
+        .connect_end_microseconds = microseconds + 3000,
+        .request_start_microseconds = microseconds + 4000,
+        .response_start_microseconds = microseconds + 5000,
+        .encoded_body_size = 1234,
+    };
+}
+
+static FetchAlgorithms::Input recording_responses(GC::Heap& heap, NonnullRefPtr<AlgorithmCalls> const& record)
+{
+    FetchAlgorithms::Input input { Web::Fetch::Engine::BodyIntent::DrainAndDiscard };
+    input.process_response = GC::create_function(heap, GC::captures(record), [](auto& record, GC::Ref<ResponseView> response) {
+        record->responses.append(GC::make_root(response));
+    });
+    return input;
+}
+
+static void run_until_responses(FetchHarness const& harness, NonnullRefPtr<AlgorithmCalls> const& record, size_t count)
+{
+    harness.run_tasks_until(GC::create_function(harness.realm->heap(), GC::captures(record, count), [](auto& record, auto& count) { return record->responses.size() == count; }));
+    VERIFY(record->responses.size() == count);
+}
+
+static void run_until_encoded_size(FetchHarness const& harness, NonnullRefPtr<Response const> const& response, u64 encoded_size)
+{
+    harness.run_tasks_until(GC::create_function(harness.realm->heap(), GC::captures(response, encoded_size), [](auto& response, auto& encoded_size) { return response->body_info().encoded_size == encoded_size; }));
+}
+
+namespace {
+
+// A fetch whose response has been handed over while its body still arrives from the stand-in RequestServer.
+struct DeliveredBody {
+    GC::Root<FetchController> controller;
+    NonnullRefPtr<Response const> response;
+    Web::Fetch::Engine::DeliveryId delivery_id;
+    u64 request_id { 0 };
+};
+
+}
+
+static DeliveredBody deliver_a_body(FetchHarness const& harness, StandInRequestServer& request_server, StringView url, Optional<Request::InitiatorType> initiator_type = {})
+{
+    auto record = make_ref_counted<AlgorithmCalls>();
+    auto request = harness.create_request_for(url);
+    request->set_initiator_type(initiator_type);
+    auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record)));
+    auto request_id = request_server.wait_for_request("GET"sv);
+    request_server.send_headers(request_id, 200);
+    run_until_responses(harness, record, 1);
+    auto response = record->responses[0]->record()->unsafe_response();
+    auto delivery_id = response->network_transport()->body_channel->delivery_id();
+    VERIFY(delivery_id.has_value());
+    return { move(controller), move(response), *delivery_id, request_id };
+}
+
+// Reports the end of the delivered body, as the engine would once the body had arrived whole.
+static void report_end_of_body(DeliveredBody const& delivered)
+{
+    EndOfBody end_of_body {
+        .delivery_id = delivered.delivery_id,
+        .final_sizes = { .encoded_body_size = 1, .decoded_body_size = 1 },
+        .end_time = 1,
+    };
+    FetchEventSink event_sink { *delivered.controller };
+    event_sink.handle_event(move(end_of_body));
+}
+
+// A request whose response main fetch reads whole, to check its integrity, before handing it over.
+static NonnullRefPtr<Request> create_request_checked_for_integrity(FetchHarness const& harness, StringView url)
+{
+    auto request = harness.create_request_for(url);
+    request->set_mode(Request::Mode::CORS);
+    // The digest of an empty body.
+    request->set_integrity_metadata("sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="_utf16);
+    return request;
+}
+
+TEST_CASE(a_body_that_ends_before_its_response_is_handed_over_gets_its_sizes_from_its_pump)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto record = make_ref_counted<AlgorithmCalls>();
+    auto request = create_request_checked_for_integrity(harness, "http://127.0.0.1:8000/ended-before-handover"sv);
+    (void)harness.fetch(request, recording_responses(harness.realm->heap(), record));
+    auto request_id = request_server.wait_for_request("GET"sv);
+    request_server.send_headers(request_id, 200, { { "Access-Control-Allow-Origin"sv, "*"sv } });
+    request_server.send_finished(request_id, finished_timing_info(1000));
+    run_until_responses(harness, record, 1);
+
+    auto response = record->responses[0]->record()->unsafe_response();
+    EXPECT_EQ(response->body_info().encoded_size, 1234u);
+    EXPECT(!response->network_transport()->body_channel->delivery_id().has_value());
+}
+
+TEST_CASE(a_body_that_ends_after_its_response_is_handed_over_gets_its_sizes_from_its_end)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto delivered = deliver_a_body(harness, request_server, "http://127.0.0.1:8000/ended-after-handover"sv);
+    EXPECT_EQ(delivered.response->body_info().encoded_size, 0u);
+
+    request_server.send_finished(delivered.request_id, finished_timing_info(1000));
+    run_until_encoded_size(harness, delivered.response, 1234);
+    EXPECT_EQ(delivered.response->body_info().encoded_size, 1234u);
+}
+
+TEST_CASE(a_body_that_ends_after_its_response_is_handed_over_reports_the_end_time_of_its_end)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto delivered = deliver_a_body(harness, request_server, "http://127.0.0.1:8000/reported"sv, Request::InitiatorType::Fetch);
+    report_end_of_body(delivered);
+
+    auto agent_timing_info = delivered.controller->control_block().agent_timing_info();
+    VERIFY(agent_timing_info);
+    EXPECT_EQ(agent_timing_info->end_time(), 1);
+    EXPECT_EQ(delivered.controller->control_block().end_time(), 1);
+}
+
+TEST_CASE(a_stopped_fetch_no_longer_awaits_the_end_of_its_body)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto delivered = deliver_a_body(harness, request_server, "http://127.0.0.1:8000/stopped"sv);
+    delivered.controller->stop_fetch();
+    report_end_of_body(delivered);
+    EXPECT_EQ(delivered.response->body_info().encoded_size, 0u);
+}
+
+TEST_CASE(a_body_that_fails_or_moves_away_reports_no_end)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto failed = deliver_a_body(harness, request_server, "http://127.0.0.1:8000/failed"sv);
+    auto transferred = deliver_a_body(harness, request_server, "http://127.0.0.1:8000/transferred"sv);
+    request_server.send_finished(failed.request_id, finished_timing_info(1000), Requests::NetworkError::IncompleteContent);
+    request_server.send_transferred(transferred.request_id);
+    auto failed_channel = failed.response->network_transport()->body_channel;
+    auto transferred_channel = transferred.response->network_transport()->body_channel;
+    harness.run_tasks_until(GC::create_function(harness.realm->heap(), GC::captures(failed_channel, transferred_channel), [](auto& failed_channel, auto& transferred_channel) {
+        return failed_channel->peek_up_to(0).state.template has<FetchByteChannel::Errored>()
+            && transferred_channel->peek_up_to(0).state.template has<FetchByteChannel::Transferred>();
+    }));
+
+    EXPECT(failed_channel->peek_up_to(0).state.has<FetchByteChannel::Errored>());
+    EXPECT(transferred_channel->peek_up_to(0).state.has<FetchByteChannel::Transferred>());
+    EXPECT_EQ(failed.response->body_info().encoded_size, 0u);
+    EXPECT_EQ(transferred.response->body_info().encoded_size, 0u);
+
+    // Each fetch still awaits the end of its body.
+    report_end_of_body(failed);
+    report_end_of_body(transferred);
+    EXPECT_EQ(failed.response->body_info().encoded_size, 1u);
+    EXPECT_EQ(transferred.response->body_info().encoded_size, 1u);
+}
+
 namespace {
 
 // The WebDriver BiDi network events that reached the event sink, by name and request id.
@@ -983,6 +1234,27 @@ struct ReportedNetworkEvents : RefCounted<ReportedNetworkEvents> {
 
     Vector<String> names;
     Vector<String> request_ids;
+};
+
+// A WebDriver BiDi session with the given events enabled, whose events reach the callback, until it goes.
+class WebDriverBiDiSession {
+public:
+    using OnEvent = Function<void(Web::HTML::Navigable const&, String const&, JsonValue)>;
+
+    WebDriverBiDiSession(Vector<String> enabled_events, OnEvent on_event)
+    {
+        Web::WebDriver::BiDi::set_event_sink({ .on_event = move(on_event), .on_navigation_event = {} });
+        Web::WebDriver::BiDiSessionState session_state;
+        session_state.is_active = true;
+        session_state.enabled_events = move(enabled_events);
+        Web::WebDriver::BiDi::set_session_state(move(session_state));
+    }
+
+    ~WebDriverBiDiSession()
+    {
+        Web::WebDriver::BiDi::set_session_state({});
+        Web::WebDriver::BiDi::set_event_sink({});
+    }
 };
 
 }
@@ -994,20 +1266,12 @@ TEST_CASE(a_request_fetched_again_keeps_its_webdriver_bidi_request_id)
     FetchHarness harness;
 
     auto events = make_ref_counted<ReportedNetworkEvents>();
-    Web::WebDriver::BiDi::set_event_sink({
-        .on_event = [events](Web::HTML::Navigable const&, String const& name, JsonValue params) {
+    WebDriverBiDiSession session {
+        { "network.beforeRequestSent"_string, "network.fetchError"_string },
+        [events](Web::HTML::Navigable const&, String const& name, JsonValue params) {
             events->names.append(name);
             events->request_ids.append(*params.as_object().get_object("request"sv)->get_string("request"sv));
         },
-        .on_navigation_event = {},
-    });
-    Web::WebDriver::BiDiSessionState session_state;
-    session_state.is_active = true;
-    session_state.enabled_events = { "network.beforeRequestSent"_string, "network.fetchError"_string };
-    Web::WebDriver::BiDi::set_session_state(move(session_state));
-    ScopeGuard end_session = [] {
-        Web::WebDriver::BiDi::set_session_state({});
-        Web::WebDriver::BiDi::set_event_sink({});
     };
 
     auto& heap = harness.realm->heap();
@@ -1049,23 +1313,15 @@ TEST_CASE(a_request_that_starts_after_its_fetch_was_stopped_reports_the_stop)
     FetchHarness harness;
 
     auto events = make_ref_counted<ReachedSteps>();
-    Web::WebDriver::BiDi::set_event_sink({
-        .on_event = [events](Web::HTML::Navigable const&, String const& name, JsonValue params) {
+    WebDriverBiDiSession session {
+        { "network.beforeRequestSent"_string, "network.fetchError"_string },
+        [events](Web::HTML::Navigable const&, String const& name, JsonValue params) {
             auto const& object = params.as_object();
             auto event = ByteString::formatted("{} {}", name, object.get_u32("redirectCount"sv).value());
             if (auto error_text = object.get_string("errorText"sv); error_text.has_value())
                 event = ByteString::formatted("{}: {}", event, *error_text);
             events->steps.append(move(event));
         },
-        .on_navigation_event = {},
-    });
-    Web::WebDriver::BiDiSessionState session_state;
-    session_state.is_active = true;
-    session_state.enabled_events = { "network.beforeRequestSent"_string, "network.fetchError"_string };
-    Web::WebDriver::BiDi::set_session_state(move(session_state));
-    ScopeGuard end_session = [] {
-        Web::WebDriver::BiDi::set_session_state({});
-        Web::WebDriver::BiDi::set_event_sink({});
     };
 
     auto request = harness.create_request_for("http://localhost/"sv);
@@ -1085,7 +1341,7 @@ TEST_CASE(a_request_that_starts_after_its_fetch_was_stopped_reports_the_stop)
 
 namespace {
 
-// A page client that records the network activity reported to it.
+// A page client that records the network activity reported to it, and opens the files its page asks for.
 class NetworkActivityPageClient final : public Web::PageClient {
     GC_CELL(NetworkActivityPageClient, Web::PageClient);
     GC_DECLARE_ALLOCATOR(NetworkActivityPageClient);
@@ -1115,8 +1371,17 @@ public:
     virtual void report_finished_handling_input_event(Web::PageId, u64, Web::EventResult) override { }
     virtual Web::HTML::CrossProcessId allocate_cross_process_id() override { return { 2, s_next_cross_process_id++ }; }
     virtual void request_frame() override { }
-    virtual void request_file(Web::FileRequest) override { }
     virtual bool is_headless() const override { return true; }
+
+    virtual void request_file(Web::FileRequest request) override
+    {
+        auto file = Core::File::open(request.path(), Core::File::OpenMode::Read);
+        if (file.is_error()) {
+            request.on_file_request_finish(file.release_error());
+            return;
+        }
+        request.on_file_request_finish(file.value()->leak_fd());
+    }
 
     virtual void page_did_start_network_request(u64 request_id, URL::URL const& url, ByteString const& method, Vector<HTTP::Header> const& request_headers, ReadonlyBytes request_body, Optional<String> initiator_type, String const& referrer_policy, bool is_navigation_request, Web::Fetch::Infrastructure::Request::Priority priority) override
     {
@@ -1312,6 +1577,366 @@ TEST_CASE(a_fetch_reads_the_network_activity_observers_of_its_agent)
     EXPECT(fetch_params->engine_record()->network_activity_observers().has_devtools_client());
     agent.network_activity_observers->page_did_lose_devtools_client();
     EXPECT(!fetch_params->engine_record()->network_activity_observers().has_devtools_client());
+}
+
+static void expect_network_phases_of(Web::Fetch::Infrastructure::FetchTimingInfo const& timing_info, Requests::RequestTimingInfo const& finished)
+{
+    auto expected = timing_info.final_network_phases(finished, Web::HTML::CanUseCrossOriginIsolatedAPIs::No);
+    EXPECT(timing_info.final_connection_timing_info().has_value());
+    if (!timing_info.final_connection_timing_info().has_value())
+        return;
+    EXPECT_EQ(timing_info.final_connection_timing_info()->domain_lookup_start_time, expected.final_connection_timing_info.domain_lookup_start_time);
+    EXPECT_EQ(timing_info.final_connection_timing_info()->connection_end_time, expected.final_connection_timing_info.connection_end_time);
+    EXPECT_EQ(timing_info.final_network_request_start_time(), expected.final_network_request_start_time);
+    EXPECT_EQ(timing_info.final_network_response_start_time(), expected.final_network_response_start_time);
+}
+
+static Web::Fetch::Engine::FetchNetworkPhases network_phases(double request_start_time)
+{
+    Web::Fetch::Infrastructure::ConnectionTimingInfo connection_timing_info;
+    connection_timing_info.connection_start_time = request_start_time - 1;
+    return {
+        .final_connection_timing_info = move(connection_timing_info),
+        .final_network_request_start_time = request_start_time,
+        .final_network_response_start_time = request_start_time + 1,
+    };
+}
+
+TEST_CASE(a_load_that_finishes_before_its_response_is_handed_over_gives_the_agent_its_network_phases)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto record = make_ref_counted<AlgorithmCalls>();
+    auto request = create_request_checked_for_integrity(harness, "http://127.0.0.1:8000/finished-before-handover"sv);
+    auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record)));
+    auto request_id = request_server.wait_for_request("GET"sv);
+    request_server.send_headers(request_id, 200, { { "Access-Control-Allow-Origin"sv, "*"sv } });
+    request_server.send_finished(request_id, finished_timing_info(1000));
+    run_until_responses(harness, record, 1);
+
+    auto agent_timing_info = controller->control_block().agent_timing_info();
+    VERIFY(agent_timing_info);
+    expect_network_phases_of(*agent_timing_info, finished_timing_info(1000));
+}
+
+TEST_CASE(a_load_that_finishes_after_its_response_is_handed_over_gives_the_agent_its_network_phases)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto delivered = deliver_a_body(harness, request_server, "http://127.0.0.1:8000/finished-after-handover"sv);
+    auto agent_timing_info = delivered.controller->control_block().agent_timing_info();
+    VERIFY(agent_timing_info);
+    EXPECT(!agent_timing_info->final_connection_timing_info().has_value());
+
+    request_server.send_finished(delivered.request_id, finished_timing_info(1000));
+    run_until_encoded_size(harness, delivered.response, 1234);
+    expect_network_phases_of(*agent_timing_info, finished_timing_info(1000));
+    EXPECT_EQ(delivered.controller->control_block().agent_timing_info().ptr(), agent_timing_info.ptr());
+}
+
+TEST_CASE(network_phases_heard_before_a_handover_reach_each_timing_info_it_makes)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    auto controller = FetchController::create(Web::HTML::surrounding_agent().fetch_controller_registry);
+    FetchEventSink event_sink { controller };
+    auto& control_block = controller->control_block();
+
+    event_sink.handle_event(RequestTransmissionEnded { network_phases(10) });
+    EXPECT(!control_block.agent_timing_info());
+
+    Web::Fetch::Engine::FetchTimingSeed seed;
+    seed.post_redirect_start_time = 5;
+    auto first = control_block.hand_over_timing(seed);
+    EXPECT_EQ(first->post_redirect_start_time(), 5);
+    EXPECT_EQ(first->final_network_request_start_time(), 10);
+
+    // The next response of a manual redirect starts from the phases settled last. Phases settled later reach only the
+    // newest handover's timing info.
+    auto next = control_block.hand_over_timing(seed);
+    EXPECT_NE(next.ptr(), first.ptr());
+    EXPECT_EQ(next->final_network_request_start_time(), 10);
+    event_sink.handle_event(RequestTransmissionEnded { network_phases(20) });
+    EXPECT_EQ(next->final_network_request_start_time(), 20);
+    EXPECT_EQ(first->final_network_request_start_time(), 10);
+}
+
+TEST_CASE(a_handover_gives_its_timing_info_each_field_of_the_seed_and_the_end_time_last_set_for_the_fetch)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    auto controller = FetchController::create(Web::HTML::surrounding_agent().fetch_controller_registry);
+    auto& control_block = controller->control_block();
+
+    auto timing_info = Web::Fetch::Infrastructure::FetchTimingInfo::create();
+    timing_info->set_start_time(1);
+    timing_info->set_redirect_start_time(2);
+    timing_info->set_redirect_end_time(3);
+    timing_info->set_post_redirect_start_time(4);
+    timing_info->set_final_service_worker_start_time(5);
+    timing_info->set_server_timing_headers({ "total;dur=6"_string });
+    timing_info->set_render_blocking(true);
+    control_block.set_end_time(7);
+
+    auto handed_over = control_block.hand_over_timing(timing_info->seed());
+    EXPECT_EQ(handed_over->start_time(), 1);
+    EXPECT_EQ(handed_over->redirect_start_time(), 2);
+    EXPECT_EQ(handed_over->redirect_end_time(), 3);
+    EXPECT_EQ(handed_over->post_redirect_start_time(), 4);
+    EXPECT_EQ(handed_over->final_service_worker_start_time(), 5);
+    EXPECT_EQ(handed_over->server_timing_headers(), (Vector<String> { "total;dur=6"_string }));
+    EXPECT(handed_over->render_blocking());
+    EXPECT_EQ(handed_over->end_time(), 7);
+
+    // An end time set later reaches it too.
+    control_block.set_end_time(8);
+    EXPECT_EQ(handed_over->end_time(), 8);
+}
+
+namespace {
+
+// What the steps awaiting a body's end saw when they ran.
+struct EndOfBodySteps : RefCounted<EndOfBodySteps> {
+    GC_HOLDS_NO_CELL_EDGES;
+
+    Vector<double> end_times;
+    bool had_network_phases { false };
+};
+
+}
+
+TEST_CASE(the_network_phases_of_a_load_reach_the_agent_before_the_end_of_its_body)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    auto controller = FetchController::create(Web::HTML::surrounding_agent().fetch_controller_registry);
+    FetchEventSink event_sink { controller };
+    auto agent_timing_info = controller->control_block().hand_over_timing({});
+    auto response = Response::create();
+
+    auto steps = make_ref_counted<EndOfBodySteps>();
+    controller->when_body_ends(Web::Fetch::Engine::DeliveryId(1), response, GC::create_function(harness.realm->heap(), GC::captures(steps, agent_timing_info), [](auto& steps, auto& agent_timing_info, double end_time) {
+        steps->end_times.append(end_time);
+        steps->had_network_phases = agent_timing_info->final_connection_timing_info().has_value();
+    }));
+
+    event_sink.handle_event(RequestTransmissionEnded { network_phases(10) });
+    EXPECT(steps->end_times.is_empty());
+    EXPECT_EQ(agent_timing_info->final_network_request_start_time(), 10);
+
+    EndOfBody end_of_body {
+        .delivery_id = Web::Fetch::Engine::DeliveryId(1),
+        .final_sizes = { .encoded_body_size = 3, .decoded_body_size = 4 },
+        .end_time = 30,
+    };
+    event_sink.handle_event(move(end_of_body));
+    EXPECT_EQ(steps->end_times, (Vector<double> { 30 }));
+    EXPECT(steps->had_network_phases);
+    EXPECT_EQ(response->body_info().encoded_size, 3u);
+    EXPECT_EQ(response->body_info().decoded_size, 4u);
+}
+
+namespace {
+
+// The WebDriver BiDi responseCompleted events that reached the event sink, by redirect count.
+struct CompletedResponses : RefCounted<CompletedResponses> {
+    GC_HOLDS_NO_CELL_EDGES;
+
+    Vector<u32> redirect_counts;
+    Vector<double> request_starts;
+    Vector<double> response_ends;
+};
+
+}
+
+TEST_CASE(a_redirected_fetch_reports_the_end_time_of_its_final_body_to_webdriver_bidi_and_resource_timing)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto completed = make_ref_counted<CompletedResponses>();
+    WebDriverBiDiSession session {
+        { "network.responseCompleted"_string },
+        [completed](Web::HTML::Navigable const&, String const&, JsonValue params) {
+            auto const& object = params.as_object();
+            completed->redirect_counts.append(object.get_u32("redirectCount"sv).value());
+            auto timings = object.get_object("request"sv)->get_object("timings"sv);
+            completed->request_starts.append(timings->get_double_with_precision_loss("requestStart"sv).value());
+            completed->response_ends.append(timings->get_double_with_precision_loss("responseEnd"sv).value());
+        },
+    };
+
+    auto record = make_ref_counted<AlgorithmCalls>();
+    auto request = harness.create_request_for("http://127.0.0.1:8000/redirect"sv);
+    request->set_initiator_type(Request::InitiatorType::Fetch);
+    auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record)));
+    auto& control_block = controller->control_block();
+
+    // The redirect completes, and WebDriver BiDi sets the fetch's end time.
+    auto redirect_id = request_server.wait_for_request("GET"sv);
+    request_server.send_headers(redirect_id, 302, { { "Location"sv, "/final"sv } });
+    request_server.send_finished(redirect_id, finished_timing_info(1000));
+    auto final_id = request_server.wait_for_request("GET"sv);
+    auto redirect_end_time = control_block.end_time();
+    EXPECT_NE(redirect_end_time, 0);
+
+    // The final body ends once the clock is past the redirect's end time by more than a coarsening interval.
+    request_server.send_headers(final_id, 200);
+    run_until_responses(harness, record, 1);
+    auto clock_tick = Core::Timer::create_repeating(AK::Duration::from_milliseconds(1), [] { });
+    clock_tick->start();
+    harness.run_tasks_until(GC::create_function(harness.realm->heap(), GC::captures(redirect_end_time), [](auto& redirect_end_time) {
+        return Web::HighResolutionTime::unsafe_shared_current_time() > redirect_end_time + 1;
+    }));
+    clock_tick->stop();
+    request_server.send_finished(final_id, finished_timing_info(2000));
+    auto response = record->responses[0]->record()->unsafe_response();
+    run_until_encoded_size(harness, response, 1234);
+
+    // The timing report and WebDriver BiDi share the fetch's end time, which is the final body's.
+    auto agent_timing_info = control_block.agent_timing_info();
+    VERIFY(agent_timing_info);
+    EXPECT(agent_timing_info->end_time() > redirect_end_time + 1);
+    EXPECT_EQ(control_block.end_time(), agent_timing_info->end_time());
+    EXPECT_EQ(completed->redirect_counts, (Vector<u32> { 0, 1 }));
+    VERIFY(completed->response_ends.size() == 2);
+    auto time_origin = request->client_snapshot()->time_origin;
+    EXPECT_EQ(completed->response_ends[0], Web::HighResolutionTime::coarsen_time(redirect_end_time) - time_origin);
+    EXPECT_EQ(completed->response_ends[1], Web::HighResolutionTime::coarsen_time(agent_timing_info->end_time()) - time_origin);
+    EXPECT_NE(completed->response_ends[1], completed->response_ends[0]);
+
+    // The final body's completion reports the network phases of the final load.
+    EXPECT_EQ(completed->request_starts[1], Web::HighResolutionTime::coarsen_time(agent_timing_info->final_network_request_start_time()) - time_origin);
+}
+
+TEST_CASE(the_next_response_of_a_manual_redirect_takes_the_end_time_last_set_for_the_fetch)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+    WebDriverBiDiSession session { { "network.responseCompleted"_string }, [](Web::HTML::Navigable const&, String const&, JsonValue) { } };
+
+    auto record = make_ref_counted<AlgorithmCalls>();
+    auto request = harness.create_request_for("http://127.0.0.1:8000/manual-redirect"sv);
+    request->set_mode(Request::Mode::Navigate);
+    request->set_destination(Request::Destination::Document);
+    request->set_redirect_mode(Request::RedirectMode::Manual);
+    auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record)));
+    auto& control_block = controller->control_block();
+
+    // WebDriver BiDi completes the redirect, which sets the fetch's end time before the redirect is handed over.
+    auto redirect_id = request_server.wait_for_request("GET"sv);
+    request_server.send_headers(redirect_id, 302, { { "Location"sv, "/final"sv } });
+    run_until_responses(harness, record, 1);
+    auto redirect_end_time = control_block.end_time();
+    EXPECT_NE(redirect_end_time, 0);
+    auto redirect_timing_info = control_block.agent_timing_info();
+    VERIFY(redirect_timing_info);
+    EXPECT_EQ(redirect_timing_info->end_time(), redirect_end_time);
+
+    {
+        Web::HTML::TemporaryExecutionContext execution_context { *harness.realm, Web::HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+        controller->process_next_manual_redirect();
+    }
+    auto final_id = request_server.wait_for_request("GET"sv);
+    request_server.send_headers(final_id, 200);
+    request_server.send_finished(final_id, finished_timing_info(2000));
+    run_until_responses(harness, record, 2);
+    run_until_encoded_size(harness, record->responses[1]->record()->unsafe_response(), 1234);
+
+    // The final response's timing info takes the fetch's end time, and the redirect and network fields of its own hop.
+    auto final_timing_info = control_block.agent_timing_info();
+    VERIFY(final_timing_info);
+    EXPECT_NE(final_timing_info.ptr(), redirect_timing_info.ptr());
+    EXPECT_EQ(final_timing_info->end_time(), redirect_end_time);
+    auto fetch_params = controller->original_fetch_params();
+    VERIFY(fetch_params);
+    auto const& engine_timing_info = *fetch_params->timing_info();
+    EXPECT_NE(engine_timing_info.redirect_end_time(), redirect_timing_info->redirect_end_time());
+    EXPECT_EQ(final_timing_info->redirect_start_time(), engine_timing_info.redirect_start_time());
+    EXPECT_EQ(final_timing_info->redirect_end_time(), engine_timing_info.redirect_end_time());
+    EXPECT_EQ(final_timing_info->post_redirect_start_time(), engine_timing_info.post_redirect_start_time());
+    expect_network_phases_of(*final_timing_info, finished_timing_info(2000));
+}
+
+TEST_CASE(a_cors_preflight_reports_none_of_its_network_phases_to_its_fetch)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    StandInRequestServer request_server { harness };
+
+    auto record = make_ref_counted<AlgorithmCalls>();
+    auto request = harness.create_request_for("http://127.0.0.1:8000/preflighted"sv);
+    request->set_method("PUT");
+    request->set_mode(Request::Mode::CORS);
+    request->set_unsafe_request(true);
+    auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record)));
+
+    // The preflight's request ends right after its headers.
+    auto preflight_id = request_server.wait_for_request("OPTIONS"sv);
+    request_server.send_headers(preflight_id, 200, { { "Access-Control-Allow-Origin"sv, "*"sv }, { "Access-Control-Allow-Methods"sv, "PUT"sv } });
+    request_server.send_finished(preflight_id, finished_timing_info(9000));
+    auto request_id = request_server.wait_for_request("PUT"sv);
+    request_server.send_headers(request_id, 200, { { "Access-Control-Allow-Origin"sv, "*"sv } });
+    run_until_responses(harness, record, 1);
+
+    auto agent_timing_info = controller->control_block().agent_timing_info();
+    VERIFY(agent_timing_info);
+    EXPECT(!agent_timing_info->final_connection_timing_info().has_value());
+
+    request_server.send_finished(request_id, finished_timing_info(1000));
+    run_until_encoded_size(harness, record->responses[0]->record()->unsafe_response(), 1234);
+    expect_network_phases_of(*agent_timing_info, finished_timing_info(1000));
+}
+
+TEST_CASE(a_file_navigation_keeps_the_network_phases_of_its_load)
+{
+    auto const path = ByteString::formatted("{}/TestFetchAlgorithms-{:016x}.html", Core::StandardPaths::tempfile_directory(), get_random<u64>());
+    {
+        auto file = MUST(Core::File::open(path, Core::File::OpenMode::Write | Core::File::OpenMode::MustBeNew));
+        MUST(file->write_until_depleted("<p>file</p>"sv.bytes()));
+    }
+    ScopeGuard remove_file = [&path] { MUST(FileSystem::remove(path, FileSystem::RecursionMode::Disallowed)); };
+
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    ResourceLoaderWithoutRequestServer resource_loader { harness.realm->heap() };
+    auto page_client = NetworkActivityPageClient::create(harness.realm->heap(), Web::PageId { 1 });
+    auto document = create_document_of_page(page_client->page());
+
+    auto record = make_ref_counted<AlgorithmCalls>();
+    auto url = URL::create_with_file_scheme(path);
+    VERIFY(url.has_value());
+    auto request = harness.create_request_for(url->serialize());
+    // A traversal back to a file: entry, which fetches it with the client of the document it replaces.
+    request->set_mode(Request::Mode::Navigate);
+    request->set_destination(Request::Destination::Document);
+    request->set_redirect_mode(Request::RedirectMode::Manual);
+    request->set_history_navigation(true);
+    auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record), document));
+    run_until_responses(harness, record, 1);
+    auto response = record->responses[0]->record()->unsafe_response();
+    run_until_encoded_size(harness, response, 11);
+
+    // A load without a RequestServer request has its network phases at its post-redirect start time.
+    auto full_timing_info = controller->full_timing_info();
+    VERIFY(full_timing_info);
+    EXPECT_EQ(full_timing_info.ptr(), controller->control_block().agent_timing_info().ptr());
+    expect_network_phases_of(*full_timing_info, {});
 }
 
 TEST_CASE(algorithms_that_consume_a_body_need_a_consuming_intent)

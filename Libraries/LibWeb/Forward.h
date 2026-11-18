@@ -575,6 +575,7 @@ class WholeBodyTransport;
 
 namespace Web::Fetch::Engine::Event {
 
+struct EndOfBody;
 struct NetworkActivity;
 
 }
@@ -939,6 +940,14 @@ class MathMLMspaceElement;
 namespace Web::MediaCapabilitiesAPI {
 
 class MediaCapabilities;
+
+}
+
+namespace Web::MediaSession {
+
+class ChapterInformation;
+class MediaMetadata;
+class MediaSession;
 
 }
 

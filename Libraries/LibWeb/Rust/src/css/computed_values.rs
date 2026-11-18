@@ -3300,6 +3300,10 @@ style_bit_fields! {
         INHERITED_BITS_TEXT_WRAP_MODE_SHIFT, INHERITED_BITS_TEXT_WRAP_MODE_WIDTH;
     Inherited WordBreak: WORD_BREAK, word_break::NORMAL, keyword_to_word_break,
         INHERITED_BITS_WORD_BREAK_SHIFT, INHERITED_BITS_WORD_BREAK_WIDTH;
+    Inherited TextAlignLast: TEXT_ALIGN_LAST, text_align_last::AUTO, keyword_to_text_align_last,
+        INHERITED_BITS_TEXT_ALIGN_LAST_SHIFT, INHERITED_BITS_TEXT_ALIGN_LAST_WIDTH;
+    Inherited Hyphens: HYPHENS, hyphens::MANUAL, keyword_to_hyphens,
+        INHERITED_BITS_HYPHENS_SHIFT, INHERITED_BITS_HYPHENS_WIDTH;
     Reset Position: POSITION, positioning::STATIC, keyword_to_positioning,
         RESET_BITS_POSITION_SHIFT, RESET_BITS_POSITION_WIDTH;
     Reset Float: FLOAT, float::NONE, keyword_to_float,

@@ -8,7 +8,6 @@
 
 #include <AK/Error.h>
 #include <AK/Format.h>
-#include <LibCrypto/BigInt/UnsignedBigInteger.h>
 #include <LibCrypto/Hash/Hash.h>
 #include <LibCrypto/OpenSSLForward.h>
 
@@ -86,51 +85,12 @@ class OpenSSL_X509 {
     OPENSSL_WRAPPER_CLASS(OpenSSL_X509, X509, X509);
 };
 
-class OpenSSL_BN {
-    OPENSSL_WRAPPER_CLASS(OpenSSL_BN, BIGNUM, BN);
-
-public:
-    static ErrorOr<OpenSSL_BN> create();
-};
-
 class OpenSSL_PKEY {
     OPENSSL_WRAPPER_CLASS(OpenSSL_PKEY, EVP_PKEY, EVP_PKEY);
-
-public:
-    static ErrorOr<OpenSSL_PKEY> create();
-
-    friend class OpenSSL_SharedPKEY;
-};
-
-// OpenSSL never changes a key once it is built, so copies share one key.
-class OpenSSL_SharedPKEY {
-public:
-    OpenSSL_SharedPKEY() = default;
-    explicit OpenSSL_SharedPKEY(OpenSSL_PKEY&&);
-
-    OpenSSL_SharedPKEY(OpenSSL_SharedPKEY const&);
-    OpenSSL_SharedPKEY(OpenSSL_SharedPKEY&&);
-    OpenSSL_SharedPKEY& operator=(OpenSSL_SharedPKEY const&);
-    OpenSSL_SharedPKEY& operator=(OpenSSL_SharedPKEY&&);
-    ~OpenSSL_SharedPKEY();
-
-    // NB: OpenSSL takes a non-const key even to read from it.
-    EVP_PKEY* ptr() const { return m_ptr; }
-
-private:
-    EVP_PKEY* m_ptr { nullptr };
 };
 
 class OpenSSL_PKEY_CTX {
     OPENSSL_WRAPPER_CLASS(OpenSSL_PKEY_CTX, EVP_PKEY_CTX, EVP_PKEY_CTX);
-};
-
-class OpenSSL_MAC {
-    OPENSSL_WRAPPER_CLASS(OpenSSL_MAC, EVP_MAC, EVP_MAC);
-};
-
-class OpenSSL_MAC_CTX {
-    OPENSSL_WRAPPER_CLASS(OpenSSL_MAC_CTX, EVP_MAC_CTX, EVP_MAC_CTX);
 };
 
 class OpenSSL_MD_CTX {
@@ -140,22 +100,6 @@ public:
     static ErrorOr<OpenSSL_MD_CTX> create();
 };
 
-class OpenSSL_KDF_CTX {
-    OPENSSL_WRAPPER_CLASS(OpenSSL_KDF_CTX, EVP_KDF_CTX, EVP_KDF_CTX);
-};
-
-class OpenSSL_CIPHER_CTX {
-    OPENSSL_WRAPPER_CLASS(OpenSSL_CIPHER_CTX, EVP_CIPHER_CTX, EVP_CIPHER_CTX);
-
-public:
-    static ErrorOr<OpenSSL_CIPHER_CTX> create();
-};
-
 #undef OPENSSL_WRAPPER_CLASS
-
-ErrorOr<OpenSSL_BN> unsigned_big_integer_to_openssl_bignum(UnsignedBigInteger const& integer);
-ErrorOr<UnsignedBigInteger> openssl_bignum_to_unsigned_big_integer(OpenSSL_BN const& bn);
-
-ErrorOr<ByteBuffer> get_byte_buffer_param_from_key(EVP_PKEY* key, char const* key_name);
 
 }

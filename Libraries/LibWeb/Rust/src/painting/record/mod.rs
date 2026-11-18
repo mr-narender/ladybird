@@ -74,6 +74,9 @@ pub struct RecordingOutput {
     pub is_identical_to_published_recording: bool,
     // Whether the window was focused, which the output of the producers that read it reflects.
     pub(crate) window_is_focused: bool,
+    // A digest of the scale that each space of the tree accumulated, which the output of the producers that read one
+    // reflects. None where no producer read one.
+    pub(crate) accumulated_scales: Option<u64>,
     pub(crate) capture_log: Option<trace::CaptureLog>,
     /// The SVG images the recording draws, which the host rendered, and the ids of their records.
     pub(crate) vector_image_ids_by_request: Vec<(vector_images::VectorImageRenderRequest, u64)>,
@@ -86,6 +89,8 @@ pub struct RecordingOutput {
     /// What the display list is stamped with for async scrolling, but for the keyboard scroll state, which each frame
     /// sets.
     pub async_scrolling_metadata: Option<libcompositing_rust::ipc_types::Compositing_AsyncScrollingMetadata>,
+    /// Where the records of the tape come from, by their offsets in it, for a recording that notes it.
+    pub(crate) record_notes: Option<Arc<crate::painting::display_list::recorder::RecordNotes>>,
 }
 
 pub(crate) struct RecordingResult {
@@ -136,6 +141,8 @@ pub struct PaintRecorder<'a, O: Observer> {
     live_producer: bool,
     // Set while a producer records output that depends on whether the window is focused.
     producer_reads_window_focus: std::cell::Cell<bool>,
+    // Set while a producer records output that depends on the scale that a space of the tree accumulates.
+    producer_reads_accumulated_scale: std::cell::Cell<bool>,
     // Rows of the layout subtrees whose root moved: every producer of theirs records again.
     pub(crate) blocking_wheel_event_region_count: u32,
     pub(crate) records_per_box_wheel_hit_test_targets: bool,
@@ -146,6 +153,11 @@ pub struct PaintRecorder<'a, O: Observer> {
     // The spaces of the frame's tree against the window of the recording, for one that does not hold the whole
     // document.
     pub(crate) window_spaces: Option<window::WindowSpaces<'a>>,
+    // The notes of the records of each chunk taken, where the recording notes them.
+    pub(crate) record_notes_of_chunks: Vec<(
+        Arc<order_tree::RecordedChunk>,
+        crate::painting::display_list::recorder::RecordNotes,
+    )>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -640,8 +652,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             && style.empty_cells() == crate::css::css_enums::empty_cells::HIDE
             && crate::painting::paint_order::first_paint_child(self.source, paintable).is_none();
         let has_backdrop_filter = effects.backdrop_filter.operations.length != 0;
-        let paints_border_image = crate::painting::style_queries::handle_value(&style.border().border_image_source)
-            .is_some_and(|source| source.is_image());
+        let paints_border_image = paint::border_image::paints_border_image(style);
         let mut facts = BasePaintFacts {
             is_visible,
             empty_cells_property_applies,
@@ -724,6 +735,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
         self.svg_resource_walk.is_some_and(|walk| walk.draws_clip_path_geometry)
     }
 
+    /// The scale that the transforms of `spatial` and the spaces above it accumulate to. The producer that asks records
+    /// again when a transform changes such a scale.
     pub(crate) fn accumulated_2d_scale_at(&self, spatial: SpatialNodeIndex) -> libgfx_rust::FloatSize {
         if self.svg_resource_walk.is_some() {
             let transform = self
@@ -735,6 +748,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 height: transform.y_scale(),
             };
         }
+        self.producer_reads_accumulated_scale.set(true);
         self.paint_state.unscrolled_world_transforms().accumulated_2d_scale(
             spatial,
             crate::painting::visual_context::IncludeVisualViewportTransform::No,

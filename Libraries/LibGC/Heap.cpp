@@ -27,6 +27,7 @@
 #include <LibCore/File.h>
 #include <LibCore/StandardPaths.h>
 #include <LibCore/StatsLog.h>
+#include <LibCore/ThreadEventQueue.h>
 #include <LibCore/Timer.h>
 #include <LibGC/BlockAllocator.h>
 #include <LibGC/CellAllocator.h>
@@ -908,11 +909,19 @@ NO_SANITIZE_ADDRESS void Heap::collect_garbage(CollectionType collection_type, b
     run_collection(captured_registers, collection_type, print_report);
 }
 
-void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType collection_type, bool print_report)
+void Heap::collect_garbage_without_scanning_the_stack()
+{
+    VERIFY(!heap_access_is_forbidden_on_this_thread());
+    VERIFY(is_on_owner_thread());
+    run_collection({}, CollectionType::CollectGarbage, false, false);
+}
+
+void Heap::run_collection(ReadonlySpan<FlatPtr> callee_saved_registers, CollectionType collection_type, bool print_report, bool scan_stack)
 {
     ConservativeScanOrigin origin {
         .stack_floor = bit_cast<FlatPtr>(__builtin_frame_address(0)),
         .callee_saved_registers = callee_saved_registers,
+        .scan_stack = scan_stack,
     };
 
     VERIFY(!m_collecting_garbage);
@@ -1257,7 +1266,7 @@ void Heap::gather_roots(ConservativeScanOrigin const& origin, HashMap<Cell*, Hea
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.gather_embedder_roots_us };
         m_gather_embedder_roots(roots);
     }
-    {
+    if (origin.scan_stack) {
         ScopedPhaseTimer timer { g_recording_phase_timings, g_phase_timings.gather_conservative_roots_us };
         gather_conservative_roots(origin, roots, out_stack_frames);
     }
@@ -1995,7 +2004,7 @@ void Heap::idle_gc_on_timer()
         return;
     case IdleCollectionPolicy::Decision::Collect:
         m_allocated_bytes_since_last_gc = 0;
-        collect_garbage();
+        collect_garbage_from_timer();
         m_idle_gc_timer->stop();
         return;
     }
@@ -2045,6 +2054,19 @@ void Heap::on_abandoned_object_graph_timer()
     }
 
     m_allocated_bytes_since_last_gc = 0;
+    collect_garbage_from_timer();
+}
+
+void Heap::collect_garbage_from_timer()
+{
+    // A timer fires from the event loop. In its outermost turn the only frames on the stack are the event loop's and the
+    // embedder's, so if the embedder vouches for its own, there is no root to find there. Words that only look like a
+    // cell pointer are still there, and some never change, so scanning them could keep a cell alive for good. A nested
+    // event loop has its caller's frames further up the stack, and those need the scan.
+    if (m_outermost_event_loop_turn_holds_no_cells && !Core::ThreadEventQueue::current().is_processing_nested()) {
+        collect_garbage_without_scanning_the_stack();
+        return;
+    }
     collect_garbage();
 }
 

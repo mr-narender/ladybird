@@ -233,6 +233,7 @@
 #include <LibWeb/Layout/TreeBuilder.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Loader/ContentBlocker.h>
+#include <LibWeb/MediaSession/ActiveMediaSessionTracker.h>
 #include <LibWeb/Namespace.h>
 #include <LibWeb/NavigationTiming/PerformanceNavigationTiming.h>
 #include <LibWeb/Page/EventHandler.h>
@@ -1722,7 +1723,9 @@ WebIDL::ExceptionOr<void> Document::close()
         return {};
 
     // run() may have paused on a blocking script (e.g. from document.write inside an inline script).
-    if (has_pending_parsing_blocking_script()) {
+    // NB: An SVG script that the parser is executing keeps the parser paused, so run() did not tokenize anything. The
+    //     outermost invocation of the parser reaches the explicit "EOF" character once that script is done.
+    if (has_pending_parsing_blocking_script() || parser->is_paused()) {
         parser->set_post_parse_action(move(finish_script_created_parser));
         return {};
     }
@@ -6358,6 +6361,8 @@ void Document::run_unloading_cleanup_steps()
 // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
 void Document::destroy()
 {
+    page().active_media_session_tracker().document_became_inactive(*this);
+
     // FIXME: 1. Assert: this is running as part of a task queued on document's relevant agent's event loop.
 
     // NB: Every way a page goes away ends up here: navigating, closing its tab, and discarding it. When the process
@@ -6926,6 +6931,8 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
 
 void Document::did_stop_being_active_document_in_navigable()
 {
+    page().active_media_session_tracker().document_became_inactive(*this);
+
     stop_compositor_animation_timers();
     tear_down_layout_tree();
 
@@ -11748,7 +11755,7 @@ ElementByIdMap& Document::element_by_id() const
     return *m_element_by_id;
 }
 
-Utf16String Document::dump_display_list()
+Utf16String Document::dump_display_list(Painting::DisplayListDumpOptions const& options)
 {
     Layout::ForcedReadScope read { *this };
     update_layout(UpdateLayoutReason::DumpDisplayList);
@@ -11759,10 +11766,11 @@ Utf16String Document::dump_display_list()
     if (paint_state().has_visual_context_tree(read))
         schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
 
-    if (!record_display_list(read, HTML::PaintConfig { .records_whole_document = true }, Painting::PaintCommandCacheMode::ReadOnly))
+    HTML::PaintConfig config { .records_whole_document = true, .notes_record_origins = options.owners || options.text || options.jsonl };
+    if (!record_display_list(read, config, Painting::PaintCommandCacheMode::ReadOnly))
         return "No display list"_utf16;
 
-    return Painting::serialize_painting_dump(read, *this);
+    return Painting::serialize_painting_dump(read, *this, options);
 }
 
 Utf16String Document::dump_stacking_context_tree()

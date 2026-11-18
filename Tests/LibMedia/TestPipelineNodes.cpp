@@ -292,11 +292,50 @@ private:
 
 }
 
+// Has no data to hand out, and reports whatever status the test gives it.
+class StatusAudioProducer final : public Media::AudioProducer {
+public:
+    static NonnullRefPtr<StatusAudioProducer> create(Media::PipelineStatus status) { return adopt_ref(*new StatusAudioProducer(status)); }
+
+    virtual void start() override { }
+    virtual ErrorOr<void> set_output_sample_specification(Audio::SampleSpecification) override { return {}; }
+
+    virtual Media::AudioProducerOutput peek() override
+    {
+        MutexLocker locker { m_mutex };
+        return { nullptr, m_status };
+    }
+
+    virtual void consume() override { }
+    virtual void set_wake_handler(Media::PipelineWakeHandler handler) override { m_wake_handler = move(handler); }
+    virtual void seek(AK::Duration) override { }
+
+    void set_status(Media::PipelineStatus status)
+    {
+        {
+            MutexLocker locker { m_mutex };
+            m_status = status;
+        }
+        if (m_wake_handler)
+            m_wake_handler();
+    }
+
+private:
+    explicit StatusAudioProducer(Media::PipelineStatus status)
+        : m_status(status)
+    {
+    }
+
+    Mutex m_mutex;
+    Media::PipelineStatus m_status;
+    Media::PipelineWakeHandler m_wake_handler;
+};
+
 TEST_CASE(audio_playback_sink_reseeks_its_input_from_the_written_output_without_moving_the_clock)
 {
     auto& loop = never_destroyed_event_loop();
 
-    auto sink = MUST(Media::AudioPlaybackSink::try_create([](Media::PipelineStatus) { }, Media::AudioOutputFactory::create_null()));
+    auto sink = MUST(Media::AudioPlaybackSink::try_create([](Media::PipelineStatus, Media::PipelineCheckpoint) { }, Media::AudioOutputFactory::create_null()));
     auto producer = RecordingAudioProducer::create();
     MUST(sink->connect_input(producer));
     sink->start();
@@ -333,7 +372,7 @@ TEST_CASE(audio_playback_sink_holds_its_clock_through_a_seek_while_playing)
 {
     auto& loop = never_destroyed_event_loop();
 
-    auto sink = MUST(Media::AudioPlaybackSink::try_create([](Media::PipelineStatus) { }, Media::AudioOutputFactory::create_null()));
+    auto sink = MUST(Media::AudioPlaybackSink::try_create([](Media::PipelineStatus, Media::PipelineCheckpoint) { }, Media::AudioOutputFactory::create_null()));
     auto producer = RecordingAudioProducer::create();
     MUST(sink->connect_input(producer));
     sink->start();
@@ -359,7 +398,7 @@ TEST_CASE(audio_playback_sink_reports_readiness_at_zero_rate)
     auto& loop = never_destroyed_event_loop();
 
     Optional<Media::PipelineStatus> last_status;
-    auto sink = MUST(Media::AudioPlaybackSink::try_create([&](Media::PipelineStatus status) { last_status = status; }, Media::AudioOutputFactory::create_null()));
+    auto sink = MUST(Media::AudioPlaybackSink::try_create([&](Media::PipelineStatus status, Media::PipelineCheckpoint) { last_status = status; }, Media::AudioOutputFactory::create_null()));
     auto producer = RecordingAudioProducer::create();
     MUST(sink->connect_input(producer));
     sink->set_playback_rate(0.0f);
@@ -390,6 +429,24 @@ TEST_CASE(audio_playback_sink_reports_readiness_at_zero_rate)
     EXPECT(pump_until(loop, [&] { return time_reader.current_time() > seek_target + AK::Duration::from_milliseconds(100); }));
 }
 
+// A sink whose playback rate is zero does not pull from its input, but nothing else reports its input's status, so it
+// must still report that status as it changes.
+TEST_CASE(audio_playback_sink_reports_its_inputs_status_while_its_playback_rate_is_zero)
+{
+    auto& loop = never_destroyed_event_loop();
+
+    Optional<Media::PipelineStatus> last_dispatched_status;
+    auto sink = MUST(Media::AudioPlaybackSink::try_create([&](Media::PipelineStatus status, Media::PipelineCheckpoint) { last_dispatched_status = status; }, Media::AudioOutputFactory::create_null()));
+    auto producer = StatusAudioProducer::create(Media::PipelineStatus::Blocked);
+    MUST(sink->connect_input(producer));
+    sink->start();
+    EXPECT(pump_until(loop, [&] { return last_dispatched_status == Media::PipelineStatus::Blocked; }));
+
+    sink->set_playback_rate(0.0f);
+    producer->set_status(Media::PipelineStatus::Pending);
+    EXPECT(pump_until(loop, [&] { return last_dispatched_status == Media::PipelineStatus::Pending; }));
+}
+
 TEST_CASE(displaying_video_sink_reports_a_suspended_input_while_unticked)
 {
     auto& loop = never_destroyed_event_loop();
@@ -404,7 +461,7 @@ TEST_CASE(displaying_video_sink_reports_a_suspended_input_while_unticked)
     auto clock = TRY_OR_FAIL(Media::MonotonicMediaClock::try_create());
     auto sink = TRY_OR_FAIL(Media::DisplayingVideoSink::try_create(clock->time_reader()));
     Optional<Media::PipelineStatus> last_dispatched_status;
-    sink->set_state_change_handler([&](Media::PipelineStatus status) { last_dispatched_status = status; });
+    sink->set_state_change_handler([&](Media::PipelineStatus status, Media::PipelineCheckpoint) { last_dispatched_status = status; });
     TRY_OR_FAIL(sink->connect_input(producer));
 
     EXPECT(pump_until_the_sink_displays_a_frame(loop, *sink, *producer, *clock));

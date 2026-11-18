@@ -262,6 +262,7 @@ struct Commit<'arena, 'tree> {
     out_of_flow_boxes: Vec<(Node, std::sync::Arc<crate::layout::abspos_inputs::AbsposLayoutInputs>)>,
     pass_level_links: Vec<Node>,
     line_roots: Vec<(Node, LineRootChanges)>,
+    pieces_only_moved_by_inline_box_slot_index: Vec<bool>,
 }
 
 impl<'tree> Commit<'_, 'tree> {
@@ -670,8 +671,7 @@ impl<'tree> Commit<'_, 'tree> {
             if row_existed_before_this_commit
                 && line_root_changes_repaint_inline_box(self.arena(), node, enclosing_line_root_changes)
             {
-                self.arena_mut()
-                    .note_paint_change(node, RowPaintChange::EVERYTHING_IT_PAINTS);
+                self.note_paint_change_of_inline_box(node, RowPaintChange::EVERYTHING_IT_PAINTS);
             }
             if row_existed_before_this_commit && enclosing_line_root_changes.fragment_changed {
                 self.arena_mut()
@@ -763,10 +763,13 @@ impl<'tree> Commit<'_, 'tree> {
                 paint_change |= RowPaintChange::ORDER;
             }
             fragment_content_changed |= enclosing_line_root_changes.fragment_changed;
-        } else if offset_changed {
-            paint_change |= RowPaintChange::PLACE;
+            self.note_paint_change_of_inline_box(node, paint_change);
+        } else {
+            if offset_changed {
+                paint_change |= RowPaintChange::PLACE;
+            }
+            self.arena_mut().note_paint_change(node, paint_change);
         }
-        self.arena_mut().note_paint_change(node, paint_change);
         if offset_changed {
             self.arena_mut()
                 .note_visual_context_box_dirty(node, VisualContextBoxDirtyKind::MovedWithDescendants);
@@ -927,6 +930,18 @@ impl<'tree> Commit<'_, 'tree> {
             &physical_line_data
         };
         let has_pieces = !line_data.inline_box_pieces.is_empty();
+        if let Some(previous) = previous_content.as_ref()
+            && !is_or_was_fragmented
+            && !std::sync::Arc::ptr_eq(previous, line_data)
+        {
+            for inline_box in line_data.inline_boxes_whose_pieces_only_moved_since(previous) {
+                let index = inline_box.slot_index() as usize;
+                if self.pieces_only_moved_by_inline_box_slot_index.len() <= index {
+                    self.pieces_only_moved_by_inline_box_slot_index.resize(index + 1, false);
+                }
+                self.pieces_only_moved_by_inline_box_slot_index[index] = true;
+            }
+        }
         // NB: The link of a box in one fragment says how its content changed, but compares the content as layout made
         //     it. The plan of the foreground reads the content the row holds, which is merged and in the physical
         //     plane, so that is what says whether the plan changed.
@@ -939,7 +954,20 @@ impl<'tree> Commit<'_, 'tree> {
                 !crate::painting::paint_order_plan::content_plans_same_foreground(&previous, line_data),
             )
         });
-        self.arena_mut().committed_side_data_mut(slot).inline_content = Some(line_data.clone());
+        let previous_content = self
+            .arena_mut()
+            .committed_side_data_mut(slot)
+            .inline_content
+            .replace(line_data.clone());
+        if !previous_content
+            .as_ref()
+            .is_some_and(|previous| std::sync::Arc::ptr_eq(previous, line_data))
+        {
+            self.refresh_paint_order_inputs_that_disagree_with_the_atomic_inlines_of(
+                previous_content.as_deref(),
+                Some(line_data),
+            );
+        }
         if item_order_changed {
             self.arena_mut().note_paint_change(slot, RowPaintChange::ORDER);
         }
@@ -953,10 +981,61 @@ impl<'tree> Commit<'_, 'tree> {
         }
     }
 
+    fn note_paint_change_of_inline_box(&mut self, inline_box: Node, change: RowPaintChange) {
+        if self
+            .pieces_only_moved_by_inline_box_slot_index
+            .get(inline_box.slot_index() as usize)
+            .copied()
+            .unwrap_or(false)
+            && !crate::painting::fragment_ownership::is_self_painting_inline(&self.arena().paintable_rows(), inline_box)
+        {
+            self.arena_mut()
+                .note_paint_change_keeping_own_ink_overflow(inline_box, change);
+        } else {
+            self.arena_mut().note_paint_change(inline_box, change);
+        }
+    }
+
     /// Clears the inline content of a row whose new fragment has none.
     fn clear_line_data(&mut self, slot: NodeSlotId) {
         if self.arena().committed_side_data(slot).inline_content.is_some() {
-            self.arena_mut().committed_side_data_mut(slot).inline_content = None;
+            let previous_content = self.arena_mut().committed_side_data_mut(slot).inline_content.take();
+            self.refresh_paint_order_inputs_that_disagree_with_the_atomic_inlines_of(previous_content.as_deref(), None);
+        }
+    }
+
+    fn refresh_paint_order_inputs_that_disagree_with_the_atomic_inlines_of(
+        &mut self,
+        previous_content: Option<&crate::layout::inline_content::InlineContent>,
+        content: Option<&crate::layout::inline_content::InlineContent>,
+    ) {
+        let atomic_inlines_before_and_after: Vec<NodeSlotId> = [previous_content, content]
+            .into_iter()
+            .flatten()
+            .flat_map(|content| content.fragments.iter())
+            .filter(|fragment| fragment.is_atomic_inline)
+            .map(|fragment| fragment.layout_node)
+            .collect();
+        let is_atomic_inline_of_content = |node: NodeSlotId| {
+            content.is_some_and(|content| {
+                content
+                    .fragment_indices_of(node)
+                    .iter()
+                    .any(|&index| content.fragments[index as usize].is_atomic_inline)
+            })
+        };
+        for node in atomic_inlines_before_and_after {
+            let arena = self.arena();
+            if !arena.slot_is_live(node) || !arena.paintable_row_is_populated(node) {
+                continue;
+            }
+            let inputs_disagree = arena
+                .committed_side_data(node)
+                .prepared_order_inputs()
+                .is_some_and(|inputs| inputs.is_atomic_inline_content() != is_atomic_inline_of_content(node));
+            if inputs_disagree {
+                self.arena_mut().refresh_paint_order_inputs(node);
+            }
         }
     }
 
@@ -1229,6 +1308,7 @@ pub(crate) fn commit_replacing(
         out_of_flow_boxes: Vec::new(),
         pass_level_links: Vec::new(),
         line_roots: Vec::new(),
+        pieces_only_moved_by_inline_box_slot_index: Vec::new(),
     }
     .finish(pass_fragments)
 }

@@ -286,6 +286,11 @@ static RefPtr<Infrastructure::Response> select_response_from_cache(HTTP::MemoryC
     if (!g_http_memory_cache_enabled)
         return {};
 
+    // NB: A navigation's response comes from RequestServer, so that the UI process can take it from there. The UI
+    //     process refuses a response with a URL of the network that this process reports with a body of its own.
+    if (request.mode() == Infrastructure::Request::Mode::Navigate)
+        return {};
+
     auto cache_entry = http_cache.open_entry(request.current_url(), request.method(), request.header_list(), request.cache_mode());
     if (!cache_entry.has_value())
         return {};
@@ -1069,7 +1074,7 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
             auto internal_response = response.unsafe_response();
             WebDriver::BiDi::network_response_started(fetch_params, *internal_response);
             if (fetch_params.request()->is_navigation_request() && !internal_response->network_transport().has_value())
-                WebDriver::BiDi::network_response_completed(fetch_params, *internal_response);
+                WebDriver::BiDi::network_response_completed(fetch_params, *internal_response, *timing_info);
         }
     }
 
@@ -1090,6 +1095,11 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
             timing_info->set_server_timing_headers(server_timing_headers.release_value());
     }
 
+    // AD-HOC: timingInfo belongs to the fetch's engine, so the steps below use the agent's own copy of it, made of the
+    //         fields settled so far, the network phases settled last and the end time last set for the fetch. Those
+    //         settled or set later reach the latest handover's copy.
+    auto agent_timing_info = fetch_params.control_block().hand_over_timing(timing_info->seed());
+
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
     // NOTE: The create and initialize a Document object algorithm extracts full timing info for navigation requests
     //       whose destination can also be "embed", "frame", "iframe", or "object".
@@ -1097,19 +1107,17 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
     // 3. If fetchParams's request's destination is "document", then set fetchParams's controller's full timing info
     //    to fetchParams's timing info.
     if (fetch_params.request()->is_navigation_request())
-        fetch_params.control_block().set_full_timing_info(fetch_params.timing_info());
+        fetch_params.control_block().set_full_timing_info(agent_timing_info);
 
-    // AD-HOC: We extract steps 1-2 of processResponseEndOfBody into a separate lambda so we can also call it from
-    //         the error path. The fetch spec only runs processResponseEndOfBody on successful body read (via the
-    //         transform stream's flush algorithm). However, processResponseConsumeBody is called for both success
-    //         and failure, and specs like HTML's preload algorithm expect to be able to call reportTiming from
-    //         within processResponseConsumeBody. So we ensure report_timing_steps is set on error too, which allows
-    //         reportTiming to work without asserting, and still produces useful timing data for failed fetches.
+    // AD-HOC: We extract step 2 of processResponseEndOfBody into a separate lambda, given unsafeEndTime, so that the
+    //         error path and network completion can also run it. The fetch spec only runs processResponseEndOfBody on
+    //         successful body read (via the transform stream's flush algorithm). However, processResponseConsumeBody
+    //         is called for both success and failure, and specs like HTML's preload algorithm expect to be able to
+    //         call reportTiming from within processResponseConsumeBody. So we ensure report_timing_steps is set on
+    //         error too, which allows reportTiming to work without asserting, and still produces useful timing data
+    //         for failed fetches.
     auto timing_reported = RefCountedFlag::create(false);
-    auto setup_report_timing_steps = GC::create_function(GC::Heap::the(), GC::captures(response_view->record(), NonnullRefPtr { fetch_params }, controller, timing_info, timing_reported), [](auto& response, auto& fetch_params, auto& controller, auto& timing_info, auto& timing_reported) {
-        // 1. Let unsafeEndTime be the unsafe shared current time.
-        auto unsafe_end_time = HighResolutionTime::unsafe_shared_current_time();
-
+    auto setup_report_timing_steps = GC::create_function(GC::Heap::the(), GC::captures(response_view->record(), NonnullRefPtr { fetch_params }, controller, agent_timing_info, timing_reported), [](auto& response, auto& fetch_params, auto& controller, auto& timing_info, auto& timing_reported, HighResolutionTime::DOMHighResTimeStamp unsafe_end_time) {
         // 2. Set fetchParams’s controller’s report timing steps to the following steps given a global object global:
         controller->set_report_timing_steps(GC::create_function(GC::Heap::the(), GC::captures(response, fetch_params, timing_info, unsafe_end_time, timing_reported), [](auto& response, auto& fetch_params, auto& timing_info, auto& unsafe_end_time, auto& timing_reported, JS::Object& global) {
             // NB: Network completion and consuming the response body can both request a timing report.
@@ -1127,6 +1135,9 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
             //        it always a negative value approximately the value of the time origin.
             //        https://github.com/whatwg/fetch/issues/1812
             timing_info->set_end_time(unsafe_end_time);
+            // AD-HOC: The agent keeps this as the end time last set for the fetch, which later handovers and WebDriver
+            //         BiDi's events take.
+            fetch_params->control_block().set_end_time(unsafe_end_time);
 
             // 3. Let cacheState be response’s cache state.
             auto cache_state = response->cache_state();
@@ -1191,11 +1202,14 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
     });
 
     // 4. Let processResponseEndOfBody be the following steps:
-    auto process_response_end_of_body = GC::create_function(GC::Heap::the(), GC::captures(NonnullRefPtr { fetch_params }, controller, response_view, setup_report_timing_steps, report_timing_if_appropriate), [](auto& fetch_params, auto& controller, auto& response_view, auto& setup_report_timing_steps, auto& report_timing_if_appropriate) {
-        // 1-2. (See setup_report_timing_steps above)
-        setup_report_timing_steps->function()();
+    auto process_response_end_of_body = GC::create_function(GC::Heap::the(), GC::captures(NonnullRefPtr { fetch_params }, controller, response_view, agent_timing_info, setup_report_timing_steps, report_timing_if_appropriate), [](auto& fetch_params, auto& controller, auto& response_view, auto& agent_timing_info, auto& setup_report_timing_steps, auto& report_timing_if_appropriate) {
+        // 1. Let unsafeEndTime be the unsafe shared current time.
+        auto unsafe_end_time = HighResolutionTime::unsafe_shared_current_time();
+
+        // 2. (See setup_report_timing_steps above)
+        setup_report_timing_steps->function()(unsafe_end_time);
         if (WebDriver::BiDi::network_events_enabled() && !response_view->is_network_error())
-            WebDriver::BiDi::network_response_completed(fetch_params, *response_view->record()->unsafe_response());
+            WebDriver::BiDi::network_response_completed(fetch_params, *response_view->record()->unsafe_response(), *agent_timing_info);
 
         // 3. Let processResponseEndOfBodyTask be the following steps:
         auto process_response_end_of_body_task = GC::create_function(GC::Heap::the(), GC::captures(fetch_params, controller, response_view, report_timing_if_appropriate), [](auto& fetch_params, auto& controller, auto& response_view, auto& report_timing_if_appropriate) {
@@ -1229,20 +1243,31 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
 
     // AD-HOC: Report a body's timing once the network has delivered it. Fetch reports it from the flush of the
     //         transform the body is piped through, which backpressure on an unread body can hold back.
-    if (internal_body.has_value() && (fetch_params.request()->initiator_type().has_value() || (WebDriver::BiDi::network_events_enabled() && !fetch_params.request()->is_navigation_request()))) {
-        auto network_completion_steps = GC::create_function(GC::Heap::the(), GC::captures(NonnullRefPtr { fetch_params }, response_view, setup_report_timing_steps, report_timing_if_appropriate), [](auto& fetch_params, auto& response_view, auto& setup_report_timing_steps, auto& report_timing_if_appropriate) {
-            setup_report_timing_steps->function()();
-            report_timing_if_appropriate->function()();
-            if (WebDriver::BiDi::network_events_enabled())
-                WebDriver::BiDi::network_response_completed(*fetch_params, *response_view->record()->unsafe_response());
-        });
+    if (internal_body.has_value()) {
+        GC::Ptr<GC::Function<void(HighResolutionTime::DOMHighResTimeStamp)>> network_completion_steps;
+        if (fetch_params.request()->initiator_type().has_value() || (WebDriver::BiDi::network_events_enabled() && !fetch_params.request()->is_navigation_request())) {
+            network_completion_steps = GC::create_function(GC::Heap::the(), GC::captures(NonnullRefPtr { fetch_params }, response_view, agent_timing_info, setup_report_timing_steps, report_timing_if_appropriate), [](auto& fetch_params, auto& response_view, auto& agent_timing_info, auto& setup_report_timing_steps, auto& report_timing_if_appropriate, HighResolutionTime::DOMHighResTimeStamp unsafe_end_time) {
+                setup_report_timing_steps->function()(unsafe_end_time);
+                report_timing_if_appropriate->function()();
+                if (WebDriver::BiDi::network_events_enabled())
+                    WebDriver::BiDi::network_response_completed(*fetch_params, *response_view->record()->unsafe_response(), *agent_timing_info);
+            });
+        }
+        auto run_network_completion_steps_now = [&] {
+            if (network_completion_steps)
+                network_completion_steps->function()(HighResolutionTime::unsafe_shared_current_time());
+        };
         internal_body->bytes().visit(
-            [&](Core::ImmutableBytes const&) { network_completion_steps->function()(); },
+            [&](Core::ImmutableBytes const&) { run_network_completion_steps_now(); },
             [&](NonnullRefPtr<Engine::FetchByteChannel> const& channel) {
-                if (channel->peek_up_to(0).state.has<Engine::FetchByteChannel::Closed>())
-                    network_completion_steps->function()();
-                else
-                    controller->when_network_completes_body(*channel, network_completion_steps);
+                auto* engine_record = fetch_params.engine_record();
+                VERIFY(engine_record);
+                auto delivery_id = engine_record->deliver_body(*channel);
+                if (!delivery_id.has_value()) {
+                    run_network_completion_steps_now();
+                    return;
+                }
+                controller->when_body_ends(*delivery_id, internal_response, network_completion_steps);
             },
             [](Infrastructure::ResponseBody::ReadThroughStream) { });
     }
@@ -1385,7 +1410,7 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
         //    failure.
         auto process_body_error = GC::create_function(GC::Heap::the(), GC::captures(algorithms, response_view, fetch_params.controller(), setup_report_timing_steps), [](auto& algorithms, auto& response_view, auto& controller, auto& setup_report_timing_steps, JS::Value) {
             // AD-HOC: See comment on setup_report_timing_steps above.
-            setup_report_timing_steps->function()();
+            setup_report_timing_steps->function()(HighResolutionTime::unsafe_shared_current_time());
             // NB: A failed read does not always close or error the body's stream, which would otherwise end this.
             end_rendering_pending_operation(controller.ptr());
             algorithms->process_response_consume_body()->function()(response_view, Infrastructure::FetchAlgorithms::ConsumeBodyFailureTag {});
@@ -1900,7 +1925,7 @@ GC::Ref<PendingResponse> http_fetch(JS::Realm& realm, Infrastructure::FetchParam
         // 6. If internalResponse’s status is a redirect status:
         if (Infrastructure::is_redirect_status(internal_response->status())) {
             if (WebDriver::BiDi::network_events_enabled())
-                WebDriver::BiDi::network_response_completed(fetch_params, *internal_response);
+                WebDriver::BiDi::network_response_completed(fetch_params, *internal_response, *fetch_params->timing_info());
             // 1. If request is a navigation request, then append to request's navigation timing allow values list
             //    given request and internalResponse.
             if (request->is_navigation_request())
@@ -3043,11 +3068,16 @@ GC::Ref<PendingResponse> nonstandard_resource_loader_file_or_http_network_fetch(
         body_pump->set_cached_response_body(move(data));
     });
 
-    auto complete_load = GC::create_function(GC::Heap::the(), GC::captures(realm, pending_response, body_pump, request, fetch_timing_info, cross_origin_isolated_capability), [](auto& realm, auto& pending_response, auto& body_pump, auto& request, auto& fetch_timing_info, auto& cross_origin_isolated_capability, bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message) {
+    // A CORS preflight's network phases are those of its own timing info, not the fetch's.
+    auto reports_network_phases = !fetch_params.is_cors_preflight();
+    auto complete_load = GC::create_function(GC::Heap::the(), GC::captures(realm, pending_response, body_pump, request, fetch_timing_info, cross_origin_isolated_capability, NonnullRefPtr { *engine_record }, reports_network_phases), [](auto& realm, auto& pending_response, auto& body_pump, auto& request, auto& fetch_timing_info, auto& cross_origin_isolated_capability, auto& engine_record, auto& reports_network_phases, bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message) {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
 
         if (success) {
-            fetch_timing_info->update_final_timings(timing_info, cross_origin_isolated_capability);
+            auto network_phases = fetch_timing_info->final_network_phases(timing_info, cross_origin_isolated_capability);
+            fetch_timing_info->set_network_phases(network_phases);
+            if (reports_network_phases)
+                engine_record->event_sink().handle_event(Engine::Event::RequestTransmissionEnded { move(network_phases) });
             body_pump->handle_network_complete(Infrastructure::is_http_or_https_scheme(request->current_url().scheme()) ? Optional<i64>(timing_info.encoded_body_size) : Optional<i64> {});
         } else {
             auto error = Utf16String::formatted("Load failed: {}", error_message.value_or("Unknown error"sv));
@@ -3235,7 +3265,7 @@ GC::Ref<PendingResponse> cors_preflight_fetch(JS::Realm& realm, Infrastructure::
             if (response->is_network_error())
                 WebDriver::BiDi::network_fetch_error(*preflight_fetch_params, response->network_error_message().value_or("Preflight failed"_string));
             else
-                WebDriver::BiDi::network_response_completed(*preflight_fetch_params, *response);
+                WebDriver::BiDi::network_response_completed(*preflight_fetch_params, *response, *preflight_fetch_params->timing_info());
         }
 
         // NB: Only the preflight response's headers are read.

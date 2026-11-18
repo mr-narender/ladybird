@@ -11,7 +11,9 @@
 
 #include <AK/Assertions.h>
 #include <AK/ByteBuffer.h>
+#include <AK/Function.h>
 #include <AK/JsonValue.h>
+#include <AK/NonnullOwnPtr.h>
 #include <AK/Queue.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
@@ -111,10 +113,24 @@
 namespace Web {
 
 class PageClient;
+
+namespace Bindings {
+
+enum class MediaSessionAction : u8;
+
+}
+
 namespace Compositor {
 
 class CompositorContextHandle;
 class CompositorHost;
+
+}
+
+namespace MediaSession {
+
+class ActiveMediaSessionTracker;
+struct MediaSessionState;
 
 }
 
@@ -417,6 +433,9 @@ public:
 
     void register_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
     void unregister_media_element(Badge<HTML::HTMLMediaElement>, UniqueNodeID media_id);
+    void for_each_media_element(Function<void(HTML::HTMLMediaElement&)> const&);
+    MediaSession::ActiveMediaSessionTracker& active_media_session_tracker() { return *m_active_media_session_tracker; }
+    void handle_media_session_action(Bindings::MediaSessionAction, Optional<double> seek_offset = {}, Optional<double> seek_time = {}, Optional<bool> fast_seek = {});
     bool has_media_element_playing_audio(DOM::Document const&) const;
     Vector<GC::Root<HTML::HTMLVideoElement>> video_elements_of(DOM::Document const&);
 
@@ -528,9 +547,6 @@ private:
     void update_focused_navigable(GC::Ptr<HTML::Navigable>);
 
     GC::Ptr<HTML::HTMLMediaElement> media_context_menu_element();
-
-    template<typename Callback>
-    void for_each_media_element(Callback&& callback);
 
     template<typename Callback>
     void for_each_canvas_element(Callback&& callback);
@@ -664,6 +680,7 @@ private:
     u64 m_next_emulated_position_data_observer_id { 0 };
 
     Vector<UniqueNodeID> m_media_elements;
+    NonnullOwnPtr<MediaSession::ActiveMediaSessionTracker> m_active_media_session_tracker;
     Vector<UniqueNodeID> m_canvas_elements;
     Vector<GC::Ref<HTML::OffscreenCanvas>> m_offscreen_canvases_pending_placeholder_commit;
     Optional<UniqueNodeID> m_media_context_menu_element_id;
@@ -868,6 +885,7 @@ public:
     virtual void page_did_enter_tooltip_area(ByteString const&) { }
     virtual void page_did_leave_tooltip_area() { }
     virtual void page_did_change_favicon(Gfx::Bitmap const&) { }
+    virtual void page_did_change_media_session_state(Optional<MediaSession::MediaSessionState> const&) { }
     virtual void page_did_request_alert(Utf16String const&) { }
     virtual void page_did_request_before_unload(String const&) { }
     virtual void page_did_request_confirm(Utf16String const&) { }
@@ -925,6 +943,8 @@ public:
     virtual void page_did_request_set_system_visibility_state([[maybe_unused]] HTML::VisibilityState visibility_state) { }
     virtual String page_did_request_ui_process_session_history_for_testing() { return "{}"_string; }
     virtual bool page_did_request_has_populated_document_for_testing([[maybe_unused]] HTML::CrossProcessId navigable_id) { return false; }
+    virtual Optional<Web::MediaSession::MediaSessionState> page_did_request_now_playing_state_for_testing();
+    virtual void page_did_trigger_now_playing_action_for_testing(Web::Bindings::MediaSessionAction, Optional<double>, Optional<double>, Optional<bool>) { }
     virtual bool page_did_request_tab_is_playing_audio_for_testing() { return false; }
     virtual bool page_did_request_tab_is_heard_playing_audio_for_testing() { return false; }
     virtual bool page_did_request_tab_is_using_microphone_for_testing() { return false; }

@@ -49,6 +49,7 @@
 #include <QToolButton>
 #include <QVariantAnimation>
 #include <QWheelEvent>
+#include <QWindow>
 #include <QtMath>
 
 namespace Ladybird {
@@ -1522,6 +1523,16 @@ void BookmarksBarContainer::set_sidebar(QWidget& sidebar)
     m_sidebar->installEventFilter(this);
 }
 
+void BookmarksBarContainer::set_suppressed(bool suppressed)
+{
+    if (m_suppressed == suppressed)
+        return;
+    m_suppressed = suppressed;
+    if (suppressed)
+        set_hover_expanded(false);
+    update_geometry();
+}
+
 bool BookmarksBarContainer::shows_over_page() const
 {
     return Application::settings().appearance().show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover;
@@ -1529,7 +1540,7 @@ bool BookmarksBarContainer::shows_over_page() const
 
 bool BookmarksBarContainer::can_expand_on_hover() const
 {
-    return shows_over_page() && m_page_stack.isVisible() && m_toolbar.isVisible() && !window()->isFullScreen()
+    return !m_suppressed && shows_over_page() && m_page_stack.isVisible() && m_toolbar.isVisible() && !window()->isFullScreen()
         && !(m_tab && m_tab->is_loaded() && m_tab->location_edit().property("autocompleteOpen").toBool());
 }
 
@@ -1603,7 +1614,7 @@ void BookmarksBarContainer::update_geometry()
 {
     auto show_bookmarks_bar = Application::settings().appearance().show_bookmarks_bar;
     auto on_hover = show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover;
-    auto visible = !window()->isFullScreen()
+    auto visible = !m_suppressed && !window()->isFullScreen()
         && (show_bookmarks_bar == WebView::ShowBookmarksBar::Always
             || (show_bookmarks_bar == WebView::ShowBookmarksBar::OnHover && m_hover_expanded));
 
@@ -1619,8 +1630,14 @@ void BookmarksBarContainer::update_geometry()
     m_bar->setGeometry(0, height - full_height, width(), full_height);
     set_view_overlay_height(on_hover && visible ? height : 0);
     setVisible(visible);
-    if (on_hover && visible)
+
+    if (on_hover && visible) {
         raise();
+
+        // A newly shown page can place its native view above the bar even when the bar is already the topmost widget.
+        if (auto* handle = windowHandle())
+            handle->raise();
+    }
 
 #if defined(AK_OS_MACOS)
     ensure_appkit_window_is_exposed(*this);

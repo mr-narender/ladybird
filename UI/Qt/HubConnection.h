@@ -93,6 +93,7 @@ private:
     virtual void pip_close(u64 view_id) override;
     virtual void notification_show(u64 id, u64 page_id, Optional<u64> replaces, Web::NotificationsAPI::NotificationData data, String attribution, Optional<Gfx::ShareableBitmap> icon) override;
     virtual void notification_close(u64 id) override;
+    virtual void media_session_update(Optional<Web::MediaSession::MediaSessionState>) override;
     virtual void geolocation_start() override;
     virtual void geolocation_request_position(u64 id) override;
     virtual void geolocation_cancel_position_request(u64 id) override;
@@ -139,6 +140,7 @@ private:
     virtual void app_activate_or_open_tab_with_url(URL::URL url) override;
     virtual void app_open_view_in_new_tab(u64 view_id, Optional<u64> source_view_id, WebView::IsPrivate is_private, Web::HTML::ActivateTab activate_tab) override;
     virtual void app_display_error_dialog(String message) override;
+    virtual void app_display_update_check_result(WebView::UpdateCheckResult::Kind, Optional<String> version, WebView::InstallMethod, WebView::UpdateCheckTrigger) override;
     virtual void app_display_download_confirmation_dialog(String download_name, ByteString path) override;
     virtual void app_read_clipboard_text(u64 request_id, WebView::Application::ClipboardType type) override;
     virtual void app_read_clipboard_item(u64 request_id) override;

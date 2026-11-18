@@ -11,7 +11,9 @@
 #include <AK/Platform.h>
 #include <Hub/Application.h>
 #include <Hub/ConnectionFromUI.h>
+#include <LibCore/Forward.h>
 #include <LibCore/Platform/ProcessStatistics.h>
+#include <LibCore/Process.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/Application.h>
@@ -19,6 +21,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/ProcessSnapshot.h>
+#include <LibWebView/UpdateCheck.h>
 #include <UI/Qt/ApplicationActions.h>
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/HubConnection.h>
@@ -144,6 +147,17 @@ public:
     // the downloads and quits; if a page refuses or the downloads are kept, the quit is canceled and no window closes.
     void quit();
     bool is_quit_in_progress() const { return m_quit_in_progress; }
+    struct RestartCommand {
+        ByteString executable;
+        Vector<ByteString> arguments;
+        Optional<Core::Process> hub;
+        bool relaunched_by_updater { false };
+
+        ErrorOr<void> run();
+    };
+    void offer_restart_after_update();
+    void restart();
+    Optional<RestartCommand> take_restart_command();
     bool is_finishing_quit() const { return m_quit_is_finishing; }
     bool confirm_stop_active_downloads(QWidget* parent = nullptr);
 
@@ -228,6 +242,8 @@ private:
 
     OwnPtr<WebView::NotificationBackend> create_notification_backend();
     WebView::NotificationBackend& notification_backend();
+    OwnPtr<WebView::MediaSessionPlatformBackend> create_media_session_platform_backend();
+    WebView::MediaSessionPlatformBackend* media_session_platform_backend();
     void focus_view_from_notification(u64 view_id);
     void open_url_in_new_tab_from_notification(URL::URL const&, Optional<u64> view_id, WebView::IsPrivate);
 
@@ -258,6 +274,7 @@ private:
     void ask_user_for_download_path(u64 request_id, ByteString const& file) const;
     void display_download_confirmation_dialog(StringView download_name, ByteString const& path) const;
     void display_error_dialog(StringView error_message) const;
+    void display_update_check_result(WebView::UpdateCheckResult::Kind, Optional<String> const& version, WebView::InstallMethod, WebView::UpdateCheckTrigger);
     void open_file(String const& path) const;
 
     virtual void crash_reports_changed() override;
@@ -353,6 +370,7 @@ private:
     OwnPtr<QApplication> m_application;
     HashMap<u64, NonnullOwnPtr<WebView::PictureInPictureWindow>> m_picture_in_picture_windows;
     OwnPtr<WebView::NotificationBackend> m_notification_backend;
+    OwnPtr<WebView::MediaSessionPlatformBackend> m_media_session_platform_backend;
     HashMap<u64, NonnullRefPtr<WebView::ExternalURLHandler>> m_external_url_handlers;
     u64 m_next_external_url_handler_id { 1 };
     BrowserWindow* m_active_window { nullptr };
@@ -363,6 +381,20 @@ private:
     bool m_quit_in_progress { false };
     bool m_quit_is_finishing { false };
     Vector<QPointer<BrowserWindow>> m_windows_awaiting_quit_preflight;
+
+#if defined(AK_OS_LINUX)
+    void watch_for_replaced_installation();
+    RefPtr<Core::FileWatcher> m_installation_watcher;
+#endif
+    enum class Restart : u8 {
+        None,
+        ByLadybird,
+        ByUpdater,
+    };
+    Restart m_restart { Restart::None };
+    bool m_installation_replaced { false };
+    bool m_profile_is_temporary { false };
+    RestartCommand m_restart_command;
 };
 
 }

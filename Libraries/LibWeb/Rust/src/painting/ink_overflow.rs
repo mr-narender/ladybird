@@ -5,7 +5,7 @@
  */
 
 use crate::css::computed_value_views::ComputedValuesView;
-use crate::css::css_enums::{line_style, overflow, text_decoration_line, text_decoration_style, writing_mode};
+use crate::css::css_enums::{line_style, overflow, text_decoration_line, text_decoration_style};
 use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::{NodeFlag, NodeKind, NodeSlotId};
 use crate::painting::border_radii::BorderRadii;
@@ -88,17 +88,19 @@ fn box_decoration_ink(source: &impl PaintRead, node: NodeSlotId, border_box: Css
     .max()
     .unwrap_or_default();
     ink.rect.unite(inflated(border_box, border_reach));
-    let [top, right, bottom, left] = border_image::border_image_outsets(
-        style,
-        [
-            style.border_top_width(),
-            style.border_right_width(),
-            style.border_bottom_width(),
-            style.border_left_width(),
-        ],
-        crate::painting::record::paint::border::ALL_PIECE_EDGES,
-    );
-    ink.rect.unite(border_box.inflated(top, right, bottom, left));
+    if border_image::paints_border_image(style) {
+        let [top, right, bottom, left] = border_image::border_image_outsets(
+            style,
+            [
+                style.border_top_width(),
+                style.border_right_width(),
+                style.border_bottom_width(),
+                style.border_left_width(),
+            ],
+            crate::painting::record::paint::border::ALL_PIECE_EDGES,
+        );
+        ink.rect.unite(border_box.inflated(top, right, bottom, left));
+    }
     let outline_width = style_queries::outline_geometry(style)
         .map_or(CssPixels::default(), |geometry| geometry.width)
         .max(style_queries::auto_outline_width());
@@ -194,9 +196,10 @@ pub(crate) fn own_ink_overflow(
                 .translated_by(positions.of_line(side.lines(), piece.line_index as usize));
             let piece_ink = box_decoration_ink(source, piece.node, border_box);
             ink.rect.unite(piece_ink.rect);
-            // Each piece can record a backdrop-filter region covering the whole inline.
-            ink.rect
-                .unite(paintable_geometry::absolute_border_box_rect(source, piece.node));
+            if paints_backdrop_filter(source, piece.node) {
+                ink.rect
+                    .unite(paintable_geometry::absolute_border_box_rect(source, piece.node));
+            }
             ink.unbounded |= piece_ink.unbounded;
         };
         if owner == root || fragment_ownership::is_self_painting_inline(source, owner) {
@@ -209,9 +212,63 @@ pub(crate) fn own_ink_overflow(
             }
         }
         let filter = fragment_ownership::effective_filter(source, owner);
-        filter.for_each_owned_fragment_index(side.fragments().len(), |index| {
-            include_text_fragment(source, paint_state, root, index as u32, &mut ink.rect);
-        });
+        let owns_every_fragment = owner == root && filter.include_everything && filter.excluded.is_empty();
+        let mut text_ink = CssPixelRect::default();
+        let mut block_chain_has_text_decoration_lines = None;
+        if owns_every_fragment {
+            for (line_index, line_ink) in side.glyph_ink_of_lines().iter().enumerate() {
+                if !line_ink.is_empty() {
+                    text_ink.unite(line_ink.translated_by(positions.of_line(side.lines(), line_index)));
+                }
+            }
+            for (index, fragment) in side.fragments().iter().enumerate() {
+                if fragment.glyph_run.is_none() {
+                    continue;
+                }
+                let rect = text_fragment::rect_in_containing_block(fragment)
+                    .translated_by(positions.of_line(side.lines(), fragment.line_index as usize));
+                include_text_paint_effects(
+                    source,
+                    paint_state,
+                    root,
+                    index as u32,
+                    rect,
+                    &mut block_chain_has_text_decoration_lines,
+                    &mut text_ink,
+                );
+            }
+            if crate::painting::record::ink_bounds::verification().enabled {
+                let mut text_ink_of_each_fragment = CssPixelRect::default();
+                for index in 0..side.fragments().len() {
+                    include_text_fragment(
+                        source,
+                        paint_state,
+                        root,
+                        index as u32,
+                        &mut None,
+                        &mut text_ink_of_each_fragment,
+                    );
+                }
+                assert!(
+                    text_ink == text_ink_of_each_fragment
+                        || (text_ink.is_empty() && text_ink_of_each_fragment.is_empty())
+                        || (css_rect_is_saturated(text_ink) && css_rect_is_saturated(text_ink_of_each_fragment)),
+                    "The glyph ink kept with the lines of {root:?} is stale: {text_ink:?}, each fragment gives {text_ink_of_each_fragment:?}"
+                );
+            }
+        } else {
+            filter.for_each_owned_fragment_index(side.fragments().len(), |index| {
+                include_text_fragment(
+                    source,
+                    paint_state,
+                    root,
+                    index as u32,
+                    &mut block_chain_has_text_decoration_lines,
+                    &mut text_ink,
+                );
+            });
+        }
+        ink.rect.unite(text_ink);
     }
     ink.unbounded |= css_rect_is_saturated(ink.rect);
     ink
@@ -250,7 +307,7 @@ pub(crate) fn text_fragment_ink_rect(
     index: u32,
 ) -> CssPixelRect {
     let mut rect = CssPixelRect::default();
-    include_text_fragment(source, state, root, index, &mut rect);
+    include_text_fragment(source, state, root, index, &mut None, &mut rect);
     rect
 }
 
@@ -267,9 +324,18 @@ pub(crate) fn inline_piece_ink(
     let border_box = CssPixelRect::from(piece.border_box_rect)
         .translated_by(positions.of_line(side.lines(), piece.line_index as usize));
     let mut ink = box_decoration_ink(source, piece.node, border_box);
-    ink.rect
-        .unite(paintable_geometry::absolute_border_box_rect(source, piece.node));
+    if paints_backdrop_filter(source, piece.node) {
+        ink.rect
+            .unite(paintable_geometry::absolute_border_box_rect(source, piece.node));
+    }
     ink
+}
+
+/// Whether each piece of the inline box `node` records a backdrop filter region covering the whole inline.
+fn paints_backdrop_filter(source: &impl PaintRead, node: NodeSlotId) -> bool {
+    source
+        .node_style_if_live(node)
+        .is_some_and(|style| style.effects().backdrop_filter.operations.length != 0)
 }
 
 fn include_text_fragment(
@@ -277,6 +343,38 @@ fn include_text_fragment(
     state: &PublishedPaintState,
     root: NodeSlotId,
     index: u32,
+    block_chain_has_text_decoration_lines: &mut Option<bool>,
+    bounds: &mut CssPixelRect,
+) {
+    let side = source.committed_side_data(root);
+    let fragment = &side.fragments()[index as usize];
+    if fragment.glyph_run.is_none() {
+        return;
+    }
+    let rect = text_fragment::absolute_rect(source, fragment);
+    let rect_in_containing_block = text_fragment::rect_in_containing_block(fragment);
+    bounds.unite(
+        text_fragment::glyph_ink_rect_in_containing_block(fragment)
+            .translated(rect.x - rect_in_containing_block.x, rect.y - rect_in_containing_block.y),
+    );
+    include_text_paint_effects(
+        source,
+        state,
+        root,
+        index,
+        rect,
+        block_chain_has_text_decoration_lines,
+        bounds,
+    );
+}
+
+fn include_text_paint_effects(
+    source: &impl PaintRead,
+    state: &PublishedPaintState,
+    root: NodeSlotId,
+    index: u32,
+    rect: CssPixelRect,
+    block_chain_has_text_decoration_lines: &mut Option<bool>,
     bounds: &mut CssPixelRect,
 ) {
     let side = source.committed_side_data(root);
@@ -284,39 +382,16 @@ fn include_text_fragment(
     let Some(run) = &fragment.glyph_run else {
         return;
     };
-    let rect = text_fragment::absolute_rect(source, fragment);
-    bounds.unite(rect);
-    let glyph = run.bounding_box;
-    let pixel = CssPixels::nearest_value_for_f32;
-    let glyph_rect = if fragment.writing_mode == writing_mode::HORIZONTAL_TB {
-        CssPixelRect::new(
-            rect.x + pixel(glyph.x),
-            rect.y + fragment.baseline + pixel(glyph.y),
-            pixel(glyph.width),
-            pixel(glyph.height),
-        )
-    } else {
-        CssPixelRect::new(
-            rect.right() - fragment.baseline - pixel(glyph.y + glyph.height),
-            rect.y + pixel(glyph.x),
-            pixel(glyph.height),
-            pixel(glyph.width),
-        )
-    };
-    bounds.unite(glyph_rect);
     let Some(style) = source.node_style_if_live(fragment.style_source) else {
         return;
     };
-    bounds.unite(inflated(glyph_rect, text_stroke_reach(style)));
-    let mut span = text::RenderSpan {
-        fragment_index: index,
-        start_code_unit: 0,
-        end_code_unit: fragment.length_in_code_units,
-        text_color: style.current_color(),
-        shadow_layers: Vec::new(),
-        highlights: Vec::new(),
-        decoration_color: None,
-    };
+    let stroke_reach = text_stroke_reach(style);
+    if stroke_reach > CssPixels::default() {
+        bounds.unite(inflated(
+            text_fragment::glyph_rect_of_fragment_at(fragment, run, rect),
+            stroke_reach,
+        ));
+    }
     for shadow in style.inherited_text().text_shadow.as_slice() {
         let reach = CssPixels::from_raw(shadow.blur_radius) * 2;
         bounds.unite(inflated(rect, reach).translated(
@@ -324,6 +399,7 @@ fn include_text_fragment(
             CssPixels::from_raw(shadow.offset_y),
         ));
     }
+    let mut highlights = Vec::new();
     for styles in [
         &state.selection_pseudo_styles,
         &state.search_text_pseudo_styles,
@@ -333,6 +409,9 @@ fn include_text_fragment(
     .into_iter()
     .chain(state.custom_highlight_pseudo_styles.values())
     {
+        if styles.is_empty() {
+            continue;
+        }
         let Some(answer) = highlight_style(source, styles, fragment.layout_node) else {
             continue;
         };
@@ -342,7 +421,7 @@ fn include_text_fragment(
             );
         }
         if answer.facts.has_text_decoration {
-            span.highlights.push(text::HighlightOverlay {
+            highlights.push(text::HighlightOverlay {
                 highlight: text::HighlightLayer::TextFragmentIndication,
                 background_color: 0,
                 shadow_layers: Vec::new(),
@@ -356,30 +435,42 @@ fn include_text_fragment(
             });
         }
     }
-    // The default spelling-error decoration exists without a committed pseudo style.
-    span.highlights.push(text::HighlightOverlay {
-        highlight: text::HighlightLayer::TextFragmentIndication,
-        background_color: 0,
+    if state.spelling_errors.by_node.contains_key(&fragment.layout_node) {
+        highlights.push(text::HighlightOverlay {
+            highlight: text::HighlightLayer::TextFragmentIndication,
+            background_color: 0,
+            shadow_layers: Vec::new(),
+            text_decoration: Some(text::SpanTextDecoration {
+                lines: [text_decoration_line::SPELLING_ERROR, 0, 0, 0, 0, 0, 0, 0],
+                line_count: 1,
+                style: text_decoration_style::WAVY,
+                color: 0,
+                metrics: None,
+            }),
+        });
+    }
+    if highlights.is_empty()
+        && !text_decoration::fragment_may_paint_text_decorations(
+            source,
+            root,
+            fragment,
+            block_chain_has_text_decoration_lines,
+        )
+    {
+        return;
+    }
+    let span = text::RenderSpan {
+        fragment_index: index,
+        start_code_unit: 0,
+        end_code_unit: fragment.length_in_code_units,
+        text_color: style.current_color(),
         shadow_layers: Vec::new(),
-        text_decoration: Some(text::SpanTextDecoration {
-            lines: [text_decoration_line::SPELLING_ERROR, 0, 0, 0, 0, 0, 0, 0],
-            line_count: 1,
-            style: text_decoration_style::WAVY,
-            color: 0,
-            metrics: None,
-        }),
-    });
+        highlights,
+        decoration_color: None,
+    };
     for set in text_decoration::decoration_sets_for_span(source, root, &span) {
         bounds.unite(text_decoration::decoration_ink_bounds(rect, &set));
     }
-    bounds.unite(text_fragment::rect_for_selection_offsets(
-        source,
-        fragment,
-        text_fragment::SelectionOffsets {
-            start: 0,
-            end: fragment.length_in_code_units,
-        },
-    ));
 }
 
 fn has_resampled_ink(style: crate::layout::ComputedValuesView<'_>) -> bool {
@@ -407,6 +498,58 @@ fn has_resampled_ink(style: crate::layout::ComputedValuesView<'_>) -> bool {
                     | property_id::FILTER
             )
         })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum HitTestBoundOfLine {
+    RectInContentBoxOfLineRoot(CssPixelRect),
+    Unbounded,
+}
+
+pub(crate) fn hit_test_bounds_of_lines(
+    source: &impl PaintRead,
+    line_root: NodeSlotId,
+) -> Option<std::sync::Arc<[HitTestBoundOfLine]>> {
+    use crate::painting::paintable_data::PaintableFlag;
+    if !node_painting::has_lines(source, line_root)
+        || source
+            .paintable_data(line_root)
+            .has_flag(PaintableFlag::HasLaterBoxFragments)
+    {
+        return None;
+    }
+    let side = source.committed_side_data(line_root);
+    if side.lines().len() < 2 {
+        return None;
+    }
+    let content_origin = paintable_geometry::absolute_rect(source, line_root).location();
+    let mut bounds = vec![HitTestBoundOfLine::RectInContentBoxOfLineRoot(CssPixelRect::default()); side.lines().len()];
+    for fragment in side.fragments() {
+        let bound = bounds.get_mut(fragment.line_index as usize)?;
+        let HitTestBoundOfLine::RectInContentBoxOfLineRoot(rect) = bound else {
+            continue;
+        };
+        if !fragment.is_atomic_inline {
+            rect.unite(text_fragment::rect_in_containing_block(fragment));
+            continue;
+        }
+        let atomic_inline = fragment.layout_node;
+        if !source.paintable_row_is_populated(atomic_inline) {
+            continue;
+        }
+        let ink = source.stored_ink_overflow(atomic_inline);
+        if ink.unbounded || ink.contribution_unbounded {
+            *bound = HitTestBoundOfLine::Unbounded;
+            continue;
+        }
+        let padding_box_origin = paintable_geometry::first_fragment_padding_box_rect(source, atomic_inline).location();
+        rect.unite(
+            ink.rect
+                .translated_by(padding_box_origin)
+                .translated(-content_origin.x, -content_origin.y),
+        );
+    }
+    Some(bounds.into())
 }
 
 /// What bounds everything a paint scope paints.
@@ -506,6 +649,7 @@ fn recalculated_ink_overflow(
     use crate::painting::paintable_data::PaintableFlag;
     let own = own_ink_overflow(source, state, node);
     let mut ink = own;
+    let padding = paintable_geometry::first_fragment_padding_box_rect(source, node);
     if let Some(link) = source.with_committed_fragment_link(node, |link| link.cloned()) {
         let later_fragments = source.committed_side_data(node);
         let fragments =
@@ -514,26 +658,37 @@ fn recalculated_ink_overflow(
             for child_link in source.links_in_containing_block_fragment(node, link, fragment_index as u32) {
                 let child = child_link.fragment.node;
                 let child_ink = source.stored_ink_overflow(child);
-                let mut contribution = InkOverflow {
+                let child_padding = paintable_geometry::first_fragment_padding_box_rect(source, child);
+                let mut contribution_relative_to_padding_box = InkOverflow {
                     rect: child_ink
                         .rect
-                        .translated_by(paintable_geometry::first_fragment_padding_box_rect(source, child).location()),
+                        .translated(child_padding.x - padding.x, child_padding.y - padding.y),
                     ..child_ink
                 };
-                if let Some((transform, _)) =
+                if let Some((mut transform, _)) =
                     crate::painting::visual_context::node_values::compute_transform(source, child, 1.0)
                 {
-                    contribution = mapped_ink(contribution, &transform);
-                    contribution.holds_what_a_transform_moves = true;
+                    // NB: Round out relative to the padding box, as moving the box with its descendants keeps the ink.
+                    transform.origin.x -= padding.x.to_float();
+                    transform.origin.y -= padding.y.to_float();
+                    contribution_relative_to_padding_box = mapped_ink(contribution_relative_to_padding_box, &transform);
+                    contribution_relative_to_padding_box.holds_what_a_transform_moves = true;
                 }
-                include_child(&mut ink, contribution);
+                include_child(
+                    &mut ink,
+                    InkOverflow {
+                        rect: contribution_relative_to_padding_box
+                            .rect
+                            .translated(padding.x, padding.y),
+                        ..contribution_relative_to_padding_box
+                    },
+                );
             }
         }
     }
     if let Some(clip) = overflow_clip_ranges(source, node) {
         clip_content_to_overflow_clip(&mut ink, own, &clip);
     }
-    let padding = paintable_geometry::first_fragment_padding_box_rect(source, node);
     if let Some(style) = source.node_style_if_live(node) {
         ink.contribution_unbounded |= style.position() == positioning::STICKY
             || style.transform().has_perspective
@@ -684,6 +839,11 @@ impl crate::layout::LayoutNodeArena {
             source.paintable_rows.ink_overflow_dirty[index] = false;
             let ink = recalculated_ink_overflow(&source, state, node);
             recalculated += 1;
+            let hit_test_bounds_of_lines = hit_test_bounds_of_lines(&source, node);
+            if hit_test_bounds_of_lines.is_some() || source.committed_side_data(node).hit_test_bounds_of_lines.is_some()
+            {
+                source.committed_side_data_mut(node).hit_test_bounds_of_lines = hit_test_bounds_of_lines;
+            }
             let store = &mut source.paintable_rows;
             if store.ink_overflow.get(index).is_some_and(|previous| *previous == ink) {
                 continue;
@@ -730,6 +890,12 @@ impl crate::layout::LayoutNodeArena {
                 stored == recomputed,
                 "Stored ink overflow is stale: {:?} {node:?}, stored {stored:?}, recomputed {recomputed:?}",
                 source.node_kind_if_live(node)
+            );
+            let stored_hit_test_bounds_of_lines = source.committed_side_data(node).hit_test_bounds_of_lines.clone();
+            let recomputed_hit_test_bounds_of_lines = hit_test_bounds_of_lines(&source, node);
+            assert!(
+                stored_hit_test_bounds_of_lines == recomputed_hit_test_bounds_of_lines,
+                "Stored hit test bounds of the lines of {node:?} are stale: stored {stored_hit_test_bounds_of_lines:?}, recomputed {recomputed_hit_test_bounds_of_lines:?}"
             );
             counts.checked += 1;
         }

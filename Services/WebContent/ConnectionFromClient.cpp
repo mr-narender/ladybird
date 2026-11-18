@@ -175,6 +175,12 @@ void ConnectionFromClient::create_embedded_page(Web::PageId page_id, Vector<Web:
     page.page().begin_hosting(root_navigable_id, initial_history_entry);
 }
 
+void ConnectionFromClient::media_session_action(Web::PageId page_id, Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().handle_media_session_action(action, seek_offset, seek_time, fast_seek);
+}
+
 void ConnectionFromClient::insert_remote_navigable(Web::PageId page_id, Web::HTML::RemoteNavigableDescriptor navigable)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -1250,7 +1256,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "dump-display-list") {
         if (auto doc = page->page().local_traversable()->active_document()) {
-            auto display_list_dump = doc->dump_display_list();
+            auto display_list_dump = doc->dump_display_list({ .owners = true, .text = true, .fonts = true, .record_ids = true, .chunks = true, .jsonl = argument == "jsonl" });
             dbgln("{}", display_list_dump.to_utf8());
         }
         return;
@@ -2852,7 +2858,7 @@ static void append_display_list(Web::Page& page, StringBuilder& builder)
         return;
     }
 
-    builder.append(document->dump_display_list().to_utf8());
+    builder.append(document->dump_display_list({}).to_utf8());
 }
 
 static void append_gc_graph(StringBuilder& builder)

@@ -10,6 +10,7 @@
 #include <LibCompositing/Types.h>
 #include <LibGC/Root.h>
 #include <LibWeb/Bindings/Internals.h>
+#include <LibWeb/Bindings/MediaSession.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
@@ -228,7 +229,8 @@ public:
     bool needs_display_list_record();
     bool has_animation_frame_callbacks();
 
-    Utf16String dump_display_list();
+    Utf16String dump_display_list(Bindings::DisplayListDumpOptions const&);
+    Utf16String dump_display_list_changes(Bindings::DisplayListDumpOptions const&);
     Utf16String dump_accessibility_tree();
     String accessibility_character_offsets(GC::Ref<DOM::Node>);
     String dump_accessibility_node_data(GC::Ref<DOM::Node>);
@@ -360,6 +362,11 @@ public:
     WebIDL::ExceptionOr<GC::Ref<JS::Object>> image_animation_state_for_url(Utf16String const& url);
     bool media_element_is_fetching(HTML::HTMLMediaElement&);
     bool media_element_is_playing_audio(HTML::HTMLMediaElement&);
+    JS::Value active_media_session_state();
+    JS::Value now_playing_state_for_testing();
+    WebIDL::ExceptionOr<void> trigger_now_playing_action_for_testing(Bindings::MediaSessionAction, GC::Ptr<JS::Object> details);
+    GC::Ref<WebIDL::Promise> wait_for_media_session_artwork();
+    WebIDL::ExceptionOr<void> trigger_media_session_action(Bindings::MediaSessionAction, GC::Ptr<JS::Object> details);
     bool document_is_playing_audio(DOM::Document&);
     bool tab_is_playing_audio();
     bool tab_is_heard_playing_audio();
@@ -394,6 +401,12 @@ private:
     GC::Root<JS::Cell> m_actions_executor;
     bool m_actions_running { false };
     Optional<Utf16String> m_pending_action_test_result;
+
+    struct DisplayListDumpForChanges {
+        UniqueNodeID document_id;
+        String jsonl;
+    };
+    Optional<DisplayListDumpForChanges> m_display_list_dump_for_changes;
     Vector<GC::Ref<InternalGamepad>> m_gamepads;
     Optional<HTML::DevToolsObjectTable> m_devtools_object_table;
     HTML::DevToolsLoggedObjects m_devtools_logged_objects;

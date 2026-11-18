@@ -16,6 +16,7 @@
 #include <LibCompositing/DisplayList/DisplayListResources.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/System.h>
+#include <LibCore/ThreadEventQueue.h>
 #include <LibCore/TimeZone.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
@@ -28,6 +29,7 @@
 #include <LibJS/Runtime/Date.h>
 #include <LibJS/Runtime/Environment.h>
 #include <LibJS/Runtime/Error.h>
+#include <LibJS/Runtime/Intrinsics.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibMediaClient/Client.h>
@@ -109,6 +111,8 @@
 #include <LibWeb/Loader/ContentBlocker.h>
 #include <LibWeb/Loader/LoaderConfig.h>
 #include <LibWeb/Loader/ResourceLoader.h>
+#include <LibWeb/MediaSession/ActiveMediaSessionTracker.h>
+#include <LibWeb/MediaSession/MediaSession.h>
 #include <LibWeb/NotificationsAPI/Notification.h>
 #include <LibWeb/Page/EventHandler.h>
 #include <LibWeb/Page/Page.h>
@@ -401,14 +405,28 @@ u32 Internals::worker_agent_count() const
     return Bindings::worker_agent_count();
 }
 
+static void collect_garbage_from_the_outermost_event_loop_turn(GC::Root<WebIDL::Promise>);
+
 void Internals::gc_async(GC::Ref<WebIDL::Promise> promise)
 {
-    // Queue a LibCore event to run the collection, so that it runs outside the JS execution context with as small a
-    // stack as possible.
-    Core::deferred_invoke([promise = GC::make_root(promise)] {
+    collect_garbage_from_the_outermost_event_loop_turn(GC::make_root(promise));
+}
+
+static void collect_garbage_from_the_outermost_event_loop_turn(GC::Root<WebIDL::Promise> promise)
+{
+    // Queue a LibCore event to run the collection, so that it runs outside the JS execution context. Nothing on the stack
+    // of the outermost event loop turn refers to a cell that is not rooted some other way, so the collection leaves the
+    // stack out. A word there that only looks like a cell pointer would otherwise keep that cell alive, and one in a
+    // frame of the event loop itself would keep it alive for every later collection too.
+    Core::deferred_invoke([promise = move(promise)]() mutable {
+        // A nested event loop has script waiting further up the stack, so wait for it to finish.
+        if (Core::ThreadEventQueue::current().is_processing_nested()) {
+            collect_garbage_from_the_outermost_event_loop_turn(move(promise));
+            return;
+        }
         auto& realm = WebIDL::promise_realm(*promise);
         HTML::TemporaryExecutionContext execution_context { realm };
-        realm.vm().heap().collect_garbage();
+        realm.vm().heap().collect_garbage_without_scanning_the_stack();
         WebIDL::resolve_promise(*promise);
     });
 }
@@ -1919,9 +1937,29 @@ static Utf16String dump_string_to_utf16(String const& string)
     return Utf16String::from_utf8_without_validation(string.bytes_as_string_view());
 }
 
-Utf16String Internals::dump_display_list()
+Utf16String Internals::dump_display_list(Bindings::DisplayListDumpOptions const& options)
 {
-    return window().associated_document().dump_display_list();
+    return window().associated_document().dump_display_list({
+        .owners = options.owners,
+        .text = options.text,
+        .fonts = options.fonts,
+        .record_ids = options.record_ids,
+        .chunks = options.chunks,
+        .raw_node_indices = options.raw_node_indices,
+        .jsonl = options.format == Bindings::DisplayListDumpFormat::Jsonl,
+    });
+}
+
+Utf16String Internals::dump_display_list_changes(Bindings::DisplayListDumpOptions const& options)
+{
+    auto& document = window().associated_document();
+    auto jsonl = document.dump_display_list({ .raw_node_indices = options.raw_node_indices, .jsonl = true }).to_utf8();
+    Optional<StringView> previous_jsonl;
+    if (m_display_list_dump_for_changes.has_value() && m_display_list_dump_for_changes->document_id == document.unique_id())
+        previous_jsonl = m_display_list_dump_for_changes->jsonl;
+    auto changes = Painting::display_list_dump_changes(previous_jsonl, jsonl);
+    m_display_list_dump_for_changes = DisplayListDumpForChanges { document.unique_id(), move(jsonl) };
+    return changes;
 }
 
 Utf16String Internals::dump_accessibility_tree()
@@ -2678,6 +2716,90 @@ bool Internals::media_element_is_fetching(HTML::HTMLMediaElement& element)
 bool Internals::media_element_is_playing_audio(HTML::HTMLMediaElement& element)
 {
     return element.is_playing_audio();
+}
+
+GC::Ref<WebIDL::Promise> Internals::wait_for_media_session_artwork()
+{
+    auto promise = WebIDL::create_promise_for(window());
+    window().page().active_media_session_tracker().when_artwork_settled(promise);
+    return promise;
+}
+
+static WebIDL::ExceptionOr<Bindings::MediaSessionActionDetails> media_session_action_details(HTML::Window& window, Bindings::MediaSessionAction action, GC::Ptr<JS::Object> details)
+{
+    auto& realm = HTML::relevant_realm(window);
+    auto& vm = window.vm();
+    auto dictionary = JS::Object::create(realm, nullptr);
+    dictionary->define_direct_property("action"_utf16_fly_string, JS::PrimitiveString::create(vm, Bindings::idl_enum_to_string(action)), JS::default_attributes);
+    if (details) {
+        for (auto const& name : { "seekOffset"_utf16_fly_string, "seekTime"_utf16_fly_string, "fastSeek"_utf16_fly_string })
+            dictionary->define_direct_property(name, TRY(details->get(name)), JS::default_attributes);
+    }
+    return TRY(Bindings::convert_to_idl_value_for_media_session_action_details(vm, dictionary));
+}
+
+WebIDL::ExceptionOr<void> Internals::trigger_media_session_action(Bindings::MediaSessionAction action, GC::Ptr<JS::Object> details)
+{
+    auto converted = TRY(media_session_action_details(window(), action, details));
+    window().page().handle_media_session_action(action, converted.seek_offset, converted.seek_time, converted.fast_seek);
+    return {};
+}
+
+WebIDL::ExceptionOr<void> Internals::trigger_now_playing_action_for_testing(Bindings::MediaSessionAction action, GC::Ptr<JS::Object> details)
+{
+    auto converted = TRY(media_session_action_details(window(), action, details));
+    window().page().client().page_did_trigger_now_playing_action_for_testing(action, converted.seek_offset, converted.seek_time, converted.fast_seek);
+    return {};
+}
+
+static JS::Value media_session_state_to_js_value(HTML::Window& window, Optional<Web::MediaSession::MediaSessionState> const& state)
+{
+    auto& vm = window.vm();
+    if (!state.has_value())
+        return JS::js_null();
+
+    auto& realm = HTML::relevant_realm(window);
+    auto object = JS::Object::create(realm, realm.intrinsics().object_prototype());
+    object->define_direct_property("activationCounter"_utf16_fly_string, JS::Value(state->activation_counter), JS::default_attributes);
+    object->define_direct_property("title"_utf16_fly_string, JS::PrimitiveString::create(vm, Utf16String::from_utf8(state->title)), JS::default_attributes);
+    object->define_direct_property("artist"_utf16_fly_string, JS::PrimitiveString::create(vm, Utf16String::from_utf8(state->artist)), JS::default_attributes);
+    object->define_direct_property("album"_utf16_fly_string, JS::PrimitiveString::create(vm, Utf16String::from_utf8(state->album)), JS::default_attributes);
+    object->define_direct_property("playbackState"_utf16_fly_string, JS::PrimitiveString::create(vm, Bindings::idl_enum_to_string(state->playback_state)), JS::default_attributes);
+
+    JS::Value artwork = JS::js_null();
+    if (state->artwork) {
+        auto artwork_object = JS::Object::create(realm, realm.intrinsics().object_prototype());
+        artwork_object->define_direct_property("width"_utf16_fly_string, JS::Value(state->artwork->width()), JS::default_attributes);
+        artwork_object->define_direct_property("height"_utf16_fly_string, JS::Value(state->artwork->height()), JS::default_attributes);
+        artwork = artwork_object;
+    }
+    object->define_direct_property("artwork"_utf16_fly_string, artwork, JS::default_attributes);
+
+    JS::Value position = JS::js_null();
+    if (state->position.has_value()) {
+        auto position_object = JS::Object::create(realm, realm.intrinsics().object_prototype());
+        position_object->define_direct_property("duration"_utf16_fly_string, JS::Value(state->position->duration), JS::default_attributes);
+        position_object->define_direct_property("playbackRate"_utf16_fly_string, JS::Value(state->position->playback_rate), JS::default_attributes);
+        position_object->define_direct_property("position"_utf16_fly_string, JS::Value(state->position->position), JS::default_attributes);
+        position = position_object;
+    }
+    object->define_direct_property("position"_utf16_fly_string, position, JS::default_attributes);
+
+    auto actions = MUST(JS::Array::create(realm, 0));
+    for (size_t i = 0; i < state->supported_actions.size(); ++i)
+        MUST(actions->create_data_property_or_throw(i, JS::PrimitiveString::create(vm, Bindings::idl_enum_to_string(state->supported_actions[i]))));
+    object->define_direct_property("supportedActions"_utf16_fly_string, actions, JS::default_attributes);
+    return object;
+}
+
+JS::Value Internals::active_media_session_state()
+{
+    return media_session_state_to_js_value(window(), window().page().active_media_session_tracker().compute_state());
+}
+
+JS::Value Internals::now_playing_state_for_testing()
+{
+    return media_session_state_to_js_value(window(), window().page().client().page_did_request_now_playing_state_for_testing());
 }
 
 bool Internals::document_is_playing_audio(DOM::Document& document)

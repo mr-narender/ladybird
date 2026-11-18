@@ -215,7 +215,7 @@ pub extern "C" fn render_state_paintable_scrollable_overflow(
 ) {
     // The host reads the overflow from the rows it holds, where they were measured and still read as the arena.
     let known = host.read_known_rows(|rows, source| {
-        rows.overflow_is_settled()
+        (rows.measured_overflow() >= crate::layout::row_reads::MeasuredOverflow::Scrollable)
             .then(|| FfiOptionalOverflowData::of(source, slot))
     });
     if let Some(Some(overflow)) = known {
@@ -1445,8 +1445,22 @@ pub unsafe extern "C" fn layout_arena_paint_push_svg_filter_primitive(
     sink: *mut c_void,
     primitive: *const FfiSvgFilterPrimitive,
 ) {
-    let primitives = unsafe { &mut *sink.cast::<Vec<SvgFilterPrimitive>>() };
-    primitives.push(unsafe { svg_filter_primitive_from_ffi(&*primitive) });
+    let filter = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgFilter>() };
+    filter
+        .primitives
+        .push(unsafe { svg_filter_primitive_from_ffi(&*primitive) });
+}
+
+/// # Safety
+///
+/// `sink` must be the pointer handed to the callback, used synchronously, and `region` must be readable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_paint_set_svg_filter_region(
+    sink: *mut c_void,
+    region: *const crate::painting::host::visual_context::FfiSvgFilterRegion,
+) {
+    let filter = unsafe { &mut *sink.cast::<crate::painting::svg_paint_resources::PublishedSvgFilter>() };
+    filter.region = unsafe { *region };
 }
 
 /// Notes that the SVG paint resources the document's rows enrolled may have changed, and answers whether any row

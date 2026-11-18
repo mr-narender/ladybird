@@ -75,6 +75,7 @@
 #include <LibWebView/TabPerformanceMonitor.h>
 #include <LibWebView/Translator.h>
 #include <LibWebView/URL.h>
+#include <LibWebView/UpdateCheck.h>
 #include <LibWebView/UserAgent.h>
 #include <LibWebView/Utilities.h>
 #include <LibWebView/ViewImplementation.h>
@@ -171,6 +172,8 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
             Application::request_server_manager().disk_cache_settings_changed();
         else if (id == ConfigVariableID::DisableHighDynamicRangeSurfaces)
             Application::the().update_compositor_high_dynamic_range_surfaces();
+        else if (id == ConfigVariableID::UpdateCheckInterval && Application::the().update_checker())
+            Application::the().update_checker()->settings_changed();
     }
 };
 
@@ -190,7 +193,30 @@ Application::Application(Optional<ByteString> ladybird_binary_path)
     s_the = this;
     m_ui_process_cross_process_id_allocator = allocate_cross_process_id_allocator();
 
+    m_media_session_coordinator.on_action = [](MediaSessionSource source, Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) {
+        auto view = ViewImplementation::find_view_by_id(source.view_id);
+        if (!view.has_value() || !view->has_traversable())
+            return;
+        view->traversable().for_each_hosting_page([&](WebContentPage& page) {
+            if (page.id() != source.page_id || !page.is_open())
+                return;
+            // A command from the platform's media controls is the user's gesture, like a click on a notification.
+            page.give_user_activation();
+            page.async_media_session_action(action, seek_offset, seek_time, fast_seek);
+        });
+    };
+
     platform_init(move(ladybird_binary_path));
+}
+
+void Application::set_media_session_platform_backend(OwnPtr<MediaSessionPlatformBackend> backend)
+{
+    m_media_session_coordinator.set_platform_backend(move(backend));
+}
+
+OwnPtr<MediaSessionPlatformBackend> Application::create_media_session_platform_backend()
+{
+    return {};
 }
 
 Application::~Application()
@@ -300,7 +326,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<u32> screenshot_delay;
     Optional<StringView> screenshot_path;
     bool new_window = false;
-    bool force_new_process = false;
     StringView stats_log_directory;
     Optional<StringView> profile_name;
     Optional<StringView> profile_path;
@@ -406,7 +431,6 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     });
     args_parser.add_option(new_window, "Force opening in a new window", "new-window", 'n');
 #if !defined(AK_OS_ANDROID)
-    args_parser.add_option(force_new_process, "Force creation of a new browser process", "force-new-process");
     args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(profile_name, "Select or create a named profile", "profile", 0, "name");
     args_parser.add_option(profile_path, "Use a self-contained profile at an absolute path", "profile-path", 0, "path");
@@ -641,7 +665,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     };
 
     create_platform_options(m_browser_options, m_request_server_options, m_web_content_options);
-    TRY(create_profile(profile_name, profile_path, force_new_process, temporary_profile));
+    TRY(create_profile(profile_name, profile_path, temporary_profile));
 
     // Browsers launched by WebDriver are driven directly and must never join an existing browser process. A browser
     // that logs process statistics must not join one either, since that browser would not sample them.
@@ -663,15 +687,10 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         }
     }
 
-    // Reports belong to the profile they came from, whose own setting decides what happens to them. A temporary
-    // profile takes nothing over, since it would take it to its grave.
+    // Reports belong to the profile they came from, whose own setting decides what happens to them.
     CrashReport::set_sandbox_is_disabled(m_browser_options.disable_sandbox);
     auto& crash_report_store = CrashReportStore::the();
     crash_report_store.set_directory(LexicalPath::join(profile().paths().data, "CrashReports"sv).string());
-    if (!profile().is_temporary()) {
-        if (auto result = crash_report_store.adopt_reports_from(CrashReportStore::default_directory()); result.is_error())
-            warnln("Could not move crash reports into the profile: {}", result.error());
-    }
     if (captures_browser_crashes()) {
         if (auto result = crash_report_store.initialize_browser_crash_handler(); result.is_error())
             warnln("Could not prepare Browser crash reporting: {}", result.error());
@@ -753,22 +772,26 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         start_content_blocker_list_update(ContentBlockerListUpdateTrigger::Automatic);
     }
 
+    // Every profile of this installation shares when it last checked for updates. A temporary profile only checks when
+    // the user asks it to.
+    if (!m_browser_options.headless_mode.has_value() && !m_browser_options.webdriver_browser_endpoint.has_value()) {
+        m_update_checker = make<UpdateChecker>(LexicalPath::join(m_instance_data_directory, "UpdateCheck.json"sv).string());
+        m_update_checker->on_result = [this](UpdateCheckResult const& result, UpdateCheckTrigger trigger) {
+            display_update_check_result(result, trigger);
+        };
+        if (!profile().is_temporary())
+            m_update_checker->start();
+    }
+
     initialize_page_options();
 
     return {};
 }
 
-ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> profile_name, [[maybe_unused]] Optional<StringView> profile_path, [[maybe_unused]] bool force_new_process, [[maybe_unused]] bool temporary_profile)
+ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> profile_name, [[maybe_unused]] Optional<StringView> profile_path, [[maybe_unused]] bool temporary_profile)
 {
 #if !defined(AK_OS_ANDROID)
     ProfileSelection profile_selection { .temporary = temporary_profile };
-
-    if (force_new_process) {
-        if (profile_name.has_value() || profile_path.has_value() || temporary_profile)
-            return Error::from_string_literal("--force-new-process cannot be combined with another profile selector");
-        warnln("--force-new-process is deprecated; using --temporary-profile");
-        profile_selection.temporary = true;
-    }
 
     if (profile_name.has_value())
         profile_selection.name = profile_name->to_byte_string();
@@ -794,6 +817,8 @@ ErrorOr<void> Application::create_profile([[maybe_unused]] Optional<StringView> 
     profile_roots.data = LexicalPath { profile_roots.data }.parent().string();
     profile_roots.cache = LexicalPath { profile_roots.cache }.parent().string();
 #endif
+
+    m_instance_data_directory = LexicalPath::join(profile_roots.data, "Ladybird"sv).string();
 
 #if defined(AK_OS_ANDROID)
     m_profile = TRY(Profile::create_legacy(profile_roots));
@@ -2488,6 +2513,9 @@ static void load_page_and_exit_on_close(Core::EventLoop& event_loop, HeadlessWeb
 
 ErrorOr<int> Application::execute()
 {
+    if (!m_browser_options.headless_mode.has_value())
+        set_media_session_platform_backend(create_media_session_platform_backend());
+
     OwnPtr<HeadlessWebView> view;
     RefPtr<Core::Timer> screenshot_timer;
 
@@ -3108,6 +3136,9 @@ void Application::tab_settings_changed(Badge<ApplicationSettingsObserver>)
 
 void Application::background_networking_settings_changed(Badge<ApplicationSettingsObserver>)
 {
+    if (m_update_checker)
+        m_update_checker->settings_changed();
+
     if (!m_settings->automatic_filter_list_updates_allowed()) {
         m_pending_content_blocker_list_updates.remove_all_matching([](auto const& update) { return update.trigger == ContentBlockerListUpdateTrigger::Automatic; });
         if (m_active_content_blocker_list_update.has_value() && m_active_content_blocker_list_update->trigger == ContentBlockerListUpdateTrigger::Automatic)

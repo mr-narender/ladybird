@@ -8,6 +8,7 @@
 #include <AK/Array.h>
 #include <AK/CharacterTypes.h>
 #include <AK/GenericLexer.h>
+#include <AK/Hex.h>
 #include <AK/NumericLimits.h>
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
@@ -81,27 +82,26 @@ String serialize_url_for_cache_storage(URL::URL const& url)
     return url.serialize(URL::ExcludeFragment::Yes);
 }
 
-static u64 serialize_hash(Crypto::Hash::Hasher& hasher)
+static CacheDigest serialize_hash(Crypto::Hash::Hasher& hasher)
 {
     auto digest = hasher.finish();
-    auto bytes = digest.bytes();
-
-    u64 result = 0;
-    result |= static_cast<u64>(bytes[0]) << 56;
-    result |= static_cast<u64>(bytes[1]) << 48;
-    result |= static_cast<u64>(bytes[2]) << 40;
-    result |= static_cast<u64>(bytes[3]) << 32;
-    result |= static_cast<u64>(bytes[4]) << 24;
-    result |= static_cast<u64>(bytes[5]) << 16;
-    result |= static_cast<u64>(bytes[6]) << 8;
-    result |= static_cast<u64>(bytes[7]);
-
-    return result;
+    return CacheDigest::from_bytes(digest.bytes()).release_value();
 }
 
-u64 create_cache_key(Utf16View const& partition, StringView url, StringView method)
+// Length prefixes prevent distinct fields from hashing the same byte sequence.
+static void update_with_length(Crypto::Hash::Hasher& hasher, StringView bytes)
 {
-    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA1 };
+    u64 length = bytes.length();
+    hasher.update(ReadonlyBytes { &length, sizeof(length) });
+    hasher.update(bytes);
+}
+
+CacheDigest create_cache_key(Utf16View const& partition, StringView url, StringView method)
+{
+    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA256 };
+
+    u64 partition_length = partition.length_in_code_units();
+    hasher.update(ReadonlyBytes { &partition_length, sizeof(partition_length) });
 
     // NB: Hash the code units rather than the string's storage, so the same text always gives the same key.
     Array<u8, 256> buffer;
@@ -116,20 +116,15 @@ u64 create_cache_key(Utf16View const& partition, StringView url, StringView meth
         buffer[buffer_size++] = static_cast<u8>(code_unit >> 8);
     }
     hasher.update(buffer.span().trim(buffer_size));
-    hasher.update("\n"sv);
-    hasher.update(url);
-    hasher.update(method);
+    update_with_length(hasher, url);
+    update_with_length(hasher, method);
 
     return serialize_hash(hasher);
 }
 
-u64 create_cache_key(StringView url, StringView method)
+CacheKey create_cache_key(StringView url, StringView method)
 {
-    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA1 };
-    hasher.update(url);
-    hasher.update(method);
-
-    return serialize_hash(hasher);
+    return { MUST(String::from_utf8(url)), MUST(String::from_utf8(method)) };
 }
 
 // https://httpwg.org/specs/rfc9111.html#caching.negotiated.responses
@@ -177,25 +172,18 @@ Optional<Vector<ByteString>> vary_field_names(HeaderList const& response_headers
     return field_names;
 }
 
-Optional<u64> create_vary_key(HeaderList const& request_headers, HeaderList const& response_headers)
+Optional<CacheDigest> create_vary_key(HeaderList const& request_headers, HeaderList const& response_headers)
 {
     auto field_names = vary_field_names(response_headers);
     if (!field_names.has_value())
         return {};
     if (field_names->is_empty())
-        return 0;
+        return CacheDigest {};
 
-    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA1 };
-
-    // Length prefixes prevent distinct field sets from hashing the same byte sequence.
-    auto update_with_length = [&](StringView bytes) {
-        u64 length = bytes.length();
-        hasher.update(ReadonlyBytes { &length, sizeof(length) });
-        hasher.update(bytes);
-    };
+    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA256 };
 
     for (auto const& field_name : *field_names) {
-        update_with_length(field_name);
+        update_with_length(hasher, field_name);
 
         // If (after any normalization that might take place) a header field is absent from a request, it can only
         // match another request if it is also absent there.
@@ -207,47 +195,21 @@ Optional<u64> create_vary_key(HeaderList const& request_headers, HeaderList cons
 
         if (values.has_value()) {
             for (auto const& value : *values)
-                update_with_length(value);
+                update_with_length(hasher, value);
         }
     }
 
     return serialize_hash(hasher);
 }
 
-LexicalPath path_for_cache_entry(LexicalPath const& cache_directory, u64 cache_key, u64 vary_key)
+LexicalPath path_for_cache_entry(LexicalPath const& cache_directory, CacheDigest const& cache_key, CacheDigest const& vary_key)
 {
-    auto file = vary_key == 0
-        ? ByteString::formatted("{:016x}", cache_key)
-        : ByteString::formatted("{:016x}_{:016x}", cache_key, vary_key);
+    Crypto::Hash::Hasher hasher { Crypto::Hash::HashKind::SHA256 };
+    hasher.update(cache_key.bytes.span());
+    hasher.update(vary_key.bytes.span());
+    auto digest = hasher.finish();
 
-    return cache_directory.append(file);
-}
-
-Optional<CacheEntryData> cache_entry_data_for_file(LexicalPath const& cache_file)
-{
-    CacheEntryData result;
-
-    if (auto file_name = cache_file.basename(); file_name.contains('_')) {
-        auto parts = file_name.split_view('_', SplitBehavior::KeepEmpty);
-        if (parts.size() != 2)
-            return {};
-
-        auto cache_key = AK::parse_number<u64>(parts[0], TrimWhitespace::No, 16);
-        auto vary_key = AK::parse_number<u64>(parts[1], TrimWhitespace::No, 16);
-        if (!cache_key.has_value() || !vary_key.has_value())
-            return {};
-
-        result.cache_key = *cache_key;
-        result.vary_key = *vary_key;
-    } else {
-        auto cache_key = AK::parse_number<u64>(file_name, TrimWhitespace::No, 16);
-        if (!cache_key.has_value())
-            return {};
-
-        result.cache_key = *cache_key;
-    }
-
-    return result;
+    return cache_directory.append(encode_hex(digest.bytes().trim(16)));
 }
 
 // https://httpwg.org/specs/rfc9111.html#response.cacheability

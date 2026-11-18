@@ -277,6 +277,13 @@ public:
     // Fetches the response through the client, and has the UI process acquire its body.
     void fetch_response_through(Requests::RequestClient& client, Optional<Utf16String> top_level_site = {})
     {
+        VERIFY(try_fetch_response_through(client, move(top_level_site), [](auto&) { }));
+    }
+
+    // Fetches the response through the client, and has the UI process acquire its body with the result as the client's
+    // process reports it. Returns whether the UI process acquired the body.
+    bool try_fetch_response_through(Requests::RequestClient& client, Optional<Utf16String> top_level_site, Function<void(Web::HTML::NavigationPopulationResult&)> const& report)
+    {
         m_fetch = start_leased_request(client, m_url);
         m_fetch->set_unbuffered_request_callbacks(
             [this](auto, auto, auto const&, auto) { m_received_response_headers = true; },
@@ -285,14 +292,33 @@ public:
             [](auto, auto const&, auto) { });
         Core::EventLoop::current().spin_until([&] { return m_received_response_headers; });
 
-        m_loader->did_finish_navigation_params_creation(result_with_response_body_of(client.request_server_client_id(), m_fetch->id(), move(top_level_site)));
+        auto result = result_with_response_body_of(client.request_server_client_id(), m_fetch->id(), move(top_level_site));
+        report(result);
+        m_loader->did_finish_navigation_params_creation(move(result));
 
         Optional<bool> acquired;
         m_loader->acquire_response_body(m_view.page().client(), [&](bool succeeded) { acquired = succeeded; });
         Core::EventLoop::current().spin_until([&] { return acquired.has_value(); });
-        VERIFY(*acquired);
+        if (!*acquired)
+            return false;
 
         m_view.traversable().navigation_with_id(m_navigation_id)->state = WebView::CanonicalNavigation::Populating { m_loader };
+        return true;
+    }
+
+    // Has the UI process acquire the response that the view's process reports with a body of its own. Returns whether
+    // the UI process acquired it.
+    bool try_acquire_response_with_a_body_of_its_own(Function<void(Web::HTML::NavigationPopulationResult&)> const& report)
+    {
+        auto result = result_with_response_body_of(m_view.page().client().request_server_site_bindings().client_id().value(), 0);
+        result.navigation_params.get<Web::HTML::NavigationParamsDescriptor>().response.body = MUST(ByteBuffer::copy("<!DOCTYPE html><script>document.title = location.origin</script>"sv.bytes()));
+        report(result);
+        m_loader->did_finish_navigation_params_creation(move(result));
+
+        Optional<bool> acquired;
+        m_loader->acquire_response_body(m_view.page().client(), [&](bool succeeded) { acquired = succeeded; });
+        Core::EventLoop::current().spin_until([&] { return acquired.has_value(); });
+        return *acquired;
     }
 
     void move_response_body_to(WebView::HeadlessWebView const& host_view)
@@ -583,6 +609,85 @@ TEST_CASE(made_up_file_url_does_not_reach_a_navigation)
     auto navigation = view->traversable().navigation_with_id(navigation_id);
     VERIFY(navigation);
     EXPECT_NE(navigation->url.scheme(), "file"sv);
+}
+
+// The URLs a process reports for a navigation's response name its document and the process that hosts it. The UI
+// process acquires the response body only if they are the URL that RequestServer fetched, apart from the fragment.
+TEST_CASE(reported_response_url_is_the_url_requestserver_fetched)
+{
+    TestFixture fixture;
+    TestResponseServer server;
+    auto view = fixture.create_view();
+    auto fetching_client = connect_client(*view);
+    auto made_up_url = URL::Parser::basic_parse("https://victim.example/"sv).release_value();
+
+    auto acquires = [&](Function<void(URL::URL const& fetched_url, Web::HTML::NavigationPopulationResult&)> report) {
+        auto url = server.unique_url();
+        TestPopulation population { *view, url };
+        return population.try_fetch_response_through(*fetching_client, {}, [&](auto& result) { report(url, result); });
+    };
+    auto navigation_params = [](Web::HTML::NavigationPopulationResult& result) -> Web::HTML::NavigationParamsDescriptor& {
+        return result.navigation_params.get<Web::HTML::NavigationParamsDescriptor>();
+    };
+    auto request_with_url_list = [](Vector<URL::URL> url_list) {
+        return Web::HTML::NavigationRequestDescriptor {
+            .url_list = move(url_list),
+            .method = "GET"sv,
+            .client_is_null = false,
+            .referrer = Web::Fetch::Infrastructure::RequestReferrer::NoReferrer,
+            .referrer_policy = Web::ReferrerPolicy::ReferrerPolicy::EmptyString,
+            .policy_container = {},
+            .redirect_count = 0,
+            .text_directive_user_activation = false,
+            .browsing_context_group_has_multiple_contexts = false,
+            .cache_mode = HTTP::CacheMode::Default,
+        };
+    };
+
+    EXPECT(acquires([&](auto const& fetched_url, auto& result) {
+        auto url_with_fragment = fetched_url;
+        url_with_fragment.set_fragment("fragment"sv);
+        navigation_params(result).response.url_list = { url_with_fragment };
+        navigation_params(result).request = request_with_url_list({ fetched_url });
+        result.redirected_url = url_with_fragment;
+    }));
+
+    EXPECT(!acquires([&](auto const&, auto& result) {
+        navigation_params(result).response.url_list = { made_up_url };
+    }));
+    EXPECT(!acquires([&](auto const& fetched_url, auto& result) {
+        navigation_params(result).request = request_with_url_list({ fetched_url, made_up_url });
+    }));
+    EXPECT(!acquires([&](auto const&, auto& result) {
+        result.redirected_url = made_up_url;
+    }));
+    EXPECT(view->page().client().is_open());
+}
+
+// A response to a request with an HTTP(S) URL comes from RequestServer. The UI process acquires a response that a
+// process reports with a body of its own only if none of the navigation's URLs is an HTTP(S) URL.
+TEST_CASE(reported_http_response_with_a_body_of_its_own_is_refused)
+{
+    TestFixture fixture;
+    auto view = fixture.create_view();
+    auto victim_url = URL::Parser::basic_parse("https://victim.example/account"sv).release_value();
+    auto data_url = URL::Parser::basic_parse("data:text/html,<title>data</title>"sv).release_value();
+
+    auto acquires = [&](URL::URL const& url, Function<void(Web::HTML::NavigationPopulationResult&)> const& report) {
+        TestPopulation population { *view, url };
+        return population.try_acquire_response_with_a_body_of_its_own(report);
+    };
+    auto response_url_list = [](Web::HTML::NavigationPopulationResult& result) -> Vector<URL::URL>& {
+        return result.navigation_params.get<Web::HTML::NavigationParamsDescriptor>().response.url_list;
+    };
+
+    EXPECT(acquires(data_url, [&](auto& result) { response_url_list(result) = { data_url }; }));
+
+    EXPECT(!acquires(victim_url, [&](auto& result) { response_url_list(result) = { victim_url }; }));
+    EXPECT(!acquires(victim_url, [](auto&) { }));
+    EXPECT(!acquires(data_url, [&](auto& result) { response_url_list(result) = { victim_url }; }));
+    EXPECT(!acquires(data_url, [&](auto& result) { result.redirected_url = victim_url; }));
+    EXPECT(view->page().client().is_open());
 }
 
 // A renderer whose connection to RequestServer was replaced keeps the earlier connection until it closes it. The UI

@@ -4,10 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/GenericShorthands.h>
 #include <AK/Hex.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/BrowserVersion.h>
 #include <LibCore/Environment.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/FileWatcher.h>
 #include <LibCore/GeolocationProvider.h>
 #include <LibCore/Process.h>
 #include <LibCore/Socket.h>
@@ -17,6 +20,7 @@
 #include <LibIPC/Encoder.h>
 #include <LibIPC/Transport.h>
 #include <LibURL/InternalURLs.h>
+#include <LibURL/Parser.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/MimeSniff/MimeType.h>
 #include <LibWebCommon/WebView/Utilities.h>
@@ -38,6 +42,7 @@
 #    include <LibIPC/TransportBootstrapMach.h>
 #    include <LibIPC/TransportMachPort.h>
 #    include <LibThreading/Thread.h>
+#    include <LibWebView/MediaSessionPlatformBackendMacOS.h>
 #    include <LibWebView/NotificationBackendMacOS.h>
 #    include <mach/mach.h>
 #    include <sys/wait.h>
@@ -58,6 +63,7 @@
 #include <UI/Qt/ExternalURLHandler.h>
 #include <UI/Qt/HistoryPage.h>
 #include <UI/Qt/Menu.h>
+#include <UI/Qt/PageCard.h>
 #include <UI/Qt/PictureInPictureWindow.h>
 #include <UI/Qt/PlainText.h>
 #include <UI/Qt/ProcessManagerWindow.h>
@@ -286,6 +292,7 @@ public:
 #if defined(AK_OS_MACOS)
         setQuitOnLastWindowClosed(false);
         install_appkit_event_capture();
+        install_appkit_popup_attachment();
 #endif
         installEventFilter(&m_plain_text_event_filter);
 
@@ -519,23 +526,26 @@ public:
         m_help_menu->addSeparator();
         m_help_menu->addAction(create_application_action(*m_application_widget, application.open_about_page_action(), IncludeActionIcon::No));
 
-#if defined(AK_OS_MACOS)
-        if (auto* software_updater = Application::the().software_updater()) {
-            // NB: On macOS, this moves the item into the application menu, below About Ladybird.
-            auto* check_for_updates_action = make_action("Check for Updates…");
-            check_for_updates_action->setMenuRole(QAction::ApplicationSpecificRole);
-            QObject::connect(check_for_updates_action, &QAction::triggered, this, [software_updater]() {
-                software_updater->check_for_updates();
-            });
-            m_help_menu->addAction(check_for_updates_action);
+        auto* check_for_updates_action = make_action("Check for Updates…");
+        // NB: On macOS, this moves the item into the application menu, below About Ladybird.
+        check_for_updates_action->setMenuRole(QAction::ApplicationSpecificRole);
+        QObject::connect(check_for_updates_action, &QAction::triggered, this, [] {
+            HubConnection::the().async_check_for_updates(WebView::UpdateCheckTrigger::UserInitiated);
+        });
+        m_help_menu->addAction(check_for_updates_action);
 
-            auto* show_update_dialog_action = make_action("Show Update Dialog for Latest Version");
-            QObject::connect(show_update_dialog_action, &QAction::triggered, this, [software_updater]() {
-                software_updater->show_update_dialog_for_latest_version();
-            });
-            m_debug_menu->addSeparator();
-            m_debug_menu->addAction(show_update_dialog_action);
-        }
+        auto* simulate_update_action = make_action("Simulate Available Update");
+        QObject::connect(simulate_update_action, &QAction::triggered, this, [] {
+            HubConnection::the().async_check_for_updates(WebView::UpdateCheckTrigger::Debug);
+        });
+        m_debug_menu->addSeparator();
+        m_debug_menu->addAction(simulate_update_action);
+#if defined(AK_OS_LINUX)
+        auto* simulate_replaced_installation_action = make_action("Simulate Replaced Installation");
+        QObject::connect(simulate_replaced_installation_action, &QAction::triggered, this, [] {
+            Application::the().offer_restart_after_update();
+        });
+        m_debug_menu->addAction(simulate_replaced_installation_action);
 #endif
     }
 
@@ -707,6 +717,11 @@ ErrorOr<NonnullOwnPtr<Application>> Application::create(Main::Arguments const& a
 {
     auto application = adopt_own(*new Application);
     application->m_command_line = MUST(String::join(' ', arguments.strings));
+    if (auto executable = Core::System::current_executable_path(); !executable.is_error()) {
+        application->m_restart_command.executable = executable.release_value();
+        for (auto argument : arguments.strings.slice(1))
+            application->m_restart_command.arguments.append(argument);
+    }
 
 #ifdef LADYBIRD_HUB_IN_OWN_PROCESS
     WebView::platform_init();
@@ -884,6 +899,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
         m_exit_status_if_done = TRY(process.wait_for_termination());
         return {};
     }
+    m_restart_command.hub = move(process);
     auto state = initial_state.release_value();
     m_hub_connection->did_initialize();
 
@@ -907,6 +923,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     m_browser_options.devtools_port = state.devtools_port;
     if (state.devtools_enabled)
         m_devtools_port = state.devtools_port;
+    m_profile_is_temporary = state.profile_is_temporary;
 #    if defined(AK_OS_MACOS)
     set_profile_application_icon(state.profile_identifier, state.profile_identity, state.profile_is_temporary);
 #    endif
@@ -1031,7 +1048,12 @@ Application::~Application()
         // process at once, so it never records a clean exit.
         if (m_session_store) {
             m_session_store->flush_dirty_state();
-            m_session_store->mark_clean_exit();
+            auto after_exit = SessionStore::AfterExit::KeepPinnedTabs;
+            if (m_restart != Restart::None)
+                after_exit = SessionStore::AfterExit::Restart;
+            else if (Application::settings().restore_previous_session())
+                after_exit = SessionStore::AfterExit::KeepEverything;
+            m_session_store->mark_clean_exit(after_exit);
         }
 
         // NB: The views go along with the windows that showed them, and their timers need the QApplication.
@@ -1039,7 +1061,13 @@ Application::~Application()
         if (m_hub)
             m_hub->destroy_all_views();
 #endif
+        m_media_session_platform_backend = nullptr;
         m_application = nullptr;
+
+        // Messages that arrived while quitting hold on to the connection until an event loop handles them, which none
+        // does anymore. Closing it lets the Hub end now, which a restart waits for.
+        if (m_hub_connection)
+            m_hub_connection->transport().close();
         m_hub_connection = nullptr;
 #ifndef LADYBIRD_HUB_IN_OWN_PROCESS
         m_connection_from_ui = nullptr;
@@ -1111,6 +1139,7 @@ void Application::create_platform_actions()
     auto& hub = WebView::Application::the();
 
     m_settings = make<WebView::Settings>(WebView::Settings::create_from_json(WebView::Application::settings().serialize_json()));
+    m_profile_is_temporary = WebView::Application::profile().is_temporary();
     create_session_store(WebView::Application::profile().paths().data, hub.persists_sessions());
     create_history_store(WebView::Application::profile().paths().data, WebView::Application::browser_options().disable_sql_database == WebView::DisableSQLDatabase::No);
     m_bookmark_store = make<BookmarkStore>(BookmarkStore::create(LexicalPath::join(WebView::Application::profile().paths().config, "Bookmarks.json"sv).string(), *m_favicon_store));
@@ -1135,6 +1164,11 @@ void Application::create_platform_actions()
     };
 #if defined(AK_OS_MACOS)
     m_software_updater = SoftwareUpdater::create();
+    m_software_updater->on_will_relaunch = [this] {
+        m_restart = Restart::ByUpdater;
+    };
+#elif defined(AK_OS_LINUX)
+    watch_for_replaced_installation();
 #endif
     m_web_ui_pages = make<WebUIPages>();
     m_bookmarks = make<Bookmarks>(*m_bookmark_store);
@@ -1551,6 +1585,7 @@ BrowserWindow* Application::restore_previous_session(WindowConfiguration const& 
     return frontmost_window;
 }
 
+// After Ladybird quit unexpectedly, a card over the top of the page offers to restore the tabs that were open.
 void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& window)
 {
     auto& store = session_store(WebView::IsPrivate::No);
@@ -1568,7 +1603,7 @@ void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& windo
     if (unit_ids.is_empty() || !window.current_tab())
         return;
 
-    window.current_tab()->show_restore_session_card(tab_count, [window = QPointer<BrowserWindow>(&window), unit_ids = AK::move(unit_ids)] {
+    auto restore_tabs = [window = QPointer<BrowserWindow>(&window), unit_ids = AK::move(unit_ids)] {
         // A window that still shows only the new tab page it opened with is taken over by the tabs restored first.
         QPointer<Tab> new_tab_page;
         if (window && window->tab_count() == 1) {
@@ -1585,7 +1620,12 @@ void Application::offer_to_restore_unexpectedly_closed_tabs(BrowserWindow& windo
 
         if (new_tab_page && window->tab_count() > 1)
             window->close_tab_without_keeping_it(window->tab_index(new_tab_page));
-    });
+    };
+    auto question = tab_count == 1 ? QStringLiteral("Restore the tab you had open?") : qformatted("Restore the {} tabs you had open?", tab_count);
+    Vector<PageCard::Button> buttons;
+    buttons.append({ "Not now", PageCard::ButtonRole::Secondary, {} });
+    buttons.append({ "Restore tabs", PageCard::ButtonRole::Primary, AK::move(restore_tabs) });
+    window.show_page_card(BrowserWindow::PageCardSlot::RestoreSession, "Ladybird quit unexpectedly", question, AK::move(buttons));
 }
 
 void Application::open_startup_tabs(BrowserWindow& window, Vector<URL::URL> const& urls)
@@ -1949,6 +1989,10 @@ void Application::finish_quit()
 void Application::cancel_quit()
 {
     m_quit_in_progress = false;
+    // Once Sparkle has installed an update, it relaunches Ladybird whenever Ladybird next quits. A canceled quit only
+    // calls off a restart of Ladybird's own.
+    if (m_restart == Restart::ByLadybird)
+        m_restart = Restart::None;
     m_windows_awaiting_quit_preflight.clear();
 
     // The windows whose pages already agreed go back to needing their own close check.
@@ -2039,6 +2083,29 @@ static BrowserWindow* window_for_view(RemoteView const& view)
             return window;
     }
     return nullptr;
+}
+
+OwnPtr<WebView::MediaSessionPlatformBackend> Application::create_media_session_platform_backend()
+{
+#if defined(AK_OS_MACOS)
+    auto backend = make<WebView::MediaSessionPlatformBackendMacOS>();
+    backend->on_action = [](Web::Bindings::MediaSessionAction action, Optional<double> seek_offset, Optional<double> seek_time, Optional<bool> fast_seek) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_media_session_action(action, seek_offset, seek_time, fast_seek);
+    };
+    return backend;
+#else
+    return {};
+#endif
+}
+
+WebView::MediaSessionPlatformBackend* Application::media_session_platform_backend()
+{
+    if (browser_options().headless_mode.has_value())
+        return nullptr;
+    if (!m_media_session_platform_backend)
+        m_media_session_platform_backend = create_media_session_platform_backend();
+    return m_media_session_platform_backend.ptr();
 }
 
 OwnPtr<WebView::NotificationBackend> Application::create_notification_backend()
@@ -2300,6 +2367,157 @@ void Application::display_download_confirmation_dialog(StringView download_name,
 void Application::display_error_dialog(StringView error_message) const
 {
     create_message_box(QMessageBox::Warning, error_message, active_window_if_any())->open();
+}
+
+void Application::display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> const& version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger)
+{
+    static constexpr auto current_version = BROWSER_VERSION ""sv;
+
+    switch (kind) {
+    case WebView::UpdateCheckResult::Kind::UpToDate:
+        create_message_box(QMessageBox::Information, MUST(String::formatted("Ladybird {} is the newest version.", current_version)), active_window_if_any())->open();
+        return;
+    case WebView::UpdateCheckResult::Kind::DevelopmentBuild:
+        create_message_box(QMessageBox::Information, "Development builds of Ladybird do not check for updates."sv, active_window_if_any())->open();
+        return;
+    case WebView::UpdateCheckResult::Kind::Failed:
+        display_error_dialog("Ladybird could not check for updates. Check your internet connection, and try again."sv);
+        return;
+    case WebView::UpdateCheckResult::Kind::UpdateAvailable:
+        break;
+    }
+
+    if (!version.has_value())
+        return;
+
+    // Once the system has installed a newer Ladybird in place of this one, restarting is what updates it.
+    if (m_installation_replaced) {
+        if (trigger != WebView::UpdateCheckTrigger::Automatic)
+            offer_restart_after_update();
+        return;
+    }
+
+    // A later automatic check finds the update again, but one that the user asked for answers now, in a new window if
+    // no window is open. On macOS, the menu bar outlives the last window.
+    auto* window = active_window_if_any();
+    if (!window && trigger == WebView::UpdateCheckTrigger::Automatic)
+        return;
+    if (!window)
+        window = &new_window({ Application::settings().new_tab_page_url() }, configuration_for_new_window());
+
+    Vector<PageCard::Button> buttons;
+    // A version skipped for the debug action would also be skipped when it is offered for real.
+    buttons.append({ "Skip", PageCard::ButtonRole::Secondary, [version = *version, trigger] {
+                        if (trigger != WebView::UpdateCheckTrigger::Debug)
+                            HubConnection::the().async_skip_update_version(version);
+                    } });
+
+    auto text = qformatted("You have Ladybird {}.", current_version);
+    if (first_is_one_of(install_method, WebView::InstallMethod::DEB, WebView::InstallMethod::RPM, WebView::InstallMethod::Flatpak)) {
+        text = qformatted("You have Ladybird {}. Update it with your system's software updater.", current_version);
+        buttons.append({ "Remind me later", PageCard::ButtonRole::Primary, {} });
+    } else if (install_method == WebView::InstallMethod::MacOSApp) {
+        buttons.append({ "Remind me later", PageCard::ButtonRole::Secondary, {} });
+#if defined(AK_OS_MACOS)
+        buttons.append({ "Install update", PageCard::ButtonRole::Primary, [trigger] {
+                            auto* software_updater = Application::the().software_updater();
+                            if (!software_updater)
+                                return;
+                            if (trigger == WebView::UpdateCheckTrigger::Debug)
+                                software_updater->install_latest_version();
+                            else
+                                software_updater->install_update();
+                        } });
+#endif
+    } else {
+        buttons.append({ "Remind me later", PageCard::ButtonRole::Secondary, {} });
+        buttons.append({ "View release", PageCard::ButtonRole::Primary, [url = WebView::release_page_url(*version)] {
+                            if (auto release_page = URL::Parser::basic_parse(url); release_page.has_value())
+                                Application::the().open_url_in_new_tab(*release_page, Web::HTML::ActivateTab::Yes, {}, WebView::IsPrivate::No);
+                        } });
+    }
+
+    window->show_page_card(BrowserWindow::PageCardSlot::Update, qformatted("Ladybird {} is available", *version), text, move(buttons));
+}
+
+#if defined(AK_OS_LINUX)
+// The system replaces the files of a package that it updates while Ladybird runs from the ones that it started with. The
+// processes that Ladybird starts from then on would be of the new version, so the user is asked to restart it.
+void Application::watch_for_replaced_installation()
+{
+    if (!first_is_one_of(WebView::describe_current_system().install_method, WebView::InstallMethod::DEB, WebView::InstallMethod::RPM))
+        return;
+    // /proc/self/exe stays the file that this process runs, even once another one took its place at its path.
+    auto running = Core::System::stat("/proc/self/exe"sv);
+    auto watcher = Core::FileWatcher::create();
+    if (running.is_error() || watcher.is_error())
+        return;
+
+    auto notice_replacement = [this, device = running.value().st_dev, inode = running.value().st_ino] {
+        auto executable = Core::System::stat(m_restart_command.executable);
+        if (m_installation_replaced || executable.is_error() || (executable.value().st_dev == device && executable.value().st_ino == inode))
+            return;
+        m_installation_replaced = true;
+        offer_restart_after_update();
+    };
+
+    // A package manager writes the new executable under another name, and renames it over the old one. That takes a
+    // link away from the file that this process started from, which changes its metadata.
+    m_installation_watcher = watcher.release_value();
+    m_installation_watcher->on_change = [notice_replacement](auto const&) { notice_replacement(); };
+    if (auto result = m_installation_watcher->add_watch(m_restart_command.executable, Core::FileWatcherEvent::Type::MetadataModified); result.is_error()) {
+        m_installation_watcher = nullptr;
+        return;
+    }
+
+    // An update that finished before the watch began is offered once Ladybird has opened its windows.
+    Core::deferred_invoke(move(notice_replacement));
+}
+
+#endif
+
+void Application::offer_restart_after_update()
+{
+    // Without the path of its executable, Ladybird could quit but not start again.
+    auto* window = active_window_if_any();
+    if (!window || m_restart_command.executable.is_empty())
+        return;
+
+    Vector<PageCard::Button> buttons;
+    buttons.append({ "Not now", PageCard::ButtonRole::Secondary, {} });
+    buttons.append({ "Restart", PageCard::ButtonRole::Primary, [] { Application::the().restart(); } });
+    // A temporary profile is gone once Ladybird quits, and its windows and tabs with it. A session that could not be
+    // saved, as when its database would not open, is gone as well.
+    auto reopens = !m_profile_is_temporary && m_session_store && m_session_store->is_persistent();
+    auto text = reopens ? "Restart Ladybird to use the new version. Your windows and tabs will reopen, except private ones."_string : "Restart Ladybird to use the new version."_string;
+    window->show_page_card(BrowserWindow::PageCardSlot::Update, "Ladybird was updated", qstring_from_ak_string(text), move(buttons));
+}
+
+void Application::restart()
+{
+    m_restart = Restart::ByLadybird;
+    quit();
+}
+
+Optional<Application::RestartCommand> Application::take_restart_command()
+{
+    if (m_restart == Restart::None || (m_restart == Restart::ByLadybird && m_restart_command.executable.is_empty()))
+        return {};
+    auto command = move(m_restart_command);
+    command.relaunched_by_updater = m_restart == Restart::ByUpdater;
+    return command;
+}
+
+// A restarted browser must start only once the Hub of this one is gone, as it would otherwise hand itself over to that
+// Hub. The Hub ends once the Application has closed the connection to it. An updater relaunches Ladybird by itself once
+// this process has ended, so this process ends only after the Hub has.
+ErrorOr<void> Application::RestartCommand::run()
+{
+    if (hub.has_value())
+        TRY(hub->wait_for_termination());
+    if (!relaunched_by_updater)
+        TRY(Core::Process::spawn({ .executable = executable, .arguments = arguments }));
+    return {};
 }
 
 void Application::open_file(String const& path) const

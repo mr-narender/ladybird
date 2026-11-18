@@ -451,7 +451,7 @@ void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, Strin
 
     auto const& settings = m_host.autocomplete_settings();
     auto engine = settings.search_engine_settings().engine;
-    if (!settings.search_engine_settings().suggestions || !engine.has_value() || !engine->suggestions.has_value()) {
+    if (!settings.search_engine_settings().suggestions || !engine.has_value() || !engine->suggestions_url.has_value()) {
         m_remote_suggestions.clear();
         m_remote_query_complete = true;
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete because search suggestions are disabled or unavailable");
@@ -552,7 +552,7 @@ void Autocomplete::start_remote_query(AutocompleteQueryID query_id, SearchEngine
         if (response.content_type.has_value())
             content_type = *response.content_type;
 
-        if (auto result = received_autocomplete_response(*engine.suggestions, content_type, StringView { response.body.bytes() }); result.is_error()) {
+        if (auto result = received_autocomplete_response(content_type, StringView { response.body.bytes() }); result.is_error()) {
             warnln("Unable to handle autocomplete response: {}", result.error());
             deliver_without_an_answer();
         } else {
@@ -629,27 +629,6 @@ void Autocomplete::deliver_current_result()
     invoke_autocomplete_query_complete(*m_query_id, move(merged_suggestions), result_kind);
 }
 
-static ErrorOr<Vector<String>> parse_duckduckgo_autocomplete(JsonValue const& json)
-{
-    if (!json.is_array())
-        return Error::from_string_literal("Expected DuckDuckGo autocomplete response to be a JSON array");
-
-    Vector<String> results;
-    results.ensure_capacity(json.as_array().size());
-
-    TRY(json.as_array().try_for_each([&](JsonValue const& suggestion) -> ErrorOr<void> {
-        if (!suggestion.is_object())
-            return Error::from_string_literal("Invalid DuckDuckGo autocomplete response, expected value to be an object");
-
-        if (auto value = suggestion.as_object().get_string("phrase"sv); value.has_value())
-            results.unchecked_append(*value);
-
-        return {};
-    }));
-
-    return results;
-}
-
 static ErrorOr<Vector<String>> parse_opensearch_autocomplete(JsonValue const& json)
 {
     if (!json.is_array())
@@ -673,34 +652,7 @@ static ErrorOr<Vector<String>> parse_opensearch_autocomplete(JsonValue const& js
     return results;
 }
 
-static ErrorOr<Vector<String>> parse_yahoo_autocomplete(JsonValue const& json)
-{
-    if (!json.is_object())
-        return Error::from_string_literal("Expected Yahoo autocomplete response to be a JSON array");
-
-    auto suggestions = json.as_object().get_array("r"sv);
-    if (!suggestions.has_value())
-        return Error::from_string_literal("Invalid Yahoo autocomplete response, expected \"r\" to be an object");
-
-    Vector<String> results;
-    results.ensure_capacity(suggestions->size());
-
-    TRY(suggestions->try_for_each([&](JsonValue const& suggestion) -> ErrorOr<void> {
-        if (!suggestion.is_object())
-            return Error::from_string_literal("Invalid Yahoo autocomplete response, expected value to be an object");
-
-        auto result = suggestion.as_object().get_string("k"sv);
-        if (!result.has_value())
-            return Error::from_string_literal("Invalid Yahoo autocomplete response, expected \"k\" to be a string");
-
-        results.unchecked_append(*result);
-        return {};
-    }));
-
-    return results;
-}
-
-ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(SearchSuggestions const& provider, Optional<ByteString const&> content_type, StringView response)
+ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(Optional<ByteString const&> content_type, StringView response)
 {
     auto decoder = [&]() -> Optional<TextCodec::Decoder> {
         if (!content_type.has_value())
@@ -723,15 +675,7 @@ ErrorOr<Vector<String>> Autocomplete::received_autocomplete_response(SearchSugge
     auto decoded_response = TRY(TextCodec::decode_to_utf8(response.bytes(), *decoder));
     auto json = TRY(JsonValue::from_string(decoded_response));
 
-    switch (provider.response_format) {
-    case SearchSuggestionsFormat::DuckDuckGo:
-        return parse_duckduckgo_autocomplete(json);
-    case SearchSuggestionsFormat::OpenSearch:
-        return parse_opensearch_autocomplete(json);
-    case SearchSuggestionsFormat::Yahoo:
-        return parse_yahoo_autocomplete(json);
-    }
-    VERIFY_NOT_REACHED();
+    return parse_opensearch_autocomplete(json);
 }
 
 void Autocomplete::invoke_autocomplete_query_complete(AutocompleteQueryID query_id, Vector<AutocompleteSuggestion> suggestions, AutocompleteResultKind result_kind) const

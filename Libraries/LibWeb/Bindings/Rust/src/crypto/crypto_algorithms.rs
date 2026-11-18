@@ -14,8 +14,8 @@ use std::rc::Rc;
 
 use ak::{Utf16String, Utf16StringUnits};
 use libcrypto_rust::{
-    Argon2Inputs, Argon2Type, Asn1Structure, Asn1Value, BackendError, CShakeKind, EcCurve, KeyHandle, KeyInfo, KeyPair,
-    KmacKind, MlDsaSize, MlKemSize, OkpCurve, RsaJwkInteger, ShaHashKind,
+    Argon2Inputs, Argon2Type, CShakeKind, CryptoError, EcCurve, KeyAlgorithm, KeyHandle, KeyInfo, KeyPair, KmacKind,
+    MlDsaSize, MlKemSize, OkpCurve, RsaJwkInteger, RsaSignaturePadding, ShaHashKind,
 };
 use libjs_rust::api::{
     ErrorKind, ErrorType, Gc, Object, PropertyKey, Realm, Trace, TypedArrayBase, TypedArrayKind, Value, Vm,
@@ -109,27 +109,20 @@ fn base64_url_bytes_encode(bytes: &[u8]) -> Utf16String {
 }
 
 // https://w3c.github.io/webcrypto/#concept-parse-an-asn1-structure
-fn parse_an_asn1_structure(
-    data: &[u8],
-    structure: Asn1Structure,
+// NB: The structure is given as its parser, whose errors are reported with `error_format`.
+fn parse_an_asn1_structure<'a, T>(
+    data: &'a [u8],
+    structure: impl FnOnce(&'a [u8]) -> Result<(T, bool), CryptoError>,
+    error_format: &str,
     exact_data: bool,
-) -> Result<Asn1Value<'_>, Utf16String> {
+) -> Result<T, Utf16String> {
     // 1. Let data be a sequence of bytes to be parsed.
     // 2. Let structure be the ASN.1 structure to be parsed.
     // 3. Let exactData be an optional boolean value. If it is not supplied, let it be initialized to true.
 
     // 4. Parse data according to the Distinguished Encoding Rules of [X690], using structure as the ASN.1 structure to be decoded.
-    let parsed = libcrypto_rust::decode_asn1_structure(data, structure);
-    if let Err(detail) = parsed {
-        let message = match structure {
-            Asn1Structure::SubjectPublicKeyInfo => "Error parsing subjectPublicKeyInfo: {}",
-            Asn1Structure::PrivateKeyInfo => "Error parsing privateKeyInfo: {}",
-            Asn1Structure::OctetString => "Read of kind OctetString failed: {}",
-        };
-        return Err(libjs_rust::api::utf16_formatted(message, &[&detail]));
-    }
-
-    let (value, all_consumed) = parsed.expect("the ASN.1 structure was parsed");
+    let (value, all_consumed) =
+        structure(data).map_err(|detail| libjs_rust::api::utf16_formatted(error_format, &[&detail.message()]))?;
 
     // 5. If exactData was specified, and all of the bytes of data were not consumed during the parsing phase, then throw a DataError.
     if exact_data && !all_consumed {
@@ -143,25 +136,31 @@ fn parse_an_asn1_structure(
 }
 
 // https://w3c.github.io/webcrypto/#concept-parse-a-spki
-fn parse_a_subject_public_key_info(data: &[u8]) -> Result<KeyInfo, Utf16String> {
+fn parse_a_subject_public_key_info(data: &[u8]) -> WebIdlResult<KeyInfo> {
     // When this specification says to parse a subjectPublicKeyInfo, the user agent must parse an ASN.1 structure,
     // with data set to the sequence of bytes to be parsed, structure as the ASN.1 structure of subjectPublicKeyInfo,
     // as specified in [RFC5280], and exactData set to true.
-    let Asn1Value::KeyInfo(key_info) = parse_an_asn1_structure(data, Asn1Structure::SubjectPublicKeyInfo, true)? else {
-        unreachable!("the ASN.1 structure is key info")
-    };
-    Ok(key_info)
+    parse_an_asn1_structure(
+        data,
+        libcrypto_rust::parse_subject_public_key_info,
+        "Error parsing subjectPublicKeyInfo: {}",
+        true,
+    )
+    .map_err(|message| Exception::Dom("DataError", message))
 }
 
 // https://w3c.github.io/webcrypto/#concept-parse-a-privateKeyInfo
-fn parse_a_private_key_info(data: &[u8]) -> Result<KeyInfo, Utf16String> {
+fn parse_a_private_key_info(data: &[u8]) -> WebIdlResult<KeyInfo> {
     // When this specification says to parse a PrivateKeyInfo, the user agent must parse an ASN.1 structure
     // with data set to the sequence of bytes to be parsed, structure as the ASN.1 structure of PrivateKeyInfo,
     // as specified in [RFC5208], and exactData set to true.
-    let Asn1Value::KeyInfo(key_info) = parse_an_asn1_structure(data, Asn1Structure::PrivateKeyInfo, true)? else {
-        unreachable!("the ASN.1 structure is key info")
-    };
-    Ok(key_info)
+    parse_an_asn1_structure(
+        data,
+        libcrypto_rust::parse_private_key_info,
+        "Error parsing privateKeyInfo: {}",
+        true,
+    )
+    .map_err(|message| Exception::Dom("DataError", message))
 }
 
 #[derive(Clone, Trace)]
@@ -502,17 +501,17 @@ impl AlgorithmMethods for Sha {
 
         let result_buffer = libcrypto_rust::sha_digest(hash_kind, data.as_slice()).map(Bytes::new);
         // 2. If performing the operation results in an error, then throw an OperationError.
-        if result_buffer.is_err() {
+        let Ok(result_buffer) = result_buffer else {
             return Err(Exception::Dom(
                 "OperationError",
                 Utf16String::from_utf8("Failed to create result buffer"),
             ));
-        }
+        };
 
         // 3. Return result.
         // https://wicg.github.io/webcrypto-modern-algos/#sha3-operations-digest
         // 3. Return the Keccak encoding of result.
-        Ok(result_buffer.expect("LibCrypto returns the digest"))
+        Ok(result_buffer)
     }
 }
 
@@ -526,7 +525,7 @@ impl AlgorithmMethods for CShakeParams {
         if let Err(detail) = result {
             return Err(Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Hash function failed: {}", &[&detail]),
+                libjs_rust::api::utf16_formatted("Hash function failed: {}", &[&detail.message()]),
             ));
         }
 
@@ -574,15 +573,15 @@ impl AlgorithmMethods for CShakeParams {
         .map(Bytes::new);
 
         // 5. If performing the operation results in an error, then throw an OperationError.
-        if let Err(detail) = result {
-            return Err(Exception::Dom(
+        let result = result.map_err(|detail| {
+            Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Hash function failed: {}", &[&detail]),
-            ));
-        }
+                libjs_rust::api::utf16_formatted("Hash function failed: {}", &[&detail.message()]),
+            )
+        })?;
 
         // 6. Return the Keccak encoding of result.
-        Ok(result.expect("LibCrypto returns the digest"))
+        Ok(result)
     }
 }
 
@@ -811,10 +810,10 @@ fn kmac_calculate_mac(
         customization.map(Bytes::as_slice),
     )
     .map(Bytes::new);
-    if mac.is_err() {
+    let Ok(mac) = mac else {
         return Err(dom_error("OperationError", b"KMAC operation failed"));
-    }
-    Ok(mac.expect("LibCrypto returns a MAC"))
+    };
+    Ok(mac)
 }
 
 #[derive(Clone, Trace)]
@@ -1575,11 +1574,11 @@ impl AlgorithmMethods for KmacKeyGenParams {
         let length = if let Some(length) = normalized_algorithm.length {
             length
         } else {
-            let Some(kind) = kmac_kind_from_algorithm_name(&algorithm.name) else {
-                return Err(dom_error("OperationError", b"Unsupported KMAC algorithm"));
-            };
-
-            libcrypto_rust::kmac_default_key_length(kind)
+            match kmac_kind_from_algorithm_name(&algorithm.name) {
+                Some(KmacKind::Kmac128) => 128,
+                Some(KmacKind::Kmac256) => 256,
+                None => return Err(dom_error("OperationError", b"Unsupported KMAC algorithm")),
+            }
         };
 
         validate_kmac_key_length(length)?;
@@ -1802,11 +1801,11 @@ impl AlgorithmMethods for KmacImportParams {
         // 1. Otherwise, if the name member of normalizedAlgorithm is a case-sensitive string match for "KMAC128":
         // 1. Otherwise, if the name member of normalizedAlgorithm is a case-sensitive string match for "KMAC256":
         else {
-            let Some(kind) = kmac_kind_from_algorithm_name(&algorithm.name) else {
-                return Err(dom_error("OperationError", b"Unsupported KMAC algorithm"));
-            };
-
-            libcrypto_rust::kmac_default_key_length(kind)
+            match kmac_kind_from_algorithm_name(&algorithm.name) {
+                Some(KmacKind::Kmac128) => 128,
+                Some(KmacKind::Kmac256) => 256,
+                None => return Err(dom_error("OperationError", b"Unsupported KMAC algorithm")),
+            }
         };
 
         // 2. Return length.
@@ -2186,12 +2185,12 @@ impl AlgorithmMethods for HkdfParams {
         .map(Bytes::new);
 
         // 6. If the key derivation operation fails, then throw an OperationError.
-        if result.is_err() {
+        let Ok(result) = result else {
             return Err(dom_error("OperationError", b"Failed to derive key"));
-        }
+        };
 
         // 7. Return result.
-        Ok(result.expect("LibCrypto returns the derived bytes"))
+        Ok(result)
     }
 }
 
@@ -2270,12 +2269,12 @@ impl AlgorithmMethods for Pbkdf2Params {
         .map(Bytes::new);
 
         // 6. If the key derivation operation fails, then throw an OperationError.
-        if result.is_err() {
+        let Ok(result) = result else {
             return Err(dom_error("OperationError", b"Failed to derive key"));
-        }
+        };
 
         // 7. Return result.
-        Ok(result.expect("LibCrypto returns the derived bytes"))
+        Ok(result)
     }
 }
 
@@ -2442,7 +2441,7 @@ impl AlgorithmMethods for Argon2Params {
         if let Err(detail) = result {
             return Err(Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Hashing function failed: {}", &[&detail]),
+                libjs_rust::api::utf16_formatted("Hashing function failed: {}", &[&detail.message()]),
             ));
         }
 
@@ -2496,7 +2495,6 @@ impl AlgorithmMethods for Argon2Params {
             parallelism: normalized_algorithm.parallelism,
             memory: normalized_algorithm.memory,
             passes: normalized_algorithm.passes,
-            version: 0x13,
             secret_value: secret_value.map(Bytes::as_slice),
             associated_data: associated_data.map(Bytes::as_slice),
             tag_length: length.expect("validation requires a length") / 8,
@@ -2505,15 +2503,15 @@ impl AlgorithmMethods for Argon2Params {
         let result = libcrypto_rust::argon2_derive_key(kind, &inputs).map(Bytes::new);
 
         // 10. If the key derivation operation fails, then throw an OperationError.
-        if let Err(detail) = result {
-            return Err(Exception::Dom(
+        let result = result.map_err(|detail| {
+            Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Hashing function failed: {}", &[&detail]),
-            ));
-        }
+                libjs_rust::api::utf16_formatted("Hashing function failed: {}", &[&detail.message()]),
+            )
+        })?;
 
         // 11. Return result.
-        Ok(result.expect("LibCrypto returns the derived bytes"))
+        Ok(result)
     }
 }
 
@@ -2723,12 +2721,12 @@ impl AlgorithmMethods for AesCbc {
             normalized_algorithm.iv.as_slice(),
         )
         .map(Bytes::new);
-        if ciphertext.is_err() {
+        let Ok(ciphertext) = ciphertext else {
             return Err(dom_error("OperationError", b"Failed to encrypt"));
-        }
+        };
 
         // 4. Return ciphertext.
-        Ok(ciphertext.expect("LibCrypto returns the result"))
+        Ok(ciphertext)
     }
 
     // https://w3c.github.io/webcrypto/#aes-cbc-operations-decrypt
@@ -2773,12 +2771,12 @@ impl AlgorithmMethods for AesCbc {
             normalized_algorithm.iv.as_slice(),
         )
         .map(Bytes::new);
-        if plaintext.is_err() {
+        let Ok(plaintext) = plaintext else {
             return Err(dom_error("OperationError", b"Failed to decrypt"));
-        }
+        };
 
         // 7. Return plaintext.
-        Ok(plaintext.expect("LibCrypto returns the result"))
+        Ok(plaintext)
     }
 
     // https://w3c.github.io/webcrypto/#aes-cbc-operations-import-key
@@ -3507,12 +3505,12 @@ impl AlgorithmMethods for AesCtr {
             normalized_algorithm.length,
         )
         .map(Bytes::new);
-        if ciphertext.is_err() {
+        let Ok(ciphertext) = ciphertext else {
             return Err(dom_error("OperationError", b"Encryption failed"));
-        }
+        };
 
         // 4. Return ciphertext.
-        Ok(ciphertext.expect("LibCrypto returns the result"))
+        Ok(ciphertext)
     }
 
     // https://w3c.github.io/webcrypto/#aes-ctr-operations-decrypt
@@ -3557,12 +3555,12 @@ impl AlgorithmMethods for AesCtr {
             normalized_algorithm.length,
         )
         .map(Bytes::new);
-        if plaintext.is_err() {
+        let Ok(plaintext) = plaintext else {
             return Err(dom_error("OperationError", b"Decryption failed"));
-        }
+        };
 
         // 4. Return plaintext.
-        Ok(plaintext.expect("LibCrypto returns the result"))
+        Ok(plaintext)
     }
 }
 
@@ -3900,25 +3898,19 @@ impl AlgorithmMethods for AesGcm {
         //    Section 7.1 of [NIST-SP800-38D] using AES as the block cipher, the iv member of normalizedAlgorithm as the
         //    IV input parameter, additionalData as the A input parameter, tagLength as the t pre-requisite and
         //    plaintext as the input plaintext.
-        let encrypted = libcrypto_rust::aes_gcm_encrypt(
+        // 7. Let ciphertext be equal to C | T, where '|' denotes concatenation.
+        // NB: LibCrypto gives C | T.
+        let ciphertext = libcrypto_rust::aes_gcm_cipher(
+            true,
             key.byte_handle_bytes(),
             plaintext.as_slice(),
             normalized_algorithm.iv.as_slice(),
             additional_data,
             tag_length / 8,
         );
-        let Ok((mut ciphertext, tag)) = encrypted else {
+        let Ok(ciphertext) = ciphertext else {
             return Err(dom_error("OperationError", b"Encryption failed"));
         };
-
-        // 7. Let ciphertext be equal to C | T, where '|' denotes concatenation.
-        if ciphertext.try_reserve_exact(tag.len()).is_err() {
-            return cx
-                .vm()
-                .throw_completion(ErrorKind::InternalError, ErrorType::OutOfMemory, &[])
-                .map_err(Into::into);
-        }
-        ciphertext.extend_from_slice(&tag);
 
         // 8. Return ciphertext.
         Ok(Bytes::new(ciphertext))
@@ -3972,23 +3964,8 @@ impl AlgorithmMethods for AesGcm {
         }
 
         // 5. Let tag be the last tagLength bits of ciphertext.
-        let tag_bytes = tag_length / 8;
-        let split = ciphertext.as_slice().len() - tag_bytes;
-        let copy_bytes = |bytes: &[u8]| -> WebIdlResult<Vec<u8>> {
-            let mut copy = Vec::new();
-            if copy.try_reserve_exact(bytes.len()).is_err() {
-                return cx
-                    .vm()
-                    .throw_completion(ErrorKind::InternalError, ErrorType::OutOfMemory, &[])
-                    .map_err(Into::into);
-            }
-            copy.extend_from_slice(bytes);
-            Ok(copy)
-        };
-        let tag = copy_bytes(&ciphertext.as_slice()[split..])?;
         // 6. Let actualCiphertext be the result of removing the last tagLength bits from ciphertext.
-        let actual_ciphertext = copy_bytes(&ciphertext.as_slice()[..split])?;
-
+        // NB: LibCrypto splits the tag from the ciphertext.
         // 7. Let additionalData be the additionalData member of normalizedAlgorithm if present or an empty byte
         //    sequence otherwise.
         let additional_data = normalized_algorithm
@@ -4001,22 +3978,23 @@ impl AlgorithmMethods for AesGcm {
         //    input parameter, tagLength as the t pre-requisite, actualCiphertext as the input ciphertext, C and tag as
         //    the authentication tag, T.
         // If the result of the algorithm is the indication of inauthenticity, "FAIL": throw an OperationError
-        let plaintext = libcrypto_rust::aes_gcm_decrypt(
+        let plaintext = libcrypto_rust::aes_gcm_cipher(
+            false,
             key.byte_handle_bytes(),
-            &actual_ciphertext,
+            ciphertext.as_slice(),
             normalized_algorithm.iv.as_slice(),
             additional_data,
-            &tag,
+            tag_length / 8,
         )
         .map(Bytes::new);
 
-        if plaintext.is_err() {
+        let Ok(plaintext) = plaintext else {
             return Err(dom_error("OperationError", b"Decryption failed"));
-        }
+        };
 
         // Otherwise: Let plaintext be the output P of the Authenticated Decryption Function.
         // 9. Return plaintext.
-        Ok(plaintext.expect("LibCrypto returns plaintext"))
+        Ok(plaintext)
     }
 
     // https://w3c.github.io/webcrypto/#aes-gcm-operations-generate-key
@@ -4445,12 +4423,12 @@ impl AlgorithmMethods for AesKw {
         //    with plaintext as the plaintext to be wrapped and using the default Initial Value defined in Section 2.2.3.1 of the same document.
         let ciphertext =
             libcrypto_rust::aes_kw_cipher(true, key.byte_handle_bytes(), plaintext.as_slice()).map(Bytes::new);
-        if ciphertext.is_err() {
+        let Ok(ciphertext) = ciphertext else {
             return Err(dom_error("OperationError", b"Key wrap failed"));
-        }
+        };
 
         // 3. Return ciphertext.
-        Ok(ciphertext.expect("LibCrypto returns the result"))
+        Ok(ciphertext)
     }
 
     // https://w3c.github.io/webcrypto/#aes-kw-operations-unwrap-key
@@ -4466,12 +4444,12 @@ impl AlgorithmMethods for AesKw {
         // 2. If the Key Unwrap operation returns an error, then throw an OperationError.
         let plaintext =
             libcrypto_rust::aes_kw_cipher(false, key.byte_handle_bytes(), ciphertext.as_slice()).map(Bytes::new);
-        if plaintext.is_err() {
+        let Ok(plaintext) = plaintext else {
             return Err(dom_error("OperationError", b"Key unwrap failed"));
-        }
+        };
 
         // 3. Return plaintext.
-        Ok(plaintext.expect("LibCrypto returns the result"))
+        Ok(plaintext)
     }
 }
 
@@ -4554,15 +4532,15 @@ impl AlgorithmMethods for AesOcb {
         )
         .map(Bytes::new);
 
-        if let Err(detail) = ciphertext {
-            return Err(Exception::Dom(
+        let ciphertext = ciphertext.map_err(|detail| {
+            Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Encryption failed: {}", &[&detail]),
-            ));
-        }
+                libjs_rust::api::utf16_formatted("Encryption failed: {}", &[&detail.message()]),
+            )
+        })?;
 
         // 5. Return C.
-        Ok(ciphertext.expect("LibCrypto returns the result"))
+        Ok(ciphertext)
     }
 
     // https://wicg.github.io/webcrypto-modern-algos/#aes-ocb-operations-decrypt
@@ -4642,15 +4620,15 @@ impl AlgorithmMethods for AesOcb {
         //       throw an OperationError
         //    Otherwise:
         //       Let plaintext be the output P of OCB-DECRYPT.
-        if let Err(detail) = plaintext {
-            return Err(Exception::Dom(
+        let plaintext = plaintext.map_err(|detail| {
+            Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Decryption failed: {}", &[&detail]),
-            ));
-        }
+                libjs_rust::api::utf16_formatted("Decryption failed: {}", &[&detail.message()]),
+            )
+        })?;
 
         // 6. Return plaintext.
-        Ok(plaintext.expect("LibCrypto returns the result"))
+        Ok(plaintext)
     }
 
     // https://wicg.github.io/webcrypto-modern-algos/#aes-ocb-operations-generate-key
@@ -5048,15 +5026,15 @@ impl AlgorithmMethods for ChaCha20Poly1305 {
         )
         .map(Bytes::new);
 
-        if let Err(detail) = ciphertext {
-            return Err(Exception::Dom(
+        let ciphertext = ciphertext.map_err(|detail| {
+            Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Encryption failed: {}", &[&detail]),
-            ));
-        }
+                libjs_rust::api::utf16_formatted("Encryption failed: {}", &[&detail.message()]),
+            )
+        })?;
 
         // 5. Return ciphertext.
-        Ok(ciphertext.expect("LibCrypto returns the result"))
+        Ok(ciphertext)
     }
 
     // https://wicg.github.io/webcrypto-modern-algos/#chacha20-poly1305-operations-decrypt
@@ -5111,15 +5089,15 @@ impl AlgorithmMethods for ChaCha20Poly1305 {
         //       throw an OperationError
         //    Otherwise:
         //       Let plaintext be the resulting plaintext.
-        if let Err(detail) = plaintext {
-            return Err(Exception::Dom(
+        let plaintext = plaintext.map_err(|detail| {
+            Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Decryption failed: {}", &[&detail]),
-            ));
-        }
+                libjs_rust::api::utf16_formatted("Decryption failed: {}", &[&detail.message()]),
+            )
+        })?;
 
         // 6. Return plaintext.
-        Ok(plaintext.expect("LibCrypto returns the result"))
+        Ok(plaintext)
     }
 
     // https://wicg.github.io/webcrypto-modern-algos/#chacha20-poly1305-operations-generate-key
@@ -5511,15 +5489,6 @@ impl RsaParameters {
     }
 }
 
-fn parse_key_info(data: &Bytes, structure: Asn1Structure) -> WebIdlResult<KeyInfo> {
-    let parsed = match structure {
-        Asn1Structure::SubjectPublicKeyInfo => parse_a_subject_public_key_info(data.as_slice()),
-        Asn1Structure::PrivateKeyInfo => parse_a_private_key_info(data.as_slice()),
-        Asn1Structure::OctetString => unreachable!("octet strings are not key info"),
-    };
-    parsed.map_err(|message| Exception::Dom("DataError", message))
-}
-
 // https://w3c.github.io/webcrypto/#dfn-validate-rsa-key-generation-parameters
 fn validate_rsa_key_generation_parameters(normalized_algorithm: &RsaKeyGenParams) -> WebIdlResult<()> {
     // 1. Let modulusLength be the modulusLength member of normalizedAlgorithm.
@@ -5546,20 +5515,6 @@ fn validate_rsa_key_generation_parameters(normalized_algorithm: &RsaKeyGenParams
         ));
     }
     Ok(())
-}
-
-fn export_public_exponent(vm: &Vm, exponent: &Bytes) -> WebIdlResult<Vec<u8>> {
-    let result = libcrypto_rust::rsa_export_public_exponent(exponent.as_slice()).map(Bytes::new);
-    if result.is_err() {
-        return vm
-            .throw_completion(ErrorKind::InternalError, ErrorType::OutOfMemory, &[])
-            .map_err(Into::into);
-    }
-    Ok(Rc::unwrap_or_clone(result.expect("LibCrypto returns the exponent").0))
-}
-
-fn rsa_key_metadata(vm: &Vm, key: Ref<CryptoKey>) -> WebIdlResult<(u32, Vec<u8>)> {
-    libcrypto_rust::rsa_read_key_metadata(key.handle()).map_err(|_| out_of_memory(vm))
 }
 
 fn parse_jwk_rsa_key(jwk: &JsonWebKey, is_private: bool) -> WebIdlResult<KeyHandle> {
@@ -5590,21 +5545,17 @@ fn parse_jwk_rsa_key(jwk: &JsonWebKey, is_private: bool) -> WebIdlResult<KeyHand
 
 fn rsa_export_der(vm: &Vm, key: Ref<CryptoKey>, is_public: bool) -> WebIdlResult<Bytes> {
     let result = libcrypto_rust::rsa_export_der(key.handle(), is_public).map(Bytes::new);
-    if result.is_err() {
+    let Ok(result) = result else {
         return vm
             .throw_completion(ErrorKind::InternalError, ErrorType::OutOfMemory, &[])
             .map_err(Into::into);
-    }
-    Ok(result.expect("LibCrypto returns the DER bytes"))
+    };
+    Ok(result)
 }
 
 fn rsa_export_jwk_integer(vm: &Vm, key: Ref<CryptoKey>, component: RsaJwkInteger) -> WebIdlResult<Utf16String> {
-    let bytes = libcrypto_rust::rsa_export_jwk_integer(key.handle(), component).map(Bytes::new);
-    if bytes.is_err() {
-        return Err(out_of_memory(vm));
-    }
-    let bytes = bytes.expect("LibCrypto returns the exported integer");
-    Ok(base64_url_bytes_encode(bytes.as_slice()))
+    let bytes = libcrypto_rust::rsa_export_jwk_integer(key.handle(), component).map_err(|_| out_of_memory(vm))?;
+    Ok(base64_url_bytes_encode(&bytes))
 }
 
 fn key_format_to_string(format: KeyFormat) -> &'static str {
@@ -5686,12 +5637,12 @@ impl AlgorithmMethods for RsaOaep {
         let ciphertext =
             libcrypto_rust::rsa_oaep_cipher(true, hash_kind, key.handle(), label.as_slice(), plaintext.as_slice())
                 .map(Bytes::new);
-        if ciphertext.is_err() {
+        let Ok(ciphertext) = ciphertext else {
             return Err(dom_error("OperationError", b"Failed to encrypt"));
-        }
+        };
 
         // 6. Return ciphertext.
-        Ok(ciphertext.expect("LibCrypto returns the result"))
+        Ok(ciphertext)
     }
 
     // https://w3c.github.io/webcrypto/#rsa-oaep-operations-decrypt
@@ -5741,12 +5692,12 @@ impl AlgorithmMethods for RsaOaep {
         let plaintext =
             libcrypto_rust::rsa_oaep_cipher(false, hash_kind, key.handle(), label.as_slice(), ciphertext.as_slice())
                 .map(Bytes::new);
-        if plaintext.is_err() {
+        let Ok(plaintext) = plaintext else {
             return Err(dom_error("OperationError", b"Failed to encrypt"));
-        }
+        };
 
         // 6. Return plaintext.
-        Ok(plaintext.expect("LibCrypto returns the result"))
+        Ok(plaintext)
     }
 
     // https://w3c.github.io/webcrypto/#rsa-oaep-operations-generate-key
@@ -5798,7 +5749,8 @@ impl AlgorithmMethods for RsaOaep {
             return Err(dom_error("OperationError", b"Failed generating RSA key pair"));
         };
 
-        let public_exponent = export_public_exponent(cx.vm(), &normalized_algorithm.key_gen.public_exponent)?;
+        let public_exponent =
+            libcrypto_rust::rsa_export_public_exponent(normalized_algorithm.key_gen.public_exponent.as_slice());
         let hash_name = normalized_algorithm.hash.name.clone();
 
         // 10. Let publicKey be a new CryptoKey representing the public key of the generated key pair.
@@ -5904,11 +5856,11 @@ impl AlgorithmMethods for RsaOaep {
 
             // 2. Let spki be the result of running the parse a subjectPublicKeyInfo algorithm over keyData.
             // 3. If an error occurred while parsing, then throw a DataError.
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let mut spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki
             //    is not equal to the rsaEncryption object identifier defined in [RFC3447], then throw a DataError.
-            if !spki.has_rsa_encryption_oid() {
+            if spki.algorithm() != Some(KeyAlgorithm::Rsa) {
                 return Err(dom_error(
                     "DataError",
                     b"Algorithm object identifier is not the rsaEncryption object identifier",
@@ -5919,7 +5871,7 @@ impl AlgorithmMethods for RsaOaep {
             //    with data as the subjectPublicKeyInfo field of spki, structure as the RSAPublicKey structure
             //    specified in Section A.1.1 of [RFC3447], and exactData set to true.
             // NOTE: We already did this in parse_a_subject_public_key_info
-            let public_key = spki.rsa_key();
+            let public_key = spki.take_key();
 
             // 6. If an error occurred while parsing, or it can be determined that publicKey is not
             //    a valid public key according to [RFC3447], then throw a DataError.
@@ -5955,11 +5907,11 @@ impl AlgorithmMethods for RsaOaep {
 
             // 2. Let privateKeyInfo be the result of running the parse a privateKeyInfo algorithm over keyData.
             // 3. If an error occurred while parsing, then throw a DataError.
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let mut private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of privateKeyInfo
             //    is not equal to the rsaEncryption object identifier defined in [RFC3447], then throw a DataError.
-            if !private_key_info.has_rsa_encryption_oid() {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Rsa) {
                 return Err(dom_error(
                     "DataError",
                     b"Algorithm object identifier is not the rsaEncryption object identifier",
@@ -5970,7 +5922,7 @@ impl AlgorithmMethods for RsaOaep {
             //    with data as the privateKey field of privateKeyInfo, structure as the RSAPrivateKey structure
             //    specified in Section A.1.2 of [RFC3447], and exactData set to true.
             // NOTE: We already did this in parse_a_private_key_info
-            let rsa_private_key = private_key_info.rsa_key();
+            let rsa_private_key = private_key_info.take_key();
 
             // 6. If an error occurred while parsing, or if rsaPrivateKey is not
             //    a valid RSA private key according to [RFC3447], then throw a DataError.
@@ -6159,7 +6111,8 @@ impl AlgorithmMethods for RsaOaep {
 
         // 5. Set the modulusLength attribute of algorithm to the length, in bits, of the RSA public modulus.
         // 6. Set the publicExponent attribute of algorithm to the BigInteger representation of the RSA public exponent.
-        let (modulus_length, public_exponent) = rsa_key_metadata(cx.vm(), key)?;
+        let (modulus_length, public_exponent) =
+            libcrypto_rust::rsa_read_key_metadata(key.handle()).map_err(|_| out_of_memory(cx.vm()))?;
 
         // 7. Set the hash attribute of algorithm to the hash member of normalizedAlgorithm.
         let hash_name = normalized_algorithm.hash.name.clone();
@@ -6397,7 +6350,8 @@ impl AlgorithmMethods for RsaPss {
             return Err(dom_error("OperationError", b"Failed to generate RSA key pair"));
         };
 
-        let public_exponent = export_public_exponent(cx.vm(), &normalized_algorithm.key_gen.public_exponent)?;
+        let public_exponent =
+            libcrypto_rust::rsa_export_public_exponent(normalized_algorithm.key_gen.public_exponent.as_slice());
         let hash_name = normalized_algorithm.hash.name.clone();
 
         // 10. Let publicKey be a new CryptoKey representing the public key of the generated key pair.
@@ -6505,15 +6459,21 @@ impl AlgorithmMethods for RsaPss {
         };
 
         // 4. Let signature be the signature, S, that results from performing the operation.
-        let signature =
-            libcrypto_rust::rsa_pss_sign(hash_kind, key.handle(), pss_params.salt_length, message.as_slice())
-                .map(Bytes::new);
-        if signature.is_err() {
+        let signature = libcrypto_rust::rsa_sign(
+            hash_kind,
+            key.handle(),
+            RsaSignaturePadding::Pss {
+                salt_length: pss_params.salt_length,
+            },
+            message.as_slice(),
+        )
+        .map(Bytes::new);
+        let Ok(signature) = signature else {
             return Err(dom_error("OperationError", b"Failed to sign message"));
-        }
+        };
 
         // 5. Return signature.
-        Ok(signature.expect("LibCrypto returns the result"))
+        Ok(signature)
     }
 
     // https://w3c.github.io/webcrypto/#rsa-pss-operations-verify
@@ -6562,18 +6522,20 @@ impl AlgorithmMethods for RsaPss {
         };
 
         // 3. Let result be a boolean with the value true if the result of the operation was "valid signature" and the value false otherwise.
-        let verified = libcrypto_rust::rsa_pss_verify(
+        let verified = libcrypto_rust::rsa_verify(
             hash_kind,
             key.handle(),
-            pss_params.salt_length,
+            RsaSignaturePadding::Pss {
+                salt_length: pss_params.salt_length,
+            },
             message.as_slice(),
             signature.as_slice(),
         );
-        if verified.is_err() {
+        let Ok(verified) = verified else {
             return Err(dom_error("OperationError", b"Failed to verify message"));
-        }
+        };
 
-        Ok(verified.expect("LibCrypto returns the verification result"))
+        Ok(verified)
     }
 
     // https://w3c.github.io/webcrypto/#rsa-pss-operations-import-key
@@ -6611,11 +6573,11 @@ impl AlgorithmMethods for RsaPss {
 
             // 2. Let spki be the result of running the parse a subjectPublicKeyInfo algorithm over keyData.
             // 3. If an error occurred while parsing, then throw a DataError.
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let mut spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki
             //    is not equal to the rsaEncryption object identifier defined in [RFC3447], then throw a DataError.
-            if !spki.has_rsa_encryption_oid() {
+            if spki.algorithm() != Some(KeyAlgorithm::Rsa) {
                 return Err(dom_error(
                     "DataError",
                     b"Algorithm object identifier is not the rsaEncryption object identifier",
@@ -6626,7 +6588,7 @@ impl AlgorithmMethods for RsaPss {
             //    with data as the subjectPublicKeyInfo field of spki, structure as the RSAPublicKey structure
             //    specified in Section A.1.1 of [RFC3447], and exactData set to true.
             // NOTE: We already did this in parse_a_subject_public_key_info
-            let public_key = spki.rsa_key();
+            let public_key = spki.take_key();
 
             // 6. If an error occurred while parsing, or it can be determined that publicKey is not
             //    a valid public key according to [RFC3447], then throw a DataError.
@@ -6662,11 +6624,11 @@ impl AlgorithmMethods for RsaPss {
 
             // 2. Let privateKeyInfo be the result of running the parse a privateKeyInfo algorithm over keyData.
             // 3. If an error occurred while parsing, then throw a DataError.
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let mut private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of privateKeyInfo
             //    is not equal to the rsaEncryption object identifier defined in [RFC3447], then throw a DataError.
-            if !private_key_info.has_rsa_encryption_oid() {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Rsa) {
                 return Err(dom_error(
                     "DataError",
                     b"Algorithm object identifier is not the rsaEncryption object identifier",
@@ -6677,7 +6639,7 @@ impl AlgorithmMethods for RsaPss {
             //    with data as the privateKey field of privateKeyInfo, structure as the RSAPrivateKey structure
             //    specified in Section A.1.2 of [RFC3447], and exactData set to true.
             // NOTE: We already did this in parse_a_private_key_info
-            let rsa_private_key = private_key_info.rsa_key();
+            let rsa_private_key = private_key_info.take_key();
 
             // 6. If an error occurred while parsing, or if rsaPrivateKey is not
             //    a valid RSA private key according to [RFC3447], then throw a DataError.
@@ -6865,7 +6827,8 @@ impl AlgorithmMethods for RsaPss {
 
         // 5. Set the modulusLength attribute of algorithm to the length, in bits, of the RSA public modulus.
         // 6. Set the publicExponent attribute of algorithm to the BigInteger representation of the RSA public exponent.
-        let (modulus_length, public_exponent) = rsa_key_metadata(cx.vm(), key)?;
+        let (modulus_length, public_exponent) =
+            libcrypto_rust::rsa_read_key_metadata(key.handle()).map_err(|_| out_of_memory(cx.vm()))?;
 
         // 7. Set the hash attribute of algorithm to the hash member of normalizedAlgorithm.
         let hash_name = normalized_algorithm.hash.name.clone();
@@ -7103,7 +7066,8 @@ impl AlgorithmMethods for RsassaPkcs1 {
             return Err(dom_error("OperationError", b"Failed to generate RSA key pair"));
         };
 
-        let public_exponent = export_public_exponent(cx.vm(), &normalized_algorithm.key_gen.public_exponent)?;
+        let public_exponent =
+            libcrypto_rust::rsa_export_public_exponent(normalized_algorithm.key_gen.public_exponent.as_slice());
         let hash_name = normalized_algorithm.hash.name.clone();
 
         // 10. Let publicKey be a new CryptoKey representing the public key of the generated key pair.
@@ -7208,13 +7172,15 @@ impl AlgorithmMethods for RsassaPkcs1 {
         };
 
         // 4. Let signature be the value S that results from performing the operation.
-        let signature = libcrypto_rust::rsa_pkcs1_sign(hash_kind, key.handle(), message.as_slice()).map(Bytes::new);
-        if signature.is_err() {
+        let signature =
+            libcrypto_rust::rsa_sign(hash_kind, key.handle(), RsaSignaturePadding::Pkcs1, message.as_slice())
+                .map(Bytes::new);
+        let Ok(signature) = signature else {
             return Err(dom_error("OperationError", b"Failed to sign message"));
-        }
+        };
 
         // 5. Return signature.
-        Ok(signature.expect("LibCrypto returns the result"))
+        Ok(signature)
     }
 
     // https://w3c.github.io/webcrypto/#rsassa-pkcs1-operations-verify
@@ -7260,14 +7226,19 @@ impl AlgorithmMethods for RsassaPkcs1 {
 
         // 3. Let result be a boolean with value true if the result of the operation was "valid signature" and the value
         //    false otherwise.
-        let verified =
-            libcrypto_rust::rsa_pkcs1_verify(hash_kind, key.handle(), message.as_slice(), signature.as_slice());
-        if verified.is_err() {
+        let verified = libcrypto_rust::rsa_verify(
+            hash_kind,
+            key.handle(),
+            RsaSignaturePadding::Pkcs1,
+            message.as_slice(),
+            signature.as_slice(),
+        );
+        let Ok(verified) = verified else {
             return Err(dom_error("OperationError", b"Failed to verify message"));
-        }
+        };
 
         // 4. Return result.
-        Ok(verified.expect("LibCrypto returns the verification result"))
+        Ok(verified)
     }
 
     // https://w3c.github.io/webcrypto/#rsassa-pkcs1-operations-import-key
@@ -7305,11 +7276,11 @@ impl AlgorithmMethods for RsassaPkcs1 {
 
             // 2. Let spki be the result of running the parse a subjectPublicKeyInfo algorithm over keyData.
             // 3. If an error occurred while parsing, then throw a DataError.
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let mut spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki
             //    is not equal to the rsaEncryption object identifier defined in [RFC3447], then throw a DataError.
-            if !spki.has_rsa_encryption_oid() {
+            if spki.algorithm() != Some(KeyAlgorithm::Rsa) {
                 return Err(dom_error(
                     "DataError",
                     b"Algorithm object identifier is not the rsaEncryption object identifier",
@@ -7320,7 +7291,7 @@ impl AlgorithmMethods for RsassaPkcs1 {
             //    with data as the subjectPublicKeyInfo field of spki, structure as the RSAPublicKey structure
             //    specified in Section A.1.1 of [RFC3447], and exactData set to true.
             // NOTE: We already did this in parse_a_subject_public_key_info
-            let public_key = spki.rsa_key();
+            let public_key = spki.take_key();
 
             // 6. If an error occurred while parsing, or it can be determined that publicKey is not
             //    a valid public key according to [RFC3447], then throw a DataError.
@@ -7356,11 +7327,11 @@ impl AlgorithmMethods for RsassaPkcs1 {
 
             // 2. Let privateKeyInfo be the result of running the parse a privateKeyInfo algorithm over keyData.
             // 3. If an error occurred while parsing, then throw a DataError.
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let mut private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of privateKeyInfo
             //    is not equal to the rsaEncryption object identifier defined in [RFC3447], then throw a DataError.
-            if !private_key_info.has_rsa_encryption_oid() {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Rsa) {
                 return Err(dom_error(
                     "DataError",
                     b"Algorithm object identifier is not the rsaEncryption object identifier",
@@ -7371,7 +7342,7 @@ impl AlgorithmMethods for RsassaPkcs1 {
             //    with data as the privateKey field of privateKeyInfo, structure as the RSAPrivateKey structure
             //    specified in Section A.1.2 of [RFC3447], and exactData set to true.
             // NOTE: We already did this in parse_a_private_key_info
-            let rsa_private_key = private_key_info.rsa_key();
+            let rsa_private_key = private_key_info.take_key();
 
             // 6. If an error occurred while parsing, or if rsaPrivateKey is not
             //    a valid RSA private key according to [RFC3447], then throw a DataError.
@@ -7561,7 +7532,8 @@ impl AlgorithmMethods for RsassaPkcs1 {
 
         // 5. Set the modulusLength attribute of algorithm to the length, in bits, of the RSA public modulus.
         // 6. Set the publicExponent attribute of algorithm to the BigInteger representation of the RSA public exponent.
-        let (modulus_length, public_exponent) = rsa_key_metadata(cx.vm(), key)?;
+        let (modulus_length, public_exponent) =
+            libcrypto_rust::rsa_read_key_metadata(key.handle()).map_err(|_| out_of_memory(cx.vm()))?;
 
         // 7. Set the hash attribute of algorithm to the hash member of normalizedAlgorithm.
         let hash_name = normalized_algorithm.hash.name.clone();
@@ -7838,10 +7810,6 @@ fn ec_curve_from_name(named_curve: &Utf16String) -> Option<EcCurve> {
     }
 }
 
-const SECP256R1_OID: [u32; 7] = [1, 2, 840, 10045, 3, 1, 7];
-const SECP384R1_OID: [u32; 5] = [1, 3, 132, 0, 34];
-const SECP521R1_OID: [u32; 5] = [1, 3, 132, 0, 35];
-
 fn ec_key_from_coordinates(vm: &Vm, x: &Bytes, y: &Bytes, d: Option<&Bytes>) -> WebIdlResult<Ref<CryptoKey>> {
     let Some(key) = libcrypto_rust::ec_key_from_coordinates(x.as_slice(), y.as_slice(), d.map(Bytes::as_slice)) else {
         return Err(dom_error("DataError", b"Invalid key"));
@@ -7854,34 +7822,15 @@ fn ec_parse_raw_public_key(vm: &Vm, curve: EcCurve, key_bytes: &Bytes) -> WebIdl
         return Err(dom_error("DataError", b"Failed to parse key"));
     };
     let key = CryptoKey::create(vm, key);
-    let Ok(is_valid) = ec_key_is_valid(curve, key) else {
-        return Err(dom_error("DataError", b"Failed to verify key"));
-    };
-    if !is_valid {
+    if !libcrypto_rust::ec_key_is_valid(curve, key.handle()) {
         return Err(dom_error("DataError", b"Invalid key"));
     }
     Ok(key)
 }
 
-fn ec_key_is_valid(curve: EcCurve, key: Ref<CryptoKey>) -> Result<bool, BackendError> {
-    libcrypto_rust::ec_key_is_valid(curve, key.handle())
-}
-
-fn ec_export_der(curve: EcCurve, key: Ref<CryptoKey>, is_public: bool) -> Result<Bytes, BackendError> {
-    libcrypto_rust::ec_export_der(curve, key.handle(), is_public).map(Bytes::new)
-}
-
-fn ec_export_uncompressed(key: Ref<CryptoKey>) -> Result<Bytes, BackendError> {
-    libcrypto_rust::ec_export_uncompressed(key.handle()).map(Bytes::new)
-}
-
-fn ec_export_public_coordinates(key: Ref<CryptoKey>) -> Result<(Bytes, Bytes), BackendError> {
+fn ec_export_public_coordinates(key: Ref<CryptoKey>) -> Result<(Bytes, Bytes), CryptoError> {
     let (x, y) = libcrypto_rust::ec_export_public_coordinates(key.handle())?;
     Ok((Bytes::new(x), Bytes::new(y)))
-}
-
-fn ec_export_private_scalar(key: Ref<CryptoKey>) -> Result<Bytes, BackendError> {
-    libcrypto_rust::ec_export_private_scalar(key.handle()).map(Bytes::new)
 }
 
 fn copy_bytes(vm: &Vm, bytes: &[u8]) -> WebIdlResult<Vec<u8>> {
@@ -8051,13 +8000,13 @@ impl AlgorithmMethods for Ecdsa {
             sha_hash_kind(hash_algorithm).map_err(|message| Exception::Dom("NotSupportedError", message))?;
 
         let digest = libcrypto_rust::sha_digest(hash_kind, message.as_slice()).map(Bytes::new);
-        if digest.is_err() {
+        let Ok(digest) = digest else {
             return cx
                 .vm()
                 .throw_completion(ErrorKind::InternalError, ErrorType::OutOfMemory, &[])
                 .map_err(Into::into);
-        }
-        let m = digest.expect("LibCrypto returns the digest");
+        };
+        let m = digest;
 
         // 4. Let d be the ECDSA private key associated with key.
         let d = key.handle();
@@ -8085,7 +8034,12 @@ impl AlgorithmMethods for Ecdsa {
             let signature = libcrypto_rust::ec_sign(curve, d, m.as_slice());
             let (r_bytes, s_bytes) = match signature {
                 Ok(signature) => signature,
-                Err(message) => return Err(Exception::Dom("OperationError", message)),
+                Err(message) => {
+                    return Err(Exception::Dom(
+                        "OperationError",
+                        Utf16String::from_utf8(message.message()),
+                    ));
+                }
             };
 
             // 3. Let result be an empty byte sequence.
@@ -8155,13 +8109,13 @@ impl AlgorithmMethods for Ecdsa {
             sha_hash_kind(hash_algorithm).map_err(|message| Exception::Dom("NotSupportedError", message))?;
 
         let digest = libcrypto_rust::sha_digest(hash_kind, message.as_slice()).map(Bytes::new);
-        if digest.is_err() {
+        let Ok(digest) = digest else {
             return cx
                 .vm()
                 .throw_completion(ErrorKind::InternalError, ErrorType::OutOfMemory, &[])
                 .map_err(Into::into);
-        }
-        let m = digest.expect("LibCrypto returns the digest");
+        };
+        let m = digest;
 
         // 4. Let Q be the ECDSA public key associated with key.
         let q = key.handle();
@@ -8195,10 +8149,9 @@ impl AlgorithmMethods for Ecdsa {
             // 5. Perform the ECDSA verifying process, as specified in [RFC6090], Section 5.4.3, with M as the received
             //    message, (r, s) as the signature and using params as the EC domain parameters, and Q as the public key.
             let verification = libcrypto_rust::ec_verify(curve, q, m.as_slice(), r, s);
-            if let Err(message) = verification {
-                return Err(Exception::Dom("OperationError", message));
-            }
-            result = verification.expect("LibCrypto returns the verification result");
+            let verification = verification
+                .map_err(|message| Exception::Dom("OperationError", Utf16String::from_utf8(message.message())))?;
+            result = verification;
         } else {
             // Otherwise, the namedCurve attribute of the [[algorithm]] internal slot of key is a value specified in an applicable specification:
             // Perform the ECDSA verification steps specified in that specification passing in M, signature, params and Q and resulting in an indication of whether or not the purported signature is valid.
@@ -8272,38 +8225,38 @@ impl AlgorithmMethods for Ecdsa {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let mut spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki
             //    is not equal to the id-ecPublicKey object identifier defined in [RFC5480], then throw a DataError.
-            if !spki.has_ec_public_key_oid() {
+            if spki.algorithm() != Some(KeyAlgorithm::Ec) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 5. If the parameters field of the algorithm AlgorithmIdentifier field of spki is absent, then throw a DataError.
-            if spki.ec_parameters().is_none() {
+            if !spki.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
             // 6. Let params be the parameters field of the algorithm AlgorithmIdentifier field of spki.
-            let ec_params = spki.ec_parameters().expect("the algorithm parameters are present");
+            let ec_params = spki.named_curve();
 
             // 7. If params is not an instance of the ECParameters ASN.1 type defined in [RFC5480] that specifies a namedCurve, then throw a DataError.
             // 8. Let namedCurve be a string whose initial value is undefined.
             let mut named_curve = Utf16String::default();
 
             // 9. If params is equivalent to the secp256r1 object identifier defined in [RFC5480]:
-            if ec_params == SECP256R1_OID {
+            if ec_params == Some(EcCurve::P256) {
                 // Set namedCurve "P-256".
                 named_curve = Utf16String::from_ascii(b"P-256");
             }
             // If params is equivalent to the secp384r1 object identifier defined in [RFC5480]:
-            else if ec_params == SECP384R1_OID {
+            else if ec_params == Some(EcCurve::P384) {
                 // Set namedCurve "P-384".
                 named_curve = Utf16String::from_ascii(b"P-384");
             }
             // If params is equivalent to the secp521r1 object identifier defined in [RFC5480]:
-            else if ec_params == SECP521R1_OID {
+            else if ec_params == Some(EcCurve::P521) {
                 // Set namedCurve "P-521".
                 named_curve = Utf16String::from_ascii(b"P-521");
             }
@@ -8314,7 +8267,7 @@ impl AlgorithmMethods for Ecdsa {
                 //    defined in Section 2.3.4 of [SEC1] using the subjectPublicKey field of spki. The uncompressed
                 //    point format MUST be supported.
                 // The uncompressed point format MUST be supported.
-                let public_key = spki.ec_key();
+                let public_key = spki.take_key();
 
                 // 2. If the implementation does not support the compressed point format and a compressed point is provided, throw a DataError.
                 // 3. If a decode error occurs or an identity point is found, throw a DataError.
@@ -8336,10 +8289,7 @@ impl AlgorithmMethods for Ecdsa {
             // 12. If the public key value is not a valid point on the Elliptic Curve identified
             //     by the namedCurve member of normalizedAlgorithm throw a DataError.
             let curve = ec_curve_from_name(&named_curve).expect("the named curve is supported");
-            let Ok(maybe_valid) = ec_key_is_valid(curve, key) else {
-                return Err(dom_error("DataError", b"Failed to verify key"));
-            };
-            if !maybe_valid {
+            if !libcrypto_rust::ec_key_is_valid(curve, key.handle()) {
                 return Err(dom_error("DataError", b"Invalid key"));
             }
 
@@ -8372,41 +8322,39 @@ impl AlgorithmMethods for Ecdsa {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let mut private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of privateKeyInfo
             //    is not equal to the id-ecPublicKey object identifier defined in [RFC5480], then throw a DataError.
-            if !private_key_info.has_ec_public_key_oid() {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Ec) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 5. If the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field
             //    of privateKeyInfo is not present, then throw a DataError.
-            if private_key_info.ec_parameters().is_none() {
+            if !private_key_info.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
             // 6. Let params be the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of privateKeyInfo.
-            let ec_params = private_key_info
-                .ec_parameters()
-                .expect("the algorithm parameters are present");
+            let ec_params = private_key_info.named_curve();
 
             // 7. If params is not an instance of the ECParameters ASN.1 type defined in [RFC5480] that specifies a namedCurve, then throw a DataError.
             // 8. Let namedCurve be a string whose initial value is undefined.
             let mut named_curve = Utf16String::default();
 
             // 9. If params is equivalent to the secp256r1 object identifier defined in [RFC5480]:
-            if ec_params == SECP256R1_OID {
+            if ec_params == Some(EcCurve::P256) {
                 // Set namedCurve "P-256".
                 named_curve = Utf16String::from_ascii(b"P-256");
             }
             // If params is equivalent to the secp384r1 object identifier defined in [RFC5480]:
-            else if ec_params == SECP384R1_OID {
+            else if ec_params == Some(EcCurve::P384) {
                 // Set namedCurve "P-384".
                 named_curve = Utf16String::from_ascii(b"P-384");
             }
             // If params is equivalent to the secp521r1 object identifier defined in [RFC5480]:
-            else if ec_params == SECP521R1_OID {
+            else if ec_params == Some(EcCurve::P521) {
                 // Set namedCurve "P-521".
                 named_curve = Utf16String::from_ascii(b"P-521");
             }
@@ -8418,16 +8366,13 @@ impl AlgorithmMethods for Ecdsa {
                 //    structure specified in Section 3 of [RFC5915], and exactData set to true.
                 // NOTE: We already did this in parse_a_private_key_info
                 // 2. If an error occurred while parsing, then throw a DataError.
-                let ec_private_key = private_key_info.ec_key();
+                let ec_private_key = private_key_info.take_key();
 
                 // 3. If the parameters field of ecPrivateKey is present, and is not an instance of the namedCurve ASN.1
                 //    type defined in [RFC5480], or does not contain the same object identifier as the parameters field
                 //    of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of privateKeyInfo, then throw a
                 //    DataError.
-                if !private_key_info.ec_private_parameters_match() {
-                    return Err(dom_error("DataError", b"Invalid algorithm parameters"));
-                }
-
+                // NB: LibCrypto rejects such an ecPrivateKey while parsing.
                 // 4. Let key be a new CryptoKey that represents the Elliptic Curve private key identified
                 //    by performing the conversion steps defined in Section 3 of [RFC5915] using ecPrivateKey.
                 key = CryptoKey::create(cx.vm(), ec_private_key);
@@ -8447,10 +8392,7 @@ impl AlgorithmMethods for Ecdsa {
             // 12. If the private key value is not a valid point on the Elliptic Curve identified by the namedCurve
             //     member of normalizedAlgorithm throw a DataError.
             let curve = ec_curve_from_name(&named_curve).expect("the named curve is supported");
-            let Ok(maybe_valid) = ec_key_is_valid(curve, key) else {
-                return Err(dom_error("DataError", b"Failed to verify key"));
-            };
-            if !maybe_valid {
+            if !libcrypto_rust::ec_key_is_valid(curve, key.handle()) {
                 return Err(dom_error("DataError", b"Invalid key"));
             }
 
@@ -8630,10 +8572,7 @@ impl AlgorithmMethods for Ecdsa {
             // 10. If the key value is not a valid point on the Elliptic Curve identified
             //     by the namedCurve member of normalizedAlgorithm throw a DataError.
             let curve = ec_curve_from_name(&named_curve).expect("the named curve is supported");
-            let Ok(maybe_valid) = ec_key_is_valid(curve, key) else {
-                return Err(dom_error("DataError", b"Failed to verify key"));
-            };
-            if !maybe_valid {
+            if !libcrypto_rust::ec_key_is_valid(curve, key.handle()) {
                 return Err(dom_error("DataError", b"Invalid key"));
             }
 
@@ -8752,13 +8691,13 @@ impl AlgorithmMethods for Ecdsa {
                 //    If the namedCurve attribute of the [[algorithm]] internal slot of key is "P-521":
                 //       Set parameters to the namedCurve choice with value equal to the object identifier secp521r1
                 //       defined in [RFC5480]
-                let maybe_data = ec_export_der(curve, key, true);
+                let maybe_data = libcrypto_rust::ec_export_der(curve, key.handle(), true).map(Bytes::new);
 
-                if maybe_data.is_err() {
+                let Ok(maybe_data) = maybe_data else {
                     return Err(dom_error("DataError", b"Failed to encode public key"));
-                }
+                };
 
-                data = maybe_data.expect("encoding succeeded");
+                data = maybe_data;
             } else {
                 // Otherwise:
                 // FIXME: 1. Perform any key export steps defined by other applicable specifications, passing format and
@@ -8813,13 +8752,13 @@ impl AlgorithmMethods for Ecdsa {
                 //    If the namedCurve attribute of the [[algorithm]] internal slot of key is "P-521":
                 //       Set parameters to the namedCurve choice with value equal to the object identifier secp521r1
                 //       defined in [RFC5480]
-                let maybe_data = ec_export_der(curve, key, false);
+                let maybe_data = libcrypto_rust::ec_export_der(curve, key.handle(), false).map(Bytes::new);
 
-                if maybe_data.is_err() {
+                let Ok(maybe_data) = maybe_data else {
                     return Err(dom_error("DataError", b"Failed to encode private key"));
-                }
+                };
 
-                data = maybe_data.expect("encoding succeeded");
+                data = maybe_data;
             } else {
                 // Otherwise:
                 // FIXME: 1. Perform any key export steps defined by other applicable specifications, passing format and
@@ -8876,7 +8815,8 @@ impl AlgorithmMethods for Ecdsa {
                 // 4. If the [[type]] internal slot of key is "private"
                 if key.key_type() == KeyType::Private {
                     // Set the d attribute of jwk according to the definition in Section 6.2.2.1 of JSON Web Algorithms [JWA].
-                    let d_bytes = ec_export_private_scalar(key)
+                    let d_bytes = libcrypto_rust::ec_export_private_scalar(key.handle())
+                        .map(Bytes::new)
                         .map_err(|_| dom_error("DataError", b"Failed to encode private key"))?;
                     jwk.d = Some(base64_url_bytes_encode(d_bytes.as_slice()));
                 }
@@ -8921,13 +8861,13 @@ impl AlgorithmMethods for Ecdsa {
                 //    "P-521":
                 //    Let data be a byte sequence representing the Elliptic Curve point Q represented by the [[handle]]
                 //    internal slot of key according to [SEC1] 2.3.3 using the uncompressed format.
-                let maybe_data = ec_export_uncompressed(key);
+                let maybe_data = libcrypto_rust::ec_export_uncompressed(key.handle()).map(Bytes::new);
 
-                if maybe_data.is_err() {
+                let Ok(maybe_data) = maybe_data else {
                     return Err(dom_error("DataError", b"Failed to encode public key"));
-                }
+                };
 
-                maybe_data.expect("encoding succeeded")
+                maybe_data
             } else {
                 // Perform any key export steps defined by other applicable specifications, passing format and
                 // the namedCurve attribute of the [[algorithm]] internal slot of key and obtaining namedCurve and data.
@@ -9180,7 +9120,7 @@ impl AlgorithmMethods for Ecdh {
                 Err(detail) => {
                     return Err(Exception::Dom(
                         "OperationError",
-                        libjs_rust::api::utf16_formatted("Failed to compute secret: {}", &[&detail]),
+                        libjs_rust::api::utf16_formatted("Failed to compute secret: {}", &[&detail.message()]),
                     ));
                 }
             };
@@ -9277,38 +9217,38 @@ impl AlgorithmMethods for Ecdh {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let mut spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki
             //    is not equal to the id-ecPublicKey object identifier defined in [RFC5480], then throw a DataError.
-            if !spki.has_ec_public_key_oid() {
+            if spki.algorithm() != Some(KeyAlgorithm::Ec) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 5. If the parameters field of the algorithm AlgorithmIdentifier field of spki is absent, then throw a DataError.
-            if spki.ec_parameters().is_none() {
+            if !spki.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
             // 6. Let params be the parameters field of the algorithm AlgorithmIdentifier field of spki.
-            let ec_params = spki.ec_parameters().expect("the algorithm parameters are present");
+            let ec_params = spki.named_curve();
 
             // 7. If params is not an instance of the ECParameters ASN.1 type defined in [RFC5480] that specifies a namedCurve, then throw a DataError.
             // 8. Let namedCurve be a string whose initial value is undefined.
             let mut named_curve = Utf16String::default();
 
             // 9. If params is equivalent to the secp256r1 object identifier defined in [RFC5480]:
-            if ec_params == SECP256R1_OID {
+            if ec_params == Some(EcCurve::P256) {
                 // Set namedCurve "P-256".
                 named_curve = Utf16String::from_ascii(b"P-256");
             }
             // If params is equivalent to the secp384r1 object identifier defined in [RFC5480]:
-            else if ec_params == SECP384R1_OID {
+            else if ec_params == Some(EcCurve::P384) {
                 // Set namedCurve "P-384".
                 named_curve = Utf16String::from_ascii(b"P-384");
             }
             // If params is equivalent to the secp521r1 object identifier defined in [RFC5480]:
-            else if ec_params == SECP521R1_OID {
+            else if ec_params == Some(EcCurve::P521) {
                 // Set namedCurve "P-521".
                 named_curve = Utf16String::from_ascii(b"P-521");
             }
@@ -9319,7 +9259,7 @@ impl AlgorithmMethods for Ecdh {
                 //    defined in Section 2.3.4 of [SEC1] to the subjectPublicKey field of spki. The uncompressed point
                 //    format MUST be supported.
                 // The uncompressed point format MUST be supported.
-                let public_key = spki.ec_key();
+                let public_key = spki.take_key();
 
                 // 2. If the implementation does not support the compressed point format and a compressed point is provided, throw a DataError.
                 // 3. If a decode error occurs or an identity point is found, throw a DataError.
@@ -9341,10 +9281,7 @@ impl AlgorithmMethods for Ecdh {
             // 12. If the key value is not a valid point on the Elliptic Curve identified
             //     by the namedCurve member of normalizedAlgorithm throw a DataError.
             let curve = ec_curve_from_name(&named_curve).expect("the named curve is supported");
-            let Ok(maybe_valid) = ec_key_is_valid(curve, key) else {
-                return Err(dom_error("DataError", b"Failed to verify key"));
-            };
-            if !maybe_valid {
+            if !libcrypto_rust::ec_key_is_valid(curve, key.handle()) {
                 return Err(dom_error("DataError", b"Invalid key"));
             }
 
@@ -9377,42 +9314,40 @@ impl AlgorithmMethods for Ecdh {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let mut private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of
             //    privateKeyInfo is not equal to the id-ecPublicKey object identifier defined in [RFC5480], throw a
             //    DataError.
-            if !private_key_info.has_ec_public_key_oid() {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Ec) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 5. If the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of
             //    privateKeyInfo is not present, throw a DataError.
-            if private_key_info.ec_parameters().is_none() {
+            if !private_key_info.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
             // 6. Let params be the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of privateKeyInfo.
-            let ec_params = private_key_info
-                .ec_parameters()
-                .expect("the algorithm parameters are present");
+            let ec_params = private_key_info.named_curve();
 
             // 7. If params is not an instance of the ECParameters ASN.1 type defined in [RFC5480] that specifies a namedCurve, then throw a DataError.
             // 8. Let namedCurve be a string whose initial value is undefined.
             let mut named_curve = Utf16String::default();
 
             // 9. If params is equivalent to the secp256r1 object identifier defined in [RFC5480]:
-            if ec_params == SECP256R1_OID {
+            if ec_params == Some(EcCurve::P256) {
                 // Set namedCurve to "P-256".
                 named_curve = Utf16String::from_ascii(b"P-256");
             }
             // If params is equivalent to the secp384r1 object identifier defined in [RFC5480]:
-            else if ec_params == SECP384R1_OID {
+            else if ec_params == Some(EcCurve::P384) {
                 // Set namedCurve to "P-384".
                 named_curve = Utf16String::from_ascii(b"P-384");
             }
             // If params is equivalent to the secp521r1 object identifier defined in [RFC5480]:
-            else if ec_params == SECP521R1_OID {
+            else if ec_params == Some(EcCurve::P521) {
                 // Set namedCurve to "P-521".
                 named_curve = Utf16String::from_ascii(b"P-521");
             }
@@ -9424,16 +9359,13 @@ impl AlgorithmMethods for Ecdh {
                 //    structure specified in Section 3 of [RFC5915], and exactData set to true.
                 // NOTE: We already did this in parse_a_private_key_info
                 // 2. If an error occurred while parsing, then throw a DataError.
-                let ec_private_key = private_key_info.ec_key();
+                let ec_private_key = private_key_info.take_key();
 
                 // 3. If the parameters field of ecPrivateKey is present, and is not an instance
                 //    of the namedCurve ASN.1 type defined in [RFC5480], or does not contain
                 //    the same object identifier as the parameters field of the privateKeyAlgorithm
                 //    PrivateKeyAlgorithmIdentifier field of privateKeyInfo, throw a DataError.
-                if !private_key_info.ec_private_parameters_match() {
-                    return Err(dom_error("DataError", b"Invalid algorithm parameters"));
-                }
-
+                // NB: LibCrypto rejects such an ecPrivateKey while parsing.
                 // 4. Let key be a new CryptoKey that represents the Elliptic Curve private key identified
                 //    by performing the conversion steps defined in Section 3 of [RFC5915] using ecPrivateKey.
                 key = CryptoKey::create(cx.vm(), ec_private_key);
@@ -9453,10 +9385,7 @@ impl AlgorithmMethods for Ecdh {
             // 12. If the key value is not a valid point on the Elliptic Curve identified
             //     by the namedCurve member of normalizedAlgorithm throw a DataError.
             let curve = ec_curve_from_name(&named_curve).expect("the named curve is supported");
-            let Ok(maybe_valid) = ec_key_is_valid(curve, key) else {
-                return Err(dom_error("DataError", b"Failed to verify key"));
-            };
-            if !maybe_valid {
+            if !libcrypto_rust::ec_key_is_valid(curve, key.handle()) {
                 return Err(dom_error("DataError", b"Invalid key"));
             }
 
@@ -9598,10 +9527,7 @@ impl AlgorithmMethods for Ecdh {
             // 11. If the key value is not a valid point on the Elliptic Curve identified
             //     by the namedCurve member of normalizedAlgorithm throw a DataError.
             let curve = ec_curve_from_name(&named_curve).expect("the named curve is supported");
-            let Ok(maybe_valid) = ec_key_is_valid(curve, key) else {
-                return Err(dom_error("DataError", b"Failed to verify key"));
-            };
-            if !maybe_valid {
+            if !libcrypto_rust::ec_key_is_valid(curve, key.handle()) {
                 return Err(dom_error("DataError", b"Invalid key"));
             }
 
@@ -9714,13 +9640,13 @@ impl AlgorithmMethods for Ecdh {
                 //    If the namedCurve attribute of the [[algorithm]] internal slot of key is "P-521":
                 //       Set parameters to the namedCurve choice with value equal to the object identifier secp521r1
                 //       defined in [RFC5480]
-                let maybe_data = ec_export_der(curve, key, true);
+                let maybe_data = libcrypto_rust::ec_export_der(curve, key.handle(), true).map(Bytes::new);
 
-                if maybe_data.is_err() {
+                let Ok(maybe_data) = maybe_data else {
                     return Err(dom_error("DataError", b"Failed to encode public key"));
-                }
+                };
 
-                data = maybe_data.expect("encoding succeeded");
+                data = maybe_data;
             } else {
                 // Otherwise:
                 // FIXME: 1. Perform any key export steps defined by other applicable specifications, passing format and
@@ -9775,13 +9701,13 @@ impl AlgorithmMethods for Ecdh {
                 //    If the namedCurve attribute of the [[algorithm]] internal slot of key is "P-521":
                 //       Set parameters to the namedCurve choice with value equal to the object identifier secp521r1
                 //       defined in [RFC5480]
-                let maybe_data = ec_export_der(curve, key, false);
+                let maybe_data = libcrypto_rust::ec_export_der(curve, key.handle(), false).map(Bytes::new);
 
-                if maybe_data.is_err() {
+                let Ok(maybe_data) = maybe_data else {
                     return Err(dom_error("DataError", b"Failed to encode private key"));
-                }
+                };
 
-                data = maybe_data.expect("encoding succeeded");
+                data = maybe_data;
             } else {
                 // Otherwise:
                 // FIXME: 1. Perform any key export steps defined by other applicable specifications, passing format and
@@ -9838,7 +9764,8 @@ impl AlgorithmMethods for Ecdh {
                 // 4. If the [[type]] internal slot of key is "private"
                 if key.key_type() == KeyType::Private {
                     // Set the d attribute of jwk according to the definition in Section 6.2.2.1 of JSON Web Algorithms [JWA].
-                    let d_bytes = ec_export_private_scalar(key)
+                    let d_bytes = libcrypto_rust::ec_export_private_scalar(key.handle())
+                        .map(Bytes::new)
                         .map_err(|_| dom_error("DataError", b"Failed to encode private key"))?;
                     jwk.d = Some(base64_url_bytes_encode(d_bytes.as_slice()));
                 }
@@ -9884,13 +9811,13 @@ impl AlgorithmMethods for Ecdh {
                 //    Let data be the byte sequence that represents the Elliptic Curve public key represented by the
                 //    [[handle]] internal slot of key according to the encoding rules specified in Section 2.3.3 of
                 //    [SEC1] and using the uncompressed form.
-                let maybe_data = ec_export_uncompressed(key);
+                let maybe_data = libcrypto_rust::ec_export_uncompressed(key.handle()).map(Bytes::new);
 
-                if maybe_data.is_err() {
+                let Ok(maybe_data) = maybe_data else {
                     return Err(dom_error("DataError", b"Failed to encode public key"));
-                }
+                };
 
-                maybe_data.expect("encoding succeeded")
+                maybe_data
             } else {
                 // Perform any key export steps defined by other applicable specifications, passing format and
                 // the namedCurve attribute of the [[algorithm]] internal slot of key and obtaining namedCurve and data.
@@ -9938,38 +9865,36 @@ impl Ed448Params {
 }
 
 fn parse_octet_string(vm: &Vm, bytes: &[u8]) -> WebIdlResult<Vec<u8>> {
-    let Asn1Value::OctetString(octets) = parse_an_asn1_structure(bytes, Asn1Structure::OctetString, true)
-        .map_err(|message| Exception::Dom("DataError", message))?
-    else {
-        unreachable!("the ASN.1 structure is an octet string")
-    };
+    let octets = parse_an_asn1_structure(
+        bytes,
+        libcrypto_rust::parse_octet_string,
+        "Read of kind OctetString failed: {}",
+        true,
+    )
+    .map_err(|message| Exception::Dom("DataError", message))?;
     copy_bytes(vm, octets)
 }
 
 fn okp_generate_private_key(curve: OkpCurve) -> Result<Bytes, ()> {
-    let key = libcrypto_rust::okp_generate_private_key(curve).map(Bytes::new);
-    if key.is_err() {
-        return Err(());
-    }
-    Ok(key.expect("LibCrypto returns the private key"))
+    libcrypto_rust::okp_generate_private_key(curve)
+        .map(Bytes::new)
+        .map_err(|_| ())
 }
 
 fn okp_generate_public_key(curve: OkpCurve, private_key: &[u8]) -> Result<Bytes, ()> {
-    let key = libcrypto_rust::okp_generate_public_key(curve, private_key).map(Bytes::new);
-    if key.is_err() {
-        return Err(());
-    }
-    Ok(key.expect("LibCrypto returns the public key"))
+    libcrypto_rust::okp_generate_public_key(curve, private_key)
+        .map(Bytes::new)
+        .map_err(|_| ())
 }
 
 fn okp_export_der(vm: &Vm, curve: OkpCurve, is_public: bool, key: &[u8]) -> WebIdlResult<Bytes> {
     let result = libcrypto_rust::okp_export_der(curve, is_public, key).map(Bytes::new);
-    if result.is_err() {
+    let Ok(result) = result else {
         return vm
             .throw_completion(ErrorKind::InternalError, ErrorType::OutOfMemory, &[])
             .map_err(Into::into);
-    }
-    Ok(result.expect("LibCrypto returns the DER bytes"))
+    };
+    Ok(result)
 }
 
 fn out_of_memory(vm: &Vm) -> Exception {
@@ -10093,16 +10018,16 @@ impl AlgorithmMethods for Ed25519 {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki
             //    is not equal to the id-Ed25519 object identifier defined in [RFC8410], then throw a DataError.
-            if !spki.has_okp_oid(OkpCurve::Ed25519) {
+            if spki.algorithm() != Some(KeyAlgorithm::Okp(OkpCurve::Ed25519)) {
                 return Err(dom_error("DataError", b"Invalid algorithm identifier"));
             }
 
             // 5. If the parameters field of the algorithm AlgorithmIdentifier field of spki is present, then throw a DataError.
-            if spki.ec_parameters().is_some() {
+            if spki.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -10139,17 +10064,17 @@ impl AlgorithmMethods for Ed25519 {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field
             //    of privateKeyInfo is not equal to the id-Ed25519 object identifier defined in [RFC8410], then throw a DataError.
-            if !private_key_info.has_okp_oid(OkpCurve::Ed25519) {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Okp(OkpCurve::Ed25519)) {
                 return Err(dom_error("DataError", b"Invalid algorithm identifier"));
             }
 
             // 5. If the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of privateKeyInfo is present,
             //    then throw a DataError.
-            if private_key_info.ec_parameters().is_some() {
+            if private_key_info.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -10515,12 +10440,11 @@ impl AlgorithmMethods for Ed25519 {
 
         let signature = libcrypto_rust::okp_sign(OkpCurve::Ed25519, key.okp_handle_bytes(), message.as_slice(), &[])
             .map(Bytes::new);
-        if signature.is_err() {
+        let Ok(signature) = signature else {
             return Err(dom_error("OperationError", b"Failed to sign message"));
-        }
+        };
 
         // 3. Return result.
-        let signature = signature.expect("LibCrypto returns the signature");
         let result = Bytes::new(copy_bytes(cx.vm(), signature.as_slice())?);
         Ok(result)
     }
@@ -10555,12 +10479,11 @@ impl AlgorithmMethods for Ed25519 {
             message.as_slice(),
             &[],
         );
-        if let Err(error) = verified {
-            return Err(Exception::Dom("OperationError", error));
-        }
+        let verified =
+            verified.map_err(|error| Exception::Dom("OperationError", Utf16String::from_utf8(error.message())))?;
 
         // 6. Return result.
-        Ok(verified.expect("LibCrypto returns the verification result"))
+        Ok(verified)
     }
 }
 
@@ -10694,16 +10617,16 @@ impl AlgorithmMethods for Ed448 {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki
             //    is not equal to the id-Ed448 object identifier defined in [RFC8410], then throw a DataError.
-            if !spki.has_okp_oid(OkpCurve::Ed448) {
+            if spki.algorithm() != Some(KeyAlgorithm::Okp(OkpCurve::Ed448)) {
                 return Err(dom_error("DataError", b"Invalid algorithm identifier"));
             }
 
             // 5. If the parameters field of the algorithm AlgorithmIdentifier field of spki is present, then throw a DataError.
-            if spki.ec_parameters().is_some() {
+            if spki.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -10741,17 +10664,17 @@ impl AlgorithmMethods for Ed448 {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field
             //    of privateKeyInfo is not equal to the id-Ed448 object identifier defined in [RFC8410], then throw a DataError.
-            if !private_key_info.has_okp_oid(OkpCurve::Ed448) {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Okp(OkpCurve::Ed448)) {
                 return Err(dom_error("DataError", b"Invalid algorithm identifier"));
             }
 
             // 5. If the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of privateKeyInfo is present,
             //    then throw a DataError.
-            if private_key_info.ec_parameters().is_some() {
+            if private_key_info.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -11120,13 +11043,13 @@ impl AlgorithmMethods for Ed448 {
         //    with message as M and context as C, using the Ed448 private key associated with key.
         let signature = libcrypto_rust::okp_sign(OkpCurve::Ed448, key.okp_handle_bytes(), message.as_slice(), context)
             .map(Bytes::new);
-        if signature.is_err() {
+        let Ok(signature) = signature else {
             return Err(dom_error("OperationError", b"Failed to sign message"));
-        }
+        };
 
         // 5. Return a new ArrayBuffer associated with the relevant global object of this [HTML],
         //    and containing the bytes of the signature resulting from performing the Ed448 signing process.
-        Ok(signature.expect("LibCrypto returns the signature"))
+        Ok(signature)
     }
 
     // https://wicg.github.io/webcrypto-secure-curves/#ed448-operations
@@ -11171,14 +11094,13 @@ impl AlgorithmMethods for Ed448 {
             message.as_slice(),
             context,
         );
-        if let Err(error) = verified {
-            return Err(Exception::Dom("OperationError", error));
-        }
+        let verified =
+            verified.map_err(|error| Exception::Dom("OperationError", Utf16String::from_utf8(error.message())))?;
 
         // 7. Let result be a boolean with the value true if the signature is valid
         //    and the value false otherwise.
         // 8. Return result.
-        Ok(verified.expect("LibCrypto returns the verification result"))
+        Ok(verified)
     }
 }
 
@@ -11270,11 +11192,9 @@ impl AlgorithmMethods for X25519 {
 
         let secret =
             libcrypto_rust::okp_compute_coordinate(OkpCurve::X25519, private_key, public_key_data).map(Bytes::new);
-        if secret.is_err() {
+        let Ok(secret) = secret else {
             return Err(dom_error("OperationError", b"Failed to compute secret"));
-        }
-
-        let secret = secret.expect("LibCrypto returns the shared secret");
+        };
 
         // 8. If secret is the all-zero value, then throw a OperationError.
         //    This check must be performed in constant-time, as per [RFC7748] Section 6.1.
@@ -11424,16 +11344,16 @@ impl AlgorithmMethods for X25519 {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki
             //    is not equal to the id-X25519 object identifier defined in [RFC8410], then throw a DataError.
-            if !spki.has_okp_oid(OkpCurve::X25519) {
+            if spki.algorithm() != Some(KeyAlgorithm::Okp(OkpCurve::X25519)) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 5. If the parameters field of the algorithm AlgorithmIdentifier field of spki is present, then throw a DataError.
-            if spki.ec_parameters().is_some() {
+            if spki.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -11470,16 +11390,16 @@ impl AlgorithmMethods for X25519 {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of privateKeyInfo
             //    is not equal to the id-X25519 object identifier defined in [RFC8410], then throw a DataError.
-            if !private_key_info.has_okp_oid(OkpCurve::X25519) {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Okp(OkpCurve::X25519)) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 5. If the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of privateKeyInfo is present, then throw a DataError.
-            if private_key_info.ec_parameters().is_some() {
+            if private_key_info.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -11870,11 +11790,9 @@ impl AlgorithmMethods for X448 {
 
         let secret =
             libcrypto_rust::okp_compute_coordinate(OkpCurve::X448, private_key, public_key_data).map(Bytes::new);
-        if secret.is_err() {
+        let Ok(secret) = secret else {
             return Err(dom_error("OperationError", b"Failed to compute secret"));
-        }
-
-        let secret = secret.expect("LibCrypto returns the shared secret");
+        };
 
         // 6. If secret is the all-zero value, then throw a OperationError. This check must be performed in constant-time, as per [RFC7748] Section 6.2.
         // NB: ORing all the bytes avoids an early exit on a nonzero byte.
@@ -12132,15 +12050,15 @@ impl AlgorithmMethods for X448 {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki is not equal to the id-X448 object identifier defined in [RFC8410], then throw a DataError.
-            if !spki.has_okp_oid(OkpCurve::X448) {
+            if spki.algorithm() != Some(KeyAlgorithm::Okp(OkpCurve::X448)) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 5. If the parameters field of the algorithm AlgorithmIdentifier field of spki is present, then throw a DataError.
-            if spki.ec_parameters().is_some() {
+            if spki.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -12180,15 +12098,15 @@ impl AlgorithmMethods for X448 {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of privateKeyInfo is not equal to the id-X448 object identifier defined in [RFC8410], then throw a DataError.
-            if !private_key_info.has_okp_oid(OkpCurve::X448) {
+            if private_key_info.algorithm() != Some(KeyAlgorithm::Okp(OkpCurve::X448)) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 5. If the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of privateKeyInfo is present, then throw a DataError.
-            if private_key_info.ec_parameters().is_some() {
+            if private_key_info.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -12408,10 +12326,6 @@ impl AlgorithmMethods for X448 {
 
 type ContextParams = Ed448Params;
 
-const ML_DSA_44_OID: [u32; 9] = [2, 16, 840, 1, 101, 3, 4, 3, 17];
-const ML_DSA_65_OID: [u32; 9] = [2, 16, 840, 1, 101, 3, 4, 3, 18];
-const ML_DSA_87_OID: [u32; 9] = [2, 16, 840, 1, 101, 3, 4, 3, 19];
-
 fn mldsa_size(name: &Utf16String) -> MlDsaSize {
     if matches!(name.as_units(), Utf16StringUnits::Ascii(b"ML-DSA-44")) {
         MlDsaSize::MlDsa44
@@ -12432,7 +12346,7 @@ fn mldsa_read_public_key(vm: &Vm, size: MlDsaSize, bytes: &[u8]) -> WebIdlResult
     Ok(CryptoKey::create(vm, key))
 }
 
-fn generate_mldsa_key_pair_from_seed(name: &Utf16String, seed: &Bytes) -> Result<KeyPair, Utf16String> {
+fn generate_mldsa_key_pair_from_seed(name: &Utf16String, seed: &Bytes) -> Result<KeyPair, CryptoError> {
     if matches!(name.as_units(), Utf16StringUnits::Ascii(b"ML-DSA-44")) {
         return libcrypto_rust::mldsa_generate_key_pair(MlDsaSize::MlDsa44, seed.as_slice());
     }
@@ -12445,12 +12359,10 @@ fn generate_mldsa_key_pair_from_seed(name: &Utf16String, seed: &Bytes) -> Result
     unreachable!("the name identifies an ML-DSA parameter set")
 }
 
-fn mldsa_export_der(vm: &Vm, key: Ref<CryptoKey>, is_public: bool, oid: &[u32]) -> WebIdlResult<Bytes> {
-    let result = libcrypto_rust::mldsa_export_der(key.handle(), is_public, oid).map(Bytes::new);
-    if result.is_err() {
-        return Err(out_of_memory(vm));
-    }
-    Ok(result.expect("LibCrypto returns the DER bytes"))
+fn ml_export_der(vm: &Vm, key: Ref<CryptoKey>, is_public: bool, algorithm: KeyAlgorithm) -> WebIdlResult<Bytes> {
+    libcrypto_rust::ml_export_der(key.handle(), is_public, algorithm)
+        .map(Bytes::new)
+        .map_err(|_| out_of_memory(vm))
 }
 
 #[derive(Clone, Trace)]
@@ -12526,12 +12438,12 @@ impl AlgorithmMethods for MlDsa {
         let signature = libcrypto_rust::mldsa_sign(size, key.handle(), message.as_slice(), context).map(Bytes::new);
 
         // 5. If the ML-DSA.Sign algorithm returned an error, throw an OperationError.
-        if signature.is_err() {
+        let Ok(signature) = signature else {
             return Err(dom_error("OperationError", b"Failed to sign message"));
-        }
+        };
 
         // 6. Return result.
-        Ok(signature.expect("LibCrypto returns a signature"))
+        Ok(signature)
     }
 
     // https://wicg.github.io/webcrypto-modern-algos/#ml-dsa-operations-verify
@@ -12590,12 +12502,12 @@ impl AlgorithmMethods for MlDsa {
             libcrypto_rust::mldsa_verify(size, key.handle(), message.as_slice(), signature.as_slice(), context);
 
         // 5. If the ML-DSA.Verify algorithm returned an error, throw an OperationError.
-        if verified.is_err() {
+        let Ok(verified) = verified else {
             return Err(dom_error("OperationError", b"Failed to verify message"));
-        }
+        };
 
         // 6. Return result.
-        Ok(verified.expect("LibCrypto returns the verification result"))
+        Ok(verified)
     }
 
     // https://wicg.github.io/webcrypto-modern-algos/#ml-dsa-operations-generate-key
@@ -12711,22 +12623,22 @@ impl AlgorithmMethods for MlDsa {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the name member of normalizedAlgorithm is "ML-DSA-44":
             let expected_oid = if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-DSA-44")) {
                 // Let expectedOid be id-ml-dsa-44 (2.16.840.1.101.3.4.3.17).
-                ML_DSA_44_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa44)
             }
             // If the name member of normalizedAlgorithm is "ML-DSA-65":
             else if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-DSA-65")) {
                 // Let expectedOid be id-ml-dsa-65 (2.16.840.1.101.3.4.3.18).
-                ML_DSA_65_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa65)
             }
             // If the name member of normalizedAlgorithm is "ML-DSA-87":
             else if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-DSA-87")) {
                 // Let expectedOid be id-ml-dsa-87 (2.16.840.1.101.3.4.3.19).
-                ML_DSA_87_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa87)
             }
             // Otherwise:
             else {
@@ -12736,12 +12648,12 @@ impl AlgorithmMethods for MlDsa {
 
             // 5. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki is not equal
             //    to expectedOid, then throw a DataError.
-            if spki.oid() != expected_oid {
+            if spki.algorithm() != Some(expected_oid) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 6. If the parameters field of the algorithm AlgorithmIdentifier field of spki is present, then throw a DataError.
-            if spki.ec_parameters().is_some() {
+            if spki.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -12778,7 +12690,7 @@ impl AlgorithmMethods for MlDsa {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let mut private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the name member of normalizedAlgorithm is "ML-DSA-44":
             //    Let expectedOid be id-ml-dsa-44 (2.16.840.1.101.3.4.3.17). Let asn1Structure be the ASN.1
@@ -12792,24 +12704,24 @@ impl AlgorithmMethods for MlDsa {
             // 4. Otherwise:
             //    throw a NotSupportedError.
             let expected_oid = if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-DSA-44")) {
-                ML_DSA_44_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa44)
             } else if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-DSA-65")) {
-                ML_DSA_65_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa65)
             } else if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-DSA-87")) {
-                ML_DSA_87_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa87)
             } else {
                 return Err(dom_error("NotSupportedError", b"Invalid algorithm"));
             };
 
             // 5. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of
             //    privateKeyInfo is not equal to expectedOid, then throw a DataError.
-            if private_key_info.oid() != expected_oid {
+            if private_key_info.algorithm() != Some(expected_oid) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 6. If the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of
             //    privateKeyInfo is present, then throw a DataError.
-            if private_key_info.ec_parameters().is_some() {
+            if private_key_info.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -12818,13 +12730,10 @@ impl AlgorithmMethods for MlDsa {
             //    true.
             // NOTE: We already did this in parse_a_private_key_info
             // 8. If an error occurred while parsing, then throw a DataError.
-            let ml_dsa_private_key = private_key_info.mldsa_private_key();
-
             // 9. If mlDsaPrivateKey represents an ML-DSA key in the expandedKey format, or if mlDsaPrivateKey
             //    represents an ML-DSA key in the both format and the both format is not supported, throw a
             //    NotSupportedError.
-            // NB: A key in the expandedKey format has no seed.
-            if !libcrypto_rust::ml_private_key_has_seed(&ml_dsa_private_key) {
+            if private_key_info.is_ml_expanded_key_form() {
                 return Err(dom_error(
                     "NotSupportedError",
                     b"ML-DSA private keys in the expandedKey format are not supported",
@@ -12836,7 +12745,7 @@ impl AlgorithmMethods for MlDsa {
             // NB: LibCrypto checks the correspondence between the seed and expanded key while parsing.
 
             // 11. Let key be a new CryptoKey that represents the ML-DSA private key identified by mlDsaPrivateKey.
-            key = CryptoKey::create(cx.vm(), ml_dsa_private_key);
+            key = CryptoKey::create(cx.vm(), private_key_info.take_key());
 
             // 12. Set the [[type]] internal slot of key to "private"
             key.set_type(KeyType::Private);
@@ -12904,7 +12813,7 @@ impl AlgorithmMethods for MlDsa {
             let key_pair = maybe_key_pair.map_err(|error| {
                 Exception::Dom(
                     "OperationError",
-                    libjs_rust::api::utf16_formatted("Key generation failed: {}", &[&error]),
+                    libjs_rust::api::utf16_formatted("Key generation failed: {}", &[&error.message()]),
                 )
             })?;
             let private_key = key_pair.private_key;
@@ -12984,7 +12893,7 @@ impl AlgorithmMethods for MlDsa {
                 let key_pair = maybe_key_pair.map_err(|error| {
                     Exception::Dom(
                         "DataError",
-                        libjs_rust::api::utf16_formatted("Invalid seed: {}", &[&error]),
+                        libjs_rust::api::utf16_formatted("Invalid seed: {}", &[&error.message()]),
                     )
                 })?;
                 let KeyPair {
@@ -13079,16 +12988,16 @@ impl AlgorithmMethods for MlDsa {
             //             throw a NotSupportedError.
             //    * Set the subjectPublicKey field to keyData.
             let algorithm_oid = if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-DSA-44")) {
-                ML_DSA_44_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa44)
             } else if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-DSA-65")) {
-                ML_DSA_65_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa65)
             } else if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-DSA-87")) {
-                ML_DSA_87_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa87)
             } else {
                 return Err(dom_error("NotSupportedError", b"Invalid algorithm"));
             };
 
-            let data = mldsa_export_der(vm, key, true, &algorithm_oid)?;
+            let data = ml_export_der(vm, key, true, algorithm_oid)?;
 
             // 4. Let result be the result of DER-encoding data.
             ExportKeyResult::Bytes(data)
@@ -13134,16 +13043,16 @@ impl AlgorithmMethods for MlDsa {
             //          Otherwise:
             //             throw a NotSupportedError.
             let algorithm_oid = if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-DSA-44")) {
-                ML_DSA_44_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa44)
             } else if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-DSA-65")) {
-                ML_DSA_65_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa65)
             } else if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-DSA-87")) {
-                ML_DSA_87_OID
+                KeyAlgorithm::MlDsa(MlDsaSize::MlDsa87)
             } else {
                 return Err(dom_error("NotSupportedError", b"Invalid algorithm"));
             };
 
-            let data = mldsa_export_der(vm, key, false, &algorithm_oid)?;
+            let data = ml_export_der(vm, key, false, algorithm_oid)?;
 
             // 4. Let result be the result of DER-encoding data.
             ExportKeyResult::Bytes(data)
@@ -13172,7 +13081,7 @@ impl AlgorithmMethods for MlDsa {
             // 2. Let data be a byte sequence containing the ξ seed variable of the key represented by the [[handle]] internal slot of key.
             // Note: The ξ value is the seed from which the key was generated or imported, as used by
             //       ML-DSA.KeyGen_internal in Section 6.1 of [FIPS-204].
-            let seed = libcrypto_rust::mldsa_seed_bytes(handle).map_err(|_| out_of_memory(vm))?;
+            let seed = libcrypto_rust::ml_seed_bytes(handle).map_err(|_| out_of_memory(vm))?;
             let data = Bytes::new(seed);
 
             // 3. Let result be data.
@@ -13198,7 +13107,7 @@ impl AlgorithmMethods for MlDsa {
             // 6. -> If the [[type]] internal slot of key is "private":
             //       Set the priv attribute of jwk to the base64url encoded seed represented by the [[handle]] internal slot of key.
             if key.key_type() == KeyType::Private {
-                let seed = libcrypto_rust::mldsa_seed_bytes(handle).map_err(|_| out_of_memory(vm))?;
+                let seed = libcrypto_rust::ml_seed_bytes(handle).map_err(|_| out_of_memory(vm))?;
                 jwk.r#priv = Some(base64_url_bytes_encode(&seed));
             }
 
@@ -13231,23 +13140,11 @@ impl AlgorithmMethods for MlDsa {
     }
 }
 
-const ML_KEM_512_OID: [u32; 9] = [2, 16, 840, 1, 101, 3, 4, 4, 1];
-const ML_KEM_768_OID: [u32; 9] = [2, 16, 840, 1, 101, 3, 4, 4, 2];
-const ML_KEM_1024_OID: [u32; 9] = [2, 16, 840, 1, 101, 3, 4, 4, 3];
-
 fn mlkem_read_public_key(vm: &Vm, bytes: &[u8]) -> WebIdlResult<Ref<CryptoKey>> {
     let Some(key) = libcrypto_rust::mlkem_read_public_key(bytes) else {
         return Err(dom_error("DataError", b"Invalid key"));
     };
     Ok(CryptoKey::create(vm, key))
-}
-
-fn mlkem_export_der(vm: &Vm, key: Ref<CryptoKey>, is_public: bool, oid: &[u32]) -> WebIdlResult<Bytes> {
-    let result = libcrypto_rust::mlkem_export_der(key.handle(), is_public, oid).map(Bytes::new);
-    if result.is_err() {
-        return Err(out_of_memory(vm));
-    }
-    Ok(result.expect("LibCrypto returns the DER bytes"))
 }
 
 #[derive(Clone, Trace)]
@@ -13294,7 +13191,7 @@ impl AlgorithmMethods for MlKem {
         let key_pair = maybe_key_pair.map_err(|error| {
             Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Key generation failed: {}", &[&error]),
+                libjs_rust::api::utf16_formatted("Key generation failed: {}", &[&error.message()]),
             )
         })?;
 
@@ -13385,22 +13282,22 @@ impl AlgorithmMethods for MlKem {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let spki = parse_key_info(&key_data, Asn1Structure::SubjectPublicKeyInfo)?;
+            let spki = parse_a_subject_public_key_info(key_data.as_slice())?;
 
             // 4. If the name member of normalizedAlgorithm is "ML-KEM-512":
             let expected_oid = if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-KEM-512")) {
                 // Let expectedOid be id-alg-ml-kem-512 (2.16.840.1.101.3.4.4.1).
-                ML_KEM_512_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem512)
             }
             // If the name member of normalizedAlgorithm is "ML-KEM-768":
             else if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-KEM-768")) {
                 // Let expectedOid be id-alg-ml-kem-768 (2.16.840.1.101.3.4.4.2).
-                ML_KEM_768_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem768)
             }
             // If the name member of normalizedAlgorithm is "ML-KEM-1024":
             else if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-KEM-1024")) {
                 // Let expectedOid be id-alg-ml-kem-1024 (2.16.840.1.101.3.4.4.3).
-                ML_KEM_1024_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem1024)
             }
             // Otherwise:
             else {
@@ -13410,12 +13307,12 @@ impl AlgorithmMethods for MlKem {
 
             // 5. If the algorithm object identifier field of the algorithm AlgorithmIdentifier field of spki is not equal
             //    to expectedOid, then throw a DataError.
-            if spki.oid() != expected_oid {
+            if spki.algorithm() != Some(expected_oid) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 6. If the parameters field of the algorithm AlgorithmIdentifier field of spki is present, then throw a DataError.
-            if spki.ec_parameters().is_some() {
+            if spki.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -13452,7 +13349,7 @@ impl AlgorithmMethods for MlKem {
             let ImportKeyData::Bytes(key_data) = key_data else {
                 unreachable!("DER key data contains bytes")
             };
-            let private_key_info = parse_key_info(&key_data, Asn1Structure::PrivateKeyInfo)?;
+            let mut private_key_info = parse_a_private_key_info(key_data.as_slice())?;
 
             // 4. If the name member of normalizedAlgorithm is "ML-KEM-512":
             //    Let expectedOid be id-alg-ml-kem-512 (2.16.840.1.101.3.4.4.1). Let asn1Structure be the ASN.1
@@ -13466,24 +13363,24 @@ impl AlgorithmMethods for MlKem {
             // 4. Otherwise:
             //    throw a NotSupportedError.
             let expected_oid = if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-KEM-512")) {
-                ML_KEM_512_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem512)
             } else if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-KEM-768")) {
-                ML_KEM_768_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem768)
             } else if matches!(params.name.as_units(), Utf16StringUnits::Ascii(b"ML-KEM-1024")) {
-                ML_KEM_1024_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem1024)
             } else {
                 return Err(dom_error("NotSupportedError", b"Invalid algorithm"));
             };
 
             // 5. If the algorithm object identifier field of the privateKeyAlgorithm PrivateKeyAlgorithm field of
             //    privateKeyInfo is not equal to expectedOid, then throw a DataError.
-            if private_key_info.oid() != expected_oid {
+            if private_key_info.algorithm() != Some(expected_oid) {
                 return Err(dom_error("DataError", b"Invalid algorithm"));
             }
 
             // 6. If the parameters field of the privateKeyAlgorithm PrivateKeyAlgorithmIdentifier field of
             //    privateKeyInfo is present, then throw a DataError.
-            if private_key_info.ec_parameters().is_some() {
+            if private_key_info.has_parameters() {
                 return Err(dom_error("DataError", b"Invalid algorithm parameters"));
             }
 
@@ -13492,13 +13389,10 @@ impl AlgorithmMethods for MlKem {
             //    true.
             // NOTE: We already did this in parse_a_private_key_info
             // 8. If an error occurred while parsing, then throw a DataError.
-            let ml_kem_private_key = private_key_info.mlkem_private_key();
-
             // 9. If mlKemPrivateKey represents an ML-KEM key in the expandedKey format, or if mlKemPrivateKey
             //    represents an ML-KEM key in the both format and the both format is not supported, throw a
             //    NotSupportedError.
-            // NB: A key in the expandedKey format has no seed.
-            if !libcrypto_rust::ml_private_key_has_seed(&ml_kem_private_key) {
+            if private_key_info.is_ml_expanded_key_form() {
                 return Err(dom_error(
                     "NotSupportedError",
                     b"ML-KEM private keys in the expandedKey format are not supported",
@@ -13510,7 +13404,7 @@ impl AlgorithmMethods for MlKem {
             // NB: LibCrypto checks the correspondence between the seed and expanded key while parsing.
 
             // 11. Let key be a new CryptoKey that represents the ML-KEM private key identified by mlKemPrivateKey.
-            key = CryptoKey::create(cx.vm(), ml_kem_private_key);
+            key = CryptoKey::create(cx.vm(), private_key_info.take_key());
 
             // 12. Set the [[type]] internal slot of key to "private"
             key.set_type(KeyType::Private);
@@ -13590,7 +13484,7 @@ impl AlgorithmMethods for MlKem {
             let key_pair = maybe_key_pair.map_err(|error| {
                 Exception::Dom(
                     "OperationError",
-                    libjs_rust::api::utf16_formatted("Key generation failed: {}", &[&error]),
+                    libjs_rust::api::utf16_formatted("Key generation failed: {}", &[&error.message()]),
                 )
             })?;
 
@@ -13692,16 +13586,16 @@ impl AlgorithmMethods for MlKem {
             //             throw a NotSupportedError.
             //    * Set the subjectPublicKey field to keyData.
             let algorithm_oid = if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-KEM-512")) {
-                ML_KEM_512_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem512)
             } else if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-KEM-768")) {
-                ML_KEM_768_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem768)
             } else if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-KEM-1024")) {
-                ML_KEM_1024_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem1024)
             } else {
                 return Err(dom_error("NotSupportedError", b"Invalid algorithm"));
             };
 
-            let data = mlkem_export_der(vm, key, true, &algorithm_oid)?;
+            let data = ml_export_der(vm, key, true, algorithm_oid)?;
 
             // 4. Let result be the result of DER-encoding data.
             ExportKeyResult::Bytes(data)
@@ -13747,16 +13641,16 @@ impl AlgorithmMethods for MlKem {
             //          Otherwise:
             //             throw a NotSupportedError.
             let algorithm_oid = if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-KEM-512")) {
-                ML_KEM_512_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem512)
             } else if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-KEM-768")) {
-                ML_KEM_768_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem768)
             } else if matches!(key.algorithm_name().as_units(), Utf16StringUnits::Ascii(b"ML-KEM-1024")) {
-                ML_KEM_1024_OID
+                KeyAlgorithm::MlKem(MlKemSize::MlKem1024)
             } else {
                 return Err(dom_error("NotSupportedError", b"Invalid algorithm"));
             };
 
-            let data = mlkem_export_der(vm, key, false, &algorithm_oid)?;
+            let data = ml_export_der(vm, key, false, algorithm_oid)?;
 
             // 4. Let result be the result of DER-encoding data.
             ExportKeyResult::Bytes(data)
@@ -13785,7 +13679,7 @@ impl AlgorithmMethods for MlKem {
             //    key represented by the [[handle]] internal slot of key.
             // Note: The d and z values are the seed from which the key was generated or imported, as used by
             //       ML-KEM.KeyGen_internal in Section 6.1 of [FIPS-203].
-            let seed = libcrypto_rust::mlkem_seed_bytes(handle).map_err(|_| out_of_memory(vm))?;
+            let seed = libcrypto_rust::ml_seed_bytes(handle).map_err(|_| out_of_memory(vm))?;
             let data = Bytes::new(seed);
 
             // 3. Let result be data.
@@ -13854,17 +13748,17 @@ impl AlgorithmMethods for MlKem {
         let encapsulation = libcrypto_rust::mlkem_encapsulate(size, key.handle());
 
         // 5. If the ML-KEM.Encaps function returned an error, throw an OperationError.
-        if let Err(error) = encapsulation {
-            return Err(Exception::Dom(
+        let encapsulation = encapsulation.map_err(|error| {
+            Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Key encapsulation failed: {}", &[&error]),
-            ));
-        }
+                libjs_rust::api::utf16_formatted("Key encapsulation failed: {}", &[&error.message()]),
+            )
+        })?;
 
         // 6. Let result be a new EncapsulatedBits dictionary.
         // 7. Set the sharedKey attribute of result to the result of creating an ArrayBuffer containing sharedKey.
         // 8. Set the ciphertext attribute of result to the result of creating an ArrayBuffer containing ciphertext.
-        let (shared_key, ciphertext) = encapsulation.expect("LibCrypto returns the encapsulation");
+        let (shared_key, ciphertext) = encapsulation;
         let result = EncapsulatedBitsData {
             shared_key: Some(Bytes::new(shared_key)),
             ciphertext: Some(Bytes::new(ciphertext)),
@@ -13911,14 +13805,12 @@ impl AlgorithmMethods for MlKem {
 
         let shared_key = libcrypto_rust::mlkem_decapsulate(size, key.handle(), ciphertext.as_slice()).map(Bytes::new);
 
-        if let Err(error) = shared_key {
-            return Err(Exception::Dom(
+        let shared_key = shared_key.map_err(|error| {
+            Exception::Dom(
                 "OperationError",
-                libjs_rust::api::utf16_formatted("Key decapsulation failed: {}", &[&error]),
-            ));
-        }
-
-        let shared_key = shared_key.expect("LibCrypto returns the shared key");
+                libjs_rust::api::utf16_formatted("Key decapsulation failed: {}", &[&error.message()]),
+            )
+        })?;
 
         // 5. Return sharedKey.
         Ok(shared_key)

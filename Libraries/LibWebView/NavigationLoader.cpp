@@ -9,6 +9,7 @@
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibRequests/RequestControlClient.h>
+#include <LibURL/Parser.h>
 #include <LibURL/Site.h>
 #include <LibWebCommon/Fetch/Infrastructure/URL.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
@@ -251,8 +252,8 @@ void NavigationLoader::obtain_the_response_policies(CanonicalNavigable const& na
 
     auto const& response_url = navigation_params->response.url_list.is_empty() ? m_request.history_entry.url : navigation_params->response.url_list.last();
 
-    // NB: A response that the fetching process read from its own HTTP memory cache has no RequestServer request, so
-    //     its headers are the ones that process reported.
+    // NB: A response without a RequestServer request, such as one for a non-HTTP(S) URL or one that WebDriver BiDi
+    //     provided, has the headers that the fetching process reported.
     auto header_list = m_response_header_list ? NonnullRefPtr { *m_response_header_list } : HTTP::HeaderList::create(navigation_params->response.headers);
 
     // 17. Let responseCOOP be a new opener policy.
@@ -390,7 +391,7 @@ void NavigationLoader::acquire_response_body(WebContentClient const& population_
 
     auto const* body_handle = response_body_handle(*m_result);
     if (!body_handle) {
-        did_acquire(true);
+        did_acquire(!reports_an_http_response_of_its_own());
         return;
     }
     if (!response_body_was_fetched_by(*body_handle, population_worker)) {
@@ -418,15 +419,81 @@ void NavigationLoader::acquire_response_body(WebContentClient const& population_
     m_response_body_request = request;
 }
 
+// NB: The process that fetched a navigation's response reports the URLs it reached: the history entry's URL, and the
+//     last URLs of the response's and the request's URL lists.
+template<typename Callback>
+static bool any_reported_url(URL::URL const& history_entry_url, Web::HTML::NavigationParamsDescriptor const* navigation_params, Callback const& callback)
+{
+    if (callback(history_entry_url))
+        return true;
+    if (!navigation_params)
+        return false;
+    if (!navigation_params->response.url_list.is_empty() && callback(navigation_params->response.url_list.last()))
+        return true;
+    return navigation_params->request.has_value() && !navigation_params->request->url_list.is_empty() && callback(navigation_params->request->url_list.last());
+}
+
+// NB: The process that fetched the response reports the URLs it reached, and they name the document, its origin, and
+//     the process that hosts it. RequestServer follows no redirects, so the URL of the request it made for the response
+//     is the response's URL. A navigation that reports another URL is made up: the document it would create could
+//     place another site's response in a process of the fetching process's choosing. Such a navigation is canceled.
+bool NavigationLoader::reported_urls_match_the_response_url(URL::URL const& response_url) const
+{
+    auto const* navigation_params = m_result->navigation_params.get_pointer<Web::HTML::NavigationParamsDescriptor>();
+    // NB: RequestServer's URL is parsed from its serialization, and a URL the UI process gave a navigation need not be.
+    return !any_reported_url(m_request.history_entry.url, navigation_params, [&](URL::URL const& url) {
+        auto parsed_url = URL::Parser::basic_parse(url.serialize());
+        return !parsed_url.has_value() || !parsed_url->equals(response_url, URL::ExcludeFragment::Yes);
+    });
+}
+
+// NB: A navigation's response to a request with an HTTP(S) URL comes from RequestServer, from which the UI process
+//     takes it. One the process that fetched it reports with a response of its own is made up: the document it would
+//     create could run what that process chose with the origin of another site, in a process of that site. Such a
+//     navigation is canceled.
+bool NavigationLoader::reports_an_http_response_of_its_own() const
+{
+    auto const* navigation_params = m_result->navigation_params.get_pointer<Web::HTML::NavigationParamsDescriptor>();
+    if (!navigation_params)
+        return false;
+
+    auto reports_an_http_url = any_reported_url(m_request.history_entry.url, navigation_params, [](URL::URL const& url) {
+        return Web::Fetch::Infrastructure::is_http_or_https_scheme(url.scheme());
+    });
+    if (!reports_an_http_url)
+        return false;
+
+    // AD-HOC: WebDriver BiDi provides the responses of the requests it intercepts, which the process running a request
+    //         reports with the body that WebDriver gave it. The Hub saw that body when it routed the command, so the
+    //         process must report exactly those bytes.
+    if (!m_response_provided_by_webdriver.has_value())
+        return true;
+    auto const& provided = *m_response_provided_by_webdriver;
+    auto const& response_url = navigation_params->response.url_list.is_empty() ? m_request.history_entry.url : navigation_params->response.url_list.last();
+    if (!provided.url.equals(response_url, URL::ExcludeFragment::Yes))
+        return true;
+    auto const* reported_body = navigation_params->response.body.get_pointer<ByteBuffer>();
+    auto reported_bytes = reported_body ? reported_body->bytes() : ReadonlyBytes {};
+    if (reported_bytes != provided.body.bytes())
+        return true;
+    return !reported_urls_match_the_response_url(response_url);
+}
+
 void NavigationLoader::set_response_body_callbacks(Requests::Request& request)
 {
     auto weak_this = make_weak_ptr();
     request.set_unbuffered_request_callbacks(
-        [weak_this](NonnullRefPtr<HTTP::HeaderList> response_header_list, Optional<u32>, Optional<String> const&, Requests::CacheState) {
-            if (auto* loader = weak_this.ptr()) {
-                loader->m_response_header_list = move(response_header_list);
-                loader->did_acquire(true);
+        // NB: The request owns its callbacks, so it is alive while they run.
+        [weak_this, &request](NonnullRefPtr<HTTP::HeaderList> response_header_list, Optional<u32>, Optional<String> const&, Requests::CacheState) {
+            auto* loader = weak_this.ptr();
+            if (!loader)
+                return;
+            if (!request.response_url().has_value() || !loader->reported_urls_match_the_response_url(*request.response_url())) {
+                loader->did_acquire(false);
+                return;
             }
+            loader->m_response_header_list = move(response_header_list);
+            loader->did_acquire(true);
         },
         [](Requests::ResponseData) { },
         [](Core::ImmutableBytes) { },

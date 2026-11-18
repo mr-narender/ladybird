@@ -17,6 +17,7 @@
 #include <QDrag>
 #include <QGuiApplication>
 #include <QMargins>
+#include <QMetaObject>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QWheelEvent>
@@ -457,6 +458,77 @@ void install_appkit_event_capture()
 
     if (auto* application = QCoreApplication::instance()) {
         application->installNativeEventFilter(filter);
+        installed = true;
+    }
+}
+
+static NSWindow* appkit_window_for(QWidget& widget)
+{
+    if (QGuiApplication::platformName() != "cocoa")
+        return nil;
+    auto* view = reinterpret_cast<NSView*>(widget.internalWinId());
+    return view.window;
+}
+
+// A popup is a window of its own, placed by what it hangs from when it opens. Dragging that window by its title bar
+// never reaches the popup as a press outside it, so the popup would stay open where it was while the window moved away.
+// The popup's window is a child window of the window it hangs from while it is shown, so AppKit moves it along. On
+// other platforms, starting to move a window is a press outside the popup, which closes it.
+class LadybirdAppKitPopupAttachmentFilter final : public QObject {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    virtual bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() != QEvent::Show && event->type() != QEvent::Hide)
+            return false;
+        if (!watched->isWidgetType())
+            return false;
+        auto& popup = static_cast<QWidget&>(*watched);
+        if (popup.windowType() != Qt::Popup || !popup.parentWidget())
+            return false;
+
+        if (event->type() == QEvent::Hide) {
+            auto* popup_window = appkit_window_for(popup);
+            if (auto* parent_window = popup_window.parentWindow)
+                [parent_window removeChildWindow:popup_window];
+            return false;
+        }
+
+        // Qt sends the Show event before applying the popup's geometry to its native window. Attaching it during
+        // that event can expose the window with its initial geometry.
+        auto attach_popup = [&popup] {
+            auto* parent_widget = popup.parentWidget();
+            if (!popup.isVisible() || !parent_widget)
+                return;
+            auto* popup_window = appkit_window_for(popup);
+            if (!popup_window)
+                return;
+
+            // A window can be dragged by its content with a gesture, which would take the popup away from its anchor.
+            popup_window.movable = NO;
+
+            auto* parent_window = appkit_window_for(*parent_widget->window());
+            if (!parent_window || parent_window == popup_window || popup_window.parentWindow == parent_window)
+                return;
+
+            if (auto* previous_parent_window = popup_window.parentWindow)
+                [previous_parent_window removeChildWindow:popup_window];
+            [parent_window addChildWindow:popup_window ordered:NSWindowAbove];
+        };
+
+        QMetaObject::invokeMethod(&popup, attach_popup, Qt::QueuedConnection);
+        return false;
+    }
+};
+
+void install_appkit_popup_attachment()
+{
+    static bool installed = false;
+    if (installed)
+        return;
+    if (auto* application = QCoreApplication::instance()) {
+        application->installEventFilter(new LadybirdAppKitPopupAttachmentFilter);
         installed = true;
     }
 }

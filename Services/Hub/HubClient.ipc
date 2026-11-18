@@ -15,6 +15,7 @@
 #include <LibURL/URL.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
 #include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
+#include <LibWebCommon/MediaSession/MediaSessionState.h>
 #include <LibWebCommon/Gamepad/GamepadSnapshot.h>
 #include <LibWebCommon/Page/SpellingError.h>
 #include <LibWebCommon/Page/Translation.h>
@@ -29,6 +30,7 @@
 #include <LibWebView/MicrophoneAuthorizer.h>
 #include <LibWebView/SessionHistory.h>
 #include <LibWebView/TabPerformanceStats.h>
+#include <LibWebView/UpdateCheck.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/HTML/PreparedNavigationDescriptor.h>
 #include <LibWebView/Application.h>
@@ -249,6 +251,7 @@ endpoint HubClient
     pip_close(u64 view_id) =|
     notification_show(u64 id, u64 page_id, Optional<u64> replaces, Web::NotificationsAPI::NotificationData data, String attribution, Optional<Gfx::ShareableBitmap> icon) =|
     notification_close(u64 id) =|
+    media_session_update(Optional<Web::MediaSession::MediaSessionState> state) =|
     geolocation_start() =|
     geolocation_request_position(u64 id) =|
     geolocation_cancel_position_request(u64 id) =|
@@ -295,6 +298,7 @@ endpoint HubClient
     app_activate_or_open_tab_with_url(URL::URL url) =|
     app_open_view_in_new_tab(u64 view_id, Optional<u64> source_view_id, WebView::IsPrivate is_private, Web::HTML::ActivateTab activate_tab) =|
     app_display_error_dialog(String message) =|
+    app_display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger) =|
     app_display_download_confirmation_dialog(String download_name, ByteString path) =|
     app_read_clipboard_text(u64 request_id, WebView::Application::ClipboardType type) =|
     app_read_clipboard_item(u64 request_id) =|
