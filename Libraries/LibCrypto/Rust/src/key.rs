@@ -9,13 +9,15 @@
 use crate::ec::{self, EcPrivateKey, EcPublicKey};
 use crate::ml::{self, MlDsaPublicKey, MlKemPublicKey, MlPrivateKey};
 use crate::rsa::{self, RsaPrivateKey, RsaPublicKey};
+use crate::sys;
+use crate::{OkpCurve, OkpKey, okp_key_from_raw};
 
 pub struct KeyHandle(pub(crate) Key);
 
 pub(crate) enum Key {
     Secret(SecretBytes),
-    OkpPublic(Vec<u8>),
-    OkpPrivate(SecretBytes),
+    OkpPublic(OkpKey),
+    OkpPrivate(OkpKey),
     MlDsaPublic(MlDsaPublicKey),
     MlKemPublic(MlKemPublicKey),
     MlPrivate(MlPrivateKey),
@@ -98,25 +100,21 @@ impl StoredKey {
         Self { tag, buffers }
     }
 
-    pub fn buffers(&self) -> Vec<&[u8]> {
-        self.buffers.iter().map(|buffer| &**buffer).collect()
+    pub fn buffers(&self) -> &[SecretBytes] {
+        &self.buffers
     }
 }
 
 /// Bytes that are cleared when they are dropped.
-pub(crate) struct SecretBytes(Vec<u8>);
+pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
 
-    /// Shortens the bytes to `length`, clearing the ones cut off.
     pub(crate) fn truncate(&mut self, length: usize) {
-        if length < self.0.len() {
-            clear(&mut self.0[length..]);
-            self.0.truncate(length);
-        }
+        self.0.truncate(length);
     }
 
     /// Appends `bytes`, which must fit in the capacity reserved so that no partial copy is left behind by a reallocation.
@@ -125,7 +123,7 @@ impl SecretBytes {
         self.0.extend_from_slice(bytes);
     }
 
-    pub(crate) fn into_vec(mut self) -> Vec<u8> {
+    pub fn into_vec(mut self) -> Vec<u8> {
         core::mem::take(&mut self.0)
     }
 }
@@ -146,17 +144,20 @@ impl core::ops::DerefMut for SecretBytes {
 
 impl Drop for SecretBytes {
     fn drop(&mut self) {
-        clear(&mut self.0);
+        clear_allocation(&mut self.0);
     }
 }
 
 /// Overwrites `bytes` with zeros in a way the compiler does not remove.
 pub(crate) fn clear(bytes: &mut [u8]) {
-    for byte in bytes.iter_mut() {
-        // SAFETY: The pointer comes from a live mutable reference.
-        unsafe { core::ptr::write_volatile(byte, 0) };
-    }
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: The pointer and length come from a live mutable slice.
+    unsafe { sys::OPENSSL_cleanse(bytes.as_mut_ptr().cast(), bytes.len()) };
+}
+
+/// Overwrites all of the allocation of `bytes` with zeros, including what lies past its length.
+pub(crate) fn clear_allocation(bytes: &mut Vec<u8>) {
+    // SAFETY: The pointer and capacity describe the vector's allocation.
+    unsafe { sys::OPENSSL_cleanse(bytes.as_mut_ptr().cast(), bytes.capacity()) };
 }
 
 pub struct KeyPair {
@@ -174,14 +175,6 @@ impl KeyHandle {
         Self(Key::Secret(SecretBytes::new(bytes.to_vec())))
     }
 
-    pub fn from_okp_bytes(is_private: bool, bytes: &[u8]) -> Self {
-        Self(if is_private {
-            Key::OkpPrivate(SecretBytes::new(bytes.to_vec()))
-        } else {
-            Key::OkpPublic(bytes.to_vec())
-        })
-    }
-
     pub fn secret_bytes(&self) -> &[u8] {
         match &self.0 {
             Key::Secret(bytes) => bytes,
@@ -189,23 +182,11 @@ impl KeyHandle {
         }
     }
 
-    pub fn okp_bytes(&self) -> &[u8] {
-        match &self.0 {
-            Key::OkpPublic(bytes) => bytes,
-            Key::OkpPrivate(bytes) => bytes,
-            _ => panic!("The key is not an OKP key"),
-        }
-    }
-
-    pub(crate) fn is_okp_private(&self) -> bool {
-        matches!(self.0, Key::OkpPrivate(_))
-    }
-
     pub fn to_stored(&self) -> StoredKey {
         match &self.0 {
             Key::Secret(bytes) => StoredKey::new(HandleTag::Secret, vec![SecretBytes::new(bytes.to_vec())]),
-            Key::OkpPublic(bytes) => StoredKey::new(HandleTag::OkpPublic, vec![SecretBytes::new(bytes.clone())]),
-            Key::OkpPrivate(bytes) => StoredKey::new(HandleTag::OkpPrivate, vec![SecretBytes::new(bytes.to_vec())]),
+            Key::OkpPublic(key) => key.stored(HandleTag::OkpPublic),
+            Key::OkpPrivate(key) => key.stored(HandleTag::OkpPrivate),
             Key::EcPublic(key) => key.stored(),
             Key::EcPrivate(key) => key.stored(),
             Key::RsaPublic(key) => key.stored(),
@@ -216,12 +197,13 @@ impl KeyHandle {
         }
     }
 
-    /// The key that a stored form holds, as `to_stored()` gives it.
+    /// The key that a stored form holds, as `to_stored()` gives it. An OKP key's curve is not stored with it.
     pub fn from_stored(
         tag: HandleTag,
         buffers: &[&[u8]],
         ec_parameters: Option<&[u32]>,
         has_ec_public_key: bool,
+        okp_curve: Option<OkpCurve>,
     ) -> Result<Self, KeyDecodeError> {
         let is_ec_private_key = tag == HandleTag::EcPrivate;
         let expected = tag.buffer_count() + if has_ec_public_key { 2 } else { 0 };
@@ -230,8 +212,11 @@ impl KeyHandle {
         }
         match tag {
             HandleTag::Secret => Ok(Self::from_secret_bytes(buffers[0])),
-            HandleTag::OkpPublic => Ok(Self::from_okp_bytes(false, buffers[0])),
-            HandleTag::OkpPrivate => Ok(Self::from_okp_bytes(true, buffers[0])),
+            HandleTag::OkpPublic | HandleTag::OkpPrivate => {
+                let curve = okp_curve.ok_or(KeyDecodeError::InvalidComponents)?;
+                okp_key_from_raw(curve, tag == HandleTag::OkpPrivate, buffers[0])
+                    .map_err(|_| KeyDecodeError::InvalidComponents)
+            }
             HandleTag::RsaPublic | HandleTag::RsaPrivate => rsa::decode_stored(tag, buffers),
             HandleTag::EcPublic | HandleTag::EcPrivate => {
                 ec::decode_stored(tag, buffers, ec_parameters, has_ec_public_key)

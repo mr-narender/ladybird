@@ -257,6 +257,8 @@ pub struct ObjectMethods {
     /// [[PrivateElements]], for a class whose fields do not tell: one whose fields only cache, or one with a slot that
     /// holds nothing. None leaves it to the fields, which Object::has_internal_slots() reads.
     pub has_internal_slots: Option<bool>,
+    /// What Object::preserve_identity() runs, for the objects of an embedder that drops objects it can recreate.
+    pub preserve_identity: Option<fn(&Object)>,
 }
 
 /// [[GetPrototypeOf]].
@@ -293,6 +295,7 @@ pub static ORDINARY_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     as_builtin_iterator_if_next_is_not_redefined: |_, _| None,
     error_data: error_data_of_error,
     has_internal_slots: None,
+    preserve_identity: None,
 };
 
 define_cell!(
@@ -515,6 +518,10 @@ pub fn plain_object_size_classes(heap: &Heap) -> &[SizeClassAllocator] {
 }
 
 const SPARSE_ARRAY_HOLE_THRESHOLD: u32 = 200;
+
+/// Holey elements whose storage grows stay holey while at least one in this many of them is filled. At that density,
+/// their storage takes about twice as much memory as a dictionary of the filled elements would.
+const SPARSE_ARRAY_DENSITY_RATIO: usize = 8;
 
 /// Whether elements with `filled` of their `length` indices filled are dense enough for holey storage: three quarters.
 fn are_dense_enough(filled: usize, length: usize) -> bool {
@@ -1746,6 +1753,8 @@ impl Object {
             &name.property_key(),
             ValueAndAttributes::new(value, PropertyAttributes::new(Attribute::WRITABLE)),
         );
+        // NB: The private element is state of the object that the embedder can't recreate.
+        self.preserve_identity();
 
         // 5. Return unused.
         Ok(())
@@ -1778,6 +1787,8 @@ impl Object {
             &element.key.property_key(),
             ValueAndAttributes::new(element.value, PropertyAttributes::default()),
         );
+        // NB: The private element is state of the object that the embedder can't recreate.
+        self.preserve_identity();
 
         // 6. Return unused.
         Ok(())
@@ -2096,6 +2107,15 @@ impl Object {
 
     pub fn error_data(&self) -> Option<&ErrorData> {
         (self.methods().error_data)(self)
+    }
+
+    /// Tells the object that script made its identity outlive the references to it: it is held weakly, or has a
+    /// private element. An embedder may drop an object of its own while script holds no reference to it and create an
+    /// equal one when script asks for it again, which is unobservable only until then.
+    pub fn preserve_identity(&self) {
+        if let Some(preserve_identity) = self.methods().preserve_identity {
+            preserve_identity(self);
+        }
     }
 
     /// Whether the object has an [[ErrorData]] internal slot.
@@ -4208,14 +4228,34 @@ impl Object {
         if index < self.indexed_elements_capacity() {
             return true;
         }
-        let filled = match kind {
+        are_dense_enough(
+            self.filled_dense_elements(materialized_elements) + 1,
+            index as usize + 1,
+        )
+    }
+
+    /// Whether holey elements whose storage grows for a store at `index`, past their first `materialized_elements`,
+    /// stay holey instead of becoming a dictionary: where they have no more than SPARSE_ARRAY_HOLE_THRESHOLD holes, or
+    /// where at least one in SPARSE_ARRAY_DENSITY_RATIO of them is filled.
+    ///
+    /// NB: Stores that each leave fewer holes than SPARSE_ARRAY_HOLE_THRESHOLD would otherwise make the elements
+    ///     arbitrarily sparse, like {50, 100, 200, ..., 900} does. The storage grows by half at least, and copies the
+    ///     elements anyway, so counting their holes takes linear time overall.
+    fn keeps_holey_storage_growing_for(&self, index: u32, materialized_elements: u32) -> bool {
+        let filled = self.filled_dense_elements(materialized_elements) + 1;
+        let length = index as usize + 1;
+        length - filled <= SPARSE_ARRAY_HOLE_THRESHOLD as usize || filled >= length / SPARSE_ARRAY_DENSITY_RATIO
+    }
+
+    /// The number of the first `materialized_elements` of packed or holey elements that are not holes.
+    fn filled_dense_elements(&self, materialized_elements: u32) -> usize {
+        match self.indexed_storage_kind() {
             IndexedStorageKind::Packed => materialized_elements as usize,
             IndexedStorageKind::Holey => (0..materialized_elements)
                 .filter(|index| !self.indexed_element(*index).is_empty())
                 .count(),
             IndexedStorageKind::None | IndexedStorageKind::Dictionary => unreachable!(),
-        };
-        are_dense_enough(filled + 1, index as usize + 1)
+        }
     }
 
     fn indexed_put_dictionary_and_update_size(&self, index: u32, value: Value, attributes: PropertyAttributes) {
@@ -4245,9 +4285,15 @@ impl Object {
         }
 
         // Check for sparse threshold
-        if u64::from(index) > u64::from(materialized_elements) + u64::from(SPARSE_ARRAY_HOLE_THRESHOLD)
-            && !self.keeps_dense_storage_for(index, materialized_elements)
-        {
+        let makes_dictionary =
+            if u64::from(index) > u64::from(materialized_elements) + u64::from(SPARSE_ARRAY_HOLE_THRESHOLD) {
+                !self.keeps_dense_storage_for(index, materialized_elements)
+            } else {
+                kind == IndexedStorageKind::Holey
+                    && index >= self.indexed_elements_capacity()
+                    && !self.keeps_holey_storage_growing_for(index, materialized_elements)
+            };
+        if makes_dictionary {
             self.transition_to_dictionary();
             self.indexed_put_dictionary_and_update_size(index, value, attributes);
             return;

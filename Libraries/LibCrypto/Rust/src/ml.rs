@@ -23,9 +23,8 @@ pub(crate) struct MlDsaPublicKey {
 /// Any bytes make an ML-KEM public key. Web Crypto only runs the encapsulation key check of FIPS 203, section 7.2, when
 /// the key is used, so a key that fails it has no OpenSSL key or parameter set.
 pub(crate) struct MlKemPublicKey {
-    key: Option<Pkey>,
     bytes: Vec<u8>,
-    size: Option<MlKemSize>,
+    checked: Option<(Pkey, MlKemSize)>,
 }
 
 /// An ML-DSA or ML-KEM private key, which is made from its seed.
@@ -122,24 +121,21 @@ fn mlkem_public_key_from_bytes(bytes: &[u8]) -> MlKemPublicKey {
                 .ok()
                 .map(|key| (key, size))
         });
-    let (key, size) = checked.map_or((None, None), |(key, size)| (Some(key), Some(size)));
     MlKemPublicKey {
-        key,
         bytes: bytes.to_vec(),
-        size,
+        checked,
     }
 }
 
 impl MlPrivateKey {
-    /// The key of `parameter_set` that `seed` makes, or a new key for an empty seed.
+    fn generate(parameter_set: ParameterSet) -> Result<Self, CryptoError> {
+        let mut seed = SecretBytes::new(vec![0; parameter_set.seed_size()]);
+        openssl::fill_with_random(&mut seed)?;
+        Self::from_seed(parameter_set, &seed)
+    }
+
     fn from_seed(parameter_set: ParameterSet, seed: &[u8]) -> Result<Self, CryptoError> {
-        let key = if seed.is_empty() {
-            let mut seed = SecretBytes::new(vec![0; parameter_set.seed_size()]);
-            openssl::fill_with_random(&mut seed)?;
-            private_key_from_seed(parameter_set, &seed)?
-        } else {
-            private_key_from_seed(parameter_set, seed)?
-        };
+        let key = private_key_from_seed(parameter_set, seed)?;
         let public_key = key.raw_public_key()?;
         Ok(Self {
             key,
@@ -167,8 +163,8 @@ impl MlPrivateKey {
 /// The private key of `parameter_set` that `seed` makes.
 // NB: The seed parameter points at the caller's buffer, and the key clears its own copy.
 fn private_key_from_seed(parameter_set: ParameterSet, seed: &[u8]) -> Result<Pkey, CryptoError> {
-    let mut params = [openssl::octet_string_parameter(c"seed", seed), openssl::end_parameter()];
-    Pkey::from_data(parameter_set.name(), sys::EVP_PKEY_KEYPAIR, params.as_mut_ptr())
+    let params = [openssl::octet_string_parameter(c"seed", seed), openssl::end_parameter()];
+    Pkey::from_data(parameter_set.name(), sys::EVP_PKEY_KEYPAIR, &params)
 }
 
 fn private_key(key: &KeyHandle) -> &MlPrivateKey {
@@ -178,8 +174,8 @@ fn private_key(key: &KeyHandle) -> &MlPrivateKey {
     }
 }
 
-fn generate_key_pair(parameter_set: ParameterSet, seed: &[u8]) -> Result<KeyPair, CryptoError> {
-    let private_key = MlPrivateKey::from_seed(parameter_set, seed)?;
+fn generate_key_pair(parameter_set: ParameterSet) -> Result<KeyPair, CryptoError> {
+    let private_key = MlPrivateKey::generate(parameter_set)?;
     let public_key = private_key
         .public()
         .ok_or(CryptoError::Invalid("Invalid ML-DSA key length"))?;
@@ -189,12 +185,28 @@ fn generate_key_pair(parameter_set: ParameterSet, seed: &[u8]) -> Result<KeyPair
     })
 }
 
-pub fn mldsa_generate_key_pair(size: MlDsaSize, seed: &[u8]) -> Result<KeyPair, CryptoError> {
-    generate_key_pair(ParameterSet::MlDsa(size), seed)
+pub fn mldsa_generate_key_pair(size: MlDsaSize) -> Result<KeyPair, CryptoError> {
+    generate_key_pair(ParameterSet::MlDsa(size))
 }
 
-pub fn mlkem_generate_key_pair(size: MlKemSize, seed: &[u8]) -> Result<KeyPair, CryptoError> {
-    generate_key_pair(ParameterSet::MlKem(size), seed)
+pub fn mlkem_generate_key_pair(size: MlKemSize) -> Result<KeyPair, CryptoError> {
+    generate_key_pair(ParameterSet::MlKem(size))
+}
+
+/// The ML-DSA private key of `size` that `seed`, the ξ of ML-DSA.KeyGen_internal, makes.
+pub fn mldsa_private_key_from_seed(size: MlDsaSize, seed: &[u8]) -> Result<KeyHandle, CryptoError> {
+    Ok(KeyHandle(Key::MlPrivate(MlPrivateKey::from_seed(
+        ParameterSet::MlDsa(size),
+        seed,
+    )?)))
+}
+
+/// The ML-KEM private key of `size` that `seed`, the d and z of ML-KEM.KeyGen_internal, makes.
+pub fn mlkem_private_key_from_seed(size: MlKemSize, seed: &[u8]) -> Result<KeyHandle, CryptoError> {
+    Ok(KeyHandle(Key::MlPrivate(MlPrivateKey::from_seed(
+        ParameterSet::MlKem(size),
+        seed,
+    )?)))
 }
 
 pub fn mldsa_read_public_key(size: MlDsaSize, bytes: &[u8]) -> Option<KeyHandle> {
@@ -202,8 +214,8 @@ pub fn mldsa_read_public_key(size: MlDsaSize, bytes: &[u8]) -> Option<KeyHandle>
     (public_key.size == size).then(|| KeyHandle(Key::MlDsaPublic(public_key)))
 }
 
-pub fn mlkem_read_public_key(bytes: &[u8]) -> Option<KeyHandle> {
-    Some(KeyHandle(Key::MlKemPublic(mlkem_public_key_from_bytes(bytes))))
+pub fn mlkem_read_public_key(bytes: &[u8]) -> KeyHandle {
+    KeyHandle(Key::MlKemPublic(mlkem_public_key_from_bytes(bytes)))
 }
 
 pub fn mldsa_public_bytes(key: &KeyHandle) -> &[u8] {
@@ -225,14 +237,15 @@ pub fn ml_seed_bytes(key: &KeyHandle) -> Result<Vec<u8>, CryptoError> {
     Ok(private_key(key).seed()?.into_vec())
 }
 
-/// The SubjectPublicKeyInfo or PrivateKeyInfo of an ML-DSA or ML-KEM key of `algorithm`. A private key's privateKey is
-/// in the seed-only form.
-pub fn ml_export_der(key: &KeyHandle, is_public: bool, algorithm: KeyAlgorithm) -> Result<Vec<u8>, CryptoError> {
+/// The SubjectPublicKeyInfo of an ML-DSA or ML-KEM public key, or the PrivateKeyInfo of a private key, of `algorithm`.
+/// A private key's privateKey is in the seed-only form.
+// NB: The algorithm is not taken from the key, since an ML-KEM public key can hold bytes of no parameter set.
+pub fn ml_export_der(key: &KeyHandle, algorithm: KeyAlgorithm) -> Result<Vec<u8>, CryptoError> {
     let oid = algorithm.oid();
     match &key.0 {
-        Key::MlDsaPublic(public_key) if is_public => Ok(der::subject_public_key_info(oid, None, &public_key.bytes)),
-        Key::MlKemPublic(public_key) if is_public => Ok(der::subject_public_key_info(oid, None, &public_key.bytes)),
-        Key::MlPrivate(private_key) if !is_public => {
+        Key::MlDsaPublic(public_key) => Ok(der::subject_public_key_info(oid, None, &public_key.bytes)),
+        Key::MlKemPublic(public_key) => Ok(der::subject_public_key_info(oid, None, &public_key.bytes)),
+        Key::MlPrivate(private_key) => {
             let seed = private_key.seed()?;
             let seed_header = der::header(0x80, seed.len());
             let mut encoded = SecretBytes::new(Vec::with_capacity(seed_header.len() + seed.len()));
@@ -281,10 +294,10 @@ pub fn mlkem_encapsulate(size: MlKemSize, key: &KeyHandle) -> Result<(Vec<u8>, V
     let Key::MlKemPublic(public_key) = &key.0 else {
         return Err(CryptoError::Invalid("The key is not an ML-KEM public key"));
     };
-    let (Some(openssl_key), Some(key_size)) = (&public_key.key, public_key.size) else {
+    let Some((openssl_key, key_size)) = &public_key.checked else {
         return Err(CryptoError::Invalid("The key fails the encapsulation key check"));
     };
-    if key_size != size {
+    if *key_size != size {
         return Err(CryptoError::Invalid("The key fails the encapsulation key check"));
     }
     let (shared_key, ciphertext) = openssl::encapsulate(openssl_key)?;
@@ -437,13 +450,10 @@ pub(crate) fn decode_stored(tag: HandleTag, buffers: &[&[u8]]) -> Result<KeyHand
             ParameterSet::MlDsa(mldsa_public_key_from_bytes(buffers[1]).ok_or_else(invalid)?.size)
         }
         HandleTag::MlKemPrivate => {
-            ParameterSet::MlKem(mlkem_public_key_from_bytes(buffers[1]).size.ok_or_else(invalid)?)
+            ParameterSet::MlKem(mlkem_public_key_from_bytes(buffers[1]).checked.ok_or_else(invalid)?.1)
         }
         _ => return Err(invalid()),
     };
-    if buffers[0].is_empty() {
-        return Err(invalid());
-    }
     let private_key = MlPrivateKey::from_seed(parameter_set, buffers[0]).map_err(|_| invalid())?;
     if private_key.public_key != buffers[1] {
         return Err(invalid());

@@ -54,7 +54,7 @@ public:
 
     virtual DecoderErrorOr<void> receive_coded_data(CodedFrame const&, DecodeIntent) override;
     virtual void signal_end_of_stream() override;
-    virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_next_output(CodingIndependentCodePoints const& container_cicp, Optional<AK::Duration> target = {}) override;
+    virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> take_next_output(ColorMetadata const& container_color_metadata, Optional<AK::Duration> target = {}) override;
     virtual void flush() override;
 
 private:
@@ -62,6 +62,8 @@ private:
         // None marks the end of the stream, after the last frame.
         AVFrame* frame { nullptr };
         VideoFramesAwaitingOutput::Frame timing;
+        // The codec context that decoded the frame can be replaced before the frame goes out.
+        CodingIndependentCodePoints cicp;
         u64 generation { 0 };
         // Later decodes that reference the frame advance its semaphore further, so the value its own decode signals
         // is taken as soon as FFmpeg hands the frame out.
@@ -76,6 +78,7 @@ private:
         VideoFramesAwaitingOutput::Frame timing;
         Gfx::Size<u32> size;
         u8 bit_depth { 0 };
+        CodingIndependentCodePoints cicp;
     };
 
     enum class EndOfStreamIsFinal : u8 {

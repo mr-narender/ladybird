@@ -645,7 +645,12 @@ void DecodedVideoProducer::ThreadData::handle_seek()
             }
 
             m_current_halting_status = PipelineStatus::Pending;
-            m_frame_awaiting_decoder_replacement.clear();
+            // A seek makes the drain pointless, and the demuxer has already given us the frame and its configuration, so
+            // start over with a new decoder and have the demuxer provide the configuration again.
+            if (m_frame_awaiting_decoder_replacement.has_value()) {
+                m_frame_awaiting_decoder_replacement.clear();
+                m_decoder.clear();
+            }
             m_decoder_is_draining_before_unavailable_data = false;
             if (m_decoder != nullptr)
                 m_decoder_that_failed_due_to_missing_features = {};
@@ -688,7 +693,7 @@ void DecodedVideoProducer::ThreadData::handle_seek()
                 break;
 
             while (m_decoder != nullptr && new_seek_id == seek_id) {
-                auto frame_result = m_decoder->take_next_output(m_track.video_data().cicp, timestamp);
+                auto frame_result = m_decoder->take_next_output(m_track.video_data().color_metadata, timestamp);
                 if (frame_result.is_error()) {
                     if (frame_result.error().category() == DecoderErrorCategory::EndOfStream) {
                         if (m_decoder_is_draining_before_unavailable_data) {
@@ -877,7 +882,7 @@ void DecodedVideoProducer::ThreadData::push_data_and_decode_some_frames()
         if (seek_is_pending())
             return;
 
-        auto frame_result = m_decoder->take_next_output(m_track.video_data().cicp);
+        auto frame_result = m_decoder->take_next_output(m_track.video_data().color_metadata);
         if (frame_result.is_error()) {
             if (frame_result.error().category() == DecoderErrorCategory::NeedsMoreInput)
                 break;

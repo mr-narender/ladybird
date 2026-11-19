@@ -13,6 +13,7 @@ use core::ptr::{self, NonNull};
 
 use crate::CryptoError;
 use crate::key::SecretBytes;
+use crate::key_info::KeyAlgorithm;
 use crate::sys;
 
 fn failed<T>() -> Result<T, CryptoError> {
@@ -116,29 +117,85 @@ impl Clone for Pkey {
     }
 }
 
-pub(crate) fn octet_string_parameter(name: &CStr, bytes: &[u8]) -> sys::OSSL_PARAM {
-    // SAFETY: Constructing a parameter only records the pointer and length, which the caller keeps alive.
-    unsafe { sys::OSSL_PARAM_construct_octet_string(name.as_ptr(), bytes.as_ptr().cast_mut().cast(), bytes.len()) }
+/// An OSSL_PARAM, which points at a static name and at a value that lives for `'a`.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub(crate) struct Param<'a> {
+    raw: sys::OSSL_PARAM,
+    value: PhantomData<&'a ()>,
 }
 
-pub(crate) fn utf8_parameter(name: &CStr, value: &'static CStr) -> sys::OSSL_PARAM {
-    // SAFETY: Constructing a parameter only records the pointer, a static string, and its length.
-    unsafe { sys::OSSL_PARAM_construct_utf8_string(name.as_ptr(), value.as_ptr().cast_mut(), value.count_bytes()) }
+impl Param<'_> {
+    fn new(raw: sys::OSSL_PARAM) -> Self {
+        Self {
+            raw,
+            value: PhantomData,
+        }
+    }
 }
 
-pub(crate) fn uint_parameter(name: &CStr, value: &mut c_uint) -> sys::OSSL_PARAM {
-    // SAFETY: Constructing a parameter only records the pointer, which the caller keeps alive.
-    unsafe { sys::OSSL_PARAM_construct_uint(name.as_ptr(), value) }
+/// A list of parameters for OpenSSL, which reads them up to the end marker.
+///
+/// # Safety
+///
+/// `as_params_ptr()` must give parameters that end with the end marker, and whose names and values live as long as the
+/// list does.
+pub(crate) unsafe trait Params {
+    fn as_params_ptr(&self) -> *const sys::OSSL_PARAM;
 }
 
-pub(crate) fn int_parameter(name: &CStr, value: &mut c_int) -> sys::OSSL_PARAM {
-    // SAFETY: Constructing a parameter only records the pointer, which the caller keeps alive.
-    unsafe { sys::OSSL_PARAM_construct_int(name.as_ptr(), value) }
+// SAFETY: The parameters borrow their values, and the end marker is checked for.
+unsafe impl Params for [Param<'_>] {
+    fn as_params_ptr(&self) -> *const sys::OSSL_PARAM {
+        assert!(
+            self.last().is_some_and(|param| param.raw.is_end()),
+            "The parameters end with the end marker"
+        );
+        <[Param<'_>]>::as_ptr(self).cast()
+    }
 }
 
-pub(crate) fn end_parameter() -> sys::OSSL_PARAM {
+// SAFETY: See the slice's implementation.
+unsafe impl<const N: usize> Params for [Param<'_>; N] {
+    fn as_params_ptr(&self) -> *const sys::OSSL_PARAM {
+        self.as_slice().as_params_ptr()
+    }
+}
+
+// SAFETY: OpenSSL builds the array with the end marker, and the array owns the parameters' values.
+unsafe impl Params for ParamArray {
+    fn as_params_ptr(&self) -> *const sys::OSSL_PARAM {
+        self.as_ptr()
+    }
+}
+
+pub(crate) fn octet_string_parameter<'a>(name: &'static CStr, bytes: &'a [u8]) -> Param<'a> {
+    // SAFETY: Constructing a parameter only records the pointers and length, which the parameter borrows.
+    Param::new(unsafe {
+        sys::OSSL_PARAM_construct_octet_string(name.as_ptr(), bytes.as_ptr().cast_mut().cast(), bytes.len())
+    })
+}
+
+pub(crate) fn utf8_parameter(name: &'static CStr, value: &'static CStr) -> Param<'static> {
+    // SAFETY: Constructing a parameter only records the pointers, to static strings, and the value's length.
+    Param::new(unsafe {
+        sys::OSSL_PARAM_construct_utf8_string(name.as_ptr(), value.as_ptr().cast_mut(), value.count_bytes())
+    })
+}
+
+pub(crate) fn uint_parameter<'a>(name: &'static CStr, value: &'a mut c_uint) -> Param<'a> {
+    // SAFETY: Constructing a parameter only records the pointers, which the parameter borrows.
+    Param::new(unsafe { sys::OSSL_PARAM_construct_uint(name.as_ptr(), value) })
+}
+
+pub(crate) fn int_parameter<'a>(name: &'static CStr, value: &'a mut c_int) -> Param<'a> {
+    // SAFETY: Constructing a parameter only records the pointers, which the parameter borrows.
+    Param::new(unsafe { sys::OSSL_PARAM_construct_int(name.as_ptr(), value) })
+}
+
+pub(crate) fn end_parameter() -> Param<'static> {
     // SAFETY: Constructing the end marker takes no pointers.
-    unsafe { sys::OSSL_PARAM_construct_end() }
+    Param::new(unsafe { sys::OSSL_PARAM_construct_end() })
 }
 
 /// Parameters that hold big numbers, which an OSSL_PARAM_BLD builds.
@@ -261,29 +318,39 @@ impl Pkey {
     }
 
     /// The key of the algorithm `name` that `params` describe, with the parts that `selection` names.
-    pub(crate) fn from_data(name: &CStr, selection: c_int, params: *mut sys::OSSL_PARAM) -> Result<Self, CryptoError> {
+    pub(crate) fn from_data(
+        name: &CStr,
+        selection: c_int,
+        params: &(impl Params + ?Sized),
+    ) -> Result<Self, CryptoError> {
         // SAFETY: The name is live; a non-null result is owned.
         let context =
             PkeyContext::new(unsafe { sys::EVP_PKEY_CTX_new_from_name(ptr::null_mut(), name.as_ptr(), ptr::null()) })?;
         // SAFETY: The context is live.
         check(unsafe { sys::EVP_PKEY_fromdata_init(context.as_ptr()) })?;
         let mut key = ptr::null_mut();
-        // SAFETY: The context and the caller's parameters are live; a non-null result is owned.
-        check(unsafe { sys::EVP_PKEY_fromdata(context.as_ptr(), &raw mut key, selection, params) })?;
+        // SAFETY: The context and the parameters are live, and OpenSSL only reads the parameters; a non-null result is
+        //         owned.
+        check(unsafe {
+            sys::EVP_PKEY_fromdata(
+                context.as_ptr(),
+                &raw mut key,
+                selection,
+                params.as_params_ptr().cast_mut(),
+            )
+        })?;
         Self::new(key)
     }
 
-    /// A new key of the algorithm `name`, with the generation parameters `params`, which end with the end marker.
-    pub(crate) fn generate(name: &CStr, params: Option<*const sys::OSSL_PARAM>) -> Result<Self, CryptoError> {
+    /// A new key of the algorithm `name`, with the generation parameters `params`.
+    pub(crate) fn generate(name: &CStr, params: &(impl Params + ?Sized)) -> Result<Self, CryptoError> {
         // SAFETY: The name is live; a non-null result is owned.
         let context =
             PkeyContext::new(unsafe { sys::EVP_PKEY_CTX_new_from_name(ptr::null_mut(), name.as_ptr(), ptr::null()) })?;
         // SAFETY: The context is live.
         check(unsafe { sys::EVP_PKEY_keygen_init(context.as_ptr()) })?;
-        if let Some(params) = params {
-            // SAFETY: The context and the caller's parameters are live.
-            check(unsafe { sys::EVP_PKEY_CTX_set_params(context.as_ptr(), params) })?;
-        }
+        // SAFETY: The context and the parameters are live.
+        check(unsafe { sys::EVP_PKEY_CTX_set_params(context.as_ptr(), params.as_params_ptr()) })?;
         let mut key = ptr::null_mut();
         // SAFETY: The context is live; a non-null result is owned.
         check(unsafe { sys::EVP_PKEY_generate(context.as_ptr(), &raw mut key) })?;
@@ -395,27 +462,21 @@ impl Pkey {
     }
 }
 
-pub(crate) struct KeyChecks {
-    pub(crate) public: bool,
-    pub(crate) private: bool,
-    pub(crate) pairwise: bool,
-}
-
 /// Runs OpenSSL's public, private and pairwise checks of `key`, the last two only when asked for.
-pub(crate) fn check_key(key: &Pkey, private: bool, pairwise: bool) -> Result<KeyChecks, CryptoError> {
+pub(crate) fn check_key(key: &Pkey, private: bool, pairwise: bool) -> Result<bool, CryptoError> {
     let context = key.context()?;
+    // NB: OpenSSL's pairwise check of RSA factors is unbounded, so it must only run on a key whose modulus passed the
+    //     public check.
     // SAFETY: The context is live for each call.
-    let checks = unsafe {
-        KeyChecks {
-            public: sys::EVP_PKEY_public_check(context.as_ptr()) == 1,
-            private: !private || sys::EVP_PKEY_private_check(context.as_ptr()) == 1,
-            pairwise: !pairwise || sys::EVP_PKEY_pairwise_check(context.as_ptr()) == 1,
-        }
+    let valid = unsafe {
+        sys::EVP_PKEY_public_check(context.as_ptr()) == 1
+            && (!private || sys::EVP_PKEY_private_check(context.as_ptr()) == 1)
+            && (!pairwise || sys::EVP_PKEY_pairwise_check(context.as_ptr()) == 1)
     };
     // NB: A failed check leaves its reasons queued.
     // SAFETY: Clearing the error queue takes no arguments.
     unsafe { sys::ERR_clear_error() };
-    Ok(checks)
+    Ok(valid)
 }
 
 /// Signs `message` with `key`, hashing it with the digest `digest_name` unless the algorithm takes none. The parameters
@@ -423,7 +484,7 @@ pub(crate) fn check_key(key: &Pkey, private: bool, pairwise: bool) -> Result<Key
 pub(crate) fn digest_sign(
     key: &Pkey,
     digest_name: Option<&CStr>,
-    params: &[sys::OSSL_PARAM],
+    params: &[Param<'_>],
     message: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     // SAFETY: Making a context takes no arguments.
@@ -437,7 +498,7 @@ pub(crate) fn digest_sign(
             ptr::null_mut(),
             ptr::null(),
             key.as_ptr(),
-            params.as_ptr(),
+            params.as_params_ptr(),
         )
     })?;
     let mut size = 0;
@@ -470,7 +531,7 @@ pub(crate) fn digest_sign(
 pub(crate) fn digest_verify(
     key: &Pkey,
     digest_name: Option<&CStr>,
-    params: &[sys::OSSL_PARAM],
+    params: &[Param<'_>],
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, CryptoError> {
@@ -485,7 +546,7 @@ pub(crate) fn digest_verify(
             ptr::null_mut(),
             ptr::null(),
             key.as_ptr(),
-            params.as_ptr(),
+            params.as_params_ptr(),
         )
     })?;
     // SAFETY: The context and both buffers are live for the call.
@@ -567,7 +628,7 @@ pub(crate) fn sign_message(
         check(sys::EVP_PKEY_sign_message_init(
             key_context.as_ptr(),
             signature_algorithm.as_ptr(),
-            params.as_ptr(),
+            params.as_params_ptr(),
         ))?;
         let mut size = 0;
         check(sys::EVP_PKEY_sign(
@@ -608,7 +669,7 @@ pub(crate) fn verify_message(
         check(sys::EVP_PKEY_verify_message_init(
             key_context.as_ptr(),
             signature_algorithm.as_ptr(),
-            params.as_ptr(),
+            params.as_params_ptr(),
         ))?;
         check_bool(sys::EVP_PKEY_verify(
             key_context.as_ptr(),
@@ -620,11 +681,11 @@ pub(crate) fn verify_message(
     }
 }
 
-pub(crate) fn context_string_parameters(context: &[u8]) -> [sys::OSSL_PARAM; 2] {
+pub(crate) fn context_string_parameters(context: &[u8]) -> [Param<'_>; 2] {
     [octet_string_parameter(c"context-string", context), end_parameter()]
 }
 
-fn optional_context_string_parameters(context: &[u8]) -> [sys::OSSL_PARAM; 2] {
+fn optional_context_string_parameters(context: &[u8]) -> [Param<'_>; 2] {
     if context.is_empty() {
         [end_parameter(), end_parameter()]
     } else {
@@ -633,10 +694,10 @@ fn optional_context_string_parameters(context: &[u8]) -> [sys::OSSL_PARAM; 2] {
 }
 
 /// Encrypts `input` with `key`, with the parameters `params`, which end with the end marker.
-pub(crate) fn encrypt(key: &Pkey, params: &[sys::OSSL_PARAM], input: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub(crate) fn encrypt(key: &Pkey, params: &[Param<'_>], input: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let context = key.context()?;
     // SAFETY: The context and parameters are live.
-    check(unsafe { sys::EVP_PKEY_encrypt_init_ex(context.as_ptr(), params.as_ptr()) })?;
+    check(unsafe { sys::EVP_PKEY_encrypt_init_ex(context.as_ptr(), params.as_params_ptr()) })?;
     let mut size = 0;
     // SAFETY: A null output asks for its size.
     check(unsafe {
@@ -664,10 +725,10 @@ pub(crate) fn encrypt(key: &Pkey, params: &[sys::OSSL_PARAM], input: &[u8]) -> R
 }
 
 /// Decrypts `input` with `key`, with the parameters `params`, which end with the end marker.
-pub(crate) fn decrypt(key: &Pkey, params: &[sys::OSSL_PARAM], input: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub(crate) fn decrypt(key: &Pkey, params: &[Param<'_>], input: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let context = key.context()?;
     // SAFETY: The context and parameters are live.
-    check(unsafe { sys::EVP_PKEY_decrypt_init_ex(context.as_ptr(), params.as_ptr()) })?;
+    check(unsafe { sys::EVP_PKEY_decrypt_init_ex(context.as_ptr(), params.as_params_ptr()) })?;
     let mut size = 0;
     // SAFETY: A null output asks for its size.
     check(unsafe {
@@ -695,7 +756,7 @@ pub(crate) fn decrypt(key: &Pkey, params: &[sys::OSSL_PARAM], input: &[u8]) -> R
 }
 
 /// The secret that `key` and the public key `peer` agree on. OpenSSL checks the peer when `validate_peer` is set.
-pub(crate) fn derive(key: &Pkey, peer: &Pkey, validate_peer: bool) -> Result<Vec<u8>, CryptoError> {
+pub(crate) fn derive(key: &Pkey, peer: &Pkey, validate_peer: bool) -> Result<SecretBytes, CryptoError> {
     let context = key.context()?;
     // SAFETY: The context and peer are live for each call, and the output holds the size the first call gives.
     unsafe {
@@ -707,7 +768,7 @@ pub(crate) fn derive(key: &Pkey, peer: &Pkey, validate_peer: bool) -> Result<Vec
         ))?;
         let mut size = 0;
         check(sys::EVP_PKEY_derive(context.as_ptr(), ptr::null_mut(), &raw mut size))?;
-        let mut secret = vec![0; size];
+        let mut secret = SecretBytes::new(vec![0; size]);
         check(sys::EVP_PKEY_derive(
             context.as_ptr(),
             secret.as_mut_ptr(),
@@ -832,8 +893,8 @@ pub(crate) fn ec_public_point(nid: c_int, scalar: &[u8]) -> Result<Option<Vec<u8
     Ok(Some(encoded))
 }
 
-/// The ECDSA signature (r, s) of `digest` by `key`, each of `scalar_size` bytes.
-pub(crate) fn ecdsa_sign(key: &Pkey, digest: &[u8], scalar_size: usize) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+/// The ECDSA signature of `digest` by `key`: r and then s, each of `scalar_size` bytes.
+pub(crate) fn ecdsa_sign(key: &Pkey, digest: &[u8], scalar_size: usize) -> Result<Vec<u8>, CryptoError> {
     let encoded = sign_digest(key, digest)?;
     let mut cursor = encoded.as_ptr();
     // SAFETY: The cursor points into `encoded`, of the length given; a non-null result is owned.
@@ -843,19 +904,20 @@ pub(crate) fn ecdsa_sign(key: &Pkey, digest: &[u8], scalar_size: usize) -> Resul
     let (mut r, mut s) = (ptr::null(), ptr::null());
     // SAFETY: The signature is live, and owns r and s.
     unsafe { sys::ECDSA_SIG_get0(signature.as_ptr(), &raw mut r, &raw mut s) };
-    let padded = |number: *const sys::BIGNUM| -> Result<Vec<u8>, CryptoError> {
-        let mut bytes = vec![0; scalar_size];
+    let mut bytes = vec![0; scalar_size * 2];
+    let (r_bytes, s_bytes) = bytes.split_at_mut(scalar_size);
+    for (number, number_bytes) in [(r, r_bytes), (s, s_bytes)] {
         // SAFETY: The number is live while the signature is, and the buffer holds `scalar_size` bytes.
-        if unsafe { sys::BN_bn2binpad(number, bytes.as_mut_ptr(), int_length(scalar_size)?) } < 0 {
+        if unsafe { sys::BN_bn2binpad(number, number_bytes.as_mut_ptr(), int_length(scalar_size)?) } < 0 {
             return failed();
         }
-        Ok(bytes)
-    };
-    Ok((padded(r)?, padded(s)?))
+    }
+    Ok(bytes)
 }
 
-/// Verifies the ECDSA signature (r, s) of `digest` with `key`.
-pub(crate) fn ecdsa_verify(key: &Pkey, digest: &[u8], r: &[u8], s: &[u8]) -> Result<bool, CryptoError> {
+/// Verifies the ECDSA signature of `digest` with `key`, which is r and then s, each of half its length.
+pub(crate) fn ecdsa_verify(key: &Pkey, digest: &[u8], signature: &[u8]) -> Result<bool, CryptoError> {
+    let (r, s) = signature.split_at(signature.len() / 2);
     // SAFETY: Making a signature takes no arguments.
     let signature = EcdsaSignature::new(unsafe { sys::ECDSA_SIG_new() })?;
     let r = BigNum::from_bytes(r, false)?;
@@ -926,7 +988,7 @@ pub(crate) fn mac(
     key: &[u8],
     message: &[u8],
     output_size: usize,
-    params: &[sys::OSSL_PARAM],
+    params: &[Param<'_>],
 ) -> Result<Vec<u8>, CryptoError> {
     // SAFETY: The name is live; a non-null result is owned.
     let mac = Mac::new(unsafe { sys::EVP_MAC_fetch(ptr::null_mut(), name.as_ptr(), ptr::null()) })?;
@@ -938,7 +1000,7 @@ pub(crate) fn mac(
             context.as_ptr(),
             key.as_ptr(),
             key.len(),
-            params.as_ptr(),
+            params.as_params_ptr(),
         ))?;
         check(sys::EVP_MAC_update(context.as_ptr(), message.as_ptr(), message.len()))?;
         let mut output = vec![0; output_size];
@@ -960,13 +1022,20 @@ pub(crate) fn mac(
 /// end marker.
 // NB: The parameters point at the caller's buffers, so OpenSSL copies secrets only into the KDF context, which clears
 //     them.
-pub(crate) fn kdf(name: &CStr, params: &[sys::OSSL_PARAM], output: &mut [u8]) -> Result<(), CryptoError> {
+pub(crate) fn kdf(name: &CStr, params: &[Param<'_>], output: &mut [u8]) -> Result<(), CryptoError> {
     // SAFETY: The name is live; a non-null result is owned.
     let kdf = Kdf::new(unsafe { sys::EVP_KDF_fetch(ptr::null_mut(), name.as_ptr(), ptr::null()) })?;
     // SAFETY: The KDF is live; a non-null result is owned.
     let context = KdfContext::new(unsafe { sys::EVP_KDF_CTX_new(kdf.as_ptr()) })?;
     // SAFETY: The context, parameters and output are live, and the output holds its length.
-    check(unsafe { sys::EVP_KDF_derive(context.as_ptr(), output.as_mut_ptr(), output.len(), params.as_ptr()) })
+    check(unsafe {
+        sys::EVP_KDF_derive(
+            context.as_ptr(),
+            output.as_mut_ptr(),
+            output.len(),
+            params.as_params_ptr(),
+        )
+    })
 }
 
 pub(crate) fn fill_with_random(bytes: &mut [u8]) -> Result<(), CryptoError> {
@@ -999,7 +1068,7 @@ impl CipherContext {
     }
 
     /// Sets up the context to encrypt or decrypt with whichever of the cipher, key and IV are given. The key and IV must
-    /// be of the sizes the cipher takes.
+    /// be of the sizes that the cipher, or the cipher the context already has, takes.
     pub(crate) fn init(
         &mut self,
         encrypt: bool,
@@ -1007,7 +1076,28 @@ impl CipherContext {
         key: Option<&[u8]>,
         iv: Option<&[u8]>,
     ) -> Result<(), CryptoError> {
-        // SAFETY: The context, cipher and buffers are live for the call.
+        // SAFETY: The cipher is static, and the context is live.
+        let (key_length, iv_length) = unsafe {
+            match cipher {
+                Some(cipher) => (
+                    sys::EVP_CIPHER_get_key_length(cipher.0),
+                    sys::EVP_CIPHER_get_iv_length(cipher.0),
+                ),
+                None => (
+                    sys::EVP_CIPHER_CTX_get_key_length(self.as_ptr()),
+                    sys::EVP_CIPHER_CTX_get_iv_length(self.as_ptr()),
+                ),
+            }
+        };
+        let has_length = |buffer: Option<&[u8]>, length: c_int| {
+            buffer.is_none_or(|buffer| usize::try_from(length).is_ok_and(|length| buffer.len() == length))
+        };
+        if !has_length(key, key_length) || !has_length(iv, iv_length) {
+            return Err(CryptoError::Invalid(
+                "The key or IV is not of the size the cipher takes",
+            ));
+        }
+        // SAFETY: The context, cipher and buffers are live for the call, and the buffers are of the sizes OpenSSL reads.
         check(unsafe {
             sys::EVP_CipherInit_ex(
                 self.as_ptr(),
@@ -1067,6 +1157,8 @@ impl CipherContext {
     }
 
     pub(crate) fn update(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), CryptoError> {
+        // NB: Reserving room for all of the output first keeps a reallocation from leaving a copy of it behind.
+        output.reserve(input.len() + MAXIMUM_UPDATE_GROWTH);
         for chunk in input.chunks(MAXIMUM_UPDATE_LENGTH) {
             self.update_whole(chunk, output)?;
         }
@@ -1121,16 +1213,6 @@ fn encoding<T>(object: *const T, i2d: unsafe extern "C" fn(*const T, *mut *mut u
     // SAFETY: The buffer holds the length the first call gave.
     unsafe { i2d(object, &raw mut output) };
     encoded
-}
-
-/// The kinds of key the parsers treat differently.
-#[derive(PartialEq, Eq)]
-pub(crate) enum KeyKind {
-    Rsa,
-    Ec,
-    MlKem,
-    MlDsa,
-    Other,
 }
 
 pub(crate) struct AlgorithmIdentifier {
@@ -1204,10 +1286,7 @@ fn has_version_zero(der: &[u8]) -> bool {
 }
 
 /// Parses the DER SubjectPublicKeyInfo at the start of `data`, which must be the encoding OpenSSL gives back for it.
-pub(crate) fn parse_subject_public_key_info(
-    data: &[u8],
-    kind_of: impl Fn(&[u8]) -> KeyKind,
-) -> Result<PublicKeyInfo, &'static str> {
+pub(crate) fn parse_subject_public_key_info(data: &[u8]) -> Result<PublicKeyInfo, &'static str> {
     let invalid = "Invalid SubjectPublicKeyInfo";
     let mut cursor = data.as_ptr();
     // SAFETY: The cursor points into `data`, of the length given; a non-null result is owned.
@@ -1246,7 +1325,7 @@ pub(crate) fn parse_subject_public_key_info(
 
     // NB: OpenSSL runs the ML-KEM encapsulation key check when it decodes the key, but Web Crypto runs it at
     //     encapsulation. So an ML-KEM key is only checked to be in DER, without parameters.
-    if kind_of(&algorithm.oid) == KeyKind::MlKem {
+    if matches!(KeyAlgorithm::from_oid(&algorithm.oid), Some(KeyAlgorithm::MlKem(_))) {
         if algorithm.has_parameters() {
             return Err("The algorithm takes no parameters");
         }
@@ -1284,10 +1363,7 @@ pub(crate) fn parse_subject_public_key_info(
 }
 
 /// Parses the DER PrivateKeyInfo at the start of `data`, which must be the encoding OpenSSL gives back for it.
-pub(crate) fn parse_private_key_info(
-    data: &[u8],
-    kind_of: impl Fn(&[u8]) -> KeyKind,
-) -> Result<PrivateKeyInfo, &'static str> {
+pub(crate) fn parse_private_key_info(data: &[u8]) -> Result<PrivateKeyInfo, &'static str> {
     let invalid = "Invalid PrivateKeyInfo";
     let mut cursor = data.as_ptr();
     // SAFETY: The cursor points into `data`, of the length given; a non-null result is owned.
@@ -1332,7 +1408,7 @@ pub(crate) fn parse_private_key_info(
     let private_key_size = usize::try_from(private_key_size).unwrap_or_default();
     // SAFETY: OpenSSL gives the private key's octets, of `private_key_size` bytes, which the structure owns.
     let raw_key = unsafe { ak::slice_from_raw_parts(private_key, private_key_size) };
-    let kind = kind_of(&algorithm.oid);
+    let kind = KeyAlgorithm::from_oid(&algorithm.oid);
 
     // https://www.rfc-editor.org/rfc/rfc8410#section-9
     // For all of the OIDs, the parameters MUST be absent.
@@ -1340,19 +1416,19 @@ pub(crate) fn parse_private_key_info(
     // The contents of the parameters component for each algorithm MUST be absent.
     // NB: ML-KEM's parameters are absent likewise, and the outer encoding check above keeps whatever parameters were
     //     given.
-    if kind != KeyKind::Rsa && kind != KeyKind::Ec && algorithm.has_parameters() {
+    if !matches!(kind, Some(KeyAlgorithm::Rsa | KeyAlgorithm::Ec)) && algorithm.has_parameters() {
         return Err("The algorithm takes no parameters");
     }
 
     // NB: The ML-DSA and ML-KEM privateKey choices are parsed after this, since OpenSSL also takes forms that Web Crypto
     //     does not, and refuses an expandedKey that is not valid before Web Crypto can reject that form.
     let mut decoded_key = None;
-    if kind != KeyKind::MlDsa && kind != KeyKind::MlKem {
+    if !matches!(kind, Some(KeyAlgorithm::MlDsa(_) | KeyAlgorithm::MlKem(_))) {
         // SAFETY: The structure is live; a non-null result is owned.
         let key = Pkey::new(unsafe { sys::EVP_PKCS82PKEY(private_key_info.as_ptr()) })
             .map_err(|_| "Invalid or unsupported private key")?;
 
-        if kind == KeyKind::Rsa {
+        if kind == Some(KeyAlgorithm::Rsa) {
             // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.1
             // The parameters field MUST have ASN.1 type NULL for this algorithm identifier.
             if algorithm.parameters_type != sys::V_ASN1_NULL {

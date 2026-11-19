@@ -6,7 +6,7 @@
 
 //! What a frame repaints of the frame painted before it, and of what each backing store holds.
 
-use super::layers::{LayerUpdate, MediaUpdate};
+use super::layers::LayerUpdate;
 use super::{ContextPresenting, FrameToPaint, PresentingEnvironment, rect_of_size};
 use crate::frame_inputs::FrameInputs;
 use crate::host::PendingFrame;
@@ -27,6 +27,7 @@ pub struct PaintedFrame {
     pub display_list: Rc<DisplayList>,
     pub frame_inputs: FrameInputs,
     pub viewport_size: IntSize,
+    allows_lcd_text: bool,
     canvas_content_generations: HashMap<u64, u64>,
     video_frame_ids: HashMap<u64, Option<u64>>,
     image_frame_pixel_generations: HashMap<u64, u64>,
@@ -73,6 +74,35 @@ impl StoreDamage {
         }
         repaint_rect
     }
+
+    /// Damage discovered while painting the current store is still owed to the other stores.
+    pub fn add_damage_to_other_stores(&mut self, bitmap_id: i32, damage: IntRect) {
+        for (id, accumulated) in &mut self.accumulated {
+            if *id != bitmap_id {
+                *accumulated = accumulated.united(damage);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_late_full_repaint_is_owed_to_the_other_stores() {
+        let mut damage = StoreDamage::default();
+        let full_rect = IntRect::new(0, 0, 100, 100);
+        let partial_rect = IntRect::new(10, 10, 20, 20);
+        damage.take(1, full_rect, full_rect);
+        damage.take(2, full_rect, full_rect);
+        assert_eq!(damage.take(1, partial_rect, full_rect), full_rect);
+        assert_eq!(damage.take(2, partial_rect, full_rect), partial_rect);
+
+        damage.add_damage_to_other_stores(2, full_rect);
+        assert_eq!(damage.take(2, partial_rect, full_rect), partial_rect);
+        assert_eq!(damage.take(1, partial_rect, full_rect), full_rect);
+    }
 }
 
 // The canvases, video sinks, image frames and nested contexts whose pixels changed since the frame painted last.
@@ -82,7 +112,6 @@ pub struct LiveContentChangesSinceLastPaint {
     pub video_sinks: Vec<VideoSinkHandle>,
     pub image_frames: Vec<ImageFrameResourceId>,
     pub nested_contexts: Vec<CompositorContextId>,
-    pub media_updates: Vec<MediaUpdate>,
     pub repaints_everything: bool,
 }
 
@@ -151,6 +180,7 @@ impl ContextPresenting {
             .iter()
             .map(|&id| (id, env.nested_contexts.frame_generation_of(CompositorContextId(id))))
             .collect();
+        let allows_lcd_text = self.allows_lcd_text(display_list, &frame_inputs);
         self.painted_frame = Some(PaintedFrame {
             display_list: display_list.clone(),
             frame_inputs,
@@ -158,6 +188,7 @@ impl ContextPresenting {
                 width: viewport_rect.width,
                 height: viewport_rect.height,
             },
+            allows_lcd_text,
             canvas_content_generations,
             video_frame_ids,
             image_frame_pixel_generations,
@@ -170,6 +201,7 @@ impl ContextPresenting {
         env: &PresentingEnvironment<'_>,
         viewport_size: IntSize,
         display_list: &DisplayList,
+        frame_inputs: &FrameInputs,
         live_content: &LiveContent,
     ) -> LiveContentChangesSinceLastPaint {
         let mut changes = LiveContentChangesSinceLastPaint::default();
@@ -179,6 +211,7 @@ impl ContextPresenting {
         };
         if painted_frame.viewport_size != viewport_size
             || painted_frame.display_list.surface_clear_color() != display_list.surface_clear_color()
+            || painted_frame.allows_lcd_text != self.allows_lcd_text(display_list, frame_inputs)
         {
             changes.repaints_everything = true;
         }
@@ -197,10 +230,6 @@ impl ContextPresenting {
                 changes.repaints_everything = true;
             }
             changes.canvases.push(CanvasId(*canvas_id));
-            changes.media_updates.push(MediaUpdate {
-                media: LiveMedia::Canvas(CanvasId(*canvas_id)),
-                content_version: current_content_generation,
-            });
         }
         let summary = display_list.storage().summary();
         let image_frame_ids_of_list: HashSet<u64> = summary.image_frame_ids.iter().copied().collect();
@@ -213,10 +242,6 @@ impl ContextPresenting {
             if current_frame_id == *frame_id {
                 continue;
             }
-            changes.media_updates.push(MediaUpdate {
-                media: LiveMedia::VideoFrame(VideoSinkHandle(*video_sink_handle)),
-                content_version: current_frame_id.unwrap_or(0),
-            });
             // A video that no command of this list draws has no command in this list to damage.
             if !video_sink_handles_of_list.contains(video_sink_handle) {
                 changes.repaints_everything = true;
@@ -261,14 +286,15 @@ impl ContextPresenting {
         };
         let viewport_rect = rect_of_size(viewport_size);
         let forced_damage_rect = pending_frame.forced_damage_rect.intersected(viewport_rect);
-        let changes = self.live_content_changes_since_last_paint(env, viewport_size, frame.display_list, live_content);
-        self.layers.media_activity.note_updates(
-            &changes.media_updates,
-            frame.display_list.storage().summary(),
-            env.now,
+        let changes = self.live_content_changes_since_last_paint(
+            env,
+            viewport_size,
+            frame.display_list,
+            frame.frame_inputs,
+            live_content,
         );
 
-        let mut layers = self.layer_update_for(env, frame, viewport_rect, live_content);
+        let mut layers = self.layer_update_for(frame, viewport_rect);
         let shown_by_window_server = match layers.plan(&self.layers) {
             Some(plan) => self.window_server_can_show_media_layers_of(env, plan, live_content),
             None => false,
@@ -299,10 +325,7 @@ impl ContextPresenting {
 
         let layer_count = layers.plan(&self.layers).map(|plan| plan.layers.len());
         match layer_count {
-            None => {
-                layers.repaints_everything =
-                    layers_hold_last_frame || self.layers.repaint_everything_after_dropping_layers;
-            }
+            None => layers.repaints_everything = layers_hold_last_frame,
             Some(_) if !keeps_layer_rasters => {
                 layers.fully_repainted_layer_bits = u32::MAX;
                 layers.repaints_everything = true;
@@ -396,12 +419,7 @@ impl ContextPresenting {
         damage
     }
 
-    pub(super) fn layers_keep_plan_for(
-        &self,
-        frame: &FrameToPaint<'_>,
-        viewport_rect: IntRect,
-        active_media: &[LiveMedia],
-    ) -> bool {
+    pub(super) fn layers_keep_plan_for(&self, frame: &FrameToPaint<'_>, viewport_rect: IntRect) -> bool {
         let Some(painted_frame) = &self.painted_frame else {
             return false;
         };
@@ -409,7 +427,6 @@ impl ContextPresenting {
             && Rc::ptr_eq(&painted_frame.display_list, frame.display_list)
             && painted_frame.viewport_size.width == viewport_rect.width
             && painted_frame.viewport_size.height == viewport_rect.height
-            && self.layers.plan_active_media() == active_media
             && frame.frame_inputs.places_content_like(&painted_frame.frame_inputs)
     }
 }

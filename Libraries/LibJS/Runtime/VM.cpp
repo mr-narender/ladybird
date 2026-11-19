@@ -543,6 +543,16 @@ Vector<StackTraceElement> VM::stack_trace() const
     return stack_trace;
 }
 
+void VM::set_keeps_long_stack_traces(bool keeps_long_stack_traces)
+{
+    js_vm_set_keeps_long_stack_traces(vm_abi(*this), keeps_long_stack_traces);
+}
+
+Optional<SourceRange> VM::innermost_source_range() const
+{
+    return source_range_from_abi(js_vm_innermost_source_range(vm_abi(*this)));
+}
+
 Optional<SourceRange> VM::take_throw_site_of(Value value)
 {
     auto throw_site = source_range_from_abi(js_vm_throw_site_of(vm_abi(*this), value_to_abi(value)));

@@ -316,13 +316,39 @@ void HTMLMediaElement::finalize()
 // https://html.spec.whatwg.org/multipage/media.html#queue-a-media-element-task
 void HTMLMediaElement::queue_a_media_element_task(GC::Ref<GC::Function<void(HTMLMediaElement&)>> steps)
 {
+    m_pending_media_element_tasks.append({ .key = ++m_next_media_element_task_key, .task_id = {}, .steps = steps });
+    queue_pending_media_element_task(m_pending_media_element_tasks.last());
+}
+
+void HTMLMediaElement::queue_pending_media_element_task(PendingMediaElementTask& pending_task)
+{
     // To queue a media element task with a media element element and a series of steps steps, queue an element task on the media element's
     // media element event task source given element and steps.
-    queue_an_element_task(media_element_event_task_source(), GC::create_function(GC::Heap::the(), GC::captures(*this, steps), [](auto& self, auto& steps) {
+    pending_task.task_id = queue_an_element_task(media_element_event_task_source(), GC::create_function(GC::Heap::the(), GC::captures(*this, pending_task.key), [](auto& self, auto key) {
+        // NB: A task that doesn't run here stays pending, so that it can run once the element is adopted into a
+        //     document that's fully active.
         if (!self.document().is_fully_active())
             return;
+        auto index = self.m_pending_media_element_tasks.find_first_index_if([key](auto const& pending_task) { return pending_task.key == key; });
+        if (!index.has_value())
+            return;
+        auto steps = self.m_pending_media_element_tasks.take(*index).steps;
         steps->function()(self);
     }));
+}
+
+// NB: Tasks are queued for the document of the element's relevant global object at the time. So once the element is
+//     adopted, the tasks it still has pending won't run while the old document isn't fully active, and are removed if
+//     that document is destroyed. Instead, take them out of the queue, and queue them again, in the same order, for
+//     the document that adopted the element.
+void HTMLMediaElement::requeue_pending_media_element_tasks()
+{
+    main_thread_event_loop().task_queue().remove_tasks_matching([&](auto const& task) {
+        return task.source() == media_element_event_task_source()
+            && any_of(m_pending_media_element_tasks, [&](auto const& pending_task) { return pending_task.task_id == task.id(); });
+    });
+    for (auto& pending_task : m_pending_media_element_tasks)
+        queue_pending_media_element_task(pending_task);
 }
 
 void HTMLMediaElement::visit_edges(Cell::Visitor& visitor)
@@ -335,6 +361,8 @@ void HTMLMediaElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_list_of_newly_introduced_cues);
     visitor.visit(m_document_observer);
     visitor.visit(m_source_element_selector);
+    for (auto const& pending_task : m_pending_media_element_tasks)
+        visitor.visit(pending_task.steps);
     visitor.visit(m_pending_play_promises);
     visitor.visit(m_selected_video_track);
     visitor.visit(m_attached_media_source);
@@ -472,25 +500,13 @@ void HTMLMediaElement::adopted_from(DOM::Document& old_document)
     // While the delaying-the-load-event flag is true, the element must delay the load event of its document.
     // NB: The flag delays the load event of the element's current node document, so it follows the element when it is
     //     adopted into another document.
-    if (m_delaying_the_load_event.has_value()) {
+    if (m_delaying_the_load_event.has_value())
         m_delaying_the_load_event.emplace(document());
 
-        // AD-HOC: If the resource selection algorithm was invoked while the element's node document was not fully
-        //         active, its queued media element tasks are associated with the old document and will never run.
-        //         That would leave this element delaying the load event of the document that adopted it forever.
-        //         Drop those stale tasks and re-invoke the resource selection algorithm so that it can proceed with
-        //         tasks associated with the new document. This matches the major engines, where a pending media load
-        //         continues after adoption and delays the new document's load event until it completes. Once a fetch
-        //         is in flight the pending work lives in the fetch machinery rather than in queued media element
-        //         tasks, and the synthesized activity transitions above take care of stopping and resuming it, so
-        //         only restart resource selection when no fetch has begun.
-        if (!old_document.is_fully_active() && !m_remote_fetch_data) {
-            main_thread_event_loop().task_queue().remove_tasks_matching([&](auto const& task) {
-                return task.source() == media_element_event_task_source();
-            });
-            select_resource_for_current_load();
-        }
-    }
+    // NB: So a load that's under way when the element is adopted carries on in the document that adopted it, and
+    //     delays that document's load event until it's done. Once a fetch is in flight, the activity transitions
+    //     synthesized above stop and resume it.
+    requeue_pending_media_element_tasks();
 
     if (m_screen_wake_lock.has_value()) {
         m_screen_wake_lock.clear();
@@ -949,6 +965,8 @@ WebIDL::ExceptionOr<void> HTMLMediaElement::load_element()
     //          source, or run as part of the fetch. Step 3 will remove any subroutine from the queue. Step 7.2 will stop
     //          any ongoing fetch operation. Therefore, all resource selection algorithms will be cancelled before a new
     //          one begins.
+    // NB: A source element selector also resumes from changes to the element's children, so drop it too.
+    m_source_element_selector = nullptr;
 
     // 3. Let pending tasks be a list of all tasks from the media element's media element event task source in one of
     //    the task queues.
@@ -958,6 +976,7 @@ WebIDL::ExceptionOr<void> HTMLMediaElement::load_element()
     main_thread_event_loop().task_queue().remove_tasks_matching([&](auto& task) {
         return task.source() == media_element_event_task_source();
     });
+    m_pending_media_element_tasks.clear();
 
     // 6. If the media element's networkState is set to NETWORK_LOADING or NETWORK_IDLE, queue a media element task given the media element to
     //    fire an event named abort at the media element.
@@ -1080,8 +1099,9 @@ public:
     {
         // 2. ⌛ Process candidate: If candidate does not have a src attribute, or if its src attribute's value is the
         //    empty string, then end the synchronous section, and jump down to the failed with elements step below.
+        auto& candidate = *m_candidate;
         Utf16String candidate_src;
-        if (auto maybe_src = m_candidate->get_attribute(HTML::AttributeNames::src); maybe_src.has_value())
+        if (auto maybe_src = candidate.get_attribute(HTML::AttributeNames::src); maybe_src.has_value())
             candidate_src = maybe_src.release_value();
 
         if (candidate_src.is_empty()) {
@@ -1093,7 +1113,7 @@ public:
         //           then end the synchronous section, and jump down to the failed with elements step below.
 
         // 4. ⌛ Let urlRecord be the result of encoding-parsing a URL given candidate's src attribute's value, relative to candidate's node document when the src attribute was last changed.
-        auto url_record = m_candidate->document().encoding_parse_url(candidate_src);
+        auto url_record = candidate.document().encoding_parse_url(candidate_src);
 
         // 5. ⌛ If urlRecord is failure, then end the synchronous section, and jump down to the failed with elements step below.
         if (!url_record.has_value()) {
@@ -1105,7 +1125,7 @@ public:
         //    the codecs parameter, for types that define that parameter), represents a type that the user agent knows it
         //    cannot render, then end the synchronous section, and jump down to the failed with elements step below.
         // NB: An empty type attribute names no type, so unlike an unparseable one, it doesn't rule the source out.
-        if (auto type = m_candidate->get_attribute(HTML::AttributeNames::type); type.has_value() && !type->is_empty()) {
+        if (auto type = candidate.get_attribute(HTML::AttributeNames::type); type.has_value() && !type->is_empty()) {
             if (m_media_element->can_play_type(*type) == Bindings::CanPlayTypeResult::Empty) {
                 failed_with_elements();
                 return;
@@ -1134,7 +1154,16 @@ public:
         if (!m_waiting)
             return;
 
-        wait_for_next_candidate();
+        // NB: Resume from a media element task, which runs only while the document is fully active: A selection
+        //     resumed synchronously would fetch a candidate for a document that isn't (one whose iframe was removed,
+        //     e.g.). The pointer itself is still kept in place synchronously, by node_removed(). Each change queues a
+        //     task of its own, and once one task has resumed the selection, the rest find it no longer waiting.
+        m_media_element->queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& selector, HTMLMediaElement&) {
+            // A later load replaced this selector, and that selection decides what loads now.
+            if (!selector.is_current() || !selector.m_waiting)
+                return;
+            selector.wait_for_next_candidate();
+        }));
     }
 
     // If the node before pointer is removed: Let pointer be the point between the node after pointer and the node
@@ -1148,26 +1177,64 @@ public:
     void all_children_removed()
     {
         m_node_before_pointer = nullptr;
+        m_candidate = nullptr;
+    }
+
+    // If candidate is removed from the media element, or moved out of it, then set candidate to null.
+    void node_left(DOM::Node const& node)
+    {
+        if (m_candidate.ptr() == &node)
+            m_candidate = nullptr;
     }
 
 private:
+    bool is_current() const { return m_media_element->m_source_element_selector.ptr() == this; }
+
     void failed_with_elements()
     {
-        // 9. Failed with elements: Queue a media element task given the media element to fire an event named error at candidate.
+        // 9. Failed with elements: If candidate is not null, then queue a media element task given the media element to
+        //    fire an event named error at candidate.
+        // NB: The steps after this one run in that same task (see the FIXME below), so it's queued even when candidate
+        //     is null, and checks candidate when it runs.
         m_media_element->queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& selector, HTMLMediaElement&) {
-            selector.m_candidate->dispatch_event(DOM::Event::create(HTML::relevant_global_object(*selector.m_candidate), HTML::EventNames::error));
+            // A later load replaced this selector, and that selection decides what loads now.
+            if (!selector.is_current())
+                return;
 
-            // 10. Await a stable state. The synchronous section consists of all the remaining steps of this algorithm until
-            //     the algorithm says the synchronous section has ended. (Steps in synchronous sections are marked with ⌛.)
-            // FIXME: Also run the next steps within this task, instead of waiting for a stable state.
-            //        This seems to match the intent in https://github.com/whatwg/html/issues/2882#issuecomment-1108531815.
-            //        Update this if the spec is clarified in regard to this step.
+            if (selector.m_candidate)
+                selector.m_candidate->dispatch_event(DOM::Event::create(HTML::relevant_global_object(*selector.m_candidate), HTML::EventNames::error));
 
-            // 11. ⌛ Forget the media element's media-resource-specific tracks.
-            selector.m_media_element->forget_media_resource_specific_tracks();
+            // NB: An error listener that invoked the load algorithm (by setting src, e.g.) aborted this selection.
+            if (!selector.is_current())
+                return;
 
-            selector.find_next_candidate();
+            // NB: An error listener can also adopt the element into a document that isn't fully active, where nothing can
+            //     be fetched. So go on from a media element task instead, which waits until the element is back in a
+            //     fully active document.
+            if (!selector.m_media_element->document().is_fully_active()) {
+                selector.m_media_element->queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(selector), [](auto& selector, HTMLMediaElement&) {
+                    if (selector.is_current())
+                        selector.continue_after_failure();
+                }));
+                return;
+            }
+
+            selector.continue_after_failure();
         }));
+    }
+
+    void continue_after_failure()
+    {
+        // 10. Await a stable state. The synchronous section consists of all the remaining steps of this algorithm until
+        //     the algorithm says the synchronous section has ended. (Steps in synchronous sections are marked with ⌛.)
+        // FIXME: Also run the next steps within this task, instead of waiting for a stable state.
+        //        This seems to match the intent in https://github.com/whatwg/html/issues/2882#issuecomment-1108531815.
+        //        Update this if the spec is clarified in regard to this step.
+
+        // 11. ⌛ Forget the media element's media-resource-specific tracks.
+        m_media_element->forget_media_resource_specific_tracks();
+
+        find_next_candidate();
     }
 
     GC::Ptr<DOM::Node> node_after(GC::Ptr<DOM::Node> node_before_pointer) const
@@ -1212,8 +1279,12 @@ private:
 
         // 19. ⌛ Queue a media element task given the media element to set the element's delaying-the-load-event flag
         //     to false. This stops delaying the load event.
-        m_media_element->queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(*this), [](auto& selector, HTMLMediaElement&) {
-            selector.m_media_element->set_delaying_the_load_event(false);
+        // NB: Only if this same wait still goes on when the task runs: Once it ends, the fetch it went on to start
+        //     delays the load event, and a later wait queues a task of its own.
+        auto wait = ++m_wait_count;
+        m_media_element->queue_a_media_element_task(GC::create_function(GC::Heap::the(), GC::captures(*this, wait), [](auto& selector, auto wait, HTMLMediaElement&) {
+            if (selector.is_current() && selector.m_waiting && selector.m_wait_count == wait)
+                selector.m_media_element->set_delaying_the_load_event(false);
         }));
 
         // 20. End the synchronous section, continuing the remaining steps in parallel.
@@ -1248,8 +1319,9 @@ private:
     }
 
     GC::Ref<HTMLMediaElement> m_media_element;
-    GC::Ref<HTMLSourceElement> m_candidate;
+    GC::Ptr<HTMLSourceElement> m_candidate;
     bool m_waiting { false };
+    u64 m_wait_count { 0 };
     GC::Ptr<DOM::Node> m_node_before_pointer;
 };
 
@@ -1260,12 +1332,30 @@ void HTMLMediaElement::children_changed(ChildrenChangedMetadata const& metadata)
     Base::children_changed(metadata);
 
     if (m_source_element_selector) {
-        if (metadata.type == ChildrenChangedMetadata::Type::Removal)
+        if (metadata.type == ChildrenChangedMetadata::Type::Removal) {
             m_source_element_selector->node_removed(*metadata.node, metadata.old_previous_sibling);
-        else if (metadata.type == ChildrenChangedMetadata::Type::AllChildrenRemoved)
+            m_source_element_selector->node_left(*metadata.node);
+        } else if (metadata.type == ChildrenChangedMetadata::Type::AllChildrenRemoved)
             m_source_element_selector->all_children_removed();
         m_source_element_selector->process_next_candidate();
     }
+}
+
+void HTMLMediaElement::child_moved_out(DOM::Node const& child, GC::Ptr<DOM::Node> old_previous_sibling)
+{
+    if (!m_source_element_selector)
+        return;
+    m_source_element_selector->node_removed(child, old_previous_sibling);
+    // NB: A child moved within this element is still in it, so it stays the candidate.
+    if (child.parent() != this)
+        m_source_element_selector->node_left(child);
+    m_source_element_selector->process_next_candidate();
+}
+
+void HTMLMediaElement::child_moved_in()
+{
+    if (m_source_element_selector)
+        m_source_element_selector->process_next_candidate();
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#concept-media-load-algorithm

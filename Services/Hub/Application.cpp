@@ -27,6 +27,16 @@ void Application::create_platform_arguments(Core::ArgsParser& args_parser)
 {
     args_parser.add_option(m_encoded_ui_info, "What the UI tells the Hub to start with", "ui-info", 0, "hex");
     args_parser.add_option(m_ui_mach_server_name, "Mach server to get the connection to the UI from", "ui-mach-server", 0, "name");
+    // NB: main() reads this itself, before the arguments are parsed.
+    args_parser.add_option(m_ui_pid, "Process of the UI, which the Hub ends with", "ui-pid", 0, "pid");
+}
+
+Optional<pid_t> Application::ui_process_id() const
+{
+    auto pid = m_ui_pid.to_number<pid_t>();
+    if (!pid.has_value() || *pid <= 0)
+        return {};
+    return pid;
 }
 
 Hub::UIInfo const* Application::ui_info() const
@@ -428,6 +438,7 @@ OwnPtr<WebView::PictureInPictureWindow> Application::create_picture_in_picture_w
     auto initial_state = owner_view.initial_state_for_related_view();
     initial_state.owner_view_id = owner_view.view_id();
     initial_state.is_tab = false;
+    initial_state.scales_frames_to_fit = true;
     auto screen_size = owner_view.screen_size();
     auto& view = create_view(move(initial_state), traversable);
     return make<PictureInPictureWindowInUI>(view, owner_view.view_id(), video_size, WebView::PictureInPictureWindow::initial_size(video_size, screen_size));

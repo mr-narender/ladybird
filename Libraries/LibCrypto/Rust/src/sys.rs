@@ -56,6 +56,12 @@ pub(crate) struct OSSL_PARAM {
     return_size: usize,
 }
 
+impl OSSL_PARAM {
+    pub(crate) fn is_end(&self) -> bool {
+        self.key.is_null()
+    }
+}
+
 pub(crate) const EVP_PKEY_PUBLIC_KEY: c_int = 0x86;
 pub(crate) const EVP_PKEY_KEYPAIR: c_int = 0x87;
 
@@ -76,6 +82,7 @@ pub(crate) const POINT_CONVERSION_UNCOMPRESSED: c_int = 4;
 
 unsafe extern "C" {
     pub(crate) fn ERR_clear_error();
+    pub(crate) fn OPENSSL_cleanse(pointer: *mut c_void, length: usize);
     pub(crate) fn RAND_bytes(buffer: *mut u8, length: c_int) -> c_int;
 
     pub(crate) fn OSSL_PARAM_construct_octet_string(key: *const c_char, buffer: *mut c_void, size: usize)
@@ -243,6 +250,10 @@ unsafe extern "C" {
 
     pub(crate) fn EVP_CIPHER_CTX_new() -> *mut EVP_CIPHER_CTX;
     pub(crate) fn EVP_CIPHER_CTX_free(context: *mut EVP_CIPHER_CTX);
+    pub(crate) fn EVP_CIPHER_get_key_length(cipher: *const EVP_CIPHER) -> c_int;
+    pub(crate) fn EVP_CIPHER_get_iv_length(cipher: *const EVP_CIPHER) -> c_int;
+    pub(crate) fn EVP_CIPHER_CTX_get_key_length(context: *const EVP_CIPHER_CTX) -> c_int;
+    pub(crate) fn EVP_CIPHER_CTX_get_iv_length(context: *const EVP_CIPHER_CTX) -> c_int;
     pub(crate) fn EVP_CipherInit_ex(
         context: *mut EVP_CIPHER_CTX,
         cipher: *const EVP_CIPHER,

@@ -122,6 +122,10 @@ public:
     Optional<i32> compositor_connection_id(Badge<Application>) const { return m_compositor_connection_id; }
 
     virtual void did_misbehave(StringView message_name, StringView reason) override;
+    // The process is about to be ended for using more memory than the limit.
+    void did_exceed_memory_limit() { m_exceeded_memory_limit = true; }
+    // A tab that a page of this process belongs to was shown or hidden.
+    void did_change_visibility_of_a_tab();
     enum class HTTPCookieAccess : u8 {
         Allowed,
         // A WebDriver cookie command runs, but for another document, which the renderer may not have heard of yet.
@@ -272,6 +276,7 @@ private:
     RequestServerSiteBindings m_request_server_site_bindings;
     bool m_requested_close { false };
     bool m_rejected_ipc { false };
+    bool m_exceeded_memory_limit { false };
     // The site of the documents this process hosts, if it has only hosted those of one.
     Optional<Utf16String> m_site_of_hosted_documents;
     Optional<u64> m_image_decoder_client_generation;
@@ -334,6 +339,10 @@ private:
         [this] { update_audio_capture_indicators(); },
     };
     RefPtr<Core::Timer> m_detached_page_close_timer;
+
+    bool all_tabs_are_hidden() const;
+    void release_memory_of_hidden_tabs();
+    RefPtr<Core::Timer> m_release_memory_of_hidden_tabs_timer;
 
     // When this process last got a WebRTCClient, so that it can't make us spawn them in a loop.
     Vector<MonotonicTime> m_webrtc_client_launch_times;

@@ -12,7 +12,7 @@ use core::ffi::{CStr, c_int};
 
 use crate::key::{HandleTag, Key, KeyDecodeError, KeyHandle, KeyPair, SecretBytes, StoredKey};
 use crate::openssl::{
-    self, BigNum, ParamBuilder, Pkey, end_parameter, int_parameter, octet_string_parameter, utf8_parameter,
+    self, BigNum, Param, ParamBuilder, Pkey, end_parameter, int_parameter, octet_string_parameter, utf8_parameter,
 };
 use crate::{CryptoError, KeyAlgorithm, RsaJwkInteger, ShaHashKind, der, sys};
 
@@ -67,7 +67,7 @@ impl RsaPublicKey {
         builder.push_number(c"e", public_exponent, false)?;
         let params = builder.build()?;
         Ok(Self {
-            key: Pkey::from_data(c"RSA", sys::EVP_PKEY_PUBLIC_KEY, params.as_ptr())?,
+            key: Pkey::from_data(c"RSA", sys::EVP_PKEY_PUBLIC_KEY, &params)?,
         })
     }
 
@@ -75,7 +75,7 @@ impl RsaPublicKey {
         if !public_exponent_is_valid(&self.key) {
             return Ok(false);
         }
-        Ok(openssl::check_key(&self.key, false, false)?.public)
+        openssl::check_key(&self.key, false, false)
     }
 }
 
@@ -104,7 +104,7 @@ impl RsaPrivateKey {
         }
         let params = builder.build()?;
         Ok(Self {
-            key: Pkey::from_data(c"RSA", sys::EVP_PKEY_KEYPAIR, params.as_ptr())?,
+            key: Pkey::from_data(c"RSA", sys::EVP_PKEY_KEYPAIR, &params)?,
             has_crt_components: crt_components.is_some(),
         })
     }
@@ -140,8 +140,7 @@ impl RsaPrivateKey {
             return Ok(false);
         }
         // NB: The pairwise check needs the prime factors, which a key of only n, e and d does not have.
-        let checks = openssl::check_key(&self.key, true, self.has_crt_components)?;
-        Ok(checks.public && checks.private && checks.pairwise)
+        openssl::check_key(&self.key, true, self.has_crt_components)
     }
 }
 
@@ -180,7 +179,7 @@ pub fn rsa_generate_key_pair(modulus_length: u32, exponent: &[u8]) -> Result<Key
     builder.push_uint(c"bits", modulus_length)?;
     builder.push_number(c"e", exponent, false)?;
     let params = builder.build()?;
-    let private_key = RsaPrivateKey::from_key(Pkey::generate(c"RSA", Some(params.as_ptr()))?);
+    let private_key = RsaPrivateKey::from_key(Pkey::generate(c"RSA", &params)?);
     let public_key = private_key.public_key()?;
     Ok(KeyPair {
         public_key: KeyHandle(Key::RsaPublic(public_key)),
@@ -221,11 +220,12 @@ pub fn rsa_key_from_components(is_private: bool, components: &[&[u8]]) -> Option
 }
 
 // NB: OpenSSL writes a SubjectPublicKeyInfo of rsaEncryption with NULL parameters.
-pub fn rsa_export_der(key: &KeyHandle, is_public: bool) -> Result<Vec<u8>, CryptoError> {
-    if is_public {
-        return public_key(key).key.public_key_info();
-    }
-    let private_key = private_key(key);
+pub fn rsa_export_der(key: &KeyHandle) -> Result<Vec<u8>, CryptoError> {
+    let private_key = match &key.0 {
+        Key::RsaPublic(public_key) => return public_key.key.public_key_info(),
+        Key::RsaPrivate(private_key) => private_key,
+        _ => panic!("The key is not an RSA key"),
+    };
     if !private_key.has_crt_components {
         return Err(CryptoError::Backend);
     }
@@ -252,17 +252,27 @@ pub fn rsa_export_der(key: &KeyHandle, is_public: bool) -> Result<Vec<u8>, Crypt
     ))
 }
 
-pub fn rsa_export_jwk_integer(key: &KeyHandle, component: RsaJwkInteger) -> Result<Vec<u8>, CryptoError> {
-    match &key.0 {
-        Key::RsaPublic(public_key) => match component {
-            RsaJwkInteger::Modulus | RsaJwkInteger::PublicExponent => {
-                Ok(integer(&public_key.key, component)?.into_vec())
-            }
-            _ => panic!("A public key has only n and e"),
-        },
-        Key::RsaPrivate(private_key) => Ok(private_key.component(component)?.into_vec()),
+/// The integer of an RSA key, or none for a CRT value of a private key that has none.
+pub fn rsa_export_jwk_integer(key: &KeyHandle, component: RsaJwkInteger) -> Result<Option<Vec<u8>>, CryptoError> {
+    let (key, has_crt_components) = match &key.0 {
+        Key::RsaPublic(public_key) => {
+            assert!(
+                matches!(component, RsaJwkInteger::Modulus | RsaJwkInteger::PublicExponent),
+                "A public key has only n and e"
+            );
+            (&public_key.key, false)
+        }
+        Key::RsaPrivate(private_key) => (&private_key.key, private_key.has_crt_components),
         _ => panic!("The key is not an RSA key"),
+    };
+    let is_crt_component = !matches!(
+        component,
+        RsaJwkInteger::Modulus | RsaJwkInteger::PublicExponent | RsaJwkInteger::PrivateExponent
+    );
+    if is_crt_component && !has_crt_components {
+        return Ok(None);
     }
+    Ok(Some(integer(key, component)?.into_vec()))
 }
 
 pub fn rsa_oaep_cipher(
@@ -313,7 +323,7 @@ impl RsaSignaturePadding {
 }
 
 /// The signature parameters of the padding, which point at `salt_length`.
-fn signature_parameters(hash_kind: ShaHashKind, salt_length: Option<&mut c_int>) -> Vec<sys::OSSL_PARAM> {
+fn signature_parameters(hash_kind: ShaHashKind, salt_length: Option<&mut c_int>) -> Vec<Param<'_>> {
     match salt_length {
         Some(salt_length) => vec![
             utf8_parameter(c"pad-mode", c"pss"),

@@ -399,6 +399,11 @@ struct HostObjectHookThunks {
     {
         return normal_completion_to_abi(value_to_abi(Traits::get_indexed_value(host_object_from_abi(object), index)));
     }
+
+    static void preserve_identity(JSObject* object)
+    {
+        Traits::preserve_identity(host_object_from_abi(object));
+    }
 };
 
 template<typename Traits>
@@ -481,6 +486,8 @@ consteval JSHostObjectHooks make_host_object_hooks()
         hooks.finalize = &Thunks::finalize;
     if constexpr (requires { &Traits::get_indexed_value; })
         hooks.get_indexed_value = &Thunks::get_indexed_value;
+    if constexpr (requires { &Traits::preserve_identity; })
+        hooks.preserve_identity = &Thunks::preserve_identity;
     return hooks;
 }
 
@@ -543,9 +550,7 @@ consteval JSHostClass make_host_class(u8 kind, StringView name, JSHostClass cons
     VERIFY(!(flags & JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT) || parent);
 
     return JSHostClass {
-        .abi_version = JS_HOST_ABI_VERSION,
         .kind = kind,
-        .reserved = 0,
         .flags = flags,
         .name = name.characters_without_null_termination(),
         .name_length = name.length(),

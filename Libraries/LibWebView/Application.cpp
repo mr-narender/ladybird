@@ -326,6 +326,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     Optional<u32> screenshot_delay;
     Optional<StringView> screenshot_path;
     bool new_window = false;
+    Optional<i64> replace_browser_from_before;
     StringView stats_log_directory;
     Optional<StringView> profile_name;
     Optional<StringView> profile_path;
@@ -351,6 +352,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     auto site_isolation_mode = default_site_isolation_mode();
     bool disable_same_origin_tab_sharing = false;
     Optional<size_t> maximum_site_request_servers;
+    Optional<u64> web_content_memory_limit_in_mebibytes;
     bool disable_http_memory_cache = false;
     bool disable_http_disk_cache = false;
     bool disable_content_blocker = false;
@@ -430,6 +432,10 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .hide_mode = Core::ArgsParser::OptionHideMode::CommandLineAndMarkdown,
     });
     args_parser.add_option(new_window, "Force opening in a new window", "new-window", 'n');
+#if !defined(AK_OS_WINDOWS)
+    // FIXME: Offer this on Windows as well, once an unresponsive browser can be ended there.
+    args_parser.add_option(replace_browser_from_before, "End a browser that is running for the profile if it is unresponsive and started before this time, and start in its place", "replace-unresponsive-browser-from-before", 0, "unix-time-in-milliseconds");
+#endif
 #if !defined(AK_OS_ANDROID)
     args_parser.add_option(stats_log_directory, "Directory for process statistics (JSON lines)", "stats-log-dir", 0, "path");
     args_parser.add_option(profile_name, "Select or create a named profile", "profile", 0, "name");
@@ -480,6 +486,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
     args_parser.add_option(disable_http_memory_cache, "Disable HTTP memory cache", "disable-http-memory-cache");
     args_parser.add_option(disable_http_disk_cache, "Disable HTTP disk cache", "disable-http-disk-cache");
     args_parser.add_option(maximum_site_request_servers, "How many RequestServers a session may have for the sites it visits, 0 to share one", "max-site-request-servers", 0, "count");
+    args_parser.add_option(web_content_memory_limit_in_mebibytes, "How much memory a WebContent process may use before it is ended, 0 for no limit", "web-content-memory-limit", 0, "MiB");
     args_parser.add_option(disable_content_blocker, "Disable content blocker", "disable-content-blocker");
     args_parser.add_option(disable_sandbox, "Disable helper process sandboxing", "disable-sandbox");
     args_parser.add_option(force_video_decoder_server, "Also decode video that has no hardware decoder in the VideoDecoderServer", "force-video-decoder-server");
@@ -613,6 +620,11 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
         .force_video_decoder_server = force_video_decoder_server ? ForceVideoDecoderServer::Yes : ForceVideoDecoderServer::No,
     };
 
+    if (web_content_memory_limit_in_mebibytes.has_value()) {
+        if (*web_content_memory_limit_in_mebibytes > NumericLimits<u64>::max() / MiB)
+            return Error::from_string_literal("The WebContent memory limit is too large");
+        m_browser_options.web_content_memory_limit_in_bytes = *web_content_memory_limit_in_mebibytes * MiB;
+    }
     if (screenshot_delay.has_value())
         m_browser_options.screenshot_delay = *screenshot_delay;
     if (screenshot_path.has_value())
@@ -680,9 +692,11 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
 
     m_browser_process = make<BrowserProcess>();
     if (coordinate_browser_process) {
-        auto disposition = TRY(m_browser_process->connect(m_browser_options.raw_urls, m_browser_options.new_window, profile().paths().runtime, profile_identity));
-        if (disposition == BrowserProcess::ProcessDisposition::ExitProcess) {
+        auto replace_from_before = replace_browser_from_before.map([](auto milliseconds) { return UnixDateTime::from_milliseconds_since_epoch(milliseconds); });
+        auto disposition = TRY(m_browser_process->connect(m_browser_options.raw_urls, m_browser_options.new_window, profile().paths().runtime, profile_identity, ui_process_id(), replace_from_before));
+        if (disposition != BrowserProcess::ProcessDisposition::ContinueMainProcess) {
             m_should_exit_after_profile_coordination = true;
+            m_browser_is_unresponsive = disposition == BrowserProcess::ProcessDisposition::BrowserIsUnresponsive;
             return {};
         }
     }
@@ -1658,6 +1672,13 @@ void Application::update_compositor_context_presents_from_cpu_memory(Web::Compos
     m_compositor_client->async_set_context_presents_from_cpu_memory(context_id, presents_from_cpu_memory);
 }
 
+void Application::update_compositor_context_scales_frames_to_fit(Web::CompositorContextId context_id, bool scales_frames_to_fit)
+{
+    if (!can_send_compositor_process_ipc(m_compositor_client))
+        return;
+    m_compositor_client->async_set_context_scales_frames_to_fit(context_id, scales_frames_to_fit);
+}
+
 bool Application::handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId context_id, Web::KeyEvent const& event, bool allow_keyboard_scroll)
 {
     if (!can_send_compositor_process_ipc(m_compositor_presentation_client))
@@ -1862,6 +1883,19 @@ ErrorOr<void> Application::launch_services()
     m_process_manager->on_process_exited = [this](Process&& process, Optional<int> exit_status) {
         process_did_exit(move(process), exit_status);
     };
+    m_process_manager->on_process_near_memory_limit = [](Process& process, u64) {
+        if (process.type() != ProcessType::WebContent)
+            return;
+        if (auto client = process.client<WebContentClient>())
+            client->async_release_memory();
+    };
+    m_process_manager->on_process_exceeded_memory_limit = [](Process& process, u64) {
+        if (process.type() != ProcessType::WebContent)
+            return;
+        if (auto client = process.client<WebContentClient>())
+            client->did_exceed_memory_limit();
+    };
+    m_process_manager->set_web_content_memory_limit(m_browser_options.web_content_memory_limit_in_bytes.value_or(ProcessManager::default_web_content_memory_limit()));
 
     if (m_browser_options.disable_sql_database == DisableSQLDatabase::No) {
         auto database_path = profile().paths().data;
@@ -2497,6 +2531,13 @@ static void load_page_for_info_and_exit(Core::EventLoop& event_loop, HeadlessWeb
                 warnln("Unable to get page info: {}", error);
                 event_loop.quit(1);
             });
+    };
+    // NB: A page that was ended for its memory use is not loaded again, so its load never finishes.
+    view.on_web_content_crashed = [&event_loop](auto crash_reason) {
+        if (crash_reason != ViewImplementation::WebContentCrashReason::ExceededMemoryLimit)
+            return;
+        warnln("Unable to get page info: the page was ended for its memory use");
+        event_loop.quit(1);
     };
 
     view.load(url);

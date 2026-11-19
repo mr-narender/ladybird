@@ -11,10 +11,9 @@
 
 use core::ffi::{CStr, c_int, c_uint};
 
-use ak::Utf16String;
 use subtle::ConstantTimeEq;
 
-use key::SecretBytes;
+use key::Key;
 use openssl::{Cipher, CipherContext, Pkey, end_parameter, octet_string_parameter, uint_parameter, utf8_parameter};
 
 mod der;
@@ -31,12 +30,14 @@ pub use ec::{
     ec_export_uncompressed, ec_generate_key_pair, ec_key_from_coordinates, ec_key_is_valid, ec_parse_raw_public_key,
     ec_public_key_scalar_size, ec_sign, ec_verify,
 };
-pub use key::{HandleTag, KeyDecodeError, KeyHandle, KeyPair, StoredKey};
-pub use key_info::{KeyAlgorithm, KeyInfo, parse_octet_string, parse_private_key_info, parse_subject_public_key_info};
+pub use key::{HandleTag, KeyDecodeError, KeyHandle, KeyPair, SecretBytes, StoredKey};
+pub use key_info::{
+    KeyAlgorithm, KeyInfo, KeyMaterial, parse_octet_string, parse_private_key_info, parse_subject_public_key_info,
+};
 pub use ml::{
-    ml_export_der, ml_seed_bytes, mldsa_generate_key_pair, mldsa_public_bytes, mldsa_read_public_key, mldsa_sign,
-    mldsa_verify, mlkem_decapsulate, mlkem_encapsulate, mlkem_generate_key_pair, mlkem_public_bytes,
-    mlkem_read_public_key,
+    ml_export_der, ml_seed_bytes, mldsa_generate_key_pair, mldsa_private_key_from_seed, mldsa_public_bytes,
+    mldsa_read_public_key, mldsa_sign, mldsa_verify, mlkem_decapsulate, mlkem_encapsulate, mlkem_generate_key_pair,
+    mlkem_private_key_from_seed, mlkem_public_bytes, mlkem_read_public_key,
 };
 pub use rsa::{
     RsaSignaturePadding, rsa_export_der, rsa_export_jwk_integer, rsa_export_public_exponent, rsa_generate_key_pair,
@@ -183,7 +184,7 @@ pub fn hkdf_derive_key(
     key: &[u8],
     info: &[u8],
     length: u32,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<SecretBytes, CryptoError> {
     let params = [
         utf8_parameter(c"digest", kind.name()),
         octet_string_parameter(c"key", key),
@@ -191,7 +192,7 @@ pub fn hkdf_derive_key(
         octet_string_parameter(c"info", info),
         end_parameter(),
     ];
-    let mut derived = vec![0; length as usize];
+    let mut derived = SecretBytes::new(vec![0; length as usize]);
     openssl::kdf(c"HKDF", &params, &mut derived)?;
     Ok(derived)
 }
@@ -202,7 +203,7 @@ pub fn pbkdf2_derive_key(
     salt: &[u8],
     iterations: u32,
     length: u32,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<SecretBytes, CryptoError> {
     // NB: OpenSSL's PBKDF2 takes the iteration count and the lengths as int.
     let fits_in_int = |value: usize| c_int::try_from(value).is_ok();
     if ![iterations as usize, password.len(), salt.len(), length as usize]
@@ -223,7 +224,7 @@ pub fn pbkdf2_derive_key(
         openssl::int_parameter(c"pkcs5", &mut pkcs5),
         end_parameter(),
     ];
-    let mut derived = vec![0; length as usize];
+    let mut derived = SecretBytes::new(vec![0; length as usize]);
     openssl::kdf(c"PBKDF2", &params, &mut derived)?;
     Ok(derived)
 }
@@ -350,14 +351,14 @@ pub fn argon2_validate_parameters(nonce: &[u8]) -> Result<(), CryptoError> {
 }
 
 /// Argon2 with inputs that `argon2_validate_parameters()` accepts.
-pub fn argon2_derive_key(kind: Argon2Type, inputs: &Argon2Inputs<'_>) -> Result<Vec<u8>, CryptoError> {
+pub fn argon2_derive_key(kind: Argon2Type, inputs: &Argon2Inputs<'_>) -> Result<SecretBytes, CryptoError> {
     let name = match kind {
         Argon2Type::Argon2d => c"ARGON2D",
         Argon2Type::Argon2i => c"ARGON2I",
         Argon2Type::Argon2id => c"ARGON2ID",
     };
     // NB: OpenSSL takes version 0x13, the only version Web Crypto allows, and one thread when none are given.
-    let mut output = vec![0; inputs.tag_length as usize];
+    let mut output = SecretBytes::new(vec![0; inputs.tag_length as usize]);
     let (mut passes, mut lanes, mut memory) = (inputs.passes, inputs.parallelism, inputs.memory);
     let mut size = c_uint::try_from(output.len()).map_err(|_| CryptoError::Backend)?;
     let mut params = vec![
@@ -420,12 +421,15 @@ fn cipher(
     context.init(encrypt, Some(cipher), Some(key), iv)?;
     let mut output = Vec::with_capacity(input.len());
     // NB: Key wrapping takes its input whole.
-    if allow_key_wrapping {
-        context.update_whole(input, &mut output)?;
+    let result = if allow_key_wrapping {
+        context.update_whole(input, &mut output)
     } else {
-        context.update(input, &mut output)?;
-    }
-    context.finalize(&mut output)?;
+        context.update(input, &mut output)
+    };
+    // NB: OpenSSL writes a plaintext out before it checks its padding.
+    result
+        .and_then(|()| context.finalize(&mut output))
+        .inspect_err(|_| key::clear_allocation(&mut output))?;
     Ok(output)
 }
 
@@ -465,12 +469,12 @@ pub fn aes_ctr_cipher(
             _ => remaining.len(),
         };
         let (segment, rest) = remaining.split_at(segment_length);
-        output.extend(aes_ctr_cipher_whole_block_counter(
+        output.extend_from_slice(&SecretBytes::new(aes_ctr_cipher_whole_block_counter(
             encrypt,
             key,
             segment,
             &block.to_be_bytes(),
-        )?);
+        )?));
         remaining = rest;
         block &= !mask;
     }
@@ -528,8 +532,12 @@ fn aead(
     context.add_additional_data(additional_data)?;
 
     let mut output = Vec::with_capacity(input.len() + tag_length);
-    context.update(input, &mut output)?;
-    context.finalize(&mut output)?;
+    // NB: OpenSSL writes a plaintext out before it checks its tag, and a failed finalization does not count the
+    //     bytes it wrote.
+    context
+        .update(input, &mut output)
+        .and_then(|()| context.finalize(&mut output))
+        .inspect_err(|_| key::clear_allocation(&mut output))?;
     if encrypt {
         output.extend_from_slice(&context.tag(tag_length)?);
     }
@@ -606,28 +614,84 @@ impl OkpCurve {
     }
 }
 
-pub fn okp_generate_private_key(curve: OkpCurve) -> Result<Vec<u8>, CryptoError> {
-    Ok(Pkey::generate(curve.name(), None)?.raw_private_key()?.into_vec())
+pub(crate) struct OkpKey {
+    curve: OkpCurve,
+    key: Pkey,
 }
 
-pub fn okp_generate_public_key(curve: OkpCurve, private_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    Pkey::from_raw_private_key(curve.name(), private_key)?.raw_public_key()
+impl OkpKey {
+    /// The stored form of the key: its raw public or private key.
+    pub(crate) fn stored(&self, tag: HandleTag) -> StoredKey {
+        let bytes = if tag == HandleTag::OkpPrivate {
+            self.key.raw_private_key()
+        } else {
+            self.key.raw_public_key().map(SecretBytes::new)
+        };
+        StoredKey::new(tag, vec![bytes.expect("OpenSSL gives an OKP key's raw key")])
+    }
+
+    fn public_key(&self) -> Result<Self, CryptoError> {
+        Ok(Self {
+            curve: self.curve,
+            key: Pkey::from_raw_public_key(self.curve.name(), &self.key.raw_public_key()?)?,
+        })
+    }
 }
 
-pub fn okp_compute_coordinate(curve: OkpCurve, private_key: &[u8], public_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    if !matches!(curve, OkpCurve::X25519 | OkpCurve::X448) {
+fn okp_key(key: &KeyHandle) -> &OkpKey {
+    match &key.0 {
+        Key::OkpPublic(key) | Key::OkpPrivate(key) => key,
+        _ => panic!("The key is not an OKP key"),
+    }
+}
+
+pub fn okp_generate_key_pair(curve: OkpCurve) -> Result<KeyPair, CryptoError> {
+    let private_key = OkpKey {
+        curve,
+        key: Pkey::generate(curve.name(), &[end_parameter()])?,
+    };
+    Ok(KeyPair {
+        public_key: KeyHandle(Key::OkpPublic(private_key.public_key()?)),
+        private_key: KeyHandle(Key::OkpPrivate(private_key)),
+    })
+}
+
+pub fn okp_key_from_raw(curve: OkpCurve, is_private: bool, bytes: &[u8]) -> Result<KeyHandle, CryptoError> {
+    Ok(KeyHandle(if is_private {
+        Key::OkpPrivate(OkpKey {
+            curve,
+            key: Pkey::from_raw_private_key(curve.name(), bytes)?,
+        })
+    } else {
+        Key::OkpPublic(OkpKey {
+            curve,
+            key: Pkey::from_raw_public_key(curve.name(), bytes)?,
+        })
+    }))
+}
+
+/// The raw public key of an OKP public key, or of the public key of an OKP private key.
+pub fn okp_raw_public_key(key: &KeyHandle) -> Result<Vec<u8>, CryptoError> {
+    okp_key(key).key.raw_public_key()
+}
+
+pub fn okp_raw_private_key(key: &KeyHandle) -> Result<SecretBytes, CryptoError> {
+    okp_key(key).key.raw_private_key()
+}
+
+pub fn okp_compute_coordinate(private_key: &KeyHandle, public_key: &KeyHandle) -> Result<SecretBytes, CryptoError> {
+    let private_key = okp_key(private_key);
+    if !matches!(private_key.curve, OkpCurve::X25519 | OkpCurve::X448) {
         return Err(CryptoError::Backend);
     }
-    let key = Pkey::from_raw_private_key(curve.name(), private_key)?;
-    let peer = Pkey::from_raw_public_key(curve.name(), public_key)?;
-    openssl::derive(&key, &peer, false)
+    openssl::derive(&private_key.key, &okp_key(public_key).key, false)
 }
 
-pub fn okp_sign(curve: OkpCurve, private_key: &[u8], message: &[u8], context: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let key = Pkey::from_raw_private_key(curve.name(), private_key)?;
+pub fn okp_sign(private_key: &KeyHandle, message: &[u8], context: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let OkpKey { curve, key } = okp_key(private_key);
     match curve {
-        OkpCurve::Ed25519 => openssl::digest_sign(&key, None, &[end_parameter()], message),
-        OkpCurve::Ed448 => openssl::digest_sign(&key, None, &openssl::context_string_parameters(context), message),
+        OkpCurve::Ed25519 => openssl::digest_sign(key, None, &[end_parameter()], message),
+        OkpCurve::Ed448 => openssl::digest_sign(key, None, &openssl::context_string_parameters(context), message),
         OkpCurve::X25519 | OkpCurve::X448 => Err(CryptoError::Backend),
     }
 }
@@ -682,22 +746,22 @@ fn is_small_order_ed25519_point(point: &[u8]) -> bool {
 }
 
 pub fn okp_verify(
-    curve: OkpCurve,
-    public_key: &[u8],
+    public_key: &KeyHandle,
     signature: &[u8],
     message: &[u8],
     context: &[u8],
 ) -> Result<bool, CryptoError> {
-    if matches!(curve, OkpCurve::Ed25519)
-        && (is_small_order_ed25519_point(public_key) || signature.get(..32).is_some_and(is_small_order_ed25519_point))
+    let OkpKey { curve, key } = okp_key(public_key);
+    if *curve == OkpCurve::Ed25519
+        && (is_small_order_ed25519_point(&key.raw_public_key()?)
+            || signature.get(..32).is_some_and(is_small_order_ed25519_point))
     {
         return Ok(false);
     }
-    let key = Pkey::from_raw_public_key(curve.name(), public_key)?;
     match curve {
-        OkpCurve::Ed25519 => openssl::digest_verify(&key, None, &[end_parameter()], message, signature),
+        OkpCurve::Ed25519 => openssl::digest_verify(key, None, &[end_parameter()], message, signature),
         OkpCurve::Ed448 => openssl::digest_verify(
-            &key,
+            key,
             None,
             &openssl::context_string_parameters(context),
             message,
@@ -707,33 +771,26 @@ pub fn okp_verify(
     }
 }
 
-pub fn okp_export_der(curve: OkpCurve, is_public: bool, key: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    if is_public {
-        Pkey::from_raw_public_key(curve.name(), key)?.public_key_info()
-    } else {
-        // https://www.rfc-editor.org/rfc/rfc8410#section-7
-        // CurvePrivateKey ::= OCTET STRING
-        let private_key = SecretBytes::new(der::element(der::OCTET_STRING, &[key]));
-        Ok(der::private_key_info(
-            KeyAlgorithm::Okp(curve).oid(),
-            None,
-            &private_key,
-        ))
+pub fn okp_export_der(key: &KeyHandle) -> Result<Vec<u8>, CryptoError> {
+    match &key.0 {
+        Key::OkpPublic(public_key) => public_key.key.public_key_info(),
+        Key::OkpPrivate(OkpKey { curve, key }) => {
+            // https://www.rfc-editor.org/rfc/rfc8410#section-7
+            // CurvePrivateKey ::= OCTET STRING
+            let private_key = SecretBytes::new(der::element(der::OCTET_STRING, &[&key.raw_private_key()?]));
+            Ok(der::private_key_info(
+                KeyAlgorithm::Okp(*curve).oid(),
+                None,
+                &private_key,
+            ))
+        }
+        _ => panic!("The key is not an OKP key"),
     }
 }
 
-pub fn public_key_for_private_key(key: &KeyHandle, name: &Utf16String) -> Option<KeyHandle> {
-    if key.is_okp_private() {
-        let curve = [
-            ("Ed25519", OkpCurve::Ed25519),
-            ("Ed448", OkpCurve::Ed448),
-            ("X25519", OkpCurve::X25519),
-            ("X448", OkpCurve::X448),
-        ]
-        .into_iter()
-        .find_map(|(curve_name, curve)| (*name == curve_name).then_some(curve))?;
-        let public_key = okp_generate_public_key(curve, key.okp_bytes()).ok()?;
-        return Some(KeyHandle::from_okp_bytes(false, &public_key));
+pub fn public_key_for_private_key(key: &KeyHandle) -> Option<KeyHandle> {
+    if let Key::OkpPrivate(private_key) = &key.0 {
+        return Some(KeyHandle(Key::OkpPublic(private_key.public_key().ok()?)));
     }
     ml::public_key_for_private_key(key)
         .or_else(|| ec::public_key_for_private_key(key))

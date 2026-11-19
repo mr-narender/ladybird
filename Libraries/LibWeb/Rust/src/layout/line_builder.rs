@@ -1292,7 +1292,9 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             return;
         }
         let has_fragments = !self.line(line_index).fragments.is_empty();
-        if has_fragments {
+        // NB: A line that holds nothing but a forced break is a line box all the same, so the margins before it end
+        //     there as they do before any other.
+        if has_fragments || self.line(line_index).has_forced_break {
             self.prepare_to_append_inline_content();
         }
         if self.line(line_index).takes_inline_box_struts() {
@@ -1388,6 +1390,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
                 }
         };
         let inline_offset = aligned_inline_offset(self.line(line_index).inline_length);
+        self.line_mut(line_index).aligned_inline_offset = inline_offset;
         let block_offset = CssPixels::default();
 
         let LineAlignment {
@@ -1752,7 +1755,7 @@ impl<'builder, 'context> LineBuilder<'builder, 'context> {
             {
                 let fragment = &mut self.line_mut(line_index).fragments[fragment_index];
                 fragment.inline_offset = new_inline_offset;
-                fragment.block_offset = new_block_offset.floor() + block_offset;
+                fragment.block_offset = new_block_offset + block_offset;
                 fragment.accumulated_vertical_shift = accumulated_vertical_shift;
                 snapshot.block_offset = fragment.block_offset;
             }
@@ -2038,15 +2041,13 @@ pub(crate) struct TextLayoutBounds {
 }
 
 impl TextLayoutBounds {
-    /// The bounds of text in a font with `ascent` and `descent`, with the line height's leading split above and
-    /// below it. A font's ascent and descent count in whole pixels, as they do for 'line-height: normal', and the
-    /// leading above the text is a whole number of pixels too. So the baseline of text whose line height is a whole
-    /// number of pixels lands on a pixel, wherever the text is.
+    /// The bounds of text in a font with `ascent` and `descent`, with half the line height's leading on each side.
+    /// A font's ascent and descent count in whole pixels, as they do for 'line-height: normal'.
     fn with_leading(ascent: f32, descent: f32, line_height: CssPixels) -> Self {
         let ascent = font_metric_in_whole_pixels(ascent);
         let descent = font_metric_in_whole_pixels(descent);
         let leading = line_height - (ascent + descent);
-        let leading_above = (leading / 2).floor();
+        let leading_above = leading / 2;
         Self {
             ascent: ascent + leading_above,
             descent: descent + (leading - leading_above),

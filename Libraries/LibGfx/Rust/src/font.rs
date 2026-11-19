@@ -73,6 +73,7 @@ struct FontEntry {
     id: FontId,
     raw: NonNull<c_void>,
     facts: FontFacts,
+    character_advances: std::sync::OnceLock<(f32, f32)>,
     // What the font answers about itself that text chunking asks for every character: whether it is an emoji font,
     // and whether it has a glyph for U+0020 SPACE. Each is unknown until first asked.
     is_emoji_font: LazyVerdict,
@@ -148,6 +149,7 @@ impl FontHandle {
                 pixel_size: snapshot.pixel_size,
                 point_size: snapshot.point_size,
             },
+            character_advances: std::sync::OnceLock::new(),
             is_emoji_font: LazyVerdict::default(),
             contains_space_glyph: LazyVerdict::default(),
         }))
@@ -173,6 +175,20 @@ impl FontHandle {
     #[inline]
     pub fn facts(&self) -> &FontFacts {
         &self.0.facts
+    }
+
+    /// The average and maximum horizontal advances in pixels. A missing metric is zero.
+    pub fn character_advances(&self) -> (f32, f32) {
+        unsafe extern "C" {
+            fn ladybird_gfx_font_character_advances(font: *const c_void, average: *mut f32, maximum: *mut f32);
+        }
+        *self.0.character_advances.get_or_init(|| {
+            let mut average = 0.0;
+            let mut maximum = 0.0;
+            // SAFETY: The entry owns a reference to the font, and both out-pointers address local variables.
+            unsafe { ladybird_gfx_font_character_advances(self.as_raw(), &raw mut average, &raw mut maximum) };
+            (average, maximum)
+        })
     }
 
     #[inline]
@@ -255,6 +271,26 @@ impl std::fmt::Debug for FontHandle {
 pub struct EmojiPresentation {
     pub is_emoji: bool,
     pub forced: bool,
+}
+
+/// Whether `code_point` only ever extends the emoji sequence it follows: a zero width joiner, a variation selector, an
+/// emoji modifier, a tag character, or the combining enclosing keycap. The font that draws what it follows draws it
+/// too, where that font has a glyph for it.
+/// https://www.unicode.org/reports/tr51/#Emoji_Sequences
+pub fn code_point_extends_emoji_sequence(code_point: u32) -> bool {
+    matches!(
+        code_point,
+        0x200d | 0xfe0e | 0xfe0f | 0x20e3 | 0x1f3fb..=0x1f3ff | 0xe0020..=0xe007f
+    )
+}
+
+/// Whether a zero width joiner right after `code_point` joins what follows it to an emoji sequence: `code_point` is an
+/// emoji by default, or it ends the emoji sequence it's in. A joiner after any other character, as in Indic or Arabic
+/// text, joins no emoji.
+/// https://www.unicode.org/reports/tr51/#def_emoji_zwj_element
+pub fn code_point_ends_emoji_zwj_element(code_point: u32) -> bool {
+    matches!(code_point, 0xfe0f | 0x20e3 | 0x1f3fb..=0x1f3ff | 0xe007f)
+        || emoji_presentation_for_code_point(code_point, None).is_emoji
 }
 
 pub fn emoji_presentation_for_code_point(code_point: u32, next_code_point: Option<u32>) -> EmojiPresentation {

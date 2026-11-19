@@ -240,6 +240,70 @@ void WebContentClient::die()
     did_lose_process();
 }
 
+// A tab the user left is likely to stay in the background for long, and its process keeps much that only makes it
+// faster: compiled code, decoded images, caches. Once every tab of a process was hidden for this long, the process is
+// asked to let go of all that. The wait keeps a user who switches back and forth between tabs from paying for it.
+static constexpr auto time_hidden_before_releasing_memory = AK::Duration::from_seconds(10);
+
+bool WebContentClient::all_tabs_are_hidden() const
+{
+    // NB: A process without pages has no tabs to speak of, and little to release.
+    bool has_open_page = false;
+    for (auto const& [page_id, page] : m_pages) {
+        if (!page->is_open() || !page->has_traversable())
+            continue;
+        if (page->traversable().system_visibility_state() != Web::HTML::VisibilityState::Hidden)
+            return false;
+        has_open_page = true;
+    }
+    return has_open_page;
+}
+
+void WebContentClient::did_change_visibility_of_a_tab()
+{
+    if (!all_tabs_are_hidden()) {
+        if (m_release_memory_of_hidden_tabs_timer)
+            m_release_memory_of_hidden_tabs_timer->stop();
+        return;
+    }
+    if (!m_release_memory_of_hidden_tabs_timer) {
+        m_release_memory_of_hidden_tabs_timer = Core::Timer::create_single_shot(time_hidden_before_releasing_memory, [this] {
+            release_memory_of_hidden_tabs();
+        });
+    }
+    // NB: A timer that already runs keeps its time, so that more of these calls while the tabs stay hidden do not
+    //     put the release off.
+    if (!m_release_memory_of_hidden_tabs_timer->is_active())
+        m_release_memory_of_hidden_tabs_timer->start();
+}
+
+void WebContentClient::release_memory_of_hidden_tabs()
+{
+    if (!is_open() || !all_tabs_are_hidden())
+        return;
+    // NB: What the process lets go of, it has to make again when it needs it, which a tab that plays or records sound
+    //     in the background could not do without the user hearing it. A page that only hosts a frame of a tab counts
+    //     too, as the sound of the tab may come from that frame. The process is asked once the sound has stopped.
+    for (auto const& [page_id, page] : m_pages) {
+        if (!page->is_open() || !page->has_traversable())
+            continue;
+        auto view = page->traversable().view();
+        if (!view.has_value())
+            continue;
+        auto plays_or_records_sound = view->is_playing_audio() || view->is_capturing_audio();
+        // NB: A view that another view owns has no tab of its own, and its capture shows on its owner.
+        if (auto owner_view_id = view->owner_view_id(); owner_view_id.has_value()) {
+            if (auto owner = ViewImplementation::find_view_by_id(*owner_view_id); owner.has_value())
+                plays_or_records_sound |= owner->is_playing_audio() || owner->is_capturing_audio();
+        }
+        if (plays_or_records_sound) {
+            m_release_memory_of_hidden_tabs_timer->restart();
+            return;
+        }
+    }
+    async_release_memory();
+}
+
 void WebContentClient::did_misbehave(StringView message_name, StringView reason)
 {
     m_rejected_ipc = true;
@@ -452,6 +516,8 @@ WebContentPage& WebContentClient::open_page(Web::PageId page_id, CanonicalTraver
 {
     auto page = adopt_ref(*new WebContentPage(*this, page_id, traversable));
     m_pages.set(page_id, page);
+    // NB: A tab that starts hidden, or that moves to this process while hidden, never tells of a change.
+    did_change_visibility_of_a_tab();
     return page;
 }
 
@@ -570,6 +636,7 @@ void WebContentClient::replay_compositor_view_state_after_reconnect(Badge<Applic
         if (!m_compositor_contexts.contains(context_id))
             continue;
         auto& view = page->view();
+        Application::the().update_compositor_context_scales_frames_to_fit(context_id, view.scales_frames_to_fit());
         view.recreate_remote_layer_after_compositor_reconnect({});
         Application::the().update_compositor_viewport(context_id, view.viewport_size().to_type<int>(), view.device_pixel_ratio());
         Application::the().update_compositor_display_metadata(context_id, view.display_id(), view.maximum_frames_per_second());
@@ -633,7 +700,11 @@ void WebContentClient::did_lose_process()
         return;
 
     // The views are told deferred, and looked up by ID, in case they are destroyed before then.
-    auto crash_reason = m_rejected_ipc ? ViewImplementation::WebContentCrashReason::RejectedIPC : ViewImplementation::WebContentCrashReason::ProcessCrash;
+    auto crash_reason = ViewImplementation::WebContentCrashReason::ProcessCrash;
+    if (m_rejected_ipc)
+        crash_reason = ViewImplementation::WebContentCrashReason::RejectedIPC;
+    else if (m_exceeded_memory_limit)
+        crash_reason = ViewImplementation::WebContentCrashReason::ExceededMemoryLimit;
     for (auto const& lost : lost_pages) {
         if (!lost.view_id.has_value())
             continue;
@@ -644,7 +715,7 @@ void WebContentClient::did_lose_process()
             if (!view.has_value())
                 return;
             if (shows_crash_screen)
-                view->handle_web_content_process_crash();
+                view->handle_web_content_process_crash(crash_reason);
             if (view->on_web_content_crashed)
                 view->on_web_content_crashed(crash_reason);
         });
@@ -1239,7 +1310,7 @@ void WebContentClient::report_audio_capture_for_testing(Web::PageId labelled_pag
 
 ErrorOr<void> WebContentClient::tell_audio_server_of_capture_permission()
 {
-    auto response = m_audio_server_client->send_sync_but_allow_failure<Messages::AudioServerControl::SetCapturePermission>(m_audio_tab_id, m_audio_capture_permitted);
+    auto response = send_sync_to_helper<Messages::AudioServerControl::SetCapturePermission>(*m_audio_server_client, m_audio_tab_id, m_audio_capture_permitted);
     if (!response)
         return Error::from_string_literal("Failed to tell the AudioServer of the capture permission");
     return {};
@@ -1300,7 +1371,7 @@ void WebContentClient::forget_audio_playback(Web::PageId page_id)
 
 ErrorOr<void> WebContentClient::tell_audio_server_of_playback_authorization(Audio::PlaybackGroupId group)
 {
-    auto response = m_audio_server_client->send_sync_but_allow_failure<Messages::AudioServerControl::AuthorizePlaybackGroup>(m_audio_tab_id, group);
+    auto response = send_sync_to_helper<Messages::AudioServerControl::AuthorizePlaybackGroup>(*m_audio_server_client, m_audio_tab_id, group);
     if (!response)
         return Error::from_string_literal("Failed to tell the AudioServer of a playback authorization");
     return {};

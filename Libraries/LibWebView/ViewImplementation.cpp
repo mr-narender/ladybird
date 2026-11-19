@@ -522,7 +522,12 @@ void ViewImplementation::commit_synchronized_resize(u64 token)
 
 void ViewImplementation::set_scales_frames_to_fit(bool scales_frames_to_fit)
 {
+    if (m_scales_frames_to_fit == scales_frames_to_fit)
+        return;
+
     m_scales_frames_to_fit = scales_frames_to_fit;
+    if (has_traversable())
+        Application::the().update_compositor_context_scales_frames_to_fit(page().compositor_context_id(), scales_frames_to_fit);
     update_remote_layer_fit();
 }
 
@@ -3680,6 +3685,7 @@ void ViewImplementation::prepare_page_for_tab(WebContentPage& page)
     // The window handle names the tab to WebDriver, and the viewport is the tab's: both belong to the page displaying
     // it, whose traversable is local.
     page.async_set_window_handle(m_window_handle);
+    Application::the().update_compositor_context_scales_frames_to_fit(page.compositor_context_id(), m_scales_frames_to_fit);
     page.async_set_viewport(viewport_size(), m_device_pixel_ratio, m_is_fullscreen);
     Application::the().update_compositor_viewport(page.compositor_context_id(), viewport_size().to_type<int>(), m_device_pixel_ratio);
 }
@@ -3756,6 +3762,7 @@ void ViewImplementation::display_page_changed(RefPtr<WebContentPage> previous_pa
         install_backing_stores(move(backing_stores->bitmap_ids), move(backing_stores->backing_stores));
 
     auto compositor_context_id = page.compositor_context_id();
+    Application::the().update_compositor_context_scales_frames_to_fit(compositor_context_id, m_scales_frames_to_fit);
     // The remote layer goes on showing the outgoing page's last frame until the page presents its first one.
     if (m_remote_layer_id.has_value())
         Application::the().show_context_in_remote_layer(*m_remote_layer_id, compositor_context_id);
@@ -4366,7 +4373,7 @@ void ViewImplementation::dump_session_history(StringView reason, SessionHistoryD
         history_log_entries(traversable().session_history()));
 }
 
-void ViewImplementation::handle_web_content_process_crash()
+void ViewImplementation::handle_web_content_process_crash(WebContentCrashReason crash_reason)
 {
     auto failed_url = url();
     if (auto browser_ui_load_url = this->browser_ui_load_url(); browser_ui_load_url.has_value())
@@ -4419,8 +4426,12 @@ void ViewImplementation::handle_web_content_process_crash()
     if (auto const& headless_mode = Application::browser_options().headless_mode; headless_mode.has_value())
         recovery_mode = *headless_mode == HeadlessMode::Test ? RecoveryMode::PrepareForNextNavigation : RecoveryMode::Restore;
 
-    if (recovery_mode == RecoveryMode::ShowOverlay)
-        dbgln("\033[31;1mWebContent process crashed!\033[0m Last page loaded: {}", failed_url);
+    if (recovery_mode == RecoveryMode::ShowOverlay) {
+        if (crash_reason == WebContentCrashReason::ExceededMemoryLimit)
+            dbgln("\033[31;1mWebContent process was ended for its memory use!\033[0m Last page loaded: {}", failed_url);
+        else
+            dbgln("\033[31;1mWebContent process crashed!\033[0m Last page loaded: {}", failed_url);
+    }
 
     reset_page_media_state();
 
@@ -4438,14 +4449,17 @@ void ViewImplementation::handle_web_content_process_crash()
     respawn_web_content_process_after_crash();
 
     // A repeatedly crashing headless page is left dormant so the next WebDriver test or explicit navigation can
-    // proceed without feeding an automatic restore loop.
-    if (recovery_mode == RecoveryMode::Restore && !crashed_repeatedly) {
+    // proceed without feeding an automatic restore loop. So is a page that was ended for its memory use, because
+    // the restored page would grow to the limit again.
+    auto restores_page = !crashed_repeatedly && crash_reason != WebContentCrashReason::ExceededMemoryLimit;
+    if (recovery_mode == RecoveryMode::Restore && restores_page) {
         recover_current_session_history_entry_with_history_operation();
     } else if (recovery_mode == RecoveryMode::ShowOverlay) {
         traversable().abandon_history_operations();
         set_crash_state(CrashState {
             .failed_url = move(failed_url),
             .navigation_to_retry = move(navigation_to_retry),
+            .exceeded_memory_limit = crash_reason == WebContentCrashReason::ExceededMemoryLimit,
         });
     } else {
         traversable().abandon_history_operations();

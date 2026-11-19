@@ -4,6 +4,7 @@ set(TEST_SOURCES
     TestADTSDemuxer.cpp
     TestADTSFrameHeader.cpp
     TestADTSReader.cpp
+    TestAV1Decode.cpp
     TestAudioBlockTimingRing.cpp
     TestAudioDiscardIntervals.cpp
     TestAudioMixer.cpp
@@ -44,6 +45,7 @@ set(TEST_SOURCES
     TestVideoFramePool.cpp
     TestVorbisDecode.cpp
     TestVP9Decode.cpp
+    TestWebMByteStreamParser.cpp
     TestWav.cpp
     TestWAVDemuxer.cpp
 )
@@ -61,7 +63,10 @@ if (WIN32)
     )
 endif()
 if (LINUX)
-    list(APPEND TEST_SOURCES TestH264Decode.cpp)
+    list(APPEND TEST_SOURCES
+        TestH264Decode.cpp
+        TestH265Decode.cpp
+    )
     if (USE_VULKAN_DMABUF_IMAGES)
         list(APPEND TEST_SOURCES TestFFmpegVulkanDecode.cpp)
     endif()

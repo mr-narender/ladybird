@@ -62,6 +62,10 @@ class HTMLMediaElement : public HTMLElement {
     WEB_WRAPPABLE(HTMLMediaElement, HTMLElement);
 
 public:
+    // NB: A move runs no children changed steps, so the move algorithm reports these instead.
+    void child_moved_out(DOM::Node const& child, GC::Ptr<DOM::Node> old_previous_sibling);
+    void child_moved_in();
+
     static constexpr size_t audio_tracks_offset() { return offsetof(HTMLMediaElement, m_audio_tracks); }
     static constexpr size_t video_tracks_offset() { return offsetof(HTMLMediaElement, m_video_tracks); }
     static constexpr size_t text_tracks_offset() { return offsetof(HTMLMediaElement, m_text_tracks); }
@@ -378,6 +382,18 @@ private:
 
     // https://html.spec.whatwg.org/multipage/media.html#media-element-event-task-source
     UniqueTaskSource m_media_element_event_task_source;
+
+    // NB: The media element tasks that haven't run yet, in the order they were queued, so that they can follow the
+    //     element when it's adopted into another document.
+    struct PendingMediaElementTask {
+        u64 key { 0 };
+        TaskID task_id;
+        GC::Ref<GC::Function<void(HTMLMediaElement&)>> steps;
+    };
+    void queue_pending_media_element_task(PendingMediaElementTask&);
+    void requeue_pending_media_element_tasks();
+    Vector<PendingMediaElementTask> m_pending_media_element_tasks;
+    u64 m_next_media_element_task_key { 0 };
 
     // https://html.spec.whatwg.org/multipage/media.html#dom-media-error
     GC::Ptr<MediaError> m_error;

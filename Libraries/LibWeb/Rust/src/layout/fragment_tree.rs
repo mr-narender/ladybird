@@ -124,11 +124,42 @@ pub(crate) struct GridPayload {
     pub(crate) used_tracks: Option<std::sync::Arc<grid_formatting_context::OwnedUsedGridTracks>>,
 }
 
+/// A part of the glyph outlines of a text content element's own text, which paints after one of the element's children.
+#[derive(Clone, PartialEq)]
+pub(crate) struct SvgTextSegment {
+    /// The child element the part follows, or the invalid slot for the part that comes before every child element.
+    pub(crate) after_child: crate::layout::node_data::NodeSlotId,
+    pub(crate) path: libgfx_rust::path::Path,
+    /// The glyphs of the part that a color font draws. They have no outlines for the path to hold, so they paint as
+    /// glyphs.
+    pub(crate) color_glyph_runs: Vec<SvgColorGlyphRun>,
+}
+
+/// A run of glyphs of a color font in SVG text, in user units.
+#[derive(Clone, PartialEq)]
+pub(crate) struct SvgColorGlyphRun {
+    pub(crate) font: libgfx_rust::font::FontHandle,
+    /// The glyphs, each positioned by the top of the font's ascent.
+    pub(crate) glyphs: Vec<SvgColorGlyph>,
+    /// The cells the glyphs occupy.
+    pub(crate) bounds: libgfx_rust::FloatRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SvgColorGlyph {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) glyph_id: u32,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct SvgPayload {
     pub(crate) facts: CommittedSvgFacts,
     pub(crate) geometry: svg_formatting_context::SvgGeometry,
     pub(crate) path: Option<std::sync::Arc<CommittedSvgPath>>,
+    /// The path of a text content element, in the parts that paint apart: Text that follows a child element paints
+    /// after that child. None where all of the element's text comes before its child elements.
+    pub(crate) text_segments: Option<std::sync::Arc<Vec<SvgTextSegment>>>,
     pub(crate) text_character_cells: Option<std::sync::Arc<Vec<svg_formatting_context::FfiSvgTextCharacterCell>>>,
 }
 
@@ -207,6 +238,7 @@ impl PartialEq for FcPayload {
                 left.facts == right.facts
                     && left.geometry == right.geometry
                     && same_allocation(left.path.as_ref(), right.path.as_ref())
+                    && same_allocation(left.text_segments.as_ref(), right.text_segments.as_ref())
                     && same_allocation(left.text_character_cells.as_ref(), right.text_character_cells.as_ref())
             }
             _ => false,
@@ -229,6 +261,7 @@ impl FcPayload {
                 left.facts == right.facts
                     && left.geometry == right.geometry
                     && left.path == right.path
+                    && left.text_segments == right.text_segments
                     && left.text_character_cells == right.text_character_cells
             }
             _ => false,
@@ -242,6 +275,7 @@ impl FcPayload {
                 svg.facts == CommittedSvgFacts::default()
                     && svg.geometry == Default::default()
                     && svg.path.is_none()
+                    && svg.text_segments.is_none()
                     && svg.text_character_cells.is_none()
             }
             Self::Table(_) | Self::Flex(_) | Self::Multicol(_) | Self::Math(_) => false,
@@ -345,6 +379,11 @@ pub(crate) struct ParentShowFacts {
     /// for a box hidden after a clamp point, and the area before the block-end content edge of a line-clamp container
     /// for a float inside it.
     pub(crate) clip_decided_by_parent: Option<CssPixelRect>,
+    /// For a block-level box in the flow of a block container: the margin that flow leaves past the block end of the
+    /// box, which is its block-end margin, collapsed with the margins of its contents that collapse through its block
+    /// end. For a box that margins collapse through, which sits past the margins before it, that is how much its
+    /// block-end margin adds to them. The scrollable overflow of a scroll container ends its in-flow content there.
+    pub(crate) block_end_margin_collapsed_in_flow: Option<CssPixels>,
 }
 
 impl ParentShowFacts {
