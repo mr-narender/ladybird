@@ -5,6 +5,7 @@ if (BUILD_TESTING AND NOT WIN32)
         ladybird_python_test(test-devtools-network-events.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-iframe-console.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-console-previews.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-console-output-escapes-control-characters.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-message-port-collection.py ARGS $<TARGET_FILE:WebDriver>)
         ladybird_python_test(test-shared-stylesheet-memory.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
         ladybird_python_test(test-user-agent-preset-reaches-child-frames.py ARGS $<TARGET_FILE:ladybird>)
@@ -53,6 +54,8 @@ if (BUILD_BROWSER_TESTS_ONLY)
 endif()
 
 ladybird_test_suite(LibWebView)
+# TestHelperProcessPaths looks for these where the browser would.
+add_dependencies(TestLibWebView Compositor ImageDecoder RequestServer SystemProbe WebContent)
 
 set(TEST_SOURCES
     TestAccessibilityTreeManager.cpp
@@ -69,6 +72,7 @@ set(TEST_SOURCES
     TestFaviconStore.cpp
     TestForceDarkSettings.cpp
     TestHelperProcessEnvironment.cpp
+    TestHelperProcessPaths.cpp
     TestHistoryStore.cpp
     TestHSTSStore.cpp
     TestLingeringIndicator.cpp

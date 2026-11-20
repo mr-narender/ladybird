@@ -1382,6 +1382,10 @@ CSS::ElementBoxKind Element::box_kind() const
 {
     if (local_name() == u"noscript"sv && document().is_scripting_enabled())
         return CSS::ElementBoxKind::NoBox;
+    // https://html.spec.whatwg.org/multipage/text-level-semantics.html#the-wbr-element
+    // "The wbr element represents a line break opportunity."
+    if (is_html_element() && local_name() == HTML::TagNames::wbr)
+        return CSS::ElementBoxKind::WordBreakOpportunity;
     return CSS::ElementBoxKind::FromDisplay;
 }
 
@@ -2066,39 +2070,33 @@ void Element::settle_animations_of_flat_tree_subtree(Layout::BegunRead const& re
     });
 }
 
-void Element::clear_computed_styles_from_display_none_descendants(Layout::BegunRead const& read)
+void Element::clear_computed_style_below_display_none(Layout::BegunRead const& read)
 {
-    for_each_inclusive_descendant_element_in_flat_tree(*this, [this, &read](Element& descendant) {
-        if (&descendant == this)
-            return TraversalDecision::Continue;
-        auto* element = &descendant;
-        if (!element->has_style())
-            return TraversalDecision::SkipChildrenAndContinue;
+    if (!has_style())
+        return;
 
-        // Anchor names are registered outside the style record, so unregister them before discarding the only record
-        // that identifies them. Rematerializing the element's style will register its current names again.
-        if (element->is_connected() && unregister_current_anchor_names(*element, element->root()))
-            element->document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
+    // Anchor names are registered outside the style record, so unregister them before discarding the only record
+    // that identifies them. Rematerializing the element's style will register its current names again.
+    if (is_connected() && unregister_current_anchor_names(*this, root()))
+        document().record_partial_relayout_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
 
-        // The layout tree is torn down after the style update. Keep its style alive until then without
-        // retaining the record as the descendant's current computed style.
-        if (auto* layout_node = element->unsafe_layout_node(read))
-            layout_node->pin_style_record_for_detachment();
-        element->m_installed_style = {};
+    // The layout tree is torn down after the style update. Keep its style alive until then without
+    // retaining the record as the descendant's current computed style.
+    if (auto* layout_node = unsafe_layout_node(read))
+        layout_node->pin_style_record_for_detachment();
+    m_installed_style = {};
 
-        // NB: SVG resources can still affect rendering when a DOM ancestor has display:none.
-        //     Restore their styles in this style update, so painting never needs to materialize
-        //     styles for referenced resources. The engine still holds their records and settles
-        //     the reaction from them.
-        if (auto const* svg_element = as_if<SVG::SVGElement>(*element); svg_element && svg_element->is_referenceable_in_display_none_subtree())
-            element->document().style_computer().style_engine().record_derived_element_style_input_change(element->style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
+    // NB: SVG resources can still affect rendering when a DOM ancestor has display:none.
+    //     Restore their styles in this style update, so painting never needs to materialize
+    //     styles for referenced resources. The engine still holds their records and settles
+    //     the reaction from them.
+    if (auto const* svg_element = as_if<SVG::SVGElement>(*this); svg_element && svg_element->is_referenceable_in_display_none_subtree())
+        document().style_computer().style_engine().record_derived_element_style_input_change(style_node_id(), CSS::StyleEngine::PublishedStyle | CSS::StyleEngine::RecomputeStyle);
 
-        element->for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
-            pseudo_element.clear_computed_style();
-        });
-        element->clear_custom_highlight_styles();
-        return TraversalDecision::Continue;
+    for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement& pseudo_element) {
+        pseudo_element.clear_computed_style();
     });
+    clear_custom_highlight_styles();
 }
 
 void Element::invalidate_descendant_styles_depending_on_style_container_query()
@@ -2649,15 +2647,6 @@ void Element::synchronize_style_attribute() const
     }
 
     CSS::record_element_attribute_changed(element, HTML::AttributeNames::style, {}, old_value, new_value);
-}
-
-// https://dom.spec.whatwg.org/#element-html-uppercased-qualified-name
-Utf16FlyString Element::make_html_uppercased_qualified_name() const
-{
-    // This is allowed by the spec: "User agents could optimize qualified name and HTML-uppercased qualified name by storing them in internal slots."
-    if (namespace_uri() == Namespace::HTML && document().document_type() == Document::Type::HTML)
-        return qualified_name().to_ascii_uppercase();
-    return qualified_name();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#queue-an-element-task
@@ -5077,8 +5066,6 @@ void Element::setup_custom_element_from_constructor(HTML::CustomElementDefinitio
 void Element::set_prefix(Optional<Utf16FlyString> value)
 {
     m_qualified_name.set_prefix(move(value));
-    if (auto* rare_data = element_rare_data())
-        rare_data->html_uppercased_qualified_name.clear();
 }
 
 // https://dom.spec.whatwg.org/#locate-a-namespace-prefix
@@ -6914,13 +6901,13 @@ GC::Ptr<NamedNodeMap const> Element::attributes() const
     return const_cast<Element&>(*this).attributes();
 }
 
+// https://dom.spec.whatwg.org/#element-html-uppercased-qualified-name
 Utf16FlyString const& Element::html_uppercased_qualified_name() const
 {
-    // NB: Whether the qualified name is uppercased depends on the node document, which can change when the element is
-    //     adopted. So we only use the cached uppercased name while it applies.
+    // This is allowed by the spec: "User agents could optimize qualified name and HTML-uppercased qualified name by storing them in internal slots."
     if (namespace_uri() != Namespace::HTML || document().document_type() != Document::Type::HTML)
         return qualified_name();
-    return ensure_element_rare_data().html_uppercased_qualified_name.ensure([&] { return make_html_uppercased_qualified_name(); });
+    return m_qualified_name.ascii_uppercased_as_string();
 }
 
 void Element::play_or_cancel_animations_after_display_property_change()

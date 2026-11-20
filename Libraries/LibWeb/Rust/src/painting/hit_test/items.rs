@@ -419,7 +419,10 @@ impl<'a, R: PaintRead, S: HitTestItemSink> HitTestItems<'a, R, S> {
                 .committed_side_data(root)
                 .inline_box_piece_indices(paintable)
                 .iter()
-                .any(|piece_index| !self.piece_of(root, *piece_index).is_geometry_only_placeholder)
+                .any(|piece_index| {
+                    let piece = self.piece_of(root, *piece_index);
+                    !piece.is_geometry_only_placeholder && piece.fragment_count != 0
+                })
         });
         has_content_pieces || crate::painting::paint_order::first_paint_child(self.rows, paintable).is_some()
     }
@@ -605,6 +608,8 @@ impl<'a, R: PaintRead, S: HitTestItemSink> HitTestItems<'a, R, S> {
     fn hit_node_for_text_fragment(&mut self, fragment: &FragmentRecord) -> Option<NodeSlotId> {
         let node = fragment.layout_node;
         let row = self.rows.node(node)?;
+        // https://drafts.csswg.org/css-overflow-4/#ellipsing-details
+        // "The UA should dispatch any pointer event on the ellipsis to the elided element"
         if fragment.is_block_ellipsis || !node_facts::kind_is_text(row.kind()) {
             return None;
         }

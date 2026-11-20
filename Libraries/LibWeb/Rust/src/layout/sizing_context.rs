@@ -1233,9 +1233,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         // replaced element with a natural aspect ratio and no natural size in that axis, see e.g. CSS2 §10
         // and CSS Flexible Box Model Level 1 §9.2.
         // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
-        if facts.has_replaced_element_table_display_adjustment()
-            || (facts.is_replaced_box() && facts.has_auto_content_box_size())
-        {
+        if facts.is_replaced_box() && facts.has_auto_content_box_size() {
             return true;
         }
         if facts.has_preferred_aspect_ratio() || facts.has_auto_content_box_size() {
@@ -1254,6 +1252,14 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             {
                 return false;
             }
+            return true;
+        }
+        // https://drafts.csswg.org/css-forms-1/#valdef-field-sizing-fixed
+        // For element with default preferred size, the UA must set the intrinsic size to the default preferred size
+        // defined by the host language for that element.
+        // NB: A form control without its native appearance has a default preferred size where its native box had a
+        //     natural size, and is sized from it the same way.
+        if facts.default_preferred_width().is_some() {
             return true;
         }
         false
@@ -2222,9 +2228,11 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         let facts = self.facts(node);
         let box_is_sized_as_replaced_element =
             self.box_is_sized_as_replaced_element(sized, available_space, constraints);
-        let mut makes_block_size_definite = sized.metrics().has_definite_inline_size()
-            && facts.has_preferred_aspect_ratio()
-            && box_is_sized_as_replaced_element;
+        // NB: A slider's block size follows from its intrinsic size, with no layout of its content, so its internal
+        //     track resolves a percentage block size against it, and centers in it.
+        let mut makes_block_size_definite = box_is_sized_as_replaced_element
+            && ((sized.metrics().has_definite_inline_size() && facts.has_preferred_aspect_ratio())
+                || facts.is_slider());
         // NB: Replaced sizing resolves a calc-size() itself.
         let mut block_size = if box_is_sized_as_replaced_element {
             self.compute_block_size_for_replaced_element(sized, available_space, constraints)
@@ -2410,12 +2418,21 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             let block_size_is_definite_from_aspect_ratio = sized_cells.cells.has_definite_inline_size()
                 && facts.has_preferred_aspect_ratio()
                 && block_size_is_automatic;
+            // NB: A slider's automatic block size follows from its intrinsic size, with no layout of its content, so
+            //     its internal track resolves a percentage block size against it, and centers in it.
+            let block_size_is_definite_from_slider_size = facts.is_slider() && block_size_is_automatic;
 
-            if native_control_block_size_constraint_is_active || block_size_is_definite_from_aspect_ratio {
+            if native_control_block_size_constraint_is_active
+                || block_size_is_definite_from_aspect_ratio
+                || block_size_is_definite_from_slider_size
+            {
                 sized_cells
                     .cells
                     .update_cells(|cells| cells.has_definite_block_size = true);
             }
+            // NB: A text input without its native appearance is sized from its default preferred size, and still
+            //     centers its content in a block size its min-height or max-height clamps.
+            self.make_form_control_content_box_definite(sized_cells, available_space, constraints, None);
             return None;
         }
 
@@ -3166,6 +3183,13 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         }
         let auto_size = self.auto_content_size(node);
         if let Some(width) = auto_size.width {
+            return answered_from_style(width);
+        }
+        // https://drafts.csswg.org/css-forms-1/#valdef-field-sizing-fixed
+        // For element with default preferred size, the UA must set the intrinsic size to the default preferred size
+        // defined by the host language for that element.
+        // NB: That holds for a text entry widget without its native appearance too, so a long value doesn't widen it.
+        if let Some(width) = facts.default_preferred_width() {
             return answered_from_style(width);
         }
         if facts.is_replaced_box() && facts.has_preferred_aspect_ratio() && auto_size.height.is_some() {
@@ -4704,6 +4728,7 @@ mod replaced_ratio_tests {
                 viewport_inline_size: CssPixels::from_integer(800),
                 viewport_block_size: CssPixels::from_integer(600),
                 document_in_quirks_mode: false,
+                document_in_limited_quirks_mode: false,
             },
         );
         let result = RunState::with_root(pass, node, Node::INVALID, None, |state, pass| {

@@ -619,9 +619,6 @@ namespace Web::Gamepad {
 
 class NavigatorGamepadPartial;
 class Gamepad;
-class GamepadButton;
-class GamepadEvent;
-class GamepadHapticActuator;
 
 }
 
@@ -1224,6 +1221,7 @@ namespace Web::WebGL {
 
 class RemoteWebGLTransport;
 class WebGL2RenderingContext;
+struct WebGLContextAttributes;
 class WebGLRenderingContext;
 class WebGLRenderingContextBase;
 

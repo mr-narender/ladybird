@@ -689,7 +689,8 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         case CSS::PreferredContrast::Auto:
         default:
-            // FIXME: Fallback to system settings
+            // The browser resolves Auto from the platform's settings before a page sees it, so Auto only remains where
+            // nothing reads them.
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         }
     case CSS::MediaFeatureID::PrefersReducedData:
@@ -703,7 +704,8 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
             return ident_media_feature_value(CSS::Keyword::Reduce);
         case CSS::PreferredMotion::Auto:
         default:
-            // FIXME: Fallback to system settings
+            // The browser resolves Auto from the platform's settings before a page sees it, so Auto only remains where
+            // nothing reads them.
             return ident_media_feature_value(CSS::Keyword::NoPreference);
         }
     case CSS::MediaFeatureID::PrefersReducedTransparency:

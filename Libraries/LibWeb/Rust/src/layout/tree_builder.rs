@@ -108,6 +108,13 @@ pub(crate) fn used_display_of_box(kind: NodeKind, flags: u32, display: FfiDispla
     if flags & NodeFlag::IsReplacedElement as u32 == 0 {
         return display;
     }
+    used_display_of_replaced_element(display)
+}
+
+/// The display a replaced element's box uses for `display`, its computed display.
+pub(crate) fn used_display_of_replaced_element(display: FfiDisplay) -> FfiDisplay {
+    use crate::css::css_enums::{display_inside, display_outside};
+    let flow = |outside| FfiDisplay::outside_and_inside(outside, display_inside::FLOW, false);
     // https://drafts.csswg.org/css-display-3/#outer-role
     // Note: Outer display types do affect replaced elements.
     if display.is_table_inside() {
@@ -191,6 +198,7 @@ pub(crate) fn node_kind_for_element_box_kind(
         ElementBoxKind::NoBox => return None,
         ElementBoxKind::FromDisplay => return node_kind_for_display(display),
         ElementBoxKind::Break => NodeKind::BreakNode,
+        ElementBoxKind::WordBreakOpportunity => NodeKind::WordBreakOpportunityNode,
         ElementBoxKind::FieldSet => NodeKind::FieldSetBox,
         ElementBoxKind::Legend => NodeKind::LegendBox,
         ElementBoxKind::Audio => NodeKind::AudioBox,

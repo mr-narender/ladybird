@@ -2924,9 +2924,31 @@ void Application::set_preferred_contrast(Web::CSS::PreferredContrast contrast)
     });
 }
 
+void Application::platform_contrast_preference_changed()
+{
+    // Only Auto follows the platform.
+    if (m_contrast != Web::CSS::PreferredContrast::Auto)
+        return;
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.set_preferred_contrast(m_contrast);
+        return IterationDecision::Continue;
+    });
+}
+
 void Application::set_preferred_motion(Web::CSS::PreferredMotion motion)
 {
     m_motion = motion;
+    ViewImplementation::for_each_view([&](ViewImplementation& view) {
+        view.set_preferred_motion(m_motion);
+        return IterationDecision::Continue;
+    });
+}
+
+void Application::platform_motion_preference_changed()
+{
+    // Only Auto follows the platform.
+    if (m_motion != Web::CSS::PreferredMotion::Auto)
+        return;
     ViewImplementation::for_each_view([&](ViewImplementation& view) {
         view.set_preferred_motion(m_motion);
         return IterationDecision::Continue;
