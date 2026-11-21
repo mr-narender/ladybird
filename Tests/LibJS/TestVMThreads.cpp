@@ -673,3 +673,69 @@ TEST_CASE(an_interrupt_ends_a_wait_as_terminated_and_leaves_other_waiters_alone)
     EXPECT_EQ(scripts.notify(100), 1);
     EXPECT_EQ(scripts.wait_for_result(3), RESULT_OK * 256 + 2);
 }
+
+TEST_CASE(logging_an_exception_only_reads_its_message_with_a_running_context)
+{
+    static size_t message_reads;
+    struct Traits {
+        static JS::ThrowCompletionOr<JS::Value> get(JS::HostObject const&, JS::PropertyKey const&, JS::Value, JS::CacheableGetPropertyMetadata*, JS::Object::PropertyLookupPhase)
+        {
+            ++message_reads;
+            return JS::js_undefined();
+        }
+    };
+    static constexpr auto hooks = JS::make_host_object_hooks<Traits>();
+    static constexpr auto host_class = JS::make_host_class(JS_HOST_CLASS_OBJECT, "TestException"sv, nullptr, &hooks, nullptr, 0);
+
+    run_on_vm_threads(1, [] {
+        auto vm = JS::VM::create();
+        auto context = JS::create_simple_execution_context<JS::GlobalObject>(*vm);
+        auto exception = JS::HostObject::create(*context->realm, host_class, nullptr);
+        message_reads = 0;
+        JS::set_log_all_js_exceptions(true);
+        (void)JS::throw_completion(exception);
+        EXPECT_EQ(message_reads, 1u);
+        vm->pop_execution_context();
+        (void)JS::throw_completion(exception);
+        JS::set_log_all_js_exceptions(false);
+        EXPECT_EQ(message_reads, 1u);
+        vm->push_execution_context(*context);
+    });
+}
+
+TEST_CASE(dictionary_elements_distinguish_holes_from_undefined)
+{
+    run_on_vm_threads(1, [] {
+        auto vm = JS::VM::create();
+        auto context = JS::create_simple_execution_context<JS::GlobalObject>(*vm);
+        auto object = JS::Object::create(*context->realm, nullptr);
+        object->define_direct_property(0u, JS::js_undefined(), 0);
+        object->indexed_append(JS::js_special_empty_value());
+        object->indexed_append(JS::js_undefined());
+        EXPECT_EQ(object->indexed_array_like_size(), 3u);
+        EXPECT(object->has_own_property(0u).release_value());
+        EXPECT(!object->has_own_property(1u).release_value());
+        EXPECT(object->has_own_property(2u).release_value());
+    });
+}
+
+TEST_CASE(taking_the_first_dictionary_element_shifts_the_remaining_indices)
+{
+    run_on_vm_threads(1, [] {
+        auto vm = JS::VM::create();
+        auto context = JS::create_simple_execution_context<JS::GlobalObject>(*vm);
+        auto object = JS::Object::create(*context->realm, nullptr);
+        object->define_direct_property(0u, JS::js_undefined(), 0);
+        object->define_direct_property(2u, JS::js_undefined(), 0);
+
+        object->indexed_take_first();
+        EXPECT_EQ(object->indexed_array_like_size(), 2u);
+        EXPECT(!object->has_own_property(0u).release_value());
+        EXPECT(object->has_own_property(1u).release_value());
+        EXPECT(!object->has_own_property(2u).release_value());
+
+        object->indexed_take_first();
+        EXPECT_EQ(object->indexed_array_like_size(), 1u);
+        EXPECT(object->has_own_property(0u).release_value());
+    });
+}

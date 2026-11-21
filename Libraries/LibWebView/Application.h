@@ -53,6 +53,7 @@
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/FileDownloader.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/LocalFileRoot.h>
 #include <LibWebView/MediaSessionCoordinator.h>
 #include <LibWebView/Options.h>
 #include <LibWebView/PlatformFeatureDecisions.h>
@@ -96,6 +97,7 @@ public:
 
     static Settings& settings() { return *the().m_settings; }
     static Profile const& profile() { return *the().m_profile; }
+    static LocalFileGrantPolicy const& local_file_grant_policy() { return the().m_local_file_grant_policy; }
     BrowserProcess& browser_process() { return *m_browser_process; }
     bool should_exit_after_profile_coordination() const { return m_should_exit_after_profile_coordination; }
     // Whether the process exits because a browser is running for the profile, but does not take what we were asked to
@@ -115,6 +117,7 @@ public:
     Translator* translator() { return m_translator.ptr(); }
     void set_translator(OwnPtr<Translator>);
     MicrophoneAuthorizer& microphone_authorizer();
+    DefaultBrowser& default_browser();
     static FontService& font_service() { return *the().m_font_service; }
     static FontServiceHost& font_service_host() { return *the().m_font_service_host; }
     JsonValue const& site_compatibility_data() const { return m_site_compatibility_data; }
@@ -242,7 +245,8 @@ public:
     ErrorOr<Core::GeolocationProvider::WatchId, Core::GeolocationError> start_watching_geolocation_position(Core::GeolocationProvider::SuccessCallback on_success, Core::GeolocationProvider::ErrorCallback on_error);
     void stop_watching_geolocation_position(Core::GeolocationProvider::WatchId);
 
-    bool same_origin_tabs_may_share_a_process() const;
+    TabProcesses tab_processes() const;
+    bool tabs_may_share_processes() const;
     ErrorOr<NonnullRefPtr<WebContentPage>> open_page_for_new_tab(IsPrivate);
     struct ChildFrameWebContentProcess {
         NonnullRefPtr<WebContentClient> client;
@@ -299,7 +303,7 @@ public:
     void begin_synchronized_resize(u64 remote_layer_id, u64 token);
     void await_synchronized_resize_frame(u64 remote_layer_id, u64 token, Gfx::IntSize);
     void commit_synchronized_resize(u64 remote_layer_id, u64 token);
-    void take_frame_snapshot(Web::CompositorContextId, Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)>);
+    void take_frame_snapshot(Web::CompositorContextId, Function<void(Optional<Gfx::ShareableBitmap>)>);
     bool handle_and_dispatch_key_event_in_compositor(Web::CompositorContextId, Web::KeyEvent const&, bool allow_keyboard_scroll);
     bool handle_and_dispatch_pinch_event_in_compositor(Web::CompositorContextId, Web::PinchEvent const&);
     bool handle_and_dispatch_mouse_event_in_compositor(Web::CompositorContextId, Web::MouseEvent const&);
@@ -417,6 +421,9 @@ public:
     // Calls back once the features are decided from this launch's probe rather than from cached facts.
     void when_platform_features_are_current(Function<void()>);
     PlatformFeatures::ProcessFeatures platform_features_for(FeatureProcess) const;
+    // Whether GPU painting is in the features the Compositor was last launched with. Until the Compositor first launches,
+    // it counts as enabled.
+    bool compositor_gpu_painting_enabled() const { return m_compositor_gpu_painting_enabled; }
     // Every feature's decision and the facts they were made from, for people to read.
     JsonObject platform_features_report() const;
     // The same as header lines of a report that leaves the machine: the features of one process or of all of them, the
@@ -435,13 +442,13 @@ protected:
     virtual void create_platform_actions() { }
     virtual Core::EventLoop& create_platform_event_loop();
     virtual NonnullOwnPtr<MicrophoneAuthorizer> create_microphone_authorizer();
+    virtual NonnullOwnPtr<DefaultBrowser> create_default_browser();
 
     virtual bool should_coordinate_browser_process() const { return true; }
     // The process that shows this browser to the user, if that is not this process.
     virtual Optional<pid_t> ui_process_id() const { return {}; }
     virtual bool captures_browser_crashes() const { return false; }
     virtual bool should_use_os_geolocation() const { return true; }
-    virtual SiteIsolationMode default_site_isolation_mode() const { return SiteIsolationMode::IFrame; }
 
     virtual NonnullRefPtr<Core::Promise<ByteString>> ask_user_for_download_path(ByteString const& file) const;
 
@@ -455,6 +462,7 @@ protected:
 
     virtual void on_devtools_enabled() const { }
     virtual void on_devtools_disabled() const { }
+    virtual void on_compositor_gpu_painting_changed() const { }
 
     Main::Arguments& arguments() { return m_arguments; }
 
@@ -604,6 +612,7 @@ private:
     static Application* s_the;
 
     Optional<Profile> m_profile;
+    LocalFileGrantPolicy m_local_file_grant_policy;
     OwnPtr<Settings> m_settings;
     OwnPtr<BrowserProcess> m_browser_process;
     bool m_should_exit_after_profile_coordination { false };
@@ -669,6 +678,7 @@ private:
     // Set when the Browser ends a Compositor to relaunch it with other features, which does not count as a crash.
     bool m_compositor_relaunch_is_planned { false };
     ByteString m_compositor_launched_features;
+    bool m_compositor_gpu_painting_enabled { true };
 
     FeatureOverrides m_feature_overrides;
     HashMap<PlatformFeatures::Feature, String> m_feature_runtime_failures;
@@ -708,6 +718,7 @@ private:
     OwnPtr<SpellChecker> m_spell_checker;
     OwnPtr<Translator> m_translator;
     OwnPtr<MicrophoneAuthorizer> m_microphone_authorizer;
+    OwnPtr<DefaultBrowser> m_default_browser;
     OwnPtr<Core::TimeZoneWatcher> m_time_zone_watcher;
 
     Core::EventLoop* m_event_loop { nullptr };
@@ -715,6 +726,7 @@ private:
     OwnPtr<IPC::HandleBrokerServer> m_handle_broker_server;
 #endif
     OwnPtr<ProcessManager> m_process_manager;
+    OwnPtr<TabDiscarder> m_tab_discarder;
 
     Web::CSS::PreferredColorScheme m_color_scheme { Web::CSS::PreferredColorScheme::Auto };
     Web::CSS::PreferredContrast m_contrast { Web::CSS::PreferredContrast::Auto };

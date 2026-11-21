@@ -44,6 +44,7 @@ set(SOURCES
     ImageDecoderControlClient.cpp
     ImageDecoderManager.cpp
     LingeringIndicator.cpp
+    LocalFileRoot.cpp
     MediaSessionCoordinator.cpp
     NavigationLoader.cpp
     Omnibox.cpp
@@ -61,6 +62,7 @@ set(SOURCES
     Process.cpp
     ProcessManager.cpp
     ProcessSnapshot.cpp
+    TabDiscarder.cpp
     TabIndicators.cpp
     TabPerformanceStats.cpp
     TabPerformanceMonitor.cpp

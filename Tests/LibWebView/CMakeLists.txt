@@ -27,8 +27,10 @@ if (BUILD_TESTING AND NOT WIN32)
     ladybird_python_test(test-webdriver-bidi.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-command-privileges.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-content-blockers.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
+    ladybird_python_test(test-webdriver-default-browser.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-delete-session.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-element-screenshot.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-element-send-keys-files.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-error-keep-alive.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-force-dark.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-permissions-settings.py ARGS $<TARGET_FILE:WebDriver>)
@@ -106,6 +108,8 @@ if (APPLE OR LINUX)
         TestCrashReportReview.cpp
         TestCrashReportStore.cpp
         TestFontService.cpp
+        TestLocalFileRoot.cpp
+        TestOpenLocalFileForRenderer.cpp
         TestRendererFontService.cpp
     )
 endif()
@@ -153,11 +157,13 @@ if (NOT WIN32)
         TestInputMethodState.cpp
         TestInspectDOMTree.cpp
         TestLinkHoverStatus.cpp
+        TestLocalFileNavigation.cpp
         TestNavigationDownloads.cpp
         TestPictureInPictureUserActivation.cpp
         TestPictureInPictureWindowControls.cpp
         TestPictureInPictureWindowLifetime.cpp
         TestRendererAttentionClaims.cpp
+        TestRendererClipboardFormats.cpp
         TestRendererCookieAccess.cpp
         TestRendererOriginClaims.cpp
         TestRendererResponseBodyClaims.cpp

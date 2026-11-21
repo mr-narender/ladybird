@@ -251,6 +251,7 @@ impl_computed_payload_clone_and_eq!(InheritedTextValues {
     webkit_text_stroke_width => paint_only,
     text_shadow,
     text_transform,
+    text_security,
     text_wrap_style,
     text_decoration_skip_ink,
     text_underline_position,
@@ -2713,6 +2714,7 @@ pub(crate) fn group_field_descriptors(group: usize) -> &'static [GroupFieldDescr
             _WEBKIT_TEXT_STROKE_WIDTH @ webkit_text_stroke_width => PixelLengthF64,
             TEXT_SHADOW => RequireKeyword(k::NONE),
             TEXT_JUSTIFY @ text_justify => EnumKeyword(enums::keyword_to_text_justify),
+            _WEBKIT_TEXT_SECURITY @ text_security => EnumKeyword(enums::keyword_to_text_security),
             TEXT_TRANSFORM @ text_transform => EnumKeyword(enums::keyword_to_text_transform),
             TEXT_WRAP_STYLE @ text_wrap_style => EnumKeyword(enums::keyword_to_text_wrap_style),
             TEXT_DECORATION_SKIP_INK @ text_decoration_skip_ink => EnumKeyword(enums::keyword_to_text_decoration_skip_ink),
@@ -3644,7 +3646,7 @@ const PAYLOAD_TYPED_LONGHANDS: [(u16, usize, usize, u8); 18] = {
 
 /// The longhands whose computed value a handle of their group's payload holds as it is, by the
 /// handle's offset: the group's values keep no second copy of them.
-const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 53] = {
+const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 54] = {
     use crate::css::computed_value_types::{BackgroundValues, EffectsValues, FontValues, MaskValues, SVGResetValues};
     use crate::css::property_metadata::property_id as p;
     use std::mem::offset_of;
@@ -3654,6 +3656,11 @@ const PAYLOAD_HANDLE_LONGHANDS: [(u16, usize, usize); 53] = {
     let effects = group_index::EFFECTS;
     let svg_reset = group_index::SVG_RESET;
     [
+        (
+            p::BLOCK_ELLIPSIS,
+            group_index::INHERITED_TEXT,
+            offset_of!(InheritedTextValues, block_ellipsis),
+        ),
         (
             p::BACKGROUND_IMAGE,
             background,
@@ -5776,6 +5783,8 @@ impl AlignmentValues {
 
         Self {
             webkit_box_orient: crate::css::css_enums::webkit_box_orient::HORIZONTAL,
+            webkit_box_align: crate::css::css_enums::webkit_box_align::STRETCH,
+            webkit_box_pack: crate::css::css_enums::webkit_box_pack::START,
             flex_direction: flex_direction::ROW,
             flex_wrap: flex_wrap::NOWRAP,
             flex_basis: ComputedFlexBasis {
@@ -5784,7 +5793,9 @@ impl AlignmentValues {
             },
             flex_grow: 0.0,
             flex_shrink: 1.0,
+            webkit_box_flex: 0.0,
             order: 0,
+            webkit_box_ordinal_group: 1,
             align_content: align_content::NORMAL,
             align_items: align_items::STRETCH,
             align_self: align_self::AUTO,
@@ -6246,6 +6257,7 @@ impl InheritedTextValues {
             webkit_text_stroke_color: crate::css::computed_value_types::StyleColor::CURRENT_COLOR,
             webkit_text_stroke_width: 0.0,
             text_shadow: RetainedComputedShadowList::from_vec(Vec::new()),
+            text_security: css_enums::text_security::NONE,
             text_transform: enum_value(css_enums::keyword_to_text_transform(css_enums::keyword::NONE)),
             text_wrap_style: enum_value(css_enums::keyword_to_text_wrap_style(css_enums::keyword::AUTO)),
             text_decoration_skip_ink: enum_value(css_enums::keyword_to_text_decoration_skip_ink(
@@ -6680,12 +6692,16 @@ fn alignment_overflow(data: &RetainedStyleValueData) -> u8 {
 pub(crate) fn rust_build_alignment_group(
     group_index: usize,
     webkit_box_orient: &RetainedStyleValueData,
+    webkit_box_align: &RetainedStyleValueData,
+    webkit_box_pack: &RetainedStyleValueData,
     flex_direction: &RetainedStyleValueData,
     flex_wrap: &RetainedStyleValueData,
     flex_basis: &RetainedStyleValueData,
     flex_grow: f64,
     flex_shrink: f64,
+    webkit_box_flex: f64,
     order: i32,
+    webkit_box_ordinal_group: i32,
     align_content: &RetainedStyleValueData,
     align_items: &RetainedStyleValueData,
     align_self: &RetainedStyleValueData,
@@ -6711,12 +6727,16 @@ pub(crate) fn rust_build_alignment_group(
         };
         let built = AlignmentValues {
             webkit_box_orient: keyword_code(webkit_box_orient, crate::css::css_enums::keyword_to_webkit_box_orient)?,
+            webkit_box_align: keyword_code(webkit_box_align, crate::css::css_enums::keyword_to_webkit_box_align)?,
+            webkit_box_pack: keyword_code(webkit_box_pack, crate::css::css_enums::keyword_to_webkit_box_pack)?,
             flex_direction: keyword_code(flex_direction, crate::css::css_enums::keyword_to_flex_direction)?,
             flex_wrap: keyword_code(flex_wrap, crate::css::css_enums::keyword_to_flex_wrap)?,
             flex_basis: ComputedFlexBasis::from_data(flex_basis),
             flex_grow,
             flex_shrink,
+            webkit_box_flex,
             order,
+            webkit_box_ordinal_group,
             align_content: alignment_code(align_content, css_enums::keyword_to_align_content, true)?,
             align_items: alignment_code(align_items, css_enums::keyword_to_align_items, false)?,
             align_self: alignment_code(align_self, css_enums::keyword_to_align_self, false)?,
@@ -7168,6 +7188,26 @@ mod tests {
         // SAFETY: The clone holds the last reference and is a payload of this group.
         unsafe { rust_style_group_free(group_index::INHERITED_LIST_TABLE, changed_payload) };
     }
+}
+
+/// Copies the grid template, implicit track sizes, and fit tolerance, which the anonymous content box of a grid
+/// fieldset inherits from the fieldset. The fieldset's own placement in its parent's grid stays with the fieldset.
+// https://html.spec.whatwg.org/multipage/rendering.html#anonymous-fieldset-content-box
+pub(crate) fn copy_fieldset_content_grid_template(source: &GridValues, target: &mut GridValues) {
+    target.names = source.names.clone();
+    target.name_indices = source.name_indices.clone();
+    target.entries = source.entries.clone();
+    target.areas = source.areas.clone();
+    target.template_columns = source.template_columns;
+    target.template_rows = source.template_rows;
+    target.auto_columns = source.auto_columns;
+    target.auto_rows = source.auto_rows;
+    target.grid_template_columns_style_value = source.grid_template_columns_style_value.clone();
+    target.grid_template_rows_style_value = source.grid_template_rows_style_value.clone();
+    target.grid_auto_columns_style_value = source.grid_auto_columns_style_value.clone();
+    target.grid_auto_rows_style_value = source.grid_auto_rows_style_value.clone();
+    target.grid_template_areas_style_value = source.grid_template_areas_style_value.clone();
+    target.fit_tolerance_style_value = source.fit_tolerance_style_value.clone();
 }
 
 pub(crate) fn copy_fieldset_content_alignment(source: &AlignmentValues, target: &mut AlignmentValues) {

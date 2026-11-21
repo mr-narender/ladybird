@@ -78,6 +78,7 @@
 #include <LibWeb/HTML/RemoteNavigable.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/SessionHistoryEntry.h>
 #include <LibWeb/HTML/Storage.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WorkerAgentParent.h>
@@ -2556,6 +2557,24 @@ void ConnectionFromClient::set_has_devtools_client(Web::PageId page_id, bool has
         page->set_has_devtools_client(has_devtools_client);
 }
 
+// The Hub holds the session history, but only learns where the user is in a document once they leave it. Each navigable
+// of the page saves what it would save then, and the Hub hears when all of them have.
+void ConnectionFromClient::save_session_history_entry_states(Web::PageId page_id)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value())
+        return;
+    for (auto const& navigable : page->page().hosted_navigables()) {
+        navigable->save_persisted_state_to_active_session_history_entry();
+        auto entry = navigable->active_session_history_entry();
+        if (!entry)
+            continue;
+        if (auto persisted_state = Web::HTML::create_session_history_entry_persisted_state(*entry); persisted_state.has_value())
+            async_did_save_session_history_entry_state(page_id, navigable->id(), persisted_state.release_value());
+    }
+    async_did_save_session_history_entry_states(page_id);
+}
+
 void ConnectionFromClient::start_sending_console_output(Web::PageId page_id, bool messages, bool errors)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -3636,6 +3655,16 @@ void ConnectionFromClient::request_file(Web::PageId page_id, Web::FileRequest fi
     m_requested_files.set(id, move(file_request));
 
     async_did_request_file(page_id, path, id);
+}
+
+void ConnectionFromClient::request_file_for_webdriver(Web::PageId page_id, u64 command_id, Web::FileRequest file_request)
+{
+    i32 const id = last_id++;
+
+    auto path = file_request.path();
+    m_requested_files.set(id, move(file_request));
+
+    async_did_request_file_for_webdriver(page_id, command_id, path, id);
 }
 
 void ConnectionFromClient::blob_url_entry_removed(Utf16String url)

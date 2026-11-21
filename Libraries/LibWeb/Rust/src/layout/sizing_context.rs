@@ -2803,7 +2803,23 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             .intrinsic_inline_size_measurement_cache_put(node, key, value);
     }
 
-    fn transferred_intrinsic_inline_sizing_space(&self, sized: SizedBox<'_>) -> AvailableSpace {
+    fn transferred_intrinsic_inline_sizing_space(
+        &self,
+        sized: SizedBox<'_>,
+        constraints: ContainingBlockConstraints,
+    ) -> AvailableSpace {
+        // https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes
+        // NB: A replaced box's intrinsic inline sizes come from its natural sizes and its block axis constraints, so its
+        //     own size, which a layout may already have given it, is no percentage basis for its width or height here.
+        //     Its containing block's is.
+        if self.facts(sized.node).is_replaced_box() {
+            return AvailableSpace {
+                inline_size: AvailableSize::MaxContent,
+                block_size: constraints
+                    .percentage_basis_block_size
+                    .map_or(AvailableSize::Indefinite, AvailableSize::definite),
+            };
+        }
         sized
             .metrics()
             .available_inner_space_or_constraints_from(AvailableSpace {
@@ -2829,17 +2845,37 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-automatic
         // When a box has a preferred aspect ratio, its automatic sizes are calculated the same as for a replaced element
         // with a natural aspect ratio and no natural size in that axis.
+        // NB: A replaced box's width that is an intrinsic size keyword or a calc-size() resolves through these very
+        //     intrinsic sizes, so they can't come from it.
         if !facts.has_preferred_aspect_ratio()
-            || (facts.is_replaced_box() && !style.width().is_auto())
             || style.height().is_auto()
             || style.height().is_intrinsic_sizing_constraint()
+            || (facts.is_replaced_box()
+                && (style.width().is_intrinsic_sizing_constraint() || style.width().calc_size().is_some()))
         {
             return false;
         }
-        let available_space = self.transferred_intrinsic_inline_sizing_space(sized);
-        // NB: A cyclic percentage width of a non-replaced box behaves as auto for its intrinsic sizes.
-        self.should_treat_inline_size_as_auto(sized, available_space)
+        let available_space = self.transferred_intrinsic_inline_sizing_space(sized, constraints);
+        // NB: A replaced box's intrinsic widths come from its natural sizes and its block axis constraints, whatever its
+        //     own width. A cyclic percentage width of a non-replaced box behaves as auto for its intrinsic sizes.
+        (facts.is_replaced_box() || self.should_treat_inline_size_as_auto(sized, available_space))
             && !self.should_treat_block_size_as_auto(sized, available_space, constraints)
+    }
+
+    /// The inline size that a replaced box whose width doesn't behave as auto would have if it did: its block size
+    /// through its aspect ratio.
+    // https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes
+    // When the box has a preferred aspect ratio, size constraints in the opposite dimension will transfer through and
+    // can affect the auto size in the considered one.
+    // NB: The box's own minimum and maximum widths limit its intrinsic size contributions, not its intrinsic sizes.
+    fn transferred_inline_size_ignoring_width(
+        &self,
+        sized: SizedBox<'_>,
+        available_space: AvailableSpace,
+        constraints: ContainingBlockConstraints,
+    ) -> CssPixels {
+        let block_size = self.compute_block_size_for_replaced_element(sized, available_space, constraints);
+        self.content_inline_size_from_aspect_ratio(sized, block_size)
     }
 
     fn calculate_transferred_inline_size_for_replaced_element(
@@ -2850,10 +2886,22 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         if !self.intrinsic_inline_sizes_are_transferred(sized, constraints) {
             return None;
         }
-        let available_space = self.transferred_intrinsic_inline_sizing_space(sized);
+        let available_space = self.transferred_intrinsic_inline_sizing_space(sized, constraints);
         // https://drafts.csswg.org/css2/#inline-replaced-width
         // "(used height) * (intrinsic ratio)"
-        let inline_size = self.compute_inline_size_for_replaced_element(sized, available_space, constraints);
+        let inline_size = if self.should_treat_inline_size_as_auto(sized, available_space) {
+            self.compute_inline_size_for_replaced_element(sized, available_space, constraints)
+        } else {
+            // NB: A block size that behaves as auto here, such as a stretch block size against an auto height, has no
+            //     size to transfer, so the box's natural sizes give its intrinsic widths. And a width that isn't a
+            //     length or percentage, such as a calc-size() of an intrinsic size, resolves through those very widths.
+            let (_, computed_block) = self.computed_sizes_for_replaced_element(sized, available_space, constraints);
+            let width = self.style(sized.node).width();
+            if computed_block.is_auto() || !width.is_length_percentage() || width.calc_size().is_some() {
+                return None;
+            }
+            self.transferred_inline_size_ignoring_width(sized, available_space, constraints)
+        };
         // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum
         let block_size = self.compute_block_size_for_replaced_element(sized, available_space, constraints);
         let minimum = self.automatic_minimum_size_from_aspect_ratio(
@@ -3722,10 +3770,13 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 IntrinsicSizeCacheKind::MinContentInline,
             );
         }
-        if facts.is_replaced_box() {
+        // https://drafts.csswg.org/css-sizing-3/#intrinsic-sizes
+        // NB: A replaced box's min-content block size is its max-content block size, which follows its preferred
+        //     aspect ratio where it has one, rather than its natural ratio.
+        if facts.is_replaced_box() && !facts.has_preferred_aspect_ratio() {
             let auto_size = self.auto_content_size(node);
             if let Some(height) = auto_size.height {
-                return auto_size.aspect_ratio.map_or(height, |ratio| ratio.divide(inline_size));
+                return height;
             }
         }
         // For block containers, tables, and inline boxes, this is equivalent to the max-content block size.

@@ -1460,6 +1460,34 @@ Optional<Vector<TrackCuePoint> const&> Reader::cue_points_for_track(u64 track_nu
     return m_cues.get(track_number);
 }
 
+AK::Duration Reader::earliest_possible_position(NonnullRefPtr<MediaStreamCursor> const& cursor) const
+{
+    HashTable<u64> tracks_without_blocks;
+    for (auto const& [track_number, track] : m_tracks) {
+        if (first_is_one_of(track->track_type(), TrackEntry::TrackType::Video, TrackEntry::TrackType::Audio))
+            tracks_without_blocks.set(track_number);
+    }
+
+    auto iterator_or_error = create_sample_iterator(cursor);
+    if (iterator_or_error.is_error())
+        return AK::Duration::zero();
+    auto iterator = iterator_or_error.release_value();
+
+    Optional<AK::Duration> earliest;
+    while (!tracks_without_blocks.is_empty()) {
+        auto block_or_error = iterator.next_block();
+        if (block_or_error.is_error())
+            break;
+
+        auto const& block = block_or_error.value();
+        if (!block.timestamp().has_value() || !tracks_without_blocks.remove(block.track_number()))
+            continue;
+        earliest = min(earliest.value_or(AK::Duration::max()), block.timestamp().value());
+    }
+
+    return max(earliest.value_or(AK::Duration::zero()), AK::Duration::zero());
+}
+
 Vector<BufferedRangesScan> Reader::buffered_time_ranges_by_track(NonnullRefPtr<MediaStreamCursor> const& cursor, Vector<MediaStream::ByteRange> const& byte_ranges) const
 {
     auto create_iterator = [&](size_t position) -> Optional<SampleIterator> {
@@ -1609,8 +1637,14 @@ Vector<BufferedRangesScan> Reader::buffered_time_ranges_by_track(NonnullRefPtr<M
         BufferedRangesScan scan;
         scan.track_identifier = track_number;
         for (auto const& cached_range : m_buffered_ranges) {
-            if (auto interval = cached_range.track_intervals.get(track_number); interval.has_value())
-                scan.time_ranges.add_range(max(AK::Duration::zero(), interval.value().start), interval.value().end);
+            auto interval = cached_range.track_intervals.get(track_number);
+            if (!interval.has_value())
+                continue;
+            // Data from the first cluster onward is playable from the start of the timeline.
+            auto start = max(AK::Duration::zero(), interval.value().start);
+            if (cached_range.start <= m_first_cluster_position)
+                start = AK::Duration::zero();
+            scan.time_ranges.add_range(start, interval.value().end);
         }
         scan.last_byte_range_has_samples = !m_buffered_ranges.is_empty() && m_buffered_ranges.last().track_intervals.contains(track_number);
         scans.append(move(scan));

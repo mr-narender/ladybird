@@ -52,6 +52,7 @@
 #include <LibWebView/Translator.h>
 #include <LibWebView/URL.h>
 #include <LibWebView/Utilities.h>
+#include <LibWebView/WebCompatReport.h>
 #include <LibWebView/WebContentPage.h>
 #include <UI/Qt/Application.h>
 #include <UI/Qt/BookmarkDialog.h>
@@ -77,6 +78,7 @@
 
 #if defined(AK_OS_MACOS)
 #    include <UI/Qt/ApplicationIcon.h>
+#    include <UI/Qt/DefaultBrowserMacOS.h>
 #    include <UI/Qt/LaunchURLsMacOS.h>
 #    include <UI/Qt/MacWindow.h>
 #    include <UI/Qt/MicrophoneAuthorizerMacOS.h>
@@ -90,6 +92,7 @@
 #endif
 
 #if defined(AK_OS_LINUX)
+#    include <UI/Qt/DefaultBrowserLinux.h>
 #    include <UI/Qt/X11Window.h>
 #endif
 
@@ -822,6 +825,10 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
 #    if defined(AK_OS_MACOS)
     m_spell_checker = create_platform_spell_checker();
     m_microphone_authorizer = make<MicrophoneAuthorizerMacOS>();
+    m_default_browser = make<DefaultBrowserMacOS>();
+#    elif defined(AK_OS_LINUX)
+    auto desktop_id = ByteString::formatted("{}.desktop", ak_byte_string_from_qstring(QGuiApplication::desktopFileName()));
+    m_default_browser = make<DefaultBrowserLinux>(move(desktop_id));
 #    endif
 
     IPC::MessageBuffer ui_info_buffer;
@@ -954,6 +961,7 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
     m_browser_options.devtools_port = state.devtools_port;
     if (state.devtools_enabled)
         m_devtools_port = state.devtools_port;
+    m_gpu_painting_enabled = state.gpu_painting_enabled;
     m_profile_is_temporary = state.profile_is_temporary;
 #    if defined(AK_OS_MACOS)
     set_profile_application_icon(state.profile_identifier, state.profile_identity, state.profile_is_temporary);
@@ -999,6 +1007,20 @@ ErrorOr<void> Application::connect_to_hub(Main::Arguments const& arguments)
             if (auto* hub = HubConnection::the_if_connected())
                 hub->async_microphone_authorization_changed(m_microphone_authorizer->authorization());
         });
+    }
+
+    // The user can choose another default browser in the system settings at any time, and comes back to the browser
+    // after doing it.
+    if (m_default_browser) {
+        m_default_browser->on_status_change = [this] {
+            if (auto* hub = HubConnection::the_if_connected())
+                hub->async_default_browser_status_changed(m_default_browser->status());
+        };
+        QObject::connect(qGuiApp, &QGuiApplication::applicationStateChanged, [this](Qt::ApplicationState state) {
+            if (state == Qt::ApplicationActive)
+                m_default_browser->refresh();
+        });
+        m_default_browser->refresh();
     }
 
     // NB: The UI info holds the interface color scheme, which changes with the interface theme as well as with the
@@ -1194,6 +1216,7 @@ void Application::create_platform_actions()
     });
     if (hub.devtools_enabled())
         m_devtools_port = WebView::Application::browser_options().devtools_port;
+    m_gpu_painting_enabled = hub.compositor_gpu_painting_enabled();
 
     RemoteDownloads::the().set_downloads(Hub::ConnectionFromUI::downloads());
 #endif
@@ -2947,6 +2970,34 @@ void Application::did_disable_devtools()
     for (auto* widget : QApplication::topLevelWidgets()) {
         if (auto* window = as_if<BrowserWindow>(widget))
             window->on_devtools_disabled();
+    }
+}
+
+URL::URL Application::new_bug_report_url() const
+{
+    return WebView::new_bug_report_url({
+        .disable_sandbox = browser_options().disable_sandbox,
+        .gpu_painting_enabled = m_gpu_painting_enabled,
+    });
+}
+
+void Application::did_change_gpu_painting(bool enabled)
+{
+    m_gpu_painting_enabled = enabled;
+    update_cpu_painting_bars();
+}
+
+void Application::dismiss_cpu_painting_bar()
+{
+    m_cpu_painting_bar_dismissed = true;
+    update_cpu_painting_bars();
+}
+
+void Application::update_cpu_painting_bars() const
+{
+    for (auto* widget : QApplication::topLevelWidgets()) {
+        if (auto* window = as_if<BrowserWindow>(widget))
+            window->tab_widget().update_cpu_painting_bar();
     }
 }
 

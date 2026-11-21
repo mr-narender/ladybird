@@ -129,6 +129,8 @@ public:
     RefPtr<CanonicalDocument> hosted_document_with_id(Web::HTML::CrossProcessId) const;
     bool hosts_a_document_with_top_level_origin(URL::Origin const&) const;
     bool document_may_use(Web::HTML::CrossProcessId, Web::Permissions::PermissionName) const;
+    // Whether a hosted document of a file: page may use the permission, which it was granted for as long as it lives.
+    bool hosts_a_local_file_document_that_may_use(Web::Permissions::PermissionName) const;
 
     Web::Permissions::PermissionSnapshot set_permission_for_testing(Web::HTML::CrossProcessId document_id, String const& name, String const& state);
     void set_next_permission_prompt_outcome_for_testing(String const& name, String const& outcome, bool held);
@@ -152,6 +154,7 @@ public:
     bool consume_transient_user_activation();
 
     bool needs_beforeunload_check() const { return m_needs_beforeunload_check; }
+    bool had_user_edits() const { return m_had_user_edits; }
     bool detached_close_pending() const { return m_detached_close_pending; }
     void set_detached_close_pending(bool pending) { m_detached_close_pending = pending; }
 
@@ -184,6 +187,7 @@ public:
     Optional<PresentedBackingStores> take_presented_backing_stores();
     void release_presented_bitmap(i32 bitmap_id);
     void fail_renderer_owned_downloads();
+    bool has_renderer_owned_downloads() const { return !m_renderer_owned_downloads.is_empty(); }
     void reset_state_for_testing();
 
 private:
@@ -265,6 +269,9 @@ private:
     void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls);
     Messages::WebContentClient::ConnectToStorageAreaResponse connect_to_storage_area(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id);
     virtual void did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
+    virtual void did_change_had_user_edits(bool had_user_edits) override;
+    virtual void did_save_session_history_entry_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryPersistedState persisted_state) override;
+    virtual void did_save_session_history_entry_states() override;
     virtual void did_consume_user_activation(Web::HTML::UserActivationConsumption consumption) override;
     virtual void did_notify_about_user_activation(Web::HTML::CrossProcessId document_id) override;
     virtual void webdriver_user_prompt_handling_complete(u64 request_id, Web::WebDriver::Response response) override;
@@ -284,6 +291,7 @@ private:
     virtual void did_change_picture_in_picture_video_size(Gfx::IntSize video_size) override;
     virtual void did_change_picture_in_picture_player_controls_visibility(bool shown) override;
     virtual void did_request_file(ByteString path, i32 request_id) override;
+    virtual void did_request_file_for_webdriver(u64 command_id, ByteString path, i32 request_id) override;
     virtual void did_request_color_picker(Color current_color) override;
     virtual void did_request_date_picker(Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum) override;
     virtual void did_request_geolocation_position(u64 request_id, Web::HTML::CrossProcessId document_id) override;
@@ -444,6 +452,7 @@ private:
     bool m_capturing_audio { false };
     Optional<PresentedBackingStores> m_presented_backing_stores;
     bool m_needs_beforeunload_check { true };
+    bool m_had_user_edits { false };
     bool m_detached_close_pending { false };
     Optional<String> m_history_recorded_url_for_current_load;
     HashTable<u64> m_renderer_owned_downloads;

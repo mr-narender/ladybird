@@ -9,10 +9,9 @@
 use core::ops::ControlFlow;
 use core::ptr::NonNull;
 
-use libjs_jit::code::CompiledCode;
-
 use super::code::{CompileState, FRUITLESS_LOOP_CHECKS_AFTER_INSTALL, JitCode, SnapshotExecutable};
-use super::compile_queue::CompileResult;
+use super::compile_queue::{CompileResult, Compiled};
+use super::data_memory::DataMemory;
 use super::executable_memory::ExecutableMemory;
 use super::snapshot::{CapturedSnapshot, capture_snapshot};
 use super::{CompileJob, JitState, executable_of};
@@ -343,23 +342,23 @@ pub fn tier_up_check(vm: &Vm, encoded_pc: u64) -> i64 {
 fn should_install(vm: &Vm, result: &CompileResult) -> bool {
     result.as_ref().is_ok_and(|compiled| {
         compiled
-            .dependencies
-            .iter()
-            .all(|dependency| super::dependencies::holds(vm, dependency))
+            .artifact()
+            .dependencies()
+            .all(|dependency| super::dependencies::holds(vm, &dependency))
     }) && !vm.debugging_enabled()
 }
 
 fn install(
     vm: &Vm,
     executable: Gc<Executable>,
-    compiled: CompiledCode,
+    compiled: Compiled,
     memory: ExecutableMemory,
     snapshot: SnapshotExecutables,
     defer_gc: &DeferGc<'_>,
 ) {
-    let embedded_cells = compiled
-        .embedded_cells
-        .iter()
+    let artifact = compiled.artifact();
+    let embedded_cells = artifact
+        .embedded_cells()
         .map(|cell| {
             // SAFETY: The snapshot kept every cell it captured alive, and the code embeds only those.
             unsafe { Gc::from_non_null(NonNull::new(cell.0 as *mut CellHeader).expect("embedded cells are not null")) }
@@ -369,18 +368,16 @@ fn install(
     let mut code = JitCode::new(
         memory,
         compiled.entry_offset,
-        &compiled.osr_entries,
-        compiled.osr_loop_back_edges,
-        compiled.sites,
+        DataMemory::allocate(vm.jit.data_allocator(), &compiled.words[..compiled.layout.kept_len()]),
+        compiled.layout,
         embedded_cells,
         snapshot,
         defer_gc,
     );
-    code.set_invalidation(id, compiled.invalidation_patches);
+    code.set_id(id);
     code.set_frame_offsets(compiled.site_index_frame_offset, compiled.register_dump_frame_offset);
-    code.set_osr_outer_loop_back_edges(compiled.osr_outer_loop_back_edges);
-    code.set_uncaught_handlers(compiled.uncaught_handlers);
-    vm.jit.dependents.register(vm, executable, id, &compiled.dependencies);
+    let dependencies = artifact.dependencies().collect::<Vec<_>>();
+    vm.jit.dependents.register(vm, executable, id, &dependencies);
     // NB: A callee's tier-up check may install the code while its caller still runs in the interpreter, possibly
     //     past the loop the code has an on-stack replacement entry at.
     vm.for_each_live_execution_context(|frame| {
@@ -428,10 +425,10 @@ fn finish_compile(
         }
     };
     vm.jit.count_coverage("compile");
-    for key in &compiled.coverage {
+    for key in compiled.coverage() {
         vm.jit.count_coverage(key);
     }
-    if let Some(dump) = &compiled.dump {
+    if let Some(dump) = compiled.dump() {
         eprintln!("JIT code for {}:\n{dump}", super::describe_executable(&executable));
     }
     if let Some(memory) = memory {
@@ -478,13 +475,14 @@ fn compile(
     } = capture_snapshot(vm, executable, function, realm, osr_pc, &defer_gc);
     if sync {
         // NB: Nothing collects garbage while compiling on this thread, so the snapshot's cells stay alive.
-        let result = libjs_jit::compile(&snapshot);
+        let result = super::compile_queue::compile(&snapshot);
+        super::compile_queue::give_back_snapshot(snapshot);
         let memory = should_install(vm, &result).then(|| {
             let code = &result.as_ref().expect("the compile succeeded").code;
             let name = super::describe_executable(&executable);
             ExecutableMemory::allocate(
                 vm.jit.code_allocator(),
-                &[code.as_slice()],
+                &[&code[..]],
                 &[name.as_str()],
                 vm.jit.options.perf_map,
             )
@@ -594,7 +592,7 @@ fn install_compile_results(vm: &Vm, results: Vec<(u64, CompileResult)>, defer_gc
             .map(|(compile, _)| compile)
     };
     let codes: Vec<&[u8]> = installed()
-        .map(|(_, result)| result.as_ref().expect("the compile succeeded").code.as_slice())
+        .map(|(_, result)| &result.as_ref().expect("the compile succeeded").code[..])
         .collect();
     let names: Vec<String> = installed()
         .map(|(job, _)| super::describe_executable(&job.executable))

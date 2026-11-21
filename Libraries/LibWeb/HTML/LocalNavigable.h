@@ -104,6 +104,7 @@ public:
     GC::Ptr<RemoteNavigable> provisional_for() const { return m_provisional_for; }
     void clear_provisional_for() { m_provisional_for = nullptr; }
     static GC::Ref<LocalNavigable> create_stand_in(Badge<Page>, RemoteNavigable&, SessionHistoryEntryDescriptor const& current_history_entry);
+    bool container_suppresses_viewport_scrolling() const;
     void set_root_container_state(ReplicatedContainerState);
     void set_parent_compositor_context(Optional<Web::CompositorContextId>);
 
@@ -807,6 +808,7 @@ public:
     static GC::Ref<DocumentToCreate> create(GC::Ref<NavigationParams>, GC::Ref<LoadSteps>, Optional<URL::Origin> origin = {});
 
     URL::Origin origin() const;
+    bool replaces_response_origin() const { return m_replaces_response_origin; }
     URL::URL url() const;
     CrossProcessId id() const;
     EnvironmentId const& environment_id() const;
@@ -824,7 +826,7 @@ private:
     // Null once the document is created or discarded, so that what it was created from is released.
     GC::Ptr<NavigationParams> m_navigation_params;
     GC::Ptr<LoadSteps> m_load_steps;
-    Optional<URL::Origin> m_origin;
+    bool m_replaces_response_origin { false };
     // Creating the document moves the id out of the reserved environment.
     EnvironmentId m_environment_id;
 };

@@ -194,11 +194,11 @@ void RemoteView::did_present_frame_in_remote_layer(Gfx::IntSize size, double dev
         on_ready_to_paint();
 }
 
-void RemoteView::take_frame_snapshot(Optional<Gfx::IntSize> maximum_size, Function<void(Optional<Gfx::ShareableBitmap>)> callback)
+void RemoteView::take_frame_snapshot(Function<void(Optional<Gfx::ShareableBitmap>)> callback)
 {
     auto request_id = m_next_request_id++;
     m_pending_frame_snapshots.set(request_id, move(callback));
-    HubConnection::the().async_view_take_frame_snapshot(view_id(), request_id, maximum_size);
+    HubConnection::the().async_view_take_frame_snapshot(view_id(), request_id);
 }
 
 void RemoteView::did_take_frame_snapshot(u64 request_id, Optional<Gfx::ShareableBitmap> snapshot)
@@ -376,6 +376,16 @@ ErrorOr<void> RemoteView::restore_session_history_from_snapshot(WebView::Session
         return Error::from_string_literal("Unable to restore the session history");
     return {};
 }
+
+Optional<u64> RemoteView::keep_state_for_discarding()
+{
+    return HubConnection::the().view_keep_state_for_discarding(view_id());
+}
+
+void RemoteView::restore_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    HubConnection::the().async_view_restore_state_of_discarded_tab(view_id(), discarded_tab_state_id);
+}
 #else
 Optional<i32> RemoteView::history_step_at_delta(int delta) const
 {
@@ -415,6 +425,18 @@ WebView::SessionHistorySnapshot RemoteView::session_history_snapshot() const
 ErrorOr<void> RemoteView::restore_session_history_from_snapshot(WebView::SessionHistorySnapshot snapshot)
 {
     return m_view->restore_session_history_from_snapshot(move(snapshot));
+}
+
+Optional<u64> RemoteView::keep_state_for_discarding()
+{
+    return m_view->keep_state_for_discarding();
+}
+
+// NB: The tab's pages must find their sessionStorage as they load, so this can't wait for the Hub's turn.
+void RemoteView::restore_state_of_discarded_tab(u64 discarded_tab_state_id)
+{
+    m_view->restore_state_of_discarded_tab(discarded_tab_state_id);
+    m_view->push_state_to_ui();
 }
 #endif
 

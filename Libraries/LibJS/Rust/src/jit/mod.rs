@@ -12,6 +12,7 @@ pub mod allocation;
 pub mod calls;
 pub mod code;
 pub mod compile_queue;
+pub mod data_memory;
 pub mod dependencies;
 pub mod dispatch_tables;
 pub mod entry_exit;
@@ -26,7 +27,7 @@ pub mod testing;
 pub mod tier_up;
 pub mod translate;
 
-pub use libjs_jit::options;
+pub use crate::jit_options as options;
 
 use core::cell::{Cell, OnceCell, RefCell};
 use core::ptr::NonNull;
@@ -45,6 +46,7 @@ use crate::layout::execution_context::ExecutionContext;
 use code::EntryTrampoline;
 use code::SnapshotExecutable;
 use compile_queue::{CompileQueue, CompileResult};
+use data_memory::DataAllocator;
 use executable_memory::{CodeAllocator, ExecutableMemory};
 use options::Options;
 
@@ -178,6 +180,8 @@ pub struct JitState {
     pub(crate) function_environment_free_lists: allocation::FunctionEnvironmentFreeLists,
     /// The memory the VM's JIT code lives in.
     code_allocator: Rc<RefCell<CodeAllocator>>,
+    /// The memory the tables of the VM's JIT code live in.
+    data_allocator: Rc<RefCell<DataAllocator>>,
     /// The compile threads, started by the first asynchronous compile job.
     compile_queue: OnceCell<CompileQueue>,
     /// The compile jobs that run on the compile threads, by id.
@@ -234,6 +238,7 @@ impl JitState {
             entry_table,
             function_environment_free_lists: allocation::FunctionEnvironmentFreeLists::default(),
             code_allocator: Rc::default(),
+            data_allocator: Rc::default(),
             compile_queue: OnceCell::new(),
             jobs: RefCell::default(),
             next_job_id: Cell::new(1),
@@ -380,6 +385,10 @@ impl JitState {
         &self.code_allocator
     }
 
+    pub(crate) fn data_allocator(&self) -> &Rc<RefCell<DataAllocator>> {
+        &self.data_allocator
+    }
+
     pub(crate) fn compile_queue(&self) -> &CompileQueue {
         self.compile_queue
             .get_or_init(|| CompileQueue::start(self.options.compile_thread_count()))
@@ -431,14 +440,10 @@ impl JitState {
                 let allocator = Rc::new(RefCell::new(CodeAllocator::default()));
                 #[cfg(not(windows))]
                 let allocator = Rc::clone(&self.code_allocator);
-                let memory = ExecutableMemory::allocate(
-                    &allocator,
-                    &[code.as_slice()],
-                    &["entry trampoline"],
-                    self.options.perf_map,
-                )
-                .pop()
-                .expect("one code was allocated");
+                let memory =
+                    ExecutableMemory::allocate(&allocator, &[&code[..]], &["entry trampoline"], self.options.perf_map)
+                        .pop()
+                        .expect("one code was allocated");
                 // SAFETY: The code is the entry trampoline, with its calling convention.
                 let trampoline = unsafe { core::mem::transmute::<*const u8, EntryTrampoline>(memory.address()) };
                 (memory, trampoline)
@@ -454,7 +459,7 @@ impl JitState {
                     .expect("the call stub compiles")?;
                 ExecutableMemory::allocate(
                     &self.code_allocator,
-                    &[code.as_slice()],
+                    &[&code[..]],
                     &["call stub"],
                     self.options.perf_map,
                 )
@@ -472,7 +477,7 @@ impl JitState {
                     .expect("the construct stub compiles")?;
                 ExecutableMemory::allocate(
                     &self.code_allocator,
-                    &[code.as_slice()],
+                    &[&code[..]],
                     &["construct stub"],
                     self.options.perf_map,
                 )

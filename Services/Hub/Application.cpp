@@ -355,6 +355,13 @@ Core::EventLoop& Application::create_platform_event_loop()
     return event_loop;
 }
 
+NonnullOwnPtr<WebView::DefaultBrowser> Application::create_default_browser()
+{
+    if (ui_info())
+        return make<DefaultBrowserInUI>();
+    return WebView::Application::create_default_browser();
+}
+
 NonnullOwnPtr<WebView::MicrophoneAuthorizer> Application::create_microphone_authorizer()
 {
     // NB: The UI tells of no authorization where the system has no say over the microphone.
@@ -389,6 +396,12 @@ void Application::on_devtools_disabled() const
     WebView::Application::on_devtools_disabled();
     if (auto* ui = ConnectionFromUI::the())
         ui->async_app_did_disable_devtools();
+}
+
+void Application::on_compositor_gpu_painting_changed() const
+{
+    if (auto* ui = ConnectionFromUI::the())
+        ui->async_app_gpu_painting_changed(compositor_gpu_painting_enabled());
 }
 
 void Application::create_platform_actions()

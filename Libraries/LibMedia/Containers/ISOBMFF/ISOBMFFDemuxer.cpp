@@ -30,6 +30,7 @@ DecoderErrorOr<NonnullRefPtr<Demuxer>> ISOBMFFDemuxer::from_stream(NonnullRefPtr
         if (header.type == MOVIE_BOX) {
             auto movie = TRY(Reader::parse_movie_box(stream, header));
             auto demuxer = make_ref_counted<ISOBMFFDemuxer>(source, move(movie), header.end_position().value_or(stream.position()));
+            demuxer->m_earliest_possible_position = demuxer->find_earliest_possible_position();
             demuxer->start_scan();
             return demuxer;
         }
@@ -51,6 +52,24 @@ ISOBMFFDemuxer::ISOBMFFDemuxer(NonnullRefPtr<MediaStream> stream, Movie movie, s
         m_durations->tracks.set(id, duration);
         m_durations->total = max(m_durations->total, duration);
     }
+}
+
+AK::Duration ISOBMFFDemuxer::find_earliest_possible_position() const
+{
+    auto cursor = m_stream->create_cursor();
+    Optional<AK::Duration> earliest;
+    for (auto const& [id, track] : m_movie.tracks) {
+        if (!first_is_one_of(track->handler_type, HandlerType::Audio, HandlerType::Video))
+            continue;
+        auto iterator = SampleIterator::create(cursor, m_movie, id, m_movie_end);
+        if (iterator.is_error())
+            continue;
+        auto first_sample = iterator.value().next();
+        if (first_sample.is_error() || !first_sample.value().has_value())
+            continue;
+        earliest = min(earliest.value_or(AK::Duration::max()), first_sample.value().value().presentation_timestamp);
+    }
+    return max(earliest.value_or(AK::Duration::zero()), AK::Duration::zero());
 }
 
 ISOBMFFDemuxer::~ISOBMFFDemuxer()
@@ -89,6 +108,7 @@ void ISOBMFFDemuxer::start_scan()
                 decodable_run.clear();
             };
             bool last_sample_available = false;
+            bool sample_is_first_of_track = true;
             bool track_reached_end = availability.closing_bytes_are_available();
             if (!iterator.is_error()) {
                 for (;;) {
@@ -100,6 +120,7 @@ void ISOBMFFDemuxer::start_scan()
                     if (!next.value().has_value())
                         break;
                     auto const& sample = next.value().value();
+                    bool sample_is_first = exchange(sample_is_first_of_track, false);
                     auto end = sample.presentation_timestamp + sample.duration;
                     duration = max(duration, end);
                     state.duration = max(state.duration, end);
@@ -111,10 +132,13 @@ void ISOBMFFDemuxer::start_scan()
                         end_decodable_run();
                         continue;
                     }
-                    if (decodable_run.has_value())
+                    if (decodable_run.has_value()) {
                         decodable_run->end = max(decodable_run->end, end);
-                    else if (sample.is_sync_sample)
-                        decodable_run = TimeRanges::Range { max(sample.presentation_timestamp, AK::Duration::zero()), end };
+                    } else if (sample.is_sync_sample) {
+                        // Data from the start of the track is playable from the start of the timeline.
+                        auto start = sample_is_first ? AK::Duration::zero() : max(sample.presentation_timestamp, AK::Duration::zero());
+                        decodable_run = TimeRanges::Range { start, end };
+                    }
                 }
                 end_decodable_run();
             } else {

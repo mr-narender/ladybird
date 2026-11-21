@@ -323,6 +323,11 @@ void HubConnection::app_did_disable_devtools()
     Application::the().did_disable_devtools();
 }
 
+void HubConnection::app_gpu_painting_changed(bool gpu_painting_enabled)
+{
+    Application::the().did_change_gpu_painting(gpu_painting_enabled);
+}
+
 void HubConnection::app_open_urls_in_new_tabs(Vector<URL::URL> urls)
 {
     Application::the().open_urls_in_new_tabs(urls);
@@ -580,6 +585,18 @@ void HubConnection::microphone_request_authorization()
     }
     authorizer->request_authorization([this](WebView::MicrophoneAuthorization authorization) {
         async_microphone_authorization_changed(authorization);
+    });
+}
+
+void HubConnection::default_browser_make_default()
+{
+    auto* default_browser = Application::the().default_browser();
+    if (!default_browser) {
+        async_default_browser_make_default_finished(true, {});
+        return;
+    }
+    default_browser->make_default([this](WebView::MakeDefaultBrowserResult const& result) {
+        async_default_browser_make_default_finished(result.failed, result.system_message);
     });
 }
 
@@ -882,6 +899,12 @@ void HubConnection::view_activate_tab(u64 view_id)
 {
     if (auto* view = RemoteView::find(view_id); view && view->on_activate_tab)
         view->on_activate_tab();
+}
+
+void HubConnection::view_discard(u64 view_id)
+{
+    if (auto* view = RemoteView::find(view_id); view && view->on_discard)
+        view->on_discard();
 }
 
 void HubConnection::view_close(u64 view_id)
